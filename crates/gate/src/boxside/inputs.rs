@@ -26,10 +26,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use gate_args::BoxSeams;
-use gate_win32::{Make, Share};
+use gate_win32::{Descriptor, Make, Share};
 use serde_json::{Map, Value, json};
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, READ_CONTROL,
+    WRITE_DAC, WRITE_OWNER,
 };
 
 use crate::answer::USAGE_STATUS;
@@ -48,12 +49,11 @@ use crate::remote::{Refusal, busy_line, refused_line as tagged_line};
 const GIB: u64 = 1024 * 1024 * 1024;
 /// The most bytes one put unpacks, decompressed: 4 GiB, unless the `--test-inputs-budget-bytes` seam says otherwise.
 const INPUTS_BUDGET: u64 = 4 * GIB;
-/// The folder below the box's root that holds each put's stage, `{root}\inputs-stage\{key}-{nonce}`.
-const STAGES: &str = "inputs-stage";
 /// The folder in a stage the archive is unpacked into.
 const STAGED_FILES: &str = "files";
-/// The access the stages folder is held with: listed, its security read and set.
-const STAGES_ACCESS: u32 = FILE_GENERIC_READ | WRITE_DAC | WRITE_OWNER;
+/// The access the stages folder is held with: listed, its attributes and its security read, and no more, so an
+/// existing folder is judged through a handle that could change nothing in it.
+const STAGES_ACCESS: u32 = READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY;
 /// How old a stage is before any put removes it: a put that left one ended a day ago.
 const STAGE_AGE: Duration = Duration::from_hours(24);
 /// The line refusing a request that names a sibling pair.
@@ -84,6 +84,7 @@ pub(super) fn unmatched(work: &str, held: &File, sent: &str) -> Option<String> {
     if let Some(why) = changed_copy(held, &record) {
         return Some(why);
     }
+    // A folder moved aside from the exclude file's name is said by a put; a run's check has no line for it.
     write_exclude(held, work, &record).err()
 }
 
@@ -624,11 +625,15 @@ struct Stage {
     path: PathBuf,
 }
 
-/// This put's stage, `{root}\inputs-stage\{key}-{nonce}`, made as a new folder and held with its root and stages
-/// folder ([`Stage`]): the root opened as itself and refused when it is a link, a junction or not a folder; the stages
-/// folder readied beneath it ([`stages_folder`]); every stage older than a day removed first ([`pruned`]). A stage of
-/// that name already there is refused, never shared. Else why not.
+/// This put's stage, `{root}\{stages}\{key}-{nonce}`, made as a new folder with the security that keeps every other
+/// account and every lower process out from the instant it exists ([`gate_win32::protected_descriptor`]), and held
+/// with its root and stages folder ([`Stage`]): the root opened as itself and refused when it is a link, a junction or
+/// not a folder; the stages folder of this box's elevation ([`stages_name`]) readied beneath it ([`stages_folder`]);
+/// every stage older than a day removed first ([`pruned`]). A stage of that name already there is refused, never
+/// shared. Else why not.
 fn made_stage(asked: &Asked<'_>, console: &mut Console) -> Result<Stage, String> {
+    let facts = gate_win32::token_facts().map_err(|error| format!("cannot read the box's token: {error}"))?;
+    let security = gate_win32::protected_descriptor(&facts).map_err(|error| format!("cannot make the box's security: {error}"))?;
     let root = OpenOptions::new()
         .read(true)
         .share_mode(Share::NoDelete.mode())
@@ -638,13 +643,14 @@ fn made_stage(asked: &Asked<'_>, console: &mut Console) -> Result<Stage, String>
     if !is_folder_itself(&root).map_err(|error| format!("cannot open {}: {error}", asked.root))? {
         return Err(format!("{} is a link, a junction or not a folder", asked.root));
     }
-    let path = Path::new(asked.root).join(STAGES);
-    let stages = stages_folder(&root, &path)?;
+    let stages_name = stages_name(facts.elevated);
+    let path = Path::new(asked.root).join(stages_name);
+    let stages = stages_folder(&root, &path, stages_name, &security)?;
     for line in pruned(&stages, &path, SystemTime::now()) {
         console.err(&line);
     }
     let name = format!("{}-{}", asked.key, asked.nonce);
-    let stage = gate_win32::open_beneath_as(&stages, &name, FILE_GENERIC_READ | DELETE, Share::NoDelete, Make::NewFolder)
+    let stage = gate_win32::make_folder_beneath(&stages, &name, FILE_GENERIC_READ | DELETE, Share::NoDelete, &security)
         .map_err(|error| format!("cannot make the stage {}: {error}", path.join(&name).display()))?;
     Ok(Stage {
         root,
@@ -654,37 +660,49 @@ fn made_stage(asked: &Asked<'_>, console: &mut Console) -> Result<Stage, String>
     })
 }
 
-/// The stages folder `{root}\inputs-stage`, whose path is `path`, readied beneath the held root `root` and held without
-/// delete sharing: made new when nothing has the name; an existing one adopted only when it is a folder of its own
-/// whose owner and DACL are those this box gives it ([`gate_win32::is_protected_folder`]), and anything else at the
-/// name, which another account made or may still hold a handle to, deleted beneath the held root as itself
-/// ([`gate_win32::delete_tree_opened`]) and made new. The folder is then given the owner and security that keep every
-/// lower process out ([`gate_win32::protect_folder`]). Else why not.
-fn stages_folder(root: &File, path: &Path) -> Result<File, String> {
-    let cannot = |error: io::Error| format!("cannot ready {}: {error}", path.display());
-    let made = match gate_win32::open_beneath_as(root, STAGES, STAGES_ACCESS, Share::NoDelete, Make::NewFolder) {
-        Ok(made) => made,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => adopted_or_new(root, path)?,
-        Err(error) => return Err(cannot(error)),
-    };
-    gate_win32::protect_folder(&made).map_err(cannot)?;
-    Ok(made)
+/// The name of the folder below the box's root that holds each put's stage, `{root}\{stages}\{key}-{nonce}`:
+/// `inputs-stage` for an elevated box, whose folders Administrators own and whose High label keeps every medium
+/// process out, and `inputs-stage-medium` for an unelevated one, whose folders its own user owns and labels Medium.
+/// Neither box ever touches the other's folder.
+fn stages_name(elevated: bool) -> &'static str {
+    if elevated { "inputs-stage" } else { "inputs-stage-medium" }
 }
 
-/// The stages folder already at `path` beneath the held root `root`, as [`stages_folder`] adopts it, or one made new
-/// in its place. Else why not.
-fn adopted_or_new(root: &File, path: &Path) -> Result<File, String> {
-    let cannot = |error: io::Error| format!("cannot ready {}: {error}", path.display());
-    let found = gate_win32::open_beneath_as(root, STAGES, STAGES_ACCESS, Share::NoDelete, Make::Open).map_err(cannot)?;
-    if is_folder_itself(&found).map_err(cannot)? && gate_win32::is_protected_folder(&found).map_err(cannot)? {
-        return Ok(found);
+/// The stages folder `name`, whose path is `path`, readied beneath the held root `root` and held without delete
+/// sharing: made new with the security `security`, so it is never seen with any other, when nothing has the name;
+/// else the folder there adopted ([`adopted`]), so two puts that make it at once share it. Else why not.
+fn stages_folder(root: &File, path: &Path, name: &str, security: &Descriptor) -> Result<File, String> {
+    match gate_win32::make_folder_beneath(root, name, STAGES_ACCESS, Share::NoDelete, security) {
+        Ok(made) => Ok(made),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => adopted(root, path, name),
+        Err(error) => Err(format!("cannot ready {}: {error}", path.display())),
     }
-    drop(found);
-    let replace = |error: io::Error| format!("cannot replace {}, which another account made: {error}", path.display());
-    let other = gate_win32::open_beneath_as(root, STAGES, FILE_READ_ATTRIBUTES | DELETE, Share::NoDelete, Make::Open).map_err(replace)?;
-    gate_win32::delete_tree_opened(&other).map_err(replace)?;
-    drop(other);
-    gate_win32::open_beneath_as(root, STAGES, STAGES_ACCESS, Share::NoDelete, Make::NewFolder).map_err(replace)
+}
+
+/// The stages folder `name` already at `path` beneath the held root `root`, adopted: opened as itself with no more
+/// access than lists it and reads its security ([`STAGES_ACCESS`]), and kept, as [`stages_folder`] holds it, only when
+/// it is a folder of its own whose owner, DACL and label are those this box makes its folders with
+/// ([`gate_win32::is_protected_folder`]), read through that same handle. Anything else at the name is another
+/// account's, one the box may not open included, and is refused: never walked, emptied or replaced, since another
+/// account may have filled it. Else why not.
+fn adopted(root: &File, path: &Path, name: &str) -> Result<File, String> {
+    let foreign = || {
+        format!(
+            "cannot use {}: another account made it; remove it, or give it to Administrators",
+            path.display()
+        )
+    };
+    let cannot = |error: io::Error| format!("cannot ready {}: {error}", path.display());
+    let found = match gate_win32::open_beneath_as(root, name, STAGES_ACCESS, Share::NoDelete, Make::Open) {
+        Ok(found) => found,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Err(foreign()),
+        Err(error) => return Err(cannot(error)),
+    };
+    if is_folder_itself(&found).map_err(cannot)? && gate_win32::is_protected_folder(&found).map_err(cannot)? {
+        Ok(found)
+    } else {
+        Err(foreign())
+    }
 }
 
 /// Whether the stage's path names the held stage itself: the folder it opens, through whatever links are on its way,
@@ -801,7 +819,9 @@ fn installed(asked: &Asked<'_>, sent: &Sent, staged: (&File, &[Entry]), work: &F
         };
         now.files.insert(ordinal_upper(&entry.path), copy);
     }
-    finished(asked.work, work, sent, &record, now)?;
+    if let Some(line) = finished(asked.work, work, sent, &record, now)? {
+        console.err(&line);
+    }
     Ok(entries.len())
 }
 
@@ -822,7 +842,7 @@ fn unsealed(work: &str, record: &Record) -> Result<(), String> {
 /// that no file of `now` replaces and that is still there (a kept copy gone from its path leaves the record and the
 /// exclude file); fails, the record written with no digest, when a file of the manifest is still missing; else
 /// rewrites the exclude file and, last, writes the record with the manifest's digest. Else why not.
-fn finished(work_path: &str, work: &File, sent: &Sent, record: &Record, mut now: Record) -> Result<(), String> {
+fn finished(work_path: &str, work: &File, sent: &Sent, record: &Record, mut now: Record) -> Result<Option<String>, String> {
     present(work, &sent.manifest, record, &mut now);
     now.kept.extend(record.kept.clone());
     now.kept.retain(|key, _| !now.files.contains_key(key));
@@ -846,9 +866,10 @@ fn finished(work_path: &str, work: &File, sent: &Sent, record: &Record, mut now:
             Ok(None) => format!("{path} is missing after the install"),
         });
     }
-    write_exclude(work, work_path, &now)?;
+    let moved_aside = write_exclude(work, work_path, &now)?;
     now.digest.clone_from(&sent.digest);
-    write_record(work_path, &now)
+    write_record(work_path, &now)?;
+    Ok(moved_aside)
 }
 
 /// Whether the manifest holds the member `entry` with its size and SHA-256; else the refusal naming it.
@@ -987,8 +1008,9 @@ fn present(work: &File, manifest: &Manifest, record: &Record, now: &mut Record) 
 /// Rewrites the tree's `.git\info\exclude` from `record`: one line per recorded path, installed or kept, as a literal pattern, anchored
 /// with a leading `/` and each glob character escaped. The `.git` must be a folder of its own, opened beneath the held
 /// work folder `work`, whose path is `work_path`; `.git\info` is made a folder of its own beneath it ([`info_folder`]),
-/// and the file written beneath that ([`preflight::written_beneath`]), so no link there is followed. Else why not.
-fn write_exclude(work: &File, work_path: &str, record: &Record) -> Result<(), String> {
+/// and the file written beneath that ([`preflight::written_beneath`]), so no link there is followed; the line saying
+/// where a folder at the file's name was moved aside, when one was ([`preflight::moved_aside_line`]). Else why not.
+fn write_exclude(work: &File, work_path: &str, record: &Record) -> Result<Option<String>, String> {
     let git_path = Path::new(work_path).join(".git");
     let not_own = || format!("{} is not a folder of its own", git_path.display());
     let git = gate_win32::open_beneath(work, ".git", Share::NoDelete).map_err(|_| not_own())?;
@@ -1002,7 +1024,10 @@ fn write_exclude(work: &File, work_path: &str, record: &Record) -> Result<(), St
         text.push_str(&literal_pattern(path));
         text.push('\n');
     }
-    preflight::written_beneath(&info, "exclude", &text).map_err(|why| format!("cannot write {}: {why}", info_path.join("exclude").display()))
+    let exclude = info_path.join("exclude");
+    preflight::written_beneath(&info, "exclude", &text)
+        .map(|moved| moved.map(|moved| preflight::moved_aside_line(&exclude, &moved)))
+        .map_err(|why| format!("cannot write {}: {why}", exclude.display()))
 }
 
 /// The folder `info` beneath the held `.git` folder `git`, held without delete sharing: a link, a junction or a file
@@ -1042,10 +1067,10 @@ mod tests {
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
 
-    use gate_win32::{Share, is_protected_folder, same_file};
-    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL, WRITE_DAC};
+    use gate_win32::{Descriptor, Share, file_id, make_folder_beneath, protected_descriptor, same_file, token_facts};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ};
 
-    use super::{Asked, Copy, Record, Stage, Stamp, Step, made_stage, moved_in, removed_stage, same_stage, swept};
+    use super::{Asked, Copy, Record, STAGES_ACCESS, Stage, Stamp, Step, made_stage, moved_in, removed_stage, same_stage, stages_name, swept};
     use crate::boxside::payload::ordinal_upper;
     use crate::boxside::preflight::written_beneath;
     use crate::console::Console;
@@ -1104,6 +1129,35 @@ mod tests {
         fs::create_dir_all(&made).expect("the folder can be made");
         fs::write(made.join("keep.txt"), "keep").expect("the file can be written");
         made
+    }
+
+    /// The stages folder this box, elevated or not, uses below `root`.
+    fn stages_path(root: &Path) -> PathBuf {
+        root.join(stages_name(token_facts().expect("this process's token can be read").elevated))
+    }
+
+    /// The volume and file id of the file `path`.
+    fn id_of(path: &Path) -> (u64, [u8; 16]) {
+        file_id(&File::open(path).expect("the file can be opened")).expect("its id can be read")
+    }
+
+    /// A folder planted at this box's stages name below `root`, made with the security `sddl` names, holding `a.txt`:
+    /// the path of that file.
+    fn planted_stages(root: &Path, sddl: &str) -> PathBuf {
+        fs::create_dir_all(root).expect("the root can be made");
+        let descriptor = Descriptor::from_sddl(sddl).expect("the SDDL names a descriptor");
+        let name = stages_name(token_facts().expect("this process's token can be read").elevated);
+        drop(make_folder_beneath(&held(root), name, FILE_GENERIC_READ, Share::All, &descriptor).expect("the folder can be planted"));
+        let planted = stages_path(root).join("a.txt");
+        fs::write(&planted, "a").expect("a file in it can be written");
+        planted
+    }
+
+    /// The owner of this box's folders, and this process's user and integrity level, as SDDL spells them.
+    fn sddl_facts() -> (String, String, u32) {
+        let facts = token_facts().expect("this process's token can be read");
+        let owner = if facts.elevated { "BA".to_owned() } else { facts.user.clone() };
+        (owner, facts.user, facts.integrity)
     }
 
     #[test]
@@ -1189,48 +1243,117 @@ mod tests {
     }
 
     #[test]
-    fn a_stages_folder_another_account_made_is_replaced_and_one_the_box_made_is_adopted() {
-        let folder = folder("stages-planted");
+    fn a_foreign_stages_folder_is_refused_and_nothing_in_it_is_deleted() {
+        let folder = folder("stages-foreign");
         let root = folder.join("root");
-        let stages = root.join("inputs-stage");
+        let stages = stages_path(&root);
         fs::create_dir_all(stages.join(r"old\deep")).expect("the planted folder can be made");
-        fs::write(stages.join(r"old\deep\a.txt"), "a").expect("a file in it can be written");
-        // The planter keeps a handle that may rewrite the folder's DACL.
-        let planted = OpenOptions::new()
-            .access_mode(READ_CONTROL | WRITE_DAC)
-            .share_mode(Share::All.mode())
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(&stages)
-            .expect("the planted folder can be held");
-        assert!(
-            !is_protected_folder(&planted).expect("its security can be read"),
-            "the planted DACL is another"
-        );
+        let planted = stages.join(r"old\deep\a.txt");
+        fs::write(&planted, "a").expect("a file in it can be written");
+        let id = id_of(&planted);
         let (root_text, work_text) = (text(&root), text(&root.join(r"work\k")));
 
-        let stage = made_stage(&put_asked(&root_text, &work_text), &mut Console::new()).expect("the planted folder is replaced");
+        let made = made_stage(&put_asked(&root_text, &work_text), &mut Console::new());
 
-        assert!(
-            !same_file(&planted, &stage.stages).expect("the ids can be read"),
-            "a new folder, the old handle reaches it not"
+        let why = made.map(drop).expect_err("the planted folder is refused");
+        assert_eq!(
+            why,
+            format!(
+                "cannot use {}: another account made it; remove it, or give it to Administrators",
+                stages.display()
+            )
         );
-        assert!(
-            is_protected_folder(&stage.stages).expect("its security can be read"),
-            "the new folder is protected"
-        );
-        assert!(!stages.join("old").exists(), "the planted folder's contents are gone");
-        let replaced = held(&stages);
+        assert_eq!(id_of(&planted), id, "the planted file survives as itself");
+        assert_eq!(entries(&stages), 1, "nothing is made in the planted folder");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_stages_folder_another_put_just_made_is_adopted() {
+        let folder = folder("stages-concurrent");
+        let root = folder.join("root");
+        fs::create_dir_all(&root).expect("the root can be made");
+        let facts = token_facts().expect("this process's token can be read");
+        let security = protected_descriptor(&facts).expect("the box's security can be made");
+        let root_held = held(&root);
+        let other_put = make_folder_beneath(&root_held, stages_name(facts.elevated), STAGES_ACCESS, Share::NoDelete, &security)
+            .expect("the other put makes the stages folder");
+        let (root_text, work_text) = (text(&root), text(&root.join(r"work\k")));
+
+        let stage = made_stage(&put_asked(&root_text, &work_text), &mut Console::new()).expect("the folder the other put made is adopted");
+
+        assert!(same_file(&other_put, &stage.stages).expect("the ids can be read"), "the same folder");
         removed_stage(&stage).expect("the stage is removed");
-        drop((stage, planted));
+        drop((stage, other_put, root_held));
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
 
-        let again = made_stage(&put_asked(&root_text, &work_text), &mut Console::new()).expect("the box's own folder is adopted");
+    #[test]
+    fn a_folder_with_the_box_dacl_but_no_label_is_not_adopted() {
+        let folder = folder("stages-unlabelled");
+        let root = folder.join("root");
+        let (owner, user, _) = sddl_facts();
+        let planted = planted_stages(&root, &format!("O:{owner}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})"));
+        let id = id_of(&planted);
+        let (root_text, work_text) = (text(&root), text(&root.join(r"work\k")));
 
-        assert!(
-            same_file(&replaced, &again.stages).expect("the ids can be read"),
-            "the box's own folder is kept"
+        let made = made_stage(&put_asked(&root_text, &work_text), &mut Console::new());
+
+        let why = made.map(drop).expect_err("the unlabelled folder is refused");
+        assert!(why.contains("another account made it"), "{why}");
+        assert_eq!(id_of(&planted), id, "the planted file survives as itself");
+        assert_eq!(entries(&stages_path(&root)), 1, "nothing is made in the planted folder");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_folder_denying_the_box_write_dac_is_refused_as_foreign() {
+        let folder = folder("stages-denying");
+        let root = folder.join("root");
+        let (owner, user, integrity) = sddl_facts();
+        let planted = planted_stages(
+            &root,
+            &format!("O:{owner}D:P(D;;WD;;;{user})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})S:(ML;OICI;NW;;;S-1-16-{integrity})"),
         );
-        removed_stage(&again).expect("the stage is removed");
-        drop((again, replaced));
+        let id = id_of(&planted);
+        let (root_text, work_text) = (text(&root), text(&root.join(r"work\k")));
+
+        let made = made_stage(&put_asked(&root_text, &work_text), &mut Console::new());
+
+        let why = made.map(drop).expect_err("the denying folder is refused");
+        assert!(why.contains("another account made it"), "{why}");
+        assert_eq!(id_of(&planted), id, "the planted file survives as itself");
+        assert_eq!(entries(&stages_path(&root)), 1, "nothing is made in the planted folder");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    /// Elevated, the planted `inputs-stage` is this box's own name, so the put refuses it as another account's; either
+    /// way the planted folder is left as it is.
+    #[test]
+    fn an_unelevated_put_leaves_the_elevated_stages_folder_alone() {
+        assert_eq!(stages_name(true), "inputs-stage");
+        assert_eq!(stages_name(false), "inputs-stage-medium");
+        let folder = folder("stages-unelevated");
+        let root = folder.join("root");
+        let elevated = root.join("inputs-stage");
+        fs::create_dir_all(&elevated).expect("the planted folder can be made");
+        let planted = elevated.join("a.txt");
+        fs::write(&planted, "a").expect("a file in it can be written");
+        let id = id_of(&planted);
+        let (root_text, work_text) = (text(&root), text(&root.join(r"work\k")));
+
+        let made = made_stage(&put_asked(&root_text, &work_text), &mut Console::new());
+
+        if token_facts().expect("this process's token can be read").elevated {
+            made.map(drop).expect_err("the planted folder is refused");
+        } else {
+            let stage = made.expect("the put has a stages folder of its own");
+            assert!(root.join("inputs-stage-medium").is_dir(), "the unelevated box's own folder");
+            removed_stage(&stage).expect("the stage is removed");
+            drop(stage);
+        }
+        assert_eq!(id_of(&planted), id, "the planted file survives as itself");
+        assert_eq!(entries(&elevated), 1, "nothing is made in the planted folder");
         fs::remove_dir_all(&folder).expect("the folder can be removed");
     }
 
@@ -1258,24 +1381,34 @@ mod tests {
     }
 
     #[test]
-    fn written_beneath_writes_in_the_held_folder_after_a_junction_takes_its_name() {
+    fn written_beneath_moves_a_folder_at_the_name_aside() {
         let folder = folder("written-beneath");
         let (info, outside) = (folder.join("info"), folder.join("outside"));
         fs::create_dir_all(info.join(r"exclude\inner")).expect("a folder can take the file's name");
-        fs::write(info.join(r"exclude\inner\a.txt"), "a").expect("a file in it can be written");
+        let inner = info.join(r"exclude\inner\a.txt");
+        fs::write(&inner, "a").expect("a file in it can be written");
+        let id = id_of(&inner);
+        fs::create_dir(info.join("exclude.gate-moved-1")).expect("a folder can take the first moved-aside name");
         fs::create_dir_all(outside.join("exclude")).expect("the outside folder can be made");
         fs::write(outside.join(r"exclude\keep.txt"), "keep").expect("the outside file can be written");
         let info_held = held(&info);
-        fs::rename(&info, folder.join("info-away")).expect("the held folder, sharing deletion, can be renamed away");
+        let away = folder.join("info-away");
+        fs::rename(&info, &away).expect("the held folder, sharing deletion, can be renamed away");
         junction(&info, &outside);
 
-        written_beneath(&info_held, "exclude", "/a.txt\n").expect("the file is written");
+        let moved = written_beneath(&info_held, "exclude", "/a.txt\n").expect("the file is written");
 
         drop(info_held);
+        assert_eq!(moved.as_deref(), Some("exclude.gate-moved-2"), "the first free name");
         assert_eq!(
-            fs::read_to_string(folder.join(r"info-away\exclude")).expect("the file is in the held folder"),
+            fs::read_to_string(away.join("exclude")).expect("the file is in the held folder"),
             "/a.txt\n",
-            "the folder at the name is replaced by the file"
+            "the file takes the name"
+        );
+        assert_eq!(
+            id_of(&away.join(r"exclude.gate-moved-2\inner\a.txt")),
+            id,
+            "the folder is moved aside whole, nothing in it deleted"
         );
         assert!(outside.join(r"exclude\keep.txt").exists(), "nothing outside is deleted or written");
         assert_eq!(entries(&outside), 1, "nothing else is made outside");

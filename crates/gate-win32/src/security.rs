@@ -1,6 +1,7 @@
-//! A folder's security set so only SYSTEM, Administrators and this process's user may use it, its owner one of them,
-//! and no process below this one's integrity level may write in it ([`protect_folder`]), and whether a folder's owner
-//! and DACL are those ([`is_protected_folder`]); an open file's DACL and label set back to what its folder hands down
+//! The security a folder of this process's is made with, so that from the instant it exists only SYSTEM, Administrators
+//! and this process's user may use it, its owner one of them, and no process below this one's integrity level may
+//! write in it ([`protected_descriptor`], [`Descriptor`]); whether a folder's owner, DACL and label are those
+//! ([`is_protected_folder`]); an open file's DACL and label set back to what its folder hands down
 //! ([`inherit_security`]), and an open file's DACL and label in their string form ([`security_text`]).
 
 use std::fs::File;
@@ -14,101 +15,103 @@ use windows_sys::Win32::Security::Authorization::{
     SE_FILE_OBJECT, SetSecurityInfo,
 };
 use windows_sys::Win32::Security::{
-    ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetSecurityDescriptorSacl, InitializeAcl,
-    LABEL_SECURITY_INFORMATION, OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    PSID, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, InitializeAcl, LABEL_SECURITY_INFORMATION, OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
-use windows_sys::core::{BOOL, PWSTR};
+use windows_sys::core::PWSTR;
 
-use crate::token::token_facts;
+use crate::token::{TokenFacts, token_facts};
 
-/// The security descriptor of the folder [`protect_folder`] protects, for this process's `user` SID, integrity
-/// relative ID `integrity` and elevation `elevated`: owned by Administrators when elevated and by `user` when not, a
-/// protected DACL granting full control to SYSTEM, Administrators and `user`, handed down to files and folders, and a
-/// label of the integrity level that no lower process may write up past, handed down too.
+/// A security descriptor, as the system holds it, for a file or folder to be made with ([`crate::make_folder_beneath`]):
+/// allocated by the system when made from its string form, and freed when dropped.
+pub struct Descriptor(PSECURITY_DESCRIPTOR);
+
+impl Descriptor {
+    /// The security descriptor the SDDL `sddl` names, such as `O:BAD:P(A;OICI;FA;;;SY)`.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when `sddl` is not a security descriptor's string form.
+    pub fn from_sddl(sddl: &str) -> io::Result<Descriptor> {
+        let wide: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: `wide` is NUL-terminated and outlives the call, and `descriptor` is writable; the size is not asked for.
+        let made =
+            unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(wide.as_ptr(), SDDL_REVISION_1, &raw mut descriptor, ptr::null_mut()) };
+        if made == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Descriptor(descriptor))
+    }
+
+    /// The descriptor as the system takes it, valid while `self` lives.
+    pub(crate) fn as_ptr(&self) -> PSECURITY_DESCRIPTOR {
+        self.0
+    }
+}
+
+impl Drop for Descriptor {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor was allocated by the conversion with `LocalAlloc`, and nothing uses it after this.
+        unsafe { LocalFree(self.0) };
+    }
+}
+
+/// The SDDL of the security a folder of this process's is made with, for this process's `user` SID, integrity relative
+/// ID `integrity` and elevation `elevated`: owned by Administrators when elevated and by `user` when not, a protected
+/// DACL granting full control to SYSTEM, Administrators and `user`, handed down to files and folders, and a label of
+/// the integrity level that no lower process may write up past, handed down too.
 fn protected_sddl(user: &str, integrity: u32, elevated: bool) -> String {
     let owner = if elevated { "BA" } else { user };
     format!("O:{owner}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})S:(ML;OICI;NW;;;S-1-16-{integrity})")
 }
 
-/// Sets the open folder `folder`'s owner to Administrators when this process is elevated and to this process's user
-/// when it is not, so no other user owns it and may rewrite its DACL; its DACL to a protected one granting full
-/// control to SYSTEM, Administrators and this process's user alone; and its mandatory label to this process's
-/// integrity level with no write up, both handed down to whatever is made in it. A process may always label an object
-/// at or below its own level, so no privilege is needed; an elevated process thus keeps the same user's medium
-/// processes from writing in the folder.
+/// The security a folder of the process whose token says `facts` is made with, so that no other account and no lower
+/// process may use it from the instant it exists: its owner Administrators when the process is elevated and the
+/// process's user when it is not, so no other user owns it and may rewrite its DACL; a protected DACL granting full
+/// control to SYSTEM, Administrators and the process's user alone; and a mandatory label of the process's integrity
+/// level with no write up, all handed down to whatever is made in it. A process may always label an object at or
+/// below its own level, so no privilege is needed; an elevated process thus keeps the same user's medium processes
+/// from writing in the folder.
 ///
 /// # Errors
 ///
-/// The system's error when this process's token cannot be read or the handle, which must hold `WRITE_DAC` and
-/// `WRITE_OWNER`, cannot be given the security, its owner included.
-pub fn protect_folder(folder: &File) -> io::Result<()> {
-    let facts = token_facts()?;
-    let descriptor = descriptor_of(&protected_sddl(&facts.user, facts.integrity, facts.elevated))?;
-    let set = set_lists_of(folder, descriptor);
-    // SAFETY: the descriptor was allocated by the conversion with `LocalAlloc`, and nothing uses it after this.
-    unsafe { LocalFree(descriptor) };
-    set
+/// The system's error when the descriptor cannot be made.
+pub fn protected_descriptor(facts: &TokenFacts) -> io::Result<Descriptor> {
+    Descriptor::from_sddl(&protected_sddl(&facts.user, facts.integrity, facts.elevated))
 }
 
-/// Whether the open folder `folder`, opened with `READ_CONTROL`, has the owner and the DACL [`protect_folder`] gives
-/// it: owned by Administrators when this process is elevated and by this process's user when it is not, with the
-/// protected DACL granting full control to SYSTEM, Administrators and this process's user alone. The two are compared
-/// in their string form, each written by the system, the DACL's automatic-inheritance flags left out.
+/// Whether the open folder `folder`, opened with `READ_CONTROL`, has the owner, the DACL and the label
+/// [`protected_descriptor`] gives a folder of this process's: owned by Administrators when this process is elevated and
+/// by this process's user when it is not, with the protected DACL granting full control to SYSTEM, Administrators and
+/// this process's user alone, and the label of this process's integrity level with no write up. The three are compared
+/// in their string form, each written by the system, the automatic-inheritance flags left out.
 ///
 /// # Errors
 ///
 /// The system's error when this process's token or the folder's security cannot be read.
 pub fn is_protected_folder(folder: &File) -> io::Result<bool> {
     let facts = token_facts()?;
-    let what = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
-    let descriptor = descriptor_of(&protected_sddl(&facts.user, facts.integrity, facts.elevated))?;
-    let expected = descriptor_text(descriptor, what);
-    // SAFETY: the descriptor was allocated by the conversion with `LocalAlloc`, and nothing uses it after this.
-    unsafe { LocalFree(descriptor) };
-    Ok(without_auto_inherit(&text_of(folder, what)?) == without_auto_inherit(&expected?))
+    let what = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
+    let expected = descriptor_text(protected_descriptor(&facts)?.as_ptr(), what)?;
+    Ok(without_auto_inherit(&text_of(folder, what)?) == without_auto_inherit(&expected))
 }
 
-/// The SDDL `text` with the DACL's automatic-inheritance flags (`AI`, `AR`) left out, which the system sets on a list
-/// it was given and the descriptor it was given lacks.
+/// The SDDL `text` with the automatic-inheritance flags (`AI`, `AR`) left out of its DACL and its label, which the
+/// system sets on a list it was given and the descriptor it was given lacks.
 fn without_auto_inherit(text: &str) -> String {
-    let Some((owner, rest)) = text.split_once("D:") else {
-        return text.to_owned();
-    };
-    let (flags, entries) = rest.split_at(rest.find('(').unwrap_or(rest.len()));
-    format!("{owner}D:{}{entries}", flags.replace("AI", "").replace("AR", ""))
-}
-
-/// The security descriptor the SDDL `sddl` names, allocated with `LocalAlloc`, for the caller to free with `LocalFree`.
-fn descriptor_of(sddl: &str) -> io::Result<PSECURITY_DESCRIPTOR> {
-    let wide: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
-    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    // SAFETY: `wide` is NUL-terminated and outlives the call, and `descriptor` is writable; the size is not asked for.
-    let made = unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(wide.as_ptr(), SDDL_REVISION_1, &raw mut descriptor, ptr::null_mut()) };
-    if made == 0 {
-        return Err(io::Error::last_os_error());
+    let (before, label) = text.split_once("S:").map_or((text, None), |(before, label)| (before, Some(label)));
+    let (owner, dacl) = before.split_once("D:").map_or((before, None), |(owner, dacl)| (owner, Some(dacl)));
+    let mut stripped = owner.to_owned();
+    for (prefix, list) in [("D:", dacl), ("S:", label)] {
+        if let Some(list) = list {
+            let (flags, entries) = list.split_at(list.find('(').unwrap_or(list.len()));
+            stripped.push_str(prefix);
+            stripped.push_str(&flags.replace("AI", "").replace("AR", ""));
+            stripped.push_str(entries);
+        }
     }
-    Ok(descriptor)
-}
-
-/// Sets the open `file`'s owner, its DACL, protected, and its label from the security descriptor `descriptor`.
-fn set_lists_of(file: &File, descriptor: PSECURITY_DESCRIPTOR) -> io::Result<()> {
-    let (mut present, mut defaulted): (BOOL, BOOL) = (0, 0);
-    let mut owner: PSID = ptr::null_mut();
-    let mut dacl: *mut ACL = ptr::null_mut();
-    let mut sacl: *mut ACL = ptr::null_mut();
-    // SAFETY: `descriptor` is a valid descriptor that outlives the calls, and every out pointer is writable; the owner
-    // and the lists returned point into the descriptor.
-    let read = unsafe {
-        GetSecurityDescriptorOwner(descriptor, &raw mut owner, &raw mut defaulted) != 0
-            && GetSecurityDescriptorDacl(descriptor, &raw mut present, &raw mut dacl, &raw mut defaulted) != 0
-            && GetSecurityDescriptorSacl(descriptor, &raw mut present, &raw mut sacl, &raw mut defaulted) != 0
-    };
-    if !read {
-        return Err(io::Error::last_os_error());
-    }
-    let what = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
-    set_security(file, what, owner, dacl, sacl)
+    stripped
 }
 
 /// Sets the open `file`'s DACL and label back to what its folder hands down, dropping every entry of its own: both set
@@ -202,12 +205,16 @@ mod tests {
     use std::fs::{File, OpenOptions};
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
+    use std::ptr;
 
+    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, OWNER_SECURITY_INFORMATION};
     use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, READ_CONTROL, WRITE_DAC, WRITE_OWNER};
+    use windows_sys::core::BOOL;
 
-    use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
-
-    use super::{inherit_security, protect_folder, security_text, text_of};
+    use super::{
+        Descriptor, inherit_security, is_protected_folder, protected_descriptor, security_text, set_security, text_of, without_auto_inherit,
+    };
+    use crate::file::{Make, Share, make_folder_beneath, open_beneath_as};
     use crate::token::token_facts;
 
     /// A new, empty folder of the test `name`'s own.
@@ -229,6 +236,24 @@ mod tests {
             .expect("the entry can be opened")
     }
 
+    /// The folder `name` made inside the held folder `parent` with this process's protected security, held for reading.
+    fn protected_beneath(parent: &File, name: &str) -> File {
+        let facts = token_facts().expect("this process's token can be read");
+        let descriptor = protected_descriptor(&facts).expect("the descriptor can be made");
+        make_folder_beneath(parent, name, FILE_GENERIC_READ, Share::All, &descriptor).expect("the folder can be made protected")
+    }
+
+    /// Gives the open folder `folder` the DACL the SDDL `sddl` names, as a planter with the right to would.
+    fn set_dacl(folder: &File, sddl: &str) {
+        let descriptor = Descriptor::from_sddl(sddl).expect("the SDDL names a descriptor");
+        let (mut present, mut defaulted): (BOOL, BOOL) = (0, 0);
+        let mut dacl = ptr::null_mut();
+        // SAFETY: the descriptor outlives the calls, every out pointer is writable, and the list returned points into it.
+        let read = unsafe { GetSecurityDescriptorDacl(descriptor.as_ptr(), &raw mut present, &raw mut dacl, &raw mut defaulted) };
+        assert_ne!(read, 0, "the descriptor's DACL can be read");
+        set_security(folder, DACL_SECURITY_INFORMATION, ptr::null_mut(), dacl, ptr::null()).expect("the DACL can be set");
+    }
+
     /// The SDDL alias of the integrity level whose relative ID is `integrity`.
     fn level_alias(integrity: u32) -> String {
         match integrity {
@@ -246,8 +271,8 @@ mod tests {
         let folder = folder("protect");
         let facts = token_facts().expect("this process's token can be read");
 
-        protect_folder(&securable(&folder)).expect("the folder can be protected");
-        let text = security_text(&securable(&folder)).expect("the folder's security can be read");
+        let made = protected_beneath(&securable(&folder), "made");
+        let text = security_text(&made).expect("the folder's security can be read");
 
         let (dacl, label) = text.split_once("S:").expect("the folder has a label");
         assert!(dacl.starts_with("D:P"), "the DACL is protected: {text}");
@@ -255,24 +280,25 @@ mod tests {
         for grant in ["(A;OICI;FA;;;SY)", "(A;OICI;FA;;;BA)", &format!("(A;OICI;FA;;;{})", facts.user)] {
             assert!(dacl.contains(grant), "{grant} in {text}");
         }
-        // `AI` marks a list set with automatic inheritance, as `SetSecurityInfo` sets it.
+        // `AI` marks a list set with automatic inheritance, as the system may mark one it was given at creation.
         assert_eq!(
             label.trim_start_matches("AI"),
             format!("(ML;OICI;NW;;;{})", level_alias(facts.integrity)),
             "{text}"
         );
+        drop(made);
         std::fs::remove_dir_all(&folder).expect("the folder can be removed");
     }
 
     /// Unelevated, a folder this process makes is its user's already, and elevated, Administrators' by default, so this
-    /// case pins the owner after the call but cannot tell a set owner from one kept.
+    /// case pins the owner of a folder made protected but cannot tell a set owner from one kept.
     #[test]
     fn a_protected_folder_is_owned_by_administrators_when_elevated_and_by_this_user_when_not() {
         let folder = folder("owner");
         let facts = token_facts().expect("this process's token can be read");
 
-        protect_folder(&securable(&folder)).expect("the folder can be protected");
-        let owner = text_of(&securable(&folder), OWNER_SECURITY_INFORMATION).expect("the folder's owner can be read");
+        let made = protected_beneath(&securable(&folder), "made");
+        let owner = text_of(&made, OWNER_SECURITY_INFORMATION).expect("the folder's owner can be read");
 
         let expected = if facts.elevated {
             "O:BA".to_owned()
@@ -280,16 +306,79 @@ mod tests {
             format!("O:{}", facts.user)
         };
         assert_eq!(owner, expected, "{facts:?}");
+        drop(made);
         std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_folder_made_protected_is_protected_on_its_first_handle() {
+        let folder = folder("first-handle");
+        let parent = securable(&folder);
+        set_dacl(&parent, "D:(A;OICI;FA;;;WD)");
+        let plain = open_beneath_as(&parent, "plain", FILE_GENERIC_READ, Share::All, Make::NewFolder).expect("a plain folder can be made");
+        assert!(
+            !is_protected_folder(&plain).expect("its security can be read"),
+            "the parent hands Everyone's grant down to a folder made without a descriptor: {}",
+            security_text(&plain).expect("its security can be read")
+        );
+
+        let made = protected_beneath(&parent, "made");
+
+        let text = security_text(&made).expect("the folder's security can be read through its first handle");
+        assert!(is_protected_folder(&made).expect("its security can be read"), "{text}");
+        assert!(!text.contains(";WD)"), "no grant to Everyone is inherited: {text}");
+        drop((made, plain, parent));
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_folder_with_the_box_dacl_but_no_label_or_another_dacl_is_not_protected() {
+        let folder = folder("not-protected");
+        let parent = securable(&folder);
+        let facts = token_facts().expect("this process's token can be read");
+        let owner = if facts.elevated { "BA".to_owned() } else { facts.user.clone() };
+        let unlabelled = Descriptor::from_sddl(&format!("O:{owner}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{})", facts.user))
+            .expect("the SDDL names a descriptor");
+        let everyone = Descriptor::from_sddl(&format!("O:{owner}D:P(A;OICI;FA;;;WD)S:(ML;OICI;NW;;;S-1-16-{})", facts.integrity))
+            .expect("the SDDL names a descriptor");
+
+        let no_label = make_folder_beneath(&parent, "no-label", FILE_GENERIC_READ, Share::All, &unlabelled).expect("the folder can be made");
+        let other_dacl = make_folder_beneath(&parent, "other-dacl", FILE_GENERIC_READ, Share::All, &everyone).expect("the folder can be made");
+        let protected = protected_beneath(&parent, "protected");
+
+        assert!(
+            !is_protected_folder(&no_label).expect("its security can be read"),
+            "the box's DACL without its label"
+        );
+        assert!(
+            !is_protected_folder(&other_dacl).expect("its security can be read"),
+            "the box's label without its DACL"
+        );
+        assert!(is_protected_folder(&protected).expect("its security can be read"), "both");
+        drop((no_label, other_dacl, protected, parent));
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn the_automatic_inheritance_flags_are_left_out_of_the_dacl_and_the_label() {
+        assert_eq!(
+            without_auto_inherit("O:BAD:PAI(A;OICI;FA;;;SY)S:AI(ML;OICI;NW;;;HI)"),
+            "O:BAD:P(A;OICI;FA;;;SY)S:(ML;OICI;NW;;;HI)"
+        );
+        assert_eq!(
+            without_auto_inherit("O:BAD:P(A;OICI;FA;;;SY)S:(ML;OICI;NW;;;HI)"),
+            "O:BAD:P(A;OICI;FA;;;SY)S:(ML;OICI;NW;;;HI)"
+        );
+        assert_eq!(without_auto_inherit("O:BAD:AI(A;OICI;FA;;;SY)"), "O:BAD:(A;OICI;FA;;;SY)");
+        assert_eq!(without_auto_inherit("O:BA"), "O:BA");
     }
 
     #[test]
     fn a_file_moved_out_of_a_protected_folder_takes_its_new_folder_s_security_once_reset() {
         let folder = folder("inherit");
         let (protected, plain) = (folder.join("protected"), folder.join("plain"));
-        std::fs::create_dir(&protected).expect("the folder can be made");
+        drop(protected_beneath(&securable(&folder), "protected"));
         std::fs::create_dir(&plain).expect("the folder can be made");
-        protect_folder(&securable(&protected)).expect("the folder can be protected");
         std::fs::write(protected.join("a.txt"), "a").expect("the file can be written");
         std::fs::write(plain.join("fresh.txt"), "fresh").expect("the file can be written");
         std::fs::rename(protected.join("a.txt"), plain.join("a.txt")).expect("the file can be moved");

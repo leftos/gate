@@ -34,9 +34,20 @@ fn a_tree_thousands_of_folders_deep_is_deleted_without_overflowing_the_stack() {
     open_beneath_as(&level, "leaf.txt", FILE_GENERIC_READ, Share::All, Make::NewFile).expect("the leaf file is made");
     drop(level);
 
-    delete_tree_opened(&held).expect("the whole tree is deleted");
+    // A thread of 64 KiB of stack, which a walk recursing once per level would overflow in a few hundred levels.
+    let deleted = std::thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            let deleted = delete_tree_opened(&held);
+            drop(held);
+            deleted
+        })
+        .expect("the thread starts")
+        .join()
+        .expect("the walk neither panics nor overflows its stack");
+    deleted.expect("the whole tree is deleted");
 
-    drop(held);
+    assert!(!top.exists(), "the top folder is deleted with everything in it");
     assert!(!top.exists(), "the top folder is deleted with everything in it");
     std::fs::remove_dir_all(&dir).expect("the folder can be removed");
 }

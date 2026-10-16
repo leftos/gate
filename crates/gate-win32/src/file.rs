@@ -1,5 +1,6 @@
 //! File calls the standard library does not make: a rename that never replaces the file its target names, an open of
-//! a name inside an open folder, a listing and a tree delete through an open folder's handle, an open that reads an
+//! a name inside an open folder, a folder made there with the security it is to have from the instant it exists, a
+//! listing and a tree delete through an open folder's handle, an open that reads an
 //! open file through its reparse point's filter, an open file's id, whether two open files are one, and whether an open
 //! file is on a network volume ([`on_network_volume`]).
 
@@ -27,6 +28,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     FileRemoteProtocolInfo, GetFileInformationByHandleEx, MoveFileExW, ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+use crate::security::Descriptor;
 
 /// Opens `name`, one file or folder name, inside the open folder `folder` for reading, as itself: a link or a junction
 /// so named is opened as the link, not followed. The name is looked up in the folder the handle holds, whatever its
@@ -67,12 +70,61 @@ pub enum Make {
 pub fn open_beneath_as(folder: &File, name: &str, access: u32, share: Share, make: Make) -> io::Result<File> {
     one_name(name)?;
     let wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
-    open_wide(folder, &wide, access, share, make)
+    open_wide(
+        folder,
+        &wide,
+        Opening {
+            access,
+            share,
+            make,
+            security: None,
+        },
+    )
+}
+
+/// Makes a new folder `name`, one name, inside the open folder `folder` with the security `security` names, its owner,
+/// DACL and label included, so the folder is never seen with any other security, not even the one its folder hands
+/// down; opened with the access `access` (plus `SYNCHRONIZE`), sharing what `share` says.
+///
+/// # Errors
+///
+/// As [`open_beneath_as`]'s with [`Make::NewFolder`]: an error of kind [`io::ErrorKind::AlreadyExists`] when anything
+/// has the name, and the system's error when the folder cannot be made with that security, such as access denied for
+/// an owner this process may not set.
+pub fn make_folder_beneath(folder: &File, name: &str, access: u32, share: Share, security: &Descriptor) -> io::Result<File> {
+    one_name(name)?;
+    let wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+    open_wide(
+        folder,
+        &wide,
+        Opening {
+            access,
+            share,
+            make: Make::NewFolder,
+            security: Some(security),
+        },
+    )
+}
+
+/// How [`open_wide`] opens or makes its name: with what access (plus `SYNCHRONIZE`), sharing what, making what, and
+/// the security a new file or folder is made with, none for what its folder hands down.
+#[derive(Clone, Copy)]
+struct Opening<'a> {
+    access: u32,
+    share: Share,
+    make: Make,
+    security: Option<&'a Descriptor>,
 }
 
 /// [`open_beneath_as`] of the UTF-16 `name`, which is taken as it is, unchecked: one name a listing gave, or none at
 /// all, which opens `folder` itself again.
-fn open_wide(folder: &File, name: &[u16], access: u32, share: Share, make: Make) -> io::Result<File> {
+fn open_wide(folder: &File, name: &[u16], opening: Opening<'_>) -> io::Result<File> {
+    let Opening {
+        access,
+        share,
+        make,
+        security,
+    } = opening;
     let (disposition, options) = match make {
         Make::Open => (FILE_OPEN, 0),
         Make::NewFile => (FILE_CREATE, FILE_NON_DIRECTORY_FILE),
@@ -91,14 +143,14 @@ fn open_wide(folder: &File, name: &[u16], access: u32, share: Share, make: Make)
         RootDirectory: folder.as_raw_handle(),
         ObjectName: &raw const object_name,
         Attributes: OBJ_CASE_INSENSITIVE,
-        SecurityDescriptor: ptr::null(),
+        SecurityDescriptor: security.map_or(ptr::null(), |security| security.as_ptr().cast_const().cast()),
         SecurityQualityOfService: ptr::null(),
     };
     let mut handle = ptr::null_mut();
     let mut status_block = IO_STATUS_BLOCK::default();
-    // SAFETY: the name's buffer, the attributes and the status block outlive the call, the attributes' root is the
-    // open handle `folder` owns, and `handle` is writable; synchronous I/O and `SYNCHRONIZE` make a handle std reads
-    // from and writes to as to any other.
+    // SAFETY: the name's buffer, the attributes, the security descriptor (if any, borrowed for the call) and the status
+    // block outlive the call, the attributes' root is the open handle `folder` owns, and `handle` is writable;
+    // synchronous I/O and `SYNCHRONIZE` make a handle std reads from and writes to as to any other.
     let status = unsafe {
         NtCreateFile(
             &raw mut handle,
@@ -329,7 +381,13 @@ struct Level {
 /// delete sharing; `None` when it is gone. Else the error, naming the entry.
 fn opened_entry(parent: &File, name: &OsStr) -> io::Result<Option<File>> {
     let wide: Vec<u16> = name.encode_wide().collect();
-    match open_wide(parent, &wide, DELETE | FILE_READ_ATTRIBUTES, Share::NoDelete, Make::Open) {
+    let opening = Opening {
+        access: DELETE | FILE_READ_ATTRIBUTES,
+        share: Share::NoDelete,
+        make: Make::Open,
+        security: None,
+    };
+    match open_wide(parent, &wide, opening) {
         Ok(entry) => Ok(Some(entry)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(named(name, &error)),
@@ -339,7 +397,13 @@ fn opened_entry(parent: &File, name: &OsStr) -> io::Result<Option<File>> {
 /// The names in the open folder `folder`, listed through a second handle of it with list access alone, closed once
 /// listed.
 fn listed(folder: &File) -> io::Result<Vec<OsString>> {
-    names_beneath(&open_wide(folder, &[], FILE_LIST_DIRECTORY, Share::All, Make::Open)?)
+    let opening = Opening {
+        access: FILE_LIST_DIRECTORY,
+        share: Share::All,
+        make: Make::Open,
+        security: None,
+    };
+    names_beneath(&open_wide(folder, &[], opening)?)
 }
 
 /// Whether the open `file` is a folder of its own: a folder, and no reparse point.

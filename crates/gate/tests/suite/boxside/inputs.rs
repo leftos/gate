@@ -158,13 +158,20 @@ fn work(payload: &Value) -> &Path {
     Path::new(field(payload, "Work"))
 }
 
+/// The stages folder below `root` of a box run by this suite's process: `inputs-stage` when it is elevated,
+/// `inputs-stage-medium` when it is not, as the box chooses it.
+fn stages_folder(root: &Path) -> PathBuf {
+    let elevated = gate_win32::token_facts().expect("this process's token can be read").elevated;
+    root.join(if elevated { "inputs-stage" } else { "inputs-stage-medium" })
+}
+
 /// The stages folder of `payload`'s box root, which holds nothing once a put has ended.
 fn stages_left(payload: &Value) -> Vec<String> {
     let root = work(payload)
         .parent()
         .and_then(Path::parent)
         .expect("the work folder is <root>\\work\\<key>");
-    match fs::read_dir(root.join("inputs-stage")) {
+    match fs::read_dir(stages_folder(root)) {
         Ok(entries) => entries
             .map(|entry| entry.expect("an entry").file_name().to_string_lossy().into_owned())
             .collect(),
@@ -603,7 +610,7 @@ fn the_stages_folder_keeps_lower_processes_out_and_a_moved_input_takes_its_folde
     put_all(&case, &payload, &[DATA]);
     let facts = gate_win32::token_facts().expect("this process's token can be read");
 
-    let stages = security_of(&work(&payload).parent().and_then(Path::parent).expect("a root").join("inputs-stage"));
+    let stages = security_of(&stages_folder(work(&payload).parent().and_then(Path::parent).expect("a root")));
     let (dacl, label) = stages.split_once("S:").expect("the stages folder has a label");
     assert!(dacl.starts_with("D:P"), "the DACL is protected: {stages}");
     assert_eq!(dacl.matches("(A;").count(), 3, "three grants and no more: {stages}");
@@ -835,7 +842,7 @@ fn a_put_removes_a_stage_older_than_a_day_and_keeps_a_fresh_one() {
     let case = Case::new("box_inputs_old_stages");
     let payload = inputs_payload(&case, "put");
     put_all(&case, &payload, &[DATA]);
-    let stages = work(&payload).parent().and_then(Path::parent).expect("a root").join("inputs-stage");
+    let stages = stages_folder(work(&payload).parent().and_then(Path::parent).expect("a root"));
     let (old, fresh) = (
         stages.join(format!("k-{}", "0".repeat(32))),
         stages.join(format!("other-{}", "1".repeat(32))),

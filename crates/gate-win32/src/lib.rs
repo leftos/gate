@@ -53,10 +53,10 @@ pub fn check_plain_file(file: &std::fs::File) -> io::Result<()> {
     launch::check_plain_file(file.as_raw_handle())
 }
 pub use file::{
-    Make, Share, delete_opened, delete_tree_opened, file_id, move_no_replace, names_beneath, on_network_volume, open_beneath, open_beneath_as,
-    rename_beneath, reopen_through_filter, same_file,
+    Make, Share, delete_opened, delete_tree_opened, file_id, make_folder_beneath, move_no_replace, names_beneath, on_network_volume, open_beneath,
+    open_beneath_as, rename_beneath, reopen_through_filter, same_file,
 };
-pub use security::{inherit_security, is_protected_folder, protect_folder, security_text};
+pub use security::{Descriptor, inherit_security, is_protected_folder, protected_descriptor, security_text};
 pub use tree::{Membership, OpenedJob, StoppableProcess, WaitableProcess};
 
 pub use priority::{Priority, priority_of, set_priority};

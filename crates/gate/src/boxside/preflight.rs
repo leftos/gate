@@ -14,7 +14,7 @@ use std::time::Duration;
 use gate_args::BoxSeams;
 use gate_win32::{Make, Share};
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
 };
 
 use crate::answer::USAGE_STATUS;
@@ -255,7 +255,10 @@ pub(super) fn ready_tree(git: &impl TreeGit, bare: &str, tree: &str, name: Optio
         let args = [git_dir, work_tree, "config", setting, value];
         tree_step(git, &format!("git config {setting}"), name, &args, console)?;
     }
-    write_alternates(bare, tree, git.holds_the_lock()).map_err(Unready::Folder)
+    if let Some(line) = write_alternates(bare, tree, git.holds_the_lock()).map_err(Unready::Folder)? {
+        console.err(&line);
+    }
+    Ok(())
 }
 
 /// Runs the git step `step` with `args` through `git`, named for the repo `name` on a pair run ([`for_repo`]), its
@@ -355,9 +358,9 @@ fn repair_git(tree: &str) -> Result<(), String> {
 
 /// Writes `<bare with / separators>/objects` and LF, UTF-8 without a BOM, as the tree's alternates file unless it
 /// already holds exactly that, every name read without following a link. The folders `.git\objects` and
-/// `.git\objects\info` are made when missing ([`made_folder`]), and the file written ([`written`]). Else why not:
-/// `could not write {file}: ` and the reason.
-fn write_alternates(bare: &str, tree: &str, repair: bool) -> Result<(), String> {
+/// `.git\objects\info` are made when missing ([`made_folder`]), and the file written ([`written`]), the line saying
+/// where a folder at its name was moved aside, if one was. Else why not: `could not write {file}: ` and the reason.
+fn write_alternates(bare: &str, tree: &str, repair: bool) -> Result<Option<String>, String> {
     let objects = Path::new(tree).join(".git").join("objects");
     let info = objects.join("info");
     let alternates = info.join("alternates");
@@ -383,9 +386,10 @@ pub(super) fn made_folder(folder: &Path, repair: bool) -> Result<(), String> {
 }
 
 /// Writes `text` as the file `file` unless it already holds exactly that, its folder opened as itself and held, and the
-/// file read, removed and made beneath that handle ([`written_beneath`]). Else why not, a folder that is a link, a
-/// junction or not a folder refused.
-pub(super) fn written(file: &Path, text: &str) -> Result<(), String> {
+/// file read, removed and made beneath that handle ([`written_beneath`]); the line saying where a folder at the name
+/// was moved aside, when one was ([`moved_aside_line`]). Else why not, a folder that is a link, a junction or not a
+/// folder refused.
+pub(super) fn written(file: &Path, text: &str) -> Result<Option<String>, String> {
     let (Some(parent), Some(name)) = (file.parent(), file.file_name().and_then(|name| name.to_str())) else {
         return Err(format!("{} names no file in a folder", file.display()));
     };
@@ -398,7 +402,16 @@ pub(super) fn written(file: &Path, text: &str) -> Result<(), String> {
     if !is_folder_itself(&folder).map_err(|error| error.to_string())? {
         return Err(format!("{} is a link, a junction or not a folder", parent.display()));
     }
-    written_beneath(&folder, name, text)
+    Ok(written_beneath(&folder, name, text)?.map(|moved| moved_aside_line(file, &moved)))
+}
+
+/// The line saying the folder that was at the path `file` is now `moved`, one name, beside it.
+pub(super) fn moved_aside_line(file: &Path, moved: &str) -> String {
+    format!(
+        "gate: remote moved aside the folder {} to {}",
+        file.display(),
+        file.with_file_name(moved).display()
+    )
 }
 
 /// Whether the open `opened` is a folder itself: a folder, not a link or a junction.
@@ -408,39 +421,76 @@ pub(super) fn is_folder_itself(opened: &File) -> io::Result<bool> {
 }
 
 /// Writes `text` as the file `name` in the held folder `folder` unless it already holds exactly that: whatever is at the
-/// name opened as itself beneath the handle, never followed; a plain file of other bytes, a link, a junction or
-/// anything else deleted as itself (a folder of its own emptied beneath its handle first,
-/// [`gate_win32::delete_tree_opened`]), and a new file made beneath the handle, refused when anything took the name
-/// meanwhile. Else why not.
-pub(super) fn written_beneath(folder: &File, name: &str, text: &str) -> Result<(), String> {
-    match gate_win32::open_beneath_as(folder, name, FILE_GENERIC_READ | DELETE, Share::All, Make::Open) {
-        Ok(found) => {
-            if holds_already(found, text)? {
-                return Ok(());
-            }
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+/// name opened as itself beneath the handle, never followed; a folder of its own, which another account may have
+/// filled, moved aside beneath the handle to `{name}.gate-moved-{n}` for the first free `n` and never walked
+/// ([`moved_aside`]); a plain file of other bytes, a link, a junction or anything else deleted as itself; and a new
+/// file made beneath the handle, refused when anything took the name meanwhile. The name a folder was moved aside to,
+/// when one was. Else why not.
+pub(super) fn written_beneath(folder: &File, name: &str, text: &str) -> Result<Option<String>, String> {
+    let moved = match gate_win32::open_beneath_as(folder, name, FILE_GENERIC_READ | DELETE, Share::All, Make::Open) {
+        Ok(found) => match found_at_name(folder, name, found, text)? {
+            Found::Holds => return Ok(None),
+            Found::Deleted => None,
+            Found::MovedAside(moved) => Some(moved),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.to_string()),
-    }
+    };
     let mut made =
         gate_win32::open_beneath_as(folder, name, FILE_GENERIC_WRITE, Share::NoDelete, Make::NewFile).map_err(|error| error.to_string())?;
-    made.write_all(text.as_bytes()).map_err(|error| error.to_string())
+    made.write_all(text.as_bytes()).map_err(|error| error.to_string())?;
+    Ok(moved)
 }
 
-/// Whether `found`, an entry opened as itself with `DELETE` access, is a plain file holding exactly `text`; anything
-/// else is deleted as itself, through its handle, a folder of its own emptied beneath that handle first. Else why it
-/// could not be deleted.
-fn holds_already(mut found: File, text: &str) -> Result<bool, String> {
+/// What [`written_beneath`] found at its name, and did with it.
+enum Found {
+    /// A plain file holding exactly the text, left as it is.
+    Holds,
+    /// Anything else but a folder of its own, deleted as itself through its handle.
+    Deleted,
+    /// A folder of its own, moved aside to this name beside it.
+    MovedAside(String),
+}
+
+/// Whether `found`, the entry `name` of the held folder `folder` opened as itself with `DELETE` access, is a plain file
+/// holding exactly `text`; else a folder of its own is moved aside ([`moved_aside`]) and anything else deleted as
+/// itself, through its handle. Else why it could not be moved or deleted.
+fn found_at_name(folder: &File, name: &str, mut found: File, text: &str) -> Result<Found, String> {
     let metadata = found.metadata().map_err(|error| error.to_string())?;
     let reparse = metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
     if metadata.is_file() && !reparse {
         let mut held = Vec::new();
         if found.read_to_end(&mut held).is_ok() && held == text.as_bytes() {
-            return Ok(true);
+            return Ok(Found::Holds);
         }
     }
-    gate_win32::delete_tree_opened(&found).map_err(|error| error.to_string())?;
-    Ok(false)
+    if metadata.is_dir() && !reparse {
+        return moved_aside(folder, name, &found).map(Found::MovedAside);
+    }
+    gate_win32::delete_opened(&found).map_err(|error| error.to_string())?;
+    Ok(Found::Deleted)
+}
+
+/// The most names `{name}.gate-moved-{n}` tried for a folder moved aside.
+const MOVED_ASIDE_LIMIT: u32 = 100;
+
+/// Renames `found`, the folder `name` of the held folder `folder` opened with `DELETE` access, to
+/// `{name}.gate-moved-{n}` beside it, by handle ([`gate_win32::rename_beneath`]), for the first `n` from 1 nothing has
+/// the name of: the new name. Else why not, every `n` up to [`MOVED_ASIDE_LIMIT`] taken included.
+fn moved_aside(folder: &File, name: &str, found: &File) -> Result<String, String> {
+    for n in 1..=MOVED_ASIDE_LIMIT {
+        let moved = format!("{name}.gate-moved-{n}");
+        match gate_win32::open_beneath_as(folder, &moved, FILE_READ_ATTRIBUTES, Share::All, Make::Open) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            _ => continue,
+        }
+        return gate_win32::rename_beneath(found, folder, &moved)
+            .map(|()| moved)
+            .map_err(|error| format!("cannot move aside the folder {name}: {error}"));
+    }
+    Err(format!(
+        "cannot move aside the folder {name}: {name}.gate-moved-1 to {name}.gate-moved-{MOVED_ASIDE_LIMIT} are all taken"
+    ))
 }
 
 /// Removes the entry `path` as itself, never what a link or a junction there leads to: a folder, or a link or a
