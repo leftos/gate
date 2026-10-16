@@ -1506,7 +1506,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A bad entry is skipped alone and named in the reader's problems: `tools.<name> is not a version: "<text>"`, `tools.<name> is not a string (TOML <type>)`, `tools is not a table (TOML <type>)`, `workloads is not an array (TOML <type>)`, `workloads[<i>] is not a string (TOML <type>)`, `workloads[<i>] is empty` and `<key> is not a key of the manifest (tools, workloads)`.
 
-    **On a routed run**, the client lists the snapshot's tree before the preflight: `git ls-tree -r -z --name-only` for the file names parity needs, and a root listing and a `.gate` listing for the manifest. The `.gate` folder and `toolchain.toml` are found ignoring letter case, and the exact-case regular file wins.
+    **On a routed run**, the client lists the snapshot's tree once before the preflight, with `git ls-tree -r -t -z <commit>` (a sibling's listing keeps `--name-only`): the file names parity needs and the `.gate` folder and `toolchain.toml` candidates for the manifest are read from that one listing. The `.gate` folder and `toolchain.toml` are found ignoring letter case, and the exact-case regular file wins.
 
     The file is used only when it is a regular blob, read by its object id; a submodule, a symbolic link, a folder, or several spellings of it with none in exact case gets a skip line saying why. A repo with no manifest says nothing.
 
@@ -1618,7 +1618,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   - **Sync-back.** In `remote/syncback.rs`, after a run call that ended with the command's own status (a refusal, an interrupt or a failed call never syncs back).
 
-    The sync-back first runs `git rev-parse --git-path objects` (the real object store), even when there turns out to be no back commit, and sweeps the quarantines of earlier gates (below).
+    The sync-back runs no `git rev-parse --git-path objects`: the real object store's path comes from the snapshot, whose `rev-parse --git-path` call also asks for `objects`. It reads it even when there turns out to be no back commit, and sweeps the quarantines of earlier gates (below).
 
     Then `git ls-remote -- <url> refs/gate-back/<key>` then `git -c fetch.fsckObjects=true -c maintenance.auto=false -c gc.auto=0 fetch --progress --no-recurse-submodules --no-tags -- <url> <ref>` run with the push's `GIT_SSH_COMMAND` and `--upload-pack=pwsh -NoProfile -NonInteractive -Command git-upload-pack`; a bare repository on this machine names no pack command.
 
@@ -2006,12 +2006,18 @@ Built verbs:
   When the time cannot be read it prints `gate: remote could not read the boot time: <message>` on stderr and exits 1, so the client's boot query after a lost connection says the call failed rather than taking a status 0 with no time. The preflight says the same line and goes on: an unreadable boot time fails no preflight, and the client then makes no boot query.
 - **`preflight`** creates the bare repo at `Bare` when missing and the work folder at `Work` with `.git`, `origin` set to `Bare`, `core.autocrlf false` and `core.eol lf`, and writes `.git\objects\info\alternates` as `<Bare with />/objects` and a line feed, without a byte order mark, unless the file already holds exactly that.
 
-  The preflight takes no lock, so a link, a junction or a file at the tree's `.git`, `.git\objects` or `.git\objects\info`, or anything but a file at `.git\config`, is never followed: it readies nothing there (no git step, nothing written) and the run repairs it under the lock. It readies the work folder's repository only when the folder's layout record says a run of one repo or is missing; a record that says a pair, `changing`, or cannot be read leaves the folder to the run.
+  On a tree it has just made with `git init`, the preflight writes the config itself: it takes `.git\config.lock` (as git does), reads `config` beneath the held `.git`, and when that config is `git init`'s own (a single `[core]` section, no `autocrlf` or `eol`, a plain UTF-8 file with no U+FEFF, last line not ending in `\`) it writes the `origin` remote (`url`, `fetch = +refs/heads/*:refs/remotes/origin/*`) with `core.autocrlf=false` and `core.eol=lf` into the lock in one write, quoted as git quotes values, and renames the lock over `config`.
+
+  Any other config, or one it cannot take, gets its lock deleted and the git steps run as before (`config --get remote.origin.url`, `remote add`, two `config` calls).
+
+  Apart from that config write, the preflight takes no lock, so a link, a junction or a file at the tree's `.git`, `.git\objects` or `.git\objects\info`, or anything but a file at `.git\config`, is never followed: it readies nothing there (no git step, nothing written) and the run repairs it under the lock. It readies the work folder's repository only when the folder's layout record says a run of one repo or is missing; a record that says a pair, `changing`, or cannot be read leaves the folder to the run.
 
   With a `Pair` in the payload the preflight makes the folder above `Work` and one bare repo per repo, `Bare` for the main checkout and `{root}\{stem}.git` for each sibling (`{root}` is `Bare`'s folder, `{stem}` the sibling's name with every character but an ASCII letter, digit, `-` and `_` made `-`), and touches nothing inside `Work`.
 
   It prints on stdout, in order: `gate: remote created <Bare>` (only when it created the bare repo), `gate: remote version <gate version>` (the same text as `gate --version` after `gate `, build id included), the boot line, `gate: remote sdks <v1,v2|none>`, and one `gate: remote tool <tool> ...` line for each tool of the payload's `Needs` (Tool probes, below); git's own output passes through. A payload without `Bare` or `Work` prints `gate: box payload lacks <key>` and exits 2.
-- A failing git step prints `gate: remote <step> failed (status <n>)` and exits with that status; a git that cannot start prints `gate: remote <step> failed: <OS message>` and exits 1. The steps are `git init --bare`, `git init`, `git remote add`, `git config core.autocrlf` and `git config core.eol`.
+- A failing git step prints `gate: remote <step> failed (status <n>)` and exits with that status; a git that cannot start prints `gate: remote <step> failed: <OS message>` and exits 1.
+
+  The same `failed: <message>` form covers a config read or write the preflight made itself: `gate: remote git remote add failed: cannot write <config>: <why>`, `gate: remote git remote add failed: cannot open|read <path>: <why>` and `gate: remote git remote add failed: cannot write <config>: config.lock could not be removed: <why>`. The steps are `git init --bare`, `git init`, `git remote add`, `git config core.autocrlf` and `git config core.eol`.
 
   On a pair run a step's line names its repo after the step: `gate: remote git init --bare failed for <leaf|sibling>` (status `n` and message forms as above), `gate: remote git init failed for <name>`, `gate: remote git remote add failed for <name>`, `gate: remote git config core.autocrlf failed for <name> (status <n>)`; a run of one repo says them as above.
 
