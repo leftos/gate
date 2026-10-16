@@ -3,9 +3,11 @@
 //! checked by hashing them as they are copied; each member then checked against the run's output globs, against the PC's manifest
 //! (a file it held must still have its size and last write, one it lacked must still be missing), and one that counts as
 //! tracked (its git index, a submodule or a nested repository holds it) unless a `--bring-tracked` glob matches it, or
-//! whose PC file is in use or read-only, or that records the box's work folder but is not text the install can rewrite,
-//! skipped and said; the box's work folder rewritten to the worktree's in the files that record it; and each file, its
-//! last write clamped to this PC's clock in the stage and checked unchanged once more, moved into place. A complete
+//! whose PC file is in use or read-only, or that records one of the run's box trees but is not text the install can
+//! rewrite, skipped and said; each of the run's trees on the box rewritten to its root on this PC in the files that
+//! record it (the work folder to the worktree for one repo; for a pair, the main's tree to the worktree and each
+//! sibling's to the sibling's root); and each file, its last write clamped to this PC's clock in the stage and checked
+//! unchanged once more, moved into place. A complete
 //! install also keeps the hash of each file it put in place, at the stamp that file's handle reads after the move, in
 //! the worktree's hash cache, so the next run takes it instead of reading the file again. The success line says what
 //! came back; every end removes the archive and the stage this run made, and the pending marker is cleared by a success
@@ -19,6 +21,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
+use gate_router::is_layout_char;
 use gate_state::v1;
 use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES};
 
@@ -54,14 +57,19 @@ const MB: f64 = 1024.0 * 1024.0;
 const INSTALL: &str = "install";
 
 /// What the install of a fetched archive needs: the archive, the stage folder beside it, the pending marker, the PC's
-/// manifest and the run's output globs, the box's work folder, and when the fetch started.
+/// manifest and the run's output globs, the box path of each of the run's trees with the PC root it stands for, and
+/// when the fetch started.
 pub(super) struct Fetched<'f> {
     pub(super) archive: &'f Archive,
     pub(super) stage: PathBuf,
     pub(super) marker: &'f Path,
     pub(super) manifest: &'f Manifest,
     pub(super) globs: &'f [String],
-    pub(super) box_work: &'f str,
+    /// The main repo's tree on the box, which stands for the worktree: the work folder for a run of one repo,
+    /// `{work}\{leaf}` for a pair.
+    pub(super) main_tree: String,
+    /// Each sibling's tree on the box and the sibling's root it stands for, in the pair's order; none for one repo.
+    pub(super) sibling_trees: Vec<(String, &'f str)>,
     pub(super) started: Instant,
 }
 
@@ -294,8 +302,15 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
     let mut skipped = skips(attempt, &root, &entries, &in_use)?;
     let skipped_paths: HashSet<&str> = skipped.iter().map(|(path, _)| path.as_str()).collect();
     let entries: Vec<Entry> = entries.into_iter().filter(|entry| !skipped_paths.contains(entry.path.as_str())).collect();
-    let pc_root = root.display().to_string();
-    let unrewritable = rewritten(&fetched.stage, &entries, fetched.box_work, &pc_root).map_err(Unmet::Refused)?;
+    let siblings = fetched.sibling_trees.iter().map(|(tree, pc_root)| {
+        std::path::absolute(pc_root)
+            .map(|pc_root| (tree.clone(), pc_root.display().to_string()))
+            .map_err(|error| transient(in_context(Path::new(pc_root), &error).to_string()))
+    });
+    let trees = std::iter::once(Ok((fetched.main_tree.clone(), root.display().to_string())))
+        .chain(siblings)
+        .collect::<Result<Vec<_>, _>>()?;
+    let unrewritable = rewritten(&fetched.stage, &entries, &trees).map_err(Unmet::Refused)?;
     let unrewritten: HashSet<&str> = unrewritable.iter().map(|(path, _)| path.as_str()).collect();
     let entries: Vec<Entry> = entries.into_iter().filter(|entry| !unrewritten.contains(entry.path.as_str())).collect();
     skipped.extend(unrewritable);
@@ -602,15 +617,18 @@ fn writable(root: &Path, entry: &Entry) -> bool {
     !target.is_file() || OpenOptions::new().read(true).write(true).share_mode(0).open(&target).is_ok()
 }
 
-/// Rewrites `box_work` to `pc_root` in each of the staged `entries` below `stage` that records it ([`records_a_root`]),
-/// as [`rewrite_file`] does: the paths, in order, of those that are not text the install can rewrite, each with its
-/// [`Skip`], since one installed as it stands would keep the box's paths; else why one cannot be read or written.
-fn rewritten(stage: &Path, entries: &[Entry], box_work: &str, pc_root: &str) -> Result<Vec<(String, Skip)>, Refused> {
-    let from = box_work.trim_end_matches('\\');
-    let to = pc_root.trim_end_matches('\\');
+/// Rewrites each box tree of `trees` to the PC root paired with it in each of the staged `entries` below `stage` that
+/// records a root ([`records_a_root`]), as [`rewrite_file`] does: the paths, in order, of those that are not text the
+/// install can rewrite, each with its [`Skip`], since one installed as it stands would keep the box's paths; else why
+/// one cannot be read or written.
+fn rewritten(stage: &Path, entries: &[Entry], trees: &[(String, String)]) -> Result<Vec<(String, Skip)>, Refused> {
+    let trees: Vec<(String, String)> = trees
+        .iter()
+        .map(|(tree, pc_root)| (tree.trim_end_matches('\\').to_owned(), pc_root.trim_end_matches('\\').to_owned()))
+        .collect();
     let mut skipped = Vec::new();
     for entry in entries.iter().filter(|entry| records_a_root(&entry.path)) {
-        match rewrite_file(&below(stage, &entry.path), &entry.path, from, to) {
+        match rewrite_file(&below(stage, &entry.path), &entry.path, &trees) {
             Ok(()) => {}
             Err(CannotRewrite::Skipped(why)) => skipped.push((entry.path.clone(), Skip::Unrewritable(why))),
             Err(CannotRewrite::Failed(refused)) => return Err(refused),
@@ -629,13 +647,14 @@ fn records_a_root(path: &str) -> bool {
             .is_some_and(|start| start.eq_ignore_ascii_case(COVERAGE_ROOTS))
 }
 
-/// Rewrites `from` to `to` in the text file at `path`, shown as `shown`: its JSON-escaped form (each `\` doubled) first,
-/// then its raw form, each without regard to case as .NET's `OrdinalIgnoreCase` compares. The file is read in the
-/// encoding its byte order mark names ([`Encoding`]): UTF-8, or UTF-16 in the byte order its mark gives, read as 16-bit
-/// units. A file whose text changes is written back in the same encoding, with the same byte order mark, and its last
-/// write kept. Else the skip ([`CannotRewrite::Skipped`]): a file over [`REWRITE_LIMIT`] bytes, refused before it is
-/// read, or one whose body is not text in the encoding its mark names. A file that cannot be read or written is refused.
-fn rewrite_file(path: &Path, shown: &str, from: &str, to: &str) -> Result<(), CannotRewrite> {
+/// Rewrites each box tree of `trees` to the PC root paired with it in the text file at `path`, shown as `shown`, as
+/// [`replaced`] matches them: their JSON-escaped forms (each `\` doubled) first, then their raw forms, each without
+/// regard to case as .NET's `OrdinalIgnoreCase` compares. The file is read in the encoding its byte order mark names
+/// ([`Encoding`]): UTF-8, or UTF-16 in the byte order its mark gives, read as 16-bit units. A file whose text changes
+/// is written back in the same encoding, with the same byte order mark, and its last write kept. Else the skip
+/// ([`CannotRewrite::Skipped`]): a file over [`REWRITE_LIMIT`] bytes, refused before it is read, or one whose body is
+/// not text in the encoding its mark names. A file that cannot be read or written is refused.
+fn rewrite_file(path: &Path, shown: &str, trees: &[(String, String)]) -> Result<(), CannotRewrite> {
     let cannot = |error: io::Error| CannotRewrite::Failed(Refused::transient(format!("cannot rewrite {shown}: {error}")));
     let mut file = File::open(path).map_err(cannot)?;
     let metadata = file.metadata().map_err(cannot)?;
@@ -649,8 +668,12 @@ fn rewrite_file(path: &Path, shown: &str, from: &str, to: &str) -> Result<(), Ca
     // Which byte is not text in the encoding the mark names is no use to the reader; that the file is not is the one
     // reason said.
     let (encoding, text) = decoded(&bytes).ok_or(CannotRewrite::Skipped(Unrewritable::NotText))?;
-    let escaped = replaced(&text, &from.replace('\\', r"\\"), &to.replace('\\', r"\\"));
-    let new = replaced(&escaped, from, to);
+    let escaped_trees: Vec<(String, String)> = trees
+        .iter()
+        .map(|(tree, pc_root)| (tree.replace('\\', r"\\"), pc_root.replace('\\', r"\\")))
+        .collect();
+    let escaped = replaced(&text, &escaped_trees);
+    let new = replaced(&escaped, trees);
     if new == text {
         return Ok(());
     }
@@ -758,27 +781,44 @@ fn encoded(text: &str, encoding: Encoding) -> Vec<u8> {
     }
 }
 
-/// `text` with each run of characters equal to `from`, without regard to case, replaced by `to`.
-fn replaced(text: &str, from: &str, to: &str) -> String {
-    if from.is_empty() {
-        return text.to_owned();
-    }
+/// `text` with each run of characters equal to the `from` of a `(from, to)` of `pairs`, without regard to case, that
+/// ends a path component replaced by its `to`, the longest `from` tried first. The match on whole components
+/// ([`ends_a_component`]) is what keeps a tree off another whose name extends its own (`yaat`, `yaat-server`), so each
+/// path is rewritten from its own tree. An empty `from` matches nothing.
+fn replaced(text: &str, pairs: &[(String, String)]) -> String {
     // `ordinal_upper` maps each character to one, so the characters of `text` and of its uppercase line up.
-    let wanted: Vec<char> = ordinal_upper(from).chars().collect();
+    let mut wanted: Vec<(Vec<char>, &str)> = pairs
+        .iter()
+        .filter(|(from, _)| !from.is_empty())
+        .map(|(from, to)| (ordinal_upper(from).chars().collect(), to.as_str()))
+        .collect();
+    wanted.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
     let upper: Vec<char> = ordinal_upper(text).chars().collect();
     let characters: Vec<char> = text.chars().collect();
     let mut new = String::with_capacity(text.len());
     let mut index = 0;
     while let Some(&character) = characters.get(index) {
-        if upper[index..].starts_with(&wanted) {
+        let rest = &upper[index..];
+        let hit = wanted
+            .iter()
+            .find(|(from, _)| rest.starts_with(from) && ends_a_component(rest.get(from.len()).copied()));
+        if let Some((from, to)) = hit {
             new.push_str(to);
-            index += wanted.len();
+            index += from.len();
         } else {
             new.push(character);
             index += 1;
         }
     }
     new
+}
+
+/// Whether `next`, the character after a box tree's path in a file, ends the tree's last path component: the end of the
+/// text, or any character but one a folder name the box lays out is made of ([`is_layout_char`]), which would go on
+/// with the name: so `{work}\yaat` is not matched at the start of `{work}\yaat-server`, nor `{work}` at the start of
+/// `{work}.lock`, and each is matched before a separator, a quote or a list's `;`.
+fn ends_a_component(next: Option<char>) -> bool {
+    next.is_none_or(|next| !is_layout_char(next))
 }
 
 /// Moves each of `entries` from `stage` into place below `root`, as [`move_one`] does against `manifest`, asking
@@ -895,6 +935,11 @@ mod tests {
 
     const BOX_WORK: &str = r"D:\gate-remote\work\app-1a2b3c4d";
     const PC_ROOT: &str = r"C:\src\app";
+
+    /// The trees of a run of one repo: the box's work folder, rewritten to the worktree's root.
+    fn one_tree() -> Vec<(String, String)> {
+        vec![(BOX_WORK.to_owned(), PC_ROOT.to_owned())]
+    }
 
     /// A scratch folder for one test, emptied first.
     fn scratch(name: &str) -> PathBuf {
@@ -1050,7 +1095,7 @@ mod tests {
             entry("bin/app.deps.json"),
         ];
 
-        assert_eq!(rewritten(&stage, &entries, BOX_WORK, PC_ROOT), Ok(Vec::new()));
+        assert_eq!(rewritten(&stage, &entries, &one_tree()), Ok(Vec::new()));
 
         let pc_escaped = PC_ROOT.replace('\\', r"\\");
         let mut expected = b"\xEF\xBB\xBF".to_vec();
@@ -1074,6 +1119,98 @@ mod tests {
     }
 
     #[test]
+    fn a_one_repo_work_folder_is_rewritten_only_where_its_last_name_ends() {
+        let stage = scratch("rewrite-boundary");
+        let doubled = |path: &str| path.replace('\\', r"\\");
+        let box_escaped = doubled(BOX_WORK);
+        // Each root is followed by `"`, `;`, `|`, `/`, `\` and the end of the text; the work folder's `.lock` and a
+        // folder whose name runs on past the work folder's are no paths in it.
+        let raw = |root: &str| format!(r#"{root}" {root}; {root}| {root}/x {root}\y {BOX_WORK}.lock {BOX_WORK}-x\a {root}"#);
+        let escaped = |root: &str| format!(r#"{root}" {root}; {root}| {root}/x {root}\\y {box_escaped}.lock {box_escaped}-x\\a {root}"#);
+        let coverage = put(&stage, "bin/.msCoverageSourceRootsMapping_App", raw(BOX_WORK).as_bytes());
+        let manifest = put(&stage, "bin/MvcTestingAppManifest.json", escaped(&box_escaped).as_bytes());
+        let entries = [entry("bin/.msCoverageSourceRootsMapping_App"), entry("bin/MvcTestingAppManifest.json")];
+
+        assert_eq!(rewritten(&stage, &entries, &one_tree()), Ok(Vec::new()));
+
+        assert_eq!(fs::read_to_string(&coverage).expect("the file is there"), raw(PC_ROOT), "raw");
+        assert_eq!(
+            fs::read_to_string(&manifest).expect("the file is there"),
+            escaped(&doubled(PC_ROOT)),
+            "escaped"
+        );
+    }
+
+    #[test]
+    fn a_pair_rewrites_each_tree_to_its_own_root() {
+        let stage = scratch("rewrite-pair");
+        let trees = vec![
+            (format!(r"{BOX_WORK}\app"), PC_ROOT.to_owned()),
+            (format!(r"{BOX_WORK}\lib"), r"C:\src\lib".to_owned()),
+        ];
+        let escaped_box = BOX_WORK.replace('\\', r"\\");
+        let json = format!(
+            r#"{{"App":"{}\\app\\src","Lib":"{escaped_box}\\LIB\\src","Work":"{escaped_box}\\other"}}"#,
+            escaped_box.to_uppercase()
+        );
+        let raw = format!("{}\\app\\src;{BOX_WORK}\\Lib\\tests;{BOX_WORK}\\other\n", BOX_WORK.to_lowercase());
+        let manifest = put(&stage, "bin/MvcTestingAppManifest.json", json.as_bytes());
+        let coverage = put(&stage, "bin/.msCoverageSourceRootsMapping_App", raw.as_bytes());
+        let entries = [entry("bin/MvcTestingAppManifest.json"), entry("bin/.msCoverageSourceRootsMapping_App")];
+
+        assert_eq!(rewritten(&stage, &entries, &trees), Ok(Vec::new()));
+
+        assert_eq!(
+            fs::read_to_string(&manifest).expect("the file is there"),
+            format!(r#"{{"App":"C:\\src\\app\\src","Lib":"C:\\src\\lib\\src","Work":"{escaped_box}\\other"}}"#),
+            "escaped, any case: each tree to its own root, the work folder's other folder left alone"
+        );
+        assert_eq!(
+            fs::read_to_string(&coverage).expect("the file is there"),
+            format!("C:\\src\\app\\src;C:\\src\\lib\\tests;{BOX_WORK}\\other\n"),
+            "raw, any case"
+        );
+    }
+
+    #[test]
+    fn a_sibling_whose_name_extends_another_s_is_rewritten_to_its_own_root() {
+        let stage = scratch("rewrite-prefix");
+        let raw = format!("{BOX_WORK}\\yaat-server\\src;{BOX_WORK}\\yaat\\src;{BOX_WORK}\\yaat;{BOX_WORK}\\yaatx\n");
+        let escaped_box = BOX_WORK.replace('\\', r"\\");
+        let json = format!(r#"{{"Server":"{escaped_box}\\yaat-server","App":"{escaped_box}\\yaat"}}"#);
+        let coverage = put(&stage, "bin/.msCoverageSourceRootsMapping_App", raw.as_bytes());
+        let manifest = put(&stage, "bin/MvcTestingAppManifest.json", json.as_bytes());
+        let entries = [entry("bin/.msCoverageSourceRootsMapping_App"), entry("bin/MvcTestingAppManifest.json")];
+        // The shorter name first, so only the match on whole components keeps it off the longer one.
+        for trees in [
+            vec![
+                (format!(r"{BOX_WORK}\yaat"), r"C:\src\yaat".to_owned()),
+                (format!(r"{BOX_WORK}\yaat-server"), r"C:\src\yaat-server".to_owned()),
+            ],
+            vec![
+                (format!(r"{BOX_WORK}\yaat-server"), r"C:\src\yaat-server".to_owned()),
+                (format!(r"{BOX_WORK}\yaat"), r"C:\src\yaat".to_owned()),
+            ],
+        ] {
+            fs::write(&coverage, &raw).expect("the file can be written");
+            fs::write(&manifest, &json).expect("the file can be written");
+
+            assert_eq!(rewritten(&stage, &entries, &trees), Ok(Vec::new()));
+
+            assert_eq!(
+                fs::read_to_string(&coverage).expect("the file is there"),
+                format!("C:\\src\\yaat-server\\src;C:\\src\\yaat\\src;C:\\src\\yaat;{BOX_WORK}\\yaatx\n"),
+                "raw: {trees:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(&manifest).expect("the file is there"),
+                r#"{"Server":"C:\\src\\yaat-server","App":"C:\\src\\yaat"}"#,
+                "escaped: {trees:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_utf16_file_to_rewrite_is_rewritten_in_its_own_byte_order_with_its_bom() {
         for (order, encode) in [("LE", utf16_le as fn(&str) -> Vec<u8>), ("BE", utf16_be)] {
             let stage = scratch(&format!("rewrite-utf16-{}", order.to_lowercase()));
@@ -1087,7 +1224,7 @@ mod tests {
                 .expect("the last write can be set");
             let entries = [entry("bin/.msCoverageSourceRootsMapping_App")];
 
-            assert_eq!(rewritten(&stage, &entries, BOX_WORK, PC_ROOT), Ok(Vec::new()), "{order}");
+            assert_eq!(rewritten(&stage, &entries, &one_tree()), Ok(Vec::new()), "{order}");
 
             let expected = encode(&format!("{PC_ROOT}\\src;{PC_ROOT}\\tests\n"));
             assert_eq!(fs::read(&full).expect("the file is there"), expected, "UTF-16 {order}, its BOM kept");
@@ -1103,7 +1240,7 @@ mod tests {
         put(&stage, "bin/.msCoverageSourceRootsMapping_App", bytes);
 
         assert_eq!(
-            rewritten(&stage, &[entry("bin/.msCoverageSourceRootsMapping_App")], BOX_WORK, PC_ROOT),
+            rewritten(&stage, &[entry("bin/.msCoverageSourceRootsMapping_App")], &one_tree()),
             Ok(vec![(
                 "bin/.msCoverageSourceRootsMapping_App".to_owned(),
                 Skip::Unrewritable(Unrewritable::NotText)
@@ -1147,14 +1284,14 @@ mod tests {
 
         sized(16 * 1024 * 1024 + 1);
         assert_eq!(
-            rewritten(&stage, &entries, BOX_WORK, PC_ROOT),
+            rewritten(&stage, &entries, &one_tree()),
             Ok(vec![(
                 "bin/MvcTestingAppManifest.json".to_owned(),
                 Skip::Unrewritable(Unrewritable::TooLarge(16 * 1024 * 1024 + 1))
             )])
         );
         sized(16 * 1024 * 1024);
-        assert_eq!(rewritten(&stage, &entries, BOX_WORK, PC_ROOT), Ok(Vec::new()), "16 MiB is not over");
+        assert_eq!(rewritten(&stage, &entries, &one_tree()), Ok(Vec::new()), "16 MiB is not over");
     }
 
     #[test]
@@ -1974,7 +2111,7 @@ mod tests {
         let entries = unpacked_from(&archive[..], &stage, &folder, &Manifest::default()).expect("the archive unpacks");
         let read = |path: &str| fs::read_to_string(super::below(&stage, path)).expect("the staged file is there");
 
-        let skipped = rewritten(&stage, &entries[1..], BOX_WORK, PC_ROOT);
+        let skipped = rewritten(&stage, &entries[1..], &one_tree());
 
         assert_eq!(skipped, Ok(Vec::new()));
         assert_eq!(read("b/bin/MvcTestingAppManifest.json"), recorded(PC_ROOT), "the copy is rewritten");
@@ -1983,7 +2120,7 @@ mod tests {
             recorded(BOX_WORK),
             "the member it was copied from is a file of its own"
         );
-        assert_eq!(rewritten(&stage, &entries[..1], BOX_WORK, PC_ROOT), Ok(Vec::new()));
+        assert_eq!(rewritten(&stage, &entries[..1], &one_tree()), Ok(Vec::new()));
         assert_eq!(read("a/bin/MvcTestingAppManifest.json"), recorded(PC_ROOT));
     }
 }

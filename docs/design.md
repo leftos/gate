@@ -464,11 +464,15 @@ The lines of a run that starts its command:
   With no figure from the builder (its sampler failed) the clause reads `load-adjusted unknown: the sampler failed` and the past-ceiling check uses `<c>`. The client's status is the gate's own, passed through as `N`.
 - The stale line, on stderr and in the log, before the passed line, when a routed dotnet build (verb `build`, `test`, `publish`, `pack`, `run` or `msbuild`, with no `--no-build` of its own) passed and did not bring everything back: `gate: routed build left stale: <folders>`.
 
-  The folders are every PC-side folder (no cap) that a judging glob matches and no brought-back glob covers, judged per file: a folder whose every matching file came back is not named. The judging globs are the run's `outputs`, or the default globs when the repo's entry is absent or `[]`, plus the defaults `**/bin/**` and `**/.godot/mono/temp/bin/**`. The folders are sorted, relative to the worktree root, `/`-separated, escaped and joined with `, `. A run with siblings names a sibling's output folders the same way, relative to the main worktree (`../<sibling>/src/App/bin`).
+  The folders are every PC-side folder (no cap) that a judging glob matches and no brought-back glob covers, judged per file: a folder whose every matching file came back is not named. The judging globs are the run's `outputs`, or the default globs when the repo's entry is absent or `[]`, plus the defaults `**/bin/**` and `**/.godot/mono/temp/bin/**`. The folders are sorted, relative to the worktree root, `/`-separated, escaped and joined with `, `.
+
+  A pair (a run with siblings) names each sibling's output folders after the main's, written `../<sibling>/<folder>` (`../lib/src/App/bin`), judged by the same globs with nothing brought back, since no sibling's output ever comes back; the siblings follow in declared order.
 
   A glob names the folder where its last plain folder part ends, at the first place from the left where its plain parts match whole path components: `**/bin/**` and `**/bin/**/*.dll` name each `src/App/bin`, `out/**/App.dll` names `out`, `publish/App.exe` names `publish`; a glob with no plain folder part (`**`, `*.dll`, `**/*.dll`) names nothing. The line may name a folder this build did not touch.
 
-  It is not said after a failed build (an exit 0 whose log reports a failure included), a fallback or a command that is not a build, and it neither writes nor clears the nothing-back record. A walk of the worktree that fails says `gate: routed build may have left stale output; could not list it: <reason>` instead.
+  It is not said after a failed build (an exit 0 whose log reports a failure included), a fallback or a command that is not a build, and it neither writes nor clears the nothing-back record. A walk of the worktree that fails says `gate: routed build may have left stale output; could not list it: <reason>` instead, after the folders line.
+
+  A pair's sibling whose walk fails says `gate: routed build may have left stale output in ../<sibling>; could not list it: <reason>` on a line of its own, after the folders line and after the main's failure line; the folders of the trees that could be listed are still named. A run of one repo says the same lines as without siblings.
 - A critical gate, on stderr and in the log: the `waiting for the machine (critical)`, `still waiting for the machine (critical)`, `holds the machine (critical)` and `interrupted while waiting for the machine` lines, in [Critical drain and nesting](#critical-drain-and-nesting).
 - Nesting, on stderr and in the log, from the slot marker in the gate's environment: the `running under` (including the lend's `while a critical request drains`), `ignored GATE_SLOT_HELD`, `could not judge GATE_SLOT_HELD` and `does not cover` lines, the barrier's `waiting for a heavy slot behind the critical request` and `waiting for a light slot beside the critical request` lines, and the refusal of a critical gate, all in [Critical drain and nesting](#critical-drain-and-nesting).
 
@@ -1546,7 +1550,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     An outputs install that completes (no member skipped but ones it cannot rewrite) therefore also saves the hashes of the files it put in place, so the next run does not rehash them. Each entry takes the stamp the installed file's handle reads after the move and the future-time clamp, with the SHA-256 the unpack verified against the box's manifest, under the 2 s rule below measured against the PC's clock when the moves began: a file clamped to the PC's clock is not kept.
 
-    A member the install rewrites after the hash check (the files that record the box's work folder) is not kept, its bytes no longer being the hash's. The install loads the cache file again, adds its entries and saves once; a failed, refused, partial or interrupted install saves nothing.
+    A member the install rewrites after the hash check (the files that record a box tree's path) is not kept, its bytes no longer being the hash's. The install loads the cache file again, adds its entries and saves once; a failed, refused, partial or interrupted install saves nothing.
 
     An entry is saved only when its modified time is at least 2 s before the moment the walk began, so a file written again within the same tick at the same size is never taken from the cache; a modified time in the future is never saved. A saved entry whose stamp matches is trusted. A file the walk no longer finds drops out at the next save.
 
@@ -1711,7 +1715,11 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     Before any move, in order, each member is checked against the run's output globs, against the manifest (the file must still have its size and last write; a file the manifest lacked that now exists counts as changed), for being writable, and against the worktree's git index (Tracked members, below).
 
-    `MvcTestingAppManifest.json` and `.msCoverageSourceRootsMapping_*` are rewritten from the box's work folder to the PC's root (the JSON-escaped form, then the raw one, case-insensitive; each file is decoded by its byte order mark, UTF-8 (with or without one) or UTF-16 in the byte order the mark names, and written back in the same encoding with the same mark and its last write kept; a file with no mark is read as UTF-8 only, and no other encoding is guessed).
+    `MvcTestingAppManifest.json` and `.msCoverageSourceRootsMapping_*` are rewritten from the box's path of each tree of the run to that tree's root on the PC (a run of one repo: the work folder to the worktree; a pair: `{Work}\{leaf}` to the worktree and `{Work}\{name}` to that sibling's worktree), the JSON-escaped form first, then the raw one, case-insensitive, the longest path first.
+
+    A path is matched only at a whole path component: the next character is not an ASCII letter or digit, `.`, `_` or `-` (the characters a folder name the builder lays out is made of), or the text ends, so `{Work}\yaat` never rewrites part of `{Work}\yaat-server` and `{Work}.lock` is left alone. Each box path is computed in one place (`boxside::payload::trees`), shared by the box and the client.
+
+    Each file is decoded by its byte order mark, UTF-8 (with or without one) or UTF-16 in the byte order the mark names, and written back in the same encoding with the same mark and its last write kept; a file with no mark is read as UTF-8 only, and no other encoding is guessed.
 
     A rewritten file over 16 MiB, or whose body is not text in that encoding (not UTF-8, or UTF-16 of an odd length or with an unpaired surrogate), is skipped, not refused, as below. The client does not skip the back-commit paths again; the box does.
 
@@ -1836,7 +1844,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   **Escaping.** Every text a builder supplies that a `gate:` line quotes is escaped: control characters, U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069, U+2028 and U+2029 are written `\u{..}`. That covers the preflight's last line, the builder's version in the version refusal, and every `git ... failed` line of the snapshot, the saved ref and the sync-back. A failed git line lists git's stdout first and its stderr last, keeping the last 10 lines and 4 KiB so git's `fatal:` line survives.
 
   The client's git calls also drop `GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and every `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n`, so the caller's git configuration never reaches the builder's repo, and `GIT_SSH_VARIANT` and `GIT_EXTERNAL_DIFF`, so neither the ssh option syntax nor the diff a sync-back applies can be changed from outside.
-- **Sibling worktrees** (GATE-19, GATE-213), the declaration, the machine's consent, the decision, the rewrite and the PC's sync-back and the client's send built: some repos' builds reach into a sibling repo by relative path, and a routed run that sends one worktree's snapshot would compile something different on the builder without any error.
+- **Sibling worktrees** (GATE-19, GATE-213), the declaration, the machine's consent, the decision, the rewrite, the box's layout, the client's send, the PC's sync-back and the outputs install and stale lines built: some repos' builds reach into a sibling repo by relative path, and a routed run that sends one worktree's snapshot would compile something different on the builder without any error.
 
   A repo declares its siblings in a tracked file of its own, `.gate/siblings.toml`, beside the [toolchain manifest](#routing) and apart from it, so a fault in one never changes what the other means.
 
@@ -1871,6 +1879,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   The PC's sync-back of a pair is built too, all or nothing across the repos (Sync-back, under [Routing](#routing)).
 
   The client sends the pair: the payload's `Pair` and `SiblingSnapshots` carry the main repository's snapshot and one for each sibling, in declared order, and the pushes, the parity check and the sync-back cover every repository.
+
+  A pair's outputs come back for the main repository alone. The install rewrites each tree's box path in the files that record it to that tree's own root, the main's to the worktree and each sibling's to the sibling's worktree (Outputs fetch, under [Routing](#routing)), and the stale line also names each sibling's output folders (Output lines).
 
   The client's side of a pair, in order: it holds the folders (`remote/held.rs`) and takes the worktree locks; asks git where each repository is (its top folder, git folder and common git folder, in one `git rev-parse` bounded at the root's parent) and holds the git folders too; snapshots each repository at the place git found, reading the folders again after each snapshot.
 

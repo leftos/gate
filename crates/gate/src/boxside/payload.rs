@@ -267,6 +267,18 @@ impl Payload {
     }
 }
 
+/// The box path of every tree a run checks out in the work folder `work`: the main repo's, then each sibling's in the
+/// order given. With no `pair`, `work` itself and no sibling; with the pair of the main checkout's folder name and the
+/// siblings' folder names, `{work}\{leaf}` and `{work}\{name}` for each sibling. The box lays its trees out at these
+/// paths and the client rewrites recorded box paths from them, so the two never compute them apart.
+pub(crate) fn trees(work: &str, pair: Option<(&str, &[&str])>) -> (String, Vec<String>) {
+    let Some((leaf, siblings)) = pair else {
+        return (work.to_owned(), Vec::new());
+    };
+    let tree = |name: &str| format!(r"{work}\{name}");
+    (tree(leaf), siblings.iter().map(|name| tree(name)).collect())
+}
+
 /// The leaf and the sibling names of the `Pair` value `value`; else the usage line saying it is not one.
 fn pair_names(value: &Value) -> Result<(String, Vec<String>), String> {
     let not_a_pair = || "gate: box payload Pair is not an object of a Leaf text and a Siblings list of texts".to_owned();
@@ -1086,5 +1098,27 @@ mod tests {
         assert_eq!(sibling_snapshots(&json!({"lib": SHA, "tools": null})), refusing(""));
         assert_eq!(sibling_snapshots(&json!({"lib": SHA, "tools": 3})), refusing("3"));
         assert_eq!(sibling_snapshots(&json!({"lib": SHA, "tools": "\u{1b}"})), refusing(r"\u{1b}"));
+    }
+
+    #[test]
+    fn the_trees_of_a_run_without_a_pair_are_its_work_folder() {
+        assert_eq!(
+            super::trees(r"D:\gate-remote\work\app-1a2b3c4d", None),
+            (r"D:\gate-remote\work\app-1a2b3c4d".to_owned(), Vec::<String>::new())
+        );
+    }
+
+    #[test]
+    fn the_trees_of_a_pair_put_the_main_and_each_sibling_in_the_work_folder() {
+        assert_eq!(
+            super::trees(r"D:\gate-remote\work\app-1a2b3c4d", Some(("app", &["tools", "lib"]))),
+            (
+                r"D:\gate-remote\work\app-1a2b3c4d\app".to_owned(),
+                vec![
+                    r"D:\gate-remote\work\app-1a2b3c4d\tools".to_owned(),
+                    r"D:\gate-remote\work\app-1a2b3c4d\lib".to_owned(),
+                ]
+            )
+        );
     }
 }

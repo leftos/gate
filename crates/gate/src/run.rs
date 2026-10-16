@@ -716,12 +716,12 @@ enum Pass<'h> {
 }
 
 /// A run whose verdict may pass: how long it ran, as its passed line says, the ceiling it ran under in whole seconds,
-/// and the line a passing routed build says of the folders it left stale ([`stale_line`]).
+/// and the lines a passing routed build says of the folders it left stale ([`stale_lines`]).
 #[derive(Clone, Copy)]
 struct Passing<'h> {
     pass: Pass<'h>,
     ceiling: u64,
-    stale: Option<&'h str>,
+    stale: &'h [String],
 }
 
 /// How long a command ran: by the wall clock, in load-adjusted seconds, `None` once the sampler failed and they are
@@ -1041,11 +1041,11 @@ impl Run<'_> {
         let wall = started.elapsed();
         let words = unicode_words(&self.request.command);
         self.leave_nothing_back(remote, &outcome, words.as_deref(), console);
-        let stale = stale_line(remote, &outcome, words.as_deref());
+        let stale = stale_lines(remote, &outcome, words.as_deref());
         let passing = Passing {
             pass: Pass::On(&remote.host, wall, outcome.split, outcome.adjusted),
             ceiling: figures.ceiling,
-            stale: stale.as_deref(),
+            stale: &stale,
         };
         Remotely::Ended(self.remote_ended(&outcome, passing, wall, console))
     }
@@ -1371,7 +1371,7 @@ impl Run<'_> {
     }
 
     /// Ends a run the client ran to its end: the verdict with the passed line on the run's host and, when the verdict
-    /// passes, the line naming the folders the run left stale ([`stale_line`]); its markers not scanned when the
+    /// passes, the lines naming the folders the run left stale ([`stale_lines`]); its markers not scanned when the
     /// client killed the run or the console was interrupted, and the facts its release carries, with the adjusted
     /// seconds the box said. It is a kill only when the box's kill tag named one, whose kind is the verdict, or when the
     /// client killed it, by the kill line in the log.
@@ -1859,7 +1859,7 @@ impl Run<'_> {
         let passing = Passing {
             pass: Pass::Here(timing),
             ceiling: started.figures.ceiling,
-            stale: None,
+            stale: &[],
         };
         match self.verdict(outcome.exited, Some(passing), unscanned, diagnostics, console) {
             Ok(status) => Ended {
@@ -1953,11 +1953,11 @@ impl Run<'_> {
         Ok(status)
     }
 
-    /// Says what a passed run says: the line naming the folders it left stale when it has one, the cores hint, and the
+    /// Says what a passed run says: the lines naming the folders it left stale when it has any, the cores hint, and the
     /// passed line.
     fn say_passed(&self, passing: Passing<'_>, shown: &str, console: &mut Console) {
         let Passing { pass, ceiling, stale } = passing;
-        if let Some(line) = stale {
+        for line in stale {
             console.err(line);
         }
         if let Some(line) = self.cores_hint(pass) {
@@ -2644,17 +2644,20 @@ fn brought_everything_back(outcome: &RemoteOutcome) -> bool {
     outcome.status == 0 && outcome.brought_back == Some(true)
 }
 
-/// The line a passing routed build says of the folders it left stale, `None` when it says none: the folders in the
+/// The lines a passing routed build says of the folders it left stale, none when it says none: the folders in the
 /// worktree the run's judging globs stop at that the run did not bring back. Only a dotnet build the gate treats as one
 /// ([`dotnet_builds`]) that ended on the builder has any, and the run's verdict decides whether it is said
 /// ([`Run::verdict`]), so a failed build, one whose log reports a failure among them, and a fallback (whose build ran
 /// here) say nothing. The judging globs are the run's own, the defaults beside them, even in a repo whose `outputs` list
-/// is empty ([`DEFAULT_OUTPUTS`]); a file the run brought back is no stale folder's. A tree that cannot be listed says
-/// why it could not.
-fn stale_line(remote: &RemoteRun, outcome: &RemoteOutcome, words: Option<&[String]>) -> Option<String> {
-    let words = words?;
+/// is empty ([`DEFAULT_OUTPUTS`]); a file the run brought back is no stale folder's. A pair's siblings are judged by
+/// the same globs, and named after the main's on the same line, relative to the main worktree; a sibling's output is
+/// never brought back. A tree that cannot be listed says why it could not, on a line of its own ([`stale::stale_lines`]).
+fn stale_lines(remote: &RemoteRun, outcome: &RemoteOutcome, words: Option<&[String]>) -> Vec<String> {
+    let Some(words) = words else {
+        return Vec::new();
+    };
     if outcome.status != 0 || !dotnet_builds(words) {
-        return None;
+        return Vec::new();
     }
     let mut judging = remote.outputs.clone();
     judging.extend(DEFAULT_OUTPUTS.iter().map(|glob| (*glob).to_owned()));
@@ -2663,15 +2666,14 @@ fn stale_line(remote: &RemoteRun, outcome: &RemoteOutcome, words: Option<&[Strin
     } else {
         Vec::new()
     };
-    let root = Path::new(&remote.root);
-    match stale::stale_folders(
-        |globs| walk(root, globs).map(|found| found.into_iter().map(|file| file.path).collect()),
-        &judging,
-        &brought_back,
-    ) {
-        Ok(folders) => stale::stale_line(&folders),
-        Err(reason) => Some(stale::could_not_list(&reason)),
-    }
+    let siblings: Vec<(&str, &str)> = remote
+        .siblings
+        .iter()
+        .map(|sibling| (sibling.name.as_str(), sibling.root.as_str()))
+        .collect();
+    stale::stale_lines(&remote.root, &siblings, &judging, &brought_back, |root, globs| {
+        walk(Path::new(root), globs).map(|found| found.into_iter().map(|file| file.path).collect())
+    })
 }
 
 /// The command's words as text, `None` when one of them is not valid Unicode.
