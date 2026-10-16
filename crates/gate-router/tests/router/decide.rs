@@ -68,6 +68,7 @@ fn the_control_command_routes_from_the_root() {
             host: "builder-1".to_owned(),
             slots: 2,
             root: ROOT.to_owned(),
+            root_id: fake_id(ROOT),
             leaf: "a".to_owned(),
             siblings: Vec::new(),
             repo: "yaat".to_owned(),

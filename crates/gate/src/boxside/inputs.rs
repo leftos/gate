@@ -1078,7 +1078,7 @@ mod tests {
 
     /// A new, empty folder of the test `name`'s own.
     fn folder(name: &str) -> PathBuf {
-        let folder = std::env::temp_dir().join(format!("gate-inputs-{name}-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-inputs-{name}-{}", std::process::id()));
         if fs::symlink_metadata(&folder).is_ok() {
             fs::remove_dir_all(&folder).expect("an earlier run's folder is removed");
         }

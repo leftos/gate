@@ -74,6 +74,7 @@ fn git_out(case: &Case, args: &[&str]) -> String {
     for name in GIT_REDIRECTS {
         command.env_remove(name);
     }
+    crate::support::git_home_for(&mut command);
     let output = command
         .args(args)
         .current_dir(case.folder())

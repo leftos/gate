@@ -23,6 +23,8 @@ mod mutex;
 mod piped;
 mod priority;
 mod security;
+#[cfg(test)]
+mod test_support;
 mod times;
 mod token;
 mod tree;
@@ -402,7 +404,7 @@ mod tests {
 
     #[test]
     fn a_file_with_two_names_is_refused_with_no_system_error_code() {
-        let folder = std::env::temp_dir().join(format!("gate-win32-plain-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-win32-plain-{}", std::process::id()));
         // A folder left by an earlier run of the same pid is cleared first.
         let _ = fs::remove_dir_all(&folder);
         fs::create_dir_all(&folder).expect("the scratch folder is made");

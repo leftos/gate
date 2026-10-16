@@ -808,7 +808,7 @@ pub(crate) mod scratch {
     impl Scratch {
         /// A fresh root named after `test` and this process, so no two tests share one.
         pub(crate) fn new(test: &str) -> Scratch {
-            let folder = std::env::temp_dir().join(format!("gate-wait-{}-{test}", std::process::id()));
+            let folder = crate::test_support::temp_dir().join(format!("gate-wait-{}-{test}", std::process::id()));
             // A folder an earlier run of this test left behind is cleared; one that is not there is no failure.
             let _ = fs::remove_dir_all(&folder);
             fs::create_dir_all(&folder).expect("the scratch folder can be made");

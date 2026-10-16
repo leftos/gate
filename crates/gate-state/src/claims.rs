@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn a_claim_that_is_not_there_is_no_claim() {
-        let path = std::env::temp_dir().join("gate-state-no-such-claim.json");
+        let path = crate::test_support::temp_dir().join("gate-state-no-such-claim.json");
         assert!(!path.exists(), "the test's path is free");
 
         assert!(read_claim(&path).is_none(), "a claim that is gone is no claim");

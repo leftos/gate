@@ -630,7 +630,7 @@ fn say_sdks(limit: Duration, console: &mut Console) {
 /// not be read. dotnet is run as [`git::sdk_listing`] runs it, with no console interrupt and no worktree to keep it out
 /// of, ended with its job past `limit`.
 fn sdks(limit: Duration) -> Result<String, String> {
-    let listing = git::sdk_listing(Variables::from_process(), limit, None, None)?;
+    let listing = git::sdk_listing(Variables::from_process(), limit, None, &[])?;
     Ok(sdk_list(&listing))
 }
 
@@ -651,7 +651,7 @@ mod tests {
     #[expect(clippy::expect_used, reason = "a test whose git cannot start must fail loudly")]
     fn git_writes_its_stderr_through_the_output_lock() {
         let output = OutputLock::default();
-        let missing = std::env::temp_dir().join(format!("gate-preflight-no-such-repository-{}", std::process::id()));
+        let missing = crate::test_support::temp_dir().join(format!("gate-preflight-no-such-repository-{}", std::process::id()));
         let git_dir = format!("--git-dir={}", missing.display());
         let command = Git::find()
             .command(&[&git_dir, "rev-parse", "HEAD"])

@@ -77,6 +77,10 @@ To check a timing case holds under load, run it inside `~/.claude/tools/load-bur
 
 load-burn does not starve a BelowNormal process: its critical gate runs the command at High, and Windows hands a child only Idle or BelowNormal, so a test under the burn runs at Normal beside the burners. A fault that shows only in the BelowNormal full suite is reproduced by suspending just the gate under test for seconds at a time (`NtSuspendProcess` / `NtResumeProcess` on the gate.exe the suite started), which costs no burn budget; GATE-128 was found that way.
 
+A measurement that needs a quiet machine (a timing comparison, a phase profile, a before-and-after) runs on `-Slot critical`, never by waiting for other sessions' load to drop. The critical gate drains every gate first, which can take tens of minutes behind a long heavy run, then holds the machine. Keep critical runs short and few, about 5 minutes of hold for one investigation, and ask the owner before going past that.
+
+To time the suite, add `--profile timing` to the nextest command. Its junit report, with every case's seconds, lands in `target\nextest\timing\junit.xml`. To count the git processes a case starts, set `GIT_TRACE2_EVENT=<a folder under target\tmp>` on the run. It costs almost nothing, where a WMI process tracer slows a case four times over.
+
 A commit goes through the gate: `-Slot heavy -TimeoutSeconds 300 -- git commit -F .tmp/msg-<slug>.txt`.
 
 ## Docs-owner map

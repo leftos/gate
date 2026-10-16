@@ -19,6 +19,8 @@ mod model;
 mod remote;
 mod root;
 mod state;
+#[cfg(test)]
+mod test_support;
 pub mod v1;
 mod verdict;
 #[cfg(all(windows, target_pointer_width = "64"))]

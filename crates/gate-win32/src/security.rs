@@ -223,7 +223,7 @@ mod tests {
 
     /// A new, empty folder of the test `name`'s own.
     fn folder(name: &str) -> PathBuf {
-        let folder = std::env::temp_dir().join(format!("gate-win32-security-{name}-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-win32-security-{name}-{}", std::process::id()));
         if folder.exists() {
             std::fs::remove_dir_all(&folder).expect("an earlier run's folder is removed");
         }

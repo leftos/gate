@@ -421,6 +421,20 @@ The lines of a run that starts its command:
 
   A sibling folder that cannot be carried says `gate: not routed: sibling <name> <reason>`, `<reason>` being `is a link or a junction`, `is not a folder`, `has a .git that is a link or a junction`, `is the worktree's own folder` or `is the same folder as sibling <other>`.
 
+  The remote client keeps a routed run here, after the route, with `gate: not routed: <who> <why>`, status 75 and the fallback reason `client`, then `gate: remote <host> client could not start: <who> <why>; running here`. `<who>` is the worktree root's folder name for the main repository and `sibling <name>` for a sibling.
+
+  A run of one repository can say `<leaf> is not the folder the route was decided for` (the root's folder id is not the one the route read) and `<leaf> cannot be checked: <error>`.
+
+  A run that carries siblings holds every folder first and can say, for the root or a sibling, `is a link or a junction`, `is not a folder`, `has a .git that is a link or a junction`, `is not the folder the route was decided for`, `differs in case from its declared name`, `cannot be held: <error>` and `cannot be held: its path is not valid Unicode`.
+
+  For the root alone: `is under a folder that is not the one the route was decided for`, `cannot be held: it is on a network volume` and `has no parent folder`.
+
+  Once git is asked where each repository is: `<who> is not the top folder of its git repository: git names <path>`, `<who> shares its git repository with <other>` (<other> the earlier repository sharing its common git folder, by folder id), `<who> has a git folder reached through a link or a junction`, `<who> cannot be checked: <error>` (a git or common folder that cannot be opened or read).
+
+  Then `<who> cannot be laid out on the builder: <why>` (the box's reader refused the pair; <why> is its usage line without `gate: `, the main repository's name when no one sibling is at fault), `sibling <name> cannot be sent: <why>` (a sibling's git call or push failed) and, after a save or the end of the run, `<who> moved while it was held` and `<who> changed its git location while it was held`.
+
+  A lock another routed run holds past the lock wait says `gate: not routed: <who> is busy with another routed run`. A pair's root spelled other than it was at its check has no git location recorded, and fails the run with `gate: the remote run failed: the git location of <root> was not recorded at its check`, status 1 and no fallback.
+
   A gate that is not heavy, has a covering parent, matches no pattern or has no `remote.json` says nothing.
 - A local run that drops its dotnet `--no-build`, on stderr and in the log, before it takes a slot: `gate: dropped --no-build: <reason>; building on a heavy slot`, or `gate: dropped --no-build: <reason>; building on the parent gate's <heavy|critical|light> slot` for a gate covered or lent a slot ([Routing](#routing)).
 - A routed run, on stderr and in the log, after any `gate: dropped --no-build: the last build may have run on the other machine` and `gate: outputs: none brought back for a --no-build command` lines, says `gate: routed with siblings: <name> (<path>), ...` when the repo declares siblings.
@@ -442,7 +456,7 @@ The lines of a run that starts its command:
   With no figure from the builder (its sampler failed) the clause reads `load-adjusted unknown: the sampler failed` and the past-ceiling check uses `<c>`. The client's status is the gate's own, passed through as `N`.
 - The stale line, on stderr and in the log, before the passed line, when a routed dotnet build (verb `build`, `test`, `publish`, `pack`, `run` or `msbuild`, with no `--no-build` of its own) passed and did not bring everything back: `gate: routed build left stale: <folders>`.
 
-  The folders are every PC-side folder (no cap) that a judging glob matches and no brought-back glob covers, judged per file: a folder whose every matching file came back is not named. The judging globs are the run's `outputs`, or the default globs when the repo's entry is absent or `[]`, plus the defaults `**/bin/**` and `**/.godot/mono/temp/bin/**`. The folders are sorted, relative to the worktree root, `/`-separated, escaped and joined with `, `.
+  The folders are every PC-side folder (no cap) that a judging glob matches and no brought-back glob covers, judged per file: a folder whose every matching file came back is not named. The judging globs are the run's `outputs`, or the default globs when the repo's entry is absent or `[]`, plus the defaults `**/bin/**` and `**/.godot/mono/temp/bin/**`. The folders are sorted, relative to the worktree root, `/`-separated, escaped and joined with `, `. A run with siblings names a sibling's output folders the same way, relative to the main worktree (`../<sibling>/src/App/bin`).
 
   A glob names the folder where its last plain folder part ends, at the first place from the left where its plain parts match whole path components: `**/bin/**` and `**/bin/**/*.dll` name each `src/App/bin`, `out/**/App.dll` names `out`, `publish/App.exe` names `publish`; a glob with no plain folder part (`**`, `*.dll`, `**/*.dll`) names nothing. The line may name a folder this build did not touch.
 
@@ -613,7 +627,9 @@ The box command's job name comes from the payload's `Job` (`<key>` is the payloa
 
 `<k>` is the key hash: 16 lower-case hex digits, the first 8 bytes of the SHA-256 of the lower-cased work-folder key. The Rust remote client takes the routed lock without waiting, before the remote slot, and holds it for the whole remote attempt ([Routing](#routing)).
 
-`<v>` and `<f>` are the worktree lock's folder id: the volume serial number as 16 lower-case hex digits and the 128-bit file id as 32, read from the worktree root opened following links, so two spellings of one folder share one lock. A sync-back takes it for each worktree it has a back commit for, waiting for another run's hold ([Routing](#routing), Sync-back).
+`<v>` and `<f>` are the worktree lock's folder id: the volume serial number as 16 lower-case hex digits and the 128-bit file id as 32, read from the worktree root opened following links, so two spellings of one folder share one lock.
+
+Every routed run takes it for its main root and each carried sibling before its snapshots and holds it until its last push is saved, and a sync-back takes it again for each worktree it has a back commit for, each waiting for another run's hold ([Routing](#routing), The worktree lock).
 
 The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Critical drain and nesting](#critical-drain-and-nesting)).
 
@@ -1259,9 +1275,11 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A failure to read says `gate: not routed: cannot read the sibling folder <path>: <error>`.
 
-  The folder ids are the volume serial and 128-bit file id of each open folder. A repo with no file declares no siblings and nothing changes, except that the root's own folder id is read for every matched command, siblings or none, once the declared siblings are found: a root whose id cannot be read keeps the run here with `gate: not routed: cannot read the id of the worktree folder <root>: <error>`, since the sync-back's worktree lock is named by it.
+  The folder ids are the volume serial and 128-bit file id of each open folder. A repo with no file declares no siblings and nothing changes, except that the root's own folder id is read for every matched command, siblings or none, once the declared siblings are found.
 
-  git is found along the gate's own `PATH` (absolute entries only) and run by its full path from the gate's folder, with the `GIT_*` variables that point it at another repository, index or config removed and `core.fsmonitor` off, so a gate in a hook that exports `GIT_DIR` still routes.
+  A root whose id cannot be read keeps the run here with `gate: not routed: cannot read the id of the worktree folder <root>: <error>`, since the worktree lock of every routed run is named by it, and the client checks the folder it opens against it.
+
+  git is found along the gate's own `PATH` (absolute entries only) and run by its full path from the gate's folder, with the `GIT_*` variables that point it at another repository, index or config removed and `core.fsmonitor` off and `core.hooksPath` pointing at a folder that cannot exist (inside the git program's own file), so a gate in a hook that exports `GIT_DIR` still routes and no hook a repository's config names runs.
 
   Each call gets 60 s, after which git is killed and the gate runs here saying `gate: not routed: git did not answer within 60 s` (in whole milliseconds, `1 ms`, when `--test-git-limit-ms` sets a limit that is not a whole number of seconds).
 
@@ -1294,6 +1312,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A path runs to the first of `, ; " ' ) | & < >`. In a word that holds one of those or a line break (a script word: a script's text or a list) white space ends a path too; in any other word, one argument, a path runs through its spaces.
 
+  The router keeps this `subst` model for anyone who routes from a subst drive; its tests use a made-up drive letter, never a mapping of the machine they run on.
+
   A drive other than the root's is followed through `subst` mappings as a chain, at most 26 hops with a visited set, and the root's own letter is never asked; a cycle, an unreadable device or a target that is not a `\??\` path gives no spelling, and the run stays local.
 
   A bare first word (no separator, drive or `.`/`..`) becomes `./name` only when that file exists in the gate's folder; otherwise it stays bare, for the builder's `PATH`.
@@ -1325,7 +1345,13 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   The snapshot copies the real index to `<git path>/gate-remote-<pid>.index` (a leftover copy and its `.index.lock` are removed first; the copy is empty when the repo has no index). With `GIT_INDEX_FILE` on the copy it runs `git add -A`, `git write-tree` and `git commit-tree --no-gpg-sign` with no parent, under the identity `gate-remote <gate-remote@localhost>` and with `GIT_AUTHOR_DATE` and `GIT_COMMITTER_DATE` removed.
 
-  The copy is always removed, and the real index and the worktree are never touched, so both are byte-identical before and after a snapshot. The snapshot takes a list of roots, one entry today.
+  The copy is always removed, and the real index and the worktree are never touched, so both are byte-identical before and after a snapshot. The snapshot takes a list of roots, one a repository: the main one, then a pair's siblings in declared order.
+
+  For a pair every git call about a repository is given `GIT_CEILING_DIRECTORIES` set to the root's parent, so git never reaches a repository above it.
+
+  Once the repository's place is checked (its top folder is its root, see [Output lines](#output-lines)), each later call is given `GIT_DIR`, `GIT_WORK_TREE` and `GIT_COMMON_DIR` outright, as git printed them, so a `core.worktree`, a `commondir` or a `gitdir:` written after the check cannot point it elsewhere; the place is asked again after each save and a different one keeps the run here.
+
+  Every git call runs with `core.hooksPath` off. A clean filter in a repository's own config still runs during the snapshot's `git add`: the repository's config is the user's, an accepted risk.
 
   The bridge commit has the snapshot's tree and, as its parent, the newest local `refs/gate-remote/*` not ending `-back`; with none it has no parent. The push writes `refs/gate-remote/<key>` once the builder has the snapshot.
 
@@ -1344,7 +1370,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   Once git has exited, its readers get 2 s to reach their pipes' ends (the routing decision's calls, `--test-git-drain-ms` of them), else the call fails with `cannot read git's output: it did not end within <n> s of git's exit`, `<n>` being the call's own drain in whole seconds. A failure line carries the last 10 of git's lines joined by ` | `, escaped and cut to the last 4 KiB at a whole escape.
 
-  Of the test seams, `--test-remote-snapshot` and `--test-remote-transport` give the client a stand-in. The first makes the snapshot, says `gate: remote snapshot <sha> bridge <sha or none>` on stderr and in the log, and ends with status 0. A snapshot that fails says `gate: the remote run failed: git <args> failed in <root> (status <n>): <git's lines joined by ' | '>` and ends with status 1, with no fallback.
+  Of the test seams, `--test-remote-snapshot` and `--test-remote-transport` give the client a stand-in. The first makes the snapshot of each worktree of the call, the main one then a pair's siblings in declared order, says `gate: remote snapshot <sha> bridge <sha or none>` on stderr and in the log, one line a worktree, and ends with status 0.
+
+  A snapshot that fails says `gate: the remote run failed: git <args> failed in <root> (status <n>): <git's lines joined by ' | '>` and ends with status 1, with no fallback.
 
   Ctrl+C ends it with `STATUS_CONTROL_C_EXIT` and no line. A log that cannot be written gives status 1, with no fallback.
 - **The remote client's run** (GATE-43, parts B1, B2, C1 and C2) is built in `remote/{client,parity,payload,retry,syncback,transport,watchdog}.rs`, in every build. Every routed run goes through the Rust client over ssh (`RustClient` in `remote/client.rs`, chosen in `remote/mod.rs`).
@@ -1365,7 +1393,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   - **Lock.** The run takes the routed lock, `Local\gate-[<root hash>-]routed-<16 hex>` ([Kernel object names](#kernel-object-names)), before the remote slot, with a zero wait, and holds it for the whole remote attempt.
 
     A lock held elsewhere says `gate: remote <host> busy; running here` and falls back `busy` before any queueing, so two routed runs of one worktree give a deterministic `busy`, not a race. A lock that cannot be opened or taken says `gate: cannot open the mutex <name>: <error>` or `gate: cannot take the mutex <name>: <error>`, then the busy line.
-  - **Snapshot.** Part A's snapshot and bridge commit.
+  - **Hold.** The run takes the worktree locks of its main root and each carried sibling ([Sync-back](#routing), The worktree lock) and, for a pair, holds its folders ([Sibling worktrees](#routing)); one it cannot hold keeps the run here ([Output lines](#output-lines)).
+  - **Snapshot.** Part A's snapshot and bridge commit, for each repository of a pair.
   - **Run line.** The run call's cmd line is the fixed `"%LOCALAPPDATA%\gate\bin\gate.exe" box run --stdin`, the same whatever the run holds; every other `gate box` call's line differs only in its verb. The request, base64 of compact UTF-8 JSON, is the first line of the call's stdin, followed for the run call by the outputs manifest line, so no request size is capped by a command line. The box reads the request line with a cap of 16 MiB, newline included ([The box side](#the-box-side)).
   - **Preflight.** `gate box preflight` over ssh. Status 255, ssh's own status for a lost connection, says `gate: remote <host> unreachable: <last stderr line>` and falls back `unreachable`; the line is the last `\r` update of the last stderr line, its first 4 KiB, escaped (Escaping, below). Status 9009 or 2 (no `gate box` verb there) says `gate: not routed: <host> has no gate box that takes this run (preflight status <n>)` and falls back `version`.
 
@@ -1444,6 +1473,10 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     The builder keeps one bare repo per repo name, `<builder root>/<repo>.git`, shared by every key of that repo; the key is only the ref's name.
 
     The size is read from git's last `Writing objects: 100%` line, ignoring `remote:` lines, and only a number with a unit (or `bytes`) counts as one, else the line says `up to date`. Failure says `gate: pushing the snapshot to <url> failed (status <n>)` and falls back `unreachable`.
+
+    A pair pushes each repo in order, the main one first, under one transfer clock started before the first push, and says `gate: remote pushed snapshot <repo> <8 hex> in <s> s (<size>|up to date)` for each; a failure says `gate: pushing the snapshot of <repo> to <url> failed (status <n>)`. The run's push time is the pushes' sum.
+
+    The push is given `GIT_ALLOW_PROTOCOL`, `ssh` (`file` for the test transport's local bare repositories), which git reads in place of every `protocol.*.allow`, so no `pushInsteadOf` or protocol setting a repository's config names can turn the push into a protocol helper's.
   - **Run call.** The line goes over `ssh -o RequestTTY=no -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ForwardAgent=no -o ClearAllForwardings=yes -o Compression=yes -- <host> <line>`, each argument separate.
 
     `-o RequestTTY=no` leads the options of every `gate box` call and `gate push`'s, so stdin never passes through a pseudo-terminal. The last option, `-o Compression=yes`, is the run call's alone: the preflight, stop, boot and outputs calls, git's ssh command and `gate push` ask for none. The run call's compression covers both directions of its connection: the command's output and protocol lines one way, the request and the outputs manifest the other.
@@ -1575,8 +1608,12 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     - A `fetch` that fails before the banner is not retried when its job wrote more than 1 MiB.
     - **The worktree lock.** A sync-back with a back commit takes the mutex of each worktree it will write ([Kernel object names](#kernel-object-names)), the main one's alone for a single repository, before its fetch and holds it until the sync-back ends, the quarantine and any patch removed, so two runs that write one folder, under one spelling of its path or two, never write it at once.
 
+      The client takes the same locks for every routed run, a single repository's and a pair's alike, for its main root and each carried sibling, before its snapshots (`Attempt::hold_run`), and holds them until its last push is saved, so no other run's sync-back writes a folder while it is snapshotted and pushed.
+
+      A folder that is not the one the route was decided for, by its id, is not routed. One another run holds past the lock wait keeps the run here with `gate: not routed: <who> is busy with another routed run` (the routed-run lines, [Output lines](#output-lines)), where the sync-back's wait fails the run as below.
+
       The locks are taken in the order of the folders' ids, one per folder. One another run holds is waited for, up to the attempt's lock wait (the 60 s git limit, counted from the first lock asked for), saying once `gate: remote waiting for the worktree <name>: another run holds it`; a wait past it fails the run with `another run held the worktree <name> for more than <n> s`, and a Ctrl+C ends the wait as an interrupt. A lock left by a holder that ended is taken.
-    - **A pair's sync-back** (a run that carries siblings, built in `remote/syncback.rs` and the box, not yet reached by a routed run while the client stays local for siblings) is all or nothing across its repos. It applies only the back commits of the box's last stderr line `gate: remote back commits: <name> <sha|none>, ...` (a standard output line never counts), which must name exactly the pair's repos, the main one first, in order.
+    - **A pair's sync-back** (a run that carries siblings, built in `remote/syncback.rs` and the box) is all or nothing across its repos. It applies only the back commits of the box's last stderr line `gate: remote back commits: <name> <sha|none>, ...` (a standard output line never counts), which must name exactly the pair's repos, the main one first, in order.
 
       A line that is missing, malformed or names other repos says `gate: remote changes not applied: the builder did not say which commits it made`; a pair whose sibling snapshots do not match its siblings says `gate: remote changes not applied: the run's sibling snapshots do not match its siblings`. Either applies nothing and a passing run becomes 1; its outputs are then not brought back, `gate: remote outputs not brought back: the pair's remote changes were not applied`.
 
@@ -1757,7 +1794,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   **Escaping.** Every text a builder supplies that a `gate:` line quotes is escaped: control characters, U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069, U+2028 and U+2029 are written `\u{..}`. That covers the preflight's last line, the builder's version in the version refusal, and every `git ... failed` line of the snapshot, the saved ref and the sync-back. A failed git line lists git's stdout first and its stderr last, keeping the last 10 lines and 4 KiB so git's `fatal:` line survives.
 
   The client's git calls also drop `GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and every `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n`, so the caller's git configuration never reaches the builder's repo, and `GIT_SSH_VARIANT` and `GIT_EXTERNAL_DIFF`, so neither the ssh option syntax nor the diff a sync-back applies can be changed from outside.
-- **Sibling worktrees** (GATE-19, GATE-213), the declaration, the machine's consent, the decision, the rewrite and the PC's sync-back built, the snapshot send planned: some repos' builds reach into a sibling repo by relative path, and a routed run that sends one worktree's snapshot would compile something different on the builder without any error.
+- **Sibling worktrees** (GATE-19, GATE-213), the declaration, the machine's consent, the decision, the rewrite and the PC's sync-back and the client's send built: some repos' builds reach into a sibling repo by relative path, and a routed run that sends one worktree's snapshot would compile something different on the builder without any error.
 
   A repo declares its siblings in a tracked file of its own, `.gate/siblings.toml`, beside the [toolchain manifest](#routing) and apart from it, so a fault in one never changes what the other means.
 
@@ -1781,21 +1818,29 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A declared sibling is checked in this order, the first fault keeping a matched run here with its line ([Routing](#routing), the decision): its name, the machine's consent, the root's folder name, then each folder, then the folder ids.
 
-  A sibling that passes all is carried: the route records the root's folder name and each carried sibling, `RemoteRun.leaf` and `RemoteRun.siblings` (its name, its root and its folder's id), and the run says `gate: routed with siblings: <name> (<path>), ...`. Nothing is sent to the builder yet.
+  A sibling that passes all is carried: the route records the root's folder name and each carried sibling, `RemoteRun.leaf` and `RemoteRun.siblings` (its name, its root and its folder's id), and the run says `gate: routed with siblings: <name> (<path>), ...`.
 
   Before the run takes its slot, the client re-checks each carried sibling's name and root as text and reads no folder (`remote/carried.rs`); one that fails falls the run back here with the client fallback reason, so no sibling is dropped from a run that is sent.
-
-  While the builder takes no sibling pairs, the Rust client stays local for any call carrying a sibling, before any ssh call or push: it says `gate: not routed: sibling <first sibling's name> the builder does not take sibling pairs yet`, then `gate: remote <host> client could not start: sibling pairs are off; running here`, and journals a `fallback` with reason `client`. A call with no siblings is unaffected.
 
   How a word naming a sibling is rewritten is under Routing (The in-worktree path rewrite).
 
   The box side of a sibling pair is built ([The box side](#the-box-side)): the payload's `Pair` and `SiblingSnapshots`, a bare repository per repo, the work folder laid out as `Work\{leaf}` and `Work\{sibling}` under the layout record, and back commits all or nothing across the repos, so relative paths between the trees resolve.
 
-  The PC's sync-back of a pair is built too, all or nothing across the repos (Sync-back, under [Routing](#routing)), but the client sends no `Pair` yet, so no routed run reaches it; still planned: a routed gate in a repo with siblings will snapshot each sibling's worktree and send it with the run.
+  The PC's sync-back of a pair is built too, all or nothing across the repos (Sync-back, under [Routing](#routing)).
 
-  `remote/held.rs` is the holder of a pair's folders for that send: the root's parent is opened once, the root and each sibling are opened beneath it without following a link, their ids, final paths, case, reparse points and `.git` are checked, a network volume is refused, the handles are held without delete sharing, and a recheck opens each path as git would. Nothing calls it yet, so its refusals (`gate: not routed: sibling <name> <why>`) are not said by any run.
+  The client sends the pair: the payload's `Pair` and `SiblingSnapshots` carry the main repository's snapshot and one for each sibling, in declared order, and the pushes, the parity check and the sync-back cover every repository.
 
-  Sibling support lands before a repo with siblings is enabled for routing; a repo without siblings is enabled without it.
+  The client's side of a pair, in order: it holds the folders (`remote/held.rs`) and takes the worktree locks; asks git where each repository is (its top folder, git folder and common git folder, in one `git rev-parse` bounded at the root's parent) and holds the git folders too; snapshots each repository at the place git found, reading the folders again after each snapshot.
+
+  It then reads the payload back with the box's own reader, so a pair the box would refuse stays here; checks toolchain parity for each repository; pushes each and saves each local ref; and lets the folders and locks go before the run call.
+
+  Parity is checked for each repository in order: a sibling's SDK need is read from its own `global.json` and its lines name it, and the tools are the main repository's manifest alone. A builder that lacks anything says one `gate: remote toolchain mismatch: <repo> needs ...` line per need and falls back `parity` once.
+
+  `remote/held.rs` holds a pair's folders from the check until the client lets them go: the root's parent is opened once, following links, on a local volume (a network volume is refused), and the root and each sibling are opened beneath it as themselves, never through a link, each with its `.git` entry (a folder or a linked worktree's file, no reparse point of any kind). Each is checked against the exact path the route was decided for and, the root and a sibling, its folder id.
+
+  Every handle shares reading and writing but not deletion, so none of these can be renamed, removed or swapped for a link while held. Once git has said where each repository's git folder and common folder are, those are held too, so a linked worktree's git folder, which lies outside the pair's parent, is covered; one reached through a link or a junction is refused. A recheck reads every path again and opens each as git does, to see that it still leads to the held folder.
+
+  Two repositories whose common git folders have one folder id share a repository and keep the run here. The refusals are the `gate: not routed: <who> <why>` lines of [Output lines](#output-lines), the main repository said by the root's folder name.
 - **Inputs** (GATE-22): a routed command can need ignored files only the PC has, and the snapshot sends only tracked and untracked-not-ignored files. A repo's optional `inputs` list of ignored-file globs, beside `outputs` in the routing file, names the ignored files a routed run sends to the builder's work folder before the run, compressed in the outputs archive's format and hash-diffed against what the work folder holds, so an unchanged input costs nothing.
 
   The design is [plans/remote-inputs.md](plans/remote-inputs.md).
@@ -2299,6 +2344,8 @@ During the drain a PowerShell gate neither reads `gate.exe`'s tickets nor signal
 
 ops-tower follows the flag: it reads the PowerShell gate's files until the flag exists and then `v1\`, plus the PowerShell claims of a slot whose mutex is open, and its waiters come from `gate.exe`'s tickets ([Common rules](#common-rules)). The hooks and scripts that read gate command lines or output (inventory section 4) change in the same drain.
 
+The caller sweep deletes each repo's `tools/gate.ps1` in the same change that switches that repo's docs and scripts to `gate run`; no hand-over shim is kept. Callers write `gate run --log <path> --timeout <s> --slot <kind> -- <command>` (`--stall`, `--tail`, `--no-markers`, `--local`; `gate stop-tree <pid>`), never `gate.exe` or a path. `tools/install.ps1` builds with a plain `cargo build`, not through a gate, so a broken installed gate can always be replaced.
+
 After the caller sweep there is no fallback: callers run `gate ...` on PATH, a machine without it gets "command not found", and each repo's docs name the install script. Before the sweep, the PowerShell launcher's own fallback for a machine without the gate (H2) is the launcher's, not `gate.exe`'s.
 
 The compatibility layer is deleted once no caller uses `-Log`, `-TimeoutSeconds` or `-Slot`. The guard launcher stays: `sync-launchers.ps1` publishes both launchers.
@@ -2335,6 +2382,11 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   The load rule: a case never asserts that something did or did not happen within a wall-clock window a loaded PC can cross. A case that expects a kill runs a command that sleeps until killed (`support::UNTIL_KILLED`), so a starved gate is late, never wrong.
 
   A case that cannot be written without a timer is a machine-alone case, `#[ignore = "needs the machine alone: run with -Slot critical and --ignored"]`, listed in the nextup profile and run on a critical gate with `--run-ignored only`. Widening a window until it passes on one PC is not a fix: it fails again on a busier one.
+- **Git home.** Every git the suite starts, in a case or a harness helper, reads the suite's own git home, `<workspace>\target\tmp\git-home`, not the developer's `~/.gitconfig` and `~/.config/git`: `HOME` and `XDG_CONFIG_HOME` point at it (`support::git_home_for`), the inherited `GIT_CONFIG_*` variables are removed as the gate removes them, and its `.gitconfig` and `git\attributes` are written once per test process. The config pins line endings, longpaths, `untrackedCache`, and auto-maintenance and gc off, so a case's git behaves the same on every PC. A case that tests the gate's own git environment (`routing`, `syncback_conversions`' `isolated`) sets its own values after `prepare`. Auto-maintenance stays on in the product; only the suite turns it off.
+- **Unit-test scratch folders.** The unit tests of `gate`, `gate-state` and `gate-win32` write under `target\tmp\unit-<crate>`, through each crate's `#[cfg(test)]` `test_support::temp_dir()`, not `%TEMP%`. One unit test keeps `%TEMP%`: the one in `remote/mod.rs` that needs a path outside any checkout, since everything under `target` is inside the worktree. Two suite cases in `tests/suite/durations.rs` also keep it: one runs from a folder outside any git repository, and the other only builds a path under the system temp root.
+- **Why the files stay under `target`.** `%TEMP%` lies outside the excluded tree and is scanned, which slows every file create and git start there; the suite keeps its files under `target`, which is excluded.
+- **Timing the suite.** `cargo nextest run --profile timing` (the `timing` profile in `.config/nextest.toml`; the default profile is unchanged) writes a junit report of every case's time to `target\nextest\timing\junit.xml`. To count git processes, set `GIT_TRACE2_EVENT=<folder>`: each git writes a trace file there, at near-zero cost. A process tracer built on WMI is too heavy to time with, since it slows the very starts it counts.
+- **What a routed case costs.** A routed case's time is about its git process count divided by the PC's git start rate, so 16 test threads queue on git starts, not on CPU. A change that makes the suite faster removes git processes or makes each start cheaper; adding threads does not.
 - **Test seams.** Hidden `--test-*` flags, compiled only with the `test-seams` cargo feature, set the timing knobs: `--test-sample-ms` (sample period), `--test-heartbeat-ms` (wait heartbeat; on `gate box` the command heartbeat's period), `--test-poll-ms` (fallback poll) and `--test-stall-ms` (stall window below a second). Each takes whole milliseconds above 0 on `gate run`. The sample and stall knobs drive the watchdog.
 
   Two seams of `gate box` shape the command's console: `--test-box-console fail-before` makes the UTF-8 console fail before the command starts, and `--test-box-park-launch <path>` parks the launch until `<path>` exists ([The box side](#the-box-side)). `--test-box-token refused` refuses the start with the restricted token, for the fallback to the box's own token. `--test-outputs-budget-bytes <n>` replaces the 50 GiB outputs budget of the box's trim.
@@ -2382,6 +2434,14 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   `--test-remote-interrupt-at <preflight|run|outputs|install|sdks|stop|manifest|apply>` makes the client raise the console interrupt itself after that call's first output byte; `install` raises it before the second file's move, so an install of one file is never interrupted, and `sdks` just before the parity check reads this PC's SDK list with `dotnet --list-sdks`; `manifest` just before it reads the snapshot's `.gate/toolchain.toml`; `apply` once a pair's sync-back has checked every patch and before it applies the first (no output byte is waited for); `stop` raises it at the run call's first byte and again while the stop call runs.
 
   `--test-remote-backstop-ms <n>` (whole milliseconds above 0) replaces the run call's backstop of 5 x `--timeout` + 60 s for the client, counted from the run call's start.
+
+  `--test-remote-tamper <point>:<step>` makes the client change its own folders at one point of its run, so a case can change a folder after the route checked it. It exists only in a `test-seams` build and needs `--test-remote-transport`.
+
+  The values are `before-hold:case` (the first sibling's folder renamed to upper case), `before-hold:replace` (the first sibling replaced by a new folder holding an empty `.git`), `before-hold:replace-root` (the worktree root replaced the same way) and `after-first-snapshot:worktree` (a `core.worktree` written into the first sibling's git config, naming the folder beside it with `-canary` after its name).
+
+  The first three are made before the client holds the run's folders, the last once the main repository's snapshot is taken (`remote/tamper.rs`).
+
+  Refused without the transport with `gate: --test-remote-tamper needs --test-remote-transport`, and a value outside those four with `gate: --test-remote-tamper must be before-hold:case, before-hold:replace, before-hold:replace-root or after-first-snapshot:worktree, got '<v>'`. `--test-print-request` does not show it.
 
   `--test-remote-timeout-ms <n>` (whole milliseconds above 0) applies only under `--test-remote-watch-call` naming a call other than `run`, as that call's transfer ceiling; given with `--test-remote-transport` without such a call it is refused with `gate: --test-remote-timeout-ms needs --test-remote-watch-call naming a call other than run`.
 

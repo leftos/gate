@@ -181,6 +181,19 @@ impl Pair {
     }
 }
 
+/// Why the box refuses a run's `Pair`: the usage line, and the sibling it names when one sibling alone is refused.
+#[derive(Debug)]
+pub(crate) struct PairRefused {
+    pub(crate) line: String,
+    pub(crate) sibling: Option<String>,
+}
+
+impl From<String> for PairRefused {
+    fn from(line: String) -> PairRefused {
+        PairRefused { line, sibling: None }
+    }
+}
+
 /// One sibling of a [`Pair`]: its folder name and its bare repository, `{root}\{repo_name(name)}.git` beside the main's,
 /// derived on the box and never read from the payload.
 pub(crate) struct PairSibling {
@@ -206,6 +219,12 @@ impl Payload {
     /// (`<repo_name(leaf)>-<8 hex>`), a `Bare` that is not `<root>\<name>.git` for the work folder `<root>\work\<key>`,
     /// or two bare repositories (the main's and each sibling's `<repo_name(name)>.git`) equal ignoring ASCII case.
     pub(crate) fn pair(&self) -> Result<Option<Pair>, String> {
+        self.laid_out().map_err(|refused| refused.line)
+    }
+
+    /// The run's sibling `Pair` as [`Payload::pair`] reads it; else its usage line and, when it refuses one sibling's
+    /// bare repository, that sibling's name.
+    pub(crate) fn laid_out(&self) -> Result<Option<Pair>, PairRefused> {
         let (leaf, names) = match self.0.get("Pair") {
             None | Some(Value::Null) => return Ok(None),
             Some(value) => pair_names(value)?,
@@ -213,31 +232,24 @@ impl Payload {
         check_pair_names(&leaf, &names)?;
         let (key, work) = self.work_folder()?;
         if !is_key_of(key, &leaf) {
-            return Err(format!(
-                "gate: box payload Key {key} is not the work-folder key of the Pair's Leaf {leaf}"
-            ));
+            return Err(format!("gate: box payload Key {key} is not the work-folder key of the Pair's Leaf {leaf}").into());
         }
         let bare = self.path("Bare")?;
         let Some(root) = grandparent(work) else {
-            return Err(format!(
-                r"gate: box payload Work must be <root>\work\<key> with a Pair: {}",
-                escaped(work)
-            ));
+            return Err(format!(r"gate: box payload Work must be <root>\work\<key> with a Pair: {}", escaped(work)).into());
         };
         let Some(main_stem) = bare_stem(bare, root) else {
-            return Err(format!(
-                r"gate: box payload Bare must be {root}\<name>.git with a Pair: {}",
-                escaped(bare)
-            ));
+            return Err(format!(r"gate: box payload Bare must be {root}\<name>.git with a Pair: {}", escaped(bare)).into());
         };
         let mut stems = vec![main_stem.to_owned()];
         let mut siblings = Vec::with_capacity(names.len());
         for name in names {
             let stem = repo_name(&name);
             if stems.iter().any(|taken| taken.eq_ignore_ascii_case(&stem)) {
-                return Err(format!(
-                    "gate: box payload Pair sibling {name} would share the bare repository {stem}.git"
-                ));
+                return Err(PairRefused {
+                    line: format!("gate: box payload Pair sibling {name} would share the bare repository {stem}.git"),
+                    sibling: Some(name),
+                });
             }
             siblings.push(PairSibling {
                 bare: format!(r"{root}\{stem}.git"),

@@ -511,8 +511,12 @@ fn the_routed_call_carries_the_leaf_and_the_allowed_siblings() {
     let alone_call = recorded(&alone_call);
     assert_eq!((&alone_call["leaf"], &alone_call["siblings"]), (&json!(leaf), &json!([])), "{alone_call}");
 
+    let alone_root_id = alone_call["rootId"].as_str().expect("the call carries the root's id");
+    assert_eq!(alone_root_id.len(), 16 + 1 + 32, "the volume serial and the file id: {alone_root_id}");
+
     let call = recorded(&call);
     assert_eq!(call["leaf"], json!(leaf), "{call}");
+    assert_eq!(call["rootId"].as_str(), Some(alone_root_id), "the root's id is read once a route: {call}");
     let root = call["root"].as_str().expect("the call has a root");
     let sibling_root = format!("{}/{name}", root.rsplit_once('/').expect("the root has a parent").0);
     let siblings = call["siblings"].as_array().expect("the call has siblings");

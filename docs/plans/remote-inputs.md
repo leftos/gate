@@ -4,7 +4,7 @@ A routed command can need ignored files only the PC has: an integration-test gro
 
 The map is `.tmp/map-gate-22.md` (not committed; its facts are quoted here where a decision rests on them). Every decision below is an orchestrator decision under the `gate-nextup` profile ("Decisions"), open to the owner.
 
-Branch: `feat/remote-inputs`, cut from `main` after GATE-228 merges `feat/toolchain-manifest` (it builds on GATE-282's stdin requests). Large: a routing-file key, a client phase, a new box verb, a box install step and record, two seams, a fallback reason.
+Branch: `feat/remote-inputs`, cut from `main` at 43b288c (it builds on GATE-282's stdin requests). Large: a routing-file key, a client phase, a new box verb, a box install step and record, two seams, a fallback reason.
 
 ## Decisions
 

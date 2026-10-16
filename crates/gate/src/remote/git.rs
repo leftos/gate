@@ -176,7 +176,8 @@ impl Git {
 
     /// git asked about `folder` alone, as every call starts it: the location and config variables removed,
     /// [`NO_CURRENT_FOLDER`] set, so the ssh git starts finds no program by name in the gate's working folder, `-C
-    /// <folder>`, and no file-system monitor. Its arguments, streams and start are the caller's.
+    /// <folder>`, no file-system monitor, and its hooks read from a folder that cannot exist, inside the git program's
+    /// own file, so no hook a repository's config names runs. Its arguments, streams and start are the caller's.
     pub(crate) fn command(&self, folder: &Path) -> Command {
         let mut command = Command::new(&self.program);
         command.env(NO_CURRENT_FOLDER, "1");
@@ -188,7 +189,9 @@ impl Git {
                 command.env_remove(name);
             }
         }
-        command.arg("-C").arg(folder).args(["-c", "core.fsmonitor=false"]);
+        let mut hooks = OsString::from("core.hooksPath=");
+        hooks.push(self.program.join("hooks"));
+        command.arg("-C").arg(folder).args(["-c", "core.fsmonitor=false", "-c"]).arg(hooks);
         command
     }
 
@@ -227,15 +230,15 @@ struct Spawn<'a> {
 }
 
 /// A program other than git started, bounded and ended as the client's git calls are ([`program_output`]): its name,
-/// looked for along a `PATH`, its arguments, how long it may take, the console interrupt that ends it, the worktree it
-/// must not be found inside, the console it is created on: this process's, or a hidden one of its own; and the bytes
-/// fed on its standard input, which is then closed, `None` for none.
+/// looked for along a `PATH`, its arguments, how long it may take, the console interrupt that ends it, the worktrees it
+/// must not be found inside, none for no such check, the console it is created on: this process's, or a hidden one of
+/// its own; and the bytes fed on its standard input, which is then closed, `None` for none.
 pub(crate) struct ProgramCall<'a> {
     pub program: &'a str,
     pub args: &'a [&'a str],
     pub limit: Duration,
     pub interrupt: Option<Interrupt>,
-    pub worktree: Option<&'a Path>,
+    pub worktrees: &'a [&'a Path],
     pub console: PipedConsole,
     pub stdin: Option<&'a [u8]>,
 }
@@ -302,9 +305,10 @@ pub(crate) fn program_output(call: &ProgramCall<'_>, place: &ProgramPlace) -> Re
         Err(message) if message == gate_win32::win32_message(ERROR_FILE_NOT_FOUND) => return Ok(None),
         Err(message) => return Err(cannot_run(message)),
     };
-    let target = match call.worktree {
-        Some(worktree) => judged(&found, worktree).map_err(cannot_run)?,
-        None => found.clone(),
+    let target = if call.worktrees.is_empty() {
+        found.clone()
+    } else {
+        judged_among(&found, call.worktrees).map_err(cannot_run)?
     };
     let bounds = Call {
         interrupt: call.interrupt,
@@ -323,16 +327,16 @@ pub(crate) fn program_output(call: &ProgramCall<'_>, place: &ProgramPlace) -> Re
 }
 
 /// What `dotnet --list-sdks` lists, empty when no dotnet is found; dotnet is run as [`program_output`] runs a program,
-/// with `variables`, `limit`, `interrupt` and `worktree`, and a failed read's reason carries the last lines of its
+/// with `variables`, `limit`, `interrupt` and `worktrees`, and a failed read's reason carries the last lines of its
 /// standard error. This PC's parity check and the builder's preflight both read the list this way. Else why the list
 /// cannot be read, or [`GitError::Interrupted`].
-pub(crate) fn sdk_listing(variables: Variables, limit: Duration, interrupt: Option<Interrupt>, worktree: Option<&Path>) -> Result<String, GitError> {
+pub(crate) fn sdk_listing(variables: Variables, limit: Duration, interrupt: Option<Interrupt>, worktrees: &[&Path]) -> Result<String, GitError> {
     let call = ProgramCall {
         program: "dotnet",
         args: &["--list-sdks"],
         limit,
         interrupt,
-        worktree,
+        worktrees,
         console: PipedConsole::Attached,
         stdin: None,
     };
@@ -365,8 +369,14 @@ pub(crate) fn sdk_listing(variables: Variables, limit: Duration, interrupt: Opti
 /// judged so. The refusal covers only the file launched: a program it starts in turn (a multi-call proxy such as
 /// rustup's, a shim) is not judged.
 pub(crate) fn judged(program: &Path, worktree: &Path) -> Result<PathBuf, String> {
+    judged_among(program, &[worktree])
+}
+
+/// The file `program` leads to, read once as [`judged`] reads it, refused when it lies inside any of `worktrees`: a
+/// sibling pair's repositories are each a worktree no program of the run may come from.
+fn judged_among(program: &Path, worktrees: &[&Path]) -> Result<PathBuf, String> {
     let target = resolved(program);
-    if is_within(&target, &resolved(worktree)) {
+    if worktrees.iter().any(|worktree| is_within(&target, &resolved(worktree))) {
         return Err(format!("{} lies inside the worktree", program.display()));
     }
     Ok(without_verbatim(&target))
@@ -1007,10 +1017,10 @@ mod tests {
         wait_until_gone(pid, started);
     }
 
-    /// A folder of its own in the temporary folder for the case `name` of this process, holding a `dotnet.cmd` that runs
-    /// `body` after `@echo off`, and the `PATH` that names it alone.
+    /// A folder of its own in the unit tests' temp folder for the case `name` of this process, holding a `dotnet.cmd`
+    /// that runs `body` after `@echo off`, and the `PATH` that names it alone.
     fn dotnet_folder(name: &str, body: &str) -> (PathBuf, Variables) {
-        let folder = std::env::temp_dir().join(format!("gate-sdk-{name}-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-sdk-{name}-{}", std::process::id()));
         drop(fs::remove_dir_all(&folder));
         fs::create_dir_all(&folder).expect("the stub's folder can be made");
         fs::write(folder.join("dotnet.cmd"), format!("@echo off\r\n{body}")).expect("the stub dotnet can be written");
@@ -1054,7 +1064,7 @@ mod tests {
         let interrupt = Interrupt::install().expect("the console handler is installed");
         // The hang guard as limit: in a passing run only the interrupt ends the call.
         let (ended, pid, started) = thread::scope(|scope| {
-            let running = scope.spawn(|| sdk_listing(variables, HANG_GUARD, Some(interrupt), None));
+            let running = scope.spawn(|| sdk_listing(variables, HANG_GUARD, Some(interrupt), &[]));
             let pid = pid_while_running(&pid_file, &running);
             let started = gate_win32::process_start_of(pid).expect("the stub can be looked for");
             interrupt.raise();
@@ -1069,7 +1079,7 @@ mod tests {
         let (folder, variables) = dotnet_folder("failing", ">&2 echo first\r\n>&2 echo the SDK resolver failed\r\nexit /b 3\r\n");
         let _removed = Removed(folder);
 
-        let read = sdk_listing(variables, HANG_GUARD, None, None);
+        let read = sdk_listing(variables, HANG_GUARD, None, &[]);
 
         let said = "dotnet --list-sdks exited with status 3: first | the SDK resolver failed";
         assert_eq!(read, Err(GitError::Failed(said.to_owned())));
@@ -1080,7 +1090,7 @@ mod tests {
         let (folder, variables) = dotnet_folder("failing-quiet", "exit /b 3\r\n");
         let _removed = Removed(folder);
 
-        let read = sdk_listing(variables, HANG_GUARD, None, None);
+        let read = sdk_listing(variables, HANG_GUARD, None, &[]);
 
         assert_eq!(read, Err(GitError::Failed("dotnet --list-sdks exited with status 3".to_owned())));
     }
@@ -1105,10 +1115,11 @@ mod tests {
         let stub = format!("@echo off\r\n>\"{}\" echo ran\r\necho 9.0.100 [C:\\stub]\r\n", marker.display());
         fs::write(folder.join("dotnet.cmd"), stub).expect("the stub dotnet can be written");
 
-        let refused = sdk_listing(variables, HANG_GUARD, None, Some(&folder));
+        // The dotnet lies inside the second of two worktrees, as one inside a pair's sibling does.
+        let refused = sdk_listing(variables, HANG_GUARD, None, &[Path::new(env!("CARGO_MANIFEST_DIR")), &folder]);
         let ran_inside = marker.exists();
         let again = Variables::from_process().with("PATH", &folder.to_string_lossy());
-        let elsewhere = sdk_listing(again, HANG_GUARD, None, Some(Path::new(env!("CARGO_MANIFEST_DIR"))));
+        let elsewhere = sdk_listing(again, HANG_GUARD, None, &[Path::new(env!("CARGO_MANIFEST_DIR"))]);
 
         let Err(GitError::Failed(why)) = refused else {
             panic!("a dotnet inside the worktree was read: {refused:?}");
@@ -1144,7 +1155,7 @@ mod tests {
 
     #[test]
     fn a_batch_file_git_says_why_it_cannot_run() {
-        let program = std::env::temp_dir().join("gate-git-batch").join("git.cmd");
+        let program = crate::test_support::temp_dir().join("gate-git-batch").join("git.cmd");
         let git = Git { program: program.clone() };
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));
         let Err(GitError::Failed(line)) = git.run(&Call::plain(here, &["version"], GIT_LIMIT)) else {
@@ -1423,7 +1434,7 @@ mod tests {
     /// What Windows PowerShell says its command line is when it is run as `tool`, found along a `PATH` holding only a
     /// link named `link` that leads to it, in a folder of its own named after `tag`.
     fn command_line_through_link(link: &str, tag: &str) -> String {
-        let folder = std::env::temp_dir().join(format!("gate-link-{tag}-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-link-{tag}-{}", std::process::id()));
         drop(fs::remove_dir_all(&folder));
         fs::create_dir_all(&folder).expect("the link's folder can be made");
         let _removed = Removed(folder.clone());
@@ -1436,7 +1447,7 @@ mod tests {
             args: &["-NoProfile", "-NonInteractive", "-Command", "[Environment]::CommandLine"],
             limit: HANG_GUARD,
             interrupt: None,
-            worktree: Some(Path::new(env!("CARGO_MANIFEST_DIR"))),
+            worktrees: &[Path::new(env!("CARGO_MANIFEST_DIR"))],
             console: PipedConsole::Hidden,
             stdin: None,
         };

@@ -398,7 +398,7 @@ mod tests {
 
     /// A folder of this test process's own named `name`, empty.
     fn scratch(name: &str) -> PathBuf {
-        let folder = std::env::temp_dir().join(format!("gate-no-build-{name}-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-no-build-{name}-{}", std::process::id()));
         if folder.exists() {
             fs::remove_dir_all(&folder).expect("a folder left by an earlier run can be removed");
         }

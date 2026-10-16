@@ -15,6 +15,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use gate_args::RunRequest;
+use gate_router::FolderId;
 use gate_state::{FallbackReason, StateRoot, Verdict};
 use gate_win32::{Interrupt, OwnedMutexGuard};
 
@@ -30,10 +31,6 @@ pub(crate) use carried::{Sibling, carried};
 mod carried;
 mod client;
 pub(crate) mod git;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the client does not hold a sibling pair's folders until pairs are on")
-)]
 mod held;
 mod install;
 mod launch;
@@ -44,6 +41,8 @@ mod retry;
 pub(crate) mod siblings;
 mod snapshot;
 mod syncback;
+#[cfg(feature = "test-seams")]
+mod tamper;
 #[cfg_attr(
     not(test),
     expect(
@@ -195,6 +194,9 @@ pub(crate) struct RemoteCall<'a> {
     pub host: &'a str,
     pub key: &'a str,
     pub root: &'a str,
+    /// The id the route's decision read for the worktree root's folder, following links: the worktree lock refuses a
+    /// root whose folder has another id at use.
+    pub root_id: FolderId,
     /// The worktree root's folder name.
     pub leaf: &'a str,
     /// The siblings the run carries, as the route's decision allowed and checked them, in declared order ([`carried`]).
@@ -327,8 +329,9 @@ pub(crate) fn chosen(request: &RunRequest) -> Result<Box<dyn RemoteClient>, Stri
     Ok(Box::new(client::RustClient::ssh(&request.test_seams)))
 }
 
-/// The client of `--test-remote-snapshot`: makes the snapshot and bridge commits of the call's worktree and says each
-/// as `gate: remote snapshot <commit> bridge <commit or none>`, on stderr and in the log; the run ends with status 0,
+/// The client of `--test-remote-snapshot`: makes the snapshot and bridge commits of each of the call's worktrees, the
+/// main one first, then a pair's siblings in declared order, and says each as `gate: remote snapshot <commit> bridge
+/// <commit or none>`, one line a worktree, on stderr and in the log; the run ends with status 0,
 /// nothing pushed. A git failure ends it with status 1 and `gate: the remote run failed: <why>`, with no fallback; a
 /// Ctrl+C ends it as an interrupt, as the scripted client's `wait` does; and a run whose lines cannot be said ends with
 /// status 1, since its commits are already made.
@@ -350,7 +353,10 @@ mod snapshot_only {
 
     impl RemoteClient for SnapshotOnly {
         fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome {
-            let roots = vec![PathBuf::from(call.root)];
+            let roots: Vec<PathBuf> = std::iter::once(call.root)
+                .chain(call.siblings.iter().map(super::Sibling::root))
+                .map(PathBuf::from)
+                .collect();
             let (status, lines) = match snapshot::take(&roots, call.key, self.limit, call.interrupt) {
                 Ok(snapshots) => (0, snapshots.iter().map(said).collect()),
                 // An interrupt is no failure, so it says no line: the run is the interrupt, as the client's `wait`.
@@ -405,6 +411,7 @@ mod snapshot_only {
                 host: "builder",
                 key: "app-1a2b3c4d",
                 root,
+                root_id: gate_router::FolderId { volume: 0, file: [0; 16] },
                 leaf: "app",
                 siblings: Vec::new(),
                 repo: "app",
@@ -430,7 +437,7 @@ mod snapshot_only {
         fn an_interrupted_snapshot_ends_the_run_as_an_interrupt() {
             let interrupt = Interrupt::install().expect("the console handler is installed");
             interrupt.raise();
-            let log = std::env::temp_dir().join(format!("gate-snapshot-interrupt-{}.log", std::process::id()));
+            let log = crate::test_support::temp_dir().join(format!("gate-snapshot-interrupt-{}.log", std::process::id()));
 
             let outcome = SnapshotOnly { limit: GIT_LIMIT }.run(&call(r"C:\no-such-worktree", &log, Some(interrupt)));
 
@@ -499,7 +506,7 @@ mod scripted {
     use gate_win32::Interrupt;
     use serde_json::{Value, json};
 
-    use super::{BoxKill, REFUSED, RemoteCall, RemoteClient, RemoteOutcome, Sibling};
+    use super::{BoxKill, FolderId, REFUSED, RemoteCall, RemoteClient, RemoteOutcome, Sibling};
     use crate::run::CONTROL_C_EXIT;
 
     /// How often `wait` looks for its path and the interrupt.
@@ -666,6 +673,7 @@ mod scripted {
             "host": call.host,
             "key": call.key,
             "root": call.root,
+            "rootId": recorded_id(call.root_id),
             "leaf": call.leaf,
             "siblings": call.siblings.iter().map(recorded_sibling).collect::<Vec<Value>>(),
             "repo": call.repo,
@@ -683,15 +691,18 @@ mod scripted {
         Ok(true)
     }
 
-    /// A carried sibling as the record writes it: its name, its root, and its folder's id as the volume serial's 16 hex
-    /// digits, `-`, and the file id's 32.
+    /// A carried sibling as the record writes it: its name, its root, and its folder's id ([`recorded_id`]).
     fn recorded_sibling(sibling: &Sibling<'_>) -> Value {
-        let id = sibling.id();
         json!({
             "name": sibling.name(),
             "root": sibling.root(),
-            "id": format!("{:016x}-{:032x}", id.volume, u128::from_be_bytes(id.file)),
+            "id": recorded_id(sibling.id()),
         })
+    }
+
+    /// A folder's id as the record writes it: the volume serial's 16 hex digits, `-`, and the file id's 32.
+    fn recorded_id(id: FolderId) -> String {
+        format!("{:016x}-{:032x}", id.volume, u128::from_be_bytes(id.file))
     }
 
     /// Sleeps until `path` exists, true, or the interrupt is raised, false.

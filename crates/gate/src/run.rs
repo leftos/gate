@@ -645,6 +645,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         host: &remote.host,
         key: &remote.key,
         root: &remote.root,
+        root_id: remote.root_id,
         leaf: &remote.leaf,
         siblings,
         repo: &remote.repo,
@@ -3068,7 +3069,7 @@ mod tests {
 
     #[test]
     fn a_log_reached_through_a_junction_into_the_state_root_is_inside_it() {
-        let folder = std::env::temp_dir().join(format!("gate-run-junction-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-run-junction-{}", std::process::id()));
         if folder.exists() {
             fs::remove_dir_all(&folder).expect("a folder left by an earlier run can be removed");
         }

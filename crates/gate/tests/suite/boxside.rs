@@ -170,6 +170,7 @@ fn git(args: &[&str]) -> String {
     for name in GIT_REDIRECTS {
         command.env_remove(name);
     }
+    crate::support::git_home_for(&mut command);
     let output = command.args(args).output().expect("git starts; the box cases need git on PATH");
     assert!(output.status.success(), "git {args:?} failed: {output:?}");
     String::from_utf8_lossy(&output.stdout).trim_end().to_owned()
@@ -1081,6 +1082,7 @@ fn has_ref_in(bare: &str, name: &str) -> bool {
     for variable in GIT_REDIRECTS {
         command.env_remove(variable);
     }
+    crate::support::git_home_for(&mut command);
     let bare = format!("--git-dir={bare}");
     let output = command
         .args([bare.as_str(), "rev-parse", "--verify", "-q", name])
