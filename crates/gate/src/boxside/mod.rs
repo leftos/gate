@@ -8,7 +8,7 @@ mod ceiling;
     not(test),
     expect(
         dead_code,
-        reason = "the box's desktop decisions are held for the run path that hands a command to the builder's desktop; \
+        reason = "the box's decisions on the hand-off to the desktop helper are held for the run path that hands it a command; \
                   nothing outside tests reads them"
     )
 )]
@@ -42,6 +42,11 @@ const REQUEST_LIMIT: u64 = 16 * 1024 * 1024;
 /// nothing, and one missing or not base64 JSON fails every verb; here it is a usage error (exit 2), where the wrapper,
 /// stopping on the error, exits 1. `run` reads its outputs manifest from the same stdin, as its next line.
 pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
+    // Before any verb loads a DLL by name, so none planted in a folder the box runs from is loaded.
+    if let Err(error) = gate_win32::set_default_dll_directories_system32() {
+        console.err(&format!("gate: the box cannot limit its DLL search to System32: {error}"));
+        return u32::from(FAILED_STATUS);
+    }
     let payload = match read_request(io::stdin().lock()) {
         Ok(payload) => payload,
         Err(line) => {

@@ -1574,7 +1574,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     `-o RequestTTY=no` leads the options of every `gate box` call and `gate push`'s, so stdin never passes through a pseudo-terminal. The last option, `-o Compression=yes`, is the run call's alone: the preflight, stop, boot and outputs calls, git's ssh command and `gate push` ask for none. The run call's compression covers both directions of its connection: the command's output and protocol lines one way, the request and the outputs manifest the other.
 
-    The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools|layout`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag and the adjusted line below.
+    The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools|layout|inputs|desktop`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag and the adjusted line below.
 
     The kill tag `gate-remote-killed: <nonce> timed-out|backstop` is said by the box just after its own kill line, and the client counts a box kill only on this run's tag with a status 124 (a status 124 alone is also what a stopped job or the command itself may end with). The client takes the run's verdict from the tag's kind, never from the log's last kill line.
 
@@ -1989,6 +1989,10 @@ Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which
 
 `Timeout` is the run's ceiling in whole seconds, 1 to 2147483647, which the box counts in load-adjusted time; absent or null means no box ceiling and no adjusted line, and anything else is refused before the lock with `gate: box payload Timeout is not a whole number of seconds` and exit 2. `Host` is the PC's `remote.json` name for the builder, which the box's kill lines name, control characters escaped; absent leaves it out of them.
 
+A `run` payload may also hold `Desktop` (true or false, false when absent or null, else `gate: box payload Desktop is not true or false` and exit 2) and `DesktopWait` (whole seconds, 1 to 2147483647, else `gate: box payload DesktopWait is not a whole number of seconds` and exit 2), which together ask for a desktop run, the command on the builder's logged-on desktop (The desktop run, below).
+
+A warm-up payload with `Desktop` true is refused with `gate: box payload asks a warm-up for the desktop` and exit 2.
+
 For `run` the payload also needs a `Snapshot` key: exactly 40 lowercase hex characters, the commit the run checks out. Anything else is refused before the lock and the checkout with `gate: remote run payload's Snapshot '<value>' is not a 40-hex commit sha` and exit 2.
 
 The value is empty for a missing key or JSON null, the string as given with control characters escaped, and compact JSON for any other non-string. Two differences from the wrapper are deliberate: the echoed value has its control characters escaped, and the check is stricter than the wrapper's .NET `$`, which accepts a trailing newline.
@@ -2009,7 +2013,13 @@ The other four box seams are `--test-outputs-budget-bytes <n>`, which replaces t
 
 A seam is refused as the `gate run` seams are: no value, given twice, and a value outside its rule (`gate: --test-outputs-budget-bytes must be a whole number above 0, got '<v>'`, `... must be at most 2147483647 ...`, `... needs a value`, `... is given twice`).
 
+The desktop run has four more: `--test-box-desktop-session active|none|locked|other-user|disconnected` makes the box read the console session as that state (the box's own session, with the box's account at it, or nobody, another user, a locked or a disconnected one), `--test-box-desktop <fault>` names the fault the run takes in place of the real task start and helper and, given without a session seam, also stands for an `active` session.
+
+`--test-box-desktop-mutex <unique>` names the desktop lock by a unique part under the box's own user in place of `gate\desktop`, and `--test-box-desktop-ms <n>` lowers each of the desktop run's waits to at most `n` milliseconds, one turn of the wait for the desktop lock included.
+
 The rules: a whole number above 0 and at most 2147483647 for the heartbeat, the sample period, the outputs and inputs budgets, the dotnet limit, the probe limit and the kill's leftover count, 1 to 100 for `--test-box-free-percent`, `true` or `false` for `--test-box-sampler-fail`. Without the feature each word gets the box usage line.
+
+Every `gate box` verb first limits the box's DLL search to System32 (`gate_win32::set_default_dll_directories_system32`), before it reads the request or loads a library by name; a failure says `gate: the box cannot limit its DLL search to System32: <error>` and exits 1.
 
 The box gives each run's command its own build servers: the command's environment is the box's own with `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT` set to `gate-box-<Nonce>` (the payload's `Nonce`), `MSBUILDUSESERVER=0`, `DOTNET_CLI_USE_MSBUILD_SERVER=0` and `MSBUILDDISABLENODEREUSE=1`, each replacing any inherited value (names compared case-insensitively).
 
@@ -2209,6 +2219,26 @@ Built verbs:
   A `Subfolder` is a folder of the main repo's tree, compared against its snapshot with per-character simple uppercase (the wrapper's OrdinalIgnoreCase): one that is not a folder inside `Work` prints `gate: remote subfolder <sub> is not a folder inside the work folder`, deletes the back ref and exits 2, and one missing from the snapshot prints `gate: remote subfolder <sub> does not exist in the snapshot` and exits 2, `<sub>` with its control characters escaped in both.
 
   The shared batch refusal (a `.cmd` or `.bat` word, [Command launching](#command-launching)) exits 2.
+
+  The desktop run (a `run` payload with `Desktop` true, `DesktopWait` its wait in seconds) reads the console session twice and takes the builder's desktop lock between the reads.
+
+  The first, cheap read comes right after the work-folder lock is held, before the layout and the checkout: when the console cannot take the command the run is refused with `gate-remote-refused: <nonce> desktop` then `gate: not routed: the builder has no desktop session: <why>`, said together under the output lock, the command never started, and exit 75.
+
+  A refusal of the desktop says no `gate: remote back commits:` line, on a pair run too.
+
+  The whys of the session read are `nobody is logged on at the console`, `another user is logged on at the console`, `the console session is disconnected`, `the console session is locked` and `the console session's lock state cannot be read`.
+
+  Three more come from a read that fails: `the console session cannot be read` (followed by its own line `gate: the console session read failed: <escaped system error>`), `the console session changed while the box read it` (another session was attached to the console between the two reads of which one is), and `the box's own account cannot be read: <error>`.
+
+  The text after `<why>` is escaped into one line.
+
+  After the checkout and the restores comes the desktop stage, in place of the command's start. It resolves the command's program first, so a program not found (127) or a refused batch word (2) never holds the desktop; looks at the stop signal; and takes the machine-wide desktop lock, the private-namespace mutex `gate\desktop`, waiting `DesktopWait` seconds at most, or the run's `Timeout` when that is shorter.
+
+  While another run holds it the box says `gate: remote waiting for the builder's desktop: another run holds it` once; a lock taken from a run that ended without releasing it says `gate: remote took the builder's desktop from a run that ended without releasing it`.
+
+  A wait that ends with the desktop still held is refused with the `desktop` tag, `gate: not routed: the builder's desktop stayed busy for <n> s` and exit 75. A lock that cannot be made or waited for is refused with the tag and the why `the builder's desktop lock cannot be made: <error>` or `the builder's desktop lock cannot be waited for: <error>`. A stop during the wait ends the run with status 1 and the stopped-before-start line, and on a pair run `gate: remote back commits: failed`.
+
+  With the lock held the box reads the console session again, and a console that can no longer take the command is refused with the first read's whys. A run that passes the stage is refused with `the desktop helper did not start: the box's hand-off is not built yet`, and the lock is released: the box does not yet hand a command to the builder's desktop, so no desktop run reaches the start marker or starts a command.
 
   The command runs outside the box's own job, created with `CREATE_BREAKAWAY_FROM_JOB` so it leaves the ssh session's job (the box's job refusing breakaway prints `gate: the box cannot start a command outside its own job: <message>` and exits 1). Its console is a donor's UTF-8 console (the console, below), else a hidden console of its own (`CREATE_NO_WINDOW`).
 

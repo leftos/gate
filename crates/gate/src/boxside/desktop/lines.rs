@@ -75,6 +75,12 @@ pub(crate) enum DesktopRefusal {
     WrongCommand(WrongFact),
     /// The builder's desktop lock cannot be made, for this reason.
     DesktopLock(String),
+    /// The console session cannot be read, so nothing says who is logged on to it or whether it is locked.
+    SessionUnreadable,
+    /// Another session was attached to the console while the box read which one is and what it is.
+    SessionMoved,
+    /// The box's own machinery for the builder's desktop failed, as this says.
+    Machinery(String),
 }
 
 impl DesktopRefusal {
@@ -95,6 +101,9 @@ impl DesktopRefusal {
             DesktopRefusal::HelperFailed(code) => format!("the desktop helper failed: {}", helper_exit_why(*code)),
             DesktopRefusal::WrongCommand(fact) => format!("the desktop helper failed: the command it started {}", fact.why()),
             DesktopRefusal::DesktopLock(error) => format!("the builder's desktop lock cannot be made: {error}"),
+            DesktopRefusal::SessionUnreadable => "the console session cannot be read".to_owned(),
+            DesktopRefusal::SessionMoved => "the console session changed while the box read it".to_owned(),
+            DesktopRefusal::Machinery(why) => why.clone(),
         }
     }
 
@@ -360,6 +369,30 @@ mod tests {
             verdict(Some(&console(ConnectState::Active, LockState::Unlocked, BOX_USER, "OTHER"))),
             Some(refused("another user is logged on at the console")),
             "a session of the box's user in another domain is another user"
+        );
+    }
+
+    #[test]
+    fn a_console_session_that_cannot_be_read_has_its_line() {
+        assert_eq!(
+            DesktopRefusal::SessionUnreadable.line(),
+            "gate: not routed: the builder has no desktop session: the console session cannot be read"
+        );
+        assert_eq!(
+            DesktopRefusal::SessionMoved.line(),
+            "gate: not routed: the builder has no desktop session: the console session changed while the box read it"
+        );
+    }
+
+    #[test]
+    fn a_failure_of_the_desktop_machinery_is_its_own_words_escaped() {
+        assert_eq!(
+            DesktopRefusal::Machinery("the box's own account cannot be read: access\ndenied".to_owned()).line(),
+            refused(&format!("the box's own account cannot be read: {}", escaped("access\ndenied")))
+        );
+        assert_eq!(
+            DesktopRefusal::Machinery("the builder's desktop lock cannot be waited for: the handle is invalid".to_owned()).line(),
+            "gate: not routed: the builder has no desktop session: the builder's desktop lock cannot be waited for: the handle is invalid"
         );
     }
 

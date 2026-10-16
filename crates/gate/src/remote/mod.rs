@@ -83,7 +83,6 @@ pub(crate) enum Refusal {
     Inputs,
     /// The run asked for the builder's desktop and could not have it: nobody is logged on at the console or it is
     /// locked, another user holds it, or another run held the desktop for the whole wait the run gave.
-    #[cfg_attr(not(all(test, feature = "test-seams")), expect(dead_code, reason = "nothing outside tests reads it"))]
     Desktop,
 }
 

@@ -24,6 +24,7 @@ use crate::support::{
     shown, start_with_closed, start_with_stdin, wait_until, wait_until_closed,
 };
 
+mod desktop;
 mod inputs;
 mod outputs;
 mod warm;

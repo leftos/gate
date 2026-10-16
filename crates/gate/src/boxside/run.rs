@@ -26,7 +26,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::BoxSeams;
 use gate_watchdog::{Kill, Pump};
-use gate_win32::{Donor, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken, Running, Utf8Console};
+use gate_win32::{
+    Donor, EnvironmentBlock, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken, Running, Utf8Console,
+};
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::ceiling::{Ceiling, KILLED, Spec};
@@ -46,8 +48,12 @@ use crate::remote::{Refusal, refused_line, started_line};
 use crate::resolve::{self, Environment};
 use crate::run::{Written, end_leftovers, find_program, written};
 
-/// The status of a run refused: another run holds the work folder, or the work folder's dotnet tools could not be
-/// restored.
+mod desktop_run;
+
+use desktop_run::DesktopEnd;
+
+/// The status of a run refused: another run holds the work folder, the work folder's dotnet tools could not be
+/// restored, or the run asked for the builder's desktop and could not have it.
 pub(super) const REFUSED_STATUS: u32 = 75;
 /// The status of a run the box failed on its own, and of a passed command whose tree could not be committed back.
 pub(super) const FAILED_STATUS: u32 = 1;
@@ -128,11 +134,9 @@ pub(super) struct Request<'a> {
     timeout: Option<u64>,
     /// Whether the run asks for the builder's desktop, its `Desktop` key; a run without one runs on the box's own
     /// session.
-    #[cfg_attr(not(test), expect(dead_code, reason = "nothing outside tests reads it"))]
     desktop: bool,
     /// How long the run may wait for the builder's desktop, in whole seconds; `None` on a run that does not ask for
     /// one, whatever its `DesktopWait` said.
-    #[cfg_attr(not(test), expect(dead_code, reason = "nothing outside tests reads it"))]
     desktop_wait: Option<u64>,
     /// The PC's name for the builder, which the box's kill line names, empty when the payload gives none.
     host: &'a str,
@@ -162,6 +166,10 @@ impl Request<'_> {
         let index = payload.beside_work("Index", work, "index")?;
         let job = payload.job(key)?;
         let commands = payload.commands()?;
+        // A warm-up's commands run on the box's own session alone.
+        if desktop && commands.warm_hash.is_some() {
+            return Err("gate: box payload asks a warm-up for the desktop".to_owned());
+        }
         let subfolder = payload.optional_text("Subfolder")?;
         let identity = identity(payload)?;
         let inputs_digest = payload.inputs_digest()?;
@@ -381,10 +389,12 @@ fn identity(payload: &Payload) -> Result<Vec<(String, String)>, String> {
 
 /// Runs the payload's command in its work folder and returns the status: the command's own whole 32-bit code, 127
 /// when it could not be started, 75 when another run holds the work folder, it could not be laid out for the run's
-/// repos or its dotnet tools could not be restored, 2 for a payload or a word refused, a failing git step's status, 1
-/// when the box failed, the tree of a passed command could not be committed back or a passed command's outputs are not
-/// brought back, or 255 when the client closed the connection and the box stopped the job. A warm-up's payload runs
-/// its commands in order instead and brings nothing back ([`warm_up`]).
+/// repos, its dotnet tools could not be restored or the run asked for the builder's desktop and could not have it
+/// ([`desktop_run`]: the console's session is read before the checkout and again under the desktop lock), 2 for a
+/// payload or a word refused, a failing git step's status, 1 when the box failed, the tree of a passed command could
+/// not be committed back or a passed command's outputs are not brought back, or 255 when the client closed the
+/// connection and the box stopped the job. A warm-up's payload runs its commands in order instead and brings nothing
+/// back ([`warm_up`]).
 /// Once the subfolder is checked, a heartbeat goes to stderr every period, 5 s unless `seams` set it, until the run
 /// ends; `seams` may also make the command's console fail, or park its launch.
 pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
@@ -410,6 +420,12 @@ pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
             return FAILED_STATUS;
         }
     };
+    // A run the console cannot take is refused before the checkout; the stage before the command reads it again.
+    if request.desktop
+        && let Err(status) = desktop_run::console_takes_it(&request, seams, console)
+    {
+        return status;
+    }
     // Made as soon as the lock is held and kept for the run, so a stop that comes before the job exists, during the
     // checkout, is kept for the look just before the job is created.
     let stop = match create_stop_event(request.job, console) {
@@ -648,10 +664,11 @@ fn checked_out(
     }
     let one = One {
         words: request.commands.first().map_or(&[][..], Vec::as_slice),
+        place: folders.place,
         timeout: request.timeout,
         of: Of::Run,
     };
-    let ran = command(request, &one, folders.place, beat, console).inspect_err(|_| back_commits_failed(request, beat, console))?;
+    let ran = ran_command(request, &one, beat, console)?;
     let status = match ran {
         Ran::Exited(status) => status,
         // The PC applies nothing of a run the box killed, and a process its kill could not end may still be writing.
@@ -676,6 +693,21 @@ fn checked_out(
             Ok(outputs.bring_back(folders.work, skip, beat, console))
         }
         _ => Ok(status),
+    }
+}
+
+/// The run's command seen to its end: on the builder's desktop for a run that asks for it
+/// ([`desktop_run::desktop_command`]), else on the box's own session ([`command`]). `Err` with the status of a run that
+/// ends before it, its lines said: a refusal of the builder's desktop, 75, says no back commits line; any other end is
+/// followed by the box's back commits `failed` line on a pair run ([`back_commits_failed`]).
+fn ran_command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<Ran, u32> {
+    let Some(wait) = request.desktop_wait else {
+        return command(request, one, beat, console).inspect_err(|_| back_commits_failed(request, beat, console));
+    };
+    match desktop_run::desktop_command(request, one, wait, beat, console) {
+        Ok(ran) => Ok(ran),
+        Err(DesktopEnd::Refused) => Err(REFUSED_STATUS),
+        Err(DesktopEnd::Ended(status)) => Err(ended_before(status, request, beat, console)),
     }
 }
 
@@ -733,10 +765,11 @@ fn warm_commands(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: 
         let began = Instant::now();
         let one = One {
             words,
+            place,
             timeout,
             of: Of::WarmUp,
         };
-        let ran = command(request, &one, place, beat, console)?;
+        let ran = command(request, &one, beat, console)?;
         spent += command_spent(beat.adjusted.get(), began.elapsed());
         let status = match ran {
             Ran::Exited(status) => status,
@@ -855,6 +888,8 @@ fn command_spent(adjusted: Option<f64>, wall: Duration) -> f64 {
 /// time, `None` for none; and what it is a command of ([`Of`]).
 struct One<'w> {
     words: &'w [String],
+    /// The folder the command runs in.
+    place: &'w Path,
     timeout: Option<u64>,
     of: Of,
 }
@@ -904,7 +939,7 @@ fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Bea
 
 /// A run that ended before its command with `status`, its lines said: on a pair run, the box's back commits `failed`
 /// line follows them ([`back_commits_failed`]), so a pair run the box did not refuse never ends without a back commits
-/// line. `status`.
+/// line; returns `status` unchanged.
 fn ended_before(status: u32, request: &Request<'_>, beat: &Beat<'_>, console: &mut Console) -> u32 {
     back_commits_failed(request, beat, console);
     status
@@ -1101,7 +1136,7 @@ pub(super) fn full_path(path: &Path) -> Option<PathBuf> {
     Some(if trimmed.ends_with(':') { full } else { PathBuf::from(trimmed) })
 }
 
-/// Starts the command in `place` and sees it to its end: `Ok` with its status (127 when it could not be started), or
+/// Starts the command in its place and sees it to its end: `Ok` with its status (127 when it could not be started), or
 /// `Err` with the status of a run that ends here, its line said: 2 for a batch word refused, 1 for the box's own
 /// failure or a stop that came first, 255 for a client that closed the connection. The job's stop signal is looked at
 /// just before the job is created ([`before_the_job`]), so a stop that came while the snapshot was checked out starts
@@ -1115,34 +1150,24 @@ pub(super) fn full_path(path: &Path) -> Option<PathBuf> {
 /// set to `*` over that ([`with_safe_directory`]), and the Event Log logging provider of a .NET host the command starts
 /// is turned off over that ([`with_event_log_off`]). The command runs with a restricted copy of the box's token
 /// ([`restricted_token`]).
-fn command(request: &Request<'_>, one: &One<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<Ran, u32> {
-    let run = format!("gate-box-{}", request.nonce);
-    let variables = with_event_log_off(with_safe_directory(Variables::from_process().with_build_servers(&run)));
-    let environment = variables
-        .block()
-        .map_err(|error| failed(console, &format!("cannot build the command's environment: {error}")))?;
-    let Some((word, rest)) = one.words.split_first() else {
-        return Err(failed(console, "the run has no command"));
+fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<Ran, u32> {
+    let Prepared {
+        word,
+        program,
+        application,
+        command_line,
+        environment,
+    } = match prepared(request, one, console) {
+        Ok(prepared) => prepared,
+        Err(answer) => return answer,
     };
-    let rest: Vec<OsString> = rest.iter().map(OsString::from).collect();
-    let program = match find_program(word, &variables, place) {
-        Ok(program) => program,
-        Err(message) => return Ok(Ran::Exited(not_started(console, word, None, &message))),
-    };
-    let launch = match written(&program, &rest, &variables) {
-        Written::Refused(line) => {
-            console.err(&line);
-            return Err(u32::from(USAGE_STATUS));
-        }
-        Written::NoShell(message) => return Ok(Ran::Exited(not_started(console, word, Some(&program), &message))),
-        Written::Line(application, command_line) => PipedLaunch {
-            application,
-            command_line,
-            directory: place.to_owned(),
-            environment,
-            console: PipedConsole::Hidden,
-            token: restricted_token(console),
-        },
+    let launch = PipedLaunch {
+        application,
+        command_line,
+        directory: one.place.to_owned(),
+        environment,
+        console: PipedConsole::Hidden,
+        token: restricted_token(console),
     };
     before_the_job(beat.stop.look(STARTING_COMMAND), request.job, console)?;
     let job = create_job(request.job, console)?;
@@ -1188,6 +1213,50 @@ fn command(request: &Request<'_>, one: &One<'_>, place: &Path, beat: &Beat<'_>, 
         ended_whole(&job, beat, console);
     }
     watched
+}
+
+/// A command ready to start: its first word, the program that word resolved to, the application and command line it is
+/// started with, and the environment it gets.
+struct Prepared<'w> {
+    word: &'w str,
+    program: PathBuf,
+    application: PathBuf,
+    command_line: Vec<u16>,
+    environment: EnvironmentBlock,
+}
+
+/// Resolves `one`'s program in its place and writes its command line, with the environment [`command`] describes, before
+/// anything holds a job or the builder's desktop for it. `Err` with the run's answer when it cannot start: `Ok` with
+/// 127 for a program not found or one with no shell to run it, its line said; `Err` with 2 for a batch word refused,
+/// or 1 for the box's own failure, its line said.
+fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> Result<Prepared<'w>, Result<Ran, u32>> {
+    let run = format!("gate-box-{}", request.nonce);
+    let variables = with_event_log_off(with_safe_directory(Variables::from_process().with_build_servers(&run)));
+    let environment = variables
+        .block()
+        .map_err(|error| Err(failed(console, &format!("cannot build the command's environment: {error}"))))?;
+    let Some((word, rest)) = one.words.split_first() else {
+        return Err(Err(failed(console, "the run has no command")));
+    };
+    let rest: Vec<OsString> = rest.iter().map(OsString::from).collect();
+    let program = match find_program(word, &variables, one.place) {
+        Ok(program) => program,
+        Err(message) => return Err(Ok(Ran::Exited(not_started(console, word, None, &message)))),
+    };
+    match written(&program, &rest, &variables) {
+        Written::Refused(line) => {
+            console.err(&line);
+            Err(Err(u32::from(USAGE_STATUS)))
+        }
+        Written::NoShell(message) => Err(Ok(Ran::Exited(not_started(console, word, Some(&program), &message)))),
+        Written::Line(application, command_line) => Ok(Prepared {
+            word,
+            program,
+            application,
+            command_line,
+            environment,
+        }),
+    }
 }
 
 /// The variable that counts the config entries git reads from the environment.
@@ -2619,5 +2688,30 @@ mod tests {
         let request = Request::read(&ignored).expect("a run that asks for no desktop is read");
         assert!(!request.desktop, "the payload asks for no desktop");
         assert_eq!(request.desktop_wait, None, "a wait no run asks for is ignored");
+    }
+
+    #[test]
+    fn a_warm_up_that_asks_for_the_desktop_is_refused() {
+        let warm = json!({
+            "Command": null,
+            "WarmCommands": [["cmd"]],
+            "WarmHash": "5f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+            "Timeout": 600,
+        });
+        let mut asking = warm.clone();
+        asking["Desktop"] = json!(true);
+        asking["DesktopWait"] = json!(30);
+        assert_eq!(
+            Request::read(&run_payload(&asking)).err(),
+            Some("gate: box payload asks a warm-up for the desktop".to_owned())
+        );
+
+        let mut not_asking = warm;
+        not_asking["Desktop"] = json!(false);
+        assert_eq!(
+            Request::read(&run_payload(&not_asking)).err(),
+            None,
+            "a warm-up of the box's own session is read"
+        );
     }
 }

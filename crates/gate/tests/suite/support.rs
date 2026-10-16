@@ -1357,6 +1357,105 @@ pub fn box_payload(case: &Case, key: &str, command: &[&str]) -> Value {
     })
 }
 
+/// The unique part of the case's own desktop namespace and lock, which the box's `--test-box-desktop-mutex` takes: the
+/// suite's process and the case's number, so no two cases or runs share one.
+pub fn desktop_unique(case: &Case) -> String {
+    format!("{:x}-{}", process::id(), case.number)
+}
+
+/// [`box_payload`] of a run that asks for the builder's desktop and may wait `wait_secs` for it.
+pub fn desktop_payload(case: &Case, key: &str, command: &[&str], wait_secs: u64) -> Value {
+    let mut payload = box_payload(case, key, command);
+    payload["Desktop"] = json!(true);
+    payload["DesktopWait"] = json!(wait_secs);
+    payload
+}
+
+/// The box's desktop seams of a case: the fault `mode`, the console session `session`, the case's own desktop lock
+/// ([`desktop_unique`]) and the cap `ms` on the run's desktop waits.
+pub fn desktop_seams(case: &Case, mode: &str, session: &str, ms: &str) -> Vec<String> {
+    [
+        "--test-box-desktop",
+        mode,
+        "--test-box-desktop-session",
+        session,
+        "--test-box-desktop-mutex",
+        &desktop_unique(case),
+        "--test-box-desktop-ms",
+        ms,
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
+/// The case's own desktop lock, as the box opens it under [`desktop_seams`].
+fn desktop_lock(case: &Case) -> gate_win32::PrivateName {
+    let sid = gate_win32::current_user_sid().expect("the suite's user is read");
+    gate_win32::PrivateName::for_user(&sid, &desktop_unique(case)).expect("the case's desktop lock has a name")
+}
+
+/// The case's own desktop lock held by a thread of the suite until dropped, as another run holding the builder's
+/// desktop holds it. The lock is owned by a thread, so that one thread takes and releases it.
+pub struct HeldDesktop {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    holder: Option<JoinHandle<()>>,
+}
+
+impl HeldDesktop {
+    /// Takes the case's desktop lock on a thread of its own; returns once it is held.
+    pub fn hold(case: &Case) -> HeldDesktop {
+        let name = desktop_lock(case);
+        let (taken, held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = thread::spawn(move || {
+            let mutex = gate_win32::PrivateMutex::open(&name).expect("the case's desktop lock opens");
+            let guard = mutex.acquire(Duration::ZERO).expect("the case's desktop lock is free");
+            taken.send(()).expect("the case waits for the lock to be held");
+            let _ = released.recv();
+            drop(guard);
+        });
+        held.recv().expect("the holder took the case's desktop lock");
+        HeldDesktop {
+            release: Some(release),
+            holder: Some(holder),
+        }
+    }
+
+    /// Takes the case's desktop lock on a thread that ends without releasing it, so the next taker finds it abandoned.
+    /// The thread's handle on the lock is left open for the rest of the suite's process, as an open handle is what
+    /// keeps the abandoned lock in being; the lock cannot leave its thread.
+    pub fn abandon(case: &Case) {
+        let name = desktop_lock(case);
+        thread::spawn(move || {
+            let mutex: &'static gate_win32::PrivateMutex =
+                Box::leak(Box::new(gate_win32::PrivateMutex::open(&name).expect("the case's desktop lock opens")));
+            let _never_released = std::mem::ManuallyDrop::new(mutex.acquire(Duration::ZERO).expect("the case's desktop lock is free"));
+        })
+        .join()
+        .expect("the abandoning thread ends");
+    }
+}
+
+impl Drop for HeldDesktop {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(holder) = self.holder.take() {
+            holder.join().expect("the holder of the case's desktop lock released it");
+        }
+    }
+}
+
+/// The case's own desktop lock kept open, not taken, by the suite for as long as this lives, so the lock outlives each
+/// box that takes it: a box that ended without releasing it leaves it abandoned for the next.
+pub struct KeptDesktop(#[expect(dead_code, reason = "held only to keep the lock open")] gate_win32::PrivateMutex);
+
+impl KeptDesktop {
+    /// Opens the case's desktop lock without taking it.
+    pub fn open(case: &Case) -> KeptDesktop {
+        KeptDesktop(gate_win32::PrivateMutex::open(&desktop_lock(case)).expect("the case's desktop lock opens"))
+    }
+}
+
 /// Puts the suite's process in a fresh job that allows breakaway, nested in the job it already runs in, once. A box
 /// run creates its command with `CREATE_BREAKAWAY_FROM_JOB`, which fails while the immediate job refuses breakaway, and
 /// the gate's own job refuses it; from this inner job the command breaks away and stays in the gate's job, as the
