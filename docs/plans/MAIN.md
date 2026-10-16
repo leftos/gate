@@ -86,6 +86,11 @@
 - [ ] GATE-351 Keep a planted DLL beside gate.exe out of its static imports
 - [ ] GATE-352 Treat a stop during the dotnet tool restore's start as a stop, not a tools refusal
 - [ ] GATE-353 Test a stop during the pnpm install's start with a box seam
+- [ ] GATE-354 Find why the builder's pnpm restore crashed with 0xC0000005 and whether to retry it
+- [ ] GATE-355 Refuse a test-seams build at install and push
+- [ ] GATE-356 Fail closed when the box cannot start a routed command with its restricted token
+- [ ] GATE-357 Look at the box's stop signal before the program lookup
+- [ ] GATE-358 Keep a preflight's read from making a run's layout read or write fail
 
 ## Cutover sweep
 
