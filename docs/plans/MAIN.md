@@ -5,12 +5,8 @@
 ## Do first
 
 - [ ] GATE-19 Remote: send a repo's declared sibling worktrees with a routed run — Urgent · Remote
-- [/] GATE-22 Remote: send a routed command's ignored inputs to the builder, compressed — Urgent · Remote
 - [ ] GATE-206 A per-repo toolchain manifest: check and prepare builders, and check a fresh clone — Urgent · Remote
-- [ ] GATE-312 Start fewer git processes per routed run and box run — Urgent · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
-- [ ] GATE-251 Siblings E: outputs, install rewrite and stale-line wording for a pair — High · Remote
-- [ ] GATE-252 Siblings F: docs for routed sibling pairs — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [/] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
 - [ ] GATE-304 Restore a routed repo's pnpm packages on the builder before a pnpm command — High · Remote
@@ -21,6 +17,7 @@
 - [ ] GATE-10 Port the remote client and box wrapper, then the remote cutover
   - [ ] GATE-109 Remote: carry every verb of a routed run over one ssh connection (gate box serve)
   - [ ] GATE-18 Remote preflight: refuse with `parity` when the builder lacks a .NET workload the repo needs
+  - [ ] GATE-332 Send each repo's inputs in a routed sibling pair
   - [ ] GATE-27 Remote: remember a builder's failures per host (short backoff, loss counter)
   - [ ] GATE-21 Remote: a critical pool on the builder for timing-sensitive gates (decide after measuring)
   - [ ] GATE-29 Sync-back: narrow the 'worktree changed during the run' refusal to changes that could matter
@@ -74,12 +71,23 @@
 - [ ] GATE-326 gate check --builder: report a missing box repo instead of creating it
 - [ ] GATE-327 Box input stages: check each pruned stage is the box's own, test the denied arm, fix the refusal's advice
 - [ ] GATE-330 Harden gate run --cd: final path, git ownership refusals, DLL search path, gate expect --cd
+- [ ] GATE-333 Clear a builder's installed inputs when a routed run sends none
+- [ ] GATE-334 Keep keys, credentials and other runs' logs out of routed inputs
+- [ ] GATE-335 Refuse a hard-linked file in routed inputs and outputs
+- [ ] GATE-336 Refuse a routed input that grew between the walk and the pack
+- [ ] GATE-337 Report busy, layout and unreachable for the routed inputs calls
+- [ ] GATE-339 Ask git for a routed run's worktree once, not twice
+- [ ] GATE-341 Pin a pair's sync-back git calls to the places the run checked
+- [ ] GATE-342 Give the box's inputs verb a heartbeat the client watches
+- [ ] GATE-343 Heal every wrong cached input hash at once
+- [ ] GATE-344 Leave git-tracked folders out of a routed build's stale line
+- [ ] GATE-345 Bound a routed pair's sibling walks for the stale line
+- [ ] GATE-346 Clear a box work tree's config.lock a killed preflight left
 
 ## Cutover sweep
 
 - [ ] GATE-11 Caller sweep to gate on PATH; delete the PowerShell gate
   - [/] GATE-201 Sweep part 2: each caller repo moves to gate run and deletes its launcher
-  - [ ] GATE-202 Sweep part 3: claude-config's tools and skills move to gate run; delete the PowerShell gate
   - [ ] GATE-204 Sweep part 4: drop the compatibility layer and the launcher from the gate repo
 
 ## After cutover
@@ -128,3 +136,5 @@
 - [ ] GATE-322 Bound the beside-claim test seam's wait, and keep older builds from reading a lend marker as a claim
 - [ ] GATE-328 Critical drain: unreadable tickets, a lendsClosed never cleared, a failed beside mutex, the lent-marker ETA test
 - [ ] GATE-331 Gates nested in a lent gate: their history rows and a command that outlives the lend
+- [ ] GATE-338 Bring back or refuse a routed command's own commit on the box
+- [ ] GATE-340 Keep the check suite's stub probes off the 10 s limit under load
