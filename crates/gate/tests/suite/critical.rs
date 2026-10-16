@@ -708,18 +708,18 @@ fn two_light_gates_on_the_lowest_slots_run_on_while_the_critical_gate_takes_the_
 const WAKE_ONLY: [&str; 4] = ["--test-poll-ms", "3600000", "--test-heartbeat-ms", "3600000"];
 
 #[test]
-fn a_critical_gate_waits_while_more_than_two_light_gates_run_and_a_release_on_slot_0_wakes_it() {
-    let case = Case::new("a_critical_gate_waits_while_more_than_two_light_gates_run_and_a_release_on_slot_0_wakes_it");
+fn a_critical_gate_waits_while_more_than_two_light_gates_run_and_a_release_on_the_highest_slot_wakes_it() {
+    let case = Case::new("a_critical_gate_waits_while_more_than_two_light_gates_run_and_a_release_on_the_highest_slot_wakes_it");
     write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
-    let first_go = case.folder().join("first-go");
-    let first_go_word = shown(&first_go);
+    let last_go = case.folder().join("last-go");
+    let last_go_word = shown(&last_go);
     let light_go = case.folder().join("light-go");
     let light_go_word = shown(&light_go);
-    let first = holder(&case, &run_words("first.log", &POLL, &[FAKE_TOOL, "wait", &first_go_word, "exit", "0"]));
-    let first_pid = first.id();
-    assert_eq!(take_of(&case, first_pid)["slots"], json!([name(&case, KernelObject::LightSlot(0))]));
+    let first = holder(&case, &run_words("first.log", &POLL, &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"]));
     let second = holder(&case, &run_words("second.log", &POLL, &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"]));
-    let third = holder(&case, &run_words("third.log", &POLL, &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"]));
+    let last = holder(&case, &run_words("last.log", &POLL, &[FAKE_TOOL, "wait", &last_go_word, "exit", "0"]));
+    let last_pid = last.id();
+    assert_eq!(take_of(&case, last_pid)["slots"], json!([name(&case, KernelObject::LightSlot(2))]));
 
     let critical = case.start(&critical_words("critical.log", &WAKE_ONLY, &[FAKE_TOOL, "exit", "0"]));
     let critical_pid = critical.id();
@@ -732,20 +732,31 @@ fn a_critical_gate_waits_while_more_than_two_light_gates_run_and_a_release_on_sl
         "three light gates run, one more than may run beside it"
     );
 
-    let_go(&first_go);
-    assert_passed(&first.finish());
+    let_go(&last_go);
+    assert_passed(&last.finish());
     wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{critical_pid},"#));
-    let names = json!([name(&case, KernelObject::HeavySlot(0)), name(&case, KernelObject::LightSlot(0))]);
-    assert_eq!(sorted(&take_of(&case, critical_pid)["slots"]), sorted(&names));
-    assert!(at(&case, "release", first_pid) < at(&case, "take", critical_pid));
+    let names = json!([name(&case, KernelObject::HeavySlot(0)), name(&case, KernelObject::LightSlot(2))]);
+    assert_eq!(
+        sorted(&take_of(&case, critical_pid)["slots"]),
+        sorted(&names),
+        "the slot freed, whichever index"
+    );
+    assert!(at(&case, "release", last_pid) < at(&case, "take", critical_pid));
     assert_passed(&critical.finish());
     let_go(&light_go);
+    assert_passed(&first.finish());
     assert_passed(&second.finish());
-    assert_passed(&third.finish());
 }
 
-/// The seams of a light gate that waits 20 s between journalling its take and writing its claim.
-const SLOW_CLAIM: [&str; 4] = ["--test-poll-ms", "20", "--test-beside-claim-pause-ms", "20000"];
+/// The seams of a light gate that waits between journalling its take and writing its claim until the file `go` exists.
+fn slow_claim(go: &str) -> [&str; 4] {
+    ["--test-poll-ms", "20", "--test-beside-claim-wait", go]
+}
+
+/// Whether the gate `gate` journalled a take in the case's root.
+fn took(case: &Case, gate: &Running) -> bool {
+    events_of(case, gate.id()).contains(&"take".to_owned())
+}
 
 #[test]
 fn a_light_gate_between_its_take_and_its_claim_lets_no_third_light_gate_beside_the_critical_gate() {
@@ -758,10 +769,12 @@ fn a_light_gate_between_its_take_and_its_claim_lets_no_third_light_gate_beside_t
     write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":6}"#);
     let light_go = case.folder().join("light-go");
     let light_go_word = shown(&light_go);
+    let claim_go = case.folder().join("claim-go");
+    let claim_go_word = shown(&claim_go);
 
     let slow = holder(
         &case,
-        &run_words("slow.log", &SLOW_CLAIM, &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"]),
+        &run_words("slow.log", &slow_claim(&claim_go_word), &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"]),
     );
     let slow_claim = v1::claim_path(&case.root(), KernelObject::LightSlot(1)).expect("a light slot has a claim");
     assert!(!slow_claim.exists(), "the slow gate has journalled its take and not yet claimed its slot");
@@ -781,18 +794,16 @@ fn a_light_gate_between_its_take_and_its_claim_lets_no_third_light_gate_beside_t
         gate.wait_for_stderr(&beside(critical_pid));
     }
     assert!(
-        !slow_claim.exists(),
-        "both later gates queued inside the slow gate's take-to-claim window"
-    );
-
-    wait_until("the slow gate's claim", || slow_claim.exists());
-    let took = |gate: &Running| events_of(&case, gate.id()).contains(&"take".to_owned());
-    assert!(
-        later.iter().filter(|gate| took(gate)).count() <= 1,
+        !later.iter().any(|gate| took(&case, gate)),
         "no later gate took a slot while the slow gate's claim was missing"
     );
-    wait_until("one later gate taking a slot beside the slow one", || later.iter().any(took));
-    let waiting = later.iter().find(|gate| !took(gate)).expect("one later gate still waits");
+
+    let_go(&claim_go);
+    wait_until("the slow gate's claim", || slow_claim.exists());
+    wait_until("one later gate taking a slot beside the slow one", || {
+        later.iter().any(|gate| took(&case, gate))
+    });
+    let waiting = later.iter().find(|gate| !took(&case, gate)).expect("one later gate still waits");
     let heartbeat = format!("gate: still waiting for a light slot beside the critical request of gate {critical_pid} (");
     let before = waiting.wait_for_stderr_where("its lines so far", |_| true).matches(&heartbeat).count();
     waiting.wait_for_stderr_where("two more still-waiting lines after the other's take", |stderr| {
@@ -811,6 +822,141 @@ fn a_light_gate_between_its_take_and_its_claim_lets_no_third_light_gate_beside_t
     }
     let_go(&go);
     assert_passed(&critical.finish());
+}
+
+#[test]
+fn a_light_gate_no_request_holds_back_is_counted_between_its_take_and_its_claim() {
+    let case = Case::new("a_light_gate_no_request_holds_back_is_counted_between_its_take_and_its_claim");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let light_go = case.folder().join("light-go");
+    let light_go_word = shown(&light_go);
+    let claim_go = case.folder().join("claim-go");
+    let claim_go_word = shown(&claim_go);
+    let held = holder(&case, &heavy_words("holder.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let early = holder(
+        &case,
+        &run_words(
+            "early.log",
+            &slow_claim(&claim_go_word),
+            &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"],
+        ),
+    );
+    let early_claim = v1::claim_path(&case.root(), KernelObject::LightSlot(0)).expect("a light slot has a claim");
+    assert!(
+        !early_claim.exists(),
+        "the early gate has journalled its take and not yet claimed its slot"
+    );
+
+    let critical = case.start(&critical_words("critical.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
+    let critical_pid = critical.id();
+    critical.wait_for_stderr(WAITING);
+    let later = [
+        case.start(&run_words(
+            "second.log",
+            &with_heartbeat(),
+            &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"],
+        )),
+        case.start(&run_words(
+            "third.log",
+            &with_heartbeat(),
+            &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"],
+        )),
+    ];
+    for gate in &later {
+        gate.wait_for_stderr(&beside(critical_pid));
+    }
+    assert!(
+        !later.iter().any(|gate| took(&case, gate)),
+        "no gate held back took a slot while the early gate, held back by no request, had not claimed its slot"
+    );
+
+    let_go(&claim_go);
+    wait_until("the early gate's claim", || early_claim.exists());
+    wait_until("one later gate taking a slot beside the early one", || {
+        later.iter().any(|gate| took(&case, gate))
+    });
+    let waiting = later.iter().find(|gate| !took(&case, gate)).expect("one later gate still waits");
+    let heartbeat = format!("gate: still waiting for a light slot beside the critical request of gate {critical_pid} (");
+    let before = waiting.wait_for_stderr_where("its lines so far", |_| true).matches(&heartbeat).count();
+    waiting.wait_for_stderr_where("two more still-waiting lines after the other's take", |stderr| {
+        stderr.matches(&heartbeat).count() >= before + 2
+    });
+    assert_eq!(
+        events_of(&case, waiting.id()),
+        ["queue"],
+        "two light gates run beside the critical request already"
+    );
+
+    let_go(&light_go);
+    assert_passed(&early.finish());
+    for gate in later {
+        assert_passed(&gate.finish());
+    }
+    let_go(&go);
+    assert_passed(&held.finish());
+    assert_passed(&critical.finish());
+}
+
+#[test]
+fn a_critical_gate_does_not_take_the_machine_while_a_lent_heavy_child_runs() {
+    let case = Case::new("a_critical_gate_does_not_take_the_machine_while_a_lent_heavy_child_runs");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let child_go = case.folder().join("child-go");
+    let child_go_word = shown(&child_go);
+    let held = holder(&case, &heavy_words("holder.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let critical = case.start(&critical_words("critical.log", &with_heartbeat(), &[FAKE_TOOL, "exit", "0"]));
+    let critical_pid = critical.id();
+    critical.wait_for_stderr(WAITING);
+    write_claim(&case, KernelObject::LightSlot(3), ClaimKind::Light, (process::id(), own_start()));
+
+    let marker = test_marker(&case, "light");
+    let child = start(marked(
+        &case,
+        &heavy_words("child.log", &POLL, &[FAKE_TOOL, "wait", &child_go_word, "exit", "0"]),
+        &marker,
+    ));
+    let child_pid = child.id();
+    child.wait_for_stderr(&lent(process::id()));
+    let lend_marker = format!("gate-lent-{}-{child_pid}-", process::id());
+    let has_lend_marker = || {
+        fs::read_dir(v1::slots_dir(&case.root()))
+            .expect("the claims folder can be listed")
+            .any(|entry| {
+                entry
+                    .expect("a claims entry can be read")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&lend_marker)
+            })
+    };
+    assert!(has_lend_marker(), "the lent child keeps a lend marker naming its parent");
+
+    let_go(&go);
+    assert_passed(&held.finish());
+    let heartbeat = "gate: still waiting for the machine (critical): ";
+    let before = critical.wait_for_stderr_where("its lines so far", |_| true).matches(heartbeat).count();
+    critical.wait_for_stderr_where("a still-waiting line after the heavy holder's end naming the lent child", |stderr| {
+        stderr
+            .split(heartbeat)
+            .skip(before + 1)
+            .any(|line| line.starts_with("1 heavy and 0 light slots held (2 light slots beside it), 0 earlier waiters"))
+    });
+    assert_eq!(
+        events_of(&case, critical_pid),
+        ["queue"],
+        "the critical gate waits for the heavy child its parent lent its slot"
+    );
+
+    let_go(&child_go);
+    assert_passed(&child.finish());
+    assert!(!has_lend_marker(), "the lent child's marker is gone with it");
+    assert_passed(&critical.finish());
+    assert_eq!(events_of(&case, child_pid), ["parent"]);
+    assert!(events_of(&case, critical_pid).contains(&"take".to_owned()));
 }
 
 #[test]

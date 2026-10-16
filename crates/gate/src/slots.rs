@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use gate_args::{RunRequest, Slot};
 use gate_state::v1::{self, Claim, ClaimKind, Counts, FormatError, PoolSetting, Ticket, TicketKind};
-use gate_state::{JOURNAL_WAIT, JournalIdentity, KernelObject, RemoteTag, SlotKind};
-use gate_win32::{AcquireError, NamedEvent, NamedMutex, OwnedMutexGuard, mutex_exists};
+use gate_state::{JournalIdentity, KernelObject, RemoteTag, SlotKind};
+use gate_win32::{NamedEvent, OwnedMutexGuard, mutex_exists};
 use jiff::Timestamp;
 use serde_json::{Map, Value};
 
@@ -222,10 +222,15 @@ impl Held {
     pub(crate) fn name(&self) -> &str {
         self.guard.name()
     }
+
+    /// The slot's index in its pool.
+    pub(crate) fn index(&self) -> u32 {
+        self.index
+    }
 }
 
-/// A slot just taken, whether a gate that died holding it had left it held, and the beside mutex a light gate behind a
-/// critical request took it under, which it lets go once its claim is written ([`hold_beside`]).
+/// A slot just taken, whether a gate that died holding it had left it held, and the beside mutex a local light gate
+/// took it under, which it lets go once its claim is written ([`try_beside`]).
 pub(crate) struct Taken {
     pub held: Held,
     pub abandoned: bool,
@@ -402,26 +407,51 @@ impl Survey {
         Ok(claims)
     }
 
-    /// The other gates' live claims under `root`, as [`Survey::other_claims`] reads them. A claims folder that cannot be
-    /// listed holds none, said once.
-    pub(crate) fn live_claims(&mut self, root: &Path, console: &mut Console) -> Vec<Claim> {
-        match self.other_claims(root, console) {
-            Ok(claims) => claims.into_iter().map(|(_, claim)| claim).collect(),
-            Err(error) => {
-                self.say_once("cannot read the claims in", &v1::slots_dir(root).display().to_string(), error, console);
-                Vec::new()
-            }
-        }
+    /// The other gates' live claims under `root`, as [`Survey::other_claims`] reads them; else why the claims folder
+    /// cannot be listed, said once.
+    pub(crate) fn live_claims(&mut self, root: &Path, console: &mut Console) -> io::Result<Vec<Claim>> {
+        self.other_claims(root, console)
+            .map(|claims| claims.into_iter().map(|(_, claim)| claim).collect())
+            .inspect_err(|error| self.say_once("cannot read the claims in", &v1::slots_dir(root).display().to_string(), error, console))
     }
 
     /// The pid and slot index of each other gate's live light claim under `root`, as [`Survey::live_claims`] reads
-    /// them.
-    pub(crate) fn light_claims(&mut self, root: &Path, console: &mut Console) -> Vec<(u32, u32)> {
-        self.live_claims(root, console)
+    /// them; else why the claims folder cannot be listed, said once.
+    pub(crate) fn light_claims(&mut self, root: &Path, console: &mut Console) -> io::Result<Vec<(u32, u32)>> {
+        Ok(self
+            .live_claims(root, console)?
             .into_iter()
             .filter(|claim| claim.kind == ClaimKind::Light)
             .map(|claim| (claim.pid, claim.index))
-            .collect()
+            .collect())
+    }
+
+    /// How many live gates under `root` run lent their light parent's slot, by their lend markers ([`LendMarker`]):
+    /// a marker whose gate is gone is deleted, one that cannot be read is passed over as an unreadable claim is. Else
+    /// why the claims folder cannot be listed, said once.
+    pub(crate) fn lent_children(&mut self, root: &Path, console: &mut Console) -> io::Result<usize> {
+        let dir = v1::slots_dir(root);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => {
+                self.say_once("cannot read the claims in", &dir.display().to_string(), &error, console);
+                return Err(error);
+            }
+        };
+        let mut live = 0;
+        for path in entries.flatten().map(|entry| entry.path()) {
+            let is_marker = path.file_name().is_some_and(|name| is_lend_marker(&name.to_string_lossy()));
+            let Some(claim) = is_marker.then(|| v1::read_claim(&path).ok()).flatten() else {
+                continue;
+            };
+            if self.is_live(&path, claim.pid, epoch_ms(claim.process_start), console) {
+                live += 1;
+            } else if let Err(error) = delete_dead(&path) {
+                self.say_once("cannot delete the dead gate's lend marker", &path.display().to_string(), error, console);
+            }
+        }
+        Ok(live)
     }
 
     /// The pid and start, in epoch milliseconds, of every gate a live claim under `root` names: the gates that hold a
@@ -493,29 +523,65 @@ pub(crate) fn critical_open(root: &ResolvedRoot, survey: &mut Survey, console: &
         .unwrap_or(false)
 }
 
-/// Takes the beside mutex under `root`, `Local\gate-critical-beside`, waiting for it as long as a journal append waits
-/// for the journal mutex. A light gate behind a critical request holds it from its count of the light gates beside the
-/// request to its claim, and a critical gate from its count of the light gates to its last light take, so a gate between
-/// its take and its claim is never missed by a count. `None` when it is not free in that time, so the caller counts
-/// again on its next pass, or when it cannot be taken, said once. One a killed gate left held is said and kept.
-pub(crate) fn hold_beside(root: &ResolvedRoot, survey: &mut Survey, console: &mut Console) -> Option<OwnedMutexGuard> {
+/// Tries the beside mutex under `root`, `Local\gate-critical-beside`, once, without waiting. A local light gate holds
+/// it from before its try to after its claim, a gate lent its parent's slot from its lend decision to its lend marker,
+/// and a critical gate around its count of the light gates and its light takes, and around its count of the lent gates
+/// and its ticket's rewrite as holding, so no gate between a take and its claim or marker is missed by a count. `None`
+/// when another gate holds it, so the caller finds no room this pass and counts again on its next, or when it cannot
+/// be taken, said once. One a killed gate left held is said and kept.
+pub(crate) fn try_beside(root: &ResolvedRoot, survey: &mut Survey, console: &mut Console) -> Option<OwnedMutexGuard> {
     let name = root.root.object_name(KernelObject::CriticalBeside);
-    let held = NamedMutex::open(&name)
-        .map_err(AcquireError::Failed)
-        .and_then(|mutex| mutex.acquire_owned(JOURNAL_WAIT));
-    match held {
-        Ok(guard) => {
+    match acquire::try_slot(&name) {
+        Ok(Some(guard)) => {
             if guard.abandoned() {
                 acquire::say_taken_abandoned(console, &name);
             }
             Some(guard)
         }
-        Err(AcquireError::Timeout) => None,
-        Err(AcquireError::Failed(error)) => {
+        Ok(None) => None,
+        Err(error) => {
             survey.say_once("could not take", &name, error, console);
             None
         }
     }
+}
+
+/// The marker a gate lent its light parent's slot keeps while a critical request drains, from before its command
+/// starts until after it ends: `slots\gate-lent-<parent pid>-<pid>-<start ms>.json`, named after its parent gate, whose
+/// one light slot it runs on, and itself, in the claim format, of kind heavy and index 0 as a claim of no slot of its
+/// own. A critical gate's drain counts each live one as a heavy holder it waits for ([`Survey::lent_children`]).
+pub(crate) struct LendMarker {
+    path: PathBuf,
+}
+
+impl LendMarker {
+    /// Writes the marker under `root` of the gate `of` names, lent the slot of the parent gate `parent_pid`; `None` when
+    /// it cannot be written, said, so the gate is not lent.
+    pub(crate) fn write(root: &Path, parent_pid: u32, of: &ClaimOf<'_>, console: &mut Console) -> Option<LendMarker> {
+        let file = format!("gate-lent-{parent_pid}-{}-{}.json", of.gate.pid, of.gate.start_ms);
+        let path = v1::slots_dir(root).join(file);
+        let written = claim_of(ClaimKind::Heavy, 0, of).and_then(|claim| v1::write_claim(&path, &claim));
+        match written {
+            Ok(()) => Some(LendMarker { path }),
+            Err(error) => {
+                console.err(&format!("gate: cannot write the lend marker {}: {error}", path.display()));
+                None
+            }
+        }
+    }
+
+    /// Deletes the marker, then wakes the waiters, so a critical gate that waited for this gate counts again.
+    pub(crate) fn end(self, root: &ResolvedRoot, survey: &mut Survey, console: &mut Console) {
+        if let Err(error) = delete(&self.path) {
+            console.err(&format!("gate: cannot delete the lend marker {}: {error}", self.path.display()));
+        }
+        wake_waiters(root, survey, console);
+    }
+}
+
+/// Whether a file of the claims folder named `name` is a lend marker ([`LendMarker`]).
+fn is_lend_marker(name: &str) -> bool {
+    name.starts_with("gate-lent-") && Path::new(name).extension().is_some_and(|extension| extension == "json")
 }
 
 /// Tries the mutex of `object`, the slot `index` of its pool or the critical mutex at index 0, once, and takes it when
@@ -542,9 +608,10 @@ pub(crate) fn try_object(root: &ResolvedRoot, object: KernelObject, index: u32, 
 }
 
 /// Whether a file of the claims folder named `name` is a claim of this root: `gate-<slot>.json`, as
-/// [`KernelObject::claim_file_name`] names them, so a claim's `*.tmp` file and another prefix's claim are not.
+/// [`KernelObject::claim_file_name`] names them, so a claim's `*.tmp` file, another prefix's claim and a lend marker
+/// ([`LendMarker`]) are not.
 fn is_claim_file(name: &str) -> bool {
-    name.starts_with("gate-") && Path::new(name).extension().is_some_and(|extension| extension == "json")
+    name.starts_with("gate-") && !is_lend_marker(name) && Path::new(name).extension().is_some_and(|extension| extension == "json")
 }
 
 /// `tickets` less the one of the gate `own`, its pid and start in epoch milliseconds.
@@ -612,13 +679,14 @@ pub(crate) fn write_claim(held: &Held, kind: ClaimKind, of: &ClaimOf<'_>, consol
     let Some(path) = &held.claim else {
         return;
     };
-    let written = claim(held, kind, of).and_then(|claim| v1::write_claim(path, &claim));
+    let written = claim_of(kind, held.index, of).and_then(|claim| v1::write_claim(path, &claim));
     if let Err(error) = written {
         console.err(&format!("gate: cannot write the claim {}: {error}", path.display()));
     }
 }
 
-fn claim(held: &Held, kind: ClaimKind, of: &ClaimOf<'_>) -> io::Result<Claim> {
+/// The claim of `kind` on the slot `index` of the gate `of` names, taken now.
+fn claim_of(kind: ClaimKind, index: u32, of: &ClaimOf<'_>) -> io::Result<Claim> {
     let ClaimOf {
         gate,
         ceiling,
@@ -628,7 +696,7 @@ fn claim(held: &Held, kind: ClaimKind, of: &ClaimOf<'_>) -> io::Result<Claim> {
     } = *of;
     Ok(Claim {
         kind,
-        index: held.index,
+        index,
         pid: gate.pid,
         process_start: gate.start,
         started: Timestamp::now(),
@@ -733,6 +801,7 @@ mod tests {
         assert!(!is_claim_file("gate-light-slot-0.json.4242.1.tmp"), "a claim being written");
         assert!(!is_claim_file("t1-gate-slot-0.json"), "another prefix's claim");
         assert!(!is_claim_file("notes.json"));
+        assert!(!is_claim_file("gate-lent-5-6-7.json"), "a lend marker");
     }
 
     #[test]

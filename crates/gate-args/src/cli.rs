@@ -255,7 +255,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-remote-wait-ms" => Some(RunOption::Value(ValueOption::RemoteWaitMs)),
         "test-git-limit-ms" => Some(RunOption::Value(ValueOption::GitLimitMs)),
         "test-git-drain-ms" => Some(RunOption::Value(ValueOption::GitDrainMs)),
-        "test-beside-claim-pause-ms" => Some(RunOption::Value(ValueOption::BesideClaimPauseMs)),
+        "test-beside-claim-wait" => Some(RunOption::Value(ValueOption::BesideClaimWait)),
         "test-dotnet-limit-ms" => Some(RunOption::Value(ValueOption::DotnetLimitMs)),
         "test-remote-snapshot" => Some(RunOption::Switch(SwitchOption::RemoteSnapshot)),
         "test-remote-transport" => Some(RunOption::Value(ValueOption::RemoteTransport)),

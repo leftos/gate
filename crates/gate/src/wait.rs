@@ -26,6 +26,9 @@ use crate::slots::{self, Pool, Survey, Taken, ThisGate};
 const POLL: Duration = Duration::from_secs(2);
 /// How often a waiter says it still waits.
 const HEARTBEAT: Duration = Duration::from_secs(30);
+/// The longest a waiter sleeps after a pass that found the beside mutex held by another gate: that gate wakes the
+/// waiters only once it took or lent something, so a pass that found no room for this reason alone looks again soon.
+const BUSY_RETRY: Duration = Duration::from_millis(100);
 /// How long a routed run waits for a remote slot before it falls back here.
 const REMOTE_LIMIT: Duration = Duration::from_secs(60);
 
@@ -52,6 +55,8 @@ pub(crate) struct Waiter {
     /// Where the gate's ticket is.
     ticket: PathBuf,
     said_wait_failed: bool,
+    /// Whether the last pass found the beside mutex held by another gate, so the next sleep is [`BUSY_RETRY`] at most.
+    retry_soon: bool,
 }
 
 impl Waiter {
@@ -81,7 +86,13 @@ impl Waiter {
                 .filter(|_| seams.interrupt_queued || (seams.interrupt_after_fallback && arrival.after_fallback)),
             ticket: path,
             said_wait_failed: false,
+            retry_soon: false,
         }
+    }
+
+    /// Notes that this pass found the beside mutex held by another gate: the next sleep lasts [`BUSY_RETRY`] at most.
+    pub(crate) fn retry_soon(&mut self) {
+        self.retry_soon = true;
     }
 
     /// Where the gate's ticket is.
@@ -119,12 +130,16 @@ impl Waiter {
     }
 
     /// Sleeps on the wake event until it is set, the console is interrupted, the poll runs out, the next still-waiting
-    /// line is due or `limit`, counted from the queueing, passes. A wait that fails is said once and slept out instead.
+    /// line is due, `limit`, counted from the queueing, passes, or after a pass that found the beside mutex held by
+    /// another gate, [`BUSY_RETRY`]. A wait that fails is said once and slept out instead.
     pub(crate) fn sleep(&mut self, limit: Option<Duration>, console: &mut Console) {
         let elapsed = self.queued.elapsed();
         let mut timeout = self.poll.min(self.next_heartbeat.saturating_sub(elapsed));
         if let Some(limit) = limit {
             timeout = timeout.min(limit.saturating_sub(elapsed));
+        }
+        if std::mem::take(&mut self.retry_soon) {
+            timeout = timeout.min(BUSY_RETRY);
         }
         let Some(event) = &self.event else {
             thread::sleep(timeout);
@@ -245,8 +260,9 @@ pub(crate) struct Arrival<'g> {
 /// How a wait ended.
 pub(crate) enum Waited {
     Taken(Taken),
-    /// The gate's light parent lends it its slot while a critical request drains.
-    Lent,
+    /// The gate's light parent lends it its slot while a critical request drains, decided holding the beside mutex,
+    /// which the gate keeps until it has written its lend marker ([`slots::LendMarker`]).
+    Lent(OwnedMutexGuard),
     /// The console was interrupted.
     Interrupted,
     /// The wait's limit passed with no slot taken.
@@ -328,17 +344,17 @@ impl<'a> Wait<'a> {
         }
         let count = self.counts(console);
         let others = live_others(self.root, survey, console);
-        if self.lent(&others, survey, console) {
-            return Some(Waited::Lent);
+        if let Some(lent) = self.lent(&others, survey, console) {
+            return Some(lent);
         }
         self.barrier = self.barrier_in(&others);
         self.pause.refresh(self.barrier.is_some(), console);
-        let beside = self.beside_held(survey, console);
-        let range = self.range(count, beside.is_some(), survey, console);
+        let beside = self.beside(survey, console);
+        let (range, room) = self.range(count, &beside, survey, console);
         self.range = range.clone();
-        let (may_try, probe) = self.may_try(&others, range.clone(), survey, console);
+        let (may_try, probe) = self.may_try(&others, range.clone(), room, survey, console);
         if may_try && let Some(mut taken) = slots::try_pool(self.root, self.pool, range.clone(), survey, console) {
-            taken.beside = beside;
+            taken.beside = beside.into_guard();
             return Some(Waited::Taken(taken));
         }
         drop(beside);
@@ -388,11 +404,28 @@ impl<'a> Wait<'a> {
         setting.count
     }
 
-    /// Whether the gate's light parent lends it its slot on a pass that read the other gates' live tickets `others`
-    /// ([`lends`]); never for a gate under no such parent, nor under a parent that holds no slot.
-    fn lent(&self, others: &[Ticket], survey: &mut Survey, console: &mut Console) -> bool {
+    /// How the wait ends when the gate's light parent lends it its slot on a pass that read the other gates' live
+    /// tickets `others` ([`lends`]), the lend confirmed holding the beside mutex ([`lend_held`]); `None` for a gate under
+    /// no such parent, under a parent that holds no slot or that may not lend now, and when the beside mutex is held by
+    /// another gate, which this gate looks again for soon.
+    fn lent(&mut self, others: &[Ticket], survey: &mut Survey, console: &mut Console) -> Option<Waited> {
         let root = self.root;
-        self.under.is_some_and(|parent| parent.lends) && lends(others, &mut Probed { root, survey, console })
+        if !self.under.is_some_and(|parent| parent.lends) || !lends(others, &mut Probed { root, survey, console }) {
+            return None;
+        }
+        let held = lend_held(root, survey, console);
+        if held.is_none() {
+            self.waiter.retry_soon();
+        }
+        held.map(Waited::Lent)
+    }
+
+    /// Stops the gate's light parent lending it its slot for the rest of the wait: the gate could not write its lend
+    /// marker, without which a critical gate's drain would not wait for it.
+    pub(crate) fn refuse_lend(&mut self) {
+        if let Some(under) = &mut self.under {
+            under.lends = false;
+        }
     }
 
     /// The critical request of the other gates' live tickets `others` that holds the gate back ([`barrier`]); none for
@@ -404,36 +437,53 @@ impl<'a> Wait<'a> {
         }
     }
 
-    /// The beside mutex, for a light gate a critical request holds back, which holds it from its count of the light
-    /// gates beside the request to its claim ([`slots::hold_beside`]); `None` for any other gate, and when it is not
-    /// taken this pass.
-    fn beside_held(&self, survey: &mut Survey, console: &mut Console) -> Option<OwnedMutexGuard> {
-        match (self.pool, self.barrier) {
-            (Pool::Local(SlotKind::Light), Some(_)) => slots::hold_beside(self.root, survey, console),
-            _ => None,
+    /// The beside mutex as this pass finds it: a local light gate tries it once ([`slots::try_beside`]) and holds it from
+    /// before its count and its try to after its claim, whether or not a critical request holds it back; any other gate
+    /// needs none. Held by another gate, this gate finds no room this pass and looks again soon.
+    fn beside(&mut self, survey: &mut Survey, console: &mut Console) -> Beside {
+        if !matches!(self.pool, Pool::Local(SlotKind::Light)) {
+            return Beside::Unneeded;
         }
+        if let Some(guard) = slots::try_beside(self.root, survey, console) {
+            return Beside::Held(guard);
+        }
+        self.waiter.retry_soon();
+        Beside::Busy
     }
 
-    /// The slots of a count of `count` the gate tries on this pass: every one, unless a critical request ahead holds
-    /// it back ([`slot_range`]). A light gate held back counts the light gates beside the request, the other gates'
-    /// live light claims whatever their slots, only while it holds the beside mutex (`beside_held`), and tries none
-    /// without it.
-    fn range(&self, count: u32, beside_held: bool, survey: &mut Survey, console: &mut Console) -> Range<u32> {
+    /// The slots of a count of `count` the gate tries on this pass, every one unless a critical request ahead holds it
+    /// back ([`slot_range`]), and the room left it, `None` for no cap but the free slots. A light gate held back counts
+    /// the light gates beside the request, the other gates' live light claims whatever their slots, holding the beside
+    /// mutex `beside`, and has the room the allowance leaves; it has none when it cannot list the claims, said once. A
+    /// light gate that found the beside mutex held by another gate has no room this pass.
+    fn range(&self, count: u32, beside: &Beside, survey: &mut Survey, console: &mut Console) -> (Range<u32>, Option<usize>) {
+        let busy = matches!(beside, Beside::Busy).then_some(0);
         let (Pool::Local(kind), Some(_)) = (self.pool, self.barrier) else {
-            return 0..count;
+            return (0..count, busy);
         };
-        if kind == SlotKind::Heavy || !beside_held {
-            return slot_range(kind, count, usize::MAX);
+        if kind == SlotKind::Heavy || busy.is_some() {
+            return (slot_range(kind, count, usize::MAX), busy);
         }
-        let beside = survey.light_claims(&self.root.path, console).len();
-        slot_range(kind, count, beside)
+        match survey.light_claims(&self.root.path, console) {
+            Ok(claims) => (slot_range(kind, count, claims.len()), Some(beside_room(count, claims.len()))),
+            Err(_) => (slot_range(kind, count, usize::MAX), Some(0)),
+        }
     }
 
-    /// Whether the gate may try the slots `range`: some are left it, and fewer live tickets of its kind of `others`
-    /// are ahead of it than those slots are free, so a try never takes the slot an earlier waiter would get. The slots
-    /// are probed only when the decision needs it; the pass's probe comes with it, `None` when it made none.
-    fn may_try(&self, others: &[Ticket], range: Range<u32>, survey: &mut Survey, console: &mut Console) -> (bool, Option<Probe>) {
-        if range.is_empty() {
+    /// Whether the gate may try the slots `range` with the room `room` left it: some are left it, and fewer live
+    /// tickets of its kind of `others` are ahead of it than those slots are free, or than the room when that is less
+    /// ([`may_take`]), so a try never takes the slot or the place beside a critical request an earlier waiter would
+    /// get. The slots are probed only when the decision needs it; the pass's probe comes with it, `None` when it made
+    /// none.
+    fn may_try(
+        &self,
+        others: &[Ticket],
+        range: Range<u32>,
+        room: Option<usize>,
+        survey: &mut Survey,
+        console: &mut Console,
+    ) -> (bool, Option<Probe>) {
+        if range.is_empty() || room == Some(0) {
             return (false, None);
         }
         let ahead = self.ahead(others, survey, console);
@@ -441,7 +491,7 @@ impl<'a> Wait<'a> {
             return (true, None);
         }
         let probe = self.probe(range, survey, console);
-        (ahead < slots_where(&probe, false), Some(probe))
+        (may_take(ahead, slots_where(&probe, false), room), Some(probe))
     }
 
     /// Says the gate waits, once a wait. Held back by a critical request, it says so whether or not a slot is free.
@@ -487,7 +537,7 @@ impl<'a> Wait<'a> {
         if busy.is_empty() {
             return None;
         }
-        let claims = survey.live_claims(&self.root.path, console);
+        let claims = survey.live_claims(&self.root.path, console).ok()?;
         holder_eta(&claims, &busy, Which::First, Timestamp::now())
     }
 
@@ -584,10 +634,20 @@ pub(crate) enum Which {
 /// One holder as its ETA reads it: the seconds of its usual run time left, negative once past it, its usual run time,
 /// the claim's `expected.p50`, and its ceiling in seconds.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Usual {
-    left: f64,
+pub(crate) struct Usual {
+    pub left: f64,
     p50: f64,
     ceiling: f64,
+}
+
+/// The holder of `claim` as its ETA reads it at `now` ([`Usual`]); `None` when the claim carries no usual.
+pub(crate) fn usual(claim: &Claim, now: Timestamp) -> Option<Usual> {
+    let p50 = claim.expected.as_ref()?.get("p50")?.as_f64()?;
+    Some(Usual {
+        left: p50 - now.duration_since(claim.started).as_secs_f64(),
+        p50,
+        ceiling: claim.timeout_seconds,
+    })
 }
 
 /// When the holders of the busy slots `busy`, each a claim kind and slot index, free them, by their live claims
@@ -598,13 +658,7 @@ pub(crate) fn holder_eta(claims: &[Claim], busy: &[(ClaimKind, u32)], which: Whi
     let mut holders = Vec::with_capacity(busy.len());
     for &(kind, index) in busy {
         let claim = claims.iter().find(|claim| claim.kind == kind && claim.index == index)?;
-        let p50 = claim.expected.as_ref()?.get("p50")?.as_f64()?;
-        let ran = now.duration_since(claim.started).as_secs_f64();
-        holders.push(Usual {
-            left: p50 - ran,
-            p50,
-            ceiling: claim.timeout_seconds,
-        });
+        holders.push(usual(claim, now)?);
     }
     let by_left = |one: &Usual, other: &Usual| one.left.total_cmp(&other.left);
     let named = match which {
@@ -640,10 +694,24 @@ fn beside_place(pid: u32) -> String {
 
 /// Whether the gate under a light parent gate is lent that parent's slot before it queues, by the same rule and reads
 /// as each pass of a wait ([`lends`]): the other gates' live tickets under `root`, then the critical mutex only as the
-/// rule needs it.
-pub(crate) fn lent_before_queue(root: &ResolvedRoot, survey: &mut Survey, console: &mut Console) -> bool {
+/// rule needs it, the lend confirmed holding the beside mutex ([`lend_held`]), which comes with it. `None` when the
+/// parent does not lend, or the beside mutex is held by another gate: the gate then queues and asks on each pass.
+pub(crate) fn lent_before_queue(root: &ResolvedRoot, survey: &mut Survey, console: &mut Console) -> Option<OwnedMutexGuard> {
     let others = live_others(root, survey, console);
-    lends(&others, &mut Probed { root, survey, console })
+    if !lends(&others, &mut Probed { root, survey, console }) {
+        return None;
+    }
+    lend_held(root, survey, console)
+}
+
+/// The beside mutex under `root`, for a lend the tickets allowed a moment ago, once a read of the tickets made holding
+/// it still allows it ([`lends`]): a critical gate rewrites its ticket as holding the machine only holding that mutex,
+/// after it counted the lend markers, so a lend that holds it until its marker is written is either counted or never
+/// made. `None` when another gate holds it, or the lend is no longer allowed.
+fn lend_held(root: &ResolvedRoot, survey: &mut Survey, console: &mut Console) -> Option<OwnedMutexGuard> {
+    let guard = slots::try_beside(root, survey, console)?;
+    let others = live_others(root, survey, console);
+    lends(&others, &mut Probed { root, survey, console }).then_some(guard)
 }
 
 /// The counts file under `root` as it stands, a missing or unreadable one giving the defaults for `processors`.
@@ -702,10 +770,42 @@ fn barrier(others: &[Ticket], order: (u64, u32)) -> Option<Barrier> {
 /// light gate every one while fewer than the allowance of light gates, `min(2, count)`, run `beside` the request, a
 /// number whichever slots they hold, and none once that many do.
 fn slot_range(kind: SlotKind, count: u32, beside: usize) -> Range<u32> {
-    let room = usize::try_from(beside_allowance(count)).is_ok_and(|allowance| beside < allowance);
     match kind {
-        SlotKind::Light if room => 0..count,
+        SlotKind::Light if beside_room(count, beside) > 0 => 0..count,
         SlotKind::Light | SlotKind::Heavy => count..count,
+    }
+}
+
+/// How many more light gates may run beside a critical request with `beside` running there, for a light count of
+/// `count`: the allowance, `min(2, count)`, less those.
+fn beside_room(count: u32, beside: usize) -> usize {
+    usize::try_from(beside_allowance(count)).map_or(usize::MAX, |allowance| allowance.saturating_sub(beside))
+}
+
+/// Whether a gate with `ahead` live tickets of its kind ahead of it may try a slot, with `free` slots free and `room`
+/// places left beside a critical request that holds it back, `None` when none does: fewer are ahead than the free
+/// slots, or than the room when that is less, so an earlier gate held back keeps the one place left.
+fn may_take(ahead: usize, free: usize, room: Option<usize>) -> bool {
+    ahead < room.map_or(free, |room| free.min(room))
+}
+
+/// The beside mutex as a pass of a wait finds it ([`Wait::beside`]).
+enum Beside {
+    /// The gate takes no local light slot, so it needs none.
+    Unneeded,
+    /// The gate holds it for this pass's count and try and, once it takes a slot, until its claim is written.
+    Held(OwnedMutexGuard),
+    /// Another gate holds it, or it cannot be taken: no room this pass.
+    Busy,
+}
+
+impl Beside {
+    /// The mutex, when the pass holds it.
+    fn into_guard(self) -> Option<OwnedMutexGuard> {
+        match self {
+            Beside::Held(guard) => Some(guard),
+            Beside::Unneeded | Beside::Busy => None,
+        }
     }
 }
 
@@ -889,7 +989,9 @@ mod tests {
     use jiff::{SignedDuration, Timestamp};
 
     use super::scratch::{Holder, Scratch, holding, request};
-    use super::{Arrival, Barrier, Host, LendFacts, Wait, Waited, Which, barrier, first_heartbeat, holder_eta, lends, slot_range};
+    use super::{
+        Arrival, Barrier, Host, LendFacts, Wait, Waited, Which, barrier, beside_room, first_heartbeat, holder_eta, lends, may_take, slot_range,
+    };
     use crate::console::Console;
     use crate::slots::{self, Pool, Survey, ThisGate};
 
@@ -1157,6 +1259,18 @@ mod tests {
         assert_eq!(slot_range(SlotKind::Light, 1, 0), 0..1, "a count of 1 allows one light gate");
         assert_eq!(slot_range(SlotKind::Light, 1, 1), 1..1);
         assert_eq!(slot_range(SlotKind::Light, 5, usize::MAX), 5..5, "no beside count, no slot");
+    }
+
+    #[test]
+    fn of_two_light_gates_held_back_with_one_place_left_beside_the_request_the_later_one_leaves_it_to_the_earlier() {
+        assert_eq!(beside_room(5, 1), 1, "one light gate beside it, one place left");
+        assert_eq!(beside_room(5, 3), 0, "past the allowance, no place");
+        assert_eq!(beside_room(1, 0), 1);
+        assert!(!may_take(1, 4, Some(1)), "four slots free, but the one place goes to the earlier gate");
+        assert!(may_take(0, 4, Some(1)), "the earlier gate takes the place");
+        assert!(may_take(1, 4, Some(2)), "two places, one for each");
+        assert!(may_take(1, 4, None), "no request holds it back: the free slots alone");
+        assert!(!may_take(2, 2, None));
     }
 
     /// One row of the lend table: the other gates' tickets, whether the critical mutex is open, whether the parent
