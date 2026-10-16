@@ -4,18 +4,21 @@
 
 ## Do first
 
+- [ ] GATE-329 Make the gate's own suite pass on a builder — Urgent · Remote
+- [/] GATE-347 Warm a builder work folder with a repo's warm-up commands before routing work for it — Urgent · Remote
+- [ ] GATE-367 Route a Godot or dotnet command named by its absolute install path (opening-hand, delve) — Urgent · Remote
+- [ ] GATE-368 Trial routing for worktree-sweep's csharpier, ops-tower's pnpm and opening-hand's uv pytest — Urgent · Remote
+- [ ] GATE-369 Find why three routed runs found the builder unreachable — Urgent · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [/] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
-- [/] GATE-347 Warm a builder work folder with a repo's warm-up commands before routing work for it — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
-- [ ] GATE-362 Send a caller's chosen environment to a routed command, and say when a routed run drops one — High · Remote
+- [/] GATE-362 Send a caller's chosen environment to a routed command, and say when a routed run drops one — High · Remote
 
 ## Remote
 
 - [ ] GATE-332 Send each repo's inputs in a routed sibling pair
 - [ ] GATE-273 Read a dotnet tools manifest at the repo root as a toolchain pin
-- [ ] GATE-329 Make the gate's own suite pass on a builder
 - [ ] GATE-109 Remote: carry every verb of a routed run over one ssh connection (gate box serve)
 - [ ] GATE-29 Sync-back: narrow the 'worktree changed during the run' refusal to changes that could matter
 - [ ] GATE-27 Remote: remember a builder's failures per host (short backoff, loss counter)
@@ -150,3 +153,7 @@
 - [ ] GATE-331 Gates nested in a lent gate: their history rows and a command that outlives the lend
 - [ ] GATE-338 Bring back or refuse a routed command's own commit on the box
 - [ ] GATE-340 Keep the check suite's stub probes off the 10 s limit under load
+- [ ] GATE-363 Let the warm-up budget case pass when its first command uses the whole budget on a busy machine
+- [ ] GATE-364 Open the state root's own folders without following junctions
+- [ ] GATE-365 Decide whether warm-up consent names the warm-up file's hash, not just the repo
+- [ ] GATE-366 Find why a between-two-fetches outputs case hung its last run on a busy PC
