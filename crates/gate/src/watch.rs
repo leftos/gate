@@ -189,8 +189,8 @@ pub(crate) struct Watching<'a> {
     pub root: &'a ResolvedRoot,
     /// This gate, whose name the pause markers of the gates under it carry.
     pub gate: &'a ThisGate,
-    /// The parent whose marker this gate hands its command, when that parent's slot covers it or is lent to it: the
-    /// gates under that command name their pause markers after the parent.
+    /// The parent whose marker this gate hands its command, when that parent's slot covers it: the gates under that
+    /// command name their pause markers after the parent.
     pub hands_on: Option<&'a Parent>,
     /// Where the samples record the processes outside the job, which the run's kill reads.
     pub recorded: &'a RefCell<Recorded>,
@@ -867,6 +867,7 @@ mod tests {
             local: false,
             bring_tracked: Vec::new(),
             state_dir: None,
+            cd: None,
             command: command.iter().map(OsString::from).collect(),
             test_seams: TestSeams::default(),
             print_request: false,

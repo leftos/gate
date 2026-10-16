@@ -333,6 +333,9 @@ pub struct RemoteRun {
     pub slots: u32,
     /// The worktree root as git gives it.
     pub root: String,
+    /// The id of the worktree root's folder, read following links ([`Facts::root_id`]): what the run's worktree lock
+    /// checks the root against at use.
+    pub root_id: FolderId,
     /// The worktree root's folder name: its last segment.
     pub leaf: String,
     /// The siblings the run carries: those declared, each allowed and checked, in declared order; none for a repo that
@@ -355,6 +358,9 @@ pub struct RemoteRun {
     pub fallback: Vec<String>,
     /// The output globs the run brings back; none for a dotnet `--no-build` command.
     pub outputs: Vec<String>,
+    /// The input globs the run sends: the repo's `inputs` list, none when it has no entry; kept for a dotnet
+    /// `--no-build` command, whose outputs alone are withheld.
+    pub inputs: Vec<String>,
     /// Whether `--no-build` was dropped from the builder's words.
     pub dropped_no_build: bool,
     /// Whether outputs were withheld from a `--no-build` command.
@@ -415,6 +421,7 @@ struct Matched<'a> {
     words: Vec<String>,
     outside: Option<String>,
     leaf: String,
+    root_id: FolderId,
     siblings: Vec<CarriedSibling>,
 }
 
@@ -682,7 +689,7 @@ fn matched<'a>(config: &'a Config, words: &[String], facts: &dyn Facts) -> Resul
         leaf: &leaf,
         siblings: &siblings,
     };
-    let ids = check_siblings(&declared, config.allowed_siblings(&repo), facts)?;
+    let (root_id, ids) = check_siblings(&declared, config.allowed_siblings(&repo), facts)?;
     let siblings = siblings
         .into_iter()
         .zip(ids)
@@ -695,6 +702,7 @@ fn matched<'a>(config: &'a Config, words: &[String], facts: &dyn Facts) -> Resul
         words: sent.words,
         outside: sent.outside,
         leaf,
+        root_id,
         siblings,
         place,
     })
@@ -750,8 +758,8 @@ struct Declared<'a> {
 /// sibling's. No sibling is looked for until every name is allowed
 /// and known to be another folder's. With each sibling's folder id, in declared order. The root's own id is read for
 /// every matched command, siblings or none, after the siblings are found ([`Facts::root_id`]): a root whose id cannot be
-/// read keeps the run here, as its sync-back's lock needs it.
-fn check_siblings(declared: &Declared<'_>, allowed: Result<&[String], &str>, facts: &dyn Facts) -> Result<Vec<FolderId>, Here> {
+/// read keeps the run here, as its sync-back's lock needs it. With the root's id first.
+fn check_siblings(declared: &Declared<'_>, allowed: Result<&[String], &str>, facts: &dyn Facts) -> Result<(FolderId, Vec<FolderId>), Here> {
     let &Declared {
         ref problem,
         root,
@@ -765,8 +773,7 @@ fn check_siblings(declared: &Declared<'_>, allowed: Result<&[String], &str>, fac
     }
     let root_id = || facts.root_id(root).map_err(|reason| Some(failed(&reason)));
     if siblings.is_empty() {
-        root_id()?;
-        return Ok(Vec::new());
+        return Ok((root_id()?, Vec::new()));
     }
     check_layout_names(siblings)?;
     check_consent(siblings, allowed)?;
@@ -774,7 +781,7 @@ fn check_siblings(declared: &Declared<'_>, allowed: Result<&[String], &str>, fac
     let ids = folder_ids(siblings, facts)?;
     let root_id = root_id()?;
     check_distinct(siblings, &ids, root_id)?;
-    Ok(ids)
+    Ok((root_id, ids))
 }
 
 /// Keeps the run here for a sibling's name the builder cannot lay out, checked again here whatever the siblings file's
@@ -919,6 +926,7 @@ fn remote_run(matched: Matched<'_>, subfolder: String, given: &[String], facts: 
     if outputs_withheld {
         outputs.clear();
     }
+    let inputs = matched.config.inputs(&matched.repo);
     mark_bare_first_word(&mut words, facts);
     stamp_source_revision(&mut words, &matched.place, facts);
     RemoteRun {
@@ -926,6 +934,7 @@ fn remote_run(matched: Matched<'_>, subfolder: String, given: &[String], facts: 
         slots: matched.config.slots(),
         key: work_folder_key(&matched.place.root),
         leaf: matched.leaf,
+        root_id: matched.root_id,
         root: matched.place.root,
         siblings: matched.siblings,
         repo: matched.repo,
@@ -934,6 +943,7 @@ fn remote_run(matched: Matched<'_>, subfolder: String, given: &[String], facts: 
         words,
         fallback,
         outputs,
+        inputs,
         dropped_no_build,
         outputs_withheld,
     }

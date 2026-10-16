@@ -508,6 +508,36 @@ fn a_gate_under_a_no_slot_run_is_not_lent_a_slot_during_a_critical_request() {
     assert_eq!(take_of(&case, child_pid)["parentPid"], Value::from(process::id()));
 }
 
+#[test]
+fn a_gate_lent_its_light_parents_slot_hands_its_command_its_own_heavy_marker() {
+    let case = Case::new("a_gate_lent_its_light_parents_slot_hands_its_command_its_own_heavy_marker");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
+    let go = case.folder().join("go");
+    let holder = heavy_holder(&case, &go);
+    let critical = case.start(&critical_words("critical.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
+    critical.wait_for_stderr("gate: waiting for the machine (critical)");
+
+    let words = heavy_words("child.log", &POLL, &[FAKE_TOOL, "env", "GATE_SLOT_HELD"]);
+    let child = start(marked(&case, &words, &test_marker(&case, "light")));
+    let child_pid = child.id();
+    assert_passed(&child.finish());
+    let_go(&go);
+    assert_passed(&holder.finish());
+    assert_passed(&critical.finish());
+
+    assert_eq!(events_of(&case, child_pid), ["parent"], "the child ran on its parent's lent slot");
+    let parent_line = events(&case)
+        .into_iter()
+        .find(|event| event["event"] == "parent" && event["pid"] == child_pid)
+        .expect("checked above");
+    let marker = marker_of(&case, "heavy", &parent_line);
+    let child_log = fs::read_to_string(case.folder().join("child.log")).expect("the child wrote its log");
+    assert!(
+        child_log.contains(&format!("{marker}\n")),
+        "the lent child hands its command its own heavy marker {marker}: {child_log}"
+    );
+}
+
 /// The line of a gate that ignores `marker`, naming this test process, because it does not run inside that process's
 /// gate's command, then goes on as `going_on` says.
 fn unbound_line(marker: &str, going_on: &str) -> String {

@@ -29,8 +29,11 @@ mod mutex;
 mod pipe;
 mod piped;
 mod priority;
+mod security;
 mod session;
 mod task;
+#[cfg(test)]
+mod test_support;
 mod times;
 mod token;
 mod tree;
@@ -70,7 +73,11 @@ pub fn check_plain_file(file: &std::fs::File) -> io::Result<()> {
 
     launch::check_plain_file(file.as_raw_handle())
 }
-pub use file::{Share, file_id, move_no_replace, on_network_volume, open_beneath, reopen_through_filter, same_file};
+pub use file::{
+    Make, Share, delete_opened, delete_tree_opened, file_id, make_folder_beneath, move_no_replace, names_beneath, on_network_volume, open_beneath,
+    open_beneath_as, rename_beneath, rename_beneath_no_replace, reopen_through_filter, same_file,
+};
+pub use security::{Descriptor, inherit_security, is_protected_folder, protected_descriptor, security_text};
 pub use tree::{Membership, OpenedJob, StoppableProcess, WaitableProcess};
 
 pub use priority::{Priority, priority_of, set_priority};
@@ -416,7 +423,7 @@ mod tests {
 
     #[test]
     fn a_file_with_two_names_is_refused_with_no_system_error_code() {
-        let folder = std::env::temp_dir().join(format!("gate-win32-plain-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-win32-plain-{}", std::process::id()));
         // A folder left by an earlier run of the same pid is cleared first.
         let _ = fs::remove_dir_all(&folder);
         fs::create_dir_all(&folder).expect("the scratch folder is made");

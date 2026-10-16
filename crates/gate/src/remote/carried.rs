@@ -13,10 +13,6 @@ pub(crate) struct Sibling<'a> {
     id: FolderId,
 }
 
-#[cfg_attr(
-    not(any(test, feature = "test-seams")),
-    expect(dead_code, reason = "read only by the sibling tests and the scripted client in this build")
-)]
 impl<'a> Sibling<'a> {
     /// The folder name as `.gate/siblings.toml` declares it.
     pub(crate) fn name(&self) -> &'a str {
@@ -76,6 +72,7 @@ mod tests {
             host: "builder".to_owned(),
             slots: 1,
             root: "X:/dev/app".to_owned(),
+            root_id: ID,
             leaf: "app".to_owned(),
             siblings: siblings
                 .iter()
@@ -92,6 +89,7 @@ mod tests {
             words: Vec::new(),
             fallback: Vec::new(),
             outputs: Vec::new(),
+            inputs: Vec::new(),
             dropped_no_build: false,
             outputs_withheld: false,
         }

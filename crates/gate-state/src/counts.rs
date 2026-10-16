@@ -472,7 +472,7 @@ mod tests {
 
     #[test]
     fn a_temp_name_something_stands_at_is_passed_over_and_what_stands_there_is_left() {
-        let folder = std::env::temp_dir().join(format!("gate-state-replace-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-state-replace-{}", std::process::id()));
         fs::create_dir_all(&folder).expect("the folder can be made");
         let path = folder.join("record");
         let planted = temp_name(&path, TEMP_COUNTER.load(Ordering::Relaxed));

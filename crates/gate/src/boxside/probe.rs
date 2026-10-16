@@ -129,7 +129,7 @@ fn ran(run: &Run<'_>, place: &ProgramPlace, deadline: Instant, limit: Duration) 
         args,
         limit: remaining,
         interrupt: None,
-        worktree,
+        worktrees: worktree.as_slice(),
         console: PipedConsole::Hidden,
         stdin: None,
     };

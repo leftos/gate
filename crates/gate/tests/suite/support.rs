@@ -41,6 +41,7 @@ run options:
   --no-markers         the command's status is the verdict
   --local              never route this run to a builder
   --state-dir <path>   use another state root (also GATE_STATE_DIR)
+  --cd <folder>        run the command in <folder> and route from it
   --bring-tracked <glob>
                        install a routed run's outputs git tracks that match <glob>; repeatable
 
@@ -112,7 +113,8 @@ impl Case {
         std::path::absolute(&self.folder).expect("the case folder has an absolute path")
     }
 
-    /// Readies `command` for this case: the inherited gate variables removed, LOCALAPPDATA under the case folder
+    /// Readies `command` for this case: the inherited gate variables removed, git pointed at the suite's git home
+    /// (`HOME` and `XDG_CONFIG_HOME`, [`git_home_for`]), LOCALAPPDATA under the case folder
     /// ([`Case::local_app_data`]), the working directory the case folder,
     /// and `args` given with `--state-dir <root>` after a `run`, `stop-tree` or `expect` subcommand.
     pub fn prepare(&self, command: &mut Command, args: &[&str]) {
@@ -132,6 +134,7 @@ impl Case {
         for name in INHERITED.iter().chain(&GIT_REDIRECTS) {
             command.env_remove(name);
         }
+        git_home_for(command);
         command.env("LOCALAPPDATA", self.local_app_data()).current_dir(&self.folder).args(args);
     }
 
@@ -1000,6 +1003,92 @@ pub fn none_words<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> V
     words
 }
 
+/// The global git config every case's git reads in place of the user's own: line ends as the developer's config sets
+/// them over the system config's `core.autocrlf=true`, and no auto-maintenance or gc after a commit, push or fetch.
+const GIT_CONFIG: &str = "\
+[core]
+\tautocrlf = false
+\teol = lf
+\tlongpaths = true
+\tuntrackedCache = true
+[maintenance]
+\tauto = false
+[receive]
+\tautogc = false
+[gc]
+\tauto = 0
+";
+/// The global attributes every case's git reads in place of the user's own: LF everywhere but in batch files.
+const GIT_ATTRIBUTES: &str = "* text=auto eol=lf\n*.bat text eol=crlf\n*.cmd text eol=crlf\n";
+
+/// The variables that point git at another global or system config, or give it config of its own, which no suite git
+/// inherits: the config variables of the gate's `GIT_LOCATION` (`crates/gate/src/remote/git.rs`) less
+/// `GIT_CONFIG_PARAMETERS`, which [`GIT_REDIRECTS`] holds, and `GIT_CONFIG_NOSYSTEM`.
+const GIT_CONFIG_REDIRECTS: [&str; 4] = ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_COUNT"];
+/// The prefixes of the config variables `GIT_CONFIG_COUNT` indexes, as the gate's `GIT_CONFIG_INDEXED`
+/// (`crates/gate/src/remote/git.rs`) names them: `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>`.
+const GIT_CONFIG_INDEXED: [&str; 2] = ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
+
+/// Points `command`'s git, and every git it starts, at [`git_home`] as its home and XDG config folder, so it reads
+/// the suite's global config and attributes, not the user's or a caller's; the system config still applies, under
+/// them. The config variables a caller may have set ([`GIT_CONFIG_REDIRECTS`], [`GIT_CONFIG_INDEXED`]) are removed, as
+/// the gate removes them from every git it starts.
+pub fn git_home_for(command: &mut Command) {
+    for name in GIT_CONFIG_REDIRECTS {
+        command.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(is_indexed_config) {
+            command.env_remove(name);
+        }
+    }
+    let home = git_home();
+    command.env("HOME", home).env("XDG_CONFIG_HOME", home);
+}
+
+/// Whether the variable `name` is one of the config variables `GIT_CONFIG_COUNT` indexes, its case ignored as Windows
+/// ignores it.
+fn is_indexed_config(name: &str) -> bool {
+    GIT_CONFIG_INDEXED
+        .iter()
+        .any(|prefix| name.get(..prefix.len()).is_some_and(|start| start.eq_ignore_ascii_case(prefix)) && name.len() > prefix.len())
+}
+
+/// The suite's git home under the target's temporary folder, shared by every test process and written once by each:
+/// [`GIT_CONFIG`] as its `.gitconfig`, [`GIT_ATTRIBUTES`] as `git/attributes`.
+fn git_home() -> &'static Path {
+    static HOME: OnceLock<PathBuf> = OnceLock::new();
+    HOME.get_or_init(|| {
+        let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join("git-home");
+        place(&home.join(".gitconfig"), GIT_CONFIG);
+        place(&home.join("git").join("attributes"), GIT_ATTRIBUTES);
+        home
+    })
+}
+
+/// Makes the file `path` hold `content`, as many test processes may at once: one that holds it already is left alone,
+/// so no git ever reads a file being written; otherwise `content` is written beside it and renamed into place. A rename
+/// refused, as by another process's git reading the file, is fine when that file already holds `content`.
+fn place(path: &Path, content: &str) {
+    if fs::read_to_string(path).is_ok_and(|held| held == content) {
+        return;
+    }
+    let folder = path.parent().expect("a file of the git home has a folder");
+    fs::create_dir_all(folder).expect("the git home's folders can be made");
+    let name = path.file_name().expect("a file of the git home has a name").to_string_lossy();
+    let staged = folder.join(format!("{name}.{}.new", process::id()));
+    fs::write(&staged, content).expect("a file of the git home can be written");
+    if let Err(error) = fs::rename(&staged, path) {
+        fs::remove_file(&staged).expect("a file of the git home that was not renamed can be removed");
+        let held = fs::read_to_string(path);
+        assert!(
+            held.as_deref().is_ok_and(|held| held == content),
+            "{} cannot be replaced ({error}) and holds {held:?}",
+            path.display()
+        );
+    }
+}
+
 /// Makes the case folder a git worktree of its own, so a gate there is at the root of a checkout named as the folder.
 pub fn git_init(case: &Case) {
     git(case, &["init", "--quiet"]);
@@ -1012,6 +1101,7 @@ pub fn git(case: &Case, args: &[&str]) -> String {
     for name in GIT_REDIRECTS {
         command.env_remove(name);
     }
+    git_home_for(&mut command);
     let identity = ["-c", "user.name=gate suite", "-c", "user.email=suite@example.invalid"];
     let quiet = ["-c", "commit.gpgsign=false", "-c", "core.hooksPath=.no-hooks"];
     let output = command
@@ -1144,6 +1234,54 @@ pub fn write_powershell_ticket(case: &Case, (pid, start): (u32, Timestamp), kind
 /// Copies fake-tool into the case folder as `name`, so a command can name it inside the case's worktree.
 pub fn copy_tool(case: &Case, name: &str) {
     fs::copy(FAKE_TOOL, case.folder().join(name)).expect("fake-tool can be copied into the case folder");
+}
+
+/// An entry in a folder's access list that denies this user the icacls `rights` given, such as `(X)` (traverse the
+/// folder itself) or `(OI)(IO)(X)` (run any file put in it); dropping the guard takes the entry away.
+pub struct DenyEntry(PathBuf);
+
+impl DenyEntry {
+    pub fn new(folder: &Path, rights: &str) -> DenyEntry {
+        let denied = DenyEntry(folder.to_path_buf());
+        let status = Command::new("icacls")
+            .arg(folder)
+            .args(["/deny", &format!("{}:{rights}", this_user())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .status()
+            .expect("icacls starts");
+        assert!(status.success(), "the deny entry is added");
+        denied
+    }
+}
+
+/// This user, as `whoami` names one and icacls takes it.
+fn this_user() -> String {
+    let said = Command::new("whoami").stdin(Stdio::null()).output().expect("whoami starts");
+    assert!(said.status.success(), "whoami names this user: {said:?}");
+    String::from_utf8_lossy(&said.stdout).trim().to_owned()
+}
+
+impl Drop for DenyEntry {
+    /// Takes the deny entry away; one that stays is said on stderr with its folder, since the test cannot fail here.
+    #[expect(clippy::print_stderr, reason = "a deny entry that cannot be taken away is said without failing the case")]
+    fn drop(&mut self) {
+        let removed = Command::new("icacls")
+            .arg(&self.0)
+            .args(["/remove:d", &this_user()])
+            .stdin(Stdio::null())
+            .output();
+        match removed {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => eprintln!(
+                "the deny entry on {} is left: icacls said {}{}",
+                shown(&self.0),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => eprintln!("the deny entry on {} is left: icacls cannot start: {error}", shown(&self.0)),
+        }
+    }
 }
 
 /// Copies fake-tool into the case folder as `name` and returns its absolute path, so a command or a process the case

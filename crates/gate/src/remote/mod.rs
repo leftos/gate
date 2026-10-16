@@ -15,6 +15,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use gate_args::RunRequest;
+use gate_router::FolderId;
 use gate_state::{FallbackReason, StateRoot, Verdict};
 use gate_win32::{Interrupt, OwnedMutexGuard};
 
@@ -30,11 +31,8 @@ pub(crate) use carried::{Sibling, carried};
 mod carried;
 mod client;
 pub(crate) mod git;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the client does not hold a sibling pair's folders until pairs are on")
-)]
 mod held;
+mod inputs;
 mod install;
 mod launch;
 mod outputs;
@@ -44,6 +42,8 @@ mod retry;
 pub(crate) mod siblings;
 mod snapshot;
 mod syncback;
+#[cfg(feature = "test-seams")]
+mod tamper;
 #[cfg_attr(
     not(test),
     expect(
@@ -78,6 +78,8 @@ pub(crate) enum Refusal {
     Tools,
     /// The work folder could not be cleared or laid out for the run's repos.
     Layout,
+    /// The work folder does not hold the inputs the run's `InputsDigest` names.
+    Inputs,
 }
 
 impl Refusal {
@@ -87,6 +89,7 @@ impl Refusal {
             Refusal::Busy => "busy",
             Refusal::Tools => "tools",
             Refusal::Layout => "layout",
+            Refusal::Inputs => "inputs",
         }
     }
 }
@@ -195,6 +198,9 @@ pub(crate) struct RemoteCall<'a> {
     pub host: &'a str,
     pub key: &'a str,
     pub root: &'a str,
+    /// The id the route's decision read for the worktree root's folder, following links: the worktree lock refuses a
+    /// root whose folder has another id at use.
+    pub root_id: FolderId,
     /// The worktree root's folder name.
     pub leaf: &'a str,
     /// The siblings the run carries, as the route's decision allowed and checked them, in declared order ([`carried`]).
@@ -208,6 +214,8 @@ pub(crate) struct RemoteCall<'a> {
     /// Whether the route withheld the run's outputs, its command a dotnet `--no-build` one whose word the builder
     /// dropped: the builder builds, and nothing comes back.
     pub outputs_withheld: bool,
+    /// The input globs the run sends: the repo's `inputs` list, none when it has no entry.
+    pub inputs: &'a [String],
     /// The `--bring-tracked` globs: a fetched output git tracks is installed only when one matches it.
     pub bring_tracked: &'a [String],
     /// The log the client writes the run's output to.
@@ -252,12 +260,13 @@ pub(crate) struct RemoteOutcome {
 }
 
 /// How long a routed run's parts took: the run call, the command's own time, which its ceiling counts; the push; and the
-/// sync-back's fetch and the outputs fetch, each `None` when the run made none. A client that times none of them leaves
-/// them all at zero and `None`.
+/// inputs calls, the sync-back's fetch and the outputs fetch, each `None` when the run made none. A client that times
+/// none of them leaves them all at zero and `None`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Split {
     pub command: Duration,
     pub push: Duration,
+    pub inputs: Option<Duration>,
     pub sync_back: Option<Duration>,
     pub outputs: Option<Duration>,
 }
@@ -325,8 +334,9 @@ pub(crate) fn chosen(request: &RunRequest) -> Result<Box<dyn RemoteClient>, Stri
     Ok(Box::new(client::RustClient::ssh(&request.test_seams)))
 }
 
-/// The client of `--test-remote-snapshot`: makes the snapshot and bridge commits of the call's worktree and says each
-/// as `gate: remote snapshot <commit> bridge <commit or none>`, on stderr and in the log; the run ends with status 0,
+/// The client of `--test-remote-snapshot`: makes the snapshot and bridge commits of each of the call's worktrees, the
+/// main one first, then a pair's siblings in declared order, and says each as `gate: remote snapshot <commit> bridge
+/// <commit or none>`, one line a worktree, on stderr and in the log; the run ends with status 0,
 /// nothing pushed. A git failure ends it with status 1 and `gate: the remote run failed: <why>`, with no fallback; a
 /// Ctrl+C ends it as an interrupt, as the scripted client's `wait` does; and a run whose lines cannot be said ends with
 /// status 1, since its commits are already made.
@@ -348,7 +358,10 @@ mod snapshot_only {
 
     impl RemoteClient for SnapshotOnly {
         fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome {
-            let roots = vec![PathBuf::from(call.root)];
+            let roots: Vec<PathBuf> = std::iter::once(call.root)
+                .chain(call.siblings.iter().map(super::Sibling::root))
+                .map(PathBuf::from)
+                .collect();
             let (status, lines) = match snapshot::take(&roots, call.key, self.limit, call.interrupt) {
                 Ok(snapshots) => (0, snapshots.iter().map(said).collect()),
                 // An interrupt is no failure, so it says no line: the run is the interrupt, as the client's `wait`.
@@ -403,6 +416,7 @@ mod snapshot_only {
                 host: "builder",
                 key: "app-1a2b3c4d",
                 root,
+                root_id: gate_router::FolderId { volume: 0, file: [0; 16] },
                 leaf: "app",
                 siblings: Vec::new(),
                 repo: "app",
@@ -410,6 +424,7 @@ mod snapshot_only {
                 words: &[],
                 outputs: &[],
                 outputs_withheld: false,
+                inputs: &[],
                 log,
                 timeout: 3600,
                 usual: None,
@@ -427,7 +442,7 @@ mod snapshot_only {
         fn an_interrupted_snapshot_ends_the_run_as_an_interrupt() {
             let interrupt = Interrupt::install().expect("the console handler is installed");
             interrupt.raise();
-            let log = std::env::temp_dir().join(format!("gate-snapshot-interrupt-{}.log", std::process::id()));
+            let log = crate::test_support::temp_dir().join(format!("gate-snapshot-interrupt-{}.log", std::process::id()));
 
             let outcome = SnapshotOnly { limit: GIT_LIMIT }.run(&call(r"C:\no-such-worktree", &log, Some(interrupt)));
 
@@ -496,13 +511,13 @@ mod scripted {
     use gate_win32::Interrupt;
     use serde_json::{Value, json};
 
-    use super::{BoxKill, REFUSED, RemoteCall, RemoteClient, RemoteOutcome, Sibling};
+    use super::{BoxKill, FolderId, REFUSED, RemoteCall, RemoteClient, RemoteOutcome, Sibling};
     use crate::run::CONTROL_C_EXIT;
 
     /// How often `wait` looks for its path and the interrupt.
     const WAIT_STEP: Duration = Duration::from_millis(20);
     /// Every reason a `refuse` step may give.
-    const REASONS: [FallbackReason; 9] = [
+    const REASONS: [FallbackReason; 10] = [
         FallbackReason::Full,
         FallbackReason::Busy,
         FallbackReason::Unreachable,
@@ -512,6 +527,7 @@ mod scripted {
         FallbackReason::Layout,
         FallbackReason::Version,
         FallbackReason::Client,
+        FallbackReason::Inputs,
     ];
 
     #[derive(Debug, PartialEq)]
@@ -663,12 +679,14 @@ mod scripted {
             "host": call.host,
             "key": call.key,
             "root": call.root,
+            "rootId": recorded_id(call.root_id),
             "leaf": call.leaf,
             "siblings": call.siblings.iter().map(recorded_sibling).collect::<Vec<Value>>(),
             "repo": call.repo,
             "subfolder": call.subfolder,
             "words": call.words,
             "outputs": call.outputs,
+            "inputs": call.inputs,
             "log": call.log.to_string_lossy(),
             "timeout": call.timeout,
             "stall": call.stall,
@@ -679,15 +697,18 @@ mod scripted {
         Ok(true)
     }
 
-    /// A carried sibling as the record writes it: its name, its root, and its folder's id as the volume serial's 16 hex
-    /// digits, `-`, and the file id's 32.
+    /// A carried sibling as the record writes it: its name, its root, and its folder's id ([`recorded_id`]).
     fn recorded_sibling(sibling: &Sibling<'_>) -> Value {
-        let id = sibling.id();
         json!({
             "name": sibling.name(),
             "root": sibling.root(),
-            "id": format!("{:016x}-{:032x}", id.volume, u128::from_be_bytes(id.file)),
+            "id": recorded_id(sibling.id()),
         })
+    }
+
+    /// A folder's id as the record writes it: the volume serial's 16 hex digits, `-`, and the file id's 32.
+    fn recorded_id(id: FolderId) -> String {
+        format!("{:016x}-{:032x}", id.volume, u128::from_be_bytes(id.file))
     }
 
     /// Sleeps until `path` exists, true, or the interrupt is raised, false.

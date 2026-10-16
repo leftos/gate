@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn ssh_is_found_as_ssh_exe_past_an_earlier_ssh_cmd() {
-        let root = std::env::temp_dir().join(format!("gate-ssh-find-{}", std::process::id()));
+        let root = crate::test_support::temp_dir().join(format!("gate-ssh-find-{}", std::process::id()));
         let (shim, real) = (root.join("shim"), root.join("real"));
         for folder in [&shim, &real] {
             fs::create_dir_all(folder).expect("a PATH folder can be made");

@@ -270,6 +270,7 @@ fn a_holder_whose_ticket_was_not_deleted_does_not_block_the_queue() {
         pid: claim.pid,
         start_ms,
         holds: false,
+        lends_closed: false,
         remote: None,
         expected: None,
     };
@@ -307,6 +308,7 @@ fn a_waiter_deferring_to_a_gate_that_took_its_slot_does_not_say_it_waits() {
         pid,
         start_ms,
         holds: false,
+        lends_closed: false,
         remote: None,
         expected: None,
     };

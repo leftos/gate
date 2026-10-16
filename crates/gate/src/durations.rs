@@ -873,14 +873,14 @@ mod tests {
         }
     }
 
-    /// A state root of its own in the temp folder, holding a journal of one passing release in each of two folders that
-    /// exist, its own `first` and `second`; removed when dropped.
+    /// A state root of its own in the unit tests' temp folder, holding a journal of one passing release in each of two
+    /// folders that exist, its own `first` and `second`; removed when dropped.
     struct Root(PathBuf);
 
     impl Root {
         #[expect(clippy::expect_used, reason = "a test that cannot build its state root must fail loudly")]
         fn new(test: &str) -> Root {
-            let root = std::env::temp_dir().join(format!("gate-durations-{}-{test}", std::process::id()));
+            let root = crate::test_support::temp_dir().join(format!("gate-durations-{}-{test}", std::process::id()));
             // A folder left by an earlier run of the same pid is cleared first.
             let _ = fs::remove_dir_all(&root);
             let lines: Vec<String> = ["first", "second"]
@@ -903,7 +903,7 @@ mod tests {
 
     impl Drop for Root {
         fn drop(&mut self) {
-            // A folder left in the temp folder harms no later test, and a panic in drop would abort the run.
+            // A folder left in the unit tests' temp folder harms no later test, and a panic in drop would abort the run.
             let _ = fs::remove_dir_all(&self.0);
         }
     }

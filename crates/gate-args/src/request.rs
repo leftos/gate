@@ -65,6 +65,9 @@ pub struct BoxSeams {
     /// The outputs folder's size budget in bytes for `gate box run`, over the built-in 50 GiB; `None` without the
     /// feature.
     pub outputs_budget_bytes: Option<u64>,
+    /// The most bytes `gate box inputs` unpacks from one put, decompressed, over the built-in 4 GiB; `None` without the
+    /// feature.
+    pub inputs_budget_bytes: Option<u64>,
     /// How long `gate box preflight`'s `dotnet --list-sdks` may take, in milliseconds, in place of the built-in 30 s;
     /// `None` without the feature.
     pub dotnet_limit_ms: Option<u64>,
@@ -94,6 +97,8 @@ pub enum BoxVerb {
     Outputs,
     /// How many of the builder's work folders a run holds.
     Inflight,
+    /// Which of a routed run's ignored inputs the work folder lacks, or their install.
+    Inputs,
 }
 
 impl BoxVerb {
@@ -107,6 +112,7 @@ impl BoxVerb {
             BoxVerb::Boot => "boot",
             BoxVerb::Outputs => "outputs",
             BoxVerb::Inflight => "inflight",
+            BoxVerb::Inputs => "inputs",
         }
     }
 }
@@ -169,6 +175,9 @@ pub struct TestSeams {
     /// How long the readers of a routing-decision git call that has exited may take to reach their pipes' ends before
     /// the call fails, in place of 2 s.
     pub git_drain_ms: Option<u64>,
+    /// The file a local light gate waits for, holding the beside mutex, between journalling its take and writing its
+    /// claim: it writes the claim once the file exists.
+    pub beside_claim_wait: Option<PathBuf>,
     /// How long the remote client's `dotnet --list-sdks` of this PC may take before it is killed and the SDK list
     /// counts as unreadable, in place of 30 s.
     pub dotnet_limit_ms: Option<u64>,
@@ -210,8 +219,17 @@ pub struct TestSeams {
     /// The box's outputs budget the remote client reads, in place of 50 GiB: the outputs fetch is capped at zstd's
     /// worst case for it, and the install unpacks its archive to it.
     pub remote_outputs_budget_bytes: Option<u64>,
+    /// The most bytes one put of the remote client's inputs may total, decompressed, in place of 4 GiB: a set past it
+    /// is not sent, and the run falls back `inputs`.
+    pub remote_inputs_budget_bytes: Option<u64>,
     /// The most bytes of one remote call's output the remote client writes to the gate's log, in place of 256 MiB.
     pub remote_log_cap_bytes: Option<u64>,
+    /// A change the remote client makes to its own folders at one point of its run, as `<point>:<step>`: before it
+    /// holds the pair (`before-hold`), its first sibling's letter case changed (`case`), its first sibling replaced by a
+    /// new folder (`replace`) or its worktree root replaced by one (`replace-root`); or once the main repository's
+    /// snapshot is taken (`after-first-snapshot`), `core.worktree` written into its first sibling's git config, naming
+    /// the folder beside it whose name is the sibling's with `-canary` after it (`worktree`).
+    pub remote_tamper: Option<String>,
     /// Make this gate's own start unreadable both ways, so the run refuses before it writes anything.
     pub own_start_fails: bool,
     /// Count every live parent a slot marker names as one this gate runs inside the command of, so a marker naming the
@@ -257,6 +275,9 @@ pub struct RunRequest {
     pub bring_tracked: Vec<String>,
     /// `--state-dir` as given.
     pub state_dir: Option<PathBuf>,
+    /// `--cd` as given: the folder the run runs and routes from; a relative path is read against the working directory
+    /// by the binary, after the log and the state root.
+    pub cd: Option<PathBuf>,
     /// The words after `--`, unchanged.
     pub command: Vec<OsString>,
     pub test_seams: TestSeams,

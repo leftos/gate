@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use gate_router::repo_name;
+use gate_router::{FolderId, repo_name};
 
 use super::RemoteCall;
 use super::client::{Attempt, Called, End, Watch};
@@ -41,7 +41,7 @@ use super::payload;
 use super::retry::GIT_SSH_FAILED;
 use super::snapshot::{self, BACK, REFS, Snapshot};
 use super::watchdog::{self, Cut};
-use super::worktree_lock;
+use super::worktree_lock::{self, Folder};
 use crate::boxside::payload::escaped;
 use crate::outputs::names::{is_git_s, is_lfs_config};
 use crate::slots::{self, Liveness};
@@ -62,6 +62,8 @@ pub(super) struct Target<'a> {
     /// The name the box's back commits line gives the repository, and every pair line says.
     name: &'a str,
     root: &'a str,
+    /// The id the route read for the worktree's folder, which its lock checks the folder against.
+    id: FolderId,
     /// The name the transport's push target is asked for.
     repo: String,
     snapshot: &'a Snapshot,
@@ -72,16 +74,26 @@ pub(super) struct Target<'a> {
 }
 
 impl<'a> Target<'a> {
-    /// The repository `name` whose worktree is at `root`, named `repo` on the builder, synced back for `snapshot` in the
-    /// run of the key `key`.
-    pub(super) fn new(name: &'a str, root: &'a str, repo: &str, snapshot: &'a Snapshot, key: &str) -> Target<'a> {
+    /// The repository of the worktree `folder`, named `repo` on the builder, synced back for `snapshot` in the run of
+    /// the key `key`.
+    pub(super) fn new(folder: Folder<'a>, repo: &str, snapshot: &'a Snapshot, key: &str) -> Target<'a> {
         Target {
-            name,
-            root,
+            name: folder.name,
+            root: folder.root,
+            id: folder.id,
             repo: repo.to_owned(),
             snapshot,
             reference: format!("refs/gate-back/{key}"),
             kept: format!("{REFS}{key}{BACK}"),
+        }
+    }
+
+    /// The worktree as its lock takes it.
+    fn folder(&self) -> Folder<'a> {
+        Folder {
+            name: self.name,
+            root: self.root,
+            id: self.id,
         }
     }
 }
@@ -91,18 +103,26 @@ impl<'a> Target<'a> {
 /// folder name; the main one alone for a call that carries no siblings. `None` when there is not a snapshot for each
 /// sibling: such a pair applies nothing ([`unmatched`]).
 pub(super) fn targets<'a>(call: &RemoteCall<'a>, snapshot: &'a Snapshot, sibling_snapshots: &'a [Snapshot]) -> Option<Vec<Target<'a>>> {
-    let main = Target::new(call.leaf, call.root, call.repo, snapshot, call.key);
+    let main_folder = Folder {
+        name: call.leaf,
+        root: call.root,
+        id: call.root_id,
+    };
+    let main = Target::new(main_folder, call.repo, snapshot, call.key);
     if call.siblings.is_empty() {
         return Some(vec![main]);
     }
     if sibling_snapshots.len() != call.siblings.len() {
         return None;
     }
-    let siblings = call
-        .siblings
-        .iter()
-        .zip(sibling_snapshots)
-        .map(|(sibling, snapshot)| Target::new(sibling.name(), sibling.root(), &repo_name(sibling.name()), snapshot, call.key));
+    let siblings = call.siblings.iter().zip(sibling_snapshots).map(|(sibling, snapshot)| {
+        let folder = Folder {
+            name: sibling.name(),
+            root: sibling.root(),
+            id: sibling.id(),
+        };
+        Target::new(folder, &repo_name(sibling.name()), snapshot, call.key)
+    });
     Some(std::iter::once(main).chain(siblings).collect())
 }
 
@@ -155,6 +175,11 @@ impl Worktree<'_> {
     fn snapshot(&self) -> &str {
         &self.target.snapshot.commit
     }
+
+    /// The object store of the worktree's repository, as the snapshot named it.
+    fn objects(&self) -> &Path {
+        &self.target.snapshot.objects
+    }
 }
 
 /// Fetches and applies the builder's changes for `targets`, the main repository first, or ends the run as `status`
@@ -189,19 +214,19 @@ fn one(attempt: &mut Attempt<'_, '_>, target: &Target<'_>, status: i64) -> Resul
         git: Git::find(Path::new(target.root)).map_err(End::Failed)?,
         pair: false,
     };
-    let objects = objects_folder(attempt, &worktree)?;
-    for line in swept(&objects, SystemTime::now(), slots::gate_liveness) {
+    let objects = worktree.objects();
+    for line in swept(objects, SystemTime::now(), slots::gate_liveness) {
         attempt.say(line);
     }
     let Some(advertised) = has_back(attempt, &worktree, &remote)? else {
         return Ok(End::Status(status));
     };
     let call = attempt.call;
-    let _lock = worktree_lock::held(call.state, &[(target.name, target.root)], attempt.lock_wait, call.interrupt, |line| {
+    let _lock = worktree_lock::held(call.state, &[target.folder()], attempt.lock_wait, call.interrupt, |line| {
         attempt.say(line);
     })?;
     let name = incoming_name(std::process::id(), own_start(attempt.own_start_fails)?, &payload::job_nonce());
-    let quarantine = Quarantine::made(&objects, &name).map_err(End::Failed)?;
+    let quarantine = Quarantine::made(objects, &name).map_err(End::Failed)?;
     let back = Back {
         commit: &advertised,
         quarantine: &quarantine,
@@ -299,7 +324,7 @@ fn pair(attempt: &mut Attempt<'_, '_>, targets: &[Target<'_>], back_commits: Opt
         return Ok(unchanged);
     }
     let call = attempt.call;
-    let worktrees: Vec<(&str, &str)> = backed.iter().map(|repo| (repo.target.name, repo.target.root)).collect();
+    let worktrees: Vec<Folder<'_>> = backed.iter().map(|repo| repo.target.folder()).collect();
     let _locks = worktree_lock::held(call.state, &worktrees, attempt.lock_wait, call.interrupt, |line| attempt.say(line))?;
     let mut fetched = Vec::with_capacity(backed.len());
     let end = pair_phases(attempt, &backed, &mut fetched, status);
@@ -367,8 +392,8 @@ fn first_phase<'t>(attempt: &mut Attempt<'_, '_>, repo: &Repo<'t, '_>, fetched: 
         git: Git::find(Path::new(target.root)).map_err(End::Failed)?,
         pair: true,
     };
-    let objects = objects_folder(attempt, &worktree)?;
-    for line in swept(&objects, SystemTime::now(), slots::gate_liveness) {
+    let objects = worktree.objects();
+    for line in swept(objects, SystemTime::now(), slots::gate_liveness) {
         attempt.say(line);
     }
     if has_back(attempt, &worktree, &remote)?.as_deref() != Some(repo.commit) {
@@ -376,7 +401,7 @@ fn first_phase<'t>(attempt: &mut Attempt<'_, '_>, repo: &Repo<'t, '_>, fetched: 
         return Ok(false);
     }
     let name = incoming_name(std::process::id(), own_start(attempt.own_start_fails)?, &payload::job_nonce());
-    let quarantine = Quarantine::made(&objects, &format!("{name}-{}", repo.at)).map_err(End::Failed)?;
+    let quarantine = Quarantine::made(objects, &format!("{name}-{}", repo.at)).map_err(End::Failed)?;
     let mut repo = Fetched {
         worktree,
         commit: repo.commit.to_owned(),
@@ -682,23 +707,6 @@ fn fetch(
 /// `status`, but 1 for a passing run: how a run whose changes were not applied ends.
 fn not_passing(status: i64) -> i64 {
     if status == 0 { 1 } else { status }
-}
-
-/// The object store of the worktree's repository, as `git rev-parse --git-path objects` names it, asked with no
-/// interrupt: a Ctrl+C meanwhile is left to the call that follows, which ends as the run's interrupt.
-fn objects_folder(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>) -> Result<PathBuf, End> {
-    let args = ["rev-parse", "--git-path", "objects"];
-    let printed = worktree
-        .git
-        .output(&git::Call::plain(worktree.root(), &args, attempt.limit))
-        .map_err(escaped_end)?;
-    let folder = printed
-        .lines()
-        .next()
-        .map(str::trim_end)
-        .filter(|folder| !folder.is_empty())
-        .ok_or_else(|| End::Failed(format!("git {} printed nothing", args.join(" "))))?;
-    Ok(worktree.root().join(folder))
 }
 
 /// The real object store `objects` as `GIT_ALTERNATE_OBJECT_DIRECTORIES` names it: as it is, or C-quoted, its `\` and
@@ -2048,6 +2056,7 @@ mod tests {
     use crate::remote::git::{self, Git};
     use crate::remote::snapshot::{Snapshot, repository};
     use crate::remote::transport::{Local, Program, PushTarget, Transport, Wire};
+    use crate::remote::worktree_lock::tests::routed;
     use crate::slots;
     use gate_router::{CarriedSibling, FolderId, RemoteRun, sibling_root};
 
@@ -2112,7 +2121,7 @@ mod tests {
     /// its pack folder and git's fetch itself runs.
     #[test]
     fn a_ctrl_c_during_a_sync_back_call_to_the_builder_is_an_interrupt() {
-        let folder = std::env::temp_dir().join(format!("gate-sync-back-interrupt-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-sync-back-interrupt-{}", std::process::id()));
         std::fs::create_dir_all(&folder).expect("the test's folder can be made");
         let root = folder.to_string_lossy().into_owned();
         let log = folder.join("out.log");
@@ -2123,6 +2132,7 @@ mod tests {
             host: "builder",
             key: "app-1a2b3c4d",
             root: &root,
+            root_id: crate::route::root_id(&root).expect("the test's folder's id is read"),
             leaf: "app",
             siblings: Vec::new(),
             repo: "app",
@@ -2130,6 +2140,7 @@ mod tests {
             words: &[],
             outputs: &[],
             outputs_withheld: false,
+            inputs: &[],
             log: &log,
             timeout: 60,
             usual: None,
@@ -2158,8 +2169,9 @@ mod tests {
         let snapshot = Snapshot {
             commit: SNAPSHOT.to_owned(),
             bridge: None,
+            objects: objects.clone(),
         };
-        let target = Target::new("app", &root, "app", &snapshot, "app-1a2b3c4d");
+        let target = Target::new(routed("app", &root), "app", &snapshot, "app-1a2b3c4d");
         let worktree = Worktree {
             target: &target,
             git,
@@ -2183,7 +2195,7 @@ mod tests {
 
     /// A new, empty object store of the test `name`'s own, holding only its `pack` folder.
     fn store(name: &str) -> PathBuf {
-        let objects = std::env::temp_dir().join(format!("gate-quarantine-{name}-{}", std::process::id()));
+        let objects = crate::test_support::temp_dir().join(format!("gate-quarantine-{name}-{}", std::process::id()));
         if objects.exists() {
             std::fs::remove_dir_all(&objects).expect("an earlier run's store is removed");
         }
@@ -2928,6 +2940,7 @@ mod tests {
             host: "builder",
             key: KEY,
             root,
+            root_id: crate::route::root_id(root).expect("the wiring test's repository's id is read"),
             leaf: "app",
             siblings: Vec::new(),
             repo: "app",
@@ -2935,6 +2948,7 @@ mod tests {
             words: &[],
             outputs: &[],
             outputs_withheld: false,
+            inputs: &[],
             log,
             timeout: 60,
             usual: None,
@@ -2950,7 +2964,7 @@ mod tests {
 
     /// The log of the wiring test `name`, outside its repository, and none there yet.
     fn test_log(name: &str) -> PathBuf {
-        let log = std::env::temp_dir().join(format!("gate-sync-back-{name}-{}.log", std::process::id()));
+        let log = crate::test_support::temp_dir().join(format!("gate-sync-back-{name}-{}.log", std::process::id()));
         if log.exists() {
             std::fs::remove_file(&log).expect("an earlier run's log is removed");
         }
@@ -2974,6 +2988,7 @@ mod tests {
         let snapshot = Snapshot {
             commit: snapshot,
             bridge: None,
+            objects,
         };
         (root, snapshot, back.trim_end().to_owned(), quarantine)
     }
@@ -3007,7 +3022,7 @@ mod tests {
         let call = call_in(&shown, &log, &state);
         let transport = Local::new(r"local:C:\gate-sync-back-tests", None).expect("a local transport");
         let mut attempt = Attempt::for_tests(&call, &transport);
-        let target = Target::new("app", &shown, "app", &snapshot, KEY);
+        let target = Target::new(routed("app", &shown), "app", &snapshot, KEY);
         let worktree = Worktree {
             target: &target,
             git: Git::find(&root).expect("git is found"),
@@ -3042,7 +3057,7 @@ mod tests {
         let call = call_in(&shown, &log, &state);
         let transport = Local::new(r"local:C:\gate-sync-back-tests", None).expect("a local transport");
         let mut attempt = Attempt::for_tests(&call, &transport);
-        let target = Target::new("app", &shown, "app", &snapshot, KEY);
+        let target = Target::new(routed("app", &shown), "app", &snapshot, KEY);
         let worktree = Worktree {
             target: &target,
             git: Git::find(&root).expect("git is found"),
@@ -3077,7 +3092,7 @@ mod tests {
         let client = repository("retry-client");
         let objects = client.join(".git").join("objects");
         let quarantine = Quarantine::made(&objects, &incoming_name(std::process::id(), 1, NONCE)).expect("the quarantine is made");
-        let marker = std::env::temp_dir().join(format!("gate-sync-back-retry-{}", std::process::id()));
+        let marker = crate::test_support::temp_dir().join(format!("gate-sync-back-retry-{}", std::process::id()));
         if marker.exists() {
             std::fs::remove_file(&marker).expect("an earlier run's marker is removed");
         }
@@ -3102,8 +3117,9 @@ mod tests {
         let snapshot = Snapshot {
             commit: SNAPSHOT.to_owned(),
             bridge: None,
+            objects: objects.clone(),
         };
-        let target = Target::new("app", &shown, "app", &snapshot, KEY);
+        let target = Target::new(routed("app", &shown), "app", &snapshot, KEY);
         let worktree = Worktree {
             target: &target,
             git: Git::find(&client).expect("git is found"),
@@ -3156,7 +3172,7 @@ mod tests {
 
     impl PairCase {
         fn new(name: &str) -> PairCase {
-            let folder = std::env::temp_dir().join(format!("gate-pair-{name}-{}", std::process::id()));
+            let folder = crate::test_support::temp_dir().join(format!("gate-pair-{name}-{}", std::process::id()));
             if folder.exists() {
                 std::fs::remove_dir_all(&folder).expect("an earlier run's pair is removed");
             }
@@ -3172,7 +3188,14 @@ mod tests {
                 let commit = asked(&root, &[], &["rev-parse", "HEAD"]).expect("HEAD is read").trim_end().to_owned();
                 let bare = folder.join("builder").join(format!("{repo}.git"));
                 asked(&folder, &[], &["init", "--bare", "--quiet", &bare.to_string_lossy()]).expect("the bare repository is made");
-                (root.to_string_lossy().into_owned(), Snapshot { commit, bridge: None })
+                (
+                    root.to_string_lossy().into_owned(),
+                    Snapshot {
+                        commit,
+                        bridge: None,
+                        objects: root.join(".git/objects"),
+                    },
+                )
             });
             let [(app, app_snapshot), (lib, lib_snapshot)] = made;
             PairCase {
@@ -3228,7 +3251,7 @@ mod tests {
             transport: &dyn Transport,
             tweak: impl FnOnce(&mut Attempt<'_, '_>),
         ) -> Result<Synced, End> {
-            let targets = [0, 1].map(|at| Target::new(PAIR[at], &self.roots[at], PAIR[at], &self.snapshots[at], KEY));
+            let targets = [0, 1].map(|at| Target::new(routed(PAIR[at], &self.roots[at]), PAIR[at], &self.snapshots[at], KEY));
             self.with_attempt(transport, None, |attempt| {
                 tweak(attempt);
                 sync_back(attempt, &targets, line, 0)
@@ -3604,6 +3627,7 @@ mod tests {
             host: "builder".to_owned(),
             slots: 1,
             root: root.clone(),
+            root_id: crate::route::root_id(&root).expect("the main worktree's id is read"),
             leaf: "app".to_owned(),
             siblings: vec![CarriedSibling {
                 name: "lib".to_owned(),
@@ -3617,6 +3641,7 @@ mod tests {
             words: Vec::new(),
             fallback: Vec::new(),
             outputs: Vec::new(),
+            inputs: Vec::new(),
             dropped_no_build: false,
             outputs_withheld: false,
         };
@@ -3699,7 +3724,7 @@ mod tests {
         let app = case.plant(0, &[("b.txt", "b\n")]);
         let lib = case.plant(1, &[("c.txt", "c\n")]);
         let interrupt = Interrupt::install().expect("the console handler is installed");
-        let targets = [0, 1].map(|at| Target::new(PAIR[at], &case.roots[at], PAIR[at], &case.snapshots[at], KEY));
+        let targets = [0, 1].map(|at| Target::new(routed(PAIR[at], &case.roots[at]), PAIR[at], &case.snapshots[at], KEY));
         let line = line_of([Some(&app), Some(&lib)]);
         let transport = case.local();
 
@@ -3736,7 +3761,7 @@ mod tests {
             interrupt: Some(interrupt),
             readied: std::cell::Cell::new(0),
         };
-        let targets = [0, 1].map(|at| Target::new(PAIR[at], &case.roots[at], PAIR[at], &case.snapshots[at], KEY));
+        let targets = [0, 1].map(|at| Target::new(routed(PAIR[at], &case.roots[at]), PAIR[at], &case.snapshots[at], KEY));
         let line = line_of([Some(&app), Some(&lib)]);
 
         let ended = case.with_attempt(&through, Some(interrupt), |attempt| sync_back(attempt, &targets, Some(&line), 0));
@@ -3759,7 +3784,7 @@ mod tests {
     /// The lock of the worktree at `at` in `case`'s pair, held by another run until the sender it hands back is sent to.
     fn locked_elsewhere(case: &PairCase, at: usize) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
         let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
-        let (_, lock) = crate::remote::worktree_lock::lock_of(&state, &case.roots[at]).expect("the worktree's id is read");
+        let lock = crate::remote::worktree_lock::tests::lock_name(&state, &case.roots[at]);
         crate::remote::worktree_lock::tests::held_elsewhere(&lock)
     }
 
@@ -3770,7 +3795,7 @@ mod tests {
     fn a_single_sync_back_whose_worktree_lock_is_held_elsewhere_fetches_nothing() {
         let case = PairCase::new("single-locked");
         let app = case.plant(0, &[("b.txt", "b\n")]);
-        let target = Target::new(PAIR[0], &case.roots[0], PAIR[0], &case.snapshots[0], KEY);
+        let target = Target::new(routed(PAIR[0], &case.roots[0]), PAIR[0], &case.snapshots[0], KEY);
         let transport = case.local();
         let (release, holder) = locked_elsewhere(&case, 0);
 

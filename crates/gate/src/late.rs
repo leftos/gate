@@ -232,7 +232,7 @@ impl<'a> Late<'a> {
         let waited = since.elapsed().as_secs_f64();
         wait.end(console);
         let slot = self.of.held.insert(LateSlot { taken, took: Instant::now() });
-        self.of.taker.took(&slot.taken, self.of.pool, waited, &mut self.survey, console);
+        self.of.taker.took(&mut slot.taken, self.of.pool, waited, &mut self.survey, console);
         true
     }
 }

@@ -146,6 +146,7 @@ fn run_option(name: &str) -> Option<RunOption> {
         "stall" => RunOption::Value(ValueOption::Stall),
         "tail" => RunOption::Value(ValueOption::Tail),
         "state-dir" => RunOption::Value(ValueOption::StateDir),
+        "cd" => RunOption::Value(ValueOption::Cd),
         "bring-tracked" => RunOption::Value(ValueOption::BringTracked),
         "no-markers" => RunOption::Switch(SwitchOption::NoMarkers),
         "local" => RunOption::Switch(SwitchOption::Local),
@@ -254,6 +255,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-remote-wait-ms" => Some(RunOption::Value(ValueOption::RemoteWaitMs)),
         "test-git-limit-ms" => Some(RunOption::Value(ValueOption::GitLimitMs)),
         "test-git-drain-ms" => Some(RunOption::Value(ValueOption::GitDrainMs)),
+        "test-beside-claim-wait" => Some(RunOption::Value(ValueOption::BesideClaimWait)),
         "test-dotnet-limit-ms" => Some(RunOption::Value(ValueOption::DotnetLimitMs)),
         "test-remote-snapshot" => Some(RunOption::Switch(SwitchOption::RemoteSnapshot)),
         "test-remote-transport" => Some(RunOption::Value(ValueOption::RemoteTransport)),
@@ -268,7 +270,9 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-remote-fetch-cap-bytes" => Some(RunOption::Value(ValueOption::RemoteFetchCapBytes)),
         "test-remote-apply-cap-bytes" => Some(RunOption::Value(ValueOption::RemoteApplyCapBytes)),
         "test-remote-outputs-budget-bytes" => Some(RunOption::Value(ValueOption::RemoteOutputsBudgetBytes)),
+        "test-remote-inputs-budget-bytes" => Some(RunOption::Value(ValueOption::RemoteInputsBudgetBytes)),
         "test-remote-log-cap-bytes" => Some(RunOption::Value(ValueOption::RemoteLogCapBytes)),
+        "test-remote-tamper" => Some(RunOption::Value(ValueOption::RemoteTamper)),
         _ => None,
     }
 }

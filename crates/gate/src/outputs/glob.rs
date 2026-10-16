@@ -38,13 +38,26 @@ impl Globs {
         Globs::named(globs, "--bring-tracked glob")
     }
 
+    /// The matcher of a routed run's input globs `globs`, with the inputs' own exclusions `excluded`, a regex of the
+    /// `/`-separated relative paths never sent, in place of the outputs' (so `.tmp` is reachable); the `.git*`,
+    /// `.lfsconfig` and plain-name rules hold as for outputs. Else why a glob or the exclusions cannot be matched.
+    pub(crate) fn inputs(globs: &[String], excluded: &str) -> Result<Globs, String> {
+        Globs::with_exclusions(globs, "input glob", excluded)
+    }
+
     /// The matcher of `globs`, each a `noun`; else why one of them cannot be matched, naming it by `noun`.
     fn named(globs: &[String], noun: &str) -> Result<Globs, String> {
+        Globs::with_exclusions(globs, noun, EXCLUDED)
+    }
+
+    /// The matcher of `globs`, each a `noun`, never matching a path the regex `excluded` matches; else why one of them
+    /// cannot be matched, naming it by `noun`.
+    fn with_exclusions(globs: &[String], noun: &str, excluded: &str) -> Result<Globs, String> {
         let patterns = globs
             .iter()
             .map(|glob| Regex::new(&regex_of(glob, false)).map_err(|error| format!("the {noun} '{}' cannot be matched: {error}", escaped(glob))))
             .collect::<Result<_, _>>()?;
-        let excluded = Regex::new(EXCLUDED).map_err(|error| format!("the output exclusions cannot be matched: {error}"))?;
+        let excluded = Regex::new(excluded).map_err(|error| format!("the {noun} exclusions cannot be matched: {error}"))?;
         Ok(Globs { patterns, excluded })
     }
 
@@ -53,6 +66,12 @@ impl Globs {
     /// outputs archive ([`fits`]).
     pub(crate) fn matches(&self, path: &str) -> bool {
         fits(path) && !is_git_s(path) && !is_lfs_config(path) && self.selects(path)
+    }
+
+    /// Whether the glob at `index` of those this matcher was built from matches the `/`-separated relative `path`, its
+    /// pattern alone asked: for a path the matcher already [`Globs::matches`], which of its globs did.
+    pub(crate) fn matched_by(&self, index: usize, path: &str) -> bool {
+        self.patterns.get(index).is_some_and(|pattern| pattern.is_match(path))
     }
 
     /// Whether the file at the `/`-separated relative `path` would come back but for its name: [`Globs::selects`] it,

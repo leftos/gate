@@ -1121,7 +1121,7 @@ mod tests {
 
     /// A scratch folder for one test, emptied first.
     fn scratch(test: &str) -> PathBuf {
-        let folder = std::env::temp_dir().join(format!("gate-archive-{}-{test}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-archive-{}-{test}", std::process::id()));
         let _ = fs::remove_dir_all(&folder);
         folder
     }

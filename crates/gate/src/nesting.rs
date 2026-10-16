@@ -189,16 +189,6 @@ impl Nesting {
         }
     }
 
-    /// The parent whose marker this gate hands its command: the parent whose slot covers it, or the parent that lent it
-    /// its slot (`lent`) while a critical request drains; none otherwise.
-    pub(crate) fn handed_on(&self, lent: bool) -> Option<&Parent> {
-        match self {
-            Nesting::Covered(parent) => Some(parent),
-            Nesting::Under(parent) if lent => Some(parent),
-            _ => None,
-        }
-    }
-
     /// The slot kind a gate of `kind` runs its command as: critical under a critical parent's slot, which it follows,
     /// else its own.
     pub(crate) fn runs_as(&self, kind: Slot) -> Slot {
@@ -632,13 +622,8 @@ mod tests {
             let nesting = decided(&marker(Slot::None), kind);
             assert_eq!(nesting, Nesting::Beside(parent(Slot::None)), "a {kind:?} gate");
             assert_eq!(
-                (
-                    nesting.line(kind, Spelling::Cli),
-                    nesting.covering(),
-                    nesting.handed_on(true),
-                    nesting.runs_as(kind)
-                ),
-                (None, None, None, kind),
+                (nesting.line(kind, Spelling::Cli), nesting.covering(), nesting.runs_as(kind)),
+                (None, None, kind),
                 "a {kind:?} gate"
             );
         }
@@ -710,8 +695,8 @@ mod tests {
                     "a {kind:?} gate under a {held:?} marker"
                 );
                 assert_eq!(
-                    (nesting.covering(), nesting.uncovering(), nesting.handed_on(true), nesting.runs_as(kind)),
-                    (None, None, None, kind),
+                    (nesting.covering(), nesting.uncovering(), nesting.runs_as(kind)),
+                    (None, None, kind),
                     "a {kind:?} gate under a {held:?} marker runs under no parent"
                 );
             }
@@ -1092,18 +1077,6 @@ mod tests {
             Some("gate: running under the heavy slot of gate 4242"),
             "the decision's own line follows"
         );
-    }
-
-    #[test]
-    fn a_covered_gate_and_a_lent_one_hand_on_their_parent() {
-        let covered = Nesting::Covered(parent(Slot::Heavy));
-        let under = Nesting::Under(parent(Slot::Light));
-        assert_eq!(covered.handed_on(false), Some(&parent(Slot::Heavy)), "a covered gate");
-        assert_eq!(under.handed_on(true), Some(&parent(Slot::Light)), "a gate lent its parent's slot");
-        assert_eq!(under.handed_on(false), None, "a gate under a parent that lent it nothing");
-        for nesting in [Nesting::Own, Nesting::Malformed("x:y".to_owned()), Nesting::Refused(parent(Slot::Heavy))] {
-            assert_eq!(nesting.handed_on(true), None, "{nesting:?} names no parent to hand on");
-        }
     }
 
     #[test]

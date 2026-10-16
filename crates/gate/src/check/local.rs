@@ -256,7 +256,7 @@ pub(super) fn sdk_listed(pin: Option<&parity::Pin>, sdks: impl FnOnce() -> Resul
 /// The SDKs this PC's `dotnet --list-sdks` lists, run with the folders inside the worktree `root` dropped from
 /// `PATH`; none when no dotnet is found; else why the list cannot be read.
 fn sdk_list(root: &Path) -> Result<Vec<String>, String> {
-    let listing = local_sdk_listing(Variables::from_process(), root, git::DOTNET_LIMIT, None)?;
+    let listing = local_sdk_listing(Variables::from_process(), &[root], git::DOTNET_LIMIT, None)?;
     Ok(parity::sdk_versions(&listing).into_iter().map(str::to_owned).collect())
 }
 
@@ -350,12 +350,12 @@ mod tests {
     use crate::remote::toolchain::{ToolNeed, Version};
     use crate::test_support::junction;
 
-    /// A folder of its own under the temp folder, removed when the test ends, failed or not.
+    /// A folder of its own under the unit tests' temp folder, removed when the test ends, failed or not.
     struct Folder(PathBuf);
 
     impl Folder {
         fn new(name: &str) -> Folder {
-            let path = std::env::temp_dir().join(format!("gate-check-{name}-{}", std::process::id()));
+            let path = crate::test_support::temp_dir().join(format!("gate-check-{name}-{}", std::process::id()));
             if path.exists() {
                 fs::remove_dir_all(&path).expect("a folder left by an earlier run can be removed");
             }

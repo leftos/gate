@@ -9,13 +9,14 @@ use serde_json::{Map, Value};
 
 use crate::counts::{format_count_value, powershell_text};
 
-/// The most light slots a critical gate keeps free beside it.
-pub const CRITICAL_LIGHT_RESERVE: u32 = 2;
+/// The most light gates that run beside a critical request, whichever light slots they hold.
+pub const CRITICAL_BESIDE_LIGHT: u32 = 2;
 
-/// The light slots a critical gate keeps free beside it, out of a light pool of `light_count` slots.
+/// How many light gates may run beside a critical request, out of a light pool of `light_count` slots: a count, never a
+/// set of slot indices.
 #[must_use]
-pub fn reserved_light(light_count: u32) -> u32 {
-    light_count.min(CRITICAL_LIGHT_RESERVE)
+pub fn beside_allowance(light_count: u32) -> u32 {
+    light_count.min(CRITICAL_BESIDE_LIGHT)
 }
 
 /// The two slot pools, in the order the dashboard lists them.

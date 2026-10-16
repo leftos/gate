@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use gate_args::{Ceiling, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, RunRequest, Slot, Spelling, TestSeams};
+use gate_args::{Ceiling, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, RunRequest, Slot, Spelling, TestSeams, USAGE};
 
 use crate::support::{RUN, os, problems, problems_of, refs, run_of, run_request, unreadable_word, with};
 
@@ -29,6 +29,7 @@ fn run_reads_every_option_and_the_defaults() {
             local: false,
             bring_tracked: Vec::new(),
             state_dir: None,
+            cd: None,
             command: os(&["cmd", "/c", "echo hi"]),
             test_seams: TestSeams::default(),
             print_request: false,
@@ -265,9 +266,40 @@ fn run_unknown_flag() {
 fn run_repeated_option_is_usage_error() {
     assert_eq!(problems_with(&["--slot", "light", "--", "cmd"]), ["gate: --slot is given twice"]);
     assert_eq!(problems_with(&["--local", "--local", "--", "cmd"]), ["gate: --local is given twice"]);
+    assert_eq!(problems_with(&["--cd", "a", "--cd=b", "--", "cmd"]), ["gate: --cd is given twice"]);
     assert_eq!(
         problems(&["-Log", "a", "-log", "b", "-TimeoutSeconds", "5", "-Slot", "heavy", "--", "cmd"]),
         ["gate: -log is given twice"]
+    );
+}
+
+#[test]
+fn run_reads_cd_as_given() {
+    assert_eq!(
+        run_with(&["--cd", r"X:\dev\repo.wt\other", "--", "cmd"]).cd,
+        Some(PathBuf::from(r"X:\dev\repo.wt\other"))
+    );
+    assert_eq!(
+        run_with(&["--cd=..\\sibling", "--", "cmd"]).cd,
+        Some(PathBuf::from(r"..\sibling")),
+        "the inline form"
+    );
+    assert_eq!(run_with(&["--", "cmd"]).cd, None, "none by default");
+}
+
+#[test]
+fn run_cd_needs_a_value() {
+    assert_eq!(problems_with(&["--cd", "--", "cmd"]), ["gate: --cd needs a value"]);
+    assert_eq!(problems_with(&["--cd=", "--", "cmd"]), ["gate: --cd needs a value"]);
+}
+
+#[test]
+fn the_usage_lists_cd_among_the_run_options() {
+    assert!(
+        USAGE
+            .lines()
+            .any(|line| line == "  --cd <folder>        run the command in <folder> and route from it"),
+        "the usage lists --cd:\n{USAGE}"
     );
 }
 

@@ -132,6 +132,14 @@ pub fn outputs_hashes_path(root: &Path, key: &str) -> PathBuf {
     remote_dir(root).join(format!("{key}.outputs-hashes"))
 }
 
+/// The inputs hash cache of the work folder `key`, `<root>\remote\<key>.inputs-hashes`: the inputs manifest line of
+/// the worktree's last built inputs manifest, its files whose last write came well before that build, kept apart from
+/// the outputs cache, whose saves drop every file the outputs walk no longer finds.
+#[must_use]
+pub fn inputs_hashes_path(root: &Path, key: &str) -> PathBuf {
+    remote_dir(root).join(format!("{key}.inputs-hashes"))
+}
+
 /// The nothing-back record of the work folder `key`, `<root>\remote\<key>.nothing-back`: the JSON object
 /// `{"v": 1, "host": "<builder>", "configuration": …, "framework": …, "runtime": …}` ([`NothingBackRecord`]). It is
 /// written when a routed dotnet build of that worktree ends without its outputs known to be brought back, and when a
@@ -345,6 +353,10 @@ pub struct Ticket {
     pub start_ms: u64,
     /// True only for a critical gate that holds the machine.
     pub holds: bool,
+    /// True only for a critical gate that holds every slot it takes and waits for the gates lent a light parent's slot
+    /// to end: no light parent lends its slot while it says so. Written only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lends_closed: bool,
     /// True while queued for the remote pool. Written only when `Some(true)`, so a local queue's ticket is `None`.
     #[serde(skip_serializing_if = "is_not_true")]
     pub remote: Option<bool>,

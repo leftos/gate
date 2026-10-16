@@ -20,6 +20,7 @@ pub(crate) enum ValueOption {
     Stall,
     Tail,
     StateDir,
+    Cd,
     Cores,
     Seconds,
     BringTracked,
@@ -44,6 +45,8 @@ pub(crate) enum ValueOption {
     GitLimitMs,
     #[cfg(feature = "test-seams")]
     GitDrainMs,
+    #[cfg(feature = "test-seams")]
+    BesideClaimWait,
     #[cfg(feature = "test-seams")]
     DotnetLimitMs,
     #[cfg(feature = "test-seams")]
@@ -71,7 +74,11 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     RemoteOutputsBudgetBytes,
     #[cfg(feature = "test-seams")]
+    RemoteInputsBudgetBytes,
+    #[cfg(feature = "test-seams")]
     RemoteLogCapBytes,
+    #[cfg(feature = "test-seams")]
+    RemoteTamper,
     #[cfg(feature = "test-seams")]
     ConfirmMs,
     #[cfg(feature = "test-seams")]
@@ -124,6 +131,7 @@ pub(crate) struct RunBuilder {
     stall: Option<u64>,
     tail: Option<u64>,
     state_dir: Option<PathBuf>,
+    cd: Option<PathBuf>,
     cores: Option<u32>,
     seconds: Option<u32>,
     no_markers: bool,
@@ -217,6 +225,7 @@ impl RunBuilder {
             ValueOption::Stall => self.stall = Some(values::above_zero(spelled, value)?),
             ValueOption::Tail => self.tail = Some(values::zero_or_above(spelled, value)?),
             ValueOption::StateDir => self.state_dir = Some(PathBuf::from(value)),
+            ValueOption::Cd => self.cd = Some(PathBuf::from(value)),
             ValueOption::Cores => self.cores = Some(values::above_zero_u32(spelled, value)?),
             ValueOption::Seconds => self.seconds = Some(values::in_range(spelled, value, 1, values::MAX_BURN_SECONDS)?),
             ValueOption::BringTracked => self.bring_tracked.push(value.to_owned()),
@@ -243,6 +252,8 @@ impl RunBuilder {
             ValueOption::GitLimitMs => self.test_seams.git_limit_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::GitDrainMs => self.test_seams.git_drain_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::BesideClaimWait => self.test_seams.beside_claim_wait = Some(PathBuf::from(value)),
             #[cfg(feature = "test-seams")]
             ValueOption::DotnetLimitMs => self.test_seams.dotnet_limit_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
@@ -274,7 +285,11 @@ impl RunBuilder {
             #[cfg(feature = "test-seams")]
             ValueOption::RemoteOutputsBudgetBytes => self.test_seams.remote_outputs_budget_bytes = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
+            ValueOption::RemoteInputsBudgetBytes => self.test_seams.remote_inputs_budget_bytes = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
             ValueOption::RemoteLogCapBytes => self.test_seams.remote_log_cap_bytes = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::RemoteTamper => self.test_seams.remote_tamper = Some(values::remote_call(spelled, value, values::TAMPERS)?),
             #[cfg(feature = "test-seams")]
             ValueOption::ConfirmMs => self.cutover_seams.confirm_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
@@ -347,6 +362,7 @@ impl RunBuilder {
                 local: self.local,
                 bring_tracked: self.bring_tracked,
                 state_dir: self.state_dir,
+                cd: self.cd,
                 command,
                 test_seams: self.test_seams,
                 print_request: self.print_request,
@@ -360,7 +376,9 @@ impl RunBuilder {
     /// `--test-remote-retry-pause-ms`, `--test-remote-bound-ms`, `--test-remote-interrupt-at`,
     /// `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-remote-backstop-ms`, `--test-local-sdks`,
     /// `--test-remote-fetch-cap-bytes`,
-    /// `--test-remote-apply-cap-bytes`, `--test-remote-outputs-budget-bytes` and `--test-remote-log-cap-bytes` without
+    /// `--test-remote-apply-cap-bytes`, `--test-remote-outputs-budget-bytes`, `--test-remote-inputs-budget-bytes`,
+    /// `--test-remote-log-cap-bytes` and
+    /// `--test-remote-tamper` without
     /// `--test-remote-transport`,
     /// whose client alone reads them, `--test-remote-timeout-ms` with it unless `--test-remote-watch-call` names a call
     /// other than `run`, and `--test-remote-snapshot` with it, as each chooses the client.
@@ -384,7 +402,9 @@ impl RunBuilder {
                 self.test_seams.remote_outputs_budget_bytes.is_some(),
                 "--test-remote-outputs-budget-bytes",
             ),
+            (self.test_seams.remote_inputs_budget_bytes.is_some(), "--test-remote-inputs-budget-bytes"),
             (self.test_seams.remote_log_cap_bytes.is_some(), "--test-remote-log-cap-bytes"),
+            (self.test_seams.remote_tamper.is_some(), "--test-remote-tamper"),
         ] {
             if read && !transport {
                 self.problems.push(Problem::SeamNeeds {

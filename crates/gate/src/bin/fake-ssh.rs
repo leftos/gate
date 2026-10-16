@@ -17,7 +17,9 @@
 //! the folder named as the host, the word before the line, in the folder the variable `GATE_FAKE_SSH_BUILDERS` names,
 //! made when missing, fed this process's standard input, which it reads whole first and keeps as `<steps file>.input`;
 //! its standard streams are otherwise this process's, and it exits with its status;
-//! `hold <path>` waits until the path exists, then does as `ok`; `version <v>` does as `ok` with the gate's standard
+//! `hold <path>` waits until the path exists, then does as `ok`; `fed-hold <path>` reads its standard input whole and
+//! keeps it as `<steps file>.input`, then waits until the path exists, then runs the call as `ok` does, fed what it
+//! read, so the call's input has all been sent before the call does anything; `version <v>` does as `ok` with the gate's standard
 //! output read, its `gate: remote version` line said as `gate: remote version <v>`; `boot <time>` does the same with
 //! its `gate: remote boot` line, said as `gate: remote boot <time>`, and `no-boot` with that line dropped;
 //! `drop` exits 255 with nothing written, as a connection lost after the banner; `fail-banner` writes ssh's
@@ -105,6 +107,7 @@ fn run() -> Result<i32, String> {
             hold(Path::new(path))?;
             call.ok()
         }
+        Some(("fed-hold", path)) => fed_call(call.command()?, call.steps, Some(Path::new(path))),
         Some(("version", version)) => call.rewritten(VERSION, Some(version)),
         Some(("boot", time)) => call.rewritten(BOOT, Some(time)),
         Some(("exit", status)) => status.parse().map_err(|_| format!("the step '{step}' names no status")),
@@ -290,22 +293,26 @@ fn appended(path: &Path, line: &str) -> Result<(), String> {
         .map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
-/// Runs the push call `command` fed this process's standard input, read whole first and kept beside the steps file
-/// `steps` as `<steps file>.input`, so a case can tell what the push sent; its status.
-fn fed_push(mut command: Command, steps: &Path) -> Result<i32, String> {
+/// Runs the call `command` fed this process's standard input, read whole first and kept beside the steps file `steps`
+/// as `<steps file>.input`, so a case can tell what the call sent, once the path `after` exists when one is given; its
+/// status.
+fn fed_call(mut command: Command, steps: &Path, after: Option<&Path>) -> Result<i32, String> {
     let mut input = Vec::new();
     io::stdin()
         .lock()
         .read_to_end(&mut input)
-        .map_err(|error| format!("cannot read the push's input: {error}"))?;
+        .map_err(|error| format!("cannot read the call's input: {error}"))?;
     let kept = beside(steps, ".input");
     fs::write(&kept, &input).map_err(|error| format!("cannot write {}: {error}", kept.display()))?;
+    if let Some(path) = after {
+        hold(path)?;
+    }
     let mut child = command.stdin(Stdio::piped()).spawn().map_err(|error| cannot_run(&command, &error))?;
-    let mut stdin = child.stdin.take().ok_or("the push call has no input pipe")?;
-    stdin.write_all(&input).map_err(|error| format!("cannot feed the push call: {error}"))?;
+    let mut stdin = child.stdin.take().ok_or("the call has no input pipe")?;
+    stdin.write_all(&input).map_err(|error| format!("cannot feed the call: {error}"))?;
     drop(stdin);
-    let status = child.wait().map_err(|error| format!("cannot wait for the push call: {error}"))?;
-    status.code().ok_or_else(|| "the push call ended with no status".to_owned())
+    let status = child.wait().map_err(|error| format!("cannot wait for the call: {error}"))?;
+    status.code().ok_or_else(|| "the call ended with no status".to_owned())
 }
 
 fn hold(path: &Path) -> Result<(), String> {
@@ -400,7 +407,7 @@ impl<'a> BoxCall<'a> {
     fn ok(&self) -> Result<i32, String> {
         let mut command = self.command()?;
         if self.verb == PUSH {
-            return fed_push(command, self.steps);
+            return fed_call(command, self.steps, None);
         }
         let status = command.status().map_err(|error| cannot_run(&command, &error))?;
         status.code().ok_or_else(|| "the gate ended with no status".to_owned())

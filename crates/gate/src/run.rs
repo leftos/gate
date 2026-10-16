@@ -47,7 +47,7 @@ use crate::outputs::{stale, walk::walk};
 use crate::remote::{self, RemoteCall, RemoteClient, RemoteOutcome, Split, git};
 use crate::resolve::{Environment, ResolvedRoot};
 use crate::route::{self, Placed};
-use crate::slots::{self, ClaimOf, Pool, Survey, Taken, Takes, ThisGate, epoch_ms};
+use crate::slots::{self, ClaimOf, LendMarker, Pool, Survey, Taken, Takes, ThisGate, epoch_ms};
 use crate::stopping::{TERMINATE_CHECK, failure};
 use crate::wait::{self, Arrival, Host, UnderParent, Wait, Waited};
 use crate::watch::{Start, Watched, Watcher, Watching};
@@ -147,6 +147,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         arrived: epoch_ms(Timestamp::now()),
         queued_at: None,
         lent: false,
+        lend: None,
         covered: None,
         late: None,
         durations: None,
@@ -364,9 +365,10 @@ impl Plan {
     fn prepare(request: &RunRequest, words: &[OsString], at: &Where<'_>, console: &mut Console) -> Result<Plan, NotRun> {
         let Where { root, gate, log, nesting } = *at;
         let folder = std::env::current_dir().map_err(|error| NotRun::failed(format!("gate: cannot read the working directory: {error}")))?;
-        // A covered gate hands on the marker of the parent whose slot its command runs under; one its parent lends its
-        // slot later is handed that marker then ([`Plan::handing_on`]).
-        let marker = match nesting.handed_on(false) {
+        // A covered gate hands on the marker of the parent whose slot its command runs under. Any other hands on its own,
+        // a gate its light parent lends its slot included: that gate's marker names it as a heavy holder, so every gate
+        // nested in its command runs covered by the lend.
+        let marker = match nesting.covering() {
             Some(parent) => parent.marker.clone(),
             None => environment::slot_marker(request.slot.as_str(), gate, &root.root),
         };
@@ -412,21 +414,6 @@ impl Plan {
             resolved: Some(program.to_string_lossy().into_owned()),
             launch,
         })
-    }
-
-    /// The plan with its command's environment handing on `marker`, the marker of the parent gate whose slot the
-    /// command runs on.
-    ///
-    /// # Errors
-    ///
-    /// An environment the gate cannot build (status 1).
-    fn handing_on(mut self, root: &ResolvedRoot, gate: &ThisGate, marker: &str) -> Result<Plan, NotRun> {
-        if let Ok(launch) = &mut self.launch {
-            launch.environment = Variables::for_command(root, gate, marker)
-                .block()
-                .map_err(|error| NotRun::failed(format!("gate: cannot build the command's environment: {error}")))?;
-        }
-        Ok(self)
     }
 }
 
@@ -515,6 +502,9 @@ struct Run<'a> {
     /// Whether the run's light parent lent it its slot while a critical request drained, before it queued or once it
     /// journalled `parent` as it waited, so it takes, journals and releases no slot.
     lent: bool,
+    /// The lend marker of a run its light parent lent its slot, from the lend to its release, which a critical gate's
+    /// drain waits for ([`LendMarker`]).
+    lend: Option<LendMarker>,
     /// The covered marker of a run a parent's slot covers, from its `covered` line to its release.
     covered: Option<Covered>,
     /// The slot a run a parent's slot covers took when that parent ended as its command ran ([`Late`]), until its
@@ -541,8 +531,9 @@ pub(crate) struct Taker<'t> {
 
 impl Taker<'_> {
     /// Journals the take of `taken`, a slot of `pool` the run waited `waited` seconds for, says and names it when a
-    /// killed gate had left it held, writes its claim and wakes the waiters. The gate's ticket is already deleted.
-    pub(crate) fn took(&mut self, taken: &Taken, pool: Pool, waited: f64, survey: &mut Survey, console: &mut Console) {
+    /// killed gate had left it held, writes its claim, lets go of the beside mutex a light gate behind a critical
+    /// request took the slot under, and wakes the waiters. The gate's ticket is already deleted.
+    pub(crate) fn took(&mut self, taken: &mut Taken, pool: Pool, waited: f64, survey: &mut Survey, console: &mut Console) {
         let name = taken.held.name().to_owned();
         let mut abandoned = Vec::new();
         if taken.abandoned {
@@ -558,7 +549,15 @@ impl Taker<'_> {
             remote: self.tag,
             expected: self.expected,
         };
+        if taken.beside.is_some()
+            && let Some(go) = &self.request.test_seams.beside_claim_wait
+        {
+            while !go.exists() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         slots::write_claim(&taken.held, pool.claim_kind(), &of, console);
+        taken.beside = None;
         slots::wake_waiters(self.root, survey, console);
     }
 }
@@ -645,6 +644,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         host: &remote.host,
         key: &remote.key,
         root: &remote.root,
+        root_id: remote.root_id,
         leaf: &remote.leaf,
         siblings,
         repo: &remote.repo,
@@ -652,6 +652,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         words: &remote.words,
         outputs: &remote.outputs,
         outputs_withheld: remote.outputs_withheld,
+        inputs: &remote.inputs,
         log: log.path(),
         timeout: ceiling,
         usual,
@@ -716,12 +717,12 @@ enum Pass<'h> {
 }
 
 /// A run whose verdict may pass: how long it ran, as its passed line says, the ceiling it ran under in whole seconds,
-/// and the line a passing routed build says of the folders it left stale ([`stale_line`]).
+/// and the lines a passing routed build says of the folders it left stale ([`stale_lines`]).
 #[derive(Clone, Copy)]
 struct Passing<'h> {
     pass: Pass<'h>,
     ceiling: u64,
-    stale: Option<&'h str>,
+    stale: &'h [String],
 }
 
 /// How long a command ran: by the wall clock, in load-adjusted seconds, `None` once the sampler failed and they are
@@ -755,14 +756,11 @@ impl Run<'_> {
     /// here, as does one whose light parent lends it its slot before it queues, while a critical request drains, which
     /// is not routed ([`Run::on_parent`]). The route, and what the decision learnt of the gate's place in its worktree.
     fn route(&mut self, environment: &Environment, console: &mut Console) -> (Route, Placed) {
-        let nesting = self.nesting;
-        if let Nesting::Under(parent) = nesting
-            && wait::lent_before_queue(self.root, parent.pid, self.host.processors, &mut self.survey, console)
-        {
+        if self.lend_before_queue(console) {
             self.lent = true;
             return (Route::Local { reason: None }, Placed::NotAsked);
         }
-        let covering = nesting.covering().is_some();
+        let covering = self.nesting.covering().is_some();
         let (route, place) = route::route(self.request, environment, covering, console);
         self.tag = match &route {
             Route::Routed(remote) => Some(RemoteTag {
@@ -837,11 +835,37 @@ impl Run<'_> {
     /// slot, whether it lends that slot before the run queues, as [`Run::route`] asked of the nesting the run was read
     /// with; a run already lent its parent's slot keeps it.
     fn lend_again(&mut self, console: &mut Console) {
-        if let Nesting::Under(parent) = self.nesting
-            && !self.lent
-        {
-            self.lent = wait::lent_before_queue(self.root, parent.pid, self.host.processors, &mut self.survey, console);
+        if !self.lent {
+            self.lent = self.lend_before_queue(console);
         }
+    }
+
+    /// Whether the light parent whose slot does not cover the run lends it that slot before it queues
+    /// ([`wait::lent_before_queue`]), its lend marker written under the floor of its ceiling holding the beside mutex
+    /// the lend was decided under. A marker that cannot be written lends nothing: the run queues.
+    fn lend_before_queue(&mut self, console: &mut Console) -> bool {
+        let Nesting::Under(parent) = self.nesting else {
+            return false;
+        };
+        let Some(beside) = wait::lent_before_queue(self.root, &mut self.survey, console) else {
+            return false;
+        };
+        self.lend = self.lend_marker(parent.pid, Figures::floor(self.request.timeout).ceiling, None, console);
+        drop(beside);
+        self.lend.is_some()
+    }
+
+    /// The lend marker of this run on the slot of its light parent `parent_pid`, under `ceiling`, with what the
+    /// durations store `expected` of the run; `None` when it cannot be written, said.
+    fn lend_marker(&self, parent_pid: u32, ceiling: u64, expected: Option<&Map<String, Value>>, console: &mut Console) -> Option<LendMarker> {
+        let of = ClaimOf {
+            gate: &self.gate,
+            ceiling,
+            log: self.log.path(),
+            remote: None,
+            expected,
+        };
+        LendMarker::write(&self.root.path, parent_pid, &of, console)
     }
 
     /// Journals the queue of the run `route` sends: with `notRouted` for a heavy gate its caller kept here with
@@ -960,22 +984,11 @@ impl Run<'_> {
         self.on_parent(parent, plan, figures, console)
     }
 
-    /// Runs the command on the slot of the light parent `parent`, which lends it while a critical request drains: hands
-    /// the command the parent's marker, then says so, journals `parent` with the parent's pid and runs it. The run
-    /// takes, claims and releases no slot. A command environment that cannot be built fails the gate (status 1) before
-    /// it says or journals the lend: a gate lent the slot before it queued then journals nothing, and one that queued
-    /// journals its release as any gate that fails before its command does. The command runs under `figures`.
+    /// Runs the command on the slot of the light parent `parent`, which lends it while a critical request drains: says
+    /// so, journals `parent` with the parent's pid and runs it. The run takes, claims and releases no slot. Its command
+    /// keeps the marker of this gate as a heavy holder ([`Plan::prepare`]), so a gate nested in it runs covered by the
+    /// lend and asks for none of its own. The command runs under `figures`.
     fn on_parent(&mut self, parent: &Parent, plan: Plan, figures: Figures, console: &mut Console) -> Ended {
-        let plan = match plan.handing_on(self.root, &self.gate, &parent.marker) {
-            Ok(plan) => plan,
-            Err(NotRun { status, line }) => {
-                console.err(&line);
-                return Ended {
-                    status: i64::from(status),
-                    facts: None,
-                };
-            }
-        };
         self.lent = true;
         console.err(&format!(
             "gate: running under the {} slot of gate {} while a critical request drains; taking no slot",
@@ -1029,11 +1042,11 @@ impl Run<'_> {
         let wall = started.elapsed();
         let words = unicode_words(&self.request.command);
         self.leave_nothing_back(remote, &outcome, words.as_deref(), console);
-        let stale = stale_line(remote, &outcome, words.as_deref());
+        let stale = stale_lines(remote, &outcome, words.as_deref());
         let passing = Passing {
             pass: Pass::On(&remote.host, wall, outcome.split, outcome.adjusted),
             ceiling: figures.ceiling,
-            stale: stale.as_deref(),
+            stale: &stale,
         };
         Remotely::Ended(self.remote_ended(&outcome, passing, wall, console))
     }
@@ -1237,7 +1250,8 @@ impl Run<'_> {
     /// The line a run says as it drops its `--no-build` for `reason`, naming where it builds: on the slot of the parent
     /// gate that covers or lent it, else on a heavy slot of its own.
     fn dropped_line(&self, reason: &str) -> String {
-        let building = match self.nesting.handed_on(self.lent) {
+        let lent_by = self.lent.then(|| self.nesting.uncovering()).flatten();
+        let building = match self.nesting.covering().or(lent_by) {
             Some(parent) => format!("building on the parent gate's {} slot", parent.held.as_str()),
             None => "building on a heavy slot".to_owned(),
         };
@@ -1358,7 +1372,7 @@ impl Run<'_> {
     }
 
     /// Ends a run the client ran to its end: the verdict with the passed line on the run's host and, when the verdict
-    /// passes, the line naming the folders the run left stale ([`stale_line`]); its markers not scanned when the
+    /// passes, the lines naming the folders the run left stale ([`stale_lines`]); its markers not scanned when the
     /// client killed the run or the console was interrupted, and the facts its release carries, with the adjusted
     /// seconds the box said. It is a kill only when the box's kill tag named one, whose kind is the verdict, or when the
     /// client killed it, by the kill line in the log.
@@ -1476,27 +1490,27 @@ impl Run<'_> {
             expected: expected.as_ref(),
         };
         let mut wait = Wait::queue(self.root, pool, arrival, self.host, console);
-        let taken = match wait.until_taken(&mut self.survey, console) {
-            Waited::Taken(taken) => held.insert(taken),
-            Waited::Lent => {
-                wait.end(console);
-                slots::wake_waiters(self.root, &mut self.survey, console);
-                // The command runs on the parent's slot, under the ceiling this take's estimate resolves, which the
-                // take says as a take of its own slot does; a lent take says no expected-time line.
-                let (figures, resolved) = Figures::resolved(self.request.timeout, estimate.as_ref());
-                if let Some(estimate) = &estimate {
-                    say_ceiling(estimate, resolved, console);
+        let taken = loop {
+            match wait.until_taken(&mut self.survey, console) {
+                Waited::Taken(taken) => break held.insert(taken),
+                Waited::Lent(beside) => {
+                    let Some(figures) = self.lent_as_it_waits(beside, estimate.as_ref(), expected.as_ref(), console) else {
+                        wait.refuse_lend();
+                        continue;
+                    };
+                    wait.end(console);
+                    slots::wake_waiters(self.root, &mut self.survey, console);
+                    return Taking::Lent(figures);
                 }
-                return Taking::Lent(figures);
-            }
-            Waited::Interrupted => {
-                self.abandon(wait, pool, queued, console);
-                return Taking::Interrupted;
-            }
-            Waited::TimedOut => {
-                wait.end(console);
-                slots::wake_waiters(self.root, &mut self.survey, console);
-                return Taking::Full;
+                Waited::Interrupted => {
+                    self.abandon(wait, pool, queued, console);
+                    return Taking::Interrupted;
+                }
+                Waited::TimedOut => {
+                    wait.end(console);
+                    slots::wake_waiters(self.root, &mut self.survey, console);
+                    return Taking::Full;
+                }
             }
         };
         let waited = queued.elapsed().as_secs_f64();
@@ -1510,7 +1524,30 @@ impl Run<'_> {
         Taking::Took(took, figures)
     }
 
-    /// Waits for the machine as a critical gate and takes it into `held` once it holds every heavy and unreserved light
+    /// The figures of a run its light parent lent its slot as it waited, the lend decided holding the beside mutex
+    /// `beside`: the command runs on the parent's slot under the ceiling the take's `estimate` resolves, which it says
+    /// as a take of its own slot does, with no expected-time line. Its lend marker is written, with what the durations
+    /// store `expected`, before the mutex is let go. `None` when the marker cannot be written: the run waits on.
+    fn lent_as_it_waits(
+        &mut self,
+        beside: OwnedMutexGuard,
+        estimate: Option<&Estimate>,
+        expected: Option<&Map<String, Value>>,
+        console: &mut Console,
+    ) -> Option<Figures> {
+        let Nesting::Under(parent) = self.nesting else {
+            unreachable!("only a gate under a light parent is lent its parent's slot")
+        };
+        let (figures, resolved) = Figures::resolved(self.request.timeout, estimate);
+        self.lend = Some(self.lend_marker(parent.pid, figures.ceiling, expected, console)?);
+        drop(beside);
+        if let Some(estimate) = estimate {
+            say_ceiling(estimate, resolved, console);
+        }
+        Some(figures)
+    }
+
+    /// Waits for the machine as a critical gate and takes it into `held` once it holds every heavy slot and its light
     /// slot, then journals the take with what it found, says the holds line, writes the critical claim and wakes the
     /// waiters. When the machine was taken; else a Ctrl+C ended the wait, which says so, journals the abandon, then
     /// releases what it took so far, deletes the ticket and wakes the waiters.
@@ -1596,8 +1633,11 @@ impl Run<'_> {
     /// slot it held first, then lets the machine go ([`Machine::release`]). A gate a parent's slot covers deletes its
     /// covered marker, then lets go the slot it took when that parent ended as its command ran ([`Late`]), as any slot
     /// is let go; it took no other slot, and journals no release when it took none. A gate a light parent lent its slot
-    /// took no slot and journals no release.
+    /// took no slot and journals no release; it deletes its lend marker and wakes the waiters.
     fn release(&mut self, hold: Hold, ended: Option<&Ended>, console: &mut Console) {
+        if let Some(lend) = self.lend.take() {
+            lend.end(self.root, &mut self.survey, console);
+        }
         if let Some(mut covered) = self.covered.take() {
             covered.end(console);
         }
@@ -1716,7 +1756,7 @@ impl Run<'_> {
         start: &Start,
         console: &mut Console,
     ) -> Result<(Watched, Timing), String> {
-        let (nesting, host, arrived, lent) = (self.nesting, self.host, self.arrived, self.lent);
+        let (nesting, host, arrived) = (self.nesting, self.host, self.arrived);
         let Figures { ceiling, usual } = started.figures;
         let covering = nesting.covering();
         let (taker, held, covered) = self.late_taker(covering.map(|parent| parent.pid), ceiling);
@@ -1746,7 +1786,7 @@ impl Run<'_> {
             runs_as: nesting.runs_as(request.slot),
             root,
             gate,
-            hands_on: nesting.handed_on(lent),
+            hands_on: covering,
             recorded,
             late,
         };
@@ -1820,7 +1860,7 @@ impl Run<'_> {
         let passing = Passing {
             pass: Pass::Here(timing),
             ceiling: started.figures.ceiling,
-            stale: None,
+            stale: &[],
         };
         match self.verdict(outcome.exited, Some(passing), unscanned, diagnostics, console) {
             Ok(status) => Ended {
@@ -1914,11 +1954,11 @@ impl Run<'_> {
         Ok(status)
     }
 
-    /// Says what a passed run says: the line naming the folders it left stale when it has one, the cores hint, and the
+    /// Says what a passed run says: the lines naming the folders it left stale when it has any, the cores hint, and the
     /// passed line.
     fn say_passed(&self, passing: Passing<'_>, shown: &str, console: &mut Console) {
         let Passing { pass, ceiling, stale } = passing;
-        if let Some(line) = stale {
+        for line in stale {
             console.err(line);
         }
         if let Some(line) = self.cores_hint(pass) {
@@ -2489,6 +2529,7 @@ fn against_ceiling(adjusted: Option<f64>, wall: Duration, ceiling: u64) -> Strin
 fn split_said(split: Split) -> String {
     let seconds = |part: Duration| whole_seconds(part.as_secs_f64());
     let mut parts = vec![format!("command {} s", seconds(split.command)), format!("push {} s", seconds(split.push))];
+    parts.extend(split.inputs.map(|part| format!("inputs {} s", seconds(part))));
     parts.extend(split.sync_back.map(|part| format!("sync-back {} s", seconds(part))));
     parts.extend(split.outputs.map(|part| format!("outputs {} s", seconds(part))));
     parts.join(", ")
@@ -2605,17 +2646,20 @@ fn brought_everything_back(outcome: &RemoteOutcome) -> bool {
     outcome.status == 0 && outcome.brought_back == Some(true)
 }
 
-/// The line a passing routed build says of the folders it left stale, `None` when it says none: the folders in the
+/// The lines a passing routed build says of the folders it left stale, none when it says none: the folders in the
 /// worktree the run's judging globs stop at that the run did not bring back. Only a dotnet build the gate treats as one
 /// ([`dotnet_builds`]) that ended on the builder has any, and the run's verdict decides whether it is said
 /// ([`Run::verdict`]), so a failed build, one whose log reports a failure among them, and a fallback (whose build ran
 /// here) say nothing. The judging globs are the run's own, the defaults beside them, even in a repo whose `outputs` list
-/// is empty ([`DEFAULT_OUTPUTS`]); a file the run brought back is no stale folder's. A tree that cannot be listed says
-/// why it could not.
-fn stale_line(remote: &RemoteRun, outcome: &RemoteOutcome, words: Option<&[String]>) -> Option<String> {
-    let words = words?;
+/// is empty ([`DEFAULT_OUTPUTS`]); a file the run brought back is no stale folder's. A pair's siblings are judged by
+/// the same globs, and named after the main's on the same line, relative to the main worktree; a sibling's output is
+/// never brought back. A tree that cannot be listed says why it could not, on a line of its own ([`stale::stale_lines`]).
+fn stale_lines(remote: &RemoteRun, outcome: &RemoteOutcome, words: Option<&[String]>) -> Vec<String> {
+    let Some(words) = words else {
+        return Vec::new();
+    };
     if outcome.status != 0 || !dotnet_builds(words) {
-        return None;
+        return Vec::new();
     }
     let mut judging = remote.outputs.clone();
     judging.extend(DEFAULT_OUTPUTS.iter().map(|glob| (*glob).to_owned()));
@@ -2624,15 +2668,14 @@ fn stale_line(remote: &RemoteRun, outcome: &RemoteOutcome, words: Option<&[Strin
     } else {
         Vec::new()
     };
-    let root = Path::new(&remote.root);
-    match stale::stale_folders(
-        |globs| walk(root, globs).map(|found| found.into_iter().map(|file| file.path).collect()),
-        &judging,
-        &brought_back,
-    ) {
-        Ok(folders) => stale::stale_line(&folders),
-        Err(reason) => Some(stale::could_not_list(&reason)),
-    }
+    let siblings: Vec<(&str, &str)> = remote
+        .siblings
+        .iter()
+        .map(|sibling| (sibling.name.as_str(), sibling.root.as_str()))
+        .collect();
+    stale::stale_lines(&remote.root, &siblings, &judging, &brought_back, |root, globs| {
+        walk(Path::new(root), globs).map(|found| found.into_iter().map(|file| file.path).collect())
+    })
 }
 
 /// The command's words as text, `None` when one of them is not valid Unicode.
@@ -3002,6 +3045,7 @@ mod tests {
         let pushed = Split {
             command: Duration::from_millis(76_400),
             push: 224 * second,
+            inputs: None,
             sync_back: None,
             outputs: None,
         };
@@ -3067,7 +3111,7 @@ mod tests {
 
     #[test]
     fn a_log_reached_through_a_junction_into_the_state_root_is_inside_it() {
-        let folder = std::env::temp_dir().join(format!("gate-run-junction-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-run-junction-{}", std::process::id()));
         if folder.exists() {
             fs::remove_dir_all(&folder).expect("a folder left by an earlier run can be removed");
         }

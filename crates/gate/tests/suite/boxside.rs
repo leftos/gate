@@ -24,9 +24,10 @@ use crate::support::{
     shown, start_with_closed, start_with_stdin, wait_until, wait_until_closed,
 };
 
+mod inputs;
 mod outputs;
 
-const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight --stdin (the base64 JSON request as stdin's first line)\n";
+const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs --stdin (the base64 JSON request as stdin's first line)\n";
 
 /// The request line for `json`, as the remote client encodes it: base64 of the JSON, without its newline.
 fn payload(json: &Value) -> String {
@@ -169,6 +170,7 @@ fn git(args: &[&str]) -> String {
     for name in GIT_REDIRECTS {
         command.env_remove(name);
     }
+    crate::support::git_home_for(&mut command);
     let output = command.args(args).output().expect("git starts; the box cases need git on PATH");
     assert!(output.status.success(), "git {args:?} failed: {output:?}");
     String::from_utf8_lossy(&output.stdout).trim_end().to_owned()
@@ -1080,6 +1082,7 @@ fn has_ref_in(bare: &str, name: &str) -> bool {
     for variable in GIT_REDIRECTS {
         command.env_remove(variable);
     }
+    crate::support::git_home_for(&mut command);
     let bare = format!("--git-dir={bare}");
     let output = command
         .args([bare.as_str(), "rev-parse", "--verify", "-q", name])

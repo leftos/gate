@@ -475,7 +475,7 @@ mod tests {
 
     /// A scratch folder for one test, emptied first.
     fn scratch(name: &str) -> PathBuf {
-        let folder = std::env::temp_dir().join(format!("gate-box-outputs-{name}-{}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-box-outputs-{name}-{}", std::process::id()));
         if folder.exists() {
             fs::remove_dir_all(&folder).expect("an earlier scratch folder can be removed");
         }
@@ -583,7 +583,7 @@ mod tests {
     #[test]
     fn an_output_folder_that_cannot_be_listed_is_named_with_its_control_characters_escaped() {
         // In a folder that exists, so the name itself is refused, not found missing.
-        let parent = std::env::temp_dir();
+        let parent = crate::test_support::temp_dir();
         let parent = parent.to_str().expect("the temp folder is Unicode").trim_end_matches('\\');
         let lines = prune(&asked(&format!("{parent}\\a\u{1}b")), SystemTime::now());
 

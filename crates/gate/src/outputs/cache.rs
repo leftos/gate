@@ -62,6 +62,11 @@ impl HashCache {
         }
     }
 
+    /// Forgets the hash the cache holds for `path`, found without regard to case, so the next build hashes the file.
+    pub(crate) fn forget(&mut self, path: &str) {
+        self.held.remove(path);
+    }
+
     /// Saves the cache at `path`, its folder made when missing, through a temporary sibling `<path>.<pid>.tmp` moved
     /// over it, so a reader never sees a torn file. A save that fails removes its temporary sibling and is not said.
     pub(crate) fn save(&self, path: &Path) {
@@ -156,7 +161,7 @@ mod tests {
 
     /// A scratch folder for one test, emptied first.
     fn scratch(name: &str) -> PathBuf {
-        let folder = std::env::temp_dir().join(format!("gate-outputs-cache-{}-{name}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-outputs-cache-{}-{name}", std::process::id()));
         // A folder left by an earlier run of the test may not be there.
         let _ = fs::remove_dir_all(&folder);
         fs::create_dir_all(&folder).expect("the scratch folder can be made");

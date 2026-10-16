@@ -453,7 +453,7 @@ pub(crate) mod tests {
     #[test]
     fn a_launch_hands_over_inheritable_copies_under_the_spawn_lock() {
         let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
-        let dir = std::env::temp_dir().join(format!("gate-win32-create-{}", std::process::id()));
+        let dir = crate::test_support::temp_dir().join(format!("gate-win32-create-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("the case folder is created");
         let system = system_folder();
         let launch = Launch {

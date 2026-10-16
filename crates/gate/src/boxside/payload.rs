@@ -10,7 +10,7 @@ use gate_router::{is_layout_name, repo_name};
 use serde_json::{Map, Value};
 
 use crate::outputs::archive::SUFFIX;
-use crate::outputs::hash::is_lower_hex;
+use crate::outputs::hash::{SHA256_DIGITS, is_lower_hex};
 use crate::remote::siblings::MOST_SIBLINGS;
 
 /// The decoded JSON object.
@@ -134,6 +134,25 @@ impl Payload {
         }
     }
 
+    /// The run's `InputsDigest`, the SHA-256 of the inputs manifest line the client sent the work folder's inputs
+    /// with: 64 lower-case hex digits; `None` when the key is absent or null. Else the usage line, the value shown with
+    /// its control characters escaped.
+    pub(crate) fn inputs_digest(&self) -> Result<Option<&str>, String> {
+        match self.0.get("InputsDigest") {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(digest)) if is_lower_hex(digest, SHA256_DIGITS) => Ok(Some(digest)),
+            Some(other) => Err(format!(
+                "gate: box payload InputsDigest is not 64 lower-case hex digits: {}",
+                escaped(&other.as_str().map_or_else(|| other.to_string(), str::to_owned))
+            )),
+        }
+    }
+
+    /// Whether the payload sets `key` to anything but null.
+    pub(crate) fn sets(&self, key: &str) -> bool {
+        !matches!(self.0.get(key), None | Some(Value::Null))
+    }
+
     /// The run's `Snapshot`: the payload's commit, exactly 40 lowercase hex digits, as the client sends it; else the
     /// line saying it is not one. This is PowerShell's `-cmatch '^[0-9a-f]{40}$'` without .NET's allowance for a
     /// trailing newline. A missing key and a JSON null are shown as the empty string, any other non-string value as its
@@ -162,6 +181,19 @@ impl Pair {
     }
 }
 
+/// Why the box refuses a run's `Pair`: the usage line, and the sibling it names when one sibling alone is refused.
+#[derive(Debug)]
+pub(crate) struct PairRefused {
+    pub(crate) line: String,
+    pub(crate) sibling: Option<String>,
+}
+
+impl From<String> for PairRefused {
+    fn from(line: String) -> PairRefused {
+        PairRefused { line, sibling: None }
+    }
+}
+
 /// One sibling of a [`Pair`]: its folder name and its bare repository, `{root}\{repo_name(name)}.git` beside the main's,
 /// derived on the box and never read from the payload.
 pub(crate) struct PairSibling {
@@ -187,6 +219,12 @@ impl Payload {
     /// (`<repo_name(leaf)>-<8 hex>`), a `Bare` that is not `<root>\<name>.git` for the work folder `<root>\work\<key>`,
     /// or two bare repositories (the main's and each sibling's `<repo_name(name)>.git`) equal ignoring ASCII case.
     pub(crate) fn pair(&self) -> Result<Option<Pair>, String> {
+        self.laid_out().map_err(|refused| refused.line)
+    }
+
+    /// The run's sibling `Pair` as [`Payload::pair`] reads it; else its usage line and, when it refuses one sibling's
+    /// bare repository, that sibling's name.
+    pub(crate) fn laid_out(&self) -> Result<Option<Pair>, PairRefused> {
         let (leaf, names) = match self.0.get("Pair") {
             None | Some(Value::Null) => return Ok(None),
             Some(value) => pair_names(value)?,
@@ -194,31 +232,24 @@ impl Payload {
         check_pair_names(&leaf, &names)?;
         let (key, work) = self.work_folder()?;
         if !is_key_of(key, &leaf) {
-            return Err(format!(
-                "gate: box payload Key {key} is not the work-folder key of the Pair's Leaf {leaf}"
-            ));
+            return Err(format!("gate: box payload Key {key} is not the work-folder key of the Pair's Leaf {leaf}").into());
         }
         let bare = self.path("Bare")?;
         let Some(root) = grandparent(work) else {
-            return Err(format!(
-                r"gate: box payload Work must be <root>\work\<key> with a Pair: {}",
-                escaped(work)
-            ));
+            return Err(format!(r"gate: box payload Work must be <root>\work\<key> with a Pair: {}", escaped(work)).into());
         };
         let Some(main_stem) = bare_stem(bare, root) else {
-            return Err(format!(
-                r"gate: box payload Bare must be {root}\<name>.git with a Pair: {}",
-                escaped(bare)
-            ));
+            return Err(format!(r"gate: box payload Bare must be {root}\<name>.git with a Pair: {}", escaped(bare)).into());
         };
         let mut stems = vec![main_stem.to_owned()];
         let mut siblings = Vec::with_capacity(names.len());
         for name in names {
             let stem = repo_name(&name);
             if stems.iter().any(|taken| taken.eq_ignore_ascii_case(&stem)) {
-                return Err(format!(
-                    "gate: box payload Pair sibling {name} would share the bare repository {stem}.git"
-                ));
+                return Err(PairRefused {
+                    line: format!("gate: box payload Pair sibling {name} would share the bare repository {stem}.git"),
+                    sibling: Some(name),
+                });
             }
             siblings.push(PairSibling {
                 bare: format!(r"{root}\{stem}.git"),
@@ -253,6 +284,18 @@ impl Payload {
             .map(|sibling| commit(object.get(&sibling.name)).map_err(|shown| not_a_snapshot(&format!("SiblingSnapshots {}", sibling.name), &shown)))
             .collect()
     }
+}
+
+/// The box path of every tree a run checks out in the work folder `work`: the main repo's, then each sibling's in the
+/// order given. With no `pair`, `work` itself and no sibling; with the pair of the main checkout's folder name and the
+/// siblings' folder names, `{work}\{leaf}` and `{work}\{name}` for each sibling. The box lays its trees out at these
+/// paths and the client rewrites recorded box paths from them, so the two never compute them apart.
+pub(crate) fn trees(work: &str, pair: Option<(&str, &[&str])>) -> (String, Vec<String>) {
+    let Some((leaf, siblings)) = pair else {
+        return (work.to_owned(), Vec::new());
+    };
+    let tree = |name: &str| format!(r"{work}\{name}");
+    (tree(leaf), siblings.iter().map(|name| tree(name)).collect())
 }
 
 /// The leaf and the sibling names of the `Pair` value `value`; else the usage line saying it is not one.
@@ -416,7 +459,7 @@ impl Payload {
 /// The hex digits of a run's nonce, as the client draws it.
 const NONCE_DIGITS: usize = 12;
 /// The hex digits of a run's outputs nonce, as the client draws it.
-const OUTPUTS_NONCE_DIGITS: usize = 32;
+pub(crate) const OUTPUTS_NONCE_DIGITS: usize = 32;
 /// The hex digits of a commit's sha.
 const COMMIT_SHA_DIGITS: usize = 40;
 /// The hex digits that end a work-folder key, after the repo name and a `-`.
@@ -448,7 +491,7 @@ pub(crate) fn archive_key(name: &str) -> Option<&str> {
 
 /// The `<root>` of the work folder `path`, `<root>\work\<key>` with `work` in any case, without a trailing separator;
 /// `None` when `path` is not one.
-fn grandparent(path: &str) -> Option<&str> {
+pub(crate) fn grandparent(path: &str) -> Option<&str> {
     let parent = &path[..path.rfind(['\\', '/'])?];
     let split = parent.rfind(['\\', '/'])?;
     let (root, middle) = (&parent[..split], &parent[split + 1..]);
@@ -1074,5 +1117,27 @@ mod tests {
         assert_eq!(sibling_snapshots(&json!({"lib": SHA, "tools": null})), refusing(""));
         assert_eq!(sibling_snapshots(&json!({"lib": SHA, "tools": 3})), refusing("3"));
         assert_eq!(sibling_snapshots(&json!({"lib": SHA, "tools": "\u{1b}"})), refusing(r"\u{1b}"));
+    }
+
+    #[test]
+    fn the_trees_of_a_run_without_a_pair_are_its_work_folder() {
+        assert_eq!(
+            super::trees(r"D:\gate-remote\work\app-1a2b3c4d", None),
+            (r"D:\gate-remote\work\app-1a2b3c4d".to_owned(), Vec::<String>::new())
+        );
+    }
+
+    #[test]
+    fn the_trees_of_a_pair_put_the_main_and_each_sibling_in_the_work_folder() {
+        assert_eq!(
+            super::trees(r"D:\gate-remote\work\app-1a2b3c4d", Some(("app", &["tools", "lib"]))),
+            (
+                r"D:\gate-remote\work\app-1a2b3c4d\app".to_owned(),
+                vec![
+                    r"D:\gate-remote\work\app-1a2b3c4d\tools".to_owned(),
+                    r"D:\gate-remote\work\app-1a2b3c4d\lib".to_owned(),
+                ]
+            )
+        );
     }
 }

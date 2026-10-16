@@ -32,8 +32,9 @@ use crate::answer::USAGE_STATUS;
 use crate::boxside::ceiling::{Ceiling, KILLED, Spec};
 use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
 use crate::boxside::heartbeat;
+use crate::boxside::inputs;
 use crate::boxside::outputs::{self, Asked};
-use crate::boxside::payload::{Payload, bare_stem, escaped, ordinal_upper};
+use crate::boxside::payload::{PairSibling, Payload, bare_stem, escaped, ordinal_upper, trees};
 use crate::boxside::preflight::{self, Failed, GIT_REDIRECTS, Git, GitFailure, Unready, exit_code, git_failed};
 use crate::boxside::stop::{Ending, STOPPED, stop_event_name, terminate_and_wait};
 use crate::boxside::tools;
@@ -117,6 +118,8 @@ pub(super) struct Request<'a> {
     timeout: Option<u64>,
     /// The PC's name for the builder, which the box's kill line names, empty when the payload gives none.
     host: &'a str,
+    /// The digest of the inputs manifest the client installed the run's inputs from, `None` when it sent none.
+    inputs_digest: Option<&'a str>,
 }
 
 impl Request<'_> {
@@ -135,6 +138,7 @@ impl Request<'_> {
         let command = payload.words("Command")?;
         let subfolder = payload.optional_text("Subfolder")?;
         let identity = identity(payload)?;
+        let inputs_digest = payload.inputs_digest()?;
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
         let (main, siblings) = repos(payload, work, bare, snapshot)?;
         Ok(Request {
@@ -152,6 +156,7 @@ impl Request<'_> {
             nonce,
             timeout,
             host,
+            inputs_digest,
         })
     }
 
@@ -165,9 +170,45 @@ impl Request<'_> {
         std::iter::once(&self.main).chain(&self.siblings)
     }
 
-    /// The layout the run lays the work folder out in, as its record says it: [`LAYOUT_SINGLE`] for a run of one repo,
-    /// else `pair` followed by the leaf, then each sibling's name sorted without regard to ASCII case, one space before
-    /// each, so the same siblings named in another order are the same layout.
+    /// The work folder and the repos the run lays out in it.
+    fn laid(&self) -> Laid<'_> {
+        Laid {
+            work: self.work,
+            main: &self.main,
+            siblings: &self.siblings,
+        }
+    }
+
+    /// The main repo's name as routing names it ([`repo_name_of`]).
+    fn repo_name(&self) -> &str {
+        repo_name_of(&self.main.bare)
+    }
+}
+
+/// The name routing gives the repo of the bare repository `bare`: the stem of `{name}.git` ([`bare_stem`]), or the
+/// bare repository's whole file name when it is not of that form.
+fn repo_name_of(bare: &str) -> &str {
+    let (folder, file) = bare.rsplit_once(['\\', '/']).unwrap_or(("", bare));
+    bare_stem(bare, folder).unwrap_or(file)
+}
+
+/// What the layout step lays out ([`WorkGit::lay_out`]): the work folder, the main repo and the siblings of a pair,
+/// none for one repo. A run and the inputs verb each build one, so both lay the work folder out alike.
+pub(super) struct Laid<'r> {
+    work: &'r str,
+    main: &'r Repo<'r>,
+    siblings: &'r [Repo<'r>],
+}
+
+impl Laid<'_> {
+    /// Every repo laid out, the main one first.
+    fn repos(&self) -> impl Iterator<Item = &Repo<'_>> {
+        std::iter::once(self.main).chain(self.siblings)
+    }
+
+    /// The layout the work folder is laid out in, as its record says it: [`LAYOUT_SINGLE`] for one repo, else `pair`
+    /// followed by the leaf, then each sibling's name sorted without regard to ASCII case, one space before each, so
+    /// the same siblings named in another order are the same layout.
     fn layout(&self) -> String {
         let Some(leaf) = self.main.name.as_deref() else {
             return LAYOUT_SINGLE.to_owned();
@@ -176,14 +217,57 @@ impl Request<'_> {
         siblings.sort_by_key(|name| name.to_ascii_lowercase());
         format!("pair {leaf} {}", siblings.join(" "))
     }
+}
 
-    /// The main repo's name as routing names it: the stem of its bare repository, `{name}.git` ([`bare_stem`]), or the
-    /// bare repository's whole file name when it is not of that form.
-    fn repo_name(&self) -> &str {
-        let bare = self.main.bare.as_str();
-        let (folder, file) = bare.rsplit_once(['\\', '/']).unwrap_or(("", bare));
-        bare_stem(bare, folder).unwrap_or(file)
+/// Lays out the work folder `work` for one repo, its bare repository `bare`, as a run does before its checkout
+/// ([`WorkGit::lay_out`]), under the work folder's lock file `lock`, which the caller holds; git's output is forwarded
+/// as a run's is. The held work folder; else `Err` with the status, its lines said: a failing git step's, or 75 for a
+/// work folder that could not be laid out, its `layout` tag and line said as a run says them.
+pub(super) fn lay_out_alone(work: &str, bare: &str, lock: &str, nonce: &str, console: &mut Console) -> Result<File, u32> {
+    let main = Repo::new(None, work.to_owned(), bare, "");
+    let laid = Laid {
+        work,
+        main: &main,
+        siblings: &[],
+    };
+    match WorkGit::ready(lock, &OutputLock::default()).lay_out(&laid, console) {
+        Ok(held) => Ok(held),
+        Err(NotLaidOut::Failed(failed)) => Err(said(console, &failed)),
+        Err(NotLaidOut::Refused(why)) => {
+            console.err(&refused_line(nonce, Refusal::Layout));
+            console.err(&crate::remote::layout_line(repo_name_of(bare), &escaped(&why)));
+            Err(REFUSED_STATUS)
+        }
     }
+}
+
+/// Checks the run's `InputsDigest`, when it has one, against the work folder `held`'s inputs record and the copies it
+/// holds, and rewrites the tree's exclude file from it ([`inputs::unmatched`]), once the work folder is laid out and
+/// before the checkout: a record missing, unreadable or of another digest, a copy changed or gone, or an exclude file
+/// that cannot be written refuses the run `inputs`, its tag and line said under the box's output lock, so the PC runs
+/// the command itself; 75. A folder moved aside from the exclude file's name is said, under the lock too.
+fn inputs_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
+    let Some(sent) = request.inputs_digest else {
+        return Ok(());
+    };
+    let why = match inputs::unmatched(request.work, held, sent) {
+        Ok(moved_aside) => {
+            if let Some(line) = moved_aside {
+                let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
+                console.err(&line);
+            }
+            return Ok(());
+        }
+        Err(why) => why,
+    };
+    let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
+    console.err(&inputs::refused_line(request.nonce));
+    console.err(&format!(
+        "gate: remote inputs of work folder {} are not the ones sent: {}",
+        request.key,
+        escaped(&why)
+    ));
+    Err(REFUSED_STATUS)
 }
 
 /// The main repo and the siblings of a run in the work folder `work`: with no `Pair`, the one repo of `bare` checked out
@@ -191,15 +275,19 @@ impl Request<'_> {
 /// its own bare repository and its commit from `SiblingSnapshots`. Else the usage line.
 fn repos<'a>(payload: &'a Payload, work: &str, bare: &str, snapshot: &'a str) -> Result<(Repo<'a>, Vec<Repo<'a>>), String> {
     let Some(pair) = payload.pair()? else {
-        return Ok((Repo::new(None, work.to_owned(), bare, snapshot), Vec::new()));
+        let (tree, _) = trees(work, None);
+        return Ok((Repo::new(None, tree, bare, snapshot), Vec::new()));
     };
     let commits = payload.sibling_snapshots(&pair)?;
-    let main = Repo::new(Some(pair.leaf()), format!(r"{work}\{}", pair.leaf()), bare, snapshot);
+    let names: Vec<&str> = pair.siblings().iter().map(PairSibling::name).collect();
+    let (main_tree, sibling_trees) = trees(work, Some((pair.leaf(), &names)));
+    let main = Repo::new(Some(pair.leaf()), main_tree, bare, snapshot);
     let siblings = pair
         .siblings()
         .iter()
         .zip(commits)
-        .map(|(sibling, commit)| Repo::new(Some(sibling.name()), format!(r"{work}\{}", sibling.name()), sibling.bare(), commit))
+        .zip(sibling_trees)
+        .map(|((sibling, commit), tree)| Repo::new(Some(sibling.name()), tree, sibling.bare(), commit))
         .collect();
     Ok((main, siblings))
 }
@@ -456,7 +544,7 @@ impl<'a> RunOutputs<'a> {
 /// ended before it, its lines said. The heartbeat starts once the subfolder is checked and stops on every way out.
 fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, console: &mut Console) -> Result<u32, u32> {
     let lock = OutputLock::default();
-    let git = WorkGit::ready(request, &lock);
+    let git = WorkGit::ready(request.lock, &lock);
     git.clear_back_refs(request, console).map_err(|failed| {
         let status = said(console, &failed);
         no_back_commits(request, console);
@@ -547,11 +635,12 @@ fn checked_out(
 /// restored; else `Err` with the status the run ends on, its lines said. A refusal is said as such; any other end is
 /// followed, on a pair run, by the box's `gate: remote back commits: failed` line ([`ended_before`]).
 fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
-    let held = match git.lay_out(request, console) {
+    let held = match git.lay_out(&request.laid(), console) {
         Ok(held) => held,
         Err(NotLaidOut::Failed(failed)) => return Err(ended_before(said(console, &failed), request, beat, console)),
         Err(NotLaidOut::Refused(why)) => return Err(layout_refused(request, &why, beat, console)),
     };
+    inputs_matched(request, &held, beat, console)?;
     if let Err(failed) = git.checkout(request, console) {
         return Err(ended_before(said(console, &failed), request, beat, console));
     }
@@ -719,7 +808,7 @@ fn write_layout(record: &str, layout: &str) -> Result<(), NotLaidOut> {
 /// The work folder's lock: `path` opened for reading and writing, created when missing, shared with no one, never
 /// through a link, and only as a plain disk file. `None` when another process has it open; else the line saying why it
 /// could not be opened.
-fn take_lock(path: &str) -> Result<Option<File>, String> {
+pub(super) fn take_lock(path: &str) -> Result<Option<File>, String> {
     let opened = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1650,11 +1739,12 @@ struct WorkGit {
 }
 
 impl WorkGit {
-    /// Finds git, its output to be forwarded under `output`; called only once the run holds the lock.
-    fn ready(request: &Request<'_>, output: &OutputLock) -> WorkGit {
+    /// Finds git, its output to be forwarded under `output`; called only once the caller holds the work folder's lock
+    /// file `lock`.
+    fn ready(lock: &str, output: &OutputLock) -> WorkGit {
         WorkGit {
             git: Git::find(),
-            hooks: format!(r"core.hooksPath={}\hooks", request.lock),
+            hooks: format!(r"core.hooksPath={lock}\hooks"),
             output: Arc::clone(output),
         }
     }
@@ -1698,22 +1788,24 @@ impl WorkGit {
     /// readied ([`WorkGit::ready_trees`]) on a pair run, after a clear, or when the main tree's `.git`, `.git\objects`
     /// or `.git\objects\info` is missing or not a folder of its own, or its `.git\config` is there and not a file of
     /// its own, a link there leading git or the alternates file into another repository ([`preflight::git_is_plain`]);
-    /// and the run's layout recorded after a clear. A run of one repo in a work folder of that layout whose `.git` is
-    /// plain readies nothing here: the preflight readied its tree. The held folder, which the caller keeps through the
-    /// checkouts.
-    fn lay_out(&self, request: &Request<'_>, console: &mut Console) -> Result<File, NotLaidOut> {
-        let work = Path::new(request.work);
-        fs::create_dir_all(work).map_err(|error| NotLaidOut::Refused(format!("cannot create {}: {error}", request.work)))?;
-        let held = hold_folder(request.work).map_err(NotLaidOut::Refused)?;
-        let record = format!("{}.layout", request.work);
-        let layout = request.layout();
+    /// and the run's layout recorded after a clear. A clear removes the inputs record `{Work}.inputs` too, before the
+    /// work folder's children, so no record outlives the inputs it lists. A run of one repo in a work folder of that
+    /// layout whose `.git` is plain readies nothing here: the preflight readied its tree. The held folder, which the
+    /// caller keeps through the checkouts.
+    fn lay_out(&self, laid: &Laid<'_>, console: &mut Console) -> Result<File, NotLaidOut> {
+        let work = Path::new(laid.work);
+        fs::create_dir_all(work).map_err(|error| NotLaidOut::Refused(format!("cannot create {}: {error}", laid.work)))?;
+        let held = hold_folder(laid.work).map_err(NotLaidOut::Refused)?;
+        let record = format!("{}.layout", laid.work);
+        let layout = laid.layout();
         let changed = layout_changed(&record, &layout);
         if changed {
             write_layout(&record, LAYOUT_CHANGING)?;
+            removed(Path::new(&inputs::record_path(laid.work)))?;
             clear_work(work)?;
         }
-        if changed || !request.siblings.is_empty() || !preflight::git_is_plain(Path::new(&request.main.tree)) {
-            self.ready_trees(request, console)?;
+        if changed || !laid.siblings.is_empty() || !preflight::git_is_plain(Path::new(&laid.main.tree)) {
+            self.ready_trees(laid, console)?;
         }
         if changed {
             write_layout(&record, &layout)?;
@@ -1724,8 +1816,8 @@ impl WorkGit {
     /// Each repo's tree and its `.git` made folders of their own ([`plain_tree`]) and readied as the preflight readies
     /// a run of one repo's ([`preflight::ready_tree`]), under the lock, so a link at `.git\objects` or
     /// `.git\objects\info` is replaced by a folder too.
-    fn ready_trees(&self, request: &Request<'_>, console: &mut Console) -> Result<(), NotLaidOut> {
-        for repo in request.repos() {
+    fn ready_trees(&self, laid: &Laid<'_>, console: &mut Console) -> Result<(), NotLaidOut> {
+        for repo in laid.repos() {
             plain_tree(&repo.tree)?;
             preflight::ready_tree(self, &repo.bare, &repo.tree, repo.name.as_deref(), console).map_err(NotLaidOut::from)?;
         }

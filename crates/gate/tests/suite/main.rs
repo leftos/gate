@@ -29,6 +29,7 @@ mod nesting;
 mod pause;
 mod push;
 mod remote_client;
+mod remote_inputs;
 mod request;
 mod routing;
 mod slots;

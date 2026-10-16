@@ -22,14 +22,14 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo, GetFileInformationByHandle, SetFileInformationByHandle,
 };
 
-use super::RemoteCall;
 use super::client::{self, Attempt, Called, End, RawSink};
 use super::git::{FAILURE_BYTES, first_bytes};
 use super::install::{self, Fetched};
 use super::payload::Location;
 use super::syncback::Synced;
 use super::watchdog::Cut;
-use crate::boxside::payload::{archive_file_name, escaped};
+use super::{RemoteCall, Sibling};
+use crate::boxside::payload::{archive_file_name, escaped, trees};
 use crate::outputs::archive::final_path;
 use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
@@ -53,10 +53,10 @@ const STOPPED: &str = "the fetch was stopped by the watchdog";
 const PARTIAL: &str = "partial";
 /// `GENERIC_WRITE`, which lives in `Win32_Foundation`, a feature this crate does not enable: the access the archive
 /// file is made with, beside [`DELETE`] so a make it refuses can remove that file through the same handle.
-const GENERIC_WRITE: u32 = 0x4000_0000;
+pub(super) const GENERIC_WRITE: u32 = 0x4000_0000;
 /// `DELETE`, from `Win32_Foundation` too: the access that lets [`Archive::create`] remove a file it refuses through the
 /// handle it made it with, whatever its name now resolves to.
-const DELETE: u32 = 0x0001_0000;
+pub(super) const DELETE: u32 = 0x0001_0000;
 /// The most of an outputs cap record that is read: its one count fits many times over.
 const CAP_RECORD_BYTES: u64 = 4096;
 /// What an archive fetched whole and handed to the install is called when it cannot be removed.
@@ -142,7 +142,7 @@ impl Archive {
     /// nor its rename, so nothing can move the folder or remove it while the archive, and the stage the install makes
     /// beside it, are in it. The handle also says through the folder itself that it is a folder, not a link or a
     /// junction, and that its final path is the worktree's own `.tmp`. Else why it cannot be held.
-    fn hold(&mut self, folder: &Path) -> io::Result<()> {
+    pub(super) fn hold(&mut self, folder: &Path) -> io::Result<()> {
         if self.hold.is_some() {
             return Ok(());
         }
@@ -367,6 +367,27 @@ struct Kept<'k> {
     marker: &'k Path,
 }
 
+/// Each tree the box checked the run out in, as [`trees`] places it in the work folder of `location`, with the PC root
+/// it stands for: the main repo's tree with the worktree root, then each sibling's with the sibling's root, in the
+/// pair's order. A sibling's output is never brought back; its tree is here for a main repo's file that records it.
+///
+/// # Panics
+///
+/// When the location's pair names another number of siblings than the call carries: the location is built from the
+/// call's siblings, so that is a bug, and a sibling paired with no root would keep its box path unseen.
+fn box_trees<'a>(location: &Location, call: &RemoteCall<'a>) -> (String, Vec<(String, &'a str)>) {
+    let names: Vec<&str> = location.pair.iter().flat_map(|pair| pair.siblings.iter().map(String::as_str)).collect();
+    let (main, siblings) = trees(&location.work, location.pair.as_ref().map(|pair| (pair.leaf.as_str(), names.as_slice())));
+    assert_eq!(
+        siblings.len(),
+        call.siblings.len(),
+        "the run's Pair names {} siblings but the call carries {}",
+        siblings.len(),
+        call.siblings.len()
+    );
+    (main, siblings.into_iter().zip(call.siblings.iter().map(Sibling::root)).collect())
+}
+
 /// The outputs call of a passing run whose box packed an archive, `synced` its end so far: the archive the run's own
 /// key and nonce name, never the box's line, is fetched raw into the worktree's `.tmp` folder, which is held until this
 /// run's end. One fetched whole is installed, as [`install::installed`] says, through a stage folder beside it named
@@ -394,13 +415,15 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
                 End::Status(0) if called.cut.is_none() => {
                     // The fetch ended whole, under the cap: how the install ends no longer bears on the count.
                     uncapped(attempt);
+                    let (main_tree, sibling_trees) = box_trees(ran.location, attempt.call);
                     let fetched = Fetched {
                         archive: &archive,
                         stage: tmp.join(format!("{}-{}", attempt.call.key, ran.nonce)),
                         marker: kept.marker,
                         manifest: kept.files,
                         globs: kept.globs,
-                        box_work: &ran.location.work,
+                        main_tree,
+                        sibling_trees,
                         started,
                     };
                     install::installed(attempt, &fetched)
@@ -573,7 +596,13 @@ fn manifest_line(
 /// already opened. The stamp is taken before the hash, never after: a write during the hash then leaves the file refused
 /// by the install as changed during the run, where a stamp read after would pair the old hash with the new stamp and let
 /// the install replace the write.
-fn sha256_for(file: &Found, inside: &Path, cache: &HashCache, go_on: &dyn Fn() -> bool, stopped: &Cell<bool>) -> io::Result<(String, Stamp)> {
+pub(super) fn sha256_for(
+    file: &Found,
+    inside: &Path,
+    cache: &HashCache,
+    go_on: &dyn Fn() -> bool,
+    stopped: &Cell<bool>,
+) -> io::Result<(String, Stamp)> {
     asked(go_on, stopped)?;
     let Some(held) = cache.held(&file.path) else {
         return hashed(&file.full, inside, go_on, stopped);
@@ -779,7 +808,7 @@ mod tests {
 
     /// A scratch folder for one test, emptied first.
     fn scratch(name: &str) -> PathBuf {
-        let folder = std::env::temp_dir().join(format!("gate-remote-outputs-{}-{name}", std::process::id()));
+        let folder = crate::test_support::temp_dir().join(format!("gate-remote-outputs-{}-{name}", std::process::id()));
         // A folder left by an earlier run of the test may not be there.
         let _ = fs::remove_dir_all(&folder);
         fs::create_dir_all(&folder).expect("the scratch folder can be made");

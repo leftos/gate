@@ -443,7 +443,7 @@ fn the_remote_client_seams_need_a_value_once() {
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-interrupt-at", "push", "--", "cmd"]
         ))),
-        ["gate: --test-remote-interrupt-at must be preflight, run, outputs, install, sdks, stop, manifest or apply, got 'push'"]
+        ["gate: --test-remote-interrupt-at must be preflight, inputs, run, outputs, install, sdks, stop, manifest or apply, got 'push'"]
     );
 }
 
@@ -452,7 +452,7 @@ fn the_remote_client_seams_need_a_value_once() {
 fn the_remote_watch_seams_name_one_call_and_a_ceiling() {
     use crate::support::run_request;
 
-    for call in ["preflight", "push", "run", "ls-remote", "fetch", "outputs"] {
+    for call in ["preflight", "push", "inputs-diff", "inputs", "run", "ls-remote", "fetch", "outputs"] {
         let words = with(
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-watch-call", call, "--", "cmd"],
@@ -464,7 +464,7 @@ fn the_remote_watch_seams_name_one_call_and_a_ceiling() {
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-watch-call", "stop", "--", "cmd"]
         ))),
-        ["gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got 'stop'"]
+        ["gate: --test-remote-watch-call must be preflight, push, inputs-diff, inputs, run, ls-remote, fetch or outputs, got 'stop'"]
     );
     let words = with(
         &RUN,
@@ -548,6 +548,37 @@ fn the_outputs_budget_seam_takes_a_whole_number_of_bytes_above_0() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn the_inputs_budget_seam_takes_a_whole_number_of_bytes_above_0_once() {
+    use crate::support::run_request;
+
+    const FLAG: &str = "--test-remote-inputs-budget-bytes";
+    let transport = ["--test-remote-transport", "local:b"];
+    let words = with(&RUN, &[&transport[..], &[FLAG, "1048576", "--", "cmd"]].concat());
+    assert_eq!(run_request(&refs(&words)).test_seams.remote_inputs_budget_bytes, Some(1_048_576));
+    for (value, said) in [
+        ("0", format!("gate: {FLAG} must be a whole number above 0, got '0'")),
+        ("4GiB", format!("gate: {FLAG} must be a whole number above 0, got '4GiB'")),
+        (
+            "18446744073709551616",
+            format!("gate: {FLAG} must be at most 2147483647, got '18446744073709551616'"),
+        ),
+    ] {
+        let words = with(&RUN, &[&transport[..], &[FLAG, value, "--", "cmd"]].concat());
+        assert_eq!(problems(&refs(&words)), [said], "{value}");
+    }
+    let twice = with(&RUN, &[&transport[..], &[FLAG, "1", FLAG, "2", "--", "cmd"]].concat());
+    assert_eq!(problems(&refs(&twice)), [format!("gate: {FLAG} is given twice")]);
+    let empty = format!("{FLAG}=");
+    for missing in [&[FLAG][..], &[empty.as_str()][..]] {
+        let words = with(&RUN, &[&transport[..], missing, &["--", "cmd"]].concat());
+        assert_eq!(problems(&refs(&words)), [format!("gate: {FLAG} needs a value")], "{missing:?}");
+    }
+    let none = run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams;
+    assert_eq!(none.remote_inputs_budget_bytes, None, "none unless given");
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn the_log_cap_seam_takes_a_whole_number_of_bytes_above_0_once() {
     use crate::support::run_request;
 
@@ -575,6 +606,39 @@ fn the_log_cap_seam_takes_a_whole_number_of_bytes_above_0_once() {
     );
     let none = run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams;
     assert_eq!(none.remote_log_cap_bytes, None, "none unless given");
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_tamper_seam_names_one_point_and_step_and_needs_the_transport() {
+    use crate::support::run_request;
+
+    const FLAG: &str = "--test-remote-tamper";
+    for tamper in [
+        "before-hold:case",
+        "before-hold:replace",
+        "before-hold:replace-root",
+        "after-first-snapshot:worktree",
+    ] {
+        let words = with(&RUN, &["--test-remote-transport", "local:b", FLAG, tamper, "--", "cmd"]);
+        assert_eq!(run_request(&refs(&words)).test_seams.remote_tamper.as_deref(), Some(tamper));
+    }
+    assert_eq!(
+        problems(&refs(&with(
+            &RUN,
+            &["--test-remote-transport", "local:b", FLAG, "after-first-snapshot:case", "--", "cmd"]
+        ))),
+        [format!(
+            "gate: {FLAG} must be before-hold:case, before-hold:replace, before-hold:replace-root or \
+             after-first-snapshot:worktree, got 'after-first-snapshot:case'"
+        )]
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &[FLAG, "before-hold:case", "--", "cmd"]))),
+        [format!("gate: {FLAG} needs --test-remote-transport")]
+    );
+    let none = run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams;
+    assert_eq!(none.remote_tamper, None, "none unless given");
 }
 
 #[cfg(feature = "test-seams")]
@@ -647,6 +711,10 @@ fn the_remote_client_seams_that_conflict_are_refused() {
             "gate: --test-remote-outputs-budget-bytes needs --test-remote-transport",
         ),
         (
+            &["--test-remote-inputs-budget-bytes", "1048576"][..],
+            "gate: --test-remote-inputs-budget-bytes needs --test-remote-transport",
+        ),
+        (
             &["--test-remote-log-cap-bytes", "65536"][..],
             "gate: --test-remote-log-cap-bytes needs --test-remote-transport",
         ),
@@ -697,7 +765,7 @@ fn the_remote_timeout_seam_needs_a_watched_call_other_than_run() {
     }
     assert_eq!(
         problems(&refs(&given(&["--test-remote-watch-call", "stop", "--test-remote-timeout-ms", "300"]))),
-        ["gate: --test-remote-watch-call must be preflight, push, run, ls-remote, fetch or outputs, got 'stop'"],
+        ["gate: --test-remote-watch-call must be preflight, push, inputs-diff, inputs, run, ls-remote, fetch or outputs, got 'stop'"],
         "a refused watched call says its own problem alone"
     );
     let fetch = run_request(&refs(&given(&["--test-remote-watch-call", "fetch", "--test-remote-timeout-ms", "300"])));
@@ -819,7 +887,7 @@ fn the_bridge_seams_are_unknown_options() {
 }
 
 /// The one line a malformed `gate box` prints.
-const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight --stdin (the base64 JSON request as stdin's first line)";
+const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs --stdin (the base64 JSON request as stdin's first line)";
 
 #[cfg(feature = "test-seams")]
 #[test]
@@ -968,6 +1036,92 @@ fn box_seam_outputs_budget_bytes_refuses_what_the_run_seams_refuse() {
     for (words, want) in rows {
         assert_eq!(problems(words), want, "{words:?}");
     }
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_inputs_budget_bytes_is_read_before_the_verb() {
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    let budgeted = |inputs_budget_bytes| {
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Inputs,
+            seams: BoxSeams {
+                inputs_budget_bytes,
+                ..BoxSeams::default()
+            },
+        })
+    };
+    assert_eq!(
+        invocation(&["box", "--test-inputs-budget-bytes", "1024", "inputs", "--stdin"]),
+        budgeted(Some(1024))
+    );
+    assert_eq!(
+        invocation(&["box", "--test-inputs-budget-bytes=1024", "inputs", "--stdin"]),
+        budgeted(Some(1024))
+    );
+    assert_eq!(invocation(&["box", "inputs", "--stdin"]), budgeted(None), "no seam given, none set");
+    assert_eq!(
+        invocation(&["box", "--test-inputs-budget-bytes", "2147483647", "inputs", "--stdin"]),
+        budgeted(Some(2_147_483_647))
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_inputs_budget_bytes_refuses_what_the_outputs_budget_refuses() {
+    let rows: [(&[&str], &[&str]); 7] = [
+        (
+            &["box", "--test-inputs-budget-bytes", "--test-inputs-budget-bytes=2", "inputs", "--stdin"],
+            &[
+                "gate: --test-inputs-budget-bytes needs a value",
+                "gate: --test-inputs-budget-bytes is given twice",
+            ],
+        ),
+        (
+            &["box", "--test-inputs-budget-bytes=", "inputs", "--stdin"],
+            &["gate: --test-inputs-budget-bytes needs a value"],
+        ),
+        (
+            &["box", "--test-inputs-budget-bytes", "0", "inputs", "--stdin"],
+            &["gate: --test-inputs-budget-bytes must be a whole number above 0, got '0'"],
+        ),
+        (
+            &["box", "--test-inputs-budget-bytes", "fast", "inputs", "--stdin"],
+            &["gate: --test-inputs-budget-bytes must be a whole number above 0, got 'fast'"],
+        ),
+        (
+            &["box", "--test-inputs-budget-bytes", "2147483648", "inputs", "--stdin"],
+            &["gate: --test-inputs-budget-bytes must be at most 2147483647, got '2147483648'"],
+        ),
+        (
+            &[
+                "box",
+                "--test-inputs-budget-bytes",
+                "1",
+                "--test-inputs-budget-bytes=2",
+                "inputs",
+                "--stdin",
+            ],
+            &["gate: --test-inputs-budget-bytes is given twice"],
+        ),
+        (
+            &["box", "--test-inputs-budget-bytes"],
+            &["gate: --test-inputs-budget-bytes needs a value", BOX_USAGE],
+        ),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), want, "{words:?}");
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+#[test]
+fn box_seam_inputs_budget_bytes_is_an_unknown_word_without_the_feature() {
+    assert_eq!(problems(&["box", "--test-inputs-budget-bytes", "30", "inputs", "--stdin"]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-inputs-budget-bytes=30", "inputs", "--stdin"]), [BOX_USAGE]);
 }
 
 #[cfg(not(feature = "test-seams"))]
@@ -1386,6 +1540,7 @@ fn seam_flags_are_unknown_without_the_feature() {
         "--test-remote-fetch-cap-bytes",
         "--test-remote-apply-cap-bytes",
         "--test-remote-outputs-budget-bytes",
+        "--test-remote-inputs-budget-bytes",
         "--test-remote-log-cap-bytes",
         "--test-server-image",
         "--test-servers-under",

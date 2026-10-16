@@ -85,9 +85,20 @@ impl Manifest {
         self.files.insert(ordinal_upper(&path), (path, held));
     }
 
+    /// Drops the file at `path`, found without regard to case, when the manifest holds one.
+    pub(crate) fn remove(&mut self, path: &str) {
+        self.files.remove(&ordinal_upper(path));
+    }
+
     /// What the PC holds at `path`, found without regard to case.
     pub(crate) fn get(&self, path: &str) -> Option<&Held> {
         self.files.get(&ordinal_upper(path)).map(|(_, held)| held)
+    }
+
+    /// Each file of the manifest, its path as given and what the PC holds there, in the order of the paths' simple
+    /// uppercase.
+    pub(crate) fn files(&self) -> impl Iterator<Item = (&str, &Held)> {
+        self.files.values().map(|(path, held)| (path.as_str(), held))
     }
 
     /// The manifest's files by their SHA-256 ([`HeldBy`]), each path of `skip` left out, found without regard to case.
@@ -418,7 +429,7 @@ mod tests {
 
     #[test]
     fn a_manifest_built_from_a_walk_holds_each_files_stamp_and_hash() {
-        let root = std::env::temp_dir().join(format!("gate-manifest-{}-build", std::process::id()));
+        let root = crate::test_support::temp_dir().join(format!("gate-manifest-{}-build", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("bin")).expect("the folder can be made");
         fs::write(root.join("bin").join("ü.dll"), "abc").expect("the file can be written");

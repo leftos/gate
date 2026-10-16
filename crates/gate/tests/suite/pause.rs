@@ -10,9 +10,7 @@ use std::{process, thread};
 use gate_state::v1::{self, Ticket, TicketKind};
 use regex::Regex;
 
-use crate::support::{
-    Case, FAKE_TOOL, GATE, Outcome, Running, critical_words, events, heavy_words, run_words, shown, wait_for_journal_line, wait_until, write_counts,
-};
+use crate::support::{Case, FAKE_TOOL, GATE, Outcome, Running, critical_words, events, heavy_words, run_words, shown, wait_until, write_counts};
 
 /// The seam that keeps a wait's passes and its still-waiting lines close together.
 const POLL: [&str; 2] = ["--test-poll-ms", "20"];
@@ -193,7 +191,7 @@ fn a_child_waiting_behind_a_holding_critical_gate_keeps_a_pause_marker_until_it_
     let (go, critical) = holding_critical(&case);
     let critical_pid = critical.id();
 
-    // The parent runs on the one light slot, which the drain reserves: it lends its heavy child nothing, so the child
+    // The critical gate holds the machine, so the parent lends its heavy child nothing on its light slot, and the child
     // waits behind the critical request and keeps the marker.
     let parent = case.start(&parent_words("parent.log", &child_gate("child.log", &POLL)));
     let parent_pid = parent.id();
@@ -305,15 +303,25 @@ fn a_pause_marker_is_deleted_when_the_wait_is_interrupted() {
 fn a_pause_marker_is_deleted_when_the_child_is_lent_its_parents_slot() {
     let case = Case::new("a_pause_marker_is_deleted_when_the_child_is_lent_its_parents_slot");
     write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":1}"#);
-    let go = case.folder().join("go");
-    let go_word = shown(&go);
-    // A heavy holder keeps the critical request waiting, so the child has a barrier to write its marker behind.
-    let holder = case.start(&heavy_words("holder.log", &HOLDER, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
-    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, holder.id()));
-    let critical = case.start(&critical_words("critical.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
-    critical.wait_for_stderr("gate: waiting for the machine (critical)");
+    // A critical request of this test process that holds the machine: a parent lends nothing while one holds it, so
+    // the child waits behind it and keeps its marker.
+    let start = gate_win32::process_start_of(process::id())
+        .expect("this process's start can be read")
+        .expect("this process runs");
+    let start_ms = start.as_millisecond().unsigned_abs();
+    let mut request = Ticket {
+        kind: TicketKind::Critical,
+        arrived: 0,
+        pid: process::id(),
+        start_ms,
+        holds: true,
+        lends_closed: false,
+        remote: None,
+        expected: None,
+    };
+    let ticket = v1::ticket_path(&case.root(), process::id(), start_ms);
+    v1::write_ticket(&ticket, &request).expect("the critical ticket can be written");
 
-    // The parent's one light slot is a reserved one, so it lends the child nothing yet.
     let parent = case.start(&parent_words("parent.log", &child_gate("child.log", &POLL)));
     let parent_pid = parent.id();
     let parent_start = started(parent_pid).expect("the parent gate runs");
@@ -321,9 +329,10 @@ fn a_pause_marker_is_deleted_when_the_child_is_lent_its_parents_slot() {
         marker_of(&case, parent_pid, parent_start).is_some()
     });
 
-    // Raising the light count past that slot makes it an unreserved one, which the parent lends while the critical
-    // request drains.
-    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    // The request still drains once it no longer holds the machine, and the parent lends its slot, whichever index it
+    // is, while it does.
+    request.holds = false;
+    v1::write_ticket(&ticket, &request).expect("the critical ticket can be rewritten");
     wait_until("the pause marker gone as the child is lent its parent's slot", || {
         marker_of(&case, parent_pid, parent_start).is_none()
     });
@@ -333,10 +342,7 @@ fn a_pause_marker_is_deleted_when_the_child_is_lent_its_parents_slot() {
         child_stderr(&case, "parent.log").contains(&lent),
         "the child left the queue for its parent's slot"
     );
-
-    let_go(&go);
-    assert_passed(&holder.finish());
-    assert_passed(&critical.finish());
+    fs::remove_file(&ticket).expect("the critical ticket can be deleted");
 }
 
 #[test]
@@ -346,7 +352,7 @@ fn a_parent_whose_child_waits_behind_a_critical_request_is_not_stalled() {
     let (go, critical) = holding_critical(&case);
     let critical_pid = critical.id();
 
-    // The parent runs on the one light slot, which the drain reserves: it lends its heavy child nothing, so the child
+    // The critical gate holds the machine, so the parent lends its heavy child nothing on its light slot, and the child
     // waits behind the critical request and keeps its pause marker. Only that marker tells the parent's watchdog the
     // wait is progress, since the child's still-waiting line comes every 6 s, longer than the parent's 5 s window.
     let child = child_gate("child.log", &CHILD_WAIT);
@@ -390,7 +396,7 @@ fn a_covered_gate_whose_grandchild_waits_behind_a_critical_request_is_not_stalle
     let critical_pid = critical.id();
 
     // The light parent's slot covers the light gate it runs, which hands its own command the parent's marker: the heavy
-    // grandchild waits under the parent's reserved slot, and names its pause marker after the parent, not after the
+    // grandchild waits under the parent's light slot, and names its pause marker after the parent, not after the
     // covered gate whose watchdog this case is about.
     let mut covered = vec![GATE];
     covered.extend(run_words("covered.log", &PARENT_WATCH, &child_gate("grandchild.log", &CHILD_WAIT)));
@@ -504,6 +510,7 @@ fn a_covered_gate_is_not_paused_by_a_sibling_waiting_under_its_parent() {
         pid: sibling.0,
         start_ms: sibling.1,
         holds: false,
+        lends_closed: false,
         remote: None,
         expected: None,
     };

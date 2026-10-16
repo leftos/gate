@@ -30,10 +30,13 @@ const BRIDGE_MESSAGE: &str = "gate-remote bridge";
 pub(super) const REFS: &str = "refs/gate-remote/";
 pub(super) const BACK: &str = "-back";
 
-/// One worktree's snapshot commit and, when there was a previous snapshot, its bridge commit; both full shas.
+/// One worktree's snapshot commit and, when there was a previous snapshot, its bridge commit, both full shas; and the
+/// repository's object store, as the snapshot's `git rev-parse --git-path objects` named it, which the sync-back
+/// fetches beside.
 pub(crate) struct Snapshot {
     pub commit: String,
     pub bridge: Option<String>,
+    pub objects: PathBuf,
 }
 
 /// The snapshot of each of `roots`, in order, under the work-folder `key`, each git call ended after `limit` or by the
@@ -43,16 +46,102 @@ pub(crate) fn take(roots: &[PathBuf], key: &str, limit: Duration, interrupt: Opt
         return Ok(Vec::new());
     };
     let git = Git::find(first).map_err(GitError::Failed)?;
-    roots.iter().map(|root| take_one(&git, root, key, limit, interrupt)).collect()
+    roots.iter().map(|root| take_one(&git, root, &[], key, limit, interrupt)).collect()
+}
+
+/// A repository of a sibling pair as its git calls ask about it: its worktree's folder; the folder git's search for a
+/// repository stops at, `GIT_CEILING_DIRECTORIES`, the pair's parent folder, so git never reaches a repository above;
+/// and, once checked, where git found it, which every later call is given outright, so a `core.worktree`, a
+/// `commondir` or a `gitdir:` written after the check cannot point it elsewhere; `None` before the check.
+#[derive(Clone, Copy)]
+pub(crate) struct Bounded<'a> {
+    pub root: &'a Path,
+    pub ceiling: &'a Path,
+    pub place: Option<&'a Place>,
+}
+
+impl<'a> Bounded<'a> {
+    /// The variables every git call about the repository is given: the ceiling, and with a checked place its git
+    /// folder, its worktree, the root, and its common folder.
+    pub(crate) fn variables(&self) -> Vec<(&'a str, &'a OsStr)> {
+        let mut variables = vec![(CEILING, self.ceiling.as_os_str())];
+        if let Some(place) = self.place {
+            variables.extend([
+                ("GIT_DIR", OsStr::new(place.git_dir.as_str())),
+                ("GIT_WORK_TREE", self.root.as_os_str()),
+                ("GIT_COMMON_DIR", OsStr::new(place.common.as_str())),
+            ]);
+        }
+        variables
+    }
+}
+
+/// Where git finds a pair's repository: the top folder of its worktree, its git folder and its common git folder, each
+/// absolute, as git printed them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Place {
+    pub top: String,
+    pub git_dir: String,
+    pub common: String,
+}
+
+/// The variable naming the folder git's search for a repository stops at, which every git call about a pair's
+/// repository is given.
+pub(crate) const CEILING: &str = "GIT_CEILING_DIRECTORIES";
+
+/// The snapshot of the pair's repository `repo`, as [`take`] takes one, under the work-folder `key`.
+pub(crate) fn take_bounded(repo: Bounded<'_>, key: &str, limit: Duration, interrupt: Option<Interrupt>) -> Result<Snapshot, GitError> {
+    let git = Git::find(repo.root).map_err(GitError::Failed)?;
+    take_one(&git, repo.root, &repo.variables(), key, limit, interrupt)
+}
+
+/// Where git finds the pair's repository `repo`, searching from its root up to its ceiling and given no place, as one
+/// `git rev-parse --show-toplevel --path-format=absolute --absolute-git-dir --git-common-dir` prints it.
+pub(crate) fn place_of(repo: Bounded<'_>, limit: Duration, interrupt: Option<Interrupt>) -> Result<Place, GitError> {
+    let git = Git::find(repo.root).map_err(GitError::Failed)?;
+    let ceiling = [(CEILING, repo.ceiling.as_os_str())];
+    let calls = Calls {
+        git: &git,
+        root: repo.root,
+        bound: &ceiling,
+        limit,
+        interrupt,
+    };
+    let args = [
+        "rev-parse",
+        "--show-toplevel",
+        "--path-format=absolute",
+        "--absolute-git-dir",
+        "--git-common-dir",
+    ];
+    let printed = calls.output(&args, &[], &[])?;
+    let mut lines = printed.lines().map(str::trim_end);
+    match (lines.next(), lines.next(), lines.next(), lines.next()) {
+        (Some(top), Some(git_dir), Some(common), None) => Ok(Place {
+            top: top.to_owned(),
+            git_dir: git_dir.to_owned(),
+            common: common.to_owned(),
+        }),
+        _ => Err(GitError::Failed(format!(
+            "git {} did not print three paths: {}",
+            args.join(" "),
+            printed.trim()
+        ))),
+    }
 }
 
 /// Points `refs/gate-remote/<key>` at `commit` in the repository of `root`, once the builder has the snapshot, so the
-/// next bridge commit builds on it. git holds the ref's lock while it runs, so it is a [`git::Call::locked`] call,
-/// which no Ctrl+C ends: it ends on its own or after `limit`.
-pub(crate) fn save(root: &Path, key: &str, commit: &str, limit: Duration) -> Result<(), GitError> {
+/// next bridge commit builds on it, git given `bound`, a pair's repository's [`Bounded::variables`], none for a run
+/// of one. git holds the ref's lock while it runs, so it is a [`git::Call::locked`] call, which no Ctrl+C ends: it ends
+/// on its own or after `limit`.
+pub(crate) fn save(root: &Path, bound: &[(&str, &OsStr)], key: &str, commit: &str, limit: Duration) -> Result<(), GitError> {
     let git = Git::find(root).map_err(GitError::Failed)?;
     let args = ["update-ref", &format!("{REFS}{key}"), commit];
-    git.output(&git::Call::locked(root, &args, limit)).map(drop)
+    git.output(&git::Call {
+        set: bound,
+        ..git::Call::locked(root, &args, limit)
+    })
+    .map(drop)
 }
 
 /// The tree of the worktree at `root` as `git add -A` and `git write-tree` write it through a copy of its index: what
@@ -63,26 +152,41 @@ pub(super) fn worktree(root: &Path, limit: Duration, interrupt: Option<Interrupt
     worktree_tree(&Calls {
         git: &git,
         root,
+        bound: &[],
         limit,
         interrupt,
     })
+    .map(|(tree, _)| tree)
 }
 
-fn take_one(git: &Git, root: &Path, key: &str, limit: Duration, interrupt: Option<Interrupt>) -> Result<Snapshot, GitError> {
-    let calls = Calls { git, root, limit, interrupt };
+fn take_one(
+    git: &Git,
+    root: &Path,
+    bound: &[(&str, &OsStr)],
+    key: &str,
+    limit: Duration,
+    interrupt: Option<Interrupt>,
+) -> Result<Snapshot, GitError> {
+    let calls = Calls {
+        git,
+        root,
+        bound,
+        limit,
+        interrupt,
+    };
     let listing = calls.output(
         &["for-each-ref", "--sort=-committerdate", "--format=%(refname) %(objectname)", REFS],
         &[],
         &[],
     )?;
     let previous = previous(&listing, key);
-    let tree = worktree_tree(&calls)?;
+    let (tree, objects) = worktree_tree(&calls)?;
     let commit = calls.committed(&["commit-tree", "--no-gpg-sign", &tree, "-m", SNAPSHOT_MESSAGE])?;
     let bridge = match &previous {
         Some(parent) => Some(calls.committed(&["commit-tree", "--no-gpg-sign", &tree, "-p", parent, "-m", BRIDGE_MESSAGE])?),
         None => None,
     };
-    Ok(Snapshot { commit, bridge })
+    Ok(Snapshot { commit, bridge, objects })
 }
 
 /// The snapshot a bridge builds on, from `for-each-ref`'s `<ref> <sha>` lines, newest first: the key's own, else the
@@ -96,18 +200,22 @@ fn previous(listing: &str, key: &str) -> Option<String> {
         .map(|(_, sha)| (*sha).to_owned())
 }
 
-/// git asked about one worktree, with the limit and the interrupt every call of one snapshot shares.
+/// git asked about one worktree, with the variables of a pair's repository ([`Bounded::variables`]), the limit and the
+/// interrupt every call of one snapshot shares.
 struct Calls<'a> {
     git: &'a Git,
     root: &'a Path,
+    bound: &'a [(&'a str, &'a OsStr)],
     limit: Duration,
     interrupt: Option<Interrupt>,
 }
 
 impl Calls<'_> {
-    /// What git wrote on stdout for `args`, with `set` given and `unset` removed.
+    /// What git wrote on stdout for `args`, with `set` and the bound variables given and `unset` removed.
     fn output(&self, args: &[&str], set: &[(&str, &OsStr)], unset: &[&str]) -> Result<String, GitError> {
-        self.git.output(&self.call(args, set, unset))
+        let mut given = set.to_vec();
+        given.extend(self.bound.iter().copied());
+        self.git.output(&self.call(args, &given, unset))
     }
 
     /// The first line of what git wrote on stdout for `args`, with `set` given and `unset` removed.
@@ -142,26 +250,46 @@ fn first_line(args: &[&str], text: &str) -> Result<String, GitError> {
         .ok_or_else(|| GitError::Failed(format!("git {} printed nothing", args.join(" "))))
 }
 
-/// The tree of the worktree at `root`, written through a copy of its index, which is removed however the write ends.
-fn worktree_tree(calls: &Calls<'_>) -> Result<String, GitError> {
-    let (index, copy) = paths(calls, &copy_name(std::process::id()))?;
-    let tree = write_tree(calls, &index, &copy);
-    let removed = remove_leftovers(&copy);
+/// The tree of the worktree at `root`, written through a copy of its index, which is removed however the write ends,
+/// and the repository's object store.
+fn worktree_tree(calls: &Calls<'_>) -> Result<(String, PathBuf), GitError> {
+    let paths = paths(calls, &copy_name(std::process::id()))?;
+    let tree = write_tree(calls, &paths.index, &paths.copy);
+    let removed = remove_leftovers(&paths.copy);
     let tree = tree?;
-    removed.map(|()| tree)
+    removed.map(|()| (tree, paths.objects))
 }
 
-/// The index and the index copy of the worktree, as one `git rev-parse --git-path` call names them.
-fn paths(calls: &Calls<'_>, name: &str) -> Result<(PathBuf, PathBuf), GitError> {
-    let printed = calls.output(&["rev-parse", "--git-path", "index", "--git-path", name], &[], &[])?;
-    let mut lines = printed.lines();
-    match (lines.next(), lines.next()) {
-        (Some(index), Some(copy)) => Ok((git_path(calls.root, index.trim_end()), git_path(calls.root, copy.trim_end()))),
-        _ => Err(GitError::Failed(format!(
+/// The index, the index copy and the object store of the worktree's repository.
+struct GitPaths {
+    index: PathBuf,
+    copy: PathBuf,
+    objects: PathBuf,
+}
+
+/// The worktree's [`GitPaths`], as one `git rev-parse --git-path` call names them.
+fn paths(calls: &Calls<'_>, name: &str) -> Result<GitPaths, GitError> {
+    let printed = calls.output(
+        &["rev-parse", "--git-path", "index", "--git-path", name, "--git-path", "objects"],
+        &[],
+        &[],
+    )?;
+    let mut lines = printed.lines().map(str::trim_end);
+    let (Some(index), Some(copy)) = (lines.next(), lines.next()) else {
+        return Err(GitError::Failed(format!(
             "git rev-parse --git-path did not print both paths: {}",
             printed.trim()
-        ))),
-    }
+        )));
+    };
+    let objects = lines
+        .next()
+        .filter(|objects| !objects.is_empty())
+        .ok_or_else(|| GitError::Failed("git rev-parse --git-path objects printed nothing".to_owned()))?;
+    Ok(GitPaths {
+        index: git_path(calls.root, index),
+        copy: git_path(calls.root, copy),
+        objects: git_path(calls.root, objects),
+    })
 }
 
 /// `git add -A` and `git write-tree` on `copy`, a fresh copy of `index`; with no index, git starts from an empty one.
@@ -220,11 +348,11 @@ fn asked(root: &Path, args: &[&str]) -> Result<String, GitError> {
     git.output(&git::Call::plain(root, args, git::GIT_LIMIT))
 }
 
-/// A new git repository in the temporary folder for the test `name`, holding `a.txt`.
+/// A new git repository in the unit tests' temp folder for the test `name`, holding `a.txt`.
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test that cannot make its repository must fail loudly")]
 pub(super) fn repository(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("gate-snapshot-{name}-{}", std::process::id()));
+    let root = crate::test_support::temp_dir().join(format!("gate-snapshot-{name}-{}", std::process::id()));
     if root.exists() {
         fs::remove_dir_all(&root).expect("a repository left by an earlier run can be removed");
     }
@@ -241,10 +369,39 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::slice;
 
-    use super::{DATES, IDENTITY, asked, copy_name, git_path, lock_of, previous, repository, save, take, worktree};
+    use super::{Bounded, DATES, IDENTITY, asked, copy_name, git_path, lock_of, place_of, previous, repository, save, take, worktree};
     use crate::remote::git::{GIT_LIMIT, GitError};
 
     const OWN: &str = "app-1a2b3c4d";
+
+    /// A folder with no `.git` of its own inside another repository is no repository to a search bounded at its parent:
+    /// git fails, and never names the repository above.
+    #[test]
+    fn a_folder_with_no_git_inside_a_repository_is_not_found_above_its_ceiling() {
+        let outer = repository("ceiling");
+        let parent = outer.join("dev");
+        let folder = parent.join("lib");
+        fs::create_dir_all(&folder).expect("the folder can be made");
+        let bounded = Bounded {
+            root: &folder,
+            ceiling: &parent,
+            place: None,
+        };
+
+        let found = place_of(bounded, GIT_LIMIT, None);
+
+        let outer_shown = outer.to_string_lossy().replace('\\', "/");
+        fs::remove_dir_all(&outer).expect("the repository can be removed");
+        let failed = match &found {
+            Err(GitError::Failed(why)) => Some(why.replace('\\', "/")),
+            _ => None,
+        };
+        assert!(failed.is_some(), "git found a repository above the ceiling: {found:?}");
+        assert!(
+            failed.is_some_and(|why| !why.contains(&format!("{outer_shown}/.git"))),
+            "the repository above is not named: {found:?}"
+        );
+    }
 
     #[test]
     fn the_previous_snapshot_is_the_key_s_own_else_the_newest_that_is_no_back_ref() {
@@ -310,7 +467,7 @@ mod tests {
         let first = take(roots, OWN, GIT_LIMIT, None).expect("the first snapshot is made");
         assert_eq!(first.len(), 1, "one snapshot for one root");
         assert_eq!(first[0].bridge, None, "no snapshot before the first");
-        save(&root, OWN, &first[0].commit, GIT_LIMIT).expect("the ref is saved");
+        save(&root, &[], OWN, &first[0].commit, GIT_LIMIT).expect("the ref is saved");
         fs::write(root.join("a.txt"), "b\n").expect("a file can be changed");
 
         let second = take(roots, OWN, GIT_LIMIT, None).expect("the second snapshot is made");
@@ -343,6 +500,32 @@ mod tests {
         );
         fs::write(root.join("b.txt"), "c\n").expect("a file can be changed");
         assert_ne!(worktree(&root, GIT_LIMIT, None).expect("the tree is written again"), tree, "read afresh");
+        fs::remove_dir_all(&root).expect("the repository can be removed");
+    }
+
+    /// The snapshot names its repository's object store: the `.git\objects` of a plain repository, and the common
+    /// folder's `objects` for a worktree `git worktree add` made, which the sync-back fetches beside.
+    #[test]
+    fn the_snapshot_names_the_repository_s_object_store() {
+        let root = repository("objects");
+        let store = fs::canonicalize(root.join(".git").join("objects")).expect("the store is there");
+        let objects_of = |folder: &Path| {
+            let made = take(slice::from_ref(&folder.to_path_buf()), OWN, GIT_LIMIT, None).expect("the snapshot is made");
+            fs::canonicalize(&made[0].objects).expect("the named store is there")
+        };
+        assert_eq!(objects_of(&root), store, "a plain repository's own");
+
+        let ask = |args: &[&str]| asked(&root, args).expect("git answers");
+        ask(&["add", "-A"]);
+        ask(&["-c", "user.name=t", "-c", "user.email=t@localhost", "commit", "-q", "-m", "start"]);
+        let linked = root.with_file_name(format!("{}-linked", root.file_name().expect("a name").to_string_lossy()));
+        if linked.exists() {
+            fs::remove_dir_all(&linked).expect("an earlier run's worktree can be removed");
+        }
+        ask(&["worktree", "add", "-q", "--detach", &linked.to_string_lossy()]);
+
+        assert_eq!(objects_of(&linked), store, "a linked worktree's is the common folder's");
+        fs::remove_dir_all(&linked).expect("the worktree can be removed");
         fs::remove_dir_all(&root).expect("the repository can be removed");
     }
 

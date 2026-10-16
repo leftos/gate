@@ -39,6 +39,7 @@ fn v1_ticket(machine: &Machine, kind: TicketKind, pid: u32, arrived: &str) {
         pid,
         start_ms: ms(START),
         holds: false,
+        lends_closed: false,
         remote: None,
         expected: None,
     };

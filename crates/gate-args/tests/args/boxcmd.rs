@@ -1,4 +1,4 @@
-//! The hidden `gate box`: its six verbs, each followed by the literal `--stdin` (the request comes on stdin), and the one
+//! The hidden `gate box`: its seven verbs, each followed by the literal `--stdin` (the request comes on stdin), and the one
 //! usage line every other shape gets.
 
 use std::ffi::OsString;
@@ -7,7 +7,7 @@ use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation, USAGE};
 
 use crate::support::{invocation, os, problems, problems_of, unreadable_word};
 
-const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight --stdin (the base64 JSON request as stdin's first line)";
+const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs --stdin (the base64 JSON request as stdin's first line)";
 
 #[test]
 fn each_verb_parses_with_stdin() {
@@ -18,6 +18,7 @@ fn each_verb_parses_with_stdin() {
         ("boot", BoxVerb::Boot),
         ("outputs", BoxVerb::Outputs),
         ("inflight", BoxVerb::Inflight),
+        ("inputs", BoxVerb::Inputs),
     ] {
         assert_eq!(
             invocation(&["box", word, "--stdin"]),

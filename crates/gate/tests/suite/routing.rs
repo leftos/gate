@@ -15,8 +15,8 @@ use serde_json::{Value, json};
 use crate::nesting::{LOOK_OFTEN, end_parent, first_event, marked, orphaned_as, spawned, test_marker};
 
 use crate::support::{
-    Case, FAKE_TOOL, GATE, Junction, Outcome, Running, assert_in_order, beside, copy_tool, events, finish, git, git_init, heavy_words, nothing_back,
-    powershell_folder, record_path, release, run_words, shown, wait_for_journal_line, wait_until, write_counts, write_remote_json,
+    Case, DenyEntry, FAKE_TOOL, GATE, Go, Junction, Outcome, Running, assert_in_order, beside, copy_tool, events, finish, git, git_init, heavy_words,
+    nothing_back, powershell_folder, record_path, release, run_words, shown, wait_for_journal_line, wait_until, write_counts, write_remote_json,
 };
 
 pub(crate) const HOST: &str = "builder";
@@ -411,6 +411,214 @@ fn a_folder_that_holds_nothing_the_snapshot_sends_runs_here_saying_so() {
     assert_local(&events(&case), None);
 }
 
+/// A routed case holding a checkout of its own, `other`, whose repo the routing file routes too, so a gate started in
+/// `other` judges the case's own files outside its worktree.
+fn case_with_another_checkout(name: &str) -> Case {
+    let case = routed_case(name);
+    git(&case, &["init", "--quiet", "other"]);
+    let routing = json!({ "host": HOST, "repos": { repo(&case): ["*tool*"], repo_name("other"): ["*tool*"] } });
+    write_remote_json(&case, &routing.to_string());
+    case
+}
+
+/// The case's folder `name`, made, as a `--cd` value.
+fn cd_folder(case: &Case, name: &str) -> PathBuf {
+    let folder = case.folder().join(name);
+    fs::create_dir_all(&folder).expect("the --cd folder can be made");
+    folder
+}
+
+#[test]
+fn a_gate_given_cd_routes_as_a_gate_started_in_that_folder() {
+    let case = case_with_another_checkout("routing-cd");
+    let tool = word(&case, "tool.exe");
+    let here_log = log_path(&case, "here.log");
+    let here = finish(case.gate_in("other", &heavy_words_with_limit(&here_log, &[], &[&tool, "out", "ran here"])));
+    assert_eq!(here.code, Some(0), "{here:?}");
+    assert!(
+        here.stderr.contains(&format!("gate: not routed: {tool} is outside the worktree")),
+        "without --cd the case's files are outside the worktree: {here:?}"
+    );
+
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let folder = shown(&case.folder());
+    let routed_log = log_path(&case, "routed.log");
+    let routed = finish(case.gate_in(
+        "other",
+        &routed_words(&routed_log, &steps, &["--cd", &folder], &[&tool, "out", "ran here"]),
+    ));
+
+    assert_eq!(routed.code, Some(0), "{routed:?}");
+    assert!(!routed.stderr.contains("not routed"), "{routed:?}");
+    let call = recorded(&call);
+    assert_eq!((&call["repo"], &call["subfolder"]), (&json!(repo(&case)), &json!("")), "{call}");
+    let events = events(&case);
+    assert_eq!(names(&events[3..]), ["queue", "take", "release"], "{events:#?}");
+    assert!(events[3..].iter().all(has_remote_tag), "{events:#?}");
+}
+
+#[test]
+fn a_relative_log_is_read_against_the_caller_s_folder_not_the_cd_folder() {
+    let case = Case::new("cd-relative-log");
+    let there = cd_folder(&case, "there");
+    for folder in [case.folder(), there.clone()] {
+        fs::create_dir_all(folder.join(".tmp")).expect("a .tmp folder can be made");
+    }
+    let outcome = finish(case.gate(&run_words(".tmp/x.log", &["--cd", "there"], &[FAKE_TOOL, "out", "logged"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let log = fs::read_to_string(case.folder().join(".tmp").join("x.log")).expect("the log is under the caller's folder");
+    assert!(log.contains("logged"), "{log}");
+    assert!(!there.join(".tmp").join("x.log").exists(), "no log under the --cd folder");
+}
+
+#[test]
+fn a_local_run_given_cd_runs_its_command_in_that_folder() {
+    let case = Case::new("cd-local-run");
+    let there = cd_folder(&case, "there");
+    copy_tool(&case, r"there\tool.exe");
+    let outcome = finish(case.gate(&heavy_words_with_limit(
+        "out.log",
+        &["--local", "--cd", "there"],
+        &[r".\tool.exe", "write", "here.txt", "ran"],
+    )));
+
+    assert_eq!(outcome.code, Some(0), "the command was found in the --cd folder: {outcome:?}");
+    assert_eq!(
+        fs::read_to_string(there.join("here.txt")).expect("the command wrote in the --cd folder"),
+        "ran"
+    );
+    assert!(!case.folder().join("here.txt").exists(), "nothing written in the caller's folder");
+}
+
+/// The JSON file at `path`.
+fn json_file(path: &Path) -> Value {
+    serde_json::from_str(&fs::read_to_string(path).expect("the file can be read")).expect("the file is JSON")
+}
+
+#[test]
+fn a_cd_run_s_journal_and_claim_carry_the_cd_folder_as_cwd() {
+    let case = Case::new("cd-cwd-records");
+    let there = shown(&cd_folder(&case, "there"));
+    let go = Go(case.folder().join("go"));
+    let holder = case.start(&run_words("holder.log", &["--cd", "there"], &[FAKE_TOOL, "wait", &shown(go.path())]));
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, holder.id()));
+    let claimed = json_file(&case.root().join("slots").join("gate-light-slot-0.json"));
+    fs::write(go.path(), "").expect("the go file can be made");
+    let holder = holder.finish();
+
+    assert_eq!(holder.code, Some(0), "{holder:?}");
+    assert_eq!(claimed["cwd"], there, "{claimed}");
+    let events = events(&case);
+    assert_eq!(names(&events), ["queue", "take", "release"], "{events:#?}");
+    assert!(events.iter().all(|event| event["cwd"] == there), "{events:#?}");
+}
+
+#[test]
+fn a_relative_state_dir_is_read_against_the_caller_s_folder_with_cd() {
+    let case = Case::new("cd-relative-state-dir");
+    let there = cd_folder(&case, "there");
+    let words = run_words("out.log", &["--state-dir", "state", "--cd", "there"], &[FAKE_TOOL, "out", "hi"]);
+    let outcome = finish(case.gate_without_state_dir(&words));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        names(&events(&case)),
+        ["queue", "take", "release"],
+        "the journal is in the caller's state root"
+    );
+    assert!(!there.join("state").exists(), "no state root under the --cd folder");
+}
+
+#[test]
+fn a_routed_refusal_falls_back_in_the_cd_folder() {
+    let case = case_with_another_checkout("routing-cd-fallback");
+    let steps = shown(&stub(&case, &["refuse busy"]));
+    let folder = shown(&case.folder());
+    let log = log_path(&case, "fallback.log");
+    let outcome = finish(case.gate_in(
+        "other",
+        &routed_words(&log, &steps, &["--cd", &folder], &[r".\tool.exe", "write", "here.txt", "ran"]),
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(BUSY_LINE), "{outcome:?}");
+    assert_eq!(
+        fs::read_to_string(case.folder().join("here.txt")).expect("the fallback ran in the --cd folder"),
+        "ran"
+    );
+    assert!(
+        !case.folder().join("other").join("here.txt").exists(),
+        "nothing written where the gate started"
+    );
+}
+
+#[test]
+fn a_cd_into_a_folder_the_user_cannot_enter_names_the_os_error() {
+    let case = Case::new("cd-cannot-enter");
+    let there = cd_folder(&case, "there");
+    let denied = DenyEntry::new(&there, "(X)");
+    let outcome = finish(case.gate(&heavy_words_with_limit("refused.log", &["--cd", "there"], &[FAKE_TOOL, "out", "ran"])));
+    drop(denied);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert!(outcome.stderr.starts_with("gate: cannot run in --cd there: "), "{outcome:?}");
+    assert_eq!(outcome.stderr.lines().count(), 1, "the line alone: {outcome:?}");
+    assert_eq!(case.root_entries(), Vec::<String>::new(), "no claim, ticket or journal line");
+}
+
+#[test]
+fn a_cd_given_as_cd_names_the_flag_as_given() {
+    let case = Case::new("cd-compat-spelling");
+    let words = [
+        "-Log",
+        "out.log",
+        "-TimeoutSeconds",
+        "60",
+        "-Slot",
+        "light",
+        "-Cd",
+        "missing",
+        "--",
+        FAKE_TOOL,
+        "out",
+        "ran",
+    ];
+    let outcome = finish(case.gate(&words));
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stderr, "gate: -Cd missing is not a folder\n");
+}
+
+#[test]
+fn a_cd_to_a_unc_or_device_path_is_refused_before_any_check() {
+    let case = Case::new("cd-not-on-a-drive");
+    let verbatim = format!(r"\\?\{}", shown(&case.folder()));
+    for value in [r"\\localhost\c$\x", verbatim.as_str(), r"\\.\C:\"] {
+        let outcome = finish(case.gate(&heavy_words_with_limit("refused.log", &["--cd", value], &[FAKE_TOOL, "out", "ran"])));
+
+        assert_eq!(outcome.code, Some(2), "{value}: {outcome:?}");
+        assert_eq!(outcome.stderr, format!("gate: --cd {value} is not a folder on a drive\n"), "{value}");
+    }
+    assert_eq!(case.root_entries(), Vec::<String>::new(), "no claim, ticket or journal line");
+}
+
+#[test]
+fn a_cd_that_is_not_a_folder_is_refused_before_any_slot() {
+    let case = Case::new("cd-not-a-folder");
+    fs::write(case.folder().join("a-file.txt"), "a\n").expect("a file can be written");
+    for value in ["missing", "a-file.txt"] {
+        let outcome = finish(case.gate(&heavy_words_with_limit("refused.log", &["--cd", value], &[FAKE_TOOL, "out", "ran"])));
+
+        assert_eq!(outcome.code, Some(2), "{value}: {outcome:?}");
+        assert_eq!(outcome.stderr, format!("gate: --cd {value} is not a folder\n"), "{value}");
+        assert!(!outcome.stdout.contains("ran"), "{value}: {outcome:?}");
+    }
+    assert!(!case.folder().join("refused.log").exists(), "no log was opened");
+    assert_eq!(case.root_entries(), Vec::<String>::new(), "no claim, ticket or journal line");
+}
+
 /// Declares in the case's `.gate/siblings.toml` one sibling, named for the case folder so no other case shares it, and
 /// allows it in the routing file; its name and the folder it would be, beside the case folder.
 fn declare_sibling(case: &Case) -> (String, PathBuf) {
@@ -511,8 +719,12 @@ fn the_routed_call_carries_the_leaf_and_the_allowed_siblings() {
     let alone_call = recorded(&alone_call);
     assert_eq!((&alone_call["leaf"], &alone_call["siblings"]), (&json!(leaf), &json!([])), "{alone_call}");
 
+    let alone_root_id = alone_call["rootId"].as_str().expect("the call carries the root's id");
+    assert_eq!(alone_root_id.len(), 16 + 1 + 32, "the volume serial and the file id: {alone_root_id}");
+
     let call = recorded(&call);
     assert_eq!(call["leaf"], json!(leaf), "{call}");
+    assert_eq!(call["rootId"].as_str(), Some(alone_root_id), "the root's id is read once a route: {call}");
     let root = call["root"].as_str().expect("the call has a root");
     let sibling_root = format!("{}/{name}", root.rsplit_once('/').expect("the root has a parent").0);
     let siblings = call["siblings"].as_array().expect("the call has siblings");
@@ -787,6 +999,24 @@ fn the_client_is_called_with_the_rewritten_words_and_the_route() {
 }
 
 #[test]
+fn the_client_is_called_with_the_repo_s_inputs() {
+    let case = routed_case("routing-call-inputs");
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["*tool*"] },
+        "inputs": { repo(&case): [".tmp/helper/**", "keys.json"] },
+    });
+    write_remote_json(&case, &routing.to_string());
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "argv", "a"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let call = recorded(&call);
+    assert_eq!(call["inputs"], json!([".tmp/helper/**", "keys.json"]), "{call}");
+}
+
+#[test]
 fn a_failing_client_status_is_the_gates_and_the_log_is_scanned() {
     let case = routed_case("routing-failing");
     let failing = shown(&stub(&case, &["err error CS1002: x", "status 1"]));
@@ -918,7 +1148,7 @@ fn a_refused_run_falls_back_to_a_local_run_with_the_attempts_lines_in_the_log() 
 #[test]
 fn every_refusal_reason_names_itself_in_the_line_and_the_journal() {
     let case = routed_case("routing-reasons");
-    let reasons = ["busy", "unreachable", "parity", "tools", "rebooted", "layout"];
+    let reasons = ["busy", "unreachable", "parity", "tools", "rebooted", "layout", "inputs"];
     for reason in reasons {
         let steps = shown(&stub(&case, &[&format!("refuse {reason}")]));
         let log = format!("{reason}.log");
