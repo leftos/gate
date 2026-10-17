@@ -1316,7 +1316,17 @@ fn a_refused_run_falls_back_to_a_local_run_with_the_attempts_lines_in_the_log() 
 #[test]
 fn every_refusal_reason_names_itself_in_the_line_and_the_journal() {
     let case = routed_case("routing-reasons");
-    let reasons = ["busy", "unreachable", "parity", "tools", "rebooted", "layout", "inputs", "cold"];
+    let reasons = [
+        "busy",
+        "unreachable",
+        "parity",
+        "tools",
+        "rebooted",
+        "layout",
+        "inputs",
+        "cold",
+        "desktop",
+    ];
     for reason in reasons {
         let steps = shown(&stub(&case, &[&format!("refuse {reason}")]));
         let log = format!("{reason}.log");

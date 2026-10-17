@@ -245,6 +245,8 @@ pub enum FallbackReason {
     Inputs,
     /// The builder's work folder was not warm for the run's warm-up file.
     Cold,
+    /// The builder could not give the run its desktop.
+    Desktop,
 }
 
 impl FallbackReason {
@@ -263,6 +265,7 @@ impl FallbackReason {
             FallbackReason::Client => "client",
             FallbackReason::Inputs => "inputs",
             FallbackReason::Cold => "cold",
+            FallbackReason::Desktop => "desktop",
         }
     }
 }

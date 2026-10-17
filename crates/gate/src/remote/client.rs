@@ -4018,7 +4018,7 @@ enum Protocol {
     Adjusted(f64),
 }
 
-/// The start marker, the four refusal tags, the two kill tags and the adjusted line's prefix of one run, made once for
+/// The start marker, the five refusal tags, the two kill tags and the adjusted line's prefix of one run, made once for
 /// its run call's readers.
 struct ProtocolLines {
     started: String,
@@ -4026,6 +4026,7 @@ struct ProtocolLines {
     tools: String,
     layout: String,
     inputs: String,
+    desktop: String,
     timed_out: String,
     backstop: String,
     adjusted: String,
@@ -4040,6 +4041,7 @@ impl ProtocolLines {
             tools: refused_line(nonce, Refusal::Tools),
             layout: refused_line(nonce, Refusal::Layout),
             inputs: refused_line(nonce, Refusal::Inputs),
+            desktop: refused_line(nonce, Refusal::Desktop),
             timed_out: killed_line(nonce, BoxKill::TimedOut),
             backstop: killed_line(nonce, BoxKill::Backstop),
             adjusted: adjusted_prefix(nonce),
@@ -4056,6 +4058,7 @@ impl ProtocolLines {
             (&self.tools, Protocol::Refused(FallbackReason::Tools)),
             (&self.layout, Protocol::Refused(FallbackReason::Layout)),
             (&self.inputs, Protocol::Refused(FallbackReason::Inputs)),
+            (&self.desktop, Protocol::Refused(FallbackReason::Desktop)),
             (&self.timed_out, Protocol::Killed(BoxKill::TimedOut)),
             (&self.backstop, Protocol::Killed(BoxKill::Backstop)),
         ]
@@ -6189,6 +6192,15 @@ mod tests {
     #[test]
     fn refused_line_names_desktop() {
         assert_eq!(refused_line(NONCE, Refusal::Desktop), format!("gate-remote-refused: {NONCE} desktop"));
+    }
+
+    #[test]
+    fn a_desktop_refusal_ends_the_run_refused_for_the_desktop() {
+        let tag = refused_line(NONCE, Refusal::Desktop);
+        let (called, said) = run_call_said("", &format!("{tag}\n"), "desktop-refusal");
+
+        assert_eq!(called.refusal(), Some(FallbackReason::Desktop), "{said:?}");
+        assert!(matches!(status_end(&called, 0..0), End::Refused(FallbackReason::Desktop)), "{said:?}");
     }
 
     #[test]

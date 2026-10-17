@@ -575,7 +575,7 @@ mod scripted {
     /// How often `wait` looks for its path and the interrupt.
     const WAIT_STEP: Duration = Duration::from_millis(20);
     /// Every reason a `refuse` step may give.
-    const REASONS: [FallbackReason; 11] = [
+    const REASONS: [FallbackReason; 12] = [
         FallbackReason::Full,
         FallbackReason::Busy,
         FallbackReason::Unreachable,
@@ -587,6 +587,7 @@ mod scripted {
         FallbackReason::Client,
         FallbackReason::Inputs,
         FallbackReason::Cold,
+        FallbackReason::Desktop,
     ];
 
     #[derive(Debug, PartialEq)]
