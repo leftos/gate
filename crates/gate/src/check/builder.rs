@@ -306,6 +306,7 @@ impl Answer<'_> {
             unreadable: declared.unreadable(false),
             problems: declared.problems,
             tools,
+            godot: declared.godot,
             sdk,
             workloads: declared.manifest.workloads,
             consent_problem: None,
@@ -348,7 +349,7 @@ mod tests {
     use crate::check::report::{At, Checked, Line, Sdk, said};
     use crate::remote::git::GitError;
     use crate::remote::parity::pin_of;
-    use crate::remote::toolchain::{self, Manifest, Reported, ToolNeed, Version};
+    use crate::remote::toolchain::{self, Manifest, Pin, Reported, ToolNeed, Version};
     use crate::version::build_version;
 
     const HOST: &str = "builder-1";
@@ -373,6 +374,7 @@ mod tests {
                 tools,
                 ..Manifest::default()
             },
+            godot: None,
             pin: pin.map(|version| pin_of(Some(&format!(r#"{{"sdk": {{"version": "{version}"}}}}"#)))),
             problems: Vec::new(),
             toolchain_unreadable: false,
@@ -421,6 +423,41 @@ mod tests {
                 ("ffmpeg", &Reported::Missing),
             ]
         );
+    }
+
+    /// A builder's godot is judged against the manifest's exact pin, as a routed run judges it: another version is
+    /// missing, and a builder that gives no answer is missing for its text.
+    #[test]
+    fn a_pinned_godot_on_a_builder_is_missing_when_it_does_not_serve_the_pin() {
+        let Some(pin) = Pin::parse("4.7.2") else {
+            unreachable!("4.7.2 is a pin");
+        };
+        let mut serving = declared(vec![need("godot", "4.7.2")], None);
+        serving.godot = Some(vec![pin]);
+        let answer = lines(&["gate: remote tool godot 4.7.3"]);
+        let other = checked(serving, &["godot"], &answer, None);
+        assert_eq!(
+            said(AT, &other).lines,
+            [
+                Line::Out("check: builder-1: app (work folder app-1a2b3c4d)".to_owned()),
+                Line::Out("check: builder-1: godot missing (needs 4.7.2 exactly: 4.7.3)".to_owned()),
+                Line::Out("check: builder-1: 1 missing, 0 too old".to_owned()),
+            ]
+        );
+        assert_eq!(said(AT, &other).status, 1);
+
+        let mut silent = declared(vec![need("godot", "4.7.2")], None);
+        silent.godot = Some(vec![pin]);
+        let quiet = checked(silent, &["godot"], &lines(&[]), None);
+        assert_eq!(
+            said(AT, &quiet).lines,
+            [
+                Line::Out("check: builder-1: app (work folder app-1a2b3c4d)".to_owned()),
+                Line::Out("check: builder-1: godot missing (needs 4.7.2 exactly: not probed (the builder gave no answer))".to_owned()),
+                Line::Out("check: builder-1: 1 missing, 0 too old".to_owned()),
+            ]
+        );
+        assert_eq!(said(AT, &quiet).status, 1);
     }
 
     #[test]

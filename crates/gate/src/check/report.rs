@@ -10,7 +10,7 @@ use gate_router::{SiblingFolder, spelled};
 
 use crate::answer::FAILED_STATUS;
 use crate::boxside::payload::escaped;
-use crate::remote::toolchain::{Reported, Standing, ToolNeed, Version, standing};
+use crate::remote::toolchain::{Pin, Pinned, Reported, Standing, ToolNeed, Version, pinned, standing};
 
 /// Where the check looked: this PC, or the builder `host`, whose work folder for the repo is `key`.
 #[derive(Clone, Copy, Debug)]
@@ -106,6 +106,10 @@ pub(crate) struct Checked {
     pub problems: Vec<Problem>,
     /// The manifest's tools, in manifest order.
     pub tools: Vec<Tool>,
+    /// The exact Godot versions the repo requires, as [`toolchain::godot_required`](crate::remote::toolchain::godot_required)
+    /// reads them: empty for any version,
+    /// `None` when the manifest names no godot. The `godot` tool is judged by them, as a routed run is.
+    pub godot: Option<Vec<Pin>>,
     /// The SDK pin's check; `None` when the root has no `global.json`.
     pub sdk: Option<Sdk>,
     /// The manifest's workload ids, which the check lists without checking them.
@@ -214,7 +218,7 @@ pub(crate) fn said(place: At<'_>, checked: &Checked) -> Said {
 
 /// Every item of `checked`, found `at` this PC or a builder, in the order the lines say them.
 fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
-    let mut items: Vec<Item> = checked.tools.iter().map(|tool| tool_item(at, tool)).collect();
+    let mut items: Vec<Item> = checked.tools.iter().map(|tool| tool_item(at, checked.godot.as_deref(), tool)).collect();
     items.extend(checked.sdk.as_ref().map(|sdk| sdk_item(at, sdk)));
     if !checked.workloads.is_empty() {
         let ids: Vec<String> = checked.workloads.iter().map(|id| one_line(id)).collect();
@@ -256,8 +260,9 @@ fn counts(missing: usize, too_old: usize, skipped: usize) -> String {
     }
 }
 
-/// The line of a manifest tool as its probe found it `at` this PC or a builder, against its minimum.
-fn tool_item(at: At<'_>, tool: &Tool) -> Item {
+/// The line of a manifest tool as its probe found it `at` this PC or a builder, against its minimum, or against the
+/// exact Godot versions `godot` the repo requires when it names godot.
+fn tool_item(at: At<'_>, godot: Option<&[Pin]>, tool: &Tool) -> Item {
     let name = one_line(&tool.need.name);
     if !tool.need.known {
         return Item::new(format!("tools.{name} skipped: not a tool gate knows"), Kind::Skipped);
@@ -271,6 +276,9 @@ fn tool_item(at: At<'_>, tool: &Tool) -> Item {
         };
         command.map(|command| (name.clone(), command))
     };
+    if let Some(pins) = godot.filter(|pins| tool.need.name == "godot" && !pins.is_empty()) {
+        return pinned_item(&name, pins, &tool.reported, &hint);
+    }
     let reported = &tool.reported;
     match (standing(min, reported), reported) {
         (Standing::Met, Reported::Version(found)) if min.is_some() => Item::new(format!("{name} {} ok ({needs})", escaped(found)), Kind::Ok),
@@ -281,6 +289,29 @@ fn tool_item(at: At<'_>, tool: &Tool) -> Item {
         (Standing::Missing, _) => Item::hinted(format!("{name} missing ({needs})"), Kind::Missing, hint(Kind::Missing)),
         (Standing::Skipped(why), _) => Item::new(format!("{name} skipped: {}", escaped(&why)), Kind::Skipped),
     }
+}
+
+/// The line of the manifest `godot` `name` against the exact versions `pins` the repo requires, as a routed run judges
+/// the same answer: met, or missing saying what the probe found of the pin, with the same hint a missing tool has.
+fn pinned_item(name: &str, pins: &[Pin], reported: &Reported, hint: &impl Fn(Kind) -> Option<(String, String)>) -> Item {
+    let needs = format!("needs {} exactly", pins_text(pins));
+    match pinned(pins, reported) {
+        Pinned::Met => match reported {
+            Reported::Version(found) => Item::new(format!("{name} {} ok ({needs})", escaped(found)), Kind::Ok),
+            _ => Item::new(format!("{name} ok (version not readable)"), Kind::Ok),
+        },
+        Pinned::Lacks(what) => Item::hinted(
+            format!("{name} missing ({needs}: {})", escaped(&what)),
+            Kind::Missing,
+            hint(Kind::Missing),
+        ),
+        Pinned::Skipped(why) => Item::new(format!("{name} skipped: {}", escaped(&why)), Kind::Skipped),
+    }
+}
+
+/// The pins `pins` as the lines say them, their texts joined by ` and `.
+fn pins_text(pins: &[Pin]) -> String {
+    pins.iter().map(ToString::to_string).collect::<Vec<String>>().join(" and ")
 }
 
 /// The command that installs the tool `name` on this PC, `kind` saying whether it is missing or too old, its minimum
@@ -378,7 +409,7 @@ mod tests {
     use gate_router::{FolderId, SiblingFolder};
 
     use crate::boxside::probe::Probed;
-    use crate::remote::toolchain::{Reported, ToolNeed, Version};
+    use crate::remote::toolchain::{Pin, Reported, ToolNeed, Version};
 
     fn need(name: &str, min: Option<&str>) -> ToolNeed {
         ToolNeed {
@@ -411,6 +442,7 @@ mod tests {
             unreadable: Vec::new(),
             problems: Vec::new(),
             tools,
+            godot: None,
             sdk: None,
             workloads: Vec::new(),
             consent_problem: None,
@@ -626,6 +658,49 @@ mod tests {
         );
         assert_eq!(summary(&checked), "check: here: nothing missing (2 skipped)");
         assert_eq!(said(HERE, &checked).status, 0);
+    }
+
+    /// A pinned godot the probe found at another version is missing, as a routed run judges the pin exact on the parts
+    /// it gives, though the check's generic rule would read the found version as past a minimum.
+    #[test]
+    fn a_pinned_godot_at_another_version_is_missing() {
+        let Some(pin) = Pin::parse("4.7.2") else {
+            unreachable!("4.7.2 is a pin");
+        };
+        let checked = Checked {
+            godot: Some(vec![pin]),
+            ..checked(vec![tool("godot", Some("4.7.2"), found("4.7.3"))])
+        };
+        assert_eq!(body(&checked), ["check: here: godot missing (needs 4.7.2 exactly: 4.7.3)"]);
+        assert_eq!(summary(&checked), "check: here: 1 missing, 0 too old");
+        assert_eq!(said(HERE, &checked).status, 1);
+    }
+
+    /// A pinned godot the probe found at the pin's version is ok, whatever else its version list holds, and a partial
+    /// pin is met by any install on the parts it gives.
+    #[test]
+    fn a_pinned_godot_met_is_ok() {
+        let Some(pin) = Pin::parse("4.7.2") else {
+            unreachable!("4.7.2 is a pin");
+        };
+        let met = Checked {
+            godot: Some(vec![pin]),
+            ..checked(vec![tool("godot", Some("4.7.2"), found("4.3.0,4.7.2"))])
+        };
+        assert_eq!(body(&met), ["check: here: godot 4.3.0,4.7.2 ok (needs 4.7.2 exactly)"]);
+        assert_eq!(summary(&met), "check: here: nothing missing");
+        assert_eq!(said(HERE, &met).status, 0);
+
+        let Some(pin) = Pin::parse("4.5") else {
+            unreachable!("4.5 is a pin");
+        };
+        let partial = Checked {
+            godot: Some(vec![pin]),
+            ..checked(vec![tool("godot", Some("4.5"), found("4.5.3"))])
+        };
+        assert_eq!(body(&partial), ["check: here: godot 4.5.3 ok (needs 4.5 exactly)"]);
+        assert_eq!(summary(&partial), "check: here: nothing missing");
+        assert_eq!(said(HERE, &partial).status, 0);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::boxside::probe;
 use crate::check::report::{self, Checked, Found, Problem, Sdk, Sibling, Tool};
 use crate::console::Console;
 use crate::environment::Variables;
-use crate::remote::toolchain::{self, Manifest, Reported, ToolNeed};
+use crate::remote::toolchain::{self, Manifest, Pin, Reported, ToolNeed};
 use crate::remote::{git, local_sdk_listing, outside_worktree, parity, siblings};
 use crate::route::{self, PLACE_ARGS, read_place};
 
@@ -70,6 +70,9 @@ pub(super) struct Declared {
     pub declares_toolchain: bool,
     /// The manifest as it reads, empty when there is none or it cannot be read; its problems are in `problems`.
     pub manifest: Manifest,
+    /// The exact Godot versions the manifest requires, as [`toolchain::godot_required`] reads them: empty for any
+    /// version, `None` when it names no godot.
+    pub godot: Option<Vec<Pin>>,
     pub pin: Option<parity::Pin>,
     pub problems: Vec<Problem>,
     /// Whether the manifest is there but cannot be read whole.
@@ -114,6 +117,7 @@ pub(super) fn declared(root: &Path) -> Declared {
         file: report::TOOLCHAIN,
         text,
     }));
+    let godot = toolchain::godot_required(Some(&Ok(manifest.clone())), &[]);
     let (pin, pin_problem) = read_pin(root);
     let pin_unreadable = pin_problem.is_some();
     if let Some(text) = pin_problem {
@@ -125,6 +129,7 @@ pub(super) fn declared(root: &Path) -> Declared {
     Declared {
         declares_toolchain,
         manifest,
+        godot,
         pin,
         problems,
         toolchain_unreadable,
@@ -174,6 +179,7 @@ fn checked(place: &Place, limit: Duration) -> Checked {
         unreadable: declared.unreadable(siblings_unreadable),
         problems: declared.problems,
         tools,
+        godot: declared.godot,
         sdk,
         workloads: declared.manifest.workloads,
         consent_problem,
