@@ -1129,10 +1129,10 @@ pub(super) fn full_path(path: &Path) -> Option<PathBuf> {
 /// over it ([`Variables::with_caller`]) and then the build-server settings of its run
 /// ([`Variables::with_build_servers`]), replacing any value the box inherited (the caller can give none of them): the
 /// compiler server's pipe and `MSBuild`'s node handshake are named by the run id `gate-box-<Nonce>`, so no other run's
-/// command, on the box or on the PC, uses the servers this one starts, and the `MSBuild` server and node reuse are off. Git's `safe.directory` is
-/// set to `*` over that ([`with_safe_directory`]), and the Event Log logging provider of a .NET host the command starts
-/// is turned off over that ([`with_event_log_off`]). The command runs with a restricted copy of the box's token
-/// ([`restricted_token`]).
+/// command, on the box or on the PC, uses the servers this one starts, and the `MSBuild` server, the compiler server and
+/// node reuse are off. Git's `safe.directory` is set to `*` over that ([`with_safe_directory`]), and the Event Log
+/// logging provider of a .NET host the command starts is turned off over that ([`with_event_log_off`]). The command runs
+/// with a restricted copy of the box's token ([`restricted_token`]).
 fn command(request: &Request<'_>, one: &One<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<Ran, u32> {
     let run = format!("gate-box-{}", request.nonce);
     let variables = command_variables(&request.env, &run);

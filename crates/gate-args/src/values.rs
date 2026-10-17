@@ -332,7 +332,7 @@ pub fn shown_name(name: &str) -> String {
 pub enum EnvRefusal {
     /// The name holds a character outside the ASCII set a name may hold ([`name_characters`]).
     MalformedName,
-    /// The value holds a NUL, a CR or an LF.
+    /// The value holds a NUL.
     MalformedValue,
     /// A name the gate sets on every command it starts.
     GateSets,

@@ -22,8 +22,6 @@ impl Default for Forward {
     }
 }
 
-impl Forward {}
-
 /// An option that takes a value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ValueOption {
@@ -690,15 +688,27 @@ fn is_print_request(_option: RunOption) -> bool {
     false
 }
 
-/// The next gate word that is valid Unicode, each unreadable word before it reported in `problems`.
-pub(crate) fn next_text(words: &mut impl Iterator<Item = OsString>, problems: &mut Vec<Problem>) -> Option<String> {
+/// The next gate word that is valid Unicode, each unreadable word before it reported in `builder`'s problems. An inline
+/// `--env` word is refused by its position, as the two-word form is, and counts as an `--env` word.
+pub(crate) fn next_text(words: &mut impl Iterator<Item = OsString>, builder: &mut RunBuilder) -> Option<String> {
     for word in words {
         match word.into_string() {
             Ok(text) => return Some(text),
-            Err(word) => problems.push(unreadable(&word)),
+            Err(word) if inline_env_word(&word) => {
+                let position = builder.next_env_word();
+                builder.problems.push(Problem::EnvWordNotUnicode(position));
+            }
+            Err(word) => builder.problems.push(unreadable(&word)),
         }
     }
     None
+}
+
+/// Whether `word`, which is not valid Unicode, is the inline form of an `--env` word: the command line's `--env=<word>`, or
+/// the compatibility layer's `-Env:<word>`, its name read in any ASCII case.
+fn inline_env_word(word: &OsStr) -> bool {
+    let shown = word.to_string_lossy();
+    shown.starts_with("--env=") || shown.get(..5).is_some_and(|start| start.eq_ignore_ascii_case("-env:"))
 }
 
 /// The next word as an option's value: `None` at the end of the words, before `--`, which is never a value, and

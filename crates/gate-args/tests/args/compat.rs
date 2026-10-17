@@ -1,8 +1,10 @@
 //! The compatibility layer: the PowerShell gate's argument form.
 
+use std::ffi::OsString;
+
 use gate_args::{Ceiling, Invocation, RunRequest, Slot, Spelling, StopRequest, parse};
 
-use crate::support::{RUN, invocation, os, problems, refs, run_request, stop_request, with};
+use crate::support::{RUN, invocation, os, problems, problems_of, refs, run_request, stop_request, unreadable_word_after, with};
 
 const COMPAT: [&str; 6] = ["-Log", "out.log", "-TimeoutSeconds", "5", "-Slot", "heavy"];
 const COMMAND: [&str; 4] = ["--", "cmd", "/c", "echo hi"];
@@ -57,6 +59,31 @@ fn compat_env_parses_to_the_same_request_as_the_cli_s() {
     assert_eq!(
         problems(&refs(&compat(&["-Env", "GATE_X=1", "--", "cmd"]))),
         ["gate: --env sets GATE_X: GATE_ names are the gate's"]
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn compat_env_refuses_an_inline_word_that_is_not_unicode_by_its_position() {
+    let mut words = os(&COMPAT);
+    words.extend([unreadable_word_after("-Env:"), OsString::from("--"), OsString::from("cmd")]);
+    assert_eq!(problems_of(words), ["gate: --env word 1 is not valid Unicode"]);
+
+    let mut words = os(&COMPAT);
+    words.extend([
+        unreadable_word_after("-ENV:"),
+        OsString::from("-Env"),
+        OsString::from("ZZ_GATE_TEST_FORWARD_UNSET"),
+        OsString::from("--"),
+        OsString::from("cmd"),
+    ]);
+    assert_eq!(
+        problems_of(words),
+        [
+            "gate: --env word 1 is not valid Unicode",
+            "gate: --env word 2 names a variable to forward, and it is not set",
+        ],
+        "an inline word counts as an --env word, its name in any ASCII case"
     );
 }
 

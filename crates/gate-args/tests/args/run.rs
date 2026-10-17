@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use gate_args::{Ceiling, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, RunRequest, Slot, Spelling, TestSeams, USAGE};
 
-use crate::support::{RUN, os, problems, problems_of, refs, run_of, run_request, unreadable_word, with};
+use crate::support::{RUN, os, problems, problems_of, refs, run_of, run_request, unreadable_word, unreadable_word_after, with};
 
 fn run_with(extra: &[&str]) -> RunRequest {
     run_request(&refs(&with(&RUN, extra)))
@@ -433,6 +433,31 @@ fn run_env_refuses_a_word_that_is_not_unicode_by_its_position() {
     words.extend([OsString::from("--env"), unreadable_word(), OsString::from("--"), OsString::from("cmd")]);
 
     assert_eq!(problems_of(words), ["gate: --env word 1 is not valid Unicode"]);
+}
+
+#[test]
+#[cfg(windows)]
+fn run_env_refuses_an_inline_word_that_is_not_unicode_by_its_position() {
+    let mut words = os(&RUN);
+    words.extend([unreadable_word_after("--env="), OsString::from("--"), OsString::from("cmd")]);
+    assert_eq!(problems_of(words), ["gate: --env word 1 is not valid Unicode"]);
+
+    let mut words = os(&RUN);
+    words.extend([
+        unreadable_word_after("--env="),
+        OsString::from("--env"),
+        OsString::from("ZZ_GATE_TEST_FORWARD_UNSET"),
+        OsString::from("--"),
+        OsString::from("cmd"),
+    ]);
+    assert_eq!(
+        problems_of(words),
+        [
+            "gate: --env word 1 is not valid Unicode",
+            "gate: --env word 2 names a variable to forward, and it is not set",
+        ],
+        "an inline word counts as an --env word"
+    );
 }
 
 #[test]

@@ -170,3 +170,12 @@ pub fn unreadable_word() -> OsString {
     use std::os::unix::ffi::OsStringExt;
     OsString::from_vec(vec![b'a', 0xFF])
 }
+
+/// `prefix` followed by one unit that is not valid Unicode, so the whole word is not.
+#[cfg(windows)]
+pub fn unreadable_word_after(prefix: &str) -> OsString {
+    use std::os::windows::ffi::OsStringExt;
+    let mut units: Vec<u16> = prefix.encode_utf16().collect();
+    units.push(0xD800);
+    OsString::from_wide(&units)
+}

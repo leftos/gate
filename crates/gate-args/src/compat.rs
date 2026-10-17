@@ -46,7 +46,7 @@ pub(crate) fn parse(words: impl Iterator<Item = OsString>) -> Result<Invocation,
         stop_tree: None,
     };
     let mut command = None;
-    while let Some(text) = next_text(&mut words, &mut compat.builder.problems) {
+    while let Some(text) = next_text(&mut words, &mut compat.builder) {
         if text == "--" {
             command = Some(words.collect::<Vec<OsString>>());
             break;
