@@ -2,31 +2,44 @@
 
 <#
 .SYNOPSIS
-    Builds gate.exe in release and installs it into %LOCALAPPDATA%\gate\bin, putting that folder on the user's PATH.
+    Builds gate.exe and its desktop helper in release and installs them into %LOCALAPPDATA%\gate\bin, putting that
+    folder on the user's PATH.
 
 .DESCRIPTION
     A running gate holds its own executable open, so a rebuild into target\release cannot replace an installed copy,
-    and installed gates never run from target\, which build cleaners empty. This script builds through the repo gate,
-    copies the built executable beside the installed one under a temporary name, moves an installed gate.exe aside to
-    gate.exe.<stamp>.<pid>.old, which works while a gate runs it, and renames the temporary copy into place, so the
-    name gate.exe never points at nothing. Once the install is confirmed, it holds push.lock in the install folder
-    open, unshared, as gate push does, to its end, and stops with nothing changed while a push holds it or when
-    push.lock is a link, a second name of another file, a folder or a junction; whether the same exe is installed
-    already is decided under the lock. An installed copy that does not answer --version is
-    replaced by the previous gate.exe again, or removed when there was none, and the install fails. Once the installed
-    gate.exe answers, it deletes the aside copies no process holds any more, its own kept, and leaves the ones a gate
-    still runs for a later install; an install that ends with no gate.exe that answers keeps every one. It then adds
+    and installed gates never run from target\, which build cleaners empty. This script builds gate.exe and
+    gate-desktop-helper.exe in one release build through the repo gate, so both name the same build, and refuses a
+    helper built with its test seams. It installs the helper first, then gate.exe, each the same way: it copies the
+    built file beside the installed one under a temporary name, moves the installed file aside to
+    <name>.<stamp>.<pid>.old, which works while a gate runs it, and renames the temporary copy into place, so the name
+    never points at nothing; a file whose installed bytes are the same already is kept as it is. Once the install is
+    confirmed, it holds push.lock in the install folder open, unshared, as gate push does, to its end, and stops with
+    nothing changed while a push holds it or when push.lock is a link, a second name of another file, a folder or a
+    junction; whether the same files are installed already is decided under the lock. A helper that cannot be placed
+    is replaced by the previous helper again and gate.exe is not touched. An installed gate.exe that does not answer
+    --version, or that cannot be placed, is replaced by the previous gate.exe again, or removed when there was none,
+    the previous helper is put back the same way, and the install fails. Once the installed gate.exe answers, it
+    deletes the aside copies of both files no process holds any more, its own kept, and leaves the ones a gate still
+    runs for a later install; an install that ends with no gate.exe that answers keeps every one. It then adds
     %LOCALAPPDATA%\gate\bin to the user's PATH when it is missing, by reading and writing the raw Path value of the
     user environment registry key, which keeps that value's kind and its unexpanded %NAME% entries, and tells the
     running windows the environment changed. It never touches the state root's files. Run with -WhatIf to list every
     step without taking it.
 
 .PARAMETER Exe
-    Installs this prebuilt executable instead of building one; the build is skipped. For tests only.
+    Installs this prebuilt executable instead of building one; the build is skipped. Given only with -HelperExe. For
+    tests only.
+
+.PARAMETER HelperExe
+    Installs this prebuilt desktop helper beside the -Exe executable. Given only with -Exe. For tests only.
 
 .PARAMETER EnvironmentKey
     The user environment registry key the PATH entry is read from and written to, HKCU:\Environment by default. For
     tests only: the environment change is broadcast only for the real key.
+
+.PARAMETER PrintBuild
+    Prints the arguments the release build gives cargo, on one line, and ends without building or installing. For
+    tests only.
 
 .EXAMPLE
     pwsh -NoProfile -File tools/install.ps1
@@ -34,7 +47,9 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [string]$Exe,
-    [string]$EnvironmentKey = 'HKCU:\Environment'
+    [string]$HelperExe,
+    [string]$EnvironmentKey = 'HKCU:\Environment',
+    [switch]$PrintBuild
 )
 
 Set-StrictMode -Version Latest
@@ -148,7 +163,14 @@ function Get-BuildId {
     return "$id-dirty.$hash"
 }
 
-# Runs the release build through the repo gate from the repo root, where the gate's -Log lands, and returns its status.
+# The arguments the release build gives cargo: gate.exe and its desktop helper in one call, with their default features
+# only, so the helper is never built with its test seams.
+function Get-BuildArguments {
+    return @('build', '--release', '-p', 'gate', '-p', 'gate-desktop')
+}
+
+# Runs the release build of gate.exe and its desktop helper through the repo gate from the repo root, where the gate's
+# -Log lands, and returns its status. Cargo gets Get-BuildArguments and nothing else.
 # The build runs with -Local, so it is never routed to a builder. $BuildId reaches cargo as GATE_BUILD_ID for this one
 # build, so the exe it writes names the commit it was made from; an empty one removes GATE_BUILD_ID for the build, so a
 # value the caller set never leaks in, and builds a gate that names no commit (`+dev`).
@@ -156,6 +178,7 @@ function Invoke-ReleaseBuild {
     param([string]$Root, [string]$BuildId)
 
     $gate = Join-Path $Root 'tools\gate.ps1'
+    $cargoArguments = Get-BuildArguments
     Push-Location $Root
     try {
         $before = $env:GATE_BUILD_ID
@@ -167,7 +190,7 @@ function Invoke-ReleaseBuild {
                 $env:GATE_BUILD_ID = $BuildId
             }
             & pwsh -NoProfile -File $gate -Log '.tmp/install-build.log' -TimeoutSeconds 900 -Slot heavy -Local -- `
-                cargo build --release -p gate | Out-Host
+                cargo @cargoArguments | Out-Host
             return [int]$LASTEXITCODE
         }
         finally {
@@ -208,14 +231,19 @@ function Test-FileHeld {
     return $false
 }
 
-# Deletes every aside copy in $Dir that no process holds any more, but the one at $Keep, this install's own. One a gate
-# still runs is left for a later install, and left silently: its delete fails, and the probe shows the file is still held.
+# Deletes every aside copy of gate.exe and of the desktop helper in $Dir that no process holds any more, but the ones at
+# $Keep, this install's own. One a gate still runs is left for a later install, and left silently: its delete fails,
+# and the probe shows the file is still held.
 function Remove-AsideCopy {
     [CmdletBinding(SupportsShouldProcess)]
-    param([string]$Dir, [string]$Keep)
+    param([string]$Dir, [string[]]$Keep)
 
-    foreach ($file in Get-ChildItem -LiteralPath $Dir -Filter 'gate.exe.*.old' -File) {
-        if ($Keep -and $file.Name -eq [IO.Path]::GetFileName($Keep)) { continue }
+    $kept = @($Keep | Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFileName($_) })
+    $asides = foreach ($pattern in 'gate.exe.*.old', 'gate-desktop-helper.exe.*.old') {
+        Get-ChildItem -LiteralPath $Dir -Filter $pattern -File
+    }
+    foreach ($file in $asides) {
+        if ($kept -contains $file.Name) { continue }
         if (-not $PSCmdlet.ShouldProcess($file.FullName, 'Delete')) { continue }
         try {
             Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
@@ -368,18 +396,120 @@ function Get-InstalledState {
     return 'missing'
 }
 
-# Undoes an install that failed for $Reason, a whole `install: ` text, and exits 1: puts the previous gate.exe at $Aside
-# back at $Dest, or removes the install's copy there when there was no earlier gate.exe, but only while $Dest is missing
-# or the install's own copy, the file whose id is $Own, and over a missing one never by force; a gate.exe another process
-# placed is left as it is. Says which. Every aside copy is kept.
-function Restore-PreviousGate {
-    param([string]$Reason, [string]$Dest, [string]$Aside, [string]$Own)
+# Whether the desktop helper at $Path was built with its test seams: its bytes hold the ASCII text of the seams'
+# variable names, which only a build with the `test-seams` feature compiles in.
+function Test-HelperSeams {
+    param([string]$Path)
 
+    $text = [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($Path))
+    return $text.Contains('GATE_DESKTOP_TEST_', [StringComparison]::Ordinal)
+}
+
+# Writes $Built beside $Dest as $Dest.<pid>.tmp, afresh and through a handle of the install's own, so a copy that fails
+# never touches the installed file, then moves an existing $Dest aside to $Dest.<stamp>.<pid>.old. Returns the swap:
+# Dest, Temp, Own, the copy's file id, which its move into place keeps and which tells the install's own file from one
+# another process placed, and Aside, $null when nothing was at $Dest. Throws when a step fails, with the copy removed
+# and $Dest as it was.
+function New-Swap {
+    param([string]$Dest, [string]$Built)
+
+    $temp = $Dest + '.' + $PID + '.tmp'
+    Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+    $aside = $null
+    try {
+        $source = [IO.File]::OpenRead($Built)
+        try {
+            $copy = [IO.File]::Open($temp, 'CreateNew', 'Write', 'None')
+            try {
+                $source.CopyTo($copy)
+                $own = [GateFile]::Id($copy.SafeFileHandle)
+            }
+            finally {
+                $copy.Dispose()
+            }
+        }
+        finally {
+            $source.Dispose()
+        }
+        if (Test-Path -LiteralPath $Dest) {
+            $aside = $Dest + '.' + (Get-Date -Format 'yyyyMMddHHmmss') + '.' + $PID + '.old'
+            Move-Item -LiteralPath $Dest -Destination $aside -Force -ErrorAction Stop
+        }
+    }
+    catch {
+        Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+        throw
+    }
+    return @{ Dest = $Dest; Temp = $temp; Own = $own; Aside = $aside }
+}
+
+# Renames the copy of $Swap into place, never by force: with the installed file moved aside its name is missing, so a
+# file that appeared there meanwhile is another process's and makes the move fail. Throws then, with the copy removed.
+function Move-SwapIntoPlace {
+    param([hashtable]$Swap)
+
+    try {
+        Move-Item -LiteralPath $Swap.Temp -Destination $Swap.Dest -ErrorAction Stop
+    }
+    catch {
+        Remove-Item -LiteralPath $Swap.Temp -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+# Puts the desktop helper back as it was before $Swap, this install's swap of it, when there was one: moves the previous
+# helper back from its aside copy, or removes the install's copy when there was no earlier helper, but only while the
+# helper's name is missing or holds the install's own copy, and over a missing one never by force; a helper another
+# process placed is left as it is. Silent when the helper is back as it was; says what it left otherwise. Returns whether
+# a previous helper was moved back into place.
+function Undo-HelperSwap {
+    param([hashtable]$Swap)
+
+    if ($null -eq $Swap) { return $false }
+    $dest = $Swap.Dest
+    $aside = $Swap.Aside
+    $left = if ($null -eq $aside) { '' } else { "; the previous desktop helper is at $aside" }
+    $state = Get-InstalledState -Dest $dest -Own $Swap.Own
+    if ($state -eq 'foreign') {
+        Write-InstallError "install: another desktop helper was placed at $dest meanwhile and was left as it is$left"
+        return $false
+    }
+    try {
+        if ($null -eq $aside) {
+            if ($state -eq 'mine') { Remove-Item -LiteralPath $dest -Force -ErrorAction Stop }
+            return $false
+        }
+        if ($state -eq 'mine') {
+            Move-Item -LiteralPath $aside -Destination $dest -Force -ErrorAction Stop
+        }
+        else {
+            Move-Item -LiteralPath $aside -Destination $dest -ErrorAction Stop
+        }
+        return $true
+    }
+    catch {
+        Write-InstallError "install: the desktop helper at $dest could not be put back as it was: $($_.Exception.Message)$left"
+        return $false
+    }
+}
+
+# Undoes an install that failed for $Reason, a whole `install: ` text, and exits 1: puts the desktop helper back as it
+# was before $Helper, this install's swap of it ($null when the helper was kept), then puts the previous gate.exe at
+# $Aside back at $Dest, or removes the install's copy there when there was no earlier gate.exe, but only while $Dest is
+# missing or the install's own copy, the file whose id is $Own, and over a missing one never by force; a gate.exe another
+# process placed is left as it is. Says which, and says when a previous helper was put back beside that other gate.exe.
+# Every gate.exe aside copy is kept.
+function Restore-PreviousGate {
+    param([string]$Reason, [string]$Dest, [string]$Aside, [string]$Own, [hashtable]$Helper)
+
+    $helperBack = Undo-HelperSwap -Swap $Helper
     $state = Get-InstalledState -Dest $Dest -Own $Own
     $placed = "${Reason}; another gate.exe was placed meanwhile and was left as it is"
     if (-not [string]::IsNullOrEmpty($Aside)) { $placed += ", the previous gate.exe is at $Aside" }
+    $mismatch = 'install: the previous desktop helper was put back beside a gate.exe another process placed; they may not match'
     if ($state -eq 'foreign') {
         Write-InstallError $placed
+        if ($helperBack) { Write-InstallError $mismatch }
         exit 1
     }
     if ([string]::IsNullOrEmpty($Aside)) {
@@ -407,6 +537,7 @@ function Restore-PreviousGate {
     catch {
         if ($state -eq 'missing' -and (Test-Path -LiteralPath $Dest)) {
             Write-InstallError $placed
+            if ($helperBack) { Write-InstallError $mismatch }
         }
         else {
             Write-InstallError "${Reason}; the previous gate.exe is at $Aside"
@@ -476,6 +607,16 @@ function Add-UserPath {
     if (-not $WhatIfPreference) { $env:Path = "$Folder;$env:Path" }
 }
 
+if ([string]::IsNullOrEmpty($Exe) -ne [string]::IsNullOrEmpty($HelperExe)) {
+    Write-InstallError 'install: -Exe and -HelperExe are given together or not at all'
+    exit 1
+}
+
+if ($PrintBuild) {
+    Write-Output ((Get-BuildArguments) -join ' ')
+    exit 0
+}
+
 if ([string]::IsNullOrEmpty($env:LOCALAPPDATA)) {
     Write-InstallError 'install: LOCALAPPDATA is not set'
     exit 1
@@ -483,10 +624,12 @@ if ([string]::IsNullOrEmpty($env:LOCALAPPDATA)) {
 
 $installDir = Join-Path $env:LOCALAPPDATA 'gate\bin'
 $dest = Join-Path $installDir 'gate.exe'
+$helperDest = Join-Path $installDir 'gate-desktop-helper.exe'
 
 if ([string]::IsNullOrEmpty($Exe)) {
     $built = Join-Path $repoRoot 'target\release\gate.exe'
-    if ($PSCmdlet.ShouldProcess($repoRoot, 'cargo build --release -p gate')) {
+    $builtHelper = Join-Path $repoRoot 'target\release\gate-desktop-helper.exe'
+    if ($PSCmdlet.ShouldProcess($repoRoot, "cargo $((Get-BuildArguments) -join ' ')")) {
         $buildId = Get-BuildId -Root $repoRoot
         if ($null -eq $buildId) {
             Write-InstallError 'install: git could not say which commit this is or what changed in it; building a gate whose version ends +dev'
@@ -495,9 +638,11 @@ if ([string]::IsNullOrEmpty($Exe)) {
             Write-InstallError 'install: cargo build --release failed; see .tmp/install-build.log'
             exit 1
         }
-        if (-not (Test-Path -LiteralPath $built)) {
-            Write-InstallError "install: the build left no executable at '$built'"
-            exit 1
+        foreach ($file in $built, $builtHelper) {
+            if (-not (Test-Path -LiteralPath $file)) {
+                Write-InstallError "install: the build left no executable at '$file'"
+                exit 1
+            }
         }
     }
     elseif (-not $WhatIfPreference) {
@@ -513,6 +658,30 @@ else {
         Write-InstallError "install: no executable at '$Exe'"
         exit 1
     }
+    try {
+        $builtHelper = (Resolve-Path -LiteralPath $HelperExe -ErrorAction Stop).ProviderPath
+    }
+    catch {
+        Write-InstallError "install: no desktop helper at '$HelperExe'"
+        exit 1
+    }
+}
+
+# A helper built with its test seams is never installed. A -WhatIf run that would build checks none: nothing is built in
+# a preview, so whatever target\release holds is not what a real run would install.
+$previewBuild = $WhatIfPreference -and [string]::IsNullOrEmpty($HelperExe)
+if ((-not $previewBuild) -and (Test-Path -LiteralPath $builtHelper)) {
+    try {
+        $seams = Test-HelperSeams -Path $builtHelper
+    }
+    catch {
+        Write-InstallError "install: could not read the desktop helper at '${builtHelper}': $($_.Exception.Message)"
+        exit 1
+    }
+    if ($seams) {
+        Write-InstallError "install: the desktop helper at '$builtHelper' was built with its test seams; build it without features"
+        exit 1
+    }
 }
 
 $newVersion = $null
@@ -520,107 +689,124 @@ if (Test-Path -LiteralPath $built) { $newVersion = Get-GateVersion $built }
 
 $lock = $null
 $same = $false
+$sameGate = $false
+$sameHelper = $false
 $previewSame = $false
+$withHelper = " with its desktop helper at $helperDest"
 if ($WhatIfPreference -and ($null -ne $newVersion)) {
     try {
-        $previewSame = Test-SameExe -Dest $dest -Built $built
+        $previewSame = (Test-SameExe -Dest $dest -Built $built) -and (Test-SameExe -Dest $helperDest -Built $builtHelper)
     }
     catch {
         # A hash that cannot be read previews the install a real run would then try.
-        Write-Verbose "Whether $dest is the same exe could not be read: $($_.Exception.Message)"
+        Write-Verbose "Whether $dest and $helperDest are the same files could not be read: $($_.Exception.Message)"
     }
 }
 try {
     if ($previewSame) {
-        # The preview of an install of the exe already in place, decided without the lock, since it changes nothing but
-        # the aside copies a real run deletes once the installed gate answers.
-        Write-Output "install: gate $newVersion already installed at $dest"
+        # The preview of an install of the files already in place, decided without the lock, since it changes nothing
+        # but the aside copies a real run deletes once the installed gate answers.
+        Write-Output "install: gate $newVersion already installed at $dest$withHelper"
         if ($null -ne (Get-GateVersion $dest)) { Remove-AsideCopy -Dir $installDir -WhatIf }
     }
-    elseif ($PSCmdlet.ShouldProcess($dest, 'Install')) {
-        if ($null -eq $newVersion) {
-            Write-InstallError "install: could not read the version of $built"
-            exit 1
+    else {
+        # Both installs are asked for, so -WhatIf lists the helper's and gate.exe's.
+        $installHelper = $PSCmdlet.ShouldProcess($helperDest, 'Install')
+        $installGate = $PSCmdlet.ShouldProcess($dest, 'Install')
+        if ($installHelper -and $installGate) {
+            if ($null -eq $newVersion) {
+                Write-InstallError "install: could not read the version of $built"
+                exit 1
+            }
+            # Every look at the install folder from here on, the same-file checks included, is made under the lock.
+            $lock = Lock-InstallFolder -Dir $installDir
+            $sameGate = Test-SameExe -Dest $dest -Built $built
+            try {
+                $sameHelper = Test-SameExe -Dest $helperDest -Built $builtHelper
+            }
+            catch {
+                Write-InstallError "install: could not read the desktop helper at '${helperDest}': $($_.Exception.Message)"
+                exit 1
+            }
+            $same = $sameGate -and $sameHelper
         }
-        # Every look at the install folder from here on, the same-exe check included, is made under the lock.
-        $lock = Lock-InstallFolder -Dir $installDir
-        $same = Test-SameExe -Dest $dest -Built $built
-    }
-    elseif ($WhatIfPreference -and (Test-Path -LiteralPath $installDir)) {
-        # The aside copies a verified install would delete, listed.
-        Remove-AsideCopy -Dir $installDir -WhatIf
+        elseif ($WhatIfPreference -and (Test-Path -LiteralPath $installDir)) {
+            # The aside copies a verified install would delete, listed.
+            Remove-AsideCopy -Dir $installDir -WhatIf
+        }
     }
 
     # Declined or -WhatIf, the lock is not held and nothing is installed.
     if ($same) {
-        Write-Output "install: gate $newVersion already installed at $dest"
+        Write-Output "install: gate $newVersion already installed at $dest$withHelper"
         if ($null -ne (Get-GateVersion $dest)) { Remove-AsideCopy -Dir $installDir }
     }
     elseif ($null -ne $lock) {
-        $oldVersion = if (Test-Path -LiteralPath $dest) { Get-GateVersion $dest } else { $null }
-
-        # The new exe is written beside the installed one first, afresh and through a handle of the install's own, so a
-        # copy that fails never touches the installed exe, and a name gate.exe never points at nothing. The copy's file
-        # id, read from that handle and kept by its move into place, is what tells the install's own gate.exe from one
-        # another process placed.
-        $temp = $dest + '.' + $PID + '.tmp'
-        Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
-        try {
-            $source = [IO.File]::OpenRead($built)
+        # The helper is placed first; one that cannot be is put back as it was, and gate.exe is not touched.
+        $helperSwap = $null
+        $helperAside = $null
+        if (-not $sameHelper) {
             try {
-                $copy = [IO.File]::Open($temp, 'CreateNew', 'Write', 'None')
-                try {
-                    $source.CopyTo($copy)
-                    $own = [GateFile]::Id($copy.SafeFileHandle)
-                }
-                finally {
-                    $copy.Dispose()
-                }
-            }
-            finally {
-                $source.Dispose()
-            }
-        }
-        catch {
-            Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
-            Write-InstallError "install: could not install ${dest}: $($_.Exception.Message)"
-            exit 1
-        }
-
-        $aside = $null
-        if (Test-Path -LiteralPath $dest) {
-            $aside = $dest + '.' + (Get-Date -Format 'yyyyMMddHHmmss') + '.' + $PID + '.old'
-            try {
-                Move-Item -LiteralPath $dest -Destination $aside -Force -ErrorAction Stop
+                $helperSwap = New-Swap -Dest $helperDest -Built $builtHelper
             }
             catch {
-                Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+                Write-InstallError "install: could not install ${helperDest}: $($_.Exception.Message)"
+                exit 1
+            }
+            $helperAside = $helperSwap.Aside
+            try {
+                Move-SwapIntoPlace -Swap $helperSwap
+            }
+            catch {
+                Write-InstallError "install: could not install ${helperDest}: $($_.Exception.Message)"
+                $null = Undo-HelperSwap -Swap $helperSwap
+                exit 1
+            }
+        }
+
+        # Then gate.exe; any way its install fails puts the previous helper back too.
+        $oldVersion = $null
+        $gateAside = $null
+        if (-not $sameGate) {
+            $oldVersion = if (Test-Path -LiteralPath $dest) { Get-GateVersion $dest } else { $null }
+            try {
+                $swap = New-Swap -Dest $dest -Built $built
+            }
+            catch {
                 Write-InstallError "install: could not install ${dest}: $($_.Exception.Message)"
+                $null = Undo-HelperSwap -Swap $helperSwap
                 exit 1
             }
-        }
-
-        # Never by force: with the old exe moved aside, gate.exe is missing, so a file that appeared there meanwhile is
-        # another process's and makes the move fail.
-        try {
-            Move-Item -LiteralPath $temp -Destination $dest -ErrorAction Stop
-        }
-        catch {
-            $message = $_.Exception.Message
-            Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
-            if ($null -eq $aside) {
-                Write-InstallError "install: could not install ${dest}: $message"
-                exit 1
+            $gateAside = $swap.Aside
+            try {
+                Move-SwapIntoPlace -Swap $swap
             }
-            Restore-PreviousGate -Reason "install: could not install ${dest}: $message" -Dest $dest -Aside $aside -Own $own
-        }
+            catch {
+                $reason = "install: could not install ${dest}: $($_.Exception.Message)"
+                if ($null -eq $gateAside) {
+                    Write-InstallError $reason
+                    $null = Undo-HelperSwap -Swap $helperSwap
+                    exit 1
+                }
+                Restore-PreviousGate -Reason $reason -Dest $dest -Aside $gateAside -Own $swap.Own -Helper $helperSwap
+            }
 
-        if ($null -eq (Get-GateVersion $dest)) {
-            Restore-PreviousGate -Reason 'install: the installed gate.exe does not run' -Dest $dest -Aside $aside -Own $own
+            if ($null -eq (Get-GateVersion $dest)) {
+                Restore-PreviousGate -Reason 'install: the installed gate.exe does not run' -Dest $dest -Aside $gateAside `
+                    -Own $swap.Own -Helper $helperSwap
+            }
         }
-        Remove-AsideCopy -Dir $installDir -Keep $aside
-        if ($null -ne $oldVersion) { Write-Output "install: replaced gate $oldVersion" }
-        Write-Output "install: installed gate $newVersion at $dest"
+        # A gate.exe kept as it was is asked too: the aside copies go only once the installed gate answers.
+        if ((-not $sameGate) -or ($null -ne (Get-GateVersion $dest))) {
+            Remove-AsideCopy -Dir $installDir -Keep $gateAside, $helperAside
+        }
+        if ($sameGate) {
+            Write-Output "install: gate $newVersion already installed at $dest; installed its desktop helper at $helperDest"
+        }
+        else {
+            if ($null -ne $oldVersion) { Write-Output "install: replaced gate $oldVersion" }
+            Write-Output "install: installed gate $newVersion at $dest$withHelper"
+        }
     }
 
     # The remote.ps1 bridge script an earlier install put beside gate.exe, which no gate starts any more. One that cannot

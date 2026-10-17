@@ -7,6 +7,8 @@ use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
 use crate::support::{Case, DenyEntry, FAKE_TOOL, Outcome, finish, names, shown, start, version_of, wait_for_journal_line, wait_until_closed};
 
 /// `tools/install.ps1`, the script under test: a checked-in file a case runs.
@@ -62,8 +64,17 @@ fn pwsh_command(script: &str) -> Command {
     command
 }
 
-/// The install script with `args`, the case's registry key and its own LOCALAPPDATA.
-fn install_command(case: &Case, key: &EnvironmentKey, args: &[&str]) -> Command {
+/// The install script with `args`, the desktop helper at `helper` (`-HelperExe`), the case's registry key and its own
+/// LOCALAPPDATA.
+fn install_command(case: &Case, key: &EnvironmentKey, helper: &Path, args: &[&str]) -> Command {
+    let helper_word = shown(helper);
+    let words: Vec<&str> = ["-HelperExe", &helper_word].into_iter().chain(args.iter().copied()).collect();
+    bare_install_command(case, key, &words)
+}
+
+/// The install script with only `args`, the case's registry key and its own LOCALAPPDATA: no `-HelperExe` unless
+/// `args` name one.
+fn bare_install_command(case: &Case, key: &EnvironmentKey, args: &[&str]) -> Command {
     let words: Vec<String> = ["-NoProfile", "-File", &shown(&script()), "-EnvironmentKey", &key.0]
         .into_iter()
         .chain(args.iter().copied())
@@ -75,9 +86,52 @@ fn install_command(case: &Case, key: &EnvironmentKey, args: &[&str]) -> Command 
     command
 }
 
-/// Runs the install script for `case` and returns what it did.
+/// Runs the install script for `case` with the case's default stand-in helper and returns what it did.
 fn install(case: &Case, key: &EnvironmentKey, args: &[&str]) -> Outcome {
-    finish(install_command(case, key, args))
+    install_with_helper(case, key, &default_helper(case), args)
+}
+
+/// Runs the install script for `case` with the desktop helper at `helper` and returns what it did.
+fn install_with_helper(case: &Case, key: &EnvironmentKey, helper: &Path, args: &[&str]) -> Outcome {
+    finish(install_command(case, key, helper, args))
+}
+
+/// A stand-in desktop helper in the case folder under `name`, holding `bytes`: the install only copies the helper, so
+/// any small file without the seams' text stands in for it.
+fn stand_in_helper(case: &Case, name: &str, bytes: &[u8]) -> PathBuf {
+    let helper = case.folder().join(name);
+    fs::write(&helper, bytes).expect("the stand-in helper can be written");
+    helper
+}
+
+/// The stand-in helper a case installs when it does not care which: the same bytes on every call.
+fn default_helper(case: &Case) -> PathBuf {
+    stand_in_helper(case, "helper-default.exe", b"a stand-in desktop helper")
+}
+
+/// The installed desktop helper.
+fn installed_helper(case: &Case) -> PathBuf {
+    install_dir(case).join("gate-desktop-helper.exe")
+}
+
+/// What a success line adds after the installed gate.exe: where its desktop helper is.
+fn with_helper(case: &Case) -> String {
+    format!(" with its desktop helper at {}", shown(&installed_helper(case)))
+}
+
+/// Opens `path` for reading and lets others only read it, so while the handle is held the file can be hashed but not
+/// moved aside, renamed or deleted.
+fn hold_against_moves(path: &Path) -> fs::File {
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .expect("the file can be held")
+}
+
+/// Opens `path` and lets no one else open it, so while the handle is held the file cannot even be read.
+fn hold_against_reads(path: &Path) -> fs::File {
+    fs::OpenOptions::new().read(true).share_mode(0).open(path).expect("the file can be held")
 }
 
 /// What a child of `case` sees as its LOCALAPPDATA when the suite asks for `value`: `None` for the empty value
@@ -131,8 +185,18 @@ fn assert_same_bytes(left: &Path, right: &Path) {
     );
 }
 
-/// The aside copies in a case's install folder, in name order.
+/// The gate.exe aside copies in a case's install folder, in name order.
 fn aside_copies(case: &Case) -> Vec<PathBuf> {
+    asides_of(case, "gate.exe.")
+}
+
+/// The desktop helper's aside copies in a case's install folder, in name order.
+fn helper_aside_copies(case: &Case) -> Vec<PathBuf> {
+    asides_of(case, "gate-desktop-helper.exe.")
+}
+
+/// The aside copies in a case's install folder whose names start with `prefix`, in name order.
+fn asides_of(case: &Case, prefix: &str) -> Vec<PathBuf> {
     let mut copies: Vec<PathBuf> = fs::read_dir(install_dir(case))
         .expect("the install folder can be listed")
         .filter_map(Result::ok)
@@ -142,7 +206,7 @@ fn aside_copies(case: &Case) -> Vec<PathBuf> {
             let aside = Path::new(&name)
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("old"));
-            name.starts_with("gate.exe.") && aside
+            name.starts_with(prefix) && aside
         })
         .collect();
     copies.sort();
@@ -301,9 +365,10 @@ fn a_second_install_of_the_same_exe_changes_nothing() {
     assert_eq!(
         unix(&second.stdout),
         format!(
-            "install: gate {} already installed at {}\ninstall: added {dir} to your user PATH; open a new terminal to use gate\n",
+            "install: gate {} already installed at {}{}\ninstall: added {dir} to your user PATH; open a new terminal to use gate\n",
             version_of(&exe),
-            shown(&dest)
+            shown(&dest),
+            with_helper(&case)
         ),
         "the same bytes are not copied again, the PATH step still runs: {second:?}"
     );
@@ -346,8 +411,9 @@ fn install_over_a_running_gate_moves_it_aside() {
     assert_eq!(
         unix(&replaced.stdout),
         format!(
-            "install: replaced gate {version}\ninstall: installed gate {version} at {}\n",
-            shown(&dest)
+            "install: replaced gate {version}\ninstall: installed gate {version} at {}{}\n",
+            shown(&dest),
+            with_helper(&case)
         ),
         "the replaced version is the running gate's, read from the exe moved aside: {replaced:?}"
     );
@@ -417,7 +483,7 @@ fn an_install_while_a_push_holds_the_lock_changes_nothing() {
     assert!(aside.exists(), "the aside copy is left: {outcome:?}");
     assert_eq!(
         names(&install_dir(&case)),
-        ["gate.exe", ASIDE, "push.lock"],
+        ["gate-desktop-helper.exe", "gate.exe", ASIDE, "push.lock"],
         "nothing was added or deleted"
     );
     assert_eq!(path_value(&key), None, "the PATH step did not run: {outcome:?}");
@@ -451,7 +517,7 @@ fn an_install_refuses_a_push_lock_that_is_a_hard_link() {
     assert!(aside.exists(), "the aside copy is left: {outcome:?}");
     assert_eq!(
         names(&install_dir(&case)),
-        ["gate.exe", ASIDE, "push.lock"],
+        ["gate-desktop-helper.exe", "gate.exe", ASIDE, "push.lock"],
         "nothing was added or deleted"
     );
     assert_eq!(path_value(&key), None, "the PATH step did not run: {outcome:?}");
@@ -520,9 +586,10 @@ fn install_whatif_of_the_installed_exe_says_already_installed() {
     assert_eq!(
         unix(&outcome.stdout),
         format!(
-            "install: gate {} already installed at {}\nWhat if: Performing the operation \"Delete\" on target \"{}\".\n",
+            "install: gate {} already installed at {}{}\nWhat if: Performing the operation \"Delete\" on target \"{}\".\n",
             version_of(&exe),
             shown(&installed_gate(&case)),
+            with_helper(&case),
             shown(&aside)
         ),
         "what a real run says and the aside delete it takes, and no install step: {outcome:?}"
@@ -604,7 +671,7 @@ fn install_without_localappdata_fails() {
         None,
         "an empty LOCALAPPDATA reaches a child as no variable, which the script reads as unset"
     );
-    let mut command = install_command(&case, &key, &["-Exe", &shown(&exe)]);
+    let mut command = install_command(&case, &key, &default_helper(&case), &["-Exe", &shown(&exe)]);
     command.env("LOCALAPPDATA", "");
 
     let outcome = finish(command);
@@ -626,4 +693,349 @@ fn install_whatif_changes_nothing() {
     assert!(!installed_gate(&case).exists(), "nothing was installed: {outcome:?}");
     assert!(!install_dir(&case).exists(), "no folder and no push.lock was made: {outcome:?}");
     assert_eq!(path_value(&key), None, "no Path value was written: {outcome:?}");
+}
+
+#[test]
+fn an_install_puts_the_desktop_helper_beside_gate() {
+    let case = Case::new("an_install_puts_the_desktop_helper_beside_gate");
+    let key = EnvironmentKey::new("an_install_puts_the_desktop_helper_beside_gate");
+    let exe = copy_gate(&case, "gate-a.exe");
+    let helper = stand_in_helper(&case, "helper-a.exe", b"helper one");
+
+    let outcome = install_with_helper(&case, &key, &helper, &["-Exe", &shown(&exe)]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert!(
+        unix(&outcome.stdout).contains(&format!(
+            "install: installed gate {} at {}{}\n",
+            version_of(&exe),
+            shown(&installed_gate(&case)),
+            with_helper(&case)
+        )),
+        "the success line names both files: {outcome:?}"
+    );
+    assert_same_bytes(&installed_gate(&case), &exe);
+    assert_same_bytes(&installed_helper(&case), &helper);
+}
+
+#[test]
+fn an_identical_helper_is_kept() {
+    let case = Case::new("an_identical_helper_is_kept");
+    let key = EnvironmentKey::new("an_identical_helper_is_kept");
+    let first = copy_gate(&case, "gate-a.exe");
+    let second = copy_gate_with_a_byte(&case, "gate-b.exe");
+    let helper = stand_in_helper(&case, "helper-a.exe", b"helper one");
+    let installed = install_with_helper(&case, &key, &helper, &["-Exe", &shown(&first)]);
+    assert_eq!(installed.code, Some(0), "{installed:?}");
+    // A held handle that lets others only read: a helper the install moved aside or replaced would fail the install.
+    let held = hold_against_moves(&installed_helper(&case));
+
+    let outcome = install_with_helper(&case, &key, &helper, &["-Exe", &shown(&second)]);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(0), "the identical helper is left as it is: {outcome:?}");
+    assert_same_bytes(&installed_gate(&case), &second);
+    assert_same_bytes(&installed_helper(&case), &helper);
+    assert!(
+        helper_aside_copies(&case).is_empty(),
+        "no helper aside copy was made: {:?}",
+        helper_aside_copies(&case)
+    );
+}
+
+#[test]
+fn a_helper_built_with_its_seams_is_refused_and_nothing_is_installed() {
+    let case = Case::new("a_helper_built_with_its_seams_is_refused_and_nothing_is_installed");
+    let key = EnvironmentKey::new("a_helper_built_with_its_seams_is_refused_and_nothing_is_installed");
+    let exe = copy_gate(&case, "gate-a.exe");
+    let helper = stand_in_helper(&case, "helper-seams.exe", b"\0\0GATE_DESKTOP_TEST_FAULT\0\0");
+
+    let outcome = install_with_helper(&case, &key, &helper, &["-Exe", &shown(&exe)]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        format!(
+            "install: the desktop helper at '{}' was built with its test seams; build it without features\n",
+            shown(&helper)
+        ),
+        "{outcome:?}"
+    );
+    assert!(!install_dir(&case).exists(), "nothing was installed: {outcome:?}");
+    assert_eq!(path_value(&key), None, "the PATH step did not run: {outcome:?}");
+}
+
+#[test]
+fn a_helper_that_cannot_be_placed_leaves_the_previous_pair() {
+    let case = Case::new("a_helper_that_cannot_be_placed_leaves_the_previous_pair");
+    let key = EnvironmentKey::new("a_helper_that_cannot_be_placed_leaves_the_previous_pair");
+    let first = copy_gate(&case, "gate-a.exe");
+    let second = copy_gate_with_a_byte(&case, "gate-b.exe");
+    let old_helper = stand_in_helper(&case, "helper-a.exe", b"helper one");
+    let new_helper = stand_in_helper(&case, "helper-b.exe", b"helper two");
+    let installed = install_with_helper(&case, &key, &old_helper, &["-Exe", &shown(&first)]);
+    assert_eq!(installed.code, Some(0), "{installed:?}");
+    let held = hold_against_moves(&installed_helper(&case));
+
+    let outcome = install_with_helper(&case, &key, &new_helper, &["-Exe", &shown(&second)]);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(
+        unix(&outcome.stderr).starts_with(&format!("install: could not install {}: ", shown(&installed_helper(&case)))),
+        "{outcome:?}"
+    );
+    assert_same_bytes(&installed_gate(&case), &first);
+    assert_same_bytes(&installed_helper(&case), &old_helper);
+    assert!(aside_copies(&case).is_empty(), "gate.exe was not touched: {:?}", aside_copies(&case));
+    assert!(
+        helper_aside_copies(&case).is_empty(),
+        "no helper aside copy is left: {:?}",
+        helper_aside_copies(&case)
+    );
+}
+
+#[test]
+fn a_gate_that_does_not_run_puts_the_previous_helper_back() {
+    let case = Case::new("a_gate_that_does_not_run_puts_the_previous_helper_back");
+    let key = EnvironmentKey::new("a_gate_that_does_not_run_puts_the_previous_helper_back");
+    let first = copy_gate(&case, "gate-a.exe");
+    let old_helper = stand_in_helper(&case, "helper-a.exe", b"helper one");
+    let new_helper = stand_in_helper(&case, "helper-b.exe", b"helper two");
+    let installed = install_with_helper(&case, &key, &old_helper, &["-Exe", &shown(&first)]);
+    assert_eq!(installed.code, Some(0), "{installed:?}");
+    // The new exe answers its version where it is built; the copy the install puts in the folder cannot start.
+    let denied = DenyEntry::new(&install_dir(&case), NO_RUNNING_IN);
+    let second = copy_gate_with_a_byte(&case, "gate-b.exe");
+
+    let outcome = install_with_helper(&case, &key, &new_helper, &["-Exe", &shown(&second)]);
+
+    drop(denied);
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        "install: the installed gate.exe does not run; the previous gate.exe is back in place\n",
+        "{outcome:?}"
+    );
+    assert_same_bytes(&installed_gate(&case), &first);
+    assert_same_bytes(&installed_helper(&case), &old_helper);
+    assert!(
+        helper_aside_copies(&case).is_empty(),
+        "the previous helper was moved back, not left aside: {:?}",
+        helper_aside_copies(&case)
+    );
+}
+
+#[test]
+fn what_if_lists_the_helper() {
+    let case = Case::new("what_if_lists_the_helper");
+    let key = EnvironmentKey::new("what_if_lists_the_helper");
+    let exe = copy_gate(&case, "gate-a.exe");
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&exe), "-WhatIf"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let stdout = unix(&outcome.stdout);
+    for target in [installed_helper(&case), installed_gate(&case)] {
+        assert!(
+            stdout.contains(&format!(
+                "What if: Performing the operation \"Install\" on target \"{}\".\n",
+                shown(&target)
+            )),
+            "the install of {} is listed: {outcome:?}",
+            shown(&target)
+        );
+    }
+    assert!(!install_dir(&case).exists(), "nothing was installed: {outcome:?}");
+}
+
+#[test]
+fn the_install_build_names_no_features() {
+    let mut command = Command::new("pwsh");
+    command.args(["-NoProfile", "-File", &shown(&script()), "-PrintBuild"]);
+
+    let outcome = finish(command);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let printed = unix(&outcome.stdout);
+    for banned in ["--features", "--all-features", "test-seams"] {
+        assert!(!printed.contains(banned), "an installed build names no features: {outcome:?}");
+    }
+    assert_eq!(
+        printed, "build --release -p gate -p gate-desktop\n",
+        "the release build makes the desktop helper with gate.exe and nothing else: {outcome:?}"
+    );
+}
+
+/// Installs gate-a.exe with a helper holding `b"helper one"` for `case`: the installed pair's sources, gate first.
+fn installed_pair_a(case: &Case, key: &EnvironmentKey) -> (PathBuf, PathBuf) {
+    let gate = copy_gate(case, "gate-a.exe");
+    let helper = stand_in_helper(case, "helper-a.exe", b"helper one");
+    let installed = install_with_helper(case, key, &helper, &["-Exe", &shown(&gate)]);
+    assert_eq!(installed.code, Some(0), "{installed:?}");
+    (gate, helper)
+}
+
+#[test]
+fn a_gate_that_cannot_be_moved_aside_after_the_helper_was_placed_leaves_the_previous_pair() {
+    let name = "a_gate_that_cannot_be_moved_aside_after_the_helper_was_placed_leaves_the_previous_pair";
+    let case = Case::new(name);
+    let key = EnvironmentKey::new(name);
+    let (first, old_helper) = installed_pair_a(&case, &key);
+    let second = copy_gate_with_a_byte(&case, "gate-b.exe");
+    let new_helper = stand_in_helper(&case, "helper-b.exe", b"helper two");
+    let held = hold_against_moves(&installed_gate(&case));
+
+    let outcome = install_with_helper(&case, &key, &new_helper, &["-Exe", &shown(&second)]);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(
+        unix(&outcome.stderr).starts_with(&format!("install: could not install {}: ", shown(&installed_gate(&case)))),
+        "{outcome:?}"
+    );
+    assert_same_bytes(&installed_gate(&case), &first);
+    assert_same_bytes(&installed_helper(&case), &old_helper);
+    assert!(
+        helper_aside_copies(&case).is_empty(),
+        "the previous helper was moved back, not left aside: {:?}",
+        helper_aside_copies(&case)
+    );
+}
+
+#[test]
+fn a_first_install_of_the_helper_that_fails_removes_it() {
+    let case = Case::new("a_first_install_of_the_helper_that_fails_removes_it");
+    let key = EnvironmentKey::new("a_first_install_of_the_helper_that_fails_removes_it");
+    let (first, _) = installed_pair_a(&case, &key);
+    // A folder that holds gate.exe and no helper, as one an install before the helper left.
+    fs::remove_file(installed_helper(&case)).expect("the installed helper can be removed");
+    let second = copy_gate_with_a_byte(&case, "gate-b.exe");
+    let new_helper = stand_in_helper(&case, "helper-b.exe", b"helper two");
+    let held = hold_against_moves(&installed_gate(&case));
+
+    let outcome = install_with_helper(&case, &key, &new_helper, &["-Exe", &shown(&second)]);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_same_bytes(&installed_gate(&case), &first);
+    assert!(
+        !installed_helper(&case).exists(),
+        "the helper this install placed is removed: {outcome:?}"
+    );
+    assert!(helper_aside_copies(&case).is_empty(), "{:?}", helper_aside_copies(&case));
+}
+
+#[test]
+fn exe_without_helper_exe_is_refused() {
+    let case = Case::new("exe_without_helper_exe_is_refused");
+    let key = EnvironmentKey::new("exe_without_helper_exe_is_refused");
+    let exe = shown(&copy_gate(&case, "gate-a.exe"));
+    let helper = shown(&default_helper(&case));
+
+    for args in [["-Exe", exe.as_str()], ["-HelperExe", helper.as_str()]] {
+        let outcome = finish(bare_install_command(&case, &key, &args));
+
+        assert_eq!(outcome.code, Some(1), "{args:?}: {outcome:?}");
+        assert_eq!(outcome.stdout, "", "{args:?}: {outcome:?}");
+        assert_eq!(
+            unix(&outcome.stderr),
+            "install: -Exe and -HelperExe are given together or not at all\n",
+            "{args:?}: {outcome:?}"
+        );
+    }
+    assert!(!install_dir(&case).exists(), "nothing was installed");
+}
+
+#[test]
+fn a_missing_helper_exe_is_refused() {
+    let case = Case::new("a_missing_helper_exe_is_refused");
+    let key = EnvironmentKey::new("a_missing_helper_exe_is_refused");
+    let exe = copy_gate(&case, "gate-a.exe");
+    let missing = case.folder().join("no-helper.exe");
+
+    let outcome = install_with_helper(&case, &key, &missing, &["-Exe", &shown(&exe)]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        format!("install: no desktop helper at '{}'\n", shown(&missing)),
+        "{outcome:?}"
+    );
+    assert!(!install_dir(&case).exists(), "nothing was installed: {outcome:?}");
+}
+
+#[test]
+fn an_unreadable_helper_is_refused() {
+    let case = Case::new("an_unreadable_helper_is_refused");
+    let key = EnvironmentKey::new("an_unreadable_helper_is_refused");
+    let exe = copy_gate(&case, "gate-a.exe");
+    let helper = stand_in_helper(&case, "helper-a.exe", b"helper one");
+    let held = hold_against_reads(&helper);
+
+    let outcome = install_with_helper(&case, &key, &helper, &["-Exe", &shown(&exe)]);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert!(
+        unix(&outcome.stderr).starts_with(&format!("install: could not read the desktop helper at '{}': ", shown(&helper))),
+        "{outcome:?}"
+    );
+    assert!(!install_dir(&case).exists(), "nothing was installed: {outcome:?}");
+}
+
+#[test]
+fn an_installed_helper_that_cannot_be_read_changes_nothing() {
+    let case = Case::new("an_installed_helper_that_cannot_be_read_changes_nothing");
+    let key = EnvironmentKey::new("an_installed_helper_that_cannot_be_read_changes_nothing");
+    let (first, old_helper) = installed_pair_a(&case, &key);
+    let second = copy_gate_with_a_byte(&case, "gate-b.exe");
+    let new_helper = stand_in_helper(&case, "helper-b.exe", b"helper two");
+    let held = hold_against_reads(&installed_helper(&case));
+
+    let outcome = install_with_helper(&case, &key, &new_helper, &["-Exe", &shown(&second)]);
+
+    drop(held);
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert!(
+        unix(&outcome.stderr).starts_with(&format!(
+            "install: could not read the desktop helper at '{}': ",
+            shown(&installed_helper(&case))
+        )),
+        "{outcome:?}"
+    );
+    assert_same_bytes(&installed_gate(&case), &first);
+    assert_same_bytes(&installed_helper(&case), &old_helper);
+    assert!(aside_copies(&case).is_empty(), "{:?}", aside_copies(&case));
+}
+
+#[test]
+fn a_new_helper_beside_the_same_gate_replaces_only_the_helper() {
+    let case = Case::new("a_new_helper_beside_the_same_gate_replaces_only_the_helper");
+    let key = EnvironmentKey::new("a_new_helper_beside_the_same_gate_replaces_only_the_helper");
+    let (first, _) = installed_pair_a(&case, &key);
+    let new_helper = stand_in_helper(&case, "helper-b.exe", b"helper two");
+
+    let outcome = install_with_helper(&case, &key, &new_helper, &["-Exe", &shown(&first)]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stdout),
+        format!(
+            "install: gate {} already installed at {}; installed its desktop helper at {}\n",
+            version_of(&first),
+            shown(&installed_gate(&case)),
+            shown(&installed_helper(&case))
+        ),
+        "{outcome:?}"
+    );
+    assert_same_bytes(&installed_gate(&case), &first);
+    assert_same_bytes(&installed_helper(&case), &new_helper);
+    assert!(aside_copies(&case).is_empty(), "gate.exe was not moved aside: {:?}", aside_copies(&case));
 }

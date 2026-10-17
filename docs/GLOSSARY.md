@@ -58,7 +58,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Desktop helper**: `gate-desktop-helper`, the Windows-subsystem exe a scheduled task starts in the builder's logged-on session at the box's request, which connects to the box's control pipe, creates a routed command suspended on the interactive desktop (`DesktopLaunch`) with the box's output pipes, and reports it for the box to adopt.
 - **Desktop run**: a routed `gate box run` whose payload sets `Desktop` true, so its command is to run on the builder's logged-on desktop; the box refuses it with the `desktop` tag when it cannot.
 - **Desktop stage**: the box's step after the checkout and the restores in a desktop run: it resolves the program and the run's Godot, takes the machine-wide desktop lock within the run's wait and reads the console session again under the lock, before any hand-off to the helper.
-- **Desktop task**: the Task Scheduler task `gate push` registers on a builder, which starts the desktop helper in the logged-on user's session when the box asks.
+- **Desktop task**: the Task Scheduler task that `gate push` is to register on a builder (it does not yet, nor send the helper), which starts the desktop helper in the logged-on user's session when the box asks.
 - **Diagnostics block**: the record of what was running that a kill writes to the log before it terminates the job: the job's processes, the descendants outside the job and the last samples.
 - **Drain**: see critical drain.
 - **Drained cutover**: a cutover in which every gate of the old generation finishes before the switch completes, while the two generations share the slot mutexes and take turns on them.
