@@ -1,7 +1,7 @@
 //! Starting a registered scheduled task in a given session through the Task Scheduler's COM API, once its definition
 //! is checked: the desktop helper's task, which runs the helper beside the running program in the logged-on user's
-//! session. The COM work runs on a short-lived thread of its own, in the multithreaded apartment. The Task Scheduler's
-//! class is made from `taskschd.dll`, loaded once for the process by its full path in the system folder and never
+//! session; and registering that task, with the definition the check wants. The COM work runs on a short-lived thread
+//! of its own, in the multithreaded apartment. The Task Scheduler's class is made from `taskschd.dll`, loaded once for the process by its full path in the system folder and never
 //! freed, never looked up in the registry, where a user's own class entry could stand in for it; every interface is
 //! released before that thread ends.
 
@@ -24,8 +24,9 @@ use windows::Win32::Foundation::VARIANT_BOOL;
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize, IClassFactory};
 use windows::Win32::System::TaskScheduler::{
     IAction, IExecAction, IRegisteredTask, IRunningTask, ITaskDefinition, ITaskFolder, ITaskService, ITaskSettings, ITaskSettings3, TASK_ACTION_EXEC,
-    TASK_ACTION_TYPE, TASK_INSTANCES_PARALLEL, TASK_INSTANCES_POLICY, TASK_LOGON_INTERACTIVE_TOKEN, TASK_LOGON_TYPE, TASK_RUN_IGNORE_CONSTRAINTS,
-    TASK_RUN_USE_SESSION_ID, TASK_RUNLEVEL_LUA, TASK_RUNLEVEL_TYPE, TASK_STATE, TASK_STATE_DISABLED, TASK_STATE_READY, TaskScheduler,
+    TASK_ACTION_TYPE, TASK_CREATE_OR_UPDATE, TASK_DONT_ADD_PRINCIPAL_ACE, TASK_INSTANCES_PARALLEL, TASK_INSTANCES_POLICY,
+    TASK_LOGON_INTERACTIVE_TOKEN, TASK_LOGON_TYPE, TASK_RUN_IGNORE_CONSTRAINTS, TASK_RUN_USE_SESSION_ID, TASK_RUNLEVEL_LUA, TASK_RUNLEVEL_TYPE,
+    TASK_STATE, TASK_STATE_DISABLED, TASK_STATE_READY, TaskScheduler,
 };
 use windows::Win32::System::Variant::{VARIANT, VT_BSTR};
 use windows::core::{BSTR, GUID, HRESULT, IUnknown, Interface};
@@ -52,11 +53,16 @@ const TASK_PRIORITY: i32 = 4;
 /// The execution time limit the task must have: none, so the Task Scheduler never ends the helper or its job.
 const NO_TIME_LIMIT: &str = "PT0S";
 
-/// `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`: no task of the name in the folder.
+/// `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`: no task of the name in the folder, and also what `GetFolder` gives for a
+/// folder that does not exist, nested or not.
 const TASK_NOT_FOUND: i32 = 0x8007_0002_u32.cast_signed();
 
-/// `HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND)`: no folder of the name.
+/// `HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND)`: a path that names no folder; the Task Scheduler may give it for a folder
+/// that does not exist, though `GetFolder` gives [`TASK_NOT_FOUND`]'s code for one.
 const FOLDER_NOT_FOUND: i32 = 0x8007_0003_u32.cast_signed();
+
+/// `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)`: a folder made that another made first.
+const ALREADY_EXISTS: i32 = 0x8007_00B7_u32.cast_signed();
 
 /// The most characters of a text read from the task that an error shows, once escaped.
 const SHOWN_LIMIT: usize = 200;
@@ -131,11 +137,11 @@ pub enum StartedTask {
 pub enum TaskError {
     /// No task, or no folder, of the path is registered; nothing was started.
     NotRegistered,
-    /// The task is registered with a definition other than the one the check wants; the text names the first setting
-    /// that differs. Nothing was started.
+    /// The task is registered with a definition other than the one the check wants, or its folder's security fails
+    /// the check; the text names the first setting that differs. Nothing was started, or registered.
     SetUpWrong(String),
     /// A call of the Task Scheduler or of COM failed before the task was started, so nothing was; the text names the
-    /// call and holds the system's message.
+    /// call and holds the system's message. For a registration, also a task read back that fails the check.
     Failed(String),
     /// The task was started, then a call of the Task Scheduler failed; the text names the call and holds the system's
     /// message. The instance may be running, and its helper ends by its own limits.
@@ -243,17 +249,17 @@ pub fn run_task(start: &TaskStart<'_>, deadline: Instant, wake: &[BorrowedHandle
         // The thread is left to finish on its own; one that has not reached the run yet starts nothing.
         cancel.store(true, Ordering::SeqCst);
     }
-    answered(waited, thread)
+    answered(waited, thread, "starts the task")
 }
 
-/// The answer of the start `thread` asked for, as the wait `waited` for that thread and the wake handles found it: the
-/// thread's own result once it ended; [`TaskError::Unanswered`] when it panicked or the wait failed. A thread the wait
-/// did not see end is left to finish on its own.
-fn answered(waited: io::Result<Signalled>, thread: JoinHandle<Result<StartedTask, TaskError>>) -> Result<StartedTask, TaskError> {
+/// The answer of the `thread` that `doing` (such as `starts the task`) asked the Task Scheduler, as the wait `waited`
+/// for that thread and the wake handles found it: the thread's own result once it ended; [`TaskError::Unanswered`] when
+/// it panicked or the wait failed. A thread the wait did not see end is left to finish on its own.
+fn answered<T>(waited: io::Result<Signalled>, thread: JoinHandle<Result<T, TaskError>>, doing: &str) -> Result<T, TaskError> {
     match waited {
         Ok(Signalled::Event) => thread.join().unwrap_or_else(|panic| {
             Err(TaskError::unanswered(&format!(
-                "the thread that starts the task panicked: {}",
+                "the thread that {doing} panicked: {}",
                 panic_text(&*panic)
             )))
         }),
@@ -463,19 +469,331 @@ impl Drop for Apartment {
 /// Connects to the Task Scheduler, finds the task, checks its definition, then runs it and reads the process it
 /// started.
 fn start_checked(library: &SystemLibrary, request: &Request) -> Result<StartedTask, TaskError> {
+    let service = connected(library)?;
+    let task = checked_task(&service, &request.folder, &request.name, &request.expected)?;
+    run(&task, request)
+}
+
+/// A new Task Scheduler service object of `library`, connected to this machine as the running user.
+fn connected(library: &SystemLibrary) -> Result<ITaskService, TaskError> {
     let service = library.task_service()?;
     let local = VARIANT::default();
     // SAFETY: four empty variants connect to this machine as the running user.
     unsafe { service.Connect(&local, &local, &local, &local) }.map_err(failed("connect to the Task Scheduler"))?;
+    Ok(service)
+}
+
+/// The task `name` of the folder `folder`, once the folder's security and the task's definition pass the check against
+/// `expected`.
+fn checked_task(service: &ITaskService, folder: &str, name: &str, expected: &Expected) -> Result<IRegisteredTask, TaskError> {
     // SAFETY: the folder's path is a valid BSTR for the call.
-    let found = unsafe { service.GetFolder(&BSTR::from(request.folder.as_str())) }.map_err(missing("open the task's folder"))?;
+    let found = unsafe { service.GetFolder(&BSTR::from(folder)) }.map_err(missing("open the task's folder"))?;
     // SAFETY: the task's name is a valid BSTR for the call.
-    let task = unsafe { found.GetTask(&BSTR::from(request.name.as_str())) }.map_err(missing("open the task"))?;
+    let task = unsafe { found.GetTask(&BSTR::from(name)) }.map_err(missing("open the task"))?;
     let (owner, dacl) = read_folder_security(&found)?;
-    check_folder(owner.as_deref(), dacl.as_deref(), &request.folder).map_err(|what| TaskError::set_up_wrong(&what))?;
+    check_folder(owner.as_deref(), dacl.as_deref(), folder).map_err(|what| TaskError::set_up_wrong(&what))?;
     let definition = read_definition(&task)?;
-    check_definition(&definition, &request.expected).map_err(|what| TaskError::set_up_wrong(&what))?;
-    run(&task, request)
+    check_definition(&definition, expected).map_err(|what| TaskError::set_up_wrong(&what))?;
+    Ok(task)
+}
+
+/// The security descriptor string the desktop helper's task and its folder are registered with, `user_sid` naming the
+/// user it runs as: owned by Administrators, its DACL protected from inheritance, SYSTEM and Administrators allowed
+/// everything and the user reading alone (`FR`, which [`READ_ONLY`] holds).
+fn security_sddl(user_sid: &str) -> String {
+    format!("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;{user_sid})")
+}
+
+/// The owner and the DACL [`security_sddl`] names for `user_sid`, as the check reads them.
+#[cfg(test)]
+fn wanted_security(user_sid: &str) -> Result<(Option<String>, Option<Vec<Entry>>), TaskError> {
+    owner_and_dacl(&BSTR::from(security_sddl(user_sid).as_str()), "the wanted")
+}
+
+/// The definition the desktop helper's task is registered with, the one [`check_definition`] wants but for its security,
+/// which the task gets from the descriptor [`security_sddl`] at its registration and the XML never holds, so its owner
+/// and DACL are left empty: running `helper` with `$(Arg0)` as the user whose SID is `user_sid`. A `helper` that is not
+/// Unicode cannot be written into a task, and one that holds a `%` is refused, since the Task Scheduler expands
+/// `%VAR%` in the action's program from the environment of the task's user, who can change it.
+fn wanted_definition(helper: &Path, user_sid: &str) -> Result<Definition, TaskError> {
+    let Some(path) = helper.to_str() else {
+        return Err(TaskError::failed(&format!(
+            "the desktop helper's path {} is not Unicode",
+            shown(&helper.display().to_string())
+        )));
+    };
+    if path.contains('%') {
+        return Err(TaskError::failed(&format!("the desktop helper's path holds a %: {}", shown(path))));
+    }
+    Ok(Definition {
+        enabled: true,
+        allow_demand_start: true,
+        parallel: true,
+        priority: TASK_PRIORITY,
+        restart_count: 0,
+        maintenance: false,
+        no_start_on_batteries: false,
+        stop_on_batteries: false,
+        time_limit: NO_TIME_LIMIT.to_owned(),
+        triggers: 0,
+        actions: vec![Action::Exec {
+            path: path.to_owned(),
+            arguments: ARG0_ARGUMENTS.to_owned(),
+            directory: String::new(),
+        }],
+        interactive_token: true,
+        least_privilege: true,
+        user: user_sid.to_owned(),
+        user_sid: Some(user_sid.to_owned()),
+        owner: None,
+        dacl: None,
+    })
+}
+
+/// `definition` as Task Scheduler XML, every text XML-escaped. It writes no triggers, no restart on failure and no
+/// maintenance settings, the only values of those [`check_definition`] accepts; its owner and DACL are not part of the
+/// XML, but of the descriptor the task is registered with.
+fn task_xml(definition: &Definition) -> String {
+    let flag = |set: bool| if set { "true" } else { "false" };
+    let logon = if definition.interactive_token { "InteractiveToken" } else { "Password" };
+    let level = if definition.least_privilege {
+        "LeastPrivilege"
+    } else {
+        "HighestAvailable"
+    };
+    let policy = if definition.parallel { "Parallel" } else { "IgnoreNew" };
+    let actions: String = definition.actions.iter().map(exec_xml).collect();
+    format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n",
+            "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n",
+            "  <Principals>\n",
+            "    <Principal id=\"Author\">\n",
+            "      <UserId>{user}</UserId>\n",
+            "      <LogonType>{logon}</LogonType>\n",
+            "      <RunLevel>{level}</RunLevel>\n",
+            "    </Principal>\n",
+            "  </Principals>\n",
+            "  <Settings>\n",
+            "    <Enabled>{enabled}</Enabled>\n",
+            "    <AllowStartOnDemand>{on_demand}</AllowStartOnDemand>\n",
+            "    <MultipleInstancesPolicy>{policy}</MultipleInstancesPolicy>\n",
+            "    <Priority>{priority}</Priority>\n",
+            "    <DisallowStartIfOnBatteries>{no_start}</DisallowStartIfOnBatteries>\n",
+            "    <StopIfGoingOnBatteries>{stop}</StopIfGoingOnBatteries>\n",
+            "    <ExecutionTimeLimit>{limit}</ExecutionTimeLimit>\n",
+            "  </Settings>\n",
+            "  <Actions Context=\"Author\">\n",
+            "{actions}",
+            "  </Actions>\n",
+            "</Task>\n",
+        ),
+        user = xml_escaped(&definition.user),
+        logon = logon,
+        level = level,
+        enabled = flag(definition.enabled),
+        on_demand = flag(definition.allow_demand_start),
+        policy = policy,
+        priority = definition.priority,
+        no_start = flag(definition.no_start_on_batteries),
+        stop = flag(definition.stop_on_batteries),
+        limit = xml_escaped(&definition.time_limit),
+        actions = actions,
+    )
+}
+
+/// `action` as the `Exec` element of a task's XML; nothing for an action that starts no program, which the
+/// registration never writes.
+fn exec_xml(action: &Action) -> String {
+    let Action::Exec { path, arguments, directory } = action else {
+        return String::new();
+    };
+    let directory = if directory.is_empty() {
+        String::new()
+    } else {
+        format!("      <WorkingDirectory>{}</WorkingDirectory>\n", xml_escaped(directory))
+    };
+    format!(
+        "    <Exec>\n      <Command>{}</Command>\n      <Arguments>{}</Arguments>\n{directory}    </Exec>\n",
+        xml_escaped(path),
+        xml_escaped(arguments)
+    )
+}
+
+/// `text` with each of XML's markup characters, `&`, `<`, `>`, `"` and `'`, written as its entity.
+fn xml_escaped(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+/// What the thread that registers the task needs, owned.
+struct Registration {
+    folder: String,
+    name: String,
+    expected: Expected,
+}
+
+/// Registers the task `path`, such as `\gate\desktop-helper`, with the definition [`run_task`] checks for: running
+/// `helper` with `$(Arg0)`, as the user whose SID is `user_sid`, the task and its folder owned by Administrators with a
+/// protected DACL that lets that user only read them. A folder that does not exist is made with that descriptor; one
+/// that exists must pass the check [`run_task`] makes of it, and a task that exists must have an owner and a DACL that
+/// pass it, or the registration is refused and neither is changed. A task that passes is updated in place. Once
+/// registered, the task is read back and checked as [`run_task`] checks it, without being started. It never deletes,
+/// stops or starts a task. The Task Scheduler is asked on a thread of its own, which this waits for.
+///
+/// # Errors
+///
+/// [`TaskError::SetUpWrong`] naming why a folder or a task that exists is refused; [`TaskError::Failed`] naming the
+/// call that failed and its HRESULT, a task read back that fails the check, a helper path that is not Unicode or holds
+/// a `%`, or a path that holds no task name; [`TaskError::TimedOut`] when the Task Scheduler did not answer by
+/// `deadline`, the thread that asked it left to finish on its own; [`TaskError::Unanswered`] when the wait failed or
+/// that thread panicked.
+pub fn register_task(path: &str, helper: &Path, user_sid: &str, deadline: Instant) -> Result<(), TaskError> {
+    let Some((folder, name)) = split_task_path(path) else {
+        return Err(TaskError::failed(&format!("{} is not a task path, \\<folder>\\<name>", shown(path))));
+    };
+    let registration = Registration {
+        folder: folder.to_owned(),
+        name: name.to_owned(),
+        expected: Expected {
+            helper: helper.to_owned(),
+            user_sid: user_sid.to_owned(),
+        },
+    };
+    let thread = std::thread::Builder::new()
+        .name("gate-task-register".to_owned())
+        .spawn(move || register_on_this_thread(&registration))
+        .map_err(|error| TaskError::failed(&format!("the thread that registers the task could not be made: {error}")))?;
+    let waited = wait_any(&[thread.as_raw_handle()], deadline);
+    answered(waited, thread, "registers the task")
+}
+
+/// The task registered on this thread: COM joined, then the work, whose interfaces are all released when it returns,
+/// before COM is left.
+fn register_on_this_thread(registration: &Registration) -> Result<(), TaskError> {
+    let library = task_library()?;
+    let _apartment = Apartment::join()?;
+    register_checked(library, registration)
+}
+
+/// Finds or makes the folder, refuses a folder or a task whose security fails the check, registers the task, then reads
+/// it back and checks it.
+fn register_checked(library: &SystemLibrary, registration: &Registration) -> Result<(), TaskError> {
+    let Expected { helper, user_sid } = &registration.expected;
+    let definition = wanted_definition(helper, user_sid)?;
+    let sddl = security_sddl(user_sid);
+    let service = connected(library)?;
+    let folder = wanted_folder(&service, &registration.folder, &sddl)?;
+    refuse_unsafe_task(&folder, &registration.name)?;
+    let flags = TASK_CREATE_OR_UPDATE.0 | TASK_DONT_ADD_PRINCIPAL_ACE.0;
+    register_definition(&folder, &registration.name, &task_xml(&definition), user_sid, &sddl, flags)?;
+    match checked_task(&service, &registration.folder, &registration.name, &registration.expected) {
+        Ok(_) => Ok(()),
+        Err(TaskError::SetUpWrong(what)) => Err(TaskError::failed(&format!("the task read back is set up wrong: {what}"))),
+        Err(TaskError::NotRegistered) => Err(TaskError::failed("the task read back is not registered")),
+        Err(other) => Err(other),
+    }
+}
+
+/// Registers the task `name` of `folder` from the XML `xml` with `flags`, as the user whose SID is `user_sid` with the
+/// interactive token and no password, secured by the descriptor string `sddl`; the user and the descriptor go in
+/// variants of [`handed_variant`].
+fn register_definition(folder: &ITaskFolder, name: &str, xml: &str, user_sid: &str, sddl: &str, flags: i32) -> Result<(), TaskError> {
+    // SAFETY: both BSTRs outlive the call; the two string variants each own a string this side never frees, and the
+    // empty variant passes no password, as an interactive token needs none.
+    unsafe {
+        folder.RegisterTask(
+            &BSTR::from(name),
+            &BSTR::from(xml),
+            flags,
+            &handed_variant(user_sid),
+            &VARIANT::default(),
+            TASK_LOGON_INTERACTIVE_TOKEN,
+            &handed_variant(sddl),
+        )
+    }
+    .map(drop)
+    .map_err(com_failed("RegisterTask"))
+}
+
+/// A variant holding a new BSTR of `text`, for a string variant passed to the Task Scheduler. With `OANOCACHE=1`,
+/// `a_task_registered_run_and_read_on_one_thread_leaves_the_heap_whole` failed while `CreateFolder` and `RegisterTask`
+/// took a variant borrowing a string this side also freed, and passes with this fresh string that this side never
+/// frees: the variant type has no destructor and the string sits in a `ManuallyDrop` field. Which call frees the
+/// string is not known; `RunEx`'s parameters take the same form by analogy, unmeasured. Where no call frees it, it is
+/// a leak of that one string.
+fn handed_variant(text: &str) -> VARIANT {
+    let mut variant = VARIANT::default();
+    // SAFETY: the variant is set to hold a BSTR it alone points to, in a `ManuallyDrop` field nothing on this side drops.
+    unsafe {
+        let value = &mut variant.Anonymous.Anonymous;
+        value.vt = VT_BSTR;
+        value.Anonymous.bstrVal = ManuallyDrop::new(BSTR::from(text));
+    }
+    variant
+}
+
+/// The folder `folder`: made with the descriptor `sddl` when it does not exist; when it does, refused unless its
+/// security passes the check.
+fn wanted_folder(service: &ITaskService, folder: &str, sddl: &str) -> Result<ITaskFolder, TaskError> {
+    // SAFETY: the folder's path is a valid BSTR for the call.
+    match unsafe { service.GetFolder(&BSTR::from(folder)) } {
+        Ok(found) => checked_folder(found, folder),
+        Err(error) if is_not_found(&error) => {
+            // SAFETY: the root's path is a valid BSTR for the call.
+            let root = unsafe { service.GetFolder(&BSTR::from("\\")) }.map_err(com_failed("GetFolder"))?;
+            // SAFETY: the name is a valid BSTR, and the variant owns a string this side never frees.
+            match unsafe { root.CreateFolder(&BSTR::from(folder.trim_start_matches('\\')), &handed_variant(sddl)) } {
+                Ok(made) => Ok(made),
+                // Another registration made it between the look and the make: it is checked as one found would be.
+                Err(error) if error.code().0 == ALREADY_EXISTS => {
+                    // SAFETY: the folder's path is a valid BSTR for the call.
+                    let found = unsafe { service.GetFolder(&BSTR::from(folder)) }.map_err(com_failed("GetFolder"))?;
+                    checked_folder(found, folder)
+                }
+                Err(error) => Err(com_failed("CreateFolder")(error)),
+            }
+        }
+        Err(error) => Err(com_failed("GetFolder")(error)),
+    }
+}
+
+/// `found`, the folder `folder`, once its security passes the check; else the refusal naming why.
+fn checked_folder(found: ITaskFolder, folder: &str) -> Result<ITaskFolder, TaskError> {
+    let (owner, dacl) = read_folder_security(&found)?;
+    check_folder(owner.as_deref(), dacl.as_deref(), folder).map_err(|what| TaskError::set_up_wrong(&what))?;
+    Ok(found)
+}
+
+/// Refuses the task `name` of `folder` when it exists and its owner or DACL fails the check; a task that does not exist,
+/// or one whose security passes, is left to the registration to make or update.
+fn refuse_unsafe_task(folder: &ITaskFolder, name: &str) -> Result<(), TaskError> {
+    // SAFETY: the task's name is a valid BSTR for the call.
+    let task = match unsafe { folder.GetTask(&BSTR::from(name)) } {
+        Ok(task) => task,
+        Err(error) if is_not_found(&error) => return Ok(()),
+        Err(error) => return Err(com_failed("GetTask")(error)),
+    };
+    let mut security = Definition::default();
+    read_security(&task, &mut security)?;
+    check_owner(security.owner.as_deref())
+        .and_then(|()| check_dacl(security.dacl.as_deref()))
+        .map_err(|what| TaskError::set_up_wrong(&what))
+}
+
+/// The error of a failed registration call `call`: the call's name, the system's message and the HRESULT.
+fn com_failed(call: &'static str) -> impl Fn(windows::core::Error) -> TaskError {
+    move |error| TaskError::failed(&format!("{call}: {} (0x{:08X})", shown(&error.message()), error.code().0))
 }
 
 /// Runs `task` in the request's session, as no named user and ignoring its constraints, with the request's argument
@@ -485,19 +803,10 @@ fn run(task: &IRegisteredTask, request: &Request) -> Result<StartedTask, TaskErr
     if request.cancel.load(Ordering::SeqCst) || Instant::now() >= request.deadline {
         return Err(TaskError::failed("the start was given up before the task was run"));
     }
-    let argument = BSTR::from(request.argument.as_str());
-    let mut parameters = VARIANT::default();
-    // SAFETY: the variant is set to hold a BSTR whose pointer is a bitwise copy of `argument`'s, in a field that never
-    // frees it; `argument` alone owns the string and outlives the call that reads the variant.
-    unsafe {
-        let value = &mut parameters.Anonymous.Anonymous;
-        value.vt = VT_BSTR;
-        value.Anonymous.bstrVal = ManuallyDrop::new(std::ptr::read(&raw const argument));
-    }
+    let parameters = handed_variant(&request.argument);
     let flags = TASK_RUN_USE_SESSION_ID.0 | TASK_RUN_IGNORE_CONSTRAINTS.0;
-    // SAFETY: the variant holds a valid BSTR, and the empty user name asks for the task's own principal.
+    // SAFETY: the variant owns a string this side never frees, and the empty user name asks for the task's own principal.
     let running = unsafe { task.RunEx(&parameters, flags, request.session_id.cast_signed(), &BSTR::new()) }.map_err(failed("run the task"))?;
-    drop(argument);
     let by = Instant::now()
         .checked_add(request.pid_wait)
         .map_or(request.deadline, |end| end.min(request.deadline));
@@ -668,7 +977,8 @@ fn check_limits(definition: &Definition) -> Result<(), String> {
 
 /// The first thing of `actions` that differs from one action running `helper` with the arguments `$(Arg0)` and no
 /// working folder. One pair of quotes around the action's path is taken off; anything else, `%VAR%` among it, is
-/// compared as written.
+/// compared as written, and a path that holds a `%` is refused even when it is the helper's, since the Task Scheduler
+/// expands it from the environment of the task's user, who can change it.
 fn check_action(actions: &[Action], helper: &Path) -> Result<(), String> {
     let [action] = actions else {
         return Err(format!("it has {} actions, not one", actions.len()));
@@ -679,6 +989,12 @@ fn check_action(actions: &[Action], helper: &Path) -> Result<(), String> {
     let unquoted = path.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')).unwrap_or(path);
     if !same_path_text(unquoted, helper) {
         return Err(format!("its action runs {}, not {}", shown(path), shown(&helper.display().to_string())));
+    }
+    if unquoted.contains('%') {
+        return Err(format!(
+            "its action's program {} holds a %, which the Task Scheduler expands from its user's environment",
+            shown(path)
+        ));
     }
     if arguments != ARG0_ARGUMENTS {
         return Err(format!("its action's arguments are {}, not {ARG0_ARGUMENTS}", shown(arguments)));
@@ -1060,10 +1376,18 @@ fn unseen(what: &'static str) -> impl Fn(windows::core::Error) -> TaskError {
 
 /// As [`failed`], but a task or folder that does not exist is [`TaskError::NotRegistered`].
 fn missing(what: &'static str) -> impl Fn(windows::core::Error) -> TaskError {
-    move |error| match error.code().0 {
-        TASK_NOT_FOUND | FOLDER_NOT_FOUND => TaskError::NotRegistered,
-        _ => failed(what)(error),
+    move |error| {
+        if is_not_found(&error) {
+            TaskError::NotRegistered
+        } else {
+            failed(what)(error)
+        }
     }
+}
+
+/// Whether `error` says the task or the folder asked for does not exist: [`TASK_NOT_FOUND`] or [`FOLDER_NOT_FOUND`].
+fn is_not_found(error: &windows::core::Error) -> bool {
+    matches!(error.code().0, TASK_NOT_FOUND | FOLDER_NOT_FOUND)
 }
 
 /// The text of a failed call that did `what`.
@@ -1092,7 +1416,8 @@ mod tests {
 
     use super::{
         Action, Definition, Entry, Expected, FOLDER_NOT_FOUND, Instance, StartedTask, TASK_NOT_FOUND, TaskArgument, TaskError, TaskStart, answered,
-        check_definition, check_folder, check_loaded_from, engine_pid, failed, given_up, missing, run_task, split_task_path, unseen,
+        check_action, check_definition, check_folder, check_loaded_from, engine_pid, failed, given_up, is_not_found, missing, register_task,
+        run_task, split_task_path, task_xml, unseen, wanted_definition, wanted_security,
     };
     use crate::pipe::Signalled;
 
@@ -1710,7 +2035,7 @@ mod tests {
     fn a_start_the_task_scheduler_gave_no_answer_to_may_have_happened() {
         let panicked = std::thread::spawn(|| -> Result<StartedTask, TaskError> { panic!("the call broke\nhere") });
 
-        let answer = answered(Ok(Signalled::Event), panicked);
+        let answer = answered(Ok(Signalled::Event), panicked, "starts the task");
 
         assert_eq!(
             answer,
@@ -1719,7 +2044,7 @@ mod tests {
             ))
         );
         let finished = std::thread::spawn(|| Ok(StartedTask::NoPid));
-        let answer = answered(Err(io::Error::other("refused")), finished);
+        let answer = answered(Err(io::Error::other("refused")), finished, "starts the task");
         assert_eq!(
             answer,
             Err(TaskError::Unanswered("the wait for the Task Scheduler failed: refused".to_owned()))
@@ -1749,6 +2074,297 @@ mod tests {
             );
             assert!(text.contains(r"x\u{a}gate-remote-refused: busy\u{2028}"), "{text:?}");
         }
+    }
+
+    #[test]
+    fn the_registered_definition_passes_the_check() {
+        let (owner, dacl) = wanted_security(USER).expect("the wanted descriptor is read");
+        let wanted = Definition {
+            owner: owner.clone(),
+            dacl: dacl.clone(),
+            ..wanted_definition(Path::new(HELPER), USER).expect("the wanted definition is built")
+        };
+
+        assert_eq!(check_definition(&wanted, &expected()), Ok(()));
+        assert_eq!(owner.as_deref(), Some("S-1-5-32-544"), "owned by Administrators");
+        assert_eq!(
+            check_folder(owner.as_deref(), dacl.as_deref(), "\\gate"),
+            Ok(()),
+            "the folder's descriptor"
+        );
+        assert_eq!(
+            dacl,
+            Some(vec![
+                allowed("S-1-5-18", 0x001f_01ff),
+                allowed("S-1-5-32-544", 0x001f_01ff),
+                allowed(USER, 0x0012_0089),
+            ]),
+            "SYSTEM and Administrators in full, the user reading"
+        );
+    }
+
+    #[test]
+    fn a_task_or_folder_not_found_is_either_not_found_code() {
+        for code in [TASK_NOT_FOUND, FOLDER_NOT_FOUND] {
+            assert!(is_not_found(&windows::core::Error::from_hresult(HRESULT(code))), "0x{code:08X}");
+        }
+        for code in [0x8007_0005_u32.cast_signed(), 0x8007_00B7_u32.cast_signed(), E_FAIL.0] {
+            assert!(!is_not_found(&windows::core::Error::from_hresult(HRESULT(code))), "0x{code:08X}");
+        }
+    }
+
+    #[test]
+    fn a_helper_path_that_holds_a_percent_is_refused() {
+        let helper = r"C:\Users\some%USERNAME%one\gate-desktop-helper.exe";
+
+        let refused = wanted_definition(Path::new(helper), USER);
+
+        assert_eq!(
+            refused.err().map(|error| error.to_string()).as_deref(),
+            Some(r"the desktop helper's path holds a %: C:\Users\some%USERNAME%one\gate-desktop-helper.exe")
+        );
+        let checked = Expected {
+            helper: PathBuf::from(helper),
+            user_sid: USER.to_owned(),
+        };
+        let task = Definition {
+            actions: vec![exec(helper, "$(Arg0)")],
+            ..good()
+        };
+        assert_eq!(
+            check_definition(&task, &checked),
+            Err(
+                r"its action's program C:\Users\some%USERNAME%one\gate-desktop-helper.exe holds a %, which the Task Scheduler expands from its user's environment"
+                    .to_owned()
+            ),
+            "the check refuses it even when it is the helper's own path"
+        );
+    }
+
+    #[test]
+    fn the_registered_task_xml_says_the_wanted_definition() {
+        let wanted = wanted_definition(Path::new(HELPER), USER).expect("the wanted definition is built");
+
+        let xml = task_xml(&wanted);
+
+        let want = concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n",
+            "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n",
+            "  <Principals>\n",
+            "    <Principal id=\"Author\">\n",
+            "      <UserId>S-1-5-21-1-2-3-1001</UserId>\n",
+            "      <LogonType>InteractiveToken</LogonType>\n",
+            "      <RunLevel>LeastPrivilege</RunLevel>\n",
+            "    </Principal>\n",
+            "  </Principals>\n",
+            "  <Settings>\n",
+            "    <Enabled>true</Enabled>\n",
+            "    <AllowStartOnDemand>true</AllowStartOnDemand>\n",
+            "    <MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>\n",
+            "    <Priority>4</Priority>\n",
+            "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n",
+            "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n",
+            "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n",
+            "  </Settings>\n",
+            "  <Actions Context=\"Author\">\n",
+            "    <Exec>\n",
+            "      <Command>C:\\Users\\someone\\AppData\\Local\\gate\\bin\\gate-desktop-helper.exe</Command>\n",
+            "      <Arguments>$(Arg0)</Arguments>\n",
+            "    </Exec>\n",
+            "  </Actions>\n",
+            "</Task>\n",
+        );
+        assert_eq!(xml, want);
+    }
+
+    #[test]
+    fn a_helper_path_with_xml_markup_is_escaped() {
+        let helper = r#"C:\a&b\<c>\"d'\gate-desktop-helper.exe"#;
+        let wanted = wanted_definition(Path::new(helper), USER).expect("the wanted definition is built");
+
+        let xml = task_xml(&wanted);
+
+        assert!(
+            xml.contains(r"<Command>C:\a&amp;b\&lt;c&gt;\&quot;d&apos;\gate-desktop-helper.exe</Command>"),
+            "{xml}"
+        );
+        assert_eq!(
+            check_action(&wanted.actions, Path::new(helper)),
+            Ok(()),
+            "the definition keeps the path as it is"
+        );
+    }
+
+    /// The security descriptor strings of the test folder `folder` and of its task `name`, read after a registration,
+    /// then the task and the folder deleted, on a thread in the multithreaded apartment of its own.
+    fn read_and_delete(folder: String, name: &'static str) -> [Result<String, String>; 4] {
+        std::thread::spawn(move || {
+            let library = super::task_library().expect("the Task Scheduler's library loads");
+            let _apartment = super::Apartment::join().expect("COM is set up");
+            let service = super::connected(library).expect("the Task Scheduler connects");
+            let text = |error: windows::core::Error| error.to_string();
+            let information = super::OWNER_AND_DACL.cast_signed();
+            // SAFETY: each interface is valid for its call, and each BSTR outlives it.
+            unsafe {
+                let found = service.GetFolder(&windows::core::BSTR::from(folder.as_str())).map_err(text);
+                let folder_sddl = found
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .and_then(|found| found.GetSecurityDescriptor(information).map(|sddl| sddl.to_string()).map_err(text));
+                let task_sddl = found.as_ref().map_err(Clone::clone).and_then(|found| {
+                    let task = found.GetTask(&windows::core::BSTR::from(name)).map_err(text)?;
+                    task.GetSecurityDescriptor(information).map(|sddl| sddl.to_string()).map_err(text)
+                });
+                let task_deleted = found
+                    .and_then(|found| found.DeleteTask(&windows::core::BSTR::from(name), 0).map_err(text))
+                    .map(|()| "deleted".to_owned());
+                // The folder is deleted whether or not its task was, and each result is reported.
+                let folder_deleted = service
+                    .GetFolder(&windows::core::BSTR::from("\\"))
+                    .and_then(|root| root.DeleteFolder(&windows::core::BSTR::from(folder.trim_start_matches('\\')), 0))
+                    .map(|()| "deleted".to_owned())
+                    .map_err(text);
+                [folder_sddl, task_sddl, task_deleted, folder_deleted]
+            }
+        })
+        .join()
+        .expect("the thread that reads and deletes the test task ends")
+    }
+
+    /// What [`make_register_run_read_and_delete`] found at each step.
+    struct HeapSteps {
+        made: Result<(), TaskError>,
+        registered: Result<(), TaskError>,
+        started: Result<StartedTask, TaskError>,
+        read: Result<Definition, TaskError>,
+        deleted: Result<(), String>,
+    }
+
+    /// Through the production calls, on one thread: makes the folder `\gate-test-<pid>` ([`super::wanted_folder`]),
+    /// registers a task in it ([`register_definition`]), runs it ([`super::run`]; its program does not exist, so nothing
+    /// starts), reads its definition back, then deletes the task and the folder. Each string variant goes to the Task
+    /// Scheduler there; the descriptor is one an unelevated process may set.
+    fn make_register_run_read_and_delete() -> HeapSteps {
+        let folder = format!(r"\gate-test-{}", std::process::id());
+        let user_sid = crate::current_user_sid().expect("the running user is read");
+        let mut session = 0;
+        // SAFETY: the call writes only to `session`, which is writable.
+        let found = unsafe { windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId(std::process::id(), &raw mut session) };
+        assert_ne!(found, 0, "this process's session is read: {}", io::Error::last_os_error());
+        std::thread::spawn(move || {
+            use windows::core::BSTR;
+            let library = super::task_library().expect("the Task Scheduler's library loads");
+            let _apartment = super::Apartment::join().expect("COM is set up");
+            let service = super::connected(library).expect("the Task Scheduler connects");
+            let wanted = wanted_definition(Path::new(HELPER), &user_sid).expect("the wanted definition is built");
+            // An unelevated registrant may neither name Administrators as owner nor keep less than full access itself.
+            let sddl = format!("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{user_sid})");
+            let made = super::wanted_folder(&service, &folder, &sddl);
+            let Ok(made) = made else {
+                return HeapSteps {
+                    made: made.map(drop),
+                    registered: Err(TaskError::failed("not tried")),
+                    started: Err(TaskError::failed("not tried")),
+                    read: Err(TaskError::failed("not tried")),
+                    deleted: Err("not tried".to_owned()),
+                };
+            };
+            let registered = super::register_definition(&made, "t", &task_xml(&wanted), &user_sid, &sddl, super::TASK_CREATE_OR_UPDATE.0);
+            // SAFETY: each interface is valid for its call, and each BSTR outlives it.
+            let task = unsafe { made.GetTask(&BSTR::from("t")) }.map_err(super::failed("open the task"));
+            let request = super::Request {
+                folder: folder.clone(),
+                name: "t".to_owned(),
+                argument: "1:00".to_owned(),
+                session_id: session,
+                expected: expected(),
+                pid_wait: Duration::from_millis(200),
+                deadline: Instant::now() + HANG_GUARD,
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let started = task.as_ref().map_err(Clone::clone).and_then(|task| super::run(task, &request));
+            let read = task.and_then(|task| super::read_definition(&task));
+            // SAFETY: each interface is valid for its call, and each BSTR outlives it.
+            let deleted = unsafe {
+                made.DeleteTask(&BSTR::from("t"), 0).and_then(|()| {
+                    let root = service.GetFolder(&BSTR::from("\\"))?;
+                    root.DeleteFolder(&BSTR::from(folder.trim_start_matches('\\')), 0)
+                })
+            }
+            .map_err(|error| error.to_string());
+            HeapSteps {
+                made: Ok(()),
+                registered,
+                started,
+                read,
+                deleted,
+            }
+        })
+        .join()
+        .expect("the thread that makes, registers, runs, reads and deletes the test task ends")
+    }
+
+    /// Set in the child run of [`a_task_registered_run_and_read_on_one_thread_leaves_the_heap_whole`], which does the
+    /// work; unset, the test starts that child.
+    const HEAP_CHILD: &str = "GATE_TEST_TASK_HEAP_CHILD";
+
+    /// Makes a folder, registers, runs and reads back a task on one thread through the production calls, then deletes
+    /// both. A string freed twice sits unseen in OLE Automation's per-thread cache of freed strings, so the work runs in
+    /// a child of this test binary with that cache off (`OANOCACHE=1`), where the heap catches a second free at once and
+    /// ends the child with `STATUS_HEAP_CORRUPTION`.
+    #[test]
+    #[ignore = "makes and deletes the folder \\gate-test-<pid> and a task in it on this machine; runs unelevated"]
+    fn a_task_registered_run_and_read_on_one_thread_leaves_the_heap_whole() {
+        if std::env::var_os(HEAP_CHILD).is_none() {
+            let name = "task::tests::a_task_registered_run_and_read_on_one_thread_leaves_the_heap_whole";
+            let mut command = std::process::Command::new(std::env::current_exe().expect("the test binary's path is read"));
+            command
+                .args(["--ignored", "--exact", name, "--test-threads", "1"])
+                .env(HEAP_CHILD, "1")
+                .env("OANOCACHE", "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let child = crate::spawn(&mut command)
+                .and_then(std::process::Child::wait_with_output)
+                .expect("the child run starts and ends");
+            let said = format!("{}{}", String::from_utf8_lossy(&child.stdout), String::from_utf8_lossy(&child.stderr));
+            assert!(child.status.success(), "the child run ends cleanly: {:?}\n{said}", child.status);
+            assert!(said.contains("1 passed"), "the child ran the test: {said}");
+            return;
+        }
+        let steps = make_register_run_read_and_delete();
+
+        assert_eq!(steps.made, Ok(()), "the test folder is made");
+        assert_eq!(steps.registered, Ok(()), "the test task is registered");
+        // Its program does not exist, so the instance may end before its process is asked for; `RunEx` itself must pass.
+        assert!(
+            !matches!(steps.started, Err(TaskError::Failed(_))),
+            "the test task is run: {:?}",
+            steps.started
+        );
+        let read = steps.read.expect("the test task's definition is read");
+        assert_eq!(read.actions, vec![exec(HELPER, "$(Arg0)")], "its action is the one registered");
+        assert_eq!(read.user_sid, crate::current_user_sid().ok(), "it runs as this user");
+        assert_eq!(steps.deleted, Ok(()), "the test task and folder are deleted");
+    }
+
+    #[test]
+    #[ignore = "needs an elevated session: registers and deletes a task under a temporary folder"]
+    #[expect(clippy::print_stdout, reason = "the hand proof reads the real descriptors the registration left")]
+    fn a_registered_task_reads_back_and_passes_the_check() {
+        let folder = format!(r"\gate-test-{}", std::process::id());
+        let path = format!(r"{folder}\desktop-helper");
+        let user_sid = crate::current_user_sid().expect("the running user is read");
+
+        let registered = register_task(&path, Path::new(HELPER), &user_sid, Instant::now() + HANG_GUARD);
+
+        let [folder_sddl, task_sddl, task_deleted, folder_deleted] = read_and_delete(folder.clone(), "desktop-helper");
+        println!("the folder {folder}: {folder_sddl:?}");
+        println!("the task {path}: {task_sddl:?}");
+        println!("the task's delete: {task_deleted:?}; the folder's delete: {folder_deleted:?}");
+        assert_eq!(registered, Ok(()), "the registration, read back and checked");
+        assert_eq!(task_deleted, Ok("deleted".to_owned()), "the test task is deleted");
+        assert_eq!(folder_deleted, Ok("deleted".to_owned()), "the test folder is deleted");
     }
 
     #[test]

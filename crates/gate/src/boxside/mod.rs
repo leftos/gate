@@ -15,6 +15,7 @@ mod packages;
 pub(crate) mod payload;
 mod preflight;
 pub(crate) mod probe;
+mod register;
 mod run;
 mod stop;
 mod tools;
@@ -40,21 +41,29 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
         console.err(&format!("gate: the box cannot limit its DLL search to System32: {error}"));
         return u32::from(FAILED_STATUS);
     }
-    let payload = match read_request(io::stdin().lock()) {
-        Ok(payload) => payload,
+    let seams = &request.seams;
+    match request.verb {
+        // A verb with no request never reads stdin, which the push script that runs it keeps for its own files.
+        BoxVerb::RegisterDesktop => register::register(seams, console),
+        BoxVerb::Preflight => with_request(console, |payload, console| preflight::preflight(payload, seams, console)),
+        BoxVerb::Boot => with_request(console, |_, console| boot_status(boot::say(console))),
+        BoxVerb::Run => with_request(console, |payload, console| run::run(payload, seams, console)),
+        BoxVerb::Stop => with_request(console, stop::stop),
+        BoxVerb::Outputs => with_request(console, outputs::outputs),
+        BoxVerb::Inflight => with_request(console, inflight::inflight),
+        BoxVerb::Inputs => with_request(console, |payload, console| inputs::inputs(payload, seams, console)),
+    }
+}
+
+/// Reads the request from stdin's first line and returns `answer`'s status for it; a request that cannot be read is
+/// said on stderr and is the usage status.
+fn with_request(console: &mut Console, answer: impl FnOnce(&Payload, &mut Console) -> u32) -> u32 {
+    match read_request(io::stdin().lock()) {
+        Ok(payload) => answer(&payload, console),
         Err(line) => {
             console.err(&line);
-            return u32::from(USAGE_STATUS);
+            u32::from(USAGE_STATUS)
         }
-    };
-    match request.verb {
-        BoxVerb::Preflight => preflight::preflight(&payload, &request.seams, console),
-        BoxVerb::Boot => boot_status(boot::say(console)),
-        BoxVerb::Run => run::run(&payload, &request.seams, console),
-        BoxVerb::Stop => stop::stop(&payload, console),
-        BoxVerb::Outputs => outputs::outputs(&payload, console),
-        BoxVerb::Inflight => inflight::inflight(&payload, console),
-        BoxVerb::Inputs => inputs::inputs(&payload, &request.seams, console),
     }
 }
 

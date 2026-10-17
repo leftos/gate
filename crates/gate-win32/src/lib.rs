@@ -61,7 +61,7 @@ pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, PrivateMu
 pub use pipe::{ConnectWait, PipeClient, PipeOwner, PipeRead, PipeServer, PipeWrite};
 pub use piped::{DesktopLaunch, OutputPipes, PipedConsole, PipedFed, PipedLaunch, PipedSuspended, breakaway_refused, output_pipes};
 pub use session::{ConnectState, LockState, SessionState, active_console_session, input_desktop_name, session_state};
-pub use task::{StartedTask, TaskArgument, TaskError, TaskStart, run_task};
+pub use task::{StartedTask, TaskArgument, TaskError, TaskStart, register_task, run_task};
 pub use times::{ProcessTimes, SystemTimes, file_time_now, process_times, system_times, wsl_vm_cpu};
 pub use token::{Account, Grant, NetworkGroup, RestrictedToken, TokenFacts, current_account, current_user_sid, token_facts};
 

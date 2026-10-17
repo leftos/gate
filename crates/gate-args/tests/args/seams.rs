@@ -1494,6 +1494,66 @@ fn box_seam_token_refuses_a_bad_missing_or_repeated_value() {
     }
 }
 
+/// The registration seam: `ok` or `fail` in place of the Task Scheduler's work, before the verb, given once.
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_register_seam_parses_ok_or_fail_and_refuses_another_value() {
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    let registering = |register_ok| {
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::RegisterDesktop,
+            seams: BoxSeams {
+                register_ok: Some(register_ok),
+                ..BoxSeams::default()
+            },
+        })
+    };
+    for (word, register_ok) in [("ok", true), ("fail", false)] {
+        assert_eq!(
+            invocation(&["box", "--test-box-register", word, "register-desktop"]),
+            registering(register_ok),
+            "{word}"
+        );
+        let joined = format!("--test-box-register={word}");
+        assert_eq!(
+            invocation(&["box", joined.as_str(), "register-desktop"]),
+            registering(register_ok),
+            "{joined}"
+        );
+    }
+    let rows: [(&[&str], &str); 5] = [
+        (
+            &["box", "--test-box-register", "OK", "register-desktop"],
+            "gate: --test-box-register must be ok or fail, got 'OK'",
+        ),
+        (
+            &["box", "--test-box-register", "refused", "register-desktop"],
+            "gate: --test-box-register must be ok or fail, got 'refused'",
+        ),
+        (
+            &["box", "--test-box-register=", "register-desktop"],
+            "gate: --test-box-register needs a value",
+        ),
+        (
+            &["box", "--test-box-register", "ok", "--test-box-register=fail", "register-desktop"],
+            "gate: --test-box-register is given twice",
+        ),
+        (&["box", "register-desktop", "--test-box-register", "ok"], BOX_USAGE),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), [want], "{words:?}");
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+#[test]
+fn box_seam_register_is_an_unknown_word_without_the_feature() {
+    assert_eq!(problems(&["box", "--test-box-register", "ok", "register-desktop"]), [BOX_USAGE]);
+}
+
 #[cfg(not(feature = "test-seams"))]
 #[test]
 fn box_seam_token_is_an_unknown_word_without_the_feature() {

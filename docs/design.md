@@ -438,7 +438,9 @@ The lines, each on stderr and escaped to one line where it carries a path, a rep
 
 Hidden from the usage and from `--help`. It is the builder side of a routed run, run over ssh on the builder ([The box side](#the-box-side)).
 
-`gate box preflight|run|stop|boot|outputs|inflight --stdin` takes exactly one verb and the word `--stdin`, and no `--state-dir`: the request is the first line of stdin, and every path comes from it. Any other shape (no verb, no `--stdin`, any other word in its place, an unknown verb, an extra word) prints `usage: gate box preflight|run|stop|boot|outputs|inflight --stdin (the base64 JSON request as stdin's first line)` alone on stderr and exits 2.
+`gate box preflight|run|stop|boot|outputs|inflight|inputs --stdin` takes exactly one verb and the word `--stdin`, and no `--state-dir`: the request is the first line of stdin, and every path comes from it. The one exception is `gate box register-desktop`, which takes no request and no `--stdin`.
+
+Any other shape (no verb, no `--stdin`, any other word in its place, an unknown verb, an extra word) prints `usage: gate box preflight|run|stop|boot|outputs|inflight|inputs --stdin (the base64 JSON request as stdin's first line)` alone on stderr and exits 2.
 
 ### Later subcommands
 
@@ -2207,7 +2209,9 @@ The desktop run has four more: `--test-box-desktop-session active|none|locked|ot
 
 `--test-box-desktop-mutex <unique>` names the desktop lock by a unique part under the box's own user in place of `gate\desktop`, and `--test-box-desktop-ms <n>` lowers each of the desktop run's waits to at most `n` milliseconds, one turn of the wait for the desktop lock included.
 
-The rules: a whole number above 0 and at most 2147483647 for the heartbeat, the sample period, the outputs and inputs budgets, the dotnet limit, the probe limit and the kill's leftover count, 1 to 100 for `--test-box-free-percent`, `true` or `false` for `--test-box-sampler-fail`. Without the feature each word gets the box usage line.
+`--test-box-register ok|fail` is the seam of the `register-desktop` verb: the registration succeeds, or fails as the seam refusing, in place of the Task Scheduler's work (the verb takes no `--stdin`, so the seam goes before it).
+
+The rules: `ok` or `fail` for `--test-box-register`, a whole number above 0 and at most 2147483647 for the heartbeat, the sample period, the outputs and inputs budgets, the dotnet limit, the probe limit and the kill's leftover count, 1 to 100 for `--test-box-free-percent`, `true` or `false` for `--test-box-sampler-fail`. Without the feature each word gets the box usage line.
 
 Every `gate box` verb first limits the box's DLL search to System32 (`gate_win32::set_default_dll_directories_system32`), before it reads the request or loads a library by name; a failure says `gate: the box cannot limit its DLL search to System32: <error>` and exits 1.
 
@@ -2681,6 +2685,21 @@ Built verbs:
   Caps: an archive of more than 50,000 members, or that decompresses to more than 4 GiB (`--test-inputs-budget-bytes` replaces it), is refused as the outputs archive's are, and the put fails (`gate: remote inputs put failed: <why>`, exit 1). The step is not watched on the box; the PC watches both calls ([The remote client's run](#routing), Inputs).
 
   Deployment prerequisites: the folders above `<root>` are writable by Administrators only; no account outside SYSTEM, Administrators and the builder's user may write in `<root>`; and `<root>\work` is not writable by other accounts. The stage's protection and the beneath-handle walk assume it; the box checks the stages folder it adopts, not the folders above it.
+- **`register-desktop`** (`boxside/register.rs`) registers the desktop helper's task, `\gate\desktop-helper`, through the Task Scheduler's COM interface (`gate_win32::register_task`, `task.rs`) for the user running the box, and says so on stdout. It reads no request and never reads stdin: its ssh line is `gate.exe box register-desktop` with no `--stdin`, and any word after the verb is the box usage. It is run elevated, over ssh, by the builder's setup, not by a routed run.
+
+  The task runs `gate-desktop-helper.exe`, beside the box's `gate.exe`, with the one argument `$(Arg0)`, which `RunEx` fills at each start, on demand (no trigger), with the interactive token of that user at least privilege and no password.
+
+  The `\gate` folder and the task carry a protected descriptor, owner Administrators, full access for SYSTEM and Administrators, and read for that user's SID. A folder that does not exist is made with it; a folder or a task that exists and whose owner or DACL fails the check `run_task` makes (anyone but SYSTEM and Administrators able to do more than read it) is refused, never adopted, and nothing is changed.
+
+  A task that passes is updated in place. Once registered, the task is read back and checked as `run_task` checks it, without being started.
+
+  On success it prints `gate-register: registered \gate\desktop-helper for <user SID>` and exits 0. Otherwise it prints `gate-register: failed: <why>` on stdout and exits 1.
+
+  The whys: `the running user could not be read: <error>`; `the desktop helper's path could not be read: <error>`; `the Task Scheduler did not answer in 10 s`; a refusal, `the task is set up wrong: <what differs>`; and a failed call, `<call>: <system message> (0x<HRESULT>)` (a helper path that is not Unicode or holds a `%`, and a task read back that fails the check, are also `failed`).
+
+  A squatted folder or task is cleared by an administrator deleting it, after which the verb registers again.
+
+  A `test-seams` build given `--test-box-register ok|fail` skips the Task Scheduler: `ok` says the registered line, `fail` says `failed: the test seam refused`.
 
 **The outputs module** (GATE-44) is shared by both ends, this exe, in `crates/gate/src/outputs/`. The box's `run` packs with it and the box's `outputs` verb sends the archive. The PC's manifest, the pending marker, the reading of the box's `gate-remote-outputs: ` line, the fetch of the archive and its install are built in the Rust remote client ([The remote client's run](#routing)).
 
@@ -2836,7 +2855,7 @@ A virtual Cargo workspace (`resolver = "3"`) with every crate under `crates/`, l
 |---|---|---|
 | `gate-state` | Every file format in the state root (claim, ticket, counts, journal, archive, `remote.json`), their readers and writers, path and object-name rules, journal history and `normalize_command`, the dashboard state ops-tower shows. Moved from ops-tower with its history (GATE-4). | yes; a pure crate |
 | `proc-table` | The process snapshot model (`ProcessInfo`, `ProcessTable`, `ProcessTree`) and its Windows reader. Moved with `gate-state` (GATE-4). | yes; its `win32` module is Windows-only |
-| `gate-win32` | The Win32 layer: job objects, process creation, named mutexes and events, priority, console, the start of a registered Task Scheduler task in a given session (`task.rs`, through COM), the WSL VM's CPU reader, the samples the watchdog consumes. | no |
+| `gate-win32` | The Win32 layer: job objects, process creation, named mutexes and events, priority, console, the registration of the desktop helper's Task Scheduler task and the start of a registered one in a given session (`task.rs`, through COM), the WSL VM's CPU reader, the samples the watchdog consumes. | no |
 | `gate-desktop` | The desktop helper exe and the pipe protocol the box speaks with it, its exit codes, and `build_version`, the gate's version text. | no |
 | `gate-watchdog` | Free-share, load-adjusted clock, stall, ceiling and backstop arithmetic over samples with the kill lines, and the box heartbeat, on an injected clock; the cores-hint verdict. | yes; a pure crate |
 | `gate-args` | The gate's own argv: the subcommand CLI, the compatibility layer, the C-runtime and cmd.exe quoting, the `%VAR%` refusals and the PATHEXT resolution rules over an injected environment and file lookup. | yes; a pure crate |

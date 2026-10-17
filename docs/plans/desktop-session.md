@@ -235,6 +235,12 @@ Worst case: the second binary. `push.rs` gains a second file in its stdin protoc
 
 **D2. Registering the task.** Generate the task XML with a pure, unit-tested function. Register it through COM `ITaskFolder::RegisterTask(..., TASK_CREATE_OR_UPDATE, TASK_LOGON_INTERACTIVE_TOKEN)` with the K settings, at `\gate\desktop-helper`. The command is a hidden verb (`gate box register-desktop`) that builder setup runs once over ssh. An elevated session-0 process can register a same-user interactive-token task with no password; the spike measured that. The box checks the definition on every run (K).
 
+The verb registers the task in the folder `\gate`, makes the folder when it is missing, and gives both the same protected descriptor: owner Administrators, full access for SYSTEM and Administrators, read for the builder user's SID. The string the code writes is `O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;<user SID>)`; Windows reads it back as `O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;<user SID>)`, the `AI` being the auto-inherited flag it sets, so a hand check compares the ACEs and not the flags.
+
+A task is registered with `TASK_DONT_ADD_PRINCIPAL_ACE`, so the user gets no write access through the principal, and is read back and checked after registering.
+
+A folder or task that already exists with a weaker owner or DACL is refused, never adopted or repaired: whoever could change it could have replaced the task the box then runs. The verb says `gate-register: failed: the task is set up wrong: <what differs>`. To recover from a squatted `\gate` folder or task, an administrator deletes it on the builder (Task Scheduler, or `schtasks /delete /tn \gate\desktop-helper`, and the folder if it too is the squatter's), then runs the verb again.
+
 Alternative: `gate push` re-registers on every push. That keeps the task in step with the exe, but push no longer "only replaces files", so it is an owner question.
 
 Worst case: a builder that skipped setup refuses every desktop run with a why naming the verb, and the run goes local.
@@ -286,7 +292,7 @@ Run the COM calls on a short-lived multithreaded-apartment thread, and release e
 
 The Task Scheduler's class is made from `taskschd.dll`, loaded once for the process by its full path in the system folder (`LOAD_LIBRARY_SEARCH_SYSTEM32`) and never freed, never looked up in the registry, where a user's own class entry could stand in for it; the loaded module's path is checked against the system folder.
 
-`run_task(&TaskStart { path, argument, session_id, helper, pid_wait }, deadline, wake)` returns `StartedTask::Process(pid)`, or `NoPid` when the task started but the Task Scheduler gave no process within `pid_wait` (the helper may be running; only the caller's deadline bounds the wait for it). It reads the definition first and checks every K setting plus the task's owner (SYSTEM, Administrators or the user running gate) and DACL (no one else allowed more than read); it runs with `TASK_RUN_USE_SESSION_ID | TASK_RUN_IGNORE_CONSTRAINTS`.
+`run_task(&TaskStart { path, argument, session_id, helper, pid_wait }, deadline, wake)` returns `StartedTask::Process(pid)`, or `NoPid` when the task started but the Task Scheduler gave no process within `pid_wait` (the helper may be running; only the caller's deadline bounds the wait for it). It reads the definition first and checks every K setting plus the task's owner (SYSTEM or Administrators) and DACL (no one else allowed more than read); it runs with `TASK_RUN_USE_SESSION_ID | TASK_RUN_IGNORE_CONSTRAINTS`.
 
 `TaskError` tells the caller whether the helper may exist. `NotRegistered`, `SetUpWrong` and `Failed`: nothing was started. `StartedUnknown`: started, then a later call failed. `TimedOut`, `Woken` and `Unanswered` (the wait failed or the start thread panicked): the start may have happened, the thread that asked is left to finish, one that has not yet run the task starts nothing, and the caller drops its pipe server. Every text is escaped and cut, so none can carry a line break or control character to the console.
 

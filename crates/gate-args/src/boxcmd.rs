@@ -1,10 +1,12 @@
 //! The hidden `gate box <verb> --stdin`: the builder side of a routed run. Only the words are read here; the request
-//! is stdin's first line, which the binary reads and decodes. A `test-seams` build also reads the hidden
+//! is stdin's first line, which the binary reads and decodes. `gate box register-desktop` takes no `--stdin`: it reads
+//! no request. A `test-seams` build also reads the hidden
 //! `--test-heartbeat-ms <n>`, `--test-box-console fail-before`, `--test-box-token refused`, `--test-box-park-launch <path>`,
 //! `--test-outputs-budget-bytes <n>`, `--test-inputs-budget-bytes <n>`, `--test-dotnet-limit-ms <n>`,
 //! `--test-box-sample-ms <n>`, `--test-box-sampler-fail true|false`, `--test-box-free-percent <1-100>`,
 //! `--test-box-kill-leaves <n>`, `--test-probe-limit-ms <n>`, `--test-box-desktop <fault>`,
-//! `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>` and `--test-box-desktop-ms <n>` (each also as
+//! `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>`, `--test-box-desktop-ms <n>` and
+//! `--test-box-register ok|fail` (each also as
 //! `--<seam>=<value>`) before the verb; without the feature each is no verb, and so the box usage.
 
 use std::ffi::{OsStr, OsString};
@@ -16,15 +18,25 @@ use crate::request::{BoxRequest, BoxSeams, BoxVerb};
 /// The one word after the verb: the request is stdin's first line, never a word.
 const STDIN: &str = "--stdin";
 
-/// Reads the words after `gate box`: the seams, then a verb, then exactly `--stdin`, and nothing after it. A seam
-/// refused is its own problem, as `gate run` reports it; any other shape is the one box usage problem, after those.
+/// The values `--test-box-register` takes: the registration succeeds, or fails as the seam refusing.
+#[cfg(feature = "test-seams")]
+const REGISTER_RESULTS: &[&str] = &["ok", "fail"];
+
+/// Reads the words after `gate box`: the seams, then a verb, then exactly `--stdin`, and nothing after it; or, for
+/// `register-desktop`, which reads no request, nothing after the verb at all. A seam refused is its own problem, as
+/// `gate run` reports it; any other shape is the one box usage problem, after those.
 pub(crate) fn parse(words: impl Iterator<Item = OsString>) -> Result<BoxRequest, Vec<Problem>> {
     let mut words = words.peekable();
     let mut problems = Vec::new();
     let seams = seams(&mut words, &mut problems);
     let verb = words.next().as_deref().and_then(OsStr::to_str).and_then(verb);
-    let stdin = words.next().is_some_and(|word| word == STDIN);
-    match (verb, stdin, words.next()) {
+    // A verb that reads no request must have no word after it, which stands where `--stdin` stands for the others.
+    let closed = if verb.is_some_and(|verb| !verb.takes_request()) {
+        words.peek().is_none()
+    } else {
+        words.next().is_some_and(|word| word == STDIN)
+    };
+    match (verb, closed, words.next()) {
         (Some(verb), true, None) if problems.is_empty() => Ok(BoxRequest { verb, seams }),
         (Some(_), true, None) => Err(problems),
         _ => {
@@ -43,6 +55,7 @@ fn verb(text: &str) -> Option<BoxVerb> {
         "outputs" => Some(BoxVerb::Outputs),
         "inflight" => Some(BoxVerb::Inflight),
         "inputs" => Some(BoxVerb::Inputs),
+        "register-desktop" => Some(BoxVerb::RegisterDesktop),
         _ => None,
     }
 }
@@ -83,6 +96,8 @@ enum Seam {
     DesktopMutex,
     /// `--test-box-desktop-ms <n>`: how long a desktop run's waits may take, in milliseconds.
     DesktopMs,
+    /// `--test-box-register ok|fail`: what `register-desktop` does in place of the Task Scheduler's work.
+    Register,
 }
 
 #[cfg(feature = "test-seams")]
@@ -107,6 +122,7 @@ impl Seam {
             "--test-box-desktop-session" => Some(Seam::DesktopSession),
             "--test-box-desktop-mutex" => Some(Seam::DesktopMutex),
             "--test-box-desktop-ms" => Some(Seam::DesktopMs),
+            "--test-box-register" => Some(Seam::Register),
             _ => None,
         }
     }
@@ -130,6 +146,7 @@ impl Seam {
             Seam::DesktopSession => "--test-box-desktop-session",
             Seam::DesktopMutex => "--test-box-desktop-mutex",
             Seam::DesktopMs => "--test-box-desktop-ms",
+            Seam::Register => "--test-box-register",
         }
     }
 }
@@ -166,8 +183,8 @@ fn seams(words: &mut Peekable<impl Iterator<Item = OsString>>, problems: &mut Ve
 /// probe limit and the desktop waits, `fail-before` for the console, `refused` for the token, any path for the park,
 /// whole bytes above 0 for the outputs and the inputs budgets, `true` or `false` for the sampler's failure, a whole
 /// percent from 1 to 100 for the free share, a whole count above 0 for the processes a kill leaves, one of the desktop
-/// faults for the desktop, one of the session states for the desktop session and 1 to 64 letters, digits and `-` for the
-/// desktop mutex. An empty or missing value is no value.
+/// faults for the desktop, one of the session states for the desktop session, 1 to 64 letters, digits and `-` for the
+/// desktop mutex and `ok` or `fail` for the registration. An empty or missing value is no value.
 #[cfg(feature = "test-seams")]
 fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Problem>) -> Result<(), Problem> {
     let name = seam.name();
@@ -189,6 +206,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::DesktopSession => seams.desktop_session = Some(crate::values::desktop_session(name, &value)?),
         Seam::DesktopMutex => seams.desktop_mutex = Some(crate::values::desktop_mutex(name, &value)?),
         Seam::DesktopMs => seams.desktop_ms = Some(crate::values::above_zero(name, &value)?),
+        Seam::Register => seams.register_ok = Some(crate::values::remote_call(name, &value, REGISTER_RESULTS)? == "ok"),
         Seam::Console => seams.fail_console = the_word(name, value, "fail-before", |option, value| Problem::BadConsoleFailure { option, value })?,
         Seam::Token => seams.refuse_token = the_word(name, value, "refused", |option, value| Problem::BadTokenRefusal { option, value })?,
         Seam::ParkLaunch => seams.park_launch = Some(std::path::PathBuf::from(value)),

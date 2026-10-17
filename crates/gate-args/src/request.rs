@@ -33,7 +33,7 @@ pub enum Invocation {
     Expect(ExpectRequest),
     /// `gate warm`.
     Warm(WarmRequest),
-    /// The hidden `gate box <verb> --stdin`.
+    /// The hidden `gate box <verb> --stdin`, or `gate box register-desktop`.
     Box(BoxRequest),
 }
 
@@ -95,6 +95,9 @@ pub struct BoxSeams {
     /// How long `gate box run`'s desktop run's waits may take, in milliseconds, in place of the built-in limits; `None`
     /// without the feature.
     pub desktop_ms: Option<u64>,
+    /// What `gate box register-desktop` does in place of the Task Scheduler's work: `true` succeeds, `false` fails as
+    /// the test seam refusing; `None` without the feature.
+    pub register_ok: Option<bool>,
 }
 
 /// A fault `--test-box-desktop` makes the box's desktop run take, in place of the real task start and helper.
@@ -175,6 +178,8 @@ pub enum BoxVerb {
     Inflight,
     /// Which of a routed run's ignored inputs the work folder lacks, or their install.
     Inputs,
+    /// The registration of the desktop helper's task; the one verb that takes no request.
+    RegisterDesktop,
 }
 
 impl BoxVerb {
@@ -189,7 +194,15 @@ impl BoxVerb {
             BoxVerb::Outputs => "outputs",
             BoxVerb::Inflight => "inflight",
             BoxVerb::Inputs => "inputs",
+            BoxVerb::RegisterDesktop => "register-desktop",
         }
+    }
+
+    /// Whether the verb reads a request, as stdin's first line, after the word `--stdin`: every verb but
+    /// `register-desktop`.
+    #[must_use]
+    pub fn takes_request(self) -> bool {
+        self != BoxVerb::RegisterDesktop
     }
 }
 

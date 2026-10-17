@@ -29,7 +29,9 @@ fn each_verb_parses_with_stdin() {
             "{word}"
         );
         assert_eq!(verb.as_str(), word, "the verb as the CLI spells it");
+        assert!(verb.takes_request(), "{word} reads a request");
     }
+    assert!(!BoxVerb::RegisterDesktop.takes_request(), "register-desktop reads none");
 }
 
 #[test]
@@ -73,6 +75,32 @@ fn box_takes_the_inflight_verb() {
         })
     );
     assert_eq!(BoxVerb::Inflight.as_str(), "inflight", "the verb as the CLI spells it");
+}
+
+/// The registration of the desktop task: a verb that takes no request, so no `--stdin` and nothing after it.
+#[test]
+fn register_desktop_parses_alone_and_refuses_stdin_or_another_word() {
+    assert_eq!(
+        invocation(&["box", "register-desktop"]),
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::RegisterDesktop,
+            seams: BoxSeams::default(),
+        })
+    );
+    assert_eq!(BoxVerb::RegisterDesktop.as_str(), "register-desktop", "the verb as the CLI spells it");
+    let shapes: [&[&str]; 5] = [
+        &["box", "register-desktop", "--stdin"],
+        &["box", "register-desktop", "more"],
+        &["box", "register-desktop", ""],
+        &["box", "register-desktop", "--stdin", "more"],
+        &["box", "Register-Desktop"],
+    ];
+    for words in shapes {
+        assert_eq!(problems(words), [BOX_USAGE], "{words:?}");
+    }
+    let mut unreadable = os(&["box", "register-desktop"]);
+    unreadable.push(unreadable_word());
+    assert_eq!(problems_of(unreadable), [BOX_USAGE], "a word after it that is not Unicode is refused too");
 }
 
 #[test]

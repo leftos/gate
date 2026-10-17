@@ -27,6 +27,7 @@ use crate::support::{
 mod desktop;
 mod inputs;
 mod outputs;
+mod register;
 mod warm;
 
 const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs --stdin (the base64 JSON request as stdin's first line)\n";

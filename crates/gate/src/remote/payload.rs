@@ -264,10 +264,14 @@ fn word(object: &Map<String, Value>) -> String {
     STANDARD.encode(Value::Object(object.clone()).to_string())
 }
 
-/// The line ssh carries for `verb`, the same whatever the call sends: the builder's gate, `box`, the verb and
-/// `--stdin`, as the request comes on the call's standard input ([`input`]).
+/// The line ssh carries for `verb`, the same whatever the call sends: the builder's gate, `box`, the verb and, for a
+/// verb that reads a request, `--stdin`, as the request comes on the call's standard input ([`input`]).
 pub(crate) fn line(verb: BoxVerb) -> String {
-    format!("{BOX_EXE} box {} --stdin", verb.as_str())
+    if verb.takes_request() {
+        format!("{BOX_EXE} box {} --stdin", verb.as_str())
+    } else {
+        format!("{BOX_EXE} box {}", verb.as_str())
+    }
 }
 
 /// What a call writes on the box's standard input: the payload `word` as a line, then the run call's outputs
@@ -753,6 +757,11 @@ mod tests {
     fn the_line_is_the_fixed_box_line_for_the_verb() {
         assert_eq!(line(BoxVerb::Run), r#""%LOCALAPPDATA%\gate\bin\gate.exe" box run --stdin"#);
         assert_eq!(line(BoxVerb::Preflight), r#""%LOCALAPPDATA%\gate\bin\gate.exe" box preflight --stdin"#);
+        assert_eq!(
+            line(BoxVerb::RegisterDesktop),
+            r#""%LOCALAPPDATA%\gate\bin\gate.exe" box register-desktop"#,
+            "a verb that reads no request has no --stdin"
+        );
     }
 
     #[test]
