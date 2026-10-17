@@ -4,7 +4,7 @@ A routed command can need ignored files only the PC has: an integration-test gro
 
 The map is `.tmp/map-gate-22.md` (not committed; its facts are quoted here where a decision rests on them). Every decision below is an orchestrator decision under the `gate-nextup` profile ("Decisions"), open to the owner.
 
-Branch: `feat/remote-inputs`, cut from `main` at 43b288c (it builds on GATE-282's stdin requests). Large: a routing-file key, a client phase, a new box verb, a box install step and record, two seams, a fallback reason.
+Large: a routing-file key, a client phase, a new box verb, a box install step and record, two seams, a fallback reason. It builds on GATE-282's stdin requests.
 
 ## Decisions
 
@@ -72,6 +72,6 @@ The put then moves each file in with `check_folder` on every parent under `Work`
 
 ## Landing
 
-Steps (a), (b) and (c) are built.
+Steps (a), (b) and (c) are built and on main.
 
-Steps in order on `feat/remote-inputs`: (a) router key and `RemoteRun`/`RemoteCall` field; (b) box verb with diff and put, record, exclude rewrite, stage and install, seams; (c) client phase, cache, lines, fallback reason, the run's digest check; (d) docs: design.md Routing and The box side (the Inputs bullet), ARCHITECTURE.md Task Index row "Send ignored inputs with a routed run", GLOSSARY.md "input", test-map rows; ops-tower inbox request for the `inputs` fallback reason.
+Steps in order: (a) router key and `RemoteRun`/`RemoteCall` field; (b) box verb with diff and put, record, exclude rewrite, stage and install, seams; (c) client phase, cache, lines, fallback reason, the run's digest check; (d) docs: design.md Routing and The box side (the Inputs bullet), ARCHITECTURE.md Task Index row "Send ignored inputs with a routed run", GLOSSARY.md "input", test-map rows; ops-tower inbox request for the `inputs` fallback reason.
