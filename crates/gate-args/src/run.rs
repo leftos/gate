@@ -11,6 +11,19 @@ use crate::request::{
 };
 use crate::values;
 
+/// The lookup a bare `--env NAME` word forwards `NAME`'s value from: the gate's own environment, unless a test built the
+/// builder with one of its own.
+#[derive(Clone, Copy)]
+pub(crate) struct Forward(fn(&str) -> Option<OsString>);
+
+impl Default for Forward {
+    fn default() -> Forward {
+        Forward(|name| std::env::var_os(name))
+    }
+}
+
+impl Forward {}
+
 /// An option that takes a value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ValueOption {
@@ -24,6 +37,7 @@ pub(crate) enum ValueOption {
     Cores,
     Seconds,
     BringTracked,
+    Env,
     Builder,
     #[cfg(feature = "test-seams")]
     SampleMs,
@@ -146,6 +160,13 @@ pub(crate) struct RunBuilder {
     /// `gate warm`'s `--background`.
     background: bool,
     bring_tracked: Vec<String>,
+    /// The `--env` pairs the gate can set, in the order given.
+    env: Vec<(String, String)>,
+    /// How many `--env` words the run has given, whether the pair was accepted or not: the position a word to forward is
+    /// refused at.
+    env_words: usize,
+    /// Where a word to forward reads its value.
+    forward: Forward,
     print_request: bool,
     test_seams: TestSeams,
     /// `gate cutover`'s own seams, `--test-confirm-ms` and `--test-cutover-interrupt-after-list`; its poll and
@@ -177,15 +198,22 @@ impl RunBuilder {
         self.given.iter().any(|option| !is_print_request(*option))
     }
 
-    /// Records `option` as given, or the problem of its being given twice; `--bring-tracked` may be given any number of
-    /// times.
+    /// Records `option` as given, or the problem of its being given twice; `--bring-tracked` and `--env` may be given any
+    /// number of times.
     fn first_time(&mut self, option: RunOption, spelled: &str) -> bool {
-        if self.given.contains(&option) && option != RunOption::Value(ValueOption::BringTracked) {
+        let repeatable = matches!(option, RunOption::Value(ValueOption::BringTracked | ValueOption::Env));
+        if self.given.contains(&option) && !repeatable {
             self.problems.push(Problem::GivenTwice(spelled.to_owned()));
             return false;
         }
         self.given.push(option);
         true
+    }
+
+    /// The 1-based position of the run's next `--env` word, counting every word given, an empty one included.
+    fn next_env_word(&mut self) -> usize {
+        self.env_words += 1;
+        self.env_words
     }
 
     /// Reads `option`'s value, spelled `spelled` by the caller; an empty value is no value.
@@ -194,6 +222,9 @@ impl RunBuilder {
             return;
         }
         if value.is_empty() {
+            if option == ValueOption::Env {
+                self.next_env_word();
+            }
             self.problems.push(Problem::NeedsValue(spelled.to_owned()));
         } else if let Err(problem) = self.apply(option, spelled, value) {
             self.problems.push(problem);
@@ -214,7 +245,14 @@ impl RunBuilder {
             Ok(None) => self.value(option, spelled, ""),
             Err(problem) => {
                 if self.first_time(RunOption::Value(option), spelled) {
-                    self.problems.push(problem);
+                    match option {
+                        // An `--env` word that is not Unicode is refused by its position: the word may be a secret.
+                        ValueOption::Env => {
+                            let position = self.next_env_word();
+                            self.problems.push(Problem::EnvWordNotUnicode(position));
+                        }
+                        _ => self.problems.push(problem),
+                    }
                 }
             }
         }
@@ -238,6 +276,11 @@ impl RunBuilder {
             ValueOption::Cores => self.cores = Some(values::above_zero_u32(spelled, value)?),
             ValueOption::Seconds => self.seconds = Some(values::in_range(spelled, value, 1, values::MAX_BURN_SECONDS)?),
             ValueOption::BringTracked => self.bring_tracked.push(value.to_owned()),
+            ValueOption::Env => {
+                let position = self.next_env_word();
+                let forward = self.forward.0;
+                self.env.push(values::env_pair(value, position, forward)?);
+            }
             ValueOption::Builder => self.builder = Some(value.to_owned()),
             #[cfg(feature = "test-seams")]
             ValueOption::SampleMs => self.test_seams.sample_ms = Some(values::above_zero(spelled, value)?),
@@ -351,6 +394,7 @@ impl RunBuilder {
         let spelling = self.spelling;
         #[cfg(feature = "test-seams")]
         self.check_remote_seams();
+        self.check_env();
         for (option, required) in [
             (ValueOption::Slot, Required::Slot),
             (ValueOption::Timeout, Required::Timeout),
@@ -373,6 +417,7 @@ impl RunBuilder {
                 no_markers: self.no_markers,
                 local: self.local,
                 bring_tracked: self.bring_tracked,
+                env: self.env,
                 state_dir: self.state_dir,
                 cd: self.cd,
                 command,
@@ -381,6 +426,25 @@ impl RunBuilder {
                 spelling,
             }),
             _ => Err(self.problems),
+        }
+    }
+
+    /// Refuses the `--env` pairs: more pairs or bytes than its cap ([`values::over_cap`]), counted over the accepted
+    /// pairs only, else a name given twice in any ASCII case, named as its later spelling. Each pair was checked as it
+    /// was read. Neither refusal names a word, so each takes the run's whole `--env` count as its position.
+    fn check_env(&mut self) {
+        let bytes = self.env.iter().map(|(name, value)| name.len() + value.len()).sum();
+        let refused = if values::over_cap(self.env.len(), bytes) {
+            Some((values::EnvRefusal::OverCap, String::new()))
+        } else {
+            values::repeated_name(self.env.iter().map(|(name, _)| name.as_str())).map(|name| (values::EnvRefusal::Twice, name.to_owned()))
+        };
+        if let Some((refusal, name)) = refused {
+            self.problems.push(Problem::EnvRefused {
+                refusal,
+                name,
+                position: self.env_words,
+            });
         }
     }
 
@@ -649,4 +713,105 @@ pub(crate) fn next_value(words: &mut Peekable<impl Iterator<Item = OsString>>, i
 /// The problem of a gate word that is not valid Unicode.
 pub(crate) fn unreadable(word: &OsStr) -> Problem {
     Problem::Unreadable(word.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+
+    use super::{Forward, RunBuilder, ValueOption};
+    use crate::problem::Problem;
+    use crate::values::{EnvRefusal, MOST_ENV_BYTES};
+
+    thread_local! {
+        /// The environment the tests below forward from, one thread's own so the tests cannot see each other's.
+        static FORWARDED: RefCell<HashMap<String, OsString>> = RefCell::new(HashMap::new());
+    }
+
+    /// The lookup of the tests: a name of [`FORWARDED`], and nothing else.
+    fn forward(name: &str) -> Option<OsString> {
+        FORWARDED.with(|table| table.borrow().get(name).cloned())
+    }
+
+    /// A builder that forwards from `pairs` alone, with the options a run cannot do without already given.
+    fn builder(pairs: &[(&str, &str)]) -> RunBuilder {
+        FORWARDED.with(|table| {
+            let mut table = table.borrow_mut();
+            table.clear();
+            for (name, value) in pairs {
+                table.insert((*name).to_owned(), OsString::from(value));
+            }
+        });
+        let mut builder = RunBuilder {
+            forward: Forward(forward),
+            ..RunBuilder::default()
+        };
+        builder.value(ValueOption::Slot, "--slot", "heavy");
+        builder.value(ValueOption::Timeout, "--timeout", "5");
+        builder.value(ValueOption::Log, "--log", "out.log");
+        builder
+    }
+
+    /// `builder` with each of `words` given as an `--env` word.
+    fn env_words(builder: &mut RunBuilder, words: &[&str]) {
+        for word in words {
+            builder.value(ValueOption::Env, "--env", word);
+        }
+    }
+
+    /// Asserts that `builder` refuses its run of `cmd` with exactly `problems`.
+    fn refused(builder: RunBuilder, problems: Vec<Problem>) {
+        assert_eq!(builder.finish_run(vec![OsString::from("cmd")]), Err(problems));
+    }
+
+    #[test]
+    fn a_forwarded_word_names_its_position_when_it_is_not_set() {
+        let mut builder = builder(&[("SET", "v")]);
+        env_words(&mut builder, &["SET=1", "MISSING", "OTHER=2"]);
+
+        refused(builder, vec![Problem::EnvForwardNotSet(2)]);
+    }
+
+    #[test]
+    fn an_empty_env_word_still_counts() {
+        let mut builder = builder(&[]);
+        env_words(&mut builder, &["", "MISSING"]);
+
+        refused(builder, vec![Problem::NeedsValue("--env".to_owned()), Problem::EnvForwardNotSet(2)]);
+    }
+
+    #[test]
+    fn a_forwarded_pair_and_a_written_one_of_one_name_are_refused_as_twice() {
+        for (words, later) in [(["FORWARDED=1", "FORWARDED"], "FORWARDED"), (["FORWARDED", "forwarded=1"], "forwarded")] {
+            let mut builder = builder(&[("FORWARDED", "v")]);
+            env_words(&mut builder, &words);
+
+            refused(
+                builder,
+                vec![Problem::EnvRefused {
+                    refusal: EnvRefusal::Twice,
+                    name: later.to_owned(),
+                    position: 2,
+                }],
+            );
+        }
+    }
+
+    #[test]
+    fn the_cap_counts_a_forwarded_value() {
+        let value = "x".repeat(MOST_ENV_BYTES);
+        let mut builder = builder(&[("BIG", value.as_str())]);
+        env_words(&mut builder, &["BIG"]);
+
+        refused(
+            builder,
+            vec![Problem::EnvRefused {
+                refusal: EnvRefusal::OverCap,
+                name: String::new(),
+                position: 1,
+            }],
+        );
+    }
 }

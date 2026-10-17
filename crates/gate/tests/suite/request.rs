@@ -61,6 +61,7 @@ fn print_request_shows_the_new_cli_request() {
         "noMarkers": false,
         "local": false,
         "bringTracked": [],
+        "env": [],
         "cd": null,
         "stateDir": shown(&case.root()),
         "defaultRoot": false,
@@ -99,6 +100,15 @@ fn print_request_shows_cd_as_given() {
     words.splice(7..7, ["--cd", r"..\other"]);
 
     assert_eq!(case.run(&words).request()["cd"], r"..\other");
+}
+
+#[test]
+fn print_request_shows_env_pairs_in_order() {
+    let case = Case::new("print_request_shows_env_pairs_in_order");
+    let mut words = print_run(&["cmd"]);
+    words.splice(7..7, ["--env", "NuGetAudit=false", "--env=EMPTY="]);
+
+    assert_eq!(case.run(&words).request()["env"], json!([["NuGetAudit", "false"], ["EMPTY", ""]]));
 }
 
 /// The seams the case's runs give are printed as given.

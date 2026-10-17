@@ -375,7 +375,7 @@ impl Plan {
             Some(parent) => parent.marker.clone(),
             None => environment::slot_marker(request.slot.as_str(), gate, &root.root),
         };
-        let variables = Variables::for_command(root, gate, &marker);
+        let variables = Variables::for_command(root, gate, &marker, &request.env);
         let environment = variables
             .block()
             .map_err(|error| NotRun::failed(format!("gate: cannot build the command's environment: {error}")))?;
@@ -681,6 +681,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         tail: request.tail,
         no_markers: request.no_markers,
         bring_tracked: &request.bring_tracked,
+        env: &request.env,
         interrupt: host.interrupt,
         state: &root.root,
         state_dir: &root.path,

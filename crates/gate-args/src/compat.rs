@@ -1,9 +1,9 @@
 //! The compatibility layer: the PowerShell gate's `-Log <path> -TimeoutSeconds <n> -Slot <kind> [...] -- <command>`
-//! and `-StopTree <pid>`. Exactly its eight options and `-Cd <folder>` are read, by name in any ASCII case, in the
-//! `-Name value` and the `-Name:value` forms; `--` is required before the command. A `test-seams` build also reads
-//! the hidden `--test-print-request` switch, spelled exactly so, so the suite can see what a compat run asked for, and
-//! the hidden `--test-parent-job-trusted` switch, spelled exactly so, so a compat run under a marker naming the test
-//! process trusts it.
+//! and `-StopTree <pid>`. Exactly its eight options, `-Cd <folder>` and `-Env NAME[=value]` are read, by name in any
+//! ASCII case, in the `-Name value` and the `-Name:value` forms; `--` is required before the command. A `test-seams`
+//! build also reads the hidden `--test-print-request` switch, spelled exactly so, so the suite can see what a compat
+//! run asked for, and the hidden `--test-parent-job-trusted` switch, spelled exactly so, so a compat run under a
+//! marker naming the test process trusts it.
 
 use std::ffi::OsString;
 use std::iter::Peekable;
@@ -19,7 +19,7 @@ enum CompatOption {
     StopTree,
 }
 
-const OPTIONS: [(&str, CompatOption); 9] = [
+const OPTIONS: [(&str, CompatOption); 10] = [
     ("Log", CompatOption::Run(RunOption::Value(ValueOption::Log))),
     ("TimeoutSeconds", CompatOption::Run(RunOption::Value(ValueOption::Timeout))),
     ("Slot", CompatOption::Run(RunOption::Value(ValueOption::Slot))),
@@ -28,6 +28,7 @@ const OPTIONS: [(&str, CompatOption); 9] = [
     ("NoMarkers", CompatOption::Run(RunOption::Switch(SwitchOption::NoMarkers))),
     ("Local", CompatOption::Run(RunOption::Switch(SwitchOption::Local))),
     ("Cd", CompatOption::Run(RunOption::Value(ValueOption::Cd))),
+    ("Env", CompatOption::Run(RunOption::Value(ValueOption::Env))),
     ("StopTree", CompatOption::StopTree),
 ];
 
@@ -132,7 +133,7 @@ fn compat_option(name: &str) -> Option<CompatOption> {
         .map(|(_, option)| *option)
 }
 
-/// Whether `word` is one of the nine options, `-Name` or `-Name:value`, and so never an option's value.
+/// Whether `word` is one of the ten options, `-Name` or `-Name:value`, and so never an option's value.
 fn is_compat_option(word: &str) -> bool {
     word.strip_prefix('-').is_some_and(|rest| compat_option(split_colon(rest).0).is_some())
 }

@@ -26,9 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::{BoxSeams, EnvRefusal, env_refusal, over_cap, repeated_name, shown_name};
 use gate_watchdog::{Kill, Pump};
-use gate_win32::{
-    Donor, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken, Running, Utf8Console, same_variable_name,
-};
+use gate_win32::{Donor, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken, Running, Utf8Console};
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::ceiling::{Ceiling, KILLED, Spec};
@@ -371,10 +369,10 @@ fn identity(payload: &Payload) -> Result<Vec<(String, String)>, String> {
 /// The payload's `Env`: the caller's variables for the command, each pair a name and a value the gate can set; none when
 /// the key is absent or null. Else the usage line: a list over its cap (`gate_args::MOST_ENV_NAMES`,
 /// `gate_args::MOST_ENV_BYTES`), a name the gate sets itself, a `GATE_` name, a machine path, a name or value no
-/// environment block carries ([`env_refusal`]), or a name given twice, as an ASCII scan and then as Windows reads names.
+/// environment block carries ([`env_refusal`]), or a name given twice in any ASCII case.
 ///
-/// The cap is read from the raw object before any pair of it is built or checked, so a request holding a hundred thousand
-/// names is refused without one of them being built.
+/// The cap is read from the raw object before any pair of it is checked, so a request over the cap is refused without
+/// its pairs being copied.
 fn caller_env(payload: &Payload) -> Result<Vec<(String, String)>, String> {
     let (names, bytes) = payload.pair_size("Env")?.unwrap_or_default();
     if over_cap(names, bytes) {
@@ -386,24 +384,10 @@ fn caller_env(payload: &Payload) -> Result<Vec<(String, String)>, String> {
             return Err(refusal.box_line(&shown_escaped(name)));
         }
     }
-    if let Some(twice) = repeated_name(pairs.iter().map(|(name, _)| name.as_str())).or_else(|| repeated_name_as_windows(&pairs)) {
+    if let Some(twice) = repeated_name(pairs.iter().map(|(name, _)| name.as_str())) {
         return Err(EnvRefusal::Twice.box_line(&shown_escaped(twice)));
     }
     Ok(pairs)
-}
-
-/// The first name of `pairs` an earlier one names as Windows names variables ([`same_variable_name`]), as the later
-/// spelling gives it; `None` when no name is one Windows reads as another. The cap check in [`caller_env`] runs first, so
-/// this pass reads at most `gate_args::MOST_ENV_NAMES` names.
-fn repeated_name_as_windows(pairs: &[(String, String)]) -> Option<&str> {
-    let mut seen: Vec<&str> = Vec::new();
-    for (name, _) in pairs {
-        if seen.iter().any(|set| same_variable_name(OsStr::new(set), OsStr::new(name))) {
-            return Some(name);
-        }
-        seen.push(name);
-    }
-    None
 }
 
 /// The name `name` a refusal line shows: shortened to [`shown_name`]'s limit and escaped as the box escapes a payload

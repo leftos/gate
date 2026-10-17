@@ -46,6 +46,21 @@ fn compat_cd_parses_to_the_same_request_as_the_cli_s() {
 }
 
 #[test]
+fn compat_env_parses_to_the_same_request_as_the_cli_s() {
+    let new = with(&RUN, &["--env", "NuGetAudit=false", "--env", "B=", "--", "cmd"]);
+    for env in [
+        ["-Env", "NuGetAudit=false", "-Env", "B=", "--", "cmd"].as_slice(),
+        ["-ENV:NuGetAudit=false", "-env:B=", "--", "cmd"].as_slice(),
+    ] {
+        assert_eq!(run_request(&refs(&compat(env))), as_compat(&new), "{env:?}");
+    }
+    assert_eq!(
+        problems(&refs(&compat(&["-Env", "GATE_X=1", "--", "cmd"]))),
+        ["gate: --env sets GATE_X: GATE_ names are the gate's"]
+    );
+}
+
+#[test]
 fn compat_options_are_case_insensitive() {
     let old = [
         "-log",

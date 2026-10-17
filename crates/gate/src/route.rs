@@ -10,9 +10,11 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use gate_args::{RunRequest, Slot, TestSeams};
+use gate_args::{GATE_SET_NAMES, RunRequest, Slot, TestSeams};
 use gate_router::warm::{FileRead, Judgement, RecordRead, Situation, failed_line, judge, lock_problem_line, unwarmed_line, warming_line};
-use gate_router::{Config, ConfigProblem, Facts, FolderId, Inputs, LocalReason, Place, RemoteRun, Route, SiblingFolder, decide};
+use gate_router::{
+    Config, ConfigProblem, Facts, FolderId, Inputs, LocalReason, Place, RemoteRun, Route, SiblingFolder, decide, dropped_env, dropped_env_line,
+};
 use gate_state::v1;
 use gate_win32::Share;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -77,11 +79,12 @@ pub(crate) struct Decided {
 }
 
 /// Decides where `request`'s command runs and says the decision's lines, on stderr and in the log: why a command runs
-/// here when there is a reason to say, or the lines of a routed run. A command that would route but has a word that is
-/// not valid Unicode runs here, saying so. A command that would still route then has its work folder's warm-up judged
-/// against the state root `root` ([`warmed`]). A gate under a `covering_parent`'s slot runs here, saying nothing. With
-/// the route, what the decision learnt of the gate's place in its git worktree, and the hash of the warm-up file the
-/// routed run's work folder must be warm with, when the warm-up asks one.
+/// here when there is a reason to say, or the lines of a routed run, the line of the watched variables it does not send
+/// ([`dropped_line`]) after them. A command that would route but has a word that is not valid Unicode runs here, saying
+/// so. A command that would still route then has its work folder's warm-up judged against the state root `root`
+/// ([`warmed`]). A gate under a `covering_parent`'s slot runs here, saying nothing. With the route, what the decision
+/// learnt of the gate's place in its git worktree, and the hash of the warm-up file the routed run's work folder must be
+/// warm with, when the warm-up asks one.
 pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_parent: bool, root: &ResolvedRoot, console: &mut Console) -> Decided {
     let words: Vec<String> = request.command.iter().map(|word| word.to_string_lossy().into_owned()).collect();
     let unicode = request.command.iter().all(|word| word.to_str().is_some());
@@ -108,13 +111,27 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
     match &route {
         Route::Local { reason: Some(reason) } => console.err(&reason.line()),
         Route::Local { reason: None } => {}
-        Route::Routed(run) => run.lines().iter().for_each(|line| console.err(line)),
+        Route::Routed(run) => {
+            run.lines().iter().for_each(|line| console.err(line));
+            if let Some(line) = dropped_line(request) {
+                console.err(&line);
+            }
+        }
     }
     Decided {
         route,
         placed: machine.found.into_inner(),
         warm_hash,
     }
+}
+
+/// The line a routed run says for the watched variables of the gate's environment it does not send
+/// ([`gate_router::dropped_env`]): those no `--env` pair of `request` names and the gate does not set itself. A name
+/// that is not valid Unicode is left out. `None` when it sends them all.
+fn dropped_line(request: &RunRequest) -> Option<String> {
+    let caller: Vec<String> = std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()).collect();
+    let sent: Vec<&str> = request.env.iter().map(|(name, _)| name.as_str()).collect();
+    dropped_env_line(&dropped_env(caller.iter().map(String::as_str), &sent, GATE_SET_NAMES))
 }
 
 /// Whether the warm-up lock at `lock` is held ([`warm::lock_held`]); else the line of a lock that cannot be probed.

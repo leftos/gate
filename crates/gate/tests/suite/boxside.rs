@@ -1618,14 +1618,15 @@ fn box_run_refuses_a_malformed_env() {
     let case = Case::new("box_run_env_refused");
     let many = Value::Object((0..65).map(|number| (format!("A{number}"), json!("v"))).collect());
     let hundred_thousand = Value::Object((0..100_000).map(|number| (format!("A{number:06}"), json!("v"))).collect());
-    // A name of 250 characters refused as the gate's own: its first 200 are shown, the control character among them
-    // escaped.
-    let long_name = format!("GATE_{}\u{1b}{}", "x".repeat(194), "y".repeat(50));
-    let long_line = format!(
-        "gate: box payload Env sets GATE_{}\\u{{1b}}…: GATE_ names are the gate's",
-        "x".repeat(194)
-    );
+    // A name of 250 characters refused as the gate's own: its first 200 are shown.
+    let long_name = format!("GATE_{}", "x".repeat(245));
+    let long_line = format!("gate: box payload Env sets GATE_{}…: GATE_ names are the gate's", "x".repeat(195));
     let long_env = Value::Object(std::iter::once((long_name, json!("c"))).collect());
+    // A name holding a character no name may hold: its first 200 characters are shown, the control character among them
+    // escaped.
+    let escaped_name = format!("GATE_{}\u{1b}{}", "x".repeat(194), "y".repeat(50));
+    let escaped_line = format!("gate: box payload Env has a malformed name 'GATE_{}\\u{{1b}}…'", "x".repeat(194));
+    let escaped_env = Value::Object(std::iter::once((escaped_name, json!("c"))).collect());
     let refusing = [
         (json!("A=b"), "gate: box payload Env is not an object of texts"),
         (json!({"A": 1}), "gate: box payload Env is not an object of texts"),
@@ -1633,10 +1634,8 @@ fn box_run_refuses_a_malformed_env() {
             json!({"NuGetAudit": "false", "NUGETAUDIT": "true"}),
             "gate: box payload Env names NUGETAUDIT twice",
         ),
-        (
-            json!({"ZZ_\u{c4}_X": "a", "ZZ_\u{e4}_X": "b"}),
-            "gate: box payload Env names ZZ_\u{e4}_X twice",
-        ),
+        (json!({"ZZ_A_X": "a", "zz_a_x": "b"}), "gate: box payload Env names zz_a_x twice"),
+        (json!({"ZZ_\u{c4}_X": "a"}), "gate: box payload Env has a malformed name 'ZZ_\u{c4}_X'"),
         (
             json!({"MSBUILDUSESERVER": "1"}),
             "gate: box payload Env sets MSBUILDUSESERVER, which the gate sets itself",
@@ -1654,6 +1653,7 @@ fn box_run_refuses_a_malformed_env() {
         (json!({"": "c"}), "gate: box payload Env has a malformed name ''"),
         (json!({"A=\u{1b}": "c"}), "gate: box payload Env has a malformed name 'A=\\u{1b}'"),
         (long_env, long_line.as_str()),
+        (escaped_env, escaped_line.as_str()),
         (many, "gate: box payload Env is over its cap of 64 names or 32 KiB"),
         (hundred_thousand, "gate: box payload Env is over its cap of 64 names or 32 KiB"),
     ];

@@ -45,6 +45,7 @@ run options:
   --cd <folder>        run the command in <folder> and route from it
   --bring-tracked <glob>
                        install a routed run's outputs git tracks that match <glob>; repeatable
+  --env NAME[=value]   set NAME for the command, local or routed; without =value, forward NAME's value from here, the form for secrets; repeatable
 
 --slot, --timeout, --log and the command are all required.
 The PowerShell form (gate -Log <path> -TimeoutSeconds <n> -Slot <kind> [...] -- <command>) is also accepted.

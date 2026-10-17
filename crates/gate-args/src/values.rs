@@ -1,5 +1,7 @@
 //! Value validation, shared by the CLI and the compatibility layer.
 
+use std::ffi::OsString;
+
 use crate::problem::{MAX_WHOLE_NUMBER, Problem};
 use crate::request::{Ceiling, Slot};
 
@@ -214,11 +216,11 @@ pub const MOST_ENV_BYTES: usize = 32 * 1024;
 
 /// Why a name and value the caller gives for the command's environment cannot be set; `None` when the gate can set it.
 ///
-/// A name that is empty or holds `=` or a NUL, and a value holding a NUL, cannot be carried by an environment block. A
-/// name the gate sets itself ([`GATE_SET_NAMES`], [`GATE_SET_PREFIXES`]), a name git would read over the gate's own git
-/// settings ([`GIT_READ_NAMES`]), a `GATE_` name and a machine path ([`MACHINE_PATH_NAMES`]) are the gate's own:
-/// refusing them is what makes one `--env` mean the same thing on the PC and on a builder. Names are compared without
-/// regard to ASCII case.
+/// A name holding a character outside the ASCII set a name may hold ([`name_characters`]), and a value holding a NUL,
+/// cannot be carried by an environment block. A name the gate sets itself ([`GATE_SET_NAMES`], [`GATE_SET_PREFIXES`]), a
+/// name git would read over the gate's own git settings ([`GIT_READ_NAMES`]), a `GATE_` name and a machine path
+/// ([`MACHINE_PATH_NAMES`]) are the gate's own: refusing them is what makes one `--env` mean the same thing on the PC
+/// and on a builder. Names are compared without regard to ASCII case.
 #[must_use]
 pub fn env_refusal(name: &str, value: &str) -> Option<EnvRefusal> {
     if let Some(refusal) = malformed(name, value) {
@@ -236,12 +238,27 @@ pub fn env_refusal(name: &str, value: &str) -> Option<EnvRefusal> {
     named(name, MACHINE_PATH_NAMES).then_some(EnvRefusal::MachinePath)
 }
 
-/// Why the pair is malformed: the name empty or holding `=` or a NUL, or the value holding a NUL.
+/// Why the pair is malformed: a name holding a character no name may hold ([`name_characters`]), or a value holding a
+/// NUL.
 fn malformed(name: &str, value: &str) -> Option<EnvRefusal> {
-    if name.is_empty() || name.contains('=') || name.contains('\0') {
+    if !name_characters(name) {
         return Some(EnvRefusal::MalformedName);
     }
     value.contains('\0').then_some(EnvRefusal::MalformedValue)
+}
+
+/// Whether `name` holds at least one character and none but the printable ASCII characters, `=` excepted: U+0021 to
+/// U+007E. A space, every control character and every character outside ASCII are refused.
+///
+/// The set is as wide as it is because a name is whatever the tool that reads the variable calls it: npm names a
+/// per-registry token `npm_config_//registry.npmjs.org/:_authToken`, and `/`, `@` and the rest of the printable
+/// punctuation appear in other tools' names. The colon is .NET's colon-form setting key and the parentheses are
+/// `ProgramFiles(x86)`. What the set buys is that a name is ASCII: the ASCII-case check of the tables below is then the
+/// same check Windows makes when it reads a name, so a name that is not ASCII can never pass a table check written in
+/// ASCII and then be read, under Windows' own comparison of names, as one the gate protects. Do not widen this to
+/// non-ASCII.
+fn name_characters(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_graphic() && byte != b'=')
 }
 
 /// Whether `name` is one the gate sets itself: a name of [`GATE_SET_NAMES`], a numbered name of
@@ -312,9 +329,9 @@ pub fn shown_name(name: &str) -> String {
 /// Why a name or value the caller gives for the command's environment cannot be set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnvRefusal {
-    /// The name is empty or holds `=` or a NUL.
+    /// The name holds a character outside the ASCII set a name may hold ([`name_characters`]).
     MalformedName,
-    /// The value holds a NUL.
+    /// The value holds a NUL, a CR or an LF.
     MalformedValue,
     /// A name the gate sets on every command it starts.
     GateSets,
@@ -351,6 +368,74 @@ impl EnvRefusal {
             ),
         }
     }
+
+    /// The usage line the command line says for this refusal of the `--env` word at `position`, `name` being the pair's
+    /// name shortened ([`shown_name`]) and escaped ([`escaped`]). A name the gate cannot carry is not said at all, so a
+    /// word pasted without its `NAME=` cannot reach the line; the cap refusal names no name and ignores the position.
+    #[must_use]
+    pub fn usage_line(&self, name: &str, position: usize) -> String {
+        match self {
+            EnvRefusal::MalformedName => format!("gate: --env word {position} has a malformed name"),
+            EnvRefusal::MalformedValue => format!("gate: --env gives {name} a value holding NUL"),
+            EnvRefusal::GateSets => format!("gate: --env sets {name}, which the gate sets itself"),
+            EnvRefusal::GitReads => format!("gate: --env sets {name}, which git would read over the gate's own git settings"),
+            EnvRefusal::GateName => format!("gate: --env sets {name}: GATE_ names are the gate's"),
+            EnvRefusal::MachinePath => format!("gate: --env sets {name}, a machine path the gate keeps for the command"),
+            EnvRefusal::Twice => format!("gate: --env names {name} twice"),
+            EnvRefusal::OverCap => format!("gate: --env is over its cap of {MOST_ENV_NAMES} names or {} KiB", MOST_ENV_BYTES / 1024),
+        }
+    }
+}
+
+/// A `--env` word as a pair: `NAME=value` split at its first `=`, an empty value allowed; or a bare `NAME`, the
+/// `position`-th word among the run's `--env` words, whose value `forward` gives from the gate's own environment. The
+/// pair is then refused as any pair is ([`env_refusal`]).
+pub(crate) fn env_pair(word: &str, position: usize, forward: impl Fn(&str) -> Option<OsString>) -> Result<(String, String), Problem> {
+    let (name, value) = match word.split_once('=') {
+        Some((name, value)) => (name.to_owned(), value.to_owned()),
+        None => forwarded(word, position, forward)?,
+    };
+    match env_refusal(&name, &value) {
+        Some(refusal) => Err(Problem::EnvRefused { refusal, name, position }),
+        None => Ok((name, value)),
+    }
+}
+
+/// The pair of a bare `--env` word: the word as the name and the value `forward` gives it. A word `forward` does not set
+/// is refused as the `position`-th word of the run, and so is one whose value is not Unicode.
+fn forwarded(word: &str, position: usize, forward: impl Fn(&str) -> Option<OsString>) -> Result<(String, String), Problem> {
+    match forward(word) {
+        None => Err(Problem::EnvForwardNotSet(position)),
+        Some(value) => match value.into_string() {
+            Ok(value) => Ok((word.to_owned(), value)),
+            Err(_) => Err(Problem::EnvForwardNotUnicode(position)),
+        },
+    }
+}
+
+/// `text` with each control character escaped, and each mark that reorders text or separates lines, so a word cannot
+/// break or forge a usage line. The same rule as gate-router's `escaped`, which gate-args cannot depend on.
+pub(crate) fn escaped(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                character.escape_debug().to_string()
+            } else if is_reordering_mark(character) {
+                format!("\\u{{{:x}}}", u32::from(character))
+            } else {
+                character.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Whether `character` is a bidirectional mark, embedding, override or isolate, or the line or paragraph separator:
+/// U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069, U+2028 and U+2029.
+fn is_reordering_mark(character: char) -> bool {
+    matches!(
+        character,
+        '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{2028}' | '\u{2029}'
+    )
 }
 
 /// Whether `name` is `prefix` followed by one or more ASCII digits, `prefix` compared without regard to ASCII case.
@@ -368,7 +453,9 @@ fn starts_with_ignoring_case(name: &str, prefix: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{EnvRefusal, LONGEST_SHOWN_NAME, MOST_ENV_BYTES, MOST_ENV_NAMES, env_refusal, over_cap, repeated_name, shown_name};
+    use super::{EnvRefusal, LONGEST_SHOWN_NAME, MOST_ENV_BYTES, MOST_ENV_NAMES, env_pair, env_refusal, over_cap, repeated_name, shown_name};
+    use crate::problem::Problem;
+    use std::ffi::OsString;
 
     #[test]
     fn a_name_or_value_no_environment_block_carries_is_malformed() {
@@ -488,6 +575,30 @@ mod tests {
     }
 
     #[test]
+    fn a_name_may_hold_only_printable_ascii_and_never_an_equals_sign() {
+        for bad in ["\u{17f}ystemRoot", "G\u{131}T_CONFIG_PARAMETERS", "A\nPATH", "A B", "A\u{200b}", "A=B"] {
+            assert_eq!(env_refusal(bad, "v"), Some(EnvRefusal::MalformedName), "{bad:?}");
+        }
+        for good in [
+            "npm_config_//registry.npmjs.org/:_authToken",
+            "a@b",
+            "ProgramFiles(x86)",
+            "Logging:LogLevel:Default",
+            "a.b-c_1",
+        ] {
+            assert_eq!(env_refusal(good, "v"), None, "{good:?}");
+        }
+    }
+
+    #[test]
+    fn a_value_holding_a_nul_is_malformed_and_a_multiline_one_is_not() {
+        assert_eq!(env_refusal("A", "x\0y"), Some(EnvRefusal::MalformedValue));
+        for good in ["x\ny", "x\ry", "x\r\ny", "x\ty", ""] {
+            assert_eq!(env_refusal("A", good), None, "{good:?}");
+        }
+    }
+
+    #[test]
     fn a_name_given_twice_is_named_as_its_later_spelling() {
         assert_eq!(repeated_name(["NuGetAudit", "NUGETAUDIT"]), Some("NUGETAUDIT"));
         assert_eq!(repeated_name(["NuGetAudit", "Other", "nugetaudit"]), Some("nugetaudit"));
@@ -555,5 +666,114 @@ mod tests {
             EnvRefusal::OverCap.box_line(""),
             "gate: box payload Env is over its cap of 64 names or 32 KiB"
         );
+    }
+
+    #[test]
+    fn an_env_word_splits_at_its_first_equals_sign() {
+        assert_eq!(env_pair("A=b=c", 1, nothing), Ok(("A".to_owned(), "b=c".to_owned())));
+        assert_eq!(
+            env_pair("A=", 1, nothing),
+            Ok(("A".to_owned(), String::new())),
+            "an empty value is allowed"
+        );
+        assert_eq!(env_pair("A", 2, nothing), Err(Problem::EnvForwardNotSet(2)));
+        assert_eq!(
+            env_pair("PATH=x", 1, nothing),
+            Err(Problem::EnvRefused {
+                refusal: EnvRefusal::MachinePath,
+                name: "PATH".to_owned(),
+                position: 1
+            })
+        );
+    }
+
+    /// A lookup that sets no variable.
+    fn nothing(_: &str) -> Option<OsString> {
+        None
+    }
+
+    /// A lookup that gives every name the value `value`.
+    fn holding(value: &'static str) -> impl Fn(&str) -> Option<OsString> {
+        move |_| Some(OsString::from(value))
+    }
+
+    #[test]
+    fn a_forwarded_name_takes_the_value_the_lookup_gives() {
+        assert_eq!(
+            env_pair("FORWARDED", 1, holding("v")),
+            Ok(("FORWARDED".to_owned(), "v".to_owned())),
+            "a set name forwards its value"
+        );
+        assert_eq!(
+            env_pair("EMPTY", 2, holding("")),
+            Ok(("EMPTY".to_owned(), String::new())),
+            "a name set to nothing forwards nothing"
+        );
+        assert_eq!(env_pair("MISSING", 3, nothing), Err(Problem::EnvForwardNotSet(3)));
+    }
+
+    #[test]
+    fn a_forwarded_pair_is_refused_as_the_written_one_is() {
+        for (word, value) in [("GATE_X", "v"), ("PATH", "C:\\bin"), ("GATE_SLOT_HELD", "forged")] {
+            let forwarded = env_pair(word, 1, holding(value));
+            let written = env_pair(&format!("{word}={value}"), 1, nothing);
+            assert_eq!(forwarded, written, "{word}");
+            assert!(forwarded.is_err(), "{word} is refused");
+        }
+        assert_eq!(
+            env_pair("HOLDS", 1, holding("x\0y")),
+            Err(Problem::EnvRefused {
+                refusal: EnvRefusal::MalformedValue,
+                name: "HOLDS".to_owned(),
+                position: 1
+            }),
+            "a forwarded value holding a NUL"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_forwarded_value_that_is_not_unicode_is_refused() {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let odd = |_: &str| Some(OsString::from_wide(&[0xD800]));
+        assert_eq!(env_pair("ODD", 3, odd), Err(Problem::EnvForwardNotUnicode(3)));
+    }
+
+    #[test]
+    fn an_env_usage_line_shows_its_name_escaped_and_shortened() {
+        let refused = |name: &str| {
+            Problem::EnvRefused {
+                refusal: EnvRefusal::GateName,
+                name: name.to_owned(),
+                position: 1,
+            }
+            .to_string()
+        };
+        assert_eq!(
+            refused("GATE_\u{1b}X\u{202e}"),
+            r"gate: --env sets GATE_\u{1b}X\u{202e}: GATE_ names are the gate's"
+        );
+        let long = format!("GATE_{}", "x".repeat(LONGEST_SHOWN_NAME));
+        assert_eq!(
+            refused(&long),
+            format!("gate: --env sets {}…: GATE_ names are the gate's", &long[..LONGEST_SHOWN_NAME])
+        );
+        assert_eq!(
+            Problem::EnvForwardNotSet(2).to_string(),
+            "gate: --env word 2 names a variable to forward, and it is not set"
+        );
+        assert_eq!(
+            Problem::EnvForwardNotUnicode(3).to_string(),
+            "gate: --env word 3 names a variable whose value is not Unicode"
+        );
+        assert_eq!(
+            EnvRefusal::MalformedName.usage_line("A=B", 2),
+            "gate: --env word 2 has a malformed name",
+            "a name the gate cannot carry is not said"
+        );
+        assert_eq!(EnvRefusal::MalformedValue.usage_line("A", 1), "gate: --env gives A a value holding NUL");
+        assert_eq!(EnvRefusal::OverCap.usage_line("", 1), "gate: --env is over its cap of 64 names or 32 KiB");
+        assert_eq!(EnvRefusal::Twice.usage_line("A", 1), "gate: --env names A twice");
     }
 }

@@ -55,6 +55,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot) -> Stri
         "noMarkers": request.no_markers,
         "local": request.local,
         "bringTracked": request.bring_tracked,
+        "env": request.env,
         "cd": request.cd.as_deref().map(Path::to_string_lossy),
         "stateDir": root.path.to_string_lossy(),
         "defaultRoot": root.root.is_default(),

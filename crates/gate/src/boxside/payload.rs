@@ -86,10 +86,10 @@ impl Payload {
             .collect()
     }
 
-    /// How many entries the object at `key` holds and how many bytes its names and values take together, read before
-    /// [`Payload::pairs`] builds or checks any of them, so a request holding more entries than the box takes is refused
-    /// without one of them being built; `None` when the key is absent or null. Else the usage line saying it is not an
-    /// object of texts.
+    /// How many entries the object at `key` holds and how many bytes its names and values take together, counted over
+    /// the object `serde_json` parsed (`serde_json` has already built it, and the 16 MiB request line limit bounds it)
+    /// so [`Payload::pairs`] need not copy an object over the box's cap; `None` when the key is absent or null. Else the
+    /// usage line saying it is not an object of texts.
     pub(crate) fn pair_size(&self, key: &str) -> Result<Option<(usize, usize)>, String> {
         let Some(object) = self.object_at(key)? else {
             return Ok(None);

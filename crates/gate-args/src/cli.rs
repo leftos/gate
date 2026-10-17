@@ -163,6 +163,7 @@ fn run_option(name: &str) -> Option<RunOption> {
         "state-dir" => RunOption::Value(ValueOption::StateDir),
         "cd" => RunOption::Value(ValueOption::Cd),
         "bring-tracked" => RunOption::Value(ValueOption::BringTracked),
+        "env" => RunOption::Value(ValueOption::Env),
         "no-markers" => RunOption::Switch(SwitchOption::NoMarkers),
         "local" => RunOption::Switch(SwitchOption::Local),
         _ => return seam_option(name),

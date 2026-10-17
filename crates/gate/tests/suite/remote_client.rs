@@ -599,6 +599,67 @@ fn a_routed_run_runs_on_the_box_and_passes_its_output_and_status() {
     assert!(log.contains(&format!("gate: pushed snapshot {} in ", &snapshot[..8])), "{log}");
 }
 
+/// A routed run's `--env` pairs travel in the run call's `Env`: the command on the box sees the value the PC gave, a
+/// variable the box's own environment does not hold.
+#[test]
+fn a_routed_run_sends_its_env_pairs() {
+    let case = client_case("client-env");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--env", "ZZ_GATE_ENV_SENT=from the PC", "--env", "ZZ_GATE_ENV_EMPTY="],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(
+        &case,
+        "out.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "env", "ZZ_GATE_ENV_SENT"],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert!(outcome.stdout.lines().any(|line| line == "from the PC"), "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
+}
+
+/// A forwarded `--env NAME`: the box's command sees the value the PC's environment held, and no line of the gate's or
+/// the journal says it.
+#[test]
+fn a_routed_run_sends_a_forwarded_env_pair() {
+    let case = client_case("client-env-forwarded");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--env", "ZZ_GATE_ENV_FORWARDED"],
+        ..Tuned::default()
+    };
+    let mut gate = client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "env", "ZZ_GATE_ENV_FORWARDED"]);
+    gate.env("ZZ_GATE_ENV_FORWARDED", "from the caller's environment");
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert!(
+        outcome.stdout.lines().any(|line| line == "from the caller's environment"),
+        "the command on the box sees the value: {outcome:?}"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
+    assert!(
+        !outcome
+            .stderr
+            .lines()
+            .any(|line| line.starts_with("gate: ") && line.contains("from the caller's environment")),
+        "no line of the gate's says the value: {outcome:?}"
+    );
+    let journal = fs::read_to_string(case.root().join("events.jsonl")).expect("the journal was written");
+    assert!(
+        !journal.contains("from the caller's environment"),
+        "the journal holds no value: {journal}"
+    );
+}
+
 /// The most git processes the simple pass below starts, on the PC and the box together, children of git counted.
 const SIMPLE_PASS_GIT_STARTS: usize = 30;
 

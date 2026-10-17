@@ -274,6 +274,9 @@ pub struct RunRequest {
     pub local: bool,
     /// The `--bring-tracked` globs, in the order given: a fetched output git tracks is installed only when one matches it.
     pub bring_tracked: Vec<String>,
+    /// The `--env` pairs, name and value, in the order given: set for the command over the environment it starts in and
+    /// under the gate's own settings, on the PC and on a builder alike.
+    pub env: Vec<(String, String)>,
     /// `--state-dir` as given.
     pub state_dir: Option<PathBuf>,
     /// `--cd` as given: the folder the run runs and routes from; a relative path is read against the working directory

@@ -17,10 +17,11 @@ pub(crate) struct Variables(Vec<(OsString, OsString)>);
 type Override = (OsString, Option<OsString>);
 
 impl Variables {
-    /// The gate's environment with the overrides of `gate`, holding the slot `marker` ([`slot_marker`]) under `root`.
-    pub(crate) fn for_command(root: &ResolvedRoot, gate: &ThisGate, marker: &str) -> Variables {
+    /// The gate's environment with the caller's `--env` pairs `caller` set over it, then the overrides of `gate`,
+    /// holding the slot `marker` ([`slot_marker`]) under `root`, so no pair can undo one ([`composed`]).
+    pub(crate) fn for_command(root: &ResolvedRoot, gate: &ThisGate, marker: &str, caller: &[(String, String)]) -> Variables {
         let run = run_id(gate, &root.root);
-        Variables(applied(std::env::vars_os().collect(), overrides(root, &run, marker)))
+        Variables(composed(std::env::vars_os().collect(), caller, overrides(root, &run, marker)))
     }
 
     /// The gate's own environment, unchanged: what a program the gate starts for itself sees.
@@ -44,11 +45,7 @@ impl Variables {
     /// for its name, names compared as Windows compares them. Applied before the gate's own settings, so no pair can
     /// undo one.
     pub(crate) fn with_caller(self, caller: &[(String, String)]) -> Variables {
-        let overrides = caller
-            .iter()
-            .map(|(name, value)| (OsString::from(name), Some(OsString::from(value))))
-            .collect();
-        Variables(applied(self.0, overrides))
+        Variables(applied(self.0, caller_overrides(caller)))
     }
 
     /// The value the command gets for `name`, names compared as Windows compares them.
@@ -111,6 +108,20 @@ fn run_id(gate: &ThisGate, root: &StateRoot) -> String {
     }
 }
 
+/// The environment a command starts in: `start`, then the caller's pairs `caller` over it, then the gate's own
+/// `overrides` last, names compared as Windows compares them at each step.
+fn composed(start: Vec<(OsString, OsString)>, caller: &[(String, String)], overrides: Vec<Override>) -> Vec<(OsString, OsString)> {
+    applied(applied(start, caller_overrides(caller)), overrides)
+}
+
+/// The caller's pairs as overrides, each setting its name.
+fn caller_overrides(caller: &[(String, String)]) -> Vec<Override> {
+    caller
+        .iter()
+        .map(|(name, value)| (OsString::from(name), Some(OsString::from(value))))
+        .collect()
+}
+
 /// `variables` with each override applied in turn: every pair of its name removed, names compared as Windows compares
 /// them, then the new pair added when it has a value.
 fn applied(mut variables: Vec<(OsString, OsString)>, overrides: Vec<Override>) -> Vec<(OsString, OsString)> {
@@ -141,7 +152,7 @@ mod tests {
     use gate_state::StateRoot;
     use gate_win32::same_variable_name;
 
-    use super::{Variables, applied, overrides};
+    use super::{Variables, applied, composed, overrides};
     use crate::resolve::ResolvedRoot;
 
     const DEFAULT: &str = r"C:\Users\someone\AppData\Local\gate\v1";
@@ -240,5 +251,33 @@ mod tests {
 
         assert_eq!(replaced.0, [path.clone(), set.clone()], "the value set under another letter case is gone");
         assert_eq!(added.0, [path, set], "an unset name is added");
+    }
+
+    fn pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect()
+    }
+
+    #[test]
+    fn the_caller_s_pairs_come_over_the_start_environment_and_under_the_gate_s_own() {
+        let start = vec![
+            (OsString::from("nugetaudit"), OsString::from("true")),
+            (OsString::from("Path"), OsString::from(r"C:\bin")),
+        ];
+        let caller = pairs(&[("NuGetAudit", "false"), ("GATE_SLOT_HELD", "forged"), ("EMPTY", "")]);
+
+        let variables = Variables(composed(start, &caller, overrides(&root(DEFAULT), "gate-1-2", "heavy:1:2")));
+
+        assert_eq!(
+            variables.get("NUGETAUDIT"),
+            Some(OsStr::new("false")),
+            "the caller's value replaces the inherited one"
+        );
+        assert_eq!(
+            variables.get("GATE_SLOT_HELD"),
+            Some(OsStr::new("heavy:1:2")),
+            "the gate's own setting comes last"
+        );
+        assert_eq!(variables.get("EMPTY"), Some(OsStr::new("")), "an empty value is set");
+        assert_eq!(variables.get("Path"), Some(OsStr::new(r"C:\bin")), "other variables pass through");
     }
 }

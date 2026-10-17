@@ -28,6 +28,7 @@ fn run_reads_every_option_and_the_defaults() {
             no_markers: false,
             local: false,
             bring_tracked: Vec::new(),
+            env: Vec::new(),
             state_dir: None,
             cd: None,
             command: os(&["cmd", "/c", "echo hi"]),
@@ -332,6 +333,126 @@ fn a_repeated_bring_tracked_leaves_other_options_given_once() {
     assert_eq!(
         problems_with(&["--bring-tracked", "a", "--bring-tracked", "b", "--timeout", "9", "--", "cmd"]),
         ["gate: --timeout is given twice"]
+    );
+}
+
+fn pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect()
+}
+
+#[test]
+fn run_collects_every_env_pair_in_order() {
+    let request = run_with(&[
+        "--env",
+        "NuGetAudit=false",
+        "--env=RUSTFLAGS=-D warnings",
+        "--env",
+        "EMPTY=",
+        "--env",
+        "HOLDS=a=b",
+        "--",
+        "cmd",
+    ]);
+    assert_eq!(
+        request.env,
+        pairs(&[("NuGetAudit", "false"), ("RUSTFLAGS", "-D warnings"), ("EMPTY", ""), ("HOLDS", "a=b")]),
+        "split at the first '=', an empty value kept"
+    );
+    assert_eq!(run_with(&["--", "cmd"]).env, Vec::<(String, String)>::new(), "none by default");
+    assert_eq!(
+        problems_with(&["--env", "A=1", "--env", "B=2", "--timeout", "9", "--", "cmd"]),
+        ["gate: --timeout is given twice"],
+        "a repeated --env leaves other options given once"
+    );
+}
+
+#[test]
+fn run_env_needs_a_value() {
+    assert_eq!(problems_with(&["--env", "--", "cmd"]), ["gate: --env needs a value"]);
+    assert_eq!(problems_with(&["--env=", "--", "cmd"]), ["gate: --env needs a value"]);
+}
+
+#[test]
+fn run_env_refuses_a_name_to_forward_that_is_not_set() {
+    assert_eq!(
+        problems_with(&["--env", "ZZ_GATE_TEST_FORWARD_UNSET", "--", "cmd"]),
+        ["gate: --env word 1 names a variable to forward, and it is not set"]
+    );
+}
+
+#[test]
+fn run_env_refuses_each_name_the_gate_keeps_with_its_own_line() {
+    for (word, line) in [
+        ("=b", "gate: --env word 1 has a malformed name"),
+        ("A B=v", "gate: --env word 1 has a malformed name"),
+        ("A\nPATH=v", "gate: --env word 1 has a malformed name"),
+        ("\u{17f}ystemRoot=v", "gate: --env word 1 has a malformed name"),
+        ("A\u{200b}=v", "gate: --env word 1 has a malformed name"),
+        ("A=b\0c", "gate: --env gives A a value holding NUL"),
+        ("msbuilduseserver=1", "gate: --env sets msbuilduseserver, which the gate sets itself"),
+        (
+            "GIT_CONFIG=x",
+            "gate: --env sets GIT_CONFIG, which git would read over the gate's own git settings",
+        ),
+        ("GATE_ANY=1", "gate: --env sets GATE_ANY: GATE_ names are the gate's"),
+        ("Path=C:\\bin", "gate: --env sets Path, a machine path the gate keeps for the command"),
+    ] {
+        assert_eq!(problems_with(&["--env", word, "--", "cmd"]), [line], "{word:?}");
+    }
+}
+
+#[test]
+fn run_env_accepts_the_names_a_caller_may_give() {
+    for (word, pair) in [
+        ("ProgramFiles(x86)=C:\\x", ("ProgramFiles(x86)", "C:\\x")),
+        ("Logging:LogLevel:Default=Warning", ("Logging:LogLevel:Default", "Warning")),
+        ("a.b-c_1=1", ("a.b-c_1", "1")),
+        (
+            "npm_config_//registry.npmjs.org/:_authToken=x",
+            ("npm_config_//registry.npmjs.org/:_authToken", "x"),
+        ),
+        ("a@b=1", ("a@b", "1")),
+    ] {
+        assert_eq!(run_with(&["--env", word, "--", "cmd"]).env, pairs(&[pair]), "{word:?}");
+    }
+}
+
+#[test]
+fn run_env_refuses_a_word_that_is_not_unicode_by_its_position() {
+    let mut words = os(&RUN);
+    words.extend([OsString::from("--env"), unreadable_word(), OsString::from("--"), OsString::from("cmd")]);
+
+    assert_eq!(problems_of(words), ["gate: --env word 1 is not valid Unicode"]);
+}
+
+#[test]
+fn run_env_refuses_a_name_given_twice_in_any_ascii_case() {
+    assert_eq!(
+        problems_with(&["--env", "NuGetAudit=a", "--env", "NUGETAUDIT=b", "--", "cmd"]),
+        ["gate: --env names NUGETAUDIT twice"]
+    );
+}
+
+#[test]
+fn run_env_refuses_more_than_its_cap() {
+    let names: Vec<String> = (0..=64).map(|index| format!("--env=N{index}=v")).collect();
+    let mut extra: Vec<&str> = names.iter().map(String::as_str).collect();
+    extra.extend(["--", "cmd"]);
+    assert_eq!(problems_with(&extra), ["gate: --env is over its cap of 64 names or 32 KiB"]);
+    assert_eq!(run_with(&extra[1..]).env.len(), 64, "64 names are allowed");
+    let long = format!("--env=BIG={}", "x".repeat(32 * 1024));
+    assert_eq!(
+        problems_with(&[&long, "--", "cmd"]),
+        ["gate: --env is over its cap of 64 names or 32 KiB"]
+    );
+}
+
+#[test]
+fn run_usage_lists_env() {
+    assert!(
+        USAGE.lines().any(|line| line
+            == "  --env NAME[=value]   set NAME for the command, local or routed; without =value, forward NAME's value from here, the form for secrets; repeatable"),
+        "the usage lists --env:\n{USAGE}"
     );
 }
 

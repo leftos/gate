@@ -938,6 +938,7 @@ pub(crate) mod scratch {
             no_markers: false,
             local: false,
             bring_tracked: Vec::new(),
+            env: Vec::new(),
             state_dir: None,
             cd: None,
             command: ["fake-tool", "exit", "0"].into_iter().map(OsString::from).collect(),

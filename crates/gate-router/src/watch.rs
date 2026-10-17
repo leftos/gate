@@ -35,10 +35,7 @@ pub fn dropped_env<'a>(caller: impl IntoIterator<Item = &'a str>, sent: &[&str],
 pub fn dropped_env_line(names: &[String]) -> Option<String> {
     (!names.is_empty()).then(|| {
         let shown: Vec<String> = names.iter().map(|name| escaped(name)).collect();
-        format!(
-            "gate: a routed run does not send the caller's {}; --env NAME=value sends one",
-            shown.join(", ")
-        )
+        format!("gate: a routed run does not send the caller's {}; --env NAME sends it", shown.join(", "))
     })
 }
 

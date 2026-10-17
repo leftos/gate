@@ -1123,6 +1123,7 @@ impl Attempt<'_, '_> {
             host: self.call.host,
             sibling_snapshots: &sibling_snapshots,
             inputs_digest: inputs.as_ref().map(|built| built.digest.as_str()),
+            env: self.call.env,
         };
         let run_input = payload::input(&self.run_word(&location, &run), sent.manifest.as_deref());
         let trees = self.trees(&repos, &snapshots)?;
@@ -4174,6 +4175,7 @@ mod tests {
             tail: 0,
             no_markers: false,
             bring_tracked: &[],
+            env: &[],
             interrupt: Some(raised()),
             state: &STATE,
             state_dir: Path::new(r"C:\gate-client-tests-state"),
@@ -6396,6 +6398,7 @@ mod tests {
             tail: 0,
             no_markers: false,
             bring_tracked: &[],
+            env: &[],
             interrupt,
             state,
             state_dir: Path::new(r"C:\gate-client-tests-state"),

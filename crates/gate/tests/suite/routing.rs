@@ -405,6 +405,111 @@ fn a_matched_command_holding_a_path_outside_the_worktree_runs_here_saying_so() {
     assert_local(&events(&case), None);
 }
 
+/// The line a routed run says for the caller's watched variables it does not send, as far as its first name.
+const DROPPED_LINE: &str = "gate: a routed run does not send the caller's ";
+
+#[test]
+fn a_routed_run_says_which_watched_variables_it_drops() {
+    let case = routed_case("routing-dropped-env");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let mut gate = case.gate(&routed_words(
+        "out.log",
+        &steps,
+        &["--env", "rustflags=-D warnings"],
+        &[FAKE_TOOL, "out", "ran"],
+    ));
+    gate.env("NuGetAudit", "false").env("RUSTFLAGS", "-D warnings");
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let dropped: Vec<&str> = outcome.stderr.lines().filter(|line| line.starts_with(DROPPED_LINE)).collect();
+    assert_eq!(dropped.len(), 1, "one line: {outcome:?}");
+    assert!(dropped[0].ends_with("; --env NAME sends it"), "{dropped:?}");
+    let names = &dropped[0][DROPPED_LINE.len()..];
+    assert!(names.split([',', ';', ' ']).any(|name| name == "NuGetAudit"), "{dropped:?}");
+    assert!(
+        !names.to_ascii_uppercase().contains("RUSTFLAGS"),
+        "a name --env sends is not dropped: {dropped:?}"
+    );
+    let name = fake_tool_name();
+    let routed_line = format!("gate: routed {FAKE_TOOL} as {name}");
+    assert_in_order(&outcome.stderr, &[routed_line.as_str(), DROPPED_LINE]);
+    assert_eq!(
+        recorded(&call)["env"],
+        json!([["rustflags", "-D warnings"]]),
+        "the client is given the pairs"
+    );
+}
+
+#[test]
+fn a_local_run_says_no_dropped_variables() {
+    let case = routed_case("routing-local-dropped-env");
+    let steps = shown(&stub(&case, &["status 0"]));
+    let mut gate = case.gate(&routed_words("out.log", &steps, &["--local"], &[r".\tool.exe", "out", "ran"]));
+    gate.env("NuGetAudit", "false");
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran"), "the run ran here: {outcome:?}");
+    assert!(!outcome.stderr.contains(DROPPED_LINE), "{outcome:?}");
+}
+
+#[test]
+fn a_run_that_would_route_but_runs_here_says_no_dropped_variables() {
+    let case = routed_case("routing-would-route-local");
+    let mut gate = case.gate(&heavy_words_with_limit(
+        "out.log",
+        &["--env", "rustflags=-D warnings"],
+        &[r".\tool.exe", "argv"],
+    ));
+    gate.arg(OsString::from_wide(&[u16::from(b'x'), 0xD800]));
+    gate.env("NuGetAudit", "false");
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: not routed: a word of the command is not valid Unicode\n"),
+        "the decision would route: {outcome:?}"
+    );
+    assert!(!outcome.stderr.contains(DROPPED_LINE), "only a routed run says the line: {outcome:?}");
+}
+
+/// A forwarded `--env NAME` takes the path a written pair takes: the route's call carries it, and no line of the gate's
+/// says its value.
+#[test]
+fn a_routed_run_sends_a_forwarded_env_pair() {
+    let case = routed_case("routing-forwarded-env");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let mut gate = case.gate(&routed_words(
+        "out.log",
+        &steps,
+        &["--env", "ZZ_GATE_FORWARDED"],
+        &[FAKE_TOOL, "out", "ran"],
+    ));
+    gate.env("ZZ_GATE_FORWARDED", "from the caller's environment");
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        recorded(&call)["env"],
+        json!([["ZZ_GATE_FORWARDED", "from the caller's environment"]]),
+        "the forwarded pair reaches the call's Env"
+    );
+    assert!(
+        !outcome
+            .stderr
+            .lines()
+            .any(|line| line.starts_with("gate: ") && line.contains("from the caller's environment")),
+        "no line of the gate's says the value: {outcome:?}"
+    );
+}
+
 #[test]
 fn a_command_naming_a_program_outside_the_worktree_routes_by_the_program_s_name() {
     let case = routed_case("routing-program-path");

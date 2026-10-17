@@ -236,6 +236,8 @@ pub(crate) struct RemoteCall<'a> {
     pub inputs: &'a [String],
     /// The `--bring-tracked` globs: a fetched output git tracks is installed only when one matches it.
     pub bring_tracked: &'a [String],
+    /// The caller's `--env` pairs, sent in the run call's `Env` for the command on the builder.
+    pub env: &'a [(String, String)],
     /// The log the client writes the run's output to.
     pub log: &'a Path,
     pub timeout: u64,
@@ -473,6 +475,7 @@ mod snapshot_only {
                 tail: 0,
                 no_markers: false,
                 bring_tracked: &[],
+                env: &[],
                 interrupt,
                 state: &STATE,
                 state_dir: Path::new(r"C:\gate-snapshot-client-tests"),
@@ -761,6 +764,7 @@ mod scripted {
             "stall": call.stall,
             "tail": call.tail,
             "noMarkers": call.no_markers,
+            "env": call.env,
             "warmth": recorded_warmth(call.warmth),
         });
         fs::write(path, recorded.to_string()).map_err(|error| format!("cannot record the call to {}: {error}", path.display()))?;
