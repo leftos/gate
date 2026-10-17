@@ -660,6 +660,27 @@ fn a_routed_run_sends_a_forwarded_env_pair() {
     );
 }
 
+/// The builder's command gets the gate's `UseSharedCompilation=false`, whatever the PC's own environment holds
+/// (GATE-383): a command that waits for every process in its job never ends while the run's own compiler server idles in
+/// it.
+#[test]
+fn a_routed_run_gives_the_builder_s_command_shared_compilation_off() {
+    let case = client_case("client-shared-compilation");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(&case, "out.log", &steps, &[r".\tool.exe", "env", "UseSharedCompilation"]);
+    gate.env("UseSharedCompilation", "true");
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "the run went to the builder: {outcome:?}");
+    assert!(
+        outcome.stdout.lines().any(|line| line == "false"),
+        "the builder's command read the gate's value, not the PC's `true`: {outcome:?}"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
+}
+
 /// The most git processes the simple pass below starts, on the PC and the box together, children of git counted.
 const SIMPLE_PASS_GIT_STARTS: usize = 30;
 

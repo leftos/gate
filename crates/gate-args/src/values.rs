@@ -174,6 +174,7 @@ pub const GATE_SET_NAMES: &[&str] = &[
     "MSBUILDNODEHANDSHAKESALT",
     "MSBUILDUSESERVER",
     "DOTNET_CLI_USE_MSBUILD_SERVER",
+    "UseSharedCompilation",
     "MSBUILDDISABLENODEREUSE",
     "GIT_CONFIG_COUNT",
     "Logging__EventLog__LogLevel__Default",

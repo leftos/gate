@@ -85,15 +85,18 @@ fn overrides(root: &ResolvedRoot, run: &str, marker: &str) -> Vec<Override> {
 }
 
 /// The build-server settings of the run `run`: the compiler server's pipe and `MSBuild`'s node handshake are named by
-/// the run id, so no other run's command uses the servers this one starts; the `MSBuild` server is off, an inherited
-/// `MSBUILDUSESERVER` included; and `MSBuild`'s node reuse is off, so no node idles in the command's job after its
-/// build, keeping alive whatever in the command waits for its whole tree.
+/// the run id, so no other run's command uses the servers this one starts; the `MSBuild` server, the compiler server and
+/// `MSBuild`'s node reuse are all off, an inherited `MSBUILDUSESERVER`, `UseSharedCompilation` or
+/// `MSBUILDDISABLENODEREUSE` included: nothing may idle in the command's job once its build has run, since a command
+/// that waits for its whole job (Godot's console wrapper waits for every process in it) never ends while an idle process
+/// holds it, and Roslyn's compiler server idles there for up to ten minutes.
 fn build_servers(run: &str) -> Vec<Override> {
     vec![
         (OsString::from("SharedCompilationId"), Some(OsString::from(run))),
         (OsString::from("MSBUILDNODEHANDSHAKESALT"), Some(OsString::from(run))),
         (OsString::from("MSBUILDUSESERVER"), Some(OsString::from("0"))),
         (OsString::from("DOTNET_CLI_USE_MSBUILD_SERVER"), Some(OsString::from("0"))),
+        (OsString::from("UseSharedCompilation"), Some(OsString::from("false"))),
         (OsString::from("MSBUILDDISABLENODEREUSE"), Some(OsString::from("1"))),
     ]
 }
@@ -238,6 +241,30 @@ mod tests {
         assert_eq!(named("MSBUILDUSESERVER"), [OsStr::new("0")]);
         assert_eq!(named("DOTNET_CLI_USE_MSBUILD_SERVER"), [OsStr::new("0")]);
         assert_eq!(named("MSBUILDDISABLENODEREUSE"), [OsStr::new("1")]);
+    }
+
+    #[test]
+    fn the_overrides_give_the_command_shared_compilation_off_over_an_inherited_on() {
+        let inherited = vec![(OsString::from("usesharedcompilation"), OsString::from("true"))];
+
+        let variables = Variables(applied(inherited, overrides(&root(DEFAULT), "gate-1-2", "heavy:1:2")));
+
+        assert_eq!(
+            variables.get("UseSharedCompilation"),
+            Some(OsStr::new("false")),
+            "no compiler server idles in the job of a command that waits for its whole tree"
+        );
+    }
+
+    #[test]
+    fn every_name_the_gate_sets_is_one_a_caller_cannot_set() {
+        for (name, _) in overrides(&root(DEFAULT), "gate-1-2", "heavy:1:2") {
+            let name = name.to_string_lossy().into_owned();
+            assert!(
+                gate_args::GATE_SET_NAMES.iter().any(|set| set.eq_ignore_ascii_case(&name)),
+                "{name} is set over the command, and a caller may set it"
+            );
+        }
     }
 
     #[test]

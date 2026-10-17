@@ -401,6 +401,16 @@ fn run_env_refuses_each_name_the_gate_keeps_with_its_own_line() {
     }
 }
 
+/// `UseSharedCompilation` is one of the gate's own settings: it is off for every command the gate starts, local or
+/// routed, so a caller's `--env` value for it is refused (GATE-383).
+#[test]
+fn run_env_refuses_the_shared_compilation_setting_as_the_gate_s_own() {
+    assert_eq!(
+        problems_with(&["--env", "UseSharedCompilation=true", "--", "cmd"]),
+        ["gate: --env sets UseSharedCompilation, which the gate sets itself"]
+    );
+}
+
 #[test]
 fn run_env_accepts_the_names_a_caller_may_give() {
     for (word, pair) in [

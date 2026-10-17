@@ -250,6 +250,25 @@ fn the_build_server_environment_reaches_the_command() {
     assert_eq!(lines[6], shown(&case.root()), "{text}");
 }
 
+/// The gate turns shared compilation off for every command it starts, an inherited `true` included: a command that waits
+/// for every process in its job never ends while the run's own Roslyn compiler server idles in it (GATE-383; Godot's
+/// console wrapper waits for its whole job).
+#[test]
+fn the_command_gets_shared_compilation_off_over_an_inherited_on() {
+    let case = Case::new("the_command_gets_shared_compilation_off_over_an_inherited_on");
+    let mut gate = case.gate(&run_words("out.log", &[], &[FAKE_TOOL, "env", "UseSharedCompilation"]));
+    gate.env("UseSharedCompilation", "true");
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        log_text(&case).lines().next(),
+        Some("false"),
+        "the command sees the gate's value, not the inherited one"
+    );
+}
+
 #[test]
 fn an_env_pair_reaches_the_command_and_cannot_undo_the_gate_s_own() {
     let case = Case::new("an_env_pair_reaches_the_command_and_cannot_undo_the_gate_s_own");
