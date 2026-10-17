@@ -248,7 +248,7 @@ With a pin that names a version it is `.NET SDK <version> (rollForward <policy>)
 
 The SDK list is read with the folders inside the worktree dropped from `PATH`. A `global.json` whose pin cannot be read (a reason above) says `.NET SDK skipped: global.json has no readable sdk pin`, which counts as skipped, and the file counts as unreadable; a list that cannot be read `.NET SDK skipped: cannot read this PC's SDK list: <why>`.
 
-A manifest that lists workloads gets one line, `workloads <ids, comma separated> not checked yet`, which counts as neither skipped nor missing. The tools in `.config/dotnet-tools.json` and a `Godot.NET.Sdk` pin are not checked and say nothing.
+A manifest that lists workloads gets one line, `workloads <ids, comma separated> not checked yet`, which counts as neither skipped nor missing. The tools in `.config/dotnet-tools.json` and a `Godot.NET.Sdk` pin are not checked by `gate check` and say nothing; a routed run does read a Godot pin (Toolchain manifest, under Routing), and `gate check` judges a manifest `godot` entry as a minimum, as every other tool's.
 
 Each sibling the repo declares is checked as routing checks it, and gets one line:
 
@@ -1574,7 +1574,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     `toolchain::meets` compares a found version with a minimum. A repo's sibling worktrees are not declared here but in `.gate/siblings.toml` ([Sibling worktrees](#routing)), whose problems keep a run local.
 
-    The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version. The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot` and `ffmpeg`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
+    The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version; a routed run reads the `godot` entry as an exact pin instead (below). The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot` and `ffmpeg`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
 
     A file that is not UTF-8 or does not parse is unreadable whole, and the line for it is `gate: cannot read .gate/toolchain.toml: <why>; skipping the manifest's checks`, `<why>` being `line <l>, column <c>: <toml message>` or `not valid UTF-8 (...)`. A routed run words a manifest problem its own way, `gate: .gate/toolchain.toml: <problem>; skipping it`, for a whole file that cannot be read as for a bad entry, `<problem>` escaped.
 
@@ -1586,13 +1586,25 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The preflight's `Needs` carry the tools the manifest declares whose names the box knows how to probe (the known names above), each with its minimum, or empty for any version. A name outside them is skipped with `gate: .gate/toolchain.toml names unknown tool <name>; skipping it` and not sent.
 
+    `godot` is sent whenever the repo pins a Godot version, on every routed run whatever its command: the manifest names `godot`, or a `*.csproj` of the snapshot names `Godot.NET.Sdk/<version>`. Its value is the distinct pins joined by `,` (the box ignores the text and reads only the name), or empty for a manifest entry of `""`. A manifest `godot` entry wins over every project pin; a manifest that is unreadable, or whose `godot` value is no version, does not stop the project pins from applying.
+
+    A repo pinning nothing sends no `godot` need and is judged as before.
+
     The builder answers each tool with a `gate: remote tool <name> <version|present|missing|skipped: <why>>` line. A tool it found missing, or older than the minimum, is a need, and the route is refused as under Parity: one `gate: remote toolchain mismatch: <repo> needs <name> <min> or later; <host> has <version|none>` line per need (`<name>` alone when the manifest sets no minimum), then the parity fallback line, and the run goes local.
+
+    `godot` is judged as an exact pin, not a minimum. The builder's answer is the list `gate: remote tool godot <v1>,<v2>,...` of its installed versions, split on `,`. A pin is met when one installed version equals it on the parts the pin gives (`4.7.2` exactly, `4.7` any `4.7.x`, `4` any `4.x.y`), a prerelease install reading as its release; a four-part SDK version reads as its first three parts.
+
+    Every pin must be met, else the mismatch line is `gate: remote toolchain mismatch: <repo> needs godot <pins, comma separated> exactly; <host> has <found>`, `<found>` being the builder's versions joined by `, `, `none`, `not probed (<why>)`, or its own answer when that is no version list; for a manifest entry of `""` (any version) the line reads `needs godot`.
+
+    An answer that is no version list is a mismatch whenever a pin needs checking, so the command runs here rather than on a builder that may lack the version. A slow install that drops off the builder's list reads as missing, a needless fallback and a known limitation.
 
     A tool the builder did not probe, gave no answer for, or found at a version that cannot be read against a minimum gets `gate: <host> did not probe <name>: <why>; not checking it` and is not a need. The lines come in this order: the SDK step's own, then the manifest's problem lines, then the per-tool skip lines in the manifest's order, then the mismatch lines.
 
-    A text from the manifest or the builder is escaped, and the builder's cut to 4096 bytes, so neither can forge a line. `toolchain::standing` judges a tool against what its probe found (met, too old, missing, not readable, skipped) in one place, which `gate check`'s report shares; `gate check`'s output is unchanged. `--test-remote-interrupt-at manifest` raises the interrupt just before the manifest is read.
+    A text from the manifest or the builder is escaped, and the builder's cut to 4096 bytes, so neither can forge a line. `toolchain::standing` judges a tool against a minimum from what its probe found (met, too old, missing, not readable, skipped) in one place, which `gate check`'s report shares and a routed run applies to every tool but a pinned `godot`; `gate check`'s output is unchanged and still judges a manifest `godot` entry as a minimum. `--test-remote-interrupt-at manifest` raises the interrupt just before the manifest is read.
 
-    Two pins a repo already declares are read beside it, also as minimums: each tool's version in `.config/dotnet-tools.json` (the release part, so `1.0.0-beta.1` is 1.0.0; read as strict JSON, as dotnet reads it, so a comment or a trailing comma makes the file unreadable, and a tool id given twice counts once, with its last version) and the `Godot.NET.Sdk/<version>` a project file names, on its root `<Project Sdk=...>` or an `<Sdk Name="Godot.NET.Sdk" Version=...>` element directly inside it (an `<Import Sdk=...>`, a deeper `<Sdk>` element and a `min=` version are not read).
+    Two pins a repo already declares are read beside it: each tool's version in `.config/dotnet-tools.json` (the release part, so `1.0.0-beta.1` is 1.0.0; read as strict JSON, as dotnet reads it, so a comment or a trailing comma makes the file unreadable, and a tool id given twice counts once, with its last version) and the `Godot.NET.Sdk/<version>` a project file names, on its root `<Project Sdk=...>` or an `<Sdk Name="Godot.NET.Sdk" Version=...>` element directly inside it (an `<Import Sdk=...>`, a deeper `<Sdk>` element and a `min=` version are not read). The dotnet tools' versions are read and nothing judges them yet. The Godot pin is an exact version on the parts it gives, a four-part SDK version reading as its first three, and is judged on every routed run (above).
+
+    The project files are every `*.csproj` the snapshot holds, at any depth and in any ASCII letter case: at most 64 files of at most 256 KiB each, read with at most two git calls, the sizes first and then one bounded batch read. A file that cannot be read says `gate: cannot read the Godot pin of <file>: <why>; not checking it` and gives no pin; files past the 64th say `gate: <n> more project files not read for a Godot pin; not checking them`.
 
     `global.json` stays the SDK pin, read by `parity.rs` as above.
   - **Push.** `git push --no-verify --no-recurse-submodules --progress [--receive-pack=…] -- <host>:<builder root>/<repo>.git +<snapshot>:refs/gate/<key> [+<bridge>:refs/gate-bridge/<key>]`, with `GIT_SSH_COMMAND` carrying the ssh options. Success says `gate: pushed snapshot <8 hex> in <s> s (<size>|up to date)` and moves the local `refs/gate-remote/<key>`.
@@ -2005,7 +2017,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   It then reads the payload back with the box's own reader, so a pair the box would refuse stays here; checks toolchain parity for each repository; pushes each and saves each local ref; and lets the folders and locks go before the run call.
 
-  Parity is checked for each repository in order: a sibling's SDK need is read from its own `global.json` and its lines name it, and the tools are the main repository's manifest alone. A builder that lacks anything says one `gate: remote toolchain mismatch: <repo> needs ...` line per need and falls back `parity` once.
+  Parity is checked for each repository in order: a sibling's SDK need is read from its own `global.json` and its lines name it, and the tools, with the Godot pin, are the main repository's manifest and project files alone. A builder that lacks anything says one `gate: remote toolchain mismatch: <repo> needs ...` line per need and falls back `parity` once.
 
   `remote/held.rs` holds a pair's folders from the check until the client lets them go: the root's parent is opened once, following links, on a local volume (a network volume is refused), and the root and each sibling are opened beneath it as themselves, never through a link, each with its `.git` entry (a folder or a linked worktree's file, no reparse point of any kind). Each is checked against the exact path the route was decided for and, the root and a sibling, its folder id.
 
@@ -2048,7 +2060,7 @@ The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent a
 
 A warm-up's `run` payload sets `WarmCommands` (1 to 8 commands, each a non-empty list of non-empty texts) and `WarmHash` (64 lower-case hex digits, the hash of the warm-up file the commands come from), sets no `Command`, and asks for no outputs. The PC's client sends it (The remote client's run, Warm-up call) for `gate warm`.
 
-`preflight` also reads an optional `Needs`, an object of tool name to minimum version text (`""` for any version), which the PC builds with `remote::payload::preflight_word` from the tools it wants probed; it is omitted when there are none, so a payload without needs is the same bytes as before.
+`preflight` also reads an optional `Needs`, an object of tool name to minimum version text (`""` for any version; the box ignores the text, and for `godot` the PC sends the distinct exact pins joined by `,`), which the PC builds with `remote::payload::preflight_word` from the tools it wants probed; it is omitted when there are none, so a payload without needs is the same bytes as before.
 
 Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which the outputs transport owns (GATE-44), are read only by `run` (the outputs) and `outputs` (`Name`, `OutputFolder`); `preflight`, `stop` and `boot` ignore them.
 

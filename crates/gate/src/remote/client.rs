@@ -51,7 +51,7 @@ use super::snapshot::{self, Bounded, Place, Snapshot};
 use super::syncback;
 #[cfg(feature = "test-seams")]
 use super::tamper;
-use super::toolchain::{self, Manifest, Reported};
+use super::toolchain::{self, Manifest, Pin, Reported};
 #[cfg(feature = "test-seams")]
 use super::transport::Local;
 use super::transport::ssh::Ssh;
@@ -528,12 +528,18 @@ struct Prepared {
 
 /// What the snapshot's tree gives the parity check, read before the preflight: the git that listed it, the worktree it
 /// was asked in, the names of its files and submodules, and its `.gate/toolchain.toml`, `None` when it has none or is
-/// a sibling's, which is not read, `Err` with why when it cannot be read or is no regular file.
+/// a sibling's, which is not read, `Err` with why when it cannot be read or is no regular file, and the Godot versions
+/// its project files pin, with a line per file left unread. A sibling's tree gives no manifest and no pins: only the
+/// main repository's say what the run needs.
 struct Tree {
     git: Git,
     folder: PathBuf,
     names: Vec<String>,
     manifest: Option<Result<Manifest, String>>,
+    /// The `Godot.NET.Sdk` versions its `*.csproj` files name, each version once, in the order the tree lists them.
+    godot_pins: Vec<Pin>,
+    /// One line per project file whose pin could not be read, in the same order.
+    godot_skips: Vec<String>,
 }
 
 /// The repo's toolchain manifest, as its path at the repo root is spelled.
@@ -601,13 +607,203 @@ fn regular(entry: &Entry) -> Result<&Entry, String> {
     }
 }
 
-impl Tree {
-    /// The `Needs` the preflight sends for the tree's manifest; none when it has no manifest that reads.
-    fn needs(&self) -> Vec<(String, String)> {
-        match &self.manifest {
-            Some(Ok(manifest)) => toolchain::needs_of(manifest),
-            _ => Vec::new(),
+/// The most project files a tree's Godot pins are read from: files past it are not read, and one line names how many
+/// were left.
+const CSPROJ_FILES: usize = 64;
+
+/// The most bytes of one project file read for its Godot pin.
+const CSPROJ_BYTES: usize = 256 * 1024;
+
+/// The most bytes one project file's frame takes in a `git cat-file --batch` answer beside its own text: the object id,
+/// the type, the size and the line ends, with room to spare.
+const CSPROJ_FRAME: usize = 128;
+
+/// The most bytes one `git cat-file --batch` read of the project files can write: [`CSPROJ_FILES`] files of at most
+/// [`CSPROJ_BYTES`] each, every frame within [`CSPROJ_FRAME`].
+const CSPROJ_READ: usize = CSPROJ_FILES * (CSPROJ_BYTES + CSPROJ_FRAME);
+
+/// The most bytes one `git cat-file --batch-check` answer for the project files can write: [`CSPROJ_FILES`] lines of an
+/// object size and a line end, with room to spare.
+const CSPROJ_SIZES: usize = CSPROJ_FILES * 64;
+
+/// What the name of a project file ends in.
+const CSPROJ_SUFFIX: &str = ".csproj";
+
+/// Whether `path` names a project file: its last characters [`CSPROJ_SUFFIX`], in any ASCII letter case, at whatever
+/// depth of the tree it lies.
+fn is_csproj(path: &str) -> bool {
+    path.get(path.len().saturating_sub(CSPROJ_SUFFIX.len())..)
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(CSPROJ_SUFFIX))
+}
+
+/// The project files among a tree's `entries` whose Godot pins are read, with the line naming the files left past
+/// [`CSPROJ_FILES`], `None` when none were left: the first [`CSPROJ_FILES`] entries whose path ends in `.csproj`, in
+/// the listing's order, a folder named like a project file left out as no file at all.
+fn csproj_files(entries: &[Entry]) -> (Vec<&Entry>, Option<String>) {
+    let mut files: Vec<&Entry> = entries.iter().filter(|entry| entry.kind != "tree" && is_csproj(&entry.path)).collect();
+    let left = files.len().saturating_sub(CSPROJ_FILES);
+    files.truncate(CSPROJ_FILES);
+    let line = (left > 0).then(|| format!("gate: {left} more project files not read for a Godot pin; not checking them"));
+    (files, line)
+}
+
+/// Why the project file `entry` is no file the run can read, worded as [`regular`] words the same kinds without the
+/// path the skip line names already; `None` when it is a regular file.
+fn unreadable_csproj(entry: &Entry) -> Option<String> {
+    match (entry.mode.as_str(), entry.kind.as_str()) {
+        ("100644" | "100755", "blob") => None,
+        ("160000", _) => Some("it is a submodule, not a file".to_owned()),
+        ("120000", _) => Some("it is a symbolic link, not a file".to_owned()),
+        (_, "tree") => Some("it is a folder, not a file".to_owned()),
+        (mode, _) => Some(format!("it is not a regular file (mode {mode})")),
+    }
+}
+
+/// The line said for a project file whose Godot pin cannot be read, the file and why both escaped as other lines escape
+/// theirs.
+fn godot_skip_line(file: &str, why: &str) -> String {
+    format!("gate: cannot read the Godot pin of {}: {}; not checking it", escaped(file), escaped(why))
+}
+
+/// Why a project file is left unread: its text is past [`CSPROJ_BYTES`].
+fn oversized_reason() -> String {
+    format!("its text is more than {} KiB", CSPROJ_BYTES / 1024)
+}
+
+/// The run's failure for a git answer no project file's pin can be read from, `why` naming what it answered.
+fn csproj_end(why: &str) -> End {
+    End::Failed(format!("gate: cannot read the Godot pin of the project files: {}", escaped(why)))
+}
+
+/// The size of each blob of `files`, from the `git cat-file --batch-check=%(objectsize)` answer `answer`, one line for
+/// each in their order; `Err` with what it answered when it names no size for one of them.
+fn sizes_of(answer: &[u8], files: &[&Entry]) -> Result<Vec<u64>, String> {
+    let answer = String::from_utf8_lossy(answer);
+    let lines: Vec<&str> = answer.lines().collect();
+    if lines.len() != files.len() {
+        return Err(format!("it answered {} line(s) for {} project file(s)", lines.len(), files.len()));
+    }
+    lines
+        .iter()
+        .zip(files)
+        .map(|(line, file)| {
+            line.trim()
+                .parse::<u64>()
+                .map_err(|_| format!("it answered '{}' for {}", line.trim(), file.path))
+        })
+        .collect()
+}
+
+/// The text of each blob of `files`, from the `git cat-file --batch` answer `answer`, one for each in their order: each
+/// object's header line, then its bytes, then the line end after them; `Err` with what it answered when the answer is
+/// not shaped so.
+fn texts_of(answer: &[u8], files: &[&Entry]) -> Result<Vec<Vec<u8>>, String> {
+    let mut texts = Vec::with_capacity(files.len());
+    let mut rest = answer;
+    for file in files {
+        let Some(end) = rest.iter().position(|byte| *byte == b'\n') else {
+            return Err(format!("it gave no header for {}", file.path));
+        };
+        let header = String::from_utf8_lossy(&rest[..end]);
+        let Some(size) = header.rsplit(' ').next().and_then(|size| size.trim().parse::<usize>().ok()) else {
+            return Err(format!("it named no size for {}: '{}'", file.path, header));
+        };
+        let body = &rest[end + 1..];
+        if body.len() < size + 1 {
+            return Err(format!("it gave {} byte(s) for {}", body.len(), file.path));
         }
+        texts.push(body[..size].to_vec());
+        rest = &body[size + 1..];
+    }
+    Ok(texts)
+}
+
+/// The project files of `files` whose blobs are read, and the line for each file no file at all, in the order of
+/// `files`.
+fn readable_files<'a>(files: &[&'a Entry]) -> (Vec<&'a Entry>, Vec<String>) {
+    let mut readable = Vec::new();
+    let mut skips = Vec::new();
+    for file in files {
+        match unreadable_csproj(file) {
+            Some(why) => skips.push(godot_skip_line(&file.path, &why)),
+            None => readable.push(*file),
+        }
+    }
+    (readable, skips)
+}
+
+/// The project files of `files` within [`CSPROJ_BYTES`], as the sizes `sizes` gives them one for one, and the line for
+/// each file left past it; `Err` when the sizes do not answer for `files` one for one.
+fn within_cap<'a>(files: &[&'a Entry], sizes: Vec<u64>) -> Result<(Vec<&'a Entry>, Vec<String>), End> {
+    if sizes.len() != files.len() {
+        return Err(csproj_end(&format!(
+            "it named the size of {} of {} project file(s)",
+            sizes.len(),
+            files.len()
+        )));
+    }
+    let mut kept = Vec::new();
+    let mut skips = Vec::new();
+    for (file, size) in files.iter().zip(sizes) {
+        if size > CSPROJ_BYTES as u64 {
+            skips.push(godot_skip_line(&file.path, &oversized_reason()));
+        } else {
+            kept.push(*file);
+        }
+    }
+    Ok((kept, skips))
+}
+
+/// The pins the project file texts `texts` give, one for each of `files`, and the line for each whose bytes are not
+/// UTF-8; `Err` when the texts do not answer for `files` one for one.
+fn pins_of(files: &[&Entry], texts: Vec<Vec<u8>>) -> Result<(Vec<Pin>, Vec<String>), End> {
+    if texts.len() != files.len() {
+        return Err(csproj_end(&format!("it read {} of {} project file(s)", texts.len(), files.len())));
+    }
+    let mut pins: Vec<Pin> = Vec::new();
+    let mut skips = Vec::new();
+    for (file, bytes) in files.iter().zip(texts) {
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            skips.push(godot_skip_line(&file.path, "not valid UTF-8"));
+            continue;
+        };
+        for pin in toolchain::godot_sdk_pins(text) {
+            if !pins.contains(&pin) {
+                pins.push(pin);
+            }
+        }
+    }
+    Ok((pins, skips))
+}
+
+/// The `Godot.NET.Sdk` versions the project files among a tree's `entries` pin ([`toolchain::godot_sdk_pins`]), and the
+/// line for each file left out: the files [`csproj_files`] names, `size` asked for their sizes as one
+/// `cat-file --batch-check` answers them and `read` handed the ones within [`CSPROJ_BYTES`] as one `cat-file --batch`
+/// reads them, so a file past that cap is left unread. The skips come in this order: a file that is no file at all,
+/// then a file past [`CSPROJ_BYTES`], then a file whose text is not UTF-8, each in the tree's order, then the count of
+/// the files left past [`CSPROJ_FILES`]. The same version pinned twice is one pin.
+fn csproj_pins(
+    entries: &[Entry],
+    size: impl FnOnce(&[&Entry]) -> Result<Vec<u64>, End>,
+    read: impl FnOnce(&[&Entry]) -> Result<Vec<Vec<u8>>, End>,
+) -> Result<(Vec<Pin>, Vec<String>), End> {
+    let (files, capped) = csproj_files(entries);
+    let (readable, mut skips) = readable_files(&files);
+    let sizes = if readable.is_empty() { Vec::new() } else { size(&readable)? };
+    let (kept, over) = within_cap(&readable, sizes)?;
+    skips.extend(over);
+    let texts = if kept.is_empty() { Vec::new() } else { read(&kept)? };
+    let (pins, unread) = pins_of(&kept, texts)?;
+    skips.extend(unread);
+    skips.extend(capped);
+    Ok((pins, skips))
+}
+
+impl Tree {
+    /// The `Needs` the preflight sends for the tree ([`toolchain::routed_needs`]): the tools its manifest declares, and
+    /// the exact versions its project files pin of godot when the manifest does not name godot itself.
+    fn needs(&self) -> Vec<(String, String)> {
+        toolchain::routed_needs(self.manifest.as_ref(), &self.godot_pins)
     }
 }
 
@@ -1246,6 +1442,8 @@ impl Attempt<'_, '_> {
             folder,
             names,
             manifest: None,
+            godot_pins: Vec::new(),
+            godot_skips: Vec::new(),
         }))
     }
 
@@ -1330,11 +1528,14 @@ impl Attempt<'_, '_> {
             .map(|entry| entry.path.clone())
             .collect();
         let manifest = self.manifest(&git, &entries)?;
+        let (godot_pins, godot_skips) = self.godot_pins(&git, &entries)?;
         Ok(Some(Tree {
             git,
             folder,
             names,
             manifest,
+            godot_pins,
+            godot_skips,
         }))
     }
 
@@ -1405,6 +1606,37 @@ impl Attempt<'_, '_> {
         Ok(Some(read))
     }
 
+    /// The `Godot.NET.Sdk` versions the snapshot's project files pin ([`csproj_pins`]), read in two git calls whatever
+    /// their count — one `cat-file --batch-check` for their sizes, so a file past [`CSPROJ_BYTES`] is left unread, then
+    /// one `cat-file --batch`, bounded by [`CSPROJ_READ`], for the rest — and the line for each file left out. A tree
+    /// holding no project file asks git nothing. Any git failure ends the run.
+    fn godot_pins(&mut self, git: &Git, entries: &[Entry]) -> Result<(Vec<Pin>, Vec<String>), End> {
+        self.go_on()?;
+        let attempt = &*self;
+        let pins = csproj_pins(
+            entries,
+            |files| {
+                let answer = attempt.blobs(git, &["cat-file", "--batch-check=%(objectsize)"], files, CSPROJ_SIZES)?;
+                sizes_of(&answer, files).map_err(|why| csproj_end(&why))
+            },
+            |files| {
+                let answer = attempt.blobs(git, &["cat-file", "--batch"], files, CSPROJ_READ)?;
+                texts_of(&answer, files).map_err(|why| csproj_end(&why))
+            },
+        )?;
+        self.go_on()?;
+        Ok(pins)
+    }
+
+    /// What git writes for `args` in the worktree, its standard input fed the object ids of `files`, one to a line, and
+    /// its standard output read up to `cap` bytes, as one `cat-file` call; a Ctrl+C, a failure and an answer past the
+    /// cap each end the run.
+    fn blobs(&self, git: &Git, args: &[&str], files: &[&Entry], cap: usize) -> Result<Vec<u8>, End> {
+        let ids: String = files.iter().flat_map(|file| [file.oid.as_str(), "\n"]).collect();
+        self.git_bytes_within(Path::new(self.call.root), git, args, Some(ids.as_bytes()), cap)
+            .map_err(git_end)
+    }
+
     /// The toolchain parity check, made after the preflight and before the push, so a refusal costs no transfer, over
     /// the snapshot's `tree`, which `None` skips: the builder must have the SDK [`Attempt::sdk_needs`] reads and the
     /// tools the manifest declares, as [`toolchain::judge`] weighs what the `prepared` preflight said of them. The SDK
@@ -1432,16 +1664,21 @@ impl Attempt<'_, '_> {
     }
 
     /// What the builder lacks for the repository `repo`, at `at` in the run's order, whose `snapshot` has the tree
-    /// `tree`: its SDK, and for the main one, first, the tools its manifest declares, each manifest problem and tool not
-    /// checked said. A sibling's git failure keeps the run here naming it.
+    /// `tree`: its SDK, and for the main one, first, the tools its manifest declares and the Godot versions its project
+    /// files pin, each manifest problem, tool not checked and project file left unread said. A sibling's git failure
+    /// keeps the run here naming it.
     fn repo_needs(&mut self, at: usize, repo: &Repo, snapshot: &Snapshot, tree: &Tree, prepared: &Prepared) -> Result<Vec<parity::Need>, End> {
         self.go_on()?;
         let needs = self.sdk_needs(snapshot, tree, prepared.sdks.as_deref());
         let mut needs = needs.map_err(|end| repo_end(at, &repo.name, end))?;
         if at == 0 {
-            let judged = toolchain::judge(tree.manifest.as_ref(), &prepared.sent, &prepared.tools, self.call.host);
+            let godot = toolchain::godot_required(tree.manifest.as_ref(), &tree.godot_pins);
+            let judged = toolchain::judge(tree.manifest.as_ref(), godot.as_deref(), &prepared.sent, &prepared.tools, self.call.host);
             for line in judged.skips {
                 self.say(line);
+            }
+            for line in &tree.godot_skips {
+                self.say(line.clone());
             }
             needs.extend(judged.needs);
         }
@@ -1487,6 +1724,12 @@ impl Attempt<'_, '_> {
     /// What git writes on standard output for `args` in the worktree `folder`, as [`Attempt::git_bytes`] asks it, a pair's
     /// repository asked at the place git found it at its check ([`Attempt::bound_at`]).
     fn git_bytes_in(&self, folder: &Path, git: &Git, args: &[&str]) -> Result<Vec<u8>, GitError> {
+        self.git_bytes_within(folder, git, args, None, git::OUTPUT_CAP)
+    }
+
+    /// [`Attempt::git_bytes_in`] with the bytes `stdin` fed on git's standard input and its standard output read up to
+    /// `cap` bytes, for a call git answers from what it is fed and a caller whose own cap bounds the answer.
+    fn git_bytes_within(&self, folder: &Path, git: &Git, args: &[&str], stdin: Option<&[u8]>, cap: usize) -> Result<Vec<u8>, GitError> {
         // A run of one repository gives git no variable of its own.
         let set = self
             .bound_at(folder)
@@ -1496,9 +1739,10 @@ impl Attempt<'_, '_> {
         let call = git::Call {
             set: &set,
             interrupt: self.call.interrupt,
+            stdin,
             ..git::Call::plain(folder, args, self.limit)
         };
-        git.output_bytes(&call)
+        git.output_bytes_within(&call, cap)
     }
 
     /// This PC's newest .NET SDK major, from `--test-local-sdks` when given, else from `dotnet --list-sdks`, read once
@@ -3800,7 +4044,7 @@ mod tests {
         called_of, console_of, held, is_heartbeat, last_update, local_sdk_listing, path_outside, paused, push_size, relay, relay_raw, relayed_raw,
         sdks_of, seconds, their_version, version_refusal,
     };
-    use super::{Entry, entries_of, manifest_entry};
+    use super::{CSPROJ_BYTES, CSPROJ_FILES, Entry, csproj_pins, entries_of, manifest_entry};
     use super::{KeyHold, RunEnd, Warm, hold_key, hold_key_waiting, is_cold, status_end, warm_end, warm_of};
     use crate::environment::Variables;
     use crate::remote::git::{DOTNET_LIMIT, GIT_LIMIT, Git, GitError};
@@ -3809,6 +4053,7 @@ mod tests {
     use crate::remote::payload;
     use crate::remote::payload::Location;
     use crate::remote::snapshot::Snapshot;
+    use crate::remote::toolchain::Pin;
     use crate::remote::transport::{Local, Transport};
     use crate::remote::watchdog::{self, Kill, LOG_CAP};
     use crate::remote::worktree_lock::tests::{held_elsewhere, lock_name};
@@ -6426,6 +6671,105 @@ mod tests {
             Some(Err(".GATE/toolchain.toml and .gate/toolchain.toml differ only in letter case".to_owned())),
             "an exact spelling that is no regular file wins nothing"
         );
+    }
+
+    /// The pin the version text `text` spells, as a repo writes one.
+    fn pin_of(text: &str) -> Pin {
+        Pin::parse(text).expect("a pin")
+    }
+
+    /// A repo's project files are the tree's entries whose name ends in `.csproj`, at any depth and in either letter
+    /// case — a folder named like one is no file at all and is left out — and each names the `Godot.NET.Sdk` version
+    /// the root `Sdk` attribute pins; the same version twice is one pin.
+    #[test]
+    fn csproj_pins_are_read_from_the_tree() {
+        let entries = [
+            entry("100644", "blob", "a.txt"),
+            entry("100644", "blob", "src/App/App.csproj"),
+            entry("100644", "blob", "Sub/Game.CSProj"),
+            entry("040000", "tree", "folder.csproj"),
+            entry("100644", "blob", "x.csproj/y.txt"),
+        ];
+        let mut asked: Vec<String> = Vec::new();
+        let (pins, skips) = csproj_pins(
+            &entries,
+            |files| Ok(files.iter().map(|_| 40_u64).collect()),
+            |files| {
+                asked.extend(files.iter().map(|file| file.path.clone()));
+                Ok(files.iter().map(|_| b"<Project Sdk=\"Godot.NET.Sdk/4.7.2\">".to_vec()).collect())
+            },
+        )
+        .expect("no git failure");
+
+        assert_eq!(
+            asked,
+            ["src/App/App.csproj", "Sub/Game.CSProj"],
+            "any depth, either letter case, no folder, nothing else"
+        );
+        assert_eq!(pins, [pin_of("4.7.2")], "the same version pinned twice is one");
+        assert_eq!(skips, Vec::<String>::new());
+    }
+
+    /// What the sizes say decides what is read: a project file past [`CSPROJ_BYTES`] is skipped with its line and never
+    /// handed to the read, where a file that is no file at all and one whose text is not UTF-8 are skipped with theirs,
+    /// and the file beside them that reads still pins.
+    #[test]
+    fn a_csproj_over_its_cap_is_skipped_with_its_line() {
+        let entries = [
+            entry("100644", "blob", "big.csproj"),
+            entry("100644", "blob", "odd.csproj"),
+            entry("120000", "blob", "link.csproj"),
+            entry("100644", "blob", "ok.csproj"),
+        ];
+        let mut asked: Vec<String> = Vec::new();
+        let (pins, skips) = csproj_pins(
+            &entries,
+            |files| {
+                assert_eq!(files.len(), 3, "a file that is no regular file is not weighed");
+                Ok(vec![CSPROJ_BYTES as u64 + 1, 4, 20])
+            },
+            |files| {
+                asked.extend(files.iter().map(|file| file.path.clone()));
+                Ok(vec![vec![0xff, 0xfe], b"<Project Sdk=\"Godot.NET.Sdk/4.7.2\">".to_vec()])
+            },
+        )
+        .expect("no git failure");
+
+        assert_eq!(asked, ["odd.csproj", "ok.csproj"], "the file past its cap is never read");
+        assert_eq!(pins, [pin_of("4.7.2")], "the file that reads still pins");
+        assert_eq!(skips.len(), 3, "{skips:?}");
+        assert_eq!(
+            skips[0],
+            "gate: cannot read the Godot pin of link.csproj: it is a symbolic link, not a file; not checking it"
+        );
+        assert_eq!(
+            skips[1],
+            "gate: cannot read the Godot pin of big.csproj: its text is more than 256 KiB; not checking it"
+        );
+        assert_eq!(
+            skips[2],
+            "gate: cannot read the Godot pin of odd.csproj: not valid UTF-8; not checking it"
+        );
+    }
+
+    /// Only the first sixty-four project files are read, and one line names how many were left past the cap.
+    #[test]
+    fn at_most_64_csproj_files_are_read() {
+        let entries: Vec<Entry> = (0..65).map(|at| entry("100644", "blob", &format!("p{at:02}.csproj"))).collect();
+        let mut read = 0;
+        let (pins, skips) = csproj_pins(
+            &entries,
+            |files| Ok(files.iter().map(|_| 40_u64).collect()),
+            |files| {
+                read += files.len();
+                Ok(files.iter().map(|_| Vec::<u8>::new()).collect())
+            },
+        )
+        .expect("no git failure");
+
+        assert_eq!(read, CSPROJ_FILES, "sixty-four is the most");
+        assert_eq!(pins, Vec::<Pin>::new());
+        assert_eq!(skips, ["gate: 1 more project files not read for a Godot pin; not checking them"]);
     }
 
     #[test]

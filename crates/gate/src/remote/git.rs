@@ -173,6 +173,12 @@ impl Git {
         self.output_within(call, OUTPUT_CAP, ERRORS_KEPT)
     }
 
+    /// [`Git::output_bytes`] with standard output read up to `cap` bytes and the last [`ERRORS_KEPT`] bytes of standard
+    /// error kept: a caller whose own cap bounds an answer it asked for, as a batch of object ids is.
+    pub(crate) fn output_bytes_within(&self, call: &Call<'_>, cap: usize) -> Result<Vec<u8>, GitError> {
+        self.output_within(call, cap, ERRORS_KEPT)
+    }
+
     /// [`Git::output_bytes`] with standard output read up to `cap` bytes and the last `kept` bytes of standard error
     /// kept: a call that writes more than `cap` is ended as soon as its reader sees it, and is an over-cap call.
     fn output_within(&self, call: &Call<'_>, cap: usize, kept: usize) -> Result<Vec<u8>, GitError> {

@@ -49,8 +49,8 @@ mod tamper;
     not(test),
     expect(
         dead_code,
-        reason = "gate check reads the manifest; nothing outside the tests reads the dotnet tool and Godot SDK pins \
-                  read beside it"
+        reason = "gate check reads the manifest and a routed run reads the Godot SDK pins beside it; nothing outside \
+                  the tests reads the dotnet tools read beside it"
     )
 )]
 pub(crate) mod toolchain;
