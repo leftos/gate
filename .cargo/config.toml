@@ -1,0 +1,3 @@
+[target.'cfg(all(windows, target_env = "msvc"))']
+# Static CRT: the shipped exes must not load the VC runtime from their own folder.
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -20,6 +20,7 @@ mod diagnostics;
 mod durations;
 mod harness;
 mod hold;
+mod image;
 mod install;
 mod interrupt;
 mod journal;

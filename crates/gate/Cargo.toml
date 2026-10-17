@@ -45,6 +45,9 @@ windows-sys = { version = "0.61.2", features = [
 zstd = "0.14.2"
 
 [dev-dependencies]
+# Reads the built exe's import and load config directories (`image`): parsing the load config by hand is error-prone,
+# and the crate is test-only.
+object = { version = "0.40.0", default-features = false, features = ["read_core", "pe", "std"] }
 # The MSYS keeper's machine-alone case reads Git's MSYS section (`Wdk_*`, `Win32_Security`, `Win32_System_Memory`,
 # `Win32_System_RemoteDesktop`).
 windows-sys = { version = "0.61.2", features = [

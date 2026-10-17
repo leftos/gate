@@ -28,6 +28,9 @@ windows-sys = { version = "0.61.2", features = ["Win32_System_SystemServices"] }
 [dev-dependencies]
 # The unit tests make a pipe their own user owns (`PipeOwner::User`), which gate-win32 has only with its test seams.
 gate-win32 = { path = "../gate-win32", features = ["test-seams"] }
+# Reads the built helper's import and load config directories (`image`): parsing the load config by hand is
+# error-prone, and the crate is test-only.
+object = { version = "0.40.0", default-features = false, features = ["read_core", "pe", "std"] }
 proc-table = { path = "../proc-table" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
