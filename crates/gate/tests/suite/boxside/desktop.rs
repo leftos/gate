@@ -34,11 +34,6 @@ const DESKTOP_MS: &str = "50";
 /// enough for a real helper's start and connect on a busy machine, and never reached by a passing run.
 const HAND_OFF_MS: &str = "10000";
 
-/// The cap on every desktop wait of the case whose stand-in helper hangs, in milliseconds: low enough that the box's
-/// message limit, the cap, is under the stand-in's own, twice the cap but never above the helper's built limit of 5 s,
-/// so the box's limit is the one that ends the wait; high enough for the stand-in's start and connect on a busy machine.
-const HANG_MS: &str = "3000";
-
 /// `NORMAL_PRIORITY_CLASS`, which the helper gives the command although it runs below normal itself.
 const NORMAL_PRIORITY: &str = "priority 0x20";
 
@@ -371,7 +366,7 @@ fn a_refused_child_report_leaves_nothing_running() {
 
     let outcome = call.finish();
 
-    let left = left_by(&record, &mark_word);
+    let left = left_by(&record);
     assert!(!left.recorded.is_empty(), "the stand-in created a child: {outcome:?}");
     assert!(
         left.children.is_empty(),
@@ -398,7 +393,7 @@ const INVALID_HANDLE: &str = "The handle is invalid. (os error 6)";
 struct Left {
     /// The pids of the children the stand-in recorded.
     recorded: Vec<u32>,
-    /// The recorded children still running the case's command.
+    /// The recorded children still running.
     children: Vec<u32>,
     /// The stand-in's own pid, as the box recorded it.
     stand_in: u32,
@@ -409,9 +404,10 @@ struct Left {
 }
 
 /// Reads what the run recorded at `record`, the stand-in's pid and creation time and each child's pid, and finds which
-/// of them still run: a child by its pid and a command line holding `mark_word`, the stand-in by its pid and creation
-/// time. Every one found is ended before this returns, so a case that fails leaves nothing behind.
-fn left_by(record: &Path, mark_word: &str) -> Left {
+/// of them still run: a child by its pid, the stand-in as its parent and a creation time no earlier than the stand-in's,
+/// the stand-in by its pid and creation time, none of it read from a command line, which a snapshot may not hold. Every
+/// one found is ended before this returns, so a case that fails leaves nothing behind.
+fn left_by(record: &Path) -> Left {
     let lines = fs::read_to_string(record).expect("the box recorded the stand-in");
     let (stand_in, stand_in_created) = lines
         .lines()
@@ -425,11 +421,12 @@ fn left_by(record: &Path, mark_word: &str) -> Left {
         .filter(|line| !line.starts_with("stand-in "))
         .map(|line| line.parse().expect("a recorded pid"))
         .collect();
-    let snapshot = Win32ProcessTable.snapshot();
+    let snapshot = Win32ProcessTable.snapshot_without_command_lines();
+    // The parent and the creation-time bound with the pid, so another process at a reused pid is never taken for a child.
     let children: Vec<u32> = snapshot
         .iter()
         .filter(|process| recorded.contains(&process.pid))
-        .filter(|process| process.command_line.as_deref().is_some_and(|line| line.contains(mark_word)))
+        .filter(|process| process.parent_pid == stand_in && process.created.is_some_and(|created| created >= stand_in_created))
         .map(|process| process.pid)
         .collect();
     // The pid and the creation time together, so another case's stand-in at a reused pid is never taken for this one.
@@ -498,7 +495,7 @@ fn a_helper_that_dies_after_creating_the_child_leaves_no_suspended_process() {
 
     let outcome = call.finish();
 
-    let left = left_by(&record, &mark_word);
+    let left = left_by(&record);
     assert!(!left.recorded.is_empty(), "the stand-in created a child: {outcome:?}");
     assert!(
         left.children.is_empty(),
@@ -518,7 +515,7 @@ fn a_helper_that_dies_after_creating_the_child_leaves_no_suspended_process() {
     assert!(!mark.exists(), "the command never ran: {outcome:?}");
 }
 
-/// Checks a run whose helper task the seam answers as `mode` is refused with `line`, the stand-in never started.
+/// Checks a run whose helper task the seam answers as `mode` is refused with `line`.
 fn task_refuses(name: &str, mode: &str, line: &str) {
     let case = Case::new(name);
     let payload = ready_payload(&case, COMMAND);
@@ -569,7 +566,7 @@ fn a_helper_that_hangs_refuses_desktop_after_the_message_limit() {
     let case = Case::new("desktop_hang");
     let payload = ready_payload(&case, COMMAND);
 
-    let outcome = run_desktop(&case, &payload, "hang", "active", HANG_MS);
+    let outcome = handed_off(&case, &payload, "hang");
 
     refused_with(
         &outcome,

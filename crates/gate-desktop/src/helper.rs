@@ -217,12 +217,13 @@ fn fault_before_hello(pipe: &PipeClient, limits: Limits) -> Option<HelperExit> {
     }
 }
 
-/// The exit `hang` ends with: the box gone when its pipe goes away before the message limit, else that the box did not
+/// The exit `hang` ends with: the box gone when its pipe goes away before the done limit, else that the box did not
 /// answer in time. It never sends `Hello` and never answers what the box sends: it reads, and goes on waiting, until
-/// one of those two ends it.
+/// one of those two ends it. It waits the done limit, the longest the helper keeps, so a box that keeps its own message
+/// limit gives up on the hanging helper first.
 #[cfg(feature = "test-seams")]
 fn hang(pipe: &PipeClient, limits: Limits) -> HelperExit {
-    let deadline = Instant::now() + limits.message;
+    let deadline = Instant::now() + limits.done;
     loop {
         match read_message(pipe, deadline, FRAME_LIMIT, &[]) {
             // Whatever the box said, the hanging helper keeps quiet and waits on. An empty frame and a body that is no
