@@ -3768,7 +3768,7 @@ fn status_end(called: &Called, output: Range<usize>) -> End {
 
 /// What the builder's preflight said of the work folder's warm-up.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Warm {
+pub(crate) enum Warm {
     /// Warm with the warm-up file of this hash.
     Hash(String),
     /// Not warm: `none`.
@@ -3779,7 +3779,7 @@ enum Warm {
 
 /// The work folder's warm-up, from the line right after the preflight's last `gate: remote version` line alone, when it
 /// is exactly `gate: remote warm none` or `gate: remote warm ` and 64 lower-case hex digits.
-fn warm_of(lines: &[String]) -> Warm {
+pub(crate) fn warm_of(lines: &[String]) -> Warm {
     let Some(version) = lines.iter().rposition(|line| line.starts_with(VERSION)) else {
         return Warm::Unseen;
     };

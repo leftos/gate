@@ -1,11 +1,12 @@
 //! What `gate check` says, as a pure function of where it looked ([`At`]) and what it found ([`Checked`]): a header, a
 //! builder's created folders, each item's line in the order manifest tools, the .NET SDK, workloads, the routing file's
-//! `siblings` problem, siblings, an install hint per missing or too-old item, then a summary, all prefixed
-//! `check: <where>: ` (`install: <where>: ` for a hint), `<where>` being `here` for this PC and the host for a builder,
-//! and the problems of the `.gate` files on stderr as `check: .gate/<file>: <problem>`. A builder's hints are commands
-//! that work over ssh, and its SDK line names the builder. The exit status is 0 only when nothing is missing or too old:
-//! a skipped item never fails the check.
+//! `siblings` problem, siblings, the warm-up's items (`warm-up: ...`), an install hint per missing or too-old item, then
+//! a summary, all prefixed `check: <where>: ` (`install: <where>: ` for a hint), `<where>` being `here` for this PC and
+//! the host for a builder, and the problems of the `.gate` files on stderr as `check: .gate/<file>: <problem>`. A
+//! builder's hints are commands that work over ssh, and its SDK line names the builder. The exit status is 0 only when
+//! nothing is missing or too old: a skipped item, and a warm-up line that only informs, never fails the check.
 
+use gate_router::warm::{shown_value, warming_text};
 use gate_router::{SiblingFolder, spelled};
 
 use crate::answer::FAILED_STATUS;
@@ -82,6 +83,42 @@ pub(crate) const TOOLCHAIN: &str = ".gate/toolchain.toml";
 pub(crate) const SIBLINGS: &str = ".gate/siblings.toml";
 /// How the lines name the root SDK pin file.
 pub(crate) const GLOBAL_JSON: &str = "global.json";
+/// How the lines name the warm-up file.
+pub(crate) const WARMUP: &str = ".gate/warmup.toml";
+
+/// One item of the repo's warm-up, as the check found it: the warm-up file and `remote.json`'s consent, then, with
+/// both, the work folder's warm-up record on this PC, and for a builder what its preflight said of its work folder.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Warmup {
+    /// The repo has a warm-up file, but `remote.json` does not consent to its warm-ups.
+    Unconsented,
+    /// `remote.json` consents to the repo's warm-ups, but it has no warm-up file.
+    NoFile,
+    /// `remote.json`'s `warmup` value cannot be used, for this reason, and the repo has a warm-up file.
+    ConsentProblem(String),
+    /// The consented warm-up file has problems, said on lines of their own, so no warm-up runs.
+    FileProblems,
+    /// The state root, where the record is, cannot be found, for this reason.
+    NoStateRoot(String),
+    /// The record says the work folder is warm on `host` for the file on disk.
+    Warm { host: String },
+    /// The work folder's warm-up lock is held: `host` is warming it.
+    Warming { host: String },
+    /// A warm-up on `host` failed `minutes_ago` whole minutes ago, for `reason`, and its backoff has `minutes_left`.
+    Failed {
+        host: String,
+        minutes_ago: u64,
+        reason: String,
+        minutes_left: u64,
+    },
+    /// The work folder is not warm on `host` and nothing holds a warm-up back; `stale` when the record still says
+    /// `warming` with nothing holding its lock.
+    NotWarm { host: String, stale: bool },
+    /// The record or the lock cannot be read, so a routed run stays here: the text, worded as the route words it.
+    Unreadable(String),
+    /// What a builder's preflight said of its work folder: `warm` when its `.warm` holds the warm-up file's hash.
+    Builder { warm: bool },
+}
 
 /// A problem of a file the check reads: how the lines name the file and the problem, as its reader words it.
 #[derive(Debug)]
@@ -123,6 +160,8 @@ pub(crate) struct Checked {
     /// Whether the repo declares siblings a builder is not checked for, as a routed run lays them out; never for this
     /// PC, which checks each in `siblings`.
     pub siblings_skipped: bool,
+    /// The warm-up's items, in order; none when the repo has neither a warm-up file nor `remote.json`'s consent.
+    pub warmup: Vec<Warmup>,
 }
 
 /// One line the check says.
@@ -146,7 +185,7 @@ enum Kind {
     Missing,
     TooOld,
     Skipped,
-    /// Said, but neither checked nor skipped: the workloads.
+    /// Said, but neither checked nor skipped, never counted: the workloads, and the warm-up's lines that only inform.
     Unchecked,
 }
 
@@ -232,7 +271,53 @@ fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
     if checked.siblings_skipped {
         items.push(Item::new("siblings skipped: a routed run lays them out".to_owned(), Kind::Skipped));
     }
+    items.extend(checked.warmup.iter().map(|warmup| warmup_item(&checked.repo, warmup)));
     items
+}
+
+/// The line of a warm-up item of the repo `repo`: what fails the check is what keeps the repo's matched runs here or
+/// leaves its consent unread, and the record's other states are said without counting.
+fn warmup_item(repo: &str, warmup: &Warmup) -> Item {
+    let (text, kind) = match warmup {
+        Warmup::Unconsented => (
+            format!("{WARMUP} is there, but remote.json does not consent to warm-ups for {}", escaped(repo)),
+            Kind::Unchecked,
+        ),
+        Warmup::NoFile => (format!("remote.json consents, but the repo has no {WARMUP}"), Kind::Unchecked),
+        Warmup::ConsentProblem(why) => (format!("remote.json: {}", escaped(why)), Kind::Missing),
+        Warmup::FileProblems => (
+            format!("{WARMUP} has problems, so no warm-up runs and matched runs stay here"),
+            Kind::Missing,
+        ),
+        Warmup::NoStateRoot(why) => (format!("the state root cannot be found: {}", escaped(why)), Kind::Skipped),
+        Warmup::Warm { host } => (format!("warm on {}", shown_value(host)), Kind::Ok),
+        Warmup::Warming { host } => (warming_text(host), Kind::Unchecked),
+        Warmup::Failed {
+            host,
+            minutes_ago,
+            reason,
+            minutes_left,
+        } => (
+            format!(
+                "the warm-up on {} failed {minutes_ago} min ago: {}; it may be tried again in {minutes_left} min",
+                shown_value(host),
+                shown_value(reason)
+            ),
+            Kind::Unchecked,
+        ),
+        Warmup::NotWarm { host, stale: false } => (format!("not warm on {}; gate warm warms it", shown_value(host)), Kind::Unchecked),
+        Warmup::NotWarm { host, stale: true } => (
+            format!(
+                "not warm on {}; the last warm-up ended without a verdict; gate warm warms it",
+                shown_value(host)
+            ),
+            Kind::Unchecked,
+        ),
+        Warmup::Unreadable(text) => (text.clone(), Kind::Missing),
+        Warmup::Builder { warm: true } => ("the work folder is warm".to_owned(), Kind::Ok),
+        Warmup::Builder { warm: false } => ("the work folder is not warm".to_owned(), Kind::Unchecked),
+    };
+    Item::new(format!("warm-up: {text}"), kind)
 }
 
 /// A name or id the manifest gives, as its reader spells a key ([`spelled`]), with any mark that reorders text or
@@ -405,11 +490,16 @@ fn sibling_item(sibling: &Sibling) -> Item {
 
 #[cfg(test)]
 mod tests {
-    use super::{At, Checked, Found, GLOBAL_JSON, HERE, Line, Problem, SIBLINGS, Said, Sdk, Sibling, TOOLCHAIN, Tool, said};
+    use std::time::{Duration, SystemTime};
+
+    use super::{At, Checked, Found, GLOBAL_JSON, HERE, Line, Problem, SIBLINGS, Said, Sdk, Sibling, TOOLCHAIN, Tool, WARMUP, Warmup, said};
+    use gate_router::warm::{FailureClass, FileRead, Record, RecordRead, RecordState, WarmupFile, lock_problem_text};
     use gate_router::{FolderId, SiblingFolder};
 
     use crate::boxside::probe::Probed;
+    use crate::check::local::record_item;
     use crate::remote::toolchain::{Pin, Reported, ToolNeed, Version};
+    use crate::version::build_version;
 
     fn need(name: &str, min: Option<&str>) -> ToolNeed {
         ToolNeed {
@@ -449,6 +539,7 @@ mod tests {
             siblings: Vec::new(),
             created: Vec::new(),
             siblings_skipped: false,
+            warmup: Vec::new(),
         }
     }
 
@@ -828,6 +919,309 @@ mod tests {
         );
         assert_eq!(summary(&checked), "check: here: 2 missing, 0 too old");
         assert_eq!(said(HERE, &checked).status, 1);
+    }
+
+    const HOST: &str = "builder-1";
+    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const OTHER_HASH: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    /// When the records of the warm-up cases were written.
+    fn written() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    }
+
+    /// A record of `state` on `host` for the file of `hash`, written by this gate build at [`written`].
+    fn record(host: &str, state: RecordState, hash: &str) -> RecordRead {
+        RecordRead::Parsed(Record {
+            host: host.to_owned(),
+            state,
+            at: written(),
+            hash: hash.to_owned(),
+            gate: build_version(),
+        })
+    }
+
+    fn failed(class: FailureClass, reason: &str) -> RecordState {
+        RecordState::Failed {
+            class,
+            reason: reason.to_owned(),
+        }
+    }
+
+    /// The item of `record` for the file of [`HASH`] on [`HOST`], `elapsed` after it was written, its lock held or not.
+    fn warm_item(record: &RecordRead, lock_held: bool, elapsed: Duration) -> Warmup {
+        item_at(record, lock_held, written() + elapsed)
+    }
+
+    /// The item of `record` for the file of [`HASH`] on [`HOST`] at `now`, its lock held or not.
+    fn item_at(record: &RecordRead, lock_held: bool, now: SystemTime) -> Warmup {
+        let file = FileRead::Parsed {
+            file: WarmupFile {
+                commands: vec![vec!["dotnet".to_owned(), "build".to_owned()]],
+                timeout_seconds: 1800,
+            },
+            hash: HASH.to_owned(),
+        };
+        record_item(record, &file, lock_held, HOST, now)
+    }
+
+    /// What the check says, and its status, of the warm-up items `warmup` and the file problems `problems` alone.
+    fn warm_said(warmup: Vec<Warmup>, problems: &[&str]) -> Said {
+        let checked = Checked {
+            problems: problems
+                .iter()
+                .map(|text| Problem {
+                    file: WARMUP,
+                    text: (*text).to_owned(),
+                })
+                .collect(),
+            warmup,
+            ..checked(Vec::new())
+        };
+        said(HERE, &checked)
+    }
+
+    /// The lines of a check of one warm-up item alone: the header, the item's line `text`, the summary `summary`.
+    fn one_item(text: &str, summary: &str) -> Vec<Line> {
+        vec![out("check: here: app at X:/dev/app"), out(text), out(summary)]
+    }
+
+    #[test]
+    fn a_warm_record_of_the_host_and_file_is_ok_and_comes_after_the_siblings() {
+        let warm = warm_item(&record(HOST, RecordState::Warm, HASH), false, Duration::from_mins(90));
+        assert_eq!(warm, Warmup::Warm { host: HOST.to_owned() });
+        let checked = Checked {
+            siblings: vec![Sibling {
+                name: "b".to_owned(),
+                path: "X:/dev/b".to_owned(),
+                found: Found::Folder(Ok(SiblingFolder::Present(FolderId { volume: 1, file: [2; 16] }))),
+            }],
+            warmup: vec![warm],
+            ..checked(Vec::new())
+        };
+        assert_eq!(
+            body(&checked),
+            ["check: here: sibling b ok (X:/dev/b)", "check: here: warm-up: warm on builder-1"]
+        );
+        assert_eq!(said(HERE, &checked).status, 0);
+    }
+
+    #[test]
+    fn a_held_lock_says_the_host_is_warming_and_does_not_fail() {
+        for (name, read) in [
+            ("no record", RecordRead::Absent),
+            ("a warming record", record(HOST, RecordState::Warming, HASH)),
+            ("a warm record", record(HOST, RecordState::Warm, HASH)),
+        ] {
+            let item = warm_item(&read, true, Duration::from_secs(5));
+            assert_eq!(
+                warm_said(vec![item], &[]),
+                Said {
+                    lines: one_item(
+                        "check: here: warm-up: builder-1 is warming the work folder",
+                        "check: here: nothing missing"
+                    ),
+                    status: 0,
+                },
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_record_inside_its_backoff_says_its_age_and_when_it_may_be_tried_again() {
+        let commands = record(HOST, failed(FailureClass::Commands, "command 1 stopped with status 3"), HASH);
+        for (elapsed, line) in [
+            (
+                Duration::ZERO,
+                "check: here: warm-up: the warm-up on builder-1 failed 1 min ago: command 1 stopped with status 3; it may be tried again in 30 min",
+            ),
+            (
+                Duration::from_secs(90),
+                "check: here: warm-up: the warm-up on builder-1 failed 1 min ago: command 1 stopped with status 3; it may be tried again in 29 min",
+            ),
+            (
+                Duration::from_secs(20),
+                "check: here: warm-up: the warm-up on builder-1 failed 1 min ago: command 1 stopped with status 3; it may be tried again in 30 min",
+            ),
+            (
+                Duration::from_mins(29),
+                "check: here: warm-up: the warm-up on builder-1 failed 29 min ago: command 1 stopped with status 3; it may be tried again in 1 min",
+            ),
+        ] {
+            assert_eq!(
+                warm_said(vec![warm_item(&commands, false, elapsed)], &[]),
+                Said {
+                    lines: one_item(line, "check: here: nothing missing"),
+                    status: 0,
+                },
+                "{elapsed:?}"
+            );
+        }
+        let refused = record(HOST, failed(FailureClass::Refused, "the builder is busy\u{1b}[2J"), HASH);
+        assert_eq!(
+            warm_said(vec![warm_item(&refused, false, Duration::from_secs(10))], &[]).lines[1],
+            out(r"check: here: warm-up: the warm-up on builder-1 failed 1 min ago: the builder is busy\u{1b}[2J; it may be tried again in 1 min"),
+            "a refusal's backoff, its reason escaped"
+        );
+    }
+
+    #[test]
+    fn each_record_that_leaves_the_folder_cold_says_gate_warm_warms_it() {
+        let commands = || failed(FailureClass::Commands, "command 1 stopped with status 3");
+        let mut other_build = record(HOST, commands(), HASH);
+        if let RecordRead::Parsed(found) = &mut other_build {
+            found.gate = "0.0.0-other".to_owned();
+        }
+        let later = |elapsed: Duration| written() + elapsed;
+        for (name, read, now) in [
+            ("no record", RecordRead::Absent, written()),
+            (
+                "a failure past its backoff",
+                record(HOST, commands(), HASH),
+                later(Duration::from_mins(30)),
+            ),
+            ("a failure of another gate build", other_build, later(Duration::from_mins(1))),
+            (
+                "a failure dated in the future",
+                record(HOST, commands(), HASH),
+                written() - Duration::from_mins(1),
+            ),
+            ("a warm record of another host", record("builder-2", RecordState::Warm, HASH), written()),
+            ("a warm record of another file", record(HOST, RecordState::Warm, OTHER_HASH), written()),
+        ] {
+            assert_eq!(
+                warm_said(vec![item_at(&read, false, now)], &[]),
+                Said {
+                    lines: one_item(
+                        "check: here: warm-up: not warm on builder-1; gate warm warms it",
+                        "check: here: nothing missing"
+                    ),
+                    status: 0,
+                },
+                "{name}"
+            );
+        }
+        let stale = warm_item(&record(HOST, RecordState::Warming, HASH), false, Duration::from_mins(5));
+        assert_eq!(
+            warm_said(vec![stale], &[]).lines[1],
+            out("check: here: warm-up: not warm on builder-1; the last warm-up ended without a verdict; gate warm warms it")
+        );
+    }
+
+    #[test]
+    fn an_unreadable_record_fails_the_check_in_the_route_s_words() {
+        let unreadable = RecordRead::Unreadable {
+            path: r"C:\state\remote\warm\app-1.json".to_owned(),
+            error: "is larger than 64 KiB".to_owned(),
+        };
+        assert_eq!(
+            warm_said(vec![warm_item(&unreadable, false, Duration::ZERO)], &[]),
+            Said {
+                lines: one_item(
+                    r"check: here: warm-up: the warm-up record C:\state\remote\warm\app-1.json cannot be read: is larger than 64 KiB",
+                    "check: here: 1 missing, 0 too old"
+                ),
+                status: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_lock_that_cannot_be_probed_fails_the_check_in_the_route_s_words() {
+        let item = Warmup::Unreadable(lock_problem_text(r"C:\state\remote\warm\app-1.lock", "Access is denied. (os error 5)"));
+        assert_eq!(
+            warm_said(vec![item], &[]),
+            Said {
+                lines: one_item(
+                    r"check: here: warm-up: the warm-up lock C:\state\remote\warm\app-1.lock cannot be read: Access is denied. (os error 5)",
+                    "check: here: 1 missing, 0 too old"
+                ),
+                status: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_warm_up_file_without_consent_is_an_info_line_and_its_problems_still_print() {
+        assert_eq!(
+            warm_said(vec![Warmup::Unconsented], &["commands[0] is empty"]),
+            Said {
+                lines: vec![
+                    out("check: here: app at X:/dev/app"),
+                    Line::Err("check: .gate/warmup.toml: commands[0] is empty".to_owned()),
+                    out("check: here: warm-up: .gate/warmup.toml is there, but remote.json does not consent to warm-ups for app"),
+                    out("check: here: nothing missing"),
+                ],
+                status: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn consent_without_a_warm_up_file_is_an_info_line() {
+        assert_eq!(
+            warm_said(vec![Warmup::NoFile], &[]),
+            Said {
+                lines: one_item(
+                    "check: here: warm-up: remote.json consents, but the repo has no .gate/warmup.toml",
+                    "check: here: nothing missing"
+                ),
+                status: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn a_warmup_value_that_cannot_be_used_is_an_escaped_missing_line() {
+        assert_eq!(
+            warm_said(
+                vec![Warmup::ConsentProblem("warmup[0] is not a non-empty string\u{202e}".to_owned())],
+                &[]
+            ),
+            Said {
+                lines: one_item(
+                    r"check: here: warm-up: remote.json: warmup[0] is not a non-empty string\u{202e}",
+                    "check: here: 1 missing, 0 too old"
+                ),
+                status: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_consented_warm_up_file_with_problems_prints_each_and_fails_the_check() {
+        assert_eq!(
+            warm_said(
+                vec![Warmup::FileProblems],
+                &["commands[0] is empty", "extra is not a key (commands, timeout)"]
+            ),
+            Said {
+                lines: vec![
+                    out("check: here: app at X:/dev/app"),
+                    Line::Err("check: .gate/warmup.toml: commands[0] is empty".to_owned()),
+                    Line::Err("check: .gate/warmup.toml: extra is not a key (commands, timeout)".to_owned()),
+                    out("check: here: warm-up: .gate/warmup.toml has problems, so no warm-up runs and matched runs stay here"),
+                    out("check: here: 1 missing, 0 too old"),
+                ],
+                status: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_state_root_that_cannot_be_found_is_skipped() {
+        let why = "cannot read the LOCALAPPDATA variable";
+        assert_eq!(
+            warm_said(vec![Warmup::NoStateRoot(why.to_owned())], &[]),
+            Said {
+                lines: one_item(
+                    &format!("check: here: warm-up: the state root cannot be found: {why}"),
+                    "check: here: nothing missing (1 skipped)"
+                ),
+                status: 0,
+            }
+        );
     }
 
     #[test]

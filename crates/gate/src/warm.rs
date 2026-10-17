@@ -238,17 +238,25 @@ fn read_file(target: &Target, machine: &Machine<'_>) -> Result<Warmup, End> {
 /// parsed and hashed: absent, its first problem ([`first_problem`]), or what it declares with the [`warmup_hash`] of its
 /// bytes. `gate warm` and the route read the file through this.
 pub(crate) fn read_warmup_file(root: &Path) -> FileRead {
-    match route::read_gate_file(root, "warmup.toml") {
+    match read_warmup_file_whole(root) {
         Ok(None) => FileRead::Absent,
-        Err(problem) => FileRead::Problem(problem),
-        Ok(Some(bytes)) => match read_warmup(&bytes) {
-            Ok(file) => FileRead::Parsed {
-                file,
-                hash: warmup_hash(&bytes),
-            },
-            Err(problems) => FileRead::Problem(first_problem(&problems)),
-        },
+        Ok(Some((file, hash))) => FileRead::Parsed { file, hash },
+        Err(problems) => FileRead::Problem(first_problem(&problems)),
     }
+}
+
+/// The `.gate\warmup.toml` of the worktree at `root`, read as [`read_warmup_file`] reads it: `None` when it is absent,
+/// else what it declares with the [`warmup_hash`] of its bytes. `gate check` reads it through this, to say each problem.
+///
+/// # Errors
+///
+/// Every problem of the file, in file order: one when it cannot be read or is not UTF-8 or not TOML.
+pub(crate) fn read_warmup_file_whole(root: &Path) -> Result<Option<(WarmupFile, String)>, Vec<String>> {
+    let Some(bytes) = route::read_gate_file(root, "warmup.toml").map_err(|problem| vec![problem])? else {
+        return Ok(None);
+    };
+    let file = read_warmup(&bytes)?;
+    Ok(Some((file, warmup_hash(&bytes))))
 }
 
 /// The warm-up record at `path` as the route reads it: absent when nothing is there; else opened without following a
@@ -792,12 +800,15 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
-    use gate_router::warm::{FailureClass, Record, RecordRead, RecordState};
+    use gate_router::warm::{FailureClass, FileRead, Record, RecordRead, RecordState};
     use gate_state::FallbackReason;
     use gate_state::v1::{self, WarmFailure, WarmRecord, WarmState};
     use jiff::Timestamp;
 
-    use super::{Ending, Lock, NOT_STARTED, ending_of, first_problem, fresh_log, lock_held, read_warm_record, take_lock};
+    use super::{
+        Ending, Lock, NOT_STARTED, ending_of, first_problem, fresh_log, lock_held, read_warm_record, read_warmup_file, read_warmup_file_whole,
+        take_lock,
+    };
     use crate::remote::{RemoteOutcome, WarmEnd};
 
     const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -944,6 +955,26 @@ mod tests {
         let problems = |list: &[&str]| first_problem(&list.iter().map(|text| (*text).to_owned()).collect::<Vec<_>>());
         assert_eq!(problems(&["a"]), "a");
         assert_eq!(problems(&["a", "b", "c"]), "a (and 2 more)");
+    }
+
+    #[test]
+    fn the_whole_read_of_a_file_with_two_problems_says_both_in_file_order() {
+        let root = scratch("file-two-problems");
+        fs::create_dir_all(root.join(".gate")).expect("the .gate folder is made");
+        fs::write(root.join(".gate").join("warmup.toml"), "commands = [[]]\nextra = 1\n").expect("the file is written");
+        assert_eq!(
+            read_warmup_file_whole(&root),
+            Err(vec![
+                "commands[0] is empty".to_owned(),
+                "extra is not a key (commands, timeout)".to_owned()
+            ])
+        );
+        assert_eq!(
+            read_warmup_file(&root),
+            FileRead::Problem("commands[0] is empty (and 1 more)".to_owned()),
+            "the route's read keeps the first"
+        );
+        assert_eq!(read_warmup_file_whole(&scratch("file-absent")), Ok(None), "no file");
     }
 
     #[test]

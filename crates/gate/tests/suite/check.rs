@@ -3,10 +3,14 @@
 //! on a `PATH` of that folder and git's alone, so no real tool of the machine answers.
 
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use gate_router::warm::warmup_hash;
 use gate_router::work_folder_key;
+use gate_state::v1::{self, WarmRecord, WarmState};
+use jiff::Timestamp;
 
 use crate::support::{
     ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, Go, Outcome, PREFLIGHT_SEAMS_VARIABLE, STEPS_VARIABLE, build_version, calls, finish,
@@ -664,6 +668,284 @@ fn check_a_global_json_naming_no_sdk_prints_no_sdk_line() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
 }
 
+/// The routing file of a warm-up case: the repo listed, routed to `builder-1` and consenting to warm-ups.
+const WARM_ROUTING: &str = r#"{"host": "builder-1", "repos": {"app": ["*"]}, "warmup": ["app"]}"#;
+/// A warm-up file that reads.
+const WARMUP_FILE: &str = "commands = [[\"dotnet\", \"build\"]]\n";
+
+/// A [`repo_case`] whose routing file consents to warm-ups and whose `.gate/warmup.toml` is [`WARMUP_FILE`].
+fn warm_case(name: &str) -> Case {
+    let case = repo_case(name);
+    write_remote_json(&case, WARM_ROUTING);
+    write(&case, ".gate/warmup.toml", WARMUP_FILE);
+    case
+}
+
+/// `gate check` in the repo, its state root the case's through `GATE_STATE_DIR`, since check takes no `--state-dir`.
+fn check_warm(case: &Case) -> Outcome {
+    let mut command = case.gate_in(REPO, &["check"]);
+    command
+        .env("PATH", path_with_git(&[]))
+        .env_remove("GATE_GODOT_ROOT")
+        .env("GATE_STATE_DIR", case.root());
+    finish(command)
+}
+
+/// Writes the work folder's warm-up record in the case's state root through the gate's own writer: `state` on
+/// `builder-1` for [`WARMUP_FILE`], written now by the suite's gate build.
+fn write_warm_record(case: &Case, state: WarmState) {
+    let at = Timestamp::now();
+    let record = WarmRecord {
+        host: "builder-1".to_owned(),
+        state,
+        at,
+        hash: warmup_hash(WARMUP_FILE.as_bytes()),
+        gate: build_version(case),
+        pid: 1,
+        started: at,
+        failure: None,
+        reason: None,
+    };
+    let path = v1::warm_record_path(&case.root(), &key(case));
+    fs::create_dir_all(v1::warm_dir(&case.root())).expect("the warm-up folder can be made");
+    v1::write_warm_record(&path, &record).expect("the warm-up record can be written");
+}
+
+/// The lines of a warm-up case with no manifest whose one warm-up line is `line`, and the summary `summary`.
+fn warm_lines(case: &Case, line: &str, summary: &str) -> Vec<String> {
+    vec![
+        format!("check: here: app at {}", root(case)),
+        "check: here: app declares no toolchain".to_owned(),
+        line.to_owned(),
+        summary.to_owned(),
+    ]
+}
+
+/// A repo with no warm-up file and a routing file that lists it without consenting says nothing of warm-ups.
+#[test]
+fn check_without_a_warm_up_file_or_consent_says_nothing_of_warm_ups() {
+    let case = repo_case("check_warm_silent");
+    write_remote_json(&case, r#"{"host": "builder-1", "repos": {"app": ["*"]}}"#);
+
+    let outcome = check_warm(&case);
+
+    assert_eq!(
+        lines(&outcome.stdout),
+        [
+            format!("check: here: app at {}", root(&case)).as_str(),
+            "check: here: app declares no toolchain",
+            "check: here: nothing missing",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+/// Each problem of a consented warm-up file is a stderr line of its own, and the check fails, since matched runs then
+/// stay here.
+#[test]
+fn check_a_consented_broken_warm_up_file_prints_each_problem_and_exits_1() {
+    let case = warm_case("check_warm_broken");
+    write(&case, ".gate/warmup.toml", "commands = [[]]\nextra = 1\n");
+
+    let outcome = check_warm(&case);
+
+    assert_eq!(
+        lines(&outcome.stderr),
+        [
+            "check: .gate/warmup.toml: commands[0] is empty",
+            "check: .gate/warmup.toml: extra is not a key (commands, timeout)",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(
+        lines(&outcome.stdout),
+        warm_lines(
+            &case,
+            "check: here: warm-up: .gate/warmup.toml has problems, so no warm-up runs and matched runs stay here",
+            "check: here: 1 missing, 0 too old"
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+#[test]
+fn check_a_consented_warm_up_file_with_no_record_says_not_warm_and_exits_0() {
+    let case = warm_case("check_warm_no_record");
+
+    let outcome = check_warm(&case);
+
+    assert_eq!(
+        lines(&outcome.stdout),
+        warm_lines(
+            &case,
+            "check: here: warm-up: not warm on builder-1; gate warm warms it",
+            "check: here: nothing missing"
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+#[test]
+fn check_a_warm_record_for_the_host_and_file_says_warm() {
+    let case = warm_case("check_warm_warm");
+    write_warm_record(&case, WarmState::Warm);
+
+    let outcome = check_warm(&case);
+
+    assert_eq!(
+        lines(&outcome.stdout),
+        warm_lines(&case, "check: here: warm-up: warm on builder-1", "check: here: nothing missing"),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+/// A warm-up lock another handle holds says a warm-up is running, whatever the record says; the check only probes it.
+#[test]
+fn check_a_held_warm_up_lock_says_the_host_is_warming() {
+    let case = warm_case("check_warm_lock_held");
+    write_warm_record(&case, WarmState::Warming);
+    let held = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(v1::warm_lock_path(&case.root(), &key(&case)))
+        .expect("the case holds the warm-up lock");
+
+    let outcome = check_warm(&case);
+
+    assert_eq!(
+        lines(&outcome.stdout),
+        warm_lines(
+            &case,
+            "check: here: warm-up: builder-1 is warming the work folder",
+            "check: here: nothing missing"
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    drop(held);
+}
+
+/// A routing file whose `warmup` is no array of repo names.
+const BAD_WARMUP_ROUTING: &str = r#"{"host": "builder-1", "repos": {"app": ["*"]}, "warmup": "app"}"#;
+
+/// A `warmup` value that cannot be used fails the check of a listed repo with a warm-up file, saying why.
+#[test]
+fn check_an_unusable_warmup_value_with_a_warm_up_file_says_why_and_exits_1() {
+    let case = warm_case("check_warm_bad_value");
+    write_remote_json(&case, BAD_WARMUP_ROUTING);
+
+    let outcome = check_warm(&case);
+
+    assert_eq!(
+        lines(&outcome.stdout),
+        warm_lines(
+            &case,
+            "check: here: warm-up: remote.json: warmup must be an array of repo names",
+            "check: here: 1 missing, 0 too old"
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// A `warmup` value that cannot be used says nothing for a repo with no warm-up file, so one bad value never fails
+/// the check of every repo on the PC.
+#[test]
+fn check_an_unusable_warmup_value_without_a_warm_up_file_says_nothing() {
+    let case = repo_case("check_warm_bad_value_no_file");
+    write_remote_json(&case, BAD_WARMUP_ROUTING);
+
+    let outcome = check_warm(&case);
+
+    assert_eq!(
+        lines(&outcome.stdout),
+        [
+            format!("check: here: app at {}", root(&case)).as_str(),
+            "check: here: app declares no toolchain",
+            "check: here: nothing missing",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+/// A broken warm-up file without consent still has each problem said, but no warm-up would run, so it does not fail.
+#[test]
+fn check_a_broken_warm_up_file_without_consent_prints_its_problems_and_exits_0() {
+    let case = repo_case("check_warm_broken_unconsented");
+    write_remote_json(&case, r#"{"host": "builder-1", "repos": {"app": ["*"]}}"#);
+    write(&case, ".gate/warmup.toml", "commands = [[]]\n");
+
+    let outcome = check_warm(&case);
+
+    assert_eq!(lines(&outcome.stderr), ["check: .gate/warmup.toml: commands[0] is empty"], "{outcome:?}");
+    assert_eq!(
+        lines(&outcome.stdout),
+        warm_lines(
+            &case,
+            "check: here: warm-up: .gate/warmup.toml is there, but remote.json does not consent to warm-ups for app",
+            "check: here: nothing missing"
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+#[test]
+fn check_consent_without_a_warm_up_file_says_so_and_exits_0() {
+    let case = repo_case("check_warm_consent_no_file");
+    write_remote_json(&case, WARM_ROUTING);
+
+    let outcome = check_warm(&case);
+
+    assert_eq!(
+        lines(&outcome.stdout),
+        warm_lines(
+            &case,
+            "check: here: warm-up: remote.json consents, but the repo has no .gate/warmup.toml",
+            "check: here: nothing missing"
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+/// A repo `remote.json`'s `repos` does not list has no consent, whether `warmup` names it or cannot be used, and its
+/// warm-up file never fails the check.
+#[test]
+fn check_a_repo_remote_json_does_not_list_has_no_consent_and_exits_0() {
+    let case = warm_case("check_warm_unlisted");
+    for routing in [
+        r#"{"host": "builder-1", "repos": {"other": ["*"]}, "warmup": ["app"]}"#,
+        r#"{"host": "builder-1", "repos": {"other": ["*"]}, "warmup": "app"}"#,
+    ] {
+        write_remote_json(&case, routing);
+
+        let outcome = check_warm(&case);
+
+        assert_eq!(
+            lines(&outcome.stdout),
+            warm_lines(
+                &case,
+                "check: here: warm-up: .gate/warmup.toml is there, but remote.json does not consent to warm-ups for app",
+                "check: here: nothing missing"
+            ),
+            "{routing}: {outcome:?}"
+        );
+        assert_eq!(outcome.code, Some(0), "{routing}: {outcome:?}");
+    }
+}
+
 /// The routing file of a builder case: `builder-1` the host a routed run goes to, `builder-2` one `gate push` reaches.
 const ROUTING: &str = r#"{"host": "builder-1", "hosts": ["builder-2"], "repos": {"app": ["*"]}}"#;
 
@@ -1004,4 +1286,30 @@ fn check_builder_says_the_sdk_the_builder_has() {
         "{outcome:?}"
     );
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// A consented warm-up file of a builder whose work folder holds no `.warm` says the folder is not warm, which never
+/// fails the check; with no PC record naming the builder, no record line is said.
+#[test]
+fn check_builder_says_a_work_folder_that_is_not_warm() {
+    let case = builder_case("check_builder_not_warm");
+    write_remote_json(
+        &case,
+        r#"{"host": "builder-1", "hosts": ["builder-2"], "repos": {"app": ["*"]}, "warmup": ["app"]}"#,
+    );
+    write(&case, ".gate/warmup.toml", WARMUP_FILE);
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = check_builder(&case, "builder-1", &[], &steps);
+
+    assert_eq!(
+        lines(&outcome.stdout)[2..],
+        [
+            "check: builder-1: app declares no toolchain",
+            "check: builder-1: warm-up: the work folder is not warm",
+            "check: builder-1: nothing missing",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
 }

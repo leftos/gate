@@ -237,20 +237,22 @@ A word prints `gate: unexpected argument <word>` and any option, `--state-dir` i
 
 The repo is the git worktree root of the working folder, as routing finds it.
 
-Outside a git worktree it prints `check: not in a git repository` on stderr and exits 1; a working folder or git that cannot be read prints `check: <why>` on stderr and exits 1. The repo's `.gate/toolchain.toml`, `.gate/siblings.toml` and root `global.json` are read from the worktree on disk, so an uncommitted edit counts.
+Outside a git worktree it prints `check: not in a git repository` on stderr and exits 1; a working folder or git that cannot be read prints `check: <why>` on stderr and exits 1. The repo's `.gate/toolchain.toml`, `.gate/siblings.toml`, `.gate/warmup.toml` and root `global.json` are read from the worktree on disk, so an uncommitted edit counts.
 
-The two `.gate` files are read as routing reads `.gate/siblings.toml`: a `.gate` folder or file that is a link or junction, or a file over 64 KiB, is refused. `global.json` is read the same way, a link refused and 64 KiB the most.
+The `.gate` files are read as routing reads `.gate/siblings.toml`: a `.gate` folder or file that is a link or junction, or a file over 64 KiB, is refused. `global.json` is read the same way, a link refused and 64 KiB the most.
 
 A file that cannot be read whole (not one that reads with problems) fails the check: the summary says it and the exit is 1, however the items came out.
 
 On stdout, each line prefixed `check: here: `, `here` being this PC, in this order:
 
 1. The header `check: here: <repo> at <root>`, `<repo>` being the name routing gives the repo and `<root>` the worktree root as git spells it. With no `.gate/toolchain.toml` the line `check: here: <repo> declares no toolchain` follows; the SDK pin and the siblings are still checked.
-2. One line per item, every item printed, the ones that are fine included: the manifest's tools in manifest order, then the .NET SDK, then the workloads, then the `remote.json` item when it applies, then the siblings.
+2. One line per item, every item printed, the ones that are fine included: the manifest's tools in manifest order, then the .NET SDK, then the workloads, then the `remote.json` item when it applies, then the siblings, then the warm-up's items ([The warm-up items](#the-warm-up-items)).
 3. One `install: here: <subject>: <command>` hint line per missing or too-old item, in item order.
 4. The summary: `check: here: nothing missing` or `check: here: <n> missing, <n> too old`, with `, <n> skipped` added when any item was skipped; with nothing missing and some skipped it is `check: here: nothing missing (<n> skipped)`. When a file could not be read it is `check: here: could not read <files>; <n> missing, <n> too old`, `, <n> skipped` added as above, the files comma separated in the order `.gate/toolchain.toml`, `.gate/siblings.toml`, `global.json`.
 
-The problems of the files go to stderr, one per line, before the item lines: `check: .gate/<file>: <problem>`, `<file>` being `toolchain.toml` or `siblings.toml` and `<problem>` the text the file's reader gives ([Toolchain manifest](#routing), [Sibling worktrees](#routing)), or why the file could not be read at all (`.gate is not a folder`, for the manifest, when `.gate` is a file). A file with problems is still used for what reads, and the rest is still checked.
+The problems of the files go to stderr, one per line, before the item lines: `check: .gate/<file>: <problem>`, `<file>` being `toolchain.toml`, `siblings.toml` or `warmup.toml` and `<problem>` the text the file's reader gives ([Toolchain manifest](#routing), [Sibling worktrees](#routing), [remote.json](#remotejson)), or why the file could not be read at all (`.gate is not a folder`, for the manifest, when `.gate` is a file). A file with problems is still used for what reads, and the rest is still checked.
+
+Every problem of `.gate/warmup.toml` is said, whether `remote.json` consents to warm-ups or not.
 
 The `global.json` ones are `check: global.json: <reason>`, `<reason>` being `is larger than 64 KiB`, `cannot read it: <error>`, `is a link, a junction or not a file`, `is not UTF-8`, `does not parse as JSON`, `its sdk is not an object`, `its sdk.version is not a version dotnet reads`, `its sdk.rollForward is not a policy gate knows` or `its sdk.allowPrerelease is not true or false`.
 
@@ -282,6 +284,21 @@ Each sibling the repo declares is checked as routing checks it, and gets one lin
 
 When the repo declares siblings and `remote.json` lists the repo but its `siblings` value cannot be used, the line `check: here: remote.json: <problem>` (control characters escaped, counted missing) comes before the sibling lines, and every sibling is not allowed. A repo that declares none says nothing of it.
 
+#### The warm-up items
+
+Each is one line `check: here: warm-up: <text>`. The state root, where the work folder's warm-up record and lock are, is found as the other commands find it, `GATE_STATE_DIR` and then `%LOCALAPPDATA%\gate\v1`; `gate check` takes no `--state-dir`.
+
+Consent is asked only of a repo `remote.json` lists in `repos`, whatever its `warmup` value: an unlisted repo has none, and so has one with no usable `remote.json`. A repo with neither `.gate/warmup.toml` nor consent, or whose `.gate` is not a folder, says nothing of warm-ups.
+
+- With the file and no consent: `.gate/warmup.toml is there, but remote.json does not consent to warm-ups for <repo>`. With consent and no file: `remote.json consents, but the repo has no .gate/warmup.toml`. Both only inform.
+- `remote.json: <problem>`, counted missing, when `remote.json` lists the repo, its `warmup` value cannot be used and the file is there.
+- `.gate/warmup.toml has problems, so no warm-up runs and matched runs stay here`, counted missing, with consent and a file that has problems.
+- With consent and a file that parsed, the work folder's record and lock are judged as the route judges them ([remote.json](#remotejson)), the lock probed and never taken. `the state root cannot be found: <why>` is skipped, and `warm on <host>` is ok.
+- `<host> is warming the work folder` (the lock is held), `the warm-up on <host> failed <n> min ago: <reason>; it may be tried again in <m> min` (a failure inside its backoff; an age under a minute, zero included, says 1 min, and `<m>` rounds up), `not warm on <host>; gate warm warms it` and `not warm on <host>; the last warm-up ended without a verdict; gate warm warms it` (a `warming` record whose lock is free) only inform.
+- `the warm-up record <path> cannot be read: <error>` and `the warm-up lock <path> cannot be read: <error>`, worded as the route words them, are counted missing: a routed run stays here for either.
+
+The lines that only inform are never counted and never fail the check.
+
 The install hints, for the items that have one:
 
 | Item | Hint |
@@ -297,7 +314,7 @@ The install hints, for the items that have one:
 
 A tool not in the table (`godot`) gets no hint line, nor does a sibling that is not allowed or refused, nor the `remote.json` item.
 
-The exit is 0 when nothing is missing or too old and every file read, whatever was skipped; 1 when anything is missing or too old, or the check could not run (not in a git repository, an unreadable `.gate/toolchain.toml`, `.gate/siblings.toml` or `global.json`, `.gate` not a folder); 2 for a usage error. Test-seams builds accept the hidden `--test-probe-limit-ms <n>` (the 10 s probe bound, in milliseconds above 0), which `--builder` refuses.
+The exit is 0 when nothing is missing or too old and every file read, whatever was skipped and whatever warm-up line only informs; 1 when anything is missing or too old, or the check could not run (not in a git repository, an unreadable `.gate/toolchain.toml`, `.gate/siblings.toml` or `global.json`, `.gate` not a folder); 2 for a usage error. Test-seams builds accept the hidden `--test-probe-limit-ms <n>` (the 10 s probe bound, in milliseconds above 0), which `--builder` refuses.
 
 #### With `--builder`
 
@@ -312,8 +329,9 @@ On stdout, each line prefixed `check: <host>: `, in this order:
 1. The header `check: <host>: <repo> (work folder <key>)`.
 2. `check: <host>: created <folder>` for each folder the preflight made, at most 20, then `check: <host>: and <n> more created folders`.
 3. The items, worded as on this PC with `<host>` for `here`: the SDK reads `.NET SDK <version> (rollForward <policy>) missing (<host> has <list>)`, the list cut at 20 entries and then `, and <n> more`; `.NET SDK skipped: <host> sent no SDK list`, with `: <last stderr line>` when there is one; a tool that did not answer is `check: <host>: <tool> skipped: the builder gave no answer`; the workloads are `not checked yet`.
-4. The install hints `install: <host>: <tool>: <command>`: `cargo install cargo-nextest --locked`, `npm install -g pnpm@<min>` (`npm install -g pnpm` with no minimum), `rustup toolchain install <min> && rustup default <min>`, `dotnet-install.ps1 -Version <v>`, and `run the build-box toolchain script on <host>` for node, pwsh, ffmpeg and a rust with no minimum.
-5. The summary.
+4. The warm-up's items, as on this PC ([The warm-up items](#the-warm-up-items)) and this PC's own: the record is said only when it names `<host>`, and with consent and a warm-up file that parsed, `check: <host>: warm-up: the work folder is warm` (ok) when the preflight's `gate: remote warm` line holds the hash of the worktree's file, else `check: <host>: warm-up: the work folder is not warm` (only informs).
+5. The install hints `install: <host>: <tool>: <command>`: `cargo install cargo-nextest --locked`, `npm install -g pnpm@<min>` (`npm install -g pnpm` with no minimum), `rustup toolchain install <min> && rustup default <min>`, `dotnet-install.ps1 -Version <v>`, and `run the build-box toolchain script on <host>` for node, pwsh, ffmpeg and a rust with no minimum.
+6. The summary.
 
 When the repo's `.gate/siblings.toml` names a sibling or cannot be read, one line `check: <host>: siblings skipped: a routed run lays them out` comes instead of the sibling lines and counts as skipped.
 
@@ -968,13 +986,13 @@ The optional `hosts` is an array of strings naming further builders, which only 
 
 The push order is `host`, then `hosts` in file order, an entry equal to an earlier one in any letter case skipped. A `hosts` that is not an array of strings, or holds a bad entry, never affects routing: `gate push` alone refuses the file with `push: ignored <path>: <reason>`.
 
-`warmup` is an array of repo names, matched in any letter case, that consent to the repo's `.gate/warmup.toml` warming its builder work folders (`Config::warmup_consented`); a repo it does not name, or a file without the key, has no consent. A value that is not an array of non-empty strings consents to none and leaves the rest of the file usable, and `warmup_consented` gives its reason. A routed run reads the consent from the same `remote.json` read its routing decision used, one read per run.
+`warmup` is an array of repo names, matched in any letter case, that consent to the repo's `.gate/warmup.toml` warming its builder work folders (`Config::warmup_consented`); a repo it does not name, or a file without the key, has no consent. A value that is not an array of non-empty strings consents to none and leaves the rest of the file usable, and `warmup_consented` gives its reason. `gate check` asks the consent only of a repo `repos` lists. A routed run reads the consent from the same `remote.json` read its routing decision used, one read per run.
 
 ops-tower reads only `slots`.
 
 A repo's own `.gate/toolchain.toml`, which declares the tools and workloads a routed run's builder needs, is a separate file in the snapshot, not part of `remote.json`: [Routing](#routing) (Toolchain manifest) describes its format.
 
-A repo's `.gate/warmup.toml`, which declares the warm-up commands, is read by `gate_router::warm::read_warmup`: `commands`, an array of 1 to 8 commands, each a non-empty array of non-empty strings, and the optional `timeout`, whole seconds from 1 to 86400, 1800 when missing. A leading byte order mark is skipped, any other key is a problem, and any problem means no warm-up. `gate warm` reads the file ([`gate warm`](#gate-warm)), and so does a routed run of a consenting repo, for the judge; nothing starts a warm-up from a route yet.
+A repo's `.gate/warmup.toml`, which declares the warm-up commands, is read by `gate_router::warm::read_warmup`: `commands`, an array of 1 to 8 commands, each a non-empty array of non-empty strings, and the optional `timeout`, whole seconds from 1 to 86400, 1800 when missing. A leading byte order mark is skipped, any other key is a problem, and any problem means no warm-up. `gate warm` reads the file ([`gate warm`](#gate-warm)), and so does a routed run of a consenting repo, for the judge, and `gate check` ([The warm-up items](#the-warm-up-items)), which gives every problem; nothing starts a warm-up from a route yet.
 
 A warm-up command is worded for the builder as a routed run's words are. A command whose first word is `git` or `prek`, named by any path or sent as that program's name (`C:\x\git.exe.exe status`), is a file problem, `gate: warm: .gate/warmup.toml command <n> starts with <word>, which a routed run never sends`; a first word naming another program by a path outside the worktree is sent as the program's name ([Routing](#routing), the in-worktree path rewrite), not a file problem.
 
