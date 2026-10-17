@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::iter::Peekable;
 
 use crate::problem::Problem;
-use crate::request::{BurnRequest, CheckRequest, CutoverRequest, ExpectRequest, PushRequest, RunRequest, StopRequest};
+use crate::request::{BurnRequest, CheckRequest, CutoverRequest, ExpectRequest, PushRequest, RunRequest, StopRequest, WarmRequest};
 use crate::run::{RunBuilder, RunOption, SwitchOption, ValueOption, next_text};
 use crate::values;
 
@@ -103,6 +103,21 @@ pub(crate) fn parse_check(words: impl Iterator<Item = OsString>) -> Result<Check
         }
     }
     builder.finish_check()
+}
+
+/// Reads the words after `gate warm`, which takes none: every word is a problem, `--` included, save `--cd <folder>`,
+/// `--background`, `--state-dir <path>` and the hidden seams of a build with the `test-seams` feature.
+pub(crate) fn parse_warm(words: impl Iterator<Item = OsString>) -> Result<WarmRequest, Vec<Problem>> {
+    let mut words = words.peekable();
+    let mut builder = RunBuilder::default();
+    while let Some(text) = next_text(&mut words, &mut builder.problems) {
+        if text.starts_with('-') && text != "--" {
+            read_option(&mut builder, &mut words, &text, warm_option);
+        } else {
+            builder.problems.push(Problem::UnexpectedArgument(text));
+        }
+    }
+    builder.finish_warm()
 }
 
 /// Reads the words after `gate burn`: the optional `--cores <n>` and the required `--seconds <s>`.
@@ -231,6 +246,30 @@ fn check_seam_option(name: &str) -> Option<RunOption> {
 
 #[cfg(not(feature = "test-seams"))]
 fn check_seam_option(_name: &str) -> Option<RunOption> {
+    None
+}
+
+fn warm_option(name: &str) -> Option<RunOption> {
+    match name {
+        "cd" => Some(RunOption::Value(ValueOption::Cd)),
+        "background" => Some(RunOption::Switch(SwitchOption::Background)),
+        "state-dir" => Some(RunOption::Value(ValueOption::StateDir)),
+        _ => warm_seam_option(name),
+    }
+}
+
+/// The warm-up's own wait, then the client seams a routed run takes; `gate warm` has no request printer.
+#[cfg(feature = "test-seams")]
+fn warm_seam_option(name: &str) -> Option<RunOption> {
+    match name {
+        "test-warm-wait-ms" => Some(RunOption::Value(ValueOption::WarmWaitMs)),
+        "test-print-request" => None,
+        _ => seam_option(name),
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+fn warm_seam_option(_name: &str) -> Option<RunOption> {
     None
 }
 

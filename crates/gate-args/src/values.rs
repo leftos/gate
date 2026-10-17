@@ -206,3 +206,399 @@ pub(crate) fn pid(value: &str) -> Result<u32, Problem> {
         .filter(|pid| *pid > 0)
         .ok_or_else(|| Problem::BadPid(value.to_owned()))
 }
+
+/// The names the gate sets on every command it starts, over the environment it starts it in: the slot marker and the
+/// state root, the build-server settings of the run, the `GIT_CONFIG_COUNT` entry the box gives git, and the Event Log
+/// logging provider turned off. A caller may set none of them; the gate sets each after the caller's own pairs.
+pub const GATE_SET_NAMES: &[&str] = &[
+    "GATE_SLOT_HELD",
+    "GATE_STATE_DIR",
+    "SharedCompilationId",
+    "MSBUILDNODEHANDSHAKESALT",
+    "MSBUILDUSESERVER",
+    "DOTNET_CLI_USE_MSBUILD_SERVER",
+    "MSBUILDDISABLENODEREUSE",
+    "GIT_CONFIG_COUNT",
+    "Logging__EventLog__LogLevel__Default",
+    "Logging:EventLog:LogLevel:Default",
+];
+
+/// The names git itself reads over the config entries the gate sets ([`GATE_SET_NAMES`], [`GATE_SET_PREFIXES`]): a value
+/// the caller gave one of them would be read after the gate's own entries, undoing the `safe.directory` the box gives the
+/// git a command runs. The gate sets none of them, so they refuse for their own reason ([`EnvRefusal::GitReads`]).
+pub const GIT_READ_NAMES: &[&str] = &["GIT_CONFIG_PARAMETERS", "GIT_CONFIG"];
+
+/// The names the gate sets on a command with a number after them: the `safe.directory` entry the box appends to git's
+/// config takes the index `GIT_CONFIG_COUNT` holds, as `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>`.
+pub const GATE_SET_PREFIXES: &[&str] = &["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
+
+/// The prefix of the gate's own names, none of which a caller may set.
+pub const GATE_NAME_PREFIX: &str = "GATE_";
+
+/// The names of machine paths the gate keeps for the command: the builder's own, which a caller's value would move out
+/// from under it.
+pub const MACHINE_PATH_NAMES: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "SystemRoot",
+    "windir",
+    "ComSpec",
+    "USERPROFILE",
+    "HOME",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramData",
+];
+
+/// The most names a caller may give for the command's environment.
+pub const MOST_ENV_NAMES: usize = 64;
+/// The most the names and values of a caller's environment may take together, in bytes.
+pub const MOST_ENV_BYTES: usize = 32 * 1024;
+
+/// Why a name and value the caller gives for the command's environment cannot be set; `None` when the gate can set it.
+///
+/// A name that is empty or holds `=` or a NUL, and a value holding a NUL, cannot be carried by an environment block. A
+/// name the gate sets itself ([`GATE_SET_NAMES`], [`GATE_SET_PREFIXES`]), a name git would read over the gate's own git
+/// settings ([`GIT_READ_NAMES`]), a `GATE_` name and a machine path ([`MACHINE_PATH_NAMES`]) are the gate's own:
+/// refusing them is what makes one `--env` mean the same thing on the PC and on a builder. Names are compared without
+/// regard to ASCII case.
+#[must_use]
+pub fn env_refusal(name: &str, value: &str) -> Option<EnvRefusal> {
+    if let Some(refusal) = malformed(name, value) {
+        return Some(refusal);
+    }
+    if gate_set(name) {
+        return Some(EnvRefusal::GateSets);
+    }
+    if named(name, GIT_READ_NAMES) {
+        return Some(EnvRefusal::GitReads);
+    }
+    if starts_with_ignoring_case(name, GATE_NAME_PREFIX) {
+        return Some(EnvRefusal::GateName);
+    }
+    named(name, MACHINE_PATH_NAMES).then_some(EnvRefusal::MachinePath)
+}
+
+/// Why the pair is malformed: the name empty or holding `=` or a NUL, or the value holding a NUL.
+fn malformed(name: &str, value: &str) -> Option<EnvRefusal> {
+    if name.is_empty() || name.contains('=') || name.contains('\0') {
+        return Some(EnvRefusal::MalformedName);
+    }
+    value.contains('\0').then_some(EnvRefusal::MalformedValue)
+}
+
+/// Whether `name` is one the gate sets itself: a name of [`GATE_SET_NAMES`], a numbered name of
+/// [`GATE_SET_PREFIXES`], or one of .NET's Event Log logging settings in any spelling ([`event_log_name`]).
+fn gate_set(name: &str) -> bool {
+    named(name, GATE_SET_NAMES) || GATE_SET_PREFIXES.iter().any(|prefix| numbered(name, prefix)) || event_log_name(name)
+}
+
+/// Whether `name` is one of .NET's Event Log logging settings, in any of the spellings .NET reads: an optional leading
+/// `DOTNET_` or `ASPNETCORE_` removed, then, read in ASCII lower case with every `__` taken as the `:` of a key, a name
+/// under `logging:eventlog:`, or one under the full type name of the provider that setting belongs to
+/// (`logging:microsoft.extensions.logging.eventlog.eventlogloggerprovider:`). So `Logging__EventLog__LogLevel__Default`,
+/// its colon spelling, a level below the default, either host prefix and the provider's own type name all refuse.
+fn event_log_name(name: &str) -> bool {
+    let bare = ["DOTNET_", "ASPNETCORE_"]
+        .iter()
+        .find_map(|prefix| name.get(prefix.len()..).filter(|_| starts_with_ignoring_case(name, prefix)))
+        .unwrap_or(name);
+    let folded = bare.to_ascii_lowercase().replace("__", ":");
+    [
+        "logging:eventlog:",
+        "logging:microsoft.extensions.logging.eventlog.eventlogloggerprovider:",
+    ]
+    .iter()
+    .any(|prefix| folded.starts_with(prefix))
+}
+
+/// Whether any name of `names` is `name`, compared without regard to ASCII case.
+fn named(name: &str, names: &[&str]) -> bool {
+    names.iter().any(|set| set.eq_ignore_ascii_case(name))
+}
+
+/// The first name of `names` an earlier one equals without regard to ASCII case, as the later spelling gives it; `None`
+/// when every name is set once.
+#[must_use]
+pub fn repeated_name<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let mut seen: Vec<&str> = Vec::new();
+    for name in names {
+        if seen.iter().any(|set| set.eq_ignore_ascii_case(name)) {
+            return Some(name);
+        }
+        seen.push(name);
+    }
+    None
+}
+
+/// Whether a caller's environment is over a cap: more than [`MOST_ENV_NAMES`] names, or more than [`MOST_ENV_BYTES`]
+/// bytes of names and values together. Read from the request before any pair of it is built or checked, so a request
+/// holding a hundred thousand names is refused without one of them being built.
+#[must_use]
+pub fn over_cap(names: usize, bytes: usize) -> bool {
+    names > MOST_ENV_NAMES || bytes > MOST_ENV_BYTES
+}
+
+/// The most characters of a name a refusal line shows, before [`shown_name`] shortens it.
+const LONGEST_SHOWN_NAME: usize = 200;
+
+/// `name` as a refusal line shows it: its first [`LONGEST_SHOWN_NAME`] characters, with `…` after them when there are
+/// more, so a name of any length says which name it is without filling the line. Shortened before it is escaped.
+#[must_use]
+pub fn shown_name(name: &str) -> String {
+    match name.char_indices().nth(LONGEST_SHOWN_NAME) {
+        Some((end, _)) => format!("{}…", &name[..end]),
+        None => name.to_owned(),
+    }
+}
+
+/// Why a name or value the caller gives for the command's environment cannot be set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvRefusal {
+    /// The name is empty or holds `=` or a NUL.
+    MalformedName,
+    /// The value holds a NUL.
+    MalformedValue,
+    /// A name the gate sets on every command it starts.
+    GateSets,
+    /// A name git would read over the gate's own git settings, so a caller's value could undo them.
+    GitReads,
+    /// A `GATE_` name no table lists, the gate's own.
+    GateName,
+    /// A machine path the gate keeps for the command.
+    MachinePath,
+    /// A name given twice, in any letter case.
+    Twice,
+    /// More pairs or more bytes than a request may carry ([`MOST_ENV_NAMES`], [`MOST_ENV_BYTES`]).
+    OverCap,
+}
+
+impl EnvRefusal {
+    /// The line the box says for this refusal, `name` being the pair's name shortened ([`shown_name`]) and escaped as
+    /// the box escapes one. The cap refusal names no name and ignores it.
+    #[must_use]
+    pub fn box_line(&self, name: &str) -> String {
+        match self {
+            EnvRefusal::MalformedName => format!("gate: box payload Env has a malformed name '{name}'"),
+            EnvRefusal::MalformedValue => format!("gate: box payload Env gives {name} a value holding NUL"),
+            EnvRefusal::GateSets => format!("gate: box payload Env sets {name}, which the gate sets itself"),
+            EnvRefusal::GitReads => {
+                format!("gate: box payload Env sets {name}, which git would read over the gate's own git settings")
+            }
+            EnvRefusal::GateName => format!("gate: box payload Env sets {name}: GATE_ names are the gate's"),
+            EnvRefusal::MachinePath => format!("gate: box payload Env sets {name}, a machine path the builder keeps"),
+            EnvRefusal::Twice => format!("gate: box payload Env names {name} twice"),
+            EnvRefusal::OverCap => format!(
+                "gate: box payload Env is over its cap of {MOST_ENV_NAMES} names or {} KiB",
+                MOST_ENV_BYTES / 1024
+            ),
+        }
+    }
+}
+
+/// Whether `name` is `prefix` followed by one or more ASCII digits, `prefix` compared without regard to ASCII case.
+fn numbered(name: &str, prefix: &str) -> bool {
+    let Some(rest) = name.get(prefix.len()..) else {
+        return false;
+    };
+    starts_with_ignoring_case(name, prefix) && !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Whether `name` starts with `prefix`, compared without regard to ASCII case.
+fn starts_with_ignoring_case(name: &str, prefix: &str) -> bool {
+    name.get(..prefix.len()).is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EnvRefusal, LONGEST_SHOWN_NAME, MOST_ENV_BYTES, MOST_ENV_NAMES, env_refusal, over_cap, repeated_name, shown_name};
+
+    #[test]
+    fn a_name_or_value_no_environment_block_carries_is_malformed() {
+        for bad in ["", "A=B", "A\0B"] {
+            assert_eq!(env_refusal(bad, "v"), Some(EnvRefusal::MalformedName), "{bad:?}");
+        }
+        assert_eq!(env_refusal("A", "v\0"), Some(EnvRefusal::MalformedValue));
+        assert_eq!(env_refusal("A", ""), None, "an empty value is allowed");
+        assert_eq!(env_refusal("A", "v"), None);
+    }
+
+    #[test]
+    fn the_names_the_gate_sets_are_refused_in_any_letter_case() {
+        for name in [
+            "GATE_SLOT_HELD",
+            "gate_state_dir",
+            "SharedCompilationId",
+            "sharedcompilationid",
+            "MSBUILDNODEHANDSHAKESALT",
+            "msbuilduseserver",
+            "DOTNET_CLI_USE_MSBUILD_SERVER",
+            "dotnet_cli_use_msbuild_server",
+            "MSBUILDDISABLENODEREUSE",
+            "GIT_CONFIG_COUNT",
+            "git_config_count",
+            "Logging__EventLog__LogLevel__Default",
+            "logging:eventlog:loglevel:default",
+            "GIT_CONFIG_KEY_12",
+            "git_config_value_0",
+        ] {
+            assert_eq!(env_refusal(name, "x"), Some(EnvRefusal::GateSets), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_names_git_would_read_over_the_gates_own_are_refused_as_such() {
+        for name in ["GIT_CONFIG", "git_config", "GIT_CONFIG_PARAMETERS", "git_config_parameters"] {
+            assert_eq!(
+                env_refusal(name, "x").map(|refusal| refusal.box_line(name)),
+                Some(format!(
+                    "gate: box payload Env sets {name}, which git would read over the gate's own git settings"
+                )),
+                "{name}"
+            );
+        }
+        for name in ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"] {
+            assert_eq!(
+                env_refusal(name, "x").map(|refusal| refusal.box_line(name)),
+                Some(format!("gate: box payload Env sets {name}, which the gate sets itself")),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_spelling_of_the_event_log_setting_is_refused() {
+        for name in [
+            "Logging__EventLog__LogLevel__Default",
+            "Logging:EventLog:LogLevel:Default",
+            "Logging__EventLog:LogLevel__Default",
+            "Logging__EventLog__LogLevel__Microsoft",
+            "DOTNET_Logging__EventLog__LogLevel__Default",
+            "dotnet_logging:eventlog:loglevel:default",
+            "ASPNETCORE_Logging__EventLog__LogLevel__Default",
+            "aspnetcore_logging__eventlog__loglevel__default",
+            "Logging__Microsoft.Extensions.Logging.EventLog.EventLogLoggerProvider__LogLevel__Microsoft",
+        ] {
+            assert_eq!(env_refusal(name, "x"), Some(EnvRefusal::GateSets), "{name}");
+        }
+        for name in [
+            "Logging__Console__LogLevel__Default",
+            "DOTNET_Logging__Console__LogLevel__Default",
+            "Logging__EventLogs__LogLevel__Default",
+        ] {
+            assert_eq!(env_refusal(name, "x"), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_git_config_name_needs_its_digits() {
+        assert_eq!(env_refusal("GIT_CONFIG_KEYS", "x"), None, "not a name the gate sets");
+        assert_eq!(env_refusal("git_config_key_", "x"), None, "no digits after the prefix");
+        assert_eq!(env_refusal("GIT_CONFIG_KEY_1x", "x"), None, "not all digits");
+        assert_eq!(env_refusal("GIT_CONFIG_KEY_12", "x"), Some(EnvRefusal::GateSets));
+    }
+
+    #[test]
+    fn a_gate_name_no_table_lists_is_refused_as_the_gates() {
+        assert_eq!(env_refusal("GATE_ANYTHING", "x"), Some(EnvRefusal::GateName));
+        assert_eq!(env_refusal("gate_anything", "x"), Some(EnvRefusal::GateName));
+        assert_eq!(env_refusal("AGATE_X", "x"), None, "the prefix starts the name");
+    }
+
+    #[test]
+    fn a_machine_path_is_refused_in_any_letter_case() {
+        for name in [
+            "PATH",
+            "path",
+            "Path",
+            "PATHEXT",
+            "TEMP",
+            "tmp",
+            "SystemRoot",
+            "windir",
+            "ComSpec",
+            "userprofile",
+            "HOME",
+            "appdata",
+            "LOCALAPPDATA",
+            "programdata",
+        ] {
+            assert_eq!(env_refusal(name, "x"), Some(EnvRefusal::MachinePath), "{name}");
+        }
+        for name in ["PATHS", "HOMEDRIVE", "TMPDIR"] {
+            assert_eq!(env_refusal(name, "x"), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_name_given_twice_is_named_as_its_later_spelling() {
+        assert_eq!(repeated_name(["NuGetAudit", "NUGETAUDIT"]), Some("NUGETAUDIT"));
+        assert_eq!(repeated_name(["NuGetAudit", "Other", "nugetaudit"]), Some("nugetaudit"));
+        assert_eq!(repeated_name(["NuGetAudit", "Other"]), None);
+        assert_eq!(repeated_name(std::iter::empty::<&str>()), None);
+    }
+
+    #[test]
+    fn a_list_over_its_cap_is_refused() {
+        assert!(
+            !over_cap(MOST_ENV_NAMES, MOST_ENV_BYTES),
+            "{MOST_ENV_NAMES} names of {MOST_ENV_BYTES} bytes are allowed"
+        );
+        assert!(!over_cap(MOST_ENV_NAMES, 0), "both caps are separate");
+        assert!(over_cap(MOST_ENV_NAMES + 1, 0), "one more name is not");
+        assert!(over_cap(0, MOST_ENV_BYTES + 1), "one byte more is not");
+    }
+
+    #[test]
+    fn a_name_a_line_shows_is_shortened_to_its_first_two_hundred_characters() {
+        let longest = "x".repeat(LONGEST_SHOWN_NAME);
+        assert_eq!(shown_name("A"), "A", "a short name is shown as it is");
+        assert_eq!(shown_name(&longest), longest, "a name of the whole limit is shown as it is");
+        assert_eq!(
+            shown_name(&format!("{longest}x")),
+            format!("{longest}…"),
+            "one more character shortens it"
+        );
+        assert_eq!(
+            shown_name(&"é".repeat(LONGEST_SHOWN_NAME + 1)),
+            format!("{}…", "é".repeat(LONGEST_SHOWN_NAME)),
+            "characters, not bytes"
+        );
+    }
+
+    #[test]
+    fn each_refusal_says_its_line() {
+        assert_eq!(
+            EnvRefusal::MalformedName.box_line("A=B"),
+            "gate: box payload Env has a malformed name 'A=B'"
+        );
+        assert_eq!(EnvRefusal::MalformedName.box_line(""), "gate: box payload Env has a malformed name ''");
+        assert_eq!(
+            EnvRefusal::MalformedValue.box_line("A"),
+            "gate: box payload Env gives A a value holding NUL"
+        );
+        assert_eq!(
+            EnvRefusal::GateSets.box_line("MSBUILDUSESERVER"),
+            "gate: box payload Env sets MSBUILDUSESERVER, which the gate sets itself"
+        );
+        assert_eq!(
+            EnvRefusal::GitReads.box_line("GIT_CONFIG"),
+            "gate: box payload Env sets GIT_CONFIG, which git would read over the gate's own git settings"
+        );
+        assert_eq!(
+            EnvRefusal::GateName.box_line("GATE_X"),
+            "gate: box payload Env sets GATE_X: GATE_ names are the gate's"
+        );
+        assert_eq!(
+            EnvRefusal::MachinePath.box_line("PATH"),
+            "gate: box payload Env sets PATH, a machine path the builder keeps"
+        );
+        assert_eq!(EnvRefusal::Twice.box_line("NuGetAudit"), "gate: box payload Env names NuGetAudit twice");
+        assert_eq!(
+            EnvRefusal::OverCap.box_line(""),
+            "gate: box payload Env is over its cap of 64 names or 32 KiB"
+        );
+    }
+}

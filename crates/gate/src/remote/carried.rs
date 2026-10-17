@@ -2,7 +2,7 @@
 //! accessors, so no other part of the client can write one or change what it holds. Making one re-checks only its name
 //! and its root, as text; it reads no folder, so whoever sends a sibling must open its folder again at use.
 
-use gate_router::{FolderId, RemoteRun, is_layout_name, sibling_root};
+use gate_router::{CarriedSibling, FolderId, is_layout_name, sibling_root};
 
 /// A sibling a routed run carries: its folder name, its root and its folder's id, borrowed from the route's decision,
 /// never a fresh read of the siblings file or the routing file.
@@ -30,20 +30,21 @@ impl<'a> Sibling<'a> {
     }
 }
 
-/// The siblings the routed run `run` carries, in declared order, each checked again: its name a folder name the
-/// builder can lay out ([`is_layout_name`]) and its root the one [`sibling_root`] makes of the run's root and that name.
+/// The `siblings` the route's decision gave a call from the worktree `root`, in declared order, each checked again: its
+/// name a folder name the builder can lay out ([`is_layout_name`]) and its root the one [`sibling_root`] makes of `root`
+/// and that name.
 ///
 /// # Errors
 ///
-/// The first sibling that fails either check, named; the run is then not sent, and no sibling is ever dropped from it.
-pub(crate) fn carried(run: &RemoteRun) -> Result<Vec<Sibling<'_>>, String> {
-    run.siblings
+/// The first sibling that fails either check, named; the call is then not sent, and no sibling is ever dropped from it.
+pub(crate) fn carried<'a>(root: &str, siblings: &'a [CarriedSibling]) -> Result<Vec<Sibling<'a>>, String> {
+    siblings
         .iter()
         .map(|sibling| {
             if !is_layout_name(&sibling.name) {
                 return Err(format!("the sibling {:?} is not a folder name the builder can lay out", sibling.name));
             }
-            if sibling.root != sibling_root(&run.root, &sibling.name) {
+            if sibling.root != sibling_root(root, &sibling.name) {
                 return Err(format!(
                     "the sibling {:?} has the root {:?}, not one beside the worktree",
                     sibling.name, sibling.root
@@ -88,6 +89,7 @@ mod tests {
             pattern: "*".to_owned(),
             words: Vec::new(),
             fallback: Vec::new(),
+            program_named: false,
             outputs: Vec::new(),
             inputs: Vec::new(),
             dropped_no_build: false,
@@ -98,7 +100,7 @@ mod tests {
     #[test]
     fn each_sibling_is_borrowed_as_the_decision_made_it() {
         let run = run(&[("b", "X:/dev/b"), ("c.d", "X:/dev/c.d")]);
-        let siblings = carried(&run);
+        let siblings = carried(&run.root, &run.siblings);
         let seen: Option<Vec<(&str, &str, FolderId)>> = siblings
             .ok()
             .map(|siblings| siblings.iter().map(|sibling| (sibling.name(), sibling.root(), sibling.id())).collect());
@@ -114,7 +116,7 @@ mod tests {
             ("b", "X:/dev/B", "a root naming another folder"),
         ] {
             let run = run(&[("c", "X:/dev/c"), (name, root)]);
-            let refused = carried(&run).map(|siblings| siblings.len());
+            let refused = carried(&run.root, &run.siblings).map(|siblings| siblings.len());
             assert!(
                 refused.as_ref().is_err_and(|why| why.contains(&format!("{name:?}"))),
                 "{why}: {refused:?}"

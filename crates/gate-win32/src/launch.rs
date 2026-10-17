@@ -944,6 +944,7 @@ pub enum Waited {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test whose block or command cannot be made must fail loudly")]
 mod tests {
+    use std::ffi::OsStr;
     use std::io;
     use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
     use std::sync::PoisonError;
@@ -954,7 +955,7 @@ mod tests {
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, TerminateProcess, WaitForSingleObject,
     };
 
-    use super::{EnvironmentBlock, Launch, LaunchOutput};
+    use super::{EnvironmentBlock, Launch, LaunchOutput, same_variable_name};
     use crate::{StoppableProcess, creation_time_of, pid_of_process, pid_of_thread, system_directory};
 
     /// The longest a test waits for a process to end: it never runs out unless the code is broken.
@@ -1204,5 +1205,29 @@ mod tests {
             7,
             "ended by the test, not by the release"
         );
+    }
+
+    /// The ASCII letters a one-character environment name can be, in both cases.
+    const LETTERS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+    /// A name of one ASCII letter is the same variable name as another only when the two are the same letter in another
+    /// case, whatever the character outside ASCII the other name holds: so the ASCII-only comparison the gate makes
+    /// before it asks Windows refuses every name Windows would read as one of its own, and no other.
+    #[test]
+    fn no_character_outside_ascii_is_the_same_variable_name_as_an_ascii_letter() {
+        for unit in 0x80..=0xFFFF_u32 {
+            // A surrogate is not a character, so no name holds one.
+            let Some(character) = char::from_u32(unit) else {
+                continue;
+            };
+            let name = character.to_string();
+            for letter in LETTERS.chars() {
+                let other = letter.to_string();
+                assert!(
+                    !same_variable_name(OsStr::new(&name), OsStr::new(&other)),
+                    "U+{unit:04X} is not the ASCII letter {letter}"
+                );
+            }
+        }
     }
 }

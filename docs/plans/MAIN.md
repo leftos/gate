@@ -4,16 +4,23 @@
 
 ## Do first
 
+- [/] GATE-347 Warm a builder work folder with a repo's warm-up commands before routing work for it — Urgent · Remote
+- [ ] GATE-370 Run a routed Godot command on the builder's side-by-side install of the version its repo pins — Urgent · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [/] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
-- [/] GATE-347 Warm a builder work folder with a repo's warm-up commands before routing work for it — High · Remote
+- [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
+- [/] GATE-362 Send a caller's chosen environment to a routed command, and say when a routed run drops one — High · Remote
+- [ ] GATE-374 Run a routed Godot command on the builder's install of the pinned version, with GODOT_PATH set — High · Remote
+- [ ] GATE-375 Install Godot side by side on the builders and trial each Godot command family — High · Remote
+- [ ] GATE-371 Route ops-tower's Playwright tests: the fixture server and browsers on the builder — High · Remote
+- [ ] GATE-376 Wait for a busy work folder's holder before falling back — High · Remote
+- [ ] GATE-383 Find why a routed headless Godot run stalls on the builder and never exits — High · Remote
 
 ## Remote
 
 - [ ] GATE-332 Send each repo's inputs in a routed sibling pair
 - [ ] GATE-273 Read a dotnet tools manifest at the repo root as a toolchain pin
-- [ ] GATE-329 Make the gate's own suite pass on a builder
 - [ ] GATE-109 Remote: carry every verb of a routed run over one ssh connection (gate box serve)
 - [ ] GATE-29 Sync-back: narrow the 'worktree changed during the run' refusal to changes that could matter
 - [ ] GATE-27 Remote: remember a builder's failures per host (short backoff, loss counter)
@@ -91,6 +98,9 @@
 - [ ] GATE-356 Fail closed when the box cannot start a routed command with its restricted token
 - [ ] GATE-357 Look at the box's stop signal before the program lookup
 - [ ] GATE-358 Keep a preflight's read from making a run's layout read or write fail
+- [ ] GATE-359 Mark a test-seams build in its version so a box refuses a seam helper
+- [ ] GATE-360 Harden the box's desktop hand-off: first-thread, token, clock-step and case checks
+- [ ] GATE-378 Test a Ctrl+C during gate warm's key wait
 
 ## Cutover sweep
 
@@ -146,3 +156,10 @@
 - [ ] GATE-331 Gates nested in a lent gate: their history rows and a command that outlives the lend
 - [ ] GATE-338 Bring back or refuse a routed command's own commit on the box
 - [ ] GATE-340 Keep the check suite's stub probes off the 10 s limit under load
+- [ ] GATE-363 Let the warm-up budget case pass when its first command uses the whole budget on a busy machine
+- [ ] GATE-364 Open the state root's own folders without following junctions
+- [ ] GATE-366 Find why a between-two-fetches outputs case hung its last run on a busy PC
+- [ ] GATE-372 Keep a warm-up or run log that a reader holds open from blocking every later run of its key
+- [ ] GATE-379 Say the routed-as line for a warm-up command sent by its program's name
+- [ ] GATE-381 Write a slot claim before journaling its take, so a take line always has its claim
+- [ ] GATE-382 Open the PC state root's folders without following links before reading, writing or deleting a file in them

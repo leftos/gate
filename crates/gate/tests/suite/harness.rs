@@ -1,16 +1,18 @@
 //! The harness itself: each case's own root, the cleared gate environment, and the helper programs.
 
+use std::any::Any;
 use std::ffi::OsStr;
 use std::io::Read;
 use std::os::windows::io::AsHandle;
 use std::os::windows::process::CommandExt;
+use std::panic::catch_unwind;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 use gate_desktop::HelperExit;
 use serde_json::Value;
 
-use crate::support::{Case, FAKE_DESKTOP_HELPER, FAKE_TOOL, GATE, Outcome, finish, print_run, shown};
+use crate::support::{Case, FAKE_DESKTOP_HELPER, FAKE_TOOL, GATE, Outcome, finish, git, git_init, print_run, shown};
 
 #[test]
 fn each_case_gets_its_own_root() {
@@ -78,6 +80,29 @@ fn fake_tool_runs_its_steps_in_order() {
 
     assert_eq!(outcome.code, Some(0), "argv is the last step");
     assert_eq!(outcome.stdout, "first\nout\nx\nexit\n3\n");
+}
+
+/// A git call that fails names every part of what the machine it failed on showed: the arguments, the folder, git's
+/// exit status and both its streams, so a failure on a box this suite cannot see is read from the report alone.
+#[test]
+fn a_failed_git_setup_call_names_its_status_and_output() {
+    let case = Case::new("a_failed_git_setup_call_names_its_status_and_output");
+    git_init(&case);
+
+    let payload = catch_unwind(|| git(&case, &["commit", "-m", "x"])).expect_err("a commit with nothing staged fails");
+    let message = panic_text(&*payload);
+
+    assert!(message.contains("exit code: 1"), "the exit status is named: {message}");
+    assert!(message.contains("nothing to commit"), "what git printed on stdout is named: {message}");
+    assert!(message.contains("\"commit\""), "the arguments are named: {message}");
+}
+
+/// The text the panic `payload` carried, whether it was a `String` or a `&str`.
+fn panic_text(payload: &(dyn Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<String>() {
+        return text.clone();
+    }
+    payload.downcast_ref::<&str>().map_or_else(String::new, |text| (*text).to_owned())
 }
 
 #[test]

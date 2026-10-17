@@ -40,6 +40,17 @@ impl Variables {
         Variables(applied(self.0, build_servers(run)))
     }
 
+    /// This environment with the caller's `Env` pairs set over it, each pair replacing every value the environment holds
+    /// for its name, names compared as Windows compares them. Applied before the gate's own settings, so no pair can
+    /// undo one.
+    pub(crate) fn with_caller(self, caller: &[(String, String)]) -> Variables {
+        let overrides = caller
+            .iter()
+            .map(|(name, value)| (OsString::from(name), Some(OsString::from(value))))
+            .collect();
+        Variables(applied(self.0, overrides))
+    }
+
     /// The value the command gets for `name`, names compared as Windows compares them.
     pub(crate) fn get(&self, name: &str) -> Option<&OsStr> {
         let name = OsStr::new(name);

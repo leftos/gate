@@ -64,6 +64,12 @@ fn word(case: &Case, name: &str) -> String {
     shown(&case.folder().join(name))
 }
 
+/// The path of a file `name` in the case folder, spelled with a `.` segment before its file name: a form of a path
+/// outside another worktree that the rewrite judges outside and never reads as a program's name.
+fn dotted_word(case: &Case, name: &str) -> String {
+    format!(r"{}\.\{name}", shown(&case.folder()))
+}
+
 /// The call the scripted client recorded at `path`.
 fn recorded(path: &Path) -> Value {
     serde_json::from_str(&fs::read_to_string(path).expect("the client recorded its call")).expect("the record is JSON")
@@ -387,16 +393,51 @@ fn an_unusable_routing_file_is_ignored_with_one_line() {
 }
 
 #[test]
-fn a_matched_command_outside_the_worktree_runs_here_saying_so() {
+fn a_matched_command_holding_a_path_outside_the_worktree_runs_here_saying_so() {
     let case = routed_case("routing-outside");
-    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[FAKE_TOOL, "out", "ran here"])));
+    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", FAKE_TOOL])));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(
         outcome.stderr.contains(&format!("gate: not routed: {FAKE_TOOL} is outside the worktree")),
-        "{outcome:?}"
+        "only a command's first word is read as a program's path: {outcome:?}"
     );
     assert_local(&events(&case), None);
+}
+
+#[test]
+fn a_command_naming_a_program_outside_the_worktree_routes_by_the_program_s_name() {
+    let case = routed_case("routing-program-path");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[FAKE_TOOL, "out", "ran here"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("not routed"), "the program's name matches *tool*: {outcome:?}");
+    let name = fake_tool_name();
+    let line = format!("gate: routed {FAKE_TOOL} as {name}");
+    assert_eq!(
+        outcome.stderr.matches(&line).count(),
+        1,
+        "the word as given and the name it was sent as, once: {outcome:?}"
+    );
+    assert_eq!(
+        recorded_words(&recorded(&call)),
+        [name.as_str(), "out", "ran here"],
+        "the builder runs the name it finds on its own PATH"
+    );
+    let events = events(&case);
+    assert_eq!(names(&events), ["queue", "take", "release"], "{events:#?}");
+    assert!(events.iter().all(has_remote_tag), "{events:#?}");
+}
+
+/// The name of the fake tool a builder looks up for it: its path's file name without its extension.
+fn fake_tool_name() -> String {
+    Path::new(FAKE_TOOL)
+        .file_stem()
+        .expect("the fake tool is a file")
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[test]
@@ -432,11 +473,12 @@ fn cd_folder(case: &Case, name: &str) -> PathBuf {
 fn a_gate_given_cd_routes_as_a_gate_started_in_that_folder() {
     let case = case_with_another_checkout("routing-cd");
     let tool = word(&case, "tool.exe");
+    let dotted = dotted_word(&case, "tool.exe");
     let here_log = log_path(&case, "here.log");
-    let here = finish(case.gate_in("other", &heavy_words_with_limit(&here_log, &[], &[&tool, "out", "ran here"])));
+    let here = finish(case.gate_in("other", &heavy_words_with_limit(&here_log, &[], &[&dotted, "out", "ran here"])));
     assert_eq!(here.code, Some(0), "{here:?}");
     assert!(
-        here.stderr.contains(&format!("gate: not routed: {tool} is outside the worktree")),
+        here.stderr.contains(&format!("gate: not routed: {dotted} is outside the worktree")),
         "without --cd the case's files are outside the worktree: {here:?}"
     );
 
@@ -936,6 +978,10 @@ fn a_routed_run_goes_to_the_client_and_passes_its_output_and_status_through() {
     let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", "ran here"])));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        !outcome.stderr.contains("gate: routed "),
+        "no word of this command was sent as a program's name: {outcome:?}"
+    );
     assert_in_order(
         &outcome.stdout,
         &[

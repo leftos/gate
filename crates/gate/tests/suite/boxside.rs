@@ -794,20 +794,178 @@ fn preflight_a_tool_name_it_does_not_know_is_skipped() {
     assert!(!marker.exists(), "a program the payload names is never run");
 }
 
-#[test]
-fn preflight_godot_is_skipped_with_no_probe() {
-    let case = Case::new("preflight_godot_skipped");
-    let marker = case.folder().join("godot-ran");
-    let godot = format!("@echo off\r\n>\"{}\" echo ran\r\necho 4.7.2.stable\r\n", marker.display());
+/// Puts a copy of fake-tool named `Godot_console.exe` in `folder`, answering `--version` with the line `line`, so the
+/// folder stands in for a Godot install.
+fn fake_godot(folder: &Path, line: &str) {
+    fs::create_dir_all(folder).expect("the fake godot's folder can be made");
+    fs::copy(FAKE_TOOL, folder.join("Godot_console.exe")).expect("the fake godot can be copied");
+    fs::write(folder.join("version.txt"), line).expect("the line the fake godot answers with can be written");
+}
 
-    let outcome = probed(&case, &json!({"godot": "4.7.2"}), &[("godot", &godot)]);
+/// The folder a case's `GATE_GODOT_ROOT` names, made and holding no install: one goes in a subfolder of it, put there
+/// with [`fake_godot`].
+fn godot_root(case: &Case) -> PathBuf {
+    let root = case.folder().join("godot");
+    fs::create_dir_all(&root).expect("the godot root can be made");
+    root
+}
+
+/// A `gate box preflight` needing `needs`, its `PATH` the stub folders `stubs` then git's folder, so no dotnet is
+/// found and the sdks line says `none`, and its `GATE_GODOT_ROOT` the folder `root`, taken out of the box's
+/// environment when there is none.
+fn probed_with_root(case: &Case, needs: &Value, stubs: &[PathBuf], root: Option<&Path>) -> Outcome {
+    let folders = Folders::new(case);
+    let mut command = box_call(
+        case,
+        &["box", "--test-probe-limit-ms", UNREACHED_PROBE_LIMIT_MS, "preflight"],
+        &needing(&folders, needs),
+    );
+    command.env("PATH", path_with_git(stubs));
+    if let Some(root) = root {
+        command.env("GATE_GODOT_ROOT", root);
+    } else {
+        command.env_remove("GATE_GODOT_ROOT");
+    }
+    command.finish()
+}
+
+/// Every Godot the root names is probed, and the line carries every version found, by number and without repeats.
+#[test]
+fn preflight_says_every_godot_the_root_names() {
+    let case = Case::new("preflight_godot_root");
+    let root = godot_root(&case);
+    fake_godot(&root.join("4.7.2"), "4.7.2.stable.mono.official.x\n");
+    fake_godot(&root.join("4.3"), "4.3.stable.mono.official.y\n");
+
+    let outcome = probed_with_root(&case, &json!({"godot": "4.7.2"}), &[], Some(&root));
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool godot 4.3.0,4.7.2"], "{outcome:?}");
+}
+
+/// A root that names no Godot install is missing, as any other tool the box does not find.
+#[test]
+fn preflight_says_a_root_holding_no_godot_is_missing() {
+    let case = Case::new("preflight_godot_root_empty");
+    let root = godot_root(&case);
+
+    let outcome = probed_with_root(&case, &json!({"godot": "4.7.2"}), &[], Some(&root));
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool godot missing"], "{outcome:?}");
+}
+
+/// With no `GATE_GODOT_ROOT` the probe runs the `Godot_console.exe` the box's `PATH` holds.
+#[test]
+fn preflight_says_the_godot_on_the_path_without_a_root() {
+    let case = Case::new("preflight_godot_on_path");
+    let stub = case.folder().join("stub");
+    fake_godot(&stub, "4.7.2.stable.mono.official.x\n");
+
+    let outcome = probed_with_root(&case, &json!({"godot": "4.7.2"}), &[stub], None);
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool godot 4.7.2"], "{outcome:?}");
+}
+
+/// An install that answers with no version is skipped with the line it wrote, not said as one the box has.
+#[test]
+fn preflight_says_a_godot_answering_with_no_version_is_skipped() {
+    let case = Case::new("preflight_godot_no_version");
+    let root = godot_root(&case);
+    fake_godot(&root.join("4.7.2"), "hello\n");
+
+    let outcome = probed_with_root(&case, &json!({"godot": "4.7.2"}), &[], Some(&root));
 
     assert_eq!(
         after_sdks(&outcome),
-        ["gate: remote tool godot skipped: no probe for godot"],
+        ["gate: remote tool godot skipped: Godot_console.exe --version gave no version: hello"],
         "{outcome:?}"
     );
-    assert!(!marker.exists(), "godot is not run");
+}
+
+/// A root that is no absolute path on a drive is refused with its path, so a relative one is never listed in one
+/// folder and run from another.
+#[test]
+fn preflight_skips_a_godot_root_that_is_no_drive_path() {
+    let case = Case::new("preflight_godot_root_no_drive");
+
+    let outcome = probed_with_root(&case, &json!({"godot": "4.7.2"}), &[], Some(Path::new("godot")));
+
+    assert_eq!(
+        after_sdks(&outcome),
+        ["gate: remote tool godot skipped: GATE_GODOT_ROOT godot is not an absolute path on a drive"],
+        "{outcome:?}"
+    );
+}
+
+/// A root naming no folder the box can read is skipped with the folder and why it cannot be read.
+#[test]
+fn preflight_skips_a_godot_root_it_cannot_read() {
+    let case = Case::new("preflight_godot_root_unreadable");
+    let root = case.folder().join("no-such-root");
+
+    let outcome = probed_with_root(&case, &json!({"godot": "4.7.2"}), &[], Some(&root));
+
+    let unreadable = fs::read_dir(&root).expect_err("the root is no folder");
+    let said = format!(
+        "gate: remote tool godot skipped: cannot read GATE_GODOT_ROOT {}: {unreadable}",
+        root.display()
+    );
+    assert_eq!(after_sdks(&outcome), [said.as_str()], "{outcome:?}");
+}
+
+/// An install inside the run's own folders is refused, as a program of any other probe found inside a worktree is,
+/// and never runs.
+#[test]
+fn preflight_refuses_a_godot_inside_the_run_s_folders() {
+    let case = Case::new("preflight_godot_inside_the_run");
+    let folders = Folders::new(&case);
+    let root = Path::new(&folders.work).parent().expect("the work folder has a parent").to_path_buf();
+    let install = root.join("inst");
+    fake_godot(&install, "9.9.9.stable.mono.official.x\n");
+
+    let outcome = probed_with_root(&case, &json!({"godot": "9.9.9"}), &[], Some(&root));
+
+    let program = install.join("Godot_console.exe");
+    let said = format!(
+        "gate: remote tool godot skipped: cannot run {}: {} lies inside the worktree",
+        program.display(),
+        program.display()
+    );
+    assert_eq!(after_sdks(&outcome), [said.as_str()], "{outcome:?}");
+    assert!(!install.join("ran").exists(), "the refused install ran");
+}
+
+/// A subfolder of the root that is a junction is not followed: the install behind it is neither probed nor run.
+#[test]
+fn preflight_skips_a_godot_behind_a_junction() {
+    let case = Case::new("preflight_godot_behind_a_junction");
+    let root = godot_root(&case);
+    let behind = case.folder().join("behind");
+    fake_godot(&behind, "9.9.9.stable.mono.official.x\n");
+    junction(&root.join("linked"), &behind);
+    fake_godot(&root.join("4.7.2"), "4.7.2.stable.mono.official.x\n");
+
+    let outcome = probed_with_root(&case, &json!({"godot": "4.7.2"}), &[], Some(&root));
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool godot 4.7.2"], "{outcome:?}");
+    assert!(!behind.join("ran").exists(), "the install behind the junction ran");
+
+    // A root whose only install is behind a junction is skipped with its reason, not said missing.
+    let only = Case::new("preflight_godot_only_a_junction");
+    let root = godot_root(&only);
+    let behind = only.folder().join("behind");
+    fake_godot(&behind, "9.9.9.stable.mono.official.x\n");
+    junction(&root.join("linked"), &behind);
+
+    let outcome = probed_with_root(&only, &json!({"godot": "4.7.2"}), &[], Some(&root));
+
+    let linked = root.join("linked");
+    let said = format!(
+        "gate: remote tool godot skipped: cannot run {}: {} is a link or a junction",
+        linked.join("Godot_console.exe").display(),
+        linked.display()
+    );
+    assert_eq!(after_sdks(&outcome), [said.as_str()], "{outcome:?}");
+    assert!(!behind.join("ran").exists(), "the install behind the junction ran");
 }
 
 #[test]
@@ -1365,6 +1523,23 @@ fn box_run_gives_the_command_its_run_s_compiler_server_id() {
 }
 
 #[test]
+fn box_run_gives_the_command_the_payloads_env() {
+    let case = Case::new("box_run_env");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "env", "GATE362_PROBE", "env", "NuGetAudit"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    payload["Env"] = json!({"GATE362_PROBE": "x", "NuGetAudit": "false"});
+
+    // Inherited under the same name, so the case sees the payload's pair replace the box's own value.
+    let outcome = run_box_with_env(&case, &payload, "GATE362_PROBE", "inherited");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout, "x\nfalse\n",
+        "the command reads the payload's Env, not the box's own: {outcome:?}"
+    );
+}
+
+#[test]
 fn box_run_turns_the_event_log_provider_off_for_the_command() {
     let case = Case::new("box_run_event_log_off");
     let mut payload = box_payload(&case, "k", &[r".\eventlog.cmd"]);
@@ -1437,6 +1612,70 @@ fn box_run_refuses_an_identity_name_outside_the_git_identity() {
         "gate: box payload Identity may set only GIT_AUTHOR_* and GIT_COMMITTER_* names: GIT_CONFIG_COUNT\n"
     );
     assert_eq!(work_entries(&payload), [".git"], "nothing is checked out or run");
+}
+
+#[test]
+fn box_run_refuses_a_malformed_env() {
+    let case = Case::new("box_run_env_refused");
+    let many = Value::Object((0..65).map(|number| (format!("A{number}"), json!("v"))).collect());
+    let hundred_thousand = Value::Object((0..100_000).map(|number| (format!("A{number:06}"), json!("v"))).collect());
+    // A name of 250 characters refused as the gate's own: its first 200 are shown, the control character among them
+    // escaped.
+    let long_name = format!("GATE_{}\u{1b}{}", "x".repeat(194), "y".repeat(50));
+    let long_line = format!(
+        "gate: box payload Env sets GATE_{}\\u{{1b}}…: GATE_ names are the gate's",
+        "x".repeat(194)
+    );
+    let long_env = Value::Object(std::iter::once((long_name, json!("c"))).collect());
+    let refusing = [
+        (json!("A=b"), "gate: box payload Env is not an object of texts"),
+        (json!({"A": 1}), "gate: box payload Env is not an object of texts"),
+        (
+            json!({"NuGetAudit": "false", "NUGETAUDIT": "true"}),
+            "gate: box payload Env names NUGETAUDIT twice",
+        ),
+        (
+            json!({"ZZ_\u{c4}_X": "a", "ZZ_\u{e4}_X": "b"}),
+            "gate: box payload Env names ZZ_\u{e4}_X twice",
+        ),
+        (
+            json!({"MSBUILDUSESERVER": "1"}),
+            "gate: box payload Env sets MSBUILDUSESERVER, which the gate sets itself",
+        ),
+        (
+            json!({"PATH": "C:\\x"}),
+            "gate: box payload Env sets PATH, a machine path the builder keeps",
+        ),
+        (
+            json!({"GATE_OTHER": "1"}),
+            "gate: box payload Env sets GATE_OTHER: GATE_ names are the gate's",
+        ),
+        (json!({"A": "b\u{0}c"}), "gate: box payload Env gives A a value holding NUL"),
+        (json!({"A=B": "c"}), "gate: box payload Env has a malformed name 'A=B'"),
+        (json!({"": "c"}), "gate: box payload Env has a malformed name ''"),
+        (json!({"A=\u{1b}": "c"}), "gate: box payload Env has a malformed name 'A=\\u{1b}'"),
+        (long_env, long_line.as_str()),
+        (many, "gate: box payload Env is over its cap of 64 names or 32 KiB"),
+        (hundred_thousand, "gate: box payload Env is over its cap of 64 names or 32 KiB"),
+    ];
+
+    // One preflight lays the work folder out, so each refusal is shown to leave it as it was.
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "env", "A"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let laid = work_entries(&payload);
+    assert_eq!(laid, [".git"], "the preflight lays nothing else out");
+
+    for (env, line) in refusing {
+        let mut refused = payload.clone();
+        refused["Env"] = env;
+
+        let outcome = run_box(&case, &refused);
+
+        assert_eq!(outcome.code, Some(2), "{line}: {outcome:?}");
+        assert_eq!(outcome.stdout, "");
+        assert_eq!(outcome.stderr, format!("{line}\n"), "{outcome:?}");
+        assert_eq!(work_entries(&payload), laid, "nothing is checked out or run");
+    }
 }
 
 #[test]
@@ -1965,6 +2204,21 @@ fn box_run_an_unknown_program_exits_127() {
         outcome.stderr,
         format!("gate: could not start gate-suite-no-such-program: {}\n", gate_win32::win32_message(2))
     );
+}
+
+/// A bare name holding a dot that is not a `PATHEXT` extension, the shape a versioned Godot exe's derived name has, is
+/// found on the box's `PATH` as `<name>.exe`.
+#[test]
+fn box_run_finds_a_dotted_bare_name_with_exe_appended() {
+    let case = Case::new("box_run_dotted_bare_name");
+    copy_tool(&case, "fake.tool.v1.exe");
+    let mut payload = box_payload(&case, "k", &["fake.tool.v1", "out", "ran", "exit", "0"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[case.folder()])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
 }
 
 /// Whether `line` is the box's line for a command it could not give a UTF-8 console, whatever the reason.

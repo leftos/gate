@@ -167,6 +167,27 @@ fn a_missing_program_exits_127_and_releases_the_slot() {
     assert_eq!(next.stderr, "", "the slot was released, not left held: {next:?}");
 }
 
+/// The suite's own `PATH` with `folders` in front, for a case whose bare word must be found in one of them.
+fn path_with(folders: &[PathBuf]) -> std::ffi::OsString {
+    let own = std::env::var_os("PATH").expect("PATH is set");
+    std::env::join_paths(folders.iter().cloned().chain(std::env::split_paths(&own))).expect("the folders join into a PATH")
+}
+
+/// A bare name holding a dot that is not a `PATHEXT` extension, the shape a versioned Godot exe's derived name has, is
+/// found on `PATH` as `<name>.exe`.
+#[test]
+fn a_dotted_bare_name_is_found_with_exe_appended() {
+    let case = Case::new("a_dotted_bare_name_is_found_with_exe_appended");
+    copy_tool(&case, "fake.tool.v1.exe");
+    let mut command = case.gate(&run_words("out.log", &[], &["fake.tool.v1", "out", "ran", "exit", "0"]));
+    command.env("PATH", path_with(&[case.folder()]));
+
+    let outcome = finish(command);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.starts_with("ran\n"), "{outcome:?}");
+}
+
 #[test]
 fn a_refused_batch_word_exits_2_before_queueing() {
     let case = Case::new("a_refused_batch_word_exits_2_before_queueing");

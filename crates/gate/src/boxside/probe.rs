@@ -1,17 +1,23 @@
 //! The builder's tool probes: for each tool a routed run needs, what the builder has, read by running the tool's own
-//! version command from this module's table, never a program the caller names. Every probe of a batch that runs a
-//! program runs at once, under one deadline the batch shares, in the system folder and on a hidden console of its own,
+//! version command from this module's table, never a program the caller names. The tool the box may have several
+//! installs of is godot: the folder the batch's environment names as its root holds one install per subfolder, and each
+//! is asked for its version, so the line carries every version the box has. Every probe of a batch that runs a program
+//! runs at once, under one deadline the batch shares, in the system folder and on a hidden console of its own,
 //! as [`git::program_output`] runs a program; a probe still running at the deadline is ended with its job. Nothing here
 //! writes to the console or reads a payload: the caller hands over the names and says the lines.
 
 use std::any::Any;
+use std::cmp::Ordering;
+use std::ffi::OsStr;
+use std::fs;
+use std::io;
 use std::path::Path;
 use std::thread::{self, Scope, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
 use gate_win32::PipedConsole;
 
-use crate::boxside::payload::escaped;
+use crate::boxside::payload::{escaped, is_drive_path};
 use crate::environment::Variables;
 use crate::remote::git::{self, GitError, ProgramCall, ProgramOutput, ProgramPlace};
 
@@ -21,10 +27,24 @@ pub(crate) const PROBE_LIMIT: Duration = Duration::from_secs(10);
 /// The most digits a part of a version may have: a longer one is no version the client could compare.
 const MAX_PART_DIGITS: usize = 10;
 
+/// The console program of a Godot install.
+const GODOT: &str = "Godot_console.exe";
+
+/// The word a Godot install is asked for its version with.
+const GODOT_VERSION: &[&str] = &["--version"];
+
+/// The most entries of the folder `GATE_GODOT_ROOT` names that are looked at: a folder holding more is no Godot
+/// install root.
+const GODOT_ENTRIES: usize = 64;
+
+/// The most characters of a Godot install's answer the no-version reason carries before it is escaped.
+const GODOT_ANSWER_MAX: usize = 200;
+
 /// What a probe found of one tool.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Probed {
-    /// It ran, and its version reads as this text.
+    /// It ran, and its version reads as this text: a tool the box has several installs of names every version found,
+    /// `,`-joined.
     Version(String),
     /// It ran, and no version reads in what it wrote.
     Present,
@@ -38,8 +58,8 @@ pub(crate) enum Probed {
 enum ToolProbe {
     /// Runs `program` with `args`.
     Runs { program: &'static str, args: &'static [&'static str] },
-    /// The tool is known, but no command probes it.
-    Unprobed,
+    /// Runs the `--version` of every Godot install the batch's environment names.
+    Godot,
 }
 
 /// The table's probe of the tool `name`; `None` for a name it does not know. cargo-nextest is run as the plugin itself,
@@ -54,7 +74,7 @@ fn probe_of(name: &str) -> Option<ToolProbe> {
         "pnpm" => runs("pnpm", &["--version"]),
         "pwsh" => runs("pwsh", &["--version"]),
         "ffmpeg" => runs("ffmpeg", &["-version"]),
-        "godot" => Some(ToolProbe::Unprobed),
+        "godot" => Some(ToolProbe::Godot),
         _ => None,
     }
 }
@@ -65,16 +85,39 @@ enum Pending<'scope> {
     Running(ScopedJoinHandle<'scope, Probed>),
 }
 
+/// What one batch of probes shares beyond the place a program is looked for in: the folders no program may come from,
+/// the folder the batch's environment names as `GATE_GODOT_ROOT`, and the batch's deadline and its limit.
+#[derive(Clone, Copy)]
+struct Batch<'a> {
+    worktrees: &'a [&'a Path],
+    godot_root: Option<&'a OsStr>,
+    deadline: Instant,
+    limit: Duration,
+}
+
 /// Probes each tool of `names`, all within `limit` from now, and gives back each name with what its probe found, in
 /// the order of `names`. The probes that run a program run at once, each on a thread of its own, sharing the system
-/// folder and the environment `variables` for the batch, whose programs are looked for along its `PATH`; with a
-/// `worktree`, a program found that lies inside it is refused ([`git::judged`]). Environment `variables` that could
-/// not be made, for the reason given, skip every probe that runs a program.
-pub(crate) fn probe(names: &[String], limit: Duration, variables: Result<Variables, String>, worktree: Option<&Path>) -> Vec<(String, Probed)> {
+/// folder and the environment `variables` for the batch, whose programs are looked for along its `PATH`, and none of
+/// them from a folder of `worktrees`: a program found that still lies inside any of them is refused
+/// ([`git::program_output`]). Environment `variables` that could not be made, for the reason given, skip every probe
+/// that runs a program. The godot probe reads the folder `variables` names as `GATE_GODOT_ROOT` to find the installs
+/// it runs.
+pub(crate) fn probe(names: &[String], limit: Duration, variables: Result<Variables, String>, worktrees: &[&Path]) -> Vec<(String, Probed)> {
     let deadline = Instant::now() + limit;
+    let godot_root = variables
+        .as_ref()
+        .ok()
+        .and_then(|variables| variables.get("GATE_GODOT_ROOT"))
+        .map(OsStr::to_os_string);
     let place = variables.and_then(ProgramPlace::new);
+    let batch = Batch {
+        worktrees,
+        godot_root: godot_root.as_deref(),
+        deadline,
+        limit,
+    };
     thread::scope(|scope| {
-        let pending: Vec<Pending<'_>> = names.iter().map(|name| started(scope, name, &place, worktree, deadline, limit)).collect();
+        let pending: Vec<Pending<'_>> = names.iter().map(|name| started(scope, name, &place, batch)).collect();
         names
             .iter()
             .zip(pending)
@@ -89,54 +132,53 @@ pub(crate) fn probe(names: &[String], limit: Duration, variables: Result<Variabl
     })
 }
 
-/// The probe of the tool `name`: what is found without running anything, or the thread on `scope` that runs its
-/// program in `place`, never one inside `worktree`, by `deadline`, the end of the batch's `limit`.
+/// The probe of the tool `name`: what is found without running anything, or the thread on `scope` that runs it in
+/// `place`, never a program inside a folder of the batch's worktrees, by the batch's deadline.
 fn started<'scope, 'env>(
     scope: &'scope Scope<'scope, 'env>,
     name: &str,
     place: &'env Result<ProgramPlace, String>,
-    worktree: Option<&'env Path>,
-    deadline: Instant,
-    limit: Duration,
+    batch: Batch<'env>,
 ) -> Pending<'scope> {
     match probe_of(name) {
         None => Pending::Found(Probed::Skipped("unknown tool".to_owned())),
-        Some(ToolProbe::Unprobed) => Pending::Found(Probed::Skipped(format!("no probe for {name}"))),
         Some(ToolProbe::Runs { program, args }) => match place {
             Err(why) => Pending::Found(Probed::Skipped(format!("cannot run {program}: {why}"))),
-            Ok(place) => Pending::Running(scope.spawn(move || ran(&Run { program, args, worktree }, place, deadline, limit))),
+            Ok(place) => Pending::Running(scope.spawn(move || ran(program, args, place, batch, read))),
+        },
+        Some(ToolProbe::Godot) => match place {
+            Err(why) => Pending::Found(Probed::Skipped(format!("cannot run {GODOT}: {why}"))),
+            Ok(place) => Pending::Running(scope.spawn(move || godot(place, batch))),
         },
     }
 }
 
-/// A probe's program, its arguments, and the worktree it must not be found inside.
-struct Run<'a> {
-    program: &'a str,
-    args: &'a [&'a str],
-    worktree: Option<&'a Path>,
+/// Why a probe did not answer: the batch had no time left for it.
+fn no_answer(limit: Duration) -> String {
+    format!("no answer in {}", git::spelled_limit(limit))
 }
 
-/// What running `run`'s program in `place` finds by `deadline`, the end of the batch's `limit`; nothing is run once
-/// the deadline has passed.
-fn ran(run: &Run<'_>, place: &ProgramPlace, deadline: Instant, limit: Duration) -> Probed {
-    let Run { program, args, worktree } = *run;
-    let remaining = deadline.saturating_duration_since(Instant::now());
+/// What running `program` with `args` in `place` finds by the batch's deadline, `read` turning what it wrote into what
+/// the probe found; nothing is run once the deadline has passed, and a program that lies inside one of the batch's
+/// worktrees is refused.
+fn ran(program: &str, args: &[&str], place: &ProgramPlace, batch: Batch<'_>, read: fn(&ProgramOutput) -> Probed) -> Probed {
+    let remaining = batch.deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Probed::Skipped(format!("no answer in {}", git::spelled_limit(limit)));
+        return Probed::Skipped(no_answer(batch.limit));
     }
     let call = ProgramCall {
         program,
         args,
         limit: remaining,
         interrupt: None,
-        worktrees: worktree.as_slice(),
+        worktrees: batch.worktrees,
         console: PipedConsole::Hidden,
         stdin: None,
     };
     match git::program_output(&call, place) {
         Ok(None) => Probed::Missing,
         Ok(Some(output)) => read(&output),
-        Err(GitError::Failed(why)) => Probed::Skipped(late_reason(&why, &call.late_line(), limit).unwrap_or(why)),
+        Err(GitError::Failed(why)) => Probed::Skipped(late_reason(&why, &call.late_line(), batch.limit).unwrap_or(why)),
         Err(error) => Probed::Skipped(String::from(error)),
     }
 }
@@ -147,6 +189,181 @@ fn ran(run: &Run<'_>, place: &ProgramPlace, deadline: Instant, limit: Duration) 
 fn late_reason(why: &str, late: &str, limit: Duration) -> Option<String> {
     why.strip_prefix(late)
         .map(|rest| format!("no answer in {}{rest}", git::spelled_limit(limit)))
+}
+
+/// What the godot probe finds in `place`: the version of every install the batch's environment names, `,`-joined,
+/// `missing` when the root names no install at all, and `skipped` with the first reason its entries gave when installs
+/// are there and none of them answers with a version.
+fn godot(place: &ProgramPlace, batch: Batch<'_>) -> Probed {
+    let candidates = match godot_candidates(batch.godot_root, batch.deadline, batch.limit) {
+        Ok(candidates) => candidates,
+        Err(why) => return Probed::Skipped(why),
+    };
+    let mut versions = Vec::new();
+    let mut reason: Option<String> = None;
+    for candidate in &candidates {
+        let found = match candidate {
+            Candidate::Install(install) => ran(install, GODOT_VERSION, place, batch, read_godot),
+            Candidate::Skipped(why) => Probed::Skipped(why.clone()),
+        };
+        match found {
+            Probed::Version(version) => versions.push(version),
+            Probed::Present | Probed::Missing => {}
+            Probed::Skipped(why) => {
+                if reason.is_none() {
+                    reason = Some(why);
+                }
+            }
+        }
+    }
+    if versions.is_empty() {
+        return reason.map_or(Probed::Missing, Probed::Skipped);
+    }
+    Probed::Version(version_list(&versions))
+}
+
+/// One direct subfolder of `GATE_GODOT_ROOT` as the godot probe reads it.
+#[derive(Debug, PartialEq, Eq)]
+enum Candidate {
+    /// The `Godot_console.exe` to run, by path.
+    Install(String),
+    /// A folder, or the program in it, that is a link or a junction: left out for this reason.
+    Skipped(String),
+}
+
+/// The subfolders the godot probe reads, in name order: those of the folder the batch's environment names as
+/// `GATE_GODOT_ROOT`, or `Godot_console.exe` itself, looked for along the `PATH`, when it names none. Else why that
+/// folder is refused. The folder must be an absolute path on a drive, and its subfolders are read as they are: a
+/// subfolder whose name is no Unicode, one past the first [`GODOT_ENTRIES`] and an entry that cannot be read are left
+/// out, each subfolder the rest come to is judged by [`godot_install`], and the listing ends at `deadline`, which with
+/// nothing read at all is the batch's own `no answer` reason.
+fn godot_candidates(root: Option<&OsStr>, deadline: Instant, limit: Duration) -> Result<Vec<Candidate>, String> {
+    let Some(root) = root else {
+        return Ok(vec![Candidate::Install(GODOT.to_owned())]);
+    };
+    if !root.to_str().is_some_and(is_drive_path) {
+        return Err(format!(
+            "GATE_GODOT_ROOT {} is not an absolute path on a drive",
+            escaped(&root.to_string_lossy())
+        ));
+    }
+    let folder = Path::new(root);
+    let unreadable = |error: &io::Error| format!("cannot read GATE_GODOT_ROOT {}: {error}", escaped(&folder.to_string_lossy()));
+    let entries = fs::read_dir(folder).map_err(|error| unreadable(&error))?;
+    let mut folders = Vec::new();
+    let mut cut = false;
+    for entry in entries.take(GODOT_ENTRIES) {
+        if Instant::now() >= deadline {
+            cut = true;
+            break;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if entry.file_name().to_str().is_none() {
+            continue;
+        }
+        folders.push(entry.path());
+    }
+    if cut && folders.is_empty() {
+        return Err(no_answer(limit));
+    }
+    folders.sort();
+    Ok(folders.iter().filter_map(|folder| godot_install(folder)).collect())
+}
+
+/// What `folder`, one direct subfolder of `GATE_GODOT_ROOT`, comes to: the `Godot_console.exe` in it to run, why a
+/// link or a junction leaves it out, or nothing when it holds no program to run.
+fn godot_install(folder: &Path) -> Option<Candidate> {
+    let program = folder.join(GODOT);
+    if linked(folder) {
+        return Some(Candidate::Skipped(linked_reason(&program, folder)));
+    }
+    if !plain_folder(folder) {
+        return None;
+    }
+    if linked(&program) {
+        return Some(Candidate::Skipped(linked_reason(&program, &program)));
+    }
+    plain_file(&program).then(|| Candidate::Install(program.to_string_lossy().into_owned()))
+}
+
+/// Whether `path` is a plain folder, read as it is rather than through a link or a junction.
+fn plain_folder(path: &Path) -> bool {
+    plain_type(path).is_some_and(|kind| kind.is_dir() && !kind.is_symlink())
+}
+
+/// Whether `path` is a plain file, read as it is rather than through a link.
+fn plain_file(path: &Path) -> bool {
+    plain_type(path).is_some_and(|kind| kind.is_file() && !kind.is_symlink())
+}
+
+/// Whether `path` is a link or a junction, read as it is, so what one leads to is never taken for it.
+fn linked(path: &Path) -> bool {
+    plain_type(path).is_some_and(|kind| kind.is_symlink())
+}
+
+/// The kind of file `path` is, read as it is ([`fs::symlink_metadata`]); `None` when it cannot be read at all.
+fn plain_type(path: &Path) -> Option<fs::FileType> {
+    fs::symlink_metadata(path).ok().map(|metadata| metadata.file_type())
+}
+
+/// The reason a link or a junction at `path`, found where the program `exe` would be run from, is left out, in the
+/// shape the probe's other reasons take.
+fn linked_reason(exe: &Path, path: &Path) -> String {
+    format!(
+        "cannot run {}: {} is a link or a junction",
+        escaped(&exe.to_string_lossy()),
+        escaped(&path.to_string_lossy())
+    )
+}
+
+/// What a Godot install's `--version` output found: the version the first line of its standard output leads with, or
+/// why it gave none.
+fn read_godot(output: &ProgramOutput) -> Probed {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    godot_version(&stdout).map_or_else(|| Probed::Skipped(godot_gave_no_version(&stdout)), Probed::Version)
+}
+
+/// The version a Godot install's standard output `stdout` gives: the leading dot-separated runs of ASCII digits of its
+/// first line, trimmed, as Godot writes it (`4.7.2.stable.mono.official.abc`). Three runs are taken as they are, and
+/// two are given a `.0`, which Godot leaves out of a zero patch (`4.3.stable.mono.official.77dcf97d8` is `4.3.0`).
+/// `None` for any other shape, an output with no line among them.
+fn godot_version(stdout: &str) -> Option<String> {
+    let line = stdout.lines().next().unwrap_or("").trim();
+    match godot_leading(line)?.as_slice() {
+        [major, minor] => Some(format!("{major}.{minor}.0")),
+        [major, minor, patch] => Some(format!("{major}.{minor}.{patch}")),
+        _ => None,
+    }
+}
+
+/// The leading dot-separated runs of ASCII digits `line` spells, with a trailing `.` dropped: `None` when it does not
+/// start with a digit, one of the runs is empty, or one has more than [`MAX_PART_DIGITS`] digits.
+fn godot_leading(line: &str) -> Option<Vec<&str>> {
+    let end = line
+        .find(|character: char| !character.is_ascii_digit() && character != '.')
+        .unwrap_or(line.len());
+    let runs: Vec<&str> = line[..end].trim_end_matches('.').split('.').collect();
+    let part = |run: &&str| !run.is_empty() && run.len() <= MAX_PART_DIGITS && run.bytes().all(|byte| byte.is_ascii_digit());
+    runs.iter().all(part).then_some(runs)
+}
+
+/// Why a Godot install whose standard output was `stdout` gave no version: the first line it wrote, cut to
+/// [`GODOT_ANSWER_MAX`] characters with `…` after when it is longer, escaped.
+fn godot_gave_no_version(stdout: &str) -> String {
+    format!("{GODOT} --version gave no version: {}", escaped(&godot_answered(stdout)))
+}
+
+/// The first line of a Godot install's standard output, trimmed and cut to [`GODOT_ANSWER_MAX`] characters, with `…`
+/// after when it is longer.
+fn godot_answered(stdout: &str) -> String {
+    let line = stdout.lines().next().unwrap_or("").trim();
+    let mut cut: String = line.chars().take(GODOT_ANSWER_MAX).collect();
+    if cut.len() < line.len() {
+        cut.push('…');
+    }
+    cut
 }
 
 /// The reason a probe whose thread panicked with `panic` is skipped for, its message when it has one.
@@ -210,6 +427,26 @@ fn dotted(text: &str) -> Option<Vec<&str>> {
     (parts.len() >= 2).then_some(parts)
 }
 
+/// The versions `versions` names, deduplicated and ordered by number, joined by `,`.
+fn version_list(versions: &[String]) -> String {
+    let mut ordered: Vec<&String> = versions.iter().collect();
+    ordered.sort_by(|left, right| by_number(left, right));
+    ordered.dedup();
+    ordered.iter().map(|version| version.as_str()).collect::<Vec<&str>>().join(",")
+}
+
+/// How the versions `a` and `b` order by number: part by part, a run of digits compared as the number it spells, and
+/// a version with more parts the larger one.
+fn by_number(a: &str, b: &str) -> Ordering {
+    a.split('.').map(number).cmp(b.split('.').map(number))
+}
+
+/// A run of digits as it orders: its digits with the leading zeros dropped, so a longer run is the larger number.
+fn number(run: &str) -> (usize, &str) {
+    let held = run.trim_start_matches('0');
+    (held.len(), held)
+}
+
 /// The line the preflight says for the tool `name`, as its probe found it: `gate: remote tool <name> <version>`,
 /// `present`, `missing` or `skipped: <why>`, the name and the reason escaped, as either may come from outside.
 pub(crate) fn tool_line(name: &str, probed: &Probed) -> String {
@@ -224,10 +461,20 @@ pub(crate) fn tool_line(name: &str, probed: &Probed) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::ffi::{OsStr, OsString};
+    use std::fs;
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::process::ExitStatusExt;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
-    use super::{Probed, first_version, late_reason, panic_reason, probe, tool_line, version_of};
+    use super::GODOT;
+    use super::{
+        Candidate, Probed, first_version, godot_candidates, godot_gave_no_version, godot_version, late_reason, panic_reason, probe, read_godot,
+        tool_line, version_list, version_of,
+    };
     use crate::environment::Variables;
+    use crate::remote::git::ProgramOutput;
 
     #[test]
     fn the_version_is_the_first_dotted_number_after_an_optional_v() {
@@ -337,27 +584,179 @@ mod tests {
     }
 
     #[test]
-    fn a_name_the_table_does_not_know_or_cannot_probe_runs_nothing() {
-        let names = ["nodejs".to_owned(), "godot".to_owned(), "Node".to_owned()];
+    fn a_name_the_table_does_not_know_runs_nothing() {
+        let names = ["nodejs".to_owned(), "Node".to_owned()];
         assert_eq!(
-            probe(&names, Duration::from_secs(1), Ok(Variables::from_process()), None),
+            probe(&names, Duration::from_secs(1), Ok(Variables::from_process()), &[]),
             [
                 ("nodejs".to_owned(), Probed::Skipped("unknown tool".to_owned())),
-                ("godot".to_owned(), Probed::Skipped("no probe for godot".to_owned())),
                 ("Node".to_owned(), Probed::Skipped("unknown tool".to_owned())),
             ]
         );
     }
 
+    /// The godot probe is given a root of its own here, holding one entry: a listing its first entry comes to with no
+    /// time left says the batch's own reason, as a probe that runs a program does.
     #[test]
+    #[expect(clippy::expect_used, reason = "a test whose root cannot be made must fail loudly")]
     fn a_batch_with_no_time_left_runs_nothing_and_says_so() {
-        let names = ["node".to_owned(), "rust".to_owned()];
+        let names = ["node".to_owned(), "rust".to_owned(), "godot".to_owned()];
+        let root = unit_root("no-time");
+        fs::create_dir_all(root.join("4.7.2")).expect("the root's one entry can be made");
+        let root = root.to_string_lossy().into_owned();
         assert_eq!(
-            probe(&names, Duration::ZERO, Ok(Variables::from_process()), None),
+            probe(&names, Duration::ZERO, Ok(Variables::from_process().with("GATE_GODOT_ROOT", &root)), &[]),
             [
                 ("node".to_owned(), Probed::Skipped("no answer in 0 s".to_owned())),
                 ("rust".to_owned(), Probed::Skipped("no answer in 0 s".to_owned())),
+                ("godot".to_owned(), Probed::Skipped("no answer in 0 s".to_owned())),
             ]
         );
+        fs::remove_dir_all(&root).expect("the test's root can be removed");
+    }
+
+    #[test]
+    fn the_version_a_godot_install_answers_with_is_the_number_its_line_leads_with() {
+        for (output, version) in [
+            ("4.7.2.stable.mono.official.abc\n", "4.7.2"),
+            ("4.3.stable.mono.official.77dcf97d8\n", "4.3.0"),
+            ("  4.7.2.stable.mono.official.abc  \r\nsecond line\r\n", "4.7.2"),
+            ("4.7.2\n", "4.7.2"),
+            ("4.7\n", "4.7.0"),
+        ] {
+            assert_eq!(godot_version(output).as_deref(), Some(version), "{output:?}");
+        }
+    }
+
+    #[test]
+    fn a_godot_output_whose_first_line_leads_with_no_version_has_none() {
+        for output in [
+            "",
+            "\n4.7.2.stable.mono.official.abc\n",
+            "hello\n",
+            "Godot 4.7.2.stable.mono.official.abc\n",
+            "4\n",
+            "4.7.2.1.stable\n",
+            "4.dev.stable\n",
+        ] {
+            assert_eq!(godot_version(output), None, "{output:?}");
+        }
+    }
+
+    #[test]
+    fn the_godot_list_is_deduplicated_and_ordered_by_number() {
+        assert_eq!(version_list(&[]), "");
+        assert_eq!(version_list(&["4.7.2".to_owned()]), "4.7.2");
+        assert_eq!(version_list(&["4.7.2".to_owned(), "4.10.0".to_owned()]), "4.7.2,4.10.0");
+        assert_eq!(version_list(&["4.7.2".to_owned(), "4.3.0".to_owned(), "4.7.2".to_owned()]), "4.3.0,4.7.2");
+    }
+
+    #[test]
+    fn a_godot_version_part_of_more_than_ten_digits_is_no_version() {
+        for output in ["12345678901.2.stable\n", "4.12345678901.stable\n", "4.7.12345678901.stable\n"] {
+            assert_eq!(godot_version(output), None, "{output:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_answer_is_cut_for_the_no_version_reason() {
+        assert_eq!(
+            godot_gave_no_version(&format!("{}\nsecond line\n", "x".repeat(300))),
+            format!("Godot_console.exe --version gave no version: {}…", "x".repeat(200))
+        );
+        assert_eq!(
+            godot_gave_no_version(&"y".repeat(200)),
+            format!("Godot_console.exe --version gave no version: {}", "y".repeat(200)),
+            "a line of exactly 200 characters is not cut"
+        );
+    }
+
+    #[test]
+    fn a_root_that_is_no_drive_path_is_skipped_with_its_path() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        for root in ["godot", r"\\server\share\godot", r"\\?\C:\godot", "/godot"] {
+            assert_eq!(
+                godot_candidates(Some(OsStr::new(root)), deadline, Duration::from_secs(10)),
+                Err(format!("GATE_GODOT_ROOT {root} is not an absolute path on a drive")),
+                "{root}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_install_answering_with_a_version_is_read_whatever_its_exit_status() {
+        let output = ProgramOutput {
+            status: ExitStatusExt::from_raw(3),
+            stdout: b"4.7.2.stable.mono.official.abc\n".to_vec(),
+            stderr: Vec::new(),
+        };
+
+        assert_eq!(read_godot(&output), Probed::Version("4.7.2".to_owned()));
+    }
+
+    /// The reason a root that is no absolute path on a drive is refused for escapes the root it names.
+    #[test]
+    fn the_drive_reason_escapes_the_root_it_names() {
+        assert_eq!(
+            godot_candidates(
+                Some(OsStr::new("C:\\godot\u{7}")),
+                Instant::now() + Duration::from_secs(1),
+                Duration::from_secs(10)
+            ),
+            Err(r"GATE_GODOT_ROOT C:\godot\u{7} is not an absolute path on a drive".to_owned())
+        );
+    }
+
+    /// A root of a test's own in the tests' temp folder, made and empty.
+    #[expect(clippy::expect_used, reason = "a test whose root cannot be made must fail loudly")]
+    fn unit_root(name: &str) -> PathBuf {
+        let root = crate::test_support::temp_dir().join(format!("gate-godot-{name}-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("the test's root can be made");
+        root
+    }
+
+    /// Only the first sixty-four subfolders are read: which one the cap leaves out is the folder's own order, so the
+    /// count is what a case can hold.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test whose install folders cannot be made must fail loudly")]
+    fn only_the_first_sixty_four_godot_subfolders_are_read() {
+        let root = unit_root("cap");
+        for at in 0..65 {
+            let folder = root.join(format!("s{at:02}"));
+            fs::create_dir_all(&folder).expect("an install folder can be made");
+            fs::write(folder.join(GODOT), b"").expect("a file named as the program can be written");
+        }
+
+        let candidates =
+            godot_candidates(Some(root.as_os_str()), Instant::now() + Duration::from_secs(60), Duration::from_secs(10)).expect("the root reads");
+        let installed: Vec<&str> = candidates
+            .iter()
+            .filter_map(|candidate| match candidate {
+                Candidate::Install(install) => Some(install.as_str()),
+                Candidate::Skipped(_) => None,
+            })
+            .collect();
+
+        assert_eq!(installed.len(), 64, "only the first sixty-four are read: {installed:?}");
+        fs::remove_dir_all(&root).expect("the test's root can be removed");
+    }
+
+    /// A subfolder whose name is no Unicode is left out, and the plain one beside it still lists.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test whose folders cannot be made must fail loudly")]
+    fn a_godot_subfolder_whose_name_is_no_unicode_is_left_out() {
+        let root = unit_root("unicode");
+        let odd = root.join(OsString::from_wide(&[0xD800]));
+        fs::create_dir_all(&odd).expect("a folder with a lone surrogate in its name can be made");
+        fs::write(odd.join(GODOT), b"").expect("a file named as the program can be written");
+        let plain = root.join("4.7.2");
+        fs::create_dir_all(&plain).expect("an install folder can be made");
+        fs::write(plain.join(GODOT), b"").expect("a file named as the program can be written");
+
+        let candidates =
+            godot_candidates(Some(root.as_os_str()), Instant::now() + Duration::from_secs(60), Duration::from_secs(10)).expect("the root reads");
+
+        assert_eq!(candidates, [Candidate::Install(plain.join(GODOT).to_string_lossy().into_owned())]);
+        fs::remove_dir_all(&root).expect("the test's root can be removed");
     }
 }

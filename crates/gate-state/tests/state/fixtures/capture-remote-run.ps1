@@ -17,10 +17,10 @@ since this process opens the scratch root's critical mutex before the refusal; a
 matches no pattern.
 
 The second pass routes through the Rust client over the local transport (--test-remote-transport local:<builder>), each
-ssh call made through fake-ssh, for the refusals the client makes itself: unreachable (two banner drops), rebooted (a
-dropped run call and a later boot time), tools (a failing dotnet restoring the tool manifest on the builder), parity (a
-global.json pin the builder's SDK list lacks), busy (the builder's work-folder lock held by this process) and version
-(a builder that says another gate version).
+ssh call made through fake-ssh, for the refusals the client makes itself: unreachable (a preflight dropped before the
+banner and its three retries), rebooted (a dropped run call and a later boot time), tools (a failing dotnet restoring
+the tool manifest on the builder), parity (a global.json pin the builder's SDK list lacks), busy (the builder's
+work-folder lock held by this process) and version (a builder that says another gate version).
 
 The script checks each gate's exit status, that each refused gate journals fallback with its reason, that the parent
 gate journals parent and that the other gates journal none, and only then writes the journal as the fixture: LF, the
@@ -324,8 +324,9 @@ $client = @('--test-remote-transport', "local:$builder", '--test-remote-ssh', $f
 $lost = $client + @('--test-remote-bound-ms', '600000')
 $sshVariables = { param([string]$Name, [string[]]$Steps) @{ GATE_FAKE_SSH_STEPS = (Write-Step -Name "$Name.steps" -Steps $Steps); GATE_FAKE_SSH_GATE = $gate } }
 
+# The preflight's call and each of its retries are dropped before the banner, so it falls back unreachable.
 Invoke-Gate -Name 'client-unreachable' -Seams $client -Command $tool -Expected 0 -Reason 'unreachable' `
-    -Variables (& $sshVariables 'unreachable' @('fail-banner', 'fail-banner'))
+    -Variables (& $sshVariables 'unreachable' @('fail-banner', 'fail-banner', 'fail-banner', 'fail-banner'))
 
 $rebootedSteps = @('boot 2026-10-10T08:00:00.0000000Z', 'drop', 'ok', 'boot 2026-10-10T08:01:00.0000000Z')
 Invoke-Gate -Name 'client-rebooted' -Seams $lost -Command $tool -Expected 0 -Reason 'rebooted' `

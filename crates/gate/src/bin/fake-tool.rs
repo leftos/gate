@@ -38,7 +38,10 @@
 //! `owner other`, and its default DACL as `dacl <sid>:0x<mask> …`, each entry's SID in its string form and the access
 //! mask it allows in hex, in the DACL's order (`dacl null` for a null DACL), and how it holds the NETWORK group as
 //! `network absent`, `network enabled`, `network deny-only` or `network disabled`;
-//! `argv` prints every word after it, each on its own line, and ends, so it is always the last step.
+//! `argv` prints every word after it, each on its own line, and ends, so it is always the last step;
+//! `--version` adds the line `run` to the file `ran` beside this program's own file, then prints the first line of the
+//! file `version.txt` beside it, and nothing when there is no such file, so a copy named `Godot_console.exe` stands in
+//! for a Godot install a case can tell the running of from what it answers.
 //! With no `exit` step it exits 0. For example `fake-tool out hi err oops exit 3`.
 
 #![expect(
@@ -49,7 +52,7 @@
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::windows::process::CommandExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -165,6 +168,7 @@ fn run(args: &[OsString]) -> Result<i32, String> {
             }
             "noise" => noise(&mut steps)?,
             "free-console" => free_console()?,
+            "--version" => version_beside(&mut stdout)?,
             "pid" => {
                 writeln!(stdout, "pid {}", std::process::id()).map_err(|error| write_failed(&error))?;
                 stdout.flush().map_err(|error| write_failed(&error))?;
@@ -543,6 +547,33 @@ fn free_console() -> Result<(), String> {
         return Err(format!("cannot leave the console: {}", io::Error::last_os_error()));
     }
     Ok(())
+}
+
+/// The `--version` step: adds the line `run` to the file `ran` beside this program's own file, then prints the first
+/// line of the file `version.txt` beside it, and nothing when there is no `version.txt`, so a copy named
+/// `Godot_console.exe` answers a probe as a Godot install of the version a case chose does.
+fn version_beside(stdout: &mut impl Write) -> Result<(), String> {
+    let folder = own_folder()?;
+    mark(&folder.join("ran").to_string_lossy())?;
+    let version = folder.join("version.txt");
+    let text = match std::fs::read_to_string(&version) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot read {}: {error}", version.display())),
+    };
+    if let Some(line) = text.lines().next() {
+        writeln!(stdout, "{line}").map_err(|error| write_failed(&error))?;
+    }
+    Ok(())
+}
+
+/// This program's own folder, or why it has none.
+fn own_folder() -> Result<PathBuf, String> {
+    let program = std::env::current_exe().map_err(|error| format!("cannot find this program: {error}"))?;
+    program
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| format!("{} has no folder", program.display()))
 }
 
 /// The value of the variable `name`, or the line saying it is not set.

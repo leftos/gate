@@ -1,5 +1,6 @@
 //! Where a run's command runs: the facts [`gate_router::decide`] asks for, read from the routing file, git and the
-//! drive table, and the lines its decision says. git runs on the run thread, before any command is started.
+//! drive table, then, for a command that would still route, the judgement of its work folder's warm-up
+//! ([`gate_router::warm::judge`]), and the lines they say. git runs on the run thread, before any command is started.
 
 use std::cell::RefCell;
 use std::ffi::OsStr;
@@ -7,10 +8,13 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use gate_args::{RunRequest, Slot};
-use gate_router::{Config, ConfigProblem, Facts, FolderId, Inputs, LocalReason, Place, Route, SiblingFolder, decide};
+use gate_args::{RunRequest, Slot, TestSeams};
+use gate_desktop::version::build_version;
+use gate_router::warm::{FileRead, Judgement, RecordRead, Situation, failed_line, judge, lock_problem_line, unwarmed_line, warming_line};
+use gate_router::{Config, ConfigProblem, Facts, FolderId, Inputs, LocalReason, Place, RemoteRun, Route, SiblingFolder, decide};
+use gate_state::v1;
 use gate_win32::Share;
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -18,7 +22,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use crate::console::Console;
 use crate::remote::{git, siblings};
-use crate::resolve::Environment;
+use crate::resolve::{Environment, ResolvedRoot};
+use crate::warm;
 
 /// The `notRouted` value of a heavy gate its caller kept here with `--local`.
 const LOCAL_FLAG: &str = "--local";
@@ -63,11 +68,21 @@ impl Placed {
     }
 }
 
+/// Where a run's command runs ([`route`]), what the decision learnt of the gate's place in its git worktree, and the
+/// hash of the warm-up file the routed run's work folder must be warm with, when the warm-up asks one.
+pub(crate) struct Decided {
+    pub route: Route,
+    pub placed: Placed,
+    pub warm_hash: Option<String>,
+}
+
 /// Decides where `request`'s command runs and says the decision's lines, on stderr and in the log: why a command runs
 /// here when there is a reason to say, or the lines of a routed run. A command that would route but has a word that is
-/// not valid Unicode runs here, saying so. A gate under a `covering_parent`'s slot runs here, saying nothing. With the
-/// route, what the decision learnt of the gate's place in its git worktree.
-pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_parent: bool, console: &mut Console) -> (Route, Placed) {
+/// not valid Unicode runs here, saying so. A command that would still route then has its work folder's warm-up judged
+/// against the state root `root` ([`warmed`]). A gate under a `covering_parent`'s slot runs here, saying nothing. With
+/// the route, what the decision learnt of the gate's place in its git worktree, and the hash of the warm-up file the
+/// routed run's work folder must be warm with, when the warm-up asks one.
+pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_parent: bool, root: &ResolvedRoot, console: &mut Console) -> Decided {
     let words: Vec<String> = request.command.iter().map(|word| word.to_string_lossy().into_owned()).collect();
     let unicode = request.command.iter().all(|word| word.to_str().is_some());
     let inputs = Inputs {
@@ -77,13 +92,7 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
         git_hook: environment.git_index_file.as_deref().is_some_and(|value| !value.is_empty()),
         words: &words,
     };
-    let machine = Machine {
-        folder: std::env::current_dir(),
-        local_app_data: environment.local_app_data.as_deref(),
-        git_limit: git::limit(&request.test_seams),
-        git_drain: git::drain(&request.test_seams),
-        found: RefCell::new(Placed::NotAsked),
-    };
+    let machine = Machine::new(environment, &request.test_seams);
     let route = match decide(&inputs, &machine) {
         Route::Routed(_) if !unicode => Route::Local {
             reason: Some(LocalReason::Failed {
@@ -92,12 +101,79 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
         },
         route => route,
     };
+    let (route, warm_hash) = match route {
+        Route::Routed(remote) => warmed(remote, &machine, root, console),
+        local @ Route::Local { .. } => (local, None),
+    };
     match &route {
         Route::Local { reason: Some(reason) } => console.err(&reason.line()),
         Route::Local { reason: None } => {}
         Route::Routed(run) => run.lines().iter().for_each(|line| console.err(line)),
     }
-    (route, machine.found.into_inner())
+    Decided {
+        route,
+        placed: machine.found.into_inner(),
+        warm_hash,
+    }
+}
+
+/// Whether the warm-up lock at `lock` is held ([`warm::lock_held`]); else the line of a lock that cannot be probed.
+fn probed_lock(lock: &Path) -> Result<bool, String> {
+    warm::lock_held(lock).map_err(|error| lock_problem_line(&lock.to_string_lossy(), &error.to_string()))
+}
+
+/// The route of `remote`, a command that would otherwise route, once its work folder's warm-up is judged
+/// ([`gate_router::warm::judge`]): routed as it was, with the warm-up file's hash when the work folder is warm for it
+/// or with none when the repo has no consent or no warm-up file; else here, the judgement's line said.
+fn warmed(remote: Box<RemoteRun>, machine: &Machine<'_>, root: &ResolvedRoot, console: &mut Console) -> (Route, Option<String>) {
+    let (judgement, hash) = judged(&remote, machine, root);
+    let line = match judgement {
+        Judgement::Route => return (Route::Routed(remote), None),
+        Judgement::Ready => return (Route::Routed(remote), hash),
+        Judgement::Warming { host } => warming_line(&host),
+        Judgement::Start => unwarmed_line(&remote.host),
+        Judgement::Failed { minutes_ago, reason } => failed_line(minutes_ago, &reason),
+        Judgement::Problem(line) => line,
+    };
+    console.err(&line);
+    (Route::Local { reason: None }, None)
+}
+
+/// The judgement of `remote`'s work folder's warm-up, with the hash of the warm-up file when one parsed. Consent is
+/// read from the routing file the decision read, not read again; without it nothing more is read, and without a file that parsed neither the record nor the
+/// lock is: the lock is probed, never taken, and the record read, each in the state root `root`. A lock that cannot be
+/// probed keeps the run here with its line.
+fn judged(remote: &RemoteRun, machine: &Machine<'_>, root: &ResolvedRoot) -> (Judgement, Option<String>) {
+    let consented = machine
+        .config
+        .borrow()
+        .as_ref()
+        .is_some_and(|config| config.warmup_consented(&remote.repo) == Ok(true));
+    if !consented {
+        return (Judgement::Route, None);
+    }
+    let file = warm::read_warmup_file(Path::new(&remote.root));
+    let gate = build_version();
+    let judge_with = |record: &RecordRead, lock_held: bool| {
+        judge(&Situation {
+            consented,
+            file: &file,
+            record,
+            lock_held,
+            host: &remote.host,
+            gate: &gate,
+            now: SystemTime::now(),
+        })
+    };
+    let FileRead::Parsed { hash, .. } = &file else {
+        return (judge_with(&RecordRead::Absent, false), None);
+    };
+    let lock_held = match probed_lock(&v1::warm_lock_path(&root.path, &remote.key)) {
+        Ok(held) => held,
+        Err(line) => return (Judgement::Problem(line), None),
+    };
+    let record = warm::read_warm_record(&v1::warm_record_path(&root.path, &remote.key));
+    (judge_with(&record, lock_held), Some(hash.clone()))
 }
 
 /// The queue line's `notRouted`: `--local` for a heavy gate its caller kept here with `--local`, else none.
@@ -147,17 +223,31 @@ pub(crate) fn remote_json_path(local_app_data: Option<&OsStr>) -> Option<PathBuf
 /// This machine's facts: the gate's working folder, or why it cannot be read, the LOCALAPPDATA folder that holds the
 /// routing file, how long each of the decision's git calls may take, how long its readers get once git has exited, and
 /// what git said of the gate's place when the decision asked.
-struct Machine<'a> {
+pub(crate) struct Machine<'a> {
     folder: io::Result<PathBuf>,
     local_app_data: Option<&'a OsStr>,
     git_limit: Duration,
     git_drain: Duration,
     found: RefCell<Placed>,
+    /// The routing file the decision read, when it read one: the warm-up's judgement reads its consent from this.
+    config: RefCell<Option<Config>>,
 }
 
-impl Machine<'_> {
+impl<'a> Machine<'a> {
+    /// The facts of the gate's working folder now, with `environment`'s LOCALAPPDATA and the git limits `seams` set.
+    pub(crate) fn new(environment: &'a Environment, seams: &TestSeams) -> Machine<'a> {
+        Machine {
+            folder: std::env::current_dir(),
+            local_app_data: environment.local_app_data.as_deref(),
+            git_limit: git::limit(seams),
+            git_drain: git::drain(seams),
+            found: RefCell::new(Placed::NotAsked),
+            config: RefCell::new(None),
+        }
+    }
+
     /// The decision's git call in `folder` with `args`, under the decision's limit and drain.
-    fn git_call<'a>(&self, folder: &'a Path, args: &'a [&'a str]) -> git::Call<'a> {
+    fn git_call<'b>(&self, folder: &'b Path, args: &'b [&'b str]) -> git::Call<'b> {
         git::Call {
             drain: self.git_drain,
             ..git::Call::plain(folder, args, self.git_limit)
@@ -166,9 +256,14 @@ impl Machine<'_> {
 }
 
 impl Facts for Machine<'_> {
-    /// `<LOCALAPPDATA>\gate\remote.json`; with LOCALAPPDATA unset, empty or relative there is no routing file.
+    /// `<LOCALAPPDATA>\gate\remote.json`; with LOCALAPPDATA unset, empty or relative there is no routing file. A file
+    /// that reads is kept for the warm-up's judgement, so the route reads it once.
     fn config(&self) -> Result<Option<Config>, ConfigProblem> {
-        remote_json_path(self.local_app_data).map_or(Ok(None), |path| read_remote_json(&path))
+        let config = remote_json_path(self.local_app_data).map_or(Ok(None), |path| read_remote_json(&path));
+        if let Ok(Some(read)) = &config {
+            self.config.replace(Some(read.clone()));
+        }
+        config
     }
 
     fn place(&self) -> Result<Option<Place>, String> {
@@ -496,7 +591,7 @@ mod tests {
 
     use super::{
         GATE_FILE_NOT_A_FILE, SIBLING_GIT_LINK, SIBLING_LINK, SIBLING_NOT_A_FOLDER, holds_existing_path, not_routed, parse_head, parse_place,
-        read_siblings, sibling_folder,
+        probed_lock, read_siblings, sibling_folder,
     };
     use crate::test_support::junction;
 
@@ -661,6 +756,27 @@ mod tests {
             Ok(SiblingFolder::Missing),
             "a parent that is not there"
         );
+    }
+
+    #[test]
+    fn a_lock_that_is_a_folder_or_a_junction_is_a_lock_problem() {
+        let folder: PathBuf = crate::test_support::temp_dir().join(format!("gate-route-lock-{}", std::process::id()));
+        if folder.exists() {
+            fs::remove_dir_all(&folder).expect("a folder left by an earlier run can be removed");
+        }
+        let _removed = Removed(vec![folder.clone()]);
+        let target = folder.join("target");
+        fs::create_dir_all(&target).expect("the junction's target can be made");
+        let made = folder.join("folder.lock");
+        fs::create_dir(&made).expect("a folder named like the lock can be made");
+        let linked = folder.join("linked.lock");
+        junction(&linked, &target);
+        for lock in [made, linked] {
+            let line = probed_lock(&lock).expect_err("a folder or a junction is no lock");
+            let start = format!("gate: not routed: the warm-up lock {} cannot be read: ", lock.to_string_lossy());
+            assert!(line.starts_with(&start), "{line}");
+        }
+        assert_eq!(probed_lock(&folder.join("missing.lock")), Ok(false), "a missing lock is free");
     }
 
     #[test]

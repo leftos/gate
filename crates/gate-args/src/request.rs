@@ -12,10 +12,6 @@ pub const DEFAULT_TAIL_LINES: u64 = 20;
 
 /// What the gate was asked to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "one invocation is read once a process and moved once; boxing the run request would save nothing"
-)]
 pub enum Invocation {
     /// `gate --version`.
     Version,
@@ -35,6 +31,8 @@ pub enum Invocation {
     Burn(BurnRequest),
     /// `gate expect`.
     Expect(ExpectRequest),
+    /// `gate warm`.
+    Warm(WarmRequest),
     /// The hidden `gate box <verb> --stdin`.
     Box(BoxRequest),
 }
@@ -316,6 +314,9 @@ pub struct TestSeams {
     /// Let a process in the command's job create one outside it (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`), so a case can stand
     /// a process that left the job in for a packaged app the command's descendant starts.
     pub job_breakaway: bool,
+    /// How long `gate warm` waits for the key mutex and for the warm-up cap each, in milliseconds, in place of the
+    /// warm-up file's ceiling.
+    pub warm_wait_ms: Option<u64>,
 }
 
 /// A run's ceiling as the caller gave it, in whole seconds.
@@ -430,6 +431,20 @@ pub struct CheckSeams {
     pub remote_ssh: Option<PathBuf>,
     /// How long the builder check's call may take, in milliseconds, in place of 120 s (`--test-remote-timeout-ms`).
     pub remote_timeout_ms: Option<u64>,
+}
+
+/// A valid `gate warm`, which takes no words: the folder to warm from, whether it runs in the background, the state
+/// root, and the hidden seams the black-box suite gives it. The commands come only from the warm-up file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WarmRequest {
+    /// `--cd` as given: a folder of the worktree to warm; a relative path is read against the working directory.
+    pub cd: Option<PathBuf>,
+    /// `--background`: say nothing of a warm-up that does not start, and exit 0 for it.
+    pub background: bool,
+    /// `--state-dir` as given.
+    pub state_dir: Option<PathBuf>,
+    /// The remote client's seams, as a routed run's, and the warm-up's own wait.
+    pub test_seams: TestSeams,
 }
 
 /// A valid `gate burn`: the threads to spin, `None` for the machine's logical processors, and how many seconds to spin

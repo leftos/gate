@@ -26,7 +26,11 @@ These replace the matching items in GATE-347's earlier orchestrator decision.
 ## Invariants
 
 - **I1. At most one warm-up per key at a time**, across sessions on this PC and across PCs on the builder. Enforced in this order: the warm lock, the key mutex (bounded wait, a new waiting variant of `hold_key`, `remote/client.rs:216-224`), the cap, then the box's `{Work}.lock` (`take_lock` in `boxside/run.rs`'s `run`). This never inverts a routed run's order (key mutex → remote slot → worktree locks → box lock).
-- **I2. A stale `warming` record never keeps runs local longer than the warming process's own bounded life.** That life is bounded by the key mutex wait, the git limits, the client watchdog limits, and a self-deadline of 5× the warm-up ceiling plus slack. The warming process retries its own lock open for about 200 ms, to ride out a route's probe.
+- **I2. A stale `warming` record never keeps runs local longer than the warming process's own bounded life.** That life is bounded by the key mutex wait, the git limits, the client watchdog limits, and the client's own backstop on the run call.
+
+  In `warm.rs` the key mutex wait and the cap wait are each one ceiling, and the run call's backstop is five ceilings and 60 s, so the whole life is bounded by about 7× the warm-up ceiling plus 60 s and the git limits; there is no separate self-deadline.
+
+  The warming process retries its own lock open for about 200 ms, to ride out a route's probe.
 - **I3. A `warm` PC record means the box wrote a matching `{Work}.warm` for that host after the commands passed, and a run routes only if the box's `.warm` still matches at its preflight.** The box preflight says `gate: remote warm <hash|none>` (`warm_state` in `boxside/preflight.rs`), read before `ready()`. The client compares it after the version check (`client.rs:1188-1191`) and before parity and push. A mismatch ends `Refused(FallbackReason::Cold)`, a new reason in `gate-state/src/journal_writer.rs`. On `cold`, the run deletes the PC record while still holding the key mutex, then starts a warm-up.
 - **I4. `{Work}.warm` never outlives the folder state it describes.** `lay_out` deletes it before writing `changing` (beside `.inputs`, in `lay_out` of `boxside/run.rs`), and also when the work folder has to be created. A warm-up deletes it under the lock before its first command. The preflight says `none` when the folder or the main tree's `.git` is missing, and for anything that is not exactly one 64-hex hash, including a read that collides with a write.
 - **I5. A run never routes on a record whose host is not `remote.json`'s current host, or whose hash is not that of the file on disk now.** One hash function (SHA-256 of the raw bytes, BOM included) is shared by the route and the warm-up. The warm-up reads the file once, late, and uses those same bytes for the commands, `WarmHash` and the record.
@@ -64,8 +68,8 @@ Each lands on `main` and stays dormant until B5. B1, B2, B3 and B5 touch central
 2. **B2 box side** (`boxside/payload.rs`, `run.rs`, `preflight.rs`, `ceiling.rs`): warm requests, `.warm`, the preflight line, the command loop with one budget and a stop check per command. Conflicts with GATE-304 (`ready()`) and GATE-231 (`preflight.rs`).
 3. **B3 client warm mode and the `cold` refusal** (`remote/mod.rs`, `remote/payload.rs`, `remote/client.rs`). Conflicts with GATE-231 in `client.rs`.
 4. **B4 the `gate warm` verb** (`gate-args` cli, request and usage; `answer.rs`; a new `gate/src/warm.rs`), with a new suite module `warm`.
-5. **B5 the route goes live** (`route.rs`, `run.rs`, with a spawn seam `--test-warm-spawn <file>`). `run.rs` is central.
-6. **B6 the detached launch** (`gate-win32` `create.rs`, `launch.rs`, `piped.rs`, central). Sequenced after GATE-231, which rewrites `create.rs` and `launch.rs`.
+5. **B5 the route goes live** (`route.rs`, `run.rs`). `run.rs` is central. It starts no warm-up: a Start judgement runs here and says `gate warm` warms the folder.
+6. **B6 the detached launch** (`gate-win32` `create.rs`, `launch.rs`, `piped.rs`, central), and the route's start of `gate warm --background` through it, with a spawn seam `--test-warm-spawn <file>` and `starting_line`. Sequenced after GATE-231, which rewrites `create.rs` and `launch.rs`.
 7. **B7 `gate check`** (`check/local.rs`, `check/report.rs`): warm-up file problems, consent shape, record state.
 
 Each brief's docs sweep lands with it:

@@ -24,10 +24,11 @@ use std::sync::{Arc, PoisonError, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use gate_args::BoxSeams;
+use gate_args::{BoxSeams, EnvRefusal, env_refusal, over_cap, repeated_name, shown_name};
 use gate_watchdog::{Kill, Pump};
 use gate_win32::{
     Donor, EnvironmentBlock, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken, Running, Utf8Console,
+    same_variable_name,
 };
 
 use crate::answer::USAGE_STATUS;
@@ -126,6 +127,9 @@ pub(super) struct Request<'a> {
     warm_hash: Option<&'a str>,
     subfolder: &'a str,
     identity: Vec<(String, String)>,
+    /// The caller's variables for the command, `Env`: each a name and a value, set over the box's own environment and
+    /// under the gate's own settings; none when the payload gives none.
+    env: Vec<(String, String)>,
     /// The outputs the run brings back, `None` when it has no output globs.
     outputs: Option<Asked<'a>>,
     /// The run's `Nonce`, which its start marker and its refusal tags name.
@@ -172,6 +176,7 @@ impl Request<'_> {
         }
         let subfolder = payload.optional_text("Subfolder")?;
         let identity = identity(payload)?;
+        let env = caller_env(payload)?;
         let inputs_digest = payload.inputs_digest()?;
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
         let (main, siblings) = repos(payload, work, bare, snapshot)?;
@@ -187,6 +192,7 @@ impl Request<'_> {
             warm_hash: commands.warm_hash,
             subfolder,
             identity,
+            env,
             outputs,
             nonce,
             timeout,
@@ -385,6 +391,50 @@ fn identity(payload: &Payload) -> Result<Vec<(String, String)>, String> {
         }
     }
     Ok(pairs)
+}
+
+/// The payload's `Env`: the caller's variables for the command, each pair a name and a value the gate can set; none when
+/// the key is absent or null. Else the usage line: a list over its cap (`gate_args::MOST_ENV_NAMES`,
+/// `gate_args::MOST_ENV_BYTES`), a name the gate sets itself, a `GATE_` name, a machine path, a name or value no
+/// environment block carries ([`env_refusal`]), or a name given twice, as an ASCII scan and then as Windows reads names.
+///
+/// The cap is read from the raw object before any pair of it is built or checked, so a request holding a hundred thousand
+/// names is refused without one of them being built.
+fn caller_env(payload: &Payload) -> Result<Vec<(String, String)>, String> {
+    let (names, bytes) = payload.pair_size("Env")?.unwrap_or_default();
+    if over_cap(names, bytes) {
+        return Err(EnvRefusal::OverCap.box_line(""));
+    }
+    let pairs = payload.pairs("Env")?;
+    for (name, value) in &pairs {
+        if let Some(refusal) = env_refusal(name, value) {
+            return Err(refusal.box_line(&shown_escaped(name)));
+        }
+    }
+    if let Some(twice) = repeated_name(pairs.iter().map(|(name, _)| name.as_str())).or_else(|| repeated_name_as_windows(&pairs)) {
+        return Err(EnvRefusal::Twice.box_line(&shown_escaped(twice)));
+    }
+    Ok(pairs)
+}
+
+/// The first name of `pairs` an earlier one names as Windows names variables ([`same_variable_name`]), as the later
+/// spelling gives it; `None` when no name is one Windows reads as another. The cap check in [`caller_env`] runs first, so
+/// this pass reads at most `gate_args::MOST_ENV_NAMES` names.
+fn repeated_name_as_windows(pairs: &[(String, String)]) -> Option<&str> {
+    let mut seen: Vec<&str> = Vec::new();
+    for (name, _) in pairs {
+        if seen.iter().any(|set| same_variable_name(OsStr::new(set), OsStr::new(name))) {
+            return Some(name);
+        }
+        seen.push(name);
+    }
+    None
+}
+
+/// The name `name` a refusal line shows: shortened to [`shown_name`]'s limit and escaped as the box escapes a payload
+/// value, so a long or forged name cannot fill or break the line.
+fn shown_escaped(name: &str) -> String {
+    escaped(&shown_name(name))
 }
 
 /// Runs the payload's command in its work folder and returns the status: the command's own whole 32-bit code, 127
@@ -1143,10 +1193,11 @@ pub(super) fn full_path(path: &Path) -> Option<PathBuf> {
 /// nothing; the tool restore and the pnpm install look at it the same way before they run, so such a stop runs neither
 /// ([`crate::boxside::tools`], [`crate::boxside::packages`]). The command starts on a UTF-8 console when it can have one ([`start_command`]), whose
 /// donor lives until the wait for the command is over, however it ends. The heartbeat watches the job while [`watch`]
-/// waits for it. The command's environment is the box's own with the build-server settings of its run set over it
-/// ([`Variables::with_build_servers`]), replacing any value the box inherited: the compiler server's pipe and
-/// `MSBuild`'s node handshake are named by the run id `gate-box-<Nonce>`, so no other run's command, on the box or on
-/// the PC, uses the servers this one starts, and the `MSBuild` server and node reuse are off. Git's `safe.directory` is
+/// waits for it. The command's environment is [`command_variables`]'s: the box's own, with the caller's `Env` pairs set
+/// over it ([`Variables::with_caller`]) and then the build-server settings of its run
+/// ([`Variables::with_build_servers`]), replacing any value the box inherited (the caller can give none of them): the
+/// compiler server's pipe and `MSBuild`'s node handshake are named by the run id `gate-box-<Nonce>`, so no other run's
+/// command, on the box or on the PC, uses the servers this one starts, and the `MSBuild` server and node reuse are off. Git's `safe.directory` is
 /// set to `*` over that ([`with_safe_directory`]), and the Event Log logging provider of a .NET host the command starts
 /// is turned off over that ([`with_event_log_off`]). The command runs with a restricted copy of the box's token
 /// ([`restricted_token`]).
@@ -1225,13 +1276,13 @@ struct Prepared<'w> {
     environment: EnvironmentBlock,
 }
 
-/// Resolves `one`'s program in its place and writes its command line, with the environment [`command`] describes, before
-/// anything holds a job or the builder's desktop for it. `Err` with the run's answer when it cannot start: `Ok` with
-/// 127 for a program not found or one with no shell to run it, its line said; `Err` with 2 for a batch word refused,
-/// or 1 for the box's own failure, its line said.
+/// Resolves `one`'s program in its place and writes its command line, with the environment [`command_variables`]
+/// composes, before anything holds a job or the builder's desktop for it, so a desktop run gets the same environment as
+/// any run. `Err` with the run's answer when it cannot start: `Ok` with 127 for a program not found or one with no
+/// shell to run it, its line said; `Err` with 2 for a batch word refused, or 1 for the box's own failure, its line said.
 fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> Result<Prepared<'w>, Result<Ran, u32>> {
     let run = format!("gate-box-{}", request.nonce);
-    let variables = with_event_log_off(with_safe_directory(Variables::from_process().with_build_servers(&run)));
+    let variables = command_variables(&request.env, &run);
     let environment = variables
         .block()
         .map_err(|error| Err(failed(console, &format!("cannot build the command's environment: {error}"))))?;
@@ -1257,6 +1308,14 @@ fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> 
             environment,
         }),
     }
+}
+
+/// The environment the payload's command is started with: the box's own, with the caller's `Env` pairs `env` set over
+/// it, then the gate's own settings for the run `run` — the build-server settings ([`Variables::with_build_servers`]),
+/// git's `safe.directory` ([`with_safe_directory`]) and the Event Log logging provider off ([`with_event_log_off`]).
+/// The caller's pairs stand before every setting the gate applies, so none of them can undo one.
+fn command_variables(env: &[(String, String)], run: &str) -> Variables {
+    with_event_log_off(with_safe_directory(Variables::from_process().with_caller(env).with_build_servers(run)))
 }
 
 /// The variable that counts the config entries git reads from the environment.
@@ -2429,6 +2488,7 @@ impl BackGit<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::fs::{self, File, OpenOptions};
     use std::io;
     use std::os::windows::fs::OpenOptionsExt;
@@ -2441,7 +2501,7 @@ mod tests {
 
     use super::{
         CLOSED_STATUS, GIT_CONFIG_COUNT, Look, Payload, Request, SHARING_VIOLATION, STARTING_COMMAND, before_the_job, client_gone, command_spent,
-        gap_spent, look, remaining_budget, with_safe_directory, written_retrying,
+        command_variables, gap_spent, look, remaining_budget, with_safe_directory, written_retrying,
     };
     use crate::console::Console;
     use crate::environment::Variables;
@@ -2713,5 +2773,42 @@ mod tests {
             None,
             "a warm-up of the box's own session is read"
         );
+    }
+
+    #[test]
+    fn caller_pairs_never_undo_the_gates_own_settings() {
+        // A payload cannot reach this: the box refuses a name the gate sets. The caller's pairs stand before every
+        // setting the chain applies, so a reordering inside it is what this test would catch.
+        let caller = [
+            ("MSBUILDUSESERVER".to_owned(), "1".to_owned()),
+            ("DOTNET_CLI_USE_MSBUILD_SERVER".to_owned(), "1".to_owned()),
+            ("MSBUILDDISABLENODEREUSE".to_owned(), "0".to_owned()),
+            ("Logging__EventLog__LogLevel__Default".to_owned(), "Warning".to_owned()),
+        ];
+
+        let variables = command_variables(&caller, "gate-box-ab");
+
+        assert_eq!(variables.get("MSBUILDUSESERVER"), Some(OsStr::new("0")), "the gate's value wins");
+        assert_eq!(variables.get("DOTNET_CLI_USE_MSBUILD_SERVER"), Some(OsStr::new("0")));
+        assert_eq!(variables.get("MSBUILDDISABLENODEREUSE"), Some(OsStr::new("1")), "node reuse is off");
+        assert_eq!(variables.get("SharedCompilationId"), Some(OsStr::new("gate-box-ab")), "the run's own id");
+        assert_eq!(variables.get("Logging__EventLog__LogLevel__Default"), Some(OsStr::new("None")));
+    }
+
+    #[test]
+    fn caller_git_config_entries_come_before_the_gates_safe_directory() {
+        // A payload cannot reach this: the box refuses a `GIT_CONFIG_COUNT` a caller gives. An inherited count is what
+        // the box composes over, and the caller's pair stands exactly where an inherited one does.
+        let caller = [("GIT_CONFIG_COUNT".to_owned(), "9".to_owned())];
+
+        let variables = command_variables(&caller, "gate-box-ab");
+
+        assert_eq!(
+            variables.get(GIT_CONFIG_COUNT),
+            Some(OsStr::new("10")),
+            "the gate's entry takes the index after the caller's entries"
+        );
+        assert_eq!(variables.get("GIT_CONFIG_KEY_9"), Some(OsStr::new("safe.directory")));
+        assert_eq!(variables.get("GIT_CONFIG_VALUE_9"), Some(OsStr::new("*")));
     }
 }

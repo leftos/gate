@@ -77,6 +77,7 @@ fn the_control_command_routes_from_the_root() {
             pattern: "dotnet *".to_owned(),
             words: stamped(&["dotnet", "test", "tests/T.csproj"]),
             fallback: command.clone(),
+            program_named: false,
             outputs: words(&["**/bin/**", "**/.godot/mono/temp/bin/**"]),
             inputs: Vec::new(),
             dropped_no_build: false,
@@ -234,6 +235,14 @@ fn no_non_empty_word_or_a_git_or_prek_command_stays_local() {
         let facts = FakeFacts::with_config(routing_all());
         assert_eq!(decide(&heavy(&command), &facts), SILENT, "{command:?}");
         assert_eq!(facts.asked(), ["config"], "{command:?}");
+    }
+    // A path sent as a program's name is read the same way: a `git` or `prek` the rewrite would send stays here, before
+    // any pattern is asked.
+    for command in [[r"C:\x\git.exe.exe", "status"], [r"C:\x\prek.exe.exe", "run"]] {
+        let command = words(&command);
+        let facts = FakeFacts::with_config(routing_all());
+        assert_eq!(decide(&heavy(&command), &facts), SILENT, "{command:?}");
+        assert_eq!(facts.asked(), ["config", "place", "subst_target C"], "{command:?}");
     }
     let command = words(&["gitk", "x"]);
     assert!(matches!(
@@ -1161,8 +1170,8 @@ fn a_dotnet_program_named_by_an_in_worktree_path_still_builds_stamped() {
 }
 
 #[test]
-fn a_dotnet_program_outside_the_worktree_runs_here_with_no_word() {
-    let command = words(&[r"C:\Program Files\dotnet\dotnet.exe", "pack"]);
+fn a_program_path_outside_the_worktree_in_a_later_word_runs_here_with_no_word() {
+    let command = words(&["dotnet", "pack", r"C:\Program Files\dotnet\dotnet.exe"]);
     let facts = FakeFacts::with_config(routing_all());
     let route = decide(&heavy(&command), &facts);
     assert_eq!(
@@ -1170,6 +1179,128 @@ fn a_dotnet_program_outside_the_worktree_runs_here_with_no_word() {
         Some(r"gate: not routed: C:\Program Files\dotnet\dotnet.exe is outside the worktree")
     );
     assert!(!asked_head(&facts), "no word is made for a command that runs here");
+}
+
+#[test]
+fn a_dotnet_program_named_by_a_path_outside_the_worktree_routes_as_dotnet() {
+    let command = words(&[r"C:\Program Files\dotnet\dotnet.exe", "pack"]);
+    let facts = FakeFacts::with_config(routing_all());
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.words, ["dotnet", "pack", stamp().as_str()]);
+    assert!(run.program_named, "the word was sent as a program's name");
+    assert_eq!(run.fallback, command, "the fallback keeps the path the caller gave");
+}
+
+#[test]
+fn a_program_named_by_a_path_outside_matches_a_pattern_on_its_name() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet build *"]}}"#).expect("usable");
+    let command = words(&[r"C:\Program Files\dotnet\dotnet.exe", "build", "X:/dev/yaat.wt/a/src/X.csproj"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.pattern, "dotnet build *", "the pattern reads the program's name");
+    assert_eq!(run.words, ["dotnet", "build", "src/X.csproj", stamp().as_str()]);
+    assert!(run.program_named);
+}
+
+#[test]
+fn a_program_name_the_rewrite_derived_is_no_file_of_the_gate_s_folder() {
+    let derived = FakeFacts {
+        files: words(&["dotnet"]),
+        ..FakeFacts::with_config(routing_all())
+    };
+    let command = words(&[r"C:\Program Files\dotnet\dotnet.exe", "build"]);
+    let run = routed(decide(&heavy(&command), &derived));
+    assert_eq!(
+        run.words[0], "dotnet",
+        "the caller asked for the program outside, not the file here: {:?}",
+        run.words
+    );
+    assert!(
+        !derived.asked().iter().any(|question| question.starts_with("file_in_folder")),
+        "no file of the gate's folder is looked for: {:?}",
+        derived.asked()
+    );
+
+    let bare = FakeFacts {
+        files: words(&["dotnet"]),
+        ..FakeFacts::with_config(routing_all())
+    };
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &bare));
+    assert_eq!(
+        run.words[0], "./dotnet",
+        "a bare word naming a file of the folder is still marked: {:?}",
+        run.words
+    );
+}
+
+#[test]
+fn a_word_sent_as_a_program_s_name_is_said_before_the_run_s_other_lines() {
+    let command = words(&[r"C:\Program Files\dotnet\dotnet.exe", "build"]);
+    let plain = routed(decide(&heavy(&command), &FakeFacts::with_config(routing_all())));
+    assert_eq!(plain.lines(), [r"gate: routed C:\Program Files\dotnet\dotnet.exe as dotnet".to_owned()]);
+
+    let no_build = words(&[r"C:\Program Files\dotnet\dotnet.exe", "test", "--no-build"]);
+    let run = routed(decide(&heavy(&no_build), &FakeFacts::with_config(routing_all())));
+    assert_eq!(
+        run.lines(),
+        [
+            r"gate: routed C:\Program Files\dotnet\dotnet.exe as dotnet".to_owned(),
+            DROPPED_NO_BUILD_LINE.to_owned(),
+            NO_OUTPUTS_LINE.to_owned(),
+        ],
+        "the line comes before the run's other lines"
+    );
+
+    let tabbed = words(&["F:\\tools\\a\tb\\tool.exe", "arg"]);
+    let escaped = routed(decide(&heavy(&tabbed), &FakeFacts::with_config(routing_all())));
+    assert_eq!(
+        escaped.lines(),
+        ["gate: routed F:\\tools\\a\\tb\\tool.exe as tool".to_owned()],
+        "both words are escaped as the run's lines escape words"
+    );
+}
+
+#[test]
+fn an_upper_case_dotnet_program_named_by_a_path_outside_routes_stamped() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet build *"]}}"#).expect("usable");
+    let command = words(&[r"C:\Program Files\dotnet\DOTNET.EXE", "build", "X:/dev/yaat.wt/a/src/X.csproj"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.pattern, "dotnet build *", "the pattern reads the name in any letter case");
+    assert_eq!(run.words, ["DOTNET", "build", "src/X.csproj", stamp().as_str()]);
+    assert!(run.program_named);
+}
+
+#[test]
+fn a_program_named_by_a_path_outside_after_an_empty_word_is_still_no_file_of_the_folder() {
+    let derived = FakeFacts {
+        files: words(&["dotnet"]),
+        ..FakeFacts::with_config(routing_all())
+    };
+    let command = words(&["", r"C:\Program Files\dotnet\dotnet.exe", "build"]);
+    let run = routed(decide(&heavy(&command), &derived));
+    assert_eq!(
+        run.words,
+        ["", "dotnet", "build", stamp().as_str()],
+        "the first non-empty word is the one sent as a program's name"
+    );
+    assert!(run.program_named);
+    assert!(
+        !derived.asked().iter().any(|question| question.starts_with("file_in_folder")),
+        "no file of the gate's folder is looked for: {:?}",
+        derived.asked()
+    );
+}
+
+#[test]
+fn a_subst_drive_into_the_worktree_names_a_file_of_the_folder_not_a_program() {
+    let facts = FakeFacts {
+        files: words(&["x"]),
+        devices: vec![('D', r"\??\X:\dev\yaat.wt\a".to_owned())],
+        ..FakeFacts::with_config(routing_all())
+    };
+    let command = words(&[r"D:\x", "arg"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.words, ["./x", "arg"], "the worktree's own file is marked, never looked up on PATH");
+    assert!(!run.program_named, "the word stayed a path of the worktree");
 }
 
 #[test]

@@ -47,6 +47,7 @@ mod stopping;
 #[cfg(test)]
 mod test_support;
 mod wait;
+mod warm;
 mod watch;
 
 use std::io::{self, Write};

@@ -1,20 +1,20 @@
 //! The Rust remote client, in the phases the PowerShell client runs: the snapshot; the run call built and checked
 //! against the most cmd takes before anything is sent; the preflight and the builder's version; the push and the saved
 //! ref; and the run call, its output passed through to the log and the console. A call that failed before the ssh
-//! banner is made once more, unless the box said the run's start marker. A Ctrl+C ends the attempt between its calls,
-//! during the retry pause, and during any call; one during the run call stops the command on the builder. Each call
-//! goes through the [`Transport`]; every process is created suspended, put in an anonymous job of its own that ends its
-//! whole tree when it is killed, and only then let run. The preflight, the push and the run call run under the run's
-//! watchdog, whose clock starts with the attempt: a call that sends nothing for the stall window, or outlives the run's
-//! ceiling, is killed. A kill before the run call falls back `unreachable`, as the command never started; a kill of the
-//! run call stops the command and ends the run 124. A run call that exits 255 other than a failure before the banner
-//! lost its connection: nothing is synced back and the command is stopped; then, when the preflight said the builder's
-//! boot time, the builder is asked for it again. One that booted more than 30 s later restarted, and the run falls back
-//! `rebooted`; one that gives no boot time, or when either value is no timestamp, falls back `unreachable`; else the
-//! run ends 255. No call holds more than 64 KiB of a line in memory, nor keeps more than a call's last 1,000 lines,
-//! totalling at most 1 MiB: a longer line ends any call but the run call, whose output is passed on whole. The run
-//! takes the work-folder key's lock, [`hold_key`], before its remote slot, so a second routed run of one worktree falls
-//! back `busy` at once.
+//! banner is made again up to three times, for as long as every call fails the same way, unless the box said the run's
+//! start marker. A Ctrl+C ends the attempt between its calls, during the retry pause, and during any call; one during
+//! the run call stops the command on the builder. Each call goes through the [`Transport`]; every process is created
+//! suspended, put in an anonymous job of its own that ends its whole tree when it is killed, and only then let run.
+//! The preflight, the push and the run call run under the run's watchdog, whose clock starts with the attempt: a call
+//! that sends nothing for the stall window, or outlives the run's ceiling, is killed. A kill before the run call falls
+//! back `unreachable`, as the command never started; a kill of the run call stops the command and ends the run 124. A
+//! run call that exits 255 other than a failure before the banner lost its connection: nothing is synced back and the
+//! command is stopped; then, when the preflight said the builder's boot time, the builder is asked for it again. One
+//! that booted more than 30 s later restarted, and the run falls back `rebooted`; one that gives no boot time, or when
+//! either value is no timestamp, falls back `unreachable`; else the run ends 255. No call holds more than 64 KiB of a
+//! line in memory, nor keeps more than a call's last 1,000 lines, totalling at most 1 MiB: a longer line ends any call
+//! but the run call, whose output is passed on whole. The run takes the work-folder key's lock, [`hold_key`], before
+//! its remote slot, so a second routed run of one worktree falls back `busy` at once.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
@@ -30,8 +30,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use gate_args::BoxVerb;
-#[cfg(feature = "test-seams")]
-use gate_args::RunRequest;
 use gate_args::TestSeams;
 use gate_desktop::version::build_version;
 use gate_state::v1::WarmFailure;
@@ -54,7 +52,7 @@ use super::snapshot::{self, Bounded, Place, Snapshot};
 use super::syncback;
 #[cfg(feature = "test-seams")]
 use super::tamper;
-use super::toolchain::{self, Manifest, Reported};
+use super::toolchain::{self, Manifest, Pin, Reported};
 #[cfg(feature = "test-seams")]
 use super::transport::Local;
 use super::transport::ssh::Ssh;
@@ -62,8 +60,8 @@ use super::transport::{Program, Transport, Wire};
 use super::watchdog::{self, Cut, Kept, Kill, LINE_CAP};
 use super::worktree_lock::{self, Folder, Locked, Wait};
 use super::{
-    BoxKill, FAILED, FAILED_RUN, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, Split, WarmEnd, Warmth, adjusted_prefix, killed_line,
-    refused_line, started_line,
+    BoxKill, FAILED, FAILED_RUN, KeyWait, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, Split, WarmEnd, Warmth, adjusted_prefix,
+    killed_line, refused_line, started_line,
 };
 use crate::boxside::outputs::{NAMES_SKIPPED, OUTPUTS_BUDGET};
 use crate::boxside::payload::{PairRefused, Payload, escaped};
@@ -80,8 +78,8 @@ use crate::run::{CONTROL_C_EXIT, is_within, resolved};
 /// and a gate's usage error for a payload it does not read.
 pub(crate) const NOT_RECOGNIZED: i32 = 9009;
 pub(crate) const USAGE: i32 = 2;
-/// The most bytes a call's job may have written and still be made once more after a failure before the banner: ssh's
-/// own failure writes one line, and a second fetch from a builder would start a fresh count against its cap.
+/// The most bytes a call's job may have written and still be made again after a failure before the banner: ssh's own
+/// failure writes one line, and another fetch from a builder would start a fresh count against its cap.
 const RETRY_WRITTEN: u64 = 1 << 20;
 /// How often the retry pause looks at the console interrupt.
 const PAUSE_STEP: Duration = Duration::from_millis(20);
@@ -161,8 +159,7 @@ impl RustClient {
     /// The client of the local transport `transport` names, with the request's seams; else the line saying why the
     /// transport cannot be used, or why the stand-in `--test-remote-ssh` names cannot be found.
     #[cfg(feature = "test-seams")]
-    pub(crate) fn local(request: &RunRequest, transport: &str) -> Result<RustClient, String> {
-        let seams = &request.test_seams;
+    pub(crate) fn local(seams: &TestSeams, transport: &str) -> Result<RustClient, String> {
         let local = local_transport(transport, seams.remote_ssh.as_deref())?;
         Ok(RustClient::over(Some(Box::new(local)), seams))
     }
@@ -282,6 +279,14 @@ fn found(slot: &mut Option<Box<dyn Transport>>) -> Result<&mut dyn Transport, St
 impl RemoteClient for RustClient {
     fn hold_key(&self, call: &RemoteCall<'_>) -> Result<Option<OwnedMutexGuard>, Option<String>> {
         hold_key(call).map(Some)
+    }
+
+    fn hold_key_waiting(&self, call: &RemoteCall<'_>, wait: Duration) -> Result<KeyWait, String> {
+        Ok(match hold_key_waiting(call, wait)? {
+            KeyHold::Held(held) => KeyWait::Held(Some(held)),
+            KeyHold::Busy => KeyWait::Busy,
+            KeyHold::Interrupted => KeyWait::Interrupted,
+        })
     }
 
     /// Looks for ssh on the routed attempt's first need of it, so a run that cannot find it falls back `client` before
@@ -523,12 +528,18 @@ struct Prepared {
 
 /// What the snapshot's tree gives the parity check, read before the preflight: the git that listed it, the worktree it
 /// was asked in, the names of its files and submodules, and its `.gate/toolchain.toml`, `None` when it has none or is
-/// a sibling's, which is not read, `Err` with why when it cannot be read or is no regular file.
+/// a sibling's, which is not read, `Err` with why when it cannot be read or is no regular file, and the Godot versions
+/// its project files pin, with a line per file left unread. A sibling's tree gives no manifest and no pins: only the
+/// main repository's say what the run needs.
 struct Tree {
     git: Git,
     folder: PathBuf,
     names: Vec<String>,
     manifest: Option<Result<Manifest, String>>,
+    /// The `Godot.NET.Sdk` versions its `*.csproj` files name, each version once, in the order the tree lists them.
+    godot_pins: Vec<Pin>,
+    /// One line per project file whose pin could not be read, in the same order.
+    godot_skips: Vec<String>,
 }
 
 /// The repo's toolchain manifest, as its path at the repo root is spelled.
@@ -596,13 +607,203 @@ fn regular(entry: &Entry) -> Result<&Entry, String> {
     }
 }
 
-impl Tree {
-    /// The `Needs` the preflight sends for the tree's manifest; none when it has no manifest that reads.
-    fn needs(&self) -> Vec<(String, String)> {
-        match &self.manifest {
-            Some(Ok(manifest)) => toolchain::needs_of(manifest),
-            _ => Vec::new(),
+/// The most project files a tree's Godot pins are read from: files past it are not read, and one line names how many
+/// were left.
+const CSPROJ_FILES: usize = 64;
+
+/// The most bytes of one project file read for its Godot pin.
+const CSPROJ_BYTES: usize = 256 * 1024;
+
+/// The most bytes one project file's frame takes in a `git cat-file --batch` answer beside its own text: the object id,
+/// the type, the size and the line ends, with room to spare.
+const CSPROJ_FRAME: usize = 128;
+
+/// The most bytes one `git cat-file --batch` read of the project files can write: [`CSPROJ_FILES`] files of at most
+/// [`CSPROJ_BYTES`] each, every frame within [`CSPROJ_FRAME`].
+const CSPROJ_READ: usize = CSPROJ_FILES * (CSPROJ_BYTES + CSPROJ_FRAME);
+
+/// The most bytes one `git cat-file --batch-check` answer for the project files can write: [`CSPROJ_FILES`] lines of an
+/// object size and a line end, with room to spare.
+const CSPROJ_SIZES: usize = CSPROJ_FILES * 64;
+
+/// What the name of a project file ends in.
+const CSPROJ_SUFFIX: &str = ".csproj";
+
+/// Whether `path` names a project file: its last characters [`CSPROJ_SUFFIX`], in any ASCII letter case, at whatever
+/// depth of the tree it lies.
+fn is_csproj(path: &str) -> bool {
+    path.get(path.len().saturating_sub(CSPROJ_SUFFIX.len())..)
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(CSPROJ_SUFFIX))
+}
+
+/// The project files among a tree's `entries` whose Godot pins are read, with the line naming the files left past
+/// [`CSPROJ_FILES`], `None` when none were left: the first [`CSPROJ_FILES`] entries whose path ends in `.csproj`, in
+/// the listing's order, a folder named like a project file left out as no file at all.
+fn csproj_files(entries: &[Entry]) -> (Vec<&Entry>, Option<String>) {
+    let mut files: Vec<&Entry> = entries.iter().filter(|entry| entry.kind != "tree" && is_csproj(&entry.path)).collect();
+    let left = files.len().saturating_sub(CSPROJ_FILES);
+    files.truncate(CSPROJ_FILES);
+    let line = (left > 0).then(|| format!("gate: {left} more project files not read for a Godot pin; not checking them"));
+    (files, line)
+}
+
+/// Why the project file `entry` is no file the run can read, worded as [`regular`] words the same kinds without the
+/// path the skip line names already; `None` when it is a regular file.
+fn unreadable_csproj(entry: &Entry) -> Option<String> {
+    match (entry.mode.as_str(), entry.kind.as_str()) {
+        ("100644" | "100755", "blob") => None,
+        ("160000", _) => Some("it is a submodule, not a file".to_owned()),
+        ("120000", _) => Some("it is a symbolic link, not a file".to_owned()),
+        (_, "tree") => Some("it is a folder, not a file".to_owned()),
+        (mode, _) => Some(format!("it is not a regular file (mode {mode})")),
+    }
+}
+
+/// The line said for a project file whose Godot pin cannot be read, the file and why both escaped as other lines escape
+/// theirs.
+fn godot_skip_line(file: &str, why: &str) -> String {
+    format!("gate: cannot read the Godot pin of {}: {}; not checking it", escaped(file), escaped(why))
+}
+
+/// Why a project file is left unread: its text is past [`CSPROJ_BYTES`].
+fn oversized_reason() -> String {
+    format!("its text is more than {} KiB", CSPROJ_BYTES / 1024)
+}
+
+/// The run's failure for a git answer no project file's pin can be read from, `why` naming what it answered.
+fn csproj_end(why: &str) -> End {
+    End::Failed(format!("gate: cannot read the Godot pin of the project files: {}", escaped(why)))
+}
+
+/// The size of each blob of `files`, from the `git cat-file --batch-check=%(objectsize)` answer `answer`, one line for
+/// each in their order; `Err` with what it answered when it names no size for one of them.
+fn sizes_of(answer: &[u8], files: &[&Entry]) -> Result<Vec<u64>, String> {
+    let answer = String::from_utf8_lossy(answer);
+    let lines: Vec<&str> = answer.lines().collect();
+    if lines.len() != files.len() {
+        return Err(format!("it answered {} line(s) for {} project file(s)", lines.len(), files.len()));
+    }
+    lines
+        .iter()
+        .zip(files)
+        .map(|(line, file)| {
+            line.trim()
+                .parse::<u64>()
+                .map_err(|_| format!("it answered '{}' for {}", line.trim(), file.path))
+        })
+        .collect()
+}
+
+/// The text of each blob of `files`, from the `git cat-file --batch` answer `answer`, one for each in their order: each
+/// object's header line, then its bytes, then the line end after them; `Err` with what it answered when the answer is
+/// not shaped so.
+fn texts_of(answer: &[u8], files: &[&Entry]) -> Result<Vec<Vec<u8>>, String> {
+    let mut texts = Vec::with_capacity(files.len());
+    let mut rest = answer;
+    for file in files {
+        let Some(end) = rest.iter().position(|byte| *byte == b'\n') else {
+            return Err(format!("it gave no header for {}", file.path));
+        };
+        let header = String::from_utf8_lossy(&rest[..end]);
+        let Some(size) = header.rsplit(' ').next().and_then(|size| size.trim().parse::<usize>().ok()) else {
+            return Err(format!("it named no size for {}: '{}'", file.path, header));
+        };
+        let body = &rest[end + 1..];
+        if body.len() < size + 1 {
+            return Err(format!("it gave {} byte(s) for {}", body.len(), file.path));
         }
+        texts.push(body[..size].to_vec());
+        rest = &body[size + 1..];
+    }
+    Ok(texts)
+}
+
+/// The project files of `files` whose blobs are read, and the line for each file no file at all, in the order of
+/// `files`.
+fn readable_files<'a>(files: &[&'a Entry]) -> (Vec<&'a Entry>, Vec<String>) {
+    let mut readable = Vec::new();
+    let mut skips = Vec::new();
+    for file in files {
+        match unreadable_csproj(file) {
+            Some(why) => skips.push(godot_skip_line(&file.path, &why)),
+            None => readable.push(*file),
+        }
+    }
+    (readable, skips)
+}
+
+/// The project files of `files` within [`CSPROJ_BYTES`], as the sizes `sizes` gives them one for one, and the line for
+/// each file left past it; `Err` when the sizes do not answer for `files` one for one.
+fn within_cap<'a>(files: &[&'a Entry], sizes: Vec<u64>) -> Result<(Vec<&'a Entry>, Vec<String>), End> {
+    if sizes.len() != files.len() {
+        return Err(csproj_end(&format!(
+            "it named the size of {} of {} project file(s)",
+            sizes.len(),
+            files.len()
+        )));
+    }
+    let mut kept = Vec::new();
+    let mut skips = Vec::new();
+    for (file, size) in files.iter().zip(sizes) {
+        if size > CSPROJ_BYTES as u64 {
+            skips.push(godot_skip_line(&file.path, &oversized_reason()));
+        } else {
+            kept.push(*file);
+        }
+    }
+    Ok((kept, skips))
+}
+
+/// The pins the project file texts `texts` give, one for each of `files`, and the line for each whose bytes are not
+/// UTF-8; `Err` when the texts do not answer for `files` one for one.
+fn pins_of(files: &[&Entry], texts: Vec<Vec<u8>>) -> Result<(Vec<Pin>, Vec<String>), End> {
+    if texts.len() != files.len() {
+        return Err(csproj_end(&format!("it read {} of {} project file(s)", texts.len(), files.len())));
+    }
+    let mut pins: Vec<Pin> = Vec::new();
+    let mut skips = Vec::new();
+    for (file, bytes) in files.iter().zip(texts) {
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            skips.push(godot_skip_line(&file.path, "not valid UTF-8"));
+            continue;
+        };
+        for pin in toolchain::godot_sdk_pins(text) {
+            if !pins.contains(&pin) {
+                pins.push(pin);
+            }
+        }
+    }
+    Ok((pins, skips))
+}
+
+/// The `Godot.NET.Sdk` versions the project files among a tree's `entries` pin ([`toolchain::godot_sdk_pins`]), and the
+/// line for each file left out: the files [`csproj_files`] names, `size` asked for their sizes as one
+/// `cat-file --batch-check` answers them and `read` handed the ones within [`CSPROJ_BYTES`] as one `cat-file --batch`
+/// reads them, so a file past that cap is left unread. The skips come in this order: a file that is no file at all,
+/// then a file past [`CSPROJ_BYTES`], then a file whose text is not UTF-8, each in the tree's order, then the count of
+/// the files left past [`CSPROJ_FILES`]. The same version pinned twice is one pin.
+fn csproj_pins(
+    entries: &[Entry],
+    size: impl FnOnce(&[&Entry]) -> Result<Vec<u64>, End>,
+    read: impl FnOnce(&[&Entry]) -> Result<Vec<Vec<u8>>, End>,
+) -> Result<(Vec<Pin>, Vec<String>), End> {
+    let (files, capped) = csproj_files(entries);
+    let (readable, mut skips) = readable_files(&files);
+    let sizes = if readable.is_empty() { Vec::new() } else { size(&readable)? };
+    let (kept, over) = within_cap(&readable, sizes)?;
+    skips.extend(over);
+    let texts = if kept.is_empty() { Vec::new() } else { read(&kept)? };
+    let (pins, unread) = pins_of(&kept, texts)?;
+    skips.extend(unread);
+    skips.extend(capped);
+    Ok((pins, skips))
+}
+
+impl Tree {
+    /// The `Needs` the preflight sends for the tree ([`toolchain::routed_needs`]): the tools its manifest declares, and
+    /// the exact versions its project files pin of godot when the manifest does not name godot itself.
+    fn needs(&self) -> Vec<(String, String)> {
+        toolchain::routed_needs(self.manifest.as_ref(), &self.godot_pins)
     }
 }
 
@@ -1241,6 +1442,8 @@ impl Attempt<'_, '_> {
             folder,
             names,
             manifest: None,
+            godot_pins: Vec::new(),
+            godot_skips: Vec::new(),
         }))
     }
 
@@ -1325,11 +1528,14 @@ impl Attempt<'_, '_> {
             .map(|entry| entry.path.clone())
             .collect();
         let manifest = self.manifest(&git, &entries)?;
+        let (godot_pins, godot_skips) = self.godot_pins(&git, &entries)?;
         Ok(Some(Tree {
             git,
             folder,
             names,
             manifest,
+            godot_pins,
+            godot_skips,
         }))
     }
 
@@ -1400,6 +1606,37 @@ impl Attempt<'_, '_> {
         Ok(Some(read))
     }
 
+    /// The `Godot.NET.Sdk` versions the snapshot's project files pin ([`csproj_pins`]), read in two git calls whatever
+    /// their count — one `cat-file --batch-check` for their sizes, so a file past [`CSPROJ_BYTES`] is left unread, then
+    /// one `cat-file --batch`, bounded by [`CSPROJ_READ`], for the rest — and the line for each file left out. A tree
+    /// holding no project file asks git nothing. Any git failure ends the run.
+    fn godot_pins(&mut self, git: &Git, entries: &[Entry]) -> Result<(Vec<Pin>, Vec<String>), End> {
+        self.go_on()?;
+        let attempt = &*self;
+        let pins = csproj_pins(
+            entries,
+            |files| {
+                let answer = attempt.blobs(git, &["cat-file", "--batch-check=%(objectsize)"], files, CSPROJ_SIZES)?;
+                sizes_of(&answer, files).map_err(|why| csproj_end(&why))
+            },
+            |files| {
+                let answer = attempt.blobs(git, &["cat-file", "--batch"], files, CSPROJ_READ)?;
+                texts_of(&answer, files).map_err(|why| csproj_end(&why))
+            },
+        )?;
+        self.go_on()?;
+        Ok(pins)
+    }
+
+    /// What git writes for `args` in the worktree, its standard input fed the object ids of `files`, one to a line, and
+    /// its standard output read up to `cap` bytes, as one `cat-file` call; a Ctrl+C, a failure and an answer past the
+    /// cap each end the run.
+    fn blobs(&self, git: &Git, args: &[&str], files: &[&Entry], cap: usize) -> Result<Vec<u8>, End> {
+        let ids: String = files.iter().flat_map(|file| [file.oid.as_str(), "\n"]).collect();
+        self.git_bytes_within(Path::new(self.call.root), git, args, Some(ids.as_bytes()), cap)
+            .map_err(git_end)
+    }
+
     /// The toolchain parity check, made after the preflight and before the push, so a refusal costs no transfer, over
     /// the snapshot's `tree`, which `None` skips: the builder must have the SDK [`Attempt::sdk_needs`] reads and the
     /// tools the manifest declares, as [`toolchain::judge`] weighs what the `prepared` preflight said of them. The SDK
@@ -1427,16 +1664,21 @@ impl Attempt<'_, '_> {
     }
 
     /// What the builder lacks for the repository `repo`, at `at` in the run's order, whose `snapshot` has the tree
-    /// `tree`: its SDK, and for the main one, first, the tools its manifest declares, each manifest problem and tool not
-    /// checked said. A sibling's git failure keeps the run here naming it.
+    /// `tree`: its SDK, and for the main one, first, the tools its manifest declares and the Godot versions its project
+    /// files pin, each manifest problem, tool not checked and project file left unread said. A sibling's git failure
+    /// keeps the run here naming it.
     fn repo_needs(&mut self, at: usize, repo: &Repo, snapshot: &Snapshot, tree: &Tree, prepared: &Prepared) -> Result<Vec<parity::Need>, End> {
         self.go_on()?;
         let needs = self.sdk_needs(snapshot, tree, prepared.sdks.as_deref());
         let mut needs = needs.map_err(|end| repo_end(at, &repo.name, end))?;
         if at == 0 {
-            let judged = toolchain::judge(tree.manifest.as_ref(), &prepared.sent, &prepared.tools, self.call.host);
+            let godot = toolchain::godot_required(tree.manifest.as_ref(), &tree.godot_pins);
+            let judged = toolchain::judge(tree.manifest.as_ref(), godot.as_deref(), &prepared.sent, &prepared.tools, self.call.host);
             for line in judged.skips {
                 self.say(line);
+            }
+            for line in &tree.godot_skips {
+                self.say(line.clone());
             }
             needs.extend(judged.needs);
         }
@@ -1482,6 +1724,12 @@ impl Attempt<'_, '_> {
     /// What git writes on standard output for `args` in the worktree `folder`, as [`Attempt::git_bytes`] asks it, a pair's
     /// repository asked at the place git found it at its check ([`Attempt::bound_at`]).
     fn git_bytes_in(&self, folder: &Path, git: &Git, args: &[&str]) -> Result<Vec<u8>, GitError> {
+        self.git_bytes_within(folder, git, args, None, git::OUTPUT_CAP)
+    }
+
+    /// [`Attempt::git_bytes_in`] with the bytes `stdin` fed on git's standard input and its standard output read up to
+    /// `cap` bytes, for a call git answers from what it is fed and a caller whose own cap bounds the answer.
+    fn git_bytes_within(&self, folder: &Path, git: &Git, args: &[&str], stdin: Option<&[u8]>, cap: usize) -> Result<Vec<u8>, GitError> {
         // A run of one repository gives git no variable of its own.
         let set = self
             .bound_at(folder)
@@ -1491,9 +1739,10 @@ impl Attempt<'_, '_> {
         let call = git::Call {
             set: &set,
             interrupt: self.call.interrupt,
+            stdin,
             ..git::Call::plain(folder, args, self.limit)
         };
-        git.output_bytes(&call)
+        git.output_bytes_within(&call, cap)
     }
 
     /// This PC's newest .NET SDK major, from `--test-local-sdks` when given, else from `dotnet --list-sdks`, read once
@@ -1697,9 +1946,10 @@ impl Attempt<'_, '_> {
         }
     }
 
-    /// The run call to the builder at `location`: the command's own status; `unreachable` when it failed before the
-    /// banner twice, as the command never started; a refusal when its 75 comes with the box's refusal tag for the run
-    /// whose nonce is `nonce` and no start marker; a lost connection when it exited 255 otherwise. A watchdog kill says
+    /// The run call to the builder at `location`: the command's own status; `unreachable` when the call and each of its
+    /// retries failed before the banner, as the command never started; a refusal when its 75 comes with the box's refusal
+    /// tag for the run whose nonce is `nonce` and no start marker; a lost connection when it exited 255 otherwise. A
+    /// watchdog kill says
     /// its line, stops the command and ends the run killed; a Ctrl+C stops the command too. Each call made is fed
     /// `input` on its standard input ([`payload::input`]). With the end, what the call that counts said of the outputs
     /// ([`RunEnd`]).
@@ -1798,22 +2048,24 @@ impl Attempt<'_, '_> {
     }
 
     /// Makes a call with `make` and, when it failed before the banner and its job did not write more than 1 MiB, says
-    /// so, pauses and makes it once more; a Ctrl+C
-    /// before the retry or during its pause ends the attempt instead. The call that counts, its lines not yet kept, and
-    /// whether the retry failed before the banner too.
+    /// so, pauses and makes it again, up to [`retry::PRE_BANNER_RETRIES`] more times for as long as every call fails
+    /// the same way; a Ctrl+C before a retry or during its pause ends the attempt instead. The call that counts, its
+    /// lines not yet kept, and whether that call failed before the banner too.
     pub(super) fn with_retry(&mut self, fail_status: i32, mut make: impl FnMut(&mut Self) -> Result<Called, End>) -> Result<(Called, bool), End> {
-        let mut first = make(self)?;
-        if !first.before_the_banner(fail_status) || first.wrote_much() {
-            return Ok((first, false));
+        let mut called = make(self)?;
+        for retry in 1..=retry::PRE_BANNER_RETRIES {
+            if !called.before_the_banner(fail_status) || called.wrote_much() {
+                return Ok((called, false));
+            }
+            self.lines.append(&mut called.lines);
+            self.go_on()?;
+            self.say(retry::retry_line(self.call.host, retry, retry::PRE_BANNER_RETRIES));
+            paused(self.pause, self.call.interrupt)?;
+            self.go_on()?;
+            called = make(self)?;
         }
-        self.lines.append(&mut first.lines);
-        self.go_on()?;
-        self.say(retry::retry_line(self.call.host));
-        paused(self.pause, self.call.interrupt)?;
-        self.go_on()?;
-        let second = make(self)?;
-        let again = second.before_the_banner(fail_status);
-        Ok((second, again))
+        let again = called.before_the_banner(fail_status);
+        Ok((called, again))
     }
 
     /// After the run call's connection to the builder at `location` was lost: stops the command, then, when the
@@ -1896,7 +2148,7 @@ impl Attempt<'_, '_> {
             if let Ok(first) = &mut made {
                 self.lines.append(&mut first.lines);
             }
-            self.say(retry::retry_line(self.call.host));
+            self.say(retry::retry_line(self.call.host, 1, 1));
             thread::sleep(self.pause);
             made = self.ssh(
                 verb,
@@ -1955,8 +2207,8 @@ impl Attempt<'_, '_> {
         self.started(&command, echo, watch, starts)
     }
 
-    /// The outputs call to the builder at `location` for the archive `name`: `gate box outputs`, made once more when
-    /// it failed before the banner, watched as a fetch by `limits`, and the console interrupt raised after its first
+    /// The outputs call to the builder at `location` for the archive `name`: `gate box outputs`, made again when it
+    /// failed before the banner, watched as a fetch by `limits`, and the console interrupt raised after its first
     /// output byte with `--test-remote-interrupt-at outputs`. Each attempt writes its standard output raw to the file
     /// `archive` makes new for it; its standard error lines go to the log. The call that counts, its lines kept; else
     /// why the file or the call could not be made, or the interrupt.
@@ -1976,7 +2228,7 @@ impl Attempt<'_, '_> {
         Ok(called)
     }
 
-    /// One inputs call, `gate box inputs`, made once more when it failed before the banner, watched as `watch` says,
+    /// One inputs call, `gate box inputs`, made again when it failed before the banner, watched as `watch` says,
     /// and the console interrupt raised after its first output byte with `--test-remote-interrupt-at inputs`. Each
     /// attempt is fed `head`, then, when an archive is given, the open file's first bytes up to its packed length, read
     /// from its start at a position of its own; its standard output goes raw into the sink `sink` makes anew when
@@ -3785,13 +4037,14 @@ mod tests {
     use gate_state::{FallbackReason, StateRoot};
     use gate_win32::{Interrupt, PipedConsole};
 
+    use super::retry::PRE_BANNER_RETRIES;
     use super::{
         Attempt, CallEnd, Called, Capped, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, NonZeroU64, OUTPUTS_BUDGET, OneCall,
         ProtocolLines, Push, Raised, Reader, Reading, RustClient, SSH_FAILED, Shared, Split, Ssh, Unfinished, Watch, Watching, after_loss, boot_time,
         called_of, console_of, held, is_heartbeat, last_update, local_sdk_listing, path_outside, paused, push_size, relay, relay_raw, relayed_raw,
         sdks_of, seconds, their_version, version_refusal,
     };
-    use super::{Entry, entries_of, manifest_entry};
+    use super::{CSPROJ_BYTES, CSPROJ_FILES, Entry, csproj_pins, entries_of, manifest_entry};
     use super::{KeyHold, RunEnd, Warm, hold_key, hold_key_waiting, is_cold, status_end, warm_end, warm_of};
     use crate::environment::Variables;
     use crate::remote::git::{DOTNET_LIMIT, GIT_LIMIT, Git, GitError};
@@ -3800,6 +4053,7 @@ mod tests {
     use crate::remote::payload;
     use crate::remote::payload::Location;
     use crate::remote::snapshot::Snapshot;
+    use crate::remote::toolchain::Pin;
     use crate::remote::transport::{Local, Transport};
     use crate::remote::watchdog::{self, Kill, LOG_CAP};
     use crate::remote::worktree_lock::tests::{held_elsewhere, lock_name};
@@ -3984,7 +4238,7 @@ mod tests {
         fs::rename(pair.folder("lib"), &moved).expect("the sibling can be moved");
         junction(&pair.folder("lib"), &moved);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let mut attempt = attempt(&call, &transport);
 
@@ -4002,7 +4256,7 @@ mod tests {
         let pair = Pair::new("client-busy", &["lib"]);
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let (release, holder) = held_elsewhere(&lock_name(&STATE, &run.siblings[0].root));
         let transport = nowhere();
         let mut attempt = attempt(&call, &transport);
@@ -4065,7 +4319,7 @@ mod tests {
     fn pair_phases(pair: &Pair, names: &[&str], tamper: Option<&str>) -> Result<End, End> {
         let run = pair.run(&pair.root, names);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let mut attempt = attempt(&call, &transport);
         attempt.tamper = tamper;
@@ -4201,7 +4455,7 @@ mod tests {
         repositories(&pair, &["lib"]);
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let (mut attempt, repos) = held_pair(&call, &transport);
         misplaced(&mut attempt, &pair);
@@ -4221,7 +4475,7 @@ mod tests {
         repositories(&pair, &["lib"]);
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let (mut attempt, repos) = held_pair(&call, &transport);
         attempt.snapshots(&repos).expect("the snapshots are taken");
@@ -4243,7 +4497,7 @@ mod tests {
         let main = linked_worktrees(&pair, &["lib"]);
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let (mut attempt, repos) = held_pair(&call, &transport);
 
@@ -4284,7 +4538,7 @@ mod tests {
         let helper = format!("url.ext::touch {} .pushInsteadOf", marker.to_string_lossy().replace('\\', "/"));
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let target = transport
             .push_target(call.host, call.repo)
@@ -4308,7 +4562,7 @@ mod tests {
         repositories(&pair, &["lib"]);
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let (mut attempt, repos) = held_pair(&call, &transport);
         attempt.snapshots(&repos).expect("the snapshots are taken");
@@ -5736,7 +5990,62 @@ mod tests {
     }
 
     #[test]
-    fn a_sync_back_git_call_dropped_before_the_banner_is_retried_once() {
+    fn a_call_dropped_before_the_banner_through_a_builder_stall_is_made_again_until_it_is_answered() {
+        let log = unwritten_log();
+        let mut given = call(&log);
+        given.interrupt = None;
+        let transport = Local::new(r"local:C:\builder", None).expect("a local transport");
+        let mut attempt = attempt(&given, &transport);
+        attempt.pause = Duration::ZERO;
+        let mut made = 0;
+
+        let retried = attempt.with_retry(SSH_FAILED, |_| {
+            made += 1;
+            Ok(if made < 3 {
+                ended_with(SSH_FAILED, "Connection timed out during banner exchange")
+            } else {
+                ended_with(0, "the command's line")
+            })
+        });
+
+        let (called, again) = retried.expect("a call that ends without an interrupt");
+        assert_eq!(made, 3, "the builder's ssh answered the third call");
+        assert_eq!(called.status, 0, "the answered call is the one returned");
+        assert_eq!(called.first_error.as_deref(), Some("the command's line"));
+        assert!(!again, "the call that counts did not fail before the banner");
+    }
+
+    #[test]
+    fn a_call_that_never_passes_the_banner_is_made_four_times_and_flagged() {
+        let log = crate::test_support::temp_dir().join(format!("gate-client-banner-never-{}.log", std::process::id()));
+        let mut given = call(&log);
+        given.interrupt = None;
+        let transport = Local::new(r"local:C:\builder", None).expect("a local transport");
+        let mut attempt = attempt(&given, &transport);
+        attempt.pause = Duration::ZERO;
+        let mut made = 0;
+
+        let retried = attempt.with_retry(SSH_FAILED, |_| {
+            made += 1;
+            Ok(ended_with(SSH_FAILED, "Connection timed out during banner exchange"))
+        });
+
+        let (called, again) = retried.expect("a call that ends without an interrupt");
+        assert_eq!(made, 1 + PRE_BANNER_RETRIES, "the call and its retries");
+        assert!(again, "the last call failed before the banner too");
+        assert_eq!(called.status, SSH_FAILED);
+        let said = std::fs::read_to_string(&log).expect("the retry lines were written");
+        let want = [
+            "gate: builder did not answer the ssh banner; trying again (1 of 3)",
+            "gate: builder did not answer the ssh banner; trying again (2 of 3)",
+            "gate: builder did not answer the ssh banner; trying again (3 of 3)",
+        ];
+        assert_eq!(said.lines().collect::<Vec<_>>(), want, "{said}");
+        std::fs::remove_file(&log).expect("the log can be removed");
+    }
+
+    #[test]
+    fn a_sync_back_git_call_dropped_before_the_banner_is_made_again_until_its_retries_run_out() {
         // The local transport runs git against a bare repository path, never through the ssh stand-in, so the only way
         // to reach the sync-back's retry is the decision itself, as a call that failed before the banner.
         let log = crate::test_support::temp_dir().join(format!("gate-client-sync-back-retry-{}.log", std::process::id()));
@@ -5756,12 +6065,13 @@ mod tests {
         });
 
         let (called, again) = retried.expect("a call that ends without an interrupt");
-        assert_eq!(made, 2, "the git call is made once more");
-        assert!(again, "the retry failed before the banner too");
+        assert_eq!(made, 1 + PRE_BANNER_RETRIES, "the git call and its retries");
+        assert!(again, "the last call failed before the banner too");
         assert_eq!(called.status, GIT_SSH_FAILED);
-        let said = std::fs::read_to_string(&log).expect("the retry line was written");
-        let retry_line = "gate: builder did not answer the ssh banner; trying once more";
-        assert_eq!(said.lines().filter(|line| *line == retry_line).count(), 1, "{said}");
+        let said = std::fs::read_to_string(&log).expect("the retry lines were written");
+        let retries = said.matches("gate: builder did not answer the ssh banner; trying again (").count();
+        assert_eq!(retries, PRE_BANNER_RETRIES, "{said}");
+        assert!(said.contains("(3 of 3)"), "the last retry is said: {said}");
         std::fs::remove_file(&log).expect("the log can be removed");
     }
 
@@ -5776,7 +6086,7 @@ mod tests {
         let transport = Local::new(r"local:C:\builder", None).expect("a local transport");
         let mut attempt = attempt(&given, &transport);
         attempt.pause = Duration::ZERO;
-        for (written, times) in [(Some(MIB + 1), 1), (Some(MIB), 2), (None, 2)] {
+        for (written, times) in [(Some(MIB + 1), 1), (Some(MIB), 1 + PRE_BANNER_RETRIES), (None, 1 + PRE_BANNER_RETRIES)] {
             let mut made = 0;
             let retried = attempt.with_retry(GIT_SSH_FAILED, |_| {
                 made += 1;
@@ -6368,6 +6678,105 @@ mod tests {
         );
     }
 
+    /// The pin the version text `text` spells, as a repo writes one.
+    fn pin_of(text: &str) -> Pin {
+        Pin::parse(text).expect("a pin")
+    }
+
+    /// A repo's project files are the tree's entries whose name ends in `.csproj`, at any depth and in either letter
+    /// case — a folder named like one is no file at all and is left out — and each names the `Godot.NET.Sdk` version
+    /// the root `Sdk` attribute pins; the same version twice is one pin.
+    #[test]
+    fn csproj_pins_are_read_from_the_tree() {
+        let entries = [
+            entry("100644", "blob", "a.txt"),
+            entry("100644", "blob", "src/App/App.csproj"),
+            entry("100644", "blob", "Sub/Game.CSProj"),
+            entry("040000", "tree", "folder.csproj"),
+            entry("100644", "blob", "x.csproj/y.txt"),
+        ];
+        let mut asked: Vec<String> = Vec::new();
+        let (pins, skips) = csproj_pins(
+            &entries,
+            |files| Ok(files.iter().map(|_| 40_u64).collect()),
+            |files| {
+                asked.extend(files.iter().map(|file| file.path.clone()));
+                Ok(files.iter().map(|_| b"<Project Sdk=\"Godot.NET.Sdk/4.7.2\">".to_vec()).collect())
+            },
+        )
+        .expect("no git failure");
+
+        assert_eq!(
+            asked,
+            ["src/App/App.csproj", "Sub/Game.CSProj"],
+            "any depth, either letter case, no folder, nothing else"
+        );
+        assert_eq!(pins, [pin_of("4.7.2")], "the same version pinned twice is one");
+        assert_eq!(skips, Vec::<String>::new());
+    }
+
+    /// What the sizes say decides what is read: a project file past [`CSPROJ_BYTES`] is skipped with its line and never
+    /// handed to the read, where a file that is no file at all and one whose text is not UTF-8 are skipped with theirs,
+    /// and the file beside them that reads still pins.
+    #[test]
+    fn a_csproj_over_its_cap_is_skipped_with_its_line() {
+        let entries = [
+            entry("100644", "blob", "big.csproj"),
+            entry("100644", "blob", "odd.csproj"),
+            entry("120000", "blob", "link.csproj"),
+            entry("100644", "blob", "ok.csproj"),
+        ];
+        let mut asked: Vec<String> = Vec::new();
+        let (pins, skips) = csproj_pins(
+            &entries,
+            |files| {
+                assert_eq!(files.len(), 3, "a file that is no regular file is not weighed");
+                Ok(vec![CSPROJ_BYTES as u64 + 1, 4, 20])
+            },
+            |files| {
+                asked.extend(files.iter().map(|file| file.path.clone()));
+                Ok(vec![vec![0xff, 0xfe], b"<Project Sdk=\"Godot.NET.Sdk/4.7.2\">".to_vec()])
+            },
+        )
+        .expect("no git failure");
+
+        assert_eq!(asked, ["odd.csproj", "ok.csproj"], "the file past its cap is never read");
+        assert_eq!(pins, [pin_of("4.7.2")], "the file that reads still pins");
+        assert_eq!(skips.len(), 3, "{skips:?}");
+        assert_eq!(
+            skips[0],
+            "gate: cannot read the Godot pin of link.csproj: it is a symbolic link, not a file; not checking it"
+        );
+        assert_eq!(
+            skips[1],
+            "gate: cannot read the Godot pin of big.csproj: its text is more than 256 KiB; not checking it"
+        );
+        assert_eq!(
+            skips[2],
+            "gate: cannot read the Godot pin of odd.csproj: not valid UTF-8; not checking it"
+        );
+    }
+
+    /// Only the first sixty-four project files are read, and one line names how many were left past the cap.
+    #[test]
+    fn at_most_64_csproj_files_are_read() {
+        let entries: Vec<Entry> = (0..65).map(|at| entry("100644", "blob", &format!("p{at:02}.csproj"))).collect();
+        let mut read = 0;
+        let (pins, skips) = csproj_pins(
+            &entries,
+            |files| Ok(files.iter().map(|_| 40_u64).collect()),
+            |files| {
+                read += files.len();
+                Ok(files.iter().map(|_| Vec::<u8>::new()).collect())
+            },
+        )
+        .expect("no git failure");
+
+        assert_eq!(read, CSPROJ_FILES, "sixty-four is the most");
+        assert_eq!(pins, Vec::<Pin>::new());
+        assert_eq!(skips, ["gate: 1 more project files not read for a Godot pin; not checking them"]);
+    }
+
     #[test]
     fn the_boot_time_is_the_preflight_s_last_boot_line() {
         let preflight = lines(&["gate: remote version 0.1.0", "gate: remote boot 2026-10-10T08:00:00.0000000Z"]);
@@ -6687,7 +7096,7 @@ mod tests {
         let pair = Pair::new("client-one-clock", &["lib"]);
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let mut attempt = attempt(&call, &transport);
         attempt.one_call = Some(OneCall {
@@ -6721,7 +7130,7 @@ mod tests {
         let pair = Pair::new("client-push-sum", &["lib"]);
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let mut attempt = attempt(&call, &transport);
         let repos = attempt.repos();
@@ -6747,7 +7156,7 @@ mod tests {
         fs::write(&program, b"").expect("the stand-in ssh can be written");
         let run = pair.run(&pair.root, &["lib"]);
         let log = pair.top.join("out.log");
-        let call = pair_call(&run, carried(&run).expect("the run's siblings check"), &log);
+        let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let ssh = Ssh { program: program.clone() };
         let mut client = RustClient::over(Some(Box::new(ssh)), &TestSeams::default());
 

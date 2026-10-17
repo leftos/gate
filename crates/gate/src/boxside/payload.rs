@@ -72,15 +72,39 @@ impl Payload {
     /// The name and text of each entry of the object at `key`, none when the key is absent or null; else the usage
     /// line saying it is not an object of texts.
     pub(crate) fn pairs(&self, key: &str) -> Result<Vec<(String, String)>, String> {
-        let not_pairs = || format!("gate: box payload {key} is not an object of texts");
-        let object = match self.0.get(key) {
-            None | Some(Value::Null) => return Ok(Vec::new()),
-            Some(value) => value.as_object().ok_or_else(not_pairs)?,
+        let Some(object) = self.object_at(key)? else {
+            return Ok(Vec::new());
         };
         object
             .iter()
-            .map(|(name, value)| value.as_str().map(|text| (name.clone(), text.to_owned())).ok_or_else(not_pairs))
+            .map(|(name, value)| {
+                value
+                    .as_str()
+                    .map(|text| (name.clone(), text.to_owned()))
+                    .ok_or_else(|| not_an_object(key))
+            })
             .collect()
+    }
+
+    /// How many entries the object at `key` holds and how many bytes its names and values take together, read before
+    /// [`Payload::pairs`] builds or checks any of them, so a request holding more entries than the box takes is refused
+    /// without one of them being built; `None` when the key is absent or null. Else the usage line saying it is not an
+    /// object of texts.
+    pub(crate) fn pair_size(&self, key: &str) -> Result<Option<(usize, usize)>, String> {
+        let Some(object) = self.object_at(key)? else {
+            return Ok(None);
+        };
+        let bytes = object.iter().map(|(name, value)| name.len() + value.as_str().map_or(0, str::len)).sum();
+        Ok(Some((object.len(), bytes)))
+    }
+
+    /// The object at `key`, none when the key is absent or null; else the usage line saying it is not an object of texts.
+    fn object_at(&self, key: &str) -> Result<Option<&Map<String, Value>>, String> {
+        match self.0.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Object(object)) => Ok(Some(object)),
+            Some(_) => Err(not_an_object(key)),
+        }
     }
 
     /// The run's output globs, `Outputs`: a list of non-empty texts holding no `[` or `]`, as the routing file allows
@@ -189,6 +213,9 @@ impl Payload {
         let warm_hash = self.warm_hash()?;
         if !self.output_globs()?.is_empty() || self.outputs_full()? {
             return Err("gate: box payload asks a warm-up for outputs".to_owned());
+        }
+        if self.sets("Env") {
+            return Err("gate: box payload asks a warm-up for Env".to_owned());
         }
         // The budget bounds the warm-up's commands, their wall time included, though not the layout, checkout and
         // restores before them; a warm-up never goes without one.
@@ -607,6 +634,11 @@ fn same_path(first: &str, second: &str) -> bool {
     !renamed && matches!((full(first), full(second)), (Some(first_full), Some(second_full)) if first_full == second_full)
 }
 
+/// The line saying the value at the payload key `key` is not an object of texts.
+fn not_an_object(key: &str) -> String {
+    format!("gate: box payload {key} is not an object of texts")
+}
+
 fn not_a_key(key: &str) -> String {
     format!("gate: box payload Key is not a work-folder key: {}", escaped(key))
 }
@@ -630,7 +662,7 @@ pub(crate) fn ordinal_upper(text: &str) -> String {
         .collect()
 }
 
-fn is_drive_path(value: &str) -> bool {
+pub(crate) fn is_drive_path(value: &str) -> bool {
     let rooted = matches!(value.as_bytes(), [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic());
     rooted && !value.chars().any(|character| character < ' ')
 }
@@ -832,6 +864,15 @@ mod tests {
         ] {
             assert_eq!(commands(&json), Err("gate: box payload asks a warm-up for outputs".to_owned()), "{json}");
         }
+    }
+
+    #[test]
+    fn a_warm_payload_that_asks_for_env_is_refused() {
+        let warmed = |env: serde_json::Value| json!({"WarmCommands": [["x"]], "WarmHash": WARM_HASH, "Timeout": 1, "Env": env});
+        for env in [json!({"NuGetAudit": "false"}), json!({})] {
+            assert_eq!(commands(&warmed(env)), Err("gate: box payload asks a warm-up for Env".to_owned()));
+        }
+        assert!(commands(&warmed(json!(null))).is_ok(), "a null Env is not set");
     }
 
     #[test]

@@ -327,16 +327,36 @@ fn judge_record(record: &Record, hash: &str, situation: &Situation<'_>) -> Judge
 /// The line of a run kept here while `host` warms its work folder.
 #[must_use]
 pub fn warming_line(host: &str) -> String {
-    format!("gate: not routed: {} is warming the work folder for this worktree", escaped(host))
+    format!(
+        "gate: not routed: {} is warming the work folder for this worktree",
+        escaped(&shortened(host))
+    )
 }
 
-/// The line of a run kept here as it starts a warm-up on `host`.
+/// The line of a run kept here as it starts a warm-up on `host`. The route says it once it starts a warm-up of its own,
+/// which the detached launch brings; until then it says [`unwarmed_line`].
 #[must_use]
 pub fn starting_line(host: &str) -> String {
     format!(
         "gate: not routed: starting a warm-up of the work folder for this worktree on {}",
         escaped(host)
     )
+}
+
+/// The line of a run kept here because the work folder for this worktree on `host` is not warm, and no warm-up is
+/// running or held back by a failure.
+#[must_use]
+pub fn unwarmed_line(host: &str) -> String {
+    format!(
+        "gate: not routed: the work folder for this worktree on {} is not warm; gate warm warms it",
+        escaped(host)
+    )
+}
+
+/// The line a routed run says after it fell back `cold` from `host`, below the fallback's own line.
+#[must_use]
+pub fn warm_hint_line(host: &str) -> String {
+    format!("gate: gate warm warms the work folder for this worktree on {}", escaped(host))
 }
 
 /// The line of a run kept here after a warm-up failed `minutes_ago` whole minutes ago, for `reason`.
@@ -347,7 +367,7 @@ pub fn failed_line(minutes_ago: u64, reason: &str) -> String {
     } else {
         format!("{minutes_ago} min ago")
     };
-    format!("gate: not routed: the warm-up failed {when}: {}", escaped(reason))
+    format!("gate: not routed: the warm-up failed {when}: {}", escaped(&shortened(reason)))
 }
 
 /// The line of a run kept here for a problem of `.gate/warmup.toml`.
@@ -362,6 +382,24 @@ pub fn record_problem_line(path: &str, error: &str) -> String {
     format!(
         "gate: not routed: the warm-up record {} cannot be read: {}",
         escaped(path),
-        escaped(error)
+        escaped(&shortened(error))
     )
+}
+
+/// The line of a run kept here because the warm-up lock at `path` cannot be probed, for `error`.
+#[must_use]
+pub fn lock_problem_line(path: &str, error: &str) -> String {
+    format!("gate: not routed: the warm-up lock {} cannot be read: {}", escaped(path), escaped(error))
+}
+
+/// The most characters of a value read from a warm-up record that a line shows.
+const LONGEST_SHOWN: usize = 200;
+
+/// `text`, read from a warm-up record, as a line shows it: its first [`LONGEST_SHOWN`] characters, with `…` after them
+/// when there are more, as the gate shows a name. Shortened before it is escaped.
+fn shortened(text: &str) -> String {
+    match text.char_indices().nth(LONGEST_SHOWN) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_owned(),
+    }
 }

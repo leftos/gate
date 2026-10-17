@@ -338,7 +338,8 @@ fn a_snapshot_ignores_commit_signing() {
 /// What a client case's snapshot leaves out: the gate's state root, LOCALAPPDATA and logs, the builder root and the
 /// stand-in's files, and `.tmp/`, which the client writes in. `tool.exe` is sent, so the builder runs it.
 pub(super) const CLIENT_IGNORED: &str = "state/\nappdata/\n*.log\nbuilder/\nssh/\n.tmp/\n";
-const RETRY_LINE: &str = "gate: builder did not answer the ssh banner; trying once more";
+/// The start of every retry line of a builder that did not answer the ssh banner; its `n of 3` follows it.
+const RETRY_LINE: &str = "gate: builder did not answer the ssh banner; trying again (";
 const BUSY_LINE: &str = "gate: remote builder busy; running here";
 const UNREACHABLE_LINE: &str = "gate: remote builder unreachable; running here";
 /// The line of a run call whose connection was lost on a builder that did not restart.
@@ -904,33 +905,33 @@ fn a_dropped_preflight_logs_no_line_saying_its_input_was_not_sent() {
 }
 
 #[test]
-fn two_banner_drops_of_the_preflight_fall_back_unreachable() {
+fn a_preflight_that_never_answers_before_the_banner_falls_back_unreachable() {
     let case = client_case("client-preflight-drops");
-    let steps = ssh_steps(&case, "ssh", &["fail-banner", "fail-banner"]);
+    let steps = ssh_steps(&case, "ssh", &["fail-banner", "fail-banner", "fail-banner", "fail-banner"]);
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 1, "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 3, "{outcome:?}");
     assert!(outcome.stderr.contains(UNREACHABLE_LINE), "{outcome:?}");
     assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
-    assert_eq!(calls(&steps), ["preflight", "preflight"]);
+    assert_eq!(calls(&steps), ["preflight", "preflight", "preflight", "preflight"]);
     assert_eq!(fallbacks(&events(&case)), ["unreachable"]);
 }
 
 #[test]
-fn two_banner_drops_of_the_run_call_fall_back_unreachable() {
+fn a_run_call_that_never_answers_before_the_banner_falls_back_unreachable() {
     let case = client_case("client-run-drops");
-    let steps = ssh_steps(&case, "ssh", &["ok", "fail-banner", "fail-banner"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "fail-banner", "fail-banner", "fail-banner", "fail-banner"]);
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 1, "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 3, "{outcome:?}");
     assert!(outcome.stderr.contains(UNREACHABLE_LINE), "{outcome:?}");
     let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
     assert!(log.contains("ran here"), "it ran here: {log}");
-    assert_eq!(calls(&steps), ["preflight", "run", "run"]);
+    assert_eq!(calls(&steps), ["preflight", "run", "run", "run", "run"]);
     assert_eq!(fallbacks(&events(&case)), ["unreachable"]);
 }
 
@@ -2280,13 +2281,15 @@ fn is_parity_line(line: &str) -> bool {
     line.starts_with("gate: remote toolchain mismatch: ") || line == PARITY_LINE
 }
 
-/// A routed run of a case whose builder, given the `PATH` `box_path`, lacks what the case's tree needs: it falls back
-/// `parity` after the preflight alone, so nothing is pushed, says the mismatch lines `said` and no other, in their order,
-/// then the one parity line, on the console and, but the parity line, in the log, and runs the command here once.
-fn a_toolchain_refusal(case: &Case, box_path: &OsString, said: &[String]) -> Outcome {
+/// A routed run of a case whose builder, given the `PATH` `box_path` and the `GATE_GODOT_ROOT` `godot`, lacks what the
+/// case's tree needs: it falls back `parity` after the preflight alone, so nothing is pushed, says the mismatch lines
+/// `said` and no other, in their order, then the one parity line, on the console and, but the parity line, in the log,
+/// and runs the command here once.
+fn a_toolchain_refusal(case: &Case, box_path: &OsString, said: &[String], godot: Option<&Path>) -> Outcome {
     let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
     let mut gate = client_gate(case, "out.log", &steps, &[r".\tool.exe", "mark", RAN, "out", "ran"]);
     gate.env("PATH", box_path).env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING);
+    set_godot_root(&mut gate, godot);
 
     let (pid, outcome) = finish_with_pid(gate);
 
@@ -2305,12 +2308,14 @@ fn a_toolchain_refusal(case: &Case, box_path: &OsString, said: &[String]) -> Out
     outcome
 }
 
-/// A routed run of a case whose builder, given the `PATH` `box_path` and the preflight seams `seams`, serves what the
-/// case's tree needs: it goes remote with no mismatch line, and runs the command once, on the builder.
-fn a_toolchain_served(case: &Case, box_path: &OsString, seams: &str) -> Outcome {
+/// A routed run of a case whose builder, given the `PATH` `box_path`, the preflight seams `seams` and the
+/// `GATE_GODOT_ROOT` `godot`, serves what the case's tree needs: it goes remote with no mismatch line, and runs the
+/// command once, on the builder.
+fn a_toolchain_served(case: &Case, box_path: &OsString, seams: &str, godot: Option<&Path>) -> Outcome {
     let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
     let mut gate = client_gate(case, "out.log", &steps, &[r".\tool.exe", "mark", RAN, "out", "ran there"]);
     gate.env("PATH", box_path).env(PREFLIGHT_SEAMS_VARIABLE, seams);
+    set_godot_root(&mut gate, godot);
 
     let (pid, outcome) = finish_with_pid(gate);
 
@@ -2322,6 +2327,17 @@ fn a_toolchain_served(case: &Case, box_path: &OsString, seams: &str) -> Outcome 
     outcome
 }
 
+/// Sets the gate's `GATE_GODOT_ROOT` to `root` — which the builder's godot probe reads, and no run of this PC's own —
+/// or takes it out of the environment when the case gives none, so a machine with one set cannot serve a case by
+/// accident.
+fn set_godot_root(gate: &mut Command, root: Option<&Path>) {
+    if let Some(root) = root {
+        gate.env("GATE_GODOT_ROOT", root);
+    } else {
+        gate.env_remove("GATE_GODOT_ROOT");
+    }
+}
+
 /// A builder that finds no tool the manifest declares is refused `parity`, though the tree is no .NET tree, which the
 /// SDK check skips.
 #[test]
@@ -2330,7 +2346,7 @@ fn a_tool_the_builder_lacks_is_refused_parity_in_a_tree_that_is_not_dotnet() {
     write(&case, MANIFEST, "[tools]\npnpm = \"10\"\n");
     let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &["pnpm"]);
 
-    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")]);
+    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")], None);
 }
 
 #[test]
@@ -2340,7 +2356,7 @@ fn a_tool_older_than_the_manifest_s_minimum_is_refused_parity() {
     let nextest = "echo cargo-nextest 0.9.80 (abc 2026-01-01)\r\n";
     let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[("cargo-nextest", nextest)], &[]);
 
-    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "cargo-nextest 0.9.100 or later", "0.9.80")]);
+    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "cargo-nextest 0.9.100 or later", "0.9.80")], None);
 }
 
 /// The SDK's mismatch line comes first, then each tool's in the manifest's order, not the names', then one parity line.
@@ -2361,6 +2377,7 @@ fn the_sdk_s_mismatch_line_comes_before_the_tools_in_the_manifest_s_order() {
             mismatch_of(&case, "pnpm 10.0.0 or later", "none"),
             mismatch_of(&case, "cargo-nextest 0.9.100 or later", "0.9.80"),
         ],
+        None,
     );
 }
 
@@ -2372,7 +2389,7 @@ fn a_tool_the_builder_serves_goes_remote() {
     let tools = [("cargo-nextest", nextest), ("pnpm", "echo 10.0.0\r\n")];
     let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &tools, &[]);
 
-    let outcome = a_toolchain_served(&case, &box_path, ANSWERING);
+    let outcome = a_toolchain_served(&case, &box_path, ANSWERING, None);
 
     assert!(!outcome.stderr.contains("did not probe"), "{outcome:?}");
 }
@@ -2385,7 +2402,7 @@ fn a_tool_found_with_no_readable_version_is_skipped_with_its_line() {
     write(&case, MANIFEST, "[tools]\npnpm = \"10\"\n");
     let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[("pnpm", "echo pnpm, no version here\r\n")], &[]);
 
-    let outcome = a_toolchain_served(&case, &box_path, ANSWERING);
+    let outcome = a_toolchain_served(&case, &box_path, ANSWERING, None);
 
     let skipped = "gate: builder did not probe pnpm: found, version not readable; not checking it";
     assert!(outcome.stderr.lines().any(|line| line == skipped), "{skipped}: {outcome:?}");
@@ -2399,32 +2416,30 @@ fn a_builder_with_no_sdks_line_still_has_its_tools_checked() {
     write(&case, MANIFEST, "[tools]\npnpm = \"10\"\n");
     let box_path = box_path_with_tools(&case, "exit /b 3\r\n", &[], &["pnpm"]);
 
-    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")]);
+    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")], None);
 }
 
 /// Each tool the run cannot check is skipped with its line, and the run goes remote: a bad entry, a tool the builder's
-/// probe does not answer for in its 1 s bound, `godot`, which no probe reads, an unknown name, and a name that is no
-/// tool name at all. Only the probe's bound ends the hanging one, and no other line waits on a probe, so no load
-/// changes what the run says.
+/// probe does not answer for in its 1 s bound, an unknown name, and a name that is no tool name at all. Only the
+/// probe's bound ends the hanging one, and no other line waits on a probe, so no load changes what the run says.
 #[test]
 fn each_tool_the_run_cannot_check_is_skipped_with_its_line_and_the_run_goes_remote() {
     let case = client_case("client-tool-skipped");
     write(
         &case,
         MANIFEST,
-        "[tools]\nffmpeg = \"x\"\nnode = \"24\"\ngodot = \"4.7\"\nnodejs = \"24\"\n\"No de\" = \"1\"\n",
+        "[tools]\nffmpeg = \"x\"\nnode = \"24\"\nnodejs = \"24\"\n\"No de\" = \"1\"\n",
     );
     let go = Go(case.folder().join("ssh").join("node-go"));
     let held = case.folder().join("ssh").join("node-held");
     let hang = format!("\"{FAKE_TOOL}\" wait \"{}\" >\"{}\"\r\n", go.path().display(), held.display());
     let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[("node", hang.as_str())], &[]);
 
-    let outcome = a_toolchain_served(&case, &box_path, "--test-probe-limit-ms 1000 --test-dotnet-limit-ms 3600000");
+    let outcome = a_toolchain_served(&case, &box_path, "--test-probe-limit-ms 1000 --test-dotnet-limit-ms 3600000", None);
 
     let skipped = [
         "gate: .gate/toolchain.toml: tools.ffmpeg is not a version: \"x\"; skipping it",
         "gate: builder did not probe node: no answer in 1 s; not checking it",
-        "gate: builder did not probe godot: no probe for godot; not checking it",
         "gate: .gate/toolchain.toml names unknown tool nodejs; skipping it",
         "gate: .gate/toolchain.toml names unknown tool \"No de\"; skipping it",
     ];
@@ -2447,7 +2462,7 @@ fn an_unreadable_manifest_is_skipped_with_its_line_and_the_run_goes_remote() {
     write(&case, MANIFEST, "[tools\npnpm = \"10\"\n");
     let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &[]);
 
-    let outcome = a_toolchain_served(&case, &box_path, ANSWERING);
+    let outcome = a_toolchain_served(&case, &box_path, ANSWERING, None);
 
     let said: Vec<&str> = outcome
         .stderr
@@ -2467,7 +2482,7 @@ fn a_manifest_named_in_another_case_is_read() {
     write(&case, ".Gate/Toolchain.TOML", "[tools]\npnpm = \"10\"\n");
     let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &["pnpm"]);
 
-    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")]);
+    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")], None);
 }
 
 /// The manifest is read from the snapshot, which carries the worktree's uncommitted edits: the committed manifest
@@ -2481,7 +2496,77 @@ fn an_uncommitted_manifest_edit_is_read() {
     write(&case, MANIFEST, "[tools]\npnpm = \"10\"\n");
     let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &["pnpm"]);
 
-    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")]);
+    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")], None);
+}
+
+/// A project file naming the Godot SDK version `version`, as a Godot .NET repo's does.
+fn godot_csproj(version: &str) -> String {
+    format!(
+        "<Project Sdk=\"Godot.NET.Sdk/{version}\">\n  <PropertyGroup>\n    <TargetFramework>net10.0</TargetFramework>\n  \
+         </PropertyGroup>\n</Project>\n"
+    )
+}
+
+/// A `GATE_GODOT_ROOT` for a case, under its `ssh` folder, holding one Godot install per `(folder, line)`: a copy of the
+/// fake tool named `Godot_console.exe` answering `--version` with the line beside it, as step A's box reads one. The
+/// folder is left out of the case's snapshot, and lies outside the builder's own work folders, where a program would be
+/// refused.
+fn godot_root(case: &Case, installs: &[(&str, &str)]) -> PathBuf {
+    let root = case.folder().join("ssh").join("godot");
+    for (folder, line) in installs {
+        let install = root.join(folder);
+        fs::create_dir_all(&install).expect("an install folder can be made");
+        fs::copy(FAKE_TOOL, install.join("Godot_console.exe")).expect("the fake godot can be copied");
+        fs::write(install.join("version.txt"), line).expect("the line the fake godot answers with can be written");
+    }
+    root
+}
+
+/// A repo whose project file pins a Godot the builder has goes remote, with no line about godot: the builder probed the
+/// install the root names for its version.
+#[test]
+fn a_repo_pinning_a_godot_the_builder_has_routes() {
+    let case = client_case("client-godot-served");
+    write(&case, "src/App/Game.csproj", &godot_csproj("4.7.2"));
+    let root = godot_root(&case, &[("4.7.2", "4.7.2.stable.mono.official.abc\n")]);
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &[]);
+
+    let outcome = a_toolchain_served(&case, &box_path, ANSWERING, Some(&root));
+
+    assert!(
+        root.join("4.7.2").join("ran").exists(),
+        "the builder probed the Godot the project file pins"
+    );
+    assert!(!outcome.stderr.contains("godot"), "{outcome:?}");
+}
+
+/// A repo whose project file pins a Godot the builder has not runs here, saying the versions it has.
+#[test]
+fn a_repo_pinning_a_godot_the_builder_lacks_runs_here_saying_the_mismatch() {
+    let case = client_case("client-godot-lacking");
+    write(&case, "src/App/Game.csproj", &godot_csproj("4.7.2"));
+    let root = godot_root(&case, &[("4.3", "4.3.stable.mono.official.y\n")]);
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &[]);
+
+    a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "godot 4.7.2 exactly", "4.3.0")], Some(&root));
+}
+
+/// A repo that pins no Godot asks the builder for none: the run goes remote though the case's root names an install no
+/// project file pins, and the builder's probe never runs it.
+#[test]
+fn a_repo_with_no_godot_pin_sends_no_godot_need() {
+    let case = client_case("client-godot-unpinned");
+    write(&case, "src/App/App.csproj", "<Project />\n");
+    let root = godot_root(&case, &[("4.7.2", "4.7.2.stable.mono.official.abc\n")]);
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &[]);
+
+    let outcome = a_toolchain_served(&case, &box_path, ANSWERING, Some(&root));
+
+    assert!(!outcome.stderr.lines().any(|line| line.contains("godot")), "{outcome:?}");
+    assert!(
+        !root.join("4.7.2").join("ran").exists(),
+        "the builder probed a godot the repo never pinned"
+    );
 }
 
 /// A Ctrl+C raised just before the manifest is read ends the run as an interrupt before the preflight: nothing reaches
@@ -3927,6 +4012,12 @@ fn a_boot_call_dropped_before_the_banner_is_retried_once() {
 
     assert_eq!(outcome.code, Some(255), "{outcome:?}");
     assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 1, "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: builder did not answer the ssh banner; trying again (1 of 1)"),
+        "a bounded call's retry is its only one: {outcome:?}"
+    );
     assert!(outcome.stderr.contains(LOST_LINE), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight", "run", "stop", "boot", "boot"]);
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
@@ -4989,15 +5080,15 @@ fn ctrl_c_during_the_fetch_ends_as_an_interrupt() {
 }
 
 #[test]
-fn a_fetch_dropped_before_any_byte_is_retried_once() {
+fn a_fetch_dropped_before_any_byte_is_made_again_until_its_retries_run_out() {
     let case = outputs_case("client-outputs-fetch-banner", &BIN);
-    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "fail-banner", "fail-banner"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "fail-banner", "fail-banner", "fail-banner", "fail-banner"]);
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\new.txt", "built"]));
 
     assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
-    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 1, "{outcome:?}");
-    assert_eq!(calls(&steps), ["preflight", "run", "outputs", "outputs"]);
+    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 3, "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs", "outputs", "outputs", "outputs"]);
     let line = "gate: remote outputs not brought back: Connection timed out during banner exchange";
     assert!(outcome.stderr.contains(line), "{outcome:?}");
     assert_eq!(fetched_archives(&case), Vec::<PathBuf>::new(), "nothing is left of either attempt");

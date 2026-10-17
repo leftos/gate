@@ -130,6 +130,7 @@ fn is_batch_target_reads_the_extension_as_windows_does() {
         ("run.cmd ", true),
         ("run.cmd. .", true),
         ("run.cmdx", false),
+        ("foo.bat.exe", false),
         ("run", false),
         ("run.exe", false),
         (r"C:\dir.cmd\run", false),

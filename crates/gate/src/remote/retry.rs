@@ -1,5 +1,6 @@
 //! The one rule a call of the client is retried on: it failed before the ssh banner, so the builder never started
-//! anything and the call is safe to make again. It is made once more, after a pause.
+//! anything and the call is safe to make again. It is made again up to [`PRE_BANNER_RETRIES`] times, each after a pause,
+//! for as long as every call fails the same way.
 
 use std::time::Duration;
 
@@ -10,6 +11,9 @@ pub(crate) const SSH_FAILED: i32 = 255;
 pub(crate) const GIT_SSH_FAILED: i32 = 128;
 /// The pause before the retry, when `--test-remote-retry-pause-ms` gives none.
 const PAUSE: Duration = Duration::from_secs(2);
+/// How many times a call that failed before the banner is made again, each after [`pause`]: a builder whose ssh server
+/// stops starting sessions for tens of seconds at a time is passed by the calls this many pauses apart.
+pub(crate) const PRE_BANNER_RETRIES: usize = 3;
 /// The least of a bounded call's bound that must be left after the pause for its retry to be made.
 const FLOOR: Duration = Duration::from_secs(5);
 /// The bound of a bounded call, the `stop` or the `boot`, when `--test-remote-bound-ms` gives none.
@@ -45,9 +49,9 @@ pub(crate) fn before_the_banner(ended: &Ended<'_>) -> bool {
             .is_some_and(|line| PRE_BANNER.iter().any(|words| line.starts_with(words)))
 }
 
-/// The line said before the retry of a call to `host`.
-pub(crate) fn retry_line(host: &str) -> String {
-    format!("gate: {host} did not answer the ssh banner; trying once more")
+/// The line said before the retry `n` of the `total` a call to `host` gets, counted from 1.
+pub(crate) fn retry_line(host: &str, n: usize, total: usize) -> String {
+    format!("gate: {host} did not answer the ssh banner; trying again ({n} of {total})")
 }
 
 /// The pause before a retry: `--test-remote-retry-pause-ms` when given, else 2 s.
@@ -70,7 +74,7 @@ pub(crate) fn retry_allowed(bound: Duration, elapsed: Duration, pause: Duration)
 mod tests {
     use std::time::Duration;
 
-    use super::{Ended, GIT_SSH_FAILED, SSH_FAILED, before_the_banner, retry_allowed, retry_line};
+    use super::{Ended, GIT_SSH_FAILED, PRE_BANNER_RETRIES, SSH_FAILED, before_the_banner, retry_allowed, retry_line};
 
     #[test]
     fn a_bounded_call_is_retried_only_with_5_s_of_its_bound_left_after_the_pause() {
@@ -160,7 +164,18 @@ mod tests {
     }
 
     #[test]
-    fn the_retry_line_names_the_host() {
-        assert_eq!(retry_line("builder"), "gate: builder did not answer the ssh banner; trying once more");
+    fn the_retry_line_names_the_host_and_the_retry() {
+        assert_eq!(
+            retry_line("builder", 1, 1),
+            "gate: builder did not answer the ssh banner; trying again (1 of 1)"
+        );
+        assert_eq!(
+            retry_line("builder", 1, PRE_BANNER_RETRIES),
+            "gate: builder did not answer the ssh banner; trying again (1 of 3)"
+        );
+        assert_eq!(
+            retry_line("builder", 3, PRE_BANNER_RETRIES),
+            "gate: builder did not answer the ssh banner; trying again (3 of 3)"
+        );
     }
 }

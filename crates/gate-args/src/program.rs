@@ -17,19 +17,28 @@ pub struct ProgramSearch<'a> {
 ///
 /// A name with a directory part is taken as written and read against the working folder: `.` and `..` folded,
 /// separators written `\`; a name with a drive (`C:\x`, or `C:x`, which stays drive-relative) or a UNC name is left as
-/// written. Any other name is looked for in each absolute `PATH` folder in order (a relative entry is skipped): a name
-/// with an extension as written, `<folder>\<name>`; a bare name with each `PATHEXT` extension in order within each
-/// folder, `<folder>\<name><ext>`, so an extensionless file (a shim) is never found. The first that `is_file` finds
-/// wins.
+/// written. Any other name is looked for in each absolute `PATH` folder in order (a relative entry is skipped), the
+/// folders outer and the candidates within one folder inner:
+///
+/// - with no extension, each `PATHEXT` extension in order, `<folder>\<name><ext>`, so an extensionless file (a shim) is
+///   never found;
+/// - with an extension that is one of `PATHEXT`'s, the extension compared whole, its leading dot included, against
+///   whole `PATHEXT` entries and ignoring ASCII case (so a dotless entry such as `EXE` matches nothing), as written
+///   only, `<folder>\<name>`, so a name ending in `.cmd` never gains a second extension;
+/// - with any other extension, a version-holding name such as `Godot_v4.7.2-stable_mono_win64_console` among them, as
+///   written, `<folder>\<name>`, then with `.exe` appended, `<folder>\<name>.exe`; no other `PATHEXT` extension is
+///   appended.
+///
+/// The first that `is_file` finds wins.
 #[must_use]
 pub fn resolve_program(name: &str, search: &ProgramSearch<'_>, is_file: impl Fn(&str) -> bool) -> Option<String> {
     if has_directory(name) {
         return Some(absolute(name, search.folder));
     }
-    let extensions: Vec<&str> = if has_extension(name) {
-        vec![""]
-    } else {
-        search.pathext.split(';').filter(|extension| !extension.is_empty()).collect()
+    let extensions: Vec<&str> = match extension(name) {
+        None => search.pathext.split(';').filter(|extension| !extension.is_empty()).collect(),
+        Some(extension) if is_pathext_extension(extension, search.pathext) => vec![""],
+        Some(_) => vec!["", ".exe"],
     };
     search.path.split(';').filter(|folder| is_absolute(folder)).find_map(|folder| {
         let folder = folder.trim_end_matches(is_separator);
@@ -49,10 +58,16 @@ fn is_separator(character: char) -> bool {
     matches!(character, '\\' | '/')
 }
 
-/// Whether the name's last segment has a `.` that is not its last character, as .NET's `Path.GetExtension` reads it.
-fn has_extension(name: &str) -> bool {
+/// The name's extension, its last `.` and what follows it, when that dot is not the segment's last character, as .NET's
+/// `Path.GetExtension` reads one; `None` for a name without one.
+fn extension(name: &str) -> Option<&str> {
     let segment = name.rsplit(is_separator).next().unwrap_or(name);
-    segment.rfind('.').is_some_and(|dot| dot + 1 < segment.len())
+    segment.rfind('.').filter(|dot| dot + 1 < segment.len()).map(|dot| &segment[dot..])
+}
+
+/// Whether `extension`, the dot included, is one of `pathext`'s entries, compared ignoring ASCII case.
+fn is_pathext_extension(extension: &str, pathext: &str) -> bool {
+    pathext.split(';').any(|entry| entry.eq_ignore_ascii_case(extension))
 }
 
 fn has_directory(name: &str) -> bool {

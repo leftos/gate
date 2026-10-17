@@ -93,26 +93,29 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
     console.out(&format!("gate: remote version {}", build_version()));
     console.out(&format!("gate: remote warm {}", warm.as_deref().unwrap_or("none")));
     boot::say(console);
-    say_sdks_and_tools(payload, seams, console);
+    say_sdks_and_tools(payload, work, seams, console);
     0
 }
 
 /// Says the SDK line, the list read within `--test-dotnet-limit-ms` when `seams` gives it, else
 /// [`git::DOTNET_LIMIT`], then one line on stdout for each tool the payload's `Needs` names, in its order. The tools are
 /// probed within `--test-probe-limit-ms` when `seams` gives it, else [`probe::PROBE_LIMIT`], while dotnet lists the
-/// SDKs. A `Needs` that is not an object of texts is said on stderr, probes nothing, and fails nothing. The minimum each
-/// need carries is not read: the box reports, the client compares.
-fn say_sdks_and_tools(payload: &Payload, seams: &BoxSeams, console: &mut Console) {
+/// SDKs. No probe runs a program from the run's own folders ([`refused_folders`]). A `Needs` that is not an object of
+/// texts is said on stderr, probes nothing, and fails nothing. The minimum each need carries is not read: the box
+/// reports, the client compares.
+fn say_sdks_and_tools(payload: &Payload, work: &str, seams: &BoxSeams, console: &mut Console) {
     let names: Result<Vec<String>, String> = payload
         .pairs("Needs")
         .map(|needs| needs.into_iter().map(|(name, _)| name).collect())
         .map_err(|line| format!("{line}; probing nothing"));
     let probe_limit = seams.probe_limit_ms.map_or(probe::PROBE_LIMIT, Duration::from_millis);
+    let refused = refused_folders(payload, work);
+    let worktrees: Vec<&Path> = refused.iter().map(PathBuf::as_path).collect();
     thread::scope(|scope| {
         let probes = names.as_ref().ok().filter(|names| !names.is_empty()).map(|names| {
             (
                 names,
-                scope.spawn(move || probe::probe(names, probe_limit, Ok(Variables::from_process()), None)),
+                scope.spawn(move || probe::probe(names, probe_limit, Ok(Variables::from_process()), &worktrees)),
             )
         });
         say_sdks(seams.dotnet_limit_ms.map_or(git::DOTNET_LIMIT, Duration::from_millis), console);
@@ -130,6 +133,25 @@ fn say_sdks_and_tools(payload: &Payload, seams: &BoxSeams, console: &mut Console
             console.out(&probe::tool_line(&name, &probed));
         }
     });
+}
+
+/// The folders of the payload's run that no tool probe runs a program from: the folder above `work`, `work` itself,
+/// the bare folder and the outputs folder, each one the payload has. `work` is the work folder the preflight has
+/// already read, so the folder above it and itself are always refused; a payload whose `Bare` or `OutputFolder`
+/// cannot be read refuses the rest.
+fn refused_folders(payload: &Payload, work: &str) -> Vec<PathBuf> {
+    let mut folders: Vec<PathBuf> = Vec::new();
+    if let Some(above) = Path::new(work).parent() {
+        folders.push(above.to_path_buf());
+    }
+    folders.push(PathBuf::from(work));
+    if let Ok(bare) = payload.path("Bare") {
+        folders.push(PathBuf::from(bare));
+    }
+    if let Ok(outputs) = payload.output_folder(work) {
+        folders.push(PathBuf::from(outputs));
+    }
+    folders
 }
 
 /// The most bytes of a warm record [`warm_state`] reads: one past a hash, so a longer record is seen as not one.
@@ -890,14 +912,17 @@ mod tests {
     use std::fs::{self, OpenOptions};
     use std::io::{self, Write as _};
     use std::os::windows::fs::OpenOptionsExt;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::{Child, Stdio};
     use std::sync::PoisonError;
 
+    use base64::Engine as _;
+    use serde_json::json;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
-    use super::{Git, TreeAt, fresh_config, fresh_config_written, git_failed, ready_tree, replace_config, run_forwarded, sdk_list};
+    use super::{Git, TreeAt, fresh_config, fresh_config_written, git_failed, ready_tree, refused_folders, replace_config, run_forwarded, sdk_list};
     use crate::boxside::forward::OutputLock;
+    use crate::boxside::payload::Payload;
     use crate::console::Console;
 
     #[test]
@@ -920,6 +945,39 @@ mod tests {
         assert!(
             !drained.all_ended,
             "the reader of git's stderr waits for the held output lock, so it cannot end within the drain"
+        );
+    }
+
+    /// The payload `json` spells, as the box reads it off its own standard input.
+    #[expect(clippy::expect_used, reason = "a test payload that does not decode must fail loudly")]
+    fn decoded(json: &str) -> Payload {
+        Payload::decode(&base64::engine::general_purpose::STANDARD.encode(json)).expect("the test payload decodes")
+    }
+
+    /// All four folders of a run's own layout are refused, the folder above `Work` among them: dropping any one of
+    /// them fails this.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test payload with no work folder must fail loudly")]
+    fn the_refused_folders_are_the_run_s_own() {
+        let payload = decoded(
+            &json!({
+                "Key": "k",
+                "Work": r"D:\gate-remote\work\k",
+                "Bare": r"D:\gate-remote\app.git",
+                "OutputFolder": r"D:\gate-remote\outputs",
+            })
+            .to_string(),
+        );
+        let (_, work) = payload.work_folder().expect("the test payload has a work folder");
+
+        assert_eq!(
+            refused_folders(&payload, work),
+            [
+                PathBuf::from(r"D:\gate-remote\work"),
+                PathBuf::from(r"D:\gate-remote\work\k"),
+                PathBuf::from(r"D:\gate-remote\app.git"),
+                PathBuf::from(r"D:\gate-remote\outputs"),
+            ]
         );
     }
 

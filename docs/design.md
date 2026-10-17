@@ -27,7 +27,7 @@ Non-goals:
 
 The CLI is subcommands with GNU-style flags: `--name value` or `--name=value`, and `--` ends the gate's options. The first word picks the parser. `--version`, `--help`, `-h` and `help` are matched first; then a subcommand name selects the CLI below, and any other first word starting with `-` selects the [compatibility layer](#compatibility-layer). No arguments at all print the usage on stderr and exit 2.
 
-A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `check`, `burn` or `expect` line also prints the usage on stdout and exits 0, whatever else the line holds; after the `--` it belongs to the command (`gate run --slot light --timeout 5 --log x.log -- tool --help` runs `tool --help`).
+A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `check`, `warm`, `burn` or `expect` line also prints the usage on stdout and exits 0, whatever else the line holds; after the `--` it belongs to the command (`gate run --slot light --timeout 5 --log x.log -- tool --help` runs `tool --help`).
 
 | Subcommand | Purpose |
 |---|---|
@@ -38,6 +38,7 @@ A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `
 | `gate check` | Say what this PC lacks for the repo in the current folder, and how to install it. |
 | `gate burn` | Spin the CPU for a set time, for the load-burn tool. |
 | `gate expect` | Print the expected time of a command here and on each builder, from the durations store. |
+| `gate warm` | Warm the builder's work folder of the worktree the gate is started in, by running its `.gate/warmup.toml` commands there ([`gate warm`](#gate-warm)). |
 | `gate box` | Hidden: the builder side of a routed run. |
 | `gate --version` | Print `gate <package version>+<build id>` and exit 0 ([Build id](#build-id)). |
 | `gate --help`, `gate -h`, `gate help`, `gate <subcommand> --help` | Print the usage on stdout and exit 0. |
@@ -238,7 +239,7 @@ The tool lines, for each tool of the manifest, probed as the box probes the tool
 - `<tool> missing (needs <min> or later)`, or `(needs it present)` for a tool declared with `""`;
 - `<tool> <found> ok` for a tool declared present at any version, and `<tool> ok (version not readable)` for a present one whose version the probe could not read;
 - `<tool> skipped: found, version not readable (needs <min> or later)` when a minimum is declared and the tool answered with no version;
-- `<tool> skipped: <why>` when the probe gave no answer, `<why>` being the probe's own reason (`no answer in 10 s`, `no probe for godot`, `cannot run <program>: <error>`);
+- `<tool> skipped: <why>` when the probe gave no answer, `<why>` being the probe's own reason (`no answer in 10 s`, `cannot run <program>: <error>`, and for `godot` the reasons of its probe, such as `cannot run <install>: <install> lies inside the worktree` for a `GATE_GODOT_ROOT` inside the repo, [Tool probes](#the-box-side));
 - `tools.<name> skipped: not a tool gate knows` for a name the manifest declares that gate has no probe for, which runs nothing.
 
 The SDK line comes only when the root has a `global.json` with an `sdk.version`; one with no `sdk` key, or an `sdk` with no `version`, pins nothing and prints none.
@@ -247,7 +248,7 @@ With a pin that names a version it is `.NET SDK <version> (rollForward <policy>)
 
 The SDK list is read with the folders inside the worktree dropped from `PATH`. A `global.json` whose pin cannot be read (a reason above) says `.NET SDK skipped: global.json has no readable sdk pin`, which counts as skipped, and the file counts as unreadable; a list that cannot be read `.NET SDK skipped: cannot read this PC's SDK list: <why>`.
 
-A manifest that lists workloads gets one line, `workloads <ids, comma separated> not checked yet`, which counts as neither skipped nor missing. The tools in `.config/dotnet-tools.json` and a `Godot.NET.Sdk` pin are not checked and say nothing.
+A manifest that lists workloads gets one line, `workloads <ids, comma separated> not checked yet`, which counts as neither skipped nor missing. The tools in `.config/dotnet-tools.json` and a `Godot.NET.Sdk` pin are not checked by `gate check` and say nothing; a routed run does read a Godot pin (Toolchain manifest, under Routing), and `gate check` judges a manifest `godot` entry as a minimum, as every other tool's.
 
 Each sibling the repo declares is checked as routing checks it, and gets one line:
 
@@ -342,6 +343,49 @@ It prints one line per place with an estimate on stdout, the local one first, th
 
 The launcher maps no `-Expect`: the compatibility layer refuses it, and callers run `gate.exe expect -- <command>` directly.
 
+### `gate warm`
+
+`gate warm [--cd <folder>] [--background] [--state-dir <path>]` warms the builder's work folder of the worktree the gate is started in: it runs the commands of the worktree's `.gate/warmup.toml` there and keeps how that ended in the worktree's warm-up record.
+
+It takes no command, `--log`, `--timeout` or `--local`: the commands come from the file, the log is `remote\warm\<key>.log` and the ceiling is the file's `timeout`. A warm-up takes no slot and writes no journal event. It runs the warm-up even when the work folder is already warm.
+
+- `--cd <folder>` enters the folder as `gate run --cd` does ([Run folder](#run-folder)), with the same refusals, which exit 2. Whatever folder of the worktree the gate starts in, the warm-up is worded and laid out from the worktree root (the gate makes the root its working folder), so its commands, their path rewrite and its work folder are those of a routed run started at the root, and the call's subfolder is empty.
+- `--background` keeps a warm-up that does not start quiet: no consent, no warm-up file and a warm-up already running say nothing and exit 0. It detaches nothing; whatever starts a warm-up in the background does that. Nothing starts one from a route yet.
+- `--state-dir` and `GATE_STATE_DIR` resolve the [state root](#state-root) as for `gate stop-tree`.
+- A test-seams build also takes `--test-warm-wait-ms <n>`, which replaces the file's ceiling as the length of the key mutex wait and of the cap wait, and the remote client's seams a routed run takes (`--test-remote-client`, `--test-remote-transport`, and the others that need the transport), but not `--test-print-request`.
+- Exit codes: 0 warm (also, with `--background`, a warm-up that did not start for no consent, no file or a warm-up already running); 2 a usage or precondition problem; 1 a warm-up that failed or was refused, a failed record write, and, without `--background`, a warm-up already running; `0xC000013A` on Ctrl+C. A word other than the options above is a usage error, exit 2.
+
+It works in this order, each step ending the warm-up where it fails.
+
+1. The state root, then `--cd`, then the worktree root, then `remote.json`, then the repo's consent (`warmup` in `remote.json`; one that cannot be read is no consent), then the routing target (a repo `remote.json` does not list, or siblings that cannot be used, end here), then the warm-up file's first read: through the `.gate` reader, parsed and hashed, each command worded for the builder as a routed run words it (`builder_words`). This read gives the hash of the first `warming` record only.
+2. The warm-up lock `remote\warm\<key>.lock`, taken for the warm-up's whole life: created when missing, opened without sharing and without following a link, required to be a plain file, its open tried again every 20 ms for 200 ms while another handle holds it, which rides out a route's probe. A lock still held ends the warm-up without touching the record. In the foreground it says `gate: a warm-up of <host> is already running` and exits 1; with `--background` it says nothing and exits 0.
+3. The warm-up's log `remote\warm\<key>.log`, made new: an earlier one is removed, then the new one is created as a plain file without following a link and held open sharing reading and writing but not deletion, so nothing can put a link in its place while the client appends to it by its path.
+4. The `warming` record, with the first read's hash, this process's pid and start and the PC gate's build id.
+5. The remote client chosen and `ready()`, then the key's mutex waited for up to the file's ceiling (the client's `hold_key_waiting`), then the cap lock `remote\warm.lock` waited for up to the same length in slices of 100 ms, looking at the console interrupt between them.
+
+   A key or cap not got in time ends the warm-up `failed`, class `refused`, with the reason `another routed run held the work folder past the wait` or `another warm-up held the warm-up cap past the wait`. A Ctrl+C during either wait deletes the record.
+
+   A client that is not ready ends it `failed`, class `refused`, with the client's line as the reason.
+6. The late recheck, in this order: `remote.json` read again, consent, the builder host, the routing entry, the siblings, then the warm-up file read again. The commands, the `WarmHash` and the final record come from this read alone, not from the first. A recheck that finds one of them gone or changed withdraws the warm-up: the record is deleted, the builder is not called, and the end says its line (quiet with `--background`, except a file problem or a target problem, which say their line).
+7. The client's warm call ([Warm-up call](#routing)) from the worktree root, with the late read's commands and hash and the late file's `timeout` as its ceiling.
+
+   The record is written from how the client says the warm-up ended alone, never from its status: `warm` for a confirmed warm-up, `failed` with the client's class and reason, deleted for a Ctrl+C (exit `0xC000013A`), and `failed`, class `refused`, with the client's detail (else `the client did not start the warm-up`) for a call that said nothing of its end.
+
+   A final write that fails says its line, deletes the `warming` record and exits 1. Its cap lock, key mutex and warm-up lock are let go last.
+
+The key mutex wait, the cap wait and the client's backstop on the run call (five ceilings and 60 s) bound the warm-up's life at about seven ceilings plus 60 s and the git limits; it has no deadline of its own, and a stale `warming` record counts as live only while its lock is held.
+
+The lines, each on stderr and escaped to one line where it carries a path, a repo, a host or a reason:
+
+- Ends before the record, exit 2: `gate: warm: LOCALAPPDATA is unset or not absolute, so there is no remote.json`, `gate: warm: <path> does not exist`, `gate: warm: <path> cannot be used: <reason>` (both for `remote.json`), `gate: warm: the folder is not in a git worktree`, `gate: warm: cannot find the git worktree: <why>`, `gate: warm: cannot enter the worktree root <path>: <error>`, `gate: warm: <repo> is not listed in remote.json`, and the target's siblings line.
+- No consent, exit 2 (quiet with `--background`, exit 0): `gate: warm: <repo> has not consented to warm-ups in remote.json` and `gate: warm: remote.json's warmup cannot be read: <reason>`.
+- No file, exit 2 (quiet with `--background`, exit 0): `gate: warm: <root>\.gate\warmup.toml does not exist`.
+- A file problem, exit 2: `gate: warm: .gate\warmup.toml <problem>` (the first problem, then ` (and <n> more)`), `gate: warm: .gate\warmup.toml command <n> starts with <word>, which a routed run never sends` (a command a routed run keeps on this PC) and `gate: warm: .gate\warmup.toml command <n> names <word>, outside the worktree`.
+- Withdrawn at the recheck, exit 2 (quiet with `--background`, exit 0): `gate: warm: remote.json's builder changed from <host> to <host>`, `gate: warm: remote.json's entry for <repo> changed` (also for a changed work folder key or inputs), `gate: warm: the siblings of <repo> changed while the warm-up waited`, and the consent and file lines above.
+- Ends that write no record, exit 1: `gate: warm: cannot make <folder>: <error>`, `gate: warm: cannot take <lock>: <why>`, `gate: warm: cannot remove the earlier warm-up log <path>: <error>`, `gate: warm: cannot create the warm-up log <path>: <error>`, `gate: warm: cannot use the warm-up log <path>: <error>` and `gate: warm: cannot write the warm-up record <path>: <error>`.
+- `gate: warm: cannot delete the warm-up record <path>: <error>` joins the line of a final write that failed or a record a withdrawal could not delete.
+- `gate: cannot install the Ctrl+C handler, so Ctrl+C ends the gate at once: <error>`, and the verdicts: `gate: warm-up of <host> passed` (exit 0) and `gate: warm-up of <host> failed: <reason>` (exit 1). The client's own lines and the box's go to the console and the warm-up's log as a run's do.
+
 ### `gate box`
 
 Hidden from the usage and from `--help`. It is the builder side of a routed run, run over ssh on the builder ([The box side](#the-box-side)).
@@ -429,6 +473,10 @@ The lines of a run that starts its command:
 
   A sibling folder that cannot be carried says `gate: not routed: sibling <name> <reason>`, `<reason>` being `is a link or a junction`, `is not a folder`, `has a .git that is a link or a junction`, `is the worktree's own folder` or `is the same folder as sibling <other>`.
 
+  A repo with warm-up consent and a `.gate/warmup.toml` keeps a run here, after every other local reason, with `gate: not routed: the work folder for this worktree on <host> is not warm; gate warm warms it`, `gate: not routed: <host> is warming the work folder for this worktree`, `gate: not routed: the warm-up failed <n> min ago|less than a minute ago: <reason>`.
+
+  The same repo's run also stays here with `gate: not routed: .gate/warmup.toml: <problem>`, `gate: not routed: the warm-up record <path> cannot be read: <error>` or `gate: not routed: the warm-up lock <path> cannot be read: <error>` (the judge is under [remote.json](#remotejson)).
+
   The remote client keeps a routed run here, after the route, with `gate: not routed: <who> <why>`, status 75 and the fallback reason `client`, then `gate: remote <host> client could not start: <who> <why>; running here`. `<who>` is the worktree root's folder name for the main repository and `sibling <name>` for a sibling.
 
   A run of one repository can say `<leaf> is not the folder the route was decided for` (the root's folder id is not the one the route read) and `<leaf> cannot be checked: <error>`.
@@ -445,11 +493,13 @@ The lines of a run that starts its command:
 
   A gate that is not heavy, has a covering parent, matches no pattern or has no `remote.json` says nothing.
 - A local run that drops its dotnet `--no-build`, on stderr and in the log, before it takes a slot: `gate: dropped --no-build: <reason>; building on a heavy slot`, or `gate: dropped --no-build: <reason>; building on the parent gate's <heavy|critical|light> slot` for a gate covered or lent a slot ([Routing](#routing)).
-- A routed run, on stderr and in the log, after any `gate: dropped --no-build: the last build may have run on the other machine` and `gate: outputs: none brought back for a --no-build command` lines, says `gate: routed with siblings: <name> (<path>), ...` when the repo declares siblings.
+- A routed run, on stderr and in the log, says first `gate: routed <given> as <name>` when it sent the command's first word, which named a program by an absolute path outside the worktree, as the program's name (`<given>` the word as given, `<name>` the name sent, each escaped; [Routing](#routing), the in-worktree path rewrite). After that line and any `gate: dropped --no-build: the last build may have run on the other machine` and `gate: outputs: none brought back for a --no-build command` lines, it says `gate: routed with siblings: <name> (<path>), ...` when the repo declares siblings.
 
   The line names each sibling in declared order with its root as routing spells it. While it waits for a remote slot: `gate: waiting for a remote slot on <host> (<n> busy)` and `gate: still waiting for a remote slot on <host> (<s> s)`, as a local wait says them, ETA included.
 
-  A run the builder does not take says why and goes on here: `gate: remote <host> <reason>; running here`, with `<reason>` one of `full` (no remote slot within 60 s), `busy`, `unreachable`, `parity`, `rebooted`, `tools`, `layout`, `version`, `inputs` (the run's ignored inputs could not be sent, or the builder's work folder no longer held them at the run) or `cold` (the builder's work folder was not warm for the run's warm-up file; the client says it for a call that needs a warm folder, and no run makes such a call yet), and `gate: remote <host> client could not start: <detail>; running here` when the remote client cannot start.
+  A run the builder does not take says why and goes on here: `gate: remote <host> <reason>; running here`, with `<reason>` one of `full` (no remote slot within 60 s), `busy`, `unreachable`, `parity`, `rebooted`, `tools`, `layout`, `version`, `inputs` (the run's ignored inputs could not be sent, or the builder's work folder no longer held them at the run) or `cold` (the builder's work folder was not warm for the run's warm-up file; the client says it for a call that needs a warm folder, which a routed run of a repo with a warm record makes), and `gate: remote <host> client could not start: <detail>; running here` when the remote client cannot start.
+
+  After a `cold` fallback's line the run says `gate: gate warm warms the work folder for this worktree on <host>`. A `cold` or `layout` fallback removes the worktree's warm-up record, but only while it is still the `warm` record of the hash the route asked for, under the remote key; the other fallbacks keep it. A removal that fails says `gate: cannot remove the warm-up record <path>: <error>` before that hint.
 
   A routed run whose repo declares `inputs` says `gate: inputs: <n> file(s), <X.X> MB (<Y.Y> MB compressed) in <Z.Z> s` once a put has sent files.
 
@@ -616,9 +666,9 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | `remote\<key>.inputs-hashes` | the Rust remote client | the same | The inputs' hash cache, in the outputs cache's shape and saved as it is, kept apart from it since the outputs saves drop every file the outputs walk no longer finds. Saved after an inputs manifest the client builds changes it; a file whose hash the pack finds wrong is dropped from it, and deleting the file resets the cache ([The remote client's run](#routing), Inputs). |
 | `remote\<key>.nothing-back` | the gate, after a routed dotnet build ends on the builder without its outputs known to be brought back, or, when none stands, a routed dotnet `--no-build` command whose word the builder dropped | every gate (the `--no-build` drop and the clear) | JSON `{"v":1,"host":"…","configuration":"…","framework":"…","runtime":"…"}`; the last three are optional and come from the routed build's own `-c`, `-f` and `-r` words. A passing local build of the whole worktree with the same three removes it, as does a passing routed build of that kind that brought all its outputs back ([Routing](#routing)). Written with create-new and the reparse-point flag, and read the same way, 4096 bytes at most; one that cannot be read counts as present. |
 | `remote\<key>.outputs-capped` | the Rust remote client, at an outputs fetch that passed the fetch cap | the same | The outputs cap record: JSON `{"v":1,"hits":<n>}`, the fetches in a row of that worktree that passed the cap. A second hit in a row fails the run; any other end of its outputs fetch but a Ctrl+C during it, and a box that packed nothing, removes it; one that cannot be read counts no hit ([The remote client's run](#routing), Outputs fetch). |
-| `remote\warm\<key>.json` | the warm-up of the work folder `<key>` (not wired yet; `gate-state` has the writer and reader) | the route's warm-up judge | The warm-up record: JSON `{"v":1,"host":"…","state":"…","at":"<ISO>","hash":"…","gate":"…","pid":<n>,"started":"<ISO>"}`, then `failure` and `reason` when, and only when, `state` is `failed`. `state` is `warming`, `warm` or `failed`; `failure` is `commands` (the commands failed or ran out of time) or `refused` (refused before any command ran); `hash` is the 64 lower-case hex digits of the SHA-256 of the raw bytes of the worktree's `.gate/warmup.toml`, a byte order mark included; `gate` is the build id of the PC gate that wrote it; `pid` and `started` are the warming process's, for the lines only. Written whole or not at all like the nothing-back record; a record that breaks a rule of its shape is refused on read and on write. ops-tower does not read it. |
-| `remote\warm\<key>.log`, `remote\warm\<key>.lock` | the warming process | the route's warm-up judge (the lock) | The warm-up's log, and the lock it holds for its whole life: a `warming` record counts as live only while the lock is held. Paths only so far. |
-| `remote\warm.lock` | the warming process | other warming processes | The lock that lets one warm-up at a time run on this PC. Path only so far. |
+| `remote\warm\<key>.json` | `gate warm` for the work folder `<key>` (`gate-state` has the writer and reader) | the route's warm-up judge | The warm-up record: JSON `{"v":1,"host":"…","state":"…","at":"<ISO>","hash":"…","gate":"…","pid":<n>,"started":"<ISO>"}`, then `failure` and `reason` when, and only when, `state` is `failed`. `state` is `warming`, `warm` or `failed`; `failure` is `commands` (the commands failed or ran out of time) or `refused` (refused before any command ran); `hash` is the 64 lower-case hex digits of the SHA-256 of the raw bytes of the worktree's `.gate/warmup.toml`, a byte order mark included; `gate` is the build id of the PC gate that wrote it; `pid` and `started` are the warming process's, for the lines only. Written whole or not at all like the nothing-back record; a record that breaks a rule of its shape is refused on read and on write. ops-tower does not read it. A routed run reads it without following the leaf link and removes it after a `cold` or `layout` fallback while it is still the `warm` record of the hash the route asked for. |
+| `remote\warm\<key>.log`, `remote\warm\<key>.lock` | `gate warm` | the route's warm-up judge (the lock) | The warm-up's log, made new for each warm-up, opened without following links and held open without delete sharing, and the lock it holds for its whole life, opened without sharing: a `warming` record counts as live only while the lock is held. A routed run probes the lock opened with full sharing and never takes or creates it. |
+| `remote\warm.lock` | `gate warm` | other warming processes | The lock that lets one warm-up at a time run on this PC, taken after the key's mutex and waited for up to the warm-up file's ceiling. |
 `<start>` everywhere in a name is the process start time in Unix epoch milliseconds. Claims, tickets, counts, the nothing-back record and the outputs cap record are written to a temporary sibling (`<file>.<pid>.<n>.tmp`, where `<n>` is a per-process counter so two threads of one process never share one) and moved over the target, so a reader never sees a torn file (kept, L1, Q1).
 
 A `remote-cutover.flag` or `remote-cutover.draining` left in a state root is ignored: nothing reads or writes either file.
@@ -819,7 +869,7 @@ Fields beyond J1's:
   `transfer-timed-out` is a routed run's fetch after the command cut at its transfer ceiling.
 
   A routed run is a kill only when the gate killed it; a command that exits 124 on its own is `failed`.
-- `fallback`: `reason`, one of `full` (no remote slot within the 60 s wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `layout` (the box could not clear or lay out its work folder), `version` ([The box side](#the-box-side)), `client` (the remote client could not start, as when it finds no usable ssh), `inputs` (the run's ignored inputs could not be sent, a sibling pair declared inputs, or the box refused the run because its work folder no longer held the inputs sent) and `cold` (the builder's work folder was not warm for the run's warm-up file; `FallbackReason::Cold` writes the word, and the client refuses a call that needs a warm folder this way, but no run makes such a call yet).
+- `fallback`: `reason`, one of `full` (no remote slot within the 60 s wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `layout` (the box could not clear or lay out its work folder), `version` ([The box side](#the-box-side)), `client` (the remote client could not start, as when it finds no usable ssh), `inputs` (the run's ignored inputs could not be sent, a sibling pair declared inputs, or the box refused the run because its work folder no longer held the inputs sent) and `cold` (the builder's work folder was not warm for the run's warm-up file; `FallbackReason::Cold` writes the word, and the client refuses a call that needs a warm folder this way).
 
   The `take` after it is the run's local one, untagged, its `waitedSeconds` counted from the `fallback`, except after `full`, where it counts from the run's `queue` line; a Ctrl+C that ends that local wait writes the same figure on its `abandon`.
 - a routed run's `take`, `release` and `abandon` carry the tag; its `release` has the builder's `adjustedSeconds` (null when it said none) and a `wallSeconds` of the whole remote call, and the verdict `timed-out` or `backstop` after a kill by the builder or by the client's backstop.
@@ -890,15 +940,21 @@ The optional `hosts` is an array of strings naming further builders, which only 
 
 The push order is `host`, then `hosts` in file order, an entry equal to an earlier one in any letter case skipped. A `hosts` that is not an array of strings, or holds a bad entry, never affects routing: `gate push` alone refuses the file with `push: ignored <path>: <reason>`.
 
-`warmup` is an array of repo names, matched in any letter case, that consent to the repo's `.gate/warmup.toml` warming its builder work folders (`Config::warmup_consented`); a repo it does not name, or a file without the key, has no consent. A value that is not an array of non-empty strings consents to none and leaves the rest of the file usable, and `warmup_consented` gives its reason. Nothing reads the consent yet.
+`warmup` is an array of repo names, matched in any letter case, that consent to the repo's `.gate/warmup.toml` warming its builder work folders (`Config::warmup_consented`); a repo it does not name, or a file without the key, has no consent. A value that is not an array of non-empty strings consents to none and leaves the rest of the file usable, and `warmup_consented` gives its reason. A routed run reads the consent from the same `remote.json` read its routing decision used, one read per run.
 
 ops-tower reads only `slots`.
 
 A repo's own `.gate/toolchain.toml`, which declares the tools and workloads a routed run's builder needs, is a separate file in the snapshot, not part of `remote.json`: [Routing](#routing) (Toolchain manifest) describes its format.
 
-A repo's `.gate/warmup.toml`, which declares the warm-up commands, is read by `gate_router::warm::read_warmup`: `commands`, an array of 1 to 8 commands, each a non-empty array of non-empty strings, and the optional `timeout`, whole seconds from 1 to 86400, 1800 when missing. A leading byte order mark is skipped, any other key is a problem, and any problem means no warm-up. Nothing in the gate binary reads the file yet.
+A repo's `.gate/warmup.toml`, which declares the warm-up commands, is read by `gate_router::warm::read_warmup`: `commands`, an array of 1 to 8 commands, each a non-empty array of non-empty strings, and the optional `timeout`, whole seconds from 1 to 86400, 1800 when missing. A leading byte order mark is skipped, any other key is a problem, and any problem means no warm-up. `gate warm` reads the file ([`gate warm`](#gate-warm)), and so does a routed run of a consenting repo, for the judge; nothing starts a warm-up from a route yet.
 
-The judge, `gate_router::warm::judge`, says where a command that would otherwise route goes, given the repo's consent, the file, the work folder's record and whether its warm-up lock is held; it does not run yet. In order: no consent or no file routes; a file problem runs here saying `gate: not routed: .gate/warmup.toml: <problem>`; a held lock means a warm-up is running and the run stays here with `gate: not routed: <host> is warming the work folder for this worktree`; an unreadable record runs here with `gate: not routed: the warm-up record <path> cannot be read: <error>`; no record, a `warming` record with a free lock, or a `warm` record of another host or file starts a warm-up, the run staying here with `gate: not routed: starting a warm-up of the work folder for this worktree on <host>`; a `warm` record of this host and the file's hash routes. A `failed` record of this host, file hash and gate build keeps the run here until its backoff has passed, 30 minutes after `commands` and 60 seconds after `refused`, with `gate: not routed: the warm-up failed <n> min ago: <reason>` (`less than a minute ago` under a minute); a failure of another host, file or build, or one written in the future, has no backoff and starts a warm-up. Every `<…>` text is escaped to one line.
+A warm-up command is worded for the builder as a routed run's words are. A command whose first word is `git` or `prek`, named by any path or sent as that program's name (`C:\x\git.exe.exe status`), is a file problem, `gate: warm: .gate/warmup.toml command <n> starts with <word>, which a routed run never sends`; a first word naming another program by a path outside the worktree is sent as the program's name ([Routing](#routing), the in-worktree path rewrite), not a file problem.
+
+The judge, `gate_router::warm::judge`, says where a command that would otherwise route goes, given the repo's consent, the file, the work folder's record and whether its warm-up lock is held; a routed run asks it after every other local reason (below). In order: no consent or no file routes; a file problem runs here saying `gate: not routed: .gate/warmup.toml: <problem>`; a held lock means a warm-up is running and the run stays here with `gate: not routed: <host> is warming the work folder for this worktree`; an unreadable record runs here with `gate: not routed: the warm-up record <path> cannot be read: <error>`; no record, a `warming` record with a free lock, or a `warm` record of another host or file starts a warm-up, the run staying here with `gate: not routed: starting a warm-up of the work folder for this worktree on <host>`; a `warm` record of this host and the file's hash routes. A `failed` record of this host, file hash and gate build keeps the run here until its backoff has passed, 30 minutes after `commands` and 60 seconds after `refused`, with `gate: not routed: the warm-up failed <n> min ago: <reason>` (`less than a minute ago` under a minute); a failure of another host, file or build, or one written in the future, has no backoff and starts a warm-up. Every `<…>` text is escaped to one line, and a value read from a record is cut to 200 characters plus `…` first.
+
+A routed run of a repo with consent and a `.gate/warmup.toml` reads the work folder's warm-up record (`remote\warm\<key>.json` under the remote key, opened without following the leaf link: a plain file of at most 64 KiB, strictly parsed) and probes its lock (`remote\warm\<key>.lock`, opened with full sharing and never taken or created), then asks the judge. A `warm` record of this host and file routes, and the run call carries `warmth: {"needs": <hash>}`, which makes the builder refuse `cold` when its work folder is not warm for that hash. A repo with no consent or no file routes as before, with `warmth: null`, and reads or makes nothing under `remote\warm`.
+
+Nothing starts a warm-up from a route yet, so where the judge says to start one the run stays here with `gate: not routed: the work folder for this worktree on <host> is not warm; gate warm warms it`. That is also the line for a failure past its backoff or of another gate build. A record that cannot be read says `gate: not routed: the warm-up record <path> cannot be read: <error>`, and a lock that cannot be read, or that is a link, a hard link or a folder, says `gate: not routed: the warm-up lock <path> cannot be read: <error>`.
 
  It carries no `v`; its format moves with the remote port (GATE-10).
 
@@ -1184,7 +1240,8 @@ The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wai
 - **Program resolution.** The program must resolve to an absolute path (kept, C6):
 
   - A name with a directory part is read against the working folder, `.` and `..` folded and separators written `\`; a drive-qualified or UNC name is kept as written.
-  - A name with an extension but no directory is looked for as written in each absolute PATH folder.
+  - A name with no directory whose extension is one of PATHEXT's (compared whole, its dot included, ignoring case) is looked for as written in each absolute PATH folder.
+  - A name with no directory whose extension is not one of PATHEXT's (`Godot_v4.7.2-stable_mono_win64_console`, a routed program name) is looked for in each absolute PATH folder as written, then with `.exe` appended; no other extension is ever appended, so `foo.1` never finds `foo.1.cmd`.
   - A bare name is looked for in PATH × PATHEXT, the folders outer and the extensions inner, as `Get-Command` orders them.
   - The current folder and relative PATH entries are never searched, and an extensionless shim is never found.
 
@@ -1259,7 +1316,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
 - **What routes** is kept (T2): a heavy gate, not `--local`, under no covering or lending parent, outside a git hook (`GIT_INDEX_FILE` set to a non-empty value), whose first word is not `git` or `prek`, in a git worktree of a repo `remote.json` lists, whose words with in-worktree paths rewritten (T3) match one of that repo's patterns.
 
-  A matched command still runs here, saying why, when a word names a path outside the worktree (a drive-relative, root-relative, share, device or climbing form included, see [the path rewrite](#routing)) or the gate's folder holds nothing the snapshot sends.
+  A matched command still runs here, saying why, when a word names a path outside the worktree (a drive-relative, root-relative, share, device or climbing form included, see [the path rewrite](#routing)) or the gate's folder holds nothing the snapshot sends. The one exception is a first word naming a program by an absolute path, which the path rewrite sends as the program's name unless it refuses the name.
 
   `--no-build` is dropped from the builder's words of a dotnet `test` or `run` command, saying so (T4); `build`, `msbuild`, `pack` and `publish` keep it everywhere. The fallback here drops the same words after every refusal, rebuilding locally as the builder would have, because an earlier routed step (a repo's test-all build) may have built only on the builder, so a later `dotnet test --no-build` that falls back here would find no build output.
 
@@ -1311,7 +1368,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   The SDK keeps an explicit value (its git targets fill `SourceRevisionId` only when it is empty) and a `-p:` global property overrides a repo's own `<SourceRevisionId>`, so the builder's DLLs read `1.0.0+<HEAD sha>` as a local build's do, and a no-change routed build compiles nothing. The fallback here, the journal and the claim keep the command as given, and no output line says the word was added.
 - **The decision is `gate-router`'s**, pure, over facts the caller gives it and the decision asks for lazily, in this order. A light or critical gate, or one under a covering or lending parent, stays local silently and reads nothing. `--local` stays local, saying `gate: not routed: --local`. Only then is `remote.json` read: no file stays local silently, and a file that is not a file, cannot be read or is refused stays local saying `gate: ignored <path>: <reason>; running locally`.
 
-  After the file: a git hook, a command with no non-empty word, or a first word whose file name without extension is `git` or `prek` (`git.exe` and a full path included, in any letter case) stays local silently.
+  After the file: a git hook, a command with no non-empty word, or a first word whose file name without extension is `git` or `prek` (`git.exe` and a full path included, in any letter case) stays local silently, as does a matched command whose first word the path rewrite sends as a program's name that is `git` or `prek` (`C:\x\git.exe.exe status`).
 
   Git is asked only then: a folder in no worktree (any non-zero `git rev-parse` exit), a repo the file does not list (the main checkout's folder name as a repo name, in any letter case) and words no pattern of the repo matches stay local silently, the first matching pattern winning. A fact that cannot be read stays local saying `gate: not routed: <reason>`. A machine with no `remote.json` costs no git call.
 
@@ -1380,6 +1437,10 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A bare first word (no separator, drive or `.`/`..`) becomes `./name` only when that file exists in the gate's folder; otherwise it stays bare, for the builder's `PATH`.
 
+  A first word that names a program by an absolute path outside the worktree and its siblings is sent as the program's name, the file name with a trailing `.exe` removed, so the builder finds it on its own `PATH` (a Godot or dotnet install named by its full path). The run says once, first among its routed lines, `gate: routed <given> as <name>` (both escaped), and the fallback here, the journal and the claim keep the words as given. Such a word is never written `./name`.
+
+  The name is refused, and the word stays outside (the run stays here with `gate: not routed: <word> is outside the worktree`), when the file name holds any of `* ? " < > |`, white space or a line break, or is empty once `.exe` is removed; when any path segment after the drive (folders and file name) holds `:`, holds `~` followed by an ASCII digit (a short name), ends in `.` or a space, or is empty, `.` or `..`; or when the word holds a second drive path (`X:\a\x.exe;C:\other`).
+
   With siblings declared, a path inside a sibling's root (every spelling the root can have, `subst` drives included) is sent as `..` once for each level of the gate's folder below the worktree root and once more, then `/<name>` as declared and the rest, with the separator the in-worktree edit uses.
 
   A relative path is inside a sibling when its `..` climb exactly to the root's parent and then enters a declared sibling (names compare in ASCII letter case only; `yaat-server2` is not `yaat-server`). Any other climb above the root, a word naming the parent itself, and leaving a sibling again (`../yaat-server/../x`) are outside, and keep the run here with `gate: not routed: <word> is outside the worktree`.
@@ -1390,7 +1451,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A path on a bare `subst` drive that stands for a root (`S:\..`) never leaves that root either.
 
-  Every word is judged for outside at each path start: the start of the word, after white space or a line break, after `, ; " ' ) | & < > ( =`, after a leading `@` (and an `@` right after any path start), and after the colon of a switch that starts its white-space token or follows a `"`, `'` or `,` (`-bl:`, `/p:`). The forms below keep the run here with the same `is outside the worktree` line.
+  Every word is judged for outside at each path start: the start of the word, after white space or a line break, after `, ; " ' ) | & < > ( =`, after a leading `@` (and an `@` right after any path start), and after the colon of a switch that starts its white-space token or follows a `"`, `'` or `,` (`-bl:`, `/p:`). The forms below keep the run here with the same `is outside the worktree` line. A command's first word that names a program by an absolute path is judged first, as above: it is sent as the program's name, or, when the name is refused, it is outside like any other path.
 
   Drive-relative text is a letter and `:` not followed by `\`, `/` or `:`, anywhere in a word or at any path start (`C:..\..\secret`, `-bl:C:..\x.binlog`); `-c:Release`, `/t:Build`, `$env:PATH` and `crate::mod` are not. Root-relative text is a single `\` at a path start, or a single `/` only where a value begins (after `=`, a switch colon or `@`); `/p:...`, `/c` and nextest's `test(/^run::/)` stay switches or text.
 
@@ -1464,7 +1525,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The client also reads the preflight's `gate: remote warm <none|64 lower-case hex>` line, only the line right after the last `gate: remote version` line: anything else there, no such line, or a warm line elsewhere reads as no warmth.
 
-    A call that needs the work folder warm with a given hash and whose preflight does not name exactly that hash falls back `cold` here, after the version check and before parity and the push, so nothing is sent. A warm-up and a plain run do not compare the line. No run makes a call that needs warmth yet.
+    A call that needs the work folder warm with a given hash and whose preflight does not name exactly that hash falls back `cold` here, after the version check and before parity and the push, so nothing is sent. A warm-up and a plain run do not compare the line. A routed run of a repo whose warm-up record is `warm` for this host and file makes such a call.
   - **Parity.** After the preflight and before the push, `remote/parity.rs` checks that the builder's `gate: remote sdks` line (from the preflight) has what the snapshot needs. A builder with no sdks line, or a tree that is not .NET (no `global.json`, `.sln`, `.slnx` or `.csproj` anywhere in the snapshot), skips the SDK part of the check; the tools of the repo's `.gate/toolchain.toml` are judged either way (Toolchain manifest, below).
 
     A lacking builder says `gate: remote toolchain mismatch: <repo> needs <need>; <host> has <sdks>` once for each need, in the order the needs are listed, then a single `gate: remote <host> parity; running here`, and falls back `parity` (status 75).
@@ -1513,7 +1574,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     `toolchain::meets` compares a found version with a minimum. A repo's sibling worktrees are not declared here but in `.gate/siblings.toml` ([Sibling worktrees](#routing)), whose problems keep a run local.
 
-    The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version. The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot` and `ffmpeg`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
+    The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version; a routed run reads the `godot` entry as an exact pin instead (below). The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot` and `ffmpeg`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
 
     A file that is not UTF-8 or does not parse is unreadable whole, and the line for it is `gate: cannot read .gate/toolchain.toml: <why>; skipping the manifest's checks`, `<why>` being `line <l>, column <c>: <toml message>` or `not valid UTF-8 (...)`. A routed run words a manifest problem its own way, `gate: .gate/toolchain.toml: <problem>; skipping it`, for a whole file that cannot be read as for a bad entry, `<problem>` escaped.
 
@@ -1525,13 +1586,25 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The preflight's `Needs` carry the tools the manifest declares whose names the box knows how to probe (the known names above), each with its minimum, or empty for any version. A name outside them is skipped with `gate: .gate/toolchain.toml names unknown tool <name>; skipping it` and not sent.
 
+    `godot` is sent whenever the repo pins a Godot version, on every routed run whatever its command: the manifest names `godot`, or a `*.csproj` of the snapshot names `Godot.NET.Sdk/<version>`. Its value is the distinct pins joined by `,` (the box ignores the text and reads only the name), or empty for a manifest entry of `""`. A manifest `godot` entry wins over every project pin; a manifest that is unreadable, or whose `godot` value is no version, does not stop the project pins from applying.
+
+    A repo pinning nothing sends no `godot` need and is judged as before.
+
     The builder answers each tool with a `gate: remote tool <name> <version|present|missing|skipped: <why>>` line. A tool it found missing, or older than the minimum, is a need, and the route is refused as under Parity: one `gate: remote toolchain mismatch: <repo> needs <name> <min> or later; <host> has <version|none>` line per need (`<name>` alone when the manifest sets no minimum), then the parity fallback line, and the run goes local.
+
+    `godot` is judged as an exact pin, not a minimum. The builder's answer is the list `gate: remote tool godot <v1>,<v2>,...` of its installed versions, split on `,`. A pin is met when one installed version equals it on the parts the pin gives (`4.7.2` exactly, `4.7` any `4.7.x`, `4` any `4.x.y`), a prerelease install reading as its release; a four-part SDK version reads as its first three parts.
+
+    Every pin must be met, else the mismatch line is `gate: remote toolchain mismatch: <repo> needs godot <pins, comma separated> exactly; <host> has <found>`, `<found>` being the builder's versions joined by `, `, `none`, `not probed (<why>)`, or its own answer when that is no version list; for a manifest entry of `""` (any version) the line reads `needs godot`.
+
+    An answer that is no version list is a mismatch whenever a pin needs checking, so the command runs here rather than on a builder that may lack the version. A slow install that drops off the builder's list reads as missing, a needless fallback and a known limitation.
 
     A tool the builder did not probe, gave no answer for, or found at a version that cannot be read against a minimum gets `gate: <host> did not probe <name>: <why>; not checking it` and is not a need. The lines come in this order: the SDK step's own, then the manifest's problem lines, then the per-tool skip lines in the manifest's order, then the mismatch lines.
 
-    A text from the manifest or the builder is escaped, and the builder's cut to 4096 bytes, so neither can forge a line. `toolchain::standing` judges a tool against what its probe found (met, too old, missing, not readable, skipped) in one place, which `gate check`'s report shares; `gate check`'s output is unchanged. `--test-remote-interrupt-at manifest` raises the interrupt just before the manifest is read.
+    A text from the manifest or the builder is escaped, and the builder's cut to 4096 bytes, so neither can forge a line. `toolchain::standing` judges a tool against a minimum from what its probe found (met, too old, missing, not readable, skipped) in one place, which `gate check`'s report shares and a routed run applies to every tool but a pinned `godot`; `gate check`'s output is unchanged and still judges a manifest `godot` entry as a minimum. `--test-remote-interrupt-at manifest` raises the interrupt just before the manifest is read.
 
-    Two pins a repo already declares are read beside it, also as minimums: each tool's version in `.config/dotnet-tools.json` (the release part, so `1.0.0-beta.1` is 1.0.0; read as strict JSON, as dotnet reads it, so a comment or a trailing comma makes the file unreadable, and a tool id given twice counts once, with its last version) and the `Godot.NET.Sdk/<version>` a project file names, on its root `<Project Sdk=...>` or an `<Sdk Name="Godot.NET.Sdk" Version=...>` element directly inside it (an `<Import Sdk=...>`, a deeper `<Sdk>` element and a `min=` version are not read).
+    Two pins a repo already declares are read beside it: each tool's version in `.config/dotnet-tools.json` (the release part, so `1.0.0-beta.1` is 1.0.0; read as strict JSON, as dotnet reads it, so a comment or a trailing comma makes the file unreadable, and a tool id given twice counts once, with its last version) and the `Godot.NET.Sdk/<version>` a project file names, on its root `<Project Sdk=...>` or an `<Sdk Name="Godot.NET.Sdk" Version=...>` element directly inside it (an `<Import Sdk=...>`, a deeper `<Sdk>` element and a `min=` version are not read). The dotnet tools' versions are read and nothing judges them yet. The Godot pin is an exact version on the parts it gives, a four-part SDK version reading as its first three, and is judged on every routed run (above).
+
+    The project files are every `*.csproj` the snapshot holds, at any depth and in any ASCII letter case: at most 64 files of at most 256 KiB each, read with at most two git calls, the sizes first and then one bounded batch read. A file that cannot be read says `gate: cannot read the Godot pin of <file>: <why>; not checking it` and gives no pin; files past the 64th say `gate: <n> more project files not read for a Godot pin; not checking them`.
 
     `global.json` stays the SDK pin, read by `parity.rs` as above.
   - **Push.** `git push --no-verify --no-recurse-submodules --progress [--receive-pack=…] -- <host>:<builder root>/<repo>.git +<snapshot>:refs/gate/<key> [+<bridge>:refs/gate-bridge/<key>]`, with `GIT_SSH_COMMAND` carrying the ssh options. Success says `gate: pushed snapshot <8 hex> in <s> s (<size>|up to date)` and moves the local `refs/gate-remote/<key>`.
@@ -1583,7 +1656,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     A status 75 is a refusal only when this run's refusal tag came on stderr before any start marker (`busy`, `tools` or `layout`, the fallback reason); a tag after the marker is ignored, so a command that prints the human busy, tools or layout line, or a tag of its own, and exits 75 ends with status 75 and no fallback.
 
     Safety rests on order, not on the nonce being secret (the request is on no command line, but the nonce still appears in the run id, the pipe names and the archive name): the box says the marker before it creates the command's process, and the client ignores every tag once it has heard the marker.
-  - **Warm-up call.** A call whose `warmth` is a warm-up (`Warmth::WarmUp` in `remote/mod.rs`) runs the phases above with the run call's payload built by `payload::warm_word`: the run's keys, `Timeout` always among them, with `WarmCommands` and `WarmHash` in place of `Command` and no `Outputs` or `OutputsFull` key. Its limits are a run's, from the call's `timeout`. No run, verb or route makes such a call yet.
+  - **Warm-up call.** A call whose `warmth` is a warm-up (`Warmth::WarmUp` in `remote/mod.rs`) runs the phases above with the run call's payload built by `payload::warm_word`: the run's keys, `Timeout` always among them, with `WarmCommands` and `WarmHash` in place of `Command` and no `Outputs` or `OutputsFull` key. Its limits are a run's, from the call's `timeout`. `gate warm` makes such a call. A routed run's call carries `warmth: {"needs": <hash>}` instead, which only adds the `cold` comparison above.
 
     The run call's end is classed by `warm_end` in `remote/client.rs` and handed back as `RemoteOutcome.warm`. It is warm only on status 0, after the start marker, with the call's last stderr line that is neither a heartbeat nor a protocol line exactly `gate: remote warm {H}` for the `WarmHash` sent. A Ctrl+C is deleted: it leaves no record.
 
@@ -1735,7 +1808,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     - A fetch the watchdog stops says its `gate: STALLED: ...` or `gate: TRANSFER TIMED OUT after 1800 s fetching the outputs` line (the ceiling counted from the fetch's own start), then `gate: remote outputs not brought back: the fetch was stopped by the watchdog`, and the run ends 124.
     - Any other failed fetch says `gate: remote outputs not brought back: <reason>`: the box's last stderr line (escaped, its first 4 KiB), `the outputs call failed (status <n>)`, `the outputs call sent a line longer than 64 KiB` or `cannot write <path>: <error>`. A passing run becomes 1. The partial archive is removed; a removal that fails says `gate: cannot remove the partial outputs archive <path>: <error>`.
     - A Ctrl+C during the fetch, or noticed by the end of an outputs call however it ended, ends the run as an interrupt with no `stop` call, and removes the partial archive.
-    - A fetch that already sent a byte is never retried as a pre-banner drop; one dropped before any byte is retried once like the other calls.
+    - A fetch that already sent a byte is never retried as a pre-banner drop; one dropped before any byte is retried like the other calls, up to three times.
 
     **Fetch cap** (GATE-137): the raw relay is bounded by the stall window, which any byte resets, and the transfer ceiling of 1800 s counted from the fetch's own start, and also by a size cap, so a broken or hostile builder cannot make the archive grow without bound. The cap bounds the archive only; what a builder's output may write to the gate's log has a cap of its own, the log cap (see The output cap below), which counts the outputs call's standard error but not the archive.
 
@@ -1842,7 +1915,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A folder the walk does not enter because its name is not plain or not Unicode (`bin/x~1/`, `bin/con/`, `bin/report./`) is read through a verbatim `\\?\` path only to count the files below it that the globs select, which are never packed (`Globs::counts_below`). That read enters no excluded or `.git*`-spelled folder and no folder of 64 parts or more. A folder or entry it cannot read leaves those files uncounted and the walk goes on, so the outputs are still brought back.
 
-  A pre-banner failure, which is exit 255 (128 for git) with empty stdout, no start marker heard and a first stderr line starting `Connection timed out during banner exchange`, `kex_exchange_identification: ` or `banner exchange: `, says `gate: <host> did not answer the ssh banner; trying once more` and is retried once after a 2 s pause. A run call whose box said the start marker is never retried or read as a pre-banner failure, whatever its first stderr line: the command may have started.
+  A pre-banner failure, which is exit 255 (128 for git) with empty stdout, no start marker heard and a first stderr line starting `Connection timed out during banner exchange`, `kex_exchange_identification: ` or `banner exchange: `, is made again up to three times, each after a 2 s pause and the line `gate: <host> did not answer the ssh banner; trying again (<n> of 3)`, until a call gets past the banner; the call counts as unreachable only when every one of them failed before it. This rides out a builder whose ssh server starts no session for half a minute.
+
+  The bounded `stop` and `boot` calls keep a single retry, said as `(1 of 1)`. A run call whose box said the start marker is never retried or read as a pre-banner failure, whatever its first stderr line: the command may have started.
 
   Two pre-banner failures of the run call fall back `unreachable`; the sync-back's `ls-remote` and `fetch` are retried the same way, and two failures of either end the run with status 1.
 
@@ -1942,7 +2017,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   It then reads the payload back with the box's own reader, so a pair the box would refuse stays here; checks toolchain parity for each repository; pushes each and saves each local ref; and lets the folders and locks go before the run call.
 
-  Parity is checked for each repository in order: a sibling's SDK need is read from its own `global.json` and its lines name it, and the tools are the main repository's manifest alone. A builder that lacks anything says one `gate: remote toolchain mismatch: <repo> needs ...` line per need and falls back `parity` once.
+  Parity is checked for each repository in order: a sibling's SDK need is read from its own `global.json` and its lines name it, and the tools, with the Godot pin, are the main repository's manifest and project files alone. A builder that lacks anything says one `gate: remote toolchain mismatch: <repo> needs ...` line per need and falls back `parity` once.
 
   `remote/held.rs` holds a pair's folders from the check until the client lets them go: the root's parent is opened once, following links, on a local volume (a network volume is refused), and the root and each sibling are opened beneath it as themselves, never through a link, each with its `.git` entry (a folder or a linked worktree's file, no reparse point of any kind). Each is checked against the exact path the route was decided for and, the root and a sibling, its folder id.
 
@@ -1977,13 +2052,15 @@ Each verb is one ssh call today, and the call's cost is its connection, not its 
 
 A routed run therefore moves to one long-lived connection carrying every verb, `gate box serve`, and the per-call client stays until that lands (GATE-70 holds the measurement, and GATE-109 the work).
 
-The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, and for `outputs` also `Name`. `inflight` reads only `Root`.
+The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, and for `outputs` also `Name`.
+
+`inflight` reads only `Root`.
 
 `inputs` reads `Key`, `Bare`, `Work`, `Lock`, `Nonce` and `Step`.
 
-A warm-up's `run` payload sets `WarmCommands` (1 to 8 commands, each a non-empty list of non-empty texts) and `WarmHash` (64 lower-case hex digits, the hash of the warm-up file the commands come from), sets no `Command`, and asks for no outputs. The PC's client can send it (The remote client's run, Warm-up call), but no verb or run does yet.
+A warm-up's `run` payload sets `WarmCommands` (1 to 8 commands, each a non-empty list of non-empty texts) and `WarmHash` (64 lower-case hex digits, the hash of the warm-up file the commands come from), sets no `Command`, and asks for no outputs. The PC's client sends it (The remote client's run, Warm-up call) for `gate warm`.
 
-`preflight` also reads an optional `Needs`, an object of tool name to minimum version text (`""` for any version), which the PC builds with `remote::payload::preflight_word` from the tools it wants probed; it is omitted when there are none, so a payload without needs is the same bytes as before.
+`preflight` also reads an optional `Needs`, an object of tool name to minimum version text (`""` for any version; the box ignores the text, and for `godot` the PC sends the distinct exact pins joined by `,`), which the PC builds with `remote::payload::preflight_word` from the tools it wants probed; it is omitted when there are none, so a payload without needs is the same bytes as before.
 
 Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which the outputs transport owns (GATE-44), are read only by `run` (the outputs) and `outputs` (`Name`, `OutputFolder`); `preflight`, `stop` and `boot` ignore them.
 
@@ -2065,7 +2142,13 @@ Built verbs:
 
   Tool probes (`boxside/probe.rs`): for each tool of the payload's `Needs`, in payload order, the box runs a probe and says one line on stdout after the sdks line, all once every probe has ended: `gate: remote tool <tool> <version>`, `gate: remote tool <tool> present` or `gate: remote tool <tool> missing`, or `gate: remote tool <tool> skipped: <why>`. The box only reports; the PC compares the minimums.
 
-  The probes are `rustc --version` for `rust`, `cargo-nextest nextest --version` for `cargo-nextest` (the plugin directly, never through `cargo`, so no `.cargo\config.toml` above the folder can alias it), `<name> --version` for `node`, `pnpm` and `pwsh`, and `ffmpeg -version`. `godot` has no probe.
+  The probes are `rustc --version` for `rust`, `cargo-nextest nextest --version` for `cargo-nextest` (the plugin directly, never through `cargo`, so no `.cargo\config.toml` above the folder can alias it), `<name> --version` for `node`, `pnpm` and `pwsh`, and `ffmpeg -version`. `godot` is probed as the next paragraph says.
+
+  The `godot` probe reads `GATE_GODOT_ROOT`, an environment variable of the builder naming a folder of side-by-side Godot installs, one per subfolder, each holding `Godot_console.exe`. It lists the direct subfolders of that folder (the first 64 entries, in path-name order), runs each install's `Godot_console.exe --version` under the batch's deadline and says the versions found as one line, `gate: remote tool godot <v1>,<v2>,...`, ordered by number and without repeats.
+
+  A version is the leading dot-separated digits of the first line of stdout, three parts as printed or two with `.0` added (`4.3.stable.mono.official.<hash>` is `4.3.0`); an install that prints a version and exits non-zero is still listed. With no `GATE_GODOT_ROOT` the probe runs the `Godot_console.exe` found on `PATH`. A root that names no install is `missing`. Subfolders whose name is not valid Unicode, that hold no plain `Godot_console.exe`, past the first 64, or that cannot be read are left out.
+
+  When no install gives a version the line is `gate: remote tool godot skipped: <why>`, the first reason met: `cannot run <install>: <install> lies inside the worktree` (an install inside the run's own folders, the folder above `Work`, `Work`, `Bare` and the outputs folder, is refused unrun; a `gate check` refuses the repo root), `cannot run <exe>: <path> is a link or a junction` (a subfolder or the exe), `GATE_GODOT_ROOT <path> is not an absolute path on a drive`, `cannot read GATE_GODOT_ROOT <path>: <error>`, `no answer in <limit>` (the listing was cut by the deadline with nothing read) or `Godot_console.exe --version gave no version: <line>` (the first line of stdout, cut to 200 characters with `…`, escaped, when a version part has over ten digits or the line leads with no version).
 
   Each program is found through `PATH` and `PATHEXT` as `dotnet` is (a `.cmd` shim runs through the system folder's cmd.exe; a `.ps1` is not run) and runs in the system folder on a hidden console, in the bounded runner of `remote/git.rs` (`program_output`).
 
@@ -2073,7 +2156,7 @@ Built verbs:
 
   The version is read from the first non-blank line of stdout, else of stderr: the first run of two or more dot-separated numbers after an optional `v`, its first three kept. A line with no such run, a number longer than 10 digits or a non-zero exit gives `present`; a program that cannot be found gives `missing`.
 
-  The `<why>` of a skip is `unknown tool`, `no probe for godot`, `no answer in <n> s` (or `<n> ms` when the limit is not whole seconds), `no answer in <limit>, and could not be stopped: <error>`, `the probe failed` (followed by `: <panic text>` when the probe panicked), or the runner's failure text: `cannot run <program>: <why>`, `<program> <args> wrote more than 16 MiB` or `cannot run <program>: cannot read the system folder: <error>`.
+  The `<why>` of a skip is `unknown tool`, the `godot` reasons above, `no answer in <n> s` (or `<n> ms` when the limit is not whole seconds), `no answer in <limit>, and could not be stopped: <error>`, `the probe failed` (followed by `: <panic text>` when the probe panicked), or the runner's failure text: `cannot run <program>: <why>`, `<program> <args> wrote more than 16 MiB` or `cannot run <program>: cannot read the system folder: <error>`.
 
   A payload whose `Needs` is not an object of texts prints `gate: box payload Needs is not an object of texts; probing nothing` on stderr, probes nothing and still exits 0.
 - **`run`** runs the payload's `Command` (a list of texts), or, for a warm-up, each of its `WarmCommands` in order (Warm-up, below), in `Work` (in `Work\{Leaf}` for a sibling pair), and exits with the command's own whole 32-bit status after a successful run. Its stdout is the command's stdout, LF-terminated; its stderr is the command's stderr plus the box's own lines.
@@ -2116,7 +2199,13 @@ Built verbs:
 
   Payload refusals exit 2, each on stderr. The command's own: `gate: box payload Command is not a list of texts`, `gate: box payload lacks Command`, `gate: box payload Subfolder is not a text`, `gate: box payload Identity is not an object of texts`, `gate: box payload Identity may set only GIT_AUTHOR_* and GIT_COMMITTER_* names: <name>` and `gate: box payload Identity <name> holds a NUL`.
 
-  A warm-up payload's: `gate: box payload sets both Command and WarmCommands`, `gate: box payload lacks WarmHash`, `gate: box payload asks a warm-up for outputs` (an `Outputs` glob or `OutputsFull` true), `gate: box payload WarmCommands is not a list of 1 to 8 commands, each a non-empty list of non-empty texts` and `gate: box payload WarmHash is not 64 lower-case hex digits: <value>`. A `WarmHash` beside a `Command` is ignored, and a null `WarmCommands` is not set.
+  `Env`'s: `gate: box payload Env is not an object of texts`, `gate: box payload Env has a malformed name '<name>'` (empty, or holding `=` or a NUL), `gate: box payload Env gives <name> a value holding NUL`, `gate: box payload Env sets <name>, which the gate sets itself` and `gate: box payload Env sets <name>, which git would read over the gate's own git settings`.
+
+  Also `gate: box payload Env sets <name>: GATE_ names are the gate's`, `gate: box payload Env sets <name>, a machine path the builder keeps`, `gate: box payload Env names <name> twice` and `gate: box payload Env is over its cap of 64 names or 32 KiB`. A null `Env` is not set.
+
+  A warm-up payload's: `gate: box payload sets both Command and WarmCommands`, `gate: box payload lacks WarmHash`, `gate: box payload asks a warm-up for outputs` (an `Outputs` glob or `OutputsFull` true), `gate: box payload asks a warm-up for Env` (an `Env` that is not null, even `{}`), `gate: box payload WarmCommands is not a list of 1 to 8 commands, each a non-empty list of non-empty texts` and `gate: box payload WarmHash is not 64 lower-case hex digits: <value>`.
+
+  A `WarmHash` beside a `Command` is ignored, and a null `WarmCommands` is not set.
 
   The work folder's: `gate: box payload Lock must be <Work>.lock`, `gate: box payload Index must be <Work>.index`, `gate: box payload Key is not a work-folder key: <key>` and `gate: box payload Job is not this work folder's job name: <job>`.
 
@@ -2129,6 +2218,16 @@ Built verbs:
   `SiblingSnapshots`, an object of exactly the pair's sibling names, each a 40 lower-case hex digit commit, is read by `run` alone: `gate: box payload SiblingSnapshots is not an object`, `gate: box payload SiblingSnapshots must name exactly the Pair's siblings: <names>` and `gate: remote run payload's SiblingSnapshots <name> '<value>' is not a 40-hex commit sha`.
 
   `Identity` may hold only `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_AUTHOR_DATE`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL` and `GIT_COMMITTER_DATE`.
+
+  `Env` is the caller's variables for the command: an object of texts of at most 64 names and 32 KiB of names and values together, the cap read from the raw object before any pair is checked.
+
+  It refuses a name the gate sets (`GATE_SLOT_HELD`, `GATE_STATE_DIR`, `SharedCompilationId`, `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `MSBUILDDISABLENODEREUSE`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`, and .NET's Event Log logging settings in any spelling: the `__` and `:` forms, a `DOTNET_` or `ASPNETCORE_` prefix, the provider's full type name).
+
+  It also refuses `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG` (git reads them over the gate's own `safe.directory` entry), any `GATE_` name, and the machine paths `PATH`, `PATHEXT`, `TEMP`, `TMP`, `SystemRoot`, `windir`, `ComSpec`, `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA` and `ProgramData`. Names are compared without regard to ASCII case.
+
+  A name given twice is refused, first as an ASCII-case scan and then as Windows compares names, which folds more than ASCII. A refusal line shows the name shortened to 200 characters and escaped.
+
+  The pairs apply to the command only, never to the box's own steps (the git steps, the tool restore, the pnpm install).
 
   `Key` is `[A-Za-z0-9_-]+` and is the last name of `Work`; `Job` is `Local\gate-remote-<Key>-<12 hex digits>`. `run`, `stop` and `preflight` check the key; `run` and `stop` check the job.
 
@@ -2257,6 +2356,8 @@ Built verbs:
   The command's environment gains `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>=safe.directory` and `GIT_CONFIG_VALUE_<n>=*`, where n is the inherited count (0 when there is none) and the count grows by one.
 
   The inherited count is read as git reads it (leading whitespace, an optional `+`, decimal digits to the end, at most `i32::MAX`; an empty value is 0); a count git would refuse, or `i32::MAX` itself, leaves the environment unchanged. The work folders are owned by Administrators, which git refuses from a non-elevated token.
+
+  The command's environment is the box's own with the payload's `Env` pairs set over it, each replacing any inherited value; the settings below are applied after the pairs, so none of them can be undone by one.
 
   The command's environment also sets `Logging__EventLog__LogLevel__Default=None`, replacing any inherited value, so a .NET host with default logging writes nothing to the Windows Event Log; its console output is unchanged. Of the groups the Application log's default access lets write, a restricted copy of the box's token could hold only Administrators, INTERACTIVE, SERVICE, BATCH and WRITE_RESTRICTED, and the command's token holds none of them.
 
@@ -2534,7 +2635,7 @@ A virtual Cargo workspace (`resolver = "3"`) with every crate under `crates/`, l
 | `gate-desktop` | The desktop helper exe and the pipe protocol the box speaks with it, its exit codes, and `build_version`, the gate's version text. | no |
 | `gate-watchdog` | Free-share, load-adjusted clock, stall, ceiling and backstop arithmetic over samples with the kill lines, and the box heartbeat, on an injected clock; the cores-hint verdict. | yes; a pure crate |
 | `gate-args` | The gate's own argv: the subcommand CLI, the compatibility layer, the C-runtime and cmd.exe quoting, the `%VAR%` refusals and the PATHEXT resolution rules over an injected environment and file lookup. | yes; a pure crate |
-| `gate-router` | The routing rules (T2-T4) over strings: what routes, the path rewrite, the `--no-build` drop (`test` and `run` only), the wrapped dotnet form, the builder warm-up's file, hash and judge (`warm.rs`). | yes; a pure crate |
+| `gate-router` | The routing rules (T2-T4) over strings: what routes, the path rewrite, the `--no-build` drop (`test` and `run` only), the wrapped dotnet form, the builder warm-up's file, hash and judge (`warm.rs`), the caller's variables a routed run does not send and the line it says for them (`watch.rs`). | yes; a pure crate |
 | `gate` | The `gate` binary: the subcommands, the wait loop, the run, the journal writes, the remote client and `gate box`. | no |
 
 Rules:
