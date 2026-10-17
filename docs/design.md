@@ -82,6 +82,7 @@ The watchdog samples the command and kills its job on a stall, at the ceiling an
 | `--state-dir <path>` | none | Use another [state root](#state-root); a relative path is read against the caller's working directory, before `--cd`. | ruling |
 | `--cd <folder>` | `-Cd` | Run the command in `<folder>` and route from it ([Run folder](#run-folder)). | ruling (GATE-323) |
 | `--bring-tracked <glob>` | none | A routed run's fetched output that git tracks and `<glob>` matches is installed rather than skipped (Outputs install, "Tracked members"); repeatable, and the one option that is not refused when given twice. The launcher's PowerShell form (`-Log …`) does not take it: use the `gate run` form. | ruling |
+| `--env NAME[=value]` | `-Env` | Sets `NAME` for the command, local or routed ([Command environment](#command-environment)); without `=value`, forwards `NAME`'s value from the gate's own environment, the form for secrets. Repeatable. | ruling (GATE-362) |
 
 The words after `--` reach the command exactly as the caller passed them ([Command launching](#command-launching)).
 
@@ -89,7 +90,27 @@ The words after `--` reach the command exactly as the caller passed them ([Comma
 
 `--cd <folder>` (a relative folder is read against the caller's working directory) makes the gate enter `<folder>` once, after `--log` and `--state-dir` are made absolute against the caller's folder and before any slot is taken. From then on `<folder>` is the folder the gate was started in: [routing](#routing) reads its worktree, the command's working folder and program lookup, a fallback's local run, and the journal's and claim's `cwd` all take it. A relative `--log` or `--state-dir` stays the caller's.
 
-It is how a caller in a main checkout gates a command that names another worktree's files: `--cd <worktree>` routes the run as if the gate had been started there. Given twice it is refused (`gate: --cd is given twice`). `gate expect` and `gate check` do not take it (unknown option). The compatibility layer reads it as `-Cd`, which is the one new option it takes (the launcher's callers need it); the frozen PowerShell gate refuses `-Cd`. Nothing is said on success.
+It is how a caller in a main checkout gates a command that names another worktree's files: `--cd <worktree>` routes the run as if the gate had been started there. Given twice it is refused (`gate: --cd is given twice`). `gate expect` and `gate check` do not take it (unknown option). The compatibility layer reads it as `-Cd`, one of the two new options it takes (the launcher's callers need it); the frozen PowerShell gate refuses `-Cd`. Nothing is said on success.
+
+#### Command environment
+
+`--env NAME=value` sets `NAME` in the command's environment over the gate's own; the written value is on the gate's command line. `--env NAME` is the bare form: the value is `NAME`'s in the gate's own environment, so a secret stays off the command line. It is repeatable and means the same on a local run and a routed one. The compatibility layer reads it as `-Env`, in the same two forms, and `-Env` is the other new option it takes.
+
+A name is one or more printable ASCII characters, U+0021 to U+007E, `=` excepted. ASCII only keeps the ASCII-case check of the refused names below equal to Windows' own comparison of names, so a name that is not ASCII can never pass that check and then be read as one the gate protects. A value may hold anything but NUL (CR and LF included) and may be empty.
+
+The gate refuses a name it sets itself (the build-server settings, `UseSharedCompilation`, `GATE_SLOT_HELD`, `GATE_STATE_DIR` and the rest listed under [Command launching](#command-launching) and [The box side](#the-box-side)), any `GATE_` name, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG` and the machine paths the box keeps, the same on both sides so one `--env` means the same on the PC and on a builder.
+
+It also refuses a name given twice in any ASCII case, and more than 64 names or 32 KiB of names and values together. The gate's own settings are applied after the caller's pairs, so no pair undoes one.
+
+Refusals are exit 2 on stderr before any slot. `{n}` is the word's 1-based place among every `--env` word given, an empty one included; a word whose name is malformed, that is not Unicode, or that names a variable to forward the gate's environment lacks, is never echoed, since it may be a secret pasted without its name.
+
+- `gate: --env word {n} has a malformed name`, `gate: --env word {n} is not valid Unicode`, `gate: --env word {n} names a variable to forward, and it is not set` and `gate: --env word {n} names a variable whose value is not Unicode`.
+- `gate: --env sets {name}, which the gate sets itself`, `gate: --env sets {name}, which git would read over the gate's own git settings`, `gate: --env sets {name}: GATE_ names are the gate's` and `gate: --env sets {name}, a machine path the gate keeps for the command`.
+- `gate: --env gives {name} a value holding NUL`, `gate: --env names {name} twice` and `gate: --env is over its cap of 64 names or 32 KiB`.
+
+A routed run sends the pairs as the payload's `Env` ([The box side](#the-box-side)), in the payload on the ssh call's stdin and nowhere else: no output line, the journal or ops-tower state shows a value. A warm-up sends none.
+
+A routed run does not send the rest of the gate's environment: when it holds a variable a repo's builds read (`NuGetAudit`, `RUSTFLAGS`, `RUSTDOCFLAGS`, and the `NUGET_`, `MSBUILD`, `CARGO_BUILD_` and `CARGO_PROFILE_` families) that no `--env` names and the gate does not set itself, the route says so after its other lines: `gate: a routed run does not send the caller's <names>; --env NAME sends it`.
 
 ### `gate stop-tree`
 
@@ -400,9 +421,9 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 
 `gate.exe` also accepts the PowerShell gate's argument form, so the cutover breaks no caller:
 
-`gate -Log <path> -TimeoutSeconds <n> -Slot heavy|light|critical|none [-StallSeconds <n>] [-Tail <n>] [-NoMarkers] [-Local] [-Cd <folder>] -- <command>` and `gate -StopTree <pid>`.
+`gate -Log <path> -TimeoutSeconds <n> -Slot heavy|light|critical|none [-StallSeconds <n>] [-Tail <n>] [-NoMarkers] [-Local] [-Cd <folder>] [-Env NAME[=value]] -- <command>` and `gate -StopTree <pid>`.
 
-- It accepts exactly the options `-Log`, `-TimeoutSeconds`, `-Slot`, `-StallSeconds`, `-Tail`, `-NoMarkers`, `-Local`, `-Cd` and `-StopTree`, compared case-insensitively, and maps each to the flag in the table above (`-StopTree <pid>` to `gate stop-tree <pid>`).
+- It accepts exactly the options `-Log`, `-TimeoutSeconds`, `-Slot`, `-StallSeconds`, `-Tail`, `-NoMarkers`, `-Local`, `-Cd`, `-Env` and `-StopTree`, compared case-insensitively, and maps each to the flag in the table above (`-StopTree <pid>` to `gate stop-tree <pid>`).
 
   Any other option, or a new-CLI flag in the old form (`-StateDir`, `--state-dir`, `--slot`), is a usage error (exit 2). `-TimeoutSeconds` refuses `auto:<n>`: `gate: -TimeoutSeconds must be a whole number above 0, got 'auto:900'`. The one exception is the hidden `--test-print-request` of a `test-seams` build ([Black-box suite harness](#black-box-suite-harness)).
 - `--` is required before the command; the command never starts at the first word that is not an option.
@@ -1116,7 +1137,7 @@ All kept, with each knob's default unchanged:
 
   A read that fails is said once per run, by the first sample whose read fails, on stderr and in the log: `gate: WSL VM CPU unavailable (<message>); retrying each sample, and until a read succeeds this wsl command counts only output and job CPU as progress`. A failed read at the watch's start alone says nothing, and every sample retries.
 - A command that exits on its own before the kill keeps its status (W7).
-- Build servers: the per-run server settings of [Command launching](#command-launching) (the run id as `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER=0`, `DOTNET_CLI_USE_MSBUILD_SERVER=0`, `MSBUILDDISABLENODEREUSE=1`), so each run has its own compiler server and MSBuild nodes. No gate classifies, lowers or raises a build server.
+- Build servers: the per-run server settings of [Command launching](#command-launching) (the run id as `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER=0`, `DOTNET_CLI_USE_MSBUILD_SERVER=0`, `MSBUILDDISABLENODEREUSE=1`, `UseSharedCompilation=false`), so each run has its own MSBuild nodes and no compiler server idles in its job. No gate classifies, lowers or raises a build server.
 
   The stall check and the load figures count the job's own processes and the escaped tree only: a build server that is neither in the job nor under one of its members is neither progress nor the command's own CPU in the free share, and a server in the job, or escaped from a member, is one of its processes like any other.
 
@@ -1286,7 +1307,11 @@ The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wai
 - **Priority.** BelowNormal, or the gate's own class when that is already BelowNormal or Idle; High for a critical gate and any gate under a critical marker (kept, P2).
 - **Environment.**
 
-  Every command gets the gate's environment with these set over it (names compared case-insensitively): `GATE_SLOT_HELD=<kind>:<pid>:<start_ms>[:<h>]` (the held slot's marker, `none` too, or the parent's for a covered gate; a gate lent its light parent's slot holds none and hands `heavy:<its pid>:<its start>[:<h>]`, naming itself), `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, both the run id, `MSBUILDUSESERVER=0` (over an inherited value), `DOTNET_CLI_USE_MSBUILD_SERVER=0` (kept, P3), `MSBUILDDISABLENODEREUSE=1` (over an inherited value), and `GATE_STATE_DIR=<root>` under a non-default root.
+  Every command gets the gate's environment with these set over it (names compared case-insensitively): `GATE_SLOT_HELD=<kind>:<pid>:<start_ms>[:<h>]` (the held slot's marker, `none` too, or the parent's for a covered gate; a gate lent its light parent's slot holds none and hands `heavy:<its pid>:<its start>[:<h>]`, naming itself), `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, both the run id, `MSBUILDUSESERVER=0` (over an inherited value), `DOTNET_CLI_USE_MSBUILD_SERVER=0` (kept, P3), `MSBUILDDISABLENODEREUSE=1` (over an inherited value), `UseSharedCompilation=false` (over an inherited value), and `GATE_STATE_DIR=<root>` under a non-default root.
+
+  The caller's `--env` pairs ([Command environment](#command-environment)) are set over the gate's environment first, so the settings above come last and no pair can undo one.
+
+  `UseSharedCompilation=false` keeps Roslyn's compiler server from idling in the command's job for up to ten minutes after a build: a command that waits for its whole job, as Godot's console wrapper does, never ended while the server held it, and the stall kill fired. The same setting is on a `gate box run` command and a routed one.
 
   Under the default root an inherited `GATE_STATE_DIR` is removed. The gate's own environment is never changed.
 
@@ -2060,7 +2085,7 @@ The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent a
 
 A warm-up's `run` payload sets `WarmCommands` (1 to 8 commands, each a non-empty list of non-empty texts) and `WarmHash` (64 lower-case hex digits, the hash of the warm-up file the commands come from), sets no `Command`, and asks for no outputs. The PC's client sends it (The remote client's run, Warm-up call) for `gate warm`.
 
-`preflight` also reads an optional `Needs`, an object of tool name to minimum version text (`""` for any version; the box ignores the text, and for `godot` the PC sends the distinct exact pins joined by `,`), which the PC builds with `remote::payload::preflight_word` from the tools it wants probed; it is omitted when there are none, so a payload without needs is the same bytes as before.
+`preflight` also reads an optional `Needs`, an object of tool name to minimum version text (`""` for any version; the box ignores the text, and for `godot` the PC sends the manifest's own pin when the manifest names one, else the project files' distinct pins, joined by `,`), which the PC builds with `remote::payload::preflight_word` from the tools it wants probed; it is omitted when there are none, so a payload without needs is the same bytes as before.
 
 Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which the outputs transport owns (GATE-44), are read only by `run` (the outputs) and `outputs` (`Name`, `OutputFolder`); `preflight`, `stop` and `boot` ignore them.
 
@@ -2088,7 +2113,7 @@ A seam is refused as the `gate run` seams are: no value, given twice, and a valu
 
 The rules: a whole number above 0 and at most 2147483647 for the heartbeat, the sample period, the outputs and inputs budgets, the dotnet limit, the probe limit and the kill's leftover count, 1 to 100 for `--test-box-free-percent`, `true` or `false` for `--test-box-sampler-fail`. Without the feature each word gets the box usage line.
 
-The box gives each run's command its own build servers: the command's environment is the box's own with `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT` set to `gate-box-<Nonce>` (the payload's `Nonce`), `MSBUILDUSESERVER=0`, `DOTNET_CLI_USE_MSBUILD_SERVER=0` and `MSBUILDDISABLENODEREUSE=1`, each replacing any inherited value (names compared case-insensitively).
+The box gives each run's command its own build servers: the command's environment is the box's own with `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT` set to `gate-box-<Nonce>` (the payload's `Nonce`), `MSBUILDUSESERVER=0`, `DOTNET_CLI_USE_MSBUILD_SERVER=0`, `UseSharedCompilation=false` and `MSBUILDDISABLENODEREUSE=1`, each replacing any inherited value (names compared case-insensitively).
 
 So no other run's command, on the box or on the PC, uses the compiler server or the MSBuild nodes this one starts, and no node idles in the job after its build (an idle node would keep alive anything in the command that waits on its whole tree).
 
@@ -2189,7 +2214,7 @@ Built verbs:
 
   Payload refusals exit 2, each on stderr. The command's own: `gate: box payload Command is not a list of texts`, `gate: box payload lacks Command`, `gate: box payload Subfolder is not a text`, `gate: box payload Identity is not an object of texts`, `gate: box payload Identity may set only GIT_AUTHOR_* and GIT_COMMITTER_* names: <name>` and `gate: box payload Identity <name> holds a NUL`.
 
-  `Env`'s: `gate: box payload Env is not an object of texts`, `gate: box payload Env has a malformed name '<name>'` (empty, or holding `=` or a NUL), `gate: box payload Env gives <name> a value holding NUL`, `gate: box payload Env sets <name>, which the gate sets itself` and `gate: box payload Env sets <name>, which git would read over the gate's own git settings`.
+  `Env`'s: `gate: box payload Env is not an object of texts`, `gate: box payload Env has a malformed name '<name>'` (empty, or holding a character outside printable ASCII U+0021 to U+007E, or `=`), `gate: box payload Env gives <name> a value holding NUL`, `gate: box payload Env sets <name>, which the gate sets itself` and `gate: box payload Env sets <name>, which git would read over the gate's own git settings`.
 
   Also `gate: box payload Env sets <name>: GATE_ names are the gate's`, `gate: box payload Env sets <name>, a machine path the builder keeps`, `gate: box payload Env names <name> twice` and `gate: box payload Env is over its cap of 64 names or 32 KiB`. A null `Env` is not set.
 
@@ -2209,13 +2234,13 @@ Built verbs:
 
   `Identity` may hold only `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_AUTHOR_DATE`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL` and `GIT_COMMITTER_DATE`.
 
-  `Env` is the caller's variables for the command: an object of texts of at most 64 names and 32 KiB of names and values together, the cap read from the raw object before any pair is checked.
+  `Env` is the caller's variables for the command, the PC's `--env` pairs ([Command environment](#command-environment)), sent only when there is one: an object of texts of at most 64 names and 32 KiB of names and values together, the cap read from the parsed object before any pair is checked. A name is one or more printable ASCII characters (U+0021 to U+007E) but `=`; a value may hold anything but NUL.
 
-  It refuses a name the gate sets (`GATE_SLOT_HELD`, `GATE_STATE_DIR`, `SharedCompilationId`, `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `MSBUILDDISABLENODEREUSE`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`, and .NET's Event Log logging settings in any spelling: the `__` and `:` forms, a `DOTNET_` or `ASPNETCORE_` prefix, the provider's full type name).
+  It refuses a name the gate sets (`GATE_SLOT_HELD`, `GATE_STATE_DIR`, `SharedCompilationId`, `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `UseSharedCompilation`, `MSBUILDDISABLENODEREUSE`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`, and .NET's Event Log logging settings in any spelling: the `__` and `:` forms, a `DOTNET_` or `ASPNETCORE_` prefix, the provider's full type name).
 
   It also refuses `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG` (git reads them over the gate's own `safe.directory` entry), any `GATE_` name, and the machine paths `PATH`, `PATHEXT`, `TEMP`, `TMP`, `SystemRoot`, `windir`, `ComSpec`, `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA` and `ProgramData`. Names are compared without regard to ASCII case.
 
-  A name given twice is refused, first as an ASCII-case scan and then as Windows compares names, which folds more than ASCII. A refusal line shows the name shortened to 200 characters and escaped.
+  A name given twice in any ASCII case is refused; names are ASCII, so that is also how Windows compares them. A refusal line shows the name shortened to 200 characters and escaped.
 
   The pairs apply to the command only, never to the box's own steps (the git steps, the tool restore, the pnpm install).
 
@@ -2256,6 +2281,8 @@ Built verbs:
   A payload without `InputsDigest` skips the check. The PC reads the `inputs` tag as fallback reason `inputs` and says `gate: remote <host> inputs; running here`, with `gate: remote inputs not sent: the builder's work folder does not hold the inputs sent` in the log.
 
   The steps are the layout, fetch, the commit probe, checkout, clean and the back ref reset (each of the three git steps once per repo on a pair run, the main repo first), the dotnet tool restore, the pnpm package restore, then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset> failed (status <n>)` and exits `n`.
+
+  The clean is `git clean -fdq`, with no `-x`, so a work folder keeps its ignored files between runs; a Godot project's `.godot` folder is one, so it persists from one routed run to the next.
 
   On a pair run the step is followed by the repo's name (`gate: remote fetch <name> failed (status <n>)`), while the steps that ready a tree say `failed for <name>` as the preflight's do.
 
