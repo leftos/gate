@@ -194,7 +194,7 @@ pub const GATE_SET_PREFIXES: &[&str] = &["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"]
 pub const GATE_NAME_PREFIX: &str = "GATE_";
 
 /// The names of machine paths the gate keeps for the command: the builder's own, which a caller's value would move out
-/// from under it.
+/// from under it, and `GODOT_PATH`, which a routed run of a repo pinning one Godot sets to the install it resolved.
 pub const MACHINE_PATH_NAMES: &[&str] = &[
     "PATH",
     "PATHEXT",
@@ -208,6 +208,7 @@ pub const MACHINE_PATH_NAMES: &[&str] = &[
     "APPDATA",
     "LOCALAPPDATA",
     "ProgramData",
+    "GODOT_PATH",
 ];
 
 /// The most names a caller may give for the command's environment.
@@ -567,6 +568,8 @@ mod tests {
             "appdata",
             "LOCALAPPDATA",
             "programdata",
+            "GODOT_PATH",
+            "godot_path",
         ] {
             assert_eq!(env_refusal(name, "x"), Some(EnvRefusal::MachinePath), "{name}");
         }

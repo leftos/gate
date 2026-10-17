@@ -35,6 +35,11 @@ impl Variables {
         Variables(applied(self.0, vec![(OsString::from(name), Some(OsString::from(value)))]))
     }
 
+    /// This environment with every value it holds for `name` removed, names compared as Windows compares them.
+    pub(crate) fn without(self, name: &str) -> Variables {
+        Variables(applied(self.0, vec![(OsString::from(name), None)]))
+    }
+
     /// This environment with the build-server settings of the run `run` ([`build_servers`]) set over it, replacing
     /// every value it holds for each name, names compared as Windows compares them.
     pub(crate) fn with_build_servers(self, run: &str) -> Variables {

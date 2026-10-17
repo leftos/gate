@@ -2889,7 +2889,7 @@ fn a_repo_pinning_a_godot_the_builder_has_routes() {
 fn a_repo_pinning_a_godot_the_builder_lacks_runs_here_saying_the_mismatch() {
     let case = client_case("client-godot-lacking");
     write(&case, "src/App/Game.csproj", &godot_csproj("4.7.2"));
-    let root = godot_root(&case, &[("4.3", "4.3.stable.mono.official.y\n")]);
+    let root = godot_root(&case, &[("4.3.0", "4.3.stable.mono.official.y\n")]);
     let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &[]);
 
     a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "godot 4.7.2 exactly", "4.3.0")], Some(&root));
@@ -6564,4 +6564,154 @@ fn an_interrupted_install_caches_nothing() {
     );
     let cache = fs::read_to_string(hashes_file(&case)).map_or(Value::Null, |text| serde_json::from_str(&text).expect("the hash cache is JSON"));
     assert!(cache["files"].get("bin/a.txt").is_none(), "an interrupted install keeps no hash: {cache}");
+}
+
+/// A routed run of `command` in a case whose builder's `GATE_GODOT_ROOT` is `root`, with no `GODOT_PATH` of its own: it
+/// goes remote with no parity line and runs once, on the builder, and passes.
+fn a_routed_godot_run(case: &Case, root: &Path, command: &[&str]) -> Outcome {
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({ "host": HOST, "slots": 2, "repos": { &repo: ["*tool*", "Godot_console*"] }, "outputs": { &repo: [] } });
+    write_remote_json(case, &routing.to_string());
+    let box_path = box_path_with_tools(case, &listing(&[BUILDER_SDK]), &[], &[]);
+    let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
+    let mut words = command.to_vec();
+    words.extend(["mark", RAN]);
+    let mut gate = client_gate(case, "out.log", &steps, &words);
+    gate.env("PATH", box_path)
+        .env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING)
+        .env_remove("GODOT_PATH");
+    set_godot_root(&mut gate, Some(root));
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.lines().any(is_parity_line), "{outcome:?}");
+    assert_eq!(fallbacks(&own(case, pid)), Vec::<&str>::new(), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert_eq!(runs(case), (0, 1), "the command ran once, on the builder: {outcome:?}");
+    outcome
+}
+
+/// The Godot command a routed case runs: the install's answer, then the `GODOT_PATH` the command sees.
+const GODOT_COMMAND: [&str; 4] = ["Godot_console.exe", "--version", "env", "GODOT_PATH"];
+
+/// Whether the routed run's output holds the answer of the install `version` of `root` and a `GODOT_PATH` naming it.
+fn ran_the_install(outcome: &Outcome, root: &Path, version: &str) -> bool {
+    let install = root.join(version).join("Godot_console.exe").display().to_string();
+    let answer = format!("{version}.stable.mono.official.x");
+    let lines: Vec<&str> = outcome.stdout.lines().collect();
+    lines.contains(&answer.as_str()) && lines.contains(&install.as_str())
+}
+
+/// A routed Godot run of a repo pinning a version the builder has sends it, and the builder runs that install.
+#[test]
+fn a_routed_godot_run_sends_the_installed_version_its_repo_pins() {
+    let case = client_case("client-godot-version-sent");
+    write(&case, "src/App/Game.csproj", &godot_csproj("4.7.2"));
+    let root = godot_root(
+        &case,
+        &[("4.3.0", "4.3.0.stable.mono.official.x\n"), ("4.7.2", "4.7.2.stable.mono.official.x\n")],
+    );
+
+    let outcome = a_routed_godot_run(&case, &root, &GODOT_COMMAND);
+
+    assert!(ran_the_install(&outcome, &root, "4.7.2"), "{outcome:?}");
+}
+
+/// A partial pin picks the highest install of the builder that meets it.
+#[test]
+fn a_routed_godot_run_of_a_partial_pin_picks_the_highest_matching_install() {
+    let case = client_case("client-godot-partial-pin");
+    write(&case, MANIFEST, "[tools]\ngodot = \"4.7\"\n");
+    let root = godot_root(
+        &case,
+        &[
+            ("4.7.1", "4.7.1.stable.mono.official.x\n"),
+            ("4.7.2", "4.7.2.stable.mono.official.x\n"),
+            ("4.8.0", "4.8.0.stable.mono.official.x\n"),
+        ],
+    );
+
+    let outcome = a_routed_godot_run(&case, &root, &GODOT_COMMAND);
+
+    assert!(ran_the_install(&outcome, &root, "4.7.2"), "{outcome:?}");
+}
+
+/// A case whose project files pin the differing Godot versions 4.7.2 and 4.3.0, and the root of a builder that has both.
+fn several_pins_case(name: &str) -> (Case, PathBuf) {
+    let case = client_case(name);
+    write(&case, "src/A/Game.csproj", &godot_csproj("4.7.2"));
+    write(&case, "src/B/Tool.csproj", &godot_csproj("4.3.0"));
+    let root = godot_root(
+        &case,
+        &[("4.3.0", "4.3.0.stable.mono.official.x\n"), ("4.7.2", "4.7.2.stable.mono.official.x\n")],
+    );
+    (case, root)
+}
+
+/// A Godot command of a repo whose project files pin several differing Godot versions runs here, saying why before the
+/// parity line, on the console and in the log, though the builder has both.
+#[test]
+fn a_godot_run_of_a_repo_pinning_several_godot_versions_falls_back_saying_why() {
+    let (case, root) = several_pins_case("client-godot-several-pins");
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({ "host": HOST, "slots": 2, "repos": { &repo: ["Godot_console*"] }, "outputs": { &repo: [] } });
+    write_remote_json(&case, &routing.to_string());
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &[]);
+    let mut local_path = OsString::from(root.join("4.7.2"));
+    local_path.push(";");
+    local_path.push(&box_path);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(&case, "out.log", &steps, &["Godot_console.exe", "--version", "mark", RAN]);
+    gate.env("PATH", &local_path)
+        .env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING)
+        .env_remove("GODOT_PATH");
+    set_godot_root(&mut gate, Some(&root));
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    let why = "gate: the repo pins several Godot versions (4.7.2, 4.3.0); a routed run needs one";
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), ["parity"], "{outcome:?}");
+    let said: Vec<&str> = outcome.stderr.lines().filter(|line| *line == why || is_parity_line(line)).collect();
+    assert_eq!(said, [why, PARITY_LINE], "{outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(log.lines().any(|line| line == why), "{log}");
+    assert_eq!(calls(&steps), ["preflight"], "the preflight alone reached the builder");
+    assert_eq!(runs(&case), (1, 0), "the command ran once, here: {outcome:?}");
+}
+
+/// Any other command of a repo pinning several differing Godot versions routes as it would with no pin, sending no
+/// version: the builder's command sees no `GODOT_PATH`.
+#[test]
+fn another_command_of_a_repo_pinning_several_godot_versions_routes_with_no_version() {
+    let (case, root) = several_pins_case("client-godot-several-pins-other");
+
+    let outcome = a_routed_godot_run(&case, &root, &[r".\tool.exe", "env", "GODOT_PATH"]);
+
+    assert!(
+        outcome.stdout.lines().any(|line| line == "fake-tool: GODOT_PATH is not set"),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("several Godot versions"), "{outcome:?}");
+}
+
+/// A repo requiring any Godot, or pinning none, sends no version: the builder's command sees no `GODOT_PATH`.
+#[test]
+fn a_routed_run_of_any_godot_or_no_pin_sends_no_version() {
+    for (name, file, text) in [
+        ("client-godot-any", MANIFEST, "[tools]\ngodot = \"\"\n"),
+        ("client-godot-no-pin", "src/App/App.csproj", "<Project />\n"),
+    ] {
+        let case = client_case(name);
+        write(&case, file, text);
+        let root = godot_root(&case, &[("4.7.2", "4.7.2.stable.mono.official.x\n")]);
+
+        let outcome = a_routed_godot_run(&case, &root, &[r".\tool.exe", "env", "GODOT_PATH"]);
+
+        assert!(
+            outcome.stdout.lines().any(|line| line == "fake-tool: GODOT_PATH is not set"),
+            "{name}: {outcome:?}"
+        );
+    }
 }

@@ -834,7 +834,7 @@ fn preflight_says_every_godot_the_root_names() {
     let case = Case::new("preflight_godot_root");
     let root = godot_root(&case);
     fake_godot(&root.join("4.7.2"), "4.7.2.stable.mono.official.x\n");
-    fake_godot(&root.join("4.3"), "4.3.stable.mono.official.y\n");
+    fake_godot(&root.join("4.3.0"), "4.3.stable.mono.official.y\n");
 
     let outcome = probed_with_root(&case, &json!({"godot": "4.7.2"}), &[], Some(&root));
 
@@ -965,6 +965,32 @@ fn preflight_skips_a_godot_behind_a_junction() {
     );
     assert_eq!(after_sdks(&outcome), [said.as_str()], "{outcome:?}");
     assert!(!behind.join("ran").exists(), "the install behind the junction ran");
+}
+
+/// An install whose folder is not named the version it answers with is left out of the line, as a run finds an install
+/// by its folder's name; a root whose only install is misnamed is skipped with that reason.
+#[test]
+fn preflight_leaves_out_a_godot_whose_folder_is_named_another_version() {
+    let case = Case::new("preflight_godot_misnamed");
+    let root = godot_root(&case);
+    fake_godot(&root.join("4.7"), "4.7.2.stable.mono.official.x\n");
+    fake_godot(&root.join("4.3.0"), "4.3.stable.mono.official.y\n");
+
+    let outcome = probed_with_root(&case, &json!({"godot": "4.7.2"}), &[], Some(&root));
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool godot 4.3.0"], "{outcome:?}");
+
+    let only = Case::new("preflight_godot_only_misnamed");
+    let root = godot_root(&only);
+    fake_godot(&root.join("4.7"), "4.7.2.stable.mono.official.x\n");
+
+    let outcome = probed_with_root(&only, &json!({"godot": "4.7.2"}), &[], Some(&root));
+
+    assert_eq!(
+        after_sdks(&outcome),
+        ["gate: remote tool godot skipped: named 4.7 but reports 4.7.2"],
+        "{outcome:?}"
+    );
 }
 
 #[test]
@@ -1645,6 +1671,10 @@ fn box_run_refuses_a_malformed_env() {
             "gate: box payload Env sets PATH, a machine path the builder keeps",
         ),
         (
+            json!({"GODOT_PATH": "C:\\x\\Godot_console.exe"}),
+            "gate: box payload Env sets GODOT_PATH, a machine path the builder keeps",
+        ),
+        (
             json!({"GATE_OTHER": "1"}),
             "gate: box payload Env sets GATE_OTHER: GATE_ names are the gate's",
         ),
@@ -1667,6 +1697,227 @@ fn box_run_refuses_a_malformed_env() {
     for (env, line) in refusing {
         let mut refused = payload.clone();
         refused["Env"] = env;
+
+        let outcome = run_box(&case, &refused);
+
+        assert_eq!(outcome.code, Some(2), "{line}: {outcome:?}");
+        assert_eq!(outcome.stdout, "");
+        assert_eq!(outcome.stderr, format!("{line}\n"), "{outcome:?}");
+        assert_eq!(work_entries(&payload), laid, "nothing is checked out or run");
+    }
+}
+
+/// `gate box run` of `payload` with the box's `GATE_GODOT_ROOT` the folder `root`, taken out of its environment when
+/// there is none, its `PATH` the folders `stubs` first ([`path_for_run`]), and its own `GODOT_PATH` `inherited`, taken
+/// out likewise.
+fn run_box_with_godot(case: &Case, payload: &Value, root: Option<&Path>, stubs: &[PathBuf], inherited: Option<&str>) -> Outcome {
+    let mut command = box_call(case, &["box", "run"], &self::payload(payload));
+    if let Some(root) = root {
+        command.env("GATE_GODOT_ROOT", root);
+    } else {
+        command.env_remove("GATE_GODOT_ROOT");
+    }
+    command.env("PATH", path_for_run(stubs));
+    if let Some(inherited) = inherited {
+        command.env("GODOT_PATH", inherited);
+    } else {
+        command.env_remove("GODOT_PATH");
+    }
+    command.finish()
+}
+
+/// A run payload of `words`, snapshotted, with the `GodotVersion` `version` when given.
+fn godot_payload(case: &Case, words: &[&str], version: Option<&str>) -> Value {
+    let mut payload = box_payload(case, "k", words);
+    snapshot(case, &mut payload, &[("a.txt", "a\n")]);
+    if let Some(version) = version {
+        payload["GodotVersion"] = json!(version);
+    }
+    payload
+}
+
+/// A folder of the case holding a fake `Godot_console.exe` answering `1.1.1`, for the box's `PATH`: what a word the
+/// root does not serve resolves to.
+fn path_godot(case: &Case) -> PathBuf {
+    let stub = case.folder().join("path-godot");
+    fake_godot(&stub, "1.1.1.stable.mono.official.p\n");
+    stub
+}
+
+/// A run with a `GodotVersion` runs a bare Godot console word as the install of that version from a root of two, and
+/// the command sees `GODOT_PATH` naming it.
+#[test]
+fn box_run_runs_the_godot_install_of_the_chosen_version() {
+    let case = Case::new("box_run_godot_chosen");
+    let root = godot_root(&case);
+    fake_godot(&root.join("4.3.0"), "4.3.stable.mono.official.y\n");
+    fake_godot(&root.join("4.7.2"), "4.7.2.stable.mono.official.x\n");
+    let payload = godot_payload(&case, &["godot_CONSOLE.exe", "--version", "env", "GODOT_PATH"], Some("4.7.2"));
+
+    let outcome = run_box_with_godot(&case, &payload, Some(&root), &[path_godot(&case)], None);
+
+    let install = root.join("4.7.2").join("Godot_console.exe");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout,
+        format!("4.7.2.stable.mono.official.x\n{}\n", install.display()),
+        "{outcome:?}"
+    );
+    assert!(!root.join("4.3.0").join("ran").exists(), "the other install ran");
+}
+
+/// Every command of a run with a `GodotVersion` sees `GODOT_PATH`, whatever its first word, naming the install of that
+/// version over the value the box inherited.
+#[test]
+fn box_run_sets_godot_path_over_an_inherited_one_for_any_command() {
+    let case = Case::new("box_run_godot_path_inherited");
+    let root = godot_root(&case);
+    fake_godot(&root.join("4.7.2"), "4.7.2.stable.mono.official.x\n");
+    let payload = godot_payload(&case, &[FAKE_TOOL, "env", "GODOT_PATH"], Some("4.7.2"));
+
+    let outcome = run_box_with_godot(&case, &payload, Some(&root), &[], Some(r"C:\stale\Godot_console.exe"));
+
+    let install = root.join("4.7.2").join("Godot_console.exe");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, format!("{}\n", install.display()), "{outcome:?}");
+}
+
+/// A run with no `GodotVersion` sets no `GODOT_PATH` and finds a Godot console word on the `PATH`, as any other word,
+/// though the root holds an install.
+#[test]
+fn box_run_without_a_godot_version_sets_no_godot_path_and_reads_the_path() {
+    let case = Case::new("box_run_godot_none");
+    let root = godot_root(&case);
+    fake_godot(&root.join("4.7.2"), "4.7.2.stable.mono.official.x\n");
+    let payload = godot_payload(&case, &["Godot_console.exe", "--version", "env", "GODOT_PATH"], None);
+
+    let outcome = run_box_with_godot(&case, &payload, Some(&root), &[path_godot(&case)], None);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout, "1.1.1.stable.mono.official.p\nfake-tool: GODOT_PATH is not set\n",
+        "{outcome:?}"
+    );
+    assert!(!root.join("4.7.2").join("ran").exists(), "the root's install ran");
+}
+
+/// A Godot console word of a run whose chosen version the root holds no plain install of fails to start, status 127,
+/// and nothing runs: neither the Godot the `PATH` holds nor any install behind the root's folder.
+fn assert_no_godot_started(outcome: &Outcome, path_godot: &Path) {
+    assert_eq!(outcome.code, Some(127), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .lines()
+            .any(|line| line.starts_with("gate: could not start Godot_console.exe")),
+        "{outcome:?}"
+    );
+    assert!(!path_godot.join("ran").exists(), "the Godot on the PATH ran");
+}
+
+/// An install of the chosen version behind a junction is never run, and with a root set nothing falls back to the
+/// `PATH`: the command fails to start.
+#[test]
+fn box_run_never_runs_a_godot_install_behind_a_junction() {
+    let case = Case::new("box_run_godot_junction");
+    let root = godot_root(&case);
+    let behind = case.folder().join("behind");
+    fake_godot(&behind, "4.7.2.stable.mono.official.x\n");
+    junction(&root.join("4.7.2"), &behind);
+    let payload = godot_payload(&case, &["Godot_console.exe", "--version"], Some("4.7.2"));
+    let path_godot = path_godot(&case);
+
+    let outcome = run_box_with_godot(&case, &payload, Some(&root), std::slice::from_ref(&path_godot), None);
+
+    assert_no_godot_started(&outcome, &path_godot);
+    assert!(!behind.join("ran").exists(), "the install behind the junction ran");
+}
+
+/// With a root set and no install of the chosen version in it, a Godot console word fails to start rather than run the
+/// Godot the `PATH` holds.
+#[test]
+fn box_run_with_a_root_lacking_the_chosen_godot_never_reads_the_path() {
+    let case = Case::new("box_run_godot_missing_install");
+    let root = godot_root(&case);
+    fake_godot(&root.join("4.3.0"), "4.3.stable.mono.official.y\n");
+    let payload = godot_payload(&case, &["Godot_console.exe", "--version"], Some("4.7.2"));
+    let path_godot = path_godot(&case);
+
+    let outcome = run_box_with_godot(&case, &payload, Some(&root), std::slice::from_ref(&path_godot), None);
+
+    assert_no_godot_started(&outcome, &path_godot);
+    assert!(!root.join("4.3.0").join("ran").exists(), "the other install ran");
+}
+
+/// A run with a chosen version for which no Godot program is found anywhere gives its command no `GODOT_PATH` at all,
+/// the box's own inherited value removed rather than passed on as if the gate had set it.
+#[test]
+fn box_run_with_no_godot_found_unsets_an_inherited_godot_path() {
+    let case = Case::new("box_run_godot_path_unset");
+    let root = godot_root(&case);
+    let payload = godot_payload(&case, &[FAKE_TOOL, "env", "GODOT_PATH"], Some("4.7.2"));
+
+    let outcome = run_box_with_godot(&case, &payload, Some(&root), &[], Some(r"C:\stale\Godot_console.exe"));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "fake-tool: GODOT_PATH is not set\n", "{outcome:?}");
+}
+
+/// With no root, a run with a chosen version finds a Godot console word on the `PATH`, and every command sees
+/// `GODOT_PATH` naming the Godot found there, a Godot word's own program or the `PATH`'s `Godot_console.exe`.
+#[test]
+fn box_run_without_a_root_takes_the_godot_on_the_path() {
+    for (name, words, answer) in [
+        (
+            "box_run_godot_no_root_word",
+            &["Godot_console.exe", "--version", "env", "GODOT_PATH"][..],
+            "1.1.1.stable.mono.official.p\n",
+        ),
+        ("box_run_godot_no_root_other", &[FAKE_TOOL, "env", "GODOT_PATH"][..], ""),
+    ] {
+        let case = Case::new(name);
+        let path_godot = path_godot(&case);
+        let payload = godot_payload(&case, words, Some("4.7.2"));
+
+        let outcome = run_box_with_godot(&case, &payload, None, std::slice::from_ref(&path_godot), None);
+
+        let found = path_godot.join("Godot_console.exe");
+        assert_eq!(outcome.code, Some(0), "{name}: {outcome:?}");
+        assert_eq!(outcome.stdout, format!("{answer}{}\n", found.display()), "{name}: {outcome:?}");
+    }
+}
+
+/// A `GodotVersion` that is not three runs of digits is refused with the usage line before anything is checked out,
+/// as it would be joined into a path.
+#[test]
+fn box_run_refuses_a_godot_version_that_is_no_version() {
+    let case = Case::new("box_run_godot_version_refused");
+    let long = "9".repeat(250);
+    let long_line = format!("gate: box payload GodotVersion is not a version: '{}…'", "9".repeat(200));
+    let refusing = [
+        (json!("4.7"), "gate: box payload GodotVersion is not a version: '4.7'".to_owned()),
+        (json!("4.7.2.1"), "gate: box payload GodotVersion is not a version: '4.7.2.1'".to_owned()),
+        (
+            json!(r"..\4.7.2"),
+            r"gate: box payload GodotVersion is not a version: '..\4.7.2'".to_owned(),
+        ),
+        (json!("4.7.x"), "gate: box payload GodotVersion is not a version: '4.7.x'".to_owned()),
+        (json!("4..2"), "gate: box payload GodotVersion is not a version: '4..2'".to_owned()),
+        (json!(""), "gate: box payload GodotVersion is not a version: ''".to_owned()),
+        (
+            json!("4.7.2\u{1b}"),
+            "gate: box payload GodotVersion is not a version: '4.7.2\\u{1b}'".to_owned(),
+        ),
+        (json!(4), "gate: box payload GodotVersion is not a version: '4'".to_owned()),
+        (json!(long), long_line),
+    ];
+    let payload = godot_payload(&case, &[FAKE_TOOL, "exit", "0"], None);
+    let laid = work_entries(&payload);
+
+    for (version, line) in refusing {
+        let mut refused = payload.clone();
+        refused["GodotVersion"] = version;
 
         let outcome = run_box(&case, &refused);
 

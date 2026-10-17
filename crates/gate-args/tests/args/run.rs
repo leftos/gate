@@ -401,6 +401,15 @@ fn run_env_refuses_each_name_the_gate_keeps_with_its_own_line() {
     }
 }
 
+/// `GODOT_PATH` is the Godot install a routed run resolves, so a caller's value for it is refused as a machine path.
+#[test]
+fn run_env_refuses_godot_path_as_a_machine_path() {
+    assert_eq!(
+        problems_with(&["--env", "GODOT_PATH=x", "--", "cmd"]),
+        ["gate: --env sets GODOT_PATH, a machine path the gate keeps for the command"]
+    );
+}
+
 /// `UseSharedCompilation` is one of the gate's own settings: it is off for every command the gate starts, local or
 /// routed, so a caller's `--env` value for it is refused (GATE-383).
 #[test]

@@ -98,7 +98,7 @@ It is how a caller in a main checkout gates a command that names another worktre
 
 A name is one or more printable ASCII characters, U+0021 to U+007E, `=` excepted. ASCII only keeps the ASCII-case check of the refused names below equal to Windows' own comparison of names, so a name that is not ASCII can never pass that check and then be read as one the gate protects. A value may hold anything but NUL (CR and LF included) and may be empty.
 
-The gate refuses a name it sets itself (the build-server settings, `UseSharedCompilation`, `GATE_SLOT_HELD`, `GATE_STATE_DIR` and the rest listed under [Command launching](#command-launching) and [The box side](#the-box-side)), any `GATE_` name, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG` and the machine paths the box keeps, the same on both sides so one `--env` means the same on the PC and on a builder.
+The gate refuses a name it sets itself (the build-server settings, `UseSharedCompilation`, `GATE_SLOT_HELD`, `GATE_STATE_DIR` and the rest listed under [Command launching](#command-launching) and [The box side](#the-box-side)), any `GATE_` name, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG` and the machine paths the box keeps (`GODOT_PATH` among them, which a routed run sets itself), the same on both sides so one `--env` means the same on the PC and on a builder.
 
 It also refuses a name given twice in any ASCII case, and more than 64 names or 32 KiB of names and values together. The gate's own settings are applied after the caller's pairs, so no pair undoes one.
 
@@ -1468,7 +1468,11 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A bare first word (no separator, drive or `.`/`..`) becomes `./name` only when that file exists in the gate's folder; otherwise it stays bare, for the builder's `PATH`.
 
-  A first word that names a program by an absolute path outside the worktree and its siblings is sent as the program's name, the file name with a trailing `.exe` removed, so the builder finds it on its own `PATH` (a Godot or dotnet install named by its full path). The run says once, first among its routed lines, `gate: routed <given> as <name>` (both escaped), and the fallback here, the journal and the claim keep the words as given. Such a word is never written `./name`.
+  A first word that names a program by an absolute path outside the worktree and its siblings is sent as the program's name, the file name with a trailing `.exe` removed, so the builder finds it on its own `PATH` (a Godot or dotnet install named by its full path).
+
+  A Godot console word of a run with a chosen Godot version runs that version's install instead (Toolchain manifest, below).
+
+  The run says once, first among its routed lines, `gate: routed <given> as <name>` (both escaped), and the fallback here, the journal and the claim keep the words as given. Such a word is never written `./name`.
 
   The name is refused, and the word stays outside (the run stays here with `gate: not routed: <word> is outside the worktree`), when the file name holds any of `* ? " < > |`, white space or a line break, or is empty once `.exe` is removed; when any path segment after the drive (folders and file name) holds `:`, holds `~` followed by an ASCII digit (a short name), ends in `.` or a space, or is empty, `.` or `..`; or when the word holds a second drive path (`X:\a\x.exe;C:\other`).
 
@@ -1630,6 +1634,14 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     Every pin must be met, else the mismatch line is `gate: remote toolchain mismatch: <repo> needs godot <pins, comma separated> exactly; <host> has <found>`, `<found>` being the builder's versions joined by `, `, `none`, `not probed (<why>)`, or its own answer when that is no version list; for a manifest entry of `""` (any version) the line reads `needs godot`.
 
     An answer that is no version list is a mismatch whenever a pin needs checking, so the command runs here rather than on a builder that may lack the version. A slow install that drops off the builder's list reads as missing, a needless fallback and a known limitation.
+
+    After the preflight the client chooses the Godot version the run uses, from the repo's pins among the versions the builder reported: no pin, or a manifest entry of `""`, chooses none; one pin chooses the highest reported version that meets it (`4.7.2` itself, `4.7` the highest `4.7.x`); a pin no reported version meets chooses none.
+
+    A chosen version, spelled `x.y.z`, is sent as the optional `GodotVersion` of the run payload and of a warm-up's, and left out when none is chosen. The box resolves it ([The box side](#the-box-side), the command's environment).
+
+    A repo whose pins differ chooses none. A command whose first word is a Godot console word (a bare name with no directory part whose name, after one trailing `.exe` is removed, matches `godot*console*` ignoring ASCII case with no `.` after the last `console`; `.cmd`, `.bat`, `.ps1` and any other extension are not) falls back `parity`.
+
+    It says `gate: the repo pins several Godot versions (<pins, comma separated>); a routed run needs one` after the mismatch lines and before the parity line. Every other command of that repo routes as before, with no `GodotVersion`.
 
     A tool the builder did not probe, gave no answer for, or found at a version that cannot be read against a minimum gets `gate: <host> did not probe <name>: <why>; not checking it` and is not a need. The lines come in this order: the SDK step's own, then the manifest's problem lines, then the per-tool skip lines in the manifest's order, then the mismatch lines.
 
@@ -2085,13 +2097,13 @@ Each verb is one ssh call today, and the call's cost is its connection, not its 
 
 A routed run therefore moves to one long-lived connection carrying every verb, `gate box serve`, and the per-call client stays until that lands (GATE-70 holds the measurement, and GATE-109 the work).
 
-The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, and for `outputs` also `Name`.
+The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest` and `GodotVersion`, and for `outputs` also `Name`.
 
 `inflight` reads only `Root`.
 
 `inputs` reads `Key`, `Bare`, `Work`, `Lock`, `Nonce` and `Step`.
 
-A warm-up's `run` payload sets `WarmCommands` (1 to 8 commands, each a non-empty list of non-empty texts) and `WarmHash` (64 lower-case hex digits, the hash of the warm-up file the commands come from), sets no `Command`, and asks for no outputs. The PC's client sends it (The remote client's run, Warm-up call) for `gate warm`.
+A warm-up's `run` payload sets `WarmCommands` (1 to 8 commands, each a non-empty list of non-empty texts) and `WarmHash` (64 lower-case hex digits, the hash of the warm-up file the commands come from), sets no `Command`, and asks for no outputs. The PC's client sends it (The remote client's run, Warm-up call) for `gate warm`. It may carry `GodotVersion` too, and its commands resolve Godot as a run's do.
 
 `preflight` also reads an optional `Needs`, an object of tool name to minimum version text (`""` for any version; the box ignores the text, and for `godot` the PC sends the manifest's own pin when the manifest names one, else the project files' distinct pins, joined by `,`), which the PC builds with `remote::payload::preflight_word` from the tools it wants probed; it is omitted when there are none, so a payload without needs is the same bytes as before.
 
@@ -2167,11 +2179,15 @@ Built verbs:
 
   The probes are `rustc --version` for `rust`, `cargo-nextest nextest --version` for `cargo-nextest` (the plugin directly, never through `cargo`, so no `.cargo\config.toml` above the folder can alias it), `<name> --version` for `node`, `pnpm` and `pwsh`, and `ffmpeg -version`. `godot` is probed as the next paragraph says.
 
-  The `godot` probe reads `GATE_GODOT_ROOT`, an environment variable of the builder naming a folder of side-by-side Godot installs, one per subfolder, each holding `Godot_console.exe`. It lists the direct subfolders of that folder (the first 64 entries, in path-name order), runs each install's `Godot_console.exe --version` under the batch's deadline and says the versions found as one line, `gate: remote tool godot <v1>,<v2>,...`, ordered by number and without repeats.
+  The `godot` probe reads `GATE_GODOT_ROOT`, an environment variable of the builder naming a folder of side-by-side Godot installs, one per subfolder, each holding `Godot_console.exe`. A subfolder is named for its install's version in full canonical form, `x.y.z` (`4.7.2`: three parts, no leading zero in a part, as `04.7.2` and `4.3` are not), since a run finds an install by that name, `<root>\<version>\Godot_console.exe`.
 
-  A version is the leading dot-separated digits of the first line of stdout, three parts as printed or two with `.0` added (`4.3.stable.mono.official.<hash>` is `4.3.0`); an install that prints a version and exits non-zero is still listed. With no `GATE_GODOT_ROOT` the probe runs the `Godot_console.exe` found on `PATH`. A root that names no install is `missing`. Subfolders whose name is not valid Unicode, that hold no plain `Godot_console.exe`, past the first 64, or that cannot be read are left out.
+  The probe lists the direct subfolders of that folder (the first 64 entries, in path-name order), runs each install's `Godot_console.exe --version` under the batch's deadline and says the versions found as one line, `gate: remote tool godot <v1>,<v2>,...`, ordered by number and without repeats.
 
-  When no install gives a version the line is `gate: remote tool godot skipped: <why>`, the first reason met: `cannot run <install>: <install> lies inside the worktree` (an install inside the run's own folders, the folder above `Work`, `Work`, `Bare` and the outputs folder, is refused unrun; a `gate check` refuses the repo root), `cannot run <exe>: <path> is a link or a junction` (a subfolder or the exe), `GATE_GODOT_ROOT <path> is not an absolute path on a drive`, `cannot read GATE_GODOT_ROOT <path>: <error>`, `no answer in <limit>` (the listing was cut by the deadline with nothing read) or `Godot_console.exe --version gave no version: <line>` (the first line of stdout, cut to 200 characters with `…`, escaped, when a version part has over ten digits or the line leads with no version).
+  A version is the leading dot-separated digits of the first line of stdout, three parts as printed or two with `.0` added (`4.3.stable.mono.official.<hash>` is `4.3.0`), each part spelled with no leading zero (`04.07.2` is `4.7.2`); an install that prints a version and exits non-zero is still listed.
+
+  An install under `GATE_GODOT_ROOT` whose folder is not named exactly the version it reports is left out of the list, as a run could not find it by name. With no `GATE_GODOT_ROOT` the probe runs the `Godot_console.exe` found on `PATH`. A root that names no install is `missing`. Subfolders whose name is not valid Unicode, that hold no plain `Godot_console.exe`, past the first 64, or that cannot be read are left out.
+
+  When no install gives a version the line is `gate: remote tool godot skipped: <why>`, the first reason met: `cannot run <install>: <install> lies inside the worktree` (an install inside the run's own folders, the folder above `Work`, `Work`, `Bare` and the outputs folder, is refused unrun; a `gate check` refuses the repo root), `cannot run <exe>: <path> is a link or a junction` (a subfolder or the exe, being any reparse point: a link, a junction, an app execution alias or a cloud placeholder), `named <folder> but reports <version>` (an install of the root whose folder is not named the version it reports; said only when no other install lists), `GATE_GODOT_ROOT <path> is not an absolute path on a drive`, `cannot read GATE_GODOT_ROOT <path>: <error>`, `no answer in <limit>` (the listing was cut by the deadline with nothing read) or `Godot_console.exe --version gave no version: <line>` (the first line of stdout, cut to 200 characters with `…`, escaped, when a version part has over ten digits or the line leads with no version).
 
   Each program is found through `PATH` and `PATHEXT` as `dotnet` is (a `.cmd` shim runs through the system folder's cmd.exe; a `.ps1` is not run) and runs in the system folder on a hidden console, in the bounded runner of `remote/git.rs` (`program_output`).
 
@@ -2226,6 +2242,8 @@ Built verbs:
 
   Also `gate: box payload Env sets <name>: GATE_ names are the gate's`, `gate: box payload Env sets <name>, a machine path the builder keeps`, `gate: box payload Env names <name> twice` and `gate: box payload Env is over its cap of 64 names or 32 KiB`. A null `Env` is not set.
 
+  `GodotVersion`'s: `gate: box payload GodotVersion is not a version: '<value>'` for any value but a string of exactly three dot-separated parts of one to ten digits each with no leading zero (except `0`), as it is joined into an install's path; a value that is no string shows as compact JSON, shortened and escaped. A null `GodotVersion` is not set.
+
   A warm-up payload's: `gate: box payload sets both Command and WarmCommands`, `gate: box payload lacks WarmHash`, `gate: box payload asks a warm-up for outputs` (an `Outputs` glob or `OutputsFull` true), `gate: box payload asks a warm-up for Env` (an `Env` that is not null, even `{}`), `gate: box payload WarmCommands is not a list of 1 to 8 commands, each a non-empty list of non-empty texts` and `gate: box payload WarmHash is not 64 lower-case hex digits: <value>`.
 
   A `WarmHash` beside a `Command` is ignored, and a null `WarmCommands` is not set.
@@ -2246,7 +2264,7 @@ Built verbs:
 
   It refuses a name the gate sets (`GATE_SLOT_HELD`, `GATE_STATE_DIR`, `SharedCompilationId`, `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `UseSharedCompilation`, `MSBUILDDISABLENODEREUSE`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`, and .NET's Event Log logging settings in any spelling: the `__` and `:` forms, a `DOTNET_` or `ASPNETCORE_` prefix, the provider's full type name).
 
-  It also refuses `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG` (git reads them over the gate's own `safe.directory` entry), any `GATE_` name, and the machine paths `PATH`, `PATHEXT`, `TEMP`, `TMP`, `SystemRoot`, `windir`, `ComSpec`, `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA` and `ProgramData`. Names are compared without regard to ASCII case.
+  It also refuses `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG` (git reads them over the gate's own `safe.directory` entry), any `GATE_` name, and the machine paths `PATH`, `PATHEXT`, `TEMP`, `TMP`, `SystemRoot`, `windir`, `ComSpec`, `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA` and `ProgramData`, and `GODOT_PATH`, which a run sets itself (the command's environment, below). Names are compared without regard to ASCII case.
 
   A name given twice in any ASCII case is refused; names are ASCII, so that is also how Windows compares them. A refusal line shows the name shortened to 200 characters and escaped.
 
@@ -2363,6 +2381,12 @@ Built verbs:
   The inherited count is read as git reads it (leading whitespace, an optional `+`, decimal digits to the end, at most `i32::MAX`; an empty value is 0); a count git would refuse, or `i32::MAX` itself, leaves the environment unchanged. The work folders are owned by Administrators, which git refuses from a non-elevated token.
 
   The command's environment is the box's own with the payload's `Env` pairs set over it, each replacing any inherited value; the settings below are applied after the pairs, so none of them can be undone by one.
+
+  A run with a `GodotVersion` resolves Godot on the box. With `GATE_GODOT_ROOT` set in the command's environment, a Godot console word runs only `<root>\<version>\Godot_console.exe`: an install that is missing, or a folder or exe that is any reparse point (link, junction, app execution alias, cloud placeholder), fails as `gate: could not start <word>: <file-not-found text>` with status 127, and never falls back to the `PATH`.
+
+  With no root the word resolves on the `PATH` as before. Any other word resolves as before.
+
+  `GODOT_PATH` is then set for every command of the run to the Godot program that resolved: the root's install when the root is set, else, with no root, the program the `PATH` gave a Godot console word, or the `PATH`'s `Godot_console.exe` for any other. It is set after the caller's pairs and the gate's own settings, so none undoes it. When no Godot program resolves, `GODOT_PATH` is removed, an inherited value included. A run with no `GodotVersion` leaves the environment as before.
 
   The command's environment also sets `Logging__EventLog__LogLevel__Default=None`, replacing any inherited value, so a .NET host with default logging writes nothing to the Windows Event Log; its console output is unchanged. Of the groups the Application log's default access lets write, a restricted copy of the box's token could hold only Administrators, INTERACTIVE, SERVICE, BATCH and WRITE_RESTRICTED, and the command's token holds none of them.
 
