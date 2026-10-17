@@ -29,6 +29,8 @@ The owner wants this project worked as autonomously as possible and holds no str
 
 Output text the gate prints for the agents that invoke it (its lines, refusals and failure messages) is designed by the round too, as well as the round can: the owner does not review its wording. The owner is asked only about what they know as a user and a developer and the round cannot settle from the code: a default that changes how a caller repo's runs behave, a change to a workflow in those repos, or anything that touches their machines beyond the builders' gate setup. A feature branch counts as technical: the round decides it and says so.
 
+The builders' setup is the session's own work, with the owner's standing permission: a session installs the toolchains and tools a routed repo needs and changes a builder's configuration (ACLs, environment variables, installs) directly over ssh, without asking and without a request to claude-config first. After each change it sends claude-config a repo inbox note with what changed and the exact commands, so `tools/build-box/install-toolchains.ps1` follows and a new builder gets the same setup. The repo-is-public rule still holds: no builder host, address or user goes into a commit or an issue.
+
 The primary goal is remote gates working for every caller repo under `X:\dev` as soon as possible. When ordering, splitting or merging work, prefer whatever routes the next repo soonest, and say the choice in one line.
 
 Merging is the agents' call too. Once every item under a feature marker has landed and its gates are green, the session runs `ship` on the branch and merges the feature PR without asking.
