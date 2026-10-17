@@ -24,8 +24,8 @@ use sha2::{Digest, Sha256};
 use crate::durations::seed;
 use crate::support::{
     ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Junction, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running,
-    STEPS_VARIABLE, allow_breakaway, beside, build_version, calls, copy_tool, events, finish, git, git_init, heavy_words, nothing_back, release,
-    shown, ssh_steps, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
+    STEPS_VARIABLE, allow_breakaway, assert_in_order, beside, build_version, calls, copy_tool, events, finish, git, git_init, heavy_words,
+    nothing_back, release, shown, ssh_steps, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
 };
 
 const HOST: &str = "builder";
@@ -884,20 +884,41 @@ fn a_routed_run_past_3x_its_usual_p90_is_hinted_once() {
     assert!(events.iter().all(|event| event["remote"] == true), "every run was routed: {events:#?}");
 }
 
+/// The first line of a routed run waiting for its worktree's work folder: the slot wait's line for the key mutex.
+const KEY_WAITING: &str = "gate: waiting for this worktree's work folder on builder, which another of its runs holds";
+/// The line a routed run says when a Ctrl+C ends its wait for the work folder.
+const KEY_INTERRUPTED: &str = "gate: interrupted while waiting for this worktree's work folder on builder";
+
 #[test]
-fn a_second_routed_run_of_one_worktree_falls_back_busy_at_once() {
-    // One slot, which the first run holds: the second finds the key's lock taken before it would wait for the slot.
+fn a_second_routed_run_of_one_worktree_falls_back_busy_past_the_bound() {
+    // One slot, which the first run holds: the second waits for the key's lock up to a bound this run crosses at once,
+    // then falls back as it did before there was a wait. The holder ran the command once, so its claim carries no usual
+    // run time and the wait's first line names none.
     let case = client_case_of("client-busy", 1);
     let go = Go(case.folder().join("ssh").join("go"));
     let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
     let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
     first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "100"],
+        ..Tuned::default()
+    };
 
-    let (pid, second) = finish_with_pid(client_gate(&case, "second.log", &second_steps, &[r".\tool.exe", "out", "ran here"]));
+    let (pid, second) = finish_with_pid(client_gate_tuned(
+        &case,
+        "second.log",
+        &second_steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran here"],
+    ));
 
     assert_eq!(second.code, Some(0), "{second:?}");
-    assert!(second.stderr.contains(BUSY_LINE), "{second:?}");
+    assert_in_order(&second.stderr, &[KEY_WAITING, BUSY_LINE]);
+    assert!(
+        second.stderr.lines().any(|line| line == KEY_WAITING),
+        "a holder with no usual run time leaves the line without a time left: {second:?}"
+    );
     assert!(second.stdout.contains("ran here"), "it ran here: {second:?}");
     assert_eq!(calls(&second_steps), Vec::<String>::new(), "the second run made no ssh call");
     assert_eq!(fallbacks(&own(&case, pid)), ["busy"]);
@@ -906,6 +927,247 @@ fn a_second_routed_run_of_one_worktree_falls_back_busy_at_once() {
     assert_eq!(first.code, Some(0), "{first:?}");
     assert!(first.stdout.contains("ran there"), "{first:?}");
     assert_eq!(calls(&first_steps), ["preflight", "run"]);
+}
+
+#[test]
+fn a_second_routed_run_of_one_worktree_waits_for_its_holder_and_routes() {
+    // The bound is far longer than the wait: once the first run lets the key go, the second takes it and routes.
+    let case = client_case_of("client-key-waits", 1);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "600000", "--test-remote-wait-ms", "3600000"],
+        ..Tuned::default()
+    };
+    let second = start(client_gate_tuned(
+        &case,
+        "second.log",
+        &second_steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+    let pid = second.id();
+    second.wait_for_stderr(KEY_WAITING);
+
+    fs::write(go.path(), "").expect("the go file can be made");
+    let first = first.finish();
+    let second = second.finish();
+
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert!(
+        !second.stderr.contains(BUSY_LINE),
+        "the wait outlived the holder, so it did not fall back: {second:?}"
+    );
+    assert!(second.stdout.contains("ran here"), "it ran there: {second:?}");
+    assert_eq!(calls(&second_steps), ["preflight", "run"]);
+    assert_eq!(fallbacks(&own(&case, pid)), Vec::<&str>::new(), "the second run fell back for nothing");
+}
+
+#[test]
+fn a_second_routed_run_of_one_worktree_says_the_holders_time_left() {
+    // Five runs file the command's duration and `seed` makes its usual 600 s, so the holder's remote claim carries that
+    // expected time and the wait's line says what is left of it.
+    let case = client_case_of("client-key-eta", 1);
+    let steps = ssh_steps(&case, "seed", &["ok"; 12]);
+    let command = [r".\tool.exe", "out", "ran"];
+    for _ in 0..5 {
+        let outcome = finish(client_gate(&case, "history.log", &steps, &command));
+        assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    }
+    seed(&case, " out ran", 600.0, None);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &command));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "600000", "--test-remote-wait-ms", "3600000"],
+        ..Tuned::default()
+    };
+    let second = start(client_gate_tuned(&case, "second.log", &second_steps, &tuned, &command));
+    let left = Regex::new(r" \(about (\d+) (s|min) left\)$").expect("the pattern is valid");
+    let said = second.wait_for_stderr_where("the key wait's line with the time left", |stderr| {
+        stderr.lines().any(|line| line.starts_with(KEY_WAITING) && left.is_match(line))
+    });
+
+    let line = said
+        .lines()
+        .find(|line| line.starts_with(KEY_WAITING))
+        .expect("the key wait's line was said");
+    let found = left.captures(line).expect("the line says the holder's time left");
+    let figure: u64 = found[1].parse().expect("the time left is a whole number");
+    let seconds = if &found[2] == "min" { figure * 60 } else { figure };
+    assert!((1..=600).contains(&seconds), "what is left of the holder's seeded usual 600 s: {line:?}");
+    fs::write(go.path(), "").expect("the go file can be made");
+    let first = first.finish();
+    let second = second.finish();
+    assert_eq!((first.code, second.code), (Some(0), Some(0)), "{first:?}\n{second:?}");
+}
+
+#[test]
+fn a_second_routed_run_of_one_worktree_says_it_still_waits() {
+    let case = client_case_of("client-key-still-waits", 1);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &[
+            "--test-key-wait-ms",
+            "600000",
+            "--test-heartbeat-ms",
+            "50",
+            "--test-remote-wait-ms",
+            "3600000",
+        ],
+        ..Tuned::default()
+    };
+    let second = start(client_gate_tuned(
+        &case,
+        "second.log",
+        &second_steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+    let pid = second.id();
+    second.wait_for_stderr(KEY_WAITING);
+    second.wait_for_stderr("gate: still waiting for this worktree's work folder on builder (");
+
+    fs::write(go.path(), "").expect("the go file can be made");
+    let first = first.finish();
+    let second = second.finish();
+
+    assert_eq!((first.code, second.code), (Some(0), Some(0)), "{first:?}\n{second:?}");
+    assert!(!second.stderr.contains(BUSY_LINE), "{second:?}");
+    assert_eq!(calls(&second_steps), ["preflight", "run"]);
+    assert_eq!(fallbacks(&own(&case, pid)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_ctrl_c_while_waiting_for_the_work_folder_abandons_the_wait() {
+    let case = client_case_of("client-key-ctrl-c", 1);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    // The seam raises the console interrupt once the gate has said it waits, the key wait's line included.
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "3600000", "--test-interrupt-queued"],
+        ..Tuned::default()
+    };
+    let second = start(client_gate_tuned(
+        &case,
+        "second.log",
+        &second_steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+    let pid = second.id();
+    let outcome = second.finish();
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert_in_order(&outcome.stderr, &[KEY_WAITING, KEY_INTERRUPTED]);
+    let own = own(&case, pid);
+    let names: Vec<&str> = own.iter().map(|event| event["event"].as_str().expect("an event has a name")).collect();
+    assert_eq!(names, ["queue", "abandon"], "{own:#?}");
+    assert!(own.iter().all(|event| event["remote"] == true), "{own:#?}");
+    assert!(own[1]["waitedSeconds"].is_number(), "{own:#?}");
+    assert_eq!(calls(&second_steps), Vec::<String>::new(), "the second run made no ssh call");
+    fs::write(go.path(), "").expect("the go file can be made");
+    assert_eq!(first.finish().code, Some(0));
+}
+
+#[test]
+fn a_ctrl_c_already_raised_at_the_key_take_abandons_before_busy() {
+    let case = client_case_of("client-key-ctrl-c-before", 1);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    // The seam raises the console interrupt before the zero-wait take, which reads the taken lock as busy: the run must
+    // end as an interrupted key wait, not fall back `busy`, and without a waiting line it never said.
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "3600000", "--test-interrupt-before-key"],
+        ..Tuned::default()
+    };
+    let second = start(client_gate_tuned(
+        &case,
+        "second.log",
+        &second_steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+    let pid = second.id();
+    let outcome = second.finish();
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert!(outcome.stderr.contains(KEY_INTERRUPTED), "{outcome:?}");
+    assert!(!outcome.stderr.contains(KEY_WAITING), "it never waited: {outcome:?}");
+    assert!(!outcome.stderr.contains(BUSY_LINE), "an interrupt is not a busy fallback: {outcome:?}");
+    let own = own(&case, pid);
+    let names: Vec<&str> = own.iter().map(|event| event["event"].as_str().expect("an event has a name")).collect();
+    assert_eq!(names, ["queue", "abandon"], "{own:#?}");
+    assert!(own.iter().all(|event| event["remote"] == true), "{own:#?}");
+    assert_eq!(calls(&second_steps), Vec::<String>::new(), "the second run made no ssh call");
+    fs::write(go.path(), "").expect("the go file can be made");
+    assert_eq!(first.finish().code, Some(0));
+}
+
+#[test]
+fn a_routed_run_behind_a_warm_up_falls_back_busy_without_waiting() {
+    // A work folder with no warm-up consent of its own is warmed by a warm-up the route never probes the lock for, and
+    // the run reaches the key with a warm-up holding it. The warm-up lock is held here as a warm-up holds it, and the
+    // run falls back at once rather than wait a warm-up out.
+    let case = client_case_of("client-warm-holder", 1);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let lock = gate_state::v1::warm_lock_path(&case.root(), &key_of(&events(&case)));
+    fs::create_dir_all(lock.parent().expect("the lock has a folder")).expect("the warm-up folder can be made");
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(&lock)
+        .expect("the warm-up lock can be held");
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "3600000"],
+        ..Tuned::default()
+    };
+
+    let (pid, second) = finish_with_pid(client_gate_tuned(
+        &case,
+        "second.log",
+        &second_steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+
+    drop(held);
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert!(
+        !second
+            .stderr
+            .lines()
+            .any(|line| line.starts_with("gate: waiting for this worktree's work folder")),
+        "a warm-up's work folder is not waited for: {second:?}"
+    );
+    assert!(second.stderr.contains(BUSY_LINE), "{second:?}");
+    assert_eq!(calls(&second_steps), Vec::<String>::new(), "the second run made no ssh call");
+    assert_eq!(fallbacks(&own(&case, pid)), ["busy"]);
+    fs::write(go.path(), "").expect("the go file can be made");
+    assert_eq!(first.finish().code, Some(0));
 }
 
 /// The running stand-in whose parent is the gate `pid`, with its start, once there is exactly one.

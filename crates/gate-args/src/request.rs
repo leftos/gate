@@ -157,6 +157,8 @@ pub struct TestSeams {
     pub interrupt_after_samples: Option<u64>,
     /// Raise the console interrupt once the gate has said it is waiting for a slot.
     pub interrupt_queued: bool,
+    /// Raise the console interrupt just before a routed run's zero-wait take of its work folder's key.
+    pub interrupt_before_key: bool,
     /// Raise the console interrupt once the gate has said it is waiting for a slot here, after the remote pool sent the
     /// run back with reason `full`, so the wait counts from the run's own queue line.
     pub interrupt_after_fallback: bool,
@@ -168,6 +170,9 @@ pub struct TestSeams {
     pub remote_client: Option<PathBuf>,
     /// How long a routed run waits for a remote slot before it falls back with reason `full`.
     pub remote_wait_ms: Option<u64>,
+    /// How long a routed run waits for its work folder's key, held by another run of the same worktree, before it falls
+    /// back with reason `busy`.
+    pub key_wait_ms: Option<u64>,
     /// How long each git call of the routing decision may take before git is killed and the run goes ahead here.
     pub git_limit_ms: Option<u64>,
     /// How long the readers of a routing-decision git call that has exited may take to reach their pipes' ends before

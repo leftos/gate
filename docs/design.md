@@ -532,6 +532,10 @@ The lines of a run that starts its command:
 
   A Ctrl+C while the client waits to start ends the gate the same way with no slot to release, and journals an `abandon` after the `queue` line, not a `release`.
 
+  A routed run that finds its work folder's key held by another run on this PC says `gate: waiting for this worktree's work folder on <host>, which another of its runs holds`, with ` (about <figure> left)` after it when the key's latest claim (by `started`) has an expected time not yet reached, `<figure>` by the gate's figure rule (`<n> s` below 90 s, else whole `<n> min`, never below 1). Each heartbeat it says `gate: still waiting for this worktree's work folder on <host> (<s> s)`.
+
+  A warm-up lock that cannot be probed says `gate: cannot probe the warm-up lock <path>: <error>` once (path and error escaped) and the wait goes on. A Ctrl+C during that wait, or raised at the key take, says `gate: interrupted while waiting for this worktree's work folder on <host>` and ends the gate with 0xC000013A, never a `busy` fallback.
+
   A routed run that passed says `gate: passed in <w> s on <host> (load-adjusted <a> s, ceiling <n> s; command <c> s, push <p> s[, inputs <i> s][, sync-back <s> s][, outputs <o> s]). Full output: <log>`, with `past its ceiling of <n> s` in place of `ceiling <n> s` as the local line has it.
 
   In it `<w>` is the attempt's whole wall time; `<a>` is the load-adjusted time the builder counted for the command, the clock `--timeout` bounds; `<c>` is the run call's own wall time; the push is always named, the inputs calls (diff and put together), the sync-back and the outputs fetch only when they ran, in the order they ran, each in whole seconds rounded half to even.
@@ -724,7 +728,7 @@ The box command's job name comes from the payload's `Job` (`<key>` is the payloa
 
 `<l>` is the log hash: 16 lower-case hex digits, the first 8 bytes of the SHA-256 of the lower-cased, normalised absolute log path. Each run takes its log's mutex without waiting, before it readies the log, and holds it until after the slot release and the final append to the log, so two gates never write one log; a second gate fails at once ([Output lines](#output-lines)).
 
-`<k>` is the key hash: 16 lower-case hex digits, the first 8 bytes of the SHA-256 of the lower-cased work-folder key. The Rust remote client takes the routed lock without waiting, before the remote slot, and holds it for the whole remote attempt ([Routing](#routing)).
+`<k>` is the key hash: 16 lower-case hex digits, the first 8 bytes of the SHA-256 of the lower-cased work-folder key. The Rust remote client takes the routed lock before the remote slot, first at once, then by the run's wait of up to 90 s while another run holds it, and holds it for the whole remote attempt ([Routing](#routing)).
 
 `<v>` and `<f>` are the worktree lock's folder id: the volume serial number as 16 lower-case hex digits and the 128-bit file id as 32, read from the worktree root opened following links, so two spellings of one folder share one lock.
 
@@ -866,7 +870,7 @@ The event's own fields:
 | `queue` | `log` (the log's full path), `notRouted` (written right after `log`, only when a heavy gate's caller kept it local with `--local`, with the value `--local`; other reasons for a local run write none) |
 | `take` | `slots` (the slot names taken; a critical gate lists every heavy and light slot it holds; a `none` run lists none, `[]`, with `waitedSeconds` 0.0), `waitedSeconds`, optionally `parentPid` (also on the late take of a covered gate), and for a critical gate `counts`, `otherHeld`, then `otherClaims` or `snapshotError` |
 | `release` | `slots` (the same list), `heldSeconds`, `status` (null when the gate failed before its command had one), `wallSeconds`, `adjustedSeconds`, optionally `avgCores`, `peakCores`, `freeCores`, `verdict` |
-| `abandon` | `waitedSeconds`: the gate ended while still queued (Ctrl+C while waiting for a slot, or, for a routed run, while its client waited to start) |
+| `abandon` | `waitedSeconds`: the gate ended while still queued (Ctrl+C while waiting for a slot, or, for a routed run, while its client waited to start or while it waited for its work folder's key, remote-tagged) |
 | `parent`, `covered` | `parentPid`; a lent gate writes `parent` after its `queue` when it was lent the slot as it waited, and alone, with no `queue`, when it was lent it before it queued |
 | `fallback` | `reason`, then `remote`, `host`, `key`: it ends the routed attempt, so a remote `take` that falls back gets no `release`; a `full` fallback, and a `client` fallback with no client built, follow no remote `take` |
 
@@ -1484,7 +1488,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A share or device path at any path start is outside: two separators, or a drive right after `\\?\`, `\\.\`, `//?/` or `//./`. Relative text that climbs out of the worktree (or past the drive-root floor above) is outside at every path start, not only at the word's.
 - **The work folder** on the builder is named `<repo name>-<key>`, the worktree root's last segment cut to letters, digits, `-` and `_` and 8 hex digits of the SHA-256 of the lower-cased root ([Glossary](GLOSSARY.md), work-folder key).
-- **The routed run's life** is kept (T5) and built in `remote/mod.rs` and `run.rs`: its ticket is heavy with `remote: true` and queues apart from the local waiters, which never count it ahead of them, nor it them; it waits up to 60 s for a remote slot (`--test-remote-wait-ms` in a test build); it takes one with a claim of kind `remote` of its own and calls the remote client with the route, the log and the limits (`--stall` as given, the interrupt).
+- **The routed run's life** is kept (T5) and built in `remote/mod.rs` and `run.rs`: its ticket is heavy with `remote: true` and queues apart from the local waiters, which never count it ahead of them, nor it them; before that it waits up to 90 s for its work folder's key while another run holds it (`--test-key-wait-ms` in a test build), holding no PC slot and journaling only its remote-tagged `queue` line, and falls back `busy` only past that bound or when a warm-up of the folder holds or takes the key; it then waits up to 60 s for a remote slot (`--test-remote-wait-ms` in a test build); it takes one with a claim of kind `remote` of its own and calls the remote client with the route, the log and the limits (`--stall` as given, the interrupt).
 
   A client that runs the command to its end hands back its status, which the gate passes through, and the run releases the slot with the remote tag. On `full` (no slot within the wait), a refusal (status 75 with a reason) or a client that cannot start, it journals `fallback` while still holding the remote slot (none was taken on `full`), deletes the claim, lets the slot go, and runs here, taking a heavy slot with its first arrival kept in the ticket.
 
@@ -1540,9 +1544,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   A repo name that is not `[A-Za-z0-9_-]+` is never sent to the builder: the push and the sync-back fail the run with `cannot push to the repo '<name>': a repo name is letters, digits, '_' and '-'`, as a client failure (`gate: the remote run failed: ...`).
 
   The phases run in this order. Any `gate: the remote run failed` line ends the run with status 1 and no fallback; Ctrl+C at any point after the snapshot ends the run as an interrupt.
-  - **Lock.** The run takes the routed lock, `Local\gate-[<root hash>-]routed-<16 hex>` ([Kernel object names](#kernel-object-names)), before the remote slot, with a zero wait, and holds it for the whole remote attempt.
+  - **Lock.** The run takes the routed lock, `Local\gate-[<root hash>-]routed-<16 hex>` ([Kernel object names](#kernel-object-names)), before the remote slot, and holds it for the whole remote attempt. A lock held elsewhere is waited for up to 90 s (`--test-key-wait-ms` in a test build) with no PC slot held; the journal shows the run's remote-tagged `queue` line only.
 
-    A lock held elsewhere says `gate: remote <host> busy; running here` and falls back `busy` before any queueing, so two routed runs of one worktree give a deterministic `busy`, not a race. A lock that cannot be opened or taken says `gate: cannot open the mutex <name>: <error>` or `gate: cannot take the mutex <name>: <error>`, then the busy line.
+    A lock still held past the bound says `gate: remote <host> busy; running here` and falls back `busy` before any queueing. A warm-up lock on the key, probed before the wait and at each still-waiting heartbeat, that holds or takes the key makes the run fall back `busy` at once instead of waiting it out. A lock that cannot be opened or taken says `gate: cannot open the mutex <name>: <error>` or `gate: cannot take the mutex <name>: <error>`, then the busy line.
   - **Hold.** The run takes the worktree locks of its main root and each carried sibling ([Sync-back](#routing), The worktree lock) and, for a pair, holds its folders ([Sibling worktrees](#routing)); one it cannot hold keeps the run here ([Output lines](#output-lines)).
   - **Snapshot.** Part A's snapshot and bridge commit, for each repository of a pair.
   - **Run line.** The run call's cmd line is the fixed `"%LOCALAPPDATA%\gate\bin\gate.exe" box run --stdin`, the same whatever the run holds; every other `gate box` call's line differs only in its verb. The request, base64 of compact UTF-8 JSON, is the first line of the call's stdin, followed for the run call by the outputs manifest line, so no request size is capped by a command line. The box reads the request line with a cap of 16 MiB, newline included ([The box side](#the-box-side)).
@@ -2665,7 +2669,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   Two seams of `gate box` shape the command's console: `--test-box-console fail-before` makes the UTF-8 console fail before the command starts, and `--test-box-park-launch <path>` parks the launch until `<path>` exists ([The box side](#the-box-side)). `--test-box-token refused` refuses the start with the restricted token, for the fallback to the box's own token. `--test-outputs-budget-bytes <n>` replaces the 50 GiB outputs budget of the box's trim.
 
-  Two more seams make a run end by Ctrl+C without a console: `--test-interrupt-after-samples <n>` raises the interrupt after the n-th sample, and `--test-interrupt-queued` raises it when the waiting line is printed, so once no slot is free for the gate. `--test-print-request` shows them as `testSeams.interruptAfterSamples` and `testSeams.interruptQueued`.
+  Two more seams make a run end by Ctrl+C without a console: `--test-interrupt-after-samples <n>` raises the interrupt after the n-th sample, and `--test-interrupt-queued` raises it when the waiting line is printed, so once no slot is free for the gate, and at the wait for a routed run's work folder. `--test-print-request` shows them as `testSeams.interruptAfterSamples` and `testSeams.interruptQueued`.
 
   `--test-interrupt-queued-after-fallback` (a switch) raises it once the gate has said it waits for its own slot after a `full` fallback from the builder, the wait that counts from the run's queue line, so a case can pin how a Ctrl+C there counts that wait; `--test-print-request` shows it as `testSeams.interruptAfterFallback`, after `interruptQueued`.
 
@@ -2690,6 +2694,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   `--test-remote-wait-ms <n>` (whole milliseconds above 0) replaces the 60 s limit of the wait for a remote slot. `--test-print-request` shows them as `testSeams.remoteClient` and `testSeams.remoteWaitMs`.
 
   `--test-git-limit-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 60 s limit of each git call of the routing decision; `--test-print-request` shows it as `testSeams.gitLimitMs`, after `remoteWaitMs`.
+
+  `--test-key-wait-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 90 s bound of a routed run's wait for its work folder's key, and the switch `--test-interrupt-before-key` raises the interrupt before the key is taken; `--test-heartbeat-ms` sets the wait's step. `--test-print-request` shows them as `testSeams.keyWaitMs` and `testSeams.interruptBeforeKey`.
 
   `--test-git-drain-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 2 s the readers of each git call of the routing decision get to end once git has exited; `--test-print-request` shows it as `testSeams.gitDrainMs`, after `gitLimitMs`. The suite's routing cases pass it with a very long drain, so a starved gate does not fail a call that a loaded machine only delays.
 

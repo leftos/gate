@@ -25,7 +25,7 @@ These replace the matching items in GATE-347's earlier orchestrator decision.
 
 ## Invariants
 
-- **I1. At most one warm-up per key at a time**, across sessions on this PC and across PCs on the builder. Enforced in this order: the warm lock, the key mutex (bounded wait, a new waiting variant of `hold_key`, `remote/client.rs:216-224`), the cap, then the box's `{Work}.lock` (`take_lock` in `boxside/run.rs`'s `run`). This never inverts a routed run's order (key mutex → remote slot → worktree locks → box lock).
+- **I1. At most one warm-up per key at a time**, across sessions on this PC and across PCs on the builder. Enforced in this order: the warm lock, the key mutex (bounded wait, a new waiting variant of `hold_key`, `remote/client.rs:219-224`), the cap, then the box's `{Work}.lock` (`take_lock` in `boxside/run.rs`'s `run`). This never inverts a routed run's order (key mutex → remote slot → worktree locks → box lock).
 - **I2. A stale `warming` record never keeps runs local longer than the warming process's own bounded life.** That life is bounded by the key mutex wait, the git limits, the client watchdog limits, and the client's own backstop on the run call.
 
   In `warm.rs` the key mutex wait and the cap wait are each one ceiling, and the run call's backstop is five ceilings and 60 s, so the whole life is bounded by about 7× the warm-up ceiling plus 60 s and the git limits; there is no separate self-deadline.

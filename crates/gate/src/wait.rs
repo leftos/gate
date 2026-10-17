@@ -25,8 +25,8 @@ use crate::slots::{self, BesideTry, Pool, Survey, Taken, ThisGate};
 
 /// The fallback poll: the longest a waiter sleeps before it reads the counts and the tickets again.
 const POLL: Duration = Duration::from_secs(2);
-/// How often a waiter says it still waits.
-const HEARTBEAT: Duration = Duration::from_secs(30);
+/// How often a waiter says it still waits, a routed run's wait for its work folder's key among them.
+pub(crate) const HEARTBEAT: Duration = Duration::from_secs(30);
 /// The longest a waiter sleeps after a pass that found the beside mutex held by another gate: that gate wakes the
 /// waiters only once it took or lent something, so a pass that found no room for this reason alone looks again soon.
 const BUSY_RETRY: Duration = Duration::from_millis(100);

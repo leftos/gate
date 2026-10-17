@@ -54,6 +54,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     RemoteWaitMs,
     #[cfg(feature = "test-seams")]
+    KeyWaitMs,
+    #[cfg(feature = "test-seams")]
     GitLimitMs,
     #[cfg(feature = "test-seams")]
     GitDrainMs,
@@ -113,6 +115,8 @@ pub(crate) enum SwitchOption {
     PrintRequest,
     #[cfg(feature = "test-seams")]
     InterruptQueued,
+    #[cfg(feature = "test-seams")]
+    InterruptBeforeKey,
     #[cfg(feature = "test-seams")]
     InterruptAfterFallback,
     #[cfg(feature = "test-seams")]
@@ -299,6 +303,8 @@ impl RunBuilder {
             #[cfg(feature = "test-seams")]
             ValueOption::RemoteWaitMs => self.test_seams.remote_wait_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
+            ValueOption::KeyWaitMs => self.test_seams.key_wait_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
             ValueOption::GitLimitMs => self.test_seams.git_limit_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::GitDrainMs => self.test_seams.git_drain_ms = Some(values::above_zero(spelled, value)?),
@@ -367,6 +373,8 @@ impl RunBuilder {
             SwitchOption::PrintRequest => self.print_request = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::InterruptQueued => self.test_seams.interrupt_queued = on,
+            #[cfg(feature = "test-seams")]
+            SwitchOption::InterruptBeforeKey => self.test_seams.interrupt_before_key = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::InterruptAfterFallback => self.test_seams.interrupt_after_fallback = on,
             #[cfg(feature = "test-seams")]

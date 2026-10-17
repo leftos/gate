@@ -31,6 +31,8 @@ pub(crate) use carried::{Sibling, carried};
 
 mod carried;
 mod client;
+
+pub(crate) use client::KEY_WAIT_SLICE;
 pub(crate) mod git;
 mod held;
 mod inputs;
@@ -170,8 +172,9 @@ pub(crate) fn adjusted_prefix(nonce: &str) -> String {
 /// What runs a routed command on the builder.
 pub(crate) trait RemoteClient {
     /// Takes the lock of the call's work-folder key, which the run holds from before it takes a remote slot until its
-    /// remote attempt ends: `Ok(None)` for a client that takes none. `Err` when the run falls back `busy`: `None` when
-    /// another routed run holds the lock, else the line saying why it could not be opened or taken.
+    /// remote attempt ends: `Ok(None)` for a client that takes none. `Err(None)` when another run of the worktree holds
+    /// the lock, which the run waits for ([`RemoteClient::hold_key_waiting`]); else the line saying why it could not be
+    /// opened or taken.
     fn hold_key(&self, _call: &RemoteCall<'_>) -> Result<Option<OwnedMutexGuard>, Option<String>> {
         Ok(None)
     }

@@ -13,8 +13,8 @@
 //! that booted more than 30 s later restarted, and the run falls back `rebooted`; one that gives no boot time, or when
 //! either value is no timestamp, falls back `unreachable`; else the run ends 255. No call holds more than 64 KiB of a
 //! line in memory, nor keeps more than a call's last 1,000 lines, totalling at most 1 MiB: a longer line ends any call
-//! but the run call, whose output is passed on whole. The run takes the work-folder key's lock, [`hold_key`], before
-//! its remote slot, so a second routed run of one worktree falls back `busy` at once.
+//! but the run call, whose output is passed on whole. The run takes the work-folder key's lock ([`hold_key`], then
+//! [`hold_key_waiting`] in slices from `run.rs` up to its bound) before its remote slot.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
@@ -222,8 +222,9 @@ pub(crate) fn hold_key(call: &RemoteCall<'_>) -> Result<OwnedMutexGuard, Option<
     }
 }
 
-/// How long one slice of [`hold_key_waiting`]'s wait lasts, between two looks at the console interrupt.
-const KEY_WAIT_SLICE: Duration = Duration::from_millis(100);
+/// How long one slice of [`hold_key_waiting`]'s wait lasts, between two looks at the console interrupt. A run that
+/// waits in slices of its own ([`crate::run`]) takes each one as a call's whole wait.
+pub(crate) const KEY_WAIT_SLICE: Duration = Duration::from_millis(100);
 
 /// How a wait for the work-folder key's lock ended.
 pub(crate) enum KeyHold {
