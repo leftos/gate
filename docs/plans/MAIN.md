@@ -5,16 +5,13 @@
 ## Do first
 
 - [/] GATE-347 Warm a builder work folder with a repo's warm-up commands before routing work for it — Urgent · Remote
-- [ ] GATE-370 Run a routed Godot command on the builder's side-by-side install of the version its repo pins — Urgent · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [/] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
-- [ ] GATE-399 Run the suite's desktop cases when the gate repo's tests are routed to a builder — High · Remote
+- [!] GATE-399 Run the suite's desktop cases when the gate repo's tests are routed to a builder — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
-- [!] GATE-375 Install Godot side by side on the builders and trial each Godot command family — High · Remote
 - [!] GATE-371 Route ops-tower's Playwright tests: the fixture server and browsers on the builder — High · Remote
-- [ ] GATE-398 Find why a run's job end says a process still ran after 5 passes under a loaded builder — High · Remote
-- [ ] GATE-400 Find why godot-mcp's routed integration tests fail on the builder: the C# bridge never connects and prep and scene time out — High · Remote
+- [ ] GATE-409 Keep a routed Godot command here when no Godot version is chosen — High · Remote
 
 ## Remote
 
@@ -109,6 +106,9 @@
 - [ ] GATE-396 Read a repo's csproj Godot pins in gate check, as a routed run does
 - [ ] GATE-397 Give gate check an install hint for a missing pinned Godot
 - [ ] GATE-401 Close the test-rig gaps the desktop and session-0 box cases share
+- [ ] GATE-403 Journal why a heavy run stayed on the PC
+- [ ] GATE-405 Check whether the stall and ceiling kill paths count an exited job member as left
+- [ ] GATE-408 Read a repo's csproj Godot pin in gate check as a routed run does
 
 ## Cutover sweep
 
@@ -174,3 +174,6 @@
 - [ ] GATE-391 Remove the reserved-name files the walk tests make, so worktrees can be deleted
 - [ ] GATE-393 Refuse an MSYS keeper or a box git.exe from an install the restricted token can write
 - [ ] GATE-394 Keep the suite's box cases independent of whether this PC's Git is an admin install
+- [ ] GATE-404 Route a repo whose checkout folder name the push refuses, such as claude-config's .claude
+- [ ] GATE-406 Check from the restricted token that a mono Godot install's assemblies folder can be entered
+- [ ] GATE-407 Decide what a zero file id means at every file-identity check, not only the desktop hand-off
