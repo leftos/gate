@@ -2377,11 +2377,11 @@ fn in_passes(mut pass: impl FnMut(bool) -> Result<EndPass, String>) -> Option<St
 /// One pass of the run's end over `job`, ending what it finds when `ending`: the job's processes are listed, then the
 /// machine's in a snapshot, the gates among them spared with what runs under them and the console hosts
 /// ([`spared_gates`]), and the processes of `keep`, and every other one ended that its own handle shows in the job still
-/// ([`opened_members`]) and with the start and the parent the snapshot lists for its pid ([`by_start`]), so a pid freed
-/// and taken by a new process since the snapshot, a spared gate's command's child included, is passed over, and left to
-/// the next pass
-/// to look at again. The processes ended are given [`TERMINATE_CHECK`] together to leave the job before the next pass
-/// lists it ([`end_and_wait`]).
+/// and still running ([`opened_members`]), a member whose own handle shows it ended not counted, and with the start and
+/// the parent the snapshot lists for its pid ([`by_start`]), so a pid freed and taken by a new process since the
+/// snapshot, a spared gate's command's child included, is passed over, and left to the next pass to look at again. The
+/// processes ended are given [`TERMINATE_CHECK`] together to leave the job before the next pass lists it
+/// ([`end_and_wait`]).
 ///
 /// # Errors
 ///
@@ -2583,8 +2583,9 @@ fn is_console_host(image: &str) -> bool {
     escaped::is_image(image, CONSOLE_HOST_IMAGE)
 }
 
-/// The process `pid`, opened to be ended, when its own handle shows it in `job`; `None` when no process has that pid
-/// now or the one that has it is outside the job; the failure, when it cannot be opened or judged.
+/// The process `pid`, opened to be ended, when its own handle shows it in `job` and still running; `None` when no
+/// process has that pid now, the one that has it is outside the job, or its own handle shows it ended, as the job's list
+/// names a process for a while after it ended; the failure, when it cannot be opened or judged.
 fn opened_member(job: &Job, pid: u32) -> Result<Option<StoppableProcess>, String> {
     let process = match StoppableProcess::open(pid) {
         Ok(Some(process)) => process,
@@ -2592,9 +2593,15 @@ fn opened_member(job: &Job, pid: u32) -> Result<Option<StoppableProcess>, String
         Err(error) => return Err(failure(&format!("OpenProcess({pid})"), &error)),
     };
     match process.in_job(job) {
-        Ok(true) => Ok(Some(process)),
-        Ok(false) => Ok(None),
-        Err(error) => Err(failure(&format!("IsProcessInJob({pid})"), &error)),
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
+        Err(error) => return Err(failure(&format!("IsProcessInJob({pid})"), &error)),
+    }
+    // The job's list still names a member for a while after its handle is signalled; one that has ended is not left.
+    match process.wait(Duration::ZERO) {
+        Ok(true) => Ok(None),
+        Ok(false) => Ok(Some(process)),
+        Err(error) => Err(failure(&format!("WaitForSingleObject({pid})"), &error)),
     }
 }
 
@@ -3435,7 +3442,7 @@ mod end_tests {
 
     use gate_state::{KernelObject, StateRoot};
 
-    use super::{END_PASSES, EndPass, Endable, Origin, by_start, end_and_wait, in_passes, job_under_roots, spared_gates};
+    use super::{END_PASSES, EndPass, Endable, Origin, by_start, end_and_wait, in_passes, job_under_roots, opened_member, spared_gates};
     use crate::escaped::EMPTY_SNAPSHOT;
 
     /// `ERROR_ACCESS_DENIED`, as a refused terminate reports it.
@@ -3808,5 +3815,39 @@ mod end_tests {
         let said = in_passes(|_| passes.next().expect("two passes"));
 
         assert_eq!(said, None, "the process the first pass could not open had gone by the last");
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test that cannot make its job or start its member must fail loudly")]
+    fn a_member_that_has_exited_is_not_opened_to_be_ended() {
+        let system = std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot is set"));
+        let launch = gate_win32::Launch {
+            application: system.join(r"System32\cmd.exe"),
+            command_line: "cmd.exe /d /c exit 0".encode_utf16().collect(),
+            directory: system,
+            environment: gate_win32::EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
+            output: gate_win32::LaunchOutput::Piped,
+            priority: None,
+        };
+        // Kill-on-close, so a failing case leaves nothing in it running.
+        let job = gate_win32::Job::anonymous_kill_on_close().expect("the job is created");
+        let running = launch
+            .start_suspended()
+            .expect("the member starts")
+            .assign_and_resume(&job)
+            .expect("the member is put in the job and resumed");
+        // A hang guard, not a bound the case asserts on.
+        assert_eq!(running.wait(Duration::from_secs(600)).expect("the member is waited for"), Some(0));
+
+        // `running` holds the member's handle, as the gate holds its command's, so it still opens and still shows in the
+        // job: the job's list names such a member for a while after its handle is signalled, longer than the run end's
+        // passes on a busy machine.
+        let opened = opened_member(&job, running.pid());
+
+        assert!(
+            matches!(opened, Ok(None)),
+            "an exited member is nothing to end: {:?}",
+            opened.map(|process| process.is_some())
+        );
     }
 }
