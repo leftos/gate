@@ -7,6 +7,7 @@ use std::path::Path;
 
 use gate_win32::{OpenedJob, StoppableProcess};
 use proc_table::{ProcessTable, Win32ProcessTable};
+use regex::Regex;
 use serde_json::{Value, json};
 
 use super::{
@@ -14,8 +15,8 @@ use super::{
     payload as request_line, refused_line, run_box, run_box_with_seams, snapshot, started_line, stopped_line_for,
 };
 use crate::support::{
-    Case, FAKE_TOOL, HeldDesktop, KeptDesktop, Outcome, box_payload, build_version, copy_tool, desktop_payload, desktop_seams, junction, shown,
-    wait_until,
+    Case, Closed, FAKE_TOOL, HeldDesktop, KeptDesktop, Outcome, box_payload, build_version, copy_tool, desktop_payload, desktop_seams, junction,
+    shown, wait_until,
 };
 
 /// The box's prefix of every line refusing a run the builder's desktop cannot take.
@@ -906,4 +907,177 @@ fn a_warm_up_that_asks_for_the_desktop_exits_2() {
         ["gate: box payload asks a warm-up for the desktop"],
         "{outcome:?}"
     );
+}
+
+#[test]
+fn a_killed_box_ends_its_desktop_command_and_the_next_run_takes_the_abandoned_lock() {
+    let case = Case::new("desktop_killed_box");
+    let record = case.folder().join("children");
+    // A sleep longer than the suite's hang guard, so nothing but the run's job can end the command inside the case.
+    let payload = ready_payload(&case, &[FAKE_TOOL, "pid", "sleep", "620000"]);
+    // Open across both runs, so the lock the killed box held is still there for the second run to find abandoned.
+    let _kept = KeptDesktop::open(&case);
+    // The record seam keeps the stand-in helper in no job of the box's, so the command is only ever in the run's own
+    // job, and only that job's kill-on-close can end it once the box is gone.
+    let mut call = desktop_call(&case, &payload, "ok", &[]);
+    call.env("GATE_DESKTOP_TEST_RECORD", &record);
+    let running = call.start();
+    let pid = printed_pid(&running.wait_for_stdout("pid "));
+    let created = started_at(pid);
+    assert!(created.is_some(), "the command's creation time can be read: {pid}");
+
+    // As a lost connection's cut kills the box while it holds the builder's desktop and the run's job.
+    let killed = running.kill();
+
+    // The run's job went with the box's last handle on it, so the next run can take the same name.
+    wait_until("the killed box's desktop job ending", || {
+        OpenedJob::open_to_list(field(&payload, "Job")).ok().flatten().is_none()
+    });
+    wait_until_all_ended(&[(pid, created)], "the killed box's desktop command ending");
+    let left = left_by(&record);
+    assert!(!left.recorded.is_empty(), "the stand-in started the command: {killed:?}");
+    assert!(
+        left.children.is_empty(),
+        "no child of the stand-in outlives the box: {:?} {killed:?}",
+        left.children
+    );
+    assert!(
+        !left.stand_in_running,
+        "the stand-in itself does not outlive the box: {} created {} {killed:?}",
+        left.stand_in, left.stand_in_created
+    );
+
+    let mut next = payload.clone();
+    next["Command"] = json!(COMMAND);
+    let outcome = handed_off(&case, &next, "ok");
+
+    assert_eq!(outcome.code, Some(0), "the next run took the lock and ran: {killed:?} {outcome:?}");
+    assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
+    assert_eq!(
+        lines_starting(&outcome, ABANDONED),
+        [ABANDONED],
+        "the abandoned lock, said once: {outcome:?}"
+    );
+    assert!(
+        lines_starting(&outcome, BUSY_WAIT).is_empty(),
+        "the next run found the lock abandoned, not held: {outcome:?}"
+    );
+}
+
+#[test]
+fn the_ceiling_kills_a_desktop_command() {
+    let case = Case::new("desktop_ceiling_kill");
+    let mut payload = desktop_payload(&case, "k", &[FAKE_TOOL, "pid", "sleep", "10000"], 30);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    payload["Timeout"] = json!(1);
+    payload["Host"] = json!("builder");
+    let running = desktop_call(&case, &payload, "ok", &["--test-box-sample-ms", "20", "--test-box-free-percent", "100"]).start();
+    let pid = printed_pid(&running.wait_for_stdout("pid "));
+    let created = started_at(pid);
+    assert!(created.is_some(), "the command's creation time can be read: {pid}");
+
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    let kill = Regex::new(
+        r"^gate: TIMED OUT on builder after 1 s of load-adjusted time \(wall \d+ s, machine free 100% on average\); killed .+ and its children$",
+    )
+    .expect("the pattern compiles");
+    let said: Vec<&str> = outcome.stderr.lines().collect();
+    let at = said.iter().position(|line| kill.is_match(line));
+    assert!(at.is_some(), "the kill line: {outcome:?}");
+    let at = at.expect("it is there");
+    assert_eq!(
+        said.get(at + 1).copied(),
+        Some(format!("gate-remote-killed: {} timed-out", field(&payload, "Nonce")).as_str()),
+        "the kill tag right after the kill line: {outcome:?}"
+    );
+    wait_until_all_ended(&[(pid, created)], "the killed desktop command ending");
+}
+
+#[test]
+fn a_closed_stdout_pipe_stops_a_desktop_job_and_exits_255() {
+    let case = Case::new("desktop_closed_stdout");
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let payload = ready_payload(&case, &[FAKE_TOOL, "err", "started", "wait", &go_word, "out", "x", "sleep", "10000"]);
+    let running = desktop_call(&case, &payload, "ok", &[]).start_with_closed(Closed::Stdout);
+    running.wait_for_stderr("started");
+    let members = job_processes(&payload);
+    assert!(!members.is_empty(), "the command is in the run's job: {payload:?}");
+    let_go(&go);
+
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: remote the client closed the connection; stopped job "),
+        "{outcome:?}"
+    );
+    wait_until_all_ended(&members, "the desktop command of the closed stdout pipe ending");
+}
+
+#[test]
+fn a_closed_stderr_pipe_stops_a_desktop_job_and_exits_255() {
+    let case = Case::new("desktop_closed_stderr");
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let payload = ready_payload(
+        &case,
+        &[FAKE_TOOL, "pid", "out", "started", "wait", &go_word, "err", "x", "sleep", "10000"],
+    );
+    let running = desktop_call(&case, &payload, "ok", &[]).start_with_closed(Closed::Stderr);
+    running.wait_for_stdout("started");
+    let members = job_processes(&payload);
+    assert!(!members.is_empty(), "the command is in the run's job: {payload:?}");
+    let_go(&go);
+
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
+    wait_until_all_ended(&members, "the desktop command of the closed stderr pipe ending");
+}
+
+/// The pid of the command that printed its `pid <n>` line to `stdout`.
+fn printed_pid(stdout: &str) -> u32 {
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("pid "))
+        .and_then(|pid| pid.trim().parse().ok())
+        .expect("the command printed its pid")
+}
+
+/// The creation time of the process `pid`, read now, so a process at a reused pid is never taken for it.
+fn started_at(pid: u32) -> Option<jiff::Timestamp> {
+    Win32ProcessTable
+        .snapshot_without_command_lines()
+        .into_iter()
+        .find(|process| process.pid == pid)
+        .and_then(|process| process.created)
+}
+
+/// The pid and creation time of every process in the run's job of `payload`, read while its command runs.
+fn job_processes(payload: &Value) -> Vec<(u32, Option<jiff::Timestamp>)> {
+    let members = OpenedJob::open_to_list(field(payload, "Job"))
+        .expect("the job can be opened")
+        .expect("the job exists while its command runs")
+        .process_ids()
+        .expect("the job's processes are listed");
+    let snapshot = Win32ProcessTable.snapshot_without_command_lines();
+    snapshot
+        .iter()
+        .filter(|process| members.contains(&process.pid))
+        .map(|process| (process.pid, process.created))
+        .collect()
+}
+
+/// Waits until no process of `ended`, each a pid and the creation time read while it ran, still runs: another process
+/// at a reused pid is never taken for one of them.
+fn wait_until_all_ended(ended: &[(u32, Option<jiff::Timestamp>)], what: &str) {
+    wait_until(what, || {
+        let snapshot = Win32ProcessTable.snapshot_without_command_lines();
+        ended
+            .iter()
+            .all(|(pid, created)| !snapshot.iter().any(|process| process.pid == *pid && process.created == *created))
+    });
 }
