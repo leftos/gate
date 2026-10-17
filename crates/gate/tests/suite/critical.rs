@@ -752,9 +752,17 @@ fn a_critical_gate_waits_while_more_than_two_light_gates_run_and_a_release_on_th
     assert_passed(&second.finish());
 }
 
-/// The seams of a light gate that waits between journalling its take and writing its claim until the file `go` exists.
+/// The seams of a light gate that waits between taking its slot and writing its claim until the file `go` exists.
 fn slow_claim(go: &str) -> [&str; 4] {
     ["--test-poll-ms", "20", "--test-beside-claim-wait", go]
+}
+
+/// The arrival file the seam writes before it waits, for the go file `go`: once it exists, the gate is held at the seam
+/// between its slot and its claim.
+fn reached(go: &Path) -> PathBuf {
+    let mut path = go.as_os_str().to_owned();
+    path.push(".reached");
+    PathBuf::from(path)
 }
 
 /// Whether the gate `gate` journalled a take in the case's root.
@@ -776,12 +784,15 @@ fn a_light_gate_between_its_take_and_its_claim_lets_no_third_light_gate_beside_t
     let claim_go = case.folder().join("claim-go");
     let claim_go_word = shown(&claim_go);
 
-    let slow = holder(
-        &case,
-        &run_words("slow.log", &slow_claim(&claim_go_word), &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"]),
-    );
+    let slow = case.start(&run_words(
+        "slow.log",
+        &slow_claim(&claim_go_word),
+        &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"],
+    ));
     let slow_claim = v1::claim_path(&case.root(), KernelObject::LightSlot(1)).expect("a light slot has a claim");
-    assert!(!slow_claim.exists(), "the slow gate has journalled its take and not yet claimed its slot");
+    wait_for_file(&reached(&claim_go));
+    assert!(!slow_claim.exists(), "the slow gate has taken its slot and not yet claimed it");
+    assert!(!took(&case, &slow), "no take line before the gate's claim");
     let later = [
         case.start(&run_words(
             "second.log",
@@ -839,19 +850,14 @@ fn a_light_gate_no_request_holds_back_is_counted_between_its_take_and_its_claim(
     let claim_go = case.folder().join("claim-go");
     let claim_go_word = shown(&claim_go);
     let held = holder(&case, &heavy_words("holder.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
-    let early = holder(
-        &case,
-        &run_words(
-            "early.log",
-            &slow_claim(&claim_go_word),
-            &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"],
-        ),
-    );
+    let early = case.start(&run_words(
+        "early.log",
+        &slow_claim(&claim_go_word),
+        &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"],
+    ));
     let early_claim = v1::claim_path(&case.root(), KernelObject::LightSlot(0)).expect("a light slot has a claim");
-    assert!(
-        !early_claim.exists(),
-        "the early gate has journalled its take and not yet claimed its slot"
-    );
+    wait_for_file(&reached(&claim_go));
+    assert!(!early_claim.exists(), "the early gate has taken its slot and not yet claimed it");
 
     let critical = case.start(&critical_words("critical.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
     let critical_pid = critical.id();

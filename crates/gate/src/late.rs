@@ -212,7 +212,7 @@ impl<'a> Late<'a> {
     }
 
     /// One pass of the wait, its still-waiting line first when due; a slot taken ends the wait, is kept for the run's
-    /// release before anything else, then journalled with the parent's pid and claimed ([`Taker::took`]). Whether this
+    /// release before anything else, then claimed and journalled with the parent's pid ([`Taker::took`]). Whether this
     /// pass took it.
     fn pass(&mut self, console: &mut Console) -> bool {
         let State::Waiting { wait, since } = &mut self.state else {

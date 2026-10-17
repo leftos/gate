@@ -173,8 +173,9 @@ pub struct TestSeams {
     /// How long the readers of a routing-decision git call that has exited may take to reach their pipes' ends before
     /// the call fails, in place of 2 s.
     pub git_drain_ms: Option<u64>,
-    /// The file a local light gate waits for, holding the beside mutex, between journalling its take and writing its
-    /// claim: it writes the claim once the file exists.
+    /// The file a local light gate waits for, holding the beside mutex, between taking its slot and writing its claim,
+    /// its arrival written to `<file>.reached` before the wait: it writes the claim, then journals its take, once the file
+    /// exists.
     pub beside_claim_wait: Option<PathBuf>,
     /// How long the remote client's `dotnet --list-sdks` of this PC may take before it is killed and the SDK list
     /// counts as unreadable, in place of 30 s.

@@ -536,9 +536,10 @@ pub(crate) struct Taker<'t> {
 }
 
 impl Taker<'_> {
-    /// Journals the take of `taken`, a slot of `pool` the run waited `waited` seconds for, says and names it when a
-    /// killed gate had left it held, writes its claim, lets go of the beside mutex a light gate behind a critical
-    /// request took the slot under, and wakes the waiters. The gate's ticket is already deleted.
+    /// Writes the claim of `taken`, a slot of `pool` the run waited `waited` seconds for, then journals its take, so a
+    /// reader that sees the take finds its claim, unless the claim could not be written. It says and names the slot when
+    /// a killed gate had left it held, lets go of the beside mutex a light gate behind a critical request took the slot
+    /// under, and wakes the waiters. The gate's ticket is already deleted.
     pub(crate) fn took(&mut self, taken: &mut Taken, pool: Pool, waited: f64, survey: &mut Survey, console: &mut Console) {
         let name = taken.held.name().to_owned();
         let mut abandoned = Vec::new();
@@ -546,8 +547,6 @@ impl Taker<'_> {
             acquire::say_taken_abandoned(console, &name);
             abandoned.push(name.clone());
         }
-        self.journal
-            .write(&take_event(vec![name], waited, abandoned, self.parent_pid), self.tag, console);
         let of = ClaimOf {
             gate: self.gate,
             ceiling: self.ceiling,
@@ -558,11 +557,20 @@ impl Taker<'_> {
         if taken.beside.is_some()
             && let Some(go) = &self.request.test_seams.beside_claim_wait
         {
+            // The arrival file says the gate reached the seam, so a case can check what is not written yet.
+            let mut reached = go.as_os_str().to_owned();
+            reached.push(".reached");
+            let reached = PathBuf::from(reached);
+            if let Err(error) = fs::write(&reached, "") {
+                console.err(&format!("gate: cannot write the seam's arrival {}: {error}", reached.display()));
+            }
             while !go.exists() {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
         slots::write_claim(&taken.held, pool.claim_kind(), &of, console);
+        self.journal
+            .write(&take_event(vec![name], waited, abandoned, self.parent_pid), self.tag, console);
         taken.beside = None;
         slots::wake_waiters(self.root, survey, console);
     }
@@ -1518,8 +1526,8 @@ impl Run<'_> {
         (taker, &mut self.late, &mut self.covered)
     }
 
-    /// Waits its turn for a slot of `pool` and takes it into `held` the moment it has it, then journals the take, with
-    /// the remote tag while the run has one, and writes the claim. `since` is the moment the wait counts from, the run's
+    /// Waits its turn for a slot of `pool` and takes it into `held` the moment it has it, then writes the claim and
+    /// journals the take, with the remote tag while the run has one. `since` is the moment the wait counts from, the run's
     /// own `queue` line for a run the full remote pool sent back and `None` for every other wait, which counts from now;
     /// the wait, its still-waiting lines and its journal all count from that one instant.
     /// When the slot was taken; else a Ctrl+C ended the wait, which deletes the ticket at once, wakes the waiters and
@@ -1611,9 +1619,10 @@ impl Run<'_> {
     }
 
     /// Waits for the machine as a critical gate and takes it into `held` once it holds every heavy slot and its light
-    /// slot, then journals the take with what it found, says the holds line, writes the critical claim and wakes the
-    /// waiters. When the machine was taken; else a Ctrl+C ended the wait, which says so, journals the abandon, then
-    /// releases what it took so far, deletes the ticket and wakes the waiters.
+    /// slot, then says the holds line, writes the critical claim, journals the take with what it found and wakes the
+    /// waiters, so a reader that sees the take finds its claim, unless the claim could not be written. When the machine
+    /// was taken; else a Ctrl+C ended the wait, which says so, journals the abandon, then releases what it took so far,
+    /// deletes the ticket and wakes the waiters.
     fn take_machine(&mut self, held: &mut Option<Machine>, console: &mut Console) -> Taking {
         let queued = Instant::now();
         let estimate = self.estimate(console);
@@ -1650,7 +1659,6 @@ impl Run<'_> {
             // slot is named here.
             parent_pid: self.nesting.uncovering().map(|parent| parent.pid),
         };
-        self.journal.write(&take, None, console);
         console.err(&line);
         let took = Instant::now();
         let (figures, resolved) = Figures::resolved(self.request.timeout, estimate.as_ref());
@@ -1662,6 +1670,7 @@ impl Run<'_> {
             expected: expected.as_ref(),
         };
         machine.write_claim(&of, console);
+        self.journal.write(&take, None, console);
         slots::wake_waiters(self.root, &mut self.survey, console);
         say_expected(estimate.as_ref(), resolved, console);
         Taking::Took(took, figures)

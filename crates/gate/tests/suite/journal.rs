@@ -16,7 +16,7 @@ use gate_win32::NamedMutex;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::support::{Case, FAKE_TOOL, Outcome, assert_in_order, finish, none_words, run_words, shown, wait_for_file, wait_for_journal_line};
+use crate::support::{Case, FAKE_TOOL, Outcome, assert_in_order, finish, none_words, run_words, shown, wait_for_journal_line};
 
 /// The words of a light run logging to `log` whose command exits with `status`.
 fn exiting<'a>(log: &'a str, status: &'a str) -> Vec<&'a str> {
@@ -222,10 +222,9 @@ fn journal_command_is_quoted_like_format_command_text() {
     let expected = format!(r#"{} argv "a b" "x\"y""#, quoted(&[FAKE_TOOL, "wait", &go_word]));
 
     let running = case.start(&run_words("out.log", &[], &[FAKE_TOOL, "wait", &go_word, "argv", "a b", "x\"y"]));
-    // The take is journalled before the claim is written; the claim is complete once it exists (written by rename).
+    // The claim is written (by rename) before the take is journalled, so it is complete once the take line is there.
     let claim_path = case.root().join("slots").join("gate-light-slot-0.json");
     wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, running.id()));
-    wait_for_file(&claim_path);
     let claim = fs::read_to_string(&claim_path).expect("the held slot's claim can be read");
     fs::write(&go, "").expect("the go file can be made");
     let outcome = running.finish();
