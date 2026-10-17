@@ -33,8 +33,8 @@ use crate::{own_handle, start_of, wait_millis};
 /// The longest image path read, in UTF-16 units: the longest path Windows has.
 const LONGEST_PATH: usize = 32_768;
 
-/// Another process, opened with `PROCESS_QUERY_LIMITED_INFORMATION` alone, for a caller that only reads it, such as its
-/// session ([`session_of`]): it cannot copy handles, be waited on or be ended.
+/// Another process, opened with `PROCESS_QUERY_LIMITED_INFORMATION` alone, for a caller that only reads its session
+/// or its creation time: it cannot copy handles, be waited on or be ended, and it gives no handle that could be.
 pub struct QueryOnlyProcess {
     handle: OwnedHandle,
 }
@@ -51,9 +51,26 @@ impl QueryOnlyProcess {
         Ok(QueryOnlyProcess { handle })
     }
 
-    /// The process's own handle, for a query.
-    #[must_use]
-    pub fn handle(&self) -> BorrowedHandle<'_> {
+    /// The id of the session the process runs in ([`session_of`]).
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the session cannot be read.
+    pub fn session(&self) -> io::Result<u32> {
+        session_of(self.borrowed())
+    }
+
+    /// When the process was created ([`creation_time_of`]).
+    ///
+    /// # Errors
+    ///
+    /// The system's error when its times cannot be read.
+    pub fn created(&self) -> io::Result<Timestamp> {
+        creation_time_of(self.borrowed())
+    }
+
+    /// The process's handle, for the reads above alone.
+    fn borrowed(&self) -> BorrowedHandle<'_> {
         // SAFETY: the handle is open for as long as `self` lives, which the borrow cannot outlive.
         unsafe { BorrowedHandle::borrow_raw(self.handle.raw()) }
     }
@@ -180,8 +197,8 @@ impl RemoteProcess {
         }
     }
 
-    /// The code the process ended with, meaningful once [`RemoteProcess::wait_or_woken`] has found it ended: a process that still
-    /// runs reports `STILL_ACTIVE` (259).
+    /// The code the process ended with, meaningful once [`RemoteProcess::wait_or_woken`] has found it ended: a
+    /// process that still runs reports `STILL_ACTIVE` (259).
     ///
     /// # Errors
     ///

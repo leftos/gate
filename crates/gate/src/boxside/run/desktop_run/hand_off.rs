@@ -616,11 +616,7 @@ fn sweep(here: &Here<'_, '_>, helper: u32, created: Timestamp, console: &mut Con
             return;
         }
     };
-    let session_of = |pid| {
-        QueryOnlyProcess::open(pid)
-            .ok()
-            .and_then(|process| gate_win32::session_of(process.handle()).ok())
-    };
+    let session_of = |pid| QueryOnlyProcess::open(pid).ok().and_then(|process| process.session().ok());
     for (pid, at) in sweep_targets(&snapshot, helper, created, here.session, session_of) {
         let process = match StoppableProcess::open(pid) {
             Ok(Some(process)) => process,
@@ -645,13 +641,24 @@ fn sweep(here: &Here<'_, '_>, helper: u32, created: Timestamp, console: &mut Con
 ///
 /// # Errors
 ///
-/// The system's error when the file cannot be opened or its identity read.
+/// The system's error when the file cannot be opened or its identity read, and an error when its id is zero
+/// ([`one_files_identity`]).
 fn identity_of(path: &Path) -> io::Result<FileIdentity> {
     let file = OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
         .share_mode(Share::All.mode())
         .open(path)?;
     let (volume, file) = gate_win32::file_id(&file)?;
+    one_files_identity(volume, file)
+}
+
+/// The identity of one file from its volume serial number `volume` and file id `file`, as [`gate_win32::file_id`]
+/// gives them, refused as unread when the id is zero: a file system that gives its file index in place of a file id
+/// may give 0 for every file, which would make every file on its volume one identity.
+fn one_files_identity(volume: u64, file: [u8; 16]) -> io::Result<FileIdentity> {
+    if file == [0; 16] {
+        return Err(io::Error::other("the file system gives the file no id of its own"));
+    }
     Ok(FileIdentity { volume, file })
 }
 
@@ -849,8 +856,9 @@ fn stand_in(fault: &str, argument: &TaskArgument, cap_ms: Option<u64>) -> io::Re
         priority: Some(gate_win32::PriorityClass::BelowNormal),
     };
     let suspended = launch.start_suspended().map_err(|error| io::Error::other(error.to_string()))?;
-    let record = std::env::var_os(RECORD_VARIABLE);
-    let (running, job) = if record.is_some() {
+    let (running, job) = if let Some(record) = std::env::var_os(RECORD_VARIABLE) {
+        // Still suspended, so a record that cannot be written ends the stand-in with the drop of `suspended`.
+        record_stand_in(Path::new(&record), suspended.pid())?;
         (suspended.resume(), None)
     } else {
         let job = Job::anonymous_kill_on_close()?;
@@ -858,20 +866,19 @@ fn stand_in(fault: &str, argument: &TaskArgument, cap_ms: Option<u64>) -> io::Re
     };
     let running = running.map_err(|error| io::Error::other(error.to_string()))?;
     let pid = std::num::NonZeroU32::new(running.pid()).ok_or_else(|| io::Error::other("the stand-in helper has no pid"))?;
-    if let Some(record) = record {
-        record_stand_in(Path::new(&record), pid.get())?;
-    }
     Ok((pid, job))
 }
 
-/// Adds the stand-in helper's own `pid` to the record at `record` as `stand-in <pid>`: before any child it records,
-/// as it creates none until the box sends it the command.
+/// Adds the stand-in helper's own `pid` and creation time to the record at `record` as `stand-in <pid> <created>`,
+/// which no other process at a reused pid matches: before any child it records, as it is written while the stand-in
+/// is still suspended.
 #[cfg(feature = "test-seams")]
 fn record_stand_in(record: &Path, pid: u32) -> io::Result<()> {
     use std::io::Write;
 
+    let created = QueryOnlyProcess::open(pid)?.created()?;
     let mut file = OpenOptions::new().create(true).append(true).open(record)?;
-    writeln!(file, "{STAND_IN_RECORD}{pid}")
+    writeln!(file, "{STAND_IN_RECORD}{pid} {created}")
 }
 
 /// The start of the record's line holding the stand-in helper's own pid.
@@ -935,11 +942,13 @@ mod tests {
     }
 
     /// A helper that never ends by itself and is never seen ended, on a clock that every wait and end runs to the
-    /// bound it was given, as a helper on a busy machine would: the bounds it was given are kept.
+    /// bound it was given, as a helper on a busy machine would, and its wait `late` past that: the bounds it was given
+    /// are kept.
     struct Stubborn {
         clock: Cell<Instant>,
         bounds: RefCell<Vec<Duration>>,
         wait: io::Result<EndWait>,
+        late: Duration,
     }
 
     impl Stubborn {
@@ -952,6 +961,7 @@ mod tests {
     impl EndingHelper for Stubborn {
         fn wait_for_end(&self, bound: Duration) -> io::Result<EndWait> {
             self.spend(bound);
+            self.clock.set(self.clock.get() + self.late);
             match &self.wait {
                 Ok(waited) => Ok(*waited),
                 Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
@@ -964,13 +974,45 @@ mod tests {
         }
     }
 
-    /// A [`Stubborn`] helper whose wait answers `wait`.
+    /// A [`Stubborn`] helper whose wait answers `wait`, on time.
     fn stubborn(wait: io::Result<EndWait>) -> Stubborn {
         Stubborn {
             clock: Cell::new(Instant::now()),
             bounds: RefCell::new(Vec::new()),
             wait,
+            late: Duration::ZERO,
         }
+    }
+
+    #[test]
+    fn the_end_keeps_its_slice_after_a_late_wait() {
+        let limit = Duration::from_secs(10);
+        let helper = Stubborn {
+            late: Duration::from_secs(1),
+            ..stubborn(Ok(EndWait::Running))
+        };
+
+        end_within(&helper, limit, || helper.clock.get(), true);
+
+        assert_eq!(
+            helper.bounds.borrow().as_slice(),
+            [Duration::from_millis(9_500), super::END_SLICE],
+            "a wait that returned past its bound still leaves the end its slice"
+        );
+    }
+
+    #[test]
+    fn a_limit_under_two_seconds_keeps_a_quarter_of_it_for_the_end() {
+        let limit = Duration::from_secs(1);
+        let helper = stubborn(Ok(EndWait::Running));
+
+        end_within(&helper, limit, || helper.clock.get(), true);
+
+        assert_eq!(
+            helper.bounds.borrow().as_slice(),
+            [Duration::from_millis(750), Duration::from_millis(250)],
+            "the wait, then the end's quarter"
+        );
     }
 
     #[test]
@@ -1029,6 +1071,21 @@ mod tests {
             pipe,
             Some(format!("{start} the control pipe failed: broken")),
             "a pipe failure is a refusal"
+        );
+    }
+
+    #[test]
+    fn a_file_id_of_zero_is_no_identity() {
+        let mut index = [0_u8; 16];
+        index[..8].copy_from_slice(&42_u64.to_le_bytes());
+        let read = super::one_files_identity(0x1234, index).expect("an id that is not zero is read");
+        assert_eq!((read.volume, read.file), (0x1234, index));
+
+        let zero = super::one_files_identity(0x1234, [0; 16]).expect_err("an id of zero names no one file");
+        assert_eq!(
+            DesktopRefusal::Machinery(super::with_error(super::PROGRAM_UNREAD, &zero)).line(),
+            "gate: not routed: the builder has no desktop session: the program the box sends cannot be read: \
+             the file system gives the file no id of its own"
         );
     }
 

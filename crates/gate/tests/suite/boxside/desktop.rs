@@ -338,12 +338,13 @@ fn a_refused_child_report_leaves_nothing_running() {
     let outcome = call.finish();
 
     let lines = fs::read_to_string(&record).expect("the box recorded the stand-in");
-    let stand_in: u32 = lines
+    let (stand_in, stand_in_created) = lines
         .lines()
         .find_map(|line| line.strip_prefix("stand-in "))
-        .expect("the box recorded the stand-in's pid")
-        .parse()
-        .expect("the stand-in's pid");
+        .and_then(|line| line.split_once(' '))
+        .expect("the box recorded the stand-in's pid and creation time");
+    let stand_in: u32 = stand_in.parse().expect("the stand-in's pid");
+    let stand_in_created: jiff::Timestamp = stand_in_created.parse().expect("the stand-in's creation time");
     let recorded: Vec<u32> = lines
         .lines()
         .filter(|line| !line.starts_with("stand-in "))
@@ -356,17 +357,27 @@ fn a_refused_child_report_leaves_nothing_running() {
         .filter(|process| process.command_line.as_deref().is_some_and(|line| line.contains(&mark_word)))
         .map(|process| process.pid)
         .collect();
+    // The pid and the creation time together, so another case's stand-in at a reused pid is never taken for this one.
     let stand_in_left = snapshot
         .iter()
-        .any(|process| process.pid == stand_in && process.name.eq_ignore_ascii_case("fake-desktop-helper.exe"));
-    for pid in left.iter().chain(stand_in_left.then_some(&stand_in)) {
+        .any(|process| process.pid == stand_in && process.created == Some(stand_in_created));
+    for pid in &left {
         if let Ok(Some(process)) = StoppableProcess::open(*pid) {
             let _ = process.terminate(1);
         }
     }
+    if stand_in_left
+        && let Ok(Some(process)) = StoppableProcess::open(stand_in)
+        && process.created().ok() == Some(stand_in_created)
+    {
+        let _ = process.terminate(1);
+    }
     assert!(!recorded.is_empty(), "the stand-in created a child: {outcome:?}");
     assert!(left.is_empty(), "no child of the stand-in outlives the run: {left:?} {outcome:?}");
-    assert!(!stand_in_left, "the stand-in itself does not outlive the run: {stand_in} {outcome:?}");
+    assert!(
+        !stand_in_left,
+        "the stand-in itself does not outlive the run: {stand_in} created {stand_in_created} {outcome:?}"
+    );
     refused_with(
         &outcome,
         &payload,
