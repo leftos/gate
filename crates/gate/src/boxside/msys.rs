@@ -26,7 +26,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gate_win32::{Job, PipedConsole, PipedFed, PipedLaunch, RestrictedToken, Running};
+use gate_win32::{Job, PipedConsole, PipedFed, PipedLaunch, RestrictedToken, Running, TRUSTED_OWNERS};
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
 use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
@@ -43,13 +43,6 @@ const RUNTIME: &str = "msys-2.0.dll";
 /// How many folders above `git.exe` the box looks in for Git's root: those of `cmd\git.exe`, `bin\git.exe` and
 /// `<environment>\bin\git.exe`, such as `ucrt64\bin\git.exe`.
 const ROOT_DEPTH: usize = 3;
-/// The owners the keeper's folder may have: SYSTEM, Administrators and `TrustedInstaller`. The check is the owner alone:
-/// it keeps out a Git the user installed in a folder of their own, not a folder another local user can write to.
-const TRUSTED_OWNERS: [&str; 3] = [
-    "S-1-5-18",
-    "S-1-5-32-544",
-    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
-];
 /// The line the box writes to the keeper and waits to read back.
 const ECHO: &[u8] = b"gate: msys keeper\n";
 /// How long the box waits for the keeper's echo before it goes on without it.

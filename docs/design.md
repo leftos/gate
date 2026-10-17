@@ -2556,7 +2556,7 @@ Built verbs:
 
   Lookup: from the `git.exe` the box resolves to (the same `PATH` search its git calls use), it walks at most 3 folders up (`cmd\`, `bin\`, `ucrt64\bin\`, `mingw64\bin\`) for the first folder whose `usr\bin` holds both `cat.exe` and `msys-2.0.dll`. A `git.exe` with no such root above it, such as a shim, has no keeper.
 
-  The folder's owner must be Administrators, SYSTEM or TrustedInstaller. The check is the owner, not write access: it keeps out a Git the user installed in a folder of their own, but an elevated install outside `Program Files` can still be writable by another local user, and the check does not see that.
+  The folder's owner must be Administrators, SYSTEM or TrustedInstaller (`gate_win32::TRUSTED_OWNERS`, the list gate-win32's installed-file check shares). The check is the owner, not write access: it keeps out a Git the user installed in a folder of their own, but an elevated install outside `Program Files` can still be writable by another local user, and the check does not see that.
 
   The keeper starts on the command's restricted token (the box's own is never the fallback here: the keeper then does not start and says why), in the system folder, on a hidden console, with the box's environment, in an anonymous kill-on-close job of the box's own and never the command's; its three standard streams are pipes the box holds, and the command inherits none of them. Dropping the keeper closes the job and ends it.
 

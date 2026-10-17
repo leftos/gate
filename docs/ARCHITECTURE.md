@@ -195,6 +195,8 @@ The rule that shapes it: every file and kernel object another process sees is de
 
   `PipedLaunch::start_suspended_within_fed` (in `piped.rs`) is the same suspended start in a job with stdin piped as well, a `PipedFed` holding the write end, which `gate push` feeds the exe through.
 
+  `trust.rs` owns `TRUSTED_OWNERS` (SYSTEM, Administrators and TrustedInstaller, as SID strings; `boxside/msys.rs` takes its owner list from it) and `check_installed_file(path) -> Result<(), Untrusted>`, which judges an installed file, its folder and every folder above it to the volume root, each opened by handle, refusing links, junctions, network locations and a path that resolves elsewhere. Nothing outside its tests calls it yet.
+
   What a run on the builder's interactive desktop needs (`gate-desktop`'s helper calls all of it; `gate box` calls `session.rs`, `mutex.rs`'s `PrivateMutex` and `token.rs`'s `current_account` in its desktop stage, `boxside/run/desktop_run.rs`, and the pipe, adoption, task, launch and job pieces below in its hand-off, `boxside/run/desktop_run/hand_off.rs`):
   - `lib.rs`: `set_default_dll_directories_system32`, the DLL search limited to System32, which the helper's start and every `gate box` verb call first.
   - `pipe.rs`: `PipeServer` and `PipeClient`, a one-instance named pipe under a random name for one user's local client, the client refusing a pipe whose owner, DACL or label is not the server's; `read` and `write_all` on either end are overlapped and bounded by a deadline and wake handles (`PipeRead`, `PipeWrite`); a client refuses a name outside `\\.\pipe\`. Its `wait_any`, `look_at_wake` and the shared decoder of a wait's result (`woken`) also serve `task.rs`.
@@ -308,7 +310,7 @@ It also holds `run.rs` (the lock, the git flags, the sync, the command, the back
 
 It also holds `tools.rs` (the dotnet tool restore and its `<Work>.tools` record), `packages.rs` (the pnpm or bun install before a routed `pnpm`, `bun` or `bunx` command and its `<Work>.packages` record), `forward.rs` (the pipes forwarded to stdout and stderr), `heartbeat.rs` (the command heartbeat: the job's CPU on `gate-watchdog`'s `Pump`), `inflight.rs` (the `inflight` verb: which locks under `{Root}\work` a routed run holds) and `stop.rs` (terminating the job).
 
-`msys.rs` is the MSYS keeper, started from `run.rs` after the heartbeat: Git's `cat.exe`, found above the box's `git.exe` and owned by Administrators, SYSTEM or TrustedInstaller, kept running in a job of its own so no killed MSYS start-up leaves Git's shared section locked.
+`msys.rs` is the MSYS keeper, started from `run.rs` after the heartbeat: Git's `cat.exe`, found above the box's `git.exe` and owned by one of `gate_win32::TRUSTED_OWNERS` (Administrators, SYSTEM or TrustedInstaller), kept running in a job of its own so no killed MSYS start-up leaves Git's shared section locked.
 
 `outputs/` is a routed run's outputs, shared by both ends: `glob.rs` (the output globs and the exclusions, case-insensitive), `walk.rs` (the matching files below a folder, skipping links and junctions; `walk_with_refused` also notes the files refused for their names, reading a folder whose name is not plain through a verbatim path to count them), `hash.rs` (SHA-256 and `is_lower_hex`).
 

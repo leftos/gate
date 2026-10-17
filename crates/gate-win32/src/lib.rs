@@ -8,8 +8,10 @@
 //! code. And what a run on the interactive desktop needs: a named pipe for one
 //! user's local client, handles copied into and out of another process and the checks on a process taken that way, a
 //! command created on the interactive desktop, the console session's state, and a registered scheduled task started in
-//! a given session once its definition is checked ([`run_task`]). It holds no policy but two: [`run_task`] starts only
-//! a task defined as the desktop helper's must be, and a
+//! a given session once its definition is checked ([`run_task`]), and whether an installed file only SYSTEM,
+//! Administrators and `TrustedInstaller` can change ([`check_installed_file`]). It holds no policy but three:
+//! [`run_task`] starts only a task defined as the desktop helper's must be, [`check_installed_file`] trusts only the
+//! owners [`TRUSTED_OWNERS`] names, and a
 //! [`DesktopLaunch`] always creates its command in the normal priority class on `WinSta0\Default`. The names, the
 //! waits, the environment and priority of any other command, and what an abandoned mutex means to the gate are the
 //! caller's. Windows only; elsewhere the crate is empty.
@@ -40,6 +42,7 @@ mod thread;
 mod times;
 mod token;
 mod tree;
+mod trust;
 
 pub use adopt::{
     EndWait, QueryOnlyProcess, RemoteProcess, check_received_output, creation_time_of, end_process, image_path_of, is_handle_value, parent_pid_of,
@@ -84,6 +87,7 @@ pub use file::{
 pub use security::{Descriptor, inherit_security, is_protected_folder, protected_descriptor, security_text, without_auto_inherit};
 pub use thread::cancel_synchronous_io;
 pub use tree::{Membership, OpenedJob, StoppableProcess, WaitableProcess};
+pub use trust::{TRUSTED_OWNERS, Untrusted, check_installed_file};
 
 pub use priority::{Priority, priority_of, set_priority};
 
