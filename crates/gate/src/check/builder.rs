@@ -1,10 +1,10 @@
-//! The check of a builder `remote.json` lists: the repo's `.gate/toolchain.toml` and root `global.json` read from disk
-//! as this PC's check reads them, then one bounded call of the builder's `gate box preflight`, as a routed run's
-//! preflight is made, with the repo's own work-folder key and the manifest's tools as its `Needs`. The preflight
-//! readies only the work folder the next routed run of the repo would ready, and its answer is read with the remote
-//! client's own readers: the builder's gate build, the folders it created, its SDK list, what it found of each tool,
-//! and whether its work folder is warm for the worktree's warm-up file. The warm-up's items are this PC's, its record
-//! said only when it names the builder checked.
+//! The check of a builder `remote.json` lists: the repo's `.gate/toolchain.toml`, `.gate/siblings.toml` and root
+//! `global.json` read from disk as this PC's check reads them, then one bounded call of the builder's `gate box
+//! preflight`, as a routed run's preflight is made, with the repo's own work-folder key and the manifest's tools as its
+//! `Needs`. The preflight readies only the work folder the next routed run of the repo would ready, and its answer is
+//! read with the remote client's own readers: the builder's gate build, the folders it created, its SDK list, what it
+//! found of each tool, and whether its work folder is warm for the worktree's warm-up file. The warm-up's items are
+//! this PC's, its record said only when it names the builder checked.
 
 use std::path::Path;
 use std::time::Duration;
@@ -15,7 +15,7 @@ use gate_win32::PipedConsole;
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::boxside::payload::escaped;
-use crate::check::local::{self, Declared, WarmSources, Warmed};
+use crate::check::local::{self, Declared, SiblingsFile, WarmSources, Warmed};
 use crate::check::report::{self, At, Checked, Problem, Tool, Warmup};
 use crate::console::Console;
 use crate::environment::Variables;
@@ -148,9 +148,10 @@ fn asked(transport: &dyn Transport, host: &str, place: &Place, bound: Duration) 
         lines: &heard.lines,
         last_error: heard.last_error.as_deref(),
     };
+    let siblings = local::read_siblings_file(root, &mut declared.problems);
     let sources = WarmSources::from_process(&repo);
     let warmed = warm_items(&place.root, sources, host, &heard.lines, &mut declared.problems);
-    let mut checked = answer.checked(declared, repo, place.root.clone(), local::declares_siblings(root), warmed.unreadable);
+    let mut checked = answer.checked(declared, repo, place.root.clone(), &siblings, warmed.unreadable);
     checked.warmup = warmed.items;
     Ok(Asked { checked, key })
 }
@@ -272,7 +273,12 @@ fn refusal(host: &str, root: &str, heard: &Heard) -> Option<String> {
     let last = heard.last_error.as_deref().map(|line| git::failure_text(&[line]));
     match heard.status {
         Some(0) => {}
-        Some(SSH_FAILED) => return Some(format!("check: {host}: unreachable: {}", last.unwrap_or_default())),
+        Some(SSH_FAILED) => {
+            let why = last
+                .filter(|shown| !shown.trim().is_empty())
+                .unwrap_or_else(|| format!("ssh exited {SSH_FAILED} with no message"));
+            return Some(format!("check: {host}: unreachable: {why}"));
+        }
         Some(status @ (NOT_RECOGNIZED | BOX_USAGE)) => {
             return Some(format!(
                 "check: {host}: has no gate box that takes this call (status {status}); run gate push"
@@ -298,10 +304,10 @@ struct Answer<'a> {
 }
 
 impl Answer<'_> {
-    /// What the builder has of what the repo named `repo`, whose worktree root is `root`, `declared`, whether it
-    /// `declares_siblings`, which a builder is not checked for, and whether its warm-up file is there but
-    /// `warmup_unreadable` whole.
-    fn checked(&self, declared: Declared, repo: String, root: String, declares_siblings: bool, warmup_unreadable: bool) -> Checked {
+    /// What the builder has of what the repo named `repo`, whose worktree root is `root`, `declared`, what its
+    /// `siblings` file declares (the sibling folders are not checked on a builder), and whether its warm-up file is
+    /// there but `warmup_unreadable` whole.
+    fn checked(&self, declared: Declared, repo: String, root: String, siblings: &SiblingsFile, warmup_unreadable: bool) -> Checked {
         let reported = toolchain::reported(self.lines, self.sent);
         let tools = declared
             .manifest
@@ -326,7 +332,7 @@ impl Answer<'_> {
             repo,
             root,
             declares_toolchain: declared.declares_toolchain,
-            unreadable: declared.unreadable(false, warmup_unreadable),
+            unreadable: declared.unreadable(siblings.unreadable, warmup_unreadable),
             problems: declared.problems,
             tools,
             godot: declared.godot,
@@ -335,7 +341,7 @@ impl Answer<'_> {
             consent_problem: None,
             siblings: Vec::new(),
             created,
-            siblings_skipped: declares_siblings,
+            siblings_skipped: siblings.declares,
             warmup: Vec::new(),
         }
     }
@@ -377,7 +383,7 @@ mod tests {
     use jiff::Timestamp;
 
     use super::{Answer, Failure, Heard, builder_warmth, failure, refusal, warm_items};
-    use crate::check::local::{Consent, Declared, WarmSources};
+    use crate::check::local::{Consent, Declared, SiblingsFile, WarmSources};
     use crate::check::report::{At, Checked, Line, Sdk, Warmup, said};
     use crate::remote::git::GitError;
     use crate::remote::parity::pin_of;
@@ -427,7 +433,7 @@ mod tests {
             lines: answer,
             last_error,
         }
-        .checked(declared, "app".to_owned(), "X:/dev/app".to_owned(), false, false)
+        .checked(declared, "app".to_owned(), "X:/dev/app".to_owned(), &SiblingsFile::default(), false)
     }
 
     fn reported(checked: &Checked) -> Vec<(&str, &Reported)> {
@@ -725,6 +731,21 @@ mod tests {
         assert_eq!(
             refusal(HOST, root, &heard(Some(3), Vec::new(), None)),
             Some(r"check: builder-1: preparing D:\gate-remote failed (status 3)".to_owned())
+        );
+    }
+
+    /// An ssh that exits 255 with nothing on its standard error still says why the builder is unreachable.
+    #[test]
+    fn an_ssh_failure_with_no_message_says_ssh_exited_255() {
+        let root = r"D:\gate-remote";
+        assert_eq!(
+            refusal(HOST, root, &heard(Some(255), Vec::new(), None)),
+            Some("check: builder-1: unreachable: ssh exited 255 with no message".to_owned())
+        );
+        assert_eq!(
+            refusal(HOST, root, &heard(Some(255), Vec::new(), Some("ssh: connection lost\r"))),
+            Some("check: builder-1: unreachable: ssh exited 255 with no message".to_owned()),
+            "a line a carriage return ends shows as nothing"
         );
     }
 

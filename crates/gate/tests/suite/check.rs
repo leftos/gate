@@ -1350,6 +1350,53 @@ fn check_builder_skips_declared_siblings() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
 }
 
+/// A builder check reads the worktree's `.gate/siblings.toml` on this PC and says each of its problems as this PC's
+/// check does.
+#[test]
+fn check_builder_says_the_siblings_file_s_problems() {
+    let case = builder_case("check_builder_siblings_problem");
+    write(&case, ".gate/toolchain.toml", "[tools]\nnode = \">=24\"\n");
+    write(&case, ".gate/siblings.toml", "siblings = ['']\n");
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = check_builder(&case, "builder-1", &[], &steps);
+
+    assert_eq!(
+        lines(&outcome.stderr),
+        [
+            "check: .gate/toolchain.toml: tools.node is not a version: \">=24\"",
+            "check: .gate/siblings.toml: siblings[0] is empty",
+        ],
+        "the manifest's problems come first, as on this PC: {outcome:?}"
+    );
+    assert!(
+        lines(&outcome.stdout).contains(&"check: builder-1: siblings skipped: a routed run lays them out"),
+        "{outcome:?}"
+    );
+}
+
+/// A `.gate/siblings.toml` that cannot be read is named in the builder check's summary, and fails it, as on this PC.
+#[test]
+fn check_builder_an_unreadable_siblings_file_exits_1_and_says_so() {
+    let case = builder_case("check_builder_siblings_unreadable");
+    fs::create_dir_all(Path::new(&root(&case)).join(".gate").join("siblings.toml")).expect("a folder named siblings.toml can be made");
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = check_builder(&case, "builder-1", &[], &steps);
+
+    assert_eq!(
+        lines(&outcome.stdout)[2..],
+        [
+            "check: builder-1: app declares no toolchain",
+            "check: builder-1: siblings skipped: a routed run lays them out",
+            "check: builder-1: could not read .gate/siblings.toml; 0 missing, 0 too old, 1 skipped",
+        ],
+        "{outcome:?}"
+    );
+    assert!(outcome.stderr.starts_with("check: .gate/siblings.toml: "), "{outcome:?}");
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
 /// The builder's SDK list is the one its preflight says, read there with its own `dotnet`; a builder `hosts` lists is
 /// checked as the one `host` names is.
 #[test]

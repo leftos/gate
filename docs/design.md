@@ -357,11 +357,13 @@ On stdout, each line prefixed `check: <host>: `, in this order:
 5. The install hints `install: <host>: <tool>: <command>`: `cargo install cargo-nextest --locked`, `npm install -g pnpm@<min>` (`npm install -g pnpm` with no minimum), `rustup toolchain install <min> && rustup default <min>`, `dotnet-install.ps1 -Version <v>`, and `run the build-box toolchain script on <host>` for node, pwsh, ffmpeg and a rust with no minimum.
 6. The summary.
 
-When the repo's `.gate/siblings.toml` names a sibling or cannot be read, one line `check: <host>: siblings skipped: a routed run lays them out` comes instead of the sibling lines and counts as skipped.
+When the repo's `.gate/siblings.toml` names a sibling or cannot be read, one line `check: <host>: siblings skipped: a routed run lays them out` comes instead of the sibling lines and counts as skipped. The sibling folders themselves are not checked on the builder.
+
+The problems of `.gate/siblings.toml` are said on stderr as on this PC (`check: .gate/siblings.toml: <problem>`, for example `check: .gate/siblings.toml: siblings[0] is empty`), and a problem alone does not change the exit status. A `.gate/siblings.toml` that cannot be read is named in the summary, `check: <host>: could not read .gate/siblings.toml; <n> missing, <n> too old`, with `, <n> skipped` as on this PC, and the exit is 1.
 
 A failure is one stderr line, exit 1, and nothing else on stdout:
 
-- `check: <host>: unreachable: <ssh's last error line>` for ssh status 255, and on the timeout `check: <host>: unreachable: no answer in <limit>`;
+- `check: <host>: unreachable: <ssh's last error line>` for ssh status 255 (`ssh exited 255 with no message` when ssh printed nothing on stderr), and on the timeout `check: <host>: unreachable: no answer in <limit>`;
 - `check: <host>: no answer in <limit>, and ssh could not be stopped: <error>`;
 - `check: <host>: runs gate <theirs>, this PC runs <ours>; run gate push`, a version mismatch printing only this line;
 - `check: <host>: has no gate box that takes this call (status <n>); run gate push`;

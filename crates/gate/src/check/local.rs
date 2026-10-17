@@ -144,17 +144,48 @@ pub(super) fn declared(root: &Path) -> Declared {
     }
 }
 
-/// Whether the worktree `root`'s `.gate/siblings.toml` declares a sibling: an entry of its `siblings` array names one,
-/// as it reads or as one it skips as bad, or the file is there but cannot be read, so it may. A problem of the file
-/// that is no entry's, such as a stray key or a `siblings` that is not an array, declares none.
-pub(super) fn declares_siblings(root: &Path) -> bool {
-    match route::read_gate_file(root, SIBLINGS) {
-        Ok(None) => false,
-        Ok(Some(bytes)) => match siblings::read_bytes(&bytes) {
-            Ok(declared) => !declared.names.is_empty() || declared.problems.iter().any(|problem| problem.starts_with(ENTRY_PROBLEM)),
-            Err(_) => true,
-        },
-        Err(_) => true,
+/// What a worktree root's `.gate/siblings.toml` declares, as both checks read it ([`read_siblings_file`]).
+#[derive(Debug, Default)]
+pub(super) struct SiblingsFile {
+    /// The sibling names that read, in the file's order.
+    pub names: Vec<String>,
+    /// Whether it declares a sibling: an entry of its `siblings` array names one, as it reads or as one it skips as
+    /// bad, or the file is there but cannot be read, so it may. A problem of the file that is no entry's, such as a
+    /// stray key or a `siblings` that is not an array, declares none.
+    pub declares: bool,
+    /// Whether the file is there but cannot be read whole.
+    pub unreadable: bool,
+}
+
+/// What the worktree `root`'s `.gate/siblings.toml` declares, read through routing's guarded read
+/// ([`route::read_gate_file`]); every problem of the file is added to `problems`.
+pub(super) fn read_siblings_file(root: &Path, problems: &mut Vec<Problem>) -> SiblingsFile {
+    let declared = route::read_gate_file(root, SIBLINGS).and_then(|bytes| bytes.map(|bytes| siblings::read_bytes(&bytes)).transpose());
+    match declared {
+        Ok(None) => SiblingsFile::default(),
+        Err(why) => {
+            problems.push(Problem {
+                file: report::SIBLINGS,
+                text: why,
+            });
+            SiblingsFile {
+                names: Vec::new(),
+                declares: true,
+                unreadable: true,
+            }
+        }
+        Ok(Some(declared)) => {
+            let declares = !declared.names.is_empty() || declared.problems.iter().any(|problem| problem.starts_with(ENTRY_PROBLEM));
+            problems.extend(declared.problems.into_iter().map(|text| Problem {
+                file: report::SIBLINGS,
+                text,
+            }));
+            SiblingsFile {
+                names: declared.names,
+                declares,
+                unreadable: false,
+            }
+        }
     }
 }
 
@@ -484,28 +515,13 @@ fn sdk_list(root: &Path) -> Result<Vec<String>, String> {
 /// Each sibling `<root>\.gate\siblings.toml` declares, checked in routing's order: one `allowed` does not name is not
 /// allowed (all are when `allowed` is `None`), one named like the root's folder (ASCII letter case aside) is refused,
 /// and only the rest are looked for beside the worktree root `root`; and whether that file is there but cannot be read
-/// whole. Every problem of the file is added to `problems`, and the names that read are still checked.
+/// whole. Every problem of the file is added to `problems` ([`read_siblings_file`]), and the names that read are still
+/// checked.
 fn read_siblings(root: &str, allowed: Option<&[String]>, problems: &mut Vec<Problem>) -> (Vec<Sibling>, bool) {
-    let declared = route::read_gate_file(Path::new(root), SIBLINGS).and_then(|bytes| bytes.map(|bytes| siblings::read_bytes(&bytes)).transpose());
-    let names = match declared {
-        Ok(None) => return (Vec::new(), false),
-        Err(why) => {
-            problems.push(Problem {
-                file: report::SIBLINGS,
-                text: why,
-            });
-            return (Vec::new(), true);
-        }
-        Ok(Some(declared)) => {
-            problems.extend(declared.problems.into_iter().map(|text| Problem {
-                file: report::SIBLINGS,
-                text,
-            }));
-            declared.names
-        }
-    };
+    let file = read_siblings_file(Path::new(root), problems);
     let leaf = root_leaf(root);
-    let siblings = names
+    let siblings = file
+        .names
         .into_iter()
         .map(|name| {
             if !allowed.is_none_or(|allowed| allowed.contains(&name)) {
@@ -525,7 +541,7 @@ fn read_siblings(root: &str, allowed: Option<&[String]>, problems: &mut Vec<Prob
             }
         })
         .collect();
-    (siblings, false)
+    (siblings, file.unreadable)
 }
 
 /// The worktree root `root`'s folder name: its last segment, separators at its end ignored.
@@ -565,7 +581,7 @@ mod tests {
 
     use gate_router::SiblingFolder;
 
-    use super::{Declared, declares_siblings, read_manifest, read_pin, read_siblings, sdk_of, sibling};
+    use super::{Declared, read_manifest, read_pin, read_siblings, read_siblings_file, sdk_of, sibling};
     use crate::check::report::{Found, Sdk, Sibling};
     use crate::remote::parity::{Pin, pin_of};
     use crate::remote::toolchain::{Manifest, ToolNeed, Version};
@@ -680,6 +696,7 @@ mod tests {
     fn only_a_siblings_file_that_names_one_or_cannot_be_read_declares_siblings() {
         let root = Folder::new("declares-siblings");
         let file = root.path().join(".gate").join("siblings.toml");
+        let declares_siblings = |root: &Path| read_siblings_file(root, &mut Vec::new()).declares;
         assert!(!declares_siblings(root.path()), "no file");
         write(&file, "siblings = []\n");
         assert!(!declares_siblings(root.path()), "an empty list");
