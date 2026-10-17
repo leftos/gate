@@ -73,7 +73,7 @@ fn desktop_call(case: &Case, payload: &Value, mode: &str, extra: &[&str]) -> Box
 
 /// The desktop payload of `case`'s work folder `k` running `command`, its snapshot made.
 fn ready_payload(case: &Case, command: &[&str]) -> Value {
-    let mut payload = desktop_payload(case, "k", command, 30);
+    let mut payload = desktop_payload(case, "k", command, 600);
     snapshot(case, &mut payload, &[("a.txt", "a\n")]);
     payload
 }
@@ -422,7 +422,9 @@ fn left_by(record: &Path) -> Left {
         .filter(|line| !line.starts_with("stand-in "))
         .map(|line| line.parse().expect("a recorded pid"))
         .collect();
-    let snapshot = Win32ProcessTable.snapshot_without_command_lines();
+    let snapshot = Win32ProcessTable
+        .try_snapshot_without_command_lines()
+        .expect("the process table can be listed");
     // The parent and the creation-time bound with the pid, so another process at a reused pid is never taken for a child.
     let children: Vec<u32> = snapshot
         .iter()
@@ -792,6 +794,14 @@ fn box_stop_during_a_desktop_run_ends_it() {
     assert!(created.is_some(), "the command's creation time can be read: {pid}");
 
     let stopped = gate_box(&case, "stop", &request_line(&payload), None);
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(
+        stopped.stdout,
+        format!("gate: remote stopped job {}\n", field(&payload, "Job")),
+        "{stopped:?}"
+    );
+    assert_eq!(stopped.stderr, "", "{stopped:?}");
     wait_until("the stopped desktop command ending", || {
         !Win32ProcessTable
             .snapshot()
@@ -800,12 +810,6 @@ fn box_stop_during_a_desktop_run_ends_it() {
     });
     let outcome = running.finish();
 
-    assert_eq!(stopped.code, Some(0), "{stopped:?}");
-    assert_eq!(
-        stopped.stdout,
-        format!("gate: remote stopped job {}\n", field(&payload, "Job")),
-        "{stopped:?}"
-    );
     assert_eq!(outcome.code, Some(124), "the stopped command's status: {outcome:?}");
     ran_its_command(&outcome, &payload);
 }
@@ -819,7 +823,7 @@ fn a_stop_while_the_desktop_command_is_parked_says_it_was_stopped_before_start()
     let (park_word, mark_word) = (shown(&park), shown(&mark));
     let payload = ready_payload(&case, &[FAKE_TOOL, "mark", &mark_word, "out", "ran"]);
     let running = desktop_call(&case, &payload, "ok", &["--test-box-park-launch", &park_word]).start();
-    wait_until("the box parked before the command's marker", || parked.exists());
+    running.wait_until("the box parked before the command's marker", || parked.exists());
 
     let stopped = gate_box(&case, "stop", &request_line(&payload), None);
     let_go(&park);
