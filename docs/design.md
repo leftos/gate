@@ -1670,6 +1670,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     Every other command of the repo routes as before, with no `GodotVersion`.
 
+    A warm-up counts as a Godot-console command when any of its commands' first word is a Godot console word. It then sends the same `godot` need, follows the same rules with the same lines (said in its log, and on the console of a foreground `gate warm`), and carries the chosen version as its payload's `GodotVersion`. A warm-up the rules refuse is recorded `failed`, refused, with the reason `the builder refused: parity`.
+
     A tool the builder did not probe, gave no answer for, or found at a version that cannot be read against a minimum gets `gate: <host> did not probe <name>: <why>; not checking it` and is not a need. The lines come in this order: the SDK step's own, then the manifest's problem lines, then the per-tool skip lines in the manifest's order, then the mismatch lines.
 
     A text from the manifest or the builder is escaped, and the builder's cut to 4096 bytes, so neither can forge a line. `toolchain::standing` judges a tool against a minimum from what its probe found (met, too old, missing, not readable, skipped) in one place, which `gate check`'s report shares and a routed run applies to every tool but a pinned `godot`, which both judge with `pinned`; `gate check` judges a manifest `godot` pin through `pinned` too, so its report and a routed run agree. `--test-remote-interrupt-at manifest` raises the interrupt just before the manifest is read.

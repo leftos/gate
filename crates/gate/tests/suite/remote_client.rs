@@ -2844,7 +2844,7 @@ fn an_uncommitted_manifest_edit_is_read() {
 }
 
 /// A project file naming the Godot SDK version `version`, as a Godot .NET repo's does.
-fn godot_csproj(version: &str) -> String {
+pub(super) fn godot_csproj(version: &str) -> String {
     format!(
         "<Project Sdk=\"Godot.NET.Sdk/{version}\">\n  <PropertyGroup>\n    <TargetFramework>net10.0</TargetFramework>\n  \
          </PropertyGroup>\n</Project>\n"
@@ -2855,7 +2855,7 @@ fn godot_csproj(version: &str) -> String {
 /// fake tool named `Godot_console.exe` answering `--version` with the line beside it, as step A's box reads one. The
 /// folder is left out of the case's snapshot, and lies outside the builder's own work folders, where a program would be
 /// refused.
-fn godot_root(case: &Case, installs: &[(&str, &str)]) -> PathBuf {
+pub(super) fn godot_root(case: &Case, installs: &[(&str, &str)]) -> PathBuf {
     let root = case.folder().join("ssh").join("godot");
     for (folder, line) in installs {
         let install = root.join(folder);
@@ -6713,7 +6713,7 @@ fn a_godot_run_refused_saying_why(case: &Case, root: &Path, local: &Path, why: &
 }
 
 /// The warning a Godot command of a repo pinning no Godot version says, naming the install `version` the run uses.
-fn no_pin_warning(version: &str) -> String {
+pub(super) fn no_pin_warning(version: &str) -> String {
     format!(
         "gate: warning: the repo pins no Godot version, so this run uses {version}, the newest on {HOST}; pin the \
          version it needs in .gate/toolchain.toml ([tools] godot = \"x.y.z\") or as the .csproj's Godot.NET.Sdk version"

@@ -489,7 +489,7 @@ pub(crate) enum NoChosenGodot {
 
 /// What a routed run of a repo choosing no Godot version does, given the versions `required` the repo requires
 /// ([`godot_required`]; `None` when it requires nothing), whether its Godot pins were `pins_read`
-/// ([`godot_pins_read`]), whether the command's first word is a Godot console (`godot_command`), what the preflight
+/// ([`godot_pins_read`]), whether the call runs a Godot console (`godot_command`), what the preflight
 /// `reported` of the builder's installs, and the builder `host`: nothing for any other command, the newest install with a
 /// warning when the repo pins none and without one when it takes any, and a refusal line when no version is known. An
 /// unmet pin is the parity mismatch's own refusal, with no line here. So is a `godot = ""` repo whose builder reports

@@ -1122,7 +1122,7 @@ impl Attempt<'_, '_> {
             .map(|(repo, sibling)| (repo.name.clone(), sibling.commit.clone()))
             .collect();
         let trees = self.trees(&repos, &snapshots)?;
-        let godot_command = self.call.words.first().is_some_and(|word| is_godot_console(word));
+        let godot_command = self.godot_command();
         let needs = trees
             .first()
             .and_then(Option::as_ref)
@@ -1183,6 +1183,16 @@ impl Attempt<'_, '_> {
             End::Lost(output) => Ok(self.connection_lost(&location, prepared.boot.as_deref(), output)),
             End::Refused(FallbackReason::Inputs) => Ok(inputs::run_refused(self)),
             end => Ok(end),
+        }
+    }
+
+    /// Whether the call runs a Godot console, which the preflight's Godot need and [`Attempt::parity`]'s Godot rule
+    /// both read: a run's first word, or any of a warm-up's commands' first words, since a warm-up's call carries none
+    /// of its own.
+    fn godot_command(&self) -> bool {
+        match self.call.warmth {
+            Warmth::WarmUp { commands, .. } => commands.iter().any(|command| command.first().is_some_and(|word| is_godot_console(word))),
+            Warmth::Unasked | Warmth::Needs(_) => self.call.words.first().is_some_and(|word| is_godot_console(word)),
         }
     }
 
@@ -1663,8 +1673,8 @@ impl Attempt<'_, '_> {
     /// for its own SDK alone, as its own `global.json` pins it, its lines naming it; the tools are the main one's.
     ///
     /// `Ok` with the version of the builder's Godot install the run uses ([`toolchain::godot_choice`]), `None` when none
-    /// is chosen; a main repo pinning several Godot versions chooses none, and a run whose first word is a Godot console
-    /// ([`is_godot_console`]) then says why after the mismatch lines and is refused `parity`. A repo pinning no Godot
+    /// is chosen; a main repo pinning several Godot versions chooses none, and a call that runs a Godot console
+    /// ([`Attempt::godot_command`]) then says why after the mismatch lines and is refused `parity`. A repo pinning no Godot
     /// version, or taking any, chooses none too, and such a run uses the newest install the builder listed
     /// ([`toolchain::no_chosen_godot`]), warning when the repo pins none, said before the run starts and only when the
     /// run is not refused; it stays here, refused `parity`, when the builder lists no install, did not list its
@@ -1693,30 +1703,23 @@ impl Attempt<'_, '_> {
             refused = true;
         }
         let mut warning = None;
+        let godot_command = self.godot_command();
         let chosen = match toolchain::godot_choice(required.as_deref(), &prepared.tools) {
-            GodotChoice::None => {
-                match toolchain::no_chosen_godot(
-                    required.as_deref(),
-                    pins_read,
-                    self.call.words.first().is_some_and(|word| is_godot_console(word)),
-                    &prepared.tools,
-                    self.call.host,
-                ) {
-                    NoChosenGodot::None => None,
-                    NoChosenGodot::Newest { version, warning: why } => {
-                        warning = why;
-                        Some(version)
-                    }
-                    NoChosenGodot::Refuse(line) => {
-                        self.say(line);
-                        refused = true;
-                        None
-                    }
+            GodotChoice::None => match toolchain::no_chosen_godot(required.as_deref(), pins_read, godot_command, &prepared.tools, self.call.host) {
+                NoChosenGodot::None => None,
+                NoChosenGodot::Newest { version, warning: why } => {
+                    warning = why;
+                    Some(version)
                 }
-            }
+                NoChosenGodot::Refuse(line) => {
+                    self.say(line);
+                    refused = true;
+                    None
+                }
+            },
             GodotChoice::Version(version) => Some(version),
             GodotChoice::Several(list) => {
-                if self.call.words.first().is_some_and(|word| is_godot_console(word)) {
+                if godot_command {
                     self.say(toolchain::several_godot_line(&list));
                     refused = true;
                 }

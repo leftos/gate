@@ -18,11 +18,11 @@ use gate_router::warm::warmup_hash;
 use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 
-use crate::remote_client::{client_case, client_gate};
+use crate::remote_client::{client_case, client_gate, godot_csproj, godot_root, no_pin_warning};
 use crate::routing::{CONTROL_C_EXIT, HOST, names, repo, routed_case};
 use crate::support::{
-    Case, FAKE_SSH, GATE, GATE_VARIABLE, Go, Outcome, Running, STEPS_VARIABLE, build_version, calls, events, finish, git, heavy_words, junction,
-    nothing_back, shown, ssh_steps, start, wait_until, write_remote_json,
+    ANSWERING, Case, FAKE_SSH, GATE, GATE_VARIABLE, Go, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running, STEPS_VARIABLE, build_version, calls, events,
+    finish, git, heavy_words, junction, nothing_back, shown, ssh_steps, start, wait_until, write_remote_json,
 };
 
 /// The routing git limit and drain no machine reaches, so a starved gate still finds its worktree.
@@ -1057,6 +1057,92 @@ fn a_real_client_warm_up_a_box_refuses_is_recorded_refused() {
         "refused",
         "the builder ended the warm-up before its commands with status 2",
     );
+}
+
+/// The warm-up file's one command, a Godot console word that then prints the `GODOT_PATH` the builder gave it.
+const ONE_GODOT_COMMAND: &str = "commands = [[\"Godot_console.exe\", \"--version\", \"env\", \"GODOT_PATH\"]]\n";
+
+/// A real-client case whose warm-up file is [`ONE_GODOT_COMMAND`].
+fn godot_warm_client_case(name: &str) -> Case {
+    let case = warm_client_case(name);
+    warmup_file(&case, ONE_GODOT_COMMAND.as_bytes());
+    case
+}
+
+/// This PC's own `PATH` without any folder holding a `Godot_console.exe`, so a warm-up's Godot word is found only where
+/// the builder's `GATE_GODOT_ROOT` serves it.
+fn path_without_godot() -> OsString {
+    let own = std::env::var_os("PATH").expect("PATH is set");
+    let kept = std::env::split_paths(&own).filter(|folder| !folder.join("Godot_console.exe").is_file());
+    std::env::join_paths(kept).expect("the folders join into a PATH")
+}
+
+/// The case's warm client whose builder is the Godot root `root`, its preflight given the seams that answer.
+fn godot_warm_client(case: &Case, steps: &Path, root: &Path) -> Command {
+    let mut command = warm_client(case, steps, &[]);
+    command
+        .env("PATH", path_without_godot())
+        .env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING)
+        .env("GATE_GODOT_ROOT", root);
+    command
+}
+
+/// Writes the case's project file `path` pinning the Godot SDK `version`.
+fn pinned_csproj(case: &Case, path: &str, version: &str) {
+    let path = case.folder().join(path);
+    fs::create_dir_all(path.parent().expect("a project file has a folder")).expect("a project folder can be made");
+    fs::write(path, godot_csproj(version)).expect("a project file can be written");
+}
+
+/// The warm-up's log of the case, as text.
+fn warm_log(case: &Case) -> String {
+    fs::read_to_string(warm_entry(case, "log").expect("the warm-up wrote its log")).expect("the log can be read")
+}
+
+/// A warm-up whose one command is a Godot console, of a repo pinning no Godot version, runs on the builder's newest
+/// install and warns that it chose it: the log holds the install the command ran and the warning naming it.
+#[test]
+fn a_warm_up_running_a_godot_console_of_an_unpinned_repo_uses_the_newest_godot() {
+    let case = godot_warm_client_case("warm-real-godot-newest");
+    let root = godot_root(
+        &case,
+        &[("4.3.0", "4.3.0.stable.mono.official.x\n"), ("4.7.2", "4.7.2.stable.mono.official.x\n")],
+    );
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(godot_warm_client(&case, &steps, &root));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "{outcome:?}");
+    assert_eq!(record(&case).expect("a record")["state"], "warm");
+    let log = warm_log(&case);
+    let install = root.join("4.7.2").join("Godot_console.exe").display().to_string();
+    assert!(log.lines().any(|line| line == install), "the box ran the newest install: {log}");
+    let other = root.join("4.3.0").join("Godot_console.exe").display().to_string();
+    assert!(!log.lines().any(|line| line == other), "the box ran the older install too: {log}");
+    let warning = no_pin_warning("4.7.2");
+    assert!(log.lines().any(|line| line == warning), "the log holds the warning: {log}");
+}
+
+/// A warm-up whose one command is a Godot console, of a repo pinning several Godot versions, is refused `parity`
+/// before it reaches the builder: the record fails refused, and no command ran.
+#[test]
+fn a_warm_up_running_a_godot_console_of_a_repo_pinning_several_versions_is_refused() {
+    let case = godot_warm_client_case("warm-real-godot-several");
+    pinned_csproj(&case, "src/A/Game.csproj", "4.7.2");
+    pinned_csproj(&case, "src/B/Tool.csproj", "4.3.0");
+    let root = godot_root(
+        &case,
+        &[("4.3.0", "4.3.0.stable.mono.official.x\n"), ("4.7.2", "4.7.2.stable.mono.official.x\n")],
+    );
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(godot_warm_client(&case, &steps, &root));
+
+    assert_failed(&outcome, record(&case).as_ref(), "refused", "the builder refused: parity");
+    assert_eq!(calls(&steps), ["preflight"], "the preflight alone reached the builder: {outcome:?}");
+    let why = "gate: the repo pins several Godot versions (4.7.2, 4.3.0); a routed run needs one";
+    assert!(warm_log(&case).lines().any(|line| line == why), "the log holds why it was refused");
 }
 
 #[test]

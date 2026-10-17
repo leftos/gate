@@ -108,7 +108,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | tools/gate.ps1 | `launcher` (runs the checked-in launcher), `cutover` (hand-over), `checkout` (`repo_file`) | - | no |
 | tools/install.ps1 | `install`, `checkout` | - | no |
 | suite support.rs / harness.rs / main.rs / fake tools | all suite (support.rs is `Case`, the suite's `junction` helper, and the shared `Junction` helper that `routing` and `remote_client` use for another spelling of a path): CENTRAL for suite; `harness` self-tests | - | CENTRAL |
-| suite warm.rs | its own module `warm` only (`test(/^warm::/)`); it imports `client_case` and `client_gate` from `remote_client.rs` and `HOST`, `repo`, `routed_case` and `CONTROL_C_EXIT` from `routing.rs`, so a change to those reaches it | - | no |
+| suite warm.rs | its own module `warm` only (`test(/^warm::/)`); it imports `client_case` and `client_gate` from `remote_client.rs` (and `godot_csproj`, `godot_root` and `no_pin_warning` for its Godot warm-up cases) and `HOST`, `repo`, `routed_case` and `CONTROL_C_EXIT` from `routing.rs`, so a change to those reaches it | - | no |
 | suite module file `X.rs` | its own module only (`test(/^X::/)`), plus `boxside/outputs.rs`, `boxside/inputs.rs` and `boxside/warm.rs` -> `boxside::` | - | no |
 | Cargo.toml (workspace), Cargo.lock, crates/gate/Cargo.toml, rust-toolchain, .cargo/, clippy config | whole workspace | - | CENTRAL |
 | docs/, README | none | - | none (no tests) |
