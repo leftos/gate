@@ -224,12 +224,8 @@ fn a_desktop_command_is_in_the_runs_job_at_normal_priority() {
     let go = case.folder().join("go");
     let go_word = shown(&go);
     let payload = ready_payload(&case, &[FAKE_TOOL, "priority", "pid", "wait", &go_word]);
-    let seams = desktop_seams(&case, "ok", "active", HAND_OFF_MS);
-    let mut args = vec!["box"];
-    args.extend(seams.iter().map(String::as_str));
-    args.push("run");
 
-    let running = box_call(&case, &args, &request_line(&payload)).start();
+    let running = desktop_call(&case, &payload, "ok", &[]).start();
     running.wait_for_stdout("pid ");
     let members = OpenedJob::open_to_list(field(&payload, "Job"))
         .expect("the job can be opened")
@@ -285,12 +281,8 @@ fn a_desktop_command_gets_the_boxs_environment_and_working_folder() {
         ],
     );
     payload["Env"] = json!({ "NuGetAudit": "false" });
-    let seams = desktop_seams(&case, "ok", "active", HAND_OFF_MS);
-    let mut args = vec!["box"];
-    args.extend(seams.iter().map(String::as_str));
-    args.push("run");
     // The box inherits no config entries, whatever the environment this suite runs in holds.
-    let mut command = box_call(&case, &args, &request_line(&payload));
+    let mut command = desktop_call(&case, &payload, "ok", &[]);
     command.env_remove("GIT_CONFIG_COUNT");
 
     let outcome = command.finish();
@@ -345,25 +337,36 @@ fn a_refused_child_report_leaves_nothing_running() {
 
     let outcome = call.finish();
 
-    let recorded: Vec<u32> = fs::read_to_string(&record)
-        .expect("the stand-in recorded the child it created")
+    let lines = fs::read_to_string(&record).expect("the box recorded the stand-in");
+    let stand_in: u32 = lines
         .lines()
+        .find_map(|line| line.strip_prefix("stand-in "))
+        .expect("the box recorded the stand-in's pid")
+        .parse()
+        .expect("the stand-in's pid");
+    let recorded: Vec<u32> = lines
+        .lines()
+        .filter(|line| !line.starts_with("stand-in "))
         .map(|line| line.parse().expect("a recorded pid"))
         .collect();
-    let left: Vec<u32> = Win32ProcessTable
-        .snapshot()
-        .into_iter()
+    let snapshot = Win32ProcessTable.snapshot();
+    let left: Vec<u32> = snapshot
+        .iter()
         .filter(|process| recorded.contains(&process.pid))
         .filter(|process| process.command_line.as_deref().is_some_and(|line| line.contains(&mark_word)))
         .map(|process| process.pid)
         .collect();
-    for pid in &left {
+    let stand_in_left = snapshot
+        .iter()
+        .any(|process| process.pid == stand_in && process.name.eq_ignore_ascii_case("fake-desktop-helper.exe"));
+    for pid in left.iter().chain(stand_in_left.then_some(&stand_in)) {
         if let Ok(Some(process)) = StoppableProcess::open(*pid) {
             let _ = process.terminate(1);
         }
     }
     assert!(!recorded.is_empty(), "the stand-in created a child: {outcome:?}");
     assert!(left.is_empty(), "no child of the stand-in outlives the run: {left:?} {outcome:?}");
+    assert!(!stand_in_left, "the stand-in itself does not outlive the run: {stand_in} {outcome:?}");
     refused_with(
         &outcome,
         &payload,

@@ -39,8 +39,8 @@ mod token;
 mod tree;
 
 pub use adopt::{
-    EndWait, RemoteProcess, check_received_output, creation_time_of, end_process, image_path_of, is_handle_value, parent_pid_of, pid_of_process,
-    pid_of_thread, same_object, session_of, thread_is_suspended, user_of,
+    EndWait, QueryOnlyProcess, RemoteProcess, check_received_output, creation_time_of, end_process, image_path_of, is_handle_value, parent_pid_of,
+    pid_of_process, pid_of_thread, same_object, session_of, thread_is_suspended, user_of,
 };
 pub use console::{Donor, Utf8Console};
 pub use create::spawn;

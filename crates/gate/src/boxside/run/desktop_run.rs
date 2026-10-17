@@ -12,7 +12,7 @@ use std::sync::PoisonError;
 use std::time::{Duration, Instant};
 
 use gate_args::{BoxSeams, DesktopSession};
-use gate_win32::{Account, AcquireError, ConnectState, LockState, MutexGuard, PrivateMutex, PrivateName, RemoteProcess, SessionState};
+use gate_win32::{Account, AcquireError, ConnectState, LockState, MutexGuard, PrivateMutex, PrivateName, QueryOnlyProcess, SessionState};
 
 use crate::boxside::desktop::lines::{DesktopRefusal, Limits, abandoned_line, busy_timeout_line, busy_wait_line, capped_wait, session_verdict};
 use crate::boxside::payload::escaped;
@@ -272,7 +272,7 @@ fn settled(id: u32, read: io::Result<SessionState>, now: Option<u32>) -> Result<
 /// The console session the seam `state` names: the box's own session, with the box's `account` logged on to it, but
 /// nobody for `none` and another user for `other-user`, locked for `locked` and disconnected for `disconnected`.
 fn seam_session(state: DesktopSession, account: &Account) -> io::Result<SessionState> {
-    let id = gate_win32::session_of(RemoteProcess::open_to_query(std::process::id())?.handle())?;
+    let id = gate_win32::session_of(QueryOnlyProcess::open(std::process::id())?.handle())?;
     let (user, connect, lock) = match state {
         DesktopSession::Active => (account.name.as_str(), ConnectState::Active, LockState::Unlocked),
         DesktopSession::NoUser => ("", ConnectState::Active, LockState::Unlocked),

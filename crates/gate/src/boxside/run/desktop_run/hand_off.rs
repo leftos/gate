@@ -22,8 +22,8 @@ use gate_desktop::protocol::{HELPER_FRAME_LIMIT, Message, ReadError, Spawn, Writ
 use gate_desktop::version::build_version;
 use gate_desktop::{PIPE_PREFIX, TASK_PATH, arg0};
 use gate_win32::{
-    ConnectWait, EndWait, Job, OutputPipes, PipeOwner, PipeServer, RemoteProcess, Share, StartedTask, StoppableProcess, Suspended, TaskArgument,
-    TaskError, TaskStart,
+    ConnectWait, EndWait, Job, OutputPipes, PipeOwner, PipeServer, QueryOnlyProcess, RemoteProcess, Share, StartedTask, StoppableProcess, Suspended,
+    TaskArgument, TaskError, TaskStart,
 };
 use jiff::Timestamp;
 use proc_table::Win32ProcessTable;
@@ -60,6 +60,26 @@ const OUT_OF_TURN: &str = "it sent a message the box did not expect";
 
 /// Why the helper did not start when it closed the control pipe and had not ended by itself within the end limit.
 const CLOSED: &str = "it closed the control pipe";
+
+/// Why the run is refused when the program the box sends cannot be opened for its identity.
+const PROGRAM_UNREAD: &str = "the program the box sends cannot be read";
+
+/// Why the run is refused when the run's kill-on-close job cannot be created.
+const JOB_UNMADE: &str = "the command's job cannot be made";
+
+/// Why the run is refused when the box cannot read its own user, which owns the control pipe.
+const USER_UNREAD: &str = "the box's own user cannot be read";
+
+/// Why the run is refused when the helper's own file cannot be opened for its identity.
+const HELPER_FILE_UNREAD: &str = "the desktop helper's file cannot be read";
+
+/// Why the helper did not start when it ended by itself and its exit code cannot be read.
+const EXIT_CODE_UNREAD: &str = "its exit code cannot be read";
+
+/// `why`, followed by the system's `error` that caused it.
+fn with_error(why: &str, error: &io::Error) -> String {
+    format!("{why}: {error}")
+}
 
 /// The exit code a process the box ends is given: a command that never ran, as `gate_win32` ends one.
 const ENDED_UNSTARTED: u32 = 1;
@@ -147,11 +167,10 @@ enum Exchanged {
 /// said once the command is taken into the job, still suspended, and before the stop signal is looked at; a command
 /// the helper could not create is said after the marker, as a command that could not be started (127).
 pub(super) fn hand_off(here: &Here<'_, '_>, console: &mut Console) -> Result<Ran, DesktopEnd> {
-    let program = identity_of(&here.prepared.application)
-        .map_err(|error| here.machinery(format!("the program the box sends cannot be read: {error}"), console))?;
+    let program = identity_of(&here.prepared.application).map_err(|error| here.machinery(with_error(PROGRAM_UNREAD, &error), console))?;
     let job = match Job::create_kill_on_close(here.request.job) {
         Err(error) if error.kind() != io::ErrorKind::AlreadyExists => {
-            return Err(here.machinery(format!("the command's job cannot be made: {error}"), console));
+            return Err(here.machinery(with_error(JOB_UNMADE, &error), console));
         }
         made => job_made(made, here.request.job, console).map_err(DesktopEnd::Ended)?,
     };
@@ -202,7 +221,7 @@ pub(super) fn hand_off(here: &Here<'_, '_>, console: &mut Console) -> Result<Ran
 /// stand-in helper's job under the desktop seam. A refusal, or a stop, ends the run here; a helper that may have
 /// started, or one that is not the box's, has its pipe dropped and is never ended through its pid.
 fn pinned_helper(here: &Here<'_, '_>, job: &Job, console: &mut Console) -> Result<(Pinned, Option<Job>), DesktopEnd> {
-    let user = gate_win32::current_user_sid().map_err(|error| here.machinery(format!("the box's own user cannot be read: {error}"), console))?;
+    let user = gate_win32::current_user_sid().map_err(|error| here.machinery(with_error(USER_UNREAD, &error), console))?;
     let server = PipeServer::create(PIPE_PREFIX, &user, pipe_owner(here.beat.seams)).map_err(|error| {
         here.refused(
             DesktopRefusal::HelperDidNotStart(format!("the control pipe cannot be made: {error}")),
@@ -214,8 +233,7 @@ fn pinned_helper(here: &Here<'_, '_>, job: &Job, console: &mut Console) -> Resul
     };
     let image =
         helper_image(here.beat.seams).map_err(|error| here.machinery(format!("the desktop helper's path cannot be read: {error}"), console))?;
-    let image_identity =
-        identity_of(&image).map_err(|error| here.machinery(format!("the desktop helper's file cannot be read: {error}"), console))?;
+    let image_identity = identity_of(&image).map_err(|error| here.machinery(with_error(HELPER_FILE_UNREAD, &error), console))?;
     let Some(before) = crate::escaped::now() else {
         return Err(here.machinery("the system clock cannot be read".to_owned(), console));
     };
@@ -487,7 +505,7 @@ fn gone(helper: &RemoteProcess, ended: &HelperEnd) -> DesktopRefusal {
     match ended {
         HelperEnd::Exited => match helper.exit_code() {
             Ok(code) => DesktopRefusal::HelperFailed(code),
-            Err(error) => DesktopRefusal::HelperDidNotStart(format!("its exit code cannot be read: {error}")),
+            Err(error) => DesktopRefusal::HelperDidNotStart(with_error(EXIT_CODE_UNREAD, &error)),
         },
         HelperEnd::Ended | HelperEnd::NotEnded(_) => DesktopRefusal::HelperDidNotStart(CLOSED.to_owned()),
     }
@@ -536,15 +554,28 @@ impl EndingHelper for Watched<'_> {
     }
 }
 
+/// The most of an end limit kept back from the wait for the helper to end by itself, for the wait that sees the box's
+/// end of it take effect: an end takes effect some time after the call that asks for it, so a wait of nothing after it
+/// almost never sees it.
+const END_SLICE: Duration = Duration::from_millis(500);
+
+/// The part of `limit` kept for the wait that sees the box's end take effect: [`END_SLICE`], or a quarter of `limit`
+/// when that is less.
+fn end_slice(limit: Duration) -> Duration {
+    END_SLICE.min(limit / 4)
+}
+
 /// Brings `helper` to its end within `limit` in total, on the clock `now`: when `wait_first`, a wait for it to end by
-/// itself, which a stop ends at once, then, if it still runs or the wait failed, its end by the box, given only what is
-/// left of the limit. A failed wait is not said: the end that follows it is.
+/// itself, which a stop ends at once, given the limit less [`end_slice`], then, if it still runs or the wait failed,
+/// its end by the box, given what is left of the limit and never less than that slice. A failed wait is not said: the
+/// end that follows it is.
 fn end_within(helper: &impl EndingHelper, limit: Duration, now: impl Fn() -> Instant, wait_first: bool) -> HelperEnd {
     let deadline = now() + limit;
-    if wait_first && matches!(helper.wait_for_end(deadline.saturating_duration_since(now())), Ok(EndWait::Ended)) {
+    let slice = end_slice(limit);
+    if wait_first && matches!(helper.wait_for_end(limit.saturating_sub(slice)), Ok(EndWait::Ended)) {
         return HelperEnd::Exited;
     }
-    match helper.end(deadline.saturating_duration_since(now())) {
+    match helper.end(deadline.saturating_duration_since(now()).max(slice)) {
         Ok(true) => HelperEnd::Ended,
         Ok(false) => HelperEnd::NotEnded(io::Error::other("it had not ended in time")),
         Err(error) => HelperEnd::NotEnded(error),
@@ -586,7 +617,7 @@ fn sweep(here: &Here<'_, '_>, helper: u32, created: Timestamp, console: &mut Con
         }
     };
     let session_of = |pid| {
-        RemoteProcess::open_to_query(pid)
+        QueryOnlyProcess::open(pid)
             .ok()
             .and_then(|process| gate_win32::session_of(process.handle()).ok())
     };
@@ -701,9 +732,9 @@ fn wide(path: &Path) -> Vec<u16> {
 #[cfg(feature = "test-seams")]
 const STAND_IN: &str = "fake-desktop-helper.exe";
 
-/// The stand-in helper's seam that, set to a file's path, has it record each child it creates there; a run whose
-/// stand-in records its children starts it in no job of the box's, so a child the box failed to end outlives the run
-/// and the case that reads the record sees it.
+/// The stand-in helper's seam that, set to a file's path, has it record each child it creates there, and the box record
+/// the stand-in's own pid first; a run whose stand-in records its children starts it in no job of the box's, so a
+/// stand-in or a child the box failed to end outlives the run and the case that reads the record sees it.
 #[cfg(feature = "test-seams")]
 const RECORD_VARIABLE: &str = "GATE_DESKTOP_TEST_RECORD";
 
@@ -818,7 +849,8 @@ fn stand_in(fault: &str, argument: &TaskArgument, cap_ms: Option<u64>) -> io::Re
         priority: Some(gate_win32::PriorityClass::BelowNormal),
     };
     let suspended = launch.start_suspended().map_err(|error| io::Error::other(error.to_string()))?;
-    let (running, job) = if std::env::var_os(RECORD_VARIABLE).is_some() {
+    let record = std::env::var_os(RECORD_VARIABLE);
+    let (running, job) = if record.is_some() {
         (suspended.resume(), None)
     } else {
         let job = Job::anonymous_kill_on_close()?;
@@ -826,8 +858,25 @@ fn stand_in(fault: &str, argument: &TaskArgument, cap_ms: Option<u64>) -> io::Re
     };
     let running = running.map_err(|error| io::Error::other(error.to_string()))?;
     let pid = std::num::NonZeroU32::new(running.pid()).ok_or_else(|| io::Error::other("the stand-in helper has no pid"))?;
+    if let Some(record) = record {
+        record_stand_in(Path::new(&record), pid.get())?;
+    }
     Ok((pid, job))
 }
+
+/// Adds the stand-in helper's own `pid` to the record at `record` as `stand-in <pid>`: before any child it records,
+/// as it creates none until the box sends it the command.
+#[cfg(feature = "test-seams")]
+fn record_stand_in(record: &Path, pid: u32) -> io::Result<()> {
+    use std::io::Write;
+
+    let mut file = OpenOptions::new().create(true).append(true).open(record)?;
+    writeln!(file, "{STAND_IN_RECORD}{pid}")
+}
+
+/// The start of the record's line holding the stand-in helper's own pid.
+#[cfg(feature = "test-seams")]
+const STAND_IN_RECORD: &str = "stand-in ";
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a case whose files cannot be made must fail loudly")]
@@ -835,16 +884,31 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::fs;
     use std::io;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     use gate_win32::EndWait;
 
+    use crate::boxside::desktop::lines::DesktopRefusal;
+
     use super::{EndingHelper, HelperEnd, end_within, helper_not_ended, identity_of, unlisted_line};
+
+    /// A case's own temp folder, removed with everything in it when the case ends, also when it fails.
+    struct Removed(PathBuf);
+
+    impl Drop for Removed {
+        fn drop(&mut self) {
+            // Nothing here may fail a case that is already ending; a folder left behind is only temp clutter.
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn a_file_reached_through_a_junction_has_its_targets_identity() {
         let folder = crate::test_support::temp_dir().join(format!("gate-identity-{}", std::process::id()));
         let _ = fs::remove_dir_all(&folder);
+        let removed = Removed(folder);
+        let folder = &removed.0;
         let real = folder.join("real");
         fs::create_dir_all(&real).expect("the target folder is made");
         fs::write(real.join("tool.exe"), "tool").expect("the file is made");
@@ -920,6 +984,10 @@ mod tests {
             let bounds = helper.bounds.borrow();
             assert_eq!(bounds.len(), 2, "one wait, then one end: {bounds:?}");
             assert!(bounds.iter().sum::<Duration>() <= limit, "within one end limit in all: {bounds:?}");
+            assert!(
+                bounds[1] > Duration::ZERO,
+                "the end keeps a part of the limit for its own wait: {bounds:?}"
+            );
             assert!(matches!(ended, HelperEnd::NotEnded(_)), "{ended:?}");
         }
 
@@ -961,6 +1029,26 @@ mod tests {
             pipe,
             Some(format!("{start} the control pipe failed: broken")),
             "a pipe failure is a refusal"
+        );
+    }
+
+    #[test]
+    fn each_machinery_why_of_the_hand_off_has_its_line() {
+        let refused = "gate: not routed: the builder has no desktop session:";
+        let denied = io::Error::other("access denied");
+        let whys = [
+            (super::PROGRAM_UNREAD, "the program the box sends cannot be read"),
+            (super::JOB_UNMADE, "the command's job cannot be made"),
+            (super::HELPER_FILE_UNREAD, "the desktop helper's file cannot be read"),
+            (super::USER_UNREAD, "the box's own user cannot be read"),
+        ];
+        for (why, said) in whys {
+            let line = DesktopRefusal::Machinery(super::with_error(why, &denied)).line();
+            assert_eq!(line, format!("{refused} {said}: access denied"));
+        }
+        assert_eq!(
+            DesktopRefusal::HelperDidNotStart(super::with_error(super::EXIT_CODE_UNREAD, &denied)).line(),
+            format!("{refused} the desktop helper did not start: its exit code cannot be read: access denied")
         );
     }
 

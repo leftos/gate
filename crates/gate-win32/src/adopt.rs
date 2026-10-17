@@ -33,6 +33,32 @@ use crate::{own_handle, start_of, wait_millis};
 /// The longest image path read, in UTF-16 units: the longest path Windows has.
 const LONGEST_PATH: usize = 32_768;
 
+/// Another process, opened with `PROCESS_QUERY_LIMITED_INFORMATION` alone, for a caller that only reads it, such as its
+/// session ([`session_of`]): it cannot copy handles, be waited on or be ended.
+pub struct QueryOnlyProcess {
+    handle: OwnedHandle,
+}
+
+impl QueryOnlyProcess {
+    /// Opens the process `pid` to read it.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the process cannot be opened: `ERROR_INVALID_PARAMETER` when no process has the pid.
+    pub fn open(pid: u32) -> io::Result<QueryOnlyProcess> {
+        // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
+        let handle = unsafe { own_handle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)) }?;
+        Ok(QueryOnlyProcess { handle })
+    }
+
+    /// The process's own handle, for a query.
+    #[must_use]
+    pub fn handle(&self) -> BorrowedHandle<'_> {
+        // SAFETY: the handle is open for as long as `self` lives, which the borrow cannot outlive.
+        unsafe { BorrowedHandle::borrow_raw(self.handle.raw()) }
+    }
+}
+
 /// Another process, opened to copy handles into and out of its handle table (`PROCESS_DUP_HANDLE`), to query it, to
 /// wait for it and to end it.
 pub struct RemoteProcess {
@@ -128,18 +154,6 @@ impl RemoteProcess {
         unsafe { BorrowedHandle::borrow_raw(self.handle.raw()) }
     }
 
-    /// Opens the process `pid` with `PROCESS_QUERY_LIMITED_INFORMATION` alone, for a caller that only reads it, such as
-    /// its session ([`session_of`]); such a handle cannot copy handles, be waited on or end the process.
-    ///
-    /// # Errors
-    ///
-    /// The system's error when the process cannot be opened: `ERROR_INVALID_PARAMETER` when no process has the pid.
-    pub fn open_to_query(pid: u32) -> io::Result<RemoteProcess> {
-        // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
-        let handle = unsafe { own_handle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)) }?;
-        Ok(RemoteProcess { handle })
-    }
-
     /// Waits at most `timeout` for the process to end, or for a handle of `wake` to be signalled, whichever comes first;
     /// an end that comes at the same moment as a wake wins.
     ///
@@ -166,21 +180,7 @@ impl RemoteProcess {
         }
     }
 
-    /// Waits at most `timeout` for the process to end: true once it has ended, false while it still runs.
-    ///
-    /// # Errors
-    ///
-    /// The system's error when the wait fails.
-    pub fn wait(&self, timeout: Duration) -> io::Result<bool> {
-        // SAFETY: the handle is open for the whole call, with `SYNCHRONIZE`; the wait is bounded below `INFINITE`.
-        match unsafe { WaitForSingleObject(self.handle.raw(), wait_millis(timeout)) } {
-            WAIT_OBJECT_0 => Ok(true),
-            WAIT_TIMEOUT => Ok(false),
-            _ => Err(io::Error::last_os_error()),
-        }
-    }
-
-    /// The code the process ended with, meaningful once [`RemoteProcess::wait`] has found it ended: a process that still
+    /// The code the process ended with, meaningful once [`RemoteProcess::wait_or_woken`] has found it ended: a process that still
     /// runs reports `STILL_ACTIVE` (259).
     ///
     /// # Errors
@@ -527,7 +527,7 @@ pub(crate) mod tests {
     };
 
     use super::{
-        RemoteProcess, check_received_output, creation_time_of, end_process, image_path_of, is_handle_value, parent_pid_of, pid_of_process,
+        EndWait, RemoteProcess, check_received_output, creation_time_of, end_process, image_path_of, is_handle_value, parent_pid_of, pid_of_process,
         pid_of_thread, session_of, thread_is_suspended, user_of,
     };
     use crate::{EnvironmentBlock, Job, Launch, LaunchError, LaunchOutput, StoppableProcess, Suspended, system_directory};
@@ -1048,13 +1048,21 @@ pub(crate) mod tests {
         let child = suspended("exit 0");
         let remote = RemoteProcess::open(child.pid()).expect("the child opens");
 
-        assert!(!remote.wait(Duration::ZERO).expect("the wait succeeds"), "a suspended child still runs");
+        assert_eq!(
+            remote.wait_or_woken(Duration::ZERO, &[]).expect("the wait succeeds"),
+            EndWait::Running,
+            "a suspended child still runs"
+        );
         assert!(
             remote.terminate(7, HANG_GUARD).expect("the child is ended"),
             "the child ended within the bound"
         );
 
-        assert!(remote.wait(Duration::ZERO).expect("the wait succeeds"), "the ended child is signalled");
+        assert_eq!(
+            remote.wait_or_woken(Duration::ZERO, &[]).expect("the wait succeeds"),
+            EndWait::Ended,
+            "the ended child is signalled"
+        );
         assert_eq!(remote.exit_code().expect("the exit code is read"), 7, "ended with the code given");
         assert!(
             remote.terminate(9, HANG_GUARD).expect("a child that has ended already is no error"),

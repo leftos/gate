@@ -273,8 +273,8 @@ pub(crate) fn verify_helper(facts: &impl HelperFacts, expected: &ExpectedHelper<
 }
 
 /// The processes a failed hand-off leaves to end, each with the creation time its snapshot holds: the pids of
-/// `processes` whose parent is the helper, whose creation time is known and not earlier than the helper's, and whose session
-/// `session_of` reads as the one the builder's desktop runs in.
+/// `processes` whose parent is the helper, whose creation time is known and not earlier than the helper's, and
+/// whose session `session_of` reads as the one the builder's desktop runs in.
 ///
 /// A process whose creation time or session cannot be read is left alone: nothing the box cannot prove the helper's is
 /// ever ended. A snapshot that holds a process at the helper's own pid whose creation time is known and is not the

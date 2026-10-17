@@ -19,13 +19,15 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, GENERIC_READ, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+    ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, GENERIC_READ, INVALID_HANDLE_VALUE,
+    OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
-    FILE_FULL_DIR_INFO, FILE_GENERIC_READ, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_REMOTE_PROTOCOL_INFO, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfoEx, FileFullDirectoryInfo, FileFullDirectoryRestartInfo, FileIdInfo,
-    FileRemoteProtocolInfo, GetFileInformationByHandleEx, MoveFileExW, ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle,
+    BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    FILE_DISPOSITION_INFO_EX, FILE_FULL_DIR_INFO, FILE_GENERIC_READ, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    FILE_REMOTE_PROTOCOL_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfoEx, FileFullDirectoryInfo,
+    FileFullDirectoryRestartInfo, FileIdInfo, FileRemoteProtocolInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, MoveFileExW,
+    ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -503,10 +505,47 @@ pub fn same_file(first: &File, second: &File) -> io::Result<bool> {
 /// The volume serial number and the 128-bit file id of the open file or folder `file`: two handles give the same pair
 /// only when they are of one file.
 ///
+/// The id is the 128-bit one `FileIdInfo` gives, which a Dev Drive and other `ReFS` volumes need. A file system that does not serve
+/// that class (FAT and exFAT) gives its 32-bit volume serial number and 64-bit file index instead, each widened into
+/// the same pair. Which of the two a file gives is the file system's, so two reads of one volume's files always take
+/// the same one.
+///
 /// # Errors
 ///
-/// The system's error when the id cannot be read, as on a file system that keeps none.
+/// The system's error when neither can be read.
 pub fn file_id(file: &File) -> io::Result<(u64, [u8; 16])> {
+    identity_by_either(id_info(file), || index_info(file))
+}
+
+/// The pair [`file_id`] gives for a file whose `FileIdInfo` read gave `by_id`, its index read by `by_index` only when
+/// the file system does not serve that class ([`serves_no_id_info`]).
+fn identity_by_either(
+    by_id: io::Result<FILE_ID_INFO>,
+    by_index: impl FnOnce() -> io::Result<BY_HANDLE_FILE_INFORMATION>,
+) -> io::Result<(u64, [u8; 16])> {
+    match by_id {
+        Ok(information) => Ok((information.VolumeSerialNumber, information.FileId.Identifier)),
+        Err(error) if serves_no_id_info(&error) => {
+            let information = by_index()?;
+            let index = (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+            let mut file = [0_u8; 16];
+            file[..8].copy_from_slice(&index.to_le_bytes());
+            Ok((u64::from(information.dwVolumeSerialNumber), file))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether a `FileIdInfo` read failed with `error` because the file system does not serve that class:
+/// `ERROR_INVALID_PARAMETER`, `ERROR_NOT_SUPPORTED` or `ERROR_INVALID_FUNCTION`.
+fn serves_no_id_info(error: &io::Error) -> bool {
+    [ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_INVALID_FUNCTION]
+        .iter()
+        .any(|unserved| error.raw_os_error() == Some(unserved.cast_signed()))
+}
+
+/// The `FileIdInfo` class of the open file `file`.
+fn id_info(file: &File) -> io::Result<FILE_ID_INFO> {
     let mut information = FILE_ID_INFO::default();
     let size = u32::try_from(size_of::<FILE_ID_INFO>()).map_err(io::Error::other)?;
     // SAFETY: the handle `file` owns is open for the whole call, and `information` is a writable `FILE_ID_INFO` of
@@ -515,7 +554,19 @@ pub fn file_id(file: &File) -> io::Result<(u64, [u8; 16])> {
     if read == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((information.VolumeSerialNumber, information.FileId.Identifier))
+    Ok(information)
+}
+
+/// The volume serial number and file index of the open file `file`, as `GetFileInformationByHandle` gives them.
+fn index_info(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the handle `file` owns is open for the whole call, and `information` is a writable
+    // `BY_HANDLE_FILE_INFORMATION`, the buffer the call fills.
+    let read = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut information) };
+    if read == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(information)
 }
 
 /// Whether the open file or folder `file` is on a network volume: whether the system gives its remote protocol
@@ -625,10 +676,57 @@ mod tests {
         DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
     };
 
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED};
+    use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, FILE_ID_128, FILE_ID_INFO};
+
     use super::{
-        Make, Share, delete_opened, delete_tree_opened, move_no_replace, names_beneath, open_beneath, open_beneath_as, rename_beneath,
-        rename_beneath_no_replace, same_file, verbatim,
+        Make, Share, delete_opened, delete_tree_opened, identity_by_either, move_no_replace, names_beneath, open_beneath, open_beneath_as,
+        rename_beneath, rename_beneath_no_replace, same_file, verbatim,
     };
+
+    /// A read of a file's index that a case expects never to be asked for.
+    fn unasked() -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+        Err(io::Error::other("the file index was read"))
+    }
+
+    #[test]
+    fn a_file_system_without_file_id_info_gives_its_serial_and_file_index() {
+        let by_index = BY_HANDLE_FILE_INFORMATION {
+            dwVolumeSerialNumber: 0x1234_5678,
+            nFileIndexHigh: 0x0102_0304,
+            nFileIndexLow: 0x0506_0708,
+            ..BY_HANDLE_FILE_INFORMATION::default()
+        };
+        let mut index = [0_u8; 16];
+        index[..8].copy_from_slice(&0x0102_0304_0506_0708_u64.to_le_bytes());
+        for unserved in [ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_INVALID_FUNCTION] {
+            let by_id = Err(io::Error::from_raw_os_error(unserved.cast_signed()));
+
+            let identity = identity_by_either(by_id, || Ok(by_index)).expect("the file index is read");
+
+            assert_eq!(identity, (0x1234_5678, index), "the serial and the index, widened, for error {unserved}");
+        }
+    }
+
+    #[test]
+    fn file_id_info_is_used_when_the_file_system_gives_it() {
+        let by_id = FILE_ID_INFO {
+            VolumeSerialNumber: 0x0abc_def0_1234_5678,
+            FileId: FILE_ID_128 { Identifier: [7; 16] },
+        };
+
+        assert_eq!(
+            identity_by_either(Ok(by_id), unasked).expect("the id is read"),
+            (0x0abc_def0_1234_5678, [7; 16])
+        );
+        let denied = identity_by_either(Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED.cast_signed())), unasked)
+            .expect_err("a read that failed for another reason fails");
+        assert_eq!(
+            denied.raw_os_error(),
+            Some(ERROR_ACCESS_DENIED.cast_signed()),
+            "its own error, the index unread: {denied}"
+        );
+    }
 
     /// Makes a junction at `link` leading to the folder `target`.
     #[expect(clippy::disallowed_methods, reason = "a test's one mklink takes no spawn lock")]
