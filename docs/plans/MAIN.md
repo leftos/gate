@@ -9,10 +9,12 @@
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [/] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
+- [ ] GATE-399 Run the suite's desktop cases when the gate repo's tests are routed to a builder — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [!] GATE-375 Install Godot side by side on the builders and trial each Godot command family — High · Remote
 - [!] GATE-371 Route ops-tower's Playwright tests: the fixture server and browsers on the builder — High · Remote
-- [/] GATE-387 Find why Git's sh.exe fails with an MSYS add_item error on the builder under a routed full suite — High · Remote
+- [ ] GATE-398 Find why a run's job end says a process still ran after 5 passes under a loaded builder — High · Remote
+- [ ] GATE-400 Find why godot-mcp's routed integration tests fail on the builder: the C# bridge never connects and prep and scene time out — High · Remote
 
 ## Remote
 
@@ -103,6 +105,10 @@
 - [ ] GATE-386 Re-read docs/design/gate-box-critical.md against ops-tower's swept pre-push hook
 - [ ] GATE-389 Say why a misnamed Godot install is left out even when another install lists
 - [ ] GATE-390 Let a stop wake the desktop helper's end wait
+- [ ] GATE-395 Say a desktop sweep target whose parent or creation time cannot be read, instead of skipping it
+- [ ] GATE-396 Read a repo's csproj Godot pins in gate check, as a routed run does
+- [ ] GATE-397 Give gate check an install hint for a missing pinned Godot
+- [ ] GATE-401 Close the test-rig gaps the desktop and session-0 box cases share
 
 ## Cutover sweep
 
@@ -166,3 +172,5 @@
 - [ ] GATE-382 Open the PC state root's folders without following links before reading, writing or deleting a file in them
 - [ ] GATE-388 Write a covered gate's marker before journaling its covered line
 - [ ] GATE-391 Remove the reserved-name files the walk tests make, so worktrees can be deleted
+- [ ] GATE-393 Refuse an MSYS keeper or a box git.exe from an install the restricted token can write
+- [ ] GATE-394 Keep the suite's box cases independent of whether this PC's Git is an admin install
