@@ -1,0 +1,33 @@
+# Routing a repo
+
+How a caller repo's heavy gates come to run on a builder: what goes in `remote.json`, how a routing trial runs, and what stays on the PC. The format of `remote.json` and the router's rules are in [design.md](design.md#remotejson); this page is the procedure.
+
+## Which repos and which commands
+
+Every repo that runs heavy gates is in scope, and every heavy command family in the gate journal ends in one of three states:
+
+- it routes;
+- it is booked with what blocks it (a GATE issue, High when it blocks the repo's adoption);
+- it stays local for a stated reason: it needs this PC's hardware, desktop or a local-only path (a WSL distro on `/mnt/x`, an output installed here), a `git commit` or `git push` whose hooks need this checkout, or a run too short to repay a push (a few seconds).
+
+Coverage is judged from the journal's history of gated commands per repo, not from the commands guessed to matter. Light-slot runs never route (the router considers heavy runs only), so a repo whose gates are all light, short checks stays local without an entry.
+
+## Adding a repo
+
+1. Read the repo's own gate commands (its CLAUDE.md, nextup profile, justfile or package scripts) and the tools each needs: toolchains and their pins (`.gate/toolchain.toml`, `rust-toolchain.toml`, `global.json`), shells and utilities, package managers.
+2. Set the builder up. A session installs what a routed repo needs, at the repo's pinned version, and changes the builder's configuration (PATH, ACLs, environment) directly over ssh. After each change it sends claude-config a repo inbox note with what changed and the exact commands, so `tools/build-box/install-toolchains.ps1` follows and a new builder gets the same setup. Run `gate check --builder` from the repo.
+3. Back up `remote.json` beside it (`remote.json.bak-<UTC stamp>`), then add the repo's patterns under `repos.<repo>`, plus `outputs`, `inputs`, `siblings` or `warmup` consent where the repo needs them. Re-read the file just before writing and change only the repo's own keys: other sessions edit it too.
+4. Run one routing trial (below). The repo counts as routed once its trial passes.
+
+## The routing trial
+
+A trial runs the repo's full command routed, once, and assumes a local run passes: it never runs the full command locally to compare. If the routed run fails, only the failing steps or tests are rerun locally, with the narrowest command that reproduces them:
+
+- **A step that fails locally too** is the repo's own failure. The pattern stays routed, since routed and local agree, and the failure goes to the repo as an inbox note.
+- **A step that passes locally but fails routed** is a routing failure. It is fixed in the builder's setup and that step alone is retried routed, once. If it still fails, the repo's patterns come back out of `remote.json` and the failure is booked as a GATE issue.
+
+A first routed run in a new work folder is cold, so give the trial a generous `--timeout`; the repo's ordinary routed runs keep their usual ceilings. Run one heavy trial at a time.
+
+## A repo whose short runs a cold folder would push past their ceiling
+
+A repo whose short routed runs (a filtered test of a minute) would meet a cold builder work folder declares warm-up builds in a tracked `.gate/warmup.toml`, and `remote.json` consents to it under `warmup` ([design.md, gate warm](design.md#gate-warm)). Until the folder is warm, a matched run stays here and starts the warm-up in the background; the runs after it route.

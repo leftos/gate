@@ -19,6 +19,7 @@ linear: gate
 
   Everything else waits, however high it sits in the project order; a finding off the path gets an **add**, not a fix. The path is kept in Linear's priorities: a step that lands moves the next one up.
 - The port is the owner's top priority. claude-config's CC-212 is its umbrella; the PowerShell gate in `~/.claude/tools/gate/` is frozen to bug fixes, which stay claude-config's.
+- Routing a repo (its builder setup, `remote.json` entry, routing trial and what stays local) follows [docs/routing-a-repo.md](../../../docs/routing-a-repo.md); a trial runs the full command routed once and reruns locally only what failed.
 - An issue that blocks a caller repo's adoption of remote gates, reported by another repo's agents (a repo inbox request, a trial failure), is created High, or raised to High, without asking the owner: this is the owner's standing ask for that class, which the focus fence then admits.
 - A steer or a finding the item does not fix gets an **add**, in the project whose files it shares, else in `Backlog`. A change another repo needs (claude-config's launcher, docs or skills; ops-tower's use of `gate-state`) goes as a repo inbox request.
 - Tracker: **triage** as plan-operations says.
