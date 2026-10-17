@@ -4,16 +4,17 @@
 
 ## Do first
 
-- [ ] GATE-426 Stop asserting that GetSystemTimes only rises in the gate-win32 times test — Urgent · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
-- [/] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
+- [ ] GATE-427 Route herdr-gpui's Credential Manager tests and godot-mcp's GL tests over the desktop route — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
-- [!] GATE-371 Route ops-tower's Playwright tests: the fixture server and browsers on the builder — High · Remote
-- [!] GATE-417 Route collie's vitest and bun test gates to the builder — High · Remote
+- [/] GATE-425 Install the builder's gate.exe and desktop helper in an admin-owned folder — High · Remote
 
 ## Remote
 
+- [ ] GATE-432 Harden the push script's registration run and helper rollback
+- [ ] GATE-429 Measure which Task Scheduler call frees its string argument, and quote the desktop task's command
+- [ ] GATE-428 Report a desktop task whose instance already ended as started with no process, not unknown
 - [ ] GATE-332 Send each repo's inputs in a routed sibling pair
 - [ ] GATE-273 Read a dotnet tools manifest at the repo root as a toolchain pin
 - [ ] GATE-109 Remote: carry every verb of a routed run over one ssh connection (gate box serve)
@@ -33,7 +34,6 @@
 - [ ] GATE-267 Box: check every payload's Bare path and read the preflight's .git without following links
 - [ ] GATE-270 gate check --builder: hold the worktree's lock, and bound the box preflight's git steps
 - [ ] GATE-271 Box: harden the work folder against an earlier run's leftovers (back ref, commondir, index copy, final path, origin)
-- [ ] GATE-272 gate check --builder: a silent ssh 255, and the siblings file's problems
 - [ ] GATE-275 Router: judge MSBuild property values from each project's folder, not only the gate's
 - [ ] GATE-276 Router: spelling edges of the outside check (an outward link, case folding, a separate /-rooted argument)
 - [ ] GATE-277 Router: a gate folder reached through a junction is judged by its spelling
@@ -107,7 +107,9 @@
 - [ ] GATE-422 Re-read docs/design/gate-box-critical.md against the 16 commits on its named files since 2026-10-13
 - [ ] GATE-423 Make the desktop hand-off suite cases hold on a busy PC
 - [ ] GATE-424 Report .gate/desktop.toml and the desktop consent in gate check
-- [ ] GATE-425 Install the builder's gate.exe and desktop helper in an admin-owned folder
+- [ ] GATE-430 Check the unverified review findings on the bun install and desktop routing code
+- [ ] GATE-431 Warn when a routed run drops a variable the repo declares its commands read
+- [ ] GATE-435 Check whether the SourceRevisionId stamp makes a routed script's builds and direct dotnet builds rebuild each other
 
 ## Cutover sweep
 
@@ -179,3 +181,5 @@
 - [ ] GATE-418 Let tools/gate.ps1 run a worktree's command (-Cd)
 - [ ] GATE-419 Test that a detached warm-up starts with no console window
 - [ ] GATE-420 Say why when install cannot read the installed gate.exe
+- [ ] GATE-433 Stop the test suite leaving gate-* scratch folders in TEMP
+- [ ] GATE-434 Give the cli suite's plain-run cases a ceiling a busy machine cannot cross
