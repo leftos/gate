@@ -9,6 +9,7 @@ mod forward;
 mod heartbeat;
 mod inflight;
 mod inputs;
+mod msys;
 pub(crate) mod outputs;
 mod packages;
 pub(crate) mod payload;

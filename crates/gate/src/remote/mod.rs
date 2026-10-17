@@ -24,7 +24,9 @@ use crate::durations::Usual;
 
 #[cfg(feature = "test-seams")]
 pub(crate) use client::local_transport;
-pub(crate) use client::{CREATED, NOT_RECOGNIZED, USAGE as BOX_USAGE, local_sdk_listing, other_build, outside_worktree, sdks_of, their_version};
+pub(crate) use client::{
+    CREATED, NOT_RECOGNIZED, USAGE as BOX_USAGE, Warm, local_sdk_listing, other_build, outside_worktree, sdks_of, their_version, warm_of,
+};
 pub(crate) use retry::SSH_FAILED;
 
 pub(crate) use carried::{Sibling, carried};

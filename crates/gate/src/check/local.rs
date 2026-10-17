@@ -1,24 +1,30 @@
 //! The check of this PC: the worktree root the gate's working folder is in, the repo's `.gate/toolchain.toml` and
 //! `.gate/siblings.toml` read from disk through the guarded `.gate` read routing uses ([`route::read_gate_file`]), so
 //! an uncommitted edit counts, the root `global.json`'s SDK pin, the manifest's tools probed as a builder probes them
-//! ([`probe::probe`]) while this PC's SDK list is read, both with the worktree's own folders dropped from `PATH`, and
-//! each sibling looked for by routing's rule. It runs only version commands and installs nothing.
+//! ([`probe::probe`]) while this PC's SDK list is read, both with the worktree's own folders dropped from `PATH`, each
+//! sibling looked for by routing's rule, and the warm-up: `.gate/warmup.toml`, `remote.json`'s consent and the work
+//! folder's warm-up record, judged as the route judges it. It runs only version commands and installs nothing.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use gate_args::{CheckRequest, CheckSeams};
-use gate_router::{Place, SiblingFolder, repo_name, sibling_root};
+use gate_router::warm::{FileRead, Judgement, Record, RecordRead, RecordState, Situation, judge, lock_problem_text, record_problem_text};
+use gate_router::{Place, SiblingFolder, repo_name, sibling_root, work_folder_key};
+use gate_state::v1;
 
 use crate::answer::FAILED_STATUS;
 use crate::boxside::probe;
-use crate::check::report::{self, Checked, Found, Problem, Sdk, Sibling, Tool};
+use crate::check::report::{self, Checked, Found, Problem, Sdk, Sibling, Tool, Warmup};
 use crate::console::Console;
 use crate::environment::Variables;
-use crate::remote::toolchain::{self, Manifest, Reported, ToolNeed};
+use crate::remote::toolchain::{self, Manifest, Pin, Reported, ToolNeed};
 use crate::remote::{git, local_sdk_listing, outside_worktree, parity, siblings};
+use crate::resolve::{self, Environment};
 use crate::route::{self, PLACE_ARGS, read_place};
+use crate::warm;
+use gate_desktop::version::build_version;
 
 /// The manifest's name in `.gate`.
 const TOOLCHAIN: &str = "toolchain.toml";
@@ -70,6 +76,9 @@ pub(super) struct Declared {
     pub declares_toolchain: bool,
     /// The manifest as it reads, empty when there is none or it cannot be read; its problems are in `problems`.
     pub manifest: Manifest,
+    /// The exact Godot versions the manifest requires, as [`toolchain::godot_required`] reads them: empty for any
+    /// version, `None` when it names no godot.
+    pub godot: Option<Vec<Pin>>,
     pub pin: Option<parity::Pin>,
     pub problems: Vec<Problem>,
     /// Whether the manifest is there but cannot be read whole.
@@ -114,6 +123,7 @@ pub(super) fn declared(root: &Path) -> Declared {
         file: report::TOOLCHAIN,
         text,
     }));
+    let godot = toolchain::godot_required(Some(&Ok(manifest.clone())), &[]);
     let (pin, pin_problem) = read_pin(root);
     let pin_unreadable = pin_problem.is_some();
     if let Some(text) = pin_problem {
@@ -125,6 +135,7 @@ pub(super) fn declared(root: &Path) -> Declared {
     Declared {
         declares_toolchain,
         manifest,
+        godot,
         pin,
         problems,
         toolchain_unreadable,
@@ -160,27 +171,202 @@ fn checked(place: &Place, limit: Duration) -> Checked {
             .unwrap_or_else(|panic| Some(Sdk::Skipped(format!("cannot read this PC's SDK list: {}", probe::panic_reason(&*panic)))));
         (tools, sdk)
     });
-    let (allowed, consent_problem) = match allowed_siblings(&repo_name(&place.checkout)) {
+    let repo = repo_name(&place.checkout);
+    let (allowed, consent_problem) = match allowed_siblings(&repo) {
         None => (None, None),
         Some(Ok(names)) => (Some(names), None),
         Some(Err(problem)) => (Some(Vec::new()), Some(problem)),
     };
     let (siblings, siblings_unreadable) = read_siblings(&place.root, allowed.as_deref(), &mut declared.problems);
     let consent_problem = consent_problem.filter(|_| !siblings.is_empty());
+    let (warmup, _) = warmup(&place.root, WarmSources::from_process(&repo), None, &mut declared.problems);
     Checked {
-        repo: repo_name(&place.checkout),
+        repo,
         root: place.root.clone(),
         declares_toolchain: declared.declares_toolchain,
         unreadable: declared.unreadable(siblings_unreadable),
         problems: declared.problems,
         tools,
+        godot: declared.godot,
         sdk,
         workloads: declared.manifest.workloads,
         consent_problem,
         siblings,
         created: Vec::new(),
         siblings_skipped: false,
+        warmup,
     }
+}
+
+/// How `remote.json` answers the repo's warm-up consent.
+#[derive(Debug)]
+pub(super) enum Consent {
+    /// It consents, and routes the repo's runs to `host`.
+    Given { host: String },
+    /// No routing file that can be used, one whose `repos` does not list the repo, or one whose `warmup` does not
+    /// name it.
+    Refused,
+    /// The repo is listed, but the `warmup` value cannot be used, for this reason.
+    Problem(String),
+}
+
+/// What the warm-up's items are judged from besides the worktree: `remote.json`'s consent, and the state root that
+/// holds the work folder's record and lock, or why it cannot be found.
+pub(super) struct WarmSources {
+    pub consent: Consent,
+    pub state: Result<PathBuf, String>,
+}
+
+impl WarmSources {
+    /// The sources of `repo` on this PC: its routing file's consent, and the state root found with no `--state-dir`
+    /// (`GATE_STATE_DIR`, then `%LOCALAPPDATA%\gate\v1`).
+    pub(super) fn from_process(repo: &str) -> WarmSources {
+        let state = resolve::root(None, &Environment::from_process())
+            .map(|state| state.path)
+            .map_err(|why| why.strip_prefix("gate: ").map_or_else(|| why.clone(), str::to_owned));
+        WarmSources {
+            consent: warmup_consent(repo),
+            state,
+        }
+    }
+}
+
+/// How this PC's routing file answers `repo`'s warm-up consent: a repo its `repos` does not list has none, whatever
+/// the `warmup` value, as the siblings consent is asked only of a listed repo and the route never weighs a warm-up for
+/// one it does not route.
+fn warmup_consent(repo: &str) -> Consent {
+    let Some(path) = route::remote_json_path(std::env::var_os("LOCALAPPDATA").as_deref()) else {
+        return Consent::Refused;
+    };
+    let Ok(Some(config)) = route::read_remote_json(&path) else {
+        return Consent::Refused;
+    };
+    if config.patterns(repo).is_none() {
+        return Consent::Refused;
+    }
+    match config.warmup_consented(repo) {
+        Err(problem) => Consent::Problem(problem.to_owned()),
+        Ok(true) => Consent::Given {
+            host: config.host().to_owned(),
+        },
+        Ok(false) => Consent::Refused,
+    }
+}
+
+/// The warm-up's items of the worktree root `root`, from `sources`, and the hash of its warm-up file when the repo
+/// consents and the file parsed; each problem of the file is added to `problems`, consent or not. A repo with neither
+/// the file nor consent, and a `.gate` that is not a folder, have no item. The record is judged for `remote.json`'s
+/// host, or for the builder `builder` a builder check checks, and then only a record that names it is said.
+pub(super) fn warmup(root: &str, sources: WarmSources, builder: Option<&str>, problems: &mut Vec<Problem>) -> (Vec<Warmup>, Option<String>) {
+    let folder = Path::new(root);
+    if route::gate_is_not_a_folder(folder) {
+        return (Vec::new(), None);
+    }
+    let file = warm::read_warmup_file_whole(folder);
+    if let Err(found) = &file {
+        problems.extend(found.iter().map(|text| Problem {
+            file: report::WARMUP,
+            text: text.clone(),
+        }));
+    }
+    let declared = !matches!(file, Ok(None));
+    let host = match sources.consent {
+        Consent::Given { host } => host,
+        Consent::Refused => return (declared.then_some(Warmup::Unconsented).into_iter().collect(), None),
+        Consent::Problem(why) => return (declared.then_some(Warmup::ConsentProblem(why)).into_iter().collect(), None),
+    };
+    let (file, hash) = match file {
+        Ok(Some(parsed)) => parsed,
+        Ok(None) => return (vec![Warmup::NoFile], None),
+        Err(_) => return (vec![Warmup::FileProblems], None),
+    };
+    let state = match sources.state {
+        Ok(state) => state,
+        Err(why) => return (vec![Warmup::NoStateRoot(why)], Some(hash)),
+    };
+    let file = FileRead::Parsed { file, hash: hash.clone() };
+    let item = recorded(root, &state, &file, builder.unwrap_or(&host), builder.is_some());
+    (item.into_iter().collect(), Some(hash))
+}
+
+/// The item of the warm-up record of the worktree root `root`'s work folder, in the state root `state`, for the
+/// warm-up file `file` on `host`; the lock is probed, never taken. `None` when `only_its_own` and the record does not
+/// name `host`.
+fn recorded(root: &str, state: &Path, file: &FileRead, host: &str, only_its_own: bool) -> Option<Warmup> {
+    let key = work_folder_key(root);
+    let record = warm::read_warm_record(&v1::warm_record_path(state, &key));
+    if only_its_own && !matches!(&record, RecordRead::Parsed(found) if found.host == host) {
+        return None;
+    }
+    let lock = v1::warm_lock_path(state, &key);
+    match warm::lock_held(&lock) {
+        Ok(held) => Some(record_item(&record, file, held, host, SystemTime::now())),
+        Err(error) => Some(Warmup::Unreadable(lock_problem_text(&lock.to_string_lossy(), &error.to_string()))),
+    }
+}
+
+/// The item of the warm-up record `record` for the warm-up file `file` that parsed, its lock held or not, on `host` at
+/// `now`, as the route's judge ([`judge`]) weighs them: warm, warming, failed within its backoff, unreadable, or else
+/// not warm, a `warming` record whose lock is free said as one that ended without a verdict.
+pub(super) fn record_item(record: &RecordRead, file: &FileRead, lock_held: bool, host: &str, now: SystemTime) -> Warmup {
+    let gate = build_version();
+    let situation = Situation {
+        consented: true,
+        file,
+        record,
+        lock_held,
+        host,
+        gate: &gate,
+        now,
+    };
+    let not_warm = |stale: bool| Warmup::NotWarm {
+        host: host.to_owned(),
+        stale,
+    };
+    match (judge(&situation), record) {
+        (Judgement::Ready, _) => Warmup::Warm { host: host.to_owned() },
+        (Judgement::Warming { host }, _) => Warmup::Warming { host },
+        (Judgement::Problem(_), RecordRead::Unreadable { path, error }) => Warmup::Unreadable(record_problem_text(path, error)),
+        (
+            Judgement::Start,
+            RecordRead::Parsed(Record {
+                state: RecordState::Warming, ..
+            }),
+        ) => not_warm(true),
+        (
+            Judgement::Failed { reason, .. },
+            RecordRead::Parsed(
+                found @ Record {
+                    state: RecordState::Failed { class, .. },
+                    ..
+                },
+            ),
+        ) => {
+            let Ok(age) = now.duration_since(found.at) else {
+                return not_warm(false);
+            };
+            Warmup::Failed {
+                host: found.host.clone(),
+                minutes_ago: minutes_ago(age),
+                reason,
+                minutes_left: minutes_up(class.backoff().saturating_sub(age)),
+            }
+        }
+        // Start with any other record is not warm. Route (no consent or no file), and a failure or a problem without a
+        // record of its kind, never come with a consented file that parsed. Each judgement is named, so a new one is a
+        // compile error.
+        (Judgement::Start | Judgement::Route | Judgement::Failed { .. } | Judgement::Problem(_), _) => not_warm(false),
+    }
+}
+
+/// An age in whole minutes, rounded down and at least 1, so an age under a minute, zero included, is 1.
+fn minutes_ago(age: Duration) -> u64 {
+    (age.as_secs() / 60).max(1)
+}
+
+/// `duration` in whole minutes, rounded up.
+fn minutes_up(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos().div_ceil(60_000_000_000)).unwrap_or(u64::MAX)
 }
 
 /// The manifest `<root>\.gate\toolchain.toml` holds as it stands on disk; `None` when there is none; else why it

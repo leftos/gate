@@ -16,6 +16,8 @@ The watchdog kills a stalled command, one past its ceiling and one past the back
 
 `gate check` says what this PC lacks for the repo in the current folder (the tools its `.gate/toolchain.toml` names, the SDK its `global.json` pins, the sibling worktrees `.gate/siblings.toml` declares) and the command that installs each; it installs nothing, and exits 1 when something is missing or the check could not run (not in a git repository, or a `.gate/toolchain.toml`, `.gate/siblings.toml` or `global.json` it cannot read).
 
+For a repo with a `.gate/warmup.toml` or `remote.json` consent to warm-ups, it also says whether the builder's work folder is warm, and prints the file's problems.
+
 `gate check --builder <host>` asks one builder from `remote.json` the same question over ssh (for example `gate check --builder builder-1`): it runs the builder's preflight once, so it creates the folders a routed run would, and prints the same kind of lines and `install: builder-1:` hints; it also exits 1 when the builder is unreachable, runs a different gate build, or `remote.json` is missing or unusable.
 
 `gate burn [--cores <n>] --seconds <s>` spins the CPU on `n` threads for up to 180 s, for the load-burn tool, and ends early if the process that started it ends. `gate expect -- <command>` prints the expected time of a command in the current folder, here and on each builder, from the durations store, or `no history`; the launcher maps no `-Expect`, so callers run `gate.exe expect -- <command>` directly.

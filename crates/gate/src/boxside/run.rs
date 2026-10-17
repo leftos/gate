@@ -35,6 +35,7 @@ use crate::boxside::ceiling::{Ceiling, KILLED, Spec};
 use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
 use crate::boxside::heartbeat;
 use crate::boxside::inputs;
+use crate::boxside::msys;
 use crate::boxside::outputs::{self, Asked};
 use crate::boxside::packages;
 use crate::boxside::payload::{PairSibling, Payload, bare_stem, escaped, ordinal_upper, trees};
@@ -670,6 +671,12 @@ fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, co
         stop: StopSignal::new(stop, request.job),
         adjusted: Cell::new(None),
     };
+    // The MSYS keeper (`boxside::msys`): up once the heartbeat beats and before the checkout's first git call, held
+    // until the run returns, so no MSYS start of the run can leave Git's shared section locked. A stop ends the wait
+    // for it; a signal that cannot be read is no stop here, and the run's own look at it says so.
+    let _keeper = msys::kept(&|| stop.is_set().unwrap_or(false))
+        .inspect_err(|line| beat.say(console, line))
+        .ok();
     // Read while the heartbeat beats and before the checkout, so the client can take its time hashing the PC's files.
     let mut outputs = request.outputs.as_ref().map(|asked| RunOutputs::read(asked, &beat, console));
     let folders = Folders { work: &work, place: &place };

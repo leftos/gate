@@ -2,7 +2,9 @@
 //! as this PC's check reads them, then one bounded call of the builder's `gate box preflight`, as a routed run's
 //! preflight is made, with the repo's own work-folder key and the manifest's tools as its `Needs`. The preflight
 //! readies only the work folder the next routed run of the repo would ready, and its answer is read with the remote
-//! client's own readers: the builder's gate build, the folders it created, its SDK list and what it found of each tool.
+//! client's own readers: the builder's gate build, the folders it created, its SDK list, what it found of each tool,
+//! and whether its work folder is warm for the worktree's warm-up file. The warm-up's items are this PC's, its record
+//! said only when it names the builder checked.
 
 use std::path::Path;
 use std::time::Duration;
@@ -13,8 +15,8 @@ use gate_win32::PipedConsole;
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::boxside::payload::escaped;
-use crate::check::local::{self, Declared};
-use crate::check::report::{self, At, Checked, Tool};
+use crate::check::local::{self, Declared, WarmSources};
+use crate::check::report::{self, At, Checked, Problem, Tool, Warmup};
 use crate::console::Console;
 use crate::environment::Variables;
 use crate::remote::git::{self, GitError, ProgramCall, ProgramOutput, ProgramPlace};
@@ -22,7 +24,7 @@ use crate::remote::payload::{self, Location};
 use crate::remote::toolchain::{self, Reported};
 use crate::remote::transport::ssh::Ssh;
 use crate::remote::transport::{Program, Transport, Wire};
-use crate::remote::{BOX_USAGE, CREATED, NOT_RECOGNIZED, SSH_FAILED, other_build, sdks_of, their_version};
+use crate::remote::{BOX_USAGE, CREATED, NOT_RECOGNIZED, SSH_FAILED, Warm, other_build, sdks_of, their_version, warm_of};
 use crate::route;
 use gate_desktop::version::build_version;
 
@@ -146,10 +148,28 @@ fn asked(transport: &dyn Transport, host: &str, place: &Place, bound: Duration) 
         lines: &heard.lines,
         last_error: heard.last_error.as_deref(),
     };
-    Ok(Asked {
-        checked: answer.checked(declared, repo, place.root.clone(), local::declares_siblings(root)),
-        key,
-    })
+    let sources = WarmSources::from_process(&repo);
+    let mut checked = answer.checked(declared, repo, place.root.clone(), local::declares_siblings(root));
+    checked.warmup = warm_items(&place.root, sources, host, &heard.lines, &mut checked.problems);
+    Ok(Asked { checked, key })
+}
+
+/// The warm-up's items of a builder check of `host` for the worktree root `root`, from `sources`: this PC's
+/// ([`local::warmup`]), the record said only when it names `host`, then, when the repo consents and its warm-up file
+/// parsed, what the preflight's `lines` say of the builder's work folder against that file's hash. Each problem of
+/// the file is added to `problems`.
+fn warm_items(root: &str, sources: WarmSources, host: &str, lines: &[String], problems: &mut Vec<Problem>) -> Vec<Warmup> {
+    let (mut items, hash) = local::warmup(root, sources, Some(host), problems);
+    items.extend(hash.map(|hash| builder_warmth(lines, &hash)));
+    items
+}
+
+/// What the builder's preflight `lines` say of its work folder's warm-up, as the client reads them ([`warm_of`]): warm
+/// only when its `.warm` holds `hash`, the hash of the worktree's warm-up file.
+fn builder_warmth(lines: &[String], hash: &str) -> Warmup {
+    Warmup::Builder {
+        warm: matches!(warm_of(lines), Warm::Hash(said) if said == hash),
+    }
 }
 
 /// What the builder's call said: its exit status, its standard output's lines, and the last line of its standard error
@@ -306,12 +326,14 @@ impl Answer<'_> {
             unreadable: declared.unreadable(false),
             problems: declared.problems,
             tools,
+            godot: declared.godot,
             sdk,
             workloads: declared.manifest.workloads,
             consent_problem: None,
             siblings: Vec::new(),
             created,
             siblings_skipped: declares_siblings,
+            warmup: Vec::new(),
         }
     }
 
@@ -343,12 +365,20 @@ fn shown(text: &str) -> String {
 mod tests {
     use std::time::Duration;
 
-    use super::{Answer, Failure, Heard, failure, refusal};
-    use crate::check::local::Declared;
-    use crate::check::report::{At, Checked, Line, Sdk, said};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use gate_router::warm::warmup_hash;
+    use gate_router::work_folder_key;
+    use gate_state::v1::{self, WarmRecord, WarmState};
+    use jiff::Timestamp;
+
+    use super::{Answer, Failure, Heard, builder_warmth, failure, refusal, warm_items};
+    use crate::check::local::{Consent, Declared, WarmSources};
+    use crate::check::report::{At, Checked, Line, Sdk, Warmup, said};
     use crate::remote::git::GitError;
     use crate::remote::parity::pin_of;
-    use crate::remote::toolchain::{self, Manifest, Reported, ToolNeed, Version};
+    use crate::remote::toolchain::{self, Manifest, Pin, Reported, ToolNeed, Version};
     use gate_desktop::version::build_version;
 
     const HOST: &str = "builder-1";
@@ -373,6 +403,7 @@ mod tests {
                 tools,
                 ..Manifest::default()
             },
+            godot: None,
             pin: pin.map(|version| pin_of(Some(&format!(r#"{{"sdk": {{"version": "{version}"}}}}"#)))),
             problems: Vec::new(),
             toolchain_unreadable: false,
@@ -423,6 +454,41 @@ mod tests {
         );
     }
 
+    /// A builder's godot is judged against the manifest's exact pin, as a routed run judges it: another version is
+    /// missing, and a builder that gives no answer is missing for its text.
+    #[test]
+    fn a_pinned_godot_on_a_builder_is_missing_when_it_does_not_serve_the_pin() {
+        let Some(pin) = Pin::parse("4.7.2") else {
+            unreachable!("4.7.2 is a pin");
+        };
+        let mut serving = declared(vec![need("godot", "4.7.2")], None);
+        serving.godot = Some(vec![pin]);
+        let answer = lines(&["gate: remote tool godot 4.7.3"]);
+        let other = checked(serving, &["godot"], &answer, None);
+        assert_eq!(
+            said(AT, &other).lines,
+            [
+                Line::Out("check: builder-1: app (work folder app-1a2b3c4d)".to_owned()),
+                Line::Out("check: builder-1: godot missing (needs 4.7.2 exactly: 4.7.3)".to_owned()),
+                Line::Out("check: builder-1: 1 missing, 0 too old".to_owned()),
+            ]
+        );
+        assert_eq!(said(AT, &other).status, 1);
+
+        let mut silent = declared(vec![need("godot", "4.7.2")], None);
+        silent.godot = Some(vec![pin]);
+        let quiet = checked(silent, &["godot"], &lines(&[]), None);
+        assert_eq!(
+            said(AT, &quiet).lines,
+            [
+                Line::Out("check: builder-1: app (work folder app-1a2b3c4d)".to_owned()),
+                Line::Out("check: builder-1: godot missing (needs 4.7.2 exactly: not probed (the builder gave no answer))".to_owned()),
+                Line::Out("check: builder-1: 1 missing, 0 too old".to_owned()),
+            ]
+        );
+        assert_eq!(said(AT, &quiet).status, 1);
+    }
+
     #[test]
     fn a_pin_with_no_sdk_line_is_skipped_saying_the_builder_sent_none() {
         let answer = lines(&["gate: remote version x"]);
@@ -467,6 +533,138 @@ mod tests {
                     .to_owned()
             ),
             "{texts:?}"
+        );
+    }
+
+    /// The builder's `.warm` is warm only when its preflight's warm line holds the warm-up file's hash: another hash and
+    /// `none` are not warm, and neither counts against the check.
+    #[test]
+    fn the_builder_s_work_folder_is_warm_only_for_the_warm_up_file_s_hash() {
+        const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const OTHER: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+        let version = format!("gate: remote version {}", build_version());
+        for (name, warm_line, line) in [
+            (
+                "warm",
+                format!("gate: remote warm {HASH}"),
+                "check: builder-1: warm-up: the work folder is warm",
+            ),
+            (
+                "another hash",
+                format!("gate: remote warm {OTHER}"),
+                "check: builder-1: warm-up: the work folder is not warm",
+            ),
+            (
+                "none",
+                "gate: remote warm none".to_owned(),
+                "check: builder-1: warm-up: the work folder is not warm",
+            ),
+        ] {
+            let answer = lines(&[version.as_str(), warm_line.as_str()]);
+            let mut checked = checked(declared(Vec::new(), None), &[], &answer, None);
+            checked.warmup = vec![builder_warmth(&answer, HASH)];
+            assert_eq!(
+                said(AT, &checked).lines,
+                [
+                    Line::Out("check: builder-1: app (work folder app-1a2b3c4d)".to_owned()),
+                    Line::Out(line.to_owned()),
+                    Line::Out("check: builder-1: nothing missing".to_owned()),
+                ],
+                "{name}"
+            );
+            assert_eq!(said(AT, &checked).status, 0, "{name}");
+        }
+        assert_eq!(
+            builder_warmth(&lines(&["gate: remote warm none"]), HASH),
+            Warmup::Builder { warm: false },
+            "a warm line with no version line before it is unseen"
+        );
+    }
+
+    /// A warm-up file that reads.
+    const WARMUP_FILE: &[u8] = b"commands = [[\"dotnet\", \"build\"]]\n";
+
+    /// A scratch worktree root holding [`WARMUP_FILE`] as its `.gate/warmup.toml`, and a state root beside it, both
+    /// made new for the test `name`.
+    #[expect(clippy::expect_used, reason = "a test that cannot make its folders must fail loudly")]
+    fn warm_scratch(name: &str) -> (String, PathBuf) {
+        let folder = crate::test_support::temp_dir().join(format!("gate-check-builder-{name}-{}", std::process::id()));
+        if folder.exists() {
+            fs::remove_dir_all(&folder).expect("an earlier scratch folder can be removed");
+        }
+        let root = folder.join("app");
+        fs::create_dir_all(root.join(".gate")).expect("the .gate folder can be made");
+        fs::write(root.join(".gate").join("warmup.toml"), WARMUP_FILE).expect("the warm-up file can be written");
+        let state = folder.join("state");
+        fs::create_dir_all(v1::warm_dir(&state)).expect("the warm-up folder can be made");
+        (root.to_string_lossy().into_owned(), state)
+    }
+
+    /// The sources of a repo consenting to warm-ups on `builder-1`, its state root `state`.
+    fn consenting(state: &Path) -> WarmSources {
+        WarmSources {
+            consent: Consent::Given { host: HOST.to_owned() },
+            state: Ok(state.to_path_buf()),
+        }
+    }
+
+    /// A preflight's lines whose warm line holds `hash`.
+    fn warm_said(hash: &str) -> Vec<String> {
+        lines(&[
+            format!("gate: remote version {}", build_version()).as_str(),
+            format!("gate: remote warm {hash}").as_str(),
+        ])
+    }
+
+    /// The builder's line is judged against the hash of the worktree's own warm-up file, read from disk.
+    #[test]
+    fn the_builder_s_warm_line_is_compared_with_the_hash_of_the_worktree_s_file() {
+        let (root, state) = warm_scratch("hash");
+        let mut problems = Vec::new();
+        let file_hash = warmup_hash(WARMUP_FILE);
+        assert_eq!(
+            warm_items(&root, consenting(&state), HOST, &warm_said(&file_hash), &mut problems),
+            [Warmup::Builder { warm: true }],
+            "the hash of the file's bytes"
+        );
+        let other = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+        assert_eq!(
+            warm_items(&root, consenting(&state), HOST, &warm_said(other), &mut problems),
+            [Warmup::Builder { warm: false }],
+            "another hash"
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    /// This PC's record is said on a builder check when it names the builder checked, and not when it names another.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test that cannot write its record must fail loudly")]
+    fn a_pc_record_is_said_on_a_builder_check_only_when_it_names_that_builder() {
+        let (root, state) = warm_scratch("record");
+        let at = Timestamp::from_second(1_700_000_000).expect("a time in range");
+        let record = WarmRecord {
+            host: HOST.to_owned(),
+            state: WarmState::Warm,
+            at,
+            hash: warmup_hash(WARMUP_FILE),
+            gate: build_version(),
+            pid: 1,
+            started: at,
+            failure: None,
+            reason: None,
+        };
+        v1::write_warm_record(&v1::warm_record_path(&state, &work_folder_key(&root)), &record).expect("the record can be written");
+        let said = warm_said(&warmup_hash(WARMUP_FILE));
+        let mut problems = Vec::new();
+        assert_eq!(
+            warm_items(&root, consenting(&state), HOST, &said, &mut problems),
+            [Warmup::Warm { host: HOST.to_owned() }, Warmup::Builder { warm: true }],
+            "a record of the builder checked"
+        );
+        assert_eq!(
+            warm_items(&root, consenting(&state), "builder-2", &said, &mut problems),
+            [Warmup::Builder { warm: true }],
+            "a record of another builder"
         );
     }
 

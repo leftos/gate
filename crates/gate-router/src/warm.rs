@@ -327,10 +327,13 @@ fn judge_record(record: &Record, hash: &str, situation: &Situation<'_>) -> Judge
 /// The line of a run kept here while `host` warms its work folder.
 #[must_use]
 pub fn warming_line(host: &str) -> String {
-    format!(
-        "gate: not routed: {} is warming the work folder for this worktree",
-        escaped(&shortened(host))
-    )
+    format!("gate: not routed: {} for this worktree", warming_text(host))
+}
+
+/// That `host` is warming the work folder, as the route's line and `gate check`'s item both say it.
+#[must_use]
+pub fn warming_text(host: &str) -> String {
+    format!("{} is warming the work folder", shown_value(host))
 }
 
 /// The line of a run kept here as it starts a warm-up on `host`. The route says it once it starts a warm-up of its own,
@@ -367,7 +370,7 @@ pub fn failed_line(minutes_ago: u64, reason: &str) -> String {
     } else {
         format!("{minutes_ago} min ago")
     };
-    format!("gate: not routed: the warm-up failed {when}: {}", escaped(&shortened(reason)))
+    format!("gate: not routed: the warm-up failed {when}: {}", shown_value(reason))
 }
 
 /// The line of a run kept here for a problem of `.gate/warmup.toml`.
@@ -379,17 +382,34 @@ pub fn file_problem_line(problem: &str) -> String {
 /// The line of a run kept here because the warm-up record at `path` cannot be read, for `error`.
 #[must_use]
 pub fn record_problem_line(path: &str, error: &str) -> String {
-    format!(
-        "gate: not routed: the warm-up record {} cannot be read: {}",
-        escaped(path),
-        escaped(&shortened(error))
-    )
+    format!("gate: not routed: {}", record_problem_text(path, error))
+}
+
+/// That the warm-up record at `path` cannot be read, for `error`, as the route's line and `gate check`'s item both say
+/// it.
+#[must_use]
+pub fn record_problem_text(path: &str, error: &str) -> String {
+    format!("the warm-up record {} cannot be read: {}", escaped(path), shown_value(error))
 }
 
 /// The line of a run kept here because the warm-up lock at `path` cannot be probed, for `error`.
 #[must_use]
 pub fn lock_problem_line(path: &str, error: &str) -> String {
-    format!("gate: not routed: the warm-up lock {} cannot be read: {}", escaped(path), escaped(error))
+    format!("gate: not routed: {}", lock_problem_text(path, error))
+}
+
+/// That the warm-up lock at `path` cannot be probed, for `error`, as the route's line and `gate check`'s item both say
+/// it.
+#[must_use]
+pub fn lock_problem_text(path: &str, error: &str) -> String {
+    format!("the warm-up lock {} cannot be read: {}", escaped(path), escaped(error))
+}
+
+/// A value read from a warm-up record, such as its host or a failure's reason, as a line shows it: [`shortened`], then
+/// escaped, so it is always one line.
+#[must_use]
+pub fn shown_value(text: &str) -> String {
+    escaped(&shortened(text))
 }
 
 /// The most characters of a value read from a warm-up record that a line shows.

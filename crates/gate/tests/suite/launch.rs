@@ -615,6 +615,50 @@ fn a_process_left_in_the_job_ends_with_the_run() {
     assert!(!outcome.stderr.contains("cannot end the run's job"), "{outcome:?}");
 }
 
+/// Pins this process, and so the gate it starts and the command under it, to its lowest core at normal priority. Each
+/// failure is that call's Win32 error.
+fn pin_to_one_core_at_normal() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessAffinityMask, NORMAL_PRIORITY_CLASS, SetPriorityClass, SetProcessAffinityMask,
+    };
+
+    let process = unsafe { GetCurrentProcess() };
+    let (mut own, mut system) = (0, 0);
+    // SAFETY: the pseudo handle names this process, and both pointers are writable.
+    let read = unsafe { GetProcessAffinityMask(process, &raw mut own, &raw mut system) };
+    assert!(read != 0, "GetProcessAffinityMask failed: {}", std::io::Error::last_os_error());
+    let lowest = own.isolate_lowest_one();
+    // SAFETY: the pseudo handle names this process, which this case owns.
+    let pinned = unsafe { SetProcessAffinityMask(process, lowest) };
+    assert!(
+        pinned != 0,
+        "SetProcessAffinityMask({lowest:#x}) failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: as above.
+    let at_normal = unsafe { SetPriorityClass(process, NORMAL_PRIORITY_CLASS) };
+    assert!(
+        at_normal != 0,
+        "SetPriorityClass(NORMAL_PRIORITY_CLASS) failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// The command's own exit is no process left in the run's job, even when the gate wakes on the exit before the job's
+/// list lets the process go.
+#[test]
+fn a_command_s_exit_is_no_process_left_in_its_job_on_one_core() {
+    let case = Case::new("a_command_s_exit_is_no_process_left_in_its_job_on_one_core");
+    // The gate and its command on one core, the gate at normal and its light command below it: the gate's wake on the
+    // command's exit preempts the command's last thread before the job's list lets it go, as a busy machine does.
+    pin_to_one_core_at_normal();
+
+    let outcome = finish(case.gate(&run_words("out.log", &[], &[FAKE_TOOL, "exit", "0"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("cannot end the run's job"), "{outcome:?}");
+}
+
 /// The name of the job the gate `gate` runs its command in under the case's root.
 fn job_name(case: &Case, gate: u32) -> String {
     StateRoot::new(&shown(&case.root()), None).object_name(KernelObject::Job { gate_pid: gate })

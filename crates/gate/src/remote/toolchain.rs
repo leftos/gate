@@ -251,7 +251,7 @@ pub(crate) fn standing(min: Option<Version>, reported: &Reported) -> Standing {
 
 /// What a repo's exact Godot pins make of what the builder's probe `reported` of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Pinned {
+pub(crate) enum Pinned {
     /// The builder serves the pins.
     Met,
     /// It does not, and the mismatch line ends in this, as it ends in what the builder has of any other tool.
@@ -270,7 +270,7 @@ enum Pinned {
 /// version, so an install of a prerelease such as `4.7.2-beta.1` is the `4.7.2` an install of that release is, both
 /// sides dropping the label; and an install the box's own listing did not reach, as one still being installed, is
 /// simply not on its list, which reads as the builder lacking it and falls back here needlessly.
-fn pinned(pins: &[Pin], reported: &Reported) -> Pinned {
+pub(crate) fn pinned(pins: &[Pin], reported: &Reported) -> Pinned {
     match reported {
         Reported::Missing => Pinned::Lacks("none".to_owned()),
         Reported::Skipped(why) if pins.is_empty() => Pinned::Skipped(why.clone()),

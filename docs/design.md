@@ -237,25 +237,28 @@ A word prints `gate: unexpected argument <word>` and any option, `--state-dir` i
 
 The repo is the git worktree root of the working folder, as routing finds it.
 
-Outside a git worktree it prints `check: not in a git repository` on stderr and exits 1; a working folder or git that cannot be read prints `check: <why>` on stderr and exits 1. The repo's `.gate/toolchain.toml`, `.gate/siblings.toml` and root `global.json` are read from the worktree on disk, so an uncommitted edit counts.
+Outside a git worktree it prints `check: not in a git repository` on stderr and exits 1; a working folder or git that cannot be read prints `check: <why>` on stderr and exits 1. The repo's `.gate/toolchain.toml`, `.gate/siblings.toml`, `.gate/warmup.toml` and root `global.json` are read from the worktree on disk, so an uncommitted edit counts.
 
-The two `.gate` files are read as routing reads `.gate/siblings.toml`: a `.gate` folder or file that is a link or junction, or a file over 64 KiB, is refused. `global.json` is read the same way, a link refused and 64 KiB the most.
+The `.gate` files are read as routing reads `.gate/siblings.toml`: a `.gate` folder or file that is a link or junction, or a file over 64 KiB, is refused. `global.json` is read the same way, a link refused and 64 KiB the most.
 
 A file that cannot be read whole (not one that reads with problems) fails the check: the summary says it and the exit is 1, however the items came out.
 
 On stdout, each line prefixed `check: here: `, `here` being this PC, in this order:
 
 1. The header `check: here: <repo> at <root>`, `<repo>` being the name routing gives the repo and `<root>` the worktree root as git spells it. With no `.gate/toolchain.toml` the line `check: here: <repo> declares no toolchain` follows; the SDK pin and the siblings are still checked.
-2. One line per item, every item printed, the ones that are fine included: the manifest's tools in manifest order, then the .NET SDK, then the workloads, then the `remote.json` item when it applies, then the siblings.
+2. One line per item, every item printed, the ones that are fine included: the manifest's tools in manifest order, then the .NET SDK, then the workloads, then the `remote.json` item when it applies, then the siblings, then the warm-up's items ([The warm-up items](#the-warm-up-items)).
 3. One `install: here: <subject>: <command>` hint line per missing or too-old item, in item order.
 4. The summary: `check: here: nothing missing` or `check: here: <n> missing, <n> too old`, with `, <n> skipped` added when any item was skipped; with nothing missing and some skipped it is `check: here: nothing missing (<n> skipped)`. When a file could not be read it is `check: here: could not read <files>; <n> missing, <n> too old`, `, <n> skipped` added as above, the files comma separated in the order `.gate/toolchain.toml`, `.gate/siblings.toml`, `global.json`.
 
-The problems of the files go to stderr, one per line, before the item lines: `check: .gate/<file>: <problem>`, `<file>` being `toolchain.toml` or `siblings.toml` and `<problem>` the text the file's reader gives ([Toolchain manifest](#routing), [Sibling worktrees](#routing)), or why the file could not be read at all (`.gate is not a folder`, for the manifest, when `.gate` is a file). A file with problems is still used for what reads, and the rest is still checked.
+The problems of the files go to stderr, one per line, before the item lines: `check: .gate/<file>: <problem>`, `<file>` being `toolchain.toml`, `siblings.toml` or `warmup.toml` and `<problem>` the text the file's reader gives ([Toolchain manifest](#routing), [Sibling worktrees](#routing), [remote.json](#remotejson)), or why the file could not be read at all (`.gate is not a folder`, for the manifest, when `.gate` is a file). A file with problems is still used for what reads, and the rest is still checked.
+
+Every problem of `.gate/warmup.toml` is said, whether `remote.json` consents to warm-ups or not.
 
 The `global.json` ones are `check: global.json: <reason>`, `<reason>` being `is larger than 64 KiB`, `cannot read it: <error>`, `is a link, a junction or not a file`, `is not UTF-8`, `does not parse as JSON`, `its sdk is not an object`, `its sdk.version is not a version dotnet reads`, `its sdk.rollForward is not a policy gate knows` or `its sdk.allowPrerelease is not true or false`.
 
 The tool lines, for each tool of the manifest, probed as the box probes the tools of a preflight ([The box side](#the-box-side), Tool probes), all together within one 10 s bound, on this PC's own `PATH` with the worktree's own folders dropped, a program found that still lies inside the worktree refused:
 
+- `godot <found> ok (needs <pin> exactly)` when the manifest's `godot` pin is met, else `godot missing (needs <pin> exactly: <found>)`, `<found>` being the versions the probe found, `none`, or `not probed (<why>)` for a probe that gave no answer or a version it could not read. The pin is judged as a routed run judges it ([Toolchain manifest](#routing)): exact on the parts it gives, so `4.5` reads `needs 4.5 exactly` and matches any `4.5.x`. A pin not met counts as missing, never as skipped, and has no install hint. Only the manifest entry is read, not the project files' pins;
 - `<tool> <found> ok (needs <min> or later)`, `<min>` written as `major.minor.patch`, when the found version is the minimum or later, and `<tool> <found> too old (needs <min> or later)` when it is below it;
 - `<tool> missing (needs <min> or later)`, or `(needs it present)` for a tool declared with `""`;
 - `<tool> <found> ok` for a tool declared present at any version, and `<tool> ok (version not readable)` for a present one whose version the probe could not read;
@@ -269,7 +272,7 @@ With a pin that names a version it is `.NET SDK <version> (rollForward <policy>)
 
 The SDK list is read with the folders inside the worktree dropped from `PATH`. A `global.json` whose pin cannot be read (a reason above) says `.NET SDK skipped: global.json has no readable sdk pin`, which counts as skipped, and the file counts as unreadable; a list that cannot be read `.NET SDK skipped: cannot read this PC's SDK list: <why>`.
 
-A manifest that lists workloads gets one line, `workloads <ids, comma separated> not checked yet`, which counts as neither skipped nor missing. The tools in `.config/dotnet-tools.json` and a `Godot.NET.Sdk` pin are not checked by `gate check` and say nothing; a routed run does read a Godot pin (Toolchain manifest, under Routing), and `gate check` judges a manifest `godot` entry as a minimum, as every other tool's.
+A manifest that lists workloads gets one line, `workloads <ids, comma separated> not checked yet`, which counts as neither skipped nor missing. The tools in `.config/dotnet-tools.json` and a `Godot.NET.Sdk` pin are not checked by `gate check` and say nothing; a routed run does read a Godot pin (Toolchain manifest, under Routing), and `gate check` judges a manifest `godot` pin as a routed run does (the first tool line above), and a `godot` of `""` and every other tool as a minimum.
 
 Each sibling the repo declares is checked as routing checks it, and gets one line:
 
@@ -280,6 +283,21 @@ Each sibling the repo declares is checked as routing checks it, and gets one lin
 - `sibling <name> skipped: <why>` when its folder cannot be read.
 
 When the repo declares siblings and `remote.json` lists the repo but its `siblings` value cannot be used, the line `check: here: remote.json: <problem>` (control characters escaped, counted missing) comes before the sibling lines, and every sibling is not allowed. A repo that declares none says nothing of it.
+
+#### The warm-up items
+
+Each is one line `check: here: warm-up: <text>`. The state root, where the work folder's warm-up record and lock are, is found as the other commands find it, `GATE_STATE_DIR` and then `%LOCALAPPDATA%\gate\v1`; `gate check` takes no `--state-dir`.
+
+Consent is asked only of a repo `remote.json` lists in `repos`, whatever its `warmup` value: an unlisted repo has none, and so has one with no usable `remote.json`. A repo with neither `.gate/warmup.toml` nor consent, or whose `.gate` is not a folder, says nothing of warm-ups.
+
+- With the file and no consent: `.gate/warmup.toml is there, but remote.json does not consent to warm-ups for <repo>`. With consent and no file: `remote.json consents, but the repo has no .gate/warmup.toml`. Both only inform.
+- `remote.json: <problem>`, counted missing, when `remote.json` lists the repo, its `warmup` value cannot be used and the file is there.
+- `.gate/warmup.toml has problems, so no warm-up runs and matched runs stay here`, counted missing, with consent and a file that has problems.
+- With consent and a file that parsed, the work folder's record and lock are judged as the route judges them ([remote.json](#remotejson)), the lock probed and never taken. `the state root cannot be found: <why>` is skipped, and `warm on <host>` is ok.
+- `<host> is warming the work folder` (the lock is held), `the warm-up on <host> failed <n> min ago: <reason>; it may be tried again in <m> min` (a failure inside its backoff; an age under a minute, zero included, says 1 min, and `<m>` rounds up), `not warm on <host>; gate warm warms it` and `not warm on <host>; the last warm-up ended without a verdict; gate warm warms it` (a `warming` record whose lock is free) only inform.
+- `the warm-up record <path> cannot be read: <error>` and `the warm-up lock <path> cannot be read: <error>`, worded as the route words them, are counted missing: a routed run stays here for either.
+
+The lines that only inform are never counted and never fail the check.
 
 The install hints, for the items that have one:
 
@@ -296,7 +314,7 @@ The install hints, for the items that have one:
 
 A tool not in the table (`godot`) gets no hint line, nor does a sibling that is not allowed or refused, nor the `remote.json` item.
 
-The exit is 0 when nothing is missing or too old and every file read, whatever was skipped; 1 when anything is missing or too old, or the check could not run (not in a git repository, an unreadable `.gate/toolchain.toml`, `.gate/siblings.toml` or `global.json`, `.gate` not a folder); 2 for a usage error. Test-seams builds accept the hidden `--test-probe-limit-ms <n>` (the 10 s probe bound, in milliseconds above 0), which `--builder` refuses.
+The exit is 0 when nothing is missing or too old and every file read, whatever was skipped and whatever warm-up line only informs; 1 when anything is missing or too old, or the check could not run (not in a git repository, an unreadable `.gate/toolchain.toml`, `.gate/siblings.toml` or `global.json`, `.gate` not a folder); 2 for a usage error. Test-seams builds accept the hidden `--test-probe-limit-ms <n>` (the 10 s probe bound, in milliseconds above 0), which `--builder` refuses.
 
 #### With `--builder`
 
@@ -311,8 +329,9 @@ On stdout, each line prefixed `check: <host>: `, in this order:
 1. The header `check: <host>: <repo> (work folder <key>)`.
 2. `check: <host>: created <folder>` for each folder the preflight made, at most 20, then `check: <host>: and <n> more created folders`.
 3. The items, worded as on this PC with `<host>` for `here`: the SDK reads `.NET SDK <version> (rollForward <policy>) missing (<host> has <list>)`, the list cut at 20 entries and then `, and <n> more`; `.NET SDK skipped: <host> sent no SDK list`, with `: <last stderr line>` when there is one; a tool that did not answer is `check: <host>: <tool> skipped: the builder gave no answer`; the workloads are `not checked yet`.
-4. The install hints `install: <host>: <tool>: <command>`: `cargo install cargo-nextest --locked`, `npm install -g pnpm@<min>` (`npm install -g pnpm` with no minimum), `rustup toolchain install <min> && rustup default <min>`, `dotnet-install.ps1 -Version <v>`, and `run the build-box toolchain script on <host>` for node, pwsh, ffmpeg and a rust with no minimum.
-5. The summary.
+4. The warm-up's items, as on this PC ([The warm-up items](#the-warm-up-items)) and this PC's own: the record is said only when it names `<host>`, and with consent and a warm-up file that parsed, `check: <host>: warm-up: the work folder is warm` (ok) when the preflight's `gate: remote warm` line holds the hash of the worktree's file, else `check: <host>: warm-up: the work folder is not warm` (only informs).
+5. The install hints `install: <host>: <tool>: <command>`: `cargo install cargo-nextest --locked`, `npm install -g pnpm@<min>` (`npm install -g pnpm` with no minimum), `rustup toolchain install <min> && rustup default <min>`, `dotnet-install.ps1 -Version <v>`, and `run the build-box toolchain script on <host>` for node, pwsh, ffmpeg and a rust with no minimum.
+6. The summary.
 
 When the repo's `.gate/siblings.toml` names a sibling or cannot be read, one line `check: <host>: siblings skipped: a routed run lays them out` comes instead of the sibling lines and counts as skipped.
 
@@ -967,13 +986,13 @@ The optional `hosts` is an array of strings naming further builders, which only 
 
 The push order is `host`, then `hosts` in file order, an entry equal to an earlier one in any letter case skipped. A `hosts` that is not an array of strings, or holds a bad entry, never affects routing: `gate push` alone refuses the file with `push: ignored <path>: <reason>`.
 
-`warmup` is an array of repo names, matched in any letter case, that consent to the repo's `.gate/warmup.toml` warming its builder work folders (`Config::warmup_consented`); a repo it does not name, or a file without the key, has no consent. A value that is not an array of non-empty strings consents to none and leaves the rest of the file usable, and `warmup_consented` gives its reason. A routed run reads the consent from the same `remote.json` read its routing decision used, one read per run.
+`warmup` is an array of repo names, matched in any letter case, that consent to the repo's `.gate/warmup.toml` warming its builder work folders (`Config::warmup_consented`); a repo it does not name, or a file without the key, has no consent. A value that is not an array of non-empty strings consents to none and leaves the rest of the file usable, and `warmup_consented` gives its reason. `gate check` asks the consent only of a repo `repos` lists. A routed run reads the consent from the same `remote.json` read its routing decision used, one read per run.
 
 ops-tower reads only `slots`.
 
 A repo's own `.gate/toolchain.toml`, which declares the tools and workloads a routed run's builder needs, is a separate file in the snapshot, not part of `remote.json`: [Routing](#routing) (Toolchain manifest) describes its format.
 
-A repo's `.gate/warmup.toml`, which declares the warm-up commands, is read by `gate_router::warm::read_warmup`: `commands`, an array of 1 to 8 commands, each a non-empty array of non-empty strings, and the optional `timeout`, whole seconds from 1 to 86400, 1800 when missing. A leading byte order mark is skipped, any other key is a problem, and any problem means no warm-up. `gate warm` reads the file ([`gate warm`](#gate-warm)), and so does a routed run of a consenting repo, for the judge; nothing starts a warm-up from a route yet.
+A repo's `.gate/warmup.toml`, which declares the warm-up commands, is read by `gate_router::warm::read_warmup`: `commands`, an array of 1 to 8 commands, each a non-empty array of non-empty strings, and the optional `timeout`, whole seconds from 1 to 86400, 1800 when missing. A leading byte order mark is skipped, any other key is a problem, and any problem means no warm-up. `gate warm` reads the file ([`gate warm`](#gate-warm)), and so does a routed run of a consenting repo, for the judge, and `gate check` ([The warm-up items](#the-warm-up-items)), which gives every problem; nothing starts a warm-up from a route yet.
 
 A warm-up command is worded for the builder as a routed run's words are. A command whose first word is `git` or `prek`, named by any path or sent as that program's name (`C:\x\git.exe.exe status`), is a file problem, `gate: warm: .gate/warmup.toml command <n> starts with <word>, which a routed run never sends`; a first word naming another program by a path outside the worktree is sent as the program's name ([Routing](#routing), the in-worktree path rewrite), not a file problem.
 
@@ -1159,7 +1178,7 @@ All kept, with each knob's default unchanged:
 - Kill, on a STALLED, TIMED OUT or BACKSTOP alike: the diagnostics block (X3), then `TerminateJobObject(job, 124)` and the end of the processes that left the job (below), `gate: terminated the job's <n> process(es)` (with the escaped processes named, below), `gate: diagnostics written to <log>`, a 5 s wait for the command and exit 124 (X2).
 
   A failure inside the gate while the command runs terminates the job and ends the escaped processes first (X4); one after the command's own exit ends none of them.
-- **Run end.** Once the command exits, clean or failing, and before the verdict is reached, the gate ends every process the command left in its job, with exit code 124 (`end_leftovers` in `crates/gate/src/run.rs`), so a leftover's last output is in the log the verdict's marker scan reads and a `gate: cannot end the run's job: …` line comes before the verdict line. The exit status and verdict are unchanged.
+- **Run end.** Once the command exits, clean or failing, and before the verdict is reached, the gate ends every process the command left in its job, with exit code 124 (`end_leftovers` in `crates/gate/src/run.rs`). A process the job's list still names but whose own handle shows it ended is not counted as left: the list names a process for a while after it exits, seconds on a loaded machine. So a leftover's last output is in the log the verdict's marker scan reads and a `gate: cannot end the run's job: …` line comes before the verdict line. The exit status and verdict are unchanged.
 
   It spares every job member whose image is `gate.exe` (compared ASCII case-insensitively): a covered gate the command left running (GATE-101's late slot), a nested gate on its own slot, and any program named `gate.exe`.
 
@@ -1645,7 +1664,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A tool the builder did not probe, gave no answer for, or found at a version that cannot be read against a minimum gets `gate: <host> did not probe <name>: <why>; not checking it` and is not a need. The lines come in this order: the SDK step's own, then the manifest's problem lines, then the per-tool skip lines in the manifest's order, then the mismatch lines.
 
-    A text from the manifest or the builder is escaped, and the builder's cut to 4096 bytes, so neither can forge a line. `toolchain::standing` judges a tool against a minimum from what its probe found (met, too old, missing, not readable, skipped) in one place, which `gate check`'s report shares and a routed run applies to every tool but a pinned `godot`; `gate check`'s output is unchanged and still judges a manifest `godot` entry as a minimum. `--test-remote-interrupt-at manifest` raises the interrupt just before the manifest is read.
+    A text from the manifest or the builder is escaped, and the builder's cut to 4096 bytes, so neither can forge a line. `toolchain::standing` judges a tool against a minimum from what its probe found (met, too old, missing, not readable, skipped) in one place, which `gate check`'s report shares and a routed run applies to every tool but a pinned `godot`, which both judge with `pinned`; `gate check` judges a manifest `godot` pin through `pinned` too, so its report and a routed run agree. `--test-remote-interrupt-at manifest` raises the interrupt just before the manifest is read.
 
     Two pins a repo already declares are read beside it: each tool's version in `.config/dotnet-tools.json` (the release part, so `1.0.0-beta.1` is 1.0.0; read as strict JSON, as dotnet reads it, so a comment or a trailing comma makes the file unreadable, and a tool id given twice counts once, with its last version) and the `Godot.NET.Sdk/<version>` a project file names, on its root `<Project Sdk=...>` or an `<Sdk Name="Godot.NET.Sdk" Version=...>` element directly inside it (an `<Import Sdk=...>`, a deeper `<Sdk>` element and a `min=` version are not read). The dotnet tools' versions are read and nothing judges them yet. The Godot pin is an exact version on the parts it gives, a four-part SDK version reading as its first three, and is judged on every routed run (above).
 
@@ -2119,7 +2138,7 @@ For `run` the payload also needs a `Snapshot` key: exactly 40 lowercase hex char
 
 The value is empty for a missing key or JSON null, the string as given with control characters escaped, and compact JSON for any other non-string. Two differences from the wrapper are deliberate: the echoed value has its control characters escaped, and the check is stricter than the wrapper's .NET `$`, which accepts a trailing newline.
 
-Every path comes from the payload and nothing is written under the gate's state root; `gate box` takes no `--state-dir`. Test seams are `test-seams`-gated flags, never environment variables, and sit before the verb (`gate box --test-... run --stdin`) in a `BoxSeams` struct on `BoxRequest`, apart from the `gate run` seams, so `--test-print-request` is unchanged.
+Every path comes from the payload and nothing is written under the gate's state root; `gate box` takes no `--state-dir`. Test seams are `test-seams`-gated flags, never environment variables (but the MSYS keeper's two, below), and sit before the verb (`gate box --test-... run --stdin`) in a `BoxSeams` struct on `BoxRequest`, apart from the `gate run` seams, so `--test-print-request` is unchanged.
 
 The box seams go in any order before the verb, each also as `--<seam>=<value>`. `--test-heartbeat-ms <n>` sets the period of the command heartbeat, and `--test-box-console fail-before` makes the command's UTF-8 console fail before the command starts (the only accepted value, else `gate: --test-box-console must be fail-before, got '<value>'`).
 
@@ -2132,6 +2151,10 @@ The box's ceiling has three seams: `--test-box-sample-ms <n>` replaces the 5 s s
 `--test-box-kill-leaves <n>` stands in for the number of processes the last ending of a ceiling or backstop kill leaves (a whole number above 0), so the box says its note for a job that is still not ended.
 
 The other four box seams are `--test-outputs-budget-bytes <n>`, which replaces the 50 GiB outputs budget of the box's trim, in bytes, `--test-inputs-budget-bytes <n>`, which replaces the 4 GiB a `gate box inputs` put unpacks, decompressed, in bytes, `--test-dotnet-limit-ms <n>`, which replaces the 30 s bound of the preflight's `dotnet --list-sdks` read, in milliseconds, and `--test-probe-limit-ms <n>`, which replaces the 10 s shared bound of the preflight's tool probes, in milliseconds.
+
+Two seams of the MSYS keeper are environment variables, read only in a `test-seams` build (the installed binary ignores them), because a stand-in is a program plus words.
+
+`GATE_TEST_BOX_MSYS_KEEPER` is the program and its words, joined with `|`, started in the keeper's place (the lookup and the owner check are skipped; the token, job, console and echo stay), and `GATE_TEST_BOX_MSYS_KEEPER_MS` is the echo limit in milliseconds in place of 30 s (a value that is no whole number is the keeper's why, `GATE_TEST_BOX_MSYS_KEEPER_MS is not a count of milliseconds: <value>`). The suite's `fake-tool` is the stand-in.
 
 A seam is refused as the `gate run` seams are: no value, given twice, and a value outside its rule (`gate: --test-outputs-budget-bytes must be a whole number above 0, got '<v>'`, `... must be at most 2147483647 ...`, `... needs a value`, `... is given twice`).
 
@@ -2432,11 +2455,35 @@ Built verbs:
 
   The ssh logon's NETWORK group (S-1-5-2) is made deny-only in it, so WMI does not treat the command's calls as remote and `taskkill`, `tasklist` and `Get-CimInstance` work from the command (with NETWORK enabled they fail with `ERROR: Access denied`). `gate_win32::NetworkGroup` (`Absent`, `Enabled`, `DenyOnly`, `Disabled`) and `TokenFacts::network` report the group's state.
 
-  The console donor and keeper `cmd.exe` run with the same restricted token, so no elevated process shares the command's console. The box itself, its git calls and its tool restore keep the box's own token; the pnpm install runs with the command's restricted token, with no fallback to the box's own.
+  The console donor and console keeper `cmd.exe` run with the same restricted token, so no elevated process shares the command's console. The box itself, its git calls and its tool restore keep the box's own token; the pnpm install runs with the command's restricted token, with no fallback to the box's own.
 
   The restriction makes the command's token non-elevated with NETWORK deny-only, but it is still a network logon's token and lacks INTERACTIVE, so it is not the token a local run's command has; it is not a boundary against the command, whose code is trusted, since the box's elevated git and tool restore later read what the command wrote.
 
-  When the token cannot be made, or a start with it is refused and a start with the box's own token then works, the box prints `gate: the command runs with the builder session's own token: <error>` on stderr, after the start marker, and the command (with the donor and keeper) runs with the box's own token. A start refused with both tokens says only `could not start`.
+  When the token cannot be made, or a start with it is refused and a start with the box's own token then works, the box prints `gate: the command runs with the builder session's own token: <error>` on stderr, after the start marker, and the command (with the donor and console keeper) runs with the box's own token. A start refused with both tokens says only `could not start`.
+
+  Every MSYS program of one user in one session (Git's `sh.exe` and the tools in `usr\bin`) shares one section, `msys-2.0S5-<install key>\<SID>.1`, whose first word is both its set-up lock and its ready mark. The box's git, the command and the warm-up commands share it in session 0, on either token.
+
+  A start-up killed inside the lock (about 2 ms) while another MSYS process keeps the section open leaves it held: every later `sh.exe` of that user then waits out the runtime's 15 s spinlock and dies with an `add_item ... errno 1` error, until no MSYS process of that user is alive (GATE-387).
+
+  So the box starts an MSYS keeper (`boxside/msys.rs`, not the console keeper): a long-lived `cat.exe` of Git's own `usr\bin`, kept for the run or warm-up. It starts in `in_work_folder` right after the heartbeat starts, once the work folder's lock is held and before the checkout's first git call, and ends when the run returns.
+
+  Lookup: from the `git.exe` the box resolves to (the same `PATH` search its git calls use), it walks at most 3 folders up (`cmd\`, `bin\`, `ucrt64\bin\`, `mingw64\bin\`) for the first folder whose `usr\bin` holds both `cat.exe` and `msys-2.0.dll`. A `git.exe` with no such root above it, such as a shim, has no keeper.
+
+  The folder's owner must be Administrators, SYSTEM or TrustedInstaller. The check is the owner, not write access: it keeps out a Git the user installed in a folder of their own, but an elevated install outside `Program Files` can still be writable by another local user, and the check does not see that.
+
+  The keeper starts on the command's restricted token (the box's own is never the fallback here: the keeper then does not start and says why), in the system folder, on a hidden console, with the box's environment, in an anonymous kill-on-close job of the box's own and never the command's; its three standard streams are pipes the box holds, and the command inherits none of them. Dropping the keeper closes the job and ends it.
+
+  The box writes it the line `gate: msys keeper` and waits for the same line back, at most 30 s, looking at the stop event every 100 ms. The echo shows the runtime has set the section up. A stop during the wait ends it, and the run goes on to its own look at the stop.
+
+  A keeper that cannot start or answer prints `gate: box could not start Git's MSYS keeper: <why>; a Git shell killed as it starts can stall later ones` on stderr once, through the heartbeat's output lock, and the run goes on without it with its own status.
+
+  `<why>` is escaped and names the step that failed: the lookup (`cannot find git: <error>`, `no Git root with usr\bin\cat.exe above <git.exe>`, `cannot read the owner of <folder>: <error>`, `<folder> is not owned by Administrators, SYSTEM or TrustedInstaller`).
+
+  The launch's whys are (`cannot make its restricted token: <error>`, `cannot create its job: <error>`, `cannot start <cat.exe>: <error>`, `cannot run <cat.exe>: <error>`), and the wait's (`it ended without answering`, with `: <the first line of its stderr, at most 200 characters>` when it wrote one; `it did not answer within <s> s`; `it answered '<line>' rather than the line written to it`; `the run was stopped`).
+
+  The lookup's whys come from the real keeper only; a stand-in skips the lookup.
+
+  Until a box with the MSYS keeper is installed, builder setup keeps one MSYS process of the builder user alive as a stopgap: a startup scheduled task as that user, run whether logged on or not, not elevated, with no run-time limit, running Git's `usr\bin\sleep.exe infinity`. It is restarted after every Git for Windows update, so a new runtime never meets an old one's section.
 
   The command's environment gains `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>=safe.directory` and `GIT_CONFIG_VALUE_<n>=*`, where n is the inherited count (0 when there is none) and the count grows by one.
 
@@ -2622,9 +2669,9 @@ A copy whose bytes differ from its item is refused (`the outputs archive copy '<
 
 The console: `gate box run` gives the command a UTF-8 console through a donor console, as the PowerShell wrapper does. Right after it creates the run's job, the box starts a hidden donor, the system's `cmd.exe /d /q /k` (never one found on PATH), in the job. The donor holds a stdin pipe nobody writes so `cmd /k` does not exit, and lives for the whole run, until the wait for the command is over.
 
-To create the command the box starts a keeper `cmd.exe` on its own console, so that console stays alive, then takes the output lock, waiting at most 10 s. It leaves its console, attaches to the donor's and sets the input and output code pages to 65001.
+To create the command the box starts a console keeper `cmd.exe` on its own console, so that console stays alive, then takes the output lock, waiting at most 10 s. It leaves its console, attaches to the donor's and sets the input and output code pages to 65001.
 
-It creates the command suspended in the job, without `CREATE_NO_WINDOW`, so the command inherits the donor's console, then checks the stop event and resumes it. It then returns to its own console, the keeper's (`AttachConsole(ATTACH_PARENT_PROCESS)` as the last resort), ends the keeper, and puts back its standard handles that were not console handles.
+It creates the command suspended in the job, without `CREATE_NO_WINDOW`, so the command inherits the donor's console, then checks the stop event and resumes it. It then returns to its own console, the console keeper's (`AttachConsole(ATTACH_PARENT_PROCESS)` as the last resort), ends the console keeper, and puts back its standard handles that were not console handles.
 
 Before the command starts, a donor that cannot start, an attach or code page that fails, or an output lock not had in 10 s (reason `the box's output is blocked`) does not fail the run: the command runs on the plain hidden console and the box says `gate: remote could not give the command a UTF-8 console (<reason>); running it on the box's default code page`. The line comes after the launch, and only when the launch was not stopped.
 
@@ -2747,6 +2794,10 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   The load rule: a case never asserts that something did or did not happen within a wall-clock window a loaded PC can cross. A case that expects a kill runs a command that sleeps until killed (`support::UNTIL_KILLED`), so a starved gate is late, never wrong.
 
   A case that cannot be written without a timer is a machine-alone case, `#[ignore = "needs the machine alone: run with -Slot critical and --ignored"]`, listed in the nextup profile and run on a critical gate with `--run-ignored only`. Widening a window until it passes on one PC is not a fix: it fails again on a busier one.
+
+  A case machine-alone for another reason keeps the `#[ignore]` reason naming that reason, and the nextup profile lists it with how it runs.
+
+  The MSYS keeper's `boxside::msys::tests::a_start_up_killed_beside_the_keeper_leaves_the_next_sh_working` is `#[ignore = "needs no other MSYS process alive (a direct ssh session, not a routed run): run on a builder"]`: it needs no MSYS process of the user alive, so it runs with `--run-ignored only` over plain ssh on an idle builder and never as a routed run, whose own box keeps an MSYS keeper up and would pass it with the keeper removed.
 - **Git home.** Every git the suite starts, in a case or a harness helper, reads the suite's own git home, `<workspace>\target\tmp\git-home`, not the developer's `~/.gitconfig` and `~/.config/git`: `HOME` and `XDG_CONFIG_HOME` point at it (`support::git_home_for`), the inherited `GIT_CONFIG_*` variables are removed as the gate removes them, and its `.gitconfig` and `git\attributes` are written once per test process. The config pins line endings, longpaths, `untrackedCache`, and auto-maintenance and gc off, so a case's git behaves the same on every PC. A case that tests the gate's own git environment (`routing`, `syncback_conversions`' `isolated`) sets its own values after `prepare`. Auto-maintenance stays on in the product; only the suite turns it off.
 - **Unit-test scratch folders.** The unit tests of `gate`, `gate-state` and `gate-win32` write under `target\tmp\unit-<crate>`, through each crate's `#[cfg(test)]` `test_support::temp_dir()`, not `%TEMP%`. One unit test keeps `%TEMP%`: the one in `remote/mod.rs` that needs a path outside any checkout, since everything under `target` is inside the worktree. Two suite cases in `tests/suite/durations.rs` also keep it: one runs from a folder outside any git repository, and the other only builds a path under the system temp root.
 - **Why the files stay under `target`.** `%TEMP%` lies outside the excluded tree and is scanned, which slows every file create and git start there; the suite keeps its files under `target`, which is excluded.
