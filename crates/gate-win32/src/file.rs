@@ -493,11 +493,11 @@ pub fn reopen_through_filter(file: &File) -> io::Result<File> {
 }
 
 /// Whether the open files `first` and `second` give the same pair of volume serial number and file id ([`file_id`]):
-/// one file, or two files of a file system that gives them both the file index 0, which this does not refuse.
+/// one file.
 ///
 /// # Errors
 ///
-/// The system's error when either handle's pair cannot be read.
+/// The system's error when either handle's pair cannot be read, and [`file_id`]'s error for a zero id.
 pub fn same_file(first: &File, second: &File) -> io::Result<bool> {
     Ok(file_id(first)? == file_id(second)?)
 }
@@ -509,21 +509,34 @@ pub fn same_file(first: &File, second: &File) -> io::Result<bool> {
 /// that does not serve that class (FAT and exFAT) gives its 32-bit volume serial number and 64-bit file index
 /// instead, each widened into the same pair. Which of the two a file gives is the file system's, so two reads of one
 /// volume's files always take the same one. Such a file system may give the index 0 for every file, so a zero id
-/// does not tell its files apart, and a caller that must tell one file from another refuses a zero id.
+/// does not tell its files apart: this refuses a zero id from either source, and no caller ever compares one.
 ///
 /// # Errors
 ///
-/// The system's error when neither can be read.
+/// The system's error when neither can be read; an error of kind [`io::ErrorKind::Unsupported`] when the file system
+/// gives an id of all zeros.
 pub fn file_id(file: &File) -> io::Result<(u64, [u8; 16])> {
     identity_by_either(id_info(file), || index_info(file))
 }
 
 /// The pair [`file_id`] gives for a file whose `FileIdInfo` read gave `by_id`, its index read by `by_index` only when
-/// the file system does not serve that class ([`serves_no_id_info`]).
+/// the file system does not serve that class ([`serves_no_id_info`]); an id of all zeros is refused.
 fn identity_by_either(
     by_id: io::Result<FILE_ID_INFO>,
     by_index: impl FnOnce() -> io::Result<BY_HANDLE_FILE_INFORMATION>,
 ) -> io::Result<(u64, [u8; 16])> {
+    let (volume, file) = identity_read(by_id, by_index)?;
+    if file == [0; 16] {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the file system gives the file no usable file id",
+        ));
+    }
+    Ok((volume, file))
+}
+
+/// The pair `by_id` gives, or, when the file system does not serve `FileIdInfo`, the one `by_index` gives, widened.
+fn identity_read(by_id: io::Result<FILE_ID_INFO>, by_index: impl FnOnce() -> io::Result<BY_HANDLE_FILE_INFORMATION>) -> io::Result<(u64, [u8; 16])> {
     match by_id {
         Ok(information) => Ok((information.VolumeSerialNumber, information.FileId.Identifier)),
         Err(error) if serves_no_id_info(&error) => {
@@ -727,6 +740,26 @@ mod tests {
             Some(ERROR_ACCESS_DENIED.cast_signed()),
             "its own error, the index unread: {denied}"
         );
+    }
+
+    #[test]
+    fn a_zero_file_id_from_either_source_is_refused() {
+        let zero_index = BY_HANDLE_FILE_INFORMATION {
+            dwVolumeSerialNumber: 0x1234_5678,
+            ..BY_HANDLE_FILE_INFORMATION::default()
+        };
+        let by_id = Err(io::Error::from_raw_os_error(ERROR_NOT_SUPPORTED.cast_signed()));
+        let from_index = identity_by_either(by_id, || Ok(zero_index)).expect_err("a zero file index names no one file");
+        let zero_id = FILE_ID_INFO {
+            VolumeSerialNumber: 0x0abc_def0_1234_5678,
+            FileId: FILE_ID_128 { Identifier: [0; 16] },
+        };
+        let from_id = identity_by_either(Ok(zero_id), unasked).expect_err("a zero file id names no one file");
+
+        for refused in [from_index, from_id] {
+            assert_eq!(refused.kind(), io::ErrorKind::Unsupported, "{refused}");
+            assert_eq!(refused.to_string(), "the file system gives the file no usable file id");
+        }
     }
 
     /// Makes a junction at `link` leading to the folder `target`.

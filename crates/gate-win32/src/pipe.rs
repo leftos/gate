@@ -237,8 +237,10 @@ impl PipeServer {
     /// Waits until a client connects, `deadline` passes or one of `wake` is signalled, whichever comes first; a client
     /// that connects at the same moment as either of the others wins. A client that connected before the call is
     /// [`ConnectWait::Connected`] at once; one that connected and closed its end before the call is dropped
-    /// ([`PipeServer::disconnect`]) and the wait goes on. A wait that ends without a client leaves the pipe waiting for
-    /// none, and a later call waits again.
+    /// ([`PipeServer::disconnect`]) and the wait goes on. That retry is bounded and the limits hold across it: after the
+    /// disconnect the pipe takes no client until the next connect starts, so the restarted connect can only pend, and
+    /// `deadline` and `wake` then govern the wait. A wait that ends without a client leaves the pipe waiting for none,
+    /// and a later call waits again.
     ///
     /// A handle of `wake` must stay signalled once set: a manual-reset event or a process handle. An auto-reset event,
     /// a semaphore or a mutex can lose its signal, since the wait takes it and a connect that completes despite the

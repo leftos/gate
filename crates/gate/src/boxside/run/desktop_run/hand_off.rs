@@ -347,7 +347,9 @@ fn exchange(here: &Here<'_, '_>, pinned: &Pinned, job: &Job, program: FileIdenti
 }
 
 /// Waits for the helper to connect by the deadline it shares with the task start: a client that is not the pinned
-/// helper is disconnected and the wait goes on, so only the helper is ever read.
+/// helper is disconnected and the wait goes on, so only the helper is ever read. The deadline and the stop hold across
+/// wrong clients: each is looked at after a wrong client is disconnected, before the wait goes on, so a process that
+/// keeps connecting cannot keep the run past its connect limit.
 fn connected(pinned: &Pinned, wake: &[BorrowedHandle<'_>]) -> Result<(), Fault> {
     let mut another_client = false;
     loop {
@@ -358,6 +360,7 @@ fn connected(pinned: &Pinned, wake: &[BorrowedHandle<'_>]) -> Result<(), Fault> 
                 }
                 another_client = true;
                 pinned.server.disconnect().map_err(|error| Fault::pipe(&error))?;
+                still_waiting(pinned, wake)?;
             }
             Ok(ConnectWait::Woken(0)) => return Err(Fault::Stopped),
             Ok(ConnectWait::Woken(_)) => return Err(Fault::Gone),
@@ -365,6 +368,22 @@ fn connected(pinned: &Pinned, wake: &[BorrowedHandle<'_>]) -> Result<(), Fault> 
             Ok(ConnectWait::TimedOut) => return Err(Fault::did_not_start(NO_CONNECT)),
             Err(error) => return Err(Fault::pipe(&error)),
         }
+    }
+}
+
+/// Looks, without waiting, at the stop, the helper's end and the connect deadline after a wrong client was dropped: a
+/// stop is [`Fault::Stopped`], the helper's end [`Fault::Gone`], a past deadline the refusal for a client that was not
+/// the helper; else the wait for the helper goes on.
+fn still_waiting(pinned: &Pinned, wake: &[BorrowedHandle<'_>]) -> Result<(), Fault> {
+    let looked = pinned
+        .process
+        .wait_or_woken(Duration::ZERO, wake)
+        .map_err(|error| Fault::machinery(format!("the stop and the desktop helper cannot be looked at between connects: {error}")))?;
+    match looked {
+        EndWait::Woken(0) => Err(Fault::Stopped),
+        EndWait::Woken(_) | EndWait::Ended => Err(Fault::Gone),
+        EndWait::Running if Instant::now() >= pinned.connect_by => Err(Fault::did_not_start(WrongHelper::NotTheClient.why())),
+        EndWait::Running => Ok(()),
     }
 }
 
@@ -706,24 +725,14 @@ impl SweptProcess for StoppableProcess {
 ///
 /// # Errors
 ///
-/// The system's error when the file cannot be opened or its identity read, and an error when its id is zero
-/// ([`one_files_identity`]).
+/// The system's error when the file cannot be opened or its identity read, and [`gate_win32::file_id`]'s error when
+/// its id is zero.
 fn identity_of(path: &Path) -> io::Result<FileIdentity> {
     let file = OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
         .share_mode(Share::All.mode())
         .open(path)?;
     let (volume, file) = gate_win32::file_id(&file)?;
-    one_files_identity(volume, file)
-}
-
-/// The identity of one file from its volume serial number `volume` and file id `file`, as [`gate_win32::file_id`]
-/// gives them, refused as unread when the id is zero: a file system that gives its file index in place of a file id
-/// may give 0 for every file, which would make every file on its volume one identity.
-fn one_files_identity(volume: u64, file: [u8; 16]) -> io::Result<FileIdentity> {
-    if file == [0; 16] {
-        return Err(io::Error::other("the file system gives the file no id of its own"));
-    }
     Ok(FileIdentity { volume, file })
 }
 
@@ -1140,21 +1149,6 @@ mod tests {
             pipe,
             Some(format!("{start} the control pipe failed: broken")),
             "a pipe failure is a refusal"
-        );
-    }
-
-    #[test]
-    fn a_file_id_of_zero_is_no_identity() {
-        let mut index = [0_u8; 16];
-        index[..8].copy_from_slice(&42_u64.to_le_bytes());
-        let read = super::one_files_identity(0x1234, index).expect("an id that is not zero is read");
-        assert_eq!((read.volume, read.file), (0x1234, index));
-
-        let zero = super::one_files_identity(0x1234, [0; 16]).expect_err("an id of zero names no one file");
-        assert_eq!(
-            DesktopRefusal::Machinery(super::with_error(super::PROGRAM_UNREAD, &zero)).line(),
-            "gate: not routed: the builder has no desktop session: the program the box sends cannot be read: \
-             the file system gives the file no id of its own"
         );
     }
 
