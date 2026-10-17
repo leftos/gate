@@ -4,13 +4,13 @@
 
 ## Do first
 
+- [ ] GATE-426 Stop asserting that GetSystemTimes only rises in the gate-win32 times test — Urgent · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [/] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [!] GATE-371 Route ops-tower's Playwright tests: the fixture server and browsers on the builder — High · Remote
 - [!] GATE-417 Route collie's vitest and bun test gates to the builder — High · Remote
-- [ ] GATE-421 Install a routed repo's bun packages on the builder, as pnpm's are — High · Remote
 
 ## Remote
 
@@ -105,6 +105,9 @@
 - [ ] GATE-403 Journal why a heavy run stayed on the PC
 - [ ] GATE-405 Check whether the stall and ceiling kill paths count an exited job member as left
 - [ ] GATE-422 Re-read docs/design/gate-box-critical.md against the 16 commits on its named files since 2026-10-13
+- [ ] GATE-423 Make the desktop hand-off suite cases hold on a busy PC
+- [ ] GATE-424 Report .gate/desktop.toml and the desktop consent in gate check
+- [ ] GATE-425 Install the builder's gate.exe and desktop helper in an admin-owned folder
 
 ## Cutover sweep
 
