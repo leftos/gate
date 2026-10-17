@@ -5,6 +5,6 @@
 - Test map: [test-map.md](test-map.md), which tests each source area reaches, as cargo-nextest filtersets.
 - Glossary: [GLOSSARY.md](GLOSSARY.md), every term the docs use in a project sense.
 - Routing a repo: [routing-a-repo.md](routing-a-repo.md), how a caller repo's heavy gates come to route: builder setup, `remote.json`, the routing trial, and what stays local.
-- Designs for queued features: [design/gate-durations.md](design/gate-durations.md) (learned durations, GATE-7), [design/gate-remote-slot.md](design/gate-remote-slot.md) (remote follow-ups, GATE-10), [design/gate-box-critical.md](design/gate-box-critical.md) (a builder's critical pool, GATE-21).
+- Designs for queued features: [design/gate-durations.md](design/gate-durations.md) (learned durations, GATE-7), [design/gate-remote-slot.md](design/gate-remote-slot.md) (remote follow-ups, GATE-10), [design/gate-box-critical.md](design/gate-box-critical.md) (a builder's critical pool, GATE-21), [plans/desktop-session.md](plans/desktop-session.md) (a routed command on the builder's desktop, GATE-231).
 - Plan: Linear team GATE; `docs/plans/MAIN.md` is its generated snapshot.
 - The PowerShell gate this replaces: claude-config's `tools/gate/README.md`, and its behaviour, Win32 surface, cross-process names and consumers as the port needs them: [research/2026-10-09-powershell-gate-inventory.md](research/2026-10-09-powershell-gate-inventory.md).

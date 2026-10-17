@@ -4,7 +4,8 @@
 //! the optional `outputs` (each repo name's globs for the files a routed run brings back), the optional `inputs` (each
 //! repo name's globs for the ignored files a routed run sends) and the optional `siblings` (each repo name's list of
 //! the sibling folder names a routed run of it may carry) and the optional `warmup` (the repo names whose
-//! `.gate/warmup.toml` may warm their builder work folders). Keys match in any letter case and unknown keys are ignored.
+//! `.gate/warmup.toml` may warm their builder work folders) and the optional `desktop` (each repo name's list of the
+//! `.gate/desktop.toml` patterns whose commands may run on the builder's desktop). Keys match in any letter case and unknown keys are ignored.
 //! The text may hold `//` and `/* */` comments and trailing commas, as the
 //! PowerShell gate's JSON reader allows; single-quoted strings are refused. A file that breaks a rule is unusable as a
 //! whole, for the reason the PowerShell gate gives (or, for a host ssh or git would misread, a reason of its own),
@@ -42,6 +43,8 @@ pub struct Config {
     siblings: Result<Vec<(String, Vec<String>)>, String>,
     /// The repo names whose warm-up may run, or why `warmup` cannot be used, which consents to none.
     warmup: Result<Vec<String>, String>,
+    /// Each repo name's allowed desktop patterns, or why `desktop` cannot be used, which allows none.
+    desktop: Result<Vec<(String, Vec<String>)>, String>,
 }
 
 /// A routing file that is there but cannot be used: not a file, unreadable, or refused by [`Config::parse`].
@@ -77,7 +80,8 @@ impl Config {
     /// the gate's own, since the PowerShell gate accepts it. A bad `hosts` leaves the file usable for routing, and
     /// [`Config::builders`] gives its reason. A bad `siblings` leaves it usable too, allowing no sibling, and
     /// [`Config::allowed_siblings`] gives its reason. So does a bad `warmup`, consenting to no warm-up, and
-    /// [`Config::warmup_consented`] gives its reason.
+    /// [`Config::warmup_consented`] gives its reason, and a bad `desktop`, allowing no desktop pattern, and
+    /// [`Config::allowed_desktop`] gives its reason.
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = strict_json(text.strip_prefix('\u{feff}').unwrap_or(text));
         // PowerShell's JSON reader gives no value at all for blank text, which is then no JSON object.
@@ -107,7 +111,23 @@ impl Config {
             inputs,
             siblings: read_siblings(&data),
             warmup: read_warmup_consent(&data),
+            desktop: read_desktop_consent(&data),
         })
+    }
+
+    /// The `.gate/desktop.toml` patterns `desktop` allows `repo`'s commands to run on the builder's desktop, its repo
+    /// name matched in any letter case: none when it does not name the repo. A declared pattern is allowed only when it
+    /// is listed exactly, letter case included.
+    ///
+    /// # Errors
+    ///
+    /// Why `desktop` cannot be used: not an object of arrays of non-empty strings. Such a value allows no desktop
+    /// pattern, and the rest of the file is read whatever it holds.
+    pub fn allowed_desktop(&self, repo: &str) -> Result<&[String], &str> {
+        match &self.desktop {
+            Err(problem) => Err(problem),
+            Ok(table) => Ok(find(table, repo).unwrap_or(&[])),
+        }
     }
 
     /// Whether `warmup` lets `repo` run its warm-up, its repo name matched in any letter case: `false` when it does not
@@ -466,6 +486,35 @@ fn read_warmup_consent(data: &Map<String, Value>) -> Result<Vec<String>, String>
         .map(|(index, item)| match item {
             Value::String(name) if !name.is_empty() => Ok(name.clone()),
             _ => Err(format!("warmup[{index}] is not a non-empty string")),
+        })
+        .collect()
+}
+
+/// The `desktop` table: each repo name's allowed desktop patterns, in file order, each a non-empty string kept as
+/// written; an empty table when the key is missing. A problem writes the repo name quoted and escaped, so no control
+/// character in it reaches the console.
+fn read_desktop_consent(data: &Map<String, Value>) -> Result<Vec<(String, Vec<String>)>, String> {
+    let Some(value) = property(data, "desktop") else {
+        return Ok(Vec::new());
+    };
+    let Value::Object(table) = value else {
+        return Err("desktop must be a JSON object".to_owned());
+    };
+    table
+        .iter()
+        .map(|(repo, list)| {
+            let Value::Array(items) = list else {
+                return Err(format!("desktop.{repo:?} is not an array of strings"));
+            };
+            let patterns = items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| match item {
+                    Value::String(pattern) if !pattern.is_empty() => Ok(pattern.clone()),
+                    _ => Err(format!("desktop.{repo:?}[{index}] is not a non-empty string")),
+                })
+                .collect::<Result<Vec<String>, String>>()?;
+            Ok((repo.clone(), patterns))
         })
         .collect()
 }

@@ -12,6 +12,7 @@ use gate_args::BoxVerb;
 use serde_json::{Map, Value, json};
 
 use crate::remote::snapshot::IDENTITY;
+use crate::wait::REMOTE_LIMIT;
 
 /// The gate a builder runs, from its own `%LOCALAPPDATA%\gate\bin`, as cmd expands it.
 pub(crate) const BOX_EXE: &str = r#""%LOCALAPPDATA%\gate\bin\gate.exe""#;
@@ -120,6 +121,9 @@ pub(crate) struct RunCall<'a> {
     /// The version, `major.minor.patch`, of the builder's Godot install the run uses (`GodotVersion`, sent only when
     /// one is chosen), which a warm-up sends too.
     pub godot_version: Option<&'a str>,
+    /// Whether the run asks for the builder's desktop (`Desktop: true` and `DesktopWait`, the usual remote wait in
+    /// whole seconds, sent only then); a warm-up never sends them, as the box refuses a warm-up on the desktop.
+    pub desktop: bool,
 }
 
 /// The step an inputs call asks the box for: which files the work folder needs (`diff`), or installing them (`put`).
@@ -168,7 +172,9 @@ pub(crate) fn outputs_word(location: &Location, name: &str) -> String {
     word(&object)
 }
 
-/// The payload word of the run call, with the caller's `--env` pairs as `Env` when there is one.
+/// The payload word of the run call, with the caller's `--env` pairs as `Env` when there is one, and `Desktop: true`
+/// with `DesktopWait` ([`REMOTE_LIMIT`] in whole seconds, which the box caps at the run's `Timeout`) for a run that asks
+/// for the builder's desktop.
 pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     let mut object = location.object();
     for (name, value) in [
@@ -187,6 +193,10 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     if !run.env.is_empty() {
         let env: Map<String, Value> = run.env.iter().map(|(name, value)| (name.clone(), Value::String(value.clone()))).collect();
         object.insert("Env".to_owned(), Value::Object(env));
+    }
+    if run.desktop {
+        object.insert("Desktop".to_owned(), json!(true));
+        object.insert("DesktopWait".to_owned(), json!(REMOTE_LIMIT.as_secs()));
     }
     insert_siblings_and_inputs(&mut object, run);
     word(&object)
@@ -344,6 +354,7 @@ mod tests {
             inputs_digest: None,
             env: &[],
             godot_version: None,
+            desktop: false,
         };
         run_word(&location().with_pair("app", &["lib".to_owned(), "tools".to_owned()]), &run)
     }
@@ -464,6 +475,7 @@ mod tests {
             inputs_digest: None,
             env: &[],
             godot_version: None,
+            desktop: false,
         };
         let mut expected = preflight;
         let extra = json!({
@@ -505,6 +517,7 @@ mod tests {
             inputs_digest: Some("ab"),
             env: &[],
             godot_version: None,
+            desktop: false,
         };
 
         let sent = decoded(&run_word(&location(), &run));
@@ -538,6 +551,7 @@ mod tests {
             inputs_digest: None,
             env: &env,
             godot_version: None,
+            desktop: false,
         };
 
         let word = run_word(&location(), &run);
@@ -572,6 +586,7 @@ mod tests {
             inputs_digest: None,
             env: &[],
             godot_version: Some("4.7.2"),
+            desktop: false,
         };
         let commands = warm_commands();
         let warm = WarmCall {
@@ -594,6 +609,49 @@ mod tests {
         );
         assert_eq!(on_the_box(&word).godot_version(), Ok(None));
         assert!(decoded(&warm_word(&location(), &run, &warm)).get("GodotVersion").is_none());
+    }
+
+    #[test]
+    fn a_desktop_run_asks_for_the_desktop_with_the_usual_remote_wait_and_no_other_call_does() {
+        let words = ["./tool.exe".to_owned()];
+        let mut run = RunCall {
+            words: &words,
+            subfolder: "",
+            nonce: "0123456789abcdef0123456789abcdef",
+            snapshot: SHA,
+            outputs: &[],
+            full: false,
+            timeout: 300,
+            host: "builder",
+            sibling_snapshots: &[],
+            inputs_digest: None,
+            env: &[],
+            godot_version: None,
+            desktop: true,
+        };
+        let commands = warm_commands();
+        let warm = WarmCall {
+            commands: &commands,
+            hash: WARM_HASH,
+        };
+
+        let word = run_word(&location(), &run);
+        let sent = decoded(&word);
+        assert_eq!((&sent["Desktop"], &sent["DesktopWait"]), (&json!(true), &json!(60)));
+        assert_eq!(on_the_box(&word).desktop(), Ok(true), "the box reads Desktop back");
+        assert_eq!(on_the_box(&word).desktop_wait(), Ok(Some(60)), "the box reads DesktopWait back");
+        let warm_sent = decoded(&warm_word(&location(), &run, &warm));
+        assert!(
+            warm_sent.get("Desktop").is_none() && warm_sent.get("DesktopWait").is_none(),
+            "a warm-up never asks for the desktop: {warm_sent}"
+        );
+
+        run.desktop = false;
+        let sent = decoded(&run_word(&location(), &run));
+        assert!(
+            sent.get("Desktop").is_none() && sent.get("DesktopWait").is_none(),
+            "a run without the desktop sends neither key: {sent}"
+        );
     }
 
     const WARM_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -622,6 +680,7 @@ mod tests {
             inputs_digest,
             env: &[],
             godot_version: None,
+            desktop: false,
         }
     }
 

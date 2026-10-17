@@ -16,7 +16,7 @@ Coverage is judged from the journal's history of gated commands per repo, not fr
 
 1. Read the repo's own gate commands (its CLAUDE.md, nextup profile, justfile or package scripts) and the tools each needs: toolchains and their pins (`.gate/toolchain.toml`, `rust-toolchain.toml`, `global.json`), shells and utilities, package managers.
 2. Set the builder up. A session installs what a routed repo needs, at the repo's pinned version, and changes the builder's configuration (PATH, ACLs, environment) directly over ssh. After each change it sends claude-config a repo inbox note with what changed and the exact commands, so `tools/build-box/install-toolchains.ps1` follows and a new builder gets the same setup. Run `gate check --builder` from the repo.
-3. Back up `remote.json` beside it (`remote.json.bak-<UTC stamp>`), then add the repo's patterns under `repos.<repo>`, plus `outputs`, `inputs`, `siblings` or `warmup` consent where the repo needs them. Re-read the file just before writing and change only the repo's own keys: other sessions edit it too.
+3. Back up `remote.json` beside it (`remote.json.bak-<UTC stamp>`), then add the repo's patterns under `repos.<repo>`, plus `outputs`, `inputs`, `siblings`, `desktop` or `warmup` consent where the repo needs them. Re-read the file just before writing and change only the repo's own keys: other sessions edit it too.
 4. Run one routing trial (below). The repo counts as routed once its trial passes.
 
 ## The routing trial
@@ -27,6 +27,14 @@ A trial runs the repo's full command routed, once, and assumes a local run passe
 - **A step that passes locally but fails routed** is a routing failure. It is fixed in the builder's setup and that step alone is retried routed, once. If it still fails, the repo's patterns come back out of `remote.json` and the failure is booked as a GATE issue.
 
 A first routed run in a new work folder is cold, so give the trial a generous `--timeout`; the repo's ordinary routed runs keep their usual ceilings. Run one heavy trial at a time.
+
+## A repo with a command that needs the builder's desktop
+
+A repo with a routed command that needs the builder's logged-on desktop (a GUI test run) declares its `-like` patterns in a tracked `.gate/desktop.toml`, `patterns = ["dotnet test *Ui*"]`, at most 32, matched against the same rewritten words as the repo's `repos` patterns. The PC consents in `remote.json`: `"desktop": {"<repo>": ["dotnet test *Ui*"]}`, each pattern listed exactly as the file spells it, letter case included. The first declared pattern a command matches decides,
+
+Without the consent the command runs here with `gate: not routed: desktop pattern '<pattern>' not allowed in remote.json`.
+
+A `.gate/desktop.toml` the gate cannot use keeps every routed command of the repo here with `gate: not routed: .gate/desktop.toml: <problem>`, so fix it before relying on routing. A desktop run holds a remote slot while it waits for the desktop, up to the usual 60 s remote wait. Format and rules: [design.md](design.md#remotejson).
 
 ## A repo whose short runs a cold folder would push past their ceiling
 

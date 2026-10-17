@@ -519,6 +519,8 @@ The lines of a run that starts its command:
 
   Also a declared sibling `remote.json` does not allow: `gate: not routed: sibling <name> is not allowed in remote.json`, or `siblings <a>, <b> are not allowed in remote.json` for more, with `: <problem>` added when the `siblings` value cannot be used.
 
+  For the builder's desktop: a problem with the repo's `.gate/desktop.toml` (`gate: not routed: .gate/desktop.toml: <problem>`, escaped), and the first declared pattern the command matches when `remote.json` does not allow it (`gate: not routed: desktop pattern '<pattern>' not allowed in remote.json`, with `: <problem>` added when the `desktop` value cannot be used).
+
   A sibling folder that cannot be carried says `gate: not routed: sibling <name> <reason>`, `<reason>` being `is a link or a junction`, `is not a folder`, `has a .git that is a link or a junction`, `is the worktree's own folder` or `is the same folder as sibling <other>`.
 
   A repo with warm-up consent and a `.gate/warmup.toml` keeps a run here, after every other local reason, with `gate: not routed: starting a warm-up of the work folder for this worktree on <host>` (and the warm-up is started, as the judge's paragraph below says), `gate: not routed: <host> is warming the work folder for this worktree`, `gate: not routed: the warm-up failed <n> min ago|less than a minute ago: <reason>`.
@@ -990,7 +992,7 @@ Two rolls within one second collide on the archive name: the second archive fail
 
 ### remote.json
 
-`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos` and the optional per-repo `outputs`, `inputs` and `siblings` and the optional `warmup`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
+`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos` and the optional per-repo `outputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
 
 The optional `hosts` is an array of strings naming further builders, which only `gate push` reaches; a routed run goes to `host` alone. Each entry passes the checks `host` does, with the same reasons worded `hosts entries ...`.
 
@@ -999,6 +1001,10 @@ The push order is `host`, then `hosts` in file order, an entry equal to an earli
 `warmup` is an array of repo names, matched in any letter case, that consent to the repo's `.gate/warmup.toml` warming its builder work folders (`Config::warmup_consented`); a repo it does not name, or a file without the key, has no consent. A value that is not an array of non-empty strings consents to none and leaves the rest of the file usable, and `warmup_consented` gives its reason. `gate check` asks the consent only of a repo `repos` lists. A routed run reads the consent from the same `remote.json` read its routing decision used, one read per run.
 
 ops-tower reads only `slots`.
+
+A repo's `.gate/desktop.toml`, which declares the commands that need the builder's desktop, is read by `gate_router::desktop::read_desktop`: one key, `patterns`, an array of at most 32 non-empty `-like` patterns (`patterns = []` declares none). A leading byte order mark is skipped and any other key is a problem.
+
+The first problem wins, the count checked before the entries: `declares no patterns`, `patterns is not an array (TOML <type>)`, `patterns[<i>] is not a string (TOML <type>)`, `patterns[<i>] is empty`, `patterns[<i>] is not a valid wildcard pattern: "<text>"`, `declares more than 32 patterns`, `<key> is not a key (patterns)`, plus the UTF-8 and parse failures. Routing reads it for a matched command ([Routing](#routing)).
 
 A repo's own `.gate/toolchain.toml`, which declares the tools and workloads a routed run's builder needs, is a separate file in the snapshot, not part of `remote.json`: [Routing](#routing) (Toolchain manifest) describes its format.
 
@@ -1458,6 +1464,14 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A root whose id cannot be read keeps the run here with `gate: not routed: cannot read the id of the worktree folder <root>: <error>`, since the worktree lock of every routed run is named by it, and the client checks the folder it opens against it.
 
+  A command that needs the builder's desktop is declared in the repo's `.gate/desktop.toml` and consented to in `remote.json`'s `desktop` ([remote.json](#remotejson)); the check runs after the siblings checks and before the outside-path and nothing-sent checks, on a command the `repos` patterns matched, and the file is read from disk as it stands, through the same guarded read as `siblings.toml` (`.gate` and the file not followed as links, at most 64 KiB).
+
+  The first declared pattern the command's rewritten words match decides, matched against the same words joined by single spaces as the repo's `repos` patterns. No file, `patterns = []` or no matching pattern asks for nothing.
+
+  A matching pattern that `remote.json` does not list for the repo, letter case included, keeps the run here with `gate: not routed: desktop pattern '<pattern>' not allowed in remote.json` (escaped), the line ending `: <problem>` when the `desktop` value cannot be used. A file that cannot be used keeps every routed command of the repo here with `gate: not routed: .gate/desktop.toml: <problem>`, the first problem, on one line and escaped.
+
+  A consented match makes the run a desktop run: `RemoteRun.desktop` is true and the run call asks for the desktop (the client's Desktop bullet, below).
+
   git is found along the gate's own `PATH` (absolute entries only) and run by its full path from the gate's folder, with the `GIT_*` variables that point it at another repository, index or config removed and `core.fsmonitor` off and `core.hooksPath` pointing at a folder that cannot exist (inside the git program's own file), so a gate in a hook that exports `GIT_DIR` still routes and no hook a repository's config names runs.
 
   Each call gets 60 s, after which git is killed and the gate runs here saying `gate: not routed: git did not answer within 60 s` (in whole milliseconds, `1 ms`, when `--test-git-limit-ms` sets a limit that is not a whole number of seconds).
@@ -1486,6 +1500,10 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   `siblings` is an optional object of the same shape as `outputs`, but each value an array of folder names the builder can lay out (`is_layout_name`): the sibling worktrees the machine lets that repo carry, its repo name matched in any letter case and each sibling name exactly. A repo with no entry is allowed none.
 
   A `siblings` that is not an object, or holds a value that is not an array of such names, never refuses the file: it allows no sibling, and the rest of the file is read as usual ([Sibling worktrees](#routing)).
+
+  `desktop` is an optional object mapping a repo name, matched in any letter case, to an array of the `.gate/desktop.toml` patterns the machine lets that repo run on the builder's desktop (`Config::allowed_desktop`); a declared pattern is consented only when listed exactly, letter case included. A repo with no entry is allowed none.
+
+  A `desktop` that is not an object, or holds a value that is not an array of non-empty strings, never refuses the file: it consents to none and the rest is read as usual. The reasons are `desktop must be a JSON object`, `desktop."<repo>" is not an array of strings` and `desktop."<repo>"[<i>] is not a non-empty string`, which the routed run's not-allowed line appends.
 - **The `-like` matcher** is PowerShell's wildcard match, case-insensitive, over the words joined by single spaces. It folds case by simple case folding. Inside a `[...]` set, a non-ASCII member whose .NET case-insensitive equivalents differ (the Kelvin sign and `k`) can match in PowerShell and not here.
 - **The in-worktree path rewrite** (T3) finds a path wherever a drive letter, a colon and a separator start one inside a word (`--flag=X:\a`, `-p:Name=X:\a`, a script's text), each start judged on its own.
 
@@ -1740,6 +1758,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     A status 75 is a refusal only when this run's refusal tag came on stderr before any start marker (`busy`, `tools`, `layout`, `inputs` or `desktop`, the fallback reason); a tag after the marker is ignored, so a command that prints the human busy, tools, layout, inputs or desktop line, or a tag of its own, and exits 75 ends with status 75 and no fallback.
 
     Safety rests on order, not on the nonce being secret (the request is on no command line, but the nonce still appears in the run id, the pipe names and the archive name): the box says the marker before the command can run any code (before it creates the command's process, or, in a desktop run, while the command the helper created is still suspended), and the client ignores every tag once it has heard the marker.
+  - **Desktop.** A routed run whose `RemoteRun.desktop` is true (Routing, the desktop paragraphs) sends `Desktop: true` and `DesktopWait` in its run call's payload (`payload::run_word`), `DesktopWait` being the usual remote wait, `REMOTE_LIMIT` (60 s), which the box caps at the run's `Timeout`. No other call sends either key, a warm-up included; the scripted test client's recorded call has a `desktop` key.
+
+    A desktop run holds a normal remote slot while it waits for the builder's desktop, so other routed runs of this PC can fall back `full` meanwhile, and the wait counts against the client's backstop.
   - **Warm-up call.** A call whose `warmth` is a warm-up (`Warmth::WarmUp` in `remote/mod.rs`) runs the phases above with the run call's payload built by `payload::warm_word`: the run's keys, `Timeout` always among them, with `WarmCommands` and `WarmHash` in place of `Command` and no `Outputs` or `OutputsFull` key. Its limits are a run's, from the call's `timeout`. `gate warm` makes such a call. A routed run's call carries `warmth: {"needs": <hash>}` instead, which only adds the `cold` comparison above.
 
     The run call's end is classed by `warm_end` in `remote/client.rs` and handed back as `RemoteOutcome.warm`. It is warm only on status 0, after the start marker, with the call's last stderr line that is neither a heartbeat nor a protocol line exactly `gate: remote warm {H}` for the `WarmHash` sent. A Ctrl+C is deleted: it leaves no record.

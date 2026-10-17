@@ -136,6 +136,7 @@ fn a_warm_up_from_a_subfolder_is_worded_and_sent_from_the_root() {
     let call = recorded(&call);
     assert_eq!(call["subfolder"], "", "sent from the root: {call}");
     assert_eq!(call["words"], json!([]), "{call}");
+    assert_eq!(call["desktop"], json!(false), "a warm-up never asks for the desktop: {call}");
     let hash = warmup_hash(file.as_bytes());
     let stamp = format!("-p:SourceRevisionId={head}");
     assert_eq!(

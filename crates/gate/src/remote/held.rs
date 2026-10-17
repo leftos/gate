@@ -420,6 +420,7 @@ pub(super) mod tests {
                 inputs: Vec::new(),
                 dropped_no_build: false,
                 outputs_withheld: false,
+                desktop: false,
             }
         }
     }

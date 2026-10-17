@@ -2140,6 +2140,7 @@ mod tests {
             words: &[],
             outputs: &[],
             outputs_withheld: false,
+            desktop: false,
             inputs: &[],
             log: &log,
             timeout: 60,
@@ -2950,6 +2951,7 @@ mod tests {
             words: &[],
             outputs: &[],
             outputs_withheld: false,
+            desktop: false,
             inputs: &[],
             log,
             timeout: 60,
@@ -3652,6 +3654,7 @@ mod tests {
             inputs: Vec::new(),
             dropped_no_build: false,
             outputs_withheld: false,
+            desktop: false,
         };
         let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
         let mut call = call_in(&root, &case.log, &state);

@@ -653,6 +653,7 @@ fn call_of<'a>(
         words: &[],
         outputs: &[],
         outputs_withheld: false,
+        desktop: false,
         inputs: &target.inputs,
         bring_tracked: &[],
         env: &[],

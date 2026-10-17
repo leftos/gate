@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use gate_router::{
     BuildSettings, BuildTarget, Config, ConfigProblem, DROPPED_NO_BUILD_LINE, DotnetTarget, Facts, Inputs, LocalReason, NO_OUTPUTS_LINE,
-    PROJECT_EXTENSIONS, Place, RemoteRun, Route, SiblingFolder, Slot, Target, build_settings, builder_words, decide, dotnet_builds, dotnet_target,
-    is_cargo, is_dotnet, is_usable_host, sdk_build_target, target, without_no_build, work_folder_key,
+    PROJECT_EXTENSIONS, Pattern, Place, RemoteRun, Route, SiblingFolder, Slot, Target, build_settings, builder_words, decide, dotnet_builds,
+    dotnet_target, is_cargo, is_dotnet, is_usable_host, sdk_build_target, target, without_no_build, work_folder_key,
 };
 
 use crate::support::{FakeFacts, HEAD, ROOT, carried, fake_id, heavy, place_at, sibling_root, words};
@@ -82,10 +82,12 @@ fn the_control_command_routes_from_the_root() {
             inputs: Vec::new(),
             dropped_no_build: false,
             outputs_withheld: false,
+            desktop: false,
         }
     );
     assert_eq!(run.lines(), Vec::<&str>::new());
     assert_eq!(facts.asked(), ["config", "place", "file_in_folder dotnet", "head_sha"]);
+    assert_eq!(facts.desktop_read.get(), 1, "a routed command reads the desktop file once");
 }
 
 #[test]
@@ -1739,4 +1741,146 @@ fn a_sibling_folder_that_is_the_root_or_another_sibling_keeps_the_run_local() {
     let distinct = checked(Vec::new());
     let run = routed(decide(&heavy(&command), &distinct));
     assert_eq!(run.siblings, [carried("b"), carried("c"), carried("yaat-server")]);
+}
+
+/// The patterns `texts`, each parsed as `.gate/desktop.toml` declares it.
+fn patterns(texts: &[&str]) -> Vec<Pattern> {
+    texts.iter().map(|text| Pattern::parse(text).expect("a valid pattern")).collect()
+}
+
+/// A gate at the root whose `.gate/desktop.toml` declares `declared`, under a routing file routing `dotnet *` and
+/// `tool *` of `yaat` whose `desktop` value is `desktop` (no key at all for `None`).
+fn desktop_facts(desktop: Option<&str>, declared: &[&str]) -> FakeFacts {
+    let key = desktop.map_or_else(String::new, |value| format!(r#", "desktop": {value}"#));
+    let config = Config::parse(&format!(r#"{{"host": "builder-1", "repos": {{"yaat": ["dotnet *", "tool *"]}}{key}}}"#)).expect("usable");
+    FakeFacts {
+        desktop: Ok(patterns(declared)),
+        ..FakeFacts::with_config(config)
+    }
+}
+
+#[test]
+fn a_command_matching_a_consented_desktop_pattern_asks_for_the_desktop() {
+    let facts = desktop_facts(Some(r#"{"YAAT": ["dotnet build*", "dotnet test*"]}"#), &["dotnet test*", "dotnet build*"]);
+    let run = routed(decide(&heavy(&words(&["dotnet", "test"])), &facts));
+    assert!(run.desktop, "the first declared pattern that matches is listed");
+    assert_eq!(run.pattern, "dotnet *", "the repos pattern still names the route");
+    assert_eq!(facts.desktop_read.get(), 1);
+}
+
+#[test]
+fn a_routed_command_matching_no_declared_pattern_routes_without_the_desktop() {
+    let facts = desktop_facts(Some(r#"{"yaat": ["dotnet test*"]}"#), &["dotnet test*"]);
+    let run = routed(decide(&heavy(&words(&["tool", "x"])), &facts));
+    assert!(!run.desktop);
+}
+
+#[test]
+fn a_declared_desktop_pattern_remote_json_does_not_list_keeps_its_commands_here() {
+    for (case, desktop, line) in [
+        (
+            "no key",
+            None,
+            "gate: not routed: desktop pattern 'dotnet test*' not allowed in remote.json",
+        ),
+        (
+            "no entry",
+            Some(r#"{"other": ["dotnet test*"]}"#),
+            "gate: not routed: desktop pattern 'dotnet test*' not allowed in remote.json",
+        ),
+        (
+            "another case",
+            Some(r#"{"yaat": ["Dotnet test*"]}"#),
+            "gate: not routed: desktop pattern 'dotnet test*' not allowed in remote.json",
+        ),
+        (
+            "another pattern",
+            Some(r#"{"yaat": ["tool *"]}"#),
+            "gate: not routed: desktop pattern 'dotnet test*' not allowed in remote.json",
+        ),
+        (
+            "not an object",
+            Some(r#"["dotnet test*"]"#),
+            "gate: not routed: desktop pattern 'dotnet test*' not allowed in remote.json: desktop must be a JSON object",
+        ),
+        (
+            "a bad entry",
+            Some(r#"{"yaat": ["dotnet test*", 3]}"#),
+            "gate: not routed: desktop pattern 'dotnet test*' not allowed in remote.json: desktop.\"yaat\"[1] is not a non-empty string",
+        ),
+    ] {
+        let facts = desktop_facts(desktop, &["dotnet test*", "tool *"]);
+        assert_eq!(
+            local_line(&decide(&heavy(&words(&["dotnet", "test"])), &facts)).as_deref(),
+            Some(line),
+            "{case}"
+        );
+    }
+    let facts = desktop_facts(Some(r#"{"yaat": ["tool *"]}"#), &["dotnet test*", "tool *"]);
+    assert!(
+        routed(decide(&heavy(&words(&["tool", "x"])), &facts)).desktop,
+        "an unlisted pattern stops only the commands it matches"
+    );
+    assert!(!routed(decide(&heavy(&words(&["dotnet", "build"])), &facts)).desktop);
+}
+
+#[test]
+fn the_first_declared_pattern_that_matches_decides_even_when_a_later_one_is_allowed() {
+    let facts = desktop_facts(Some(r#"{"yaat": ["dotnet test*"]}"#), &["dotnet *", "dotnet test*"]);
+    assert_eq!(
+        local_line(&decide(&heavy(&words(&["dotnet", "test"])), &facts)).as_deref(),
+        Some("gate: not routed: desktop pattern 'dotnet *' not allowed in remote.json")
+    );
+}
+
+#[test]
+fn a_not_allowed_desktop_pattern_is_said_before_a_word_outside_the_worktree() {
+    let command = words(&["dotnet", "test", r"..\other\x.csproj"]);
+    let undeclared = desktop_facts(None, &[]);
+    assert_eq!(
+        local_line(&decide(&heavy(&command), &undeclared)).as_deref(),
+        Some(r"gate: not routed: ..\other\x.csproj is outside the worktree"),
+        "the command alone names a path outside"
+    );
+    let declared = desktop_facts(None, &["dotnet test*"]);
+    assert_eq!(
+        local_line(&decide(&heavy(&command), &declared)).as_deref(),
+        Some("gate: not routed: desktop pattern 'dotnet test*' not allowed in remote.json")
+    );
+}
+
+#[test]
+fn a_not_allowed_desktop_pattern_is_shown_escaped() {
+    let facts = desktop_facts(None, &["dotnet test\u{1b}*"]);
+    assert_eq!(
+        local_line(&decide(&heavy(&words(&["dotnet", "test\u{1b}x"])), &facts)).as_deref(),
+        Some(r"gate: not routed: desktop pattern 'dotnet test\u{1b}*' not allowed in remote.json")
+    );
+}
+
+#[test]
+fn a_desktop_file_problem_keeps_every_routed_command_here() {
+    for command in [&["dotnet", "test"][..], &["tool", "x"]] {
+        let facts = FakeFacts {
+            desktop: Err("line 1, column 3:\r\n  bad\u{1b}[31m".to_owned()),
+            ..desktop_facts(Some(r#"{"yaat": ["dotnet test*"]}"#), &[])
+        };
+        assert_eq!(
+            local_line(&decide(&heavy(&words(command)), &facts)).as_deref(),
+            Some(r"gate: not routed: .gate/desktop.toml: line 1, column 3: bad\u{1b}[31m"),
+            "{command:?}"
+        );
+    }
+}
+
+#[test]
+fn a_command_the_repos_patterns_do_not_route_reads_no_desktop_file() {
+    for desktop in [Ok(patterns(&["cargo *"])), Err("bad".to_owned())] {
+        let facts = FakeFacts {
+            desktop,
+            ..desktop_facts(Some(r#"{"yaat": ["cargo *"]}"#), &[])
+        };
+        assert_eq!(decide(&heavy(&words(&["cargo", "test"])), &facts), SILENT);
+        assert_eq!(facts.desktop_read.get(), 0);
+    }
 }

@@ -2,7 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 
-use gate_router::{CarriedSibling, Config, ConfigProblem, Facts, FolderId, Inputs, Place, SiblingFolder, SiblingRoot, Slot};
+use gate_router::{CarriedSibling, Config, ConfigProblem, Facts, FolderId, Inputs, Pattern, Place, SiblingFolder, SiblingRoot, Slot};
 
 /// The worktree root the fixtures use.
 pub const ROOT: &str = "X:/dev/yaat.wt/a";
@@ -90,6 +90,10 @@ pub struct FakeFacts {
     pub asked: RefCell<Vec<String>>,
     /// How many times the siblings file was read, kept apart from [`FakeFacts::asked`].
     pub siblings_read: Cell<u32>,
+    /// What `.gate/desktop.toml` gives.
+    pub desktop: Result<Vec<Pattern>, String>,
+    /// How many times the desktop file was read, kept apart from [`FakeFacts::asked`].
+    pub desktop_read: Cell<u32>,
     /// Each root asked whether a git worktree is there, in order, kept apart from [`FakeFacts::asked`].
     pub presence_asked: RefCell<Vec<String>>,
 }
@@ -116,6 +120,8 @@ impl FakeFacts {
             root_id: Ok(fake_id(ROOT)),
             asked: RefCell::new(Vec::new()),
             siblings_read: Cell::new(0),
+            desktop: Ok(Vec::new()),
+            desktop_read: Cell::new(0),
             presence_asked: RefCell::new(Vec::new()),
         }
     }
@@ -183,6 +189,11 @@ impl Facts for FakeFacts {
     fn siblings(&self, _place: &Place) -> Result<Vec<String>, String> {
         self.siblings_read.set(self.siblings_read.get() + 1);
         self.siblings.clone()
+    }
+
+    fn desktop(&self, _place: &Place) -> Result<Vec<Pattern>, String> {
+        self.desktop_read.set(self.desktop_read.get() + 1);
+        self.desktop.clone()
     }
 
     fn sibling_folder(&self, root: &str) -> Result<SiblingFolder, String> {

@@ -1182,6 +1182,49 @@ fn the_client_is_called_with_the_repo_s_inputs() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let call = recorded(&call);
     assert_eq!(call["inputs"], json!([".tmp/helper/**", "keys.json"]), "{call}");
+    assert_eq!(call["desktop"], json!(false), "a repo with no desktop file asks for no desktop: {call}");
+}
+
+/// Declares `*tool* argv*` in the case's `.gate/desktop.toml` and writes a routing file routing `*tool*` whose
+/// `desktop` value allows the repo `allowed`.
+fn declare_desktop(case: &Case, allowed: &[&str]) {
+    let folder = case.folder();
+    fs::create_dir_all(folder.join(".gate")).expect("the .gate folder can be made");
+    fs::write(folder.join(".gate").join("desktop.toml"), "patterns = ['*tool* argv*']\n").expect("the declaration can be written");
+    let routing = json!({ "host": HOST, "repos": { repo(case): ["*tool*"] }, "desktop": { repo(case): allowed } });
+    write_remote_json(case, &routing.to_string());
+}
+
+#[test]
+fn a_command_matching_a_consented_desktop_pattern_asks_the_client_for_the_desktop() {
+    let case = routed_case("routing-call-desktop");
+    declare_desktop(&case, &["*tool* argv*"]);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "argv", "a"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let call = recorded(&call);
+    assert_eq!(call["desktop"], json!(true), "{call}");
+}
+
+#[test]
+fn a_declared_desktop_pattern_the_routing_file_does_not_allow_runs_here_saying_so() {
+    let case = routed_case("routing-desktop-not-allowed");
+    declare_desktop(&case, &["*TOOL* argv*"]);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "argv", "a"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: not routed: desktop pattern '*tool* argv*' not allowed in remote.json\n"),
+        "a pattern allowed in another letter case is not allowed: {outcome:?}"
+    );
+    assert!(!call.exists(), "the client never ran");
+    assert_local(&events(&case), None);
 }
 
 #[test]

@@ -208,6 +208,15 @@ pub trait Facts {
     /// saying so.
     fn siblings(&self, place: &Place) -> Result<Vec<String>, String>;
 
+    /// The patterns the worktree root's `.gate/desktop.toml` declares, read from disk as it stands; none when there is
+    /// no such file. Asked only of a command one of its repo's patterns matched, once its siblings pass their checks.
+    ///
+    /// # Errors
+    ///
+    /// The file's first problem, when it cannot be read, does not parse or has any problem; the gate then runs here,
+    /// saying so.
+    fn desktop(&self, place: &Place) -> Result<Vec<Pattern>, String>;
+
     /// The folder of the sibling whose root is `root`, which the decision builds as the worktree root's parent and the
     /// sibling's name: its parent opened following links, then the name opened beneath it without following one.
     /// Missing when nothing is there or it holds no `.git`; refused, with the reason, when it is a link or a junction,
@@ -290,6 +299,11 @@ pub enum LocalReason {
     SiblingsNotAllowed { names: Vec<String>, problem: Option<String> },
     /// The worktree root, which declares siblings, has a folder name `leaf` the builder cannot lay out.
     LeafNotLaidOut { leaf: String },
+    /// `.gate/desktop.toml` cannot be read or has a problem; `problem` is its first, on one line.
+    DesktopFile { problem: String },
+    /// The first declared desktop pattern the command matches, `pattern`, is not among those `remote.json`'s `desktop`
+    /// allows the repo; `problem` is why that value cannot be used, when it cannot.
+    DesktopNotAllowed { pattern: String, problem: Option<String> },
 }
 
 impl LocalReason {
@@ -307,6 +321,14 @@ impl LocalReason {
             Self::SiblingRefused { name, reason } => format!("gate: not routed: sibling {name} {reason}"),
             Self::SiblingsNotAllowed { names, problem } => not_allowed_line(names, problem.as_deref()),
             Self::LeafNotLaidOut { leaf } => format!("gate: not routed: the worktree folder name {leaf} cannot be laid out on the builder"),
+            Self::DesktopFile { problem } => format!("gate: not routed: .gate/desktop.toml: {problem}"),
+            Self::DesktopNotAllowed { pattern, problem } => {
+                let problem = problem.as_ref().map_or_else(String::new, |problem| format!(": {problem}"));
+                format!(
+                    "gate: not routed: desktop pattern '{}' not allowed in remote.json{problem}",
+                    escaped(pattern)
+                )
+            }
         }
     }
 }
@@ -326,6 +348,10 @@ fn not_allowed_line(names: &[String], problem: Option<&str>) -> String {
 
 /// A command routed to the builder.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent fact of the route that a caller reads by name; no two form a state machine"
+)]
 pub struct RemoteRun {
     /// The builder's host alias.
     pub host: String,
@@ -369,6 +395,9 @@ pub struct RemoteRun {
     pub dropped_no_build: bool,
     /// Whether outputs were withheld from a `--no-build` command.
     pub outputs_withheld: bool,
+    /// Whether the run asks for the builder's desktop: the first `.gate/desktop.toml` pattern its rewritten words match
+    /// is one `remote.json`'s `desktop` allows the repo.
+    pub desktop: bool,
 }
 
 impl RemoteRun {
@@ -419,7 +448,9 @@ impl RemoteRun {
 /// as a program's name that names `git` or `prek` keeps it here too. A matched command still runs
 /// here, saying why, when the worktree's `.gate/siblings.toml` has a problem or declares a sibling the routing file's
 /// `siblings` does not allow the repo, or declares siblings from a root folder name the builder cannot lay out, a
-/// sibling named like that folder or one with no git worktree beside the root; when
+/// sibling named like that folder or one with no git worktree beside the root; when its `.gate/desktop.toml` has a
+/// problem, or the first pattern it declares that the words match is not one the routing file's `desktop` allows the
+/// repo, listed exactly; when
 /// a word names a path outside the worktree and its siblings; or when the gate's folder holds nothing the snapshot
 /// sends; and so does one whose facts cannot be read.
 #[must_use]
@@ -505,6 +536,8 @@ struct Matched {
     outside: Option<String>,
     /// Whether the rewrite sent the command's first word as a program's name ([`Rewritten::program_named`]).
     program_named: bool,
+    /// Whether the command asks for the builder's desktop ([`check_desktop`]).
+    desktop: bool,
 }
 
 fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<RemoteRun, Here> {
@@ -761,13 +794,39 @@ fn matched(config: &Config, words: &[String], facts: &dyn Facts) -> Result<Match
     }
     let pattern = first_match(opened.patterns, &sent.words).ok_or(None)?;
     let target = settle(config, opened, facts)?;
+    let desktop = check_desktop(config, &target, &sent.words, facts)?;
     Ok(Matched {
         target,
         pattern,
         words: sent.words,
         outside: sent.outside,
         program_named: sent.program_named,
+        desktop,
     })
+}
+
+/// Whether a matched command asks for the builder's desktop: the first pattern of the worktree's `.gate/desktop.toml`
+/// that its rewritten `words` match, joined by single spaces as the repo's patterns see them, is one `remote.json`'s
+/// `desktop` allows the repo, listed exactly (letter case included); `false` when no declared pattern matches. Keeps the
+/// command here, saying why, when the file has a problem, shown [`escaped`], or when that pattern is not allowed, every
+/// one when `desktop` cannot be used.
+fn check_desktop(config: &Config, target: &Target, words: &[String], facts: &dyn Facts) -> Result<bool, Here> {
+    let declared = facts.desktop(&target.place).map_err(|problem| {
+        Some(LocalReason::DesktopFile {
+            problem: escaped(&fold_lines(&problem)),
+        })
+    })?;
+    let Some(pattern) = first_match(&declared, words) else {
+        return Ok(false);
+    };
+    let (allowed, problem) = match config.allowed_desktop(&target.repo) {
+        Ok(patterns) => (patterns, None),
+        Err(problem) => (&[][..], Some(fold_lines(problem))),
+    };
+    if allowed.contains(&pattern) {
+        return Ok(true);
+    }
+    Err(Some(LocalReason::DesktopNotAllowed { pattern, problem }))
 }
 
 /// A worktree whose repo the routing file lists, with the patterns it lists and the siblings its siblings file declares,
@@ -1073,6 +1132,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         pattern,
         words: sent,
         program_named,
+        desktop,
         ..
     } = matched;
     let sent_count = sent.len();
@@ -1108,6 +1168,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         inputs: target.inputs,
         dropped_no_build,
         outputs_withheld,
+        desktop,
     }
 }
 

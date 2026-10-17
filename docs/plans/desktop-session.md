@@ -271,7 +271,7 @@ Worst case: the protocol code is new, unsafe-heavy Win32 work. It is testable en
 
 Worst case: the journal's `busy` mixes a busy worktree with a busy desktop, and only the line tells them apart.
 
-**D5. Detecting a busy desktop.** Use the I21-I23 mutex. The wait is bounded by a payload `DesktopWait`: what is left of the PC's 60 s remote wait, with a small floor. That matches the owner's "up to the usual remote wait".
+**D5. Detecting a busy desktop.** Use the I21-I23 mutex. The wait is bounded by a payload `DesktopWait`: the constant usual remote wait, 60 s (`REMOTE_LIMIT`), which the box caps at the run's timeout. That matches the owner's "up to the usual remote wait".
 
 Worst case:
 - A losing run pays push, checkout and restore before it falls back.

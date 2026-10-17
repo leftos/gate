@@ -245,6 +245,8 @@ pub(crate) struct RemoteCall<'a> {
     pub outputs_withheld: bool,
     /// The input globs the run sends: the repo's `inputs` list, none when it has no entry.
     pub inputs: &'a [String],
+    /// Whether the run asks for the builder's desktop, as the route's decision judged it; a warm-up never does.
+    pub desktop: bool,
     /// The `--bring-tracked` globs: a fetched output git tracks is installed only when one matches it.
     pub bring_tracked: &'a [String],
     /// The caller's `--env` pairs, sent in the run call's `Env` for the command on the builder.
@@ -478,6 +480,7 @@ mod snapshot_only {
                 words: &[],
                 outputs: &[],
                 outputs_withheld: false,
+                desktop: false,
                 inputs: &[],
                 log,
                 timeout: 3600,
@@ -771,6 +774,7 @@ mod scripted {
             "words": call.words,
             "outputs": call.outputs,
             "inputs": call.inputs,
+            "desktop": call.desktop,
             "log": call.log.to_string_lossy(),
             "timeout": call.timeout,
             "stall": call.stall,

@@ -31,7 +31,7 @@ pub(crate) const HEARTBEAT: Duration = Duration::from_secs(30);
 /// waiters only once it took or lent something, so a pass that found no room for this reason alone looks again soon.
 const BUSY_RETRY: Duration = Duration::from_millis(100);
 /// How long a routed run waits for a remote slot before it falls back here.
-const REMOTE_LIMIT: Duration = Duration::from_secs(60);
+pub(crate) const REMOTE_LIMIT: Duration = Duration::from_secs(60);
 
 /// A probe of a pool's slots: for each, whether some gate has it open, `None` for a slot that could not be probed.
 type Probe = Vec<Option<bool>>;

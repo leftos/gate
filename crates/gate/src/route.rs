@@ -18,7 +18,8 @@ use gate_router::warm::{
     warming_line,
 };
 use gate_router::{
-    Config, ConfigProblem, Facts, FolderId, Inputs, LocalReason, Place, RemoteRun, Route, SiblingFolder, decide, dropped_env, dropped_env_line,
+    Config, ConfigProblem, Facts, FolderId, Inputs, LocalReason, Pattern, Place, RemoteRun, Route, SiblingFolder, decide, dropped_env,
+    dropped_env_line,
 };
 use gate_state::v1;
 use gate_win32::{Detached, DetachedLaunch, Share};
@@ -421,6 +422,10 @@ impl Facts for Machine<'_> {
         read_siblings(Path::new(&place.root))
     }
 
+    fn desktop(&self, place: &Place) -> Result<Vec<Pattern>, String> {
+        read_desktop(Path::new(&place.root))
+    }
+
     fn sibling_folder(&self, root: &str) -> Result<SiblingFolder, String> {
         sibling_folder(root)
     }
@@ -504,8 +509,17 @@ fn read_siblings(root: &Path) -> Result<Vec<String>, String> {
     }
 }
 
+/// The patterns `<root>\.gate\desktop.toml` declares as it stands on disk, read by [`read_gate_file`]: no file declares
+/// none, and a file that cannot be read, does not parse or has any problem gives its first problem.
+fn read_desktop(root: &Path) -> Result<Vec<Pattern>, String> {
+    match read_gate_file(root, "desktop.toml")? {
+        Some(bytes) => gate_router::desktop::read_desktop(&bytes),
+        None => Ok(Vec::new()),
+    }
+}
+
 /// The bytes of the file `name` of `<root>\.gate` as it stands on disk; `None` when there is no such file. Routing reads
-/// `siblings.toml` and `gate check` reads `toolchain.toml` and `siblings.toml` through this.
+/// `siblings.toml` and `desktop.toml`, and `gate check` reads `toolchain.toml` and `siblings.toml` through this.
 ///
 /// `.gate` is opened as itself, not following a link, and held open until the file is read, sharing reading, writing
 /// and deletion so it never blocks a checkout. A `.gate` that is a link or a junction (any name-surrogate reparse

@@ -462,6 +462,53 @@ fn a_bad_warmup_value_consents_to_none_and_leaves_the_rest_of_the_file_alone() {
     }
 }
 
+/// The routing file listing `g` with `desktop` holding `value`.
+fn desktop_file(value: &str) -> Config {
+    Config::parse(&format!(
+        r#"{{"host": "builder-1", "slots": 2, "repos": {{"g": ["x"]}}, "siblings": {{"g": ["b"]}}, "warmup": ["g"], "desktop": {value}}}"#
+    ))
+    .expect("routing reads the file whatever desktop holds")
+}
+
+#[test]
+fn desktop_gives_each_repo_s_allowed_patterns_as_written() {
+    let config = desktop_file(r#"{"Gate": ["dotnet test *", "Tool*"], "other": []}"#);
+    let allowed = |repo: &str| config.allowed_desktop(repo).map(<[String]>::to_vec);
+    assert_eq!(
+        allowed("gate"),
+        Ok(vec!["dotnet test *".to_owned(), "Tool*".to_owned()]),
+        "the repo name in any case"
+    );
+    assert_eq!(allowed("other"), Ok(Vec::new()), "an empty list");
+    assert_eq!(allowed("missing"), Ok(Vec::new()), "a repo it does not name consents to none");
+    let none = Config::parse(r#"{"host": "builder-1", "repos": {}}"#).expect("usable");
+    assert_eq!(none.allowed_desktop("gate"), Ok(&[][..]), "no desktop key consents to none");
+    let keyed = Config::parse(r#"{"host": "builder-1", "repos": {}, "DeskTop": {"gate": ["x*"]}}"#).expect("usable");
+    assert_eq!(keyed.allowed_desktop("gate"), Ok(&["x*".to_owned()][..]), "the key in any case");
+}
+
+#[test]
+fn a_bad_desktop_value_consents_to_none_and_leaves_the_rest_of_the_file_alone() {
+    for (value, problem) in [
+        (r#"["x"]"#, "desktop must be a JSON object"),
+        ("null", "desktop must be a JSON object"),
+        (r#""x""#, "desktop must be a JSON object"),
+        (r#"{"g": "x"}"#, r#"desktop."g" is not an array of strings"#),
+        (r#"{"g": {}}"#, r#"desktop."g" is not an array of strings"#),
+        (r#"{"g": ["x", ""]}"#, r#"desktop."g"[1] is not a non-empty string"#),
+        (r#"{"g": [3]}"#, r#"desktop."g"[0] is not a non-empty string"#),
+        (r#"{"other": [null], "g": ["x"]}"#, r#"desktop."other"[0] is not a non-empty string"#),
+    ] {
+        let config = desktop_file(value);
+        assert_eq!(config.allowed_desktop("g"), Err(problem), "{value}");
+        assert_eq!(config.host(), "builder-1", "{value}");
+        assert_eq!(config.slots(), 2, "{value}");
+        assert_eq!(pattern_texts(&config, "g"), ["x"], "{value}");
+        assert_eq!(config.allowed_siblings("g"), Ok(&["b".to_owned()][..]), "{value}");
+        assert_eq!(config.warmup_consented("g"), Ok(true), "{value}");
+    }
+}
+
 #[test]
 fn an_ssh_alias_or_user_at_host_of_allowed_characters_is_accepted() {
     for host in ["builder", "build-box.lan", "user@build-box", "10.0.0.5", "b_1"] {

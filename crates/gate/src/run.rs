@@ -685,6 +685,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         outputs: &remote.outputs,
         outputs_withheld: remote.outputs_withheld,
         inputs: &remote.inputs,
+        desktop: remote.desktop,
         log: log.path(),
         timeout: ceiling,
         usual,

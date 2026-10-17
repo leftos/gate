@@ -1144,6 +1144,7 @@ impl Attempt<'_, '_> {
             inputs_digest: inputs.as_ref().map(|built| built.digest.as_str()),
             env: self.call.env,
             godot_version: godot_version.as_deref(),
+            desktop: self.call.desktop,
         };
         let run_input = payload::input(&self.run_word(&location, &run), sent.manifest.as_deref());
         self.pushes(&repos, &snapshots, &prepared.created)?;
@@ -4244,6 +4245,7 @@ mod tests {
             words: &[],
             outputs: &[],
             outputs_withheld: false,
+            desktop: false,
             inputs: &[],
             log,
             timeout: 60,
@@ -6481,6 +6483,7 @@ mod tests {
             words: &[],
             outputs: &[],
             outputs_withheld: false,
+            desktop: false,
             inputs: &[],
             log,
             timeout: 60,
@@ -6541,6 +6544,7 @@ mod tests {
         let warm_call = RemoteCall {
             outputs: &globs,
             outputs_withheld: true,
+            desktop: false,
             warmth: Warmth::WarmUp {
                 commands: &warm_up,
                 hash: WARM_HASH,
