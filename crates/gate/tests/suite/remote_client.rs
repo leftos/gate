@@ -6681,6 +6681,167 @@ fn a_godot_run_of_a_repo_pinning_several_godot_versions_falls_back_saying_why() 
     assert_eq!(runs(&case), (1, 0), "the command ran once, here: {outcome:?}");
 }
 
+/// A Godot command of a case runs here, saying `why` before the parity line, on the console and in the log: the
+/// command it then runs here is the fake Godot console of the install folder `local`, and `root` is the builder's
+/// `GATE_GODOT_ROOT`.
+fn a_godot_run_refused_saying_why(case: &Case, root: &Path, local: &Path, why: &str) -> Outcome {
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({ "host": HOST, "slots": 2, "repos": { &repo: ["Godot_console*"] }, "outputs": { &repo: [] } });
+    write_remote_json(case, &routing.to_string());
+    let box_path = box_path_with_tools(case, &listing(&[BUILDER_SDK]), &[], &[]);
+    let mut local_path = OsString::from(local);
+    local_path.push(";");
+    local_path.push(&box_path);
+    let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(case, "out.log", &steps, &["Godot_console.exe", "--version", "mark", RAN]);
+    gate.env("PATH", &local_path)
+        .env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING)
+        .env_remove("GODOT_PATH");
+    set_godot_root(&mut gate, Some(root));
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    assert_eq!(fallbacks(&own(case, pid)), ["parity"], "{outcome:?}");
+    let said: Vec<&str> = outcome.stderr.lines().filter(|line| *line == why || is_parity_line(line)).collect();
+    assert_eq!(said, [why, PARITY_LINE], "{outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(log.lines().any(|line| line == why), "{log}");
+    assert_eq!(calls(&steps), ["preflight"], "the preflight alone reached the builder");
+    assert_eq!(runs(case), (1, 0), "the command ran once, here: {outcome:?}");
+    outcome
+}
+
+/// The warning a Godot command of a repo pinning no Godot version says, naming the install `version` the run uses.
+fn no_pin_warning(version: &str) -> String {
+    format!(
+        "gate: warning: the repo pins no Godot version, so this run uses {version}, the newest on {HOST}; pin the \
+         version it needs in .gate/toolchain.toml ([tools] godot = \"x.y.z\") or as the .csproj's Godot.NET.Sdk version"
+    )
+}
+
+/// A Godot command of a repo pinning no Godot version runs on the builder's newest install, warning that it chose it.
+#[test]
+fn a_godot_run_of_a_repo_pinning_no_godot_version_runs_on_the_newest_and_warns() {
+    let case = client_case("client-godot-no-pin-newest");
+    write(&case, "src/App/Game.csproj", "<Project />\n");
+    let root = godot_root(
+        &case,
+        &[("4.3.0", "4.3.0.stable.mono.official.x\n"), ("4.7.2", "4.7.2.stable.mono.official.x\n")],
+    );
+
+    let outcome = a_routed_godot_run(&case, &root, &GODOT_COMMAND);
+
+    let warning = no_pin_warning("4.7.2");
+    assert!(ran_the_install(&outcome, &root, "4.7.2"), "{outcome:?}");
+    assert_eq!(outcome.stderr.lines().filter(|line| *line == warning).count(), 1, "{outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let warning_at = line_at(&log, &warning).expect("the warning is logged");
+    let output_at = line_at(&log, "4.7.2.stable.mono.official.x").expect("the command's own output is logged");
+    assert!(warning_at < output_at, "the warning comes before the command's own output: {log}");
+}
+
+/// A Godot command of a repo taking any Godot version runs on the builder's newest install, with no warning.
+#[test]
+fn a_godot_run_of_a_repo_taking_any_godot_version_runs_on_the_newest() {
+    let case = client_case("client-godot-any-newest");
+    write(&case, MANIFEST, "[tools]\ngodot = \"\"\n");
+    let root = godot_root(
+        &case,
+        &[("4.3.0", "4.3.0.stable.mono.official.x\n"), ("4.7.2", "4.7.2.stable.mono.official.x\n")],
+    );
+
+    let outcome = a_routed_godot_run(&case, &root, &GODOT_COMMAND);
+
+    assert!(ran_the_install(&outcome, &root, "4.7.2"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gate: warning:"), "{outcome:?}");
+}
+
+/// A Godot command of a repo pinning no Godot version stays here, refused `parity` with its own line, when the builder
+/// lists no Godot install.
+#[test]
+fn a_godot_run_of_an_unpinned_repo_falls_back_when_the_builder_lists_no_godot() {
+    let case = client_case("client-godot-no-pin-no-install");
+    write(&case, "src/App/Game.csproj", "<Project />\n");
+    let local = godot_root(&case, &[("4.7.2", "4.7.2.stable.mono.official.x\n")]);
+    let root = case.folder().join("ssh").join("godot-empty");
+    fs::create_dir_all(&root).expect("the builder's empty Godot root can be made");
+
+    a_godot_run_refused_saying_why(
+        &case,
+        &root,
+        &local.join("4.7.2"),
+        "gate: the repo pins no Godot version and builder lists no Godot install; a routed run needs one",
+    );
+}
+
+/// A Godot command of a repo whose pin no listed install meets stays here, refused `parity` as the mismatch it is, with
+/// no warning and no line of its own.
+#[test]
+fn a_godot_run_of_a_repo_whose_pin_no_install_meets_falls_back_parity() {
+    let case = client_case("client-godot-pin-unmet");
+    write(&case, "src/App/Game.csproj", &godot_csproj("4.7.2"));
+    let root = godot_root(&case, &[("4.3.0", "4.3.0.stable.mono.official.y\n")]);
+
+    let outcome = a_godot_run_refused_saying_why(&case, &root, &root.join("4.3.0"), &mismatch_of(&case, "godot 4.7.2 exactly", "4.3.0"));
+
+    assert!(!outcome.stderr.contains("gate: warning:"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("pins no Godot version"), "{outcome:?}");
+}
+
+/// A Godot command of a repo whose Godot pins could not be read stays here, refused `parity` with its own line, though
+/// the builder has an install it could have run.
+#[test]
+fn a_godot_run_of_a_repo_whose_godot_pins_cannot_be_read_falls_back_parity() {
+    let case = client_case("client-godot-pins-unreadable");
+    write(&case, MANIFEST, "[tools\npnpm = \"10\"\n");
+    let root = godot_root(&case, &[("4.7.2", "4.7.2.stable.mono.official.x\n")]);
+
+    let outcome = a_godot_run_refused_saying_why(
+        &case,
+        &root,
+        &root.join("4.7.2"),
+        "gate: the repo's Godot pins could not be read; a routed run needs one",
+    );
+
+    assert!(!outcome.stderr.contains("gate: warning:"), "{outcome:?}");
+}
+
+/// A refused Godot run of an unpinned repo says the mismatch and the parity line, and no warning about a version it will
+/// not use: the warning is said only for a run that goes remote.
+#[test]
+fn a_refused_godot_run_of_an_unpinned_repo_says_no_pin_warning() {
+    let case = client_case("client-godot-no-pin-refused");
+    write(&case, "global.json", r#"{"sdk": {"version": "999.0.0"}}"#);
+    write(&case, "src/App/Game.csproj", "<Project />\n");
+    let root = godot_root(&case, &[("4.7.2", "4.7.2.stable.mono.official.x\n")]);
+
+    let outcome = a_godot_run_refused_saying_why(
+        &case,
+        &root,
+        &root.join("4.7.2"),
+        &mismatch_of(&case, ".NET SDK 999.0.0 (rollForward patch)", BUILDER_SDK),
+    );
+
+    assert!(!outcome.stderr.contains("gate: warning:"), "{outcome:?}");
+}
+
+/// A Godot run of a repo taking any Godot version, on a builder that reports no Godot at all, stays here on the judge's
+/// mismatch line alone: no second line says the install is missing.
+#[test]
+fn a_godot_run_of_a_repo_taking_any_godot_version_on_a_builder_without_godot_falls_back_with_the_mismatch_alone() {
+    let case = client_case("client-godot-any-without-godot");
+    write(&case, MANIFEST, "[tools]\ngodot = \"\"\n");
+    let local = godot_root(&case, &[("4.7.2", "4.7.2.stable.mono.official.x\n")]);
+    let root = case.folder().join("ssh").join("godot-empty");
+    fs::create_dir_all(&root).expect("the builder's empty Godot root can be made");
+
+    let outcome = a_godot_run_refused_saying_why(&case, &root, &local.join("4.7.2"), &mismatch_of(&case, "godot", "none"));
+
+    assert!(!outcome.stderr.contains("lists no Godot install"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("did not list its Godot installs"), "{outcome:?}");
+}
+
 /// Any other command of a repo pinning several differing Godot versions routes as it would with no pin, sending no
 /// version: the builder's command sees no `GODOT_PATH`.
 #[test]

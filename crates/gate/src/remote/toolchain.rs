@@ -350,19 +350,33 @@ pub(crate) fn needs_of(manifest: &Manifest) -> Vec<(String, String)> {
 
 /// The `Needs` a routed run's preflight sends for a repo whose manifest read `manifest` and whose project files pin the
 /// versions `pins`: the manifest's own tools ([`needs_of`]) with `godot` moved last, carrying the versions
-/// [`godot_required`] reads of the repo, joined by `,`, or empty for any version. The box ignores the text, and reads
-/// only the names.
-pub(crate) fn routed_needs(manifest: Option<&Result<Manifest, String>>, pins: &[Pin]) -> Vec<(String, String)> {
+/// [`godot_required`] reads of the repo, joined by `,`, or empty for any version. A Godot command (`godot_command`) of a
+/// repo requiring no version of godot still sends its name, so the builder lists the installs the run may choose from.
+/// The box ignores the text, and reads only the names.
+pub(crate) fn routed_needs(manifest: Option<&Result<Manifest, String>>, pins: &[Pin], godot_command: bool) -> Vec<(String, String)> {
     let mut needs = match manifest {
         Some(Ok(manifest)) => needs_of(manifest),
         _ => Vec::new(),
     };
     needs.retain(|(name, _)| name != GODOT);
-    if let Some(godot) = godot_required(manifest, pins) {
-        let versions: Vec<String> = godot.iter().map(ToString::to_string).collect();
-        needs.push((GODOT.to_owned(), versions.join(",")));
+    match godot_required(manifest, pins) {
+        Some(godot) => {
+            let versions: Vec<String> = godot.iter().map(ToString::to_string).collect();
+            needs.push((GODOT.to_owned(), versions.join(",")));
+        }
+        // A Godot command of a repo requiring no version still has the builder list its installs, so the run can use
+        // the newest.
+        None if godot_command => needs.push((GODOT.to_owned(), String::new())),
+        None => {}
     }
     needs
+}
+
+/// Whether a repo's Godot pins were read, given its manifest read `manifest` (`None` when the repo has none) and the
+/// lines `skips` for the project files left unread: the manifest reads or is absent, and no project file was left unread.
+/// A repo with neither a manifest nor a pin is the plain no-pin case, not an unreadable one.
+pub(crate) fn godot_pins_read(manifest: Option<&Result<Manifest, String>>, skips: &[String]) -> bool {
+    !matches!(manifest, Some(Err(_))) && skips.is_empty()
 }
 
 /// The versions a repo requires of a routed run's builder Godot installs: the manifest's own `godot` entry when it names
@@ -383,6 +397,10 @@ pub(crate) fn godot_required(manifest: Option<&Result<Manifest, String>>, pins: 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum GodotChoice {
     /// No version: the repo requires nothing of godot, or any version, or no install the builder listed meets its pin.
+    /// What a routed run does with it is [`no_chosen_godot`]'s decision: a Godot console command runs on the newest
+    /// install the builder listed, warning when the repo pins no version, and stays here when the builder lists no
+    /// install, did not list its installs, or the repo's pins could not be read. A pin no listed install meets is the
+    /// parity mismatch's own refusal.
     None,
     /// The version, `major.minor.patch`, of the install the builder listed that the run is to use.
     Version(String),
@@ -393,6 +411,31 @@ pub(crate) enum GodotChoice {
 /// The line said when a repo pins the several Godot versions `list`, which keeps a routed run here.
 pub(crate) fn several_godot_line(list: &str) -> String {
     format!("gate: the repo pins several Godot versions ({list}); a routed run needs one")
+}
+
+/// The line said when a repo pinning no Godot version has the builder `host` list no Godot install either, which keeps a
+/// routed run here.
+pub(crate) fn no_godot_install_line(host: &str) -> String {
+    format!("gate: the repo pins no Godot version and {host} lists no Godot install; a routed run needs one")
+}
+
+/// The line said when the preflight did not list the builder's Godot installs, which keeps a routed run here.
+pub(crate) fn godot_not_listed_line(host: &str) -> String {
+    format!("gate: {host} did not list its Godot installs; a routed run needs one")
+}
+
+/// The line said when a repo's Godot pins could not be read, which keeps a routed run here.
+pub(crate) fn unreadable_godot_pins_line() -> String {
+    "gate: the repo's Godot pins could not be read; a routed run needs one".to_owned()
+}
+
+/// The warning a routed run of a repo pinning no Godot version says when it uses the newest install `version` the
+/// builder `host` listed.
+pub(crate) fn no_pin_godot_warning(version: &str, host: &str) -> String {
+    format!(
+        "gate: warning: the repo pins no Godot version, so this run uses {version}, the newest on {host}; pin the \
+         version it needs in .gate/toolchain.toml ([tools] godot = \"x.y.z\") or as the .csproj's Godot.NET.Sdk version"
+    )
 }
 
 /// Which of the builder's Godot installs a routed run uses, given the versions `required` the repo requires
@@ -408,17 +451,79 @@ pub(crate) fn godot_choice(required: Option<&[Pin]>, reported: &[(String, Report
             return GodotChoice::Several(list.join(", "));
         }
     };
-    let listed = reported.iter().find_map(|(name, answer)| match answer {
-        Reported::Version(list) if name == GODOT => Some(list),
-        _ => None,
-    });
-    let highest = listed
+    let highest = listed_godot(reported).filter(|found| pin.met_by(*found)).max();
+    highest.map_or(GodotChoice::None, |version| GodotChoice::Version(version.to_string()))
+}
+
+/// The versions the preflight `reported` of the builder's Godot installs, in the order it listed them; none when it said
+/// nothing of godot.
+fn listed_godot(reported: &[(String, Reported)]) -> impl Iterator<Item = Version> + '_ {
+    reported
+        .iter()
+        .find_map(|(name, answer)| match answer {
+            Reported::Version(list) if name == GODOT => Some(list),
+            _ => None,
+        })
         .into_iter()
         .flat_map(|list| list.split(','))
         .filter_map(|member| Version::parse(member.trim()))
-        .filter(|found| pin.met_by(*found))
-        .max();
-    highest.map_or(GodotChoice::None, |version| GodotChoice::Version(version.to_string()))
+}
+
+/// The newest `major.minor.patch` of the Godot installs the preflight `reported`; `None` when it listed none.
+pub(crate) fn newest_godot(reported: &[(String, Reported)]) -> Option<String> {
+    listed_godot(reported).max().map(|version| version.to_string())
+}
+
+/// What a routed run whose repo chooses no Godot version ([`GodotChoice::None`]) does with its command, as
+/// [`no_chosen_godot`] decides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NoChosenGodot {
+    /// Nothing: the command is not a Godot console, or the repo pins a version no listed install meets, which the parity
+    /// mismatch refuses.
+    None,
+    /// The newest install the builder listed, `major.minor.patch`, and the warning to say before the run, if any.
+    Newest { version: String, warning: Option<String> },
+    /// The run stays here, refused `parity`, saying this line.
+    Refuse(String),
+}
+
+/// What a routed run of a repo choosing no Godot version does, given the versions `required` the repo requires
+/// ([`godot_required`]; `None` when it requires nothing), whether its Godot pins were `pins_read`
+/// ([`godot_pins_read`]), whether the command's first word is a Godot console (`godot_command`), what the preflight
+/// `reported` of the builder's installs, and the builder `host`: nothing for any other command, the newest install with a
+/// warning when the repo pins none and without one when it takes any, and a refusal line when no version is known. An
+/// unmet pin is the parity mismatch's own refusal, with no line here. So is a `godot = ""` repo whose builder reports
+/// godot missing, its judge's mismatch line carrying that refusal. A report that lists no version at all — a skipped
+/// probe, no answer, a `present` godot or a version list with nothing in it — is not a missing install, and is refused
+/// with [`godot_not_listed_line`].
+pub(crate) fn no_chosen_godot(
+    required: Option<&[Pin]>,
+    pins_read: bool,
+    godot_command: bool,
+    reported: &[(String, Reported)],
+    host: &str,
+) -> NoChosenGodot {
+    if !godot_command {
+        return NoChosenGodot::None;
+    }
+    let answer = reported.iter().find_map(|(name, answer)| (name == GODOT).then_some(answer));
+    match required {
+        Some(pins) if !pins.is_empty() => NoChosenGodot::None,
+        None if !pins_read => NoChosenGodot::Refuse(unreadable_godot_pins_line()),
+        required => {
+            if let Some(version) = newest_godot(reported) {
+                return NoChosenGodot::Newest {
+                    warning: required.is_none().then(|| no_pin_godot_warning(&version, host)),
+                    version,
+                };
+            }
+            match answer {
+                Some(Reported::Missing) if required.is_some() => NoChosenGodot::None,
+                Some(Reported::Missing) => NoChosenGodot::Refuse(no_godot_install_line(host)),
+                _ => NoChosenGodot::Refuse(godot_not_listed_line(host)),
+            }
+        }
+    }
 }
 
 /// The pins among `pins` that are not read already, in their order.
@@ -821,9 +926,10 @@ fn attributes(text: &str) -> Vec<(&str, &str)> {
 #[expect(clippy::expect_used, reason = "a fixture that does not read must fail loudly")]
 mod tests {
     use super::{
-        Godot, GodotChoice, Judged, Manifest, Pin, Pinned, Reported, Standing, ToolNeed, Version, dotnet_tools, godot_choice, godot_required,
-        godot_sdk_pins, is_sent, judge, meets, needs_of, pinned, read, read_bytes, reported, reported_as, routed_needs, several_godot_line,
-        skip_line, standing, unreadable_line,
+        Godot, GodotChoice, Judged, Manifest, NoChosenGodot, Pin, Pinned, Reported, Standing, ToolNeed, Version, dotnet_tools, godot_choice,
+        godot_not_listed_line, godot_pins_read, godot_required, godot_sdk_pins, is_sent, judge, meets, needs_of, newest_godot, no_chosen_godot,
+        no_godot_install_line, no_pin_godot_warning, pinned, read, read_bytes, reported, reported_as, routed_needs, several_godot_line, skip_line,
+        standing, unreadable_godot_pins_line, unreadable_line,
     };
     use crate::remote::git::FAILURE_BYTES;
     use crate::remote::parity::{Need, NeedKind};
@@ -873,6 +979,114 @@ mod tests {
     fn any_version_or_no_pin_chooses_none() {
         assert_eq!(godot_choice(Some(&[]), &godot_listed("4.7.2")), GodotChoice::None, "any version");
         assert_eq!(godot_choice(None, &godot_listed("4.7.2")), GodotChoice::None, "no pin");
+    }
+
+    #[test]
+    fn the_lines_say_what_a_run_with_no_chosen_version_does() {
+        assert_eq!(
+            no_godot_install_line("builder"),
+            "gate: the repo pins no Godot version and builder lists no Godot install; a routed run needs one"
+        );
+        assert_eq!(
+            unreadable_godot_pins_line(),
+            "gate: the repo's Godot pins could not be read; a routed run needs one"
+        );
+        assert_eq!(
+            no_pin_godot_warning("4.7.2", "builder"),
+            "gate: warning: the repo pins no Godot version, so this run uses 4.7.2, the newest on builder; pin the version it needs in \
+             .gate/toolchain.toml ([tools] godot = \"x.y.z\") or as the .csproj's Godot.NET.Sdk version"
+        );
+    }
+
+    #[test]
+    fn a_godot_command_of_a_repo_with_no_chosen_version_uses_the_newest_or_stays_here() {
+        let installs = godot_listed("4.3.0,4.7.2");
+        assert_eq!(newest_godot(&installs), Some("4.7.2".to_owned()));
+        assert_eq!(newest_godot(&godot_listed("")), None, "an empty install list");
+        assert_eq!(
+            no_chosen_godot(None, true, true, &installs, "builder"),
+            NoChosenGodot::Newest {
+                version: "4.7.2".to_owned(),
+                warning: Some(no_pin_godot_warning("4.7.2", "builder")),
+            },
+            "no pin: the newest, warned"
+        );
+        assert_eq!(
+            no_chosen_godot(Some(&[]), true, true, &installs, "builder"),
+            NoChosenGodot::Newest {
+                version: "4.7.2".to_owned(),
+                warning: None,
+            },
+            "any version: the newest, with nothing said"
+        );
+        assert_eq!(
+            no_chosen_godot(None, true, true, &godot_listed(""), "builder"),
+            NoChosenGodot::Refuse(godot_not_listed_line("builder")),
+            "a version list with no version in it"
+        );
+        assert_eq!(
+            no_chosen_godot(Some(&[]), true, true, &[], "builder"),
+            NoChosenGodot::Refuse(godot_not_listed_line("builder")),
+            "no godot answer at all"
+        );
+        let missing = [("godot".to_owned(), Reported::Missing)];
+        let skipped = [("godot".to_owned(), Reported::Skipped("no answer in 2 s".to_owned()))];
+        assert_eq!(
+            no_chosen_godot(Some(&[]), true, true, &missing, "builder"),
+            NoChosenGodot::None,
+            "any version and a missing godot: the mismatch already refuses the run"
+        );
+        assert_eq!(
+            no_chosen_godot(Some(&[]), true, true, &skipped, "builder"),
+            NoChosenGodot::Refuse(godot_not_listed_line("builder")),
+            "any version and a skipped probe"
+        );
+        assert_eq!(
+            no_chosen_godot(None, true, true, &missing, "builder"),
+            NoChosenGodot::Refuse(no_godot_install_line("builder")),
+            "no pin and a missing godot"
+        );
+        assert_eq!(
+            no_chosen_godot(None, true, true, &skipped, "builder"),
+            NoChosenGodot::Refuse(godot_not_listed_line("builder")),
+            "no pin and a skipped probe"
+        );
+        assert_eq!(
+            no_chosen_godot(Some(&[]), false, true, &installs, "builder"),
+            NoChosenGodot::Newest {
+                version: "4.7.2".to_owned(),
+                warning: None,
+            },
+            "any version is the manifest's own word, whatever a project file left unread"
+        );
+        assert_eq!(
+            no_chosen_godot(None, false, true, &installs, "builder"),
+            NoChosenGodot::Refuse(unreadable_godot_pins_line()),
+            "the pins could not be read, so a version may be there"
+        );
+        let unreadable: Result<Manifest, String> = Err("line 1, column 7: unclosed table".to_owned());
+        assert!(!godot_pins_read(Some(&unreadable), &[]), "a manifest that cannot be read");
+        assert!(
+            !godot_pins_read(None, &["gate: a project file was left unread".to_owned()]),
+            "a project file left unread"
+        );
+        assert!(godot_pins_read(None, &[]), "no manifest and nothing left unread");
+        assert!(godot_pins_read(Some(&Ok(manifest(""))), &[]), "a manifest that reads");
+        assert_eq!(
+            no_chosen_godot(Some(&pins_of(&["4.7.2"])), true, true, &godot_listed("4.3.0"), "builder"),
+            NoChosenGodot::None,
+            "an unmet pin is the mismatch's own refusal"
+        );
+        assert_eq!(
+            no_chosen_godot(Some(&pins_of(&["4.7.2"])), false, true, &godot_listed("4.3.0"), "builder"),
+            NoChosenGodot::None,
+            "an unmet pin keeps the mismatch's own refusal, even with a project file left unread"
+        );
+        assert_eq!(
+            no_chosen_godot(None, true, false, &installs, "builder"),
+            NoChosenGodot::None,
+            "a command that is no Godot console"
+        );
     }
 
     #[test]
@@ -1130,7 +1344,7 @@ mod tests {
     /// builder said the lines `said` to a preflight sending its needs.
     fn judged_with(text: &str, pins: &[Pin], said: &[&str]) -> Judged {
         let readable: Result<Manifest, String> = Ok(manifest(text));
-        let sent: Vec<String> = routed_needs(Some(&readable), pins).into_iter().map(|(name, _)| name).collect();
+        let sent: Vec<String> = routed_needs(Some(&readable), pins, false).into_iter().map(|(name, _)| name).collect();
         let said = owned(said);
         let godot = godot_required(Some(&readable), pins);
         judge(Some(&readable), godot.as_deref(), &sent, &reported(&said, &sent), "builder")
@@ -1515,13 +1729,23 @@ mod tests {
         assert_eq!(manifest("[tools]\ngodot = \"\"\n").godot, Some(Godot::Any));
         assert_eq!(manifest("[tools]\nnode = \"24\"\n").godot, None, "a manifest naming no godot");
         assert_eq!(
-            routed_needs(Some(&Ok(manifest("[tools]\ngodot = \"4.7\"\n"))), &pins),
+            routed_needs(Some(&Ok(manifest("[tools]\ngodot = \"4.7\"\n"))), &pins, false),
             [("godot".to_owned(), "4.7".to_owned())]
         );
         assert_eq!(
-            routed_needs(Some(&Ok(manifest("[tools]\nnode = \"24\"\n"))), &pins),
+            routed_needs(Some(&Ok(manifest("[tools]\nnode = \"24\"\n"))), &pins, false),
             [("node".to_owned(), "24.0.0".to_owned()), ("godot".to_owned(), "4.8.0".to_owned())],
             "with no entry the files' pins apply, after the manifest's own tools"
+        );
+        assert_eq!(
+            routed_needs(Some(&Ok(manifest("[tools]\nnode = \"24\"\n"))), &[], false),
+            [("node".to_owned(), "24.0.0".to_owned())],
+            "a repo requiring no godot sends no need for it to a command that is no Godot console"
+        );
+        assert_eq!(
+            routed_needs(Some(&Ok(manifest("[tools]\nnode = \"24\"\n"))), &[], true),
+            [("node".to_owned(), "24.0.0".to_owned()), ("godot".to_owned(), String::new())],
+            "a Godot command of a repo requiring none has the builder list its installs"
         );
         let unreadable: Result<Manifest, String> = Err("line 1, column 1: x".to_owned());
         assert_eq!(

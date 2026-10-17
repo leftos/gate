@@ -1644,7 +1644,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     `godot` is sent whenever the repo pins a Godot version, on every routed run whatever its command: the manifest names `godot`, or a `*.csproj` of the snapshot names `Godot.NET.Sdk/<version>`. Its value is the distinct pins joined by `,` (the box ignores the text and reads only the name), or empty for a manifest entry of `""`. A manifest `godot` entry wins over every project pin; a manifest that is unreadable, or whose `godot` value is no version, does not stop the project pins from applying.
 
-    A repo pinning nothing sends no `godot` need and is judged as before.
+    A repo pinning nothing sends no `godot` need and is judged as before, except for a command whose first word is a Godot console word (below), which sends a `godot` need with no versions so the builder lists its installs (`gate: remote tool godot <versions>` shows in its output). Every other command of an unpinned repo sends what it always sent.
 
     The builder answers each tool with a `gate: remote tool <name> <version|present|missing|skipped: <why>>` line. A tool it found missing, or older than the minimum, is a need, and the route is refused as under Parity: one `gate: remote toolchain mismatch: <repo> needs <name> <min> or later; <host> has <version|none>` line per need (`<name>` alone when the manifest sets no minimum), then the parity fallback line, and the run goes local.
 
@@ -1654,13 +1654,21 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     An answer that is no version list is a mismatch whenever a pin needs checking, so the command runs here rather than on a builder that may lack the version. A slow install that drops off the builder's list reads as missing, a needless fallback and a known limitation.
 
-    After the preflight the client chooses the Godot version the run uses, from the repo's pins among the versions the builder reported: no pin, or a manifest entry of `""`, chooses none; one pin chooses the highest reported version that meets it (`4.7.2` itself, `4.7` the highest `4.7.x`); a pin no reported version meets chooses none.
+    After the preflight the client chooses the Godot version the run uses, from the repo's pins among the versions the builder reported: no pin, or a manifest entry of `""`, chooses none (see below for a Godot command); one pin chooses the highest reported version that meets it (`4.7.2` itself, `4.7` the highest `4.7.x`); a pin no reported version meets chooses none.
 
     A chosen version, spelled `x.y.z`, is sent as the optional `GodotVersion` of the run payload and of a warm-up's, and left out when none is chosen. The box resolves it ([The box side](#the-box-side), the command's environment).
 
-    A repo whose pins differ chooses none. A command whose first word is a Godot console word (a bare name with no directory part whose name, after one trailing `.exe` is removed, matches `godot*console*` ignoring ASCII case with no `.` after the last `console`; `.cmd`, `.bat`, `.ps1` and any other extension are not) falls back `parity`.
+    A repo whose pins differ, a repo that pins no Godot version and a manifest entry of `""` choose none. What a command does then depends on its first word. A Godot console word is a bare name with no directory part whose name, after one trailing `.exe` is removed, matches `godot*console*` ignoring ASCII case with no `.` after the last `console`; `.cmd`, `.bat`, `.ps1` and any other extension are not.
 
-    It says `gate: the repo pins several Godot versions (<pins, comma separated>); a routed run needs one` after the mismatch lines and before the parity line. Every other command of that repo routes as before, with no `GodotVersion`.
+    A Godot-console command of a repo pinning several versions falls back `parity`, saying `gate: the repo pins several Godot versions (<pins, comma separated>); a routed run needs one` after the mismatch lines and before the parity line, on the console and in the log. A pin no reported version meets is the parity mismatch, with its own lines and no new one.
+
+    A Godot-console command of a repo that pins no version, or whose manifest has `godot = ""`, runs on the newest install the builder listed: that version is chosen and sent as `GodotVersion`. A repo pinning no version says, on stderr and in the log, `gate: warning: the repo pins no Godot version, so this run uses <x.y.z>, the newest on <host>; pin the version it needs in .gate/toolchain.toml ([tools] godot = "x.y.z") or as the .csproj's Godot.NET.Sdk version`, once the run is known not to be refused and before it starts; `godot = ""` says nothing. A run refused for another need says no warning.
+
+    Such a command stays here, refused `parity`, when the builder reports no Godot install: a repo pinning no version says `gate: the repo pins no Godot version and <host> lists no Godot install; a routed run needs one`, and `godot = ""` has only the parity mismatch's own lines. When the builder gives no version list for godot (its probe was skipped, or it answered with no version), either says `gate: <host> did not list its Godot installs; a routed run needs one`.
+
+    A repo pinning no version also stays here, refused `parity`, when its pins could not be read (its tree could not be read, its `.gate/toolchain.toml` exists but cannot be read, or a project file's Godot pin was left unread), saying `gate: the repo's Godot pins could not be read; a routed run needs one`. A missing manifest is not unreadable, and a manifest entry of `""` settles the version whatever a project file pins.
+
+    Every other command of the repo routes as before, with no `GodotVersion`.
 
     A tool the builder did not probe, gave no answer for, or found at a version that cannot be read against a minimum gets `gate: <host> did not probe <name>: <why>; not checking it` and is not a need. The lines come in this order: the SDK step's own, then the manifest's problem lines, then the per-tool skip lines in the manifest's order, then the mismatch lines.
 
