@@ -705,6 +705,142 @@ fn a_stop_during_the_desktop_wait_on_a_pair_says_back_commits_failed() {
 }
 
 #[test]
+fn a_second_desktop_run_waits_for_the_first_and_then_runs() {
+    let case = Case::new("desktop_waits_then_runs");
+    let payload = ready_payload(&case, COMMAND);
+    let held = HeldDesktop::hold(&case);
+
+    let running = desktop_call(&case, &payload, "ok", &[]).start();
+    running.wait_for_stderr(BUSY_WAIT);
+    drop(held);
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "the run took the desktop once it was free: {outcome:?}");
+    assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
+    assert_eq!(lines_starting(&outcome, BUSY_WAIT), [BUSY_WAIT], "the busy line, once: {outcome:?}");
+    let marker = started_line(&payload);
+    let lines: Vec<&str> = outcome.stderr.lines().collect();
+    let at = |wanted: &str| lines.iter().position(|line| *line == wanted);
+    assert!(
+        at(BUSY_WAIT).zip(at(&marker)).is_some_and(|(busy, marker)| busy < marker),
+        "the marker comes after the busy line: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_desktop_wait_is_capped_at_the_runs_timeout() {
+    let case = Case::new("desktop_wait_capped");
+    let mut payload = desktop_payload(&case, "k", COMMAND, 600);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    // The run's ceiling, which the box reads as `Timeout`, caps its wait for the desktop below the wait it asked for.
+    payload["Timeout"] = json!(1);
+    let held = HeldDesktop::hold(&case);
+
+    let outcome = run_desktop(&case, &payload, "ok", "active", DESKTOP_MS);
+    drop(held);
+
+    refused_with(&outcome, &payload, BUSY_FOR_1_S);
+    assert_eq!(lines_starting(&outcome, BUSY_WAIT), [BUSY_WAIT], "the busy line, once: {outcome:?}");
+}
+
+#[test]
+fn box_stop_during_the_desktop_wait_is_stopped_before_the_command_started() {
+    let case = Case::new("desktop_stop_in_wait_one_repo");
+    let mut payload = desktop_payload(&case, "k", COMMAND, 600);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let held = HeldDesktop::hold(&case);
+    let running = desktop_call(&case, &payload, "ok", &[]).start();
+    running.wait_for_stderr(BUSY_WAIT);
+
+    let stopped = gate_box(&case, "stop", &request_line(&payload), None);
+    let outcome = running.finish();
+    drop(held);
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(outcome.code, Some(1), "a stop during the wait fails the run: {outcome:?}");
+    let said: Vec<&str> = outcome.stderr.lines().collect();
+    assert!(said.contains(&stopped_line_for(field(&payload, "Job")).as_str()), "{outcome:?}");
+    assert!(
+        !said.iter().any(|line| line.starts_with("gate: remote back commits:")),
+        "a single repository has no back commits line: {outcome:?}"
+    );
+    assert!(lines_starting(&outcome, "gate-remote-refused:").is_empty(), "no desktop tag: {outcome:?}");
+    assert!(
+        lines_starting(&outcome, &started_line(&payload)).is_empty(),
+        "no start marker: {outcome:?}"
+    );
+}
+
+#[test]
+fn box_stop_during_a_desktop_run_ends_it() {
+    let case = Case::new("desktop_stop_in_run");
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    // `pid` first, so the case can name the command's process; then it waits for a go this case never writes.
+    let payload = ready_payload(&case, &[FAKE_TOOL, "pid", "wait", &go_word]);
+    let running = desktop_call(&case, &payload, "ok", &[]).start();
+    let printed = running.wait_for_stdout("pid ");
+    let pid: u32 = printed
+        .lines()
+        .find_map(|line| line.strip_prefix("pid "))
+        .and_then(|pid| pid.trim().parse().ok())
+        .expect("the command printed its pid");
+    // The pid and the creation time together, so another case's process at a reused pid is never taken for this one.
+    let created = Win32ProcessTable
+        .snapshot()
+        .into_iter()
+        .find(|process| process.pid == pid)
+        .and_then(|process| process.created);
+    assert!(created.is_some(), "the command's creation time can be read: {pid}");
+
+    let stopped = gate_box(&case, "stop", &request_line(&payload), None);
+    wait_until("the stopped desktop command ending", || {
+        !Win32ProcessTable
+            .snapshot()
+            .iter()
+            .any(|process| process.pid == pid && process.created == created)
+    });
+    let outcome = running.finish();
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(
+        stopped.stdout,
+        format!("gate: remote stopped job {}\n", field(&payload, "Job")),
+        "{stopped:?}"
+    );
+    assert_eq!(outcome.code, Some(124), "the stopped command's status: {outcome:?}");
+    ran_its_command(&outcome, &payload);
+}
+
+#[test]
+fn a_stop_while_the_desktop_command_is_parked_says_it_was_stopped_before_start() {
+    let case = Case::new("desktop_stop_parked");
+    let park = case.folder().join("park");
+    let parked = case.folder().join("park.parked");
+    let mark = case.folder().join("marked");
+    let (park_word, mark_word) = (shown(&park), shown(&mark));
+    let payload = ready_payload(&case, &[FAKE_TOOL, "mark", &mark_word, "out", "ran"]);
+    let running = desktop_call(&case, &payload, "ok", &["--test-box-park-launch", &park_word]).start();
+    wait_until("the box parked before the command's marker", || parked.exists());
+
+    let stopped = gate_box(&case, "stop", &request_line(&payload), None);
+    let_go(&park);
+    let outcome = running.finish();
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(outcome.code, Some(1), "a stop while the command is parked fails the run: {outcome:?}");
+    let said: Vec<&str> = outcome.stderr.lines().collect();
+    assert!(said.contains(&stopped_line_for(field(&payload, "Job")).as_str()), "{outcome:?}");
+    let marker = started_line(&payload);
+    assert_eq!(
+        lines_starting(&outcome, &marker),
+        [marker.as_str()],
+        "the marker was said before the stop look: {outcome:?}"
+    );
+    assert!(!mark.exists(), "the command never ran: {outcome:?}");
+}
+
+#[test]
 fn a_desktop_command_that_cannot_start_never_waits_for_the_desktop() {
     let case = Case::new("desktop_cannot_start");
     let _held = HeldDesktop::hold(&case);
