@@ -9,7 +9,7 @@ use std::time::Duration;
 use gate_desktop::HelperExit;
 use gate_win32::{ConnectState, EndReport, LockState, SessionState, StartedTask, TaskError};
 
-use crate::boxside::desktop::verify::WrongFact;
+use crate::boxside::desktop::verify::{Unproved, WrongFact};
 use crate::boxside::payload::escaped;
 
 /// The box's line refusing a run it cannot hand to the builder's desktop: the box's own prefix, then why.
@@ -73,6 +73,18 @@ pub(crate) enum DesktopRefusal {
     HelperFailed(u32),
     /// The command the helper started is not the one the box asked for, for this reason.
     WrongCommand(WrongFact),
+    /// The command the helper started could not be taken, for this reason, with the system's error.
+    WrongCommandFor(WrongFact, String),
+    /// A fact of the command the helper started, so named, cannot be read, for this error.
+    CommandUnread {
+        /// The fact's name, such as `session`.
+        fact: &'static str,
+        /// The system's error.
+        error: String,
+    },
+    /// The command the helper started passed every check, but the box could not put it in the run's job, for this
+    /// error.
+    NotPutInTheJob(String),
     /// The builder's desktop lock cannot be made, for this reason.
     DesktopLock(String),
     /// The console session cannot be read, so nothing says who is logged on to it or whether it is locked.
@@ -100,6 +112,15 @@ impl DesktopRefusal {
             DesktopRefusal::HelperNotOnDesktop => "the desktop helper is not on the console's Default desktop".to_owned(),
             DesktopRefusal::HelperFailed(code) => format!("the desktop helper failed: {}", helper_exit_why(*code)),
             DesktopRefusal::WrongCommand(fact) => format!("the desktop helper failed: the command it started {}", fact.why()),
+            DesktopRefusal::WrongCommandFor(fact, error) => {
+                format!("the desktop helper failed: the command it started {}: {error}", fact.why())
+            }
+            DesktopRefusal::CommandUnread { fact, error } => {
+                format!("the desktop helper failed: the {fact} of the command it started cannot be read: {error}")
+            }
+            DesktopRefusal::NotPutInTheJob(error) => {
+                format!("the desktop helper failed: the command it started cannot be put in the box's job: {error}")
+            }
             DesktopRefusal::DesktopLock(error) => format!("the builder's desktop lock cannot be made: {error}"),
             DesktopRefusal::SessionUnreadable => "the console session cannot be read".to_owned(),
             DesktopRefusal::SessionMoved => "the console session changed while the box read it".to_owned(),
@@ -111,6 +132,16 @@ impl DesktopRefusal {
     #[must_use]
     pub(crate) fn line(&self) -> String {
         format!("{NO_DESKTOP}{}", escaped(&self.why()))
+    }
+}
+
+impl From<Unproved<WrongFact>> for DesktopRefusal {
+    /// The refusal of a command the box did not verify: the fact that does not hold, or the one that cannot be read.
+    fn from(unproved: Unproved<WrongFact>) -> DesktopRefusal {
+        match unproved {
+            Unproved::Wrong(fact) => DesktopRefusal::WrongCommand(fact),
+            Unproved::Unread { fact, error } => DesktopRefusal::CommandUnread { fact, error },
+        }
     }
 }
 
@@ -593,6 +624,22 @@ mod tests {
         assert_eq!(
             could_not_end_line(4321, &io::Error::other("access denied")),
             "gate: remote could not end the desktop command (process 4321): access denied"
+        );
+    }
+
+    #[test]
+    fn a_command_the_box_cannot_put_in_its_job_is_said_as_the_helpers_failure() {
+        assert_eq!(
+            DesktopRefusal::NotPutInTheJob("Access is denied.".to_owned()).line(),
+            refused("the desktop helper failed: the command it started cannot be put in the box's job: Access is denied.")
+        );
+    }
+
+    #[test]
+    fn a_command_the_box_cannot_take_carries_the_systems_error() {
+        assert_eq!(
+            DesktopRefusal::WrongCommandFor(super::WrongFact::NotTheProcess, "The handle is invalid.".to_owned()).line(),
+            refused("the desktop helper failed: the command it started is not the process it reported: The handle is invalid.")
         );
     }
 }

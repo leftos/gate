@@ -1,8 +1,11 @@
-//! A run that asks for the builder's desktop: the console's session read before the checkout, and the stage between
-//! the run's readiness and its command, which resolves the program, takes the builder's desktop lock within the wait
-//! the run gave and reads the console's session once more while it holds the lock. Every failure of the desktop's
-//! machinery before the command starts is a refusal: the box's `desktop` tag and its line, exit 75, and never a back
-//! commits line, so the PC runs the command itself.
+//! A run that asks for the builder's desktop: the console's session read before the checkout, the stage between the
+//! run's readiness and its command, which resolves the program, takes the builder's desktop lock within the wait the
+//! run gave and reads the console's session once more while it holds the lock, and then the hand-off of the command to
+//! the desktop helper ([`hand_off`]). Every failure of the desktop's machinery before the command's start marker is a
+//! refusal: the box's `desktop` tag and its line, exit 75, and never a back commits line, so the PC runs the command
+//! itself.
+
+mod hand_off;
 
 use std::io;
 use std::sync::PoisonError;
@@ -13,12 +16,9 @@ use gate_win32::{Account, AcquireError, ConnectState, LockState, MutexGuard, Pri
 
 use crate::boxside::desktop::lines::{DesktopRefusal, Limits, abandoned_line, busy_timeout_line, busy_wait_line, capped_wait, session_verdict};
 use crate::boxside::payload::escaped;
-use crate::boxside::run::{Beat, One, Prepared, REFUSED_STATUS, Ran, Request, STARTING_COMMAND, before_the_job, prepared};
+use crate::boxside::run::{Beat, One, REFUSED_STATUS, Ran, Request, STARTING_COMMAND, before_the_job, prepared};
 use crate::console::Console;
 use crate::remote::{Refusal, refused_line};
-
-/// Why the desktop helper did not start, while the box has no hand-off to it.
-const NO_HAND_OFF: &str = "the box's hand-off is not built yet";
 
 /// The user name the session seam `other-user` puts at the console: one no account of the box has.
 const OTHER_USER: &str = "gate-seam-other-user";
@@ -35,9 +35,7 @@ pub(super) enum DesktopEnd {
 /// held the lock, and the limits of its waits.
 struct DesktopHold<'m> {
     _guard: MutexGuard<'m>,
-    #[expect(dead_code, reason = "nothing reads the session until the run hands its command to the helper")]
     session_id: u32,
-    #[expect(dead_code, reason = "nothing reads the limits until the run hands its command to the helper")]
     limits: Limits,
 }
 
@@ -94,15 +92,16 @@ pub(super) fn console_takes_it(request: &Request<'_>, seams: &BoxSeams, console:
 /// The run's command on the builder's desktop, which may wait `wait` seconds for it: the stage, then the hand-off.
 /// The stage resolves the program first, so a command that cannot start (127, or 2 for a batch word refused) never
 /// holds the desktop; looks at the stop signal; takes the builder's desktop lock within the run's wait
-/// ([`wait_for_desktop`]); and reads the console's session again while it holds the lock. The hand-off is not built: a
-/// run past the stage releases the lock and is refused.
+/// ([`wait_for_desktop`]); and reads the console's session again while it holds the lock. The hand-off
+/// ([`hand_off::hand_off`]) then runs the command in that session and sees it to its end; the lock is released once it
+/// is over, however it ended.
 pub(super) fn desktop_command(request: &Request<'_>, one: &One<'_>, wait: u64, beat: &Beat<'_>, console: &mut Console) -> Result<Ran, DesktopEnd> {
-    let _prepared: Prepared<'_> = match prepared(request, one, console) {
+    let prepared = match prepared(request, one, console) {
         Ok(prepared) => prepared,
         Err(answer) => return answer.map_err(DesktopEnd::Ended),
     };
     // Looked at before the lock is opened, so a run already stopped never opens it.
-    before_the_job(beat.stop.look(STARTING_COMMAND), beat.stop.job, console).map_err(DesktopEnd::Ended)?;
+    before_the_job(beat.stop.look(STARTING_COMMAND), beat.stop.job, beat.lock, console).map_err(DesktopEnd::Ended)?;
     let mutex = desktop_name(beat.seams)
         .and_then(|name| PrivateMutex::open(&name))
         .map_err(|error| desktop_refused(request, &DesktopRefusal::DesktopLock(error.to_string()).into(), beat, console))?;
@@ -123,13 +122,17 @@ pub(super) fn desktop_command(request: &Request<'_>, one: &One<'_>, wait: u64, b
         session_id,
         limits,
     };
-    drop(hold);
-    Err(desktop_refused(
+    let here = hand_off::Here {
         request,
-        &DesktopRefusal::HelperDidNotStart(NO_HAND_OFF.to_owned()).into(),
+        one,
+        prepared: &prepared,
         beat,
-        console,
-    ))
+        limits: hold.limits,
+        session: hold.session_id,
+    };
+    let ran = hand_off::hand_off(&here, console);
+    drop(hold);
+    ran
 }
 
 /// Why the builder's desktop lock was not taken.
@@ -142,9 +145,10 @@ enum Unheld {
     Failed(io::Error),
 }
 
-/// Takes the builder's desktop lock `mutex`, waiting in turns of `step` for at most `total`: the stop signal is looked
-/// at before each turn, the busy-wait line is said once when another run holds the lock, and a lock taken from a run
-/// that ended holding it is said.
+/// Takes the builder's desktop lock `mutex`, waiting in turns of at most `step`, and never past `total`: the stop signal
+/// is looked at before each turn, the busy-wait line is said once when another run holds the lock and some of the wait
+/// is left, and a lock taken from a run that ended holding it is said. A `total` of zero is one try, with no wait and
+/// no busy-wait line.
 fn wait_for_desktop<'m>(
     mutex: &'m PrivateMutex,
     total: Duration,
@@ -152,23 +156,49 @@ fn wait_for_desktop<'m>(
     beat: &Beat<'_>,
     console: &mut Console,
 ) -> Result<MutexGuard<'m>, Unheld> {
-    let started = Instant::now();
+    let turns = Turns {
+        total,
+        step,
+        now: Instant::now,
+    };
+    let look = |console: &mut Console| before_the_job(beat.stop.look(STARTING_COMMAND), beat.stop.job, beat.lock, console);
+    let busy = |console: &mut Console| beat.say(console, &busy_wait_line());
+    let guard = waited(&turns, console, look, |bound| mutex.acquire(bound), busy)?;
+    if guard.abandoned() {
+        beat.say(console, &abandoned_line());
+    }
+    Ok(guard)
+}
+
+/// How a wait for the builder's desktop is cut into turns: `total` in all, turns of at most `step`, on the clock `now`.
+struct Turns<N> {
+    total: Duration,
+    step: Duration,
+    now: N,
+}
+
+/// The turns of [`wait_for_desktop`]: before each, `look` at the stop signal; each `acquire` given at most a step and
+/// never more than is left of the total; `busy` said once, after a turn that timed out with some of the wait left.
+fn waited<G>(
+    turns: &Turns<impl Fn() -> Instant>,
+    console: &mut Console,
+    look: impl Fn(&mut Console) -> Result<(), u32>,
+    mut acquire: impl FnMut(Duration) -> Result<G, AcquireError>,
+    busy: impl Fn(&mut Console),
+) -> Result<G, Unheld> {
+    let started = (turns.now)();
     let mut busy_said = false;
     loop {
-        before_the_job(beat.stop.look(STARTING_COMMAND), beat.stop.job, console).map_err(Unheld::Ended)?;
-        match mutex.acquire(step) {
-            Ok(guard) => {
-                if guard.abandoned() {
-                    beat.say(console, &abandoned_line());
-                }
-                return Ok(guard);
-            }
+        look(console).map_err(Unheld::Ended)?;
+        let left = turns.total.saturating_sub((turns.now)().saturating_duration_since(started));
+        match acquire(turns.step.min(left)) {
+            Ok(guard) => return Ok(guard),
             Err(AcquireError::Timeout) => {
-                if !busy_said {
+                if !busy_said && !left.is_zero() {
                     busy_said = true;
-                    beat.say(console, &busy_wait_line());
+                    busy(console);
                 }
-                if started.elapsed() >= total {
+                if (turns.now)().saturating_duration_since(started) >= turns.total {
                     return Err(Unheld::Busy);
                 }
             }
@@ -230,19 +260,19 @@ fn console_session(seams: &BoxSeams, account: &Account) -> Result<Option<Session
 }
 
 /// The state `read` of the session `id` the console had, as long as the console still has `id` after the read (`now`):
-/// a session switch between the two reads leaves the state of a session the console no longer shows.
+/// a session switch between the two reads leaves the state of a session the console no longer shows. The switch is
+/// looked at first, so a session that ended between the reads, and so could not be read, is one that moved.
 fn settled(id: u32, read: io::Result<SessionState>, now: Option<u32>) -> Result<Option<SessionState>, Unread> {
-    let state = read.map_err(Unread::Failed)?;
     if now != Some(id) {
         return Err(Unread::Moved);
     }
-    Ok(Some(state))
+    read.map(Some).map_err(Unread::Failed)
 }
 
 /// The console session the seam `state` names: the box's own session, with the box's `account` logged on to it, but
 /// nobody for `none` and another user for `other-user`, locked for `locked` and disconnected for `disconnected`.
 fn seam_session(state: DesktopSession, account: &Account) -> io::Result<SessionState> {
-    let id = gate_win32::session_of(RemoteProcess::open(std::process::id())?.handle())?;
+    let id = gate_win32::session_of(RemoteProcess::open_to_query(std::process::id())?.handle())?;
     let (user, connect, lock) = match state {
         DesktopSession::Active => (account.name.as_str(), ConnectState::Active, LockState::Unlocked),
         DesktopSession::NoUser => ("", ConnectState::Active, LockState::Unlocked),
@@ -282,13 +312,16 @@ fn seam_name(_unique: &str) -> io::Result<PrivateName> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
     use std::io;
+    use std::time::{Duration, Instant};
 
-    use gate_win32::{Account, ConnectState, LockState, SessionState};
+    use gate_win32::{Account, AcquireError, ConnectState, LockState, SessionState};
 
-    use super::{ConsoleRefused, Unread, read_console, settled};
+    use super::{ConsoleRefused, Turns, Unheld, Unread, read_console, settled, waited};
     use crate::boxside::desktop::lines::DesktopRefusal;
     use crate::boxside::payload::escaped;
+    use crate::console::Console;
 
     /// The box's own account in every case.
     fn account() -> Account {
@@ -362,6 +395,61 @@ mod tests {
             matches!(settled(3, Err(io::Error::other("gone")), Some(3)), Err(Unread::Failed(_))),
             "a read that failed is said as such"
         );
+        assert!(
+            matches!(settled(3, Err(io::Error::other("gone")), Some(4)), Err(Unread::Moved)),
+            "a session that ended as another took the console moved, though its read failed"
+        );
+        assert!(
+            matches!(settled(3, Err(io::Error::other("gone")), None), Err(Unread::Moved)),
+            "a session that ended leaving the console empty moved, though its read failed"
+        );
+    }
+
+    /// A desktop lock another run holds for good, on a clock each turn runs to the bound it was given: the bounds are
+    /// kept, and how many times the busy line was said.
+    struct Held {
+        clock: Cell<Instant>,
+        bounds: RefCell<Vec<Duration>>,
+        busy: Cell<u32>,
+    }
+
+    /// The bounds a wait of `total` in turns of `step` gives a lock that stays held, and how often it said busy.
+    fn turns_against_a_held_lock(total: Duration, step: Duration) -> (Vec<Duration>, u32) {
+        let held = Held {
+            clock: Cell::new(Instant::now()),
+            bounds: RefCell::new(Vec::new()),
+            busy: Cell::new(0),
+        };
+        let turns = Turns {
+            total,
+            step,
+            now: || held.clock.get(),
+        };
+        let acquire = |bound: Duration| -> Result<(), AcquireError> {
+            held.bounds.borrow_mut().push(bound);
+            held.clock.set(held.clock.get() + bound);
+            Err(AcquireError::Timeout)
+        };
+        let ended = waited(&turns, &mut Console::new(), |_| Ok(()), acquire, |_| held.busy.set(held.busy.get() + 1));
+        assert!(matches!(ended, Err(Unheld::Busy)), "a lock held for good is busy");
+        (held.bounds.into_inner(), held.busy.get())
+    }
+
+    #[test]
+    fn a_zero_desktop_wait_is_one_try_with_no_busy_line() {
+        assert_eq!(
+            turns_against_a_held_lock(Duration::ZERO, Duration::from_millis(100)),
+            (vec![Duration::ZERO], 0),
+            "one try, no wait, and nothing said"
+        );
+    }
+
+    #[test]
+    fn a_desktop_wait_never_runs_past_its_total() {
+        let (bounds, busy) = turns_against_a_held_lock(Duration::from_millis(250), Duration::from_millis(100));
+
+        assert_eq!(bounds, [100, 100, 50].map(Duration::from_millis), "the last turn takes only what is left");
+        assert_eq!(busy, 1, "the busy line, once");
     }
 
     #[test]

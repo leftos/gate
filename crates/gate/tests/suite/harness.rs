@@ -158,6 +158,19 @@ fn fake_tool_prints_its_session_priority_and_cwd() {
     );
 }
 
+/// The desktop cases need it: the stand-in desktop helper, as the real one, refuses to run elevated, and every program
+/// the suite starts runs with the suite's own token.
+#[test]
+fn the_suite_runs_unelevated() {
+    let outcome = fake_tool(&["token"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stdout.lines().any(|line| line == "not-elevated"),
+        "the suite's token is not elevated; run the suite from an unelevated shell: {outcome:?}"
+    );
+}
+
 #[test]
 fn the_fake_desktop_helper_needs_an_argument() {
     let outcome = finish(Command::new(FAKE_DESKTOP_HELPER));

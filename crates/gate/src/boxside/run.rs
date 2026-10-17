@@ -560,7 +560,7 @@ impl Beat<'_> {
     }
 
     /// Says `line` on stderr holding the box's output lock, so it never lands inside a heartbeat or a forwarded line.
-    fn say(&self, console: &mut Console, line: &str) {
+    pub(super) fn say(&self, console: &mut Console, line: &str) {
         let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         console.err(line);
     }
@@ -1220,7 +1220,7 @@ fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut 
         console: PipedConsole::Hidden,
         token: restricted_token(console),
     };
-    before_the_job(beat.stop.look(STARTING_COMMAND), request.job, console)?;
+    before_the_job(beat.stop.look(STARTING_COMMAND), request.job, beat.lock, console)?;
     let job = create_job(request.job, console)?;
     // Started right after the job and kept until the command's wait is over, so its console outlives the command.
     let donor = console_donor(&job, launch.token.as_ref(), beat.seams);
@@ -1450,7 +1450,7 @@ fn start_command(start: &mut Start<'_>, donor: Result<&Donor, &str>, beat: &Beat
     match ended.how {
         LaunchEnd::Started(launched) => Ok(launched),
         LaunchEnd::Refused(error) => Err(start_refused(console, start, error)),
-        LaunchEnd::Stopped => Err(Err(stopped_before_start(start.job, console))),
+        LaunchEnd::Stopped => Err(Err(stopped_before_start(start.job, beat.lock, console))),
     }
 }
 
@@ -1604,8 +1604,9 @@ fn look(check: impl FnOnce() -> io::Result<bool>, job: &str, then: &str) -> Look
 
 /// Ends the run before a job is created when a stop came already, as `seen` found the stop signal of the run's job
 /// `job`: the stop line said, status 1, and nothing started. A signal that could not be read is said, and the run goes
-/// on.
-pub(super) fn before_the_job(seen: Look, job: &str, console: &mut Console) -> Result<(), u32> {
+/// on. Either line is said holding the box's output `lock`, as the heartbeat writes under it.
+pub(super) fn before_the_job(seen: Look, job: &str, lock: &OutputLock, console: &mut Console) -> Result<(), u32> {
+    let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
     match seen {
         Look::Stopped => Err(stopped_first(console, job)),
         Look::Go(unread) => {
@@ -1623,15 +1624,17 @@ fn stopped_first(console: &mut Console, job: &str) -> u32 {
 }
 
 /// Stops the job of a command a stop came before, then says the run failed for it ([`said_stopped`]); status 1.
-fn stopped_before_start(job: &Job, console: &mut Console) -> u32 {
+pub(super) fn stopped_before_start(job: &Job, lock: &OutputLock, console: &mut Console) -> u32 {
     let ending = terminate_and_wait(job);
-    said_stopped(job, ending, console)
+    said_stopped(job, ending, lock, console)
 }
 
 /// Says the run failed for a stop that came before the command started, naming `job`, whose `ending` is already
 /// decided; status 1. What the job still holds after the stop and a later terminate that failed ([`Ending::say`]), or
-/// why it could not be stopped, is said after.
-pub(super) fn said_stopped(job: &Job, ending: io::Result<Ending>, console: &mut Console) -> u32 {
+/// why it could not be stopped, is said after. Every line is said holding the box's output `lock`, as the heartbeat
+/// writes under it.
+pub(super) fn said_stopped(job: &Job, ending: io::Result<Ending>, lock: &OutputLock, console: &mut Console) -> u32 {
+    let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
     let status = stopped_first(console, job.name());
     match ending {
         Ok(ending) => ending.say(job.name(), console),
@@ -1700,7 +1703,13 @@ fn create_stop_event(name: &str, console: &mut Console) -> Result<NamedEvent, u3
 /// for an earlier run never reaches it; shared, so the heartbeat's thread can read its CPU. Else the status 1, its line
 /// said.
 fn create_job(name: &str, console: &mut Console) -> Result<Arc<Job>, u32> {
-    Job::create(name).map(Arc::new).map_err(|error| {
+    job_made(Job::create(name), name, console)
+}
+
+/// The run's job `name` as `made` gave it, shared, as [`create_job`] gives it; else the status 1, its line said, a
+/// name some job already has said as such.
+pub(super) fn job_made(made: io::Result<Job>, name: &str, console: &mut Console) -> Result<Arc<Job>, u32> {
+    made.map(Arc::new).map_err(|error| {
         if error.kind() == io::ErrorKind::AlreadyExists {
             console.err(&format!("gate: the job {name} already exists; a run's job name must be new"));
             FAILED_STATUS
@@ -2500,9 +2509,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CLOSED_STATUS, GIT_CONFIG_COUNT, Look, Payload, Request, SHARING_VIOLATION, STARTING_COMMAND, before_the_job, client_gone, command_spent,
-        command_variables, gap_spent, look, remaining_budget, with_safe_directory, written_retrying,
+        CLOSED_STATUS, GIT_CONFIG_COUNT, Look, Of, One, Payload, Request, SHARING_VIOLATION, STARTING_COMMAND, before_the_job, client_gone,
+        command_spent, command_variables, gap_spent, look, prepared, remaining_budget, with_safe_directory, written_retrying,
     };
+    use crate::boxside::forward::OutputLock;
     use crate::console::Console;
     use crate::environment::Variables;
 
@@ -2679,7 +2689,10 @@ mod tests {
     #[test]
     fn run_stopped_before_its_job_exists_says_so_and_fails() {
         let mut console = Console::new();
-        assert_eq!(before_the_job(look(|| Ok(true), JOB, STARTING_COMMAND), JOB, &mut console), Err(1));
+        assert_eq!(
+            before_the_job(look(|| Ok(true), JOB, STARTING_COMMAND), JOB, &OutputLock::default(), &mut console),
+            Err(1)
+        );
         assert_eq!(
             console.take_notes(),
             [format!(
@@ -2691,7 +2704,10 @@ mod tests {
     #[test]
     fn run_not_stopped_before_its_job_exists_goes_on_and_says_nothing() {
         let mut console = Console::new();
-        assert_eq!(before_the_job(look(|| Ok(false), JOB, STARTING_COMMAND), JOB, &mut console), Ok(()));
+        assert_eq!(
+            before_the_job(look(|| Ok(false), JOB, STARTING_COMMAND), JOB, &OutputLock::default(), &mut console),
+            Ok(())
+        );
         assert!(console.take_notes().is_empty(), "nothing is said");
     }
 
@@ -2699,7 +2715,7 @@ mod tests {
     fn run_that_cannot_read_the_stop_signal_before_its_job_exists_says_so_and_goes_on() {
         let mut console = Console::new();
         let seen = look(|| Err(io::Error::other("the wait failed")), JOB, STARTING_COMMAND);
-        assert_eq!(before_the_job(seen, JOB, &mut console), Ok(()));
+        assert_eq!(before_the_job(seen, JOB, &OutputLock::default(), &mut console), Ok(()));
         assert_eq!(console.take_notes(), [unread()]);
     }
 
@@ -2810,5 +2826,31 @@ mod tests {
         );
         assert_eq!(variables.get("GIT_CONFIG_KEY_9"), Some(OsStr::new("safe.directory")));
         assert_eq!(variables.get("GIT_CONFIG_VALUE_9"), Some(OsStr::new("*")));
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a payload the box cannot read must fail the case loudly")]
+    fn a_prepared_command_carries_the_callers_env_pairs() {
+        // A desktop run sends the prepared environment to the helper, so this is the environment it starts with too.
+        let payload = run_payload(&json!({ "Env": { "NuGetAudit": "false" } }));
+        let request = Request::read(&payload).expect("a run with a caller pair is read");
+        let words = ["cmd".to_owned()];
+        let place = std::env::temp_dir();
+        let one = One {
+            words: &words,
+            place: &place,
+            timeout: None,
+            of: Of::Run,
+        };
+        let mut console = Console::new();
+
+        let environment = prepared(&request, &one, &mut console).map(|prepared| prepared.environment).ok();
+
+        let entries = environment.map(|block| String::from_utf16_lossy(block.as_wide()));
+        assert!(
+            entries.is_some_and(|entries| entries.split('\0').any(|entry| entry == "NuGetAudit=false")),
+            "the caller's pair is in the environment: {:?}",
+            console.take_notes()
+        );
     }
 }

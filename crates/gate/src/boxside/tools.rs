@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 use gate_win32::{Job, PipedConsole, PipedLaunch, PipedSuspended};
 
-use crate::boxside::forward::{DRAIN, Forwarders};
+use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
 use crate::boxside::payload::ordinal_upper;
 use crate::boxside::preflight::locate;
 use crate::boxside::run::{
@@ -191,7 +191,7 @@ fn restore_launch(place: &Path) -> Result<PipedLaunch, String> {
 /// started outlives the restore.
 fn restore(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<Restored, String> {
     // A stop that came while the snapshot was checked out ends the run here, before dotnet is even looked for.
-    if let Err(status) = before_the_job(beat.stop.look(STARTING_RESTORE), request.job, console) {
+    if let Err(status) = before_the_job(beat.stop.look(STARTING_RESTORE), request.job, beat.lock, console) {
         return Ok(Restored::Ended(status));
     }
     let launch = restore_launch(place)?;
@@ -219,7 +219,7 @@ fn restore(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
     Ok(match watched.wait(Some(&beat.stop), |_| None::<Infallible>, console) {
         WaitEnd::Failed(status) => Restored::Ended(status),
         WaitEnd::ClientGone => Restored::Ended(watched.client_gone(console)),
-        WaitEnd::Exited { stopped: true, .. } => Restored::Ended(stopped(watched, console)),
+        WaitEnd::Exited { stopped: true, .. } => Restored::Ended(stopped(watched, beat.lock, console)),
         WaitEnd::Exited { code, stopped: false } => {
             let took = started.elapsed();
             let drained = watched.drained(console);
@@ -239,10 +239,10 @@ fn restore(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
 
 /// Ends a restore a stop came during: its job terminated and waited for, then its readers drained and stopped, so no
 /// line of the restore comes after the stop line, which is said last; status 1.
-fn stopped(watched: Watched<'_>, console: &mut Console) -> u32 {
+fn stopped(watched: Watched<'_>, lock: &OutputLock, console: &mut Console) -> u32 {
     let ending = terminate_and_wait(watched.job);
     watched.forwarders.drain(DRAIN);
-    said_stopped(watched.job, ending, console)
+    said_stopped(watched.job, ending, lock, console)
 }
 
 /// Restores the work folder's dotnet tools before the command runs: the manifests `dotnet` would read for `place`,

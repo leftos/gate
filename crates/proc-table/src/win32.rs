@@ -36,7 +36,7 @@ pub struct Win32ProcessTable;
 
 impl ProcessTable for Win32ProcessTable {
     fn snapshot(&self) -> Vec<ProcessInfo> {
-        walk(true)
+        walk(true).unwrap_or_default()
     }
 }
 
@@ -49,21 +49,30 @@ impl Win32ProcessTable {
     /// the process tree and start times takes this snapshot.
     #[must_use]
     pub fn snapshot_without_command_lines(&self) -> Vec<ProcessInfo> {
+        walk(false).unwrap_or_default()
+    }
+
+    /// The entries [`Win32ProcessTable::snapshot_without_command_lines`] lists, or why the snapshot could not be taken,
+    /// for a caller that must not take a failed snapshot for a machine with no processes.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the `ToolHelp` snapshot cannot be taken.
+    pub fn try_snapshot_without_command_lines(&self) -> io::Result<Vec<ProcessInfo>> {
         walk(false)
     }
 }
 
-/// Every process of one `ToolHelp` snapshot, each turned into a [`ProcessInfo`] by [`process_info`]; an empty list when
-/// the snapshot itself cannot be taken. `command_lines` reads each process's command line as well as its start time.
-fn walk(command_lines: bool) -> Vec<ProcessInfo> {
+/// Every process of one `ToolHelp` snapshot, each turned into a [`ProcessInfo`] by [`process_info`], or the system's
+/// error when the snapshot itself cannot be taken. `command_lines` reads each process's command line as well as its
+/// start time.
+fn walk(command_lines: bool) -> io::Result<Vec<ProcessInfo>> {
     let mut processes = Vec::new();
-    let Ok(entry_size) = u32::try_from(size_of::<PROCESSENTRY32W>()) else {
-        return processes;
-    };
+    let entry_size = u32::try_from(size_of::<PROCESSENTRY32W>()).map_err(io::Error::other)?;
     // SAFETY: CreateToolhelp32Snapshot takes no pointers; its result is checked by the guard before any use. It returns
     // a fresh handle nothing else owns, so the guard alone closes it.
     let Some(snapshot) = (unsafe { OwnedHandle::new(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)) }) else {
-        return processes;
+        return Err(io::Error::last_os_error());
     };
     let mut entry = PROCESSENTRY32W {
         dwSize: entry_size,
@@ -76,7 +85,7 @@ fn walk(command_lines: bool) -> Vec<ProcessInfo> {
         // SAFETY: as for Process32FirstW above; the snapshot stays open until this loop ends.
         more = unsafe { Process32NextW(snapshot.0, &raw mut entry) } != 0;
     }
-    processes
+    Ok(processes)
 }
 
 /// One snapshot entry with its start time, and its command line only when `command_lines` is set, each `None` when it

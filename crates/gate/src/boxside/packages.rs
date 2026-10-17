@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use gate_win32::{Job, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken, Running};
 
-use crate::boxside::forward::{DRAIN, Forwarders};
+use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
 use crate::boxside::payload::{escaped, ordinal_upper};
 use crate::boxside::preflight::{is_real_folder, locate};
 use crate::boxside::run::{
@@ -388,7 +388,7 @@ fn install_launch(folder: &Path) -> Result<PipedLaunch, String> {
 /// when the box could not wait for it, or when the client closed the connection. `Err` carries the message of an
 /// install that could not be started. Its job kills on close and is terminated on every way out of here.
 fn install(request: &Request<'_>, folder: &Path, key: &str, beat: &Beat<'_>, console: &mut Console) -> Result<Installed, String> {
-    if let Err(status) = before_the_job(beat.stop.look(STARTING_INSTALL), request.job, console) {
+    if let Err(status) = before_the_job(beat.stop.look(STARTING_INSTALL), request.job, beat.lock, console) {
         return Ok(Installed::Ended(status));
     }
     let launch = install_launch(folder)?;
@@ -410,7 +410,7 @@ fn install(request: &Request<'_>, folder: &Path, key: &str, beat: &Beat<'_>, con
     Ok(match watched.wait(Some(&beat.stop), |_| None::<Infallible>, console) {
         WaitEnd::Failed(status) => Installed::Ended(status),
         WaitEnd::ClientGone => Installed::Ended(watched.client_gone(console)),
-        WaitEnd::Exited { stopped: true, .. } => Installed::Ended(stopped(watched, console)),
+        WaitEnd::Exited { stopped: true, .. } => Installed::Ended(stopped(watched, beat.lock, console)),
         WaitEnd::Exited { code, stopped: false } => {
             let took = started.elapsed();
             let drained = watched.drained(console);
@@ -436,8 +436,8 @@ fn start(launch: &PipedLaunch, job: &Job, beat: &Beat<'_>, console: &mut Console
     // A stop that came while the install was created ends it before it runs, as the command's launch looks: whether
     // the install went in the job or the stopped job refused it, it never runs, and is ended as it is dropped.
     match beat.stop.look(STARTING_INSTALL) {
-        Look::Stopped => return Ok(Err(said_stopped(job, terminate_and_wait(job), console))),
-        Look::Go(Some(unread)) => console.err(&unread),
+        Look::Stopped => return Ok(Err(said_stopped(job, terminate_and_wait(job), beat.lock, console))),
+        Look::Go(Some(unread)) => beat.say(console, &unread),
         Look::Go(None) => {}
     }
     let running = assigned.and_then(|()| suspended.resume()).map_err(|error| error.to_string())?;
@@ -452,10 +452,10 @@ fn start(launch: &PipedLaunch, job: &Job, beat: &Beat<'_>, console: &mut Console
 
 /// Ends an install a stop came during: its job terminated and waited for, then its readers drained, so the stop line,
 /// said last, follows every line of the install; status 1.
-fn stopped(watched: Watched<'_>, console: &mut Console) -> u32 {
+fn stopped(watched: Watched<'_>, lock: &OutputLock, console: &mut Console) -> u32 {
     let ending = terminate_and_wait(watched.job);
     watched.forwarders.drain(DRAIN);
-    said_stopped(watched.job, ending, console)
+    said_stopped(watched.job, ending, lock, console)
 }
 
 /// Writes `record` at `path`; a failure is said and fails the run with status 1.

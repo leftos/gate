@@ -4,14 +4,6 @@
 
 mod boot;
 mod ceiling;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the box's decisions on the hand-off to the desktop helper are held for the run path that hands it a command; \
-                  nothing outside tests reads them"
-    )
-)]
 mod desktop;
 mod forward;
 mod heartbeat;

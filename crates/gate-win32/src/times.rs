@@ -93,8 +93,9 @@ pub fn system_times() -> io::Result<SystemTimes> {
     })
 }
 
-/// The time now as the system clock that stamps a process's creation reads it, in 100 ns ticks since 1601, so a
-/// process created after this call has a creation time at or after it.
+/// The time now on the coarse system clock (`GetSystemTimeAsFileTime`), in 100 ns ticks since 1601. The coarse clock
+/// is never ahead of the precise one a process's creation is stamped from, so a process created after this call has a
+/// creation time at or after it, unless the clock is stepped back meanwhile.
 #[must_use]
 pub fn file_time_now() -> u64 {
     let mut now = FILETIME::default();

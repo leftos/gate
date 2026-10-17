@@ -22,9 +22,9 @@ use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, FileNameInfo, GetF
 use windows_sys::Win32::System::Pipes::{GetNamedPipeInfo, PIPE_SERVER_END};
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessId, GetProcessIdOfThread, OpenProcess, OpenProcessToken, PROCESS_DUP_HANDLE, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, ResumeThread, SuspendThread, TerminateProcess,
-    WaitForSingleObject,
+    GetCurrentProcess, GetExitCodeProcess, GetProcessId, GetProcessIdOfThread, OpenProcess, OpenProcessToken, PROCESS_DUP_HANDLE, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW, ResumeThread, SuspendThread,
+    TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
 };
 use windows_sys::Win32::System::WindowsProgramming::PUBLIC_OBJECT_BASIC_INFORMATION;
 
@@ -33,20 +33,21 @@ use crate::{own_handle, start_of, wait_millis};
 /// The longest image path read, in UTF-16 units: the longest path Windows has.
 const LONGEST_PATH: usize = 32_768;
 
-/// Another process, opened to copy handles into and out of its handle table (`PROCESS_DUP_HANDLE`), to query it and to
-/// wait for it.
+/// Another process, opened to copy handles into and out of its handle table (`PROCESS_DUP_HANDLE`), to query it, to
+/// wait for it and to end it.
 pub struct RemoteProcess {
     handle: OwnedHandle,
 }
 
 impl RemoteProcess {
-    /// Opens the process `pid` with `PROCESS_DUP_HANDLE`, `PROCESS_QUERY_LIMITED_INFORMATION` and `SYNCHRONIZE`.
+    /// Opens the process `pid` with `PROCESS_DUP_HANDLE`, `PROCESS_QUERY_LIMITED_INFORMATION`, `SYNCHRONIZE` and
+    /// `PROCESS_TERMINATE`.
     ///
     /// # Errors
     ///
     /// The system's error when the process cannot be opened: `ERROR_INVALID_PARAMETER` when no process has the pid.
     pub fn open(pid: u32) -> io::Result<RemoteProcess> {
-        let access = PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
+        let access = PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE;
         // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
         let handle = unsafe { own_handle(OpenProcess(access, 0, pid)) }?;
         Ok(RemoteProcess { handle })
@@ -126,6 +127,95 @@ impl RemoteProcess {
         // SAFETY: the handle is open for as long as `self` lives, which the borrow cannot outlive.
         unsafe { BorrowedHandle::borrow_raw(self.handle.raw()) }
     }
+
+    /// Opens the process `pid` with `PROCESS_QUERY_LIMITED_INFORMATION` alone, for a caller that only reads it, such as
+    /// its session ([`session_of`]); such a handle cannot copy handles, be waited on or end the process.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the process cannot be opened: `ERROR_INVALID_PARAMETER` when no process has the pid.
+    pub fn open_to_query(pid: u32) -> io::Result<RemoteProcess> {
+        // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
+        let handle = unsafe { own_handle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)) }?;
+        Ok(RemoteProcess { handle })
+    }
+
+    /// Waits at most `timeout` for the process to end, or for a handle of `wake` to be signalled, whichever comes first;
+    /// an end that comes at the same moment as a wake wins.
+    ///
+    /// # Errors
+    ///
+    /// An error of kind [`io::ErrorKind::InvalidInput`] for more than 63 handles in `wake`; the system's error when the
+    /// wait fails.
+    pub fn wait_or_woken(&self, timeout: Duration, wake: &[BorrowedHandle<'_>]) -> io::Result<EndWait> {
+        crate::pipe::check_wake(wake, "wait for a process's end")?;
+        let handles: Vec<HANDLE> = std::iter::once(self.handle.raw())
+            .chain(wake.iter().map(AsRawHandle::as_raw_handle))
+            .collect();
+        let count = u32::try_from(handles.len()).map_err(io::Error::other)?;
+        // SAFETY: every handle is open for the whole call (the process's by `self`, the others borrowed), `handles` holds
+        // `count` of them, and the wait is bounded below `INFINITE`.
+        let waited = unsafe { WaitForMultipleObjects(count, handles.as_ptr(), 0, wait_millis(timeout)) };
+        match waited {
+            WAIT_OBJECT_0 => Ok(EndWait::Ended),
+            WAIT_TIMEOUT => Ok(EndWait::Running),
+            signalled if (WAIT_OBJECT_0 + 1..WAIT_OBJECT_0 + count).contains(&signalled) => {
+                Ok(EndWait::Woken((signalled - WAIT_OBJECT_0 - 1) as usize))
+            }
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    /// Waits at most `timeout` for the process to end: true once it has ended, false while it still runs.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the wait fails.
+    pub fn wait(&self, timeout: Duration) -> io::Result<bool> {
+        // SAFETY: the handle is open for the whole call, with `SYNCHRONIZE`; the wait is bounded below `INFINITE`.
+        match unsafe { WaitForSingleObject(self.handle.raw(), wait_millis(timeout)) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    /// The code the process ended with, meaningful once [`RemoteProcess::wait`] has found it ended: a process that still
+    /// runs reports `STILL_ACTIVE` (259).
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the code cannot be read.
+    pub fn exit_code(&self) -> io::Result<u32> {
+        let mut code = 0;
+        // SAFETY: the handle is open for the whole call, with `PROCESS_QUERY_LIMITED_INFORMATION`, and `code` is
+        // writable.
+        if unsafe { GetExitCodeProcess(self.handle.raw(), &raw mut code) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(code)
+    }
+
+    /// Ends the process with `exit_code` and waits at most `bound` for its end, as [`end_process`] does: true once it
+    /// has ended, false when it still had not by then. A process that had ended already is no error.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the wait fails, or when the process could not be terminated and has not ended.
+    pub fn terminate(&self, exit_code: u32, bound: Duration) -> io::Result<bool> {
+        end_process(self.handle(), exit_code, bound)
+    }
+}
+
+/// How a [`RemoteProcess::wait_or_woken`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndWait {
+    /// The process has ended.
+    Ended,
+    /// The wake handle at this index was signalled first, the process still running.
+    Woken(usize),
+    /// The timeout passed with the process still running.
+    Running,
 }
 
 /// The highest value a handle table entry can have: handle values stay below 2^31, so a value with the high bit of a
@@ -950,5 +1040,60 @@ pub(crate) mod tests {
         let user = user_of(borrow(child.process.as_ref().expect("the process is held"))).expect("the child's user is read");
 
         assert_eq!(user, crate::token_facts().expect("this process's token is read").user);
+    }
+
+    #[test]
+    fn a_remote_process_is_waited_for_ended_and_read_for_its_exit_code() {
+        let _alone = one_at_a_time();
+        let child = suspended("exit 0");
+        let remote = RemoteProcess::open(child.pid()).expect("the child opens");
+
+        assert!(!remote.wait(Duration::ZERO).expect("the wait succeeds"), "a suspended child still runs");
+        assert!(
+            remote.terminate(7, HANG_GUARD).expect("the child is ended"),
+            "the child ended within the bound"
+        );
+
+        assert!(remote.wait(Duration::ZERO).expect("the wait succeeds"), "the ended child is signalled");
+        assert_eq!(remote.exit_code().expect("the exit code is read"), 7, "ended with the code given");
+        assert!(
+            remote.terminate(9, HANG_GUARD).expect("a child that has ended already is no error"),
+            "an ended child stays ended"
+        );
+        assert_eq!(
+            remote.exit_code().expect("the exit code is read"),
+            7,
+            "a second terminate changes nothing"
+        );
+        drop(child);
+    }
+
+    #[test]
+    fn a_wait_for_a_remote_process_is_ended_by_a_wake_handle() {
+        let _alone = one_at_a_time();
+        let child = suspended("exit 0");
+        let remote = RemoteProcess::open(child.pid()).expect("the child opens");
+        let wake = event();
+
+        assert_eq!(
+            remote.wait_or_woken(Duration::ZERO, &[wake.as_handle()]).expect("the wait succeeds"),
+            super::EndWait::Running,
+            "a suspended child still runs and nothing woke the wait"
+        );
+        // SAFETY: the event is open for the whole call.
+        let set = unsafe { windows_sys::Win32::System::Threading::SetEvent(wake.as_raw_handle()) };
+        assert_ne!(set, 0, "the event is set");
+        assert_eq!(
+            remote.wait_or_woken(HANG_GUARD, &[wake.as_handle()]).expect("the wait succeeds"),
+            super::EndWait::Woken(0),
+            "the set event ends the wait at once"
+        );
+        assert!(remote.terminate(7, HANG_GUARD).expect("the child is ended"), "the child ended");
+        assert_eq!(
+            remote.wait_or_woken(HANG_GUARD, &[wake.as_handle()]).expect("the wait succeeds"),
+            super::EndWait::Ended,
+            "an end at the same moment as a wake wins"
+        );
+        drop(child);
     }
 }

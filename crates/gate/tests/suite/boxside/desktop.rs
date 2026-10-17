@@ -1,17 +1,21 @@
 //! A run that asks for the builder's desktop, on the box: the console's session refused before the checkout, the
-//! builder's desktop lock waited for after it, each refusal's `desktop` tag and exit 75 with no back commits line, and
-//! the payloads refused with exit 2.
+//! builder's desktop lock waited for after it, each refusal's `desktop` tag and exit 75 with no back commits line, the
+//! payloads refused with exit 2, and the command handed to the seam's stand-in helper and run in the run's job.
 
 use std::fs;
 use std::path::Path;
 
+use gate_win32::{OpenedJob, StoppableProcess};
+use proc_table::{ProcessTable, Win32ProcessTable};
 use serde_json::{Value, json};
 
 use super::{
-    box_call, field, gate_box, lines_starting, pair_payload, pair_snapshot, payload as request_line, refused_line, run_box, run_box_with_seams,
-    snapshot, started_line, stopped_line_for,
+    BoxCall, box_call, field, gate_box, let_go, lines_starting, pair_payload, pair_snapshot, payload as request_line, refused_line, run_box,
+    run_box_with_seams, snapshot, started_line, stopped_line_for,
 };
-use crate::support::{Case, FAKE_TOOL, HeldDesktop, KeptDesktop, Outcome, box_payload, desktop_payload, desktop_seams};
+use crate::support::{
+    Case, FAKE_TOOL, HeldDesktop, KeptDesktop, Outcome, box_payload, copy_tool, desktop_payload, desktop_seams, junction, shown, wait_until,
+};
 
 /// The box's prefix of every line refusing a run the builder's desktop cannot take.
 const NO_DESKTOP: &str = "gate: not routed: the builder has no desktop session: ";
@@ -19,11 +23,18 @@ const NO_DESKTOP: &str = "gate: not routed: the builder has no desktop session: 
 /// A snapshot no refusal before the checkout ever fetches.
 const UNFETCHED: &str = "0123456789abcdef0123456789abcdef01234567";
 
-/// The command of every desktop case: it never runs, as no run gets past the stage.
+/// The command of every desktop case that gives none of its own: it says `ran` once it runs.
 const COMMAND: &[&str] = &[FAKE_TOOL, "out", "ran"];
 
-/// The cap on every desktop wait of a case, in milliseconds.
+/// The cap on every desktop wait of a case that ends before the hand-off, in milliseconds.
 const DESKTOP_MS: &str = "50";
+
+/// The cap on every desktop wait of a case whose run hands its command to the stand-in helper, in milliseconds: large
+/// enough for a real helper's start and connect on a busy machine, and never reached by a passing run.
+const HAND_OFF_MS: &str = "10000";
+
+/// `NORMAL_PRIORITY_CLASS`, which the helper gives the command although it runs below normal itself.
+const NORMAL_PRIORITY: &str = "priority 0x20";
 
 /// The line the box says when another run held the builder's desktop for the whole of a one-second wait.
 const BUSY_FOR_1_S: &str = "gate: not routed: the builder's desktop stayed busy for 1 s";
@@ -34,11 +45,46 @@ const BUSY_WAIT: &str = "gate: remote waiting for the builder's desktop: another
 /// The line the box says when it takes the builder's desktop from a run that ended holding it.
 const ABANDONED: &str = "gate: remote took the builder's desktop from a run that ended without releasing it";
 
-/// `gate box run` of `payload` with the desktop seams of `case`: the fault `ok` and the console session `session`.
-fn run_desktop(case: &Case, payload: &Value, session: &str) -> Outcome {
-    let seams = desktop_seams(case, "ok", session, DESKTOP_MS);
+/// `gate box run` of `payload` with the desktop seams of `case`: the fault `mode`, the console session `session` and the
+/// cap `ms` on its desktop waits.
+fn run_desktop(case: &Case, payload: &Value, mode: &str, session: &str, ms: &str) -> Outcome {
+    let seams = desktop_seams(case, mode, session, ms);
     let seams: Vec<&str> = seams.iter().map(String::as_str).collect();
     run_box_with_seams(case, payload, &seams)
+}
+
+/// `gate box run` of `payload` handed to the stand-in helper with the fault `mode`, at an active console.
+fn handed_off(case: &Case, payload: &Value, mode: &str) -> Outcome {
+    desktop_call(case, payload, mode, &[]).finish()
+}
+
+/// `gate box run` of `payload` with the desktop seams of a hand-off with the fault `mode` at an active console, and the
+/// box's `extra` seams, not yet started.
+fn desktop_call(case: &Case, payload: &Value, mode: &str, extra: &[&str]) -> BoxCall {
+    let seams = desktop_seams(case, mode, "active", HAND_OFF_MS);
+    let mut args = vec!["box"];
+    args.extend(seams.iter().map(String::as_str));
+    args.extend_from_slice(extra);
+    args.push("run");
+    box_call(case, &args, &request_line(payload))
+}
+
+/// The desktop payload of `case`'s work folder `k` running `command`, its snapshot made.
+fn ready_payload(case: &Case, command: &[&str]) -> Value {
+    let mut payload = desktop_payload(case, "k", command, 30);
+    snapshot(case, &mut payload, &[("a.txt", "a\n")]);
+    payload
+}
+
+/// Checks `outcome` ran its command: no refusal tag, no back commits line, and the start marker said once.
+fn ran_its_command(outcome: &Outcome, payload: &Value) {
+    assert!(lines_starting(outcome, "gate-remote-refused:").is_empty(), "no refusal: {outcome:?}");
+    assert!(
+        lines_starting(outcome, "gate: remote back commits: failed").is_empty(),
+        "no back commits failure: {outcome:?}"
+    );
+    let marker = started_line(payload);
+    assert_eq!(lines_starting(outcome, &marker), [marker.as_str()], "the marker, once: {outcome:?}");
 }
 
 /// The desktop payload of `case`'s work folder `k` with a snapshot no refusal before the checkout fetches, and the
@@ -76,7 +122,7 @@ fn console_refuses(name: &str, session: &str, why: &str) {
     let case = Case::new(name);
     let payload = unfetched_payload(&case);
 
-    let outcome = run_desktop(&case, &payload, session);
+    let outcome = run_desktop(&case, &payload, "ok", session, DESKTOP_MS);
 
     refused_with(&outcome, &payload, &format!("{NO_DESKTOP}{why}"));
 }
@@ -109,28 +155,27 @@ fn a_desktop_refusal_carries_the_tag_and_exit_75_and_no_back_commits_line_on_a_p
     payload["DesktopWait"] = json!(1);
     pair_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("lib", &[("b.txt", "b\n")])]);
 
-    let before = run_desktop(&case, &payload, "none");
+    let before = run_desktop(&case, &payload, "ok", "none", DESKTOP_MS);
     refused_with(&before, &payload, &format!("{NO_DESKTOP}nobody is logged on at the console"));
 
     let held = HeldDesktop::hold(&case);
-    let after = run_desktop(&case, &payload, "active");
+    let after = run_desktop(&case, &payload, "ok", "active", DESKTOP_MS);
     drop(held);
     refused_with(&after, &payload, BUSY_FOR_1_S);
 }
 
 #[test]
-fn a_desktop_run_past_the_stage_gets_the_placeholder_refusal() {
-    let case = Case::new("desktop_placeholder");
-    let mut payload = desktop_payload(&case, "k", COMMAND, 30);
-    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
-    let placeholder = format!("{NO_DESKTOP}the desktop helper did not start: the box's hand-off is not built yet");
+fn a_desktop_run_releases_the_builders_desktop_when_it_ends() {
+    let case = Case::new("desktop_released");
+    let payload = ready_payload(&case, COMMAND);
     // Open across both runs, so a lock the first box left taken would be found abandoned by the second.
     let _kept = KeptDesktop::open(&case);
 
     for run in ["first", "second"] {
-        let outcome = run_desktop(&case, &payload, "active");
+        let outcome = handed_off(&case, &payload, "ok");
 
-        refused_with(&outcome, &payload, &placeholder);
+        assert_eq!(outcome.code, Some(0), "the {run} run ran its command: {outcome:?}");
+        assert_eq!(outcome.stdout, "ran\n", "the {run} run's command output: {outcome:?}");
         assert!(
             lines_starting(&outcome, BUSY_WAIT).is_empty(),
             "the {run} run found the lock free: {outcome:?}"
@@ -139,8 +184,267 @@ fn a_desktop_run_past_the_stage_gets_the_placeholder_refusal() {
             lines_starting(&outcome, ABANDONED).is_empty(),
             "the {run} run found the lock released, not abandoned: {outcome:?}"
         );
-        assert!(!outcome.stdout.lines().any(|line| line == "ran"), "the command never ran: {outcome:?}");
     }
+}
+
+#[test]
+fn a_desktop_run_prints_the_marker_after_the_command_is_adopted_and_before_its_output() {
+    let case = Case::new("desktop_marker");
+    let payload = ready_payload(&case, &[FAKE_TOOL, "err", "first", "out", "x"]);
+
+    let outcome = handed_off(&case, &payload, "ok");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    ran_its_command(&outcome, &payload);
+    let marker = started_line(&payload);
+    let lines: Vec<&str> = outcome.stderr.lines().collect();
+    let at = |wanted: &str| lines.iter().position(|line| *line == wanted);
+    assert!(
+        at(&marker).zip(at("first")).is_some_and(|(marker, first)| marker < first),
+        "the marker comes before the command's first line: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_desktop_run_passes_the_commands_status_and_output() {
+    let case = Case::new("desktop_status");
+    let payload = ready_payload(&case, &[FAKE_TOOL, "out", "ran", "err", "e", "exit", "7"]);
+
+    let outcome = handed_off(&case, &payload, "ok");
+
+    assert_eq!(outcome.code, Some(7), "the command's own status: {outcome:?}");
+    assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
+    assert!(outcome.stderr.lines().any(|line| line == "e"), "the command's stderr: {outcome:?}");
+    ran_its_command(&outcome, &payload);
+}
+
+#[test]
+fn a_desktop_command_is_in_the_runs_job_at_normal_priority() {
+    let case = Case::new("desktop_job");
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let payload = ready_payload(&case, &[FAKE_TOOL, "priority", "pid", "wait", &go_word]);
+    let seams = desktop_seams(&case, "ok", "active", HAND_OFF_MS);
+    let mut args = vec!["box"];
+    args.extend(seams.iter().map(String::as_str));
+    args.push("run");
+
+    let running = box_call(&case, &args, &request_line(&payload)).start();
+    running.wait_for_stdout("pid ");
+    let members = OpenedJob::open_to_list(field(&payload, "Job"))
+        .expect("the job can be opened")
+        .expect("the job exists while its command waits")
+        .process_ids()
+        .expect("the job's processes are listed");
+    // Named while the command still waits, so no pid of the job has been reused yet.
+    let names: Vec<String> = Win32ProcessTable
+        .snapshot_without_command_lines()
+        .into_iter()
+        .filter(|process| members.contains(&process.pid))
+        .map(|process| process.name)
+        .collect();
+    let_go(&go);
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let pid: u32 = outcome
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("pid "))
+        .and_then(|pid| pid.trim().parse().ok())
+        .expect("the command printed its pid");
+    assert!(members.contains(&pid), "the run's job holds the command: {members:?} {outcome:?}");
+    let commands = names.iter().filter(|name| name.eq_ignore_ascii_case("fake-tool.exe")).count();
+    assert_eq!(commands, 1, "the command, once: {names:?}");
+    assert!(
+        names
+            .iter()
+            .all(|name| name.eq_ignore_ascii_case("fake-tool.exe") || name.eq_ignore_ascii_case("conhost.exe")),
+        "beside the command, the job holds only its console host, no console donor: {names:?} {outcome:?}"
+    );
+    assert!(
+        outcome.stdout.lines().any(|line| line == NORMAL_PRIORITY),
+        "normal priority, though the stand-in helper runs below normal: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_desktop_command_gets_the_boxs_environment_and_working_folder() {
+    let case = Case::new("desktop_environment");
+    let mut payload = ready_payload(
+        &case,
+        &[
+            FAKE_TOOL,
+            "env",
+            "Logging__EventLog__LogLevel__Default",
+            "env",
+            "GIT_CONFIG_COUNT",
+            "env",
+            "NuGetAudit",
+            "cwd",
+        ],
+    );
+    payload["Env"] = json!({ "NuGetAudit": "false" });
+    let seams = desktop_seams(&case, "ok", "active", HAND_OFF_MS);
+    let mut args = vec!["box"];
+    args.extend(seams.iter().map(String::as_str));
+    args.push("run");
+    // The box inherits no config entries, whatever the environment this suite runs in holds.
+    let mut command = box_call(&case, &args, &request_line(&payload));
+    command.env_remove("GIT_CONFIG_COUNT");
+
+    let outcome = command.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let lines: Vec<&str> = outcome.stdout.lines().collect();
+    assert_eq!(
+        lines.get(..3),
+        Some(["None", "1", "false"].as_slice()),
+        "the Event Log provider off, git's safe.directory entry, the caller's pair: {outcome:?}"
+    );
+    let cwd = lines.get(3).and_then(|line| line.strip_prefix("cwd ")).expect("the cwd line");
+    assert!(
+        cwd.eq_ignore_ascii_case(field(&payload, "Work")),
+        "the command runs in the work folder: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_desktop_run_has_no_donor_and_ignores_the_console_and_token_seams() {
+    let case = Case::new("desktop_no_donor");
+    let payload = ready_payload(&case, COMMAND);
+    let mut seams = desktop_seams(&case, "ok", "active", HAND_OFF_MS);
+    seams.extend(["--test-box-console", "fail-before", "--test-box-token", "refused"].map(str::to_owned));
+    let seams: Vec<&str> = seams.iter().map(String::as_str).collect();
+
+    let outcome = run_box_with_seams(&case, &payload, &seams);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
+    ran_its_command(&outcome, &payload);
+    assert!(
+        lines_starting(&outcome, "gate: remote could not give the command a UTF-8 console").is_empty(),
+        "no console donor, so no fallback from one: {outcome:?}"
+    );
+    assert!(
+        !outcome.stderr.contains("own token"),
+        "no restricted token, so no start with the box's own: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_refused_child_report_leaves_nothing_running() {
+    let case = Case::new("desktop_lie_handle");
+    let mark = case.folder().join("marked");
+    let mark_word = shown(&mark);
+    let record = case.folder().join("children");
+    let payload = ready_payload(&case, &[FAKE_TOOL, "mark", &mark_word, "out", "ran"]);
+    // The stand-in records its child and runs in no job of the box's, so only the box's own ending ends the child.
+    let mut call = desktop_call(&case, &payload, "lie-handle", &[]);
+    call.env("GATE_DESKTOP_TEST_RECORD", &record);
+
+    let outcome = call.finish();
+
+    let recorded: Vec<u32> = fs::read_to_string(&record)
+        .expect("the stand-in recorded the child it created")
+        .lines()
+        .map(|line| line.parse().expect("a recorded pid"))
+        .collect();
+    let left: Vec<u32> = Win32ProcessTable
+        .snapshot()
+        .into_iter()
+        .filter(|process| recorded.contains(&process.pid))
+        .filter(|process| process.command_line.as_deref().is_some_and(|line| line.contains(&mark_word)))
+        .map(|process| process.pid)
+        .collect();
+    for pid in &left {
+        if let Ok(Some(process)) = StoppableProcess::open(*pid) {
+            let _ = process.terminate(1);
+        }
+    }
+    assert!(!recorded.is_empty(), "the stand-in created a child: {outcome:?}");
+    assert!(left.is_empty(), "no child of the stand-in outlives the run: {left:?} {outcome:?}");
+    refused_with(
+        &outcome,
+        &payload,
+        &format!("{NO_DESKTOP}the desktop helper failed: the command it started is not the process it reported: {INVALID_HANDLE}"),
+    );
+    assert!(!mark.exists(), "the command never ran: {outcome:?}");
+}
+
+/// The system's error for a handle value the helper's table does not hold, as the box says it.
+const INVALID_HANDLE: &str = "The handle is invalid. (os error 6)";
+
+#[test]
+fn a_desktop_run_parks_after_the_command_is_adopted_and_before_it_runs() {
+    let case = Case::new("desktop_park");
+    let park = case.folder().join("park");
+    let parked = case.folder().join("park.parked");
+    let mark = case.folder().join("marked");
+    let (park_word, mark_word) = (shown(&park), shown(&mark));
+    let payload = ready_payload(&case, &[FAKE_TOOL, "mark", &mark_word, "out", "ran"]);
+    let running = desktop_call(&case, &payload, "ok", &["--test-box-park-launch", &park_word]).start();
+    wait_until("the box parked before the command's marker", || parked.exists());
+
+    let members = OpenedJob::open_to_list(field(&payload, "Job"))
+        .expect("the job can be opened")
+        .expect("the job exists while the box is parked")
+        .process_ids()
+        .expect("the job's processes are listed");
+    let ran_before = mark.exists();
+    let_go(&park);
+    let outcome = running.finish();
+
+    assert!(
+        !members.is_empty(),
+        "the command was adopted into the run's job before the park: {outcome:?}"
+    );
+    assert!(!ran_before, "the parked command had not run: {outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
+    ran_its_command(&outcome, &payload);
+}
+
+#[test]
+fn a_desktop_command_the_helper_cannot_create_is_a_start_failure_after_the_marker() {
+    let case = Case::new("desktop_not_created");
+    let mut payload = desktop_payload(&case, "k", &[r".\bad.exe"], 30);
+    snapshot(&case, &mut payload, &[("bad.exe", "not a program\r\n")]);
+
+    let outcome = handed_off(&case, &payload, "ok");
+
+    assert_eq!(outcome.code, Some(127), "a command that could not be created: {outcome:?}");
+    assert!(lines_starting(&outcome, "gate-remote-refused:").is_empty(), "no refusal: {outcome:?}");
+    let marker = started_line(&payload);
+    let lines: Vec<&str> = outcome.stderr.lines().collect();
+    let at_marker = lines.iter().position(|line| *line == marker);
+    let at_failure = lines.iter().position(|line| line.starts_with("gate: could not start"));
+    assert!(
+        at_marker.zip(at_failure).is_some_and(|(marker, failure)| marker < failure),
+        "the marker, then the start failure: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_desktop_command_reached_through_a_junction_runs() {
+    let case = Case::new("desktop_junction");
+    let real = case.folder().join("real");
+    fs::create_dir_all(&real).expect("the program's folder is made");
+    copy_tool(&case, r"real\fake-tool.exe");
+    let current = case.folder().join("current");
+    junction(&current, &real);
+    let program = shown(&current.join("fake-tool.exe"));
+    let payload = ready_payload(&case, &[&program, "out", "ran"]);
+
+    let outcome = handed_off(&case, &payload, "ok");
+
+    assert_eq!(
+        outcome.code,
+        Some(0),
+        "the program the junction reaches is the one the box sent: {outcome:?}"
+    );
+    assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
+    ran_its_command(&outcome, &payload);
 }
 
 #[test]
@@ -150,23 +454,20 @@ fn a_desktop_wait_says_the_busy_line_once_and_an_abandoned_lock_is_said() {
     snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
 
     let held = HeldDesktop::hold(&case);
-    let busy = run_desktop(&case, &payload, "active");
+    let busy = run_desktop(&case, &payload, "ok", "active", DESKTOP_MS);
     drop(held);
     refused_with(&busy, &payload, BUSY_FOR_1_S);
     assert_eq!(lines_starting(&busy, BUSY_WAIT), [BUSY_WAIT], "the busy line, once: {busy:?}");
 
     HeldDesktop::abandon(&case);
-    let abandoned = run_desktop(&case, &payload, "active");
+    let abandoned = handed_off(&case, &payload, "ok");
     assert_eq!(
         lines_starting(&abandoned, ABANDONED),
         [ABANDONED],
         "the abandoned lock, said once: {abandoned:?}"
     );
-    refused_with(
-        &abandoned,
-        &payload,
-        &format!("{NO_DESKTOP}the desktop helper did not start: the box's hand-off is not built yet"),
-    );
+    assert_eq!(abandoned.code, Some(0), "the run took the lock and ran: {abandoned:?}");
+    ran_its_command(&abandoned, &payload);
 }
 
 #[test]
@@ -207,7 +508,7 @@ fn a_desktop_command_that_cannot_start_never_waits_for_the_desktop() {
 
     let mut missing = desktop_payload(&case, "k", &["gate-no-such-program-anywhere"], 1);
     snapshot(&case, &mut missing, &[("write.cmd", "@echo x>new.txt\r\n")]);
-    let not_found = run_desktop(&case, &missing, "active");
+    let not_found = run_desktop(&case, &missing, "ok", "active", DESKTOP_MS);
     assert_eq!(not_found.code, Some(127), "{not_found:?}");
     assert_eq!(
         lines_starting(&not_found, "gate: could not start gate-no-such-program-anywhere").len(),
@@ -217,7 +518,7 @@ fn a_desktop_command_that_cannot_start_never_waits_for_the_desktop() {
 
     let mut batch = desktop_payload(&case, "k", &[r".\write.cmd", "%PATH%"], 1);
     batch["Snapshot"] = missing["Snapshot"].clone();
-    let refused = run_desktop(&case, &batch, "active");
+    let refused = run_desktop(&case, &batch, "ok", "active", DESKTOP_MS);
     assert_eq!(refused.code, Some(2), "{refused:?}");
     assert_eq!(
         lines_starting(&refused, "gate: a .cmd or .bat command cannot take a word"),

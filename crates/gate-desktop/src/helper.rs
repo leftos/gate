@@ -169,6 +169,8 @@ fn serve(box_pid: u32, name: &str, limits: Limits, owner: PipeOwner) -> Result<H
     let child = start(&pipe, spawn, limits.message)?;
     let released = child.release().map_err(|_| HelperExit::Internal)?;
     #[cfg(feature = "test-seams")]
+    record_child(released.pid)?;
+    #[cfg(feature = "test-seams")]
     if Fault::asked() == Some(Fault::ExitAfterCreate) {
         return Err(HelperExit::Internal);
     }
@@ -180,6 +182,28 @@ fn serve(box_pid: u32, name: &str, limits: Limits, owner: PipeOwner) -> Result<H
         Err(WriteError::TimedOut) => Err(HelperExit::TimedOut),
         Err(WriteError::Io(_) | WriteError::Woken(_) | WriteError::TooLong) => Err(HelperExit::Internal),
     }
+}
+
+/// The seam that, set to a file's path, makes the helper add the pid of each child it creates to that file, one line
+/// each, in a build with the `test-seams` feature, so a case can see whether the child outlived the run.
+#[cfg(feature = "test-seams")]
+const TEST_RECORD_VARIABLE: &str = "GATE_DESKTOP_TEST_RECORD";
+
+/// Adds the child's `pid` to the file `GATE_DESKTOP_TEST_RECORD` names, when it names one. A record that cannot be
+/// written ends the run as [`HelperExit::Internal`], so a case never reads a record that misses a child.
+#[cfg(feature = "test-seams")]
+fn record_child(pid: u32) -> Result<(), HelperExit> {
+    use std::io::Write;
+
+    let Some(path) = std::env::var_os(TEST_RECORD_VARIABLE) else {
+        return Ok(());
+    };
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| writeln!(file, "{pid}"))
+        .map_err(|_| HelperExit::Internal)
 }
 
 /// The exit a fault asks for before `Hello` is sent: `exit-before-hello` exits at once, as a helper whose box went
