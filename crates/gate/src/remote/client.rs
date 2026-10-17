@@ -13,8 +13,8 @@
 //! that booted more than 30 s later restarted, and the run falls back `rebooted`; one that gives no boot time, or when
 //! either value is no timestamp, falls back `unreachable`; else the run ends 255. No call holds more than 64 KiB of a
 //! line in memory, nor keeps more than a call's last 1,000 lines, totalling at most 1 MiB: a longer line ends any call
-//! but the run call, whose output is passed on whole. The run takes the work-folder key's lock, [`hold_key`], before
-//! its remote slot, so a second routed run of one worktree falls back `busy` at once.
+//! but the run call, whose output is passed on whole. The run takes the work-folder key's lock ([`hold_key`], then
+//! [`hold_key_waiting`] in slices from `run.rs` up to its bound) before its remote slot.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use gate_args::BoxVerb;
 use gate_args::TestSeams;
+use gate_args::is_godot_console;
 use gate_desktop::version::build_version;
 use gate_state::v1::WarmFailure;
 use gate_state::{FallbackReason, KernelObject, key_hash};
@@ -52,7 +53,7 @@ use super::snapshot::{self, Bounded, Place, Snapshot};
 use super::syncback;
 #[cfg(feature = "test-seams")]
 use super::tamper;
-use super::toolchain::{self, Manifest, Pin, Reported};
+use super::toolchain::{self, GodotChoice, Manifest, Pin, Reported};
 #[cfg(feature = "test-seams")]
 use super::transport::Local;
 use super::transport::ssh::Ssh;
@@ -222,8 +223,9 @@ pub(crate) fn hold_key(call: &RemoteCall<'_>) -> Result<OwnedMutexGuard, Option<
     }
 }
 
-/// How long one slice of [`hold_key_waiting`]'s wait lasts, between two looks at the console interrupt.
-const KEY_WAIT_SLICE: Duration = Duration::from_millis(100);
+/// How long one slice of [`hold_key_waiting`]'s wait lasts, between two looks at the console interrupt. A run that
+/// waits in slices of its own ([`crate::run`]) takes each one as a call's whole wait.
+pub(crate) const KEY_WAIT_SLICE: Duration = Duration::from_millis(100);
 
 /// How a wait for the work-folder key's lock ended.
 pub(crate) enum KeyHold {
@@ -1112,6 +1114,11 @@ impl Attempt<'_, '_> {
             .zip(siblings)
             .map(|(repo, sibling)| (repo.name.clone(), sibling.commit.clone()))
             .collect();
+        let trees = self.trees(&repos, &snapshots)?;
+        let needs = trees.first().and_then(Option::as_ref).map(Tree::needs).unwrap_or_default();
+        let prepared = self.preflight(&location, &needs)?;
+        let godot_version = self.parity(&repos, &snapshots, &trees, &prepared)?;
+        // After the preflight, whose installs the Godot version is chosen from.
         let run = RunCall {
             words: self.call.words,
             subfolder: self.call.subfolder,
@@ -1123,12 +1130,10 @@ impl Attempt<'_, '_> {
             host: self.call.host,
             sibling_snapshots: &sibling_snapshots,
             inputs_digest: inputs.as_ref().map(|built| built.digest.as_str()),
+            env: self.call.env,
+            godot_version: godot_version.as_deref(),
         };
         let run_input = payload::input(&self.run_word(&location, &run), sent.manifest.as_deref());
-        let trees = self.trees(&repos, &snapshots)?;
-        let needs = trees.first().and_then(Option::as_ref).map(Tree::needs).unwrap_or_default();
-        let prepared = self.preflight(&location, &needs)?;
-        self.parity(&repos, &snapshots, &trees, &prepared)?;
         self.pushes(&repos, &snapshots, &prepared.created)?;
         // The pair's folders are let go before the run call, which never runs while they are held.
         self.release_run()?;
@@ -1644,13 +1649,24 @@ impl Attempt<'_, '_> {
     /// tool not checked, in order; then a builder that lacks any of it says one mismatch line per need, the SDK's
     /// before the tools', and is refused `parity` once. A pair's repositories are each checked so, in order, a sibling
     /// for its own SDK alone, as its own `global.json` pins it, its lines naming it; the tools are the main one's.
-    fn parity(&mut self, repos: &[Repo], snapshots: &[Snapshot], trees: &[Option<Tree>], prepared: &Prepared) -> Result<(), End> {
+    ///
+    /// `Ok` with the version of the builder's Godot install the run uses ([`toolchain::godot_choice`]), `None` when none
+    /// is chosen; a main repo pinning several Godot versions chooses none, and a run whose first word is a Godot console
+    /// ([`is_godot_console`]) then says why after the mismatch lines and is refused `parity`.
+    fn parity(&mut self, repos: &[Repo], snapshots: &[Snapshot], trees: &[Option<Tree>], prepared: &Prepared) -> Result<Option<String>, End> {
         let mut refused = false;
+        let required = trees
+            .first()
+            .and_then(Option::as_ref)
+            .and_then(|tree| toolchain::godot_required(tree.manifest.as_ref(), &tree.godot_pins));
         for (at, ((repo, snapshot), tree)) in repos.iter().zip(snapshots).zip(trees).enumerate() {
             let Some(tree) = tree else {
                 continue;
             };
-            let needs = self.repo_needs(at, repo, snapshot, tree, prepared)?;
+            let mut needs = self.repo_needs(at, repo, snapshot, tree, prepared)?;
+            if at == 0 {
+                needs.extend(self.tool_needs(tree, prepared, required.as_deref()));
+            }
             if needs.is_empty() {
                 continue;
             }
@@ -1660,29 +1676,45 @@ impl Attempt<'_, '_> {
             }
             refused = true;
         }
-        if refused { Err(End::Refused(FallbackReason::Parity)) } else { Ok(()) }
+        let chosen = match toolchain::godot_choice(required.as_deref(), &prepared.tools) {
+            GodotChoice::None => None,
+            GodotChoice::Version(version) => Some(version),
+            GodotChoice::Several(list) => {
+                if self.call.words.first().is_some_and(|word| is_godot_console(word)) {
+                    self.say(toolchain::several_godot_line(&list));
+                    refused = true;
+                }
+                None
+            }
+        };
+        if refused {
+            Err(End::Refused(FallbackReason::Parity))
+        } else {
+            Ok(chosen)
+        }
     }
 
     /// What the builder lacks for the repository `repo`, at `at` in the run's order, whose `snapshot` has the tree
-    /// `tree`: its SDK, and for the main one, first, the tools its manifest declares and the Godot versions its project
-    /// files pin, each manifest problem, tool not checked and project file left unread said. A sibling's git failure
-    /// keeps the run here naming it.
+    /// `tree`: its SDK, the SDK step's own lines said; the main one's tools are [`Attempt::tool_needs`]'. A sibling's git
+    /// failure keeps the run here naming it.
     fn repo_needs(&mut self, at: usize, repo: &Repo, snapshot: &Snapshot, tree: &Tree, prepared: &Prepared) -> Result<Vec<parity::Need>, End> {
         self.go_on()?;
         let needs = self.sdk_needs(snapshot, tree, prepared.sdks.as_deref());
-        let mut needs = needs.map_err(|end| repo_end(at, &repo.name, end))?;
-        if at == 0 {
-            let godot = toolchain::godot_required(tree.manifest.as_ref(), &tree.godot_pins);
-            let judged = toolchain::judge(tree.manifest.as_ref(), godot.as_deref(), &prepared.sent, &prepared.tools, self.call.host);
-            for line in judged.skips {
-                self.say(line);
-            }
-            for line in &tree.godot_skips {
-                self.say(line.clone());
-            }
-            needs.extend(judged.needs);
+        needs.map_err(|end| repo_end(at, &repo.name, end))
+    }
+
+    /// What the builder lacks of the tools the main repository's tree `tree` declares and of the Godot versions `godot`
+    /// it requires ([`toolchain::godot_required`]), as the `prepared` preflight said of them, each manifest problem, tool
+    /// not checked and project file left unread said.
+    fn tool_needs(&mut self, tree: &Tree, prepared: &Prepared, godot: Option<&[Pin]>) -> Vec<parity::Need> {
+        let judged = toolchain::judge(tree.manifest.as_ref(), godot, &prepared.sent, &prepared.tools, self.call.host);
+        for line in judged.skips {
+            self.say(line);
         }
-        Ok(needs)
+        for line in &tree.godot_skips {
+            self.say(line.clone());
+        }
+        judged.needs
     }
 
     /// The SDK needs of the snapshot whose `tree` the builder whose preflight listed the SDKs `sdks` lacks, as
@@ -4174,6 +4206,7 @@ mod tests {
             tail: 0,
             no_markers: false,
             bring_tracked: &[],
+            env: &[],
             interrupt: Some(raised()),
             state: &STATE,
             state_dir: Path::new(r"C:\gate-client-tests-state"),
@@ -6401,6 +6434,7 @@ mod tests {
             tail: 0,
             no_markers: false,
             bring_tracked: &[],
+            env: &[],
             interrupt,
             state,
             state_dir: Path::new(r"C:\gate-client-tests-state"),

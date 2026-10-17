@@ -100,8 +100,9 @@ pub(crate) fn bare(root: &str, repo: &str) -> String {
 /// in, the run's outputs nonce, the snapshot the box checks out, the output globs the run brings back (none asks for no
 /// outputs), and whether every file under them counts as changed (`OutputsFull`), as after an outputs step that did not
 /// complete; the run's ceiling in whole seconds, which the box counts in load-adjusted time (`Timeout`), and the PC's
-/// name for the builder, which the box's kill line names (`Host`); and each sibling's name and the commit its snapshot
-/// is (`SiblingSnapshots`, sent only when there is one).
+/// name for the builder, which the box's kill line names (`Host`); the caller's `--env` pairs (`Env`, sent only when
+/// there is one); and each sibling's name and the commit its snapshot is (`SiblingSnapshots`, sent only when there is
+/// one); and the version of the builder's Godot install the run uses (`GodotVersion`, sent only when one is chosen).
 pub(crate) struct RunCall<'a> {
     pub words: &'a [String],
     pub subfolder: &'a str,
@@ -114,6 +115,11 @@ pub(crate) struct RunCall<'a> {
     pub sibling_snapshots: &'a [(String, String)],
     /// The SHA-256 of the inputs manifest line the inputs calls sent (`InputsDigest`), `None` for a run with no inputs.
     pub inputs_digest: Option<&'a str>,
+    /// The caller's `--env` pairs (`Env`, sent only when there is one); a warm-up never sends them.
+    pub env: &'a [(String, String)],
+    /// The version, `major.minor.patch`, of the builder's Godot install the run uses (`GodotVersion`, sent only when
+    /// one is chosen), which a warm-up sends too.
+    pub godot_version: Option<&'a str>,
 }
 
 /// The step an inputs call asks the box for: which files the work folder needs (`diff`), or installing them (`put`).
@@ -162,7 +168,7 @@ pub(crate) fn outputs_word(location: &Location, name: &str) -> String {
     word(&object)
 }
 
-/// The payload word of the run call.
+/// The payload word of the run call, with the caller's `--env` pairs as `Env` when there is one.
 pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
     let mut object = location.object();
     for (name, value) in [
@@ -177,6 +183,10 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
         ("Host", json!(run.host)),
     ] {
         object.insert(name.to_owned(), value);
+    }
+    if !run.env.is_empty() {
+        let env: Map<String, Value> = run.env.iter().map(|(name, value)| (name.clone(), Value::String(value.clone()))).collect();
+        object.insert("Env".to_owned(), Value::Object(env));
     }
     insert_siblings_and_inputs(&mut object, run);
     word(&object)
@@ -220,8 +230,12 @@ fn identity() -> Value {
     )
 }
 
-/// Adds `run`'s `SiblingSnapshots`, when it has any, and its `InputsDigest`, when it has one, to `object`.
+/// Adds `run`'s `SiblingSnapshots`, when it has any, its `InputsDigest`, when it has one, and its `GodotVersion`, when
+/// one is chosen, to `object`.
 fn insert_siblings_and_inputs(object: &mut Map<String, Value>, run: &RunCall<'_>) {
+    if let Some(version) = run.godot_version {
+        object.insert("GodotVersion".to_owned(), json!(version));
+    }
     if !run.sibling_snapshots.is_empty() {
         let snapshots: Map<String, Value> = run
             .sibling_snapshots
@@ -328,6 +342,8 @@ mod tests {
             host: "builder",
             sibling_snapshots,
             inputs_digest: None,
+            env: &[],
+            godot_version: None,
         };
         run_word(&location().with_pair("app", &["lib".to_owned(), "tools".to_owned()]), &run)
     }
@@ -446,6 +462,8 @@ mod tests {
             host: "builder",
             sibling_snapshots: &[],
             inputs_digest: None,
+            env: &[],
+            godot_version: None,
         };
         let mut expected = preflight;
         let extra = json!({
@@ -485,6 +503,8 @@ mod tests {
             host: "builder",
             sibling_snapshots: &[],
             inputs_digest: Some("ab"),
+            env: &[],
+            godot_version: None,
         };
 
         let sent = decoded(&run_word(&location(), &run));
@@ -499,6 +519,81 @@ mod tests {
         assert_eq!(sent["Outputs"], json!(["**/bin/**", "out/*.dll"]));
         assert_eq!(sent["OutputsFull"], json!(true));
         assert_eq!(sent["Nonce"], json!("n2"));
+    }
+
+    #[test]
+    fn a_run_with_env_pairs_sends_them_in_order_and_the_box_reads_them_back() {
+        let words = ["./tool.exe".to_owned()];
+        let env = [("NuGetAudit".to_owned(), "false".to_owned()), ("EMPTY".to_owned(), String::new())];
+        let run = RunCall {
+            words: &words,
+            subfolder: "",
+            nonce: "n3",
+            snapshot: SHA,
+            outputs: &[],
+            full: false,
+            timeout: 1,
+            host: "builder",
+            sibling_snapshots: &[],
+            inputs_digest: None,
+            env: &env,
+            godot_version: None,
+        };
+
+        let word = run_word(&location(), &run);
+
+        assert_eq!(decoded(&word)["Env"], json!({"NuGetAudit": "false", "EMPTY": ""}));
+        assert_eq!(on_the_box(&word).pairs("Env"), Ok(env.to_vec()), "in the order given");
+        assert!(decoded(&run_call(&[])).get("Env").is_none(), "a run with no pairs sends no Env key");
+        let commands = warm_commands();
+        let warm = WarmCall {
+            commands: &commands,
+            hash: WARM_HASH,
+        };
+        assert!(
+            decoded(&warm_word(&location(), &run, &warm)).get("Env").is_none(),
+            "a warm-up never sends Env"
+        );
+    }
+
+    #[test]
+    fn a_run_and_a_warm_up_send_the_chosen_godot_version_and_none_without_one() {
+        let words = ["Godot_console.exe".to_owned()];
+        let mut run = RunCall {
+            words: &words,
+            subfolder: "",
+            nonce: "0123456789abcdef0123456789abcdef",
+            snapshot: SHA,
+            outputs: &[],
+            full: false,
+            timeout: 1,
+            host: "builder",
+            sibling_snapshots: &[],
+            inputs_digest: None,
+            env: &[],
+            godot_version: Some("4.7.2"),
+        };
+        let commands = warm_commands();
+        let warm = WarmCall {
+            commands: &commands,
+            hash: WARM_HASH,
+        };
+
+        let word = run_word(&location(), &run);
+        assert_eq!(decoded(&word)["GodotVersion"], json!("4.7.2"));
+        assert_eq!(on_the_box(&word).godot_version(), Ok(Some("4.7.2")), "the box reads it back");
+        let warm_word_sent = warm_word(&location(), &run, &warm);
+        assert_eq!(decoded(&warm_word_sent)["GodotVersion"], json!("4.7.2"), "a warm-up sends it too");
+        assert!(on_the_box(&warm_word_sent).commands().is_ok(), "the box takes a warm-up with it");
+
+        run.godot_version = None;
+        let word = run_word(&location(), &run);
+        assert!(
+            decoded(&word).get("GodotVersion").is_none(),
+            "no version chosen sends no GodotVersion key"
+        );
+        assert_eq!(on_the_box(&word).godot_version(), Ok(None));
+        assert!(decoded(&warm_word(&location(), &run, &warm)).get("GodotVersion").is_none());
     }
 
     const WARM_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -525,6 +620,8 @@ mod tests {
             host: "builder",
             sibling_snapshots,
             inputs_digest,
+            env: &[],
+            godot_version: None,
         }
     }
 

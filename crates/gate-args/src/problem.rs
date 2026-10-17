@@ -6,6 +6,7 @@ use std::fmt;
 use crate::request::{DESKTOP_MODES, DESKTOP_SESSIONS};
 #[cfg(feature = "test-seams")]
 use crate::values::MAX_MUTEX_NAME;
+use crate::values::{EnvRefusal, escaped, shown_name};
 
 /// The largest value a timeout, stall window, tail or test-seam value may take.
 pub const MAX_WHOLE_NUMBER: u64 = 2_147_483_647;
@@ -133,6 +134,21 @@ pub enum Problem {
         option: &'static str,
         with: &'static str,
     },
+    /// A `--env` word the gate cannot set, `name` as given and `position` its 1-based place among the run's `--env`
+    /// words; the cap refusal's `name` is empty.
+    EnvRefused {
+        refusal: EnvRefusal,
+        name: String,
+        position: usize,
+    },
+    /// A `--env` word that is not valid Unicode, `position` its place among the run's `--env` words. The word is not
+    /// said: it may be a secret pasted without its name.
+    EnvWordNotUnicode(usize),
+    /// A `--env` word naming a variable to forward, `n` its 1-based position among the run's `--env` words, which the
+    /// gate's own environment does not set. The word is not said: it may be a secret pasted without its name.
+    EnvForwardNotSet(usize),
+    /// A `--env` word naming a variable to forward whose value is not Unicode, `n` its position among the run's words.
+    EnvForwardNotUnicode(usize),
 }
 
 impl fmt::Display for Problem {
@@ -194,6 +210,10 @@ impl fmt::Display for Problem {
             Problem::SeamsConflict { option, other } => write!(f, "gate: {option} cannot be given with {other}"),
             #[cfg(feature = "test-seams")]
             Problem::SeamNotUsedWith { option, with } => write!(f, "gate: {option} is not used with {with}"),
+            Problem::EnvRefused { refusal, name, position } => f.write_str(&refusal.usage_line(&escaped(&shown_name(name)), *position)),
+            Problem::EnvWordNotUnicode(n) => write!(f, "gate: --env word {n} is not valid Unicode"),
+            Problem::EnvForwardNotSet(n) => write!(f, "gate: --env word {n} names a variable to forward, and it is not set"),
+            Problem::EnvForwardNotUnicode(n) => write!(f, "gate: --env word {n} names a variable whose value is not Unicode"),
         }
     }
 }

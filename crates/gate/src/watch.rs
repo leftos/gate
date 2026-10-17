@@ -866,6 +866,7 @@ mod tests {
             no_markers: false,
             local: false,
             bring_tracked: Vec::new(),
+            env: Vec::new(),
             state_dir: None,
             cd: None,
             command: command.iter().map(OsString::from).collect(),

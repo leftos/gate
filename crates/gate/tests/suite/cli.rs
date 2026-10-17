@@ -87,6 +87,60 @@ fn run_reports_missing_inputs_then_usage_exit_2() {
 }
 
 #[test]
+fn an_env_name_given_twice_in_any_case_is_refused() {
+    let case = Case::new("an_env_name_given_twice_in_any_case_is_refused");
+    let env = ["--env", "ZZ_A_X=a", "--env", "zz_a_x=b"];
+    let mut run = vec!["run", "--slot", "heavy", "--timeout", "5", "--log", "out.log"];
+    run.extend(env);
+    let mut printed = run.clone();
+    printed.push("--test-print-request");
+    for words in [run, printed] {
+        let mut words = words;
+        words.extend(["--", FAKE_TOOL, "exit", "0"]);
+
+        let outcome = case.run(&words);
+
+        assert_eq!(outcome.code, Some(2), "{outcome:?}");
+        assert_eq!(outcome.stdout, "", "{outcome:?}");
+        assert!(
+            outcome.stderr.starts_with("gate: --env names zz_a_x twice\nusage: gate run"),
+            "the later spelling: {outcome:?}"
+        );
+        assert!(outcome.stderr.ends_with(USAGE), "the usage comes last");
+        assert_eq!(case.folder_entries(), Vec::<String>::new(), "a refused run writes nothing");
+    }
+}
+
+#[test]
+fn an_env_name_outside_ascii_is_refused() {
+    let case = Case::new("an_env_name_outside_ascii_is_refused");
+    let mut words = vec![
+        "run",
+        "--slot",
+        "heavy",
+        "--timeout",
+        "5",
+        "--log",
+        "out.log",
+        "--env",
+        "ZZ_\u{c4}_X=a",
+        "--",
+    ];
+    words.extend([FAKE_TOOL, "exit", "0"]);
+
+    let outcome = case.run(&words);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert!(
+        outcome.stderr.starts_with("gate: --env word 1 has a malformed name\nusage: gate run"),
+        "{outcome:?}"
+    );
+    assert!(outcome.stderr.ends_with(USAGE), "the usage comes last");
+    assert_eq!(case.folder_entries(), Vec::<String>::new(), "a refused run writes nothing");
+}
+
+#[test]
 fn valid_run_runs_its_command_and_exits_with_its_status() {
     let case = Case::new("valid_run_runs_its_command");
     let outcome = case.run(&[

@@ -235,6 +235,8 @@ pub struct TestSeams {
     pub interrupt_after_samples: Option<u64>,
     /// Raise the console interrupt once the gate has said it is waiting for a slot.
     pub interrupt_queued: bool,
+    /// Raise the console interrupt just before a routed run's zero-wait take of its work folder's key.
+    pub interrupt_before_key: bool,
     /// Raise the console interrupt once the gate has said it is waiting for a slot here, after the remote pool sent the
     /// run back with reason `full`, so the wait counts from the run's own queue line.
     pub interrupt_after_fallback: bool,
@@ -246,13 +248,17 @@ pub struct TestSeams {
     pub remote_client: Option<PathBuf>,
     /// How long a routed run waits for a remote slot before it falls back with reason `full`.
     pub remote_wait_ms: Option<u64>,
+    /// How long a routed run waits for its work folder's key, held by another run of the same worktree, before it falls
+    /// back with reason `busy`.
+    pub key_wait_ms: Option<u64>,
     /// How long each git call of the routing decision may take before git is killed and the run goes ahead here.
     pub git_limit_ms: Option<u64>,
     /// How long the readers of a routing-decision git call that has exited may take to reach their pipes' ends before
     /// the call fails, in place of 2 s.
     pub git_drain_ms: Option<u64>,
-    /// The file a local light gate waits for, holding the beside mutex, between journalling its take and writing its
-    /// claim: it writes the claim once the file exists.
+    /// The file a local light gate waits for, holding the beside mutex, between taking its slot and writing its claim,
+    /// its arrival written to `<file>.reached` before the wait: it writes the claim, then journals its take, once the file
+    /// exists.
     pub beside_claim_wait: Option<PathBuf>,
     /// How long the remote client's `dotnet --list-sdks` of this PC may take before it is killed and the SDK list
     /// counts as unreadable, in place of 30 s.
@@ -352,6 +358,9 @@ pub struct RunRequest {
     pub local: bool,
     /// The `--bring-tracked` globs, in the order given: a fetched output git tracks is installed only when one matches it.
     pub bring_tracked: Vec<String>,
+    /// The `--env` pairs, name and value, in the order given: set for the command over the environment it starts in and
+    /// under the gate's own settings, on the PC and on a builder alike.
+    pub env: Vec<(String, String)>,
     /// `--state-dir` as given.
     pub state_dir: Option<PathBuf>,
     /// `--cd` as given: the folder the run runs and routes from; a relative path is read against the working directory

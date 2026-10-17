@@ -1,11 +1,12 @@
 //! The PowerShell form through the binary. The compatibility layer has no `--state-dir`, so these cases give the root
 //! through `GATE_STATE_DIR`.
 
+use std::fs;
 use std::process::Command;
 
 use serde_json::Value;
 
-use crate::support::{Case, USAGE, finish, print_run};
+use crate::support::{Case, FAKE_TOOL, USAGE, finish, print_run};
 
 /// The PowerShell form of a run that prints its request, with `extra` before `--`.
 fn compat_run(extra: &[&'static str]) -> Vec<&'static str> {
@@ -65,6 +66,69 @@ fn compat_refuses_slot_auto_exit_2() {
     assert_eq!(
         outcome.stderr,
         format!("gate: -Slot must be heavy, light, critical or none, got 'auto'\n{USAGE}")
+    );
+}
+
+#[test]
+fn compat_env_pair_reaches_the_command() {
+    let case = Case::new("compat_env_pair_reaches_the_command");
+    let words = [
+        "-Log",
+        "out.log",
+        "-TimeoutSeconds",
+        "5",
+        "-Slot",
+        "heavy",
+        "-Env",
+        "ZZ_COMPAT_ENV=from -Env",
+        "--",
+        FAKE_TOOL,
+        "env",
+        "ZZ_COMPAT_ENV",
+    ];
+
+    let outcome = finish(with_env_root(&case, &words));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(log.contains("from -Env"), "the command sees the pair: {log}");
+}
+
+#[test]
+fn compat_env_name_forwards_the_caller_s_value() {
+    let case = Case::new("compat_env_name_forwards_the_caller_s_value");
+    let words = [
+        "-Log",
+        "out.log",
+        "-TimeoutSeconds",
+        "5",
+        "-Slot",
+        "heavy",
+        "-Env",
+        "ZZ_COMPAT_FORWARDED",
+        "--",
+        FAKE_TOOL,
+        "env",
+        "ZZ_COMPAT_FORWARDED",
+    ];
+    let mut command = with_env_root(&case, &words);
+    command.env("ZZ_COMPAT_FORWARDED", "from the caller's environment");
+
+    let outcome = finish(command);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(
+        log.lines().any(|line| line == "from the caller's environment"),
+        "the command sees the forwarded value: {log}"
+    );
+    assert!(
+        !outcome
+            .stdout
+            .lines()
+            .chain(outcome.stderr.lines())
+            .any(|line| line.starts_with("gate: ") && line.contains("from the caller's environment")),
+        "no line of the gate's says the value: {outcome:?}"
     );
 }
 

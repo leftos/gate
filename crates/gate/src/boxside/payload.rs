@@ -4,12 +4,13 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use gate_args::MAX_WHOLE_NUMBER;
+use gate_args::{MAX_WHOLE_NUMBER, shown_name};
 use gate_router::warm::MOST_COMMANDS;
 pub(crate) use gate_router::{escaped, is_reordering_mark};
 use gate_router::{is_layout_name, repo_name};
 use serde_json::{Map, Value};
 
+use crate::boxside::probe::MAX_PART_DIGITS;
 use crate::outputs::archive::SUFFIX;
 use crate::outputs::hash::{SHA256_DIGITS, is_lower_hex};
 use crate::remote::siblings::MOST_SIBLINGS;
@@ -86,10 +87,10 @@ impl Payload {
             .collect()
     }
 
-    /// How many entries the object at `key` holds and how many bytes its names and values take together, read before
-    /// [`Payload::pairs`] builds or checks any of them, so a request holding more entries than the box takes is refused
-    /// without one of them being built; `None` when the key is absent or null. Else the usage line saying it is not an
-    /// object of texts.
+    /// How many entries the object at `key` holds and how many bytes its names and values take together, counted over
+    /// the object `serde_json` parsed (`serde_json` has already built it, and the 16 MiB request line limit bounds it)
+    /// so [`Payload::pairs`] need not copy an object over the box's cap; `None` when the key is absent or null. Else the
+    /// usage line saying it is not an object of texts.
     pub(crate) fn pair_size(&self, key: &str) -> Result<Option<(usize, usize)>, String> {
         let Some(object) = self.object_at(key)? else {
             return Ok(None);
@@ -192,6 +193,20 @@ impl Payload {
             Some(other) => Err(format!(
                 "gate: box payload InputsDigest is not 64 lower-case hex digits: {}",
                 escaped(&other.as_str().map_or_else(|| other.to_string(), str::to_owned))
+            )),
+        }
+    }
+
+    /// The version of the builder's Godot install the run uses, `GodotVersion`: a canonical `major.minor.patch`
+    /// ([`is_canonical_version`]), as it is joined into an install's path; `None` when the key is absent or null. Else
+    /// the usage line, the value shortened and shown with its control characters escaped.
+    pub(crate) fn godot_version(&self) -> Result<Option<&str>, String> {
+        match self.0.get("GodotVersion") {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(version)) if is_canonical_version(version) => Ok(Some(version)),
+            Some(other) => Err(format!(
+                "gate: box payload GodotVersion is not a version: '{}'",
+                escaped(&shown_name(&other.as_str().map_or_else(|| other.to_string(), str::to_owned)))
             )),
         }
     }
@@ -662,6 +677,17 @@ pub(crate) fn ordinal_upper(text: &str) -> String {
         .collect()
 }
 
+/// Whether `text` is a version in the one spelling a Godot install's folder has: three dot-separated parts, each of one
+/// to [`MAX_PART_DIGITS`] ASCII digits with no leading zero unless the part is `0`, as the godot probe spells the
+/// version an install reports.
+pub(crate) fn is_canonical_version(text: &str) -> bool {
+    let parts: Vec<&str> = text.split('.').collect();
+    let canonical = |part: &&str| {
+        (1..=MAX_PART_DIGITS).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_digit()) && (*part == "0" || !part.starts_with('0'))
+    };
+    parts.len() == 3 && parts.iter().all(canonical)
+}
+
 pub(crate) fn is_drive_path(value: &str) -> bool {
     let rooted = matches!(value.as_bytes(), [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic());
     rooted && !value.chars().any(|character| character < ' ')
@@ -690,6 +716,27 @@ mod tests {
 
     fn text(json: &str, key: &str) -> Result<String, String> {
         decoded(json).and_then(|payload| payload.text(key).map(str::to_owned))
+    }
+
+    /// What the `GodotVersion` reader makes of the payload whose `GodotVersion` is `version`.
+    fn godot_version_of(version: &str) -> Result<Option<String>, String> {
+        decoded(&json!({ "GodotVersion": version }).to_string()).and_then(|payload| payload.godot_version().map(|read| read.map(str::to_owned)))
+    }
+
+    /// `GodotVersion` is three parts of at most ten digits each, none with a leading zero but a part that is `0`, the
+    /// one spelling an install's folder is named.
+    #[test]
+    fn a_godot_version_is_three_canonical_parts_of_at_most_ten_digits() {
+        for version in ["4.7.2", "0.0.0", "4.0.10", "9999999999.0.1"] {
+            assert_eq!(godot_version_of(version), Ok(Some(version.to_owned())), "{version}");
+        }
+        for version in ["04.7.2", "4.07.2", "4.7.00", "4.7.02", "99999999999.0.1", "4.7.12345678901"] {
+            assert_eq!(
+                godot_version_of(version),
+                Err(format!("gate: box payload GodotVersion is not a version: '{version}'")),
+                "{version}"
+            );
+        }
     }
 
     const NOT_BASE64_JSON: &str = "gate: box payload is not base64 JSON: ";

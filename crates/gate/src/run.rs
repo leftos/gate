@@ -34,7 +34,7 @@ use crate::answer::USAGE_STATUS;
 use crate::console::Console;
 use crate::covered::Covered;
 use crate::durations::{
-    Resolved, RunDurations, RunIdentity, Usual, ceiling_hint, expected_field, expected_line, raised_ceiling_line, resolve_ceiling,
+    Resolved, RunDurations, RunIdentity, Usual, ceiling_hint, expected_field, expected_line, raised_ceiling_line, resolve_ceiling, span_text,
 };
 use crate::environment::{self, Variables};
 use crate::escaped::{self, Found, Reach, Reached, Recorded};
@@ -45,7 +45,7 @@ use crate::machine::{self, Machine, MachineWait, MachineWaited};
 use crate::nesting::{Nesting, Parent, enclosing_of};
 use crate::no_build::{self, NothingBack, Unfound, Worktree};
 use crate::outputs::{stale, walk::walk};
-use crate::remote::{self, RemoteCall, RemoteClient, RemoteOutcome, Split, git};
+use crate::remote::{self, KEY_WAIT_SLICE, KeyWait, RemoteCall, RemoteClient, RemoteOutcome, Split, git};
 use crate::resolve::{Environment, ResolvedRoot};
 use crate::route::{self, Placed};
 use crate::slots::{self, ClaimOf, LendMarker, Pool, Survey, Taken, Takes, ThisGate, epoch_ms};
@@ -75,6 +75,9 @@ const CONSOLE_HOST_IMAGE: &str = "conhost.exe";
 const END_PASSES: usize = 5;
 /// The wall time under which a passed run is too short to judge its slot by, so it gets no cores line.
 const HINT_MIN_WALL: Duration = Duration::from_secs(10);
+/// How long a routed run waits for its worktree's work folder while another of its runs holds it, before it falls back
+/// here as `busy` ([`Run::take_key`]).
+const KEY_WAIT: Duration = Duration::from_secs(90);
 
 /// Runs `request`'s command, logging to `log` (absolute) under `root`, routing a heavy one by `environment`'s routing
 /// file and git hook, saying each line as it goes; returns the gate's exit status.
@@ -375,7 +378,7 @@ impl Plan {
             Some(parent) => parent.marker.clone(),
             None => environment::slot_marker(request.slot.as_str(), gate, &root.root),
         };
-        let variables = Variables::for_command(root, gate, &marker);
+        let variables = Variables::for_command(root, gate, &marker, &request.env);
         let environment = variables
             .block()
             .map_err(|error| NotRun::failed(format!("gate: cannot build the command's environment: {error}")))?;
@@ -536,9 +539,10 @@ pub(crate) struct Taker<'t> {
 }
 
 impl Taker<'_> {
-    /// Journals the take of `taken`, a slot of `pool` the run waited `waited` seconds for, says and names it when a
-    /// killed gate had left it held, writes its claim, lets go of the beside mutex a light gate behind a critical
-    /// request took the slot under, and wakes the waiters. The gate's ticket is already deleted.
+    /// Writes the claim of `taken`, a slot of `pool` the run waited `waited` seconds for, then journals its take, so a
+    /// reader that sees the take finds its claim, unless the claim could not be written. It says and names the slot when
+    /// a killed gate had left it held, lets go of the beside mutex a light gate behind a critical request took the slot
+    /// under, and wakes the waiters. The gate's ticket is already deleted.
     pub(crate) fn took(&mut self, taken: &mut Taken, pool: Pool, waited: f64, survey: &mut Survey, console: &mut Console) {
         let name = taken.held.name().to_owned();
         let mut abandoned = Vec::new();
@@ -546,8 +550,6 @@ impl Taker<'_> {
             acquire::say_taken_abandoned(console, &name);
             abandoned.push(name.clone());
         }
-        self.journal
-            .write(&take_event(vec![name], waited, abandoned, self.parent_pid), self.tag, console);
         let of = ClaimOf {
             gate: self.gate,
             ceiling: self.ceiling,
@@ -558,11 +560,20 @@ impl Taker<'_> {
         if taken.beside.is_some()
             && let Some(go) = &self.request.test_seams.beside_claim_wait
         {
+            // The arrival file says the gate reached the seam, so a case can check what is not written yet.
+            let mut reached = go.as_os_str().to_owned();
+            reached.push(".reached");
+            let reached = PathBuf::from(reached);
+            if let Err(error) = fs::write(&reached, "") {
+                console.err(&format!("gate: cannot write the seam's arrival {}: {error}", reached.display()));
+            }
             while !go.exists() {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
         slots::write_claim(&taken.held, pool.claim_kind(), &of, console);
+        self.journal
+            .write(&take_event(vec![name], waited, abandoned, self.parent_pid), self.tag, console);
         taken.beside = None;
         slots::wake_waiters(self.root, survey, console);
     }
@@ -681,6 +692,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         tail: request.tail,
         no_markers: request.no_markers,
         bring_tracked: &request.bring_tracked,
+        env: &request.env,
         interrupt: host.interrupt,
         state: &root.root,
         state_dir: &root.path,
@@ -1028,11 +1040,12 @@ impl Run<'_> {
     }
 
     /// Runs the routed command on the builder: takes the client's work-folder key lock and a remote slot into `hold`,
-    /// calls the client and ends the run as the client ended it, the lock held until then. A key lock held elsewhere, a
-    /// full remote pool, a refusal or a client that cannot start falls back here; with a client not ready, the run
-    /// falls back before it takes a remote slot. A Ctrl+C ends the run here, with the remote slot released: one raised
-    /// before the call, or during it over a refusal. A client that ended on its own keeps its own status, and the run
-    /// writes or clears the worktree's nothing-back record ([`Run::leave_nothing_back`]).
+    /// calls the client and ends the run as the client ended it, the lock held until then. A key lock another run of the
+    /// worktree holds is waited for up to its bound; a full remote pool, a refusal or a client that cannot start falls
+    /// back here; with a client not ready, the run falls back before it takes a remote slot. A Ctrl+C ends the run here,
+    /// with the remote slot released: one raised before the call, or during it over a refusal. A client that ended on its
+    /// own keeps its own status, and the run writes or clears the worktree's nothing-back record
+    /// ([`Run::leave_nothing_back`]).
     fn routed(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> Remotely {
         if let Err(why) = self.client.ready() {
             return self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), None, console);
@@ -1153,27 +1166,15 @@ impl Run<'_> {
         }
     }
 
-    /// Takes the work-folder key lock the run's client takes, without waiting, then a remote slot into `hold`: the
-    /// lock, held until the remote attempt ends, with the figures of the remote take. Else how the run goes on: here,
-    /// `busy`, when the lock is held elsewhere or cannot be opened or taken, which says why; here, `full`, when the pool
-    /// stayed full; or interrupted during the wait.
+    /// Takes the work-folder key lock the run's client takes, waiting up to the run's key-wait bound for another run of
+    /// the worktree to let it go, then a remote slot into `hold`: the lock, held until the remote attempt ends, with the
+    /// figures of the remote take. Else how the run goes on: here, `busy`, when the lock is held elsewhere past the
+    /// bound, or by a warm-up of the work folder, or cannot be opened or taken, which says why; here, `full`, when the
+    /// pool stayed full; or interrupted during the wait, which journals the abandon.
     fn hold_remote(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> Result<(Option<OwnedMutexGuard>, Figures), Remotely> {
         // The key lock reads neither figure of the call; no take has resolved them yet. A sibling that fails its check
         // again sends nothing: the run falls back here before it takes the lock or a slot.
-        let call = match self.call(remote, Figures::floor(self.request.timeout)) {
-            Ok(call) => call,
-            Err(why) => return Err(self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), None, console)),
-        };
-        let held = self.client.hold_key(&call);
-        let key = match held {
-            Ok(key) => key,
-            Err(why) => {
-                if let Some(line) = why {
-                    console.err(&line);
-                }
-                return Err(self.fell_back(FallbackReason::Busy, &RemoteOutcome::default(), None, console));
-            }
-        };
+        let key = self.take_key(remote, console)?;
         let figures = match self.take(Pool::Remote(remote.slots), None, &mut hold.taken, console) {
             Taking::Took(took, figures) => {
                 hold.took = took;
@@ -1186,21 +1187,115 @@ impl Run<'_> {
         Ok((key, figures))
     }
 
-    /// The client's call for `remote` under `figures`, with the run's log, limits and interrupt.
-    ///
-    /// # Errors
-    ///
-    /// Why a sibling the route carries fails its check again ([`remote::carried`]).
-    fn call<'r>(&'r self, remote: &'r RemoteRun, figures: Figures) -> Result<RemoteCall<'r>, String> {
+    /// Takes the lock of the call's work-folder key: at once when no other run of the worktree holds it, and else after
+    /// waiting up to the run's key-wait bound for the holder to let it go, saying the wait in a line with the holder's
+    /// time left when its remote claim carries a usual run time, and a still-waiting line each heartbeat. When a warm-up
+    /// of the work folder holds the key, the run falls back at once, as it did before the wait. Else how the run goes on:
+    /// here, `busy`, when the lock is held past the bound or cannot be opened or taken, which says why; or interrupted
+    /// during the wait, which says so and journals the abandon.
+    fn take_key(&mut self, remote: &RemoteRun, console: &mut Console) -> Result<Option<OwnedMutexGuard>, Remotely> {
+        // The key lock reads neither figure of the call; no take has resolved them yet. A sibling that fails its check
+        // again sends nothing: the run falls back here before it takes the lock or a slot.
         let parts = CallParts {
             request: self.request,
-            figures,
+            figures: Figures::floor(self.request.timeout),
             log: &self.log,
             host: &self.host,
             root: self.root,
             warmth: warmth_of(self.warm_hash.as_deref()),
         };
-        call_of(parts, remote)
+        let call = match call_of(parts, remote) {
+            Ok(call) => call,
+            Err(why) => return Err(self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), None, console)),
+        };
+        let busy = |run: &mut Run<'_>, console: &mut Console| run.fell_back(FallbackReason::Busy, &RemoteOutcome::default(), None, console);
+        // The seam raises the console interrupt before the take, so the zero wait meets it as the lock's busy.
+        if self.request.test_seams.interrupt_before_key
+            && let Some(interrupt) = self.host.interrupt
+        {
+            interrupt.raise();
+        }
+        match self.client.hold_key(&call) {
+            Ok(held) => return Ok(held),
+            // Another run of the worktree holds the key, or the lock could not be taken without a line; the zero wait
+            // never reads the interrupt, which the check after it sees.
+            Err(None) => {}
+            Err(Some(line)) => {
+                console.err(&line);
+                return Err(busy(self, console));
+            }
+        }
+        // A Ctrl+C raised before the take reads as the lock's busy; it ends the run as an interrupted wait does.
+        if self.host.interrupt.is_some_and(Interrupt::is_raised) {
+            return Err(self.interrupted_key_wait(remote, Duration::ZERO, console));
+        }
+        let mut probe_said = false;
+        if warm_up_holds(&self.root.path, &remote.key, console, &mut probe_said) {
+            return Err(busy(self, console));
+        }
+        let bound = self.request.test_seams.key_wait_ms.map_or(KEY_WAIT, Duration::from_millis);
+        let heartbeat = self.request.test_seams.heartbeat_ms.map_or(wait::HEARTBEAT, Duration::from_millis);
+        let mut next = heartbeat;
+        let left = holder_time_left(&mut self.survey, &self.root.path, call.key, console);
+        console.err(&key_wait_line(&remote.host, left));
+        // The seam raises the console interrupt once the gate has said it waits, the key wait's line among them.
+        if self.request.test_seams.interrupt_queued
+            && let Some(interrupt) = self.host.interrupt
+        {
+            interrupt.raise();
+        }
+        let begun = Instant::now();
+        loop {
+            match self.client.hold_key_waiting(&call, KEY_WAIT_SLICE) {
+                Ok(KeyWait::Held(held)) => return Ok(held),
+                Ok(KeyWait::Interrupted) => return Err(self.interrupted_key_wait(remote, begun.elapsed(), console)),
+                Ok(KeyWait::Busy) => {}
+                Err(line) => {
+                    console.err(&line);
+                    return Err(busy(self, console));
+                }
+            }
+            // Each slice's wait is the slice itself, whose `Busy` comes before the client reads the interrupt.
+            if self.host.interrupt.is_some_and(Interrupt::is_raised) {
+                return Err(self.interrupted_key_wait(remote, begun.elapsed(), console));
+            }
+            let waited = begun.elapsed();
+            if waited >= bound {
+                return Err(busy(self, console));
+            }
+            if waited >= next {
+                // A warm-up that took the key during the wait is not waited for either.
+                if warm_up_holds(&self.root.path, &remote.key, console, &mut probe_said) {
+                    return Err(busy(self, console));
+                }
+                console.err(&format!(
+                    "gate: still waiting for this worktree's work folder on {} ({} s)",
+                    remote.host,
+                    waited.as_secs()
+                ));
+                while next <= waited {
+                    next += heartbeat;
+                }
+            }
+        }
+    }
+
+    /// Ends a run whose wait for its work folder's key was interrupted after `waited`: says so with the builder, journals
+    /// the abandon with how long it waited and the run's remote tag, and ends the run as an interrupted wait does, with
+    /// no ticket and no claim to delete.
+    fn interrupted_key_wait(&mut self, remote: &RemoteRun, waited: Duration, console: &mut Console) -> Remotely {
+        console.err(&format!(
+            "gate: interrupted while waiting for this worktree's work folder on {}",
+            remote.host
+        ));
+        self.journal.write(
+            &JournalEvent::Abandon {
+                waited_seconds: waited.as_secs_f64(),
+            },
+            self.tag.as_ref(),
+            console,
+        );
+        Remotely::Interrupted
     }
 
     /// Gives up the remote attempt for `reason`: journals the fallback, the run's last line with the remote tag, while
@@ -1517,8 +1612,8 @@ impl Run<'_> {
         (taker, &mut self.late, &mut self.covered)
     }
 
-    /// Waits its turn for a slot of `pool` and takes it into `held` the moment it has it, then journals the take, with
-    /// the remote tag while the run has one, and writes the claim. `since` is the moment the wait counts from, the run's
+    /// Waits its turn for a slot of `pool` and takes it into `held` the moment it has it, then writes the claim and
+    /// journals the take, with the remote tag while the run has one. `since` is the moment the wait counts from, the run's
     /// own `queue` line for a run the full remote pool sent back and `None` for every other wait, which counts from now;
     /// the wait, its still-waiting lines and its journal all count from that one instant.
     /// When the slot was taken; else a Ctrl+C ended the wait, which deletes the ticket at once, wakes the waiters and
@@ -1610,9 +1705,10 @@ impl Run<'_> {
     }
 
     /// Waits for the machine as a critical gate and takes it into `held` once it holds every heavy slot and its light
-    /// slot, then journals the take with what it found, says the holds line, writes the critical claim and wakes the
-    /// waiters. When the machine was taken; else a Ctrl+C ended the wait, which says so, journals the abandon, then
-    /// releases what it took so far, deletes the ticket and wakes the waiters.
+    /// slot, then says the holds line, writes the critical claim, journals the take with what it found and wakes the
+    /// waiters, so a reader that sees the take finds its claim, unless the claim could not be written. When the machine
+    /// was taken; else a Ctrl+C ended the wait, which says so, journals the abandon, then releases what it took so far,
+    /// deletes the ticket and wakes the waiters.
     fn take_machine(&mut self, held: &mut Option<Machine>, console: &mut Console) -> Taking {
         let queued = Instant::now();
         let estimate = self.estimate(console);
@@ -1649,7 +1745,6 @@ impl Run<'_> {
             // slot is named here.
             parent_pid: self.nesting.uncovering().map(|parent| parent.pid),
         };
-        self.journal.write(&take, None, console);
         console.err(&line);
         let took = Instant::now();
         let (figures, resolved) = Figures::resolved(self.request.timeout, estimate.as_ref());
@@ -1661,6 +1756,7 @@ impl Run<'_> {
             expected: expected.as_ref(),
         };
         machine.write_claim(&of, console);
+        self.journal.write(&take, None, console);
         slots::wake_waiters(self.root, &mut self.survey, console);
         say_expected(estimate.as_ref(), resolved, console);
         Taking::Took(took, figures)
@@ -2648,6 +2744,61 @@ fn cores_line(cores: Cores, misfit: Hint) -> String {
     }
 }
 
+/// The line a routed run says as it starts waiting for its worktree's work folder on `host`, which another of its runs
+/// holds, with `left`, the holder's time left by its remote claim, when that claim carries a usual run time.
+fn key_wait_line(host: &str, left: Option<String>) -> String {
+    let line = format!("gate: waiting for this worktree's work folder on {host}, which another of its runs holds");
+    match left {
+        Some(left) => format!("{line} (about {left} left)"),
+        None => line,
+    }
+}
+
+/// How long the holder of the work folder of `key` under `state` has left by its remote claim, by the gate's figure
+/// rule, for the key wait's first line: `None` when no live claim names `key`, when its claim carries no usual run time,
+/// or once that time is at or past.
+fn holder_time_left(survey: &mut Survey, state: &Path, key: &str, console: &mut Console) -> Option<String> {
+    let claims = survey.live_claims(state, console).ok()?;
+    key_wait_left(holder_claim(&claims, key)?, Timestamp::now())
+}
+
+/// The live claim of the work folder of `key` among `claims` with the latest `started`, when one names it: a holder
+/// that let the key go keeps its claim until its run ends, so the latest one is the run that holds it now.
+fn holder_claim<'c>(claims: &'c [v1::Claim], key: &str) -> Option<&'c v1::Claim> {
+    claims
+        .iter()
+        .filter(|claim| claim.key.as_deref() == Some(key))
+        .max_by_key(|claim| claim.started)
+}
+
+/// What the key wait's first line says of `claim` at `now`: the holder's time left by its usual run time, by the gate's
+/// figure rule ([`span_text`]), or `None` when the claim carries no usual run time or that time is at or past.
+fn key_wait_left(claim: &v1::Claim, now: Timestamp) -> Option<String> {
+    let left = wait::usual(claim, now)?.left;
+    (left > 0.0).then(|| span_text(left))
+}
+
+/// Whether a warm-up of the work folder of `key` under `state` holds the key's lock, by the warm-up lock beside it: a
+/// run whose holder is a warm-up falls back at once rather than wait for a warm-up to end. A lock that cannot be
+/// probed reads as no warm-up, said once through `said`, and the wait goes on.
+fn warm_up_holds(state: &Path, key: &str, console: &mut Console, said: &mut bool) -> bool {
+    let path = v1::warm_lock_path(state, key);
+    match warm::lock_held(&path) {
+        Ok(held) => held,
+        Err(error) => {
+            if !*said {
+                *said = true;
+                console.err(&format!(
+                    "gate: cannot probe the warm-up lock {}: {}",
+                    gate_router::escaped(&path.to_string_lossy()),
+                    gate_router::escaped(&error.to_string())
+                ));
+            }
+            false
+        }
+    }
+}
+
 /// The line a routed run says as it falls back here for `reason` from the builder `host`; a client that could not
 /// start says why, `detail`.
 fn fallback_line(host: &str, reason: FallbackReason, detail: Option<&str>) -> String {
@@ -2763,14 +2914,85 @@ mod tests {
     use gate_watchdog::{Cores, Hint};
 
     use super::{
-        Ends, Judged, Pass, Stopper, Timing, brought_everything_back, cores_hint_for, cores_line, earlier, interrupted, kill, log_in_state_root,
-        passed_line, records_after, stop, takes_own_slot,
+        Ends, Judged, Pass, Stopper, Timing, brought_everything_back, cores_hint_for, cores_line, earlier, holder_claim, interrupted, key_wait_left,
+        key_wait_line, kill, log_in_state_root, passed_line, records_after, stop, takes_own_slot,
     };
     use crate::console::Console;
     use crate::escaped::{Found, Look, Reached, Recorded};
     use crate::nesting::{Nesting, Parent};
     use crate::remote::{RemoteOutcome, Split};
     use crate::watch::Watched;
+    use gate_state::v1::{Claim, ClaimKind};
+    use jiff::Timestamp;
+    use serde_json::{Map, Value};
+
+    /// A remote claim of the work folder of `key`, started at `started`, whose usual run time is `p50` when one.
+    fn claim_of(key: &str, started: Timestamp, p50: Option<f64>) -> Claim {
+        let expected: Option<Map<String, Value>> = p50.map(|p50| [("p50".to_owned(), Value::from(p50))].into_iter().collect());
+        Claim {
+            kind: ClaimKind::Remote,
+            index: 0,
+            pid: 1,
+            process_start: started,
+            started,
+            cwd: String::new(),
+            command: String::new(),
+            log: String::new(),
+            timeout_seconds: 900.0,
+            remote: Some(true),
+            host: Some("builder".to_owned()),
+            key: Some(key.to_owned()),
+            expected,
+        }
+    }
+
+    #[test]
+    fn the_key_wait_names_the_latest_claim_of_the_work_folder() {
+        let base = Timestamp::from_second(1_792_000_000).expect("a timestamp");
+        let later = Timestamp::from_second(base.as_second() + 5).expect("a timestamp");
+        let claims = [
+            claim_of("k", base, Some(600.0)),
+            claim_of("k", later, Some(600.0)),
+            claim_of("other", base, Some(600.0)),
+        ];
+
+        let found = holder_claim(&claims, "k").expect("a claim names the key");
+
+        assert_eq!(found.started, later, "the latest claim of the key, not the first the folder lists");
+        assert!(holder_claim(&claims, "none").is_none(), "no claim names the key");
+    }
+
+    #[test]
+    fn the_key_wait_time_left_is_the_holders_usual_time_by_the_figure_rule() {
+        let base = Timestamp::from_second(1_792_000_000).expect("a timestamp");
+        let at = |seconds: i64| Timestamp::from_second(base.as_second() + seconds).expect("a timestamp");
+        let claim = |p50: Option<f64>| claim_of("k", base, p50);
+
+        assert!(key_wait_left(&claim(None), at(0)).is_none(), "a claim with no usual run time names none");
+        assert!(
+            key_wait_left(&claim(Some(10.0)), at(20)).is_none(),
+            "at or past the usual, the line leaves the time left out"
+        );
+        assert_eq!(
+            key_wait_left(&claim(Some(10.4)), at(10)),
+            Some("1 s".to_owned()),
+            "0.4 s left is never 0 s"
+        );
+        assert_eq!(
+            key_wait_left(&claim(Some(100.5)), at(11)),
+            Some("2 min".to_owned()),
+            "89.5 s left is whole minutes"
+        );
+        assert_eq!(key_wait_left(&claim(Some(610.0)), at(10)), Some("10 min".to_owned()), "600 s left");
+    }
+
+    #[test]
+    fn the_key_wait_line_says_the_time_left_only_when_there_is_one() {
+        let line = "gate: waiting for this worktree's work folder on builder, which another of its runs holds";
+
+        assert_eq!(key_wait_line("builder", None), line);
+        assert_eq!(key_wait_line("builder", Some("10 min".to_owned())), format!("{line} (about 10 min left)"));
+    }
 
     #[test]
     fn only_a_passing_routed_run_that_brought_its_outputs_back_clears_the_record() {

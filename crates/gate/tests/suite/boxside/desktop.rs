@@ -10,8 +10,8 @@ use proc_table::{ProcessTable, Win32ProcessTable};
 use serde_json::{Value, json};
 
 use super::{
-    BoxCall, box_call, field, gate_box, let_go, lines_starting, pair_payload, pair_snapshot, payload as request_line, refused_line, run_box,
-    run_box_with_seams, snapshot, started_line, stopped_line_for,
+    BoxCall, box_call, fake_godot, field, gate_box, godot_root, let_go, lines_starting, pair_payload, pair_snapshot, path_for_run, path_godot,
+    payload as request_line, refused_line, run_box, run_box_with_seams, snapshot, started_line, stopped_line_for,
 };
 use crate::support::{
     Case, FAKE_TOOL, HeldDesktop, KeptDesktop, Outcome, box_payload, copy_tool, desktop_payload, desktop_seams, junction, shown, wait_until,
@@ -299,6 +299,34 @@ fn a_desktop_command_gets_the_boxs_environment_and_working_folder() {
         cwd.eq_ignore_ascii_case(field(&payload, "Work")),
         "the command runs in the work folder: {outcome:?}"
     );
+}
+
+/// A desktop run with a `GodotVersion` resolves a Godot console word as any run does: to the root's install of that
+/// version, never the `PATH`'s, with `GODOT_PATH` naming that install.
+#[test]
+fn a_desktop_run_runs_the_godot_install_of_the_chosen_version() {
+    let case = Case::new("desktop_godot_chosen");
+    let root = godot_root(&case);
+    fake_godot(&root.join("4.3.0"), "4.3.stable.mono.official.y\n");
+    fake_godot(&root.join("4.7.2"), "4.7.2.stable.mono.official.x\n");
+    let mut payload = ready_payload(&case, &["godot_CONSOLE.exe", "--version", "env", "GODOT_PATH"]);
+    payload["GodotVersion"] = json!("4.7.2");
+    let mut command = desktop_call(&case, &payload, "ok", &[]);
+    command.env("GATE_GODOT_ROOT", &root);
+    command.env("PATH", path_for_run(&[path_godot(&case)]));
+    command.env_remove("GODOT_PATH");
+
+    let outcome = command.finish();
+
+    let install = root.join("4.7.2").join("Godot_console.exe");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout,
+        format!("4.7.2.stable.mono.official.x\n{}\n", install.display()),
+        "{outcome:?}"
+    );
+    ran_its_command(&outcome, &payload);
+    assert!(!root.join("4.3.0").join("ran").exists(), "the other install ran");
 }
 
 #[test]

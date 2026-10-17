@@ -17,10 +17,11 @@ pub(crate) struct Variables(Vec<(OsString, OsString)>);
 type Override = (OsString, Option<OsString>);
 
 impl Variables {
-    /// The gate's environment with the overrides of `gate`, holding the slot `marker` ([`slot_marker`]) under `root`.
-    pub(crate) fn for_command(root: &ResolvedRoot, gate: &ThisGate, marker: &str) -> Variables {
+    /// The gate's environment with the caller's `--env` pairs `caller` set over it, then the overrides of `gate`,
+    /// holding the slot `marker` ([`slot_marker`]) under `root`, so no pair can undo one ([`composed`]).
+    pub(crate) fn for_command(root: &ResolvedRoot, gate: &ThisGate, marker: &str, caller: &[(String, String)]) -> Variables {
         let run = run_id(gate, &root.root);
-        Variables(applied(std::env::vars_os().collect(), overrides(root, &run, marker)))
+        Variables(composed(std::env::vars_os().collect(), caller, overrides(root, &run, marker)))
     }
 
     /// The gate's own environment, unchanged: what a program the gate starts for itself sees.
@@ -34,6 +35,11 @@ impl Variables {
         Variables(applied(self.0, vec![(OsString::from(name), Some(OsString::from(value)))]))
     }
 
+    /// This environment with every value it holds for `name` removed, names compared as Windows compares them.
+    pub(crate) fn without(self, name: &str) -> Variables {
+        Variables(applied(self.0, vec![(OsString::from(name), None)]))
+    }
+
     /// This environment with the build-server settings of the run `run` ([`build_servers`]) set over it, replacing
     /// every value it holds for each name, names compared as Windows compares them.
     pub(crate) fn with_build_servers(self, run: &str) -> Variables {
@@ -44,11 +50,7 @@ impl Variables {
     /// for its name, names compared as Windows compares them. Applied before the gate's own settings, so no pair can
     /// undo one.
     pub(crate) fn with_caller(self, caller: &[(String, String)]) -> Variables {
-        let overrides = caller
-            .iter()
-            .map(|(name, value)| (OsString::from(name), Some(OsString::from(value))))
-            .collect();
-        Variables(applied(self.0, overrides))
+        Variables(applied(self.0, caller_overrides(caller)))
     }
 
     /// The value the command gets for `name`, names compared as Windows compares them.
@@ -88,15 +90,18 @@ fn overrides(root: &ResolvedRoot, run: &str, marker: &str) -> Vec<Override> {
 }
 
 /// The build-server settings of the run `run`: the compiler server's pipe and `MSBuild`'s node handshake are named by
-/// the run id, so no other run's command uses the servers this one starts; the `MSBuild` server is off, an inherited
-/// `MSBUILDUSESERVER` included; and `MSBuild`'s node reuse is off, so no node idles in the command's job after its
-/// build, keeping alive whatever in the command waits for its whole tree.
+/// the run id, so no other run's command uses the servers this one starts; the `MSBuild` server, the compiler server and
+/// `MSBuild`'s node reuse are all off, an inherited `MSBUILDUSESERVER`, `UseSharedCompilation` or
+/// `MSBUILDDISABLENODEREUSE` included: nothing may idle in the command's job once its build has run, since a command
+/// that waits for its whole job (Godot's console wrapper waits for every process in it) never ends while an idle process
+/// holds it, and Roslyn's compiler server idles there for up to ten minutes.
 fn build_servers(run: &str) -> Vec<Override> {
     vec![
         (OsString::from("SharedCompilationId"), Some(OsString::from(run))),
         (OsString::from("MSBUILDNODEHANDSHAKESALT"), Some(OsString::from(run))),
         (OsString::from("MSBUILDUSESERVER"), Some(OsString::from("0"))),
         (OsString::from("DOTNET_CLI_USE_MSBUILD_SERVER"), Some(OsString::from("0"))),
+        (OsString::from("UseSharedCompilation"), Some(OsString::from("false"))),
         (OsString::from("MSBUILDDISABLENODEREUSE"), Some(OsString::from("1"))),
     ]
 }
@@ -109,6 +114,20 @@ fn run_id(gate: &ThisGate, root: &StateRoot) -> String {
         Some(hash) => format!("{id}-{hash}"),
         None => id,
     }
+}
+
+/// The environment a command starts in: `start`, then the caller's pairs `caller` over it, then the gate's own
+/// `overrides` last, names compared as Windows compares them at each step.
+fn composed(start: Vec<(OsString, OsString)>, caller: &[(String, String)], overrides: Vec<Override>) -> Vec<(OsString, OsString)> {
+    applied(applied(start, caller_overrides(caller)), overrides)
+}
+
+/// The caller's pairs as overrides, each setting its name.
+fn caller_overrides(caller: &[(String, String)]) -> Vec<Override> {
+    caller
+        .iter()
+        .map(|(name, value)| (OsString::from(name), Some(OsString::from(value))))
+        .collect()
 }
 
 /// `variables` with each override applied in turn: every pair of its name removed, names compared as Windows compares
@@ -141,7 +160,7 @@ mod tests {
     use gate_state::StateRoot;
     use gate_win32::same_variable_name;
 
-    use super::{Variables, applied, overrides};
+    use super::{Variables, applied, composed, overrides};
     use crate::resolve::ResolvedRoot;
 
     const DEFAULT: &str = r"C:\Users\someone\AppData\Local\gate\v1";
@@ -230,6 +249,30 @@ mod tests {
     }
 
     #[test]
+    fn the_overrides_give_the_command_shared_compilation_off_over_an_inherited_on() {
+        let inherited = vec![(OsString::from("usesharedcompilation"), OsString::from("true"))];
+
+        let variables = Variables(applied(inherited, overrides(&root(DEFAULT), "gate-1-2", "heavy:1:2")));
+
+        assert_eq!(
+            variables.get("UseSharedCompilation"),
+            Some(OsStr::new("false")),
+            "no compiler server idles in the job of a command that waits for its whole tree"
+        );
+    }
+
+    #[test]
+    fn every_name_the_gate_sets_is_one_a_caller_cannot_set() {
+        for (name, _) in overrides(&root(DEFAULT), "gate-1-2", "heavy:1:2") {
+            let name = name.to_string_lossy().into_owned();
+            assert!(
+                gate_args::GATE_SET_NAMES.iter().any(|set| set.eq_ignore_ascii_case(&name)),
+                "{name} is set over the command, and a caller may set it"
+            );
+        }
+    }
+
+    #[test]
     fn with_replaces_a_set_variable_whatever_its_letter_case_and_adds_an_unset_one() {
         let path = (OsString::from("Path"), OsString::from(r"C:\bin"));
         let inherited = vec![(OsString::from("msbuildnodehandshakesalt"), OsString::from("other")), path.clone()];
@@ -240,5 +283,33 @@ mod tests {
 
         assert_eq!(replaced.0, [path.clone(), set.clone()], "the value set under another letter case is gone");
         assert_eq!(added.0, [path, set], "an unset name is added");
+    }
+
+    fn pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect()
+    }
+
+    #[test]
+    fn the_caller_s_pairs_come_over_the_start_environment_and_under_the_gate_s_own() {
+        let start = vec![
+            (OsString::from("nugetaudit"), OsString::from("true")),
+            (OsString::from("Path"), OsString::from(r"C:\bin")),
+        ];
+        let caller = pairs(&[("NuGetAudit", "false"), ("GATE_SLOT_HELD", "forged"), ("EMPTY", "")]);
+
+        let variables = Variables(composed(start, &caller, overrides(&root(DEFAULT), "gate-1-2", "heavy:1:2")));
+
+        assert_eq!(
+            variables.get("NUGETAUDIT"),
+            Some(OsStr::new("false")),
+            "the caller's value replaces the inherited one"
+        );
+        assert_eq!(
+            variables.get("GATE_SLOT_HELD"),
+            Some(OsStr::new("heavy:1:2")),
+            "the gate's own setting comes last"
+        );
+        assert_eq!(variables.get("EMPTY"), Some(OsStr::new("")), "an empty value is set");
+        assert_eq!(variables.get("Path"), Some(OsStr::new(r"C:\bin")), "other variables pass through");
     }
 }

@@ -278,7 +278,7 @@ fn pinned(pins: &[Pin], reported: &Reported) -> Pinned {
         Reported::Present if pins.is_empty() => Pinned::Met,
         Reported::Present => Pinned::Lacks("present".to_owned()),
         Reported::Version(list) => {
-            let found: Vec<Version> = list.split(',').filter_map(Version::parse).collect();
+            let found: Vec<Version> = list.split(',').map(str::trim).filter_map(Version::parse).collect();
             if pins.iter().all(|pin| found.iter().any(|found| pin.met_by(*found))) {
                 Pinned::Met
             } else {
@@ -377,6 +377,48 @@ pub(crate) fn godot_required(manifest: Option<&Result<Manifest, String>>, pins: 
         });
     }
     (!pins.is_empty()).then(|| distinct(pins))
+}
+
+/// The Godot install a routed run's builder runs the repo's command on, as [`godot_choice`] picks it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GodotChoice {
+    /// No version: the repo requires nothing of godot, or any version, or no install the builder listed meets its pin.
+    None,
+    /// The version, `major.minor.patch`, of the install the builder listed that the run is to use.
+    Version(String),
+    /// The repo pins several versions, here `, `-joined in the order [`godot_required`] gives them; a routed run needs one.
+    Several(String),
+}
+
+/// The line said when a repo pins the several Godot versions `list`, which keeps a routed run here.
+pub(crate) fn several_godot_line(list: &str) -> String {
+    format!("gate: the repo pins several Godot versions ({list}); a routed run needs one")
+}
+
+/// Which of the builder's Godot installs a routed run uses, given the versions `required` the repo requires
+/// ([`godot_required`]; `None` when it requires nothing) and what the preflight `reported` of each tool: none for no pin
+/// or any version, several for more than one pin, else the highest version the builder listed that meets the one pin
+/// ([`Pin::met_by`]), none when no listed version meets it.
+pub(crate) fn godot_choice(required: Option<&[Pin]>, reported: &[(String, Reported)]) -> GodotChoice {
+    let pin = match required.unwrap_or_default() {
+        [] => return GodotChoice::None,
+        [pin] => pin,
+        pins => {
+            let list: Vec<String> = pins.iter().map(ToString::to_string).collect();
+            return GodotChoice::Several(list.join(", "));
+        }
+    };
+    let listed = reported.iter().find_map(|(name, answer)| match answer {
+        Reported::Version(list) if name == GODOT => Some(list),
+        _ => None,
+    });
+    let highest = listed
+        .into_iter()
+        .flat_map(|list| list.split(','))
+        .filter_map(|member| Version::parse(member.trim()))
+        .filter(|found| pin.met_by(*found))
+        .max();
+    highest.map_or(GodotChoice::None, |version| GodotChoice::Version(version.to_string()))
 }
 
 /// The pins among `pins` that are not read already, in their order.
@@ -779,14 +821,67 @@ fn attributes(text: &str) -> Vec<(&str, &str)> {
 #[expect(clippy::expect_used, reason = "a fixture that does not read must fail loudly")]
 mod tests {
     use super::{
-        Godot, Judged, Manifest, Pin, Pinned, Reported, Standing, ToolNeed, Version, dotnet_tools, godot_required, godot_sdk_pins, is_sent, judge,
-        meets, needs_of, pinned, read, read_bytes, reported, reported_as, routed_needs, skip_line, standing, unreadable_line,
+        Godot, GodotChoice, Judged, Manifest, Pin, Pinned, Reported, Standing, ToolNeed, Version, dotnet_tools, godot_choice, godot_required,
+        godot_sdk_pins, is_sent, judge, meets, needs_of, pinned, read, read_bytes, reported, reported_as, routed_needs, several_godot_line,
+        skip_line, standing, unreadable_line,
     };
     use crate::remote::git::FAILURE_BYTES;
     use crate::remote::parity::{Need, NeedKind};
 
     fn version(major: u64, minor: u64, patch: u64) -> Version {
         Version { major, minor, patch }
+    }
+
+    /// The pins `texts` spell.
+    fn pins_of(texts: &[&str]) -> Vec<Pin> {
+        texts.iter().map(|text| Pin::parse(text).expect("the pin reads")).collect()
+    }
+
+    /// What the preflight said of godot: the builder's install list `list`, beside another tool's answer.
+    fn godot_listed(list: &str) -> Vec<(String, Reported)> {
+        vec![
+            ("node".to_owned(), Reported::Version("4.7.2".to_owned())),
+            ("godot".to_owned(), Reported::Version(list.to_owned())),
+        ]
+    }
+
+    #[test]
+    fn one_full_pin_chooses_the_install_of_that_version() {
+        let chosen = godot_choice(Some(&pins_of(&["4.7.2"])), &godot_listed("4.3.0,4.7.2,4.8.0"));
+        assert_eq!(chosen, GodotChoice::Version("4.7.2".to_owned()));
+    }
+
+    #[test]
+    fn a_partial_pin_chooses_the_highest_install_meeting_it_whatever_the_list_order() {
+        let chosen = godot_choice(Some(&pins_of(&["4.7"])), &godot_listed("4.7.10,4.8.0,4.7.2,4.6.9"));
+        assert_eq!(chosen, GodotChoice::Version("4.7.10".to_owned()));
+        let major = godot_choice(Some(&pins_of(&["4"])), &godot_listed("4.3.0,5.0.0,4.7.2"));
+        assert_eq!(major, GodotChoice::Version("4.7.2".to_owned()));
+    }
+
+    #[test]
+    fn several_differing_pins_choose_none_and_name_them_in_order() {
+        let chosen = godot_choice(Some(&pins_of(&["4.7.2", "4.3"])), &godot_listed("4.3.0,4.7.2"));
+        assert_eq!(chosen, GodotChoice::Several("4.7.2, 4.3".to_owned()));
+        assert_eq!(
+            several_godot_line("4.7.2, 4.3"),
+            "gate: the repo pins several Godot versions (4.7.2, 4.3); a routed run needs one"
+        );
+    }
+
+    #[test]
+    fn any_version_or_no_pin_chooses_none() {
+        assert_eq!(godot_choice(Some(&[]), &godot_listed("4.7.2")), GodotChoice::None, "any version");
+        assert_eq!(godot_choice(None, &godot_listed("4.7.2")), GodotChoice::None, "no pin");
+    }
+
+    #[test]
+    fn a_pin_no_listed_install_meets_chooses_none() {
+        let pins = pins_of(&["4.7.2"]);
+        assert_eq!(godot_choice(Some(&pins), &godot_listed("4.3.0,4.7.1")), GodotChoice::None, "not listed");
+        assert_eq!(godot_choice(Some(&pins), &[]), GodotChoice::None, "no godot answer");
+        let missing = [("godot".to_owned(), Reported::Missing)];
+        assert_eq!(godot_choice(Some(&pins), &missing), GodotChoice::None, "missing");
     }
 
     #[test]

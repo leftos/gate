@@ -78,11 +78,11 @@ fn the_line_names_one_or_many_and_nothing_for_none() {
     assert_eq!(dropped_env_line(&[]), None, "every name is sent");
     assert_eq!(
         dropped_env_line(&["NuGetAudit".to_owned()]),
-        Some("gate: a routed run does not send the caller's NuGetAudit; --env NAME=value sends one".to_owned())
+        Some("gate: a routed run does not send the caller's NuGetAudit; --env NAME sends it".to_owned())
     );
     assert_eq!(
         dropped_env_line(&["NuGetAudit".to_owned(), "RUSTFLAGS".to_owned()]),
-        Some("gate: a routed run does not send the caller's NuGetAudit, RUSTFLAGS; --env NAME=value sends one".to_owned())
+        Some("gate: a routed run does not send the caller's NuGetAudit, RUSTFLAGS; --env NAME sends it".to_owned())
     );
 }
 
@@ -90,11 +90,11 @@ fn the_line_names_one_or_many_and_nothing_for_none() {
 fn the_line_escapes_each_name_that_holds_a_control_character() {
     assert_eq!(
         dropped_env_line(&["A\u{1b}B".to_owned()]),
-        Some(r"gate: a routed run does not send the caller's A\u{1b}B; --env NAME=value sends one".to_owned())
+        Some(r"gate: a routed run does not send the caller's A\u{1b}B; --env NAME sends it".to_owned())
     );
     assert_eq!(
         dropped_env_line(&["NuGetAudit".to_owned(), "A\u{7}B".to_owned()]),
-        Some(r"gate: a routed run does not send the caller's NuGetAudit, A\u{7}B; --env NAME=value sends one".to_owned()),
+        Some(r"gate: a routed run does not send the caller's NuGetAudit, A\u{7}B; --env NAME sends it".to_owned()),
         "each name on its own"
     );
 }

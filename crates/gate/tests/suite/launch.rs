@@ -250,6 +250,111 @@ fn the_build_server_environment_reaches_the_command() {
     assert_eq!(lines[6], shown(&case.root()), "{text}");
 }
 
+/// The gate turns shared compilation off for every command it starts, an inherited `true` included: a command that waits
+/// for every process in its job never ends while the run's own Roslyn compiler server idles in it (GATE-383; Godot's
+/// console wrapper waits for its whole job).
+#[test]
+fn the_command_gets_shared_compilation_off_over_an_inherited_on() {
+    let case = Case::new("the_command_gets_shared_compilation_off_over_an_inherited_on");
+    let mut gate = case.gate(&run_words("out.log", &[], &[FAKE_TOOL, "env", "UseSharedCompilation"]));
+    gate.env("UseSharedCompilation", "true");
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        log_text(&case).lines().next(),
+        Some("false"),
+        "the command sees the gate's value, not the inherited one"
+    );
+}
+
+#[test]
+fn an_env_pair_reaches_the_command_and_cannot_undo_the_gate_s_own() {
+    let case = Case::new("an_env_pair_reaches_the_command_and_cannot_undo_the_gate_s_own");
+    let command = [
+        FAKE_TOOL,
+        "env",
+        "ZZ_GATE_ENV_GIVEN",
+        "env",
+        "ZZ_GATE_ENV_OTHER",
+        "env",
+        "MSBUILDUSESERVER",
+    ];
+    let extra = ["--env", "zz_gate_env_given=from --env", "--env", "ZZ_GATE_ENV_OTHER=a=b"];
+    let mut gate = case.gate(&run_words("out.log", &extra, &command));
+    gate.env("ZZ_GATE_ENV_GIVEN", "inherited").env("MSBUILDUSESERVER", "1");
+
+    let outcome = start(gate).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let text = log_text(&case);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines[..3],
+        ["from --env", "a=b", "0"],
+        "the pair replaces an inherited value under another letter case, and the gate's own setting stays: {text}"
+    );
+
+    let refused = case.run(&run_words("refused.log", &["--env", "MSBUILDUSESERVER=1"], &[FAKE_TOOL, "exit", "0"]));
+
+    assert_eq!(refused.code, Some(2), "{refused:?}");
+    assert!(
+        refused
+            .stderr
+            .starts_with("gate: --env sets MSBUILDUSESERVER, which the gate sets itself\nusage: gate run"),
+        "{refused:?}"
+    );
+    assert!(!case.folder().join("refused.log").exists(), "a refused run readies no log");
+}
+
+#[test]
+fn a_forwarded_env_name_reaches_the_command_and_the_gate_does_not_say_its_value() {
+    let case = Case::new("a_forwarded_env_name_reaches_the_command_and_the_gate_does_not_say_its_value");
+    let command = [FAKE_TOOL, "env", "ZZ_GATE_FORWARDED"];
+    let mut gate = case.gate(&run_words("out.log", &["--env", "ZZ_GATE_FORWARDED"], &command));
+    gate.env("ZZ_GATE_FORWARDED", "from the caller's environment");
+
+    let outcome = start(gate).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let text = log_text(&case);
+    assert!(
+        text.lines().any(|line| line == "from the caller's environment"),
+        "the command sees the forwarded value: {text}"
+    );
+    assert!(
+        !outcome
+            .stdout
+            .lines()
+            .chain(outcome.stderr.lines())
+            .any(|line| line.starts_with("gate: ") && line.contains("from the caller's environment")),
+        "no line of the gate's says the value: {outcome:?}"
+    );
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.starts_with("gate: ") && line.contains("from the caller's environment")),
+        "no line of the gate's says the value: {text}"
+    );
+}
+
+#[test]
+fn a_written_and_a_forwarded_value_may_hold_a_line_end() {
+    let case = Case::new("a_written_and_a_forwarded_value_may_hold_a_line_end");
+    let command = [FAKE_TOOL, "env", "ZZ_GATE_WRITTEN_LINES", "env", "ZZ_GATE_FORWARDED_LINES"];
+    let extra = ["--env", "ZZ_GATE_WRITTEN_LINES=one\ntwo", "--env", "ZZ_GATE_FORWARDED_LINES"];
+    let mut gate = case.gate(&run_words("out.log", &extra, &command));
+    gate.env("ZZ_GATE_FORWARDED_LINES", "one\r\ntwo");
+
+    let outcome = start(gate).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let text = log_text(&case);
+    assert!(text.contains("one\ntwo"), "the written value reaches the command as it is: {text:?}");
+    assert!(text.contains("one\r\ntwo"), "the forwarded value reaches the command as it is: {text:?}");
+}
+
 #[test]
 fn two_runs_give_their_commands_different_compiler_server_ids() {
     let case = Case::new("two_runs_give_their_commands_different_compiler_server_ids");

@@ -24,11 +24,10 @@ use std::sync::{Arc, PoisonError, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use gate_args::{BoxSeams, EnvRefusal, env_refusal, over_cap, repeated_name, shown_name};
+use gate_args::{BoxSeams, EnvRefusal, env_refusal, is_godot_console, over_cap, repeated_name, shown_name};
 use gate_watchdog::{Kill, Pump};
 use gate_win32::{
     Donor, EnvironmentBlock, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken, Running, Utf8Console,
-    same_variable_name,
 };
 
 use crate::answer::USAGE_STATUS;
@@ -40,6 +39,7 @@ use crate::boxside::outputs::{self, Asked};
 use crate::boxside::packages;
 use crate::boxside::payload::{PairSibling, Payload, bare_stem, escaped, ordinal_upper, trees};
 use crate::boxside::preflight::{self, Failed, GIT_REDIRECTS, Git, GitFailure, Unready, exit_code, git_failed};
+use crate::boxside::probe;
 use crate::boxside::stop::{Ending, STOPPED, stop_event_name, terminate_and_wait};
 use crate::boxside::tools;
 use crate::console::Console;
@@ -47,7 +47,7 @@ use crate::environment::Variables;
 use crate::outputs::manifest::{Listing, Manifest};
 use crate::remote::{Refusal, refused_line, started_line};
 use crate::resolve::{self, Environment};
-use crate::run::{Written, end_leftovers, find_program, written};
+use crate::run::{ERROR_FILE_NOT_FOUND, Written, end_leftovers, find_program, written};
 
 mod desktop_run;
 
@@ -130,6 +130,8 @@ pub(super) struct Request<'a> {
     /// The caller's variables for the command, `Env`: each a name and a value, set over the box's own environment and
     /// under the gate's own settings; none when the payload gives none.
     env: Vec<(String, String)>,
+    /// The version of the Godot install the run uses, `GodotVersion`, `major.minor.patch`; `None` when none is chosen.
+    godot: Option<&'a str>,
     /// The outputs the run brings back, `None` when it has no output globs.
     outputs: Option<Asked<'a>>,
     /// The run's `Nonce`, which its start marker and its refusal tags name.
@@ -177,6 +179,7 @@ impl Request<'_> {
         let subfolder = payload.optional_text("Subfolder")?;
         let identity = identity(payload)?;
         let env = caller_env(payload)?;
+        let godot = payload.godot_version()?;
         let inputs_digest = payload.inputs_digest()?;
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
         let (main, siblings) = repos(payload, work, bare, snapshot)?;
@@ -193,6 +196,7 @@ impl Request<'_> {
             subfolder,
             identity,
             env,
+            godot,
             outputs,
             nonce,
             timeout,
@@ -396,10 +400,10 @@ fn identity(payload: &Payload) -> Result<Vec<(String, String)>, String> {
 /// The payload's `Env`: the caller's variables for the command, each pair a name and a value the gate can set; none when
 /// the key is absent or null. Else the usage line: a list over its cap (`gate_args::MOST_ENV_NAMES`,
 /// `gate_args::MOST_ENV_BYTES`), a name the gate sets itself, a `GATE_` name, a machine path, a name or value no
-/// environment block carries ([`env_refusal`]), or a name given twice, as an ASCII scan and then as Windows reads names.
+/// environment block carries ([`env_refusal`]), or a name given twice in any ASCII case.
 ///
-/// The cap is read from the raw object before any pair of it is built or checked, so a request holding a hundred thousand
-/// names is refused without one of them being built.
+/// The cap is read from the raw object before any pair of it is checked, so a request over the cap is refused without
+/// its pairs being copied.
 fn caller_env(payload: &Payload) -> Result<Vec<(String, String)>, String> {
     let (names, bytes) = payload.pair_size("Env")?.unwrap_or_default();
     if over_cap(names, bytes) {
@@ -411,24 +415,10 @@ fn caller_env(payload: &Payload) -> Result<Vec<(String, String)>, String> {
             return Err(refusal.box_line(&shown_escaped(name)));
         }
     }
-    if let Some(twice) = repeated_name(pairs.iter().map(|(name, _)| name.as_str())).or_else(|| repeated_name_as_windows(&pairs)) {
+    if let Some(twice) = repeated_name(pairs.iter().map(|(name, _)| name.as_str())) {
         return Err(EnvRefusal::Twice.box_line(&shown_escaped(twice)));
     }
     Ok(pairs)
-}
-
-/// The first name of `pairs` an earlier one names as Windows names variables ([`same_variable_name`]), as the later
-/// spelling gives it; `None` when no name is one Windows reads as another. The cap check in [`caller_env`] runs first, so
-/// this pass reads at most `gate_args::MOST_ENV_NAMES` names.
-fn repeated_name_as_windows(pairs: &[(String, String)]) -> Option<&str> {
-    let mut seen: Vec<&str> = Vec::new();
-    for (name, _) in pairs {
-        if seen.iter().any(|set| same_variable_name(OsStr::new(set), OsStr::new(name))) {
-            return Some(name);
-        }
-        seen.push(name);
-    }
-    None
 }
 
 /// The name `name` a refusal line shows: shortened to [`shown_name`]'s limit and escaped as the box escapes a payload
@@ -1197,10 +1187,11 @@ pub(super) fn full_path(path: &Path) -> Option<PathBuf> {
 /// over it ([`Variables::with_caller`]) and then the build-server settings of its run
 /// ([`Variables::with_build_servers`]), replacing any value the box inherited (the caller can give none of them): the
 /// compiler server's pipe and `MSBuild`'s node handshake are named by the run id `gate-box-<Nonce>`, so no other run's
-/// command, on the box or on the PC, uses the servers this one starts, and the `MSBuild` server and node reuse are off. Git's `safe.directory` is
-/// set to `*` over that ([`with_safe_directory`]), and the Event Log logging provider of a .NET host the command starts
-/// is turned off over that ([`with_event_log_off`]). The command runs with a restricted copy of the box's token
-/// ([`restricted_token`]).
+/// command, on the box or on the PC, uses the servers this one starts, and the `MSBuild` server, the compiler server and
+/// node reuse are off. Git's `safe.directory` is set to `*` over that ([`with_safe_directory`]), and the Event Log
+/// logging provider of a .NET host the command starts is turned off over that ([`with_event_log_off`]). The command runs
+/// with a restricted copy of the box's token ([`restricted_token`]). The program and a run's `GODOT_PATH` are
+/// [`resolved_command`]'s, through [`prepared`].
 fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<Ran, u32> {
     let Prepared {
         word,
@@ -1277,20 +1268,20 @@ struct Prepared<'w> {
 }
 
 /// Resolves `one`'s program in its place and writes its command line, with the environment [`command_variables`]
-/// composes, before anything holds a job or the builder's desktop for it, so a desktop run gets the same environment as
-/// any run. `Err` with the run's answer when it cannot start: `Ok` with 127 for a program not found or one with no
+/// composes, the program and a run's `GODOT_PATH` being [`resolved_command`]'s, before anything holds a job or the
+/// builder's desktop for it, so a desktop run gets the same program and environment as any run. `Err` with the run's answer when it cannot start: `Ok` with 127 for a program not found or one with no
 /// shell to run it, its line said; `Err` with 2 for a batch word refused, or 1 for the box's own failure, its line said.
 fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> Result<Prepared<'w>, Result<Ran, u32>> {
     let run = format!("gate-box-{}", request.nonce);
-    let variables = command_variables(&request.env, &run);
-    let environment = variables
-        .block()
-        .map_err(|error| Err(failed(console, &format!("cannot build the command's environment: {error}"))))?;
     let Some((word, rest)) = one.words.split_first() else {
         return Err(Err(failed(console, "the run has no command")));
     };
+    let (variables, found) = resolved_command(request.godot, word, command_variables(&request.env, &run), one.place);
+    let environment = variables
+        .block()
+        .map_err(|error| Err(failed(console, &format!("cannot build the command's environment: {error}"))))?;
     let rest: Vec<OsString> = rest.iter().map(OsString::from).collect();
-    let program = match find_program(word, &variables, one.place) {
+    let program = match found {
         Ok(program) => program,
         Err(message) => return Err(Ok(Ran::Exited(not_started(console, word, None, &message)))),
     };
@@ -1316,6 +1307,48 @@ fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> 
 /// The caller's pairs stand before every setting the gate applies, so none of them can undo one.
 fn command_variables(env: &[(String, String)], run: &str) -> Variables {
     with_event_log_off(with_safe_directory(Variables::from_process().with_caller(env).with_build_servers(run)))
+}
+
+/// The variable a command of a run with a chosen Godot version reads the Godot install it resolved from.
+const GODOT_PATH: &str = "GODOT_PATH";
+
+/// The program the command's first word `word` runs in `place` and the environment `variables` it runs with, for a run
+/// whose chosen Godot version is `godot`. With no version, the word is looked for as any other ([`find_program`]) and
+/// the environment is left as it is.
+///
+/// With a version and the box's `GATE_GODOT_ROOT` set, the Godot program is the install of that version under the root
+/// ([`probe::installed_godot`]) and nothing else: a Godot console word ([`gate_args::is_godot_console`]) runs it, and
+/// with no such install fails to start, never falling back to the `PATH`. With a version and no root, a Godot console
+/// word is looked for as any other word, and the Godot program is the one it runs, or, for any other word, the
+/// `Godot_console.exe` the `PATH` holds. `GODOT_PATH` is set over every other value the environment holds for it, the
+/// caller's having been refused, to the Godot program found; with none found, every value it holds is removed, so an
+/// inherited one never passes for the gate's.
+fn resolved_command(godot: Option<&str>, word: &str, variables: Variables, place: &Path) -> (Variables, Result<PathBuf, String>) {
+    let Some(version) = godot else {
+        let found = find_program(word, &variables, place);
+        return (variables, found);
+    };
+    let (found, godot_program) = match (is_godot_console(word), variables.get("GATE_GODOT_ROOT")) {
+        (true, Some(root)) => {
+            let installed = probe::installed_godot(root, version);
+            (
+                installed.clone().ok_or_else(|| gate_win32::win32_message(ERROR_FILE_NOT_FOUND)),
+                installed,
+            )
+        }
+        (true, None) => {
+            let found = find_program(word, &variables, place);
+            let godot_program = found.as_ref().ok().cloned();
+            (found, godot_program)
+        }
+        (false, Some(root)) => (find_program(word, &variables, place), probe::installed_godot(root, version)),
+        (false, None) => (find_program(word, &variables, place), find_program(probe::GODOT, &variables, place).ok()),
+    };
+    let variables = match godot_program {
+        Some(program) => variables.with(GODOT_PATH, &program.to_string_lossy()),
+        None => variables.without(GODOT_PATH),
+    };
+    (variables, found)
 }
 
 /// The variable that counts the config entries git reads from the environment.

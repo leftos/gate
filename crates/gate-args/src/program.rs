@@ -49,6 +49,23 @@ pub fn resolve_program(name: &str, search: &ProgramSearch<'_>, is_file: impl Fn(
     })
 }
 
+/// Whether the command's first word `word` names a Godot console program by name alone: no directory part, and a file
+/// stem, the name without a trailing `.exe`, that matches `Godot*console*` with no `.` after its last `console`, ASCII
+/// case ignored. A version-holding name such as `Godot_v4.7.2-stable_mono_win64_console.exe` matches, and so does
+/// `Godot_console.exe`, `godot_console.EXE` and `godot_CONSOLE`; a name with any other extension, as
+/// `Godot_console.cmd`, `.bat` or `.ps1`, does not.
+#[must_use]
+pub fn is_godot_console(word: &str) -> bool {
+    if has_directory(word) {
+        return false;
+    }
+    let lower = word.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    stem.strip_prefix("godot")
+        .and_then(|rest| rest.rfind("console").map(|at| &rest[at..]))
+        .is_some_and(|tail| !tail.contains('.'))
+}
+
 /// Whether `folder` is a full path: a drive and a separator (`C:\`), or a UNC path.
 fn is_absolute(folder: &str) -> bool {
     is_unc(folder) || (has_drive(folder) && folder[2..].starts_with(is_separator))
@@ -127,4 +144,58 @@ fn folded(root: &str, rest: &str) -> String {
         }
     }
     format!("{root}\\{}", segments.join("\\"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_godot_console;
+
+    #[test]
+    fn a_bare_godot_console_name_is_one_in_any_ascii_case_with_or_without_exe() {
+        for word in [
+            "Godot_console.exe",
+            "Godot_console",
+            "godot_console.EXE",
+            "godot_CONSOLE",
+            "GODOTCONSOLE.EXE",
+            "Godot_v4.7.2-stable_mono_win64_console.exe",
+            "Godot_v4.7.2-stable_mono_win64_console",
+            "Godot_console_extra.exe",
+        ] {
+            assert!(is_godot_console(word), "{word}");
+        }
+    }
+
+    #[test]
+    fn a_name_with_a_directory_part_or_another_stem_is_no_godot_console() {
+        for word in [
+            r"C:\Godot\Godot_console.exe",
+            r".\Godot_console.exe",
+            "bin/Godot_console.exe",
+            "C:Godot_console.exe",
+            "Godot.exe",
+            "Godot_v4.7.2-stable_mono_win64.exe",
+            "my_Godot_console.exe",
+            "console_Godot.exe",
+            "dotnet",
+            "",
+        ] {
+            assert!(!is_godot_console(word), "{word}");
+        }
+    }
+
+    /// A Godot console name ending in an extension other than `.exe` is a script or another file, not the console
+    /// program an install holds, so it is never taken for one.
+    #[test]
+    fn a_godot_console_name_with_another_extension_is_none() {
+        for word in [
+            "godot_console.cmd",
+            "Godot_console.bat",
+            "Godot_console.ps1",
+            "Godot_console.exe.cmd",
+            "Godot_v4.7.2-stable_mono_win64_console.com",
+        ] {
+            assert!(!is_godot_console(word), "{word}");
+        }
+    }
 }

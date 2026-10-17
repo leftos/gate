@@ -1054,11 +1054,10 @@ fn slot_name(case: &Case, object: KernelObject) -> String {
     StateRoot::new(&shown(&case.root()), None).object_name(object)
 }
 
-/// The pid the claim of the slot `object` under the case root names, once it is written: a gate journals its `take`
-/// before it writes its claim.
+/// The pid the claim of the slot `object` under the case root names, once it is written: a gate writes its claim before
+/// it journals its `take`, so a caller that waited for the take line finds it.
 fn claimant(case: &Case, object: KernelObject) -> u32 {
     let claim = v1::claim_path(&case.root(), object).expect("a pool's slot has a claim");
-    wait_for_file(&claim);
     v1::read_claim(&claim).expect("the slot's claim can be read").pid
 }
 

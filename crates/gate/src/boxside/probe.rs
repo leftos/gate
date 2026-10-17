@@ -11,11 +11,13 @@ use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::os::windows::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::thread::{self, Scope, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
 use gate_win32::PipedConsole;
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
 use crate::boxside::payload::{escaped, is_drive_path};
 use crate::environment::Variables;
@@ -25,10 +27,10 @@ use crate::remote::git::{self, GitError, ProgramCall, ProgramOutput, ProgramPlac
 pub(crate) const PROBE_LIMIT: Duration = Duration::from_secs(10);
 
 /// The most digits a part of a version may have: a longer one is no version the client could compare.
-const MAX_PART_DIGITS: usize = 10;
+pub(crate) const MAX_PART_DIGITS: usize = 10;
 
 /// The console program of a Godot install.
-const GODOT: &str = "Godot_console.exe";
+pub(crate) const GODOT: &str = "Godot_console.exe";
 
 /// The word a Godot install is asked for its version with.
 const GODOT_VERSION: &[&str] = &["--version"];
@@ -193,7 +195,8 @@ fn late_reason(why: &str, late: &str, limit: Duration) -> Option<String> {
 
 /// What the godot probe finds in `place`: the version of every install the batch's environment names, `,`-joined,
 /// `missing` when the root names no install at all, and `skipped` with the first reason its entries gave when installs
-/// are there and none of them answers with a version.
+/// are there and none of them answers with a version. An install of the root whose folder is not named the version it
+/// answers with is left out, as a run finds an install by its folder's name ([`installed_godot`]).
 fn godot(place: &ProgramPlace, batch: Batch<'_>) -> Probed {
     let candidates = match godot_candidates(batch.godot_root, batch.deadline, batch.limit) {
         Ok(candidates) => candidates,
@@ -203,7 +206,14 @@ fn godot(place: &ProgramPlace, batch: Batch<'_>) -> Probed {
     let mut reason: Option<String> = None;
     for candidate in &candidates {
         let found = match candidate {
-            Candidate::Install(install) => ran(install, GODOT_VERSION, place, batch, read_godot),
+            Candidate::Install(install) => {
+                let found = ran(install, GODOT_VERSION, place, batch, read_godot);
+                if batch.godot_root.is_some() {
+                    named_as_found(install, found)
+                } else {
+                    found
+                }
+            }
             Candidate::Skipped(why) => Probed::Skipped(why.clone()),
         };
         match found {
@@ -220,6 +230,35 @@ fn godot(place: &ProgramPlace, batch: Batch<'_>) -> Probed {
         return reason.map_or(Probed::Missing, Probed::Skipped);
     }
     Probed::Version(version_list(&versions))
+}
+
+/// What the probe of the root's install `install` `found`, kept only when it is a version the install's folder is named:
+/// else skipped with the reason `named <folder> but reports <version>`.
+fn named_as_found(install: &str, found: Probed) -> Probed {
+    let Probed::Version(version) = found else {
+        return found;
+    };
+    let folder = Path::new(install)
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if folder == version {
+        Probed::Version(version)
+    } else {
+        Probed::Skipped(format!("named {} but reports {version}", escaped(&folder)))
+    }
+}
+
+/// The `Godot_console.exe` of the install of `version` under the root `root`, the box's `GATE_GODOT_ROOT`, as a run
+/// finds it by name: `<root>\<version>\Godot_console.exe`, when the root is an absolute path on a drive and that file is
+/// a plain one in a plain folder, neither of them a reparse point ([`godot_install`]); else `None`.
+pub(crate) fn installed_godot(root: &OsStr, version: &str) -> Option<PathBuf> {
+    let root = root.to_str().filter(|root| is_drive_path(root))?;
+    match godot_install(&Path::new(root).join(version))? {
+        Candidate::Install(program) => Some(PathBuf::from(program)),
+        Candidate::Skipped(_) => None,
+    }
 }
 
 /// One direct subfolder of `GATE_GODOT_ROOT` as the godot probe reads it.
@@ -288,24 +327,37 @@ fn godot_install(folder: &Path) -> Option<Candidate> {
     plain_file(&program).then(|| Candidate::Install(program.to_string_lossy().into_owned()))
 }
 
-/// Whether `path` is a plain folder, read as it is rather than through a link or a junction.
+/// Whether `path` is a plain folder, read as it is and no reparse point ([`linked`]).
 fn plain_folder(path: &Path) -> bool {
-    plain_type(path).is_some_and(|kind| kind.is_dir() && !kind.is_symlink())
+    plain_type(path).is_some_and(|(kind, reparse)| kind.is_dir() && !reparse)
 }
 
-/// Whether `path` is a plain file, read as it is rather than through a link.
+/// Whether `path` is a plain file, read as it is and no reparse point ([`linked`]).
 fn plain_file(path: &Path) -> bool {
-    plain_type(path).is_some_and(|kind| kind.is_file() && !kind.is_symlink())
+    plain_type(path).is_some_and(|(kind, reparse)| kind.is_file() && !reparse)
 }
 
-/// Whether `path` is a link or a junction, read as it is, so what one leads to is never taken for it.
+/// Whether `path` is a link, a junction or any other reparse point (an app execution alias, a cloud placeholder), read
+/// as it is, so what one leads to is never taken for it.
 fn linked(path: &Path) -> bool {
-    plain_type(path).is_some_and(|kind| kind.is_symlink())
+    plain_type(path).is_some_and(|(_, reparse)| reparse)
 }
 
-/// The kind of file `path` is, read as it is ([`fs::symlink_metadata`]); `None` when it cannot be read at all.
-fn plain_type(path: &Path) -> Option<fs::FileType> {
-    fs::symlink_metadata(path).ok().map(|metadata| metadata.file_type())
+/// The kind of file `path` is, read as it is ([`fs::symlink_metadata`]), and whether it is a reparse point
+/// ([`is_reparse_point`]); `None` when it cannot be read at all.
+fn plain_type(path: &Path) -> Option<(fs::FileType, bool)> {
+    fs::symlink_metadata(path).ok().map(|metadata| {
+        let kind = metadata.file_type();
+        (kind, is_reparse_point(kind.is_symlink(), metadata.file_attributes()))
+    })
+}
+
+/// Whether a file read as itself is a reparse point: a link or a junction as `is_symlink` says, or any file whose
+/// `attributes` carry `FILE_ATTRIBUTE_REPARSE_POINT`, as the box judges a folder itself ([`is_folder_itself`]).
+///
+/// [`is_folder_itself`]: crate::boxside::preflight::is_folder_itself
+fn is_reparse_point(is_symlink: bool, attributes: u32) -> bool {
+    is_symlink || attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 /// The reason a link or a junction at `path`, found where the program `exe` would be run from, is left out, in the
@@ -326,12 +378,20 @@ fn read_godot(output: &ProgramOutput) -> Probed {
 }
 
 /// The version a Godot install's standard output `stdout` gives: the leading dot-separated runs of ASCII digits of its
-/// first line, trimmed, as Godot writes it (`4.7.2.stable.mono.official.abc`). Three runs are taken as they are, and
-/// two are given a `.0`, which Godot leaves out of a zero patch (`4.3.stable.mono.official.77dcf97d8` is `4.3.0`).
-/// `None` for any other shape, an output with no line among them.
+/// first line, trimmed, as Godot writes it (`4.7.2.stable.mono.official.abc`), each spelled with no leading zero, the
+/// canonical spelling an install's folder and a run's `GodotVersion` have ([`is_canonical_version`]). Three runs are
+/// taken, and two are given a `.0`, which Godot leaves out of a zero patch (`4.3.stable.mono.official.77dcf97d8` is
+/// `4.3.0`). `None` for any other shape, an output with no line among them.
+///
+/// [`is_canonical_version`]: crate::boxside::payload::is_canonical_version
 fn godot_version(stdout: &str) -> Option<String> {
     let line = stdout.lines().next().unwrap_or("").trim();
-    match godot_leading(line)?.as_slice() {
+    let canonical = |run: &&str| match run.trim_start_matches('0') {
+        "" => "0".to_owned(),
+        digits => digits.to_owned(),
+    };
+    let runs: Vec<String> = godot_leading(line)?.iter().map(canonical).collect();
+    match runs.as_slice() {
         [major, minor] => Some(format!("{major}.{minor}.0")),
         [major, minor, patch] => Some(format!("{major}.{minor}.{patch}")),
         _ => None,
@@ -470,11 +530,53 @@ mod tests {
 
     use super::GODOT;
     use super::{
-        Candidate, Probed, first_version, godot_candidates, godot_gave_no_version, godot_version, late_reason, panic_reason, probe, read_godot,
-        tool_line, version_list, version_of,
+        Candidate, Probed, first_version, godot_candidates, godot_gave_no_version, godot_version, is_reparse_point, late_reason, named_as_found,
+        panic_reason, probe, read_godot, tool_line, version_list, version_of,
     };
     use crate::environment::Variables;
     use crate::remote::git::ProgramOutput;
+
+    /// `FILE_ATTRIBUTE_DIRECTORY`, `FILE_ATTRIBUTE_ARCHIVE` and `FILE_ATTRIBUTE_REPARSE_POINT`.
+    const DIRECTORY: u32 = 0x10;
+    const ARCHIVE: u32 = 0x20;
+    const REPARSE_POINT: u32 = 0x400;
+
+    /// An install's version is spelled with no leading zero in a part, so the one folder name it may have is the
+    /// canonical `x.y.z` a run's `GodotVersion` names: a folder spelled otherwise is left out with its reason.
+    #[test]
+    fn an_install_s_folder_is_named_its_canonical_version() {
+        assert_eq!(godot_version("04.07.2.stable.mono.official.x\n"), Some("4.7.2".to_owned()));
+        assert_eq!(godot_version("4.0.10.stable\n"), Some("4.0.10".to_owned()));
+        assert_eq!(godot_version("4.3.00.stable\n"), Some("4.3.0".to_owned()));
+        let install = |folder: &str| format!(r"C:\godot\{folder}\Godot_console.exe");
+        assert_eq!(
+            named_as_found(&install("4.7.2"), Probed::Version("4.7.2".to_owned())),
+            Probed::Version("4.7.2".to_owned())
+        );
+        for (folder, version) in [("04.7.2", "4.7.2"), ("4.3", "4.3.0"), ("4.7.2", "4.7.10")] {
+            assert_eq!(
+                named_as_found(&install(folder), Probed::Version(version.to_owned())),
+                Probed::Skipped(format!("named {folder} but reports {version}")),
+                "{folder}"
+            );
+        }
+        assert_eq!(
+            named_as_found(&install("4.7.2"), Probed::Missing),
+            Probed::Missing,
+            "no version, nothing to judge"
+        );
+    }
+
+    /// A reparse point that is no link, as an app execution alias or a cloud placeholder is, is refused as a link is.
+    #[test]
+    fn any_reparse_point_is_refused_not_only_a_link() {
+        assert!(is_reparse_point(false, REPARSE_POINT | ARCHIVE), "an app execution alias");
+        assert!(is_reparse_point(false, REPARSE_POINT | DIRECTORY), "a reparse folder that is no junction");
+        assert!(is_reparse_point(true, REPARSE_POINT), "a link");
+        assert!(is_reparse_point(true, 0), "a link as the file type says");
+        assert!(!is_reparse_point(false, ARCHIVE), "a plain file");
+        assert!(!is_reparse_point(false, DIRECTORY), "a plain folder");
+    }
 
     #[test]
     fn the_version_is_the_first_dotted_number_after_an_optional_v() {

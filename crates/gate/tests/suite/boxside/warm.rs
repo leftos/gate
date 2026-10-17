@@ -13,9 +13,9 @@ use serde_json::{Value, json};
 use regex::Regex;
 
 use super::{
-    ENDLESS, Folders, NODE_MODULES_IGNORED, PNPM_LOCKFILE, PNPM_LOCKFILE_PATH, box_call, command_call, field, gate_box, has_ref, install_call,
-    installs, let_go, lines_starting, marks, pair_payload, pair_snapshot, pair_tree, passed, path_for_pnpm, pnpm_box, pnpm_calls, renamed, run_box,
-    run_box_with_seams, snapshot, started_line, stopped_line_for, stub_pnpm,
+    ENDLESS, Folders, NODE_MODULES_IGNORED, PNPM_LOCKFILE, PNPM_LOCKFILE_PATH, box_call, command_call, fake_godot, field, gate_box, godot_root,
+    has_ref, install_call, installs, let_go, lines_starting, marks, pair_payload, pair_snapshot, pair_tree, passed, path_for_pnpm, pnpm_box,
+    pnpm_calls, renamed, run_box, run_box_with_godot, run_box_with_seams, snapshot, started_line, stopped_line_for, stub_pnpm,
 };
 use crate::support::{Case, FAKE_TOOL, GATE, Outcome, box_payload, shown, wait_until, wait_until_closed};
 
@@ -605,6 +605,32 @@ fn box_run_refuses_a_warm_up_that_asks_for_outputs() {
     payload["Outputs"] = json!(["bin/**"]);
 
     refused_before_the_lock(&case, payload, "gate: box payload asks a warm-up for outputs");
+}
+
+/// A warm-up's `GodotVersion` is taken, and its Godot console word runs the install of that version, `GODOT_PATH`
+/// naming it, as a run's does.
+#[test]
+fn box_warm_up_runs_the_godot_install_of_its_godot_version() {
+    let case = Case::new("box_warm_godot");
+    let root = godot_root(&case);
+    fake_godot(&root.join("4.3.0"), "4.3.stable.mono.official.y\n");
+    fake_godot(&root.join("4.7.2"), "4.7.2.stable.mono.official.x\n");
+    let mut payload = warm_payload(&case, &[&["Godot_console.exe", "--version", "env", "GODOT_PATH"]]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    payload["GodotVersion"] = json!("4.7.2");
+
+    let outcome = run_box_with_godot(&case, &payload, Some(&root), &[], None);
+
+    let install = root.join("4.7.2").join("Godot_console.exe");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout,
+        format!("4.7.2.stable.mono.official.x\n{}\n", install.display()),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr.lines().last(), Some(warm_said().as_str()), "{outcome:?}");
+    assert!(!root.join("4.3.0").join("ran").exists(), "the other install ran");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 
 #[test]

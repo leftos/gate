@@ -127,6 +127,28 @@ fn the_interrupt_after_fallback_seam_is_a_switch() {
     );
 }
 
+/// The seams of the key wait: its bound is a whole number above zero, and the raise before the take is a switch of its
+/// own, off unless given.
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_key_wait_seams_parse() {
+    use crate::support::run_request;
+
+    let words = with(&RUN, &["--test-key-wait-ms", "91", "--test-interrupt-before-key", "--", "cmd"]);
+    let seams = run_request(&refs(&words)).test_seams;
+    assert_eq!(seams.key_wait_ms, Some(91));
+    assert!(seams.interrupt_before_key);
+    assert!(!seams.interrupt_queued, "it is its own switch");
+    assert!(
+        !run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams.interrupt_before_key,
+        "off unless given"
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-key-wait-ms", "0", "--", "cmd"]))),
+        ["gate: --test-key-wait-ms must be a whole number above 0, got '0'"]
+    );
+}
+
 #[cfg(feature = "test-seams")]
 #[test]
 fn the_diagnostics_budget_seam_is_read_once_and_refuses_zero() {

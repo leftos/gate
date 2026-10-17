@@ -24,8 +24,8 @@ use sha2::{Digest, Sha256};
 use crate::durations::seed;
 use crate::support::{
     ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Junction, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running,
-    STEPS_VARIABLE, allow_breakaway, beside, build_version, calls, copy_tool, events, finish, git, git_init, heavy_words, nothing_back, release,
-    shown, ssh_steps, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
+    STEPS_VARIABLE, allow_breakaway, assert_in_order, beside, build_version, calls, copy_tool, events, finish, git, git_init, heavy_words,
+    nothing_back, release, shown, ssh_steps, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
 };
 
 const HOST: &str = "builder";
@@ -599,6 +599,88 @@ fn a_routed_run_runs_on_the_box_and_passes_its_output_and_status() {
     assert!(log.contains(&format!("gate: pushed snapshot {} in ", &snapshot[..8])), "{log}");
 }
 
+/// A routed run's `--env` pairs travel in the run call's `Env`: the command on the box sees the value the PC gave, a
+/// variable the box's own environment does not hold.
+#[test]
+fn a_routed_run_sends_its_env_pairs() {
+    let case = client_case("client-env");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--env", "ZZ_GATE_ENV_SENT=from the PC", "--env", "ZZ_GATE_ENV_EMPTY="],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(
+        &case,
+        "out.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "env", "ZZ_GATE_ENV_SENT"],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert!(outcome.stdout.lines().any(|line| line == "from the PC"), "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
+}
+
+/// A forwarded `--env NAME`: the box's command sees the value the PC's environment held, and no line of the gate's or
+/// the journal says it.
+#[test]
+fn a_routed_run_sends_a_forwarded_env_pair() {
+    let case = client_case("client-env-forwarded");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--env", "ZZ_GATE_ENV_FORWARDED"],
+        ..Tuned::default()
+    };
+    let mut gate = client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "env", "ZZ_GATE_ENV_FORWARDED"]);
+    gate.env("ZZ_GATE_ENV_FORWARDED", "from the caller's environment");
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert!(
+        outcome.stdout.lines().any(|line| line == "from the caller's environment"),
+        "the command on the box sees the value: {outcome:?}"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
+    assert!(
+        !outcome
+            .stderr
+            .lines()
+            .any(|line| line.starts_with("gate: ") && line.contains("from the caller's environment")),
+        "no line of the gate's says the value: {outcome:?}"
+    );
+    let journal = fs::read_to_string(case.root().join("events.jsonl")).expect("the journal was written");
+    assert!(
+        !journal.contains("from the caller's environment"),
+        "the journal holds no value: {journal}"
+    );
+}
+
+/// The builder's command gets the gate's `UseSharedCompilation=false`, whatever the PC's own environment holds
+/// (GATE-383): a command that waits for every process in its job never ends while the run's own compiler server idles in
+/// it.
+#[test]
+fn a_routed_run_gives_the_builder_s_command_shared_compilation_off() {
+    let case = client_case("client-shared-compilation");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(&case, "out.log", &steps, &[r".\tool.exe", "env", "UseSharedCompilation"]);
+    gate.env("UseSharedCompilation", "true");
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "the run went to the builder: {outcome:?}");
+    assert!(
+        outcome.stdout.lines().any(|line| line == "false"),
+        "the builder's command read the gate's value, not the PC's `true`: {outcome:?}"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
+}
+
 /// The most git processes the simple pass below starts, on the PC and the box together, children of git counted.
 const SIMPLE_PASS_GIT_STARTS: usize = 30;
 
@@ -802,20 +884,41 @@ fn a_routed_run_past_3x_its_usual_p90_is_hinted_once() {
     assert!(events.iter().all(|event| event["remote"] == true), "every run was routed: {events:#?}");
 }
 
+/// The first line of a routed run waiting for its worktree's work folder: the slot wait's line for the key mutex.
+const KEY_WAITING: &str = "gate: waiting for this worktree's work folder on builder, which another of its runs holds";
+/// The line a routed run says when a Ctrl+C ends its wait for the work folder.
+const KEY_INTERRUPTED: &str = "gate: interrupted while waiting for this worktree's work folder on builder";
+
 #[test]
-fn a_second_routed_run_of_one_worktree_falls_back_busy_at_once() {
-    // One slot, which the first run holds: the second finds the key's lock taken before it would wait for the slot.
+fn a_second_routed_run_of_one_worktree_falls_back_busy_past_the_bound() {
+    // One slot, which the first run holds: the second waits for the key's lock up to a bound this run crosses at once,
+    // then falls back as it did before there was a wait. The holder ran the command once, so its claim carries no usual
+    // run time and the wait's first line names none.
     let case = client_case_of("client-busy", 1);
     let go = Go(case.folder().join("ssh").join("go"));
     let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
     let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
     first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "100"],
+        ..Tuned::default()
+    };
 
-    let (pid, second) = finish_with_pid(client_gate(&case, "second.log", &second_steps, &[r".\tool.exe", "out", "ran here"]));
+    let (pid, second) = finish_with_pid(client_gate_tuned(
+        &case,
+        "second.log",
+        &second_steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran here"],
+    ));
 
     assert_eq!(second.code, Some(0), "{second:?}");
-    assert!(second.stderr.contains(BUSY_LINE), "{second:?}");
+    assert_in_order(&second.stderr, &[KEY_WAITING, BUSY_LINE]);
+    assert!(
+        second.stderr.lines().any(|line| line == KEY_WAITING),
+        "a holder with no usual run time leaves the line without a time left: {second:?}"
+    );
     assert!(second.stdout.contains("ran here"), "it ran here: {second:?}");
     assert_eq!(calls(&second_steps), Vec::<String>::new(), "the second run made no ssh call");
     assert_eq!(fallbacks(&own(&case, pid)), ["busy"]);
@@ -824,6 +927,247 @@ fn a_second_routed_run_of_one_worktree_falls_back_busy_at_once() {
     assert_eq!(first.code, Some(0), "{first:?}");
     assert!(first.stdout.contains("ran there"), "{first:?}");
     assert_eq!(calls(&first_steps), ["preflight", "run"]);
+}
+
+#[test]
+fn a_second_routed_run_of_one_worktree_waits_for_its_holder_and_routes() {
+    // The bound is far longer than the wait: once the first run lets the key go, the second takes it and routes.
+    let case = client_case_of("client-key-waits", 1);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "600000", "--test-remote-wait-ms", "3600000"],
+        ..Tuned::default()
+    };
+    let second = start(client_gate_tuned(
+        &case,
+        "second.log",
+        &second_steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+    let pid = second.id();
+    second.wait_for_stderr(KEY_WAITING);
+
+    fs::write(go.path(), "").expect("the go file can be made");
+    let first = first.finish();
+    let second = second.finish();
+
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert!(
+        !second.stderr.contains(BUSY_LINE),
+        "the wait outlived the holder, so it did not fall back: {second:?}"
+    );
+    assert!(second.stdout.contains("ran here"), "it ran there: {second:?}");
+    assert_eq!(calls(&second_steps), ["preflight", "run"]);
+    assert_eq!(fallbacks(&own(&case, pid)), Vec::<&str>::new(), "the second run fell back for nothing");
+}
+
+#[test]
+fn a_second_routed_run_of_one_worktree_says_the_holders_time_left() {
+    // Five runs file the command's duration and `seed` makes its usual 600 s, so the holder's remote claim carries that
+    // expected time and the wait's line says what is left of it.
+    let case = client_case_of("client-key-eta", 1);
+    let steps = ssh_steps(&case, "seed", &["ok"; 12]);
+    let command = [r".\tool.exe", "out", "ran"];
+    for _ in 0..5 {
+        let outcome = finish(client_gate(&case, "history.log", &steps, &command));
+        assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    }
+    seed(&case, " out ran", 600.0, None);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &command));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "600000", "--test-remote-wait-ms", "3600000"],
+        ..Tuned::default()
+    };
+    let second = start(client_gate_tuned(&case, "second.log", &second_steps, &tuned, &command));
+    let left = Regex::new(r" \(about (\d+) (s|min) left\)$").expect("the pattern is valid");
+    let said = second.wait_for_stderr_where("the key wait's line with the time left", |stderr| {
+        stderr.lines().any(|line| line.starts_with(KEY_WAITING) && left.is_match(line))
+    });
+
+    let line = said
+        .lines()
+        .find(|line| line.starts_with(KEY_WAITING))
+        .expect("the key wait's line was said");
+    let found = left.captures(line).expect("the line says the holder's time left");
+    let figure: u64 = found[1].parse().expect("the time left is a whole number");
+    let seconds = if &found[2] == "min" { figure * 60 } else { figure };
+    assert!((1..=600).contains(&seconds), "what is left of the holder's seeded usual 600 s: {line:?}");
+    fs::write(go.path(), "").expect("the go file can be made");
+    let first = first.finish();
+    let second = second.finish();
+    assert_eq!((first.code, second.code), (Some(0), Some(0)), "{first:?}\n{second:?}");
+}
+
+#[test]
+fn a_second_routed_run_of_one_worktree_says_it_still_waits() {
+    let case = client_case_of("client-key-still-waits", 1);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &[
+            "--test-key-wait-ms",
+            "600000",
+            "--test-heartbeat-ms",
+            "50",
+            "--test-remote-wait-ms",
+            "3600000",
+        ],
+        ..Tuned::default()
+    };
+    let second = start(client_gate_tuned(
+        &case,
+        "second.log",
+        &second_steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+    let pid = second.id();
+    second.wait_for_stderr(KEY_WAITING);
+    second.wait_for_stderr("gate: still waiting for this worktree's work folder on builder (");
+
+    fs::write(go.path(), "").expect("the go file can be made");
+    let first = first.finish();
+    let second = second.finish();
+
+    assert_eq!((first.code, second.code), (Some(0), Some(0)), "{first:?}\n{second:?}");
+    assert!(!second.stderr.contains(BUSY_LINE), "{second:?}");
+    assert_eq!(calls(&second_steps), ["preflight", "run"]);
+    assert_eq!(fallbacks(&own(&case, pid)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_ctrl_c_while_waiting_for_the_work_folder_abandons_the_wait() {
+    let case = client_case_of("client-key-ctrl-c", 1);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    // The seam raises the console interrupt once the gate has said it waits, the key wait's line included.
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "3600000", "--test-interrupt-queued"],
+        ..Tuned::default()
+    };
+    let second = start(client_gate_tuned(
+        &case,
+        "second.log",
+        &second_steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+    let pid = second.id();
+    let outcome = second.finish();
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert_in_order(&outcome.stderr, &[KEY_WAITING, KEY_INTERRUPTED]);
+    let own = own(&case, pid);
+    let names: Vec<&str> = own.iter().map(|event| event["event"].as_str().expect("an event has a name")).collect();
+    assert_eq!(names, ["queue", "abandon"], "{own:#?}");
+    assert!(own.iter().all(|event| event["remote"] == true), "{own:#?}");
+    assert!(own[1]["waitedSeconds"].is_number(), "{own:#?}");
+    assert_eq!(calls(&second_steps), Vec::<String>::new(), "the second run made no ssh call");
+    fs::write(go.path(), "").expect("the go file can be made");
+    assert_eq!(first.finish().code, Some(0));
+}
+
+#[test]
+fn a_ctrl_c_already_raised_at_the_key_take_abandons_before_busy() {
+    let case = client_case_of("client-key-ctrl-c-before", 1);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    // The seam raises the console interrupt before the zero-wait take, which reads the taken lock as busy: the run must
+    // end as an interrupted key wait, not fall back `busy`, and without a waiting line it never said.
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "3600000", "--test-interrupt-before-key"],
+        ..Tuned::default()
+    };
+    let second = start(client_gate_tuned(
+        &case,
+        "second.log",
+        &second_steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+    let pid = second.id();
+    let outcome = second.finish();
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert!(outcome.stderr.contains(KEY_INTERRUPTED), "{outcome:?}");
+    assert!(!outcome.stderr.contains(KEY_WAITING), "it never waited: {outcome:?}");
+    assert!(!outcome.stderr.contains(BUSY_LINE), "an interrupt is not a busy fallback: {outcome:?}");
+    let own = own(&case, pid);
+    let names: Vec<&str> = own.iter().map(|event| event["event"].as_str().expect("an event has a name")).collect();
+    assert_eq!(names, ["queue", "abandon"], "{own:#?}");
+    assert!(own.iter().all(|event| event["remote"] == true), "{own:#?}");
+    assert_eq!(calls(&second_steps), Vec::<String>::new(), "the second run made no ssh call");
+    fs::write(go.path(), "").expect("the go file can be made");
+    assert_eq!(first.finish().code, Some(0));
+}
+
+#[test]
+fn a_routed_run_behind_a_warm_up_falls_back_busy_without_waiting() {
+    // A work folder with no warm-up consent of its own is warmed by a warm-up the route never probes the lock for, and
+    // the run reaches the key with a warm-up holding it. The warm-up lock is held here as a warm-up holds it, and the
+    // run falls back at once rather than wait a warm-up out.
+    let case = client_case_of("client-warm-holder", 1);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let lock = gate_state::v1::warm_lock_path(&case.root(), &key_of(&events(&case)));
+    fs::create_dir_all(lock.parent().expect("the lock has a folder")).expect("the warm-up folder can be made");
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(&lock)
+        .expect("the warm-up lock can be held");
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "3600000"],
+        ..Tuned::default()
+    };
+
+    let (pid, second) = finish_with_pid(client_gate_tuned(
+        &case,
+        "second.log",
+        &second_steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+
+    drop(held);
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert!(
+        !second
+            .stderr
+            .lines()
+            .any(|line| line.starts_with("gate: waiting for this worktree's work folder")),
+        "a warm-up's work folder is not waited for: {second:?}"
+    );
+    assert!(second.stderr.contains(BUSY_LINE), "{second:?}");
+    assert_eq!(calls(&second_steps), Vec::<String>::new(), "the second run made no ssh call");
+    assert_eq!(fallbacks(&own(&case, pid)), ["busy"]);
+    fs::write(go.path(), "").expect("the go file can be made");
+    assert_eq!(first.finish().code, Some(0));
 }
 
 /// The running stand-in whose parent is the gate `pid`, with its start, once there is exactly one.
@@ -2545,7 +2889,7 @@ fn a_repo_pinning_a_godot_the_builder_has_routes() {
 fn a_repo_pinning_a_godot_the_builder_lacks_runs_here_saying_the_mismatch() {
     let case = client_case("client-godot-lacking");
     write(&case, "src/App/Game.csproj", &godot_csproj("4.7.2"));
-    let root = godot_root(&case, &[("4.3", "4.3.stable.mono.official.y\n")]);
+    let root = godot_root(&case, &[("4.3.0", "4.3.stable.mono.official.y\n")]);
     let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &[]);
 
     a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "godot 4.7.2 exactly", "4.3.0")], Some(&root));
@@ -6220,4 +6564,154 @@ fn an_interrupted_install_caches_nothing() {
     );
     let cache = fs::read_to_string(hashes_file(&case)).map_or(Value::Null, |text| serde_json::from_str(&text).expect("the hash cache is JSON"));
     assert!(cache["files"].get("bin/a.txt").is_none(), "an interrupted install keeps no hash: {cache}");
+}
+
+/// A routed run of `command` in a case whose builder's `GATE_GODOT_ROOT` is `root`, with no `GODOT_PATH` of its own: it
+/// goes remote with no parity line and runs once, on the builder, and passes.
+fn a_routed_godot_run(case: &Case, root: &Path, command: &[&str]) -> Outcome {
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({ "host": HOST, "slots": 2, "repos": { &repo: ["*tool*", "Godot_console*"] }, "outputs": { &repo: [] } });
+    write_remote_json(case, &routing.to_string());
+    let box_path = box_path_with_tools(case, &listing(&[BUILDER_SDK]), &[], &[]);
+    let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
+    let mut words = command.to_vec();
+    words.extend(["mark", RAN]);
+    let mut gate = client_gate(case, "out.log", &steps, &words);
+    gate.env("PATH", box_path)
+        .env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING)
+        .env_remove("GODOT_PATH");
+    set_godot_root(&mut gate, Some(root));
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.lines().any(is_parity_line), "{outcome:?}");
+    assert_eq!(fallbacks(&own(case, pid)), Vec::<&str>::new(), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert_eq!(runs(case), (0, 1), "the command ran once, on the builder: {outcome:?}");
+    outcome
+}
+
+/// The Godot command a routed case runs: the install's answer, then the `GODOT_PATH` the command sees.
+const GODOT_COMMAND: [&str; 4] = ["Godot_console.exe", "--version", "env", "GODOT_PATH"];
+
+/// Whether the routed run's output holds the answer of the install `version` of `root` and a `GODOT_PATH` naming it.
+fn ran_the_install(outcome: &Outcome, root: &Path, version: &str) -> bool {
+    let install = root.join(version).join("Godot_console.exe").display().to_string();
+    let answer = format!("{version}.stable.mono.official.x");
+    let lines: Vec<&str> = outcome.stdout.lines().collect();
+    lines.contains(&answer.as_str()) && lines.contains(&install.as_str())
+}
+
+/// A routed Godot run of a repo pinning a version the builder has sends it, and the builder runs that install.
+#[test]
+fn a_routed_godot_run_sends_the_installed_version_its_repo_pins() {
+    let case = client_case("client-godot-version-sent");
+    write(&case, "src/App/Game.csproj", &godot_csproj("4.7.2"));
+    let root = godot_root(
+        &case,
+        &[("4.3.0", "4.3.0.stable.mono.official.x\n"), ("4.7.2", "4.7.2.stable.mono.official.x\n")],
+    );
+
+    let outcome = a_routed_godot_run(&case, &root, &GODOT_COMMAND);
+
+    assert!(ran_the_install(&outcome, &root, "4.7.2"), "{outcome:?}");
+}
+
+/// A partial pin picks the highest install of the builder that meets it.
+#[test]
+fn a_routed_godot_run_of_a_partial_pin_picks_the_highest_matching_install() {
+    let case = client_case("client-godot-partial-pin");
+    write(&case, MANIFEST, "[tools]\ngodot = \"4.7\"\n");
+    let root = godot_root(
+        &case,
+        &[
+            ("4.7.1", "4.7.1.stable.mono.official.x\n"),
+            ("4.7.2", "4.7.2.stable.mono.official.x\n"),
+            ("4.8.0", "4.8.0.stable.mono.official.x\n"),
+        ],
+    );
+
+    let outcome = a_routed_godot_run(&case, &root, &GODOT_COMMAND);
+
+    assert!(ran_the_install(&outcome, &root, "4.7.2"), "{outcome:?}");
+}
+
+/// A case whose project files pin the differing Godot versions 4.7.2 and 4.3.0, and the root of a builder that has both.
+fn several_pins_case(name: &str) -> (Case, PathBuf) {
+    let case = client_case(name);
+    write(&case, "src/A/Game.csproj", &godot_csproj("4.7.2"));
+    write(&case, "src/B/Tool.csproj", &godot_csproj("4.3.0"));
+    let root = godot_root(
+        &case,
+        &[("4.3.0", "4.3.0.stable.mono.official.x\n"), ("4.7.2", "4.7.2.stable.mono.official.x\n")],
+    );
+    (case, root)
+}
+
+/// A Godot command of a repo whose project files pin several differing Godot versions runs here, saying why before the
+/// parity line, on the console and in the log, though the builder has both.
+#[test]
+fn a_godot_run_of_a_repo_pinning_several_godot_versions_falls_back_saying_why() {
+    let (case, root) = several_pins_case("client-godot-several-pins");
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({ "host": HOST, "slots": 2, "repos": { &repo: ["Godot_console*"] }, "outputs": { &repo: [] } });
+    write_remote_json(&case, &routing.to_string());
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &[]);
+    let mut local_path = OsString::from(root.join("4.7.2"));
+    local_path.push(";");
+    local_path.push(&box_path);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(&case, "out.log", &steps, &["Godot_console.exe", "--version", "mark", RAN]);
+    gate.env("PATH", &local_path)
+        .env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING)
+        .env_remove("GODOT_PATH");
+    set_godot_root(&mut gate, Some(&root));
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    let why = "gate: the repo pins several Godot versions (4.7.2, 4.3.0); a routed run needs one";
+    assert_eq!(outcome.code, Some(0), "the run here passed: {outcome:?}");
+    assert_eq!(fallbacks(&own(&case, pid)), ["parity"], "{outcome:?}");
+    let said: Vec<&str> = outcome.stderr.lines().filter(|line| *line == why || is_parity_line(line)).collect();
+    assert_eq!(said, [why, PARITY_LINE], "{outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(log.lines().any(|line| line == why), "{log}");
+    assert_eq!(calls(&steps), ["preflight"], "the preflight alone reached the builder");
+    assert_eq!(runs(&case), (1, 0), "the command ran once, here: {outcome:?}");
+}
+
+/// Any other command of a repo pinning several differing Godot versions routes as it would with no pin, sending no
+/// version: the builder's command sees no `GODOT_PATH`.
+#[test]
+fn another_command_of_a_repo_pinning_several_godot_versions_routes_with_no_version() {
+    let (case, root) = several_pins_case("client-godot-several-pins-other");
+
+    let outcome = a_routed_godot_run(&case, &root, &[r".\tool.exe", "env", "GODOT_PATH"]);
+
+    assert!(
+        outcome.stdout.lines().any(|line| line == "fake-tool: GODOT_PATH is not set"),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("several Godot versions"), "{outcome:?}");
+}
+
+/// A repo requiring any Godot, or pinning none, sends no version: the builder's command sees no `GODOT_PATH`.
+#[test]
+fn a_routed_run_of_any_godot_or_no_pin_sends_no_version() {
+    for (name, file, text) in [
+        ("client-godot-any", MANIFEST, "[tools]\ngodot = \"\"\n"),
+        ("client-godot-no-pin", "src/App/App.csproj", "<Project />\n"),
+    ] {
+        let case = client_case(name);
+        write(&case, file, text);
+        let root = godot_root(&case, &[("4.7.2", "4.7.2.stable.mono.official.x\n")]);
+
+        let outcome = a_routed_godot_run(&case, &root, &[r".\tool.exe", "env", "GODOT_PATH"]);
+
+        assert!(
+            outcome.stdout.lines().any(|line| line == "fake-tool: GODOT_PATH is not set"),
+            "{name}: {outcome:?}"
+        );
+    }
 }

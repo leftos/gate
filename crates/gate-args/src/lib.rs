@@ -27,7 +27,7 @@ use std::ffi::OsString;
 pub use batch::{BatchRefusal, batch_command_line, batch_refusal, is_batch_target, quote_batch_arg, quote_batch_arg_str};
 pub use cmdline::{command_line, command_text, quote_arg, quote_arg_str};
 pub use problem::{MAX_WHOLE_NUMBER, Problem, Required, Spelling};
-pub use program::{ProgramSearch, resolve_program};
+pub use program::{ProgramSearch, is_godot_console, resolve_program};
 pub use request::WarmRequest;
 pub use request::{
     BoxRequest, BoxSeams, BoxVerb, BurnRequest, Ceiling, CheckRequest, CheckSeams, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS,

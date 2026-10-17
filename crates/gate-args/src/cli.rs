@@ -26,7 +26,7 @@ pub(crate) fn parse_expect(words: impl Iterator<Item = OsString>) -> Result<Expe
 /// is no `--`. A word before it that is not an option is a problem.
 fn read_until_command(builder: &mut RunBuilder, words: impl Iterator<Item = OsString>, lookup: fn(&str) -> Option<RunOption>) -> Vec<OsString> {
     let mut words = words.peekable();
-    while let Some(text) = next_text(&mut words, &mut builder.problems) {
+    while let Some(text) = next_text(&mut words, builder) {
         if text == "--" {
             return words.collect();
         }
@@ -45,7 +45,7 @@ pub(crate) fn parse_stop_tree(words: impl Iterator<Item = OsString>) -> Result<S
     let mut builder = RunBuilder::default();
     let mut positional = Vec::new();
     let mut options_ended = false;
-    while let Some(text) = next_text(&mut words, &mut builder.problems) {
+    while let Some(text) = next_text(&mut words, &mut builder) {
         if options_ended || !text.starts_with('-') {
             positional.push(text);
         } else if text == "--" {
@@ -65,7 +65,7 @@ pub(crate) fn parse_stop_tree(words: impl Iterator<Item = OsString>) -> Result<S
 pub(crate) fn parse_cutover(words: impl Iterator<Item = OsString>) -> Result<CutoverRequest, Vec<Problem>> {
     let mut words = words.peekable();
     let mut builder = RunBuilder::default();
-    while let Some(text) = next_text(&mut words, &mut builder.problems) {
+    while let Some(text) = next_text(&mut words, &mut builder) {
         if text.starts_with('-') && text != "--" {
             read_option(&mut builder, &mut words, &text, cutover_option);
         } else {
@@ -80,7 +80,7 @@ pub(crate) fn parse_cutover(words: impl Iterator<Item = OsString>) -> Result<Cut
 pub(crate) fn parse_push(words: impl Iterator<Item = OsString>) -> Result<PushRequest, Vec<Problem>> {
     let mut words = words.peekable();
     let mut builder = RunBuilder::default();
-    while let Some(text) = next_text(&mut words, &mut builder.problems) {
+    while let Some(text) = next_text(&mut words, &mut builder) {
         if text.starts_with('-') && text != "--" {
             read_option(&mut builder, &mut words, &text, push_option);
         } else {
@@ -95,7 +95,7 @@ pub(crate) fn parse_push(words: impl Iterator<Item = OsString>) -> Result<PushRe
 pub(crate) fn parse_check(words: impl Iterator<Item = OsString>) -> Result<CheckRequest, Vec<Problem>> {
     let mut words = words.peekable();
     let mut builder = RunBuilder::default();
-    while let Some(text) = next_text(&mut words, &mut builder.problems) {
+    while let Some(text) = next_text(&mut words, &mut builder) {
         if text.starts_with('-') && text != "--" {
             read_option(&mut builder, &mut words, &text, check_option);
         } else {
@@ -110,7 +110,7 @@ pub(crate) fn parse_check(words: impl Iterator<Item = OsString>) -> Result<Check
 pub(crate) fn parse_warm(words: impl Iterator<Item = OsString>) -> Result<WarmRequest, Vec<Problem>> {
     let mut words = words.peekable();
     let mut builder = RunBuilder::default();
-    while let Some(text) = next_text(&mut words, &mut builder.problems) {
+    while let Some(text) = next_text(&mut words, &mut builder) {
         if text.starts_with('-') && text != "--" {
             read_option(&mut builder, &mut words, &text, warm_option);
         } else {
@@ -124,7 +124,7 @@ pub(crate) fn parse_warm(words: impl Iterator<Item = OsString>) -> Result<WarmRe
 pub(crate) fn parse_burn(words: impl Iterator<Item = OsString>) -> Result<BurnRequest, Vec<Problem>> {
     let mut words = words.peekable();
     let mut builder = RunBuilder::default();
-    while let Some(text) = next_text(&mut words, &mut builder.problems) {
+    while let Some(text) = next_text(&mut words, &mut builder) {
         if text.starts_with('-') && text != "--" {
             read_option(&mut builder, &mut words, &text, burn_option);
         } else {
@@ -163,6 +163,7 @@ fn run_option(name: &str) -> Option<RunOption> {
         "state-dir" => RunOption::Value(ValueOption::StateDir),
         "cd" => RunOption::Value(ValueOption::Cd),
         "bring-tracked" => RunOption::Value(ValueOption::BringTracked),
+        "env" => RunOption::Value(ValueOption::Env),
         "no-markers" => RunOption::Switch(SwitchOption::NoMarkers),
         "local" => RunOption::Switch(SwitchOption::Local),
         _ => return seam_option(name),
@@ -284,6 +285,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-interrupt-after-samples" => Some(RunOption::Value(ValueOption::InterruptAfterSamples)),
         "test-print-request" => Some(RunOption::Switch(SwitchOption::PrintRequest)),
         "test-interrupt-queued" => Some(RunOption::Switch(SwitchOption::InterruptQueued)),
+        "test-interrupt-before-key" => Some(RunOption::Switch(SwitchOption::InterruptBeforeKey)),
         "test-interrupt-queued-after-fallback" => Some(RunOption::Switch(SwitchOption::InterruptAfterFallback)),
         "test-sampler-fail" => Some(RunOption::Switch(SwitchOption::SamplerFail)),
         "test-own-start-fails" => Some(RunOption::Switch(SwitchOption::OwnStartFails)),
@@ -292,6 +294,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-job-breakaway" => Some(RunOption::Switch(SwitchOption::JobBreakaway)),
         "test-remote-client" => Some(RunOption::Value(ValueOption::RemoteClient)),
         "test-remote-wait-ms" => Some(RunOption::Value(ValueOption::RemoteWaitMs)),
+        "test-key-wait-ms" => Some(RunOption::Value(ValueOption::KeyWaitMs)),
         "test-git-limit-ms" => Some(RunOption::Value(ValueOption::GitLimitMs)),
         "test-git-drain-ms" => Some(RunOption::Value(ValueOption::GitDrainMs)),
         "test-beside-claim-wait" => Some(RunOption::Value(ValueOption::BesideClaimWait)),

@@ -82,6 +82,7 @@ The watchdog samples the command and kills its job on a stall, at the ceiling an
 | `--state-dir <path>` | none | Use another [state root](#state-root); a relative path is read against the caller's working directory, before `--cd`. | ruling |
 | `--cd <folder>` | `-Cd` | Run the command in `<folder>` and route from it ([Run folder](#run-folder)). | ruling (GATE-323) |
 | `--bring-tracked <glob>` | none | A routed run's fetched output that git tracks and `<glob>` matches is installed rather than skipped (Outputs install, "Tracked members"); repeatable, and the one option that is not refused when given twice. The launcher's PowerShell form (`-Log …`) does not take it: use the `gate run` form. | ruling |
+| `--env NAME[=value]` | `-Env` | Sets `NAME` for the command, local or routed ([Command environment](#command-environment)); without `=value`, forwards `NAME`'s value from the gate's own environment, the form for secrets. Repeatable. | ruling (GATE-362) |
 
 The words after `--` reach the command exactly as the caller passed them ([Command launching](#command-launching)).
 
@@ -89,7 +90,27 @@ The words after `--` reach the command exactly as the caller passed them ([Comma
 
 `--cd <folder>` (a relative folder is read against the caller's working directory) makes the gate enter `<folder>` once, after `--log` and `--state-dir` are made absolute against the caller's folder and before any slot is taken. From then on `<folder>` is the folder the gate was started in: [routing](#routing) reads its worktree, the command's working folder and program lookup, a fallback's local run, and the journal's and claim's `cwd` all take it. A relative `--log` or `--state-dir` stays the caller's.
 
-It is how a caller in a main checkout gates a command that names another worktree's files: `--cd <worktree>` routes the run as if the gate had been started there. Given twice it is refused (`gate: --cd is given twice`). `gate expect` and `gate check` do not take it (unknown option). The compatibility layer reads it as `-Cd`, which is the one new option it takes (the launcher's callers need it); the frozen PowerShell gate refuses `-Cd`. Nothing is said on success.
+It is how a caller in a main checkout gates a command that names another worktree's files: `--cd <worktree>` routes the run as if the gate had been started there. Given twice it is refused (`gate: --cd is given twice`). `gate expect` and `gate check` do not take it (unknown option). The compatibility layer reads it as `-Cd`, one of the two new options it takes (the launcher's callers need it); the frozen PowerShell gate refuses `-Cd`. Nothing is said on success.
+
+#### Command environment
+
+`--env NAME=value` sets `NAME` in the command's environment over the gate's own; the written value is on the gate's command line. `--env NAME` is the bare form: the value is `NAME`'s in the gate's own environment, so a secret stays off the command line. It is repeatable and means the same on a local run and a routed one. The compatibility layer reads it as `-Env`, in the same two forms, and `-Env` is the other new option it takes.
+
+A name is one or more printable ASCII characters, U+0021 to U+007E, `=` excepted. ASCII only keeps the ASCII-case check of the refused names below equal to Windows' own comparison of names, so a name that is not ASCII can never pass that check and then be read as one the gate protects. A value may hold anything but NUL (CR and LF included) and may be empty.
+
+The gate refuses a name it sets itself (the build-server settings, `UseSharedCompilation`, `GATE_SLOT_HELD`, `GATE_STATE_DIR` and the rest listed under [Command launching](#command-launching) and [The box side](#the-box-side)), any `GATE_` name, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG` and the machine paths the box keeps (`GODOT_PATH` among them, which a routed run sets itself), the same on both sides so one `--env` means the same on the PC and on a builder.
+
+It also refuses a name given twice in any ASCII case, and more than 64 names or 32 KiB of names and values together. The gate's own settings are applied after the caller's pairs, so no pair undoes one.
+
+Refusals are exit 2 on stderr before any slot. `{n}` is the word's 1-based place among every `--env` word given, an empty one included; a word whose name is malformed, that is not Unicode, or that names a variable to forward the gate's environment lacks, is never echoed, since it may be a secret pasted without its name.
+
+- `gate: --env word {n} has a malformed name`, `gate: --env word {n} is not valid Unicode`, `gate: --env word {n} names a variable to forward, and it is not set` and `gate: --env word {n} names a variable whose value is not Unicode`.
+- `gate: --env sets {name}, which the gate sets itself`, `gate: --env sets {name}, which git would read over the gate's own git settings`, `gate: --env sets {name}: GATE_ names are the gate's` and `gate: --env sets {name}, a machine path the gate keeps for the command`.
+- `gate: --env gives {name} a value holding NUL`, `gate: --env names {name} twice` and `gate: --env is over its cap of 64 names or 32 KiB`.
+
+A routed run sends the pairs as the payload's `Env` ([The box side](#the-box-side)), in the payload on the ssh call's stdin and nowhere else: no output line, the journal or ops-tower state shows a value. A warm-up sends none.
+
+A routed run does not send the rest of the gate's environment: when it holds a variable a repo's builds read (`NuGetAudit`, `RUSTFLAGS`, `RUSTDOCFLAGS`, and the `NUGET_`, `MSBUILD`, `CARGO_BUILD_` and `CARGO_PROFILE_` families) that no `--env` names and the gate does not set itself, the route says so after its other lines: `gate: a routed run does not send the caller's <names>; --env NAME sends it`.
 
 ### `gate stop-tree`
 
@@ -400,9 +421,9 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 
 `gate.exe` also accepts the PowerShell gate's argument form, so the cutover breaks no caller:
 
-`gate -Log <path> -TimeoutSeconds <n> -Slot heavy|light|critical|none [-StallSeconds <n>] [-Tail <n>] [-NoMarkers] [-Local] [-Cd <folder>] -- <command>` and `gate -StopTree <pid>`.
+`gate -Log <path> -TimeoutSeconds <n> -Slot heavy|light|critical|none [-StallSeconds <n>] [-Tail <n>] [-NoMarkers] [-Local] [-Cd <folder>] [-Env NAME[=value]] -- <command>` and `gate -StopTree <pid>`.
 
-- It accepts exactly the options `-Log`, `-TimeoutSeconds`, `-Slot`, `-StallSeconds`, `-Tail`, `-NoMarkers`, `-Local`, `-Cd` and `-StopTree`, compared case-insensitively, and maps each to the flag in the table above (`-StopTree <pid>` to `gate stop-tree <pid>`).
+- It accepts exactly the options `-Log`, `-TimeoutSeconds`, `-Slot`, `-StallSeconds`, `-Tail`, `-NoMarkers`, `-Local`, `-Cd`, `-Env` and `-StopTree`, compared case-insensitively, and maps each to the flag in the table above (`-StopTree <pid>` to `gate stop-tree <pid>`).
 
   Any other option, or a new-CLI flag in the old form (`-StateDir`, `--state-dir`, `--slot`), is a usage error (exit 2). `-TimeoutSeconds` refuses `auto:<n>`: `gate: -TimeoutSeconds must be a whole number above 0, got 'auto:900'`. The one exception is the hidden `--test-print-request` of a `test-seams` build ([Black-box suite harness](#black-box-suite-harness)).
 - `--` is required before the command; the command never starts at the first word that is not an option.
@@ -511,6 +532,10 @@ The lines of a run that starts its command:
 
   A Ctrl+C while the client waits to start ends the gate the same way with no slot to release, and journals an `abandon` after the `queue` line, not a `release`.
 
+  A routed run that finds its work folder's key held by another run on this PC says `gate: waiting for this worktree's work folder on <host>, which another of its runs holds`, with ` (about <figure> left)` after it when the key's latest claim (by `started`) has an expected time not yet reached, `<figure>` by the gate's figure rule (`<n> s` below 90 s, else whole `<n> min`, never below 1). Each heartbeat it says `gate: still waiting for this worktree's work folder on <host> (<s> s)`.
+
+  A warm-up lock that cannot be probed says `gate: cannot probe the warm-up lock <path>: <error>` once (path and error escaped) and the wait goes on. A Ctrl+C during that wait, or raised at the key take, says `gate: interrupted while waiting for this worktree's work folder on <host>` and ends the gate with 0xC000013A, never a `busy` fallback.
+
   A routed run that passed says `gate: passed in <w> s on <host> (load-adjusted <a> s, ceiling <n> s; command <c> s, push <p> s[, inputs <i> s][, sync-back <s> s][, outputs <o> s]). Full output: <log>`, with `past its ceiling of <n> s` in place of `ceiling <n> s` as the local line has it.
 
   In it `<w>` is the attempt's whole wall time; `<a>` is the load-adjusted time the builder counted for the command, the clock `--timeout` bounds; `<c>` is the run call's own wall time; the push is always named, the inputs calls (diff and put together), the sync-back and the outputs fetch only when they ran, in the order they ran, each in whole seconds rounded half to even.
@@ -579,7 +604,7 @@ A missing file or key means the default; an unreadable or invalid value is ignor
 2. Waiters of one kind take slots in ticket `arrived` order, ties broken by pid. A gate tries a slot only when fewer live tickets of its kind are ahead of it than the pool has free slots (indices whose mutex no handle holds, a probe that fails counting as not free), not counting a ticket whose gate already holds a live claim (it holds a slot and only failed to delete its ticket), so a try never takes the slot an earlier waiter would get.
 
    It then tries indices 0 up to the count in order and takes the first free one. A live critical ticket that arrived before the gate (by `arrived`, then pid; the barrier, Q3) narrows that: a heavy gate tries no slot, and a light gate tries any light slot, and none once as many light gates run beside the critical request as the beside allowance (K3). See [Critical drain and nesting](#critical-drain-and-nesting).
-3. A take deletes the gate's own ticket, journals `take`, writes the claim and wakes the waiters, so the next in line tries at once. A release deletes the claim, journals `release`, lets the mutex go and wakes the waiters. A critical gate takes the machine instead ([Critical drain and nesting](#critical-drain-and-nesting)): its `take` and `release` list every slot it holds, and it writes one claim, `gate-critical.json`, and none for the slots.
+3. A take deletes the gate's own ticket, writes the claim, journals `take` and wakes the waiters, so the next in line tries at once. A release deletes the claim, journals `release`, lets the mutex go and wakes the waiters. A critical gate takes the machine instead ([Critical drain and nesting](#critical-drain-and-nesting)): its `take` and `release` list every slot it holds, and it writes one claim, `gate-critical.json`, and none for the slots.
 4. A waiter sleeps on its own wake event, `Local\gate-wake-<pid>-<start>` (auto-reset). A gate that takes or releases a slot, or deletes a dead gate's ticket, signals the wake event of every live ticket in its state root. An auto-reset event stays signalled until its waiter wakes, so no wakeup is lost between a waiter's check and its wait. A wake that cannot be opened or set is not said: the fallback poll covers it.
 5. Each wait has a fallback poll as its timeout (2 s, kept from S4's interval). The poll re-reads the counts and the tickets, which deletes a dead waiter's ticket so it cannot hold the queue (Q1), and picks up a count changed by hand. A pass that found the [beside mutex](GLOSSARY.md) held by another gate (a light gate's, a lend's, a critical gate's) sleeps 100 ms at most, since that gate wakes the waiters only once it took or lent something.
 6. A waiter prints `gate: waiting for a <kind> slot (<n> busy)` once, on the first pass whose own [probe by open](#probe-by-open) finds none of the pool's slots free, where `<n>` is how many slots that same probe reports held, followed by `, the first frees in about <eta>` when the ETA below is known.
@@ -651,7 +676,7 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 |---|---|---|---|
 | `slot-counts.json` | ops-tower's Gates tab, people | every waiting gate, ops-tower | [Counts](#counts). |
 | `remote.json` | people | the router, ops-tower (`slots`) | Builders and routing (T1); read from `%LOCALAPPDATA%\gate\remote.json`, beside the `v1\` folder, whatever the state root is. |
-| `slots\<name>.json` | the gate holding the slot, written after its `take` line | other gates, ops-tower | [Claim](#claim); `<name>` is the mutex name without `Local\` and the root hash, plus `gate-critical.json` for a critical gate, its one claim for the whole machine (kind `critical`, index 0), written after its `take` line; the heavy and light slots it holds get none. |
+| `slots\<name>.json` | the gate holding the slot, written before its `take` line | other gates, ops-tower | [Claim](#claim); `<name>` is the mutex name without `Local\` and the root hash, plus `gate-critical.json` for a critical gate, its one claim for the whole machine (kind `critical`, index 0), written before its `take` line; the heavy and light slots it holds get none. |
 | `slots\gate-lent-<parent pid>-<pid>-<start>.json` | a gate lent its light parent's slot, from before its command starts to after it ends | a critical gate's drain; ops-tower does not read it | [Claim](#claim) (the lend marker). Claim readers skip it. |
 | `waiting\<pid>-<start>.json` | the waiting gate | other gates, ops-tower | [Ticket](#ticket). |
 | `covered\<pid>-<start>.json` | a gate running under a parent gate's slot | other gates (the survey), ops-tower | [Covered marker](#covered-marker). |
@@ -703,7 +728,7 @@ The box command's job name comes from the payload's `Job` (`<key>` is the payloa
 
 `<l>` is the log hash: 16 lower-case hex digits, the first 8 bytes of the SHA-256 of the lower-cased, normalised absolute log path. Each run takes its log's mutex without waiting, before it readies the log, and holds it until after the slot release and the final append to the log, so two gates never write one log; a second gate fails at once ([Output lines](#output-lines)).
 
-`<k>` is the key hash: 16 lower-case hex digits, the first 8 bytes of the SHA-256 of the lower-cased work-folder key. The Rust remote client takes the routed lock without waiting, before the remote slot, and holds it for the whole remote attempt ([Routing](#routing)).
+`<k>` is the key hash: 16 lower-case hex digits, the first 8 bytes of the SHA-256 of the lower-cased work-folder key. The Rust remote client takes the routed lock before the remote slot, first at once, then by the run's wait of up to 90 s while another run holds it, and holds it for the whole remote attempt ([Routing](#routing)).
 
 `<v>` and `<f>` are the worktree lock's folder id: the volume serial number as 16 lower-case hex digits and the 128-bit file id as 32, read from the worktree root opened following links, so two spellings of one folder share one lock.
 
@@ -763,7 +788,7 @@ The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Criti
 
 The file name `<name>` is `gate-slot-<i>`, `gate-light-slot-<i>`, `gate-remote-slot-<i>` or `gate-critical`, the same whatever the root: a non-default root's claims sit in that root's own `slots\` folder, so the file name carries no root hash.
 
-A claim is live while its `pid` runs with that `processStart` (L2), the start compared in whole milliseconds. A killed gate leaves its file; the next holder overwrites it and readers treat it as stale. A gate that cannot write its claim says so once and runs on (L1).
+A claim is live while its `pid` runs with that `processStart` (L2), the start compared in whole milliseconds. A killed gate leaves its file; the next holder overwrites it and readers treat it as stale. A gate that cannot write its claim says so once and runs on (L1). The claim is written before the gate's `take` line ([Journal](#journal)), so a gate paused or killed before that line shows a claim with no `take` line: a reader, ops-tower included, must not expect a `take` line for every claim.
 
 **The lend marker.** A gate lent its light parent's slot while a critical request drains ([Critical drain and nesting](#critical-drain-and-nesting), the lend) holds no slot and writes no claim. It writes `slots\gate-lent-<parent pid>-<pid>-<start ms>.json` instead, named after its parent gate and itself, in the claim's format with kind `heavy` and index 0 (its `expected` is there when the gate was lent as it waited).
 
@@ -845,7 +870,7 @@ The event's own fields:
 | `queue` | `log` (the log's full path), `notRouted` (written right after `log`, only when a heavy gate's caller kept it local with `--local`, with the value `--local`; other reasons for a local run write none) |
 | `take` | `slots` (the slot names taken; a critical gate lists every heavy and light slot it holds; a `none` run lists none, `[]`, with `waitedSeconds` 0.0), `waitedSeconds`, optionally `parentPid` (also on the late take of a covered gate), and for a critical gate `counts`, `otherHeld`, then `otherClaims` or `snapshotError` |
 | `release` | `slots` (the same list), `heldSeconds`, `status` (null when the gate failed before its command had one), `wallSeconds`, `adjustedSeconds`, optionally `avgCores`, `peakCores`, `freeCores`, `verdict` |
-| `abandon` | `waitedSeconds`: the gate ended while still queued (Ctrl+C while waiting for a slot, or, for a routed run, while its client waited to start) |
+| `abandon` | `waitedSeconds`: the gate ended while still queued (Ctrl+C while waiting for a slot, or, for a routed run, while its client waited to start or while it waited for its work folder's key, remote-tagged) |
 | `parent`, `covered` | `parentPid`; a lent gate writes `parent` after its `queue` when it was lent the slot as it waited, and alone, with no `queue`, when it was lent it before it queued |
 | `fallback` | `reason`, then `remote`, `host`, `key`: it ends the routed attempt, so a remote `take` that falls back gets no `release`; a `full` fallback, and a `client` fallback with no client built, follow no remote `take` |
 
@@ -914,6 +939,8 @@ The journal writer says these prose lines, each prefixed `gate: `:
 - the archive's lines ([Archive](#archive)).
 
 Ordering is part of the interface: `release` is written before the slots are let go, so no later `take` precedes it; `fallback` is written while the routed run still holds its remote slot; a `take` with no `release` or `fallback` after it is a gate killed outright (J1). Runs are keyed by (`pid`, `processStart`).
+
+The claim is written before the `take` line, for a local, remote, fallback or late take and for a critical gate's (its holds line, then `gate-critical.json`, then `take`), so a reader that sees a `take` line finds that gate's claim already written. The exception is a claim that could not be written: the gate says so and still journals the take, and the slot stays held. A gate killed between its claim and its take leaves a claim with no `take` line, which a reader judges by the claim's liveness ([Claim](#claim)) like any other.
 
 Rollover, torn lines and failures are kept: a journal of 5,242,880 bytes (5 MiB) or more is moved over `events.1.jsonl` before an append, so it rolls at or above the cap, and a move a reader blocks leaves it in place and is said once (J2); a torn last line gets a line feed before the next (J3); a line that cannot be written is said once and skipped, and the gate runs on (J4). The cap and the 2 s mutex wait are constants; a test writes a near-cap journal into its own root.
 
@@ -994,7 +1021,7 @@ What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K
 
   A heavy or light covered gate holds a waitable handle on its parent (`WaitableProcess` in `crates/gate-win32/src/tree.rs`, as `burn.rs` uses it), opened as its watch begins and looked at on every step of the watch loop. A `none` or critical gate takes no late slot and watches nothing.
 
-  When the parent ends while the command still runs, the gate looks for a stand-in (below); finding none it says `gate: the parent gate <pid> ended; taking a <kind> slot for the rest of this run`, queues a ticket of its own kind with the run's first arrival, and takes a slot as soon as one frees. The journal records a `take` with `parentPid` naming the ended parent, the claim is written, and the run's end journals a `release` of that slot and lets it go as any slot is.
+  When the parent ends while the command still runs, the gate looks for a stand-in (below); finding none it says `gate: the parent gate <pid> ended; taking a <kind> slot for the rest of this run`, queues a ticket of its own kind with the run's first arrival, and takes a slot as soon as one frees. The claim is written and the journal records a `take` with `parentPid` naming the ended parent, and the run's end journals a `release` of that slot and lets it go as any slot is.
 
   The take happens beside the running command, on the thread that will release the slot, never through `Hold`/`take_own` before it: the command never pauses while it waits. Until a slot frees the machine is one gate over its pool, and a command that ends while the gate still waits deletes the ticket and says nothing more. The wait's `still waiting` lines are the ordinary ones.
 
@@ -1116,7 +1143,7 @@ All kept, with each knob's default unchanged:
 
   A read that fails is said once per run, by the first sample whose read fails, on stderr and in the log: `gate: WSL VM CPU unavailable (<message>); retrying each sample, and until a read succeeds this wsl command counts only output and job CPU as progress`. A failed read at the watch's start alone says nothing, and every sample retries.
 - A command that exits on its own before the kill keeps its status (W7).
-- Build servers: the per-run server settings of [Command launching](#command-launching) (the run id as `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER=0`, `DOTNET_CLI_USE_MSBUILD_SERVER=0`, `MSBUILDDISABLENODEREUSE=1`), so each run has its own compiler server and MSBuild nodes. No gate classifies, lowers or raises a build server.
+- Build servers: the per-run server settings of [Command launching](#command-launching) (the run id as `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER=0`, `DOTNET_CLI_USE_MSBUILD_SERVER=0`, `MSBUILDDISABLENODEREUSE=1`, `UseSharedCompilation=false`), so each run has its own MSBuild nodes and no compiler server idles in its job. No gate classifies, lowers or raises a build server.
 
   The stall check and the load figures count the job's own processes and the escaped tree only: a build server that is neither in the job nor under one of its members is neither progress nor the command's own CPU in the free share, and a server in the job, or escaped from a member, is one of its processes like any other.
 
@@ -1286,7 +1313,11 @@ The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wai
 - **Priority.** BelowNormal, or the gate's own class when that is already BelowNormal or Idle; High for a critical gate and any gate under a critical marker (kept, P2).
 - **Environment.**
 
-  Every command gets the gate's environment with these set over it (names compared case-insensitively): `GATE_SLOT_HELD=<kind>:<pid>:<start_ms>[:<h>]` (the held slot's marker, `none` too, or the parent's for a covered gate; a gate lent its light parent's slot holds none and hands `heavy:<its pid>:<its start>[:<h>]`, naming itself), `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, both the run id, `MSBUILDUSESERVER=0` (over an inherited value), `DOTNET_CLI_USE_MSBUILD_SERVER=0` (kept, P3), `MSBUILDDISABLENODEREUSE=1` (over an inherited value), and `GATE_STATE_DIR=<root>` under a non-default root.
+  Every command gets the gate's environment with these set over it (names compared case-insensitively): `GATE_SLOT_HELD=<kind>:<pid>:<start_ms>[:<h>]` (the held slot's marker, `none` too, or the parent's for a covered gate; a gate lent its light parent's slot holds none and hands `heavy:<its pid>:<its start>[:<h>]`, naming itself), `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, both the run id, `MSBUILDUSESERVER=0` (over an inherited value), `DOTNET_CLI_USE_MSBUILD_SERVER=0` (kept, P3), `MSBUILDDISABLENODEREUSE=1` (over an inherited value), `UseSharedCompilation=false` (over an inherited value), and `GATE_STATE_DIR=<root>` under a non-default root.
+
+  The caller's `--env` pairs ([Command environment](#command-environment)) are set over the gate's environment first, so the settings above come last and no pair can undo one.
+
+  `UseSharedCompilation=false` keeps Roslyn's compiler server from idling in the command's job for up to ten minutes after a build: a command that waits for its whole job, as Godot's console wrapper does, never ended while the server held it, and the stall kill fired. The same setting is on a `gate box run` command and a routed one.
 
   Under the default root an inherited `GATE_STATE_DIR` is removed. The gate's own environment is never changed.
 
@@ -1437,7 +1468,11 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A bare first word (no separator, drive or `.`/`..`) becomes `./name` only when that file exists in the gate's folder; otherwise it stays bare, for the builder's `PATH`.
 
-  A first word that names a program by an absolute path outside the worktree and its siblings is sent as the program's name, the file name with a trailing `.exe` removed, so the builder finds it on its own `PATH` (a Godot or dotnet install named by its full path). The run says once, first among its routed lines, `gate: routed <given> as <name>` (both escaped), and the fallback here, the journal and the claim keep the words as given. Such a word is never written `./name`.
+  A first word that names a program by an absolute path outside the worktree and its siblings is sent as the program's name, the file name with a trailing `.exe` removed, so the builder finds it on its own `PATH` (a Godot or dotnet install named by its full path).
+
+  A Godot console word of a run with a chosen Godot version runs that version's install instead (Toolchain manifest, below).
+
+  The run says once, first among its routed lines, `gate: routed <given> as <name>` (both escaped), and the fallback here, the journal and the claim keep the words as given. Such a word is never written `./name`.
 
   The name is refused, and the word stays outside (the run stays here with `gate: not routed: <word> is outside the worktree`), when the file name holds any of `* ? " < > |`, white space or a line break, or is empty once `.exe` is removed; when any path segment after the drive (folders and file name) holds `:`, holds `~` followed by an ASCII digit (a short name), ends in `.` or a space, or is empty, `.` or `..`; or when the word holds a second drive path (`X:\a\x.exe;C:\other`).
 
@@ -1457,7 +1492,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A share or device path at any path start is outside: two separators, or a drive right after `\\?\`, `\\.\`, `//?/` or `//./`. Relative text that climbs out of the worktree (or past the drive-root floor above) is outside at every path start, not only at the word's.
 - **The work folder** on the builder is named `<repo name>-<key>`, the worktree root's last segment cut to letters, digits, `-` and `_` and 8 hex digits of the SHA-256 of the lower-cased root ([Glossary](GLOSSARY.md), work-folder key).
-- **The routed run's life** is kept (T5) and built in `remote/mod.rs` and `run.rs`: its ticket is heavy with `remote: true` and queues apart from the local waiters, which never count it ahead of them, nor it them; it waits up to 60 s for a remote slot (`--test-remote-wait-ms` in a test build); it takes one with a claim of kind `remote` of its own and calls the remote client with the route, the log and the limits (`--stall` as given, the interrupt).
+- **The routed run's life** is kept (T5) and built in `remote/mod.rs` and `run.rs`: its ticket is heavy with `remote: true` and queues apart from the local waiters, which never count it ahead of them, nor it them; before that it waits up to 90 s for its work folder's key while another run holds it (`--test-key-wait-ms` in a test build), holding no PC slot and journaling only its remote-tagged `queue` line, and falls back `busy` only past that bound or when a warm-up of the folder holds or takes the key; it then waits up to 60 s for a remote slot (`--test-remote-wait-ms` in a test build); it takes one with a claim of kind `remote` of its own and calls the remote client with the route, the log and the limits (`--stall` as given, the interrupt).
 
   A client that runs the command to its end hands back its status, which the gate passes through, and the run releases the slot with the remote tag. On `full` (no slot within the wait), a refusal (status 75 with a reason) or a client that cannot start, it journals `fallback` while still holding the remote slot (none was taken on `full`), deletes the claim, lets the slot go, and runs here, taking a heavy slot with its first arrival kept in the ticket.
 
@@ -1513,9 +1548,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   A repo name that is not `[A-Za-z0-9_-]+` is never sent to the builder: the push and the sync-back fail the run with `cannot push to the repo '<name>': a repo name is letters, digits, '_' and '-'`, as a client failure (`gate: the remote run failed: ...`).
 
   The phases run in this order. Any `gate: the remote run failed` line ends the run with status 1 and no fallback; Ctrl+C at any point after the snapshot ends the run as an interrupt.
-  - **Lock.** The run takes the routed lock, `Local\gate-[<root hash>-]routed-<16 hex>` ([Kernel object names](#kernel-object-names)), before the remote slot, with a zero wait, and holds it for the whole remote attempt.
+  - **Lock.** The run takes the routed lock, `Local\gate-[<root hash>-]routed-<16 hex>` ([Kernel object names](#kernel-object-names)), before the remote slot, and holds it for the whole remote attempt. A lock held elsewhere is waited for up to 90 s (`--test-key-wait-ms` in a test build) with no PC slot held; the journal shows the run's remote-tagged `queue` line only.
 
-    A lock held elsewhere says `gate: remote <host> busy; running here` and falls back `busy` before any queueing, so two routed runs of one worktree give a deterministic `busy`, not a race. A lock that cannot be opened or taken says `gate: cannot open the mutex <name>: <error>` or `gate: cannot take the mutex <name>: <error>`, then the busy line.
+    A lock still held past the bound says `gate: remote <host> busy; running here` and falls back `busy` before any queueing. A warm-up lock on the key, probed before the wait and at each still-waiting heartbeat, that holds or takes the key makes the run fall back `busy` at once instead of waiting it out. A lock that cannot be opened or taken says `gate: cannot open the mutex <name>: <error>` or `gate: cannot take the mutex <name>: <error>`, then the busy line.
   - **Hold.** The run takes the worktree locks of its main root and each carried sibling ([Sync-back](#routing), The worktree lock) and, for a pair, holds its folders ([Sibling worktrees](#routing)); one it cannot hold keeps the run here ([Output lines](#output-lines)).
   - **Snapshot.** Part A's snapshot and bridge commit, for each repository of a pair.
   - **Run line.** The run call's cmd line is the fixed `"%LOCALAPPDATA%\gate\bin\gate.exe" box run --stdin`, the same whatever the run holds; every other `gate box` call's line differs only in its verb. The request, base64 of compact UTF-8 JSON, is the first line of the call's stdin, followed for the run call by the outputs manifest line, so no request size is capped by a command line. The box reads the request line with a cap of 16 MiB, newline included ([The box side](#the-box-side)).
@@ -1576,6 +1611,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version; a routed run reads the `godot` entry as an exact pin instead (below). The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot` and `ffmpeg`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
 
+    A repo's minimums are the lowest versions its own files require: `rust-version`, `rust-toolchain.toml` or the edition, `packageManager`, the launcher's `#requires`. Where nothing pins a floor, the minimum is the oldest toolchain the builders install (rust 1.89, the first with edition 2024's let chains); where neither applies, the entry is `""`. pwsh is `7.4` everywhere, since the launcher needs PowerShell 7. A minimum set higher than the repo needs would refuse a builder that can run it.
+
     A file that is not UTF-8 or does not parse is unreadable whole, and the line for it is `gate: cannot read .gate/toolchain.toml: <why>; skipping the manifest's checks`, `<why>` being `line <l>, column <c>: <toml message>` or `not valid UTF-8 (...)`. A routed run words a manifest problem its own way, `gate: .gate/toolchain.toml: <problem>; skipping it`, for a whole file that cannot be read as for a bad entry, `<problem>` escaped.
 
     A bad entry is skipped alone and named in the reader's problems: `tools.<name> is not a version: "<text>"`, `tools.<name> is not a string (TOML <type>)`, `tools is not a table (TOML <type>)`, `workloads is not an array (TOML <type>)`, `workloads[<i>] is not a string (TOML <type>)`, `workloads[<i>] is empty` and `<key> is not a key of the manifest (tools, workloads)`.
@@ -1597,6 +1634,14 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     Every pin must be met, else the mismatch line is `gate: remote toolchain mismatch: <repo> needs godot <pins, comma separated> exactly; <host> has <found>`, `<found>` being the builder's versions joined by `, `, `none`, `not probed (<why>)`, or its own answer when that is no version list; for a manifest entry of `""` (any version) the line reads `needs godot`.
 
     An answer that is no version list is a mismatch whenever a pin needs checking, so the command runs here rather than on a builder that may lack the version. A slow install that drops off the builder's list reads as missing, a needless fallback and a known limitation.
+
+    After the preflight the client chooses the Godot version the run uses, from the repo's pins among the versions the builder reported: no pin, or a manifest entry of `""`, chooses none; one pin chooses the highest reported version that meets it (`4.7.2` itself, `4.7` the highest `4.7.x`); a pin no reported version meets chooses none.
+
+    A chosen version, spelled `x.y.z`, is sent as the optional `GodotVersion` of the run payload and of a warm-up's, and left out when none is chosen. The box resolves it ([The box side](#the-box-side), the command's environment).
+
+    A repo whose pins differ chooses none. A command whose first word is a Godot console word (a bare name with no directory part whose name, after one trailing `.exe` is removed, matches `godot*console*` ignoring ASCII case with no `.` after the last `console`; `.cmd`, `.bat`, `.ps1` and any other extension are not) falls back `parity`.
+
+    It says `gate: the repo pins several Godot versions (<pins, comma separated>); a routed run needs one` after the mismatch lines and before the parity line. Every other command of that repo routes as before, with no `GodotVersion`.
 
     A tool the builder did not probe, gave no answer for, or found at a version that cannot be read against a minimum gets `gate: <host> did not probe <name>: <why>; not checking it` and is not a need. The lines come in this order: the SDK step's own, then the manifest's problem lines, then the per-tool skip lines in the manifest's order, then the mismatch lines.
 
@@ -2052,15 +2097,15 @@ Each verb is one ssh call today, and the call's cost is its connection, not its 
 
 A routed run therefore moves to one long-lived connection carrying every verb, `gate box serve`, and the per-call client stays until that lands (GATE-70 holds the measurement, and GATE-109 the work).
 
-The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, and for `outputs` also `Name`.
+The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest` and `GodotVersion`, and for `outputs` also `Name`.
 
 `inflight` reads only `Root`.
 
 `inputs` reads `Key`, `Bare`, `Work`, `Lock`, `Nonce` and `Step`.
 
-A warm-up's `run` payload sets `WarmCommands` (1 to 8 commands, each a non-empty list of non-empty texts) and `WarmHash` (64 lower-case hex digits, the hash of the warm-up file the commands come from), sets no `Command`, and asks for no outputs. The PC's client sends it (The remote client's run, Warm-up call) for `gate warm`.
+A warm-up's `run` payload sets `WarmCommands` (1 to 8 commands, each a non-empty list of non-empty texts) and `WarmHash` (64 lower-case hex digits, the hash of the warm-up file the commands come from), sets no `Command`, and asks for no outputs. The PC's client sends it (The remote client's run, Warm-up call) for `gate warm`. It may carry `GodotVersion` too, and its commands resolve Godot as a run's do.
 
-`preflight` also reads an optional `Needs`, an object of tool name to minimum version text (`""` for any version; the box ignores the text, and for `godot` the PC sends the distinct exact pins joined by `,`), which the PC builds with `remote::payload::preflight_word` from the tools it wants probed; it is omitted when there are none, so a payload without needs is the same bytes as before.
+`preflight` also reads an optional `Needs`, an object of tool name to minimum version text (`""` for any version; the box ignores the text, and for `godot` the PC sends the manifest's own pin when the manifest names one, else the project files' distinct pins, joined by `,`), which the PC builds with `remote::payload::preflight_word` from the tools it wants probed; it is omitted when there are none, so a payload without needs is the same bytes as before.
 
 Unknown keys are ignored, and `Outputs`, `OutputsFull` and `OutputFolder`, which the outputs transport owns (GATE-44), are read only by `run` (the outputs) and `outputs` (`Name`, `OutputFolder`); `preflight`, `stop` and `boot` ignore them.
 
@@ -2100,7 +2145,7 @@ The rules: a whole number above 0 and at most 2147483647 for the heartbeat, the 
 
 Every `gate box` verb first limits the box's DLL search to System32 (`gate_win32::set_default_dll_directories_system32`), before it reads the request or loads a library by name; a failure says `gate: the box cannot limit its DLL search to System32: <error>` and exits 1.
 
-The box gives each run's command its own build servers: the command's environment is the box's own with `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT` set to `gate-box-<Nonce>` (the payload's `Nonce`), `MSBUILDUSESERVER=0`, `DOTNET_CLI_USE_MSBUILD_SERVER=0` and `MSBUILDDISABLENODEREUSE=1`, each replacing any inherited value (names compared case-insensitively).
+The box gives each run's command its own build servers: the command's environment is the box's own with `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT` set to `gate-box-<Nonce>` (the payload's `Nonce`), `MSBUILDUSESERVER=0`, `DOTNET_CLI_USE_MSBUILD_SERVER=0`, `UseSharedCompilation=false` and `MSBUILDDISABLENODEREUSE=1`, each replacing any inherited value (names compared case-insensitively).
 
 So no other run's command, on the box or on the PC, uses the compiler server or the MSBuild nodes this one starts, and no node idles in the job after its build (an idle node would keep alive anything in the command that waits on its whole tree).
 
@@ -2146,11 +2191,15 @@ Built verbs:
 
   The probes are `rustc --version` for `rust`, `cargo-nextest nextest --version` for `cargo-nextest` (the plugin directly, never through `cargo`, so no `.cargo\config.toml` above the folder can alias it), `<name> --version` for `node`, `pnpm` and `pwsh`, and `ffmpeg -version`. `godot` is probed as the next paragraph says.
 
-  The `godot` probe reads `GATE_GODOT_ROOT`, an environment variable of the builder naming a folder of side-by-side Godot installs, one per subfolder, each holding `Godot_console.exe`. It lists the direct subfolders of that folder (the first 64 entries, in path-name order), runs each install's `Godot_console.exe --version` under the batch's deadline and says the versions found as one line, `gate: remote tool godot <v1>,<v2>,...`, ordered by number and without repeats.
+  The `godot` probe reads `GATE_GODOT_ROOT`, an environment variable of the builder naming a folder of side-by-side Godot installs, one per subfolder, each holding `Godot_console.exe`. A subfolder is named for its install's version in full canonical form, `x.y.z` (`4.7.2`: three parts, no leading zero in a part, as `04.7.2` and `4.3` are not), since a run finds an install by that name, `<root>\<version>\Godot_console.exe`.
 
-  A version is the leading dot-separated digits of the first line of stdout, three parts as printed or two with `.0` added (`4.3.stable.mono.official.<hash>` is `4.3.0`); an install that prints a version and exits non-zero is still listed. With no `GATE_GODOT_ROOT` the probe runs the `Godot_console.exe` found on `PATH`. A root that names no install is `missing`. Subfolders whose name is not valid Unicode, that hold no plain `Godot_console.exe`, past the first 64, or that cannot be read are left out.
+  The probe lists the direct subfolders of that folder (the first 64 entries, in path-name order), runs each install's `Godot_console.exe --version` under the batch's deadline and says the versions found as one line, `gate: remote tool godot <v1>,<v2>,...`, ordered by number and without repeats.
 
-  When no install gives a version the line is `gate: remote tool godot skipped: <why>`, the first reason met: `cannot run <install>: <install> lies inside the worktree` (an install inside the run's own folders, the folder above `Work`, `Work`, `Bare` and the outputs folder, is refused unrun; a `gate check` refuses the repo root), `cannot run <exe>: <path> is a link or a junction` (a subfolder or the exe), `GATE_GODOT_ROOT <path> is not an absolute path on a drive`, `cannot read GATE_GODOT_ROOT <path>: <error>`, `no answer in <limit>` (the listing was cut by the deadline with nothing read) or `Godot_console.exe --version gave no version: <line>` (the first line of stdout, cut to 200 characters with `…`, escaped, when a version part has over ten digits or the line leads with no version).
+  A version is the leading dot-separated digits of the first line of stdout, three parts as printed or two with `.0` added (`4.3.stable.mono.official.<hash>` is `4.3.0`), each part spelled with no leading zero (`04.07.2` is `4.7.2`); an install that prints a version and exits non-zero is still listed.
+
+  An install under `GATE_GODOT_ROOT` whose folder is not named exactly the version it reports is left out of the list, as a run could not find it by name. With no `GATE_GODOT_ROOT` the probe runs the `Godot_console.exe` found on `PATH`. A root that names no install is `missing`. Subfolders whose name is not valid Unicode, that hold no plain `Godot_console.exe`, past the first 64, or that cannot be read are left out.
+
+  When no install gives a version the line is `gate: remote tool godot skipped: <why>`, the first reason met: `cannot run <install>: <install> lies inside the worktree` (an install inside the run's own folders, the folder above `Work`, `Work`, `Bare` and the outputs folder, is refused unrun; a `gate check` refuses the repo root), `cannot run <exe>: <path> is a link or a junction` (a subfolder or the exe, being any reparse point: a link, a junction, an app execution alias or a cloud placeholder), `named <folder> but reports <version>` (an install of the root whose folder is not named the version it reports; said only when no other install lists), `GATE_GODOT_ROOT <path> is not an absolute path on a drive`, `cannot read GATE_GODOT_ROOT <path>: <error>`, `no answer in <limit>` (the listing was cut by the deadline with nothing read) or `Godot_console.exe --version gave no version: <line>` (the first line of stdout, cut to 200 characters with `…`, escaped, when a version part has over ten digits or the line leads with no version).
 
   Each program is found through `PATH` and `PATHEXT` as `dotnet` is (a `.cmd` shim runs through the system folder's cmd.exe; a `.ps1` is not run) and runs in the system folder on a hidden console, in the bounded runner of `remote/git.rs` (`program_output`).
 
@@ -2201,9 +2250,11 @@ Built verbs:
 
   Payload refusals exit 2, each on stderr. The command's own: `gate: box payload Command is not a list of texts`, `gate: box payload lacks Command`, `gate: box payload Subfolder is not a text`, `gate: box payload Identity is not an object of texts`, `gate: box payload Identity may set only GIT_AUTHOR_* and GIT_COMMITTER_* names: <name>` and `gate: box payload Identity <name> holds a NUL`.
 
-  `Env`'s: `gate: box payload Env is not an object of texts`, `gate: box payload Env has a malformed name '<name>'` (empty, or holding `=` or a NUL), `gate: box payload Env gives <name> a value holding NUL`, `gate: box payload Env sets <name>, which the gate sets itself` and `gate: box payload Env sets <name>, which git would read over the gate's own git settings`.
+  `Env`'s: `gate: box payload Env is not an object of texts`, `gate: box payload Env has a malformed name '<name>'` (empty, or holding a character outside printable ASCII U+0021 to U+007E, or `=`), `gate: box payload Env gives <name> a value holding NUL`, `gate: box payload Env sets <name>, which the gate sets itself` and `gate: box payload Env sets <name>, which git would read over the gate's own git settings`.
 
   Also `gate: box payload Env sets <name>: GATE_ names are the gate's`, `gate: box payload Env sets <name>, a machine path the builder keeps`, `gate: box payload Env names <name> twice` and `gate: box payload Env is over its cap of 64 names or 32 KiB`. A null `Env` is not set.
+
+  `GodotVersion`'s: `gate: box payload GodotVersion is not a version: '<value>'` for any value but a string of exactly three dot-separated parts of one to ten digits each with no leading zero (except `0`), as it is joined into an install's path; a value that is no string shows as compact JSON, shortened and escaped. A null `GodotVersion` is not set.
 
   A warm-up payload's: `gate: box payload sets both Command and WarmCommands`, `gate: box payload lacks WarmHash`, `gate: box payload asks a warm-up for outputs` (an `Outputs` glob or `OutputsFull` true), `gate: box payload asks a warm-up for Env` (an `Env` that is not null, even `{}`), `gate: box payload WarmCommands is not a list of 1 to 8 commands, each a non-empty list of non-empty texts` and `gate: box payload WarmHash is not 64 lower-case hex digits: <value>`.
 
@@ -2221,13 +2272,13 @@ Built verbs:
 
   `Identity` may hold only `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_AUTHOR_DATE`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL` and `GIT_COMMITTER_DATE`.
 
-  `Env` is the caller's variables for the command: an object of texts of at most 64 names and 32 KiB of names and values together, the cap read from the raw object before any pair is checked.
+  `Env` is the caller's variables for the command, the PC's `--env` pairs ([Command environment](#command-environment)), sent only when there is one: an object of texts of at most 64 names and 32 KiB of names and values together, the cap read from the parsed object before any pair is checked. A name is one or more printable ASCII characters (U+0021 to U+007E) but `=`; a value may hold anything but NUL.
 
-  It refuses a name the gate sets (`GATE_SLOT_HELD`, `GATE_STATE_DIR`, `SharedCompilationId`, `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `MSBUILDDISABLENODEREUSE`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`, and .NET's Event Log logging settings in any spelling: the `__` and `:` forms, a `DOTNET_` or `ASPNETCORE_` prefix, the provider's full type name).
+  It refuses a name the gate sets (`GATE_SLOT_HELD`, `GATE_STATE_DIR`, `SharedCompilationId`, `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `UseSharedCompilation`, `MSBUILDDISABLENODEREUSE`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`, and .NET's Event Log logging settings in any spelling: the `__` and `:` forms, a `DOTNET_` or `ASPNETCORE_` prefix, the provider's full type name).
 
-  It also refuses `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG` (git reads them over the gate's own `safe.directory` entry), any `GATE_` name, and the machine paths `PATH`, `PATHEXT`, `TEMP`, `TMP`, `SystemRoot`, `windir`, `ComSpec`, `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA` and `ProgramData`. Names are compared without regard to ASCII case.
+  It also refuses `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG` (git reads them over the gate's own `safe.directory` entry), any `GATE_` name, and the machine paths `PATH`, `PATHEXT`, `TEMP`, `TMP`, `SystemRoot`, `windir`, `ComSpec`, `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA` and `ProgramData`, and `GODOT_PATH`, which a run sets itself (the command's environment, below). Names are compared without regard to ASCII case.
 
-  A name given twice is refused, first as an ASCII-case scan and then as Windows compares names, which folds more than ASCII. A refusal line shows the name shortened to 200 characters and escaped.
+  A name given twice in any ASCII case is refused; names are ASCII, so that is also how Windows compares them. A refusal line shows the name shortened to 200 characters and escaped.
 
   The pairs apply to the command only, never to the box's own steps (the git steps, the tool restore, the pnpm install).
 
@@ -2268,6 +2319,8 @@ Built verbs:
   A payload without `InputsDigest` skips the check. The PC reads the `inputs` tag as fallback reason `inputs` and says `gate: remote <host> inputs; running here`, with `gate: remote inputs not sent: the builder's work folder does not hold the inputs sent` in the log.
 
   The steps are the layout, fetch, the commit probe, checkout, clean and the back ref reset (each of the three git steps once per repo on a pair run, the main repo first), the dotnet tool restore, the pnpm package restore, then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset> failed (status <n>)` and exits `n`.
+
+  The clean is `git clean -fdq`, with no `-x`, so a work folder keeps its ignored files between runs; a Godot project's `.godot` folder is one, so it persists from one routed run to the next.
 
   On a pair run the step is followed by the repo's name (`gate: remote fetch <name> failed (status <n>)`), while the steps that ready a tree say `failed for <name>` as the preflight's do.
 
@@ -2390,6 +2443,12 @@ Built verbs:
   The inherited count is read as git reads it (leading whitespace, an optional `+`, decimal digits to the end, at most `i32::MAX`; an empty value is 0); a count git would refuse, or `i32::MAX` itself, leaves the environment unchanged. The work folders are owned by Administrators, which git refuses from a non-elevated token.
 
   The command's environment is the box's own with the payload's `Env` pairs set over it, each replacing any inherited value; the settings below are applied after the pairs, so none of them can be undone by one.
+
+  A run with a `GodotVersion` resolves Godot on the box. With `GATE_GODOT_ROOT` set in the command's environment, a Godot console word runs only `<root>\<version>\Godot_console.exe`: an install that is missing, or a folder or exe that is any reparse point (link, junction, app execution alias, cloud placeholder), fails as `gate: could not start <word>: <file-not-found text>` with status 127, and never falls back to the `PATH`.
+
+  With no root the word resolves on the `PATH` as before. Any other word resolves as before.
+
+  `GODOT_PATH` is then set for every command of the run to the Godot program that resolved: the root's install when the root is set, else, with no root, the program the `PATH` gave a Godot console word, or the `PATH`'s `Godot_console.exe` for any other. It is set after the caller's pairs and the gate's own settings, so none undoes it. When no Godot program resolves, `GODOT_PATH` is removed, an inherited value included. A run with no `GodotVersion` leaves the environment as before.
 
   The command's environment also sets `Logging__EventLog__LogLevel__Default=None`, replacing any inherited value, so a .NET host with default logging writes nothing to the Windows Event Log; its console output is unchanged. Of the groups the Application log's default access lets write, a restricted copy of the box's token could hold only Administrators, INTERACTIVE, SERVICE, BATCH and WRITE_RESTRICTED, and the command's token holds none of them.
 
@@ -2697,7 +2756,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   Two seams of `gate box` shape the command's console: `--test-box-console fail-before` makes the UTF-8 console fail before the command starts, and `--test-box-park-launch <path>` parks the launch until `<path>` exists ([The box side](#the-box-side)). `--test-box-token refused` refuses the start with the restricted token, for the fallback to the box's own token. `--test-outputs-budget-bytes <n>` replaces the 50 GiB outputs budget of the box's trim.
 
-  Two more seams make a run end by Ctrl+C without a console: `--test-interrupt-after-samples <n>` raises the interrupt after the n-th sample, and `--test-interrupt-queued` raises it when the waiting line is printed, so once no slot is free for the gate. `--test-print-request` shows them as `testSeams.interruptAfterSamples` and `testSeams.interruptQueued`.
+  Two more seams make a run end by Ctrl+C without a console: `--test-interrupt-after-samples <n>` raises the interrupt after the n-th sample, and `--test-interrupt-queued` raises it when the waiting line is printed, so once no slot is free for the gate, and at the wait for a routed run's work folder. `--test-print-request` shows them as `testSeams.interruptAfterSamples` and `testSeams.interruptQueued`.
 
   `--test-interrupt-queued-after-fallback` (a switch) raises it once the gate has said it waits for its own slot after a `full` fallback from the builder, the wait that counts from the run's queue line, so a case can pin how a Ctrl+C there counts that wait; `--test-print-request` shows it as `testSeams.interruptAfterFallback`, after `interruptQueued`.
 
@@ -2723,9 +2782,11 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-git-limit-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 60 s limit of each git call of the routing decision; `--test-print-request` shows it as `testSeams.gitLimitMs`, after `remoteWaitMs`.
 
+  `--test-key-wait-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 90 s bound of a routed run's wait for its work folder's key, and the switch `--test-interrupt-before-key` raises the interrupt before the key is taken; `--test-heartbeat-ms` sets the wait's step. `--test-print-request` shows them as `testSeams.keyWaitMs` and `testSeams.interruptBeforeKey`.
+
   `--test-git-drain-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 2 s the readers of each git call of the routing decision get to end once git has exited; `--test-print-request` shows it as `testSeams.gitDrainMs`, after `gitLimitMs`. The suite's routing cases pass it with a very long drain, so a starved gate does not fail a call that a loaded machine only delays.
 
-  `--test-beside-claim-wait <file>` (on `gate run` only) makes a local light gate that took its slot holding the beside mutex wait, after it journals its `take` and before it writes its claim, until `<file>` exists, so a case can hold a gate between its take and its claim; `--test-print-request` does not show it.
+  `--test-beside-claim-wait <file>` (on `gate run` only) makes a local light gate that took its slot holding the beside mutex wait, after it takes the slot and before it writes its claim and journals its `take`, until `<file>` exists, so a case can hold a gate between its take and its claim. Before it waits it writes the empty file `<file>.reached`, so a case can tell the gate is at the seam; when that cannot be written the gate says `gate: cannot write the seam's arrival <path>: <error>` and waits on. `--test-print-request` does not show the seam.
 
   `--test-remote-snapshot` (a switch, on `gate run` only) sends the run to the Rust remote client's snapshot alone ([The remote client](#routing)); `--test-print-request` shows it as `testSeams.remoteSnapshot`, after `gitDrainMs`.
 

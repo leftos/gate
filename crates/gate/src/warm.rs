@@ -608,6 +608,7 @@ fn call_of<'a>(
         outputs_withheld: false,
         inputs: &target.inputs,
         bring_tracked: &[],
+        env: &[],
         log,
         timeout,
         usual: None,

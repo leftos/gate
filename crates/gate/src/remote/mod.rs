@@ -31,6 +31,8 @@ pub(crate) use carried::{Sibling, carried};
 
 mod carried;
 mod client;
+
+pub(crate) use client::KEY_WAIT_SLICE;
 pub(crate) mod git;
 mod held;
 mod inputs;
@@ -175,8 +177,9 @@ pub(crate) fn adjusted_prefix(nonce: &str) -> String {
 /// What runs a routed command on the builder.
 pub(crate) trait RemoteClient {
     /// Takes the lock of the call's work-folder key, which the run holds from before it takes a remote slot until its
-    /// remote attempt ends: `Ok(None)` for a client that takes none. `Err` when the run falls back `busy`: `None` when
-    /// another routed run holds the lock, else the line saying why it could not be opened or taken.
+    /// remote attempt ends: `Ok(None)` for a client that takes none. `Err(None)` when another run of the worktree holds
+    /// the lock, which the run waits for ([`RemoteClient::hold_key_waiting`]); else the line saying why it could not be
+    /// opened or taken.
     fn hold_key(&self, _call: &RemoteCall<'_>) -> Result<Option<OwnedMutexGuard>, Option<String>> {
         Ok(None)
     }
@@ -241,6 +244,8 @@ pub(crate) struct RemoteCall<'a> {
     pub inputs: &'a [String],
     /// The `--bring-tracked` globs: a fetched output git tracks is installed only when one matches it.
     pub bring_tracked: &'a [String],
+    /// The caller's `--env` pairs, sent in the run call's `Env` for the command on the builder.
+    pub env: &'a [(String, String)],
     /// The log the client writes the run's output to.
     pub log: &'a Path,
     pub timeout: u64,
@@ -478,6 +483,7 @@ mod snapshot_only {
                 tail: 0,
                 no_markers: false,
                 bring_tracked: &[],
+                env: &[],
                 interrupt,
                 state: &STATE,
                 state_dir: Path::new(r"C:\gate-snapshot-client-tests"),
@@ -766,6 +772,7 @@ mod scripted {
             "stall": call.stall,
             "tail": call.tail,
             "noMarkers": call.no_markers,
+            "env": call.env,
             "warmth": recorded_warmth(call.warmth),
         });
         fs::write(path, recorded.to_string()).map_err(|error| format!("cannot record the call to {}: {error}", path.display()))?;
