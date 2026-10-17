@@ -4,11 +4,8 @@
 
 ## Do first
 
-- [/] GATE-329 Make the gate's own suite pass on a builder — Urgent · Remote
 - [/] GATE-347 Warm a builder work folder with a repo's warm-up commands before routing work for it — Urgent · Remote
-- [/] GATE-367 Route a Godot or dotnet command named by its absolute install path (opening-hand, delve) — Urgent · Remote
 - [ ] GATE-370 Run a routed Godot command on the builder's side-by-side install of the version its repo pins — Urgent · Remote
-- [ ] GATE-373 Probe the builder's Godot versions and require a repo's exact Godot pin in preflight — Urgent · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [/] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
@@ -18,6 +15,7 @@
 - [ ] GATE-375 Install Godot side by side on the builders and trial each Godot command family — High · Remote
 - [ ] GATE-371 Route ops-tower's Playwright tests: the fixture server and browsers on the builder — High · Remote
 - [ ] GATE-376 Wait for a busy work folder's holder before falling back — High · Remote
+- [ ] GATE-383 Find why a routed headless Godot run stalls on the builder and never exits — High · Remote
 
 ## Remote
 
@@ -162,3 +160,6 @@
 - [ ] GATE-364 Open the state root's own folders without following junctions
 - [ ] GATE-366 Find why a between-two-fetches outputs case hung its last run on a busy PC
 - [ ] GATE-372 Keep a warm-up or run log that a reader holds open from blocking every later run of its key
+- [ ] GATE-379 Say the routed-as line for a warm-up command sent by its program's name
+- [ ] GATE-381 Write a slot claim before journaling its take, so a take line always has its claim
+- [ ] GATE-382 Open the PC state root's folders without following links before reading, writing or deleting a file in them
