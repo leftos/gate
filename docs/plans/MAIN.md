@@ -11,7 +11,6 @@
 - [!] GATE-399 Run the suite's desktop cases when the gate repo's tests are routed to a builder — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [!] GATE-371 Route ops-tower's Playwright tests: the fixture server and browsers on the builder — High · Remote
-- [ ] GATE-409 Keep a routed Godot command here when no Godot version is chosen — High · Remote
 
 ## Remote
 
@@ -109,6 +108,7 @@
 - [ ] GATE-403 Journal why a heavy run stayed on the PC
 - [ ] GATE-405 Check whether the stall and ceiling kill paths count an exited job member as left
 - [ ] GATE-408 Read a repo's csproj Godot pin in gate check as a routed run does
+- [ ] GATE-413 Route delve's bare Godot_console.exe form once the install is on PATH
 
 ## Cutover sweep
 
