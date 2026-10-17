@@ -2090,7 +2090,9 @@ The other four box seams are `--test-outputs-budget-bytes <n>`, which replaces t
 
 A seam is refused as the `gate run` seams are: no value, given twice, and a value outside its rule (`gate: --test-outputs-budget-bytes must be a whole number above 0, got '<v>'`, `... must be at most 2147483647 ...`, `... needs a value`, `... is given twice`).
 
-The desktop run has four more: `--test-box-desktop-session active|none|locked|other-user|disconnected` makes the box read the console session as that state (the box's own session, with the box's account at it, or nobody, another user, a locked or a disconnected one), `--test-box-desktop <fault>` names the fault the run takes in place of the real task start and helper and, given without a session seam, also stands for an `active` session.
+The desktop run has four more: `--test-box-desktop-session active|none|locked|other-user|disconnected` makes the box read the console session as that state (the box's own session, with the box's account at it, or nobody, another user, a locked or a disconnected one), `--test-box-desktop <mode>` starts the stand-in helper (`fake-desktop-helper.exe`, beside the box's program) in place of the registered task, at below normal priority in a kill-on-close job and with the helper's own seams set: `ok`, or a fault of the helper (`exit-before-hello`, `hang`, `wrong-version`, `lie-handle`, `exit-after-create`), or a task mode (`task-not-registered`, `task-set-up-wrong`, `task-failed`, `task-no-pid`) that stands for that refusal of the task without starting anything.
+
+`--test-box-desktop`, given without a session seam, also stands for an `active` session. A desktop run uses no console donor and ignores the console and token seams.
 
 `--test-box-desktop-mutex <unique>` names the desktop lock by a unique part under the box's own user in place of `gate\desktop`, and `--test-box-desktop-ms <n>` lowers each of the desktop run's waits to at most `n` milliseconds, one turn of the wait for the desktop lock included.
 
@@ -2337,7 +2339,37 @@ Built verbs:
 
   A wait that ends with the desktop still held is refused with the `desktop` tag, `gate: not routed: the builder's desktop stayed busy for <n> s` and exit 75. A lock that cannot be made or waited for is refused with the tag and the why `the builder's desktop lock cannot be made: <error>` or `the builder's desktop lock cannot be waited for: <error>`. A stop during the wait ends the run with status 1 and the stopped-before-start line, and on a pair run `gate: remote back commits: failed`.
 
-  With the lock held the box reads the console session again, and a console that can no longer take the command is refused with the first read's whys. A run that passes the stage is refused with `the desktop helper did not start: the box's hand-off is not built yet`, and the lock is released: the box does not yet hand a command to the builder's desktop, so no desktop run reaches the start marker or starts a command.
+  With the lock held the box reads the console session again, and a console that can no longer take the command is refused with the first read's whys. A run that passes the stage hands its command to the desktop helper, and the lock is released when the hand-off is over, however it ended.
+
+  The hand-off creates the run's job (kill-on-close), makes the control pipe and starts the helper through the registered task in the console's session.
+
+  It pins the process the task started by handle and checks it before trusting it: created no earlier than the box's own clock reading taken before the start, in the console's session, running the installed helper image (compared by file identity) and as the box's user. The pipe's client must be that process; a connection from another pid is refused and the connect goes on.
+
+  Then the helper says hello, the box sends the command (program, arguments, working folder, environment and the two output pipe write ends it gives the helper), and the helper reports the child it created suspended. The box pulls the child's handles out of the helper, verifies them by file identity and by facts it reads from its own handles, adopts the child into the run's job, and tells the helper it is done.
+
+  The start marker follows, then the run's usual park seam, stop look and resume, and the command is watched to its end as any run's command is. A zero `DesktopWait` is one try for the lock, with no busy line.
+
+  Before the start marker every failure is a refusal (the `desktop` tag, exit 75, no back commits line).
+
+  The whys after `gate: not routed: the builder has no desktop session: ` are `the desktop helper did not start: ` and one of `the control pipe cannot be made: <error>`, `it did not connect in time`, `it did not answer in time`, `it sent a message the box cannot read`, `it sent a message the box did not expect`, `it did not take the box's message in time`, `it closed the control pipe`, `the control pipe failed: <error>`.
+
+  Of the same prefix, about the process the task started: `the process the task started cannot be opened: <error>`, `its exit code cannot be read: <error>`, `it cannot be waited for: <error>`.
+
+  Of the process that answered the pipe: `the process that answered was created before the task ran`, `the process that answered is in another session`, `the process that answered is not the gate's desktop helper`, `the process that answered runs as another user`, `the pipe's client is not the helper the task started`, or `its creation time|session|image|user cannot be read: <error>`.
+
+  The other why is `the desktop helper failed: ` and one of `the command it started cannot be put in the box's job: <error>`, `the command it started is not the process it reported: <error>`, `the <fact> of the command it started cannot be read: <error>`, or `the job does not hold it after the assign`.
+
+  The box's own machinery adds whys of the same prefix: `the command's job cannot be made: <error>`, `the program the box sends cannot be read: <error>`, `the desktop helper's file cannot be read: <error>`, `the system clock cannot be read`, `the box's own user cannot be read: <error>`, `the desktop helper's argument cannot be made`.
+
+  Also of the machinery: `the command's output pipes cannot be made: <error>`, `the command's output pipes cannot be given to the desktop helper: <error>`, `a handle value does not fit the start request: <error>` and `the command's start request is too long for the control pipe`.
+
+  A helper that reports it could not create the command (`Failed`) is not a refusal: the box says the start marker, then `gate: could not start ...` as for any command that cannot start, and ends with 127, after the failure ending below.
+
+  A failure after the box has sent the command ends the helper's side before the box answers.
+
+  The box drops the pipe without `Done` (the helper then ends its own child), waits once, for at most the end limit and watching the run's stop signal, for the helper to exit, ends the helper if it is still there, and sweeps: from a process snapshot (without command lines) it ends each process whose parent is the helper, created after it and in the console's session, re-checking each by its own handle first.
+
+  A process the box could not end is said as `gate: remote could not end the desktop command (process <pid>): <error>`, the helper as `gate: remote could not end the desktop helper (process <pid>): <error>`, and a snapshot that failed as `gate: remote could not list processes to end after the desktop command: <error>`. The stop lines of a desktop run are written under the output lock, as the heartbeat is.
 
   The command runs outside the box's own job, created with `CREATE_BREAKAWAY_FROM_JOB` so it leaves the ssh session's job (the box's job refusing breakaway prints `gate: the box cannot start a command outside its own job: <message>` and exits 1). Its console is a donor's UTF-8 console (the console, below), else a hidden console of its own (`CREATE_NO_WINDOW`).
 
@@ -2796,9 +2828,11 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   A third helper, `fake-desktop-helper`, is the real desktop helper's code (`gate_desktop::run`) built beside `gate.exe`, so a box case can put it where the box looks for the installed one. It is built only with `--features test-seams` (`required-features`), and `gate`'s `test-seams` feature turns on `gate-desktop/test-seams` for it. With no argument it exits 10 (`HelperExit::BadArgument`).
 
-  The helper has three seams, environment variables that exist only in a `test-seams` build of it (unlike the `--test-*` flags). `GATE_DESKTOP_TEST_LIMIT_MS` caps each of its waits (connect, message, done) at that many whole milliseconds. `GATE_DESKTOP_TEST_PIPE_OWNER=user` makes it take a control pipe its own user owns in place of Administrators. A value of either that it cannot read (a limit that is not a whole number of milliseconds, an owner other than `user`) ends the helper at once with its bad-argument exit, 10.
+  The helper has four seams, environment variables that exist only in a `test-seams` build of it (unlike the `--test-*` flags). `GATE_DESKTOP_TEST_RECORD`, set to a file's path, has it add the pid of each child it creates to that file, one line each; the box then starts it in no job of its own, so a child the box failed to end outlives the run and a case can read the record.
 
-  The third, `GATE_DESKTOP_TEST_FAULT`, names the step it breaks; absent, empty or unknown is no fault:
+  `GATE_DESKTOP_TEST_LIMIT_MS` caps each of its waits (connect, message, done) at that many whole milliseconds. `GATE_DESKTOP_TEST_PIPE_OWNER=user` makes it take a control pipe its own user owns in place of Administrators. A value of either that it cannot read (a limit that is not a whole number of milliseconds, an owner other than `user`) ends the helper at once with its bad-argument exit, 10.
+
+  The last, `GATE_DESKTOP_TEST_FAULT`, names the step it breaks; absent, empty or unknown is no fault:
   - `exit-before-hello` exits 13 before saying hello, `hang` answers nothing and waits until the pipe goes away (13) or its own message limit passes (18), and `wrong-version` says the build `0.0.0+fault`.
   - `lie-handle` reports the child's thread handle value as `process` (the real pid and thread), and `exit-after-create` creates its child, leaves it suspended and exits 19.
 - **No fixture from the checkout path.** No routing pattern, expected path or assertion is derived from where the repo is checked out; a case builds its own repository and routing file in its root. `checkout::repo_file` is the one route to a checked-in file (the install script), never for a path or pattern a case asserts on.
