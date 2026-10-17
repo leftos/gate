@@ -1230,7 +1230,8 @@ The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wai
 - **Program resolution.** The program must resolve to an absolute path (kept, C6):
 
   - A name with a directory part is read against the working folder, `.` and `..` folded and separators written `\`; a drive-qualified or UNC name is kept as written.
-  - A name with an extension but no directory is looked for as written in each absolute PATH folder.
+  - A name with no directory whose extension is one of PATHEXT's (compared whole, its dot included, ignoring case) is looked for as written in each absolute PATH folder.
+  - A name with no directory whose extension is not one of PATHEXT's (`Godot_v4.7.2-stable_mono_win64_console`, a routed program name) is looked for in each absolute PATH folder as written, then with `.exe` appended; no other extension is ever appended, so `foo.1` never finds `foo.1.cmd`.
   - A bare name is looked for in PATH × PATHEXT, the folders outer and the extensions inner, as `Get-Command` orders them.
   - The current folder and relative PATH entries are never searched, and an extensionless shim is never found.
 

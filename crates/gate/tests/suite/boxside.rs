@@ -2205,6 +2205,21 @@ fn box_run_an_unknown_program_exits_127() {
     );
 }
 
+/// A bare name holding a dot that is not a `PATHEXT` extension, the shape a versioned Godot exe's derived name has, is
+/// found on the box's `PATH` as `<name>.exe`.
+#[test]
+fn box_run_finds_a_dotted_bare_name_with_exe_appended() {
+    let case = Case::new("box_run_dotted_bare_name");
+    copy_tool(&case, "fake.tool.v1.exe");
+    let mut payload = box_payload(&case, "k", &["fake.tool.v1", "out", "ran", "exit", "0"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path_for_run(&[case.folder()])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
+}
+
 /// Whether `line` is the box's line for a command it could not give a UTF-8 console, whatever the reason.
 fn is_console_fallback(line: &str) -> bool {
     line.strip_prefix("gate: remote could not give the command a UTF-8 console (")

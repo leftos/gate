@@ -60,6 +60,68 @@ fn a_name_with_an_extension_is_searched_on_path_as_written() {
 }
 
 #[test]
+fn a_dotted_bare_name_is_found_with_exe_appended() {
+    assert_eq!(
+        resolve(
+            "Godot_v4.7.2-stable_mono_win64_console",
+            &[r"C:\d3\Godot_v4.7.2-stable_mono_win64_console.exe"]
+        )
+        .as_deref(),
+        Some(r"C:\d3\Godot_v4.7.2-stable_mono_win64_console.exe")
+    );
+}
+
+#[test]
+fn a_dotted_bare_name_found_nowhere_is_none() {
+    assert_eq!(resolve("a.b", &[r"C:\d3\a.b.c", r"C:\d2\a.b.exe.txt"]), None);
+}
+
+#[test]
+fn a_pathext_extension_is_searched_as_written_only() {
+    assert_eq!(
+        resolve("tool.cmd", &[r"C:\d3\tool.cmd", r"C:\d3\tool.cmd.exe"]).as_deref(),
+        Some(r"C:\d3\tool.cmd"),
+        "tool.cmd with both tool.cmd and tool.cmd.exe is found as written"
+    );
+    assert_eq!(
+        resolve("tool.cmd", &[r"C:\d3\tool.cmd.exe"]),
+        None,
+        "tool.cmd with only tool.cmd.exe is not found"
+    );
+    assert_eq!(
+        resolve("tool.exe", &[r"C:\d3\tool.exe.exe"]),
+        None,
+        "tool.exe with only tool.exe.exe is not found"
+    );
+    assert_eq!(resolve("x.com", &[r"C:\d3\x.com.exe"]), None, "x.com with only x.com.exe is not found");
+}
+
+#[test]
+fn a_dotted_name_never_gains_a_batch_or_other_pathext_extension() {
+    assert_eq!(
+        resolve("foo.1", &[r"C:\d3\foo.1.cmd", r"C:\d3\foo.1.bat", r"C:\d3\foo.1.com"]),
+        None,
+        "only .exe is appended, so a dotted name never finds a .cmd, .bat or .com file"
+    );
+}
+
+#[test]
+fn a_pathext_extension_is_matched_ignoring_ascii_case() {
+    assert_eq!(resolve("TOOL.Exe", &[r"C:\d3\TOOL.Exe"]).as_deref(), Some(r"C:\d3\TOOL.Exe"));
+    assert_eq!(resolve("TOOL.Exe", &[r"C:\d3\TOOL.Exe.exe"]), None);
+}
+
+#[test]
+fn as_written_wins_over_the_appended_exe_within_one_folder() {
+    assert_eq!(resolve("a.b", &[r"C:\d3\a.b", r"C:\d3\a.b.exe"]).as_deref(), Some(r"C:\d3\a.b"));
+}
+
+#[test]
+fn path_order_decides_before_the_appended_exe() {
+    assert_eq!(resolve("a.b", &[r"C:\d3\a.b.exe", r"C:\d2\a.b"]).as_deref(), Some(r"C:\d3\a.b.exe"));
+}
+
+#[test]
 fn a_path_entry_that_is_not_absolute_is_skipped() {
     let search = ProgramSearch {
         path: r"bin;.;\rooted;C:relative;C:\d2",
