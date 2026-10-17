@@ -1700,7 +1700,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A status 75 is a refusal only when this run's refusal tag came on stderr before any start marker (`busy`, `tools` or `layout`, the fallback reason); a tag after the marker is ignored, so a command that prints the human busy, tools or layout line, or a tag of its own, and exits 75 ends with status 75 and no fallback.
 
-    Safety rests on order, not on the nonce being secret (the request is on no command line, but the nonce still appears in the run id, the pipe names and the archive name): the box says the marker before it creates the command's process, and the client ignores every tag once it has heard the marker.
+    Safety rests on order, not on the nonce being secret (the request is on no command line, but the nonce still appears in the run id, the pipe names and the archive name): the box says the marker before the command can run any code (before it creates the command's process, or, in a desktop run, while the command the helper created is still suspended), and the client ignores every tag once it has heard the marker.
   - **Warm-up call.** A call whose `warmth` is a warm-up (`Warmth::WarmUp` in `remote/mod.rs`) runs the phases above with the run call's payload built by `payload::warm_word`: the run's keys, `Timeout` always among them, with `WarmCommands` and `WarmHash` in place of `Command` and no `Outputs` or `OutputsFull` key. Its limits are a run's, from the call's `timeout`. `gate warm` makes such a call. A routed run's call carries `warmth: {"needs": <hash>}` instead, which only adds the `cold` comparison above.
 
     The run call's end is classed by `warm_end` in `remote/client.rs` and handed back as `RemoteOutcome.warm`. It is warm only on status 0, after the start marker, with the call's last stderr line that is neither a heartbeat nor a protocol line exactly `gate: remote warm {H}` for the `WarmHash` sent. A Ctrl+C is deleted: it leaves no record.
@@ -2386,7 +2386,7 @@ Built verbs:
 
   The text after `<why>` is escaped into one line.
 
-  After the checkout and the restores comes the desktop stage, in place of the command's start. It resolves the command's program first, so a program not found (127) or a refused batch word (2) never holds the desktop; looks at the stop signal; and takes the machine-wide desktop lock, the private-namespace mutex `gate\desktop`, waiting `DesktopWait` seconds at most, or the run's `Timeout` when that is shorter.
+  After the checkout and the restores comes the desktop stage, in place of the command's start. It resolves the command's program and the run's Godot (`resolved_command`, as a run with no desktop does) first, so a program not found (127) or a refused batch word (2) never holds the desktop; looks at the stop signal; and takes the machine-wide desktop lock, the private-namespace mutex `gate\desktop`, waiting `DesktopWait` seconds at most, or the run's `Timeout` when that is shorter.
 
   While another run holds it the box says `gate: remote waiting for the builder's desktop: another run holds it` once; a lock taken from a run that ended without releasing it says `gate: remote took the builder's desktop from a run that ended without releasing it`.
 
@@ -2889,12 +2889,16 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   A third helper, `fake-desktop-helper`, is the real desktop helper's code (`gate_desktop::run`) built beside `gate.exe`, so a box case can put it where the box looks for the installed one. It is built only with `--features test-seams` (`required-features`), and `gate`'s `test-seams` feature turns on `gate-desktop/test-seams` for it. With no argument it exits 10 (`HelperExit::BadArgument`).
 
-  The helper has four seams, environment variables that exist only in a `test-seams` build of it (unlike the `--test-*` flags). `GATE_DESKTOP_TEST_RECORD`, set to a file's path, has it add the pid of each child it creates to that file, one line each; the box then starts it in no job of its own, so a child the box failed to end outlives the run and a case can read the record.
+  The helper has four seams, environment variables that exist only in a `test-seams` build of it (unlike the `--test-*` flags). `GATE_DESKTOP_TEST_RECORD`, set to a file's path, has it add the pid of each child it creates to that file, one line each.
+
+  The box writes the line `stand-in <pid> <created>` (the stand-in's pid and creation time) there first, before it resumes the stand-in, and starts the stand-in in no job of its own, so a child the box failed to end outlives the run and a case can read the record.
 
   `GATE_DESKTOP_TEST_LIMIT_MS` caps each of its waits (connect, message, done) at that many whole milliseconds. `GATE_DESKTOP_TEST_PIPE_OWNER=user` makes it take a control pipe its own user owns in place of Administrators. A value of either that it cannot read (a limit that is not a whole number of milliseconds, an owner other than `user`) ends the helper at once with its bad-argument exit, 10.
 
+  The box sets the stand-in's cap to twice its own `--test-box-desktop-ms` cap, so the box's limits pass before the stand-in's.
+
   The last, `GATE_DESKTOP_TEST_FAULT`, names the step it breaks; absent, empty or unknown is no fault:
-  - `exit-before-hello` exits 13 before saying hello, `hang` answers nothing and waits until the pipe goes away (13) or its own message limit passes (18), and `wrong-version` says the build `0.0.0+fault`.
+  - `exit-before-hello` exits 13 before saying hello, `hang` answers nothing and waits until the pipe goes away (13) or its own done limit passes (18), the longest limit it keeps, so a box that keeps its message limit gives up first, and `wrong-version` says the build `0.0.0+fault`.
   - `lie-handle` reports the child's thread handle value as `process` (the real pid and thread), and `exit-after-create` creates its child, leaves it suspended and exits 19.
 - **No fixture from the checkout path.** No routing pattern, expected path or assertion is derived from where the repo is checked out; a case builds its own repository and routing file in its root. `checkout::repo_file` is the one route to a checked-in file (the install script), never for a path or pattern a case asserts on.
 - **Launcher cases** (GATE-41): `crates/gate/tests/suite/launcher.rs` has 8 cases. They run the synced `tools/gate.ps1`. A case's `LOCALAPPDATA` is its `appdata` folder, whose `gate\v1` is the default root with the real slot names, so every such case also sets `GATE_STATE_DIR` to a non-default folder. The flag-unset case points the launcher at a stub canonical gate through `CLAUDE_CONFIG_DIR`. A new suite module that calls `repo_file` updates the callers pin in `checkout.rs`.
