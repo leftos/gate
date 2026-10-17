@@ -9,8 +9,8 @@
 - [/] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [!] GATE-371 Route ops-tower's Playwright tests: the fixture server and browsers on the builder — High · Remote
-- [/] GATE-416 Route herdr-gpui's just ci to the builder — High · Remote
-- [/] GATE-417 Route collie's vitest and bun test gates to the builder — High · Remote
+- [!] GATE-417 Route collie's vitest and bun test gates to the builder — High · Remote
+- [ ] GATE-421 Install a routed repo's bun packages on the builder, as pnpm's are — High · Remote
 
 ## Remote
 
