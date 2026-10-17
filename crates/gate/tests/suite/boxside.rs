@@ -4726,37 +4726,68 @@ const NODE_MODULES_IGNORED: (&str, &str) = (".gitignore", "node_modules/\n");
 fn stub_pnpm(case: &Case, exit: i32, before: &str) -> PathBuf {
     let stub = case.folder().join(format!("stub-pnpm-{exit}"));
     fs::create_dir_all(&stub).expect("the stub folder can be made");
-    fs::write(
-        stub.join("pnpm.cmd"),
-        format!(
-            concat!(
-                "@echo off\r\n>>\"{counter}\" echo %CD%^|%*^|CI=%CI%\r\nif not \"%1\"==\"install\" exit /b 0\r\n",
-                "{before}if not exist node_modules mkdir node_modules\r\necho install: out\r\nexit /b {exit}\r\n"
-            ),
-            counter = shown(&counter(case)),
-            before = before,
-            exit = exit,
-        ),
-    )
-    .expect("the pnpm stub can be written");
+    fs::write(stub.join("pnpm.cmd"), stub_script(case, "", exit, before)).expect("the pnpm stub can be written");
     stub
 }
 
-/// Whether `folder` holds a `pnpm` named with any of the extensions a `PATHEXT` search tries.
-fn holds_pnpm(folder: &Path) -> bool {
+/// A folder holding a `bun.cmd` and a `bunx.cmd` that stand for bun and bunx as [`stub_pnpm`]'s `pnpm.cmd` stands for
+/// pnpm, each call's arguments in the counter file led by `bun ` or `bunx `, so a case tells which program the box ran.
+/// A case passes it through [`path_for_bun`], so its `PATH` holds this bun and bunx and no other.
+fn stub_bun(case: &Case, exit: i32, before: &str) -> PathBuf {
+    let stub = case.folder().join(format!("stub-bun-{exit}"));
+    fs::create_dir_all(&stub).expect("the stub folder can be made");
+    for program in ["bun", "bunx"] {
+        fs::write(
+            stub.join(format!("{program}.cmd")),
+            stub_script(case, &format!("{program} "), exit, before),
+        )
+        .expect("the bun stub can be written");
+    }
+    stub
+}
+
+/// The batch script of a package manager stub: each call appends `{working folder}|{tag}{arguments}|CI={%CI%}` to the
+/// case's counter file; an `install` then runs the batch script `before`, makes `node_modules` in its working folder,
+/// prints `install: out` and exits with `exit`, and any other call exits 0.
+fn stub_script(case: &Case, tag: &str, exit: i32, before: &str) -> String {
+    format!(
+        concat!(
+            "@echo off\r\n>>\"{counter}\" echo %CD%^|{tag}%*^|CI=%CI%\r\nif not \"%1\"==\"install\" exit /b 0\r\n",
+            "{before}if not exist node_modules mkdir node_modules\r\necho install: out\r\nexit /b {exit}\r\n"
+        ),
+        counter = shown(&counter(case)),
+        tag = tag,
+        before = before,
+        exit = exit,
+    )
+}
+
+/// Whether `folder` holds a `program` named with any of the extensions a `PATHEXT` search tries.
+fn holds(folder: &Path, program: &str) -> bool {
     ["exe", "cmd", "bat", "com"]
         .iter()
-        .any(|extension| folder.join(format!("pnpm.{extension}")).is_file())
+        .any(|extension| folder.join(format!("{program}.{extension}")).is_file())
+}
+
+/// [`path_for_run`] less every folder holding one of `programs` too, after `folders`.
+fn path_without(folders: &[PathBuf], programs: &[&str]) -> OsString {
+    let own = path_for_run(&[]);
+    let without = std::env::split_paths(&own).filter(|folder| !programs.iter().any(|program| holds(folder, program)));
+    std::env::join_paths(folders.iter().cloned().chain(without)).expect("the folders join into a PATH")
 }
 
 /// [`path_for_run`] less every folder holding a `pnpm` too, so the box finds the stub's pnpm or none.
 fn path_for_pnpm(folders: &[PathBuf]) -> OsString {
-    let own = path_for_run(&[]);
-    let without_pnpm = std::env::split_paths(&own).filter(|folder| !holds_pnpm(folder));
-    std::env::join_paths(folders.iter().cloned().chain(without_pnpm)).expect("the folders join into a PATH")
+    path_without(folders, &["pnpm"])
 }
 
-/// `gate box run` of `payload` with `PATH` set to `path` and no `CI` variable, so only the box's install sets one.
+/// [`path_for_run`] less every folder holding a `bun` or a `bunx` too, so the box finds the stub's bun or none.
+fn path_for_bun(folders: &[PathBuf]) -> OsString {
+    path_without(folders, &["bun", "bunx"])
+}
+
+/// `gate box run` of `payload` with `PATH` set to `path` and no `CI` variable, so only the box's install sets one; a
+/// bun case's too.
 fn pnpm_box(case: &Case, payload: &Value, path: &OsString) -> BoxCall {
     let mut call = box_call(case, &["box", "run"], &self::payload(payload));
     call.env("PATH", path);
@@ -4764,7 +4795,8 @@ fn pnpm_box(case: &Case, payload: &Value, path: &OsString) -> BoxCall {
     call
 }
 
-/// The calls the case's stub pnpm saw, each `{working folder}|{arguments}|CI={value}`, the folder in upper case.
+/// The calls the case's stub pnpm saw, each `{working folder}|{arguments}|CI={value}`, the folder in upper case; with
+/// [`stub_bun`] too, its calls' arguments led by `bun ` or `bunx `.
 fn pnpm_calls(case: &Case) -> Vec<String> {
     counter_lines(case)
         .iter()
@@ -4780,7 +4812,21 @@ fn install_call(folder: &str) -> String {
     format!("{}|install --frozen-lockfile|CI=true", folder.to_uppercase())
 }
 
-/// The call of the command `words` the stub pnpm sees in `folder`, run without a `CI` variable.
+/// The call of the box's install the stub bun sees in `folder`.
+fn bun_install_call(folder: &str) -> String {
+    format!("{}|bun install --frozen-lockfile|CI=true", folder.to_uppercase())
+}
+
+/// How many of the stub bun's calls were installs.
+fn bun_installs(case: &Case) -> usize {
+    pnpm_calls(case)
+        .iter()
+        .filter(|call| call.contains("|bun install --frozen-lockfile|"))
+        .count()
+}
+
+/// The call of the command `words` the stub pnpm sees in `folder`, run without a `CI` variable; a stub bun's or
+/// bunx's command has its program as its first word.
 fn command_call(folder: &str, words: &str) -> String {
     format!("{}|{words}|CI=", folder.to_uppercase())
 }
@@ -4793,9 +4839,14 @@ fn installs(case: &Case) -> usize {
         .count()
 }
 
-/// Whether `outcome` said the install's elapsed line, ending in `tail` after the seconds.
+/// Whether `outcome` said the pnpm install's elapsed line, ending in `tail` after the seconds.
 fn said_install_took(outcome: &Outcome, tail: &str) -> bool {
-    let shape = Regex::new(&format!(r"^gate: pnpm install took \d+\.\d s{}$", regex::escape(tail))).expect("the pattern compiles");
+    said_took(outcome, "pnpm", tail)
+}
+
+/// Whether `outcome` said the elapsed line of the install of the manager `name`, ending in `tail` after the seconds.
+fn said_took(outcome: &Outcome, name: &str, tail: &str) -> bool {
+    let shape = Regex::new(&format!(r"^gate: {name} install took \d+\.\d s{}$", regex::escape(tail))).expect("the pattern compiles");
     outcome.stderr.lines().any(|line| shape.is_match(line))
 }
 
@@ -5330,6 +5381,236 @@ fn box_run_the_pnpm_install_gets_safe_directory() {
         said.lines().any(|line| line == format!("GIT_CONFIG_VALUE_{index}=*")),
         "safe.directory is `*`: {said:?}"
     );
+}
+
+/// The lockfile a bun case's snapshot holds, and its path at the work folder's root.
+const BUN_LOCKFILE: &str = "{\n  \"lockfileVersion\": 1\n}\n";
+const BUN_LOCKFILE_PATH: &str = "bun.lock";
+
+/// A bun case's payload of `command` with `files` snapshotted beside the ignore file and the root's lockfile.
+fn bun_payload(case: &Case, command: &[&str], files: &[(&str, &str)]) -> Value {
+    let mut payload = box_payload(case, "k", command);
+    let mut all = vec![NODE_MODULES_IGNORED, (BUN_LOCKFILE_PATH, BUN_LOCKFILE)];
+    all.extend_from_slice(files);
+    snapshot(case, &mut payload, &all);
+    payload
+}
+
+#[test]
+fn box_run_installs_bun_packages_in_the_nearest_lockfile_folder_before_a_bunx_command() {
+    let case = Case::new("box_run_bun_install");
+    let mut payload = box_payload(&case, "k", &["bunx", "vitest", "run"]);
+    payload["Subfolder"] = json!("web");
+    snapshot(
+        &case,
+        &mut payload,
+        &[
+            NODE_MODULES_IGNORED,
+            (BUN_LOCKFILE_PATH, BUN_LOCKFILE),
+            ("web/bun.lock", BUN_LOCKFILE),
+            ("web/package.json", "{}\n"),
+        ],
+    );
+    let stub = stub_bun(&case, 0, "");
+
+    let outcome = pnpm_box(&case, &payload, &path_for_bun(&[stub])).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let web = format!(r"{}\web", field(&payload, "Work"));
+    assert_eq!(
+        pnpm_calls(&case),
+        [bun_install_call(&web), command_call(&web, "bunx vitest run")],
+        "bun's install in web, the nearest lockfile's folder, then the command: {outcome:?}"
+    );
+    assert!(
+        outcome.stdout.contains("install: out"),
+        "the install's output passes through: {outcome:?}"
+    );
+    assert!(said_took(&outcome, "bun", " in web"), "the elapsed line names the folder: {outcome:?}");
+    let record = fs::read_to_string(packages_record(&payload)).expect("the record is written");
+    let shape = Regex::new(r"^bun:web\t[0-9a-f]{64}\n$").expect("the pattern compiles");
+    assert!(shape.is_match(&record), "bun's line for web: {record:?}");
+    assert!(Path::new(&web).join("node_modules").is_dir(), "the install's folder stays");
+    assert!(
+        !Path::new(field(&payload, "Work")).join("node_modules").exists(),
+        "no install at the root"
+    );
+}
+
+#[test]
+fn box_run_skips_the_bun_install_while_the_lockfile_and_node_modules_are_unchanged() {
+    let case = Case::new("box_run_bun_unchanged");
+    let payload = bun_payload(&case, &["bun", "test"], &[]);
+    let path = path_for_bun(&[stub_bun(&case, 0, "")]);
+    let first = pnpm_box(&case, &payload, &path).finish();
+    assert_eq!(first.code, Some(0), "{first:?}");
+
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    let work = field(&payload, "Work");
+    assert_eq!(
+        pnpm_calls(&case),
+        [bun_install_call(work), command_call(work, "bun test"), command_call(work, "bun test")],
+        "one install, the command in both runs: {second:?}"
+    );
+    assert!(!second.stderr.contains("gate: bun install took"), "{second:?}");
+}
+
+#[test]
+fn box_run_installs_bun_packages_again_when_package_json_changes() {
+    let case = Case::new("box_run_bun_package_json_changed");
+    let mut payload = bun_payload(&case, &["bun", "test"], &[("package.json", "{}\n")]);
+    let path = path_for_bun(&[stub_bun(&case, 0, "")]);
+    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+
+    let changed = push_snapshot(&case, &payload, &[("package.json", "{\"name\": \"x\"}\n")]);
+    payload["Snapshot"] = json!(changed);
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert_eq!(bun_installs(&case), 2, "a changed package.json installs again: {second:?}");
+    assert!(said_took(&second, "bun", ""), "{second:?}");
+}
+
+#[test]
+fn box_run_skips_the_bun_install_when_node_modules_is_not_ignored() {
+    let case = Case::new("box_run_bun_not_ignored");
+    let mut payload = box_payload(&case, "k", &["bun", "test"]);
+    snapshot(&case, &mut payload, &[(BUN_LOCKFILE_PATH, BUN_LOCKFILE)]);
+
+    let outcome = pnpm_box(&case, &payload, &path_for_bun(&[stub_bun(&case, 0, "")])).finish();
+
+    assert_eq!(outcome.code, Some(0), "the command still runs: {outcome:?}");
+    assert!(
+        lines(&outcome.stderr).contains(&"gate: remote bun install skipped: node_modules is not ignored in ."),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        pnpm_calls(&case),
+        [command_call(field(&payload, "Work"), "bun test")],
+        "no install: {outcome:?}"
+    );
+    assert!(!Path::new(&packages_record(&payload)).exists(), "no record");
+}
+
+#[test]
+fn box_run_a_bun_install_drops_the_pnpm_line_of_its_folder_so_pnpm_installs_again() {
+    let case = Case::new("box_run_bun_then_pnpm");
+    let payload = bun_payload(
+        &case,
+        &["pnpm", "run", "x"],
+        &[(PNPM_LOCKFILE_PATH, PNPM_LOCKFILE), ("package.json", "{}\n")],
+    );
+    let mut bun = renamed(&payload, 1);
+    bun["Command"] = json!(["bun", "run", "x"]);
+    // The stubs lead the `PATH`, so a real pnpm after them is never found.
+    let path = path_for_bun(&[stub_pnpm(&case, 0, ""), stub_bun(&case, 0, "")]);
+    let only = |key: &str| Regex::new(&format!(r"^{key}\t[0-9a-f]{{64}}\n$")).expect("the pattern compiles");
+    let record = || fs::read_to_string(packages_record(&payload)).expect("the record is written");
+
+    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+    let after_bun = pnpm_box(&case, &bun, &path).finish();
+    assert_eq!(after_bun.code, Some(0), "{after_bun:?}");
+    assert!(only(r"bun:\.").is_match(&record()), "bun's install dropped pnpm's line: {:?}", record());
+    let again = pnpm_box(&case, &renamed(&payload, 2), &path).finish();
+
+    assert_eq!(again.code, Some(0), "{again:?}");
+    let work = field(&payload, "Work");
+    assert_eq!(
+        pnpm_calls(&case),
+        [
+            install_call(work),
+            command_call(work, "run x"),
+            bun_install_call(work),
+            command_call(work, "bun run x"),
+            install_call(work),
+            command_call(work, "run x"),
+        ],
+        "pnpm installs again over bun's node_modules: {again:?}"
+    );
+    assert!(only(r"\.").is_match(&record()), "pnpm's install dropped bun's line: {:?}", record());
+}
+
+#[test]
+fn box_run_a_failed_pnpm_install_drops_the_bun_line_of_its_folder_so_bun_installs_again() {
+    let case = Case::new("box_run_bun_then_failed_pnpm");
+    let payload = bun_payload(
+        &case,
+        &["bun", "run", "x"],
+        &[(PNPM_LOCKFILE_PATH, PNPM_LOCKFILE), ("package.json", "{}\n")],
+    );
+    let mut pnpm = renamed(&payload, 1);
+    pnpm["Command"] = json!(["pnpm", "run", "x"]);
+    // The stubs lead the `PATH`, so a real pnpm after them is never found.
+    let path = path_for_bun(&[stub_pnpm(&case, 3, ""), stub_bun(&case, 0, "")]);
+
+    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+    let failed = pnpm_box(&case, &pnpm, &path).finish();
+    assert_eq!(failed.code, Some(75), "{failed:?}");
+    let again = pnpm_box(&case, &renamed(&payload, 2), &path).finish();
+
+    assert_eq!(again.code, Some(0), "{again:?}");
+    let work = field(&payload, "Work");
+    assert_eq!(
+        pnpm_calls(&case),
+        [
+            bun_install_call(work),
+            command_call(work, "bun run x"),
+            install_call(work),
+            bun_install_call(work),
+            command_call(work, "bun run x"),
+        ],
+        "bun installs again over the failed pnpm install's node_modules: {again:?}"
+    );
+    let record = fs::read_to_string(packages_record(&payload)).expect("the record is written");
+    let shape = Regex::new(r"^bun:\.\t[0-9a-f]{64}\n$").expect("the pattern compiles");
+    assert!(shape.is_match(&record), "bun's line alone: {record:?}");
+}
+
+#[test]
+fn box_run_installs_bun_packages_for_a_bun_lockb_alone() {
+    let case = Case::new("box_run_bun_lockb");
+    let mut payload = box_payload(&case, "k", &["bun", "test"]);
+    snapshot(&case, &mut payload, &[NODE_MODULES_IGNORED, ("bun.lockb", "binary lockfile\n")]);
+
+    let outcome = pnpm_box(&case, &payload, &path_for_bun(&[stub_bun(&case, 0, "")])).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let work = field(&payload, "Work");
+    assert_eq!(pnpm_calls(&case), [bun_install_call(work), command_call(work, "bun test")], "{outcome:?}");
+    let record = fs::read_to_string(packages_record(&payload)).expect("the record is written");
+    let shape = Regex::new(r"^bun:\.\t[0-9a-f]{64}\n$").expect("the pattern compiles");
+    assert!(shape.is_match(&record), "bun's line for the root: {record:?}");
+}
+
+#[test]
+fn box_run_refuses_tools_when_the_bun_install_fails() {
+    let case = Case::new("box_run_bun_install_fails");
+    let payload = bun_payload(&case, &["bunx", "vitest", "run"], &[]);
+
+    let outcome = pnpm_box(&case, &payload, &path_for_bun(&[stub_bun(&case, 3, "")])).finish();
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    let said = lines(&outcome.stderr);
+    let tag = refused_line(&payload, "tools");
+    let failed = said.iter().position(|line| *line == "gate: remote package restore failed (status 3)");
+    let tagged = said.iter().position(|line| *line == tag);
+    let refused = said
+        .iter()
+        .position(|line| *line == "gate: remote work folder k could not restore its bun packages");
+    assert!(
+        matches!((failed, tagged, refused), (Some(failed), Some(tagged), Some(refused)) if failed < tagged && tagged + 1 == refused),
+        "the status line, then the tag just before the packages line: {outcome:?}"
+    );
+    assert!(said_took(&outcome, "bun", ""), "the elapsed line of a failed install: {outcome:?}");
+    assert_eq!(
+        pnpm_calls(&case),
+        [bun_install_call(field(&payload, "Work"))],
+        "bun installed, and the command never ran: {outcome:?}"
+    );
+    assert!(!Path::new(&packages_record(&payload)).exists(), "no record");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 
 /// A command the box's ceiling cases run that never ends on its own within any case's time.

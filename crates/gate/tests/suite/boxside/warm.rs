@@ -13,9 +13,10 @@ use serde_json::{Value, json};
 use regex::Regex;
 
 use super::{
-    ENDLESS, Folders, NODE_MODULES_IGNORED, PNPM_LOCKFILE, PNPM_LOCKFILE_PATH, box_call, command_call, fake_godot, field, gate_box, godot_root,
-    has_ref, install_call, installs, let_go, lines_starting, marks, pair_payload, pair_snapshot, pair_tree, passed, path_for_pnpm, pnpm_box,
-    pnpm_calls, renamed, run_box, run_box_with_godot, run_box_with_seams, snapshot, started_line, stopped_line_for, stub_pnpm,
+    BUN_LOCKFILE, BUN_LOCKFILE_PATH, ENDLESS, Folders, NODE_MODULES_IGNORED, PNPM_LOCKFILE, PNPM_LOCKFILE_PATH, box_call, bun_install_call,
+    command_call, fake_godot, field, gate_box, godot_root, has_ref, install_call, installs, let_go, lines_starting, marks, pair_payload,
+    pair_snapshot, pair_tree, passed, path_for_bun, path_for_pnpm, pnpm_box, pnpm_calls, refused_line, renamed, run_box, run_box_with_godot,
+    run_box_with_seams, snapshot, started_line, stopped_line_for, stub_bun, stub_pnpm,
 };
 use crate::support::{Case, FAKE_TOOL, GATE, Outcome, box_payload, shown, wait_until, wait_until_closed};
 
@@ -245,6 +246,69 @@ fn box_warm_up_restores_pnpm_packages_before_its_marker() {
     let took = said.iter().position(|line| line.starts_with("gate: pnpm install took "));
     let marker = said.iter().position(|line| *line == started_line(&payload));
     assert!(took.is_some() && took < marker, "the install before the marker: {outcome:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_warm_up_restores_bun_packages_before_its_marker() {
+    let case = Case::new("box_warm_up_bun");
+    let mut payload = warm_payload(&case, &[&["bunx", "vitest", "run"], &[FAKE_TOOL, "exit", "0"], &["bun", "test"]]);
+    snapshot(
+        &case,
+        &mut payload,
+        &[NODE_MODULES_IGNORED, (BUN_LOCKFILE_PATH, BUN_LOCKFILE), ("package.json", "{}\n")],
+    );
+    let stub = stub_bun(&case, 0, "");
+
+    let outcome = pnpm_box(&case, &payload, &path_for_bun(&[stub])).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let work = field(&payload, "Work");
+    assert_eq!(
+        pnpm_calls(&case),
+        [
+            bun_install_call(work),
+            command_call(work, "bunx vitest run"),
+            command_call(work, "bun test")
+        ],
+        "one install for the one lockfile, then the commands: {outcome:?}"
+    );
+    let said: Vec<&str> = outcome.stderr.lines().collect();
+    let took = said.iter().position(|line| line.starts_with("gate: bun install took "));
+    let marker = said.iter().position(|line| *line == started_line(&payload));
+    assert!(took.is_some() && took < marker, "the install before the marker: {outcome:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_warm_up_refuses_commands_that_need_pnpm_and_bun_in_one_folder() {
+    let case = Case::new("box_warm_up_pnpm_and_bun");
+    let mut payload = warm_payload(&case, &[&["pnpm", "run", "a"], &["bun", "test"]]);
+    snapshot(
+        &case,
+        &mut payload,
+        &[
+            NODE_MODULES_IGNORED,
+            (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE),
+            (BUN_LOCKFILE_PATH, BUN_LOCKFILE),
+            ("package.json", "{}\n"),
+        ],
+    );
+    let path = path_for_bun(&[stub_pnpm(&case, 0, ""), stub_bun(&case, 0, "")]);
+
+    let outcome = pnpm_box(&case, &payload, &path).finish();
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    let said: Vec<&str> = outcome.stderr.lines().collect();
+    let tag = refused_line(&payload, "tools");
+    let tagged = said.iter().position(|line| *line == tag);
+    assert!(
+        tagged.and_then(|at| said.get(at + 1)) == Some(&"gate: remote work folder k uses both pnpm and bun in ."),
+        "the tag, then the line naming the folder: {outcome:?}"
+    );
+    assert!(pnpm_calls(&case).is_empty(), "no install and no command: {outcome:?}");
+    assert!(!said.contains(&started_line(&payload).as_str()), "no marker: {outcome:?}");
+    assert!(!Path::new(&format!("{}.packages", field(&payload, "Work"))).exists(), "no record");
     wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 

@@ -2215,7 +2215,7 @@ The box gives each run's command its own build servers: the command's environmen
 
 So no other run's command, on the box or on the PC, uses the compiler server or the MSBuild nodes this one starts, and no node idles in the job after its build (an idle node would keep alive anything in the command that waits on its whole tree).
 
-The box's own git calls, tool restore and pnpm install do not get these settings.
+The box's own git calls, tool restore and package install do not get these settings.
 
 The servers a run starts live in its job and are ended at its end, so every routed build starts its own nodes and compiler server; none is kept warm between runs.
 
@@ -2298,7 +2298,7 @@ Built verbs:
 
   The start marker: just before it launches the command, before the donor console and the launch, the box says `gate-remote-started: <nonce>` on stderr once, with the payload's `Nonce`; a launch then refused or stopped has said it too. A warm-up says it once, after every tool and pnpm restore and before its first command, and not again before the later ones.
 
-  Warm-up: a `run` with `WarmCommands` lays out and readies the work folder, restores the tools and the pnpm packages of every command, as a run does, then removes `{Work}.warm`, says the start marker and runs each command in order as a run's command is run (the stop signal looked at before each). It makes no back commit and packs no outputs, and on a pair run never says `gate: remote back commits: ...`. The payload's `Timeout` is one budget for all the commands: each command's ceiling is what the earlier ones left of it, in whole seconds rounded up, counting each one's load-adjusted seconds (its wall time once the sampler failed).
+  Warm-up: a `run` with `WarmCommands` lays out and readies the work folder, restores the tools and the pnpm and bun packages of every command, as a run does, then removes `{Work}.warm`, says the start marker and runs each command in order as a run's command is run (the stop signal looked at before each). It makes no back commit and packs no outputs, and on a pair run never says `gate: remote back commits: ...`. The payload's `Timeout` is one budget for all the commands: each command's ceiling is what the earlier ones left of it, in whole seconds rounded up, counting each one's load-adjusted seconds (its wall time once the sampler failed).
 
   The first command that ends non-zero or is killed ends the warm-up with `gate: remote warm-up stopped at command <k> of <n>` on stderr and that command's status (124 for a kill). A budget spent before command `k` ends it with `gate: remote warm-up ran out of its <s> s budget before command <k> of <n>` and exit 124. Once every command passed, the box writes `{Work}.warm` holding exactly `WarmHash` and says `gate: remote warm <hash>` last, exit 0. A record that cannot be removed or written says `gate: remote could not remove <Work>.warm: <error>` or `gate: remote could not write <Work>.warm: <error>` and exits 1.
 
@@ -2346,7 +2346,7 @@ Built verbs:
 
   A name given twice in any ASCII case is refused; names are ASCII, so that is also how Windows compares them. A refusal line shows the name shortened to 200 characters and escaped.
 
-  The pairs apply to the command only, never to the box's own steps (the git steps, the tool restore, the pnpm install).
+  The pairs apply to the command only, never to the box's own steps (the git steps, the tool restore, the package install).
 
   `Key` is `[A-Za-z0-9_-]+` and is the last name of `Work`; `Job` is `Local\gate-remote-<Key>-<12 hex digits>`. `run`, `stop` and `preflight` check the key; `run` and `stop` check the job.
 
@@ -2362,7 +2362,7 @@ Built verbs:
 
   The layout record `<Work>.layout`, beside the lock, says which layout `Work` holds: `single`, `pair {Leaf} {siblings}` (the siblings sorted without regard to ASCII case, one space before each, so the same siblings in another order are one layout) or `changing` while the folder is being cleared. A missing record says `single`. It is read and written as the tools record is, through a handle that refuses a link, a folder or a file with more than one name.
 
-  The records beside the lock, one file each, named `Work` plus: `.lock` (the run's lock), `.index` (the sync-back's copy of the index), `.layout` (above), `.inputs` (the copies the `inputs` verb left), `.tools` (the dotnet tool restore), `.packages` (the pnpm package restore) and `.warm` (the hash of the warm-up file whose commands last passed in the folder, 64 lower-case hex digits, no line end, written only by a warm-up). Each is described where its feature is.
+  The records beside the lock, one file each, named `Work` plus: `.lock` (the run's lock), `.index` (the sync-back's copy of the index), `.layout` (above), `.inputs` (the copies the `inputs` verb left), `.tools` (the dotnet tool restore), `.packages` (the pnpm and bun package restore) and `.warm` (the hash of the warm-up file whose commands last passed in the folder, 64 lower-case hex digits, no line end, written only by a warm-up). Each is described where its feature is.
 
   The warm record is removed before a warm-up's first command, when a run finds the layout changed (before `changing` is written) and when the work folder is missing and the run makes it, so it never outlives the folder state it describes. The preflight reads it without taking the lock, sharing reading, writing and deletion.
 
@@ -2384,7 +2384,7 @@ Built verbs:
 
   A payload without `InputsDigest` skips the check. The PC reads the `inputs` tag as fallback reason `inputs` and says `gate: remote <host> inputs; running here`, with `gate: remote inputs not sent: the builder's work folder does not hold the inputs sent` in the log.
 
-  The steps are the layout, fetch, the commit probe, checkout, clean and the back ref reset (each of the three git steps once per repo on a pair run, the main repo first), the dotnet tool restore, the pnpm package restore, then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset> failed (status <n>)` and exits `n`.
+  The steps are the layout, fetch, the commit probe, checkout, clean and the back ref reset (each of the three git steps once per repo on a pair run, the main repo first), the dotnet tool restore, the package restore (pnpm or bun), then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset> failed (status <n>)` and exits `n`.
 
   The clean is `git clean -fdq`, with no `-x`, so a work folder keeps its ignored files between runs; a Godot project's `.godot` folder is one, so it persists from one routed run to the next.
 
@@ -2420,19 +2420,35 @@ Built verbs:
 
   Known limit, as in PowerShell: after the builder's NuGet cache is cleared, the `*.tools` records must be deleted by hand.
 
-  The package restore (`boxside/packages.rs`) runs for a routed command whose first word's file stem is `pnpm`, in any case, after the tool restore and before the command. A run whose commands include more than one pnpm command (a warm-up's) installs once per distinct lockfile folder, in the commands' order, before the first command, and stops at the first install that fails. It looks for the folder to install in, for each command, from `--dir` or `-C`, read only among pnpm's own options before the first non-option word, else the place folder, and walks up from it to the work root (the main tree on a pair run) for the first `pnpm-lock.yaml`; a walk that finds none does nothing.
+  The package restore (`boxside/packages.rs`) runs for a routed command whose first word's file stem is `pnpm`, `bun` or `bunx`, in any case, after the tool restore and before the command. A run whose commands include more than one such command (a warm-up's) installs once per distinct lockfile folder and manager, in the commands' order, before the first command, and stops at the first install that fails.
 
-  It runs `pnpm install --frozen-lockfile` in the lockfile's folder in a job of its own named `{job}-packages`, created kill-on-close and never handed to pnpm, with the command's restricted token (the box's own is never the fallback) and the box's environment plus `CI=true` and git's `safe.directory=*`. Its output is forwarded as the tool restore's is, and it has no time limit (GATE-159).
+  It looks for the folder to install in, for each command, from the start folder, and walks up from it to the work root (the main tree on a pair run) for the first lockfile (`pnpm-lock.yaml` for pnpm, `bun.lock` or `bun.lockb` for bun); a walk that finds none does nothing.
 
-  The record `{Work}.packages`, beside `{Work}.tools`, is UTF-8 lines `{folder}\t{64 lower-case hex digits}\n`, sorted, `.` for the root and `\` between folder names. The hash is SHA-256 over each of `pnpm-lock.yaml`, `package.json`, `pnpm-workspace.yaml` and `.npmrc` that exists in the folder, in that order: its name, a NUL, its bytes, a NUL. The install is skipped while the folder's line matches and `node_modules` there is a real folder.
+  The pnpm start folder is `--dir` or `-C`, read only among pnpm's own options before the first non-option word, else the place folder.
+
+  The bun start folder is read from `--cwd`. Before the subcommand only `--cwd=<d>` counts and a bare `--cwd` ends the scan. After `run` or `test`, both `--cwd <d>` and `--cwd=<d>` count, up to the script or test path. An option that takes a value ends the scan, as with pnpm. For `bunx` and `bun x` the start folder is the place folder and every `--cwd` is ignored, because bun looks the bin up from the real cwd even with `--cwd=`.
+
+  It runs `pnpm install --frozen-lockfile`, or `bun install --frozen-lockfile` with the `bun` on the box's PATH (never `bunx`), in the lockfile's folder in a job of its own named `{job}-packages`, created kill-on-close and never handed to the manager, with the command's restricted token (the box's own is never the fallback) and the box's environment plus `CI=true` and git's `safe.directory=*`. Its output is forwarded as the tool restore's is, and it has no time limit (GATE-159).
+
+  Bun is not a probed tool: a box without bun refuses at the install's start, as it does for pnpm.
+
+  The record `{Work}.packages`, beside `{Work}.tools`, is UTF-8 lines `{folder}\t{64 lower-case hex digits}\n`, sorted, `.` for the root and `\` between folder names. A bun line is keyed `bun:{folder}`, beside pnpm's bare-folder lines.
+
+  The pnpm hash is SHA-256 over each of `pnpm-lock.yaml`, `package.json`, `pnpm-workspace.yaml` and `.npmrc` that exists in the folder, in that order: its name, a NUL, its bytes, a NUL. The bun hash is built the same way over `bun.lock`, `bun.lockb`, `package.json`, `bunfig.toml` and `.npmrc`, each only when present. The install is skipped while the folder's line matches and `node_modules` there is a real folder.
+
+  An install that starts drops the other manager's line for its folder before it runs, whether it then passes, fails or is stopped, so a folder holds at most one manager's line and the other manager reinstalls on its next command. A request or warm-up whose commands need both pnpm and bun in one lockfile folder installs nothing: it prints `gate-remote-refused: <nonce> tools` then `gate: remote work folder <key> uses both pnpm and bun in <folder>` and exits 75.
 
   Before it installs, the box asks git, with its own token, `git -c core.hooksPath=<lock>\hooks -c core.fsmonitor=false --git-dir=<work>\.git --work-tree=<work> check-ignore -q <folder>/node_modules/`, and the install runs only when git ignores `node_modules` there.
 
-  An install that exits, passing or failing, first prints `gate: pnpm install took <s> s` (` in <folder>` after it when the folder is not the root of the work folder), after its own output. One that cannot start prints `gate: remote could not start the pnpm install: <message>` (`cannot make its restricted token: <error>` when the token cannot be made); a non-zero one prints `gate: remote package restore failed (status <n>)` then `gate-remote-refused: <nonce> tools` and `gate: remote work folder <key> could not restore its pnpm packages`, and exits 75 with the command never started, as the tool restore's does.
+  An install that exits, passing or failing, first prints `gate: pnpm install took <s> s` (`gate: bun install took <s> s` for bun; ` in <folder>` after it when the folder is not the root of the work folder), after its own output.
+
+  One that cannot start prints `gate: remote could not start the pnpm install: <message>` (`bun install` for bun; `cannot make its restricted token: <error>` when the token cannot be made); a non-zero one prints `gate: remote package restore failed (status <n>)` then `gate-remote-refused: <nonce> tools` and `gate: remote work folder <key> could not restore its pnpm packages` (`bun packages` for bun), and exits 75 with the command never started, as the tool restore's does.
 
   A stop already set, a stop during the install and a client that closes the connection give the tool restore's lines naming `{job}-packages`: `the job {job}-packages was stopped before the command started`, `gate: remote stopped job {job}-packages` and `gate: remote the client closed the connection; stopping job {job}-packages`. A process that keeps the install's output open after the job ended prints `gate: remote the package restore's output is still held open by a leftover process; stopped reading`.
 
-  The install is skipped, with the command still run, when the folder pnpm starts in lies outside the work root (`gate: remote pnpm install skipped: <folder> is outside the work root`), when a folder from the work root down to the lockfile's is a link or a junction (`... <folder> is reached through a link`) or when git does not ignore `node_modules` there (`gate: remote pnpm install skipped: node_modules is not ignored in <folder>`); git that cannot say prints `gate: remote could not ask git whether node_modules is ignored in <folder>: <error | status n>`.
+  The install is skipped, with the command still run, when the folder the manager starts in lies outside the work root (`gate: remote pnpm install skipped: <folder> is outside the work root`), when a folder from the work root down to the lockfile's is a link or a junction (`... <folder> is reached through a link`) or when git does not ignore `node_modules` there (`gate: remote pnpm install skipped: node_modules is not ignored in <folder>`); the bun lines read `gate: remote bun install skipped: ...` alike.
+
+  Git that cannot say prints `gate: remote could not ask git whether node_modules is ignored in <folder>: <error | status n>`.
 
   A lockfile or package file that cannot be read prints `gate: remote could not read the lockfile <path>: <error>` or `gate: remote could not read the package file <path>: <error>`, and a record that cannot be written prints `gate: remote could not write <Work>.packages: <error>`; these exit 1. A record that cannot be read prints `gate: remote could not read <Work>.packages: <error>; installing the packages` and installs. Folders and paths in every line are escaped.
 
@@ -2498,7 +2514,7 @@ Built verbs:
 
   The ssh logon's NETWORK group (S-1-5-2) is made deny-only in it, so WMI does not treat the command's calls as remote and `taskkill`, `tasklist` and `Get-CimInstance` work from the command (with NETWORK enabled they fail with `ERROR: Access denied`). `gate_win32::NetworkGroup` (`Absent`, `Enabled`, `DenyOnly`, `Disabled`) and `TokenFacts::network` report the group's state.
 
-  The console donor and console keeper `cmd.exe` run with the same restricted token, so no elevated process shares the command's console. The box itself, its git calls and its tool restore keep the box's own token; the pnpm install runs with the command's restricted token, with no fallback to the box's own.
+  The console donor and console keeper `cmd.exe` run with the same restricted token, so no elevated process shares the command's console. The box itself, its git calls and its tool restore keep the box's own token; the pnpm and bun installs run with the command's restricted token, with no fallback to the box's own.
 
   The restriction makes the command's token non-elevated with NETWORK deny-only, but it is still a network logon's token and lacks INTERACTIVE, so it is not the token a local run's command has; it is not a boundary against the command, whose code is trusted, since the box's elevated git and tool restore later read what the command wrote.
 
@@ -2606,7 +2622,7 @@ Built verbs:
 
   A terminate after the first that fails is not a failure of the stop: it is said once, `gate: remote could not terminate job <name> again: <error>`, after the other lines. An event that cannot be set prints `gate: remote could not signal the stop of job <name>: <error>` on stderr, and the job is terminated all the same. A stopped job prints `gate: remote stopped job <name>` on stdout and exits 0; no such job exits 0 with no output.
 
-  The stop also ends the run's tool restore job `<name>-tools` and its pnpm install job `<name>-packages` when they exist: it opens each before it sets the event and terminates it after the payload's job, with the same lines and rules for `<name>-tools` and `<name>-packages`. It exits 1 when any job is left with processes or cannot be stopped, else 0.
+  The stop also ends the run's tool restore job `<name>-tools` and its package install job `<name>-packages` when they exist: it opens each before it sets the event and terminates it after the payload's job, with the same lines and rules for `<name>-tools` and `<name>-packages`. It exits 1 when any job is left with processes or cannot be stopped, else 0.
 
   Processes still alive 10 s after the termination print `gate: remote job <name> still has <n> process(es) 10 s after it was terminated` and exit 1, and a job that cannot be terminated prints `gate: remote could not stop job <name>: <error>` and exits 1.
 

@@ -1,12 +1,16 @@
-//! The repo's pnpm packages, installed before a routed `pnpm` command, after the dotnet tool restore: the
-//! `pnpm-lock.yaml` nearest the folder pnpm starts in, never above the main repo's tree, has its folder's package files
-//! hashed and compared with that folder's line in the work folder's `<Work>.packages` record, so `pnpm install
-//! --frozen-lockfile` runs there only when a package file changed or `node_modules` is gone, and only when git ignores
-//! `node_modules` and no folder from the work root down to the lockfile's is a link or a junction. The install runs
-//! with the command's restricted token, its `safe.directory` and `CI=true`, in a job of its own that ends every process
-//! in it when the box's handle to it closes; its two streams are forwarded like the command's. It ends when it ends,
-//! when a stop sets the run's stop signal, or when a write to the box's own output fails. An install that fails or
-//! cannot start refuses the run with status 75, as a failed tool restore does, so the gate falls back to a local run.
+//! The repo's pnpm and bun packages, installed before a routed command of their package manager, after the dotnet tool
+//! restore: a `pnpm` command's `pnpm-lock.yaml`, or a `bun` or `bunx` command's `bun.lock` or `bun.lockb`, nearest the
+//! folder the command starts in, never above the main repo's tree, has its folder's package files hashed and compared
+//! with that folder's line for the manager in the work folder's `<Work>.packages` record, so `pnpm install
+//! --frozen-lockfile` or `bun install --frozen-lockfile` runs there only when a package file changed or `node_modules`
+//! is gone, and only when git ignores `node_modules` and no folder from the work root down to the lockfile's is a link
+//! or a junction. Both managers install into the folder's one `node_modules`, so a passed install drops the other
+//! manager's line for its folder, and a run whose commands need both managers in one folder is refused. The install
+//! runs with the command's restricted token, its `safe.directory` and `CI=true`, in a job of its own that ends every
+//! process in it when the box's handle to it closes; its two streams are forwarded like the command's. It ends when it
+//! ends, when a stop sets the run's stop signal, or when a write to the box's own output fails. An install that fails
+//! or cannot start refuses the run with status 75, as a failed tool restore does, so the gate falls back to a local
+//! run.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -37,38 +41,146 @@ use crate::environment::Variables;
 use crate::remote::{Refusal, refused_line};
 use crate::run::{ERROR_FILE_NOT_FOUND, Written, written};
 
-/// The lockfile whose folder pnpm installs in.
-const LOCKFILE: &str = "pnpm-lock.yaml";
-/// The files of a lockfile's folder the record hashes, in hash order, each only when it exists.
-const HASHED: [&str; 4] = [LOCKFILE, "package.json", "pnpm-workspace.yaml", ".npmrc"];
+/// A package manager whose packages the box installs before a routed command of it.
+struct Manager {
+    /// Its name in the box's lines, and the program the install runs, found on the box's `PATH`.
+    name: &'static str,
+    /// The file stems of a command's first word that make the command this manager's, compared in any case.
+    stems: &'static [&'static str],
+    /// The lockfiles whose folder it installs in: a folder holding any of them is the lockfile folder.
+    lockfiles: &'static [&'static str],
+    /// The files of a lockfile's folder the record hashes, in hash order, each only when it exists.
+    hashed: &'static [&'static str],
+    /// The stems of its commands that run a bin looked up from the folder they run in, whatever a start-folder option
+    /// says, so their walk starts at the place.
+    bin_stems: &'static [&'static str],
+    /// The folder a command of it is told to start in by the words after its first.
+    start_word: fn(&[String]) -> Option<&str>,
+    /// What its folders' keys in the record start with, so a folder holds one line for each manager.
+    key_prefix: &'static str,
+}
+
+/// pnpm, for a `pnpm` command.
+const PNPM: Manager = Manager {
+    name: "pnpm",
+    stems: &["pnpm"],
+    lockfiles: &["pnpm-lock.yaml"],
+    hashed: &["pnpm-lock.yaml", "package.json", "pnpm-workspace.yaml", ".npmrc"],
+    bin_stems: &[],
+    start_word,
+    key_prefix: "",
+};
+
+/// bun, for a `bun` or `bunx` command, installing with `bun` for both.
+const BUN: Manager = Manager {
+    name: "bun",
+    stems: &["bun", "bunx"],
+    lockfiles: &["bun.lock", "bun.lockb"],
+    hashed: &["bun.lock", "bun.lockb", "package.json", "bunfig.toml", ".npmrc"],
+    bin_stems: &["bunx"],
+    start_word: bun_start_word,
+    key_prefix: "bun:",
+};
+
+/// The package managers the box installs for, in the order a command is matched against them.
+const MANAGERS: [&Manager; 2] = [&PNPM, &BUN];
+
 /// The hex digit of each hash byte's high nibble, the low nibble reading from the same table.
 const HEX: &[u8; 16] = b"0123456789abcdef";
-/// The words of the install the box runs, after the `pnpm` it found.
+/// The words of the install the box runs, after the manager's program it found.
 const INSTALL_WORDS: [&str; 2] = ["install", "--frozen-lockfile"];
 /// The path git is asked about: with its trailing separator, so a folder pattern such as `node_modules/` matches it
 /// before the folder exists.
 const NODE_MODULES: &str = "node_modules/";
-/// What the box does instead when it cannot read the stop signal just before it starts the install.
-const STARTING_INSTALL: &str = "starting the pnpm install";
 
-/// The line the box says when the work folder `key` could not restore its pnpm packages, just after its refusal tag.
-pub(crate) fn packages_line(key: &str) -> String {
-    format!("gate: remote work folder {key} could not restore its pnpm packages")
+/// The line the box says when the work folder `key` could not restore the packages of the manager `name`, just after
+/// its refusal tag.
+pub(crate) fn packages_line(name: &str, key: &str) -> String {
+    format!("gate: remote work folder {key} could not restore its {name} packages")
 }
 
-/// Whether the command's first word `word` names pnpm: its file name, after any folder or drive, less its last
-/// extension, is `pnpm` in any case.
-fn is_pnpm(word: &str) -> bool {
+/// The file name of the command's first word `word`, after any folder or drive, less its last extension.
+fn stem(word: &str) -> &str {
     let name = word.rsplit(['\\', '/']).next().unwrap_or(word);
     let name = match name.as_bytes().get(1) {
         Some(b':') => &name[2..],
         _ => name,
     };
-    let stem = match name.rfind('.') {
+    match name.rfind('.') {
         Some(dot) if dot > 0 => &name[..dot],
         _ => name,
-    };
-    stem.eq_ignore_ascii_case("pnpm")
+    }
+}
+
+/// Whether the [`stem`] of the command's first word `word` is one of `stems`, in any case.
+fn stem_in(stems: &[&str], word: &str) -> bool {
+    let stem = stem(word);
+    stems.iter().any(|known| stem.eq_ignore_ascii_case(known))
+}
+
+/// Whether the command's first word `word` names `manager`: its [`stem`] is one of the manager's stems in any case.
+fn is_command(manager: &Manager, word: &str) -> bool {
+    stem_in(manager.stems, word)
+}
+
+/// The folder `manager`'s command of first word `first` and the words `rest` after it is told to start in: none for a
+/// command that runs a bin from the folder it runs in, else what the manager's start word reads in `rest`.
+fn start_named<'a>(manager: &Manager, first: &str, rest: &'a [String]) -> Option<&'a str> {
+    if stem_in(manager.bin_stems, first) {
+        return None;
+    }
+    (manager.start_word)(rest)
+}
+
+/// The folder bun is told to start in by `words`, the command's words after its first: the value of the last
+/// `--cwd=<d>` among bun's own options before its subcommand, a bare `--cwd` there ending the scan as bun reads it as
+/// valueless; and, after the subcommand `run` or `test`, of the last `--cwd <d>` or `--cwd=<d>` up to the script or
+/// test path. None for `bun x`, which looks its bin up from the folder it runs in, whatever `--cwd` says; none when
+/// there is none or its value is empty.
+fn bun_start_word(words: &[String]) -> Option<&str> {
+    let mut named = None;
+    let stop = cwd_options(words, false, &mut named);
+    let subcommand = stop.and_then(|at| words.get(at)).map(String::as_str);
+    match subcommand {
+        Some("x") => None,
+        Some("run" | "test") => {
+            let after = stop.and_then(|at| words.get(at + 1..)).unwrap_or_default();
+            cwd_options(after, true, &mut named);
+            named
+        }
+        _ => named,
+    }
+}
+
+/// Reads bun's options at the start of `words` into `named`, the last non-empty `--cwd=<d>` value winning and, when
+/// `spaced`, a `--cwd <d>` too; a bare `--cwd` when not `spaced`, or one without a value, ends them. The index of the
+/// first word that is not an option, none when they end otherwise: at a lone `--`, at such a `--cwd`, or at the end.
+/// Another option's value is not an option, so it ends them too (`test -t smoke --cwd web` names no folder): the
+/// conservative limit [`start_word`] has for pnpm, which leaves the walk at the place.
+fn cwd_options<'a>(words: &'a [String], spaced: bool, named: &mut Option<&'a str>) -> Option<usize> {
+    let mut index = 0;
+    while let Some(word) = words.get(index) {
+        if word == "--" {
+            return None;
+        }
+        if !word.starts_with('-') {
+            return Some(index);
+        }
+        let value = if word == "--cwd" {
+            index += 1;
+            match words.get(index) {
+                Some(value) if spaced && value != "--" => Some(value.as_str()),
+                _ => return None,
+            }
+        } else {
+            word.strip_prefix("--cwd=")
+        };
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            *named = Some(value);
+        }
+        index += 1;
+    }
+    None
 }
 
 /// The folder pnpm is told to start in by `words`, the command's words after its first: the value of the last
@@ -105,10 +217,10 @@ fn is_within(work: &Path, path: &Path) -> bool {
     path_text == work_text || path_text.starts_with(&format!("{work_text}\\"))
 }
 
-/// The folder the lockfile walk starts in: the folder [`start_word`] names in `words`, joined to `place` when relative
-/// and folded, else `place`; `Err` with the folder when it lies outside the work root `work`.
-fn start_folder(work: &Path, place: &Path, words: &[String]) -> Result<PathBuf, PathBuf> {
-    let Some(named) = start_word(words) else {
+/// The folder the lockfile walk starts in: the folder `named` by the command's start-folder option, joined to `place`
+/// when relative and folded, else `place`; `Err` with the folder when it lies outside the work root `work`.
+fn start_folder(work: &Path, place: &Path, named: Option<&str>) -> Result<PathBuf, PathBuf> {
+    let Some(named) = named else {
         return Ok(place.to_owned());
     };
     let joined = place.join(named);
@@ -119,18 +231,14 @@ fn start_folder(work: &Path, place: &Path, words: &[String]) -> Result<PathBuf, 
     }
 }
 
-/// The folder of the first `pnpm-lock.yaml` that is a file, from `start` up to the work root `work` inclusive, never
-/// above it; none when there is none. A lockfile whose metadata cannot be read for any reason but its absence is an
-/// error, the line saying so.
-fn lockfile_folder(work: &Path, start: &Path) -> Result<Option<PathBuf>, String> {
+/// The folder of the first of `manager`'s lockfiles that is a file, from `start` up to the work root `work` inclusive,
+/// never above it; none when there is none. A lockfile whose metadata cannot be read for any reason but its absence is
+/// an error, the line saying so.
+fn lockfile_folder(manager: &Manager, work: &Path, start: &Path) -> Result<Option<PathBuf>, String> {
     let mut here = start.to_owned();
     while is_within(work, &here) {
-        let path = here.join(LOCKFILE);
-        match fs::metadata(&path) {
-            Ok(metadata) if metadata.is_file() => return Ok(Some(here)),
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(unreadable(&path, LOCKFILE, &error)),
+        if holds_lockfile(manager, &here)? {
+            return Ok(Some(here));
         }
         if !here.pop() {
             break;
@@ -139,9 +247,28 @@ fn lockfile_folder(work: &Path, start: &Path) -> Result<Option<PathBuf>, String>
     Ok(None)
 }
 
-/// The line saying the package file `name` at `path` could not be read for `error`.
-fn unreadable(path: &Path, name: &str, error: &io::Error) -> String {
-    let what = if name == LOCKFILE { "the lockfile" } else { "the package file" };
+/// Whether `folder` holds one of `manager`'s lockfiles as a file; `Err` with the line saying one's metadata cannot be
+/// read for any reason but its absence.
+fn holds_lockfile(manager: &Manager, folder: &Path) -> Result<bool, String> {
+    for name in manager.lockfiles {
+        let path = folder.join(name);
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(unreadable(manager, &path, name, &error)),
+        }
+    }
+    Ok(false)
+}
+
+/// The line saying `manager`'s package file `name` at `path` could not be read for `error`.
+fn unreadable(manager: &Manager, path: &Path, name: &str, error: &io::Error) -> String {
+    let what = if manager.lockfiles.contains(&name) {
+        "the lockfile"
+    } else {
+        "the package file"
+    };
     format!(
         "gate: remote could not read {what} {}: {}",
         escaped(&path.to_string_lossy()),
@@ -196,9 +323,16 @@ impl Record {
 
     /// Sets the line of `folder` to `digest`, replacing the one it had in any case, the others kept.
     fn set(&mut self, folder: &str, digest: &str) {
-        let upper = ordinal_upper(folder);
-        self.0.retain(|held, _| ordinal_upper(held) != upper);
+        self.remove(folder);
         self.0.insert(folder.to_owned(), digest.to_owned());
+    }
+
+    /// Drops the line of `folder`, its name compared in any case, the others kept; whether there was one.
+    fn remove(&mut self, folder: &str) -> bool {
+        let upper = ordinal_upper(folder);
+        let before = self.0.len();
+        self.0.retain(|held, _| ordinal_upper(held) != upper);
+        self.0.len() != before
     }
 
     /// The record's text, a line for each folder, each ending in LF.
@@ -214,12 +348,12 @@ impl Record {
     }
 }
 
-/// Where the pnpm install of one command leads ([`lockfile_for`]).
+/// Where the install of one command of a package manager leads ([`lockfile_for`]).
 #[derive(PartialEq, Eq)]
 enum Found {
-    /// No install: the command is not pnpm, or no lockfile is found up to the work root.
+    /// No install: no lockfile is found up to the work root.
     Nothing,
-    /// No install: the folder pnpm starts in lies outside the work root.
+    /// No install: the folder the command starts in lies outside the work root.
     Outside(PathBuf),
     /// No install: this folder from the work root down to the lockfile's is a link or a junction.
     Linked(String),
@@ -227,38 +361,40 @@ enum Found {
     Lockfile(PathBuf),
 }
 
-/// Where the command of `words` leads its pnpm install ([`Found`]), nothing said. `Err` with the line saying a
-/// lockfile's metadata cannot be read.
-fn lockfile_for(words: &[String], folders: &Folders<'_>) -> Result<Found, String> {
+/// The package manager of the command of `words` and where it leads its install ([`Found`]), nothing said; none when
+/// the command is no manager's. `Err` with the line saying a lockfile's metadata cannot be read.
+fn lockfile_for(words: &[String], folders: &Folders<'_>) -> Result<Option<(&'static Manager, Found)>, String> {
     let Some((word, rest)) = words.split_first() else {
-        return Ok(Found::Nothing);
+        return Ok(None);
     };
-    if !is_pnpm(word) {
-        return Ok(Found::Nothing);
-    }
-    let start = match start_folder(folders.work, folders.place, rest) {
+    let Some(manager) = MANAGERS.into_iter().find(|manager| is_command(manager, word)) else {
+        return Ok(None);
+    };
+    let start = match start_folder(folders.work, folders.place, start_named(manager, word, rest)) {
         Ok(start) => start,
-        Err(outside) => return Ok(Found::Outside(outside)),
+        Err(outside) => return Ok(Some((manager, Found::Outside(outside)))),
     };
-    Ok(match lockfile_folder(folders.work, &start)? {
+    let found = match lockfile_folder(manager, folders.work, &start)? {
         None => Found::Nothing,
         Some(folder) => match linked(folders.work, &folder) {
             Some(link) => Found::Linked(link),
             None => Found::Lockfile(folder),
         },
-    })
+    };
+    Ok(Some((manager, found)))
 }
 
-/// The hash of `folder`'s package files: for each of [`HASHED`] that exists, its name, a NUL byte, its bytes and a NUL
-/// byte, hashed with SHA-256 and written as lower-case hex; else the line saying which file could not be read.
-fn hash(folder: &Path) -> Result<String, String> {
+/// The hash of `folder`'s package files: for each of `manager`'s hashed files that exists, its name, a NUL byte, its
+/// bytes and a NUL byte, hashed with SHA-256 and written as lower-case hex; else the line saying which file could not
+/// be read.
+fn hash(manager: &Manager, folder: &Path) -> Result<String, String> {
     let mut hasher = Sha256::new();
-    for name in HASHED {
+    for name in manager.hashed {
         let path = folder.join(name);
         let content = match read_plain(&path) {
             Ok(Some(content)) => content,
             Ok(None) => continue,
-            Err(error) => return Err(unreadable(&path, name, &error)),
+            Err(error) => return Err(unreadable(manager, &path, name, &error)),
         };
         hasher.update(name.as_bytes());
         hasher.update([0_u8]);
@@ -297,6 +433,12 @@ fn relative(work: &Path, folder: &Path) -> String {
     }
 }
 
+/// The key of `manager`'s line for the folder `relative` (as [`relative`] names it) in the record: the folder after
+/// the manager's prefix, so pnpm's keys are bare folders and bun's start `bun:`.
+fn record_key(manager: &Manager, relative: &str) -> String {
+    format!("{}{relative}", manager.key_prefix)
+}
+
 /// The record at `path`, empty when there is none; one that cannot be read is said, and read as empty.
 fn read(path: &str, console: &mut Console) -> Record {
     match read_record(path) {
@@ -321,8 +463,8 @@ fn installed(record: &Record, key: &str, digest: &str, folder: &Path) -> bool {
 
 /// Whether git ignores `node_modules` in the folder `key` below the work root `work`, asked with the box's own git as
 /// it runs in the work tree ([`WorkGit::args`]), its repository and work tree named, never found from the folder;
-/// when it does not, or cannot say, the line saying why the install is skipped is said.
-fn ignored(git: &WorkGit, work: &Path, key: &str, console: &mut Console) -> bool {
+/// when it does not, or cannot say, the line saying why `manager`'s install is skipped is said.
+fn ignored(manager: &Manager, git: &WorkGit, work: &Path, key: &str, console: &mut Console) -> bool {
     let work_text = work.to_string_lossy();
     let git_dir = format!(r"--git-dir={work_text}\.git");
     let work_tree = format!("--work-tree={work_text}");
@@ -337,7 +479,8 @@ fn ignored(git: &WorkGit, work: &Path, key: &str, console: &mut Console) -> bool
         Ok(0) => return true,
         Ok(1) => {
             console.err(&format!(
-                "gate: remote pnpm install skipped: node_modules is not ignored in {}",
+                "gate: remote {} install skipped: node_modules is not ignored in {}",
+                manager.name,
                 escaped(key)
             ));
             return false;
@@ -360,16 +503,16 @@ enum Installed {
     Ended(u32),
 }
 
-/// The launch of `pnpm install --frozen-lockfile` in `folder`: the `pnpm` found on the box's `PATH`, the box's own
-/// environment with git's `safe.directory` set to `*` over it as the command's is ([`with_safe_directory`]) and
+/// The launch of `{program} install --frozen-lockfile` in `folder`: the `program` found on the box's `PATH`, the box's
+/// own environment with git's `safe.directory` set to `*` over it as the command's is ([`with_safe_directory`]) and
 /// `CI=true` over that, and the restricted token the command gets; else why it cannot be launched.
-fn install_launch(folder: &Path) -> Result<PipedLaunch, String> {
-    let pnpm = locate("pnpm")?.ok_or_else(|| gate_win32::win32_message(ERROR_FILE_NOT_FOUND))?;
+fn install_launch(program: &str, folder: &Path) -> Result<PipedLaunch, String> {
+    let found = locate(program)?.ok_or_else(|| gate_win32::win32_message(ERROR_FILE_NOT_FOUND))?;
     let token = RestrictedToken::of_this_process().map_err(|error| format!("cannot make its restricted token: {error}"))?;
     let variables = with_safe_directory(Variables::from_process()).with("CI", "true");
     let environment = variables.block().map_err(|error| format!("cannot build its environment: {error}"))?;
     let words: Vec<OsString> = INSTALL_WORDS.into_iter().map(OsString::from).collect();
-    match written(&pnpm, &words, &variables) {
+    match written(&found, &words, &variables) {
         Written::Line(application, command_line) => Ok(PipedLaunch {
             application,
             command_line,
@@ -382,21 +525,24 @@ fn install_launch(folder: &Path) -> Result<PipedLaunch, String> {
     }
 }
 
-/// Runs the install in `folder`, named `key`, in a job of its own named after the run's job ([`packages_job_name`]), its
-/// two streams forwarded through the box's output lock, and sees it to its end: [`Installed::Status`] with its status,
-/// after a line saying how long it ran, or [`Installed::Ended`] when a stop set the run's signal before or while it ran,
-/// when the box could not wait for it, or when the client closed the connection. `Err` carries the message of an
-/// install that could not be started. Its job kills on close and is terminated on every way out of here.
-fn install(request: &Request<'_>, folder: &Path, key: &str, beat: &Beat<'_>, console: &mut Console) -> Result<Installed, String> {
-    if let Err(status) = before_the_job(beat.stop.look(STARTING_INSTALL), request.job, beat.lock, console) {
+/// Runs the install of `lockfile`'s folder, named `key`, in a job of its own named after the run's job
+/// ([`packages_job_name`]), its two streams forwarded through the box's output lock, and sees it to its end:
+/// [`Installed::Status`] with its status, after a line saying how long it ran, or [`Installed::Ended`] when a stop set
+/// the run's signal before or while it ran, when the box could not wait for it, or when the client closed the
+/// connection. `Err` carries the message of an install that could not be started. Its job kills on close and is
+/// terminated on every way out of here.
+fn install(request: &Request<'_>, lockfile: &Lockfile<'_>, key: &str, beat: &Beat<'_>, console: &mut Console) -> Result<Installed, String> {
+    let manager = lockfile.manager;
+    let starting = format!("starting the {} install", manager.name);
+    if let Err(status) = before_the_job(beat.stop.look(&starting), request.job, beat.lock, console) {
         return Ok(Installed::Ended(status));
     }
-    let launch = install_launch(folder)?;
+    let launch = install_launch(manager.name, &lockfile.folder)?;
     let name = packages_job_name(request.job);
     let job = Job::create_kill_on_close(&name).map_err(|error| format!("cannot create its job {name}: {error}"))?;
     let _stopper = Stopper { job: &job, armed: true };
     let started = Instant::now();
-    let (running, forwarders) = match start(&launch, &job, beat, console)? {
+    let (running, forwarders) = match start(&launch, &job, &starting, beat, console)? {
         Ok(started) => started,
         Err(status) => return Ok(Installed::Ended(status)),
     };
@@ -418,7 +564,7 @@ fn install(request: &Request<'_>, folder: &Path, key: &str, beat: &Beat<'_>, con
             match drained {
                 Ok(()) => {
                     let place = if key == "." { String::new() } else { format!(" in {}", escaped(key)) };
-                    console.err(&format!("gate: pnpm install took {:.1} s{place}", took.as_secs_f64()));
+                    console.err(&format!("gate: {} install took {:.1} s{place}", manager.name, took.as_secs_f64()));
                     Installed::Status(code.cast_signed())
                 }
                 Err(status) => Installed::Ended(status),
@@ -429,13 +575,20 @@ fn install(request: &Request<'_>, folder: &Path, key: &str, beat: &Beat<'_>, con
 
 /// Starts `launch` suspended in `job`, then, unless a stop came meanwhile, resumes it and starts forwarding its two
 /// streams through the box's output lock: the install running and its readers, or `Ok(Err)` with status 1 for a stop
-/// that came first, its job terminated and its line said; `Err` with why it could not be started.
-fn start(launch: &PipedLaunch, job: &Job, beat: &Beat<'_>, console: &mut Console) -> Result<Result<(Running, Forwarders), u32>, String> {
+/// that came first, its job terminated and its line said; `Err` with why it could not be started. `starting` is what
+/// the box does instead when it cannot read the stop signal.
+fn start(
+    launch: &PipedLaunch,
+    job: &Job,
+    starting: &str,
+    beat: &Beat<'_>,
+    console: &mut Console,
+) -> Result<Result<(Running, Forwarders), u32>, String> {
     let PipedSuspended { suspended, stdout, stderr } = launch.start_suspended(job).map_err(|error| error.to_string())?;
     let assigned = suspended.assign(job);
     // A stop that came while the install was created ends it before it runs, as the command's launch looks: whether
     // the install went in the job or the stopped job refused it, it never runs, and is ended as it is dropped.
-    match beat.stop.look(STARTING_INSTALL) {
+    match beat.stop.look(starting) {
         Look::Stopped => return Ok(Err(said_stopped(job, terminate_and_wait(job), beat.lock, console))),
         Look::Go(Some(unread)) => beat.say(console, &unread),
         Look::Go(None) => {}
@@ -471,50 +624,101 @@ fn write(path: &str, record: &Record, console: &mut Console) -> Result<(), u32> 
     Ok(())
 }
 
-/// Refuses the run for an install that ended with `status`: the status line, then the `tools` tag and the packages
-/// line under the heartbeat's lock; status 75.
-fn refused(request: &Request<'_>, status: i32, beat: &Beat<'_>, console: &mut Console) -> u32 {
+/// Refuses the run for `manager`'s install that ended with `status`: the status line, then the `tools` tag and the
+/// packages line under the heartbeat's lock; status 75.
+fn refused(request: &Request<'_>, manager: &Manager, status: i32, beat: &Beat<'_>, console: &mut Console) -> u32 {
     console.err(&format!("gate: remote package restore failed (status {status})"));
     // Held across both lines, so no heartbeat lands between the tag and the line it tags.
     let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
     console.err(&refused_line(request.nonce, Refusal::Tools));
-    console.err(&packages_line(request.key));
+    console.err(&packages_line(manager.name, request.key));
     REFUSED_STATUS
 }
 
-/// Installs the pnpm packages of each `pnpm` command of the run before its first command runs ([`update_folder`]),
-/// once for each lockfile folder the commands need, in their order: nothing for another command or one without a
-/// lockfile. Where each command leads is found first and the same place kept once, so a skip's line is said once
-/// however many commands lead to it: the install skipped when the folder pnpm starts in lies outside the work root,
-/// or when a folder from the work root down to the lockfile's is a link or a junction. `Ok` when nothing ran or every
+/// Installs the packages of each package manager's command of the run before its first command runs
+/// ([`update_folder`]), once for each manager and lockfile folder the commands need, in their order: nothing for
+/// another command or one without a lockfile. Where each command leads is found first and the same place of the same
+/// manager kept once, so a skip's line is said once however many commands lead to it: the install skipped when the
+/// folder the command starts in lies outside the work root, or when a folder from the work root down to the lockfile's
+/// is a link or a junction. A run whose commands lead two managers to one lockfile folder installs nothing and is
+/// refused ([`refused_shared`]), since both would install into its one `node_modules`. `Ok` when nothing ran or every
 /// install passed; else `Err` with the status of the first that did not, as [`update_folder`] gives it, its lines
 /// said, and no later install run; 1 when a lockfile's metadata cannot be read, its line said.
 pub(super) fn update(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
-    let mut places: Vec<Found> = Vec::new();
+    let mut places: Vec<(&'static Manager, Found)> = Vec::new();
     for words in request.commands() {
-        let found = lockfile_for(words, folders).map_err(|line| {
+        let place = lockfile_for(words, folders).map_err(|line| {
             console.err(&line);
             FAILED_STATUS
         })?;
-        if !places.iter().any(|known| same_place(known, &found)) {
-            places.push(found);
+        let Some((manager, found)) = place else {
+            continue;
+        };
+        if !places
+            .iter()
+            .any(|(known_manager, known)| known_manager.name == manager.name && same_place(known, &found))
+        {
+            places.push((manager, found));
         }
     }
-    for found in places {
+    if let Some(folder) = shared_folder(&places, folders.work) {
+        return Err(refused_shared(request, &folder, beat, console));
+    }
+    for (manager, found) in places {
         match found {
             Found::Nothing => {}
             Found::Outside(outside) => console.err(&format!(
-                "gate: remote pnpm install skipped: {} is outside the work root",
+                "gate: remote {} install skipped: {} is outside the work root",
+                manager.name,
                 escaped(&outside.to_string_lossy())
             )),
             Found::Linked(link) => console.err(&format!(
-                "gate: remote pnpm install skipped: {} is reached through a link",
+                "gate: remote {} install skipped: {} is reached through a link",
+                manager.name,
                 escaped(&link)
             )),
-            Found::Lockfile(folder) => update_folder(request, git, &Lockfile { work: folders.work, folder }, beat, console)?,
+            Found::Lockfile(folder) => {
+                let lockfile = Lockfile {
+                    manager,
+                    work: folders.work,
+                    folder,
+                };
+                update_folder(request, git, &lockfile, beat, console)?;
+            }
         }
     }
     Ok(())
+}
+
+/// The first lockfile folder of `places` that two managers lead to, relative to the work root `work`; none when each
+/// lockfile folder is one manager's.
+fn shared_folder(places: &[(&Manager, Found)], work: &Path) -> Option<String> {
+    places.iter().enumerate().find_map(|(at, (manager, found))| {
+        let Found::Lockfile(folder) = found else {
+            return None;
+        };
+        let shared = places
+            .iter()
+            .skip(at + 1)
+            .any(|(other, known)| other.name != manager.name && same_place(found, known));
+        shared.then(|| relative(work, folder))
+    })
+}
+
+/// Refuses a run whose commands need both managers in the lockfile folder `folder`: the `tools` tag and the line
+/// naming the folder under the heartbeat's lock; status 75.
+fn refused_shared(request: &Request<'_>, folder: &str, beat: &Beat<'_>, console: &mut Console) -> u32 {
+    // Held across both lines, so no heartbeat lands between the tag and the line it tags.
+    let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
+    console.err(&refused_line(request.nonce, Refusal::Tools));
+    console.err(&format!(
+        "gate: remote work folder {} uses both {} and {} in {}",
+        request.key,
+        PNPM.name,
+        BUN.name,
+        escaped(folder)
+    ));
+    REFUSED_STATUS
 }
 
 /// Whether `one` and `other` are the same place: two lockfile folders compared as Windows names them, without regard
@@ -526,40 +730,56 @@ fn same_place(one: &Found, other: &Found) -> bool {
     }
 }
 
-/// A folder holding a lockfile a command needs, and the work folder it lies under.
+/// A folder holding a lockfile of a package manager a command needs, and the work folder it lies under.
 struct Lockfile<'a> {
+    manager: &'static Manager,
     work: &'a Path,
     folder: PathBuf,
 }
 
-/// Installs the pnpm packages of `lockfile`'s folder: nothing when the record holds the folder's hash and its
-/// `node_modules` is there, or when git does not ignore `node_modules` there (said); else `pnpm install
-/// --frozen-lockfile` in the folder, its line in `<Work>.packages` rewritten when it passes. `Ok` when nothing ran or
-/// the install passed; else `Err` with the status the run ends on, its lines said: 75 when the install failed or could
-/// not start; 1 when a package file could not be read, the record could not be written, a stop came before or during
-/// the install, or the box could not wait for it; 255 when the client closed the connection during it.
+/// Installs the packages of `lockfile`'s folder with its manager: nothing when the record holds the folder's hash in
+/// the manager's line ([`record_key`]) and its `node_modules` is there, or when git does not ignore `node_modules`
+/// there (said); else `{manager} install --frozen-lockfile` in the folder, the manager's line for the folder in
+/// `<Work>.packages` rewritten when it passes. The other managers' lines for the folder are dropped, and the record
+/// written, before the install starts, since whatever its end it rewrites the `node_modules` they were for; a record
+/// without such a line is not written then. `Ok` when nothing ran or the install passed; else `Err` with the status the run
+/// ends on, its lines said: 75 when the install failed or could not start; 1 when a package file could not be read,
+/// the record could not be written, a stop came before or during the install, or the box could not wait for it; 255
+/// when the client closed the connection during it.
 fn update_folder(request: &Request<'_>, git: &WorkGit, lockfile: &Lockfile<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
-    let folder = &lockfile.folder;
-    let digest = hash(folder).map_err(|line| {
+    let (manager, folder) = (lockfile.manager, &lockfile.folder);
+    let digest = hash(manager, folder).map_err(|line| {
         console.err(&line);
         FAILED_STATUS
     })?;
-    let key = relative(lockfile.work, folder);
+    let place = relative(lockfile.work, folder);
+    let key = record_key(manager, &place);
     let path = format!("{}.packages", request.work);
     let mut record = read(&path, console);
-    if installed(&record, &key, &digest, folder) || !ignored(git, lockfile.work, &key, console) {
+    if installed(&record, &key, &digest, folder) || !ignored(manager, git, lockfile.work, &place, console) {
         return Ok(());
     }
-    let status = match install(request, folder, &key, beat, console) {
+    let mut dropped = false;
+    for other in MANAGERS.into_iter().filter(|other| other.name != manager.name) {
+        dropped |= record.remove(&record_key(other, &place));
+    }
+    if dropped {
+        write(&path, &record, console)?;
+    }
+    let status = match install(request, lockfile, &place, beat, console) {
         Ok(Installed::Status(status)) => status,
         Ok(Installed::Ended(status)) => return Err(status),
         Err(message) => {
-            console.err(&format!("gate: remote could not start the pnpm install: {}", escaped(&message)));
+            console.err(&format!(
+                "gate: remote could not start the {} install: {}",
+                manager.name,
+                escaped(&message)
+            ));
             FAILED_STATUS.cast_signed()
         }
     };
     if status != 0 {
-        return Err(refused(request, status, beat, console));
+        return Err(refused(request, manager, status, beat, console));
     }
     record.set(&key, &digest);
     write(&path, &record, console)
@@ -571,7 +791,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use super::{Found, Record, hash, is_pnpm, lockfile_folder, same_place, start_folder, start_word};
+    use super::{BUN, Found, PNPM, Record, hash, is_command, lockfile_folder, record_key, same_place, start_folder, start_named, start_word};
 
     #[test]
     fn lockfile_folders_are_one_place_whatever_their_letter_case() {
@@ -619,11 +839,78 @@ mod tests {
     #[test]
     fn a_pnpm_word_triggers_in_any_case_and_form() {
         for word in ["pnpm", "PNPM.CMD", r"C:\tools\pnpm.exe", "pnpm.ps1", "/usr/bin/pnpm", "C:pnpm.cmd"] {
-            assert!(is_pnpm(word), "{word} names pnpm");
+            assert!(is_command(&PNPM, word), "{word} names pnpm");
         }
         for word in ["pnpmx", "npx", "node", "corepack", "", r"C:\pnpm\node.exe", "xpnpm.cmd"] {
-            assert!(!is_pnpm(word), "{word} does not name pnpm");
+            assert!(!is_command(&PNPM, word), "{word} does not name pnpm");
         }
+    }
+
+    #[test]
+    fn a_bun_or_bunx_word_triggers_in_any_case_and_form() {
+        for word in ["bun", "bunx", r"C:\x\bun.exe", "BUNX.EXE", "/usr/bin/bun", "C:bunx.cmd"] {
+            assert!(is_command(&BUN, word), "{word} names bun");
+            assert!(!is_command(&PNPM, word), "{word} does not name pnpm");
+        }
+        for word in ["bunyan", "bunk", "xbun.exe", "pnpm", "", r"C:\bun\node.exe"] {
+            assert!(!is_command(&BUN, word), "{word} does not name bun");
+        }
+    }
+
+    #[test]
+    fn bun_reads_cwd_before_its_subcommand_and_after_run_or_test() {
+        let start = |first: &str, rest: &[&str]| start_named(&BUN, first, &words(rest)).map(str::to_owned);
+        assert_eq!(start("bun", &["--cwd=web", "test"]), Some("web".to_owned()));
+        assert_eq!(
+            start("bun", &["test", "-t", "smoke", "--cwd", "web"]),
+            None,
+            "another option's value ends the scan"
+        );
+        assert_eq!(start("bun", &["--cwd=web", "--version"]), Some("web".to_owned()), "no subcommand");
+        assert_eq!(start("bun", &["run", "--cwd", "web", "x"]), Some("web".to_owned()));
+        assert_eq!(start("bun", &["run", "--cwd=web", "x"]), Some("web".to_owned()));
+        assert_eq!(start("bun", &["test", "--cwd", "web"]), Some("web".to_owned()));
+        assert_eq!(
+            start("bun", &["--cwd=a", "run", "--cwd", "b", "x"]),
+            Some("b".to_owned()),
+            "the last wins"
+        );
+        assert_eq!(
+            start("bun", &["--cwd", "web", "test"]),
+            None,
+            "a bare `--cwd` before the subcommand ends the scan"
+        );
+        assert_eq!(
+            start("bun", &["--cwd=a", "--cwd", "b", "run"]),
+            Some("a".to_owned()),
+            "a bare `--cwd` changes nothing"
+        );
+        assert_eq!(start("bun", &["run", "x", "--cwd", "web"]), None, "after the script is the script's");
+        assert_eq!(start("bun", &["test", "src", "--cwd=web"]), None, "after the test path is the tests'");
+        assert_eq!(start("bun", &["install", "--cwd", "web"]), None, "another subcommand's words are its own");
+        assert_eq!(start("bun", &["run", "--cwd", "--", "x"]), None, "a lone `--` is never a value");
+        assert_eq!(start("bun", &["run", "--cwd"]), None, "a trailing `--cwd` has no value");
+        assert_eq!(start("bun", &["--cwd=", "test"]), None, "an empty value is none");
+        assert_eq!(start("bun", &[]), None);
+        assert_eq!(start("bunx", &["--cwd=p", "hello"]), None, "bunx looks its bin up from the place");
+        assert_eq!(start("bun", &["--cwd=p", "x", "hello"]), None, "so does `bun x`");
+        assert_eq!(start("bun", &["x", "--cwd", "p", "hello"]), None, "after `x` too");
+        assert_eq!(start("BUNX.EXE", &["--cwd", "p", "hello"]), None);
+    }
+
+    #[test]
+    fn a_bun_start_folder_is_joined_to_the_place() {
+        let (work, place) = root_and_place();
+        assert_eq!(
+            start_folder(&work, &place, start_named(&BUN, "bun", &words(&["--cwd=..", "test"]))),
+            Ok(work.clone()),
+            "relative to the place"
+        );
+        assert_eq!(
+            start_folder(&work, &place, start_named(&BUN, "bunx", &words(&["--cwd=..", "vitest"]))),
+            Ok(place.clone()),
+            "bunx starts at the place"
+        );
     }
 
     #[test]
@@ -667,37 +954,37 @@ mod tests {
     fn a_start_folder_outside_the_work_root_is_refused() {
         let (work, place) = root_and_place();
         assert_eq!(
-            start_folder(&work, &place, &words(&["run", "x"])),
+            start_folder(&work, &place, start_word(&words(&["run", "x"]))),
             Ok(place.clone()),
             "no folder named: the place"
         );
         assert_eq!(
-            start_folder(&work, &place, &words(&["--dir", r"..\api"])),
+            start_folder(&work, &place, start_word(&words(&["--dir", r"..\api"]))),
             Ok(PathBuf::from(r"C:\work\app\api")),
             "relative to the place"
         );
         assert_eq!(
-            start_folder(&work, &place, &words(&["-C", ".."])),
+            start_folder(&work, &place, start_word(&words(&["-C", ".."]))),
             Ok(work.clone()),
             "the work root itself"
         );
         assert_eq!(
-            start_folder(&work, &place, &words(&["--dir", r"C:\WORK\APP\lib"])),
+            start_folder(&work, &place, start_word(&words(&["--dir", r"C:\WORK\APP\lib"]))),
             Ok(PathBuf::from(r"C:\WORK\APP\lib")),
             "an absolute folder inside, in another case"
         );
         assert_eq!(
-            start_folder(&work, &place, &words(&["--dir", r"..\..\x"])),
+            start_folder(&work, &place, start_word(&words(&["--dir", r"..\..\x"]))),
             Err(PathBuf::from(r"C:\work\x")),
             "climbing out of the work root"
         );
         assert_eq!(
-            start_folder(&work, &place, &words(&["--dir", r"D:\elsewhere"])),
+            start_folder(&work, &place, start_word(&words(&["--dir", r"D:\elsewhere"]))),
             Err(PathBuf::from(r"D:\elsewhere")),
             "an absolute folder elsewhere"
         );
         assert_eq!(
-            start_folder(&work, &place, &words(&[r"--dir=C:\work\application"])),
+            start_folder(&work, &place, start_word(&words(&[r"--dir=C:\work\application"]))),
             Err(PathBuf::from(r"C:\work\application")),
             "a sibling whose name starts with the root's is outside"
         );
@@ -710,28 +997,90 @@ mod tests {
         let place = work.join("web").join("app");
         fs::create_dir_all(&place).expect("the place can be made");
         lockfile(&scratch.0);
-        assert_eq!(lockfile_folder(&work, &place), Ok(None), "a lockfile above the work root is never read");
+        assert_eq!(
+            lockfile_folder(&PNPM, &work, &place),
+            Ok(None),
+            "a lockfile above the work root is never read"
+        );
 
         lockfile(&work);
         assert_eq!(
-            lockfile_folder(&work, &place),
+            lockfile_folder(&PNPM, &work, &place),
             Ok(Some(work.clone())),
             "the work root's, reached from below"
         );
 
         lockfile(&work.join("web"));
-        assert_eq!(lockfile_folder(&work, &place), Ok(Some(work.join("web"))), "the nearest parent's");
+        assert_eq!(lockfile_folder(&PNPM, &work, &place), Ok(Some(work.join("web"))), "the nearest parent's");
 
         fs::create_dir_all(place.join("pnpm-lock.yaml")).expect("a folder named as the lockfile can be made");
         assert_eq!(
-            lockfile_folder(&work, &place),
+            lockfile_folder(&PNPM, &work, &place),
             Ok(Some(work.join("web"))),
             "a folder named as the lockfile is skipped"
         );
 
         let leaf = work.join("leaf");
         lockfile(&leaf);
-        assert_eq!(lockfile_folder(&work, &leaf), Ok(Some(leaf.clone())), "the start folder's own");
+        assert_eq!(lockfile_folder(&PNPM, &work, &leaf), Ok(Some(leaf.clone())), "the start folder's own");
+    }
+
+    #[test]
+    fn the_bun_walk_finds_either_lockfile_and_no_other() {
+        let scratch = Scratch::new("the_bun_walk_finds_either_lockfile_and_no_other");
+        let work = scratch.0.join("work");
+        let place = work.join("web").join("app");
+        fs::create_dir_all(&place).expect("the place can be made");
+        lockfile(&place);
+        assert_eq!(lockfile_folder(&BUN, &work, &place), Ok(None), "a pnpm lockfile is no bun lockfile");
+
+        fs::write(work.join("bun.lock"), "{}\n").expect("the lockfile can be written");
+        assert_eq!(lockfile_folder(&BUN, &work, &place), Ok(Some(work.clone())), "a bun.lock");
+
+        fs::write(work.join("web").join("bun.lockb"), [0_u8, 1]).expect("the lockfile can be written");
+        assert_eq!(
+            lockfile_folder(&BUN, &work, &place),
+            Ok(Some(work.join("web"))),
+            "the nearest folder with a bun.lockb"
+        );
+    }
+
+    /// The SHA-256 of the five bun package files [`the_bun_hash_reads_its_files_in_order`] writes, laid out as
+    /// [`FOUR_FILES_HASH`] is; computed apart from this code.
+    const BUN_FIVE_FILES_HASH: &str = "21768ac03a3f80b0670adcdabd467ee5f7baedb4b686844010048f7775ef98d6";
+    /// The same of `bun.lock` and `.npmrc` alone, the three others absent.
+    const BUN_TWO_FILES_HASH: &str = "c033598b4fa507d3580e82ea57aa57dced7d193fa883259f67db8e05a62fc40c";
+
+    #[test]
+    fn the_bun_hash_reads_its_files_in_order() {
+        let scratch = Scratch::new("the_bun_hash_reads_its_files_in_order");
+        let folder = scratch.0.join("web");
+        fs::create_dir_all(&folder).expect("the folder can be made");
+        fs::write(folder.join(".npmrc"), "a=1\n").expect("the file can be written");
+        fs::write(folder.join("bun.lock"), "lock\n").expect("the file can be written");
+        fs::write(folder.join("pnpm-lock.yaml"), "not bun's\n").expect("the file can be written");
+        assert_eq!(hash(&BUN, &folder), Ok(BUN_TWO_FILES_HASH.to_owned()), "an absent file is skipped");
+
+        fs::write(folder.join("bunfig.toml"), "[install]\n").expect("the file can be written");
+        fs::write(folder.join("package.json"), "{}\n").expect("the file can be written");
+        fs::write(folder.join("bun.lockb"), [0_u8, 1, b'l', b'o', b'c', b'k', b'b']).expect("the file can be written");
+        assert_eq!(
+            hash(&BUN, &folder),
+            Ok(BUN_FIVE_FILES_HASH.to_owned()),
+            "bun.lock, bun.lockb, package.json, bunfig.toml, .npmrc"
+        );
+    }
+
+    #[test]
+    fn a_bun_folder_key_is_prefixed_and_a_pnpm_one_is_not() {
+        assert_eq!(record_key(&BUN, "web"), "bun:web");
+        assert_eq!(record_key(&BUN, "."), "bun:.");
+        assert_eq!(record_key(&PNPM, "web"), "web");
+        let mut record = Record::default();
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        record.set(&record_key(&PNPM, "web"), &a);
+        record.set(&record_key(&BUN, "web"), &b);
+        assert_eq!(record.text(), format!("bun:web\t{b}\nweb\t{a}\n"), "one line for each manager");
     }
 
     /// The SHA-256 of the four package files [`hash_layout_is_name_nul_bytes_nul`] writes, in hash order, each its
@@ -749,11 +1098,11 @@ mod tests {
         // Written in another order than the hash's, which the hash ignores.
         fs::write(folder.join(".npmrc"), "a=1\n").expect("the file can be written");
         fs::write(folder.join("pnpm-lock.yaml"), "lock\n").expect("the file can be written");
-        assert_eq!(hash(&folder), Ok(TWO_FILES_HASH.to_owned()), "an absent file is skipped");
+        assert_eq!(hash(&PNPM, &folder), Ok(TWO_FILES_HASH.to_owned()), "an absent file is skipped");
 
         fs::write(folder.join("pnpm-workspace.yaml"), "packages: []\n").expect("the file can be written");
         fs::write(folder.join("package.json"), "{}\n").expect("the file can be written");
-        assert_eq!(hash(&folder), Ok(FOUR_FILES_HASH.to_owned()), "the name, a NUL, the bytes, a NUL");
+        assert_eq!(hash(&PNPM, &folder), Ok(FOUR_FILES_HASH.to_owned()), "the name, a NUL, the bytes, a NUL");
     }
 
     #[test]

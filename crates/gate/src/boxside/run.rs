@@ -690,8 +690,8 @@ fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, co
     ran
 }
 
-/// The run once the heartbeat beats: the snapshot checked out, the repo's dotnet tools restored, a pnpm command's pnpm
-/// packages installed, the outputs listed, the command seen to its end in the place, the tree it left committed back
+/// The run once the heartbeat beats: the snapshot checked out, the repo's dotnet tools restored, a pnpm or bun
+/// command's packages installed, the outputs listed, the command seen to its end in the place, the tree it left committed back
 /// unless the box's ceiling killed it, and, after a passed command, its outputs packed; the status as
 /// [`in_work_folder`] gives it, 1 for a passed command whose outputs are not brought back, [`KILLED`] for a killed one.
 fn checked_out(
@@ -758,7 +758,7 @@ fn ran_command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &
     }
 }
 
-/// A warm-up once its work folder is ready, its tools and every pnpm lockfile its commands need restored: the warm
+/// A warm-up once its work folder is ready, its tools and every pnpm or bun lockfile its commands need restored: the warm
 /// record `{Work}.warm` removed, the start marker said once, then each command run in `place` in order, as a run's
 /// command is ([`command`]), with the stop signal looked at before each. The warm-up's `Timeout` is one budget: each
 /// command's ceiling is what the earlier ones left of it ([`remaining_budget`]). The first command that ends non-zero,
@@ -952,7 +952,7 @@ enum Of {
 }
 
 /// The run up to its command: the snapshot laid out and checked out, the subfolder found, the repo's dotnet tools
-/// restored and, for a pnpm command, its pnpm packages installed ([`packages::update`]); else `Err` with the status the
+/// restored and, for a pnpm or bun command, its packages installed ([`packages::update`]); else `Err` with the status the
 /// run ends on, its lines said. A refusal is said as such; any other end is followed, on a pair run, by the box's
 /// `gate: remote back commits: failed` line ([`ended_before`]).
 fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
@@ -1187,7 +1187,7 @@ pub(super) fn full_path(path: &Path) -> Option<PathBuf> {
 /// `Err` with the status of a run that ends here, its line said: 2 for a batch word refused, 1 for the box's own
 /// failure or a stop that came first, 255 for a client that closed the connection. The job's stop signal is looked at
 /// just before the job is created ([`before_the_job`]), so a stop that came while the snapshot was checked out starts
-/// nothing; the tool restore and the pnpm install look at it the same way before they run, so such a stop runs neither
+/// nothing; the tool restore and the package install look at it the same way before they run, so such a stop runs neither
 /// ([`crate::boxside::tools`], [`crate::boxside::packages`]). The command starts on a UTF-8 console when it can have one ([`start_command`]), whose
 /// donor lives until the wait for the command is over, however it ends. The heartbeat watches the job while [`watch`]
 /// waits for it. The command's environment is [`command_variables`]'s: the box's own, with the caller's `Env` pairs set

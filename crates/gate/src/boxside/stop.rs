@@ -1,7 +1,7 @@
 //! `gate box stop`: ends every process of the run whose job the payload names, as the PowerShell wrapper's
 //! `Invoke-Stop` does. It sets the run's stop signal first, so a run whose job does not exist yet never starts its
 //! command, then ends the run's job, the job its dotnet tool restore runs in ([`restore_job_name`]) and the job its
-//! pnpm install runs in ([`packages_job_name`]). The job name carries the run's nonce, so a stop that arrives late
+//! package install runs in ([`packages_job_name`]). The job name carries the run's nonce, so a stop that arrives late
 //! finds no job, and never another run's. It takes no lock.
 
 use std::io;
@@ -125,7 +125,7 @@ pub(crate) fn restore_job_name(job: &str) -> String {
     format!("{job}-tools")
 }
 
-/// The name of the job the pnpm install of the run whose job is `job` runs in, which a stop ends beside the run's own.
+/// The name of the job the package install of the run whose job is `job` runs in, which a stop ends beside the run's own.
 pub(crate) fn packages_job_name(job: &str) -> String {
     format!("{job}-packages")
 }
