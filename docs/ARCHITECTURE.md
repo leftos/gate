@@ -173,7 +173,7 @@ The rule that shapes it: every file and kernel object another process sees is de
 
   Built so far: named mutexes, events and process start times (the gate's own, and `process_start_of(pid)` for another process, `None` for a pid that is gone or exited).
 
-  Also `move_no_replace` (`file.rs`: a rename that never replaces its target, which a sync-back moves fetched objects with), `device_target` (`device.rs`: the target of a drive letter's DOS device over `QueryDosDevice`, which the routing facts use to follow `subst` drives), `system_directory` (the folder holding cmd.exe), `runs_below_normal` (the gate's own priority class), `win32_message`, `boot_time` (when the machine booted).
+  Also `move_no_replace` (`file.rs`: a rename that never replaces its target, which a sync-back moves fetched objects with), `device_target` (`device.rs`: the target of a drive letter's DOS device over `QueryDosDevice`, which the routing facts use to follow `subst` drives), `system_directory` (the folder holding cmd.exe), `runs_below_normal` (the gate's own priority class), `win32_message`, `boot_time` (when the machine booted), `cancel_synchronous_io` (`thread.rs`: cancels the read a thread is waiting on, which the box's output drain uses to tell a pipe a leftover holds open from a reader that is only behind).
 
   Also job objects (`Job`: create, `create_kill_on_close` (a job whose last handle ends its processes, never handed to a piped command), terminate, process ids, `accounting`; `OpenedJob`: open by name with query and terminate access, `open_to_list` with query access only (`nesting/binding.rs` and `run.rs` use it), process ids, terminate).
 
@@ -316,6 +316,7 @@ The client's inputs, which reuse the module's glob matcher, hash cache and archi
 - **Set an ACL on a builder's tool install (the Godot root, a browser folder)** → a deny entry that carries SYNCHRONIZE on an exe makes every launch fail with "Access is denied", which the probe words as `cannot run <exe>: Access is denied.`; on a folder it stops a process without SeBackupPrivilege from listing it, a routed command under the restricted token included. icacls's simple rights `D` and `W` carry SYNCHRONIZE, its specific rights `DE`, `WD`, `AD` and `DC` do not, so deny with `(CI)(DE)`, not `(CI)(D)`.
 
   On a .NET Godot install, a folder that cannot be entered (`GodotSharp\Api\Debug`) makes every Godot launch, `--headless` included, raise a task-modal ".NET assemblies not found" alert that nobody in session 0 or on a hidden desktop can answer, so the process hangs after its banner while `--version`, which returns before .NET starts, still answers and the probe calls the install healthy.
+- **Reproduce a box output reader falling behind** (`boxside/forward.rs`) → suspending the whole box with `NtSuspendProcess` does not reproduce it, since the writer and the readers stop together; suspend the one reader thread instead, found by its name (`forward stdout` or `forward stderr`, read with `GetThreadDescription`), so the command's output arrives while the reader does not read it.
 - **Change `gate-state` or `proc-table`'s public API** → ops-tower builds against them by git rev; a breaking change needs its matching change there, by inbox request.
 
 ## Test locations

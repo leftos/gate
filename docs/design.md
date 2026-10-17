@@ -2245,7 +2245,7 @@ Built verbs:
 
   When ending the job fails or leaves processes, the box tries once more to end it. If the job is still not ended, it says first `gate: note: the box's ceiling|backstop kill left <n> process(es) running in job <job>` (or `gate: note: the box's ceiling|backstop kill could not end job <job>: <error>`), then the kill line, the tag and the adjusted line as on any kill, and exits 124: the run is still a kill.
 
-  A drain that ends with the output still held open says `gate: remote command's output is still held open by a leftover process; stopped reading`. A client gone during the kill drain gets the box's client-gone status, not a kill.
+  A drain that ends with the output still held open says `gate: remote command's output is still held open by a leftover process; stopped reading`; the drain's rule is under "Output is forwarded" below. A client gone during the kill drain gets the box's client-gone status, not a kill.
 
   The PC journals a tagged kill with the tag's verdict whatever its log holds, applies no sync-back and fetches no outputs. A command's own exit 124 (no tag) is an ordinary status with a sync-back.
 
@@ -2261,7 +2261,7 @@ Built verbs:
 
   A heartbeat line never splits a forwarded line: the pump writes under the output lock the forwarders take. The run's git children (fetch, checkout, clean, the back ref reset, the back commit's add, write-tree, rev-parse, commit-tree and push, and diff-tree) have their output forwarded the same way, line by line; the box's own lines are written whole under std's stream lock, which the pump's writes take too. A line still waiting for the lock when the readers stop is dropped.
 
-  After git exits, the box waits at most 2 s for its pipes to close. A pipe a leftover process still holds says `gate: remote git's output is still held open by a leftover process; stopped reading` and the run goes on.
+  After git exits, the box drains its pipes by the same rule as a command's output (below). A pipe a leftover process still holds says `gate: remote git's output is still held open by a leftover process; stopped reading` and the run goes on.
 
   A client that closed the connection while git's output was forwarded ends the run with 255 and `gate: remote the client closed the connection during git <step>`, the step's name saying git once (`during git init`, not `during git git init`). A pipe that cannot be read says `gate: remote could not read git's stderr: <error>` (or `stdout`).
 
@@ -2469,7 +2469,11 @@ Built verbs:
 
   Output is forwarded from the pipes until both end. What the command left in its job is ended first (below), the console's donor excepted, so a leftover there holds no pipe open and costs no drain.
 
-  A process the run's end spares, such as a live nested gate, can still hold a pipe open after the command ended: the box then stops reading after a 2 s drain and says `gate: remote command's output is still held open by a leftover process; stopped reading`. A pipe that cannot be read prints `gate: remote could not read the command's <stdout|stderr>: <error>`.
+  The drain: once the command's main process has exited, the box waits 2 s for each reader to reach the end of its pipe. A reader still not at the end then is waited for further, up to a 30 s guard counted from the start of the drain, only while it is behind: it holds bytes it has read and not yet written or dropped, or it waits on no read (between reads, or not yet run). A read still pending on a pipe holding nothing is a leftover's, and the drain cancels it with `CancelSynchronousIo`.
+
+  A reader is a leftover only if its read ended aborted by that cancellation: the line below is said at about 2 s and the reader ends quietly, writing nothing further. A cancelled read that completes anyway has its bytes forwarded and is judged again, and a reader at the end of its pipe is never one. A reader writing to the box's own output is never cancelled; the drain waits for it. A reader still behind when the guard passes is stopped, its unread bytes dropped, and the run says the same leftover line. Git's pipes drain by the same rule.
+
+  A process the run's end spares, such as a live nested gate, can still hold a pipe open after the command ended: the box then stops reading and says `gate: remote command's output is still held open by a leftover process; stopped reading`. A pipe that cannot be read prints `gate: remote could not read the command's <stdout|stderr>: <error>`.
 
   Once the command has exited, before the readers drain and before the outputs are listed, the box ends what the command left in its job, sparing live gates and console hosts as the local run end does, and the console's donor (a spared gate may still be using it; the box ends it itself once the wait for the command is over), with the passes the local run end uses (`end_leftovers`), under the state root a `gate run` with no `--state-dir` resolves.
 

@@ -4,7 +4,8 @@
 //! system's boot time, what a drive letter stands for, a rename that never replaces its target, a name opened inside an
 //! open folder, a file opened again through its reparse point's filter, an open file's volume serial and file id
 //! ([`file_id`]), whether two open files are one, whether an open file is on a network volume ([`on_network_volume`]),
-//! and the Windows message of an error code. It holds no policy:
+//! the synchronous I/O a thread waits on cancelled ([`cancel_synchronous_io`]), and the Windows message of an error
+//! code. It holds no policy:
 //! the names, the waits, the command's environment and priority, and what an abandoned mutex means to the gate are the
 //! caller's. Windows only; elsewhere the crate is empty.
 
@@ -25,6 +26,7 @@ mod priority;
 mod security;
 #[cfg(test)]
 mod test_support;
+mod thread;
 mod times;
 mod token;
 mod tree;
@@ -59,6 +61,7 @@ pub use file::{
     open_beneath_as, rename_beneath, rename_beneath_no_replace, reopen_through_filter, same_file,
 };
 pub use security::{Descriptor, inherit_security, is_protected_folder, protected_descriptor, security_text, without_auto_inherit};
+pub use thread::cancel_synchronous_io;
 pub use tree::{Membership, OpenedJob, StoppableProcess, WaitableProcess};
 
 pub use priority::{Priority, priority_of, set_priority};
