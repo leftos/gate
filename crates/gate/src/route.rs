@@ -5,24 +5,29 @@
 use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use gate_args::{GATE_SET_NAMES, RunRequest, Slot, TestSeams};
+use gate_args::{GATE_SET_NAMES, RunRequest, Slot, TestSeams, command_line};
 use gate_desktop::version::build_version;
-use gate_router::warm::{FileRead, Judgement, RecordRead, Situation, failed_line, judge, lock_problem_line, unwarmed_line, warming_line};
+use gate_router::warm::{
+    FileRead, Judgement, RecordRead, Situation, failed_line, inside_job_line, judge, lock_problem_line, start_failed_line, starting_line,
+    warming_line,
+};
 use gate_router::{
     Config, ConfigProblem, Facts, FolderId, Inputs, LocalReason, Place, RemoteRun, Route, SiblingFolder, decide, dropped_env, dropped_env_line,
 };
 use gate_state::v1;
-use gate_win32::Share;
+use gate_win32::{Detached, DetachedLaunch, Share};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 
 use crate::console::Console;
+use crate::environment::Variables;
 use crate::remote::{git, siblings};
 use crate::resolve::{Environment, ResolvedRoot};
 use crate::warm;
@@ -105,7 +110,7 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
         route => route,
     };
     let (route, warm_hash) = match route {
-        Route::Routed(remote) => warmed(remote, &machine, root, console),
+        Route::Routed(remote) => warmed(remote, &machine, root, &request.test_seams, console),
         local @ Route::Local { .. } => (local, None),
     };
     match &route {
@@ -141,19 +146,86 @@ fn probed_lock(lock: &Path) -> Result<bool, String> {
 
 /// The route of `remote`, a command that would otherwise route, once its work folder's warm-up is judged
 /// ([`gate_router::warm::judge`]): routed as it was, with the warm-up file's hash when the work folder is warm for it
-/// or with none when the repo has no consent or no warm-up file; else here, the judgement's line said.
-fn warmed(remote: Box<RemoteRun>, machine: &Machine<'_>, root: &ResolvedRoot, console: &mut Console) -> (Route, Option<String>) {
+/// or with none when the repo has no consent or no warm-up file; else here, the judgement's line said. A work folder
+/// that needs a warm-up has one started ([`start_warm_up`]) before its lines are said; the run stays here either way.
+fn warmed(remote: Box<RemoteRun>, machine: &Machine<'_>, root: &ResolvedRoot, seams: &TestSeams, console: &mut Console) -> (Route, Option<String>) {
     let (judgement, hash) = judged(&remote, machine, root);
-    let line = match judgement {
+    let lines = match judgement {
         Judgement::Route => return (Route::Routed(remote), None),
         Judgement::Ready => return (Route::Routed(remote), hash),
-        Judgement::Warming { host } => warming_line(&host),
-        Judgement::Start => unwarmed_line(&remote.host),
-        Judgement::Failed { minutes_ago, reason } => failed_line(minutes_ago, &reason),
-        Judgement::Problem(line) => line,
+        Judgement::Warming { host } => vec![warming_line(&host)],
+        Judgement::Start => start_warm_up(&remote, root, seams),
+        Judgement::Failed { minutes_ago, reason } => vec![failed_line(minutes_ago, &reason)],
+        Judgement::Problem(line) => vec![line],
     };
-    console.err(&line);
+    for line in &lines {
+        console.err(line);
+    }
     (Route::Local { reason: None }, None)
+}
+
+/// Starts `gate warm --background --state-dir <root>`, this gate's own exe, in `remote`'s worktree root with this
+/// gate's whole environment, detached ([`DetachedLaunch`]), and returns the lines to say: [`starting_line`], with
+/// [`inside_job_line`] below it when the warm-up runs inside this run's job, or [`start_failed_line`] when it could not
+/// be started. The start is a request, never a wait: the warm-up takes its own lock, and one that finds it held exits.
+/// With the spawn seam (`--test-warm-spawn`), the command line is appended to the seam's file in place of a start.
+fn start_warm_up(remote: &RemoteRun, root: &ResolvedRoot, seams: &TestSeams) -> Vec<String> {
+    let directory = Path::new(&remote.root);
+    let started = std::env::current_exe()
+        .map_err(|error| format!("cannot find this gate's own exe: {error}"))
+        .and_then(|program| {
+            let words = [
+                program.as_os_str(),
+                OsStr::new("warm"),
+                OsStr::new("--background"),
+                OsStr::new("--state-dir"),
+                root.path.as_os_str(),
+            ];
+            match &seams.warm_spawn {
+                Some(file) => record_spawn(file, &words, directory),
+                None => launch_detached(&program, &words, directory),
+            }
+        });
+    match started {
+        Ok(Detachment::OutsideJob) => vec![starting_line(&remote.host)],
+        Ok(Detachment::InsideJob) => vec![starting_line(&remote.host), inside_job_line()],
+        Err(error) => vec![start_failed_line(&remote.host, &error)],
+    }
+}
+
+/// Where a started warm-up runs, as [`Detached`] says it.
+enum Detachment {
+    OutsideJob,
+    InsideJob,
+}
+
+/// Starts `program` with the command line of `words`, the program's own first, detached in `directory` with this
+/// gate's whole environment; else the error.
+fn launch_detached(program: &Path, words: &[&OsStr], directory: &Path) -> Result<Detachment, String> {
+    let wide: Vec<Vec<u16>> = words.iter().map(|word| word.encode_wide().collect()).collect();
+    let launch = DetachedLaunch {
+        application: program.to_path_buf(),
+        command_line: command_line(&wide),
+        directory: directory.to_path_buf(),
+        environment: Variables::from_process()
+            .block()
+            .map_err(|error| format!("cannot build the environment: {error}"))?,
+    };
+    match launch.start().map_err(|error| error.to_string())? {
+        Detached::OutsideJob(_) => Ok(Detachment::OutsideJob),
+        Detached::InsideJob(_) => Ok(Detachment::InsideJob),
+    }
+}
+
+/// The spawn seam: appends `words`, then `cwd=<directory>`, separated by tabs, as one line to `file`, as a warm-up
+/// started outside the job.
+fn record_spawn(file: &Path, words: &[&OsStr], directory: &Path) -> Result<Detachment, String> {
+    let mut fields: Vec<String> = words.iter().map(|word| word.to_string_lossy().into_owned()).collect();
+    fields.push(format!("cwd={}", directory.display()));
+    let cannot = |error: io::Error| format!("cannot write the spawn file {}: {error}", file.display());
+    let mut opened = fs::OpenOptions::new().create(true).append(true).open(file).map_err(cannot)?;
+    writeln!(opened, "{}", fields.join("\t")).map_err(cannot)?;
+    Ok(Detachment::OutsideJob)
 }
 
 /// The judgement of `remote`'s work folder's warm-up, with the hash of the warm-up file when one parsed. Consent is

@@ -1,4 +1,5 @@
-//! The one way [`crate::Launch`] and [`crate::PipedLaunch`] create a command: the checks before the call, the
+//! The one way [`crate::Launch`], [`crate::PipedLaunch`], [`crate::DesktopLaunch`] and [`crate::DetachedLaunch`]
+//! create a command: the checks before the call, the
 //! inheritable copies of the handles it inherits, the startup information naming its standard handles, and the
 //! `CreateProcessW` call itself, or `CreateProcessAsUserW` for a command given a [`crate::RestrictedToken`], under the
 //! spawn lock that [`spawn`] takes too.
@@ -389,13 +390,16 @@ pub(crate) mod tests {
     use proc_table::win32::OwnedHandle;
     use windows_sys::Win32::Foundation::{CompareObjectHandles, GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, GetFileType};
     use windows_sys::Win32::System::Threading::{
         BELOW_NORMAL_PRIORITY_CLASS, CreateEventW, GetCurrentProcess, GetPriorityClass, NORMAL_PRIORITY_CLASS, SetPriorityClass,
     };
 
     use super::SPAWN_LOCK;
     use crate::piped::pipe_from_child;
-    use crate::{DesktopLaunch, EnvironmentBlock, Job, Launch, LaunchOutput, PipedConsole, PipedLaunch, RemoteProcess, thread_is_suspended};
+    use crate::{
+        DesktopLaunch, DetachedLaunch, EnvironmentBlock, Job, Launch, LaunchOutput, PipedConsole, PipedLaunch, RemoteProcess, thread_is_suspended,
+    };
 
     /// Keeps these tests from running at once, so that one's launch never holds the spawn lock while the other checks
     /// that it is free. Every unit test of this crate that starts a process takes it for its whole run, or that check
@@ -615,6 +619,44 @@ pub(crate) mod tests {
             // SAFETY: both handles are open for the whole call.
             let same = unsafe { CompareObjectHandles(pulled.as_raw_handle(), original.raw()) } != 0;
             assert!(same, "the child's stdout and stderr are the given write ends");
+        }
+        let not_inherited = child.pull(stray.raw().addr()).map_or(true, |pulled| {
+            // SAFETY: both handles are open for the whole call.
+            unsafe { CompareObjectHandles(pulled.as_raw_handle(), stray.raw()) == 0 }
+        });
+        assert!(not_inherited, "the child does not hold the inheritable handle it was not given");
+    }
+
+    #[test]
+    fn a_detached_child_inherits_only_its_three_nul_handles() {
+        let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+        let inheritable_attributes = SECURITY_ATTRIBUTES {
+            nLength: crate::launch::struct_size::<SECURITY_ATTRIBUTES>(),
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        // SAFETY: the attributes are whole and outlive the call, and a null name is allowed. A success is a fresh
+        // handle nothing else owns.
+        let stray = unsafe { crate::own_handle(CreateEventW(&raw const inheritable_attributes, 1, 0, std::ptr::null())) }.expect("the event is made");
+        let system = system_folder();
+        let launch = DetachedLaunch {
+            application: system.join("cmd.exe"),
+            command_line: "cmd /d /c exit 0".encode_utf16().collect(),
+            directory: system,
+            environment: environment(),
+        };
+
+        // Created inside this process's job, never resumed: what it inherits is fixed at creation.
+        let suspended = launch.created(0).expect("the command is created");
+
+        let copies = COPIES.take();
+        assert_eq!(CHECKED.take(), Some(3), "the window checked the three NUL handles and nothing else");
+        let child = RemoteProcess::open(suspended.pid()).expect("the child opens");
+        for &value in &copies {
+            let pulled = child.pull(value).expect("the child holds each listed handle");
+            // SAFETY: the handle is open for the whole call.
+            let kind = unsafe { GetFileType(pulled.as_raw_handle()) };
+            assert_eq!(kind, FILE_TYPE_CHAR, "each standard handle is the NUL device");
         }
         let not_inherited = child.pull(stray.raw().addr()).map_or(true, |pulled| {
             // SAFETY: both handles are open for the whole call.

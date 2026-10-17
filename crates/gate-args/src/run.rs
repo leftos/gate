@@ -103,6 +103,8 @@ pub(crate) enum ValueOption {
     ProbeLimitMs,
     #[cfg(feature = "test-seams")]
     WarmWaitMs,
+    #[cfg(feature = "test-seams")]
+    WarmSpawn,
 }
 
 /// An option that is on or off.
@@ -356,6 +358,8 @@ impl RunBuilder {
             ValueOption::ProbeLimitMs => self.check_seams.probe_limit_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::WarmWaitMs => self.test_seams.warm_wait_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::WarmSpawn => self.test_seams.warm_spawn = Some(PathBuf::from(value)),
         }
         Ok(())
     }

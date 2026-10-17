@@ -336,8 +336,8 @@ pub fn warming_text(host: &str) -> String {
     format!("{} is warming the work folder", shown_value(host))
 }
 
-/// The line of a run kept here as it starts a warm-up on `host`. The route says it once it starts a warm-up of its own,
-/// which the detached launch brings; until then it says [`unwarmed_line`].
+/// The line of a run kept here as it starts a warm-up on `host`: the route says it once the work folder is judged to
+/// need a warm-up and the detached `gate warm --background` has started, inside the run's job or outside it.
 #[must_use]
 pub fn starting_line(host: &str) -> String {
     format!(
@@ -346,13 +346,20 @@ pub fn starting_line(host: &str) -> String {
     )
 }
 
-/// The line of a run kept here because the work folder for this worktree on `host` is not warm, and no warm-up is
-/// running or held back by a failure.
+/// The note the route says below [`starting_line`] when a job the gate was started in still holds the warm-up it
+/// started: one that refused it breakaway, or one above a job it left.
 #[must_use]
-pub fn unwarmed_line(host: &str) -> String {
+pub fn inside_job_line() -> String {
+    "gate: note: the warm-up runs inside a job this gate was started in, which it cannot leave, so it ends if that job ends".to_owned()
+}
+
+/// The line of a run kept here whose warm-up on `host` could not be started, for `error`, the system's error.
+#[must_use]
+pub fn start_failed_line(host: &str, error: &str) -> String {
     format!(
-        "gate: not routed: the work folder for this worktree on {} is not warm; gate warm warms it",
-        escaped(host)
+        "gate: not routed: cannot start a warm-up of the work folder for this worktree on {}: {}",
+        escaped(host),
+        escaped(error)
     )
 }
 

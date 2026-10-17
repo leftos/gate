@@ -7,11 +7,10 @@
 use std::fs::File;
 use std::io;
 use std::os::windows::io::{BorrowedHandle, FromRawHandle, IntoRawHandle};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use proc_table::win32::OwnedHandle;
 use windows_sys::Win32::Foundation::{GENERIC_READ, HANDLE};
-use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING};
 use windows_sys::Win32::System::JobObjects::{
     IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
@@ -24,7 +23,7 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE;
 
 use crate::create::{Creation, DesktopPolicy, Inherited, check_launch, create_inheriting_on};
-use crate::launch::{open_shared, setup, struct_size};
+use crate::launch::{nul, setup, struct_size};
 use crate::{EnvironmentBlock, Job, LaunchError, RestrictedToken, Suspended, own_handle, wide};
 
 /// How to start a command whose output the caller reads: the caller decides every part of it.
@@ -87,7 +86,7 @@ impl PipedLaunch {
     /// (an application that is relative or a batch file, or a NUL in the application, command line or working folder)
     /// or a handle, a pipe or the attribute list cannot be made.
     pub fn start_suspended(&self, job: &Job) -> Result<PipedSuspended, LaunchError> {
-        self.created(job, CREATE_BREAKAWAY_FROM_JOB, nul()?)
+        self.created(job, CREATE_BREAKAWAY_FROM_JOB, nul(GENERIC_READ)?)
     }
 
     /// Creates the command suspended as [`PipedLaunch::start_suspended`] does, but inside this process's job rather
@@ -98,7 +97,7 @@ impl PipedLaunch {
     ///
     /// As [`PipedLaunch::start_suspended`].
     pub fn start_suspended_within(&self, job: &Job) -> Result<PipedSuspended, LaunchError> {
-        self.created(job, 0, nul()?)
+        self.created(job, 0, nul(GENERIC_READ)?)
     }
 
     /// Creates the command suspended as [`PipedLaunch::start_suspended_within`] does, but with its stdin the read end
@@ -189,7 +188,7 @@ impl DesktopLaunch {
     /// or a handle or the attribute list cannot be made.
     pub fn start_suspended(&self, stdout: BorrowedHandle<'_>, stderr: BorrowedHandle<'_>) -> Result<Suspended, LaunchError> {
         check_launch(&self.command_line, &self.application, &[("working folder", self.directory.as_path())])?;
-        let input = nul()?;
+        let input = nul(GENERIC_READ)?;
         let output = own_copy(stdout, "stdout")?;
         let errors = own_copy(stderr, "stderr")?;
         let creation = Creation {
@@ -218,11 +217,6 @@ fn own_copy(handle: BorrowedHandle<'_>, stream: &str) -> Result<OwnedHandle, Lau
     let copy = handle.try_clone_to_owned().map_err(|error| setup(error, &operation))?;
     // SAFETY: `into_raw_handle` gives up the std guard's ownership, so the new guard alone owns the open copy.
     unsafe { own_handle(copy.into_raw_handle()) }.map_err(|error| setup(error, &operation))
-}
-
-/// A handle to `NUL` for a command's stdin.
-fn nul() -> Result<OwnedHandle, LaunchError> {
-    open_shared(Path::new("NUL"), GENERIC_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL)
 }
 
 /// A command [`PipedLaunch::start_suspended_within_fed`] created: the suspended process, the write end of its stdin

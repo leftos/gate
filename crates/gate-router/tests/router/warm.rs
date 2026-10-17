@@ -3,8 +3,8 @@
 use std::time::{Duration, SystemTime};
 
 use gate_router::warm::{
-    FailureClass, FileRead, Judgement, Record, RecordRead, RecordState, Situation, WarmupFile, failed_line, file_problem_line, judge,
-    lock_problem_line, read_warmup, record_problem_line, starting_line, unwarmed_line, warm_hint_line, warming_line, warmup_hash,
+    FailureClass, FileRead, Judgement, Record, RecordRead, RecordState, Situation, WarmupFile, failed_line, file_problem_line, inside_job_line,
+    judge, lock_problem_line, read_warmup, record_problem_line, start_failed_line, starting_line, warm_hint_line, warming_line, warmup_hash,
 };
 
 fn problems(text: &str) -> Vec<String> {
@@ -462,12 +462,20 @@ fn the_lines_name_the_host_the_age_and_the_reason_escaped() {
 #[test]
 fn the_warm_route_lines_name_the_host_and_the_lock_escaped() {
     assert_eq!(
-        unwarmed_line("builder"),
-        "gate: not routed: the work folder for this worktree on builder is not warm; gate warm warms it"
+        starting_line("b\u{1b}"),
+        r"gate: not routed: starting a warm-up of the work folder for this worktree on b\u{1b}"
     );
     assert_eq!(
-        unwarmed_line("b\u{1b}"),
-        r"gate: not routed: the work folder for this worktree on b\u{1b} is not warm; gate warm warms it"
+        inside_job_line(),
+        "gate: note: the warm-up runs inside a job this gate was started in, which it cannot leave, so it ends if that job ends"
+    );
+    assert_eq!(
+        start_failed_line("builder", "The system cannot find the file specified."),
+        "gate: not routed: cannot start a warm-up of the work folder for this worktree on builder: The system cannot find the file specified."
+    );
+    assert_eq!(
+        start_failed_line("b\u{1b}", "bad\r\ngate: forged"),
+        r"gate: not routed: cannot start a warm-up of the work folder for this worktree on b\u{1b}: bad\r\ngate: forged"
     );
     assert_eq!(
         warm_hint_line("builder"),

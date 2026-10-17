@@ -1743,6 +1743,37 @@ fn the_job_breakaway_seam_parses_with_the_feature() {
     );
 }
 
+/// The warm-up spawn seam is a run's file path, given once, and not an option of `gate warm`, which starts no warm-up.
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_warm_spawn_seam_is_a_runs_path_given_once() {
+    use crate::support::run_request;
+
+    let words = with(&RUN, &["--test-warm-spawn", r"case\spawn.txt", "--", "cmd"]);
+    assert_eq!(
+        run_request(&refs(&words)).test_seams.warm_spawn,
+        Some(std::path::PathBuf::from(r"case\spawn.txt"))
+    );
+    assert_eq!(
+        run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams.warm_spawn,
+        None,
+        "a run starts its warm-ups unless the seam is given"
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-warm-spawn", "--", "cmd"]))),
+        ["gate: --test-warm-spawn needs a value"]
+    );
+    assert_eq!(
+        problems(&refs(&with(&RUN, &["--test-warm-spawn", "a", "--test-warm-spawn", "b", "--", "cmd"]))),
+        ["gate: --test-warm-spawn is given twice"]
+    );
+    assert_eq!(
+        problems(&["warm", "--test-warm-spawn", "a"]),
+        ["gate: unknown option --test-warm-spawn", "gate: unexpected argument a"],
+        "gate warm starts no warm-up"
+    );
+}
+
 #[cfg(not(feature = "test-seams"))]
 #[test]
 fn seam_flags_are_unknown_without_the_feature() {
@@ -1793,6 +1824,7 @@ fn seam_flags_are_unknown_without_the_feature() {
         "--test-server-image",
         "--test-servers-under",
         "--test-diagnostics-budget-ms",
+        "--test-warm-spawn",
     ] {
         assert_eq!(
             problems(&refs(&with(&RUN, &[flag, "5", "--", "cmd"]))),

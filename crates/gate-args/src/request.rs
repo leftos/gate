@@ -323,6 +323,9 @@ pub struct TestSeams {
     /// How long `gate warm` waits for the key mutex and for the warm-up cap each, in milliseconds, in place of the
     /// warm-up file's ceiling.
     pub warm_wait_ms: Option<u64>,
+    /// The file a run that judges its work folder must start a warm-up appends the warm-up's command line to, in place
+    /// of starting it: the program, each argument and `cwd=<working folder>`, separated by tabs, on a line of its own.
+    pub warm_spawn: Option<PathBuf>,
 }
 
 /// A run's ceiling as the caller gave it, in whole seconds.

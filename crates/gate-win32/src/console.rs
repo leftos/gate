@@ -13,13 +13,11 @@
 
 use std::io;
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use proc_table::win32::OwnedHandle;
 use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING};
 use windows_sys::Win32::System::Console::{
     ATTACH_PARENT_PROCESS, AttachConsole, FreeConsole, GetConsoleMode, GetConsoleProcessList, GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE,
     STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCP, SetConsoleOutputCP, SetStdHandle,
@@ -31,7 +29,7 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::create::{Creation, DesktopPolicy, Inherited, create_inheriting_on};
 use crate::event::signalled;
-use crate::launch::{LaunchError, open_shared};
+use crate::launch::{LaunchError, nul};
 use crate::{EnvironmentBlock, Job, RestrictedToken, Running, Suspended, own_handle, system_directory};
 
 /// The UTF-8 code page.
@@ -345,8 +343,7 @@ impl Feed {
         let (read, write) = unsafe { (own_handle(read), own_handle(write)) };
         let (read, write) = (read.map_err(cannot)?, write.map_err(cannot)?);
         // Read and write, as cmd.exe ends with status 1 when a write to its output fails.
-        let nul = open_shared(Path::new("NUL"), GENERIC_READ | GENERIC_WRITE, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL)
-            .map_err(|error| format!("cannot open NUL for the console helpers: {error}"))?;
+        let nul = nul(GENERIC_READ | GENERIC_WRITE).map_err(|error| format!("cannot open NUL for the console helpers: {error}"))?;
         Ok(Feed { read, _write: write, nul })
     }
 }

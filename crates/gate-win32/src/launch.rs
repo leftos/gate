@@ -364,7 +364,7 @@ impl Launch {
         let mut pipes = None;
         let (input, output, errors) = match &self.output {
             LaunchOutput::Files { log, err_log } => {
-                let input = open_shared(Path::new("NUL"), GENERIC_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL)?;
+                let input = nul(GENERIC_READ)?;
                 (input, create_output(log)?, create_output(err_log)?)
             }
             LaunchOutput::Piped => {
@@ -406,7 +406,7 @@ fn own_stderr() -> Result<OwnedHandle, LaunchError> {
     // SAFETY: `GetStdHandle` takes no pointers.
     let stderr = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
     if stderr.is_null() || stderr == INVALID_HANDLE_VALUE {
-        return open_shared(Path::new("NUL"), GENERIC_WRITE, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL);
+        return nul(GENERIC_WRITE);
     }
     let mut copy: HANDLE = std::ptr::null_mut();
     // SAFETY: both process handles are this process's pseudo-handle, which is always open; the std handle stays open
@@ -470,6 +470,11 @@ pub(crate) fn open_shared(
     }
     // SAFETY: a success is a fresh handle nothing else owns.
     unsafe { own_handle(handle) }.map_err(|error| setup(error, &format!("open {}", path.display())))
+}
+
+/// A handle to `NUL` with `access`, never inheritable, open to every process for reading, writing and deleting.
+pub(crate) fn nul(access: u32) -> Result<OwnedHandle, LaunchError> {
+    open_shared(Path::new("NUL"), access, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL)
 }
 
 /// A new file at `path` for the command to write: an earlier file there is deleted first (a link itself, never its

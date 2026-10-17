@@ -1172,18 +1172,47 @@ fn a_real_client_warm_up_on_a_held_lock_says_it_or_stays_quiet() {
 
 /// The command of the routed cases: fake-tool at the worktree root, which prints `ran here`.
 const RAN_HERE: [&str; 3] = [r".\tool.exe", "out", "ran here"];
-/// The line of a run kept here because the work folder is not warm.
-const UNWARMED: &str = "gate: not routed: the work folder for this worktree on builder is not warm; gate warm warms it";
+/// The line of a run kept here as it starts a warm-up of its work folder.
+const STARTING: &str = "gate: not routed: starting a warm-up of the work folder for this worktree on builder";
 /// The line a routed run says below its `cold` fallback.
 const WARM_HINT: &str = "gate: gate warm warms the work folder for this worktree on builder";
 
 /// A heavy run of `command` in the case's folder logging to `out.log`, through the scripted client of `steps`, with
-/// the git guards and `extra` before `--`.
+/// the git guards, the warm-up spawn seam writing to [`spawn_file`], and `extra` before `--`: no routed case starts a
+/// real warm-up.
 fn routed_run(case: &Case, steps: &str, extra: &[&str], command: &[&str]) -> Outcome {
-    let mut before = vec!["--test-remote-client", steps];
+    let words = routed_words(steps, &spawn_file(case), extra, command);
+    finish(case.gate(&words.iter().map(String::as_str).collect::<Vec<_>>()))
+}
+
+/// The words of a [`routed_run`] whose spawn seam writes to `spawn`.
+fn routed_words(steps: &str, spawn: &Path, extra: &[&str], command: &[&str]) -> Vec<String> {
+    let spawn = shown(spawn);
+    let mut before = vec!["--test-remote-client", steps, "--test-warm-spawn", &spawn];
     before.extend(GIT_HANG_GUARDS);
     before.extend(extra);
-    finish(case.gate(&heavy_words("out.log", &before, command)))
+    heavy_words("out.log", &before, command).into_iter().map(str::to_owned).collect()
+}
+
+/// The file the case's routed runs record the warm-ups they start in, in the case folder.
+fn spawn_file(case: &Case) -> PathBuf {
+    case.folder().join("warm-spawn.txt")
+}
+
+/// The warm-ups the case's routed runs started, one line each, its fields split at tabs; none when none was.
+#[expect(clippy::panic, reason = "a spawn file that cannot be read fails the case saying so")]
+fn spawned(case: &Case) -> Vec<Vec<String>> {
+    match fs::read_to_string(spawn_file(case)) {
+        Ok(text) => text.lines().map(|line| line.split('\t').map(str::to_owned).collect()).collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("the spawn file can be read: {error}"),
+    }
+}
+
+/// Asserts `outcome` ran here as [`assert_here`] asserts, saying [`STARTING`], having started exactly one warm-up.
+fn assert_started(case: &Case, outcome: &Outcome, call: &Path) {
+    assert_here(case, outcome, STARTING, call);
+    assert_eq!(spawned(case).len(), 1, "one warm-up is started: {outcome:?}");
 }
 
 /// The steps of a routed run's scripted client that records its call at `call` and passes.
@@ -1230,14 +1259,130 @@ fn assert_here(case: &Case, outcome: &Outcome, line: &str, call: &Path) {
 }
 
 #[test]
-fn a_consented_run_with_no_record_runs_here_and_says_the_work_folder_is_not_warm() {
+fn a_consented_run_with_no_record_runs_here_and_says_it_starts_a_warm_up() {
     let case = warm_case("warm-route-none");
     let call = case.folder().join("call.json");
 
     let outcome = routed_run(&case, &passing(&case, &call), &[], &RAN_HERE);
 
-    assert_here(&case, &outcome, UNWARMED, &call);
+    assert_started(&case, &outcome, &call);
     assert!(!warm_folder(&case).exists(), "the route writes no record and makes no lock");
+}
+
+#[test]
+#[expect(clippy::panic, reason = "a spawn line of another shape fails the case saying so")]
+fn a_run_judged_start_starts_a_detached_warm_up_of_its_worktree() {
+    let case = warm_case("warm-route-spawn");
+    let call = case.folder().join("call.json");
+
+    let outcome = routed_run(&case, &passing(&case, &call), &[], &RAN_HERE);
+
+    assert_here(&case, &outcome, STARTING, &call);
+    assert_eq!(outcome.stdout.matches("ran here").count(), 1, "the run ran here once: {outcome:?}");
+    let spawned = spawned(&case);
+    let [fields] = spawned.as_slice() else {
+        panic!("one warm-up is started: {spawned:?}");
+    };
+    let [program, verb, background, state_flag, state, cwd] = fields.as_slice() else {
+        panic!("the warm-up is this gate, warm, --background, --state-dir, the state root and its folder: {fields:?}");
+    };
+    assert_eq!(Path::new(program), Path::new(GATE), "the warm-up is this gate's own exe: {fields:?}");
+    assert_eq!(
+        [verb.as_str(), background.as_str(), state_flag.as_str()],
+        ["warm", "--background", "--state-dir"],
+        "{fields:?}"
+    );
+    assert_eq!(Path::new(state), case.root(), "the warm-up uses the run's state root: {fields:?}");
+    let folder = cwd.strip_prefix("cwd=").expect("the last field is the working folder").replace('/', "\\");
+    assert!(
+        folder.eq_ignore_ascii_case(&shown(&case.folder())),
+        "the warm-up starts at the worktree root: {fields:?}"
+    );
+}
+
+#[test]
+fn a_warm_up_that_cannot_be_started_keeps_the_run_here_and_says_why() {
+    let case = warm_case("warm-route-spawn-fails");
+    let call = case.folder().join("call.json");
+    let spawn = case.folder().join("spawn-folder");
+    fs::create_dir_all(&spawn).expect("the folder the seam cannot append to can be made");
+    let words = routed_words(&passing(&case, &call), &spawn, &[], &RAN_HERE);
+
+    let outcome = finish(case.gate(&words.iter().map(String::as_str).collect::<Vec<_>>()));
+
+    let start = "gate: not routed: cannot start a warm-up of the work folder for this worktree on builder: cannot write the spawn file ";
+    let line = outcome
+        .stderr
+        .lines()
+        .find(|line| line.starts_with(start))
+        .expect("the start's failure is said");
+    assert_here(&case, &outcome, line, &call);
+    assert!(!outcome.stderr.contains(STARTING), "no start is claimed: {outcome:?}");
+}
+
+#[test]
+fn a_run_from_a_subfolder_starts_the_warm_up_at_the_worktree_root() {
+    let case = warm_case("warm-route-spawn-sub");
+    fs::create_dir_all(case.folder().join("sub")).expect("the subfolder can be made");
+    fs::write(case.folder().join("sub").join("a.txt"), "a\n").expect("the subfolder holds a file");
+    let call = case.folder().join("call.json");
+    let command = [r"..\tool.exe", "out", "ran here"];
+    let words = routed_words(&passing(&case, &call), &spawn_file(&case), &[], &command);
+
+    let outcome = finish(case.gate_in("sub", &words.iter().map(String::as_str).collect::<Vec<_>>()));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.lines().any(|line| line == STARTING), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    let spawned = spawned(&case);
+    let cwd = spawned
+        .first()
+        .and_then(|fields| fields.last())
+        .and_then(|field| field.strip_prefix("cwd="))
+        .expect("one warm-up is started with its working folder")
+        .replace('/', "\\");
+    assert_eq!(spawned.len(), 1, "{spawned:?}");
+    assert!(
+        cwd.eq_ignore_ascii_case(&shown(&case.folder())),
+        "the warm-up starts at the worktree root, not the subfolder: {spawned:?}"
+    );
+}
+
+#[test]
+fn a_run_judged_ready_warming_or_failed_starts_no_warm_up() {
+    let ready = recorded_case("warm-route-spawn-ready", "warmed");
+    let call = ready.folder().join("call.json");
+    let outcome = routed_run(&ready, &passing(&ready, &call), &[], &RAN_HERE);
+    assert!(!outcome.stderr.contains("not routed"), "the run routes: {outcome:?}");
+
+    let warming = recorded_case("warm-route-spawn-warming", "warmed");
+    let call = warming.folder().join("call.json");
+    let held = hold(&warm_entry(&warming, "lock").expect("the warm-up made its lock"));
+    let outcome = routed_run(&warming, &passing(&warming, &call), &[], &RAN_HERE);
+    assert_here(
+        &warming,
+        &outcome,
+        "gate: not routed: builder is warming the work folder for this worktree",
+        &call,
+    );
+    drop(held);
+
+    // The `commands` class backs off 30 min, so a run starved for minutes still judges the failure within it.
+    let failed = recorded_case("warm-route-spawn-failed", "warm-failed commands command 1 stopped");
+    rewrite(&failed, "at", &json!((Timestamp::now() - SignedDuration::from_mins(5)).to_string()));
+    let call = failed.folder().join("call.json");
+    let outcome = routed_run(&failed, &passing(&failed, &call), &[], &RAN_HERE);
+    let (before, after) = ("gate: not routed: the warm-up failed ", " min ago: command 1 stopped");
+    let line = outcome
+        .stderr
+        .lines()
+        .find(|line| line.starts_with(before) && line.ends_with(after))
+        .expect("the failure's line is said");
+    assert_here(&failed, &outcome, line, &call);
+
+    for case in [&ready, &warming, &failed] {
+        assert!(!spawn_file(case).exists(), "no warm-up is started: {}", shown(&case.folder()));
+    }
 }
 
 #[test]
@@ -1258,14 +1403,14 @@ fn a_run_whose_lock_is_held_runs_here_and_says_the_builder_is_warming() {
 }
 
 #[test]
-fn a_warming_record_whose_lock_is_free_runs_here_and_says_the_work_folder_is_not_warm() {
+fn a_warming_record_whose_lock_is_free_runs_here_and_says_it_starts_a_warm_up() {
     let case = recorded_case("warm-route-stale", "warmed");
     rewrite(&case, "state", &json!("warming"));
     let call = case.folder().join("call.json");
 
     let outcome = routed_run(&case, &passing(&case, &call), &[], &RAN_HERE);
 
-    assert_here(&case, &outcome, UNWARMED, &call);
+    assert_started(&case, &outcome, &call);
 }
 
 #[test]
@@ -1288,18 +1433,18 @@ fn a_warm_record_of_this_host_and_file_routes_and_asks_the_box_for_its_hash() {
 }
 
 #[test]
-fn a_warm_record_of_another_host_or_file_runs_here_and_says_the_work_folder_is_not_warm() {
+fn a_warm_record_of_another_host_or_file_runs_here_and_says_it_starts_a_warm_up() {
     let case = recorded_case("warm-route-other-host", "warmed");
     rewrite(&case, "host", &json!("other-builder"));
     let call = case.folder().join("call.json");
     let outcome = routed_run(&case, &passing(&case, &call), &[], &RAN_HERE);
-    assert_here(&case, &outcome, UNWARMED, &call);
+    assert_started(&case, &outcome, &call);
 
     let case = recorded_case("warm-route-other-file", "warmed");
     warmup_file(&case, b"commands = [[\"tool.exe\", \"out\", \"changed\"]]\n");
     let call = case.folder().join("call.json");
     let outcome = routed_run(&case, &passing(&case, &call), &[], &RAN_HERE);
-    assert_here(&case, &outcome, UNWARMED, &call);
+    assert_started(&case, &outcome, &call);
 }
 
 #[test]
@@ -1329,18 +1474,18 @@ fn a_failure_within_its_backoff_runs_here_and_says_when_it_failed() {
 }
 
 #[test]
-fn a_failure_past_its_backoff_or_of_another_gate_build_runs_here_and_says_the_work_folder_is_not_warm() {
+fn a_failure_past_its_backoff_or_of_another_gate_build_runs_here_and_says_it_starts_a_warm_up() {
     let case = recorded_case("warm-route-failed-past", "warm-failed commands command 1 stopped");
     long_ago(&case);
     let call = case.folder().join("call.json");
     let outcome = routed_run(&case, &passing(&case, &call), &[], &RAN_HERE);
-    assert_here(&case, &outcome, UNWARMED, &call);
+    assert_started(&case, &outcome, &call);
 
     let case = recorded_case("warm-route-failed-build", "warm-failed commands command 1 stopped");
     rewrite(&case, "gate", &json!("0.0.0-another-build"));
     let call = case.folder().join("call.json");
     let outcome = routed_run(&case, &passing(&case, &call), &[], &RAN_HERE);
-    assert_here(&case, &outcome, UNWARMED, &call);
+    assert_started(&case, &outcome, &call);
 }
 
 #[test]
