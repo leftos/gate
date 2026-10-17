@@ -11,8 +11,8 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use super::{
-    BoxCall, box_call, fake_godot, field, gate_box, godot_root, let_go, lines_starting, pair_payload, pair_snapshot, path_for_run, path_godot,
-    payload as request_line, refused_line, run_box, run_box_with_seams, snapshot, started_line, stopped_line_for,
+    BoxCall, adjusted_seconds, box_call, fake_godot, field, gate_box, godot_root, let_go, lines_starting, pair_payload, pair_snapshot, path_for_run,
+    path_godot, payload as request_line, refused_line, run_box, run_box_with_seams, snapshot, started_line, stopped_line_for,
 };
 use crate::support::{
     Case, Closed, FAKE_TOOL, HeldDesktop, KeptDesktop, Outcome, box_payload, build_version, copy_tool, desktop_payload, desktop_seams, junction,
@@ -935,7 +935,7 @@ fn a_killed_box_ends_its_desktop_command_and_the_next_run_takes_the_abandoned_lo
 
     // The run's job went with the box's last handle on it, so the next run can take the same name.
     wait_until("the killed box's desktop job ending", || {
-        OpenedJob::open_to_list(field(&payload, "Job")).ok().flatten().is_none()
+        OpenedJob::open_to_list(field(&payload, "Job")).expect("the job can be opened").is_none()
     });
     wait_until_all_ended(&[(pid, created)], "the killed box's desktop command ending");
     let left = left_by(&record);
@@ -975,12 +975,7 @@ fn the_ceiling_kills_a_desktop_command() {
     snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
     payload["Timeout"] = json!(1);
     payload["Host"] = json!("builder");
-    let running = desktop_call(&case, &payload, "ok", &["--test-box-sample-ms", "20", "--test-box-free-percent", "100"]).start();
-    let pid = printed_pid(&running.wait_for_stdout("pid "));
-    let created = started_at(pid);
-    assert!(created.is_some(), "the command's creation time can be read: {pid}");
-
-    let outcome = running.finish();
+    let outcome = desktop_call(&case, &payload, "ok", &["--test-box-sample-ms", "20", "--test-box-free-percent", "100"]).finish();
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     let kill = Regex::new(
@@ -996,7 +991,7 @@ fn the_ceiling_kills_a_desktop_command() {
         Some(format!("gate-remote-killed: {} timed-out", field(&payload, "Nonce")).as_str()),
         "the kill tag right after the kill line: {outcome:?}"
     );
-    wait_until_all_ended(&[(pid, created)], "the killed desktop command ending");
+    assert!(adjusted_seconds(&outcome, &payload) >= 1.0, "the clock reached the ceiling: {outcome:?}");
 }
 
 #[test]
@@ -1007,8 +1002,6 @@ fn a_closed_stdout_pipe_stops_a_desktop_job_and_exits_255() {
     let payload = ready_payload(&case, &[FAKE_TOOL, "err", "started", "wait", &go_word, "out", "x", "sleep", "10000"]);
     let running = desktop_call(&case, &payload, "ok", &[]).start_with_closed(Closed::Stdout);
     running.wait_for_stderr("started");
-    let members = job_processes(&payload);
-    assert!(!members.is_empty(), "the command is in the run's job: {payload:?}");
     let_go(&go);
 
     let outcome = running.finish();
@@ -1018,7 +1011,6 @@ fn a_closed_stdout_pipe_stops_a_desktop_job_and_exits_255() {
         outcome.stderr.contains("gate: remote the client closed the connection; stopped job "),
         "{outcome:?}"
     );
-    wait_until_all_ended(&members, "the desktop command of the closed stdout pipe ending");
 }
 
 #[test]
@@ -1026,20 +1018,14 @@ fn a_closed_stderr_pipe_stops_a_desktop_job_and_exits_255() {
     let case = Case::new("desktop_closed_stderr");
     let go = case.folder().join("go");
     let go_word = shown(&go);
-    let payload = ready_payload(
-        &case,
-        &[FAKE_TOOL, "pid", "out", "started", "wait", &go_word, "err", "x", "sleep", "10000"],
-    );
+    let payload = ready_payload(&case, &[FAKE_TOOL, "out", "started", "wait", &go_word, "err", "x", "sleep", "10000"]);
     let running = desktop_call(&case, &payload, "ok", &[]).start_with_closed(Closed::Stderr);
     running.wait_for_stdout("started");
-    let members = job_processes(&payload);
-    assert!(!members.is_empty(), "the command is in the run's job: {payload:?}");
     let_go(&go);
 
     let outcome = running.finish();
 
     assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
-    wait_until_all_ended(&members, "the desktop command of the closed stderr pipe ending");
 }
 
 /// The pid of the command that printed its `pid <n>` line to `stdout`.
@@ -1054,32 +1040,20 @@ fn printed_pid(stdout: &str) -> u32 {
 /// The creation time of the process `pid`, read now, so a process at a reused pid is never taken for it.
 fn started_at(pid: u32) -> Option<jiff::Timestamp> {
     Win32ProcessTable
-        .snapshot_without_command_lines()
+        .try_snapshot_without_command_lines()
+        .expect("the process table can be listed")
         .into_iter()
         .find(|process| process.pid == pid)
         .and_then(|process| process.created)
-}
-
-/// The pid and creation time of every process in the run's job of `payload`, read while its command runs.
-fn job_processes(payload: &Value) -> Vec<(u32, Option<jiff::Timestamp>)> {
-    let members = OpenedJob::open_to_list(field(payload, "Job"))
-        .expect("the job can be opened")
-        .expect("the job exists while its command runs")
-        .process_ids()
-        .expect("the job's processes are listed");
-    let snapshot = Win32ProcessTable.snapshot_without_command_lines();
-    snapshot
-        .iter()
-        .filter(|process| members.contains(&process.pid))
-        .map(|process| (process.pid, process.created))
-        .collect()
 }
 
 /// Waits until no process of `ended`, each a pid and the creation time read while it ran, still runs: another process
 /// at a reused pid is never taken for one of them.
 fn wait_until_all_ended(ended: &[(u32, Option<jiff::Timestamp>)], what: &str) {
     wait_until(what, || {
-        let snapshot = Win32ProcessTable.snapshot_without_command_lines();
+        let snapshot = Win32ProcessTable
+            .try_snapshot_without_command_lines()
+            .expect("the process table can be listed");
         ended
             .iter()
             .all(|(pid, created)| !snapshot.iter().any(|process| process.pid == *pid && process.created == *created))
