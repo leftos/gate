@@ -136,14 +136,12 @@ fn a_child_started_after_now_was_created_at_or_after_it() {
     assert!(times.created >= since, "created {} before {since}", times.created);
 }
 
+// No rise is asserted between the reads: GetSystemTimes sums the processors' times without one atomic snapshot.
 #[test]
-fn system_times_only_rise() {
+fn system_times_are_read_with_kernel_time_holding_idle_time() {
     let first = system_times().expect("the system's times are read");
     let second = system_times().expect("the system's times are read again");
 
     assert!(first.kernel >= first.idle, "kernel time includes idle time: {first:?}");
-    assert!(
-        second.idle >= first.idle && second.kernel >= first.kernel && second.user >= first.user,
-        "{first:?} then {second:?}"
-    );
+    assert!(second.kernel >= second.idle, "kernel time includes idle time: {second:?}");
 }

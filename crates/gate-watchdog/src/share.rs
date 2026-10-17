@@ -5,8 +5,8 @@
 pub struct Ticks(pub u64);
 
 impl Ticks {
-    /// The ticks gained from `earlier` to `self`, saturating at zero: these readings only ever rise, so one that fell
-    /// is read as no gain rather than as a wrap.
+    /// The ticks gained from `earlier` to `self`, saturating at zero: a reading can fall by a tick (the system's totals
+    /// are summed over processors without one atomic read), and one that fell is read as no gain rather than as a wrap.
     #[must_use]
     pub fn saturating_sub(self, earlier: Self) -> Self {
         Self(self.0.saturating_sub(earlier.0))
@@ -119,5 +119,30 @@ mod tests {
         for free in [1.0, 1.5, 16.0] {
             assert!((share_of(machine, free) - 1.0).abs() <= 1e-9, "{free} free cores");
         }
+    }
+
+    #[test]
+    fn a_sample_whose_idle_and_kernel_times_fell_gives_a_finite_share_within_the_machine() {
+        const TICK: u64 = 156_250;
+        let machine = Machine::new(16, 16, false);
+        let before = SystemTimes {
+            idle: 37_458_201_406_250,
+            kernel: 39_799_138_906_250,
+            user: 5_938_393_125_000,
+        };
+        let after = SystemTimes {
+            idle: before.idle - TICK,
+            kernel: before.kernel - TICK,
+            user: before.user,
+        };
+
+        let free = free_cores(machine, before, after, Ticks(0), 10.0);
+
+        assert!(free.is_finite(), "free cores {free} is not finite");
+        assert!(
+            (0.0..=f64::from(machine.cores)).contains(&free),
+            "free cores {free} outside 0..={}",
+            machine.cores
+        );
     }
 }
