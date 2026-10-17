@@ -185,7 +185,7 @@ The rule that shapes it: every file and kernel object another process sees is de
 
   `PipedLaunch::start_suspended_within_fed` (in `piped.rs`) is the same suspended start in a job with stdin piped as well, a `PipedFed` holding the write end, which `gate push` feeds the exe through.
 
-  `console.rs` is the box's UTF-8 console: a `Donor` (a `cmd.exe` put in the command's job) and `Utf8Console`, which attaches the process to the donor's console, sets the code pages, and returns through a keeper. `event.rs`'s `NamedEvent` also gives the named manual-reset event of a job's stop signal (`create_new_manual` by the run, `open_to_set` by `stop`).
+  `console.rs` is the box's UTF-8 console: a `Donor` (a `cmd.exe` put in the command's job) and `Utf8Console`, which attaches the process to the donor's console, sets the code pages, and returns through a console keeper. `event.rs`'s `NamedEvent` also gives the named manual-reset event of a job's stop signal (`create_new_manual` by the run, `open_to_set` by `stop`).
 
   Both launches create the process through the shared `create.rs` (`check_launch`, `startup_info`, `AttributeList`, `create_process`, `create_inheriting`), so the refusals before the call and the startup information are one code path.
 
@@ -285,6 +285,8 @@ The rule that shapes it: every file and kernel object another process sees is de
 It also holds `run.rs` (the lock, the git flags, the sync, the command, the back commit and the call to pack outputs), `outputs.rs` (the PC's manifest read, the old-archive prune, the pack of a run's outputs, the 50 GiB trim of the outputs folder and the `outputs` verb that sends and deletes the archive).
 
 It also holds `tools.rs` (the dotnet tool restore and its `<Work>.tools` record), `packages.rs` (the pnpm install before a routed `pnpm` command and its `<Work>.packages` record), `forward.rs` (the pipes forwarded to stdout and stderr), `heartbeat.rs` (the command heartbeat: the job's CPU on `gate-watchdog`'s `Pump`), `inflight.rs` (the `inflight` verb: which locks under `{Root}\work` a routed run holds) and `stop.rs` (terminating the job).
+
+`msys.rs` is the MSYS keeper, started from `run.rs` after the heartbeat: Git's `cat.exe`, found above the box's `git.exe` and owned by Administrators, SYSTEM or TrustedInstaller, kept running in a job of its own so no killed MSYS start-up leaves Git's shared section locked.
 
 `outputs/` is a routed run's outputs, shared by both ends: `glob.rs` (the output globs and the exclusions, case-insensitive), `walk.rs` (the matching files below a folder, skipping links and junctions; `walk_with_refused` also notes the files refused for their names, reading a folder whose name is not plain through a verbatim path to count them), `hash.rs` (SHA-256 and `is_lower_hex`).
 

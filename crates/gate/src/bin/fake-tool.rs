@@ -35,7 +35,12 @@
 //! level's relative ID as `integrity 0x<hex>`, `owner user` when the objects it creates are owned by its user, else
 //! `owner other`, and its default DACL as `dacl <sid>:0x<mask> …`, each entry's SID in its string form and the access
 //! mask it allows in hex, in the DACL's order (`dacl null` for a null DACL), and how it holds the NETWORK group as
-//! `network absent`, `network enabled`, `network deny-only` or `network disabled`;
+//! `network absent`, `network enabled`, `network deny-only` or `network disabled`; `token-to <path>` writes the same
+//! lines to the file at the path, its folders made when missing;
+//! `echo` writes each line it reads on stdin back to stdout, flushed, until stdin ends; `swallow` reads stdin to its end
+//! and writes nothing; `pid-to <path>` writes this process's pid to the file at the path, its folders made when
+//! missing; `alive <path>` reads a pid from the file at the path and prints `alive <pid>` when that process runs, else
+//! fails with `fake-tool: process <pid> is not running`;
 //! `argv` prints every word after it, each on its own line, and ends, so it is always the last step;
 //! `--version` adds the line `run` to the file `ran` beside this program's own file, then prints the first line of the
 //! file `version.txt` beside it, and nothing when there is no such file, so a copy named `Godot_console.exe` stands in
@@ -133,10 +138,7 @@ fn run(args: &[OsString]) -> Result<i32, String> {
                 stdout.flush().map_err(|error| write_failed(&error))?;
                 burn_until(&path)?;
             }
-            "chatter" => {
-                let path = operand(&mut steps, "chatter")?;
-                chatter_until(&path, &mut stdout)?;
-            }
+            "chatter" => chatter_until(&operand(&mut steps, "chatter")?, &mut stdout)?,
             "spawn-wait" => {
                 let pid = spawn_wait(&operand(&mut steps, "spawn-wait")?)?;
                 writeln!(stdout, "spawned {pid}").map_err(|error| write_failed(&error))?;
@@ -180,11 +182,52 @@ fn run(args: &[OsString]) -> Result<i32, String> {
             }
             "spawn-away" => spawn_away(&mut steps, &mut stdout)?,
             "token" => token(&mut stdout)?,
-            other => return Err(format!("unknown step '{other}'")),
+            "token-to" => token_to(&operand(&mut steps, "token-to")?)?,
+            other => keeper_step(other, &mut steps, &mut stdout)?,
         }
     }
     stdout.flush().map_err(|error| write_failed(&error))?;
     Ok(0)
+}
+
+/// The steps a stand-in for the box's MSYS keeper and the command watching it take: `echo`, `swallow`, `pid-to` and
+/// `alive`; any other step is unknown.
+fn keeper_step<'a>(step: &str, steps: &mut impl Iterator<Item = &'a OsString>, stdout: &mut impl Write) -> Result<(), String> {
+    match step {
+        "echo" => echo(stdout),
+        "swallow" => io::copy(&mut io::stdin().lock(), &mut io::sink())
+            .map(drop)
+            .map_err(|error| format!("cannot read stdin: {error}")),
+        "pid-to" => write_file(&operand(steps, "pid-to")?, &std::process::id().to_string()),
+        "alive" => alive(&operand(steps, "alive")?, stdout),
+        other => Err(format!("unknown step '{other}'")),
+    }
+}
+
+/// The `echo` step: writes each line of stdin back to stdout as it comes, flushed, until stdin ends.
+fn echo(stdout: &mut impl Write) -> Result<(), String> {
+    let mut stdin = io::stdin().lock();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if io::BufRead::read_until(&mut stdin, b'\n', &mut line).map_err(|error| format!("cannot read stdin: {error}"))? == 0 {
+            return Ok(());
+        }
+        stdout.write_all(&line).map_err(|error| write_failed(&error))?;
+        stdout.flush().map_err(|error| write_failed(&error))?;
+    }
+}
+
+/// The `alive <path>` step: prints `alive <pid>` when the process whose pid the file at `path` holds is running, else
+/// fails with `process <pid> is not running`.
+fn alive(path: &str, stdout: &mut impl Write) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|error| format!("cannot read {path}: {error}"))?;
+    let pid: u32 = text.trim().parse().map_err(|_| format!("{path} holds no pid: '{text}'"))?;
+    let running = gate_win32::process_start_of(pid).map_err(|error| format!("cannot look for process {pid}: {error}"))?;
+    if running.is_none() {
+        return Err(format!("process {pid} is not running"));
+    }
+    writeln!(stdout, "alive {pid}").map_err(|error| write_failed(&error))
 }
 
 fn operand<'a>(steps: &mut impl Iterator<Item = &'a OsString>, step: &str) -> Result<String, String> {
@@ -353,6 +396,15 @@ fn token(stdout: &mut impl Write) -> Result<(), String> {
         facts.integrity
     )
     .map_err(|error| write_failed(&error))
+}
+
+/// The `token-to <path>` step: writes the lines the `token` step prints to the file at the path, its folders made when
+/// missing, so a stand-in the box starts can be checked for its token.
+fn token_to(path: &str) -> Result<(), String> {
+    let mut lines = Vec::new();
+    token(&mut lines)?;
+    let text = String::from_utf8(lines).map_err(|error| format!("the token facts are not UTF-8: {error}"))?;
+    write_file(path, &text)
 }
 
 /// Prints a numbered line about every [`CHATTER_STEP`], flushing each, until the file at `path` exists: the log a case's

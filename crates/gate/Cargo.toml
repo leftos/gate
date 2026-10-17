@@ -27,12 +27,30 @@ sha2 = "0.11.0"
 tar = "0.4.46"
 # Reads `.gate/toolchain.toml` into a `toml::Table`, its keys in file order; no writer, no derive.
 toml = { version = "1.1.8", default-features = false, features = ["std", "parse", "serde", "preserve_order"] }
-# `Win32_Storage_FileSystem` for the outputs walk and pack; `Win32_System_Console` for `fake-tool`, a `test-seams` bin.
-windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_Console"] }
+# `Win32_Storage_FileSystem` for the outputs walk and pack; `Win32_System_Console` for `fake-tool`, a `test-seams` bin;
+# `Win32_Foundation` and `Win32_Security*` for the owner of the MSYS keeper's folder.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+] }
 zstd = "0.14.2"
 
 [dev-dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
+# The MSYS keeper's machine-alone case reads Git's MSYS section (`Wdk_*`, `Win32_Security`, `Win32_System_Memory`,
+# `Win32_System_RemoteDesktop`).
+windows-sys = { version = "0.61.2", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Memory",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+] }
 
 [[bin]]
 name = "gate"

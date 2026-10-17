@@ -5554,3 +5554,143 @@ fn a_box_kill_that_leaves_a_process_says_a_note_then_still_the_kill_line_and_tag
     );
     wait_until_closed(Path::new(field(&payload, "Lock")));
 }
+
+/// The test seam that starts a stand-in in place of Git's MSYS keeper: its program, then each of its words, separated by
+/// `|`.
+const KEEPER_STAND_IN: &str = "GATE_TEST_BOX_MSYS_KEEPER";
+/// The test seam that sets how long the box waits for the keeper's echo, in milliseconds.
+const KEEPER_LIMIT_MS: &str = "GATE_TEST_BOX_MSYS_KEEPER_MS";
+/// The start and the end of the line a box says when it could not start the keeper, its reason between them.
+const UNKEPT_START: &str = "gate: box could not start Git's MSYS keeper: ";
+const UNKEPT_END: &str = "; a Git shell killed as it starts can stall later ones";
+
+/// `gate box run` of `payload` with the keeper's stand-in `stand_in`, and the wait for its echo `limit_ms` when given,
+/// to its end.
+fn run_box_with_keeper(case: &Case, payload: &Value, stand_in: &[&str], limit_ms: Option<&str>) -> Outcome {
+    let mut call = box_call(case, &["box", "run"], &self::payload(payload));
+    call.env(KEEPER_STAND_IN, stand_in.join("|"));
+    if let Some(ms) = limit_ms {
+        call.env(KEEPER_LIMIT_MS, ms);
+    }
+    call.finish()
+}
+
+/// The lines of `outcome`'s stderr saying the keeper could not be started.
+fn unkept_lines(outcome: &Outcome) -> Vec<&str> {
+    lines_starting(outcome, UNKEPT_START)
+}
+
+#[test]
+fn box_run_keeps_the_msys_keeper_running_through_the_command_and_ends_it_after() {
+    let case = Case::new("box_run_msys_keeper");
+    let pid_file = case.folder().join("keeper.pid");
+    let pid_word = shown(&pid_file);
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "alive", &pid_word]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    // The stand-in first leaves a file in the work folder, which only a checkout after it clears; it outlives the end
+    // of its input, so only the end of its job ends it.
+    let before_checkout = Path::new(field(&payload, "Work")).join("keeper-before-checkout.txt");
+    let before_word = shown(&before_checkout);
+    let stand_in = [FAKE_TOOL, "write", &before_word, "x", "pid-to", &pid_word, "echo", "sleep", "600000"];
+    let outcome = run_box_with_keeper(&case, &payload, &stand_in, Some("600000"));
+
+    assert_eq!(
+        outcome.code,
+        Some(0),
+        "the keeper was up before the command and while it ran: {outcome:?}"
+    );
+    assert!(unkept_lines(&outcome).is_empty(), "{outcome:?}");
+    assert!(
+        !before_checkout.exists(),
+        "the keeper was up before the checkout cleared the work folder: {outcome:?}"
+    );
+    let pid: u32 = fs::read_to_string(&pid_file)
+        .expect("the keeper wrote its pid")
+        .trim()
+        .parse()
+        .expect("the pid file holds a pid");
+    assert!(
+        outcome.stdout.contains(&format!("alive {pid}\n")),
+        "the command saw the keeper: {outcome:?}"
+    );
+    wait_until_gone(pid);
+}
+
+#[test]
+fn box_run_starts_the_msys_keeper_non_elevated_on_the_restricted_token() {
+    let case = Case::new("box_run_msys_keeper_token");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let token_file = case.folder().join("keeper-token");
+    let token_word = shown(&token_file);
+    let stand_in = [FAKE_TOOL, "token-to", token_word.as_str(), "echo"];
+    let outcome = run_box_with_keeper(&case, &payload, &stand_in, Some("600000"));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(unkept_lines(&outcome).is_empty(), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran\n"), "the command ran: {outcome:?}");
+    let lines: Vec<String> = fs::read_to_string(&token_file)
+        .expect("the keeper wrote its token facts")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(lines.iter().any(|line| line == "not-elevated"), "{lines:?}");
+    let dacl = restricted_dacl_line();
+    assert!(lines.contains(&dacl), "the keeper's restricted token's default DACL, {dacl:?}: {lines:?}");
+}
+
+#[test]
+fn box_run_that_cannot_start_the_msys_keeper_says_so_once_and_runs_the_command() {
+    let case = Case::new("box_run_msys_keeper_missing");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "exit", "3"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let missing = shown(&case.folder().join("no-such-keeper.exe"));
+    let outcome = run_box_with_keeper(&case, &payload, &[&missing], None);
+
+    assert_eq!(outcome.code, Some(3), "the command ran with its usual status: {outcome:?}");
+    let unkept = unkept_lines(&outcome);
+    assert_eq!(unkept.len(), 1, "one line: {outcome:?}");
+    assert!(unkept[0].ends_with(UNKEPT_END), "{outcome:?}");
+}
+
+#[test]
+fn box_run_whose_msys_keeper_ends_without_answering_says_its_stderr_and_runs_the_command() {
+    let case = Case::new("box_run_msys_keeper_ended");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let stand_in = [FAKE_TOOL, "err", "add_item failed, errno 1", "exit", "0"];
+    let outcome = run_box_with_keeper(&case, &payload, &stand_in, Some("600000"));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran\n"), "the command ran: {outcome:?}");
+    let unkept = unkept_lines(&outcome);
+    assert_eq!(unkept.len(), 1, "one line: {outcome:?}");
+    assert_eq!(
+        unkept[0],
+        format!("{UNKEPT_START}it ended without answering: add_item failed, errno 1{UNKEPT_END}"),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn box_run_whose_msys_keeper_does_not_answer_says_so_once_and_runs_the_command() {
+    let case = Case::new("box_run_msys_keeper_silent");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box_with_keeper(&case, &payload, &[FAKE_TOOL, "swallow"], Some("100"));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran\n"), "the command ran: {outcome:?}");
+    let unkept = unkept_lines(&outcome);
+    assert_eq!(unkept.len(), 1, "one line: {outcome:?}");
+    assert_eq!(
+        unkept[0],
+        format!("{UNKEPT_START}it did not answer within 0.1 s{UNKEPT_END}"),
+        "{outcome:?}"
+    );
+}
