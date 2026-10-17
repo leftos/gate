@@ -2135,7 +2135,7 @@ The other four box seams are `--test-outputs-budget-bytes <n>`, which replaces t
 
 A seam is refused as the `gate run` seams are: no value, given twice, and a value outside its rule (`gate: --test-outputs-budget-bytes must be a whole number above 0, got '<v>'`, `... must be at most 2147483647 ...`, `... needs a value`, `... is given twice`).
 
-The desktop run has four more: `--test-box-desktop-session active|none|locked|other-user|disconnected` makes the box read the console session as that state (the box's own session, with the box's account at it, or nobody, another user, a locked or a disconnected one), `--test-box-desktop <mode>` starts the stand-in helper (`fake-desktop-helper.exe`, beside the box's program) in place of the registered task, at below normal priority in a kill-on-close job and with the helper's own seams set: `ok`, or a fault of the helper (`exit-before-hello`, `hang`, `wrong-version`, `lie-handle`, `exit-after-create`), or a task mode (`task-not-registered`, `task-set-up-wrong`, `task-failed`, `task-no-pid`) that stands for that refusal of the task without starting anything.
+The desktop run has four more: `--test-box-desktop-session active|none|locked|other-user|disconnected` makes the box read the console session as that state (the box's own session, with the box's account at it, or nobody, another user, a locked or a disconnected one), `--test-box-desktop <mode>` starts the stand-in helper (`fake-desktop-helper.exe`, beside the box's program) in place of the registered task, at below normal priority in a kill-on-close job, with the helper's own seams set and every other variable of the box's environment inherited (the three seams the box sets itself are never inherited): `ok`, or a fault of the helper (`exit-before-hello`, `hang`, `wrong-version`, `lie-handle`, `exit-after-create`), or a task mode (`task-not-registered`, `task-set-up-wrong`, `task-failed`, `task-no-pid`) that stands for that refusal of the task without starting anything.
 
 `--test-box-desktop`, given without a session seam, also stands for an `active` session. A desktop run uses no console donor and ignores the console and token seams.
 
@@ -2889,7 +2889,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   A third helper, `fake-desktop-helper`, is the real desktop helper's code (`gate_desktop::run`) built beside `gate.exe`, so a box case can put it where the box looks for the installed one. It is built only with `--features test-seams` (`required-features`), and `gate`'s `test-seams` feature turns on `gate-desktop/test-seams` for it. With no argument it exits 10 (`HelperExit::BadArgument`).
 
-  The helper has four seams, environment variables that exist only in a `test-seams` build of it (unlike the `--test-*` flags). `GATE_DESKTOP_TEST_RECORD`, set to a file's path, has it add the pid of each child it creates to that file, one line each.
+  The helper has five seams, environment variables that exist only in a `test-seams` build of it (unlike the `--test-*` flags). `GATE_DESKTOP_TEST_RECORD`, set to a file's path, has it add the pid of each child it creates to that file, one line each.
 
   The box writes the line `stand-in <pid> <created>` (the stand-in's pid and creation time) there first, before it resumes the stand-in, and starts the stand-in in no job of its own, so a child the box failed to end outlives the run and a case can read the record.
 
@@ -2897,7 +2897,11 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   The box sets the stand-in's cap to twice its own `--test-box-desktop-ms` cap, so the box's limits pass before the stand-in's.
 
-  The last, `GATE_DESKTOP_TEST_FAULT`, names the step it breaks; absent, empty or unknown is no fault:
+  `GATE_DESKTOP_TEST_INPUT_DESKTOP` names the input desktop the helper reports in its hello in place of the one it reads, and the helper still judges that name against `Default`; unlike the fault seam, an empty value names the empty desktop.
+
+  The suite's desktop cases set it to `Default` through the box's environment, which the stand-in inherits, so they run and pass in a builder's session 0 as at the console. `boxside::desktop::the_real_helper_checks_the_input_desktop` leaves it unset: on the `Default` input desktop the run is handed off, and anywhere else it is refused with exit 75 and `gate: not routed: the builder has no desktop session: the desktop helper is not on the console's Default desktop`.
+
+  `GATE_DESKTOP_TEST_FAULT` names the step the helper breaks; absent, empty or unknown is no fault:
   - `exit-before-hello` exits 13 before saying hello, `hang` answers nothing and waits until the pipe goes away (13) or its own done limit passes (18), the longest limit it keeps, so a box that keeps its message limit gives up first, and `wrong-version` says the build `0.0.0+fault`.
   - `lie-handle` reports the child's thread handle value as `process` (the real pid and thread), and `exit-after-create` creates its child, leaves it suspended and exits 19.
 - **No fixture from the checkout path.** No routing pattern, expected path or assertion is derived from where the repo is checked out; a case builds its own repository and routing file in its root. `checkout::repo_file` is the one route to a checked-in file (the install script), never for a path or pattern a case asserts on.

@@ -492,8 +492,8 @@ pub fn reopen_through_filter(file: &File) -> io::Result<File> {
     Ok(unsafe { File::from_raw_handle(handle) })
 }
 
-/// Whether the open files `first` and `second` are one file: the same pair of volume serial number and file id
-/// ([`file_id`]).
+/// Whether the open files `first` and `second` give the same pair of volume serial number and file id ([`file_id`]):
+/// one file, or two files of a file system that gives them both the file index 0, which this does not refuse.
 ///
 /// # Errors
 ///
@@ -502,13 +502,14 @@ pub fn same_file(first: &File, second: &File) -> io::Result<bool> {
     Ok(file_id(first)? == file_id(second)?)
 }
 
-/// The volume serial number and the 128-bit file id of the open file or folder `file`: two handles give the same pair
-/// only when they are of one file.
+/// The volume serial number and the 128-bit file id of the open file or folder `file`: two handles of one file give
+/// the same pair, and, but for the file index below, two of different files never do.
 ///
 /// The id is the 128-bit one `FileIdInfo` gives, which a Dev Drive and other `ReFS` volumes need. A file system
 /// that does not serve that class (FAT and exFAT) gives its 32-bit volume serial number and 64-bit file index
 /// instead, each widened into the same pair. Which of the two a file gives is the file system's, so two reads of one
-/// volume's files always take the same one.
+/// volume's files always take the same one. Such a file system may give the index 0 for every file, so a zero id
+/// does not tell its files apart, and a caller that must tell one file from another refuses a zero id.
 ///
 /// # Errors
 ///

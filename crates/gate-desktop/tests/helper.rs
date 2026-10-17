@@ -105,8 +105,12 @@ fn serve() -> PipeServer {
 /// The helper's seam that, set to `user`, makes it take a control pipe its user owns, as an unelevated test makes it.
 const PIPE_OWNER_VARIABLE: &str = "GATE_DESKTOP_TEST_PIPE_OWNER";
 
+/// The helper's seam that names the input desktop in place of the one it reads.
+const INPUT_DESKTOP_VARIABLE: &str = "GATE_DESKTOP_TEST_INPUT_DESKTOP";
+
 /// The helper's command, with `args` and, when given, the seam capping its limits at `limit_ms`, the seam that makes
-/// it take the pipe this unelevated test makes, which its user owns, and the step `fault` breaks.
+/// it take the pipe this unelevated test makes, which its user owns, and the step `fault` breaks. It reads the input
+/// desktop itself, whatever the test's own environment names.
 fn helper_command(args: &[&str], limit_ms: Option<u64>, fault: Option<&str>) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_gate-desktop-helper"));
     command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -115,6 +119,7 @@ fn helper_command(args: &[&str], limit_ms: Option<u64>, fault: Option<&str>) -> 
         None => command.env_remove(LIMIT_VARIABLE),
     };
     command.env(PIPE_OWNER_VARIABLE, "user");
+    command.env_remove(INPUT_DESKTOP_VARIABLE);
     match fault {
         Some(mode) => command.env(FAULT_VARIABLE, mode),
         None => command.env_remove(FAULT_VARIABLE),
@@ -706,6 +711,32 @@ fn wrong_version_mode_says_another_build() {
 
     drop(server);
     assert_eq!(exit_of(&mut helper), code(HelperExit::BoxGone), "the helper ends with its pipe");
+}
+
+#[test]
+fn the_input_desktop_seam_names_the_desktop_the_hello_judges() {
+    for (named, wanted_ok) in [("Default", true), ("Other", false)] {
+        let server = serve();
+        let arg = arg0(std::process::id(), server.name()).expect("the pipe's name makes an Arg0");
+        let mut command = helper_command(&[&arg], Some(ROOMY_LIMIT_MS), None);
+        command.env(INPUT_DESKTOP_VARIABLE, named);
+
+        let mut helper = gate_win32::spawn(&mut command).expect("the helper starts");
+
+        let waited = server.wait_for_client(guard(), &[helper.as_handle()]).expect("the connect is waited on");
+        assert_eq!(waited, ConnectWait::Connected, "the helper connects");
+        let hello = read_message(&server, guard(), HELPER_FRAME_LIMIT, &[]).expect("the hello is read");
+        let (desktop, ok) = match hello {
+            Message::Hello { desktop, ok, .. } => Some((desktop, ok)),
+            _ => None,
+        }
+        .expect("the helper's first message is a hello");
+        assert_eq!(desktop, named, "the hello names the seam's desktop, whatever desktop the helper is on");
+        assert_eq!(ok, wanted_ok, "the helper still judges the name it was given ({named:?})");
+
+        drop(server);
+        assert_eq!(exit_of(&mut helper), code(HelperExit::BoxGone), "the helper ends with its pipe");
+    }
 }
 
 #[test]

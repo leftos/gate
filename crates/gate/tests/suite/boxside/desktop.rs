@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use super::{
     BoxCall, adjusted_seconds, box_call, fake_godot, field, gate_box, godot_root, let_go, lines_starting, pair_payload, pair_snapshot, path_for_run,
-    path_godot, payload as request_line, refused_line, run_box, run_box_with_seams, snapshot, started_line, stopped_line_for,
+    path_godot, payload as request_line, refused_line, run_box, snapshot, started_line, stopped_line_for,
 };
 use crate::support::{
     Case, Closed, FAKE_TOOL, HeldDesktop, KeptDesktop, Outcome, box_payload, build_version, copy_tool, desktop_payload, desktop_seams, junction,
@@ -47,12 +47,29 @@ const BUSY_WAIT: &str = "gate: remote waiting for the builder's desktop: another
 /// The line the box says when it takes the builder's desktop from a run that ended holding it.
 const ABANDONED: &str = "gate: remote took the builder's desktop from a run that ended without releasing it";
 
+/// The stand-in helper's seam that names the input desktop in place of the one it reads.
+const INPUT_DESKTOP_VARIABLE: &str = "GATE_DESKTOP_TEST_INPUT_DESKTOP";
+
+/// The input desktop the helper must be on for the box to hand it the command.
+const DEFAULT_DESKTOP: &str = "Default";
+
+/// `gate box` with `args` after `box` and the request line `request`, not yet started, the box's environment naming
+/// [`DEFAULT_DESKTOP`] as the stand-in helper's input desktop ([`INPUT_DESKTOP_VARIABLE`]): so its `Hello` names
+/// `Default` in whatever session the suite runs, a builder's session 0 among them, while the helper still judges the name.
+fn desktop_box_call(case: &Case, args: &[&str], request: &str) -> BoxCall {
+    let mut call = box_call(case, args, request);
+    call.env(INPUT_DESKTOP_VARIABLE, DEFAULT_DESKTOP);
+    call
+}
+
 /// `gate box run` of `payload` with the desktop seams of `case`: the fault `mode`, the console session `session` and the
 /// cap `ms` on its desktop waits.
 fn run_desktop(case: &Case, payload: &Value, mode: &str, session: &str, ms: &str) -> Outcome {
     let seams = desktop_seams(case, mode, session, ms);
-    let seams: Vec<&str> = seams.iter().map(String::as_str).collect();
-    run_box_with_seams(case, payload, &seams)
+    let mut args = vec!["box"];
+    args.extend(seams.iter().map(String::as_str));
+    args.push("run");
+    desktop_box_call(case, &args, &request_line(payload)).finish()
 }
 
 /// `gate box run` of `payload` handed to the stand-in helper with the fault `mode`, at an active console.
@@ -68,7 +85,7 @@ fn desktop_call(case: &Case, payload: &Value, mode: &str, extra: &[&str]) -> Box
     args.extend(seams.iter().map(String::as_str));
     args.extend_from_slice(extra);
     args.push("run");
-    box_call(case, &args, &request_line(payload))
+    desktop_box_call(case, &args, &request_line(payload))
 }
 
 /// The desktop payload of `case`'s work folder `k` running `command`, its snapshot made.
@@ -220,6 +237,42 @@ fn a_desktop_run_passes_the_commands_status_and_output() {
     ran_its_command(&outcome, &payload);
 }
 
+/// Whether the input desktop, as the suite reads it in its own process, is `Default`: an unreadable one is not, as the
+/// helper reads it.
+fn on_default_desktop() -> bool {
+    gate_win32::input_desktop_name().is_ok_and(|name| name == DEFAULT_DESKTOP)
+}
+
+/// The one hand-off whose stand-in helper reads the input desktop itself, no name given in its place: on the `Default`
+/// input desktop, as the suite reads it in its own process, the run is handed off and runs its command; on any other,
+/// a builder's session 0 among them, the box refuses it as a helper not on the desktop. When the suite's readings
+/// before and after the run differ, as a lock screen or a UAC prompt between them makes them, the helper may have read
+/// either, so either outcome passes, each with its full checks.
+#[test]
+fn the_real_helper_checks_the_input_desktop() {
+    let case = Case::new("desktop_real_check");
+    let payload = ready_payload(&case, COMMAND);
+    let before = on_default_desktop();
+    let mut call = desktop_call(&case, &payload, "ok", &[]);
+    call.env_remove(INPUT_DESKTOP_VARIABLE);
+
+    let outcome = call.finish();
+
+    let after = on_default_desktop();
+    let on_default = if before == after { before } else { outcome.code == Some(0) };
+    if on_default {
+        assert_eq!(outcome.code, Some(0), "handed off on the Default desktop: {outcome:?}");
+        assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
+        ran_its_command(&outcome, &payload);
+    } else {
+        refused_with(
+            &outcome,
+            &payload,
+            &format!("{NO_DESKTOP}the desktop helper is not on the console's Default desktop"),
+        );
+    }
+}
+
 #[test]
 fn a_desktop_command_is_in_the_runs_job_at_normal_priority() {
     let case = Case::new("desktop_job");
@@ -335,11 +388,9 @@ fn a_desktop_run_runs_the_godot_install_of_the_chosen_version() {
 fn a_desktop_run_has_no_donor_and_ignores_the_console_and_token_seams() {
     let case = Case::new("desktop_no_donor");
     let payload = ready_payload(&case, COMMAND);
-    let mut seams = desktop_seams(&case, "ok", "active", HAND_OFF_MS);
-    seams.extend(["--test-box-console", "fail-before", "--test-box-token", "refused"].map(str::to_owned));
-    let seams: Vec<&str> = seams.iter().map(String::as_str).collect();
+    let extra = ["--test-box-console", "fail-before", "--test-box-token", "refused"];
 
-    let outcome = run_box_with_seams(&case, &payload, &seams);
+    let outcome = desktop_call(&case, &payload, "ok", &extra).finish();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
@@ -686,7 +737,7 @@ fn a_stop_during_the_desktop_wait_on_a_pair_says_back_commits_failed() {
     args.extend(seams.iter().map(String::as_str));
     args.push("run");
 
-    let running = box_call(&case, &args, &request_line(&payload)).start();
+    let running = desktop_box_call(&case, &args, &request_line(&payload)).start();
     running.wait_for_stderr(BUSY_WAIT);
     let stopped = gate_box(&case, "stop", &request_line(&payload), None);
     let outcome = running.finish();
@@ -971,7 +1022,7 @@ fn a_killed_box_ends_its_desktop_command_and_the_next_run_takes_the_abandoned_lo
 #[test]
 fn the_ceiling_kills_a_desktop_command() {
     let case = Case::new("desktop_ceiling_kill");
-    let mut payload = desktop_payload(&case, "k", &[FAKE_TOOL, "pid", "sleep", "10000"], 30);
+    let mut payload = desktop_payload(&case, "k", &[FAKE_TOOL, "sleep", "10000"], 30);
     snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
     payload["Timeout"] = json!(1);
     payload["Host"] = json!("builder");

@@ -111,8 +111,9 @@ pub(crate) fn layout_line(repo: &str, why: &str) -> String {
 /// `gate-remote-started: <nonce>`. A call that said it is past the banner, so the client never makes it again.
 ///
 /// The nonce only tells runs apart: it is no secret, as it is on the box's and ssh's command lines. That a command
-/// cannot forge a refusal rests on the box saying this line before it creates the command's process, and on the
-/// client ignoring every refusal tag once it has seen this line, whatever order the two came in.
+/// cannot forge a refusal rests on the box saying this line before the command can run any code (before it creates
+/// the command's process, or, in a desktop run, before it resumes the process the helper created suspended), and on
+/// the client ignoring every refusal tag once it has seen this line, whatever order the two came in.
 pub(crate) fn started_line(nonce: &str) -> String {
     format!("gate-remote-started: {nonce}")
 }

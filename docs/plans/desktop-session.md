@@ -315,7 +315,7 @@ A received stdout or stderr value is used only when it passes `adopt::is_handle_
 
 ## 5. Tests: what the PC can and cannot cover
 
-**Seam:** `--test-box-desktop spawn` replaces only the Task Scheduler start and the WTS read. The box starts the helper itself, inside a fresh anonymous job without breakaway (which mimics the Task Scheduler's job) and at below-normal priority. Everything else is the real code. Companions:
+**Seam:** `--test-box-desktop ok` replaces only the Task Scheduler start and the WTS read. The box starts the helper itself, inside a fresh anonymous job without breakaway (which mimics the Task Scheduler's job) and at below-normal priority. Everything else is the real code. Companions:
 - `--test-box-desktop-session active|none|locked|other-user|disconnected`
 - helper fault modes: `exit-before-hello`, `hang`, `wrong-version`, `lie-handle`, `exit-after-create`
 - desktop-wait milliseconds and the mutex name

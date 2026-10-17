@@ -292,9 +292,21 @@ fn connect(name: &str, limit: Duration, owner: PipeOwner) -> Result<PipeClient, 
     }
 }
 
+/// The seam that, set, names the input desktop in place of the one the helper reads, in a build with the `test-seams`
+/// feature: the helper still judges the name it is given against `Default`.
+#[cfg(feature = "test-seams")]
+const TEST_INPUT_DESKTOP_VARIABLE: &str = "GATE_DESKTOP_TEST_INPUT_DESKTOP";
+
 /// The `Hello` this helper sends: its build and the input desktop's name, empty when it cannot be read. A
-/// `wrong-version` fault names [`FAULT_VERSION`] in place of its build.
+/// `wrong-version` fault names [`FAULT_VERSION`] in place of its build, and `GATE_DESKTOP_TEST_INPUT_DESKTOP`, when set,
+/// names the desktop.
 fn hello() -> Message {
+    #[cfg(feature = "test-seams")]
+    let desktop = match std::env::var_os(TEST_INPUT_DESKTOP_VARIABLE) {
+        Some(named) => named.to_string_lossy().into_owned(),
+        None => gate_win32::input_desktop_name().unwrap_or_default(),
+    };
+    #[cfg(not(feature = "test-seams"))]
     let desktop = gate_win32::input_desktop_name().unwrap_or_default();
     #[cfg(feature = "test-seams")]
     let version = match Fault::asked() {
