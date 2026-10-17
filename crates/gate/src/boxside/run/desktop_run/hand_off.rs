@@ -26,7 +26,7 @@ use gate_win32::{
     TaskArgument, TaskError, TaskStart,
 };
 use jiff::Timestamp;
-use proc_table::Win32ProcessTable;
+use proc_table::{ProcessInfo, Win32ProcessTable};
 use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
 
 use super::{DesktopEnd, desktop_refused};
@@ -609,20 +609,25 @@ fn unlisted_line(error: &io::Error) -> String {
 /// handle opened to end it, its parent still the helper and its creation time the snapshot's, and one that cannot be
 /// opened or ended said. A snapshot that cannot be taken is said, and nothing is ended.
 fn sweep(here: &Here<'_, '_>, helper: u32, created: Timestamp, console: &mut Console) {
-    let snapshot = match Win32ProcessTable.try_snapshot_without_command_lines() {
+    sweep_on(&Machine, helper, created, here.session, &mut |line| here.beat.say(console, line));
+}
+
+/// [`sweep`] over the processes of `machine`, of the helper `helper` created at `created` in the session `session`,
+/// each line it says given to `say`.
+fn sweep_on(machine: &impl SweptMachine, helper: u32, created: Timestamp, session: u32, say: &mut impl FnMut(&str)) {
+    let snapshot = match machine.snapshot() {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            here.beat.say(console, &unlisted_line(&error));
+            say(&unlisted_line(&error));
             return;
         }
     };
-    let session_of = |pid| QueryOnlyProcess::open(pid).ok().and_then(|process| process.session().ok());
-    for (pid, at) in sweep_targets(&snapshot, helper, created, here.session, session_of) {
-        let process = match StoppableProcess::open(pid) {
+    for (pid, at) in sweep_targets(&snapshot, helper, created, session, |pid| machine.session_of(pid)) {
+        let process = match machine.open(pid) {
             Ok(Some(process)) => process,
             Ok(None) => continue,
             Err(error) => {
-                here.beat.say(console, &could_not_end_line(pid, &error));
+                say(&could_not_end_line(pid, &error));
                 continue;
             }
         };
@@ -631,8 +636,68 @@ fn sweep(here: &Here<'_, '_>, helper: u32, created: Timestamp, console: &mut Con
             continue;
         }
         if let Err(error) = process.terminate(ENDED_UNSTARTED) {
-            here.beat.say(console, &could_not_end_line(pid, &error));
+            say(&could_not_end_line(pid, &error));
         }
+    }
+}
+
+/// The machine's processes as a sweep reads and ends them.
+trait SweptMachine {
+    /// A process opened to be re-checked and ended.
+    type Process: SweptProcess;
+
+    /// Every process on the machine, without its command line.
+    fn snapshot(&self) -> io::Result<Vec<ProcessInfo>>;
+
+    /// The session the process `pid` runs in; `None` when it cannot be read.
+    fn session_of(&self, pid: u32) -> Option<u32>;
+
+    /// The process `pid`, opened to be re-checked and ended; `None` when no process has that pid any more.
+    fn open(&self, pid: u32) -> io::Result<Option<Self::Process>>;
+}
+
+/// A process a sweep opened: its parent and creation time read through the handle it is ended by.
+trait SweptProcess {
+    /// The pid of the process that started it.
+    fn parent_pid(&self) -> io::Result<u32>;
+
+    /// When it was created.
+    fn created(&self) -> io::Result<Timestamp>;
+
+    /// Ends it with the exit code `exit_code`.
+    fn terminate(&self, exit_code: u32) -> io::Result<()>;
+}
+
+/// This machine's own processes.
+struct Machine;
+
+impl SweptMachine for Machine {
+    type Process = StoppableProcess;
+
+    fn snapshot(&self) -> io::Result<Vec<ProcessInfo>> {
+        Win32ProcessTable.try_snapshot_without_command_lines()
+    }
+
+    fn session_of(&self, pid: u32) -> Option<u32> {
+        QueryOnlyProcess::open(pid).ok().and_then(|process| process.session().ok())
+    }
+
+    fn open(&self, pid: u32) -> io::Result<Option<StoppableProcess>> {
+        StoppableProcess::open(pid)
+    }
+}
+
+impl SweptProcess for StoppableProcess {
+    fn parent_pid(&self) -> io::Result<u32> {
+        StoppableProcess::parent_pid(self)
+    }
+
+    fn created(&self) -> io::Result<Timestamp> {
+        StoppableProcess::created(self)
+    }
+
+    fn terminate(&self, exit_code: u32) -> io::Result<()> {
+        StoppableProcess::terminate(self, exit_code)
     }
 }
 
@@ -823,7 +888,8 @@ fn run_helper_task(
 
 /// The stand-in helper started in the box's own session, as the task would start the helper: below normal priority,
 /// with `argument` as its one argument, its environment the box's with the helper's seams set: the fault `fault` (none
-/// when empty), the cap `cap_ms` on its limits, and a pipe its user owns. It runs in a kill-on-close job that allows no
+/// when empty), a cap on its limits of twice the box's cap `cap_ms`, so a wait both keep is always ended by the box's own
+/// limit first, and a pipe its user owns. It runs in a kill-on-close job that allows no
 /// breakaway, unless the box's environment asks it to record its children ([`RECORD_VARIABLE`]), when it runs in none
 /// of the box's. Its pid, and the job, which the caller keeps for as long as the command runs.
 #[cfg(feature = "test-seams")]
@@ -837,7 +903,7 @@ fn stand_in(fault: &str, argument: &TaskArgument, cap_ms: Option<u64>) -> io::Re
     command_line.push(application.as_os_str());
     command_line.push("\" ");
     command_line.push(argument.as_str());
-    let cap = cap_ms.map(|ms| ms.to_string());
+    let cap = cap_ms.map(|ms| ms.saturating_mul(2).to_string());
     let seams = [
         ("GATE_DESKTOP_TEST_FAULT", Some(fault)),
         ("GATE_DESKTOP_TEST_LIMIT_MS", cap.as_deref()),
@@ -892,13 +958,16 @@ mod tests {
     use std::fs;
     use std::io;
     use std::path::PathBuf;
+    use std::rc::Rc;
     use std::time::{Duration, Instant};
 
     use gate_win32::EndWait;
+    use jiff::Timestamp;
+    use proc_table::ProcessInfo;
 
     use crate::boxside::desktop::lines::DesktopRefusal;
 
-    use super::{EndingHelper, HelperEnd, end_within, helper_not_ended, identity_of, unlisted_line};
+    use super::{EndingHelper, HelperEnd, SweptMachine, SweptProcess, end_within, helper_not_ended, identity_of, sweep_on, unlisted_line};
 
     /// A case's own temp folder, removed with everything in it when the case ends, also when it fails.
     struct Removed(PathBuf);
@@ -1118,6 +1187,216 @@ mod tests {
         assert_eq!(
             unlisted_line(&io::Error::other("no snapshot")),
             "gate: remote could not list processes to end after the desktop command: no snapshot"
+        );
+    }
+
+    /// The helper's pid in every sweep case.
+    const HELPER: u32 = 4000;
+    /// The session the builder's desktop runs in, in every sweep case.
+    const SESSION: u32 = 3;
+    /// The pid of the one process every sweep case's snapshot holds under the helper.
+    const TARGET: u32 = 4100;
+
+    /// The time `second` seconds after the epoch.
+    fn time(second: i64) -> Timestamp {
+        Timestamp::from_second(second).expect("a time in range")
+    }
+
+    /// When the helper of every sweep case was created.
+    fn helper_created() -> Timestamp {
+        time(100)
+    }
+
+    /// When the target of every sweep case was created, as the snapshot holds it.
+    fn target_created() -> Timestamp {
+        time(200)
+    }
+
+    /// What opening the target of a sweep case gives.
+    enum Opened {
+        /// No process has its pid any more.
+        Gone,
+        /// It cannot be opened, for this error.
+        Refused(&'static str),
+        /// A process with this parent and creation time, whose end fails with this error when there is one.
+        Process {
+            parent: u32,
+            created: Timestamp,
+            end_error: Option<&'static str>,
+        },
+    }
+
+    /// A machine of a sweep case: a snapshot holding the target, or the error taking it fails with, and the target as
+    /// opening it gives it; every pid it ended is kept.
+    struct Scripted {
+        snapshot: Result<(), &'static str>,
+        opened: Opened,
+        ended: Rc<RefCell<Vec<u32>>>,
+    }
+
+    /// The target as a sweep case opened it.
+    struct ScriptedProcess {
+        pid: u32,
+        parent: u32,
+        created: Timestamp,
+        end_error: Option<&'static str>,
+        ended: Rc<RefCell<Vec<u32>>>,
+    }
+
+    impl SweptMachine for Scripted {
+        type Process = ScriptedProcess;
+
+        fn snapshot(&self) -> io::Result<Vec<ProcessInfo>> {
+            self.snapshot.map_err(io::Error::other)?;
+            Ok(vec![ProcessInfo {
+                pid: TARGET,
+                parent_pid: HELPER,
+                name: "fake-tool.exe".to_owned(),
+                command_line: None,
+                created: Some(target_created()),
+            }])
+        }
+
+        fn session_of(&self, _pid: u32) -> Option<u32> {
+            Some(SESSION)
+        }
+
+        fn open(&self, pid: u32) -> io::Result<Option<ScriptedProcess>> {
+            match self.opened {
+                Opened::Gone => Ok(None),
+                Opened::Refused(error) => Err(io::Error::other(error)),
+                Opened::Process { parent, created, end_error } => Ok(Some(ScriptedProcess {
+                    pid,
+                    parent,
+                    created,
+                    end_error,
+                    ended: Rc::clone(&self.ended),
+                })),
+            }
+        }
+    }
+
+    impl SweptProcess for ScriptedProcess {
+        fn parent_pid(&self) -> io::Result<u32> {
+            Ok(self.parent)
+        }
+
+        fn created(&self) -> io::Result<Timestamp> {
+            Ok(self.created)
+        }
+
+        fn terminate(&self, _exit_code: u32) -> io::Result<()> {
+            if let Some(error) = self.end_error {
+                return Err(io::Error::other(error));
+            }
+            self.ended.borrow_mut().push(self.pid);
+            Ok(())
+        }
+    }
+
+    /// A sweep case's machine: its snapshot taken as `snapshot` says, and its target opened as `opened`.
+    fn scripted(snapshot: Result<(), &'static str>, opened: Opened) -> Scripted {
+        Scripted {
+            snapshot,
+            opened,
+            ended: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    /// The target opened still the helper's: its parent the helper and its creation time the snapshot's.
+    fn still_the_helpers(end_error: Option<&'static str>) -> Opened {
+        Opened::Process {
+            parent: HELPER,
+            created: target_created(),
+            end_error,
+        }
+    }
+
+    /// The lines a sweep of `machine` says, and the pids it ended.
+    fn swept(machine: &Scripted) -> (Vec<String>, Vec<u32>) {
+        let mut said = Vec::new();
+        sweep_on(machine, HELPER, helper_created(), SESSION, &mut |line| said.push(line.to_owned()));
+        (said, machine.ended.borrow().clone())
+    }
+
+    #[test]
+    fn a_sweep_ends_a_target_still_the_helpers() {
+        let machine = scripted(Ok(()), still_the_helpers(None));
+
+        assert_eq!(swept(&machine), (Vec::new(), vec![TARGET]));
+    }
+
+    #[test]
+    fn a_sweep_leaves_a_target_whose_parent_changed() {
+        let machine = scripted(
+            Ok(()),
+            Opened::Process {
+                parent: 4200,
+                created: target_created(),
+                end_error: None,
+            },
+        );
+
+        assert_eq!(swept(&machine), (Vec::new(), Vec::new()), "another process took the pid");
+    }
+
+    #[test]
+    fn a_sweep_leaves_a_target_whose_creation_time_changed() {
+        let machine = scripted(
+            Ok(()),
+            Opened::Process {
+                parent: HELPER,
+                created: time(300),
+                end_error: None,
+            },
+        );
+
+        assert_eq!(swept(&machine), (Vec::new(), Vec::new()), "another process took the pid");
+    }
+
+    #[test]
+    fn a_sweep_skips_a_target_that_is_gone_without_a_line() {
+        let machine = scripted(Ok(()), Opened::Gone);
+
+        assert_eq!(swept(&machine), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn a_sweep_says_a_target_it_cannot_open() {
+        let machine = scripted(Ok(()), Opened::Refused("access denied"));
+
+        assert_eq!(
+            swept(&machine),
+            (
+                vec!["gate: remote could not end the desktop command (process 4100): access denied".to_owned()],
+                Vec::new()
+            )
+        );
+    }
+
+    #[test]
+    fn a_sweep_says_a_target_it_cannot_end() {
+        let machine = scripted(Ok(()), still_the_helpers(Some("access denied")));
+
+        assert_eq!(
+            swept(&machine),
+            (
+                vec!["gate: remote could not end the desktop command (process 4100): access denied".to_owned()],
+                Vec::new()
+            )
+        );
+    }
+
+    #[test]
+    fn a_sweep_whose_snapshot_fails_says_so_and_ends_nothing() {
+        let machine = scripted(Err("no snapshot"), still_the_helpers(None));
+
+        assert_eq!(
+            swept(&machine),
+            (
+                vec!["gate: remote could not list processes to end after the desktop command: no snapshot".to_owned()],
+                Vec::new()
+            )
         );
     }
 }

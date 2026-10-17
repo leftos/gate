@@ -14,7 +14,8 @@ use super::{
     payload as request_line, refused_line, run_box, run_box_with_seams, snapshot, started_line, stopped_line_for,
 };
 use crate::support::{
-    Case, FAKE_TOOL, HeldDesktop, KeptDesktop, Outcome, box_payload, copy_tool, desktop_payload, desktop_seams, junction, shown, wait_until,
+    Case, FAKE_TOOL, HeldDesktop, KeptDesktop, Outcome, box_payload, build_version, copy_tool, desktop_payload, desktop_seams, junction, shown,
+    wait_until,
 };
 
 /// The box's prefix of every line refusing a run the builder's desktop cannot take.
@@ -32,6 +33,11 @@ const DESKTOP_MS: &str = "50";
 /// The cap on every desktop wait of a case whose run hands its command to the stand-in helper, in milliseconds: large
 /// enough for a real helper's start and connect on a busy machine, and never reached by a passing run.
 const HAND_OFF_MS: &str = "10000";
+
+/// The cap on every desktop wait of the case whose stand-in helper hangs, in milliseconds: low enough that the box's
+/// message limit, the cap, is under the stand-in's own, twice the cap but never above the helper's built limit of 5 s,
+/// so the box's limit is the one that ends the wait; high enough for the stand-in's start and connect on a busy machine.
+const HANG_MS: &str = "3000";
 
 /// `NORMAL_PRIORITY_CLASS`, which the helper gives the command although it runs below normal itself.
 const NORMAL_PRIORITY: &str = "priority 0x20";
@@ -365,7 +371,48 @@ fn a_refused_child_report_leaves_nothing_running() {
 
     let outcome = call.finish();
 
-    let lines = fs::read_to_string(&record).expect("the box recorded the stand-in");
+    let left = left_by(&record, &mark_word);
+    assert!(!left.recorded.is_empty(), "the stand-in created a child: {outcome:?}");
+    assert!(
+        left.children.is_empty(),
+        "no child of the stand-in outlives the run: {:?} {outcome:?}",
+        left.children
+    );
+    assert!(
+        !left.stand_in_running,
+        "the stand-in itself does not outlive the run: {} created {} {outcome:?}",
+        left.stand_in, left.stand_in_created
+    );
+    refused_with(
+        &outcome,
+        &payload,
+        &format!("{NO_DESKTOP}the desktop helper failed: the command it started is not the process it reported: {INVALID_HANDLE}"),
+    );
+    assert!(!mark.exists(), "the command never ran: {outcome:?}");
+}
+
+/// The system's error for a handle value the helper's table does not hold, as the box says it.
+const INVALID_HANDLE: &str = "The handle is invalid. (os error 6)";
+
+/// What a run whose stand-in helper recorded to a record left running.
+struct Left {
+    /// The pids of the children the stand-in recorded.
+    recorded: Vec<u32>,
+    /// The recorded children still running the case's command.
+    children: Vec<u32>,
+    /// The stand-in's own pid, as the box recorded it.
+    stand_in: u32,
+    /// The stand-in's creation time, as the box recorded it.
+    stand_in_created: jiff::Timestamp,
+    /// Whether the stand-in itself still runs: a process at its pid with its creation time.
+    stand_in_running: bool,
+}
+
+/// Reads what the run recorded at `record`, the stand-in's pid and creation time and each child's pid, and finds which
+/// of them still run: a child by its pid and a command line holding `mark_word`, the stand-in by its pid and creation
+/// time. Every one found is ended before this returns, so a case that fails leaves nothing behind.
+fn left_by(record: &Path, mark_word: &str) -> Left {
+    let lines = fs::read_to_string(record).expect("the box recorded the stand-in");
     let (stand_in, stand_in_created) = lines
         .lines()
         .find_map(|line| line.strip_prefix("stand-in "))
@@ -379,17 +426,17 @@ fn a_refused_child_report_leaves_nothing_running() {
         .map(|line| line.parse().expect("a recorded pid"))
         .collect();
     let snapshot = Win32ProcessTable.snapshot();
-    let left: Vec<u32> = snapshot
+    let children: Vec<u32> = snapshot
         .iter()
         .filter(|process| recorded.contains(&process.pid))
-        .filter(|process| process.command_line.as_deref().is_some_and(|line| line.contains(&mark_word)))
+        .filter(|process| process.command_line.as_deref().is_some_and(|line| line.contains(mark_word)))
         .map(|process| process.pid)
         .collect();
     // The pid and the creation time together, so another case's stand-in at a reused pid is never taken for this one.
     let stand_in_left = snapshot
         .iter()
         .any(|process| process.pid == stand_in && process.created == Some(stand_in_created));
-    for pid in &left {
+    for pid in &children {
         if let Ok(Some(process)) = StoppableProcess::open(*pid) {
             let _ = process.terminate(1);
         }
@@ -400,22 +447,136 @@ fn a_refused_child_report_leaves_nothing_running() {
     {
         let _ = process.terminate(1);
     }
-    assert!(!recorded.is_empty(), "the stand-in created a child: {outcome:?}");
-    assert!(left.is_empty(), "no child of the stand-in outlives the run: {left:?} {outcome:?}");
+    Left {
+        recorded,
+        children,
+        stand_in,
+        stand_in_created,
+        stand_in_running: stand_in_left,
+    }
+}
+
+#[test]
+fn a_helper_that_exits_before_hello_refuses_desktop_with_its_exit_why() {
+    let case = Case::new("desktop_exit_before_hello");
+    let payload = ready_payload(&case, COMMAND);
+
+    let outcome = handed_off(&case, &payload, "exit-before-hello");
+
+    refused_with(
+        &outcome,
+        &payload,
+        &format!("{NO_DESKTOP}the desktop helper failed: the box closed the control pipe"),
+    );
+}
+
+#[test]
+fn a_helper_of_another_build_refuses_desktop_naming_both_versions() {
+    let case = Case::new("desktop_wrong_version");
+    let payload = ready_payload(&case, COMMAND);
+
+    let outcome = handed_off(&case, &payload, "wrong-version");
+
+    let ours = build_version(&case);
+    refused_with(
+        &outcome,
+        &payload,
+        &format!("{NO_DESKTOP}the desktop helper runs gate 0.0.0+fault, the box {ours}"),
+    );
+}
+
+#[test]
+fn a_helper_that_dies_after_creating_the_child_leaves_no_suspended_process() {
+    let case = Case::new("desktop_exit_after_create");
+    let mark = case.folder().join("marked");
+    let mark_word = shown(&mark);
+    let record = case.folder().join("children");
+    let payload = ready_payload(&case, &[FAKE_TOOL, "mark", &mark_word, "out", "ran"]);
+    // The stand-in records its child and runs in no job of the box's, so only the box's sweep ends the child it left.
+    let mut call = desktop_call(&case, &payload, "exit-after-create", &[]);
+    call.env("GATE_DESKTOP_TEST_RECORD", &record);
+
+    let outcome = call.finish();
+
+    let left = left_by(&record, &mark_word);
+    assert!(!left.recorded.is_empty(), "the stand-in created a child: {outcome:?}");
     assert!(
-        !stand_in_left,
-        "the stand-in itself does not outlive the run: {stand_in} created {stand_in_created} {outcome:?}"
+        left.children.is_empty(),
+        "no suspended child of the stand-in outlives the run: {:?} {outcome:?}",
+        left.children
+    );
+    assert!(
+        !left.stand_in_running,
+        "the stand-in itself does not outlive the run: {} created {} {outcome:?}",
+        left.stand_in, left.stand_in_created
     );
     refused_with(
         &outcome,
         &payload,
-        &format!("{NO_DESKTOP}the desktop helper failed: the command it started is not the process it reported: {INVALID_HANDLE}"),
+        &format!("{NO_DESKTOP}the desktop helper failed: a system call failed in the helper"),
     );
     assert!(!mark.exists(), "the command never ran: {outcome:?}");
 }
 
-/// The system's error for a handle value the helper's table does not hold, as the box says it.
-const INVALID_HANDLE: &str = "The handle is invalid. (os error 6)";
+/// Checks a run whose helper task the seam answers as `mode` is refused with `line`, the stand-in never started.
+fn task_refuses(name: &str, mode: &str, line: &str) {
+    let case = Case::new(name);
+    let payload = ready_payload(&case, COMMAND);
+
+    let outcome = handed_off(&case, &payload, mode);
+
+    refused_with(&outcome, &payload, &format!("{NO_DESKTOP}{line}"));
+}
+
+#[test]
+fn a_helper_task_that_is_not_registered_refuses_desktop() {
+    task_refuses(
+        "desktop_task_not_registered",
+        "task-not-registered",
+        "the desktop helper task is not registered (gate push registers it)",
+    );
+}
+
+#[test]
+fn a_helper_task_set_up_wrong_refuses_desktop_naming_what_differs() {
+    task_refuses(
+        "desktop_task_set_up_wrong",
+        "task-set-up-wrong",
+        "the desktop helper task is set up wrong: the desktop seam's definition",
+    );
+}
+
+#[test]
+fn a_helper_task_whose_start_failed_refuses_desktop() {
+    task_refuses(
+        "desktop_task_failed",
+        "task-failed",
+        "the desktop helper did not start: the desktop seam's start failed",
+    );
+}
+
+#[test]
+fn a_helper_task_that_gave_no_pid_refuses_desktop() {
+    task_refuses(
+        "desktop_task_no_pid",
+        "task-no-pid",
+        "the desktop helper did not start: the Task Scheduler gave no process id",
+    );
+}
+
+#[test]
+fn a_helper_that_hangs_refuses_desktop_after_the_message_limit() {
+    let case = Case::new("desktop_hang");
+    let payload = ready_payload(&case, COMMAND);
+
+    let outcome = run_desktop(&case, &payload, "hang", "active", HANG_MS);
+
+    refused_with(
+        &outcome,
+        &payload,
+        &format!("{NO_DESKTOP}the desktop helper did not start: it did not answer in time"),
+    );
+}
 
 #[test]
 fn a_desktop_run_parks_after_the_command_is_adopted_and_before_it_runs() {
