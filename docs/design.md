@@ -248,11 +248,11 @@ On stdout, each line prefixed `check: here: `, `here` being this PC, in this ord
 1. The header `check: here: <repo> at <root>`, `<repo>` being the name routing gives the repo and `<root>` the worktree root as git spells it. With no `.gate/toolchain.toml` the line `check: here: <repo> declares no toolchain` follows; the SDK pin and the siblings are still checked.
 2. One line per item, every item printed, the ones that are fine included: the manifest's tools in manifest order, then the .NET SDK, then the workloads, then the `remote.json` item when it applies, then the siblings, then the warm-up's items ([The warm-up items](#the-warm-up-items)).
 3. One `install: here: <subject>: <command>` hint line per missing or too-old item, in item order.
-4. The summary: `check: here: nothing missing` or `check: here: <n> missing, <n> too old`, with `, <n> skipped` added when any item was skipped; with nothing missing and some skipped it is `check: here: nothing missing (<n> skipped)`. When a file could not be read it is `check: here: could not read <files>; <n> missing, <n> too old`, `, <n> skipped` added as above, the files comma separated in the order `.gate/toolchain.toml`, `.gate/siblings.toml`, `global.json`.
+4. The summary: `check: here: nothing missing` or `check: here: <n> missing, <n> too old`, with `, <n> skipped` added when any item was skipped; with nothing missing and some skipped it is `check: here: nothing missing (<n> skipped)`. When a file could not be read it is `check: here: could not read <files>; <n> missing, <n> too old`, `, <n> skipped` added as above, the files comma separated in the order `.gate/toolchain.toml`, `.gate/siblings.toml`, `.gate/warmup.toml`, `global.json`.
 
 The problems of the files go to stderr, one per line, before the item lines: `check: .gate/<file>: <problem>`, `<file>` being `toolchain.toml`, `siblings.toml` or `warmup.toml` and `<problem>` the text the file's reader gives ([Toolchain manifest](#routing), [Sibling worktrees](#routing), [remote.json](#remotejson)), or why the file could not be read at all (`.gate is not a folder`, for the manifest, when `.gate` is a file). A file with problems is still used for what reads, and the rest is still checked.
 
-Every problem of `.gate/warmup.toml` is said, whether `remote.json` consents to warm-ups or not.
+Every problem of `.gate/warmup.toml` is said, whether `remote.json` consents to warm-ups or not. A warm-up file that cannot be read whole (a link or junction, over 64 KiB, not UTF-8 or not TOML) fails the check whatever the consent, and the summary names it. One that reads with problems of its keys or commands is counted missing only with consent, and without consent only informs.
 
 The `global.json` ones are `check: global.json: <reason>`, `<reason>` being `is larger than 64 KiB`, `cannot read it: <error>`, `is a link, a junction or not a file`, `is not UTF-8`, `does not parse as JSON`, `its sdk is not an object`, `its sdk.version is not a version dotnet reads`, `its sdk.rollForward is not a policy gate knows` or `its sdk.allowPrerelease is not true or false`.
 
@@ -314,7 +314,7 @@ The install hints, for the items that have one:
 
 A tool not in the table (`godot`) gets no hint line, nor does a sibling that is not allowed or refused, nor the `remote.json` item.
 
-The exit is 0 when nothing is missing or too old and every file read, whatever was skipped and whatever warm-up line only informs; 1 when anything is missing or too old, or the check could not run (not in a git repository, an unreadable `.gate/toolchain.toml`, `.gate/siblings.toml` or `global.json`, `.gate` not a folder); 2 for a usage error. Test-seams builds accept the hidden `--test-probe-limit-ms <n>` (the 10 s probe bound, in milliseconds above 0), which `--builder` refuses.
+The exit is 0 when nothing is missing or too old and every file read, whatever was skipped and whatever warm-up line only informs; 1 when anything is missing or too old, or the check could not run (not in a git repository, an unreadable `.gate/toolchain.toml`, `.gate/siblings.toml`, `.gate/warmup.toml` or `global.json`, `.gate` not a folder); 2 for a usage error. Test-seams builds accept the hidden `--test-probe-limit-ms <n>` (the 10 s probe bound, in milliseconds above 0), which `--builder` refuses.
 
 #### With `--builder`
 
@@ -329,7 +329,7 @@ On stdout, each line prefixed `check: <host>: `, in this order:
 1. The header `check: <host>: <repo> (work folder <key>)`.
 2. `check: <host>: created <folder>` for each folder the preflight made, at most 20, then `check: <host>: and <n> more created folders`.
 3. The items, worded as on this PC with `<host>` for `here`: the SDK reads `.NET SDK <version> (rollForward <policy>) missing (<host> has <list>)`, the list cut at 20 entries and then `, and <n> more`; `.NET SDK skipped: <host> sent no SDK list`, with `: <last stderr line>` when there is one; a tool that did not answer is `check: <host>: <tool> skipped: the builder gave no answer`; the workloads are `not checked yet`.
-4. The warm-up's items, as on this PC ([The warm-up items](#the-warm-up-items)) and this PC's own: the record is said only when it names `<host>`, and with consent and a warm-up file that parsed, `check: <host>: warm-up: the work folder is warm` (ok) when the preflight's `gate: remote warm` line holds the hash of the worktree's file, else `check: <host>: warm-up: the work folder is not warm` (only informs).
+4. The warm-up's items, as on this PC ([The warm-up items](#the-warm-up-items)) and this PC's own: the lock is probed before the record is read, as the route does, and the record is said only when it names `<host>` or cannot be read (`check: <host>: warm-up: the warm-up record <path> cannot be read: <error>`, counted missing, exit 1), and with consent and a warm-up file that parsed, `check: <host>: warm-up: the work folder is warm` (ok) when the preflight's `gate: remote warm` line holds the hash of the worktree's file, else `check: <host>: warm-up: the work folder is not warm` (only informs).
 5. The install hints `install: <host>: <tool>: <command>`: `cargo install cargo-nextest --locked`, `npm install -g pnpm@<min>` (`npm install -g pnpm` with no minimum), `rustup toolchain install <min> && rustup default <min>`, `dotnet-install.ps1 -Version <v>`, and `run the build-box toolchain script on <host>` for node, pwsh, ffmpeg and a rust with no minimum.
 6. The summary.
 
@@ -1644,7 +1644,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     `godot` is sent whenever the repo pins a Godot version, on every routed run whatever its command: the manifest names `godot`, or a `*.csproj` of the snapshot names `Godot.NET.Sdk/<version>`. Its value is the distinct pins joined by `,` (the box ignores the text and reads only the name), or empty for a manifest entry of `""`. A manifest `godot` entry wins over every project pin; a manifest that is unreadable, or whose `godot` value is no version, does not stop the project pins from applying.
 
-    A repo pinning nothing sends no `godot` need and is judged as before.
+    A repo pinning nothing sends no `godot` need and is judged as before, except for a command whose first word is a Godot console word (below), which sends a `godot` need with no versions so the builder lists its installs (`gate: remote tool godot <versions>` shows in its output). Every other command of an unpinned repo sends what it always sent.
 
     The builder answers each tool with a `gate: remote tool <name> <version|present|missing|skipped: <why>>` line. A tool it found missing, or older than the minimum, is a need, and the route is refused as under Parity: one `gate: remote toolchain mismatch: <repo> needs <name> <min> or later; <host> has <version|none>` line per need (`<name>` alone when the manifest sets no minimum), then the parity fallback line, and the run goes local.
 
@@ -1654,13 +1654,23 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     An answer that is no version list is a mismatch whenever a pin needs checking, so the command runs here rather than on a builder that may lack the version. A slow install that drops off the builder's list reads as missing, a needless fallback and a known limitation.
 
-    After the preflight the client chooses the Godot version the run uses, from the repo's pins among the versions the builder reported: no pin, or a manifest entry of `""`, chooses none; one pin chooses the highest reported version that meets it (`4.7.2` itself, `4.7` the highest `4.7.x`); a pin no reported version meets chooses none.
+    After the preflight the client chooses the Godot version the run uses, from the repo's pins among the versions the builder reported: no pin, or a manifest entry of `""`, chooses none (see below for a Godot command); one pin chooses the highest reported version that meets it (`4.7.2` itself, `4.7` the highest `4.7.x`); a pin no reported version meets chooses none.
 
     A chosen version, spelled `x.y.z`, is sent as the optional `GodotVersion` of the run payload and of a warm-up's, and left out when none is chosen. The box resolves it ([The box side](#the-box-side), the command's environment).
 
-    A repo whose pins differ chooses none. A command whose first word is a Godot console word (a bare name with no directory part whose name, after one trailing `.exe` is removed, matches `godot*console*` ignoring ASCII case with no `.` after the last `console`; `.cmd`, `.bat`, `.ps1` and any other extension are not) falls back `parity`.
+    A repo whose pins differ, a repo that pins no Godot version and a manifest entry of `""` choose none. What a command does then depends on its first word. A Godot console word is a bare name with no directory part whose name, after one trailing `.exe` is removed, matches `godot*console*` ignoring ASCII case with no `.` after the last `console`; `.cmd`, `.bat`, `.ps1` and any other extension are not.
 
-    It says `gate: the repo pins several Godot versions (<pins, comma separated>); a routed run needs one` after the mismatch lines and before the parity line. Every other command of that repo routes as before, with no `GodotVersion`.
+    A Godot-console command of a repo pinning several versions falls back `parity`, saying `gate: the repo pins several Godot versions (<pins, comma separated>); a routed run needs one` after the mismatch lines and before the parity line, on the console and in the log. A pin no reported version meets is the parity mismatch, with its own lines and no new one.
+
+    A Godot-console command of a repo that pins no version, or whose manifest has `godot = ""`, runs on the newest install the builder listed: that version is chosen and sent as `GodotVersion`. A repo pinning no version says, on stderr and in the log, `gate: warning: the repo pins no Godot version, so this run uses <x.y.z>, the newest on <host>; pin the version it needs in .gate/toolchain.toml ([tools] godot = "x.y.z") or as the .csproj's Godot.NET.Sdk version`, once the run is known not to be refused and before it starts; `godot = ""` says nothing. A run refused for another need says no warning.
+
+    Such a command stays here, refused `parity`, when the builder reports no Godot install: a repo pinning no version says `gate: the repo pins no Godot version and <host> lists no Godot install; a routed run needs one`, and `godot = ""` has only the parity mismatch's own lines. When the builder gives no version list for godot (its probe was skipped, or it answered with no version), either says `gate: <host> did not list its Godot installs; a routed run needs one`.
+
+    A repo pinning no version also stays here, refused `parity`, when its pins could not be read (its tree could not be read, its `.gate/toolchain.toml` exists but cannot be read, or a project file's Godot pin was left unread), saying `gate: the repo's Godot pins could not be read; a routed run needs one`. A missing manifest is not unreadable, and a manifest entry of `""` settles the version whatever a project file pins.
+
+    Every other command of the repo routes as before, with no `GodotVersion`.
+
+    A warm-up counts as a Godot-console command when any of its commands' first word is a Godot console word. It then sends the same `godot` need, follows the same rules with the same lines (said in its log, and on the console of a foreground `gate warm`), and carries the chosen version as its payload's `GodotVersion`. A warm-up the rules refuse is recorded `failed`, refused, with the reason `the builder refused: parity`.
 
     A tool the builder did not probe, gave no answer for, or found at a version that cannot be read against a minimum gets `gate: <host> did not probe <name>: <why>; not checking it` and is not a need. The lines come in this order: the SDK step's own, then the manifest's problem lines, then the per-tool skip lines in the manifest's order, then the mismatch lines.
 
@@ -2247,7 +2257,7 @@ Built verbs:
 
   When ending the job fails or leaves processes, the box tries once more to end it. If the job is still not ended, it says first `gate: note: the box's ceiling|backstop kill left <n> process(es) running in job <job>` (or `gate: note: the box's ceiling|backstop kill could not end job <job>: <error>`), then the kill line, the tag and the adjusted line as on any kill, and exits 124: the run is still a kill.
 
-  A drain that ends with the output still held open says `gate: remote command's output is still held open by a leftover process; stopped reading`. A client gone during the kill drain gets the box's client-gone status, not a kill.
+  A drain that ends with the output still held open says `gate: remote command's output is still held open by a leftover process; stopped reading`; the drain's rule is under "Output is forwarded" below. A client gone during the kill drain gets the box's client-gone status, not a kill.
 
   The PC journals a tagged kill with the tag's verdict whatever its log holds, applies no sync-back and fetches no outputs. A command's own exit 124 (no tag) is an ordinary status with a sync-back.
 
@@ -2263,7 +2273,7 @@ Built verbs:
 
   A heartbeat line never splits a forwarded line: the pump writes under the output lock the forwarders take. The run's git children (fetch, checkout, clean, the back ref reset, the back commit's add, write-tree, rev-parse, commit-tree and push, and diff-tree) have their output forwarded the same way, line by line; the box's own lines are written whole under std's stream lock, which the pump's writes take too. A line still waiting for the lock when the readers stop is dropped.
 
-  After git exits, the box waits at most 2 s for its pipes to close. A pipe a leftover process still holds says `gate: remote git's output is still held open by a leftover process; stopped reading` and the run goes on.
+  After git exits, the box drains its pipes by the same rule as a command's output (below). A pipe a leftover process still holds says `gate: remote git's output is still held open by a leftover process; stopped reading` and the run goes on.
 
   A client that closed the connection while git's output was forwarded ends the run with 255 and `gate: remote the client closed the connection during git <step>`, the step's name saying git once (`during git init`, not `during git git init`). A pipe that cannot be read says `gate: remote could not read git's stderr: <error>` (or `stdout`).
 
@@ -2521,7 +2531,11 @@ Built verbs:
 
   Output is forwarded from the pipes until both end. What the command left in its job is ended first (below), the console's donor excepted, so a leftover there holds no pipe open and costs no drain.
 
-  A process the run's end spares, such as a live nested gate, can still hold a pipe open after the command ended: the box then stops reading after a 2 s drain and says `gate: remote command's output is still held open by a leftover process; stopped reading`. A pipe that cannot be read prints `gate: remote could not read the command's <stdout|stderr>: <error>`.
+  The drain: once the command's main process has exited, the box waits 2 s for each reader to reach the end of its pipe. A reader still not at the end then is waited for further, up to a 30 s guard counted from the start of the drain, only while it is behind: it holds bytes it has read and not yet written or dropped, or it waits on no read (between reads, or not yet run). A read still pending on a pipe holding nothing is a leftover's, and the drain cancels it with `CancelSynchronousIo`.
+
+  A reader is a leftover only if its read ended aborted by that cancellation: the line below is said at about 2 s and the reader ends quietly, writing nothing further. A cancelled read that completes anyway has its bytes forwarded and is judged again, and a reader at the end of its pipe is never one. A reader writing to the box's own output is never cancelled; the drain waits for it. A reader still behind when the guard passes is stopped, its unread bytes dropped, and the run says the same leftover line. Git's pipes drain by the same rule.
+
+  A process the run's end spares, such as a live nested gate, can still hold a pipe open after the command ended: the box then stops reading and says `gate: remote command's output is still held open by a leftover process; stopped reading`. A pipe that cannot be read prints `gate: remote could not read the command's <stdout|stderr>: <error>`.
 
   Once the command has exited, before the readers drain and before the outputs are listed, the box ends what the command left in its job, sparing live gates and console hosts as the local run end does, and the console's donor (a spared gate may still be using it; the box ends it itself once the wait for the command is over), with the passes the local run end uses (`end_leftovers`), under the state root a `gate run` with no `--state-dir` resolves.
 

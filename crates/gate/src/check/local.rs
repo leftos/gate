@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use gate_args::{CheckRequest, CheckSeams};
-use gate_router::warm::{FileRead, Judgement, Record, RecordRead, RecordState, Situation, judge, lock_problem_text, record_problem_text};
+use gate_router::warm::{FileRead, Judgement, Record, RecordRead, RecordState, Situation, WarmupFile, judge, lock_problem_text, record_problem_text};
 use gate_router::{Place, SiblingFolder, repo_name, sibling_root, work_folder_key};
 use gate_state::v1;
 
@@ -89,11 +89,12 @@ pub(super) struct Declared {
 
 impl Declared {
     /// The files that are there but cannot be read whole, in the order the summary names them: the manifest, its
-    /// siblings when `siblings_unreadable`, the root `global.json`.
-    pub(super) fn unreadable(&self, siblings_unreadable: bool) -> Vec<&'static str> {
+    /// siblings when `siblings_unreadable`, the warm-up file when `warmup_unreadable`, the root `global.json`.
+    pub(super) fn unreadable(&self, siblings_unreadable: bool, warmup_unreadable: bool) -> Vec<&'static str> {
         [
             self.toolchain_unreadable.then_some(report::TOOLCHAIN),
             siblings_unreadable.then_some(report::SIBLINGS),
+            warmup_unreadable.then_some(report::WARMUP),
             self.pin_unreadable.then_some(report::GLOBAL_JSON),
         ]
         .into_iter()
@@ -179,12 +180,12 @@ fn checked(place: &Place, limit: Duration) -> Checked {
     };
     let (siblings, siblings_unreadable) = read_siblings(&place.root, allowed.as_deref(), &mut declared.problems);
     let consent_problem = consent_problem.filter(|_| !siblings.is_empty());
-    let (warmup, _) = warmup(&place.root, WarmSources::from_process(&repo), None, &mut declared.problems);
+    let warmed = warmup(&place.root, WarmSources::from_process(&repo), None, &mut declared.problems);
     Checked {
         repo,
         root: place.root.clone(),
         declares_toolchain: declared.declares_toolchain,
-        unreadable: declared.unreadable(siblings_unreadable),
+        unreadable: declared.unreadable(siblings_unreadable, warmed.unreadable),
         problems: declared.problems,
         tools,
         godot: declared.godot,
@@ -194,7 +195,7 @@ fn checked(place: &Place, limit: Duration) -> Checked {
         siblings,
         created: Vec::new(),
         siblings_skipped: false,
-        warmup,
+        warmup: warmed.items,
     }
 }
 
@@ -253,22 +254,48 @@ fn warmup_consent(repo: &str) -> Consent {
     }
 }
 
-/// The warm-up's items of the worktree root `root`, from `sources`, and the hash of its warm-up file when the repo
-/// consents and the file parsed; each problem of the file is added to `problems`, consent or not. A repo with neither
-/// the file nor consent, and a `.gate` that is not a folder, have no item. The record is judged for `remote.json`'s
-/// host, or for the builder `builder` a builder check checks, and then only a record that names it is said.
-pub(super) fn warmup(root: &str, sources: WarmSources, builder: Option<&str>, problems: &mut Vec<Problem>) -> (Vec<Warmup>, Option<String>) {
+/// What the warm-up of a worktree root came to: its items, the hash of its warm-up file when the repo consents and the
+/// file parsed, and whether the file is there but cannot be read whole.
+pub(super) struct Warmed {
+    pub items: Vec<Warmup>,
+    pub hash: Option<String>,
+    pub unreadable: bool,
+}
+
+/// The warm-up's items of the worktree root `root`, from `sources`; each problem of the file is added to `problems`,
+/// consent or not, and a file that cannot be read whole is said as such whatever the consent. A repo with neither the
+/// file nor consent, and a `.gate` that is not a folder, have no item. The record is judged for `remote.json`'s host,
+/// or for the builder `builder` a builder check checks, and then only a record that names it, or cannot be read, is
+/// said.
+pub(super) fn warmup(root: &str, sources: WarmSources, builder: Option<&str>, problems: &mut Vec<Problem>) -> Warmed {
     let folder = Path::new(root);
     if route::gate_is_not_a_folder(folder) {
-        return (Vec::new(), None);
+        return Warmed {
+            items: Vec::new(),
+            hash: None,
+            unreadable: false,
+        };
     }
-    let file = warm::read_warmup_file_whole(folder);
+    let file = warm::read_warmup_file_checked(folder);
+    let unreadable = file.as_ref().is_err_and(|found| found.unreadable);
     if let Err(found) = &file {
-        problems.extend(found.iter().map(|text| Problem {
+        problems.extend(found.problems.iter().map(|text| Problem {
             file: report::WARMUP,
             text: text.clone(),
         }));
     }
+    let (items, hash) = warmup_items(root, file.map_err(drop), sources, builder);
+    Warmed { items, hash, unreadable }
+}
+
+/// The items of [`warmup`], from the warm-up file `file` as it read (`Err` when it did not), and the file's hash when
+/// the repo consents and it parsed.
+fn warmup_items(
+    root: &str,
+    file: Result<Option<(WarmupFile, String)>, ()>,
+    sources: WarmSources,
+    builder: Option<&str>,
+) -> (Vec<Warmup>, Option<String>) {
     let declared = !matches!(file, Ok(None));
     let host = match sources.consent {
         Consent::Given { host } => host,
@@ -278,7 +305,7 @@ pub(super) fn warmup(root: &str, sources: WarmSources, builder: Option<&str>, pr
     let (file, hash) = match file {
         Ok(Some(parsed)) => parsed,
         Ok(None) => return (vec![Warmup::NoFile], None),
-        Err(_) => return (vec![Warmup::FileProblems], None),
+        Err(()) => return (vec![Warmup::FileProblems], None),
     };
     let state = match sources.state {
         Ok(state) => state,
@@ -290,19 +317,27 @@ pub(super) fn warmup(root: &str, sources: WarmSources, builder: Option<&str>, pr
 }
 
 /// The item of the warm-up record of the worktree root `root`'s work folder, in the state root `state`, for the
-/// warm-up file `file` on `host`; the lock is probed, never taken. `None` when `only_its_own` and the record does not
-/// name `host`.
+/// warm-up file `file` on `host`: the lock probed first, never taken, then the record read, in the route's order. A lock
+/// that cannot be probed is said whatever the record, as the route gives it precedence. Else `None` when
+/// `only_its_own` and the record is absent or names another host; one that cannot be read names none, so it is said,
+/// as every routed run stays here for it.
 fn recorded(root: &str, state: &Path, file: &FileRead, host: &str, only_its_own: bool) -> Option<Warmup> {
     let key = work_folder_key(root);
+    let lock = v1::warm_lock_path(state, &key);
+    let held = match warm::lock_held(&lock) {
+        Ok(held) => held,
+        Err(error) => return Some(Warmup::Unreadable(lock_problem_text(&lock.to_string_lossy(), &error.to_string()))),
+    };
     let record = warm::read_warm_record(&v1::warm_record_path(state, &key));
-    if only_its_own && !matches!(&record, RecordRead::Parsed(found) if found.host == host) {
+    let names_another = match &record {
+        RecordRead::Absent => true,
+        RecordRead::Parsed(found) => found.host != host,
+        RecordRead::Unreadable { .. } => false,
+    };
+    if only_its_own && names_another {
         return None;
     }
-    let lock = v1::warm_lock_path(state, &key);
-    match warm::lock_held(&lock) {
-        Ok(held) => Some(record_item(&record, file, held, host, SystemTime::now())),
-        Err(error) => Some(Warmup::Unreadable(lock_problem_text(&lock.to_string_lossy(), &error.to_string()))),
-    }
+    Some(record_item(&record, file, held, host, SystemTime::now()))
 }
 
 /// The item of the warm-up record `record` for the warm-up file `file` that parsed, its lock held or not, on `host` at
@@ -530,10 +565,10 @@ mod tests {
 
     use gate_router::SiblingFolder;
 
-    use super::{declares_siblings, read_manifest, read_pin, read_siblings, sdk_of, sibling};
+    use super::{Declared, declares_siblings, read_manifest, read_pin, read_siblings, sdk_of, sibling};
     use crate::check::report::{Found, Sdk, Sibling};
     use crate::remote::parity::{Pin, pin_of};
-    use crate::remote::toolchain::{ToolNeed, Version};
+    use crate::remote::toolchain::{Manifest, ToolNeed, Version};
     use crate::test_support::junction;
 
     /// A folder of its own under the unit tests' temp folder, removed when the test ends, failed or not.
@@ -586,6 +621,24 @@ mod tests {
                 min: Version::parse("24"),
                 known: true,
             }]
+        );
+    }
+
+    #[test]
+    fn the_unreadable_files_are_named_in_the_summary_s_order() {
+        let declared = Declared {
+            declares_toolchain: true,
+            manifest: Manifest::default(),
+            godot: None,
+            pin: None,
+            problems: Vec::new(),
+            toolchain_unreadable: true,
+            pin_unreadable: true,
+        };
+
+        assert_eq!(
+            declared.unreadable(true, true),
+            [".gate/toolchain.toml", ".gate/siblings.toml", ".gate/warmup.toml", "global.json"]
         );
     }
 

@@ -1781,8 +1781,9 @@ struct Pipes {
     stderr: File,
 }
 
-/// Forwards the running command's output, waits for its main process to exit, then lets the readers drain for at most
-/// [`DRAIN`]; the command's exit code. A failed write to the box's own output means the client closed the connection,
+/// Forwards the running command's output, waits for its main process to exit, then drains the readers as
+/// [`Forwarders::drain`] does — up to [`DRAIN`], and past it up to its hang guard for a reader that is only behind;
+/// the command's exit code. A failed write to the box's own output means the client closed the connection,
 /// whenever it is noticed: the command's job is stopped then, before the readers drain or after them, and
 /// [`CLOSED_STATUS`] answered for it instead. Should the box fail first, the job is terminated, so the command does
 /// not outlive a run that no longer watches it. The heartbeat watches the job once the readers drain its pipes, so no
@@ -2010,9 +2011,10 @@ impl Watched<'_> {
         stop.is_some_and(|stop| stop.seen(self.watching.while_waiting(), console))
     }
 
-    /// Once the main process exited: lets the readers drain for at most [`DRAIN`]. A write to the box's own output
-    /// that failed meanwhile stops the job and answers [`CLOSED_STATUS`]; a leftover process still holding the output
-    /// open is said, and the run goes on.
+    /// Once the main process exited: drains the readers as [`Forwarders::drain`] does — up to [`DRAIN`], and past it
+    /// up to its hang guard for a reader that is only behind. A write to the box's own output that failed meanwhile
+    /// stops the job and answers [`CLOSED_STATUS`]; a leftover process still holding the output open is said, and the
+    /// run goes on.
     pub(super) fn drained(self, console: &mut Console) -> Result<(), u32> {
         let drained = self.forwarders.drain(DRAIN);
         if drained.pipe_closed {
@@ -2024,8 +2026,9 @@ impl Watched<'_> {
         Ok(())
     }
 
-    /// The box's ceiling found the process past a limit: its job is ended first, then the readers drain for at most
-    /// [`DRAIN`]; how the ending went, which the ceiling says. A write to the box's own output that failed meanwhile
+    /// The box's ceiling found the process past a limit: its job is ended first, then the readers drain as
+    /// [`Forwarders::drain`] does — up to [`DRAIN`], and past it up to its hang guard for a reader that is only
+    /// behind; how the ending went, which the ceiling says. A write to the box's own output that failed meanwhile
     /// answers [`CLOSED_STATUS`], and a leftover process still holding the output open is said, as
     /// [`Watched::drained`] does.
     pub(super) fn killed(self, console: &mut Console) -> Result<io::Result<Ending>, u32> {
@@ -2040,8 +2043,8 @@ impl Watched<'_> {
         Ok(ending)
     }
 
-    /// The client closed the connection: the job is stopped first, then the readers drain for at most [`DRAIN`];
-    /// [`CLOSED_STATUS`].
+    /// The client closed the connection: the job is stopped first, then the readers drain as [`Forwarders::drain`]
+    /// does — up to [`DRAIN`], and past it up to its hang guard for a reader that is only behind; [`CLOSED_STATUS`].
     pub(super) fn client_gone(self, console: &mut Console) -> u32 {
         let ending = terminate_and_wait(self.job);
         self.forwarders.drain(DRAIN);
@@ -2049,8 +2052,9 @@ impl Watched<'_> {
     }
 
     /// The wait for the main process failed, its line said: the job is ended and waited for, then the readers drain
-    /// for at most [`DRAIN`], so no line of the process is forwarded after the box's next line; then what the ending
-    /// left is said. `status`, the wait's own.
+    /// as [`Forwarders::drain`] does — up to [`DRAIN`], and past it up to its hang guard for a reader that is only
+    /// behind — so no line of the process is forwarded after the box's next line; then what the ending left is said.
+    /// `status`, the wait's own.
     pub(super) fn wait_failed(self, status: u32, console: &mut Console) -> u32 {
         let ending = terminate_and_wait(self.job);
         self.forwarders.drain(DRAIN);

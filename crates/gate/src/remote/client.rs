@@ -53,7 +53,7 @@ use super::snapshot::{self, Bounded, Place, Snapshot};
 use super::syncback;
 #[cfg(feature = "test-seams")]
 use super::tamper;
-use super::toolchain::{self, GodotChoice, Manifest, Pin, Reported};
+use super::toolchain::{self, GodotChoice, Manifest, NoChosenGodot, Pin, Reported};
 #[cfg(feature = "test-seams")]
 use super::transport::Local;
 use super::transport::ssh::Ssh;
@@ -803,9 +803,16 @@ fn csproj_pins(
 
 impl Tree {
     /// The `Needs` the preflight sends for the tree ([`toolchain::routed_needs`]): the tools its manifest declares, and
-    /// the exact versions its project files pin of godot when the manifest does not name godot itself.
-    fn needs(&self) -> Vec<(String, String)> {
-        toolchain::routed_needs(self.manifest.as_ref(), &self.godot_pins)
+    /// the exact versions its project files pin of godot when the manifest does not name godot itself; a Godot command
+    /// (`godot_command`) has the builder list its installs even when the repo requires no version.
+    fn needs(&self, godot_command: bool) -> Vec<(String, String)> {
+        toolchain::routed_needs(self.manifest.as_ref(), &self.godot_pins, godot_command)
+    }
+
+    /// Whether the repo's Godot pins were read ([`toolchain::godot_pins_read`]): its manifest reads or is absent, and
+    /// every project file's pin was read.
+    fn godot_pins_read(&self) -> bool {
+        toolchain::godot_pins_read(self.manifest.as_ref(), &self.godot_skips)
     }
 }
 
@@ -1115,7 +1122,12 @@ impl Attempt<'_, '_> {
             .map(|(repo, sibling)| (repo.name.clone(), sibling.commit.clone()))
             .collect();
         let trees = self.trees(&repos, &snapshots)?;
-        let needs = trees.first().and_then(Option::as_ref).map(Tree::needs).unwrap_or_default();
+        let godot_command = self.godot_command();
+        let needs = trees
+            .first()
+            .and_then(Option::as_ref)
+            .map(|tree| tree.needs(godot_command))
+            .unwrap_or_default();
         let prepared = self.preflight(&location, &needs)?;
         let godot_version = self.parity(&repos, &snapshots, &trees, &prepared)?;
         // After the preflight, whose installs the Godot version is chosen from.
@@ -1171,6 +1183,16 @@ impl Attempt<'_, '_> {
             End::Lost(output) => Ok(self.connection_lost(&location, prepared.boot.as_deref(), output)),
             End::Refused(FallbackReason::Inputs) => Ok(inputs::run_refused(self)),
             end => Ok(end),
+        }
+    }
+
+    /// Whether the call runs a Godot console, which the preflight's Godot need and [`Attempt::parity`]'s Godot rule
+    /// both read: a run's first word, or any of a warm-up's commands' first words, since a warm-up's call carries none
+    /// of its own.
+    fn godot_command(&self) -> bool {
+        match self.call.warmth {
+            Warmth::WarmUp { commands, .. } => commands.iter().any(|command| command.first().is_some_and(|word| is_godot_console(word))),
+            Warmth::Unasked | Warmth::Needs(_) => self.call.words.first().is_some_and(|word| is_godot_console(word)),
         }
     }
 
@@ -1651,14 +1673,18 @@ impl Attempt<'_, '_> {
     /// for its own SDK alone, as its own `global.json` pins it, its lines naming it; the tools are the main one's.
     ///
     /// `Ok` with the version of the builder's Godot install the run uses ([`toolchain::godot_choice`]), `None` when none
-    /// is chosen; a main repo pinning several Godot versions chooses none, and a run whose first word is a Godot console
-    /// ([`is_godot_console`]) then says why after the mismatch lines and is refused `parity`.
+    /// is chosen; a main repo pinning several Godot versions chooses none, and a call that runs a Godot console
+    /// ([`Attempt::godot_command`]) then says why after the mismatch lines and is refused `parity`. A repo pinning no Godot
+    /// version, or taking any, chooses none too, and such a run uses the newest install the builder listed
+    /// ([`toolchain::no_chosen_godot`]), warning when the repo pins none, said before the run starts and only when the
+    /// run is not refused; it stays here, refused `parity`, when the builder lists no install, did not list its
+    /// installs, or the repo's pins could not be read. A pin no listed install meets is refused as the parity mismatch it
+    /// is.
     fn parity(&mut self, repos: &[Repo], snapshots: &[Snapshot], trees: &[Option<Tree>], prepared: &Prepared) -> Result<Option<String>, End> {
         let mut refused = false;
-        let required = trees
-            .first()
-            .and_then(Option::as_ref)
-            .and_then(|tree| toolchain::godot_required(tree.manifest.as_ref(), &tree.godot_pins));
+        let main = trees.first().and_then(Option::as_ref);
+        let pins_read = main.is_some_and(Tree::godot_pins_read);
+        let required = main.and_then(|tree| toolchain::godot_required(tree.manifest.as_ref(), &tree.godot_pins));
         for (at, ((repo, snapshot), tree)) in repos.iter().zip(snapshots).zip(trees).enumerate() {
             let Some(tree) = tree else {
                 continue;
@@ -1676,11 +1702,24 @@ impl Attempt<'_, '_> {
             }
             refused = true;
         }
+        let mut warning = None;
+        let godot_command = self.godot_command();
         let chosen = match toolchain::godot_choice(required.as_deref(), &prepared.tools) {
-            GodotChoice::None => None,
+            GodotChoice::None => match toolchain::no_chosen_godot(required.as_deref(), pins_read, godot_command, &prepared.tools, self.call.host) {
+                NoChosenGodot::None => None,
+                NoChosenGodot::Newest { version, warning: why } => {
+                    warning = why;
+                    Some(version)
+                }
+                NoChosenGodot::Refuse(line) => {
+                    self.say(line);
+                    refused = true;
+                    None
+                }
+            },
             GodotChoice::Version(version) => Some(version),
             GodotChoice::Several(list) => {
-                if self.call.words.first().is_some_and(|word| is_godot_console(word)) {
+                if godot_command {
                     self.say(toolchain::several_godot_line(&list));
                     refused = true;
                 }
@@ -1688,10 +1727,14 @@ impl Attempt<'_, '_> {
             }
         };
         if refused {
-            Err(End::Refused(FallbackReason::Parity))
-        } else {
-            Ok(chosen)
+            return Err(End::Refused(FallbackReason::Parity));
         }
+        // Said here, on the run's `Ok` path alone, so a refused run is not told which version it would have used; still
+        // before the push and the run start.
+        if let Some(warning) = warning {
+            self.say(warning);
+        }
+        Ok(chosen)
     }
 
     /// What the builder lacks for the repository `repo`, at `at` in the run's order, whose `snapshot` has the tree

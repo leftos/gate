@@ -252,11 +252,50 @@ pub(crate) fn read_warmup_file(root: &Path) -> FileRead {
 ///
 /// Every problem of the file, in file order: one when it cannot be read or is not UTF-8 or not TOML.
 pub(crate) fn read_warmup_file_whole(root: &Path) -> Result<Option<(WarmupFile, String)>, Vec<String>> {
-    let Some(bytes) = route::read_gate_file(root, "warmup.toml").map_err(|problem| vec![problem])? else {
-        return Ok(None);
+    read_warmup_file_checked(root).map_err(|found| found.problems)
+}
+
+/// The problems of a `.gate\warmup.toml` that did not read, and whether it cannot be read whole: the `.gate` reader
+/// refused it, or it is not UTF-8 or not TOML, rather than a TOML file with problems of its keys or commands.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct WarmupProblems {
+    /// Every problem, in file order.
+    pub problems: Vec<String>,
+    /// Whether the file cannot be read whole.
+    pub unreadable: bool,
+}
+
+/// The `.gate\warmup.toml` of the worktree at `root`, read as [`read_warmup_file_whole`] reads it, its problems also
+/// saying whether it cannot be read whole. `gate check` reads it through this.
+///
+/// # Errors
+///
+/// Every problem of the file, in file order, and whether it cannot be read whole.
+pub(crate) fn read_warmup_file_checked(root: &Path) -> Result<Option<(WarmupFile, String)>, WarmupProblems> {
+    let bytes = match route::read_gate_file(root, "warmup.toml") {
+        Ok(None) => return Ok(None),
+        Ok(Some(bytes)) => bytes,
+        Err(problem) => {
+            return Err(WarmupProblems {
+                problems: vec![problem],
+                unreadable: true,
+            });
+        }
     };
-    let file = read_warmup(&bytes)?;
-    Ok(Some((file, warmup_hash(&bytes))))
+    match read_warmup(&bytes) {
+        Ok(file) => Ok(Some((file, warmup_hash(&bytes)))),
+        Err(problems) => Err(WarmupProblems {
+            problems,
+            unreadable: !reads_as_toml(&bytes),
+        }),
+    }
+}
+
+/// Whether `bytes`, a leading byte order mark skipped as [`read_warmup`] skips it, are UTF-8 that parses as a TOML
+/// table.
+fn reads_as_toml(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    std::str::from_utf8(bytes).is_ok_and(|text| text.parse::<toml::Table>().is_ok())
 }
 
 /// The warm-up record at `path` as the route reads it: absent when nothing is there; else opened without following a

@@ -15,7 +15,7 @@ use gate_win32::PipedConsole;
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::boxside::payload::escaped;
-use crate::check::local::{self, Declared, WarmSources};
+use crate::check::local::{self, Declared, WarmSources, Warmed};
 use crate::check::report::{self, At, Checked, Problem, Tool, Warmup};
 use crate::console::Console;
 use crate::environment::Variables;
@@ -130,7 +130,7 @@ struct Asked {
 /// the line saying why it could not be checked.
 fn asked(transport: &dyn Transport, host: &str, place: &Place, bound: Duration) -> Result<Asked, String> {
     let root = Path::new(&place.root);
-    let declared = local::declared(root);
+    let mut declared = local::declared(root);
     let needs = toolchain::needs_of(&declared.manifest);
     let repo = repo_name(&place.checkout);
     let key = work_folder_key(&place.root);
@@ -149,19 +149,21 @@ fn asked(transport: &dyn Transport, host: &str, place: &Place, bound: Duration) 
         last_error: heard.last_error.as_deref(),
     };
     let sources = WarmSources::from_process(&repo);
-    let mut checked = answer.checked(declared, repo, place.root.clone(), local::declares_siblings(root));
-    checked.warmup = warm_items(&place.root, sources, host, &heard.lines, &mut checked.problems);
+    let warmed = warm_items(&place.root, sources, host, &heard.lines, &mut declared.problems);
+    let mut checked = answer.checked(declared, repo, place.root.clone(), local::declares_siblings(root), warmed.unreadable);
+    checked.warmup = warmed.items;
     Ok(Asked { checked, key })
 }
 
-/// The warm-up's items of a builder check of `host` for the worktree root `root`, from `sources`: this PC's
-/// ([`local::warmup`]), the record said only when it names `host`, then, when the repo consents and its warm-up file
-/// parsed, what the preflight's `lines` say of the builder's work folder against that file's hash. Each problem of
-/// the file is added to `problems`.
-fn warm_items(root: &str, sources: WarmSources, host: &str, lines: &[String], problems: &mut Vec<Problem>) -> Vec<Warmup> {
-    let (mut items, hash) = local::warmup(root, sources, Some(host), problems);
-    items.extend(hash.map(|hash| builder_warmth(lines, &hash)));
-    items
+/// The warm-up of a builder check of `host` for the worktree root `root`, from `sources`: this PC's
+/// ([`local::warmup`]), the record said only when it names `host` or cannot be read, then, when the repo consents and
+/// its warm-up file parsed, what the preflight's `lines` say of the builder's work folder against that file's hash.
+/// Each problem of the file is added to `problems`.
+fn warm_items(root: &str, sources: WarmSources, host: &str, lines: &[String], problems: &mut Vec<Problem>) -> Warmed {
+    let mut warmed = local::warmup(root, sources, Some(host), problems);
+    let builder = warmed.hash.as_deref().map(|hash| builder_warmth(lines, hash));
+    warmed.items.extend(builder);
+    warmed
 }
 
 /// What the builder's preflight `lines` say of its work folder's warm-up, as the client reads them ([`warm_of`]): warm
@@ -296,9 +298,10 @@ struct Answer<'a> {
 }
 
 impl Answer<'_> {
-    /// What the builder has of what the repo named `repo`, whose worktree root is `root`, `declared`, and whether it
-    /// `declares_siblings`, which a builder is not checked for.
-    fn checked(&self, declared: Declared, repo: String, root: String, declares_siblings: bool) -> Checked {
+    /// What the builder has of what the repo named `repo`, whose worktree root is `root`, `declared`, whether it
+    /// `declares_siblings`, which a builder is not checked for, and whether its warm-up file is there but
+    /// `warmup_unreadable` whole.
+    fn checked(&self, declared: Declared, repo: String, root: String, declares_siblings: bool, warmup_unreadable: bool) -> Checked {
         let reported = toolchain::reported(self.lines, self.sent);
         let tools = declared
             .manifest
@@ -323,7 +326,7 @@ impl Answer<'_> {
             repo,
             root,
             declares_toolchain: declared.declares_toolchain,
-            unreadable: declared.unreadable(false),
+            unreadable: declared.unreadable(false, warmup_unreadable),
             problems: declared.problems,
             tools,
             godot: declared.godot,
@@ -424,7 +427,7 @@ mod tests {
             lines: answer,
             last_error,
         }
-        .checked(declared, "app".to_owned(), "X:/dev/app".to_owned(), false)
+        .checked(declared, "app".to_owned(), "X:/dev/app".to_owned(), false, false)
     }
 
     fn reported(checked: &Checked) -> Vec<(&str, &Reported)> {
@@ -623,13 +626,13 @@ mod tests {
         let mut problems = Vec::new();
         let file_hash = warmup_hash(WARMUP_FILE);
         assert_eq!(
-            warm_items(&root, consenting(&state), HOST, &warm_said(&file_hash), &mut problems),
+            warm_items(&root, consenting(&state), HOST, &warm_said(&file_hash), &mut problems).items,
             [Warmup::Builder { warm: true }],
             "the hash of the file's bytes"
         );
         let other = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
         assert_eq!(
-            warm_items(&root, consenting(&state), HOST, &warm_said(other), &mut problems),
+            warm_items(&root, consenting(&state), HOST, &warm_said(other), &mut problems).items,
             [Warmup::Builder { warm: false }],
             "another hash"
         );
@@ -657,12 +660,12 @@ mod tests {
         let said = warm_said(&warmup_hash(WARMUP_FILE));
         let mut problems = Vec::new();
         assert_eq!(
-            warm_items(&root, consenting(&state), HOST, &said, &mut problems),
+            warm_items(&root, consenting(&state), HOST, &said, &mut problems).items,
             [Warmup::Warm { host: HOST.to_owned() }, Warmup::Builder { warm: true }],
             "a record of the builder checked"
         );
         assert_eq!(
-            warm_items(&root, consenting(&state), "builder-2", &said, &mut problems),
+            warm_items(&root, consenting(&state), "builder-2", &said, &mut problems).items,
             [Warmup::Builder { warm: true }],
             "a record of another builder"
         );

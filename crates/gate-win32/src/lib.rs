@@ -4,7 +4,8 @@
 //! system's boot time, what a drive letter stands for, a rename that never replaces its target, a name opened inside an
 //! open folder, a file opened again through its reparse point's filter, an open file's volume serial and file id
 //! ([`file_id`]), whether two open files are one, whether an open file is on a network volume ([`on_network_volume`]),
-//! and the Windows message of an error code. And what a run on the interactive desktop needs: a named pipe for one
+//! the synchronous I/O a thread waits on cancelled ([`cancel_synchronous_io`]), and the Windows message of an error
+//! code. And what a run on the interactive desktop needs: a named pipe for one
 //! user's local client, handles copied into and out of another process and the checks on a process taken that way, a
 //! command created on the interactive desktop, the console session's state, and a registered scheduled task started in
 //! a given session once its definition is checked ([`run_task`]). It holds no policy but two: [`run_task`] starts only
@@ -34,6 +35,7 @@ mod session;
 mod task;
 #[cfg(test)]
 mod test_support;
+mod thread;
 mod times;
 mod token;
 mod tree;
@@ -78,6 +80,7 @@ pub use file::{
     open_beneath_as, rename_beneath, rename_beneath_no_replace, reopen_through_filter, same_file,
 };
 pub use security::{Descriptor, inherit_security, is_protected_folder, protected_descriptor, security_text, without_auto_inherit};
+pub use thread::cancel_synchronous_io;
 pub use tree::{Membership, OpenedJob, StoppableProcess, WaitableProcess};
 
 pub use priority::{Priority, priority_of, set_priority};
