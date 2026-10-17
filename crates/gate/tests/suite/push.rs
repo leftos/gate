@@ -1,7 +1,8 @@
 //! `gate push` through the suite's stand-in for ssh, whose push call runs the builder script in this PC's pwsh with a
 //! LOCALAPPDATA of the builder's own, `builders\<host>` in the case folder. Each case's installed gate is a copy of the
-//! built gate in the case's own LOCALAPPDATA, and a builder's old gate a copy of the stand-in, which says its own
-//! version, [`OLD_VERSION`].
+//! built gate in the case's own LOCALAPPDATA, its desktop helper a copy of the suite's stand-in helper, and a builder's
+//! old gate a copy of the stand-in, which says its own version, [`OLD_VERSION`]. Each builder's registration of the
+//! desktop task runs the pushed gate's own seam, so no case touches this PC's Task Scheduler.
 
 use std::fs::{self, File};
 use std::io::Read as _;
@@ -18,7 +19,9 @@ use flate2::read::GzDecoder;
 use serde_json::{Value, json};
 
 use crate::install::unix;
-use crate::support::{Case, FAKE_TOOL, GATE, Outcome, beside, finish, junction, names, shown, start, version_of, write_remote_json};
+use crate::support::{
+    Case, FAKE_DESKTOP_HELPER, FAKE_TOOL, GATE, Outcome, beside, finish, junction, names, shown, start, version_of, write_remote_json,
+};
 
 /// The suite's stand-in for ssh, which `--test-push-ssh` names.
 const FAKE_SSH: &str = env!("CARGO_BIN_EXE_fake-ssh");
@@ -30,6 +33,8 @@ const BUILDERS_VARIABLE: &str = "GATE_FAKE_SSH_BUILDERS";
 const HOST: &str = "pushbox-a";
 /// The builder a `hosts` entry adds.
 const OTHER_HOST: &str = "pushbox-b";
+/// The desktop helper's name beside gate.exe, on this PC and on a builder.
+const HELPER: &str = "gate-desktop-helper.exe";
 /// An aside copy an earlier install left, named as the script names one.
 const ASIDE: &str = "gate.exe.20200101000000.4.old";
 /// What the stand-in says after `gate ` when it is started with `--version` alone, as a builder's old gate.
@@ -59,8 +64,19 @@ fn installed_gate(case: &Case) -> PathBuf {
     case.local_app_data().join("gate").join("bin").join("gate.exe")
 }
 
-/// Installs a copy of the built gate as the case's installed gate.
+/// The desktop helper the case's push sends: `<LOCALAPPDATA>\gate\bin\gate-desktop-helper.exe`.
+fn installed_helper(case: &Case) -> PathBuf {
+    installed_gate(case).with_file_name(HELPER)
+}
+
+/// Installs a copy of the built gate as the case's installed gate, and a copy of the suite's stand-in helper beside it.
 fn install_gate(case: &Case) {
+    install_gate_alone(case);
+    fs::copy(FAKE_DESKTOP_HELPER, installed_helper(case)).expect("the helper can be installed");
+}
+
+/// Installs a copy of the built gate as the case's installed gate, with no desktop helper beside it.
+fn install_gate_alone(case: &Case) {
     let exe = installed_gate(case);
     fs::create_dir_all(exe.parent().expect("the installed gate has a folder")).expect("the install folder can be made");
     fs::copy(GATE, &exe).expect("the gate can be installed");
@@ -117,9 +133,15 @@ fn pushed_input(steps: &Path) -> Vec<u8> {
     fs::read(beside(steps, ".input")).expect("the stand-in kept the push's input")
 }
 
-/// `gate push` for `case`, each builder's call made through `ssh` acting on the steps file `steps`, `extra` after.
+/// `gate push` for `case`, each builder's call made through `ssh` acting on the steps file `steps`, `extra` after; each
+/// builder's registration is `--test-push-register ok` unless `extra` gives that seam, so no case reaches this PC's
+/// Task Scheduler.
 fn push_command(case: &Case, steps: &Path, ssh: &str, extra: &[&str]) -> Command {
     let mut words = vec!["push", "--test-push-ssh", ssh];
+    let registers = |word: &&str| *word == "--test-push-register" || word.starts_with("--test-push-register=");
+    if !extra.iter().any(registers) {
+        words.extend(["--test-push-register", "ok"]);
+    }
     words.extend(extra);
     let mut command = case.gate_without_state_dir(&words);
     command.env(STEPS_VARIABLE, steps).env(BUILDERS_VARIABLE, builders(case));
@@ -172,13 +194,22 @@ fn assert_holds(path: &Path, bytes: &[u8]) {
     assert!(held == bytes, "{} holds other bytes", shown(path));
 }
 
-/// The lines a push that installed on `host` says on stdout.
+/// The lines a push that installed gate.exe and the helper on `host` and registered the task there says on stdout.
 fn installed_lines(host: &str) -> String {
     let version = version();
-    format!("push: {host}: sending gate {version}\npush: {host}: installed gate {version}\n")
+    format!(
+        "push: {host}: sending gate {version}\npush: {host}: installed gate {version}\n{}",
+        desktop_lines(host)
+    )
 }
 
-/// Asserts `outcome` is a push that installed the built gate on [`HOST`], with nothing on stderr.
+/// The lines a push that installed the helper on `host` and registered the task there says after its gate lines.
+fn desktop_lines(host: &str) -> String {
+    format!("push: {host}: installed the desktop helper\npush: {host}: registered the desktop task\n")
+}
+
+/// Asserts `outcome` is a push that installed the built gate and the helper on [`HOST`] and registered the task there,
+/// with nothing on stderr.
 fn assert_installed(case: &Case, outcome: &Outcome) {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(unix(&outcome.stdout), installed_lines(HOST), "{outcome:?}");
@@ -186,6 +217,10 @@ fn assert_installed(case: &Case, outcome: &Outcome) {
     assert_holds(
         &builder_bin(case, HOST).join("gate.exe"),
         &fs::read(installed_gate(case)).expect("the installed gate can be read"),
+    );
+    assert_holds(
+        &builder_bin(case, HOST).join(HELPER),
+        &fs::read(installed_helper(case)).expect("the installed helper can be read"),
     );
 }
 
@@ -210,7 +245,7 @@ fn a_push_installs_on_a_builder_with_no_gate() {
     assert_installed(&case, &outcome);
     assert_eq!(
         names(&builder_bin(&case, HOST)),
-        ["gate.exe", "push.lock"],
+        [HELPER, "gate.exe", "push.lock"],
         "nothing else is left in the builder's install folder, the lock's plain file aside"
     );
     assert_eq!(calls(&steps), ["push"]);
@@ -237,17 +272,24 @@ fn a_push_sends_the_exe_compressed_and_installs_it_whole() {
         sent.len()
     );
     let text = String::from_utf8(sent).expect("the push fed text");
-    let (_, exe_text) = text.split_once('\n').expect("the push fed the script's line, then the exe");
-    let gzip = STANDARD.decode(exe_text.trim_end()).expect("the push fed base64");
+    let lines: Vec<&str> = text.trim_end().split('\n').collect();
+    assert_eq!(lines.len(), 3, "the push fed the script's line, then the exe's, then the helper's");
+    let gzip = STANDARD.decode(lines[1]).expect("the push fed base64");
     let mut unpacked = Vec::new();
     GzDecoder::new(gzip.as_slice()).read_to_end(&mut unpacked).expect("the push fed gzip");
     assert!(unpacked == exe, "what the push fed decompresses to the installed exe");
 }
 
 #[test]
-fn a_push_to_an_identical_gate_says_already_installed() {
-    let case = push_case("a_push_to_an_identical_gate_says_already_installed");
+fn a_push_to_an_identical_gate_says_already_installed_and_registers_again() {
+    let case = push_case("a_push_to_an_identical_gate_says_already_installed_and_registers_again");
     let theirs = builder_file(&case, HOST, "gate.exe", &fs::read(GATE).expect("the built gate can be read"));
+    builder_file(
+        &case,
+        HOST,
+        HELPER,
+        &fs::read(FAKE_DESKTOP_HELPER).expect("the stand-in helper can be read"),
+    );
     let modified = |path: &Path| -> SystemTime {
         fs::metadata(path)
             .and_then(|metadata| metadata.modified())
@@ -262,12 +304,19 @@ fn a_push_to_an_identical_gate_says_already_installed() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(
         unix(&outcome.stdout),
-        format!("push: {HOST}: sending gate {version}\npush: {HOST}: gate {version} already installed\n"),
-        "{outcome:?}"
+        format!(
+            "push: {HOST}: sending gate {version}\npush: {HOST}: gate {version} already installed\n\
+             push: {HOST}: registered the desktop task\n"
+        ),
+        "an identical gate and helper still register the task again: {outcome:?}"
     );
     assert_eq!(outcome.stderr, "", "{outcome:?}");
     assert_eq!(modified(&theirs), before, "the builder's gate was not written");
-    assert_eq!(names(&builder_bin(&case, HOST)), ["gate.exe", "push.lock"], "nothing was replaced");
+    assert_eq!(
+        names(&builder_bin(&case, HOST)),
+        [HELPER, "gate.exe", "push.lock"],
+        "nothing was replaced"
+    );
 }
 
 #[test]
@@ -290,7 +339,10 @@ fn a_push_reports_the_build_it_sends() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(
         unix(&outcome.stdout),
-        format!("push: {HOST}: sending gate {version}\npush: {HOST}: replaced gate {version}\npush: {HOST}: installed gate {version}\n"),
+        format!(
+            "push: {HOST}: sending gate {version}\npush: {HOST}: replaced gate {version}\npush: {HOST}: installed gate {version}\n{}",
+            desktop_lines(HOST)
+        ),
         "another build of this version is not already installed: {outcome:?}"
     );
     assert_eq!(outcome.stderr, "", "{outcome:?}");
@@ -310,7 +362,10 @@ fn a_push_replaces_an_older_gate() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(
         unix(&outcome.stdout),
-        format!("push: {HOST}: sending gate {version}\npush: {HOST}: replaced gate {OLD_VERSION}\npush: {HOST}: installed gate {version}\n"),
+        format!(
+            "push: {HOST}: sending gate {version}\npush: {HOST}: replaced gate {OLD_VERSION}\npush: {HOST}: installed gate {version}\n{}",
+            desktop_lines(HOST)
+        ),
         "the replaced version is read from the builder's old gate before the move: {outcome:?}"
     );
     assert_eq!(outcome.stderr, "", "{outcome:?}");
@@ -320,9 +375,13 @@ fn a_push_replaces_an_older_gate() {
         &fs::read(installed_gate(&case)).expect("the installed gate can be read"),
     );
     let names = names(&bin);
-    assert_eq!(names.len(), 3, "the gate, one aside copy and the lock, no temp copy: {names:?}");
-    assert_eq!(names[2], "push.lock", "{names:?}");
-    let aside = &names[1];
+    assert_eq!(
+        names.len(),
+        4,
+        "the helper, the gate, one aside copy and the lock, no temp copy: {names:?}"
+    );
+    assert_eq!(names[3], "push.lock", "{names:?}");
+    let aside = &names[2];
     assert!(is_aside_name(aside), "the old gate is left aside for a later push to delete: {names:?}");
     assert_holds(&bin.join(aside), &old);
 }
@@ -341,15 +400,22 @@ fn a_verified_install_deletes_older_aside_copies_but_keeps_its_own() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(
         unix(&outcome.stdout),
-        format!("push: {HOST}: sending gate {version}\npush: {HOST}: replaced gate {OLD_VERSION}\npush: {HOST}: installed gate {version}\n"),
+        format!(
+            "push: {HOST}: sending gate {version}\npush: {HOST}: replaced gate {OLD_VERSION}\npush: {HOST}: installed gate {version}\n{}",
+            desktop_lines(HOST)
+        ),
         "{outcome:?}"
     );
     assert_eq!(outcome.stderr, "", "{outcome:?}");
     let bin = builder_bin(&case, HOST);
     let names = names(&bin);
-    assert_eq!(names.len(), 3, "the gate, its own aside copy and the lock: {names:?}");
-    assert_eq!((names[0].as_str(), names[2].as_str()), ("gate.exe", "push.lock"), "{names:?}");
-    let own = &names[1];
+    assert_eq!(names.len(), 4, "the helper, the gate, its own aside copy and the lock: {names:?}");
+    assert_eq!(
+        (names[0].as_str(), names[1].as_str(), names[3].as_str()),
+        (HELPER, "gate.exe", "push.lock"),
+        "{names:?}"
+    );
+    let own = &names[2];
     assert!(
         own != ASIDE && is_aside_name(own),
         "the older aside copy was deleted, the push's own kept: {names:?}"
@@ -372,7 +438,8 @@ fn a_push_tries_every_builder_and_fails_if_one_did() {
         text,
         format!(
             "push: {HOST}: sending gate {version}\npush: {HOST} failed: {REFUSED}\n\
-             push: {OTHER_HOST}: sending gate {version}\npush: {OTHER_HOST}: installed gate {version}\n"
+             push: {OTHER_HOST}: sending gate {version}\npush: {OTHER_HOST}: installed gate {version}\n{}",
+            desktop_lines(OTHER_HOST)
         ),
         "the builder after the failed one is tried too"
     );
@@ -406,7 +473,7 @@ fn a_held_aside_copy_is_left_silently() {
     assert_eq!(ran.code, Some(0), "the process running the aside copy ran to its end: {ran:?}");
     assert_eq!(
         names(&builder_bin(&case, HOST)),
-        ["gate.exe", ASIDE, "push.lock"],
+        [HELPER, "gate.exe", ASIDE, "push.lock"],
         "an aside copy a process runs is left, and left silently, as install leaves it"
     );
 }
@@ -420,7 +487,11 @@ fn an_unheld_aside_copy_is_cleaned_up_after_a_verified_install() {
     let outcome = push(&case, &steps);
 
     assert_installed(&case, &outcome);
-    assert_eq!(names(&builder_bin(&case, HOST)), ["gate.exe", "push.lock"], "the aside copy was deleted");
+    assert_eq!(
+        names(&builder_bin(&case, HOST)),
+        [HELPER, "gate.exe", "push.lock"],
+        "the aside copy was deleted"
+    );
 }
 
 #[test]
@@ -434,7 +505,7 @@ fn a_stale_temp_copy_does_not_stop_a_push() {
     assert_installed(&case, &outcome);
     assert_eq!(
         names(&builder_bin(&case, HOST)),
-        ["gate.exe", "push.lock"],
+        [HELPER, "gate.exe", "push.lock"],
         "the stale temp copy was deleted"
     );
 }
@@ -653,4 +724,75 @@ fn a_push_with_no_installed_gate_tries_no_builder() {
         "{outcome:?}"
     );
     assert_eq!(calls(&steps), Vec::<String>::new(), "no builder was called");
+}
+
+#[test]
+fn a_push_with_no_installed_desktop_helper_tries_no_builder() {
+    let case = Case::new("a_push_with_no_installed_desktop_helper_tries_no_builder");
+    install_gate_alone(&case);
+    route(&case, &json!({ "host": HOST, "repos": {} }));
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push(&case, &steps);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        format!(
+            "push: no installed desktop helper at {}; run tools/install.ps1\n",
+            shown(&installed_helper(&case))
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(calls(&steps), Vec::<String>::new(), "no builder was called");
+}
+
+#[test]
+fn a_failed_registration_is_said_on_the_builder_s_line_and_push_exits_0() {
+    let case = push_case("a_failed_registration_is_said_on_the_builder_s_line_and_push_exits_0");
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = finish(push_command(&case, &steps, FAKE_SSH, &["--test-push-register", "fail"]));
+
+    let version = version();
+    assert_eq!(outcome.code, Some(0), "a failed registration alone fails no push: {outcome:?}");
+    assert_eq!(
+        unix(&outcome.stdout),
+        format!(
+            "push: {HOST}: sending gate {version}\npush: {HOST}: installed gate {version}\n\
+             push: {HOST}: installed the desktop helper\npush: {HOST}: desktop task not registered: the test seam refused\n"
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_holds(
+        &builder_bin(&case, HOST).join(HELPER),
+        &fs::read(installed_helper(&case)).expect("the installed helper can be read"),
+    );
+}
+
+/// A builder whose helper name is a folder, which no file read or move takes, fails the helper's install after gate.exe
+/// is in place: the push fails that builder and exits 1, and no registration is said.
+#[test]
+fn a_failed_helper_install_fails_the_push() {
+    let case = push_case("a_failed_helper_install_fails_the_push");
+    let helper = builder_bin(&case, HOST).join(HELPER);
+    fs::create_dir_all(&helper).expect("a folder can be made at the helper's name");
+    let steps = steps(&case, &["ok"]);
+
+    let outcome = push(&case, &steps);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stdout),
+        format!("push: {HOST}: sending gate {}\n", version()),
+        "{outcome:?}"
+    );
+    let stderr = unix(&outcome.stderr);
+    assert!(
+        stderr.starts_with(&format!("push: {HOST} failed: could not install {}: ", shown(&helper))) && stderr.lines().count() == 1,
+        "one failure line naming the helper: {outcome:?}"
+    );
+    assert!(helper.is_dir(), "the folder is left as it was");
 }

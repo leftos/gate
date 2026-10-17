@@ -428,7 +428,7 @@ pub struct CutoverSeams {
 /// A valid `gate push`, which takes no words: only the hidden seams the black-box suite gives it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PushRequest {
-    /// The hidden `--test-*` flags that set the push's ssh and bound.
+    /// The hidden `--test-*` flags that set the push's ssh, bound and desktop task registration.
     pub seams: PushSeams,
 }
 
@@ -500,4 +500,7 @@ pub struct PushSeams {
     pub ssh: Option<PathBuf>,
     /// How long each builder's call may take before it is killed, in milliseconds (`--test-push-bound-ms`).
     pub bound_ms: Option<u64>,
+    /// What each builder's registration of the desktop task does in place of the Task Scheduler's work, `true` for
+    /// `ok` (`--test-push-register ok|fail`): the pushed gate's `box register-desktop` is given `--test-box-register`.
+    pub register_ok: Option<bool>,
 }

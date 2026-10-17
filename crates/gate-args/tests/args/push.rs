@@ -34,13 +34,38 @@ fn push_is_in_the_usage() {
 #[test]
 fn push_seams_parse_with_the_feature() {
     assert_eq!(
-        invocation(&["push", "--test-push-ssh", r"C:\suite\fake-ssh.exe", "--test-push-bound-ms=250"]),
+        invocation(&[
+            "push",
+            "--test-push-ssh",
+            r"C:\suite\fake-ssh.exe",
+            "--test-push-bound-ms=250",
+            "--test-push-register",
+            "ok"
+        ]),
         Invocation::Push(PushRequest {
             seams: PushSeams {
                 ssh: Some(r"C:\suite\fake-ssh.exe".into()),
                 bound_ms: Some(250),
+                register_ok: Some(true),
             },
         })
+    );
+    assert_eq!(
+        invocation(&["push", "--test-push-register=fail"]),
+        Invocation::Push(PushRequest {
+            seams: PushSeams {
+                register_ok: Some(false),
+                ..PushSeams::default()
+            },
+        })
+    );
+    assert_eq!(
+        problems(&["push", "--test-push-register", "skip"]),
+        ["gate: --test-push-register must be ok or fail, got 'skip'"]
+    );
+    assert_eq!(
+        problems(&["push", "--test-push-register", "ok", "--test-push-register", "fail"]),
+        ["gate: --test-push-register is given twice"]
     );
     assert_eq!(
         problems(&["push", "--test-push-bound-ms", "0"]),
@@ -78,7 +103,7 @@ fn push_seams_parse_with_the_feature() {
 #[cfg(not(feature = "test-seams"))]
 #[test]
 fn push_seams_are_unknown_without_the_feature() {
-    for flag in ["--test-push-ssh", "--test-push-bound-ms"] {
+    for flag in ["--test-push-ssh", "--test-push-bound-ms", "--test-push-register"] {
         assert_eq!(
             problems(&["push", flag, "5"]),
             [format!("gate: unknown option {flag}"), "gate: unexpected argument 5".to_owned()],

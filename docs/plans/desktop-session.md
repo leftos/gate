@@ -233,7 +233,7 @@ The decision:
 
 Worst case: the second binary. `push.rs` gains a second file in its stdin protocol, along with `install.ps1`, `suite/install.rs`, `suite/push.rs` and fake-ssh. Version skew between the two files is caught by the HELLO check and becomes a `desktop` refusal.
 
-**D2. Registering the task.** Generate the task XML with a pure, unit-tested function. Register it through COM `ITaskFolder::RegisterTask(..., TASK_CREATE_OR_UPDATE, TASK_LOGON_INTERACTIVE_TOKEN)` with the K settings, at `\gate\desktop-helper`. The command is a hidden verb (`gate box register-desktop`) that builder setup runs once over ssh. An elevated session-0 process can register a same-user interactive-token task with no password; the spike measured that. The box checks the definition on every run (K).
+**D2. Registering the task.** Generate the task XML with a pure, unit-tested function. Register it through COM `ITaskFolder::RegisterTask(..., TASK_CREATE_OR_UPDATE, TASK_LOGON_INTERACTIVE_TOKEN)` with the K settings, at `\gate\desktop-helper`. The command is a hidden verb (`gate box register-desktop`) that `gate push` runs on every builder after it installs the helper beside gate.exe (the script `tools/install.ps1` places the helper first; the push places gate.exe first), and that builder setup may run by hand over ssh. An elevated session-0 process can register a same-user interactive-token task with no password; the spike measured that. The box checks the definition on every run (K).
 
 The verb registers the task in the folder `\gate`, makes the folder when it is missing, and gives both the same protected descriptor: owner Administrators, full access for SYSTEM and Administrators, read for the builder user's SID. The string the code writes is `O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;<user SID>)`; Windows reads it back as `O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;<user SID>)`, the `AI` being the auto-inherited flag it sets, so a hand check compares the ACEs and not the flags.
 
@@ -241,7 +241,7 @@ A task is registered with `TASK_DONT_ADD_PRINCIPAL_ACE`, so the user gets no wri
 
 A folder or task that already exists with a weaker owner or DACL is refused, never adopted or repaired: whoever could change it could have replaced the task the box then runs. The verb says `gate-register: failed: the task is set up wrong: <what differs>`. To recover from a squatted `\gate` folder or task, an administrator deletes it on the builder (Task Scheduler, or `schtasks /delete /tn \gate\desktop-helper`, and the folder if it too is the squatter's), then runs the verb again.
 
-Alternative: `gate push` re-registers on every push. That keeps the task in step with the exe, but push no longer "only replaces files", so it is an owner question.
+`gate push` re-registers on every push, which keeps the task in step with the exe; push no longer only replaces files. A failed registration is said on that builder's line and does not change push's exit code.
 
 Worst case: a builder that skipped setup refuses every desktop run with a why naming the verb, and the run goes local.
 

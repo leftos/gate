@@ -11,6 +11,10 @@ use crate::request::{
 };
 use crate::values;
 
+/// The values `--test-push-register` takes: each builder's registration succeeds, or fails as the box's seam refusing.
+#[cfg(feature = "test-seams")]
+const PUSH_REGISTER_RESULTS: &[&str] = &["ok", "fail"];
+
 /// The lookup a bare `--env NAME` word forwards `NAME`'s value from: the gate's own environment, unless a test built the
 /// builder with one of its own.
 #[derive(Clone, Copy)]
@@ -100,6 +104,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     PushBoundMs,
     #[cfg(feature = "test-seams")]
+    PushRegister,
+    #[cfg(feature = "test-seams")]
     ProbeLimitMs,
     #[cfg(feature = "test-seams")]
     WarmWaitMs,
@@ -176,7 +182,7 @@ pub(crate) struct RunBuilder {
     /// `gate cutover`'s own seams, `--test-confirm-ms` and `--test-cutover-interrupt-after-list`; its poll and
     /// still-waiting period are read into `test_seams`, as a run's are.
     cutover_seams: CutoverSeams,
-    /// `gate push`'s own seams, `--test-push-ssh` and `--test-push-bound-ms`.
+    /// `gate push`'s own seams, `--test-push-ssh`, `--test-push-bound-ms` and `--test-push-register`.
     push_seams: PushSeams,
     /// `gate check`'s `--builder <host>`.
     builder: Option<String>,
@@ -354,6 +360,8 @@ impl RunBuilder {
             ValueOption::PushSsh => self.push_seams.ssh = Some(PathBuf::from(value)),
             #[cfg(feature = "test-seams")]
             ValueOption::PushBoundMs => self.push_seams.bound_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::PushRegister => self.push_seams.register_ok = Some(values::remote_call(spelled, value, PUSH_REGISTER_RESULTS)? == "ok"),
             #[cfg(feature = "test-seams")]
             ValueOption::ProbeLimitMs => self.check_seams.probe_limit_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
@@ -562,7 +570,7 @@ impl RunBuilder {
         })
     }
 
-    /// The push request, its seams the ssh and bound read, or every problem found.
+    /// The push request, its seams the ssh, bound and registration read, or every problem found.
     pub(crate) fn finish_push(self) -> Result<PushRequest, Vec<Problem>> {
         if !self.problems.is_empty() {
             return Err(self.problems);

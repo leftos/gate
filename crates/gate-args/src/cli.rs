@@ -218,6 +218,7 @@ fn push_option(name: &str) -> Option<RunOption> {
     match name {
         "test-push-ssh" => Some(RunOption::Value(ValueOption::PushSsh)),
         "test-push-bound-ms" => Some(RunOption::Value(ValueOption::PushBoundMs)),
+        "test-push-register" => Some(RunOption::Value(ValueOption::PushRegister)),
         _ => None,
     }
 }

@@ -1,10 +1,15 @@
-//! `gate push`: copies the installed `%LOCALAPPDATA%\gate\bin\gate.exe` to every builder `remote.json` names, one
-//! after another. Each builder gets one ssh call whose line is a short PowerShell bootstrap, [`BOOTSTRAP`], sent
-//! encoded; ssh's stdin carries the install script, [`SCRIPT`], as one line of base64, then the exe compressed with gzip,
-//! as base64 text. The bootstrap reads the script's line and runs it in the bootstrap's scope; the script reads the
-//! rest, decompresses it, checks the copy's SHA-256 and installs it on the builder as `tools/install.ps1` installs
-//! here, with the old exe set aside, and says what it did on `gate-push: ` lines, which this side reads into the
-//! `push: ` lines. Every builder is tried; one that failed makes the exit 1.
+//! `gate push`: copies the installed `%LOCALAPPDATA%\gate\bin\gate.exe` and the desktop helper beside it to every
+//! builder `remote.json` names, one after another, and registers the desktop task there. Each builder gets one ssh call
+//! whose line is a short PowerShell bootstrap, [`BOOTSTRAP`], sent encoded; ssh's stdin carries the install script,
+//! [`SCRIPT`], as one line of base64, then the exe compressed with gzip, as one line of base64, then the helper the same
+//! way. The bootstrap reads the script's line and runs it in the bootstrap's scope; the script reads the rest,
+//! decompresses both, checks each copy's SHA-256 and installs each on the builder the way `tools/install.ps1` installs
+//! a file here, with the old file set aside. The order differs: `tools/install.ps1` places the helper first, while the
+//! builder places gate.exe first and the helper after it, so a helper that cannot be placed still leaves the builder's
+//! gate updated; the version skew a push leaves between the two shows as `desktop` refusals, which is accepted. Last
+//! it runs the installed gate's `box register-desktop`, and says what it did on `gate-push: ` lines, which this side
+//! reads into the `push: ` lines. Every builder is tried; one whose install failed makes the exit 1, and a
+//! registration that failed is said on that builder's line alone.
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -55,6 +60,14 @@ const PWSH: &str = "pwsh -NoProfile -NonInteractive -OutputFormat Text -EncodedC
 const ERROR_SHARING_VIOLATION: i32 = 32;
 /// The stand-in for the exe's SHA-256, as upper-case hex, in [`SCRIPT`].
 const SHA_SLOT: &str = "@SHA@";
+/// The stand-in for the desktop helper's SHA-256, as upper-case hex, in [`SCRIPT`].
+const HELPER_SHA_SLOT: &str = "@HSHA@";
+/// The stand-in for the expression that registers the desktop task in [`SCRIPT`]: it gives the script's `Reg` answer, a
+/// table of the exit status `c` and output lines `r`, else the seconds `t` it was killed at, else why it could not run, `x`.
+const REGISTER_SLOT: &str = "@REGISTER@";
+/// How the builder registers the desktop task: the installed gate's `box register-desktop`, killed with its process tree
+/// after 60 s.
+const REGISTER: &str = "Reg $g 'box register-desktop' 60";
 
 /// What the push line runs: it reads stdin's first line, [`SCRIPT`] as base64 of its UTF-8, and runs it dot-sourced,
 /// so the script's variables, `$lock` among them, and its functions live in one scope, the bootstrap's. Both read
@@ -62,30 +75,48 @@ const SHA_SLOT: &str = "@SHA@";
 const BOOTSTRAP: &str = "$l=[Console]::In.ReadLine();. ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($l))))";
 
 /// The builder script, run by [`BOOTSTRAP`], as `tools/install.ps1` installs: on a pwsh older than 7.2, whose .NET
-/// lacks what its file checks call, it says `failed` and touches nothing. It reads the rest of stdin, the exe as
+/// lacks what its file checks call, it says `failed` and touches nothing. It reads the next line of stdin, the exe as
 /// base64 of its gzip, decompresses it, and refuses bytes whose SHA-256 is not the one this side put in for
-/// [`SHA_SLOT`]. It then adds its file checks, a small C# type, and fails before anything is touched when that cannot
-/// be done. In `%LOCALAPPDATA%\gate\bin`, made when missing and refused when it is a link, it first holds `push.lock`
+/// [`SHA_SLOT`]; then the rest of stdin, the desktop helper the same way, checked against [`HELPER_SHA_SLOT`]. It then
+/// adds its file checks, a small C# type, and fails before anything is touched when that cannot be done. Every line it
+/// says has its line breaks made spaces, so no text can say a second fact. In `%LOCALAPPDATA%\gate\bin`, made when
+/// missing and refused when it is a link, it first holds `push.lock`
 /// open, unshared, to its end, so a second push to the builder at once says `failed` and touches nothing. `push.lock` is
 /// opened without following a link and refused as a link when it is one, a second name of another file, a folder or a
 /// junction; the plain file is left in place, since the open handle is the lock. It deletes each `gate.exe.<pid>.tmp`
-/// of another pid that no process holds, saying `note` and why for one it cannot delete. With a `gate.exe` of the same
-/// SHA-256 it says `same` and its version; else it writes `gate.exe.<pid>.tmp` afresh and reads its file id, the volume
-/// serial number and the 128-bit id within the volume, from the handle that wrote it; the rename into place keeps the
-/// id. It moves the old exe aside to `gate.exe.<yyyyMMddHHmmss>.<pid>.old` and the temp into place, never by force,
-/// checks the installed copy's SHA-256 and that it answers `--version` with `gate <version>`, and on a failure, the
+/// and `gate-desktop-helper.exe.<pid>.tmp` of another pid that no process holds, saying `note` and why for one it cannot
+/// delete. With a `gate.exe` of the same SHA-256 it says `same` and its version; else it writes `gate.exe.<pid>.tmp`
+/// afresh and reads its file id, the volume serial number and the 128-bit id within the volume, from the handle that
+/// wrote it; the rename into place keeps the id. It moves the old exe aside to `gate.exe.<yyyyMMddHHmmss>.<pid>.old`
+/// and the temp into place, never by force, checks the installed copy's SHA-256, then holds it open, shared for reading
+/// only, checks the SHA-256 again through that handle and, while it is held, that it answers `--version` with
+/// `gate <version>`, and on a failure, the
 /// check's own included, moves the aside copy back, or removes the installed copy when there was no old exe, but only
 /// while `gate.exe` is missing or still the push's own file, the one with the temp copy's file id. An id it cannot
 /// read is tried three times, 300 ms apart, and a file gone at any try or 300 ms after the last counts as missing. Over
 /// a missing one it moves never by force: one another process placed is left as it is. Then it says `replaced` and
 /// the old version when it read one, and `installed` and the new one. Only an installed gate that answers lets it
-/// delete the `gate.exe.*.old` copies no process holds, its own aside copy kept, with the same `note` for one it cannot
-/// delete or a folder it cannot list; a push that ends with no such gate, a failed one included, keeps every aside
-/// copy, and says `kept` and their number when there are any and it ends with `gate.exe` missing or one it could not
-/// verify in place. A failure says `failed` and why, and exits 1. Each version read is bounded at 30 s, and a version
-/// read that is killed at its bound is waited for up to 10 s more; one that cannot be stopped says `note` and why.
+/// delete the `gate.exe.*.old` and `gate-desktop-helper.exe.*.old` copies no process holds, its own aside copy kept,
+/// with the same `note` for one it cannot delete or a folder it cannot list; a push that ends with no such gate, a
+/// failed one included, keeps every aside copy, and says `kept` and their number when there are any and it ends with
+/// `gate.exe` missing or one it could not verify in place. With `gate.exe` in place, installed or the same, it installs
+/// the helper beside it as `gate-desktop-helper.exe` unless that holds the same bytes already: it writes
+/// `gate-desktop-helper.exe.<pid>.tmp` afresh and reads its file id from the handle that wrote it, moves an old helper
+/// aside to `gate-desktop-helper.exe.<yyyyMMddHHmmss>.<pid>.old`, moves the temp into place, never by force, checks
+/// that the helper in place has the temp's file id and the pushed SHA-256, and says `helper-installed`. A move into
+/// place or a check that fails puts the old helper back, or removes the push's own copy when there was none, but
+/// leaves a helper another process placed as it is, and says where the old one is when it cannot be put back; the
+/// failure says, after its reason, that gate.exe was installed, and where its previous copy is, or that it was there
+/// already. Last it holds `gate.exe` open, shared for reading only, checks its SHA-256 through that handle, and while
+/// it is held runs [`REGISTER_SLOT`]'s command, killed with its process tree after 60 s: it says `registered` and the
+/// task and user when the command said `gate-register: registered ` and exited 0, else `unregistered` and the
+/// command's `gate-register: failed: ` text, else its last line, else `exit` and its status, or that gate.exe changed
+/// before registration, that it did not finish in its time, or why it could not run; either way it exits 0. A failure
+/// says `failed` and why, and exits 1, a failed helper install included, which tries no registration. Each version
+/// read is bounded at 30 s, and a version read that is killed at its bound is waited for up to 10 s more; one that
+/// cannot be stopped says `note` and why.
 const SCRIPT: &str = r#"$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
-function Say($k,$t){[Console]::Out.WriteLine("gate-push: $k $t")}
+function Say($k,$t){$t="$t" -replace '[\r\n]+',' ';[Console]::Out.WriteLine("gate-push: $k $t")}
 function Tally{try{$n=@(Get-ChildItem -LiteralPath $dir -File|?{$_.Name -like 'gate.exe.*.old'}).Count;if($n){Say kept $n}}
 catch{Say note "could not list ${dir}: $($_.Exception.Message)"}}
 function Fail($t){if($locked -and ($st.u -or !(Test-Path -LiteralPath $g))){Tally};Say failed $t;exit 1}
@@ -97,7 +128,7 @@ if(($o.Result -split '\r?\n')[0] -notmatch '^gate\s+(.+?)\s*$'){return ''};$Matc
 function Held($p){try{[IO.File]::Open($p,'Open','ReadWrite','None').Dispose();$false}catch{$_.Exception.GetBaseException().HResult -eq -2147024864}}
 function Drop($p){Remove-Item -LiteralPath $p -Force -EA Ignore}
 function Purge($p){try{Remove-Item -LiteralPath $p -Force}catch{if(!(Held $p)){Say note "could not delete ${p}: $($_.Exception.Message)"}}}
-function Clean{try{$fs=@(Get-ChildItem -LiteralPath $dir -File|?{$_.Name -like 'gate.exe.*.old' -and (Join-Path $dir $_.Name) -ne $a})}
+function Clean{try{$fs=@(Get-ChildItem -LiteralPath $dir -File|?{($_.Name -like 'gate.exe.*.old' -or $_.Name -like 'gate-desktop-helper.exe.*.old') -and (Join-Path $dir $_.Name) -ne $a})}
 catch{Say note "could not delete the aside copies in ${dir}: $($_.Exception.Message)";return}
 foreach($f in $fs){Purge $f.FullName}}
 function Mine{foreach($i in 1..3){if(!(Test-Path -LiteralPath $g)){return 'missing'}
@@ -116,11 +147,20 @@ $st.u=0;Fail "$m; the previous gate.exe is back in place"}
 $pv=$PSVersionTable.PSVersion;if([version]"$($pv.Major).$($pv.Minor)" -lt [version]'7.2'){Fail "the builder needs pwsh 7.2 or later (it has $pv)"}
 if(!$env:LOCALAPPDATA){Fail 'LOCALAPPDATA is not set'}
 $dir=Join-Path $env:LOCALAPPDATA 'gate\bin';$g=Join-Path $dir 'gate.exe';$a=$null;$ci="could not install ${g}:";$st=@{u=0;i=''}
-try{$u=[IO.MemoryStream]::new()
-$z=[IO.MemoryStream]::new([Convert]::FromBase64String([Console]::In.ReadToEnd()))
-[IO.Compression.GZipStream]::new($z,[IO.Compression.CompressionMode]::Decompress).CopyTo($u)
-$b=$u.ToArray()}catch{Fail "the copy could not be read: $($_.Exception.Message)"}
-if([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($b)) -ne '@SHA@'){Fail 'the copy arrived damaged'}
+function Unzip($t){$u=[IO.MemoryStream]::new();$z=[IO.MemoryStream]::new([Convert]::FromBase64String($t))
+[IO.Compression.GZipStream]::new($z,[IO.Compression.CompressionMode]::Decompress).CopyTo($u);,$u.ToArray()}
+function Sha($x){[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($x))}
+function Hash($s){[Convert]::ToHexString([Security.Cryptography.SHA256]::Create().ComputeHash($s))}
+function Reg($p,$w,$n){try{$x=[Diagnostics.Process]::Start([Diagnostics.ProcessStartInfo]@{FileName=$p;Arguments=$w;RedirectStandardOutput=1;RedirectStandardError=1;UseShellExecute=0})}
+catch{return @{x="could not run ${p}: $($_.Exception.Message)"}}
+$o=$x.StandardOutput.ReadToEndAsync();$e=$x.StandardError.ReadToEndAsync()
+if(!$x.WaitForExit($n*1000)){try{$x.Kill($true)}catch{Say note "could not stop the registration: $($_.Exception.Message)"}
+[void]$x.WaitForExit(10000);return @{t=$n}}
+$x.WaitForExit();@{c=$x.ExitCode;r=@("$($o.Result)`n$($e.Result)" -split '\r?\n')}}
+try{$b=Unzip ([Console]::In.ReadLine())}catch{Fail "the copy could not be read: $($_.Exception.Message)"}
+if((Sha $b) -ne '@SHA@'){Fail 'the copy arrived damaged'}
+try{$hb=Unzip ([Console]::In.ReadToEnd())}catch{Fail "the desktop helper's copy could not be read: $($_.Exception.Message)"}
+if((Sha $hb) -ne '@HSHA@'){Fail "the desktop helper's copy arrived damaged"}
 try{Add-Type -TypeDefinition 'using System;using System.ComponentModel;using System.IO;using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 public static class GateFile{const uint ReadWrite=0xC0000000,OpenAlways=4,NoFollow=0x200080,Folder=0x10,Link=0x400;
@@ -148,8 +188,9 @@ try{$lock=[GateFile]::OpenLock($pl)}catch{$x=$_.Exception.GetBaseException()
 if($x.HResult -eq -2147024864){Fail 'another gate push is installing on this builder'};Fail "could not lock ${dir}: $($x.Message)"}
 if($null -eq $lock){Fail "$pl is a link"}
 $locked=1
-foreach($f in Get-ChildItem -LiteralPath $dir -File|?{$_.Name -match '^gate\.exe\.(\d+)\.tmp$' -and $Matches[1] -ne $PID}){Purge $f.FullName}
-if((Test-Path -LiteralPath $g) -and (Get-FileHash -LiteralPath $g).Hash -eq '@SHA@'){$v=Ver $g;if($v){Clean}else{Tally};Say same $v;exit 0}
+foreach($f in Get-ChildItem -LiteralPath $dir -File|?{$_.Name -match '^gate(-desktop-helper)?\.exe\.(\d+)\.tmp$' -and $Matches[2] -ne $PID}){Purge $f.FullName}
+if((Test-Path -LiteralPath $g) -and (Get-FileHash -LiteralPath $g).Hash -eq '@SHA@'){$v=Ver $g;if($v){Clean}else{Tally};Say same $v
+$gs=if($v){"; gate $v was already installed"}else{'; the same gate.exe was already installed'}}else{
 $tmp="$g.$PID.tmp";Drop $tmp
 try{$s=[IO.File]::Open($tmp,'CreateNew','Write','None');try{$s.Write($b,0,$b.Length);$st.i=[GateFile]::Id($s.SafeFileHandle)}finally{$s.Dispose()}}
 catch{Drop $tmp;Fail "$ci $($_.Exception.Message)"}
@@ -161,10 +202,47 @@ if(!$a){Fail "$ci $m; nothing was installed and no earlier gate.exe existed"};Ba
 $st.u=1
 try{$h=(Get-FileHash -LiteralPath $g).Hash}catch{Back "$ci $($_.Exception.Message)"}
 if($h -ne '@SHA@'){Back 'the installed copy does not match'}
-$v=Ver $g;if(!$v){Back 'the installed gate.exe does not run'}
+try{$gh=[IO.File]::Open($g,'Open','Read','Read');try{$h=Hash $gh;if($h -eq '@SHA@'){$v=Ver $g}}finally{$gh.Dispose()}}
+catch{Back "$ci $($_.Exception.Message)"}
+if($h -ne '@SHA@'){Back 'the installed copy does not match'}
+if(!$v){Back 'the installed gate.exe does not run'}
 Clean
 if($old){Say replaced $old}
 Say installed $v
+$gs=if($a){"; gate $v is installed and its previous copy is at $a"}else{"; gate $v is installed"}}
+$st.u=0;$hp=Join-Path $dir 'gate-desktop-helper.exe';$hc="could not install ${hp}:";$ha=$null;$hi=''
+function HFail($t){Fail "$t$gs"}
+function HMine{if(!(Test-Path -LiteralPath $hp)){return 'missing'};try{if([GateFile]::Of($hp) -eq $hi){'mine'}else{'foreign'}}catch{'foreign'}}
+function HBack($m){$w=HMine
+if($w -eq 'foreign'){$t="$m; another desktop helper was placed meanwhile and was left as it is";if($ha){$t+=", the previous desktop helper is at $ha"};HFail $t}
+if(!$ha){if($w -eq 'mine'){try{Remove-Item -LiteralPath $hp -Force}catch{HFail "$m; the copy at $hp could not be removed: $($_.Exception.Message)"}}
+HFail "$m; no earlier desktop helper existed"}
+try{if($w -eq 'mine'){Move-Item -LiteralPath $ha -Destination $hp -Force}else{Move-Item -LiteralPath $ha -Destination $hp}}
+catch{HFail "$m; the previous desktop helper is at $ha"}
+HFail "$m; the previous desktop helper is back in place"}
+try{$hs=if(Test-Path -LiteralPath $hp){Sha ([IO.File]::ReadAllBytes($hp))}else{''}}catch{HFail "$hc $($_.Exception.Message)"}
+if($hs -ne '@HSHA@'){$ht="$hp.$PID.tmp";Drop $ht
+try{$s=[IO.File]::Open($ht,'CreateNew','Write','None');try{$s.Write($hb,0,$hb.Length);$hi=[GateFile]::Id($s.SafeFileHandle)}finally{$s.Dispose()}}
+catch{Drop $ht;HFail "$hc $($_.Exception.Message)"}
+if($hs){$ha="$hp.$(Get-Date -Format yyyyMMddHHmmss).$PID.old"
+try{Move-Item -LiteralPath $hp -Destination $ha -Force}catch{Drop $ht;HFail "$hc $($_.Exception.Message)"}}
+try{Move-Item -LiteralPath $ht -Destination $hp}catch{$m=$_.Exception.Message;Drop $ht;HBack "$hc $m"}
+$ok=$false
+try{$hh=[IO.File]::Open($hp,'Open','Read','Read');try{$ok=([GateFile]::Id($hh.SafeFileHandle) -eq $hi) -and ((Hash $hh) -eq '@HSHA@')}finally{$hh.Dispose()}}
+catch{HBack "$hc $($_.Exception.Message)"}
+if(!$ok){HBack "$hc the installed copy does not match"}
+Say helper-installed}
+$rg=$null
+try{$gh=[IO.File]::Open($g,'Open','Read','Read')
+try{if((Hash $gh) -eq '@SHA@'){$rg=@REGISTER@}else{Say unregistered 'gate.exe changed before registration'}}finally{$gh.Dispose()}}
+catch{Say unregistered "gate.exe could not be held: $($_.Exception.Message)"}
+if($rg){$f=@($rg.r|?{$_ -like 'gate-register: *'});$l=@($rg.r|?{"$_".Trim()})
+if($rg.t){Say unregistered "it did not finish in $($rg.t) s"}
+elseif($null -ne $rg.x){Say unregistered $rg.x}
+elseif($rg.c -eq 0 -and $f.Count -and $f[-1] -match '^gate-register: registered (.+)$'){Say registered $Matches[1]}
+elseif($f.Count -and $f[-1] -match '(?s)^gate-register: failed: (.*)$'){Say unregistered $Matches[1]}
+elseif($l.Count){Say unregistered $l[-1]}else{Say unregistered "exit $($rg.c)"}}
+exit 0
 "#;
 
 /// `gate --version`'s line, matched in any letter case as PowerShell's `-match` does: the version is what follows
@@ -174,7 +252,7 @@ static VERSION: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"(?i)^gat
 /// Runs `gate push` and returns its exit status.
 pub(crate) fn push(request: &PushRequest, environment: &Environment, console: &mut Console) -> u32 {
     let variables: Vec<(OsString, OsString)> = std::env::vars_os().collect();
-    let prepared = match prepared(environment, &variables) {
+    let prepared = match prepared(environment, &variables, request.seams.register_ok) {
         Ok(prepared) => prepared,
         Err(line) => {
             console.err(&line);
@@ -223,9 +301,10 @@ struct Prepared {
     line: String,
 }
 
-/// The push's builders, exe and line, read from `LOCALAPPDATA`, the exe's version read with `variables` as its
-/// environment; else the line saying why there is nothing to push or nowhere to push it.
-fn prepared(environment: &Environment, variables: &[(OsString, OsString)]) -> Result<Prepared, String> {
+/// The push's builders, exe, desktop helper and line, read from `LOCALAPPDATA`, the exe's version read with `variables`
+/// as its environment, each builder's registration done as [`register_command`] says for `register_ok`; else the line
+/// saying why there is nothing to push or nowhere to push it.
+fn prepared(environment: &Environment, variables: &[(OsString, OsString)], register_ok: Option<bool>) -> Result<Prepared, String> {
     let folder = environment
         .local_app_data
         .as_deref()
@@ -236,14 +315,20 @@ fn prepared(environment: &Environment, variables: &[(OsString, OsString)]) -> Re
     let builders = builders(&gate.join("remote.json"))?;
     let bin = gate.join("bin");
     let exe = bin.join("gate.exe");
-    // The lock tools/install.ps1 holds while it replaces and checks the exe, held for the read and the version only;
-    // with no bin folder there is no exe, which the read says.
+    // The lock tools/install.ps1 holds while it replaces and checks the exe and the helper, held for their reads and the
+    // version only; with no bin folder there is no exe, which the read says.
     let lock = if bin.is_dir() { Some(local_lock(&bin)?) } else { None };
     let bytes = installed(&exe)?;
+    let helper = installed_helper(&bin.join(gate_desktop::HELPER_FILE))?;
     let version = shown(&local_version(&exe, variables)?);
     drop(lock);
     let line = push_line();
-    let input = pushed_input(&sha256_hex(&bytes), &bytes);
+    let slots = Slots {
+        sha: &sha256_hex(&bytes),
+        helper_sha: &sha256_hex(&helper),
+        register: &register_command(register_ok),
+    };
+    let input = pushed_input(&slots, &bytes, &helper);
     Ok(Prepared {
         builders,
         input,
@@ -252,15 +337,41 @@ fn prepared(environment: &Environment, variables: &[(OsString, OsString)]) -> Re
     })
 }
 
-/// What a builder's call is fed for `exe`, whose SHA-256 is `sha`: [`script_line`] and a line break, then
-/// [`gzipped`].
-fn pushed_input(sha: &str, exe: &[u8]) -> String {
-    format!("{}\n{}", script_line(sha), gzipped(exe))
+/// What [`SCRIPT`]'s slots hold for one push: the exe's SHA-256, the desktop helper's, and the command that registers
+/// the desktop task.
+struct Slots<'a> {
+    sha: &'a str,
+    helper_sha: &'a str,
+    register: &'a str,
 }
 
-/// [`SCRIPT`] with `sha` put in, as base64 of its UTF-8: one line, as [`BOOTSTRAP`] reads it.
-fn script_line(sha: &str) -> String {
-    STANDARD.encode(SCRIPT.replace(SHA_SLOT, sha))
+/// What a builder's call is fed for `exe` and `helper`, whose SHA-256s `slots` holds: [`script_line`], then the
+/// [`gzipped`] exe, then the [`gzipped`] helper, each on a line of its own.
+fn pushed_input(slots: &Slots<'_>, exe: &[u8], helper: &[u8]) -> String {
+    format!("{}\n{}\n{}", script_line(slots), gzipped(exe), gzipped(helper))
+}
+
+/// [`SCRIPT`] with `slots` put in.
+fn filled(slots: &Slots<'_>) -> String {
+    SCRIPT
+        .replace(SHA_SLOT, slots.sha)
+        .replace(HELPER_SHA_SLOT, slots.helper_sha)
+        .replace(REGISTER_SLOT, slots.register)
+}
+
+/// [`filled`] as base64 of its UTF-8: one line, as [`BOOTSTRAP`] reads it.
+fn script_line(slots: &Slots<'_>) -> String {
+    STANDARD.encode(filled(slots))
+}
+
+/// The command the builder registers the desktop task with: [`REGISTER`], or, given `register_ok` by the
+/// `--test-push-register` seam, the same with the box's `--test-box-register` seam before the verb, so no test reaches
+/// the Task Scheduler.
+fn register_command(register_ok: Option<bool>) -> String {
+    match register_ok {
+        None => REGISTER.to_owned(),
+        Some(ok) => format!("Reg $g 'box --test-box-register {} register-desktop' 60", if ok { "ok" } else { "fail" }),
+    }
 }
 
 /// `exe`'s gzip at the best level, as base64 text.
@@ -328,6 +439,17 @@ fn installed(exe: &Path) -> Result<Vec<u8>, String> {
         return Err(format!("push: no installed gate at {}; run tools/install.ps1", exe.display()));
     }
     fs::read(exe).map_err(|error| format!("push: cannot read {}: {error}", exe.display()))
+}
+
+/// The installed desktop helper's bytes; else the line saying there is none or it cannot be read.
+fn installed_helper(helper: &Path) -> Result<Vec<u8>, String> {
+    if !fs::metadata(helper).is_ok_and(|metadata| metadata.is_file()) {
+        return Err(format!(
+            "push: no installed desktop helper at {}; run tools/install.ps1",
+            helper.display()
+        ));
+    }
+    fs::read(helper).map_err(|error| format!("push: cannot read {}: {error}", helper.display()))
 }
 
 /// The installed exe's version, from its `--version`, a call bounded as a builder's is, at [`VERSION_BOUND`]; else
@@ -586,6 +708,12 @@ enum Fact {
     Same(String),
     Replaced(String),
     Installed(String),
+    /// The desktop helper's bytes changed.
+    HelperInstalled,
+    /// The desktop task was registered.
+    Registered,
+    /// The desktop task was not registered, for this reason.
+    Unregistered(String),
     Failed(String),
 }
 
@@ -600,6 +728,9 @@ fn fact(line: &str) -> Option<Fact> {
         "same" => Some(Fact::Same(text)),
         "replaced" => Some(Fact::Replaced(text)),
         "installed" => Some(Fact::Installed(text)),
+        "helper-installed" => Some(Fact::HelperInstalled),
+        "registered" => Some(Fact::Registered),
+        "unregistered" => Some(Fact::Unregistered(text)),
         "failed" => Some(Fact::Failed(text)),
         _ => None,
     }
@@ -660,9 +791,28 @@ fn ended(host: &str, version: &str, heard: &Heard, facts: &[Fact], bound: Durati
     Err(reason.unwrap_or_else(|| "no answer".to_owned()))
 }
 
-/// The lines of a push whose builder said it holds `version` already, or installed it: `None` when it said neither.
-/// A version the builder could not read is said as `version`, this PC's.
+/// The lines of a push whose builder said it holds `version` already, or installed it, then what it did with the
+/// desktop helper and task ([`desktop`]): `None` when it said neither. A version the builder could not read is said as
+/// `version`, this PC's.
 fn succeeded(host: &str, version: &str, facts: &[Fact]) -> Option<Vec<String>> {
+    let mut out = gate_lines(host, version, facts)?;
+    out.extend(desktop(host, facts));
+    Some(out)
+}
+
+/// The lines saying the desktop helper was installed and whether the desktop task was registered, in the order the
+/// builder said them.
+fn desktop<'a>(host: &'a str, facts: &'a [Fact]) -> impl Iterator<Item = String> + 'a {
+    facts.iter().filter_map(move |fact| match fact {
+        Fact::HelperInstalled => Some(format!("push: {host}: installed the desktop helper")),
+        Fact::Registered => Some(format!("push: {host}: registered the desktop task")),
+        Fact::Unregistered(why) => Some(format!("push: {host}: desktop task not registered: {}", shown(why))),
+        _ => None,
+    })
+}
+
+/// The lines of a push whose builder said it holds `version` already, or installed it: `None` when it said neither.
+fn gate_lines(host: &str, version: &str, facts: &[Fact]) -> Option<Vec<String>> {
     let theirs = |text: &str| if text.is_empty() { version.to_owned() } else { shown(text) };
     for fact in facts {
         if let Fact::Same(same) = fact {
@@ -710,14 +860,45 @@ mod tests {
     use flate2::read::GzDecoder;
 
     use super::{
-        BOOTSTRAP, Call, End, Heard, LINE_CAP, MARKED_CAP, PWSH, SCRIPT, Said, called, encoded_line, gzipped, kept, push_line, pushed_input, said,
-        script_line, sha256_hex, version_of,
+        BOOTSTRAP, Call, End, Fact, Heard, LINE_CAP, MARKED_CAP, PWSH, REGISTER, Said, Slots, called, encoded_line, fact, filled, gzipped, kept,
+        push_line, pushed_input, register_command, said, sha256_hex, version_of,
     };
     use crate::environment::Variables;
     use crate::run::find_program;
 
     const SHA: &str = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+    const HELPER_SHA: &str = "FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210";
     const BOUND: Duration = Duration::from_secs(300);
+    /// The desktop helper every script case pushes.
+    const HELPER: &[u8] = b"a desktop helper";
+    /// The helper's install name on a builder.
+    const HELPER_NAME: &str = "gate-desktop-helper.exe";
+    /// What the script cases register the desktop task with: a stand-in for the gate's `box register-desktop` that says
+    /// it registered the task and exits 0, so no case reaches the Task Scheduler.
+    const REGISTERS: &str = r"@{c=0;r=@('gate-register: registered \gate\desktop-helper for S-1-5-21-0','')}";
+    /// The `registered` fact the script says after [`REGISTERS`].
+    const REGISTERED: &str = r"gate-push: registered \gate\desktop-helper for S-1-5-21-0";
+
+    /// [`super::SCRIPT`] filled for an exe whose SHA-256 is `sha`, the helper [`HELPER`] and the stand-in [`REGISTERS`].
+    fn script_for(sha: &str) -> String {
+        filled(&Slots {
+            sha,
+            helper_sha: &sha256_hex(HELPER),
+            register: REGISTERS,
+        })
+    }
+
+    /// What a builder is fed for `exe`, whose SHA-256 the script checks as `sha`, and `helper`, checked as [`HELPER`]'s,
+    /// the task registered by [`REGISTERS`].
+    fn input_for(sha: &str, exe: &[u8], helper: &[u8]) -> String {
+        let helper_sha = sha256_hex(HELPER);
+        let slots = Slots {
+            sha,
+            helper_sha: &helper_sha,
+            register: REGISTERS,
+        };
+        pushed_input(&slots, exe, helper)
+    }
 
     #[test]
     fn the_push_line_fits_the_cap() {
@@ -741,15 +922,93 @@ mod tests {
         let wide: Vec<u16> = pairs.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
         assert_eq!(String::from_utf16(&wide).expect("the bootstrap is UTF-16"), BOOTSTRAP);
 
-        let input = pushed_input(SHA, b"an exe");
-        let (first, exe) = input.split_once('\n').expect("the script's line ends with a line break");
-        assert_eq!(exe, gzipped(b"an exe"), "the exe follows the script's line");
-        let script = String::from_utf8(STANDARD.decode(first).expect("the script's line is base64")).expect("the script is UTF-8");
-        assert_eq!(script, SCRIPT.replace("@SHA@", SHA));
+        let slots = Slots {
+            sha: SHA,
+            helper_sha: HELPER_SHA,
+            register: REGISTER,
+        };
+        let input = pushed_input(&slots, b"an exe", b"a helper");
+        let lines: Vec<&str> = input.split('\n').collect();
+        assert_eq!(lines.len(), 3, "the script, the exe and the helper, each on a line: {input}");
+        assert_eq!(lines[1], gzipped(b"an exe"), "the exe follows the script's line");
+        assert_eq!(lines[2], gzipped(b"a helper"), "the helper follows the exe's line");
+        let script = String::from_utf8(STANDARD.decode(lines[0]).expect("the script's line is base64")).expect("the script is UTF-8");
+        assert_eq!(script, filled(&slots));
+        for slot in ["@SHA@", "@HSHA@", "@REGISTER@"] {
+            assert!(!script.contains(slot), "{slot} is filled");
+        }
         assert_eq!(
             script.matches(SHA).count(),
+            6,
+            "the hash checks the copy, the installed exe, the copy put in place, the same copy while it is held, once \
+             before its version read and once after, and the exe held for its registration"
+        );
+        assert_eq!(
+            script.matches(HELPER_SHA).count(),
             3,
-            "the hash checks the copy, the installed exe and the copy put in place"
+            "the helper's hash checks its copy, the installed helper and the copy put in place"
+        );
+        assert_eq!(script.matches(REGISTER).count(), 1, "the task is registered once");
+    }
+
+    #[test]
+    fn the_register_seam_gives_the_box_its_own_seam_before_the_verb() {
+        assert_eq!(register_command(None), "Reg $g 'box register-desktop' 60");
+        assert_eq!(register_command(Some(true)), "Reg $g 'box --test-box-register ok register-desktop' 60");
+        assert_eq!(register_command(Some(false)), "Reg $g 'box --test-box-register fail register-desktop' 60");
+    }
+
+    #[test]
+    fn the_desktop_facts_parse() {
+        assert_eq!(fact("gate-push: helper-installed"), Some(Fact::HelperInstalled));
+        assert_eq!(fact(r"gate-push: registered \gate\desktop-helper for S-1-5-21-0"), Some(Fact::Registered));
+        assert_eq!(
+            fact("gate-push: unregistered the test seam refused "),
+            Some(Fact::Unregistered("the test seam refused".to_owned()))
+        );
+        assert_eq!(fact("gate-push: unregistered"), Some(Fact::Unregistered(String::new())));
+        assert_eq!(fact("gate-register: registered x"), None, "the verb's own line states no fact");
+    }
+
+    #[test]
+    fn desktop_facts_map_to_their_lines_after_the_gate_s() {
+        let said = |heard: &Heard| said("b1", "0.2.0", heard, BOUND);
+        assert_eq!(
+            said(&heard(
+                0,
+                &["gate-push: installed 0.2.0", "gate-push: helper-installed", REGISTERED],
+                None
+            )),
+            out(&[
+                "push: b1: installed gate 0.2.0",
+                "push: b1: installed the desktop helper",
+                "push: b1: registered the desktop task"
+            ])
+        );
+        assert_eq!(
+            said(&heard(0, &["gate-push: same 0.2.0", REGISTERED], None)),
+            out(&["push: b1: gate 0.2.0 already installed", "push: b1: registered the desktop task"]),
+            "an identical gate still registers, and a helper of the same bytes says nothing"
+        );
+        assert_eq!(
+            said(&heard(0, &["gate-push: same 0.2.0", "gate-push: unregistered access denied\u{7}"], None)),
+            out(&[
+                "push: b1: gate 0.2.0 already installed",
+                r"push: b1: desktop task not registered: access denied\u{7}"
+            ]),
+            "a failed registration is said on the builder's line and fails nothing"
+        );
+        assert_eq!(
+            said(&heard(
+                1,
+                &[
+                    "gate-push: installed 0.2.0",
+                    r"gate-push: failed could not install D:\x\gate-desktop-helper.exe: denied"
+                ],
+                None
+            )),
+            failure(r"push: b1 failed: could not install D:\x\gate-desktop-helper.exe: denied"),
+            "a failed helper install fails the push, gate.exe installed or not"
         );
     }
 
@@ -949,7 +1208,7 @@ mod tests {
     /// The script run here through local pwsh with `exe` fed, `LOCALAPPDATA` set to `local_app_data`: the
     /// `gate-push: ` lines it said and its end.
     fn run_script(exe: &[u8], local_app_data: &Path) -> Heard {
-        run_script_fed(&pushed_input(&sha256_hex(exe), exe), local_app_data)
+        run_script_fed(&input_for(&sha256_hex(exe), exe, HELPER), local_app_data)
     }
 
     /// The push line run here through local pwsh, fed `input`, `LOCALAPPDATA` set to `local_app_data`: the
@@ -975,8 +1234,8 @@ mod tests {
     #[test]
     fn the_pushed_input_is_the_gzip_of_the_exe_in_base64() {
         let exe = stand_in();
-        let input = pushed_input(&sha256_hex(&exe), &exe);
-        let (_, input) = input.split_once('\n').expect("the exe follows the script's line");
+        let input = input_for(&sha256_hex(&exe), &exe, HELPER);
+        let input = input.split('\n').nth(1).expect("the exe follows the script's line");
         let gzip = STANDARD.decode(input).expect("the input is base64");
         let mut unpacked = Vec::new();
         GzDecoder::new(gzip.as_slice()).read_to_end(&mut unpacked).expect("the input is gzip");
@@ -1013,9 +1272,271 @@ mod tests {
         let exe = stand_in();
         let heard = run_script_answering("", &exe, &exe, &local_app_data);
         assert_eq!(heard.end, End::Exited(0), "{heard:?}");
-        assert_eq!(heard.marked, [format!("gate-push: installed {ANSWERED}")], "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            [
+                format!("gate-push: installed {ANSWERED}"),
+                "gate-push: helper-installed ".to_owned(),
+                REGISTERED.to_owned()
+            ],
+            "{heard:?}"
+        );
         let installed = fs::read(local_app_data.join(r"gate\bin\gate.exe")).expect("the exe is installed");
         assert_eq!(sha256_hex(&installed), sha256_hex(&exe));
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_fresh_builder_gets_the_desktop_helper_beside_gate() {
+        let local_app_data = scratch("helper-fresh");
+        let bin = local_app_data.join(r"gate\bin");
+        let exe = stand_in();
+        let heard = run_script_answering("", &exe, &exe, &local_app_data);
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert!(heard.marked.iter().any(|line| line == "gate-push: helper-installed "), "{heard:?}");
+        assert_eq!(fs::read(bin.join(HELPER_NAME)).expect("the helper is installed"), HELPER);
+        assert_eq!(listed(&bin), [HELPER_NAME, "gate.exe", "push.lock"], "no temp or aside copy is left");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_desktop_helper_of_the_same_bytes_is_left_as_it_is() {
+        let local_app_data = builder_with("helper-same", &[(HELPER_NAME, HELPER)]);
+        let bin = local_app_data.join(r"gate\bin");
+        let exe = stand_in();
+        let heard = run_script_answering("", &exe, &exe, &local_app_data);
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            [format!("gate-push: installed {ANSWERED}"), REGISTERED.to_owned()],
+            "no helper-installed for the same bytes: {heard:?}"
+        );
+        assert_eq!(listed(&bin), [HELPER_NAME, "gate.exe", "push.lock"], "the helper was not set aside");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_damaged_desktop_helper_copy_fails_before_anything_is_touched() {
+        let local_app_data = scratch("helper-damaged");
+        let exe = stand_in();
+        let heard = run_script_fed(&input_for(&sha256_hex(&exe), &exe, b"other helper bytes"), &local_app_data);
+        assert_eq!(
+            failed_line(&heard, &local_app_data),
+            "gate-push: failed the desktop helper's copy arrived damaged"
+        );
+        assert!(!local_app_data.join(r"gate\bin").exists(), "nothing was made: {heard:?}");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn the_same_exe_path_still_installs_the_helper_and_registers() {
+        let exe = stand_in();
+        let local_app_data = builder_with("same-registers", &[("gate.exe", exe.as_slice())]);
+        let heard = run_script_answering("", &exe, &exe, &local_app_data);
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            [
+                format!("gate-push: same {ANSWERED}"),
+                "gate-push: helper-installed ".to_owned(),
+                REGISTERED.to_owned()
+            ],
+            "{heard:?}"
+        );
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    /// The facts a fresh install with `register` as its registration's expression says after `gate.exe` and the helper,
+    /// and that it exited 0.
+    fn registration_facts(test: &str, register: &str) -> Vec<String> {
+        let local_app_data = scratch(test);
+        let exe = stand_in();
+        let heard = run_lines("", &answering_with(&sha256_hex(&exe), &exe, register), &exe, &local_app_data);
+        let _ = fs::remove_dir_all(&local_app_data);
+        assert_eq!(heard.end, End::Exited(0), "a registration never fails the push: {heard:?}");
+        let installed = [format!("gate-push: installed {ANSWERED}"), "gate-push: helper-installed ".to_owned()];
+        assert_eq!(heard.marked.get(..2), Some(installed.as_slice()), "{heard:?}");
+        heard.marked[2..].to_vec()
+    }
+
+    #[test]
+    fn a_registration_with_no_verb_line_says_its_last_line() {
+        assert_eq!(
+            registration_facts("register-last-line", "@{c=1;r=@('noise','the last words','  ','')}"),
+            ["gate-push: unregistered the last words"]
+        );
+    }
+
+    #[test]
+    fn a_silent_registration_says_its_exit_status() {
+        assert_eq!(
+            registration_facts("register-silent", "@{c=3;r=@('','')}"),
+            ["gate-push: unregistered exit 3"]
+        );
+    }
+
+    #[test]
+    fn a_registration_that_cannot_run_says_why() {
+        let facts = registration_facts("register-cannot-run", r"Reg 'X:\no\such\gate.exe' 'box register-desktop' 5");
+        assert_eq!(facts.len(), 1, "{facts:?}");
+        assert!(
+            facts[0].starts_with(r"gate-push: unregistered could not run X:\no\such\gate.exe: "),
+            "{facts:?}"
+        );
+    }
+
+    #[test]
+    fn a_registration_message_of_many_lines_says_one_fact() {
+        assert_eq!(
+            registration_facts(
+                "register-many-lines",
+                "@{c=1;r=@(\"gate-register: failed: one`r`ngate-push: registered forged`ntwo\")}"
+            ),
+            ["gate-push: unregistered one gate-push: registered forged two"]
+        );
+    }
+
+    #[test]
+    fn a_registration_past_its_limit_is_killed_and_said() {
+        let facts = registration_facts(
+            "register-timeout",
+            "Reg 'pwsh' '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 60' 1",
+        );
+        assert_eq!(facts, ["gate-push: unregistered it did not finish in 1 s"]);
+    }
+
+    /// The helper an earlier push installed, older than [`HELPER`].
+    const OLDER_HELPER: &[u8] = b"an older desktop helper";
+    /// A helper aside copy an earlier push left, named as the script names one.
+    const HELPER_ASIDE: &str = "gate-desktop-helper.exe.20200101000000.4.old";
+
+    /// The helper aside copies in `bin`, in name order.
+    fn helper_asides(bin: &Path) -> Vec<String> {
+        listed(bin)
+            .into_iter()
+            .filter(|name| {
+                name.starts_with("gate-desktop-helper.exe.")
+                    && Path::new(name).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("old"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_older_desktop_helper_is_set_aside_and_replaced() {
+        let local_app_data = builder_with("helper-older", &[(HELPER_NAME, OLDER_HELPER)]);
+        let bin = local_app_data.join(r"gate\bin");
+        let exe = stand_in();
+        let heard = run_script_answering("", &exe, &exe, &local_app_data);
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert!(heard.marked.iter().any(|line| line == "gate-push: helper-installed "), "{heard:?}");
+        assert_eq!(fs::read(bin.join(HELPER_NAME)).expect("the helper is installed"), HELPER);
+        let asides = helper_asides(&bin);
+        assert_eq!(asides.len(), 1, "the push keeps its own aside copy: {heard:?}");
+        assert_eq!(fs::read(bin.join(&asides[0])).expect("the aside copy is read"), OLDER_HELPER);
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_verified_push_deletes_older_helper_aside_copies() {
+        let local_app_data = builder_with("helper-asides", &[(HELPER_ASIDE, OLDER_HELPER), (HELPER_NAME, OLDER_HELPER)]);
+        let bin = local_app_data.join(r"gate\bin");
+        let exe = stand_in();
+        let heard = run_script_answering("", &exe, &exe, &local_app_data);
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        let asides = helper_asides(&bin);
+        assert_eq!(asides.len(), 1, "only this push's own aside copy is left: {heard:?}");
+        assert_ne!(asides[0], HELPER_ASIDE, "the earlier push's aside copy was deleted");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_stale_helper_temp_copy_is_swept() {
+        let local_app_data = builder_with("helper-stale-temp", &[("gate-desktop-helper.exe.4.tmp", b"half a helper")]);
+        let bin = local_app_data.join(r"gate\bin");
+        let exe = stand_in();
+        let heard = run_script_answering("", &exe, &exe, &local_app_data);
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert_eq!(listed(&bin), [HELPER_NAME, "gate.exe", "push.lock"], "the stale temp copy was deleted");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_failed_helper_move_in_puts_the_old_helper_back_and_names_the_replaced_gate() {
+        let local_app_data = builder_with("helper-move-in", &[("gate.exe", OLDER), (HELPER_NAME, OLDER_HELPER)]);
+        let bin = local_app_data.join(r"gate\bin");
+        let exe = stand_in();
+        let heard = run_script_answering(&move_denied_when("$LiteralPath -eq $ht"), &exe, &exe, &local_app_data);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        let gate_asides = asides(&bin).into_iter().filter(|name| name.starts_with("gate.exe.")).collect::<Vec<_>>();
+        assert_eq!(gate_asides.len(), 1, "{heard:?}");
+        assert_eq!(
+            heard.marked.last().cloned(),
+            Some(format!(
+                "gate-push: failed could not install {}: denied; the previous desktop helper is back in place; gate {ANSWERED} is \
+                 installed and its previous copy is at {}",
+                bin.join(HELPER_NAME).display(),
+                bin.join(&gate_asides[0]).display()
+            )),
+            "{heard:?}"
+        );
+        assert!(
+            !heard.marked.iter().any(|line| line.contains("registered")),
+            "no registration was tried: {heard:?}"
+        );
+        assert_eq!(
+            fs::read(bin.join(HELPER_NAME)).expect("a helper is there"),
+            OLDER_HELPER,
+            "the old helper is back"
+        );
+        assert!(helper_asides(&bin).is_empty(), "{heard:?}");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_failed_helper_install_on_the_same_gate_says_it_was_already_installed() {
+        let exe = stand_in();
+        let local_app_data = builder_with("helper-same-gate", &[("gate.exe", exe.as_slice())]);
+        let bin = local_app_data.join(r"gate\bin");
+        let heard = run_script_answering(&move_denied_when("$LiteralPath -eq $ht"), &exe, &exe, &local_app_data);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked.last().cloned(),
+            Some(format!(
+                "gate-push: failed could not install {}: denied; no earlier desktop helper existed; gate {ANSWERED} was already \
+                 installed",
+                bin.join(HELPER_NAME).display()
+            )),
+            "{heard:?}"
+        );
+        assert_eq!(listed(&bin), ["gate.exe", "push.lock"], "no helper or temp copy is left");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_helper_that_does_not_match_after_its_move_puts_the_old_one_back() {
+        let local_app_data = builder_with("helper-post-move", &[(HELPER_NAME, OLDER_HELPER)]);
+        let bin = local_app_data.join(r"gate\bin");
+        let exe = stand_in();
+        // The helper's bytes in place are overwritten just after its move in, the file id kept, as a damaged write would.
+        let prelude = "function Move-Item($LiteralPath,$Destination,[switch]$Force){\n\
+                       Microsoft.PowerShell.Management\\Move-Item -LiteralPath $LiteralPath -Destination $Destination -Force:$Force\n\
+                       if($LiteralPath -eq $ht){[IO.File]::WriteAllBytes($Destination,[byte[]](9,9,9))}}";
+        let heard = run_script_answering(prelude, &exe, &exe, &local_app_data);
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked.last().cloned(),
+            Some(format!(
+                "gate-push: failed could not install {}: the installed copy does not match; the previous desktop helper is back in \
+                 place; gate {ANSWERED} is installed",
+                bin.join(HELPER_NAME).display()
+            )),
+            "{heard:?}"
+        );
+        assert_eq!(
+            fs::read(bin.join(HELPER_NAME)).expect("a helper is there"),
+            OLDER_HELPER,
+            "the old helper is back"
+        );
         let _ = fs::remove_dir_all(&local_app_data);
     }
 
@@ -1032,7 +1553,7 @@ mod tests {
     /// The push line run here as [`run_script`] runs it, with `prelude` put before the script on its line, so a case can
     /// stand in for one of the commands it calls: a function takes precedence over a cmdlet of the same name.
     fn run_script_after(prelude: &str, exe: &[u8], local_app_data: &Path) -> Heard {
-        run_lines(prelude, &SCRIPT.replace("@SHA@", &sha256_hex(exe)), exe, local_app_data)
+        run_lines(prelude, &script_for(&sha256_hex(exe)), exe, local_app_data)
     }
 
     /// [`run_script_after`] with [`answering`]'s script, so a gate.exe holding `answers`'s bytes answers its version.
@@ -1040,10 +1561,13 @@ mod tests {
         run_lines(prelude, &answering(&sha256_hex(exe), answers), exe, local_app_data)
     }
 
-    /// `script` after `prelude` on the script's line, run as the push line runs it, fed `exe`.
+    /// `script` after `prelude` on the script's line, run as the push line runs it, fed `exe` and [`HELPER`].
     fn run_lines(prelude: &str, script: &str, exe: &[u8], local_app_data: &Path) -> Heard {
         let script = format!("{prelude}\n{script}");
-        run_script_fed(&format!("{}\n{}", STANDARD.encode(script), gzipped(exe)), local_app_data)
+        run_script_fed(
+            &format!("{}\n{}\n{}", STANDARD.encode(script), gzipped(exe), gzipped(HELPER)),
+            local_app_data,
+        )
     }
 
     /// What the script's version read starts with.
@@ -1051,10 +1575,20 @@ mod tests {
     /// The version [`answering`]'s stand-in says.
     const ANSWERED: &str = "0.0.0-stand-in";
 
-    /// [`SCRIPT`] with `sha` put in and its version read standing in for a gate's: a file holding `answers`'s bytes says
+    /// [`script_for`] `sha` with its version read standing in for a gate's: a file holding `answers`'s bytes says
     /// `gate` [`ANSWERED`], as a gate would, since no exe the system has answers `--version` so; any other file is run.
     fn answering(sha: &str, answers: &[u8]) -> String {
-        let script = SCRIPT.replace("@SHA@", sha);
+        answering_with(sha, answers, REGISTERS)
+    }
+
+    /// [`answering`] with `register` as the registration's expression.
+    fn answering_with(sha: &str, answers: &[u8], register: &str) -> String {
+        let helper_sha = sha256_hex(HELPER);
+        let script = filled(&Slots {
+            sha,
+            helper_sha: &helper_sha,
+            register,
+        });
         assert!(script.contains(VER), "the script reads versions with Ver");
         let stand_in = format!(
             "{VER}$h=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($p)))\n\
@@ -1192,7 +1726,7 @@ mod tests {
     fn a_copy_that_is_not_gzip_fails_as_could_not_be_read() {
         let local_app_data = scratch("not-gzip");
         let exe = stand_in();
-        let input = format!("{}\n{}", script_line(&sha256_hex(&exe)), STANDARD.encode(&exe));
+        let input = format!("{}\n{}", STANDARD.encode(script_for(&sha256_hex(&exe))), STANDARD.encode(&exe));
         let heard = run_script_fed(&input, &local_app_data);
         let line = failed_line(&heard, &local_app_data);
         assert!(line.starts_with("gate-push: failed the copy could not be read: "), "{line}");
@@ -1203,7 +1737,7 @@ mod tests {
     fn a_gzip_of_other_bytes_fails_as_damaged() {
         let local_app_data = scratch("other-gzip");
         let exe = stand_in();
-        let heard = run_script_fed(&pushed_input(&sha256_hex(&exe), b"other bytes"), &local_app_data);
+        let heard = run_script_fed(&input_for(&sha256_hex(&exe), b"other bytes", HELPER), &local_app_data);
         assert_eq!(failed_line(&heard, &local_app_data), "gate-push: failed the copy arrived damaged");
         let _ = fs::remove_dir_all(&local_app_data);
     }
@@ -1218,7 +1752,7 @@ mod tests {
         let heard = run_script(&exe, &local_app_data);
         assert_eq!(heard.end, End::Exited(0), "{heard:?}");
         assert!(heard.marked.iter().any(|line| line.starts_with("gate-push: same")), "{heard:?}");
-        assert_eq!(listed(&bin), ["gate.exe", "push.lock"], "nothing was replaced");
+        assert_eq!(listed(&bin), [HELPER_NAME, "gate.exe", "push.lock"], "gate.exe was not replaced");
         let _ = fs::remove_dir_all(&local_app_data);
     }
 
@@ -1309,8 +1843,12 @@ mod tests {
         let bin = local_app_data.join(r"gate\bin");
         let heard = run_script(&exe, &local_app_data);
         assert_eq!(heard.end, End::Exited(0), "{heard:?}");
-        assert_eq!(heard.marked, ["gate-push: kept 1", "gate-push: same "], "{heard:?}");
-        assert_eq!(listed(&bin), ["gate.exe", ASIDE, "push.lock"], "the aside copy is kept");
+        assert_eq!(
+            heard.marked,
+            ["gate-push: kept 1", "gate-push: same ", "gate-push: helper-installed ", REGISTERED],
+            "{heard:?}"
+        );
+        assert_eq!(listed(&bin), [HELPER_NAME, "gate.exe", ASIDE, "push.lock"], "the aside copy is kept");
         let _ = fs::remove_dir_all(&local_app_data);
     }
 
@@ -1679,7 +2217,9 @@ mod tests {
                     "gate-push: note could not delete the aside copies in {}: the folder is busy",
                     bin.display()
                 ),
-                format!("gate-push: installed {ANSWERED}")
+                format!("gate-push: installed {ANSWERED}"),
+                "gate-push: helper-installed ".to_owned(),
+                REGISTERED.to_owned()
             ],
             "{heard:?}"
         );

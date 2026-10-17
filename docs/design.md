@@ -34,7 +34,7 @@ A `--help` or `-h` before the `--` of a `run`, `stop-tree`, `cutover`, `push`, `
 | `gate run` | Run one command under a slot and the watchdog. |
 | `gate stop-tree` | Stop a process tree, reaching the gate jobs inside it. |
 | `gate cutover` | Switch this machine from the PowerShell gate to `gate.exe`, draining it first. |
-| `gate push` | Copy the installed `gate.exe` to every builder `remote.json` names. |
+| `gate push` | Copy the installed `gate.exe` and desktop helper to every builder `remote.json` names and register the desktop task there. |
 | `gate check` | Say what this PC lacks for the repo in the current folder, and how to install it. |
 | `gate burn` | Spin the CPU for a set time, for the load-burn tool. |
 | `gate expect` | Print the expected time of a command here and on each builder, from the durations store. |
@@ -157,25 +157,35 @@ Test-seams builds accept hidden options on `cutover`: `--test-poll-ms`, `--test-
 
 `gate push` takes no words; its usage line is `       gate push`, after `gate cutover`. A word prints `gate: unexpected argument <word>` and any option, `--state-dir` included, prints `gate: unknown option <opt>`, each followed by the usage, exit 2. It reads `%LOCALAPPDATA%` only; `GATE_STATE_DIR` is ignored. What it does is [Install](#install); this is what it says.
 
-It copies the installed `%LOCALAPPDATA%\gate\bin\gate.exe` to each builder, one after another, in the order `host` then `hosts` of `remote.json` ([remote.json](#remotejson)). The routing file must be one routing accepts, so `repos` and the other keys are checked as routing checks them. Every builder is tried, whatever happened to an earlier one. The exit is 1 if any builder failed or nothing could be pushed, else 0.
+It copies the installed `%LOCALAPPDATA%\gate\bin\gate.exe` and the desktop helper `gate-desktop-helper.exe` beside it to each builder, one after another, in the order `host` then `hosts` of `remote.json` ([remote.json](#remotejson)), and registers the desktop task there by running the builder's installed `gate box register-desktop`.
+
+The routing file must be one routing accepts, so `repos` and the other keys are checked as routing checks them. Every builder is tried, whatever happened to an earlier one. The exit is 1 if any builder failed or nothing could be pushed, else 0; a registration that failed is said on that builder's line and does not change the exit.
 
 With nothing to push or nowhere to push it, `gate push` tries no builder, prints one line on stderr and exits 1:
 
 - `push: no remote.json at <path>`;
 - `push: ignored <path>: <reason>`, the router's reason text for an unusable file, or for a bad `hosts` ([remote.json](#remotejson));
 - `push: no installed gate at <path>; run tools/install.ps1`;
+- `push: no installed desktop helper at <path>; run tools/install.ps1`, for a `gate-desktop-helper.exe` missing beside the installed gate.exe, or not a file;
 - `push: no remote.json: LOCALAPPDATA is not an absolute folder`, for an unset, empty or relative `LOCALAPPDATA`;
 - `push: could not read the version of <path>`, when the installed exe's `--version` gives no `gate <version>` line or takes over 30 s;
-- `push: cannot read <path>: <error>`, when the installed exe cannot be read;
+- `push: cannot read <path>: <error>`, when the installed exe or the desktop helper cannot be read;
 - `push: an install is in progress on this PC; nothing was sent`, when `tools/install.ps1` holds this PC's `push.lock`;
 - `push: <bin>\push.lock is a link; nothing was sent`, and `push: could not lock <bin>: <error>; nothing was sent` for any other refusal of the lock. The link text is also said for a `push.lock` that is a folder, a junction or a second name of another file (a hard link); the open never follows a link.
 
-`gate push` holds `%LOCALAPPDATA%\gate\bin\push.lock` on this PC, open and unshared, while it reads the installed exe's bytes and runs its `--version`, and lets go before the first builder, so it never reads a gate.exe that `tools/install.ps1` is replacing.
+`gate push` holds `%LOCALAPPDATA%\gate\bin\push.lock` on this PC, open and unshared, while it reads the installed exe's and helper's bytes and runs the exe's `--version`, and lets go before the first builder, so it never reads a gate.exe that `tools/install.ps1` is replacing.
 
 `<v>`, `<old>` and `<new>` are the whole text after `gate ` in `gate.exe --version`, build id included, as `tools/install.ps1` reads it; the local one is read once, before the first builder. Per builder, on stdout:
 
 1. `push: <host>: sending gate <v>`, before the transfer.
 2. Then one of `push: <host>: gate <v> already installed` (an identical SHA-256: nothing was replaced), or `push: <host>: replaced gate <old>` followed by `push: <host>: installed gate <new>` (`replaced` only when a gate was there before), or on stderr `push: <host> failed: <reason>`.
+3. After either install line, in this order: `push: <host>: installed the desktop helper`, only when the helper's bytes changed (a builder whose helper has the same SHA-256 says nothing); then `push: <host>: registered the desktop task` on every push that registers, the identical-gate path included, or `push: <host>: desktop task not registered: <why>`. A failure of the install (the line on stderr above) tries no registration.
+
+The order on a builder is gate.exe, then the helper, then the registration; `tools/install.ps1` places the helper first, and the push places gate.exe first, so a helper that cannot be placed still leaves the builder's gate updated. The helper is installed only with a gate.exe in place, installed or identical.
+
+A registration runs the installed gate's `box register-desktop` (killed with its process tree after 60 s) while the script holds gate.exe open, shared for reading only, after checking its SHA-256 through that handle. The `<why>` of `desktop task not registered` is one of: `it did not finish in 60 s`; `gate.exe changed before registration`; `gate.exe could not be held: <message>`; `could not run <path>: <message>`; the verb's own text after `gate-register: failed: `; else the last non-blank line the verb printed; else `exit <n>`.
+
+The verb's own lines are in [The box side](#the-box-side) (`register-desktop`). A registration succeeded when the verb printed `gate-register: registered ...` and exited 0. Whatever it did, the script then exits 0.
 
 A note on stderr never fails the push: `push: <host>: could not delete <path>: <message>` names an aside or stale temporary copy the builder could not delete, `push: <host>: could not delete the aside copies in <dir>: <message>` says the folder could not be listed after a verified install, and `push: <host>: could not list <dir>: <message>` says the same of the count of kept aside copies.
 
@@ -185,7 +195,9 @@ After the builder's other stdout lines, a push that ends with `gate.exe` missing
 
 A failure reason is one of: `timed out after <n> s`, `no answer`, ssh's last stderr line, `cannot feed the call: <error>`, or the builder script's own.
 
-The builder script's own reasons are `the copy could not be read: <exception message>`, for bytes that do not decompress; `the copy arrived damaged`; `<dir> is a link`; `<dir>\push.lock is a link` (also for a folder, a junction or a hard link there); `another gate push is installing on this builder`; `could not lock <dir>: <message>`; `the builder needs pwsh 7.2 or later (it has <version>)`.
+The builder script's own reasons are `the copy could not be read: <exception message>`, for bytes that do not decompress; `the copy arrived damaged`;
+
+The helper's two are `the desktop helper's copy could not be read: <exception message>` and `the desktop helper's copy arrived damaged`, the same two for the helper's bytes, each before anything is touched; `<dir> is a link`; `<dir>\push.lock is a link` (also for a folder, a junction or a hard link there); `another gate push is installing on this builder`; `could not lock <dir>: <message>`; `the builder needs pwsh 7.2 or later (it has <version>)`.
 
 `could not prepare the install: <message>` says the script's small C# type for its file checks could not be added (constrained language, no compiler), before anything is touched. Any other failure says the failing step's message.
 
@@ -199,7 +211,13 @@ An id that cannot be read is tried three times, 300 ms apart, and a file gone at
 
 A `gate.exe` another process placed meanwhile, a by-hand install say, is left as it is and the reason ends with `; another gate.exe was placed meanwhile and was left as it is`, followed on a push that moved an old gate aside by `, the previous gate.exe is at <aside>`.
 
-Builder text is escaped as the remote client escapes it and cut to 4096 bytes.
+The desktop helper's install fails the builder (exit 1) with `could not install <helper path>: <message>`, where the helper path is `gate-desktop-helper.exe` in the builder's bin folder; `the installed copy does not match` (the helper in place lacks the temp copy's file id or the pushed SHA-256) takes the same `could not install <helper path>:` lead.
+
+The reason ends with one of `; no earlier desktop helper existed`, `; the previous desktop helper is at <aside>`, `; the previous desktop helper is back in place`, `; another desktop helper was placed meanwhile and was left as it is` (followed by `, the previous desktop helper is at <aside>` when one was moved aside) or `; the copy at <helper path> could not be removed: <message>`.
+
+Then comes what happened to gate.exe, which the push had already settled: `; gate <v> is installed and its previous copy is at <aside>`, `; gate <v> is installed` (a first install), `; gate <v> was already installed`, or, for an identical gate.exe that gave no version, `; the same gate.exe was already installed`. A move back acts as the gate.exe's does: only while the helper is missing or still this push's own file (its NTFS file id), over a missing one never by force.
+
+Builder text is escaped as the remote client escapes it and cut to 4096 bytes. The script says every line with its line breaks made spaces, so builder text with line breaks arrives as one line and cannot say a second fact.
 
 Each builder is one ssh call, run in a kill-on-close job with stdin piped and bounded at 300 s.
 
@@ -209,9 +227,9 @@ The call is `pwsh -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand 
 
 The bootstrap is a short fixed PowerShell line that reads stdin's first line and runs it as the install script, so the call stays within the 8127 characters cmd takes (8191, less 64 for sshd's own `cmd.exe /c`, `%LOCALAPPDATA%` counted as 100) however long the script grows, which a unit test checks.
 
-Stdin is line 1, the install script as base64 of its UTF-8 with this PC's SHA-256 put in, then the exe as base64 text of its gzip (flate2's best level). The push call is not asked for ssh compression: the bytes are already compressed.
+Stdin is three lines: line 1, the install script as base64 of its UTF-8 with this PC's SHA-256 of the exe and of the helper put in (and the registration command); line 2, the exe as base64 text of its gzip (flate2's best level); line 3, the helper the same way. The push call is not asked for ssh compression: the bytes are already compressed.
 
-The builder needs pwsh 7.2 or later, whose .NET the file checks need; an older one fails the push with `the builder needs pwsh 7.2 or later (it has <version>)` before anything is touched. The script decompresses the copy with .NET `GZipStream`, carries this PC's SHA-256 of the exe and refuses decompressed bytes that differ, reports on `gate-push: ` lines that this side maps to the `push:` lines, and exits 1 after a failure.
+The builder needs pwsh 7.2 or later, whose .NET the file checks need; an older one fails the push with `the builder needs pwsh 7.2 or later (it has <version>)` before anything is touched. The script decompresses each copy with .NET `GZipStream`, carries this PC's SHA-256 of the exe and of the helper and refuses decompressed bytes that differ, reports on `gate-push: ` lines that this side maps to the `push:` lines, and exits 1 after a failure.
 
 Two pushes to one builder at once are refused: the script holds `push.lock` in the builder's `%LOCALAPPDATA%\gate\bin` open, unshared, for the whole install, so the second push fails at once with `another gate push is installing on this builder`, touching nothing, the cleanup of aside copies included.
 
@@ -219,15 +237,21 @@ The open handle is the lock: `push.lock` stays as a plain file after a push and 
 
 `tools/install.ps1` and the PC side of `gate push` take the same `push.lock` in their own bin folder with the same open, so an install, a push's read of the exe and a push to a builder never change or read one folder's gate.exe at once ([Install](#install)).
 
-On the builder the script installs as `tools/install.ps1` does ([Install](#install)), in its own `%LOCALAPPDATA%\gate\bin`, which it creates when missing and refuses when it is a link: it first deletes the stale `gate.exe.<pid>.tmp` copies of other pids that no process holds, and the aside copies (`gate.exe.*.old`) only after the installed gate is verified.
+On the builder the script installs as `tools/install.ps1` does ([Install](#install)), in its own `%LOCALAPPDATA%\gate\bin`, which it creates when missing and refuses when it is a link: it first deletes the stale `gate.exe.<pid>.tmp` and `gate-desktop-helper.exe.<pid>.tmp` copies of other pids that no process holds, and the aside copies (`gate.exe.*.old` and `gate-desktop-helper.exe.*.old`) only after the installed gate is verified.
 
 It says the same version when `gate.exe` already has the same SHA-256; else it writes the exe to `gate.exe.<pid>.tmp` (created new), moves the old one aside to `gate.exe.<stamp>.<pid>.old`, moves the temporary file into place without force, checks the SHA-256 of the installed copy and that it answers `--version` with `gate <version>`, and puts the aside copy back when anything failed, the check's own read included; with no old exe to move back, it removes the installed copy.
 
-An installed gate is verified when its SHA-256 matches and `--version` answers, and only then does the cleanup run: it deletes every aside copy no process holds but this push's own, which stays as the last good gate. A push that ends with `gate.exe` missing or unverified, a failed one and an identical exe that does not answer included, deletes no aside copy.
+With gate.exe in place the script then installs the helper the same way, unless `gate-desktop-helper.exe` already has the pushed SHA-256: a temp copy `gate-desktop-helper.exe.<pid>.tmp`, the old helper moved aside to `gate-desktop-helper.exe.<stamp>.<pid>.old`, the temp moved into place without force, and a check that the helper in place has the temp copy's file id and the pushed SHA-256, with the old helper put back (or the push's own copy removed, when there was none) on a failure, unless another process placed a helper meanwhile.
+
+An installed gate is verified when its SHA-256 matches and `--version` answers (read through a handle held open, shared for reading only, with the SHA-256 checked again through it), and only then does the cleanup run: it deletes every aside copy, the helper's included, no process holds but this push's own, which stays as the last good gate.
+
+The helper's aside copies thus go with a later verified push. The `kept <n> aside copies` line counts `gate.exe.*.old` only. A push that ends with `gate.exe` missing or unverified, a failed one and an identical exe that does not answer included, deletes no aside copy.
 
 Each version read on the builder is bounded at 30 s.
 
-The ssh a push runs is `ssh.exe` found along `PATH`, never `ssh.cmd` or `ssh.bat`. Test-seams builds accept hidden options on `push`: `--test-push-ssh <path>` (the program each builder's call runs in place of the ssh found along `PATH`) and `--test-push-bound-ms <n>` (the 300 s bound, in milliseconds above 0). `gate push` has no `--test-print-request`.
+The ssh a push runs is `ssh.exe` found along `PATH`, never `ssh.cmd` or `ssh.bat`. Test-seams builds accept hidden options on `push`: `--test-push-ssh <path>` (the program each builder's call runs in place of the ssh found along `PATH`), `--test-push-bound-ms <n>` (the 300 s bound, in milliseconds above 0) and `--test-push-register ok|fail` (each builder's registration runs the pushed gate's `box --test-box-register <ok|fail> register-desktop`, the box's seam, so no Task Scheduler is reached; any other value is `gate: --test-push-register must be ok or fail, got '<value>'`).
+
+`gate push` has no `--test-print-request`.
 
 ### `gate check`
 
@@ -2685,7 +2709,9 @@ Built verbs:
   Caps: an archive of more than 50,000 members, or that decompresses to more than 4 GiB (`--test-inputs-budget-bytes` replaces it), is refused as the outputs archive's are, and the put fails (`gate: remote inputs put failed: <why>`, exit 1). The step is not watched on the box; the PC watches both calls ([The remote client's run](#routing), Inputs).
 
   Deployment prerequisites: the folders above `<root>` are writable by Administrators only; no account outside SYSTEM, Administrators and the builder's user may write in `<root>`; and `<root>\work` is not writable by other accounts. The stage's protection and the beneath-handle walk assume it; the box checks the stages folder it adopts, not the folders above it.
-- **`register-desktop`** (`boxside/register.rs`) registers the desktop helper's task, `\gate\desktop-helper`, through the Task Scheduler's COM interface (`gate_win32::register_task`, `task.rs`) for the user running the box, and says so on stdout. It reads no request and never reads stdin: its ssh line is `gate.exe box register-desktop` with no `--stdin`, and any word after the verb is the box usage. It is run elevated, over ssh, by the builder's setup, not by a routed run.
+- **`register-desktop`** (`boxside/register.rs`) registers the desktop helper's task, `\gate\desktop-helper`, through the Task Scheduler's COM interface (`gate_win32::register_task`, `task.rs`) for the user running the box, and says so on stdout.
+
+  It reads no request and never reads stdin: its ssh line is `gate.exe box register-desktop` with no `--stdin`, and any word after the verb is the box usage. It is run by the builder's setup and by `gate push` on every push ([`gate push`](#gate-push)), not by a routed run.
 
   The task runs `gate-desktop-helper.exe`, beside the box's `gate.exe`, with the one argument `$(Arg0)`, which `RunEx` fills at each start, on demand (no trigger), with the interactive token of that user at least privilege and no password.
 
@@ -2787,7 +2813,9 @@ The rest of the protocol, the transport of snapshots and outputs, is the remote 
 
   For the exe already in place it prints `install: gate <version> already installed at <path>` and a Delete line for each aside copy a real run would delete, when the installed gate answers `--version`. The helper is listed too. `-Exe` (install a prebuilt exe, skipping the build), `-HelperExe` (the prebuilt helper; each is given only with the other, else `install: -Exe and -HelperExe are given together or not at all`, and a missing or unreadable one is `install: no desktop helper at '<path>'` or `install: could not read the desktop helper at '<path>': <message>`), `-EnvironmentKey` (the registry key the PATH entry lives in) and `-PrintBuild` (prints the build's cargo arguments on one line and exits 0) exist for the suite, which runs the script against a temporary `LOCALAPPDATA` and registry key.
 - Every install deletes a leftover `remote-bridge.ps1` file in the install folder, which no gate starts. When it cannot, it prints `install: cannot remove the old remote-bridge.ps1 (<reason>); it is unused` on stderr and carries on with exit 0; a folder at that name is left alone.
-- The script installs locally only. `gate push` copies the installed gate.exe (not yet the desktop helper) to each builder in `remote.json` (`host`, then `hosts`), with the same rename-aside on the builder, so a machine with builders runs `pwsh tools/install.ps1` and then `gate push` ([`gate push`](#gate-push)). It pushes the installed exe, never one from `target/`, and never installs here.
+- The script installs locally only. `gate push` copies the installed gate.exe and the desktop helper to each builder in `remote.json` (`host`, then `hosts`), with the same rename-aside on the builder, and registers the desktop task there on every push, so a machine with builders runs `pwsh tools/install.ps1` and then `gate push` ([`gate push`](#gate-push)).
+
+  It differs in order: the script places the helper first, the push places gate.exe first and the helper after it. It pushes the installed files, never ones from `target/`, and never installs here.
 - Install is a script, not a `gate install` subcommand.
 
 ### Build id
