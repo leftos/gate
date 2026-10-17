@@ -4,13 +4,13 @@
 
 ## Do first
 
-- [/] GATE-347 Warm a builder work folder with a repo's warm-up commands before routing work for it — Urgent · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [/] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
-- [!] GATE-399 Run the suite's desktop cases when the gate repo's tests are routed to a builder — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [!] GATE-371 Route ops-tower's Playwright tests: the fixture server and browsers on the builder — High · Remote
+- [/] GATE-416 Route herdr-gpui's just ci to the builder — High · Remote
+- [/] GATE-417 Route collie's vitest and bun test gates to the builder — High · Remote
 
 ## Remote
 
@@ -50,7 +50,6 @@
 - [ ] GATE-294 End the box's tool restore and drain its output when its wait fails
 - [ ] GATE-296 Name the box's own reason when a preflight exits 2 and the run falls back
 - [ ] GATE-297 Bound each field of a box request, now that the command line no longer does
-- [ ] GATE-298 Merge feat/desktop-session (#305)
 - [ ] GATE-300 Find whether a routed run call's stdin read end leaks into the client's later children
 - [ ] GATE-301 Make an empty environment block agree between EnvironmentBlock::new and from_wide
 - [ ] GATE-302 Make a_pair_fetch_stopped_at_its_cap_names_its_repo's cleanup hold on a loaded PC
@@ -108,7 +107,6 @@
 - [ ] GATE-403 Journal why a heavy run stayed on the PC
 - [ ] GATE-405 Check whether the stall and ceiling kill paths count an exited job member as left
 - [ ] GATE-408 Read a repo's csproj Godot pin in gate check as a routed run does
-- [ ] GATE-413 Route delve's bare Godot_console.exe form once the install is on PATH
 
 ## Cutover sweep
 
@@ -176,4 +174,8 @@
 - [ ] GATE-394 Keep the suite's box cases independent of whether this PC's Git is an admin install
 - [ ] GATE-404 Route a repo whose checkout folder name the push refuses, such as claude-config's .claude
 - [ ] GATE-406 Check from the restricted token that a mono Godot install's assemblies folder can be entered
-- [ ] GATE-407 Decide what a zero file id means at every file-identity check, not only the desktop hand-off
+- [ ] GATE-414 Let the console-session smoke test pass while no session holds the console
+- [ ] GATE-415 Report the builder's desktop task in gate check --builder
+- [ ] GATE-418 Let tools/gate.ps1 run a worktree's command (-Cd)
+- [ ] GATE-419 Test that a detached warm-up starts with no console window
+- [ ] GATE-420 Say why when install cannot read the installed gate.exe
