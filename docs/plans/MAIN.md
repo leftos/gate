@@ -6,15 +6,13 @@
 
 - [/] GATE-347 Warm a builder work folder with a repo's warm-up commands before routing work for it — Urgent · Remote
 - [ ] GATE-370 Run a routed Godot command on the builder's side-by-side install of the version its repo pins — Urgent · Remote
-- [/] GATE-381 Write a slot claim before journaling its take, so a take line always has its claim — Urgent · Backlog
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [/] GATE-231 Run a routed command that needs a desktop in the builder's logged-on session — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
-- [/] GATE-374 Run a routed Godot command on the builder's install of the pinned version, with GODOT_PATH set — High · Remote
-- [ ] GATE-375 Install Godot side by side on the builders and trial each Godot command family — High · Remote
-- [ ] GATE-371 Route ops-tower's Playwright tests: the fixture server and browsers on the builder — High · Remote
-- [/] GATE-376 Wait for a busy work folder's holder before falling back — High · Remote
+- [!] GATE-375 Install Godot side by side on the builders and trial each Godot command family — High · Remote
+- [!] GATE-371 Route ops-tower's Playwright tests: the fixture server and browsers on the builder — High · Remote
+- [/] GATE-387 Find why Git's sh.exe fails with an MSYS add_item error on the builder under a routed full suite — High · Remote
 
 ## Remote
 
@@ -103,6 +101,8 @@
 - [ ] GATE-384 Refuse a run payload key the box does not know, so an older box never drops Env or a later key silently
 - [ ] GATE-385 Desktop run: tie the helper to the Task Scheduler and check the child's thread, user and siblings
 - [ ] GATE-386 Re-read docs/design/gate-box-critical.md against ops-tower's swept pre-push hook
+- [ ] GATE-389 Say why a misnamed Godot install is left out even when another install lists
+- [ ] GATE-390 Let a stop wake the desktop helper's end wait
 
 ## Cutover sweep
 
@@ -164,3 +164,5 @@
 - [ ] GATE-372 Keep a warm-up or run log that a reader holds open from blocking every later run of its key
 - [ ] GATE-379 Say the routed-as line for a warm-up command sent by its program's name
 - [ ] GATE-382 Open the PC state root's folders without following links before reading, writing or deleting a file in them
+- [ ] GATE-388 Write a covered gate's marker before journaling its covered line
+- [ ] GATE-391 Remove the reserved-name files the walk tests make, so worktrees can be deleted
