@@ -946,6 +946,93 @@ fn check_a_repo_remote_json_does_not_list_has_no_consent_and_exits_0() {
     }
 }
 
+/// A warm-up file that cannot be read whole fails the check whatever the consent, since the repo declares a warm-up it
+/// cannot use; one that reads with problems only informs without consent.
+#[test]
+fn check_an_unreadable_warmup_file_without_consent_says_why_and_exits_1() {
+    let case = repo_case("check_warm_unreadable_unconsented");
+    write_remote_json(&case, r#"{"host": "builder-1", "repos": {"app": ["*"]}}"#);
+    let unconsented = "check: here: warm-up: .gate/warmup.toml is there, but remote.json does not consent to warm-ups for app";
+    for (name, bytes, problem) in [
+        (
+            "not UTF-8",
+            b"commands = [[\"\xff\"]]\n".to_vec(),
+            "check: .gate/warmup.toml: not valid UTF-8",
+        ),
+        ("not TOML", b"commands = [\n".to_vec(), "check: .gate/warmup.toml: line "),
+        (
+            "over 64 KiB",
+            format!("{WARMUP_FILE}#{}\n", "x".repeat(64 * 1024)).into_bytes(),
+            "check: .gate/warmup.toml: is larger than 64 KiB",
+        ),
+    ] {
+        write_bytes(&case, ".gate/warmup.toml", &bytes);
+
+        let outcome = check_warm(&case);
+
+        let stderr = lines(&outcome.stderr);
+        assert!(stderr.len() == 1 && stderr[0].starts_with(problem), "{name}: {outcome:?}");
+        assert_eq!(
+            lines(&outcome.stdout),
+            warm_lines(&case, unconsented, "check: here: could not read .gate/warmup.toml; 0 missing, 0 too old"),
+            "{name}: {outcome:?}"
+        );
+        assert_eq!(outcome.code, Some(1), "{name}: {outcome:?}");
+    }
+}
+
+/// A consented warm-up file that cannot be read whole has problems, so runs stay here, and the summary names it.
+#[test]
+fn check_an_unreadable_consented_warmup_file_says_why_and_exits_1() {
+    let case = warm_case("check_warm_unreadable_consented");
+    write(&case, ".gate/warmup.toml", "commands = [\n");
+
+    let outcome = check_warm(&case);
+
+    let stderr = lines(&outcome.stderr);
+    assert!(
+        stderr.len() == 1 && stderr[0].starts_with("check: .gate/warmup.toml: line "),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        lines(&outcome.stdout),
+        warm_lines(
+            &case,
+            "check: here: warm-up: .gate/warmup.toml has problems, so no warm-up runs and matched runs stay here",
+            "check: here: could not read .gate/warmup.toml; 1 missing, 0 too old"
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// A warm-up file that parses as TOML but holds a key of the wrong type reads with problems, which only inform without
+/// consent.
+#[test]
+fn check_a_wrong_typed_warmup_key_without_consent_only_informs() {
+    let case = repo_case("check_warm_wrong_type_unconsented");
+    write_remote_json(&case, r#"{"host": "builder-1", "repos": {"app": ["*"]}}"#);
+    write(&case, ".gate/warmup.toml", "commands = 5\n");
+
+    let outcome = check_warm(&case);
+
+    assert_eq!(
+        lines(&outcome.stderr),
+        ["check: .gate/warmup.toml: commands is not an array (TOML integer)"],
+        "{outcome:?}"
+    );
+    assert_eq!(
+        lines(&outcome.stdout),
+        warm_lines(
+            &case,
+            "check: here: warm-up: .gate/warmup.toml is there, but remote.json does not consent to warm-ups for app",
+            "check: here: nothing missing"
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
 /// The routing file of a builder case: `builder-1` the host a routed run goes to, `builder-2` one `gate push` reaches.
 const ROUTING: &str = r#"{"host": "builder-1", "hosts": ["builder-2"], "repos": {"app": ["*"]}}"#;
 
@@ -1312,4 +1399,96 @@ fn check_builder_says_a_work_folder_that_is_not_warm() {
         "{outcome:?}"
     );
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+/// A PC warm-up record that cannot be read names no builder, but every routed run stays here for it, so a builder check
+/// says it and fails, as the check of this PC does.
+#[test]
+fn check_builder_says_an_unreadable_warm_record_and_exits_1() {
+    let case = builder_case("check_builder_unreadable_record");
+    write_remote_json(
+        &case,
+        r#"{"host": "builder-1", "hosts": ["builder-2"], "repos": {"app": ["*"]}, "warmup": ["app"]}"#,
+    );
+    write(&case, ".gate/warmup.toml", WARMUP_FILE);
+    let state = case.local_app_data().join("gate").join("v1");
+    let record = v1::warm_record_path(&state, &key(&case));
+    fs::create_dir_all(v1::warm_dir(&state)).expect("the warm-up folder can be made");
+    fs::write(&record, "x".repeat(64 * 1024 + 1)).expect("the oversized record can be written");
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = check_builder(&case, "builder-1", &[], &steps);
+
+    assert_eq!(
+        lines(&outcome.stdout)[2..],
+        [
+            "check: builder-1: app declares no toolchain".to_owned(),
+            format!(
+                "check: builder-1: warm-up: the warm-up record {} cannot be read: is larger than 64 KiB",
+                record.display()
+            ),
+            "check: builder-1: warm-up: the work folder is not warm".to_owned(),
+            "check: builder-1: 1 missing, 0 too old".to_owned(),
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// A builder case whose routing file consents to warm-ups on `builder-1`, `builder-2` among its hosts.
+fn warm_builder_case(name: &str) -> Case {
+    let case = builder_case(name);
+    write_remote_json(
+        &case,
+        r#"{"host": "builder-1", "hosts": ["builder-2"], "repos": {"app": ["*"]}, "warmup": ["app"]}"#,
+    );
+    case
+}
+
+/// A warm-up lock that cannot be probed keeps every routed run here before any record is read, as the route gives the
+/// failed probe precedence, so a builder check says it and fails though no record names the builder.
+#[test]
+fn check_builder_says_a_warm_lock_that_cannot_be_probed_and_exits_1() {
+    let case = warm_builder_case("check_builder_lock_unprobeable");
+    write(&case, ".gate/warmup.toml", WARMUP_FILE);
+    let lock = v1::warm_lock_path(&case.local_app_data().join("gate").join("v1"), &key(&case));
+    fs::create_dir_all(&lock).expect("a folder can stand where the lock goes");
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = check_builder(&case, "builder-1", &[], &steps);
+
+    let said = lines(&outcome.stdout);
+    let start = format!("check: builder-1: warm-up: the warm-up lock {} cannot be read: ", lock.display());
+    assert_eq!(said.len(), 6, "{outcome:?}");
+    assert!(said[3].starts_with(&start), "{outcome:?}");
+    assert_eq!(
+        said[4..],
+        [
+            "check: builder-1: warm-up: the work folder is not warm",
+            "check: builder-1: 1 missing, 0 too old"
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// A consented warm-up file that cannot be read whole fails a builder check, the summary naming it.
+#[test]
+fn check_builder_says_an_unreadable_warmup_file_and_exits_1() {
+    let case = warm_builder_case("check_builder_unreadable_warmup");
+    write(&case, ".gate/warmup.toml", "commands = [\n");
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = check_builder(&case, "builder-1", &[], &steps);
+
+    assert_eq!(
+        lines(&outcome.stdout)[2..],
+        [
+            "check: builder-1: app declares no toolchain",
+            "check: builder-1: warm-up: .gate/warmup.toml has problems, so no warm-up runs and matched runs stay here",
+            "check: builder-1: could not read .gate/warmup.toml; 1 missing, 0 too old",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
 }
