@@ -963,6 +963,135 @@ fn a_declared_sibling_the_routing_file_does_not_allow_runs_here_saying_so() {
     assert_local(&events(&case), None);
 }
 
+/// Names `folder` as the case repo's declarations folder in the case's routing file, the rest of it kept.
+fn name_declarations(case: &Case, folder: &Path) {
+    let path = case.local_app_data().join("gate").join("remote.json");
+    let mut routing: Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("the case has a routing file")).expect("the routing file is JSON");
+    routing["declarations"] = json!({ repo(case): folder.to_string_lossy() });
+    write_remote_json(case, &routing.to_string());
+}
+
+/// A declarations folder under the case's LOCALAPPDATA holding each `(name, text)` of `files`; its path.
+fn declarations_holding(case: &Case, files: &[(&str, &str)]) -> PathBuf {
+    let folder = case.local_app_data().join("declarations");
+    fs::create_dir_all(&folder).expect("the declarations folder can be made");
+    for (name, text) in files {
+        fs::write(folder.join(name), text).expect("a declaration file can be written");
+    }
+    folder
+}
+
+#[test]
+fn a_siblings_file_in_the_declarations_folder_is_read_when_the_worktree_has_none() {
+    let case = routed_case("routing-sibling-declared");
+    let (name, _) = declare_sibling(&case);
+    fs::remove_dir_all(case.folder().join(".gate")).expect("the worktree's .gate can be removed");
+    let folder = declarations_holding(&case, &[("siblings.toml", &format!("siblings = [\"{name}\"]\n"))]);
+    name_declarations(&case, &folder);
+    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", "ran here"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains(&format!("gate: not routed: sibling {name} not found beside the worktree\n")),
+        "the declared sibling was read: {outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("read from"), "the line is the log's alone: {outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let read = format!("gate: .gate/siblings.toml read from {}", folder.join("siblings.toml").display());
+    assert!(log.lines().any(|line| line == read), "{read}: {log}");
+    assert_local(&events(&case), None);
+}
+
+#[test]
+fn a_desktop_file_in_the_declarations_folder_needs_the_same_consent() {
+    let case = routed_case("routing-desktop-declared");
+    declare_desktop(&case, &["*TOOL* argv*"]);
+    fs::remove_dir_all(case.folder().join(".gate")).expect("the worktree's .gate can be removed");
+    let folder = declarations_holding(&case, &[("desktop.toml", "patterns = ['*tool* argv*']\n")]);
+    name_declarations(&case, &folder);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let refused = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "argv", "a"])));
+
+    assert_eq!(refused.code, Some(0), "{refused:?}");
+    assert!(
+        refused
+            .stderr
+            .contains("gate: not routed: desktop pattern '*tool* argv*' not allowed in remote.json\n"),
+        "the declarations folder's pattern needs remote.json's consent: {refused:?}"
+    );
+    assert!(!call.exists(), "the client never ran");
+
+    let path = case.local_app_data().join("gate").join("remote.json");
+    let mut routing: Value = serde_json::from_str(&fs::read_to_string(&path).expect("the routing file is there")).expect("it is JSON");
+    routing["desktop"] = json!({ repo(&case): ["*tool* argv*"] });
+    write_remote_json(&case, &routing.to_string());
+    let allowed = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "argv", "a"])));
+
+    assert_eq!(allowed.code, Some(0), "{allowed:?}");
+    assert_eq!(recorded(&call)["desktop"], json!(true), "the consented pattern asks for the desktop");
+}
+
+#[test]
+fn a_broken_siblings_file_in_the_declarations_folder_names_its_path() {
+    let case = routed_case("routing-sibling-declared-broken");
+    let folder = declarations_holding(&case, &[("siblings.toml", "siblings = [\n")]);
+    name_declarations(&case, &folder);
+    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", "ran here"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let start = format!("gate: not routed: {}: ", folder.join("siblings.toml").display());
+    assert!(outcome.stderr.lines().any(|line| line.starts_with(&start)), "{start}: {outcome:?}");
+    assert!(!outcome.stderr.contains(".gate/siblings.toml:"), "{outcome:?}");
+    assert_local(&events(&case), None);
+}
+
+#[test]
+fn an_unusable_declarations_entry_reads_nothing_and_logs_why() {
+    let case = routed_case("routing-declarations-unusable");
+    let missing = case.local_app_data().join("no-such-folder");
+    name_declarations(&case, &missing);
+    let steps = shown(&stub(&case, &["refuse busy"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", "ran here"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(BUSY_LINE), "the run still routed: {outcome:?}");
+    assert!(!outcome.stderr.contains("declarations"), "the line is the log's alone: {outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let why = format!("gate: declarations for {} not read: '{}' does not exist", repo(&case), missing.display());
+    assert_eq!(log.lines().filter(|line| *line == why).count(), 1, "said once a run: {why}: {log}");
+}
+
+#[test]
+fn a_broken_siblings_file_in_the_worktree_wins_and_notes_the_copy_it_shadows() {
+    let case = routed_case("routing-sibling-broken-shadows");
+    let own = case.folder().join(".gate").join("siblings.toml");
+    if own.is_file() {
+        fs::remove_file(&own).expect("the worktree's own file can be removed");
+    }
+    fs::create_dir_all(&own).expect("a folder named like the file can be made, so the worktree's file cannot be read");
+    let folder = declarations_holding(&case, &[("siblings.toml", "siblings = []\n")]);
+    name_declarations(&case, &folder);
+    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", "ran here"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .lines()
+            .any(|line| line.starts_with("gate: not routed: .gate/siblings.toml: ")),
+        "the worktree's broken file wins: {outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("shadows"), "the note is the log's alone: {outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let note = format!("gate: .gate/siblings.toml shadows {}", folder.join("siblings.toml").display());
+    assert!(log.lines().any(|line| line == note), "{note}: {log}");
+    assert_local(&events(&case), None);
+}
+
 #[test]
 fn the_routed_call_carries_the_leaf_and_the_allowed_siblings() {
     let case = routed_case("routing-sibling-call");

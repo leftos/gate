@@ -314,10 +314,14 @@ pub(crate) struct Judged {
     pub skips: Vec<String>,
 }
 
-/// The line said, on a routed run, for a manifest `problem`: an entry skipped as bad, or a whole file that cannot be
-/// read or is no regular file. The problem is escaped, as it may quote the file.
-pub(crate) fn skip_line(problem: &str) -> String {
-    format!("gate: .gate/toolchain.toml: {}; skipping it", escaped(problem))
+/// How a routed run's lines name the manifest the snapshot's tree holds.
+pub(crate) const MANIFEST_SAID: &str = ".gate/toolchain.toml";
+
+/// The line said, on a routed run, for a problem of the manifest named `file` ([`MANIFEST_SAID`], or the full path of
+/// a copy in the declarations folder): an entry skipped as bad, or a whole file that cannot be read or is no regular
+/// file. Both are escaped, as the problem may quote the file.
+pub(crate) fn skip_line(file: &str, problem: &str) -> String {
+    format!("gate: {}: {}; skipping it", escaped(file), escaped(problem))
 }
 
 /// A text the builder said, as a line shows it: its first [`FAILURE_BYTES`], escaped, so a builder can neither forge a
@@ -615,22 +619,24 @@ fn reported_as(said: &str) -> Reported {
 /// sent as unknown and each sent tool it did not probe, gave no answer for, or found at a version that cannot be read
 /// against a minimum. A known tool left unsent, as when the preflight could not carry the needs, says nothing, and so
 /// does a pinned tool whose own need was not sent. Every text from the manifest or the builder is escaped, and the
-/// builder's cut to [`FAILURE_BYTES`].
+/// builder's cut to [`FAILURE_BYTES`]. The manifest comes with how its lines name its file ([`skip_line`]).
 pub(crate) fn judge(
-    manifest: Option<&Result<Manifest, String>>,
+    manifest: Option<(&Result<Manifest, String>, &str)>,
     godot: Option<&[Pin]>,
     sent: &[String],
     reported: &[(String, Reported)],
     host: &str,
 ) -> Judged {
     let mut judged = Judged::default();
+    let file = manifest.map_or(MANIFEST_SAID, |(_, file)| file);
+    let manifest = manifest.map(|(read, _)| read);
     if let Some(Err(why)) = manifest {
-        judged.skips.push(skip_line(why));
+        judged.skips.push(skip_line(file, why));
     }
     let unreal = unreal_required(manifest);
     let exact = [(GODOT, godot), (UNREAL, unreal.as_deref())];
     if let Some(Ok(manifest)) = manifest {
-        judged.skips.extend(manifest.problems.iter().map(|problem| skip_line(problem)));
+        judged.skips.extend(manifest.problems.iter().map(|problem| skip_line(file, problem)));
         for tool in &manifest.tools {
             // A pinned tool is weighed exactly, below, whatever minimum its own entry spells.
             if exact.iter().any(|(name, pins)| pins.is_some() && tool.name == *name) {
@@ -640,7 +646,7 @@ pub(crate) fn judge(
                 let name = one_line(&tool.name);
                 judged
                     .skips
-                    .push(format!("gate: .gate/toolchain.toml names unknown tool {name}; skipping it"));
+                    .push(format!("gate: {} names unknown tool {name}; skipping it", escaped(file)));
                 continue;
             }
             if !sent.contains(&tool.name) {
@@ -984,10 +990,10 @@ fn attributes(text: &str) -> Vec<(&str, &str)> {
 #[expect(clippy::expect_used, reason = "a fixture that does not read must fail loudly")]
 mod tests {
     use super::{
-        Exact, GodotChoice, Judged, Manifest, NoChosenGodot, Pin, Pinned, Reported, Standing, ToolNeed, Version, dotnet_tools, godot_choice,
-        godot_not_listed_line, godot_pins_read, godot_required, godot_sdk_pins, is_sent, judge, meets, needs_of, newest_godot, no_chosen_godot,
-        no_godot_install_line, no_pin_godot_warning, pinned, read, read_bytes, reported, reported_as, routed_needs, several_godot_line, skip_line,
-        standing, unreadable_godot_pins_line, unreadable_line, unreal_choice,
+        Exact, GodotChoice, Judged, MANIFEST_SAID, Manifest, NoChosenGodot, Pin, Pinned, Reported, Standing, ToolNeed, Version, dotnet_tools,
+        godot_choice, godot_not_listed_line, godot_pins_read, godot_required, godot_sdk_pins, is_sent, judge, meets, needs_of, newest_godot,
+        no_chosen_godot, no_godot_install_line, no_pin_godot_warning, pinned, read, read_bytes, reported, reported_as, routed_needs,
+        several_godot_line, skip_line, standing, unreadable_godot_pins_line, unreadable_line, unreal_choice,
     };
     use crate::remote::git::FAILURE_BYTES;
     use crate::remote::parity::{Need, NeedKind};
@@ -1419,7 +1425,13 @@ mod tests {
         let sent: Vec<String> = routed_needs(Some(&readable), pins, false).into_iter().map(|(name, _)| name).collect();
         let said = owned(said);
         let godot = godot_required(Some(&readable), pins);
-        judge(Some(&readable), godot.as_deref(), &sent, &reported(&said, &sent), "builder")
+        judge(
+            Some((&readable, MANIFEST_SAID)),
+            godot.as_deref(),
+            &sent,
+            &reported(&said, &sent),
+            "builder",
+        )
     }
 
     /// [`judged_with`] for a repo whose project files pin no godot.
@@ -1554,7 +1566,7 @@ mod tests {
     fn a_known_tool_left_unsent_says_nothing() {
         let read = manifest("[tools]\nnode = \"24\"\nnodejs = \"1\"\n");
         assert_eq!(
-            judge(Some(&Ok(read)), None, &[], &[], "builder"),
+            judge(Some((&Ok(read), MANIFEST_SAID)), None, &[], &[], "builder"),
             Judged {
                 needs: Vec::new(),
                 skips: owned(&["gate: .gate/toolchain.toml names unknown tool nodejs; skipping it"]),
@@ -1568,7 +1580,7 @@ mod tests {
         assert_eq!(judge(None, None, &[], &[], "builder"), Judged::default());
         let unreadable = Err("line 1, column 7: invalid table header".to_owned());
         assert_eq!(
-            judge(Some(&unreadable), None, &[], &[], "builder"),
+            judge(Some((&unreadable, MANIFEST_SAID)), None, &[], &[], "builder"),
             Judged {
                 needs: Vec::new(),
                 skips: owned(&["gate: .gate/toolchain.toml: line 1, column 7: invalid table header; skipping it"]),
@@ -1593,12 +1605,12 @@ mod tests {
             ..Manifest::default()
         };
         assert_eq!(
-            judge(Some(&Ok(problem)), None, &[], &[], "builder").skips,
+            judge(Some((&Ok(problem), MANIFEST_SAID)), None, &[], &[], "builder").skips,
             ["gate: .gate/toolchain.toml: tools.\\u{202e}x is bad; skipping it"]
         );
         let unreadable = Err("line 1\u{2028}gate: forged".to_owned());
         assert_eq!(
-            judge(Some(&unreadable), None, &[], &[], "builder").skips,
+            judge(Some((&unreadable, MANIFEST_SAID)), None, &[], &[], "builder").skips,
             ["gate: .gate/toolchain.toml: line 1\\u{2028}gate: forged; skipping it"]
         );
     }
@@ -1663,7 +1675,7 @@ mod tests {
     #[test]
     fn the_manifest_s_skip_lines_name_the_file_and_the_problem() {
         assert_eq!(
-            skip_line("line 2, column 8: invalid string"),
+            skip_line(MANIFEST_SAID, "line 2, column 8: invalid string"),
             "gate: .gate/toolchain.toml: line 2, column 8: invalid string; skipping it"
         );
     }

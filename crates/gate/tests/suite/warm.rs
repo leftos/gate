@@ -337,6 +337,99 @@ fn a_warm_up_file_with_a_byte_order_mark_is_hashed_with_it() {
     assert_eq!(record(&case).expect("a record")["hash"], warmup_hash(&bytes));
 }
 
+/// A worktree with no warm-up file of its own warms from the copy in its declarations folder, hashed by its bytes alone.
+#[test]
+fn a_warm_up_file_in_the_declarations_folder_warms_and_hashes_its_bytes() {
+    let case = warm_case("warm-declared");
+    fs::remove_dir_all(case.folder().join(".gate")).expect("the worktree's .gate can be removed");
+    let bytes = format!("# the PC's copy\n{ONE_COMMAND}").into_bytes();
+    let folder = case.local_app_data().join("declarations");
+    fs::create_dir_all(&folder).expect("the declarations folder can be made");
+    fs::write(folder.join("warmup.toml"), &bytes).expect("the PC copy can be written");
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["*tool*"] },
+        "warmup": [repo(&case)],
+        "declarations": { repo(&case): folder.to_string_lossy() },
+    });
+    write_remote_json(&case, &routing.to_string());
+
+    let outcome = warm(&case, &steps(&case, &["warmed"]), &[]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let record = record(&case).expect("a record");
+    assert_eq!(record["state"], "warm", "{record}");
+    assert_eq!(record["hash"], warmup_hash(&bytes), "the copy's own bytes are hashed: {record}");
+}
+
+/// A worktree with no warm-up file of its own, whose declarations entry names no folder, says why the folder was not
+/// read on the line of the missing file, and stays quiet in the background.
+#[test]
+fn a_warm_up_without_a_file_says_why_the_declarations_folder_was_not_read() {
+    let case = warm_case("warm-declared-typo");
+    fs::remove_file(case.folder().join(".gate").join("warmup.toml")).expect("the file can be removed");
+    let typo = case.local_app_data().join("declaratoins");
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["*tool*"] },
+        "warmup": [repo(&case)],
+        "declarations": { repo(&case): typo.to_string_lossy() },
+    });
+    write_remote_json(&case, &routing.to_string());
+    let steps = steps(&case, &["warmed"]);
+
+    let outcome = warm(&case, &steps, &[]);
+
+    let end = format!(
+        r"\.gate\warmup.toml does not exist; declarations for {} not read: '{}' does not exist",
+        repo(&case),
+        typo.display()
+    );
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    let line = outcome.stderr.trim_end();
+    assert!(
+        line.starts_with("gate: warm: ") && line.ends_with(&end) && line.lines().count() == 1,
+        "{end}: {outcome:?}"
+    );
+    let background = warm(&case, &steps, &["--background"]);
+    assert_eq!((background.code, background.stderr.as_str()), (Some(0), ""), "{background:?}");
+    assert_eq!(record(&case), None, "no record");
+}
+
+/// A sibling declared only in the declarations folder's `siblings.toml` is carried by the warm-up as a routed run
+/// carries it.
+#[test]
+fn a_warm_up_carries_the_siblings_declared_only_in_the_declarations_folder() {
+    let case = warm_case("warm-declared-siblings");
+    let (sibling, beside) = sibling_plan(&case);
+    sibling_folder(&beside);
+    let folder = case.local_app_data().join("declarations");
+    fs::create_dir_all(&folder).expect("the declarations folder can be made");
+    fs::write(folder.join("siblings.toml"), format!("siblings = [\"{sibling}\"]\n")).expect("the PC copy can be written");
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["*tool*"] },
+        "warmup": [repo(&case)],
+        "siblings": { repo(&case): [&sibling] },
+        "declarations": { repo(&case): folder.to_string_lossy() },
+    });
+    write_remote_json(&case, &routing.to_string());
+    let call = case.folder().join("call.json");
+
+    let outcome = warm(&case, &steps(&case, &[&format!("record {}", shown(&call)), "warmed"]), &[]);
+    fs::remove_dir_all(&beside).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let call = recorded(&call);
+    let names: Vec<&Value> = call["siblings"]
+        .as_array()
+        .expect("the call has siblings")
+        .iter()
+        .map(|carried| &carried["name"])
+        .collect();
+    assert_eq!(names, [&json!(sibling)], "{call}");
+}
+
 #[test]
 fn a_warm_up_whose_client_cannot_start_is_recorded_refused() {
     let (_, outcome, failed) = warmed_with("warm-fail-start", &["fail-start no way to the builder"]);

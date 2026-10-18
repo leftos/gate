@@ -217,6 +217,11 @@ pub trait Facts {
     /// saying so.
     fn desktop(&self, place: &Place) -> Result<Vec<Pattern>, String>;
 
+    /// How the lines name the declaration file `name` (`siblings.toml` or `desktop.toml`) of the worktree at `place`, as
+    /// [`Facts::siblings`] or [`Facts::desktop`] read it: `.gate/<name>` for the worktree's own, else the full path of
+    /// the copy it was read from. Asked once that file was read, for a line about it.
+    fn declaration_said(&self, place: &Place, name: &str) -> String;
+
     /// The folder of the sibling whose root is `root`, which the decision builds as the worktree root's parent and the
     /// sibling's name: its parent opened following links, then the name opened beneath it without following one.
     /// Missing when nothing is there or it holds no `.git`; refused, with the reason, when it is a link or a junction,
@@ -302,8 +307,9 @@ pub enum LocalReason {
     NothingSent { subfolder: String },
     /// A fact could not be read; `reason` is on one line.
     Failed { reason: String },
-    /// `.gate/siblings.toml` cannot be read or has a problem; `problem` is its first, on one line.
-    SiblingsFile { problem: String },
+    /// The siblings file `file` ([`Facts::declaration_said`]) cannot be read or has a problem; `problem` is its first,
+    /// on one line.
+    SiblingsFile { file: String, problem: String },
     /// The declared sibling `name` has no git worktree beside the worktree root.
     SiblingMissing { name: String },
     /// The declared sibling `name` is there but cannot be carried, for `reason`, which reads after its name.
@@ -313,8 +319,9 @@ pub enum LocalReason {
     SiblingsNotAllowed { names: Vec<String>, problem: Option<String> },
     /// The worktree root, which declares siblings, has a folder name `leaf` the builder cannot lay out.
     LeafNotLaidOut { leaf: String },
-    /// `.gate/desktop.toml` cannot be read or has a problem; `problem` is its first, on one line.
-    DesktopFile { problem: String },
+    /// The desktop file `file` ([`Facts::declaration_said`]) cannot be read or has a problem; `problem` is its first,
+    /// on one line.
+    DesktopFile { file: String, problem: String },
     /// The first declared desktop pattern the command matches, `pattern`, is not among those `remote.json`'s `desktop`
     /// allows the repo; `problem` is why that value cannot be used, when it cannot.
     DesktopNotAllowed { pattern: String, problem: Option<String> },
@@ -334,12 +341,11 @@ impl LocalReason {
             }
             Self::NothingSent { subfolder } => format!("gate: not routed: {subfolder} holds nothing the snapshot sends"),
             Self::Failed { reason } => format!("gate: not routed: {reason}"),
-            Self::SiblingsFile { problem } => format!("gate: not routed: .gate/siblings.toml: {problem}"),
+            Self::SiblingsFile { file, problem } | Self::DesktopFile { file, problem } => format!("gate: not routed: {file}: {problem}"),
             Self::SiblingMissing { name } => format!("gate: not routed: sibling {name} not found beside the worktree"),
             Self::SiblingRefused { name, reason } => format!("gate: not routed: sibling {name} {reason}"),
             Self::SiblingsNotAllowed { names, problem } => not_allowed_line(names, problem.as_deref()),
             Self::LeafNotLaidOut { leaf } => format!("gate: not routed: the worktree folder name {leaf} cannot be laid out on the builder"),
-            Self::DesktopFile { problem } => format!("gate: not routed: .gate/desktop.toml: {problem}"),
             Self::DesktopNotAllowed { pattern, problem } => {
                 let problem = problem.as_ref().map_or_else(String::new, |problem| format!(": {problem}"));
                 format!(
@@ -901,6 +907,7 @@ fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts)
 fn check_desktop(config: &Config, target: &Target, words: &[String], facts: &dyn Facts) -> Result<bool, Here> {
     let declared = facts.desktop(&target.place).map_err(|problem| {
         Some(LocalReason::DesktopFile {
+            file: escaped(&facts.declaration_said(&target.place, "desktop.toml")),
             problem: escaped(&fold_lines(&problem)),
         })
     })?;
@@ -929,6 +936,8 @@ struct Opened<'a> {
     siblings: Vec<SiblingRoot>,
     /// The siblings file's problem, when it has one.
     problem: Option<String>,
+    /// How the lines name the siblings file, shown [`escaped`].
+    file: String,
 }
 
 /// The worktree at `place` when the routing file lists its repo, with the patterns it lists and its siblings file read;
@@ -941,6 +950,7 @@ fn open<'a>(config: &'a Config, place: Place, facts: &dyn Facts) -> Result<Opene
         Ok(names) => (sibling_roots(&place.root, names), None),
         Err(problem) => (Vec::new(), Some(problem)),
     };
+    let file = escaped(&facts.declaration_said(&place, "siblings.toml"));
     Ok(Opened {
         place,
         repo,
@@ -948,6 +958,7 @@ fn open<'a>(config: &'a Config, place: Place, facts: &dyn Facts) -> Result<Opene
         patterns,
         siblings,
         problem,
+        file,
     })
 }
 
@@ -982,10 +993,12 @@ fn settle(config: &Config, opened: Opened<'_>, facts: &dyn Facts) -> Result<Targ
         leaf,
         siblings,
         problem,
+        file,
         ..
     } = opened;
     let declared = Declared {
         problem,
+        file: &file,
         root: &place.root,
         leaf: &leaf,
         siblings: &siblings,
@@ -1043,6 +1056,8 @@ pub fn sibling_root(root: &str, name: &str) -> String {
 struct Declared<'a> {
     /// The file's first problem, when it has one; it then declares none.
     problem: Option<String>,
+    /// How the lines name the file, shown [`escaped`].
+    file: &'a str,
     /// The worktree root as git gives it.
     root: &'a str,
     /// The worktree root's folder name.
@@ -1063,12 +1078,14 @@ struct Declared<'a> {
 fn check_siblings(declared: &Declared<'_>, allowed: Result<&[String], &str>, facts: &dyn Facts) -> Result<(FolderId, Vec<FolderId>), Here> {
     let &Declared {
         ref problem,
+        file,
         root,
         leaf,
         siblings,
     } = declared;
     if let Some(problem) = problem {
         return Err(Some(LocalReason::SiblingsFile {
+            file: file.to_owned(),
             problem: escaped(&fold_lines(problem)),
         }));
     }
@@ -1076,9 +1093,9 @@ fn check_siblings(declared: &Declared<'_>, allowed: Result<&[String], &str>, fac
     if siblings.is_empty() {
         return Ok((root_id()?, Vec::new()));
     }
-    check_layout_names(siblings)?;
+    check_layout_names(siblings, file)?;
     check_consent(siblings, allowed)?;
-    check_leaf(siblings, leaf)?;
+    check_leaf(siblings, leaf, file)?;
     let ids = folder_ids(siblings, facts)?;
     let root_id = root_id()?;
     check_distinct(siblings, &ids, root_id)?;
@@ -1087,10 +1104,12 @@ fn check_siblings(declared: &Declared<'_>, allowed: Result<&[String], &str>, fac
 
 /// Keeps the run here for a sibling's name the builder cannot lay out, checked again here whatever the siblings file's
 /// reader checked, so no sibling's root, the root's parent and its name joined, holds a separator or `..`. It reads no
-/// folder and comes before consent, so a bad name is refused as such whatever `remote.json` allows.
-fn check_layout_names(siblings: &[SiblingRoot]) -> Result<(), Here> {
+/// folder and comes before consent, so a bad name is refused as such whatever `remote.json` allows. The line names the
+/// siblings file as `file`.
+fn check_layout_names(siblings: &[SiblingRoot], file: &str) -> Result<(), Here> {
     if let Some((index, sibling)) = siblings.iter().enumerate().find(|(_, sibling)| !is_layout_name(&sibling.name)) {
         return Err(Some(LocalReason::SiblingsFile {
+            file: file.to_owned(),
             problem: format!("siblings[{index}] is not a folder name the builder can lay out: {:?}", sibling.name),
         }));
     }
@@ -1098,13 +1117,14 @@ fn check_layout_names(siblings: &[SiblingRoot]) -> Result<(), Here> {
 }
 
 /// Keeps the run here when the root's folder name `leaf` is no name the builder can lay out, then for a sibling named
-/// like that folder (ASCII letter case aside).
-fn check_leaf(siblings: &[SiblingRoot], leaf: &str) -> Result<(), Here> {
+/// like that folder (ASCII letter case aside), the line naming the siblings file as `file`.
+fn check_leaf(siblings: &[SiblingRoot], leaf: &str, file: &str) -> Result<(), Here> {
     if !is_layout_name(leaf) {
         return Err(Some(LocalReason::LeafNotLaidOut { leaf: leaf.to_owned() }));
     }
     if let Some((index, sibling)) = siblings.iter().enumerate().find(|(_, sibling)| sibling.name.eq_ignore_ascii_case(leaf)) {
         return Err(Some(LocalReason::SiblingsFile {
+            file: file.to_owned(),
             problem: format!("siblings[{index}] is the worktree's own folder: {:?}", sibling.name),
         }));
     }

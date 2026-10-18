@@ -1,5 +1,5 @@
 //! The check of this PC: the worktree root the gate's working folder is in, the repo's `.gate/toolchain.toml` and
-//! `.gate/siblings.toml` read from disk through the guarded `.gate` read routing uses ([`route::read_gate_file`]), so
+//! `.gate/siblings.toml` read from disk through routing's declarations reader ([`route::read_declaration`]), so
 //! an uncommitted edit counts, the root `global.json`'s SDK pin, the manifest's tools probed as a builder probes them
 //! ([`probe::probe`]) while this PC's SDK list is read, both with the worktree's own folders dropped from `PATH`, each
 //! sibling looked for by routing's rule, and the warm-up: `.gate/warmup.toml`, `remote.json`'s consent and the work
@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use gate_args::{CheckRequest, CheckSeams};
 use gate_router::warm::{FileRead, Judgement, Record, RecordRead, RecordState, Situation, WarmupFile, judge, lock_problem_text, record_problem_text};
-use gate_router::{Place, SiblingFolder, repo_name, sibling_root, work_folder_key};
+use gate_router::{Config, Place, SiblingFolder, repo_name, sibling_root, work_folder_key};
 use gate_state::v1;
 
 use crate::answer::FAILED_STATUS;
@@ -23,7 +23,7 @@ use crate::environment::Variables;
 use crate::remote::toolchain::{self, Manifest, Pin, Reported, ToolNeed};
 use crate::remote::{git, local_sdk_listing, outside_worktree, parity, siblings};
 use crate::resolve::{self, Environment};
-use crate::route::{self, PLACE_ARGS, read_place};
+use crate::route::{self, Origin, PLACE_ARGS, read_place};
 use crate::warm;
 use gate_desktop::version::build_version;
 
@@ -109,10 +109,80 @@ impl Declared {
     }
 }
 
-/// What the manifest and the `global.json` of the worktree `root` declare ([`read_manifest`], [`read_pin`]).
-pub(super) fn declared(root: &Path) -> Declared {
-    let mut problems = Vec::new();
-    let manifest = read_manifest(root);
+/// The repo's declarations folder as this PC's routing file names it, and what the reads through it found
+/// ([`route::read_declaration`]): the files taken from that folder, and why it cannot be used.
+pub(super) struct Declarations {
+    repo: String,
+    config: Option<Config>,
+    /// Each file taken from the declarations folder, as the lines name it in `.gate`, with its full path there.
+    pub read_from: Vec<(&'static str, String)>,
+    /// Each file of the worktree's own that shadows a copy in the declarations folder, as the lines name it in `.gate`,
+    /// with the copy's full path.
+    pub shadowed: Vec<(&'static str, String)>,
+    /// Why the declarations folder cannot be used, judged whether or not a read reaches it.
+    pub problem: Option<String>,
+    /// Why this PC's routing file cannot be used, as its problem line says it, until [`declared`] takes it.
+    routing_problem: Option<String>,
+}
+
+impl Declarations {
+    /// The declarations of `repo` on this PC: its routing file's; a routing file that cannot be used names none, and
+    /// why is kept for its problem line.
+    pub(super) fn from_process(repo: &str) -> Declarations {
+        let read = route::remote_json_path(std::env::var_os("LOCALAPPDATA").as_deref()).map(|path| route::read_remote_json(&path));
+        match read {
+            None => Declarations::new(repo, None),
+            Some(Ok(config)) => Declarations::new(repo, config),
+            Some(Err(problem)) => Declarations {
+                routing_problem: Some(format!("ignored {}: {}", problem.path.display(), problem.reason)),
+                ..Declarations::new(repo, None)
+            },
+        }
+    }
+
+    /// The declarations of `repo` that the routing file `config` names, none read yet, its entry judged
+    /// ([`route::judge_declarations`]).
+    pub(super) fn new(repo: &str, config: Option<Config>) -> Declarations {
+        Declarations {
+            repo: repo.to_owned(),
+            problem: route::judge_declarations(repo, config.as_ref()),
+            config,
+            read_from: Vec::new(),
+            shadowed: Vec::new(),
+            routing_problem: None,
+        }
+    }
+
+    /// The bytes of the declaration file `name` of the worktree `root`, the lines naming it `said`: the repo's own,
+    /// else its declarations folder's, noted when taken from there or when the repo's own shadows it.
+    fn read(&mut self, root: &Path, name: &str, said: &'static str) -> Result<Option<Vec<u8>>, String> {
+        let (read, source) = route::read_declaration(root, &self.repo, self.config.as_ref(), name);
+        if let Origin::Declarations(path) = source.origin {
+            self.read_from.push((said, path.to_string_lossy().into_owned()));
+        }
+        if let Some(path) = source.shadows {
+            self.shadowed.push((said, path.to_string_lossy().into_owned()));
+        }
+        if self.problem.is_none() {
+            self.problem = source.unusable;
+        }
+        read
+    }
+}
+
+/// What the manifest and the `global.json` of the worktree `root` declare ([`read_manifest`], [`read_pin`]), the
+/// manifest read through `declarations`.
+pub(super) fn declared(root: &Path, declarations: &mut Declarations) -> Declared {
+    let mut problems: Vec<Problem> = declarations
+        .routing_problem
+        .take()
+        .map(|text| Problem {
+            file: report::REMOTE_JSON,
+            text,
+        })
+        .into_iter()
+        .collect();
+    let manifest = read_manifest(root, declarations);
     let declares_toolchain = !matches!(manifest, Ok(None));
     let toolchain_unreadable = manifest.is_err();
     let mut manifest = match manifest {
@@ -166,10 +236,12 @@ pub(super) struct SiblingsFile {
     pub unreadable: bool,
 }
 
-/// What the worktree `root`'s `.gate/siblings.toml` declares, read through routing's guarded read
-/// ([`route::read_gate_file`]); every problem of the file is added to `problems`.
-pub(super) fn read_siblings_file(root: &Path, problems: &mut Vec<Problem>) -> SiblingsFile {
-    let declared = route::read_gate_file(root, SIBLINGS).and_then(|bytes| bytes.map(|bytes| siblings::read_bytes(&bytes)).transpose());
+/// What the worktree `root`'s `.gate/siblings.toml` declares, read through `declarations` ([`Declarations::read`]);
+/// every problem of the file is added to `problems`.
+pub(super) fn read_siblings_file(root: &Path, declarations: &mut Declarations, problems: &mut Vec<Problem>) -> SiblingsFile {
+    let declared = declarations
+        .read(root, SIBLINGS, report::SIBLINGS)
+        .and_then(|bytes| bytes.map(|bytes| siblings::read_bytes(&bytes)).transpose());
     match declared {
         Ok(None) => SiblingsFile::default(),
         Err(why) => {
@@ -201,7 +273,9 @@ pub(super) fn read_siblings_file(root: &Path, problems: &mut Vec<Problem>) -> Si
 /// What this PC has of what the repo at `place` needs, its tools probed within `limit`.
 fn checked(place: &Place, limit: Duration) -> Checked {
     let root = Path::new(&place.root);
-    let mut declared = declared(root);
+    let repo = repo_name(&place.checkout);
+    let mut declarations = Declarations::from_process(&repo);
+    let mut declared = declared(root, &mut declarations);
     let needs = std::mem::take(&mut declared.manifest.tools);
     // The SDK list is read while the tools are probed, so the check waits for the longer of the two bounds.
     let (tools, sdk) = thread::scope(|scope| {
@@ -212,19 +286,21 @@ fn checked(place: &Place, limit: Duration) -> Checked {
             .unwrap_or_else(|panic| Some(Sdk::Skipped(format!("cannot read this PC's SDK list: {}", probe::panic_reason(&*panic)))));
         (tools, sdk)
     });
-    let repo = repo_name(&place.checkout);
     let hooks_problem = hooks_problem(&repo);
     let (allowed, consent_problem) = match allowed_siblings(&repo) {
         None => (None, None),
         Some(Ok(names)) => (Some(names), None),
         Some(Err(problem)) => (Some(Vec::new()), Some(problem)),
     };
-    let (siblings, siblings_unreadable) = read_siblings(&place.root, allowed.as_deref(), &mut declared.problems);
+    let (siblings, siblings_unreadable) = read_siblings(&place.root, allowed.as_deref(), &mut declarations, &mut declared.problems);
     let consent_problem = consent_problem.filter(|_| !siblings.is_empty());
-    let warmed = warmup(&place.root, WarmSources::from_process(&repo), None, &mut declared.problems);
+    let warmed = warmup(&place.root, WarmSources::from_process(&repo, declarations), None, &mut declared.problems);
     Checked {
         repo,
         root: place.root.clone(),
+        read_from: warmed.declarations.read_from,
+        shadowed: warmed.declarations.shadowed,
+        declarations_problem: warmed.declarations.problem,
         declares_toolchain: declared.declares_toolchain,
         unreadable: declared.unreadable(siblings_unreadable, warmed.unreadable),
         problems: declared.problems,
@@ -254,23 +330,25 @@ pub(super) enum Consent {
     Problem(String),
 }
 
-/// What the warm-up's items are judged from besides the worktree: `remote.json`'s consent, and the state root that
-/// holds the work folder's record and lock, or why it cannot be found.
+/// What the warm-up's items are judged from besides the worktree: `remote.json`'s consent, the state root that holds
+/// the work folder's record and lock, or why it cannot be found, and the declarations the file is read through.
 pub(super) struct WarmSources {
     pub consent: Consent,
     pub state: Result<PathBuf, String>,
+    pub declarations: Declarations,
 }
 
 impl WarmSources {
-    /// The sources of `repo` on this PC: its routing file's consent, and the state root found with no `--state-dir`
-    /// (`GATE_STATE_DIR`, then `%LOCALAPPDATA%\gate\v1`).
-    pub(super) fn from_process(repo: &str) -> WarmSources {
+    /// The sources of `repo` on this PC: its routing file's consent, the state root found with no `--state-dir`
+    /// (`GATE_STATE_DIR`, then `%LOCALAPPDATA%\gate\v1`), and its `declarations`.
+    pub(super) fn from_process(repo: &str, declarations: Declarations) -> WarmSources {
         let state = resolve::root(None, &Environment::from_process())
             .map(|state| state.path)
             .map_err(|why| why.strip_prefix("gate: ").map_or_else(|| why.clone(), str::to_owned));
         WarmSources {
             consent: warmup_consent(repo),
             state,
+            declarations,
         }
     }
 }
@@ -303,23 +381,26 @@ pub(super) struct Warmed {
     pub items: Vec<Warmup>,
     pub hash: Option<String>,
     pub unreadable: bool,
+    /// The declarations the warm-up file was read through, the read noted.
+    pub declarations: Declarations,
 }
 
 /// The warm-up's items of the worktree root `root`, from `sources`; each problem of the file is added to `problems`,
 /// consent or not, and a file that cannot be read whole is said as such whatever the consent. A repo with neither the
 /// file nor consent, and a `.gate` that is not a folder, have no item. The record is judged for `remote.json`'s host,
 /// or for the builder `builder` a builder check checks, and then only a record that names it, or cannot be read, is
-/// said.
-pub(super) fn warmup(root: &str, sources: WarmSources, builder: Option<&str>, problems: &mut Vec<Problem>) -> Warmed {
+/// said. The file is read through the sources' declarations, which the result gives back.
+pub(super) fn warmup(root: &str, mut sources: WarmSources, builder: Option<&str>, problems: &mut Vec<Problem>) -> Warmed {
     let folder = Path::new(root);
     if route::gate_is_not_a_folder(folder) {
         return Warmed {
             items: Vec::new(),
             hash: None,
             unreadable: false,
+            declarations: sources.declarations,
         };
     }
-    let file = warm::read_warmup_file_checked(folder);
+    let file = warm::warmup_from(sources.declarations.read(folder, warm::WARMUP_NAME, report::WARMUP));
     let unreadable = file.as_ref().is_err_and(|found| found.unreadable);
     if let Err(found) = &file {
         problems.extend(found.problems.iter().map(|text| Problem {
@@ -327,8 +408,18 @@ pub(super) fn warmup(root: &str, sources: WarmSources, builder: Option<&str>, pr
             text: text.clone(),
         }));
     }
-    let (items, hash) = warmup_items(root, file.map_err(drop), sources, builder);
-    Warmed { items, hash, unreadable }
+    let WarmSources {
+        consent,
+        state,
+        declarations,
+    } = sources;
+    let (items, hash) = warmup_items(root, file.map_err(drop), consent, state, builder);
+    Warmed {
+        items,
+        hash,
+        unreadable,
+        declarations,
+    }
 }
 
 /// The items of [`warmup`], from the warm-up file `file` as it read (`Err` when it did not), and the file's hash when
@@ -336,11 +427,12 @@ pub(super) fn warmup(root: &str, sources: WarmSources, builder: Option<&str>, pr
 fn warmup_items(
     root: &str,
     file: Result<Option<(WarmupFile, String)>, ()>,
-    sources: WarmSources,
+    consent: Consent,
+    state: Result<PathBuf, String>,
     builder: Option<&str>,
 ) -> (Vec<Warmup>, Option<String>) {
     let declared = !matches!(file, Ok(None));
-    let host = match sources.consent {
+    let host = match consent {
         Consent::Given { host } => host,
         Consent::Refused => return (declared.then_some(Warmup::Unconsented).into_iter().collect(), None),
         Consent::Problem(why) => return (declared.then_some(Warmup::ConsentProblem(why)).into_iter().collect(), None),
@@ -350,7 +442,7 @@ fn warmup_items(
         Ok(None) => return (vec![Warmup::NoFile], None),
         Err(()) => return (vec![Warmup::FileProblems], None),
     };
-    let state = match sources.state {
+    let state = match state {
         Ok(state) => state,
         Err(why) => return (vec![Warmup::NoStateRoot(why)], Some(hash)),
     };
@@ -441,10 +533,11 @@ fn minutes_ago(age: Duration) -> u64 {
     (age.as_secs() / 60).max(1)
 }
 
-/// The manifest `<root>\.gate\toolchain.toml` holds as it stands on disk; `None` when there is none; else why it
-/// cannot be read whole, a `.gate` that is not a folder among the reasons.
-fn read_manifest(root: &Path) -> Result<Option<Manifest>, String> {
-    match route::read_gate_file(root, TOOLCHAIN)? {
+/// The manifest `<root>\.gate\toolchain.toml` holds as it stands on disk, else its copy in the declarations folder,
+/// read through `declarations`; `None` when there is none; else why it cannot be read whole, a `.gate` that is not a
+/// folder among the reasons.
+fn read_manifest(root: &Path, declarations: &mut Declarations) -> Result<Option<Manifest>, String> {
+    match declarations.read(root, TOOLCHAIN, report::TOOLCHAIN)? {
         Some(bytes) => toolchain::read_bytes(&bytes).map(Some),
         None if route::gate_is_not_a_folder(root) => Err(GATE_NOT_A_FOLDER.to_owned()),
         None => Ok(None),
@@ -527,8 +620,8 @@ fn sdk_list(root: &Path) -> Result<Vec<String>, String> {
 /// and only the rest are looked for beside the worktree root `root`; and whether that file is there but cannot be read
 /// whole. Every problem of the file is added to `problems` ([`read_siblings_file`]), and the names that read are still
 /// checked.
-fn read_siblings(root: &str, allowed: Option<&[String]>, problems: &mut Vec<Problem>) -> (Vec<Sibling>, bool) {
-    let file = read_siblings_file(Path::new(root), problems);
+fn read_siblings(root: &str, allowed: Option<&[String]>, declarations: &mut Declarations, problems: &mut Vec<Problem>) -> (Vec<Sibling>, bool) {
+    let file = read_siblings_file(Path::new(root), declarations, problems);
     let leaf = root_leaf(root);
     let siblings = file
         .names
@@ -601,11 +694,16 @@ mod tests {
 
     use gate_router::SiblingFolder;
 
-    use super::{Declared, read_manifest, read_pin, read_siblings, read_siblings_file, sdk_of, sibling};
+    use super::{Declarations, Declared, read_manifest, read_pin, read_siblings, read_siblings_file, sdk_of, sibling};
     use crate::check::report::{Found, Sdk, Sibling};
     use crate::remote::parity::{Pin, pin_of};
     use crate::remote::toolchain::{Manifest, ToolNeed, Version};
     use crate::test_support::junction;
+
+    /// The declarations of a repo with no routing file.
+    fn no_declarations() -> Declarations {
+        Declarations::new("g", None)
+    }
 
     /// A folder of its own under the unit tests' temp folder, removed when the test ends, failed or not.
     struct Folder(PathBuf);
@@ -648,7 +746,9 @@ mod tests {
         let root = Folder::new("manifest-on-disk");
         write(&root.path().join(".gate").join("toolchain.toml"), "[tools]\nnode = \"24\"\n");
 
-        let manifest = read_manifest(root.path()).expect("the manifest reads").expect("there is a manifest");
+        let manifest = read_manifest(root.path(), &mut no_declarations())
+            .expect("the manifest reads")
+            .expect("there is a manifest");
 
         assert_eq!(
             manifest.tools,
@@ -682,9 +782,9 @@ mod tests {
     #[test]
     fn a_missing_manifest_declares_nothing() {
         let root = Folder::new("manifest-missing");
-        assert_eq!(read_manifest(root.path()), Ok(None), "no .gate");
+        assert_eq!(read_manifest(root.path(), &mut no_declarations()), Ok(None), "no .gate");
         fs::create_dir_all(root.path().join(".gate")).expect("the .gate folder can be made");
-        assert_eq!(read_manifest(root.path()), Ok(None), "a .gate with no manifest");
+        assert_eq!(read_manifest(root.path(), &mut no_declarations()), Ok(None), "a .gate with no manifest");
     }
 
     #[test]
@@ -692,7 +792,10 @@ mod tests {
         let root = Folder::new("manifest-gate-file");
         write(&root.path().join(".gate"), "not a folder\n");
 
-        assert_eq!(read_manifest(root.path()), Err(".gate is not a folder".to_owned()));
+        assert_eq!(
+            read_manifest(root.path(), &mut no_declarations()),
+            Err(".gate is not a folder".to_owned())
+        );
     }
 
     #[test]
@@ -701,15 +804,21 @@ mod tests {
         let elsewhere = Folder::new("manifest-refused-elsewhere");
         let file = root.path().join(".gate").join("toolchain.toml");
         write(&file, &format!("[tools]\n#{}\n", "x".repeat(64 * 1024)));
-        assert_eq!(read_manifest(root.path()), Err("is larger than 64 KiB".to_owned()));
+        assert_eq!(
+            read_manifest(root.path(), &mut no_declarations()),
+            Err("is larger than 64 KiB".to_owned())
+        );
         write(&file, "[tools\n");
-        let why = read_manifest(root.path()).expect_err("a manifest that is no TOML is unreadable");
+        let why = read_manifest(root.path(), &mut no_declarations()).expect_err("a manifest that is no TOML is unreadable");
         assert!(why.starts_with("line 1, column "), "{why}");
 
         write(&elsewhere.path().join("toolchain.toml"), "[tools]\nnode = \"24\"\n");
         fs::remove_dir_all(root.path().join(".gate")).expect("the real .gate can be removed");
         junction(&root.path().join(".gate"), elsewhere.path());
-        assert_eq!(read_manifest(root.path()), Err(".gate is a link or a junction".to_owned()));
+        assert_eq!(
+            read_manifest(root.path(), &mut no_declarations()),
+            Err(".gate is a link or a junction".to_owned())
+        );
         fs::remove_dir(root.path().join(".gate")).expect("the junction can be removed");
     }
 
@@ -717,7 +826,7 @@ mod tests {
     fn only_a_siblings_file_that_names_one_or_cannot_be_read_declares_siblings() {
         let root = Folder::new("declares-siblings");
         let file = root.path().join(".gate").join("siblings.toml");
-        let declares_siblings = |root: &Path| read_siblings_file(root, &mut Vec::new()).declares;
+        let declares_siblings = |root: &Path| read_siblings_file(root, &mut no_declarations(), &mut Vec::new()).declares;
         assert!(!declares_siblings(root.path()), "no file");
         write(&file, "siblings = []\n");
         assert!(!declares_siblings(root.path()), "an empty list");
@@ -859,7 +968,7 @@ mod tests {
         fs::create_dir_all(parent.path().join("gone")).expect("a folder with no git can be made");
 
         let mut problems = Vec::new();
-        let (found, unreadable) = read_siblings(&root.to_string_lossy(), None, &mut problems);
+        let (found, unreadable) = read_siblings(&root.to_string_lossy(), None, &mut no_declarations(), &mut problems);
         assert!(!unreadable, "the siblings file reads");
 
         let seen: Vec<(&str, bool)> = found.iter().map(|sibling| (sibling.name.as_str(), present(sibling))).collect();
@@ -899,7 +1008,7 @@ mod tests {
         write(&root.join(".gate").join("siblings.toml"), "siblings = ['here', 'Other', 'gone']\n");
         let root = root.to_string_lossy();
         let allowed = |list: Option<&[String]>| -> Vec<bool> {
-            read_siblings(&root, list, &mut Vec::new())
+            read_siblings(&root, list, &mut no_declarations(), &mut Vec::new())
                 .0
                 .iter()
                 .map(|sibling| sibling.found != Found::NotAllowed)
@@ -928,14 +1037,14 @@ mod tests {
         write(&root.join(".gate").join("siblings.toml"), "siblings = ['APP', 'here']\n");
         fs::create_dir_all(parent.path().join("here").join(".git")).expect("the sibling's git can be made");
 
-        let (found, _) = read_siblings(&root.to_string_lossy(), None, &mut Vec::new());
+        let (found, _) = read_siblings(&root.to_string_lossy(), None, &mut no_declarations(), &mut Vec::new());
 
         assert_eq!(
             found[0].found,
             Found::Folder(Ok(SiblingFolder::Refused("is the worktree's own folder".to_owned())))
         );
         assert!(present(&found[1]), "the other sibling is still looked for");
-        let (trailing, _) = read_siblings(&format!("{}\\", root.to_string_lossy()), None, &mut Vec::new());
+        let (trailing, _) = read_siblings(&format!("{}\\", root.to_string_lossy()), None, &mut no_declarations(), &mut Vec::new());
         assert_eq!(trailing[0].found, found[0].found, "a separator at the root's end changes nothing");
     }
 
@@ -948,7 +1057,7 @@ mod tests {
         fs::create_dir_all(parent.path().join("real").join(".git")).expect("the junction's target can be made");
         junction(&parent.path().join("linked"), &parent.path().join("real"));
 
-        let (found, _) = read_siblings(&root.to_string_lossy(), None, &mut Vec::new());
+        let (found, _) = read_siblings(&root.to_string_lossy(), None, &mut no_declarations(), &mut Vec::new());
 
         assert_eq!(
             found[0].found,

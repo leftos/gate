@@ -88,6 +88,8 @@ pub(crate) const SIBLINGS: &str = ".gate/siblings.toml";
 pub(crate) const GLOBAL_JSON: &str = "global.json";
 /// How the lines name the warm-up file.
 pub(crate) const WARMUP: &str = ".gate/warmup.toml";
+/// This PC's routing file, as a problem line names it.
+pub(crate) const REMOTE_JSON: &str = "remote.json";
 
 /// One item of the repo's warm-up, as the check found it: the warm-up file and `remote.json`'s consent, then, with
 /// both, the work folder's warm-up record on this PC, and for a builder what its preflight said of its work folder.
@@ -135,6 +137,14 @@ pub(crate) struct Checked {
     pub repo: String,
     /// The worktree root, as git spells it.
     pub root: String,
+    /// Each file taken from the repo's declarations folder, as the lines name it in `.gate`, with its full path there,
+    /// which its problem lines and the summary name instead.
+    pub read_from: Vec<(&'static str, String)>,
+    /// Each file of the worktree's own that shadows a copy in the declarations folder, as the lines name it in `.gate`,
+    /// with the copy's full path.
+    pub shadowed: Vec<(&'static str, String)>,
+    /// Why the repo's declarations folder cannot be used, judged whether or not a read reached it.
+    pub declarations_problem: Option<String>,
     /// Whether the repo has a `.gate/toolchain.toml`, readable or not.
     pub declares_toolchain: bool,
     /// The files that are there but cannot be read whole, so their items could not be checked, in the order the
@@ -180,6 +190,15 @@ impl Checked {
             "unreal" => self.unreal.as_deref(),
             _ => None,
         }
+    }
+
+    /// How the problem lines and the summary name the file `file`: its full path when it was taken from the
+    /// declarations folder, escaped, else as it is.
+    fn named(&self, file: &str) -> String {
+        self.read_from
+            .iter()
+            .find(|(said, _)| *said == file)
+            .map_or_else(|| file.to_owned(), |(_, path)| escaped(path))
     }
 }
 
@@ -244,6 +263,18 @@ pub(crate) fn said(place: At<'_>, checked: &Checked) -> Said {
     if more > 0 {
         lines.push(Line::Out(format!("check: {at}: and {more} more created folders")));
     }
+    lines.extend(
+        checked
+            .read_from
+            .iter()
+            .map(|(file, path)| Line::Out(format!("check: {at}: {file}: read from {}", escaped(path)))),
+    );
+    lines.extend(
+        checked
+            .shadowed
+            .iter()
+            .map(|(file, path)| Line::Out(format!("check: {at}: {file}: the worktree's copy wins over {}", escaped(path)))),
+    );
     if !checked.declares_toolchain {
         lines.push(Line::Out(format!("check: {at}: {} declares no toolchain", checked.repo)));
     }
@@ -251,7 +282,7 @@ pub(crate) fn said(place: At<'_>, checked: &Checked) -> Said {
         checked
             .problems
             .iter()
-            .map(|problem| Line::Err(format!("check: {}: {}", problem.file, escaped(&problem.text)))),
+            .map(|problem| Line::Err(format!("check: {}: {}", checked.named(problem.file), escaped(&problem.text)))),
     );
     let items = items(place, checked);
     lines.extend(items.iter().map(|item| Line::Out(format!("check: {at}: {}", item.text))));
@@ -266,7 +297,8 @@ pub(crate) fn said(place: At<'_>, checked: &Checked) -> Said {
     let summary = if checked.unreadable.is_empty() {
         summary(missing, too_old, skipped)
     } else {
-        format!("could not read {}; {}", checked.unreadable.join(", "), counts(missing, too_old, skipped))
+        let named: Vec<String> = checked.unreadable.iter().map(|file| checked.named(file)).collect();
+        format!("could not read {}; {}", named.join(", "), counts(missing, too_old, skipped))
     };
     lines.push(Line::Out(format!("check: {at}: {summary}")));
     let failed = !checked.unreadable.is_empty() || missing + too_old > 0;
@@ -293,26 +325,37 @@ fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
     if let Some(problem) = &checked.hooks_problem {
         items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
     }
+    if let Some(why) = &checked.declarations_problem {
+        items.push(Item::new(
+            format!("declarations for {}: {}", escaped(&checked.repo), escaped(why)),
+            Kind::Missing,
+        ));
+    }
     items.extend(checked.siblings.iter().map(sibling_item));
     if checked.siblings_skipped {
         items.push(Item::new("siblings skipped: a routed run lays them out".to_owned(), Kind::Skipped));
     }
-    items.extend(checked.warmup.iter().map(|warmup| warmup_item(&checked.repo, warmup)));
+    items.extend(checked.warmup.iter().map(|warmup| warmup_item(checked, warmup)));
     items
 }
 
-/// The line of a warm-up item of the repo `repo`: what fails the check is what keeps the repo's matched runs here or
-/// leaves its consent unread, and the record's other states are said without counting.
-fn warmup_item(repo: &str, warmup: &Warmup) -> Item {
+/// The line of a warm-up item of the repo `checked` checks, its warm-up file named as its problem lines name it
+/// ([`Checked::named`]): what fails the check is what keeps the repo's matched runs here or leaves its consent unread,
+/// and the record's other states are said without counting.
+fn warmup_item(checked: &Checked, warmup: &Warmup) -> Item {
     let (text, kind) = match warmup {
         Warmup::Unconsented => (
-            format!("{WARMUP} is there, but remote.json does not consent to warm-ups for {}", escaped(repo)),
+            format!(
+                "{} is there, but remote.json does not consent to warm-ups for {}",
+                checked.named(WARMUP),
+                escaped(&checked.repo)
+            ),
             Kind::Unchecked,
         ),
         Warmup::NoFile => (format!("remote.json consents, but the repo has no {WARMUP}"), Kind::Unchecked),
         Warmup::ConsentProblem(why) => (format!("remote.json: {}", escaped(why)), Kind::Missing),
         Warmup::FileProblems => (
-            format!("{WARMUP} has problems, so gate warm cannot prewarm a new worktree"),
+            format!("{} has problems, so gate warm cannot prewarm a new worktree", checked.named(WARMUP)),
             Kind::Missing,
         ),
         Warmup::NoStateRoot(why) => (format!("the state root cannot be found: {}", escaped(why)), Kind::Skipped),
@@ -561,6 +604,9 @@ mod tests {
         Checked {
             repo: "app".to_owned(),
             root: "X:/dev/app".to_owned(),
+            read_from: Vec::new(),
+            shadowed: Vec::new(),
+            declarations_problem: None,
             declares_toolchain: true,
             unreadable: Vec::new(),
             problems: Vec::new(),

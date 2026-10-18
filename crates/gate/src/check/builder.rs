@@ -1,10 +1,10 @@
-//! The check of a builder `remote.json` lists: the repo's `.gate/toolchain.toml`, `.gate/siblings.toml` and root
-//! `global.json` read from disk as this PC's check reads them, then one bounded call of the builder's `gate box
-//! preflight`, as a routed run's preflight is made, with the repo's own work-folder key and the manifest's tools as its
-//! `Needs`. The preflight readies only the work folder the next routed run of the repo would ready, and its answer is
-//! read with the remote client's own readers: the builder's gate build, the folders it created, its SDK list, what it
-//! found of each tool, and whether its work folder is warm for the worktree's warm-up file. The warm-up's items are
-//! this PC's, its record said only when it names the builder checked.
+//! The check of a builder `remote.json` lists: the repo's `.gate/toolchain.toml`, `.gate/siblings.toml` (or their
+//! copies in its declarations folder) and root `global.json` read from disk as this PC's check reads them, then one
+//! bounded call of the builder's `gate box preflight`, as a routed run's preflight is made, with the repo's own
+//! work-folder key and the manifest's tools as its `Needs`. The preflight readies only the work folder the next routed
+//! run of the repo would ready, and its answer is read with the remote client's own readers: the builder's gate build,
+//! the folders it created, its SDK list, what it found of each tool, and whether its work folder is warm for the
+//! worktree's warm-up file. The warm-up's items are this PC's, its record said only when it names the builder checked.
 
 use std::path::Path;
 use std::time::Duration;
@@ -15,7 +15,7 @@ use gate_win32::PipedConsole;
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::boxside::payload::escaped;
-use crate::check::local::{self, Declared, SiblingsFile, WarmSources, Warmed};
+use crate::check::local::{self, Declarations, Declared, SiblingsFile, WarmSources, Warmed};
 use crate::check::report::{self, At, Checked, Problem, Tool, Warmup};
 use crate::console::Console;
 use crate::environment::Variables;
@@ -130,9 +130,10 @@ struct Asked {
 /// the line saying why it could not be checked.
 fn asked(transport: &dyn Transport, host: &str, place: &Place, bound: Duration) -> Result<Asked, String> {
     let root = Path::new(&place.root);
-    let mut declared = local::declared(root);
-    let needs = toolchain::needs_of(&declared.manifest);
     let repo = repo_name(&place.checkout);
+    let mut declarations = Declarations::from_process(&repo);
+    let mut declared = local::declared(root, &mut declarations);
+    let needs = toolchain::needs_of(&declared.manifest);
     let key = work_folder_key(&place.root);
     let location = Location::under(transport.root(), &repo, &key, &payload::job_nonce());
     let input = payload::input(&payload::preflight_word(&location, &needs), None);
@@ -148,11 +149,14 @@ fn asked(transport: &dyn Transport, host: &str, place: &Place, bound: Duration) 
         lines: &heard.lines,
         last_error: heard.last_error.as_deref(),
     };
-    let siblings = local::read_siblings_file(root, &mut declared.problems);
-    let sources = WarmSources::from_process(&repo);
+    let siblings = local::read_siblings_file(root, &mut declarations, &mut declared.problems);
+    let sources = WarmSources::from_process(&repo, declarations);
     let warmed = warm_items(&place.root, sources, host, &heard.lines, &mut declared.problems);
     let mut checked = answer.checked(declared, repo, place.root.clone(), &siblings, warmed.unreadable);
     checked.warmup = warmed.items;
+    checked.read_from = warmed.declarations.read_from;
+    checked.shadowed = warmed.declarations.shadowed;
+    checked.declarations_problem = warmed.declarations.problem;
     Ok(Asked { checked, key })
 }
 
@@ -348,6 +352,9 @@ impl Answer<'_> {
             workloads: declared.manifest.workloads,
             consent_problem: None,
             hooks_problem: None,
+            read_from: Vec::new(),
+            shadowed: Vec::new(),
+            declarations_problem: None,
             siblings: Vec::new(),
             created,
             siblings_skipped: siblings.declares,
@@ -392,7 +399,7 @@ mod tests {
     use jiff::Timestamp;
 
     use super::{Answer, Failure, Heard, builder_warmth, failure, refusal, warm_items};
-    use crate::check::local::{Consent, Declared, SiblingsFile, WarmSources};
+    use crate::check::local::{Consent, Declarations, Declared, SiblingsFile, WarmSources};
     use crate::check::report::{At, Checked, Line, Sdk, Warmup, said};
     use crate::remote::git::GitError;
     use crate::remote::install_untrusted_line;
@@ -664,6 +671,7 @@ mod tests {
         WarmSources {
             consent: Consent::Given { host: HOST.to_owned() },
             state: Ok(state.to_path_buf()),
+            declarations: Declarations::new("g", None),
         }
     }
 

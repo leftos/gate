@@ -370,6 +370,162 @@ fn check_an_unreadable_manifest_exits_1_and_says_so() {
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
 }
 
+/// A declarations folder in the case folder holding each `(name, text)` of `files`, named for `app` in a routing file
+/// that lists it; the folder.
+fn declarations(case: &Case, files: &[(&str, &str)]) -> PathBuf {
+    let folder = case.folder().join("declarations");
+    fs::create_dir_all(&folder).expect("the declarations folder can be made");
+    for (name, text) in files {
+        fs::write(folder.join(name), text).expect("a declaration file can be written");
+    }
+    name_declarations(case, &folder);
+    folder
+}
+
+/// Writes a routing file that lists `app` and names `folder` as its declarations folder.
+fn name_declarations(case: &Case, folder: &Path) {
+    let routing = serde_json::json!({ "host": "builder-1", "repos": { "app": ["*"] }, "declarations": { "app": folder.to_string_lossy() } });
+    write_remote_json(case, &routing.to_string());
+}
+
+/// A repo with no manifest of its own is checked against its declarations folder's, and one line says where it was read.
+#[test]
+fn check_says_a_file_read_from_the_declarations_folder() {
+    let case = repo_case("check_declared_manifest");
+    let folder = declarations(&case, &[("toolchain.toml", "[tools]\nnode = \"24\"\n")]);
+    let stub = stubs(&case, &[("node", "@echo v24.19.0\r\n")]);
+
+    let outcome = check(&case, &[stub], &[]);
+
+    assert_eq!(
+        lines(&outcome.stdout),
+        [
+            format!("check: here: app at {}", root(&case)),
+            format!("check: here: .gate/toolchain.toml: read from {}", folder.join("toolchain.toml").display()),
+            "check: here: node 24.19.0 ok (needs 24.0.0 or later)".to_owned(),
+            "check: here: nothing missing".to_owned(),
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+/// A declarations folder that is not there is a problem of its own, exiting 1, and the repo's own files still apply.
+#[test]
+fn check_an_unusable_declarations_entry_exits_1_and_says_so() {
+    let case = repo_case("check_declarations_unusable");
+    write(&case, ".gate/toolchain.toml", "[tools]\nnode = \"24\"\n");
+    let missing = case.folder().join("no-such-folder");
+    name_declarations(&case, &missing);
+    let stub = stubs(&case, &[("node", "@echo v24.19.0\r\n")]);
+
+    let outcome = check(&case, &[stub], &[]);
+
+    assert_eq!(
+        lines(&outcome.stdout)[1..],
+        [
+            "check: here: node 24.19.0 ok (needs 24.0.0 or later)".to_owned(),
+            format!("check: here: declarations for app: '{}' does not exist", missing.display()),
+            "check: here: 1 missing, 0 too old".to_owned(),
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// A declarations folder's manifest that does not parse is named by its full path, in its problem line and the summary.
+#[test]
+fn check_a_problem_in_a_declarations_file_names_its_path() {
+    let case = repo_case("check_declared_manifest_unreadable");
+    let folder = declarations(&case, &[("toolchain.toml", "[tools\nnode = \"24\"\n")]);
+    let stub = stubs(&case, &[]);
+
+    let outcome = check(&case, &[stub], &[]);
+
+    let path = folder.join("toolchain.toml").display().to_string();
+    assert_eq!(
+        lines(&outcome.stdout)[1..],
+        [
+            format!("check: here: .gate/toolchain.toml: read from {path}"),
+            format!("check: here: could not read {path}; 0 missing, 0 too old"),
+        ],
+        "{outcome:?}"
+    );
+    assert!(outcome.stderr.starts_with(&format!("check: {path}: line ")), "{outcome:?}");
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// The worktree's own manifest wins over the declarations folder's, and the check says which copy it shadows.
+#[test]
+fn check_the_worktree_s_file_wins_and_says_the_copy_it_shadows() {
+    let case = repo_case("check_declared_manifest_shadowed");
+    write(&case, ".gate/toolchain.toml", "[tools]\nnode = \"24\"\n");
+    let folder = declarations(&case, &[("toolchain.toml", "[tools]\nnode = \"99\"\n")]);
+    let stub = stubs(&case, &[("node", "@echo v24.19.0\r\n")]);
+
+    let outcome = check(&case, &[stub], &[]);
+
+    assert_eq!(
+        lines(&outcome.stdout),
+        [
+            format!("check: here: app at {}", root(&case)),
+            format!(
+                "check: here: .gate/toolchain.toml: the worktree's copy wins over {}",
+                folder.join("toolchain.toml").display()
+            ),
+            "check: here: node 24.19.0 ok (needs 24.0.0 or later)".to_owned(),
+            "check: here: nothing missing".to_owned(),
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+/// A declarations entry that cannot be used is said, once, and fails the check even when the repo has every file of its
+/// own, so no read reaches the folder.
+#[test]
+fn check_an_unusable_declarations_entry_is_said_when_the_repo_has_every_file() {
+    let case = repo_case("check_declarations_unusable_unread");
+    write(&case, ".gate/toolchain.toml", "[tools]\nnode = \"24\"\n");
+    write(&case, ".gate/siblings.toml", "siblings = []\n");
+    write(&case, ".gate/warmup.toml", "commands = [[\"tool.exe\"]]\n");
+    let missing = case.folder().join("no-such-folder");
+    name_declarations(&case, &missing);
+    let stub = stubs(&case, &[("node", "@echo v24.19.0\r\n")]);
+
+    let outcome = check(&case, &[stub], &[]);
+
+    let line = format!("check: here: declarations for app: '{}' does not exist", missing.display());
+    assert_eq!(
+        lines(&outcome.stdout).iter().filter(|said| **said == line).count(),
+        1,
+        "{line}: {outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// A routing file that cannot be used is said on stderr as its problem, naming none of the repo's declarations, and the
+/// check's exit code stays the one its items give.
+#[test]
+fn check_an_unusable_routing_file_is_said_on_stderr_and_keeps_the_exit_code() {
+    let case = repo_case("check_routing_unusable");
+    write(&case, ".gate/toolchain.toml", "[tools]\nnode = \"24\"\n");
+    let path = write_remote_json(&case, "{}");
+    let stub = stubs(&case, &[("node", "@echo v24.19.0\r\n")]);
+
+    let outcome = check(&case, &[stub], &[]);
+
+    let line = format!("check: remote.json: ignored {}: host is missing", path.display());
+    assert!(outcome.stderr.lines().any(|said| said == line), "{line}: {outcome:?}");
+    assert_eq!(
+        lines(&outcome.stdout).last().copied(),
+        Some("check: here: nothing missing"),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
 /// A tool of the repo's own, in a folder inside the worktree first on `PATH`, is never the one probed: the probes look
 /// along `PATH` with the worktree's folders dropped, as the SDK list does.
 #[test]

@@ -39,7 +39,7 @@ use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, Pipe
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
-use gate_router::repo_name;
+use gate_router::{Config, repo_name};
 
 use super::git::{self, Git, GitError, NO_CURRENT_FOLDER, last_update};
 use super::held::{Held, sibling_who};
@@ -70,7 +70,7 @@ use crate::durations::{Usual, hang_hint, routed_usual};
 use crate::environment::Variables;
 use crate::outputs::archive::sent_limit;
 use crate::outputs::hash::{SHA256_DIGITS, is_lower_hex};
-use crate::route::open_followed;
+use crate::route::{self, open_followed};
 #[cfg(feature = "test-seams")]
 use crate::run::find_program;
 use crate::run::{CONTROL_C_EXIT, is_within, resolved};
@@ -550,7 +550,11 @@ struct Tree {
     git: Git,
     folder: PathBuf,
     names: Vec<String>,
+    /// The manifest; for a main repository whose tree has none, its copy in the declarations folder this PC's routing
+    /// file names, if any ([`Attempt::declared_manifest`]).
     manifest: Option<Result<Manifest, String>>,
+    /// The full path of the manifest when it is that copy; `None` for the tree's own.
+    manifest_file: Option<String>,
     /// The `Godot.NET.Sdk` versions its `*.csproj` files name, each version once, in the order the tree lists them.
     godot_pins: Vec<Pin>,
     /// One line per project file whose pin could not be read, in the same order.
@@ -559,6 +563,8 @@ struct Tree {
 
 /// The repo's toolchain manifest, as its path at the repo root is spelled.
 const MANIFEST_PATH: &str = ".gate/toolchain.toml";
+/// The manifest's name in a declarations folder.
+const MANIFEST_NAME: &str = "toolchain.toml";
 
 /// One entry of the snapshot's tree as `git ls-tree -z` lists one: the mode, the object type (`blob`, `tree` or
 /// `commit`), the object id and the path.
@@ -608,6 +614,31 @@ fn manifest_entry(entries: &[Entry]) -> Option<Result<&Entry, String>> {
         [only] => Some(regular(only)),
         [first, second, ..] => Some(Err(format!("{} and {} differ only in letter case", first.path, second.path))),
     }
+}
+
+/// This PC's routing file, through which the declarations folder is found: `None` when there is none, and when it
+/// cannot be used, the line saying why pushed onto `lines`.
+fn declarations_config(lines: &mut Vec<String>) -> Option<Config> {
+    match route::remote_json_path(std::env::var_os("LOCALAPPDATA").as_deref()).map(|path| route::read_remote_json(&path)) {
+        None => None,
+        Some(Ok(config)) => config,
+        Some(Err(problem)) => {
+            lines.push(format!(
+                "gate: ignored {}: {}; reading no declarations folder",
+                problem.path.display(),
+                escaped(&problem.reason)
+            ));
+            None
+        }
+    }
+}
+
+/// Whether the snapshot's `entries` hold a `.gate` (in any letter case) that is not a folder: the repo's own answer
+/// that it has no manifest, so no declarations folder is read for one.
+fn gate_is_no_folder(entries: &[Entry]) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry.path.eq_ignore_ascii_case(".gate") && entry.kind != "tree")
 }
 
 /// `entry` when it is a regular file, a blob of mode 100644 or 100755; else `Err` with what it is.
@@ -1522,6 +1553,7 @@ impl Attempt<'_, '_> {
             folder,
             names,
             manifest: None,
+            manifest_file: None,
             godot_pins: Vec::new(),
             godot_skips: Vec::new(),
         }))
@@ -1609,13 +1641,21 @@ impl Attempt<'_, '_> {
             .filter(|entry| entry.kind != "tree")
             .map(|entry| entry.path.clone())
             .collect();
-        let manifest = self.manifest(&git, &entries)?;
+        let (manifest, manifest_file) = match self.manifest(&git, &entries)? {
+            Some(read) => {
+                self.note_shadowed_manifest();
+                (Some(read), None)
+            }
+            None if gate_is_no_folder(&entries) => (None, None),
+            None => self.declared_manifest(),
+        };
         let (godot_pins, godot_skips) = self.godot_pins(&git, &entries)?;
         Ok(Some(Tree {
             git,
             folder,
             names,
             manifest,
+            manifest_file,
             godot_pins,
             godot_skips,
         }))
@@ -1686,6 +1726,40 @@ impl Attempt<'_, '_> {
         };
         self.go_on()?;
         Ok(Some(read))
+    }
+
+    /// The repo's copy of its manifest in the declarations folder this PC's routing file names, read for a snapshot
+    /// whose tree has none ([`route::read_declarations_copy`]): as it reads, `Err` with why when it cannot be read, with
+    /// its full path; `None` when there is none. Why the folder cannot be used, and where a copy was read from, go to
+    /// the log alone.
+    fn declared_manifest(&mut self) -> (Option<Result<Manifest, String>>, Option<String>) {
+        let mut lines = Vec::new();
+        let config = declarations_config(&mut lines);
+        let (read, source) = route::read_declarations_copy(self.call.repo, config.as_ref(), MANIFEST_NAME);
+        lines.extend(source.log_lines(self.call.repo, MANIFEST_NAME));
+        for line in route::unsaid(lines) {
+            self.logged_kept(line);
+        }
+        let read = match read {
+            Ok(None) => return (None, None),
+            Ok(Some(bytes)) => toolchain::read_bytes(&bytes),
+            Err(why) => Err(why),
+        };
+        (Some(read), Some(source.said(MANIFEST_NAME)))
+    }
+
+    /// Logs that the snapshot's own manifest shadows its copy in the declarations folder this PC's routing file names,
+    /// when anything is there by that name ([`route::declared_copy`]): the log alone, once a run, as routing notes the
+    /// files it reads.
+    fn note_shadowed_manifest(&mut self) {
+        let mut lines = Vec::new();
+        let config = declarations_config(&mut lines);
+        if let Some(path) = route::declared_copy(self.call.repo, config.as_ref(), MANIFEST_NAME) {
+            lines.push(route::shadows_line(MANIFEST_NAME, &path));
+        }
+        for line in route::unsaid(lines) {
+            self.logged_kept(line);
+        }
     }
 
     /// The `Godot.NET.Sdk` versions the snapshot's project files pin ([`csproj_pins`]), read in two git calls whatever
@@ -1812,7 +1886,14 @@ impl Attempt<'_, '_> {
     /// it requires ([`toolchain::godot_required`]), as the `prepared` preflight said of them, each manifest problem, tool
     /// not checked and project file left unread said.
     fn tool_needs(&mut self, tree: &Tree, prepared: &Prepared, godot: Option<&[Pin]>) -> Vec<parity::Need> {
-        let judged = toolchain::judge(tree.manifest.as_ref(), godot, &prepared.sent, &prepared.tools, self.call.host);
+        let file = tree.manifest_file.as_deref().unwrap_or(toolchain::MANIFEST_SAID);
+        let judged = toolchain::judge(
+            tree.manifest.as_ref().map(|read| (read, file)),
+            godot,
+            &prepared.sent,
+            &prepared.tools,
+            self.call.host,
+        );
         for line in judged.skips {
             self.say(line);
         }

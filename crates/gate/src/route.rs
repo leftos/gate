@@ -8,13 +8,14 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf, Prefix};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use gate_args::{GATE_SET_NAMES, RunRequest, Slot, TestSeams};
 use gate_router::warm::FileRead;
 use gate_router::{
     Config, ConfigProblem, Facts, FolderId, Inputs, LocalReason, Pattern, Place, RemoteRun, Route, SiblingFolder, decide, dropped_env,
-    dropped_env_line,
+    dropped_env_line, escaped, repo_name,
 };
 use gate_win32::Share;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -147,6 +148,9 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
         Route::Routed(remote) => consented_hash(remote, &machine),
         Route::Local { .. } => None,
     };
+    for line in unsaid(machine.notes.take()) {
+        console.note(&line);
+    }
     match &route {
         Route::Local { reason: Some(reason) } => console.err(&reason.line()),
         Route::Local { reason: None } => {}
@@ -198,15 +202,14 @@ fn dropped_line(request: &RunRequest) -> Option<String> {
 /// warm-up record nor its lock is read: the run routes either way, and the hash only words the cold note and guards the
 /// record a `layout` refusal drops.
 fn consented_hash(remote: &RemoteRun, machine: &Machine<'_>) -> Option<String> {
-    let consented = machine
-        .config
-        .borrow()
-        .as_ref()
-        .is_some_and(|config| config.warmup_consented(&remote.repo) == Ok(true));
+    let config = machine.config.borrow();
+    let consented = config.as_ref().is_some_and(|config| config.warmup_consented(&remote.repo) == Ok(true));
     if !consented {
         return None;
     }
-    match warm::read_warmup_file(Path::new(&remote.root)) {
+    let (read, source) = warm::read_warmup_file(Path::new(&remote.root), &remote.repo, config.as_ref());
+    machine.notes.borrow_mut().extend(source.log_lines(&remote.repo, warm::WARMUP_NAME));
+    match read {
         FileRead::Parsed { hash, .. } => Some(hash),
         FileRead::Absent | FileRead::Problem(_) => None,
     }
@@ -276,6 +279,10 @@ pub(crate) struct Machine<'a> {
     /// Whether the worktree's `HEAD` is read ([`Facts::head_sha`]): the route hint, which throws the route away, does
     /// not, and answers no sha.
     read_head: bool,
+    /// The log lines of the declaration files the decision read ([`Source::log_lines`]), for the log alone.
+    notes: RefCell<Vec<String>>,
+    /// Each declaration file the decision read, by name, with how the lines name it ([`Source::said`]).
+    said: RefCell<Vec<(String, String)>>,
 }
 
 impl<'a> Machine<'a> {
@@ -296,7 +303,27 @@ impl<'a> Machine<'a> {
             config: RefCell::new(None),
             look_up_trees: true,
             read_head: true,
+            notes: RefCell::new(Vec::new()),
+            said: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Holds `config` as the routing file the decision read, as [`Facts::config`] holds the one it reads: `gate warm`
+    /// reads its own and hands it over, so the declaration files are read through the folder it names.
+    pub(crate) fn hold_config(&self, config: &Config) {
+        self.config.replace(Some(config.clone()));
+    }
+
+    /// The declaration file `name` of the repo at `place` ([`read_declaration`]), its declarations folder the one the
+    /// routing file the decision read names, its log lines kept among the notes and how the lines name it kept.
+    fn declaration(&self, place: &Place, name: &str) -> Result<Option<Vec<u8>>, String> {
+        let repo = repo_name(&place.checkout);
+        let (read, source) = read_declaration(Path::new(&place.root), &repo, self.config.borrow().as_ref(), name);
+        self.notes.borrow_mut().extend(source.log_lines(&repo, name));
+        let mut said = self.said.borrow_mut();
+        said.retain(|(read_name, _)| read_name != name);
+        said.push((name.to_owned(), source.said(name)));
+        read
     }
 
     /// The decision's git call in `folder` with `args`, under the decision's limit and drain.
@@ -385,11 +412,20 @@ impl Facts for Machine<'_> {
     }
 
     fn siblings(&self, place: &Place) -> Result<Vec<String>, String> {
-        read_siblings(Path::new(&place.root))
+        read_siblings(self.declaration(place, "siblings.toml"))
     }
 
     fn desktop(&self, place: &Place) -> Result<Vec<Pattern>, String> {
-        read_desktop(Path::new(&place.root))
+        read_desktop(self.declaration(place, "desktop.toml"))
+    }
+
+    /// As the last read of `name` named it; `.gate/<name>` when it was not read.
+    fn declaration_said(&self, _place: &Place, name: &str) -> String {
+        self.said
+            .borrow()
+            .iter()
+            .find(|(read_name, _)| read_name == name)
+            .map_or_else(|| format!(".gate/{name}"), |(_, said)| said.clone())
     }
 
     fn sibling_folder(&self, root: &str) -> Result<SiblingFolder, String> {
@@ -415,6 +451,8 @@ impl Facts for Machine<'_> {
 
 /// What `GetDriveTypeW` says of a root that names no volume.
 const DRIVE_NO_ROOT_DIR: u32 = 1;
+/// What `GetDriveTypeW` says of a fixed local drive.
+const DRIVE_FIXED: u32 = 3;
 /// What `GetDriveTypeW` says of a network drive.
 const DRIVE_REMOTE: u32 = 4;
 /// The most of a `.git` file or a `commondir` file read: a line naming a folder.
@@ -446,10 +484,15 @@ fn on_local_drive(path: &Path) -> bool {
     let (Prefix::Disk(letter) | Prefix::VerbatimDisk(letter)) = prefix.kind() else {
         return false;
     };
-    let root: Vec<u16> = format!(r"{}:\", char::from(letter)).encode_utf16().chain([0]).collect();
-    // SAFETY: `root` is a NUL-terminated UTF-16 string that outlives the call, which only reads it.
-    let kind = unsafe { GetDriveTypeW(root.as_ptr()) };
+    let kind = drive_type(char::from(letter));
     kind != DRIVE_NO_ROOT_DIR && kind != DRIVE_REMOTE
+}
+
+/// What `GetDriveTypeW` says of the root of the drive `letter`.
+fn drive_type(letter: char) -> u32 {
+    let root: Vec<u16> = format!(r"{letter}:\").encode_utf16().chain([0]).collect();
+    // SAFETY: `root` is a NUL-terminated UTF-16 string that outlives the call, which only reads it.
+    unsafe { GetDriveTypeW(root.as_ptr()) }
 }
 
 /// The folder name of the main checkout of the worktree at `tree`, as git's common folder gives the run's own: the
@@ -562,10 +605,10 @@ pub(crate) fn open_followed(path: &Path, share: Share) -> io::Result<fs::File> {
         .open(path)
 }
 
-/// The siblings `<root>\.gate\siblings.toml` declares as it stands on disk, read by [`read_gate_file`]: no file
-/// declares none, and a file that cannot be read, does not parse or has any problem gives its first problem.
-fn read_siblings(root: &Path) -> Result<Vec<String>, String> {
-    let Some(bytes) = read_gate_file(root, "siblings.toml")? else {
+/// The siblings a `siblings.toml` declares, from its `read` ([`read_declaration`]): no file declares none, and a file
+/// that cannot be read, does not parse or has any problem gives its first problem.
+fn read_siblings(read: Result<Option<Vec<u8>>, String>) -> Result<Vec<String>, String> {
+    let Some(bytes) = read? else {
         return Ok(Vec::new());
     };
     let declared = siblings::read_bytes(&bytes)?;
@@ -575,17 +618,241 @@ fn read_siblings(root: &Path) -> Result<Vec<String>, String> {
     }
 }
 
-/// The patterns `<root>\.gate\desktop.toml` declares as it stands on disk, read by [`read_gate_file`]: no file declares
-/// none, and a file that cannot be read, does not parse or has any problem gives its first problem.
-fn read_desktop(root: &Path) -> Result<Vec<Pattern>, String> {
-    match read_gate_file(root, "desktop.toml")? {
+/// The patterns a `desktop.toml` declares, from its `read` ([`read_declaration`]): no file declares none, and a file
+/// that cannot be read, does not parse or has any problem gives its first problem.
+fn read_desktop(read: Result<Option<Vec<u8>>, String>) -> Result<Vec<Pattern>, String> {
+    match read? {
         Some(bytes) => gate_router::desktop::read_desktop(&bytes),
         None => Ok(Vec::new()),
     }
 }
 
-/// The bytes of the file `name` of `<root>\.gate` as it stands on disk; `None` when there is no such file. Routing reads
-/// `siblings.toml` and `desktop.toml`, and `gate check` reads `toolchain.toml` and `siblings.toml` through this.
+/// Where a declaration file came from, or where its problem is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// The worktree's own `.gate` folder; also a file neither place has.
+    Repo,
+    /// The repo's declarations folder that `remote.json` names: the file's full path there.
+    Declarations(PathBuf),
+}
+
+/// Where a read of a declaration file went: the file's origin, why the repo's declarations folder could not be used
+/// when the read reached it, and the copy there that the worktree's own file shadows, when that copy exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Source {
+    pub origin: Origin,
+    pub unusable: Option<String>,
+    pub shadows: Option<PathBuf>,
+}
+
+impl Source {
+    /// A read that went to the repo's own `.gate` alone, or found the file nowhere.
+    const REPO: Source = Source {
+        origin: Origin::Repo,
+        unusable: None,
+        shadows: None,
+    };
+
+    /// A read that found no file, the declarations folder unusable for the reason `why` when there is one.
+    fn nothing(why: Option<String>) -> (Result<Option<Vec<u8>>, String>, Source) {
+        (
+            Ok(None),
+            Source {
+                unusable: why,
+                ..Source::REPO
+            },
+        )
+    }
+
+    /// The log lines of this read of the file `name` of the repo `repo`: why its declarations folder was not read,
+    /// then where a file taken from it was read from, or the copy the worktree's own file shadows.
+    pub(crate) fn log_lines(&self, repo: &str, name: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(why) = &self.unusable {
+            lines.push(format!("gate: declarations for {} not read: {}", escaped(repo), escaped(why)));
+        }
+        if let Origin::Declarations(path) = &self.origin {
+            lines.push(format!("gate: .gate/{name} read from {}", escaped(&path.to_string_lossy())));
+        }
+        if let Some(path) = &self.shadows {
+            lines.push(shadows_line(name, path));
+        }
+        lines
+    }
+
+    /// How a line names the file `name` this read found: `.gate/<name>` for the repo's own, else its full path.
+    pub(crate) fn said(&self, name: &str) -> String {
+        match &self.origin {
+            Origin::Repo => format!(".gate/{name}"),
+            Origin::Declarations(path) => path.to_string_lossy().into_owned(),
+        }
+    }
+}
+
+/// The bytes of the declaration file `name` of the worktree at `root`, and where they came from. The repo's own
+/// `.gate` answers first ([`read_repo_file`]): its file wins, its problem included, and a `.gate` that is not a folder
+/// answers that there is none. Only when `.gate` is absent, or is a folder without the file, is the copy in the
+/// declarations folder `config` names for `repo` read ([`read_declarations_copy`]). A file of the worktree's own, its
+/// problem included, notes the copy it shadows, when there is one ([`declared_copy`]). Routing, `gate warm` and `gate
+/// check` read `siblings.toml`, `desktop.toml` and `warmup.toml` through this, and `gate check` `toolchain.toml` too.
+pub(crate) fn read_declaration(root: &Path, repo: &str, config: Option<&Config>, name: &str) -> (Result<Option<Vec<u8>>, String>, Source) {
+    match read_repo_file(root, name) {
+        RepoRead::File(Ok(None)) => read_declarations_copy(repo, config, name),
+        RepoRead::File(read) => {
+            let shadows = declared_copy(repo, config, name);
+            (read, Source { shadows, ..Source::REPO })
+        }
+        RepoRead::GateNotFolder => (Ok(None), Source::REPO),
+    }
+}
+
+/// The full path of the copy of the declaration file `name` in the declarations folder `config` names for `repo`
+/// ([`hold_declarations`]), when anything is there by that name: it is opened beneath the folder, never read, so a
+/// file of the worktree's own learns of the copy it shadows without reading it. `None` when no folder is named, the
+/// folder cannot be used, or it holds nothing by that name.
+pub(crate) fn declared_copy(repo: &str, config: Option<&Config>, name: &str) -> Option<PathBuf> {
+    let Ok(Some((folder, held))) = hold_declarations(repo, config) else {
+        return None;
+    };
+    match gate_win32::open_beneath(&held, name, Share::All) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        _ => Some(Path::new(folder).join(name)),
+    }
+}
+
+/// The log line saying that the worktree's own declaration file `name` shadows its copy at `path`.
+pub(crate) fn shadows_line(name: &str, path: &Path) -> String {
+    format!("gate: .gate/{name} shadows {}", escaped(&path.to_string_lossy()))
+}
+
+/// Why the declarations folder `config` names for `repo` cannot be used, judged as [`read_declarations_copy`] judges
+/// it before it reads; `None` when it names none or the folder can be used. `gate check` judges the entry through this
+/// whether or not a read reaches the folder.
+pub(crate) fn judge_declarations(repo: &str, config: Option<&Config>) -> Option<String> {
+    hold_declarations(repo, config).err()
+}
+
+/// The declarations folder `config` names for `repo`, matched in any letter case, as written and opened as itself;
+/// `None` when it names none.
+///
+/// # Errors
+///
+/// Why the folder cannot be used: `declarations` cannot be used, or the folder is not on a fixed local drive
+/// ([`on_fixed_drive`]), is missing, is a link or a junction, is not a folder or cannot be opened.
+fn hold_declarations<'c>(repo: &str, config: Option<&'c Config>) -> Result<Option<(&'c str, fs::File)>, String> {
+    let folder = match config.map(|config| config.declarations_folder(repo)) {
+        None | Some(Ok(None)) => return Ok(None),
+        Some(Err(problem)) => return Err(format!("remote.json's declarations cannot be used: {problem}")),
+        Some(Ok(Some(folder))) => folder,
+    };
+    if !on_fixed_drive(folder) {
+        return Err(format!("'{folder}' is not a folder on a fixed local drive"));
+    }
+    match hold_folder(Path::new(folder)) {
+        Err(error) => Err(format!("'{folder}' cannot be read: {error}")),
+        Ok(Held::Missing) => Err(format!("'{folder}' does not exist")),
+        Ok(Held::Link) => Err(format!("'{folder}' is a link or a junction")),
+        Ok(Held::NotFolder) => Err(format!("'{folder}' is not a folder")),
+        Ok(Held::Folder(held)) => Ok(Some((folder, held))),
+    }
+}
+
+/// The bytes of the file `name` in the declarations folder `config` names for `repo` ([`hold_declarations`]), and
+/// where they came from: `None` when it names none or the folder holds no such file. A folder that cannot be used is
+/// not read, and the source says why. The folder is held open while the file is read beneath it, as
+/// [`read_repo_file`] reads one of `.gate`, and a problem of the file is that file's, at its full path.
+pub(crate) fn read_declarations_copy(repo: &str, config: Option<&Config>, name: &str) -> (Result<Option<Vec<u8>>, String>, Source) {
+    let (folder, held) = match hold_declarations(repo, config) {
+        Ok(None) => return Source::nothing(None),
+        Err(why) => return Source::nothing(Some(why)),
+        Ok(Some(held)) => held,
+    };
+    let read = read_beneath(&held, name);
+    drop(held);
+    let origin = match read {
+        Ok(None) => Origin::Repo,
+        _ => Origin::Declarations(Path::new(folder).join(name)),
+    };
+    (read, Source { origin, ..Source::REPO })
+}
+
+/// Whether `folder` is an absolute drive path ([`is_drive_path`]) on a fixed local drive: `GetDriveTypeW` says its
+/// root is fixed, and its letter is no `subst` drive standing for a share ([`is_share_target`]). A letter whose device
+/// cannot be read is taken as no `subst` drive, as routing's facts take it ([`Facts::subst_target`]): a service's
+/// session may be refused the lookup of a plain volume's letter, which `GetDriveTypeW` has already found fixed.
+fn on_fixed_drive(folder: &str) -> bool {
+    let Some(letter) = folder.chars().next().filter(|_| is_drive_path(folder)) else {
+        return false;
+    };
+    let letter = letter.to_ascii_uppercase();
+    is_fixed_local(drive_type(letter), gate_win32::device_target(letter).ok().flatten().as_deref())
+}
+
+/// Whether a drive whose root `GetDriveTypeW` calls `kind`, its letter standing for the device `target` (`None` for no
+/// `subst` drive), is a fixed local drive: `kind` is fixed and `target` is no share ([`is_share_target`]).
+fn is_fixed_local(kind: u32, target: Option<&str>) -> bool {
+    kind == DRIVE_FIXED && !target.is_some_and(is_share_target)
+}
+
+/// Whether the device `target` a drive letter stands for ([`gate_win32::device_target`]) is a share: `\??\UNC\…`, as
+/// a `subst` onto a share gives, or `\\…`.
+fn is_share_target(target: &str) -> bool {
+    let unc = r"\??\UNC\";
+    target.get(..unc.len()).is_some_and(|start| start.eq_ignore_ascii_case(unc)) || target.starts_with(r"\\")
+}
+
+/// Whether `folder` is an absolute drive path: a letter, `:` and a separator, then at least one name, each separator
+/// `\` or `/`, and every name one that means only itself ([`is_plain_name`]). A share, device or `\\?\` path is not,
+/// nor is a drive-relative one.
+fn is_drive_path(folder: &str) -> bool {
+    let mut chars = folder.chars();
+    let (Some(letter), Some(':'), Some('\\' | '/')) = (chars.next(), chars.next(), chars.next()) else {
+        return false;
+    };
+    let names: Vec<&str> = chars.as_str().split(['\\', '/']).collect();
+    letter.is_ascii_alphabetic() && names.iter().any(|name| !name.is_empty()) && names.iter().all(|name| is_plain_name(name))
+}
+
+/// Whether the path name `name` means only itself: it does not end in `.` or a space, which Win32 trims (so `.` and
+/// `..` are refused too), and holds no `:`, which names an alternate data stream.
+fn is_plain_name(name: &str) -> bool {
+    !name.ends_with(['.', ' ']) && !name.contains(':')
+}
+
+/// A folder opened as itself, or what is there instead.
+enum Held {
+    Missing,
+    /// A link or a junction: any name-surrogate reparse point.
+    Link,
+    NotFolder,
+    Folder(fs::File),
+}
+
+/// The folder at `path` opened as itself ([`open_as_itself`]), a link or a junction not followed, or what is there
+/// instead.
+fn hold_folder(path: &Path) -> io::Result<Held> {
+    let Some((folder, metadata)) = open_as_itself(path)? else {
+        return Ok(Held::Missing);
+    };
+    Ok(if metadata.file_type().is_symlink() {
+        Held::Link
+    } else if metadata.is_dir() {
+        Held::Folder(folder)
+    } else {
+        Held::NotFolder
+    })
+}
+
+/// The bytes of the file `name` inside the folder object `folder` holds ([`gate_win32::open_beneath`]), opened as
+/// itself and read by [`read_whole`]; `None` when there is no such file.
+fn read_beneath(folder: &fs::File, name: &str) -> Result<Option<Vec<u8>>, String> {
+    let opened = with_metadata(gate_win32::open_beneath(folder, name, Share::All)).map_err(|error| format!("cannot read it: {error}"))?;
+    opened.map(|(file, metadata)| read_whole(file, &metadata)).transpose()
+}
+
+/// What `<root>\.gate` answers for its file `name` as it stands on disk: the file's bytes, `None` when there is no such
+/// file, or its problem; or, told apart, a `.gate` that is not a folder. The declarations reader
+/// ([`read_declaration`]) reads the repo's own files through this.
 ///
 /// `.gate` is opened as itself, not following a link, and held open until the file is read, sharing reading, writing
 /// and deletion so it never blocks a checkout. A `.gate` that is a link or a junction (any name-surrogate reparse
@@ -597,35 +864,58 @@ fn read_desktop(root: &Path) -> Result<Vec<Pattern>, String> {
 /// than [`GATE_FILE_MOST_BYTES`]. A file that is any other reparse point, such as a deduplicated one, is read through
 /// its filter, from a handle opened again that must be of the same file ([`gate_win32::same_file`]); one of any other
 /// is the not-a-file problem.
-pub(crate) fn read_gate_file(root: &Path, name: &str) -> Result<Option<Vec<u8>>, String> {
-    let gate = root.join(".gate");
-    let held = open_as_itself(&gate).map_err(|error| format!(".gate: cannot read it: {error}"))?;
-    let Some((gate_folder, gate_metadata)) = held else {
-        return Ok(None);
+fn read_repo_file(root: &Path, name: &str) -> RepoRead {
+    let held = match hold_folder(&root.join(".gate")) {
+        Ok(held) => held,
+        Err(error) => return RepoRead::File(Err(format!(".gate: cannot read it: {error}"))),
     };
-    if gate_metadata.file_type().is_symlink() {
-        return Err(".gate is a link or a junction".to_owned());
-    }
-    if !gate_metadata.is_dir() {
-        return Ok(None);
-    }
-    let opened = with_metadata(gate_win32::open_beneath(&gate_folder, name, Share::All)).map_err(|error| format!("cannot read it: {error}"))?;
-    let Some((file, metadata)) = opened else {
-        return Ok(None);
-    };
-    let bytes = read_whole(file, &metadata);
-    drop(gate_folder);
-    bytes.map(Some)
+    RepoRead::File(match held {
+        Held::Missing => Ok(None),
+        Held::NotFolder => return RepoRead::GateNotFolder,
+        Held::Link => Err(".gate is a link or a junction".to_owned()),
+        Held::Folder(gate_folder) => {
+            let bytes = read_beneath(&gate_folder, name);
+            drop(gate_folder);
+            bytes
+        }
+    })
+}
+
+/// What the repo's own `.gate` answers for one of its files ([`read_repo_file`]).
+enum RepoRead {
+    /// `.gate` is there as something other than a folder: the repo's answer, with no file.
+    GateNotFolder,
+    /// The file's bytes; `None` when `.gate` is absent or is a folder without the file; else the file's problem.
+    File(Result<Option<Vec<u8>>, String>),
+}
+
+/// Notes already said by this process.
+static SAID_NOTES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The lines of `lines` this process has not said yet, each kept as said from now on: a declarations note is said once
+/// a run, however many of its reads reach the same folder.
+pub(crate) fn unsaid(lines: Vec<String>) -> Vec<String> {
+    let mut said = SAID_NOTES.lock().unwrap_or_else(PoisonError::into_inner);
+    lines
+        .into_iter()
+        .filter(|line| {
+            if said.contains(line) {
+                return false;
+            }
+            said.push(line.clone());
+            true
+        })
+        .collect()
 }
 
 /// Whether `<root>\.gate` is there as something other than a folder, so no file of it can be read; `false` when it is
-/// absent or is a folder. A link or a junction is refused by [`read_gate_file`] by name before this is asked.
+/// absent or is a folder. A link or a junction is refused by [`read_repo_file`] by name before this is asked.
 pub(crate) fn gate_is_not_a_folder(root: &Path) -> bool {
     fs::symlink_metadata(root.join(".gate")).is_ok_and(|metadata| !metadata.is_dir())
 }
 
 /// The bytes of the file at `path`, opened as itself so a link or a junction there is not followed, and read as
-/// [`read_gate_file`] reads a file of `.gate`: a link, a junction or a folder is the not-a-file problem, and a file
+/// [`read_repo_file`] reads a file of `.gate`: a link, a junction or a folder is the not-a-file problem, and a file
 /// larger than [`GATE_FILE_MOST_BYTES`] is a problem too; `None` when nothing is there. `gate check` reads the root
 /// `global.json` through this.
 pub(crate) fn read_unfollowed(path: &Path) -> Result<Option<Vec<u8>>, String> {
@@ -755,12 +1045,13 @@ mod tests {
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
 
-    use gate_router::{LocalReason, Place, Route, SiblingFolder};
+    use gate_router::{Config, LocalReason, Place, Route, SiblingFolder};
     use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
     use super::{
-        GATE_FILE_NOT_A_FILE, SIBLING_GIT_LINK, SIBLING_LINK, SIBLING_NOT_A_FOLDER, checkout_of, holds_existing_path, not_routed, parse_head,
-        parse_place, read_siblings, sibling_folder, worktree_of,
+        DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, GATE_FILE_NOT_A_FILE, Origin, SIBLING_GIT_LINK, SIBLING_LINK, SIBLING_NOT_A_FOLDER, Source,
+        checkout_of, holds_existing_path, is_fixed_local, is_share_target, judge_declarations, not_routed, parse_head, parse_place, read_declaration,
+        read_siblings, sibling_folder, worktree_of,
     };
     use crate::test_support::junction;
     use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
@@ -853,6 +1144,7 @@ mod tests {
         let _removed = Removed(vec![root.clone(), elsewhere.clone()]);
         let gate = root.join(".gate");
         let file = gate.join("siblings.toml");
+        let read_siblings = |root: &Path| read_siblings(read_declaration(root, "g", None, "siblings.toml").0);
         assert_eq!(read_siblings(&root), Ok(Vec::new()), "no .gate folder");
         fs::create_dir_all(&root).expect("the test folder can be made");
         fs::write(&gate, "").expect("a file named .gate can be written");
@@ -886,6 +1178,208 @@ mod tests {
         fs::remove_dir_all(&gate).expect("the real .gate can be removed");
         junction(&gate, &elsewhere.join(".gate"));
         assert_eq!(read_siblings(&root), Err(".gate is a link or a junction".to_owned()), "a junction");
+    }
+
+    /// A routing file whose `declarations` names `folder` for the repo `g`.
+    fn naming(folder: &str) -> Config {
+        let text = serde_json::json!({"host": "builder-1", "repos": {"g": ["x"]}, "declarations": {"G": folder}}).to_string();
+        Config::parse(&text).expect("the routing file is usable")
+    }
+
+    /// A fresh scratch folder for the case `name`, removed when the returned guard drops.
+    fn scratch(name: &str) -> (PathBuf, Removed) {
+        let folder = crate::test_support::temp_dir().join(format!("gate-route-{name}-{}", std::process::id()));
+        if folder.exists() {
+            fs::remove_dir_all(&folder).expect("a folder left by an earlier run can be removed");
+        }
+        fs::create_dir_all(&folder).expect("the test folder can be made");
+        (folder.clone(), Removed(vec![folder]))
+    }
+
+    #[test]
+    fn the_repo_s_own_file_wins_and_the_declarations_folder_is_read_only_when_the_repo_has_none() {
+        let (base, _removed) = scratch("declarations");
+        let root = base.join("repo");
+        let pc = base.join("pc");
+        fs::create_dir_all(root.join(".gate")).expect("the .gate folder can be made");
+        fs::create_dir_all(&pc).expect("the declarations folder can be made");
+        fs::write(pc.join("siblings.toml"), "siblings = ['pc']\n").expect("the PC copy can be written");
+        let config = naming(&pc.to_string_lossy());
+        let read = |name: &str| read_declaration(&root, "g", Some(&config), name);
+        let from_pc = |name: &str| Source {
+            origin: Origin::Declarations(pc.join(name)),
+            unusable: None,
+            shadows: None,
+        };
+
+        assert_eq!(
+            read("siblings.toml"),
+            (Ok(Some(b"siblings = ['pc']\n".to_vec())), from_pc("siblings.toml")),
+            "no repo file"
+        );
+        assert_eq!(read("desktop.toml"), (Ok(None), Source::REPO), "neither place has the file");
+        assert_eq!(
+            read_declaration(&root, "other", Some(&config), "siblings.toml"),
+            (Ok(None), Source::REPO),
+            "a repo the declarations do not name"
+        );
+        assert_eq!(
+            read_declaration(&root, "g", None, "siblings.toml"),
+            (Ok(None), Source::REPO),
+            "no routing file"
+        );
+
+        fs::write(root.join(".gate").join("siblings.toml"), "siblings = ['repo']\n").expect("the repo's file can be written");
+        fs::write(root.join(".gate").join("desktop.toml"), "patterns = []\n").expect("the repo's file can be written");
+        let shadowing = Source {
+            shadows: Some(pc.join("siblings.toml")),
+            ..Source::REPO
+        };
+        assert_eq!(
+            read("siblings.toml"),
+            (Ok(Some(b"siblings = ['repo']\n".to_vec())), shadowing.clone()),
+            "the repo's file wins, shadowing the PC copy"
+        );
+        assert_eq!(
+            shadowing.log_lines("g", "siblings.toml"),
+            [format!("gate: .gate/siblings.toml shadows {}", pc.join("siblings.toml").display())]
+        );
+        assert_eq!(
+            read("desktop.toml"),
+            (Ok(Some(b"patterns = []\n".to_vec())), Source::REPO),
+            "a repo file with no PC copy shadows nothing"
+        );
+        fs::remove_file(root.join(".gate").join("desktop.toml")).expect("the repo's file can be removed");
+        fs::remove_file(root.join(".gate").join("siblings.toml")).expect("the repo's file can be removed");
+        fs::create_dir(root.join(".gate").join("siblings.toml")).expect("a folder named like the file can be made");
+        assert_eq!(
+            read("siblings.toml"),
+            (Err(GATE_FILE_NOT_A_FILE.to_owned()), shadowing.clone()),
+            "a problem of the repo's file never falls back, and still notes the copy it shadows"
+        );
+
+        fs::write(pc.join("warmup.toml"), "x".repeat(64 * 1024 + 1)).expect("a big PC copy can be written");
+        assert_eq!(
+            read("warmup.toml"),
+            (Err("is larger than 64 KiB".to_owned()), from_pc("warmup.toml")),
+            "a PC copy's problem is its own, at its path"
+        );
+        assert_eq!(
+            from_pc("warmup.toml").log_lines("g", "warmup.toml"),
+            [format!("gate: .gate/warmup.toml read from {}", pc.join("warmup.toml").display())]
+        );
+        assert_eq!(from_pc("warmup.toml").said("warmup.toml"), pc.join("warmup.toml").to_string_lossy());
+        assert_eq!(Source::REPO.said("warmup.toml"), ".gate/warmup.toml");
+
+        fs::remove_dir_all(root.join(".gate")).expect("the .gate folder can be removed");
+        fs::write(root.join(".gate"), "not a folder\n").expect("a file named .gate can be written");
+        assert_eq!(
+            read("siblings.toml"),
+            (Ok(None), Source::REPO),
+            "a .gate that is not a folder is the repo's answer, with no fallback"
+        );
+    }
+
+    #[test]
+    fn an_unusable_declarations_folder_reads_nothing_and_says_why() {
+        let (base, _removed) = scratch("declarations-unusable");
+        let root = base.join("repo");
+        fs::create_dir_all(&root).expect("the worktree can be made");
+        let file = base.join("file");
+        fs::write(&file, "x").expect("a file can be written");
+        let target = base.join("target");
+        fs::create_dir_all(&target).expect("a junction's target can be made");
+        fs::write(target.join("siblings.toml"), "siblings = ['b']\n").expect("the target's file can be written");
+        let linked = base.join("linked");
+        junction(&linked, &target);
+        let missing = base.join("missing");
+        let at = |path: &Path| path.to_string_lossy().into_owned();
+        let not_fixed = "is not a folder on a fixed local drive";
+        // SAFETY: GetLogicalDrives takes no arguments and only reads the drive table.
+        let drives = unsafe { GetLogicalDrives() };
+        let absent = (b'D'..=b'Z')
+            .find(|letter| drives & (1 << (letter - b'A')) == 0)
+            .map(char::from)
+            .expect("a drive letter is free");
+        let cases = [
+            (r"notes\gate".to_owned(), not_fixed),
+            ("C:".to_owned(), not_fixed),
+            (r"C:\".to_owned(), not_fixed),
+            (r"\\host\share\gate".to_owned(), not_fixed),
+            (format!(r"\\?\{}", at(&target)), not_fixed),
+            (format!(r"{}\..\target", at(&missing)), not_fixed),
+            (format!(r"{}\.", at(&target)), not_fixed),
+            (format!("{}.", at(&target)), not_fixed),
+            (format!("{} ", at(&target)), not_fixed),
+            (format!(r"{}\..\target ", at(&missing)), not_fixed),
+            (format!("{}:stream", at(&target)), not_fixed),
+            (format!(r"{absent}:\gate"), not_fixed),
+            (at(&missing), "does not exist"),
+            (at(&file), "is not a folder"),
+            (at(&linked), "is a link or a junction"),
+        ];
+        for (folder, why) in cases {
+            let unusable = format!("'{folder}' {why}");
+            let (read, source) = read_declaration(&root, "g", Some(&naming(&folder)), "siblings.toml");
+            assert_eq!(read, Ok(None), "{folder}");
+            assert_eq!(
+                source,
+                Source {
+                    unusable: Some(unusable.clone()),
+                    ..Source::REPO
+                },
+                "{folder}"
+            );
+            assert_eq!(
+                source.log_lines("g", "siblings.toml"),
+                [format!("gate: declarations for g not read: {unusable}")],
+                "{folder}"
+            );
+        }
+        let bad = Config::parse(r#"{"host": "builder-1", "repos": {}, "declarations": ["x"]}"#).expect("usable");
+        assert_eq!(
+            read_declaration(&root, "g", Some(&bad), "siblings.toml").1.unusable.as_deref(),
+            Some("remote.json's declarations cannot be used: declarations must be a JSON object"),
+            "a declarations value that cannot be used"
+        );
+        fs::create_dir_all(root.join(".gate")).expect("the .gate folder can be made");
+        fs::write(root.join(".gate").join("siblings.toml"), "siblings = ['a']\n").expect("the repo's file can be written");
+        let config = naming(&at(&missing));
+        assert_eq!(
+            read_declaration(&root, "g", Some(&config), "siblings.toml").1,
+            Source::REPO,
+            "a read of a repo with its own file says nothing of the folder"
+        );
+        assert_eq!(
+            judge_declarations("g", Some(&config)),
+            Some(format!("'{}' does not exist", at(&missing))),
+            "the entry is judged whether or not a read reaches it"
+        );
+        assert_eq!(judge_declarations("g", Some(&naming(&at(&target)))), None, "a usable folder");
+        assert_eq!(judge_declarations("other", Some(&config)), None, "a repo the declarations do not name");
+    }
+
+    #[test]
+    fn a_subst_drive_onto_a_share_is_a_share() {
+        assert!(is_share_target(r"\??\UNC\host\share\gate"));
+        assert!(is_share_target(r"\??\unc\host\share"));
+        assert!(is_share_target(r"\\host\share"));
+        assert!(!is_share_target(r"\??\X:\dev"));
+        assert!(!is_share_target(r"\Device\HarddiskVolume3"));
+        assert!(!is_share_target(r"\??\UN"));
+    }
+
+    #[test]
+    fn only_a_fixed_drive_standing_for_no_share_is_a_fixed_local_drive() {
+        /// What `GetDriveTypeW` says of a removable drive.
+        const DRIVE_REMOVABLE: u32 = 2;
+        assert!(is_fixed_local(DRIVE_FIXED, None), "a plain fixed volume");
+        assert!(is_fixed_local(DRIVE_FIXED, Some(r"\??\C:\dev")), "a subst onto a local folder");
+        assert!(!is_fixed_local(DRIVE_REMOTE, None), "a network drive");
+        assert!(!is_fixed_local(DRIVE_REMOVABLE, None), "a removable drive");
+        assert!(!is_fixed_local(DRIVE_NO_ROOT_DIR, None), "no volume at the root");
+        assert!(!is_fixed_local(DRIVE_FIXED, Some(r"\??\UNC\host\share\gate")), "a subst onto a share");
+        assert!(!is_fixed_local(DRIVE_FIXED, Some(r"\\host\share")), "a device standing for a share");
     }
 
     #[test]

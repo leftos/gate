@@ -209,6 +209,10 @@ impl Facts for FakeFacts {
         self.desktop.clone()
     }
 
+    fn declaration_said(&self, _place: &Place, name: &str) -> String {
+        format!(".gate/{name}")
+    }
+
     fn sibling_folder(&self, root: &str) -> Result<SiblingFolder, String> {
         self.presence_asked.borrow_mut().push(root.to_owned());
         if let Some((_, folder)) = self.folders.iter().find(|(folder_root, _)| folder_root == root) {

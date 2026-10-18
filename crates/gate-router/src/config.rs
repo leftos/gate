@@ -6,7 +6,8 @@
 //! the sibling folder names a routed run of it may carry) and the optional `warmup` (the repo names whose
 //! `.gate/warmup.toml` may warm their builder work folders) and the optional `desktop` (each repo name's list of the
 //! `.gate/desktop.toml` patterns whose commands may run on the builder's desktop) and the optional `hooks` (the repo
-//! names whose gates started inside a git hook may route). Keys match in any letter case and unknown keys are ignored.
+//! names whose gates started inside a git hook may route) and the optional `declarations` (each repo name's folder
+//! holding the `.gate` files the repo has none of). Keys match in any letter case and unknown keys are ignored.
 //! The text may hold `//` and `/* */` comments and trailing commas, as the
 //! PowerShell gate's JSON reader allows; single-quoted strings are refused. A file that breaks a rule is unusable as a
 //! whole, for the reason the PowerShell gate gives (or, for a host ssh or git would misread, a reason of its own),
@@ -49,6 +50,8 @@ pub struct Config {
     /// The repo names whose gates started inside a git hook may route, or why `hooks` cannot be used, which consents to
     /// none.
     hooks: Result<Vec<String>, String>,
+    /// Each repo name's declarations folder, as written, or why `declarations` cannot be used, which names none.
+    declarations: Result<Vec<(String, String)>, String>,
 }
 
 /// A routing file that is there but cannot be used: not a file, unreadable, or refused by [`Config::parse`].
@@ -86,7 +89,8 @@ impl Config {
     /// [`Config::allowed_siblings`] gives its reason. So does a bad `warmup`, consenting to no warm-up, and
     /// [`Config::warmup_consented`] gives its reason, and a bad `desktop`, allowing no desktop pattern, and
     /// [`Config::allowed_desktop`] gives its reason, and a bad `hooks`, consenting to no hook routing, and
-    /// [`Config::hooks_allowed`] gives its reason.
+    /// [`Config::hooks_allowed`] gives its reason, and a bad `declarations`, naming no folder, and
+    /// [`Config::declarations_folder`] gives its reason.
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = strict_json(text.strip_prefix('\u{feff}').unwrap_or(text));
         // PowerShell's JSON reader gives no value at all for blank text, which is then no JSON object.
@@ -118,7 +122,25 @@ impl Config {
             warmup: read_warmup_consent(&data),
             desktop: read_desktop_consent(&data),
             hooks: read_hooks_consent(&data),
+            declarations: read_declarations(&data),
         })
+    }
+
+    /// The folder `declarations` names for `repo`, as written, its repo name matched in any letter case: `None` when it
+    /// does not name the repo or there is no such key. Whether the folder can be read is its reader's to judge.
+    ///
+    /// # Errors
+    ///
+    /// Why `declarations` cannot be used: not an object of non-empty strings. Such a value names no folder, and the
+    /// rest of the file is read whatever it holds.
+    pub fn declarations_folder(&self, repo: &str) -> Result<Option<&str>, &str> {
+        match &self.declarations {
+            Err(problem) => Err(problem),
+            Ok(table) => Ok(table
+                .iter()
+                .find(|(name, _)| eq_ignoring_case(name, repo))
+                .map(|(_, folder)| folder.as_str())),
+        }
     }
 
     /// The `.gate/desktop.toml` patterns `desktop` allows `repo`'s commands to run on the builder's desktop, its repo
@@ -535,6 +557,25 @@ fn read_hooks_consent(data: &Map<String, Value>) -> Result<Vec<String>, String> 
         .map(|(index, item)| match item {
             Value::String(name) if !name.is_empty() => Ok(name.clone()),
             _ => Err(format!("hooks[{index}] is not a non-empty string")),
+        })
+        .collect()
+}
+
+/// The `declarations` table: each repo name's declarations folder, in file order, a non-empty string kept as written;
+/// an empty table when the key is missing. A problem writes the repo name quoted and escaped, so no control character
+/// in it reaches the console.
+fn read_declarations(data: &Map<String, Value>) -> Result<Vec<(String, String)>, String> {
+    let Some(value) = property(data, "declarations") else {
+        return Ok(Vec::new());
+    };
+    let Value::Object(table) = value else {
+        return Err("declarations must be a JSON object".to_owned());
+    };
+    table
+        .iter()
+        .map(|(repo, folder)| match folder {
+            Value::String(folder) if !folder.is_empty() => Ok((repo.clone(), folder.clone())),
+            _ => Err(format!("declarations.{repo:?} is not a non-empty string")),
         })
         .collect()
 }

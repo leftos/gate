@@ -493,6 +493,58 @@ fn hooks_absent_consents_no_repo() {
     assert!(!config.hooks_name_a_repo(), "no key names no repo");
 }
 
+/// The routing file listing `g` with `declarations` holding `value`.
+fn declarations_file(value: &str) -> Config {
+    Config::parse(&format!(
+        r#"{{"host": "builder-1", "slots": 2, "repos": {{"g": ["x"]}}, "siblings": {{"g": ["b"]}}, "declarations": {value}}}"#
+    ))
+    .expect("routing reads the file whatever declarations holds")
+}
+
+#[test]
+fn declarations_absent_names_no_folder() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"g": ["x"]}}"#).expect("usable");
+
+    assert_eq!(config.declarations_folder("g"), Ok(None));
+}
+
+#[test]
+fn declarations_names_a_repo_s_folder_in_any_letter_case() {
+    let config = declarations_file(r#"{"UE-mcp": "D:\\notes\\ue-mcp\\gate"}"#);
+
+    assert_eq!(
+        config.declarations_folder("ue-mcp"),
+        Ok(Some(r"D:\notes\ue-mcp\gate")),
+        "the repo name in any case"
+    );
+    assert_eq!(config.declarations_folder("g"), Ok(None), "a repo it does not name");
+    let keyed = Config::parse(r#"{"host": "builder-1", "repos": {}, "Declarations": {"g": "relative"}}"#).expect("usable");
+    assert_eq!(
+        keyed.declarations_folder("G"),
+        Ok(Some("relative")),
+        "the key in any case, the folder kept as written"
+    );
+}
+
+#[test]
+fn an_unusable_declarations_value_names_no_folder_and_keeps_the_rest_of_the_file() {
+    for (value, problem) in [
+        (r#"["g"]"#, "declarations must be a JSON object"),
+        (r#""D:\\x""#, "declarations must be a JSON object"),
+        ("null", "declarations must be a JSON object"),
+        (r#"{"g": 3}"#, r#"declarations."g" is not a non-empty string"#),
+        (r#"{"g": ["D:\\x"]}"#, r#"declarations."g" is not a non-empty string"#),
+        (r#"{"h": "D:\\x", "g": ""}"#, r#"declarations."g" is not a non-empty string"#),
+    ] {
+        let config = declarations_file(value);
+        assert_eq!(config.declarations_folder("g"), Err(problem), "{value}");
+        assert_eq!(config.host(), "builder-1", "{value}");
+        assert_eq!(config.slots(), 2, "{value}");
+        assert_eq!(pattern_texts(&config, "g"), ["x"], "{value}");
+        assert_eq!(config.allowed_siblings("g"), Ok(&["b".to_owned()][..]), "{value}");
+    }
+}
+
 #[test]
 fn an_unusable_hooks_value_consents_no_repo_and_keeps_the_rest_of_the_file() {
     for (value, problem) in [

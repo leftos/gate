@@ -2981,6 +2981,99 @@ fn an_uncommitted_manifest_edit_is_read() {
     a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")], None);
 }
 
+/// Makes a declarations folder under the case's LOCALAPPDATA holding each `(name, text)` of `files`, and writes the
+/// routing file [`client_case`] writes, naming that folder for the case's repo; the folder.
+fn declarations_folder(case: &Case, files: &[(&str, &str)]) -> PathBuf {
+    let folder = case.local_app_data().join("declarations");
+    fs::create_dir_all(&folder).expect("the declarations folder can be made");
+    for (name, text) in files {
+        fs::write(folder.join(name), text).expect("a declaration file can be written");
+    }
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({
+        "host": HOST,
+        "slots": 2,
+        "repos": { &repo: ["*tool*"] },
+        "outputs": { &repo: [] },
+        "declarations": { &repo: folder.to_string_lossy() },
+    });
+    write_remote_json(case, &routing.to_string());
+    folder
+}
+
+/// A snapshot whose tree has no manifest reads the copy in the declarations folder, which feeds parity as a tree's
+/// does, and the log says where it was read from.
+#[test]
+fn a_manifest_in_the_declarations_folder_is_read_when_the_tree_has_none() {
+    let case = client_case("client-tool-declared");
+    let folder = declarations_folder(&case, &[("toolchain.toml", "[tools]\npnpm = \"10\"\n")]);
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &["pnpm"]);
+
+    let outcome = a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")], None);
+
+    let read = format!("gate: .gate/toolchain.toml read from {}", folder.join("toolchain.toml").display());
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(log.lines().any(|line| line == read), "{read}: {log}");
+    assert!(!outcome.stderr.contains("read from"), "the line is the log's alone: {outcome:?}");
+}
+
+/// The tree's own manifest wins: the declarations folder's copy, which declares a tool the builder lacks, is not read,
+/// and the log alone notes the copy the tree's manifest shadows.
+#[test]
+fn the_tree_s_manifest_wins_over_the_declarations_folder() {
+    let case = client_case("client-tool-declared-tree-wins");
+    write(&case, MANIFEST, "[tools]\n");
+    let folder = declarations_folder(&case, &[("toolchain.toml", "[tools]\npnpm = \"10\"\n")]);
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &["pnpm"]);
+
+    let outcome = a_toolchain_served(&case, &box_path, ANSWERING, None);
+
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(!log.contains("read from"), "{log}");
+    let note = format!("gate: .gate/toolchain.toml shadows {}", folder.join("toolchain.toml").display());
+    assert!(log.lines().any(|line| line == note), "{note}: {log}");
+    assert!(!outcome.stderr.contains("shadows"), "the note is the log's alone: {outcome:?}");
+}
+
+/// A snapshot whose `.gate` is a file has no manifest of its own, yet reads no declarations folder: the repo's `.gate`
+/// answers for it.
+#[test]
+fn a_snapshot_whose_gate_is_a_file_reads_no_declarations_folder() {
+    let case = client_case("client-tool-declared-gate-file");
+    write(&case, ".gate", "not a folder\n");
+    declarations_folder(&case, &[("toolchain.toml", "[tools]\npnpm = \"10\"\n")]);
+    let marker = case.folder().join("pnpm-probed");
+    let pnpm = format!(">\"{}\" echo ran\r\necho 10.0.0\r\n", marker.display());
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[("pnpm", &pnpm)], &["pnpm"]);
+
+    a_toolchain_served(&case, &box_path, ANSWERING, None);
+
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(!log.contains("read from"), "{log}");
+    assert!(
+        !marker.exists(),
+        "the builder was asked for pnpm, which only the declarations folder's copy declares"
+    );
+}
+
+/// A copy in the declarations folder that is not TOML is skipped whole with its line, naming its full path, and the run
+/// goes remote.
+#[test]
+fn an_unreadable_manifest_in_the_declarations_folder_is_skipped_with_its_path() {
+    let case = client_case("client-tool-declared-unreadable");
+    let folder = declarations_folder(&case, &[("toolchain.toml", "[tools\npnpm = \"10\"\n")]);
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &[]);
+
+    let outcome = a_toolchain_served(&case, &box_path, ANSWERING, None);
+
+    let start = format!("gate: {}: line 1, column ", folder.join("toolchain.toml").display());
+    let said: Vec<&str> = outcome.stderr.lines().filter(|line| line.contains("toolchain.toml")).collect();
+    assert!(
+        said.len() == 1 && said[0].starts_with(&start) && said[0].ends_with("; skipping it"),
+        "{start}: {outcome:?}"
+    );
+}
+
 /// A project file naming the Godot SDK version `version`, as a Godot .NET repo's does.
 pub(super) fn godot_csproj(version: &str) -> String {
     format!(

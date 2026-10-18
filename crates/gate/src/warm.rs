@@ -31,7 +31,7 @@ use crate::answer::{FAILED_STATUS, USAGE_STATUS, enter};
 use crate::console::Console;
 use crate::remote::{self, KeyWait, RemoteCall, RemoteClient, RemoteOutcome, WarmEnd, Warmth};
 use crate::resolve::{self, Environment, ResolvedRoot};
-use crate::route::{self, Machine};
+use crate::route::{self, Machine, Origin, Source};
 use crate::run::CONTROL_C_EXIT;
 
 /// `ERROR_SHARING_VIOLATION`: another handle holds the file without sharing it.
@@ -48,6 +48,8 @@ const RECORD_MOST_BYTES: u64 = 64 * 1024;
 const CAP_SLICE: Duration = Duration::from_millis(100);
 /// The warm-up file, as its path below the worktree root is said.
 const FILE_SAID: &str = r".gate\warmup.toml";
+/// The warm-up file's name in `.gate` and in a declarations folder.
+pub(crate) const WARMUP_NAME: &str = "warmup.toml";
 /// Why a warm-up whose key another routed run held past the wait did not start.
 const KEY_BUSY: &str = "another routed run held the work folder past the wait";
 /// Why a warm-up that another warm-up kept from the cap past the wait did not start.
@@ -133,8 +135,9 @@ fn prepare<'e>(request: &WarmRequest, environment: &'e Environment) -> Result<Pr
     let repo = repo_name(&place.checkout);
     let config = routing(environment)?;
     consented(&config, &repo)?;
+    machine.hold_config(&config);
     let target = target(&config, place, &machine).map_err(|reason| End::Usage(reason.map_or_else(|| not_listed(&repo), |reason| reason.line())))?;
-    let first = read_file(&target, &machine)?;
+    let first = read_file(&target, &machine, &config)?;
     Ok(Prepared {
         root,
         environment,
@@ -219,40 +222,43 @@ fn consented(config: &Config, repo: &str) -> Result<(), End> {
     }
 }
 
-/// The warm-up file of `target`'s worktree read through the `.gate` reader, and its commands worded for the builder;
-/// else how the warm-up ends: no file, a file problem, or a command whose words name a path outside the worktree.
-fn read_file(target: &Target, machine: &Machine<'_>) -> Result<Warmup, End> {
-    let (file, hash) = match read_warmup_file(Path::new(&target.place.root)) {
+/// The warm-up file of `target`'s worktree read through the declarations reader, with the declarations folder `config`
+/// names, and its commands worded for the builder; else how the warm-up ends: no file, a file problem, or a command
+/// whose words name a path outside the worktree. A line about a file read from the declarations folder names its full
+/// path.
+fn read_file(target: &Target, machine: &Machine<'_>, config: &Config) -> Result<Warmup, End> {
+    let (read, source) = read_warmup_file(Path::new(&target.place.root), &target.repo, Some(config));
+    let said = match &source.origin {
+        Origin::Repo => FILE_SAID.to_owned(),
+        Origin::Declarations(path) => path.to_string_lossy().into_owned(),
+    };
+    let (file, hash) = match read {
         FileRead::Parsed { file, hash } => (file, hash),
         FileRead::Absent => {
             let root = target.place.root.replace('/', "\\");
-            return Err(End::Quiet(format!("gate: warm: {}\\{FILE_SAID} does not exist", escaped(&root))));
+            let unread = source.unusable.as_ref().map_or_else(String::new, |why| {
+                format!("; declarations for {} not read: {}", escaped(&target.repo), escaped(why))
+            });
+            return Err(End::Quiet(format!("gate: warm: {}\\{FILE_SAID} does not exist{unread}", escaped(&root))));
         }
-        FileRead::Problem(problem) => return Err(file_problem(&problem)),
+        FileRead::Problem(problem) => return Err(file_problem(&said, &problem)),
     };
-    let commands = worded(target, &file, machine)?;
+    let commands = worded(target, &file, machine, &said)?;
     Ok(Warmup { file, hash, commands })
 }
 
-/// The `.gate\warmup.toml` of the worktree at `root`, read through the `.gate` reader ([`route::read_gate_file`]),
-/// parsed and hashed: absent, its first problem ([`first_problem`]), or what it declares with the [`warmup_hash`] of its
-/// bytes. `gate warm` and the route read the file through this.
-pub(crate) fn read_warmup_file(root: &Path) -> FileRead {
-    match read_warmup_file_whole(root) {
+/// The warm-up file of the worktree at `root`, read through the declarations reader ([`route::read_declaration`]) with
+/// the declarations folder `config` names for `repo`, parsed and hashed: absent, its first problem ([`first_problem`]),
+/// or what it declares with the [`warmup_hash`] of its bytes, wherever they came from; and where the read went. `gate
+/// warm` and the route read the file through this.
+pub(crate) fn read_warmup_file(root: &Path, repo: &str, config: Option<&Config>) -> (FileRead, Source) {
+    let (bytes, source) = route::read_declaration(root, repo, config, WARMUP_NAME);
+    let read = match warmup_from(bytes) {
         Ok(None) => FileRead::Absent,
         Ok(Some((file, hash))) => FileRead::Parsed { file, hash },
-        Err(problems) => FileRead::Problem(first_problem(&problems)),
-    }
-}
-
-/// The `.gate\warmup.toml` of the worktree at `root`, read as [`read_warmup_file`] reads it: `None` when it is absent,
-/// else what it declares with the [`warmup_hash`] of its bytes. `gate check` reads it through this, to say each problem.
-///
-/// # Errors
-///
-/// Every problem of the file, in file order: one when it cannot be read or is not UTF-8 or not TOML.
-pub(crate) fn read_warmup_file_whole(root: &Path) -> Result<Option<(WarmupFile, String)>, Vec<String>> {
-    read_warmup_file_checked(root).map_err(|found| found.problems)
+        Err(found) => FileRead::Problem(first_problem(&found.problems)),
+    };
+    (read, source)
 }
 
 /// The problems of a `.gate\warmup.toml` that did not read, and whether it cannot be read whole: the `.gate` reader
@@ -265,14 +271,16 @@ pub(crate) struct WarmupProblems {
     pub unreadable: bool,
 }
 
-/// The `.gate\warmup.toml` of the worktree at `root`, read as [`read_warmup_file_whole`] reads it, its problems also
-/// saying whether it cannot be read whole. `gate check` reads it through this.
+/// The warm-up file a read of it gave, `bytes` ([`route::read_declaration`]): `None` when it is absent, else what it
+/// declares with the [`warmup_hash`] of its bytes. `gate check` and [`read_warmup_file`] read it through this, its
+/// problems also saying whether it cannot be read whole.
 ///
 /// # Errors
 ///
-/// Every problem of the file, in file order, and whether it cannot be read whole.
-pub(crate) fn read_warmup_file_checked(root: &Path) -> Result<Option<(WarmupFile, String)>, WarmupProblems> {
-    let bytes = match route::read_gate_file(root, "warmup.toml") {
+/// Every problem of the file, in file order, and whether it cannot be read whole: one when it cannot be read or is not
+/// UTF-8 or not TOML.
+pub(crate) fn warmup_from(bytes: Result<Option<Vec<u8>>, String>) -> Result<Option<(WarmupFile, String)>, WarmupProblems> {
+    let bytes = match bytes {
         Ok(None) => return Ok(None),
         Ok(Some(bytes)) => bytes,
         Err(problem) => {
@@ -378,9 +386,9 @@ pub(crate) fn lock_held(path: &Path) -> io::Result<bool> {
     }
 }
 
-/// The line of a problem of the warm-up file.
-fn file_problem(problem: &str) -> End {
-    End::Usage(format!("gate: warm: {FILE_SAID} {}", escaped(problem)))
+/// The line of a problem of the warm-up file, named as `said`.
+fn file_problem(said: &str, problem: &str) -> End {
+    End::Usage(format!("gate: warm: {} {}", escaped(said), escaped(problem)))
 }
 
 /// The first of the file's `problems`, with how many more there are when there are more.
@@ -395,23 +403,25 @@ fn first_problem(problems: &[String]) -> String {
 /// The commands of `file` as the builder of `target` runs them, as a routed run's words are made; a command a routed
 /// run keeps on this PC ([`stays_local`]) and a command whose words, as the rewrite leaves them, name a path outside
 /// the worktree and its siblings are problems of the file. A first word naming a program by such a path is sent as the
-/// program's name, as a routed run sends it, and is no problem unless that name is one this PC keeps too.
-fn worded(target: &Target, file: &WarmupFile, machine: &Machine<'_>) -> Result<Vec<Vec<String>>, End> {
+/// program's name, as a routed run sends it, and is no problem unless that name is one this PC keeps too. A problem's
+/// line names the file as `said`.
+fn worded(target: &Target, file: &WarmupFile, machine: &Machine<'_>, said: &str) -> Result<Vec<Vec<String>>, End> {
     file.commands
         .iter()
         .enumerate()
         .map(|(at, command)| {
             let first = command.iter().find(|word| !word.is_empty()).map_or("", String::as_str);
             if stays_local(command) {
-                return Err(never_sent(at, first));
+                return Err(never_sent(said, at, first));
             }
             let sent = builder_words(target, command, machine);
             if sent.program_named && stays_local(&sent.words) {
-                return Err(never_sent(at, first));
+                return Err(never_sent(said, at, first));
             }
             match sent.outside {
                 Some(word) => Err(End::Usage(format!(
-                    "gate: warm: {FILE_SAID} command {} names {}, outside the worktree",
+                    "gate: warm: {} command {} names {}, outside the worktree",
+                    escaped(said),
                     at + 1,
                     escaped(&word)
                 ))),
@@ -422,10 +432,11 @@ fn worded(target: &Target, file: &WarmupFile, machine: &Machine<'_>) -> Result<V
 }
 
 /// The end of a command of the warm-up file a routed run never sends: a command this PC keeps ([`stays_local`]), by its
-/// first word as given or by the program's name the rewrite sends for it.
-fn never_sent(at: usize, first: &str) -> End {
+/// first word as given or by the program's name the rewrite sends for it; the file named as `said`.
+fn never_sent(said: &str, at: usize, first: &str) -> End {
     End::Usage(format!(
-        "gate: warm: {FILE_SAID} command {} starts with {}, which a routed run never sends",
+        "gate: warm: {} command {} starts with {}, which a routed run never sends",
+        escaped(said),
         at + 1,
         escaped(first)
     ))
@@ -610,6 +621,7 @@ fn recheck(prepared: &Prepared<'_>) -> Result<Warmup, End> {
         )));
     }
     let changed = || End::Quiet(format!("gate: warm: remote.json's entry for {} changed", escaped(&early.repo)));
+    prepared.machine.hold_config(&config);
     let late = match target(&config, early.place.clone(), &prepared.machine) {
         Ok(late) => late,
         Err(Some(reason)) => return Err(End::Usage(reason.line())),
@@ -624,7 +636,7 @@ fn recheck(prepared: &Prepared<'_>) -> Result<Warmup, End> {
     if late.key != early.key || late.inputs != early.inputs {
         return Err(changed());
     }
-    read_file(early, &prepared.machine)
+    read_file(early, &prepared.machine, &config)
 }
 
 /// The client's warm call of `prepared`'s target, from the worktree root, writing `log`, under the ceiling `timeout`.
@@ -846,10 +858,11 @@ mod tests {
     use jiff::Timestamp;
 
     use super::{
-        Ending, Lock, NOT_STARTED, ending_of, first_problem, fresh_log, lock_held, read_warm_record, read_warmup_file, read_warmup_file_whole,
-        take_lock,
+        Ending, Lock, NOT_STARTED, WARMUP_NAME, ending_of, first_problem, fresh_log, lock_held, read_warm_record, read_warmup_file, take_lock,
+        warmup_from,
     };
     use crate::remote::{RemoteOutcome, WarmEnd};
+    use crate::route;
 
     const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -1002,19 +1015,20 @@ mod tests {
         let root = scratch("file-two-problems");
         fs::create_dir_all(root.join(".gate")).expect("the .gate folder is made");
         fs::write(root.join(".gate").join("warmup.toml"), "commands = [[]]\nextra = 1\n").expect("the file is written");
+        let whole = |root: &Path| warmup_from(route::read_declaration(root, "g", None, WARMUP_NAME).0).map_err(|found| found.problems);
         assert_eq!(
-            read_warmup_file_whole(&root),
+            whole(&root),
             Err(vec![
                 "commands[0] is empty".to_owned(),
                 "extra is not a key (commands, timeout)".to_owned()
             ])
         );
         assert_eq!(
-            read_warmup_file(&root),
+            read_warmup_file(&root, "g", None).0,
             FileRead::Problem("commands[0] is empty (and 1 more)".to_owned()),
             "the route's read keeps the first"
         );
-        assert_eq!(read_warmup_file_whole(&scratch("file-absent")), Ok(None), "no file");
+        assert_eq!(whole(&scratch("file-absent")), Ok(None), "no file");
     }
 
     #[test]
