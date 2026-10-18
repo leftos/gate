@@ -14,6 +14,7 @@
 - [ ] GATE-443 Say --cd when a heavy command works in another worktree — High · Remote
 - [ ] GATE-447 Give gates started inside a routed run a watchdog on the builder — High · Remote
 - [ ] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
+- [ ] GATE-451 Make herdr-gpui's WSL command families routable to the builder — High · Remote
 
 ## Remote
 
