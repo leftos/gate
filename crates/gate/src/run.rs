@@ -1034,18 +1034,19 @@ impl Run<'_> {
         self.on_parent(parent, plan, figures, console)
     }
 
-    /// Runs the command on the slot of the light parent `parent`, which lends it while a critical request drains: says
-    /// so, journals `parent` with the parent's pid and runs it. The run takes, claims and releases no slot. Its command
-    /// keeps the marker of this gate as a heavy holder ([`Plan::prepare`]), so a gate nested in it runs covered by the
-    /// lend and asks for none of its own. The command runs under `figures`.
+    /// Runs the command on the slot of the light parent `parent`, which lends it while a critical request drains:
+    /// journals `parent` with the parent's pid, then says so and runs it, so a reader that sees the line finds its
+    /// event. The run takes, claims and releases no slot. Its command keeps the marker of this gate as a heavy holder
+    /// ([`Plan::prepare`]), so a gate nested in it runs covered by the lend and asks for none of its own. The command
+    /// runs under `figures`.
     fn on_parent(&mut self, parent: &Parent, plan: Plan, figures: Figures, console: &mut Console) -> Ended {
         self.lent = true;
+        self.journal.write(&JournalEvent::Parent { parent_pid: parent.pid }, None, console);
         console.err(&format!(
             "gate: running under the {} slot of gate {} while a critical request drains; taking no slot",
             parent.held.as_str(),
             parent.pid
         ));
-        self.journal.write(&JournalEvent::Parent { parent_pid: parent.pid }, None, console);
         self.command(plan, figures, console)
     }
 
