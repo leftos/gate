@@ -13,10 +13,10 @@ use serde_json::{Value, json};
 use regex::Regex;
 
 use super::{
-    BUN_LOCKFILE, BUN_LOCKFILE_PATH, ENDLESS, Folders, NODE_MODULES_IGNORED, PNPM_LOCKFILE, PNPM_LOCKFILE_PATH, box_call, bun_install_call,
-    command_call, fake_godot, field, gate_box, godot_root, has_ref, install_call, installs, let_go, lines_starting, marks, pair_payload,
-    pair_snapshot, pair_tree, passed, path_for_bun, path_for_pnpm, pnpm_box, pnpm_calls, refused_line, renamed, run_box, run_box_with_godot,
-    run_box_with_seams, snapshot, started_line, stopped_line_for, stub_bun, stub_pnpm,
+    BUN_LOCKFILE, BUN_LOCKFILE_PATH, ENDLESS, Folders, NODE_MODULES_IGNORED, PNPM_LOCKFILE, PNPM_LOCKFILE_PATH, STALE_UE_ROOT, box_call,
+    bun_install_call, command_call, fake_godot, fake_unreal, field, gate_box, godot_root, has_ref, install_call, installs, let_go, lines_starting,
+    marks, pair_payload, pair_snapshot, pair_tree, passed, path_for_bun, path_for_pnpm, pnpm_box, pnpm_calls, refused_line, renamed, run_box,
+    run_box_with_godot, run_box_with_seams, run_box_with_unreal, snapshot, started_line, stopped_line_for, stub_bun, stub_pnpm, unreal_root,
 };
 use crate::support::{Case, FAKE_TOOL, GATE, Outcome, box_payload, shown, wait_until, wait_until_closed};
 
@@ -694,6 +694,26 @@ fn box_warm_up_runs_the_godot_install_of_its_godot_version() {
     );
     assert_eq!(outcome.stderr.lines().last(), Some(warm_said().as_str()), "{outcome:?}");
     assert!(!root.join("4.3.0").join("ran").exists(), "the other install ran");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// A warm-up's `UnrealVersion` is taken, and its commands see `UE_ROOT` naming the engine of that version over the one
+/// the box inherited, as a run's do.
+#[test]
+fn box_warm_up_sets_ue_root_for_its_unreal_version() {
+    let case = Case::new("box_warm_unreal");
+    let root = unreal_root(&case);
+    fake_unreal(&root.join("5.7.3"), "5.7.3");
+    fake_unreal(&root.join("5.8.0"), "5.8.0");
+    let mut payload = warm_payload(&case, &[&[FAKE_TOOL, "env", "UE_ROOT"]]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    payload["UnrealVersion"] = json!("5.8.0");
+
+    let outcome = run_box_with_unreal(&case, &payload, Some(&root), Some(STALE_UE_ROOT));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, format!("{}\n", root.join("5.8.0").display()), "{outcome:?}");
+    assert_eq!(outcome.stderr.lines().last(), Some(warm_said().as_str()), "{outcome:?}");
     wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 

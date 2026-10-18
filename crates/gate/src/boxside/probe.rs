@@ -1,7 +1,9 @@
 //! The builder's tool probes: for each tool a routed run needs, what the builder has, read by running the tool's own
 //! version command from this module's table, never a program the caller names. The tool the box may have several
 //! installs of is godot: the folder the batch's environment names as its root holds one install per subfolder, and each
-//! is asked for its version, so the line carries every version the box has. Every probe of a batch that runs a program
+//! is asked for its version, so the line carries every version the box has. The unreal probe reads the folder the
+//! batch's environment names as `GATE_UNREAL_ROOT` likewise, one Unreal Engine install per subfolder, each one's version
+//! read from its `Engine\Build\Build.version` file without running anything. Every probe of a batch that runs a program
 //! runs at once, under one deadline the batch shares, in the system folder and on a hidden console of its own,
 //! as [`git::program_output`] runs a program; a probe still running at the deadline is ended with its job. Nothing here
 //! writes to the console or reads a payload: the caller hands over the names and says the lines.
@@ -10,18 +12,20 @@ use std::any::Any;
 use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::thread::{self, Scope, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
 use gate_win32::PipedConsole;
+use serde_json::Value;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
-use crate::boxside::payload::{escaped, is_drive_path};
+use crate::boxside::payload::{escaped, is_canonical_version, is_drive_path};
 use crate::environment::Variables;
 use crate::remote::git::{self, GitError, ProgramCall, ProgramOutput, ProgramPlace};
+use crate::run::{is_within, resolved};
 
 /// How long a batch of probes may take together, unless a test seam says otherwise.
 pub(crate) const PROBE_LIMIT: Duration = Duration::from_secs(10);
@@ -35,9 +39,18 @@ pub(crate) const GODOT: &str = "Godot_console.exe";
 /// The word a Godot install is asked for its version with.
 const GODOT_VERSION: &[&str] = &["--version"];
 
-/// The most entries of the folder `GATE_GODOT_ROOT` names that are looked at: a folder holding more is no Godot
-/// install root.
-const GODOT_ENTRIES: usize = 64;
+/// The variable naming the folder of the box's Godot installs.
+const GODOT_ROOT: &str = "GATE_GODOT_ROOT";
+
+/// The variable naming the folder of the box's Unreal Engine installs.
+pub(crate) const UNREAL_ROOT: &str = "GATE_UNREAL_ROOT";
+
+/// The most entries of the folder `GATE_GODOT_ROOT` or `GATE_UNREAL_ROOT` names that are looked at: a folder holding
+/// more is no install root.
+const ROOT_ENTRIES: usize = 64;
+
+/// The most bytes of an Unreal Engine install's `Build.version` that are read: a longer one is no version file.
+const UNREAL_BUILD_VERSION_MAX: u64 = 64 * 1024;
 
 /// The most characters of a Godot install's answer the no-version reason carries before it is escaped.
 const GODOT_ANSWER_MAX: usize = 200;
@@ -62,6 +75,8 @@ enum ToolProbe {
     Runs { program: &'static str, args: &'static [&'static str] },
     /// Runs the `--version` of every Godot install the batch's environment names.
     Godot,
+    /// Reads the `Build.version` of every Unreal Engine install the batch's environment names, running nothing.
+    Unreal,
 }
 
 /// The table's probe of the tool `name`; `None` for a name it does not know. cargo-nextest is run as the plugin itself,
@@ -77,6 +92,7 @@ fn probe_of(name: &str) -> Option<ToolProbe> {
         "pwsh" => runs("pwsh", &["--version"]),
         "ffmpeg" => runs("ffmpeg", &["-version"]),
         "godot" => Some(ToolProbe::Godot),
+        "unreal" => Some(ToolProbe::Unreal),
         _ => None,
     }
 }
@@ -88,11 +104,13 @@ enum Pending<'scope> {
 }
 
 /// What one batch of probes shares beyond the place a program is looked for in: the folders no program may come from,
-/// the folder the batch's environment names as `GATE_GODOT_ROOT`, and the batch's deadline and its limit.
+/// the folders the batch's environment names as `GATE_GODOT_ROOT` and `GATE_UNREAL_ROOT` (the latter `Err` with why
+/// the environment could not be made), and the batch's deadline and its limit.
 #[derive(Clone, Copy)]
 struct Batch<'a> {
     worktrees: &'a [&'a Path],
     godot_root: Option<&'a OsStr>,
+    unreal_root: Result<Option<&'a OsStr>, &'a str>,
     deadline: Instant,
     limit: Duration,
 }
@@ -103,18 +121,23 @@ struct Batch<'a> {
 /// them from a folder of `worktrees`: a program found that still lies inside any of them is refused
 /// ([`git::program_output`]). Environment `variables` that could not be made, for the reason given, skip every probe
 /// that runs a program. The godot probe reads the folder `variables` names as `GATE_GODOT_ROOT` to find the installs
-/// it runs.
+/// it runs, and the unreal probe the folder they name as `GATE_UNREAL_ROOT`, refused when it lies inside any of
+/// `worktrees`; it runs no program, so a place no program can be looked for in never skips it.
 pub(crate) fn probe(names: &[String], limit: Duration, variables: Result<Variables, String>, worktrees: &[&Path]) -> Vec<(String, Probed)> {
     let deadline = Instant::now() + limit;
-    let godot_root = variables
-        .as_ref()
-        .ok()
-        .and_then(|variables| variables.get("GATE_GODOT_ROOT"))
-        .map(OsStr::to_os_string);
+    let root_of = |name: &str| {
+        variables
+            .as_ref()
+            .map(|variables| variables.get(name).map(OsStr::to_os_string))
+            .map_err(String::clone)
+    };
+    let godot_root = root_of(GODOT_ROOT).ok().flatten();
+    let unreal_root = root_of(UNREAL_ROOT);
     let place = variables.and_then(ProgramPlace::new);
     let batch = Batch {
         worktrees,
         godot_root: godot_root.as_deref(),
+        unreal_root: unreal_root.as_ref().map(Option::as_deref).map_err(String::as_str),
         deadline,
         limit,
     };
@@ -152,6 +175,7 @@ fn started<'scope, 'env>(
             Err(why) => Pending::Found(Probed::Skipped(format!("cannot run {GODOT}: {why}"))),
             Ok(place) => Pending::Running(scope.spawn(move || godot(place, batch))),
         },
+        Some(ToolProbe::Unreal) => Pending::Found(unreal(batch)),
     }
 }
 
@@ -202,20 +226,26 @@ fn godot(place: &ProgramPlace, batch: Batch<'_>) -> Probed {
         Ok(candidates) => candidates,
         Err(why) => return Probed::Skipped(why),
     };
+    gathered(candidates.iter().map(|candidate| match candidate {
+        Candidate::Install(install) => {
+            let found = ran(install, GODOT_VERSION, place, batch, read_godot);
+            if batch.godot_root.is_some() {
+                named_as_found(install, found)
+            } else {
+                found
+            }
+        }
+        Candidate::Skipped(why) => Probed::Skipped(why.clone()),
+    }))
+}
+
+/// What a probe of several installs comes to from what each install's probe `found`, in order: the version of every
+/// one that gave one, `,`-joined ([`version_list`]), `missing` when there is none at all, and `skipped` with the first
+/// reason one gave when none gave a version.
+fn gathered(found: impl Iterator<Item = Probed>) -> Probed {
     let mut versions = Vec::new();
     let mut reason: Option<String> = None;
-    for candidate in &candidates {
-        let found = match candidate {
-            Candidate::Install(install) => {
-                let found = ran(install, GODOT_VERSION, place, batch, read_godot);
-                if batch.godot_root.is_some() {
-                    named_as_found(install, found)
-                } else {
-                    found
-                }
-            }
-            Candidate::Skipped(why) => Probed::Skipped(why.clone()),
-        };
+    for found in found {
         match found {
             Probed::Version(version) => versions.push(version),
             Probed::Present | Probed::Missing => {}
@@ -232,8 +262,8 @@ fn godot(place: &ProgramPlace, batch: Batch<'_>) -> Probed {
     Probed::Version(version_list(&versions))
 }
 
-/// What the probe of the root's install `install` `found`, kept only when it is a version the install's folder is named:
-/// else skipped with the reason `named <folder> but reports <version>`.
+/// What the probe of the root's install `install` `found`, kept only when it is a version the install's folder is named
+/// ([`named_as`]).
 fn named_as_found(install: &str, found: Probed) -> Probed {
     let Probed::Version(version) = found else {
         return found;
@@ -243,10 +273,16 @@ fn named_as_found(install: &str, found: Probed) -> Probed {
         .and_then(Path::file_name)
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
+    named_as(&folder, version)
+}
+
+/// The `version` an install whose folder is named `folder` reports, kept only when it is that name: else skipped with
+/// the reason `named <folder> but reports <version>`.
+fn named_as(folder: &str, version: String) -> Probed {
     if folder == version {
         Probed::Version(version)
     } else {
-        Probed::Skipped(format!("named {} but reports {version}", escaped(&folder)))
+        Probed::Skipped(format!("named {} but reports {version}", escaped(folder)))
     }
 }
 
@@ -271,27 +307,37 @@ enum Candidate {
 }
 
 /// The subfolders the godot probe reads, in name order: those of the folder the batch's environment names as
-/// `GATE_GODOT_ROOT`, or `Godot_console.exe` itself, looked for along the `PATH`, when it names none. Else why that
-/// folder is refused. The folder must be an absolute path on a drive, and its subfolders are read as they are: a
-/// subfolder whose name is no Unicode, one past the first [`GODOT_ENTRIES`] and an entry that cannot be read are left
-/// out, each subfolder the rest come to is judged by [`godot_install`], and the listing ends at `deadline`, which with
-/// nothing read at all is the batch's own `no answer` reason.
+/// `GATE_GODOT_ROOT` ([`listed`], each judged by [`godot_install`]), or `Godot_console.exe` itself, looked for along the
+/// `PATH`, when it names none. Else why that folder is refused.
 fn godot_candidates(root: Option<&OsStr>, deadline: Instant, limit: Duration) -> Result<Vec<Candidate>, String> {
     let Some(root) = root else {
         return Ok(vec![Candidate::Install(GODOT.to_owned())]);
     };
-    if !root.to_str().is_some_and(is_drive_path) {
-        return Err(format!(
-            "GATE_GODOT_ROOT {} is not an absolute path on a drive",
+    listed(GODOT_ROOT, drive_root(GODOT_ROOT, root)?, deadline, limit, godot_install)
+}
+
+/// The root `root` the variable `variable` names as a path, when it is an absolute path on a drive; else why it is
+/// refused.
+fn drive_root<'r>(variable: &str, root: &'r OsStr) -> Result<&'r Path, String> {
+    match root.to_str().filter(|root| is_drive_path(root)) {
+        Some(root) => Ok(Path::new(root)),
+        None => Err(format!(
+            "{variable} {} is not an absolute path on a drive",
             escaped(&root.to_string_lossy())
-        ));
+        )),
     }
-    let folder = Path::new(root);
-    let unreadable = |error: &io::Error| format!("cannot read GATE_GODOT_ROOT {}: {error}", escaped(&folder.to_string_lossy()));
+}
+
+/// What `judged` makes of each subfolder of `folder`, the install root the variable `variable` names, in name order;
+/// else why the folder cannot be read. Its subfolders are read as they are: a subfolder whose name is no Unicode, one
+/// past the first [`ROOT_ENTRIES`] and an entry that cannot be read are left out, as is one `judged` gives nothing for,
+/// and the listing ends at `deadline`, which with nothing read at all is the batch's own `no answer` reason.
+fn listed<T>(variable: &str, folder: &Path, deadline: Instant, limit: Duration, judged: impl Fn(&Path) -> Option<T>) -> Result<Vec<T>, String> {
+    let unreadable = |error: &io::Error| format!("cannot read {variable} {}: {error}", escaped(&folder.to_string_lossy()));
     let entries = fs::read_dir(folder).map_err(|error| unreadable(&error))?;
     let mut folders = Vec::new();
     let mut cut = false;
-    for entry in entries.take(GODOT_ENTRIES) {
+    for entry in entries.take(ROOT_ENTRIES) {
         if Instant::now() >= deadline {
             cut = true;
             break;
@@ -308,7 +354,104 @@ fn godot_candidates(root: Option<&OsStr>, deadline: Instant, limit: Duration) ->
         return Err(no_answer(limit));
     }
     folders.sort();
-    Ok(folders.iter().filter_map(|folder| godot_install(folder)).collect())
+    Ok(folders.iter().filter_map(|folder| judged(folder)).collect())
+}
+
+/// What the unreal probe finds: the version of every install the folder the batch's environment names as
+/// `GATE_UNREAL_ROOT` holds, `,`-joined, as [`gathered`] comes to it; `missing` with no root, as nothing is looked for
+/// along the `PATH`; `skipped` when the root is refused ([`unreal_installs`]) or the environment could not be read.
+fn unreal(batch: Batch<'_>) -> Probed {
+    let root = match batch.unreal_root {
+        Err(why) => return Probed::Skipped(format!("cannot read {UNREAL_ROOT}: {why}")),
+        Ok(None) => return Probed::Missing,
+        Ok(Some(root)) => root,
+    };
+    match unreal_installs(root, batch.worktrees, batch.deadline, batch.limit) {
+        Ok(found) => gathered(found.into_iter()),
+        Err(why) => Probed::Skipped(why),
+    }
+}
+
+/// What each subfolder of the Unreal Engine root `root` comes to, in name order ([`listed`], each judged by
+/// [`unreal_install`]): else why the root is refused, when it is no absolute path on a drive, when it lies inside any
+/// of `worktrees`, the box's work root among them, or when it cannot be read.
+fn unreal_installs(root: &OsStr, worktrees: &[&Path], deadline: Instant, limit: Duration) -> Result<Vec<Probed>, String> {
+    let folder = drive_root(UNREAL_ROOT, root)?;
+    let held = resolved(folder);
+    if worktrees.iter().any(|worktree| is_within(&held, &resolved(worktree))) {
+        return Err(format!("{} lies inside the box's work root", escaped(&folder.to_string_lossy())));
+    }
+    listed(UNREAL_ROOT, folder, deadline, limit, unreal_install)
+}
+
+/// The engine folder of the install of `version` under the root `root`, the box's `GATE_UNREAL_ROOT`, as a run finds
+/// it by name: `<root>\<version>`, when the root is an absolute path on a drive and that folder is an install that
+/// reports that version ([`unreal_install`]); else why not.
+pub(crate) fn installed_unreal(root: &OsStr, version: &str) -> Result<PathBuf, String> {
+    let folder = drive_root(UNREAL_ROOT, root)?.join(version);
+    match unreal_install(&folder) {
+        Some(Probed::Version(_)) => Ok(folder),
+        Some(Probed::Skipped(why)) => Err(why),
+        Some(Probed::Present | Probed::Missing) | None => Err(format!("{} is not a file", escaped(&unreal_build_version(&folder).to_string_lossy()))),
+    }
+}
+
+/// The file an Unreal Engine install in `folder` says its version in: `<folder>\Engine\Build\Build.version`.
+fn unreal_build_version(folder: &Path) -> PathBuf {
+    folder.join("Engine").join("Build").join("Build.version")
+}
+
+/// What `folder`, one direct subfolder of `GATE_UNREAL_ROOT`, comes to: the version its `Build.version` reports, kept
+/// only when the folder is named it ([`named_as`]); skipped with why when the folder, its `Engine` or `Build` folder or
+/// the file is a link or a junction, or the file gives no version ([`build_version`]); nothing when it holds no such
+/// plain file.
+fn unreal_install(folder: &Path) -> Option<Probed> {
+    let file = unreal_build_version(folder);
+    let engine = folder.join("Engine");
+    let build = engine.join("Build");
+    if let Some(link) = [folder, engine.as_path(), build.as_path(), file.as_path()]
+        .into_iter()
+        .find(|path| linked(path))
+    {
+        return Some(Probed::Skipped(format!(
+            "cannot read {}: {} is a link or a junction",
+            escaped(&file.to_string_lossy()),
+            escaped(&link.to_string_lossy())
+        )));
+    }
+    if !plain_file(&file) {
+        return None;
+    }
+    let name = folder.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    Some(build_version(&file).map_or_else(Probed::Skipped, |version| named_as(&name, version)))
+}
+
+/// The version the `Build.version` file `file` reports ([`unreal_version`]); else why it gives none: it cannot be
+/// read, it is over [`UNREAL_BUILD_VERSION_MAX`] bytes, it is not UTF-8, or it is not that JSON.
+fn build_version(file: &Path) -> Result<String, String> {
+    let shown = escaped(&file.to_string_lossy());
+    let mut bytes = Vec::new();
+    fs::File::open(file)
+        .and_then(|opened| opened.take(UNREAL_BUILD_VERSION_MAX + 1).read_to_end(&mut bytes))
+        .map_err(|error| format!("cannot read {shown}: {error}"))?;
+    // A length past what u64 holds is past the cap too.
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > UNREAL_BUILD_VERSION_MAX {
+        return Err(format!("{shown} is over 64 KiB"));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| format!("{shown} is not UTF-8"))?;
+    unreal_version(&text).ok_or_else(|| format!("{shown} gives no integer MajorVersion, MinorVersion and PatchVersion"))
+}
+
+/// The version a `Build.version` text `text` reports: a JSON object, after an optional byte order mark, whose
+/// `MajorVersion`, `MinorVersion` and `PatchVersion` are non-negative integers, as `major.minor.patch` in its canonical
+/// spelling ([`is_canonical_version`]); its other keys are not read. `None` for any other shape.
+fn unreal_version(text: &str) -> Option<String> {
+    let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(text.strip_prefix('\u{feff}').unwrap_or(text)) else {
+        return None;
+    };
+    let part = |key: &str| fields.get(key).and_then(Value::as_u64);
+    let version = format!("{}.{}.{}", part("MajorVersion")?, part("MinorVersion")?, part("PatchVersion")?);
+    is_canonical_version(&version).then_some(version)
 }
 
 /// What `folder`, one direct subfolder of `GATE_GODOT_ROOT`, comes to: the `Godot_console.exe` in it to run, why a
@@ -525,13 +668,13 @@ mod tests {
     use std::fs;
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::process::ExitStatusExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     use super::GODOT;
     use super::{
-        Candidate, Probed, first_version, godot_candidates, godot_gave_no_version, godot_version, is_reparse_point, late_reason, named_as_found,
-        panic_reason, probe, read_godot, tool_line, version_list, version_of,
+        Candidate, Probed, build_version, first_version, godot_candidates, godot_gave_no_version, godot_version, is_reparse_point, late_reason,
+        named_as_found, panic_reason, probe, read_godot, tool_line, unreal_installs, unreal_version, version_list, version_of,
     };
     use crate::environment::Variables;
     use crate::remote::git::ProgramOutput;
@@ -859,6 +1002,105 @@ mod tests {
             godot_candidates(Some(root.as_os_str()), Instant::now() + Duration::from_secs(60), Duration::from_secs(10)).expect("the root reads");
 
         assert_eq!(candidates, [Candidate::Install(plain.join(GODOT).to_string_lossy().into_owned())]);
+        fs::remove_dir_all(&root).expect("the test's root can be removed");
+    }
+
+    /// Makes `folder` an Unreal Engine install whose `Build.version` holds `text`.
+    #[expect(clippy::expect_used, reason = "a test whose install cannot be made must fail loudly")]
+    fn unit_unreal(folder: &Path, text: &str) {
+        let build = folder.join("Engine").join("Build");
+        fs::create_dir_all(&build).expect("an engine's folders can be made");
+        fs::write(build.join("Build.version"), text).expect("an engine's Build.version can be written");
+    }
+
+    /// The `Build.version` text of an engine reporting `major.minor.patch`.
+    fn build_version_text(major: u32, minor: u32, patch: u32) -> String {
+        format!(r#"{{"MajorVersion": {major}, "MinorVersion": {minor}, "PatchVersion": {patch}, "BranchName": "++UE5"}}"#)
+    }
+
+    /// Only the first sixty-four subfolders of the unreal root are read, and what they come to is in name order.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test whose install folders cannot be made must fail loudly")]
+    fn only_the_first_sixty_four_unreal_subfolders_are_read_in_name_order() {
+        let root = unit_root("unreal-cap");
+        for patch in 10..75 {
+            unit_unreal(&root.join(format!("1.0.{patch}")), &build_version_text(1, 0, patch));
+        }
+
+        let found =
+            unreal_installs(root.as_os_str(), &[], Instant::now() + Duration::from_secs(60), Duration::from_secs(10)).expect("the root reads");
+
+        let expected: Vec<Probed> = (10..74).map(|patch| Probed::Version(format!("1.0.{patch}"))).collect();
+        assert_eq!(found, expected);
+        fs::remove_dir_all(&root).expect("the test's root can be removed");
+    }
+
+    /// The unreal line orders its versions by number, not by the folders' names; an environment that could not be made
+    /// skips it with why.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test whose install folders cannot be made must fail loudly")]
+    fn the_unreal_line_orders_its_versions_by_number() {
+        let root = unit_root("unreal-order");
+        unit_unreal(&root.join("5.10.0"), &build_version_text(5, 10, 0));
+        unit_unreal(&root.join("5.8.0"), &build_version_text(5, 8, 0));
+        let names = ["unreal".to_owned()];
+        let variables = Variables::from_process().with("GATE_UNREAL_ROOT", &root.to_string_lossy());
+
+        assert_eq!(
+            probe(&names, Duration::from_secs(10), Ok(variables), &[]),
+            [("unreal".to_owned(), Probed::Version("5.8.0,5.10.0".to_owned()))]
+        );
+        assert_eq!(
+            probe(&names, Duration::from_secs(10), Err("no environment".to_owned()), &[]),
+            [(
+                "unreal".to_owned(),
+                Probed::Skipped("cannot read GATE_UNREAL_ROOT: no environment".to_owned())
+            )]
+        );
+        fs::remove_dir_all(&root).expect("the test's root can be removed");
+    }
+
+    /// A `Build.version` reports a version only as a JSON object of three non-negative integer parts, each of at most
+    /// ten digits, a byte order mark before it allowed and its other keys ignored.
+    #[test]
+    fn an_unreal_build_version_is_an_object_of_three_integer_parts() {
+        assert_eq!(unreal_version(&build_version_text(5, 8, 0)).as_deref(), Some("5.8.0"));
+        assert_eq!(
+            unreal_version(&format!("\u{feff}{}", build_version_text(5, 7, 3))).as_deref(),
+            Some("5.7.3")
+        );
+        for text in [
+            "",
+            "not json",
+            "[5, 8, 0]",
+            r#"{"MajorVersion": 5, "MinorVersion": 8}"#,
+            r#"{"MajorVersion": "5", "MinorVersion": 8, "PatchVersion": 0}"#,
+            r#"{"MajorVersion": 5, "MinorVersion": -8, "PatchVersion": 0}"#,
+            r#"{"MajorVersion": 5.0, "MinorVersion": 8, "PatchVersion": 0}"#,
+            r#"{"MajorVersion": 12345678901, "MinorVersion": 8, "PatchVersion": 0}"#,
+        ] {
+            assert_eq!(unreal_version(text), None, "{text:?}");
+        }
+    }
+
+    /// A `Build.version` over 64 KiB, or one that is not UTF-8, is no version file, said with the file's path.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test whose files cannot be made must fail loudly")]
+    fn an_unreal_build_version_over_64_kib_or_not_utf8_gives_no_version() {
+        let root = unit_root("unreal-file");
+        let file = root.join("Build.version");
+        let text = build_version_text(5, 8, 0);
+        let padded = |length: usize| format!("{text}{}", " ".repeat(length - text.len()));
+        let shown = file.to_string_lossy().into_owned();
+
+        fs::write(&file, padded(64 * 1024)).expect("the file can be written");
+        assert_eq!(build_version(&file), Ok("5.8.0".to_owned()), "exactly 64 KiB is read");
+
+        fs::write(&file, padded(64 * 1024 + 1)).expect("the file can be written");
+        assert_eq!(build_version(&file), Err(format!("{shown} is over 64 KiB")));
+
+        fs::write(&file, b"{\"MajorVersion\": 5, \xff}").expect("the file can be written");
+        assert_eq!(build_version(&file), Err(format!("{shown} is not UTF-8")));
         fs::remove_dir_all(&root).expect("the test's root can be removed");
     }
 }

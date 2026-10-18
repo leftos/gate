@@ -410,6 +410,15 @@ fn run_env_refuses_godot_path_as_a_machine_path() {
     );
 }
 
+/// `UE_ROOT` is the Unreal Engine a routed run resolves, so a caller's value for it is refused as a machine path.
+#[test]
+fn run_env_refuses_ue_root_as_a_machine_path() {
+    assert_eq!(
+        problems_with(&["--env", "UE_ROOT=C:\\UE_5.8", "--", "cmd"]),
+        ["gate: --env sets UE_ROOT, a machine path the gate keeps for the command"]
+    );
+}
+
 /// `UseSharedCompilation` is one of the gate's own settings: it is off for every command the gate starts, local or
 /// routed, so a caller's `--env` value for it is refused (GATE-383).
 #[test]

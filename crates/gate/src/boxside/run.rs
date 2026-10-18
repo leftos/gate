@@ -133,6 +133,9 @@ pub(super) struct Request<'a> {
     env: Vec<(String, String)>,
     /// The version of the Godot install the run uses, `GodotVersion`, `major.minor.patch`; `None` when none is chosen.
     godot: Option<&'a str>,
+    /// The version of the Unreal Engine install the run uses, `UnrealVersion`, `major.minor.patch`; `None` when none is
+    /// chosen.
+    unreal: Option<&'a str>,
     /// The outputs the run brings back, `None` when it has no output globs.
     outputs: Option<Asked<'a>>,
     /// The run's `Nonce`, which its start marker and its refusal tags name.
@@ -181,6 +184,7 @@ impl Request<'_> {
         let identity = identity(payload)?;
         let env = caller_env(payload)?;
         let godot = payload.godot_version()?;
+        let unreal = payload.unreal_version()?;
         let inputs_digest = payload.inputs_digest()?;
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
         let (main, siblings) = repos(payload, work, bare, snapshot)?;
@@ -198,6 +202,7 @@ impl Request<'_> {
             identity,
             env,
             godot,
+            unreal,
             outputs,
             nonce,
             timeout,
@@ -1198,7 +1203,7 @@ pub(super) fn full_path(path: &Path) -> Option<PathBuf> {
 /// node reuse are off. Git's `safe.directory` is set to `*` over that ([`with_safe_directory`]), and the Event Log
 /// logging provider of a .NET host the command starts is turned off over that ([`with_event_log_off`]). The command runs
 /// with a restricted copy of the box's token ([`restricted_token`]). The program and a run's `GODOT_PATH` are
-/// [`resolved_command`]'s, through [`prepared`].
+/// [`resolved_command`]'s, and its `UE_ROOT` [`with_unreal`]'s, through [`prepared`].
 fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<Ran, u32> {
     let Prepared {
         word,
@@ -1275,10 +1280,11 @@ struct Prepared<'w> {
 }
 
 /// Resolves `one`'s program in its place and writes its command line, with the environment [`command_variables`]
-/// composes, the program and a run's `GODOT_PATH` being [`resolved_command`]'s, before anything holds a job or the
-/// builder's desktop for it, so a desktop run gets the same program and environment as any run. `Err` with the run's
-/// answer when it cannot start: `Ok` with 127 for a program not found or one with no shell to run it, its line said;
-/// `Err` with 2 for a batch word refused, or 1 for the box's own failure, its line said.
+/// composes, the program and a run's `GODOT_PATH` being [`resolved_command`]'s and its `UE_ROOT` [`with_unreal`]'s,
+/// before anything holds a job or the builder's desktop for it, so a desktop run gets the same program and environment
+/// as any run. `Err` with the run's answer when it cannot start: `Ok` with 127 for a chosen Unreal Engine that does not
+/// resolve, a program not found or one with no shell to run it, its line said; `Err` with 2 for a batch word refused,
+/// or 1 for the box's own failure, its line said.
 fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> Result<Prepared<'w>, Result<Ran, u32>> {
     let run = format!("gate-box-{}", request.nonce);
     let Some((word, rest)) = one.words.split_first() else {
@@ -1287,6 +1293,13 @@ fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> 
     let exe = std::env::current_exe().map_err(|error| Err(failed(console, &format!("the box's own path cannot be read: {error}"))))?;
     let job = handed_job(request.job, gate_win32::own_session());
     let (variables, found) = resolved_command(request.godot, word, command_variables(&request.env, &run, &job, &exe), one.place);
+    let variables = match with_unreal(request.unreal, variables) {
+        Ok(variables) => variables,
+        Err(line) => {
+            console.err(&line);
+            return Err(Ok(Ran::Exited(NOT_STARTED)));
+        }
+    };
     let environment = variables
         .block()
         .map_err(|error| Err(failed(console, &format!("cannot build the command's environment: {error}"))))?;
@@ -1385,6 +1398,29 @@ fn resolved_command(godot: Option<&str>, word: &str, variables: Variables, place
         None => variables.without(GODOT_PATH),
     };
     (variables, found)
+}
+
+/// The variable a command of a run with a chosen Unreal Engine version reads the engine folder it resolved from.
+const UE_ROOT: &str = "UE_ROOT";
+
+/// The environment `variables` of a command of a run whose chosen Unreal Engine version is `unreal`. With a version,
+/// `UE_ROOT` is set over every other value they hold for it, the caller's having been refused, to the install of that
+/// version under the box's `GATE_UNREAL_ROOT` ([`probe::installed_unreal`]); with no version, every value they hold for
+/// it is removed, so an inherited one never passes for the gate's. `Err` with the line
+/// `gate: could not resolve unreal <version>: <why>` when the version does not resolve. The command's first word is
+/// never read.
+fn with_unreal(unreal: Option<&str>, variables: Variables) -> Result<Variables, String> {
+    let Some(version) = unreal else {
+        return Ok(variables.without(UE_ROOT));
+    };
+    let installed = variables
+        .get(probe::UNREAL_ROOT)
+        .ok_or_else(|| format!("{} is not set", probe::UNREAL_ROOT))
+        .and_then(|root| probe::installed_unreal(root, version));
+    match installed {
+        Ok(folder) => Ok(variables.with(UE_ROOT, &folder.to_string_lossy())),
+        Err(why) => Err(format!("gate: could not resolve unreal {version}: {why}")),
+    }
 }
 
 /// The variable that counts the config entries git reads from the environment.

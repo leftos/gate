@@ -239,7 +239,8 @@ pub const GATE_SET_PREFIXES: &[&str] = &["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"]
 pub const GATE_NAME_PREFIX: &str = "GATE_";
 
 /// The names of machine paths the gate keeps for the command: the builder's own, which a caller's value would move out
-/// from under it, and `GODOT_PATH`, which a routed run of a repo pinning one Godot sets to the install it resolved.
+/// from under it, `GODOT_PATH`, which a routed run of a repo pinning one Godot sets to the install it resolved, and
+/// `UE_ROOT`, which a routed run of a repo pinning one Unreal Engine sets to the engine it resolved.
 pub const MACHINE_PATH_NAMES: &[&str] = &[
     "PATH",
     "PATHEXT",
@@ -254,6 +255,7 @@ pub const MACHINE_PATH_NAMES: &[&str] = &[
     "LOCALAPPDATA",
     "ProgramData",
     "GODOT_PATH",
+    "UE_ROOT",
 ];
 
 /// The most names a caller may give for the command's environment.
@@ -621,6 +623,14 @@ mod tests {
         for name in ["PATHS", "HOMEDRIVE", "TMPDIR"] {
             assert_eq!(env_refusal(name, "x"), None, "{name}");
         }
+    }
+
+    #[test]
+    fn ue_root_is_refused_as_a_machine_path_in_any_letter_case() {
+        for name in ["UE_ROOT", "ue_root", "Ue_Root"] {
+            assert_eq!(env_refusal(name, r"C:\UE_5.8"), Some(EnvRefusal::MachinePath), "{name}");
+        }
+        assert_eq!(env_refusal("UE_ROOTS", "x"), None);
     }
 
     #[test]

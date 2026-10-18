@@ -197,15 +197,25 @@ impl Payload {
         }
     }
 
-    /// The version of the builder's Godot install the run uses, `GodotVersion`: a canonical `major.minor.patch`
+    /// The version of the builder's Godot install the run uses, `GodotVersion` ([`Payload::install_version`]).
+    pub(crate) fn godot_version(&self) -> Result<Option<&str>, String> {
+        self.install_version("GodotVersion")
+    }
+
+    /// The version of the builder's Unreal Engine install the run uses, `UnrealVersion` ([`Payload::install_version`]).
+    pub(crate) fn unreal_version(&self) -> Result<Option<&str>, String> {
+        self.install_version("UnrealVersion")
+    }
+
+    /// The version of an install of the builder the run uses, under the key `key`: a canonical `major.minor.patch`
     /// ([`is_canonical_version`]), as it is joined into an install's path; `None` when the key is absent or null. Else
     /// the usage line, the value shortened and shown with its control characters escaped.
-    pub(crate) fn godot_version(&self) -> Result<Option<&str>, String> {
-        match self.0.get("GodotVersion") {
+    fn install_version(&self, key: &str) -> Result<Option<&str>, String> {
+        match self.0.get(key) {
             None | Some(Value::Null) => Ok(None),
             Some(Value::String(version)) if is_canonical_version(version) => Ok(Some(version)),
             Some(other) => Err(format!(
-                "gate: box payload GodotVersion is not a version: '{}'",
+                "gate: box payload {key} is not a version: '{}'",
                 escaped(&shown_name(&other.as_str().map_or_else(|| other.to_string(), str::to_owned)))
             )),
         }
@@ -677,9 +687,9 @@ pub(crate) fn ordinal_upper(text: &str) -> String {
         .collect()
 }
 
-/// Whether `text` is a version in the one spelling a Godot install's folder has: three dot-separated parts, each of one
-/// to [`MAX_PART_DIGITS`] ASCII digits with no leading zero unless the part is `0`, as the godot probe spells the
-/// version an install reports.
+/// Whether `text` is a version in the one spelling a Godot or Unreal Engine install's folder has: three dot-separated
+/// parts, each of one to [`MAX_PART_DIGITS`] ASCII digits with no leading zero unless the part is `0`, as the godot and
+/// unreal probes spell the version an install reports.
 pub(crate) fn is_canonical_version(text: &str) -> bool {
     let parts: Vec<&str> = text.split('.').collect();
     let canonical = |part: &&str| {
@@ -737,6 +747,31 @@ mod tests {
                 "{version}"
             );
         }
+    }
+
+    /// What the `UnrealVersion` reader makes of the payload whose `UnrealVersion` is `version`.
+    fn unreal_version_of(version: &serde_json::Value) -> Result<Option<String>, String> {
+        decoded(&json!({ "UnrealVersion": version }).to_string()).and_then(|payload| payload.unreal_version().map(|read| read.map(str::to_owned)))
+    }
+
+    /// `UnrealVersion` is read as `GodotVersion` is, with its own key in the refusal, and a null one is none.
+    #[test]
+    fn an_unreal_version_is_three_canonical_parts_of_at_most_ten_digits() {
+        for version in ["5.8.0", "0.0.0", "5.10.3", "9999999999.0.1"] {
+            assert_eq!(unreal_version_of(&json!(version)), Ok(Some(version.to_owned())), "{version}");
+        }
+        for version in ["05.8.0", "5.08.0", "5.8.00", "5.8", "99999999999.0.1", "5.8.12345678901"] {
+            assert_eq!(
+                unreal_version_of(&json!(version)),
+                Err(format!("gate: box payload UnrealVersion is not a version: '{version}'")),
+                "{version}"
+            );
+        }
+        assert_eq!(unreal_version_of(&serde_json::Value::Null), Ok(None));
+        assert_eq!(
+            decoded("{}").and_then(|payload| payload.unreal_version().map(|read| read.is_none())),
+            Ok(true)
+        );
     }
 
     const NOT_BASE64_JSON: &str = "gate: box payload is not base64 JSON: ";

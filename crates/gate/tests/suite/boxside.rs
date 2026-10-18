@@ -833,9 +833,8 @@ fn godot_root(case: &Case) -> PathBuf {
 }
 
 /// A `gate box preflight` needing `needs`, its `PATH` the stub folders `stubs` then git's folder, so no dotnet is
-/// found and the sdks line says `none`, and its `GATE_GODOT_ROOT` the folder `root`, taken out of the box's
-/// environment when there is none.
-fn probed_with_root(case: &Case, needs: &Value, stubs: &[PathBuf], root: Option<&Path>) -> Outcome {
+/// found and the sdks line says `none`, not yet started.
+fn preflight_call(case: &Case, needs: &Value, stubs: &[PathBuf]) -> BoxCall {
     let folders = Folders::new(case);
     let mut command = box_call(
         case,
@@ -843,6 +842,13 @@ fn probed_with_root(case: &Case, needs: &Value, stubs: &[PathBuf], root: Option<
         &needing(&folders, needs),
     );
     command.env("PATH", path_with_git(stubs));
+    command
+}
+
+/// A `gate box preflight` as [`preflight_call`] makes it, and its `GATE_GODOT_ROOT` the folder `root`, taken out of
+/// the box's environment when there is none.
+fn probed_with_root(case: &Case, needs: &Value, stubs: &[PathBuf], root: Option<&Path>) -> Outcome {
+    let mut command = preflight_call(case, needs, stubs);
     if let Some(root) = root {
         command.env("GATE_GODOT_ROOT", root);
     } else {
@@ -1014,6 +1020,213 @@ fn preflight_leaves_out_a_godot_whose_folder_is_named_another_version() {
         ["gate: remote tool godot skipped: named 4.7 but reports 4.7.2"],
         "{outcome:?}"
     );
+}
+
+/// Writes `text` as `Engine\Build\Build.version` under `folder`, so the folder stands in for an Unreal Engine install
+/// whose version file holds it.
+fn fake_unreal_text(folder: &Path, text: &str) {
+    let build = folder.join("Engine").join("Build");
+    fs::create_dir_all(&build).expect("the fake engine's folders can be made");
+    fs::write(build.join("Build.version"), text).expect("the fake engine's Build.version can be written");
+}
+
+/// Makes `folder` a fake Unreal Engine install whose `Build.version` reports `version`, `major.minor.patch`, beside the
+/// other keys a real one holds.
+fn fake_unreal(folder: &Path, version: &str) {
+    let parts: Vec<u64> = version
+        .split('.')
+        .map(|part| part.parse().expect("a fake engine's version is numbers"))
+        .collect();
+    let text = json!({
+        "MajorVersion": parts[0],
+        "MinorVersion": parts[1],
+        "PatchVersion": parts[2],
+        "Changelist": 0,
+        "BranchName": "++UE5+Release-5.8",
+    });
+    fake_unreal_text(folder, &text.to_string());
+}
+
+/// The `Build.version` of the fake engine in `folder`.
+fn unreal_build_version(folder: &Path) -> PathBuf {
+    folder.join("Engine").join("Build").join("Build.version")
+}
+
+/// The folder a case's `GATE_UNREAL_ROOT` names, made and holding no install: one goes in a subfolder of it, put there
+/// with [`fake_unreal`].
+fn unreal_root(case: &Case) -> PathBuf {
+    let root = case.folder().join("unreal");
+    fs::create_dir_all(&root).expect("the unreal root can be made");
+    root
+}
+
+/// A `gate box preflight` needing `unreal`, its `GATE_UNREAL_ROOT` the folder `root`, taken out of the box's
+/// environment when there is none.
+fn probed_with_unreal_root(case: &Case, root: Option<&Path>) -> Outcome {
+    let mut command = preflight_call(case, &json!({"unreal": "5.8.0"}), &[]);
+    if let Some(root) = root {
+        command.env("GATE_UNREAL_ROOT", root);
+    } else {
+        command.env_remove("GATE_UNREAL_ROOT");
+    }
+    command.finish()
+}
+
+/// Every engine the root names is read, and the line carries every version found, by number and without repeats.
+#[test]
+fn preflight_says_every_unreal_the_root_names() {
+    let case = Case::new("preflight_unreal_root");
+    let root = unreal_root(&case);
+    fake_unreal(&root.join("5.10.0"), "5.10.0");
+    fake_unreal(&root.join("5.7.3"), "5.7.3");
+
+    let outcome = probed_with_unreal_root(&case, Some(&root));
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool unreal 5.7.3,5.10.0"], "{outcome:?}");
+}
+
+/// A root that holds no engine, a subfolder with no `Build.version` among its entries, is missing.
+#[test]
+fn preflight_says_a_root_holding_no_unreal_is_missing() {
+    let case = Case::new("preflight_unreal_root_empty");
+    let root = unreal_root(&case);
+    fs::create_dir_all(root.join("5.8.0").join("Engine")).expect("a folder with no Build.version can be made");
+
+    let outcome = probed_with_unreal_root(&case, Some(&root));
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool unreal missing"], "{outcome:?}");
+}
+
+/// With no `GATE_UNREAL_ROOT` the engine is missing: nothing is looked for along the `PATH`.
+#[test]
+fn preflight_says_unreal_is_missing_with_no_root() {
+    let case = Case::new("preflight_unreal_no_root");
+
+    let outcome = probed_with_unreal_root(&case, None);
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool unreal missing"], "{outcome:?}");
+}
+
+/// A root that is no absolute path on a drive is refused with its path.
+#[test]
+fn preflight_skips_an_unreal_root_that_is_no_drive_path() {
+    let case = Case::new("preflight_unreal_root_no_drive");
+
+    let outcome = probed_with_unreal_root(&case, Some(Path::new("unreal")));
+
+    assert_eq!(
+        after_sdks(&outcome),
+        ["gate: remote tool unreal skipped: GATE_UNREAL_ROOT unreal is not an absolute path on a drive"],
+        "{outcome:?}"
+    );
+}
+
+/// A root inside the folder the box keeps its work folders in is refused, though it holds an engine.
+#[test]
+fn preflight_skips_an_unreal_root_inside_the_work_root() {
+    let case = Case::new("preflight_unreal_root_inside_work");
+    let folders = Folders::new(&case);
+    let root = Path::new(&folders.work).parent().expect("the work folder has a parent").join("unreal");
+    fake_unreal(&root.join("5.8.0"), "5.8.0");
+
+    let outcome = probed_with_unreal_root(&case, Some(&root));
+
+    let said = format!("gate: remote tool unreal skipped: {} lies inside the box's work root", root.display());
+    assert_eq!(after_sdks(&outcome), [said.as_str()], "{outcome:?}");
+}
+
+/// An engine whose folder, or whose `Engine` folder, is a junction is left out; a root whose only engine is behind a
+/// junction is skipped with that reason.
+#[test]
+fn preflight_leaves_out_an_unreal_behind_a_junction() {
+    let case = Case::new("preflight_unreal_behind_a_junction");
+    let root = unreal_root(&case);
+    let behind = case.folder().join("behind");
+    fake_unreal(&behind.join("9.9.9"), "9.9.9");
+    junction(&root.join("9.9.9"), &behind.join("9.9.9"));
+    fs::create_dir_all(root.join("5.7.3")).expect("an engine folder can be made");
+    junction(&root.join("5.7.3").join("Engine"), &behind.join("9.9.9").join("Engine"));
+    fake_unreal(&root.join("5.8.0"), "5.8.0");
+
+    let outcome = probed_with_unreal_root(&case, Some(&root));
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool unreal 5.8.0"], "{outcome:?}");
+
+    let only = Case::new("preflight_unreal_only_a_junction");
+    let root = unreal_root(&only);
+    let behind = only.folder().join("behind");
+    fake_unreal(&behind, "9.9.9");
+    junction(&root.join("9.9.9"), &behind);
+
+    let outcome = probed_with_unreal_root(&only, Some(&root));
+
+    let linked = root.join("9.9.9");
+    let said = format!(
+        "gate: remote tool unreal skipped: cannot read {}: {} is a link or a junction",
+        unreal_build_version(&linked).display(),
+        linked.display()
+    );
+    assert_eq!(after_sdks(&outcome), [said.as_str()], "{outcome:?}");
+}
+
+/// An engine whose folder is not named the version its `Build.version` reports is left out of the line, as a run finds
+/// an engine by its folder's name; a root whose only engine is misnamed is skipped with that reason.
+#[test]
+fn preflight_leaves_out_an_unreal_whose_folder_is_named_another_version() {
+    let case = Case::new("preflight_unreal_misnamed");
+    let root = unreal_root(&case);
+    fake_unreal(&root.join("5.8"), "5.8.0");
+    fake_unreal(&root.join("5.7.3"), "5.7.3");
+
+    let outcome = probed_with_unreal_root(&case, Some(&root));
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool unreal 5.7.3"], "{outcome:?}");
+
+    let only = Case::new("preflight_unreal_only_misnamed");
+    let root = unreal_root(&only);
+    fake_unreal(&root.join("5.8"), "5.8.0");
+
+    let outcome = probed_with_unreal_root(&only, Some(&root));
+
+    assert_eq!(
+        after_sdks(&outcome),
+        ["gate: remote tool unreal skipped: named 5.8 but reports 5.8.0"],
+        "{outcome:?}"
+    );
+}
+
+/// An engine whose `Build.version` is not the JSON object of three integer parts is left out; a root whose only
+/// engine is one such is skipped with the file it read.
+#[test]
+fn preflight_leaves_out_an_unreal_whose_build_version_is_not_json() {
+    let case = Case::new("preflight_unreal_not_json");
+    let root = unreal_root(&case);
+    fake_unreal_text(&root.join("5.8.0"), "not json");
+    fake_unreal(&root.join("5.7.3"), "5.7.3");
+
+    let outcome = probed_with_unreal_root(&case, Some(&root));
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool unreal 5.7.3"], "{outcome:?}");
+
+    for (name, text) in [
+        ("not_json", "not json"),
+        ("text_parts", r#"{"MajorVersion": "5", "MinorVersion": 8, "PatchVersion": 0}"#),
+        ("no_patch", r#"{"MajorVersion": 5, "MinorVersion": 8}"#),
+        ("negative", r#"{"MajorVersion": 5, "MinorVersion": -8, "PatchVersion": 0}"#),
+        ("array", "[5, 8, 0]"),
+    ] {
+        let only = Case::new(&format!("preflight_unreal_only_{name}"));
+        let root = unreal_root(&only);
+        fake_unreal_text(&root.join("5.8.0"), text);
+
+        let outcome = probed_with_unreal_root(&only, Some(&root));
+
+        let said = format!(
+            "gate: remote tool unreal skipped: {} gives no integer MajorVersion, MinorVersion and PatchVersion",
+            unreal_build_version(&root.join("5.8.0")).display()
+        );
+        assert_eq!(after_sdks(&outcome), [said.as_str()], "{name}: {outcome:?}");
+    }
 }
 
 #[test]
@@ -2118,6 +2331,179 @@ fn box_run_refuses_a_godot_version_that_is_no_version() {
         assert_eq!(outcome.stderr, format!("{line}\n"), "{outcome:?}");
         assert_eq!(work_entries(&payload), laid, "nothing is checked out or run");
     }
+}
+
+/// `gate box run` of `payload` with the box's `GATE_UNREAL_ROOT` the folder `root` and its own `UE_ROOT` `inherited`,
+/// each taken out of its environment when there is none.
+fn run_box_with_unreal(case: &Case, payload: &Value, root: Option<&Path>, inherited: Option<&str>) -> Outcome {
+    let mut command = box_call(case, &["box", "run"], &self::payload(payload));
+    if let Some(root) = root {
+        command.env("GATE_UNREAL_ROOT", root);
+    } else {
+        command.env_remove("GATE_UNREAL_ROOT");
+    }
+    command.env("PATH", path_for_run(&[]));
+    if let Some(inherited) = inherited {
+        command.env("UE_ROOT", inherited);
+    } else {
+        command.env_remove("UE_ROOT");
+    }
+    command.finish()
+}
+
+/// A run payload of `words`, snapshotted, with the `UnrealVersion` `version` when given.
+fn unreal_payload(case: &Case, words: &[&str], version: Option<&str>) -> Value {
+    let mut payload = box_payload(case, "k", words);
+    snapshot(case, &mut payload, &[("a.txt", "a\n")]);
+    if let Some(version) = version {
+        payload["UnrealVersion"] = json!(version);
+    }
+    payload
+}
+
+/// A stale `UE_ROOT` the box inherited, which no run's command may see.
+const STALE_UE_ROOT: &str = r"C:\stale\UE_5.0";
+
+/// Every command of a run with an `UnrealVersion` sees `UE_ROOT` naming the root's engine of that version, out of a
+/// root of two, over the value the box inherited.
+#[test]
+fn box_run_sets_ue_root_to_the_chosen_unreal_over_an_inherited_one() {
+    let case = Case::new("box_run_unreal_chosen");
+    let root = unreal_root(&case);
+    fake_unreal(&root.join("5.7.3"), "5.7.3");
+    fake_unreal(&root.join("5.8.0"), "5.8.0");
+    let payload = unreal_payload(&case, &[FAKE_TOOL, "env", "UE_ROOT"], Some("5.8.0"));
+
+    let outcome = run_box_with_unreal(&case, &payload, Some(&root), Some(STALE_UE_ROOT));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, format!("{}\n", root.join("5.8.0").display()), "{outcome:?}");
+}
+
+/// A run with no `UnrealVersion` gives its command no `UE_ROOT`, the box's inherited one removed, though the root
+/// holds an engine.
+#[test]
+fn box_run_without_an_unreal_version_removes_an_inherited_ue_root() {
+    let case = Case::new("box_run_unreal_none");
+    let root = unreal_root(&case);
+    fake_unreal(&root.join("5.8.0"), "5.8.0");
+    let payload = unreal_payload(&case, &[FAKE_TOOL, "env", "UE_ROOT"], None);
+
+    let outcome = run_box_with_unreal(&case, &payload, Some(&root), Some(STALE_UE_ROOT));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "fake-tool: UE_ROOT is not set\n", "{outcome:?}");
+}
+
+/// Checks a run whose `UnrealVersion` 5.8.0 did not resolve failed to start, status 127, with the one line saying why
+/// `why` and nothing run.
+fn assert_unreal_not_resolved(outcome: &Outcome, why: &str) {
+    assert_eq!(outcome.code, Some(127), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    let said = format!("gate: could not resolve unreal 5.8.0: {why}");
+    assert!(outcome.stderr.lines().any(|line| line == said), "{said}: {outcome:?}");
+}
+
+/// A run whose chosen engine the root does not hold, whose root is unset, or whose engine folder reports another version
+/// fails to start, status 127, saying why.
+#[test]
+fn box_run_with_a_root_lacking_the_chosen_unreal_fails_127_saying_why() {
+    let case = Case::new("box_run_unreal_missing");
+    let root = unreal_root(&case);
+    fake_unreal(&root.join("5.7.3"), "5.7.3");
+    let payload = unreal_payload(&case, &[FAKE_TOOL, "env", "UE_ROOT"], Some("5.8.0"));
+
+    let outcome = run_box_with_unreal(&case, &payload, Some(&root), Some(STALE_UE_ROOT));
+
+    let file = unreal_build_version(&root.join("5.8.0"));
+    assert_unreal_not_resolved(&outcome, &format!("{} is not a file", file.display()));
+
+    let outcome = run_box_with_unreal(&case, &payload, None, Some(STALE_UE_ROOT));
+
+    assert_unreal_not_resolved(&outcome, "GATE_UNREAL_ROOT is not set");
+
+    fake_unreal(&root.join("5.8.0"), "5.7.3");
+
+    let outcome = run_box_with_unreal(&case, &payload, Some(&root), None);
+
+    assert_unreal_not_resolved(&outcome, "named 5.8.0 but reports 5.7.3");
+}
+
+/// An engine of the chosen version behind a junction is never taken: the run fails to start.
+#[test]
+fn box_run_never_resolves_an_unreal_behind_a_junction() {
+    let case = Case::new("box_run_unreal_junction");
+    let root = unreal_root(&case);
+    let behind = case.folder().join("behind");
+    fake_unreal(&behind, "5.8.0");
+    junction(&root.join("5.8.0"), &behind);
+    let payload = unreal_payload(&case, &[FAKE_TOOL, "env", "UE_ROOT"], Some("5.8.0"));
+
+    let outcome = run_box_with_unreal(&case, &payload, Some(&root), None);
+
+    let linked = root.join("5.8.0");
+    let why = format!(
+        "cannot read {}: {} is a link or a junction",
+        unreal_build_version(&linked).display(),
+        linked.display()
+    );
+    assert_unreal_not_resolved(&outcome, &why);
+}
+
+/// An `UnrealVersion` that is not three runs of digits is refused with the usage line before anything is checked out,
+/// as it would be joined into a path; a null one is no version at all.
+#[test]
+fn box_run_refuses_an_unreal_version_that_is_no_version() {
+    let case = Case::new("box_run_unreal_version_refused");
+    let refusing = [
+        (json!("5.8"), "gate: box payload UnrealVersion is not a version: '5.8'"),
+        (json!("5.8.0.1"), "gate: box payload UnrealVersion is not a version: '5.8.0.1'"),
+        (json!(r"..\5.8.0"), r"gate: box payload UnrealVersion is not a version: '..\5.8.0'"),
+        (json!("05.8.0"), "gate: box payload UnrealVersion is not a version: '05.8.0'"),
+        (json!(""), "gate: box payload UnrealVersion is not a version: ''"),
+        (json!(5), "gate: box payload UnrealVersion is not a version: '5'"),
+    ];
+    let payload = unreal_payload(&case, &[FAKE_TOOL, "env", "UE_ROOT"], None);
+    let laid = work_entries(&payload);
+
+    for (version, line) in refusing {
+        let mut refused = payload.clone();
+        refused["UnrealVersion"] = version;
+
+        let outcome = run_box(&case, &refused);
+
+        assert_eq!(outcome.code, Some(2), "{line}: {outcome:?}");
+        assert_eq!(outcome.stdout, "");
+        assert_eq!(outcome.stderr, format!("{line}\n"), "{outcome:?}");
+        assert_eq!(work_entries(&payload), laid, "nothing is checked out or run");
+    }
+
+    let mut null = payload.clone();
+    null["UnrealVersion"] = Value::Null;
+
+    let outcome = run_box_with_unreal(&case, &null, None, Some(STALE_UE_ROOT));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "fake-tool: UE_ROOT is not set\n", "{outcome:?}");
+}
+
+/// `UE_ROOT` is the engine a run resolves, so a caller's value for it is refused as a machine path the builder keeps.
+#[test]
+fn box_run_refuses_ue_root_as_a_caller_env_pair() {
+    let case = Case::new("box_run_ue_root_env");
+    let mut payload = unreal_payload(&case, &[FAKE_TOOL, "env", "UE_ROOT"], None);
+    let laid = work_entries(&payload);
+    payload["Env"] = json!({"UE_ROOT": r"C:\x\UE_5.8"});
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(
+        outcome.stderr, "gate: box payload Env sets UE_ROOT, a machine path the builder keeps\n",
+        "{outcome:?}"
+    );
+    assert_eq!(work_entries(&payload), laid, "nothing is checked out or run");
 }
 
 #[test]
