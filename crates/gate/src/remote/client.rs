@@ -399,7 +399,7 @@ fn warm_status(status: i64, warm: Option<&WarmEnd>) -> i64 {
 fn outputs_sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<outputs::Sent<'a>, End> {
     match attempt.call.warmth {
         Warmth::WarmUp { .. } => Ok(outputs::Sent::nothing()),
-        Warmth::Unasked | Warmth::Needs(_) => outputs::sent(attempt),
+        Warmth::Unasked | Warmth::Consented(_) => outputs::sent(attempt),
     }
 }
 
@@ -1209,7 +1209,7 @@ impl Attempt<'_, '_> {
     fn godot_command(&self) -> bool {
         match self.call.warmth {
             Warmth::WarmUp { commands, .. } => commands.iter().any(|command| command.first().is_some_and(|word| is_godot_console(word))),
-            Warmth::Unasked | Warmth::Needs(_) => self.call.words.first().is_some_and(|word| is_godot_console(word)),
+            Warmth::Unasked | Warmth::Consented(_) => self.call.words.first().is_some_and(|word| is_godot_console(word)),
         }
     }
 
@@ -1217,7 +1217,7 @@ impl Attempt<'_, '_> {
     fn run_word(&self, location: &Location, run: &RunCall<'_>) -> String {
         match self.call.warmth {
             Warmth::WarmUp { commands, hash } => payload::warm_word(location, run, &WarmCall { commands, hash }),
-            Warmth::Unasked | Warmth::Needs(_) => payload::run_word(location, run),
+            Warmth::Unasked | Warmth::Consented(_) => payload::run_word(location, run),
         }
     }
 
@@ -1230,13 +1230,13 @@ impl Attempt<'_, '_> {
     }
 
     /// Gives the run call the `raised` ceiling, and the backstop it sets unless the backstop seam gives one, and says
-    /// the cold note once ([`cold_line`]): `gate warm` for a run that needs a warm hash, whose repo has warm-up
-    /// consent and a warm-up file that parsed.
+    /// the cold note once ([`cold_line`]): `gate warm` for a run whose repo has warm-up consent and a warm-up file
+    /// that parsed.
     fn raise_ceiling(&mut self, raised: u64) {
         self.raised = Some(raised);
         self.limits.command = Duration::from_secs(raised);
         self.limits.backstop = self.backstop_seam.unwrap_or_else(|| watchdog::backstop(raised));
-        let warm_up = matches!(self.call.warmth, Warmth::Needs(_));
+        let warm_up = matches!(self.call.warmth, Warmth::Consented(_));
         self.say(cold_line(self.call.timeout, raised, warm_up));
     }
 
@@ -1533,7 +1533,6 @@ impl Attempt<'_, '_> {
             attempt.ssh(BoxVerb::Preflight, Echo::LogOnly, watch, raise, CallOnly::plain(Arc::clone(&input)))
         })?;
         let theirs = their_version(&called.lines).map(str::to_owned);
-        let warm = warm_of(&called.lines);
         let new_tree = new_work_tree(&called.lines);
         let created = called
             .lines
@@ -1574,10 +1573,6 @@ impl Attempt<'_, '_> {
         if let Some(line) = version_refusal(host, theirs.as_deref(), &build_version()) {
             self.say(line);
             return Err(End::Refused(FallbackReason::Version));
-        }
-        // Before the parity check and the push, so a run that would meet a cold work folder sends nothing.
-        if is_cold(self.call.warmth, &warm) {
-            return Err(End::Refused(FallbackReason::Cold));
         }
         Ok(Prepared {
             created,
@@ -3929,15 +3924,6 @@ fn cold_line(from: u64, to: u64, warm_up: bool) -> String {
     format!("gate: remote cold: this worktree's work folder on the builder is new; the ceiling is raised from {from} s to {to} s; {prewarm}")
 }
 
-/// Whether a call asking `warmth` meets a cold work folder, the preflight having said `warm`: only a run that needs a
-/// hash can, when the preflight did not say exactly that hash.
-fn is_cold(warmth: Warmth<'_>, warm: &Warm) -> bool {
-    match warmth {
-        Warmth::Needs(hash) => !matches!(warm, Warm::Hash(said) if said == hash),
-        Warmth::Unasked | Warmth::WarmUp { .. } => false,
-    }
-}
-
 /// Why a warm-up the box ran to status 0 is still not warm.
 const UNCONFIRMED: &str = "the box did not confirm the warm hash";
 
@@ -4267,7 +4253,7 @@ mod tests {
         version_refusal,
     };
     use super::{CSPROJ_BYTES, CSPROJ_FILES, Entry, csproj_pins, entries_of, manifest_entry};
-    use super::{KeyHold, RunEnd, Warm, cold_line, hold_key, hold_key_waiting, is_cold, new_work_tree, status_end, warm_end, warm_of};
+    use super::{KeyHold, RunEnd, Warm, cold_line, hold_key, hold_key_waiting, new_work_tree, status_end, warm_end, warm_of};
     use crate::environment::Variables;
     use crate::remote::git::{self, DOTNET_LIMIT, GIT_LIMIT, Git, GitError};
     use crate::remote::held::tests::{Pair, junction};
@@ -6613,25 +6599,6 @@ mod tests {
         assert!(attempt.run_hang(false).is_none(), "no other call says the hint");
         attempt.raised = Some(120);
         assert!(attempt.run_hang(true).is_none(), "a cold run call compares with none");
-    }
-
-    #[test]
-    fn a_routed_run_needing_a_hash_is_refused_cold_unless_the_preflight_says_it() {
-        let said = Warm::Hash(WARM_HASH.to_owned());
-        assert!(!is_cold(Warmth::Needs(WARM_HASH), &said), "the hash it needs");
-        let other = Warm::Hash(OTHER_HASH.to_owned());
-        for (name, warm) in [("another-hash", &other), ("none", &Warm::NoHash), ("unseen", &Warm::Unseen)] {
-            assert!(is_cold(Warmth::Needs(WARM_HASH), warm), "{name}");
-        }
-        let commands = [vec!["./tool.exe".to_owned()]];
-        let warm_up = Warmth::WarmUp {
-            commands: &commands,
-            hash: WARM_HASH,
-        };
-        for warm in [&said, &other, &Warm::NoHash, &Warm::Unseen] {
-            assert!(!is_cold(Warmth::Unasked, warm), "a run that asks nothing: {warm:?}");
-            assert!(!is_cold(warm_up, warm), "a warm-up: {warm:?}");
-        }
     }
 
     /// How the warm-up of [`WARM_HASH`] ended whose run call said `stdout` and `stderr` and exited `status`, as the run

@@ -1111,6 +1111,20 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_that_is_a_folder_or_a_junction_cannot_be_probed() {
+        let folder = scratch("probe-not-a-file");
+        let target = folder.join("target");
+        fs::create_dir(&target).expect("the junction's target is made");
+        let made = folder.join("folder.lock");
+        fs::create_dir(&made).expect("a folder named like the lock is made");
+        let linked = folder.join("linked.lock");
+        crate::test_support::junction(&linked, &target);
+        for lock in [made, linked] {
+            assert!(lock_held(&lock).is_err(), "a folder or a junction is no lock: {}", lock.display());
+        }
+    }
+
+    #[test]
     fn a_lock_that_is_a_junction_is_refused() {
         let folder = scratch("junction");
         let target = folder.join("target");

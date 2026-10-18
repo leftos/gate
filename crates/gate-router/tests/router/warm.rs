@@ -3,8 +3,8 @@
 use std::time::{Duration, SystemTime};
 
 use gate_router::warm::{
-    FailureClass, FileRead, Judgement, Record, RecordRead, RecordState, Situation, WarmupFile, failed_line, file_problem_line, inside_job_line,
-    judge, lock_problem_line, read_warmup, record_problem_line, start_failed_line, starting_line, warm_hint_line, warming_line, warmup_hash,
+    FailureClass, FileRead, Judgement, Record, RecordRead, RecordState, Situation, WarmupFile, judge, lock_problem_text, read_warmup,
+    record_problem_text, shown_value, warming_text, warmup_hash,
 };
 
 fn problems(text: &str) -> Vec<String> {
@@ -205,7 +205,7 @@ fn no_file_routes_whatever_the_record_says() {
 }
 
 #[test]
-fn a_file_problem_runs_here_saying_so() {
+fn a_file_problem_is_a_problem() {
     let judgement = judge(&Situation {
         consented: true,
         file: &FileRead::Problem("commands[1] is empty".to_owned()),
@@ -216,25 +216,17 @@ fn a_file_problem_runs_here_saying_so() {
         now: now(),
     });
 
-    assert_eq!(
-        judgement,
-        Judgement::Problem("gate: not routed: .gate/warmup.toml: commands[1] is empty".to_owned())
-    );
+    assert_eq!(judgement, Judgement::Problem);
 }
 
 #[test]
-fn an_unreadable_record_runs_here_saying_so() {
+fn an_unreadable_record_is_a_problem() {
     let unreadable = RecordRead::Unreadable {
         path: r"C:\state\remote\warm\app-1a2b3c4d.json".to_owned(),
         error: "missing key \"v\"".to_owned(),
     };
 
-    assert_eq!(
-        judged(&unreadable, false),
-        Judgement::Problem(
-            r#"gate: not routed: the warm-up record C:\state\remote\warm\app-1a2b3c4d.json cannot be read: missing key "v""#.to_owned()
-        )
-    );
+    assert_eq!(judged(&unreadable, false), Judgement::Problem);
 }
 
 #[test]
@@ -427,68 +419,20 @@ fn voided(state: RecordState) -> [RecordRead; 3] {
 }
 
 #[test]
-fn the_lines_name_the_host_the_age_and_the_reason_escaped() {
+fn the_texts_name_the_host_the_path_and_the_reason_escaped() {
     assert_eq!(
-        warming_line("builder"),
-        "gate: not routed: builder is warming the work folder for this worktree"
+        record_problem_text("r\u{202e}.json", "bad\u{1b}"),
+        r"the warm-up record r\u{202e}.json cannot be read: bad\u{1b}"
+    );
+    assert_eq!(warming_text("builder"), "builder is warming the work folder");
+    assert_eq!(warming_text("b\u{1b}"), r"b\u{1b} is warming the work folder");
+    assert_eq!(
+        lock_problem_text(r"C:\s\k.lock", "Access is denied. (os error 5)"),
+        r"the warm-up lock C:\s\k.lock cannot be read: Access is denied. (os error 5)"
     );
     assert_eq!(
-        starting_line("builder"),
-        "gate: not routed: starting a warm-up of the work folder for this worktree on builder"
-    );
-    assert_eq!(
-        failed_line(0, "the builder is busy"),
-        "gate: not routed: the warm-up failed less than a minute ago: the builder is busy"
-    );
-    assert_eq!(
-        failed_line(12, "command 2 timed out"),
-        "gate: not routed: the warm-up failed 12 min ago: command 2 timed out"
-    );
-    assert_eq!(file_problem_line("a\nb"), r"gate: not routed: .gate/warmup.toml: a\nb");
-    assert_eq!(
-        record_problem_line("r\u{202e}.json", "bad\u{1b}"),
-        r"gate: not routed: the warm-up record r\u{202e}.json cannot be read: bad\u{1b}"
-    );
-    assert_eq!(
-        failed_line(1, "x\r\ngate: forged"),
-        r"gate: not routed: the warm-up failed 1 min ago: x\r\ngate: forged"
-    );
-    assert_eq!(
-        warming_line("b\u{1b}"),
-        r"gate: not routed: b\u{1b} is warming the work folder for this worktree"
-    );
-}
-
-#[test]
-fn the_warm_route_lines_name_the_host_and_the_lock_escaped() {
-    assert_eq!(
-        starting_line("b\u{1b}"),
-        r"gate: not routed: starting a warm-up of the work folder for this worktree on b\u{1b}"
-    );
-    assert_eq!(
-        inside_job_line(),
-        "gate: note: the warm-up runs inside a job this gate was started in, which it cannot leave, so it ends if that job ends"
-    );
-    assert_eq!(
-        start_failed_line("builder", "The system cannot find the file specified."),
-        "gate: not routed: cannot start a warm-up of the work folder for this worktree on builder: The system cannot find the file specified."
-    );
-    assert_eq!(
-        start_failed_line("b\u{1b}", "bad\r\ngate: forged"),
-        r"gate: not routed: cannot start a warm-up of the work folder for this worktree on b\u{1b}: bad\r\ngate: forged"
-    );
-    assert_eq!(
-        warm_hint_line("builder"),
-        "gate: gate warm warms the work folder for this worktree on builder"
-    );
-    assert_eq!(warm_hint_line("b\n"), r"gate: gate warm warms the work folder for this worktree on b\n");
-    assert_eq!(
-        lock_problem_line(r"C:\s\k.lock", "Access is denied. (os error 5)"),
-        r"gate: not routed: the warm-up lock C:\s\k.lock cannot be read: Access is denied. (os error 5)"
-    );
-    assert_eq!(
-        lock_problem_line("k\u{202e}.lock", "bad\u{1b}"),
-        r"gate: not routed: the warm-up lock k\u{202e}.lock cannot be read: bad\u{1b}"
+        lock_problem_text("k\u{202e}.lock", "bad\u{1b}"),
+        r"the warm-up lock k\u{202e}.lock cannot be read: bad\u{1b}"
     );
 }
 
@@ -496,19 +440,13 @@ fn the_warm_route_lines_name_the_host_and_the_lock_escaped() {
 fn a_record_s_long_values_are_cut_to_200_characters() {
     let long = "x".repeat(10_000);
     let cut = format!("{}…", "x".repeat(200));
-    assert_eq!(failed_line(3, &long), format!("gate: not routed: the warm-up failed 3 min ago: {cut}"));
+    assert_eq!(shown_value(&long), cut);
+    assert_eq!(warming_text(&long), format!("{cut} is warming the work folder"));
     assert_eq!(
-        warming_line(&long),
-        format!("gate: not routed: {cut} is warming the work folder for this worktree")
-    );
-    assert_eq!(
-        record_problem_line("r.json", &long),
-        format!("gate: not routed: the warm-up record r.json cannot be read: {cut}")
+        record_problem_text("r.json", &long),
+        format!("the warm-up record r.json cannot be read: {cut}")
     );
     let whole = "x".repeat(200);
-    assert_eq!(
-        failed_line(3, &whole),
-        format!("gate: not routed: the warm-up failed 3 min ago: {whole}"),
-        "200 characters are kept whole"
-    );
+    assert_eq!(shown_value(&whole), whole, "200 characters are kept whole");
+    assert_eq!(shown_value("x\r\ngate: forged"), r"x\r\ngate: forged", "a value is one line");
 }

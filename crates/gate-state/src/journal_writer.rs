@@ -246,7 +246,8 @@ pub enum FallbackReason {
     Client,
     /// The run's ignored inputs could not be sent to the builder, or its work folder no longer held them at the run.
     Inputs,
-    /// The builder's work folder was not warm for the run's warm-up file.
+    /// The builder's work folder was not warm for the run's warm-up file. No run falls back for it; it is kept so
+    /// journal lines that name it still read.
     Cold,
     /// The builder could not give the run its desktop.
     Desktop,

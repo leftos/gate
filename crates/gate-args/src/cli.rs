@@ -260,13 +260,12 @@ fn warm_option(name: &str) -> Option<RunOption> {
     }
 }
 
-/// The warm-up's own wait, then the client seams a routed run takes; `gate warm` has no request printer, and starts
-/// no warm-up for its spawn seam to record.
+/// The warm-up's own wait, then the client seams a routed run takes; `gate warm` has no request printer.
 #[cfg(feature = "test-seams")]
 fn warm_seam_option(name: &str) -> Option<RunOption> {
     match name {
         "test-warm-wait-ms" => Some(RunOption::Value(ValueOption::WarmWaitMs)),
-        "test-print-request" | "test-warm-spawn" => None,
+        "test-print-request" => None,
         _ => seam_option(name),
     }
 }
@@ -318,7 +317,6 @@ fn seam_option(name: &str) -> Option<RunOption> {
         "test-remote-inputs-budget-bytes" => Some(RunOption::Value(ValueOption::RemoteInputsBudgetBytes)),
         "test-remote-log-cap-bytes" => Some(RunOption::Value(ValueOption::RemoteLogCapBytes)),
         "test-remote-tamper" => Some(RunOption::Value(ValueOption::RemoteTamper)),
-        "test-warm-spawn" => Some(RunOption::Value(ValueOption::WarmSpawn)),
         _ => None,
     }
 }

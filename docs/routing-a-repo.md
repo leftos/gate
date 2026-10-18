@@ -52,7 +52,7 @@ The hook entry calls the repo's launcher, `pwsh -NoProfile -File tools/gate.ps1 
 
 ## A repo whose short runs a cold folder would push past their ceiling
 
-A repo whose short routed runs (a filtered test of a minute) would meet a cold builder work folder declares warm-up builds in a tracked `.gate/warmup.toml`, and `remote.json` consents to it under `warmup` ([design.md, gate warm](design.md#gate-warm)). Until the folder is warm, a matched run stays here and starts the warm-up in the background; the runs after it route.
+A repo whose short routed runs (a filtered test of a minute) would meet a cold builder work folder declares warm-up builds in a tracked `.gate/warmup.toml`, and `remote.json` consents to it under `warmup` ([design.md, gate warm](design.md#gate-warm)). Routed runs go to the builder from a new worktree's first run, warm or not: the first run in a new work folder is cold, with its ceiling raised, and says to prewarm the next new worktree with `gate warm`. Run `gate warm` in a new worktree before its first routed run to find the folder warm.
 
 ## Taking a builder out for maintenance
 

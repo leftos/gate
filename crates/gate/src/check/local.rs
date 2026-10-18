@@ -3,7 +3,8 @@
 //! an uncommitted edit counts, the root `global.json`'s SDK pin, the manifest's tools probed as a builder probes them
 //! ([`probe::probe`]) while this PC's SDK list is read, both with the worktree's own folders dropped from `PATH`, each
 //! sibling looked for by routing's rule, and the warm-up: `.gate/warmup.toml`, `remote.json`'s consent and the work
-//! folder's warm-up record, judged as the route judges it. It runs only version commands and installs nothing.
+//! folder's warm-up record and lock, judged for where its warm-up stands ([`judge`]). It runs only version commands
+//! and installs nothing.
 
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -350,16 +351,16 @@ fn warmup_items(
 }
 
 /// The item of the warm-up record of the worktree root `root`'s work folder, in the state root `state`, for the
-/// warm-up file `file` on `host`: the lock probed first, never taken, then the record read, in the route's order. A lock
-/// that cannot be probed is said whatever the record, as the route gives it precedence. Else `None` when
-/// `only_its_own` and the record is absent or names another host; one that cannot be read names none, so it is said,
-/// as every routed run stays here for it.
+/// warm-up file `file` on `host`: the lock probed first, never taken, then the record read. A lock that cannot be
+/// probed is said whatever the record, as a held lock outweighs the record. Else `None` when `only_its_own` and the
+/// record is absent or names another host; one that cannot be read names none, so it is said, as it may be this
+/// host's.
 fn recorded(root: &str, state: &Path, file: &FileRead, host: &str, only_its_own: bool) -> Option<Warmup> {
     let key = work_folder_key(root);
     let lock = v1::warm_lock_path(state, &key);
     let held = match warm::lock_held(&lock) {
         Ok(held) => held,
-        Err(error) => return Some(Warmup::Unreadable(lock_problem_text(&lock.to_string_lossy(), &error.to_string()))),
+        Err(error) => return Some(Warmup::UnreadableLock(lock_problem_text(&lock.to_string_lossy(), &error.to_string()))),
     };
     let record = warm::read_warm_record(&v1::warm_record_path(state, &key));
     let names_another = match &record {
@@ -374,7 +375,7 @@ fn recorded(root: &str, state: &Path, file: &FileRead, host: &str, only_its_own:
 }
 
 /// The item of the warm-up record `record` for the warm-up file `file` that parsed, its lock held or not, on `host` at
-/// `now`, as the route's judge ([`judge`]) weighs them: warm, warming, failed within its backoff, unreadable, or else
+/// `now`, as the judge ([`judge`]) weighs them: warm, warming, failed within its backoff, unreadable, or else
 /// not warm, a `warming` record whose lock is free said as one that ended without a verdict.
 pub(super) fn record_item(record: &RecordRead, file: &FileRead, lock_held: bool, host: &str, now: SystemTime) -> Warmup {
     let gate = build_version();
@@ -394,7 +395,7 @@ pub(super) fn record_item(record: &RecordRead, file: &FileRead, lock_held: bool,
     match (judge(&situation), record) {
         (Judgement::Ready, _) => Warmup::Warm { host: host.to_owned() },
         (Judgement::Warming { host }, _) => Warmup::Warming { host },
-        (Judgement::Problem(_), RecordRead::Unreadable { path, error }) => Warmup::Unreadable(record_problem_text(path, error)),
+        (Judgement::Problem, RecordRead::Unreadable { path, error }) => Warmup::UnreadableRecord(record_problem_text(path, error)),
         (
             Judgement::Start,
             RecordRead::Parsed(Record {
@@ -405,7 +406,7 @@ pub(super) fn record_item(record: &RecordRead, file: &FileRead, lock_held: bool,
             Judgement::Failed { reason, .. },
             RecordRead::Parsed(
                 found @ Record {
-                    state: RecordState::Failed { class, .. },
+                    state: RecordState::Failed { .. },
                     ..
                 },
             ),
@@ -417,24 +418,18 @@ pub(super) fn record_item(record: &RecordRead, file: &FileRead, lock_held: bool,
                 host: found.host.clone(),
                 minutes_ago: minutes_ago(age),
                 reason,
-                minutes_left: minutes_up(class.backoff().saturating_sub(age)),
             }
         }
         // Start with any other record is not warm. Route (no consent or no file), and a failure or a problem without a
         // record of its kind, never come with a consented file that parsed. Each judgement is named, so a new one is a
         // compile error.
-        (Judgement::Start | Judgement::Route | Judgement::Failed { .. } | Judgement::Problem(_), _) => not_warm(false),
+        (Judgement::Start | Judgement::Route | Judgement::Failed { .. } | Judgement::Problem, _) => not_warm(false),
     }
 }
 
 /// An age in whole minutes, rounded down and at least 1, so an age under a minute, zero included, is 1.
 fn minutes_ago(age: Duration) -> u64 {
     (age.as_secs() / 60).max(1)
-}
-
-/// `duration` in whole minutes, rounded up.
-fn minutes_up(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos().div_ceil(60_000_000_000)).unwrap_or(u64::MAX)
 }
 
 /// The manifest `<root>\.gate\toolchain.toml` holds as it stands on disk; `None` when there is none; else why it

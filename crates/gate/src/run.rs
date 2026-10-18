@@ -19,7 +19,7 @@ use gate_args::{Ceiling, ProgramSearch, RunRequest, Slot, batch_command_line, ba
 use gate_router::warm::{RecordRead, RecordState};
 use gate_router::{
     BuildSettings, BuildTarget, DEFAULT_OUTPUTS, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target, sdk_build_target,
-    warm::warm_hint_line, without_no_build, work_folder_key,
+    without_no_build, work_folder_key,
 };
 use gate_state::{Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RunFacts, StateRoot, Verdict, log_hash, v1};
 use gate_watchdog::{Cores, Hint, SlotKind, hint};
@@ -677,20 +677,24 @@ struct CallParts<'r> {
     log: &'r Log,
     host: &'r Host,
     root: &'r ResolvedRoot,
-    /// What the call asks of the work folder's warm-up.
+    /// What the call knows of the work folder's warm-up, or asks of it.
     warmth: remote::Warmth<'r>,
 }
 
-/// Whether the warm-up record at `path` is still the one the route judged: `warm` for the warm-up file of `hash`. A
-/// record a warm-up wrote since, for another hash or state, or one that cannot be read, is not, and is left alone.
-fn still_judged(path: &Path, hash: &str) -> bool {
-    matches!(warm::read_warm_record(path), RecordRead::Parsed(record) if record.state == RecordState::Warm && record.hash == hash)
+/// Whether the warm-up record at `path` is current for the run: `warm` on `host`, the builder the run went to, for the
+/// warm-up file of `hash`. A record of another builder, hash or state, or one that cannot be read, is not, and is left
+/// alone.
+fn record_is_current(path: &Path, host: &str, hash: &str) -> bool {
+    matches!(
+        warm::read_warm_record(path),
+        RecordRead::Parsed(record) if record.state == RecordState::Warm && record.host == host && record.hash == hash
+    )
 }
 
-/// What a routed run's call asks of the work folder's warm-up: that it be warm with the warm-up file of `warm_hash`
-/// when the route asked that, else nothing.
+/// What a routed run's call knows of the work folder's warm-up: that the repo's warm-up is set up with the warm-up file
+/// of `warm_hash` when the route found one, else nothing.
 fn warmth_of(warm_hash: Option<&str>) -> remote::Warmth<'_> {
-    warm_hash.map_or(remote::Warmth::Unasked, remote::Warmth::Needs)
+    warm_hash.map_or(remote::Warmth::Unasked, remote::Warmth::Consented)
 }
 
 /// The client's call for `remote`, with the run's log, limits and interrupt, made of the run's `parts` so the run's
@@ -840,7 +844,7 @@ impl Run<'_> {
             placed: place,
             warm_hash,
             decision,
-        } = route::route(self.request, environment, covering, self.root, console);
+        } = route::route(self.request, environment, covering, console);
         self.warm_hash = warm_hash;
         self.would = Some(decision);
         self.tag = match &route {
@@ -1124,7 +1128,7 @@ impl Run<'_> {
         if let Some(reason) = fallback {
             let said = self.drop_warm_record(remote, reason);
             let here = self.fell_back(reason, &outcome, hold.taken.take(), console);
-            for line in &said {
+            if let Some(line) = &said {
                 console.err(line);
             }
             return here;
@@ -1144,30 +1148,24 @@ impl Run<'_> {
     }
 
     /// Drops the work folder's warm-up record after the client's refusal for `reason`, while the run still holds the
-    /// work folder's key: a `cold` or a `layout` refusal deletes it while it is still the record the route judged
-    /// ([`still_judged`]), one already gone among them, and any other keeps it. A run that asked no warmth, a repo
-    /// with no consent among them, neither reads nor deletes anything under `remote\warm`.
-    /// The lines to say once the run has fallen back: why the delete failed, then, after `cold`, how the work folder is
-    /// warmed.
-    fn drop_warm_record(&self, remote: &RemoteRun, reason: FallbackReason) -> Vec<String> {
-        if !matches!(reason, FallbackReason::Cold | FallbackReason::Layout) {
-            return Vec::new();
+    /// work folder's key: a `layout` refusal deletes it while it is current for the run, `warm` on the run's builder
+    /// for the warm-up file the route found ([`record_is_current`]), one already gone among them, and any other keeps
+    /// it. A run of a repo whose warm-up is not set up neither reads nor deletes anything under `remote\warm`.
+    /// The line to say once the run has fallen back, when the delete failed: why.
+    fn drop_warm_record(&self, remote: &RemoteRun, reason: FallbackReason) -> Option<String> {
+        if reason != FallbackReason::Layout {
+            return None;
         }
-        let mut lines = Vec::new();
         let path = v1::warm_record_path(&self.root.path, &remote.key);
-        let judged = self.warm_hash.as_deref().is_some_and(|hash| still_judged(&path, hash));
-        match judged.then(|| fs::remove_file(&path)) {
-            Some(Err(error)) if error.kind() != io::ErrorKind::NotFound => lines.push(format!(
+        let current = self.warm_hash.as_deref().is_some_and(|hash| record_is_current(&path, &remote.host, hash));
+        match current.then(|| fs::remove_file(&path)) {
+            Some(Err(error)) if error.kind() != io::ErrorKind::NotFound => Some(format!(
                 "gate: cannot remove the warm-up record {}: {}",
                 gate_router::escaped(&path.to_string_lossy()),
                 gate_router::escaped(&error.to_string())
             )),
-            _ => {}
+            _ => None,
         }
-        if reason == FallbackReason::Cold {
-            lines.push(warm_hint_line(&remote.host));
-        }
-        lines
     }
 
     /// Updates the worktree's nothing-back record after a routed run that ended on the builder, killed, interrupted or

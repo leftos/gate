@@ -1,6 +1,6 @@
 //! The builder warm-up, over bytes and plain values: the repo's `.gate/warmup.toml` read ([`read_warmup`]), the hash
-//! that ties a warm-up record to those bytes ([`warmup_hash`]), the judge of whether a command that would route goes to
-//! the builder, runs here or starts a warm-up ([`judge`]), and the lines the gate says for each case that runs here.
+//! that ties a warm-up record to those bytes ([`warmup_hash`]), the judge of where a work folder's warm-up stands
+//! ([`judge`]), which `gate check`'s warm-up item reads, and the texts that item says.
 //!
 //! `.gate/warmup.toml` holds `commands`, an array of 1 to [`MOST_COMMANDS`] commands, each a non-empty array of
 //! non-empty strings, and the optional `timeout`, whole seconds from 1 to [`MOST_TIMEOUT_SECONDS`],
@@ -226,7 +226,7 @@ pub enum RecordRead {
     Parsed(Record),
 }
 
-/// What the judge weighs for a command that would otherwise route.
+/// What the judge weighs of a worktree's work folder.
 #[derive(Debug, Clone, Copy)]
 pub struct Situation<'a> {
     /// Whether `remote.json`'s `warmup` names the repo.
@@ -243,29 +243,29 @@ pub struct Situation<'a> {
     pub now: SystemTime,
 }
 
-/// Where a command that would otherwise route goes, given its work folder's warm-up.
+/// Where a work folder's warm-up stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Judgement {
-    /// No consent or no warm-up file: route as a run without a warm-up does.
+    /// No consent or no warm-up file: the repo has no warm-up.
     Route,
-    /// The work folder is warm for this host and the file on disk: route.
+    /// The work folder is warm for this host and the file on disk.
     Ready,
-    /// A warm-up is running: run here and start nothing. Holds the host whose warm-up it is, for the line.
+    /// A warm-up is running. Holds the host whose warm-up it is, for the text.
     Warming { host: String },
-    /// Run here and start a warm-up: no record; a `warming` record whose lock is free to take; a record of another host
-    /// or file hash; a failed record of another gate build; a failure dated in the future; or one past its backoff.
+    /// A warm-up is due: no record; a `warming` record whose lock is free to take; a record of another host or file
+    /// hash; a failed record of another gate build; a failure dated in the future; or one past its backoff.
     Start,
-    /// A warm-up failed within its backoff: run here and start nothing.
+    /// A warm-up failed within its backoff.
     Failed { minutes_ago: u64, reason: String },
-    /// The warm-up file has a problem, or the record cannot be read: run here and start nothing. Holds the line to say.
-    Problem(String),
+    /// The warm-up file has a problem, or the record cannot be read.
+    Problem,
 }
 
-/// Where a command that would otherwise route goes. In order: no consent or no warm-up file routes; a file problem runs
-/// here, saying so; the work folder's lock being held means a warm-up is running, whatever the record says, so the run
-/// stays here; else an unreadable record runs here, saying so, no record starts a warm-up, a `warm` record of this host
-/// and the file's hash routes, a `warming` record starts a warm-up with its lock free, and a `failed` record of this
-/// host, file hash and gate build runs here until its backoff has passed, then starts a warm-up.
+/// Where a work folder's warm-up stands. In order: no consent or no warm-up file is no warm-up; a file problem is a
+/// problem; the work folder's lock being held means a warm-up is running, whatever the record says; else an unreadable
+/// record is a problem, no record is due a warm-up, a `warm` record of this host and the file's hash is ready, a
+/// `warming` record with its lock free is due one, and a `failed` record of this host, file hash and gate build is
+/// failed until its backoff has passed, then due one.
 #[must_use]
 pub fn judge(situation: &Situation<'_>) -> Judgement {
     if !situation.consented {
@@ -273,7 +273,7 @@ pub fn judge(situation: &Situation<'_>) -> Judgement {
     }
     let hash = match situation.file {
         FileRead::Absent => return Judgement::Route,
-        FileRead::Problem(problem) => return Judgement::Problem(file_problem_line(problem)),
+        FileRead::Problem(_) => return Judgement::Problem,
         FileRead::Parsed { hash, .. } => hash,
     };
     if situation.lock_held {
@@ -283,7 +283,7 @@ pub fn judge(situation: &Situation<'_>) -> Judgement {
     }
     match situation.record {
         RecordRead::Absent => Judgement::Start,
-        RecordRead::Unreadable { path, error } => Judgement::Problem(record_problem_line(path, error)),
+        RecordRead::Unreadable { .. } => Judgement::Problem,
         RecordRead::Parsed(record) => judge_record(record, hash, situation),
     }
 }
@@ -324,89 +324,19 @@ fn judge_record(record: &Record, hash: &str, situation: &Situation<'_>) -> Judge
     }
 }
 
-/// The line of a run kept here while `host` warms its work folder.
-#[must_use]
-pub fn warming_line(host: &str) -> String {
-    format!("gate: not routed: {} for this worktree", warming_text(host))
-}
-
-/// That `host` is warming the work folder, as the route's line and `gate check`'s item both say it.
+/// That `host` is warming the work folder, as `gate check`'s item says it.
 #[must_use]
 pub fn warming_text(host: &str) -> String {
     format!("{} is warming the work folder", shown_value(host))
 }
 
-/// The line of a run kept here as it starts a warm-up on `host`: the route says it once the work folder is judged to
-/// need a warm-up and the detached `gate warm --background` has started, inside the run's job or outside it.
-#[must_use]
-pub fn starting_line(host: &str) -> String {
-    format!(
-        "gate: not routed: starting a warm-up of the work folder for this worktree on {}",
-        escaped(host)
-    )
-}
-
-/// The note the route says below [`starting_line`] when a job the gate was started in still holds the warm-up it
-/// started: one that refused it breakaway, or one above a job it left.
-#[must_use]
-pub fn inside_job_line() -> String {
-    "gate: note: the warm-up runs inside a job this gate was started in, which it cannot leave, so it ends if that job ends".to_owned()
-}
-
-/// The line of a run kept here whose warm-up on `host` could not be started, for `error`, the system's error.
-#[must_use]
-pub fn start_failed_line(host: &str, error: &str) -> String {
-    format!(
-        "gate: not routed: cannot start a warm-up of the work folder for this worktree on {}: {}",
-        escaped(host),
-        escaped(error)
-    )
-}
-
-/// The line a routed run says after it fell back `cold` from `host`, below the fallback's own line.
-#[must_use]
-pub fn warm_hint_line(host: &str) -> String {
-    format!("gate: gate warm warms the work folder for this worktree on {}", escaped(host))
-}
-
-/// The line of a run kept here after a warm-up failed `minutes_ago` whole minutes ago, for `reason`.
-#[must_use]
-pub fn failed_line(minutes_ago: u64, reason: &str) -> String {
-    let when = if minutes_ago == 0 {
-        "less than a minute ago".to_owned()
-    } else {
-        format!("{minutes_ago} min ago")
-    };
-    format!("gate: not routed: the warm-up failed {when}: {}", shown_value(reason))
-}
-
-/// The line of a run kept here for a problem of `.gate/warmup.toml`.
-#[must_use]
-pub fn file_problem_line(problem: &str) -> String {
-    format!("gate: not routed: .gate/warmup.toml: {}", escaped(problem))
-}
-
-/// The line of a run kept here because the warm-up record at `path` cannot be read, for `error`.
-#[must_use]
-pub fn record_problem_line(path: &str, error: &str) -> String {
-    format!("gate: not routed: {}", record_problem_text(path, error))
-}
-
-/// That the warm-up record at `path` cannot be read, for `error`, as the route's line and `gate check`'s item both say
-/// it.
+/// That the warm-up record at `path` cannot be read, for `error`, as `gate check`'s item says it.
 #[must_use]
 pub fn record_problem_text(path: &str, error: &str) -> String {
     format!("the warm-up record {} cannot be read: {}", escaped(path), shown_value(error))
 }
 
-/// The line of a run kept here because the warm-up lock at `path` cannot be probed, for `error`.
-#[must_use]
-pub fn lock_problem_line(path: &str, error: &str) -> String {
-    format!("gate: not routed: {}", lock_problem_text(path, error))
-}
-
-/// That the warm-up lock at `path` cannot be probed, for `error`, as the route's line and `gate check`'s item both say
-/// it.
+/// That the warm-up lock at `path` cannot be probed, for `error`, as `gate check`'s item says it.
 #[must_use]
 pub fn lock_problem_text(path: &str, error: &str) -> String {
     format!("the warm-up lock {} cannot be read: {}", escaped(path), escaped(error))

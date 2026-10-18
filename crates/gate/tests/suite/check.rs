@@ -742,8 +742,8 @@ fn check_without_a_warm_up_file_or_consent_says_nothing_of_warm_ups() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
 }
 
-/// Each problem of a consented warm-up file is a stderr line of its own, and the check fails, since matched runs then
-/// stay here.
+/// Each problem of a consented warm-up file is a stderr line of its own, and the check fails, since `gate warm` then
+/// cannot prewarm a new worktree.
 #[test]
 fn check_a_consented_broken_warm_up_file_prints_each_problem_and_exits_1() {
     let case = warm_case("check_warm_broken");
@@ -763,7 +763,7 @@ fn check_a_consented_broken_warm_up_file_prints_each_problem_and_exits_1() {
         lines(&outcome.stdout),
         warm_lines(
             &case,
-            "check: here: warm-up: .gate/warmup.toml has problems, so no warm-up runs and matched runs stay here",
+            "check: here: warm-up: .gate/warmup.toml has problems, so gate warm cannot prewarm a new worktree",
             "check: here: 1 missing, 0 too old"
         ),
         "{outcome:?}"
@@ -1005,7 +1005,8 @@ fn check_an_unreadable_warmup_file_without_consent_says_why_and_exits_1() {
     }
 }
 
-/// A consented warm-up file that cannot be read whole has problems, so runs stay here, and the summary names it.
+/// A consented warm-up file that cannot be read whole has problems, so `gate warm` cannot run, and the summary names
+/// it.
 #[test]
 fn check_an_unreadable_consented_warmup_file_says_why_and_exits_1() {
     let case = warm_case("check_warm_unreadable_consented");
@@ -1022,7 +1023,7 @@ fn check_an_unreadable_consented_warmup_file_says_why_and_exits_1() {
         lines(&outcome.stdout),
         warm_lines(
             &case,
-            "check: here: warm-up: .gate/warmup.toml has problems, so no warm-up runs and matched runs stay here",
+            "check: here: warm-up: .gate/warmup.toml has problems, so gate warm cannot prewarm a new worktree",
             "check: here: could not read .gate/warmup.toml; 1 missing, 0 too old"
         ),
         "{outcome:?}"
@@ -1472,10 +1473,10 @@ fn check_builder_says_a_work_folder_that_is_not_warm() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
 }
 
-/// A PC warm-up record that cannot be read names no builder, but every routed run stays here for it, so a builder check
-/// says it and fails, as the check of this PC does.
+/// A PC warm-up record that cannot be read names no builder, so a builder check says it, as it may be the builder's; a
+/// routed run does not read it, so it fails nothing.
 #[test]
-fn check_builder_says_an_unreadable_warm_record_and_exits_1() {
+fn check_builder_says_an_unreadable_warm_record_and_exits_0() {
     let case = builder_case("check_builder_unreadable_record");
     write_remote_json(
         &case,
@@ -1495,15 +1496,16 @@ fn check_builder_says_an_unreadable_warm_record_and_exits_1() {
         [
             "check: builder-1: app declares no toolchain".to_owned(),
             format!(
-                "check: builder-1: warm-up: the warm-up record {} cannot be read: is larger than 64 KiB",
+                "check: builder-1: warm-up: the warm-up record {} cannot be read: is larger than 64 KiB; \
+                 gate warm overwrites it, and only a layout fallback's delete reads it",
                 record.display()
             ),
             "check: builder-1: warm-up: the work folder is not warm".to_owned(),
-            "check: builder-1: 1 missing, 0 too old".to_owned(),
+            "check: builder-1: nothing missing".to_owned(),
         ],
         "{outcome:?}"
     );
-    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
 }
 
 /// A builder case whose routing file consents to warm-ups on `builder-1`, `builder-2` among its hosts.
@@ -1516,10 +1518,10 @@ fn warm_builder_case(name: &str) -> Case {
     case
 }
 
-/// A warm-up lock that cannot be probed keeps every routed run here before any record is read, as the route gives the
-/// failed probe precedence, so a builder check says it and fails though no record names the builder.
+/// A warm-up lock that cannot be probed is said before any record is read, as a held lock outweighs the record, so a
+/// builder check says it though no record names the builder; it fails nothing.
 #[test]
-fn check_builder_says_a_warm_lock_that_cannot_be_probed_and_exits_1() {
+fn check_builder_says_a_warm_lock_that_cannot_be_probed_and_exits_0() {
     let case = warm_builder_case("check_builder_lock_unprobeable");
     write(&case, ".gate/warmup.toml", WARMUP_FILE);
     let lock = v1::warm_lock_path(&case.local_app_data().join("gate").join("v1"), &key(&case));
@@ -1532,15 +1534,19 @@ fn check_builder_says_a_warm_lock_that_cannot_be_probed_and_exits_1() {
     let start = format!("check: builder-1: warm-up: the warm-up lock {} cannot be read: ", lock.display());
     assert_eq!(said.len(), 6, "{outcome:?}");
     assert!(said[3].starts_with(&start), "{outcome:?}");
+    assert!(
+        said[3].ends_with("; gate warm and a routed run waiting on the work folder read it"),
+        "{outcome:?}"
+    );
     assert_eq!(
         said[4..],
         [
             "check: builder-1: warm-up: the work folder is not warm",
-            "check: builder-1: 1 missing, 0 too old"
+            "check: builder-1: nothing missing"
         ],
         "{outcome:?}"
     );
-    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
 }
 
 /// A consented warm-up file that cannot be read whole fails a builder check, the summary naming it.
@@ -1556,7 +1562,7 @@ fn check_builder_says_an_unreadable_warmup_file_and_exits_1() {
         lines(&outcome.stdout)[2..],
         [
             "check: builder-1: app declares no toolchain",
-            "check: builder-1: warm-up: .gate/warmup.toml has problems, so no warm-up runs and matched runs stay here",
+            "check: builder-1: warm-up: .gate/warmup.toml has problems, so gate warm cannot prewarm a new worktree",
             "check: builder-1: could not read .gate/warmup.toml; 1 missing, 0 too old",
         ],
         "{outcome:?}"

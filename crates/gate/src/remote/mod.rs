@@ -301,13 +301,14 @@ pub(crate) struct RemoteCall<'a> {
     pub warmth: Warmth<'a>,
 }
 
-/// What a call asks of the work folder's warm-up: nothing; that the builder's preflight say the work folder is warm
-/// with the warm-up file of this hash, else the run falls back `cold`; or that the call be the warm-up itself, which
-/// runs `commands` from the warm-up file of `hash` in place of a command and brings nothing back.
+/// What a call knows of or asks of the work folder's warm-up: nothing, for a repo without warm-up consent or without a
+/// warm-up file that parsed; that the repo has both, with the file's hash, which words the cold note of a new work
+/// folder; or that the call be the warm-up itself, which runs `commands` from the warm-up file of `hash` in place of a
+/// command and brings nothing back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Warmth<'a> {
     Unasked,
-    Needs(&'a str),
+    Consented(&'a str),
     WarmUp { commands: &'a [Vec<String>], hash: &'a str },
 }
 
@@ -827,7 +828,7 @@ mod scripted {
     fn recorded_warmth(warmth: Warmth<'_>) -> Value {
         match warmth {
             Warmth::Unasked => Value::Null,
-            Warmth::Needs(hash) => json!({"needs": hash}),
+            Warmth::Consented(hash) => json!({"consented": hash}),
             Warmth::WarmUp { commands, hash } => json!({"warmUp": {"commands": commands, "hash": hash}}),
         }
     }

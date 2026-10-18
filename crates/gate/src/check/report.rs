@@ -96,7 +96,7 @@ pub(crate) enum Warmup {
     NoFile,
     /// `remote.json`'s `warmup` value cannot be used, for this reason, and the repo has a warm-up file.
     ConsentProblem(String),
-    /// The consented warm-up file has problems, said on lines of their own, so no warm-up runs.
+    /// The consented warm-up file has problems, said on lines of their own, so `gate warm` cannot run.
     FileProblems,
     /// The state root, where the record is, cannot be found, for this reason.
     NoStateRoot(String),
@@ -104,18 +104,16 @@ pub(crate) enum Warmup {
     Warm { host: String },
     /// The work folder's warm-up lock is held: `host` is warming it.
     Warming { host: String },
-    /// A warm-up on `host` failed `minutes_ago` whole minutes ago, for `reason`, and its backoff has `minutes_left`.
-    Failed {
-        host: String,
-        minutes_ago: u64,
-        reason: String,
-        minutes_left: u64,
-    },
+    /// A warm-up on `host` failed `minutes_ago` whole minutes ago, for `reason`.
+    Failed { host: String, minutes_ago: u64, reason: String },
     /// The work folder is not warm on `host` and nothing holds a warm-up back; `stale` when the record still says
     /// `warming` with nothing holding its lock.
     NotWarm { host: String, stale: bool },
-    /// The record or the lock cannot be read, so a routed run stays here: the text, worded as the route words it.
-    Unreadable(String),
+    /// The record cannot be read: the text. `gate warm` overwrites it, and only a `layout` fallback's delete reads it.
+    UnreadableRecord(String),
+    /// The lock cannot be probed: the text. `gate warm` takes it, and a routed run waiting on the work folder's key
+    /// probes it.
+    UnreadableLock(String),
     /// What a builder's preflight said of its work folder: `warm` when its `.warm` holds the warm-up file's hash.
     Builder { warm: bool },
 }
@@ -291,20 +289,15 @@ fn warmup_item(repo: &str, warmup: &Warmup) -> Item {
         Warmup::NoFile => (format!("remote.json consents, but the repo has no {WARMUP}"), Kind::Unchecked),
         Warmup::ConsentProblem(why) => (format!("remote.json: {}", escaped(why)), Kind::Missing),
         Warmup::FileProblems => (
-            format!("{WARMUP} has problems, so no warm-up runs and matched runs stay here"),
+            format!("{WARMUP} has problems, so gate warm cannot prewarm a new worktree"),
             Kind::Missing,
         ),
         Warmup::NoStateRoot(why) => (format!("the state root cannot be found: {}", escaped(why)), Kind::Skipped),
         Warmup::Warm { host } => (format!("warm on {}", shown_value(host)), Kind::Ok),
         Warmup::Warming { host } => (warming_text(host), Kind::Unchecked),
-        Warmup::Failed {
-            host,
-            minutes_ago,
-            reason,
-            minutes_left,
-        } => (
+        Warmup::Failed { host, minutes_ago, reason } => (
             format!(
-                "the warm-up on {} failed {minutes_ago} min ago: {}; it may be tried again in {minutes_left} min",
+                "the warm-up on {} failed {minutes_ago} min ago: {}; run gate warm to try again",
                 shown_value(host),
                 shown_value(reason)
             ),
@@ -318,7 +311,14 @@ fn warmup_item(repo: &str, warmup: &Warmup) -> Item {
             ),
             Kind::Unchecked,
         ),
-        Warmup::Unreadable(text) => (text.clone(), Kind::Missing),
+        Warmup::UnreadableRecord(text) => (
+            format!("{text}; gate warm overwrites it, and only a layout fallback's delete reads it"),
+            Kind::Unchecked,
+        ),
+        Warmup::UnreadableLock(text) => (
+            format!("{text}; gate warm and a routed run waiting on the work folder read it"),
+            Kind::Unchecked,
+        ),
         Warmup::Builder { warm: true } => ("the work folder is warm".to_owned(), Kind::Ok),
         Warmup::Builder { warm: false } => ("the work folder is not warm".to_owned(), Kind::Unchecked),
     };
@@ -1035,24 +1035,24 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_record_inside_its_backoff_says_its_age_and_when_it_may_be_tried_again() {
+    fn a_failed_record_inside_its_backoff_says_its_age_and_to_run_gate_warm() {
         let commands = record(HOST, failed(FailureClass::Commands, "command 1 stopped with status 3"), HASH);
         for (elapsed, line) in [
             (
                 Duration::ZERO,
-                "check: here: warm-up: the warm-up on builder-1 failed 1 min ago: command 1 stopped with status 3; it may be tried again in 30 min",
+                "check: here: warm-up: the warm-up on builder-1 failed 1 min ago: command 1 stopped with status 3; run gate warm to try again",
             ),
             (
                 Duration::from_secs(90),
-                "check: here: warm-up: the warm-up on builder-1 failed 1 min ago: command 1 stopped with status 3; it may be tried again in 29 min",
+                "check: here: warm-up: the warm-up on builder-1 failed 1 min ago: command 1 stopped with status 3; run gate warm to try again",
             ),
             (
                 Duration::from_secs(20),
-                "check: here: warm-up: the warm-up on builder-1 failed 1 min ago: command 1 stopped with status 3; it may be tried again in 30 min",
+                "check: here: warm-up: the warm-up on builder-1 failed 1 min ago: command 1 stopped with status 3; run gate warm to try again",
             ),
             (
                 Duration::from_mins(29),
-                "check: here: warm-up: the warm-up on builder-1 failed 29 min ago: command 1 stopped with status 3; it may be tried again in 1 min",
+                "check: here: warm-up: the warm-up on builder-1 failed 29 min ago: command 1 stopped with status 3; run gate warm to try again",
             ),
         ] {
             assert_eq!(
@@ -1067,8 +1067,8 @@ mod tests {
         let refused = record(HOST, failed(FailureClass::Refused, "the builder is busy\u{1b}[2J"), HASH);
         assert_eq!(
             warm_said(vec![warm_item(&refused, false, Duration::from_secs(10))], &[]).lines[1],
-            out(r"check: here: warm-up: the warm-up on builder-1 failed 1 min ago: the builder is busy\u{1b}[2J; it may be tried again in 1 min"),
-            "a refusal's backoff, its reason escaped"
+            out(r"check: here: warm-up: the warm-up on builder-1 failed 1 min ago: the builder is busy\u{1b}[2J; run gate warm to try again"),
+            "a refusal, its reason escaped"
         );
     }
 
@@ -1116,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_record_fails_the_check_in_the_route_s_words() {
+    fn an_unreadable_record_is_said_without_failing_the_check() {
         let unreadable = RecordRead::Unreadable {
             path: r"C:\state\remote\warm\app-1.json".to_owned(),
             error: "is larger than 64 KiB".to_owned(),
@@ -1125,25 +1125,25 @@ mod tests {
             warm_said(vec![warm_item(&unreadable, false, Duration::ZERO)], &[]),
             Said {
                 lines: one_item(
-                    r"check: here: warm-up: the warm-up record C:\state\remote\warm\app-1.json cannot be read: is larger than 64 KiB",
-                    "check: here: 1 missing, 0 too old"
+                    r"check: here: warm-up: the warm-up record C:\state\remote\warm\app-1.json cannot be read: is larger than 64 KiB; gate warm overwrites it, and only a layout fallback's delete reads it",
+                    "check: here: nothing missing"
                 ),
-                status: 1,
+                status: 0,
             }
         );
     }
 
     #[test]
-    fn a_lock_that_cannot_be_probed_fails_the_check_in_the_route_s_words() {
-        let item = Warmup::Unreadable(lock_problem_text(r"C:\state\remote\warm\app-1.lock", "Access is denied. (os error 5)"));
+    fn a_lock_that_cannot_be_probed_is_said_without_failing_the_check() {
+        let item = Warmup::UnreadableLock(lock_problem_text(r"C:\state\remote\warm\app-1.lock", "Access is denied. (os error 5)"));
         assert_eq!(
             warm_said(vec![item], &[]),
             Said {
                 lines: one_item(
-                    r"check: here: warm-up: the warm-up lock C:\state\remote\warm\app-1.lock cannot be read: Access is denied. (os error 5)",
-                    "check: here: 1 missing, 0 too old"
+                    r"check: here: warm-up: the warm-up lock C:\state\remote\warm\app-1.lock cannot be read: Access is denied. (os error 5); gate warm and a routed run waiting on the work folder read it",
+                    "check: here: nothing missing"
                 ),
-                status: 1,
+                status: 0,
             }
         );
     }
@@ -1225,7 +1225,7 @@ mod tests {
                     out("check: here: app at X:/dev/app"),
                     Line::Err("check: .gate/warmup.toml: commands[0] is empty".to_owned()),
                     Line::Err("check: .gate/warmup.toml: extra is not a key (commands, timeout)".to_owned()),
-                    out("check: here: warm-up: .gate/warmup.toml has problems, so no warm-up runs and matched runs stay here"),
+                    out("check: here: warm-up: .gate/warmup.toml has problems, so gate warm cannot prewarm a new worktree"),
                     out("check: here: 1 missing, 0 too old"),
                 ],
                 status: 1,
