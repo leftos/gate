@@ -49,6 +49,9 @@ No re-hash at checkout and no record: the oid name, the verified install and hav
 
 ## Steps
 
-(a) PC pointer listing and object reading (L1, L2), with unit tests on fixture repos the suite makes with `git lfs`; (b) the box verb, store, stage and install, seams (L3, L4); (c) the checkout's check, pins and post-check, the token rule, the back commit's scratch storage, the need, pairs, the client phase, lines and fallback (L5-L9); (d) docs: design.md Routing and The box side, ARCHITECTURE Task Index row "Carry Git LFS objects to the builder", GLOSSARY "LFS store", test-map rows, the ops-tower request.
+- (a) PC pointer listing and object reading (L1, L2), with unit tests on fixture repos the suite makes with `git lfs`.
+- (b) The box verb, store, stage and install, seams (L3, L4).
+- (c) The checkout's check, pins and post-check, the token rule, the back commit's scratch storage, the need, pairs, the client phase, lines and fallback (L5-L9).
+- (d) Docs: design.md Routing and The box side, ARCHITECTURE Task Index row "Carry Git LFS objects to the builder", GLOSSARY "LFS store", test-map rows, the ops-tower request.
 
 Each step needs an invariant-pass check in its review: the store's writers (only the put's install), its readers (the checkout through alternates, never a Medium writer), and every git call that runs a filter.
