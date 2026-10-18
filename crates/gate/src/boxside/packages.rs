@@ -849,7 +849,12 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use super::{BUN, Found, NPM, PNPM, Record, hash, is_command, lockfile_folder, record_key, same_place, start_folder, start_named, start_word};
+    use crate::boxside::run::Folders;
+
+    use super::{
+        BUN, Found, NPM, PNPM, Record, hash, holds_other_lockfile, is_command, lockfile_folder, lockfile_for, record_key, same_place, start_folder,
+        start_named, start_word,
+    };
 
     #[test]
     fn lockfile_folders_are_one_place_whatever_their_letter_case() {
@@ -1221,6 +1226,28 @@ mod tests {
                 (".npmrc", b"a=1\n"),
             ])),
             "package-lock.json, npm-shrinkwrap.json, package.json, .npmrc"
+        );
+    }
+
+    #[test]
+    fn an_npm_command_restores_nothing_in_a_folder_with_a_bun_lockfile() {
+        let scratch = Scratch::new("an_npm_command_restores_nothing_in_a_folder_with_a_bun_lockfile");
+        let work = scratch.0.join("work");
+        fs::create_dir_all(&work).expect("the work root can be made");
+        fs::write(work.join("package-lock.json"), "{}\n").expect("the lockfile can be written");
+        fs::write(work.join("bun.lock"), "{}\n").expect("the lockfile can be written");
+        let folders = Folders { work: &work, place: &work };
+
+        assert_eq!(
+            holds_other_lockfile(&work),
+            Ok(true),
+            "a bun.lock beside the npm lockfile is another manager's"
+        );
+        let found = lockfile_for(&words(&["npm", "test"]), &folders).expect("no line is said");
+        let skipped = matches!(found, Some((manager, Found::OtherManager(ref folder))) if manager.name == "npm" && *folder == work);
+        assert!(
+            skipped,
+            "the npm command restores nothing, saying the folder holds a pnpm or bun lockfile"
         );
     }
 
