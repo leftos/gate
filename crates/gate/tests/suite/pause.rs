@@ -331,6 +331,7 @@ fn a_pause_marker_is_deleted_when_the_child_is_lent_its_parents_slot() {
         start_ms,
         holds: true,
         lends_closed: false,
+        alone: false,
         remote: None,
         expected: None,
     };
@@ -528,6 +529,7 @@ fn a_covered_gate_is_not_paused_by_a_sibling_waiting_under_its_parent() {
         start_ms: sibling.1,
         holds: false,
         lends_closed: false,
+        alone: false,
         remote: None,
         expected: None,
     };

@@ -123,6 +123,8 @@ pub enum Problem {
         option: &'static str,
         needs: &'static str,
     },
+    /// `--alone` given with a slot other than critical, in the caller's spelling.
+    AloneNeedsCritical(Spelling),
     /// Two test seams that each choose the remote client, given together.
     SeamsConflict {
         option: &'static str,
@@ -207,6 +209,8 @@ impl fmt::Display for Problem {
                 f.write_str("usage: gate box preflight|run|stop|boot|outputs|inflight|inputs --stdin (the base64 JSON request as stdin's first line)")
             }
             Problem::SeamNeeds { option, needs } => write!(f, "gate: {option} needs {needs}"),
+            Problem::AloneNeedsCritical(Spelling::Cli) => f.write_str("gate: --alone needs --slot critical"),
+            Problem::AloneNeedsCritical(Spelling::Compat) => f.write_str("gate: -Alone needs -Slot critical"),
             Problem::SeamsConflict { option, other } => write!(f, "gate: {option} cannot be given with {other}"),
             #[cfg(feature = "test-seams")]
             Problem::SeamNotUsedWith { option, with } => write!(f, "gate: {option} is not used with {with}"),

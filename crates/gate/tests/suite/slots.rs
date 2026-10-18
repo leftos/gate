@@ -271,6 +271,7 @@ fn a_holder_whose_ticket_was_not_deleted_does_not_block_the_queue() {
         start_ms,
         holds: false,
         lends_closed: false,
+        alone: false,
         remote: None,
         expected: None,
     };
@@ -309,6 +310,7 @@ fn a_waiter_deferring_to_a_gate_that_took_its_slot_does_not_say_it_waits() {
         start_ms,
         holds: false,
         lends_closed: false,
+        alone: false,
         remote: None,
         expected: None,
     };

@@ -29,7 +29,7 @@ pub const FAKE_DESKTOP_HELPER: &str = env!("CARGO_BIN_EXE_fake-desktop-helper");
 
 /// The published usage text, copied here so a change to it fails a case.
 pub const USAGE: &str = "\
-usage: gate run --slot heavy|light|critical|none --timeout <seconds>|auto:<seconds> --log <path> [options] -- <command> [args...]
+usage: gate run --slot heavy|light|critical|none [--alone] --timeout <seconds>|auto:<seconds> --log <path> [options] -- <command> [args...]
        gate stop-tree <pid>
        gate cutover
        gate push
@@ -44,6 +44,7 @@ run options:
   --tail <lines>       log lines printed at the end, default 20
   --no-markers         the command's status is the verdict
   --local              never route this run to a builder
+  --alone              with --slot critical: hold the machine alone, every light slot included
   --state-dir <path>   use another state root (also GATE_STATE_DIR)
   --cd <folder>        run the command in <folder> and route from it
   --bring-tracked <glob>

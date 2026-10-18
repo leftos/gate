@@ -363,6 +363,10 @@ impl Ceiling {
 
 /// A valid `gate run`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is a switch of its own, set or not independently of the others"
+)]
 pub struct RunRequest {
     pub slot: Slot,
     pub timeout: Ceiling,
@@ -372,6 +376,8 @@ pub struct RunRequest {
     pub tail: u64,
     pub no_markers: bool,
     pub local: bool,
+    /// `--alone`, given only with `--slot critical`: the critical gate holds the machine alone, light slots included.
+    pub alone: bool,
     /// The `--bring-tracked` globs, in the order given: a fetched output git tracks is installed only when one matches it.
     pub bring_tracked: Vec<String>,
     /// The `--env` pairs, name and value, in the order given: set for the command over the environment it starts in and

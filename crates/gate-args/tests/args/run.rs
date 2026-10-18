@@ -27,6 +27,7 @@ fn run_reads_every_option_and_the_defaults() {
             tail: DEFAULT_TAIL_LINES,
             no_markers: false,
             local: false,
+            alone: false,
             bring_tracked: Vec::new(),
             env: Vec::new(),
             state_dir: None,

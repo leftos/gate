@@ -118,6 +118,7 @@ pub(crate) enum ValueOption {
 pub(crate) enum SwitchOption {
     NoMarkers,
     Local,
+    Alone,
     Background,
     #[cfg(feature = "test-seams")]
     PrintRequest,
@@ -167,6 +168,8 @@ pub(crate) struct RunBuilder {
     seconds: Option<u32>,
     no_markers: bool,
     local: bool,
+    /// `--alone`, which only a critical run takes.
+    alone: bool,
     /// `gate warm`'s `--background`.
     background: bool,
     bring_tracked: Vec<String>,
@@ -385,6 +388,7 @@ impl RunBuilder {
         match option {
             SwitchOption::NoMarkers => self.no_markers = on,
             SwitchOption::Local => self.local = on,
+            SwitchOption::Alone => self.alone = on,
             SwitchOption::Background => self.background = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::PrintRequest => self.print_request = on,
@@ -412,12 +416,16 @@ impl RunBuilder {
     }
 
     /// The run request, or every problem: those found while reading, then the test seams that cannot work together,
-    /// then each missing input in the order slot, timeout, log, command.
+    /// then `--alone` with a slot other than critical, then each missing input in the order slot, timeout, log,
+    /// command.
     pub(crate) fn finish_run(mut self, command: Vec<OsString>) -> Result<RunRequest, Vec<Problem>> {
         let spelling = self.spelling;
         #[cfg(feature = "test-seams")]
         self.check_remote_seams();
         self.check_env();
+        if self.alone && self.slot.is_some_and(|slot| slot != Slot::Critical) {
+            self.problems.push(Problem::AloneNeedsCritical(spelling));
+        }
         for (option, required) in [
             (ValueOption::Slot, Required::Slot),
             (ValueOption::Timeout, Required::Timeout),
@@ -439,6 +447,7 @@ impl RunBuilder {
                 tail: self.tail.unwrap_or(DEFAULT_TAIL_LINES),
                 no_markers: self.no_markers,
                 local: self.local,
+                alone: self.alone,
                 bring_tracked: self.bring_tracked,
                 env: self.env,
                 state_dir: self.state_dir,

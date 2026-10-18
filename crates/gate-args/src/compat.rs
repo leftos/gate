@@ -1,5 +1,5 @@
 //! The compatibility layer: the PowerShell gate's `-Log <path> -TimeoutSeconds <n> -Slot <kind> [...] -- <command>`
-//! and `-StopTree <pid>`. Exactly its eight options, `-Cd <folder>` and `-Env NAME[=value]` are read, by name in any
+//! and `-StopTree <pid>`. Exactly its eight options, `-Cd <folder>`, `-Env NAME[=value]` and `-Alone` are read, by name in any
 //! ASCII case, in the `-Name value` and the `-Name:value` forms; `--` is required before the command. A `test-seams`
 //! build also reads the hidden `--test-print-request` switch, spelled exactly so, so the suite can see what a compat
 //! run asked for, and the hidden `--test-parent-job-trusted` switch, spelled exactly so, so a compat run under a
@@ -19,7 +19,7 @@ enum CompatOption {
     StopTree,
 }
 
-const OPTIONS: [(&str, CompatOption); 10] = [
+const OPTIONS: [(&str, CompatOption); 11] = [
     ("Log", CompatOption::Run(RunOption::Value(ValueOption::Log))),
     ("TimeoutSeconds", CompatOption::Run(RunOption::Value(ValueOption::Timeout))),
     ("Slot", CompatOption::Run(RunOption::Value(ValueOption::Slot))),
@@ -27,6 +27,7 @@ const OPTIONS: [(&str, CompatOption); 10] = [
     ("Tail", CompatOption::Run(RunOption::Value(ValueOption::Tail))),
     ("NoMarkers", CompatOption::Run(RunOption::Switch(SwitchOption::NoMarkers))),
     ("Local", CompatOption::Run(RunOption::Switch(SwitchOption::Local))),
+    ("Alone", CompatOption::Run(RunOption::Switch(SwitchOption::Alone))),
     ("Cd", CompatOption::Run(RunOption::Value(ValueOption::Cd))),
     ("Env", CompatOption::Run(RunOption::Value(ValueOption::Env))),
     ("StopTree", CompatOption::StopTree),

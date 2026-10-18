@@ -15,7 +15,9 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::{fs, io};
 
-use gate_args::{Ceiling, ProgramSearch, RunRequest, Slot, batch_command_line, batch_refusal, command_line, is_batch_target, resolve_program};
+use gate_args::{
+    Ceiling, ProgramSearch, RunRequest, Slot, Spelling, batch_command_line, batch_refusal, command_line, is_batch_target, resolve_program,
+};
 use gate_router::warm::{RecordRead, RecordState};
 use gate_router::{
     BuildSettings, BuildTarget, DEFAULT_OUTPUTS, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target, sdk_build_target,
@@ -223,8 +225,8 @@ fn take_heavy<'a>(run: &mut Run<'a>, heavy: &'a mut Option<(RunRequest, Nesting)
 }
 
 /// The nesting `request` runs under, or the status of a run refused before anything is taken or written, its lines
-/// said: a log inside the state root, or a critical gate under a heavy or light parent's slot, which leaves an earlier
-/// log in place. Any other nesting's lines are said once the run knows the slot it asks for ([`say_nesting`]). With the
+/// said: a log inside the state root, a critical gate under a heavy or light parent's slot, or an `--alone` gate under
+/// a parent whose slot covers it or refuses it, which leaves an earlier log in place. Any other nesting's lines are said once the run knows the slot it asks for ([`say_nesting`]). With the
 /// nesting, `request` as the gate runs it: a critical gate inside a box run runs as heavy ([`Nesting::requested`]).
 fn admitted<'r>(
     request: &'r RunRequest,
@@ -242,6 +244,14 @@ fn admitted<'r>(
         return Err(u32::from(USAGE_STATUS));
     }
     let nesting = Nesting::read(environment, request.slot, root, request.test_seams.parent_job_trusted, console);
+    if request.alone && matches!(nesting, Nesting::Covered(_) | Nesting::Refused(_)) {
+        let flag = match request.spelling {
+            Spelling::Cli => "--alone",
+            Spelling::Compat => "-Alone",
+        };
+        console.err(&format!("gate: {flag} cannot hold the machine alone from inside a gate's command"));
+        return Err(u32::from(USAGE_STATUS));
+    }
     if matches!(nesting, Nesting::Refused(_)) {
         say_nesting(&nesting, request, console);
         return Err(u32::from(USAGE_STATUS));
@@ -1799,7 +1809,7 @@ impl Run<'_> {
             }
         };
         let waited = queued.elapsed().as_secs_f64();
-        let line = machine::holds_line(Timestamp::now(), waited, &snapshot);
+        let line = machine::holds_line(Timestamp::now(), waited, &snapshot, machine);
         let take = JournalEvent::Take {
             slots: machine.names(),
             waited_seconds: waited,

@@ -493,6 +493,10 @@ pub struct Ticket {
     /// to end: no light parent lends its slot while it says so. Written only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lends_closed: bool,
+    /// True only for a critical gate asked for `--alone`: while it waits or holds, no light gate runs beside it, and it
+    /// lends no slot. Written only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub alone: bool,
     /// True while queued for the remote pool. Written only when `Some(true)`, so a local queue's ticket is `None`.
     #[serde(skip_serializing_if = "is_not_true")]
     pub remote: Option<bool>,
@@ -507,6 +511,12 @@ impl Ticket {
     #[must_use]
     pub fn queue_order(&self) -> (u64, u32) {
         (self.arrived, self.pid)
+    }
+
+    /// Whether the ticket is a critical request that holds the machine alone, light slots included.
+    #[must_use]
+    pub fn holds_alone(&self) -> bool {
+        self.kind == TicketKind::Critical && self.alone
     }
 }
 

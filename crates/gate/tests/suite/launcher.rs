@@ -379,9 +379,28 @@ fn with_no_gate_the_command_runs_directly_with_its_status() {
     let failing = [FAKE_TOOL, "out", "hi", "err", "oops", "exit", "3"];
     let passing = [FAKE_TOOL, "out", "hi"];
     let compat = ["-Log", "x.log", "-TimeoutSeconds", "5", "-Slot", "heavy", "--"];
-    let compat_colon = ["-Log:x.log", "-TimeoutSeconds", "5", "-Slot:heavy", "-NoMarkers", "-Local", "--"];
+    let compat_colon = [
+        "-Log:x.log",
+        "-TimeoutSeconds",
+        "5",
+        "-Slot:heavy",
+        "-NoMarkers",
+        "-Alone",
+        "-Local",
+        "--",
+    ];
     let hook = ["run", "--log", "x.log", "--timeout", "5", "--slot", "heavy", "--"];
-    let hook_equals = ["RUN", "--log=x.log", "--timeout=5", "--slot", "heavy", "--no-markers", "--local", "--"];
+    let hook_equals = [
+        "RUN",
+        "--log=x.log",
+        "--timeout=5",
+        "--slot",
+        "heavy",
+        "--no-markers",
+        "--alone",
+        "--local",
+        "--",
+    ];
     let runs: [(&[&str], &[&str], i32, &str); 4] = [
         (&compat, &failing, 3, "oops"),
         (&compat_colon, &passing, 0, ""),

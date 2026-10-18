@@ -551,11 +551,12 @@ pub(crate) fn critical_pending(others: &[Ticket], critical_open: impl FnOnce() -
 }
 
 /// Whether a critical request among the other gates' live tickets `others` refuses every new lend, as its ticket says:
-/// it holds the machine, or holds every slot it takes and waits only for the gates lent a slot already.
+/// it holds the machine, holds every slot it takes and waits only for the gates lent a slot already, or holds the
+/// machine alone, which lends nothing from its first pass.
 pub(crate) fn critical_refuses_lends(others: &[Ticket]) -> bool {
     others
         .iter()
-        .any(|ticket| ticket.kind == TicketKind::Critical && (ticket.holds || ticket.lends_closed))
+        .any(|ticket| ticket.kind == TicketKind::Critical && (ticket.holds || ticket.lends_closed || ticket.alone))
 }
 
 /// Whether some gate has the critical mutex under `root` open. A mutex that cannot be probed is said once and counts as

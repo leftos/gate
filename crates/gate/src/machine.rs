@@ -37,6 +37,10 @@ pub(crate) struct Machine {
     ticket: PathBuf,
     /// The mutexes taken from a gate that died holding them, in the order they were taken.
     abandoned: Vec<String>,
+    /// Whether the gate was asked for `--alone`: it holds the machine alone, light slots included.
+    alone: bool,
+    /// The light gates it left room for beside it on the pass that took the machine ([`beside_allowance`]).
+    beside: u32,
 }
 
 impl Machine {
@@ -140,6 +144,7 @@ impl<'a> MachineWait<'a> {
             start_ms: arrival.gate.start_ms,
             holds: false,
             lends_closed: false,
+            alone: arrival.request.alone,
             remote: None,
             expected: arrival.expected.cloned(),
         };
@@ -151,6 +156,8 @@ impl<'a> MachineWait<'a> {
                 slots: Vec::new(),
                 ticket: waiter.ticket().to_path_buf(),
                 abandoned: Vec::new(),
+                alone: arrival.request.alone,
+                beside: 0,
             },
             ticket,
             waiter,
@@ -212,12 +219,23 @@ impl<'a> MachineWait<'a> {
         }
         if !self.drained || self.machine.slots.is_empty() {
             let order = self.ticket.queue_order();
-            self.drained = drain_waits_for(&self.others, &self.holders, order, self.counts.light) == 0;
+            let target = light_target(self.counts.light, self.allowance());
+            self.drained = drain_waits_for(&self.others, &self.holders, order, target) == 0;
             if !self.drained {
                 return false;
             }
         }
-        self.take_slots(survey, console) && self.hold(survey, console)
+        if !(self.take_slots(survey, console) && self.hold(survey, console)) {
+            return false;
+        }
+        self.machine.beside = self.allowance();
+        true
+    }
+
+    /// How many light gates may run beside this gate on this pass, by the light count and the live tickets the pass
+    /// read, its own included ([`beside_allowance`]): none while a request that holds the machine alone waits or holds.
+    fn allowance(&self) -> u32 {
+        beside_allowance(self.counts.light, self.others.iter().chain([&self.ticket]))
     }
 
     /// Holds the machine once it holds every slot it takes: holding the beside mutex, counts the gates that run lent
@@ -318,7 +336,8 @@ impl<'a> MachineWait<'a> {
     /// gate, or the claims folder that cannot be listed, takes nothing this pass. A pass that took a slot wakes the
     /// waiters once it lets the mutex go.
     fn take_light(&mut self, survey: &mut Survey, console: &mut Console) -> bool {
-        let target = light_target(self.counts.light);
+        let allowance = self.allowance();
+        let target = light_target(self.counts.light, allowance);
         let mut held = self.machine.light_held(self.root);
         if held >= target {
             return true;
@@ -326,7 +345,7 @@ impl<'a> MachineWait<'a> {
         let Some(beside) = self.try_beside(survey, console) else {
             return false;
         };
-        let allowance = usize::try_from(beside_allowance(self.counts.light)).unwrap_or(usize::MAX);
+        let allowance = usize::try_from(allowance).unwrap_or(usize::MAX);
         if !self.running_light(survey, console).is_ok_and(|running| running <= allowance) {
             return false;
         }
@@ -375,7 +394,7 @@ impl<'a> MachineWait<'a> {
     fn say_waiting(&mut self, survey: &mut Survey, console: &mut Console) {
         self.said_waiting = true;
         let status = self.status(survey, console);
-        console.err(&format!("gate: waiting for the machine (critical): {status}"));
+        console.err(&format!("gate: waiting for {}: {status}", asked(self.machine.alone)));
         self.waiter.said_waiting();
     }
 
@@ -384,7 +403,8 @@ impl<'a> MachineWait<'a> {
         if let Some(waited) = self.waiter.heartbeat_due() {
             let status = self.status(survey, console);
             console.err(&format!(
-                "gate: still waiting for the machine (critical): {status} ({} s)",
+                "gate: still waiting for {}: {status} ({} s)",
+                asked(self.machine.alone),
                 waited.as_secs()
             ));
         }
@@ -413,7 +433,7 @@ impl<'a> MachineWait<'a> {
         if let Some(folder) = &folder {
             held.heavy = held.heavy.saturating_add(u32::try_from(folder.lent.len()).unwrap_or(u32::MAX));
         }
-        let status = status_text(held, self.counts.light, earlier);
+        let status = status_text(held, self.allowance(), earlier);
         if eta_blockers(&self.others, &self.holders, order) > 0 {
             return status;
         }
@@ -432,7 +452,7 @@ impl<'a> MachineWait<'a> {
         let claims: Vec<Claim> = folder.claims.iter().map(|(_, claim)| claim.clone()).collect();
         let busy = waited_for(probe, past_light(&claims, self.counts.light))?;
         let now = Timestamp::now();
-        let allowance = usize::try_from(beside_allowance(self.counts.light)).unwrap_or(usize::MAX);
+        let allowance = usize::try_from(self.allowance()).unwrap_or(usize::MAX);
         let busy = drained_by(&claims, busy, allowance, now)?;
         let mut holders = wait::holder_usuals(&claims, &busy, now)?;
         for marker in &folder.lent {
@@ -524,10 +544,10 @@ fn still_waits(ticket: &Ticket, holders: &Holders) -> bool {
 }
 
 /// How many of the other gates' tickets `others` the drain of a critical gate at `order` waits for: the earlier local
-/// heavy waiters, and the light ones while a light count of `light` leaves it a light slot to take beyond the allowance
-/// of light gates beside it, a gate of `holders` left out.
-fn drain_waits_for(others: &[Ticket], holders: &Holders, order: (u64, u32), light: u32) -> usize {
-    let kinds: &[TicketKind] = if light_target(light) > 0 { &LOCAL_KINDS } else { &[TicketKind::Heavy] };
+/// heavy waiters, and the light ones while it has `target` light slots to take ([`light_target`]), a gate of `holders`
+/// left out.
+fn drain_waits_for(others: &[Ticket], holders: &Holders, order: (u64, u32), target: u32) -> usize {
+    let kinds: &[TicketKind] = if target > 0 { &LOCAL_KINDS } else { &[TicketKind::Heavy] };
     others
         .iter()
         .filter(|ticket| is_earlier(ticket, order, kinds) && still_waits(ticket, holders))
@@ -543,10 +563,10 @@ fn earlier_waiters(others: &[Ticket], holders: &Holders, order: (u64, u32)) -> u
         .count()
 }
 
-/// How many light slots a critical gate holds for a light count of `light`: every one but the allowance of light gates
-/// beside it, whichever slots those hold.
-fn light_target(light: u32) -> u32 {
-    light - beside_allowance(light)
+/// How many light slots a critical gate holds for a light count of `light`: every one but the `allowance` of light
+/// gates beside it ([`beside_allowance`]), whichever slots those hold.
+fn light_target(light: u32, allowance: u32) -> u32 {
+    light.saturating_sub(allowance)
 }
 
 /// How many other light gates run by `probe`, a probe of the slots this gate does not hold: its light slots some gate
@@ -560,21 +580,30 @@ fn running_light(probe: &[SlotProbe], past: usize) -> usize {
         + past
 }
 
-/// How many light gates may run beside a critical gate for a light count of `light`, as its lines say it.
-fn beside_phrase(light: u32) -> String {
-    let allowance = beside_allowance(light);
+/// What a critical gate waits for and holds, as its lines say it: the machine, or the machine alone for a gate asked
+/// for `--alone`.
+fn asked(alone: bool) -> &'static str {
+    if alone {
+        "the machine alone (critical)"
+    } else {
+        "the machine (critical)"
+    }
+}
+
+/// The `allowance` of light gates that may run beside a critical gate ([`beside_allowance`]), as its lines say it.
+fn beside_phrase(allowance: u32) -> String {
     let noun = if allowance == 1 { "light slot" } else { "light slots" };
     format!("{allowance} {noun} beside it")
 }
 
-/// The waiting lines' status: the slots other gates hold, the light slots beside it of a count of `light`, and the
-/// earlier waiters.
-fn status_text(held: HeavyLight, light: u32, earlier: usize) -> String {
+/// The waiting lines' status: the slots other gates hold, the `allowance` of light slots beside it, and the earlier
+/// waiters.
+fn status_text(held: HeavyLight, allowance: u32, earlier: usize) -> String {
     format!(
         "{} heavy and {} light slots held ({}), {earlier} earlier waiters",
         held.heavy,
         held.light,
-        beside_phrase(light)
+        beside_phrase(allowance)
     )
 }
 
@@ -633,8 +662,9 @@ fn drained_by(claims: &[Claim], busy: Vec<(ClaimKind, u32)>, allowance: usize, n
     Some(waited)
 }
 
-/// The line a critical gate says as it takes the machine `at`, after waiting `waited` seconds, with what it found.
-pub(crate) fn holds_line(at: Timestamp, waited: f64, snapshot: &MachineSnapshot) -> String {
+/// The line a critical gate says as it takes `machine` `at`, after waiting `waited` seconds, with what it found: whether
+/// it holds the machine alone, and the light gates it left room for beside it.
+pub(crate) fn holds_line(at: Timestamp, waited: f64, snapshot: &MachineSnapshot, machine: &Machine) -> String {
     let claims = match &snapshot.other_claims {
         Ok(claims) if claims.is_empty() => "none".to_owned(),
         Ok(claims) => claims
@@ -647,28 +677,31 @@ pub(crate) fn holds_line(at: Timestamp, waited: f64, snapshot: &MachineSnapshot)
     let time = jiff::fmt::strtime::format("%Y-%m-%dT%H:%M:%S.%7fZ", at).unwrap_or_else(|_| at.to_string());
     let MachineSnapshot { counts, other_held, .. } = snapshot;
     format!(
-        "gate: holds the machine (critical) at {time} after {:.1} s: counts heavy {}, light {}; other gates hold {} heavy and {} light \
-         slots ({}); other live claims: {claims}",
+        "gate: holds {} at {time} after {:.1} s: counts heavy {}, light {}; other gates hold {} heavy and {} light slots ({}); \
+         other live claims: {claims}",
+        asked(machine.alone),
         (waited * 10.0).round_ties_even() / 10.0,
         counts.heavy,
         counts.light,
         other_held.heavy,
         other_held.light,
-        beside_phrase(counts.light)
+        beside_phrase(machine.beside)
     )
 }
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test whose fixed time cannot be read must fail loudly")]
 mod tests {
+    use std::path::PathBuf;
+
     use gate_state::v1::{Ticket, TicketKind};
-    use gate_state::{HeavyLight, MachineSnapshot, OtherClaim};
+    use gate_state::{HeavyLight, MachineSnapshot, OtherClaim, beside_allowance};
 
     use gate_state::v1::ClaimKind;
     use jiff::{SignedDuration, Timestamp};
 
     use super::{
-        Holders, drain_waits_for, drained_by, earlier_waiters, eta_blockers, held_of, holds_line, is_earlier, light_target, running_light,
+        Holders, Machine, drain_waits_for, drained_by, earlier_waiters, eta_blockers, held_of, holds_line, is_earlier, light_target, running_light,
         status_text, waited_for,
     };
     use crate::slots;
@@ -805,34 +838,38 @@ mod tests {
             start_ms: u64::from(pid) * 10,
             holds: false,
             lends_closed: false,
+            alone: false,
             remote: None,
             expected: None,
         }
     }
 
+    /// The light slots a critical gate takes for a light count of `light` with no request to hold the machine alone.
+    fn target(light: u32) -> u32 {
+        light_target(light, beside_allowance(light, []))
+    }
+
     #[test]
     fn the_critical_status_says_one_light_slot_or_n_light_slots() {
         let held = HeavyLight { heavy: 2, light: 1 };
+        let status = |light: u32, earlier: usize| status_text(held, beside_allowance(light, []), earlier);
+        assert_eq!(status(1, 3), "2 heavy and 1 light slots held (1 light slot beside it), 3 earlier waiters");
         assert_eq!(
-            status_text(held, 1, 3),
-            "2 heavy and 1 light slots held (1 light slot beside it), 3 earlier waiters"
-        );
-        assert_eq!(
-            status_text(held, 2, 0),
+            status(2, 0),
             "2 heavy and 1 light slots held (2 light slots beside it), 0 earlier waiters"
         );
         assert_eq!(
-            status_text(held, 8, 0),
+            status(8, 0),
             "2 heavy and 1 light slots held (2 light slots beside it), 0 earlier waiters"
         );
     }
 
     #[test]
     fn a_critical_gate_holds_every_light_slot_but_the_allowance_beside_it() {
-        assert_eq!(light_target(1), 0, "a count of 1 allows its one light gate beside it");
-        assert_eq!(light_target(2), 0);
-        assert_eq!(light_target(3), 1);
-        assert_eq!(light_target(5), 3);
+        assert_eq!(target(1), 0, "a count of 1 allows its one light gate beside it");
+        assert_eq!(target(2), 0);
+        assert_eq!(target(3), 1);
+        assert_eq!(target(5), 3);
     }
 
     #[test]
@@ -858,9 +895,13 @@ mod tests {
 
         assert_eq!(others.len(), 6, "every ticket but its own");
         assert!(others.iter().all(|ticket| ticket.pid != own.pid), "{others:?}");
-        assert_eq!(drain_waits_for(&others, &none, order, 3), 2, "the earlier heavy and light waiters");
         assert_eq!(
-            drain_waits_for(&others, &none, order, 2),
+            drain_waits_for(&others, &none, order, target(3)),
+            2,
+            "the earlier heavy and light waiters"
+        );
+        assert_eq!(
+            drain_waits_for(&others, &none, order, target(2)),
             1,
             "no light slot to take beyond the two beside it: the heavy waiter alone"
         );
@@ -885,9 +926,13 @@ mod tests {
         let others = vec![holder.clone(), waiter];
         let holders: Holders = [(holder.pid, holder.start_ms)].into_iter().collect();
 
-        assert_eq!(drain_waits_for(&others, &holders, own.queue_order(), 3), 1, "the light waiter alone");
         assert_eq!(
-            drain_waits_for(&others, &holders, own.queue_order(), 1),
+            drain_waits_for(&others, &holders, own.queue_order(), target(3)),
+            1,
+            "the light waiter alone"
+        );
+        assert_eq!(
+            drain_waits_for(&others, &holders, own.queue_order(), target(1)),
             0,
             "the heavy holder is no waiter"
         );
@@ -912,15 +957,24 @@ mod tests {
             file: "gate-light-slot-0.json".to_owned(),
         };
 
-        assert_eq!(holds_line(at, 1.96, &snapshot(Ok(Vec::new()))), format!("{head}none"));
+        let machine = Machine {
+            critical: None,
+            slots: Vec::new(),
+            ticket: PathBuf::new(),
+            abandoned: Vec::new(),
+            alone: false,
+            beside: 1,
+        };
+
+        assert_eq!(holds_line(at, 1.96, &snapshot(Ok(Vec::new())), &machine), format!("{head}none"));
         let two = Ok(vec![claim(5, "cargo test"), claim(6, "cargo fmt")]);
         assert_eq!(
-            holds_line(at, 2.04, &snapshot(two)),
+            holds_line(at, 2.04, &snapshot(two), &machine),
             format!("{head}5 light 0 cargo test, 6 light 0 cargo fmt")
         );
         let failed = Err("cannot read the claims in C:\\root\\slots: denied".to_owned());
         assert_eq!(
-            holds_line(at, 2.0, &snapshot(failed)),
+            holds_line(at, 2.0, &snapshot(failed), &machine),
             format!("{head}unknown (cannot read the claims in C:\\root\\slots: denied)")
         );
     }

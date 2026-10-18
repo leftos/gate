@@ -223,10 +223,12 @@ pub(crate) struct Wait<'a> {
     said_ignored: bool,
 }
 
-/// The earliest critical request ahead of a waiting gate, which holds it back: its gate's pid.
+/// The earliest critical request ahead of a waiting gate, which holds it back: its gate's pid, and whether it holds the
+/// machine alone ([`Ticket::holds_alone`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Barrier {
     pid: u32,
+    alone: bool,
 }
 
 /// What a run reads of its host once: the machine's logical processors and the console interrupt, `None` when its
@@ -290,6 +292,7 @@ impl<'a> Wait<'a> {
             start_ms: gate.start_ms,
             holds: false,
             lends_closed: false,
+            alone: false,
             remote: pool.is_remote().then_some(true),
             expected: expected.cloned(),
         };
@@ -352,7 +355,7 @@ impl<'a> Wait<'a> {
         self.barrier = self.barrier_in(&others);
         self.pause.refresh(self.barrier.is_some(), console);
         let beside = self.beside(&others, survey, console);
-        let (range, room) = self.range(count, &beside, survey, console);
+        let (range, room) = self.range(count, &others, &beside, survey, console);
         self.range = range.clone();
         let (may_try, probe) = self.may_try(&others, range.clone(), room, survey, console);
         if may_try && let Some(mut taken) = slots::try_pool(self.root, self.pool, range.clone(), survey, console) {
@@ -459,19 +462,23 @@ impl<'a> Wait<'a> {
     /// The slots of a count of `count` the gate tries on this pass, every one unless a critical request ahead holds it
     /// back ([`slot_range`]), and the room left it, `None` for no cap but the free slots. A light gate held back counts
     /// the light gates beside the request, the other gates' live light claims whatever their slots, holding the beside
-    /// mutex `beside`, and has the room the allowance leaves; it has none when it cannot list the claims, said once. A
-    /// light gate that found the beside mutex held by another gate has no room this pass.
-    fn range(&self, count: u32, beside: &Beside, survey: &mut Survey, console: &mut Console) -> (Range<u32>, Option<usize>) {
+    /// mutex `beside`, and has the room the allowance leaves while the other gates' live tickets `others` wait or hold
+    /// ([`beside_allowance`]); it has none when it cannot list the claims, said once. A light gate that found the
+    /// beside mutex held by another gate has no room this pass.
+    fn range(&self, count: u32, others: &[Ticket], beside: &Beside, survey: &mut Survey, console: &mut Console) -> (Range<u32>, Option<usize>) {
         let busy = matches!(beside, Beside::Busy).then_some(0);
         let (Pool::Local(kind), Some(_)) = (self.pool, self.barrier) else {
             return (0..count, busy);
         };
         if kind == SlotKind::Heavy || busy.is_some() {
-            return (slot_range(kind, count, usize::MAX), busy);
+            return (slot_range(kind, count, 0), busy);
         }
         match survey.light_claims(&self.root.path, console) {
-            Ok(claims) => (slot_range(kind, count, claims.len()), Some(beside_room(count, claims.len()))),
-            Err(_) => (slot_range(kind, count, usize::MAX), Some(0)),
+            Ok(claims) => {
+                let room = beside_room(beside_allowance(count, others), claims.len());
+                (slot_range(kind, count, room), Some(room))
+            }
+            Err(_) => (slot_range(kind, count, 0), Some(0)),
         }
     }
 
@@ -550,7 +557,7 @@ impl<'a> Wait<'a> {
     fn barrier_line(&self) -> Option<String> {
         let barrier = self.barrier?;
         let line = match self.pool {
-            Pool::Local(SlotKind::Light) => format!("gate: waiting for a {}", beside_place(barrier.pid)),
+            Pool::Local(SlotKind::Light) => format!("gate: waiting for a {}", beside_place(barrier)),
             _ => format!("gate: waiting for a {} behind the critical request of gate {}", self.place, barrier.pid),
         };
         Some(line)
@@ -595,7 +602,7 @@ impl<'a> Wait<'a> {
         };
         let seconds = format!("{} s", waited.as_secs());
         let line = match (self.pool, self.barrier) {
-            (Pool::Local(SlotKind::Light), Some(barrier)) => format!("gate: still waiting for a {} ({seconds})", beside_place(barrier.pid)),
+            (Pool::Local(SlotKind::Light), Some(barrier)) => format!("gate: still waiting for a {} ({seconds})", beside_place(barrier)),
             (_, Some(_)) => format!("gate: still waiting for a {} ({seconds})", self.place),
             (_, None) => format!(
                 "gate: still waiting for a {} ({})",
@@ -703,9 +710,15 @@ fn eta_text(holder: Usual, which: Which) -> String {
     )
 }
 
-/// What a light gate the critical request of gate `pid` holds back waits for.
-fn beside_place(pid: u32) -> String {
-    format!("light slot beside the critical request of gate {pid}")
+/// What a light gate the critical request `barrier` holds back waits for: a place beside it, or, behind a request that
+/// holds the machine alone, its end.
+fn beside_place(barrier: Barrier) -> String {
+    let Barrier { pid, alone } = barrier;
+    if alone {
+        format!("light slot behind the request of gate {pid} that holds the machine alone")
+    } else {
+        format!("light slot beside the critical request of gate {pid}")
+    }
 }
 
 /// Whether the gate under a light parent gate is lent that parent's slot before it queues, by the same rule and reads
@@ -782,23 +795,25 @@ fn barrier(others: &[Ticket], order: (u64, u32)) -> Option<Barrier> {
         .iter()
         .filter(|ticket| ticket.kind == TicketKind::Critical && ticket.queue_order() < order)
         .min_by_key(|ticket| ticket.queue_order())
-        .map(|earliest| Barrier { pid: earliest.pid })
+        .map(|earliest| Barrier {
+            pid: earliest.pid,
+            alone: earliest.holds_alone(),
+        })
 }
 
 /// The slots of a local pool of `kind` and `count` a gate behind a critical request tries: none for a heavy gate; for a
-/// light gate every one while fewer than the allowance of light gates, `min(2, count)`, run `beside` the request, a
-/// number whichever slots they hold, and none once that many do.
-fn slot_range(kind: SlotKind, count: u32, beside: usize) -> Range<u32> {
+/// light gate every one while `room` places are left beside the request ([`beside_room`]), and none once none is.
+fn slot_range(kind: SlotKind, count: u32, room: usize) -> Range<u32> {
     match kind {
-        SlotKind::Light if beside_room(count, beside) > 0 => 0..count,
+        SlotKind::Light if room > 0 => 0..count,
         SlotKind::Light | SlotKind::Heavy => count..count,
     }
 }
 
-/// How many more light gates may run beside a critical request with `beside` running there, for a light count of
-/// `count`: the allowance, `min(2, count)`, less those.
-fn beside_room(count: u32, beside: usize) -> usize {
-    usize::try_from(beside_allowance(count)).map_or(usize::MAX, |allowance| allowance.saturating_sub(beside))
+/// How many more light gates may run beside a critical request with `beside` running there, for an `allowance` of
+/// light gates beside it ([`beside_allowance`]): the allowance less those.
+fn beside_room(allowance: u32, beside: usize) -> usize {
+    usize::try_from(allowance).map_or(usize::MAX, |allowance| allowance.saturating_sub(beside))
 }
 
 /// Whether a gate with `ahead` live tickets of its kind ahead of it may try a slot, with `free` slots free and `room`
@@ -937,6 +952,7 @@ pub(crate) mod scratch {
             tail: 0,
             no_markers: false,
             local: false,
+            alone: false,
             bring_tracked: Vec::new(),
             env: Vec::new(),
             state_dir: None,
@@ -1016,7 +1032,7 @@ pub(crate) mod scratch {
 mod tests {
     use gate_args::Slot;
     use gate_state::v1::{self, Ticket, TicketKind};
-    use gate_state::{KernelObject, SlotKind};
+    use gate_state::{KernelObject, SlotKind, beside_allowance};
 
     use std::time::{Duration, Instant};
 
@@ -1164,7 +1180,7 @@ mod tests {
             "a slot free, as for a gate that defers to earlier tickets"
         );
         let held_again = Holder::take(scratch.name(KernelObject::LightSlot(0)));
-        wait.barrier = Some(Barrier { pid: 9 });
+        wait.barrier = Some(Barrier { pid: 9, alone: false });
         assert_eq!(
             heartbeat(&mut wait, &mut survey, &mut console),
             ["gate: still waiting for a light slot beside the critical request of gate 9 (N s)"],
@@ -1226,6 +1242,7 @@ mod tests {
             start_ms: u64::from(pid) * 10,
             holds: false,
             lends_closed: false,
+            alone: false,
             remote: None,
             expected: None,
         }
@@ -1270,7 +1287,7 @@ mod tests {
         assert!(others.iter().all(|ticket| ticket.pid != own.pid), "{others:?}");
         assert_eq!(
             barrier(&others, order),
-            Some(Barrier { pid: 12 }),
+            Some(Barrier { pid: 12, alone: false }),
             "the earliest critical request ahead, which holds the machine"
         );
         let later = [ticket(TicketKind::Critical, 100, 8), ticket(TicketKind::Critical, 200, 13)];
@@ -1282,7 +1299,7 @@ mod tests {
         let tie = [ticket(TicketKind::Critical, 100, 6), ticket(TicketKind::Heavy, 50, 5)];
         assert_eq!(
             barrier(&tie, order),
-            Some(Barrier { pid: 6 }),
+            Some(Barrier { pid: 6, alone: false }),
             "a request arrived with it, of a lower pid, still waiting"
         );
         assert_eq!(barrier(&[], order), None);
@@ -1290,20 +1307,22 @@ mod tests {
 
     #[test]
     fn behind_a_barrier_a_heavy_gate_tries_no_slot_and_a_light_one_any_slot_while_fewer_than_the_allowance_run_beside_it() {
-        assert_eq!(slot_range(SlotKind::Heavy, 3, 0), 3..3, "a heavy gate tries none");
-        assert_eq!(slot_range(SlotKind::Light, 5, 0), 0..5, "any light slot, the lowest included");
-        assert_eq!(slot_range(SlotKind::Light, 5, 1), 0..5);
-        assert_eq!(slot_range(SlotKind::Light, 5, 2), 5..5, "two light gates beside it already");
-        assert_eq!(slot_range(SlotKind::Light, 1, 0), 0..1, "a count of 1 allows one light gate");
-        assert_eq!(slot_range(SlotKind::Light, 1, 1), 1..1);
-        assert_eq!(slot_range(SlotKind::Light, 5, usize::MAX), 5..5, "no beside count, no slot");
+        let tried = |kind: SlotKind, count: u32, beside: usize| slot_range(kind, count, beside_room(beside_allowance(count, []), beside));
+        assert_eq!(tried(SlotKind::Heavy, 3, 0), 3..3, "a heavy gate tries none");
+        assert_eq!(tried(SlotKind::Light, 5, 0), 0..5, "any light slot, the lowest included");
+        assert_eq!(tried(SlotKind::Light, 5, 1), 0..5);
+        assert_eq!(tried(SlotKind::Light, 5, 2), 5..5, "two light gates beside it already");
+        assert_eq!(tried(SlotKind::Light, 1, 0), 0..1, "a count of 1 allows one light gate");
+        assert_eq!(tried(SlotKind::Light, 1, 1), 1..1);
+        assert_eq!(tried(SlotKind::Light, 5, usize::MAX), 5..5, "no beside count, no slot");
     }
 
     #[test]
     fn of_two_light_gates_held_back_with_one_place_left_beside_the_request_the_later_one_leaves_it_to_the_earlier() {
-        assert_eq!(beside_room(5, 1), 1, "one light gate beside it, one place left");
-        assert_eq!(beside_room(5, 3), 0, "past the allowance, no place");
-        assert_eq!(beside_room(1, 0), 1);
+        let room = |count: u32, beside: usize| beside_room(beside_allowance(count, []), beside);
+        assert_eq!(room(5, 1), 1, "one light gate beside it, one place left");
+        assert_eq!(room(5, 3), 0, "past the allowance, no place");
+        assert_eq!(room(1, 0), 1);
         assert!(!may_take(1, 4, Some(1)), "four slots free, but the one place goes to the earlier gate");
         assert!(may_take(0, 4, Some(1)), "the earlier gate takes the place");
         assert!(may_take(1, 4, Some(2)), "two places, one for each");

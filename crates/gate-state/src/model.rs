@@ -8,14 +8,19 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::counts::{format_count_value, powershell_text};
+use crate::v1::Ticket;
 
 /// The most light gates that run beside a critical request, whichever light slots they hold.
 pub const CRITICAL_BESIDE_LIGHT: u32 = 2;
 
-/// How many light gates may run beside a critical request, out of a light pool of `light_count` slots: a count, never a
-/// set of slot indices.
+/// How many light gates may run beside a critical request, out of a light pool of `light_count` slots, while the live
+/// tickets `tickets` wait or hold: a count, never a set of slot indices. None while one of them is a critical request
+/// that holds the machine alone ([`Ticket::holds_alone`]), else `min(2, light_count)`.
 #[must_use]
-pub fn beside_allowance(light_count: u32) -> u32 {
+pub fn beside_allowance<'t>(light_count: u32, tickets: impl IntoIterator<Item = &'t Ticket>) -> u32 {
+    if tickets.into_iter().any(Ticket::holds_alone) {
+        return 0;
+    }
     light_count.min(CRITICAL_BESIDE_LIGHT)
 }
 

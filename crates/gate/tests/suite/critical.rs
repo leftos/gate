@@ -15,8 +15,8 @@ use serde_json::{Value, json};
 use crate::durations::seed;
 use crate::nesting::{marked, test_marker};
 use crate::support::{
-    Case, FAKE_TOOL, GATE, POLL, Running, assert_in_order, critical_words, events, events_of, finish, heavy_words, none_words, run_words, shown,
-    start, take_of, wait_for_file, wait_for_journal_line, wait_until, write_counts,
+    Case, FAKE_TOOL, GATE, POLL, Running, USAGE, assert_in_order, critical_words, events, events_of, finish, heavy_words, none_words, run_words,
+    shown, start, take_of, wait_for_file, wait_for_journal_line, wait_until, write_counts,
 };
 
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
@@ -99,6 +99,7 @@ fn write_ticket(case: &Case, kind: TicketKind, (pid, start): (u32, Timestamp), a
         start_ms,
         holds: false,
         lends_closed: false,
+        alone: false,
         remote: remote.then_some(true),
         expected: None,
     };
@@ -1473,4 +1474,253 @@ fn a_nested_gate_under_a_critical_parent_runs_without_waiting_for_the_machine() 
         "{inner_log}"
     );
     assert!(!inner_log.contains("waiting for"), "{inner_log}");
+}
+
+/// The prefix of the waiting line of a critical gate asked for `--alone`.
+const ALONE_WAITING: &str = "gate: waiting for the machine alone (critical)";
+/// The prefix of the holds line of a critical gate asked for `--alone`.
+const ALONE_HOLDS: &str = "gate: holds the machine alone (critical) at ";
+
+/// The words of a critical run asked for `--alone`, as [`critical_words`] gives those of a plain one.
+fn alone_words<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
+    let mut words = critical_words(log, extra, command);
+    let at = words.iter().position(|word| *word == "--").expect("the words have a command");
+    words.insert(at, "--alone");
+    words
+}
+
+/// The first line of a light gate held back by the request of gate `pid` to hold the machine alone.
+fn behind_alone(pid: u32) -> String {
+    format!("gate: waiting for a light slot behind the request of gate {pid} that holds the machine alone\n")
+}
+
+/// Every slot of a count of one heavy and `light` light slots, by name, sorted.
+fn every_slot(case: &Case, light: u32) -> Vec<String> {
+    let mut names = vec![name(case, KernelObject::HeavySlot(0))];
+    names.extend((0..light).map(|index| name(case, KernelObject::LightSlot(index))));
+    names.sort();
+    names
+}
+
+#[test]
+fn an_alone_critical_gate_waits_for_running_light_gates() {
+    let case = Case::new("an_alone_critical_gate_waits_for_running_light_gates");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let light = holder(&case, &run_words("light.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let light_pid = light.id();
+
+    let alone = case.start(&alone_words("alone.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
+    let alone_pid = alone.id();
+    alone.wait_for_stderr(&format!(
+        "{ALONE_WAITING}: 0 heavy and 1 light slots held (0 light slots beside it), 0 earlier waiters\n"
+    ));
+    assert_eq!(events_of(&case, alone_pid), ["queue"], "no take while a light gate runs");
+
+    let_go(&go);
+    assert_passed(&alone.finish());
+    assert_passed(&light.finish());
+    assert!(at(&case, "release", light_pid) < at(&case, "take", alone_pid));
+    assert_eq!(sorted(&take_of(&case, alone_pid)["slots"]), every_slot(&case, 3));
+}
+
+#[test]
+fn a_light_gate_queued_after_an_alone_request_waits_until_it_ends() {
+    let case = Case::new("a_light_gate_queued_after_an_alone_request_waits_until_it_ends");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let first = holder(&case, &run_words("first.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let first_pid = first.id();
+    let alone = case.start(&alone_words("alone.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
+    let alone_pid = alone.id();
+    alone.wait_for_stderr(ALONE_WAITING);
+
+    let later = case.start(&run_words("later.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
+    let later_pid = later.id();
+    later.wait_for_stderr(&behind_alone(alone_pid));
+    assert_eq!(
+        events_of(&case, later_pid),
+        ["queue"],
+        "no light gate starts beside a request to hold the machine alone, two light slots free or not"
+    );
+
+    let_go(&go);
+    assert_passed(&alone.finish());
+    assert_passed(&later.finish());
+    assert_passed(&first.finish());
+    assert!(at(&case, "release", first_pid) < at(&case, "take", alone_pid));
+    assert!(
+        at(&case, "release", alone_pid) < at(&case, "take", later_pid),
+        "the later light gate starts only once the alone gate let the machine go"
+    );
+}
+
+#[test]
+fn an_alone_critical_gate_holds_every_light_slot() {
+    let case = Case::new("an_alone_critical_gate_holds_every_light_slot");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let alone = holder(&case, &alone_words("alone.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let alone_pid = alone.id();
+    assert_eq!(sorted(&take_of(&case, alone_pid)["slots"]), every_slot(&case, 3));
+
+    let light = case.start(&run_words("light.log", &with_heartbeat(), &[FAKE_TOOL, "exit", "0"]));
+    let light_pid = light.id();
+    light.wait_for_stderr(&behind_alone(alone_pid));
+    light.wait_for_stderr(&format!(
+        "gate: still waiting for a light slot behind the request of gate {alone_pid} that holds the machine alone ("
+    ));
+    assert_eq!(events_of(&case, light_pid), ["queue"], "no light slot is left beside the alone gate");
+
+    let_go(&go);
+    assert_passed(&alone.finish());
+    assert_passed(&light.finish());
+    assert!(at(&case, "release", alone_pid) < at(&case, "take", light_pid));
+}
+
+#[test]
+fn a_plain_critical_gate_still_lets_its_beside_light_gates_run() {
+    let case = Case::new("a_plain_critical_gate_still_lets_its_beside_light_gates_run");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let critical = holder(&case, &critical_words("critical.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let critical_pid = critical.id();
+    critical.wait_for_stderr("light slots (2 light slots beside it); other live claims: ");
+    let left = [name(&case, KernelObject::HeavySlot(0)), name(&case, KernelObject::LightSlot(0))];
+    assert_eq!(sorted(&take_of(&case, critical_pid)["slots"]), sorted(&json!(left)));
+
+    let light_go = case.folder().join("light-go");
+    let light_go_word = shown(&light_go);
+    let first = holder(&case, &run_words("first.log", &POLL, &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"]));
+    let second = holder(&case, &run_words("second.log", &POLL, &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"]));
+    assert_eq!(
+        events_of(&case, first.id()),
+        ["queue", "take"],
+        "a light gate runs beside the critical gate"
+    );
+    assert_eq!(events_of(&case, second.id()), ["queue", "take"], "and a second one");
+
+    let_go(&light_go);
+    assert_passed(&first.finish());
+    assert_passed(&second.finish());
+    assert_eq!(events_of(&case, critical_pid), ["queue", "take"], "the critical gate holds on");
+    let_go(&go);
+    assert_passed(&critical.finish());
+}
+
+#[test]
+fn alone_without_critical_is_a_usage_error() {
+    let case = Case::new("alone_without_critical_is_a_usage_error");
+    for slot in ["heavy", "light", "none"] {
+        let mut words = alone_words("refused.log", &[], &[FAKE_TOOL, "exit", "0"]);
+        words[2] = slot;
+        let outcome = finish(case.gate(&words));
+        assert_eq!(outcome.code, Some(2), "{slot}: {outcome:?}");
+        assert_eq!(outcome.stderr, format!("gate: --alone needs --slot critical\n{USAGE}"), "{slot}");
+    }
+    let words = [
+        "-Log",
+        "refused.log",
+        "-TimeoutSeconds",
+        "60",
+        "-Slot",
+        "light",
+        "-Alone",
+        "--",
+        FAKE_TOOL,
+        "exit",
+        "0",
+    ];
+    let mut compat = case.gate_without_state_dir(&words);
+    compat.env("GATE_STATE_DIR", case.root());
+    let outcome = finish(compat);
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stderr, format!("gate: -Alone needs -Slot critical\n{USAGE}"));
+    assert!(!case.root().join("events.jsonl").exists(), "a refused run journals nothing");
+}
+
+#[test]
+fn alone_inside_a_gates_command_is_a_usage_error() {
+    for held in ["heavy", "light", "critical"] {
+        let case = Case::new(&format!("alone_inside_a_gates_command_is_a_usage_error_{held}"));
+        write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+        let words = alone_words("refused.log", &[], &[FAKE_TOOL, "exit", "0"]);
+
+        let outcome = finish(marked(&case, &words, &test_marker(&case, held)));
+
+        assert_eq!(outcome.code, Some(2), "under a {held} marker: {outcome:?}");
+        assert_eq!(
+            outcome.stderr, "gate: --alone cannot hold the machine alone from inside a gate's command\n",
+            "under a {held} marker"
+        );
+        assert!(!case.root().join("events.jsonl").exists(), "the refused gate journals nothing");
+        assert!(!v1::tickets_dir(&case.root()).exists(), "the refused gate queued nothing");
+    }
+}
+
+#[test]
+fn an_alone_critical_gate_says_alone_in_its_lines() {
+    let case = Case::new("an_alone_critical_gate_says_alone_in_its_lines");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let light = holder(&case, &run_words("light.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+
+    let alone = case.start(&alone_words("alone.log", &with_heartbeat(), &[FAKE_TOOL, "exit", "0"]));
+    let status = "0 heavy and 1 light slots held (0 light slots beside it), 0 earlier waiters";
+    alone.wait_for_stderr(&format!("{ALONE_WAITING}: {status}\n"));
+    alone.wait_for_stderr(&format!("gate: still waiting for the machine alone (critical): {status} ("));
+
+    let_go(&go);
+    let outcome = alone.finish();
+    assert_passed(&outcome);
+    assert_passed(&light.finish());
+    let holds = outcome
+        .stderr
+        .lines()
+        .find(|line| line.starts_with(ALONE_HOLDS))
+        .expect("the alone gate says its holds line");
+    assert!(
+        holds.contains("counts heavy 1, light 3; other gates hold 0 heavy and 0 light slots (0 light slots beside it); other live claims: none"),
+        "{holds}"
+    );
+    assert!(
+        !outcome.stderr.contains(WAITING) && !outcome.stderr.contains(HOLDS),
+        "no plain critical line: {outcome:?}"
+    );
+}
+
+#[test]
+fn an_alone_critical_gate_lends_nothing() {
+    let case = Case::new("an_alone_critical_gate_lends_nothing");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let held = holder(&case, &heavy_words("holder.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let alone = case.start(&alone_words("alone.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
+    let alone_pid = alone.id();
+    alone.wait_for_stderr(ALONE_WAITING);
+    write_claim(&case, KernelObject::LightSlot(3), ClaimKind::Light, (process::id(), own_start()));
+
+    let marker = test_marker(&case, "light");
+    let child = start(marked(&case, &heavy_words("child.log", &POLL, &[FAKE_TOOL, "exit", "0"]), &marker));
+    let child_pid = child.id();
+    child.wait_for_stderr(&behind(alone_pid));
+    assert_eq!(
+        events_of(&case, child_pid),
+        ["queue"],
+        "the child waits behind the alone request, never lent its parent's slot"
+    );
+
+    let_go(&go);
+    assert_passed(&alone.finish());
+    assert_passed(&held.finish());
+    let outcome = child.finish();
+    assert_passed(&outcome);
+    assert!(!outcome.stderr.contains("while a critical request drains"), "{outcome:?}");
+    assert!(at(&case, "release", alone_pid) < at(&case, "take", child_pid));
 }

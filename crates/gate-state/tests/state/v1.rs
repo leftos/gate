@@ -58,6 +58,7 @@ fn ticket(pid: u32, arrived: u64) -> Ticket {
         start_ms: 1_759_439_760_571,
         holds: false,
         lends_closed: false,
+        alone: false,
         remote: None,
         expected: None,
     }
@@ -123,9 +124,55 @@ fn default_counts_follow_the_thread_budgets() {
 
 #[test]
 fn the_beside_allowance_is_two_light_gates_or_the_whole_pool() {
-    assert_eq!(beside_allowance(1), 1);
-    assert_eq!(beside_allowance(2), 2);
-    assert_eq!(beside_allowance(5), 2);
+    let plain = Ticket {
+        kind: TicketKind::Critical,
+        ..ticket(60080, 1)
+    };
+    assert_eq!(beside_allowance(1, []), 1);
+    assert_eq!(beside_allowance(2, []), 2);
+    assert_eq!(beside_allowance(5, [&plain]), 2);
+}
+
+#[test]
+fn the_beside_allowance_is_none_while_a_request_to_hold_the_machine_alone_is_live() {
+    let alone = Ticket {
+        kind: TicketKind::Critical,
+        alone: true,
+        ..ticket(60081, 2)
+    };
+    let light = ticket(60080, 1);
+    let not_critical = Ticket {
+        alone: true,
+        ..ticket(60082, 3)
+    };
+
+    assert_eq!(beside_allowance(5, [&light, &alone]), 0);
+    assert_eq!(beside_allowance(1, [&alone]), 0);
+    assert_eq!(
+        beside_allowance(5, [&light, &not_critical]),
+        2,
+        "only a critical ticket holds the machine alone"
+    );
+}
+
+#[test]
+fn a_ticket_writes_alone_only_when_true() {
+    let dir = scratch("alone-ticket");
+    let plain = Ticket {
+        kind: TicketKind::Critical,
+        ..ticket(60080, 1)
+    };
+    let path = v1::ticket_path(&dir, plain.pid, plain.start_ms);
+
+    v1::write_ticket(&path, &plain).expect("the plain critical ticket is written");
+    let text = fs::read_to_string(&path).expect("the plain critical ticket is there");
+    assert!(!text.contains("alone"), "{text}");
+
+    let alone = Ticket { alone: true, ..plain };
+    v1::write_ticket(&path, &alone).expect("the alone ticket is written");
+    let text = fs::read_to_string(&path).expect("the alone ticket is there");
+    assert!(text.ends_with(r#""holds":false,"alone":true}"#), "{text}");
+    assert_eq!(v1::read_ticket(&path).expect("the written alone ticket reads"), alone);
 }
 
 #[test]
