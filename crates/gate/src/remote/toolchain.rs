@@ -480,10 +480,12 @@ pub(crate) fn godot_choice(required: Option<&[Pin]>, reported: &[(String, Report
 
 /// Which of the builder's Unreal Engine installs a routed run uses, given the versions `required` the repo requires
 /// ([`unreal_required`]; `None` when it requires nothing) and what the preflight `reported` of each tool: the highest
-/// version the builder listed that meets the one pin, as `major.minor.patch`; none for no pin, any version, or a pin no
-/// listed version meets.
+/// version the builder listed that meets the one pin, as `major.minor.patch`, or for any version (an entry of `""`) the
+/// highest it listed at all, as godot's no-pin choice takes the newest; none for no entry or a pin no listed version
+/// meets.
 pub(crate) fn unreal_choice(required: Option<&[Pin]>, reported: &[(String, Reported)]) -> Option<String> {
-    match required.unwrap_or_default() {
+    match required? {
+        [] => listed_versions(reported, UNREAL).max().map(|version| version.to_string()),
         [pin] => highest_meeting(pin, reported, UNREAL),
         _ => None,
     }
@@ -985,7 +987,7 @@ mod tests {
         Exact, GodotChoice, Judged, Manifest, NoChosenGodot, Pin, Pinned, Reported, Standing, ToolNeed, Version, dotnet_tools, godot_choice,
         godot_not_listed_line, godot_pins_read, godot_required, godot_sdk_pins, is_sent, judge, meets, needs_of, newest_godot, no_chosen_godot,
         no_godot_install_line, no_pin_godot_warning, pinned, read, read_bytes, reported, reported_as, routed_needs, several_godot_line, skip_line,
-        standing, unreadable_godot_pins_line, unreadable_line,
+        standing, unreadable_godot_pins_line, unreadable_line, unreal_choice,
     };
     use crate::remote::git::FAILURE_BYTES;
     use crate::remote::parity::{Need, NeedKind};
@@ -1005,6 +1007,20 @@ mod tests {
             ("node".to_owned(), Reported::Version("4.7.2".to_owned())),
             ("godot".to_owned(), Reported::Version(list.to_owned())),
         ]
+    }
+
+    /// A manifest's `unreal = ""` chooses the highest engine the builder listed, as godot's no-pin choice takes the
+    /// newest; no entry chooses none, and a builder listing none leaves nothing to choose.
+    #[test]
+    fn an_empty_unreal_entry_chooses_the_highest_listed_version() {
+        let listed = vec![
+            ("node".to_owned(), Reported::Version("24.0.0".to_owned())),
+            ("unreal".to_owned(), Reported::Version("5.7.3,5.10.0,5.8.0".to_owned())),
+        ];
+
+        assert_eq!(unreal_choice(Some(&[]), &listed).as_deref(), Some("5.10.0"));
+        assert_eq!(unreal_choice(None, &listed), None, "no unreal entry");
+        assert_eq!(unreal_choice(Some(&[]), &[]), None, "no unreal listed");
     }
 
     #[test]

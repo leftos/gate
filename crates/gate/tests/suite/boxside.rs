@@ -1121,18 +1121,26 @@ fn preflight_skips_an_unreal_root_that_is_no_drive_path() {
     );
 }
 
-/// A root inside the folder the box keeps its work folders in is refused, though it holds an engine.
+/// A root that overlaps a folder a run writes is refused, though it holds an engine: one inside the folder the box
+/// keeps its work folders in, and one holding that folder; the line names the folder it overlaps.
 #[test]
-fn preflight_skips_an_unreal_root_inside_the_worktree() {
-    let case = Case::new("preflight_unreal_root_inside_work");
-    let folders = Folders::new(&case);
-    let root = Path::new(&folders.work).parent().expect("the work folder has a parent").join("unreal");
-    fake_unreal(&root.join("5.8.0"), "5.8.0");
+fn preflight_skips_an_unreal_root_overlapping_the_run_s_folders() {
+    for (name, inside) in [("inside", true), ("holding", false)] {
+        let case = Case::new(&format!("preflight_unreal_root_overlap_{name}"));
+        let folders = Folders::new(&case);
+        let above = Path::new(&folders.work).parent().expect("the work folder has a parent").to_path_buf();
+        let root = if inside { above.join("unreal") } else { case.folder().clone() };
+        fake_unreal(&root.join("5.8.0"), "5.8.0");
 
-    let outcome = probed_with_unreal_root(&case, Some(&root));
+        let outcome = probed_with_unreal_root(&case, Some(&root));
 
-    let said = format!("gate: remote tool unreal skipped: {} lies inside the worktree", root.display());
-    assert_eq!(after_sdks(&outcome), [said.as_str()], "{outcome:?}");
+        let said = format!(
+            "gate: remote tool unreal skipped: GATE_UNREAL_ROOT {} overlaps {}, which a run writes",
+            root.display(),
+            above.display()
+        );
+        assert_eq!(after_sdks(&outcome), [said.as_str()], "{name}: {outcome:?}");
+    }
 }
 
 /// An engine whose folder, or whose `Engine` folder, is a junction is left out; a root whose only engine is behind a
@@ -2452,18 +2460,20 @@ fn box_run_never_resolves_an_unreal_behind_a_junction() {
 
 /// A run refuses a root inside its own folders, as the preflight's probe does, though the engine there is plain.
 #[test]
-fn box_run_refuses_an_unreal_root_inside_the_worktree() {
+fn box_run_refuses_an_unreal_root_overlapping_the_run_s_folders() {
     let case = Case::new("box_run_unreal_root_inside");
     let payload = unreal_payload(&case, &[FAKE_TOOL, "env", "UE_ROOT"], Some("5.8.0"));
-    let root = Path::new(field(&payload, "Work"))
+    let above = Path::new(field(&payload, "Work"))
         .parent()
         .expect("the work folder has a parent")
-        .join("unreal");
+        .to_path_buf();
+    let root = above.join("unreal");
     fake_unreal(&root.join("5.8.0"), "5.8.0");
 
     let outcome = run_box_with_unreal(&case, &payload, Some(&root), None);
 
-    assert_unreal_not_resolved(&outcome, &format!("{} lies inside the worktree", root.display()));
+    let why = format!("GATE_UNREAL_ROOT {} overlaps {}, which a run writes", root.display(), above.display());
+    assert_unreal_not_resolved(&outcome, &why);
 }
 
 /// A run refuses a root that is itself a junction, though the engine behind it is plain.

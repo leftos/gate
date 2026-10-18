@@ -159,7 +159,12 @@ fn check_an_unreal_root_inside_the_repo_is_refused() {
 
     let outcome = check_unreal(&case, "[tools]\nunreal = \"\"\n", &root, &["5.8.0"]);
 
-    let said = format!("check: here: unreal skipped: {} lies inside the worktree", root.display());
+    let said = format!(
+        "check: here: unreal skipped: GATE_UNREAL_ROOT {} overlaps {}, which a run writes",
+        root.display(),
+        // The repo root as the check names it, in git's spelling, as its `app at` line does.
+        case.folder().join(REPO).display().to_string().replace('\\', "/")
+    );
     assert_eq!(
         lines(&outcome.stdout)[1..],
         [said.as_str(), "check: here: nothing missing (1 skipped)"],

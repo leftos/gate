@@ -98,7 +98,7 @@ It is how a caller in a main checkout gates a command that names another worktre
 
 A name is one or more printable ASCII characters, U+0021 to U+007E, `=` excepted. ASCII only keeps the ASCII-case check of the refused names below equal to Windows' own comparison of names, so a name that is not ASCII can never pass that check and then be read as one the gate protects. A value may hold anything but NUL (CR and LF included) and may be empty.
 
-The gate refuses a name it sets itself (the build-server settings, `UseSharedCompilation`, `GATE_SLOT_HELD`, `GATE_STATE_DIR`, the box's `GATE_BOX_JOB` and `GATE_BOX_EXE` and the rest listed under [Command launching](#command-launching) and [The box side](#the-box-side)), any `GATE_` name, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG` and the machine paths the box keeps (`GODOT_PATH` among them, which a routed run sets itself).
+The gate refuses a name it sets itself (the build-server settings, `UseSharedCompilation`, `GATE_SLOT_HELD`, `GATE_STATE_DIR`, the box's `GATE_BOX_JOB` and `GATE_BOX_EXE` and the rest listed under [Command launching](#command-launching) and [The box side](#the-box-side)), any `GATE_` name, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG` and the machine paths the box keeps (`GODOT_PATH` and `UE_ROOT` among them, which a routed run sets itself).
 
 The refusal is the same on both sides so one `--env` means the same on the PC and on a builder.
 
@@ -293,11 +293,12 @@ The `global.json` ones are `check: global.json: <reason>`, `<reason>` being `is 
 The tool lines, for each tool of the manifest, probed as the box probes the tools of a preflight ([The box side](#the-box-side), Tool probes), all together within one 10 s bound, on this PC's own `PATH` with the worktree's own folders dropped, a program found that still lies inside the worktree refused:
 
 - `godot <found> ok (needs <pin> exactly)` when the manifest's `godot` pin is met, else `godot missing (needs <pin> exactly: <found>)`, `<found>` being the versions the probe found, `none`, or `not probed (<why>)` for a probe that gave no answer or a version it could not read. The pin is judged as a routed run judges it ([Toolchain manifest](#routing)): exact on the parts it gives, so `4.5` reads `needs 4.5 exactly` and matches any `4.5.x`. A pin not met counts as missing, never as skipped, and has no install hint. Only the manifest entry is read, not the project files' pins;
+- `unreal <found> ok (needs <pin> exactly)` and `unreal missing (needs <pin> exactly: <found>)` for the manifest's `unreal` pin, worded and judged as `godot`'s are (`<found>` is the versions under `GATE_UNREAL_ROOT`, `none`, or `not probed (<why>)`), with no install hint. With `GATE_UNREAL_ROOT` unset on this PC it is `unreal not checked here: GATE_UNREAL_ROOT is not set`, which counts as neither missing nor skipped; a root that overlaps the worktree gives `unreal skipped: GATE_UNREAL_ROOT <root> overlaps <worktree root>, which a run writes`;
 - `<tool> <found> ok (needs <min> or later)`, `<min>` written as `major.minor.patch`, when the found version is the minimum or later, and `<tool> <found> too old (needs <min> or later)` when it is below it;
 - `<tool> missing (needs <min> or later)`, or `(needs it present)` for a tool declared with `""`;
 - `<tool> <found> ok` for a tool declared present at any version, and `<tool> ok (version not readable)` for a present one whose version the probe could not read;
 - `<tool> skipped: found, version not readable (needs <min> or later)` when a minimum is declared and the tool answered with no version;
-- `<tool> skipped: <why>` when the probe gave no answer, `<why>` being the probe's own reason (`no answer in 10 s`, `cannot run <program>: <error>`, and for `godot` the reasons of its probe, such as `cannot run <install>: <install> lies inside the worktree` for a `GATE_GODOT_ROOT` inside the repo, [Tool probes](#the-box-side));
+- `<tool> skipped: <why>` when the probe gave no answer, `<why>` being the probe's own reason (`no answer in 10 s`, `cannot run <program>: <error>`, and for `godot` and `unreal` the reasons of their probes, such as `cannot run <install>: <install> lies inside the worktree` for a `GATE_GODOT_ROOT` inside the repo, [Tool probes](#the-box-side));
 - `tools.<name> skipped: not a tool gate knows` for a name the manifest declares that gate has no probe for, which runs nothing.
 
 The SDK line comes only when the root has a `global.json` with an `sdk.version`; one with no `sdk` key, or an `sdk` with no `version`, pins nothing and prints none.
@@ -306,7 +307,7 @@ With a pin that names a version it is `.NET SDK <version> (rollForward <policy>)
 
 The SDK list is read with the folders inside the worktree dropped from `PATH`. A `global.json` whose pin cannot be read (a reason above) says `.NET SDK skipped: global.json has no readable sdk pin`, which counts as skipped, and the file counts as unreadable; a list that cannot be read `.NET SDK skipped: cannot read this PC's SDK list: <why>`.
 
-A manifest that lists workloads gets one line, `workloads <ids, comma separated> not checked yet`, which counts as neither skipped nor missing. The tools in `.config/dotnet-tools.json` and a `Godot.NET.Sdk` pin are not checked by `gate check` and say nothing; a routed run does read a Godot pin (Toolchain manifest, under Routing), and `gate check` judges a manifest `godot` pin as a routed run does (the first tool line above), and a `godot` of `""` and every other tool as a minimum.
+A manifest that lists workloads gets one line, `workloads <ids, comma separated> not checked yet`, which counts as neither skipped nor missing. The tools in `.config/dotnet-tools.json` and a `Godot.NET.Sdk` pin are not checked by `gate check` and say nothing; a routed run does read a Godot pin (Toolchain manifest, under Routing), and `gate check` judges a manifest `godot` or `unreal` pin as a routed run does (the first two tool lines above), and a `godot` of `""` and every other tool as a minimum.
 
 Each sibling the repo declares is checked as routing checks it, and gets one line:
 
@@ -346,7 +347,7 @@ The install hints, for the items that have one:
 | the .NET SDK | `.NET SDK: winget install Microsoft.DotNet.SDK.<major>`, the pin's major |
 | a missing sibling | `sibling <name>: clone it to <path>` |
 
-A tool not in the table (`godot`) gets no hint line, nor does a sibling that is not allowed or refused, nor the `remote.json` item.
+A tool not in the table (`godot`, `unreal`) gets no hint line, nor does a sibling that is not allowed or refused, nor the `remote.json` item.
 
 The exit is 0 when nothing is missing or too old and every file read, whatever was skipped and whatever warm-up line only informs; 1 when anything is missing or too old, or the check could not run (not in a git repository, an unreadable `.gate/toolchain.toml`, `.gate/siblings.toml`, `.gate/warmup.toml` or `global.json`, `.gate` not a folder); 2 for a usage error. Test-seams builds accept the hidden `--test-probe-limit-ms <n>` (the 10 s probe bound, in milliseconds above 0), which `--builder` refuses.
 
@@ -1734,7 +1735,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     `toolchain::meets` compares a found version with a minimum. A repo's sibling worktrees are not declared here but in `.gate/siblings.toml` ([Sibling worktrees](#routing)), whose problems keep a run local.
 
-    The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version; a routed run reads the `godot` entry as an exact pin instead (below). The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot` and `ffmpeg`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
+    The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version; a routed run reads the `godot` and `unreal` entries as exact pins instead (below). The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot`, `unreal` and `ffmpeg`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
 
     A repo's minimums are the lowest versions its own files require: `rust-version`, `rust-toolchain.toml` or the edition, `packageManager`, the launcher's `#requires`. Where nothing pins a floor, the minimum is the oldest toolchain the builders install (rust 1.89, the first with edition 2024's let chains); where neither applies, the entry is `""`. pwsh is `7.4` everywhere, since the launcher needs PowerShell 7. A minimum set higher than the repo needs would refuse a builder that can run it.
 
@@ -1778,9 +1779,17 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A warm-up counts as a Godot-console command when any of its commands' first word is a Godot console word. It then sends the same `godot` need, follows the same rules with the same lines (said in its log, and on the console of a foreground `gate warm`), and carries the chosen version as its payload's `GodotVersion`. A warm-up the rules refuse is recorded `failed`, refused, with the reason `the builder refused: parity`.
 
+    `unreal` is an exact pin judged as `godot` is, and read from the manifest only (no project file names it): `"5.8"` matches any 5.8.x, `"5.8.1"` that one, and `""` any version. A manifest `unreal` entry is sent as an `unreal` need like any manifest tool, and judged on every routed run whatever the command.
+
+    The builder's answer is `gate: remote tool unreal <v1>,<v2>,...`, and an unmet pin is the mismatch line `gate: remote toolchain mismatch: <repo> needs unreal <pin> exactly; <host> has <found>` (`needs unreal` for `""`), `<found>` as for godot.
+
+    When the builder cannot be probed and the entry is `""`, the line is `gate: <host> did not probe unreal: <why>; not checking it`.
+
+    After the preflight the client chooses, from the main repo's manifest pin, the highest reported version that meets it and sends it, spelled `x.y.z`, as the optional `UnrealVersion` of the run payload and of a warm-up's; a pin of `""` chooses the highest reported version, and no pin, or a pin no reported version meets, chooses none, and the field is left out. The box sets `UE_ROOT` from it (The box side, the command's environment).
+
     A tool the builder did not probe, gave no answer for, or found at a version that cannot be read against a minimum gets `gate: <host> did not probe <name>: <why>; not checking it` and is not a need. The lines come in this order: the SDK step's own, then the manifest's problem lines, then the per-tool skip lines in the manifest's order, then the mismatch lines.
 
-    A text from the manifest or the builder is escaped, and the builder's cut to 4096 bytes, so neither can forge a line. `toolchain::standing` judges a tool against a minimum from what its probe found (met, too old, missing, not readable, skipped) in one place, which `gate check`'s report shares and a routed run applies to every tool but a pinned `godot`, which both judge with `pinned`; `gate check` judges a manifest `godot` pin through `pinned` too, so its report and a routed run agree. `--test-remote-interrupt-at manifest` raises the interrupt just before the manifest is read.
+    A text from the manifest or the builder is escaped, and the builder's cut to 4096 bytes, so neither can forge a line. `toolchain::standing` judges a tool against a minimum from what its probe found (met, too old, missing, not readable, skipped) in one place, which `gate check`'s report shares and a routed run applies to every tool but a pinned `godot` or `unreal`, which both judge with `pinned`; `gate check` judges a manifest `godot` or `unreal` pin through `pinned` too, so its report and a routed run agree. `--test-remote-interrupt-at manifest` raises the interrupt just before the manifest is read.
 
     Two pins a repo already declares are read beside it: each tool's version in `.config/dotnet-tools.json` (the release part, so `1.0.0-beta.1` is 1.0.0; read as strict JSON, as dotnet reads it, so a comment or a trailing comma makes the file unreadable, and a tool id given twice counts once, with its last version) and the `Godot.NET.Sdk/<version>` a project file names, on its root `<Project Sdk=...>` or an `<Sdk Name="Godot.NET.Sdk" Version=...>` element directly inside it (an `<Import Sdk=...>`, a deeper `<Sdk>` element and a `min=` version are not read). The dotnet tools' versions are read and nothing judges them yet. The Godot pin is an exact version on the parts it gives, a four-part SDK version reading as its first three, and is judged on every routed run (above).
 
@@ -2345,7 +2354,7 @@ Built verbs:
 
   Tool probes (`boxside/probe.rs`): for each tool of the payload's `Needs`, in payload order, the box runs a probe and says one line on stdout after the sdks line, all once every probe has ended: `gate: remote tool <tool> <version>`, `gate: remote tool <tool> present` or `gate: remote tool <tool> missing`, or `gate: remote tool <tool> skipped: <why>`. The box only reports; the PC compares the minimums.
 
-  The probes are `rustc --version` for `rust`, `cargo-nextest nextest --version` for `cargo-nextest` (the plugin directly, never through `cargo`, so no `.cargo\config.toml` above the folder can alias it), `<name> --version` for `node`, `pnpm` and `pwsh`, and `ffmpeg -version`. `godot` is probed as the next paragraph says.
+  The probes are `rustc --version` for `rust`, `cargo-nextest nextest --version` for `cargo-nextest` (the plugin directly, never through `cargo`, so no `.cargo\config.toml` above the folder can alias it), `<name> --version` for `node`, `pnpm` and `pwsh`, and `ffmpeg -version`. `godot` and `unreal` are probed as the paragraphs below say.
 
   The `godot` probe reads `GATE_GODOT_ROOT`, an environment variable of the builder naming a folder of side-by-side Godot installs, one per subfolder, each holding `Godot_console.exe`. A subfolder is named for its install's version in full canonical form, `x.y.z` (`4.7.2`: three parts, no leading zero in a part, as `04.7.2` and `4.3` are not), since a run finds an install by that name, `<root>\<version>\Godot_console.exe`.
 
@@ -2357,13 +2366,27 @@ Built verbs:
 
   When no install gives a version the line is `gate: remote tool godot skipped: <why>`, the first reason met: `cannot run <install>: <install> lies inside the worktree` (an install inside the run's own folders, the folder above `Work`, `Work`, `Bare` and the outputs folder, is refused unrun; a `gate check` refuses the repo root), `cannot run <exe>: <path> is a link or a junction` (a subfolder or the exe, being any reparse point: a link, a junction, an app execution alias or a cloud placeholder), `named <folder> but reports <version>` (an install of the root whose folder is not named the version it reports; said only when no other install lists), `GATE_GODOT_ROOT <path> is not an absolute path on a drive`, `cannot read GATE_GODOT_ROOT <path>: <error>`, `no answer in <limit>` (the listing was cut by the deadline with nothing read) or `Godot_console.exe --version gave no version: <line>` (the first line of stdout, cut to 200 characters with `…`, escaped, when a version part has over ten digits or the line leads with no version).
 
+  The `unreal` probe reads `GATE_UNREAL_ROOT`, an environment variable of the builder naming a folder of side-by-side Unreal Engine installs, one per subfolder, each named for its version in full canonical form, `x.y.z`, as `GATE_GODOT_ROOT`'s are, since a run finds an install by that name, `<root>\<version>`.
+
+  No program is launched: each install's version is read from `<sub>\Engine\Build\Build.version`, a JSON file whose integers `MajorVersion`, `MinorVersion` and `PatchVersion` give it (a byte order mark is accepted; at most 64 KiB; opened without following links, and a file with more than one hard link is refused).
+
+  The probe lists the root's direct subfolders under the same 64-entry cap as the godot probe's, which the two share, and the batch's deadline, and says `gate: remote tool unreal <v1>,<v2>,...` ordered by number without repeats.
+
+  There is no `PATH` fallback: with no `GATE_UNREAL_ROOT`, or a root naming no install, the line is `gate: remote tool unreal missing`. An install whose folder is not named the version it reports is left out of the list.
+
+  When no install gives a version the line is `gate: remote tool unreal skipped: <why>`, the first reason met: `GATE_UNREAL_ROOT <root> overlaps <folder>, which a run writes` (a root inside one of the run's own folders, or holding one), `GATE_UNREAL_ROOT <root>: <path> is a link or a junction`, `named <folder> but reports <version>`, `GATE_UNREAL_ROOT <x> is not an absolute path on a drive` or `no answer in <n> s`.
+
+  The probe runs on a thread of its own under the batch's deadline, so a slow root never delays another tool's probe, and a listing the deadline cuts short answers `skipped: no answer in <n> s` even when it had read some versions, so a pin is judged not probed rather than against part of the list.
+
+  A `Build.version` that cannot be used gives `<file> gives no integer MajorVersion, MinorVersion and PatchVersion`, `<file> is over 64 KiB`, `<file> is not UTF-8` or `cannot read <file>: <why>`.
+
   Each program is found through `PATH` and `PATHEXT` as `dotnet` is (a `.cmd` shim runs through the system folder's cmd.exe; a `.ps1` is not run) and runs in the system folder on a hidden console, in the bounded runner of `remote/git.rs` (`program_output`).
 
   The probes run in parallel, started at the same time as `dotnet --list-sdks`, under one shared 10 s deadline (`--test-probe-limit-ms` lowers it); one still running at the deadline is killed with its process tree, and one with no time left is skipped without being launched.
 
   The version is read from the first non-blank line of stdout, else of stderr: the first run of two or more dot-separated numbers after an optional `v`, its first three kept. A line with no such run, a number longer than 10 digits or a non-zero exit gives `present`; a program that cannot be found gives `missing`.
 
-  The `<why>` of a skip is `unknown tool`, the `godot` reasons above, `no answer in <n> s` (or `<n> ms` when the limit is not whole seconds), `no answer in <limit>, and could not be stopped: <error>`, `the probe failed` (followed by `: <panic text>` when the probe panicked), or the runner's failure text: `cannot run <program>: <why>`, `<program> <args> wrote more than 16 MiB` or `cannot run <program>: cannot read the system folder: <error>`.
+  The `<why>` of a skip is `unknown tool`, the `godot` and `unreal` reasons above, `no answer in <n> s` (or `<n> ms` when the limit is not whole seconds), `no answer in <limit>, and could not be stopped: <error>`, `the probe failed` (followed by `: <panic text>` when the probe panicked), or the runner's failure text: `cannot run <program>: <why>`, `<program> <args> wrote more than 16 MiB` or `cannot run <program>: cannot read the system folder: <error>`.
 
   A payload whose `Needs` is not an object of texts prints `gate: box payload Needs is not an object of texts; probing nothing` on stderr, probes nothing and still exits 0.
 - **`run`** runs the payload's `Command` (a list of texts), or, for a warm-up, each of its `WarmCommands` in order (Warm-up, below), in `Work` (in `Work\{Leaf}` for a sibling pair), and exits with the command's own whole 32-bit status after a successful run. Its stdout is the command's stdout, LF-terminated; its stderr is the command's stderr plus the box's own lines.
@@ -2412,6 +2435,8 @@ Built verbs:
 
   `GodotVersion`'s: `gate: box payload GodotVersion is not a version: '<value>'` for any value but a string of exactly three dot-separated parts of one to ten digits each with no leading zero (except `0`), as it is joined into an install's path; a value that is no string shows as compact JSON, shortened and escaped. A null `GodotVersion` is not set.
 
+  `UnrealVersion`'s: `gate: box payload UnrealVersion is not a version: '<value>'`, exit 2, for any value `GodotVersion` refuses and shown the same way, as it is joined into an install's path. A null `UnrealVersion` is not set.
+
   A warm-up payload's: `gate: box payload sets both Command and WarmCommands`, `gate: box payload lacks WarmHash`, `gate: box payload asks a warm-up for outputs` (an `Outputs` glob or `OutputsFull` true), `gate: box payload asks a warm-up for Env` (an `Env` that is not null, even `{}`), `gate: box payload WarmCommands is not a list of 1 to 8 commands, each a non-empty list of non-empty texts` and `gate: box payload WarmHash is not 64 lower-case hex digits: <value>`.
 
   A `WarmHash` beside a `Command` is ignored, and a null `WarmCommands` is not set.
@@ -2432,7 +2457,7 @@ Built verbs:
 
   It refuses a name the gate sets (`GATE_SLOT_HELD`, `GATE_STATE_DIR`, `SharedCompilationId`, `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `UseSharedCompilation`, `MSBUILDDISABLENODEREUSE`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`, and .NET's Event Log logging settings in any spelling: the `__` and `:` forms, a `DOTNET_` or `ASPNETCORE_` prefix, the provider's full type name).
 
-  It also refuses `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG` (git reads them over the gate's own `safe.directory` entry), any `GATE_` name, and the machine paths `PATH`, `PATHEXT`, `TEMP`, `TMP`, `SystemRoot`, `windir`, `ComSpec`, `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA` and `ProgramData`, and `GODOT_PATH`, which a run sets itself (the command's environment, below). Names are compared without regard to ASCII case.
+  It also refuses `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG` (git reads them over the gate's own `safe.directory` entry), any `GATE_` name, and the machine paths `PATH`, `PATHEXT`, `TEMP`, `TMP`, `SystemRoot`, `windir`, `ComSpec`, `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA` and `ProgramData`, and `GODOT_PATH` and `UE_ROOT`, which a run sets itself (the command's environment, below). Names are compared without regard to ASCII case.
 
   A name given twice in any ASCII case is refused; names are ASCII, so that is also how Windows compares them. A refusal line shows the name shortened to 200 characters and escaped.
 
@@ -2510,7 +2535,7 @@ Built verbs:
 
   Known limit, as in PowerShell: after the builder's NuGet cache is cleared, the `*.tools` records must be deleted by hand.
 
-  The package restore (`boxside/packages.rs`) runs for a routed command whose first word's file stem is `pnpm`, `bun` or `bunx`, in any case, after the tool restore and before the command. A run whose commands include more than one such command (a warm-up's) installs once per distinct lockfile folder and manager, in the commands' order, before the first command, and stops at the first install that fails.
+  The package restore (`boxside/packages.rs`) runs for a routed command whose first word's file stem is `pnpm`, `bun` or `bunx`, in any case, after the tool restore and before the command. A run whose commands include more than one such command (a warm-up's) installs once per distinct lockfile folder and manager, in the commands' order, before the first command, and stops at the first install that fails. An install never sees `UE_ROOT`, nor does the dotnet tool restore.
 
   It looks for the folder to install in, for each command, from the start folder, and walks up from it to the work root (the main tree on a pair run) for the first lockfile (`pnpm-lock.yaml` for pnpm, `bun.lock` or `bun.lockb` for bun); a walk that finds none does nothing.
 
@@ -2645,6 +2670,10 @@ Built verbs:
   With no root the word resolves on the `PATH` as before. Any other word resolves as before.
 
   `GODOT_PATH` is then set for every command of the run to the Godot program that resolved: the root's install when the root is set, else, with no root, the program the `PATH` gave a Godot console word, or the `PATH`'s `Godot_console.exe` for any other. It is set after the caller's pairs and the gate's own settings, so none undoes it. When no Godot program resolves, `GODOT_PATH` is removed, an inherited value included. A run with no `GodotVersion` leaves the environment as before.
+
+  A run with an `UnrealVersion` resolves `<GATE_UNREAL_ROOT>\<version>` with the probe's root checks (no link in the root or its ancestors; the root inside none of the run's refused folders; the install's `Build.version` present), once when it reads the request, and sets `UE_ROOT` to it for every command of a plain, warm-up or desktop run, after the caller's pairs and the gate's own settings. When it cannot resolve, the run exits 127 with `gate: could not resolve unreal <version>: <why>`, before any desktop lock.
+
+  A run with no `UnrealVersion` removes an inherited `UE_ROOT`. The package restore and the dotnet tool restore run without `UE_ROOT` whatever the box inherited.
 
   The command's environment also gets the box's own names, after the pairs, so no caller can send one (any `GATE_` name is refused): `GATE_BOX_EXE`, the box's own image path, and `GATE_BOX_JOB`, the run's job name. The name is spelled `Global\gate-remote-<key>-<12 hex>` when the box runs in session 0 (an ssh logon, where `Local\` is the global namespace), so a desktop command in the console session reaches the same object, else as created.
 

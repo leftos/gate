@@ -72,6 +72,6 @@ The put then moves each file in with `check_folder` on every parent under `Work`
 
 ## Landing
 
-Steps (a), (b) and (c) are built and on main.
+All four steps, (a) to (d), are built.
 
 Steps in order: (a) router key and `RemoteRun`/`RemoteCall` field; (b) box verb with diff and put, record, exclude rewrite, stage and install, seams; (c) client phase, cache, lines, fallback reason, the run's digest check; (d) docs: design.md Routing and The box side (the Inputs bullet), ARCHITECTURE.md Task Index row "Send ignored inputs with a routed run", GLOSSARY.md "input", test-map rows; ops-tower inbox request for the `inputs` fallback reason.

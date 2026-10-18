@@ -175,7 +175,7 @@ fn started<'scope, 'env>(
             Err(why) => Pending::Found(Probed::Skipped(format!("cannot run {GODOT}: {why}"))),
             Ok(place) => Pending::Running(scope.spawn(move || godot(place, batch))),
         },
-        Some(ToolProbe::Unreal) => Pending::Found(unreal(batch)),
+        Some(ToolProbe::Unreal) => Pending::Running(scope.spawn(move || unreal(batch))),
     }
 }
 
@@ -377,28 +377,29 @@ fn unreal(batch: Batch<'_>) -> Probed {
 fn unreal_installs(root: &OsStr, worktrees: &[&Path], deadline: Instant, limit: Duration) -> Result<Vec<Probed>, String> {
     let folder = checked_unreal_root(root, worktrees)?;
     let folders = listed(UNREAL_ROOT, folder, deadline, limit, |folder| Some(folder.to_path_buf()))?;
-    Ok(unreal_read(&folders, deadline, limit))
+    // A listing the deadline cut short leaves the deadline passed, so the reading says `no answer` before its first
+    // install: a partial list is never taken for the whole.
+    unreal_read(&folders, limit, || Instant::now() >= deadline)
 }
 
-/// What each install folder of `folders` comes to, in order ([`unreal_install`]), read while the batch's `deadline`
-/// has not passed: past it the reading stops, what was read so far kept and the batch's own `no answer` reason, with
-/// its `limit`, after it.
-fn unreal_read(folders: &[PathBuf], deadline: Instant, limit: Duration) -> Vec<Probed> {
+/// What each install folder of `folders` comes to, in order ([`unreal_install`]), each read only once `passed` says
+/// the batch's deadline has not passed; else the batch's own `no answer` reason, with its `limit`, whatever was read
+/// before, so a reading cut short never passes for the root's whole list.
+fn unreal_read(folders: &[PathBuf], limit: Duration, mut passed: impl FnMut() -> bool) -> Result<Vec<Probed>, String> {
     let mut found = Vec::new();
     for folder in folders {
-        if Instant::now() >= deadline {
-            found.push(Probed::Skipped(no_answer(limit)));
-            break;
+        if passed() {
+            return Err(no_answer(limit));
         }
         found.extend(unreal_install(folder));
     }
-    found
+    Ok(found)
 }
 
 /// The folder the Unreal Engine root `root`, the box's `GATE_UNREAL_ROOT`, names, as the probe and a run both take
 /// it: an absolute path on a drive ([`drive_root`]), neither it nor any folder above it a link or a junction
-/// ([`linked`]), and not lying inside any of `worktrees`, the run's own folders, followed through links. Else why it
-/// is refused.
+/// ([`linked`]), and overlapping none of `worktrees`, the folders a run writes, followed through links: neither inside
+/// one nor holding one. Else why it is refused, naming the first folder it overlaps.
 pub(crate) fn checked_unreal_root<'r>(root: &'r OsStr, worktrees: &[&Path]) -> Result<&'r Path, String> {
     let folder = drive_root(UNREAL_ROOT, root)?;
     if let Some(link) = folder.ancestors().find(|path| linked(path)) {
@@ -409,8 +410,16 @@ pub(crate) fn checked_unreal_root<'r>(root: &'r OsStr, worktrees: &[&Path]) -> R
         ));
     }
     let held = resolved(folder);
-    if worktrees.iter().any(|worktree| is_within(&held, &resolved(worktree))) {
-        return Err(format!("{} lies inside the worktree", escaped(&folder.to_string_lossy())));
+    let overlaps = |worktree: &&&Path| {
+        let written = resolved(worktree);
+        is_within(&held, &written) || is_within(&written, &held)
+    };
+    if let Some(written) = worktrees.iter().find(overlaps) {
+        return Err(format!(
+            "{UNREAL_ROOT} {} overlaps {}, which a run writes",
+            escaped(&folder.to_string_lossy()),
+            escaped(&written.to_string_lossy())
+        ));
     }
     Ok(folder)
 }
@@ -707,15 +716,17 @@ mod tests {
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
+    use std::thread;
     use std::time::{Duration, Instant};
 
     use super::GODOT;
     use super::{
-        Candidate, Probed, build_version, first_version, godot_candidates, godot_gave_no_version, godot_version, is_reparse_point, late_reason,
-        named_as_found, panic_reason, probe, read_godot, tool_line, unreal_installs, unreal_read, unreal_version, version_list, version_of,
+        Batch, Candidate, Pending, Probed, build_version, first_version, godot_candidates, godot_gave_no_version, godot_version, is_reparse_point,
+        late_reason, named_as_found, panic_reason, probe, read_godot, started, tool_line, unreal_installs, unreal_read, unreal_version, version_list,
+        version_of,
     };
     use crate::environment::Variables;
-    use crate::remote::git::ProgramOutput;
+    use crate::remote::git::{ProgramOutput, ProgramPlace};
 
     /// `FILE_ATTRIBUTE_DIRECTORY`, `FILE_ATTRIBUTE_ARCHIVE` and `FILE_ATTRIBUTE_REPARSE_POINT`.
     const DIRECTORY: u32 = 0x10;
@@ -1142,6 +1153,25 @@ mod tests {
         fs::remove_dir_all(&root).expect("the test's root can be removed");
     }
 
+    /// The unreal probe runs on a thread of its own, as the godot probe does, so a slow root never holds up the probes
+    /// after it in the batch.
+    #[test]
+    fn the_unreal_probe_runs_on_a_thread_of_its_own() {
+        let place: Result<ProgramPlace, String> = Err("no place".to_owned());
+        let batch = Batch {
+            worktrees: &[],
+            godot_root: None,
+            unreal_root: Ok(None),
+            deadline: Instant::now(),
+            limit: Duration::ZERO,
+        };
+
+        thread::scope(|scope| {
+            let pending = started(scope, "unreal", &place, batch);
+            assert!(matches!(pending, Pending::Running(_)), "the unreal probe runs inline");
+        });
+    }
+
     /// A `Build.version` that is a symbolic link is refused when it is opened, as the link itself, so a link put there
     /// after the probe looked is never followed to the file it names.
     #[test]
@@ -1165,24 +1195,25 @@ mod tests {
         fs::remove_dir_all(&root).expect("the test's root can be removed");
     }
 
-    /// Past the batch's deadline the unreal probe reads no more installs and says the batch's own reason, as a listing
-    /// cut short does; a whole probe given no time says it alone.
+    /// A reading the deadline cuts short is the batch's own `no answer`, never the versions read before it, so a pin is
+    /// judged not probed rather than missing from a partial list; a whole probe given no time says it too.
     #[test]
     #[expect(clippy::expect_used, reason = "a test whose install folders cannot be made must fail loudly")]
-    fn an_unreal_probe_past_its_deadline_reads_no_more_installs() {
+    fn an_unreal_listing_cut_by_the_deadline_is_skipped_even_with_versions_read() {
         let root = unit_root("unreal-deadline");
         let folders = [root.join("5.7.3"), root.join("5.8.0")];
         unit_unreal(&folders[0], &build_version_text(5, 7, 3));
         unit_unreal(&folders[1], &build_version_text(5, 8, 0));
 
+        let mut looks = 0;
+        let cut = unreal_read(&folders, Duration::ZERO, || {
+            looks += 1;
+            looks > 1
+        });
+        assert_eq!(cut, Err("no answer in 0 s".to_owned()), "the first install was read before the cut");
         assert_eq!(
-            unreal_read(&folders, Instant::now(), Duration::ZERO),
-            [Probed::Skipped("no answer in 0 s".to_owned())]
-        );
-        let later = Instant::now() + Duration::from_secs(60);
-        assert_eq!(
-            unreal_read(&folders, later, Duration::from_secs(60)),
-            [Probed::Version("5.7.3".to_owned()), Probed::Version("5.8.0".to_owned())]
+            unreal_read(&folders, Duration::from_secs(60), || false),
+            Ok(vec![Probed::Version("5.7.3".to_owned()), Probed::Version("5.8.0".to_owned())])
         );
         let variables = Variables::from_process().with("GATE_UNREAL_ROOT", &root.to_string_lossy());
         assert_eq!(

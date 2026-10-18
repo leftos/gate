@@ -54,6 +54,16 @@ The hook entry calls the repo's launcher, `pwsh -NoProfile -File tools/gate.ps1 
 
 A repo whose short routed runs (a filtered test of a minute) would meet a cold builder work folder declares warm-up builds in a tracked `.gate/warmup.toml`, and `remote.json` consents to it under `warmup` ([design.md, gate warm](design.md#gate-warm)). Routed runs go to the builder from a new worktree's first run, warm or not: the first run in a new work folder is cold, with its ceiling raised, and says to prewarm the next new worktree with `gate warm`. Run `gate warm` in a new worktree before its first routed run to find the folder warm.
 
+## A repo that builds with Unreal Engine
+
+The engine is not in the worktree and not on the builder's `PATH`: the builder holds its engines side by side under `GATE_UNREAL_ROOT`, one subfolder per version named `x.y.z`, each with `Engine\Build\Build.version` ([design.md, Tool probes](design.md#the-box-side)). That setup is part of the builder's setup (claude-config's build-box installer mirrors it); `gate check --builder` shows the versions it lists.
+
+- **The pin.** The repo pins the engine in `.gate/toolchain.toml`, `unreal = "5.8"`, an exact pin like godot's: `"5.8"` takes any 5.8.x and `""` any version. A builder without a matching engine keeps the run here with the mismatch line. The gate picks the highest matching engine and the box sets `UE_ROOT` to its folder for every command of the run.
+- **The routed command is a tracked wrapper script.** It builds absolute `-project=` and `-archivedirectory=` paths itself, because `RunUAT.bat` `pushd`es into the engine and the router sends worktree paths as relative ones. It reads the engine from `UE_ROOT`, with its own fallback for the PC, where nothing sets it.
+- **The archive** goes to a gitignored folder outside `.tmp/`, named in the repo's `outputs`, because outputs never come back from `.tmp/`.
+- **What stays local:** commandlets that write into ignored content, a packaged-game run that needs a GPU when the builder has none, and the editor.
+- **Git LFS.** A tracked project with LFS assets needs GATE-469 (`docs/plans/remote-lfs.md`), which is not built yet.
+
 ## Taking a builder out for maintenance
 
 A reboot, an install that needs one, or any other work that would break a run on the builder starts by draining it, never by waiting for it to go idle while it stays in `remote.json`: new runs keep arriving, so that wait has no end.

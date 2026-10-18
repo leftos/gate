@@ -3142,6 +3142,19 @@ fn a_repo_with_no_unreal_pin_sends_no_unreal_need_or_version() {
     assert!(!outcome.stderr.contains("unreal"), "{outcome:?}");
 }
 
+/// A repo whose manifest takes any Unreal Engine, `unreal = ""`, routes with the newest engine the builder has, and its
+/// command sees that engine over the `UE_ROOT` the builder inherited.
+#[test]
+fn a_repo_with_an_any_version_unreal_entry_routes_with_the_newest_engine_in_ue_root() {
+    let case = client_case("client-unreal-any");
+    write(&case, MANIFEST, "[tools]\nunreal = \"\"\n");
+    let root = unreal_root(&case, &["5.7.3", "5.10.0", "5.8.0"]);
+
+    let outcome = a_routed_unreal_run(&case, &root, Some(STALE_UE_ROOT));
+
+    assert!(saw_the_engine(&outcome, &root, "5.10.0"), "{outcome:?}");
+}
+
 /// A partial pin sends the highest engine of the builder that meets it.
 #[test]
 fn a_partial_unreal_pin_sends_the_highest_matching_install() {

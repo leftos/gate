@@ -697,6 +697,30 @@ fn box_warm_up_runs_the_godot_install_of_its_godot_version() {
     wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 
+/// A warm-up resolves its `UnrealVersion` once for all its commands: a command that breaks the engine's
+/// `Build.version` leaves the next command the same `UE_ROOT`, never a second resolution that fails.
+#[test]
+fn box_warm_up_resolves_its_unreal_once_for_every_command() {
+    let case = Case::new("box_warm_unreal_once");
+    let root = unreal_root(&case);
+    fake_unreal(&root.join("5.8.0"), "5.8.0");
+    let file = root.join("5.8.0").join("Engine").join("Build").join("Build.version");
+    let file = file.to_string_lossy().into_owned();
+    let mut payload = warm_payload(
+        &case,
+        &[&[FAKE_TOOL, "env", "UE_ROOT", "write", &file, "broken"], &[FAKE_TOOL, "env", "UE_ROOT"]],
+    );
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    payload["UnrealVersion"] = json!("5.8.0");
+
+    let outcome = run_box_with_unreal(&case, &payload, Some(&root), None);
+
+    let engine = root.join("5.8.0").display().to_string();
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, format!("{engine}\n{engine}\n"), "{outcome:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
 /// A warm-up's `UnrealVersion` is taken, and its commands see `UE_ROOT` naming the engine of that version over the one
 /// the box inherited, as a run's do.
 #[test]
