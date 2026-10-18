@@ -49,3 +49,12 @@ The hook entry calls the gate itself, `gate run ... -- <heavy command>`, and the
 ## A repo whose short runs a cold folder would push past their ceiling
 
 A repo whose short routed runs (a filtered test of a minute) would meet a cold builder work folder declares warm-up builds in a tracked `.gate/warmup.toml`, and `remote.json` consents to it under `warmup` ([design.md, gate warm](design.md#gate-warm)). Until the folder is warm, a matched run stays here and starts the warm-up in the background; the runs after it route.
+
+## Taking a builder out for maintenance
+
+A reboot, an install that needs one, or any other work that would break a run on the builder starts by draining it, never by waiting for it to go idle while it stays in `remote.json`: new runs keep arriving, so that wait has no end.
+
+1. Back up `remote.json` beside it (`remote.json.bak-<UTC stamp>`) and save the builder's exact entry. Then, in one quick read-modify-write, take the builder out: remove it from `hosts`, or remove `host` when it is the only builder. With no `host` left, every gate on the PC runs here and says the routing file is unusable, which is expected while the builder is out.
+2. Wait for the runs already on the builder to end. No `gate.exe` box process and no routed command may still be live under the builder user, besides your own ssh session. There is no cutoff, since each routed run ends at its own ceiling. A run still live past the longest routed ceiling is looked into, never cut off by the reboot.
+3. Do the work. After a reboot, confirm that the console session logged back on (autologon), which the desktop route needs.
+4. Put the builder back with the saved entry, in a read-modify-write that keeps every other key as it stands then, and check it with `gate check --builder <host>`. If anything blocks the work partway, put the builder back first, so routing never stays off.
