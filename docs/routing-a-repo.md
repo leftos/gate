@@ -14,6 +14,8 @@ Every repo that runs heavy gates is in scope, and every heavy command family in 
 
 Coverage is judged from the journal's history of gated commands per repo, not from the commands guessed to matter. Light-slot runs never route (the router considers heavy runs only), so a repo whose gates are all light, short checks stays local without an entry.
 
+A caller never adds `--local` (`-Local`) to a gate unless that command has been tried routed and failed. It then reruns locally only what failed and always reports the failure to the gate repo's inbox with the command, the gate's lines and the log path. The gate repo fixes the routing or rules that the command stays local, and a command ruled local is kept local by the router, so callers do not carry the flag. Every `--local` run is journalled as `notRouted: --local` on its `queue` event, which is how stray uses are found.
+
 A command run from one worktree that names a path in another worktree of a listed repo stays local, saying `gate: not routed: the command works in <tree>; run it with --cd <tree>`. Run it again with `--cd <tree>` to route it from that worktree ([design.md, Routing](design.md#routing)). A path in an unlisted repo, on a network drive or in no worktree keeps the plain `is outside the worktree` line.
 
 ## Adding a repo
