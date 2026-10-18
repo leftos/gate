@@ -3,7 +3,7 @@
 //! ([`gate_router::warm::judge`]), and the lines they say. git runs on the run thread, before any command is started.
 
 use std::cell::RefCell;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::windows::ffi::OsStrExt;
@@ -47,6 +47,9 @@ pub(crate) const SIBLING_NOT_A_FOLDER: &str = "is not a folder";
 pub(crate) const SIBLING_GIT_LINK: &str = "has a .git that is a link or a junction";
 /// Why a command that would route runs here when one of its words is not valid Unicode.
 const NOT_UNICODE: &str = "a word of the command is not valid Unicode";
+/// How long a git call of the hint's decision may take while the run still holds its light slot: a call that cannot
+/// answer in time means no hint, silently ([`would_route_on_heavy`]).
+const HINT_GIT_LIMIT: Duration = Duration::from_secs(5);
 
 /// The arguments of the git call that places a folder: its worktree root, the folder below it, and the common git
 /// folder, whose parent's name is the checkout's.
@@ -76,12 +79,55 @@ impl Placed {
     }
 }
 
-/// Where a run's command runs ([`route`]), what the decision learnt of the gate's place in its git worktree, and the
-/// hash of the warm-up file the routed run's work folder must be warm with, when the warm-up asks one.
+/// Where a run's command runs ([`route`]), what the decision learnt of the gate's place in its git worktree, the hash of
+/// the warm-up file the routed run's work folder must be warm with when the warm-up asks one, and what the decision saw,
+/// which a passed light run asks again as a heavy one ([`would_route_on_heavy`]).
 pub(crate) struct Decided {
     pub route: Route,
     pub placed: Placed,
     pub warm_hash: Option<String>,
+    pub decision: Decision,
+}
+
+/// What the routing decision saw of the run, kept so a passed light run can ask whether its command would route on heavy
+/// without reading the routing file or git on any other run: the [`Inputs`] the run's own decision had, less the slot it
+/// asked for, and what [`Machine::new`] read of the environment.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent input of the decision, read by name; no two form a state machine"
+)]
+pub(crate) struct Decision {
+    covering_parent: bool,
+    local: bool,
+    git_hook: bool,
+    words: Vec<String>,
+    unicode: bool,
+    local_app_data: Option<OsString>,
+}
+
+impl Decision {
+    /// What the decision of a run with `request` sees under `covering_parent`, read from `environment`.
+    fn of(request: &RunRequest, environment: &Environment, covering_parent: bool) -> Decision {
+        Decision {
+            covering_parent,
+            local: request.local,
+            git_hook: environment.git_index_file.as_deref().is_some_and(|value| !value.is_empty()),
+            words: request.command.iter().map(|word| word.to_string_lossy().into_owned()).collect(),
+            unicode: request.command.iter().all(|word| word.to_str().is_some()),
+            local_app_data: environment.local_app_data.clone(),
+        }
+    }
+
+    /// The inputs the decision had, with `slot` in place of the run's own.
+    fn inputs(&self, slot: gate_router::Slot) -> Inputs<'_> {
+        Inputs {
+            slot,
+            covering_parent: self.covering_parent,
+            local: self.local,
+            git_hook: self.git_hook,
+            words: &self.words,
+        }
+    }
 }
 
 /// Decides where `request`'s command runs and says the decision's lines, on stderr and in the log: why a command runs
@@ -92,18 +138,10 @@ pub(crate) struct Decided {
 /// learnt of the gate's place in its git worktree, and the hash of the warm-up file the routed run's work folder must be
 /// warm with, when the warm-up asks one.
 pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_parent: bool, root: &ResolvedRoot, console: &mut Console) -> Decided {
-    let words: Vec<String> = request.command.iter().map(|word| word.to_string_lossy().into_owned()).collect();
-    let unicode = request.command.iter().all(|word| word.to_str().is_some());
-    let inputs = Inputs {
-        slot: slot(request.slot),
-        covering_parent,
-        local: request.local,
-        git_hook: environment.git_index_file.as_deref().is_some_and(|value| !value.is_empty()),
-        words: &words,
-    };
+    let decision = Decision::of(request, environment, covering_parent);
     let machine = Machine::new(environment, &request.test_seams);
-    let route = match decide(&inputs, &machine) {
-        Route::Routed(_) if !unicode => Route::Local {
+    let route = match decide(&decision.inputs(slot(request.slot)), &machine) {
+        Route::Routed(_) if !decision.unicode => Route::Local {
             reason: Some(LocalReason::Failed {
                 reason: NOT_UNICODE.to_owned(),
             }),
@@ -128,7 +166,22 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
         route,
         placed: machine.found.into_inner(),
         warm_hash,
+        decision,
     }
+}
+
+/// Whether a light run whose routing decision saw `decision` would route on heavy: the decision asked again with the
+/// heavy slot and every other input exactly as the run's own had it, routed only when every word of the command is valid
+/// Unicode (the [`NOT_UNICODE`] rule [`route`] applies). Its git calls run under [`HINT_GIT_LIMIT`], since the run still
+/// holds its light slot, and a call that cannot answer in time means no hint. It reads the routing file and git as the
+/// decision would, and never judges the work folder's warm-up ([`warmed`]), starts one, or says a line.
+pub(crate) fn would_route_on_heavy(decision: &Decision, seams: &TestSeams) -> bool {
+    let machine = Machine::at(
+        decision.local_app_data.as_deref(),
+        git::limit(seams).min(HINT_GIT_LIMIT),
+        git::drain(seams),
+    );
+    decision.unicode && matches!(decide(&decision.inputs(gate_router::Slot::Heavy), &machine), Route::Routed(_))
 }
 
 /// The line a routed run says for the watched variables of the gate's environment it does not send
@@ -326,11 +379,17 @@ pub(crate) struct Machine<'a> {
 impl<'a> Machine<'a> {
     /// The facts of the gate's working folder now, with `environment`'s LOCALAPPDATA and the git limits `seams` set.
     pub(crate) fn new(environment: &'a Environment, seams: &TestSeams) -> Machine<'a> {
+        Machine::at(environment.local_app_data.as_deref(), git::limit(seams), git::drain(seams))
+    }
+
+    /// The facts of the gate's working folder now, reading `local_app_data`'s routing file, with the decision's git
+    /// calls under `git_limit` and their readers under `git_drain`.
+    fn at(local_app_data: Option<&'a OsStr>, git_limit: Duration, git_drain: Duration) -> Machine<'a> {
         Machine {
             folder: std::env::current_dir(),
-            local_app_data: environment.local_app_data.as_deref(),
-            git_limit: git::limit(seams),
-            git_drain: git::drain(seams),
+            local_app_data,
+            git_limit,
+            git_drain,
             found: RefCell::new(Placed::NotAsked),
             config: RefCell::new(None),
         }

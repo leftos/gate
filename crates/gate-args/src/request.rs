@@ -241,6 +241,9 @@ pub struct TestSeams {
     pub heartbeat_ms: Option<u64>,
     pub poll_ms: Option<u64>,
     pub stall_ms: Option<u64>,
+    /// The unpaused wall time under which a passed light run is too short to ask whether its command would route on
+    /// heavy, in milliseconds, in place of the gate's own floor.
+    pub route_hint_floor_ms: Option<u64>,
     /// How long a kill's diagnostics gathering may take before it is cut, in milliseconds, in place of the gate's own
     /// budget.
     pub diagnostics_budget_ms: Option<u64>,

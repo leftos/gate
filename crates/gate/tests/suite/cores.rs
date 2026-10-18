@@ -5,12 +5,31 @@
 //! and asserts the line from those, never from what the command asked for. A gate starved until its command ended may
 //! take no sample, journal no cores and say no line; each case then checks only that no line was said.
 
-use serde_json::Value;
+use std::ffi::OsString;
+use std::fs;
+use std::os::windows::ffi::OsStringExt;
+use std::process::Command;
 
-use crate::support::{CORE_SECOND, Case, Escapee, FAKE_TOOL, GATE, Outcome, cpu_ticks, events, heavy_words, none_words, run_words, wait_until};
+use serde_json::{Value, json};
+
+use crate::routing::{HOST, repo, routed_case};
+use crate::support::{
+    CORE_SECOND, Case, Escapee, FAKE_TOOL, GATE, Outcome, cpu_ticks, events, finish, heavy_words, none_words, run_words, shown, wait_until,
+    write_remote_json,
+};
 
 /// The fields the release line carries the cores in.
 const CORES_FIELDS: [&str; 3] = ["avgCores", "peakCores", "freeCores"];
+
+/// The route hint's form: the whole seconds are the only part a loaded machine changes.
+const ROUTE_HINT: &str = r"\Agate: ran \d+ s on a light slot; on heavy, remote\.json would send this command to a builder\z";
+
+/// The route hint's floor, short so a case need not run 30 s.
+const HINT_FLOOR: [&str; 2] = ["--test-route-hint-floor-ms", "1000"];
+
+/// The routing decision's git calls as the routing cases guard them: a starved gate whose git readers reach their pipes'
+/// ends late still routes.
+const GIT_HANG_GUARDS: [&str; 4] = ["--test-git-limit-ms", "3600000", "--test-git-drain-ms", "600000"];
 
 /// The one release line the gate `pid` journalled in `case`.
 fn release_of(case: &Case, pid: u32) -> Value {
@@ -298,4 +317,126 @@ fn a_no_slot_run_whose_nested_gate_took_a_slot_prints_no_hint() {
         "the parent journals no cores: {release}"
     );
     assert_no_cores_line(&outcome);
+}
+
+/// Asserts that `outcome`'s gate said the route hint just before its passed line, which stays last, so any cores line
+/// was said before it.
+fn assert_route_hint_before_passed(outcome: &Outcome) {
+    let lines: Vec<&str> = outcome.stdout.lines().collect();
+    assert!(lines.len() >= 2, "{outcome:?}");
+    assert!(lines[lines.len() - 1].starts_with("gate: passed in "), "{outcome:?}");
+    let pattern = regex::Regex::new(ROUTE_HINT).expect("the pattern is valid");
+    assert!(
+        pattern.is_match(lines[lines.len() - 2]),
+        "the line before the passed one is the route hint: {outcome:?}"
+    );
+}
+
+/// Asserts that `outcome`'s gate said no route hint.
+fn assert_no_route_hint(outcome: &Outcome) {
+    let pattern = regex::Regex::new(ROUTE_HINT).expect("the pattern is valid");
+    assert!(!outcome.stdout.lines().any(|line| pattern.is_match(line)), "{outcome:?}");
+}
+
+#[test]
+fn a_long_light_pass_whose_command_would_route_on_heavy_says_so() {
+    let case = routed_case("a_long_light_pass_whose_command_would_route_on_heavy_says_so");
+    let mut extra = HINT_FLOOR.to_vec();
+    extra.extend(GIT_HANG_GUARDS);
+
+    let outcome = case.run(&run_words("out.log", &extra, &[r".\tool.exe", "sleep", "2000"]));
+
+    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
+    assert_route_hint_before_passed(&outcome);
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log can be read");
+    let pattern = regex::Regex::new(ROUTE_HINT).expect("the pattern is valid");
+    assert!(log.lines().any(|line| pattern.is_match(line)), "the log holds the route hint: {log}");
+}
+
+#[test]
+fn a_long_light_pass_whose_hint_git_call_cannot_answer_says_nothing() {
+    let case = routed_case("a_long_light_pass_whose_hint_git_call_cannot_answer_says_nothing");
+    let mut extra = HINT_FLOOR.to_vec();
+    // The hint shares the seam: a millisecond is too short for its git call, which then cannot answer, so nothing is
+    // said and the run passes.
+    extra.extend(["--test-git-limit-ms", "1"]);
+
+    let outcome = case.run(&run_words("out.log", &extra, &[r".\tool.exe", "sleep", "2000"]));
+
+    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
+    assert_no_route_hint(&outcome);
+}
+
+#[test]
+fn a_long_light_pass_whose_command_has_a_word_that_is_not_unicode_says_nothing() {
+    let case = routed_case("a_long_light_pass_whose_command_has_a_word_that_is_not_unicode_says_nothing");
+    let mut extra = HINT_FLOOR.to_vec();
+    extra.extend(GIT_HANG_GUARDS);
+    let words = run_words("out.log", &extra, &[r".\tool.exe", "sleep", "2000", "argv"]);
+    let mut command = Command::new(GATE);
+    case.prepare(&mut command, &words);
+    // A lone surrogate is not valid Unicode; fake-tool's `argv` step prints the words after its own and the command ends
+    // 0, so only the hint's own rule keeps the line quiet.
+    command.arg(OsString::from_wide(&[0xD800]));
+
+    let outcome = finish(command);
+
+    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
+    assert_no_route_hint(&outcome);
+}
+
+#[test]
+fn a_long_light_pass_whose_command_matches_no_pattern_says_nothing() {
+    let case = routed_case("a_long_light_pass_whose_command_matches_no_pattern_says_nothing");
+    let routing = json!({ "host": HOST, "repos": { repo(&case): ["*nothing*"] } });
+    write_remote_json(&case, &routing.to_string());
+    let mut extra = HINT_FLOOR.to_vec();
+    extra.extend(GIT_HANG_GUARDS);
+
+    let outcome = case.run(&run_words("out.log", &extra, &[r".\tool.exe", "sleep", "2000"]));
+
+    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
+    assert_no_route_hint(&outcome);
+}
+
+#[test]
+fn a_long_light_local_run_says_nothing() {
+    let case = routed_case("a_long_light_local_run_says_nothing");
+    let mut extra = vec!["--local"];
+    extra.extend(HINT_FLOOR);
+    extra.extend(GIT_HANG_GUARDS);
+
+    let outcome = case.run(&run_words("out.log", &extra, &[r".\tool.exe", "sleep", "2000"]));
+
+    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
+    assert_no_route_hint(&outcome);
+}
+
+#[test]
+fn a_long_light_failure_says_nothing() {
+    let case = routed_case("a_long_light_failure_says_nothing");
+    let mut extra = HINT_FLOOR.to_vec();
+    extra.extend(GIT_HANG_GUARDS);
+
+    let outcome = case.run(&run_words("out.log", &extra, &[r".\tool.exe", "sleep", "2000", "exit", "1"]));
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: FAILED (status 1)"), "{outcome:?}");
+    assert_no_route_hint(&outcome);
+}
+
+#[test]
+fn a_long_heavy_run_says_no_route_hint() {
+    let case = routed_case("a_long_heavy_run_says_no_route_hint");
+    let steps = case.folder().join("stub.txt");
+    fs::write(&steps, "refuse busy").expect("the step file can be written");
+    let steps = shown(&steps);
+    let mut extra = vec!["--test-remote-client", steps.as_str()];
+    extra.extend(HINT_FLOOR);
+    extra.extend(GIT_HANG_GUARDS);
+
+    let outcome = case.run(&heavy_words("out.log", &extra, &[r".\tool.exe", "sleep", "2000"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_no_route_hint(&outcome);
 }

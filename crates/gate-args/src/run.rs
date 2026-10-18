@@ -44,6 +44,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     SampleMs,
     #[cfg(feature = "test-seams")]
+    RouteHintFloorMs,
+    #[cfg(feature = "test-seams")]
     HeartbeatMs,
     #[cfg(feature = "test-seams")]
     PollMs,
@@ -226,6 +228,15 @@ impl RunBuilder {
         self.env_words
     }
 
+    /// Pushes the `--env` word `value` at the position of the run's next `--env` word, or the problem of a pair it
+    /// holds, read from the builder's forward lookup.
+    fn env_word(&mut self, value: &str) -> Result<(), Problem> {
+        let position = self.next_env_word();
+        let forward = self.forward.0;
+        self.env.push(values::env_pair(value, position, forward)?);
+        Ok(())
+    }
+
     /// Reads `option`'s value, spelled `spelled` by the caller; an empty value is no value.
     pub(crate) fn value(&mut self, option: ValueOption, spelled: &str, value: &str) {
         if !self.first_time(RunOption::Value(option), spelled) {
@@ -286,14 +297,12 @@ impl RunBuilder {
             ValueOption::Cores => self.cores = Some(values::above_zero_u32(spelled, value)?),
             ValueOption::Seconds => self.seconds = Some(values::in_range(spelled, value, 1, values::MAX_BURN_SECONDS)?),
             ValueOption::BringTracked => self.bring_tracked.push(value.to_owned()),
-            ValueOption::Env => {
-                let position = self.next_env_word();
-                let forward = self.forward.0;
-                self.env.push(values::env_pair(value, position, forward)?);
-            }
+            ValueOption::Env => self.env_word(value)?,
             ValueOption::Builder => self.builder = Some(value.to_owned()),
             #[cfg(feature = "test-seams")]
             ValueOption::SampleMs => self.test_seams.sample_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::RouteHintFloorMs => self.test_seams.route_hint_floor_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::HeartbeatMs => self.test_seams.heartbeat_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
