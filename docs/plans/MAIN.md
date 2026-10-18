@@ -11,9 +11,8 @@
 - [/] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [/] GATE-440 Map and trial routing all of herdr-gpui's, yaat-server's and agent-park's heavy work — High · Remote
 - [ ] GATE-442 Extend a routed run's timeout when its work folder is cold, and tell the caller to prewarm — High · Remote
-- [ ] GATE-443 Say --cd when a heavy command works in another worktree — High · Remote
-- [ ] GATE-447 Give gates started inside a routed run a watchdog on the builder — High · Remote
-- [ ] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
+- [ ] GATE-453 Route a warm-up repo's cold runs instead of running them here — High · Remote
+- [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [ ] GATE-451 Make herdr-gpui's WSL command families routable to the builder — High · Remote
 
 ## Remote
@@ -120,6 +119,11 @@
 - [ ] GATE-438 Stop the elevated ssh session trusting the builder user's profile (bare pwsh, HKCU environment, cmd AutoRun)
 - [ ] GATE-446 Judge the builder's installed gate.exe before the push runs it elevated
 - [ ] GATE-448 Read a Godot --script path against --path when deciding a route
+- [ ] GATE-455 Escape the command word in the outside-the-worktree line
+- [ ] GATE-456 End or re-slot a gate that outlives its box run
+- [ ] GATE-460 Judge the --cd tree lookup by final paths, not spellings
+- [ ] GATE-461 Make the cold-run raise hold for every first run and keep cold runs out of learned durations
+- [ ] GATE-462 Pin the in-box gate's wiring with tests that fail on revert
 
 ## Cutover sweep
 
@@ -193,3 +197,7 @@
 - [ ] GATE-420 Say why when install cannot read the installed gate.exe
 - [ ] GATE-433 Stop the test suite leaving gate-* scratch folders in TEMP
 - [ ] GATE-434 Give the cli suite's plain-run cases a ceiling a busy machine cannot cross
+- [ ] GATE-454 Give a first install's failed build a log to point at
+- [ ] GATE-457 Close the slim launcher's leftover edge cases
+- [ ] GATE-458 Make gate cutover's flag lines true now that the launcher ignores the flag
+- [ ] GATE-459 Fix the rare job-query overflow that fails a run's end
