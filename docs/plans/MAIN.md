@@ -10,11 +10,8 @@
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [/] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [/] GATE-440 Map and trial routing all of herdr-gpui's, yaat-server's and agent-park's heavy work — High · Remote
-- [ ] GATE-442 Extend a routed run's timeout when its work folder is cold, and tell the caller to prewarm — High · Remote
-- [ ] GATE-453 Route a warm-up repo's cold runs instead of running them here — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
-- [ ] GATE-451 Make herdr-gpui's WSL command families routable to the builder — High · Remote
-- [ ] GATE-463 Prove the in-box gate works on the elevated builder — High · Remote
+- [!] GATE-451 Make herdr-gpui's WSL command families routable to the builder — High · Remote
 
 ## Remote
 
@@ -125,6 +122,9 @@
 - [ ] GATE-460 Judge the --cd tree lookup by final paths, not spellings
 - [ ] GATE-461 Make the cold-run raise hold for every first run and keep cold runs out of learned durations
 - [ ] GATE-462 Pin the in-box gate's wiring with tests that fail on revert
+- [ ] GATE-464 End a routed WSL command's VM processes when the box kills its run
+- [ ] GATE-465 Route a run's --env value that names a path inside the worktree to the builder's work folder
+- [ ] GATE-467 Count a nested gate started under a packaged pwsh as its parent's progress
 
 ## Cutover sweep
 
