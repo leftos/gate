@@ -10,7 +10,8 @@ use gate_state::{StateRoot, default_root};
 pub(crate) struct Environment {
     pub state_dir: Option<OsString>,
     pub local_app_data: Option<OsString>,
-    /// `GIT_INDEX_FILE`, which git sets for a hook: a gate inside one never routes.
+    /// `GIT_INDEX_FILE`, which git sets for a hook: a gate inside one routes only when `remote.json`'s `hooks` names its
+    /// repo.
     pub git_index_file: Option<OsString>,
     /// `GATE_SLOT_HELD`, the slot marker of the gate this one runs under, if any.
     pub slot_held: Option<OsString>,

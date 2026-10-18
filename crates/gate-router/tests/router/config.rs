@@ -462,6 +462,57 @@ fn a_bad_warmup_value_consents_to_none_and_leaves_the_rest_of_the_file_alone() {
     }
 }
 
+/// The routing file listing `g` with `hooks` holding `value`.
+fn hooks_file(value: &str) -> Config {
+    Config::parse(&format!(
+        r#"{{"host": "builder-1", "slots": 2, "repos": {{"g": ["x"]}}, "siblings": {{"g": ["b"]}}, "hooks": {value}}}"#
+    ))
+    .expect("routing reads the file whatever hooks holds")
+}
+
+#[test]
+fn hooks_names_a_repo_in_any_letter_case() {
+    let config = hooks_file(r#"["Yaat", "gate"]"#);
+
+    assert_eq!(config.hooks_allowed("yaat"), Ok(true), "the repo name in any case");
+    assert_eq!(config.hooks_allowed("GATE"), Ok(true), "the repo name in any case");
+    assert_eq!(config.hooks_allowed("g"), Ok(false), "a repo it does not list");
+    assert!(config.hooks_name_a_repo(), "the list names repos");
+    let empty = hooks_file("[]");
+    assert_eq!(empty.hooks_allowed("g"), Ok(false), "an empty list");
+    assert!(!empty.hooks_name_a_repo(), "an empty list names no repo");
+    let keyed = Config::parse(r#"{"host": "builder-1", "repos": {}, "Hooks": ["g"]}"#).expect("usable");
+    assert_eq!(keyed.hooks_allowed("g"), Ok(true), "the key in any case");
+}
+
+#[test]
+fn hooks_absent_consents_no_repo() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"g": ["x"]}}"#).expect("usable");
+
+    assert_eq!(config.hooks_allowed("g"), Ok(false));
+    assert!(!config.hooks_name_a_repo(), "no key names no repo");
+}
+
+#[test]
+fn an_unusable_hooks_value_consents_no_repo_and_keeps_the_rest_of_the_file() {
+    for (value, problem) in [
+        (r#"{"g": true}"#, "hooks must be an array of repo names"),
+        (r#""g""#, "hooks must be an array of repo names"),
+        ("null", "hooks must be an array of repo names"),
+        (r#"["g", ""]"#, "hooks[1] is not a non-empty string"),
+        (r#"["g", 3]"#, "hooks[1] is not a non-empty string"),
+        (r#"[["g"]]"#, "hooks[0] is not a non-empty string"),
+    ] {
+        let config = hooks_file(value);
+        assert_eq!(config.hooks_allowed("g"), Err(problem), "{value}");
+        assert!(!config.hooks_name_a_repo(), "{value}");
+        assert_eq!(config.host(), "builder-1", "{value}");
+        assert_eq!(config.slots(), 2, "{value}");
+        assert_eq!(pattern_texts(&config, "g"), ["x"], "{value}");
+        assert_eq!(config.allowed_siblings("g"), Ok(&["b".to_owned()][..]), "{value}");
+    }
+}
+
 /// The routing file listing `g` with `desktop` holding `value`.
 fn desktop_file(value: &str) -> Config {
     Config::parse(&format!(

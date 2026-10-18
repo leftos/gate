@@ -339,6 +339,7 @@ impl Answer<'_> {
             sdk,
             workloads: declared.manifest.workloads,
             consent_problem: None,
+            hooks_problem: None,
             siblings: Vec::new(),
             created,
             siblings_skipped: siblings.declares,

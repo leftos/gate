@@ -857,6 +857,30 @@ fn check_an_unusable_warmup_value_with_a_warm_up_file_says_why_and_exits_1() {
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
 }
 
+/// A routing file whose `hooks` is no array of repo names.
+const BAD_HOOKS_ROUTING: &str = r#"{"host": "builder-1", "repos": {"app": ["*"]}, "hooks": "app"}"#;
+
+/// A `hooks` value that cannot be used fails the check once, saying why.
+#[test]
+fn check_says_an_unusable_hooks_value() {
+    let case = repo_case("check_bad_hooks_value");
+    write_remote_json(&case, BAD_HOOKS_ROUTING);
+
+    let outcome = check(&case, &[], &[]);
+
+    assert_eq!(
+        lines(&outcome.stdout),
+        [
+            format!("check: here: app at {}", root(&case)).as_str(),
+            "check: here: app declares no toolchain",
+            "check: here: remote.json: hooks must be an array of repo names",
+            "check: here: 1 missing, 0 too old",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
 /// A `warmup` value that cannot be used says nothing for a repo with no warm-up file, so one bad value never fails
 /// the check of every repo on the PC.
 #[test]

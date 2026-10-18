@@ -56,7 +56,7 @@ The PowerShell form (gate -Log <path> -TimeoutSeconds <n> -Slot <kind> [...] -- 
 
 /// The git variables a caller's environment, such as a git hook around the suite, may hold that point git at another
 /// repository, index, object store or config; no case's gate or git gets them, and a gate with `GIT_INDEX_FILE` set
-/// never routes.
+/// routes only when `remote.json`'s `hooks` names its repo.
 pub const GIT_REDIRECTS: [&str; 6] = [
     "GIT_DIR",
     "GIT_WORK_TREE",

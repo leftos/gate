@@ -8,7 +8,7 @@ Every repo that runs heavy gates is in scope, and every heavy command family in 
 
 - it routes;
 - it is booked with what blocks it (a GATE issue, High when it blocks the repo's adoption);
-- it stays local, but only for one of two reasons, named beside the family. Either it cannot run anywhere but this PC (a WSL distro on `/mnt/x`, an install into this PC's own folders, a git operation that writes this checkout's refs), or its run time is measured as shorter than what routing adds: the push, the outputs, the compression and the call overhead, taken from the repo's routed runs in the journal.
+- it stays local, but only for one of two reasons, named beside the family. Either it cannot run anywhere but this PC (a WSL distro on `/mnt/x`, an install into this PC's own folders, a git operation that writes this checkout's refs: any command whose first word is `git` or `prek`, a `git commit` included, stays local silently whatever its hooks need), or its run time is measured as shorter than what routing adds: the push, the outputs, the compression and the call overhead, taken from the repo's routed runs in the journal.
 
   A reason that work can remove does not keep a family local. It is a blocker to book. Examples: a tool or SDK the builder lacks, a window or GL the desktop route can serve, a `--local` with no recorded cause, an outputs list that would need to grow.
 
@@ -37,6 +37,14 @@ A repo with a routed command that needs the builder's logged-on desktop (a GUI t
 Without the consent the command runs here with `gate: not routed: desktop pattern '<pattern>' not allowed in remote.json`.
 
 A `.gate/desktop.toml` the gate cannot use keeps every routed command of the repo here with `gate: not routed: .gate/desktop.toml: <problem>`, so fix it before relying on routing. A desktop run holds a remote slot while it waits for the desktop, up to the usual 60 s remote wait. Format and rules: [design.md](design.md#remotejson).
+
+## A repo whose git hooks run heavy checks
+
+A heavy gate started inside a git hook stays local silently unless `remote.json` names its repo in `hooks`, an array of repo names matched in any letter case: `"hooks": ["<repo>"]`. A value that is not an array of non-empty strings consents to no repo, and the rest of the file is still read ([design.md, remote.json](design.md#remotejson)).
+
+The key is for check-only hook commands (a build, clippy, a format check). A routed fixer's patch comes back to the worktree under prek's stash, so a fixing hook stays local.
+
+The hook entry calls the gate itself, `gate run ... -- <heavy command>`, and the repo's patterns must match that command. The `git commit` that runs the hook is gated on `--slot none`, so it does not cover its hook's gate and the hook's gate takes its own slot (and routes). The `git commit` itself stays local.
 
 ## A repo whose short runs a cold folder would push past their ceiling
 

@@ -219,6 +219,90 @@ fn a_git_hook_stays_local() {
     assert_eq!(facts.asked(), ["config"]);
 }
 
+/// A gate at the root of `yaat` under a routing file routing `dotnet *` whose `hooks` value is `hooks` (no key at all
+/// for `None`).
+fn hooks_facts(hooks: Option<&str>) -> FakeFacts {
+    let key = hooks.map_or_else(String::new, |value| format!(r#", "hooks": {value}"#));
+    let config = Config::parse(&format!(r#"{{"host": "builder-1", "slots": 2, "repos": {{"yaat": ["dotnet *"]}}{key}}}"#)).expect("usable");
+    FakeFacts::with_config(config)
+}
+
+#[test]
+fn a_hook_run_in_a_consented_repo_routes() {
+    let command = words(&["dotnet", "test"]);
+    let inputs = Inputs {
+        git_hook: true,
+        ..heavy(&command)
+    };
+    let facts = hooks_facts(Some(r#"["Yaat"]"#));
+    let run = routed(decide(&inputs, &facts));
+
+    assert_eq!(run.repo, "yaat");
+    assert_eq!(run.pattern, "dotnet *", "the repo's usual pattern match");
+    assert_eq!(facts.asked(), ["config", "place", "file_in_folder dotnet", "head_sha"]);
+}
+
+#[test]
+fn a_hook_run_in_a_repo_hooks_does_not_name_stays_local_silently() {
+    let command = words(&["dotnet", "test"]);
+    let inputs = Inputs {
+        git_hook: true,
+        ..heavy(&command)
+    };
+    let facts = hooks_facts(Some(r#"["other"]"#));
+    let route = decide(&inputs, &facts);
+
+    assert_eq!(route, SILENT);
+    assert_eq!(local_line(&route), None, "no line");
+    assert_eq!(facts.asked(), ["config", "place"], "the repo is read, nothing more");
+    assert_eq!(facts.siblings_read.get(), 0, "no siblings file is read for a repo hooks does not name");
+}
+
+#[test]
+fn a_hook_run_whose_place_cannot_be_read_stays_local_silently() {
+    let command = words(&["dotnet", "test"]);
+    let inputs = Inputs {
+        git_hook: true,
+        ..heavy(&command)
+    };
+    let facts = FakeFacts {
+        place: Err("git rev-parse --show-toplevel failed".to_owned()),
+        ..hooks_facts(Some(r#"["yaat"]"#))
+    };
+
+    assert_eq!(decide(&inputs, &facts), SILENT);
+    assert_eq!(facts.asked(), ["config", "place"], "no git fact is asked after the failed place");
+}
+
+#[test]
+fn a_hook_run_asks_git_nothing_more_when_hooks_names_no_repo() {
+    let command = words(&["dotnet", "test"]);
+    let inputs = Inputs {
+        git_hook: true,
+        ..heavy(&command)
+    };
+    for hooks in [None, Some("[]"), Some(r#""yaat""#), Some(r#"[""]"#)] {
+        let facts = hooks_facts(hooks);
+        assert_eq!(decide(&inputs, &facts), SILENT, "{hooks:?}");
+        assert_eq!(facts.asked(), ["config"], "{hooks:?}");
+        assert_eq!(facts.siblings_read.get(), 0, "{hooks:?}");
+    }
+}
+
+#[test]
+fn a_consented_hook_run_whose_first_word_is_git_or_prek_stays_local() {
+    for command in [&["git", "commit"][..], &["prek", "run"]] {
+        let words = words(command);
+        let inputs = Inputs {
+            git_hook: true,
+            ..heavy(&words)
+        };
+        let facts = hooks_facts(Some(r#"["yaat"]"#));
+        assert_eq!(decide(&inputs, &facts), SILENT, "{command:?}");
+        assert_eq!(facts.asked(), ["config"], "{command:?}");
+    }
+}
+
 #[test]
 fn no_non_empty_word_or_a_git_or_prek_command_stays_local() {
     let commands: [&[&str]; 9] = [

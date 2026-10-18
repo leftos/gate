@@ -376,6 +376,27 @@ fn inside_a_git_hook_a_heavy_gate_stays_here_silently() {
 }
 
 #[test]
+fn a_gate_inside_a_git_hook_routes_when_remote_json_consents_its_repo() {
+    let case = routed_case("routing-hook-routed");
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["*tool*", "*dotnet.exe*", "*dotnet.cmd*"] },
+        "hooks": [repo(&case)],
+    });
+    write_remote_json(&case, &routing.to_string());
+    let steps = shown(&stub(&case, &["status 0"]));
+    let mut command = case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", "ran here"]));
+    command.env("GIT_INDEX_FILE", "x");
+    let outcome = finish(command);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("not routed"), "the consented hook run routes: {outcome:?}");
+    let events = events(&case);
+    assert_eq!(names(&events), ["queue", "take", "release"], "{events:#?}");
+    assert!(events.iter().all(has_remote_tag), "{events:#?}");
+}
+
+#[test]
 fn an_unusable_routing_file_is_ignored_with_one_line() {
     let case = Case::new("routing-unusable");
     let path = write_remote_json(&case, "{ not json");

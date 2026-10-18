@@ -5,7 +5,8 @@
 //! repo name's globs for the ignored files a routed run sends) and the optional `siblings` (each repo name's list of
 //! the sibling folder names a routed run of it may carry) and the optional `warmup` (the repo names whose
 //! `.gate/warmup.toml` may warm their builder work folders) and the optional `desktop` (each repo name's list of the
-//! `.gate/desktop.toml` patterns whose commands may run on the builder's desktop). Keys match in any letter case and unknown keys are ignored.
+//! `.gate/desktop.toml` patterns whose commands may run on the builder's desktop) and the optional `hooks` (the repo
+//! names whose gates started inside a git hook may route). Keys match in any letter case and unknown keys are ignored.
 //! The text may hold `//` and `/* */` comments and trailing commas, as the
 //! PowerShell gate's JSON reader allows; single-quoted strings are refused. A file that breaks a rule is unusable as a
 //! whole, for the reason the PowerShell gate gives (or, for a host ssh or git would misread, a reason of its own),
@@ -45,6 +46,9 @@ pub struct Config {
     warmup: Result<Vec<String>, String>,
     /// Each repo name's allowed desktop patterns, or why `desktop` cannot be used, which allows none.
     desktop: Result<Vec<(String, Vec<String>)>, String>,
+    /// The repo names whose gates started inside a git hook may route, or why `hooks` cannot be used, which consents to
+    /// none.
+    hooks: Result<Vec<String>, String>,
 }
 
 /// A routing file that is there but cannot be used: not a file, unreadable, or refused by [`Config::parse`].
@@ -81,7 +85,8 @@ impl Config {
     /// [`Config::builders`] gives its reason. A bad `siblings` leaves it usable too, allowing no sibling, and
     /// [`Config::allowed_siblings`] gives its reason. So does a bad `warmup`, consenting to no warm-up, and
     /// [`Config::warmup_consented`] gives its reason, and a bad `desktop`, allowing no desktop pattern, and
-    /// [`Config::allowed_desktop`] gives its reason.
+    /// [`Config::allowed_desktop`] gives its reason, and a bad `hooks`, consenting to no hook routing, and
+    /// [`Config::hooks_allowed`] gives its reason.
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = strict_json(text.strip_prefix('\u{feff}').unwrap_or(text));
         // PowerShell's JSON reader gives no value at all for blank text, which is then no JSON object.
@@ -112,6 +117,7 @@ impl Config {
             siblings: read_siblings(&data),
             warmup: read_warmup_consent(&data),
             desktop: read_desktop_consent(&data),
+            hooks: read_hooks_consent(&data),
         })
     }
 
@@ -141,6 +147,30 @@ impl Config {
         match &self.warmup {
             Err(problem) => Err(problem),
             Ok(names) => Ok(names.iter().any(|name| eq_ignoring_case(name, repo))),
+        }
+    }
+
+    /// Whether `hooks` lets a gate started inside a git hook in `repo` route, its repo name matched in any letter case:
+    /// `false` when it does not name the repo or there is no such key.
+    ///
+    /// # Errors
+    ///
+    /// Why `hooks` cannot be used: not an array of non-empty strings. Such a value consents to no repo, and the rest of
+    /// the file is read whatever it holds.
+    pub fn hooks_allowed(&self, repo: &str) -> Result<bool, &str> {
+        match &self.hooks {
+            Err(problem) => Err(problem),
+            Ok(names) => Ok(names.iter().any(|name| eq_ignoring_case(name, repo))),
+        }
+    }
+
+    /// Whether `hooks` names any repo at all: `false` when the key is missing, the list is empty, or its value cannot
+    /// be used ([`Config::hooks_allowed`]).
+    #[must_use]
+    pub fn hooks_name_a_repo(&self) -> bool {
+        match &self.hooks {
+            Ok(names) => !names.is_empty(),
+            Err(_) => false,
         }
     }
 
@@ -486,6 +516,25 @@ fn read_warmup_consent(data: &Map<String, Value>) -> Result<Vec<String>, String>
         .map(|(index, item)| match item {
             Value::String(name) if !name.is_empty() => Ok(name.clone()),
             _ => Err(format!("warmup[{index}] is not a non-empty string")),
+        })
+        .collect()
+}
+
+/// The `hooks` list: the repo names whose gates started inside a git hook may route, in file order; none when the key
+/// is missing.
+fn read_hooks_consent(data: &Map<String, Value>) -> Result<Vec<String>, String> {
+    let Some(value) = property(data, "hooks") else {
+        return Ok(Vec::new());
+    };
+    let Value::Array(items) = value else {
+        return Err("hooks must be an array of repo names".to_owned());
+    };
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| match item {
+            Value::String(name) if !name.is_empty() => Ok(name.clone()),
+            _ => Err(format!("hooks[{index}] is not a non-empty string")),
         })
         .collect()
 }

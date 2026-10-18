@@ -442,17 +442,15 @@ impl RemoteRun {
 
 /// Where a gate's command runs. In order: only a heavy gate routes; a covering or lending parent keeps it here; `--local`
 /// keeps it here saying so; then the routing file is read, and no file keeps it here, an unusable one saying it was
-/// ignored; a git hook, no non-empty word, or a first word whose file name without extension is `git` or `prek` keep it
-/// here; so does a folder in no git worktree, a repo the routing file does not list, and words (paths rewritten, joined
-/// by single spaces) none of the repo's patterns match, the first that matches winning. A first word the rewrite sends
-/// as a program's name that names `git` or `prek` keeps it here too. A matched command still runs
-/// here, saying why, when the worktree's `.gate/siblings.toml` has a problem or declares a sibling the routing file's
-/// `siblings` does not allow the repo, or declares siblings from a root folder name the builder cannot lay out, a
-/// sibling named like that folder or one with no git worktree beside the root; when its `.gate/desktop.toml` has a
-/// problem, or the first pattern it declares that the words match is not one the routing file's `desktop` allows the
-/// repo, listed exactly; when
-/// a word names a path outside the worktree and its siblings; or when the gate's folder holds nothing the snapshot
-/// sends; and so does one whose facts cannot be read.
+/// ignored; a git hook whose `hooks` names no repo, no non-empty word, or a first word whose file name without extension
+/// is `git` or `prek` keep it here; so does a folder in no git worktree, a repo the routing file does not list, a git
+/// hook whose repo its `hooks` does not name, and words (paths rewritten, joined by single spaces) none of the repo's
+/// patterns match, the first that matches winning. A first word the rewrite sends as a program's name that names `git`
+/// or `prek` keeps it here too. A matched command still runs here, saying why, when the worktree's `.gate/siblings.toml` has a problem or declares a
+/// sibling the routing file's `siblings` does not allow the repo, or declares siblings from a root folder name the builder cannot lay out, a
+/// sibling named like that folder or one with no git worktree beside the root; when its `.gate/desktop.toml` has a problem, or the first pattern it
+/// declares that the words match is not one the routing file's `desktop` allows the repo, listed exactly; when a word names a path outside the
+/// worktree and its siblings; or when the gate's folder holds nothing the snapshot sends; and so does one whose facts cannot be read.
 #[must_use]
 pub fn decide(inputs: &Inputs<'_>, facts: &dyn Facts) -> Route {
     match route(inputs, facts) {
@@ -542,7 +540,7 @@ struct Matched {
 
 fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<RemoteRun, Here> {
     let config = eligible(inputs, facts)?;
-    let matched = matched(&config, inputs.words, facts)?;
+    let matched = matched(&config, inputs.git_hook, inputs.words, facts)?;
     if let Some(word) = matched.outside.clone() {
         return Err(Some(LocalReason::Outside { word }));
     }
@@ -567,7 +565,10 @@ fn eligible(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<Config, Here> {
         .config()
         .map_err(|ConfigProblem { path, reason }| Some(LocalReason::Ignored { path, reason }))?
         .ok_or(None)?;
-    if inputs.git_hook || stays_local(inputs.words) {
+    if stays_local(inputs.words) {
+        return Err(None);
+    }
+    if inputs.git_hook && !config.hooks_name_a_repo() {
         return Err(None);
     }
     Ok(config)
@@ -784,9 +785,19 @@ fn file_stem(path: &str) -> &str {
 /// with the siblings it declares, or with none when it has a problem, then matched, the first pattern that matches
 /// winning; only a matched command is kept here for a sibling ([`check_siblings`]). A command whose first word the
 /// rewrite sent as a program's name ([`Rewritten::program_named`]) that stays on this PC by that name ([`stays_local`])
-/// is no match: a `git` or `prek` under a path is read as one however the path is spelled.
-fn matched(config: &Config, words: &[String], facts: &dyn Facts) -> Result<Matched, Here> {
-    let place = facts.place().map_err(|reason| Some(failed(&reason)))?.ok_or(None)?;
+/// is no match: a `git` or `prek` under a path is read as one however the path is spelled. A gate started inside a git
+/// hook whose repo the routing file's `hooks` does not name stays here silently, before its siblings file is read, and
+/// so does one whose place cannot be read.
+fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts) -> Result<Matched, Here> {
+    let place = match facts.place() {
+        Ok(Some(place)) => place,
+        Ok(None) => return Err(None),
+        Err(_) if git_hook => return Err(None),
+        Err(reason) => return Err(Some(failed(&reason))),
+    };
+    if git_hook && config.hooks_allowed(&repo_name(&place.checkout)) != Ok(true) {
+        return Err(None);
+    }
     let opened = open(config, place, facts)?;
     let sent = rewritten(&opened.place, &opened.leaf, declared_pairs(&opened.siblings), words, facts);
     if sent.program_named && stays_local(&sent.words) {

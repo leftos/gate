@@ -204,6 +204,7 @@ fn checked(place: &Place, limit: Duration) -> Checked {
         (tools, sdk)
     });
     let repo = repo_name(&place.checkout);
+    let hooks_problem = hooks_problem(&repo);
     let (allowed, consent_problem) = match allowed_siblings(&repo) {
         None => (None, None),
         Some(Ok(names)) => (Some(names), None),
@@ -223,6 +224,7 @@ fn checked(place: &Place, limit: Duration) -> Checked {
         sdk,
         workloads: declared.manifest.workloads,
         consent_problem,
+        hooks_problem,
         siblings,
         created: Vec::new(),
         siblings_skipped: false,
@@ -566,6 +568,16 @@ fn sibling(root: &str, name: String) -> Sibling {
 /// ([`gate_router::Config::allowed_siblings`], an exact match), or why its `siblings` value cannot be used, which
 /// allows none. `None` when routing would never route the repo, so asks no consent: no routing file, one routing
 /// ignores, or one whose `repos` does not list it.
+/// Why this PC's routing file's `hooks` value cannot be used, if it cannot: the reason the router's `hooks_allowed`
+/// gives, whatever the repo. A routing file that cannot be read at all is no such problem, as its own line says it.
+fn hooks_problem(repo: &str) -> Option<String> {
+    let path = route::remote_json_path(std::env::var_os("LOCALAPPDATA").as_deref())?;
+    let Ok(Some(config)) = route::read_remote_json(&path) else {
+        return None;
+    };
+    config.hooks_allowed(repo).err().map(str::to_owned)
+}
+
 fn allowed_siblings(repo: &str) -> Option<Result<Vec<String>, String>> {
     let path = route::remote_json_path(std::env::var_os("LOCALAPPDATA").as_deref())?;
     let config = route::read_remote_json(&path).ok().flatten()?;

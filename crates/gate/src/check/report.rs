@@ -153,6 +153,8 @@ pub(crate) struct Checked {
     pub workloads: Vec<String>,
     /// Why this PC's routing file's `siblings` value cannot be used, when the repo declares siblings and it cannot.
     pub consent_problem: Option<String>,
+    /// Why this PC's routing file's `hooks` value cannot be used, when it cannot.
+    pub hooks_problem: Option<String>,
     /// The declared siblings, in declared order.
     pub siblings: Vec<Sibling>,
     /// The folders a builder's preflight said it created, in its order; none for this PC.
@@ -265,6 +267,9 @@ fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
         items.push(Item::new(text, Kind::Unchecked));
     }
     if let Some(problem) = &checked.consent_problem {
+        items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
+    }
+    if let Some(problem) = &checked.hooks_problem {
         items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
     }
     items.extend(checked.siblings.iter().map(sibling_item));
@@ -536,6 +541,7 @@ mod tests {
             sdk: None,
             workloads: Vec::new(),
             consent_problem: None,
+            hooks_problem: None,
             siblings: Vec::new(),
             created: Vec::new(),
             siblings_skipped: false,
@@ -1182,6 +1188,24 @@ mod tests {
             Said {
                 lines: one_item(
                     r"check: here: warm-up: remote.json: warmup[0] is not a non-empty string\u{202e}",
+                    "check: here: 1 missing, 0 too old"
+                ),
+                status: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_hooks_value_that_cannot_be_used_is_an_escaped_missing_line() {
+        let checked = Checked {
+            hooks_problem: Some("hooks[0] is not a non-empty string\u{202e}".to_owned()),
+            ..checked(Vec::new())
+        };
+        assert_eq!(
+            said(HERE, &checked),
+            Said {
+                lines: one_item(
+                    r"check: here: remote.json: hooks[0] is not a non-empty string\u{202e}",
                     "check: here: 1 missing, 0 too old"
                 ),
                 status: 1,
