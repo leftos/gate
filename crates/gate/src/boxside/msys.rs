@@ -34,12 +34,17 @@ use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIP
 use crate::boxside::payload::escaped;
 use crate::boxside::preflight::Git;
 use crate::environment::Variables;
-use crate::run::{Written, written};
+use crate::run::{Written, is_within, resolved, written};
 
 /// The MSYS keeper, in Git's `usr\bin` folder: it echoes what it reads and stays up until its input ends.
 const KEEPER: &str = "cat.exe";
 /// The MSYS runtime, which marks a `usr\bin` holding [`KEEPER`] as Git's own.
 const RUNTIME: &str = "msys-2.0.dll";
+/// The shell Git's `bin` holds, which a routed command's recipe may name bare: with that folder ahead of the machine
+/// `PATH`, the name resolves to Git's own rather than WSL's `bash.exe` in the system folder.
+const BASH: &str = "bash.exe";
+/// The line a preflight says when no trusted Git `bin` was found for a routed command's `PATH`.
+pub(super) const NO_GIT_BIN: &str = "gate: remote path: Git's bin is not trusted here; bash resolves by the machine PATH";
 /// How many folders above `git.exe` the box looks in for Git's root: those of `cmd\git.exe`, `bin\git.exe` and
 /// `<environment>\bin\git.exe`, such as `ucrt64\bin\git.exe`.
 const ROOT_DEPTH: usize = 3;
@@ -57,6 +62,10 @@ const SAID_CAP: usize = 200;
 /// `|`, which no Windows path holds.
 #[cfg(feature = "test-seams")]
 const STAND_IN: &str = "GATE_TEST_BOX_MSYS_KEEPER";
+/// The test seam that names the folder in place of the trusted Git `bin` a routed command's `PATH` starts with, as the
+/// suite's boxes run from a folder this user owns.
+#[cfg(feature = "test-seams")]
+const GIT_BIN_STAND_IN: &str = "GATE_TEST_BOX_GIT_BIN";
 /// The test seam that sets how long the box waits for the keeper's echo, in milliseconds, in place of 30 s.
 #[cfg(feature = "test-seams")]
 const LIMIT_MS: &str = "GATE_TEST_BOX_MSYS_KEEPER_MS";
@@ -141,6 +150,56 @@ fn usr_bin_above(program: &Path) -> Option<PathBuf> {
         .take(ROOT_DEPTH)
         .map(|root| root.join("usr").join("bin"))
         .find(|folder| folder.join(KEEPER).is_file() && folder.join(RUNTIME).is_file())
+}
+
+/// The folder a routed command's `PATH` starts with: `<Git root>\bin` above the `git.exe` the box finds, when the
+/// folder lies outside the run's own folders `refused` — which no folder a command runs from may lie in — and its
+/// [`BASH`] passes [`gate_win32::check_installed_file`], the check the box's own image gets, which refuses a link or
+/// junction, a network share, and a file or folder whose owner or access list lets anyone but SYSTEM, Administrators or
+/// `TrustedInstaller` change what runs from it. The folder returned is the final path's, in its usual form, never the
+/// name as found; the test seam's folder stands in for both checks. `None` otherwise, and the command keeps the
+/// machine `PATH` it would have had.
+pub(super) fn git_bin(git: &Git, refused: &[PathBuf]) -> Option<PathBuf> {
+    #[cfg(feature = "test-seams")]
+    {
+        if let Ok(folder) = std::env::var(GIT_BIN_STAND_IN) {
+            let folder = PathBuf::from(folder);
+            return outside(&folder, refused).then_some(folder);
+        }
+    }
+    let program = git.program.as_ref().ok()?;
+    let bin = git_bin_above(program)?;
+    if !outside(&bin, refused) {
+        return None;
+    }
+    let bash = bin.join(BASH);
+    gate_win32::check_installed_file(&bash).ok()?;
+    let bash = usual(&std::fs::canonicalize(&bash).ok()?)?;
+    bash.parent().map(Path::to_path_buf)
+}
+
+/// Whether the Git `bin` `bin` lies outside every one of the run's own folders `refused`.
+fn outside(bin: &Path, refused: &[PathBuf]) -> bool {
+    !refused.iter().any(|folder| is_within(&resolved(bin), &resolved(folder)))
+}
+
+/// `path` in its usual form, as the system gives a final path: a `\\?\UNC\` prefix written `\\` and a `\\?\` one left
+/// out; `None` for a path that is not Unicode, which no `PATH` value can carry.
+fn usual(path: &Path) -> Option<PathBuf> {
+    let text = path.to_str()?;
+    match text.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => Some(PathBuf::from(format!(r"\\{rest}"))),
+        None => Some(PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(text))),
+    }
+}
+
+/// The `bin` of the first Git root above `program` whose `usr\bin` holds [`KEEPER`] and [`RUNTIME`] ([`usr_bin_above`])
+/// and whose `bin` holds [`BASH`], the nearest first; `None` when there is none, unchecked ([`git_bin`]).
+fn git_bin_above(program: &Path) -> Option<PathBuf> {
+    let usr_bin = usr_bin_above(program)?;
+    let root = usr_bin.parent()?.parent()?;
+    let bin = root.join("bin");
+    bin.join(BASH).is_file().then_some(bin)
 }
 
 /// Whether the SID `owner`, in its string form, is one of [`TRUSTED_OWNERS`].
@@ -369,7 +428,8 @@ mod tests {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, OpenProcessToken};
 
     use super::{
-        ANSWER_CAP, KEEPER, MsysKeeper, RUNTIME, TRUSTED_OWNERS, echoed, is_trusted_owner, owner_of, read_answer, sid_text, usr_bin, usr_bin_above,
+        ANSWER_CAP, BASH, KEEPER, MsysKeeper, RUNTIME, TRUSTED_OWNERS, echoed, git_bin, git_bin_above, is_trusted_owner, owner_of, read_answer,
+        sid_text, usr_bin, usr_bin_above, usual,
     };
     use crate::boxside::preflight::Git;
     use crate::test_support::temp_dir;
@@ -406,6 +466,13 @@ mod tests {
         vec![git, r"usr\bin\cat.exe", r"usr\bin\msys-2.0.dll"]
     }
 
+    /// A Git install's `usr\bin` and its `bin`, as files relative to its root.
+    fn git_files_with_bin(git: &'static str) -> Vec<&'static str> {
+        let mut files = git_files(git);
+        files.push(r"bin\bash.exe");
+        files
+    }
+
     #[test]
     fn git_s_usr_bin_is_found_above_each_layout_of_git_exe() {
         for (name, git) in [
@@ -436,6 +503,68 @@ mod tests {
         let git = r"a\b\c\git.exe";
         let root = tree("deep", &git_files(git));
         assert_eq!(usr_bin_above(&root.join(git)), None);
+    }
+
+    #[test]
+    fn git_s_bin_is_found_above_each_layout_of_git_exe() {
+        for (name, git) in [
+            ("bin-cmd", r"cmd\git.exe"),
+            ("bin-direct", r"bin\git.exe"),
+            ("bin-mingw64", r"mingw64\bin\git.exe"),
+            ("bin-ucrt64", r"ucrt64\bin\git.exe"),
+        ] {
+            let root = tree(name, &git_files_with_bin(git));
+            assert_eq!(git_bin_above(&root.join(git)), Some(root.join(r"bin")), "{git}");
+        }
+    }
+
+    #[test]
+    fn a_git_root_without_a_bash_in_its_bin_has_no_git_bin() {
+        let root = tree("no-bash", &git_files(r"cmd\git.exe"));
+        assert_eq!(git_bin_above(&root.join(r"cmd\git.exe")), None, "no {BASH}");
+    }
+
+    #[test]
+    fn a_git_bin_this_user_owns_is_refused() {
+        let root = tree("user-owned-bin", &git_files_with_bin(r"cmd\git.exe"));
+
+        let found = git_bin(
+            &Git {
+                program: Ok(root.join(r"cmd\git.exe")),
+            },
+            &[],
+        );
+
+        assert_eq!(found, None, "a folder this user owns is not put ahead of the machine PATH");
+    }
+
+    #[test]
+    fn a_git_bin_inside_a_run_folder_is_refused() {
+        let root = tree("refused-bin", &git_files_with_bin(r"cmd\git.exe"));
+        let git = Git {
+            program: Ok(root.join(r"cmd\git.exe")),
+        };
+
+        assert_eq!(
+            git_bin(&git, std::slice::from_ref(&root)),
+            None,
+            "a folder the run writes is not put first"
+        );
+    }
+
+    #[test]
+    fn a_final_path_is_given_in_its_usual_form() {
+        assert_eq!(usual(Path::new(r"\\?\C:\Git\bin")), Some(PathBuf::from(r"C:\Git\bin")), "a drive path");
+        assert_eq!(
+            usual(Path::new(r"\\?\UNC\host\share\bin")),
+            Some(PathBuf::from(r"\\host\share\bin")),
+            "a network path"
+        );
+        assert_eq!(
+            usual(Path::new(r"C:\Git\bin")),
+            Some(PathBuf::from(r"C:\Git\bin")),
+            "a path already usual"
+        );
     }
 
     #[test]

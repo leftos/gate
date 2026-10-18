@@ -1,6 +1,7 @@
 //! `gate box preflight`, the first call of every routed run: readies the work folder and its bare repository as the
 //! PowerShell wrapper's `Initialize-WorkFolder` does, then says the version and warm lines, the new work tree line when
-//! it laid the work folder's tree out now, the boot and SDK lines, and a line for each tool the payload's `Needs` names.
+//! it laid the work folder's tree out now, the boot and SDK lines, a line for each tool the payload's `Needs` names,
+//! and the path line when no trusted Git `bin` was found for the command's `PATH`.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -22,6 +23,7 @@ use crate::answer::USAGE_STATUS;
 use crate::boxside::boot;
 use crate::boxside::forward::{ChildPipes, DRAIN, Drained, OutputLock};
 use crate::boxside::helper_trusted;
+use crate::boxside::msys;
 use crate::boxside::payload::{Pair, Payload};
 use crate::boxside::probe;
 use crate::boxside::run::{FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_SINGLE};
@@ -115,6 +117,13 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
         console.out(NEW_WORK_TREE);
     }
     boot::say(console);
+    // The run puts Git's `bin` at the front of its command's `PATH` when it finds a trusted one; a machine `PATH` that
+    // leaves it untrusted resolves a recipe's bare `bash` to the system folder's WSL launcher, so the log says so
+    // before the command runs. The client relays a preflight's lines into the log only, so this one never reaches the
+    // console.
+    if msys::git_bin(&Git::find(), &refused_folders(payload, work)).is_none() {
+        console.out(msys::NO_GIT_BIN);
+    }
     say_sdks_and_tools(payload, work, seams, console);
     0
 }

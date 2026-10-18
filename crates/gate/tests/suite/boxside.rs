@@ -250,7 +250,7 @@ fn preflight_creates_the_bare_repo_and_work_folder() {
     let case = Case::new("preflight_creates_the_bare_repo_and_work_folder");
     let folders = Folders::new(&case);
 
-    let outcome = gate_box(&case, "preflight", &folders.payload(), None);
+    let outcome = preflight_with_git_bin(&case, &folders.payload(), &case.folder().join("fake-git").join("bin"));
 
     let printed = passed(&outcome);
     assert_eq!(printed.len(), 6, "{outcome:?}");
@@ -267,6 +267,20 @@ fn preflight_creates_the_bare_repo_and_work_folder() {
     assert_eq!(folders.alternates(), folders.written_alternates());
     assert!(!case.local_app_data().exists(), "the box reads and writes nothing under LOCALAPPDATA");
     assert_eq!(case.folder_entries(), ["remote"], "the box writes only where the payload says");
+}
+
+#[test]
+fn preflight_of_a_trusted_git_bin_says_no_path_line() {
+    let case = Case::new("preflight_git_bin_trusted");
+    let folders = Folders::new(&case);
+
+    let outcome = preflight_with_git_bin(&case, &folders.payload(), &case.folder().join("fake-git").join("bin"));
+
+    passed(&outcome);
+    assert!(
+        !outcome.stdout.contains("gate: remote path:") && !outcome.stderr.contains("gate: remote path:"),
+        "a trusted Git bin says nothing of the PATH: {outcome:?}"
+    );
 }
 
 #[test]
@@ -1810,6 +1824,137 @@ fn box_run_gives_the_command_the_payloads_env() {
         outcome.stdout, "x\nfalse\n",
         "the command reads the payload's Env, not the box's own: {outcome:?}"
     );
+}
+
+/// The test seam that stands in for the trusted Git `bin` folder a routed command's `PATH` starts with, as the suite's
+/// boxes run from a folder this user owns.
+const GIT_BIN_STAND_IN: &str = "GATE_TEST_BOX_GIT_BIN";
+
+/// The line a preflight says when it finds no trusted Git `bin` for a routed command's `PATH`.
+const NO_GIT_BIN: &str = "gate: remote path: Git's bin is not trusted here; bash resolves by the machine PATH";
+
+/// `gate box run` of `payload` with the trusted Git `bin` seam naming `bin` and `PATH` set to `path` when given, to its
+/// end.
+fn run_box_with_git_bin(case: &Case, payload: &Value, bin: &Path, path: Option<&OsString>) -> Outcome {
+    let mut call = box_call(case, &["box", "run"], &self::payload(payload));
+    call.env(GIT_BIN_STAND_IN, bin);
+    if let Some(path) = path {
+        call.env("PATH", path);
+    }
+    call.finish()
+}
+
+/// `gate box preflight` of the request line `request` with the trusted Git `bin` seam naming `bin`, to its end.
+fn preflight_with_git_bin(case: &Case, request: &str, bin: &Path) -> Outcome {
+    let mut call = box_call(case, &["box", "preflight"], request);
+    call.env(GIT_BIN_STAND_IN, bin);
+    call.finish()
+}
+
+/// A fake Git root under the case folder: `cmd\git.cmd` forwarding to the real git with the same words, `usr\bin`'s
+/// keeper and runtime, and `bin\bash.exe`. Every folder is this user's own, so the keeper's owner check refuses it.
+fn user_owned_git_root(case: &Case) -> PathBuf {
+    let root = case.folder().join("fake-git");
+    let cmd = root.join("cmd");
+    let usr_bin = root.join("usr").join("bin");
+    let bin = root.join("bin");
+    for folder in [&cmd, &usr_bin, &bin] {
+        fs::create_dir_all(folder).expect("the fake git's folders can be made");
+    }
+    let real = git_folder().join("git.exe");
+    fs::write(cmd.join("git.cmd"), format!("@echo off\r\n\"{}\" %*\r\n", shown(&real))).expect("the git shim can be written");
+    for name in ["cat.exe", "msys-2.0.dll"] {
+        fs::write(usr_bin.join(name), "").expect("the keeper's names can be made");
+    }
+    fs::write(bin.join("bash.exe"), "").expect("the bash name can be made");
+    root
+}
+
+#[test]
+fn box_run_puts_git_s_bin_first_on_the_command_s_path() {
+    let case = Case::new("box_run_git_bin_first");
+    let root = case.folder().join("fake-git");
+    let bin = root.join("bin");
+    let usr_bin = root.join("usr").join("bin");
+    fs::create_dir_all(&usr_bin).expect("the fake usr\\bin can be made");
+    fs::create_dir_all(&bin).expect("the fake bin can be made");
+    let path = path_with_git(&[]);
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "env", "PATH"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box_with_git_bin(&case, &payload, &bin, Some(&path));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout,
+        format!("{};{}\n", bin.to_str().expect("the case folder is Unicode"), path.to_string_lossy()),
+        "Git's bin is first and the box's own PATH is kept whole: {outcome:?}"
+    );
+    assert!(
+        !outcome.stdout.contains(usr_bin.to_str().expect("the case folder is Unicode")),
+        "usr\\bin is not on the command's PATH: {outcome:?}"
+    );
+}
+
+#[test]
+fn box_run_resolves_a_bare_bash_to_git_s_bash() {
+    let case = Case::new("box_run_bare_bash");
+    let root = case.folder().join("fake-git");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("the fake bin can be made");
+    fs::copy(FAKE_TOOL, bin.join("bash.exe")).expect("fake-tool can stand for Git's bash");
+    // A bash that comes earlier on the box's own PATH, so a first word resolved there would be seen to run it.
+    let other = case.folder().join("other");
+    fs::create_dir_all(&other).expect("the other bash's folder can be made");
+    fs::write(other.join("bash.cmd"), "@echo off\r\necho other-bash ran\r\n").expect("the other bash can be written");
+    let path = path_with_git(&[other]);
+    let mut payload = box_payload(&case, "k", &["bash", "out", "git-bash ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box_with_git_bin(&case, &payload, &bin, Some(&path));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, "git-bash ran\n", "Git's bash ran, not the box's own: {outcome:?}");
+}
+
+#[test]
+fn box_run_leaves_path_alone_when_git_s_bin_is_not_trusted() {
+    let case = Case::new("box_run_git_bin_untrusted");
+    let root = user_owned_git_root(&case);
+    let path = path_with_git(&[root.join("cmd")]);
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "env", "PATH"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box_with_path(&case, &payload, Some(&path));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout,
+        format!("{}\n", path.to_string_lossy()),
+        "the command's PATH is the box's own: {outcome:?}"
+    );
+    assert!(
+        !outcome.stdout.contains(NO_GIT_BIN) && !outcome.stderr.contains(NO_GIT_BIN),
+        "a run says nothing about the PATH; its preflight does: {outcome:?}"
+    );
+}
+
+#[test]
+fn box_preflight_says_the_path_line_once_when_git_s_bin_is_not_trusted() {
+    let case = Case::new("box_preflight_git_bin_untrusted");
+    let folders = Folders::new(&case);
+    let root = user_owned_git_root(&case);
+    let path = path_with_git(&[root.join("cmd")]);
+
+    let outcome = gate_box(&case, "preflight", &folders.payload(), Some(&path));
+
+    let printed = passed(&outcome);
+    assert_eq!(
+        printed.iter().filter(|line| **line == NO_GIT_BIN).count(),
+        1,
+        "the line once among the preflight's: {outcome:?}"
+    );
+    assert!(!outcome.stderr.contains(NO_GIT_BIN), "the line is the preflight's own: {outcome:?}");
 }
 
 #[test]

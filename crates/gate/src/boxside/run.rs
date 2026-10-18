@@ -137,6 +137,9 @@ pub(super) struct Request<'a> {
     /// ([`resolved_engine`]) and handed to every command alike: `Ok(None)` when none is chosen, `Err` with the line its
     /// commands fail to start with when it does not resolve.
     engine: Result<Option<PathBuf>, String>,
+    /// The folders the run writes ([`preflight::refused_folders`]): no folder a command runs from may lie inside one,
+    /// neither the chosen engine's ([`resolved_engine`]) nor Git's `bin` ([`with_git_bin_first`]).
+    refused: Vec<PathBuf>,
     /// The outputs the run brings back, `None` when it has no output globs.
     outputs: Option<Asked<'a>>,
     /// The run's `Nonce`, which its start marker and its refusal tags name.
@@ -185,7 +188,8 @@ impl Request<'_> {
         let identity = identity(payload)?;
         let env = caller_env(payload)?;
         let godot = payload.godot_version()?;
-        let engine = resolved_engine(payload.unreal_version()?, &preflight::refused_folders(payload, work));
+        let refused = preflight::refused_folders(payload, work);
+        let engine = resolved_engine(payload.unreal_version()?, &refused);
         let inputs_digest = payload.inputs_digest()?;
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
         let (main, siblings) = repos(payload, work, bare, snapshot)?;
@@ -204,6 +208,7 @@ impl Request<'_> {
             env,
             godot,
             engine,
+            refused,
             outputs,
             nonce,
             timeout,
@@ -1293,7 +1298,8 @@ fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> 
     };
     let exe = std::env::current_exe().map_err(|error| Err(failed(console, &format!("the box's own path cannot be read: {error}"))))?;
     let job = handed_job(request.job, gate_win32::own_session());
-    let (variables, found) = resolved_command(request.godot, word, command_variables(&request.env, &run, &job, &exe), one.place);
+    let variables = with_git_bin_first(command_variables(&request.env, &run, &job, &exe), &request.refused);
+    let (variables, found) = resolved_command(request.godot, word, variables, one.place);
     let variables = match with_unreal(&request.engine, variables) {
         Ok(variables) => variables,
         Err(line) => {
@@ -1335,6 +1341,46 @@ fn command_variables(env: &[(String, String)], run: &str, job: &str, exe: &Path)
     with_event_log_off(with_safe_directory(box_variables().with_caller(env).with_build_servers(run)))
         .with(BOX_JOB_VARIABLE, job)
         .with(BOX_EXE_VARIABLE, &exe.to_string_lossy())
+}
+
+/// The name of the variable a process reads its program folders from. Windows compares variable names without case, so
+/// this is every spelling of it, `Path` among them.
+const PATH_VARIABLE: &str = "PATH";
+
+/// The environment `variables` with Git's trusted `bin` at the front of its `PATH` ([`with_path_first`]), unless the
+/// box finds none or the one it finds lies inside one of the run's own folders `refused` ([`msys::git_bin`]): then
+/// they are left as they are and the command keeps the machine `PATH` it would have had.
+fn with_git_bin_first(variables: Variables, refused: &[PathBuf]) -> Variables {
+    match msys::git_bin(&Git::find(), refused) {
+        Some(bin) => with_path_first(variables, &bin),
+        None => variables,
+    }
+}
+
+/// `variables` with `folder` at the front of their `PATH`, set when there is none, so the command's own first word
+/// resolves on the same `PATH` the command gets; a folder already first leaves them as they are, so no second entry of
+/// it is added. The rest of the value is kept as it is, entries the box inherited included. A `PATH` or a `folder` that
+/// is not Unicode, and a folder holding `;` or `"`, which would split or quote the value, leave `variables` untouched.
+fn with_path_first(variables: Variables, folder: &Path) -> Variables {
+    let Some(folder) = folder.to_str() else {
+        return variables;
+    };
+    if folder.contains([';', '"']) {
+        return variables;
+    }
+    let Some(existing) = variables.get(PATH_VARIABLE).map(OsStr::to_os_string) else {
+        return variables.with(PATH_VARIABLE, folder);
+    };
+    let Some(existing) = existing.to_str() else {
+        return variables;
+    };
+    if existing.is_empty() {
+        return variables.with(PATH_VARIABLE, folder);
+    }
+    if existing.split(';').next().is_some_and(|first| first.eq_ignore_ascii_case(folder)) {
+        return variables;
+    }
+    variables.with(PATH_VARIABLE, &format!("{folder};{existing}"))
 }
 
 /// The name of the run's job `job` as the command reaches the object the box created: in session 0, where the box of
@@ -2642,8 +2688,8 @@ mod tests {
 
     use super::{
         CLOSED_STATUS, GIT_CONFIG_COUNT, Look, Of, One, Payload, Request, SHARING_VIOLATION, STARTING_COMMAND, before_the_job, client_gone,
-        command_spent, command_variables, gap_spent, handed_job, look, prepared, remaining_budget, with_safe_directory, without_engine,
-        written_retrying,
+        command_spent, command_variables, gap_spent, handed_job, look, prepared, remaining_budget, with_path_first, with_safe_directory,
+        without_engine, written_retrying,
     };
     use gate_args::{EnvRefusal, env_refusal};
 
@@ -3026,6 +3072,82 @@ mod tests {
 
         assert_eq!(base.get("UE_ROOT"), None);
         assert_eq!(base.get("ZZ_KEPT"), Some(OsStr::new("1")), "the rest is kept");
+    }
+
+    /// The `PATH` entries of `variables`, as the environment block a command is created with carries them, whatever the
+    /// name's case.
+    #[expect(clippy::expect_used, reason = "an environment block the case builds must fail it loudly")]
+    fn path_entries(variables: &Variables) -> Vec<String> {
+        let block = variables.block().expect("the environment block is built");
+        String::from_utf16_lossy(block.as_wide())
+            .split('\0')
+            .filter(|entry| entry.split('=').next().is_some_and(|name| name.eq_ignore_ascii_case("PATH")))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn a_path_first_prepend_sets_a_path_when_there_is_none() {
+        let variables = with_path_first(Variables::from_process().without("PATH"), Path::new(r"C:\Git\bin"));
+
+        assert_eq!(path_entries(&variables), [r"PATH=C:\Git\bin"]);
+    }
+
+    #[test]
+    fn a_path_first_prepend_replaces_a_path_spelled_another_way() {
+        let variables = Variables::from_process().without("PATH").with("Path", r"C:\a;C:\b");
+
+        let variables = with_path_first(variables, Path::new(r"C:\Git\bin"));
+
+        assert_eq!(
+            path_entries(&variables),
+            [r"PATH=C:\Git\bin;C:\a;C:\b"],
+            "one entry, whatever its name's case"
+        );
+    }
+
+    #[test]
+    fn a_path_first_prepend_leaves_a_bin_already_first() {
+        let variables = Variables::from_process().without("PATH").with("PATH", r"C:\Git\bin;C:\a");
+
+        let variables = with_path_first(variables, Path::new(r"C:\Git\bin"));
+
+        assert_eq!(path_entries(&variables), [r"PATH=C:\Git\bin;C:\a"]);
+    }
+
+    #[test]
+    fn a_path_first_prepend_sets_an_empty_path_to_the_bin() {
+        let variables = Variables::from_process().without("PATH").with("PATH", "");
+
+        let variables = with_path_first(variables, Path::new(r"C:\Git\bin"));
+
+        assert_eq!(path_entries(&variables), [r"PATH=C:\Git\bin"], "never the bin and an empty entry");
+    }
+
+    #[test]
+    fn a_path_first_prepend_refuses_a_folder_that_would_split_or_quote_the_value() {
+        for folder in [r"C:\Git;bin", r#"C:\Git"bin"#] {
+            let variables = Variables::from_process().without("PATH").with("PATH", r"C:\a;C:\b");
+
+            let variables = with_path_first(variables, Path::new(folder));
+
+            assert_eq!(path_entries(&variables), [r"PATH=C:\a;C:\b"], "{folder}");
+        }
+    }
+
+    #[test]
+    fn a_path_first_prepend_leaves_a_folder_that_is_not_unicode_alone() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let mut wide: Vec<u16> = r"C:\Git".encode_utf16().collect();
+        wide.push(0xd800);
+        let folder = PathBuf::from(OsString::from_wide(&wide));
+        let variables = Variables::from_process().without("PATH").with("PATH", r"C:\a");
+
+        let variables = with_path_first(variables, &folder);
+
+        assert_eq!(path_entries(&variables), [r"PATH=C:\a"]);
     }
 
     #[test]

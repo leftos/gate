@@ -11,8 +11,9 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use super::{
-    BoxCall, adjusted_seconds, box_call, fake_godot, fake_unreal, field, gate_box, godot_root, let_go, lines_starting, pair_payload, pair_snapshot,
-    path_for_run, path_godot, payload as request_line, refused_line, run_box, snapshot, started_line, stopped_line_for, unreal_root,
+    BoxCall, GIT_BIN_STAND_IN, adjusted_seconds, box_call, fake_godot, fake_unreal, field, gate_box, godot_root, let_go, lines_starting,
+    pair_payload, pair_snapshot, path_for_run, path_godot, payload as request_line, refused_line, run_box, snapshot, started_line, stopped_line_for,
+    unreal_root,
 };
 use crate::support::{
     Case, Closed, FAKE_TOOL, HeldDesktop, KeptDesktop, Outcome, box_payload, build_version, copy_tool, desktop_payload, desktop_seams, junction,
@@ -403,6 +404,24 @@ fn a_desktop_run_sets_ue_root_for_the_chosen_unreal() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stdout, format!("{}\n", root.join("5.8.0").display()), "{outcome:?}");
     ran_its_command(&outcome, &payload);
+}
+
+/// A desktop run's command gets Git's `bin` at the front of its `PATH`, as any other run's does.
+#[test]
+fn a_desktop_run_puts_git_s_bin_first_on_its_command_s_path() {
+    let case = Case::new("desktop_git_bin");
+    let bin = case.folder().join("fake-git").join("bin");
+    fs::create_dir_all(&bin).expect("the fake bin can be made");
+    let payload = ready_payload(&case, &[FAKE_TOOL, "env", "PATH"]);
+    let mut command = desktop_call(&case, &payload, "ok", &[]);
+    command.env(GIT_BIN_STAND_IN, &bin);
+
+    let outcome = command.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    ran_its_command(&outcome, &payload);
+    let printed = outcome.stdout.lines().next().expect("the command prints its PATH");
+    assert_eq!(printed.split(';').next(), bin.to_str(), "Git's bin is first: {outcome:?}");
 }
 
 #[test]

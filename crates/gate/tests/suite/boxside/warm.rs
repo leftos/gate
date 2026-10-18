@@ -16,7 +16,8 @@ use super::{
     BUN_LOCKFILE, BUN_LOCKFILE_PATH, ENDLESS, Folders, NODE_MODULES_IGNORED, PNPM_LOCKFILE, PNPM_LOCKFILE_PATH, STALE_UE_ROOT, box_call,
     bun_install_call, command_call, fake_godot, fake_unreal, field, gate_box, godot_root, has_ref, install_call, installs, let_go, lines_starting,
     marks, pair_payload, pair_snapshot, pair_tree, passed, path_for_bun, path_for_pnpm, pnpm_box, pnpm_calls, refused_line, renamed, run_box,
-    run_box_with_godot, run_box_with_seams, run_box_with_unreal, snapshot, started_line, stopped_line_for, stub_bun, stub_pnpm, unreal_root,
+    run_box_with_git_bin, run_box_with_godot, run_box_with_seams, run_box_with_unreal, snapshot, started_line, stopped_line_for, stub_bun, stub_pnpm,
+    unreal_root,
 };
 use crate::support::{Case, FAKE_TOOL, GATE, Outcome, box_payload, shown, wait_until, wait_until_closed};
 
@@ -71,6 +72,21 @@ fn box_warm_up_runs_every_command_in_order_and_writes_warm() {
         "a warm-up commits nothing back, though it changed a tracked file: {outcome:?}"
     );
     wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_warm_up_puts_git_s_bin_first_on_its_command_s_path() {
+    let case = Case::new("box_warm_up_git_bin");
+    let bin = case.folder().join("fake-git").join("bin");
+    fs::create_dir_all(&bin).expect("the fake bin can be made");
+    let mut payload = warm_payload(&case, &[&[FAKE_TOOL, "env", "PATH"]]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box_with_git_bin(&case, &payload, &bin, None);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let printed = outcome.stdout.lines().next().expect("the command prints its PATH");
+    assert_eq!(printed.split(';').next(), bin.to_str(), "Git's bin is first: {outcome:?}");
 }
 
 #[test]
