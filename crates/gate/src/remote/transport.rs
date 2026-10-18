@@ -307,7 +307,7 @@ mod tests {
         texts.iter().map(OsString::from).collect()
     }
 
-    const RUN_LINE: &str = r#""%LOCALAPPDATA%\gate\bin\gate.exe" box run --stdin"#;
+    const RUN_LINE: &str = r#""C:\Program Files\gate\bin\gate.exe" box run --stdin"#;
 
     #[test]
     fn ssh_s_words_are_the_options_then_dash_dash_then_the_host_then_the_line() {
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn every_box_call_s_ssh_words_ask_for_no_tty() {
-        let preflight = r#""%LOCALAPPDATA%\gate\bin\gate.exe" box preflight --stdin"#;
+        let preflight = r#""C:\Program Files\gate\bin\gate.exe" box preflight --stdin"#;
         for (line, wire) in [(RUN_LINE, Wire::Compressed), (preflight, Wire::Plain)] {
             let said = ssh_words("builder", line, wire);
             let tty = said.iter().position(|word| word == "RequestTTY=no").expect("no terminal is asked for");
@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn the_local_transport_runs_the_words_after_the_builder_s_gate() {
-        let line = r#""%LOCALAPPDATA%\gate\bin\gate.exe" box preflight --stdin"#;
+        let line = r#""C:\Program Files\gate\bin\gate.exe" box preflight --stdin"#;
         assert_eq!(box_words(line), words(&["box", "preflight", "--stdin"]));
         let local = Local::new(r"local:C:\builder", None).expect("a local transport");
         assert_eq!(local.root(), r"C:\builder");

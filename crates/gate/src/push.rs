@@ -1,5 +1,6 @@
-//! `gate push`: copies the installed `%LOCALAPPDATA%\gate\bin\gate.exe` and the desktop helper beside it to every
-//! builder `remote.json` names, one after another, and registers the desktop task there. Each builder gets one ssh call
+//! `gate push`: copies this PC's installed `%LOCALAPPDATA%\gate\bin\gate.exe` and the desktop helper beside it to every
+//! builder `remote.json` names, one after another, into the builder's admin-owned `C:\Program Files\gate\bin`, and
+//! registers the desktop task there. Each builder gets one ssh call
 //! whose line is a short PowerShell bootstrap, [`BOOTSTRAP`], sent encoded; ssh's stdin carries the install script,
 //! [`SCRIPT`], as one line of base64, then the exe compressed with gzip, as one line of base64, then the helper the same
 //! way. The bootstrap reads the script's line and runs it in the bootstrap's scope; the script reads the rest,
@@ -68,53 +69,81 @@ const REGISTER_SLOT: &str = "@REGISTER@";
 /// How the builder registers the desktop task: the installed gate's `box register-desktop`, killed with its process tree
 /// after 60 s.
 const REGISTER: &str = "Reg $g 'box register-desktop' 60";
+/// The stand-in for the PowerShell expression that gives the install folder in [`SCRIPT`].
+const DIR_SLOT: &str = "@DIR@";
+/// The stand-in for the Program Files folder the builder must have in [`SCRIPT`]; empty, it skips that pin and the
+/// trust checks of the install folder and the installed files.
+const PROGRAM_FILES_SLOT: &str = "@PF@";
+/// Where a builder's push installs: its admin-owned `C:\Program Files\gate\bin`, on a builder whose Program Files folder
+/// is `C:\Program Files`.
+const PROGRAM_FILES: Place<'static> = Place {
+    dir: r"'C:\Program Files\gate\bin'",
+    program_files: r"C:\Program Files",
+};
+/// Where a push through the `--test-push-ssh` seam installs: each fake builder's `%LOCALAPPDATA%\gate\bin`, with no
+/// Program Files pin and no trust check of the folder or the files.
+const PER_USER: Place<'static> = Place {
+    dir: r"(Join-Path $env:LOCALAPPDATA 'gate\bin')",
+    program_files: "",
+};
 
 /// What the push line runs: it reads stdin's first line, [`SCRIPT`] as base64 of its UTF-8, and runs it dot-sourced,
 /// so the script's variables, `$lock` among them, and its functions live in one scope, the bootstrap's. Both read
 /// through `[Console]::In`, one buffered reader, so the script reads on from where the bootstrap's line ended.
 const BOOTSTRAP: &str = "$l=[Console]::In.ReadLine();. ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($l))))";
 
-/// The builder script, run by [`BOOTSTRAP`], as `tools/install.ps1` installs: on a pwsh older than 7.2, whose .NET
-/// lacks what its file checks call, it says `failed` and touches nothing. It reads the next line of stdin, the exe as
-/// base64 of its gzip, decompresses it, and refuses bytes whose SHA-256 is not the one this side put in for
-/// [`SHA_SLOT`]; then the rest of stdin, the desktop helper the same way, checked against [`HELPER_SHA_SLOT`]. It then
-/// adds its file checks, a small C# type, and fails before anything is touched when that cannot be done. Every line it
-/// says has its line breaks made spaces, so no text can say a second fact. In `%LOCALAPPDATA%\gate\bin`, made when
-/// missing and refused when it is a link, it first holds `push.lock`
-/// open, unshared, to its end, so a second push to the builder at once says `failed` and touches nothing. `push.lock` is
-/// opened without following a link and refused as a link when it is one, a second name of another file, a folder or a
-/// junction; the plain file is left in place, since the open handle is the lock. It deletes each `gate.exe.<pid>.tmp`
-/// and `gate-desktop-helper.exe.<pid>.tmp` of another pid that no process holds, saying `note` and why for one it cannot
-/// delete. With a `gate.exe` of the same SHA-256 it says `same` and its version; else it writes `gate.exe.<pid>.tmp`
-/// afresh and reads its file id, the volume serial number and the 128-bit id within the volume, from the handle that
-/// wrote it; the rename into place keeps the id. It moves the old exe aside to `gate.exe.<yyyyMMddHHmmss>.<pid>.old`
-/// and the temp into place, never by force, checks the installed copy's SHA-256, then holds it open, shared for reading
-/// only, checks the SHA-256 again through that handle and, while it is held, that it answers `--version` with
-/// `gate <version>`, and on a failure, the
-/// check's own included, moves the aside copy back, or removes the installed copy when there was no old exe, but only
-/// while `gate.exe` is missing or still the push's own file, the one with the temp copy's file id. An id it cannot
-/// read is tried three times, 300 ms apart, and a file gone at any try or 300 ms after the last counts as missing. Over
-/// a missing one it moves never by force: one another process placed is left as it is. Then it says `replaced` and
-/// the old version when it read one, and `installed` and the new one. Only an installed gate that answers lets it
-/// delete the `gate.exe.*.old` and `gate-desktop-helper.exe.*.old` copies no process holds, its own aside copy kept,
-/// with the same `note` for one it cannot delete or a folder it cannot list; a push that ends with no such gate, a
-/// failed one included, keeps every aside copy, and says `kept` and their number when there are any and it ends with
-/// `gate.exe` missing or one it could not verify in place. With `gate.exe` in place, installed or the same, it installs
-/// the helper beside it as `gate-desktop-helper.exe` unless that holds the same bytes already: it writes
-/// `gate-desktop-helper.exe.<pid>.tmp` afresh and reads its file id from the handle that wrote it, moves an old helper
-/// aside to `gate-desktop-helper.exe.<yyyyMMddHHmmss>.<pid>.old`, moves the temp into place, never by force, checks
-/// that the helper in place has the temp's file id and the pushed SHA-256, and says `helper-installed`. A move into
-/// place or a check that fails puts the old helper back, or removes the push's own copy when there was none, but
-/// leaves a helper another process placed as it is, and says where the old one is when it cannot be put back; the
-/// failure says, after its reason, that gate.exe was installed, and where its previous copy is, or that it was there
-/// already. Last it holds `gate.exe` open, shared for reading only, checks its SHA-256 through that handle, and while
-/// it is held runs [`REGISTER_SLOT`]'s command, killed with its process tree after 60 s: it says `registered` and the
-/// task and user when the command said `gate-register: registered ` and exited 0, else `unregistered` and the
-/// command's `gate-register: failed: ` text, else its last line, else `exit` and its status, or that gate.exe changed
-/// before registration, that it did not finish in its time, or why it could not run; either way it exits 0. A failure
-/// says `failed` and why, and exits 1, a failed helper install included, which tries no registration. Each version
-/// read is bounded at 30 s, and a version read that is killed at its bound is waited for up to 10 s more; one that
-/// cannot be stopped says `note` and why.
+/// The builder script, run by [`BOOTSTRAP`], as `tools/install.ps1` installs: on a pwsh older than 7.2, whose .NET lacks
+/// what its file checks call, it says `failed` and touches nothing. It reads the next line of stdin, the exe as base64 of
+/// its gzip, decompresses it, and refuses bytes whose SHA-256 is not the one this side put in for [`SHA_SLOT`]; then the
+/// rest of stdin, the desktop helper the same way, checked against [`HELPER_SHA_SLOT`]. It then adds its file checks, a
+/// small C# type, and fails before anything is touched when that cannot be done. Every line it says has its line breaks
+/// made spaces, so no text can say a second fact. Its install folder is [`DIR_SLOT`]'s, `C:\Program Files\gate\bin` on a
+/// builder. Before reading stdin it refuses a builder whose Program Files known folder is not [`PROGRAM_FILES_SLOT`]'s,
+/// `C:\Program Files`. It makes the `gate` folder above the install folder when missing, refuses it when it is a link and
+/// judges it, then makes the install folder when missing, refuses it when it is a link and judges it. Judging an object
+/// refuses it when it is owned by anyone but SYSTEM, Administrators or `TrustedInstaller`, when its access list has a
+/// conditional or object allow entry, which the push does not judge, or when it lets anyone else change it: for a
+/// folder, add files or folders to it, delete from it, delete, re-permission or take it; for a file, write, append to,
+/// change the extended attributes or attributes of, delete, re-permission or take it, as `gate_win32::trust` judges each.
+/// With [`PROGRAM_FILES_SLOT`] empty, as the `--test-push-ssh` seam leaves it, no object is judged, no `gate` folder is
+/// made first, and the folder is the per-user `%LOCALAPPDATA%\gate\bin`.
+///
+/// In the folder it first holds `push.lock` open, unshared, to its end, so a second push to the builder at once says
+/// `failed` and touches nothing. `push.lock` is opened without following a link and refused as a link when it is one, a
+/// second name of another file, a folder or a junction; the plain file is left in place, since the open handle is the
+/// lock. It deletes each `gate.exe.<pid>.tmp` and `gate-desktop-helper.exe.<pid>.tmp` of another pid that no process
+/// holds, saying `note` and why for one it cannot delete. With a `gate.exe` of the same SHA-256 it judges it, failing on a
+/// refusal, then says `same` and its version; else it writes `gate.exe.<pid>.tmp` afresh and reads its file id, the volume
+/// serial number and the 128-bit id within the volume, from the handle that wrote it; the rename into place keeps the id.
+/// It judges the temp, which carries the folder's inherited access list, and on a refusal deletes it and fails with nothing
+/// moved. It moves the old exe aside to `gate.exe.<yyyyMMddHHmmss>.<pid>.old` and the temp into place, never by force,
+/// checks the installed copy's SHA-256, then holds it open, shared for reading only, checks the SHA-256 again through that
+/// handle and, while it is held, that it answers `--version` with `gate <version>`, and on a failure, the check's own
+/// included, moves the aside copy back, or removes the installed copy when there was no old exe, but only while `gate.exe`
+/// is missing or still the push's own file, the one with the temp copy's file id. An id it cannot read is tried three
+/// times, 300 ms apart, and a file gone at any try or 300 ms after the last counts as missing. Over a missing one it moves
+/// never by force: one another process placed is left as it is. Then it says `replaced` and the old version when it read
+/// one, and `installed` and the new one. Only an installed gate that answers lets it delete the `gate.exe.*.old` and
+/// `gate-desktop-helper.exe.*.old` copies no process holds, its own aside copy kept, with the same `note` for one it cannot
+/// delete or a folder it cannot list; a push that ends with no such gate, a failed one included, keeps every aside copy,
+/// and says `kept` and their number when there are any and it ends with `gate.exe` missing or one it could not verify in
+/// place. With `gate.exe` in place, installed or the same, it installs the helper beside it as `gate-desktop-helper.exe`
+/// unless that holds the same bytes already, which it then judges, failing on a refusal: it writes
+/// `gate-desktop-helper.exe.<pid>.tmp` afresh and reads its file id from the handle that wrote it, judges it and on a
+/// refusal deletes it and fails with nothing moved, moves an old helper aside to
+/// `gate-desktop-helper.exe.<yyyyMMddHHmmss>.<pid>.old`, moves the temp into place, never by force, checks that the helper
+/// in place has the temp's file id and the pushed SHA-256, and says `helper-installed`. A move into place or a check that
+/// fails puts the old helper back, or removes the push's own copy when there was none, but leaves a helper another process
+/// placed as it is, and says where the old one is when it cannot be put back; the failure says, after its reason, that
+/// gate.exe was installed, and where its previous copy is, or that it was there already; a refusal of the helper says the
+/// same. Last it holds `gate.exe` open, shared for reading only, checks its SHA-256 through that handle, and while it is
+/// held runs [`REGISTER_SLOT`]'s command, killed with its process tree after 60 s: it says `registered` and the task and
+/// user when the command said `gate-register: registered ` and exited 0, else `unregistered` and the command's
+/// `gate-register: failed: ` text, else its last line, else `exit` and its status, or that gate.exe changed before
+/// registration, that it did not finish in its time, or why it could not run; either way it exits 0. A failure says
+/// `failed` and why, and exits 1, a failed helper install included, which tries no registration. Each version read is
+/// bounded at 30 s, and a version read that is killed at its bound is waited for up to 10 s more; one that cannot be
+/// stopped says `note` and why.
 const SCRIPT: &str = r#"$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 function Say($k,$t){$t="$t" -replace '[\r\n]+',' ';[Console]::Out.WriteLine("gate-push: $k $t")}
 function Tally{try{$n=@(Get-ChildItem -LiteralPath $dir -File|?{$_.Name -like 'gate.exe.*.old'}).Count;if($n){Say kept $n}}
@@ -145,8 +174,24 @@ try{if($w -eq 'mine'){Move-Item -LiteralPath $a -Destination $g -Force}else{Move
 catch{if($w -eq 'missing' -and (Test-Path -LiteralPath $g)){Placed $m};Fail "$m; the previous gate.exe is at $a"}
 $st.u=0;Fail "$m; the previous gate.exe is back in place"}
 $pv=$PSVersionTable.PSVersion;if([version]"$($pv.Major).$($pv.Minor)" -lt [version]'7.2'){Fail "the builder needs pwsh 7.2 or later (it has $pv)"}
-if(!$env:LOCALAPPDATA){Fail 'LOCALAPPDATA is not set'}
-$dir=Join-Path $env:LOCALAPPDATA 'gate\bin';$g=Join-Path $dir 'gate.exe';$a=$null;$ci="could not install ${g}:";$st=@{u=0;i=''}
+$pin='@PF@'
+if($pin){$pf=[Environment]::GetFolderPath('ProgramFiles');if($pf -ne $pin){Fail "the builder's Program Files folder is $pf, not $pin"}}
+elseif(!$env:LOCALAPPDATA){Fail 'LOCALAPPDATA is not set'}
+$ts=@('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+$fm=0x2 -bor 0x4 -bor 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x40000000 -bor 0x10000000
+$xm=0x2 -bor 0x4 -bor 0x10 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x40000000 -bor 0x10000000
+function Who($s){try{([Security.Principal.SecurityIdentifier]$s).Translate([Security.Principal.NTAccount]).Value}catch{$s}}
+function Judge($p,$w,$x){$sid=[Security.Principal.SecurityIdentifier]
+try{$acl=Get-Acl -LiteralPath $p;$o="$($acl.GetOwner($sid))";$d=(($acl.GetSecurityDescriptorSddlForm('All') -csplit 'D:',2)[1] -csplit 'S:',2)[0]}
+catch{return "could not read who may change ${p}: $($_.Exception.Message)"}
+if($o -notin $ts){return "$p is owned by $(Who $o), not SYSTEM, Administrators or TrustedInstaller"}
+if($d -match '\((XA|ZA|OA);'){return "$p has a conditional access entry, which this push does not judge"}
+try{$rs=@($acl.GetAccessRules($true,$true,$sid))}catch{return "could not read who may change ${p}: $($_.Exception.Message)"}
+foreach($r in $rs){$s=$r.IdentityReference.Value
+if($r.AccessControlType -eq 'Allow' -and !$r.PropagationFlags.HasFlag([Security.AccessControl.PropagationFlags]::InheritOnly) -and
+$s -notin $ts -and ([int]$r.FileSystemRights -band $w)){return "$p lets $(Who $s) $x"}}}
+function Trust($p,$w,$x){$t=Judge $p $w $x;if($t){Fail $t}}
+$dir=@DIR@;$g=Join-Path $dir 'gate.exe';$a=$null;$ci="could not install ${g}:";$st=@{u=0;i=''}
 function Unzip($t){$u=[IO.MemoryStream]::new();$z=[IO.MemoryStream]::new([Convert]::FromBase64String($t))
 [IO.Compression.GZipStream]::new($z,[IO.Compression.CompressionMode]::Decompress).CopyTo($u);,$u.ToArray()}
 function Sha($x){[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($x))}
@@ -181,19 +226,23 @@ if(x.HResult!=Busy&&a!=uint.MaxValue&&(a&(Folder|Link))!=0){return null;}throw x
 var i=new uint[13];if(!GetFileInformationByHandle(h,i)){var x=Error("");h.Dispose();throw x;}
 if((i[0]&Link)!=0||i[10]!=1){h.Dispose();return null;}
 return new FileStream(h,FileAccess.ReadWrite);}}'}catch{Fail "could not prepare the install: $($_.Exception.Message)"}
+if($pin){$q=Split-Path $dir;try{New-Item -ItemType Directory -Path $q -Force|Out-Null}catch{Fail "could not create ${q}: $($_.Exception.Message)"}
+if((Get-Item -LiteralPath $q).LinkType){Fail "$q is a link"};Trust $q $fm 'change what is in it'}
 try{New-Item -ItemType Directory -Path $dir -Force|Out-Null}catch{Fail "could not create ${dir}: $($_.Exception.Message)"}
 if((Get-Item -LiteralPath $dir).LinkType){Fail "$dir is a link"}
+if($pin){Trust $dir $fm 'change what is in it'}
 $pl=Join-Path $dir 'push.lock'
 try{$lock=[GateFile]::OpenLock($pl)}catch{$x=$_.Exception.GetBaseException()
 if($x.HResult -eq -2147024864){Fail 'another gate push is installing on this builder'};Fail "could not lock ${dir}: $($x.Message)"}
 if($null -eq $lock){Fail "$pl is a link"}
 $locked=1
 foreach($f in Get-ChildItem -LiteralPath $dir -File|?{$_.Name -match '^gate(-desktop-helper)?\.exe\.(\d+)\.tmp$' -and $Matches[2] -ne $PID}){Purge $f.FullName}
-if((Test-Path -LiteralPath $g) -and (Get-FileHash -LiteralPath $g).Hash -eq '@SHA@'){$v=Ver $g;if($v){Clean}else{Tally};Say same $v
+if((Test-Path -LiteralPath $g) -and (Get-FileHash -LiteralPath $g).Hash -eq '@SHA@'){if($pin){Trust $g $xm 'change it'};$v=Ver $g;if($v){Clean}else{Tally};Say same $v
 $gs=if($v){"; gate $v was already installed"}else{'; the same gate.exe was already installed'}}else{
 $tmp="$g.$PID.tmp";Drop $tmp
 try{$s=[IO.File]::Open($tmp,'CreateNew','Write','None');try{$s.Write($b,0,$b.Length);$st.i=[GateFile]::Id($s.SafeFileHandle)}finally{$s.Dispose()}}
 catch{Drop $tmp;Fail "$ci $($_.Exception.Message)"}
+if($pin){$t=Judge $tmp $xm 'change it';if($t){Drop $tmp;Fail $t}}
 $old=''
 if(Test-Path -LiteralPath $g){$old=Ver $g;$a="$g.$(Get-Date -Format yyyyMMddHHmmss).$PID.old"
 try{Move-Item -LiteralPath $g -Destination $a -Force}catch{Drop $tmp;Fail "$ci $($_.Exception.Message)"}}
@@ -224,6 +273,7 @@ try{$hs=if(Test-Path -LiteralPath $hp){Sha ([IO.File]::ReadAllBytes($hp))}else{'
 if($hs -ne '@HSHA@'){$ht="$hp.$PID.tmp";Drop $ht
 try{$s=[IO.File]::Open($ht,'CreateNew','Write','None');try{$s.Write($hb,0,$hb.Length);$hi=[GateFile]::Id($s.SafeFileHandle)}finally{$s.Dispose()}}
 catch{Drop $ht;HFail "$hc $($_.Exception.Message)"}
+if($pin){$t=Judge $ht $xm 'change it';if($t){Drop $ht;HFail $t}}
 if($hs){$ha="$hp.$(Get-Date -Format yyyyMMddHHmmss).$PID.old"
 try{Move-Item -LiteralPath $hp -Destination $ha -Force}catch{Drop $ht;HFail "$hc $($_.Exception.Message)"}}
 try{Move-Item -LiteralPath $ht -Destination $hp}catch{$m=$_.Exception.Message;Drop $ht;HBack "$hc $m"}
@@ -231,7 +281,7 @@ $ok=$false
 try{$hh=[IO.File]::Open($hp,'Open','Read','Read');try{$ok=([GateFile]::Id($hh.SafeFileHandle) -eq $hi) -and ((Hash $hh) -eq '@HSHA@')}finally{$hh.Dispose()}}
 catch{HBack "$hc $($_.Exception.Message)"}
 if(!$ok){HBack "$hc the installed copy does not match"}
-Say helper-installed}
+Say helper-installed}elseif($pin){$t=Judge $hp $xm 'change it';if($t){HFail $t}}
 $rg=$null
 try{$gh=[IO.File]::Open($g,'Open','Read','Read')
 try{if((Hash $gh) -eq '@SHA@'){$rg=@REGISTER@}else{Say unregistered 'gate.exe changed before registration'}}finally{$gh.Dispose()}}
@@ -252,7 +302,7 @@ static VERSION: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"(?i)^gat
 /// Runs `gate push` and returns its exit status.
 pub(crate) fn push(request: &PushRequest, environment: &Environment, console: &mut Console) -> u32 {
     let variables: Vec<(OsString, OsString)> = std::env::vars_os().collect();
-    let prepared = match prepared(environment, &variables, request.seams.register_ok) {
+    let prepared = match prepared(environment, &variables, request.seams.register_ok, place(request.seams.ssh.is_some())) {
         Ok(prepared) => prepared,
         Err(line) => {
             console.err(&line);
@@ -302,9 +352,9 @@ struct Prepared {
 }
 
 /// The push's builders, exe, desktop helper and line, read from `LOCALAPPDATA`, the exe's version read with `variables`
-/// as its environment, each builder's registration done as [`register_command`] says for `register_ok`; else the line
-/// saying why there is nothing to push or nowhere to push it.
-fn prepared(environment: &Environment, variables: &[(OsString, OsString)], register_ok: Option<bool>) -> Result<Prepared, String> {
+/// as its environment, each builder's registration done as [`register_command`] says for `register_ok`, installed into
+/// `place`; else the line saying why there is nothing to push or nowhere to push it.
+fn prepared(environment: &Environment, variables: &[(OsString, OsString)], register_ok: Option<bool>, place: Place<'_>) -> Result<Prepared, String> {
     let folder = environment
         .local_app_data
         .as_deref()
@@ -327,6 +377,7 @@ fn prepared(environment: &Environment, variables: &[(OsString, OsString)], regis
         sha: &sha256_hex(&bytes),
         helper_sha: &sha256_hex(&helper),
         register: &register_command(register_ok),
+        place,
     };
     let input = pushed_input(&slots, &bytes, &helper);
     Ok(Prepared {
@@ -337,12 +388,27 @@ fn prepared(environment: &Environment, variables: &[(OsString, OsString)], regis
     })
 }
 
-/// What [`SCRIPT`]'s slots hold for one push: the exe's SHA-256, the desktop helper's, and the command that registers
-/// the desktop task.
+/// What [`SCRIPT`]'s slots hold for one push: the exe's SHA-256, the desktop helper's, the command that registers
+/// the desktop task, and where the builder installs them.
 struct Slots<'a> {
     sha: &'a str,
     helper_sha: &'a str,
     register: &'a str,
+    place: Place<'a>,
+}
+
+/// Where [`SCRIPT`] installs, each as its slot's text: the folder's expression ([`DIR_SLOT`]) and the Program Files
+/// folder the builder must have, or empty for none ([`PROGRAM_FILES_SLOT`]).
+#[derive(Clone, Copy)]
+struct Place<'a> {
+    dir: &'a str,
+    program_files: &'a str,
+}
+
+/// Where a push installs: [`PER_USER`] when `ssh_seam`, the `--test-push-ssh` seam, stands in for ssh, else
+/// [`PROGRAM_FILES`].
+fn place(ssh_seam: bool) -> Place<'static> {
+    if ssh_seam { PER_USER } else { PROGRAM_FILES }
 }
 
 /// What a builder's call is fed for `exe` and `helper`, whose SHA-256s `slots` holds: [`script_line`], then the
@@ -357,6 +423,8 @@ fn filled(slots: &Slots<'_>) -> String {
         .replace(SHA_SLOT, slots.sha)
         .replace(HELPER_SHA_SLOT, slots.helper_sha)
         .replace(REGISTER_SLOT, slots.register)
+        .replace(DIR_SLOT, slots.place.dir)
+        .replace(PROGRAM_FILES_SLOT, slots.place.program_files)
 }
 
 /// [`filled`] as base64 of its UTF-8: one line, as [`BOOTSTRAP`] reads it.
@@ -860,8 +928,8 @@ mod tests {
     use flate2::read::GzDecoder;
 
     use super::{
-        BOOTSTRAP, Call, End, Fact, Heard, LINE_CAP, MARKED_CAP, PWSH, REGISTER, Said, Slots, called, encoded_line, fact, filled, gzipped, kept,
-        push_line, pushed_input, register_command, said, sha256_hex, version_of,
+        BOOTSTRAP, Call, End, Fact, Heard, LINE_CAP, MARKED_CAP, PWSH, Place, REGISTER, Said, Slots, called, encoded_line, fact, filled, gzipped,
+        kept, place, push_line, pushed_input, register_command, said, sha256_hex, version_of,
     };
     use crate::environment::Variables;
     use crate::run::find_program;
@@ -879,23 +947,26 @@ mod tests {
     /// The `registered` fact the script says after [`REGISTERS`].
     const REGISTERED: &str = r"gate-push: registered \gate\desktop-helper for S-1-5-21-0";
 
-    /// [`super::SCRIPT`] filled for an exe whose SHA-256 is `sha`, the helper [`HELPER`] and the stand-in [`REGISTERS`].
+    /// [`super::SCRIPT`] filled for an exe whose SHA-256 is `sha`, the helper [`HELPER`] and the stand-in [`REGISTERS`],
+    /// installed where the ssh seam's push installs, the scratch `LOCALAPPDATA`'s `gate\bin`.
     fn script_for(sha: &str) -> String {
         filled(&Slots {
             sha,
             helper_sha: &sha256_hex(HELPER),
             register: REGISTERS,
+            place: place(true),
         })
     }
 
     /// What a builder is fed for `exe`, whose SHA-256 the script checks as `sha`, and `helper`, checked as [`HELPER`]'s,
-    /// the task registered by [`REGISTERS`].
+    /// the task registered by [`REGISTERS`], installed where the ssh seam's push installs.
     fn input_for(sha: &str, exe: &[u8], helper: &[u8]) -> String {
         let helper_sha = sha256_hex(HELPER);
         let slots = Slots {
             sha,
             helper_sha: &helper_sha,
             register: REGISTERS,
+            place: place(true),
         };
         pushed_input(&slots, exe, helper)
     }
@@ -926,6 +997,7 @@ mod tests {
             sha: SHA,
             helper_sha: HELPER_SHA,
             register: REGISTER,
+            place: place(false),
         };
         let input = pushed_input(&slots, b"an exe", b"a helper");
         let lines: Vec<&str> = input.split('\n').collect();
@@ -934,7 +1006,7 @@ mod tests {
         assert_eq!(lines[2], gzipped(b"a helper"), "the helper follows the exe's line");
         let script = String::from_utf8(STANDARD.decode(lines[0]).expect("the script's line is base64")).expect("the script is UTF-8");
         assert_eq!(script, filled(&slots));
-        for slot in ["@SHA@", "@HSHA@", "@REGISTER@"] {
+        for slot in ["@SHA@", "@HSHA@", "@REGISTER@", "@DIR@", "@PF@"] {
             assert!(!script.contains(slot), "{slot} is filled");
         }
         assert_eq!(
@@ -1583,11 +1655,17 @@ mod tests {
 
     /// [`answering`] with `register` as the registration's expression.
     fn answering_with(sha: &str, answers: &[u8], register: &str) -> String {
+        answering_in(sha, answers, register, place(true))
+    }
+
+    /// [`answering_with`] installing into `place`.
+    fn answering_in(sha: &str, answers: &[u8], register: &str, place: Place<'_>) -> String {
         let helper_sha = sha256_hex(HELPER);
         let script = filled(&Slots {
             sha,
             helper_sha: &helper_sha,
             register,
+            place,
         });
         assert!(script.contains(VER), "the script reads versions with Ver");
         let stand_in = format!(
@@ -1628,6 +1706,181 @@ mod tests {
             .into_iter()
             .filter(|name| Path::new(name).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("old")))
             .collect()
+    }
+
+    /// `exe` pushed through the script filled for `place`, its version answered as [`answering`]'s, run as the push line
+    /// runs it with `LOCALAPPDATA` set to `local_app_data`.
+    fn run_script_in(place: Place<'_>, exe: &[u8], local_app_data: &Path) -> Heard {
+        run_lines("", &answering_in(&sha256_hex(exe), exe, REGISTERS, place), exe, local_app_data)
+    }
+
+    /// `folder` as a PowerShell expression: the path in single quotes.
+    fn quoted(folder: &Path) -> String {
+        format!("'{}'", folder.display())
+    }
+
+    #[test]
+    fn the_script_refuses_a_builder_whose_program_files_folder_is_elsewhere() {
+        let local_app_data = scratch("program-files-elsewhere");
+        let gate = local_app_data.join("gate");
+        let dir = quoted(&gate.join("bin"));
+        let place = Place {
+            dir: &dir,
+            program_files: r"Q:\Program Files",
+        };
+        let heard = run_script_in(place, &stand_in(), &local_app_data);
+        let program_files = std::env::var("ProgramFiles").expect("ProgramFiles is set");
+        assert_eq!(heard.end, End::Exited(1), "{heard:?}");
+        assert_eq!(
+            heard.marked,
+            [format!(
+                "gate-push: failed the builder's Program Files folder is {program_files}, not Q:\\Program Files"
+            )],
+            "{heard:?}"
+        );
+        assert!(!gate.exists(), "the install folder is not made");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn the_script_refuses_an_install_folder_this_user_owns() {
+        let local_app_data = scratch("user-owned-folder");
+        let gate = local_app_data.join("gate");
+        let dir = quoted(&gate.join("bin"));
+        let place = Place {
+            dir: &dir,
+            program_files: r"C:\Program Files",
+        };
+        let heard = run_script_in(place, &stand_in(), &local_app_data);
+        let line = failed_line(&heard, &local_app_data);
+        assert_refused(&line, &format!("gate-push: failed {}", gate.display()), "change what is in it");
+        assert!(!gate.join("bin").exists(), "bin is not made before gate is judged");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "a test's one mklink takes no spawn lock")]
+    fn the_script_refuses_a_gate_folder_that_is_a_link() {
+        let local_app_data = scratch("gate-link");
+        let gate = local_app_data.join("gate");
+        let target = local_app_data.join("target");
+        fs::create_dir_all(&target).expect("the target folder is made");
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&gate)
+            .arg(&target)
+            .output()
+            .expect("mklink runs");
+        assert!(made.status.success(), "the junction is made: {made:?}");
+        let dir = quoted(&gate.join("bin"));
+        let place = Place {
+            dir: &dir,
+            program_files: r"C:\Program Files",
+        };
+        let heard = run_script_in(place, &stand_in(), &local_app_data);
+        let line = failed_line(&heard, &local_app_data);
+        assert_eq!(line, format!("gate-push: failed {} is a link", gate.display()), "{heard:?}");
+        assert!(!target.join("bin").exists(), "no bin is made through the link");
+        let _ = fs::remove_dir(&gate);
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    /// That `line`, which starts with `prefix` naming the object judged, refuses it for its owner, or, where an elevated
+    /// runner owns what it makes as Administrators, for letting someone else `change`.
+    fn assert_refused(line: &str, prefix: &str, change: &str) {
+        let owned = line.starts_with(&format!("{prefix} is owned by ")) && line.ends_with(", not SYSTEM, Administrators or TrustedInstaller");
+        let lets = line.starts_with(&format!("{prefix} lets ")) && line.ends_with(&format!(" {change}"));
+        assert!(owned || lets, "refused for its owner or for who may change it: {line}");
+    }
+
+    /// The script's trust definitions, from its trusted SIDs to just before `Trust`, which fails the push.
+    fn trust_definitions() -> &'static str {
+        let start = super::SCRIPT.find("$ts=@(").expect("the script lists its trusted SIDs");
+        let end = super::SCRIPT.find("function Trust(").expect("the script defines Trust");
+        &super::SCRIPT[start..end]
+    }
+
+    /// What the script's `Judge` says of `object` with the mask `$mask` and the words `change`, run as the push line runs
+    /// it with `LOCALAPPDATA` set to `local_app_data`: `gate-push: judged [<refusal>]`, empty between the brackets when
+    /// it passes.
+    fn judged(object: &Path, mask: &str, change: &str, local_app_data: &Path) -> String {
+        let script = format!(
+            "{}[Console]::Out.WriteLine(\"gate-push: judged [$(Judge {} {mask} '{change}')]\")",
+            trust_definitions(),
+            quoted(object)
+        );
+        let heard = run_script_fed(&format!("{}\n", STANDARD.encode(script)), local_app_data);
+        assert_eq!(heard.end, End::Exited(0), "{heard:?}");
+        assert_eq!(heard.marked.len(), 1, "{heard:?}");
+        heard.marked[0].clone()
+    }
+
+    /// The system folder, `%SystemRoot%\System32`, which an administrator's install made.
+    fn system32() -> PathBuf {
+        PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot is set")).join("System32")
+    }
+
+    #[test]
+    fn the_file_check_refuses_a_file_this_user_owns() {
+        let local_app_data = scratch("user-owned-file");
+        let file = local_app_data.join("gate.exe");
+        fs::write(&file, b"a file this user made").expect("the file is written");
+        let line = judged(&file, "$xm", "change it", &local_app_data);
+        let refusal = line.strip_suffix(']').expect("the refusal is in brackets");
+        assert_refused(refusal, &format!("gate-push: judged [{}", file.display()), "change it");
+        let cmd = judged(&system32().join("cmd.exe"), "$xm", "change it", &local_app_data);
+        assert_eq!(cmd, "gate-push: judged []", "the same check passes a file an administrator installed");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    #[expect(clippy::print_stderr, reason = "a case that cannot run here says why without failing")]
+    fn the_file_check_passes_an_admin_installed_file() {
+        let local_app_data = scratch("admin-file");
+        let program_files = PathBuf::from(std::env::var_os("ProgramFiles").expect("ProgramFiles is set"));
+        let file = program_files.join(r"PowerShell\7\pwsh.exe");
+        if !file.exists() {
+            eprintln!("skipped: no admin-installed file at {}", file.display());
+            let _ = fs::remove_dir_all(&local_app_data);
+            return;
+        }
+        let line = judged(&file, "$xm", "change it", &local_app_data);
+        assert_eq!(line, "gate-push: judged []");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn the_folder_check_passes_an_admin_installed_folder() {
+        let local_app_data = scratch("admin-folder");
+        let line = judged(&system32(), "$fm", "change what is in it", &local_app_data);
+        assert_eq!(line, "gate-push: judged []");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn the_folder_check_refuses_a_folder_users_may_write() {
+        let local_app_data = scratch("users-writable-folder");
+        let line = judged(Path::new(r"C:\ProgramData"), "$fm", "change what is in it", &local_app_data);
+        assert!(line.ends_with(r"lets BUILTIN\Users change what is in it]"), "{line}");
+        let _ = fs::remove_dir_all(&local_app_data);
+    }
+
+    #[test]
+    fn a_push_without_the_ssh_seam_installs_into_program_files() {
+        let script = |ssh_seam| {
+            filled(&Slots {
+                sha: SHA,
+                helper_sha: HELPER_SHA,
+                register: REGISTER,
+                place: place(ssh_seam),
+            })
+        };
+        let production = script(false);
+        assert!(production.contains(r"$dir='C:\Program Files\gate\bin';"), "{production}");
+        assert!(production.contains(r"$pin='C:\Program Files'"), "{production}");
+        let seamed = script(true);
+        assert!(seamed.contains(r"$dir=(Join-Path $env:LOCALAPPDATA 'gate\bin');"), "{seamed}");
+        assert!(seamed.contains("$pin=''"), "{seamed}");
     }
 
     #[test]

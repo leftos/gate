@@ -14,8 +14,8 @@ use serde_json::{Map, Value, json};
 use crate::remote::snapshot::IDENTITY;
 use crate::wait::REMOTE_LIMIT;
 
-/// The gate a builder runs, from its own `%LOCALAPPDATA%\gate\bin`, as cmd expands it.
-pub(crate) const BOX_EXE: &str = r#""%LOCALAPPDATA%\gate\bin\gate.exe""#;
+/// The gate a builder runs, from its admin-owned `C:\Program Files\gate\bin`, named literally.
+pub(crate) const BOX_EXE: &str = r#""C:\Program Files\gate\bin\gate.exe""#;
 /// The hex digits of a run's job nonce, as the box checks them, and of its outputs nonce.
 const JOB_NONCE_DIGITS: usize = 12;
 const RUN_NONCE_DIGITS: usize = 32;
@@ -755,11 +755,11 @@ mod tests {
 
     #[test]
     fn the_line_is_the_fixed_box_line_for_the_verb() {
-        assert_eq!(line(BoxVerb::Run), r#""%LOCALAPPDATA%\gate\bin\gate.exe" box run --stdin"#);
-        assert_eq!(line(BoxVerb::Preflight), r#""%LOCALAPPDATA%\gate\bin\gate.exe" box preflight --stdin"#);
+        assert_eq!(line(BoxVerb::Run), r#""C:\Program Files\gate\bin\gate.exe" box run --stdin"#);
+        assert_eq!(line(BoxVerb::Preflight), r#""C:\Program Files\gate\bin\gate.exe" box preflight --stdin"#);
         assert_eq!(
             line(BoxVerb::RegisterDesktop),
-            r#""%LOCALAPPDATA%\gate\bin\gate.exe" box register-desktop"#,
+            r#""C:\Program Files\gate\bin\gate.exe" box register-desktop"#,
             "a verb that reads no request has no --stdin"
         );
     }
