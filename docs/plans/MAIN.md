@@ -4,7 +4,7 @@
 
 ## Do first
 
-- [ ] GATE-480 Keep a load-only pause case from failing the full suite: wallSeconds short of the critical wait — Urgent · No project
+- [/] GATE-482 Add a profiling slot that holds the machine alone, light slots included — Urgent · Backlog
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [ ] GATE-427 Route herdr-gpui's Credential Manager tests and godot-mcp's GL tests over the desktop route — High · Remote
@@ -13,13 +13,15 @@
 - [/] GATE-440 Map and trial routing all of herdr-gpui's, yaat-server's and agent-park's heavy work — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [!] GATE-451 Make herdr-gpui's WSL command families routable to the builder — High · Remote
+- [ ] GATE-481 Find why delve's routed commit-hook build takes twice the PC's time on the builder — High · Remote
+- [ ] GATE-488 Keep the fetch-watchdog count case from timing out under the full routed suite's load — High · Backlog
 - [!] GATE-468 Route Unreal Engine packaging to the builder with an unreal toolchain pin — High · No project
-- [ ] GATE-469 Carry Git LFS content to the builder in a routed run — High · No project
+- [/] GATE-469 Carry Git LFS content to the builder in a routed run — High · No project
 - [ ] GATE-472 Map and trial routing ue-mcp's heavy work — High · No project
-- [ ] GATE-473 Restore npm packages on the box before a routed npm or npx command — High · No project
+- [/] GATE-473 Restore npm packages on the box before a routed npm or npx command — High · No project
 - [ ] GATE-474 Read the .gate files of a repo that cannot commit them from a PC-owned folder — High · No project
 - [ ] GATE-477 Release the builder's work folder when the PC's routed gate is killed — High · No project
-- [ ] GATE-478 Run a routed command's bare bash as Git Bash, not WSL's System32 bash.exe — High · No project
+- [/] GATE-478 Run a routed command's bare bash as Git Bash, not WSL's System32 bash.exe — High · No project
 
 ## Remote
 
@@ -134,6 +136,10 @@
 - [ ] GATE-465 Route a run's --env value that names a path inside the worktree to the builder's work folder
 - [ ] GATE-467 Count a nested gate started under a packaged pwsh as its parent's progress
 
+## Design
+
+- [ ] GATE-486 Design routing across two builders: one on the home network, one over the internet
+
 ## Cutover sweep
 
 - [ ] GATE-11 Caller sweep to gate on PATH; delete the PowerShell gate
@@ -210,6 +216,10 @@
 - [ ] GATE-457 Close the slim launcher's leftover edge cases
 - [ ] GATE-458 Make gate cutover's flag lines true now that the launcher ignores the flag
 - [ ] GATE-459 Fix the rare job-query overflow that fails a run's end
+- [ ] GATE-483 Trust the MSYS keeper's usr\bin by check_installed_file, not owner alone
+- [ ] GATE-484 Refuse a gate.exe built with test seams in install and gate push
+- [ ] GATE-485 Measure whether a routed command can steer the elevated box's tool lookup through HKCU PATH
+- [ ] GATE-487 Start the box's npm install as node.exe with npm-cli.js, not through the npm.cmd shim
 
 ## No project
 
