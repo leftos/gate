@@ -535,10 +535,12 @@ struct Prepared {
 }
 
 /// The versions, `major.minor.patch`, of the builder's installs a routed run uses, as the parity step chose them after
-/// the preflight: its Godot install and its Unreal Engine install, each `None` when none is chosen.
+/// the preflight: its Godot install and its Unreal Engine install, each `None` when none is chosen; and the names the
+/// main repo's manifest `[env]` sets to the Unreal Engine install's root, sent whether or not one is chosen.
 struct Chosen {
     godot: Option<String>,
     unreal: Option<String>,
+    engine_env: Vec<String>,
 }
 
 /// What the snapshot's tree gives the parity check, read before the preflight: the git that listed it, the worktree it
@@ -1196,6 +1198,7 @@ impl Attempt<'_, '_> {
             env: self.call.env,
             godot_version: chosen.godot.as_deref(),
             unreal_version: chosen.unreal.as_deref(),
+            engine_env: &chosen.engine_env,
             desktop: self.call.desktop,
         };
         let run_input = payload::input(&self.run_word(&location, &run), sent.manifest.as_deref());
@@ -1811,7 +1814,8 @@ impl Attempt<'_, '_> {
     /// is.
     ///
     /// The Unreal Engine version is chosen beside it ([`toolchain::unreal_choice`]): the highest the builder listed that
-    /// meets the main repo's manifest `unreal` pin, none for no pin or any version.
+    /// meets the main repo's manifest `unreal` pin, none for no pin or any version; the manifest's `[env]` names are
+    /// carried beside it ([`toolchain::engine_env`]).
     fn parity(&mut self, repos: &[Repo], snapshots: &[Snapshot], trees: &[Option<Tree>], prepared: &Prepared) -> Result<Chosen, End> {
         let mut refused = false;
         let main = trees.first().and_then(Option::as_ref);
@@ -1870,6 +1874,7 @@ impl Attempt<'_, '_> {
         Ok(Chosen {
             godot: chosen,
             unreal: toolchain::unreal_choice(unreal.as_deref(), &prepared.tools),
+            engine_env: main.map(|tree| toolchain::engine_env(tree.manifest.as_ref())).unwrap_or_default(),
         })
     }
 

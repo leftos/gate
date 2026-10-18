@@ -1795,11 +1795,17 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version; a routed run reads the `godot` and `unreal` entries as exact pins instead (below). The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot`, `unreal` and `ffmpeg`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
 
+    An optional `[env]` table of `NAME = "unreal"` names variables the box sets to the root of the Unreal Engine install the run chose, the folder `UE_ROOT` gets (below). `"unreal"` is the only value, and at most 64 entries are read.
+
     A repo's minimums are the lowest versions its own files require: `rust-version`, `rust-toolchain.toml` or the edition, `packageManager`, the launcher's `#requires`. Where nothing pins a floor, the minimum is the oldest toolchain the builders install (rust 1.89, the first with edition 2024's let chains); where neither applies, the entry is `""`. pwsh is `7.4` everywhere, since the launcher needs PowerShell 7. A minimum set higher than the repo needs would refuse a builder that can run it.
 
     A file that is not UTF-8 or does not parse is unreadable whole, and the line for it is `gate: cannot read .gate/toolchain.toml: <why>; skipping the manifest's checks`, `<why>` being `line <l>, column <c>: <toml message>` or `not valid UTF-8 (...)`. A routed run words a manifest problem its own way, `gate: .gate/toolchain.toml: <problem>; skipping it` (`gate: <full path>: <problem>; skipping it` for the declarations folder's copy), for a whole file that cannot be read as for a bad entry, `<problem>` escaped.
 
-    A bad entry is skipped alone and named in the reader's problems: `tools.<name> is not a version: "<text>"`, `tools.<name> is not a string (TOML <type>)`, `tools is not a table (TOML <type>)`, `workloads is not an array (TOML <type>)`, `workloads[<i>] is not a string (TOML <type>)`, `workloads[<i>] is empty` and `<key> is not a key of the manifest (tools, workloads)`.
+    A bad entry is skipped alone and named in the reader's problems: `tools.<name> is not a version: "<text>"`, `tools.<name> is not a string (TOML <type>)`, `tools is not a table (TOML <type>)`, `workloads is not an array (TOML <type>)`, `workloads[<i>] is not a string (TOML <type>)`, `workloads[<i>] is empty` and `<key> is not a key of the manifest (tools, workloads, env)`.
+
+    The `[env]` problems are `env is not a table (TOML <type>)`, `env has more than 64 names`, `env.<name> is not a string (TOML <type>)`, `env.<name> is not "unreal": "<value>"`, `env.<name> is a name the gate sets or refuses` (not an ASCII letter or `_` followed by letters, digits and `_`, or starting with `GIT_` in any case, or a name `--env` refuses).
+
+    Also `env.<name> is named twice` (in any ASCII case; the first is kept) and `env.<name> names the unreal install but the manifest pins no unreal` (the name is still sent).
 
     **On a routed run**, the client lists the snapshot's tree once before the preflight, with `git ls-tree -r -t -z <commit>` (a sibling's listing keeps `--name-only`): the file names parity needs and the `.gate` folder and `toolchain.toml` candidates for the manifest are read from that one listing. The `.gate` folder and `toolchain.toml` are found ignoring letter case, and the exact-case regular file wins.
 
@@ -1848,6 +1854,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     When the builder cannot be probed and the entry is `""`, the line is `gate: <host> did not probe unreal: <why>; not checking it`.
 
     After the preflight the client chooses, from the main repo's manifest pin, the highest reported version that meets it and sends it, spelled `x.y.z`, as the optional `UnrealVersion` of the run payload and of a warm-up's; a pin of `""` chooses the highest reported version, and no pin, or a pin no reported version meets, chooses none, and the field is left out. The box sets `UE_ROOT` from it (The box side, the command's environment).
+
+    The names of the manifest's `[env]` are sent as the optional `EngineEnv` of the run payload and of a warm-up's, an object of `{NAME: "unreal"}`, whenever the manifest has a usable name, an engine chosen or not; the box sets each to the chosen engine's folder. A builder whose gate predates `EngineEnv` ignores it.
 
     A tool the builder did not probe, gave no answer for, or found at a version that cannot be read against a minimum gets `gate: <host> did not probe <name>: <why>; not checking it` and is not a need. The lines come in this order: the SDK step's own, then the manifest's problem lines, then the per-tool skip lines in the manifest's order, then the mismatch lines.
 
@@ -2316,7 +2324,9 @@ Each verb is one ssh call today, and the call's cost is its connection, not its 
 
 A routed run therefore moves to one long-lived connection carrying every verb, `gate box serve`, and the per-call client stays until that lands (GATE-70 holds the measurement, and GATE-109 the work).
 
-The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`, and for `run` also `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest` and `GodotVersion`, and for `outputs` also `Name`.
+The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`.
+
+A `run` payload also holds `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, `GodotVersion` and `EngineEnv`. An `outputs` payload also holds `Name`.
 
 `inflight` reads only `Root`.
 
@@ -2504,6 +2514,10 @@ Built verbs:
   `GodotVersion`'s: `gate: box payload GodotVersion is not a version: '<value>'` for any value but a string of exactly three dot-separated parts of one to ten digits each with no leading zero (except `0`), as it is joined into an install's path; a value that is no string shows as compact JSON, shortened and escaped. A null `GodotVersion` is not set.
 
   `UnrealVersion`'s: `gate: box payload UnrealVersion is not a version: '<value>'`, exit 2, for any value `GodotVersion` refuses and shown the same way, as it is joined into an install's path. A null `UnrealVersion` is not set.
+
+  `EngineEnv`'s: `gate: box payload EngineEnv is not an object of texts`, `gate: box payload EngineEnv gives <name> a value other than "unreal": '<value>'`, `gate: box payload EngineEnv sets <name>, a name the gate sets or refuses`, `gate: box payload EngineEnv names <name> twice` and `gate: box payload EngineEnv is over its cap of 64 names or 32 KiB`, the names shortened and escaped.
+
+  `EngineEnv` and `Env` share the one cap, counted over both raw objects. A null `EngineEnv` is not set. A malformed `EngineEnv` is refused when the request is read, before the engine folder is probed; a warm-up may carry it though it may not carry `Env`.
 
   A warm-up payload's: `gate: box payload sets both Command and WarmCommands`, `gate: box payload lacks WarmHash`, `gate: box payload asks a warm-up for outputs` (an `Outputs` glob or `OutputsFull` true), `gate: box payload asks a warm-up for Env` (an `Env` that is not null, even `{}`), `gate: box payload WarmCommands is not a list of 1 to 8 commands, each a non-empty list of non-empty texts` and `gate: box payload WarmHash is not 64 lower-case hex digits: <value>`.
 
@@ -2745,9 +2759,13 @@ Built verbs:
 
   `GODOT_PATH` is then set for every command of the run to the Godot program that resolved: the root's install when the root is set, else, with no root, the program the `PATH` gave a Godot console word, or the `PATH`'s `Godot_console.exe` for any other. It is set after the caller's pairs and the gate's own settings, so none undoes it. When no Godot program resolves, `GODOT_PATH` is removed, an inherited value included. A run with no `GodotVersion` leaves the environment as before.
 
-  A run with an `UnrealVersion` resolves `<GATE_UNREAL_ROOT>\<version>` with the probe's root checks (no link in the root or its ancestors; the root inside none of the run's refused folders; the install's `Build.version` present), once when it reads the request, and sets `UE_ROOT` to it for every command of a plain, warm-up or desktop run, after the caller's pairs and the gate's own settings. When it cannot resolve, the run exits 127 with `gate: could not resolve unreal <version>: <why>`, before any desktop lock.
+  A run with an `UnrealVersion` resolves `<GATE_UNREAL_ROOT>\<version>` with the probe's root checks (no link in the root or its ancestors; the root inside none of the run's refused folders; the install's `Build.version` present), once when it reads the request, and sets `UE_ROOT` to it, and each name of the payload's `EngineEnv` to the same folder, for every command of a plain, warm-up or desktop run, after the caller's pairs and the gate's own settings.
 
-  A run with no `UnrealVersion` removes an inherited `UE_ROOT`. The package restore and the dotnet tool restore run without `UE_ROOT` whatever the box inherited.
+  An `EngineEnv` name replaces an inherited value and a caller's `Env` pair for it.
+
+   When it cannot resolve, the run exits 127 with `gate: could not resolve unreal <version>: <why>`, before any desktop lock.
+
+  A run with no `UnrealVersion` removes an inherited `UE_ROOT` and an inherited value of each `EngineEnv` name; a caller's `--env` pair for an `EngineEnv` name is kept. The package restore and the dotnet tool restore run without `UE_ROOT` and without the inherited values of the `EngineEnv` names, whatever the box inherited.
 
   Every command of a plain, warm-up or desktop run gets the trusted Git `bin` at the front of its `PATH`, so a recipe's bare `bash` resolves to Git's own `bash.exe` rather than WSL's in the system folder, and the command's first word resolves on that same `PATH`. The folder is `<Git root>\bin`, the root being the one the MSYS keeper's lookup finds above the box's `git.exe`, and it must hold `bash.exe`. It is used only when it lies outside every folder the run writes (the refused folders of the preflight's SDK read) and every file it puts ahead of the machine `PATH` passes the installed-file check the box's own image gets (`gate_win32::check_installed_file`): no link or junction, no network share, and an owner and access list that let no one but SYSTEM, Administrators or TrustedInstaller change what runs from it.
 

@@ -4,7 +4,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use gate_args::{MAX_WHOLE_NUMBER, shown_name};
+use gate_args::{MAX_WHOLE_NUMBER, MOST_ENV_BYTES, MOST_ENV_NAMES, env_refusal, over_cap, shown_name};
 use gate_router::warm::MOST_COMMANDS;
 pub(crate) use gate_router::{escaped, is_reordering_mark};
 use gate_router::{is_layout_name, repo_name};
@@ -17,6 +17,28 @@ use crate::remote::siblings::MOST_SIBLINGS;
 
 /// The decoded JSON object.
 pub(crate) struct Payload(Map<String, Value>);
+
+/// The key naming the variables a run's commands get set to the chosen Unreal Engine install's root.
+const ENGINE_ENV: &str = "EngineEnv";
+
+/// The one value an [`ENGINE_ENV`] entry may have.
+const ENGINE_ENV_UNREAL: &str = "unreal";
+
+/// The prefix of the names git reads, none of which a manifest `[env]` may set, compared without regard to ASCII case.
+const GIT_NAME_PREFIX: &str = "GIT_";
+
+/// Whether `name` cannot be a name a repo's toolchain manifest `[env]` sets, as the PC reads the manifest and the box
+/// reads `EngineEnv`: a name that is not an ASCII letter or `_` followed by ASCII letters, digits and `_`, a name
+/// starting with `GIT_` in any ASCII case, and a name `--env` refuses ([`env_refusal`]).
+pub(crate) fn engine_env_name_refused(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let well_formed = bytes.next().is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    let git = name
+        .get(..GIT_NAME_PREFIX.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(GIT_NAME_PREFIX));
+    !well_formed || git || env_refusal(name, "").is_some()
+}
 
 impl Payload {
     /// Decodes the payload word; else the usage line saying why it cannot be read.
@@ -219,6 +241,42 @@ impl Payload {
                 escaped(&shown_name(&other.as_str().map_or_else(|| other.to_string(), str::to_owned)))
             )),
         }
+    }
+
+    /// The names the run's commands get set to the root of the Unreal Engine install it uses, `EngineEnv`: an object of
+    /// each name and `"unreal"`, as the repo's toolchain manifest `[env]` names them; none when the key is absent or
+    /// null. Else the usage line: not an object of texts, over the cap `Env` and `EngineEnv` share
+    /// (`gate_args::MOST_ENV_NAMES`, `gate_args::MOST_ENV_BYTES`), a name the gate refuses ([`engine_env_name_refused`]),
+    /// a value other than `"unreal"`, or a name given twice in any ASCII case, the name shortened and escaped. The cap is
+    /// counted over the raw objects before any pair is copied.
+    pub(crate) fn engine_env(&self) -> Result<Vec<String>, String> {
+        let (names, bytes) = self.pair_size(ENGINE_ENV)?.unwrap_or_default();
+        let (env_names, env_bytes) = self.pair_size("Env")?.unwrap_or_default();
+        if over_cap(names + env_names, bytes + env_bytes) {
+            return Err(format!(
+                "gate: box payload {ENGINE_ENV} is over its cap of {MOST_ENV_NAMES} names or {} KiB",
+                MOST_ENV_BYTES / 1024
+            ));
+        }
+        let pairs = self.pairs(ENGINE_ENV)?;
+        let mut names: Vec<String> = Vec::with_capacity(pairs.len());
+        for (name, value) in pairs {
+            let shown = escaped(&shown_name(&name));
+            if engine_env_name_refused(&name) {
+                return Err(format!("gate: box payload {ENGINE_ENV} sets {shown}, a name the gate sets or refuses"));
+            }
+            if value != ENGINE_ENV_UNREAL {
+                return Err(format!(
+                    "gate: box payload {ENGINE_ENV} gives {shown} a value other than \"{ENGINE_ENV_UNREAL}\": '{}'",
+                    escaped(&shown_name(&value))
+                ));
+            }
+            if names.iter().any(|earlier| earlier.eq_ignore_ascii_case(&name)) {
+                return Err(format!("gate: box payload {ENGINE_ENV} names {shown} twice"));
+            }
+            names.push(name);
+        }
+        Ok(names)
     }
 
     /// What the run runs ([`Commands`]): the one `Command` of a payload that sets no `WarmCommands`, else the warm-up's
@@ -771,6 +829,90 @@ mod tests {
         assert_eq!(
             decoded("{}").and_then(|payload| payload.unreal_version().map(|read| read.is_none())),
             Ok(true)
+        );
+    }
+
+    /// What the `EngineEnv` reader makes of the payload whose `EngineEnv` is `engine_env`.
+    fn engine_env_of(engine_env: &serde_json::Value) -> Result<Vec<String>, String> {
+        decoded(&json!({ "EngineEnv": engine_env }).to_string()).and_then(|payload| payload.engine_env())
+    }
+
+    #[test]
+    fn engine_env_names_are_read_in_order_and_none_when_absent_or_null() {
+        assert_eq!(
+            engine_env_of(&json!({ "UE_MCP_TEST_ENGINE_ROOT": "unreal", "OTHER_ROOT": "unreal" })),
+            Ok(vec!["UE_MCP_TEST_ENGINE_ROOT".to_owned(), "OTHER_ROOT".to_owned()])
+        );
+        assert_eq!(engine_env_of(&serde_json::Value::Null), Ok(Vec::new()));
+        assert_eq!(decoded("{}").and_then(|payload| payload.engine_env()), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn a_malformed_engine_env_is_refused() {
+        for bad in [json!(["UE_MCP_TEST_ENGINE_ROOT"]), json!("unreal"), json!({ "A": 1 })] {
+            assert_eq!(
+                engine_env_of(&bad),
+                Err("gate: box payload EngineEnv is not an object of texts".to_owned()),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            engine_env_of(&json!({ "A": "godot\n" })),
+            Err("gate: box payload EngineEnv gives A a value other than \"unreal\": 'godot\\n'".to_owned())
+        );
+        assert_eq!(
+            engine_env_of(&json!({ "Engine_Root": "unreal", "ENGINE_ROOT": "unreal" })),
+            Err("gate: box payload EngineEnv names ENGINE_ROOT twice".to_owned())
+        );
+        assert_eq!(
+            engine_env_of(&json!({ "UE_ROOT": "godot" })),
+            Err("gate: box payload EngineEnv sets UE_ROOT, a name the gate sets or refuses".to_owned()),
+            "a refused name is named before its value, as the PC does"
+        );
+    }
+
+    /// `EngineEnv` and `Env` share `Env`'s cap of 64 names or 32 KiB, counted before any pair is read.
+    #[test]
+    fn engine_env_over_the_cap_it_shares_with_env_is_refused() {
+        let over = "gate: box payload EngineEnv is over its cap of 64 names or 32 KiB".to_owned();
+        let named =
+            |count: usize| -> serde_json::Map<String, serde_json::Value> { (0..count).map(|at| (format!("N{at}"), json!("unreal"))).collect() };
+        let read = |json: serde_json::Value| decoded(&json.to_string()).and_then(|payload| payload.engine_env());
+
+        assert_eq!(read(json!({ "EngineEnv": named(64) })).map(|names| names.len()), Ok(64));
+        assert_eq!(read(json!({ "EngineEnv": named(65) })), Err(over.clone()));
+        assert_eq!(
+            read(json!({ "EngineEnv": named(60), "Env": { "A": "1", "B": "2", "C": "3", "D": "4", "E": "5" } })),
+            Err(over.clone())
+        );
+        let long = "N".repeat(32 * 1024);
+        assert_eq!(read(json!({ "EngineEnv": { long: "unreal" } })), Err(over), "over the bytes");
+    }
+
+    #[test]
+    fn an_engine_env_name_the_gate_refuses_is_refused() {
+        for name in [
+            "UE_ROOT",
+            "GODOT_PATH",
+            "GATE_X",
+            "PATH",
+            "A=B",
+            "GIT_WORK_TREE",
+            "git_dir",
+            "A-B",
+            "1A",
+            "",
+        ] {
+            assert_eq!(
+                engine_env_of(&json!({ name: "unreal" })),
+                Err(format!("gate: box payload EngineEnv sets {name}, a name the gate sets or refuses")),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            engine_env_of(&json!({ "BAD\u{1}": "unreal" })),
+            Err("gate: box payload EngineEnv sets BAD\\u{1}, a name the gate sets or refuses".to_owned()),
+            "a forged name is escaped"
         );
     }
 

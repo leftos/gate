@@ -2575,6 +2575,85 @@ fn box_run_without_an_unreal_version_removes_an_inherited_ue_root() {
     assert_eq!(outcome.stdout, "fake-tool: UE_ROOT is not set\n", "{outcome:?}");
 }
 
+/// A name a repo's toolchain manifest `[env]` sets to the chosen engine's root, as the payload's `EngineEnv` names it.
+const ENGINE_ENV_NAME: &str = "UE_MCP_TEST_ENGINE_ROOT";
+
+/// A stale value of [`ENGINE_ENV_NAME`] the box inherited, which no run's command may see.
+const STALE_ENGINE_ENV: &str = r"C:\stale\engine";
+
+/// `gate box run` of `payload` as [`run_box_with_unreal`] runs it, with no `UE_ROOT` of its own and the stale
+/// [`ENGINE_ENV_NAME`] the box inherited.
+fn run_box_with_engine_env(case: &Case, payload: &Value, root: Option<&Path>) -> Outcome {
+    let mut command = box_call(case, &["box", "run"], &self::payload(payload));
+    if let Some(root) = root {
+        command.env("GATE_UNREAL_ROOT", root);
+    } else {
+        command.env_remove("GATE_UNREAL_ROOT");
+    }
+    command.env("PATH", path_for_run(&[]));
+    command.env_remove("UE_ROOT");
+    command.env(ENGINE_ENV_NAME, STALE_ENGINE_ENV);
+    command.finish()
+}
+
+/// The `EngineEnv` naming [`ENGINE_ENV_NAME`].
+fn engine_env() -> Value {
+    json!({ ENGINE_ENV_NAME: "unreal" })
+}
+
+/// A run whose `EngineEnv` names a variable gives its command that variable naming the chosen engine, the same folder
+/// `UE_ROOT` names, over the value the box inherited and over the caller's own `Env` pair for it.
+#[test]
+fn box_run_sets_an_engine_env_name_to_the_chosen_unreal_over_an_inherited_one() {
+    let case = Case::new("box_run_engine_env_chosen");
+    let root = unreal_root(&case);
+    fake_unreal(&root.join("5.7.3"), "5.7.3");
+    fake_unreal(&root.join("5.8.0"), "5.8.0");
+    let mut payload = unreal_payload(&case, &[FAKE_TOOL, "env", ENGINE_ENV_NAME], Some("5.8.0"));
+    payload["EngineEnv"] = engine_env();
+    payload["Env"] = json!({ ENGINE_ENV_NAME: r"C:\pc\UE_5.8" });
+
+    let outcome = run_box_with_engine_env(&case, &payload, Some(&root));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, format!("{}\n", root.join("5.8.0").display()), "{outcome:?}");
+}
+
+/// A run with an `EngineEnv` but no `UnrealVersion` gives its command none of the variable, the box's inherited one
+/// removed, though the root holds an engine.
+#[test]
+fn box_run_without_an_unreal_version_removes_an_inherited_engine_env_name() {
+    let case = Case::new("box_run_engine_env_none");
+    let root = unreal_root(&case);
+    fake_unreal(&root.join("5.8.0"), "5.8.0");
+    let mut payload = unreal_payload(&case, &[FAKE_TOOL, "env", ENGINE_ENV_NAME], None);
+    payload["EngineEnv"] = engine_env();
+
+    let outcome = run_box_with_engine_env(&case, &payload, Some(&root));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, format!("fake-tool: {ENGINE_ENV_NAME} is not set\n"), "{outcome:?}");
+}
+
+/// An `EngineEnv` naming a variable the gate owns is refused with the usage line before anything is checked out.
+#[test]
+fn box_run_refuses_an_engine_env_name_the_gate_owns() {
+    let case = Case::new("box_run_engine_env_refused");
+    let mut payload = unreal_payload(&case, &[FAKE_TOOL, "env", "UE_ROOT"], Some("5.8.0"));
+    let laid = work_entries(&payload);
+    payload["EngineEnv"] = json!({ "UE_ROOT": "unreal" });
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(
+        outcome.stderr, "gate: box payload EngineEnv sets UE_ROOT, a name the gate sets or refuses\n",
+        "{outcome:?}"
+    );
+    assert_eq!(work_entries(&payload), laid, "nothing is checked out or run");
+}
+
 /// Checks a run whose `UnrealVersion` 5.8.0 did not resolve failed to start, status 127, with the one line saying why
 /// `why` and nothing run.
 fn assert_unreal_not_resolved(outcome: &Outcome, why: &str) {
@@ -6223,6 +6302,30 @@ fn box_run_the_pnpm_install_gets_safe_directory() {
     assert!(
         said.lines().any(|line| line == format!("GIT_CONFIG_VALUE_{index}=*")),
         "safe.directory is `*`: {said:?}"
+    );
+}
+
+/// The dotnet tool restore and the package install of a run whose `EngineEnv` names a variable start without the value
+/// the box inherited for it, as they start without its `UE_ROOT`.
+#[test]
+fn box_run_restores_start_without_an_inherited_engine_env_name() {
+    let case = Case::new("box_run_restores_engine_env");
+    let mut payload = pnpm_payload(&case, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
+    payload["EngineEnv"] = engine_env();
+    let seen = case.folder().join("seen.txt");
+    let say = |program: &str| format!(">>\"{}\" echo {program} [%{ENGINE_ENV_NAME}%]\r\n", shown(&seen));
+    let path = path_for_pnpm(&[stub_dotnet_running(&case, 0, &say("dotnet")), stub_pnpm(&case, 0, &say("pnpm"))]);
+    let mut call = pnpm_box(&case, &payload, &path);
+    call.env(ENGINE_ENV_NAME, STALE_ENGINE_ENV);
+
+    let outcome = call.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = fs::read_to_string(&seen).expect("the restores wrote what they saw");
+    assert_eq!(
+        lines(&said),
+        ["dotnet []", "pnpm []"],
+        "neither restore saw the inherited value: {outcome:?}"
     );
 }
 

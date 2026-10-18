@@ -3,7 +3,8 @@
 //! caller hands over each file's text.
 //!
 //! The manifest is a `[tools]` table of `name = "version"`, where a version is a minimum (`major[.minor[.patch]]`, its
-//! missing parts 0) and `""` means present at any version, and a top-level `workloads` array of .NET workload ids. A
+//! missing parts 0) and `""` means present at any version, a top-level `workloads` array of .NET workload ids, and an
+//! `[env]` table of `NAME = "unreal"`, variables a routed run sets to the chosen Unreal Engine install's root. A
 //! file that does not parse is unreadable whole; a bad entry is skipped alone, with a problem naming it. The entries
 //! read otherwise are `godot` and `unreal`, whose values pin an exact version, as the pins read beside the manifest do:
 //! each local dotnet tool's version in `.config/dotnet-tools.json` and the `Godot.NET.Sdk` version a project file names.
@@ -11,9 +12,10 @@
 use serde_json::Value as Json;
 use toml::{Table, Value};
 
+use gate_args::MOST_ENV_NAMES;
 use gate_router::{parse_failure, spelled};
 
-use crate::boxside::payload::escaped;
+use crate::boxside::payload::{engine_env_name_refused, escaped};
 use crate::boxside::probe::Probed;
 use crate::remote::git::{FAILURE_BYTES, first_bytes};
 use crate::remote::parity::{Need, NeedKind, number};
@@ -183,6 +185,10 @@ pub(crate) struct Manifest {
     pub godot: Option<Exact>,
     /// The `[tools] unreal` entry when the manifest names unreal, read as [`Manifest::godot`] is.
     pub unreal: Option<Exact>,
+    /// The `[env]` names that read, in file order: each a variable a routed run's commands get set to the root of the
+    /// Unreal Engine install the run chose, its value in the file being `"unreal"`. A name stays here when the manifest
+    /// pins no unreal, so the builder still removes a value it inherited, though [`Manifest::problems`] names it.
+    pub env: Vec<String>,
 }
 
 /// The line said when the manifest cannot be read, `why` being the reason [`read`] or [`read_bytes`] gives.
@@ -406,6 +412,12 @@ pub(crate) fn godot_required(manifest: Option<&Result<Manifest, String>>, pins: 
 /// judged and no version is chosen.
 pub(crate) fn unreal_required(manifest: Option<&Result<Manifest, String>>) -> Option<Vec<Pin>> {
     readable(manifest).and_then(|manifest| manifest.unreal).map(exact_pins)
+}
+
+/// The names a repo's manifest `[env]` sets to the root of the Unreal Engine install a routed run chose
+/// ([`Manifest::env`]); none when the manifest names none, cannot be read or the repo has none.
+pub(crate) fn engine_env(manifest: Option<&Result<Manifest, String>>) -> Vec<String> {
+    readable(manifest).map(|manifest| manifest.env.clone()).unwrap_or_default()
 }
 
 /// The manifest `manifest` when the repo has one that reads.
@@ -737,9 +749,10 @@ pub(crate) fn read_bytes(bytes: &[u8]) -> Result<Manifest, String> {
 /// The manifest whose text is `text`, a leading byte order mark skipped as the TOML parser skips it; `Err` with the
 /// line, column and message of the failure when it is not TOML. A bad entry is skipped and named in
 /// [`Manifest::problems`]: a tool whose value is not a string or not a version, a `tools` that is not a table, a
-/// `workloads` that is not an array, a workload that is not a string or is empty, and a top-level key other than
-/// `tools` and `workloads`. A `godot` entry that reads is kept as its exact pin in [`Manifest::godot`] as well as
-/// among the tools.
+/// `workloads` that is not an array, a workload that is not a string or is empty, a bad `env` entry ([`read_env`]), and
+/// a top-level key other than `tools`, `workloads` and `env`. A `godot` entry that reads is kept as its exact pin in
+/// [`Manifest::godot`] as well as among the tools. `env` names kept in a manifest that pins no unreal are each named
+/// as a problem too, and kept.
 pub(crate) fn read(text: &str) -> Result<Manifest, String> {
     let table = text.parse::<Table>().map_err(|error| parse_failure(text, &error))?;
     let mut manifest = Manifest::default();
@@ -747,12 +760,62 @@ pub(crate) fn read(text: &str) -> Result<Manifest, String> {
         match key.as_str() {
             "tools" => read_tools(value, &mut manifest),
             "workloads" => read_workloads(value, &mut manifest),
+            "env" => read_env(value, &mut manifest),
             _ => manifest
                 .problems
-                .push(format!("{} is not a key of the manifest (tools, workloads)", spelled(&key))),
+                .push(format!("{} is not a key of the manifest (tools, workloads, env)", spelled(&key))),
+        }
+    }
+    if manifest.unreal.is_none() {
+        for name in &manifest.env {
+            manifest
+                .problems
+                .push(format!("env.{} names the unreal install but the manifest pins no unreal", spelled(name)));
         }
     }
     Ok(manifest)
+}
+
+/// The one value an `[env]` entry may have: the root of the Unreal Engine install a routed run chose.
+const ENV_UNREAL: &str = "unreal";
+
+/// Reads the `env` value `value` into `manifest`, each entry a name or a problem: a value that is not the string
+/// `"unreal"`, a name the gate refuses ([`engine_env_name_refused`]), and a name an earlier entry kept in another
+/// ASCII letter case, the first one kept. Only the first [`MOST_ENV_NAMES`] entries are read; the rest are one problem.
+fn read_env(value: Value, manifest: &mut Manifest) {
+    let entries = match value {
+        Value::Table(entries) => entries,
+        other => {
+            manifest.problems.push(format!("env is not a table (TOML {})", other.type_str()));
+            return;
+        }
+    };
+    if entries.len() > MOST_ENV_NAMES {
+        manifest.problems.push(format!("env has more than {MOST_ENV_NAMES} names"));
+    }
+    for (name, value) in entries.into_iter().take(MOST_ENV_NAMES) {
+        match env_entry(&name, &value, &manifest.env) {
+            Ok(()) => manifest.env.push(name),
+            Err(problem) => manifest.problems.push(problem),
+        }
+    }
+}
+
+/// Whether the `[env]` entry `name` whose value is `value` is kept beside the names `kept`; `Err` with its problem.
+fn env_entry(name: &str, value: &Value, kept: &[String]) -> Result<(), String> {
+    let Value::String(text) = value else {
+        return Err(format!("env.{} is not a string (TOML {})", spelled(name), value.type_str()));
+    };
+    if engine_env_name_refused(name) {
+        return Err(format!("env.{} is a name the gate sets or refuses", spelled(name)));
+    }
+    if text != ENV_UNREAL {
+        return Err(format!("env.{} is not \"{ENV_UNREAL}\": {text:?}", spelled(name)));
+    }
+    if kept.iter().any(|earlier| earlier.eq_ignore_ascii_case(name)) {
+        return Err(format!("env.{} is named twice", spelled(name)));
+    }
+    Ok(())
 }
 
 /// `text` without a leading byte order mark.
@@ -991,8 +1054,8 @@ fn attributes(text: &str) -> Vec<(&str, &str)> {
 mod tests {
     use super::{
         Exact, GodotChoice, Judged, MANIFEST_SAID, Manifest, NoChosenGodot, Pin, Pinned, Reported, Standing, ToolNeed, Version, dotnet_tools,
-        godot_choice, godot_not_listed_line, godot_pins_read, godot_required, godot_sdk_pins, is_sent, judge, meets, needs_of, newest_godot,
-        no_chosen_godot, no_godot_install_line, no_pin_godot_warning, pinned, read, read_bytes, reported, reported_as, routed_needs,
+        engine_env, godot_choice, godot_not_listed_line, godot_pins_read, godot_required, godot_sdk_pins, is_sent, judge, meets, needs_of,
+        newest_godot, no_chosen_godot, no_godot_install_line, no_pin_godot_warning, pinned, read, read_bytes, reported, reported_as, routed_needs,
         several_godot_line, skip_line, standing, unreadable_godot_pins_line, unreadable_line, unreal_choice,
     };
     use crate::remote::git::FAILURE_BYTES;
@@ -1254,7 +1317,7 @@ mod tests {
         assert_eq!(
             read.problems,
             [
-                "\"a b\" is not a key of the manifest (tools, workloads)",
+                "\"a b\" is not a key of the manifest (tools, workloads, env)",
                 "tools.\"my tool\" is not a string (TOML integer)",
                 "tools.\"x.y\" is not a version: \"latest\"",
                 "tools.node is not a string (TOML boolean)",
@@ -1359,7 +1422,91 @@ mod tests {
     fn a_top_level_key_other_than_tools_and_workloads_is_skipped_with_its_problem() {
         let read = manifest("siblings = [\"../other\"]\n[tools]\nnode = \"24\"\n");
         assert_eq!(read.tools, [tool("node", Some(version(24, 0, 0)), true)]);
-        assert_eq!(read.problems, ["siblings is not a key of the manifest (tools, workloads)"]);
+        assert_eq!(read.problems, ["siblings is not a key of the manifest (tools, workloads, env)"]);
+    }
+
+    /// The text of a manifest pinning unreal 5.8 whose `[env]` table holds `entries`.
+    fn with_env(entries: &str) -> String {
+        format!("[tools]\nunreal = \"5.8\"\n[env]\n{entries}")
+    }
+
+    #[test]
+    fn an_env_entry_naming_unreal_is_read() {
+        let read = manifest(&with_env("UE_MCP_TEST_ENGINE_ROOT = \"unreal\"\n"));
+        assert_eq!(read.env, owned(&["UE_MCP_TEST_ENGINE_ROOT"]));
+        assert_eq!(read.problems, Vec::<String>::new());
+        assert_eq!(engine_env(Some(&Ok(read))), owned(&["UE_MCP_TEST_ENGINE_ROOT"]));
+        assert_eq!(engine_env(None), Vec::<String>::new(), "no manifest names none");
+        assert_eq!(
+            engine_env(Some(&Err("bad".to_owned()))),
+            Vec::<String>::new(),
+            "an unreadable one names none"
+        );
+    }
+
+    #[test]
+    fn an_env_value_other_than_unreal_is_a_problem() {
+        let read = manifest(&with_env("A = \"godot\"\nB = \"Unreal\"\nC = 1\nD = \"unreal\"\n"));
+        assert_eq!(read.env, owned(&["D"]));
+        assert_eq!(
+            read.problems,
+            [
+                "env.A is not \"unreal\": \"godot\"",
+                "env.B is not \"unreal\": \"Unreal\"",
+                "env.C is not a string (TOML integer)",
+            ]
+        );
+        let read = manifest("env = \"unreal\"\n[tools]\nunreal = \"\"\n");
+        assert_eq!(read.env, Vec::<String>::new());
+        assert_eq!(read.problems, ["env is not a table (TOML string)"]);
+    }
+
+    #[test]
+    fn an_env_name_the_gate_refuses_is_a_problem() {
+        for name in [
+            "UE_ROOT",
+            "GODOT_PATH",
+            "GATE_ANYTHING",
+            "ue_root",
+            "GIT_WORK_TREE",
+            "git_dir",
+            "A-B",
+            "_1-",
+        ] {
+            let read = manifest(&with_env(&format!("{name} = \"unreal\"\nKEPT = \"unreal\"\n")));
+            assert_eq!(read.env, owned(&["KEPT"]), "{name}");
+            assert_eq!(read.problems, [format!("env.{name} is a name the gate sets or refuses")]);
+        }
+        let read = manifest(&with_env("\"A=B\" = \"unreal\"\n"));
+        assert_eq!(read.problems, ["env.\"A=B\" is a name the gate sets or refuses"], "a malformed name");
+    }
+
+    #[test]
+    fn an_env_of_more_than_64_names_keeps_the_first_64_and_is_one_problem() {
+        let names = |count: usize| -> Vec<String> { (0..count).map(|at| format!("N{at}")).collect() };
+        let entries = |count: usize| -> String { names(count).iter().map(|name| name.clone() + " = \"unreal\"\n").collect() };
+        let read = manifest(&with_env(&entries(66)));
+        assert_eq!(read.env, names(64));
+        assert_eq!(read.problems, ["env has more than 64 names"]);
+        assert_eq!(manifest(&with_env(&entries(64))).problems, Vec::<String>::new(), "64 is within the cap");
+    }
+
+    #[test]
+    fn an_env_name_twice_in_another_case_is_a_problem() {
+        let read = manifest(&with_env("Engine_Root = \"unreal\"\nENGINE_ROOT = \"unreal\"\n"));
+        assert_eq!(read.env, owned(&["Engine_Root"]), "the first is kept");
+        assert_eq!(read.problems, ["env.ENGINE_ROOT is named twice"]);
+    }
+
+    #[test]
+    fn an_env_entry_without_an_unreal_pin_is_a_problem_and_still_named() {
+        let read = manifest("[env]\nUE_MCP_TEST_ENGINE_ROOT = \"unreal\"\n[tools]\nnode = \"24\"\n");
+        assert_eq!(read.env, owned(&["UE_MCP_TEST_ENGINE_ROOT"]));
+        assert_eq!(
+            read.problems,
+            ["env.UE_MCP_TEST_ENGINE_ROOT names the unreal install but the manifest pins no unreal"]
+        );
+        assert_eq!(engine_env(Some(&Ok(read))), owned(&["UE_MCP_TEST_ENGINE_ROOT"]));
     }
 
     #[test]

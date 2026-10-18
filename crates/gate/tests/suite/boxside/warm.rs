@@ -13,11 +13,12 @@ use serde_json::{Value, json};
 use regex::Regex;
 
 use super::{
-    BUN_LOCKFILE, BUN_LOCKFILE_PATH, ENDLESS, Folders, NODE_MODULES_IGNORED, NPM_LOCKFILE, NPM_LOCKFILE_PATH, PNPM_LOCKFILE, PNPM_LOCKFILE_PATH,
-    STALE_UE_ROOT, box_call, bun_install_call, command_call, fake_godot, fake_unreal, field, gate_box, godot_root, has_ref, install_call, installs,
-    let_go, lines_starting, marks, npm_install_call, pair_payload, pair_snapshot, pair_tree, passed, path_for_bun, path_for_npm, path_for_pnpm,
-    pnpm_box, pnpm_calls, refused_line, renamed, run_box, run_box_with_git_bin, run_box_with_godot, run_box_with_seams, run_box_with_unreal,
-    snapshot, started_line, stopped_line_for, stub_bun, stub_npm, stub_pnpm, unreal_root,
+    BUN_LOCKFILE, BUN_LOCKFILE_PATH, ENDLESS, ENGINE_ENV_NAME, Folders, NODE_MODULES_IGNORED, NPM_LOCKFILE, NPM_LOCKFILE_PATH, PNPM_LOCKFILE,
+    PNPM_LOCKFILE_PATH, STALE_UE_ROOT, box_call, bun_install_call, command_call, engine_env, fake_godot, fake_unreal, field, gate_box, godot_root,
+    has_ref, install_call, installs, let_go, lines_starting, marks, npm_install_call, pair_payload, pair_snapshot, pair_tree, passed, path_for_bun,
+    path_for_npm, path_for_pnpm, pnpm_box, pnpm_calls, refused_line, renamed, run_box, run_box_with_engine_env, run_box_with_git_bin,
+    run_box_with_godot, run_box_with_seams, run_box_with_unreal, snapshot, started_line, stopped_line_for, stub_bun, stub_npm, stub_pnpm,
+    unreal_root,
 };
 use crate::support::{Case, FAKE_TOOL, GATE, Outcome, box_payload, shown, wait_until, wait_until_closed};
 
@@ -834,6 +835,26 @@ fn box_warm_up_resolves_its_unreal_once_for_every_command() {
     let engine = root.join("5.8.0").display().to_string();
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stdout, format!("{engine}\n{engine}\n"), "{outcome:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// A warm-up's `EngineEnv` is taken, and its commands see the variable it names naming the chosen engine over the
+/// value the box inherited, as a run's do.
+#[test]
+fn box_warm_up_sets_its_engine_env_names_for_its_unreal_version() {
+    let case = Case::new("box_warm_engine_env");
+    let root = unreal_root(&case);
+    fake_unreal(&root.join("5.8.0"), "5.8.0");
+    let mut payload = warm_payload(&case, &[&[FAKE_TOOL, "env", ENGINE_ENV_NAME]]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    payload["UnrealVersion"] = json!("5.8.0");
+    payload["EngineEnv"] = engine_env();
+
+    let outcome = run_box_with_engine_env(&case, &payload, Some(&root));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, format!("{}\n", root.join("5.8.0").display()), "{outcome:?}");
+    assert_eq!(outcome.stderr.lines().last(), Some(warm_said().as_str()), "{outcome:?}");
     wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 

@@ -103,8 +103,9 @@ pub(crate) fn bare(root: &str, repo: &str) -> String {
 /// complete; the run's ceiling in whole seconds, which the box counts in load-adjusted time (`Timeout`), and the PC's
 /// name for the builder, which the box's kill line names (`Host`); the run's variables, the caller's `--env` pairs and
 /// the gate's `SourceRevisionId` (`Env`, sent only when there is one); and each sibling's name and the commit its snapshot is (`SiblingSnapshots`, sent only when there is
-/// one); and the versions of the builder's Godot install and Unreal Engine install the run uses (`GodotVersion` and
-/// `UnrealVersion`, each sent only when one is chosen).
+/// one); the versions of the builder's Godot install and Unreal Engine install the run uses (`GodotVersion` and
+/// `UnrealVersion`, each sent only when one is chosen); and the names set to the Unreal Engine install's root
+/// (`EngineEnv`, sent only when there is one).
 pub(crate) struct RunCall<'a> {
     pub words: &'a [String],
     pub subfolder: &'a str,
@@ -126,6 +127,10 @@ pub(crate) struct RunCall<'a> {
     /// The version, `major.minor.patch`, of the builder's Unreal Engine install the run uses (`UnrealVersion`, sent
     /// only when one is chosen), which a warm-up sends too.
     pub unreal_version: Option<&'a str>,
+    /// The names the repo's toolchain manifest `[env]` sets to the root of the chosen Unreal Engine install
+    /// (`EngineEnv`, an object of each name and `"unreal"`, sent only when there is one, whether or not a version is
+    /// chosen, so the box removes a value it inherited), which a warm-up sends too.
+    pub engine_env: &'a [String],
     /// Whether the run asks for the builder's desktop (`Desktop: true` and `DesktopWait`, the usual remote wait in
     /// whole seconds, sent only then); a warm-up never sends them, as the box refuses a warm-up on the desktop.
     pub desktop: bool,
@@ -246,14 +251,22 @@ fn identity() -> Value {
     )
 }
 
-/// Adds `run`'s `SiblingSnapshots`, when it has any, its `InputsDigest`, when it has one, and its `GodotVersion` and
-/// `UnrealVersion`, each when one is chosen, to `object`.
+/// Adds `run`'s `SiblingSnapshots`, when it has any, its `InputsDigest`, when it has one, its `GodotVersion` and
+/// `UnrealVersion`, each when one is chosen, and its `EngineEnv`, when it names any, to `object`.
 fn insert_siblings_and_inputs(object: &mut Map<String, Value>, run: &RunCall<'_>) {
     if let Some(version) = run.godot_version {
         object.insert("GodotVersion".to_owned(), json!(version));
     }
     if let Some(version) = run.unreal_version {
         object.insert("UnrealVersion".to_owned(), json!(version));
+    }
+    if !run.engine_env.is_empty() {
+        let names: Map<String, Value> = run
+            .engine_env
+            .iter()
+            .map(|name| (name.clone(), Value::String("unreal".to_owned())))
+            .collect();
+        object.insert("EngineEnv".to_owned(), Value::Object(names));
     }
     if !run.sibling_snapshots.is_empty() {
         let snapshots: Map<String, Value> = run
@@ -368,6 +381,7 @@ mod tests {
             env: &[],
             godot_version: None,
             unreal_version: None,
+            engine_env: &[],
             desktop: false,
         };
         run_word(&location().with_pair("app", &["lib".to_owned(), "tools".to_owned()]), &run)
@@ -490,6 +504,7 @@ mod tests {
             env: &[],
             godot_version: None,
             unreal_version: None,
+            engine_env: &[],
             desktop: false,
         };
         let mut expected = preflight;
@@ -533,6 +548,7 @@ mod tests {
             env: &[],
             godot_version: None,
             unreal_version: None,
+            engine_env: &[],
             desktop: false,
         };
 
@@ -568,6 +584,7 @@ mod tests {
             env: &env,
             godot_version: None,
             unreal_version: None,
+            engine_env: &[],
             desktop: false,
         };
 
@@ -604,6 +621,7 @@ mod tests {
             env: &[],
             godot_version: Some("4.7.2"),
             unreal_version: None,
+            engine_env: &[],
             desktop: false,
         };
         let commands = warm_commands();
@@ -646,6 +664,7 @@ mod tests {
             env: &[],
             godot_version: None,
             unreal_version: Some("5.8.0"),
+            engine_env: &[],
             desktop: false,
         };
         let commands = warm_commands();
@@ -672,6 +691,55 @@ mod tests {
     }
 
     #[test]
+    fn a_run_and_a_warm_up_send_the_engine_env_names_and_none_without_any() {
+        let words = ["build.cmd".to_owned()];
+        let names = ["UE_MCP_TEST_ENGINE_ROOT".to_owned()];
+        let mut run = RunCall {
+            words: &words,
+            subfolder: "",
+            nonce: "0123456789abcdef0123456789abcdef",
+            snapshot: SHA,
+            outputs: &[],
+            full: false,
+            timeout: 1,
+            host: "builder",
+            sibling_snapshots: &[],
+            inputs_digest: None,
+            env: &[],
+            godot_version: None,
+            unreal_version: None,
+            engine_env: &names,
+            desktop: false,
+        };
+        let commands = warm_commands();
+        let warm = WarmCall {
+            commands: &commands,
+            hash: WARM_HASH,
+        };
+
+        let word = run_word(&location(), &run);
+        assert_eq!(
+            decoded(&word)["EngineEnv"],
+            json!({ "UE_MCP_TEST_ENGINE_ROOT": "unreal" }),
+            "sent with no version chosen too"
+        );
+        assert_eq!(on_the_box(&word).engine_env(), Ok(names.to_vec()), "the box reads it back");
+        let warm_word_sent = warm_word(&location(), &run, &warm);
+        assert_eq!(
+            decoded(&warm_word_sent)["EngineEnv"],
+            json!({ "UE_MCP_TEST_ENGINE_ROOT": "unreal" }),
+            "a warm-up sends it too"
+        );
+        assert!(on_the_box(&warm_word_sent).commands().is_ok(), "the box takes a warm-up with it");
+
+        run.engine_env = &[];
+        let word = run_word(&location(), &run);
+        assert!(decoded(&word).get("EngineEnv").is_none(), "no names send no EngineEnv key");
+        assert_eq!(on_the_box(&word).engine_env(), Ok(Vec::new()));
+        assert!(decoded(&warm_word(&location(), &run, &warm)).get("EngineEnv").is_none());
+    }
+
+    #[test]
     fn a_desktop_run_asks_for_the_desktop_with_the_usual_remote_wait_and_no_other_call_does() {
         let words = ["./tool.exe".to_owned()];
         let mut run = RunCall {
@@ -688,6 +756,7 @@ mod tests {
             env: &[],
             godot_version: None,
             unreal_version: None,
+            engine_env: &[],
             desktop: true,
         };
         let commands = warm_commands();
@@ -742,6 +811,7 @@ mod tests {
             env: &[],
             godot_version: None,
             unreal_version: None,
+            engine_env: &[],
             desktop: false,
         }
     }

@@ -11,9 +11,9 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use super::{
-    BoxCall, GIT_BIN_STAND_IN, adjusted_seconds, box_call, fake_godot, fake_unreal, field, gate_box, godot_root, let_go, lines_starting,
-    pair_payload, pair_snapshot, path_for_run, path_godot, payload as request_line, refused_line, run_box, snapshot, started_line, stopped_line_for,
-    unreal_root,
+    BoxCall, ENGINE_ENV_NAME, GIT_BIN_STAND_IN, STALE_ENGINE_ENV, adjusted_seconds, box_call, engine_env, fake_godot, fake_unreal, field, gate_box,
+    godot_root, let_go, lines_starting, pair_payload, pair_snapshot, path_for_run, path_godot, payload as request_line, refused_line, run_box,
+    snapshot, started_line, stopped_line_for, unreal_root,
 };
 use crate::support::{
     Case, Closed, FAKE_TOOL, HeldDesktop, KeptDesktop, Outcome, box_payload, build_version, copy_tool, desktop_payload, desktop_seams, junction,
@@ -398,6 +398,27 @@ fn a_desktop_run_sets_ue_root_for_the_chosen_unreal() {
     let mut command = desktop_call(&case, &payload, "ok", &[]);
     command.env("GATE_UNREAL_ROOT", &root);
     command.env("UE_ROOT", r"C:\stale\UE_5.0");
+
+    let outcome = command.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, format!("{}\n", root.join("5.8.0").display()), "{outcome:?}");
+    ran_its_command(&outcome, &payload);
+}
+
+/// A desktop run with an `EngineEnv` gives its command the variable it names naming the chosen engine, over the value
+/// the box inherited, as any run does.
+#[test]
+fn a_desktop_run_sets_its_engine_env_names_for_the_chosen_unreal() {
+    let case = Case::new("desktop_engine_env");
+    let root = unreal_root(&case);
+    fake_unreal(&root.join("5.8.0"), "5.8.0");
+    let mut payload = ready_payload(&case, &[FAKE_TOOL, "env", ENGINE_ENV_NAME]);
+    payload["UnrealVersion"] = json!("5.8.0");
+    payload["EngineEnv"] = engine_env();
+    let mut command = desktop_call(&case, &payload, "ok", &[]);
+    command.env("GATE_UNREAL_ROOT", &root);
+    command.env(ENGINE_ENV_NAME, STALE_ENGINE_ENV);
 
     let outcome = command.finish();
 

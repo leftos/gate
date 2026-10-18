@@ -543,13 +543,13 @@ enum Installed {
 }
 
 /// The launch of `manager`'s install in `folder`: its program and install words, the program found on the box's
-/// `PATH`, the box's own environment as a run's processes get it ([`box_variables`]) with git's `safe.directory` set to
-/// `*` over it as the command's is ([`with_safe_directory`]) and `CI=true` over that, and the restricted token the
-/// command gets; else why it cannot be launched.
-fn install_launch(manager: &Manager, folder: &Path) -> Result<PipedLaunch, String> {
+/// `PATH`, the box's own environment as a run's processes get it, less the run's `EngineEnv` names `engine_env`
+/// ([`box_variables`]), with git's `safe.directory` set to `*` over it as the command's is ([`with_safe_directory`]) and
+/// `CI=true` over that, and the restricted token the command gets; else why it cannot be launched.
+fn install_launch(manager: &Manager, folder: &Path, engine_env: &[String]) -> Result<PipedLaunch, String> {
     let found = locate(manager.program)?.ok_or_else(|| gate_win32::win32_message(ERROR_FILE_NOT_FOUND))?;
     let token = RestrictedToken::of_this_process().map_err(|error| format!("cannot make its restricted token: {error}"))?;
-    let variables = with_safe_directory(box_variables()).with("CI", "true");
+    let variables = with_safe_directory(box_variables(engine_env)).with("CI", "true");
     let environment = variables.block().map_err(|error| format!("cannot build its environment: {error}"))?;
     let words: Vec<OsString> = manager.install_words.iter().copied().map(OsString::from).collect();
     match written(&found, &words, &variables) {
@@ -577,7 +577,7 @@ fn install(request: &Request<'_>, lockfile: &Lockfile<'_>, key: &str, beat: &Bea
     if let Err(status) = before_the_job(beat.stop.look(&starting), request.job, beat.lock, console) {
         return Ok(Installed::Ended(status));
     }
-    let launch = install_launch(manager, &lockfile.folder)?;
+    let launch = install_launch(manager, &lockfile.folder, &request.engine_env)?;
     let name = packages_job_name(request.job);
     let job = Job::create_kill_on_close(&name).map_err(|error| format!("cannot create its job {name}: {error}"))?;
     let _stopper = Stopper { job: &job, armed: true };

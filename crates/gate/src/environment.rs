@@ -84,6 +84,15 @@ impl Variables {
     pub(crate) fn block(&self) -> io::Result<EnvironmentBlock> {
         EnvironmentBlock::new(self.0.iter().cloned())
     }
+
+    /// Each name the environment sets and the value it has, in no particular order.
+    #[cfg(test)]
+    pub(crate) fn names(&self) -> Vec<(String, String)> {
+        self.0
+            .iter()
+            .map(|(name, value)| (name.to_string_lossy().into_owned(), value.to_string_lossy().into_owned()))
+            .collect()
+    }
 }
 
 /// What the gate sets over its own environment for the command: the slot marker, the build-server settings of the run

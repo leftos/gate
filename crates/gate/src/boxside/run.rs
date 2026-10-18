@@ -137,6 +137,10 @@ pub(super) struct Request<'a> {
     /// ([`resolved_engine`]) and handed to every command alike: `Ok(None)` when none is chosen, `Err` with the line its
     /// commands fail to start with when it does not resolve.
     engine: Result<Option<PathBuf>, String>,
+    /// The names `EngineEnv` sets to the root of the chosen engine ([`with_unreal`]), as the repo's toolchain manifest
+    /// `[env]` names them; none when the payload gives none. Every process the box starts for the run's repo loses the
+    /// values it inherited for them ([`box_variables`]).
+    pub(super) engine_env: Vec<String>,
     /// The folders the run writes ([`preflight::refused_folders`]): no folder a command runs from may lie inside one,
     /// neither the chosen engine's ([`resolved_engine`]) nor Git's `bin` ([`with_git_bin_first`]).
     refused: Vec<PathBuf>,
@@ -189,6 +193,8 @@ impl Request<'_> {
         let env = caller_env(payload)?;
         let godot = payload.godot_version()?;
         let refused = preflight::refused_folders(payload, work);
+        // Before the engine is resolved, so a malformed one is refused before any engine folder is probed.
+        let engine_env = payload.engine_env()?;
         let engine = resolved_engine(payload.unreal_version()?, &refused);
         let inputs_digest = payload.inputs_digest()?;
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
@@ -208,6 +214,7 @@ impl Request<'_> {
             env,
             godot,
             engine,
+            engine_env,
             refused,
             outputs,
             nonce,
@@ -1209,7 +1216,7 @@ pub(super) fn full_path(path: &Path) -> Option<PathBuf> {
 /// node reuse are off. Git's `safe.directory` is set to `*` over that ([`with_safe_directory`]), and the Event Log
 /// logging provider of a .NET host the command starts is turned off over that ([`with_event_log_off`]). The command runs
 /// with a restricted copy of the box's token ([`restricted_token`]). The program and a run's `GODOT_PATH` are
-/// [`resolved_command`]'s, and its `UE_ROOT` [`with_unreal`]'s, through [`prepared`].
+/// [`resolved_command`]'s, and its `UE_ROOT` and `EngineEnv` names [`with_unreal`]'s, through [`prepared`].
 fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<Ran, u32> {
     let Prepared {
         word,
@@ -1286,9 +1293,9 @@ struct Prepared<'w> {
 }
 
 /// Resolves `one`'s program in its place and writes its command line, with the environment [`command_variables`]
-/// composes, the program and a run's `GODOT_PATH` being [`resolved_command`]'s and its `UE_ROOT` [`with_unreal`]'s,
-/// before anything holds a job or the builder's desktop for it, so a desktop run gets the same program and environment
-/// as any run. `Err` with the run's answer when it cannot start: `Ok` with 127 for a chosen Unreal Engine that does not
+/// composes, the program and a run's `GODOT_PATH` being [`resolved_command`]'s and its `UE_ROOT` and `EngineEnv` names
+/// [`with_unreal`]'s, before anything holds a job or the builder's desktop for it, so a desktop run gets the same
+/// program and environment as any run. `Err` with the run's answer when it cannot start: `Ok` with 127 for a chosen Unreal Engine that does not
 /// resolve, a program not found or one with no shell to run it, its line said; `Err` with 2 for a batch word refused,
 /// or 1 for the box's own failure, its line said.
 fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> Result<Prepared<'w>, Result<Ran, u32>> {
@@ -1298,9 +1305,10 @@ fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> 
     };
     let exe = std::env::current_exe().map_err(|error| Err(failed(console, &format!("the box's own path cannot be read: {error}"))))?;
     let job = handed_job(request.job, gate_win32::own_session());
-    let variables = with_git_bin_first(command_variables(&request.env, &run, &job, &exe), &request.refused);
+    let variables = command_variables(&request.env, &request.engine_env, &run, &job, &exe);
+    let variables = with_git_bin_first(variables, &request.refused);
     let (variables, found) = resolved_command(request.godot, word, variables, one.place);
-    let variables = match with_unreal(&request.engine, variables) {
+    let variables = match with_unreal(&request.engine, &request.engine_env, variables) {
         Ok(variables) => variables,
         Err(line) => {
             console.err(&line);
@@ -1331,14 +1339,14 @@ fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> 
     }
 }
 
-/// The environment the payload's command is started with: the box's own, with the caller's `Env` pairs `env` set over
-/// it, then the gate's own settings for the run `run` — the build-server settings ([`Variables::with_build_servers`]),
-/// git's `safe.directory` ([`with_safe_directory`]), the Event Log logging provider off ([`with_event_log_off`]), and
-/// the box run's own names: [`BOX_JOB_VARIABLE`] the job `job` the command runs in, as the command reaches it
+/// The environment the payload's command is started with: the box's own less the `EngineEnv` names `engine_env`
+/// ([`box_variables`]), with the caller's `Env` pairs `env` set over it, then the gate's own settings for the run `run`
+/// — the build-server settings ([`Variables::with_build_servers`]), git's `safe.directory` ([`with_safe_directory`]),
+/// the Event Log logging provider off ([`with_event_log_off`]), and the box run's own names: [`BOX_JOB_VARIABLE`] the job `job` the command runs in, as the command reaches it
 /// ([`handed_job`]), and [`BOX_EXE_VARIABLE`] the box's own image `exe`. The caller's pairs stand before every setting
 /// the gate applies, so none of them can undo one.
-fn command_variables(env: &[(String, String)], run: &str, job: &str, exe: &Path) -> Variables {
-    with_event_log_off(with_safe_directory(box_variables().with_caller(env).with_build_servers(run)))
+fn command_variables(env: &[(String, String)], engine_env: &[String], run: &str, job: &str, exe: &Path) -> Variables {
+    with_event_log_off(with_safe_directory(box_variables(engine_env).with_caller(env).with_build_servers(run)))
         .with(BOX_JOB_VARIABLE, job)
         .with(BOX_EXE_VARIABLE, &exe.to_string_lossy())
 }
@@ -1451,15 +1459,18 @@ fn resolved_command(godot: Option<&str>, word: &str, variables: Variables, place
 const UE_ROOT: &str = "UE_ROOT";
 
 /// The box's own environment as every process it starts for a run's repo gets it — the command, a package install, a
-/// tool restore — before what each sets over it: the box's process environment less any `UE_ROOT` it inherited
-/// ([`without_engine`]), so none of them sees an engine the run did not choose.
-pub(super) fn box_variables() -> Variables {
-    without_engine(Variables::from_process())
+/// tool restore — before what each sets over it: the box's process environment less any `UE_ROOT` it inherited and any
+/// value of the run's `EngineEnv` names `engine_env` ([`without_engine`]), so none of them sees an engine the run did
+/// not choose.
+pub(super) fn box_variables(engine_env: &[String]) -> Variables {
+    without_engine(Variables::from_process(), engine_env)
 }
 
-/// `inherited` with every value it holds for `UE_ROOT` removed.
-fn without_engine(inherited: Variables) -> Variables {
-    inherited.without(UE_ROOT)
+/// `inherited` with every value it holds for `UE_ROOT` and for each of the names `engine_env` removed.
+fn without_engine(inherited: Variables, engine_env: &[String]) -> Variables {
+    engine_env
+        .iter()
+        .fold(inherited.without(UE_ROOT), |variables, name| variables.without(name))
 }
 
 /// The Unreal Engine install a run whose chosen version is `unreal` uses, resolved once for all its commands: the
@@ -1471,7 +1482,7 @@ fn resolved_engine(unreal: Option<&str>, refused: &[PathBuf]) -> Result<Option<P
         return Ok(None);
     };
     let worktrees: Vec<&Path> = refused.iter().map(PathBuf::as_path).collect();
-    let variables = box_variables();
+    let variables = box_variables(&[]);
     variables
         .get(probe::UNREAL_ROOT)
         .ok_or_else(|| format!("{} is not set", probe::UNREAL_ROOT))
@@ -1482,12 +1493,17 @@ fn resolved_engine(unreal: Option<&str>, refused: &[PathBuf]) -> Result<Option<P
 
 /// The environment `variables` of a command of a run whose engine resolved to `engine` ([`resolved_engine`]): with
 /// one, `UE_ROOT` set over every other value they hold for it, the caller's having been refused, to that engine's
-/// folder; with none, as they are, the box's inherited value already gone ([`box_variables`]). `Err` with the line
-/// the engine failed to resolve with. The command's first word is never read.
-fn with_unreal(engine: &Result<Option<PathBuf>, String>, variables: Variables) -> Result<Variables, String> {
+/// folder, and then each of the `EngineEnv` names `engine_env` set to the same folder, over a caller's pair for it;
+/// with none, as they are, the box's inherited values already gone ([`box_variables`]). `Err` with the line the engine
+/// failed to resolve with. The command's first word is never read.
+fn with_unreal(engine: &Result<Option<PathBuf>, String>, engine_env: &[String], variables: Variables) -> Result<Variables, String> {
     match engine {
         Ok(None) => Ok(variables),
-        Ok(Some(folder)) => Ok(variables.with(UE_ROOT, &folder.to_string_lossy())),
+        Ok(Some(folder)) => {
+            let folder = folder.to_string_lossy();
+            let variables = variables.with(UE_ROOT, &folder);
+            Ok(engine_env.iter().fold(variables, |variables, name| variables.with(name, &folder)))
+        }
         Err(line) => Err(line.clone()),
     }
 }
@@ -2687,10 +2703,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CLOSED_STATUS, GIT_CONFIG_COUNT, Look, Of, One, Payload, Request, SHARING_VIOLATION, STARTING_COMMAND, before_the_job, client_gone,
-        command_spent, command_variables, gap_spent, handed_job, look, prepared, remaining_budget, with_path_first, with_safe_directory,
-        without_engine, written_retrying,
+        CLOSED_STATUS, GIT_CONFIG_COUNT, GODOT_PATH, Look, Of, One, PATH_VARIABLE, Payload, Request, SHARING_VIOLATION, STARTING_COMMAND, UE_ROOT,
+        before_the_job, client_gone, command_spent, command_variables, gap_spent, handed_job, look, prepared, remaining_budget, resolved_command,
+        with_git_bin_first, with_path_first, with_safe_directory, with_unreal, without_engine, written_retrying,
     };
+    use crate::boxside::payload::engine_env_name_refused;
     use gate_args::{EnvRefusal, env_refusal};
 
     use crate::boxside::forward::OutputLock;
@@ -2983,7 +3000,7 @@ mod tests {
             ("Logging__EventLog__LogLevel__Default".to_owned(), "Warning".to_owned()),
         ];
 
-        let variables = command_variables(&caller, "gate-box-ab", RUN_JOB, Path::new(BOX_IMAGE));
+        let variables = command_variables(&caller, &[], "gate-box-ab", RUN_JOB, Path::new(BOX_IMAGE));
 
         assert_eq!(variables.get("MSBUILDUSESERVER"), Some(OsStr::new("0")), "the gate's value wins");
         assert_eq!(variables.get("DOTNET_CLI_USE_MSBUILD_SERVER"), Some(OsStr::new("0")));
@@ -2998,7 +3015,7 @@ mod tests {
 
     #[test]
     fn command_variables_tell_the_command_the_box_s_exe_and_its_job_verbatim() {
-        let variables = command_variables(&[], "gate-box-ab", RUN_JOB, Path::new(BOX_IMAGE));
+        let variables = command_variables(&[], &[], "gate-box-ab", RUN_JOB, Path::new(BOX_IMAGE));
 
         assert_eq!(
             variables.get(BOX_JOB_VARIABLE),
@@ -3039,7 +3056,7 @@ mod tests {
             // Composed anyway, as an inherited value stands where a caller's pair would.
             let caller = [(name.to_owned(), "forged".to_owned())];
 
-            let variables = command_variables(&caller, "gate-box-ab", RUN_JOB, Path::new(BOX_IMAGE));
+            let variables = command_variables(&caller, &[], "gate-box-ab", RUN_JOB, Path::new(BOX_IMAGE));
 
             assert_eq!(variables.get(BOX_JOB_VARIABLE), Some(OsStr::new(RUN_JOB)), "{name}");
             assert_eq!(variables.get(BOX_EXE_VARIABLE), Some(OsStr::new(BOX_IMAGE)), "{name}");
@@ -3052,7 +3069,7 @@ mod tests {
         // the box composes over, and the caller's pair stands exactly where an inherited one does.
         let caller = [("GIT_CONFIG_COUNT".to_owned(), "9".to_owned())];
 
-        let variables = command_variables(&caller, "gate-box-ab", RUN_JOB, Path::new(BOX_IMAGE));
+        let variables = command_variables(&caller, &[], "gate-box-ab", RUN_JOB, Path::new(BOX_IMAGE));
 
         assert_eq!(
             variables.get(GIT_CONFIG_COUNT),
@@ -3063,14 +3080,51 @@ mod tests {
         assert_eq!(variables.get("GIT_CONFIG_VALUE_9"), Some(OsStr::new("*")));
     }
 
-    /// The base every process the box starts for a run's repo gets holds no `UE_ROOT` the box inherited.
+    /// No variable the box sets on a command can be a manifest `[env]` name, so none of the gate's settings can be undone
+    /// by one: every name the command's environment sets over the box's own ([`command_variables`],
+    /// [`with_git_bin_first`], [`resolved_command`], [`with_unreal`]) is refused by [`engine_env_name_refused`].
+    #[test]
+    fn every_variable_the_box_sets_on_a_command_is_refused_as_an_engine_env_name() {
+        let caller = vec![("ZZ_CALLER".to_owned(), "1".to_owned())];
+        let variables = command_variables(&caller, &[], "gate-box-ab", RUN_JOB, Path::new(BOX_IMAGE));
+        let variables = with_path_first(with_git_bin_first(variables, &[]), Path::new(r"C:\gate-guard\bin"));
+        let place = std::env::temp_dir();
+        let (variables, _) = resolved_command(Some("4.7.2"), "tool.exe", variables.with("GATE_GODOT_ROOT", r"C:\gate-guard"), &place);
+        let engine = Ok(Some(PathBuf::from(r"C:\gate-guard\UE_5.8")));
+        let named = with_unreal(&engine, &[], variables).map(|variables| variables.names());
+        assert!(named.is_ok(), "an engine that resolved sets its variables");
+
+        let inherited = Variables::from_process();
+        let set: Vec<String> = named
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(name, value)| inherited.get(name).is_none_or(|was| was != OsStr::new(value)))
+            .map(|(name, _)| name)
+            .filter(|name| name != "ZZ_CALLER")
+            .collect();
+
+        assert!(set.iter().any(|name| name == UE_ROOT), "the guard sees what the gate sets: {set:?}");
+        for name in set.iter().map(String::as_str).chain([GODOT_PATH, UE_ROOT, PATH_VARIABLE]) {
+            assert!(
+                engine_env_name_refused(name),
+                "{name} is set by the gate but not refused as an [env] name"
+            );
+        }
+    }
+
+    /// The base every process the box starts for a run's repo gets holds no `UE_ROOT` the box inherited, nor a value
+    /// of a name the run's `EngineEnv` gives.
     #[test]
     fn the_box_s_base_environment_holds_no_ue_root() {
-        let inherited = Variables::from_process().with("UE_ROOT", r"C:\stale\UE_5.0").with("ZZ_KEPT", "1");
+        let inherited = Variables::from_process()
+            .with("UE_ROOT", r"C:\stale\UE_5.0")
+            .with("UE_MCP_TEST_ENGINE_ROOT", r"C:\stale\engine")
+            .with("ZZ_KEPT", "1");
 
-        let base = without_engine(inherited);
+        let base = without_engine(inherited, &["ue_mcp_test_engine_root".to_owned()]);
 
         assert_eq!(base.get("UE_ROOT"), None);
+        assert_eq!(base.get("UE_MCP_TEST_ENGINE_ROOT"), None, "removed in any ASCII case");
         assert_eq!(base.get("ZZ_KEPT"), Some(OsStr::new("1")), "the rest is kept");
     }
 

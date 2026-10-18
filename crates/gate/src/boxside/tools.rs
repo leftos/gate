@@ -162,10 +162,11 @@ enum Restored {
 }
 
 /// The launch of `dotnet tool restore` in `place`, the `dotnet` found on the box's `PATH` and the box's own environment
-/// as a run's processes get it ([`box_variables`]) given; else why it cannot be launched.
-fn restore_launch(place: &Path) -> Result<PipedLaunch, String> {
+/// as a run's processes get it, less the run's `EngineEnv` names `engine_env` ([`box_variables`]), given; else why it
+/// cannot be launched.
+fn restore_launch(place: &Path, engine_env: &[String]) -> Result<PipedLaunch, String> {
     let dotnet = locate("dotnet")?.ok_or_else(|| gate_win32::win32_message(ERROR_FILE_NOT_FOUND))?;
-    let variables = box_variables();
+    let variables = box_variables(engine_env);
     let environment = variables.block().map_err(|error| format!("cannot build its environment: {error}"))?;
     let words: Vec<OsString> = RESTORE_WORDS.into_iter().map(OsString::from).collect();
     match written(&dotnet, &words, &variables) {
@@ -193,7 +194,7 @@ fn restore(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
     if let Err(status) = before_the_job(beat.stop.look(STARTING_RESTORE), request.job, beat.lock, console) {
         return Ok(Restored::Ended(status));
     }
-    let launch = restore_launch(place)?;
+    let launch = restore_launch(place, &request.engine_env)?;
     let name = restore_job_name(request.job);
     let job = Job::create_kill_on_close(&name).map_err(|error| format!("cannot create its job {name}: {error}"))?;
     let _stopper = Stopper { job: &job, armed: true };

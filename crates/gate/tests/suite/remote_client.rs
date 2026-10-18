@@ -3186,17 +3186,26 @@ const STALE_UE_ROOT: &str = r"C:\stale\UE_5.0";
 /// inherited `UE_ROOT` is `inherited`, none when not given: it goes remote with no parity line and runs once, on the
 /// builder, and passes.
 fn a_routed_unreal_run(case: &Case, root: &Path, inherited: Option<&str>) -> Outcome {
+    a_routed_unreal_run_of(case, root, &[r".\tool.exe", "env", "UE_ROOT", "mark", RAN], inherited, &[])
+}
+
+/// A routed run of the command `words`, as [`a_routed_unreal_run`] runs it, with each of the variables `also` the
+/// builder inherits beside `UE_ROOT`.
+fn a_routed_unreal_run_of(case: &Case, root: &Path, words: &[&str], inherited: Option<&str>, also: &[(&str, &str)]) -> Outcome {
     let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
     let routing = json!({ "host": HOST, "slots": 2, "repos": { &repo: ["*tool*"] }, "outputs": { &repo: [] } });
     write_remote_json(case, &routing.to_string());
     let box_path = box_path_with_tools(case, &listing(&[BUILDER_SDK]), &[], &[]);
     let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
-    let mut gate = client_gate(case, "out.log", &steps, &[r".\tool.exe", "env", "UE_ROOT", "mark", RAN]);
+    let mut gate = client_gate(case, "out.log", &steps, words);
     gate.env("PATH", box_path).env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING);
     match inherited {
         Some(value) => gate.env("UE_ROOT", value),
         None => gate.env_remove("UE_ROOT"),
     };
+    for (name, value) in also {
+        gate.env(name, value);
+    }
     set_unreal_root(&mut gate, Some(root));
 
     let (pid, outcome) = finish_with_pid(gate);
@@ -3292,6 +3301,33 @@ fn a_routed_run_of_an_unreal_pinned_repo_reaches_its_command_with_ue_root() {
 
     assert!(saw_the_engine(&outcome, &root, "5.8.0"), "{outcome:?}");
     assert!(!outcome.stdout.contains(STALE_UE_ROOT), "{outcome:?}");
+}
+
+/// A routed run of a repo whose manifest pins an Unreal Engine and names a variable in its `[env]` reaches its command,
+/// through the box, with that variable naming the same engine `UE_ROOT` names, over the value the builder inherited.
+#[test]
+fn a_routed_run_whose_manifest_names_an_engine_env_reaches_its_command_with_it() {
+    let case = client_case("client-unreal-engine-env");
+    write(
+        &case,
+        MANIFEST,
+        "[tools]\nunreal = \"5.8.0\"\n[env]\nUE_MCP_TEST_ENGINE_ROOT = \"unreal\"\n",
+    );
+    let root = unreal_root(&case, &["5.8.0"]);
+    let words = [r".\tool.exe", "env", "UE_ROOT", "env", "UE_MCP_TEST_ENGINE_ROOT", "mark", RAN];
+    let stale = r"C:\stale\engine";
+
+    let outcome = a_routed_unreal_run_of(&case, &root, &words, Some(STALE_UE_ROOT), &[("UE_MCP_TEST_ENGINE_ROOT", stale)]);
+
+    // The command prints `UE_ROOT`, then the manifest's variable, each on its own line: both name the engine.
+    let engine = root.join("5.8.0").display().to_string();
+    assert!(outcome.stdout.contains(&format!("{engine}\n{engine}\n")), "{outcome:?}");
+    assert!(!outcome.stdout.contains("UE_MCP_TEST_ENGINE_ROOT is not set"), "{outcome:?}");
+    assert!(!outcome.stdout.contains(stale), "the inherited value is gone: {outcome:?}");
+    assert!(
+        !outcome.stderr.contains("toolchain.toml"),
+        "the manifest reads without a problem: {outcome:?}"
+    );
 }
 
 /// A Ctrl+C raised just before the manifest is read ends the run as an interrupt before the preflight: nothing reaches
