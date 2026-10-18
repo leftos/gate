@@ -30,7 +30,7 @@ A trial runs the repo's full command routed, once, and assumes a local run passe
 - **A step that fails locally too** is the repo's own failure. The pattern stays routed, since routed and local agree, and the failure goes to the repo as an inbox note.
 - **A step that passes locally but fails routed** is a routing failure. It is fixed in the builder's setup and that step alone is retried routed, once. If it still fails, the repo's patterns come back out of `remote.json` and the failure is booked as a GATE issue.
 
-A first routed run in a new work folder is cold, so give the trial a generous `--timeout`; the repo's ordinary routed runs keep their usual ceilings. Run one heavy trial at a time.
+A first routed run in a new work folder is cold: the gate raises its ceiling to `min(2 x ceiling, ceiling + 1800 s)` and says so, so the trial still wants a `--timeout` near what a cold build takes, since the raise is at most half an hour more; the repo's ordinary routed runs keep their usual ceilings. Run one heavy trial at a time.
 
 ## A repo with a command that needs the builder's desktop
 

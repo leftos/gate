@@ -194,6 +194,12 @@ pub(crate) fn hang_hint(running_seconds: f64, usual: Usual) -> Option<String> {
     ))
 }
 
+/// The usual p90 a routed run's hang hint compares with: `usual`, or none for a `cold` run, whose work tree on the
+/// builder is new and whose ceiling was raised, as a usual p90 learnt from warm runs would call it hung.
+pub(crate) fn routed_usual(usual: Option<Usual>, cold: bool) -> Option<Usual> {
+    usual.filter(|_| !cold)
+}
+
 /// The `expected` field of a claim and a ticket for `estimate`: its usual and p90 seconds to three decimals, a midpoint
 /// to the even digit as the journal writes seconds, its run count and the key it was read under.
 pub(crate) fn expected_field(estimate: &Estimate) -> Map<String, Value> {
@@ -529,7 +535,7 @@ mod tests {
 
     use super::{
         GitLimits, Resolved, RunDurations, Said, StoreSeen, Usual, ceiling_hint, expected_line, hang_hint, in_unit, raised_ceiling_line,
-        resolve_ceiling, span_text,
+        resolve_ceiling, routed_usual, span_text,
     };
     use crate::console::Console;
 
@@ -767,6 +773,15 @@ mod tests {
             hang_hint(41.0, usual(10.0)).as_deref(),
             Some("gate: still running after 41 s, 4x its usual p90 of 10 s")
         );
+    }
+
+    #[test]
+    fn a_cold_routed_run_gets_no_hang_hint() {
+        let compared = routed_usual(Some(usual(840.0)), true);
+        assert_eq!(compared, None, "a cold run compares with no p90");
+        assert_eq!(compared.and_then(|usual| hang_hint(10.0 * 840.0, usual)), None, "even at 10x the p90");
+        assert_eq!(routed_usual(Some(usual(840.0)), false), Some(usual(840.0)), "a warm run keeps its p90");
+        assert_eq!(routed_usual(None, false), None, "no history");
     }
 
     #[test]

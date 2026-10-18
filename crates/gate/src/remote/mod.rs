@@ -25,7 +25,8 @@ use crate::durations::Usual;
 #[cfg(feature = "test-seams")]
 pub(crate) use client::local_transport;
 pub(crate) use client::{
-    CREATED, NOT_RECOGNIZED, USAGE as BOX_USAGE, Warm, local_sdk_listing, other_build, outside_worktree, sdks_of, their_version, warm_of,
+    CREATED, NEW_WORK_TREE, NOT_RECOGNIZED, USAGE as BOX_USAGE, Warm, local_sdk_listing, other_build, outside_worktree, sdks_of, their_version,
+    warm_of,
 };
 pub(crate) use retry::SSH_FAILED;
 
@@ -344,6 +345,9 @@ pub(crate) struct RemoteOutcome {
     pub box_killed: Option<BoxKill>,
     /// How a warm-up ended; `None` for a call that is no warm-up.
     pub warm: Option<WarmEnd>,
+    /// The ceiling, in whole seconds, the run call was sent once the builder's preflight found the run's work tree new,
+    /// raised from the call's; `None` for a run whose ceiling was its own.
+    pub raised: Option<u64>,
 }
 
 /// How long a routed run's parts took: the run call, the command's own time, which its ceiling counts; the push; and the

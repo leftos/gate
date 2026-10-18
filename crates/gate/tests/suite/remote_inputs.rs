@@ -189,7 +189,13 @@ fn a_run_the_box_refuses_for_its_inputs_falls_back_inputs() {
     let case = inputs_case("client-inputs-run-refused");
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", &format!("hold {}", shown(go.path())), "ok"]);
-    let running = start(client_gate(&case, "out.log", &steps, &RAN));
+    // The attempt's lines, the cold note of the work folder made now among them, are said again after the command's
+    // own: a tail of 40 lines keeps the command's line in sight.
+    let tuned = Tuned {
+        extra: &["--tail", "40"],
+        ..Tuned::default()
+    };
+    let running = start(client_gate_tuned(&case, "out.log", &steps, &tuned, &RAN));
     running.wait_until("the run call", || calls(&steps).len() == 4);
     fs::remove_file(work_folder(&case).join(INPUT_ON_DISK)).expect("the installed input can be removed");
     drop(go);
@@ -368,9 +374,10 @@ fn a_pass_that_sent_inputs_names_them_in_its_split() {
     let outcome = finish(client_gate(&case, "out.log", &steps, &RAN));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    // The case's first run meets a new work folder: its 3600 s ceiling is raised to 5400 s.
     let line = Regex::new(concat!(
         r"(?m)^gate: passed in \d+ s on builder ",
-        r"\(load-adjusted \d+ s, ceiling 3600 s; command \d+ s, push \d+ s, inputs \d+ s\)\. ",
+        r"\(load-adjusted \d+ s, ceiling 5400 s; command \d+ s, push \d+ s, inputs \d+ s\)\. ",
         r"Full output: .*out\.log\r?$",
     ))
     .expect("the pattern is valid");

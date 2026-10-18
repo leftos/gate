@@ -66,7 +66,7 @@ use super::{
 };
 use crate::boxside::outputs::{NAMES_SKIPPED, OUTPUTS_BUDGET};
 use crate::boxside::payload::{PairRefused, Payload, escaped};
-use crate::durations::{Usual, hang_hint};
+use crate::durations::{Usual, hang_hint, routed_usual};
 use crate::environment::Variables;
 use crate::outputs::archive::sent_limit;
 use crate::outputs::hash::{SHA256_DIGITS, is_lower_hex};
@@ -91,6 +91,9 @@ const VERSION: &str = "gate: remote version ";
 /// The work folder's warm-up, `gate: remote warm <hash|none>`, said right after the version line; the space keeps the
 /// box's `gate: remote warm-up …` lines from matching.
 const WARM: &str = "gate: remote warm ";
+/// The preflight's line, right after the warm line, when it found the work folder's tree new: nothing had the name
+/// `.git` there.
+pub(crate) const NEW_WORK_TREE: &str = "gate: remote new work tree";
 pub(crate) const CREATED: &str = "gate: remote created ";
 /// The builder's boot time, which the preflight and the `boot` call say.
 const BOOT: &str = "gate: remote boot ";
@@ -357,6 +360,8 @@ impl RemoteClient for RustClient {
             local_major: None,
             warm: None,
             marker_seen: false,
+            raised: None,
+            backstop_seam: self.backstop_ms.map(Duration::from_millis),
         };
         if let Some(line) = raised {
             attempt.say(line);
@@ -519,9 +524,10 @@ pub(super) enum End {
 /// What the preflight found: the bare repositories it created just now, as its `gate: remote created {bare}` lines name
 /// them, the builder's boot time, `None` when it said none, the SDKs it lists, `None` when it said no SDK line, the
 /// tools its `Needs` named, and what the builder said of each of them, in that order, a tool it said nothing of left
-/// out.
+/// out, and whether it said the work folder's tree is new ([`new_work_tree`]).
 struct Prepared {
     created: Vec<String>,
+    new_tree: bool,
     boot: Option<String>,
     sdks: Option<Vec<String>>,
     sent: Vec<String>,
@@ -1085,6 +1091,12 @@ pub(super) struct Attempt<'c, 'a> {
     warm: Option<WarmEnd>,
     /// Whether a call of the attempt said the box's start marker, however the call ended, a failure included.
     marker_seen: bool,
+    /// The run call's ceiling, in whole seconds, once it was raised for a work tree the preflight found new
+    /// ([`Attempt::raise_ceiling`]); `None` while it is the call's own.
+    raised: Option<u64>,
+    /// `--test-remote-backstop-ms`: the run call's backstop, which a raised ceiling leaves as it is; `None` without the
+    /// seam.
+    backstop_seam: Option<Duration>,
 }
 
 /// How a run call ended ([`Attempt::run_call`]): its end, the last standard error lines of the call that counts that
@@ -1130,6 +1142,7 @@ impl Attempt<'_, '_> {
             .unwrap_or_default();
         let prepared = self.preflight(&location, &needs)?;
         let godot_version = self.parity(&repos, &snapshots, &trees, &prepared)?;
+        let raised = self.cold_ceiling(prepared.new_tree);
         // After the preflight, whose installs the Godot version is chosen from.
         let run = RunCall {
             words: self.call.words,
@@ -1138,7 +1151,7 @@ impl Attempt<'_, '_> {
             snapshot: &snapshot.commit,
             outputs: sent.globs,
             full: sent.full,
-            timeout: self.call.timeout,
+            timeout: raised.unwrap_or(self.call.timeout),
             host: self.call.host,
             sibling_snapshots: &sibling_snapshots,
             inputs_digest: inputs.as_ref().map(|built| built.digest.as_str()),
@@ -1157,6 +1170,9 @@ impl Attempt<'_, '_> {
         }
         // After the push: a run refused before it, at the preflight or by the parity check, leaves no marker.
         outputs::marked(&sent)?;
+        if let Some(raised) = raised {
+            self.raise_ceiling(raised);
+        }
         let called = self.run_call(&location, &run_input, &nonce)?;
         // A warm-up brings nothing back: its end is classed, and neither the sync-back nor the outputs step follows.
         if self.warm_ran(&called) {
@@ -1203,6 +1219,34 @@ impl Attempt<'_, '_> {
             Warmth::WarmUp { commands, hash } => payload::warm_word(location, run, &WarmCall { commands, hash }),
             Warmth::Unasked | Warmth::Needs(_) => payload::run_word(location, run),
         }
+    }
+
+    /// The ceiling the run call sends a run whose work tree the preflight found new (`new_tree`), raised from the
+    /// call's ([`watchdog::cold_ceiling`]); `None` for a tree that is not new, and for a warm-up, whose tree is new by
+    /// design.
+    fn cold_ceiling(&self, new_tree: bool) -> Option<u64> {
+        let warm_up = matches!(self.call.warmth, Warmth::WarmUp { .. });
+        (new_tree && !warm_up).then(|| watchdog::cold_ceiling(self.call.timeout))
+    }
+
+    /// Gives the run call the `raised` ceiling, and the backstop it sets unless the backstop seam gives one, and says
+    /// the cold note once ([`cold_line`]): `gate warm` for a run that needs a warm hash, whose repo has warm-up
+    /// consent and a warm-up file that parsed.
+    fn raise_ceiling(&mut self, raised: u64) {
+        self.raised = Some(raised);
+        self.limits.command = Duration::from_secs(raised);
+        self.limits.backstop = self.backstop_seam.unwrap_or_else(|| watchdog::backstop(raised));
+        let warm_up = matches!(self.call.warmth, Warmth::Needs(_));
+        self.say(cold_line(self.call.timeout, raised, warm_up));
+    }
+
+    /// The hang hint a call watches for: the run call's (`run_call`) until it has said it, from the call's usual p90,
+    /// which a run whose ceiling was raised for a new work tree has none of ([`routed_usual`]); `None` for any other
+    /// call.
+    fn run_hang(&self, run_call: bool) -> Option<RunHang<'_>> {
+        routed_usual(self.call.usual, self.raised.is_some())
+            .filter(|_| run_call && !self.hang_said)
+            .map(|usual| RunHang { usual, log: self.call.log })
     }
 
     /// Whether the call is a warm-up, whose run call ended as `called`: its end is then classed and kept for the outcome.
@@ -1490,6 +1534,7 @@ impl Attempt<'_, '_> {
         })?;
         let theirs = their_version(&called.lines).map(str::to_owned);
         let warm = warm_of(&called.lines);
+        let new_tree = new_work_tree(&called.lines);
         let created = called
             .lines
             .iter()
@@ -1536,6 +1581,7 @@ impl Attempt<'_, '_> {
         }
         Ok(Prepared {
             created,
+            new_tree,
             boot,
             sdks,
             sent,
@@ -2464,11 +2510,7 @@ impl Attempt<'_, '_> {
             feeding: &feeding,
             readers: &readers,
             shown: &shown,
-            hang: self
-                .call
-                .usual
-                .filter(|_| run_call && !self.hang_said)
-                .map(|usual| RunHang { usual, log: self.call.log }),
+            hang: self.run_hang(run_call),
         };
         let raise = self.call.interrupt.filter(|_| starts.raise);
         let watching = watched.watch(watch, self.call.interrupt, raise);
@@ -2661,6 +2703,7 @@ impl Attempt<'_, '_> {
             adjusted: self.adjusted,
             box_killed: self.box_killed,
             warm,
+            raised: self.raised,
         }
     }
 
@@ -2710,6 +2753,8 @@ impl<'c, 'a> Attempt<'c, 'a> {
             local_major: None,
             warm: None,
             marker_seen: false,
+            raised: None,
+            backstop_seam: None,
         }
     }
 }
@@ -3863,6 +3908,27 @@ pub(crate) fn warm_of(lines: &[String]) -> Warm {
     }
 }
 
+/// Whether the preflight said the work folder's tree is new: [`NEW_WORK_TREE`] exactly, right after the warm line that
+/// follows its last `gate: remote version` line. A box that never says it reads as not new.
+fn new_work_tree(lines: &[String]) -> bool {
+    let Some(version) = lines.iter().rposition(|line| line.starts_with(VERSION)) else {
+        return false;
+    };
+    let warm_said = lines.get(version + 1).is_some_and(|line| line.starts_with(WARM));
+    warm_said && lines.get(version + 2).is_some_and(|line| line == NEW_WORK_TREE)
+}
+
+/// The note a run whose work folder on the builder is new says before its run call, its ceiling raised from `from` to
+/// `to` whole seconds: naming `gate warm` when the repo's warm-up is set up (`warm_up`), else the warm-up file it needs.
+fn cold_line(from: u64, to: u64, warm_up: bool) -> String {
+    let prewarm = if warm_up {
+        "prewarm the next new worktree with gate warm"
+    } else {
+        "a .gate/warmup.toml lets gate warm prewarm the next new worktree"
+    };
+    format!("gate: remote cold: this worktree's work folder on the builder is new; the ceiling is raised from {from} s to {to} s; {prewarm}")
+}
+
 /// Whether a call asking `warmth` meets a cold work folder, the preflight having said `warm`: only a run that needs a
 /// hash can, when the preflight did not say exactly that hash.
 fn is_cold(warmth: Warmth<'_>, warm: &Warm) -> bool {
@@ -4201,7 +4267,7 @@ mod tests {
         version_refusal,
     };
     use super::{CSPROJ_BYTES, CSPROJ_FILES, Entry, csproj_pins, entries_of, manifest_entry};
-    use super::{KeyHold, RunEnd, Warm, hold_key, hold_key_waiting, is_cold, status_end, warm_end, warm_of};
+    use super::{KeyHold, RunEnd, Warm, cold_line, hold_key, hold_key_waiting, is_cold, new_work_tree, status_end, warm_end, warm_of};
     use crate::environment::Variables;
     use crate::remote::git::{self, DOTNET_LIMIT, GIT_LIMIT, Git, GitError};
     use crate::remote::held::tests::{Pair, junction};
@@ -4372,6 +4438,8 @@ mod tests {
             local_major: None,
             warm: None,
             marker_seen: false,
+            raised: None,
+            backstop_seam: None,
         }
     }
 
@@ -6466,6 +6534,85 @@ mod tests {
         for (name, preflight, expected) in cases {
             assert_eq!(warm_of(&preflight), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn the_new_work_tree_line_marks_the_run_cold() {
+        let version = "gate: remote version 0.1.0";
+        let boot = "gate: remote boot 2026-10-10T08:00:00.0000000Z";
+        let new_tree = "gate: remote new work tree";
+        let hash = format!("gate: remote warm {WARM_HASH}");
+        let cases: [(&str, Vec<String>); 4] = [
+            ("after-warm-none", lines(&[version, "gate: remote warm none", new_tree, boot])),
+            (
+                "after-a-created-line",
+                lines(&[
+                    "gate: remote created D:\\gate-remote\\app.git",
+                    version,
+                    "gate: remote warm none",
+                    new_tree,
+                ]),
+            ),
+            ("after-a-warm-hash", lines(&[version, &hash, new_tree])),
+            (
+                "two-versions-the-last-counts",
+                lines(&[version, "gate: remote warm none", version, "gate: remote warm none", new_tree]),
+            ),
+        ];
+        for (name, preflight) in cases {
+            assert!(new_work_tree(&preflight), "{name}");
+        }
+    }
+
+    #[test]
+    fn no_new_work_tree_line_is_not_cold() {
+        let version = "gate: remote version 0.1.0";
+        let warm = "gate: remote warm none";
+        let new_tree = "gate: remote new work tree";
+        let cases: [(&str, Vec<String>); 7] = [
+            (
+                "an-older-box-that-never-says-it",
+                lines(&[version, warm, "gate: remote boot 2026-10-10T08:00:00.0000000Z"]),
+            ),
+            ("no-version", lines(&[warm, new_tree])),
+            ("no-warm-line-before-it", lines(&[version, new_tree])),
+            ("before-the-version", lines(&[new_tree, version, warm])),
+            ("after-the-boot-line", lines(&[version, warm, "gate: remote boot x", new_tree])),
+            ("two-versions-none-after-the-last", lines(&[version, warm, new_tree, version, warm])),
+            ("padded", lines(&[version, warm, "gate: remote new work tree "])),
+        ];
+        for (name, preflight) in cases {
+            assert!(!new_work_tree(&preflight), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_cold_note_names_gate_warm_only_for_a_repo_with_a_warm_up() {
+        assert_eq!(
+            cold_line(60, 120, true),
+            "gate: remote cold: this worktree's work folder on the builder is new; the ceiling is raised from 60 s to 120 s; \
+             prewarm the next new worktree with gate warm"
+        );
+        assert_eq!(
+            cold_line(3600, 5400, false),
+            "gate: remote cold: this worktree's work folder on the builder is new; the ceiling is raised from 3600 s to 5400 s; \
+             a .gate/warmup.toml lets gate warm prewarm the next new worktree"
+        );
+    }
+
+    #[test]
+    fn a_cold_run_call_watches_for_no_hang_hint() {
+        let log = Path::new(r"C:\no-such-log.log");
+        let call = RemoteCall {
+            usual: Some(crate::durations::Usual { p90: 30.0, family: false }),
+            ..call(log)
+        };
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+        assert!(attempt.run_hang(true).is_some(), "a warm run call compares with its usual p90");
+        assert!(attempt.run_hang(false).is_none(), "no other call says the hint");
+        attempt.raised = Some(120);
+        assert!(attempt.run_hang(true).is_none(), "a cold run call compares with none");
     }
 
     #[test]

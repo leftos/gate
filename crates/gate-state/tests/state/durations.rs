@@ -779,6 +779,7 @@ impl Release<'_> {
             held_seconds: 99.0,
             status: Some(i64::from(self.facts.verdict != Verdict::Passed)),
             facts: Some(self.facts),
+            cold: false,
         };
         let tag = self.host.map(|host| RemoteTag {
             host: host.to_owned(),

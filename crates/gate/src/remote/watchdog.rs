@@ -39,6 +39,15 @@ pub(super) fn backstop(ceiling: u64) -> Duration {
     Duration::from_secs(ceiling.saturating_mul(5).saturating_add(60))
 }
 
+/// The most a cold run's ceiling is raised by, in seconds: half an hour.
+const COLD_RAISE_CAP: u64 = 1800;
+
+/// The ceiling, in whole seconds, of a routed run whose work folder on the builder is new and whose ceiling was
+/// `ceiling`: twice it, at most [`COLD_RAISE_CAP`] more, saturating. Repos set their ceilings from warm runs.
+pub(super) fn cold_ceiling(ceiling: u64) -> u64 {
+    ceiling.saturating_mul(2).min(ceiling.saturating_add(COLD_RAISE_CAP))
+}
+
 /// Why the client killed a call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Cut {
@@ -239,8 +248,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BYTES_KEPT, Cut, Kept, Kill, LINE_CAP, LINES_KEPT, LOG_CAP, backstop, complete, kill, kill_line, size, stall_window, tick, too_long,
-        transfer_line, truncated, whole_seconds, whole_size,
+        BYTES_KEPT, Cut, Kept, Kill, LINE_CAP, LINES_KEPT, LOG_CAP, backstop, cold_ceiling, complete, kill, kill_line, size, stall_window, tick,
+        too_long, transfer_line, truncated, whole_seconds, whole_size,
     };
 
     const SECOND: Duration = Duration::from_secs(1);
@@ -374,6 +383,21 @@ mod tests {
         assert_eq!(backstop(60), 360 * SECOND);
         assert_eq!(backstop(1), 65 * SECOND);
         assert_eq!(backstop(u64::MAX), Duration::from_secs(u64::MAX), "saturates");
+    }
+
+    #[test]
+    fn a_cold_ceiling_doubles_a_short_one() {
+        assert_eq!(cold_ceiling(60), 120);
+        assert_eq!(cold_ceiling(1), 2);
+        assert_eq!(cold_ceiling(1800), 3600, "exactly the cap: doubled is half an hour more");
+        assert_eq!(cold_ceiling(0), 0);
+    }
+
+    #[test]
+    fn a_cold_ceiling_adds_at_most_half_an_hour() {
+        assert_eq!(cold_ceiling(1801), 3601);
+        assert_eq!(cold_ceiling(3600), 5400);
+        assert_eq!(cold_ceiling(u64::MAX), u64::MAX, "saturates");
     }
 
     #[test]

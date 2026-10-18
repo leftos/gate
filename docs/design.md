@@ -638,7 +638,9 @@ The lines of a run that starts its command:
   The ceiling is in load-adjusted seconds, so the hint compares it with the adjusted p90 alone: an estimate without one says no hint, however long its wall p90.
 
   Their figures are the expected-time line's: `<n> s` below 90 s, whole minutes from 90 s. An estimate from the family key reads `similar commands'` in place of `this command's`, and a family key whose p90 is above 2x its p50 does not raise the ceiling.
-- The hang hint, once a run, on stderr and in the log: `gate: still running after 42 min, 3x its usual p90 of 14 min` (`similar commands' usual p90` for a family key), `k` rounded down, from the run's passing 3x the p90 of its take's estimate. A local run counts wall time less paused time, checked at each watch sample; a routed run counts the wall time since the builder's start marker reached the client, said live. It is never said for a usual p90 under 1 s and kills nothing.
+- The hang hint, once a run, on stderr and in the log: `gate: still running after 42 min, 3x its usual p90 of 14 min` (`similar commands' usual p90` for a family key), `k` rounded down, from the run's passing 3x the p90 of its take's estimate.
+
+  A local run counts wall time less paused time, checked at each watch sample; a routed run counts the wall time since the builder's start marker reached the client, said live. It is never said for a usual p90 under 1 s, nor for a cold routed run ([Cold run](GLOSSARY.md#cold-run)), and kills nothing.
 - The durations store's notes, on stderr and in the log. Said once a run: `gate: cannot read <path> (<reason>); expected times are unavailable` for a store that is torn or cannot be read, said before the run queues, so it can come before a waiting line, and `gate: could not write <path> (<reason>)` for a failed store write, which leaves the run's exit code as it was.
 
   `gate: cannot rebuild <store path> (<reason>); expected times are unavailable` when the run's claim on a rebuild fails other than by another gate holding it.
@@ -942,7 +944,7 @@ The event's own fields:
 |---|---|
 | `queue` | `log` (the log's full path), `notRouted` (written right after `log`, only when a heavy gate was kept local with `--local`, with the value `--local`, or when a matched command's outside path lies in another worktree of a listed repo and the run says to `--cd` it, with the value `another worktree`; every other reason for a local run, the plain outside line included, writes none) |
 | `take` | `slots` (the slot names taken; a critical gate lists every heavy and light slot it holds; a `none` run lists none, `[]`, with `waitedSeconds` 0.0), `waitedSeconds`, optionally `parentPid` (also on the late take of a covered gate), and for a critical gate `counts`, `otherHeld`, then `otherClaims` or `snapshotError` |
-| `release` | `slots` (the same list), `heldSeconds`, `status` (null when the gate failed before its command had one), `wallSeconds`, `adjustedSeconds`, optionally `avgCores`, `peakCores`, `freeCores`, `verdict` |
+| `release` | `slots` (the same list), `heldSeconds`, `status` (null when the gate failed before its command had one), `wallSeconds`, `adjustedSeconds`, optionally `avgCores`, `peakCores`, `freeCores`, `verdict`, and `cold` for a cold routed run |
 | `abandon` | `waitedSeconds`: the gate ended while still queued (Ctrl+C while waiting for a slot, or, for a routed run, while its client waited to start or while it waited for its work folder's key, remote-tagged) |
 | `parent`, `covered` | `parentPid`; a lent gate writes `parent` after its `queue` when it was lent the slot as it waited, and alone, with no `queue`, when it was lent it before it queued |
 | `fallback` | `reason`, then `remote`, `host`, `key`: it ends the routed attempt, so a remote `take` that falls back gets no `release`; a `full` fallback, and a `client` fallback with no client built, follow no remote `take` |
@@ -963,6 +965,7 @@ Fields beyond J1's:
 
   Covered and lent runs write no `release`, except a covered run that took a slot late, which writes one when it lets that slot go: its `slots` the one it took, its `heldSeconds` counted from that take.
 - `release`: `wallSeconds` (the command's wall time less the seconds paused behind a critical request; a routed run's whole remote wall time), `adjustedSeconds` (load-adjusted seconds, 3 decimals, a number for every run that started; for a routed run the builder's figure, null when it said none; null for a run whose sampler failed) and `verdict`, one of `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop`, `transfer-timed-out`, `unknown` (kept, J5).
+- `release`: `cold`, `true` after `verdict` and before the remote tag's `remote`, `host` and `key`, on the release of a cold routed run ([Cold run](GLOSSARY.md#cold-run)) only. No other release has the field, and a run that fell back never writes it.
 
   `transfer-timed-out` is a routed run's fetch after the command cut at its transfer ceiling.
 
@@ -1676,6 +1679,12 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The client also reads the preflight's `gate: remote warm <none|64 lower-case hex>` line, only the line right after the last `gate: remote version` line: anything else there, no such line, or a warm line elsewhere reads as no warmth.
 
+    It reads `gate: remote new work tree` the same way, only exactly that line right after that warm line: anything else there, or an older box that never says it, reads as a work tree that is not new.
+
+    A run whose preflight said the work tree new is a cold run, unless it is a warm-up, whose tree is new by design. Its run call's `Timeout`, the client's command limit and the passed line's ceiling become `min(2 x ceiling, ceiling + 1800 s)`, for an explicit `--timeout` and `--timeout auto` alike; the claim's `timeoutSeconds` and the stall window are unchanged, and the client's backstop is 5 x the raised ceiling + 60 s.
+
+    Before the run call it says once, on stderr and in the log, `gate: remote cold: this worktree's work folder on the builder is new; the ceiling is raised from <a> s to <b> s; a .gate/warmup.toml lets gate warm prewarm the next new worktree`. For a repo with warm-up consent and a warm-up file the note ends `; prewarm the next new worktree with gate warm` instead.
+
     A call that needs the work folder warm with a given hash and whose preflight does not name exactly that hash falls back `cold` here, after the version check and before parity and the push, so nothing is sent. A warm-up and a plain run do not compare the line. A routed run of a repo whose warm-up record is `warm` for this host and file makes such a call.
   - **Parity.** After the preflight and before the push, `remote/parity.rs` checks that the builder's `gate: remote sdks` line (from the preflight) has what the snapshot needs. A builder with no sdks line, or a tree that is not .NET (no `global.json`, `.sln`, `.slnx` or `.csproj` anywhere in the snapshot), skips the SDK part of the check; the tools of the repo's `.gate/toolchain.toml` are judged either way (Toolchain manifest, below).
 
@@ -2105,7 +2114,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A `--stall` under 15 s is raised to 15 for a remote run (the box's heartbeats come every 5 s) and says `gate: --stall <n> raised to 15 for a remote run (heartbeats come every 5 s)`. It looks every quarter of the window, at most once a second.
 
-  A run call killed by the client says `gate: STALLED: no output or remote CPU for <n> s` or `gate: BACKSTOP on <host>: no end after <w> s of wall time (5 x the <n> s ceiling + 60 s); killed the run call and stopped the command`, stops the command on the builder and ends the run with status 124, with no fallback.
+  A run call killed by the client says `gate: STALLED: no output or remote CPU for <n> s` or `gate: BACKSTOP on <host>: no end after <w> s of wall time (5 x the <n> s ceiling + 60 s, the raised ceiling for a cold run); killed the run call and stopped the command`, stops the command on the builder and ends the run with status 124, with no fallback.
 
   A command the builder killed ends the run the same way as a client kill, with the verdict `timed-out` or `backstop` the kill tag names, but with no stop call (the box already ended the job), no sync-back fetch and no outputs fetch, the outputs pending marker kept; the kill line is the box's own, read from the log.
 
@@ -2318,6 +2327,8 @@ Built verbs:
   With a `Pair` in the payload the preflight makes the folder above `Work` and one bare repo per repo, `Bare` for the main checkout and `{root}\{stem}.git` for each sibling (`{root}` is `Bare`'s folder, `{stem}` the sibling's name with every character but an ASCII letter, digit, `-` and `_` made `-`), and touches nothing inside `Work`.
 
   It prints on stdout, in order: `gate: remote created <Bare>` (only when it created the bare repo), `gate: remote version <gate version>` (the same text as `gate --version` after `gate `, build id included), `gate: remote warm <64-hex>` or `gate: remote warm none` (the hash in the work folder's warm record `{Work}.warm`, read before the folders are readied; `none` when the main tree's `.git` or the record is missing, or the record is not a plain file holding exactly 64 lower-case hex digits, a line end included), the boot line, `gate: remote sdks <v1,v2|none>`, and one `gate: remote tool <tool> ...` line for each tool of the payload's `Needs` (Tool probes, below); git's own output passes through. A payload without `Bare` or `Work` prints `gate: box payload lacks <key>` and exits 2.
+
+  Right after the warm line it prints `gate: remote new work tree` when it laid out the run's own single work tree now, that is when nothing had the name `.git` in the work folder. A pair layout never prints it.
 - A failing git step prints `gate: remote <step> failed (status <n>)` and exits with that status; a git that cannot start prints `gate: remote <step> failed: <OS message>` and exits 1.
 
   The same `failed: <message>` form covers a config read or write the preflight made itself: `gate: remote git remote add failed: cannot write <config>: <why>`, `gate: remote git remote add failed: cannot open|read <path>: <why>` and `gate: remote git remote add failed: cannot write <config>: config.lock could not be removed: <why>`. The steps are `git init --bare`, `git init`, `git remote add`, `git config core.autocrlf` and `git config core.eol`.

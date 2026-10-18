@@ -158,6 +158,7 @@ fn release(facts: Option<RunFacts>) -> JournalEvent {
         held_seconds: 0.105,
         status: Some(0),
         facts,
+        cold: false,
     }
 }
 
@@ -306,7 +307,7 @@ fn a_critical_take_line_puts_its_snapshot_after_waited_seconds_and_before_abando
 
 #[test]
 fn a_routed_release_line_puts_the_remote_fields_after_the_verdict() {
-    let release = JournalEvent::Release {
+    let release = |cold: bool| JournalEvent::Release {
         slots: vec![REMOTE_SLOT.to_owned()],
         held_seconds: 12.558,
         status: Some(0),
@@ -318,9 +319,28 @@ fn a_routed_release_line_puts_the_remote_fields_after_the_verdict() {
             free_cores: None,
             verdict: Verdict::Passed,
         }),
+        cold,
     };
-    let line = journal_line(&identity(), ts(NOW), &release, Some(&tag()), None);
+    let line = journal_line(&identity(), ts(NOW), &release(false), Some(&tag()), None);
+    let cold = journal_line(&identity(), ts(NOW), &release(true), Some(&tag()), None);
 
+    assert_eq!(
+        own_keys(&cold),
+        [
+            "slots",
+            "heldSeconds",
+            "status",
+            "wallSeconds",
+            "adjustedSeconds",
+            "verdict",
+            "cold",
+            "remote",
+            "host",
+            "key"
+        ],
+        "a cold run's field is the last of the release's own"
+    );
+    assert_eq!(parsed(&cold)["cold"], true);
     assert_eq!(
         own_keys(&line),
         [
@@ -612,6 +632,7 @@ fn seconds_round_to_three_decimals() {
                 free_cores: None,
                 verdict: Verdict::Failed,
             }),
+            cold: false,
         },
         None,
         None,

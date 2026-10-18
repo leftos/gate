@@ -1,6 +1,6 @@
 //! `gate box preflight`, the first call of every routed run: readies the work folder and its bare repository as the
-//! PowerShell wrapper's `Initialize-WorkFolder` does, then says the version, warm, boot and SDK lines, and a line for
-//! each tool the payload's `Needs` names.
+//! PowerShell wrapper's `Initialize-WorkFolder` does, then says the version and warm lines, the new work tree line when
+//! it laid the work folder's tree out now, the boot and SDK lines, and a line for each tool the payload's `Needs` names.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -27,7 +27,7 @@ use crate::boxside::probe;
 use crate::boxside::run::{FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_SINGLE};
 use crate::console::Console;
 use crate::environment::Variables;
-use crate::remote::{INSTALL_STATUS, git, install_untrusted_line};
+use crate::remote::{INSTALL_STATUS, NEW_WORK_TREE, git, install_untrusted_line};
 use crate::run::{ERROR_FILE_NOT_FOUND, find_program};
 
 /// The status of a step that failed with no status of its own: git or a folder that could not be made or written.
@@ -66,9 +66,10 @@ pub(crate) fn git_failed(step: &str, code: i32) -> Failed {
     }
 }
 
-/// Readies the folders the payload's `Bare` and `Work` name, then says the three trailing lines, the SDK list read
-/// within `--test-dotnet-limit-ms` when `seams` gives it, else [`git::DOTNET_LIMIT`], and the tool lines, probed within
-/// `--test-probe-limit-ms` when `seams` gives it, else [`probe::PROBE_LIMIT`]; returns the status.
+/// Readies the folders the payload's `Bare` and `Work` name, then says the version and warm lines, [`NEW_WORK_TREE`]
+/// when the work folder of a run of one repo had no `.git` ([`ready_new_tree`]), and the three trailing lines, the SDK
+/// list read within `--test-dotnet-limit-ms` when `seams` gives it, else [`git::DOTNET_LIMIT`], and the tool lines,
+/// probed within `--test-probe-limit-ms` when `seams` gives it, else [`probe::PROBE_LIMIT`]; returns the status.
 ///
 /// First, after its version line, it refuses with the install line and [`INSTALL_STATUS`] a desktop helper beside
 /// the box that is not trusted ([`helper_trusted`]), judged as the box's own image is ([`crate::boxside::judges_trust`]),
@@ -99,14 +100,20 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
     let warm = warm_state(work, &layout);
     let readied = match &pair {
         None => ready(bare, work, &layout, console),
-        Some(pair) => ready_bares(bare, work, pair, console),
+        Some(pair) => ready_bares(bare, work, pair, console).map(|()| false),
     };
-    if let Err(failed) = readied {
-        console.err(&failed.line);
-        return failed.status;
-    }
+    let made = match readied {
+        Ok(made) => made,
+        Err(failed) => {
+            console.err(&failed.line);
+            return failed.status;
+        }
+    };
     console.out(&format!("gate: remote version {}", build_version()));
     console.out(&format!("gate: remote warm {}", warm.as_deref().unwrap_or("none")));
+    if made {
+        console.out(NEW_WORK_TREE);
+    }
     boot::say(console);
     say_sdks_and_tools(payload, work, seams, console);
     0
@@ -237,13 +244,13 @@ fn laid_out_trees(work: &str, layout: &io::Result<Option<String>>) -> Option<Vec
 /// The folder above `work`; the bare repository, said as created; and the work folder's repository ([`ready_tree`],
 /// which readies nothing through a link at its `.git`), unless the work folder is laid out for another layout
 /// ([`laid_out_for_one_repo`] of its record `layout`): a run of the key changes it under its lock, which the
-/// preflight does not take.
-fn ready(bare: &str, work: &str, layout: &io::Result<Option<String>>, console: &mut Console) -> Result<(), Failed> {
+/// preflight does not take. Whether the work folder's tree is new to this run ([`ready_new_tree`]).
+fn ready(bare: &str, work: &str, layout: &io::Result<Option<String>>, console: &mut Console) -> Result<bool, Failed> {
     let git = Git::find();
     create_parent(work)?;
     create_bare(&git, bare, None, console)?;
     if !laid_out_for_one_repo(layout) {
-        return Ok(());
+        return Ok(false);
     }
     let warm = crate::boxside::run::warm_record(work);
     let at = TreeAt {
@@ -251,7 +258,7 @@ fn ready(bare: &str, work: &str, layout: &io::Result<Option<String>>, console: &
         bare,
         warm: &warm,
     };
-    ready_tree(&git, &at, None, console).map_err(|unready| match unready {
+    ready_new_tree(&git, &at, None, console).map_err(|unready| match unready {
         Unready::Git(failed) => failed,
         Unready::Folder(why) => Failed::without_status(format!("gate: remote {why}")),
     })
@@ -352,11 +359,17 @@ impl TreeGit for Git {
 /// A `.git` made anew is no warm tree: the work folder's warm record goes first, before `git init`. A record that
 /// cannot be removed readies nothing: the preflight leaves the tree to the run, whose own removal refuses it.
 pub(super) fn ready_tree(git: &impl TreeGit, at: &TreeAt<'_>, name: Option<&str>, console: &mut Console) -> Result<(), Unready> {
+    ready_new_tree(git, at, name, console).map(|_| ())
+}
+
+/// [`ready_tree`], and whether the tree is new to this run: nothing had the name `.git` there, so its repository is
+/// made now, or by the run when the preflight leaves it to the run.
+fn ready_new_tree(git: &impl TreeGit, at: &TreeAt<'_>, name: Option<&str>, console: &mut Console) -> Result<bool, Unready> {
     let (bare, tree) = (at.bare, at.tree);
     if git.holds_the_lock() {
         repair_git(tree).map_err(Unready::Folder)?;
     } else if has_a_link_in_its_git(Path::new(tree)) {
-        return Ok(());
+        return Ok(false);
     }
     // A run removes a link, a junction or a file named `.git` before it readies a tree (`plain_tree` in the run).
     let made = fs::symlink_metadata(Path::new(tree).join(".git")).is_err();
@@ -369,7 +382,7 @@ pub(super) fn ready_tree(git: &impl TreeGit, at: &TreeAt<'_>, name: Option<&str>
                     crate::boxside::payload::escaped(at.warm),
                     crate::boxside::payload::escaped(&error.to_string())
                 ));
-                return Ok(());
+                return Ok(true);
             }
             return Err(Unready::Folder(format!("cannot remove {}: {error}", at.warm)));
         }
@@ -381,7 +394,7 @@ pub(super) fn ready_tree(git: &impl TreeGit, at: &TreeAt<'_>, name: Option<&str>
     if let Some(line) = write_alternates(bare, tree, git.holds_the_lock()).map_err(Unready::Folder)? {
         console.err(&line);
     }
-    Ok(())
+    Ok(made)
 }
 
 /// The tree `tree`'s `origin`, the bare repository `bare`, added unless it has one, and its line-ending config, each

@@ -111,6 +111,9 @@ pub enum JournalEvent {
         status: Option<i64>,
         /// The run's facts, or `None` when the gate ended before its command had a verdict.
         facts: Option<RunFacts>,
+        /// Whether the run was routed to a work tree the builder's preflight found new, so its ceiling was raised:
+        /// written as `cold: true`, the last of the event's own fields, and left out when false.
+        cold: bool,
     },
     /// The gate left the queue without taking a slot.
     Abandon {
@@ -423,6 +426,7 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
             held_seconds,
             status,
             facts,
+            cold,
         } => {
             line.insert("slots".to_owned(), Value::from(slots.clone()));
             line.insert("heldSeconds".to_owned(), seconds(*held_seconds));
@@ -444,6 +448,9 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
             }
             let verdict = facts.map_or(Verdict::Unknown, |facts| facts.verdict);
             line.insert("verdict".to_owned(), Value::from(verdict.as_str()));
+            if *cold {
+                line.insert("cold".to_owned(), Value::Bool(true));
+            }
         }
         JournalEvent::Abandon { waited_seconds } => {
             line.insert("waitedSeconds".to_owned(), seconds(*waited_seconds));

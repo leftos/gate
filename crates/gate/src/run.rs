@@ -143,6 +143,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         client,
         tag: None,
         warm_hash: None,
+        cold: false,
         would: None,
         arrived: epoch_ms(Timestamp::now()),
         queued_at: None,
@@ -531,6 +532,9 @@ struct Run<'a> {
     /// The hash of the warm-up file a routed run's work folder must be warm with, which its call asks the builder for;
     /// `None` when the route asks no warmth. Set once, by [`Run::route`].
     warm_hash: Option<String>,
+    /// Whether the routed run's call ran in a work tree the builder found new, its ceiling raised, which its `release`
+    /// line says; false for every other run, one that fell back among them.
+    cold: bool,
     /// What the routing decision saw of the run, kept for a passed light run's route line, which asks the decision again
     /// as a heavy gate would ([`route::would_route_on_heavy`]). `None` for a run whose light parent lent it its slot,
     /// which never asked.
@@ -886,6 +890,7 @@ impl Run<'_> {
             held_seconds,
             status: ended.map(|ended| ended.status),
             facts,
+            cold: self.cold,
         };
         let remote = self.tag.as_ref();
         let filing = self
@@ -1125,12 +1130,14 @@ impl Run<'_> {
             return here;
         }
         let wall = started.elapsed();
+        self.cold = outcome.raised.is_some();
         let words = unicode_words(&self.request.command);
         self.leave_nothing_back(remote, &outcome, words.as_deref(), console);
         let stale = stale_lines(remote, &outcome, words.as_deref());
         let passing = Passing {
             pass: Pass::On(&remote.host, wall, outcome.split, outcome.adjusted),
-            ceiling: figures.ceiling,
+            // A cold run's line names the ceiling the box was given.
+            ceiling: outcome.raised.unwrap_or(figures.ceiling),
             stale: &stale,
         };
         Remotely::Ended(self.remote_ended(&outcome, passing, wall, console))

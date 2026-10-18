@@ -15,6 +15,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use gate_router::{repo_name, work_folder_key};
 use proc_table::{ProcessTable as _, ProcessTree, Win32ProcessTable};
 use regex::Regex;
@@ -747,12 +749,82 @@ fn a_routed_pass_splits_its_time() {
     assert_eq!(calls(&steps), ["preflight", "run", "outputs"]);
     let line = Regex::new(concat!(
         r"(?m)^gate: passed in \d+ s on builder ",
-        r"\(load-adjusted \d+ s, ceiling 3600 s; command \d+ s, push \d+ s, sync-back \d+ s, outputs \d+ s\)\. ",
+        // The case's first run meets a new work folder: its 3600 s ceiling is raised to 5400 s.
+        r"\(load-adjusted \d+ s, ceiling 5400 s; command \d+ s, push \d+ s, sync-back \d+ s, outputs \d+ s\)\. ",
         r"Full output: .*out\.log\r?$",
     ))
     .expect("the pattern is valid");
     assert!(line.is_match(&outcome.stdout), "{outcome:?}");
     assert!(!outcome.stdout.contains("wall clock"), "{outcome:?}");
+}
+
+/// The request the stand-in of the steps file `steps` was fed by its last call that kept it (`fed-hold`), decoded: its
+/// first line, base64 JSON.
+fn last_request(steps: &Path) -> Value {
+    let input = fs::read_to_string(beside(steps, ".input")).expect("the stand-in kept the call's input");
+    let word = input.lines().next().expect("the input has a request line");
+    let json = STANDARD.decode(word).expect("the request is base64");
+    serde_json::from_slice(&json).expect("the request is JSON")
+}
+
+/// The cold note of a run whose `--timeout 60` was raised, in a repo with no warm-up.
+const COLD_NOTE: &str = "gate: remote cold: this worktree's work folder on the builder is new; the ceiling is raised from 60 s to 120 s; \
+                         a .gate/warmup.toml lets gate warm prewarm the next new worktree";
+
+/// The first routed run of a worktree meets a work folder the preflight lays out now: the box is sent twice the
+/// ceiling, and the run says so once, naming the warm-up file it lacks. The second run of the worktree is sent its own.
+#[test]
+fn a_routed_run_in_a_new_work_folder_is_given_a_raised_ceiling_and_told_to_prewarm() {
+    let case = client_case("client-cold-ceiling");
+    // Each run call keeps its request: it waits on the case folder, which is there already.
+    let fed = format!("fed-hold {}", shown(&case.folder()));
+    let steps = ssh_steps(&case, "ssh", &["ok", &fed, "ok", &fed]);
+    let tuned = Tuned {
+        timeout: "60",
+        ..Tuned::default()
+    };
+    let notes = |outcome: &Outcome| outcome.stderr.lines().filter(|line| *line == COLD_NOTE).count();
+
+    let (first_pid, first) = finish_with_pid(client_gate_tuned(
+        &case,
+        "first.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran there"],
+    ));
+    let first_request = last_request(&steps);
+    let (second_pid, second) = finish_with_pid(client_gate_tuned(
+        &case,
+        "second.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran there"],
+    ));
+    let release_of = |pid: u32| {
+        own(&case, pid)
+            .into_iter()
+            .find(|event| event["event"] == "release")
+            .expect("the run journalled its release")
+    };
+
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "preflight", "run"]);
+    assert_eq!(notes(&first), 1, "said once: {first:?}");
+    let log = fs::read_to_string(case.folder().join("first.log")).expect("the log was written");
+    assert!(log.lines().any(|line| line == COLD_NOTE), "{log}");
+    assert_eq!(first_request["Timeout"], 120, "the box is sent the raised ceiling: {first_request}");
+    assert_eq!(notes(&second), 0, "the work folder is there now: {second:?}");
+    assert_eq!(last_request(&steps)["Timeout"], 60, "the second run is sent its own ceiling");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
+    assert!(
+        first.stdout.contains(", ceiling 120 s; command "),
+        "the passed line names the raised ceiling: {first:?}"
+    );
+    assert!(second.stdout.contains(", ceiling 60 s; command "), "{second:?}");
+    let (cold, warm) = (release_of(first_pid), release_of(second_pid));
+    assert_eq!(cold["cold"], true, "{cold}");
+    assert!(warm.get("cold").is_none(), "{warm}");
 }
 
 /// A folder a case made outside its own, removed with all it holds when it drops; a removal that fails is said.
@@ -3620,8 +3692,9 @@ fn a_run_call_past_its_backstop_is_killed_with_the_backstop_line() {
     let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    // The run's work folder is new, so its 3600 s ceiling is raised to 5400 s, which the line names.
     let backstop = Regex::new(
-        r"(?m)^gate: BACKSTOP on \S+: no end after 1 s of wall time \(5 x the 3600 s ceiling \+ 60 s\); killed the run call and stopped the command$",
+        r"(?m)^gate: BACKSTOP on \S+: no end after 1 s of wall time \(5 x the 5400 s ceiling \+ 60 s\); killed the run call and stopped the command$",
     )
     .expect("the pattern compiles");
     assert!(backstop.is_match(&outcome.stderr), "{outcome:?}");
@@ -3835,10 +3908,11 @@ fn a_run_call_past_its_backstop_is_cut_only_after_the_whole_backstop_from_its_ow
     let took = begun.elapsed();
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    // The run's work folder is new, so its 2 s ceiling is raised to 4 s, which the line names.
     assert!(
         outcome
             .stderr
-            .contains("no end after 2 s of wall time (5 x the 2 s ceiling + 60 s); killed the run call and stopped the command"),
+            .contains("no end after 2 s of wall time (5 x the 4 s ceiling + 60 s); killed the run call and stopped the command"),
         "{outcome:?}"
     );
     assert!(!outcome.stderr.contains("unreachable"), "the push was not cut: {outcome:?}");
@@ -4301,8 +4375,14 @@ fn a_boot_time_within_the_slack_is_the_same_boot() {
 fn a_builder_unreachable_after_the_loss_falls_back_unreachable() {
     let case = client_case("client-lost-unreachable");
     let steps = ssh_steps(&case, "ssh", &[&format!("boot {BOOTED}"), "out-then-drop", "ok", "fail-other"]);
+    // The attempt's lines, the cold note of the work folder made now among them, are said again after the command's
+    // own: a tail of 40 lines keeps the command's line in sight.
+    let tuned = Tuned {
+        extra: &[HANG_GUARD_BOUND[0], HANG_GUARD_BOUND[1], "--tail", "40"],
+        ..Tuned::default()
+    };
 
-    let outcome = finish(lost_gate(&case, "local", &steps, &[r".\tool.exe", "out", "ran here"]));
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran here"]));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(
@@ -4360,8 +4440,9 @@ fn a_boot_call_that_does_not_finish_falls_back_unreachable() {
     let case = client_case("client-boot-hangs");
     let hold = format!("hold {}", never(&case));
     let steps = ssh_steps(&case, "ssh", &[&format!("boot {BOOTED}"), "drop", &hold, &hold]);
+    // A tail of 40 lines keeps the command's line in sight below the attempt's, said again after it.
     let tuned = Tuned {
-        extra: &["--test-remote-bound-ms", "200"],
+        extra: &["--test-remote-bound-ms", "200", "--tail", "40"],
         ..Tuned::default()
     };
 

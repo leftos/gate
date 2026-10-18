@@ -253,12 +253,13 @@ fn preflight_creates_the_bare_repo_and_work_folder() {
     let outcome = gate_box(&case, "preflight", &folders.payload(), None);
 
     let printed = passed(&outcome);
-    assert_eq!(printed.len(), 5, "{outcome:?}");
+    assert_eq!(printed.len(), 6, "{outcome:?}");
     assert_eq!(printed[0], format!("gate: remote created {}", folders.bare));
     assert_eq!(printed[1], format!("gate: remote version {}", build_version(&case)));
     assert_eq!(printed[2], "gate: remote warm none", "a folder made now is not warm: {outcome:?}");
-    assert!(printed[3].starts_with("gate: remote boot "), "{outcome:?}");
-    assert!(printed[4].starts_with("gate: remote sdks "), "{outcome:?}");
+    assert_eq!(printed[3], "gate: remote new work tree", "{outcome:?}");
+    assert!(printed[4].starts_with("gate: remote boot "), "{outcome:?}");
+    assert!(printed[5].starts_with("gate: remote sdks "), "{outcome:?}");
     assert!(Path::new(&folders.work).join(".git").is_dir());
     assert_eq!(git(&["-C", &folders.work, "config", "--get", "remote.origin.url"]), folders.bare);
     assert_eq!(git(&["-C", &folders.work, "config", "--local", "--get", "core.autocrlf"]), "false");
@@ -407,6 +408,26 @@ fn preflight_twice_creates_nothing_the_second_time() {
     assert!(!printed.iter().any(|line| line.starts_with("gate: remote created")), "{outcome:?}");
     assert_eq!(printed[0], format!("gate: remote version {}", build_version(&case)));
     assert_eq!(folders.alternates(), alternates);
+}
+
+#[test]
+fn preflight_of_a_new_work_tree_says_so_once() {
+    let case = Case::new("preflight_of_a_new_work_tree_says_so_once");
+    let folders = Folders::new(&case);
+    let new_tree = |printed: &[&str]| printed.iter().filter(|line| **line == "gate: remote new work tree").count();
+
+    let first = gate_box(&case, "preflight", &folders.payload(), None);
+    let second = gate_box(&case, "preflight", &folders.payload(), None);
+
+    let printed = passed(&first);
+    assert_eq!(new_tree(&printed), 1, "the first preflight of the key lays its tree out: {first:?}");
+    let warm = printed.iter().position(|line| *line == "gate: remote warm none");
+    assert_eq!(
+        warm.and_then(|at| printed.get(at + 1)).copied(),
+        Some("gate: remote new work tree"),
+        "right after the warm line: {first:?}"
+    );
+    assert_eq!(new_tree(&passed(&second)), 0, "the tree is there the second time: {second:?}");
 }
 
 #[test]

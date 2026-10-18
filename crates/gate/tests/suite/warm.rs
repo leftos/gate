@@ -789,6 +789,14 @@ fn a_real_client_warm_up_writes_the_record_the_log_and_the_builder_s_record() {
         log.lines().any(|line| line == format!("gate: remote warm {hash}")),
         "the warm log holds the box's line: {log}"
     );
+    assert!(
+        log.lines().any(|line| line == "gate: remote new work tree"),
+        "the warm-up meets a new work tree: {log}"
+    );
+    assert!(
+        !log.lines().any(|line| line.starts_with("gate: remote cold:")),
+        "a warm-up's budget is never raised: {log}"
+    );
     let lock = warm_entry(&case, "lock").expect("the warm-up made its lock");
     assert!(free(&lock), "the per-key lock is free afterwards");
 }

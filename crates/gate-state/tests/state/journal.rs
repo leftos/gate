@@ -235,6 +235,27 @@ fn reserved_release_fields_are_accepted() {
 }
 
 #[test]
+fn a_cold_routed_release_parses() {
+    let gate = Gate::new(1, START, COMMAND);
+    let cold = json!({
+        "wallSeconds": 3.5, "adjustedSeconds": 2.0, "verdict": "passed", "cold": true,
+        "remote": true, "host": "builder@build-box", "key": "repo-ba4a1013",
+    });
+    let lines = vec![
+        versioned(&gate.queue(&ago(30)), 1),
+        versioned(&gate.take(&ago(29), 0.5), 1),
+        versioned(&with_fields(&gate.release(&ago(28), 4.0, json!(0)), &cold), 1),
+    ];
+
+    let history = history_of("a_cold_routed_release_parses", &lines);
+
+    assert_eq!(states(&history), [RunState::Ok]);
+    let run = &history.runs[0];
+    assert_eq!((run.held_seconds, run.status, run.wall_seconds), (Some(4.0), Some(0), Some(3.5)));
+    assert_eq!(run.verdict.as_deref(), Some("passed"));
+}
+
+#[test]
 fn reserved_take_fields_are_accepted() {
     let gate = Gate::new(1, START, COMMAND);
     let reserved = json!({
