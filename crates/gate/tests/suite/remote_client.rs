@@ -5450,18 +5450,23 @@ struct Between<'b> {
 
 /// A fetch past the cap that keeps its pass, then the run `between` once `prepare` has readied the case, then another
 /// fetch past the cap of an output that differs from any the PC holds: the run between, the case's outputs cap record
-/// after it, and the last run.
+/// after it, and the last run. Each run takes its steps from a file of its own: a call the watchdog kills before the
+/// stand-in has logged it leaves its step untaken, which a shared file would hand to the next run's first call.
 fn between_two_hits(case: &Case, prepare: impl FnOnce(&Case), between: &Between<'_>) -> (Outcome, Option<String>, Outcome) {
     let hit = ["ok", "ok", PAST_THE_CAP];
-    let all: Vec<&str> = hit.iter().chain(between.steps).chain(&hit).copied().collect();
-    let steps = ssh_steps(case, "ssh", &all);
-    let first = low_budget_run(case, &steps, "first.log", &WRITE_BUILT);
+    let first = low_budget_run(case, &ssh_steps(case, "first", &hit), "first.log", &WRITE_BUILT);
     assert_eq!(first.code, Some(0), "{first:?}");
     assert_eq!(cap_record_text(case).as_deref(), Some(r#"{"v":1,"hits":1}"#), "{first:?}");
     prepare(case);
+    let steps = ssh_steps(case, "between", between.steps);
     let middle = low_budget_run_with(case, &steps, "second.log", between.more, between.command);
     let after = cap_record_text(case);
-    let last = low_budget_run(case, &steps, "third.log", &[r".\tool.exe", "write", r"bin\new.txt", "rebuilt"]);
+    let last = low_budget_run(
+        case,
+        &ssh_steps(case, "last", &hit),
+        "third.log",
+        &[r".\tool.exe", "write", r"bin\new.txt", "rebuilt"],
+    );
     assert!(last.stderr.contains(CAPPED_LINE), "the last run's fetch passed the cap: {last:?}");
     (middle, after, last)
 }
