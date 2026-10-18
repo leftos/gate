@@ -3655,6 +3655,7 @@ mod tests {
             dropped_no_build: false,
             outputs_withheld: false,
             desktop: false,
+            source_revision: None,
         };
         let state = StateRoot::new(r"C:\gate-sync-back-tests", None);
         let mut call = call_in(&root, &case.log, &state);

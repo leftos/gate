@@ -52,9 +52,9 @@ fn stamped(list: &[&str]) -> Vec<String> {
     words
 }
 
-/// Whether the decision asked for the worktree's HEAD, which only a command that gets the word does.
-fn asked_head(facts: &FakeFacts) -> bool {
-    facts.asked().iter().any(|question| question.as_str() == "head_sha")
+/// How many times the decision asked for the worktree's HEAD: once for every routed run, none for one that runs here.
+fn head_asks(facts: &FakeFacts) -> usize {
+    facts.asked().iter().filter(|question| question.as_str() == "head_sha").count()
 }
 
 #[test]
@@ -83,6 +83,7 @@ fn the_control_command_routes_from_the_root() {
             dropped_no_build: false,
             outputs_withheld: false,
             desktop: false,
+            source_revision: Some(HEAD.to_owned()),
         }
     );
     assert_eq!(run.lines(), Vec::<&str>::new());
@@ -1145,7 +1146,7 @@ fn a_bare_first_word_naming_no_file_stays_bare() {
     let command = words(&["build.cmd", "all"]);
     let facts = FakeFacts::at_root();
     assert_eq!(routed(decide(&heavy(&command), &facts)).words, ["build.cmd", "all"]);
-    assert_eq!(facts.asked(), ["config", "place", "file_in_folder build.cmd"]);
+    assert_eq!(facts.asked(), ["config", "place", "file_in_folder build.cmd", "head_sha"]);
 }
 
 #[test]
@@ -1169,7 +1170,7 @@ fn a_first_word_with_a_separator_is_never_asked_about() {
         ..FakeFacts::at_root()
     };
     assert_eq!(routed(decide(&heavy(&command), &facts)).words, ["./tool", "x"]);
-    assert_eq!(facts.asked(), ["config", "place"]);
+    assert_eq!(facts.asked(), ["config", "place", "head_sha"]);
 }
 
 #[test]
@@ -1339,12 +1340,40 @@ fn a_dotnet_command_that_does_not_build_is_left_alone() {
         let facts = FakeFacts::with_config(routing_all());
         let run = routed(decide(&heavy(&words(command)), &facts));
         assert_eq!(run.words, words(command), "{command:?}");
-        assert!(!asked_head(&facts), "HEAD is asked for {command:?}");
+        assert_eq!(head_asks(&facts), 1, "HEAD is asked once for {command:?}");
     }
     let facts = FakeFacts::with_config(routing_all());
     let run = routed(decide(&heavy(&words(&["cargo", "build"])), &facts));
     assert_eq!(run.words, ["cargo", "build"], "another build tool's command is left alone");
-    assert!(!asked_head(&facts), "HEAD is asked for cargo build");
+    assert_eq!(head_asks(&facts), 1, "HEAD is asked once for cargo build");
+}
+
+#[test]
+fn a_routed_command_without_the_word_still_carries_the_worktree_head() {
+    let command = words(&["dotnet", "format"]);
+    let facts = FakeFacts::with_config(routing_all());
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.words, command, "the words get no stamp");
+    assert_eq!(run.source_revision.as_deref(), Some(HEAD), "the run carries the worktree's HEAD");
+
+    let heads: [Result<Option<String>, String>; 2] = [Ok(None), Err("git could not be started".to_owned())];
+    for head in heads {
+        let facts = FakeFacts {
+            head,
+            ..FakeFacts::with_config(routing_all())
+        };
+        let run = routed(decide(&heavy(&command), &facts));
+        assert_eq!(run.source_revision, None, "{:?}", facts.head);
+    }
+}
+
+#[test]
+fn a_routed_build_asks_head_once_for_its_word_and_its_revision() {
+    let facts = FakeFacts::with_config(routing_all());
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.words, stamped(&["dotnet", "build"]));
+    assert_eq!(run.source_revision.as_deref(), Some(HEAD));
+    assert_eq!(head_asks(&facts), 1, "one read serves the word and the revision");
 }
 
 #[test]
@@ -1362,7 +1391,7 @@ fn a_command_that_already_sets_the_source_revision_is_left_alone() {
         let facts = FakeFacts::with_config(routing_all());
         let run = routed(decide(&heavy(&words(command)), &facts));
         assert_eq!(run.words, words(command), "{command:?}");
-        assert!(!asked_head(&facts), "HEAD is asked for {command:?}");
+        assert_eq!(head_asks(&facts), 1, "HEAD is asked once for {command:?}");
     }
 }
 
@@ -1380,7 +1409,7 @@ fn a_word_that_merely_holds_the_target_name_is_no_source_revision() {
         let mut expected = words(command);
         expected.push(stamp());
         assert_eq!(run.words, expected, "{command:?}");
-        assert!(asked_head(&facts), "HEAD is asked for {command:?}");
+        assert_eq!(head_asks(&facts), 1, "HEAD is asked once for {command:?}");
     }
 }
 
@@ -1424,7 +1453,7 @@ fn a_program_path_outside_the_worktree_in_a_later_word_runs_here_with_no_word() 
         local_line(&route).as_deref(),
         Some(r"gate: not routed: C:\Program Files\dotnet\dotnet.exe is outside the worktree")
     );
-    assert!(!asked_head(&facts), "no word is made for a command that runs here");
+    assert_eq!(head_asks(&facts), 0, "HEAD is not asked for a command that runs here");
 }
 
 #[test]
@@ -1559,7 +1588,7 @@ fn a_missing_sibling_keeps_the_run_local_saying_so() {
         Some("gate: not routed: sibling yaat-server not found beside the worktree")
     );
     assert_eq!(*facts.presence_asked.borrow(), [sibling_root("b"), sibling_root("yaat-server")]);
-    assert!(!asked_head(&facts), "no word is made for a command that runs here");
+    assert_eq!(head_asks(&facts), 0, "HEAD is not asked for a command that runs here");
 }
 
 #[test]

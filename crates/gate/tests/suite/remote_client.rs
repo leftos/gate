@@ -626,6 +626,25 @@ fn a_routed_run_sends_its_env_pairs() {
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
 }
 
+/// The box's command sees the worktree's HEAD as `SourceRevisionId`, not the snapshot commit the box checks out.
+#[test]
+fn a_routed_command_sees_the_worktree_head_as_its_source_revision() {
+    let case = client_case("client-env-source-revision");
+    git(&case, &["commit", "--quiet", "--allow-empty", "-m", "a"]);
+    let head = git(&case, &["rev-parse", "HEAD"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "env", "SourceRevisionId"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert!(
+        outcome.stdout.lines().any(|line| line == head),
+        "the command on the box sees the worktree's HEAD {head}: {outcome:?}"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
+}
+
 /// A forwarded `--env NAME`: the box's command sees the value the PC's environment held, and no line of the gate's or
 /// the journal says it.
 #[test]
@@ -683,8 +702,9 @@ fn a_routed_run_gives_the_builder_s_command_shared_compilation_off() {
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
 }
 
-/// The most git processes the simple pass below starts, on the PC and the box together, children of git counted.
-const SIMPLE_PASS_GIT_STARTS: usize = 30;
+/// The most git processes the simple pass below starts, on the PC and the box together, children of git counted. One
+/// of them is the PC's `rev-parse --verify -q HEAD` that every routed run asks for its `SourceRevisionId`.
+const SIMPLE_PASS_GIT_STARTS: usize = 31;
 
 /// The `argv` of each git process that wrote a trace into the folder `traces`, the `GIT_TRACE2_EVENT` of the gate that
 /// started them: one `"event":"start"` record a process.

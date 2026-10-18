@@ -110,7 +110,7 @@ Refusals are exit 2 on stderr before any slot. `{n}` is the word's 1-based place
 - `gate: --env sets {name}, which the gate sets itself`, `gate: --env sets {name}, which git would read over the gate's own git settings`, `gate: --env sets {name}: GATE_ names are the gate's` and `gate: --env sets {name}, a machine path the gate keeps for the command`.
 - `gate: --env gives {name} a value holding NUL`, `gate: --env names {name} twice` and `gate: --env is over its cap of 64 names or 32 KiB`.
 
-A routed run sends the pairs as the payload's `Env` ([The box side](#the-box-side)), in the payload on the ssh call's stdin and nowhere else: no output line, the journal or ops-tower state shows a value. A warm-up sends none.
+A routed run sends the pairs as the payload's `Env` ([The box side](#the-box-side)), in the payload on the ssh call's stdin and nowhere else: no output line, the journal or ops-tower state shows a value. A warm-up sends none. A routed run also sends the gate's own `SourceRevisionId` pair after them ([Routing](#routing)).
 
 A routed run does not send the rest of the gate's environment: when it holds a variable a repo's builds read (`NuGetAudit`, `RUSTFLAGS`, `RUSTDOCFLAGS`, and the `NUGET_`, `MSBUILD`, `CARGO_BUILD_` and `CARGO_PROFILE_` families) that no `--env` names and the gate does not set itself, the route says so after its other lines: `gate: a routed run does not send the caller's <names>; --env NAME sends it`.
 
@@ -1453,7 +1453,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A dotnet command is one whose first word's file name without extension is `dotnet`, or is `pwsh` or `powershell` with `--` followed by a `dotnet` word (a script handed a dotnet command to run), each compared in any letter case. A dotnet command's own words run from its `dotnet` word to its next `--`, and only they are read: a `--no-build` after that `--`, or before a wrapping script's `--`, belongs to another program and stays, so plain `dotnet test -- --no-build` keeps the word.
 
-  A dotnet command with a word starting with `@` (a response file) is opaque, since the gate cannot see its words: it drops no word, gets no `SourceRevisionId` stamp, writes no nothing-back record and clears none.
+  A dotnet command with a word starting with `@` (a response file) is opaque, since the gate cannot see its words: it drops no word, gets no `-p:SourceRevisionId` word, writes no nothing-back record and clears none.
 
   A run that stays local (the Local route) drops the same `--no-build` words before it takes a slot, when it would find no build here, saying `gate: dropped --no-build: <reason>; building on a heavy slot`, or `gate: dropped --no-build: <reason>; building on the parent gate's <heavy|critical|light> slot` under a covering or lending parent. A routed run is never dropped here. `<reason>` is one of two:
   - `the last build ran on <host> and brought nothing back`, when the worktree's nothing-back record stands (`<host>` is the record's builder, else `the builder`).
@@ -1492,7 +1492,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A routed dotnet command whose verb (the next non-empty word after `dotnet`, in any letter case) is `build`, `test`, `publish`, `pack`, `run` or `msbuild` therefore gets `-p:SourceRevisionId=<the worktree's HEAD sha>` on the builder's words only: after the dotnet command's own words, before its own `--`, else at the end (a wrapped dotnet command gets it before dotnet's own `--` too).
 
-  The word is not added when one of the dotnet command's own words already sets `SourceRevisionId` (`-p:`, `/p:`, `-property:`, `/property:` or `--property:`, in any letter case, alone or in a list separated by `;` or `,`). The sha comes from `git rev-parse --verify -q HEAD` in the worktree root, asked only of a command that would get the word; when that fails or the branch is unborn the run routes without it.
+  The word is not added when one of the dotnet command's own words already sets `SourceRevisionId` (`-p:`, `/p:`, `-property:`, `/property:` or `--property:`, in any letter case, alone or in a list separated by `;` or `,`). The sha comes from `git rev-parse --verify -q HEAD` in the worktree root, asked once of every routed run, whatever its command (the light-slot route hint reads no HEAD); when that fails or the branch is unborn the run routes without it.
+
+  The same sha is sent to the builder as the environment variable `SourceRevisionId`, after the caller's `--env` pairs, so the command sees it whatever its words: MSBuild's git targets there would otherwise read the box's HEAD, the run's snapshot commit, and stamp a new revision on every routed MSBuild run. It is not sent when a caller's `--env` names `SourceRevisionId` (in any letter case; the caller's wins), when HEAD is unborn or unreadable, or when adding it would put the variables over the cap of 64 names or 32 KiB. Nothing is printed in any case. A warm-up sends no `Env`, so its commands get no pair. A local or fallback run, the journal and the queue record never show the pair.
 
   The SDK keeps an explicit value (its git targets fill `SourceRevisionId` only when it is empty) and a `-p:` global property overrides a repo's own `<SourceRevisionId>`, so the builder's DLLs read `1.0.0+<HEAD sha>` as a local build's do, and a no-change routed build compiles nothing. The fallback here, the journal and the claim keep the command as given, and no output line says the word was added.
 - **The decision is `gate-router`'s**, pure, over facts the caller gives it and the decision asks for lazily, in this order. A light or critical gate, or one under a covering or lending parent, stays local silently and reads nothing. `--local` stays local, saying `gate: not routed: --local`. Only then is `remote.json` read: no file stays local silently, and a file that is not a file, cannot be read or is refused stays local saying `gate: ignored <path>: <reason>; running locally`.
@@ -2457,7 +2459,7 @@ Built verbs:
 
   `Identity` may hold only `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_AUTHOR_DATE`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL` and `GIT_COMMITTER_DATE`.
 
-  `Env` is the caller's variables for the command, the PC's `--env` pairs ([Command environment](#command-environment)), sent only when there is one: an object of texts of at most 64 names and 32 KiB of names and values together, the cap read from the parsed object before any pair is checked. A name is one or more printable ASCII characters (U+0021 to U+007E) but `=`; a value may hold anything but NUL.
+  `Env` is the variables for the command, the PC's `--env` pairs ([Command environment](#command-environment)) and the gate's `SourceRevisionId` pair after them, sent only when there is one: an object of texts of at most 64 names and 32 KiB of names and values together, the cap read from the parsed object before any pair is checked. A name is one or more printable ASCII characters (U+0021 to U+007E) but `=`; a value may hold anything but NUL.
 
   It refuses a name the gate sets (`GATE_SLOT_HELD`, `GATE_STATE_DIR`, `SharedCompilationId`, `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `UseSharedCompilation`, `MSBUILDDISABLENODEREUSE`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`, and .NET's Event Log logging settings in any spelling: the `__` and `:` forms, a `DOTNET_` or `ASPNETCORE_` prefix, the provider's full type name).
 

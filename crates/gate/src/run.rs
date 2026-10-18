@@ -679,7 +679,27 @@ struct CallParts<'r> {
     root: &'r ResolvedRoot,
     /// What the call knows of the work folder's warm-up, or asks of it.
     warmth: remote::Warmth<'r>,
+    /// The variables the call sends the builder ([`routed_env`]).
+    env: &'r [(String, String)],
 }
+
+/// The variables a routed run sends the builder: the caller's pairs, then `SourceRevisionId` set to the worktree's
+/// `HEAD` sha, so any build the command runs there is pinned to it, unless a caller's pair names it, the letter case
+/// ignored, the route read no sha, or the pair would put the variables over the box's cap ([`gate_args::over_cap`]):
+/// such a run goes unpinned, saying nothing.
+fn routed_env(pairs: &[(String, String)], source_revision: Option<&str>) -> Vec<(String, String)> {
+    let mut env = pairs.to_vec();
+    let named = pairs.iter().any(|(name, _)| name.eq_ignore_ascii_case(SOURCE_REVISION_VARIABLE));
+    let bytes: usize = pairs.iter().map(|(name, value)| name.len() + value.len()).sum();
+    let fits = |sha: &str| !gate_args::over_cap(pairs.len() + 1, bytes + SOURCE_REVISION_VARIABLE.len() + sha.len());
+    if let Some(sha) = source_revision.filter(|sha| !named && fits(sha)) {
+        env.push((SOURCE_REVISION_VARIABLE.to_owned(), sha.to_owned()));
+    }
+    env
+}
+
+/// The variable [`routed_env`] pins a routed run's builds with.
+const SOURCE_REVISION_VARIABLE: &str = "SourceRevisionId";
 
 /// Whether the warm-up record at `path` is current for the run: `warm` on `host`, the builder the run went to, for the
 /// warm-up file of `hash`. A record of another builder, hash or state, or one that cannot be read, is not, and is left
@@ -712,6 +732,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         host,
         root,
         warmth,
+        env,
     } = parts;
     Ok(RemoteCall {
         host: &remote.host,
@@ -734,7 +755,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         tail: request.tail,
         no_markers: request.no_markers,
         bring_tracked: &request.bring_tracked,
-        env: &request.env,
+        env,
         interrupt: host.interrupt,
         state: &root.root,
         state_dir: &root.path,
@@ -1107,6 +1128,7 @@ impl Run<'_> {
             return Remotely::Ended(self.interrupted_before_start(console));
         }
         let started = Instant::now();
+        let env = routed_env(&self.request.env, remote.source_revision.as_deref());
         let parts = CallParts {
             request: self.request,
             figures,
@@ -1114,6 +1136,7 @@ impl Run<'_> {
             host: &self.host,
             root: self.root,
             warmth: warmth_of(self.warm_hash.as_deref()),
+            env: &env,
         };
         let call = match call_of(parts, remote) {
             Ok(call) => call,
@@ -1239,6 +1262,7 @@ impl Run<'_> {
     fn take_key(&mut self, remote: &RemoteRun, console: &mut Console) -> Result<Option<OwnedMutexGuard>, Remotely> {
         // The key lock reads neither figure of the call; no take has resolved them yet. A sibling that fails its check
         // again sends nothing: the run falls back here before it takes the lock or a slot.
+        let env = routed_env(&self.request.env, remote.source_revision.as_deref());
         let parts = CallParts {
             request: self.request,
             figures: Figures::floor(self.request.timeout),
@@ -1246,6 +1270,7 @@ impl Run<'_> {
             host: &self.host,
             root: self.root,
             warmth: warmth_of(self.warm_hash.as_deref()),
+            env: &env,
         };
         let call = match call_of(parts, remote) {
             Ok(call) => call,
@@ -3034,7 +3059,7 @@ mod tests {
     use super::{
         Ends, Judged, Pass, ROUTE_HINT_MIN_WALL, RouteJudged, Stopper, Timing, brought_everything_back, cores_hint_for, cores_line, dropped_line,
         earlier, holder_claim, interrupted, key_wait_left, key_wait_line, kill, log_in_state_root, passed_line, records_after, route_hint_for,
-        route_hint_line, stop, takes_own_slot,
+        route_hint_line, routed_env, stop, takes_own_slot,
     };
     use crate::console::Console;
     use crate::escaped::{Found, Look, Reached, Recorded};
@@ -3044,6 +3069,26 @@ mod tests {
     use gate_state::v1::{Claim, ClaimKind};
     use jiff::Timestamp;
     use serde_json::{Map, Value};
+
+    /// `count` caller pairs of distinct names.
+    fn caller_pairs(count: usize) -> Vec<(String, String)> {
+        (0..count).map(|index| (format!("V{index}"), "x".to_owned())).collect()
+    }
+
+    #[test]
+    fn the_source_revision_pair_is_added_while_the_variables_stay_under_the_box_s_cap() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let under = caller_pairs(gate_args::MOST_ENV_NAMES - 1);
+        let env = routed_env(&under, Some(sha));
+        assert_eq!(env.len(), gate_args::MOST_ENV_NAMES, "the pair fills the last name");
+        assert_eq!(env.last(), Some(&("SourceRevisionId".to_owned(), sha.to_owned())));
+
+        let full = caller_pairs(gate_args::MOST_ENV_NAMES);
+        assert_eq!(routed_env(&full, Some(sha)), full, "a full list goes unpinned");
+
+        let big = vec![("BIG".to_owned(), "x".repeat(gate_args::MOST_ENV_BYTES - "BIG".len()))];
+        assert_eq!(routed_env(&big, Some(sha)), big, "a list at the byte cap goes unpinned");
+    }
 
     /// A remote claim of the work folder of `key`, started at `started`, whose usual run time is `p50` when one.
     fn claim_of(key: &str, started: Timestamp, p50: Option<f64>) -> Claim {

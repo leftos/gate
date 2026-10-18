@@ -593,6 +593,49 @@ fn a_routed_run_sends_a_forwarded_env_pair() {
     );
 }
 
+/// A routed command that gets no `-p:SourceRevisionId` word still runs any build on the box at the worktree's HEAD.
+#[test]
+fn a_routed_command_without_the_stamp_word_carries_the_worktree_head_in_its_env() {
+    let case = routed_case("routing-head-env");
+    git(&case, &["commit", "--quiet", "--allow-empty", "-m", "a"]);
+    let head = git(&case, &["rev-parse", "HEAD"]);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", "ran"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let call = recorded(&call);
+    assert_eq!(recorded_words(&call)[1..], ["out", "ran"], "the words get no stamp: {call}");
+    assert_eq!(
+        call["env"],
+        json!([["SourceRevisionId", head]]),
+        "the worktree's HEAD travels in the env: {call}"
+    );
+}
+
+#[test]
+fn a_caller_s_source_revision_pair_wins_over_the_worktree_head() {
+    let case = routed_case("routing-head-env-caller");
+    git(&case, &["commit", "--quiet", "--allow-empty", "-m", "a"]);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+
+    let outcome = finish(case.gate(&routed_words(
+        "out.log",
+        &steps,
+        &["--env", "sourcerevisionid=abc"],
+        &[r".\tool.exe", "out", "ran"],
+    )));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        recorded(&call)["env"],
+        json!([["sourcerevisionid", "abc"]]),
+        "the caller's pair is the only one sent"
+    );
+}
+
 #[test]
 fn a_command_naming_a_program_outside_the_worktree_routes_by_the_program_s_name() {
     let case = routed_case("routing-program-path");

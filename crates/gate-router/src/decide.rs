@@ -426,6 +426,10 @@ pub struct RemoteRun {
     /// Whether the run asks for the builder's desktop: the first `.gate/desktop.toml` pattern its rewritten words match
     /// is one `remote.json`'s `desktop` allows the repo.
     pub desktop: bool,
+    /// The worktree's `HEAD` sha, read once for every routed run, which the run sends the builder as the
+    /// `SourceRevisionId` variable so any build there is pinned to it; `None` when the branch is unborn or git cannot
+    /// read it.
+    pub source_revision: Option<String>,
 }
 
 impl RemoteRun {
@@ -1208,8 +1212,8 @@ fn device_path(letter: char, facts: &dyn Facts, answers: &mut Vec<(char, Option<
     path
 }
 
-/// The routed run of a matched command: its target, and its rewritten words with `--no-build` dropped, then marked and
-/// stamped as [`builder_words`] marks and stamps them.
+/// The routed run of a matched command: its target, its rewritten words with `--no-build` dropped, then marked and
+/// stamped as [`builder_words`] marks and stamps them, and the worktree's `HEAD` sha, asked once whatever the command.
 fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[String], facts: &dyn Facts) -> RemoteRun {
     let Matched {
         target,
@@ -1233,7 +1237,9 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
     if outputs_withheld {
         outputs.clear();
     }
-    mark_and_stamp(&mut words, &target.place, facts, program_named);
+    mark_bare_first_word(&mut words, facts, program_named);
+    let source_revision = head_of(&target.place, facts);
+    stamp_with(&mut words, source_revision.as_deref());
     RemoteRun {
         host: target.host,
         slots: target.slots,
@@ -1253,6 +1259,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         dropped_no_build,
         outputs_withheld,
         desktop,
+        source_revision,
     }
 }
 
@@ -1302,12 +1309,23 @@ fn mark_bare_first_word(words: &mut [String], facts: &dyn Facts, program_named: 
 /// builder's build is pinned to the revision the snapshot came from. The words of a command that is no such dotnet
 /// command, whose own words already set `SourceRevisionId`, or whose HEAD cannot be read are left as they are.
 fn stamp_source_revision(words: &mut Vec<String>, place: &Place, facts: &dyn Facts) {
-    let Some(at) = stamp_at(words) else {
-        return;
-    };
-    if let Ok(Some(sha)) = facts.head_sha(place) {
+    if stamp_at(words).is_some() {
+        stamp_with(words, head_of(place, facts).as_deref());
+    }
+}
+
+/// Writes `-p:SourceRevisionId=<sha>` where [`stamp_at`] puts it; the words are left as they are when it puts it
+/// nowhere or there is no `sha`.
+fn stamp_with(words: &mut Vec<String>, sha: Option<&str>) {
+    if let (Some(at), Some(sha)) = (stamp_at(words), sha) {
         words.insert(at, format!("-p:{SOURCE_REVISION}={sha}"));
     }
+}
+
+/// The worktree's `HEAD` sha at `place`, or `None` when the branch is unborn or git cannot read it: a run without
+/// the sha routes as it would with it, unpinned.
+fn head_of(place: &Place, facts: &dyn Facts) -> Option<String> {
+    facts.head_sha(place).ok().flatten()
 }
 
 /// Where the source-revision word goes in the builder's words, or `None` when the command gets none: not a dotnet

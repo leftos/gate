@@ -101,8 +101,8 @@ pub(crate) fn bare(root: &str, repo: &str) -> String {
 /// in, the run's outputs nonce, the snapshot the box checks out, the output globs the run brings back (none asks for no
 /// outputs), and whether every file under them counts as changed (`OutputsFull`), as after an outputs step that did not
 /// complete; the run's ceiling in whole seconds, which the box counts in load-adjusted time (`Timeout`), and the PC's
-/// name for the builder, which the box's kill line names (`Host`); the caller's `--env` pairs (`Env`, sent only when
-/// there is one); and each sibling's name and the commit its snapshot is (`SiblingSnapshots`, sent only when there is
+/// name for the builder, which the box's kill line names (`Host`); the run's variables, the caller's `--env` pairs and
+/// the gate's `SourceRevisionId` (`Env`, sent only when there is one); and each sibling's name and the commit its snapshot is (`SiblingSnapshots`, sent only when there is
 /// one); and the versions of the builder's Godot install and Unreal Engine install the run uses (`GodotVersion` and
 /// `UnrealVersion`, each sent only when one is chosen).
 pub(crate) struct RunCall<'a> {
@@ -117,7 +117,8 @@ pub(crate) struct RunCall<'a> {
     pub sibling_snapshots: &'a [(String, String)],
     /// The SHA-256 of the inputs manifest line the inputs calls sent (`InputsDigest`), `None` for a run with no inputs.
     pub inputs_digest: Option<&'a str>,
-    /// The caller's `--env` pairs (`Env`, sent only when there is one); a warm-up never sends them.
+    /// The run's variables, the caller's `--env` pairs and the gate's `SourceRevisionId` (`Env`, sent only when there
+    /// is one); a warm-up never sends them.
     pub env: &'a [(String, String)],
     /// The version, `major.minor.patch`, of the builder's Godot install the run uses (`GodotVersion`, sent only when
     /// one is chosen), which a warm-up sends too.
@@ -176,7 +177,8 @@ pub(crate) fn outputs_word(location: &Location, name: &str) -> String {
     word(&object)
 }
 
-/// The payload word of the run call, with the caller's `--env` pairs as `Env` when there is one, and `Desktop: true`
+/// The payload word of the run call, with the run's variables (the caller's `--env` pairs and the gate's
+/// `SourceRevisionId`) as `Env` when there is one, and `Desktop: true`
 /// with `DesktopWait` ([`REMOTE_LIMIT`] in whole seconds, which the box caps at the run's `Timeout`) for a run that asks
 /// for the builder's desktop.
 pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {

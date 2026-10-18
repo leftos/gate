@@ -421,6 +421,7 @@ pub(super) mod tests {
                 dropped_no_build: false,
                 outputs_withheld: false,
                 desktop: false,
+                source_revision: None,
             }
         }
     }

@@ -280,7 +280,8 @@ pub(crate) struct RemoteCall<'a> {
     pub desktop: bool,
     /// The `--bring-tracked` globs: a fetched output git tracks is installed only when one matches it.
     pub bring_tracked: &'a [String],
-    /// The caller's `--env` pairs, sent in the run call's `Env` for the command on the builder.
+    /// The variables sent in the run call's `Env` for the command on the builder: the caller's `--env` pairs, then the
+    /// gate's `SourceRevisionId` when the route read the worktree's `HEAD`.
     pub env: &'a [(String, String)],
     /// The log the client writes the run's output to.
     pub log: &'a Path,

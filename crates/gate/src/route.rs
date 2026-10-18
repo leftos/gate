@@ -174,6 +174,7 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
 pub(crate) fn would_route_on_heavy(decision: &Decision, seams: &TestSeams) -> bool {
     let machine = Machine {
         look_up_trees: false,
+        read_head: false,
         ..Machine::at(
             decision.local_app_data.as_deref(),
             git::limit(seams).min(HINT_GIT_LIMIT),
@@ -272,6 +273,9 @@ pub(crate) struct Machine<'a> {
     /// Whether the worktree an outside path lies in is looked up ([`Facts::worktree_of`]): only a decision that may say
     /// the line naming it does.
     look_up_trees: bool,
+    /// Whether the worktree's `HEAD` is read ([`Facts::head_sha`]): the route hint, which throws the route away, does
+    /// not, and answers no sha.
+    read_head: bool,
 }
 
 impl<'a> Machine<'a> {
@@ -291,6 +295,7 @@ impl<'a> Machine<'a> {
             found: RefCell::new(Placed::NotAsked),
             config: RefCell::new(None),
             look_up_trees: true,
+            read_head: true,
         }
     }
 
@@ -352,6 +357,9 @@ impl Facts for Machine<'_> {
     /// The root's `HEAD` sha, `Ok(None)` when the worktree has none: a `git rev-parse --verify -q HEAD` that fails (an
     /// unborn branch among them) or writes anything but one sha is no sha.
     fn head_sha(&self, place: &Place) -> Result<Option<String>, String> {
+        if !self.read_head {
+            return Ok(None);
+        }
         let root = Path::new(&place.root);
         let args = ["rev-parse", "--verify", "-q", "HEAD"];
         let mut ran = git::Git::find(root)?.run(&self.git_call(root, &args))?;
