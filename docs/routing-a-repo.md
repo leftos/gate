@@ -14,6 +14,8 @@ Every repo that runs heavy gates is in scope, and every heavy command family in 
 
 Coverage is judged from the journal's history of gated commands per repo, not from the commands guessed to matter. Light-slot runs never route (the router considers heavy runs only), so a repo whose gates are all light, short checks stays local without an entry.
 
+A command run from one worktree that names a path in another worktree of a listed repo stays local, saying `gate: not routed: the command works in <tree>; run it with --cd <tree>`. Run it again with `--cd <tree>` to route it from that worktree ([design.md, Routing](design.md#routing)). A path in an unlisted repo, on a network drive or in no worktree keeps the plain `is outside the worktree` line.
+
 ## Adding a repo
 
 1. Read the repo's own gate commands (its CLAUDE.md, nextup profile, justfile or package scripts) and the tools each needs: toolchains and their pins (`.gate/toolchain.toml`, `rust-toolchain.toml`, `global.json`), shells and utilities, package managers.

@@ -3,6 +3,8 @@
 //! absolute path outside the worktree: this gate sends the program's name there, where the table sends the path and
 //! refuses the run as outside. [`SPACES_GLOBS_AND_FLAGS_TABLE`] holds the cases the PowerShell rewrite gets wrong.
 
+use std::path::PathBuf;
+
 use gate_router::{Place, RewritePlace, Rewritten, SiblingRoot, rewrite_words};
 use proptest::prelude::*;
 
@@ -700,4 +702,58 @@ fn a_first_word_naming_no_program_by_a_drive_path_stays_outside() {
     // A first word inside the worktree stays a path, a subst drive standing for the root included.
     let subst = rewrite(&place_at(""), &words(&[r"D:\x"]), &[('D', r"X:\dev\yaat.wt\a".to_owned())], &[]);
     assert_eq!((subst.words, subst.outside, subst.program_named), (words(&["x"]), None, false));
+}
+
+#[test]
+fn an_outside_word_names_the_path_that_is_outside() {
+    let path_of = |prefix: &str, list: &[&str], drives: &[(char, String)]| {
+        let got = rewrite(&place_at(prefix), &words(list), drives, &[sibling("b")]);
+        assert!(got.outside.is_some(), "{list:?} names a path outside");
+        got.outside_path
+    };
+    let named = |path: &str| Some(PathBuf::from(path));
+    assert_eq!(
+        path_of("", &["dotnet", "test", r"X:\dev\other.wt\c\src\x.csproj"], &[]),
+        named(r"X:\dev\other.wt\c\src\x.csproj"),
+        "a drive path into another folder"
+    );
+    assert_eq!(
+        path_of("", &["dotnet", "test", "X:/dev/yaat.wt/b/../c/./y/"], &[]),
+        named(r"X:\dev\yaat.wt\c\y"),
+        "a drive path leaving a sibling, its climb resolved and written with backslashes"
+    );
+    assert_eq!(
+        path_of("src/", &["dotnet", "test", r"..\..\other\x.csproj"], &[]),
+        named(r"X:\dev\yaat.wt\other\x.csproj"),
+        "a climb out of the root, resolved against the gate's folder"
+    );
+    assert_eq!(
+        path_of("", &["dotnet", "build", r"-p:Root=..\other"], &[]),
+        named(r"X:\dev\yaat.wt\other"),
+        "a climb in a switch's value"
+    );
+    assert_eq!(
+        path_of("", &["dotnet", "test", r"S:\..\src\x"], &[('S', r"X:\dev\other".to_owned())]),
+        named(r"X:\dev\other\src\x"),
+        "a path on a subst drive, named by what the drive stands for, its climb stopped at the drive's root"
+    );
+    assert_eq!(path_of("", &["dotnet", "test", r"\\host\share\x"], &[]), None, "a share path");
+    assert_eq!(
+        path_of("", &["dotnet", "test", r"U:\x"], &[('U', r"UNC\host\share".to_owned())]),
+        None,
+        "a subst drive standing for a share"
+    );
+    assert_eq!(path_of("", &["dotnet", "test", r"\\?\X:\dev\other\x"], &[]), None, "a device path");
+    assert_eq!(
+        path_of("", &["pwsh", "-c", r"Get-Content X:\dev\other\x; exit 1"], &[]),
+        None,
+        "a drive path in a script's text"
+    );
+    assert_eq!(
+        path_of("", &["dotnet", "test", r"\\host\share\x", r"X:\dev\other\y"], &[]),
+        None,
+        "only the first outside word is read for its path"
+    );
+    let inside = rewrite(&place_at(""), &words(&["dotnet", "test", r"X:\dev\yaat.wt\a\x"]), &[], &[]);
+    assert_eq!((inside.outside, inside.outside_path), (None, None), "a word inside the worktree");
 }

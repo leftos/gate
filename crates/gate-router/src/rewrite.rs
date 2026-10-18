@@ -14,6 +14,8 @@
 //! (`\\?\`, `\\.\`), or, at any place a path may start in it, a root-relative, share or device path or relative text
 //! whose `..` climb out of the worktree.
 
+use std::path::PathBuf;
+
 use crate::like::{eq_ignoring_case, lower_char};
 
 /// Characters that end a path in a word.
@@ -32,6 +34,11 @@ pub struct Rewritten {
     /// The first word, as given, that names a path outside the worktree, when one does, apart from a first word sent as
     /// a program's name ([`Rewritten::program_named`]), which is not reported here.
     pub outside: Option<String>,
+    /// The absolute path, written with `\`, that the [`Rewritten::outside`] word names outside the worktree, when the
+    /// word is no script's text or list and that path is a drive path, its `..` resolved and a subst drive's letter
+    /// replaced by what it stands for, or relative text climbing out, resolved against the gate's folder below the root;
+    /// `None` for any other word, a share or device path among them.
+    pub outside_path: Option<PathBuf>,
     /// Whether the command's first non-empty word named a program by an absolute path outside the worktree and was
     /// sent as the program's name: the builder finds the program on its `PATH`, and the name is no file of the gate's
     /// folder.
@@ -123,6 +130,7 @@ pub(crate) fn rewrite_named<'s>(
         floor: drive_floor(place.folder, cwd.len()),
     };
     let mut outside = None;
+    let mut path = None;
     let mut program_named = false;
     let mut rewritten = Vec::with_capacity(words.len());
     let first = words.iter().position(|word| !word.is_empty());
@@ -135,14 +143,97 @@ pub(crate) fn rewrite_named<'s>(
             rewritten.push(text);
             if is_outside && outside.is_none() {
                 outside = Some(word.clone());
+                path = outside_path(&bases, &cwd, drives, word);
             }
         }
     }
     Rewritten {
         words: rewritten,
         outside,
+        outside_path: path,
         program_named,
     }
+}
+
+/// The absolute path the outside `word` names ([`Rewritten::outside_path`]): its first drive path the rewrite judged
+/// outside, not after a device prefix ([`drive_path`]), else the text at its first path start that climbs out
+/// ([`climbed_path`]). `None` for a share or device path, a word holding a drive-relative path, and a script's text or
+/// a list, whose paths end where the word's characters say.
+fn outside_path(bases: &Bases<'_>, cwd: &[&str], drives: &[(char, String)], word: &str) -> Option<PathBuf> {
+    let script = word.contains(PATH_ENDS) || word.contains(['\n', '\r']);
+    if script || word.starts_with(r"\\") || word.starts_with("//") || drive_relative(word) {
+        return None;
+    }
+    let outside_drive = drive_starts(word)
+        .into_iter()
+        .find(|&index| !after_device_prefix(word, index) && path_edit(bases, cwd, word, index, false).is_none());
+    match outside_drive {
+        Some(index) => drive_path(&word[index..], drives),
+        None => climb_in(bases, cwd, word),
+    }
+}
+
+/// The absolute path the text at the first path start of `word` that climbs out of the root names ([`climbed_path`]),
+/// read to the end of the word, else to the end of the path there; starts holding a rooted, drive-relative or drive
+/// path are passed over.
+fn climb_in(bases: &Bases<'_>, cwd: &[&str], word: &str) -> Option<PathBuf> {
+    path_starts(word).into_iter().find_map(|start| {
+        let text = &word[start.index..];
+        if rooted(text, start.value) || drive_relative_at(text.as_bytes()) || drive_at(text.as_bytes(), 0) {
+            return None;
+        }
+        [text, &text[..path_end(text, 0, true)]]
+            .into_iter()
+            .find(|text| climbs(cwd, bases, text))
+            .and_then(|text| climbed_path(bases, cwd, text))
+    })
+}
+
+/// The drive path `path` as an absolute path written with `\`: its `.` and empty segments dropped, each `..` taking one
+/// off and stopping at the drive's root as Windows does, and its drive letter replaced by the path a subst drive of
+/// `drives` stands for. `None` when that path starts with no drive letter (a subst drive standing for a share).
+fn drive_path(path: &str, drives: &[(char, String)]) -> Option<PathBuf> {
+    let letter = char::from(path.as_bytes()[0]).to_ascii_uppercase();
+    let base = drives.iter().find(|(drive, _)| *drive == letter).map_or_else(
+        || path[..2].to_owned(),
+        |(_, target)| target.replace('/', "\\").trim_end_matches('\\').to_owned(),
+    );
+    root_letter(&base)?;
+    let mut segments = Vec::new();
+    for segment in path[3..].split(['\\', '/']).filter(|segment| !segment.is_empty() && *segment != ".") {
+        if segment == ".." {
+            segments.pop();
+        } else {
+            segments.push(segment);
+        }
+    }
+    Some(PathBuf::from(format!("{base}\\{}", segments.join("\\"))))
+}
+
+/// The absolute path, written with `\`, that `text`, relative text climbing out of the root, names from the gate's
+/// folder `cwd` below a root on a drive: each `..` taking one off and stopping at the drive's root. `None` for a root
+/// on no drive, and when a `..` stops at the root of the drive the gate's folder is spelled on ([`drive_floor`]),
+/// which leaves the path inside the worktree.
+fn climbed_path(bases: &Bases<'_>, cwd: &[&str], text: &str) -> Option<PathBuf> {
+    let root = &bases.root.first()?.text;
+    root_letter(root)?;
+    let mut parts = root.split('/');
+    let drive = parts.next()?;
+    let mut segments: Vec<&str> = parts.filter(|segment| !segment.is_empty()).chain(cwd.iter().copied()).collect();
+    let mut depth = Some(cwd.len());
+    for segment in text.split(['\\', '/']).filter(|segment| !segment.is_empty() && *segment != ".") {
+        if segment != ".." {
+            depth = depth.map(|depth| depth + 1);
+            segments.push(segment);
+            continue;
+        }
+        if depth.is_some_and(|depth| bases.floor.is_some_and(|floor| depth <= floor)) {
+            return None;
+        }
+        depth = depth.and_then(|depth| depth.checked_sub(1));
+        segments.pop();
+    }
+    Some(PathBuf::from(format!("{drive}\\{}", segments.join("\\"))))
 }
 
 /// The drive letters, in upper case and each once, that a path in `words` starts on, other than the root's own: the

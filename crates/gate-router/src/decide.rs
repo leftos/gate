@@ -4,7 +4,7 @@
 //! routing file costs no git call.
 
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::{CARGO_OUTPUTS, Config, ConfigProblem, ignored_line};
 use crate::escape::escaped;
@@ -235,6 +235,17 @@ pub trait Facts {
     ///
     /// What could not be read; the gate then runs here, saying so.
     fn root_id(&self, root: &str) -> Result<FolderId, String>;
+
+    /// The folder taken as the git worktree `path` lies in: the nearest of `path` and the folders above it that holds a
+    /// `.git` file or folder, read from metadata alone with no git started; `None` when none on the way holds one, and
+    /// when `path` is not absolute or lies on a drive that is remote or not there. Asked only of a matched command whose
+    /// outside word names a path ([`Rewritten::outside_path`]).
+    fn worktree_of(&self, path: &Path) -> Option<PathBuf>;
+
+    /// The folder name of the main checkout of the worktree at `tree`, as [`Place::checkout`] names the run's own: the
+    /// parent of its common git folder, read from its `.git` alone with no git started; `None` when it cannot be read.
+    /// Asked only of a tree [`Facts::worktree_of`] found that is not the run's own.
+    fn checkout_of(&self, tree: &Path) -> Option<String>;
 }
 
 /// The id of an open folder: its volume's serial number and its 128-bit file id. Two handles give one id only when they
@@ -284,6 +295,9 @@ pub enum LocalReason {
     Ignored { path: PathBuf, reason: String },
     /// A matched command's word, as given, names a path outside the worktree.
     Outside { word: String },
+    /// A matched command's outside word names a path in the git worktree `tree`, neither the run's own nor a declared
+    /// sibling's: a gate started there, or given `--cd` it, can route the command.
+    OtherWorktree { tree: PathBuf },
     /// The gate's folder holds nothing the snapshot sends; `subfolder` is the prefix without its trailing `/`.
     NothingSent { subfolder: String },
     /// A fact could not be read; `reason` is on one line.
@@ -314,6 +328,10 @@ impl LocalReason {
             Self::LocalFlag => "gate: not routed: --local".to_owned(),
             Self::Ignored { path, reason } => ignored_line(path, reason),
             Self::Outside { word } => format!("gate: not routed: {word} is outside the worktree"),
+            Self::OtherWorktree { tree } => {
+                let tree = cd_value(tree);
+                format!("gate: not routed: the command works in {tree}; run it with --cd {tree}")
+            }
             Self::NothingSent { subfolder } => format!("gate: not routed: {subfolder} holds nothing the snapshot sends"),
             Self::Failed { reason } => format!("gate: not routed: {reason}"),
             Self::SiblingsFile { problem } => format!("gate: not routed: .gate/siblings.toml: {problem}"),
@@ -331,6 +349,16 @@ impl LocalReason {
             }
         }
     }
+}
+
+/// The characters that put the `--cd` line's tree in double quotes: a space and those a shell reads apart from a word.
+const CD_QUOTED: [char; 10] = [' ', ';', '&', '\'', '(', ')', ',', '=', '$', '`'];
+
+/// The worktree `tree` as the `--cd` line shows it: [`escaped`], written with `\`, and in double quotes when it holds
+/// any of [`CD_QUOTED`], so it pastes as one word.
+fn cd_value(tree: &Path) -> String {
+    let tree = escaped(&tree.to_string_lossy().replace('/', "\\"));
+    if tree.contains(CD_QUOTED) { format!("\"{tree}\"") } else { tree }
 }
 
 /// The line of declared siblings `remote.json` does not allow: `sibling b is` for one, `siblings b, c are` for more,
@@ -532,6 +560,8 @@ struct Matched {
     pattern: String,
     words: Vec<String>,
     outside: Option<String>,
+    /// The path the outside word names ([`Rewritten::outside_path`]).
+    outside_path: Option<PathBuf>,
     /// Whether the rewrite sent the command's first word as a program's name ([`Rewritten::program_named`]).
     program_named: bool,
     /// Whether the command asks for the builder's desktop ([`check_desktop`]).
@@ -542,7 +572,7 @@ fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<RemoteRun, Here> {
     let config = eligible(inputs, facts)?;
     let matched = matched(&config, inputs.git_hook, inputs.words, facts)?;
     if let Some(word) = matched.outside.clone() {
-        return Err(Some(LocalReason::Outside { word }));
+        return Err(Some(outside_reason(&config, word, &matched, facts)));
     }
     let place = &matched.target.place;
     let subfolder = place.prefix.trim_end_matches('/').to_owned();
@@ -550,6 +580,48 @@ fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<RemoteRun, Here> {
         return Err(Some(LocalReason::NothingSent { subfolder }));
     }
     Ok(remote_run(&config, matched, subfolder, inputs.words, facts))
+}
+
+/// Why the `matched` command whose `word` names a path outside the worktree runs here: the git worktree its outside
+/// path lies in ([`Facts::worktree_of`]) when there is one, it is neither the run's own root nor a carried sibling's
+/// ([`is_own_tree`]), and the routing file `config` lists its repo, named from its main checkout's folder
+/// ([`Facts::checkout_of`]) as the run names its own; else the word itself. A word naming no such path asks nothing.
+fn outside_reason(config: &Config, word: String, matched: &Matched, facts: &dyn Facts) -> LocalReason {
+    let tree = matched
+        .outside_path
+        .as_deref()
+        .and_then(|path| facts.worktree_of(path))
+        .filter(|tree| !is_own_tree(tree, &matched.target, facts))
+        .filter(|tree| {
+            facts
+                .checkout_of(tree)
+                .is_some_and(|checkout| config.patterns(&repo_name(&checkout)).is_some())
+        });
+    match tree {
+        Some(tree) => LocalReason::OtherWorktree { tree },
+        None => LocalReason::Outside { word },
+    }
+}
+
+/// Whether `tree` is the root of `target` or of one of its carried siblings: its folder id ([`Facts::root_id`]) is the
+/// root's or a sibling's, so a junction, a short name or any other spelling of them is caught. When its id cannot be
+/// read, the spellings are compared instead ([`spelled_as_own`]): a tree that cannot be opened is no folder to name a
+/// different one by.
+fn is_own_tree(tree: &Path, target: &Target, facts: &dyn Facts) -> bool {
+    match facts.root_id(&tree.to_string_lossy()) {
+        Ok(id) => id == target.root_id || target.siblings.iter().any(|sibling| sibling.id == id),
+        Err(_) => spelled_as_own(tree, target),
+    }
+}
+
+/// Whether `tree` spells the root of `target` or of one of its carried siblings, compared in any letter case and with
+/// either separator, trailing ones aside.
+fn spelled_as_own(tree: &Path, target: &Target) -> bool {
+    let folded = |path: &str| path.replace('\\', "/").trim_end_matches('/').to_owned();
+    let tree = folded(&tree.to_string_lossy());
+    std::iter::once(target.place.root.as_str())
+        .chain(target.siblings.iter().map(|sibling| sibling.root.as_str()))
+        .any(|root| eq_ignoring_case(&folded(root), &tree))
 }
 
 /// The routing file when the gate may route at all, before any git fact is asked; the file is read only after the
@@ -811,6 +883,7 @@ fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts)
         pattern,
         words: sent.words,
         outside: sent.outside,
+        outside_path: sent.outside_path,
         program_named: sent.program_named,
         desktop,
     })

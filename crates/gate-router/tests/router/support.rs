@@ -1,6 +1,7 @@
 //! A [`Facts`] of fixed answers that records every question asked, and small builders for the decision's inputs.
 
 use std::cell::{Cell, RefCell};
+use std::path::{Path, PathBuf};
 
 use gate_router::{CarriedSibling, Config, ConfigProblem, Facts, FolderId, Inputs, Pattern, Place, SiblingFolder, SiblingRoot, Slot};
 
@@ -96,6 +97,14 @@ pub struct FakeFacts {
     pub desktop_read: Cell<u32>,
     /// Each root asked whether a git worktree is there, in order, kept apart from [`FakeFacts::asked`].
     pub presence_asked: RefCell<Vec<String>>,
+    /// The folders that hold a `.git`: the nearest of them a path lies in is its worktree.
+    pub trees: Vec<PathBuf>,
+    /// Each path asked which worktree it lies in, in order, kept apart from [`FakeFacts::asked`].
+    pub trees_asked: RefCell<Vec<PathBuf>>,
+    /// The main checkout's folder name of each of these trees; any other has none that can be read.
+    pub checkouts: Vec<(PathBuf, String)>,
+    /// What the folder id check gives for these folders as written, in place of the rule [`FakeFacts::root_id`] says.
+    pub ids: Vec<(String, Result<FolderId, String>)>,
 }
 
 impl FakeFacts {
@@ -123,6 +132,10 @@ impl FakeFacts {
             desktop: Ok(Vec::new()),
             desktop_read: Cell::new(0),
             presence_asked: RefCell::new(Vec::new()),
+            trees: Vec::new(),
+            trees_asked: RefCell::new(Vec::new()),
+            checkouts: Vec::new(),
+            ids: Vec::new(),
         }
     }
 
@@ -208,8 +221,34 @@ impl Facts for FakeFacts {
         })
     }
 
-    fn root_id(&self, _root: &str) -> Result<FolderId, String> {
-        self.root_id.clone()
+    /// The folder's id as [`FakeFacts::ids`] scripts it; else, for the place's root in any spelling of its separators
+    /// and trailing ones, [`FakeFacts::root_id`]; else the [`fake_id`] of the folder with `/` separators, as a carried
+    /// sibling's.
+    fn root_id(&self, root: &str) -> Result<FolderId, String> {
+        if let Some((_, id)) = self.ids.iter().find(|(folder, _)| folder == root) {
+            return id.clone();
+        }
+        let folded = |path: &str| path.replace('\\', "/").trim_end_matches('/').to_owned();
+        let place_root = self.place.as_ref().ok().and_then(Option::as_ref).map(|place| folded(&place.root));
+        if place_root.as_deref() == Some(folded(root).as_str()) {
+            return self.root_id.clone();
+        }
+        Ok(fake_id(&folded(root)))
+    }
+
+    /// The scripted tree of [`FakeFacts::trees`], as written, that is the nearest folder `path` lies in.
+    fn worktree_of(&self, path: &Path) -> Option<PathBuf> {
+        self.trees_asked.borrow_mut().push(path.to_path_buf());
+        path.ancestors()
+            .find_map(|folder| self.trees.iter().find(|tree| tree.as_path() == folder))
+            .cloned()
+    }
+
+    fn checkout_of(&self, tree: &Path) -> Option<String> {
+        self.checkouts
+            .iter()
+            .find(|(folder, _)| folder == tree)
+            .map(|(_, checkout)| checkout.clone())
     }
 }
 

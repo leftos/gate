@@ -413,17 +413,79 @@ fn an_unusable_routing_file_is_ignored_with_one_line() {
     assert!(!light.stderr.contains("ignored"), "a light gate reads no routing file: {light:?}");
 }
 
+/// The line a matched command naming a path in the git worktree `tree`, another than the run's own, says: the tree
+/// written with `\`, in double quotes when it holds a space or a character a shell reads apart.
+fn cd_line(tree: &Path) -> String {
+    let tree = shown(tree).replace('/', "\\");
+    let quoted = tree.contains([' ', ';', '&', '\'', '(', ')', ',', '=', '$', '`']);
+    let tree = if quoted { format!("\"{tree}\"") } else { tree };
+    format!("gate: not routed: the command works in {tree}; run it with --cd {tree}")
+}
+
+/// The `notRouted` value of a matched command naming a path in another git worktree.
+const ANOTHER_WORKTREE: &str = "another worktree";
+
 #[test]
 fn a_matched_command_holding_a_path_outside_the_worktree_runs_here_saying_so() {
     let case = routed_case("routing-outside");
     let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", FAKE_TOOL])));
+    let share = finish(case.gate(&heavy_words_with_limit(
+        "share.log",
+        &[],
+        &[r".\tool.exe", "out", r"\\host\share\x.csproj"],
+    )));
 
-    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    // The fake tool lies in this repo's build folder, whose repo the routing file does not list.
+    assert_eq!((outcome.code, share.code), (Some(0), Some(0)), "{outcome:?} {share:?}");
     assert!(
         outcome.stderr.contains(&format!("gate: not routed: {FAKE_TOOL} is outside the worktree")),
         "only a command's first word is read as a program's path: {outcome:?}"
     );
-    assert_local(&events(&case), None);
+    assert!(
+        share.stderr.contains(r"gate: not routed: \\host\share\x.csproj is outside the worktree"),
+        "a share path is looked up in no worktree: {share:?}"
+    );
+    let events = events(&case);
+    assert_local(&events[..3], None);
+    assert_local(&events[3..], None);
+}
+
+/// The folder beside the case's named the case's folder name and `suffix`, made empty.
+fn beside_case(case: &Case, suffix: &str) -> PathBuf {
+    let mut name = case.folder().file_name().expect("the case folder has a name").to_owned();
+    name.push(suffix);
+    let folder = case.folder().with_file_name(name);
+    if folder.exists() {
+        fs::remove_dir_all(&folder).expect("a folder left by an earlier run can be removed");
+    }
+    fs::create_dir_all(&folder).expect("the folder beside the case can be made");
+    folder
+}
+
+#[test]
+fn a_command_in_another_worktree_is_told_to_cd_and_journals_why() {
+    let case = routed_case("routing-other-worktree");
+    let main = beside_case(&case, ".main");
+    let git_folder = main.join(".git").join("worktrees").join("other");
+    fs::create_dir_all(&git_folder).expect("the main checkout's git folder for the worktree can be made");
+    fs::write(git_folder.join("commondir"), "../..\n").expect("the commondir file can be written");
+    let other = beside_case(&case, ".other");
+    let gitdir = shown(&git_folder).replace('\\', "/");
+    fs::write(other.join(".git"), format!("gitdir: {gitdir}\n")).expect("a linked worktree's .git file can be written");
+    let main_repo = repo_name(&main.file_name().expect("the main checkout has a name").to_string_lossy());
+    let routing = json!({ "host": HOST, "repos": { repo(&case): ["*tool*"], main_repo: ["*tool*"] } });
+    write_remote_json(&case, &routing.to_string());
+    let path = shown(&other.join("src").join("x.csproj"));
+    let outcome = finish(case.gate(&heavy_words_with_limit("out.log", &[], &[r".\tool.exe", "out", &path])));
+
+    let line = cd_line(&other);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(&format!("{line}\n")), "{outcome:?}");
+    assert!(!outcome.stderr.contains("is outside the worktree"), "one line, not both: {outcome:?}");
+    assert!(outcome.stdout.contains(&path), "the command ran here: {outcome:?}");
+    assert_local(&events(&case), Some(ANOTHER_WORKTREE));
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert!(log.contains(&line), "{log}");
 }
 
 /// The line a routed run says for the caller's watched variables it does not send, as far as its first name.
@@ -604,8 +666,8 @@ fn a_gate_given_cd_routes_as_a_gate_started_in_that_folder() {
     let here = finish(case.gate_in("other", &heavy_words_with_limit(&here_log, &[], &[&dotted, "out", "ran here"])));
     assert_eq!(here.code, Some(0), "{here:?}");
     assert!(
-        here.stderr.contains(&format!("gate: not routed: {dotted} is outside the worktree")),
-        "without --cd the case's files are outside the worktree: {here:?}"
+        here.stderr.contains(&cd_line(&case.folder())),
+        "without --cd the case's files are in another worktree: {here:?}"
     );
 
     let call = case.folder().join("call.json");

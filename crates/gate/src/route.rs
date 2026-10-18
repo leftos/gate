@@ -8,7 +8,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::time::{Duration, SystemTime};
 
 use gate_args::{GATE_SET_NAMES, RunRequest, Slot, TestSeams, command_line};
@@ -25,6 +25,7 @@ use gate_state::v1;
 use gate_win32::{Detached, DetachedLaunch, Share};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    GetDriveTypeW,
 };
 
 use crate::console::Console;
@@ -35,6 +36,8 @@ use crate::warm;
 
 /// The `notRouted` value of a heavy gate its caller kept here with `--local`.
 const LOCAL_FLAG: &str = "--local";
+/// The `notRouted` value of a matched command kept here because its outside path lies in another git worktree.
+const ANOTHER_WORKTREE: &str = "another worktree";
 /// The largest file of `.gate` the gate reads: 64 KiB.
 const GATE_FILE_MOST_BYTES: usize = 64 * 1024;
 /// The problem of a file of `.gate` that is a link, a junction or a folder.
@@ -174,13 +177,17 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
 /// heavy slot and every other input exactly as the run's own had it, routed only when every word of the command is valid
 /// Unicode (the [`NOT_UNICODE`] rule [`route`] applies). Its git calls run under [`HINT_GIT_LIMIT`], since the run still
 /// holds its light slot, and a call that cannot answer in time means no hint. It reads the routing file and git as the
-/// decision would, and never judges the work folder's warm-up ([`warmed`]), starts one, or says a line.
+/// decision would, and never judges the work folder's warm-up ([`warmed`]), starts one, or says a line; nor does it
+/// look up the worktree an outside path lies in, which only changes the line of a run kept here.
 pub(crate) fn would_route_on_heavy(decision: &Decision, seams: &TestSeams) -> bool {
-    let machine = Machine::at(
-        decision.local_app_data.as_deref(),
-        git::limit(seams).min(HINT_GIT_LIMIT),
-        git::drain(seams),
-    );
+    let machine = Machine {
+        look_up_trees: false,
+        ..Machine::at(
+            decision.local_app_data.as_deref(),
+            git::limit(seams).min(HINT_GIT_LIMIT),
+            git::drain(seams),
+        )
+    };
     decision.unicode && matches!(decide(&decision.inputs(gate_router::Slot::Heavy), &machine), Route::Routed(_))
 }
 
@@ -319,15 +326,18 @@ fn judged(remote: &RemoteRun, machine: &Machine<'_>, root: &ResolvedRoot) -> (Ju
     (judge_with(&record, lock_held), Some(hash.clone()))
 }
 
-/// The queue line's `notRouted`: `--local` for a heavy gate its caller kept here with `--local`, else none.
+/// The queue line's `notRouted`: `--local` for a heavy gate its caller kept here with `--local`, `another worktree`
+/// for a matched command whose outside path lies in another git worktree, else none.
 pub(crate) fn not_routed(route: &Route) -> Option<String> {
-    matches!(
-        route,
+    match route {
         Route::Local {
-            reason: Some(LocalReason::LocalFlag)
-        }
-    )
-    .then(|| LOCAL_FLAG.to_owned())
+            reason: Some(LocalReason::LocalFlag),
+        } => Some(LOCAL_FLAG.to_owned()),
+        Route::Local {
+            reason: Some(LocalReason::OtherWorktree { .. }),
+        } => Some(ANOTHER_WORKTREE.to_owned()),
+        _ => None,
+    }
 }
 
 fn slot(slot: Slot) -> gate_router::Slot {
@@ -374,6 +384,9 @@ pub(crate) struct Machine<'a> {
     found: RefCell<Placed>,
     /// The routing file the decision read, when it read one: the warm-up's judgement reads its consent from this.
     config: RefCell<Option<Config>>,
+    /// Whether the worktree an outside path lies in is looked up ([`Facts::worktree_of`]): only a decision that may say
+    /// the line naming it does.
+    look_up_trees: bool,
 }
 
 impl<'a> Machine<'a> {
@@ -392,6 +405,7 @@ impl<'a> Machine<'a> {
             git_drain,
             found: RefCell::new(Placed::NotAsked),
             config: RefCell::new(None),
+            look_up_trees: true,
         }
     }
 
@@ -492,6 +506,106 @@ impl Facts for Machine<'_> {
     fn root_id(&self, root: &str) -> Result<FolderId, String> {
         root_id(root)
     }
+
+    /// None without looking when the machine does not look up trees (the heavy-route hint's).
+    fn worktree_of(&self, path: &Path) -> Option<PathBuf> {
+        if !self.look_up_trees {
+            return None;
+        }
+        worktree_of(path)
+    }
+
+    fn checkout_of(&self, tree: &Path) -> Option<String> {
+        checkout_of(tree)
+    }
+}
+
+/// What `GetDriveTypeW` says of a root that names no volume.
+const DRIVE_NO_ROOT_DIR: u32 = 1;
+/// What `GetDriveTypeW` says of a network drive.
+const DRIVE_REMOTE: u32 = 4;
+/// The most of a `.git` file or a `commondir` file read: a line naming a folder.
+const GIT_FILE_LIMIT: u64 = 4096;
+
+/// The git worktree `path` lies in: the nearest of `path` and the folders above it that holds a `.git` folder, a main
+/// checkout's, or file, a linked worktree's, read from its metadata without following a link, so a `.git` that is a link
+/// or a junction holds none; `None` when none on the way does, and when `path` is not on a local drive
+/// ([`on_local_drive`]). No git is started.
+fn worktree_of(path: &Path) -> Option<PathBuf> {
+    if !on_local_drive(path) {
+        return None;
+    }
+    path.ancestors()
+        .find(|folder| fs::symlink_metadata(folder.join(".git")).is_ok_and(|metadata| metadata.is_dir() || metadata.is_file()))
+        .map(Path::to_path_buf)
+}
+
+/// Whether `path` is absolute on a drive letter (`X:\`, `\\?\X:\`) whose drive is there and not a network drive, as
+/// `GetDriveTypeW` says of its root. A share or device path, or a path relative in any way, is not; nothing on the
+/// network is asked.
+fn on_local_drive(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return false;
+    };
+    let (Prefix::Disk(letter) | Prefix::VerbatimDisk(letter)) = prefix.kind() else {
+        return false;
+    };
+    let root: Vec<u16> = format!(r"{}:\", char::from(letter)).encode_utf16().chain([0]).collect();
+    // SAFETY: `root` is a NUL-terminated UTF-16 string that outlives the call, which only reads it.
+    let kind = unsafe { GetDriveTypeW(root.as_ptr()) };
+    kind != DRIVE_NO_ROOT_DIR && kind != DRIVE_REMOTE
+}
+
+/// The folder name of the main checkout of the worktree at `tree`, as git's common folder gives the run's own: the
+/// parent of `tree\.git` when that is a folder; for a `.git` file, the parent of the common folder of the git folder its
+/// `gitdir:` line names ([`common_folder`]). `None` when any of it cannot be read, the `.git` is a link or a junction,
+/// or the folder the `gitdir:` line names is on no local drive ([`on_local_drive`]). No git is started.
+fn checkout_of(tree: &Path) -> Option<String> {
+    let dot_git = tree.join(".git");
+    let metadata = fs::symlink_metadata(&dot_git).ok()?;
+    let common = if metadata.is_dir() {
+        dot_git
+    } else if metadata.is_file() {
+        common_folder(&linked_git_folder(tree, &dot_git)?)?
+    } else {
+        return None;
+    };
+    common.parent()?.file_name()?.to_str().map(str::to_owned)
+}
+
+/// The git folder the `.git` file `dot_git` of the worktree `tree` names on its first line, `gitdir: <folder>`, read
+/// against `tree` when relative; `None` when there is no such line, or the folder is not one on a local drive.
+fn linked_git_folder(tree: &Path, dot_git: &Path) -> Option<PathBuf> {
+    let text = read_git_file(dot_git)?;
+    let named = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+    let folder = std::path::absolute(tree.join(named)).ok()?;
+    let is_folder = on_local_drive(&folder) && fs::symlink_metadata(&folder).is_ok_and(|metadata| metadata.is_dir());
+    is_folder.then_some(folder)
+}
+
+/// The common folder of the git folder `git`, as git reads it: the folder its `commondir` file names, read against `git`
+/// when relative, else `git` itself when there is no such file; `None` when it cannot be read, or is not a file: a link
+/// or a junction is not followed.
+fn common_folder(git: &Path) -> Option<PathBuf> {
+    let file = git.join("commondir");
+    match fs::symlink_metadata(&file) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(git.to_path_buf()),
+        Ok(metadata) if metadata.is_file() => {}
+        _ => return None,
+    }
+    let named = read_git_file(&file)?;
+    std::path::absolute(git.join(named.lines().next()?.trim())).ok()
+}
+
+/// The text of the small file at `path`, its first [`GIT_FILE_LIMIT`] bytes; `None` when it cannot be read or is not
+/// UTF-8.
+fn read_git_file(path: &Path) -> Option<String> {
+    let mut text = String::new();
+    fs::File::open(path).ok()?.take(GIT_FILE_LIMIT).read_to_string(&mut text).ok()?;
+    Some(text)
 }
 
 /// The id of the worktree folder at `root`, opened following links and sharing everything: routing reads it for every
@@ -752,10 +866,11 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
     use super::{
-        GATE_FILE_NOT_A_FILE, SIBLING_GIT_LINK, SIBLING_LINK, SIBLING_NOT_A_FOLDER, holds_existing_path, not_routed, parse_head, parse_place,
-        probed_lock, read_siblings, sibling_folder,
+        GATE_FILE_NOT_A_FILE, SIBLING_GIT_LINK, SIBLING_LINK, SIBLING_NOT_A_FOLDER, checkout_of, holds_existing_path, not_routed, parse_head,
+        parse_place, probed_lock, read_siblings, sibling_folder, worktree_of,
     };
     use crate::test_support::junction;
+    use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
     /// The folder the place cases are asked of, spelled on a subst drive as a gate started there spells it.
     const FOLDER: &str = r"S:\src";
@@ -921,6 +1036,82 @@ mod tests {
     }
 
     #[test]
+    fn a_path_in_a_linked_worktree_names_its_root() {
+        let parent: PathBuf = crate::test_support::temp_dir().join(format!("gate-route-worktree-of-{}", std::process::id()));
+        if parent.exists() {
+            fs::remove_dir_all(&parent).expect("a folder left by an earlier run can be removed");
+        }
+        let _removed = Removed(vec![parent.clone()]);
+        let tree = parent.join("repo.wt").join("a");
+        let deep = tree.join("src").join("deep");
+        fs::create_dir_all(&deep).expect("the worktree's folders can be made");
+        let git_folder = parent.join("repo").join(".git").join("worktrees").join("a");
+        fs::create_dir_all(&git_folder).expect("the main checkout's git folder for the worktree can be made");
+        fs::write(git_folder.join("commondir"), "../..\n").expect("the commondir file can be written");
+        let gitdir = git_folder.to_string_lossy().replace('\\', "/");
+        fs::write(tree.join(".git"), format!("gitdir: {gitdir}\n")).expect("a linked worktree's .git file can be written");
+        fs::write(deep.join("x.cs"), "x").expect("a file can be written");
+        let nested = tree.join("vendor").join("lib");
+        fs::create_dir_all(nested.join(".git")).expect("a nested checkout can be made");
+        let linked = tree.join("linked");
+        fs::create_dir_all(&linked).expect("a folder whose .git is a junction can be made");
+        junction(&linked.join(".git"), &nested.join(".git"));
+
+        assert_eq!(worktree_of(&deep.join("x.cs")), Some(tree.clone()), "a file below the root");
+        assert_eq!(worktree_of(&deep), Some(tree.clone()), "a folder below the root");
+        assert_eq!(worktree_of(&tree), Some(tree.clone()), "the root itself");
+        assert_eq!(
+            worktree_of(&deep.join("gone").join("y")),
+            Some(tree.clone()),
+            "a path not on disk below the root"
+        );
+        assert_eq!(worktree_of(&nested.join("z")), Some(nested.clone()), "the nearest .git wins");
+        assert_eq!(worktree_of(&linked.join("z")), Some(tree.clone()), "a .git that is a junction holds none");
+        assert_eq!(
+            worktree_of(&parent.join("plain").join("deep")),
+            worktree_of(&parent),
+            "a folder holding no .git is in the tree its parent is in"
+        );
+
+        assert_eq!(checkout_of(&tree).as_deref(), Some("repo"), "a linked worktree's main checkout");
+        assert_eq!(checkout_of(&nested).as_deref(), Some("lib"), "a checkout with a .git folder is its own");
+        assert_eq!(checkout_of(&linked), None, "a .git that is a junction");
+
+        let commondir = git_folder.join("commondir");
+        fs::remove_file(&commondir).expect("the commondir file can be removed");
+        let named = parent.join("named-commondir");
+        fs::write(&named, "../..\n").expect("a file a link can name can be written");
+        // A file symbolic link needs Developer Mode or elevation; where it cannot be made, the folder case stands alone.
+        if std::os::windows::fs::symlink_file(&named, &commondir).is_ok() {
+            assert_eq!(checkout_of(&tree), None, "a commondir that is a link is not followed");
+            fs::remove_file(&commondir).expect("the commondir link can be removed");
+        }
+        fs::create_dir(&commondir).expect("a folder named commondir can be made");
+        assert_eq!(checkout_of(&tree), None, "a commondir that is a folder");
+        fs::remove_dir(&commondir).expect("the commondir folder can be removed");
+        assert_eq!(
+            checkout_of(&tree).as_deref(),
+            Some("worktrees"),
+            "a git folder with no commondir is its own common folder"
+        );
+        fs::remove_dir_all(&git_folder).expect("the git folder can be removed");
+        assert_eq!(checkout_of(&tree), None, "a .git file naming no folder");
+
+        // SAFETY: `GetLogicalDrives` takes nothing and only reads the system's drive table.
+        let drives = unsafe { GetLogicalDrives() };
+        let free = (b'D'..=b'Z')
+            .rev()
+            .find(|letter| drives & (1 << (letter - b'A')) == 0)
+            .expect("a drive letter is free");
+        let free = PathBuf::from(format!(r"{}:\a\b", char::from(free)));
+        assert_eq!(worktree_of(&free), None, "a path on a drive that is not there");
+        assert_eq!(worktree_of(Path::new(r"\??\UNC\host\share\x")), None, "a path that is not absolute");
+        assert_eq!(worktree_of(Path::new(r"\\host\share\x")), None, "a share path, never asked");
+        let device = PathBuf::from(format!(r"\\.\{}", deep.to_string_lossy()));
+        assert_eq!(worktree_of(&device), None, "the tree spelled as a device path is on no drive letter");
+    }
+
+    #[test]
     fn a_lock_that_is_a_folder_or_a_junction_is_a_lock_problem() {
         let folder: PathBuf = crate::test_support::temp_dir().join(format!("gate-route-lock-{}", std::process::id()));
         if folder.exists() {
@@ -942,15 +1133,25 @@ mod tests {
     }
 
     #[test]
-    fn only_the_local_flag_writes_not_routed() {
+    fn only_the_local_flag_and_another_worktree_write_not_routed() {
         let flag = Route::Local {
             reason: Some(LocalReason::LocalFlag),
+        };
+        let other = Route::Local {
+            reason: Some(LocalReason::OtherWorktree {
+                tree: PathBuf::from(r"X:\dev\other"),
+            }),
+        };
+        let outside = Route::Local {
+            reason: Some(LocalReason::Outside { word: r"X:\x".to_owned() }),
         };
         let failed = Route::Local {
             reason: Some(LocalReason::Failed { reason: "x".to_owned() }),
         };
 
         assert_eq!(not_routed(&flag).as_deref(), Some("--local"));
+        assert_eq!(not_routed(&other).as_deref(), Some("another worktree"));
+        assert_eq!(not_routed(&outside), None, "an outside word in no other worktree writes none");
         assert_eq!(not_routed(&failed), None);
         assert_eq!(not_routed(&Route::Local { reason: None }), None);
     }

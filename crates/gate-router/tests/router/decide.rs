@@ -422,6 +422,166 @@ fn a_word_outside_the_worktree_wins_over_a_folder_holding_nothing() {
     assert_eq!(facts.asked(), ["config", "place"]);
 }
 
+/// A gate at the root of [`ROOT`] whose folders `trees` hold a `.git`, each a worktree of `yaat`, which the routing
+/// file lists.
+fn with_trees(trees: &[&str]) -> FakeFacts {
+    FakeFacts {
+        trees: trees.iter().map(PathBuf::from).collect(),
+        checkouts: trees.iter().map(|tree| (PathBuf::from(tree), "yaat".to_owned())).collect(),
+        ..FakeFacts::at_root()
+    }
+}
+
+#[test]
+fn a_matched_command_in_another_worktree_says_to_cd_into_it() {
+    let other = r"X:\dev\yaat.wt\yaat-780";
+    let line = format!("gate: not routed: the command works in {other}; run it with --cd {other}");
+    let command = words(&["dotnet", "test", r"X:\dev\yaat.wt\yaat-780\src\x.csproj"]);
+    let facts = with_trees(&[r"X:\dev", other]);
+    assert_eq!(local_line(&decide(&heavy(&command), &facts)), Some(line.clone()), "the nearest tree");
+    assert_eq!(*facts.trees_asked.borrow(), [PathBuf::from(r"X:\dev\yaat.wt\yaat-780\src\x.csproj")]);
+
+    let climb = words(&["dotnet", "test", "../yaat-780/src/x.csproj"]);
+    assert_eq!(
+        local_line(&decide(&heavy(&climb), &with_trees(&[other]))),
+        Some(line),
+        "a climb out of the root, read from the gate's folder"
+    );
+
+    let spaced = words(&["dotnet", "test", r"X:\dev\my repo.wt\b\x.csproj"]);
+    assert_eq!(
+        local_line(&decide(&heavy(&spaced), &with_trees(&[r"X:\dev\my repo.wt\b"]))).as_deref(),
+        Some(r#"gate: not routed: the command works in "X:\dev\my repo.wt\b"; run it with --cd "X:\dev\my repo.wt\b""#),
+        "a tree with a space is quoted"
+    );
+    // A word holding most of these is a script's text, which names no path; a subst drive standing for the tree does.
+    let command = words(&["dotnet", "test", r"S:\src\x.csproj"]);
+    for tree in [
+        r"X:\dev\a;b",
+        r"X:\dev\a&b",
+        r"X:\dev\a'b",
+        r"X:\dev\a(b)",
+        r"X:\dev\a,b",
+        r"X:\dev\a=b",
+        r"X:\dev\a$b",
+        r"X:\dev\a`b",
+    ] {
+        let facts = FakeFacts {
+            devices: vec![('S', format!(r"\??\{tree}"))],
+            ..with_trees(&[tree])
+        };
+        assert_eq!(
+            local_line(&decide(&heavy(&command), &facts)),
+            Some(format!(r#"gate: not routed: the command works in "{tree}"; run it with --cd "{tree}""#)),
+            "a tree with a character a shell reads apart is quoted"
+        );
+    }
+}
+
+#[test]
+fn an_outside_word_in_no_worktree_keeps_the_outside_line() {
+    let command = words(&["dotnet", "test", r"X:\dev\other\x.csproj"]);
+    let facts = with_trees(&[]);
+    assert_eq!(
+        local_line(&decide(&heavy(&command), &facts)).as_deref(),
+        Some(r"gate: not routed: X:\dev\other\x.csproj is outside the worktree")
+    );
+    assert_eq!(*facts.trees_asked.borrow(), [PathBuf::from(r"X:\dev\other\x.csproj")]);
+
+    let share = words(&["dotnet", "test", r"\\host\share\x.csproj"]);
+    let anywhere = with_trees(&[r"\\host\share", r"X:\"]);
+    assert_eq!(
+        local_line(&decide(&heavy(&share), &anywhere)).as_deref(),
+        Some(r"gate: not routed: \\host\share\x.csproj is outside the worktree"),
+        "a share path names no path to look up"
+    );
+    assert!(anywhere.trees_asked.borrow().is_empty(), "{:?}", anywhere.trees_asked);
+}
+
+#[test]
+fn an_outside_path_in_a_declared_sibling_is_not_told_to_cd() {
+    // A path climbing out of a subst drive standing for a root stays where Windows stops it, at the drive's root: the
+    // rewrite judges it outside, and the tree it lies in is the run's own or a sibling's.
+    let command = words(&["dotnet", "test", r"S:\..\x\y.csproj"]);
+    for (stands_for, tree) in [
+        (r"\??\X:\dev\yaat.wt\b", r"X:\dev\yaat.wt\b"),
+        (r"\??\X:\dev\yaat.wt\a", r"X:\dev\yaat.wt\a"),
+    ] {
+        let facts = FakeFacts {
+            devices: vec![('S', stands_for.to_owned())],
+            trees: vec![PathBuf::from(tree)],
+            checkouts: vec![(PathBuf::from(tree), "yaat".to_owned())],
+            ..FakeFacts::with_siblings("", &["b"], &["b"])
+        };
+        assert_eq!(
+            local_line(&decide(&heavy(&command), &facts)).as_deref(),
+            Some(r"gate: not routed: S:\..\x\y.csproj is outside the worktree"),
+            "{tree}"
+        );
+        assert_eq!(*facts.trees_asked.borrow(), [PathBuf::from(tree).join(r"x\y.csproj")], "{tree}");
+    }
+}
+
+#[test]
+fn a_command_in_another_worktree_of_an_unlisted_repo_keeps_the_outside_line() {
+    let command = words(&["dotnet", "test", r"X:\dev\tools\x.csproj"]);
+    let line = Some(r"gate: not routed: X:\dev\tools\x.csproj is outside the worktree");
+    let listed = with_trees(&[r"X:\dev\tools"]);
+    assert_eq!(
+        local_line(&decide(&heavy(&command), &listed)).as_deref(),
+        Some(r"gate: not routed: the command works in X:\dev\tools; run it with --cd X:\dev\tools"),
+        "a tree of a listed repo"
+    );
+    for (checkouts, why) in [
+        (vec![(PathBuf::from(r"X:\dev\tools"), "tools".to_owned())], "unlisted"),
+        (Vec::new(), "unreadable"),
+    ] {
+        let facts = FakeFacts {
+            checkouts,
+            ..with_trees(&[r"X:\dev\tools"])
+        };
+        assert_eq!(local_line(&decide(&heavy(&command), &facts)).as_deref(), line, "{why}");
+    }
+}
+
+#[test]
+fn another_spelling_of_the_own_root_is_not_told_to_cd() {
+    // A junction to the root: another spelling, the root's folder id.
+    let command = words(&["dotnet", "test", r"X:\links\yaat-a\src\x.csproj"]);
+    let junction = FakeFacts {
+        ids: vec![(r"X:\links\yaat-a".to_owned(), Ok(fake_id(ROOT)))],
+        ..with_trees(&[r"X:\links\yaat-a"])
+    };
+    assert_eq!(
+        local_line(&decide(&heavy(&command), &junction)).as_deref(),
+        Some(r"gate: not routed: X:\links\yaat-a\src\x.csproj is outside the worktree")
+    );
+
+    // A tree whose id cannot be read is compared by its spelling: another letter case and a trailing separator.
+    let climb = words(&["dotnet", "test", r"S:\..\x\y.csproj"]);
+    let spelled = r"x:\DEV\yaat.wt\A\";
+    let facts = FakeFacts {
+        devices: vec![('S', r"\??\x:\DEV\yaat.wt\A".to_owned())],
+        ids: vec![(spelled.to_owned(), Err("access denied".to_owned()))],
+        ..with_trees(&[spelled])
+    };
+    assert_eq!(
+        local_line(&decide(&heavy(&climb), &facts)).as_deref(),
+        Some(r"gate: not routed: S:\..\x\y.csproj is outside the worktree")
+    );
+    assert_eq!(*facts.trees_asked.borrow(), [PathBuf::from(r"x:\DEV\yaat.wt\A\x\y.csproj")]);
+    let elsewhere = FakeFacts {
+        devices: vec![('S', r"\??\x:\DEV\yaat.wt\B".to_owned())],
+        ids: vec![(r"x:\DEV\yaat.wt\B".to_owned(), Err("access denied".to_owned()))],
+        ..with_trees(&[r"x:\DEV\yaat.wt\B"])
+    };
+    assert_eq!(
+        local_line(&decide(&heavy(&climb), &elsewhere)).as_deref(),
+        Some(r"gate: not routed: the command works in x:\DEV\yaat.wt\B; run it with --cd x:\DEV\yaat.wt\B"),
+        "a spelling of no own root"
+    );
+}
+
 #[test]
 fn a_folder_holding_nothing_the_snapshot_sends_says_so() {
     let command = words(&["dotnet", "test"]);

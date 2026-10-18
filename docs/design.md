@@ -551,6 +551,8 @@ The lines of a run that starts its command:
 
   The second line is said for `--local` (`gate: not routed: --local`), a word outside the worktree and its declared siblings (`gate: not routed: <word> is outside the worktree`), a folder that holds nothing the snapshot sends (`gate: not routed: <sub> holds nothing the snapshot sends`).
 
+  A word outside the worktree whose path lies in another git worktree of a repo `remote.json` lists says instead `gate: not routed: the command works in <tree>; run it with --cd <tree>` ([Routing](#routing), the decision). `<tree>` is the worktree's absolute path written with `\`, escaped like the sibling lines, and in double quotes when it holds a space or any of `; & ' ( ) , = $` or the backtick.
+
   It is also said for a word of the command that is not valid Unicode (`gate: not routed: a word of the command is not valid Unicode`), or a fact that could not be read (`gate: not routed: cannot run git: <error>`, or the working directory or git's output).
 
   These lines keep a matched command here for siblings: a problem with the repo's `.gate/siblings.toml` (`gate: not routed: .gate/siblings.toml: <problem>`, control characters and reordering marks escaped), a declared sibling with no worktree beside the root (`gate: not routed: sibling <name> not found beside the worktree`), a root folder name the builder cannot lay out (`gate: not routed: the worktree folder name <leaf> cannot be laid out on the builder`).
@@ -936,7 +938,7 @@ The event's own fields:
 
 | Event | Fields after the common ones |
 |---|---|
-| `queue` | `log` (the log's full path), `notRouted` (written right after `log`, only when a heavy gate's caller kept it local with `--local`, with the value `--local`; other reasons for a local run write none) |
+| `queue` | `log` (the log's full path), `notRouted` (written right after `log`, only when a heavy gate was kept local with `--local`, with the value `--local`, or when a matched command's outside path lies in another worktree of a listed repo and the run says to `--cd` it, with the value `another worktree`; every other reason for a local run, the plain outside line included, writes none) |
 | `take` | `slots` (the slot names taken; a critical gate lists every heavy and light slot it holds; a `none` run lists none, `[]`, with `waitedSeconds` 0.0), `waitedSeconds`, optionally `parentPid` (also on the late take of a covered gate), and for a critical gate `counts`, `otherHeld`, then `otherClaims` or `snapshotError` |
 | `release` | `slots` (the same list), `heldSeconds`, `status` (null when the gate failed before its command had one), `wallSeconds`, `adjustedSeconds`, optionally `avgCores`, `peakCores`, `freeCores`, `verdict` |
 | `abandon` | `waitedSeconds`: the gate ended while still queued (Ctrl+C while waiting for a slot, or, for a routed run, while its client waited to start or while it waited for its work folder's key, remote-tagged) |
@@ -1484,6 +1486,14 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A command no pattern matches stays local silently whatever the file holds.
 
+  A matched command with a word outside the worktree and its siblings stays local saying `gate: not routed: <word> is outside the worktree`, unless the word names a path ([`Rewritten::outside_path`], the absolute path with `\`, `..` resolved and a `subst` drive replaced by its target; none for a share or device path, a drive-relative path, or a word that is a script's text or a list) in another git worktree of a listed repo.
+
+  In that case the run says `gate: not routed: the command works in <tree>; run it with --cd <tree>` and the `queue` event's `notRouted` is `another worktree`.
+
+  The tree is the nearest folder from the path up that holds a `.git` file or folder, read from metadata alone with no git started and without following a link, so a `.git` that is a link or a junction holds none. It must be absolute on a local drive (`GetDriveTypeW` says neither network nor missing), and neither the run's root nor a carried sibling's, judged by folder id with the spellings compared in any letter case when an id cannot be read.
+
+  Its repo is named from its main checkout's folder, read from the `.git` file's `gitdir:` line and the git folder's `commondir` file (a link is not followed), and must be a repo `remote.json` lists. Any other case, an unlisted or unreadable repo among them, keeps the plain outside line and writes no `notRouted`. The route hint of a light run (`would_route_on_heavy`) skips this lookup, since it only changes the line of a run kept here.
+
   Only a matched command acts on what the file says, in this order, each keeping the run here with its line.
 
   First a problem with the file (`gate: not routed: .gate/siblings.toml: <problem>`, the first problem, on one line, control characters and reordering marks escaped).
@@ -1567,7 +1577,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   With siblings declared, a path inside a sibling's root (every spelling the root can have, `subst` drives included) is sent as `..` once for each level of the gate's folder below the worktree root and once more, then `/<name>` as declared and the rest, with the separator the in-worktree edit uses.
 
-  A relative path is inside a sibling when its `..` climb exactly to the root's parent and then enters a declared sibling (names compare in ASCII letter case only; `yaat-server2` is not `yaat-server`). Any other climb above the root, a word naming the parent itself, and leaving a sibling again (`../yaat-server/../x`) are outside, and keep the run here with `gate: not routed: <word> is outside the worktree`.
+  A relative path is inside a sibling when its `..` climb exactly to the root's parent and then enters a declared sibling (names compare in ASCII letter case only; `yaat-server2` is not `yaat-server`). Any other climb above the root, a word naming the parent itself, and leaving a sibling again (`../yaat-server/../x`) are outside, and keep the run here with `gate: not routed: <word> is outside the worktree` (or the `--cd` line of the decision above).
 
   An absolute path whose `..` leaves the root it starts below and lands in the worktree or in a declared sibling is sent as where it lands; landing anywhere else is outside.
 
