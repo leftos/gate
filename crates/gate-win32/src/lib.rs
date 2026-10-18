@@ -4,8 +4,8 @@
 //! system's boot time, what a drive letter stands for, a rename that never replaces its target, a name opened inside an
 //! open folder, a file opened again through its reparse point's filter, an open file's volume serial and file id
 //! ([`file_id`]), whether two open files are one, whether an open file is on a network volume ([`on_network_volume`]),
-//! the synchronous I/O a thread waits on cancelled ([`cancel_synchronous_io`]), and the Windows message of an error
-//! code. And what a run on the interactive desktop needs: a named pipe for one
+//! the synchronous I/O a thread waits on cancelled ([`cancel_synchronous_io`]), the GPU's 3D use per adapter over a
+//! window ([`Gpu3dWindow`]), and the Windows message of an error code. And what a run on the interactive desktop needs: a named pipe for one
 //! user's local client, handles copied into and out of another process and the checks on a process taken that way, a
 //! command created on the interactive desktop, the console session's state, and a registered scheduled task started in
 //! a given session once its definition is checked ([`run_task`]), and whether an installed file only SYSTEM,
@@ -24,6 +24,7 @@ mod create;
 mod device;
 mod event;
 mod file;
+mod gpu;
 mod interrupt;
 mod job;
 mod launch;
@@ -51,6 +52,7 @@ pub use console::{Donor, Utf8Console};
 pub use create::spawn;
 pub use device::device_target;
 pub use event::{EventWait, NamedEvent};
+pub use gpu::{AdapterUse, Gpu3dWindow, PdhError};
 pub use interrupt::Interrupt;
 pub use job::{Accounting, Job};
 pub use launch::{

@@ -244,6 +244,9 @@ pub struct TestSeams {
     /// The unpaused wall time under which a passed light run is too short to ask whether its command would route on
     /// heavy, in milliseconds, in place of the gate's own floor.
     pub route_hint_floor_ms: Option<u64>,
+    /// How long each window of an `--alone` run's machine-load snapshot measures, in milliseconds, in place of the
+    /// gate's own window.
+    pub load_window_ms: Option<u64>,
     /// How long a kill's diagnostics gathering may take before it is cut, in milliseconds, in place of the gate's own
     /// budget.
     pub diagnostics_budget_ms: Option<u64>,

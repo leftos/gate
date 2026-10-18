@@ -43,6 +43,7 @@ use crate::environment::{self, BOX_JOB_VARIABLE, SLOT_HELD_VARIABLE, Variables};
 use crate::escaped::{self, Found, Reach, Reached, Recorded};
 use crate::journal::{self, RunJournal};
 use crate::late::{Late, LateOf, LateSlot};
+use crate::load::{self, Measuring, When};
 use crate::log::Log;
 use crate::machine::{self, Machine, MachineWait, MachineWaited};
 use crate::nesting::{Nesting, Parent, enclosing_of};
@@ -154,6 +155,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         covered: None,
         late: None,
         durations: None,
+        load_blocks: Vec::new(),
     };
     let (route, placed) = run.route(environment, console);
     let local = run.local_words(&route, placed.place(), console);
@@ -226,8 +228,9 @@ fn take_heavy<'a>(run: &mut Run<'a>, heavy: &'a mut Option<(RunRequest, Nesting)
 
 /// The nesting `request` runs under, or the status of a run refused before anything is taken or written, its lines
 /// said: a log inside the state root, a critical gate under a heavy or light parent's slot, or an `--alone` gate under
-/// a parent whose slot covers it or refuses it, which leaves an earlier log in place. Any other nesting's lines are said once the run knows the slot it asks for ([`say_nesting`]). With the
-/// nesting, `request` as the gate runs it: a critical gate inside a box run runs as heavy ([`Nesting::requested`]).
+/// a parent whose slot covers it or refuses it or inside a box run, which leaves an earlier log in place. Any other
+/// nesting's lines are said once the run knows the slot it asks for ([`say_nesting`]). With the nesting, `request` as
+/// the gate runs it: a critical gate inside a box run runs as heavy ([`Nesting::requested`]).
 fn admitted<'r>(
     request: &'r RunRequest,
     log: &Path,
@@ -244,7 +247,7 @@ fn admitted<'r>(
         return Err(u32::from(USAGE_STATUS));
     }
     let nesting = Nesting::read(environment, request.slot, root, request.test_seams.parent_job_trusted, console);
-    if request.alone && matches!(nesting, Nesting::Covered(_) | Nesting::Refused(_)) {
+    if request.alone && matches!(nesting, Nesting::Covered(_) | Nesting::Refused(_) | Nesting::InBox) {
         let flag = match request.spelling {
             Spelling::Cli => "--alone",
             Spelling::Compat => "-Alone",
@@ -568,6 +571,9 @@ struct Run<'a> {
     late: Option<LateSlot>,
     /// The durations of a run that takes a slot of its own ([`Run::open_durations`]).
     durations: Option<RunDurations>,
+    /// Each block of load lines a run holding the machine alone wrote to its log ([`Run::log_load`]), which the log's
+    /// tail leaves out, so they reach the log only.
+    load_blocks: Vec<Vec<String>>,
 }
 
 /// What a take of a pool's slot is journalled and claimed with: the run's state root, gate, request, ceiling and log,
@@ -1833,7 +1839,34 @@ impl Run<'_> {
         self.journal.write(&take, None, console);
         slots::wake_waiters(self.root, &mut self.survey, console);
         say_expected(estimate.as_ref(), resolved, console);
+        self.log_load(When::Start, None, console);
         Taking::Took(took, figures)
+    }
+
+    /// Writes the machine's load over a window at `when` to the log of a run that holds the machine alone, `job` being
+    /// its command's once it has one; any other run writes nothing.
+    fn log_load(&mut self, when: When, job: Option<&Job>, console: &mut Console) {
+        if !self.request.alone {
+            return;
+        }
+        let measuring = Measuring {
+            pid: self.gate.pid,
+            start_ms: self.gate.start_ms,
+            root: &self.root.path,
+            job,
+            window: self.request.test_seams.load_window_ms.map_or(load::WINDOW, Duration::from_millis),
+            interrupt: self.host.interrupt,
+        };
+        let block = load::log_load(when, &measuring, self.host.processors, console);
+        self.load_blocks.push(block);
+    }
+
+    /// Writes the end window of a run that wrote its start window and not yet its end window, `job` being its
+    /// command's when one started, so the start block always has its end block.
+    fn log_owed_end_load(&mut self, job: Option<&Job>, console: &mut Console) {
+        if self.load_blocks.len() == 1 {
+            self.log_load(When::End, job, console);
+        }
     }
 
     /// Leaves the queue of `pool` after a Ctrl+C: deletes the ticket, wakes the waiters, says so and journals the
@@ -1940,6 +1973,7 @@ impl Run<'_> {
     /// is `STATUS_CONTROL_C_EXIT`, with no verdict.
     fn interrupted_before_start(&mut self, console: &mut Console) -> Ended {
         console.err("gate: interrupted before the command started");
+        self.log_owed_end_load(None, console);
         if let Err(error) = self.log.finish(console) {
             console.err(&format!("gate: could not write to {}: {error}", self.log.path().display()));
         }
@@ -2088,6 +2122,7 @@ impl Run<'_> {
     /// Reaches the verdict of `outcome`, its markers not scanned when `unscanned`, and the facts its release carries.
     /// `diagnostics` is the block a kill wrote to the log, whose lines the verdict's tail leaves out.
     fn ended(&mut self, outcome: &Outcome<'_>, unscanned: bool, diagnostics: &[String], started: Started<'_>, console: &mut Console) -> Ended {
+        self.log_load(When::End, Some(started.job), console);
         let timing = self.without_nested_cores(outcome.timing, console);
         let passing = Passing {
             pass: Pass::Here(timing),
@@ -2140,6 +2175,7 @@ impl Run<'_> {
             None => format!("gate: could not start {word}: {message}"),
         };
         console.err(&line);
+        self.log_owed_end_load(None, console);
         match self.verdict(NOT_STARTED, None, false, &[], console) {
             Ok(status) => Ended { status, facts: None },
             Err(problem) => self.gate_failed(&problem, None, console),
@@ -2246,8 +2282,15 @@ impl Run<'_> {
         } else {
             self.log.markers()?
         };
-        let wanted = self.request.tail.saturating_add(u64::try_from(diagnostics.len()).unwrap_or(u64::MAX));
-        Ok((found, tail_without_block(self.log.tail(wanted)?, diagnostics, self.request.tail)))
+        let dropped = diagnostics.len() + self.load_blocks.iter().map(Vec::len).sum::<usize>();
+        let wanted = self.request.tail.saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
+        let mut lines = self.log.tail(wanted)?;
+        for block in &self.load_blocks {
+            if let Some(at) = last_run(&lines, block) {
+                lines.drain(at..at + block.len());
+            }
+        }
+        Ok((found, tail_without_block(lines, diagnostics, self.request.tail)))
     }
 
     /// What a kill of the command in `job` reaches: the job, and the state root that names a gate's job.
@@ -2266,9 +2309,11 @@ impl Run<'_> {
     /// Says the gate's own failure, terminates the job of a command that started, and completes the log; status 1.
     fn gate_failed(&mut self, problem: &str, started: Option<Started<'_>>, console: &mut Console) -> Ended {
         console.err(&format!("gate: the gate failed while running the command: {problem}"));
+        let job = started.as_ref().map(|started| started.job);
         if let Some(Started { job, running, recorded, .. }) = started {
             stop(&self.ender(job, running), recorded, console);
         }
+        self.log_owed_end_load(job, console);
         if let Err(error) = self.log.finish(console) {
             console.err(&format!(
                 "gate: could not write to {} after the failure: {error}",

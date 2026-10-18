@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, SetConsoleCtrlHandler};
-use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
+use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject};
 use windows_sys::core::BOOL;
 
 use crate::wait_millis;
@@ -84,6 +84,25 @@ impl Interrupt {
     /// Raises the interrupt, as the console handler does on a Ctrl+C.
     pub fn raise(self) {
         raise();
+    }
+
+    /// Waits at most `timeout` for the interrupt; whether it was raised, before the wait or during it.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the wait fails.
+    pub fn wait(self, timeout: Duration) -> io::Result<bool> {
+        // SAFETY: the event is the one `install` made, never closed, and an `Interrupt` exists only once it has been
+        // made.
+        let result = unsafe { WaitForSingleObject(EVENT.load(Ordering::Acquire), wait_millis(timeout)) };
+        match result {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => Err(io::Error::last_os_error()),
+            _ => Err(io::Error::other(format!(
+                "the wait on the interrupt ended with the unexpected result 0x{result:x}"
+            ))),
+        }
     }
 }
 

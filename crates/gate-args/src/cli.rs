@@ -281,6 +281,7 @@ fn seam_option(name: &str) -> Option<RunOption> {
     match name {
         "test-sample-ms" => Some(RunOption::Value(ValueOption::SampleMs)),
         "test-route-hint-floor-ms" => Some(RunOption::Value(ValueOption::RouteHintFloorMs)),
+        "test-load-window-ms" => Some(RunOption::Value(ValueOption::LoadWindowMs)),
         "test-heartbeat-ms" => Some(RunOption::Value(ValueOption::HeartbeatMs)),
         "test-poll-ms" => Some(RunOption::Value(ValueOption::PollMs)),
         "test-stall-ms" => Some(RunOption::Value(ValueOption::StallMs)),

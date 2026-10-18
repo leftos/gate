@@ -438,7 +438,8 @@ impl<'a> Wait<'a> {
     /// a remote wait, which no critical request holds back.
     fn barrier_in(&self, others: &[Ticket]) -> Option<Barrier> {
         match self.pool {
-            Pool::Local(_) => barrier(others, self.order),
+            Pool::Local(SlotKind::Light) => light_barrier(others, self.order),
+            Pool::Local(SlotKind::Heavy) => barrier(others, self.order),
             Pool::Remote(_) => None,
         }
     }
@@ -801,6 +802,24 @@ fn barrier(others: &[Ticket], order: (u64, u32)) -> Option<Barrier> {
         })
 }
 
+/// The barrier of a light gate at the place `order` ([`barrier`]), named by the request that leaves it no room: once a
+/// barrier holds it back, the earliest of `others`' requests to hold the machine alone, ahead of it or not, since any
+/// of them leaves no light gate room beside a critical request ([`beside_allowance`]); else the barrier itself.
+fn light_barrier(others: &[Ticket], order: (u64, u32)) -> Option<Barrier> {
+    let ahead = barrier(others, order)?;
+    if ahead.alone {
+        return Some(ahead);
+    }
+    let alone = others
+        .iter()
+        .filter(|ticket| ticket.holds_alone())
+        .min_by_key(|ticket| ticket.queue_order());
+    Some(alone.map_or(ahead, |ticket| Barrier {
+        pid: ticket.pid,
+        alone: true,
+    }))
+}
+
 /// The slots of a local pool of `kind` and `count` a gate behind a critical request tries: none for a heavy gate; for a
 /// light gate every one while `room` places are left beside the request ([`beside_room`]), and none once none is.
 fn slot_range(kind: SlotKind, count: u32, room: usize) -> Range<u32> {
@@ -1041,8 +1060,8 @@ mod tests {
 
     use super::scratch::{Holder, Scratch, holding, request};
     use super::{
-        Arrival, Barrier, Beside, Host, LendFacts, Wait, Waited, Which, barrier, beside_of, beside_room, first_heartbeat, holder_eta, lends,
-        may_take, slot_range,
+        Arrival, Barrier, Beside, Host, LendFacts, Wait, Waited, Which, barrier, beside_of, beside_place, beside_room, first_heartbeat, holder_eta,
+        lends, light_barrier, may_take, slot_range,
     };
     use crate::console::Console;
     use crate::slots::BesideTry;
@@ -1303,6 +1322,38 @@ mod tests {
             "a request arrived with it, of a lower pid, still waiting"
         );
         assert_eq!(barrier(&[], order), None);
+    }
+
+    #[test]
+    fn a_light_gate_behind_a_plain_critical_request_is_named_behind_a_later_request_to_hold_the_machine_alone() {
+        let own = ticket(TicketKind::Light, 100, 7);
+        let order = own.queue_order();
+        let mut later_alone = ticket(TicketKind::Critical, 150, 21);
+        later_alone.alone = true;
+        let mut latest_alone = ticket(TicketKind::Critical, 300, 22);
+        latest_alone.alone = true;
+        let plain = ticket(TicketKind::Critical, 50, 12);
+
+        let behind = light_barrier(&[plain.clone(), latest_alone, later_alone], order);
+
+        assert_eq!(
+            behind,
+            Some(Barrier { pid: 21, alone: true }),
+            "the earliest alone request leaves it no room"
+        );
+        let line = behind.map(beside_place);
+        assert_eq!(
+            line.as_deref(),
+            Some("light slot behind the request of gate 21 that holds the machine alone")
+        );
+        assert_eq!(
+            light_barrier(std::slice::from_ref(&plain), order),
+            Some(Barrier { pid: 12, alone: false }),
+            "with no alone request, the plain request ahead"
+        );
+        let mut alone_only = ticket(TicketKind::Critical, 150, 21);
+        alone_only.alone = true;
+        assert_eq!(light_barrier(&[alone_only], order), None, "a later request alone is no barrier by itself");
     }
 
     #[test]

@@ -46,6 +46,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     RouteHintFloorMs,
     #[cfg(feature = "test-seams")]
+    LoadWindowMs,
+    #[cfg(feature = "test-seams")]
     HeartbeatMs,
     #[cfg(feature = "test-seams")]
     PollMs,
@@ -304,6 +306,8 @@ impl RunBuilder {
             ValueOption::SampleMs => self.test_seams.sample_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::RouteHintFloorMs => self.test_seams.route_hint_floor_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::LoadWindowMs => self.test_seams.load_window_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::HeartbeatMs => self.test_seams.heartbeat_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]

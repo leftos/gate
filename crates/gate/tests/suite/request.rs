@@ -26,6 +26,7 @@ fn print_request_shows_the_new_cli_request() {
         "heartbeatMs": null,
         "pollMs": null,
         "stallMs": null,
+        "loadWindowMs": null,
         "interruptAfterSamples": null,
         "interruptQueued": false,
         "interruptBeforeKey": false,
@@ -111,6 +112,15 @@ fn print_request_shows_env_pairs_in_order() {
     words.splice(7..7, ["--env", "NuGetAudit=false", "--env=EMPTY="]);
 
     assert_eq!(case.run(&words).request()["env"], json!([["NuGetAudit", "false"], ["EMPTY", ""]]));
+}
+
+#[test]
+fn print_request_shows_the_load_window_seam() {
+    let case = Case::new("print_request_shows_the_load_window_seam");
+    let mut words = print_run(&["cmd"]);
+    words.splice(7..7, ["--test-load-window-ms", "250"]);
+
+    assert_eq!(case.run(&words).request()["testSeams"]["loadWindowMs"], json!(250));
 }
 
 /// The seams the case's runs give are printed as given.

@@ -21,6 +21,7 @@ mod escaped;
 mod expect;
 mod journal;
 mod late;
+mod load;
 mod log;
 mod machine;
 mod nesting;

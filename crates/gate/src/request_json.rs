@@ -16,6 +16,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot) -> Stri
         "heartbeatMs": seams.heartbeat_ms,
         "pollMs": seams.poll_ms,
         "stallMs": seams.stall_ms,
+        "loadWindowMs": seams.load_window_ms,
         "interruptAfterSamples": seams.interrupt_after_samples,
         "interruptQueued": seams.interrupt_queued,
         "interruptBeforeKey": seams.interrupt_before_key,

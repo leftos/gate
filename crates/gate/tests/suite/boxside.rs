@@ -2123,6 +2123,33 @@ fn a_critical_gate_started_inside_a_box_run_takes_no_slot() {
 }
 
 #[test]
+fn an_alone_critical_gate_started_inside_a_box_run_is_a_usage_error() {
+    let case = Case::new("box_inner_gate_alone");
+    let mut words = inner_gate(&case, "inner", "critical", "120", &owned(&[FAKE_TOOL, "exit", "0"]));
+    let at = words.iter().position(|word| word == "--").expect("the words have a command");
+    words.insert(at, "--alone".to_owned());
+
+    let outcome = box_run_of(&case, &words);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .lines()
+            .any(|line| line == "gate: --alone cannot hold the machine alone from inside a gate's command"),
+        "{outcome:?}"
+    );
+    assert!(
+        !outcome.stderr.lines().any(|line| line == IN_BOX_LINE),
+        "refused before its nesting is said: {outcome:?}"
+    );
+    assert!(
+        !case.folder().join("inner-state").join("events.jsonl").exists(),
+        "the refused gate journals nothing"
+    );
+}
+
+#[test]
 fn box_run_turns_the_event_log_provider_off_for_the_command() {
     let case = Case::new("box_run_event_log_off");
     let mut payload = box_payload(&case, "k", &[r".\eventlog.cmd"]);

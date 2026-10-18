@@ -10,13 +10,14 @@ use std::process;
 use gate_state::v1::{self, Claim, ClaimKind, Ticket, TicketKind};
 use gate_state::{KernelObject, StateRoot};
 use jiff::Timestamp;
+use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::durations::seed;
 use crate::nesting::{marked, test_marker};
 use crate::support::{
-    Case, FAKE_TOOL, GATE, POLL, Running, USAGE, assert_in_order, critical_words, events, events_of, finish, heavy_words, none_words, run_words,
-    shown, start, take_of, wait_for_file, wait_for_journal_line, wait_until, write_counts,
+    Case, FAKE_TOOL, GATE, POLL, Running, UNTIL_KILLED, USAGE, assert_in_order, critical_words, events, events_of, finish, heavy_words, none_words,
+    run_words, shown, start, take_of, wait_for_file, wait_for_journal_line, wait_until, write_counts,
 };
 
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
@@ -1695,32 +1696,280 @@ fn an_alone_critical_gate_says_alone_in_its_lines() {
 }
 
 #[test]
-fn an_alone_critical_gate_lends_nothing() {
-    let case = Case::new("an_alone_critical_gate_lends_nothing");
+fn an_alone_request_lends_a_running_light_gate_s_slot_to_its_heavy_child_while_it_drains() {
+    let case = Case::new("an_alone_request_lends_a_running_light_gate_s_slot_to_its_heavy_child_while_it_drains");
     write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
     let go = case.folder().join("go");
     let go_word = shown(&go);
     let held = holder(&case, &heavy_words("holder.log", &POLL, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let held_pid = held.id();
+    let mut child = vec![GATE];
+    child.extend(heavy_words("child.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
+    let parent = holder(&case, &run_words("parent.log", &POLL, &child));
+    let parent_pid = parent.id();
+    wait_until("the child gate queueing", || {
+        sequence(&case)
+            .iter()
+            .any(|(event, pid)| event == "queue" && ![held_pid, parent_pid].contains(pid))
+    });
+
     let alone = case.start(&alone_words("alone.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
     let alone_pid = alone.id();
     alone.wait_for_stderr(ALONE_WAITING);
-    write_claim(&case, KernelObject::LightSlot(3), ClaimKind::Light, (process::id(), own_start()));
+    wait_until("the light parent lending its slot to its heavy child", || {
+        sequence(&case).iter().any(|(event, _)| event == "parent")
+    });
+    assert_passed(&parent.finish());
 
-    let marker = test_marker(&case, "light");
-    let child = start(marked(&case, &heavy_words("child.log", &POLL, &[FAKE_TOOL, "exit", "0"]), &marker));
-    let child_pid = child.id();
-    child.wait_for_stderr(&behind(alone_pid));
+    let child_pid = lent_to(&case, parent_pid);
     assert_eq!(
         events_of(&case, child_pid),
-        ["queue"],
-        "the child waits behind the alone request, never lent its parent's slot"
+        ["queue", "parent"],
+        "the queued child left the queue for its parent's slot"
     );
+    assert_eq!(events_of(&case, alone_pid), ["queue"], "the child ran while the alone request drains");
 
     let_go(&go);
     assert_passed(&alone.finish());
     assert_passed(&held.finish());
-    let outcome = child.finish();
+    assert!(
+        at(&case, "release", parent_pid) < at(&case, "take", alone_pid),
+        "the alone gate takes the machine only once the light gate ended"
+    );
+    assert_eq!(sorted(&take_of(&case, alone_pid)["slots"]), every_slot(&case, 4));
+}
+
+/// The seams of an alone run whose load windows last a tenth of a second.
+fn short_windows() -> Vec<&'static str> {
+    let mut seams = POLL.to_vec();
+    seams.extend(["--test-load-window-ms", "100"]);
+    seams
+}
+
+/// The load block at `when` (`start` or `end`) of `log`, its lines in order, asserted to have the shape the gate writes:
+/// the headline, at most 8 process lines, the unattributed line, one GPU line or more, and one other-gates line or more.
+fn load_block<'a>(log: &'a str, when: &str) -> Vec<&'a str> {
+    let at = format!("gate: load at {when}");
+    let block: Vec<&str> = log.lines().filter(|line| line.starts_with(&at)).collect();
+    let shapes = [
+        format!(r"^{at} over \d+\.\d s: \d+\.\d\d of \d+ cores busy outside this gate$"),
+        format!(r"^{at}:   .+ \d+ \d+\.\d\d cores$"),
+        format!(r"^{at}:   unattributed \d+\.\d\d cores$"),
+        format!(r"^{at}: GPU 3D( \d+% on adapter 0x[0-9a-f]+_0x[0-9a-f]+|: counter unavailable \(.+\))$"),
+        format!(r"^{at}: other gate(s: none| \d+ holds \w+ \d+: .+)$"),
+    ]
+    .map(|shape| Regex::new(&shape).expect("the shape compiles"));
+    let unattributed = block.iter().position(|line| shapes[2].is_match(line));
+    assert!(
+        unattributed.is_some_and(|at| (1..=9).contains(&at)),
+        "the unattributed line ends the CPU lines: {block:#?}"
+    );
+    let unattributed = unattributed.expect("checked above");
+    assert!(shapes[0].is_match(block[0]), "the headline comes first: {block:#?}");
+    assert!(
+        block[1..unattributed].iter().all(|line| shapes[1].is_match(line)),
+        "process lines: {block:#?}"
+    );
+    let rest = &block[unattributed + 1..];
+    let gpu = rest.iter().take_while(|line| shapes[3].is_match(line)).count();
+    assert!(gpu >= 1, "a GPU line follows: {block:#?}");
+    assert!(
+        rest.len() > gpu && rest[gpu..].iter().all(|line| shapes[4].is_match(line)),
+        "the other gates' lines end the block: {block:#?}"
+    );
+    block
+}
+
+/// Asserts no line of `outcome`'s console is a load line.
+fn assert_no_load_on_the_console(outcome: &crate::support::Outcome) {
+    assert!(
+        !outcome.stdout.contains("gate: load at") && !outcome.stderr.contains("gate: load at"),
+        "no load line on the console: {outcome:?}"
+    );
+}
+
+/// Asserts no journal line has a key about the load.
+fn assert_no_load_in_the_journal(case: &Case) {
+    for event in events(case) {
+        let keys = event.as_object().expect("a line is an object").keys();
+        assert!(keys.into_iter().all(|key| !key.to_ascii_lowercase().contains("load")), "{event}");
+    }
+}
+
+#[test]
+fn an_alone_run_logs_the_load_at_its_start_and_end() {
+    let case = Case::new("an_alone_run_logs_the_load_at_its_start_and_end");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+
+    let outcome = case.run(&alone_words("alone.log", &short_windows(), &[FAKE_TOOL, "out", "hi", "exit", "0"]));
+
     assert_passed(&outcome);
-    assert!(!outcome.stderr.contains("while a critical request drains"), "{outcome:?}");
-    assert!(at(&case, "release", alone_pid) < at(&case, "take", child_pid));
+    assert_no_load_on_the_console(&outcome);
+    assert_no_load_in_the_journal(&case);
+    let log = fs::read_to_string(case.folder().join("alone.log")).expect("the alone gate wrote its log");
+    let start = load_block(&log, "start");
+    let end = load_block(&log, "end");
+    assert_eq!(
+        start.last(),
+        Some(&"gate: load at start: other gates: none"),
+        "its own claims are left out"
+    );
+    assert_in_order(
+        &log,
+        &[
+            ALONE_HOLDS,
+            start[0],
+            start[start.len() - 1],
+            end[0],
+            end[end.len() - 1],
+            "gate: passed in ",
+        ],
+    );
+}
+
+#[test]
+fn a_plain_critical_run_logs_no_load() {
+    let case = Case::new("a_plain_critical_run_logs_no_load");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+
+    let outcome = case.run(&critical_words("critical.log", &short_windows(), &[FAKE_TOOL, "out", "hi", "exit", "0"]));
+
+    assert_passed(&outcome);
+    let log = fs::read_to_string(case.folder().join("critical.log")).expect("the critical gate wrote its log");
+    assert!(log.contains(HOLDS), "{log}");
+    assert!(!log.contains("gate: load at"), "{log}");
+}
+
+#[test]
+fn an_alone_run_killed_at_its_ceiling_still_logs_the_load_at_its_end() {
+    let case = Case::new("an_alone_run_killed_at_its_ceiling_still_logs_the_load_at_its_end");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    let mut seams = short_windows();
+    seams.extend(["--test-sample-ms", "100"]);
+    let mut words = alone_words("alone.log", &seams, &[FAKE_TOOL, "sleep", UNTIL_KILLED]);
+    assert_eq!(words[3], "--timeout", "the ceiling's value follows it");
+    words[4] = "1";
+
+    let outcome = case.run(&words);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert_no_load_on_the_console(&outcome);
+    let log = fs::read_to_string(case.folder().join("alone.log")).expect("the alone gate wrote its log");
+    let start = load_block(&log, "start");
+    let end = load_block(&log, "end");
+    assert_in_order(
+        &log,
+        &[
+            ALONE_HOLDS,
+            start[0],
+            "gate: TIMED OUT after 1 s",
+            end[0],
+            end[end.len() - 1],
+            "gate: FAILED (status 124)",
+        ],
+    );
+}
+
+#[test]
+fn an_alone_run_names_another_gate_s_claim_in_its_load() {
+    let case = Case::new("an_alone_run_names_another_gate_s_claim_in_its_load");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    write_claim(&case, KernelObject::RemoteSlot(2), ClaimKind::Remote, (process::id(), own_start()));
+
+    let outcome = case.run(&alone_words("alone.log", &short_windows(), &[FAKE_TOOL, "exit", "0"]));
+
+    assert_passed(&outcome);
+    assert_no_load_on_the_console(&outcome);
+    let log = fs::read_to_string(case.folder().join("alone.log")).expect("the alone gate wrote its log");
+    let other = format!("other gate {} holds remote 2: cargo build", process::id());
+    for when in ["start", "end"] {
+        let block = load_block(&log, when);
+        let last = format!("gate: load at {when}: {other}");
+        assert_eq!(block.last().copied(), Some(last.as_str()), "{block:#?}");
+    }
+}
+
+#[test]
+fn an_alone_run_interrupted_still_logs_the_load_at_its_end() {
+    let case = Case::new("an_alone_run_interrupted_still_logs_the_load_at_its_end");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    let mut seams = short_windows();
+    seams.extend(["--test-sample-ms", "100", "--test-interrupt-after-samples", "1"]);
+
+    let outcome = case.run(&alone_words("alone.log", &seams, &[FAKE_TOOL, "sleep", UNTIL_KILLED]));
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert_no_load_on_the_console(&outcome);
+    let log = fs::read_to_string(case.folder().join("alone.log")).expect("the alone gate wrote its log");
+    let start = load_block(&log, "start");
+    // The interrupt that ended the command ends the end window at once, so its CPU times may not have moved: the block
+    // is asserted by its ends only.
+    let end: Vec<&str> = log.lines().filter(|line| line.starts_with("gate: load at end")).collect();
+    assert!(
+        end.first()
+            .is_some_and(|line| line.starts_with("gate: load at end over ") || line.starts_with("gate: load at end: ")),
+        "{end:#?}"
+    );
+    assert_eq!(end.last(), Some(&"gate: load at end: other gates: none"), "{end:#?}");
+    assert!(end.iter().any(|line| line.starts_with("gate: load at end: GPU 3D")), "{end:#?}");
+    assert_in_order(
+        &log,
+        &[
+            ALONE_HOLDS,
+            start[0],
+            "gate: interrupted; stopping the command",
+            end[0],
+            end[end.len() - 1],
+            "gate: FAILED",
+        ],
+    );
+}
+
+#[test]
+fn an_alone_run_keeps_its_load_off_the_console_however_long_another_gate_s_command() {
+    let case = Case::new("an_alone_run_keeps_its_load_off_the_console_however_long_another_gate_s_command");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    write_claim(&case, KernelObject::RemoteSlot(2), ClaimKind::Remote, (process::id(), own_start()));
+    let path = v1::claim_path(&case.root(), KernelObject::RemoteSlot(2)).expect("a slot has a claim");
+    let mut claim = v1::read_claim(&path).expect("the claim reads back");
+    claim.command = format!("pwsh -EncodedCommand {}", "A".repeat(5000));
+    v1::write_claim(&path, &claim).expect("the claim can be written");
+
+    let outcome = case.run(&alone_words("alone.log", &short_windows(), &[FAKE_TOOL, "exit", "0"]));
+
+    assert_passed(&outcome);
+    assert_no_load_on_the_console(&outcome);
+    let log = fs::read_to_string(case.folder().join("alone.log")).expect("the alone gate wrote its log");
+    let end = load_block(&log, "end");
+    let other = format!(
+        "gate: load at end: other gate {} holds remote 2: pwsh -EncodedCommand AAAA",
+        process::id()
+    );
+    let last = end.last().copied().unwrap_or("");
+    assert!(last.starts_with(&other) && last.ends_with('…'), "{end:#?}");
+}
+
+#[test]
+fn an_alone_run_whose_command_cannot_start_still_logs_the_load_at_its_end() {
+    let case = Case::new("an_alone_run_whose_command_cannot_start_still_logs_the_load_at_its_end");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+
+    let outcome = case.run(&alone_words("alone.log", &short_windows(), &["gate-no-such-program", "x"]));
+
+    assert_eq!(outcome.code, Some(127), "{outcome:?}");
+    assert_no_load_on_the_console(&outcome);
+    let log = fs::read_to_string(case.folder().join("alone.log")).expect("the alone gate wrote its log");
+    let start = load_block(&log, "start");
+    let end = load_block(&log, "end");
+    assert_in_order(
+        &log,
+        &[
+            ALONE_HOLDS,
+            start[0],
+            "gate: could not start gate-no-such-program",
+            end[0],
+            end[end.len() - 1],
+            "gate: FAILED (status 127)",
+        ],
+    );
 }

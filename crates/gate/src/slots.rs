@@ -551,12 +551,13 @@ pub(crate) fn critical_pending(others: &[Ticket], critical_open: impl FnOnce() -
 }
 
 /// Whether a critical request among the other gates' live tickets `others` refuses every new lend, as its ticket says:
-/// it holds the machine, holds every slot it takes and waits only for the gates lent a slot already, or holds the
-/// machine alone, which lends nothing from its first pass.
+/// it holds the machine, or holds every slot it takes and waits only for the gates lent a slot already. A request to
+/// hold the machine alone closes lends exactly then too: a light gate whose heavy child it refused would wait for that
+/// child while the request waits for the light gate's slot.
 pub(crate) fn critical_refuses_lends(others: &[Ticket]) -> bool {
     others
         .iter()
-        .any(|ticket| ticket.kind == TicketKind::Critical && (ticket.holds || ticket.lends_closed || ticket.alone))
+        .any(|ticket| ticket.kind == TicketKind::Critical && (ticket.holds || ticket.lends_closed))
 }
 
 /// Whether some gate has the critical mutex under `root` open. A mutex that cannot be probed is said once and counts as
@@ -699,7 +700,7 @@ pub(crate) fn try_object(root: &ResolvedRoot, object: KernelObject, index: u32, 
 /// Whether a file of the claims folder named `name` is a claim of this root: `gate-<slot>.json`, as
 /// [`KernelObject::claim_file_name`] names them, so a claim's `*.tmp` file, another prefix's claim and a lend marker
 /// ([`LendMarker`]) are not.
-fn is_claim_file(name: &str) -> bool {
+pub(crate) fn is_claim_file(name: &str) -> bool {
     name.starts_with("gate-") && !is_lend_marker(name) && Path::new(name).extension().is_some_and(|extension| extension == "json")
 }
 
