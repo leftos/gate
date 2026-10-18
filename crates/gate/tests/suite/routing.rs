@@ -33,7 +33,7 @@ pub(crate) const CONTROL_C_EXIT: i32 = 0xC000_013A_u32.cast_signed();
 static NEXT_STUB: AtomicU64 = AtomicU64::new(0);
 
 /// Writes `steps` as a step file of the scripted remote client in the case folder, one step a line; its path.
-fn stub(case: &Case, steps: &[&str]) -> PathBuf {
+pub(crate) fn stub(case: &Case, steps: &[&str]) -> PathBuf {
     let path = case.folder().join(format!("stub-{}.txt", NEXT_STUB.fetch_add(1, Ordering::Relaxed)));
     fs::write(&path, steps.join("\n")).expect("the step file can be written");
     path
@@ -41,7 +41,7 @@ fn stub(case: &Case, steps: &[&str]) -> PathBuf {
 
 /// The words of a heavy run logging to `log` that calls the scripted client of the step file `stub`, `extra` before
 /// `--` and `command` after it, with a routing git limit and drain no machine reaches.
-fn routed_words<'a>(log: &'a str, stub: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
+pub(crate) fn routed_words<'a>(log: &'a str, stub: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
     let mut before = vec!["--test-remote-client", stub];
     before.extend(GIT_HANG_GUARDS);
     before.extend(extra);

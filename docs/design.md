@@ -1143,7 +1143,7 @@ What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K
 - A heavy gate under a light marker takes its own slot and says `gate: the <held kind> slot of gate <pid> does not cover a <kind> gate; taking a <kind> slot` just before its local take (after a Local route or a fallback, before its wait lines); a gate routed to the builder never says it.
 - **No slot.** A `none` run takes nothing and is never held by the drain or the barrier. Its marker is `GATE_SLOT_HELD=none:<pid>:<start>[:<h>]`. A gate under a `none` marker (the case `Nesting::Beside`) takes its own slot as a top-level gate would: a critical child takes the machine and is never refused (K7 applies to heavy and light markers only).
 
-  Such a gate prints no nesting line and is never lent a slot, and it keeps the pause marker for its no-slot parent's stall window. Its `take` names `parentPid`.
+  Such a gate prints no nesting line and is never lent a slot, and it writes the pause marker, for its no-slot parent's stall window, only while it waits for a local slot behind a critical request. Its `take` names `parentPid`.
 
   A `none` gate under a heavy, light or critical parent is covered: it journals `covered` with kind `none`, prints `gate: running under the <held kind> slot of gate <pid>` and hands the parent's marker on.
 - **One request at a time.** A critical gate queues a ticket of kind `critical` and runs after every earlier live critical ticket, in arrival order, each through the critical mutex ([Kernel object names](#kernel-object-names)). An abandoned critical mutex counts as taken, with the `took <name>, which a killed gate had left held` line.
@@ -1210,13 +1210,15 @@ All kept, with each knob's default unchanged:
 - The sampler (W1): every 5 s while the command runs, it reads, in order, the pause state, the log and `.err` sizes, the job's pids, one process snapshot, then the WSL VM, the system times and the job's accounting; nothing goes through WMI.
 
   Each sample carries two stamps: `began`, taken before its reads, and `at`, taken after them, next to the system times and the job's accounting. The `interval`, the load-adjusted clock, the paused time, the free share and the exit use `at`; the PowerShell gate stamps once, before its reads.
-- Stall (W2): no output, no CPU (at least 1% of one core over the window), no new process in the job, no WSL VM CPU and no nested gate paused behind a critical request, for `--stall` seconds: `gate: STALLED: ...`.
+- Stall (W2): no output, no CPU (at least 1% of one core over the window), no new process in the job, no WSL VM CPU, no nested gate paused behind a critical request and no live nested gate in the job, for `--stall` seconds: `gate: STALLED: ...`.
 
   The quiet time runs from the last progress sample's `at` to the latest sample's `began`, not to the moment the watcher checks: a watcher starved of CPU wakes late, and the time it spends in its reads, and after them up to the check, is not the command's quiet time, so the next sample decides.
 
   A quiet command is therefore killed up to one sample period after its window, plus the read time of the last progress sample and of the latest sample, never before; the PowerShell gate measures to the check and can kill earlier. The ceiling and the backstop read the check's own time.
 
-  Progress as the watchdog crate counts it resets the stall clock when the sum of the log and `.err` sizes changed (grew or shrank), the CPU of the job and of the processes outside it under its members (the escaped tree, below) since the last progress reached 1% of one core over the stall window together, a pid appeared in the job that the last sample did not have, a process outside it appeared that the last sample did not have (by pid and start), or a nested gate is paused.
+  Progress as the watchdog crate counts it resets the stall clock when the sum of the log and `.err` sizes changed (grew or shrank), the CPU of the job and of the processes outside it under its members (the escaped tree, below) since the last progress reached 1% of one core over the stall window together, a pid appeared in the job that the last sample did not have, a process outside it appeared that the last sample did not have (by pid and start), a nested gate is paused, or the job holds a live nested gate.
+
+  A nested gate is a `gate.exe` in the job other than the watching gate that started at or after the command's start (a routed or local gate, on any slot; it matters most for a `--slot none` or light parent of a routed hook build, whose child writes next to nothing and uses next to no CPU here). Its own watchdog judges its command, so the parent is not stalled while it lives. Only the pause stops the load-adjusted clock: a nested gate's time is counted as any other and in the backstop's wall time, so `gate: TIMED OUT after ...` and `gate: BACKSTOP: ...` still end the run. A gate outside the job (an escaped process, or under a packaged or Store pwsh, which runs outside it) does not count. Worst case, a wedged nested gate, or any process named `gate.exe` left in the job, holds off the stall until the parent's ceiling and backstop. The box side's ceiling runs with no stall window and is unchanged.
 
   The stall clock also resets, for a `wsl` command, when the WSL VM's CPU counts as progress (see WSL below).
 

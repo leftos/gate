@@ -4,7 +4,7 @@
 //! or past the backstop, or a Ctrl+C.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -585,7 +585,7 @@ impl<'a> Watcher<'a> {
         let err_bytes = size(self.log.err_path())?;
         let looked = escaped::now().ok_or_else(|| io::Error::other(escaped::NO_CLOCK))?;
         let before = self.job.process_ids()?;
-        let pids = members(before.iter().copied(), self.since, gate_win32::process_times)?;
+        let started = members(before.iter().copied(), self.since, gate_win32::process_times)?;
         let processes = Win32ProcessTable.snapshot_without_command_lines();
         // The snapshot takes a while: a process that joined the job meanwhile is a member, not one that left it.
         let after = self.job.process_ids()?;
@@ -594,6 +594,7 @@ impl<'a> Watcher<'a> {
             console.err(&line);
         }
         let tree = ProcessTree::new(processes);
+        let nested_gate = holds_nested_gate(&tree, &started, std::process::id());
         let look = Look {
             before,
             after,
@@ -618,8 +619,9 @@ impl<'a> Watcher<'a> {
             system,
             job_cpu,
             output_size: log_bytes + err_bytes,
-            pids,
+            pids: started.into_keys().collect(),
             paused,
+            nested_gate,
             escaped,
             vm_cpu: vm.as_ref().ok().copied().flatten(),
         };
@@ -773,9 +775,26 @@ fn process_facts(pid: u32, info: &ProcessInfo) -> ProcessFacts {
     }
 }
 
-/// Of the job's process `ids`, those `times` reads as created at or after `since`.
-fn members(ids: impl IntoIterator<Item = u32>, since: u64, times: impl Fn(u32) -> io::Result<Option<ProcessTimes>>) -> io::Result<BTreeSet<u32>> {
-    let mut pids = BTreeSet::new();
+/// Whether the job's `members`, each by its pid and the creation time its own times gave (100 ns ticks since 1601), hold
+/// a gate other than the watching gate `own`: the snapshot `tree` lists the pid as `gate.exe`, in any case, with that
+/// same start. A member that ended and whose pid a newer process took before the snapshot is not taken for a gate, nor
+/// is one the snapshot does not list or whose start it cannot read. A nested gate is progress while it lives; a process
+/// outside the job counts for nothing here.
+fn holds_nested_gate(tree: &ProcessTree, members: &BTreeMap<u32, u64>, own: u32) -> bool {
+    members.iter().filter(|&(&pid, _)| pid != own).any(|(&pid, &created)| {
+        tree.get(pid)
+            .is_some_and(|info| info.created.is_some() && info.created == start_instant(created) && escaped::is_gate(&info.name))
+    })
+}
+
+/// Of the job's process `ids`, those `times` reads as created at or after `since`, each with that creation time in
+/// 100 ns ticks since 1601.
+fn members(
+    ids: impl IntoIterator<Item = u32>,
+    since: u64,
+    times: impl Fn(u32) -> io::Result<Option<ProcessTimes>>,
+) -> io::Result<BTreeMap<u32, u64>> {
+    let mut pids = BTreeMap::new();
     for pid in ids {
         let read = match times(pid) {
             // A process the job created can always be queried; a denied pid was reused by another user's or a
@@ -783,8 +802,8 @@ fn members(ids: impl IntoIterator<Item = u32>, since: u64, times: impl Fn(u32) -
             Err(error) if error.raw_os_error() == Some(ACCESS_DENIED) => None,
             read => read?,
         };
-        if read.is_some_and(|times| times.created >= since) {
-            pids.insert(pid);
+        if let Some(times) = read.filter(|times| times.created >= since) {
+            pids.insert(pid, times.created);
         }
     }
     Ok(pids)
@@ -834,7 +853,60 @@ mod tests {
 
     use gate_win32::Priority;
 
-    use super::{ACCESS_DENIED, VmReader, config, lowered, machine, members, own_kind_after_take, sample_due, sample_facts, slice};
+    use super::{
+        ACCESS_DENIED, VmReader, config, holds_nested_gate, lowered, machine, members, own_kind_after_take, sample_due, sample_facts, slice,
+    };
+
+    /// The test moment `second` seconds past 10:00 on the test day.
+    fn at(second: u32) -> jiff::Timestamp {
+        format!("2026-10-01T10:00:0{second}Z").parse().expect("a test timestamp parses")
+    }
+
+    /// The snapshot entry of `pid`, running `name` since second `second`.
+    fn listed(pid: u32, name: &str, second: u32) -> proc_table::ProcessInfo {
+        proc_table::ProcessInfo {
+            pid,
+            parent_pid: 1,
+            name: name.to_owned(),
+            command_line: None,
+            created: Some(at(second)),
+        }
+    }
+
+    /// The `FILETIME` ticks of the test moment `second`, as a process's own times give its start.
+    fn filetime(second: u32) -> u64 {
+        u64::try_from(at(second).as_microsecond() * 10 + 116_444_736_000_000_000).expect("a test moment is after 1601")
+    }
+
+    #[test]
+    fn only_a_member_listed_as_a_gate_with_its_own_start_other_than_this_one_is_a_nested_gate() {
+        // This gate is pid 9. Member 6 started at second 1, ended, and a newer gate took its pid at second 2, before the
+        // snapshot; member 8's start the snapshot cannot read.
+        let mut unknown = listed(8, "gate.exe", 1);
+        unknown.created = None;
+        let tree = proc_table::ProcessTree::new(vec![
+            listed(2, "gate.exe", 1),
+            listed(3, "GATE.EXE", 1),
+            listed(4, "gate.exe", 1),
+            listed(5, "pwsh.exe", 1),
+            listed(6, "gate.exe", 2),
+            unknown,
+            listed(9, "gate.exe", 1),
+        ]);
+        let holds = |members: &[u32]| {
+            let started = members.iter().map(|&pid| (pid, filetime(1))).collect();
+            holds_nested_gate(&tree, &started, 9)
+        };
+
+        assert!(holds(&[2]), "a member gate");
+        assert!(holds(&[3]), "its image named in any case");
+        assert!(!holds(&[5]), "a member that is no gate");
+        assert!(!holds(&[7]), "a member the snapshot does not list");
+        assert!(!holds(&[6]), "a newer gate that took an ended member's pid");
+        assert!(!holds(&[8]), "a member whose start the snapshot cannot read");
+        assert!(!holds(&[9]), "this gate itself");
+        assert!(!holds(&[]), "pid 4, a gate outside the job, is no member");
+    }
 
     #[test]
     fn a_sample_s_escaped_cpu_reaches_its_diagnostics_facts() {
@@ -846,6 +918,7 @@ mod tests {
             output_size: 0,
             pids: BTreeSet::from([1]),
             paused: false,
+            nested_gate: false,
             escaped: std::collections::BTreeMap::from([((2, 10), 15_000_000), ((3, 20), 10_000_000)]),
             vm_cpu: None,
         };
@@ -1021,7 +1094,11 @@ mod tests {
         };
 
         let found = members([1, 2, 3, 4], 10, times).expect("a denied pid is no failure");
-        assert_eq!(found, BTreeSet::from([1]), "created since, still running, and readable");
+        assert_eq!(
+            found.into_keys().collect::<BTreeSet<u32>>(),
+            BTreeSet::from([1]),
+            "created since, still running, and readable"
+        );
         assert!(members([1, 9], 10, times).is_err(), "any other failure fails the sample");
     }
 }

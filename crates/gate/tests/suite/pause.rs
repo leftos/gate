@@ -4,13 +4,16 @@
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use std::{process, thread};
 
 use gate_state::v1::{self, Ticket, TicketKind};
 use regex::Regex;
 
-use crate::support::{Case, FAKE_TOOL, GATE, Outcome, Running, critical_words, events, heavy_words, run_words, shown, wait_until, write_counts};
+use crate::routing::{remote_claim, routed_case, routed_words, stub};
+use crate::support::{
+    Case, FAKE_TOOL, GATE, Outcome, Running, critical_words, events, heavy_words, none_words, run_words, shown, wait_until, write_counts,
+};
 
 /// The seam that keeps a wait's passes and its still-waiting lines close together.
 const POLL: [&str; 2] = ["--test-poll-ms", "20"];
@@ -47,6 +50,12 @@ const CANNOT_READ: &str = "gate: could not read the pause markers in ";
 const HUNG_WATCH: [&str; 6] = ["--test-poll-ms", "20", "--test-stall-ms", "1500", "--test-sample-ms", "100"];
 /// The wall and load-adjusted seconds of a passed line, as a gate that ran its command here says it.
 const PASSED: &str = r"gate: passed in (\d+) s \(load-adjusted (\d+) s";
+/// The seams of a nested gate whose own watchdog stalls its hung command within one case: a 15 s stall window, three
+/// of the [`PARENT_WATCH`] windows of the gate above it, with the default 5 s sampling and a slow poll, so its own
+/// watching costs too little CPU to hold the parent's window open by itself.
+const NESTED_HUNG: [&str; 4] = ["--test-poll-ms", "200", "--test-stall-ms", "15000"];
+/// How long a case keeps a nested gate quiet under its parent: over two of the [`PARENT_WATCH`] stall windows.
+const QUIET: Duration = Duration::from_secs(12);
 
 /// Starts `case`'s critical gate holding the machine on the case's `go` file, and returns the file and the gate.
 fn holding_critical(case: &Case) -> (PathBuf, Running) {
@@ -576,4 +585,90 @@ fn a_pause_folder_the_watchdog_cannot_read_is_said_once() {
         "{said:?}"
     );
     assert_passed(&critical.finish());
+}
+
+#[test]
+fn a_none_gate_whose_routed_child_is_quiet_for_longer_than_its_stall_window_is_not_stalled() {
+    let case = routed_case("a_none_gate_whose_routed_child_is_quiet_for_longer_than_its_stall_window_is_not_stalled");
+    let go = case.folder().join("go");
+    let steps = shown(&stub(&case, &[&format!("wait {}", shown(&go)), "status 0"]));
+
+    // The heavy child routes beside its no-slot parent, takes the remote slot and waits on the go file: no output, next
+    // to no CPU and no new process, as a hook's routed build is under a commit's gate.
+    let mut child = vec![GATE];
+    child.extend(routed_words("child.log", &steps, &[], &[r".\tool.exe", "out", "hi"]));
+    let mut parent = case.start(&none_words("parent.log", &PARENT_WATCH, &child));
+    wait_until("the routed child holding the remote slot, or the parent ending", || {
+        remote_claim(&case).exists() || !parent.is_running()
+    });
+    assert!(
+        remote_claim(&case).exists(),
+        "the child routed and holds the remote slot: {}",
+        child_stderr(&case, "parent.log")
+    );
+
+    // A parent that ended before two of its stall windows passed is the failure this case is about.
+    let held = Instant::now();
+    wait_until("two of the parent's stall windows passing, or the parent ending", || {
+        held.elapsed() >= QUIET || !parent.is_running()
+    });
+    let waited_out = parent.is_running();
+
+    let_go(&go);
+    let outcome = parent.finish();
+    assert!(waited_out, "the parent gate was killed while its routed child ran: {outcome:?}");
+    assert_passed(&outcome);
+    assert!(
+        !outcome.stderr.contains("STALLED"),
+        "a no-slot gate whose routed child is quiet is not stalled: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_none_gate_whose_nested_gate_hangs_is_still_ended_by_the_nested_gate_s_own_stall() {
+    let case = Case::new("a_none_gate_whose_nested_gate_hangs_is_still_ended_by_the_nested_gate_s_own_stall");
+
+    // The nested gate's command hangs without output or CPU for longer than any case, so only a stall ends it; the
+    // parent's window is a third of the nested gate's, so a parent that did not count the nested gate would stall first.
+    let mut child = vec![GATE];
+    child.extend(run_words("child.log", &NESTED_HUNG, &[FAKE_TOOL, "sleep", "590000"]));
+    let outcome = case.start(&none_words("parent.log", &PARENT_WATCH, &child)).finish();
+
+    assert!(
+        !outcome.stderr.contains("STALLED"),
+        "the parent itself is not stalled while its nested gate lives: {outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(124), "the parent ends with its command's status: {outcome:?}");
+    let child_log = fs::read_to_string(case.folder().join("child.log")).expect("the nested gate wrote its log");
+    assert!(
+        child_log.contains("gate: STALLED: "),
+        "the nested gate's own watchdog ends its hung command: {child_log}"
+    );
+}
+
+#[test]
+fn a_none_gate_whose_nested_gate_keeps_running_is_still_ended_by_its_own_ceiling() {
+    let case = Case::new("a_none_gate_whose_nested_gate_keeps_running_is_still_ended_by_its_own_ceiling");
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+
+    // The nested gate never stalls and its command waits on a go file the case writes only after the parent ended: only
+    // the parent's 3 s ceiling, or its backstop on a starved machine, can end the parent, whose 1.5 s stall window the
+    // nested gate holds off.
+    let mut child = vec![GATE];
+    child.extend(run_words("child.log", &HOLDER, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let mut words = none_words("parent.log", &HUNG_WATCH, &child);
+    set_timeout(&mut words, "3");
+    let outcome = case.start(&words).finish();
+    let_go(&go);
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .lines()
+            .any(|line| line.starts_with("gate: TIMED OUT after ") || line.starts_with("gate: BACKSTOP: ")),
+        "the parent's own ceiling ends it: {outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("STALLED"), "{outcome:?}");
 }

@@ -47,6 +47,9 @@ pub struct Sample {
     pub pids: BTreeSet<u32>,
     /// Whether a gate under this one waits behind a critical request.
     pub paused: bool,
+    /// Whether the job holds a live gate other than the watching one: a nested gate, whose own watchdog judges its
+    /// command, though it may write nothing and use next to no CPU here, as a routed one does.
+    pub nested_gate: bool,
     /// The processes outside the job under the processes it holds, by pid and start (in 100 ns ticks since 1601), with
     /// the CPU time each has used in 100 ns ticks: a packaged app a process of the job starts runs in a job of its own,
     /// and its CPU is the command's own.
@@ -147,7 +150,8 @@ impl Watch {
     /// between its two stamps does not count its own read time as the command's quiet time. The sample is progress
     /// when the log's size changed either way, the CPU of the job and of the processes outside it since the last
     /// progress reached 1% of one core over the stall window, a pid appeared in the job that the last sample did not
-    /// have or a process outside it the last sample did not have, the WSL VM passed its floor, or the run is paused.
+    /// have or a process outside it the last sample did not have, the WSL VM passed its floor, the job holds a nested
+    /// gate, or the run is paused. Only the pause stops the clock; a nested gate's time is counted as any other.
     pub fn sample(&mut self, sample: &Sample) {
         let interval = sample.at.saturating_sub(self.last_at).max(MIN_INTERVAL);
         let escaped = measure_cpu(&self.escaped, &sample.escaped);
@@ -181,15 +185,15 @@ impl Watch {
 
     /// Whether `sample` is progress: the log changed either way, the job's CPU since the last progress and the CPU the
     /// processes outside it gained sample by sample since then reached 1% of one core over the stall window together,
-    /// a pid appeared in the job or a process outside it that the last sample did not have, the WSL VM worked, or a
-    /// gate under this one waits.
+    /// a pid appeared in the job or a process outside it that the last sample did not have, the WSL VM worked, the job
+    /// holds a live nested gate, or a gate under this one waits.
     fn progressed(&self, sample: &Sample, escaped: CpuMove, vm_working: bool) -> bool {
         let floor = self.config.stall.as_nanos() / FLOOR_NANOS_PER_TICK;
         let grew = sample.output_size != self.output_size;
         let job_busy = u128::from(sample.job_cpu.saturating_sub(self.progress_cpu).0);
         let working = job_busy + u128::from(self.escaped_busy) >= floor;
         let appeared = !sample.pids.is_subset(&self.pids) || escaped.appeared;
-        grew || working || appeared || sample.paused || vm_working
+        grew || working || appeared || sample.paused || sample.nested_gate || vm_working
     }
 
     /// Adds the WSL VM's CPU since the last reading to the ticks accrued since the last progress, and says whether
@@ -620,6 +624,7 @@ mod tests {
             output_size: output,
             pids: pids.iter().copied().collect(),
             paused,
+            nested_gate: false,
             escaped: BTreeMap::new(),
             vm_cpu: None,
         }
@@ -636,6 +641,7 @@ mod tests {
             output_size: 0,
             pids: BTreeSet::new(),
             paused,
+            nested_gate: false,
             escaped: BTreeMap::new(),
             vm_cpu: None,
         }
@@ -960,6 +966,30 @@ mod tests {
         assert!(watch.adjusted_seconds().abs() < f64::EPSILON, "a paused second is no load-adjusted time");
         assert!((watch.free_percent() - 100.0).abs() < f64::EPSILON);
         assert!(watch.kill_check(Duration::from_millis(1500)).is_none(), "the pause is progress");
+    }
+
+    #[test]
+    fn a_sample_with_a_live_nested_gate_is_progress_but_keeps_the_clock_running() {
+        // A 1 s stall window and a 2 s ceiling; the job's CPU, its log and its pids never move.
+        let mut watch = watching(config(1000, 2));
+        let nested = |ms: u64| Sample {
+            nested_gate: true,
+            ..tick(ms, 0, 0, &[], false)
+        };
+        watch.sample(&nested(900));
+        watch.sample(&nested(1800));
+        assert!(
+            watch.kill_check(Duration::from_millis(1800)).is_none(),
+            "1.8 s without other progress: the nested gate is progress"
+        );
+        assert!((watch.adjusted_seconds() - 1.8).abs() < 1e-9, "its seconds are load-adjusted time");
+        assert_eq!(watch.paused_time(), Duration::ZERO, "and no paused time, so the backstop counts them");
+
+        watch.sample(&nested(2700));
+        assert!(
+            matches!(watch.kill_check(Duration::from_millis(2700)), Some(Kill::TimedOut { .. })),
+            "the ceiling still ends a run whose nested gate lives"
+        );
     }
 
     #[test]
