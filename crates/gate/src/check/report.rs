@@ -42,6 +42,9 @@ const BUILDER_SHOWN: usize = 20;
 pub(crate) struct Tool {
     pub need: ToolNeed,
     pub reported: Reported,
+    /// Why the check did not look for the tool where it ran, its probe aside: an unreal on a PC with no
+    /// `GATE_UNREAL_ROOT`. Said as `<name> not checked here: <why>`, counted neither missing nor skipped.
+    pub not_checked: Option<String>,
 }
 
 /// The .NET SDK the root `global.json` pins, as checked against this machine's SDKs.
@@ -145,6 +148,10 @@ pub(crate) struct Checked {
     /// reads them: empty for any version,
     /// `None` when the manifest names no godot. The `godot` tool is judged by them, as a routed run is.
     pub godot: Option<Vec<Pin>>,
+    /// The exact Unreal Engine versions the manifest requires, as
+    /// [`toolchain::unreal_required`](crate::remote::toolchain::unreal_required) reads them: empty for any version,
+    /// `None` when the manifest names no unreal. The `unreal` tool is judged by them, as a routed run is.
+    pub unreal: Option<Vec<Pin>>,
     /// The SDK pin's check; `None` when the root has no `global.json`.
     pub sdk: Option<Sdk>,
     /// The manifest's workload ids, which the check lists without checking them.
@@ -162,6 +169,18 @@ pub(crate) struct Checked {
     pub siblings_skipped: bool,
     /// The warm-up's items, in order; none when the repo has neither a warm-up file nor `remote.json`'s consent.
     pub warmup: Vec<Warmup>,
+}
+
+impl Checked {
+    /// The exact versions the repo requires of the tool `name`, for the tools whose manifest entry is an exact pin
+    /// (`godot` and `unreal`); `None` for any other tool, and for one of them the manifest does not name.
+    fn exact_pins(&self, name: &str) -> Option<&[Pin]> {
+        match name {
+            "godot" => self.godot.as_deref(),
+            "unreal" => self.unreal.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 /// One line the check says.
@@ -257,7 +276,11 @@ pub(crate) fn said(place: At<'_>, checked: &Checked) -> Said {
 
 /// Every item of `checked`, found `at` this PC or a builder, in the order the lines say them.
 fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
-    let mut items: Vec<Item> = checked.tools.iter().map(|tool| tool_item(at, checked.godot.as_deref(), tool)).collect();
+    let mut items: Vec<Item> = checked
+        .tools
+        .iter()
+        .map(|tool| tool_item(at, checked.exact_pins(&tool.need.name), tool))
+        .collect();
     items.extend(checked.sdk.as_ref().map(|sdk| sdk_item(at, sdk)));
     if !checked.workloads.is_empty() {
         let ids: Vec<String> = checked.workloads.iter().map(|id| one_line(id)).collect();
@@ -351,11 +374,14 @@ fn counts(missing: usize, too_old: usize, skipped: usize) -> String {
 }
 
 /// The line of a manifest tool as its probe found it `at` this PC or a builder, against its minimum, or against the
-/// exact Godot versions `godot` the repo requires when it names godot.
-fn tool_item(at: At<'_>, godot: Option<&[Pin]>, tool: &Tool) -> Item {
+/// exact versions `exact` the repo requires of it when its manifest entry is an exact pin.
+fn tool_item(at: At<'_>, exact: Option<&[Pin]>, tool: &Tool) -> Item {
     let name = one_line(&tool.need.name);
     if !tool.need.known {
         return Item::new(format!("tools.{name} skipped: not a tool gate knows"), Kind::Skipped);
+    }
+    if let Some(why) = &tool.not_checked {
+        return Item::new(format!("{name} not checked here: {}", escaped(why)), Kind::Unchecked);
     }
     let min = tool.need.min;
     let needs = min.map_or_else(|| "needs it present".to_owned(), |min| format!("needs {min} or later"));
@@ -366,7 +392,7 @@ fn tool_item(at: At<'_>, godot: Option<&[Pin]>, tool: &Tool) -> Item {
         };
         command.map(|command| (name.clone(), command))
     };
-    if let Some(pins) = godot.filter(|pins| tool.need.name == "godot" && !pins.is_empty()) {
+    if let Some(pins) = exact.filter(|pins| !pins.is_empty()) {
         return pinned_item(&name, pins, &tool.reported, &hint);
     }
     let reported = &tool.reported;
@@ -381,8 +407,9 @@ fn tool_item(at: At<'_>, godot: Option<&[Pin]>, tool: &Tool) -> Item {
     }
 }
 
-/// The line of the manifest `godot` `name` against the exact versions `pins` the repo requires, as a routed run judges
-/// the same answer: met, or missing saying what the probe found of the pin, with the same hint a missing tool has.
+/// The line of the manifest tool `name`, `godot` or `unreal`, against the exact versions `pins` the repo requires, as a
+/// routed run judges the same answer: met, or missing saying what the probe found of the pin, with the same hint a
+/// missing tool has.
 fn pinned_item(name: &str, pins: &[Pin], reported: &Reported, hint: &impl Fn(Kind) -> Option<(String, String)>) -> Item {
     let needs = format!("needs {} exactly", pins_text(pins));
     match pinned(pins, reported) {
@@ -522,6 +549,7 @@ mod tests {
         Tool {
             need: need(name, min),
             reported: Reported::from(&probed),
+            not_checked: None,
         }
     }
 
@@ -538,6 +566,7 @@ mod tests {
             problems: Vec::new(),
             tools,
             godot: None,
+            unreal: None,
             sdk: None,
             workloads: Vec::new(),
             consent_problem: None,
@@ -798,6 +827,37 @@ mod tests {
         assert_eq!(body(&partial), ["check: here: godot 4.5.3 ok (needs 4.5 exactly)"]);
         assert_eq!(summary(&partial), "check: here: nothing missing");
         assert_eq!(said(HERE, &partial).status, 0);
+    }
+
+    /// A pinned unreal the probe found at another version is missing, as a routed run judges the pin exact on the parts
+    /// it gives, though the found version is past the pin.
+    #[test]
+    fn a_pinned_unreal_at_another_version_is_missing() {
+        let Some(pin) = Pin::parse("5.8") else {
+            unreachable!("5.8 is a pin");
+        };
+        let checked = Checked {
+            unreal: Some(vec![pin]),
+            ..checked(vec![tool("unreal", Some("5.8"), found("5.9.0"))])
+        };
+        assert_eq!(body(&checked), ["check: here: unreal missing (needs 5.8 exactly: 5.9.0)"]);
+        assert_eq!(summary(&checked), "check: here: 1 missing, 0 too old");
+        assert_eq!(said(HERE, &checked).status, 1);
+    }
+
+    /// A pinned unreal the probe found at a version the pin names is ok, whatever else its version list holds.
+    #[test]
+    fn a_pinned_unreal_met_is_ok() {
+        let Some(pin) = Pin::parse("5.8") else {
+            unreachable!("5.8 is a pin");
+        };
+        let met = Checked {
+            unreal: Some(vec![pin]),
+            ..checked(vec![tool("unreal", Some("5.8"), found("5.7.3,5.8.1"))])
+        };
+        assert_eq!(body(&met), ["check: here: unreal 5.7.3,5.8.1 ok (needs 5.8 exactly)"]);
+        assert_eq!(summary(&met), "check: here: nothing missing");
+        assert_eq!(said(HERE, &met).status, 0);
     }
 
     #[test]

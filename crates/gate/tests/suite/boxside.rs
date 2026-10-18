@@ -1123,7 +1123,7 @@ fn preflight_skips_an_unreal_root_that_is_no_drive_path() {
 
 /// A root inside the folder the box keeps its work folders in is refused, though it holds an engine.
 #[test]
-fn preflight_skips_an_unreal_root_inside_the_work_root() {
+fn preflight_skips_an_unreal_root_inside_the_worktree() {
     let case = Case::new("preflight_unreal_root_inside_work");
     let folders = Folders::new(&case);
     let root = Path::new(&folders.work).parent().expect("the work folder has a parent").join("unreal");
@@ -1131,7 +1131,7 @@ fn preflight_skips_an_unreal_root_inside_the_work_root() {
 
     let outcome = probed_with_unreal_root(&case, Some(&root));
 
-    let said = format!("gate: remote tool unreal skipped: {} lies inside the box's work root", root.display());
+    let said = format!("gate: remote tool unreal skipped: {} lies inside the worktree", root.display());
     assert_eq!(after_sdks(&outcome), [said.as_str()], "{outcome:?}");
 }
 
@@ -2447,6 +2447,38 @@ fn box_run_never_resolves_an_unreal_behind_a_junction() {
         unreal_build_version(&linked).display(),
         linked.display()
     );
+    assert_unreal_not_resolved(&outcome, &why);
+}
+
+/// A run refuses a root inside its own folders, as the preflight's probe does, though the engine there is plain.
+#[test]
+fn box_run_refuses_an_unreal_root_inside_the_worktree() {
+    let case = Case::new("box_run_unreal_root_inside");
+    let payload = unreal_payload(&case, &[FAKE_TOOL, "env", "UE_ROOT"], Some("5.8.0"));
+    let root = Path::new(field(&payload, "Work"))
+        .parent()
+        .expect("the work folder has a parent")
+        .join("unreal");
+    fake_unreal(&root.join("5.8.0"), "5.8.0");
+
+    let outcome = run_box_with_unreal(&case, &payload, Some(&root), None);
+
+    assert_unreal_not_resolved(&outcome, &format!("{} lies inside the worktree", root.display()));
+}
+
+/// A run refuses a root that is itself a junction, though the engine behind it is plain.
+#[test]
+fn box_run_refuses_an_unreal_root_that_is_a_junction() {
+    let case = Case::new("box_run_unreal_root_junction");
+    let behind = unreal_root(&case);
+    fake_unreal(&behind.join("5.8.0"), "5.8.0");
+    let root = case.folder().join("linked-root");
+    junction(&root, &behind);
+    let payload = unreal_payload(&case, &[FAKE_TOOL, "env", "UE_ROOT"], Some("5.8.0"));
+
+    let outcome = run_box_with_unreal(&case, &payload, Some(&root), None);
+
+    let why = format!("GATE_UNREAL_ROOT {}: {} is a link or a junction", root.display(), root.display());
     assert_unreal_not_resolved(&outcome, &why);
 }
 

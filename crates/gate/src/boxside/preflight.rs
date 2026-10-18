@@ -161,7 +161,7 @@ fn say_sdks_and_tools(payload: &Payload, work: &str, seams: &BoxSeams, console: 
 /// the bare folder and the outputs folder, each one the payload has. `work` is the work folder the preflight has
 /// already read, so the folder above it and itself are always refused; a payload whose `Bare` or `OutputFolder`
 /// cannot be read refuses the rest.
-fn refused_folders(payload: &Payload, work: &str) -> Vec<PathBuf> {
+pub(super) fn refused_folders(payload: &Payload, work: &str) -> Vec<PathBuf> {
     let mut folders: Vec<PathBuf> = Vec::new();
     if let Some(above) = Path::new(work).parent() {
         folders.push(above.to_path_buf());

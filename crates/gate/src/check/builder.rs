@@ -322,6 +322,7 @@ impl Answer<'_> {
             .map(|need| Tool {
                 need: need.clone(),
                 reported: Self::found(&reported, &need.name),
+                not_checked: None,
             })
             .collect();
         let sdk = local::sdk_listed(declared.pin.as_ref(), || match sdks_of(self.lines) {
@@ -342,6 +343,7 @@ impl Answer<'_> {
             problems: declared.problems,
             tools,
             godot: declared.godot,
+            unreal: declared.unreal,
             sdk,
             workloads: declared.manifest.workloads,
             consent_problem: None,
@@ -421,6 +423,7 @@ mod tests {
                 ..Manifest::default()
             },
             godot: None,
+            unreal: None,
             pin: pin.map(|version| pin_of(Some(&format!(r#"{{"sdk": {{"version": "{version}"}}}}"#)))),
             problems: Vec::new(),
             toolchain_unreadable: false,
@@ -504,6 +507,45 @@ mod tests {
             ]
         );
         assert_eq!(said(AT, &quiet).status, 1);
+    }
+
+    /// A builder's unreal is judged against the manifest's exact pin, as a routed run judges it: a later engine is
+    /// missing, and a builder whose probe was skipped is missing saying why.
+    #[test]
+    fn a_pinned_unreal_on_a_builder_is_missing_when_it_does_not_serve_the_pin() {
+        let Some(pin) = Pin::parse("5.8") else {
+            unreachable!("5.8 is a pin");
+        };
+        let mut later = declared(vec![need("unreal", "5.8")], None);
+        later.unreal = Some(vec![pin]);
+        let answer = lines(&["gate: remote tool unreal 5.9.0"]);
+        let other = checked(later, &["unreal"], &answer, None);
+        assert_eq!(
+            said(AT, &other).lines,
+            [
+                Line::Out("check: builder-1: app (work folder app-1a2b3c4d)".to_owned()),
+                Line::Out("check: builder-1: unreal missing (needs 5.8 exactly: 5.9.0)".to_owned()),
+                Line::Out("check: builder-1: 1 missing, 0 too old".to_owned()),
+            ]
+        );
+        assert_eq!(said(AT, &other).status, 1);
+
+        let mut skipped = declared(vec![need("unreal", "5.8")], None);
+        skipped.unreal = Some(vec![pin]);
+        let answer = lines(&["gate: remote tool unreal skipped: GATE_UNREAL_ROOT u is not an absolute path on a drive"]);
+        let refused = checked(skipped, &["unreal"], &answer, None);
+        assert_eq!(
+            said(AT, &refused).lines,
+            [
+                Line::Out("check: builder-1: app (work folder app-1a2b3c4d)".to_owned()),
+                Line::Out(
+                    "check: builder-1: unreal missing (needs 5.8 exactly: not probed (GATE_UNREAL_ROOT u is not an absolute path on a drive))"
+                        .to_owned()
+                ),
+                Line::Out("check: builder-1: 1 missing, 0 too old".to_owned()),
+            ]
+        );
+        assert_eq!(said(AT, &refused).status, 1);
     }
 
     #[test]

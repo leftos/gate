@@ -11,16 +11,16 @@
 use std::any::Any;
 use std::cmp::Ordering;
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
-use std::os::windows::fs::MetadataExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::thread::{self, Scope, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
 use gate_win32::PipedConsole;
 use serde_json::Value;
-use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
 
 use crate::boxside::payload::{escaped, is_canonical_version, is_drive_path};
 use crate::environment::Variables;
@@ -372,23 +372,55 @@ fn unreal(batch: Batch<'_>) -> Probed {
     }
 }
 
-/// What each subfolder of the Unreal Engine root `root` comes to, in name order ([`listed`], each judged by
-/// [`unreal_install`]): else why the root is refused, when it is no absolute path on a drive, when it lies inside any
-/// of `worktrees`, the box's work root among them, or when it cannot be read.
+/// What each subfolder of the Unreal Engine root `root` comes to, in name order ([`listed`], then [`unreal_read`]):
+/// else why the root is refused ([`checked_unreal_root`]) or cannot be read.
 fn unreal_installs(root: &OsStr, worktrees: &[&Path], deadline: Instant, limit: Duration) -> Result<Vec<Probed>, String> {
+    let folder = checked_unreal_root(root, worktrees)?;
+    let folders = listed(UNREAL_ROOT, folder, deadline, limit, |folder| Some(folder.to_path_buf()))?;
+    Ok(unreal_read(&folders, deadline, limit))
+}
+
+/// What each install folder of `folders` comes to, in order ([`unreal_install`]), read while the batch's `deadline`
+/// has not passed: past it the reading stops, what was read so far kept and the batch's own `no answer` reason, with
+/// its `limit`, after it.
+fn unreal_read(folders: &[PathBuf], deadline: Instant, limit: Duration) -> Vec<Probed> {
+    let mut found = Vec::new();
+    for folder in folders {
+        if Instant::now() >= deadline {
+            found.push(Probed::Skipped(no_answer(limit)));
+            break;
+        }
+        found.extend(unreal_install(folder));
+    }
+    found
+}
+
+/// The folder the Unreal Engine root `root`, the box's `GATE_UNREAL_ROOT`, names, as the probe and a run both take
+/// it: an absolute path on a drive ([`drive_root`]), neither it nor any folder above it a link or a junction
+/// ([`linked`]), and not lying inside any of `worktrees`, the run's own folders, followed through links. Else why it
+/// is refused.
+pub(crate) fn checked_unreal_root<'r>(root: &'r OsStr, worktrees: &[&Path]) -> Result<&'r Path, String> {
     let folder = drive_root(UNREAL_ROOT, root)?;
+    if let Some(link) = folder.ancestors().find(|path| linked(path)) {
+        return Err(format!(
+            "{UNREAL_ROOT} {}: {} is a link or a junction",
+            escaped(&folder.to_string_lossy()),
+            escaped(&link.to_string_lossy())
+        ));
+    }
     let held = resolved(folder);
     if worktrees.iter().any(|worktree| is_within(&held, &resolved(worktree))) {
-        return Err(format!("{} lies inside the box's work root", escaped(&folder.to_string_lossy())));
+        return Err(format!("{} lies inside the worktree", escaped(&folder.to_string_lossy())));
     }
-    listed(UNREAL_ROOT, folder, deadline, limit, unreal_install)
+    Ok(folder)
 }
 
 /// The engine folder of the install of `version` under the root `root`, the box's `GATE_UNREAL_ROOT`, as a run finds
-/// it by name: `<root>\<version>`, when the root is an absolute path on a drive and that folder is an install that
-/// reports that version ([`unreal_install`]); else why not.
-pub(crate) fn installed_unreal(root: &OsStr, version: &str) -> Result<PathBuf, String> {
-    let folder = drive_root(UNREAL_ROOT, root)?.join(version);
+/// it by name: `<root>\<version>`, when the root passes the probe's checks against the run's folders `worktrees`
+/// ([`checked_unreal_root`]) and that folder is an install that reports that version ([`unreal_install`]); else why
+/// not.
+pub(crate) fn installed_unreal(root: &OsStr, version: &str, worktrees: &[&Path]) -> Result<PathBuf, String> {
+    let folder = checked_unreal_root(root, worktrees)?.join(version);
     match unreal_install(&folder) {
         Some(Probed::Version(_)) => Ok(folder),
         Some(Probed::Skipped(why)) => Err(why),
@@ -427,11 +459,17 @@ fn unreal_install(folder: &Path) -> Option<Probed> {
 }
 
 /// The version the `Build.version` file `file` reports ([`unreal_version`]); else why it gives none: it cannot be
-/// read, it is over [`UNREAL_BUILD_VERSION_MAX`] bytes, it is not UTF-8, or it is not that JSON.
+/// read, it is over [`UNREAL_BUILD_VERSION_MAX`] bytes, it is not UTF-8, or it is not that JSON. The file is opened as
+/// itself, never through a link, and read only when the handle is a plain disk file ([`gate_win32::check_plain_file`]),
+/// so a link or a pipe put there after the probe looked is never read.
 fn build_version(file: &Path) -> Result<String, String> {
     let shown = escaped(&file.to_string_lossy());
     let mut bytes = Vec::new();
-    fs::File::open(file)
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(file)
+        .and_then(|opened| gate_win32::check_plain_file(&opened).map(|()| opened))
         .and_then(|opened| opened.take(UNREAL_BUILD_VERSION_MAX + 1).read_to_end(&mut bytes))
         .map_err(|error| format!("cannot read {shown}: {error}"))?;
     // A length past what u64 holds is past the cap too.
@@ -674,7 +712,7 @@ mod tests {
     use super::GODOT;
     use super::{
         Candidate, Probed, build_version, first_version, godot_candidates, godot_gave_no_version, godot_version, is_reparse_point, late_reason,
-        named_as_found, panic_reason, probe, read_godot, tool_line, unreal_installs, unreal_version, version_list, version_of,
+        named_as_found, panic_reason, probe, read_godot, tool_line, unreal_installs, unreal_read, unreal_version, version_list, version_of,
     };
     use crate::environment::Variables;
     use crate::remote::git::ProgramOutput;
@@ -1101,6 +1139,56 @@ mod tests {
 
         fs::write(&file, b"{\"MajorVersion\": 5, \xff}").expect("the file can be written");
         assert_eq!(build_version(&file), Err(format!("{shown} is not UTF-8")));
+        fs::remove_dir_all(&root).expect("the test's root can be removed");
+    }
+
+    /// A `Build.version` that is a symbolic link is refused when it is opened, as the link itself, so a link put there
+    /// after the probe looked is never followed to the file it names.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test whose files cannot be made must fail loudly")]
+    #[expect(clippy::print_stderr, reason = "a skipped case says why it skipped")]
+    fn an_unreal_build_version_that_is_a_symlink_is_refused_at_open() {
+        let root = unit_root("unreal-symlink");
+        let target = root.join("target.version");
+        fs::write(&target, build_version_text(5, 8, 0)).expect("the target can be written");
+        let link = root.join("Build.version");
+        if let Err(error) = std::os::windows::fs::symlink_file(&target, &link) {
+            eprintln!("skipped: a file symlink cannot be made here (no privilege, or developer mode off): {error}");
+            fs::remove_dir_all(&root).expect("the test's root can be removed");
+            return;
+        }
+
+        let read = build_version(&link);
+
+        let prefix = format!("cannot read {}: ", link.display());
+        assert!(read.as_ref().is_err_and(|why| why.starts_with(&prefix)), "{read:?}");
+        fs::remove_dir_all(&root).expect("the test's root can be removed");
+    }
+
+    /// Past the batch's deadline the unreal probe reads no more installs and says the batch's own reason, as a listing
+    /// cut short does; a whole probe given no time says it alone.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test whose install folders cannot be made must fail loudly")]
+    fn an_unreal_probe_past_its_deadline_reads_no_more_installs() {
+        let root = unit_root("unreal-deadline");
+        let folders = [root.join("5.7.3"), root.join("5.8.0")];
+        unit_unreal(&folders[0], &build_version_text(5, 7, 3));
+        unit_unreal(&folders[1], &build_version_text(5, 8, 0));
+
+        assert_eq!(
+            unreal_read(&folders, Instant::now(), Duration::ZERO),
+            [Probed::Skipped("no answer in 0 s".to_owned())]
+        );
+        let later = Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            unreal_read(&folders, later, Duration::from_secs(60)),
+            [Probed::Version("5.7.3".to_owned()), Probed::Version("5.8.0".to_owned())]
+        );
+        let variables = Variables::from_process().with("GATE_UNREAL_ROOT", &root.to_string_lossy());
+        assert_eq!(
+            probe(&["unreal".to_owned()], Duration::ZERO, Ok(variables), &[]),
+            [("unreal".to_owned(), Probed::Skipped("no answer in 0 s".to_owned()))]
+        );
         fs::remove_dir_all(&root).expect("the test's root can be removed");
     }
 }

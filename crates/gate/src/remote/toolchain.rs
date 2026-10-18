@@ -4,9 +4,9 @@
 //!
 //! The manifest is a `[tools]` table of `name = "version"`, where a version is a minimum (`major[.minor[.patch]]`, its
 //! missing parts 0) and `""` means present at any version, and a top-level `workloads` array of .NET workload ids. A
-//! file that does not parse is unreadable whole; a bad entry is skipped alone, with a problem naming it. The one entry
-//! read otherwise is `godot`, whose value pins an exact version, as the pins read beside the manifest do: each local
-//! dotnet tool's version in `.config/dotnet-tools.json` and the `Godot.NET.Sdk` version a project file names.
+//! file that does not parse is unreadable whole; a bad entry is skipped alone, with a problem naming it. The entries
+//! read otherwise are `godot` and `unreal`, whose values pin an exact version, as the pins read beside the manifest do:
+//! each local dotnet tool's version in `.config/dotnet-tools.json` and the `Godot.NET.Sdk` version a project file names.
 
 use serde_json::Value as Json;
 use toml::{Table, Value};
@@ -19,10 +19,15 @@ use crate::remote::git::{FAILURE_BYTES, first_bytes};
 use crate::remote::parity::{Need, NeedKind, number};
 
 /// The tool names the manifest knows, as its `[tools]` keys spell them.
-pub(crate) const KNOWN_TOOLS: [&str; 7] = ["rust", "cargo-nextest", "node", "pnpm", "pwsh", "godot", "ffmpeg"];
+pub(crate) const KNOWN_TOOLS: [&str; 8] = ["rust", "cargo-nextest", "node", "pnpm", "pwsh", "godot", "ffmpeg", "unreal"];
 
-/// The one tool whose manifest entry pins an exact version rather than a minimum, as its key spells it.
+/// A tool whose manifest entry pins an exact version rather than a minimum, as its key spells it; its project files
+/// may pin one too.
 const GODOT: &str = "godot";
+
+/// The other tool whose manifest entry pins an exact version rather than a minimum, as its key spells it; only the
+/// manifest pins it.
+const UNREAL: &str = "unreal";
 
 /// The SDK a Godot .NET project names, its letter case aside as package ids are.
 const GODOT_SDK: &str = "Godot.NET.Sdk";
@@ -153,10 +158,10 @@ pub(crate) struct ToolNeed {
     pub known: bool,
 }
 
-/// What a manifest's `[tools] godot` entry requires of a routed run's builder, where every other entry names a minimum:
-/// the versions a repo pins exactly.
+/// What a manifest's `[tools] godot` or `[tools] unreal` entry requires of a routed run's builder, where every other
+/// entry names a minimum: the version a repo pins exactly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Godot {
+pub(crate) enum Exact {
     /// An empty value: any version, so an install of any version at all serves it.
     Any,
     /// The version the value names, on the parts it gives.
@@ -175,7 +180,9 @@ pub(crate) struct Manifest {
     /// The `[tools] godot` entry when the manifest names godot: the versions it pins, rather than the minimum its
     /// `tools` entry is otherwise read as. `None` when the manifest names no godot, or names one whose value is no
     /// version, which [`Manifest::problems`] holds instead.
-    pub godot: Option<Godot>,
+    pub godot: Option<Exact>,
+    /// The `[tools] unreal` entry when the manifest names unreal, read as [`Manifest::godot`] is.
+    pub unreal: Option<Exact>,
 }
 
 /// The line said when the manifest cannot be read, `why` being the reason [`read`] or [`read_bytes`] gives.
@@ -384,13 +391,30 @@ pub(crate) fn godot_pins_read(manifest: Option<&Result<Manifest, String>>, skips
 /// when the repo requires nothing of godot, so no need is sent and nothing is judged; a manifest that cannot be read, or
 /// that the repo has none of, does not stop the project files' pins from applying.
 pub(crate) fn godot_required(manifest: Option<&Result<Manifest, String>>, pins: &[Pin]) -> Option<Vec<Pin>> {
-    if let Some(godot) = manifest.and_then(|read| read.as_ref().ok()).and_then(|manifest| manifest.godot) {
-        return Some(match godot {
-            Godot::Any => Vec::new(),
-            Godot::Exactly(pin) => vec![pin],
-        });
+    if let Some(godot) = readable(manifest).and_then(|manifest| manifest.godot) {
+        return Some(exact_pins(godot));
     }
     (!pins.is_empty()).then(|| distinct(pins))
+}
+
+/// The versions a repo requires of a routed run's builder Unreal Engine installs: the manifest's own `unreal` entry,
+/// empty for any version. `None` when the manifest names no unreal, cannot be read or the repo has none, so nothing is
+/// judged and no version is chosen.
+pub(crate) fn unreal_required(manifest: Option<&Result<Manifest, String>>) -> Option<Vec<Pin>> {
+    readable(manifest).and_then(|manifest| manifest.unreal).map(exact_pins)
+}
+
+/// The manifest `manifest` when the repo has one that reads.
+fn readable(manifest: Option<&Result<Manifest, String>>) -> Option<&Manifest> {
+    manifest.and_then(|read| read.as_ref().ok())
+}
+
+/// The versions an exact manifest entry `entry` requires: none for any version, else its one pin.
+fn exact_pins(entry: Exact) -> Vec<Pin> {
+    match entry {
+        Exact::Any => Vec::new(),
+        Exact::Exactly(pin) => vec![pin],
+    }
 }
 
 /// The Godot install a routed run's builder runs the repo's command on, as [`godot_choice`] picks it.
@@ -451,17 +475,34 @@ pub(crate) fn godot_choice(required: Option<&[Pin]>, reported: &[(String, Report
             return GodotChoice::Several(list.join(", "));
         }
     };
-    let highest = listed_godot(reported).filter(|found| pin.met_by(*found)).max();
-    highest.map_or(GodotChoice::None, |version| GodotChoice::Version(version.to_string()))
+    highest_meeting(pin, reported, GODOT).map_or(GodotChoice::None, GodotChoice::Version)
 }
 
-/// The versions the preflight `reported` of the builder's Godot installs, in the order it listed them; none when it said
-/// nothing of godot.
-fn listed_godot(reported: &[(String, Reported)]) -> impl Iterator<Item = Version> + '_ {
+/// Which of the builder's Unreal Engine installs a routed run uses, given the versions `required` the repo requires
+/// ([`unreal_required`]; `None` when it requires nothing) and what the preflight `reported` of each tool: the highest
+/// version the builder listed that meets the one pin, as `major.minor.patch`; none for no pin, any version, or a pin no
+/// listed version meets.
+pub(crate) fn unreal_choice(required: Option<&[Pin]>, reported: &[(String, Reported)]) -> Option<String> {
+    match required.unwrap_or_default() {
+        [pin] => highest_meeting(pin, reported, UNREAL),
+        _ => None,
+    }
+}
+
+/// The highest version, `major.minor.patch`, the preflight `reported` of the tool `name` that meets `pin`
+/// ([`Pin::met_by`]); `None` when no listed version does.
+fn highest_meeting(pin: &Pin, reported: &[(String, Reported)], name: &str) -> Option<String> {
+    let highest = listed_versions(reported, name).filter(|found| pin.met_by(*found)).max();
+    highest.map(|version| version.to_string())
+}
+
+/// The versions the preflight `reported` of the builder's installs of the tool `name`, in the order it listed them;
+/// none when it said nothing of that tool, or no version list.
+fn listed_versions<'a>(reported: &'a [(String, Reported)], name: &str) -> impl Iterator<Item = Version> + 'a {
     reported
         .iter()
-        .find_map(|(name, answer)| match answer {
-            Reported::Version(list) if name == GODOT => Some(list),
+        .find_map(|(tool, answer)| match answer {
+            Reported::Version(list) if tool == name => Some(list),
             _ => None,
         })
         .into_iter()
@@ -471,7 +512,7 @@ fn listed_godot(reported: &[(String, Reported)]) -> impl Iterator<Item = Version
 
 /// The newest `major.minor.patch` of the Godot installs the preflight `reported`; `None` when it listed none.
 pub(crate) fn newest_godot(reported: &[(String, Reported)]) -> Option<String> {
-    listed_godot(reported).max().map(|version| version.to_string())
+    listed_versions(reported, GODOT).max().map(|version| version.to_string())
 }
 
 /// What a routed run whose repo chooses no Godot version ([`GodotChoice::None`]) does with its command, as
@@ -567,11 +608,12 @@ fn reported_as(said: &str) -> Reported {
 /// is no regular file), declares that the builder `host` lacks, given the versions `godot` the repo requires of the
 /// builder's Godot installs ([`godot_required`]; `None` when it requires nothing of godot), the tools `sent` in the
 /// preflight's `Needs` and what it `reported` of them: a need for each sent tool it found missing or below its minimum,
-/// and one for a `godot` its installs do not serve, and a skip line for a manifest that cannot be read, then for each
-/// problem of the manifest, then, in the manifest's order, for each tool not sent as unknown and each sent tool it did
-/// not probe, gave no answer for, or found at a version that cannot be read against a minimum. A known tool left
-/// unsent, as when the preflight could not carry the needs, says nothing, and so does a `godot` whose own need was not
-/// sent. Every text from the manifest or the builder is escaped, and the builder's cut to [`FAILURE_BYTES`].
+/// and one for a `godot`, or a manifest `unreal` ([`unreal_required`]), its installs do not serve, and a skip line for a
+/// manifest that cannot be read, then for each problem of the manifest, then, in the manifest's order, for each tool not
+/// sent as unknown and each sent tool it did not probe, gave no answer for, or found at a version that cannot be read
+/// against a minimum. A known tool left unsent, as when the preflight could not carry the needs, says nothing, and so
+/// does a pinned tool whose own need was not sent. Every text from the manifest or the builder is escaped, and the
+/// builder's cut to [`FAILURE_BYTES`].
 pub(crate) fn judge(
     manifest: Option<&Result<Manifest, String>>,
     godot: Option<&[Pin]>,
@@ -583,11 +625,13 @@ pub(crate) fn judge(
     if let Some(Err(why)) = manifest {
         judged.skips.push(skip_line(why));
     }
+    let unreal = unreal_required(manifest);
+    let exact = [(GODOT, godot), (UNREAL, unreal.as_deref())];
     if let Some(Ok(manifest)) = manifest {
         judged.skips.extend(manifest.problems.iter().map(|problem| skip_line(problem)));
         for tool in &manifest.tools {
-            // A pinned godot is weighed exactly, below, whatever minimum its own entry spells.
-            if godot.is_some() && tool.name == GODOT {
+            // A pinned tool is weighed exactly, below, whatever minimum its own entry spells.
+            if exact.iter().any(|(name, pins)| pins.is_some() && tool.name == *name) {
                 continue;
             }
             if !is_sent(tool) {
@@ -619,23 +663,32 @@ pub(crate) fn judge(
             judged.skips.push(format!("gate: {host} did not probe {name}: {why}; not checking it"));
         }
     }
-    if let Some(pins) = godot.filter(|_| sent.iter().any(|name| name == GODOT)) {
-        let answer = reported.iter().find(|(name, _)| name == GODOT).map(|(_, answer)| answer);
-        match answer.map(|answer| pinned(pins, answer)) {
-            Some(Pinned::Met) => {}
-            Some(Pinned::Lacks(found)) => judged.needs.push(godot_need(pins, shown(&found))),
-            Some(Pinned::Skipped(why)) => {
-                let why = shown(&why);
-                judged.skips.push(format!("gate: {host} did not probe {GODOT}: {why}; not checking it"));
-            }
-            None if pins.is_empty() => {
-                let why = shown(NO_ANSWER);
-                judged.skips.push(format!("gate: {host} did not probe {GODOT}: {why}; not checking it"));
-            }
-            None => judged.needs.push(godot_need(pins, shown(&format!("not probed ({NO_ANSWER})")))),
+    for (name, pins) in exact {
+        if let Some(pins) = pins.filter(|_| sent.iter().any(|sent| sent == name)) {
+            judge_exact(&mut judged, name, pins, reported, host);
         }
     }
     judged
+}
+
+/// Adds to `judged` what the builder `host` lacks of the versions `pins` a repo requires exactly of the tool `name`, as
+/// the preflight `reported` of it ([`pinned`]): a need when its installs do not serve the pins, or a skip line when the
+/// repo requires any version and the probe did not answer.
+fn judge_exact(judged: &mut Judged, name: &str, pins: &[Pin], reported: &[(String, Reported)], host: &str) {
+    let answer = reported.iter().find(|(tool, _)| tool == name).map(|(_, answer)| answer);
+    match answer.map(|answer| pinned(pins, answer)) {
+        Some(Pinned::Met) => {}
+        Some(Pinned::Lacks(found)) => judged.needs.push(exact_need(name, pins, shown(&found))),
+        Some(Pinned::Skipped(why)) => {
+            let why = shown(&why);
+            judged.skips.push(format!("gate: {host} did not probe {name}: {why}; not checking it"));
+        }
+        None if pins.is_empty() => {
+            let why = shown(NO_ANSWER);
+            judged.skips.push(format!("gate: {host} did not probe {name}: {why}; not checking it"));
+        }
+        None => judged.needs.push(exact_need(name, pins, shown(&format!("not probed ({NO_ANSWER})")))),
+    }
 }
 
 /// The need of `tool`, of which the builder has `found`: its name, and `<min> or later` when it has a minimum.
@@ -651,15 +704,15 @@ fn lacking(tool: &ToolNeed, found: String) -> Need {
     }
 }
 
-/// The need of the Godot versions `pins` a repo requires, of which the builder has `found`: its name and the versions,
-/// joined as a mismatch line spells them and each given the parts its pin gave, or the name alone for a repo requiring
-/// an install of any version.
-fn godot_need(pins: &[Pin], found: String) -> Need {
+/// The need of the versions `pins` a repo requires exactly of the tool `name`, of which the builder has `found`: its
+/// name and the versions, joined as a mismatch line spells them and each given the parts its pin gave, or the name
+/// alone for a repo requiring an install of any version.
+fn exact_need(name: &str, pins: &[Pin], found: String) -> Need {
     let versions: Vec<String> = pins.iter().map(ToString::to_string).collect();
     let text = if versions.is_empty() {
-        GODOT.to_owned()
+        name.to_owned()
     } else {
-        format!("{GODOT} {} exactly", versions.join(", "))
+        format!("{name} {} exactly", versions.join(", "))
     };
     Need {
         kind: NeedKind::Tool { found },
@@ -712,7 +765,10 @@ fn read_tools(value: Value, manifest: &mut Manifest) {
         match tool_need(&name, &value) {
             Ok(tool) => {
                 if tool.name == GODOT {
-                    manifest.godot = godot_entry(&value);
+                    manifest.godot = exact_entry(&value);
+                }
+                if tool.name == UNREAL {
+                    manifest.unreal = exact_entry(&value);
                 }
                 manifest.tools.push(tool);
             }
@@ -738,13 +794,13 @@ fn tool_need(name: &str, value: &Value) -> Result<ToolNeed, String> {
     })
 }
 
-/// The `[tools] godot` entry the value `value` pins, [`tool_need`] having just read it: `None` for a value that is no
-/// string or names no version at all, which [`tool_need`] has already named as a problem, so that no entry is read as a
-/// pin and the project files' own pins apply.
-fn godot_entry(value: &Value) -> Option<Godot> {
+/// The `[tools] godot` or `[tools] unreal` entry the value `value` pins, [`tool_need`] having just read it: `None` for a
+/// value that is no string or names no version at all, which [`tool_need`] has already named as a problem, so that no
+/// entry is read as a pin and, for godot, the project files' own pins apply.
+fn exact_entry(value: &Value) -> Option<Exact> {
     match value.as_str()? {
-        "" => Some(Godot::Any),
-        text => Pin::parse(text).map(Godot::Exactly),
+        "" => Some(Exact::Any),
+        text => Pin::parse(text).map(Exact::Exactly),
     }
 }
 
@@ -926,7 +982,7 @@ fn attributes(text: &str) -> Vec<(&str, &str)> {
 #[expect(clippy::expect_used, reason = "a fixture that does not read must fail loudly")]
 mod tests {
     use super::{
-        Godot, GodotChoice, Judged, Manifest, NoChosenGodot, Pin, Pinned, Reported, Standing, ToolNeed, Version, dotnet_tools, godot_choice,
+        Exact, GodotChoice, Judged, Manifest, NoChosenGodot, Pin, Pinned, Reported, Standing, ToolNeed, Version, dotnet_tools, godot_choice,
         godot_not_listed_line, godot_pins_read, godot_required, godot_sdk_pins, is_sent, judge, meets, needs_of, newest_godot, no_chosen_godot,
         no_godot_install_line, no_pin_godot_warning, pinned, read, read_bytes, reported, reported_as, routed_needs, several_godot_line, skip_line,
         standing, unreadable_godot_pins_line, unreadable_line,
@@ -1716,6 +1772,117 @@ mod tests {
         );
     }
 
+    /// A manifest pinning unreal at `pin`, as `[tools] unreal = "<pin>"`.
+    fn unreal_manifest(pin: &str) -> String {
+        format!("[tools]\nunreal = \"{pin}\"\n")
+    }
+
+    /// The builder's unreal tool line, answering `what`.
+    fn unreal_line(what: &str) -> String {
+        format!("gate: remote tool unreal {what}")
+    }
+
+    /// An unreal pin is met by any listed engine of that version, first, last or only.
+    #[test]
+    fn an_unreal_pin_is_met_by_any_listed_install() {
+        for list in ["5.8.0", "5.7.3,5.8.0", "5.8.0,5.9.0"] {
+            assert_eq!(judged(&unreal_manifest("5.8.0"), &[&unreal_line(list)]), Judged::default(), "{list}");
+        }
+    }
+
+    /// An unreal pin no listed engine holds is a mismatch, ending in the list the builder gave, its members joined.
+    #[test]
+    fn an_unreal_pin_missing_from_the_list_is_a_mismatch() {
+        assert_eq!(
+            judged(&unreal_manifest("5.8.0"), &[&unreal_line("5.7.3,5.9.0")]),
+            Judged {
+                needs: vec![lacks("unreal 5.8.0 exactly", "5.7.3, 5.9.0")],
+                skips: Vec::new(),
+            }
+        );
+        assert_eq!(
+            judged(&unreal_manifest("5.8.0"), &[&unreal_line("next")]),
+            Judged {
+                needs: vec![lacks("unreal 5.8.0 exactly", "next")],
+                skips: Vec::new(),
+            },
+            "an answer that is no version list"
+        );
+    }
+
+    /// An unreal pin of two parts is met by any patch of its major and minor, and by no other minor.
+    #[test]
+    fn a_two_part_unreal_pin_matches_any_patch() {
+        assert_eq!(judged(&unreal_manifest("5.8"), &[&unreal_line("5.8.0")]), Judged::default());
+        assert_eq!(judged(&unreal_manifest("5.8"), &[&unreal_line("5.8.3")]), Judged::default());
+        assert_eq!(
+            judged(&unreal_manifest("5.8"), &[&unreal_line("5.7.9")]),
+            Judged {
+                needs: vec![lacks("unreal 5.8 exactly", "5.7.9")],
+                skips: Vec::new(),
+            }
+        );
+    }
+
+    /// An empty manifest unreal entry asks for an engine of any version, which one engine at any version serves.
+    #[test]
+    fn an_empty_manifest_unreal_entry_is_met_by_any_version() {
+        assert_eq!(judged(&unreal_manifest(""), &[&unreal_line("4.27.2")]), Judged::default());
+        assert_eq!(
+            judged(&unreal_manifest(""), &[&unreal_line("missing")]),
+            Judged {
+                needs: vec![lacks("unreal", "none")],
+                skips: Vec::new(),
+            },
+            "no engine at all is still a need"
+        );
+    }
+
+    /// A pinned unreal the probe did not answer for is a mismatch; a repo that requires any version keeps the skip line.
+    #[test]
+    fn a_skipped_unreal_probe_is_a_mismatch_when_a_pin_needs_checking() {
+        let why = "GATE_UNREAL_ROOT unreal is not an absolute path on a drive";
+        let skipped = unreal_line(&format!("skipped: {why}"));
+        assert_eq!(
+            judged(&unreal_manifest("5.8"), &[&skipped]),
+            Judged {
+                needs: vec![lacks("unreal 5.8 exactly", &format!("not probed ({why})"))],
+                skips: Vec::new(),
+            }
+        );
+        assert_eq!(
+            judged(&unreal_manifest(""), &[&skipped]),
+            Judged {
+                needs: Vec::new(),
+                skips: owned(&[&format!("gate: builder did not probe unreal: {why}; not checking it")]),
+            }
+        );
+    }
+
+    /// A builder holding no engine at all is a mismatch, and the line says it has `none`.
+    #[test]
+    fn a_missing_unreal_is_a_mismatch_saying_none() {
+        assert_eq!(
+            judged(&unreal_manifest("5.8"), &[&unreal_line("missing")]),
+            Judged {
+                needs: vec![lacks("unreal 5.8 exactly", "none")],
+                skips: Vec::new(),
+            }
+        );
+    }
+
+    /// An unreal pin is exact, never the minimum its manifest text would otherwise read as: a later engine misses it.
+    #[test]
+    fn an_unreal_pin_is_not_judged_as_a_minimum() {
+        assert_eq!(
+            judged(&unreal_manifest("5.8"), &[&unreal_line("5.9.0")]),
+            Judged {
+                needs: vec![lacks("unreal 5.8 exactly", "5.9.0")],
+                skips: Vec::new(),
+            }
+        );
+    }
+
     /// The manifest's own `godot` entry wins over what the project files pin, and an entry or a manifest that cannot be
     /// read leaves those pins applying.
     #[test]
@@ -1723,10 +1890,10 @@ mod tests {
         let pins = [pin(4, 8, 0)];
         assert_eq!(
             manifest("[tools]\ngodot = \"4.7\"\n").godot,
-            Some(Godot::Exactly(pin_of("4.7"))),
+            Some(Exact::Exactly(pin_of("4.7"))),
             "the entry is read as a pin, on the parts it gives"
         );
-        assert_eq!(manifest("[tools]\ngodot = \"\"\n").godot, Some(Godot::Any));
+        assert_eq!(manifest("[tools]\ngodot = \"\"\n").godot, Some(Exact::Any));
         assert_eq!(manifest("[tools]\nnode = \"24\"\n").godot, None, "a manifest naming no godot");
         assert_eq!(
             routed_needs(Some(&Ok(manifest("[tools]\ngodot = \"4.7\"\n"))), &pins, false),

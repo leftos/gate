@@ -33,6 +33,8 @@ const TOOLCHAIN: &str = "toolchain.toml";
 const SIBLINGS: &str = "siblings.toml";
 /// Why an SDK pin is skipped when the root's `global.json` holds none that reads.
 const NO_READABLE_PIN: &str = "global.json has no readable sdk pin";
+/// The manifest tool whose engines this PC is looked for in only when its environment names `GATE_UNREAL_ROOT`.
+const UNREAL: &str = "unreal";
 /// Why a `.gate` that is not a folder leaves the manifest unreadable.
 const GATE_NOT_A_FOLDER: &str = ".gate is not a folder";
 /// How the siblings file's reader starts the problem of one entry of its array: `siblings[<index>] ...`.
@@ -80,6 +82,9 @@ pub(super) struct Declared {
     /// The exact Godot versions the manifest requires, as [`toolchain::godot_required`] reads them: empty for any
     /// version, `None` when it names no godot.
     pub godot: Option<Vec<Pin>>,
+    /// The exact Unreal Engine versions the manifest requires, as [`toolchain::unreal_required`] reads them: empty for
+    /// any version, `None` when it names no unreal.
+    pub unreal: Option<Vec<Pin>>,
     pub pin: Option<parity::Pin>,
     pub problems: Vec<Problem>,
     /// Whether the manifest is there but cannot be read whole.
@@ -125,7 +130,9 @@ pub(super) fn declared(root: &Path) -> Declared {
         file: report::TOOLCHAIN,
         text,
     }));
-    let godot = toolchain::godot_required(Some(&Ok(manifest.clone())), &[]);
+    let read = Ok(manifest.clone());
+    let godot = toolchain::godot_required(Some(&read), &[]);
+    let unreal = toolchain::unreal_required(Some(&read));
     let (pin, pin_problem) = read_pin(root);
     let pin_unreadable = pin_problem.is_some();
     if let Some(text) = pin_problem {
@@ -138,6 +145,7 @@ pub(super) fn declared(root: &Path) -> Declared {
         declares_toolchain,
         manifest,
         godot,
+        unreal,
         pin,
         problems,
         toolchain_unreadable,
@@ -222,6 +230,7 @@ fn checked(place: &Place, limit: Duration) -> Checked {
         problems: declared.problems,
         tools,
         godot: declared.godot,
+        unreal: declared.unreal,
         sdk,
         workloads: declared.manifest.workloads,
         consent_problem,
@@ -444,16 +453,20 @@ fn read_manifest(root: &Path) -> Result<Option<Manifest>, String> {
 
 /// Each of `needs` with what its probe found within `limit`, in their order; an unknown tool runs nothing. The tools
 /// are looked for as this PC's SDK list looks for dotnet: along `PATH` with the folders inside the worktree `root`
-/// dropped, and one found that still lies inside it refused.
+/// dropped, and one found that still lies inside it refused. An unreal on a PC whose environment names no
+/// `GATE_UNREAL_ROOT` is not checked here, as nothing says where its engines are.
 fn probed(needs: Vec<ToolNeed>, limit: Duration, root: &Path) -> Vec<Tool> {
     if needs.is_empty() {
         return Vec::new();
     }
     let names: Vec<String> = needs.iter().map(|need| need.name.clone()).collect();
-    probe::probe(&names, limit, outside_worktree(Variables::from_process(), root), &[root])
+    let variables = outside_worktree(Variables::from_process(), root);
+    let no_unreal_root = variables.as_ref().is_ok_and(|variables| variables.get(probe::UNREAL_ROOT).is_none());
+    probe::probe(&names, limit, variables, &[root])
         .into_iter()
         .zip(needs)
         .map(|((_, probed), need)| Tool {
+            not_checked: (no_unreal_root && need.name == UNREAL).then(|| format!("{} is not set", probe::UNREAL_ROOT)),
             need,
             reported: Reported::from(&probed),
         })
@@ -653,6 +666,7 @@ mod tests {
             declares_toolchain: true,
             manifest: Manifest::default(),
             godot: None,
+            unreal: None,
             pin: None,
             problems: Vec::new(),
             toolchain_unreadable: true,

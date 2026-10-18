@@ -2743,10 +2743,15 @@ fn is_parity_line(line: &str) -> bool {
 /// `said` and no other, in their order, then the one parity line, on the console and, but the parity line, in the log,
 /// and runs the command here once.
 fn a_toolchain_refusal(case: &Case, box_path: &OsString, said: &[String], godot: Option<&Path>) -> Outcome {
+    a_toolchain_refusal_with(case, box_path, said, |gate| set_godot_root(gate, godot))
+}
+
+/// [`a_toolchain_refusal`] with the builder's install roots set by `roots` on the gate's command.
+fn a_toolchain_refusal_with(case: &Case, box_path: &OsString, said: &[String], roots: impl FnOnce(&mut Command)) -> Outcome {
     let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
     let mut gate = client_gate(case, "out.log", &steps, &[r".\tool.exe", "mark", RAN, "out", "ran"]);
     gate.env("PATH", box_path).env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING);
-    set_godot_root(&mut gate, godot);
+    roots(&mut gate);
 
     let (pid, outcome) = finish_with_pid(gate);
 
@@ -3024,6 +3029,143 @@ fn a_repo_with_no_godot_pin_sends_no_godot_need() {
         !root.join("4.7.2").join("ran").exists(),
         "the builder probed a godot the repo never pinned"
     );
+}
+
+/// Makes `folder` a fake Unreal Engine install whose `Engine\Build\Build.version` reports `version`,
+/// `major.minor.patch`, as the box's unreal probe reads one.
+pub(super) fn fake_unreal_install(folder: &Path, version: &str) {
+    let parts: Vec<u64> = version
+        .split('.')
+        .map(|part| part.parse().expect("a fake engine's version is numbers"))
+        .collect();
+    let build = folder.join("Engine").join("Build");
+    fs::create_dir_all(&build).expect("the fake engine's folders can be made");
+    let text = json!({ "MajorVersion": parts[0], "MinorVersion": parts[1], "PatchVersion": parts[2], "Changelist": 0 });
+    fs::write(build.join("Build.version"), text.to_string()).expect("the fake engine's Build.version can be written");
+}
+
+/// A `GATE_UNREAL_ROOT` for a case, under its `ssh` folder, holding one fake engine per version of `versions`, each in
+/// the folder named for it. The folder is left out of the case's snapshot, and lies outside the builder's own work
+/// folders, where a root would be refused.
+fn unreal_root(case: &Case, versions: &[&str]) -> PathBuf {
+    let root = case.folder().join("ssh").join("unreal");
+    fs::create_dir_all(&root).expect("the unreal root can be made");
+    for version in versions {
+        fake_unreal_install(&root.join(version), version);
+    }
+    root
+}
+
+/// Sets the gate's `GATE_UNREAL_ROOT` to `root` — which the builder's unreal probe and its run read — or takes it out of
+/// the environment when the case gives none, so a machine with one set cannot serve a case by accident.
+fn set_unreal_root(gate: &mut Command, root: Option<&Path>) {
+    if let Some(root) = root {
+        gate.env("GATE_UNREAL_ROOT", root);
+    } else {
+        gate.env_remove("GATE_UNREAL_ROOT");
+    }
+}
+
+/// A stale `UE_ROOT` the builder inherits from the gate's environment, which no routed command may see.
+const STALE_UE_ROOT: &str = r"C:\stale\UE_5.0";
+
+/// A routed run of a command printing its `UE_ROOT`, in a case whose builder's `GATE_UNREAL_ROOT` is `root` and whose
+/// inherited `UE_ROOT` is `inherited`, none when not given: it goes remote with no parity line and runs once, on the
+/// builder, and passes.
+fn a_routed_unreal_run(case: &Case, root: &Path, inherited: Option<&str>) -> Outcome {
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({ "host": HOST, "slots": 2, "repos": { &repo: ["*tool*"] }, "outputs": { &repo: [] } });
+    write_remote_json(case, &routing.to_string());
+    let box_path = box_path_with_tools(case, &listing(&[BUILDER_SDK]), &[], &[]);
+    let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(case, "out.log", &steps, &[r".\tool.exe", "env", "UE_ROOT", "mark", RAN]);
+    gate.env("PATH", box_path).env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING);
+    match inherited {
+        Some(value) => gate.env("UE_ROOT", value),
+        None => gate.env_remove("UE_ROOT"),
+    };
+    set_unreal_root(&mut gate, Some(root));
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.lines().any(is_parity_line), "{outcome:?}");
+    assert_eq!(fallbacks(&own(case, pid)), Vec::<&str>::new(), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert_eq!(runs(case), (0, 1), "the command ran once, on the builder: {outcome:?}");
+    outcome
+}
+
+/// Whether the routed command printed a `UE_ROOT` naming the engine `version` of `root`.
+fn saw_the_engine(outcome: &Outcome, root: &Path, version: &str) -> bool {
+    let engine = root.join(version).display().to_string();
+    outcome.stdout.lines().any(|line| line == engine)
+}
+
+/// A repo whose manifest pins an Unreal Engine the builder has goes remote, with no line about unreal, and its command
+/// sees the engine of that version.
+#[test]
+fn a_repo_pinning_an_unreal_the_builder_has_routes_and_sends_its_version() {
+    let case = client_case("client-unreal-served");
+    write(&case, MANIFEST, "[tools]\nunreal = \"5.8.0\"\n");
+    let root = unreal_root(&case, &["5.7.3", "5.8.0"]);
+
+    let outcome = a_routed_unreal_run(&case, &root, None);
+
+    assert!(saw_the_engine(&outcome, &root, "5.8.0"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("unreal"), "{outcome:?}");
+}
+
+/// A repo whose manifest pins an Unreal Engine the builder has not runs here, saying the versions it has.
+#[test]
+fn a_repo_pinning_an_unreal_the_builder_lacks_runs_here_saying_the_mismatch() {
+    let case = client_case("client-unreal-lacking");
+    write(&case, MANIFEST, "[tools]\nunreal = \"5.8\"\n");
+    let root = unreal_root(&case, &["5.7.3"]);
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &[]);
+
+    a_toolchain_refusal_with(&case, &box_path, &[mismatch_of(&case, "unreal 5.8 exactly", "5.7.3")], |gate| {
+        set_unreal_root(gate, Some(&root));
+    });
+}
+
+/// A repo that pins no Unreal Engine asks the builder for none: the run goes remote though the builder has an engine,
+/// and its command sees no `UE_ROOT`, the builder's inherited one removed.
+#[test]
+fn a_repo_with_no_unreal_pin_sends_no_unreal_need_or_version() {
+    let case = client_case("client-unreal-unpinned");
+    let root = unreal_root(&case, &["5.8.0"]);
+
+    let outcome = a_routed_unreal_run(&case, &root, Some(STALE_UE_ROOT));
+
+    assert!(outcome.stdout.lines().any(|line| line == "fake-tool: UE_ROOT is not set"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("unreal"), "{outcome:?}");
+}
+
+/// A partial pin sends the highest engine of the builder that meets it.
+#[test]
+fn a_partial_unreal_pin_sends_the_highest_matching_install() {
+    let case = client_case("client-unreal-partial-pin");
+    write(&case, MANIFEST, "[tools]\nunreal = \"5.8\"\n");
+    let root = unreal_root(&case, &["5.8.0", "5.8.2", "5.9.0"]);
+
+    let outcome = a_routed_unreal_run(&case, &root, None);
+
+    assert!(saw_the_engine(&outcome, &root, "5.8.2"), "{outcome:?}");
+}
+
+/// A routed run of a repo pinning an Unreal Engine reaches its command, through the box, with `UE_ROOT` naming the
+/// engine chosen, over the `UE_ROOT` the builder inherited.
+#[test]
+fn a_routed_run_of_an_unreal_pinned_repo_reaches_its_command_with_ue_root() {
+    let case = client_case("client-unreal-ue-root");
+    write(&case, MANIFEST, "[tools]\nunreal = \"5.8.0\"\n");
+    let root = unreal_root(&case, &["5.8.0"]);
+
+    let outcome = a_routed_unreal_run(&case, &root, Some(STALE_UE_ROOT));
+
+    assert!(saw_the_engine(&outcome, &root, "5.8.0"), "{outcome:?}");
+    assert!(!outcome.stdout.contains(STALE_UE_ROOT), "{outcome:?}");
 }
 
 /// A Ctrl+C raised just before the manifest is read ends the run as an interrupt before the preflight: nothing reaches

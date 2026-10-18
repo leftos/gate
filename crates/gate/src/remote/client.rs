@@ -534,6 +534,13 @@ struct Prepared {
     tools: Vec<(String, Reported)>,
 }
 
+/// The versions, `major.minor.patch`, of the builder's installs a routed run uses, as the parity step chose them after
+/// the preflight: its Godot install and its Unreal Engine install, each `None` when none is chosen.
+struct Chosen {
+    godot: Option<String>,
+    unreal: Option<String>,
+}
+
 /// What the snapshot's tree gives the parity check, read before the preflight: the git that listed it, the worktree it
 /// was asked in, the names of its files and submodules, and its `.gate/toolchain.toml`, `None` when it has none or is
 /// a sibling's, which is not read, `Err` with why when it cannot be read or is no regular file, and the Godot versions
@@ -1141,9 +1148,9 @@ impl Attempt<'_, '_> {
             .map(|tree| tree.needs(godot_command))
             .unwrap_or_default();
         let prepared = self.preflight(&location, &needs)?;
-        let godot_version = self.parity(&repos, &snapshots, &trees, &prepared)?;
+        let chosen = self.parity(&repos, &snapshots, &trees, &prepared)?;
         let raised = self.cold_ceiling(prepared.new_tree);
-        // After the preflight, whose installs the Godot version is chosen from.
+        // After the preflight, whose installs the Godot and Unreal Engine versions are chosen from.
         let run = RunCall {
             words: self.call.words,
             subfolder: self.call.subfolder,
@@ -1156,7 +1163,8 @@ impl Attempt<'_, '_> {
             sibling_snapshots: &sibling_snapshots,
             inputs_digest: inputs.as_ref().map(|built| built.digest.as_str()),
             env: self.call.env,
-            godot_version: godot_version.as_deref(),
+            godot_version: chosen.godot.as_deref(),
+            unreal_version: chosen.unreal.as_deref(),
             desktop: self.call.desktop,
         };
         let run_input = payload::input(&self.run_word(&location, &run), sent.manifest.as_deref());
@@ -1727,7 +1735,10 @@ impl Attempt<'_, '_> {
     /// run is not refused; it stays here, refused `parity`, when the builder lists no install, did not list its
     /// installs, or the repo's pins could not be read. A pin no listed install meets is refused as the parity mismatch it
     /// is.
-    fn parity(&mut self, repos: &[Repo], snapshots: &[Snapshot], trees: &[Option<Tree>], prepared: &Prepared) -> Result<Option<String>, End> {
+    ///
+    /// The Unreal Engine version is chosen beside it ([`toolchain::unreal_choice`]): the highest the builder listed that
+    /// meets the main repo's manifest `unreal` pin, none for no pin or any version.
+    fn parity(&mut self, repos: &[Repo], snapshots: &[Snapshot], trees: &[Option<Tree>], prepared: &Prepared) -> Result<Chosen, End> {
         let mut refused = false;
         let main = trees.first().and_then(Option::as_ref);
         let pins_read = main.is_some_and(Tree::godot_pins_read);
@@ -1781,7 +1792,11 @@ impl Attempt<'_, '_> {
         if let Some(warning) = warning {
             self.say(warning);
         }
-        Ok(chosen)
+        let unreal = main.and_then(|tree| toolchain::unreal_required(tree.manifest.as_ref()));
+        Ok(Chosen {
+            godot: chosen,
+            unreal: toolchain::unreal_choice(unreal.as_deref(), &prepared.tools),
+        })
     }
 
     /// What the builder lacks for the repository `repo`, at `at` in the run's order, whose `snapshot` has the tree

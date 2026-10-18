@@ -25,8 +25,8 @@ use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
 use crate::boxside::payload::ordinal_upper;
 use crate::boxside::preflight::locate;
 use crate::boxside::run::{
-    Beat, FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS, Request, Stopper, WaitEnd, Watched, Watching, before_the_job, end_job,
-    said_stopped,
+    Beat, FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS, Request, Stopper, UE_ROOT, WaitEnd, Watched, Watching, before_the_job,
+    end_job, said_stopped,
 };
 use crate::boxside::stop::{restore_job_name, terminate_and_wait};
 use crate::console::Console;
@@ -162,11 +162,17 @@ enum Restored {
     Ended(u32),
 }
 
-/// The launch of `dotnet tool restore` in `place`, the `dotnet` found on the box's `PATH` and the box's own
-/// environment given; else why it cannot be launched.
+/// The environment a tool restore runs with, the box's own `inherited` less `UE_ROOT`, as no restore is given an
+/// engine the run did not choose.
+fn restore_variables(inherited: Variables) -> Variables {
+    inherited.without(UE_ROOT)
+}
+
+/// The launch of `dotnet tool restore` in `place`, the `dotnet` found on the box's `PATH` and the environment
+/// [`restore_variables`] makes of the box's own given; else why it cannot be launched.
 fn restore_launch(place: &Path) -> Result<PipedLaunch, String> {
     let dotnet = locate("dotnet")?.ok_or_else(|| gate_win32::win32_message(ERROR_FILE_NOT_FOUND))?;
-    let variables = Variables::from_process();
+    let variables = restore_variables(Variables::from_process());
     let environment = variables.block().map_err(|error| format!("cannot build its environment: {error}"))?;
     let words: Vec<OsString> = RESTORE_WORDS.into_iter().map(OsString::from).collect();
     match written(&dotnet, &words, &variables) {
@@ -299,7 +305,16 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use super::{hash, manifests, tools_line};
+    use super::{hash, manifests, restore_variables, tools_line};
+    use crate::environment::Variables;
+
+    /// A tool restore never sees a `UE_ROOT` the box inherited.
+    #[test]
+    fn a_tool_restore_s_environment_holds_no_ue_root() {
+        let variables = restore_variables(Variables::from_process().with("UE_ROOT", r"C:\stale\UE_5.0"));
+
+        assert_eq!(variables.get("UE_ROOT"), None);
+    }
 
     /// A folder for one test, removed when it ends.
     struct Scratch(PathBuf);

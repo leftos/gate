@@ -12,6 +12,7 @@ use gate_router::work_folder_key;
 use gate_state::v1::{self, WarmRecord, WarmState};
 use jiff::Timestamp;
 
+use crate::remote_client::fake_unreal_install;
 use crate::support::{
     ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, Go, Outcome, PREFLIGHT_SEAMS_VARIABLE, STEPS_VARIABLE, build_version, calls, finish,
     git, ssh_steps, wait_until_closed, write_remote_json,
@@ -71,13 +72,100 @@ fn path_with_git(folders: &[PathBuf]) -> OsString {
 }
 
 /// `gate check` with `extra` in the repo, its `PATH` the `folders` then git's folder and no `GATE_GODOT_ROOT`, so the
-/// godot probe reads that `PATH` alone.
+/// godot probe reads that `PATH` alone, nor `GATE_UNREAL_ROOT`, so this machine's own engines are never read.
 fn check(case: &Case, folders: &[PathBuf], extra: &[&str]) -> Outcome {
     let args: Vec<&str> = ["check"].iter().chain(extra).copied().collect();
     let mut command = case.gate_in(REPO, &args);
     command.env("PATH", path_with_git(folders));
     command.env_remove("GATE_GODOT_ROOT");
+    command.env_remove("GATE_UNREAL_ROOT");
     finish(command)
+}
+
+/// `gate check` of a repo whose manifest is `manifest`, with `GATE_UNREAL_ROOT` the folder `root` holding one fake
+/// engine per version of `versions`, each in the folder named for it, its `PATH` git's folder alone.
+fn check_unreal(case: &Case, manifest: &str, root: &Path, versions: &[&str]) -> Outcome {
+    write(case, ".gate/toolchain.toml", manifest);
+    fs::create_dir_all(root).expect("the unreal root can be made");
+    for version in versions {
+        fake_unreal_install(&root.join(version), version);
+    }
+    let mut command = case.gate_in(REPO, &["check"]);
+    command.env("PATH", path_with_git(&[]));
+    command.env_remove("GATE_GODOT_ROOT");
+    command.env("GATE_UNREAL_ROOT", root);
+    finish(command)
+}
+
+/// A pinned engine the root lists is ok, judged exactly on the parts the pin gives.
+#[test]
+fn check_a_pinned_unreal_the_root_lists_is_ok() {
+    let case = repo_case("check_unreal_ok");
+    let root = case.folder().join("unreal");
+
+    let outcome = check_unreal(&case, "[tools]\nunreal = \"5.8\"\n", &root, &["5.8.0"]);
+
+    assert_eq!(
+        lines(&outcome.stdout)[1..],
+        ["check: here: unreal 5.8.0 ok (needs 5.8 exactly)", "check: here: nothing missing"],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+/// A pinned engine the root holds only at another version is missing, though that version is later.
+#[test]
+fn check_a_pinned_unreal_at_another_version_is_missing() {
+    let case = repo_case("check_unreal_other_version");
+    let root = case.folder().join("unreal");
+
+    let outcome = check_unreal(&case, "[tools]\nunreal = \"5.8\"\n", &root, &["5.9.0"]);
+
+    assert_eq!(
+        lines(&outcome.stdout)[1..],
+        [
+            "check: here: unreal missing (needs 5.8 exactly: 5.9.0)",
+            "check: here: 1 missing, 0 too old"
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// With no `GATE_UNREAL_ROOT` on this PC the engine is not checked here, which counts as neither missing nor skipped.
+#[test]
+fn check_an_unreal_pin_without_a_root_says_not_checked_here() {
+    let case = repo_case("check_unreal_no_root");
+    write(&case, ".gate/toolchain.toml", "[tools]\nunreal = \"5.8\"\n");
+
+    let outcome = check(&case, &[], &[]);
+
+    assert_eq!(
+        lines(&outcome.stdout)[1..],
+        [
+            "check: here: unreal not checked here: GATE_UNREAL_ROOT is not set",
+            "check: here: nothing missing"
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+/// A root inside the repo is refused as a Godot root inside it is, though it holds an engine.
+#[test]
+fn check_an_unreal_root_inside_the_repo_is_refused() {
+    let case = repo_case("check_unreal_root_inside");
+    let root = case.folder().join(REPO).join("unreal");
+
+    let outcome = check_unreal(&case, "[tools]\nunreal = \"\"\n", &root, &["5.8.0"]);
+
+    let said = format!("check: here: unreal skipped: {} lies inside the worktree", root.display());
+    assert_eq!(
+        lines(&outcome.stdout)[1..],
+        [said.as_str(), "check: here: nothing missing (1 skipped)"],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
 }
 
 /// Every stub tool answering at a version past the minimums the cases declare.

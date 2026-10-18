@@ -31,7 +31,7 @@ use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
 use crate::boxside::payload::{escaped, ordinal_upper};
 use crate::boxside::preflight::{is_real_folder, locate};
 use crate::boxside::run::{
-    Beat, FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, Folders, Look, REFUSED_STATUS, Request, Stopper, WaitEnd, Watched, Watching, WorkGit,
+    Beat, FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, Folders, Look, REFUSED_STATUS, Request, Stopper, UE_ROOT, WaitEnd, Watched, Watching, WorkGit,
     before_the_job, end_job, full_path, said_stopped, with_safe_directory,
 };
 use crate::boxside::stop::{packages_job_name, terminate_and_wait};
@@ -503,13 +503,20 @@ enum Installed {
     Ended(u32),
 }
 
-/// The launch of `{program} install --frozen-lockfile` in `folder`: the `program` found on the box's `PATH`, the box's
-/// own environment with git's `safe.directory` set to `*` over it as the command's is ([`with_safe_directory`]) and
-/// `CI=true` over that, and the restricted token the command gets; else why it cannot be launched.
+/// The environment a package install runs with, made of the box's own `inherited`: `UE_ROOT` removed, as no install
+/// is given an engine the run did not choose, git's `safe.directory` set to `*` over it as the command's is
+/// ([`with_safe_directory`]), and `CI=true` over that.
+fn install_variables(inherited: Variables) -> Variables {
+    with_safe_directory(inherited.without(UE_ROOT)).with("CI", "true")
+}
+
+/// The launch of `{program} install --frozen-lockfile` in `folder`: the `program` found on the box's `PATH`, the
+/// environment [`install_variables`] makes of the box's own, and the restricted token the command gets; else why it
+/// cannot be launched.
 fn install_launch(program: &str, folder: &Path) -> Result<PipedLaunch, String> {
     let found = locate(program)?.ok_or_else(|| gate_win32::win32_message(ERROR_FILE_NOT_FOUND))?;
     let token = RestrictedToken::of_this_process().map_err(|error| format!("cannot make its restricted token: {error}"))?;
-    let variables = with_safe_directory(Variables::from_process()).with("CI", "true");
+    let variables = install_variables(Variables::from_process());
     let environment = variables.block().map_err(|error| format!("cannot build its environment: {error}"))?;
     let words: Vec<OsString> = INSTALL_WORDS.into_iter().map(OsString::from).collect();
     match written(&found, &words, &variables) {
@@ -791,7 +798,19 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use super::{BUN, Found, PNPM, Record, hash, is_command, lockfile_folder, record_key, same_place, start_folder, start_named, start_word};
+    use super::{
+        BUN, Found, PNPM, Record, hash, install_variables, is_command, lockfile_folder, record_key, same_place, start_folder, start_named, start_word,
+    };
+    use crate::environment::Variables;
+
+    /// An install never sees a `UE_ROOT` the box inherited, and still gets `CI=true`.
+    #[test]
+    fn a_package_install_s_environment_holds_no_ue_root() {
+        let variables = install_variables(Variables::from_process().with("UE_ROOT", r"C:\stale\UE_5.0"));
+
+        assert_eq!(variables.get("UE_ROOT"), None);
+        assert_eq!(variables.get("CI"), Some(std::ffi::OsStr::new("true")));
+    }
 
     #[test]
     fn lockfile_folders_are_one_place_whatever_their_letter_case() {

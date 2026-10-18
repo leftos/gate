@@ -136,6 +136,9 @@ pub(super) struct Request<'a> {
     /// The version of the Unreal Engine install the run uses, `UnrealVersion`, `major.minor.patch`; `None` when none is
     /// chosen.
     unreal: Option<&'a str>,
+    /// The run's own folders no Unreal Engine root may lie inside, as the preflight's probe refuses them
+    /// ([`preflight::refused_folders`]).
+    refused: Vec<PathBuf>,
     /// The outputs the run brings back, `None` when it has no output globs.
     outputs: Option<Asked<'a>>,
     /// The run's `Nonce`, which its start marker and its refusal tags name.
@@ -185,6 +188,7 @@ impl Request<'_> {
         let env = caller_env(payload)?;
         let godot = payload.godot_version()?;
         let unreal = payload.unreal_version()?;
+        let refused = preflight::refused_folders(payload, work);
         let inputs_digest = payload.inputs_digest()?;
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
         let (main, siblings) = repos(payload, work, bare, snapshot)?;
@@ -203,6 +207,7 @@ impl Request<'_> {
             env,
             godot,
             unreal,
+            refused,
             outputs,
             nonce,
             timeout,
@@ -1293,7 +1298,7 @@ fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> 
     let exe = std::env::current_exe().map_err(|error| Err(failed(console, &format!("the box's own path cannot be read: {error}"))))?;
     let job = handed_job(request.job, gate_win32::own_session());
     let (variables, found) = resolved_command(request.godot, word, command_variables(&request.env, &run, &job, &exe), one.place);
-    let variables = match with_unreal(request.unreal, variables) {
+    let variables = match with_unreal(request.unreal, &request.refused, variables) {
         Ok(variables) => variables,
         Err(line) => {
             console.err(&line);
@@ -1401,22 +1406,23 @@ fn resolved_command(godot: Option<&str>, word: &str, variables: Variables, place
 }
 
 /// The variable a command of a run with a chosen Unreal Engine version reads the engine folder it resolved from.
-const UE_ROOT: &str = "UE_ROOT";
+pub(super) const UE_ROOT: &str = "UE_ROOT";
 
 /// The environment `variables` of a command of a run whose chosen Unreal Engine version is `unreal`. With a version,
 /// `UE_ROOT` is set over every other value they hold for it, the caller's having been refused, to the install of that
-/// version under the box's `GATE_UNREAL_ROOT` ([`probe::installed_unreal`]); with no version, every value they hold for
-/// it is removed, so an inherited one never passes for the gate's. `Err` with the line
-/// `gate: could not resolve unreal <version>: <why>` when the version does not resolve. The command's first word is
-/// never read.
-fn with_unreal(unreal: Option<&str>, variables: Variables) -> Result<Variables, String> {
+/// version under the box's `GATE_UNREAL_ROOT`, a root lying inside none of the run's folders `refused`
+/// ([`probe::installed_unreal`]); with no version, every value they hold for it is removed, so an inherited one never
+/// passes for the gate's. `Err` with the line `gate: could not resolve unreal <version>: <why>` when the version does
+/// not resolve. The command's first word is never read.
+fn with_unreal(unreal: Option<&str>, refused: &[PathBuf], variables: Variables) -> Result<Variables, String> {
     let Some(version) = unreal else {
         return Ok(variables.without(UE_ROOT));
     };
+    let worktrees: Vec<&Path> = refused.iter().map(PathBuf::as_path).collect();
     let installed = variables
         .get(probe::UNREAL_ROOT)
         .ok_or_else(|| format!("{} is not set", probe::UNREAL_ROOT))
-        .and_then(|root| probe::installed_unreal(root, version));
+        .and_then(|root| probe::installed_unreal(root, version, &worktrees));
     match installed {
         Ok(folder) => Ok(variables.with(UE_ROOT, &folder.to_string_lossy())),
         Err(why) => Err(format!("gate: could not resolve unreal {version}: {why}")),
