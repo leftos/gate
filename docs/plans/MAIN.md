@@ -4,6 +4,7 @@
 
 ## Do first
 
+- [ ] GATE-480 Keep a load-only pause case from failing the full suite: wallSeconds short of the critical wait — Urgent · No project
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [ ] GATE-427 Route herdr-gpui's Credential Manager tests and godot-mcp's GL tests over the desktop route — High · Remote
@@ -12,6 +13,13 @@
 - [/] GATE-440 Map and trial routing all of herdr-gpui's, yaat-server's and agent-park's heavy work — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [!] GATE-451 Make herdr-gpui's WSL command families routable to the builder — High · Remote
+- [!] GATE-468 Route Unreal Engine packaging to the builder with an unreal toolchain pin — High · No project
+- [ ] GATE-469 Carry Git LFS content to the builder in a routed run — High · No project
+- [ ] GATE-472 Map and trial routing ue-mcp's heavy work — High · No project
+- [ ] GATE-473 Restore npm packages on the box before a routed npm or npx command — High · No project
+- [ ] GATE-474 Read the .gate files of a repo that cannot commit them from a PC-owned folder — High · No project
+- [ ] GATE-477 Release the builder's work folder when the PC's routed gate is killed — High · No project
+- [ ] GATE-478 Run a routed command's bare bash as Git Bash, not WSL's System32 bash.exe — High · No project
 
 ## Remote
 
@@ -202,3 +210,10 @@
 - [ ] GATE-457 Close the slim launcher's leftover edge cases
 - [ ] GATE-458 Make gate cutover's flag lines true now that the launcher ignores the flag
 - [ ] GATE-459 Fix the rare job-query overflow that fails a run's end
+
+## No project
+
+- [ ] GATE-470 Keep a routed command's git config out of the box's elevated git calls
+- [ ] GATE-471 Prune each repo's LFS store on the builder
+- [ ] GATE-475 Apply the probe's root checks when a run resolves its Godot install
+- [ ] GATE-479 Say why the box probe left an install out of its listing
