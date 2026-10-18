@@ -157,10 +157,13 @@ fn assert_wait_left_out(text: &str) {
     );
 }
 
-/// Asserts that the release line `case`'s journal holds for the gate `pid`, whose own passed line ends `text`, left the
-/// wait behind the critical request out of its `wallSeconds`: that wait is most of the run, so the wall seconds less
-/// the paused ones are at most half the passed line's wall seconds, whatever the machine's load.
-fn assert_release_less_paused(case: &Case, pid: u32, text: &str) {
+/// Asserts that the release line `case`'s journal holds for the gate `pid`, whose own passed line ends `text`, left out of
+/// its `wallSeconds` at least half of `waited`: the stretch the case itself saw the child wait behind the critical
+/// request, from its pause marker seen to its second still-waiting line, with the critical gate holding throughout. The
+/// parent counts paused time sample by sample, so each edge of the pause can lose at most one sample interval; the
+/// gates' start-up and the child's take and exit after the release, which load stretches without bound, are never
+/// compared. The passed line's whole seconds round the wall time half to even, so the wall is taken half a second short.
+fn assert_release_less_paused(case: &Case, pid: u32, text: &str, waited: Duration) {
     let (wall, _) = passed_seconds(text);
     let wall = u32::try_from(wall).map(f64::from).expect("a passed line's wall seconds fit in 32 bits");
     let released = events(case)
@@ -168,9 +171,12 @@ fn assert_release_less_paused(case: &Case, pid: u32, text: &str) {
         .find(|event| event["event"] == "release" && event["pid"] == pid)
         .expect("the gate journalled its release");
     let released_wall = released["wallSeconds"].as_f64().expect("the release has its wall seconds");
+    let left_out = wall - 0.5 - released_wall;
+    let waited = waited.as_secs_f64();
     assert!(
-        released_wall * 2.0 <= wall,
-        "the release's wallSeconds leave out the wait behind the critical request ({released_wall} s of {wall} s): {released}"
+        left_out * 2.0 >= waited,
+        "the release's wallSeconds leave out the wait behind the critical request: at least {left_out:.3} s of {wall} s left \
+         out, under half the {waited:.3} s the case saw the child wait: {released}"
     );
 }
 
@@ -376,12 +382,14 @@ fn a_parent_whose_child_waits_behind_a_critical_request_is_not_stalled() {
     wait_until("the pause marker of the waiting child, naming a child that runs", || {
         marker_of(&case, parent_pid, parent_start).is_some_and(|marker| started(marker.pid) == Some(marker.start_ms))
     });
+    let marker_seen = Instant::now();
 
     // The child's second still-waiting line is 12 s into its wait, over two of the parent's stall windows; a parent
     // that ended before the line was said is the failure this case is about, so the wait ends with it either way.
     wait_until("the child's still-waiting line said again, or the parent ending", || {
         child_stderr(&case, "parent.log").matches(STILL_WAITING).count() >= 2 || !parent.is_running()
     });
+    let waited = marker_seen.elapsed();
     let waited_out = parent.is_running();
 
     let_go(&go);
@@ -393,7 +401,7 @@ fn a_parent_whose_child_waits_behind_a_critical_request_is_not_stalled() {
         "a parent whose child waits behind a critical request is not stalled: {outcome:?}"
     );
     assert_wait_left_out(&outcome.stdout);
-    assert_release_less_paused(&case, parent_pid, &outcome.stdout);
+    assert_release_less_paused(&case, parent_pid, &outcome.stdout, waited);
     assert_passed(&critical.finish());
 }
 
