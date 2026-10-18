@@ -149,7 +149,7 @@ After the list, each scan says, in this order:
 - `gate: cutover: cannot read <n> claim or ticket file(s) under <LOCALAPPDATA>\gate; they are not waited on`, said once;
 - `gate: cutover: still waiting for <n> PowerShell gate(s) (<s> s)` every 30 s from the start of the drain, while gates remain.
 
-The drain ends only when every scan across a 5 s confirmation window finds no gate; a scan that finds one resets the window. Ctrl+C prints `gate: cutover: interrupted; the flag stays set, and running gate cutover again resumes the wait` and exits 0xC000013A. A rerun resumes; the take-back is deleting the flag by hand.
+The drain ends only when every scan across a 5 s confirmation window finds no gate; a scan that finds one resets the window. Ctrl+C prints `gate: cutover: interrupted; the flag stays set, and running gate cutover again resumes the wait` and exits 0xC000013A. A rerun resumes; the take-back is reinstalling the previous commit ([Cutover](#cutover)).
 
 Test-seams builds accept hidden options on `cutover`: `--test-poll-ms`, `--test-heartbeat-ms`, `--test-confirm-ms` and the switch `--test-cutover-interrupt-after-list` (raises the interrupt once the first list is printed). `--test-print-request` prints `{"mode":"cutover","localAppData":...,"testSeams":{"pollMs","heartbeatMs","confirmMs","interruptAfterList"}}`.
 
@@ -817,7 +817,7 @@ The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Criti
 - The reason a file is unreadable is one of `not JSON: <message>`, `not JSON: not UTF-8`, `duplicate key "<key>"`, `missing key "v"`, `unknown format v <value>`, `not a JSON object`, the message of the missing key or wrong type, or the io error. It is the `<reason>` of the gate's ignore line.
 - `gate-state` is the one implementation of every format; `gate.exe` and ops-tower both use it, and its fixtures (`crates/gate-state/tests/state/fixtures/`) are the reference examples. The strict rules above are the `gate_state::v1` module's, the formats `gate.exe` writes.
 
-  The crate's other readers (`claims.rs`, `state.rs` and the counts reader beside `v1`) read the PowerShell gate's files leniently, and ops-tower uses them while the cutover flag does not exist. ops-tower follows the flag: its `StateInputs.generation` (`Generation::PowerShell` or `Generation::V1`) is looked up on every `live_inputs()` call from `%LOCALAPPDATA%\gate\cutover.flag`, the switch the launcher uses ([Cutover](#cutover)).
+  The crate's other readers (`claims.rs`, `state.rs` and the counts reader beside `v1`) read the PowerShell gate's files leniently, and ops-tower uses them while the cutover flag does not exist. ops-tower follows the flag: its `StateInputs.generation` (`Generation::PowerShell` or `Generation::V1`) is looked up on every `live_inputs()` call from `%LOCALAPPDATA%\gate\cutover.flag` ([Cutover](#cutover)).
 
   In the `PowerShell` generation the state and the history read `%LOCALAPPDATA%\gate\`; in `V1` they read `%LOCALAPPDATA%\gate\v1\`, and a missing `v1\` folder is an empty state.
 
@@ -2863,7 +2863,7 @@ The default root's mutex names are the PowerShell gate's, so a PowerShell gate s
 
 1. Before it runs, ops-tower's Gates tab already writes the default root's `slot-counts.json` (`%LOCALAPPDATA%\gate\v1\`) on every edit, through `gate-state`'s writer, since `gate.exe` never reads the PowerShell gate's `%LOCALAPPDATA%\gate\slot-counts.json` ([Counts file](#counts-file)).
 
-   `gate cutover` copies the PowerShell gate's slot counts into the default root's `slot-counts.json`, so both generations count the same slots, then writes `%LOCALAPPDATA%\gate\cutover.flag`, holding its write time in RFC 3339 UTC (the launcher never reads it). The PowerShell launcher in each repo reads the flag, and from then on every new gate runs `gate.exe` through the compatibility layer.
+   `gate cutover` copies the PowerShell gate's slot counts into the default root's `slot-counts.json`, so both generations count the same slots, then writes `%LOCALAPPDATA%\gate\cutover.flag`, holding its write time in RFC 3339 UTC (the launcher never reads it). The launcher in each repo hands every call to the installed `gate.exe` through the compatibility layer, flag or no flag ([The launcher's hand-over](#the-launchers-hand-over)).
 2. It then waits until every PowerShell gate's claims and tickets in `%LOCALAPPDATA%\gate\` are gone or stale, naming on stderr what it still waits on, and exits 0 once none is left. The drain of the PowerShell gates (`powershell_gates`) reads claims and tickets only and probes no mutex; a pid whose start cannot be read counts as live.
 
    Under the default root a slot a live PowerShell claim holds counts once.
@@ -2874,7 +2874,7 @@ The default root's mutex names are the PowerShell gate's, so a PowerShell gate s
 
    It ends only when every scan across a 5 s confirmation window finds no gate, because the PowerShell gate deletes its ticket when it takes a slot and writes its claim up to about 2 s later, and a single empty scan could fall in that gap. The lines are in [`gate cutover`](#gate-cutover).
 
-   It ends by printing the flag's path and saying that deleting it goes back to the PowerShell gate: that is the take-back, by hand, so it works even when `gate.exe` is what is broken. A `gate cutover` stopped part way is run again: the rerun rewrites the flag and goes back to waiting, and it copies the slot counts only when the default root's `slot-counts.json` is absent, so a Gates-tab edit made since is kept.
+   It ends by printing the flag's path and saying that deleting it goes back to the PowerShell gate. That line is stale: the launcher never reads the flag and the PowerShell gate is gone, so the take-back is reinstalling the previous commit (`tools/install.ps1` from it). A `gate cutover` stopped part way is run again: the rerun rewrites the flag and goes back to waiting, and it copies the slot counts only when the default root's `slot-counts.json` is absent, so a Gates-tab edit made since is kept.
 
    The copy never replaces: the file is written beside the target and hard-linked into place, so one that appears meanwhile wins, and a target that exists but cannot be read is kept too.
 
@@ -2882,13 +2882,21 @@ The default root's mutex names are the PowerShell gate's, so a PowerShell gate s
 
 ### The launcher's hand-over
 
-The launcher is claude-config's `tools/gate/gate-launcher.ps1`, which `sync-launchers.ps1` copies into each repo as `tools/gate.ps1`; the hand-over is built there, and this repo's black-box cases run the synced copy.
+The launcher is this repo's `tools/gate.ps1` (`#requires -Version 7.3`), a slim pass-through to `gate.exe`; the black-box cases run it as checked in. It reads no flag.
 
-- The flag is `%LOCALAPPDATA%\gate\cutover.flag`. Its existence is the switch; its content is not read. `--state-dir` and `GATE_STATE_DIR` do not move it.
-- With the flag present, the launcher runs `%LOCALAPPDATA%\gate\bin\gate.exe` with the caller's words, waits for it, and exits with its whole status. It says nothing of its own: gate.exe's lines are the whole output. A Ctrl+C reaches both; the launcher waits for gate.exe to end and exits with its status.
-- The words go through as the caller gave them, `-StopTree` included (the compatibility layer parses it). An in-session call whose `--` PowerShell's parser ate gets it put back before the first command word, which the launcher already finds (`Read-Argument`).
-- With the flag present and `gate.exe` missing, nothing runs: the launcher says `gate: the cutover flag is set but {exe} is missing; reinstall with tools/install.ps1` on stderr and exits 127.
-- With the flag absent, the launcher runs the PowerShell gate as before.
+- It hands over to the first `gate.exe` that exists:
+  - A non-empty `GATE_BOX_EXE` is the only candidate. It must be a fully qualified existing file; otherwise the launcher says `gate: GATE_BOX_EXE names <value>, which is not a gate.exe here` on stderr and exits 127.
+  - Else `<root>\gate\bin\gate.exe`, where `<root>` is `GATE_LAUNCHER_PROGRAM_FILES` when set and non-empty, else `ProgramFiles`. The override exists for tests, since Windows resets `ProgramFiles` in every process.
+  - Else `%LOCALAPPDATA%\gate\bin\gate.exe`.
+- It waits for gate.exe and exits with its whole status. It says nothing of its own: gate.exe's lines are the whole output. A Ctrl+C reaches both; the launcher waits for gate.exe to end and exits with its status.
+- The words go through as the caller gave them, `-StopTree` included (the compatibility layer parses it), and the subcommands (`run`, `stop-tree`, `push`, ...) go as they came. An in-session call whose `--` PowerShell's parser ate gets it put back before the command, for both the compatibility spelling (`-Log ...`) and the `run --log ...` spelling, with split `-p:` colon words rejoined.
+- With no `gate.exe` found, the launcher says `gate: no gate.exe found; running the command without slots or watchdog` on stderr and runs the command directly, with the command's own status:
+  - With a `--`, the command is the words after it; only `-Cd`/`--cd` and `-Env`/`--env` are read before it. Colon words are rejoined only when no `--` was found.
+  - `-Env` variables are restored afterwards. A `GATE_` name is refused with `gate: -Env cannot set GATE_ names: <name>` and exit 2.
+  - A `-Cd` folder that cannot be entered gives `gate: cannot enter the -Cd folder <folder>: <reason>` and exit 2.
+  - A command that is not found or throws gives `gate: <message>` and exit 1.
+  - `-StopTree <pid>`, `-StopTree:<pid>` and `stop-tree <pid>` give `gate: no gate.exe found; cannot stop the tree of <pid>` and exit 1.
+  - With no command, `gate: missing the command: put it after --, e.g. -- dotnet test` and four usage lines on stderr, exit 2.
 
 Callers that start the PowerShell gate without the launcher (inventory section 4) are moved by the caller sweep.
 
@@ -2898,9 +2906,9 @@ ops-tower follows the flag: it reads the PowerShell gate's files until the flag 
 
 The caller sweep deletes each repo's `tools/gate.ps1` in the same change that switches that repo's docs and scripts to `gate run`; no hand-over shim is kept. Callers write `gate run --log <path> --timeout <s> --slot <kind> -- <command>` (`--stall`, `--tail`, `--no-markers`, `--local`; `gate stop-tree <pid>`), never `gate.exe` or a path. `tools/install.ps1` builds with a plain `cargo build`, not through a gate, so a broken installed gate can always be replaced.
 
-After the caller sweep there is no fallback: callers run `gate ...` on PATH, a machine without it gets "command not found", and each repo's docs name the install script. Before the sweep, the PowerShell launcher's own fallback for a machine without the gate (H2) is the launcher's, not `gate.exe`'s.
+After the caller sweep there is no fallback: callers run `gate ...` on PATH, a machine without it gets "command not found", and each repo's docs name the install script. Before the sweep, the launcher's direct run on a machine without the gate is the launcher's, not `gate.exe`'s.
 
-The compatibility layer is deleted once no caller uses `-Log`, `-TimeoutSeconds` or `-Slot`. The guard launcher stays: `sync-launchers.ps1` publishes both launchers.
+The compatibility layer is deleted once no caller uses `-Log`, `-TimeoutSeconds` or `-Slot`. The guard launcher stays.
 
 ## Crate layout
 
@@ -3099,12 +3107,12 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   - `exit-before-hello` exits 13 before saying hello, `hang` answers nothing and waits until the pipe goes away (13) or its own done limit passes (18), the longest limit it keeps, so a box that keeps its message limit gives up first, and `wrong-version` says the build `0.0.0+fault`.
   - `lie-handle` reports the child's thread handle value as `process` (the real pid and thread), and `exit-after-create` creates its child, leaves it suspended and exits 19.
 - **No fixture from the checkout path.** No routing pattern, expected path or assertion is derived from where the repo is checked out; a case builds its own repository and routing file in its root. `checkout::repo_file` is the one route to a checked-in file (the install script), never for a path or pattern a case asserts on.
-- **Launcher cases** (GATE-41): `crates/gate/tests/suite/launcher.rs` has 8 cases. They run the synced `tools/gate.ps1`. A case's `LOCALAPPDATA` is its `appdata` folder, whose `gate\v1` is the default root with the real slot names, so every such case also sets `GATE_STATE_DIR` to a non-default folder. The flag-unset case points the launcher at a stub canonical gate through `CLAUDE_CONFIG_DIR`. A new suite module that calls `repo_file` updates the callers pin in `checkout.rs`.
+- **Launcher cases** (GATE-41): `crates/gate/tests/suite/launcher.rs` has 20 cases. They run the checked-in `tools/gate.ps1`. A case's `LOCALAPPDATA` is its `appdata` folder, whose `gate\v1` is the default root with the real slot names, so every such case also sets `GATE_STATE_DIR` to a non-default folder, and its `GATE_LAUNCHER_PROGRAM_FILES` is an empty folder of its own, so the machine's installed gate is never found. They compare the hand-over with the same words run directly; the no-gate cases pin the command's own status and the launcher's lines. A new suite module that calls `repo_file` updates the callers pin in `checkout.rs`.
 - **Cutover cases** (GATE-9): `crates/gate/tests/suite/cutover.rs` has 15 cases: the counts copy, the flag, the refused words and the printed request, and six over the drain. A live PowerShell gate is a `fake-tool wait` child whose claim or ticket, written by `support::write_powershell_claim` or `write_powershell_ticket` under `support::powershell_folder`, carries the child's real pid and start time; a stale one names a pid that has ended or a start that differs from the running process's.
 
   The six cases wait on a live claim and name it, wait on a live ticket and name its command line, ignore stale claims and tickets, name a late arrival, resume after an interrupt, and run the launcher's hand-over after a finished cutover.
 
-  They use the launcher cases' helpers (`stub_claude`, `install_gate`, `run_launcher`, `run_direct`). Their waits are ordering-only: `Running::wait_for_stderr_while_running` returns the stderr once the line is there and the gate has not exited, and no case asserts how long anything took.
+  They use the launcher cases' helpers (`install_gate`, `run_launcher`, `run_direct`). Their waits are ordering-only: `Running::wait_for_stderr_while_running` returns the stderr once the line is there and the gate has not exited, and no case asserts how long anything took.
 - **A packaged app the command starts.** `stall::a_stall_kill_ends_a_packaged_app_the_command_started` runs only where the first `pwsh` on PATH is the Store's (WindowsApps) alias, and skips elsewhere. To tell whether a process is in the gate's job, `IsProcessInJob(h, NULL)` and the job's `TotalProcesses` answer in one run; `winget --version` under `cmd` is the packaged reproducer on Windows 11 and Server 2025.
 - **Running it.** The suite is a test target with `required-features = ["test-seams"]`, run through the gate with `cargo test --workspace --profile test-release --all-features`. Without the feature (no `--all-features`) cargo skips the suite silently.
 

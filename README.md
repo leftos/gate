@@ -22,7 +22,7 @@ For a repo with a `.gate/warmup.toml` or `remote.json` consent to warm-ups, it a
 
 `gate burn [--cores <n>] --seconds <s>` spins the CPU on `n` threads for up to 180 s, for the load-burn tool, and ends early if the process that started it ends. `gate expect -- <command>` prints the expected time of a command in the current folder, here and on each builder, from the durations store, or `no history`; the launcher maps no `-Expect`, so callers run `gate.exe expect -- <command>` directly.
 
-`gate cutover` copies the PowerShell gate's slot counts, writes the cutover flag so new gates start `gate.exe`, and waits for the PowerShell gates still running; deleting the flag by hand goes back. It succeeds a PowerShell gate its author runs today, which stays in use until gate can take its place.
+`gate cutover` copies the PowerShell gate's slot counts, writes the cutover flag that ops-tower reads, and waits for the PowerShell gates still running. Each repo's `tools/gate.ps1` hands every call to the installed `gate.exe`, and runs the command directly where none is installed. It succeeds a PowerShell gate its author runs today, which stays in use until gate can take its place.
 
 ## How it will work
 

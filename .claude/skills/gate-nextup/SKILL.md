@@ -114,7 +114,7 @@ The landing's report names the installed version and each builder's result line.
 
 A push that fails is reported in the landing's report and never undoes the local install; the next reinstall pushes again. A landing that changes only dormant code (the Rust remote client under `test-seams`) waits for the checkpoint, where one install and one push cover them.
 
-The install is safe while gates run (rename-aside). A bad build is taken back by reinstalling the previous commit, or by deleting `%LOCALAPPDATA%\gate\cutover.flag`.
+The install is safe while gates run (rename-aside). A bad build is taken back by reinstalling the previous commit.
 
 ## Repo traps
 

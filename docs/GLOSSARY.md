@@ -49,7 +49,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Critical gate**: a gate run with `--slot critical`, which takes every heavy slot and every light slot but the beside allowance and runs its command at High priority.
 - **Critical request**: a critical gate's queued ticket and run, from its arrival until it releases the machine; critical requests run one at a time in arrival order.
 - **Cutover**: switching a machine's gates from the PowerShell gate to `gate.exe`; `gate cutover` runs the local one.
-- **Cutover flag**: the file `%LOCALAPPDATA%\gate\cutover.flag`, whose existence tells the PowerShell launcher to hand every call to `gate.exe`, and ops-tower's state to read `gate.exe`'s files.
+- **Cutover flag**: the file `%LOCALAPPDATA%\gate\cutover.flag`, whose existence tells ops-tower's state to read `gate.exe`'s files; the launcher does not read it.
 - **Cutover sweep**: the later change of every calling repo from the PowerShell launcher to `gate` on PATH, after which the PowerShell gate is deleted.
 - **Delete pending**: a file marked for deletion when its last handle closes (the classic delete, not the POSIX one `fs::remove_file` takes); until then its name stays listed and every open or delete of it is refused with access denied, so the gate passes it over as going away.
 - **Deny-only**: the state of a token group that still matches deny entries in an access check but no longer matches allow entries; a routed command's token holds the ssh logon's NETWORK group so.
@@ -200,7 +200,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Sync-back**: applying the files a routed command changed on the builder to the PC's worktree, refused when the worktree changed during the run; a pair's is all or nothing across its repos, applying only the back commits the box's back commits line names.
 - **Tagged line**: a `gate-remote-<tag>: ...` line the box writes on stderr for the client: `started`, `refused`, `heartbeat`, `outputs`, `killed` (the box killed the command, naming the run's nonce and `timed-out` or `backstop`) and `adjusted` (naming the run's nonce and the load-adjusted seconds the box counted).
 - **Take**: a gate acquiring its slot, journalled as `take`; **release** is letting it go, journalled as `release` before the slot is freed.
-- **Take-back**: returning a machine to the PowerShell gate by deleting the cutover flag by hand, which works even when `gate.exe` is what is broken.
+- **Take-back**: undoing a bad install by reinstalling the previous commit with `tools/install.ps1`; the PowerShell gate it once returned to is gone.
 - **Test map**: [test-map.md](test-map.md), which maps each source area to the suite modules and unit tests that reach it, as nextest filtersets; a step's proving loop runs only those, and so does an item's last gate in test mode `unstable`.
 - **Test mode**: the `gate-nextup` profile's `test mode: unstable|stable` line; `unstable` runs each item's reached tests and the full suite before a push or reinstall, `stable` runs the full suite for every item.
 - **Test seam**: a hidden `--test-*` flag, compiled only with the `test-seams` cargo feature, by which the suite sets a timing knob or prints the parsed request.

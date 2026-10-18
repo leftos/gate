@@ -11,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 
-use crate::launcher::{install_gate, lines, refused_words, run_direct, run_launcher, stub_claude, stub_words};
+use crate::launcher::{install_gate, lines, refused_words, run_direct, run_launcher};
 use crate::routing::CONTROL_C_EXIT;
 use crate::support::{
     Case, FAKE_TOOL, Running, USAGE, assert_in_order, finish, powershell_folder, shown, write_powershell_claim, write_powershell_ticket,
@@ -335,11 +335,8 @@ fn cutover_then_the_launcher_hands_over() {
     let cutover = case.run(&CUTOVER);
     assert_eq!(cutover.code, Some(0), "{cutover:?}");
     let exe = install_gate(&case);
-    let words = stub_words(&case);
-    let config = stub_claude(&case, &words);
-
-    let handed = run_launcher(&case, &config, &refused_words());
-    let direct = run_direct(&exe, &case, &config, &refused_words());
+    let handed = run_launcher(&case, &refused_words());
+    let direct = run_direct(&exe, &case, &refused_words());
 
     assert_eq!(handed.code, Some(2), "{handed:?}");
     assert_eq!(handed.code, direct.code, "{handed:?} against {direct:?}");
@@ -348,7 +345,6 @@ fn cutover_then_the_launcher_hands_over() {
         lines(&direct.stderr),
         "not the status and output gate.exe gives directly"
     );
-    assert!(!words.exists(), "the canonical gate ran: the launcher did not hand over");
 }
 
 #[test]
