@@ -9,6 +9,11 @@
 - [ ] GATE-427 Route herdr-gpui's Credential Manager tests and godot-mcp's GL tests over the desktop route — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [/] GATE-425 Install the builder's gate.exe and desktop helper in an admin-owned folder — High · Remote
+- [/] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
+- [/] GATE-440 Map and trial routing all of herdr-gpui's, yaat-server's and agent-park's heavy work — High · Remote
+- [/] GATE-441 Explore running a commit's prek hooks on the builder — High · Remote
+- [ ] GATE-442 Extend a routed run's timeout when its work folder is cold, and tell the caller to prewarm — High · Remote
+- [ ] GATE-443 Say --cd when a heavy command works in another worktree — High · Remote
 
 ## Remote
 
@@ -110,6 +115,8 @@
 - [ ] GATE-430 Check the unverified review findings on the bun install and desktop routing code
 - [ ] GATE-431 Warn when a routed run drops a variable the repo declares its commands read
 - [ ] GATE-435 Check whether the SourceRevisionId stamp makes a routed script's builds and direct dotnet builds rebuild each other
+- [ ] GATE-437 Say when a routed run took the desktop route
+- [ ] GATE-438 Stop the elevated ssh session trusting the builder user's profile (bare pwsh, HKCU environment, cmd AutoRun)
 
 ## Cutover sweep
 
