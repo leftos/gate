@@ -61,8 +61,8 @@ use super::transport::{Program, Transport, Wire};
 use super::watchdog::{self, Cut, Kept, Kill, LINE_CAP};
 use super::worktree_lock::{self, Folder, Locked, Wait};
 use super::{
-    BoxKill, FAILED, FAILED_RUN, KeyWait, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, Split, WarmEnd, Warmth, adjusted_prefix,
-    killed_line, refused_line, started_line,
+    BoxKill, FAILED, FAILED_RUN, INSTALL_UNTRUSTED, KeyWait, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, Split, WarmEnd, Warmth,
+    adjusted_prefix, install_why, killed_line, refused_line, started_line,
 };
 use crate::boxside::outputs::{NAMES_SKIPPED, OUTPUTS_BUDGET};
 use crate::boxside::payload::{PairRefused, Payload, escaped};
@@ -1499,9 +1499,14 @@ impl Attempt<'_, '_> {
         let boot = boot_time(&called.lines).map(str::to_owned);
         let sdks = sdks_of(&called.lines);
         let tools = toolchain::reported(&called.lines, &sent);
+        let host = self.call.host;
+        let not_installed = install_refused(host, &called);
         self.lines.append(&mut called.lines);
         self.not_started_if_killed("the preflight", &called)?;
-        let host = self.call.host;
+        if let Some(line) = not_installed {
+            self.say(line);
+            return Err(End::Refused(FallbackReason::Install));
+        }
         match called.status {
             0 => {}
             SSH_FAILED => {
@@ -2092,6 +2097,10 @@ impl Attempt<'_, '_> {
             }
             Err(end) => return Err(end),
         };
+        let not_installed = run_install_refused(self.call.host, &called);
+        // The run call's refusal tag for its install is followed by the box's install line, which the client turns into
+        // the same `gate check --builder` line the preflight and inputs paths say. Read before the call's lines are kept.
+        let tagged = install_tag_refusal(self.call.host, called.lines.iter().chain(&called.last_error).map(String::as_str));
         let kept = self.lines.len();
         self.lines.append(&mut called.lines);
         let output = kept..self.lines.len();
@@ -2117,10 +2126,26 @@ impl Attempt<'_, '_> {
             return Ok(End::Refused(FallbackReason::Unreachable));
         }
         if self.go_on().is_err() {
-            self.stop_after_ctrl_c(location);
+            // A refused install started nothing, and the stop call would be refused by the same tripwire.
+            if not_installed.is_none() {
+                self.stop_after_ctrl_c(location);
+            }
             return Err(End::Interrupted);
         }
-        Ok(status_end(&called, output))
+        // The box refused before it read the run's request, so there is nothing to stop.
+        if let Some(line) = not_installed {
+            self.say(line);
+            return Ok(End::Refused(FallbackReason::Install));
+        }
+        let end = status_end(&called, output);
+        // The box refused the run for its install with its `install` tag instead: say the same line the call's plain
+        // refusal says, so `gate check --builder` is pointed at on both paths.
+        if matches!(end, End::Refused(FallbackReason::Install))
+            && let Some(line) = tagged
+        {
+            self.say(line);
+        }
+        Ok(end)
     }
 
     /// Makes a call with `make` and, when it failed before the banner and its job did not write more than 1 MiB, says
@@ -2339,6 +2364,10 @@ impl Attempt<'_, '_> {
             attempt.ssh(BoxVerb::Inputs, Echo::LogOnly, watch, raise, only)
         })?;
         self.lines.extend(called.lines.iter().cloned());
+        if let Some(line) = install_refused(self.call.host, &called) {
+            self.say(line);
+            return Err(End::Refused(FallbackReason::Install));
+        }
         Ok(called)
     }
 
@@ -3989,6 +4018,50 @@ fn version_refusal(host: &str, theirs: Option<&str>, ours: &str) -> Option<Strin
     other_build(theirs, ours).map(|shown| format!("gate: not routed: {host} runs gate {shown}, this PC {ours}; run gate push"))
 }
 
+/// The line refusing a builder `host` whose box refused its install in the call `called`: one that exited 1 having
+/// said [`INSTALL_UNTRUSTED`] before any start marker ([`install_refusal`]); `None` for any other call, and for one
+/// past the start marker, which a command's own output may have said.
+fn install_refused(host: &str, called: &Called) -> Option<String> {
+    if called.started {
+        return None;
+    }
+    install_refusal(host, called.status, called.lines.iter().chain(&called.last_error).map(String::as_str))
+}
+
+/// [`install_refused`] for the run call, whose lines before the start marker relay the work folder's checkout, restore
+/// and hooks: the plain line counts only as the call's one line, as the box says it when it refuses before reading the
+/// run's request. Once it has read it, the box refuses for its install with the run's `install` refusal tag instead.
+fn run_install_refused(host: &str, called: &Called) -> Option<String> {
+    if called.lines.len() != 1 {
+        return None;
+    }
+    install_refused(host, called)
+}
+
+/// The line refusing a builder `host` whose box refused its install: its call exited [`INSTALL_STATUS`] with one of
+/// `said`, the lines it wrote, starting [`INSTALL_UNTRUSTED`] ([`install_why`]); `None` for any other call. The box's
+/// why is shown escaped.
+fn install_refusal<'a>(host: &str, status: i32, said: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    Some(install_refusal_line(host, install_why(status, said)?))
+}
+
+/// The line refusing a builder `host` whose gate install is not trusted, for `why`; the line the preflight's plain
+/// refusal and the run call's `install` tag both end in ([`install_refusal`], [`install_tag_refusal`]).
+fn install_refusal_line(host: &str, why: &str) -> String {
+    format!(
+        "gate: not routed: {host}'s gate is not installed where only administrators can change it ({}); run gate check --builder",
+        escaped(why)
+    )
+}
+
+/// The line refusing a builder `host` whose run call was refused with the run's `install` tag: the box's
+/// [`INSTALL_UNTRUSTED`] line said after the tag, shown escaped; `None` when the box said none. The call ends at 75, not
+/// [`INSTALL_STATUS`], so [`install_refusal`] does not read it.
+fn install_tag_refusal<'a>(host: &str, said: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let why = said.into_iter().find_map(|line| line.strip_prefix(INSTALL_UNTRUSTED))?;
+    Some(install_refusal_line(host, git::first_bytes(why, git::FAILURE_BYTES)))
+}
+
 /// The builder's version, `theirs`, as a line shows it when it is not `ours`; `None` when they are the same. A builder
 /// that said no version runs one unknown; one that did is shown by its first 4 KiB, escaped.
 pub(crate) fn other_build(theirs: Option<&str>, ours: &str) -> Option<String> {
@@ -4019,7 +4092,7 @@ enum Protocol {
     Adjusted(f64),
 }
 
-/// The start marker, the five refusal tags, the two kill tags and the adjusted line's prefix of one run, made once for
+/// The start marker, the six refusal tags, the two kill tags and the adjusted line's prefix of one run, made once for
 /// its run call's readers.
 struct ProtocolLines {
     started: String,
@@ -4028,6 +4101,7 @@ struct ProtocolLines {
     layout: String,
     inputs: String,
     desktop: String,
+    install: String,
     timed_out: String,
     backstop: String,
     adjusted: String,
@@ -4043,6 +4117,7 @@ impl ProtocolLines {
             layout: refused_line(nonce, Refusal::Layout),
             inputs: refused_line(nonce, Refusal::Inputs),
             desktop: refused_line(nonce, Refusal::Desktop),
+            install: refused_line(nonce, Refusal::Install),
             timed_out: killed_line(nonce, BoxKill::TimedOut),
             backstop: killed_line(nonce, BoxKill::Backstop),
             adjusted: adjusted_prefix(nonce),
@@ -4060,6 +4135,7 @@ impl ProtocolLines {
             (&self.layout, Protocol::Refused(FallbackReason::Layout)),
             (&self.inputs, Protocol::Refused(FallbackReason::Inputs)),
             (&self.desktop, Protocol::Refused(FallbackReason::Desktop)),
+            (&self.install, Protocol::Refused(FallbackReason::Install)),
             (&self.timed_out, Protocol::Killed(BoxKill::TimedOut)),
             (&self.backstop, Protocol::Killed(BoxKill::Backstop)),
         ]
@@ -4120,13 +4196,14 @@ mod tests {
     use super::{
         Attempt, CallEnd, Called, Capped, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, NonZeroU64, OUTPUTS_BUDGET, OneCall,
         ProtocolLines, Push, Raised, Reader, Reading, RustClient, SSH_FAILED, Shared, Split, Ssh, Unfinished, Watch, Watching, after_loss, boot_time,
-        called_of, console_of, held, is_heartbeat, last_update, local_sdk_listing, path_outside, paused, push_size, relay, relay_raw, relayed_raw,
-        sdks_of, seconds, their_version, version_refusal,
+        called_of, console_of, held, install_refusal, install_refused, install_tag_refusal, install_why, is_heartbeat, last_update,
+        local_sdk_listing, path_outside, paused, push_size, relay, relay_raw, relayed_raw, run_install_refused, sdks_of, seconds, their_version,
+        version_refusal,
     };
     use super::{CSPROJ_BYTES, CSPROJ_FILES, Entry, csproj_pins, entries_of, manifest_entry};
     use super::{KeyHold, RunEnd, Warm, hold_key, hold_key_waiting, is_cold, status_end, warm_end, warm_of};
     use crate::environment::Variables;
-    use crate::remote::git::{DOTNET_LIMIT, GIT_LIMIT, Git, GitError};
+    use crate::remote::git::{self, DOTNET_LIMIT, GIT_LIMIT, Git, GitError};
     use crate::remote::held::tests::{Pair, junction};
     use crate::remote::outputs;
     use crate::remote::payload;
@@ -4136,6 +4213,7 @@ mod tests {
     use crate::remote::transport::{Local, Transport};
     use crate::remote::watchdog::{self, Kill, LOG_CAP};
     use crate::remote::worktree_lock::tests::{held_elsewhere, lock_name};
+    use crate::remote::{INSTALL_UNTRUSTED, install_untrusted_line};
     use crate::remote::{Refusal, RemoteCall, RemoteClient, Sibling, WarmEnd, Warmth, adjusted_line, busy_line, carried, refused_line, started_line};
     use crate::run::CONTROL_C_EXIT;
     use gate_state::v1::WarmFailure;
@@ -6235,6 +6313,109 @@ mod tests {
         assert_eq!(
             version_refusal("builder", None, "0.1.0"),
             Some("gate: not routed: builder runs gate unknown, this PC 0.1.0; run gate push".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_box_that_refuses_its_own_install_is_not_routed_with_its_why() {
+        let not_routed = |why: &str| {
+            format!("gate: not routed: builder's gate is not installed where only administrators can change it ({why}); run gate check --builder")
+        };
+        let why = r"C:\gate\gate.exe is owned by S-1-5-21-1, not SYSTEM";
+        let refusal = format!("{INSTALL_UNTRUSTED}{why}");
+        let said = [r"gate: remote created D:\gate-remote\app.git", refusal.as_str()];
+
+        assert_eq!(install_refusal("builder", 1, said), Some(not_routed(why)));
+        assert_eq!(install_refusal("builder", 2, said), None, "only status 1 is the refusal");
+        assert_eq!(
+            install_refusal("builder", 1, ["gate: remote failed"]),
+            None,
+            "another failure keeps its line"
+        );
+        let control = format!("{INSTALL_UNTRUSTED}a\u{1b}b");
+        assert_eq!(
+            install_refusal("builder", 1, [control.as_str()]),
+            Some(not_routed(r"a\u{1b}b")),
+            "the box's why is escaped"
+        );
+    }
+
+    #[test]
+    fn an_install_refusal_counts_only_before_the_start_marker() {
+        let refusal = install_untrusted_line("the helper is owned by S-1-5-21-1");
+        let (before, _) = run_call_ended("", &format!("{refusal}\n"), 1, "install-before");
+        let (after, _) = run_call_ended("", &format!("{}\n{refusal}\n", started_line(NONCE)), 1, "install-after");
+
+        assert!(install_refused("builder", &before).is_some(), "a refusal before the start falls back");
+        assert_eq!(
+            install_refused("builder", &after),
+            None,
+            "a command's own line after the start is its output"
+        );
+    }
+
+    /// On the run call, the plain line counts only as the call's one line: the box says it so when it refuses before
+    /// reading the request, and relayed checkout, restore or hook output before the marker cannot forge it.
+    #[test]
+    fn relayed_output_before_the_run_s_marker_is_not_an_install_refusal() {
+        let refusal = install_untrusted_line("the helper is owned by S-1-5-21-1");
+        let (alone, _) = run_call_ended("", &format!("{refusal}\n"), 1, "install-alone");
+        let (relayed, _) = run_call_ended("Restored app.csproj\n", &format!("{refusal}\n"), 1, "install-relayed");
+        let (relayed_last, _) = run_call_ended("", &format!("{refusal}\ngate: remote checkout failed\n"), 1, "install-relayed-last");
+
+        assert!(run_install_refused("builder", &alone).is_some(), "the tripwire's one line falls back");
+        assert_eq!(run_install_refused("builder", &relayed), None, "a line with other output is relayed");
+        assert_eq!(run_install_refused("builder", &relayed_last), None, "a line the box followed is relayed");
+        assert!(
+            install_refused("builder", &relayed).is_some(),
+            "a preflight or inputs call reads any of its lines"
+        );
+    }
+
+    /// The box's refusal tag for its install, bound to the run's nonce, is the run's `install` refusal at its 75, and
+    /// the client points at `gate check --builder` just as it does for the plain refusal.
+    #[test]
+    fn the_run_s_install_tag_is_an_install_refusal() {
+        let tag = refused_line(NONCE, Refusal::Install);
+        assert_eq!(tag, format!("gate-remote-refused: {NONCE} install"));
+        let why = "the helper is owned by S-1-5-21-1";
+        let line = install_untrusted_line(why);
+        let (called, _) = run_call_said("", &format!("{tag}\n{line}\n"), "install-tag");
+
+        assert_eq!(called.refusal(), Some(FallbackReason::Install));
+        assert!(matches!(status_end(&called, 0..0), End::Refused(FallbackReason::Install)));
+        assert_eq!(
+            install_tag_refusal("builder", called.lines.iter().chain(&called.last_error).map(String::as_str)),
+            Some(format!(
+                "gate: not routed: builder's gate is not installed where only administrators can change it ({why}); run gate check --builder"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_builder_s_why_is_cut_to_the_failure_bytes() {
+        let long = format!("{INSTALL_UNTRUSTED}{}", "x".repeat(git::FAILURE_BYTES + 10));
+        assert_eq!(install_why(1, [long.as_str()]).map(str::len), Some(git::FAILURE_BYTES));
+    }
+
+    #[test]
+    fn a_ctrl_c_by_the_time_the_run_call_refused_its_install_ends_the_run_interrupted() {
+        let log = unwritten_log();
+        let call = call(&log);
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+        let line = install_untrusted_line("the helper is owned by S-1-5-21-1");
+
+        let ended = attempt.run_call_made(&location(), Limits::for_tests(), |_| Ok(ended_with(1, &line)));
+
+        assert!(
+            matches!(ended, Err(End::Interrupted)),
+            "an interrupt, not the install fallback: {ended:?}"
+        );
+        assert!(
+            !stopped(&attempt),
+            "a refused install started nothing, so nothing is stopped: {:?}",
+            attempt.lines
         );
     }
 

@@ -353,6 +353,8 @@ pub(super) fn send(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &s
         Ok(()) => Ok(()),
         Err(Unsent::Ended(End::Interrupted)) => Err(End::Interrupted),
         Err(Unsent::Ended(End::Failed(why)) | Unsent::Refused(why)) => Err(refused(attempt, &why)),
+        // The box refused for its install, its line said: the run falls back for that, not for its inputs.
+        Err(Unsent::Ended(End::Refused(FallbackReason::Install))) => Err(End::Refused(FallbackReason::Install)),
         Err(Unsent::Ended(End::Refused(reason))) => Err(refused(attempt, &format!("the inputs call ended {}", reason.as_str()))),
         Err(Unsent::Ended(other)) => Err(End::Failed(format!(
             "the inputs call ended {}, which no inputs call does",

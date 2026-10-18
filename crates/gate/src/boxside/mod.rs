@@ -20,13 +20,17 @@ mod run;
 mod stop;
 mod tools;
 
+use std::fs;
 use std::io::{self, BufRead, Read};
+use std::path::Path;
 
 use gate_args::{BoxRequest, BoxVerb};
+use gate_desktop::version::build_version;
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::boxside::payload::Payload;
 use crate::console::Console;
+use crate::remote::{INSTALL_STATUS, install_untrusted_line};
 
 /// The most bytes the request line on stdin may take, its newline included.
 const REQUEST_LIMIT: u64 = 16 * 1024 * 1024;
@@ -41,6 +45,16 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
         console.err(&format!("gate: the box cannot limit its DLL search to System32: {error}"));
         return u32::from(FAILED_STATUS);
     }
+    // Before any verb runs or stdin is read: an elevated box any other process of its user could replace is refused.
+    if let Err(why) = own_image_trusted() {
+        // The preflight says its version line first, so a PC client of another version falls back on the version rather
+        // than a bare status 1.
+        if matches!(request.verb, BoxVerb::Preflight) {
+            console.out(&format!("gate: remote version {}", build_version()));
+        }
+        console.err(&install_untrusted_line(&why));
+        return u32::from(INSTALL_STATUS);
+    }
     let seams = &request.seams;
     match request.verb {
         // A verb with no request never reads stdin, which the push script that runs it keeps for its own files.
@@ -52,6 +66,40 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
         BoxVerb::Outputs => with_request(console, outputs::outputs),
         BoxVerb::Inflight => with_request(console, inflight::inflight),
         BoxVerb::Inputs => with_request(console, |payload, console| inputs::inputs(payload, seams, console)),
+    }
+}
+
+/// The test seam that makes a build with the `test-seams` feature judge its install, when it is `check`.
+const TRUST_SEAM: &str = "GATE_TEST_BOX_TRUST";
+
+/// Whether the box judges its install: its own image, and at the preflight the desktop helper beside it.
+///
+/// A build with the `test-seams` feature judges it only when [`TRUST_SEAM`] is `check`: the suite's boxes run from
+/// `target\`, a folder this user owns, which the check refuses. A build without the feature always judges it, with no
+/// switch read at run time.
+pub(crate) fn judges_trust() -> bool {
+    !cfg!(feature = "test-seams") || std::env::var(TRUST_SEAM).as_deref() == Ok("check")
+}
+
+/// `Ok` when the box's own program is installed where only an administrator can change it
+/// ([`gate_win32::check_installed_file`]), or the box does not judge its install ([`judges_trust`]); else why not, or
+/// why its path cannot be read.
+fn own_image_trusted() -> Result<(), String> {
+    if !judges_trust() {
+        return Ok(());
+    }
+    let image = std::env::current_exe().map_err(|error| format!("the box's own path cannot be read: {error}"))?;
+    gate_win32::check_installed_file(&image).map_err(|why| why.to_string())
+}
+
+/// `Ok` when no desktop helper is at `helper`, or it is installed where only an administrator can change it
+/// ([`gate_win32::check_installed_file`]); else why not. The preflight and the desktop run's hand-off share this one
+/// judge, so they cannot disagree: a builder with no helper runs no desktop run, which the hand-off refuses as a
+/// desktop refusal; only a helper that is there and not trusted is an `install` refusal.
+pub(crate) fn helper_trusted(helper: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(helper) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        _ => gate_win32::check_installed_file(helper).map_err(|why| why.to_string()),
     }
 }
 

@@ -394,7 +394,7 @@ Plus unit tests: task XML, `Arg0` parsing, the why texts, and a security-descrip
 
 ## 7. Items for the plan and the docs
 
-- **Pre-existing, for the backlog (GATE-271 territory):** ssh runs `%LOCALAPPDATA%\gate\bin\gate.exe` elevated on the builder, but the default profile ACL lets any Medium process of the builder user replace it. The ACL is unmeasured on the builder.
+- **Addressed by GATE-425:** ssh used to run a `gate.exe` elevated from a folder any Medium process of the builder user could write. `gate push` now installs into the admin-owned `C:\Program Files\gate\bin`, and the box refuses every verb when its own image or the helper is not installed where only administrators and SYSTEM can change them (design.md, "Install tripwire"). The user's own Medium processes stay outside the boundary (I1): they cannot replace the trusted install, and anything else they can do is what I1 already grants them.
 - **Glossary terms:** desktop command, desktop helper, desktop task, console session, session 0.
 - **ARCHITECTURE.md:** the Task Index row the map proposed. Integration Footguns:
   - the desktop wait counts against the client's backstop;

@@ -5977,3 +5977,60 @@ fn box_run_whose_msys_keeper_does_not_answer_says_so_once_and_runs_the_command()
         "{outcome:?}"
     );
 }
+
+/// `gate box` with `args` after `box` and `GATE_TEST_BOX_TRUST=check`, run to its end with its stdin left open and
+/// empty, so a box that read it would never end.
+fn box_judging_its_image(case: &Case, args: &[&str]) -> Outcome {
+    let mut words = vec!["box"];
+    words.extend_from_slice(args);
+    let mut command = bare_box_command(case, &words);
+    command.env("GATE_TEST_BOX_TRUST", "check");
+    let (running, stdin) = start_with_stdin(command);
+    let outcome = running.finish();
+    drop(stdin);
+    outcome
+}
+
+#[test]
+fn a_box_whose_own_image_this_user_owns_refuses_every_verb() {
+    let case = Case::new("box_image_untrusted");
+    let gate = Path::new(env!("CARGO_BIN_EXE_gate"));
+    let prefix = "gate: the builder's gate install is not trusted: ";
+
+    for args in [&["preflight", "--stdin"][..], &["--test-box-register", "ok", "register-desktop"][..]] {
+        let outcome = box_judging_its_image(&case, args);
+
+        assert_eq!(outcome.code, Some(1), "{args:?}: {outcome:?}");
+        // The preflight says its version line first, so a PC client of another version falls back on the version rather
+        // than a bare status 1; every other verb says nothing on stdout.
+        let version = format!("gate: remote version {}\n", build_version(&case));
+        let expected = if args[0] == "preflight" { version.as_str() } else { "" };
+        assert_eq!(outcome.stdout, expected, "{args:?}: {outcome:?}");
+        let line = outcome.stderr.strip_suffix('\n').unwrap_or(&outcome.stderr);
+        assert!(!line.contains('\n'), "one line: {args:?}: {outcome:?}");
+        let why = line.strip_prefix(prefix).map(str::to_lowercase);
+        // The object at fault is gate.exe itself or a folder above it, named by its final path.
+        let named = why.is_some_and(|why| {
+            gate.ancestors()
+                .any(|object| why.starts_with(&format!("{} ", object.display()).to_lowercase()))
+        });
+        assert!(named, "the refusal names the gate or a folder above it: {args:?}: {outcome:?}");
+    }
+}
+
+/// The preflight's install refusal says its version line first, so a PC client of another version falls back on the
+/// version rather than a bare status 1.
+#[test]
+fn the_preflights_install_refusal_says_the_version_line_first() {
+    let case = Case::new("box_preflight_install_version_first");
+
+    let outcome = box_judging_its_image(&case, &["preflight", "--stdin"]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, format!("gate: remote version {}\n", build_version(&case)), "{outcome:?}");
+    assert!(
+        outcome.stderr.starts_with("gate: the builder's gate install is not trusted: "),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr.lines().count(), 1, "one install line after the version line: {outcome:?}");
+}

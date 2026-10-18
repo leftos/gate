@@ -15,6 +15,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsHandle, BorrowedHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
+use std::sync::PoisonError;
 use std::time::{Duration, Instant};
 
 use gate_args::BoxSeams;
@@ -41,7 +42,7 @@ use crate::boxside::run::{
     stopped_before_start, wait_for_path, watch,
 };
 use crate::console::Console;
-use crate::remote::started_line;
+use crate::remote::{Refusal, install_untrusted_line, refused_line, started_line};
 
 /// Why the helper did not start when it never connected its control pipe within the connect limit.
 const NO_CONNECT: &str = "it did not connect in time";
@@ -104,6 +105,16 @@ impl Here<'_, '_> {
     /// Refuses the run for the box's own machinery, as `why` says.
     fn machinery(&self, why: String, console: &mut Console) -> DesktopEnd {
         self.refused(DesktopRefusal::Machinery(why), console)
+    }
+
+    /// Refuses the run, before anything starts, because the desktop helper is not installed where only administrators
+    /// can change it, as `why` says: the run's `install` refusal tag, bound to its nonce, then the box's install line,
+    /// said together under the output lock, so the PC runs the command itself and journals the fallback `install`.
+    fn untrusted(&self, why: &str, console: &mut Console) -> DesktopEnd {
+        let _held = self.beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        console.err(&refused_line(self.request.nonce, Refusal::Install));
+        console.err(&install_untrusted_line(why));
+        DesktopEnd::Refused
     }
 
     /// The stop signal's handle, which ends every wait of the hand-off.
@@ -222,6 +233,9 @@ pub(super) fn hand_off(here: &Here<'_, '_>, console: &mut Console) -> Result<Ran
 /// started, or one that is not the box's, has its pipe dropped and is never ended through its pid.
 fn pinned_helper(here: &Here<'_, '_>, job: &Job, console: &mut Console) -> Result<(Pinned, Option<Job>), DesktopEnd> {
     let user = gate_win32::current_user_sid().map_err(|error| here.machinery(with_error(USER_UNREAD, &error), console))?;
+    let image =
+        helper_image(here.beat.seams).map_err(|error| here.machinery(format!("the desktop helper's path cannot be read: {error}"), console))?;
+    helper_trusted(here.beat.seams, &image).map_err(|why| here.untrusted(&why, console))?;
     let server = PipeServer::create(PIPE_PREFIX, &user, pipe_owner(here.beat.seams)).map_err(|error| {
         here.refused(
             DesktopRefusal::HelperDidNotStart(format!("the control pipe cannot be made: {error}")),
@@ -231,8 +245,6 @@ fn pinned_helper(here: &Here<'_, '_>, job: &Job, console: &mut Console) -> Resul
     let Some(argument) = arg0(std::process::id(), server.name()).and_then(|text| TaskArgument::new(&text)) else {
         return Err(here.machinery("the desktop helper's argument cannot be made".to_owned(), console));
     };
-    let image =
-        helper_image(here.beat.seams).map_err(|error| here.machinery(format!("the desktop helper's path cannot be read: {error}"), console))?;
     let image_identity = identity_of(&image).map_err(|error| here.machinery(with_error(HELPER_FILE_UNREAD, &error), console))?;
     let Some(before) = crate::escaped::now() else {
         return Err(here.machinery("the system clock cannot be read".to_owned(), console));
@@ -852,6 +864,24 @@ fn helper_image(_seams: &BoxSeams) -> io::Result<PathBuf> {
     gate_desktop::helper_path()
 }
 
+/// `Ok` when the helper's image `image` is installed where only an administrator can change it, or is missing, which
+/// the hand-off refuses below as a desktop refusal ([`crate::boxside::helper_trusted`]), or is the stand-in helper of
+/// the desktop seam, which is not judged; else why not.
+#[cfg(feature = "test-seams")]
+fn helper_trusted(seams: &BoxSeams, image: &Path) -> Result<(), String> {
+    match seams.desktop {
+        Some(_) => Ok(()),
+        None => crate::boxside::helper_trusted(image),
+    }
+}
+
+/// `Ok` when the helper's image `image` is installed where only an administrator can change it, or is missing, which
+/// the hand-off refuses below as a desktop refusal ([`crate::boxside::helper_trusted`]); else why not.
+#[cfg(not(feature = "test-seams"))]
+fn helper_trusted(_seams: &BoxSeams, image: &Path) -> Result<(), String> {
+    crate::boxside::helper_trusted(image)
+}
+
 /// The helper's task started as `task` says ([`gate_win32::run_task`]); under the desktop seam, the answer the seam
 /// names in its place, or the stand-in helper started with the seam's fault and the job that holds it.
 #[cfg(feature = "test-seams")]
@@ -1150,6 +1180,27 @@ mod tests {
             Some(format!("{start} the control pipe failed: broken")),
             "a pipe failure is a refusal"
         );
+    }
+
+    /// A builder with no desktop helper passes the preflight, and the hand-off then refuses it as a desktop run, as it
+    /// did before the install tripwire: only a helper that is there and not trusted is an `install` refusal.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test whose file cannot be read must fail loudly")]
+    fn a_missing_helper_is_a_desktop_refusal_not_an_install_one() {
+        let missing = crate::test_support::temp_dir().join(format!("gate-hand-off-no-helper-{}.exe", std::process::id()));
+        let _ = fs::remove_file(&missing);
+        let seams = gate_args::BoxSeams::default();
+
+        assert_eq!(
+            super::helper_trusted(&seams, &missing),
+            Ok(()),
+            "a missing helper is not a helper that is there and not trusted"
+        );
+
+        let error = identity_of(&missing).expect_err("the missing helper has no identity");
+        let line = DesktopRefusal::Machinery(super::with_error(super::HELPER_FILE_UNREAD, &error)).line();
+        assert!(line.starts_with("gate: not routed: the builder has no desktop session:"), "{line}");
+        assert!(!line.contains(crate::remote::INSTALL_UNTRUSTED), "{line}");
     }
 
     #[test]

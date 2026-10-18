@@ -88,6 +88,8 @@ pub(crate) enum Refusal {
     /// The run asked for the builder's desktop and could not have it: nobody is logged on at the console or it is
     /// locked, another user holds it, or another run held the desktop for the whole wait the run gave.
     Desktop,
+    /// The desktop helper the run would hand its command to is not installed where only administrators can change it.
+    Install,
 }
 
 impl Refusal {
@@ -99,6 +101,7 @@ impl Refusal {
             Refusal::Layout => "layout",
             Refusal::Inputs => "inputs",
             Refusal::Desktop => "desktop",
+            Refusal::Install => "install",
         }
     }
 }
@@ -107,6 +110,33 @@ impl Refusal {
 /// its refusal tag; the PC passes it on as it runs the command itself.
 pub(crate) fn layout_line(repo: &str, why: &str) -> String {
     format!("gate: not routed: the builder could not clear {repo}'s work folder: {why}")
+}
+
+/// What the box says on standard error, before why, when it refuses to act because the builder's gate install is not
+/// trusted: its own program, or the desktop helper a desktop run hands its command to, is not installed where only
+/// administrators can change it. The tripwire over the box's own program says it and exits [`INSTALL_STATUS`] before
+/// any command starts; the hand-off of a desktop run whose helper is not trusted says it after the run's `install`
+/// refusal tag, and the box exits 75. The client and `gate check --builder` read the refusal by this prefix.
+pub(crate) const INSTALL_UNTRUSTED: &str = "gate: the builder's gate install is not trusted: ";
+
+/// The exit status of a box that refused to act with [`INSTALL_UNTRUSTED`].
+pub(crate) const INSTALL_STATUS: u8 = 1;
+
+/// The box's line refusing to act because its install is not trusted for `why`, shown escaped ([`INSTALL_UNTRUSTED`]).
+pub(crate) fn install_untrusted_line(why: &str) -> String {
+    format!("{INSTALL_UNTRUSTED}{}", gate_router::escaped(why))
+}
+
+/// Why the box refused a call for the builder's gate install, cut to [`git::FAILURE_BYTES`]: the call exited
+/// [`INSTALL_STATUS`] and one of `said`, the lines it wrote before any start marker, starts [`INSTALL_UNTRUSTED`];
+/// `None` for any other call. The client and `gate check --builder` both read the refusal through it.
+pub(crate) fn install_why<'a>(status: i32, said: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    if status != i32::from(INSTALL_STATUS) {
+        return None;
+    }
+    said.into_iter()
+        .find_map(|line| line.strip_prefix(INSTALL_UNTRUSTED))
+        .map(|why| git::first_bytes(why, git::FAILURE_BYTES))
 }
 
 /// The start marker the box says on stderr just before it starts the command of the run whose payload carries `nonce`:
@@ -121,7 +151,7 @@ pub(crate) fn started_line(nonce: &str) -> String {
 }
 
 /// The refusal tag the box says on stderr just before the human line of a refusal of the run whose payload carries
-/// `nonce`: `gate-remote-refused: <nonce> busy|tools|layout|inputs|desktop`. The client reads a refusal from this line
+/// `nonce`: `gate-remote-refused: <nonce> busy|tools|layout|inputs|desktop|install`. The client reads a refusal from this line
 /// alone.
 ///
 /// The nonce is no secret, as [`started_line`] says: a command can say this line too, and the client ignores it
@@ -578,7 +608,7 @@ mod scripted {
     /// How often `wait` looks for its path and the interrupt.
     const WAIT_STEP: Duration = Duration::from_millis(20);
     /// Every reason a `refuse` step may give.
-    const REASONS: [FallbackReason; 12] = [
+    const REASONS: [FallbackReason; 13] = [
         FallbackReason::Full,
         FallbackReason::Busy,
         FallbackReason::Unreachable,
@@ -591,6 +621,7 @@ mod scripted {
         FallbackReason::Inputs,
         FallbackReason::Cold,
         FallbackReason::Desktop,
+        FallbackReason::Install,
     ];
 
     #[derive(Debug, PartialEq)]

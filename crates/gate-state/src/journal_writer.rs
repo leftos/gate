@@ -247,6 +247,8 @@ pub enum FallbackReason {
     Cold,
     /// The builder could not give the run its desktop.
     Desktop,
+    /// The builder's gate is not installed where only administrators can change it.
+    Install,
 }
 
 impl FallbackReason {
@@ -266,6 +268,7 @@ impl FallbackReason {
             FallbackReason::Inputs => "inputs",
             FallbackReason::Cold => "cold",
             FallbackReason::Desktop => "desktop",
+            FallbackReason::Install => "install",
         }
     }
 }

@@ -25,7 +25,8 @@ const OTHER_USER: &str = "gate-seam-other-user";
 
 /// How a desktop run that did not run its command ended, its lines said.
 pub(super) enum DesktopEnd {
-    /// The builder's desktop refused it, its `desktop` tag said: 75, and no back commits line.
+    /// The run was refused, its `desktop` tag said, or its `install` tag for a desktop helper that is not trusted: 75,
+    /// and no back commits line.
     Refused,
     /// It ended otherwise, with this status: a stop, a payload's word refused, or the box's own failure.
     Ended(u32),

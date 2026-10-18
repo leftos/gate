@@ -21,12 +21,13 @@ use windows_sys::Win32::Storage::FileSystem::{
 use crate::answer::USAGE_STATUS;
 use crate::boxside::boot;
 use crate::boxside::forward::{ChildPipes, DRAIN, Drained, OutputLock};
+use crate::boxside::helper_trusted;
 use crate::boxside::payload::{Pair, Payload};
 use crate::boxside::probe;
 use crate::boxside::run::{FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_SINGLE};
 use crate::console::Console;
 use crate::environment::Variables;
-use crate::remote::git;
+use crate::remote::{INSTALL_STATUS, git, install_untrusted_line};
 use crate::run::{ERROR_FILE_NOT_FOUND, find_program};
 
 /// The status of a step that failed with no status of its own: git or a folder that could not be made or written.
@@ -68,7 +69,21 @@ pub(crate) fn git_failed(step: &str, code: i32) -> Failed {
 /// Readies the folders the payload's `Bare` and `Work` name, then says the three trailing lines, the SDK list read
 /// within `--test-dotnet-limit-ms` when `seams` gives it, else [`git::DOTNET_LIMIT`], and the tool lines, probed within
 /// `--test-probe-limit-ms` when `seams` gives it, else [`probe::PROBE_LIMIT`]; returns the status.
+///
+/// First, after its version line, it refuses with the install line and [`INSTALL_STATUS`] a desktop helper beside
+/// the box that is not trusted ([`helper_trusted`]), judged as the box's own image is ([`crate::boxside::judges_trust`]),
+/// so a builder whose helper any other process could replace is not routed, and `gate check --builder` says so. The
+/// version line comes first, so a PC client of another version falls back on the version rather than a bare status 1.
 pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
+    if crate::boxside::judges_trust()
+        && let Err(why) = gate_desktop::helper_path()
+            .map_err(|error| format!("the desktop helper's path cannot be read: {error}"))
+            .and_then(|helper| helper_trusted(&helper))
+    {
+        console.out(&format!("gate: remote version {}", build_version()));
+        console.err(&install_untrusted_line(&why));
+        return u32::from(INSTALL_STATUS);
+    }
     let read = payload
         .path("Bare")
         .and_then(|bare| Ok((bare, payload.work_folder()?.1, payload.pair()?)));
@@ -922,8 +937,30 @@ mod tests {
 
     use super::{Git, TreeAt, fresh_config, fresh_config_written, git_failed, ready_tree, refused_folders, replace_config, run_forwarded, sdk_list};
     use crate::boxside::forward::OutputLock;
+    use crate::boxside::helper_trusted;
     use crate::boxside::payload::Payload;
     use crate::console::Console;
+
+    #[test]
+    fn no_desktop_helper_is_no_refusal() {
+        let missing = crate::test_support::temp_dir().join(format!("gate-preflight-no-helper-{}.exe", std::process::id()));
+        assert_eq!(helper_trusted(&missing), Ok(()));
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test that cannot make or remove its file must fail loudly")]
+    fn a_desktop_helper_this_user_made_is_refused_naming_it() {
+        let folder = fs::canonicalize(crate::test_support::temp_dir()).expect("the scratch folder's final path can be read");
+        let text = folder.to_string_lossy().into_owned();
+        let helper = PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text)).join(format!("gate-preflight-helper-{}.exe", std::process::id()));
+        fs::write(&helper, "made").expect("the file can be written");
+
+        let why = helper_trusted(&helper);
+
+        fs::remove_file(&helper).expect("the file can be removed");
+        let named = format!("{} ", helper.display());
+        assert!(why.as_ref().is_err_and(|why| why.starts_with(&named)), "{why:?}");
+    }
 
     #[test]
     #[expect(clippy::expect_used, reason = "a test whose git cannot start must fail loudly")]

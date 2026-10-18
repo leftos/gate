@@ -42,6 +42,7 @@ fn registered(seams: &BoxSeams) -> Result<String, String> {
         None => {}
     }
     let helper = gate_desktop::helper_path().map_err(|error| format!("the desktop helper's path could not be read: {error}"))?;
+    gate_win32::check_installed_file(&helper).map_err(|why| why.to_string())?;
     gate_win32::register_task(gate_desktop::TASK_PATH, &helper, &user_sid, Instant::now() + REGISTER_LIMIT).map_err(|error| match error {
         TaskError::TimedOut => format!("the Task Scheduler did not answer in {} s", REGISTER_LIMIT.as_secs()),
         other => other.to_string(),

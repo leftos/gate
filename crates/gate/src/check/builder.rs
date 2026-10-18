@@ -24,7 +24,7 @@ use crate::remote::payload::{self, Location};
 use crate::remote::toolchain::{self, Reported};
 use crate::remote::transport::ssh::Ssh;
 use crate::remote::transport::{Program, Transport, Wire};
-use crate::remote::{BOX_USAGE, CREATED, NOT_RECOGNIZED, SSH_FAILED, Warm, other_build, sdks_of, their_version, warm_of};
+use crate::remote::{BOX_USAGE, CREATED, NOT_RECOGNIZED, SSH_FAILED, Warm, install_why, other_build, sdks_of, their_version, warm_of};
 use crate::route;
 use gate_desktop::version::build_version;
 
@@ -175,11 +175,12 @@ fn builder_warmth(lines: &[String], hash: &str) -> Warmup {
     }
 }
 
-/// What the builder's call said: its exit status, its standard output's lines, and the last line of its standard error
-/// that is not blank.
+/// What the builder's call said: its exit status, its standard output's lines, its standard error's lines, and the last
+/// of those that is not blank.
 struct Heard {
     status: Option<i32>,
     lines: Vec<String>,
+    errors: Vec<String>,
     last_error: Option<String>,
 }
 
@@ -254,14 +255,12 @@ fn not_stopped<'a>(why: &'a str, late: &str, shown: &str) -> Option<&'a str> {
 /// What `output` says, read as text.
 fn heard(output: &ProgramOutput) -> Heard {
     let lines = String::from_utf8_lossy(&output.stdout).lines().map(str::to_owned).collect();
-    let last_error = String::from_utf8_lossy(&output.stderr)
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .map(str::to_owned);
+    let errors: Vec<String> = String::from_utf8_lossy(&output.stderr).lines().map(str::to_owned).collect();
+    let last_error = errors.iter().rev().find(|line| !line.trim().is_empty()).cloned();
     Heard {
         status: output.status.code(),
         lines,
+        errors,
         last_error,
     }
 }
@@ -271,6 +270,13 @@ fn heard(output: &ProgramOutput) -> Heard {
 /// gate build than this PC's; `None` for one that answered.
 fn refusal(host: &str, root: &str, heard: &Heard) -> Option<String> {
     let last = heard.last_error.as_deref().map(|line| git::failure_text(&[line]));
+    let said = heard.lines.iter().chain(&heard.errors).map(String::as_str);
+    if let Some(why) = heard.status.and_then(|status| install_why(status, said)) {
+        return Some(format!(
+            "check: {host}: its gate install is not trusted ({}); reinstall with gate push",
+            escaped(why)
+        ));
+    }
     match heard.status {
         Some(0) => {}
         Some(SSH_FAILED) => {
@@ -387,6 +393,7 @@ mod tests {
     use crate::check::local::{Consent, Declared, SiblingsFile, WarmSources};
     use crate::check::report::{At, Checked, Line, Sdk, Warmup, said};
     use crate::remote::git::GitError;
+    use crate::remote::install_untrusted_line;
     use crate::remote::parity::pin_of;
     use crate::remote::toolchain::{self, Manifest, Pin, Reported, ToolNeed, Version};
     use gate_desktop::version::build_version;
@@ -682,6 +689,7 @@ mod tests {
         Heard {
             status,
             lines,
+            errors: last_error.iter().map(|line| (*line).to_owned()).collect(),
             last_error: last_error.map(str::to_owned),
         }
     }
@@ -732,6 +740,35 @@ mod tests {
         assert_eq!(
             refusal(HOST, root, &heard(Some(3), Vec::new(), None)),
             Some(r"check: builder-1: preparing D:\gate-remote failed (status 3)".to_owned())
+        );
+    }
+
+    /// A box that refused its own install is said as that, with its why, in place of a failed preparation; another
+    /// status with the same line is not that refusal.
+    #[test]
+    fn a_box_that_refuses_its_install_is_said_as_untrusted() {
+        let root = r"D:\gate-remote";
+        let line = install_untrusted_line(r"C:\gate\gate.exe is owned by S-1-5-21-1, not SYSTEM");
+        assert_eq!(
+            refusal(HOST, root, &heard(Some(1), Vec::new(), Some(&line))),
+            Some(
+                r"check: builder-1: its gate install is not trusted (C:\gate\gate.exe is owned by S-1-5-21-1, not SYSTEM); reinstall with gate push"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            refusal(HOST, root, &heard(Some(3), Vec::new(), Some(&line))),
+            Some(format!(r"check: builder-1: preparing D:\gate-remote failed (status 3): {line}"))
+        );
+        let mut followed = heard(Some(1), Vec::new(), Some("ssh: a later line"));
+        followed.errors.insert(0, line);
+        assert_eq!(
+            refusal(HOST, root, &followed),
+            Some(
+                r"check: builder-1: its gate install is not trusted (C:\gate\gate.exe is owned by S-1-5-21-1, not SYSTEM); reinstall with gate push"
+                    .to_owned()
+            ),
+            "every line is read, as the client reads them, not the last alone"
         );
     }
 

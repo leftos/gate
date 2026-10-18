@@ -1512,6 +1512,47 @@ fn a_box_of_another_version_is_not_routed() {
     assert_eq!(builder_ref(&case, &format!("refs/gate/{}", key_of(&events))), "", "nothing was pushed");
 }
 
+/// The real box, judging its own image under `GATE_TEST_BOX_TRUST=check`, refuses the `target\` gate this user owns;
+/// the run falls back to local and says why.
+#[test]
+fn a_builder_whose_gate_is_not_admin_installed_falls_back_to_local() {
+    let case = client_case("client-untrusted-box");
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+    let mut gate = client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here", "exit", "3"]);
+    gate.env("GATE_TEST_BOX_TRUST", "check");
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(3), "the local command's status: {outcome:?}");
+    let refusal = "gate: not routed: builder's gate is not installed where only administrators can change it (";
+    let said = outcome.stderr.lines().find(|line| line.starts_with(refusal));
+    assert!(said.is_some_and(|line| line.ends_with("); run gate check --builder")), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: remote builder install; running here"), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"]);
+    assert_eq!(fallbacks(&events(&case)), ["install"]);
+}
+
+/// A box that passed the preflight and refuses its install at the run call, before the command started, falls back to
+/// local as at the preflight.
+#[test]
+fn a_box_that_refuses_its_install_at_the_run_call_falls_back_to_local() {
+    let case = client_case("client-untrusted-run");
+    let why = r"C:\gate\gate-desktop-helper.exe is owned by S-1-5-21-1, not SYSTEM, Administrators or TrustedInstaller";
+    let refused = format!("say-exit 1 gate: the builder's gate install is not trusted: {why}");
+    let steps = ssh_steps(&case, "ssh", &["ok", &refused]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here", "exit", "3"]));
+
+    assert_eq!(outcome.code, Some(3), "the local command's status: {outcome:?}");
+    let line = format!("gate: not routed: builder's gate is not installed where only administrators can change it ({why}); run gate check --builder");
+    assert!(outcome.stderr.contains(&line), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: remote builder install; running here"), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert_eq!(fallbacks(&events(&case)), ["install"]);
+}
+
 /// A [`client_case`] whose repo declares one sibling the routing file allows, the folder `make` makes beside the case
 /// folder, named after it, and whose routing file gives its repo the output globs `outputs`: the case, its folder name,
 /// the sibling's name and its folder. A sibling an earlier run left is removed first.
