@@ -69,9 +69,10 @@ pub(crate) fn git_failed(step: &str, code: i32) -> Failed {
 }
 
 /// Readies the folders the payload's `Bare` and `Work` name, then says the version and warm lines, [`NEW_WORK_TREE`]
-/// when the work folder of a run of one repo had no `.git` ([`ready_new_tree`]), and the three trailing lines, the SDK
-/// list read within `--test-dotnet-limit-ms` when `seams` gives it, else [`git::DOTNET_LIMIT`], and the tool lines,
-/// probed within `--test-probe-limit-ms` when `seams` gives it, else [`probe::PROBE_LIMIT`]; returns the status.
+/// when the work folder of a run of one repo had no `.git` ([`ready_new_tree`]), the boot line, the path line
+/// [`msys::NO_GIT_BIN`] when no trusted Git `bin` was found for the command's `PATH`, the SDK line, its list read
+/// within `--test-dotnet-limit-ms` when `seams` gives it, else [`git::DOTNET_LIMIT`], and the tool lines, probed
+/// within `--test-probe-limit-ms` when `seams` gives it, else [`probe::PROBE_LIMIT`]; returns the status.
 ///
 /// First, after its version line, it refuses with the install line and [`INSTALL_STATUS`] a desktop helper beside
 /// the box that is not trusted ([`helper_trusted`]), judged as the box's own image is ([`crate::boxside::judges_trust`]),

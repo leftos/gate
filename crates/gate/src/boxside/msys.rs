@@ -153,12 +153,12 @@ fn usr_bin_above(program: &Path) -> Option<PathBuf> {
 }
 
 /// The folder a routed command's `PATH` starts with: `<Git root>\bin` above the `git.exe` the box finds, when the
-/// folder lies outside the run's own folders `refused` — which no folder a command runs from may lie in — and its
-/// [`BASH`] passes [`gate_win32::check_installed_file`], the check the box's own image gets, which refuses a link or
-/// junction, a network share, and a file or folder whose owner or access list lets anyone but SYSTEM, Administrators or
-/// `TrustedInstaller` change what runs from it. The folder returned is the final path's, in its usual form, never the
-/// name as found; the test seam's folder stands in for both checks. `None` otherwise, and the command keeps the
-/// machine `PATH` it would have had.
+/// folder lies outside the run's own folders `refused` — which no folder a command runs from may lie in — and every
+/// file it puts ahead of the machine `PATH` ([`exposed`]) passes [`gate_win32::check_installed_file`], the check the
+/// box's own image gets, which refuses a link or junction, a network share, and a file or folder whose owner or access
+/// list lets anyone but SYSTEM, Administrators or `TrustedInstaller` change what runs from it. The folder returned is
+/// the final path's, in its usual form, never the name as found; the test seam's folder stands in for both checks.
+/// `None` otherwise, and the command keeps the machine `PATH` it would have had.
 pub(super) fn git_bin(git: &Git, refused: &[PathBuf]) -> Option<PathBuf> {
     #[cfg(feature = "test-seams")]
     {
@@ -173,9 +173,41 @@ pub(super) fn git_bin(git: &Git, refused: &[PathBuf]) -> Option<PathBuf> {
         return None;
     }
     let bash = bin.join(BASH);
+    // The launcher first, which judges `bin` itself among the folders above it; only once `bin` passes are its entries
+    // listed, so no file of a folder that failed is read.
     gate_win32::check_installed_file(&bash).ok()?;
+    let root = bin.parent()?;
+    if !trusted(&exposed(&bin, root)?) {
+        return None;
+    }
     let bash = usual(&std::fs::canonicalize(&bash).ok()?)?;
     bash.parent().map(Path::to_path_buf)
+}
+
+/// The files a command's `PATH` starting with `bin` puts ahead of the machine `PATH`: every `.exe` directly in `bin`,
+/// and the files Git's shell runs from the same install, `usr\bin`'s [`BASH`] and [`RUNTIME`] and `mingw64\bin\git.exe`
+/// when that one exists; `None` when `bin` cannot be listed.
+fn exposed(bin: &Path, root: &Path) -> Option<Vec<PathBuf>> {
+    let usr_bin = root.join("usr").join("bin");
+    let mut files = vec![usr_bin.join(BASH), usr_bin.join(RUNTIME)];
+    let mingw_git = root.join("mingw64").join("bin").join("git.exe");
+    if mingw_git.is_file() {
+        files.push(mingw_git);
+    }
+    for entry in std::fs::read_dir(bin).ok()? {
+        let path = entry.ok()?.path();
+        if path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("exe")) {
+            files.push(path);
+        }
+    }
+    Some(files)
+}
+
+/// Whether every file of `files` passes [`gate_win32::check_installed_file`], the check the box's own image gets: a
+/// link or junction, a network share, or a file or folder whose owner or access list lets anyone but SYSTEM,
+/// Administrators or `TrustedInstaller` change what runs from it fails it.
+fn trusted(files: &[PathBuf]) -> bool {
+    files.iter().all(|file| gate_win32::check_installed_file(file).is_ok())
 }
 
 /// Whether the Git `bin` `bin` lies outside every one of the run's own folders `refused`.
@@ -428,8 +460,8 @@ mod tests {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, OpenProcessToken};
 
     use super::{
-        ANSWER_CAP, BASH, KEEPER, MsysKeeper, RUNTIME, TRUSTED_OWNERS, echoed, git_bin, git_bin_above, is_trusted_owner, owner_of, read_answer,
-        sid_text, usr_bin, usr_bin_above, usual,
+        ANSWER_CAP, BASH, KEEPER, MsysKeeper, RUNTIME, TRUSTED_OWNERS, echoed, exposed, git_bin, git_bin_above, is_trusted_owner, outside, owner_of,
+        read_answer, sid_text, trusted, usr_bin, usr_bin_above, usual,
     };
     use crate::boxside::preflight::Git;
     use crate::test_support::temp_dir;
@@ -550,6 +582,88 @@ mod tests {
             None,
             "a folder the run writes is not put first"
         );
+    }
+
+    #[test]
+    fn the_files_a_git_bin_exposes_are_the_ones_checked() {
+        let root = tree(
+            "exposed",
+            &[
+                r"cmd\git.exe",
+                r"usr\bin\cat.exe",
+                r"usr\bin\msys-2.0.dll",
+                r"usr\bin\bash.exe",
+                r"bin\bash.exe",
+                r"bin\git.exe",
+                r"bin\sh.exe",
+                r"bin\notes.txt",
+                r"mingw64\bin\git.exe",
+            ],
+        );
+        let mut files = exposed(&root.join(r"bin"), &root).expect("the bin folder is listed");
+        files.sort();
+        let mut want = vec![
+            root.join(r"usr\bin\bash.exe"),
+            root.join(r"usr\bin\msys-2.0.dll"),
+            root.join(r"mingw64\bin\git.exe"),
+            root.join(r"bin\bash.exe"),
+            root.join(r"bin\git.exe"),
+            root.join(r"bin\sh.exe"),
+        ];
+        want.sort();
+
+        assert_eq!(files, want, "every .exe in bin and the shell's own files, and no other entry");
+    }
+
+    #[test]
+    fn a_git_root_without_a_mingw64_git_exposes_no_such_file() {
+        let root = tree(
+            "exposed-no-mingw",
+            &[r"cmd\git.exe", r"usr\bin\cat.exe", r"usr\bin\msys-2.0.dll", r"bin\bash.exe"],
+        );
+
+        let files = exposed(&root.join(r"bin"), &root).expect("the bin folder is listed");
+
+        assert!(
+            !files.iter().any(|file| file.ends_with(r"mingw64\bin\git.exe")),
+            "no mingw64 git: {files:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_this_user_owns_fails_a_list_of_trusted_files() {
+        let root = tree("trusted-files", &[r"bin\bash.exe", r"bin\extra.exe"]);
+        let system = gate_win32::system_directory().expect("the system folder is found").join("cmd.exe");
+
+        assert!(trusted(std::slice::from_ref(&system)), "a system file passes");
+        assert!(!trusted(&[root.join(r"bin\extra.exe")]), "a file this user owns fails");
+        assert!(
+            !trusted(&[system, root.join(r"bin\extra.exe")]),
+            "one file this user owns fails the whole list"
+        );
+    }
+
+    #[test]
+    fn a_bin_inside_a_refused_folder_is_refused() {
+        let root = tree("outside-inside", &[r"work\bin\bash.exe"]);
+
+        assert!(!outside(&root.join(r"work\bin"), &[root.join("work")]), "a run folder holds the bin");
+    }
+
+    #[test]
+    fn a_bin_outside_every_refused_folder_is_kept() {
+        let root = tree("outside-kept", &[r"git\bin\bash.exe"]);
+
+        assert!(outside(&root.join(r"git\bin"), &[root.join("work")]), "no run folder holds the bin");
+    }
+
+    #[test]
+    fn a_bin_reached_through_a_junction_into_a_refused_folder_is_refused() {
+        let root = tree("outside-junction", &[r"work\bin\bash.exe"]);
+        let link = root.join("link");
+        crate::test_support::junction(&link, &root.join("work"));
+
+        assert!(!outside(&link.join("bin"), &[root.join("work")]), "the link leads into a run folder");
     }
 
     #[test]

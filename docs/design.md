@@ -2274,7 +2274,7 @@ For `run` the payload also needs a `Snapshot` key: exactly 40 lowercase hex char
 
 The value is empty for a missing key or JSON null, the string as given with control characters escaped, and compact JSON for any other non-string. Two differences from the wrapper are deliberate: the echoed value has its control characters escaped, and the check is stricter than the wrapper's .NET `$`, which accepts a trailing newline.
 
-Every path comes from the payload and nothing is written under the gate's state root; `gate box` takes no `--state-dir`. Test seams are `test-seams`-gated flags, never environment variables (but the MSYS keeper's two, below), and sit before the verb (`gate box --test-... run --stdin`) in a `BoxSeams` struct on `BoxRequest`, apart from the `gate run` seams, so `--test-print-request` is unchanged.
+Every path comes from the payload and nothing is written under the gate's state root; `gate box` takes no `--state-dir`. Test seams are `test-seams`-gated flags, never environment variables (but the three below), and sit before the verb (`gate box --test-... run --stdin`) in a `BoxSeams` struct on `BoxRequest`, apart from the `gate run` seams, so `--test-print-request` is unchanged.
 
 The box seams go in any order before the verb, each also as `--<seam>=<value>`. `--test-heartbeat-ms <n>` sets the period of the command heartbeat, and `--test-box-console fail-before` makes the command's UTF-8 console fail before the command starts (the only accepted value, else `gate: --test-box-console must be fail-before, got '<value>'`).
 
@@ -2288,9 +2288,11 @@ The box's ceiling has three seams: `--test-box-sample-ms <n>` replaces the 5 s s
 
 The other four box seams are `--test-outputs-budget-bytes <n>`, which replaces the 50 GiB outputs budget of the box's trim, in bytes, `--test-inputs-budget-bytes <n>`, which replaces the 4 GiB a `gate box inputs` put unpacks, decompressed, in bytes, `--test-dotnet-limit-ms <n>`, which replaces the 30 s bound of the preflight's `dotnet --list-sdks` read, in milliseconds, and `--test-probe-limit-ms <n>`, which replaces the 10 s shared bound of the preflight's tool probes, in milliseconds.
 
-Two seams of the MSYS keeper are environment variables, read only in a `test-seams` build (the installed binary ignores them), because a stand-in is a program plus words.
+Three seams of the MSYS keeper and the command's `PATH` are environment variables, read only in a `test-seams` build (the installed binary ignores them), because a stand-in is a program plus words or a folder the box reads in several places.
 
 `GATE_TEST_BOX_MSYS_KEEPER` is the program and its words, joined with `|`, started in the keeper's place (the lookup and the owner check are skipped; the token, job, console and echo stay), and `GATE_TEST_BOX_MSYS_KEEPER_MS` is the echo limit in milliseconds in place of 30 s (a value that is no whole number is the keeper's why, `GATE_TEST_BOX_MSYS_KEEPER_MS is not a count of milliseconds: <value>`). The suite's `fake-tool` is the stand-in.
+
+`GATE_TEST_BOX_GIT_BIN` is the folder used in place of the trusted Git `bin` at the front of the command's `PATH` (the lookup and the trust check are skipped; a folder inside the run's own folders is still refused), since the suite's boxes run from a folder this user owns.
 
   `GATE_TEST_BOX_TRUST=check` makes a `test-seams` build of `gate box` judge its install (Install tripwire, in [The box side](#the-box-side)); without it such a build does not, since the suite's boxes run from `target\`, a folder this user owns. A build without the feature always judges it. The desktop seam's stand-in helper is not judged.
 
@@ -2338,6 +2340,8 @@ Built verbs:
   It prints on stdout, in order: `gate: remote created <Bare>` (only when it created the bare repo), `gate: remote version <gate version>` (the same text as `gate --version` after `gate `, build id included), `gate: remote warm <64-hex>` or `gate: remote warm none` (the hash in the work folder's warm record `{Work}.warm`, read before the folders are readied; `none` when the main tree's `.git` or the record is missing, or the record is not a plain file holding exactly 64 lower-case hex digits, a line end included), the boot line, `gate: remote sdks <v1,v2|none>`, and one `gate: remote tool <tool> ...` line for each tool of the payload's `Needs` (Tool probes, below); git's own output passes through. A payload without `Bare` or `Work` prints `gate: box payload lacks <key>` and exits 2.
 
   Right after the warm line it prints `gate: remote new work tree` when it laid out the run's own single work tree now, that is when nothing had the name `.git` in the work folder. A pair layout never prints it.
+
+  After the boot line and before the SDK lines it prints `gate: remote path: Git's bin is not trusted here; bash resolves by the machine PATH` when the box finds no trusted Git `bin` for its commands' `PATH` (the command's environment, under the MSYS keeper below). The client relays preflight lines into the log only, so the line never reaches the console.
 - A failing git step prints `gate: remote <step> failed (status <n>)` and exits with that status; a git that cannot start prints `gate: remote <step> failed: <OS message>` and exits 1.
 
   The same `failed: <message>` form covers a config read or write the preflight made itself: `gate: remote git remote add failed: cannot write <config>: <why>`, `gate: remote git remote add failed: cannot open|read <path>: <why>` and `gate: remote git remote add failed: cannot write <config>: config.lock could not be removed: <why>`. The steps are `git init --bare`, `git init`, `git remote add`, `git config core.autocrlf` and `git config core.eol`.
@@ -2674,6 +2678,12 @@ Built verbs:
   A run with an `UnrealVersion` resolves `<GATE_UNREAL_ROOT>\<version>` with the probe's root checks (no link in the root or its ancestors; the root inside none of the run's refused folders; the install's `Build.version` present), once when it reads the request, and sets `UE_ROOT` to it for every command of a plain, warm-up or desktop run, after the caller's pairs and the gate's own settings. When it cannot resolve, the run exits 127 with `gate: could not resolve unreal <version>: <why>`, before any desktop lock.
 
   A run with no `UnrealVersion` removes an inherited `UE_ROOT`. The package restore and the dotnet tool restore run without `UE_ROOT` whatever the box inherited.
+
+  Every command of a plain, warm-up or desktop run gets the trusted Git `bin` at the front of its `PATH`, so a recipe's bare `bash` resolves to Git's own `bash.exe` rather than WSL's in the system folder, and the command's first word resolves on that same `PATH`. The folder is `<Git root>\bin`, the root being the one the MSYS keeper's lookup finds above the box's `git.exe`, and it must hold `bash.exe`. It is used only when it lies outside every folder the run writes (the refused folders of the preflight's SDK read) and every file it puts ahead of the machine `PATH` passes the installed-file check the box's own image gets (`gate_win32::check_installed_file`): no link or junction, no network share, and an owner and access list that let no one but SYSTEM, Administrators or TrustedInstaller change what runs from it.
+
+  Those files are every `.exe` directly in `bin` (listed only after `bin\bash.exe` has passed, which judges `bin` and every folder above it), and the files Git's shell runs from the same install: `usr\bin\bash.exe`, `usr\bin\msys-2.0.dll` and, when it exists, `mingw64\bin\git.exe`. One failing leaves the `PATH` alone. The folder put on the `PATH` is the final path of that `bash.exe`'s folder, in its usual form (no `\\?\` prefix).
+
+  The rest of the `PATH` is kept as it is, inherited entries and a caller's `PATH` pair included. A command with no `PATH` gets one holding only the folder, an empty `PATH` is replaced by it, and a folder already first is not added twice. A folder holding `;` or `"`, which would split or quote the value, and a `PATH` or folder that is not Unicode, leave the `PATH` untouched. With no trusted `bin` the command keeps the `PATH` it would have had and the run says nothing; the preflight says so (`preflight`, above).
 
   The command's environment also gets the box's own names, after the pairs, so no caller can send one (any `GATE_` name is refused): `GATE_BOX_EXE`, the box's own image path, and `GATE_BOX_JOB`, the run's job name. The name is spelled `Global\gate-remote-<key>-<12 hex>` when the box runs in session 0 (an ssh logon, where `Local\` is the global namespace), so a desktop command in the console session reaches the same object, else as created.
 
