@@ -13,11 +13,11 @@ use serde_json::{Value, json};
 use regex::Regex;
 
 use super::{
-    BUN_LOCKFILE, BUN_LOCKFILE_PATH, ENDLESS, Folders, NODE_MODULES_IGNORED, PNPM_LOCKFILE, PNPM_LOCKFILE_PATH, STALE_UE_ROOT, box_call,
-    bun_install_call, command_call, fake_godot, fake_unreal, field, gate_box, godot_root, has_ref, install_call, installs, let_go, lines_starting,
-    marks, pair_payload, pair_snapshot, pair_tree, passed, path_for_bun, path_for_pnpm, pnpm_box, pnpm_calls, refused_line, renamed, run_box,
-    run_box_with_git_bin, run_box_with_godot, run_box_with_seams, run_box_with_unreal, snapshot, started_line, stopped_line_for, stub_bun, stub_pnpm,
-    unreal_root,
+    BUN_LOCKFILE, BUN_LOCKFILE_PATH, ENDLESS, Folders, NODE_MODULES_IGNORED, NPM_LOCKFILE, NPM_LOCKFILE_PATH, PNPM_LOCKFILE, PNPM_LOCKFILE_PATH,
+    STALE_UE_ROOT, box_call, bun_install_call, command_call, fake_godot, fake_unreal, field, gate_box, godot_root, has_ref, install_call, installs,
+    let_go, lines_starting, marks, npm_install_call, pair_payload, pair_snapshot, pair_tree, passed, path_for_bun, path_for_npm, path_for_pnpm,
+    pnpm_box, pnpm_calls, refused_line, renamed, run_box, run_box_with_git_bin, run_box_with_godot, run_box_with_seams, run_box_with_unreal,
+    snapshot, started_line, stopped_line_for, stub_bun, stub_npm, stub_pnpm, unreal_root,
 };
 use crate::support::{Case, FAKE_TOOL, GATE, Outcome, box_payload, shown, wait_until, wait_until_closed};
 
@@ -325,6 +325,106 @@ fn box_warm_up_refuses_commands_that_need_pnpm_and_bun_in_one_folder() {
     assert!(pnpm_calls(&case).is_empty(), "no install and no command: {outcome:?}");
     assert!(!said.contains(&started_line(&payload).as_str()), "no marker: {outcome:?}");
     assert!(!Path::new(&format!("{}.packages", field(&payload, "Work"))).exists(), "no record");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_warm_up_installs_npm_once_for_npm_and_npx_commands_in_one_folder() {
+    let case = Case::new("box_warm_up_npm");
+    let mut payload = warm_payload(&case, &[&["npm", "test"], &["npx", "vitest", "run"]]);
+    snapshot(
+        &case,
+        &mut payload,
+        &[NODE_MODULES_IGNORED, (NPM_LOCKFILE_PATH, NPM_LOCKFILE), ("package.json", "{}\n")],
+    );
+    let stub = stub_npm(&case, 0, "");
+
+    let outcome = pnpm_box(&case, &payload, &path_for_npm(&[stub])).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let work = field(&payload, "Work");
+    assert_eq!(
+        pnpm_calls(&case),
+        [
+            npm_install_call(work),
+            command_call(work, "npm test"),
+            command_call(work, "npx vitest run")
+        ],
+        "one install for npm and npx in the one folder, then the commands: {outcome:?}"
+    );
+    let said: Vec<&str> = outcome.stderr.lines().collect();
+    let took = said.iter().position(|line| line.starts_with("gate: npm install took "));
+    let marker = said.iter().position(|line| *line == started_line(&payload));
+    assert!(took.is_some() && took < marker, "the install before the marker: {outcome:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_warm_up_skips_npm_in_a_folder_with_a_pnpm_lockfile() {
+    let case = Case::new("box_warm_up_npm_and_pnpm");
+    let mut payload = warm_payload(&case, &[&["npm", "test"], &["pnpm", "run", "a"]]);
+    snapshot(
+        &case,
+        &mut payload,
+        &[
+            NODE_MODULES_IGNORED,
+            (NPM_LOCKFILE_PATH, NPM_LOCKFILE),
+            (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE),
+            ("package.json", "{}\n"),
+        ],
+    );
+    let path = path_for_npm(&[stub_pnpm(&case, 0, ""), stub_npm(&case, 0, "")]);
+
+    let outcome = pnpm_box(&case, &payload, &path).finish();
+
+    assert_eq!(outcome.code, Some(0), "pnpm's lockfile folder is no npm folder: {outcome:?}");
+    let said: Vec<&str> = outcome.stderr.lines().collect();
+    assert!(
+        said.contains(&"gate: remote npm install skipped: . holds a pnpm or bun lockfile"),
+        "the npm command's skip, then pnpm's install: {outcome:?}"
+    );
+    assert!(
+        !said.iter().any(|line| line.starts_with("gate-remote-refused: ")),
+        "no refusal: {outcome:?}"
+    );
+    let work = field(&payload, "Work");
+    assert_eq!(
+        pnpm_calls(&case),
+        [install_call(work), command_call(work, "npm test"), command_call(work, "run a")],
+        "one pnpm install, then both commands: {outcome:?}"
+    );
+    assert!(said.contains(&started_line(&payload).as_str()), "the warm-up runs: {outcome:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_warm_up_names_the_first_two_of_three_managers_in_one_folder() {
+    let case = Case::new("box_warm_up_three_managers");
+    let mut payload = warm_payload(&case, &[&["npm", "test"], &["bun", "test"], &["pnpm", "run", "a"]]);
+    snapshot(
+        &case,
+        &mut payload,
+        &[
+            NODE_MODULES_IGNORED,
+            (NPM_LOCKFILE_PATH, NPM_LOCKFILE),
+            (BUN_LOCKFILE_PATH, BUN_LOCKFILE),
+            (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE),
+            ("package.json", "{}\n"),
+        ],
+    );
+    let path = path_for_npm(&[stub_pnpm(&case, 0, ""), stub_bun(&case, 0, ""), stub_npm(&case, 0, "")]);
+
+    let outcome = pnpm_box(&case, &payload, &path).finish();
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    let said: Vec<&str> = outcome.stderr.lines().collect();
+    let tag = refused_line(&payload, "tools");
+    let tagged = said.iter().position(|line| *line == tag);
+    assert!(
+        tagged.and_then(|at| said.get(at + 1)) == Some(&"gate: remote work folder k uses both pnpm and bun in ."),
+        "the tag, then the line naming the first two managers in MANAGERS order, not the command order: {outcome:?}"
+    );
+    assert!(pnpm_calls(&case).is_empty(), "no install and no command: {outcome:?}");
     wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 

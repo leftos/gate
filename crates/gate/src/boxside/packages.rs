@@ -1,16 +1,18 @@
-//! The repo's pnpm and bun packages, installed before a routed command of their package manager, after the dotnet tool
-//! restore: a `pnpm` command's `pnpm-lock.yaml`, or a `bun` or `bunx` command's `bun.lock` or `bun.lockb`, nearest the
-//! folder the command starts in, never above the main repo's tree, has its folder's package files hashed and compared
-//! with that folder's line for the manager in the work folder's `<Work>.packages` record, so `pnpm install
-//! --frozen-lockfile` or `bun install --frozen-lockfile` runs there only when a package file changed or `node_modules`
-//! is gone, and only when git ignores `node_modules` and no folder from the work root down to the lockfile's is a link
-//! or a junction. Both managers install into the folder's one `node_modules`, so a passed install drops the other
-//! manager's line for its folder, and a run whose commands need both managers in one folder is refused. The install
-//! runs with the command's restricted token, its `safe.directory` and `CI=true`, in a job of its own that ends every
-//! process in it when the box's handle to it closes; its two streams are forwarded like the command's. It ends when it
-//! ends, when a stop sets the run's stop signal, or when a write to the box's own output fails. An install that fails
-//! or cannot start refuses the run with status 75, as a failed tool restore does, so the gate falls back to a local
-//! run.
+//! The repo's pnpm, bun and npm packages, installed before a routed command of their package manager, after the dotnet
+//! tool restore: a `pnpm` command's `pnpm-lock.yaml`, a `bun` or `bunx` command's `bun.lock` or `bun.lockb`, or an
+//! `npm` or `npx` command's `package-lock.json` or `npm-shrinkwrap.json`, nearest the folder the command starts in,
+//! never above the main repo's tree, has its folder's package files hashed and compared with that folder's line for the
+//! manager in the work folder's `<Work>.packages` record, so `pnpm install --frozen-lockfile`, `bun install
+//! --frozen-lockfile` or `npm ci --ignore-scripts --no-audit --no-fund` runs there only when a package file changed or
+//! `node_modules` is gone, and only when git ignores `node_modules` and no folder from the work root down to the
+//! lockfile's is a link or a junction. Every manager installs into the folder's one `node_modules`, so a passed install
+//! drops the other managers' lines for its folder, and a run whose commands need two managers in one folder is refused.
+//! An npm or npx command restores nothing in a folder holding a pnpm or bun lockfile, whose manager owns the folder's
+//! `node_modules` instead. The install runs with the command's restricted token, its `safe.directory` and `CI=true`,
+//! in a job of its own that ends every process in it when the box's handle to it closes; its two streams are forwarded
+//! like the command's. It ends when it ends, when a stop sets the run's stop signal, or when a write to the box's own
+//! output fails. An install that fails or cannot start refuses the run with status 75, as a failed tool restore does, so
+//! the gate falls back to a local run.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -42,8 +44,12 @@ use crate::run::{ERROR_FILE_NOT_FOUND, Written, written};
 
 /// A package manager whose packages the box installs before a routed command of it.
 struct Manager {
-    /// Its name in the box's lines, and the program the install runs, found on the box's `PATH`.
+    /// Its name in the box's lines.
     name: &'static str,
+    /// The program its install runs, found on the box's `PATH`.
+    program: &'static str,
+    /// The words its install runs, after its program.
+    install_words: &'static [&'static str],
     /// The file stems of a command's first word that make the command this manager's, compared in any case.
     stems: &'static [&'static str],
     /// The lockfiles whose folder it installs in: a folder holding any of them is the lockfile folder.
@@ -62,6 +68,8 @@ struct Manager {
 /// pnpm, for a `pnpm` command.
 const PNPM: Manager = Manager {
     name: "pnpm",
+    program: "pnpm",
+    install_words: &["install", "--frozen-lockfile"],
     stems: &["pnpm"],
     lockfiles: &["pnpm-lock.yaml"],
     hashed: &["pnpm-lock.yaml", "package.json", "pnpm-workspace.yaml", ".npmrc"],
@@ -73,6 +81,8 @@ const PNPM: Manager = Manager {
 /// bun, for a `bun` or `bunx` command, installing with `bun` for both.
 const BUN: Manager = Manager {
     name: "bun",
+    program: "bun",
+    install_words: &["install", "--frozen-lockfile"],
     stems: &["bun", "bunx"],
     lockfiles: &["bun.lock", "bun.lockb"],
     hashed: &["bun.lock", "bun.lockb", "package.json", "bunfig.toml", ".npmrc"],
@@ -81,13 +91,24 @@ const BUN: Manager = Manager {
     key_prefix: "bun:",
 };
 
-/// The package managers the box installs for, in the order a command is matched against them.
-const MANAGERS: [&Manager; 2] = [&PNPM, &BUN];
+/// npm, for an `npm` or `npx` command, installing with `npm` for both.
+const NPM: Manager = Manager {
+    name: "npm",
+    program: "npm",
+    install_words: &["ci", "--ignore-scripts", "--no-audit", "--no-fund"],
+    stems: &["npm", "npx"],
+    lockfiles: &["package-lock.json", "npm-shrinkwrap.json"],
+    hashed: &["package-lock.json", "npm-shrinkwrap.json", "package.json", ".npmrc"],
+    bin_stems: &[],
+    start_word: no_start_word,
+    key_prefix: "npm:",
+};
+
+/// The package managers the box installs for, in the order a command is matched against them and two of them are named.
+const MANAGERS: [&Manager; 3] = [&PNPM, &BUN, &NPM];
 
 /// The hex digit of each hash byte's high nibble, the low nibble reading from the same table.
 const HEX: &[u8; 16] = b"0123456789abcdef";
-/// The words of the install the box runs, after the manager's program it found.
-const INSTALL_WORDS: [&str; 2] = ["install", "--frozen-lockfile"];
 /// The path git is asked about: with its trailing separator, so a folder pattern such as `node_modules/` matches it
 /// before the folder exists.
 const NODE_MODULES: &str = "node_modules/";
@@ -120,6 +141,11 @@ fn stem_in(stems: &[&str], word: &str) -> bool {
 /// Whether the command's first word `word` names `manager`: its [`stem`] is one of the manager's stems in any case.
 fn is_command(manager: &Manager, word: &str) -> bool {
     stem_in(manager.stems, word)
+}
+
+/// No start-folder option: such a manager's walk starts at the place, whatever the words after its first say.
+fn no_start_word(_words: &[String]) -> Option<&str> {
+    None
 }
 
 /// The folder `manager`'s command of first word `first` and the words `rest` after it is told to start in: none for a
@@ -261,6 +287,17 @@ fn holds_lockfile(manager: &Manager, folder: &Path) -> Result<bool, String> {
     Ok(false)
 }
 
+/// Whether `folder` also holds a pnpm or a bun lockfile, whose manager owns its `node_modules`, so npm restores nothing
+/// there; `Err` with the line saying one's metadata cannot be read.
+fn holds_other_lockfile(folder: &Path) -> Result<bool, String> {
+    for manager in [&PNPM, &BUN] {
+        if holds_lockfile(manager, folder)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// The line saying `manager`'s package file `name` at `path` could not be read for `error`.
 fn unreadable(manager: &Manager, path: &Path, name: &str, error: &io::Error) -> String {
     let what = if manager.lockfiles.contains(&name) {
@@ -356,6 +393,8 @@ enum Found {
     Outside(PathBuf),
     /// No install: this folder from the work root down to the lockfile's is a link or a junction.
     Linked(String),
+    /// No install: this npm lockfile folder also holds a pnpm or a bun lockfile, whose manager owns its `node_modules`.
+    OtherManager(PathBuf),
     /// The folder of the lockfile to install from.
     Lockfile(PathBuf),
 }
@@ -377,6 +416,7 @@ fn lockfile_for(words: &[String], folders: &Folders<'_>) -> Result<Option<(&'sta
         None => Found::Nothing,
         Some(folder) => match linked(folders.work, &folder) {
             Some(link) => Found::Linked(link),
+            None if manager.name == NPM.name && holds_other_lockfile(&folder)? => Found::OtherManager(folder),
             None => Found::Lockfile(folder),
         },
     };
@@ -433,7 +473,7 @@ fn relative(work: &Path, folder: &Path) -> String {
 }
 
 /// The key of `manager`'s line for the folder `relative` (as [`relative`] names it) in the record: the folder after
-/// the manager's prefix, so pnpm's keys are bare folders and bun's start `bun:`.
+/// the manager's prefix, so pnpm's keys are bare folders and bun's start `bun:` and npm's `npm:`.
 fn record_key(manager: &Manager, relative: &str) -> String {
     format!("{}{relative}", manager.key_prefix)
 }
@@ -502,16 +542,16 @@ enum Installed {
     Ended(u32),
 }
 
-/// The launch of `{program} install --frozen-lockfile` in `folder`: the `program` found on the box's `PATH`, the box's
-/// own environment as a run's processes get it ([`box_variables`]) with git's `safe.directory` set to `*` over it as
-/// the command's is ([`with_safe_directory`]) and `CI=true` over that, and the restricted token the command gets; else
-/// why it cannot be launched.
-fn install_launch(program: &str, folder: &Path) -> Result<PipedLaunch, String> {
-    let found = locate(program)?.ok_or_else(|| gate_win32::win32_message(ERROR_FILE_NOT_FOUND))?;
+/// The launch of `manager`'s install in `folder`: its program and install words, the program found on the box's
+/// `PATH`, the box's own environment as a run's processes get it ([`box_variables`]) with git's `safe.directory` set to
+/// `*` over it as the command's is ([`with_safe_directory`]) and `CI=true` over that, and the restricted token the
+/// command gets; else why it cannot be launched.
+fn install_launch(manager: &Manager, folder: &Path) -> Result<PipedLaunch, String> {
+    let found = locate(manager.program)?.ok_or_else(|| gate_win32::win32_message(ERROR_FILE_NOT_FOUND))?;
     let token = RestrictedToken::of_this_process().map_err(|error| format!("cannot make its restricted token: {error}"))?;
     let variables = with_safe_directory(box_variables()).with("CI", "true");
     let environment = variables.block().map_err(|error| format!("cannot build its environment: {error}"))?;
-    let words: Vec<OsString> = INSTALL_WORDS.into_iter().map(OsString::from).collect();
+    let words: Vec<OsString> = manager.install_words.iter().copied().map(OsString::from).collect();
     match written(&found, &words, &variables) {
         Written::Line(application, command_line) => Ok(PipedLaunch {
             application,
@@ -537,7 +577,7 @@ fn install(request: &Request<'_>, lockfile: &Lockfile<'_>, key: &str, beat: &Bea
     if let Err(status) = before_the_job(beat.stop.look(&starting), request.job, beat.lock, console) {
         return Ok(Installed::Ended(status));
     }
-    let launch = install_launch(manager.name, &lockfile.folder)?;
+    let launch = install_launch(manager, &lockfile.folder)?;
     let name = packages_job_name(request.job);
     let job = Job::create_kill_on_close(&name).map_err(|error| format!("cannot create its job {name}: {error}"))?;
     let _stopper = Stopper { job: &job, armed: true };
@@ -661,8 +701,8 @@ pub(super) fn update(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>
             places.push((manager, found));
         }
     }
-    if let Some(folder) = shared_folder(&places, folders.work) {
-        return Err(refused_shared(request, &folder, beat, console));
+    if let Some(shared) = shared_folder(&places, folders.work) {
+        return Err(refused_shared(request, &shared, beat, console));
     }
     for (manager, found) in places {
         match found {
@@ -677,6 +717,11 @@ pub(super) fn update(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>
                 manager.name,
                 escaped(&link)
             )),
+            Found::OtherManager(folder) => console.err(&format!(
+                "gate: remote {} install skipped: {} holds a pnpm or bun lockfile",
+                manager.name,
+                escaped(&relative(folders.work, &folder))
+            )),
             Found::Lockfile(folder) => {
                 let lockfile = Lockfile {
                     manager,
@@ -690,33 +735,46 @@ pub(super) fn update(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>
     Ok(())
 }
 
-/// The first lockfile folder of `places` that two managers lead to, relative to the work root `work`; none when each
-/// lockfile folder is one manager's.
-fn shared_folder(places: &[(&Manager, Found)], work: &Path) -> Option<String> {
-    places.iter().enumerate().find_map(|(at, (manager, found))| {
+/// A lockfile folder that two managers lead to, and the two earliest of them in [`MANAGERS`] order.
+struct Shared {
+    folder: String,
+    first: &'static Manager,
+    second: &'static Manager,
+}
+
+/// The first lockfile folder of `places` that two managers lead to, relative to the work root `work`, with the two
+/// earliest of the managers that lead there in [`MANAGERS`] order; none when each lockfile folder is one manager's.
+fn shared_folder(places: &[(&'static Manager, Found)], work: &Path) -> Option<Shared> {
+    places.iter().find_map(|(_, found)| {
         let Found::Lockfile(folder) = found else {
             return None;
         };
-        let shared = places
+        let mut managers = MANAGERS
             .iter()
-            .skip(at + 1)
-            .any(|(other, known)| other.name != manager.name && same_place(found, known));
-        shared.then(|| relative(work, folder))
+            .copied()
+            .filter(|manager| places.iter().any(|(known, lead)| known.name == manager.name && same_place(lead, found)));
+        let first = managers.next()?;
+        let second = managers.next()?;
+        Some(Shared {
+            folder: relative(work, folder),
+            first,
+            second,
+        })
     })
 }
 
-/// Refuses a run whose commands need both managers in the lockfile folder `folder`: the `tools` tag and the line
-/// naming the folder under the heartbeat's lock; status 75.
-fn refused_shared(request: &Request<'_>, folder: &str, beat: &Beat<'_>, console: &mut Console) -> u32 {
+/// Refuses a run whose commands need the two managers of `shared` in its lockfile folder: the `tools` tag and the
+/// line naming the folder and the two managers under the heartbeat's lock; status 75.
+fn refused_shared(request: &Request<'_>, shared: &Shared, beat: &Beat<'_>, console: &mut Console) -> u32 {
     // Held across both lines, so no heartbeat lands between the tag and the line it tags.
     let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
     console.err(&refused_line(request.nonce, Refusal::Tools));
     console.err(&format!(
         "gate: remote work folder {} uses both {} and {} in {}",
         request.key,
-        PNPM.name,
-        BUN.name,
-        escaped(folder)
+        shared.first.name,
+        shared.second.name,
+        escaped(&shared.folder)
     ));
     REFUSED_STATUS
 }
@@ -739,9 +797,9 @@ struct Lockfile<'a> {
 
 /// Installs the packages of `lockfile`'s folder with its manager: nothing when the record holds the folder's hash in
 /// the manager's line ([`record_key`]) and its `node_modules` is there, or when git does not ignore `node_modules`
-/// there (said); else `{manager} install --frozen-lockfile` in the folder, the manager's line for the folder in
-/// `<Work>.packages` rewritten when it passes. The other managers' lines for the folder are dropped, and the record
-/// written, before the install starts, since whatever its end it rewrites the `node_modules` they were for; a record
+/// there (said); else the manager's install in the folder, the manager's line for the folder in `<Work>.packages`
+/// rewritten when it passes. The other managers' lines for the folder are dropped, and the record written, before the
+/// install starts, since whatever its end it rewrites the `node_modules` they were for; a record
 /// without such a line is not written then. `Ok` when nothing ran or the install passed; else `Err` with the status the run
 /// ends on, its lines said: 75 when the install failed or could not start; 1 when a package file could not be read,
 /// the record could not be written, a stop came before or during the install, or the box could not wait for it; 255
@@ -791,7 +849,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use super::{BUN, Found, PNPM, Record, hash, is_command, lockfile_folder, record_key, same_place, start_folder, start_named, start_word};
+    use super::{BUN, Found, NPM, PNPM, Record, hash, is_command, lockfile_folder, record_key, same_place, start_folder, start_named, start_word};
 
     #[test]
     fn lockfile_folders_are_one_place_whatever_their_letter_case() {
@@ -1068,6 +1126,117 @@ mod tests {
             hash(&BUN, &folder),
             Ok(BUN_FIVE_FILES_HASH.to_owned()),
             "bun.lock, bun.lockb, package.json, bunfig.toml, .npmrc"
+        );
+    }
+
+    #[test]
+    fn an_npm_or_npx_word_triggers_in_any_case_and_form() {
+        for word in [
+            "npm",
+            "npx",
+            "NPM.cmd",
+            "NPX.EXE",
+            r"C:\tools\npm.cmd",
+            "npx.ps1",
+            "/usr/bin/npm",
+            "C:npx",
+        ] {
+            assert!(is_command(&NPM, word), "{word} names npm");
+            assert!(!is_command(&PNPM, word), "{word} does not name pnpm");
+            assert!(!is_command(&BUN, word), "{word} does not name bun");
+        }
+        for word in ["npmx", "npxx", "node", "pnpm", "bun", "", r"C:\npm\node.exe", "xnpm.cmd"] {
+            assert!(!is_command(&NPM, word), "{word} does not name npm");
+        }
+    }
+
+    #[test]
+    fn the_npm_walk_finds_either_lockfile_and_no_other() {
+        let scratch = Scratch::new("the_npm_walk_finds_either_lockfile_and_no_other");
+        let work = scratch.0.join("work");
+        let place = work.join("web").join("app");
+        fs::create_dir_all(&place).expect("the place can be made");
+        lockfile(&place);
+        assert_eq!(lockfile_folder(&NPM, &work, &place), Ok(None), "a pnpm lockfile is no npm lockfile");
+
+        fs::write(work.join("npm-shrinkwrap.json"), "{}\n").expect("the lockfile can be written");
+        assert_eq!(lockfile_folder(&NPM, &work, &place), Ok(Some(work.clone())), "an npm-shrinkwrap.json");
+
+        fs::write(work.join("web").join("package-lock.json"), "{}\n").expect("the lockfile can be written");
+        assert_eq!(
+            lockfile_folder(&NPM, &work, &place),
+            Ok(Some(work.join("web"))),
+            "the nearest folder with a package-lock.json, the package lock read before the shrinkwrap"
+        );
+        assert_eq!(
+            NPM.lockfiles.to_vec(),
+            vec!["package-lock.json", "npm-shrinkwrap.json"],
+            "package-lock.json is the lockfile the walk reads first"
+        );
+    }
+
+    /// The SHA-256 [`hash`] gives the package files `files`, each its name, a NUL byte, its bytes and a NUL byte in
+    /// order, computed here from the bytes rather than by the code under test.
+    fn digest(files: &[(&str, &[u8])]) -> String {
+        use std::fmt::Write as _;
+
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for (name, content) in files {
+            hasher.update(name.as_bytes());
+            hasher.update([0_u8]);
+            hasher.update(content);
+            hasher.update([0_u8]);
+        }
+        let mut hex = String::new();
+        for byte in hasher.finalize() {
+            write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        hex
+    }
+
+    #[test]
+    fn the_npm_hash_reads_its_files_in_order() {
+        let scratch = Scratch::new("the_npm_hash_reads_its_files_in_order");
+        let folder = scratch.0.join("web");
+        fs::create_dir_all(&folder).expect("the folder can be made");
+        // Written in another order than the hash's, which the hash ignores.
+        fs::write(folder.join(".npmrc"), "a=1\n").expect("the file can be written");
+        fs::write(folder.join("package-lock.json"), "lock\n").expect("the file can be written");
+        fs::write(folder.join("bun.lock"), "not npm's\n").expect("the file can be written");
+        assert_eq!(
+            hash(&NPM, &folder),
+            Ok(digest(&[("package-lock.json", b"lock\n"), (".npmrc", b"a=1\n")])),
+            "an absent file is skipped"
+        );
+
+        fs::write(folder.join("package.json"), "{}\n").expect("the file can be written");
+        fs::write(folder.join("npm-shrinkwrap.json"), "{\"x\":1}\n").expect("the file can be written");
+        assert_eq!(
+            hash(&NPM, &folder),
+            Ok(digest(&[
+                ("package-lock.json", b"lock\n"),
+                ("npm-shrinkwrap.json", b"{\"x\":1}\n"),
+                ("package.json", b"{}\n"),
+                (".npmrc", b"a=1\n"),
+            ])),
+            "package-lock.json, npm-shrinkwrap.json, package.json, .npmrc"
+        );
+    }
+
+    #[test]
+    fn an_npm_folder_key_starts_with_npm() {
+        assert_eq!(record_key(&NPM, "web"), "npm:web");
+        assert_eq!(record_key(&NPM, "."), "npm:.");
+        let mut record = Record::default();
+        let (a, b, c) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        record.set(&record_key(&PNPM, "web"), &a);
+        record.set(&record_key(&BUN, "web"), &b);
+        record.set(&record_key(&NPM, "web"), &c);
+        assert_eq!(
+            record.text(),
+            format!("bun:web\t{b}\nnpm:web\t{c}\nweb\t{a}\n"),
+            "one line for each manager, sorted"
         );
     }
 

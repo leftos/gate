@@ -5507,7 +5507,7 @@ const NODE_MODULES_IGNORED: (&str, &str) = (".gitignore", "node_modules/\n");
 fn stub_pnpm(case: &Case, exit: i32, before: &str) -> PathBuf {
     let stub = case.folder().join(format!("stub-pnpm-{exit}"));
     fs::create_dir_all(&stub).expect("the stub folder can be made");
-    fs::write(stub.join("pnpm.cmd"), stub_script(case, "", exit, before)).expect("the pnpm stub can be written");
+    fs::write(stub.join("pnpm.cmd"), stub_script(case, "install", "", exit, before)).expect("the pnpm stub can be written");
     stub
 }
 
@@ -5520,23 +5520,40 @@ fn stub_bun(case: &Case, exit: i32, before: &str) -> PathBuf {
     for program in ["bun", "bunx"] {
         fs::write(
             stub.join(format!("{program}.cmd")),
-            stub_script(case, &format!("{program} "), exit, before),
+            stub_script(case, "install", &format!("{program} "), exit, before),
         )
         .expect("the bun stub can be written");
     }
     stub
 }
 
+/// A folder holding an `npm.cmd` and an `npx.cmd` that stand for npm and npx as [`stub_bun`]'s stand for bun and bunx,
+/// each call's arguments in the counter file led by `npm ` or `npx `, so a case tells which program the box ran; the
+/// install is the call whose first word is `ci`, npm's.
+fn stub_npm(case: &Case, exit: i32, before: &str) -> PathBuf {
+    let stub = case.folder().join(format!("stub-npm-{exit}"));
+    fs::create_dir_all(&stub).expect("the stub folder can be made");
+    for program in ["npm", "npx"] {
+        fs::write(
+            stub.join(format!("{program}.cmd")),
+            stub_script(case, "ci", &format!("{program} "), exit, before),
+        )
+        .expect("the npm stub can be written");
+    }
+    stub
+}
+
 /// The batch script of a package manager stub: each call appends `{working folder}|{tag}{arguments}|CI={%CI%}` to the
-/// case's counter file; an `install` then runs the batch script `before`, makes `node_modules` in its working folder,
-/// prints `install: out` and exits with `exit`, and any other call exits 0.
-fn stub_script(case: &Case, tag: &str, exit: i32, before: &str) -> String {
+/// case's counter file; a call whose first word is `verb` then runs the batch script `before`, makes `node_modules` in
+/// its working folder, prints `install: out` and exits with `exit`, and any other call exits 0.
+fn stub_script(case: &Case, verb: &str, tag: &str, exit: i32, before: &str) -> String {
     format!(
         concat!(
-            "@echo off\r\n>>\"{counter}\" echo %CD%^|{tag}%*^|CI=%CI%\r\nif not \"%1\"==\"install\" exit /b 0\r\n",
+            "@echo off\r\n>>\"{counter}\" echo %CD%^|{tag}%*^|CI=%CI%\r\nif not \"%1\"==\"{verb}\" exit /b 0\r\n",
             "{before}if not exist node_modules mkdir node_modules\r\necho install: out\r\nexit /b {exit}\r\n"
         ),
         counter = shown(&counter(case)),
+        verb = verb,
         tag = tag,
         before = before,
         exit = exit,
@@ -5565,6 +5582,11 @@ fn path_for_pnpm(folders: &[PathBuf]) -> OsString {
 /// [`path_for_run`] less every folder holding a `bun` or a `bunx` too, so the box finds the stub's bun or none.
 fn path_for_bun(folders: &[PathBuf]) -> OsString {
     path_without(folders, &["bun", "bunx"])
+}
+
+/// [`path_for_run`] less every folder holding an `npm` or an `npx` too, so the box finds the stub's npm or none.
+fn path_for_npm(folders: &[PathBuf]) -> OsString {
+    path_without(folders, &["npm", "npx"])
 }
 
 /// `gate box run` of `payload` with `PATH` set to `path` and no `CI` variable, so only the box's install sets one; a
@@ -5603,6 +5625,19 @@ fn bun_installs(case: &Case) -> usize {
     pnpm_calls(case)
         .iter()
         .filter(|call| call.contains("|bun install --frozen-lockfile|"))
+        .count()
+}
+
+/// The call of the box's install the stub npm sees in `folder`, its program `npm` even for an npx command.
+fn npm_install_call(folder: &str) -> String {
+    format!("{}|npm ci --ignore-scripts --no-audit --no-fund|CI=true", folder.to_uppercase())
+}
+
+/// How many of the stub npm's calls were installs.
+fn npm_installs(case: &Case) -> usize {
+    pnpm_calls(case)
+        .iter()
+        .filter(|call| call.contains("|npm ci --ignore-scripts --no-audit --no-fund|"))
         .count()
 }
 
@@ -6392,6 +6427,235 @@ fn box_run_refuses_tools_when_the_bun_install_fails() {
     );
     assert!(!Path::new(&packages_record(&payload)).exists(), "no record");
     wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// The lockfile an npm case's snapshot holds, and its path at the work folder's root.
+const NPM_LOCKFILE: &str = "{\n  \"lockfileVersion\": 3\n}\n";
+const NPM_LOCKFILE_PATH: &str = "package-lock.json";
+
+/// An npm case's payload of `command` with `files` snapshotted beside the ignore file and the root's lockfile.
+fn npm_payload(case: &Case, command: &[&str], files: &[(&str, &str)]) -> Value {
+    let mut payload = box_payload(case, "k", command);
+    let mut all = vec![NODE_MODULES_IGNORED, (NPM_LOCKFILE_PATH, NPM_LOCKFILE)];
+    all.extend_from_slice(files);
+    snapshot(case, &mut payload, &all);
+    payload
+}
+
+#[test]
+fn box_run_installs_npm_packages_before_an_npm_command() {
+    let case = Case::new("box_run_npm_install");
+    let payload = npm_payload(&case, &["npm", "test"], &[("package.json", "{}\n")]);
+    let stub = stub_npm(&case, 0, "");
+
+    let outcome = pnpm_box(&case, &payload, &path_for_npm(&[stub])).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let work = field(&payload, "Work");
+    assert_eq!(
+        pnpm_calls(&case),
+        [npm_install_call(work), command_call(work, "npm test")],
+        "npm ci with its exact words in the lockfile's folder, then the command: {outcome:?}"
+    );
+    assert!(
+        outcome.stdout.contains("install: out"),
+        "the install's output passes through: {outcome:?}"
+    );
+    assert!(said_took(&outcome, "npm", ""), "the elapsed line, no folder for the root: {outcome:?}");
+    let record = fs::read_to_string(packages_record(&payload)).expect("the record is written");
+    let shape = Regex::new(r"^npm:\.\t[0-9a-f]{64}\n$").expect("the pattern compiles");
+    assert!(shape.is_match(&record), "npm's line for the root: {record:?}");
+    assert!(Path::new(work).join("node_modules").is_dir(), "the install's folder stays");
+}
+
+#[test]
+fn box_run_installs_npm_packages_with_npm_before_an_npx_command() {
+    let case = Case::new("box_run_npm_npx");
+    let payload = npm_payload(&case, &["npx", "vitest", "run"], &[]);
+    let stub = stub_npm(&case, 0, "");
+
+    let outcome = pnpm_box(&case, &payload, &path_for_npm(&[stub])).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let work = field(&payload, "Work");
+    assert_eq!(
+        pnpm_calls(&case),
+        [npm_install_call(work), command_call(work, "npx vitest run")],
+        "an npx command installs with npm, not npx: {outcome:?}"
+    );
+    assert!(said_took(&outcome, "npm", ""), "{outcome:?}");
+}
+
+#[test]
+fn box_run_finds_an_npm_shrinkwrap_when_there_is_no_package_lock() {
+    let case = Case::new("box_run_npm_shrinkwrap");
+    let mut payload = box_payload(&case, "k", &["npm", "test"]);
+    payload["Subfolder"] = json!("web");
+    snapshot(
+        &case,
+        &mut payload,
+        &[
+            NODE_MODULES_IGNORED,
+            ("web/npm-shrinkwrap.json", NPM_LOCKFILE),
+            ("web/package.json", "{}\n"),
+        ],
+    );
+    let stub = stub_npm(&case, 0, "");
+
+    let outcome = pnpm_box(&case, &payload, &path_for_npm(&[stub])).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let web = format!(r"{}\web", field(&payload, "Work"));
+    assert_eq!(
+        pnpm_calls(&case),
+        [npm_install_call(&web), command_call(&web, "npm test")],
+        "the install in the shrinkwrap's folder: {outcome:?}"
+    );
+    assert!(said_took(&outcome, "npm", " in web"), "the elapsed line names the folder: {outcome:?}");
+    let record = fs::read_to_string(packages_record(&payload)).expect("the record is written");
+    let shape = Regex::new(r"^npm:web\t[0-9a-f]{64}\n$").expect("the pattern compiles");
+    assert!(shape.is_match(&record), "npm's line for web: {record:?}");
+    assert!(
+        !Path::new(field(&payload, "Work")).join("node_modules").exists(),
+        "no install at the root"
+    );
+}
+
+#[test]
+fn box_run_skips_the_npm_install_when_the_lockfile_is_unchanged() {
+    let case = Case::new("box_run_npm_unchanged");
+    let payload = npm_payload(&case, &["npm", "test"], &[]);
+    let path = path_for_npm(&[stub_npm(&case, 0, "")]);
+    let first = pnpm_box(&case, &payload, &path).finish();
+    assert_eq!(first.code, Some(0), "{first:?}");
+
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    let work = field(&payload, "Work");
+    assert_eq!(
+        pnpm_calls(&case),
+        [npm_install_call(work), command_call(work, "npm test"), command_call(work, "npm test")],
+        "one install, the .packages record skips the second run: {second:?}"
+    );
+    assert_eq!(npm_installs(&case), 1, "the record's line skipped the second run: {second:?}");
+    assert!(!second.stderr.contains("gate: npm install took"), "{second:?}");
+}
+
+#[test]
+fn box_run_installs_npm_packages_again_when_the_lockfile_changes() {
+    let case = Case::new("box_run_npm_lockfile_changed");
+    let mut payload = npm_payload(&case, &["npm", "test"], &[]);
+    let path = path_for_npm(&[stub_npm(&case, 0, "")]);
+    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+    let record = fs::read_to_string(packages_record(&payload)).expect("the record is written");
+
+    let changed = push_snapshot(&case, &payload, &[(NPM_LOCKFILE_PATH, "{\n  \"lockfileVersion\": 2\n}\n")]);
+    payload["Snapshot"] = json!(changed);
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert_eq!(npm_installs(&case), 2, "the changed lockfile installs again: {second:?}");
+    assert!(said_took(&second, "npm", ""), "{second:?}");
+    assert_ne!(
+        fs::read_to_string(packages_record(&payload)).expect("the record is read"),
+        record,
+        "the record holds the new hash"
+    );
+}
+
+#[test]
+fn box_run_installs_npm_packages_again_when_package_json_changes() {
+    let case = Case::new("box_run_npm_package_json_changed");
+    let mut payload = npm_payload(&case, &["npm", "test"], &[("package.json", "{}\n")]);
+    let path = path_for_npm(&[stub_npm(&case, 0, "")]);
+    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+
+    let changed = push_snapshot(&case, &payload, &[("package.json", "{\"name\": \"x\"}\n")]);
+    payload["Snapshot"] = json!(changed);
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert_eq!(npm_installs(&case), 2, "a changed package.json installs again: {second:?}");
+    assert!(said_took(&second, "npm", ""), "{second:?}");
+}
+
+#[test]
+fn box_run_runs_no_npm_install_before_a_node_command() {
+    let case = Case::new("box_run_npm_node");
+    let mut payload = box_payload(&case, "k", &["node", "script.js"]);
+    snapshot(
+        &case,
+        &mut payload,
+        &[NODE_MODULES_IGNORED, (NPM_LOCKFILE_PATH, NPM_LOCKFILE), ("package.json", "{}\n")],
+    );
+    let stub = stub_npm(&case, 0, "");
+    fs::write(stub.join("node.cmd"), stub_script(&case, "never", "node ", 0, "")).expect("the node stub can be written");
+
+    let outcome = pnpm_box(&case, &payload, &path_for_npm(&[stub])).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let work = field(&payload, "Work");
+    assert_eq!(
+        pnpm_calls(&case),
+        [command_call(work, "node script.js")],
+        "a node command is no npm command, so nothing installs: {outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("npm install"), "nothing is said: {outcome:?}");
+    assert!(!Path::new(&packages_record(&payload)).exists(), "no record");
+}
+
+#[test]
+fn box_run_runs_the_npm_install_with_the_restricted_token() {
+    let case = Case::new("box_run_npm_token");
+    let payload = npm_payload(&case, &["npm", "test"], &[]);
+    let token = case.folder().join("token.txt");
+    let stub = stub_npm(&case, 0, &format!("\"{FAKE_TOOL}\" token >\"{}\"\r\n", shown(&token)));
+
+    let outcome = pnpm_box(&case, &payload, &path_for_npm(&[stub])).finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said = fs::read_to_string(&token).expect("the install wrote its token's facts");
+    let lines: Vec<&str> = said.lines().collect();
+    assert!(lines.contains(&"not-elevated"), "{lines:?}");
+    assert!(lines.contains(&"owner user"), "{lines:?}");
+    assert!(lines.contains(&restricted_dacl_line().as_str()), "the restricted token's DACL: {lines:?}");
+}
+
+#[test]
+fn box_run_runs_no_npm_install_in_a_folder_with_a_pnpm_lockfile() {
+    let case = Case::new("box_run_npm_with_pnpm_lockfile");
+    let mut payload = box_payload(&case, "k", &["pnpm", "run", "x"]);
+    snapshot(
+        &case,
+        &mut payload,
+        &[
+            NODE_MODULES_IGNORED,
+            (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE),
+            (NPM_LOCKFILE_PATH, NPM_LOCKFILE),
+            ("package.json", "{}\n"),
+        ],
+    );
+    let path = path_for_npm(&[stub_pnpm(&case, 0, ""), stub_npm(&case, 0, "")]);
+    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+
+    let mut npm = renamed(&payload, 1);
+    npm["Command"] = json!(["npx", "x"]);
+    let second = pnpm_box(&case, &npm, &path).finish();
+
+    assert_eq!(second.code, Some(0), "the command still runs: {second:?}");
+    let work = field(&payload, "Work");
+    assert_eq!(
+        pnpm_calls(&case),
+        [install_call(work), command_call(work, "run x"), command_call(work, "npx x")],
+        "one pnpm install, no npm install: {second:?}"
+    );
+    assert!(
+        lines(&second.stderr).contains(&"gate: remote npm install skipped: . holds a pnpm or bun lockfile"),
+        "{second:?}"
+    );
+    assert!(!second.stderr.contains("uses both"), "no refusal: {second:?}");
+    assert_eq!(npm_installs(&case), 0, "{second:?}");
 }
 
 /// A command the box's ceiling cases run that never ends on its own within any case's time.
