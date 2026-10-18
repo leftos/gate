@@ -8,7 +8,7 @@ Every repo that runs heavy gates is in scope, and every heavy command family in 
 
 - it routes;
 - it is booked with what blocks it (a GATE issue, High when it blocks the repo's adoption);
-- it stays local, but only for one of two reasons, named beside the family. Either it cannot run anywhere but this PC (a WSL distro on `/mnt/x`, an install into this PC's own folders, a git operation that writes this checkout's refs: any command whose first word is `git` or `prek`, a `git commit` included, stays local silently whatever its hooks need), or its run time is measured as shorter than what routing adds: the push, the outputs, the compression and the call overhead, taken from the repo's routed runs in the journal.
+- it stays local, but only for one of two reasons, named beside the family. Either it cannot run anywhere but this PC (a command that names this PC's own WSL state, such as a `/mnt/x` path or a distro folder only this PC has, an install into this PC's own folders, a git operation that writes this checkout's refs: any command whose first word is `git` or `prek`, a `git commit` included, stays local silently whatever its hooks need), or its run time is measured as shorter than what routing adds: the push, the outputs, the compression and the call overhead, taken from the repo's routed runs in the journal.
 
   A reason that work can remove does not keep a family local. It is a blocker to book. Examples: a tool or SDK the builder lacks, a window or GL the desktop route can serve, a `--local` with no recorded cause, an outputs list that would need to grow.
 
