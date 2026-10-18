@@ -65,8 +65,8 @@ pub const GIT_REDIRECTS: [&str; 6] = [
     "GIT_COMMON_DIR",
     "GIT_OBJECT_DIRECTORY",
 ];
-/// The variables a real gate around the suite may have set, which no case's gate may inherit.
-const INHERITED: [&str; 2] = ["GATE_STATE_DIR", "GATE_SLOT_HELD"];
+/// The variables a real gate or box run around the suite may have set, which no case's gate may inherit.
+const INHERITED: [&str; 4] = ["GATE_STATE_DIR", "GATE_SLOT_HELD", "GATE_BOX_JOB", "GATE_BOX_EXE"];
 /// Only guards against a stuck case; no case asserts how long anything took. Ten minutes, since a loaded machine
 /// (several heavy gates building at once) has kept a healthy case past a minute, and a real hang still ends.
 const HANG_GUARD: Duration = Duration::from_secs(600);

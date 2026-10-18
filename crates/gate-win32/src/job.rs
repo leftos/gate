@@ -23,7 +23,10 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS, JOB_OBJECT_MSG_EXIT_PROCESS, JOB_OBJECT_MSG_NEW_PROCESS};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+
 use crate::launch::struct_size;
+use crate::security::Descriptor;
 use crate::times::file_time_now;
 use crate::{own_handle, start_and_exit_of, timestamp_of, wide};
 
@@ -237,20 +240,48 @@ impl Job {
     /// An error of kind [`io::ErrorKind::AlreadyExists`] when a job of that name exists already, whose handle is
     /// closed again at once; the system's error when the job cannot be created.
     pub fn create(name: &str) -> io::Result<Job> {
-        Job::created(Some(name))
+        Job::created(Some(name), None)
     }
 
-    /// Creates the job `name`, or an anonymous one, which no other process can open by a name, for `None`.
-    fn created(name: Option<&str>) -> io::Result<Job> {
+    /// Creates the job `name` as [`Job::create`] does, made with the security `descriptor` in place of the default
+    /// DACL of this process's token.
+    ///
+    /// # Errors
+    ///
+    /// As [`Job::create`].
+    pub fn create_secured(name: &str, descriptor: &Descriptor) -> io::Result<Job> {
+        Job::created(Some(name), Some(descriptor))
+    }
+
+    /// Creates the job `name` as [`Job::create_kill_on_close`] does, made with the security `descriptor` in place of
+    /// the default DACL of this process's token.
+    ///
+    /// # Errors
+    ///
+    /// As [`Job::create_kill_on_close`].
+    pub fn create_kill_on_close_secured(name: &str, descriptor: &Descriptor) -> io::Result<Job> {
+        Job::create_limited(Some(name), JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, Some(descriptor))
+    }
+
+    /// Creates the job `name`, or an anonymous one, which no other process can open by a name, for `None`, with the
+    /// security `security` when given, else with the default DACL of this process's token.
+    fn created(name: Option<&str>, security: Option<&Descriptor>) -> io::Result<Job> {
         let created_at = now()?;
         let wide_name = name.map(wide);
         let name_pointer = wide_name.as_ref().map_or(std::ptr::null(), Vec::as_ptr);
+        let attributes = security.map(|descriptor| SECURITY_ATTRIBUTES {
+            nLength: struct_size::<SECURITY_ATTRIBUTES>(),
+            lpSecurityDescriptor: descriptor.as_ptr(),
+            bInheritHandle: 0,
+        });
+        let attributes_pointer = attributes.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
         // SAFETY: `SetLastError` takes no pointers. It clears the last error so that a stale `ERROR_ALREADY_EXISTS`
         // cannot pass for this call's.
         unsafe { SetLastError(0) };
-        // SAFETY: `name_pointer` is null or points to `wide_name`, which is NUL-terminated and outlives the call; null
-        // security attributes are allowed.
-        let created = unsafe { CreateJobObjectW(std::ptr::null(), name_pointer) };
+        // SAFETY: `name_pointer` is null or points to `wide_name`, which is NUL-terminated and outlives the call;
+        // `attributes_pointer` is null, which is allowed, or points to `attributes`, whose descriptor `security` keeps
+        // alive for the call.
+        let created = unsafe { CreateJobObjectW(attributes_pointer, name_pointer) };
         // SAFETY: `GetLastError` takes no pointers; it is read before anything else can set it.
         let error = unsafe { GetLastError() };
         // SAFETY: a success is a fresh handle nothing else owns, to a new job or to the one the name already held.
@@ -319,7 +350,7 @@ impl Job {
     ///
     /// As [`Job::create`]; and the system's error when the limit cannot be set, the job's handle closed again.
     pub fn create_kill_on_close(name: &str) -> io::Result<Job> {
-        Job::create_limited(Some(name), JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+        Job::create_limited(Some(name), JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, None)
     }
 
     /// Creates an anonymous job that ends every process in it when its last handle is closed, as
@@ -329,7 +360,7 @@ impl Job {
     ///
     /// The system's error when the job cannot be created, or its limit cannot be set.
     pub fn anonymous_kill_on_close() -> io::Result<Job> {
-        Job::create_limited(None, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+        Job::create_limited(None, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, None)
     }
 
     /// Creates an anonymous job as [`Job::anonymous_kill_on_close`] does, and lets a process in it create one outside
@@ -340,7 +371,7 @@ impl Job {
     ///
     /// As [`Job::anonymous_kill_on_close`].
     pub fn anonymous_kill_on_close_breakaway() -> io::Result<Job> {
-        Job::create_limited(None, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK)
+        Job::create_limited(None, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK, None)
     }
 
     /// Creates the job `name` as [`Job::create`] does, with nothing killed when it is dropped, and lets a process in it
@@ -351,13 +382,13 @@ impl Job {
     ///
     /// As [`Job::create`]; and the system's error when the limit cannot be set, the job's handle closed again.
     pub fn create_breakaway(name: &str) -> io::Result<Job> {
-        Job::create_limited(Some(name), JOB_OBJECT_LIMIT_BREAKAWAY_OK)
+        Job::create_limited(Some(name), JOB_OBJECT_LIMIT_BREAKAWAY_OK, None)
     }
 
     /// Creates the job `name`, or an anonymous one for `None`, with the limits `flags`; it ends every process in it when
     /// its last handle is closed only when they hold `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
-    fn create_limited(name: Option<&str>, flags: u32) -> io::Result<Job> {
-        let mut job = Job::created(name)?;
+    fn create_limited(name: Option<&str>, flags: u32, security: Option<&Descriptor>) -> io::Result<Job> {
+        let mut job = Job::created(name, security)?;
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = flags;
         // SAFETY: the handle is open for the whole call, with the `JOB_OBJECT_SET_ATTRIBUTES` access a new job's

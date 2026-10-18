@@ -98,7 +98,9 @@ It is how a caller in a main checkout gates a command that names another worktre
 
 A name is one or more printable ASCII characters, U+0021 to U+007E, `=` excepted. ASCII only keeps the ASCII-case check of the refused names below equal to Windows' own comparison of names, so a name that is not ASCII can never pass that check and then be read as one the gate protects. A value may hold anything but NUL (CR and LF included) and may be empty.
 
-The gate refuses a name it sets itself (the build-server settings, `UseSharedCompilation`, `GATE_SLOT_HELD`, `GATE_STATE_DIR` and the rest listed under [Command launching](#command-launching) and [The box side](#the-box-side)), any `GATE_` name, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG` and the machine paths the box keeps (`GODOT_PATH` among them, which a routed run sets itself), the same on both sides so one `--env` means the same on the PC and on a builder.
+The gate refuses a name it sets itself (the build-server settings, `UseSharedCompilation`, `GATE_SLOT_HELD`, `GATE_STATE_DIR`, the box's `GATE_BOX_JOB` and `GATE_BOX_EXE` and the rest listed under [Command launching](#command-launching) and [The box side](#the-box-side)), any `GATE_` name, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG` and the machine paths the box keeps (`GODOT_PATH` among them, which a routed run sets itself).
+
+The refusal is the same on both sides so one `--env` means the same on the PC and on a builder.
 
 It also refuses a name given twice in any ASCII case, and more than 64 names or 32 KiB of names and values together. The gate's own settings are applied after the caller's pairs, so no pair undoes one.
 
@@ -1125,6 +1127,17 @@ What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K
   A critical gate there is refused as under a live heavy or light gate (below). A heavy gate whose only stand-in is light says `gate: the light slot of gate <A> does not cover a heavy gate; taking a heavy slot`, and a light gate turned heavy by a dropped `--no-build` searches again for a heavy stand-in.
 
   A parent ends the processes its command left in its job once the command exits, but spares a `gate.exe` there, its launcher, its process tree and its job ([Run end](#watchdog)), so the late take above still covers a covered gate the command left running.
+- **The in-box gate.** A routed run's box gives its command `GATE_BOX_JOB`, the name of the run's job ([The box side](#the-box-side)). A gate that reads it (`Environment` in `resolve.rs`, beside `GATE_SLOT_HELD`) trusts it only when the name has the box's shape, `Local\` or `Global\` and then `gate-remote-<key>-<12 hex>`, and that job holds this gate's own process: asked from the gate's own handle, with no ancestor walk, since a box run's job lets nothing break away.
+
+  The check runs first, before the slot marker is read, and a trusted job wins over a marker.
+
+  A name of another shape is ignored without opening a job. A job that does not hold the gate says `gate: ignored GATE_BOX_JOB: this gate does not run inside its job`; one that cannot be opened or queried says `gate: ignored GATE_BOX_JOB: cannot judge its job: <error>`. Either way the gate goes on as without the variable and removes `GATE_BOX_JOB` from its own command's environment.
+
+  A trusted gate (`Nesting::InBox`) is in-box, whatever slot it asked for. It takes no slot, ticket or claim, never waits and never routes, the router seeing a covering parent, and says `gate: inside a routed run; running without a slot on this builder`. It prints no cores hint and no route hint and opens no durations, so `--timeout auto:N` uses its floor.
+
+  It still runs its command with its own job, ceiling, stall watchdog, log and verdict, at the priority and watchdog demand of the slot it asked for, a critical gate running as heavy. Its journal `take` has `slots: []`, `waitedSeconds` 0 and the kind as asked (critical as heavy).
+
+  Its command gets no `GATE_SLOT_HELD`, and gets `GATE_BOX_JOB` and `GATE_BOX_EXE` as the gate had them, so a gate nested deeper is in-box too. A dropped `--no-build` says `gate: dropped --no-build: <reason>; building on no slot`.
 - A critical gate under a heavy or light marker is refused (K7) on stderr only, exit 2, before the log mutex, with nothing queued or journalled: `gate: --slot critical cannot run under the <held kind> slot of gate <pid>: it would wait for that slot for good; run the critical command outside that gate` (`-Slot critical` through the PowerShell spelling).
 - A heavy gate under a light marker takes its own slot and says `gate: the <held kind> slot of gate <pid> does not cover a <kind> gate; taking a <kind> slot` just before its local take (after a Local route or a fallback, before its wait lines); a gate routed to the builder never says it.
 - **No slot.** A `none` run takes nothing and is never held by the drain or the barrier. Its marker is `GATE_SLOT_HELD=none:<pid>:<start>[:<h>]`. A gate under a `none` marker (the case `Nesting::Beside`) takes its own slot as a top-level gate would: a critical child takes the machine and is never refused (K7 applies to heavy and light markers only).
@@ -1395,6 +1408,8 @@ The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wai
   Every command gets the gate's environment with these set over it (names compared case-insensitively): `GATE_SLOT_HELD=<kind>:<pid>:<start_ms>[:<h>]` (the held slot's marker, `none` too, or the parent's for a covered gate; a gate lent its light parent's slot holds none and hands `heavy:<its pid>:<its start>[:<h>]`, naming itself), `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`, both the run id, `MSBUILDUSESERVER=0` (over an inherited value), `DOTNET_CLI_USE_MSBUILD_SERVER=0` (kept, P3), `MSBUILDDISABLENODEREUSE=1` (over an inherited value), `UseSharedCompilation=false` (over an inherited value), and `GATE_STATE_DIR=<root>` under a non-default root.
 
   The caller's `--env` pairs ([Command environment](#command-environment)) are set over the gate's environment first, so the settings above come last and no pair can undo one.
+
+  `GATE_BOX_JOB` and `GATE_BOX_EXE`, given to a box run's command ([The box side](#the-box-side)), pass through a trusted in-box gate to its command, which gets no `GATE_SLOT_HELD`; any other gate removes `GATE_BOX_JOB` from its command's environment.
 
   `UseSharedCompilation=false` keeps Roslyn's compiler server from idling in the command's job for up to ten minutes after a build: a command that waits for its whole job, as Godot's console wrapper does, never ended while the server held it, and the stall kill fired. The same setting is on a `gate box run` command and a routed one.
 
@@ -2620,6 +2635,12 @@ Built verbs:
 
   `GODOT_PATH` is then set for every command of the run to the Godot program that resolved: the root's install when the root is set, else, with no root, the program the `PATH` gave a Godot console word, or the `PATH`'s `Godot_console.exe` for any other. It is set after the caller's pairs and the gate's own settings, so none undoes it. When no Godot program resolves, `GODOT_PATH` is removed, an inherited value included. A run with no `GodotVersion` leaves the environment as before.
 
+  The command's environment also gets the box's own names, after the pairs, so no caller can send one (any `GATE_` name is refused): `GATE_BOX_EXE`, the box's own image path, and `GATE_BOX_JOB`, the run's job name. The name is spelled `Global\gate-remote-<key>-<12 hex>` when the box runs in session 0 (an ssh logon, where `Local\` is the global namespace), so a desktop command in the console session reaches the same object, else as created.
+
+  A gate the command starts reads them ([Critical drain and nesting](#critical-drain-and-nesting), the in-box gate).
+
+  A box that cannot read its own path ends the run before any job is made: status 1, `the box's own path cannot be read: <error>`.
+
   The command's environment also sets `Logging__EventLog__LogLevel__Default=None`, replacing any inherited value, so a .NET host with default logging writes nothing to the Windows Event Log; its console output is unchanged. Of the groups the Application log's default access lets write, a restricted copy of the box's token could hold only Administrators, INTERACTIVE, SERVICE, BATCH and WRITE_RESTRICTED, and the command's token holds none of them.
 
   On a builder without the setup grant below (a fresh or reimaged one), the host's default EventLog provider would throw `Access is denied` on its first Warning; the variable keeps such a host working wherever the grant is missing.
@@ -2639,6 +2660,8 @@ Built verbs:
   `gate box stop` sets it whether or not the job exists yet (a missing event is silent), then terminates the job when there is one. The run looks at it once just before it creates the job (set: the stop line and exit 1, nothing started), and again after the command is assigned to the job and before it is resumed, on every launch.
 
   Set means a `stop` came first: the command is ended unstarted, the job is terminated, and the run prints `gate: the gate failed while running the command: the job <name> was stopped before the command started` and exits 1. An event that cannot be read prints `gate: remote cannot read the stop signal of job <name>: <error>; starting the command`, and the command starts.
+
+  The run's job, and the desktop hand-off's, is made with an explicit DACL (`gate_win32::box_job_descriptor`, through `Job::create_secured` and `Job::create_kill_on_close_secured`): SYSTEM and Administrators full access. The box's user gets `JOB_OBJECT_QUERY` only when the box's token is elevated, and full access when it is not, since `gate box stop` and the job-name wait reopen the job as that user and an in-box gate lists the job to judge it.
 
   A job name already held prints `gate: the job <name> already exists; a run's job name must be new` and exits 1. A command that cannot start prints `gate: could not start <word>[ (<resolved>)]: <message>` and exits 127, the word and the resolved path with their control characters escaped; a failure of the gate after the start prints `gate: the gate failed while running the command: <problem>` and exits 1. If the box panics after the resume, the job is terminated with 124.
 

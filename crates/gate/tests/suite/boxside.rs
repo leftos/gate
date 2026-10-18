@@ -20,8 +20,8 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::support::{
-    Case, Closed, Escapee, FAKE_TOOL, GIT_REDIRECTS, Go, Outcome, Running, allow_breakaway, box_payload, build_version, copy_tool, finish, junction,
-    shown, start_with_closed, start_with_stdin, wait_until, wait_until_closed,
+    Case, Closed, Escapee, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, Outcome, Running, UNTIL_KILLED, allow_breakaway, box_payload, build_version,
+    copy_tool, finish, junction, shown, start_with_closed, start_with_stdin, wait_until, wait_until_closed,
 };
 
 mod desktop;
@@ -1357,7 +1357,11 @@ fn stub_git(stub: &Path, parked: &Path, go: &Path) {
     fs::write(
         stub.join("git.cmd"),
         format!(
-            "@echo off\r\nif exist \"{go}\" goto real\r\necho parked>\"{parked}\"\r\n:wait\r\nif exist \"{go}\" goto real\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n:real\r\n\"{real}\" %*\r\n",
+            concat!(
+                "@echo off\r\nif exist \"{go}\" goto real\r\necho parked>\"{parked}\"\r\n",
+                ":wait\r\nif exist \"{go}\" goto real\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n",
+                ":real\r\n\"{real}\" %*\r\n",
+            ),
             go = shown(go),
             parked = shown(parked),
             real = shown(&real),
@@ -1564,6 +1568,171 @@ fn box_run_gives_the_command_the_payloads_env() {
         outcome.stdout, "x\nfalse\n",
         "the command reads the payload's Env, not the box's own: {outcome:?}"
     );
+}
+
+#[test]
+fn box_run_tells_its_command_the_box_exe_and_job() {
+    let case = Case::new("box_run_box_names");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "env", "GATE_BOX_JOB", "env", "GATE_BOX_EXE"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout,
+        format!("{}\n{GATE}\n", handed(field(&payload, "Job"))),
+        "the command reads the job the payload named, as it reaches it from its session, and the box's own image: {outcome:?}"
+    );
+}
+
+/// The line a gate inside a box run's job says of it.
+const IN_BOX_LINE: &str = "gate: inside a routed run; running without a slot on this builder";
+
+/// The words of the built gate's `run` of `command` on a `slot` slot under the ceiling `timeout`, its log `<name>.log`
+/// and its state root `<name>-state` in the case's folder, so it never touches the machine's state root or slot names.
+fn inner_gate(case: &Case, name: &str, slot: &str, timeout: &str, command: &[String]) -> Vec<String> {
+    let folder = case.folder();
+    let mut words: Vec<String> = [GATE, "run", "--state-dir"].map(str::to_owned).to_vec();
+    words.push(shown(&folder.join(format!("{name}-state"))));
+    words.extend(["--slot", slot, "--timeout", timeout, "--log"].map(str::to_owned));
+    words.push(shown(&folder.join(format!("{name}.log"))));
+    words.push("--".to_owned());
+    words.extend_from_slice(command);
+    words
+}
+
+/// `words` as owned words.
+fn owned(words: &[&str]) -> Vec<String> {
+    words.iter().map(|word| (*word).to_owned()).collect()
+}
+
+/// A box run whose command is `words`, snapshotted, to its end.
+fn box_run_of(case: &Case, words: &[String]) -> Outcome {
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let mut payload = box_payload(case, "k", &words);
+    snapshot(case, &mut payload, &[("a.txt", "a\n")]);
+    run_box(case, &payload)
+}
+
+/// A box run whose command is the built gate's heavy `run` of `command` under the ceiling `timeout` ([`inner_gate`],
+/// named `inner`), to its end.
+fn box_run_of_a_gate(case: &Case, timeout: &str, command: &[&str]) -> Outcome {
+    box_run_of(case, &inner_gate(case, "inner", "heavy", timeout, &owned(command)))
+}
+
+/// The name the box hands its command for the job `job` it created: `Global\` in place of `Local\` when it runs in
+/// session 0, as a box of an ssh logon does, else the name as created. The suite and the box it starts share a session.
+fn handed(job: &str) -> String {
+    match (gate_win32::own_session(), job.strip_prefix(r"Local\")) {
+        (Ok(0), Some(rest)) => format!(r"Global\{rest}"),
+        _ => job.to_owned(),
+    }
+}
+
+/// Asserts the gate named `name` ([`inner_gate`]) took no slot: its journal's `take` is of no slot, waited for nothing,
+/// as a no-slot run journals it.
+fn assert_took_no_slot(case: &Case, name: &str) {
+    let journal = fs::read_to_string(case.folder().join(format!("{name}-state")).join("events.jsonl")).expect("the gate wrote its journal");
+    let take = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("a journal line is JSON"))
+        .find(|event| event["event"] == "take")
+        .expect("the gate journals its take");
+    assert_eq!(take["slots"], json!([]), "{name}'s take of no slot: {take}");
+    assert_eq!(take["waitedSeconds"].as_f64(), Some(0.0), "{name} waited for nothing: {take}");
+}
+
+#[test]
+fn a_gate_started_inside_a_box_run_keeps_its_ceiling_and_takes_no_slot() {
+    let case = Case::new("box_inner_gate_ceiling");
+
+    let outcome = box_run_of_a_gate(&case, "1", &[FAKE_TOOL, "sleep", UNTIL_KILLED]);
+
+    assert_eq!(outcome.code, Some(124), "the inner gate's ceiling killed its command: {outcome:?}");
+    let stderr: Vec<&str> = outcome.stderr.lines().collect();
+    assert!(stderr.contains(&IN_BOX_LINE), "{outcome:?}");
+    assert!(
+        stderr
+            .iter()
+            .any(|line| line.starts_with("gate: TIMED OUT after ") || line.starts_with("gate: BACKSTOP: ")),
+        "the inner gate's own ceiling kill line: {outcome:?}"
+    );
+    assert!(
+        !stderr.iter().any(|line| line.starts_with("gate: not routed")),
+        "the inner gate stays here silently: {outcome:?}"
+    );
+    assert_took_no_slot(&case, "inner");
+}
+
+#[test]
+fn a_gate_started_inside_a_box_run_passes_its_command_s_status() {
+    let case = Case::new("box_inner_gate_passes");
+
+    let outcome = box_run_of_a_gate(&case, "120", &[FAKE_TOOL, "out", "inner ran"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let stderr: Vec<&str> = outcome.stderr.lines().collect();
+    assert!(stderr.contains(&IN_BOX_LINE), "{outcome:?}");
+    // The box forwards the inner gate's console with the command's output, so the verdict line comes on its stdout.
+    assert!(
+        outcome.stdout.lines().any(|line| line.starts_with("gate: passed in ")),
+        "the inner gate's own verdict: {outcome:?}"
+    );
+    let log = fs::read_to_string(case.folder().join("inner.log")).expect("the inner gate wrote its log");
+    assert!(log.contains("inner ran"), "{log}");
+    assert_took_no_slot(&case, "inner");
+}
+
+#[test]
+fn a_gate_started_inside_a_box_run_hands_its_command_the_box_names_and_no_marker() {
+    let case = Case::new("box_inner_gate_env");
+    let command = [FAKE_TOOL, "env", "GATE_SLOT_HELD", "env", "GATE_BOX_JOB", "env", "GATE_BOX_EXE"];
+    let words = inner_gate(&case, "inner", "heavy", "120", &owned(&command));
+    let words_text: Vec<&str> = words.iter().map(String::as_str).collect();
+    let mut payload = box_payload(&case, "k", &words_text);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let log = fs::read_to_string(case.folder().join("inner.log")).expect("the inner gate wrote its log");
+    let said: Vec<&str> = log.lines().take(3).collect();
+    assert_eq!(
+        said,
+        ["fake-tool: GATE_SLOT_HELD is not set", handed(field(&payload, "Job")).as_str(), GATE],
+        "no marker, and the box's names unchanged: {log}"
+    );
+}
+
+#[test]
+fn a_gate_two_levels_inside_a_box_run_takes_no_slot_either() {
+    let case = Case::new("box_inner_gate_deep");
+    let deep = inner_gate(&case, "deep", "heavy", "120", &owned(&[FAKE_TOOL, "out", "deep ran"]));
+
+    let outcome = box_run_of(&case, &inner_gate(&case, "inner", "heavy", "120", &deep));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let inner_log = fs::read_to_string(case.folder().join("inner.log")).expect("the inner gate wrote its log");
+    assert!(
+        inner_log.contains(IN_BOX_LINE),
+        "the deeper gate said it runs inside the box run: {inner_log}"
+    );
+    assert!(!inner_log.contains("GATE_BOX_JOB"), "the deeper gate trusted the box job: {inner_log}");
+    assert_took_no_slot(&case, "inner");
+    assert_took_no_slot(&case, "deep");
+}
+
+#[test]
+fn a_critical_gate_started_inside_a_box_run_takes_no_slot() {
+    let case = Case::new("box_inner_gate_critical");
+
+    let outcome = box_run_of(&case, &inner_gate(&case, "inner", "critical", "120", &owned(&[FAKE_TOOL, "exit", "0"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.lines().any(|line| line == IN_BOX_LINE), "{outcome:?}");
+    assert!(!outcome.stderr.contains("holds the machine"), "no machine taken: {outcome:?}");
+    assert_took_no_slot(&case, "inner");
 }
 
 #[test]
@@ -2591,6 +2760,23 @@ fn box_run_starts_an_elevated_session_s_command_non_elevated() {
         lines.iter().any(|line| line == "network absent" || line == "network deny-only"),
         "NETWORK absent or deny-only, never enabled: {lines:?}"
     );
+}
+
+#[test]
+#[ignore = "needs an elevated session on a builder: run by hand over ssh"]
+fn box_run_lets_an_elevated_session_s_inner_gate_judge_the_box_job() {
+    let case = Case::new("box_inner_gate_elevated");
+
+    let outcome = box_run_of_a_gate(&case, "120", &[FAKE_TOOL, "out", "inner ran"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let stderr: Vec<&str> = outcome.stderr.lines().collect();
+    assert!(
+        stderr.contains(&IN_BOX_LINE),
+        "the unelevated command may open the job to list it: {outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("ignored GATE_BOX_JOB"), "{outcome:?}");
+    assert_took_no_slot(&case, "inner");
 }
 
 #[test]

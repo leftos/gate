@@ -59,6 +59,28 @@ pub(crate) fn runs_inside_command_with<T: Borrow<ProcessTree>>(root: &StateRoot,
     runs_inside(OpenedJob::open_to_list(&name), tree, &gates, OpenedJob::holds)
 }
 
+/// Whether the job named `name`, a box run's job ([`crate::environment::BOX_JOB_VARIABLE`]) opened to list by that
+/// name, holds this gate's own process, by the start its own handle gives. No ancestor is asked and no snapshot is
+/// taken: a box run's job lets no process break away, so a gate started inside the run is in its job itself. Outside
+/// when no job has the name or the job does not hold this gate; unjudged, for the system's reason, when the job
+/// exists and cannot be opened, this gate's start cannot be read or the query fails.
+pub(crate) fn job_holds_this_gate(name: &str) -> Binding {
+    let job = match OpenedJob::open_to_list(name) {
+        Ok(Some(job)) => job,
+        Ok(None) => return Binding::Outside,
+        Err(error) => return Binding::Unjudged(error.to_string()),
+    };
+    let created = match gate_win32::process_start() {
+        Ok(created) => created,
+        Err(error) => return Binding::Unjudged(format!("cannot read this gate's start: {error}")),
+    };
+    match job.holds(std::process::id(), created) {
+        Ok(Membership::Member) => Binding::Inside,
+        Ok(Membership::Outside | Membership::NotOpened | Membership::Reused) => Binding::Outside,
+        Err(error) => Binding::Unjudged(error.to_string()),
+    }
+}
+
 /// A snapshot of the processes without their command lines, as the walk reads it.
 pub(crate) fn snapshot() -> ProcessTree {
     ProcessTree::new(Win32ProcessTable.snapshot_without_command_lines())

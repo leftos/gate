@@ -457,6 +457,20 @@ pub fn session_of(process: BorrowedHandle<'_>) -> io::Result<u32> {
     Ok(session)
 }
 
+/// The id of the session this process runs in (`ProcessIdToSessionId` of its own pid).
+///
+/// # Errors
+///
+/// The system's error when the session cannot be read.
+pub fn own_session() -> io::Result<u32> {
+    let mut session = 0;
+    // SAFETY: `ProcessIdToSessionId` writes only to `session`, which is writable.
+    if unsafe { ProcessIdToSessionId(std::process::id(), &raw mut session) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(session)
+}
+
 /// The full path of the program file the process behind `process` runs (`QueryFullProcessImageNameW`, in its Win32
 /// form), which needs `PROCESS_QUERY_LIMITED_INFORMATION` access.
 ///

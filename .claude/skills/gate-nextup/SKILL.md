@@ -77,6 +77,8 @@ The machine-alone cases also include `remote_inputs::a_put_whose_box_works_silen
 
 `boxside::msys::tests::a_start_up_killed_beside_the_keeper_leaves_the_next_sh_working` is machine-alone on a builder: run it over plain ssh on an idle builder, never routed and never on this PC, whose long-lived MSYS processes hide the fault it proves.
 
+`boxside::box_run_lets_an_elevated_session_s_inner_gate_judge_the_box_job` needs an elevated session on a builder: run it by hand over plain ssh with `--run-ignored only`, after a push of the build that carries it.
+
 That case proves "not stalled" inside a short window, with an escapee that runs at BelowNormal and can be starved into a false STALLED. When the diff touches the watchdog, also run `-Slot critical -TimeoutSeconds 600 -- cargo nextest run -p gate --all-features --cargo-profile test-release --run-ignored only -E 'binary(suite)'`.
 
 `stall::a_stall_kill_ends_a_packaged_app_the_command_started` is machine-dependent: it runs only where the first `pwsh` on PATH is the Store (WindowsApps) alias, and skips on this PC once the Store pwsh is removed. To drive it, run it through `gate.exe` directly with the alias first on PATH.

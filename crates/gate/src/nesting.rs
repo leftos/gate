@@ -3,7 +3,8 @@
 //! is refused when it is critical and the slot does not cover it, and otherwise takes a slot of its own, as it does
 //! under a parent that holds no slot. A marker is trusted only when this gate runs inside the command of the gate it
 //! names; otherwise the gate says so and runs as a gate under no parent. A binding that cannot be judged is trusted,
-//! and the gate says that too.
+//! and the gate says that too. A gate inside the job a box run names for its command (`GATE_BOX_JOB`) takes no slot at
+//! all; a box job that does not hold it, or cannot be judged to, is said and ignored.
 
 mod binding;
 
@@ -60,6 +61,71 @@ pub(crate) enum Nesting {
     /// A parent that holds no slot: the gate takes its own slot as a gate under no parent would, and says nothing of it;
     /// a critical gate takes the machine. The parent lends it nothing.
     Beside(Parent),
+    /// A gate inside the job of a box run on a builder (`GATE_BOX_JOB`), whatever slot it asks for: the routed run
+    /// holds the builder for it, so it takes no slot, never waits and never routes, and hands its command no slot marker.
+    /// Its command runs as the kind it asked for, but a critical one runs as heavy ([`Nesting::requested`]).
+    InBox,
+}
+
+/// The line a gate inside a box run's job says of it.
+const IN_BOX_LINE: &str = "gate: inside a routed run; running without a slot on this builder";
+/// The line a gate says when the box job its environment names does not hold it, or is no box run's job name.
+const NOT_HELD_LINE: &str = "gate: ignored GATE_BOX_JOB: this gate does not run inside its job";
+/// The hex digits of the nonce a box run's job name ends with, as the client draws it.
+const BOX_NONCE_DIGITS: usize = 12;
+
+/// What a gate makes of the box job its environment names (`GATE_BOX_JOB`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BoxJob {
+    /// No name, or an empty one: the gate runs as any other.
+    Unset,
+    /// A job that holds this gate: the gate runs inside the box run ([`Nesting::InBox`]).
+    Inside,
+    /// A job that does not, or a name that is no box run's job: the gate says so and runs as if the name were unset.
+    NotHeld,
+    /// A job that cannot be opened or listed, for this reason: the gate says so and runs as if the name were unset.
+    Unjudged(String),
+}
+
+impl BoxJob {
+    /// The line a gate says of this box job; only an ignored one has one.
+    pub(crate) fn line(&self) -> Option<String> {
+        match self {
+            BoxJob::NotHeld => Some(NOT_HELD_LINE.to_owned()),
+            BoxJob::Unjudged(reason) => Some(format!("gate: ignored GATE_BOX_JOB: cannot judge its job: {reason}")),
+            BoxJob::Unset | BoxJob::Inside => None,
+        }
+    }
+}
+
+/// What a gate makes of the box job `name` its environment names, `held` judging whether the job of a name holds this
+/// gate ([`binding::job_holds_this_gate`]). Only a box run's job name ([`box_job_shaped`]) is judged, and only a job
+/// judged to hold the gate is trusted: a name of another shape, or one that is not Unicode, is not held, and a job that
+/// cannot be judged is ignored too, so an unjudged box job never skips slots.
+pub(crate) fn box_job(name: Option<&OsStr>, held: impl FnOnce(&str) -> Binding) -> BoxJob {
+    let Some(name) = name.filter(|name| !name.is_empty()) else {
+        return BoxJob::Unset;
+    };
+    let Some(name) = name.to_str().filter(|name| box_job_shaped(name)) else {
+        return BoxJob::NotHeld;
+    };
+    match held(name) {
+        Binding::Inside => BoxJob::Inside,
+        Binding::Outside => BoxJob::NotHeld,
+        Binding::Unjudged(reason) => BoxJob::Unjudged(reason),
+    }
+}
+
+/// Whether `name` has the shape of a box run's job name: `Local\` or `Global\`, then `gate-remote-<key>-<nonce>` with a
+/// key that is not empty and a nonce of [`BOX_NONCE_DIGITS`] hex digits, as the box checks a payload's `Job`.
+fn box_job_shaped(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(r"Local\").or_else(|| name.strip_prefix(r"Global\")) else {
+        return false;
+    };
+    let Some((key, nonce)) = rest.strip_prefix("gate-remote-").and_then(|rest| rest.rsplit_once('-')) else {
+        return false;
+    };
+    !key.is_empty() && nonce.len() == BOX_NONCE_DIGITS && nonce.chars().all(|digit| digit.is_ascii_hexdigit())
 }
 
 /// A marker as read: the kind of slot its gate holds, the gate's pid and start, and the root hash after them.
@@ -78,7 +144,31 @@ impl Nesting {
     /// gate whose command this gate runs inside ([`enclosing`]), as that gate's late take stands in for the ended one:
     /// this gate is judged under that gate's slot as under a live parent's ([`Nesting::under`]), so a critical gate
     /// there is refused.
+    ///
+    /// A box job the gate's environment names (`GATE_BOX_JOB`) is judged first, by the job itself, never by the
+    /// seam ([`Nesting::read_with`]).
     pub(crate) fn read(environment: &Environment, kind: Slot, root: &ResolvedRoot, job_trusted: bool, console: &mut Console) -> Nesting {
+        Nesting::read_with(environment, kind, root, job_trusted, binding::job_holds_this_gate, console)
+    }
+
+    /// [`Nesting::read`], `held` judging whether the job of a name holds this gate: a box job the environment names that
+    /// holds it ([`box_job`]) makes it [`Nesting::InBox`], whatever its marker; one ignored is said, and the marker is
+    /// read as if no box job were named.
+    fn read_with(
+        environment: &Environment,
+        kind: Slot,
+        root: &ResolvedRoot,
+        job_trusted: bool,
+        held: impl FnOnce(&str) -> Binding,
+        console: &mut Console,
+    ) -> Nesting {
+        let in_box = box_job(environment.box_job.as_deref(), held);
+        if in_box == BoxJob::Inside {
+            return Nesting::InBox;
+        }
+        if let Some(line) = in_box.line() {
+            console.err(&line);
+        }
         let inside = |pid, start_ms| bound(&root.root, pid, start_ms, job_trusted);
         let nesting = Nesting::decide(environment.slot_held.as_deref(), kind, root.root.hash(), gate_liveness, inside);
         let (Nesting::Ended { marker, .. } | Nesting::Unbound { marker, .. }) = &nesting else {
@@ -167,7 +257,24 @@ impl Nesting {
                 let parent = found.map_or_else(|| parent.clone(), |found| Parent::standing_in(parent.marker.clone(), found));
                 Nesting::under(parent, Slot::Heavy)
             }
-            Nesting::Own | Nesting::Malformed(_) | Nesting::Ended { .. } | Nesting::Unbound { .. } => self.clone(),
+            Nesting::Own | Nesting::Malformed(_) | Nesting::Ended { .. } | Nesting::Unbound { .. } | Nesting::InBox => self.clone(),
+        }
+    }
+
+    /// The slot kind a gate asked for `kind` runs as under this nesting: heavy for a critical gate inside a box run,
+    /// which never raises itself to High priority on a builder, else `kind`.
+    pub(crate) fn requested(&self, kind: Slot) -> Slot {
+        match (self, kind) {
+            (Nesting::InBox, Slot::Critical) => Slot::Heavy,
+            _ => kind,
+        }
+    }
+
+    /// The slot kind a gate running as `kind` takes under this nesting: none inside a box run, else `kind`.
+    pub(crate) fn takes(&self, kind: Slot) -> Slot {
+        match self {
+            Nesting::InBox => Slot::None,
+            _ => kind,
         }
     }
 
@@ -227,6 +334,7 @@ impl Nesting {
                 parent.pid
             ),
             Nesting::Under(parent) => parent.uncovered_line(kind),
+            Nesting::InBox => IN_BOX_LINE.to_owned(),
         };
         Some(line)
     }
@@ -236,7 +344,7 @@ impl Nesting {
     pub(crate) fn unjudged_line(&self) -> Option<String> {
         match self {
             Nesting::Covered(parent) | Nesting::Refused(parent) | Nesting::Under(parent) | Nesting::Beside(parent) => parent.unjudged_line(),
-            Nesting::Own | Nesting::Malformed(_) | Nesting::Ended { .. } | Nesting::Unbound { .. } => None,
+            Nesting::Own | Nesting::Malformed(_) | Nesting::Ended { .. } | Nesting::Unbound { .. } | Nesting::InBox => None,
         }
     }
 }
@@ -490,14 +598,18 @@ fn digits(text: &str, most: usize) -> Option<u64> {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a decision that has no line must fail the test loudly")]
 mod tests {
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::io;
+    use std::path::PathBuf;
 
     use gate_args::{Slot, Spelling};
+    use gate_state::StateRoot;
     use gate_state::v1::CoveredMarker;
 
     use super::binding::Binding;
-    use super::{Enclosing, Nesting, Parent, candidates, enclosing};
+    use super::{BoxJob, Enclosing, Nesting, Parent, box_job, candidates, enclosing};
+    use crate::console::Console;
+    use crate::resolve::{Environment, ResolvedRoot};
     use crate::slots::Liveness;
 
     /// The hash of the state root every decision here is made under.
@@ -1077,6 +1189,137 @@ mod tests {
             Some("gate: running under the heavy slot of gate 4242"),
             "the decision's own line follows"
         );
+    }
+
+    /// The job a box run names for its command, as these cases give it.
+    const RUN_JOB: &str = r"Local\gate-remote-k-ab12cd34ef56";
+    /// The line a gate inside its box job says.
+    const IN_BOX: &str = "gate: inside a routed run; running without a slot on this builder";
+    /// The line a gate says of a box job that does not hold it.
+    const NOT_HELD: &str = "gate: ignored GATE_BOX_JOB: this gate does not run inside its job";
+
+    /// What a gate whose environment names [`RUN_JOB`] makes of it, `binding` whether that job holds it.
+    fn in_job(binding: Binding) -> BoxJob {
+        box_job(Some(OsStr::new(RUN_JOB)), |name| {
+            assert_eq!(name, RUN_JOB, "the job is opened by the name given");
+            binding
+        })
+    }
+
+    /// The environment of a gate given the marker `marker` and the box job `job`, each when given.
+    fn environment(marker: Option<&str>, job: Option<&str>) -> Environment {
+        Environment {
+            state_dir: None,
+            local_app_data: None,
+            git_index_file: None,
+            slot_held: marker.map(OsString::from),
+            box_job: job.map(OsString::from),
+        }
+    }
+
+    /// The nesting [`Nesting::read_with`] gives a heavy gate of `environment`, `binding` whether a job holds it, and
+    /// the lines it said.
+    fn read(environment: &Environment, binding: Binding) -> (Nesting, Vec<String>) {
+        let path = r"C:\Users\someone\AppData\Local\gate\v1";
+        let root = ResolvedRoot {
+            path: PathBuf::from(path),
+            root: StateRoot::new(path, Some(path)),
+        };
+        let mut console = Console::new();
+        let nesting = Nesting::read_with(environment, Slot::Heavy, &root, true, |_| binding, &mut console);
+        (nesting, console.take_notes())
+    }
+
+    #[test]
+    fn a_gate_inside_its_box_job_takes_no_slot() {
+        assert_eq!(in_job(Binding::Inside), BoxJob::Inside);
+        assert_eq!(BoxJob::Inside.line(), None, "a trusted box job is said by the nesting's own line");
+        let nesting = Nesting::InBox;
+        for kind in [Slot::Heavy, Slot::Light, Slot::None] {
+            assert_eq!(nesting.takes(kind), Slot::None, "a {kind:?} gate");
+            assert_eq!(nesting.requested(kind), kind, "a {kind:?} gate runs as the kind it asked for");
+            assert_eq!(nesting.line(kind, Spelling::Cli).as_deref(), Some(IN_BOX), "a {kind:?} gate");
+        }
+        assert_eq!(
+            (nesting.covering(), nesting.uncovering(), nesting.unjudged_line()),
+            (None, None, None),
+            "no parent gate's slot and no marker"
+        );
+        assert_eq!(
+            nesting.as_heavy(|| unreachable!("no parent is looked for")),
+            Nesting::InBox,
+            "a gate turned heavy still takes no slot"
+        );
+        assert_eq!(box_job(None, |_| unreachable!("no job is opened")), BoxJob::Unset, "an unset name");
+        assert_eq!(
+            box_job(Some(OsStr::new("")), |_| unreachable!("no job is opened")),
+            BoxJob::Unset,
+            "an empty name"
+        );
+        assert_eq!(BoxJob::Unset.line(), None);
+    }
+
+    #[test]
+    fn a_box_job_that_does_not_hold_the_gate_is_ignored_with_a_line() {
+        assert_eq!(in_job(Binding::Outside), BoxJob::NotHeld);
+        assert_eq!(BoxJob::NotHeld.line().as_deref(), Some(NOT_HELD));
+    }
+
+    #[test]
+    fn a_box_job_that_cannot_be_opened_is_ignored_with_a_line() {
+        let reason = "Access is denied. (os error 5)";
+        assert_eq!(
+            in_job(Binding::Unjudged(reason.to_owned())),
+            BoxJob::Unjudged(reason.to_owned()),
+            "an unjudged box job never skips slots"
+        );
+        let (nesting, said) = read(&environment(None, Some(RUN_JOB)), Binding::Unjudged(reason.to_owned()));
+        assert_eq!(nesting, Nesting::Own, "the gate runs as if no box job were named");
+        assert_eq!(said, [format!("gate: ignored GATE_BOX_JOB: cannot judge its job: {reason}")]);
+    }
+
+    #[test]
+    fn a_critical_gate_inside_a_box_job_takes_no_slot() {
+        assert_eq!(in_job(Binding::Inside), BoxJob::Inside);
+        let nesting = Nesting::InBox;
+        assert_eq!(nesting.takes(Slot::Critical), Slot::None, "no machine taken");
+        assert_eq!(nesting.requested(Slot::Critical), Slot::Heavy, "never raised to High on a builder");
+        assert_eq!(nesting.line(Slot::Critical, Spelling::Cli).as_deref(), Some(IN_BOX), "never refused");
+        assert_eq!(
+            (Nesting::Own.requested(Slot::Critical), Nesting::Own.takes(Slot::Critical)),
+            (Slot::Critical, Slot::Critical),
+            "a gate outside a box job runs as and takes its own kind"
+        );
+    }
+
+    #[test]
+    fn a_box_job_that_holds_the_gate_wins_over_its_marker() {
+        let marker = format!("light:{PID}:{START}:{HASH}");
+        let (nesting, said) = read(&environment(Some(&marker), Some(RUN_JOB)), Binding::Inside);
+        assert_eq!(nesting, Nesting::InBox, "the marker is not read");
+        assert_eq!(said, Vec::<String>::new(), "the nesting's own line comes later");
+    }
+
+    #[test]
+    fn a_name_that_is_no_box_run_s_job_is_ignored_without_opening_it() {
+        let names = [
+            r"Local\gate-job-4242",
+            r"Local\gate-remote--ab12cd34ef56",
+            r"Local\gate-remote-k-ab12cd34ef5",
+            r"Local\gate-remote-k-ab12cd34ef567",
+            r"Local\gate-remote-k-ab12cd34ef5g",
+            r"Session\1\gate-remote-k-ab12cd34ef56",
+            r"gate-remote-k-ab12cd34ef56",
+        ];
+        for name in names {
+            let judged = box_job(Some(OsStr::new(name)), |_| unreachable!("{name} is not opened"));
+            assert_eq!(judged, BoxJob::NotHeld, "{name}");
+        }
+        let (nesting, said) = read(&environment(None, Some(r"Local\gate-job-4242")), Binding::Inside);
+        assert_eq!((nesting, said), (Nesting::Own, vec![NOT_HELD.to_owned()]));
+        for name in [RUN_JOB, r"Global\gate-remote-k-ab12cd34ef56", r"Local\gate-remote-a-b-0123456789AB"] {
+            assert_eq!(box_job(Some(OsStr::new(name)), |_| Binding::Inside), BoxJob::Inside, "{name}");
+        }
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! covers the gate, the command started in its job with its environment and priority and waited for, the log completed,
 //! the failure markers scanned, the tail and the verdict line said, and the slot released.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -36,7 +37,7 @@ use crate::covered::Covered;
 use crate::durations::{
     Resolved, RunDurations, RunIdentity, Usual, ceiling_hint, expected_field, expected_line, raised_ceiling_line, resolve_ceiling, span_text,
 };
-use crate::environment::{self, Variables};
+use crate::environment::{self, BOX_JOB_VARIABLE, SLOT_HELD_VARIABLE, Variables};
 use crate::escaped::{self, Found, Reach, Reached, Recorded};
 use crate::journal::{self, RunJournal};
 use crate::late::{Late, LateOf, LateSlot};
@@ -90,10 +91,11 @@ const KEY_WAIT: Duration = Duration::from_secs(90);
 /// or 2 for a log inside the state root, a critical gate under a heavy or light parent's slot or a batch word refused
 /// before anything was queued.
 pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: &Environment, console: &mut Console) -> u32 {
-    let nesting = match admitted(request, log, root, environment, console) {
-        Ok(nesting) => nesting,
+    let (nesting, asked) = match admitted(request, log, root, environment, console) {
+        Ok(admitted) => admitted,
         Err(status) => return status,
     };
+    let request = &*asked;
     let gate = match ThisGate::read(request) {
         Ok(gate) => gate,
         Err(line) => {
@@ -127,17 +129,6 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         console.err(&format!("gate: {problem}"));
         return exit_status(GATE_FAILED);
     }
-    let interrupt = Interrupt::install()
-        .inspect_err(|error| {
-            console.err(&format!(
-                "gate: cannot install the Ctrl+C handler, so Ctrl+C ends the gate at once: {error}"
-            ));
-        })
-        .ok();
-    let host = Host {
-        processors: wait::processors(console),
-        interrupt,
-    };
     // The request and nesting of a run here that dropped its `--no-build` and asks for a heavy slot.
     let mut heavy = None;
     let mut run = Run {
@@ -148,7 +139,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         journal: RunJournal::open(root, &gate),
         gate,
         log,
-        host,
+        host: host(console),
         client,
         tag: None,
         warm_hash: None,
@@ -192,6 +183,22 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
     status
 }
 
+/// The machine the run waits and runs on: its processors, and the Ctrl+C handler, installed now; one that cannot be
+/// installed is said, and Ctrl+C then ends the gate at once.
+fn host(console: &mut Console) -> Host {
+    let interrupt = Interrupt::install()
+        .inspect_err(|error| {
+            console.err(&format!(
+                "gate: cannot install the Ctrl+C handler, so Ctrl+C ends the gate at once: {error}"
+            ));
+        })
+        .ok();
+    Host {
+        processors: wait::processors(console),
+        interrupt,
+    }
+}
+
 /// Has `run` take the request and nesting of a run here that asks for a heavy slot ([`Run::as_heavy`]), kept in
 /// `heavy`, when `local` dropped its `--no-build` ([`Run::local_words`]), and says the line saying so. Its journal
 /// lines, ticket and claim then name the heavy kind and the command it runs. A light parent whose slot no longer covers
@@ -216,8 +223,15 @@ fn take_heavy<'a>(run: &mut Run<'a>, heavy: &'a mut Option<(RunRequest, Nesting)
 
 /// The nesting `request` runs under, or the status of a run refused before anything is taken or written, its lines
 /// said: a log inside the state root, or a critical gate under a heavy or light parent's slot, which leaves an earlier
-/// log in place. Any other nesting's lines are said once the run knows the slot it asks for ([`say_nesting`]).
-fn admitted(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: &Environment, console: &mut Console) -> Result<Nesting, u32> {
+/// log in place. Any other nesting's lines are said once the run knows the slot it asks for ([`say_nesting`]). With the
+/// nesting, `request` as the gate runs it: a critical gate inside a box run runs as heavy ([`Nesting::requested`]).
+fn admitted<'r>(
+    request: &'r RunRequest,
+    log: &Path,
+    root: &ResolvedRoot,
+    environment: &Environment,
+    console: &mut Console,
+) -> Result<(Nesting, Cow<'r, RunRequest>), u32> {
     if log_in_state_root(log, &root.path) {
         console.err(&format!(
             "gate: the log {} is inside the gate's state folder {}",
@@ -231,7 +245,13 @@ fn admitted(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: 
         say_nesting(&nesting, request, console);
         return Err(u32::from(USAGE_STATUS));
     }
-    Ok(nesting)
+    let slot = nesting.requested(request.slot);
+    let request = if slot == request.slot {
+        Cow::Borrowed(request)
+    } else {
+        Cow::Owned(RunRequest { slot, ..request.clone() })
+    };
+    Ok((nesting, request))
 }
 
 /// Says the lines of the `nesting` a gate of `request` runs under, once it is final: the line of a marker whose binding
@@ -243,7 +263,7 @@ fn say_nesting(nesting: &Nesting, request: &RunRequest, console: &mut Console) {
     }
     let said = match nesting {
         Nesting::Own | Nesting::Under(_) | Nesting::Beside(_) => None,
-        Nesting::Malformed(_) | Nesting::Ended { .. } | Nesting::Unbound { .. } | Nesting::Covered(_) | Nesting::Refused(_) => {
+        Nesting::Malformed(_) | Nesting::Ended { .. } | Nesting::Unbound { .. } | Nesting::Covered(_) | Nesting::Refused(_) | Nesting::InBox => {
             nesting.line(request.slot, request.spelling)
         }
     };
@@ -382,6 +402,12 @@ impl Plan {
             None => environment::slot_marker(request.slot.as_str(), gate, &root.root),
         };
         let variables = Variables::for_command(root, gate, &marker, &request.env);
+        // A gate inside a box run hands on no marker, so a gate nested in its command is judged by the box job alone;
+        // any other hands on no box job, which it ignored or was not given, so no gate nested in its command says so again.
+        let variables = match nesting {
+            Nesting::InBox => variables.without(SLOT_HELD_VARIABLE),
+            _ => variables.without(BOX_JOB_VARIABLE),
+        };
         let environment = variables
             .block()
             .map_err(|error| NotRun::failed(format!("gate: cannot build the command's environment: {error}")))?;
@@ -803,7 +829,8 @@ impl Run<'_> {
             self.lent = true;
             return (Route::Local { reason: None }, Placed::NotAsked);
         }
-        let covering = self.nesting.covering().is_some();
+        // A gate inside a box run stays here as a covered gate does, saying nothing.
+        let covering = self.nesting.covering().is_some() || matches!(self.nesting, Nesting::InBox);
         let route::Decided {
             route,
             placed: place,
@@ -1005,7 +1032,7 @@ impl Run<'_> {
     /// Waits for and takes the run's own slot of its pool into `hold`, or the machine for a critical run; a no-slot run
     /// takes nothing and waits for nothing ([`Run::take_nothing`]).
     fn take_own(&mut self, hold: &mut Hold, console: &mut Console) -> Taking {
-        match Takes::of(self.request.slot) {
+        match Takes::of(self.nesting.takes(self.request.slot)) {
             Takes::Pool(pool) => self.take(pool, self.queued_at, &mut hold.taken, console),
             Takes::Machine => self.take_machine(&mut hold.machine, console),
             Takes::Nothing => self.take_nothing(console),
@@ -1416,14 +1443,10 @@ impl Run<'_> {
     }
 
     /// The line a run says as it drops its `--no-build` for `reason`, naming where it builds: on the slot of the parent
-    /// gate that covers or lent it, else on a heavy slot of its own.
+    /// gate that covers or lent it, on no slot inside a box run, else on a heavy slot of its own ([`dropped_line`]).
     fn dropped_line(&self, reason: &str) -> String {
         let lent_by = self.lent.then(|| self.nesting.uncovering()).flatten();
-        let building = match self.nesting.covering().or(lent_by) {
-            Some(parent) => format!("building on the parent gate's {} slot", parent.held.as_str()),
-            None => "building on a heavy slot".to_owned(),
-        };
-        format!("gate: dropped --no-build: {reason}; {building}")
+        dropped_line(reason, self.nesting.covering().or(lent_by), matches!(self.nesting, Nesting::InBox))
     }
 
     /// Why a dotnet `--no-build` run of `words` in the worktree at `root` drops the word, `None` when it keeps it: the
@@ -2751,10 +2774,22 @@ struct Judged {
     timing: Option<Timing>,
 }
 
-/// Whether a run under `nesting` took a slot of its own: not when a parent's slot covers it, nor when a light parent
-/// lent it its slot (`lent`). A run here after a fallback from a builder takes its own local slot like any other.
+/// The line a run says as it drops its `--no-build` for `reason`: building on the slot of `parent`, the parent gate that
+/// covers or lent it, on no slot when it runs inside a box run (`in_box`), else on a heavy slot of its own.
+fn dropped_line(reason: &str, parent: Option<&Parent>, in_box: bool) -> String {
+    let building = match parent {
+        Some(parent) => format!("building on the parent gate's {} slot", parent.held.as_str()),
+        None if in_box => "building on no slot".to_owned(),
+        None => "building on a heavy slot".to_owned(),
+    };
+    format!("gate: dropped --no-build: {reason}; {building}")
+}
+
+/// Whether a run under `nesting` took a slot of its own: not when a parent's slot covers it, inside a box run, nor when
+/// a light parent lent it its slot (`lent`). A run here after a fallback from a builder takes its own local slot like any
+/// other.
 fn takes_own_slot(nesting: &Nesting, lent: bool) -> bool {
-    nesting.covering().is_none() && !lent
+    nesting.covering().is_none() && !matches!(nesting, Nesting::InBox) && !lent
 }
 
 /// The cores line of `judged`, when its slot did not fit: only a passed run that ran here on its own light or heavy
@@ -2992,8 +3027,8 @@ mod tests {
     use gate_watchdog::{Cores, Hint};
 
     use super::{
-        Ends, Judged, Pass, ROUTE_HINT_MIN_WALL, RouteJudged, Stopper, Timing, brought_everything_back, cores_hint_for, cores_line, earlier,
-        holder_claim, interrupted, key_wait_left, key_wait_line, kill, log_in_state_root, passed_line, records_after, route_hint_for,
+        Ends, Judged, Pass, ROUTE_HINT_MIN_WALL, RouteJudged, Stopper, Timing, brought_everything_back, cores_hint_for, cores_line, dropped_line,
+        earlier, holder_claim, interrupted, key_wait_left, key_wait_line, kill, log_in_state_root, passed_line, records_after, route_hint_for,
         route_hint_line, stop, takes_own_slot,
     };
     use crate::console::Console;
@@ -3245,8 +3280,9 @@ mod tests {
             unjudged: None,
             stand_in: false,
         };
-        let rows: [(&str, Nesting, bool, bool); 6] = [
+        let rows: [(&str, Nesting, bool, bool); 7] = [
             ("covered by its parent's slot", Nesting::Covered(parent.clone()), false, false),
+            ("inside a box run, which takes no slot", Nesting::InBox, false, false),
             ("lent its light parent's slot", Nesting::Under(parent.clone()), true, false),
             ("under a parent whose slot does not cover it", Nesting::Under(parent), false, true),
             ("under no parent, here after a fallback or from the start", Nesting::Own, false, true),
@@ -3264,6 +3300,31 @@ mod tests {
         for (name, nesting, lent, want) in rows {
             assert_eq!(takes_own_slot(&nesting, lent), want, "{name}");
         }
+    }
+
+    #[test]
+    fn a_dropped_no_build_inside_a_box_run_builds_on_no_slot() {
+        let reason = r"app/App.csproj has no obj\project.assets.json here";
+        let parent = Parent {
+            held: Slot::Light,
+            pid: 4242,
+            start_ms: 1,
+            marker: "light:4242:1".to_owned(),
+            unjudged: None,
+            stand_in: false,
+        };
+        assert_eq!(
+            dropped_line(reason, None, true),
+            format!("gate: dropped --no-build: {reason}; building on no slot")
+        );
+        assert_eq!(
+            dropped_line(reason, None, false),
+            format!("gate: dropped --no-build: {reason}; building on a heavy slot")
+        );
+        assert_eq!(
+            dropped_line(reason, Some(&parent), false),
+            format!("gate: dropped --no-build: {reason}; building on the parent gate's light slot")
+        );
     }
 
     const HOT: Cores = Cores {

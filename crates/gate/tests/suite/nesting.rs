@@ -1346,3 +1346,27 @@ fn a_light_gate_under_a_critical_parent_that_ends_runs_as_light_under_a_heavy_st
     assert_eq!(a.ended(), 0);
     assert_eq!(events_of(&case, c.pid), ["covered"]);
 }
+
+#[test]
+fn a_gate_given_a_box_job_it_does_not_run_inside_ignores_it() {
+    let case = Case::new("a_gate_given_a_box_job_it_does_not_run_inside_ignores_it");
+    let mut command = case.gate(&heavy_words("out.log", &[], &[FAKE_TOOL, "exit", "0"]));
+    // A box run's job name no job has: no box run holds this gate.
+    command.env("GATE_BOX_JOB", format!(r"Local\gate-remote-nowhere-{:012x}", process::id()));
+
+    let outcome = finish(command);
+
+    assert_passed(&outcome);
+    let stderr: Vec<&str> = outcome.stderr.lines().collect();
+    assert!(
+        stderr.contains(&"gate: ignored GATE_BOX_JOB: this gate does not run inside its job"),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("inside a routed run"), "{outcome:?}");
+    let take = events(&case)
+        .into_iter()
+        .find(|event| event["event"] == "take")
+        .expect("the gate journalled its take");
+    let slot = StateRoot::new(&shown(&case.root()), None).object_name(KernelObject::HeavySlot(0));
+    assert_eq!(take["slots"], Value::from(vec![slot]), "its heavy slot, as usual: {take}");
+}

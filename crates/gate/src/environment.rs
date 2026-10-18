@@ -10,6 +10,14 @@ use gate_win32::{EnvironmentBlock, same_variable_name};
 use crate::resolve::ResolvedRoot;
 use crate::slots::ThisGate;
 
+/// The variable a box run gives its command naming the job the run's command runs in, as the box created it: a gate
+/// started inside that job runs without a slot ([`crate::nesting`]).
+pub(crate) const BOX_JOB_VARIABLE: &str = "GATE_BOX_JOB";
+/// The variable a box run gives its command naming the box's own image, the builder's gate.
+pub(crate) const BOX_EXE_VARIABLE: &str = "GATE_BOX_EXE";
+/// The variable a gate gives its command holding its slot marker ([`slot_marker`]).
+pub(crate) const SLOT_HELD_VARIABLE: &str = "GATE_SLOT_HELD";
+
 /// The variables a command is started with.
 pub(crate) struct Variables(Vec<(OsString, OsString)>);
 
@@ -83,7 +91,7 @@ impl Variables {
 /// `GATE_STATE_DIR` is unset, so a gate nested in the command uses the same root.
 fn overrides(root: &ResolvedRoot, run: &str, marker: &str) -> Vec<Override> {
     let state_dir = (!root.root.is_default()).then(|| root.path.clone().into_os_string());
-    let mut overrides = vec![(OsString::from("GATE_SLOT_HELD"), Some(OsString::from(marker)))];
+    let mut overrides = vec![(OsString::from(SLOT_HELD_VARIABLE), Some(OsString::from(marker)))];
     overrides.extend(build_servers(run));
     overrides.push((OsString::from("GATE_STATE_DIR"), state_dir));
     overrides

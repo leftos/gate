@@ -83,6 +83,26 @@ pub fn protected_descriptor(facts: &TokenFacts) -> io::Result<Descriptor> {
     Descriptor::from_sddl(&protected_sddl(&facts.user, facts.integrity, facts.elevated))
 }
 
+/// The SDDL of the security a box run's job is made with, for the box's `user` SID and elevation `elevated`: a
+/// protected DACL granting full access to SYSTEM and Administrators, and to `user` only `JOB_OBJECT_QUERY` (0x4) when
+/// the box is elevated, so the command's unelevated copy of its token may list the job and nothing more, or full
+/// access when it is not, as the user's own default DACL grants it, which the command shares anyway.
+fn box_job_sddl(user: &str, elevated: bool) -> String {
+    let access = if elevated { "0x4" } else { "GA" };
+    format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;{access};;;{user})")
+}
+
+/// The security a box run's job is made with, for the box whose token says `facts` ([`box_job_sddl`]): a command run
+/// with the unelevated copy of an elevated box's token may open the job to list it, as a gate inside the run asks
+/// whether the job holds it, where the elevated token's default DACL grants only SYSTEM and Administrators.
+///
+/// # Errors
+///
+/// The system's error when the descriptor cannot be made.
+pub fn box_job_descriptor(facts: &TokenFacts) -> io::Result<Descriptor> {
+    Descriptor::from_sddl(&box_job_sddl(&facts.user, facts.elevated))
+}
+
 /// Whether the open folder `folder`, opened with `READ_CONTROL`, has the owner, the DACL and the label
 /// [`protected_descriptor`] gives a folder of this process's: owned by Administrators when this process is elevated and
 /// by this process's user when it is not, with the protected DACL granting full control to SYSTEM, Administrators and
@@ -218,10 +238,33 @@ mod tests {
     use windows_sys::core::BOOL;
 
     use super::{
-        Descriptor, inherit_security, is_protected_folder, protected_descriptor, security_text, set_security, text_of, without_auto_inherit,
+        Descriptor, box_job_descriptor, box_job_sddl, descriptor_text, inherit_security, is_protected_folder, protected_descriptor, security_text,
+        set_security, text_of, without_auto_inherit,
     };
     use crate::file::{Make, Share, make_folder_beneath, open_beneath_as};
     use crate::token::token_facts;
+
+    #[test]
+    fn a_box_job_lets_the_elevated_box_s_user_only_list_it_and_the_unelevated_one_do_anything() {
+        let user = "S-1-5-21-1-2-3-1001";
+        assert_eq!(box_job_sddl(user, true), format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x4;;;{user})"));
+        assert_eq!(box_job_sddl(user, false), format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{user})"));
+        for elevated in [true, false] {
+            let facts = crate::token::TokenFacts {
+                elevated,
+                ..token_facts().expect("this process's token can be read")
+            };
+            let descriptor = box_job_descriptor(&facts).expect("the descriptor is made");
+            let text = descriptor_text(descriptor.as_ptr(), DACL_SECURITY_INFORMATION).expect("the descriptor reads back");
+            // The system writes 0x4 back by the SDDL name it shares with a folder's list-children right.
+            let user_entry = if elevated { "LC" } else { "GA" };
+            assert_eq!(
+                text,
+                format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;{user_entry};;;{})", facts.user),
+                "elevated {elevated}"
+            );
+        }
+    }
 
     /// A new, empty folder of the test `name`'s own, granted to this user outright: its DACL is what a case's
     /// assertions are made of, so it must not depend on the ACL the work folder above it hands down. An owner is

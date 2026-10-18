@@ -45,8 +45,8 @@ mod tree;
 mod trust;
 
 pub use adopt::{
-    EndWait, QueryOnlyProcess, RemoteProcess, check_received_output, creation_time_of, end_process, image_path_of, is_handle_value, parent_pid_of,
-    pid_of_process, pid_of_thread, same_object, session_of, thread_is_suspended, user_of,
+    EndWait, QueryOnlyProcess, RemoteProcess, check_received_output, creation_time_of, end_process, image_path_of, is_handle_value, own_session,
+    parent_pid_of, pid_of_process, pid_of_thread, same_object, session_of, thread_is_suspended, user_of,
 };
 pub use console::{Donor, Utf8Console};
 pub use create::spawn;
@@ -84,7 +84,9 @@ pub use file::{
     Make, Share, delete_opened, delete_tree_opened, file_id, make_folder_beneath, move_no_replace, names_beneath, on_network_volume, open_beneath,
     open_beneath_as, rename_beneath, rename_beneath_no_replace, reopen_through_filter, same_file,
 };
-pub use security::{Descriptor, inherit_security, is_protected_folder, protected_descriptor, security_text, without_auto_inherit};
+pub use security::{
+    Descriptor, box_job_descriptor, inherit_security, is_protected_folder, protected_descriptor, security_text, without_auto_inherit,
+};
 pub use thread::cancel_synchronous_io;
 pub use tree::{Membership, OpenedJob, StoppableProcess, WaitableProcess};
 pub use trust::{TRUSTED_OWNERS, Untrusted, check_installed_file};

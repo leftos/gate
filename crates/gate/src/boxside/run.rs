@@ -44,7 +44,7 @@ use crate::boxside::probe;
 use crate::boxside::stop::{Ending, STOPPED, stop_event_name, terminate_and_wait};
 use crate::boxside::tools;
 use crate::console::Console;
-use crate::environment::Variables;
+use crate::environment::{BOX_EXE_VARIABLE, BOX_JOB_VARIABLE, Variables};
 use crate::outputs::manifest::{Listing, Manifest};
 use crate::remote::{Refusal, refused_line, started_line};
 use crate::resolve::{self, Environment};
@@ -1276,14 +1276,17 @@ struct Prepared<'w> {
 
 /// Resolves `one`'s program in its place and writes its command line, with the environment [`command_variables`]
 /// composes, the program and a run's `GODOT_PATH` being [`resolved_command`]'s, before anything holds a job or the
-/// builder's desktop for it, so a desktop run gets the same program and environment as any run. `Err` with the run's answer when it cannot start: `Ok` with 127 for a program not found or one with no
-/// shell to run it, its line said; `Err` with 2 for a batch word refused, or 1 for the box's own failure, its line said.
+/// builder's desktop for it, so a desktop run gets the same program and environment as any run. `Err` with the run's
+/// answer when it cannot start: `Ok` with 127 for a program not found or one with no shell to run it, its line said;
+/// `Err` with 2 for a batch word refused, or 1 for the box's own failure, its line said.
 fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> Result<Prepared<'w>, Result<Ran, u32>> {
     let run = format!("gate-box-{}", request.nonce);
     let Some((word, rest)) = one.words.split_first() else {
         return Err(Err(failed(console, "the run has no command")));
     };
-    let (variables, found) = resolved_command(request.godot, word, command_variables(&request.env, &run), one.place);
+    let exe = std::env::current_exe().map_err(|error| Err(failed(console, &format!("the box's own path cannot be read: {error}"))))?;
+    let job = handed_job(request.job, gate_win32::own_session());
+    let (variables, found) = resolved_command(request.godot, word, command_variables(&request.env, &run, &job, &exe), one.place);
     let environment = variables
         .block()
         .map_err(|error| Err(failed(console, &format!("cannot build the command's environment: {error}"))))?;
@@ -1310,10 +1313,36 @@ fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> 
 
 /// The environment the payload's command is started with: the box's own, with the caller's `Env` pairs `env` set over
 /// it, then the gate's own settings for the run `run` — the build-server settings ([`Variables::with_build_servers`]),
-/// git's `safe.directory` ([`with_safe_directory`]) and the Event Log logging provider off ([`with_event_log_off`]).
-/// The caller's pairs stand before every setting the gate applies, so none of them can undo one.
-fn command_variables(env: &[(String, String)], run: &str) -> Variables {
+/// git's `safe.directory` ([`with_safe_directory`]), the Event Log logging provider off ([`with_event_log_off`]), and
+/// the box run's own names: [`BOX_JOB_VARIABLE`] the job `job` the command runs in, as the command reaches it
+/// ([`handed_job`]), and [`BOX_EXE_VARIABLE`] the box's own image `exe`. The caller's pairs stand before every setting
+/// the gate applies, so none of them can undo one.
+fn command_variables(env: &[(String, String)], run: &str, job: &str, exe: &Path) -> Variables {
     with_event_log_off(with_safe_directory(Variables::from_process().with_caller(env).with_build_servers(run)))
+        .with(BOX_JOB_VARIABLE, job)
+        .with(BOX_EXE_VARIABLE, &exe.to_string_lossy())
+}
+
+/// The name of the run's job `job` as the command reaches the object the box created: in session 0, where the box of
+/// an ssh logon runs and where `Local\` is the global namespace, `Global\` in place of a leading `Local\`, so a desktop
+/// command in the console session, whose own `Local\` names another object, reaches it too; in any other session, or
+/// when the box's own `session` cannot be read, the name as created.
+fn handed_job(job: &str, session: io::Result<u32>) -> String {
+    match (session, job.strip_prefix(r"Local\")) {
+        (Ok(0), Some(rest)) => format!(r"Global\{rest}"),
+        _ => job.to_owned(),
+    }
+}
+
+/// The run's job `name`, made with the security a box run's job is made with ([`gate_win32::box_job_descriptor`]),
+/// so the command may open it to list it, and kill-on-close when `kill_on_close` ([`Job::create_kill_on_close`]).
+pub(super) fn box_run_job(name: &str, kill_on_close: bool) -> io::Result<Job> {
+    let descriptor = gate_win32::token_facts().and_then(|facts| gate_win32::box_job_descriptor(&facts))?;
+    if kill_on_close {
+        Job::create_kill_on_close_secured(name, &descriptor)
+    } else {
+        Job::create_secured(name, &descriptor)
+    }
 }
 
 /// The variable a command of a run with a chosen Godot version reads the Godot install it resolved from.
@@ -1739,11 +1768,11 @@ fn create_stop_event(name: &str, console: &mut Console) -> Result<NamedEvent, u3
     NamedEvent::create_new_manual(&event).map_err(|error| failed(console, &format!("cannot create the event {event}: {error}")))
 }
 
-/// Creates the run's job `name`; a name some job already has is refused, so a run never shares a job and a stop meant
-/// for an earlier run never reaches it; shared, so the heartbeat's thread can read its CPU. Else the status 1, its line
-/// said.
+/// Creates the run's job `name` with a box run's job's security ([`box_run_job`]); a name some job already has is
+/// refused, so a run never shares a job and a stop meant for an earlier run never reaches it; shared, so the
+/// heartbeat's thread can read its CPU. Else the status 1, its line said.
 fn create_job(name: &str, console: &mut Console) -> Result<Arc<Job>, u32> {
-    job_made(Job::create(name), name, console)
+    job_made(box_run_job(name, false), name, console)
 }
 
 /// The run's job `name` as `made` gave it, shared, as [`create_job`] gives it; else the status 1, its line said, a
@@ -2554,11 +2583,13 @@ mod tests {
 
     use super::{
         CLOSED_STATUS, GIT_CONFIG_COUNT, Look, Of, One, Payload, Request, SHARING_VIOLATION, STARTING_COMMAND, before_the_job, client_gone,
-        command_spent, command_variables, gap_spent, look, prepared, remaining_budget, with_safe_directory, written_retrying,
+        command_spent, command_variables, gap_spent, handed_job, look, prepared, remaining_budget, with_safe_directory, written_retrying,
     };
+    use gate_args::{EnvRefusal, env_refusal};
+
     use crate::boxside::forward::OutputLock;
     use crate::console::Console;
-    use crate::environment::Variables;
+    use crate::environment::{BOX_EXE_VARIABLE, BOX_JOB_VARIABLE, Variables};
 
     #[test]
     fn a_warm_up_budget_left_is_rounded_up_to_whole_seconds() {
@@ -2846,7 +2877,7 @@ mod tests {
             ("Logging__EventLog__LogLevel__Default".to_owned(), "Warning".to_owned()),
         ];
 
-        let variables = command_variables(&caller, "gate-box-ab");
+        let variables = command_variables(&caller, "gate-box-ab", RUN_JOB, Path::new(BOX_IMAGE));
 
         assert_eq!(variables.get("MSBUILDUSESERVER"), Some(OsStr::new("0")), "the gate's value wins");
         assert_eq!(variables.get("DOTNET_CLI_USE_MSBUILD_SERVER"), Some(OsStr::new("0")));
@@ -2855,13 +2886,67 @@ mod tests {
         assert_eq!(variables.get("Logging__EventLog__LogLevel__Default"), Some(OsStr::new("None")));
     }
 
+    /// The job a payload names and the box's own image, as these cases give them to [`command_variables`].
+    const RUN_JOB: &str = r"Local\gate-remote-k-ab12cd34ef56";
+    const BOX_IMAGE: &str = r"C:\Program Files\gate\bin\gate.exe";
+
+    #[test]
+    fn command_variables_tell_the_command_the_box_s_exe_and_its_job_verbatim() {
+        let variables = command_variables(&[], "gate-box-ab", RUN_JOB, Path::new(BOX_IMAGE));
+
+        assert_eq!(
+            variables.get(BOX_JOB_VARIABLE),
+            Some(OsStr::new(RUN_JOB)),
+            "the job's name as the payload gave it"
+        );
+        assert_eq!(variables.get(BOX_EXE_VARIABLE), Some(OsStr::new(BOX_IMAGE)), "the box's own image");
+    }
+
+    #[test]
+    fn command_variables_hand_a_session_0_box_s_job_by_its_global_name() {
+        assert_eq!(
+            handed_job(RUN_JOB, Ok(0)),
+            r"Global\gate-remote-k-ab12cd34ef56",
+            "session 0's Local\\ is Global\\"
+        );
+        assert_eq!(handed_job(RUN_JOB, Ok(2)), RUN_JOB, "another session's own Local\\");
+        assert_eq!(
+            handed_job(RUN_JOB, Err(io::Error::other("no session"))),
+            RUN_JOB,
+            "a session that cannot be read"
+        );
+        assert_eq!(
+            handed_job(r"Global\gate-remote-k-ab12cd34ef56", Ok(0)),
+            r"Global\gate-remote-k-ab12cd34ef56",
+            "a name of another namespace as it is"
+        );
+    }
+
+    #[test]
+    fn command_variables_keep_the_box_names_over_a_caller_pair_the_box_refuses_first() {
+        for name in [BOX_JOB_VARIABLE, BOX_EXE_VARIABLE, "gate_box_job", "Gate_Box_Exe"] {
+            assert_eq!(
+                env_refusal(name, "forged"),
+                Some(EnvRefusal::GateName),
+                "the box refuses a payload's {name} before any command is composed"
+            );
+            // Composed anyway, as an inherited value stands where a caller's pair would.
+            let caller = [(name.to_owned(), "forged".to_owned())];
+
+            let variables = command_variables(&caller, "gate-box-ab", RUN_JOB, Path::new(BOX_IMAGE));
+
+            assert_eq!(variables.get(BOX_JOB_VARIABLE), Some(OsStr::new(RUN_JOB)), "{name}");
+            assert_eq!(variables.get(BOX_EXE_VARIABLE), Some(OsStr::new(BOX_IMAGE)), "{name}");
+        }
+    }
+
     #[test]
     fn caller_git_config_entries_come_before_the_gates_safe_directory() {
         // A payload cannot reach this: the box refuses a `GIT_CONFIG_COUNT` a caller gives. An inherited count is what
         // the box composes over, and the caller's pair stands exactly where an inherited one does.
         let caller = [("GIT_CONFIG_COUNT".to_owned(), "9".to_owned())];
 
-        let variables = command_variables(&caller, "gate-box-ab");
+        let variables = command_variables(&caller, "gate-box-ab", RUN_JOB, Path::new(BOX_IMAGE));
 
         assert_eq!(
             variables.get(GIT_CONFIG_COUNT),

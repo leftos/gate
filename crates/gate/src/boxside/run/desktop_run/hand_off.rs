@@ -38,7 +38,7 @@ use crate::boxside::desktop::verify::{
 };
 use crate::boxside::payload::escaped;
 use crate::boxside::run::{
-    Beat, Launched, Look, One, Pipes, Prepared, Ran, Request, STARTING_COMMAND, Started, Stopper, failed, job_made, not_started,
+    Beat, Launched, Look, One, Pipes, Prepared, Ran, Request, STARTING_COMMAND, Started, Stopper, box_run_job, failed, job_made, not_started,
     stopped_before_start, wait_for_path, watch,
 };
 use crate::console::Console;
@@ -179,7 +179,7 @@ enum Exchanged {
 /// the helper could not create is said after the marker, as a command that could not be started (127).
 pub(super) fn hand_off(here: &Here<'_, '_>, console: &mut Console) -> Result<Ran, DesktopEnd> {
     let program = identity_of(&here.prepared.application).map_err(|error| here.machinery(with_error(PROGRAM_UNREAD, &error), console))?;
-    let job = match Job::create_kill_on_close(here.request.job) {
+    let job = match box_run_job(here.request.job, true) {
         Err(error) if error.kind() != io::ErrorKind::AlreadyExists => {
             return Err(here.machinery(with_error(JOB_UNMADE, &error), console));
         }
