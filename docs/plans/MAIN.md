@@ -12,9 +12,6 @@
 - [/] GATE-440 Map and trial routing all of herdr-gpui's, yaat-server's and agent-park's heavy work — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [!] GATE-468 Route Unreal Engine packaging to the builder with an unreal toolchain pin — High · Remote
-- [!] GATE-472 Map and trial routing ue-mcp's heavy work — High · Remote
-- [ ] GATE-526 Bring back a routed build's coverage source-roots mapping files with the PC's paths — High · Remote
-- [ ] GATE-527 Find and fix what splits a -name=X:/path argument at the drive colon — High · Remote
 
 ## Remote
 
@@ -151,6 +148,11 @@
 - [ ] GATE-523 Escape the sibling name and root in the routed-with-siblings line
 - [ ] GATE-524 Match .gitattributes case-insensitively on the PC when judging a snapshot's LFS need
 - [ ] GATE-525 Keep install output from forging the box's refusal tag before the start marker
+- [ ] GATE-528 Measure whether a routed build's coverage mapping files need the builder's NuGet root mapped to the PC's
+- [ ] GATE-529 Take over or plainly refuse a builder's empty LFS folder left by a checkout before GATE-469
+- [ ] GATE-530 Check for the .NET Framework SDK an Unreal-pinned repo's builds need
+- [ ] GATE-531 Skip any outputs member whose PC file is held at its move, not only root-recording ones
+- [ ] GATE-532 Take over the builder toolchain installer from claude-config
 
 ## Design
 
