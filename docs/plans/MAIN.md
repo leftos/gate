@@ -12,6 +12,9 @@
 - [/] GATE-440 Map and trial routing all of herdr-gpui's, yaat-server's and agent-park's heavy work — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [!] GATE-468 Route Unreal Engine packaging to the builder with an unreal toolchain pin — High · Remote
+- [/] GATE-529 Take over or plainly refuse a builder's empty LFS folder left by a checkout before GATE-469 — High · Remote
+- [/] GATE-530 Check for the .NET Framework SDK an Unreal-pinned repo's builds need — High · Remote
+- [ ] GATE-533 Give the builder's work root the security the box's deployment prerequisites state — High · Remote
 
 ## Remote
 
@@ -148,11 +151,7 @@
 - [ ] GATE-523 Escape the sibling name and root in the routed-with-siblings line
 - [ ] GATE-524 Match .gitattributes case-insensitively on the PC when judging a snapshot's LFS need
 - [ ] GATE-525 Keep install output from forging the box's refusal tag before the start marker
-- [ ] GATE-528 Measure whether a routed build's coverage mapping files need the builder's NuGet root mapped to the PC's
-- [ ] GATE-529 Take over or plainly refuse a builder's empty LFS folder left by a checkout before GATE-469
-- [ ] GATE-530 Check for the .NET Framework SDK an Unreal-pinned repo's builds need
-- [ ] GATE-531 Skip any outputs member whose PC file is held at its move, not only root-recording ones
-- [ ] GATE-532 Take over the builder toolchain installer from claude-config
+- [ ] GATE-535 Stop the elevated builder installer from running files a routed command can write
 
 ## Design
 
@@ -249,3 +248,8 @@
 - [ ] GATE-514 Keep a routed command's info/attributes from steering later LFS runs in its work folder
 - [ ] GATE-515 Count a git-lfs probe that does not answer as missing for an LFS run
 - [ ] GATE-516 Let a pair whose sibling cannot be listed route when no repo of it uses LFS
+- [ ] GATE-534 Map the builder's NuGet root to the PC's on the original side of a routed build's coverage mapping files
+
+## No project
+
+- [ ] GATE-536 docs: Task Index row for changing the remote client
