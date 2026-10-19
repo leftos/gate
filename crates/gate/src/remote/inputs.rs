@@ -537,7 +537,7 @@ fn diffed<'b>(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, b
 
 /// Why the inputs or LFS call `step` that ended as `called` failed: a cut, said in the reason alone, as the preflight's is,
 /// since the run falls back here and a watchdog line in its log would fail the run here; or a status other than 0, the
-/// box's last error line when it said one.
+/// box's last error line when it said one, without its leading `gate: `, as the line that keeps it says its own.
 pub(super) fn judged(attempt: &mut Attempt<'_, '_>, called: &Called, step: Step) -> Result<(), Unsent> {
     if let Some(cut) = called.cut {
         attempt.noted(called);
@@ -545,7 +545,7 @@ pub(super) fn judged(attempt: &mut Attempt<'_, '_>, called: &Called, step: Step)
     }
     if called.status != 0 {
         return Err(Unsent::Refused(match &called.last_error {
-            Some(line) => line.clone(),
+            Some(line) => line.strip_prefix("gate: ").unwrap_or(line).to_owned(),
             None => format!("{} failed (status {})", step.what(), called.status),
         }));
     }

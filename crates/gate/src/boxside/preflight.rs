@@ -792,7 +792,7 @@ const MOVED_ASIDE_LIMIT: u32 = 100;
 /// `{name}.gate-moved-{n}` beside it, by handle and never replacing what has that name
 /// ([`gate_win32::rename_beneath_no_replace`]), for the first `n` from 1 the rename finds free: the new name. Else why
 /// not: the rename's error, or every `n` up to [`MOVED_ASIDE_LIMIT`] taken.
-fn moved_aside(folder: &File, name: &str, found: &File) -> Result<String, String> {
+pub(super) fn moved_aside(folder: &File, name: &str, found: &File) -> Result<String, String> {
     for n in 1..=MOVED_ASIDE_LIMIT {
         let moved = format!("{name}.gate-moved-{n}");
         match gate_win32::rename_beneath_no_replace(found, folder, &moved) {

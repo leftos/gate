@@ -161,6 +161,10 @@ fn a_put_the_box_refuses_falls_back_inputs() {
         why.is_some_and(|line| line.contains(INPUT)),
         "the log says why the inputs were not sent, the box's line naming the input: {said}"
     );
+    assert!(
+        why.is_some_and(|line| line.starts_with("gate: remote inputs not sent: remote inputs put failed: ") && line.matches("gate:").count() == 1),
+        "the box's line is kept without its own prefix: {said}"
+    );
     assert!(outcome.stderr.contains(FELL_BACK), "{outcome:?}");
     assert!(outcome.stdout.contains("ran"), "the command ran here: {outcome:?}");
     assert_eq!(fallbacks(&events(&case)), ["inputs"]);
@@ -345,7 +349,7 @@ fn a_diff_the_box_fails_falls_back_inputs_without_a_put() {
     let outcome = finish(client_gate(&case, "out.log", &steps, &RAN));
 
     assert_eq!(calls(&steps), ["preflight", "inputs"], "the diff alone");
-    assert_fell_back(&case, &outcome, "out.log", "gate: the inputs request is refused");
+    assert_fell_back(&case, &outcome, "out.log", "the inputs request is refused");
 }
 
 #[test]

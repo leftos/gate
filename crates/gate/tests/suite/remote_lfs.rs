@@ -236,7 +236,9 @@ fn a_put_the_box_refuses_falls_back_lfs() {
     let outcome = finish(gate);
 
     assert_eq!(calls(&steps), ["preflight", "lfs", "lfs"], "no run call");
-    assert_fell_back(&case, &outcome, "out.log", "gate: remote lfs put failed: ");
+    assert_fell_back(&case, &outcome, "out.log", "gate: remote lfs not sent: remote lfs put failed: ");
+    let line = not_sent(&case, "out.log");
+    assert_eq!(line.matches("gate:").count(), 1, "the box's line is kept without its own prefix: {line}");
 }
 
 /// A builder whose run scratch folders another account made refuses the run call `lfs`: the box says it cannot make the
@@ -257,7 +259,8 @@ fn a_scratch_folder_the_builder_cannot_make_falls_back_lfs_naming_it() {
     let log = log_of(&case, "out.log");
     assert!(
         log.lines()
-            .any(|line| line.starts_with("gate: remote cannot make the run's LFS scratch folder: ") && line.contains("another account made it")),
+            .any(|line| line.starts_with("gate: remote cannot make the run's LFS scratch folder: ")
+                && line.contains("its owner, DACL or label is not the box's; remove it")),
         "the box's line: {log}"
     );
 }

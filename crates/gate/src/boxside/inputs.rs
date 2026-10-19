@@ -18,6 +18,7 @@
 //! at a time beneath the held work folder, never through a link, and is acted on through the handle it was checked by.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead};
@@ -685,7 +686,7 @@ pub(super) fn made_stage_named(named: &StageNamed<'_>, console: &mut Console) ->
         return Err(format!("{} is a link, a junction or not a folder", named.root));
     }
     let path = Path::new(named.root).join(named.stages);
-    let stages = protected_folder(&root, &path, named.stages, STAGES_ACCESS, &security)?;
+    let stages = protected_folder(&root, &path, STAGES_ACCESS, &security, Leftover::Refuse)?;
     for line in pruned(&stages, &path, SystemTime::now()) {
         console.err(&line);
     }
@@ -715,39 +716,152 @@ pub(super) fn protected_security() -> Result<Descriptor, String> {
     gate_win32::protected_descriptor(&facts).map_err(|error| format!("cannot make the box's security: {error}"))
 }
 
-/// The protected folder `name`, whose path is `path`, readied beneath the held folder `root` and held with `access`
-/// without delete sharing: made new with the security `security`, so it is never seen with any other, when nothing has
-/// the name; else the folder there adopted ([`adopted`]), so two puts that make it at once share it. Else why not.
-pub(super) fn protected_folder(root: &File, path: &Path, name: &str, access: u32, security: &Descriptor) -> Result<File, String> {
+/// The system's error for a file another process holds against the sharing asked for.
+pub(super) const SHARING_VIOLATION: i32 = 32;
+
+/// What [`protected_folder`] does with a folder of its own already at its name whose owner, DACL or label is not the
+/// box's.
+pub(super) enum Leftover<'c> {
+    /// Refuses it: it is never walked, emptied or replaced.
+    Refuse,
+    /// Moves it aside beside itself, never walked, says so on the console and makes the folder new ([`taken_over`]):
+    /// for the LFS store's `lfs` folder alone, which git-lfs made in a checkout before the box kept the store.
+    MoveAside(&'c mut Console),
+}
+
+/// The protected folder at `path`, its last name readied beneath the held folder `root` and held with `access` without
+/// delete sharing: made new with the security `security`, so it is never seen with any other, when nothing has the
+/// name; else the folder there adopted ([`adopted`]), so two puts that make it at once share it. A folder of its own
+/// there whose security is not the box's is refused or moved aside, as `leftover` says. Else why not.
+pub(super) fn protected_folder(root: &File, path: &Path, access: u32, security: &Descriptor, leftover: Leftover<'_>) -> Result<File, String> {
+    let name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| format!("cannot ready {}: it ends in no name", path.display()))?;
+    let at = Beneath { root, path, name, access };
     match gate_win32::make_folder_beneath(root, name, access, Share::NoDelete, security) {
-        Ok(made) => Ok(made),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => adopted(root, path, name, access),
-        Err(error) => Err(format!("cannot ready {}: {error}", path.display())),
+        Ok(made) => return Ok(made),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("cannot ready {}: {error}", path.display())),
+    }
+    match (adopted(&at), leftover) {
+        (Ok(found), _) => Ok(found),
+        (Err(Unadopted::Held(_)), Leftover::MoveAside(_)) => adopted_again(&at),
+        (Err(Unadopted::Unprotected), Leftover::MoveAside(console)) => taken_over(&at, security, console),
+        (Err(unadopted), _) => Err(unadopted.why(path)),
     }
 }
 
-/// The folder `name` already at `path` beneath the held folder `root`, adopted: opened as itself with `access`, no
-/// more than reads it and its security, and kept, as [`protected_folder`] holds it, only when it is a folder of its own
-/// whose owner, DACL and label are those this box makes its folders with ([`gate_win32::is_protected_folder`]), read
-/// through that same handle. Anything else at the name is another account's, one the box may not open included, and is
-/// refused: never walked, emptied or replaced, since another account may have filled it. Else why not.
-fn adopted(root: &File, path: &Path, name: &str, access: u32) -> Result<File, String> {
-    let foreign = || {
-        format!(
-            "cannot use {}: another account made it; remove it, or give it to Administrators",
-            path.display()
-        )
-    };
-    let cannot = |error: io::Error| format!("cannot ready {}: {error}", path.display());
-    let found = match gate_win32::open_beneath_as(root, name, access, Share::NoDelete, Make::Open) {
+/// A folder's name `name` beneath the held folder `root`, its path `path`, and the access it is held with.
+struct Beneath<'a> {
+    root: &'a File,
+    path: &'a Path,
+    name: &'a str,
+    access: u32,
+}
+
+/// Why [`adopted`] did not adopt the folder at its name.
+enum Unadopted {
+    /// The box may not open it.
+    Unopened(io::Error),
+    /// Another process holds it against the sharing asked for.
+    Held(io::Error),
+    /// A link, a junction or not a folder.
+    NotItself,
+    /// A folder of its own whose owner, DACL or label is not the box's.
+    Unprotected,
+    /// It could not be opened or read for another reason.
+    Failed(io::Error),
+}
+
+impl Unadopted {
+    /// The refusal of the folder at `path` for this reason.
+    fn why(&self, path: &Path) -> String {
+        match self {
+            Unadopted::Unopened(error) => format!("cannot use {}: the box may not open it ({error}); remove it", path.display()),
+            Unadopted::NotItself => format!("{} is a link, a junction or not a folder", path.display()),
+            Unadopted::Unprotected => not_the_box_s(path),
+            Unadopted::Held(error) | Unadopted::Failed(error) => format!("cannot ready {}: {error}", path.display()),
+        }
+    }
+}
+
+/// The refusal of the file or folder at `path`, which opens but whose owner, DACL or label is not the box's.
+pub(super) fn not_the_box_s(path: &Path) -> String {
+    format!("cannot use {}: its owner, DACL or label is not the box's; remove it", path.display())
+}
+
+/// The folder already at `at`'s name, adopted: opened as itself with its access, no more than reads it and its
+/// security, and kept, as [`protected_folder`] holds it, only when it is a folder of its own whose owner, DACL and label
+/// are those this box makes its folders with ([`gate_win32::is_protected_folder`]), read through that same handle.
+/// Anything else at the name, one the box may not open included, is not adopted, never walked, emptied or replaced
+/// here, since another account may have filled it. Else why not.
+fn adopted(at: &Beneath<'_>) -> Result<File, Unadopted> {
+    let found = match gate_win32::open_beneath_as(at.root, at.name, at.access, Share::NoDelete, Make::Open) {
         Ok(found) => found,
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Err(foreign()),
-        Err(error) => return Err(cannot(error)),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Err(Unadopted::Unopened(error)),
+        Err(error) if error.raw_os_error() == Some(SHARING_VIOLATION) => return Err(Unadopted::Held(error)),
+        Err(error) => return Err(Unadopted::Failed(error)),
     };
-    if is_folder_itself(&found).map_err(cannot)? && gate_win32::is_protected_folder(&found).map_err(cannot)? {
-        Ok(found)
-    } else {
-        Err(foreign())
+    if !is_folder_itself(&found).map_err(Unadopted::Failed)? {
+        return Err(Unadopted::NotItself);
+    }
+    if !gate_win32::is_protected_folder(&found).map_err(Unadopted::Failed)? {
+        return Err(Unadopted::Unprotected);
+    }
+    Ok(found)
+}
+
+/// The folder at `at` adopted once more ([`adopted`]) after another process held it: another call moving it aside or
+/// making it new. Else why not, a folder still held said as held open by another process.
+fn adopted_again(at: &Beneath<'_>) -> Result<File, String> {
+    adopted(at).map_err(|unadopted| match unadopted {
+        Unadopted::Held(_) => format!(
+            "cannot use {}: another process holds it open, so the box cannot move it aside; remove it",
+            at.path.display()
+        ),
+        other => other.why(at.path),
+    })
+}
+
+/// The folder at `at`, whose security is not the box's, taken over once: opened again as itself beneath its held root,
+/// with `DELETE` access and without delete sharing, and checked again through that handle; a folder of its own still
+/// not the box's renamed aside beside itself by that handle ([`preflight::moved_aside`]), never walked, and said on
+/// `console`; then the folder made new with `security` ([`made_or_adopted`]). One another call now holds is adopted
+/// once more ([`adopted_again`]), and one now protected, made new by another call, is adopted. Else why not.
+fn taken_over(at: &Beneath<'_>, security: &Descriptor, console: &mut Console) -> Result<File, String> {
+    let found = match gate_win32::open_beneath_as(at.root, at.name, FILE_GENERIC_READ | DELETE, Share::NoDelete, Make::Open) {
+        Ok(found) => found,
+        Err(error) if error.raw_os_error() == Some(SHARING_VIOLATION) => return adopted_again(at),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return made_or_adopted(at, security),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Err(Unadopted::Unopened(error).why(at.path)),
+        Err(error) => return Err(Unadopted::Failed(error).why(at.path)),
+    };
+    let cannot = |error: io::Error| Unadopted::Failed(error).why(at.path);
+    if !is_folder_itself(&found).map_err(cannot)? {
+        return Err(Unadopted::NotItself.why(at.path));
+    }
+    if gate_win32::is_protected_folder(&found).map_err(cannot)? {
+        drop(found);
+        return adopted(at).map_err(|unadopted| unadopted.why(at.path));
+    }
+    let moved = preflight::moved_aside(at.root, at.name, &found).map_err(|why| format!("cannot use {}: {why}", at.path.display()))?;
+    drop(found);
+    let line = format!(
+        "{}: its owner, DACL or label was not the box's",
+        preflight::moved_aside_line(at.path, &moved)
+    );
+    console.err(&escaped(&line));
+    made_or_adopted(at, security)
+}
+
+/// The folder at `at` made new with `security`, or, when another call made it first, adopted ([`adopted`]), never
+/// taken over again. Else why not.
+fn made_or_adopted(at: &Beneath<'_>, security: &Descriptor) -> Result<File, String> {
+    match gate_win32::make_folder_beneath(at.root, at.name, at.access, Share::NoDelete, security) {
+        Ok(made) => Ok(made),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => adopted(at).map_err(|unadopted| unadopted.why(at.path)),
+        Err(error) => Err(format!("cannot ready {}: {error}", at.path.display())),
     }
 }
 
@@ -1123,10 +1237,13 @@ mod tests {
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
 
-    use gate_win32::{Descriptor, Share, file_id, make_folder_beneath, protected_descriptor, same_file, token_facts};
-    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ};
+    use gate_win32::{Descriptor, Share, file_id, is_protected_folder, make_folder_beneath, protected_descriptor, same_file, token_facts};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, READ_CONTROL};
 
-    use super::{Asked, Copy, Record, STAGES_ACCESS, Stage, Stamp, Step, made_stage, moved_in, removed_stage, same_stage, stages_name, swept};
+    use super::{
+        Asked, Beneath, Copy, Leftover, Record, STAGES_ACCESS, Stage, Stamp, Step, Unadopted, adopted, made_stage, moved_in, not_the_box_s,
+        protected_folder, removed_stage, same_stage, stages_name, swept,
+    };
     use crate::boxside::payload::ordinal_upper;
     use crate::boxside::preflight::written_beneath;
     use crate::console::Console;
@@ -1314,13 +1431,32 @@ mod tests {
         let why = made.map(drop).expect_err("the planted folder is refused");
         assert_eq!(
             why,
-            format!(
-                "cannot use {}: another account made it; remove it, or give it to Administrators",
-                stages.display()
-            )
+            format!("cannot use {}: its owner, DACL or label is not the box's; remove it", stages.display())
         );
         assert_eq!(id_of(&planted), id, "the planted file survives as itself");
         assert_eq!(entries(&stages), 1, "nothing is made in the planted folder");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_stages_folder_the_box_may_not_open_is_refused_saying_so() {
+        let folder = folder("stages-unopened");
+        let root = folder.join("root");
+        fs::create_dir_all(&root).expect("the root can be made");
+        let (owner, user, integrity) = sddl_facts();
+        let denying = format!("O:{owner}D:P(D;;0x1;;;{user})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})S:(ML;OICI;NW;;;S-1-16-{integrity})");
+        let descriptor = Descriptor::from_sddl(&denying).expect("the SDDL names a descriptor");
+        let name = stages_name(token_facts().expect("this process's token can be read").elevated);
+        drop(make_folder_beneath(&held(&root), name, READ_CONTROL, Share::All, &descriptor).expect("the folder can be planted"));
+        let stages = stages_path(&root);
+        let (root_text, work_text) = (text(&root), text(&root.join(r"work\k")));
+
+        let made = made_stage(&put_asked(&root_text, &work_text), &mut Console::new());
+
+        let why = made.map(drop).expect_err("the folder the box may not list is refused");
+        let opening = format!("cannot use {}: the box may not open it (", stages.display());
+        assert!(why.starts_with(&opening) && why.ends_with("); remove it"), "{why}");
+        fs::remove_dir(&stages).expect("the planted folder can be removed");
         fs::remove_dir_all(&folder).expect("the folder can be removed");
     }
 
@@ -1356,7 +1492,7 @@ mod tests {
         let made = made_stage(&put_asked(&root_text, &work_text), &mut Console::new());
 
         let why = made.map(drop).expect_err("the unlabelled folder is refused");
-        assert!(why.contains("another account made it"), "{why}");
+        assert!(why.contains("its owner, DACL or label is not the box's; remove it"), "{why}");
         assert_eq!(id_of(&planted), id, "the planted file survives as itself");
         assert_eq!(entries(&stages_path(&root)), 1, "nothing is made in the planted folder");
         fs::remove_dir_all(&folder).expect("the folder can be removed");
@@ -1377,7 +1513,7 @@ mod tests {
         let made = made_stage(&put_asked(&root_text, &work_text), &mut Console::new());
 
         let why = made.map(drop).expect_err("the denying folder is refused");
-        assert!(why.contains("another account made it"), "{why}");
+        assert!(why.contains("its owner, DACL or label is not the box's; remove it"), "{why}");
         assert_eq!(id_of(&planted), id, "the planted file survives as itself");
         assert_eq!(entries(&stages_path(&root)), 1, "nothing is made in the planted folder");
         fs::remove_dir_all(&folder).expect("the folder can be removed");
@@ -1410,6 +1546,159 @@ mod tests {
         }
         assert_eq!(id_of(&planted), id, "the planted file survives as itself");
         assert_eq!(entries(&elevated), 1, "nothing is made in the planted folder");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    /// The box's protected security for this process's token.
+    fn box_security() -> Descriptor {
+        protected_descriptor(&token_facts().expect("this process's token can be read")).expect("the box's security can be made")
+    }
+
+    /// The volume and file id of the folder `path`.
+    fn folder_id(path: &Path) -> (u64, [u8; 16]) {
+        file_id(&held(path)).expect("its id can be read")
+    }
+
+    #[test]
+    fn adopted_says_which_reason_keeps_it_from_adopting_and_each_reads_as_its_own_refusal() {
+        let folder = folder("adopted-reasons");
+        let root = folder.join("root");
+        fs::create_dir_all(root.join("plain")).expect("a plain folder can be made");
+        junction(&root.join("link"), &keeping(&folder, "outside"));
+        let (owner, user, integrity) = sddl_facts();
+        let denying = format!("O:{owner}D:P(D;;0x1;;;{user})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})S:(ML;OICI;NW;;;S-1-16-{integrity})");
+        let root_held = held(&root);
+        let descriptor = Descriptor::from_sddl(&denying).expect("the SDDL names a descriptor");
+        drop(make_folder_beneath(&root_held, "denied", READ_CONTROL, Share::All, &descriptor).expect("the folder can be planted"));
+        let protected = make_folder_beneath(&root_held, "protected", STAGES_ACCESS, Share::NoDelete, &box_security()).expect("made protected");
+        let reason = |name: &str| {
+            let path = root.join(name);
+            let at = Beneath {
+                root: &root_held,
+                path: &path,
+                name,
+                access: STAGES_ACCESS,
+            };
+            adopted(&at).map(drop).map_err(|unadopted| (unadopted, path))
+        };
+
+        let (plain, link, denied, adopted_one) = (reason("plain"), reason("link"), reason("denied"), reason("protected"));
+
+        let (unprotected, path) = plain.expect_err("a plain folder is not adopted");
+        assert!(matches!(unprotected, Unadopted::Unprotected), "a plain folder is unprotected");
+        assert_eq!(
+            unprotected.why(&path),
+            format!("cannot use {}: its owner, DACL or label is not the box's; remove it", path.display())
+        );
+        let (not_itself, path) = link.expect_err("a junction is not adopted");
+        assert!(matches!(not_itself, Unadopted::NotItself), "a junction is not a folder itself");
+        assert_eq!(not_itself.why(&path), format!("{} is a link, a junction or not a folder", path.display()));
+        let (unopened, path) = denied.expect_err("a folder the box may not list is not adopted");
+        assert!(matches!(unopened, Unadopted::Unopened(_)), "a folder the box may not list is unopened");
+        let why = unopened.why(&path);
+        assert!(
+            why.starts_with(&format!("cannot use {}: the box may not open it (", path.display())) && why.ends_with("); remove it"),
+            "{why}"
+        );
+        assert!(adopted_one.is_ok(), "a protected folder is adopted");
+        drop((protected, root_held));
+        fs::remove_dir(root.join("denied")).expect("the planted folder can be removed");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn the_move_aside_policy_moves_an_unprotected_folder_aside_unwalked_and_makes_it_new_and_protected() {
+        let folder = folder("leftover-moved");
+        let root = folder.join("root");
+        let left = root.join(r"lfs\tmp\left.txt");
+        fs::create_dir_all(left.parent().expect("a folder")).expect("the leftover folder can be made");
+        fs::write(&left, "left").expect("a file in it can be written");
+        let (old, left_id) = (folder_id(&root.join("lfs")), id_of(&left));
+        let root_held = held(&root);
+
+        let made = protected_folder(
+            &root_held,
+            &root.join("lfs"),
+            FILE_GENERIC_READ,
+            &box_security(),
+            Leftover::MoveAside(&mut Console::new()),
+        )
+        .expect("the leftover is moved aside and the folder made new");
+
+        assert_ne!(file_id(&made).expect("its id can be read"), old, "a new folder");
+        assert!(
+            is_protected_folder(&made).expect("its security can be read"),
+            "the new folder is protected"
+        );
+        assert_eq!(entries(&root.join("lfs")), 0, "nothing of the leftover is in the new folder");
+        assert_eq!(folder_id(&root.join("lfs.gate-moved-1")), old, "the leftover is moved aside as itself");
+        assert_eq!(id_of(&root.join(r"lfs.gate-moved-1\tmp\left.txt")), left_id, "nothing in it is lost");
+        drop((made, root_held));
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn the_move_aside_policy_refuses_a_junction_and_adopts_a_protected_folder() {
+        let folder = folder("leftover-junction");
+        let root = folder.join("root");
+        fs::create_dir_all(&root).expect("the root can be made");
+        let outside = keeping(&folder, "outside");
+        junction(&root.join("lfs"), &outside);
+        let root_held = held(&root);
+        let security = box_security();
+
+        let refused = protected_folder(
+            &root_held,
+            &root.join("lfs"),
+            FILE_GENERIC_READ,
+            &security,
+            Leftover::MoveAside(&mut Console::new()),
+        );
+
+        let why = refused.map(drop).expect_err("the junction is refused");
+        assert_eq!(why, format!("{} is a link, a junction or not a folder", root.join("lfs").display()));
+        assert!(
+            fs::symlink_metadata(root.join("lfs")).expect("the junction is kept").is_symlink(),
+            "not moved"
+        );
+        assert!(fs::symlink_metadata(root.join("lfs.gate-moved-1")).is_err(), "nothing is moved aside");
+        assert_eq!(entries(&outside), 1, "nothing where the junction leads is touched");
+        fs::remove_dir(root.join("lfs")).expect("the junction can be removed");
+        let other = make_folder_beneath(&root_held, "lfs", FILE_GENERIC_READ, Share::NoDelete, &security).expect("another call makes it");
+
+        let adopted_one = protected_folder(
+            &root_held,
+            &root.join("lfs"),
+            FILE_GENERIC_READ,
+            &security,
+            Leftover::MoveAside(&mut Console::new()),
+        )
+        .expect("the protected folder is adopted");
+
+        assert!(same_file(&other, &adopted_one).expect("the ids can be read"), "the same folder");
+        assert!(fs::symlink_metadata(root.join("lfs.gate-moved-1")).is_err(), "nothing is moved aside");
+        drop((adopted_one, other, root_held));
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn the_refuse_policy_leaves_an_unprotected_folder_as_it_is() {
+        let folder = folder("leftover-refused");
+        let root = folder.join("root");
+        let left = root.join(r"lfs\left.txt");
+        fs::create_dir_all(left.parent().expect("a folder")).expect("the planted folder can be made");
+        fs::write(&left, "left").expect("a file in it can be written");
+        let (old, left_id) = (folder_id(&root.join("lfs")), id_of(&left));
+        let root_held = held(&root);
+
+        let refused = protected_folder(&root_held, &root.join("lfs"), FILE_GENERIC_READ, &box_security(), Leftover::Refuse);
+
+        let why = refused.map(drop).expect_err("the planted folder is refused");
+        assert_eq!(why, not_the_box_s(&root.join("lfs")));
+        assert_eq!(folder_id(&root.join("lfs")), old, "the folder stays as itself");
+        assert_eq!(id_of(&left), left_id, "the planted file survives as itself");
+        assert!(fs::symlink_metadata(root.join("lfs.gate-moved-1")).is_err(), "nothing is moved aside");
+        drop(root_held);
         fs::remove_dir_all(&folder).expect("the folder can be removed");
     }
 

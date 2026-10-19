@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL};
+use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, READ_CONTROL};
 
 use super::{
     box_call, field, gate_box, git, has_ref, lines, pair_payload, pair_snapshot, passed, payload, refused_line, renamed, run_box, run_box_with_env,
@@ -286,7 +286,8 @@ fn an_unprotected_store_lock_refuses_the_lfs_route() {
     let outcome = diff(&case, &payload, &[A]);
 
     let failed = assert_refused(&payload, &outcome, "diff", "a lock made with another security");
-    assert!(failed.contains("another account made it"), "{outcome:?}");
+    assert!(failed.contains("its owner, DACL or label is not the box's; remove it"), "{outcome:?}");
+    assert!(!failed.contains("Administrators"), "owning it is never enough: {outcome:?}");
     assert!(lock.exists(), "the planted lock is left alone");
 }
 
@@ -422,10 +423,25 @@ fn the_store_folders_are_protected() {
     }
 }
 
+/// The store's `lfs` folder made as the box makes it, with its protected security, beneath the bare repository of
+/// `payload`.
+fn protected_store(payload: &Value) {
+    let facts = gate_win32::token_facts().expect("this process's token can be read");
+    let security = gate_win32::protected_descriptor(&facts).expect("the box's security can be made");
+    let bare = File::options()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(field(payload, "Bare"))
+        .expect("the bare repository can be opened");
+    drop(gate_win32::make_folder_beneath(&bare, "lfs", FILE_GENERIC_READ, gate_win32::Share::All, &security).expect("the store can be made"));
+}
+
+/// A store folder below `lfs` whose security is not the box's is refused, never moved aside: only `lfs` itself is.
 #[test]
-fn a_store_folder_another_account_made_is_refused() {
+fn a_store_folder_whose_security_is_not_the_box_s_is_refused() {
     let case = Case::new("box_lfs_foreign");
     let payload = lfs_payload(&case);
+    protected_store(&payload);
     let planted = store(&payload).join(r"objects\aa\planted.txt");
     fs::create_dir_all(planted.parent().expect("a folder")).expect("the planted folder can be made");
     fs::write(&planted, "planted").expect("a file in it can be written");
@@ -433,8 +449,52 @@ fn a_store_folder_another_account_made_is_refused() {
     let outcome = diff(&case, &payload, &[A]);
 
     let failed = assert_refused(&payload, &outcome, "diff", "a store folder made with another security");
-    assert!(failed.contains("another account made it"), "{outcome:?}");
+    let objects = store(&payload).join("objects");
+    let refusal = format!("cannot use {}: its owner, DACL or label is not the box's; remove it", objects.display());
+    assert!(failed.contains(&refusal), "{outcome:?}");
     assert!(planted.exists(), "nothing in the planted folder is deleted");
+    assert!(
+        !objects.with_file_name("objects.gate-moved-1").exists(),
+        "nothing is moved aside: {outcome:?}"
+    );
+}
+
+/// A checkout before the box kept the store left git-lfs's own `lfs` folder in the bare repository, made with plain
+/// `CreateDirectory` and so with the security its folder hands down: the box moves it aside, never walking it, makes the
+/// store new and protected, and says so.
+#[test]
+fn a_store_folder_git_lfs_made_is_moved_aside_and_made_new() {
+    let case = Case::new("box_lfs_leftover");
+    let payload = lfs_payload(&case);
+    let leftover = store(&payload);
+    let left = leftover.join(r"tmp\left.txt");
+    fs::create_dir_all(leftover.join("objects")).expect("git-lfs's objects folder can be made");
+    fs::create_dir_all(left.parent().expect("a folder")).expect("git-lfs's tmp folder can be made");
+    fs::write(&left, "left").expect("a file in it can be written");
+
+    let outcome = diff(&case, &payload, &[A]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, needs(&[A]), "{outcome:?}");
+    let moved = leftover.with_file_name("lfs.gate-moved-1");
+    let line = format!(
+        "gate: remote moved aside the folder {} to {}: its owner, DACL or label was not the box's",
+        leftover.display(),
+        moved.display()
+    );
+    assert!(lines(&outcome.stderr).contains(&line.as_str()), "{outcome:?}");
+    assert_eq!(
+        fs::read_to_string(moved.join(r"tmp\left.txt")).expect("the moved folder keeps its file"),
+        "left"
+    );
+    assert!(!leftover.join("tmp").exists(), "the store is new: {outcome:?}");
+    assert!(
+        security_of(&leftover).starts_with("D:P"),
+        "the new store is protected: {}",
+        security_of(&leftover)
+    );
+    put_all(&case, &payload, &[A]);
+    assert_eq!(fs::read(object_path(&payload, A)).expect("the object is installed"), A);
 }
 
 #[test]
@@ -935,7 +995,8 @@ fn a_foreign_run_scratch_folder_refuses_an_lfs_repo_s_run_lfs() {
 
     let line = assert_refused_run(&payload, &outcome, "a foreign run scratch folder");
     assert!(
-        line.starts_with("gate: remote cannot make the run's LFS scratch folder: ") && line.contains("another account made it"),
+        line.starts_with("gate: remote cannot make the run's LFS scratch folder: ")
+            && line.contains("its owner, DACL or label is not the box's; remove it"),
         "the scratch folder's own line: {outcome:?}"
     );
     assert_untouched(&planted, &outcome);
@@ -975,7 +1036,7 @@ fn a_nested_attributes_file_naming_lfs_makes_the_scratch_folder() {
     let outcome = run_box(&case, &payload);
 
     let line = assert_refused_run(&payload, &outcome, "a nested attributes file and a foreign run scratch folder");
-    assert!(line.contains("another account made it"), "{outcome:?}");
+    assert!(line.contains("its owner, DACL or label is not the box's; remove it"), "{outcome:?}");
     assert_untouched(&planted, &outcome);
 }
 
@@ -993,7 +1054,7 @@ fn a_pair_whose_sibling_alone_names_lfs_makes_the_scratch_folder() {
     assert_eq!(outcome.code, Some(75), "{outcome:?}");
     assert_eq!(outcome.stdout, "", "the command never ran: {outcome:?}");
     assert!(
-        outcome.stderr.contains(&refused_line(&payload, "lfs")) && outcome.stderr.contains("another account made it"),
+        outcome.stderr.contains(&refused_line(&payload, "lfs")) && outcome.stderr.contains("its owner, DACL or label is not the box's; remove it"),
         "{outcome:?}"
     );
     assert_untouched(&planted, &outcome);

@@ -30,8 +30,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::inputs::{
-    SCRATCH_SUFFIX_DIGITS, STAGED_ACCESS, Stage, StageNamed, WorkLock, locked, made_stage_named, plain_copy, protected_folder, protected_security,
-    removed_stage, same_stage, staged_files,
+    Leftover, SCRATCH_SUFFIX_DIGITS, SHARING_VIOLATION, STAGED_ACCESS, Stage, StageNamed, WorkLock, locked, made_stage_named, not_the_box_s,
+    plain_copy, protected_folder, protected_security, removed_stage, same_stage, staged_files,
 };
 use crate::boxside::payload::{Payload, escaped, grandparent};
 use crate::boxside::preflight::is_folder_itself;
@@ -56,8 +56,6 @@ const STAGED_FILES: &str = "files";
 const PAIR_REFUSED: &str = "gate box: lfs for a sibling pair is not taken yet";
 /// The test seam that makes a build with the `test-seams` feature refuse an unelevated box, when it is `check`.
 const ELEVATION_SEAM: &str = "GATE_TEST_BOX_ELEVATION";
-/// The system's error for a file another process holds against the sharing asked for.
-const SHARING_VIOLATION: i32 = 32;
 /// The store's lock beside the store, `{Bare}\lfs.lock`.
 const STORE_LOCK: &str = "lfs.lock";
 
@@ -262,15 +260,17 @@ struct Store {
 
 impl Store {
     /// The store of the bare repository `bare`, its lock taken shared ([`store_lock`]) and its folders readied
-    /// ([`protected_folder`]); else why not, a folder another account made among them.
-    fn opened(bare: &str) -> Result<Store, String> {
+    /// ([`protected_folder`]): an `lfs` folder of its own whose security is not the box's, as git-lfs left one in a
+    /// checkout before the box kept the store, moved aside and made new, said on `console`; any other folder whose
+    /// security is not the box's refused. Else why not.
+    fn opened(bare: &str, console: &mut Console) -> Result<Store, String> {
         let bare_held = opened_bare(bare)?;
         let lock = store_lock(&bare_held, bare)?;
         let security = protected_security()?;
         let lfs_path = Path::new(bare).join("lfs");
-        let lfs = protected_folder(&bare_held, &lfs_path, "lfs", FILE_GENERIC_READ, &security)?;
+        let lfs = protected_folder(&bare_held, &lfs_path, FILE_GENERIC_READ, &security, Leftover::MoveAside(console))?;
         let path = lfs_path.join("objects");
-        let objects = protected_folder(&lfs, &path, "objects", FILE_GENERIC_READ, &security)?;
+        let objects = protected_folder(&lfs, &path, FILE_GENERIC_READ, &security, Leftover::Refuse)?;
         Ok(Store {
             _lock: lock,
             _bare: bare_held,
@@ -285,8 +285,8 @@ impl Store {
     fn folder_of(&self, oid: &str) -> Result<File, String> {
         let (first, second) = (&oid[..2], &oid[2..4]);
         let first_path = self.path.join(first);
-        let outer = protected_folder(&self.objects, &first_path, first, FILE_GENERIC_READ, &self.security)?;
-        protected_folder(&outer, &first_path.join(second), second, FILE_GENERIC_READ, &self.security)
+        let outer = protected_folder(&self.objects, &first_path, FILE_GENERIC_READ, &self.security, Leftover::Refuse)?;
+        protected_folder(&outer, &first_path.join(second), FILE_GENERIC_READ, &self.security, Leftover::Refuse)
     }
 
     /// Whether the store holds `wanted` in its held folder `folder`: a plain file at its oid, not a link or a junction,
@@ -359,10 +359,7 @@ fn store_lock(bare_held: &File, bare: &str) -> Result<File, String> {
     };
     gate_win32::check_plain_file(&lock).map_err(cannot)?;
     if !gate_win32::is_protected_file(&lock).map_err(cannot)? {
-        return Err(format!(
-            "cannot use {}: another account made it; remove it, or give it to Administrators",
-            path.display()
-        ));
+        return Err(not_the_box_s(&path));
     }
     Ok(lock)
 }
@@ -387,8 +384,8 @@ fn opened_bare(bare: &str) -> Result<File, String> {
 /// <oid>` for each object of the manifest the store lacks or holds at another size, in the manifest's order; 0. Else
 /// the status, its lines said.
 fn diff(asked: &Asked<'_>, wanted: &[Wanted], console: &mut Console) -> u32 {
-    let lacking = locked(&asked.work_lock(), console, |_, _| {
-        let store = Store::opened(asked.bare)?;
+    let lacking = locked(&asked.work_lock(), console, |_, console| {
+        let store = Store::opened(asked.bare, console)?;
         store
             .lacking(wanted)
             .map(|lacking| lacking.into_iter().map(|object| object.oid.clone()).collect::<Vec<_>>())
@@ -411,7 +408,7 @@ fn diff(asked: &Asked<'_>, wanted: &[Wanted], console: &mut Console) -> u32 {
 /// ([`installed`]); the stage removed beneath its held handles on every way out once made, and `gate-remote-lfs:
 /// installed <n>` said; 0. Else the status, its lines said.
 fn put(asked: &Asked<'_>, wanted: &[Wanted], seams: &BoxSeams, console: &mut Console) -> u32 {
-    if let Err(why) = Store::opened(asked.bare) {
+    if let Err(why) = Store::opened(asked.bare, console) {
         return refused(asked, &why, console);
     }
     let named = StageNamed {
@@ -471,7 +468,7 @@ fn staged(asked: &Asked<'_>, wanted: &[Wanted], seams: &BoxSeams, stage: &Stage,
         Ok(files) => files,
         Err(why) => return Ok(Err(why)),
     };
-    locked(&asked.work_lock(), console, |_, _| installed(asked.bare, &files, &entries))
+    locked(&asked.work_lock(), console, |_, console| installed(asked.bare, &files, &entries, console))
 }
 
 /// Whether each member of `entries` is an object of the manifest `wanted`, at most once, whose SHA-256 is its name and
@@ -506,10 +503,10 @@ fn checked(entries: &[Entry], wanted: &[Wanted]) -> Result<(), String> {
 
 /// Installs each object of `entries`, checked ([`checked`]) and unpacked into the held folder `files`, into the store of
 /// `bare` under its lock: each renamed by its handle into its folder without replacing anything there and given that
-/// folder's security; an object the store already holds at its size is kept and its staged copy deleted. The count
-/// installed or kept; else why not.
-fn installed(bare: &str, files: &File, entries: &[Entry]) -> Result<usize, String> {
-    let store = Store::opened(bare)?;
+/// folder's security; an object the store already holds at its size is kept and its staged copy deleted. The store's
+/// own lines said on `console`. The count installed or kept; else why not.
+fn installed(bare: &str, files: &File, entries: &[Entry], console: &mut Console) -> Result<usize, String> {
+    let store = Store::opened(bare, console)?;
     for entry in entries {
         let wanted = Wanted {
             oid: entry.path.clone(),
