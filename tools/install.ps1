@@ -189,7 +189,8 @@ function Invoke-ReleaseBuild {
             else {
                 $env:GATE_BUILD_ID = $BuildId
             }
-            & pwsh -NoProfile -File $gate -Log '.tmp/install-build.log' -TimeoutSeconds 900 -Slot heavy -Local -- `
+            & pwsh -NoProfile -File $gate -Log '.tmp/install-build.log' -TimeoutSeconds 900 -Slot heavy -Local `
+                -Reason 'the installer builds the gate on this PC' -- `
                 cargo @cargoArguments | Out-Host
             return [int]$LASTEXITCODE
         }
