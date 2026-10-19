@@ -38,12 +38,16 @@
 //! 255, so only the bytes it sent tell the drop from one before the banner; `garbage <n>` runs nothing, writes `<n>`
 //! bytes of `x`, no outputs archive, raw on standard output and exits 0; `flood-ok <n>` writes `<n>` bytes of `x` and
 //! no line end on standard output, then does as `ok`, whose output goes on that one line; `bytes-hold <n> <path>` writes `<n>` bytes of
-//! `x` raw on standard output, then does as `hold <path>`.
+//! `x` raw on standard output, then does as `hold <path>`; `away` runs the call as `ok` does, but outside this
+//! process's job (`CREATE_BREAKAWAY_FROM_JOB`, which the job must allow), its three standard streams pipes this process
+//! relays, so a gate killed with its call's job leaves the call running with its streams closed, as sshd closes a
+//! box's streams once the connection drops.
 
 #![expect(clippy::disallowed_methods, reason = "a test helper standing in for ssh, which holds no launch's handles")]
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::windows::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -64,6 +68,8 @@ const GIT_SERVICES: [&str; 2] = ["git-upload-pack", "git-receive-pack"];
 const PUSH: &str = "push";
 /// The version this program says to `--version`, standing in for a builder's old gate.
 const OLD_VERSION: &str = "0.0.0-old";
+/// `CREATE_BREAKAWAY_FROM_JOB`: the call `away` starts is in none of this process's jobs below the one that allows it.
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
 /// Why `command` could not be started, naming its program.
 fn cannot_run(command: &Command, error: &io::Error) -> String {
@@ -229,6 +235,7 @@ fn say_exit(step: &str, rest: &str) -> Result<i32, String> {
 fn bare_step(step: &str, call: &BoxCall<'_>) -> Result<i32, String> {
     match step {
         "ok" => call.ok(),
+        "away" => call.away(),
         "no-boot" => call.rewritten(BOOT, None),
         "drop" => Ok(SSH_FAILED),
         "fail-banner" => said(&mut io::stderr().lock(), PRE_BANNER),
@@ -313,6 +320,53 @@ fn fed_call(mut command: Command, steps: &Path, after: Option<&Path>) -> Result<
     drop(stdin);
     let status = child.wait().map_err(|error| format!("cannot wait for the call: {error}"))?;
     status.code().ok_or_else(|| "the call ended with no status".to_owned())
+}
+
+/// Puts `child`, just started outside this process's jobs, in a new job that lets a process in it start one outside it,
+/// as a box run's command is started: breaking away left it in the first job above that refuses it. The job does not
+/// end its processes when its handle closes, so the call outlives this process; its handle is left open for this
+/// process's life.
+fn allow_breakaway(child: &std::process::Child) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle as _;
+
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+
+    // SAFETY: no security attributes and no name are given; a null handle is a failure.
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return Err(format!("cannot create the call's job: {}", io::Error::last_os_error()));
+    }
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    let size = u32::try_from(size_of_val(&limits)).map_err(|error| format!("the job's limits do not fit a u32: {error}"))?;
+    // SAFETY: the job is open and `limits` is a whole extended limit structure of `size` bytes, read only.
+    let set = unsafe { SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const limits).cast(), size) };
+    if set == 0 {
+        return Err(format!("cannot let the call's job allow breakaway: {}", io::Error::last_os_error()));
+    }
+    // SAFETY: the job is open, and the child's handle is open while `child` lives.
+    let assigned = unsafe { AssignProcessToJobObject(job, child.as_raw_handle()) };
+    if assigned == 0 {
+        return Err(format!("cannot put the call in its job: {}", io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Passes what `from` gives on to `to` until it ends, each chunk written whole and flushed as it comes.
+fn relayed(from: &mut impl Read, to: &mut impl Write) -> Result<(), String> {
+    let mut buffer = [0; 8192];
+    loop {
+        let read = from.read(&mut buffer).map_err(|error| format!("cannot read the call: {error}"))?;
+        let Some(chunk) = buffer.get(..read).filter(|chunk| !chunk.is_empty()) else {
+            return Ok(());
+        };
+        to.write_all(chunk)
+            .and_then(|()| to.flush())
+            .map_err(|error| format!("cannot pass the call's output on: {error}"))?;
+    }
 }
 
 fn hold(path: &Path) -> Result<(), String> {
@@ -411,6 +465,37 @@ impl<'a> BoxCall<'a> {
         }
         let status = command.status().map_err(|error| cannot_run(&command, &error))?;
         status.code().ok_or_else(|| "the gate ended with no status".to_owned())
+    }
+
+    /// Runs the call outside this process's job, its standard input fed from this process's and its standard output and
+    /// error passed on raw to this process's as they come, each chunk flushed; its status once it and its output have
+    /// ended. The feeding thread is not waited for: it ends with this process.
+    fn away(&self) -> Result<i32, String> {
+        let mut command = self.command()?;
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_BREAKAWAY_FROM_JOB)
+            .spawn()
+            .map_err(|error| cannot_run(&command, &error))?;
+        // Before the call is fed its request, so before it can start a process of its own outside its job.
+        let in_job = allow_breakaway(&child);
+        if let Err(message) = in_job {
+            // A call left outside the case's control is ended; the case fails on the line said.
+            let _ = child.kill();
+            return Err(message);
+        }
+        let mut stdin = child.stdin.take().ok_or("the call has no input pipe")?;
+        let mut stdout = child.stdout.take().ok_or("the call has no output pipe")?;
+        let mut stderr = child.stderr.take().ok_or("the call has no error pipe")?;
+        // Dropping the call's input pipe once this process's input ends tells the call its input ended.
+        thread::spawn(move || drop(io::copy(&mut io::stdin().lock(), &mut stdin)));
+        let errors = thread::spawn(move || relayed(&mut stderr, &mut io::stderr()));
+        relayed(&mut stdout, &mut io::stdout())?;
+        errors.join().map_err(|_| "the error relay panicked".to_owned())??;
+        let status = child.wait().map_err(|error| format!("cannot wait for the call: {error}"))?;
+        status.code().ok_or_else(|| "the call ended with no status".to_owned())
     }
 
     /// Runs the call with its standard output read, only its first `count` bytes passed on raw and the rest read and

@@ -21,7 +21,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::boot;
-use crate::boxside::forward::{ChildPipes, DRAIN, Drained, OutputLock};
+use crate::boxside::forward::{ChildPipes, ClientGone, DRAIN, Drained, OutputLock};
 use crate::boxside::helper_trusted;
 use crate::boxside::msys;
 use crate::boxside::payload::{Pair, Payload};
@@ -866,10 +866,17 @@ impl Git {
     /// line under `lock` ([`ChildPipes`]), so no heartbeat lands inside a line of git's, and waits for it to end. A
     /// process still holding git's output once the readers have drained for [`DRAIN`] is said under `lock`, and the
     /// run goes on. git's output, its stdout empty unless read; else why it could not be started or waited for, or that
-    /// a line of git's could not be written to the box's own output: the client closed the connection.
-    pub(crate) fn forwarded(command: Command, read_stdout: bool, lock: &OutputLock, console: &mut Console) -> Result<Output, GitFailure> {
-        let (output, drained) = run_forwarded(command, read_stdout, lock).map_err(GitFailure::Failed)?;
-        if drained.pipe_closed {
+    /// the run's `gone` was set by the time git's output drained, by a line of git's that could not be written to the
+    /// box's own output or by the heartbeat: the client closed the connection.
+    pub(crate) fn forwarded(
+        command: Command,
+        read_stdout: bool,
+        lock: &OutputLock,
+        gone: &ClientGone,
+        console: &mut Console,
+    ) -> Result<Output, GitFailure> {
+        let (output, drained) = run_forwarded(command, read_stdout, lock, gone).map_err(GitFailure::Failed)?;
+        if drained.client_gone {
             return Err(GitFailure::ClientGone);
         }
         if !drained.all_ended {
@@ -894,8 +901,8 @@ pub(crate) enum GitFailure {
 /// [`Git::forwarded`] up to the drain: git's output, and what the readers' drain found; else why it could not be
 /// started or waited for. `command` is dropped once git is started, so the readers see the end of its pipes once git
 /// and whatever it started have closed them.
-fn run_forwarded(mut command: Command, read_stdout: bool, lock: &OutputLock) -> Result<(Output, Drained), String> {
-    let ChildPipes { stdout, stderr, forwarders } = ChildPipes::open("git's", !read_stdout, lock).map_err(|error| error.to_string())?;
+fn run_forwarded(mut command: Command, read_stdout: bool, lock: &OutputLock, gone: &ClientGone) -> Result<(Output, Drained), String> {
+    let ChildPipes { stdout, stderr, forwarders } = ChildPipes::open("git's", !read_stdout, lock, gone).map_err(|error| error.to_string())?;
     // Started under the spawn lock, so it inherits no launch's handles.
     let started = gate_win32::spawn(command.stdout(stdout).stderr(stderr));
     drop(command);
@@ -959,7 +966,7 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
     use super::{Git, TreeAt, fresh_config, fresh_config_written, git_failed, ready_tree, refused_folders, replace_config, run_forwarded, sdk_list};
-    use crate::boxside::forward::OutputLock;
+    use crate::boxside::forward::{ClientGone, OutputLock};
     use crate::boxside::helper_trusted;
     use crate::boxside::payload::Payload;
     use crate::console::Console;
@@ -997,7 +1004,7 @@ mod tests {
         let held = output.lock().unwrap_or_else(PoisonError::into_inner);
 
         // git says on stderr that the repository does not exist, then exits.
-        let ran = run_forwarded(command, false, &output);
+        let ran = run_forwarded(command, false, &output, &ClientGone::default());
         drop(held);
 
         let (ran, drained) = ran.expect("git starts");

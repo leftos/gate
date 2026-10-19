@@ -3,12 +3,12 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::os::windows::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::process::{Child, ChildStderr, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::{fs, process, thread};
@@ -16,7 +16,8 @@ use std::{fs, process, thread};
 use gate_win32::StoppableProcess;
 use jiff::Timestamp;
 use serde_json::{Value, json};
-use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{ERROR_OPERATION_ABORTED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::System::IO::CancelIoEx;
 use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
 
 /// The gate under test.
@@ -323,6 +324,118 @@ pub fn start_with_closed(closed: Closed, mut command: Command) -> (Running, Chil
         stop_tree,
     };
     (running, stdin)
+}
+
+/// How often [`StderrCloser::close`] asks its reader's read to give up until the reader has ended.
+const CANCEL_STEP: Duration = Duration::from_millis(10);
+
+/// Starts `command` with its stdin a pipe, whose write end it returns as [`start_with_stdin`] does, and both output
+/// streams piped and gathered as [`start`] gathers them, stderr by a reader the case closes on demand
+/// ([`StderrCloser::close`]): from then on the program's writes to stderr fail as a gone client's would make them.
+pub fn start_with_closable_stderr(mut command: Command) -> (Running, ChildStdin, StderrCloser) {
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let stop_tree = stop_tree_of(&command);
+    let mut child = command.spawn().expect("the program starts");
+    let stdin = child.stdin.take().expect("stdin is piped");
+    let (stdout, stdout_reader) = gather(child.stdout.take().expect("stdout is piped"));
+    let open = Arc::new(Mutex::new(true));
+    let pipe = SharedPipe {
+        pipe: child.stderr.take().expect("stderr is piped"),
+        open: Arc::clone(&open),
+    };
+    let handle = pipe.pipe.as_raw_handle();
+    let stderr = Buffer::default();
+    let closing = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let stderr = Arc::clone(&stderr);
+        let closing = Arc::clone(&closing);
+        thread::spawn(move || read_until_closed(pipe, &stderr, &closing))
+    };
+    let running = Running {
+        child,
+        stdout,
+        stderr,
+        readers: vec![stdout_reader],
+        stop_tree,
+    };
+    (
+        running,
+        stdin,
+        StderrCloser {
+            closing,
+            handle,
+            open,
+            reader,
+        },
+    )
+}
+
+/// The stderr pipe a [`StderrCloser`]'s reader reads, and whether it is still open. Its drop, on the hand-back or on
+/// the reader's panic alike, marks it shut under the lock [`StderrCloser::close`] holds while it gives up a read, and
+/// only then closes the pipe, so no read is given up on a closed handle.
+struct SharedPipe {
+    pipe: ChildStderr,
+    open: Arc<Mutex<bool>>,
+}
+
+impl Drop for SharedPipe {
+    fn drop(&mut self) {
+        *self.open.lock().unwrap_or_else(PoisonError::into_inner) = false;
+    }
+}
+
+/// Reads `pipe` into `buffer` until it ends or `closing` is set, then hands it back for the caller to close. A read
+/// given up for [`StderrCloser::close`] is not an end: the reader looks at `closing` again.
+#[expect(clippy::panic, reason = "a stderr that cannot be read fails the case, as `gather`'s does")]
+fn read_until_closed(mut pipe: SharedPipe, buffer: &Buffer, closing: &AtomicBool) -> SharedPipe {
+    let aborted = i32::try_from(ERROR_OPERATION_ABORTED).ok();
+    let mut chunk = [0; 4096];
+    while !closing.load(Ordering::SeqCst) {
+        match pipe.pipe.read(&mut chunk) {
+            Ok(read) => match chunk.get(..read).filter(|bytes| !bytes.is_empty()) {
+                Some(bytes) => buffer.lock().expect("no reader panicked holding the buffer").extend_from_slice(bytes),
+                None => break,
+            },
+            Err(error) if error.raw_os_error() == aborted => {}
+            Err(error) => panic!("the program's stderr cannot be read: {error}"),
+        }
+    }
+    pipe
+}
+
+/// The reader of a program's stderr that [`start_with_closable_stderr`] started, which the case closes on demand.
+pub struct StderrCloser {
+    closing: Arc<AtomicBool>,
+    /// The raw handle of the pipe the reader reads, open while `open` says so.
+    handle: RawHandle,
+    /// Whether `handle` is still open; [`SharedPipe`]'s drop shuts it.
+    open: Arc<Mutex<bool>>,
+    reader: JoinHandle<SharedPipe>,
+}
+
+impl StderrCloser {
+    /// Stops the reader, giving up the read it waits in (`CancelIoEx` on the pipe, which std reads with overlapped
+    /// I/O) until it has ended, then closes this process's read end of the program's stderr; fails after the hang
+    /// guard.
+    pub fn close(self) {
+        self.closing.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + HANG_GUARD;
+        while !self.reader.is_finished() {
+            assert!(Instant::now() < deadline, "the stderr reader did not end within the hang guard");
+            let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+            if *open {
+                // SAFETY: the pipe is open while `open` says so, and stays open while this lock is held, since the
+                // pipe's drop takes it before the handle closes; with no overlapped structure named every read pending
+                // on it is given up, and none pending leaves it as it is for the next turn to ask again.
+                unsafe { CancelIoEx(self.handle, std::ptr::null()) };
+            }
+            drop(open);
+            thread::sleep(CANCEL_STEP);
+        }
+        let pipe = self.reader.join();
+        assert!(pipe.is_ok(), "the stderr reader panicked");
+        drop(pipe);
+    }
 }
 
 /// A stream's bytes so far, shared with the thread that reads it.

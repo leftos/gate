@@ -29,16 +29,20 @@ sha2 = "0.11.0"
 tar = "0.4.46"
 # Reads `.gate/toolchain.toml` into a `toml::Table`, its keys in file order; no writer, no derive.
 toml = { version = "1.1.8", default-features = false, features = ["std", "parse", "serde", "preserve_order"] }
-# `Win32_Storage_FileSystem` for the outputs walk and pack; `Win32_Foundation` and `Win32_Security*` for the owner of the
+# `Win32_Storage_FileSystem` for the outputs walk and pack, and with `Win32_System_IO` for the heartbeat's zero-byte
+# `WriteFile` probe of stderr; `Win32_Foundation` and `Win32_Security*` for the owner of the
 # MSYS keeper's folder; `Win32_System_Console`, `Win32_System_Threading` and `Win32_System_RemoteDesktop` serve only
-# `fake-tool`, a `test-seams` bin, and so compile into `gate.exe` unused (a package's bins cannot use its
-# dev-dependencies, so they cannot be moved there).
+# `fake-tool`, and `Win32_System_JobObjects` only `fake-ssh` (and `late.rs`'s tests, which the dev-dependency below also
+# serves), `test-seams` bins, and so compile into `gate.exe` unused (a package's bins cannot use its dev-dependencies, so
+# they cannot be moved there).
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
     "Win32_System_RemoteDesktop",
     "Win32_System_Threading",
 ] }
@@ -49,7 +53,7 @@ zstd = "0.14.2"
 # and the crate is test-only.
 object = { version = "0.40.0", default-features = false, features = ["read_core", "pe", "std"] }
 # The MSYS keeper's machine-alone case reads Git's MSYS section (`Wdk_*`, `Win32_Security`, `Win32_System_Memory`,
-# `Win32_System_RemoteDesktop`).
+# `Win32_System_RemoteDesktop`); the heartbeat's probe tests fill a pipe that does not wait (`Win32_System_Pipes`).
 windows-sys = { version = "0.61.2", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
@@ -57,6 +61,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security",
     "Win32_System_JobObjects",
     "Win32_System_Memory",
+    "Win32_System_Pipes",
     "Win32_System_RemoteDesktop",
     "Win32_System_Threading",
 ] }

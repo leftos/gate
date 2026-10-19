@@ -9,7 +9,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -20,8 +20,9 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::support::{
-    Case, Closed, Escapee, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, Outcome, Running, UNTIL_KILLED, allow_breakaway, box_payload, build_version,
-    copy_tool, finish, junction, shown, start_with_closed, start_with_stdin, wait_until, wait_until_closed,
+    Case, Closed, Escapee, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, Outcome, Running, StderrCloser, UNTIL_KILLED, allow_breakaway, box_payload,
+    build_version, copy_tool, finish, junction, shown, start_with_closable_stderr, start_with_closed, start_with_stdin, wait_until,
+    wait_until_closed,
 };
 
 mod desktop;
@@ -75,6 +76,29 @@ impl BoxCall {
         drop(stdin);
         running
     }
+
+    /// Starts the box as [`start_with_closable_stderr`] does, its request line written and its stdin then closed; the
+    /// case closes the box's stderr with the [`StderrCloser`] returned.
+    fn start_with_closable_stderr(self) -> (Running, StderrCloser) {
+        let (running, mut stdin, stderr) = start_with_closable_stderr(self.command);
+        send_request(&mut stdin, &self.request);
+        drop(stdin);
+        (running, stderr)
+    }
+}
+
+/// Waits for `running`, a box whose client is gone, to end, failing once `guard` has passed while it still runs.
+fn ended_within(mut running: Running, guard: Duration) -> Outcome {
+    let deadline = Instant::now() + guard;
+    while running.is_running() {
+        assert!(
+            Instant::now() < deadline,
+            "the box still runs {} s after its client's stderr closed",
+            guard.as_secs()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    running.finish()
 }
 
 impl Deref for BoxCall {
@@ -3271,6 +3295,34 @@ fn box_run_a_closed_stderr_pipe_stops_the_job_and_exits_255() {
         Path::new(field(&payload, "Work")).join("new.txt").exists(),
         "the command changed the tree"
     );
+    assert!(!has_ref(&payload, "refs/gate-back/k"), "a lost client gets no back commit");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// How long a box whose client is gone may take to end: a hang guard, since the box sees the gone client within a
+/// heartbeat period of 200 ms and ends then.
+const QUIET_CLIENT_GONE_GUARD: Duration = Duration::from_secs(60);
+
+/// A command that writes nothing more after its first line never finds the closed stderr itself: stderr is closed only
+/// once the command runs and is watched, so the heartbeat, which writes no line for a command using no CPU, finds it
+/// with its idle probe within a period, and the box stops the command as a forwarded line's failed write would have.
+#[test]
+fn box_run_a_closed_stderr_pipe_stops_a_quiet_command_and_exits_255() {
+    let case = Case::new("box_run_closed_stderr_quiet");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "started", "sleep", "1200000"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let (running, stderr) =
+        bare_box_call(&case, &["box", "--test-heartbeat-ms", "200", "run"], &self::payload(&payload)).start_with_closable_stderr();
+    running.wait_for_stdout("started");
+    stderr.close();
+    let outcome = ended_within(running, QUIET_CLIENT_GONE_GUARD);
+
+    assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
+    assert!(outcome.stdout.contains("started"), "the command ran: {outcome:?}");
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    assert_eq!(stopped.code, Some(0), "the command's job is gone: {stopped:?}");
+    assert_eq!(stopped.stdout, "", "nothing is left to stop: {stopped:?}");
     assert!(!has_ref(&payload, "refs/gate-back/k"), "a lost client gets no back commit");
     wait_until_closed(Path::new(field(&payload, "Lock")));
 }

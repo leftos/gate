@@ -16,7 +16,7 @@ use gate_win32::{Account, AcquireError, ConnectState, LockState, MutexGuard, Pri
 
 use crate::boxside::desktop::lines::{DesktopRefusal, Limits, abandoned_line, busy_timeout_line, busy_wait_line, capped_wait, session_verdict};
 use crate::boxside::payload::escaped;
-use crate::boxside::run::{Beat, One, REFUSED_STATUS, Ran, Request, STARTING_COMMAND, before_the_job, prepared};
+use crate::boxside::run::{Beat, CLOSED_STATUS, One, REFUSED_STATUS, Ran, Request, STARTING_COMMAND, before_the_job, prepared};
 use crate::console::Console;
 use crate::remote::{Refusal, refused_line};
 
@@ -138,7 +138,7 @@ pub(super) fn desktop_command(request: &Request<'_>, one: &One<'_>, wait: u64, b
 
 /// Why the builder's desktop lock was not taken.
 enum Unheld {
-    /// The run ended on a stop, with this status, its line said.
+    /// The run ended on a stop, with this status, its line said, or on a gone client with [`CLOSED_STATUS`].
     Ended(u32),
     /// Another run held it for the whole wait.
     Busy,
@@ -146,8 +146,9 @@ enum Unheld {
     Failed(io::Error),
 }
 
-/// Takes the builder's desktop lock `mutex`, waiting in turns of at most `step`, and never past `total`: the stop signal
-/// is looked at before each turn, the busy-wait line is said once when another run holds the lock and some of the wait
+/// Takes the builder's desktop lock `mutex`, waiting in turns of at most `step`, and never past `total`: the run's
+/// client-gone flag and then the stop signal are looked at before each turn, a gone client ending the wait with
+/// [`CLOSED_STATUS`] and no line, the busy-wait line is said once when another run holds the lock and some of the wait
 /// is left, and a lock taken from a run that ended holding it is said. A `total` of zero is one try, with no wait and
 /// no busy-wait line.
 fn wait_for_desktop<'m>(
@@ -162,7 +163,13 @@ fn wait_for_desktop<'m>(
         step,
         now: Instant::now,
     };
-    let look = |console: &mut Console| before_the_job(beat.stop.look(STARTING_COMMAND), beat.stop.job, beat.lock, console);
+    let look = |console: &mut Console| {
+        // Nothing has started yet, and the box's output that found the client gone is no place for a line.
+        if beat.client_gone() {
+            return Err(CLOSED_STATUS);
+        }
+        before_the_job(beat.stop.look(STARTING_COMMAND), beat.stop.job, beat.lock, console)
+    };
     let busy = |console: &mut Console| beat.say(console, &busy_wait_line());
     let guard = waited(&turns, console, look, |bound| mutex.acquire(bound), busy)?;
     if guard.abandoned() {

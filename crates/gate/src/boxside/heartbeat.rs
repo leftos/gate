@@ -2,18 +2,26 @@
 //! [`Pump`], so the client knows a quiet command is still working. While no command is watched the pump writes every
 //! period; while one is, only when the CPU its job used since the last beat reaches 1% of the time since it, as the
 //! PowerShell wrapper's heartbeat counts it. The command's build servers are its run's own and run in its job, so the
-//! job's CPU counts them. Each line takes the box's output lock, so none lands inside a forwarded line. The heartbeat
-//! starts no process.
+//! job's CPU counts them. Each line takes the box's output lock, so none lands inside a forwarded line. On a period with
+//! no line due the pump flushes, and the box's flush probes stderr with a zero-byte write under the same lock; a line or
+//! a probe that fails because stderr's reader has gone sets the run's [`ClientGone`], so the run sees a gone client
+//! within a period even while its command writes nothing. A probe that fails any other way ends the probing for the
+//! rest of the run and the lines go on; any other failed line or flush ends the heartbeats. Neither sets the flag. The
+//! heartbeat starts no process.
 
 use std::io::{self, Write};
+use std::os::windows::io::{AsRawHandle, RawHandle};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
 use gate_args::BoxSeams;
 use gate_watchdog::{CpuSource, Pump, Ticker};
 use gate_win32::Job;
+use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Storage::FileSystem::WriteFile;
 
-use crate::boxside::forward::OutputLock;
+use crate::boxside::forward::{ClientGone, OutputLock};
 
 /// How often the heartbeat looks, and so the most often it writes.
 const PERIOD: Duration = Duration::from_secs(5);
@@ -26,15 +34,18 @@ pub(crate) fn period(seams: &BoxSeams) -> Duration {
     seams.heartbeat_ms.map_or(PERIOD, Duration::from_millis)
 }
 
-/// Starts the heartbeat on stderr, every line under `lock`, looking every `period`.
+/// Starts the heartbeat on stderr, every line and probe under `lock`, looking every `period`; a line or a probe that
+/// fails sets `gone`.
 ///
 /// # Errors
 ///
 /// Why the heartbeat's thread could not be started.
-pub(crate) fn start(lock: &OutputLock, period: Duration) -> io::Result<Pump> {
+pub(crate) fn start(lock: &OutputLock, gone: &ClientGone, period: Duration) -> io::Result<Pump> {
     let writer = Locked {
         lock: Arc::clone(lock),
+        gone: Arc::clone(gone),
         sink: io::stderr(),
+        probing: true,
     };
     Pump::start(writer, Arc::new(BoxClock { started: Instant::now() }), period)
 }
@@ -57,22 +68,93 @@ impl Ticker for BoxClock {
 
 /// A writer that holds the box's output lock for each write and gives `sink` the whole buffer in one `write_all`: on
 /// [`io::Stderr`], one write of the whole line on the locked stream, so a heartbeat never lands inside a line the forwarders
-/// write under the same lock.
+/// write under the same lock. Its flush, under the same lock, flushes `sink` and then probes it. A write, a flush or a
+/// probe that fails because the reader has gone ([`reader_gone`]) sets `gone`: the client's connection is gone. A probe
+/// that fails any other way is the last: the flush passes and no later flush probes.
 struct Locked<W> {
     lock: OutputLock,
+    gone: ClientGone,
     sink: W,
+    /// Whether the flush still probes `sink`: true until a probe fails other than for a gone reader.
+    probing: bool,
 }
 
-impl<W: Write> Write for Locked<W> {
+impl<W: Probed> Write for Locked<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        self.sink.write_all(buf)?;
+        self.sink.write_all(buf).inspect_err(|error| mark_if_gone(&self.gone, error))?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.sink.flush()
+        let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        self.sink.flush().inspect_err(|error| mark_if_gone(&self.gone, error))?;
+        if !self.probing {
+            return Ok(());
+        }
+        match self.sink.probe() {
+            Err(error) if reader_gone(&error) => {
+                mark_if_gone(&self.gone, &error);
+                Err(error)
+            }
+            // A stream that cannot be asked is no gone client: the lines go on, and a gone reader is seen by a line.
+            Err(_) => {
+                self.probing = false;
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+        }
     }
+}
+
+/// The Win32 errors a write to a pipe gives once its reader has gone: closed (`ERROR_NO_DATA`), broken
+/// (`ERROR_BROKEN_PIPE`) or never there (`ERROR_PIPE_NOT_CONNECTED`).
+const READER_GONE: [u32; 3] = [ERROR_NO_DATA, ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED];
+
+/// Whether `error` says the stream's reader has gone ([`READER_GONE`]), rather than any other failure.
+fn reader_gone(error: &io::Error) -> bool {
+    error
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+        .is_some_and(|code| READER_GONE.contains(&code))
+}
+
+/// Sets `gone` when `error` says the stream's reader has gone ([`reader_gone`]); any other failure leaves it alone.
+fn mark_if_gone(gone: &AtomicBool, error: &io::Error) {
+    if reader_gone(error) {
+        gone.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A stream the heartbeat writes that can be asked, without writing a byte, whether its reader still takes writes.
+trait Probed: Write {
+    /// `Err` once the stream's reader has gone, or when the stream cannot be asked.
+    fn probe(&mut self) -> io::Result<()>;
+}
+
+impl Probed for io::Stderr {
+    /// [`probe`] on stderr's raw handle, read afresh on each call. It is called only under the box's output lock, which
+    /// the box also holds while `Utf8Console` points the process's standard handles at a donor's console, so the handle
+    /// is always the box's own stderr.
+    fn probe(&mut self) -> io::Result<()> {
+        probe(self.as_raw_handle())
+    }
+}
+
+/// A zero-byte `WriteFile` on `handle`, which std would skip as an empty write: it fails on a pipe whose reader has
+/// closed it, and succeeds while the reader is there. A null or invalid handle, a process with no stderr, is not
+/// probed: there is no client to lose.
+fn probe(handle: RawHandle) -> io::Result<()> {
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Ok(());
+    }
+    let empty: [u8; 0] = [];
+    let mut written = 0;
+    // SAFETY: the buffer is valid for the zero bytes asked, `written` is a valid place for the count, and no overlapped
+    // structure is given. Stderr's handle is the box's own and open for the call: the box's output lock, held around
+    // every probe, is also held while `Utf8Console` swaps the process's standard handles.
+    let wrote = unsafe { WriteFile(handle, empty.as_ptr(), 0, &raw mut written, std::ptr::null_mut()) };
+    if wrote == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
 /// The heartbeat's CPU source for one command: its job.
@@ -92,17 +174,24 @@ impl CpuSource for JobCpu {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Write};
+    use std::io::{self, PipeWriter, Write};
+    use std::os::windows::io::AsRawHandle;
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
     use std::sync::mpsc::channel;
     use std::sync::{Arc, Mutex, PoisonError};
     use std::thread;
     use std::time::Duration;
 
     use gate_win32::{EnvironmentBlock, Launch, LaunchOutput};
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_NO_DATA, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Pipes::{PIPE_NOWAIT, PIPE_WAIT, SetNamedPipeHandleState};
 
-    use super::{Locked, job_cpu};
-    use crate::boxside::forward::OutputLock;
+    use super::{Locked, Probed, job_cpu, probe, reader_gone};
+    use crate::boxside::forward::{ClientGone, OutputLock};
+
+    /// How many bytes the full-pipe case writes at a time while it fills the pipe, before it tops it up a byte at a time.
+    const FILL_CHUNK: usize = 4096;
 
     /// The CPU the job-alone test burns outside the job: 50 ms in 100 ns ticks.
     const BURN: u64 = 500_000;
@@ -135,6 +224,197 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    impl Probed for Recording {
+        fn probe(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A pipe's write end as the heartbeat's sink, probed as stderr is.
+    struct Piped(PipeWriter);
+
+    impl Write for Piped {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
+
+    impl Probed for Piped {
+        fn probe(&mut self) -> io::Result<()> {
+            probe(self.0.as_raw_handle())
+        }
+    }
+
+    /// The heartbeat's writer on `writer`, and the client-gone flag it sets.
+    fn locked(writer: PipeWriter) -> (Locked<Piped>, ClientGone) {
+        let gone = ClientGone::default();
+        let locked = Locked {
+            lock: OutputLock::default(),
+            gone: Arc::clone(&gone),
+            sink: Piped(writer),
+            probing: true,
+        };
+        (locked, gone)
+    }
+
+    /// A sink whose probe fails with the Win32 error `probe`, and whose write and flush fail with `write` when it is
+    /// given; it records each write it takes and counts its probes.
+    struct Failing {
+        write: Option<u32>,
+        probe: u32,
+        written: Vec<Vec<u8>>,
+        probes: u32,
+    }
+
+    /// The `io::Error` of the Win32 error `code`.
+    #[expect(clippy::expect_used, reason = "a Win32 error code that does not fit fails the case loudly")]
+    fn os_error(code: u32) -> io::Error {
+        io::Error::from_raw_os_error(i32::try_from(code).expect("a Win32 error code fits an i32"))
+    }
+
+    impl Write for Failing {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(code) = self.write {
+                return Err(os_error(code));
+            }
+            self.written.push(buf.to_vec());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.write.map_or(Ok(()), |code| Err(os_error(code)))
+        }
+    }
+
+    impl Probed for Failing {
+        fn probe(&mut self) -> io::Result<()> {
+            self.probes += 1;
+            Err(os_error(self.probe))
+        }
+    }
+
+    /// The heartbeat's writer on a [`Failing`] sink, and the client-gone flag it sets.
+    fn failing(write: Option<u32>, probe: u32) -> (Locked<Failing>, ClientGone) {
+        let gone = ClientGone::default();
+        let sink = Failing {
+            write,
+            probe,
+            written: Vec::new(),
+            probes: 0,
+        };
+        let locked = Locked {
+            lock: OutputLock::default(),
+            gone: Arc::clone(&gone),
+            sink,
+            probing: true,
+        };
+        (locked, gone)
+    }
+
+    #[test]
+    fn a_probe_that_fails_while_the_reader_is_there_stops_the_probing_and_the_beats_go_on() {
+        let (mut locked, gone) = failing(None, ERROR_ACCESS_DENIED);
+
+        let probed = locked.flush();
+        let beat = locked.write_all(b"gate-remote-heartbeat: 12\n").and_then(|()| locked.flush());
+
+        assert!(probed.is_ok(), "a probe that cannot ask is no end: {probed:?}");
+        assert!(beat.is_ok(), "the next beat is written: {beat:?}");
+        assert_eq!(locked.sink.written, [b"gate-remote-heartbeat: 12\n".to_vec()], "the beat's line, whole");
+        assert_eq!(locked.sink.probes, 1, "no probe after the one that failed");
+        assert!(!gone.load(Ordering::SeqCst), "the client is not taken for gone");
+    }
+
+    #[test]
+    fn a_write_or_flush_that_fails_sets_the_flag_only_for_a_gone_reader() {
+        let (mut denied, denied_gone) = failing(Some(ERROR_ACCESS_DENIED), ERROR_ACCESS_DENIED);
+        let wrote = denied.write(b"x");
+        let flushed = denied.flush();
+
+        assert!(wrote.is_err(), "the write fails: {wrote:?}");
+        assert!(flushed.is_err(), "the flush fails: {flushed:?}");
+        assert!(!denied_gone.load(Ordering::SeqCst), "a denied write is not a gone client");
+
+        let (mut closed, closed_gone) = failing(Some(ERROR_NO_DATA), ERROR_NO_DATA);
+        let wrote = closed.write(b"x");
+
+        assert!(wrote.as_ref().is_err_and(reader_gone), "the write finds the reader gone: {wrote:?}");
+        assert!(closed_gone.load(Ordering::SeqCst), "the write alone takes the client for gone");
+    }
+
+    /// Sets the wait mode `mode` (`PIPE_WAIT` or `PIPE_NOWAIT`) on the pipe end `writer`.
+    fn set_wait(writer: &PipeWriter, mode: u32) -> io::Result<()> {
+        // SAFETY: the handle is open while `writer` lives; the mode is read only, and the two limits are not given.
+        let set = unsafe { SetNamedPipeHandleState(writer.as_raw_handle(), &raw const mode, std::ptr::null(), std::ptr::null()) };
+        if set == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    }
+
+    /// Writes `chunk` to `writer`, a pipe end that does not wait, until a write takes less than all of it.
+    fn fill_with(writer: &mut PipeWriter, chunk: &[u8]) -> io::Result<()> {
+        while writer.write(chunk)? == chunk.len() {}
+        Ok(())
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test that cannot make its pipe must fail loudly")]
+    fn a_probe_of_a_pipe_whose_reader_has_gone_fails_and_sets_the_flag() {
+        let (reader, writer) = io::pipe().expect("the pipe is made");
+        let (mut locked, gone) = locked(writer);
+        drop(reader);
+
+        let flushed = locked.flush();
+
+        assert!(flushed.as_ref().is_err_and(reader_gone), "the probe finds the reader gone: {flushed:?}");
+        assert!(gone.load(Ordering::SeqCst), "the client is gone");
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test that cannot make its pipe must fail loudly")]
+    fn a_probe_of_a_pipe_whose_reader_is_there_passes() {
+        let (reader, writer) = io::pipe().expect("the pipe is made");
+        let (mut locked, gone) = locked(writer);
+
+        let flushed = locked.flush();
+        drop(reader);
+
+        assert!(flushed.is_ok(), "the probe passes: {flushed:?}");
+        assert!(!gone.load(Ordering::SeqCst), "the client is there");
+    }
+
+    /// A pipe its reader has stopped reading, its buffer full, still has its reader: the probe neither waits for room
+    /// nor finds the reader gone. Run on a thread, so a probe that waits fails the case at the guard.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test that cannot make or fill its pipe must fail loudly")]
+    fn a_probe_of_a_full_pipe_whose_reader_is_there_returns_and_passes() {
+        let (reader, mut writer) = io::pipe().expect("the pipe is made");
+        set_wait(&writer, PIPE_NOWAIT).expect("the pipe stops waiting for room");
+        fill_with(&mut writer, &[b'x'; FILL_CHUNK]).expect("the pipe is filled");
+        fill_with(&mut writer, b"x").expect("the pipe is topped up");
+        set_wait(&writer, PIPE_WAIT).expect("the pipe waits for room again");
+        let (mut locked, gone) = locked(writer);
+        let (done, finished) = channel();
+        let probing = thread::spawn(move || {
+            let _ = done.send(locked.flush().map_err(|error| error.to_string()));
+        });
+
+        let flushed = finished.recv_timeout(GUARD);
+        drop(reader);
+
+        assert_eq!(flushed, Ok(Ok(())), "the probe returns within the guard and passes");
+        assert!(!gone.load(Ordering::SeqCst), "the client is there");
+        assert!(probing.join().is_ok());
+    }
+
+    #[test]
+    fn no_handle_is_not_probed() {
+        assert!(probe(std::ptr::null_mut()).is_ok(), "a null handle has no client to lose");
+        assert!(probe(INVALID_HANDLE_VALUE).is_ok(), "an invalid handle has no client to lose");
     }
 
     /// The CPU this test process has used so far, in 100 ns ticks.
@@ -211,7 +491,9 @@ mod tests {
         let writes = Arc::new(Mutex::new(Vec::new()));
         let mut writer = Locked {
             lock: Arc::clone(&lock),
+            gone: Arc::default(),
             sink: Recording(Arc::clone(&writes)),
+            probing: true,
         };
         let held = lock.lock().unwrap_or_else(PoisonError::into_inner);
         let (done, finished) = channel();

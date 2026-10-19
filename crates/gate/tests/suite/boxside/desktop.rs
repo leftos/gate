@@ -11,13 +11,13 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use super::{
-    BoxCall, ENGINE_ENV_NAME, GIT_BIN_STAND_IN, STALE_ENGINE_ENV, adjusted_seconds, box_call, engine_env, fake_godot, fake_unreal, field, gate_box,
-    godot_root, let_go, lines_starting, pair_payload, pair_snapshot, path_for_run, path_godot, payload as request_line, refused_line, run_box,
-    snapshot, started_line, stopped_line_for, unreal_root,
+    BoxCall, ENGINE_ENV_NAME, GIT_BIN_STAND_IN, QUIET_CLIENT_GONE_GUARD, STALE_ENGINE_ENV, adjusted_seconds, bare_box_call, box_call, ended_within,
+    engine_env, fake_godot, fake_unreal, field, gate_box, godot_root, let_go, lines_starting, pair_payload, pair_snapshot, path_for_run, path_godot,
+    payload as request_line, refused_line, run_box, snapshot, started_line, stopped_line_for, unreal_root,
 };
 use crate::support::{
     Case, Closed, FAKE_TOOL, HeldDesktop, KeptDesktop, Outcome, box_payload, build_version, copy_tool, desktop_payload, desktop_seams, junction,
-    shown, wait_until,
+    shown, wait_until, wait_until_closed,
 };
 
 /// The box's prefix of every line refusing a run the builder's desktop cannot take.
@@ -881,6 +881,38 @@ fn box_stop_during_the_desktop_wait_is_stopped_before_the_command_started() {
         lines_starting(&outcome, &started_line(&payload)).is_empty(),
         "no start marker: {outcome:?}"
     );
+}
+
+/// A client gone while the run waits for the builder's desktop ends the wait: the heartbeat, which writes a line every
+/// period while no command is watched, finds the closed stderr, and the box ends with 255 before it starts anything.
+#[test]
+fn a_closed_stderr_pipe_during_the_desktop_wait_ends_it_with_255_and_starts_nothing() {
+    let case = Case::new("desktop_gone_in_wait");
+    let payload = ready_payload(&case, COMMAND);
+    let held = HeldDesktop::hold(&case);
+    let seams = desktop_seams(&case, "ok", "active", HAND_OFF_MS);
+    let mut args = vec!["box", "--test-heartbeat-ms", "200"];
+    args.extend(seams.iter().map(String::as_str));
+    args.push("run");
+    let mut call = bare_box_call(&case, &args, &request_line(&payload));
+    call.env(INPUT_DESKTOP_VARIABLE, DEFAULT_DESKTOP);
+    let (running, stderr) = call.start_with_closable_stderr();
+    running.wait_for_stderr(BUSY_WAIT);
+
+    stderr.close();
+    let outcome = ended_within(running, QUIET_CLIENT_GONE_GUARD);
+    drop(held);
+
+    assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
+    assert_eq!(outcome.stdout, "", "stdout is empty, so the command never ran: {outcome:?}");
+    assert!(
+        lines_starting(&outcome, &started_line(&payload)).is_empty(),
+        "no start marker before stderr closed: {outcome:?}"
+    );
+    let stopped = gate_box(&case, "stop", &request_line(&payload), None);
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(stopped.stdout, "", "no job was left to stop: {stopped:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 
 #[test]

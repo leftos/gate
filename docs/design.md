@@ -1391,7 +1391,7 @@ The arithmetic (stall progress, the free share, the clock, the three kills and t
 
 A builder counts a routed run's ceiling with the same arithmetic ([The box side](#the-box-side)) and says the lines with the host: `gate: TIMED OUT on <host> after <timeout> s of load-adjusted time (...)` and `gate: BACKSTOP on <host>: <wall> s of wall time (...)`, the host left out (`gate: TIMED OUT after ...`) when the payload names none; its stall stays the client's.
 
-The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wait heartbeat: a pump thread writes `gate-remote-heartbeat: <cpu ms>` every period, and while a command is watched only when the CPU used since the last beat is at least 1% of the time elapsed since it. A failed CPU read writes `gate: remote heartbeat stopped: <message>` and ends the heartbeats, never the run. `gate box run` is the crate's caller ([The box side](#the-box-side)).
+The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wait heartbeat: a pump thread writes `gate-remote-heartbeat: <cpu ms>` every period, and while a command is watched only when the CPU used since the last beat is at least 1% of the time elapsed since it. A period with no beat due flushes instead, and the box's flush probes stderr for a gone client ([The box side](#the-box-side)). A failed CPU read writes `gate: remote heartbeat stopped: <message>` and ends the heartbeats, never the run. `gate box run` is the crate's caller ([The box side](#the-box-side)).
 
 ## Command launching
 
@@ -2473,6 +2473,10 @@ Built verbs:
 
   While the command runs it writes only when the CPU of the command's job since the last beat reaches 1% of the time since it. The command's build servers are its run's own and run in the job, so a build server outside the job counts for nothing.
 
+  A period with no beat due flushes instead, and the box's flush probes stderr with a zero-byte write under the output lock. A beat, a flush or a probe that fails with a closed, broken or not-connected pipe (`ERROR_NO_DATA`, `ERROR_BROKEN_PIPE`, `ERROR_PIPE_NOT_CONNECTED`) sets the run's client-gone flag, which the stdout and stderr forwarders set on any write error, so a quiet command whose client is gone is found within a period.
+
+  A probe that fails any other way stops the probing for the rest of the run while the beats go on, and the box then sees a gone client only when a beat fails to write.
+
   The ceiling: with a `Timeout` in the payload, the box watches the command from its start with the local watchdog's arithmetic (`boxside/ceiling.rs`; sampling every 5 s, demand every core at normal priority, the stall left to the client through the heartbeat).
 
   At the load-adjusted ceiling it ends the job and says `gate: TIMED OUT on <host> after <n> s of load-adjusted time (wall <w> s, machine free <p>% on average); killed <command> and its children`; at 5 x the ceiling of wall time it says `gate: BACKSTOP on <host>: <w> s of wall time (5 x <n> s ceiling, load-adjusted <a> s, machine free <p>% on average); killed <command> and its children`, the clause reading `machine load unknown: the sampler failed` after a sampler failure.
@@ -2489,7 +2493,7 @@ Built verbs:
 
   The start marker: just before it launches the command, before the donor console and the launch, the box says `gate-remote-started: <nonce>` on stderr once, with the payload's `Nonce`; a launch then refused or stopped has said it too. A warm-up says it once, after every tool and package restore and before its first command, and not again before the later ones.
 
-  Warm-up: a `run` with `WarmCommands` lays out and readies the work folder, restores the tools and the pnpm, bun and npm packages of every command, as a run does, then removes `{Work}.warm`, says the start marker and runs each command in order as a run's command is run (the stop signal looked at before each). It makes no back commit and packs no outputs, and on a pair run never says `gate: remote back commits: ...`. The payload's `Timeout` is one budget for all the commands: each command's ceiling is what the earlier ones left of it, in whole seconds rounded up, counting each one's load-adjusted seconds (its wall time once the sampler failed).
+  Warm-up: a `run` with `WarmCommands` lays out and readies the work folder, restores the tools and the pnpm, bun and npm packages of every command, as a run does, then removes `{Work}.warm`, says the start marker and runs each command in order as a run's command is run (the stop signal looked at before each, and a client gone found by the heartbeat ending it with 255 and no line of its own). It makes no back commit and packs no outputs, and on a pair run never says `gate: remote back commits: ...`. The payload's `Timeout` is one budget for all the commands: each command's ceiling is what the earlier ones left of it, in whole seconds rounded up, counting each one's load-adjusted seconds (its wall time once the sampler failed).
 
   The first command that ends non-zero or is killed ends the warm-up with `gate: remote warm-up stopped at command <k> of <n>` on stderr and that command's status (124 for a kill). A budget spent before command `k` ends it with `gate: remote warm-up ran out of its <s> s budget before command <k> of <n>` and exit 124. Once every command passed, the box writes `{Work}.warm` holding exactly `WarmHash` and says `gate: remote warm <hash>` last, exit 0. A record that cannot be removed or written says `gate: remote could not remove <Work>.warm: <error>` or `gate: remote could not write <Work>.warm: <error>` and exits 1.
 
@@ -2501,7 +2505,7 @@ Built verbs:
 
   A client that closed the connection while git's output was forwarded ends the run with 255 and `gate: remote the client closed the connection during git <step>`, the step's name saying git once (`during git init`, not `during git git init`). A pipe that cannot be read says `gate: remote could not read git's stderr: <error>` (or `stdout`).
 
-  A failed CPU read writes `gate: remote heartbeat stopped: cannot read the CPU of job <name>: <error>` (or `... cannot list the processes of job <name>: <error>`) and a thread that cannot start writes `gate: remote heartbeat stopped: cannot start the heartbeat: <error>`; the heartbeats end and the run does not.
+  A failed CPU read writes `gate: remote heartbeat stopped: cannot read the CPU of job <name>: <error>` (or `... cannot list the processes of job <name>: <error>`) and a thread that cannot start writes `gate: remote heartbeat stopped: cannot start the heartbeat: <error>`; the heartbeats end and the run does not, and with them the heartbeat's finding of a gone client: a forwarded line's failed write still finds it.
 
   Ending the heartbeat waits at most 2 s (`Pump::stop_within`), so a pump stuck on a client that stopped reading is left behind and the work folder's lock is released.
 
@@ -2675,7 +2679,7 @@ Built verbs:
 
   While another run holds it the box says `gate: remote waiting for the builder's desktop: another run holds it` once; a lock taken from a run that ended without releasing it says `gate: remote took the builder's desktop from a run that ended without releasing it`.
 
-  A wait that ends with the desktop still held is refused with the `desktop` tag, `gate: not routed: the builder's desktop stayed busy for <n> s` and exit 75. A lock that cannot be made or waited for is refused with the tag and the why `the builder's desktop lock cannot be made: <error>` or `the builder's desktop lock cannot be waited for: <error>`. A stop during the wait ends the run with status 1 and the stopped-before-start line, and on a pair run `gate: remote back commits: failed`.
+  A wait that ends with the desktop still held is refused with the `desktop` tag, `gate: not routed: the builder's desktop stayed busy for <n> s` and exit 75. A lock that cannot be made or waited for is refused with the tag and the why `the builder's desktop lock cannot be made: <error>` or `the builder's desktop lock cannot be waited for: <error>`. A stop during the wait ends the run with status 1 and the stopped-before-start line, and on a pair run `gate: remote back commits: failed`. A client gone during the wait, looked for before each turn, ends it with 255 and no line of its own, the lock released and no command started; a pair run's back-commits line is still written, to the dead stream.
 
   With the lock held the box reads the console session again, and a console that can no longer take the command is refused with the first read's whys. A run that passes the stage hands its command to the desktop helper, and the lock is released when the hand-off is over, however it ended.
 
@@ -2815,7 +2819,7 @@ Built verbs:
 
   A failure says `gate: cannot end the run's job: <problem>` on stderr, the problem worded as the local run end words it (the pass cap's `<n> of its processes still ran after 5 passes; first: <first problem>` included); a state root that cannot be resolved says the fixed line `gate: cannot end the run's job: the box's state root cannot be resolved; ending the whole job` (no path) and the whole job is terminated. The run's status stands either way.
 
-  A failed write by a forwarder to the box's stdout or stderr means the PC's ssh connection closed, and a closed connection always stops the job, whether it is noticed while the command runs or during the final drain. The box terminates the job with 124 and polls its processes every 100 ms for up to 10 s. It then drains the readers, skips the sync-back, releases the work-folder lock and exits 255.
+  A failed write by a forwarder to the box's stdout or stderr, or a heartbeat's failed beat or probe (above), means the PC's ssh connection closed, as when the PC's gate is killed, and a closed connection always stops the job, whether it is noticed while the command runs or during the final drain. The box terminates the job with 124 and polls its processes every 100 ms for up to 10 s. It then drains the readers, skips the sync-back, releases the work-folder lock and exits 255.
 
   On stderr, best effort, it says `gate: remote the client closed the connection; stopped job <name>` once the job is empty. Otherwise it says `gate: remote the client closed the connection; stopping job <name>` followed by the could-not-stop line or the `still has <n> process(es)` line of `stop`. The stdin closing is not the signal. A command that itself exits 255 is indistinguishable from a lost connection, as with the PowerShell wrapper.
 

@@ -4097,6 +4097,73 @@ fn a_box_kill_that_leaves_a_process_is_still_timed_out_with_no_sync_back() {
     assert!(!outcome.stderr.contains("gate: synced back"), "{outcome:?}");
 }
 
+/// How long the builder may take to stop the quiet command of a gate killed under it and free the work folder: a hang
+/// guard, since the box finds its client gone within the 200 ms heartbeat period the case gives it.
+const KILLED_GATE_GUARD: Duration = Duration::from_secs(60);
+
+/// The routed command of a case that killed its gate, held open so its pid names it alone, and ended on drop while it
+/// still runs: a failing case leaves no command running, so its box, which runs the suite's `gate.exe`, ends too.
+struct EndedOnDrop(gate_win32::StoppableProcess);
+
+impl EndedOnDrop {
+    /// Whether the command has ended.
+    fn ended(&self) -> bool {
+        matches!(self.0.wait(Duration::ZERO), Ok(true))
+    }
+}
+
+impl Drop for EndedOnDrop {
+    fn drop(&mut self) {
+        if !self.ended() {
+            // The case has already failed on its own assertion; this is its clean-up, best effort.
+            let _ = self.0.terminate(1);
+        }
+    }
+}
+
+/// A gate killed outright, as a task runner's hard stop ends it, makes no stop call; ssh goes with the gate's job, and
+/// the box, which outlives it as a builder's does, has its streams closed under it. Its command writes nothing, yet the
+/// box's heartbeat finds stderr closed within a period, stops the command's job and lets go of the work folder's lock.
+#[test]
+fn a_killed_gate_s_quiet_routed_command_frees_the_builder_s_work_folder() {
+    let case = client_case("client-killed-quiet");
+    let steps = ssh_steps(&case, "ssh", &["ok", "away"]);
+    let mut gate = client_gate(&case, "out.log", &steps, &[r".\tool.exe", "pid-to", "tool-pid.log", "sleep", "120000"]);
+    gate.env(BOX_SEAMS_VARIABLE, "--test-heartbeat-ms 200");
+    let running = start(gate);
+    running.wait_until("the run call", || calls(&steps).len() >= 2);
+    let work = work_folder(&case);
+    let pid_file = work.join("tool-pid.log");
+    let read_pid = || fs::read_to_string(&pid_file).ok().and_then(|text| text.trim().parse::<u32>().ok());
+    running.wait_until("the routed command's pid file", || read_pid().is_some());
+    let pid = read_pid().expect("the pid file holds a pid");
+    let tool = EndedOnDrop(
+        gate_win32::StoppableProcess::open(pid)
+            .expect("the routed command can be opened")
+            .expect("the routed command runs"),
+    );
+    let lock = work.with_file_name(format!(
+        "{}.lock",
+        work.file_name().expect("the work folder has a name").to_string_lossy()
+    ));
+
+    drop(running.kill());
+
+    let deadline = Instant::now() + KILLED_GATE_GUARD;
+    let tool_gone = || tool.ended();
+    let lock_free = || fs::OpenOptions::new().read(true).share_mode(0).open(&lock).is_ok();
+    while !(tool_gone() && lock_free()) {
+        assert!(
+            Instant::now() < deadline,
+            "{} s after the gate was killed, the command {pid} runs: {}, the work folder's lock is held: {}",
+            KILLED_GATE_GUARD.as_secs(),
+            !tool_gone(),
+            !lock_free()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// The run call's output floods the log past its cap before the box kills the command, so the box's kill line is not
 /// in the log: the verdict comes from the box's kill tag all the same.
 #[test]

@@ -73,8 +73,10 @@ impl BeatClock {
 /// The heartbeat pump: every period it writes a heartbeat whatever the CPU while no run is watched — the CPU total
 /// summed over every run watched so far, as the wrapper's `cpuTotal` is, and zero before any — and only when the
 /// watched command's CPU earns one while a run is. Its own thread does the sampling and the writing, so a write a full
-/// pipe blocks holds up no one else. A write or a flush that fails, a CPU read that fails and a panic in the thread
-/// all end the heartbeats for the rest of the run, and never the run.
+/// pipe blocks holds up no one else. A period with no heartbeat due flushes the writer instead. A write or a flush that
+/// fails, a CPU read that fails and a panic in the thread all end the heartbeats for the rest of the run, and the pump
+/// never ends the run itself; a writer may act on its own failure first, as the box's sets its run's client-gone flag,
+/// which then ends the run.
 pub struct Pump {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
@@ -250,7 +252,8 @@ fn pump<W: Write>(mut writer: W, period: Duration, shared: &Shared) {
     }
 }
 
-/// The loop: wait a period, decide the line under the state lock, and write it outside the lock.
+/// The loop: wait a period, decide the line under the state lock, and write it outside the lock; a period with no line
+/// due flushes the writer instead, so a writer whose flush asks whether its reader is still there asks once a period.
 fn pump_loop<W: Write>(writer: &mut W, period: Duration, shared: &Shared) {
     loop {
         {
@@ -268,7 +271,11 @@ fn pump_loop<W: Write>(writer: &mut W, period: Duration, shared: &Shared) {
             let decided = tick(&mut state, shared.ticker.as_ref());
             (decided.line, decided.ended)
         };
-        if line.is_some_and(|line| write_line(writer, &line).is_err()) {
+        let written = match line {
+            Some(line) => write_line(writer, &line),
+            None => writer.flush(),
+        };
+        if written.is_err() {
             return;
         }
         if ended {
@@ -584,6 +591,29 @@ mod tests {
         }
     }
 
+    /// A call the pump made on its writer.
+    enum Call {
+        Write,
+        Flush,
+    }
+
+    /// A writer that reports every write and flush it is given on a channel, in order.
+    struct CallReporter {
+        calls: Sender<Call>,
+    }
+
+    impl Write for CallReporter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let _ = self.calls.send(Call::Write);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let _ = self.calls.send(Call::Flush);
+            Ok(())
+        }
+    }
+
     /// The next line the pump wrote, waiting for one however long it takes; an empty string once its thread ended.
     fn next_line(events: &Receiver<Event>) -> String {
         match events.recv_timeout(GUARD) {
@@ -728,6 +758,28 @@ mod tests {
         .expect("the pump starts");
         assert!(ended(&seen), "the pump ended after its flush failed");
         assert_eq!(attempts.load(Ordering::SeqCst), 1, "the failed flush stopped the pump from trying again");
+        assert!(pump.stop().is_ok());
+    }
+
+    /// A watched run that uses no CPU on a clock that never moves earns no line, so every tick from the watch on has
+    /// none due: the pump flushes its writer on such a tick. A line is one write and its flush, so a flush with no write
+    /// before it is a tick with no line.
+    #[test]
+    fn an_idle_tick_flushes_the_writer() {
+        let (calls, made) = channel();
+        let pump = Pump::start(CallReporter { calls }, Arc::new(ZeroTicker), PERIOD).expect("the pump starts");
+        pump.watch(idle_cpu());
+        let mut after_write = false;
+        let mut idle_flush = false;
+        while !idle_flush {
+            match made.recv_timeout(GUARD).expect("the pump calls its writer again within the guard") {
+                Call::Write => after_write = true,
+                Call::Flush => {
+                    idle_flush = !after_write;
+                    after_write = false;
+                }
+            }
+        }
         assert!(pump.stop().is_ok());
     }
 

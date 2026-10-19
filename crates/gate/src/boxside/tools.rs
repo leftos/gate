@@ -202,7 +202,7 @@ fn restore(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
     let PipedSuspended { suspended, stdout, stderr } = launch.start_suspended(&job).map_err(|error| error.to_string())?;
     suspended.assign(&job).map_err(|error| error.to_string())?;
     let running = suspended.resume().map_err(|error| error.to_string())?;
-    let forwarders = match Forwarders::start(stdout, stderr, beat.lock) {
+    let forwarders = match Forwarders::start(stdout, stderr, beat.lock, beat.gone) {
         Ok(forwarders) => forwarders,
         Err(error) => {
             end_job(&job, console);

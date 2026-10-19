@@ -20,6 +20,7 @@ use std::io;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -32,7 +33,7 @@ use gate_win32::{
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::ceiling::{Ceiling, KILLED, Spec};
-use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
+use crate::boxside::forward::{ClientGone, DRAIN, Forwarders, OutputLock};
 use crate::boxside::heartbeat;
 use crate::boxside::inputs;
 use crate::boxside::msys;
@@ -302,7 +303,7 @@ pub(super) fn lay_out_alone(work: &str, bare: &str, lock: &str, nonce: &str, con
         main: &main,
         siblings: &[],
     };
-    match WorkGit::ready(lock, &OutputLock::default()).lay_out(&laid, console) {
+    match WorkGit::ready(lock, &OutputLock::default(), &ClientGone::default()).lay_out(&laid, console) {
         Ok(held) => Ok(held),
         Err(NotLaidOut::Failed(failed)) => Err(said(console, &failed)),
         Err(NotLaidOut::Refused(why)) => {
@@ -504,6 +505,8 @@ pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
 /// console fail; and the job's stop signal, made once the work folder's lock is held.
 pub(super) struct Beat<'a> {
     pub(super) lock: &'a OutputLock,
+    /// The run's client-gone flag, which the heartbeat and every forwarded output of the run set and every wait reads.
+    pub(super) gone: &'a ClientGone,
     pump: Option<&'a Pump>,
     seams: &'a BoxSeams,
     pub(super) stop: StopSignal<'a>,
@@ -554,6 +557,11 @@ impl<'a> StopSignal<'a> {
 }
 
 impl Beat<'_> {
+    /// Whether the run's [`ClientGone`] is set: the client's connection is gone.
+    pub(super) fn client_gone(&self) -> bool {
+        self.gone.load(Ordering::SeqCst)
+    }
+
     /// Has the heartbeat count the CPU of `job` from now on.
     fn watch(&self, job: &Arc<Job>) {
         if let Some(pump) = self.pump {
@@ -658,7 +666,9 @@ impl<'a> RunOutputs<'a> {
 /// ended before it, its lines said. The heartbeat starts once the subfolder is checked and stops on every way out.
 fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, console: &mut Console) -> Result<u32, u32> {
     let lock = OutputLock::default();
-    let git = WorkGit::ready(request.lock, &lock);
+    // Made with the lock, before the run's first git call, so git's forwarded output and the heartbeat share it.
+    let gone = ClientGone::default();
+    let git = WorkGit::ready(request.lock, &lock, &gone);
     git.clear_back_refs(request, console).map_err(|failed| {
         let status = said(console, &failed);
         no_back_commits(request, console);
@@ -679,11 +689,12 @@ fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, co
         return Err(u32::from(USAGE_STATUS));
     };
     // A heartbeat that cannot start ends the heartbeats, never the run.
-    let pump = heartbeat::start(&lock, heartbeat::period(seams))
+    let pump = heartbeat::start(&lock, &gone, heartbeat::period(seams))
         .inspect_err(|error| console.err(&format!("gate: remote heartbeat stopped: cannot start the heartbeat: {error}")))
         .ok();
     let beat = Beat {
         lock: &lock,
+        gone: &gone,
         pump: pump.as_ref(),
         seams,
         stop: StopSignal::new(stop, request.job),
@@ -811,11 +822,15 @@ const WARM_WRITE_WAIT: Duration = Duration::from_millis(100);
 const WARM_WRITE_WAITS: u32 = 10;
 
 /// Each of a warm-up's commands run in `place` in order ([`warm_up`]): 0 once all passed, else the status of the first
-/// that did not, or of a budget spent before a command, said; `Err` as [`command`] gives it.
+/// that did not, or of a budget spent before a command, said; `Err` as [`command`] gives it, or [`CLOSED_STATUS`] for a
+/// client found gone before a command, which is then not started.
 fn warm_commands(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<u32, u32> {
     let count = request.commands.len();
     let mut spent = 0.0;
     for (index, words) in request.commands.iter().enumerate() {
+        if beat.client_gone() {
+            return Err(CLOSED_STATUS);
+        }
         let at = index + 1;
         let budget = request.timeout.map(|budget| (budget, remaining_budget(budget, spent)));
         if let Some((budget, None)) = budget {
@@ -866,8 +881,8 @@ const BACKSTOP_TIMES: u64 = 5;
 /// handles close, an inherited handle to the job among them, so the job can outlive its last process for as long as
 /// the machine takes to tear those down. A stop is then the next command's stop outcome ([`before_the_job`]); a job
 /// still there, or one that cannot be looked for, is left to the next command's job creation, which refuses its name
-/// with its own line. A client gone meanwhile is not seen here: no output of the box's is being forwarded between
-/// commands.
+/// with its own line. A client gone meanwhile, which the heartbeat finds, is not looked for here: [`warm_commands`]
+/// looks for it before the next command.
 fn job_name_freed(job: &str, beat: &Beat<'_>, limit: Duration, console: &mut Console) {
     let started = Instant::now();
     while matches!(gate_win32::OpenedJob::open(job), Ok(Some(_))) && started.elapsed() < limit {
@@ -1953,7 +1968,7 @@ fn watch(started: Started<'_, '_>, console: &mut Console) -> Result<Ran, u32> {
         mut ceiling,
     } = started;
     let Launched { running, pipes } = launched;
-    let forwarders = match Forwarders::start(pipes.stdout, pipes.stderr, beat.lock) {
+    let forwarders = match Forwarders::start(pipes.stdout, pipes.stderr, beat.lock, beat.gone) {
         Ok(forwarders) => forwarders,
         Err(error) => {
             let status = failed(console, &format!("cannot start reading the command's output: {error}"));
@@ -2103,7 +2118,8 @@ pub(super) enum WaitEnd<K> {
     Exited { code: u32, stopped: bool },
     /// The look for a kill found this one first; the process still runs.
     Killed(K),
-    /// A write to the box's own output failed first: the client closed the connection.
+    /// The run's [`ClientGone`] was set first, by a forwarded line or a heartbeat line or probe whose write to the box's
+    /// own output found its reader gone: the client closed the connection.
     ClientGone,
     /// The box could not wait for it: the status 1, its line said and its job terminated.
     Failed(u32),
@@ -2146,7 +2162,7 @@ impl Watched<'_> {
                 code,
                 stopped: stopped || self.stop_seen(stop, console),
             }),
-            Ok(None) if self.forwarders.pipe_closed() => Some(WaitEnd::ClientGone),
+            Ok(None) if self.forwarders.client_gone() => Some(WaitEnd::ClientGone),
             Ok(None) => look(console).map(WaitEnd::Killed),
             Err(error) => {
                 let status = failed(console, &format!("cannot wait for {}: {error}", self.watching.what()));
@@ -2167,7 +2183,7 @@ impl Watched<'_> {
     /// run goes on.
     pub(super) fn drained(self, console: &mut Console) -> Result<(), u32> {
         let drained = self.forwarders.drain(DRAIN);
-        if drained.pipe_closed {
+        if drained.client_gone {
             return Err(closed_connection(self.job, terminate_and_wait(self.job), console));
         }
         if !drained.all_ended {
@@ -2184,7 +2200,7 @@ impl Watched<'_> {
     pub(super) fn killed(self, console: &mut Console) -> Result<io::Result<Ending>, u32> {
         let ending = terminate_and_wait(self.job);
         let drained = self.forwarders.drain(DRAIN);
-        if drained.pipe_closed {
+        if drained.client_gone {
             return Err(closed_connection(self.job, ending, console));
         }
         if !drained.all_ended {
@@ -2324,16 +2340,19 @@ pub(super) struct WorkGit {
     hooks: String,
     /// The box's output lock, which every line git writes is forwarded under.
     output: OutputLock,
+    /// The run's client-gone flag, which a failed forward of git's output sets and each git step reads once git ended.
+    gone: ClientGone,
 }
 
 impl WorkGit {
-    /// Finds git, its output to be forwarded under `output`; called only once the caller holds the work folder's lock
-    /// file `lock`.
-    fn ready(lock: &str, output: &OutputLock) -> WorkGit {
+    /// Finds git, its output to be forwarded under `output`, a failed forward setting `gone`; called only once the
+    /// caller holds the work folder's lock file `lock`.
+    fn ready(lock: &str, output: &OutputLock, gone: &ClientGone) -> WorkGit {
         WorkGit {
             git: Git::find(),
             hooks: format!(r"core.hooksPath={lock}\hooks"),
             output: Arc::clone(output),
+            gone: Arc::clone(gone),
         }
     }
 
@@ -2345,7 +2364,7 @@ impl WorkGit {
             .git
             .command(&self.args(args))
             .map_err(GitFailure::Failed)
-            .and_then(|command| Git::forwarded(command, false, &self.output, console));
+            .and_then(|command| Git::forwarded(command, false, &self.output, &self.gone, console));
         match ran {
             Ok(output) => match exit_code(output.status) {
                 0 => Ok(()),
@@ -2644,7 +2663,7 @@ impl BackGit<'_> {
     /// output, else why it could not run or that the client is gone.
     fn run(&self, step: &str, args: &[&str], copied_index: bool, read_stdout: bool, console: &mut Console) -> Result<Output, BackFailed> {
         let step = self.repo.step(step);
-        Git::forwarded(self.command(args, copied_index), read_stdout, &self.work.output, console).map_err(|failure| match failure {
+        Git::forwarded(self.command(args, copied_index), read_stdout, &self.work.output, &self.work.gone, console).map_err(|failure| match failure {
             GitFailure::Failed(error) => BackFailed::Step(format!("{step} failed: {error}")),
             GitFailure::ClientGone => BackFailed::ClientGone(client_gone(&step)),
         })

@@ -47,6 +47,11 @@ fn was_cancelled(error: &io::Error) -> bool {
 /// forwarded through [`ChildPipes`] instead.
 pub(crate) type OutputLock = Arc<Mutex<()>>;
 
+/// The run's one client-gone flag: set once a write to the box's own output fails, a forwarded line's or the
+/// heartbeat's line or idle probe, since the client's connection is then gone; every wait of the run that watches for a
+/// gone client reads it. A box verb with no heartbeat makes one of its own for its readers.
+pub(crate) type ClientGone = Arc<AtomicBool>;
+
 /// Which of the box's own streams a pipe's lines go to.
 #[derive(Clone, Copy)]
 enum Stream {
@@ -66,8 +71,8 @@ impl Stream {
 /// The readers of one process's output, one per pipe.
 pub(crate) struct Forwarders {
     stopped: Arc<AtomicBool>,
-    /// Set by a reader whose write to the box's own output failed: the client's connection is gone.
-    pipe_closed: Arc<AtomicBool>,
+    /// The run's [`ClientGone`], which a reader whose write to the box's own output failed sets, as the heartbeat does.
+    client_gone: ClientGone,
     ended: Receiver<()>,
     /// Set when a reader was taken for a leftover once the limit passed: a read of it ended through the cancellation
     /// the drain asked for, or the reader could not be asked. The drain's answer is not that every reader ended.
@@ -77,20 +82,26 @@ pub(crate) struct Forwarders {
 }
 
 impl Forwarders {
-    /// Starts a reader for the command's `stdout` pipe and one for its `stderr` pipe, writing under `lock`.
+    /// Starts a reader for the command's `stdout` pipe and one for its `stderr` pipe, writing under `lock`, a failed
+    /// write setting `gone`.
     ///
     /// # Errors
     ///
     /// The system's error when a thread cannot be started; a reader started before it goes on.
-    pub(crate) fn start(stdout: File, stderr: File, lock: &OutputLock) -> io::Result<Forwarders> {
-        Forwarders::start_each([(stdout, Stream::Out), (stderr, Stream::Err)], "the command's", lock)
+    pub(crate) fn start(stdout: File, stderr: File, lock: &OutputLock, gone: &ClientGone) -> io::Result<Forwarders> {
+        Forwarders::start_each([(stdout, Stream::Out), (stderr, Stream::Err)], "the command's", lock, gone)
     }
 
-    /// Starts a reader for each of `pipes`, writing its lines to the box's stream it names under `lock`; a read that
-    /// fails is said naming the pipe `source`'s, as in `the command's stdout`.
-    fn start_each(pipes: impl IntoIterator<Item = (File, Stream)>, source: &'static str, lock: &OutputLock) -> io::Result<Forwarders> {
+    /// Starts a reader for each of `pipes`, writing its lines to the box's stream it names under `lock`, a failed write
+    /// setting `gone`; a read that fails is said naming the pipe `source`'s, as in `the command's stdout`.
+    fn start_each(
+        pipes: impl IntoIterator<Item = (File, Stream)>,
+        source: &'static str,
+        lock: &OutputLock,
+        gone: &ClientGone,
+    ) -> io::Result<Forwarders> {
         let stopped = Arc::new(AtomicBool::new(false));
-        let pipe_closed = Arc::new(AtomicBool::new(false));
+        let client_gone = Arc::clone(gone);
         let (sender, ended) = mpsc::channel();
         let mut behind = Vec::new();
         for (pipe, stream) in pipes {
@@ -104,7 +115,7 @@ impl Forwarders {
             let forwarder = Forwarder {
                 lock: Arc::clone(lock),
                 stopped: Arc::clone(&stopped),
-                pipe_closed: Arc::clone(&pipe_closed),
+                client_gone: Arc::clone(&client_gone),
                 stream,
                 source,
                 sink,
@@ -130,17 +141,17 @@ impl Forwarders {
         }
         Ok(Forwarders {
             stopped,
-            pipe_closed,
+            client_gone,
             ended,
             leftover: AtomicBool::new(false),
             behind,
         })
     }
 
-    /// Whether a reader's write to the box's own output has failed: the client's connection is gone, and the run stops
-    /// the command's job for it.
-    pub(crate) fn pipe_closed(&self) -> bool {
-        self.pipe_closed.load(Ordering::SeqCst)
+    /// Whether the run's [`ClientGone`] is set, by a reader's write to the box's own output that failed or by the
+    /// heartbeat's: the client's connection is gone, and the run stops the command's job for it.
+    pub(crate) fn client_gone(&self) -> bool {
+        self.client_gone.load(Ordering::SeqCst)
     }
 
     /// Waits at most `limit` for every reader to reach the end of its pipe, then stops them, so they drop every later
@@ -187,7 +198,7 @@ impl Forwarders {
         self.stopped.store(true, Ordering::SeqCst);
         Drained {
             all_ended: self.all_ended(),
-            pipe_closed: self.pipe_closed.load(Ordering::SeqCst),
+            client_gone: self.client_gone.load(Ordering::SeqCst),
         }
     }
 
@@ -266,13 +277,13 @@ pub(crate) struct ChildPipes {
 
 impl ChildPipes {
     /// A pipe forwarded to the box's stderr and, when `forward_stdout`, one forwarded to its stdout, written under
-    /// `lock`, a read that fails said naming the pipe `source`'s. The readers end once every copy of the write ends is
-    /// closed, the child's and the [`Stdio`]s given here.
+    /// `lock`, a failed write setting `gone`, a read that fails said naming the pipe `source`'s. The readers end once
+    /// every copy of the write ends is closed, the child's and the [`Stdio`]s given here.
     ///
     /// # Errors
     ///
     /// The system's error when a pipe cannot be made or a reader cannot be started.
-    pub(crate) fn open(source: &'static str, forward_stdout: bool, lock: &OutputLock) -> io::Result<ChildPipes> {
+    pub(crate) fn open(source: &'static str, forward_stdout: bool, lock: &OutputLock, gone: &ClientGone) -> io::Result<ChildPipes> {
         let (err_reader, err_writer) = io::pipe()?;
         let mut readers = Vec::new();
         let stdout = if forward_stdout {
@@ -283,7 +294,7 @@ impl ChildPipes {
             Stdio::piped()
         };
         readers.push((File::from(OwnedHandle::from(err_reader)), Stream::Err));
-        let forwarders = Forwarders::start_each(readers, source, lock)?;
+        let forwarders = Forwarders::start_each(readers, source, lock, gone)?;
         Ok(ChildPipes {
             stdout,
             stderr: Stdio::from(err_writer),
@@ -299,16 +310,17 @@ pub(crate) struct Drained {
     /// running holding its pipe open — when a reader's thread exited without saying it reached the end, or when a
     /// reader could not be asked.
     pub(crate) all_ended: bool,
-    /// Whether a reader's write to the box's own output failed meanwhile: the client's connection is gone.
-    pub(crate) pipe_closed: bool,
+    /// Whether the run's [`ClientGone`] was set meanwhile, by a reader's write to the box's own output that failed or
+    /// by the heartbeat's: the client's connection is gone.
+    pub(crate) client_gone: bool,
 }
 
 /// One pipe's reader: where its lines go, and whether its writing has ended.
 struct Forwarder {
     lock: OutputLock,
     stopped: Arc<AtomicBool>,
-    /// Shared with the run: set when a write to the box's own output fails.
-    pipe_closed: Arc<AtomicBool>,
+    /// The run's [`ClientGone`]: set when a write to the box's own output fails.
+    client_gone: ClientGone,
     stream: Stream,
     /// Whose pipe it reads, as a read failure names it: `the command's`, `git's`.
     source: &'static str,
@@ -373,7 +385,7 @@ impl Forwarder {
         }
         if write_flushed(&mut self.sink, text.as_bytes()).is_err() {
             self.write_failed = true;
-            self.pipe_closed.store(true, Ordering::SeqCst);
+            self.client_gone.store(true, Ordering::SeqCst);
         }
     }
 
@@ -435,7 +447,7 @@ mod tests {
 
     use windows_sys::Win32::System::Threading::{ResumeThread, SuspendThread};
 
-    use super::{Behind, Forwarder, Forwarders, LineSplitter, OutputLock, Stream};
+    use super::{Behind, ClientGone, Forwarder, Forwarders, LineSplitter, OutputLock, Stream};
 
     /// How long the stop case lets its reader run before it stops the readers, so the reader is past its first look at
     /// the stop and waits for the lock: only the case's power to go red rests on it. A reader slower than this looks
@@ -461,14 +473,14 @@ mod tests {
     /// drain can be watched on it, and the flags it reports through are its own.
     fn one_reader(pipe: File, sink: Box<dyn Write + Send>, lock: &OutputLock) -> Forwarders {
         let stopped = Arc::new(AtomicBool::new(false));
-        let pipe_closed = Arc::new(AtomicBool::new(false));
+        let client_gone = Arc::new(AtomicBool::new(false));
         let in_flight = Arc::new(AtomicBool::new(false));
         let reader_ended = Arc::new(AtomicBool::new(false));
         let aborted = Arc::new(AtomicBool::new(false));
         let forwarder = Forwarder {
             lock: Arc::clone(lock),
             stopped: Arc::clone(&stopped),
-            pipe_closed: Arc::clone(&pipe_closed),
+            client_gone: Arc::clone(&client_gone),
             stream: Stream::Err,
             source: "the test's",
             sink,
@@ -485,7 +497,7 @@ mod tests {
         });
         Forwarders {
             stopped,
-            pipe_closed,
+            client_gone,
             ended: ended_rx,
             leftover: AtomicBool::new(false),
             behind: vec![Behind {
@@ -506,7 +518,7 @@ mod tests {
         let mut forwarder = Forwarder {
             lock: Arc::clone(&lock),
             stopped: Arc::clone(&stopped),
-            pipe_closed: Arc::default(),
+            client_gone: Arc::default(),
             stream: Stream::Err,
             source: "the test's",
             sink: Box::new(written.clone()),
@@ -579,7 +591,7 @@ mod tests {
         };
         held_rx.recv().expect("the lock is held");
         let pipe = File::from(OwnedHandle::from(reader));
-        let forwarders = Forwarders::start_each([(pipe, Stream::Err)], "the test's", &lock).expect("the reader starts");
+        let forwarders = Forwarders::start_each([(pipe, Stream::Err)], "the test's", &lock, &ClientGone::default()).expect("the reader starts");
 
         let drained = forwarders.drain(LIMIT);
 
@@ -596,7 +608,7 @@ mod tests {
         let (reader, writer) = io::pipe().expect("the pipe is made");
         let lock = OutputLock::default();
         let pipe = File::from(OwnedHandle::from(reader));
-        let forwarders = Forwarders::start_each([(pipe, Stream::Err)], "the test's", &lock).expect("the reader starts");
+        let forwarders = Forwarders::start_each([(pipe, Stream::Err)], "the test's", &lock, &ClientGone::default()).expect("the reader starts");
         let started = Instant::now();
 
         let drained = forwarders.drain(LIMIT);
@@ -633,7 +645,7 @@ mod tests {
             })
         };
         let pipe = File::from(OwnedHandle::from(reader));
-        let forwarders = Forwarders::start_each([(pipe, Stream::Err)], "the test's", &lock).expect("the reader starts");
+        let forwarders = Forwarders::start_each([(pipe, Stream::Err)], "the test's", &lock, &ClientGone::default()).expect("the reader starts");
         let started = Instant::now();
 
         let drained = forwarders.drain_within(LIMIT, GUARD);
@@ -747,7 +759,7 @@ mod tests {
         let got = released.join().expect("the reader of the sink does not panic");
         assert!(drained.all_ended, "a reader blocked in a write is waited for, not taken for a leftover");
         assert!(
-            !drained.pipe_closed,
+            !drained.client_gone,
             "the drain waited for the reader's write instead of cutting it short"
         );
         assert_eq!(got, line, "the line the reader waited to write is forwarded whole");
@@ -766,7 +778,7 @@ mod tests {
         let (_, ended) = mpsc::channel::<()>();
         let forwarders = Forwarders {
             stopped: Arc::default(),
-            pipe_closed: Arc::default(),
+            client_gone: Arc::default(),
             ended,
             leftover: AtomicBool::new(false),
             behind: vec![Behind {
