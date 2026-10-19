@@ -4,7 +4,6 @@
 
 ## Do first
 
-- [/] GATE-482 Add a profiling slot that holds the machine alone, light slots included — Urgent · Backlog
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [ ] GATE-427 Route herdr-gpui's Credential Manager tests and godot-mcp's GL tests over the desktop route — High · Remote
@@ -12,14 +11,11 @@
 - [/] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [/] GATE-440 Map and trial routing all of herdr-gpui's, yaat-server's and agent-park's heavy work — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
-- [!] GATE-451 Make herdr-gpui's WSL command families routable to the builder — High · Remote
-- [/] GATE-481 Find why delve's routed commit-hook build takes twice the PC's time on the builder — High · Remote
-- [ ] GATE-492 Let a toolchain manifest set extra variables to the pinned engine's root on the box — High · Remote
+- [/] GATE-508 Map a routed dotnet build's work-folder paths to the PC worktree root — High · Remote
+- [/] GATE-509 Count the WSL VM's CPU so a routed WSL compile is not killed as STALLED — High · Remote
 - [!] GATE-468 Route Unreal Engine packaging to the builder with an unreal toolchain pin — High · No project
 - [/] GATE-469 Carry Git LFS content to the builder in a routed run — High · No project
 - [/] GATE-472 Map and trial routing ue-mcp's heavy work — High · No project
-- [/] GATE-474 Read the .gate files of a repo that cannot commit them from a PC-owned folder — High · No project
-- [/] GATE-477 Release the builder's work folder when the PC's routed gate is killed — High · No project
 
 ## Remote
 
@@ -134,6 +130,15 @@
 - [ ] GATE-465 Route a run's --env value that names a path inside the worktree to the builder's work folder
 - [ ] GATE-467 Count a nested gate started under a packaged pwsh as its parent's progress
 - [ ] GATE-489 Refuse or document a routed run whose unreadable toolchain manifest may hold an Unreal pin
+- [ ] GATE-495 Judge the declarations folder's volume from its opened handle, not its drive letter
+- [ ] GATE-496 Tie the box's payload Bare to the run's own repository folder
+- [ ] GATE-498 Give a warm-up's commands the worktree HEAD as SourceRevisionId
+- [ ] GATE-499 Say the declarations folder's notes in gate warm
+- [/] GATE-504 Keep the box's drain cancel off a forwarder's write to the client
+- [ ] GATE-506 Close C:\Tools and C:\Tools\bin on the builder to non-admin writers
+- [ ] GATE-510 Say when WSL is unusable from the box's command token, before a routed wsl command fails
+- [ ] GATE-511 Prune routed WSL build folders the box's work-folder cleanup leaves in the distro
+- [ ] GATE-513 Tell a routed command's own exit 255 apart from a lost ssh connection
 
 ## Design
 
@@ -223,6 +228,14 @@
 - [ ] GATE-491 Say which folder a relative --log resolves against when --cd is given
 - [ ] GATE-493 Refuse a declarations folder or .gate file another non-admin account may write
 - [ ] GATE-494 Scan only the command's output for failure markers, not the gate's own lines
+- [ ] GATE-497 Accept SHA-256 object ids as a worktree HEAD for SourceRevisionId
+- [ ] GATE-503 Name the process holding a PC output open when the outputs install refuses it
+- [ ] GATE-505 Fall back to local when a routed cargo needs a rustup target the builder lacks
+- [ ] GATE-507 Let a rewritten output count as in place when the PC holds the bytes the install would write
+- [ ] GATE-512 Keep the slot hint from calling a WSL build light
+- [ ] GATE-514 Keep a routed command's info/attributes from steering later LFS runs in its work folder
+- [ ] GATE-515 Count a git-lfs probe that does not answer as missing for an LFS run
+- [ ] GATE-516 Let a pair whose sibling cannot be listed route when no repo of it uses LFS
 
 ## No project
 
