@@ -10,12 +10,12 @@
 //! root on this PC in the files that record it (the work folder to the worktree for one repo; for a pair, the main's
 //! tree to the worktree and each sibling's to the sibling's root); and each file, its last write clamped to this PC's
 //! clock in the stage and checked against the manifest once more, moved into place, unless its PC file is now in place
-//! by the same rule, which is left as it is, or records a root and something holds it open against the move, which is
-//! skipped as in use and said. A complete install also keeps the hash of each file it put in place, at the stamp that
-//! file's handle reads after the move, in the worktree's hash cache, so the next run takes it instead of reading the
-//! file again. The success line says what came back; every end removes the archive and the stage this run made, and
-//! the pending marker is cleared by a success whose skips a refetch would not clear, and by a refusal a refetch of the
-//! same archive would be refused the same way.
+//! by the same rule, which is left as it is, or something holds it open against the move, which is skipped as in use
+//! and said. A complete install also keeps the hash of each file it put in place, at the stamp that file's handle
+//! reads after the move, in the worktree's hash cache, so the next run takes it instead of reading the file again. The
+//! success line says what came back; every end removes the archive and the stage this run made, and the pending
+//! marker is cleared by a success whose skips a refetch would not clear, and by a refusal a refetch of the same
+//! archive would be refused the same way.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -28,7 +28,9 @@ use std::time::{Instant, SystemTime};
 use gate_router::is_layout_char;
 use gate_state::v1;
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
-use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES};
+use windows_sys::Win32::Storage::FileSystem::{
+    DELETE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+};
 
 use super::client::{Attempt, End};
 use super::git::{Git, GitError};
@@ -904,8 +906,8 @@ fn ends_a_component(next: Option<char>) -> bool {
 struct Moves {
     /// Each file moved into place, with the stamp its handle read after the move, none when that read failed.
     moved: Vec<Moved>,
-    /// The paths of the members recording a root whose PC file something held open against the move
-    /// ([`Placed::InUse`]), which the install skips as in use ([`Skip::InUse`]).
+    /// The paths of the members, any of them, whose PC file something held open against the move ([`Placed::InUse`]),
+    /// which the install skips as in use ([`Skip::InUse`]).
     in_use: Vec<String>,
 }
 
@@ -943,8 +945,8 @@ enum Placed {
     /// Left as it was: the PC's file changed during the run to the member's own bytes, or it records a root and changed
     /// during the run at all ([`Pc::InPlace`]).
     InPlace,
-    /// Not moved: it records a root, and something holds its PC file open against the rename ([`held_open`],
-    /// [`writable`]).
+    /// Not moved: something holds its PC file open against the rename ([`held_open`], [`held_against_replacing`]),
+    /// whatever the member.
     InUse,
 }
 
@@ -952,10 +954,10 @@ enum Placed {
 /// between `root` and it made when missing and refused when it is a link, a junction or not a folder. Its last write,
 /// when past `now`, is set to `now` in the stage, before the move; the PC's file is then checked against `manifest`
 /// once more ([`pc_file`]), just before the move, and one in place is left ([`Placed::InPlace`]): one already holding the
-/// member's bytes, or one recording a root that a PC writer changed or made. A member recording a root whose rename is
-/// refused because something holds a file open ([`held_open`]) is not moved when its PC file is the one held, as it is
-/// when that file cannot be opened for replacing ([`writable`]) ([`Placed::InUse`]); any other rename error is the
-/// failure, a held staged file included, as when the PC file is missing or opens freely.
+/// member's bytes, or one recording a root that a PC writer changed or made. Any member whose rename is refused because
+/// something holds a file open ([`held_open`]) is not moved when its PC file is the one held, as it is when that file
+/// cannot be opened for deletion ([`held_against_replacing`]) ([`Placed::InUse`]); else the rename is tried once more,
+/// and its error, a held staged file's included, is the failure. Any other rename error is the failure at once.
 /// The stamp read after the move through a handle opened on the staged file before it, the clamp included, is returned:
 /// the moved file's own, never that of a file put at its path after the move. None when the handle cannot be opened or
 /// read, which costs the file its hash cache entry only.
@@ -990,11 +992,15 @@ fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, now: 
         .open(&source);
     let target = below(root, path);
     if let Err(error) = fs::rename(&source, &target) {
-        return if records_a_root(path) && held_open(&error) && !writable(root, entry) {
-            Ok(Placed::InUse)
-        } else {
-            Err(error)
-        };
+        if !held_open(&error) {
+            return Err(error);
+        }
+        if held_against_replacing(&target) {
+            return Ok(Placed::InUse);
+        }
+        // The PC's file is free or missing: the staged file was held, or the PC file's holder let go since. One more
+        // rename tells them apart, and its error is the failure.
+        fs::rename(&source, &target)?;
     }
     // No stamp is the right answer for a handle that cannot be opened or read: the file is installed, its hash not kept.
     Ok(Placed::Moved(
@@ -1009,6 +1015,18 @@ fn held_open(error: &io::Error) -> bool {
         .raw_os_error()
         .and_then(|code| u32::try_from(code).ok())
         .is_some_and(|code| [ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, ERROR_ACCESS_DENIED].contains(&code))
+}
+
+/// Whether something holds the PC's file at `target` open against a rename over it: it cannot be opened for deletion
+/// with every sharing given, failing as a held file does ([`held_open`]). A missing file, or one whose holders all share
+/// its deletion, is not held.
+fn held_against_replacing(target: &Path) -> bool {
+    // Opened and closed at once: only whether it opens counts.
+    OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(target)
+        .is_err_and(|error| held_open(&error))
 }
 
 /// Writes the hash cache at `path` for the files an install put in place: an entry for each of `installed.moved`, at
@@ -2249,34 +2267,43 @@ mod tests {
         assert_eq!(fs::read_to_string(&pc).expect("the file lands"), format!("{PC_ROOT}\\src\n"));
     }
 
-    /// Moves `bin/a.txt` then `path`, whose PC file something holds open from the second move on ([`moved_holding`]);
-    /// what the moves returned, and the PC file's bytes after them.
+    /// The sharing a holder gives that lets a move rename over the held file or away from it.
+    const SHARING_DELETION: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    /// The sharing a holder gives that refuses a move the held file.
+    const NOT_SHARING_DELETION: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
+
+    /// Moves `bin/a.txt`, `path` and `bin/c.txt`, the PC file of `path` held open from the second move on, sharing
+    /// reads and writes but not its deletion ([`moved_holding`]); what the moves returned, and the PC file's bytes after
+    /// them.
     fn moved_onto_a_held_pc_file(name: &str, path: &str) -> (Result<Moves, Unmoved>, Vec<u8>) {
         let folder = scratch(name);
         let (stage, root) = (folder.join("stage"), folder.join("root"));
         put(&stage, "bin/a.txt", b"box");
         put(&stage, path, b"box");
+        put(&stage, "bin/c.txt", b"box");
         let pc = put(&root, path, b"pc");
         let manifest = manifest_of(&root, &[path]);
-        let entries = [entry("bin/a.txt"), member(path, b"box")];
+        let entries = [entry("bin/a.txt"), member(path, b"box"), entry("bin/c.txt")];
 
-        let installed = moved_holding(&stage, &root, &entries, &manifest, &pc);
+        let installed = moved_holding(&stage, &root, &entries, &manifest, &[(&pc, NOT_SHARING_DELETION)]);
 
         (installed, fs::read(&pc).expect("the PC file stays"))
     }
 
-    /// Moves `entries` from `stage` to `root` against `manifest`, holding the file at `full` open from the second move
-    /// on, sharing reads and writes but not its deletion; what the moves returned.
-    fn moved_holding(stage: &Path, root: &Path, entries: &[Entry], manifest: &Manifest, full: &Path) -> Result<Moves, Unmoved> {
-        let mut held = None;
+    /// Moves `entries` from `stage` to `root` against `manifest`, holding each file of `holds` open from the second move
+    /// on for reading, with the sharing paired with it; what the moves returned.
+    fn moved_holding(stage: &Path, root: &Path, entries: &[Entry], manifest: &Manifest, holds: &[(&Path, u32)]) -> Result<Moves, Unmoved> {
+        let mut held = Vec::new();
         let installed = moved(stage, root, entries, manifest, |done| {
             if done == 1 {
-                let file = fs::OpenOptions::new()
-                    .read(true)
-                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-                    .open(full)
-                    .expect("the file can be held");
-                held = Some(file);
+                for (full, sharing) in holds {
+                    let file = fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(*sharing)
+                        .open(full)
+                        .expect("the file can be held");
+                    held.push(file);
+                }
             }
             true
         });
@@ -2284,69 +2311,87 @@ mod tests {
         installed
     }
 
-    #[test]
-    fn a_root_recording_pc_file_held_open_at_its_move_is_skipped_as_in_use() {
-        let path = "bin/.msCoverageSourceRootsMapping_X";
-        let (installed, pc) = moved_onto_a_held_pc_file("move-roots-held", path);
+    /// Asserts that a PC file held open at its move, `path` recording a root or not, is skipped as in use, the members
+    /// around it moved and its bytes untouched.
+    fn assert_held_at_its_move_is_skipped(name: &str, path: &str) {
+        let (installed, pc) = moved_onto_a_held_pc_file(name, path);
 
         let moves = installed.expect("the moves end");
         let paths: Vec<&str> = moves.moved.iter().map(|moved| moved.entry.path.as_str()).collect();
-        assert_eq!(paths, ["bin/a.txt"], "only a is moved: {moves:?}");
+        assert_eq!(paths, ["bin/a.txt", "bin/c.txt"], "the members around it are moved: {moves:?}");
         assert_eq!(moves.in_use, [path], "the held file is skipped as in use");
         assert_eq!(pc, b"pc");
     }
 
     #[test]
-    fn a_root_recording_member_whose_staged_file_is_held_open_with_no_pc_file_fails_the_install() {
-        let folder = scratch("move-roots-staged-held");
-        let (stage, root) = (folder.join("stage"), folder.join("root"));
-        let path = "bin/.msCoverageSourceRootsMapping_X";
-        put(&stage, "bin/a.txt", b"box");
-        let staged = put(&stage, path, b"box");
-        fs::create_dir_all(&root).expect("the root can be made");
-        let entries = [entry("bin/a.txt"), member(path, b"box")];
-
-        let installed = moved_holding(&stage, &root, &entries, &Manifest::default(), &staged);
-
-        let reason = format!("1 of 2 files were installed before {path} failed:");
-        assert!(
-            matches!(&installed, Err(Unmoved::Failed(why)) if why.starts_with(&reason)),
-            "{installed:?}"
-        );
-        assert!(!super::below(&root, path).exists(), "nothing is put in its place");
+    fn a_root_recording_pc_file_held_open_at_its_move_is_skipped_as_in_use() {
+        assert_held_at_its_move_is_skipped("move-roots-held", "bin/.msCoverageSourceRootsMapping_X");
     }
 
     #[test]
-    fn a_root_recording_member_whose_staged_file_is_held_open_over_a_free_pc_file_fails_the_install() {
-        let folder = scratch("move-roots-staged-held-pc-free");
-        let (stage, root) = (folder.join("stage"), folder.join("root"));
-        let path = "bin/.msCoverageSourceRootsMapping_X";
-        put(&stage, "bin/a.txt", b"box");
-        let staged = put(&stage, path, b"box");
-        let pc = put(&root, path, b"pc");
-        let manifest = manifest_of(&root, &[path]);
-        let entries = [entry("bin/a.txt"), member(path, b"box")];
+    fn a_pc_file_held_open_at_its_move_is_skipped_as_in_use() {
+        assert_held_at_its_move_is_skipped("move-held", "bin/b.dll");
+    }
 
-        let installed = moved_holding(&stage, &root, &entries, &manifest, &staged);
+    /// How the PC's file of a member whose staged file is held at its move stands.
+    #[derive(Clone, Copy)]
+    enum PcSide {
+        /// There is none.
+        Missing,
+        /// It is there, and nothing holds it.
+        Free,
+        /// It is there, held open sharing its deletion, so a rename over it goes through.
+        HeldSharingDeletion,
+    }
 
-        let reason = format!("1 of 2 files were installed before {path} failed:");
-        assert!(
-            matches!(&installed, Err(Unmoved::Failed(why)) if why.starts_with(&reason)),
-            "{installed:?}"
-        );
-        assert_eq!(fs::read(&pc).expect("the PC file stays"), b"pc");
+    /// Asserts that the staged file of a member held open at its move, sharing reads and writes but not its deletion,
+    /// fails the install whatever the PC's file is (`pc_side`), for a member recording a root and one that does not:
+    /// the file handled before it counted, and the PC's file untouched or still missing.
+    fn assert_staged_hold_fails(name: &str, pc_side: PcSide) {
+        for (kind, path) in [("roots", "bin/.msCoverageSourceRootsMapping_X"), ("plain", "bin/b.dll")] {
+            let folder = scratch(&format!("{name}-{kind}"));
+            let (stage, root) = (folder.join("stage"), folder.join("root"));
+            put(&stage, "bin/a.txt", b"box");
+            let staged = put(&stage, path, b"box");
+            fs::create_dir_all(&root).expect("the root can be made");
+            let pc = match pc_side {
+                PcSide::Missing => None,
+                PcSide::Free | PcSide::HeldSharingDeletion => Some(put(&root, path, b"pc")),
+            };
+            let manifest = pc.as_ref().map_or_else(Manifest::default, |_| manifest_of(&root, &[path]));
+            let mut holds = vec![(staged.as_path(), NOT_SHARING_DELETION)];
+            if let (PcSide::HeldSharingDeletion, Some(pc)) = (pc_side, &pc) {
+                holds.push((pc.as_path(), SHARING_DELETION));
+            }
+            let entries = [entry("bin/a.txt"), member(path, b"box")];
+
+            let installed = moved_holding(&stage, &root, &entries, &manifest, &holds);
+
+            let reason = format!("1 of 2 files were installed before {path} failed:");
+            assert!(
+                matches!(&installed, Err(Unmoved::Failed(why)) if why.starts_with(&reason)),
+                "{path}: {installed:?}"
+            );
+            match &pc {
+                Some(pc) => assert_eq!(fs::read(pc).expect("the PC file stays"), b"pc", "{path}"),
+                None => assert!(!super::below(&root, path).exists(), "nothing is put in the place of {path}"),
+            }
+        }
     }
 
     #[test]
-    fn a_pc_file_a_writer_holds_at_its_move_fails_the_install() {
-        let (installed, pc) = moved_onto_a_held_pc_file("move-held", "bin/b.dll");
+    fn a_member_whose_staged_file_is_held_open_with_no_pc_file_fails_the_install() {
+        assert_staged_hold_fails("move-staged-held", PcSide::Missing);
+    }
 
-        let reason = "1 of 2 files were installed before bin/b.dll failed:";
-        assert!(
-            matches!(&installed, Err(Unmoved::Failed(why)) if why.starts_with(reason)),
-            "{installed:?}"
-        );
-        assert_eq!(pc, b"pc");
+    #[test]
+    fn a_member_whose_staged_file_is_held_open_over_a_free_pc_file_fails_the_install() {
+        assert_staged_hold_fails("move-staged-held-pc-free", PcSide::Free);
+    }
+
+    #[test]
+    fn a_member_whose_staged_file_is_held_open_over_a_pc_file_held_sharing_its_deletion_fails_the_install() {
+        assert_staged_hold_fails("move-staged-held-pc-shared", PcSide::HeldSharingDeletion);
     }
 
     #[test]
