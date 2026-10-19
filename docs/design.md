@@ -1402,6 +1402,10 @@ The box heartbeat (BW9) is the box wrapper's command-time heartbeat, not the wai
 ## Command launching
 
 - **The argv arrives byte-exact.** `gate.exe` reads its own command line (`GetCommandLineW`), splits it by the Microsoft C runtime's rules, and takes every word after the first `--` as the command, unchanged (C3). The PowerShell binder workarounds (C3's rejoined colon words and flattened arrays) do not exist.
+
+  A word PowerShell splits before `gate.exe` starts reaches the command split. In a native-command call from pwsh, an unquoted word that starts with `-` and a letter or `_` is cut where its name ends: at `:` after the first bare `--` (`-RAGlb=X:/a` becomes `-RAGlb=X:` and `/a`, `-p:Name=Value` becomes `-p:` and `Name=Value`), and at `.`, `[`, `,`, `(` or `{` with or without one (`-RALog=out.txt` becomes `-RALog=out` and `.txt`).
+
+  The gate's command line is then byte-identical to two words the caller meant, so the gate passes them on as two. A pwsh caller quotes such a word (`"-RAGlb=X:/a"`), puts `--%` before the `--`, or calls from Git Bash, which leaves it whole (GATE-527).
 - **C-runtime quoting.** The words are written into one CreateProcess command line so the C runtime reads each back as one argv entry: an empty word or one holding whitespace or a quote is wrapped, `"` becomes `\"`, and a backslash run before a quote or at the end is doubled (kept, C4).
 
   Splitting the written line gives back the words, for every list of argument words; a property test holds that. A program word must not hold a quote or end in a backslash, because the C runtime reads argv[0] without backslash escapes (the PowerShell gate has the same limit).
