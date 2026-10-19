@@ -124,6 +124,7 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | gate-win32 times.rs / memory.rs | `stall`, `ceiling`, `cores`, `pause` (samples) | - | no |
 | gate-win32 gpu.rs (`Gpu3dWindow`) | `critical` (the GPU line of an `--alone` run's load block) | win32 `gpu::tests::*` (the adapter's LUID read from an instance name, use summed per adapter and held at 100, the PDH error naming its call and status in hex, a live window) | no: critical |
 | proc-table | `stop_tree`, `stall` (`parent_pid_of`) (imports `Win32ProcessTable`), `cutover` (`command_line_of`), `diagnostics`, `stall`/`cores` (`ProcessTree::children` through the escaped walk), `boxside` (`try_snapshot_without_command_lines`, in the desktop hand-off's sweep) | proc-table unit | no |
+| tools/builder/* | - | `tools/builder/test-install-toolchains.ps1`, run as `pwsh -NoProfile -File tools/builder/test-install-toolchains.ps1` through `tools/gate.ps1 -Slot light` (it installs nothing and needs no admin) | no |
 | tools/gate.ps1 | `launcher` (runs the checked-in launcher, its `-Alone` and `--alone` words), `cutover` (hand-over), `checkout` (`repo_file`) | - | no |
 | tools/install.ps1 | `install` (the exe and the desktop helper installed as a pair: the identical helper kept, a new helper beside the same gate, the pair's rollback when the helper cannot be placed, gate.exe cannot be moved aside or the installed gate does not run, the refusal of a helper built with its seams, of `-Exe` without `-HelperExe` and of a missing or unreadable helper, `-WhatIf` listing the helper, and the build line `-PrintBuild` prints naming no features), `checkout` | - | no |
 | crates/gate/build.rs, crates/gate-desktop/build.rs (the `/DEPENDENTLOADFLAG:0x800` link argument per exe and the static-CRT refusal) | `image` (reads the built `gate.exe`'s PE header; `.cargo/config.toml`'s `+crt-static` stays in the CENTRAL row below) | gate-desktop `image` (test binary `crates/gate-desktop/tests/image.rs`, runs without `test-seams`: the same check on `gate-desktop-helper.exe`) | no: image |
@@ -183,6 +184,7 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | boxside/lfs.rs, suite boxside/lfs.rs | `-E 'test(/^boxside::lfs::/)'` (the suite and the unit tests both); add `remote_lfs` for a change to the lines the client reads |
 | boxside/register.rs, suite boxside/register.rs | `-E 'test(/^boxside::register::/)'` (add the `boxside::` filterset of the `mod.rs` row for a change to the verb match) |
 | boxside/warm.rs (suite), and the warm-up parts of boxside/{payload,preflight,run,packages}.rs | `-E 'test(/^boxside::warm::/)'` (add the `boxside::` filterset of the source file's row for a change to the source) |
+| tools/builder/* | no filterset: `pwsh -NoProfile -File tools/builder/test-install-toolchains.ps1` through `tools/gate.ps1 -Slot light` |
 | tools/gate.ps1 | `-E 'binary(suite) and test(/^(launcher\|cutover\|checkout)::/)'` |
 | tools/install.ps1 | `-E 'binary(suite) and test(/^(install\|checkout)::/)'` |
 | suite module `X.rs` only | `-E 'binary(suite) and test(/^(X\|checkout)::/)'` |

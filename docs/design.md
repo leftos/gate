@@ -372,7 +372,7 @@ On stdout, each line prefixed `check: <host>: `, in this order:
 
    `git-lfs` at 3.1.3 or later (or the manifest's higher minimum) is an item like any tool when a `.gitattributes` git tracks in the worktree, at any depth, names the LFS filter, judged as routing judges it.
 4. The warm-up's items, as on this PC ([The warm-up items](#the-warm-up-items)) and this PC's own: the lock is probed before the record is read, as the route does, and the record is said only when it names `<host>` or cannot be read (`check: <host>: warm-up: the warm-up record <path> cannot be read: <error>`, with the suffix above, only informing), and with consent and a warm-up file that parsed, `check: <host>: warm-up: the work folder is warm` (ok) when the preflight's `gate: remote warm` line holds the hash of the worktree's file, else `check: <host>: warm-up: the work folder is not warm` (only informs).
-5. The install hints `install: <host>: <tool>: <command>`: `cargo install cargo-nextest --locked`, `npm install -g pnpm@<min>` (`npm install -g pnpm` with no minimum), `rustup toolchain install <min> && rustup default <min>`, `dotnet-install.ps1 -Version <v>`, and `run the build-box toolchain script on <host>` for node, pwsh, ffmpeg and a rust with no minimum.
+5. The install hints `install: <host>: <tool>: <command>`: `cargo install cargo-nextest --locked`, `npm install -g pnpm@<min>` (`npm install -g pnpm` with no minimum), `rustup toolchain install <min> && rustup default <min>`, `dotnet-install.ps1 -Version <v>`, and for node, pwsh, ffmpeg and a rust with no minimum a hint that names `tools/builder/install-toolchains.ps1` and points to [routing-a-repo.md, Builder setup](routing-a-repo.md#builder-setup).
 6. The summary.
 
 When the repo's `.gate/siblings.toml` names a sibling or cannot be read, one line `check: <host>: siblings skipped: a routed run lays them out` comes instead of the sibling lines and counts as skipped. The sibling folders themselves are not checked on the builder.
@@ -2895,7 +2895,7 @@ Built verbs:
 
   The lookup's whys come from the real keeper only; a stand-in skips the lookup.
 
-  Until a box with the MSYS keeper is installed, builder setup keeps one MSYS process of the builder user alive as a stopgap: a startup scheduled task as that user, run whether logged on or not, not elevated, with no run-time limit, running Git's `usr\bin\sleep.exe infinity`. It is restarted after every Git for Windows update, so a new runtime never meets an old one's section.
+  Until a box with the MSYS keeper is installed, gate's installer (`tools/builder/install-toolchains.ps1`) keeps one MSYS process of the builder user alive as a stopgap: a startup scheduled task as that user, run whether logged on or not, not elevated, with no run-time limit, running Git's `usr\bin\sleep.exe infinity`. It is restarted after every Git for Windows update, so a new runtime never meets an old one's section.
 
   The command's environment gains `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>=safe.directory` and `GIT_CONFIG_VALUE_<n>=*`, where n is the inherited count (0 when there is none) and the count grows by one.
 
@@ -2935,11 +2935,11 @@ Built verbs:
 
   Known cost: deny entries naming NETWORK still apply to the command, but allow entries naming NETWORK no longer grant, so a resource whose DACL grants NETWORK alone is open to a command run directly over ssh and closed to the same command routed.
 
-  Known cost: the first non-elevated build in each work folder starts fresh MSBuild nodes and compiler servers, since their handshake includes elevation. A command that creates symlinks needs Developer Mode on the builder, as on the PC; builder setup turns it on (`AllowDevelopmentWithoutDevLicense` = 1).
+  Known cost: the first non-elevated build in each work folder starts fresh MSBuild nodes and compiler servers, since their handshake includes elevation. A command that creates symlinks needs Developer Mode on the builder, as on the PC; claude-config's provisioning of the builder turns it on (`AllowDevelopmentWithoutDevLicense` = 1).
 
   Known cost: the variable does not cover a command that writes to the Event Log by another route (`EventLog.WriteEntry`, a logging library's own sink). Nor does it cover a host whose own configuration sets the EventLog provider's level: a category rule (`Logging:EventLog:LogLevel:Microsoft`), which wins over the default, or a configuration source added after environment variables, or a bare `HostBuilder` that never reads them.
 
-  Builder setup therefore grants the builder user write access to the Application log: one allow entry for the user's SID, write access 0x2, added to the channel's access SDDL with `wevtutil sl Application /ca:` from an elevated session. That covers every writer to that log under a registered source.
+  claude-config's provisioning of the builder therefore grants the builder user write access to the Application log: one allow entry for the user's SID, write access 0x2, added to the channel's access SDDL with `wevtutil sl Application /ca:` from an elevated session. That covers every writer to that log under a registered source.
 
   Any routed command, and anything else run as the builder user, can then write entries under any registered source, so the builder's Application log is not evidence of what the system did. Registering a new event source and writing to any other log still need Administrators, so they fail on a routed run.
 
@@ -3214,7 +3214,7 @@ The rules behind the desktop run (GATE-231) that a later change to the helper, t
 
 - Before the start the target is the active console session, owned by the builder's user, unlocked and on the `Default` input desktop. The box reads the session; the helper confirms from inside it in its hello that `OpenInputDesktop` succeeds and names `Default`, since a UAC prompt or the lock screen is a secure desktop.
 
-  `RunEx` is given that session id, and with no user given the Task Scheduler runs the task as whoever is logged on to the session, which is why the check of the helper's token user matters. The builder logs its user on at the console after every reboot (autologon), and builder setup keeps it.
+  `RunEx` is given that session id, and with no user given the Task Scheduler runs the task as whoever is logged on to the session, which is why the check of the helper's token user matters. The builder logs its user on at the console after every reboot (autologon), which claude-config's provisioning of the builder sets up and keeps.
 - A session change mid-run is a command failure, never a fallback. Logging off ends the session's processes, the box sees the exit and the status stands; locking, an RDP takeover and a disconnection let the command run on and fail as it fails.
 
 **The helper dies, lies, hangs or is impersonated.**

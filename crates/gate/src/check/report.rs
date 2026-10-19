@@ -501,13 +501,21 @@ fn install_hint(name: &str, min: Option<Version>, kind: Kind) -> Option<String> 
 /// `min` where the command takes one; the builder's toolchain script for a tool no such command installs, and for a
 /// rust with no minimum to name; `None` for a tool with no hint.
 fn builder_hint(host: &str, name: &str, min: Option<Version>) -> Option<String> {
-    let script = || format!("run the build-box toolchain script on {host}");
+    let script = |step: &str| {
+        format!(
+            "copy tools/builder/ from the gate repo to {host} and run install-toolchains.ps1 -User <user> -Only {step} there, \
+             elevated (docs/routing-a-repo.md, Builder setup)"
+        )
+    };
     Some(match (name, min) {
         ("cargo-nextest", _) => "cargo install cargo-nextest --locked".to_owned(),
         ("pnpm", Some(min)) => format!("npm install -g pnpm@{min}"),
         ("pnpm", None) => "npm install -g pnpm".to_owned(),
         ("rust", Some(min)) => format!("rustup toolchain install {min} && rustup default {min}"),
-        ("rust" | "node" | "pwsh" | "ffmpeg", _) => script(),
+        ("rust", None) => script("Rust"),
+        ("node", _) => script("Node.js"),
+        ("pwsh", _) => script("PowerShell"),
+        ("ffmpeg", _) => script("FFmpeg"),
         _ => return None,
     })
 }
@@ -1614,10 +1622,10 @@ mod tests {
                 "install: box-1: pnpm: npm install -g pnpm@10.0.0",
                 "install: box-1: pnpm: npm install -g pnpm",
                 "install: box-1: rust: rustup toolchain install 1.89.0 && rustup default 1.89.0",
-                "install: box-1: rust: run the build-box toolchain script on box-1",
-                "install: box-1: node: run the build-box toolchain script on box-1",
-                "install: box-1: pwsh: run the build-box toolchain script on box-1",
-                "install: box-1: ffmpeg: run the build-box toolchain script on box-1",
+                "install: box-1: rust: copy tools/builder/ from the gate repo to box-1 and run install-toolchains.ps1 -User <user> -Only Rust there, elevated (docs/routing-a-repo.md, Builder setup)",
+                "install: box-1: node: copy tools/builder/ from the gate repo to box-1 and run install-toolchains.ps1 -User <user> -Only Node.js there, elevated (docs/routing-a-repo.md, Builder setup)",
+                "install: box-1: pwsh: copy tools/builder/ from the gate repo to box-1 and run install-toolchains.ps1 -User <user> -Only PowerShell there, elevated (docs/routing-a-repo.md, Builder setup)",
+                "install: box-1: ffmpeg: copy tools/builder/ from the gate repo to box-1 and run install-toolchains.ps1 -User <user> -Only FFmpeg there, elevated (docs/routing-a-repo.md, Builder setup)",
             ],
             "godot has no hint"
         );
@@ -1639,7 +1647,7 @@ mod tests {
                 "check: box-1: node 22.1.0 too old (needs 24.0.0 or later)",
                 "install: box-1: rust: rustup toolchain install 1.89.0 && rustup default 1.89.0",
                 "install: box-1: pnpm: npm install -g pnpm@10.0.0",
-                "install: box-1: node: run the build-box toolchain script on box-1",
+                "install: box-1: node: copy tools/builder/ from the gate repo to box-1 and run install-toolchains.ps1 -User <user> -Only Node.js there, elevated (docs/routing-a-repo.md, Builder setup)",
             ]
         );
     }

@@ -21,9 +21,26 @@ A command run from one worktree that names a path in another worktree of a liste
 ## Adding a repo
 
 1. Read the repo's own gate commands (its CLAUDE.md, nextup profile, justfile or package scripts) and the tools each needs: toolchains and their pins (`.gate/toolchain.toml`, `rust-toolchain.toml`, `global.json`), shells and utilities, package managers.
-2. Set the builder up. A session installs what a routed repo needs, at the repo's pinned version, and changes the builder's configuration (PATH, ACLs, environment) directly over ssh. After each change it sends claude-config a repo inbox note with what changed and the exact commands, so `tools/build-box/install-toolchains.ps1` follows and a new builder gets the same setup. Run `gate check --builder` from the repo.
+2. Set the builder up ([Builder setup](#builder-setup)). A session installs what a routed repo needs, at the repo's pinned version, and changes the builder's configuration (PATH, ACLs, environment) directly over ssh. A change to the builder's toolchains, tools, work root or git config is also made in `tools/builder/install-toolchains.ps1` in the same item, so a new builder gets the same setup. A change to the machine's provisioning goes to claude-config as a repo inbox note with what changed and the exact commands. Run `gate check --builder` from the repo.
 3. Back up `remote.json` beside it (`remote.json.bak-<UTC stamp>`), then add the repo's patterns under `repos.<repo>`, plus `outputs`, `inputs`, `siblings`, `desktop` or `warmup` consent where the repo needs them. Re-read the file just before writing and change only the repo's own keys: other sessions edit it too.
 4. Run one routing trial (below). The repo counts as routed once its trial passes.
+
+## Builder setup
+
+A builder's setup has two halves. claude-config's private provisioning does the machine: first boot, the WSL platform and its reboot, Defender, Developer Mode, the Application event log ACL, autologon, the D: Dev Drive, OpenSSH and the tailnet, the Windows Update policy, RustDesk and Process Explorer. This repo's `tools/builder/install-toolchains.ps1` does the rest: the toolchains and tools, the sccache server and WSL keep-alive tasks, the git config for gate runs, the MSYS keeper task and the gate work root.
+
+- **Order on a new builder:** claude-config's provisioning, then the installer, then `gate push`.
+- **Copy:** `scp tools/builder/* {builder}:C:/build-box/gate/`. `wsl-setup.sh` must sit beside the script.
+- **Run:** over ssh, elevated (an administrator's ssh session), under Windows PowerShell 5.1: `powershell -NoProfile -ExecutionPolicy Bypass -File C:\build-box\gate\install-toolchains.ps1 -User {builder user} [-GateRoot D:\gate-remote] [-SccacheDir D:\sccache] [-SccacheCapBytes N] [-Only {step prefix},...]`.
+- **Parameters:** `-User` is required and names the builder user: the scheduled tasks run as it and the write-deny ACLs name it. `-GateRoot` is the gate's work root, `-SccacheDir` sccache's disk cache and `-SccacheCapBytes` its size cap. `-Only` runs just the steps whose names start with one of the given prefixes, then the version summary (`-Only Summary` runs only the summary).
+- **As the builder user:** run it in the builder user's own ssh session, since the user-profile installs go to the running user. Run it only while no gate is running on the builder.
+- **Exit codes:** a missing or unknown `-User` exits 2, a `-Only` prefix that matches no step exits 2 before anything is written, and a session that is not elevated exits 1 with `install-toolchains: not elevated; ...`.
+- **Steps**, each a valid `-Only` prefix: Git, PowerShell, .NET SDK 10.0.401, .NET SDK 8.0.425, .NET Framework 4.8 Developer Pack, .NET workload wasm-tools, Node.js, uv and prek, Python, Visual Studio Build Tools 2022 (C++), Rust, cargo-nextest, just, WSL Ubuntu (registers and starts the `gate-wsl-keepalive` logon task and waits for the VM before the elevated setup), sccache, Git usr\bin on the builder user Path, Bun, Godot, FFmpeg, pnpm, Playwright browsers, Git system config for gate runs, keeper: MSYS sleep task, Gate work root, Summary.
+- **Tasks:** `\build-box\sccache-server`, `build-box-msys-keeper` and `gate-wsl-keepalive`.
+- **Test:** `pwsh -NoProfile -File tools/builder/test-install-toolchains.ps1`, run through `tools/gate.ps1 -Slot light`. It installs nothing and needs no admin.
+- **The Unreal engine install is not in the installer.**
+
+`gate check --builder` hints at the installer for a missing node, pwsh, ffmpeg or a rust with no minimum: the hint names `tools/builder/install-toolchains.ps1` and points to this section.
 
 ## The routing trial
 
@@ -56,7 +73,7 @@ A repo whose short routed runs (a filtered test of a minute) would meet a cold b
 
 ## A repo that builds with Unreal Engine
 
-The engine is not in the worktree and not on the builder's `PATH`: the builder holds its engines side by side under `GATE_UNREAL_ROOT`, one subfolder per version named `x.y.z`, each with `Engine\Build\Build.version` ([design.md, Tool probes](design.md#the-box-side)). That setup is part of the builder's setup (claude-config's build-box installer mirrors it); `gate check --builder` shows the versions it lists.
+The engine is not in the worktree and not on the builder's `PATH`: the builder holds its engines side by side under `GATE_UNREAL_ROOT`, one subfolder per version named `x.y.z`, each with `Engine\Build\Build.version` ([design.md, Tool probes](design.md#the-box-side)). The engine install is not part of `tools/builder/install-toolchains.ps1`: a session installs an engine by hand over ssh. `gate check --builder` shows the versions it lists.
 
 - **The pin.** The repo pins the engine in `.gate/toolchain.toml`, `unreal = "5.8"`, an exact pin like godot's: `"5.8"` takes any 5.8.x and `""` any version. A builder without a matching engine keeps the run here with the mismatch line. The gate picks the highest matching engine and the box sets `UE_ROOT` to its folder for every command of the run. A repo whose build reads another variable for the engine (ue-mcp's `UE_MCP_TEST_ENGINE_ROOT`) names it in the manifest's `[env]` table, `UE_MCP_TEST_ENGINE_ROOT = "unreal"`, and the box sets it to the same folder; a PC engine path passed with `--env` is not rewritten for the builder, and `UE_ROOT` itself is refused there. `gate check` shows an `[env]` entry the gate cannot use.
 - **The routed command is a tracked wrapper script.** It builds absolute `-project=` and `-archivedirectory=` paths itself, because `RunUAT.bat` `pushd`es into the engine and the router sends worktree paths as relative ones. It reads the engine from `UE_ROOT`, with its own fallback for the PC, where nothing sets it.

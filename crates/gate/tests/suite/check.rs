@@ -1471,7 +1471,7 @@ fn check_builder_says_a_missing_tool_with_its_builder_hint_and_exits_1() {
             "install: builder-1: cargo-nextest: cargo install cargo-nextest --locked",
             "install: builder-1: pnpm: npm install -g pnpm@10.0.0",
             "install: builder-1: rust: rustup toolchain install 1.89.0 && rustup default 1.89.0",
-            "install: builder-1: pwsh: run the build-box toolchain script on builder-1",
+            "install: builder-1: pwsh: copy tools/builder/ from the gate repo to builder-1 and run install-toolchains.ps1 -User <user> -Only PowerShell there, elevated (docs/routing-a-repo.md, Builder setup)",
             "check: builder-1: 4 missing, 0 too old",
         ],
         "{outcome:?}"
