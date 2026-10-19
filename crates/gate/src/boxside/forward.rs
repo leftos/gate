@@ -6,8 +6,9 @@
 //! blocks on a full one. Once the readers are stopped they drop every later line, one already waiting for the lock
 //! included. A reader that has not reached the end of its pipe when a drain's limit passes is not taken for one a
 //! leftover process still holds open while it is only behind — it holds bytes it has read and not written or dropped,
-//! or it waits on no read at all, between reads or not yet run — and is waited for up to a hang guard. A read still
-//! pending on a pipe holding nothing is a leftover's, and is cancelled; the reader is taken for a leftover only if
+//! or it is not in a read at all, between reads or still starting — and is waited for up to a hang guard. Only a reader
+//! that says it is in its read is ever cancelled: a cancel landing in a thread's start-up can wedge the drain for good. A
+//! read still pending on a pipe holding nothing is a leftover's, and is cancelled; the reader is taken for a leftover only if
 //! that read ended through the cancellation, a read that completes anyway forwarding its bytes and being judged
 //! again, or if its thread exits without saying it reached the end. The threads start no process.
 
@@ -106,6 +107,7 @@ impl Forwarders {
         let mut behind = Vec::new();
         for (pipe, stream) in pipes {
             let in_flight = Arc::new(AtomicBool::new(false));
+            let reading = Arc::new(AtomicBool::new(false));
             let ended_reader = Arc::new(AtomicBool::new(false));
             let aborted = Arc::new(AtomicBool::new(false));
             let sink: Box<dyn Write + Send> = match stream {
@@ -121,6 +123,7 @@ impl Forwarders {
                 sink,
                 write_failed: false,
                 in_flight: Arc::clone(&in_flight),
+                reading: Arc::clone(&reading),
                 aborted: Arc::clone(&aborted),
             };
             let sender = sender.clone();
@@ -135,6 +138,7 @@ impl Forwarders {
             behind.push(Behind {
                 thread,
                 in_flight,
+                reading,
                 ended: reader_ended,
                 aborted,
             });
@@ -159,8 +163,8 @@ impl Forwarders {
     /// reader can still write.
     ///
     /// A reader that has not ended when `limit` passes is waited for further, up to [`HANG_GUARD`] from the start of
-    /// the drain, while it is only behind: it holds bytes it has read and has not written or dropped, or it waits on
-    /// no read (see [`Forwarders::any_behind`]). A read still pending on a pipe holding nothing is a leftover's, so
+    /// the drain, while it is only behind: it holds bytes it has read and has not written or dropped, or it is not in
+    /// a read (see [`Forwarders::any_behind`]). A read still pending on a pipe holding nothing is a leftover's, so
     /// the drain cancels it; the reader is taken for a leftover only if that read ended through the cancellation, a
     /// read that completes anyway forwarding its bytes and being judged again. Once no reader is still behind, or the
     /// guard passes, they are stopped as above.
@@ -208,24 +212,25 @@ impl Forwarders {
         !self.leftover.load(Ordering::SeqCst) && self.behind.iter().all(Behind::reached_end)
     }
 
-    /// Whether a reader that has not ended is only behind, telling a read the kernel has not completed (or one the
-    /// reader has not issued yet, between reads or before its thread runs) from a read still pending on a pipe holding
-    /// nothing, which only a process the exited command left keeps open: that read is cancelled, and the pump records
-    /// whether it ended through the cancellation. `false` once every reader has ended or been taken for a leftover,
-    /// which is when the drain stops.
+    /// Whether a reader that has not ended is only behind, telling a reader that holds bytes or is not in a read
+    /// (between reads, or its thread still starting) from one in its read: a read still pending there on a pipe holding
+    /// nothing is one only a process the exited command left keeps open, so it is cancelled, and the pump records
+    /// whether it ended through the cancellation. A reader not in its read is never cancelled, since a cancel landing
+    /// in a thread's start-up or in a write can wedge the drain or cut the write short. `false` once every reader has
+    /// ended or been taken for a leftover, which is when the drain stops.
     fn any_behind(&self) -> bool {
         let mut behind = false;
         for reader in &self.behind {
             if reader.resolved() {
                 continue;
             }
-            if reader.in_flight.load(Ordering::SeqCst) {
+            if reader.in_flight.load(Ordering::SeqCst) || !reader.reading.load(Ordering::SeqCst) {
                 behind = true;
                 continue;
             }
-            // A read was pending, or none was: the read can still complete with bytes to forward, or end through the
-            // cancellation, which the pump marks. Either way the reader is waited for, and judged again. A reader
-            // that cannot be asked is taken for a leftover, as one that did not end in time was before.
+            // The reader is in its read, or just past it: the read can still complete with bytes to forward, or end
+            // through the cancellation, which the pump marks. Either way the reader is waited for, and judged again. A
+            // reader that cannot be asked is taken for a leftover, as one that did not end in time was before.
             if gate_win32::cancel_synchronous_io(&reader.thread).is_err() {
                 self.leftover.store(true, Ordering::SeqCst);
                 return false;
@@ -244,6 +249,8 @@ struct Behind {
     thread: JoinHandle<()>,
     /// Set while the reader holds bytes it has read and has not written or dropped yet.
     in_flight: Arc<AtomicBool>,
+    /// Set while the reader is in a read of its pipe: the only time the drain may cancel it.
+    reading: Arc<AtomicBool>,
     /// Set once the reader reached the end of its pipe, or failed to read it, and is about to say so.
     ended: Arc<AtomicBool>,
     /// Set by the pump when a read ended through the drain's cancellation: a leftover held its pipe open.
@@ -331,6 +338,9 @@ struct Forwarder {
     /// Shared with the drain: set while this reader holds bytes it has read and has not written or dropped yet, and
     /// across every write it makes to the box's own output, so the drain never cancels one.
     in_flight: Arc<AtomicBool>,
+    /// Shared with the drain: set just before each read of the pipe and cleared as soon as it returns, so the drain
+    /// cancels nothing but a read.
+    reading: Arc<AtomicBool>,
     /// Shared with the drain: set when a read ended through the drain's cancellation, which is not a read failure.
     aborted: Arc<AtomicBool>,
 }
@@ -342,7 +352,10 @@ impl Forwarder {
         let mut lines = LineSplitter::default();
         let mut chunk = [0_u8; 4096];
         loop {
-            match pipe.read(&mut chunk) {
+            self.reading.store(true, Ordering::SeqCst);
+            let result = pipe.read(&mut chunk);
+            self.reading.store(false, Ordering::SeqCst);
+            match result {
                 Ok(0) => break,
                 Ok(read) => {
                     self.in_flight.store(true, Ordering::SeqCst);
@@ -438,7 +451,7 @@ impl LineSplitter {
 #[cfg(test)]
 mod tests {
     use std::fs::File;
-    use std::io::{self, Read, Write};
+    use std::io::{self, PipeWriter, Read, Write};
     use std::os::windows::io::{AsRawHandle, OwnedHandle};
     use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::sync::{Arc, Mutex, PoisonError, mpsc};
@@ -475,6 +488,7 @@ mod tests {
         let stopped = Arc::new(AtomicBool::new(false));
         let client_gone = Arc::new(AtomicBool::new(false));
         let in_flight = Arc::new(AtomicBool::new(false));
+        let reading = Arc::new(AtomicBool::new(false));
         let reader_ended = Arc::new(AtomicBool::new(false));
         let aborted = Arc::new(AtomicBool::new(false));
         let forwarder = Forwarder {
@@ -486,6 +500,7 @@ mod tests {
             sink,
             write_failed: false,
             in_flight: Arc::clone(&in_flight),
+            reading: Arc::clone(&reading),
             aborted: Arc::clone(&aborted),
         };
         let (sender, ended_rx) = mpsc::channel();
@@ -503,6 +518,7 @@ mod tests {
             behind: vec![Behind {
                 thread,
                 in_flight,
+                reading,
                 ended: reader_ended,
                 aborted,
             }],
@@ -524,6 +540,7 @@ mod tests {
             sink: Box::new(written.clone()),
             write_failed: false,
             in_flight: Arc::default(),
+            reading: Arc::default(),
             aborted: Arc::default(),
         };
         let held = lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -605,24 +622,23 @@ mod tests {
     #[test]
     #[expect(clippy::expect_used, reason = "a test whose pipe or thread cannot be made must fail loudly")]
     fn a_reader_idle_on_a_pipe_a_stand_in_holds_open_is_still_taken_for_a_leftover() {
-        let (reader, writer) = io::pipe().expect("the pipe is made");
-        let lock = OutputLock::default();
-        let pipe = File::from(OwnedHandle::from(reader));
-        let forwarders = Forwarders::start_each([(pipe, Stream::Err)], "the test's", &lock, &ClientGone::default()).expect("the reader starts");
-        let started = Instant::now();
+        // The drain runs on a thread of its own, so a drain that never returns fails the case rather than hanging it.
+        let (finished, verdict) = mpsc::channel();
+        thread::spawn(move || {
+            let (reader, writer) = io::pipe().expect("the pipe is made");
+            let lock = OutputLock::default();
+            let pipe = File::from(OwnedHandle::from(reader));
+            let forwarders = Forwarders::start_each([(pipe, Stream::Err)], "the test's", &lock, &ClientGone::default()).expect("the reader starts");
+            let aborted = Arc::clone(&forwarders.behind[0].aborted);
 
-        let drained = forwarders.drain(LIMIT);
+            let drained = forwarders.drain(LIMIT);
 
-        let elapsed = started.elapsed();
-        drop(writer);
-        assert!(
-            !drained.all_ended,
-            "a pipe a leftover still holds open with nothing to read is a leftover"
-        );
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "a reader idle on an empty pipe is not waited for: {elapsed:?}"
-        );
+            drop(writer);
+            let _ = finished.send((drained.all_ended, aborted.load(Ordering::SeqCst)));
+        });
+        let (all_ended, aborted) = verdict.recv_timeout(START_UP_GUARD).expect("the drain returns");
+        assert!(!all_ended, "a pipe a leftover still holds open with nothing to read is a leftover");
+        assert!(aborted, "the reader ended through the drain's cancellation of its read");
     }
 
     #[test]
@@ -660,6 +676,53 @@ mod tests {
             "the drain waits for a reader that is behind until the guard passes: {elapsed:?}"
         );
         assert!(elapsed < Duration::from_secs(10), "the guard ends the wait, not the reader: {elapsed:?}");
+    }
+
+    /// How many readers each drain of the start-up case judges: they start together, so its first look finds several
+    /// still in their thread's start-up, where a cancel can wedge the drain.
+    const READERS_PER_DRAIN: usize = 64;
+
+    /// How many such drains each driver thread runs.
+    const DRAINS_PER_DRIVER: usize = 25;
+
+    /// How many threads run drains side by side, so the case's wall time stays short.
+    const DRIVERS: usize = 8;
+
+    /// The longest the start-up case waits for its drains: it never runs out unless a drain is wedged.
+    const START_UP_GUARD: Duration = Duration::from_secs(600);
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test whose pipe or thread cannot be made must fail loudly")]
+    fn a_drain_begun_as_its_readers_start_cancels_their_reads_and_never_wedges() {
+        let (done, finished) = mpsc::channel();
+        for _ in 0..DRIVERS {
+            let done = done.clone();
+            thread::spawn(move || {
+                for _ in 0..DRAINS_PER_DRIVER {
+                    let mut writers: Vec<PipeWriter> = Vec::new();
+                    let mut pipes = Vec::new();
+                    for _ in 0..READERS_PER_DRAIN {
+                        let (reader, writer) = io::pipe().expect("the pipe is made");
+                        writers.push(writer);
+                        pipes.push((File::from(OwnedHandle::from(reader)), Stream::Err));
+                    }
+                    let lock = OutputLock::default();
+                    let forwarders = Forwarders::start_each(pipes, "the test's", &lock, &ClientGone::default()).expect("the readers start");
+                    // No limit: the drain judges the readers, and cancels a read one waits on, from their start on.
+                    let drained = forwarders.drain_within(Duration::ZERO, START_UP_GUARD);
+                    drop(writers);
+                    assert!(!drained.all_ended, "readers idle on pipes a stand-in holds open are leftovers");
+                }
+                // The case listens until every driver has said it finished, or the guard passes.
+                let _ = done.send(());
+            });
+        }
+        drop(done);
+        for _ in 0..DRIVERS {
+            finished
+                .recv_timeout(START_UP_GUARD)
+                .expect("every drain returns: none is left inside the cancel of a reader that had not reached its first read");
+        }
     }
 
     #[test]
@@ -765,6 +828,61 @@ mod tests {
         assert_eq!(got, line, "the line the reader waited to write is forwarded whole");
     }
 
+    /// How long the not-reading case lets its writer get into its blocked write before the drain judges it: only the
+    /// case's power to go red rests on it, since a drain that judges the writer sooner cancels nothing either way.
+    const INTO_THE_WRITE: Duration = Duration::from_millis(200);
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test whose pipe or thread cannot be made must fail loudly")]
+    fn a_reader_past_its_read_and_blocked_in_a_write_is_not_cancelled_and_the_client_is_not_taken_for_gone() {
+        let (mut sink_reader, sink_writer) = io::pipe().expect("the sink's pipe is made");
+        let client_gone = Arc::new(AtomicBool::new(false));
+        let mut forwarder = Forwarder {
+            lock: OutputLock::default(),
+            stopped: Arc::default(),
+            client_gone: Arc::clone(&client_gone),
+            stream: Stream::Err,
+            source: "the test's",
+            sink: Box::new(sink_writer),
+            write_failed: false,
+            in_flight: Arc::default(),
+            reading: Arc::default(),
+            aborted: Arc::default(),
+        };
+        let line = vec![b'x'; LONG_LINE];
+        let writing = line.clone();
+        // Its read done, the reader writes a line far longer than the sink's pipe holds, so the write blocks in the
+        // kernel; neither its `in_flight` nor its `reading` is set, the moment between the two a drain can land in.
+        let thread = thread::spawn(move || forwarder.write(&writing));
+        thread::sleep(INTO_THE_WRITE);
+        let (_, ended) = mpsc::channel::<()>();
+        let forwarders = Forwarders {
+            stopped: Arc::default(),
+            client_gone: Arc::clone(&client_gone),
+            ended,
+            leftover: AtomicBool::new(false),
+            behind: vec![Behind {
+                thread,
+                in_flight: Arc::default(),
+                reading: Arc::default(),
+                ended: Arc::default(),
+                aborted: Arc::default(),
+            }],
+        };
+
+        assert!(forwarders.any_behind(), "a reader that is not in its read is waited for");
+
+        let mut got = Vec::new();
+        sink_reader.read_to_end(&mut got).expect("the sink is read to the writer's end");
+        assert!(
+            !client_gone.load(Ordering::SeqCst),
+            "the drain cut no write short, so the client is not taken for gone"
+        );
+        let mut expected = line;
+        expected.push(b'\n');
+        assert_eq!(got, expected, "the line the reader was writing is forwarded whole");
+    }
+
     #[test]
     fn a_reader_whose_thread_exited_without_saying_it_ended_is_not_counted_as_ended() {
         let thread = thread::spawn(|| {});
@@ -784,6 +902,7 @@ mod tests {
             behind: vec![Behind {
                 thread,
                 in_flight: Arc::default(),
+                reading: Arc::default(),
                 ended: Arc::default(),
                 aborted: Arc::default(),
             }],

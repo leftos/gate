@@ -361,6 +361,7 @@ The client's inputs, which reuse the module's glob matcher, hash cache and archi
 
   On a .NET Godot install, a folder that cannot be entered (`GodotSharp\Api\Debug`) makes every Godot launch, `--headless` included, raise a task-modal ".NET assemblies not found" alert that nobody in session 0 or on a hidden desktop can answer, so the process hangs after its banner while `--version`, which returns before .NET starts, still answers and the probe calls the install healthy.
 - **Reproduce a box output reader falling behind** (`boxside/forward.rs`) → suspending the whole box with `NtSuspendProcess` does not reproduce it, since the writer and the readers stop together; suspend the one reader thread instead, found by its name (`forward stdout` or `forward stderr`, read with `GetThreadDescription`), so the command's output arrives while the reader does not read it.
+- **Cancel a thread's pending I/O (`CancelSynchronousIo`)** → it waits for its target thread to run, and aimed at a thread still starting on a console it can wait forever, wedging the canceller (the box's drain, whose `HANG_GUARD` cannot fire since the stuck thread checks it). Cancel only a thread that has said it is reading, as `boxside/forward.rs`'s `reading` flag does.
 - **Change `gate-state` or `proc-table`'s public API** → ops-tower builds against them by git rev; a breaking change needs its matching change there, by inbox request.
 
 ## Test locations

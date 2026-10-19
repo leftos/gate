@@ -1,4 +1,8 @@
-# The default profile is nextest's own. `--profile timing` adds a junit report of every case's time, written to
-# target\nextest\timing\junit.xml.
+# The default profile is nextest's own, but for its bound on a case: a case still running after 15 periods of 60 s
+# is ended, long before the gate's own ceiling on the run. `--profile timing` adds a junit report of every case's
+# time, written to target\nextest\timing\junit.xml.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 15 }
+
 [profile.timing.junit]
 path = "junit.xml"

@@ -91,6 +91,16 @@ Suspending gate.exe cannot starve a test stand-in such as `fake-ssh`: to reprodu
 
 The rig needs the case's gate.exe on this PC, but the launcher routes nextest to the builder: build once with `-Local` and `--no-run`, then run the suite binary directly under the rig. A fault in a parent gate's timing shows by freezing the child gate it waits on, not the parent (GATE-480). A rig that reads the case folder opens its files with delete sharing, or it causes the case's `os error 32` on folder removal itself.
 
+A builder run over plain ssh has only a pseudo-console, so a fault that needs a real console (as the box gives a routed command) never shows there. Start such a repro with `CREATE_NEW_CONSOLE`, or route it.
+
+Never suspend a thread during its start-up: it holds the loader lock, and the rig deadlocks itself.
+
+`cdb -pv` plus `llvm-symbolizer --relative-address` reads a hung test's stacks without disturbing it.
+
+nextest's default profile ends a case after 15 periods of 60 s (`.config/nextest.toml`). A case that needs longer gets its own override there.
+
+A heartbeat test's command sleeps (fake-tool `sleep`), never `wait`, whose 20 ms poll earns CPU ticks on its own.
+
 A measurement that needs a quiet machine (a timing comparison, a phase profile, a before-and-after) runs on `-Slot critical`, never by waiting for other sessions' load to drop. The critical gate drains every gate first, which can take tens of minutes behind a long heavy run, then holds the machine. Keep critical runs short and few, about 5 minutes of hold for one investigation, and ask the owner before going past that.
 
 To time the suite, add `--profile timing` to the nextest command. Its junit report, with every case's seconds, lands in `target\nextest\timing\junit.xml`. To count the git processes a case starts, set `GIT_TRACE2_EVENT=<a folder under target\tmp>` on the run. It costs almost nothing, where a WMI process tracer slows a case four times over.
