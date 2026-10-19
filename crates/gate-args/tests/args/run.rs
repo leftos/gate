@@ -28,6 +28,7 @@ fn run_reads_every_option_and_the_defaults() {
             no_markers: false,
             local: false,
             alone: false,
+            reason: None,
             bring_tracked: Vec::new(),
             env: Vec::new(),
             state_dir: None,
@@ -45,14 +46,23 @@ fn run_reads_every_option_and_the_defaults() {
         "7",
         "--no-markers",
         "--local",
+        "--reason",
+        "why",
         "--state-dir",
         "root",
         "--",
         "cmd",
     ]);
     assert_eq!(
-        (request.stall, request.tail, request.no_markers, request.local, request.state_dir),
-        (30, 7, true, true, Some(PathBuf::from("root")))
+        (
+            request.stall,
+            request.tail,
+            request.no_markers,
+            request.local,
+            request.state_dir,
+            request.reason.as_deref(),
+        ),
+        (30, 7, true, true, Some(PathBuf::from("root")), Some("why"))
     );
 }
 
@@ -137,6 +147,7 @@ fn run_reports_every_missing_input_on_its_own_line() {
     assert_eq!(
         problems(&["-Local"]),
         [
+            "gate: -Local needs -Reason \"<why>\"",
             "gate: missing -Slot heavy|light|critical|none",
             "gate: missing -TimeoutSeconds <seconds>",
             "gate: missing -Log <path>",
@@ -220,7 +231,19 @@ fn run_rejects_bad_slot() {
         ("none", Slot::None),
         ("None", Slot::None),
     ] {
-        let request = run_request(&["run", "--slot", value, "--timeout", "5", "--log", "out.log", "--", "cmd"]);
+        let request = run_request(&[
+            "run",
+            "--slot",
+            value,
+            "--timeout",
+            "5",
+            "--log",
+            "out.log",
+            "--reason",
+            "why",
+            "--",
+            "cmd",
+        ]);
         assert_eq!(request.slot, slot, "--slot {value}");
     }
 }
@@ -267,7 +290,10 @@ fn run_unknown_flag() {
 #[test]
 fn run_repeated_option_is_usage_error() {
     assert_eq!(problems_with(&["--slot", "light", "--", "cmd"]), ["gate: --slot is given twice"]);
-    assert_eq!(problems_with(&["--local", "--local", "--", "cmd"]), ["gate: --local is given twice"]);
+    assert_eq!(
+        problems_with(&["--local", "--local", "--", "cmd"]),
+        ["gate: --local is given twice", "gate: --local needs --reason \"<why>\""]
+    );
     assert_eq!(problems_with(&["--cd", "a", "--cd=b", "--", "cmd"]), ["gate: --cd is given twice"]);
     assert_eq!(
         problems(&["-Log", "a", "-log", "b", "-TimeoutSeconds", "5", "-Slot", "heavy", "--", "cmd"]),
@@ -559,4 +585,100 @@ fn run_command_words_pass_through_unchanged() {
     words.push(unreadable_word());
     words.extend(os(&["--slot", "heavy", "--timeout", "5", "--", "cmd"]));
     assert_eq!(problems_of(words), ["gate: cannot read the argument a\u{FFFD}"]);
+}
+
+#[test]
+fn run_reads_a_reason_in_both_forms() {
+    assert_eq!(run_with(&["--reason", "why", "--", "cmd"]).reason.as_deref(), Some("why"));
+    assert_eq!(run_with(&["--reason=why", "--", "cmd"]).reason.as_deref(), Some("why"));
+    assert_eq!(
+        run_with(&["--reason=  why  ", "--", "cmd"]).reason.as_deref(),
+        Some("  why  "),
+        "the text is kept as given"
+    );
+    assert_eq!(run_with(&["--", "cmd"]).reason, None, "none by default");
+}
+
+#[test]
+fn run_needs_a_reason_for_local_and_critical_runs() {
+    assert_eq!(
+        problems(&["run", "--slot", "heavy", "--timeout", "5", "--log", "out.log", "--local", "--", "cmd"]),
+        ["gate: --local needs --reason \"<why>\""]
+    );
+    assert_eq!(
+        problems(&["run", "--slot", "critical", "--timeout", "5", "--log", "out.log", "--", "cmd"]),
+        ["gate: --slot critical needs --reason \"<why>\""]
+    );
+    assert_eq!(
+        problems(&["run", "--slot", "critical", "--timeout", "5", "--log", "out.log", "--local", "--", "cmd"]),
+        ["gate: --local and --slot critical need --reason \"<why>\""]
+    );
+}
+
+#[test]
+fn run_refuses_a_blank_reason() {
+    assert_eq!(problems_with(&["--reason", "   ", "--", "cmd"]), ["gate: --reason must not be empty"]);
+    assert_eq!(problems_with(&["--reason=\t", "--", "cmd"]), ["gate: --reason must not be empty"]);
+    assert_eq!(
+        problems(&[
+            "run",
+            "--slot",
+            "heavy",
+            "--timeout",
+            "5",
+            "--log",
+            "out.log",
+            "--local",
+            "--reason",
+            " ",
+            "--",
+            "cmd",
+        ]),
+        ["gate: --reason must not be empty"],
+        "a blank reason is reported once, not as missing too"
+    );
+}
+
+#[test]
+fn run_reason_needs_a_value() {
+    assert_eq!(problems_with(&["--reason", "--", "cmd"]), ["gate: --reason needs a value"]);
+    assert_eq!(problems_with(&["--reason=", "--", "cmd"]), ["gate: --reason needs a value"]);
+}
+
+#[test]
+fn run_reason_is_given_once() {
+    assert_eq!(
+        problems_with(&["--reason", "a", "--reason", "b", "--", "cmd"]),
+        ["gate: --reason is given twice"]
+    );
+}
+
+#[test]
+fn run_records_a_reason_on_a_heavy_and_a_none_run() {
+    assert_eq!(run_with(&["--reason", "released", "--", "cmd"]).reason.as_deref(), Some("released"));
+    let none = run_request(&[
+        "run",
+        "--slot",
+        "none",
+        "--timeout",
+        "5",
+        "--log",
+        "out.log",
+        "--reason",
+        "a deploy",
+        "--",
+        "cmd",
+    ]);
+    assert_eq!(none.reason.as_deref(), Some("a deploy"));
+}
+
+#[test]
+fn run_usage_lists_reason() {
+    assert!(
+        USAGE
+            .lines()
+            .any(|line| line
+                == "  --reason \"<why>\"     why this run is local, critical or alone; required with --local, --slot critical and --alone"),
+        "the usage lists --reason:\n{USAGE}"
+    );
 }

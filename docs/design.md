@@ -66,7 +66,7 @@ The watchdog samples the command and kills its job on a stall, at the ceiling an
 
 ### `gate run`
 
-`gate run --slot heavy|light|critical|none [--alone] --timeout <seconds>|auto:<seconds> --log <path> [options] -- <command> [args...]`
+`gate run --slot heavy|light|critical|none [--alone] [--reason "<why>"] --timeout <seconds>|auto:<seconds> --log <path> [options] -- <command> [args...]`
 
 `--slot`, `--timeout`, `--log` and the command are required and have no default, because a gate with no ceiling holds its caller for as long as the command hangs (kept, C1). Each missing or unreadable input is named on its own line before the usage.
 
@@ -80,10 +80,13 @@ The watchdog samples the command and kills its job on a stall, at the ceiling an
 | `--tail <lines>` | `-Tail` | Lines of the log printed at the end, default 20 (V3). | kept (C1, V3) |
 | `--no-markers` | `-NoMarkers` | The command's status is the verdict; the marker scan is off (V2). | ruling |
 | `--local` | `-Local` | Never route this run to a builder (F1). | kept (F1) |
+| `--reason "<why>"` | `-Reason "<why>"`, `-Reason:<why>` | The free-text reason a run states for itself. Required, and non-blank, when the run is `--local`, `--slot critical` or `--alone`; accepted and recorded on any run. Recorded on its `queue` event, in its claim and in its ticket. | ruling |
 | `--state-dir <path>` | none | Use another [state root](#state-root); a relative path is read against the caller's working directory, before `--cd`. | ruling |
 | `--cd <folder>` | `-Cd` | Run the command in `<folder>` and route from it ([Run folder](#run-folder)). | ruling (GATE-323) |
 | `--bring-tracked <glob>` | none | A routed run's fetched output that git tracks and `<glob>` matches is installed rather than skipped (Outputs install, "Tracked members"); repeatable, and the one option that is not refused when given twice. The launcher's PowerShell form (`-Log …`) does not take it: use the `gate run` form. | ruling |
 | `--env NAME[=value]` | `-Env` | Sets `NAME` for the command, local or routed ([Command environment](#command-environment)); without `=value`, forwards `NAME`'s value from the gate's own environment, the form for secrets. Repeatable. | ruling (GATE-362) |
+
+A local or critical run without `--reason`, and one whose reason is blank, is a usage error (exit 2) before anything is queued: `gate: --local needs --reason "<why>"`, `gate: --slot critical needs --reason "<why>"`, `gate: --local and --slot critical need --reason "<why>"`, or `gate: --reason must not be empty` (the compatibility layer says `-Local` and `-Slot critical`, and `-Reason`). `--alone` needs no separate line: it already requires a critical slot. The reason is required of every caller; the gate cannot tell an agent from a person, and an exemption by environment would be bypassable.
 
 The words after `--` reach the command exactly as the caller passed them ([Command launching](#command-launching)).
 
@@ -497,14 +500,14 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 
 `gate.exe` also accepts the PowerShell gate's argument form, so the cutover breaks no caller:
 
-`gate -Log <path> -TimeoutSeconds <n> -Slot heavy|light|critical|none [-StallSeconds <n>] [-Tail <n>] [-NoMarkers] [-Local] [-Alone] [-Cd <folder>] [-Env NAME[=value]] -- <command>` and `gate -StopTree <pid>`.
+`gate -Log <path> -TimeoutSeconds <n> -Slot heavy|light|critical|none [-StallSeconds <n>] [-Tail <n>] [-NoMarkers] [-Local] [-Alone] [-Reason "<why>"] [-Cd <folder>] [-Env NAME[=value]] -- <command>` and `gate -StopTree <pid>`.
 
-- It accepts exactly the options `-Log`, `-TimeoutSeconds`, `-Slot`, `-StallSeconds`, `-Tail`, `-NoMarkers`, `-Local`, `-Alone`, `-Cd`, `-Env` and `-StopTree`, compared case-insensitively, and maps each to the flag in the table above (`-StopTree <pid>` to `gate stop-tree <pid>`).
+- It accepts exactly the options `-Log`, `-TimeoutSeconds`, `-Slot`, `-StallSeconds`, `-Tail`, `-NoMarkers`, `-Local`, `-Alone`, `-Reason`, `-Cd`, `-Env` and `-StopTree`, compared case-insensitively, and maps each to the flag in the table above (`-StopTree <pid>` to `gate stop-tree <pid>`). `-Reason` is required with `-Local`, `-Slot critical` and `-Alone`, and its refusals use the compatibility spelling.
 
   Any other option, or a new-CLI flag in the old form (`-StateDir`, `--state-dir`, `--slot`), is a usage error (exit 2). `-TimeoutSeconds` refuses `auto:<n>`: `gate: -TimeoutSeconds must be a whole number above 0, got 'auto:900'`. The one exception is the hidden `--test-print-request` of a `test-seams` build ([Black-box suite harness](#black-box-suite-harness)).
 - `--` is required before the command; the command never starts at the first word that is not an option.
 - `-StopTree <pid>` (or `-StopTree:<pid>`) must be the only option.
-- A value option never takes one of the ten option names as its value: `-Log -NoMarkers` is `-Log` with no value, then `-NoMarkers`.
+- A value option never takes one of the twelve option names as its value: `-Log -NoMarkers` is `-Log` with no value, then `-NoMarkers`.
 - The colon form `-Name:value` in one word is read as that option with that value (C2). A switch's colon form is read by its value, compared case-insensitively: `-NoMarkers:true`, `-Local:$true` set it, `-Local:false`, `-Local:$false` clear it, and any other value is a usage error. This fixes the PowerShell gate's reading of every `-Switch:<value>` as true (C2, CC-194).
 - Values are validated as in the new CLI; the messages may name either spelling. The missing-slot line reads `gate: missing --slot heavy|light|critical|none` or `gate: missing -Slot heavy|light|critical|none`, and a bad slot says `gate: <option> must be heavy, light, critical or none, got '<value>'`.
 - The layer is removed once no caller uses it. Until then, every reader of command-line text (ops-tower's activity join, the hooks that inspect a gated command) matches both spellings.
@@ -516,7 +519,7 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 | 0 | The command exited 0 and its log holds no failure marker. `gate check` found nothing missing or too old (with `--builder`, nothing missing). |
 | `N` | The command's own non-zero status, passed through whole: the gate exits with the command's 32-bit exit code (300 stays 300; 0xFFFFFFFF reads as -1 where a caller reads it signed), and the FAILED line and the journal show it signed (a routed run whose connection was lost reports 255, RC7). |
 | 1 | The command exited 0 but its log holds a failure marker (never with `--no-markers`, V2); or the gate itself failed after the command started (X4); or it failed before queueing (the working directory, the command's environment, the log's folder or an earlier log that cannot be removed); or a routed run passed but its changes or outputs could not be brought back (RC9, D1); or `gate check` found something missing or too old, or could not run (outside a git worktree; with `--builder`, also an unreachable builder, a different build, no box, or a `remote.json` missing or unusable). |
-| 2 | Usage: a missing, unknown or invalid input; a `.cmd` or `.bat` word the gate refuses (C5); a `--log` inside the state root; a critical gate under a heavy or light slot marker (K7); `--alone` with a slot other than critical, or inside a gate's command. Nothing is queued. `gate box` also uses 2 for a refused payload and for a refused subfolder or batch word ([The box side](#the-box-side)). |
+| 2 | Usage: a missing, unknown or invalid input; a `.cmd` or `.bat` word the gate refuses (C5); a `--log` inside the state root; a critical gate under a heavy or light slot marker (K7); `--alone` with a slot other than critical, or inside a gate's command; a `--local` or `--slot critical` run without `--reason`, or with a blank one. Nothing is queued. `gate box` also uses 2 for a refused payload and for a refused subfolder or batch word ([The box side](#the-box-side)). |
 | 124 | The watchdog killed the command: STALLED, TIMED OUT or BACKSTOP (X2), for a routed run by the builder (TIMED OUT, BACKSTOP) or the client (STALLED, BACKSTOP); or a routed run's fetch outlived its transfer ceiling: TRANSFER TIMED OUT. |
 | 127 | The command could not be started (C7); the slot is released at once. `gate box run` uses it for the same failure. |
 | 75 | A builder refused a routed run (`gate box`): busy (`gate box run` finding its work folder's lock held), unreachable, parity, rebooted, tools, layout (the box could not clear or lay out its work folder), inputs, lfs, desktop (the box could not give the run the builder's desktop), install (the builder's gate or its desktop helper is not installed where only administrators can change it), version. The PC side reads the refusal and falls back to a local run, so a caller sees 75 only as a command's own status, or as a refusal that carried no reason (T5). |
@@ -871,6 +874,7 @@ The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Criti
 | `log` | string | the log's full path |
 | `timeoutSeconds` | number | the ceiling as the take resolved it ([`gate run`](#gate-run)); the writer refuses a value JSON cannot carry (not finite) |
 | `remote`, `host`, `key` | bool, string, string | a remote slot's claim only (L1) |
+| `reason` | string | optional: the free text the run gave `--reason`; absent when it gave none. A local, critical or alone run always has one, since it is required |
 | `expected` | object | optional, last: what the durations store expects of the run, `{"p50": <s>, "p90": <s>, "n": <runs>, "key": "<key>"}` with the seconds to 3 decimals, rounded half to even; absent for a run without history. It is the builder's estimate for a remote take and `crit`'s for a critical gate. The wait lines read `p50` ([Slots](#slots), step 6); `null` reads as absent, any other non-object is unreadable |
 
 The file name `<name>` is `gate-slot-<i>`, `gate-light-slot-<i>`, `gate-remote-slot-<i>` or `gate-critical`, the same whatever the root: a non-default root's claims sit in that root's own `slots\` folder, so the file name carries no root hash.
@@ -902,6 +906,7 @@ A pid the checking gate may not query is dead too, since it is another user's pr
 | `lendsClosed` | bool | optional, written only when true: a critical gate that holds every slot it takes while gates lent a light parent's slot still run writes it once, under the beside mutex, so no light parent lends its slot again and the gate waits only for the lends already made; it is replaced by `holds` when the lends have ended. A ticket without it reads as false, and a build that does not know the key ignores it |
 | `alone` | bool | optional, written only when true: a critical gate asked for `--alone`, from its first ticket on, kept by the holding rewrite. While a live ticket says it, the beside allowance is 0 for every gate. A ticket without it reads as false, and a build that does not know the key ignores it, so it treats the request as a plain critical one |
 | `remote` | bool | present and true only while queued for the remote pool |
+| `reason` | string | optional: the free text the run gave `--reason`; absent when it gave none. A critical (and therefore alone) run always has one, since it is required; a critical gate's rewritten holding ticket keeps it |
 | `expected` | object | optional, last: the same object as a claim's `expected`, written when the gate has history for its command; a critical gate's rewritten holding ticket keeps it; `null` reads as absent |
 
 Waiters of one kind queue by (`arrived`, `pid`). The ticket reader lists only `*.json` files in `waiting\` (a `*.tmp` file is skipped), and leaves out a ticket deleted between the listing and the read, since a gate that took its slot deletes it.
@@ -955,7 +960,7 @@ The event's own fields:
 
 | Event | Fields after the common ones |
 |---|---|
-| `queue` | `log` (the log's full path), `notRouted` (written right after `log`, only when a heavy gate was kept local with `--local`, with the value `--local`, or when a matched command's outside path lies in another worktree of a listed repo and the run says to `--cd` it, with the value `another worktree`; every other reason for a local run, the plain outside line included, writes none) |
+| `queue` | `log` (the log's full path), `notRouted` (written right after `log`, only when a heavy gate was kept local with `--local`, with the value `--local`, or when a matched command's outside path lies in another worktree of a listed repo and the run says to `--cd` it, with the value `another worktree`; every other reason for a local run, the plain outside line included, writes none), `reason` (the free text the run gave `--reason`, written after `notRouted`, when it gave one; absent otherwise) |
 | `take` | `slots` (the slot names taken; a critical gate lists every heavy and light slot it holds; a `none` run lists none, `[]`, with `waitedSeconds` 0.0), `waitedSeconds`, optionally `parentPid` (also on the late take of a covered gate), and for a critical gate `counts`, `otherHeld`, then `otherClaims` or `snapshotError` |
 | `release` | `slots` (the same list), `heldSeconds`, `status` (null when the gate failed before its command had one), `wallSeconds`, `adjustedSeconds`, optionally `avgCores`, `peakCores`, `freeCores`, `verdict`, and `cold` for a cold routed run |
 | `abandon` | `waitedSeconds`: the gate ended while still queued (Ctrl+C while waiting for a slot, or, for a routed run, while its client waited to start or while it waited for its work folder's key, remote-tagged) |
@@ -998,7 +1003,7 @@ The parent's run is the run of that pid whose first line is the latest at or bef
 
 A covered run that also journals a `take` of its own (it took a slot late) is no longer a lone `covered` line: it reads as a run with its own take, `running` while its gate runs, `unrecorded` once the gate is gone without a `release`, and released with its own `release`, its status, held time and verdict its own. It counts toward the 50 newest runs, outside the covered quota, and the per-command held-time summary leaves it out, its held time covering only the stretch after the parent ended.
 
-The history that ops-tower serves (`HistoryRun`, `GET /api/gate/history`) carries `verdict`, `wallSeconds` and `adjustedSeconds`, null when a line has none, and `abandoned`: every name any line of the run lists (`parent` and `covered` lines included), in line order without repeats, always present and empty when there are none.
+The history that ops-tower serves (`HistoryRun`, `GET /api/gate/history`) carries `verdict`, `wallSeconds` and `adjustedSeconds`, null when a line has none, and `abandoned`: every name any line of the run lists (`parent` and `covered` lines included), in line order without repeats, always present and empty when there are none. It also carries `reason`, the free text the run's `queue` line holds from `--reason`, omitted when the run gave none; the first `queue` line that names one wins. A covered run, and one lent its parent's slot before queueing, writes no `queue` line, so it carries no reason.
 
 The history lists the 50 newest runs that are not covered, and at most the 50 newest covered runs newer than the oldest of them: at most 100 runs, newest first by the time of each run's first journal line (its queue line, or the `parent` or `covered` line of a gate that never queued), then by pid and process start.
 
@@ -1639,7 +1644,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   The worktree comes from one `git rev-parse` run in the gate's folder, which is the `--cd` folder when given: a caller in a main checkout gates a worktree's command with `--cd <worktree>`. It reads (root, prefix below the root and common git folder), and a folder below the root asks `git ls-files` whether the snapshot would send anything there (tracked or untracked and not ignored, and still on disk). A `subst` drive is followed through `gate_win32::device_target`. A word that is not valid Unicode keeps a command that would route here, saying so.
 
-  The queue line carries `notRouted` `--local` for a heavy `--local` gate and the remote tag for a routed one. When the remote client has a part missing, the routed run falls back before it takes a remote slot: the `fallback` line has reason `client`, the gate says `gate: remote <host> client could not start: ...; running here`, and the later `take` and `release` carry no remote fields.
+  The queue line carries `notRouted` `--local` for a heavy `--local` gate, the run's `--reason` text after it, and the remote tag for a routed one. When the remote client has a part missing, the routed run falls back before it takes a remote slot: the `fallback` line has reason `client`, the gate says `gate: remote <host> client could not start: ...; running here`, and the later `take` and `release` carry no remote fields.
 - **The routing file's text** is JSON with `//` and `/* */` comments and trailing commas allowed outside strings, and a leading byte order mark skipped, as the PowerShell gate's reader allows. Keys match in any letter case, and unknown keys are ignored.
 
   An object holding two keys that differ only in letter case anywhere in the file refuses the whole file, with the PowerShell reader's error text. Single-quoted strings are refused (`Conversion from JSON failed with error: ...`), a recorded deviation: the PowerShell reader accepts them.
@@ -3369,7 +3374,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   The load rule: a case never asserts that something did or did not happen within a wall-clock window a loaded PC can cross. A case that expects a kill runs a command that sleeps until killed (`support::UNTIL_KILLED`), so a starved gate is late, never wrong.
 
-  A case that cannot be written without a timer is a machine-alone case, `#[ignore = "needs the machine alone: run with -Slot critical and --ignored"]`, listed in the nextup profile and run on a critical gate with `--run-ignored only`. Widening a window until it passes on one PC is not a fix: it fails again on a busier one.
+  A case that cannot be written without a timer is a machine-alone case, `#[ignore = "needs the machine alone: run with -Slot critical and --ignored"]`, listed in the nextup profile and run on a critical gate with `--run-ignored only -Reason "<why>"`. Widening a window until it passes on one PC is not a fix: it fails again on a busier one.
 
   A case machine-alone for another reason keeps the `#[ignore]` reason naming that reason, and the nextup profile lists it with how it runs.
 

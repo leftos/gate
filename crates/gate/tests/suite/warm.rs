@@ -21,8 +21,8 @@ use serde_json::{Value, json};
 use crate::remote_client::{Tuned, client_case, client_gate, client_gate_tuned, fallbacks, godot_csproj, godot_root, no_pin_warning};
 use crate::routing::{CONTROL_C_EXIT, HOST, path_map, repo, routed_case};
 use crate::support::{
-    ANSWERING, Case, FAKE_SSH, GATE, GATE_VARIABLE, Go, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running, STEPS_VARIABLE, build_version, calls, events,
-    finish, git, heavy_words, junction, nothing_back, shown, ssh_steps, start, wait_until, write_remote_json,
+    ANSWERING, Case, FAKE_SSH, GATE, GATE_VARIABLE, Go, LOCAL_REASON, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running, STEPS_VARIABLE, build_version,
+    calls, events, finish, git, heavy_words, junction, nothing_back, shown, ssh_steps, start, wait_until, write_remote_json,
 };
 
 /// The routing git limit and drain no machine reaches, so a starved gate still finds its worktree.
@@ -1503,7 +1503,7 @@ fn a_run_kept_here_for_another_reason_never_reads_the_warmup() {
     fs::write(warm_entry(&case, "json").expect("the record"), "{").expect("the record can be broken");
     let call = case.folder().join("call.json");
     for (extra, command) in [
-        (vec!["--local"], RAN_HERE.to_vec()),
+        (vec!["--local", LOCAL_REASON[0], LOCAL_REASON[1]], RAN_HERE.to_vec()),
         (Vec::new(), vec!["cmd.exe", "/d", "/c", "echo ran here"]),
     ] {
         let outcome = routed_run(&case, &passing(&case, &call), &extra, &command);

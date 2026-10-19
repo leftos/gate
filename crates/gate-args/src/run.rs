@@ -40,6 +40,7 @@ pub(crate) enum ValueOption {
     Seconds,
     BringTracked,
     Env,
+    Reason,
     Builder,
     #[cfg(feature = "test-seams")]
     SampleMs,
@@ -174,6 +175,8 @@ pub(crate) struct RunBuilder {
     local: bool,
     /// `--alone`, which only a critical run takes.
     alone: bool,
+    /// The `--reason` text as given, which a local or critical run must give.
+    reason: Option<String>,
     /// `gate warm`'s `--background`.
     background: bool,
     bring_tracked: Vec<String>,
@@ -287,13 +290,7 @@ impl RunBuilder {
     fn apply(&mut self, option: ValueOption, spelled: &str, value: &str) -> Result<(), Problem> {
         match option {
             ValueOption::Slot => self.slot = Some(values::slot(spelled, value)?),
-            // Only the subcommand CLI's `--timeout` takes `auto:<n>`; `-TimeoutSeconds` stays a whole number.
-            ValueOption::Timeout => {
-                self.timeout = Some(match self.spelling {
-                    Spelling::Cli => values::ceiling(spelled, value)?,
-                    Spelling::Compat => Ceiling::Given(values::above_zero(spelled, value)?),
-                });
-            }
+            ValueOption::Timeout => self.timeout = Some(self.timeout_value(spelled, value)?),
             ValueOption::Log => self.log = Some(PathBuf::from(value)),
             ValueOption::Stall => self.stall = Some(values::above_zero(spelled, value)?),
             ValueOption::Tail => self.tail = Some(values::zero_or_above(spelled, value)?),
@@ -303,6 +300,7 @@ impl RunBuilder {
             ValueOption::Seconds => self.seconds = Some(values::in_range(spelled, value, 1, values::MAX_BURN_SECONDS)?),
             ValueOption::BringTracked => self.bring_tracked.push(value.to_owned()),
             ValueOption::Env => self.env_word(value)?,
+            ValueOption::Reason => self.reason = Some(Self::reason_value(spelled, value)?),
             ValueOption::Builder => self.builder = Some(value.to_owned()),
             #[cfg(feature = "test-seams")]
             ValueOption::SampleMs => self.test_seams.sample_ms = Some(values::above_zero(spelled, value)?),
@@ -388,6 +386,23 @@ impl RunBuilder {
         Ok(())
     }
 
+    /// The `--timeout` ceiling: only the subcommand CLI's `--timeout` takes `auto:<n>`; `-TimeoutSeconds` stays a whole
+    /// number.
+    fn timeout_value(&self, spelled: &str, value: &str) -> Result<Ceiling, Problem> {
+        match self.spelling {
+            Spelling::Cli => values::ceiling(spelled, value),
+            Spelling::Compat => values::above_zero(spelled, value).map(Ceiling::Given),
+        }
+    }
+
+    /// The `--reason` text, or the problem of one that is blank.
+    fn reason_value(spelled: &str, value: &str) -> Result<String, Problem> {
+        if value.trim().is_empty() {
+            return Err(Problem::EmptyReason(spelled.to_owned()));
+        }
+        Ok(value.to_owned())
+    }
+
     /// Sets or clears a switch.
     pub(crate) fn switch(&mut self, option: SwitchOption, spelled: &str, on: bool) {
         if !self.first_time(RunOption::Switch(option), spelled) {
@@ -424,8 +439,8 @@ impl RunBuilder {
     }
 
     /// The run request, or every problem: those found while reading, then the test seams that cannot work together,
-    /// then `--alone` with a slot other than critical, then each missing input in the order slot, timeout, log,
-    /// command.
+    /// then `--alone` with a slot other than critical, then a local or critical run's missing reason, then each missing
+    /// input in the order slot, timeout, log, command.
     pub(crate) fn finish_run(mut self, command: Vec<OsString>) -> Result<RunRequest, Vec<Problem>> {
         let spelling = self.spelling;
         #[cfg(feature = "test-seams")]
@@ -433,6 +448,13 @@ impl RunBuilder {
         self.check_env();
         if self.alone && self.slot.is_some_and(|slot| slot != Slot::Critical) {
             self.problems.push(Problem::AloneNeedsCritical(spelling));
+        }
+        if !self.given.contains(&RunOption::Value(ValueOption::Reason)) {
+            let local = self.local;
+            let critical = self.slot == Some(Slot::Critical);
+            if local || critical {
+                self.problems.push(Problem::ReasonNeeded { local, critical, spelling });
+            }
         }
         for (option, required) in [
             (ValueOption::Slot, Required::Slot),
@@ -456,6 +478,7 @@ impl RunBuilder {
                 no_markers: self.no_markers,
                 local: self.local,
                 alone: self.alone,
+                reason: self.reason,
                 bring_tracked: self.bring_tracked,
                 env: self.env,
                 state_dir: self.state_dir,

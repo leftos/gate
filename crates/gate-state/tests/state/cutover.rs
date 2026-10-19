@@ -42,6 +42,7 @@ fn v1_ticket(machine: &Machine, kind: TicketKind, pid: u32, arrived: &str) {
         lends_closed: false,
         alone: false,
         remote: None,
+        reason: None,
         expected: None,
     };
     v1::write_ticket(&v1::ticket_path(&machine.v1_root(), pid, ms(START)), &ticket).expect("a v1 ticket can be written");
@@ -315,6 +316,40 @@ fn expected_passes_from_v1_claims_and_tickets_into_the_state_and_is_absent_witho
         (None, Some(&expected)),
         "a ticket without it serialises no key"
     );
+}
+
+#[test]
+fn a_v1_tickets_reason_reaches_the_queue_row_before_expected() {
+    let mut machine = Machine::v1("a_v1_tickets_reason_reaches_the_queue_row_before_expected");
+    machine.add_process(400, 1, "gate.exe", Some(GATE_EXE), Some(START));
+    let expected = json!({"p50": 240.5}).as_object().cloned().expect("expected is an object");
+    let ticket = Ticket {
+        kind: TicketKind::Heavy,
+        arrived: ms("2026-10-01T11:00:02Z"),
+        pid: 400,
+        start_ms: ms(START),
+        holds: false,
+        lends_closed: false,
+        alone: false,
+        remote: None,
+        reason: Some("checking the fallback".to_owned()),
+        expected: Some(expected),
+    };
+    v1::write_ticket(&v1::ticket_path(&machine.v1_root(), 400, ms(START)), &ticket).expect("a v1 ticket can be written");
+
+    let state = machine.state();
+
+    assert_eq!(state.queue.len(), 1, "one waiting gate");
+    assert_eq!(state.queue[0].reason.as_deref(), Some("checking the fallback"));
+    let serialised = serde_json::to_value(&state).expect("the state serialises");
+    let row = serialised["queue"][0].as_object().expect("a queue row is an object");
+    let keys: Vec<&str> = row.keys().map(String::as_str).collect();
+    let after = keys
+        .iter()
+        .position(|key| *key == "commandLine")
+        .map(|at| &keys[at..])
+        .expect("the row has a command line");
+    assert_eq!(after, ["commandLine", "reason", "expected"]);
 }
 
 /// A covered marker of gate `pid` started at `start`, under the slot of gate 52000, written at `since`.

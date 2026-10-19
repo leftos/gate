@@ -48,9 +48,18 @@ fn compat_no_markers_dollar_false_keeps_markers_on() {
 fn compat_local_true_forces_local() {
     let case = Case::new("compat_local_true_forces_local");
 
-    assert_eq!(compat_request(&case, &["-Local:true"])["local"], true);
-    assert_eq!(compat_request(&case, &["-Local:TRUE"])["local"], true);
+    assert_eq!(compat_request(&case, &["-Local:true", "-Reason", "why"])["local"], true);
+    assert_eq!(compat_request(&case, &["-Local:TRUE", "-Reason:why"])["local"], true);
     assert_eq!(compat_request(&case, &[])["local"], false);
+}
+
+#[test]
+fn compat_print_request_shows_the_reason_as_given() {
+    let case = Case::new("compat_print_request_shows_the_reason_as_given");
+
+    assert_eq!(compat_request(&case, &["-Reason", "why"])["reason"], "why");
+    assert_eq!(compat_request(&case, &["-Reason:because"])["reason"], "because");
+    assert_eq!(compat_request(&case, &[])["reason"], Value::Null);
 }
 
 #[test]

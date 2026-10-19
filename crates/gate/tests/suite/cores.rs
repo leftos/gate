@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 
 use crate::routing::{HOST, repo, routed_case};
 use crate::support::{
-    CORE_SECOND, Case, Escapee, FAKE_TOOL, GATE, Outcome, cpu_ticks, events, finish, heavy_words, none_words, run_words, shown, wait_until,
-    write_remote_json,
+    CORE_SECOND, Case, Escapee, FAKE_TOOL, GATE, LOCAL_REASON, Outcome, cpu_ticks, events, finish, heavy_words, none_words, run_words, shown,
+    wait_until, write_remote_json,
 };
 
 /// The fields the release line carries the cores in.
@@ -403,6 +403,7 @@ fn a_long_light_pass_whose_command_matches_no_pattern_says_nothing() {
 fn a_long_light_local_run_says_nothing() {
     let case = routed_case("a_long_light_local_run_says_nothing");
     let mut extra = vec!["--local"];
+    extra.extend(LOCAL_REASON);
     extra.extend(HINT_FLOOR);
     extra.extend(GIT_HANG_GUARDS);
 

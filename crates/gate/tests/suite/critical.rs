@@ -102,6 +102,7 @@ fn write_ticket(case: &Case, kind: TicketKind, (pid, start): (u32, Timestamp), a
         lends_closed: false,
         alone: false,
         remote: remote.then_some(true),
+        reason: None,
         expected: None,
     };
     v1::write_ticket(&v1::ticket_path(&case.root(), pid, start_ms), &ticket).expect("the ticket can be written");
@@ -153,6 +154,57 @@ fn a_critical_gate_starts_only_after_every_earlier_holder_has_released() {
         take_of(&case, critical_pid)["slots"],
         "the release lists the same slots"
     );
+}
+
+/// A critical run records its reason in its arrival ticket, its claim and its queue line, and a ticket rewrite keeps it.
+#[test]
+fn a_critical_run_records_its_reason_in_its_ticket_claim_and_journal() {
+    let case = Case::new("a_critical_run_records_its_reason_in_its_ticket_claim_and_journal");
+    let reason = "the suite's critical run";
+    let (held_go, critical_go) = (case.folder().join("held-go"), case.folder().join("critical-go"));
+    let (held_word, critical_word) = (shown(&held_go), shown(&critical_go));
+    let held = holder(&case, &heavy_words("holder.log", &POLL, &[FAKE_TOOL, "wait", &held_word, "exit", "0"]));
+
+    let critical = case.start(&critical_words(
+        "critical.log",
+        &with_heartbeat(),
+        &[FAKE_TOOL, "wait", &critical_word, "exit", "0"],
+    ));
+    let critical_pid = critical.id();
+    critical.wait_for_stderr(WAITING);
+    let ticket = ticket_json(&case, critical_pid);
+    assert_eq!(ticket["reason"], reason, "{ticket}");
+
+    let_go(&held_go);
+    critical.wait_for_stderr(HOLDS);
+    let claim_path = case.root().join("slots").join("gate-critical.json");
+    wait_for_file(&claim_path);
+    let claim = json_file(&claim_path);
+    assert_eq!(claim["reason"], reason, "{claim}");
+
+    let queue = events(&case)
+        .into_iter()
+        .find(|event| event["event"] == "queue" && event["pid"] == critical_pid)
+        .expect("the critical gate journalled its queue line");
+    assert_eq!(queue["reason"], reason, "{queue}");
+
+    let rewritten = ticket_json(&case, critical_pid);
+    assert_eq!(rewritten["holds"], true, "the ticket says it holds: {rewritten}");
+    assert_eq!(rewritten["reason"], reason, "a rewrite keeps the reason: {rewritten}");
+
+    let_go(&critical_go);
+    assert_passed(&critical.finish());
+    assert_passed(&held.finish());
+}
+
+/// The ticket of the gate `pid` as JSON.
+fn ticket_json(case: &Case, pid: u32) -> Value {
+    serde_json::from_str(&fs::read_to_string(ticket_file(case, pid)).expect("the ticket can be read")).expect("the ticket is JSON")
+}
+
+/// The JSON at `path`.
+fn json_file(path: &Path) -> Value {
+    serde_json::from_str(&fs::read_to_string(path).expect("the file can be read")).expect("the file is JSON")
 }
 
 #[test]
@@ -1260,6 +1312,7 @@ fn the_drain_ignores_remote_tickets_and_claims() {
         remote: Some(true),
         host: Some("builder@build-box".to_owned()),
         key: Some("repo-1".to_owned()),
+        reason: None,
         expected: None,
     };
     let path = v1::claim_path(&case.root(), KernelObject::RemoteSlot(0)).expect("a remote slot has a claim");
@@ -1362,6 +1415,7 @@ fn write_claim(case: &Case, object: KernelObject, kind: ClaimKind, (pid, start):
         remote: None,
         host: None,
         key: None,
+        reason: None,
         expected: None,
     };
     let path = v1::claim_path(&case.root(), object).expect("a slot has a claim");

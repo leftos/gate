@@ -491,6 +491,7 @@ mod tests {
             remote: None,
             host: None,
             key: None,
+            reason: None,
             expected: None,
         }
     }

@@ -1,6 +1,6 @@
 //! The first word, the usage and a valid run.
 
-use crate::support::{Case, FAKE_TOOL, USAGE, assert_in_order, shown};
+use crate::support::{Case, FAKE_TOOL, Outcome, USAGE, assert_in_order, shown};
 
 #[test]
 fn version_exits_0() {
@@ -84,6 +84,116 @@ fn run_reports_missing_inputs_then_usage_exit_2() {
     assert!(outcome.stderr.ends_with(USAGE), "the usage comes last");
     assert_eq!(case.root_entries(), Vec::<String>::new(), "a refused run writes nothing");
     assert_eq!(case.folder_entries(), Vec::<String>::new(), "a refused run writes nothing");
+}
+
+/// Asserts that `outcome` refused the run with `line` and the usage, and wrote nothing.
+fn assert_reason_refused(case: &Case, outcome: &Outcome, line: &str) {
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(outcome.stderr, format!("{line}\n{USAGE}"), "{outcome:?}");
+    assert_eq!(case.root_entries(), Vec::<String>::new(), "a refused run writes nothing");
+    assert!(!case.root().join("waiting").exists(), "no ticket was queued");
+    assert!(!case.root().join("slots").exists(), "no claim was written");
+    assert_eq!(case.folder_entries(), Vec::<String>::new(), "no log was written");
+}
+
+#[test]
+fn a_local_run_without_a_reason_is_a_usage_error() {
+    let cli = Case::new("a_local_run_without_a_reason_is_a_usage_error");
+    let outcome = cli.run(&[
+        "run",
+        "--slot",
+        "heavy",
+        "--timeout",
+        "5",
+        "--log",
+        "out.log",
+        "--local",
+        "--",
+        FAKE_TOOL,
+        "exit",
+        "0",
+    ]);
+    assert_reason_refused(&cli, &outcome, "gate: --local needs --reason \"<why>\"");
+
+    let compat = Case::new("a_local_run_without_a_reason_is_a_usage_error_compat");
+    let outcome = compat.run(&[
+        "-Log",
+        "out.log",
+        "-TimeoutSeconds",
+        "5",
+        "-Slot",
+        "heavy",
+        "-Local",
+        "--",
+        FAKE_TOOL,
+        "exit",
+        "0",
+    ]);
+    assert_reason_refused(&compat, &outcome, "gate: -Local needs -Reason \"<why>\"");
+}
+
+#[test]
+fn a_critical_run_without_a_reason_is_a_usage_error() {
+    let case = Case::new("a_critical_run_without_a_reason_is_a_usage_error");
+    let outcome = case.run(&[
+        "run",
+        "--slot",
+        "critical",
+        "--timeout",
+        "5",
+        "--log",
+        "out.log",
+        "--",
+        FAKE_TOOL,
+        "exit",
+        "0",
+    ]);
+
+    assert_reason_refused(&case, &outcome, "gate: --slot critical needs --reason \"<why>\"");
+}
+
+#[test]
+fn an_alone_run_without_a_reason_is_a_usage_error() {
+    let case = Case::new("an_alone_run_without_a_reason_is_a_usage_error");
+    let outcome = case.run(&[
+        "run",
+        "--slot",
+        "critical",
+        "--alone",
+        "--timeout",
+        "5",
+        "--log",
+        "out.log",
+        "--",
+        FAKE_TOOL,
+        "exit",
+        "0",
+    ]);
+
+    assert_reason_refused(&case, &outcome, "gate: --slot critical needs --reason \"<why>\"");
+}
+
+#[test]
+fn a_blank_reason_is_a_usage_error() {
+    let case = Case::new("a_blank_reason_is_a_usage_error");
+    let outcome = case.run(&[
+        "run",
+        "--slot",
+        "heavy",
+        "--timeout",
+        "5",
+        "--log",
+        "out.log",
+        "--reason",
+        "  ",
+        "--",
+        FAKE_TOOL,
+        "exit",
+        "0",
+    ]);
+
+    assert_reason_refused(&case, &outcome, "gate: --reason must not be empty");
 }
 
 #[test]

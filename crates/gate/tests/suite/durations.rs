@@ -14,8 +14,8 @@ use serde_json::Value;
 
 use crate::routing::{heavy_words_with_limit, routed_case};
 use crate::support::{
-    Case, FAKE_TOOL, Outcome, USAGE, assert_in_order, critical_words, events, finish, git, git_init, heavy_words, none_words, run_words, shown,
-    wait_for_file, wait_until, write_counts,
+    Case, FAKE_TOOL, LOCAL_REASON, Outcome, USAGE, assert_in_order, critical_words, events, finish, git, git_init, heavy_words, none_words,
+    run_words, shown, wait_for_file, wait_until, write_counts,
 };
 
 /// `FILE_SHARE_READ`: a handle that lets others read the file, but not write, move or delete it.
@@ -923,7 +923,11 @@ fn a_routed_run_that_falls_back_claims_and_queues_here_with_the_local_key() {
     keys.sort();
     assert!(keys[0].starts_with("local:") && keys[1].starts_with("remote:builder:"), "{keys:?}");
     write_counts(&case.root(), r#"{"v":1,"heavy":1}"#);
-    let holder = case.start(&heavy_words_with_limit("local.log", &["--local"], &[r".\tool.exe", "wait", &local_word]));
+    let holder = case.start(&heavy_words_with_limit(
+        "local.log",
+        &["--local", LOCAL_REASON[0], LOCAL_REASON[1]],
+        &[r".\tool.exe", "wait", &local_word],
+    ));
     wait_for_file(&case.root().join("slots").join("gate-slot-0.json"));
 
     let mut routed = case.start(&heavy_words_with_limit("routed.log", &["--test-remote-client", &refused], &command));

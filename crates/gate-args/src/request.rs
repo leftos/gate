@@ -389,6 +389,8 @@ pub struct RunRequest {
     pub local: bool,
     /// `--alone`, given only with `--slot critical`: the critical gate holds the machine alone, light slots included.
     pub alone: bool,
+    /// The `--reason` text the caller gave, recorded with the run; required when `local` or a critical slot.
+    pub reason: Option<String>,
     /// The `--bring-tracked` globs, in the order given: a fetched output git tracks is installed only when one matches it.
     pub bring_tracked: Vec<String>,
     /// The `--env` pairs, name and value, in the order given: set for the command over the environment it starts in and

@@ -94,7 +94,15 @@ fn expect_refuses_an_option_given_twice() {
 
 #[test]
 fn expect_refuses_any_other_option() {
-    for option in ["--local", "--timeout=5", "--log=out.log", "--cd=x", "--test-print-request", "-Slot"] {
+    for option in [
+        "--local",
+        "--timeout=5",
+        "--log=out.log",
+        "--cd=x",
+        "--test-print-request",
+        "--reason",
+        "-Slot",
+    ] {
         assert_eq!(
             problems(&["expect", option, "--", "cmd"]),
             [format!("gate: unknown option {option}")],

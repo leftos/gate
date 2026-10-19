@@ -164,6 +164,7 @@ fn run_option(name: &str) -> Option<RunOption> {
         "cd" => RunOption::Value(ValueOption::Cd),
         "bring-tracked" => RunOption::Value(ValueOption::BringTracked),
         "env" => RunOption::Value(ValueOption::Env),
+        "reason" => RunOption::Value(ValueOption::Reason),
         "no-markers" => RunOption::Switch(SwitchOption::NoMarkers),
         "local" => RunOption::Switch(SwitchOption::Local),
         "alone" => RunOption::Switch(SwitchOption::Alone),

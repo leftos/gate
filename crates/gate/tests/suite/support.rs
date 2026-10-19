@@ -30,7 +30,7 @@ pub const FAKE_DESKTOP_HELPER: &str = env!("CARGO_BIN_EXE_fake-desktop-helper");
 
 /// The published usage text, copied here so a change to it fails a case.
 pub const USAGE: &str = "\
-usage: gate run --slot heavy|light|critical|none [--alone] --timeout <seconds>|auto:<seconds> --log <path> [options] -- <command> [args...]
+usage: gate run --slot heavy|light|critical|none [--alone] [--reason \"<why>\"] --timeout <seconds>|auto:<seconds> --log <path> [options] -- <command> [args...]
        gate stop-tree <pid>
        gate cutover
        gate push
@@ -45,6 +45,7 @@ run options:
   --tail <lines>       log lines printed at the end, default 20
   --no-markers         the command's status is the verdict
   --local              never route this run to a builder
+  --reason \"<why>\"     why this run is local, critical or alone; required with --local, --slot critical and --alone
   --alone              with --slot critical: hold the machine alone, every light slot included
   --state-dir <path>   use another state root (also GATE_STATE_DIR)
   --cd <folder>        run the command in <folder> and route from it
@@ -52,7 +53,7 @@ run options:
                        install a routed run's outputs git tracks that match <glob>; repeatable
   --env NAME[=value]   set NAME for the command, local or routed; without =value, forward NAME's value from here, the form for secrets; repeatable
 
---slot, --timeout, --log and the command are all required.
+--slot, --timeout, --log and the command are all required; so is --reason \"<why>\" with --local, --slot critical or --alone.
 The PowerShell form (gate -Log <path> -TimeoutSeconds <n> -Slot <kind> [...] -- <command>) is also accepted.
 ";
 
@@ -1090,6 +1091,9 @@ impl Drop for Junction {
     }
 }
 
+/// The reason a run the suite keeps here with `--local` gives, the two words a run's options take.
+pub const LOCAL_REASON: [&str; 2] = ["--reason", "the suite keeps this run here"];
+
 /// The words of a light run logging to `log`, `extra` before `--` and `command` after it. Gates that run at once each
 /// need a log of their own, since a gate refuses a log another gate is writing. The ceiling is far above the hang
 /// guard, so a run a case holds is never ended by it.
@@ -1108,9 +1112,11 @@ pub fn heavy_words<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> 
     words
 }
 
-/// The words of a critical run, as [`run_words`] gives those of a light one.
+/// The words of a critical run, as [`run_words`] gives those of a light one, with the reason a critical run must state.
 pub fn critical_words<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
-    let mut words = run_words(log, extra, command);
+    let mut before = vec!["--reason", "the suite's critical run"];
+    before.extend(extra);
+    let mut words = run_words(log, &before, command);
     words[2] = "critical";
     words
 }

@@ -15,8 +15,9 @@ use serde_json::{Value, json};
 use crate::nesting::{LOOK_OFTEN, end_parent, first_event, marked, orphaned_as, spawned, test_marker};
 
 use crate::support::{
-    Case, DenyEntry, FAKE_TOOL, GATE, Go, Junction, Outcome, Running, assert_in_order, beside, copy_tool, events, finish, git, git_init, heavy_words,
-    nothing_back, powershell_folder, record_path, release, run_words, shown, wait_for_journal_line, wait_until, write_counts, write_remote_json,
+    Case, DenyEntry, FAKE_TOOL, GATE, Go, Junction, LOCAL_REASON, Outcome, Running, assert_in_order, beside, copy_tool, events, finish, git,
+    git_init, heavy_words, nothing_back, powershell_folder, record_path, release, run_words, shown, wait_for_journal_line, wait_until, write_counts,
+    write_remote_json,
 };
 
 pub(crate) const HOST: &str = "builder";
@@ -337,8 +338,9 @@ fn an_ssh_inside_the_worktree_is_refused_with_reason_client() {
 #[test]
 fn local_runs_here_saying_why_and_journals_not_routed() {
     let case = routed_case("routing-local");
-    let heavy = finish(case.gate(&heavy_words_with_limit("heavy.log", &["--local"], &[r".\tool.exe", "out", "hi"])));
-    let light = finish(case.gate(&run_words("light.log", &["--local"], &[r".\tool.exe", "out", "hi"])));
+    let local = ["--local", LOCAL_REASON[0], LOCAL_REASON[1]];
+    let heavy = finish(case.gate(&heavy_words_with_limit("heavy.log", &local, &[r".\tool.exe", "out", "hi"])));
+    let light = finish(case.gate(&run_words("light.log", &local, &[r".\tool.exe", "out", "hi"])));
 
     assert_eq!((heavy.code, light.code), (Some(0), Some(0)), "{heavy:?} {light:?}");
     assert!(heavy.stderr.contains("gate: not routed: --local\n"), "{heavy:?}");
@@ -346,8 +348,30 @@ fn local_runs_here_saying_why_and_journals_not_routed() {
     let events = events(&case);
     assert_local(&events[..3], Some("--local"));
     assert_local(&events[3..], None);
+    assert_eq!(events[0]["reason"], LOCAL_REASON[1], "{}", events[0]);
+    assert_eq!(events[3]["reason"], LOCAL_REASON[1], "{}", events[3]);
     let log = fs::read_to_string(case.folder().join("heavy.log")).expect("the log was written");
     assert!(log.contains("gate: not routed: --local"), "{log}");
+}
+
+/// A routed run that gave a reason writes it on its queue line though it was not kept here.
+#[test]
+fn a_queue_with_a_reason_but_no_not_routed_still_writes_it() {
+    let case = routed_case("routing-reason-routed");
+    let steps = shown(&stub(&case, &["status 0"]));
+
+    let outcome = finish(case.gate(&routed_words(
+        "out.log",
+        &steps,
+        &["--reason", "a reason given on a routed run"],
+        &[r".\tool.exe", "out", "hi"],
+    )));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let events = events(&case);
+    assert_eq!(events[0]["event"], "queue", "{events:#?}");
+    assert_eq!(events[0]["reason"], "a reason given on a routed run", "{}", events[0]);
+    assert!(events[0].get("notRouted").is_none(), "{}", events[0]);
 }
 
 #[test]
@@ -530,7 +554,8 @@ fn a_routed_run_says_which_watched_variables_it_drops() {
 fn a_local_run_says_no_dropped_variables() {
     let case = routed_case("routing-local-dropped-env");
     let steps = shown(&stub(&case, &["status 0"]));
-    let mut gate = case.gate(&routed_words("out.log", &steps, &["--local"], &[r".\tool.exe", "out", "ran"]));
+    let local = ["--local", LOCAL_REASON[0], LOCAL_REASON[1]];
+    let mut gate = case.gate(&routed_words("out.log", &steps, &local, &[r".\tool.exe", "out", "ran"]));
     gate.env("NuGetAudit", "false");
 
     let outcome = finish(gate);
@@ -753,7 +778,7 @@ fn a_local_run_given_cd_runs_its_command_in_that_folder() {
     copy_tool(&case, r"there\tool.exe");
     let outcome = finish(case.gate(&heavy_words_with_limit(
         "out.log",
-        &["--local", "--cd", "there"],
+        &["--local", LOCAL_REASON[0], LOCAL_REASON[1], "--cd", "there"],
         &[r".\tool.exe", "write", "here.txt", "ran"],
     )));
 
@@ -1891,7 +1916,8 @@ fn a_heavy_local_no_build_drops_the_word() {
     dotnet_cmd(&case);
     routed_build(&case, "routed.log");
 
-    let outcome = finish(case.gate(&heavy_words_with_limit("local.log", &["--local"], &NO_BUILD_TEST)));
+    let local = ["--local", LOCAL_REASON[0], LOCAL_REASON[1]];
+    let outcome = finish(case.gate(&heavy_words_with_limit("local.log", &local, &NO_BUILD_TEST)));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stderr.contains(NOTHING_BACK_LINE), "{outcome:?}");
@@ -2371,7 +2397,7 @@ fn a_full_fallback_says_the_whole_wait_in_its_still_waiting_lines() {
     let local_go_word = shown(&local_go);
     let local_holder = case.start(&heavy_words_with_limit(
         "local.log",
-        &["--local"],
+        &["--local", LOCAL_REASON[0], LOCAL_REASON[1]],
         &[r".\tool.exe", "wait", &local_go_word],
     ));
     wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, local_holder.id()));
@@ -2417,7 +2443,7 @@ fn a_ctrl_c_in_the_local_wait_after_a_full_fallback_journals_the_abandon_from_th
     let local_go_word = shown(&local_go);
     let local_holder = case.start(&heavy_words_with_limit(
         "local.log",
-        &["--local"],
+        &["--local", LOCAL_REASON[0], LOCAL_REASON[1]],
         &[r".\tool.exe", "wait", &local_go_word],
     ));
     wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, local_holder.id()));
@@ -2485,9 +2511,17 @@ fn remote_and_local_waiters_do_not_queue_behind_each_other() {
     write_counts(&case.root(), r#"{"v":1,"heavy":1}"#);
     let local_go = case.folder().join("local-go");
     let local_go_word = shown(&local_go);
-    let local_holder = case.start(&heavy_words_with_limit("lh.log", &["--local"], &[r".\tool.exe", "wait", &local_go_word]));
+    let local_holder = case.start(&heavy_words_with_limit(
+        "lh.log",
+        &["--local", LOCAL_REASON[0], LOCAL_REASON[1]],
+        &[r".\tool.exe", "wait", &local_go_word],
+    ));
     wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, local_holder.id()));
-    let mut local_waiter = case.start(&heavy_words_with_limit("lw.log", &["--local"], &[r".\tool.exe", "out", "hi"]));
+    let mut local_waiter = case.start(&heavy_words_with_limit(
+        "lw.log",
+        &["--local", LOCAL_REASON[0], LOCAL_REASON[1]],
+        &[r".\tool.exe", "out", "hi"],
+    ));
     local_waiter.wait_for_stderr("gate: waiting for a heavy slot");
     let free = shown(&stub(&case, &["status 0"]));
     let routed = finish(case.gate(&routed_words("routed.log", &free, &[], &[r".\tool.exe", "out", "hi"])));
@@ -2505,7 +2539,11 @@ fn remote_and_local_waiters_do_not_queue_behind_each_other() {
     let waits = ["--test-remote-wait-ms", "3600000", "--test-poll-ms", "50"];
     let mut remote_waiter = case.start(&routed_words("rw.log", &free, &waits, &[r".\tool.exe", "out", "hi"]));
     remote_waiter.wait_for_stderr(REMOTE_WAITING);
-    let local = finish(case.gate(&heavy_words_with_limit("local.log", &["--local"], &[r".\tool.exe", "out", "hi"])));
+    let local = finish(case.gate(&heavy_words_with_limit(
+        "local.log",
+        &["--local", LOCAL_REASON[0], LOCAL_REASON[1]],
+        &[r".\tool.exe", "out", "hi"],
+    )));
     assert_eq!(
         local.code,
         Some(0),
@@ -2581,7 +2619,11 @@ fn a_ctrl_c_in_the_local_wait_after_a_fallback_abandons_without_the_remote_field
     write_counts(&case.root(), r#"{"v":1,"heavy":1}"#);
     let go = case.folder().join("go");
     let go_word = shown(&go);
-    let holder = case.start(&heavy_words_with_limit("holder.log", &["--local"], &[r".\tool.exe", "wait", &go_word]));
+    let holder = case.start(&heavy_words_with_limit(
+        "holder.log",
+        &["--local", LOCAL_REASON[0], LOCAL_REASON[1]],
+        &[r".\tool.exe", "wait", &go_word],
+    ));
     wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, holder.id()));
     let steps = shown(&stub(&case, &["refuse busy"]));
     let gate = case.start(&routed_words(

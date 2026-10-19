@@ -16,6 +16,9 @@ const SAMPLER_FAILED: &str = "gate: sampler failed: --test-sampler-fail makes ev
 /// The words of a run in `slot` with a 1 s ceiling, logging to `out.log`, `seams` before `--` and `command` after it.
 fn ceiling_words<'a>(slot: &'a str, seams: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
     let mut words = vec!["run", "--slot", slot, "--timeout", "1", "--log", "out.log"];
+    if slot == "critical" {
+        words.extend(["--reason", "the suite's critical run"]);
+    }
     words.extend(seams);
     words.push("--");
     words.extend(command);

@@ -448,6 +448,10 @@ pub struct Claim {
     /// The remote work folder's key of a remote slot's claim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// The free text the run gave `--reason`, for a local, critical or alone run or any run that said one; absent when
+    /// it said none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// Reserved, read and written through untouched. Any value but an object or `null` makes the claim unreadable;
     /// `null` reads as absent.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -500,6 +504,10 @@ pub struct Ticket {
     /// True while queued for the remote pool. Written only when `Some(true)`, so a local queue's ticket is `None`.
     #[serde(skip_serializing_if = "is_not_true")]
     pub remote: Option<bool>,
+    /// The free text the run gave `--reason`, for a local, critical or alone run or any run that said one; absent when
+    /// it said none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// Reserved, read and written through untouched. Any value but an object or `null` makes the ticket unreadable;
     /// `null` reads as absent.
     #[serde(skip_serializing_if = "Option::is_none")]

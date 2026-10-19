@@ -146,6 +146,7 @@ impl<'a> MachineWait<'a> {
             lends_closed: false,
             alone: arrival.request.alone,
             remote: None,
+            reason: arrival.request.reason.clone(),
             expected: arrival.expected.cloned(),
         };
         let waiter = Waiter::queue(root, arrival, &ticket, host, console);
@@ -840,6 +841,7 @@ mod tests {
             lends_closed: false,
             alone: false,
             remote: None,
+            reason: None,
             expected: None,
         }
     }

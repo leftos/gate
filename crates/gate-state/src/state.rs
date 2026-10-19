@@ -155,6 +155,7 @@ fn ticket_from_v1(ticket: &v1::Ticket) -> Option<Ticket> {
         remote: ticket.remote == Some(true),
         exact_start_ms: Some(ticket.start_ms),
         expected: ticket.expected.clone(),
+        reason: ticket.reason.clone(),
     })
 }
 
@@ -387,6 +388,7 @@ impl Table {
             age_seconds: age_seconds(now, ticket.arrived_ticks),
             cwd: cwds.current_dir(ticket.pid),
             command_line: process.command_line.clone(),
+            reason: ticket.reason.clone(),
             kind: ticket.kind.clone(),
             holds: ticket.holds,
             remote: ticket.remote,

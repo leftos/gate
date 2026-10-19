@@ -608,6 +608,7 @@ impl Taker<'_> {
             ceiling: self.ceiling,
             log: self.log.path(),
             remote: self.tag,
+            reason: self.request.reason.as_deref(),
             expected: self.expected,
         };
         if taken.beside.is_some()
@@ -986,6 +987,7 @@ impl Run<'_> {
             ceiling,
             log: self.log.path(),
             remote: None,
+            reason: self.request.reason.as_deref(),
             expected,
         };
         LendMarker::write(&self.root.path, parent_pid, &of, console)
@@ -1006,6 +1008,7 @@ impl Run<'_> {
             None => JournalEvent::Queue {
                 log: self.log.path().to_string_lossy().into_owned(),
                 not_routed: route::not_routed(route),
+                reason: self.request.reason.clone(),
             },
         };
         if matches!(route, Route::Routed(_)) {
@@ -1833,6 +1836,7 @@ impl Run<'_> {
             ceiling: figures.ceiling,
             log: self.log.path(),
             remote: None,
+            reason: self.request.reason.as_deref(),
             expected: expected.as_ref(),
         };
         machine.write_claim(&of, console);
@@ -3162,6 +3166,7 @@ mod tests {
             remote: Some(true),
             host: Some("builder".to_owned()),
             key: Some(key.to_owned()),
+            reason: None,
             expected,
         }
     }

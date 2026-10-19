@@ -939,6 +939,7 @@ mod tests {
             no_markers: false,
             local: false,
             alone: false,
+            reason: None,
             bring_tracked: Vec::new(),
             env: Vec::new(),
             state_dir: None,

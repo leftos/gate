@@ -27,8 +27,33 @@ fn compat_accepts_the_powershell_form() {
     let new = with(&RUN, &COMMAND);
     assert_eq!(run_request(&refs(&old)), as_compat(&new));
 
-    let old = compat(&["-StallSeconds", "30", "-Tail", "5", "-NoMarkers", "-Local", "--", "cmd"]);
-    let new = with(&RUN, &["--stall", "30", "--tail", "5", "--no-markers", "--local", "--", "cmd"]);
+    let old = compat(&[
+        "-StallSeconds",
+        "30",
+        "-Tail",
+        "5",
+        "-NoMarkers",
+        "-Local",
+        "-Reason",
+        "checking",
+        "--",
+        "cmd",
+    ]);
+    let new = with(
+        &RUN,
+        &[
+            "--stall",
+            "30",
+            "--tail",
+            "5",
+            "--no-markers",
+            "--local",
+            "--reason",
+            "checking",
+            "--",
+            "cmd",
+        ],
+    );
     assert_eq!(run_request(&refs(&old)), as_compat(&new));
 }
 
@@ -102,10 +127,15 @@ fn compat_options_are_case_insensitive() {
         "5",
         "-nomarkers",
         "-LOCAL",
+        "-REASON",
+        "why",
         "--",
         "cmd",
     ];
-    let new = with(&RUN, &["--stall", "30", "--tail", "5", "--no-markers", "--local", "--", "cmd"]);
+    let new = with(
+        &RUN,
+        &["--stall", "30", "--tail", "5", "--no-markers", "--local", "--reason", "why", "--", "cmd"],
+    );
     assert_eq!(run_request(&old), as_compat(&new));
 }
 
@@ -159,7 +189,10 @@ fn compat_no_markers_colon_dollar_false_keeps_markers_on() {
 #[test]
 fn compat_local_colon_true_forces_local() {
     for switch in ["-Local:true", "-Local:TRUE", "-Local:$true"] {
-        assert!(run_request(&refs(&compat(&[switch, "--", "cmd"]))).local, "{switch} forces local");
+        assert!(
+            run_request(&refs(&compat(&[switch, "-Reason", "why", "--", "cmd"]))).local,
+            "{switch} forces local"
+        );
     }
 }
 
@@ -299,4 +332,44 @@ fn compat_stop_tree_is_used_alone() {
     );
     assert_eq!(problems(&["-StopTree", "123", "--", "cmd"]), ["gate: -StopTree is used alone"]);
     assert!(matches!(parse(os(&["-StopTree", "1"])), Ok(Invocation::StopTree(_))));
+}
+
+#[test]
+fn compat_reads_a_reason_in_both_forms_in_any_case() {
+    let new = with(&RUN, &["--reason", "why", "--", "cmd"]);
+    for reason in [
+        ["-Reason", "why", "--", "cmd"].as_slice(),
+        ["-Reason:why", "--", "cmd"].as_slice(),
+        ["-REASON:why", "--", "cmd"].as_slice(),
+    ] {
+        assert_eq!(run_request(&refs(&compat(reason))), as_compat(&new), "{reason:?}");
+    }
+}
+
+#[test]
+fn compat_needs_a_reason_for_local_and_critical_runs() {
+    assert_eq!(
+        problems(&refs(&compat(&["-Local", "--", "cmd"]))),
+        ["gate: -Local needs -Reason \"<why>\""]
+    );
+    assert_eq!(
+        problems(&["-Log", "out.log", "-TimeoutSeconds", "5", "-Slot", "critical", "--", "cmd"]),
+        ["gate: -Slot critical needs -Reason \"<why>\""]
+    );
+    assert_eq!(
+        problems(&["-Log", "out.log", "-TimeoutSeconds", "5", "-Slot", "critical", "-Local", "--", "cmd"]),
+        ["gate: -Local and -Slot critical need -Reason \"<why>\""]
+    );
+}
+
+#[test]
+fn compat_refuses_a_blank_reason_and_one_with_no_value() {
+    assert_eq!(
+        problems(&refs(&compat(&["-Reason", "   ", "--", "cmd"]))),
+        ["gate: -Reason must not be empty"]
+    );
+    assert_eq!(
+        problems(&refs(&compat(&["-Reason", "-NoMarkers", "--", "cmd"]))),
+        ["gate: -Reason needs a value"]
+    );
 }

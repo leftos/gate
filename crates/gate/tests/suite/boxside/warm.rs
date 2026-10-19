@@ -641,6 +641,8 @@ fn box_warm_up_ends_the_job_of_a_command_before_the_next() {
         GATE,
         "run",
         "--local",
+        "--reason",
+        "the box keeps this run here",
         "--slot",
         "light",
         "--timeout",

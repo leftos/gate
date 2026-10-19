@@ -2,7 +2,7 @@
 
 /// The usage, without a final line feed.
 pub const USAGE: &str = "\
-usage: gate run --slot heavy|light|critical|none [--alone] --timeout <seconds>|auto:<seconds> --log <path> [options] -- <command> [args...]
+usage: gate run --slot heavy|light|critical|none [--alone] [--reason \"<why>\"] --timeout <seconds>|auto:<seconds> --log <path> [options] -- <command> [args...]
        gate stop-tree <pid>
        gate cutover
        gate push
@@ -17,6 +17,7 @@ run options:
   --tail <lines>       log lines printed at the end, default 20
   --no-markers         the command's status is the verdict
   --local              never route this run to a builder
+  --reason \"<why>\"     why this run is local, critical or alone; required with --local, --slot critical and --alone
   --alone              with --slot critical: hold the machine alone, every light slot included
   --state-dir <path>   use another state root (also GATE_STATE_DIR)
   --cd <folder>        run the command in <folder> and route from it
@@ -24,5 +25,5 @@ run options:
                        install a routed run's outputs git tracks that match <glob>; repeatable
   --env NAME[=value]   set NAME for the command, local or routed; without =value, forward NAME's value from here, the form for secrets; repeatable
 
---slot, --timeout, --log and the command are all required.
+--slot, --timeout, --log and the command are all required; so is --reason \"<why>\" with --local, --slot critical or --alone.
 The PowerShell form (gate -Log <path> -TimeoutSeconds <n> -Slot <kind> [...] -- <command>) is also accepted.";

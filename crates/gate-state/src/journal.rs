@@ -98,6 +98,9 @@ pub struct HistoryRun {
     /// work folder for the run's repos), `version` (the box's gate is of another version) or
     /// `client` (the remote client could not start); `unknown` when the line names none. `None` when it was not.
     pub fallback: Option<String>,
+    /// The free text the run gave `--reason`, from its `queue` line; serialised only when it carries one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// The run's own gate's pid, from its run key.
     pub pid: u32,
     /// The run's own gate's process start, as the journal wrote it (ISO 8601 UTC, seven fractional digits); with
@@ -261,6 +264,8 @@ struct Run {
     remote: bool,
     host: Option<String>,
     fallback: Option<String>,
+    /// The free text the run's `queue` line carries from `--reason`; the first such line's when more than one names one.
+    reason: Option<String>,
     /// The remote take a fallback ended, kept for the reader: its start and wait, and when the run fell back.
     remote_take: Option<RemoteTake>,
     waited_seconds: Option<f64>,
@@ -559,6 +564,7 @@ impl Run {
             remote: false,
             host: None,
             fallback: None,
+            reason: None,
             remote_take: None,
             waited_seconds: None,
             held_seconds: None,
@@ -587,6 +593,9 @@ impl Run {
         match line.event.as_str() {
             "queue" => {
                 self.queued.get_or_insert(stamp);
+                if self.reason.is_none() {
+                    self.reason.clone_from(&line.reason);
+                }
                 self.route(line.remote, line.host.clone());
             }
             "take" => {
@@ -696,6 +705,7 @@ impl Run {
             remote: self.remote,
             host: self.host.clone(),
             fallback: self.fallback.clone(),
+            reason: self.reason.clone(),
             pid: *pid,
             process_start: process_start.clone(),
             parent_pid: self.parent.map(|(pid, _)| pid),

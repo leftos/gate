@@ -517,6 +517,7 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 remote: false,
                 host: None,
                 fallback: None,
+                reason: None,
                 pid: 200,
                 process_start: START.to_owned(),
                 parent_pid: None,
@@ -544,6 +545,7 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 remote: false,
                 host: None,
                 fallback: None,
+                reason: None,
                 pid: 100,
                 process_start: START.to_owned(),
                 parent_pid: None,
@@ -562,6 +564,47 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
             },
         ]
     );
+}
+
+#[test]
+fn a_queue_reason_is_the_runs_reason() {
+    let first = Gate::new(100, START, COMMAND);
+    let second = Gate::new(200, START, COMMAND);
+    let lines = [
+        first.line("queue", &ago(30), json!({"log": "run.log", "reason": "checking the fallback"})),
+        first.line("queue", &ago(29), json!({"log": "run.log", "reason": "a second reason"})),
+        first.take(&ago(28), 0.5),
+        second.queue(&ago(27)),
+    ];
+
+    let history = history_of("a_queue_reason_is_the_runs_reason", &lines);
+    let of = |pid: u32| history.runs.iter().find(|run| run.pid == pid).expect("the run is in the history");
+
+    assert_eq!(
+        of(100).reason.as_deref(),
+        Some("checking the fallback"),
+        "the first queue line's reason stands, not the second's"
+    );
+    assert_eq!(of(200).reason, None, "a run that gave none carries none");
+}
+
+#[test]
+fn a_history_run_serializes_reason_only_when_it_has_one() {
+    let gate = Gate::new(100, START, COMMAND);
+    let history = history_of(
+        "a_history_run_serializes_reason_only_when_it_has_one",
+        &[gate.line("queue", &ago(30), json!({"log": "run.log", "reason": "why"}))],
+    );
+    let mut run = history.runs.into_iter().next().expect("the run is in the history");
+
+    assert_eq!(run.reason.as_deref(), Some("why"));
+    run.reason = None;
+    let shape = serde_json::to_value(&run).expect("a run serializes");
+    assert_eq!(shape.get("reason"), None, "a run without one serialises no key");
+
+    run.reason = Some("why".to_owned());
+    let shape = serde_json::to_value(&run).expect("a run serializes");
+    assert_eq!(shape["reason"], "why");
 }
 
 #[test]

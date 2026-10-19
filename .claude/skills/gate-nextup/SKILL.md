@@ -79,7 +79,7 @@ The machine-alone cases also include `remote_inputs::a_put_whose_box_works_silen
 
 `boxside::box_run_lets_an_elevated_session_s_inner_gate_judge_the_box_job` needs an elevated session on a builder: run it by hand over plain ssh with `--run-ignored only`, after a push of the build that carries it.
 
-That case proves "not stalled" inside a short window, with an escapee that runs at BelowNormal and can be starved into a false STALLED. When the diff touches the watchdog, also run `-Slot critical -TimeoutSeconds 600 -- cargo nextest run -p gate --all-features --cargo-profile test-release --run-ignored only -E 'binary(suite)'`.
+That case proves "not stalled" inside a short window, with an escapee that runs at BelowNormal and can be starved into a false STALLED. When the diff touches the watchdog, also run `-Slot critical -Reason "the watchdog timing case" -TimeoutSeconds 600 -- cargo nextest run -p gate --all-features --cargo-profile test-release --run-ignored only -E 'binary(suite)'`.
 
 `stall::a_stall_kill_ends_a_packaged_app_the_command_started` is machine-dependent: it runs only where the first `pwsh` on PATH is the Store (WindowsApps) alias, and skips on this PC once the Store pwsh is removed. To drive it, run it through `gate.exe` directly with the alias first on PATH.
 
@@ -89,7 +89,7 @@ load-burn does not starve a BelowNormal process: its critical gate runs the comm
 
 Suspending gate.exe cannot starve a test stand-in such as `fake-ssh`: to reproduce a stand-in that gets no CPU in time, put a wrapper that delays before running the real one in place of `target\test-release\fake-ssh.exe` (an untracked build file) and restore it afterwards; GATE-488 was found that way.
 
-The rig needs the case's gate.exe on this PC, but the launcher routes nextest to the builder: build once with `-Local` and `--no-run`, then run the suite binary directly under the rig. A fault in a parent gate's timing shows by freezing the child gate it waits on, not the parent (GATE-480). A rig that reads the case folder opens its files with delete sharing, or it causes the case's `os error 32` on folder removal itself.
+The rig needs the case's gate.exe on this PC, but the launcher routes nextest to the builder: build once with `-Local -Reason "the rig needs this PC's gate.exe"` and `--no-run`, then run the suite binary directly under the rig. A fault in a parent gate's timing shows by freezing the child gate it waits on, not the parent (GATE-480). A rig that reads the case folder opens its files with delete sharing, or it causes the case's `os error 32` on folder removal itself.
 
 A builder run over plain ssh has only a pseudo-console, so a fault that needs a real console (as the box gives a routed command) never shows there. Start such a repro with `CREATE_NEW_CONSOLE`, or route it.
 
@@ -101,7 +101,7 @@ nextest's default profile ends a case after 15 periods of 60 s (`.config/nextest
 
 A heartbeat test's command sleeps (fake-tool `sleep`), never `wait`, whose 20 ms poll earns CPU ticks on its own.
 
-A measurement that needs a quiet machine (a timing comparison, a phase profile, a before-and-after) runs on `-Slot critical`, never by waiting for other sessions' load to drop. The critical gate drains every gate first, which can take tens of minutes behind a long heavy run, then holds the machine. Keep critical runs short and few, about 5 minutes of hold for one investigation, and ask the owner before going past that.
+A measurement that needs a quiet machine (a timing comparison, a phase profile, a before-and-after) runs on `-Slot critical -Reason "<why>"`, never by waiting for other sessions' load to drop. The critical gate drains every gate first, which can take tens of minutes behind a long heavy run, then holds the machine. Keep critical runs short and few, about 5 minutes of hold for one investigation, and ask the owner before going past that.
 
 To time the suite, add `--profile timing` to the nextest command. Its junit report, with every case's seconds, lands in `target\nextest\timing\junit.xml`. To count the git processes a case starts, set `GIT_TRACE2_EVENT=<a folder under target\tmp>` on the run. It costs almost nothing, where a WMI process tracer slows a case four times over.
 

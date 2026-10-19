@@ -86,6 +86,8 @@ pub enum JournalEvent {
         /// Why a gate that could have been routed was kept on this machine, such as `--local`; `None` writes no
         /// `notRouted` field.
         not_routed: Option<String>,
+        /// The free text the run gave `--reason`, written after `notRouted`; `None` writes no field.
+        reason: Option<String>,
     },
     /// The gate took its slot.
     Take {
@@ -403,10 +405,13 @@ pub fn journal_line(
 /// Inserts `event`'s own fields after the identity's.
 fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
     match event {
-        JournalEvent::Queue { log, not_routed } => {
+        JournalEvent::Queue { log, not_routed, reason } => {
             line.insert("log".to_owned(), Value::from(log.as_str()));
             if let Some(not_routed) = not_routed {
                 line.insert("notRouted".to_owned(), Value::from(not_routed.as_str()));
+            }
+            if let Some(reason) = reason {
+                line.insert("reason".to_owned(), Value::from(reason.as_str()));
             }
         }
         JournalEvent::Take {

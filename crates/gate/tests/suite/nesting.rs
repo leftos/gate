@@ -320,6 +320,8 @@ fn a_critical_gate_refused_through_the_powershell_form_names_its_flag_so() {
             "60",
             "-Slot",
             "critical",
+            "-Reason",
+            "the suite's critical run",
             TRUSTED,
             "--",
             FAKE_TOOL,
@@ -674,7 +676,11 @@ pub(crate) fn orphaned_as(case: &Case, outer_kind: &str, inner: &[&str], release
     let (pid_text, release_text) = (shown(&pid_file), shown(release));
     let mut command = vec![FAKE_TOOL, "spawn-pid", &pid_text, &release_text, GATE];
     command.extend(inner);
-    let mut words = heavy_words("outer.log", &[], &command);
+    let mut extra = Vec::new();
+    if outer_kind == "critical" {
+        extra.extend(["--reason", "the suite's outer critical gate"]);
+    }
+    let mut words = heavy_words("outer.log", &extra, &command);
     words[2] = outer_kind;
     let outer = case.start(&words);
     (outer, spawned(case, &pid_file))

@@ -294,6 +294,7 @@ impl<'a> Wait<'a> {
             lends_closed: false,
             alone: false,
             remote: pool.is_remote().then_some(true),
+            reason: request.reason.clone(),
             expected: expected.cloned(),
         };
         let waiter = Waiter::queue(root, arrival, &ticket, host, console);
@@ -972,6 +973,7 @@ pub(crate) mod scratch {
             no_markers: false,
             local: false,
             alone: false,
+            reason: None,
             bring_tracked: Vec::new(),
             env: Vec::new(),
             state_dir: None,
@@ -1005,6 +1007,7 @@ pub(crate) mod scratch {
             remote: None,
             host: None,
             key: None,
+            reason: None,
             expected,
         }
     }
@@ -1263,6 +1266,7 @@ mod tests {
             lends_closed: false,
             alone: false,
             remote: None,
+            reason: None,
             expected: None,
         }
     }

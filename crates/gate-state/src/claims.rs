@@ -76,6 +76,8 @@ pub(crate) struct Ticket {
     /// For a `gate.exe` ticket, what the durations store expected of the gate's run as it queued; `None` for a ticket
     /// without one and for a PowerShell ticket, which never carries it.
     pub expected: Option<Map<String, Value>>,
+    /// The free text the gate gave `--reason`; `None` for a PowerShell ticket, which never carries it.
+    pub reason: Option<String>,
 }
 
 /// The claim files of the slots and of the critical gate in `dir`, keyed by mutex name in lower case: the files named
@@ -168,6 +170,7 @@ pub(crate) fn read_ticket(path: &Path) -> Option<Ticket> {
         remote: object.get("remote").and_then(Value::as_bool).unwrap_or(false),
         exact_start_ms: None,
         expected: None,
+        reason: None,
     })
 }
 

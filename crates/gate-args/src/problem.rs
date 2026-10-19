@@ -125,6 +125,15 @@ pub enum Problem {
     },
     /// `--alone` given with a slot other than critical, in the caller's spelling.
     AloneNeedsCritical(Spelling),
+    /// A run that must state its reason (`local`, `slot critical`, or both) and gave no `--reason`, in the caller's
+    /// spelling.
+    ReasonNeeded {
+        local: bool,
+        critical: bool,
+        spelling: Spelling,
+    },
+    /// A `--reason` whose text is empty or whitespace only, named as the caller spelled it.
+    EmptyReason(String),
     /// Two test seams that each choose the remote client, given together.
     SeamsConflict {
         option: &'static str,
@@ -211,6 +220,16 @@ impl fmt::Display for Problem {
             Problem::SeamNeeds { option, needs } => write!(f, "gate: {option} needs {needs}"),
             Problem::AloneNeedsCritical(Spelling::Cli) => f.write_str("gate: --alone needs --slot critical"),
             Problem::AloneNeedsCritical(Spelling::Compat) => f.write_str("gate: -Alone needs -Slot critical"),
+            Problem::ReasonNeeded { local, critical, spelling } => f.write_str(match (local, critical, spelling) {
+                (true, false, Spelling::Cli) => "gate: --local needs --reason \"<why>\"",
+                (false, true, Spelling::Cli) => "gate: --slot critical needs --reason \"<why>\"",
+                (true, true, Spelling::Cli) => "gate: --local and --slot critical need --reason \"<why>\"",
+                (true, false, Spelling::Compat) => "gate: -Local needs -Reason \"<why>\"",
+                (false, true, Spelling::Compat) => "gate: -Slot critical needs -Reason \"<why>\"",
+                (true, true, Spelling::Compat) => "gate: -Local and -Slot critical need -Reason \"<why>\"",
+                (false, false, _) => unreachable!("a run that needs no reason is given no ReasonNeeded problem"),
+            }),
+            Problem::EmptyReason(option) => write!(f, "gate: {option} must not be empty"),
             Problem::SeamsConflict { option, other } => write!(f, "gate: {option} cannot be given with {other}"),
             #[cfg(feature = "test-seams")]
             Problem::SeamNotUsedWith { option, with } => write!(f, "gate: {option} is not used with {with}"),

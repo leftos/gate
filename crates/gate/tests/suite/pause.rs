@@ -333,6 +333,7 @@ fn a_pause_marker_is_deleted_when_the_child_is_lent_its_parents_slot() {
         lends_closed: false,
         alone: false,
         remote: None,
+        reason: None,
         expected: None,
     };
     let ticket = v1::ticket_path(&case.root(), process::id(), start_ms);
@@ -531,6 +532,7 @@ fn a_covered_gate_is_not_paused_by_a_sibling_waiting_under_its_parent() {
         lends_closed: false,
         alone: false,
         remote: None,
+        reason: None,
         expected: None,
     };
     v1::write_ticket(&v1::ticket_path(&case.root(), sibling.0, sibling.1), &ticket).expect("the ticket can be written");

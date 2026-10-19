@@ -45,6 +45,7 @@ fn claim() -> Claim {
         remote: None,
         host: None,
         key: None,
+        reason: None,
         expected: None,
     }
 }
@@ -60,6 +61,7 @@ fn ticket(pid: u32, arrived: u64) -> Ticket {
         lends_closed: false,
         alone: false,
         remote: None,
+        reason: None,
         expected: None,
     }
 }
@@ -670,6 +672,38 @@ fn a_written_ticket_reads_back_equal_and_omits_remote_when_local() {
     let text = fs::read_to_string(&path).expect("the remote ticket is there");
     assert!(text.ends_with(r#""holds":false,"remote":true}"#), "{text}");
     assert_eq!(v1::read_ticket(&path).expect("the written remote ticket reads"), remote);
+}
+
+#[test]
+fn a_reason_is_written_before_expected_and_reads_back() {
+    let dir = scratch("reason");
+    let expected = json!({"p50": 1.0}).as_object().cloned().expect("expected is an object");
+    let claim_with = Claim {
+        reason: Some("why".to_owned()),
+        expected: Some(expected.clone()),
+        ..claim()
+    };
+    let claim_path = v1::claim_path(&dir, KernelObject::HeavySlot(0)).expect("a heavy slot has a claim");
+    v1::write_claim(&claim_path, &claim_with).expect("the claim is written");
+    let text = fs::read_to_string(&claim_path).expect("the claim is there");
+    assert!(text.ends_with(r#","reason":"why","expected":{"p50":1.0}}"#), "{text}");
+    assert_eq!(v1::read_claim(&claim_path).expect("the written claim reads"), claim_with);
+
+    let ticket_with = Ticket {
+        reason: Some("why".to_owned()),
+        expected: Some(expected),
+        ..ticket(60080, 1)
+    };
+    let ticket_path = v1::ticket_path(&dir, ticket_with.pid, ticket_with.start_ms);
+    v1::write_ticket(&ticket_path, &ticket_with).expect("the ticket is written");
+    let text = fs::read_to_string(&ticket_path).expect("the ticket is there");
+    assert!(text.ends_with(r#""reason":"why","expected":{"p50":1.0}}"#), "{text}");
+    assert_eq!(v1::read_ticket(&ticket_path).expect("the written ticket reads"), ticket_with);
+
+    v1::write_claim(&claim_path, &claim()).expect("the claim without one is written");
+    assert!(!fs::read_to_string(&claim_path).expect("the claim is there").contains("reason"));
+    v1::write_ticket(&ticket_path, &ticket(60080, 1)).expect("the ticket without one is written");
+    assert!(!fs::read_to_string(&ticket_path).expect("the ticket is there").contains("reason"));
 }
 
 #[test]

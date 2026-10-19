@@ -64,6 +64,7 @@ fn print_request_shows_the_new_cli_request() {
         "tail": 20,
         "noMarkers": false,
         "local": false,
+        "reason": null,
         "bringTracked": [],
         "env": [],
         "cd": null,
@@ -95,6 +96,15 @@ fn print_request_shows_slot_none() {
     words[2] = "none";
 
     assert_eq!(case.run(&words).request()["slot"], "none");
+}
+
+#[test]
+fn print_request_shows_the_reason_as_given() {
+    let case = Case::new("print_request_shows_the_reason_as_given");
+    let mut words = print_run(&["cmd"]);
+    words.splice(7..7, ["--reason", "why"]);
+
+    assert_eq!(case.run(&words).request()["reason"], "why");
 }
 
 #[test]

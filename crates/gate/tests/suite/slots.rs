@@ -273,6 +273,7 @@ fn a_holder_whose_ticket_was_not_deleted_does_not_block_the_queue() {
         lends_closed: false,
         alone: false,
         remote: None,
+        reason: None,
         expected: None,
     };
     write_ticket(&ticket_path(&case.root(), claim.pid, start_ms), &ticket).expect("the holder's ticket can be written back");
@@ -312,6 +313,7 @@ fn a_waiter_deferring_to_a_gate_that_took_its_slot_does_not_say_it_waits() {
         lends_closed: false,
         alone: false,
         remote: None,
+        reason: None,
         expected: None,
     };
     let taker = ticket_path(&case.root(), pid, start_ms);

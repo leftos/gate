@@ -348,6 +348,8 @@ fn the_parent_job_seam_is_a_switch_given_once_in_either_form() {
         "5",
         "-Slot",
         "critical",
+        "-Reason",
+        "a seam test",
         "--test-parent-job-trusted",
         "--",
         "cmd",

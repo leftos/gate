@@ -214,6 +214,7 @@ fn a_routed_queue_line_ends_with_the_remote_fields_as_the_fixture_does() {
     let queue = JournalEvent::Queue {
         log: r"C:\work\repo\.tmp\remote-ok.log".to_owned(),
         not_routed: None,
+        reason: None,
     };
     let line = journal_line(&identity(), ts(NOW), &queue, Some(&tag()), None);
 
@@ -226,6 +227,7 @@ fn a_queue_kept_local_writes_not_routed_after_the_log() {
     let queue = JournalEvent::Queue {
         log: r"C:\work\repo\.tmp\local.log".to_owned(),
         not_routed: Some("--local".to_owned()),
+        reason: None,
     };
     let line = journal_line(&identity(), ts(NOW), &queue, None, None);
 
@@ -234,6 +236,26 @@ fn a_queue_kept_local_writes_not_routed_after_the_log() {
     let mut fields = own_fields(&line);
     fields.retain(|(key, _)| key != "notRouted");
     assert_eq!(fields, own_fields(remote_fixture(37)), "otherwise the fixture's local queue line");
+}
+
+#[test]
+fn a_queue_with_a_reason_writes_it_after_not_routed() {
+    let queue = JournalEvent::Queue {
+        log: "x".to_owned(),
+        not_routed: Some("--local".to_owned()),
+        reason: Some("checking routing".to_owned()),
+    };
+    let line = journal_line(&identity(), ts(NOW), &queue, None, None);
+
+    assert_eq!(own_keys(&line), ["log", "notRouted", "reason"]);
+    assert_eq!(parsed(&line)["reason"], "checking routing");
+
+    let without = JournalEvent::Queue {
+        log: "x".to_owned(),
+        not_routed: None,
+        reason: Some("checking routing".to_owned()),
+    };
+    assert_eq!(own_keys(&journal_line(&identity(), ts(NOW), &without, None, None)), ["log", "reason"]);
 }
 
 #[test]
@@ -440,6 +462,7 @@ fn a_line_without_a_remote_tag_has_no_remote_field() {
         JournalEvent::Queue {
             log: "x".to_owned(),
             not_routed: None,
+            reason: None,
         },
         JournalEvent::Take {
             slots: Vec::new(),
@@ -479,6 +502,7 @@ fn line_starts_with_v_then_the_common_keys_in_order() {
         &JournalEvent::Queue {
             log: r"C:\work\repo\.tmp\f1.log".to_owned(),
             not_routed: None,
+            reason: None,
         },
         None,
         None,
@@ -566,6 +590,7 @@ fn time_has_seven_fractional_digits_and_z() {
         &JournalEvent::Queue {
             log: "x".to_owned(),
             not_routed: None,
+            reason: None,
         },
         None,
         None,
@@ -581,6 +606,7 @@ fn time_has_seven_fractional_digits_and_z() {
         &JournalEvent::Queue {
             log: "x".to_owned(),
             not_routed: None,
+            reason: None,
         },
         None,
         None,
@@ -925,6 +951,7 @@ fn journal_line_lists_the_lock_on_a_queue_line() {
         &JournalEvent::Queue {
             log: "x".to_owned(),
             not_routed: None,
+            reason: None,
         },
         None,
         Some(r"Local\gate-test-journal"),
@@ -969,6 +996,7 @@ fn a_line_appended_under_an_abandoned_journal_lock_lists_the_lock() {
                 &JournalEvent::Queue {
                     log: "x".to_owned(),
                     not_routed: None,
+                    reason: None,
                 },
                 None,
                 abandoned,

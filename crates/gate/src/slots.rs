@@ -755,12 +755,14 @@ pub(crate) fn listed_tickets(root: &Path, own: (u32, u64)) -> io::Result<Vec<Lis
 }
 
 /// Whose claim a slot holds: the gate, its ceiling in whole seconds as the run resolved it, its log, the remote tag of a
-/// routed run's remote slot, and what the durations store expects of the run, `None` without history.
+/// routed run's remote slot, the free text the run gave `--reason`, and what the durations store expects of the run,
+/// `None` without history.
 pub(crate) struct ClaimOf<'a> {
     pub gate: &'a ThisGate,
     pub ceiling: u64,
     pub log: &'a Path,
     pub remote: Option<&'a RemoteTag>,
+    pub reason: Option<&'a str>,
     pub expected: Option<&'a Map<String, Value>>,
 }
 
@@ -782,6 +784,7 @@ fn claim_of(kind: ClaimKind, index: u32, of: &ClaimOf<'_>) -> io::Result<Claim> 
         ceiling,
         log,
         remote,
+        reason,
         expected,
     } = *of;
     Ok(Claim {
@@ -797,6 +800,7 @@ fn claim_of(kind: ClaimKind, index: u32, of: &ClaimOf<'_>) -> io::Result<Claim> 
         remote: remote.map(|_| true),
         host: remote.map(|tag| tag.host.clone()),
         key: remote.map(|tag| tag.key.clone()),
+        reason: reason.map(str::to_owned),
         expected: expected.cloned(),
     })
 }

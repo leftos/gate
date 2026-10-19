@@ -2010,6 +2010,9 @@ fn inner_gate(case: &Case, name: &str, slot: &str, timeout: &str, command: &[Str
     words.push(shown(&folder.join(format!("{name}-state"))));
     words.extend(["--slot", slot, "--timeout", timeout, "--log"].map(str::to_owned));
     words.push(shown(&folder.join(format!("{name}.log"))));
+    if slot == "critical" {
+        words.extend(["--reason", "the box's inner critical run"].map(str::to_owned));
+    }
     words.push("--".to_owned());
     words.extend_from_slice(command);
     words
