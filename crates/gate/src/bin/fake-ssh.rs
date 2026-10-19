@@ -10,8 +10,8 @@
 //! with no step taken. Started with `--version` alone, as a push case starts a copy of it standing in for a builder's
 //! old gate, it says `gate 0.0.0-old` and exits 0.
 //!
-//! `ok` runs `<gate> box <verb> --stdin` with the gate the variable `GATE_FAKE_SSH_GATE` names, a `run` call given
-//! the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`, when set, before its verb as box seams, and a `preflight` call
+//! `ok` runs `<gate> box <verb> --stdin` with the gate the variable `GATE_FAKE_SSH_GATE` names, a `run` or `lfs` call
+//! given the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`, when set, before its verb as box seams, and a `preflight` call
 //! those of `GATE_FAKE_SSH_PREFLIGHT_SEAMS` the same way, or `git
 //! upload-pack <path>` or `git receive-pack <path>`, or a push call's words with this PC's `pwsh`, its `LOCALAPPDATA`
 //! the folder named as the host, the word before the line, in the folder the variable `GATE_FAKE_SSH_BUILDERS` names,
@@ -256,7 +256,7 @@ fn variable(name: &str) -> Result<String, String> {
 }
 
 /// The box seams a call's gate is given before its verb: the words of the variable `name`, `GATE_FAKE_SSH_BOX_SEAMS`
-/// for a `run` call and `GATE_FAKE_SSH_PREFLIGHT_SEAMS` for a preflight, none when it is unset.
+/// for a `run` or `lfs` call and `GATE_FAKE_SSH_PREFLIGHT_SEAMS` for a preflight, none when it is unset.
 fn seams_of(name: &str) -> Result<String, String> {
     match std::env::var(name) {
         Err(std::env::VarError::NotPresent) => Ok(String::new()),
@@ -432,7 +432,7 @@ impl<'a> BoxCall<'a> {
         let mut command = Command::new(variable("GATE_FAKE_SSH_GATE")?);
         command.arg("box");
         let seams = match self.verb {
-            "run" => Some("GATE_FAKE_SSH_BOX_SEAMS"),
+            "run" | "lfs" => Some("GATE_FAKE_SSH_BOX_SEAMS"),
             "preflight" => Some("GATE_FAKE_SSH_PREFLIGHT_SEAMS"),
             _ => None,
         };

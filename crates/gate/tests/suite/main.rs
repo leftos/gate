@@ -31,6 +31,7 @@ mod pause;
 mod push;
 mod remote_client;
 mod remote_inputs;
+mod remote_lfs;
 mod request;
 mod routing;
 mod slots;

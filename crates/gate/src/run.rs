@@ -2839,6 +2839,7 @@ fn split_said(split: Split) -> String {
     let seconds = |part: Duration| whole_seconds(part.as_secs_f64());
     let mut parts = vec![format!("command {} s", seconds(split.command)), format!("push {} s", seconds(split.push))];
     parts.extend(split.inputs.map(|part| format!("inputs {} s", seconds(part))));
+    parts.extend(split.lfs.map(|part| format!("lfs {} s", seconds(part))));
     parts.extend(split.sync_back.map(|part| format!("sync-back {} s", seconds(part))));
     parts.extend(split.outputs.map(|part| format!("outputs {} s", seconds(part))));
     parts.join(", ")
@@ -3647,6 +3648,7 @@ mod tests {
             command: Duration::from_millis(76_400),
             push: 224 * second,
             inputs: None,
+            lfs: None,
             sync_back: None,
             outputs: None,
         };
@@ -3665,6 +3667,17 @@ mod tests {
                 },
                 Some(70.4),
                 "gate: passed in 301 s on builder (load-adjusted 70 s, ceiling 300 s; command 76 s, push 224 s, outputs 2 s). Full output: out.log",
+            ),
+            (
+                "the inputs and the LFS content sent, in the order they ran",
+                Split {
+                    inputs: Some(2 * second),
+                    lfs: Some(Duration::from_millis(4_400)),
+                    ..pushed
+                },
+                Some(70.4),
+                "gate: passed in 301 s on builder (load-adjusted 70 s, ceiling 300 s; command 76 s, push 224 s, inputs 2 s, lfs 4 s). \
+                 Full output: out.log",
             ),
             (
                 "the sync-back and the outputs fetched, in the order they ran",

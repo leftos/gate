@@ -62,7 +62,9 @@ The engine is not in the worktree and not on the builder's `PATH`: the builder h
 - **The routed command is a tracked wrapper script.** It builds absolute `-project=` and `-archivedirectory=` paths itself, because `RunUAT.bat` `pushd`es into the engine and the router sends worktree paths as relative ones. It reads the engine from `UE_ROOT`, with its own fallback for the PC, where nothing sets it.
 - **The archive** goes to a gitignored folder outside `.tmp/`, named in the repo's `outputs`, because outputs never come back from `.tmp/`.
 - **What stays local:** commandlets that write into ignored content, a packaged-game run that needs a GPU when the builder has none, and the editor.
-- **Git LFS.** A tracked project with LFS assets needs GATE-469 (`docs/plans/remote-lfs.md`), which is not built yet.
+- **Git LFS.** A repo with LFS-tracked files routes with them: the PC sends the objects the snapshot's pointers name to the builder's per-repo LFS store, and the box checks them out with no download.
+
+  The builder needs git-lfs 3.1.3 or later whenever a tracked `.gitattributes` names the LFS filter (a builder without it keeps the run here, `parity`), and the PC must hold the objects: run `git lfs fetch` first, else the run falls back `lfs` with a log line naming the missing object. See [design.md, Routing](design.md#routing) (Git LFS).
 
 ## Taking a builder out for maintenance
 

@@ -21,7 +21,7 @@ use crate::remote::git::{FAILURE_BYTES, first_bytes};
 use crate::remote::parity::{Need, NeedKind, number};
 
 /// The tool names the manifest knows, as its `[tools]` keys spell them.
-pub(crate) const KNOWN_TOOLS: [&str; 8] = ["rust", "cargo-nextest", "node", "pnpm", "pwsh", "godot", "ffmpeg", "unreal"];
+pub(crate) const KNOWN_TOOLS: [&str; 9] = ["rust", "cargo-nextest", "node", "pnpm", "pwsh", "godot", "ffmpeg", "unreal", "git-lfs"];
 
 /// A tool whose manifest entry pins an exact version rather than a minimum, as its key spells it; its project files
 /// may pin one too.
@@ -661,26 +661,7 @@ pub(crate) fn judge(
                     .push(format!("gate: {} names unknown tool {name}; skipping it", escaped(file)));
                 continue;
             }
-            if !sent.contains(&tool.name) {
-                continue;
-            }
-            let answer = reported.iter().find(|(name, _)| *name == tool.name).map(|(_, answer)| answer);
-            let why = match answer.map(|answer| standing(tool.min, answer)) {
-                Some(Standing::Met) => continue,
-                Some(Standing::TooOld(found)) => {
-                    judged.needs.push(lacking(tool, shown(&found)));
-                    continue;
-                }
-                Some(Standing::Missing) => {
-                    judged.needs.push(lacking(tool, "none".to_owned()));
-                    continue;
-                }
-                None => NO_ANSWER.to_owned(),
-                Some(Standing::NotReadable) => NOT_READABLE.to_owned(),
-                Some(Standing::Skipped(why)) => shown(&why),
-            };
-            let name = one_line(&tool.name);
-            judged.skips.push(format!("gate: {host} did not probe {name}: {why}; not checking it"));
+            judge_tool(&mut judged, tool, sent, reported, host);
         }
     }
     for (name, pins) in exact {
@@ -689,6 +670,100 @@ pub(crate) fn judge(
         }
     }
     judged
+}
+
+/// Adds to `judged` what the builder `host` lacks of the tool `tool`, as the preflight `reported` of it: a need when it
+/// is missing or too old, or a skip line when its probe did not answer; nothing for a tool not `sent`.
+fn judge_tool(judged: &mut Judged, tool: &ToolNeed, sent: &[String], reported: &[(String, Reported)], host: &str) {
+    if !sent.contains(&tool.name) {
+        return;
+    }
+    let answer = reported.iter().find(|(name, _)| *name == tool.name).map(|(_, answer)| answer);
+    let why = match answer.map(|answer| standing(tool.min, answer)) {
+        Some(Standing::Met) => return,
+        Some(Standing::TooOld(found)) => {
+            judged.needs.push(lacking(tool, shown(&found)));
+            return;
+        }
+        Some(Standing::Missing) => {
+            judged.needs.push(lacking(tool, "none".to_owned()));
+            return;
+        }
+        None => NO_ANSWER.to_owned(),
+        Some(Standing::NotReadable) => NOT_READABLE.to_owned(),
+        Some(Standing::Skipped(why)) => shown(&why),
+    };
+    let name = one_line(&tool.name);
+    judged.skips.push(format!("gate: {host} did not probe {name}: {why}; not checking it"));
+}
+
+/// The tool a snapshot holding Git LFS pointers needs on the builder, at [`GIT_LFS_MIN`] or later.
+const GIT_LFS: &str = "git-lfs";
+/// The oldest git-lfs a run with LFS pointers takes: one older counts as missing.
+const GIT_LFS_MIN: Version = Version {
+    major: 3,
+    minor: 1,
+    patch: 3,
+};
+
+/// git-lfs at [`GIT_LFS_MIN`] or later, as a need of a snapshot holding LFS pointers.
+fn git_lfs_need() -> ToolNeed {
+    ToolNeed {
+        name: GIT_LFS.to_owned(),
+        min: Some(GIT_LFS_MIN),
+        known: true,
+    }
+}
+
+/// The minimum a run with LFS pointers weighs git-lfs at: the higher of [`GIT_LFS_MIN`] and `declared`, the manifest's
+/// own minimum, `None` for an entry naming no version.
+fn git_lfs_floor(declared: Option<Version>) -> Version {
+    declared.map_or(GIT_LFS_MIN, |min| min.max(GIT_LFS_MIN))
+}
+
+/// Adds a `git-lfs` need of [`GIT_LFS_MIN`] or later to the preflight's `needs` of a run whose snapshot holds LFS
+/// pointers or whose repo's attributes name the LFS filter; a git-lfs they name already is raised to it when its version is lower, or names none.
+pub(crate) fn with_git_lfs(needs: &mut Vec<(String, String)>) {
+    match needs.iter_mut().find(|(name, _)| name == GIT_LFS) {
+        Some((_, version)) => *version = git_lfs_floor(Version::parse(version)).to_string(),
+        None => needs.push((GIT_LFS.to_owned(), GIT_LFS_MIN.to_string())),
+    }
+}
+
+/// What the builder `host` lacks for a run whose snapshot holds LFS pointers or whose repo's attributes name the LFS
+/// filter, as [`judge`] weighs `manifest` and the Godot versions `godot`, with git-lfs weighed at [`GIT_LFS_MIN`] or
+/// later, or the manifest's own minimum when higher ([`add_git_lfs`]), once. A manifest that cannot be read has git-lfs
+/// weighed at [`GIT_LFS_MIN`] besides its skip line.
+pub(crate) fn judge_with_git_lfs(
+    manifest: Option<(&Result<Manifest, String>, &str)>,
+    godot: Option<&[Pin]>,
+    sent: &[String],
+    reported: &[(String, Reported)],
+    host: &str,
+) -> Judged {
+    let file = manifest.map_or(MANIFEST_SAID, |(_, file)| file);
+    let floored = match manifest.map(|(read, _)| read) {
+        Some(Ok(read)) => {
+            let mut read = read.clone();
+            add_git_lfs(&mut read);
+            Some(Ok(read))
+        }
+        other => other.cloned(),
+    };
+    let mut judged = judge(floored.as_ref().map(|read| (read, file)), godot, sent, reported, host);
+    if readable(floored.as_ref()).is_none() {
+        judge_tool(&mut judged, &git_lfs_need(), sent, reported, host);
+    }
+    judged
+}
+
+/// Adds git-lfs, [`GIT_LFS_MIN`] or later, to `manifest`'s tools, for a repo whose attributes name the LFS filter; a
+/// git-lfs it declares already is weighed at the higher of its own minimum and [`GIT_LFS_MIN`].
+pub(crate) fn add_git_lfs(manifest: &mut Manifest) {
+    match manifest.tools.iter_mut().find(|tool| tool.name == GIT_LFS) {
+        Some(tool) => tool.min = Some(git_lfs_floor(tool.min)),
+        None => manifest.tools.push(git_lfs_need()),
+    }
 }
 
 /// Adds to `judged` what the builder `host` lacks of the versions `pins` a repo requires exactly of the tool `name`, as
@@ -1053,10 +1128,11 @@ fn attributes(text: &str) -> Vec<(&str, &str)> {
 #[expect(clippy::expect_used, reason = "a fixture that does not read must fail loudly")]
 mod tests {
     use super::{
-        Exact, GodotChoice, Judged, MANIFEST_SAID, Manifest, NoChosenGodot, Pin, Pinned, Reported, Standing, ToolNeed, Version, dotnet_tools,
-        engine_env, godot_choice, godot_not_listed_line, godot_pins_read, godot_required, godot_sdk_pins, is_sent, judge, meets, needs_of,
-        newest_godot, no_chosen_godot, no_godot_install_line, no_pin_godot_warning, pinned, read, read_bytes, reported, reported_as, routed_needs,
-        several_godot_line, skip_line, standing, unreadable_godot_pins_line, unreadable_line, unreal_choice,
+        Exact, GodotChoice, Judged, MANIFEST_SAID, Manifest, NoChosenGodot, Pin, Pinned, Reported, Standing, ToolNeed, Version, add_git_lfs,
+        dotnet_tools, engine_env, godot_choice, godot_not_listed_line, godot_pins_read, godot_required, godot_sdk_pins, is_sent, judge,
+        judge_with_git_lfs, meets, needs_of, newest_godot, no_chosen_godot, no_godot_install_line, no_pin_godot_warning, pinned, read, read_bytes,
+        reported, reported_as, routed_needs, several_godot_line, skip_line, standing, unreadable_godot_pins_line, unreadable_line, unreal_choice,
+        with_git_lfs,
     };
     use crate::remote::git::FAILURE_BYTES;
     use crate::remote::parity::{Need, NeedKind};
@@ -2043,6 +2119,78 @@ mod tests {
                 needs: vec![lacks("unreal 5.8 exactly", "none")],
                 skips: Vec::new(),
             }
+        );
+    }
+
+    #[test]
+    fn a_run_with_lfs_pointers_needs_git_lfs_3_1_3_or_later_once() {
+        let mut needs = vec![("node".to_owned(), "24.0.0".to_owned())];
+        with_git_lfs(&mut needs);
+        with_git_lfs(&mut needs);
+        assert_eq!(
+            needs,
+            [("node".to_owned(), "24.0.0".to_owned()), ("git-lfs".to_owned(), "3.1.3".to_owned())]
+        );
+        let sent = owned(&["git-lfs"]);
+        let judged_with = |manifest: Option<(&Result<Manifest, String>, &str)>, answer: Reported| {
+            judge_with_git_lfs(manifest, None, &sent, &[("git-lfs".to_owned(), answer)], "builder")
+        };
+
+        let missing = judged_with(None, Reported::Missing);
+        let met = judged_with(None, Reported::Version("3.8.0".to_owned()));
+
+        assert_eq!(missing.needs.len(), 1, "{missing:?}");
+        assert!(missing.needs[0].text.contains("git-lfs"), "{missing:?}");
+        assert_eq!(met, Judged::default());
+        let oldest = judged_with(None, Reported::Version("3.1.3".to_owned()));
+        let older = judged_with(None, Reported::Version("3.1.2".to_owned()));
+        assert_eq!(oldest, Judged::default(), "3.1.3 is taken");
+        assert_eq!(older.needs, [lacks("git-lfs 3.1.3 or later", "3.1.2")], "3.1.2 counts as missing");
+        let mut read = manifest("[tools]\nnode = \"24\"\n");
+        add_git_lfs(&mut read);
+        add_git_lfs(&mut read);
+        assert_eq!(needs_of(&read), needs, "the check sends what the run sends");
+    }
+
+    /// A manifest's own git-lfs entry is weighed at the higher of its minimum and 3.1.3, in the need sent, in the
+    /// judgement and in the check, once.
+    #[test]
+    fn a_declared_git_lfs_is_weighed_at_3_1_3_or_its_own_minimum_if_higher() {
+        let sent = owned(&["git-lfs"]);
+        let declared = |text: &str| Ok(manifest(&format!("[tools]\ngit-lfs = \"{text}\"\n")));
+        let judged_with = |manifest: &Result<Manifest, String>, found: &str| {
+            judge_with_git_lfs(
+                Some((manifest, MANIFEST_SAID)),
+                None,
+                &sent,
+                &[("git-lfs".to_owned(), Reported::Version(found.to_owned()))],
+                "builder",
+            )
+        };
+
+        assert_eq!(judged_with(&declared("3"), "3.0.2").needs, [lacks("git-lfs 3.1.3 or later", "3.0.2")]);
+        assert_eq!(judged_with(&declared("3"), "3.1.3"), Judged::default(), "3.1.3 routes");
+        assert_eq!(judged_with(&declared(""), "3.0.2").needs, [lacks("git-lfs 3.1.3 or later", "3.0.2")]);
+        assert_eq!(judged_with(&declared("3.5"), "3.4.0").needs, [lacks("git-lfs 3.5.0 or later", "3.4.0")]);
+        let missing = judge_with_git_lfs(
+            Some((&declared("3"), MANIFEST_SAID)),
+            None,
+            &sent,
+            &[("git-lfs".to_owned(), Reported::Missing)],
+            "builder",
+        );
+        assert_eq!(missing.needs, [lacks("git-lfs 3.1.3 or later", "none")], "one need");
+        for (text, wanted) in [("3.0.0", "3.1.3"), ("", "3.1.3"), ("4.0.0", "4.0.0")] {
+            let mut needs = vec![("git-lfs".to_owned(), text.to_owned())];
+            with_git_lfs(&mut needs);
+            assert_eq!(needs, [("git-lfs".to_owned(), wanted.to_owned())], "{text}");
+        }
+        let mut read = manifest("[tools]\ngit-lfs = \"3\"\n");
+        add_git_lfs(&mut read);
+        assert_eq!(
+            needs_of(&read),
+            [("git-lfs".to_owned(), "3.1.3".to_owned())],
+            "the check weighs it so too"
         );
     }
 

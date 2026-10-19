@@ -209,11 +209,24 @@ impl Payload {
     /// with: 64 lower-case hex digits; `None` when the key is absent or null. Else the usage line, the value shown with
     /// its control characters escaped.
     pub(crate) fn inputs_digest(&self) -> Result<Option<&str>, String> {
-        match self.0.get("InputsDigest") {
+        self.digest("InputsDigest")
+    }
+
+    /// The run's `LfsDigest`, the SHA-256 of the LFS manifest line of the objects the snapshot's pointers name, without
+    /// its newline: 64 lower-case hex digits; `None` when the key is absent or null. Else the usage line, as
+    /// [`Payload::inputs_digest`] gives it.
+    pub(crate) fn lfs_digest(&self) -> Result<Option<&str>, String> {
+        self.digest("LfsDigest")
+    }
+
+    /// The SHA-256 under the key `key`: 64 lower-case hex digits; `None` when the key is absent or null. Else the usage
+    /// line, the value shown with its control characters escaped.
+    fn digest(&self, key: &str) -> Result<Option<&str>, String> {
+        match self.0.get(key) {
             None | Some(Value::Null) => Ok(None),
             Some(Value::String(digest)) if is_lower_hex(digest, SHA256_DIGITS) => Ok(Some(digest)),
             Some(other) => Err(format!(
-                "gate: box payload InputsDigest is not 64 lower-case hex digits: {}",
+                "gate: box payload {key} is not 64 lower-case hex digits: {}",
                 escaped(&other.as_str().map_or_else(|| other.to_string(), str::to_owned))
             )),
         }
@@ -803,6 +816,29 @@ mod tests {
                 godot_version_of(version),
                 Err(format!("gate: box payload GodotVersion is not a version: '{version}'")),
                 "{version}"
+            );
+        }
+    }
+
+    /// `LfsDigest` is 64 lower-case hex digits, as `InputsDigest` is; absent or null is none.
+    #[test]
+    fn an_lfs_digest_is_64_lower_case_hex_digits() {
+        let lfs_digest_of = |value: serde_json::Value| {
+            decoded(&json!({ "LfsDigest": value }).to_string()).and_then(|payload| payload.lfs_digest().map(|read| read.map(str::to_owned)))
+        };
+        let good = "0a".repeat(32);
+        assert_eq!(lfs_digest_of(json!(good)), Ok(Some(good.clone())));
+        assert_eq!(lfs_digest_of(serde_json::Value::Null), Ok(None), "null is none");
+        assert_eq!(
+            decoded("{}").and_then(|payload| payload.lfs_digest().map(|read| read.map(str::to_owned))),
+            Ok(None)
+        );
+        for bad in [json!(good.to_uppercase()), json!(&good[..63]), json!(format!("{good}0")), json!(12)] {
+            let shown = bad.as_str().map_or_else(|| bad.to_string(), str::to_owned);
+            assert_eq!(
+                lfs_digest_of(bad),
+                Err(format!("gate: box payload LfsDigest is not 64 lower-case hex digits: {shown}")),
+                "{shown}"
             );
         }
     }

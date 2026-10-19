@@ -453,7 +453,7 @@ fn the_remote_client_seams_need_a_value_once() {
         ))),
         ["gate: --test-remote-bound-ms must be a whole number above 0, got '0'"]
     );
-    for call in ["preflight", "run", "outputs", "install", "sdks", "stop", "manifest", "apply"] {
+    for call in ["preflight", "lfs", "run", "outputs", "install", "sdks", "stop", "manifest", "apply"] {
         let words = with(
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-interrupt-at", call, "--", "cmd"],
@@ -465,7 +465,7 @@ fn the_remote_client_seams_need_a_value_once() {
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-interrupt-at", "push", "--", "cmd"]
         ))),
-        ["gate: --test-remote-interrupt-at must be preflight, inputs, run, outputs, install, sdks, stop, manifest or apply, got 'push'"]
+        ["gate: --test-remote-interrupt-at must be preflight, inputs, lfs, run, outputs, install, sdks, stop, manifest or apply, got 'push'"]
     );
 }
 
@@ -474,7 +474,18 @@ fn the_remote_client_seams_need_a_value_once() {
 fn the_remote_watch_seams_name_one_call_and_a_ceiling() {
     use crate::support::run_request;
 
-    for call in ["preflight", "push", "inputs-diff", "inputs", "run", "ls-remote", "fetch", "outputs"] {
+    for call in [
+        "preflight",
+        "push",
+        "inputs-diff",
+        "inputs",
+        "lfs-diff",
+        "lfs",
+        "run",
+        "ls-remote",
+        "fetch",
+        "outputs",
+    ] {
         let words = with(
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-watch-call", call, "--", "cmd"],
@@ -486,7 +497,7 @@ fn the_remote_watch_seams_name_one_call_and_a_ceiling() {
             &RUN,
             &["--test-remote-transport", "local:b", "--test-remote-watch-call", "stop", "--", "cmd"]
         ))),
-        ["gate: --test-remote-watch-call must be preflight, push, inputs-diff, inputs, run, ls-remote, fetch or outputs, got 'stop'"]
+        ["gate: --test-remote-watch-call must be preflight, push, inputs-diff, inputs, lfs-diff, lfs, run, ls-remote, fetch or outputs, got 'stop'"]
     );
     let words = with(
         &RUN,
@@ -787,7 +798,7 @@ fn the_remote_timeout_seam_needs_a_watched_call_other_than_run() {
     }
     assert_eq!(
         problems(&refs(&given(&["--test-remote-watch-call", "stop", "--test-remote-timeout-ms", "300"]))),
-        ["gate: --test-remote-watch-call must be preflight, push, inputs-diff, inputs, run, ls-remote, fetch or outputs, got 'stop'"],
+        ["gate: --test-remote-watch-call must be preflight, push, inputs-diff, inputs, lfs-diff, lfs, run, ls-remote, fetch or outputs, got 'stop'"],
         "a refused watched call says its own problem alone"
     );
     let fetch = run_request(&refs(&given(&["--test-remote-watch-call", "fetch", "--test-remote-timeout-ms", "300"])));
@@ -909,7 +920,7 @@ fn the_bridge_seams_are_unknown_options() {
 }
 
 /// The one line a malformed `gate box` prints.
-const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs --stdin (the base64 JSON request as stdin's first line)";
+const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)";
 
 #[cfg(feature = "test-seams")]
 #[test]

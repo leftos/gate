@@ -45,7 +45,8 @@ use super::git::{self, Git, GitError, NO_CURRENT_FOLDER, last_update};
 use super::held::{Held, sibling_who};
 use super::inputs;
 use super::launch::{DRAIN, KILL_WAIT, KILLED, call_job, launched, piped_launch};
-use super::outputs;
+use super::lfs;
+use super::outputs::{self, Unbuilt};
 use super::parity;
 use super::payload::{self, Location, RunCall, WarmCall};
 use super::retry::{self, Ended, GIT_SSH_FAILED, SSH_FAILED};
@@ -144,6 +145,8 @@ pub(crate) struct RustClient {
     outputs_budget: u64,
     /// The most bytes one put of the inputs may total, decompressed: `--test-remote-inputs-budget-bytes`, else 4 GiB.
     inputs_budget: u64,
+    /// The most bytes one put of LFS objects may total: `--test-remote-lfs-budget-bytes`, else 16 GiB.
+    lfs_budget: u64,
     /// The most bytes of one call's output written to the gate's log: `--test-remote-log-cap-bytes`, else 256 MiB.
     log_cap: u64,
     /// `--test-own-start-fails`: this gate's start, which names the sync-back's quarantine, cannot be read.
@@ -187,6 +190,7 @@ impl RustClient {
             apply_cap: seams.remote_apply_cap_bytes.unwrap_or(watchdog::APPLY_CAP),
             outputs_budget: seams.remote_outputs_budget_bytes.unwrap_or(OUTPUTS_BUDGET),
             inputs_budget: seams.remote_inputs_budget_bytes.unwrap_or(inputs::INPUTS_BUDGET),
+            lfs_budget: seams.remote_lfs_budget_bytes.unwrap_or(lfs::LFS_BUDGET),
             log_cap: seams.remote_log_cap_bytes.unwrap_or(watchdog::LOG_CAP),
             own_start_fails: seams.own_start_fails,
             #[cfg(feature = "test-seams")]
@@ -343,6 +347,7 @@ impl RemoteClient for RustClient {
             apply_cap: self.apply_cap,
             outputs_budget: self.outputs_budget,
             inputs_budget: self.inputs_budget,
+            lfs_budget: self.lfs_budget,
             log_cap: self.log_cap,
             own_start_fails: self.own_start_fails,
             #[cfg(feature = "test-seams")]
@@ -561,6 +566,11 @@ struct Tree {
     godot_pins: Vec<Pin>,
     /// One line per project file whose pin could not be read, in the same order.
     godot_skips: Vec<String>,
+    /// The main repository's blobs the LFS listing reads, from the same listing; none for a sibling's.
+    small: lfs::Small,
+    /// The `/`-separated paths of the main repository's `.gitattributes` files, at any depth, from the same listing;
+    /// none for a sibling's.
+    attributes: Vec<String>,
 }
 
 /// The repo's toolchain manifest, as its path at the repo root is spelled.
@@ -568,34 +578,55 @@ const MANIFEST_PATH: &str = ".gate/toolchain.toml";
 /// The manifest's name in a declarations folder.
 const MANIFEST_NAME: &str = "toolchain.toml";
 
-/// One entry of the snapshot's tree as `git ls-tree -z` lists one: the mode, the object type (`blob`, `tree` or
-/// `commit`), the object id and the path.
+/// One entry of the snapshot's tree as `git ls-tree -l -z` lists one: the mode, the object type (`blob`, `tree` or
+/// `commit`), the object id, the size of a blob (`None` for any other entry, which git gives `-`) and the path.
 #[derive(Debug, PartialEq, Eq)]
 struct Entry {
     mode: String,
     kind: String,
     oid: String,
+    size: Option<u64>,
     path: String,
 }
 
-/// The entries of a `git ls-tree -z` listing, each `<mode> <type> <oid>\t<path>` ended by a NUL; `None` when an entry
-/// is not of that form.
+/// The entries of a `git ls-tree -l -z` listing, each `<mode> <type> <oid> <size>\t<path>` ended by a NUL, the size
+/// padded with spaces and `-` for an entry that is no blob; `None` when an entry is not of that form.
 fn entries_of(listing: &str) -> Option<Vec<Entry>> {
     listing
         .split('\0')
         .filter(|record| !record.is_empty())
         .map(|record| {
             let (meta, path) = record.split_once('\t')?;
-            let mut parts = meta.split(' ');
-            let (mode, kind, oid) = (parts.next()?, parts.next()?, parts.next()?);
+            let mut parts = meta.split_ascii_whitespace();
+            let (mode, kind, oid, size) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+            let size = match size {
+                "-" => None,
+                size => Some(size.parse().ok()?),
+            };
             parts.next().is_none().then(|| Entry {
                 mode: mode.to_owned(),
                 kind: kind.to_owned(),
                 oid: oid.to_owned(),
+                size,
                 path: path.to_owned(),
             })
         })
         .collect()
+}
+
+/// The blobs of the snapshot's tree `entries` the LFS listing reads ([`lfs::is_small_blob`]), and whether the tree
+/// holds a `.gitattributes` file at any depth.
+fn small_blobs_of(entries: &[Entry]) -> lfs::Small {
+    let blobs = entries
+        .iter()
+        .filter(|entry| entry.size.is_some_and(|size| lfs::is_small_blob(&entry.mode, &entry.kind, size)))
+        .map(|entry| lfs::Blob {
+            path: entry.path.clone(),
+            id: entry.oid.clone(),
+        })
+        .collect();
+    let attributes = entries.iter().any(|entry| entry.kind == "blob" && lfs::is_attributes(&entry.path));
+    lfs::Small { blobs, attributes }
 }
 
 /// The entry among `entries` that is the repo's manifest, its path matched ignoring ASCII case: the one spelled exactly
@@ -1079,7 +1110,7 @@ pub(super) struct Attempt<'c, 'a> {
     /// Ctrl+C would; or `install`, once the install has moved its first file and before it moves a second, so its line
     /// reads `1 of {m}`: an install of a single file ends before the seam is reached; or `stop`, as `run` and then once
     /// more while the stop call that Ctrl+C leads to runs; or `apply`, once a pair's sync-back has checked every patch
-    /// and before it applies the first.
+    /// and before it applies the first; or `lfs`, at the start of the LFS phase, before its first call.
     pub(super) interrupt_at: Option<&'c str>,
     /// `--test-local-sdks`: this PC's SDK list, read in place of `dotnet --list-sdks`.
     local_sdks: Option<&'c str>,
@@ -1094,6 +1125,8 @@ pub(super) struct Attempt<'c, 'a> {
     pub(super) outputs_budget: u64,
     /// The most bytes one put of the inputs may total, decompressed: a set past it is not sent.
     pub(super) inputs_budget: u64,
+    /// The most bytes one put of LFS objects may total: a set past it is not sent.
+    pub(super) lfs_budget: u64,
     /// The most bytes of one call's output, its two streams counted together, written to the gate's log.
     log_cap: u64,
     /// `--test-own-start-fails`: this gate's start, which names the sync-back's quarantine, cannot be read.
@@ -1174,14 +1207,16 @@ impl Attempt<'_, '_> {
             .map(|(repo, sibling)| (repo.name.clone(), sibling.commit.clone()))
             .collect();
         let trees = self.trees(&repos, &snapshots)?;
+        let lfs = self.lfs_sending(&repos, &snapshots, &trees)?;
         let godot_command = self.godot_command();
-        let needs = trees
+        let mut needs = trees
             .first()
             .and_then(Option::as_ref)
             .map(|tree| tree.needs(godot_command))
             .unwrap_or_default();
+        let git_lfs = self.git_lfs_needed(lfs.is_some(), &repos, &trees, &mut needs)?;
         let prepared = self.preflight(&location, &needs)?;
-        let chosen = self.parity(&repos, &snapshots, &trees, &prepared)?;
+        let chosen = self.parity(&repos, &snapshots, &trees, &prepared, git_lfs)?;
         let raised = self.cold_ceiling(prepared.new_tree);
         // After the preflight, whose installs the Godot and Unreal Engine versions are chosen from.
         let run = RunCall {
@@ -1195,6 +1230,7 @@ impl Attempt<'_, '_> {
             host: self.call.host,
             sibling_snapshots: &sibling_snapshots,
             inputs_digest: inputs.as_ref().map(|built| built.digest.as_str()),
+            lfs_digest: lfs.as_ref().map(|sending| sending.digest.as_str()),
             env: self.call.env,
             godot_version: chosen.godot.as_deref(),
             unreal_version: chosen.unreal.as_deref(),
@@ -1207,9 +1243,7 @@ impl Attempt<'_, '_> {
         self.release_run()?;
         // After the push, so a route refused before it sends no input, and before the marker, so one the inputs refuse
         // leaves none.
-        if let Some(built) = &inputs {
-            inputs::send(self, &location, &nonce, built)?;
-        }
+        self.sent_contents(&location, &nonce, inputs.as_ref(), lfs.as_ref())?;
         // After the push: a run refused before it, at the preflight or by the parity check, leaves no marker.
         outputs::marked(&sent)?;
         if let Some(raised) = raised {
@@ -1218,7 +1252,7 @@ impl Attempt<'_, '_> {
         let called = self.run_call(&location, &run_input, &nonce)?;
         // A warm-up brings nothing back: its end is classed, and neither the sync-back nor the outputs step follows.
         if self.warm_ran(&called) {
-            return Ok(self.warm_ended(called.end, &location, prepared.boot.as_deref()));
+            return Ok(self.warm_ended(called, &location, prepared.boot.as_deref()));
         }
         // The sync-back runs after a run call that ended with the command's own status; a refusal, an interrupt, a
         // kill, a lost connection or a failed call ended the attempt before it, so a box refusal's 75 never syncs back.
@@ -1240,8 +1274,41 @@ impl Attempt<'_, '_> {
                 Ok(outputs::ended(self, &sent, &ran, synced, brought.as_ref()))
             }
             End::Lost(output) => Ok(self.connection_lost(&location, prepared.boot.as_deref(), output)),
-            End::Refused(FallbackReason::Inputs) => Ok(inputs::run_refused(self)),
-            end => Ok(end),
+            end => Ok(self.refused_end(end, called.last_error.as_deref())),
+        }
+    }
+
+    /// Whether the run needs git-lfs of the builder, its need then added to `needs` ([`toolchain::with_git_lfs`]): when
+    /// it sends LFS content (`sending`), or when any of `repos`, whose trees `trees` holds, uses the LFS filter
+    /// ([`Attempt::lfs_filtered`]), as the box's checkout then runs git-lfs. A listing git fails refuses the route `lfs`;
+    /// a Ctrl+C ends the run.
+    fn git_lfs_needed(&mut self, sending: bool, repos: &[Repo], trees: &[Option<Tree>], needs: &mut Vec<(String, String)>) -> Result<bool, End> {
+        let git_lfs = sending || self.lfs_filtered(repos, trees)?;
+        if git_lfs {
+            toolchain::with_git_lfs(needs);
+        }
+        Ok(git_lfs)
+    }
+
+    /// The run's inputs `inputs` and its LFS content `lfs` sent to `location` for the run of `nonce`, each when the run
+    /// has some ([`inputs::send`], [`lfs::send`]), the inputs first; else the end a send ended the attempt on.
+    fn sent_contents(&mut self, location: &Location, nonce: &str, inputs: Option<&inputs::Built>, lfs: Option<&lfs::Sending>) -> Result<(), End> {
+        if let Some(built) = inputs {
+            inputs::send(self, location, nonce, built)?;
+        }
+        if let Some(sending) = lfs {
+            lfs::send(self, location, nonce, sending)?;
+        }
+        Ok(())
+    }
+
+    /// The end of a run call that ended at `end`, its last error line `last_error`: a refusal of its inputs or of its
+    /// LFS content said in the log ([`inputs::run_refused`], [`lfs::run_refused`]); any other end as it is.
+    fn refused_end(&mut self, end: End, last_error: Option<&str>) -> End {
+        match end {
+            End::Refused(FallbackReason::Inputs) => inputs::run_refused(self),
+            End::Refused(FallbackReason::Lfs) => lfs::run_refused(self, last_error),
+            end => end,
         }
     }
 
@@ -1300,11 +1367,11 @@ impl Attempt<'_, '_> {
         true
     }
 
-    /// The end of a warm-up whose run call ended at `end`, which never reaches the sync-back or the outputs step: a lost
-    /// connection is handled as a run's is, and an interrupt it ends on leaves no record; a refusal of its inputs is
-    /// handled as a run's is; any other end is the attempt's as it is.
-    fn warm_ended(&mut self, end: End, location: &Location, boot: Option<&str>) -> End {
-        match end {
+    /// The end of a warm-up whose run call ended as `called`, which never reaches the sync-back or the outputs step: a
+    /// lost connection is handled as a run's is, and an interrupt it ends on leaves no record; a refusal of its inputs
+    /// or its LFS content is handled as a run's is; any other end is the attempt's as it is.
+    fn warm_ended(&mut self, called: RunEnd, location: &Location, boot: Option<&str>) -> End {
+        match called.end {
             End::Lost(output) => {
                 let end = self.connection_lost(location, boot, output);
                 if matches!(end, End::Interrupted) {
@@ -1312,8 +1379,7 @@ impl Attempt<'_, '_> {
                 }
                 end
             }
-            End::Refused(FallbackReason::Inputs) => inputs::run_refused(self),
-            end => end,
+            end => self.refused_end(end, called.last_error.as_deref()),
         }
     }
 
@@ -1544,6 +1610,103 @@ impl Attempt<'_, '_> {
         Ok(trees)
     }
 
+    /// The LFS content the run sends ([`lfs::sending`]): the objects the pointers of the main repository's snapshot
+    /// name, `None` when it holds none. The main repository's blobs come from its tree's listing (`trees`), and a
+    /// sibling's from a listing of its own ([`Attempt::lfs_listed`]). A pair any of whose snapshots holds a pointer is
+    /// refused `lfs`, naming the repository; a Ctrl+C ends the run.
+    fn lfs_sending(&mut self, repos: &[Repo], snapshots: &[Snapshot], trees: &[Option<Tree>]) -> Result<Option<lfs::Sending>, End> {
+        let mut sending = None;
+        let main_small = trees.first().and_then(Option::as_ref).map(|tree| &tree.small);
+        for (at, (repo, snapshot)) in repos.iter().zip(snapshots).enumerate() {
+            self.go_on()?;
+            let Some(listed) = self.lfs_listed(repo, snapshot, (at == 0).then_some(main_small))? else {
+                continue;
+            };
+            if listed.pointers.is_empty() {
+                continue;
+            }
+            if repos.len() > 1 {
+                return Err(lfs::refused(self, &lfs::pair_why(&repo.name)));
+            }
+            sending = Some(lfs::sending(listed).map_err(|why| lfs::refused(self, &why))?);
+        }
+        Ok(sending)
+    }
+
+    /// The pointers of `repo`'s `snapshot`: for the main repository (`main` given), those among the blobs of its tree's
+    /// listing ([`lfs::listed_among`]), `None` when its tree could not be listed (past the git output cap, not UTF-8,
+    /// not of `ls-tree`'s form), which has no LFS phase, as before LFS content was sent; for a sibling (`main` not
+    /// given), those of a listing of its own ([`lfs::listed`]). A main tree holding a `.gitattributes` in a repository
+    /// whose `info/attributes` is not empty is refused `lfs` first ([`lfs::unseen_attributes`]) when the repository
+    /// uses LFS at all ([`lfs::tracks_lfs_filter`]), and so is a listing git fails; a Ctrl+C ends the run.
+    #[expect(clippy::option_option, reason = "the main repository's listing, given, may be one that could not be made")]
+    fn lfs_listed(&mut self, repo: &Repo, snapshot: &Snapshot, main: Option<Option<&lfs::Small>>) -> Result<Option<lfs::Listed>, End> {
+        let root = Path::new(&repo.root);
+        let (limit, interrupt) = (self.limit, self.call.interrupt);
+        let small = match main {
+            Some(None) => return Ok(None),
+            Some(Some(small)) => Some(small),
+            None => None,
+        };
+        if small.is_some_and(|small| small.attributes) {
+            let unseen = self.lfs_bound(root).map_err(Unbuilt::Failed);
+            let unseen = unseen.and_then(|bound| lfs::unseen_attributes(bound, limit, interrupt));
+            if let Some(why) = self.lfs_unbuilt(repo, unseen)? {
+                let uses = lfs::tracks_lfs_filter(root, limit, interrupt).map_err(lfs::unbuilt);
+                if self.lfs_unbuilt(repo, uses)? {
+                    return Err(lfs::refused(self, &why));
+                }
+            }
+        }
+        let listed = match (self.lfs_bound(root), small) {
+            (Ok(bound), Some(small)) => lfs::listed_among(bound, &snapshot.commit, small, limit, interrupt),
+            (Ok(bound), None) => lfs::listed(bound, &snapshot.commit, limit, interrupt),
+            (Err(why), _) => Err(Unbuilt::Failed(why)),
+        };
+        self.lfs_unbuilt(repo, listed).map(Some)
+    }
+
+    /// Whether any of `repos` uses LFS at all, so the builder's checkout runs git-lfs for its files whether or not its
+    /// snapshot holds a pointer: for the main repository whose tree `trees` holds, a `.gitattributes` file of that
+    /// listing names the LFS filter as it is on disk, which is what the snapshot sent ([`lfs::names_lfs_filter_among`]);
+    /// for a sibling, or a main tree that could not be listed, as [`lfs::tracks_lfs_filter`] reads it. A listing git
+    /// fails refuses the route `lfs`, naming the repository; a Ctrl+C ends the run.
+    fn lfs_filtered(&mut self, repos: &[Repo], trees: &[Option<Tree>]) -> Result<bool, End> {
+        let (limit, interrupt) = (self.limit, self.call.interrupt);
+        for (at, repo) in repos.iter().enumerate() {
+            let root = Path::new(&repo.root);
+            let uses = match trees.first().and_then(Option::as_ref) {
+                Some(tree) if at == 0 => Ok(lfs::names_lfs_filter_among(root, &tree.attributes)),
+                _ => lfs::tracks_lfs_filter(root, limit, interrupt).map_err(lfs::unbuilt),
+            };
+            if self.lfs_unbuilt(repo, uses)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// What an LFS listing step of `repo` gave: the interrupt ends the run, and a failure refuses the route `lfs`,
+    /// naming the repository ([`lfs::unlisted`]).
+    fn lfs_unbuilt<T>(&mut self, repo: &Repo, result: Result<T, Unbuilt>) -> Result<T, End> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(Unbuilt::Interrupted) => Err(End::Interrupted),
+            Err(Unbuilt::Failed(why)) => Err(lfs::refused(self, &lfs::unlisted(&repo.name, &why))),
+        }
+    }
+
+    /// The repository whose root is `root` as the LFS listing asks git about it: a pair's as [`Attempt::bound_at`]
+    /// gives it; the run's one repository bounded at its root's parent folder.
+    fn lfs_bound<'b>(&'b self, root: &'b Path) -> Result<Bounded<'b>, String> {
+        let alone = Bounded {
+            root,
+            ceiling: root.parent().unwrap_or(root),
+            place: None,
+        };
+        Ok(self.bound_at(root)?.unwrap_or(alone))
+    }
+
     /// The names of the files of the sibling `repo`'s `snapshot`, which its SDK check reads; its toolchain manifest is
     /// not read, as only the main repository's says what the run needs.
     fn sibling_tree(&mut self, repo: &Repo, snapshot: &Snapshot) -> Result<Option<Tree>, End> {
@@ -1559,6 +1722,8 @@ impl Attempt<'_, '_> {
             manifest_file: None,
             godot_pins: Vec::new(),
             godot_skips: Vec::new(),
+            small: lfs::Small::default(),
+            attributes: Vec::new(),
         }))
     }
 
@@ -1661,6 +1826,12 @@ impl Attempt<'_, '_> {
             manifest_file,
             godot_pins,
             godot_skips,
+            small: small_blobs_of(&entries),
+            attributes: entries
+                .iter()
+                .filter(|entry| entry.kind == "blob" && lfs::is_attributes(&entry.path))
+                .map(|entry| entry.path.clone())
+                .collect(),
         }))
     }
 
@@ -1674,11 +1845,11 @@ impl Attempt<'_, '_> {
         Ok(Some(listing.split('\0').filter(|name| !name.is_empty()).map(str::to_owned).collect()))
     }
 
-    /// The entries of `git ls-tree -r -t -z` over the tree `treeish` ([`entries_of`]), every file, submodule and folder
-    /// at any depth, each with its mode, type, object id and path from the root; `None`, with a line, when that listing
-    /// is past the git output cap, is not UTF-8 or is not of that form.
+    /// The entries of `git ls-tree -r -t -l -z` over the tree `treeish` ([`entries_of`]), every file, submodule and
+    /// folder at any depth, each with its mode, type, object id, blob size and path from the root; `None`, with a line,
+    /// when that listing is past the git output cap, is not UTF-8 or is not of that form.
     fn tree_entries(&mut self, git: &Git, treeish: &str) -> Result<Option<Vec<Entry>>, End> {
-        let Some(listing) = self.listed(Path::new(self.call.root), git, &["ls-tree", "-r", "-t", "-z", treeish], None)? else {
+        let Some(listing) = self.listed(Path::new(self.call.root), git, &["ls-tree", "-r", "-t", "-l", "-z", treeish], None)? else {
             return Ok(None);
         };
         let Some(entries) = entries_of(&listing) else {
@@ -1802,7 +1973,8 @@ impl Attempt<'_, '_> {
     /// step's own lines come first, its "cannot read this PC's SDK list" among them; then each manifest problem and
     /// tool not checked, in order; then a builder that lacks any of it says one mismatch line per need, the SDK's
     /// before the tools', and is refused `parity` once. A pair's repositories are each checked so, in order, a sibling
-    /// for its own SDK alone, as its own `global.json` pins it, its lines naming it; the tools are the main one's.
+    /// for its own SDK alone, as its own `global.json` pins it, its lines naming it; the tools are the main one's, and
+    /// git-lfs when the run sends LFS content (`lfs`).
     ///
     /// `Ok` with the version of the builder's Godot install the run uses ([`toolchain::godot_choice`]), `None` when none
     /// is chosen; a main repo pinning several Godot versions chooses none, and a call that runs a Godot console
@@ -1816,7 +1988,7 @@ impl Attempt<'_, '_> {
     /// The Unreal Engine version is chosen beside it ([`toolchain::unreal_choice`]): the highest the builder listed that
     /// meets the main repo's manifest `unreal` pin, none for no pin or any version; the manifest's `[env]` names are
     /// carried beside it ([`toolchain::engine_env`]).
-    fn parity(&mut self, repos: &[Repo], snapshots: &[Snapshot], trees: &[Option<Tree>], prepared: &Prepared) -> Result<Chosen, End> {
+    fn parity(&mut self, repos: &[Repo], snapshots: &[Snapshot], trees: &[Option<Tree>], prepared: &Prepared, lfs: bool) -> Result<Chosen, End> {
         let mut refused = false;
         let main = trees.first().and_then(Option::as_ref);
         let pins_read = main.is_some_and(Tree::godot_pins_read);
@@ -1827,7 +1999,7 @@ impl Attempt<'_, '_> {
             };
             let mut needs = self.repo_needs(at, repo, snapshot, tree, prepared)?;
             if at == 0 {
-                needs.extend(self.tool_needs(tree, prepared, required.as_deref()));
+                needs.extend(self.tool_needs(tree, prepared, required.as_deref(), lfs));
             }
             if needs.is_empty() {
                 continue;
@@ -1889,16 +2061,15 @@ impl Attempt<'_, '_> {
 
     /// What the builder lacks of the tools the main repository's tree `tree` declares and of the Godot versions `godot`
     /// it requires ([`toolchain::godot_required`]), as the `prepared` preflight said of them, each manifest problem, tool
-    /// not checked and project file left unread said.
-    fn tool_needs(&mut self, tree: &Tree, prepared: &Prepared, godot: Option<&[Pin]>) -> Vec<parity::Need> {
+    /// not checked and project file left unread said; with `lfs`, a snapshot holding LFS pointers or a repository whose
+    /// tracked attributes name the LFS filter ([`Attempt::lfs_filtered`]), git-lfs at 3.1.3 or later, or the manifest's
+    /// own minimum when higher, too ([`toolchain::judge_with_git_lfs`]).
+    fn tool_needs(&mut self, tree: &Tree, prepared: &Prepared, godot: Option<&[Pin]>, lfs: bool) -> Vec<parity::Need> {
+        let host = self.call.host;
         let file = tree.manifest_file.as_deref().unwrap_or(toolchain::MANIFEST_SAID);
-        let judged = toolchain::judge(
-            tree.manifest.as_ref().map(|read| (read, file)),
-            godot,
-            &prepared.sent,
-            &prepared.tools,
-            self.call.host,
-        );
+        let manifest = tree.manifest.as_ref().map(|read| (read, file));
+        let judge = if lfs { toolchain::judge_with_git_lfs } else { toolchain::judge };
+        let judged = judge(manifest, godot, &prepared.sent, &prepared.tools, host);
         for line in judged.skips {
             self.say(line);
         }
@@ -2484,14 +2655,39 @@ impl Attempt<'_, '_> {
         sink: Option<&dyn Fn() -> Result<RawSink, String>>,
         watch: Watch,
     ) -> Result<Called, End> {
-        self.go_on()?;
         let raise = self.raises_at("inputs");
+        self.archive_call(BoxVerb::Inputs, raise, (head, archive), sink, watch)
+    }
+
+    /// One LFS call, `gate box lfs`, made as [`Attempt::inputs_call`] makes an inputs call, but for the console
+    /// interrupt, which `--test-remote-interrupt-at lfs` raises at the LFS phase's start instead.
+    pub(super) fn lfs_call(
+        &mut self,
+        head: &Arc<str>,
+        archive: Option<(&File, u64)>,
+        sink: Option<&dyn Fn() -> Result<RawSink, String>>,
+        watch: Watch,
+    ) -> Result<Called, End> {
+        self.archive_call(BoxVerb::Lfs, false, (head, archive), sink, watch)
+    }
+
+    /// One call of `gate box <verb>` fed `head` and, when given, an archive ([`Attempt::inputs_call`]), the console
+    /// interrupt raised after its first output byte when `raise`.
+    fn archive_call(
+        &mut self,
+        verb: BoxVerb,
+        raise: bool,
+        (head, archive): (&Arc<str>, Option<(&File, u64)>),
+        sink: Option<&dyn Fn() -> Result<RawSink, String>>,
+        watch: Watch,
+    ) -> Result<Called, End> {
+        self.go_on()?;
         let (called, _) = self.with_retry(SSH_FAILED, |attempt| {
             let input = match archive {
                 Some((file, length)) => {
                     let file = file
                         .try_clone()
-                        .map_err(|error| End::Failed(format!("cannot read the inputs archive: {error}")))?;
+                        .map_err(|error| End::Failed(format!("cannot read the archive sent: {error}")))?;
                     Input::Streamed(Arc::clone(head), Archived::new(file, length))
                 }
                 None => Input::Text(Arc::clone(head)),
@@ -2503,7 +2699,7 @@ impl Attempt<'_, '_> {
                 sink,
                 wire: Wire::Plain,
             };
-            attempt.ssh(BoxVerb::Inputs, Echo::LogOnly, watch, raise, only)
+            attempt.ssh(verb, Echo::LogOnly, watch, raise, only)
         })?;
         self.lines.extend(called.lines.iter().cloned());
         if let Some(line) = install_refused(self.call.host, &called) {
@@ -2833,6 +3029,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             apply_cap: watchdog::APPLY_CAP,
             outputs_budget: OUTPUTS_BUDGET,
             inputs_budget: inputs::INPUTS_BUDGET,
+            lfs_budget: lfs::LFS_BUDGET,
             log_cap: watchdog::LOG_CAP,
             own_start_fails: false,
             tamper: None,
@@ -4245,7 +4442,7 @@ enum Protocol {
     Adjusted(f64),
 }
 
-/// The start marker, the six refusal tags, the two kill tags and the adjusted line's prefix of one run, made once for
+/// The start marker, the seven refusal tags, the two kill tags and the adjusted line's prefix of one run, made once for
 /// its run call's readers.
 struct ProtocolLines {
     started: String,
@@ -4255,6 +4452,7 @@ struct ProtocolLines {
     inputs: String,
     desktop: String,
     install: String,
+    lfs: String,
     timed_out: String,
     backstop: String,
     adjusted: String,
@@ -4271,6 +4469,7 @@ impl ProtocolLines {
             inputs: refused_line(nonce, Refusal::Inputs),
             desktop: refused_line(nonce, Refusal::Desktop),
             install: refused_line(nonce, Refusal::Install),
+            lfs: refused_line(nonce, Refusal::Lfs),
             timed_out: killed_line(nonce, BoxKill::TimedOut),
             backstop: killed_line(nonce, BoxKill::Backstop),
             adjusted: adjusted_prefix(nonce),
@@ -4289,6 +4488,7 @@ impl ProtocolLines {
             (&self.inputs, Protocol::Refused(FallbackReason::Inputs)),
             (&self.desktop, Protocol::Refused(FallbackReason::Desktop)),
             (&self.install, Protocol::Refused(FallbackReason::Install)),
+            (&self.lfs, Protocol::Refused(FallbackReason::Lfs)),
             (&self.timed_out, Protocol::Killed(BoxKill::TimedOut)),
             (&self.backstop, Protocol::Killed(BoxKill::Backstop)),
         ]
@@ -4353,7 +4553,7 @@ mod tests {
         local_sdk_listing, path_outside, paused, push_size, relay, relay_raw, relayed_raw, run_install_refused, sdks_of, seconds, their_version,
         version_refusal,
     };
-    use super::{CSPROJ_BYTES, CSPROJ_FILES, Entry, csproj_pins, entries_of, manifest_entry};
+    use super::{CSPROJ_BYTES, CSPROJ_FILES, Entry, csproj_pins, entries_of, manifest_entry, small_blobs_of};
     use super::{KeyHold, RunEnd, Warm, cold_line, hold_key, hold_key_waiting, new_work_tree, status_end, warm_end, warm_of};
     use crate::environment::Variables;
     use crate::remote::git::{self, DOTNET_LIMIT, GIT_LIMIT, Git, GitError};
@@ -4512,6 +4712,7 @@ mod tests {
             own_start_fails: false,
             tamper: None,
             inputs_budget: super::inputs::INPUTS_BUDGET,
+            lfs_budget: super::lfs::LFS_BUDGET,
             brought_back: None,
             split: Split::default(),
             lines: Vec::new(),
@@ -4562,6 +4763,31 @@ mod tests {
         fs::remove_dir(pair.folder("lib")).expect("the junction can be removed");
         let link = format!("gate: not routed: sibling lib {}", crate::route::SIBLING_LINK);
         assert!(matches!(&ended, Err(End::NotRouted(line)) if *line == link), "{ended:?}");
+    }
+
+    /// A main tree that could not be listed, past the git output cap or holding a path that is not UTF-8, which
+    /// [`Attempt::tree`] gives as `None`, has no LFS phase: no git call about its pointers and no `lfs` refusal.
+    #[test]
+    fn a_main_tree_that_could_not_be_listed_has_no_lfs_phase() {
+        let log = crate::test_support::temp_dir().join(format!("gate-client-lfs-unlisted-{}.log", std::process::id()));
+        let call = RemoteCall {
+            interrupt: None,
+            ..call(&log)
+        };
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+        let repos = [super::Repo {
+            name: "app".to_owned(),
+            root: call.root.to_owned(),
+            on_builder: r"C:\builder\work\app-1a2b3c4d".to_owned(),
+            bare: r"C:\builder\app.git".to_owned(),
+        }];
+
+        let sending = attempt.lfs_sending(&repos, &[snapshot()], &[None]);
+
+        assert!(matches!(sending, Ok(None)), "no LFS phase and no refusal");
+        assert!(attempt.lines.is_empty(), "nothing said: {:?}", attempt.lines);
+        assert!(!log.exists(), "nothing logged");
     }
 
     /// A sibling whose worktree lock another run's sync-back holds past the lock wait keeps the run here naming it.
@@ -6845,7 +7071,7 @@ mod tests {
         let warm = ran(End::Status(0), true, Some(format!("gate: remote warm {WARM_HASH}")));
 
         assert!(attempt_of_warm_up.warm_ran(&warm), "a warm-up's end is kept");
-        let ended = attempt_of_warm_up.warm_ended(warm.end, &location(), None);
+        let ended = attempt_of_warm_up.warm_ended(warm, &location(), None);
 
         assert!(matches!(ended, End::Status(0)), "{ended:?}");
         assert_eq!(attempt_of_warm_up.warm, Some(WarmEnd::Warm));
@@ -7015,7 +7241,7 @@ mod tests {
         let lost = ran(End::Lost(0..0), true, None);
         assert!(attempt_of_warm_up.warm_ran(&lost), "a warm-up's end is kept");
 
-        let ended = attempt_of_warm_up.warm_ended(lost.end, &location(), Some(BOOTED));
+        let ended = attempt_of_warm_up.warm_ended(lost, &location(), Some(BOOTED));
 
         assert!(matches!(ended, End::Interrupted), "{ended:?}");
         assert_eq!(attempt_of_warm_up.warm, Some(WarmEnd::Deleted), "an interrupt leaves no record");
@@ -7053,21 +7279,51 @@ mod tests {
             mode: mode.to_owned(),
             kind: kind.to_owned(),
             oid: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            size: None,
             path: path.to_owned(),
         }
     }
 
     #[test]
-    fn a_listing_reads_each_entry_s_mode_type_object_and_path() {
-        let listing = "100644 blob 0123456789abcdef0123456789abcdef01234567\t.gate/toolchain.toml\0\
-                       040000 tree 0123456789abcdef0123456789abcdef01234567\tsrc dir\0";
+    fn a_listing_reads_each_entry_s_mode_type_object_size_and_path() {
+        let listing = "100644 blob 0123456789abcdef0123456789abcdef01234567      21\t.gate/toolchain.toml\0\
+                       040000 tree 0123456789abcdef0123456789abcdef01234567       -\tsrc dir\0";
         assert_eq!(
             entries_of(listing),
-            Some(vec![entry("100644", "blob", ".gate/toolchain.toml"), entry("040000", "tree", "src dir")])
+            Some(vec![
+                Entry {
+                    size: Some(21),
+                    ..entry("100644", "blob", ".gate/toolchain.toml")
+                },
+                entry("040000", "tree", "src dir")
+            ])
         );
         assert_eq!(entries_of(""), Some(Vec::new()));
         assert_eq!(entries_of("100644 blob\0"), None, "no tab");
-        assert_eq!(entries_of("100644 blob x y\ta\0"), None, "four words");
+        assert_eq!(entries_of("100644 blob x\ta\0"), None, "three words");
+        assert_eq!(entries_of("100644 blob x y\ta\0"), None, "a size that is no number");
+        assert_eq!(entries_of("100644 blob x 1 z\ta\0"), None, "five words");
+    }
+
+    #[test]
+    fn the_lfs_listing_takes_small_regular_blobs_and_sees_any_attributes_file() {
+        let sized = |mode: &str, kind: &str, size: Option<u64>, path: &str| Entry {
+            size,
+            ..entry(mode, kind, path)
+        };
+        let entries = [
+            sized("100644", "blob", Some(1024), "a.bin"),
+            sized("100644", "blob", Some(1025), "big.bin"),
+            sized("120000", "blob", Some(5), "link.bin"),
+            sized("160000", "commit", None, "sub"),
+            sized("040000", "tree", None, "deep"),
+        ];
+        let small = small_blobs_of(&entries);
+        let paths: Vec<&str> = small.blobs.iter().map(|blob| blob.path.as_str()).collect();
+        assert_eq!(paths, ["a.bin"]);
+        assert!(!small.attributes);
+        let with = [sized("100644", "blob", Some(4000), "deep/.gitattributes")];
+        assert!(small_blobs_of(&with).attributes, "an attributes file of any size, at any depth");
     }
 
     /// The manifest is found in one recursive listing that names folders too, as `git ls-tree -r -t -z` gives it: the
@@ -7077,7 +7333,11 @@ mod tests {
     #[test]
     fn the_manifest_is_found_in_one_recursive_listing() {
         let oid = "0123456789abcdef0123456789abcdef01234567";
-        let record = |mode: &str, kind: &str, name: &str| format!("{mode} {kind} {oid}\t{name}\0");
+        // As `git ls-tree -l` lists them: a blob's size, padded, and `-` for a folder.
+        let record = |mode: &str, kind: &str, name: &str| {
+            let size = if kind == "blob" { "3" } else { "-" };
+            format!("{mode} {kind} {oid} {size:>7}\t{name}\0")
+        };
         let tree = |name: &str| record("040000", "tree", name);
         let blob = |name: &str| record("100644", "blob", name);
         let found = |listing: &str| -> Option<Result<Entry, String>> {

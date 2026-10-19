@@ -16,10 +16,10 @@
 use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError, TryLockError};
 use std::thread;
@@ -36,6 +36,7 @@ use crate::boxside::ceiling::{Ceiling, KILLED, Spec};
 use crate::boxside::forward::{ClientGone, DRAIN, Forwarders, OutputLock};
 use crate::boxside::heartbeat;
 use crate::boxside::inputs;
+use crate::boxside::lfs::{self, RunLfs};
 use crate::boxside::msys;
 use crate::boxside::outputs::{self, Asked};
 use crate::boxside::packages;
@@ -67,6 +68,27 @@ const CLOSED_STATUS: u32 = 255;
 
 /// The git step that deletes a repo's back ref ([`WorkGit::clear_back_ref`]).
 const BACK_REF_RESET: &str = "back ref reset";
+/// The most bytes of standard output the LFS post-check's quiet checkout may print.
+const RECHECKOUT_OUTPUT: usize = 64 * 1024;
+/// The pathspec of every `.gitattributes` file at any depth, whatever the case of its name, as NTFS opens a file named
+/// `.GitAttributes` as a folder's attributes file.
+const ATTRIBUTES_FILES: &str = ":(glob,icase)**/.gitattributes";
+
+/// Why a run's checkout did not end with its snapshot checked out.
+enum NotCheckedOut {
+    /// A git step failed, or the client went, as the line says.
+    Failed(Failed),
+    /// The run's LFS content is not what its snapshot needs, for this reason: refused `lfs`, so the PC runs it.
+    Refused(String),
+    /// The run's LFS scratch folder could not be made, for this reason: refused `lfs`, so the PC runs it.
+    NoScratch(String),
+}
+
+impl From<Failed> for NotCheckedOut {
+    fn from(failed: Failed) -> NotCheckedOut {
+        NotCheckedOut::Failed(failed)
+    }
+}
 /// How long one wait for a watched process's exit lasts before the box looks again whether the client is still there
 /// and, for the restore, whether a stop came.
 const WAIT_STEP: Duration = Duration::from_millis(100);
@@ -161,6 +183,9 @@ pub(super) struct Request<'a> {
     host: &'a str,
     /// The digest of the inputs manifest the client installed the run's inputs from, `None` when it sent none.
     inputs_digest: Option<&'a str>,
+    /// The digest of the LFS manifest of the objects the snapshot's pointers name, `LfsDigest`, `None` when the client
+    /// sent none. Past the checkout's cover check, a run has one exactly when its snapshot holds LFS pointers.
+    lfs_digest: Option<&'a str>,
 }
 
 impl Request<'_> {
@@ -198,6 +223,7 @@ impl Request<'_> {
         let engine_env = payload.engine_env()?;
         let engine = resolved_engine(payload.unreal_version()?, &refused);
         let inputs_digest = payload.inputs_digest()?;
+        let lfs_digest = payload.lfs_digest()?;
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
         let (main, siblings) = repos(payload, work, bare, snapshot)?;
         Ok(Request {
@@ -224,6 +250,7 @@ impl Request<'_> {
             desktop_wait,
             host,
             inputs_digest,
+            lfs_digest,
         })
     }
 
@@ -728,10 +755,25 @@ fn checked_out(
     git: &WorkGit,
     folders: &Folders<'_>,
     beat: &Beat<'_>,
-    mut outputs: Option<&mut RunOutputs<'_>>,
+    outputs: Option<&mut RunOutputs<'_>>,
     console: &mut Console,
 ) -> Result<u32, u32> {
-    ready(request, git, folders, beat, console)?;
+    let lfs = ready(request, git, folders, beat, console)?;
+    let ended = commanded(request, git, folders, beat, (outputs, &lfs), console);
+    lfs.close(console);
+    ended
+}
+
+/// The run once its checkout is ready, as [`checked_out`] goes on with it, its LFS state `lfs` held throughout and
+/// giving the back commit its pins ([`RunLfs::pins`]).
+fn commanded(
+    request: &Request<'_>,
+    git: &WorkGit,
+    folders: &Folders<'_>,
+    beat: &Beat<'_>,
+    (mut outputs, lfs): (Option<&mut RunOutputs<'_>>, &RunLfs),
+    console: &mut Console,
+) -> Result<u32, u32> {
     if let Some(hash) = request.warm_hash {
         return warm_up(request, hash, folders.place, beat, console);
     }
@@ -753,7 +795,7 @@ fn checked_out(
             return Ok(KILLED);
         }
     };
-    let commit = match git.back_commit(request, console) {
+    let commit = match git.back_commit(request, lfs, console) {
         Ok(commit) => commit,
         Err(failed) => {
             back_commits_failed(request, beat, console);
@@ -995,19 +1037,46 @@ enum Of {
 /// The run up to its command: the snapshot laid out and checked out, the subfolder found, the repo's dotnet tools
 /// restored and, for a pnpm, bun or npm command, its packages installed ([`packages::update`]); else `Err` with the status the
 /// run ends on, its lines said. A refusal is said as such; any other end is followed, on a pair run, by the box's
-/// `gate: remote back commits: failed` line ([`ended_before`]).
-fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
+/// `gate: remote back commits: failed` line ([`ended_before`]). The run's LFS state, held: its LFS content when it
+/// carries an `LfsDigest`, its scratch folder alone, or nothing, otherwise ([`WorkGit::checkout`]); a refusal of it is said as such
+/// ([`lfs_refused`]).
+fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<RunLfs, u32> {
     let held = match git.lay_out(&request.laid(), console) {
         Ok(held) => held,
         Err(NotLaidOut::Failed(failed)) => return Err(ended_before(said(console, &failed), request, beat, console)),
         Err(NotLaidOut::Refused(why)) => return Err(layout_refused(request, &why, beat, console)),
     };
     inputs_matched(request, &held, beat, console)?;
-    if let Err(failed) = git.checkout(request, console) {
-        return Err(ended_before(said(console, &failed), request, beat, console));
-    }
+    let lfs = match git.checkout(request, console) {
+        Ok(lfs) => lfs,
+        Err(NotCheckedOut::Failed(failed)) => return Err(ended_before(said(console, &failed), request, beat, console)),
+        Err(NotCheckedOut::Refused(why)) => return Err(lfs_refused(request, &lfs::not_the_snapshots(request.key, &why), beat, console)),
+        Err(NotCheckedOut::NoScratch(why)) => return Err(lfs_refused(request, &lfs::no_scratch_line(&why), beat, console)),
+    };
     // Released before the command, which may change the work folder as it likes.
     drop(held);
+    match restored(request, git, folders, beat, console) {
+        Ok(()) => Ok(lfs),
+        Err(status) => {
+            lfs.close(console);
+            Err(status)
+        }
+    }
+}
+
+/// Refuses the run `lfs`, its tag and then `line`, which says why, said under the box's output lock, so the PC runs the
+/// command itself; 75.
+fn lfs_refused(request: &Request<'_>, line: &str, beat: &Beat<'_>, console: &mut Console) -> u32 {
+    let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
+    console.err(&lfs::refused_line(request.nonce));
+    console.err(line);
+    REFUSED_STATUS
+}
+
+/// The run after its checkout and up to its command: the subfolder found, the repo's dotnet tools restored and, for a
+/// pnpm or bun command, its packages installed; else `Err` with the status the run ends on, its lines said, as
+/// [`ready`] gives it.
+fn restored(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
     if !folders.place.is_dir() {
         console.err(&format!(
             "gate: remote subfolder {} does not exist in the snapshot",
@@ -1257,7 +1326,7 @@ fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut 
         directory: one.place.to_owned(),
         environment,
         console: PipedConsole::Hidden,
-        token: restricted_token(console),
+        token: command_token(request, console)?,
     };
     before_the_job(beat.stop.look(STARTING_COMMAND), request.job, beat.lock, console)?;
     let job = create_job(request.job, console)?;
@@ -1274,6 +1343,7 @@ fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut 
         program: &program,
         marker: (one.of == Of::Run).then_some(request.nonce),
         refuse_token: beat.seams.refuse_token,
+        keep_restricted: request.lfs_digest.is_some(),
     };
     let launched = match start_command(&mut start, donor.as_ref().map_err(String::as_str), beat, console) {
         Ok(launched) => launched,
@@ -1604,6 +1674,23 @@ fn restricted_token(console: &mut Console) -> Option<RestrictedToken> {
     }
 }
 
+/// The command's restricted token ([`restricted_token`]); for a run with LFS content, which never runs on the box's own
+/// token, a token that cannot be made fails the start instead: `Err` with status 1, its line said.
+fn command_token(request: &Request<'_>, console: &mut Console) -> Result<Option<RestrictedToken>, u32> {
+    if request.lfs_digest.is_none() {
+        return Ok(restricted_token(console));
+    }
+    RestrictedToken::of_this_process().map(Some).map_err(|error| {
+        failed(
+            console,
+            &format!("cannot make the command's restricted token, and {LFS_OWN_TOKEN}: {error}"),
+        )
+    })
+}
+
+/// Why a run with LFS content does not fall back to the box's own token.
+const LFS_OWN_TOKEN: &str = "a run with LFS content never runs with the builder session's own token";
+
 /// The line saying the command runs with the box's own token, as its restricted one could not be made or started
 /// with, for `error`.
 fn own_token_line(error: &dyn std::fmt::Display) -> String {
@@ -1624,6 +1711,9 @@ struct Start<'a> {
     program: &'a Path,
     marker: Option<&'a str>,
     refuse_token: bool,
+    /// Whether a refused start with the restricted token fails the start rather than falling back to the box's own
+    /// token: a run with LFS content.
+    keep_restricted: bool,
 }
 
 /// A command started in its job, and the read ends of its pipes.
@@ -1701,7 +1791,8 @@ struct Ended {
     how: LaunchEnd,
     /// Why the command could not have a UTF-8 console, when it was launched on the plain hidden one.
     fallback: Option<String>,
-    /// The line saying the command runs with the box's own token, when its start with the restricted one was refused.
+    /// The line saying the command runs with the box's own token, when its start with the restricted one was refused;
+    /// for a run with LFS content, the line saying it was not started instead.
     own_token: Option<String>,
     /// The line saying the job's stop signal could not be read, when it could not.
     unread: Option<String>,
@@ -1770,7 +1861,9 @@ fn launch(start: &mut Start<'_>, on: PipedConsole) -> Ended {
 /// Creates the command suspended: with its restricted token when it has one, and when `CreateProcessAsUserW` refuses
 /// that, or the token seam says it does, once more with the box's own token, which it keeps from then on. Only a
 /// failure of that second start is the launch's. The command created, or why not, and the line saying it runs with the
-/// box's own token when the restricted start was refused and the second one created it.
+/// box's own token when the restricted start was refused and the second one created it. A run with LFS content
+/// (`keep_restricted`) never takes the second start: the restricted start's refusal is the launch's, with the line
+/// saying why the command was not started on the box's own token.
 fn create_suspended(start: &mut Start<'_>) -> (Result<PipedSuspended, LaunchError>, Option<String>) {
     if start.launch.token.is_none() {
         return (start.launch.start_suspended(start.job), None);
@@ -1784,6 +1877,10 @@ fn create_suspended(start: &mut Start<'_>) -> (Result<PipedSuspended, LaunchErro
         start.launch.start_suspended(start.job)
     };
     match restricted {
+        Err(error @ LaunchError::CreateProcess { .. }) if start.keep_restricted => {
+            let line = format!("gate: remote could not start the command with its restricted token, and {LFS_OWN_TOKEN}");
+            (Err(error), Some(line))
+        }
         Err(error @ LaunchError::CreateProcess { .. }) => {
             start.launch.token = None;
             let created = start.launch.start_suspended(start.job);
@@ -2372,24 +2469,32 @@ impl WorkGit {
     /// status, or a git that cannot be started, fails `step`, said as [`Git::step`] says it, and a client gone ends the
     /// run ([`client_gone`]).
     fn git_step(&self, step: &str, args: &[&str], console: &mut Console) -> Result<(), Failed> {
+        match self.git_code(step, args, console)? {
+            0 => Ok(()),
+            code => Err(git_failed(step, code)),
+        }
+    }
+
+    /// git's exit code for the safety options and `args`, both of its streams forwarded ([`Git::forwarded`]); a git that
+    /// cannot be started fails `step`, said as [`Git::step`] says it, and a client gone ends the run ([`client_gone`]).
+    fn git_code(&self, step: &str, args: &[&str], console: &mut Console) -> Result<i32, Failed> {
         let ran = self
             .git
             .command(&self.args(args))
             .map_err(GitFailure::Failed)
             .and_then(|command| Git::forwarded(command, false, &self.output, &self.gone, console));
         match ran {
-            Ok(output) => match exit_code(output.status) {
-                0 => Ok(()),
-                code => Err(git_failed(step, code)),
-            },
+            Ok(output) => Ok(exit_code(output.status)),
             Err(GitFailure::Failed(message)) => Err(Failed::without_status(format!("gate: remote {step} failed: {message}"))),
             Err(GitFailure::ClientGone) => Err(client_gone(step)),
         }
     }
 
-    /// The safety options, then `args`.
+    /// The safety options, no `core.attributesFile` among them ([`crate::remote::lfs::NO_ATTRIBUTES_FILE`]), so the
+    /// tree's attributes are read from its own `.gitattributes` files and from `<Work>\.git\info\attributes`, then `args`.
     pub(super) fn args<'a>(&'a self, args: &[&'a str]) -> Vec<&'a str> {
         let mut all = vec!["-c", self.hooks.as_str(), "-c", "core.fsmonitor=false"];
+        all.extend(crate::remote::lfs::NO_ATTRIBUTES_FILE);
         all.extend_from_slice(args);
         all
     }
@@ -2461,17 +2566,226 @@ impl WorkGit {
         Ok(())
     }
 
-    /// Each repo's snapshot, one repo after another, the main one first ([`WorkGit::checkout_repo`]).
-    fn checkout(&self, request: &Request<'_>, console: &mut Console) -> Result<(), Failed> {
-        request.repos().try_for_each(|repo| self.checkout_repo(request, repo, console))
+    /// Each repo's snapshot, fetched from its bare repository at `refs/gate/<key>` ([`WorkGit::fetched`]) and checked
+    /// out, one repo after another, the main one first ([`WorkGit::checked_out_repo`]); between the main repo's fetch
+    /// and its checkout, the run's LFS state is readied ([`WorkGit::run_lfs`]) and given back held, let go on a
+    /// failure. A pair run whose payload carries an `LfsDigest` is refused `lfs` before any checkout, as no pair takes
+    /// LFS content.
+    fn checkout(&self, request: &Request<'_>, console: &mut Console) -> Result<RunLfs, NotCheckedOut> {
+        if !request.siblings.is_empty() && request.lfs_digest.is_some() {
+            return Err(NotCheckedOut::Refused(
+                "a sibling pair's run carries an LfsDigest, and no pair takes LFS content".to_owned(),
+            ));
+        }
+        self.fetched(request, &request.main, console)?;
+        let mut lfs = self.run_lfs(request, console)?;
+        let ended = request.repos().enumerate().try_for_each(|(at, repo)| {
+            if at > 0 {
+                self.fetched(request, repo, console)?;
+            }
+            self.lfs_scratch(request, repo, &mut lfs, console)?;
+            self.checked_out_repo(request, repo, &lfs, console)
+        });
+        match ended {
+            Ok(()) => Ok(lfs),
+            Err(not) => {
+                lfs.close(console);
+                Err(not)
+            }
+        }
     }
 
-    /// The snapshot of `repo`, fetched from its bare repository at `refs/gate/<key>` and checked out by its commit over
-    /// whatever the last run left, untracked files removed and ignored ones (build output) kept, and no back commit of
-    /// an earlier run left behind. The commit, never the ref's tip, is what is checked out, so a later push of the key
-    /// changes nothing this run runs. A commit the repo's repository lacks after the fetch ends the run with the box's
-    /// own line.
-    fn checkout_repo(&self, request: &Request<'_>, repo: &Repo<'_>, console: &mut Console) -> Result<(), Failed> {
+    /// git's standard output for `args` in the tree of `repo`, fed `feed` on its standard input when given, at most
+    /// `cap` bytes, its stderr forwarded; else the failure of `step`, said as [`WorkGit::git_step`] says it.
+    fn output(&self, step: &str, repo: &Repo<'_>, args: &[&str], feed: Option<&[u8]>, cap: usize, console: &mut Console) -> Result<Vec<u8>, Failed> {
+        let step = repo.step(step);
+        let cannot = |message: String| Failed::without_status(format!("gate: remote {step} failed: {message}"));
+        let mut all = repo.at().to_vec();
+        all.extend_from_slice(args);
+        let mut command = self.git.command(&self.args(&all)).map_err(cannot)?;
+        let writer = match feed {
+            None => None,
+            Some(bytes) => {
+                let (reader, mut writer) = io::pipe().map_err(|error| cannot(format!("cannot make the pipe of its input: {error}")))?;
+                command.stdin(reader);
+                let bytes = bytes.to_vec();
+                Some(thread::spawn(move || writer.write_all(&bytes)))
+            }
+        };
+        let ran = Git::forwarded(command, true, &self.output, &self.gone, console);
+        let written = writer.map(thread::JoinHandle::join);
+        let output = match ran {
+            Ok(output) => output,
+            Err(GitFailure::Failed(message)) => return Err(cannot(message)),
+            Err(GitFailure::ClientGone) => return Err(client_gone(&step)),
+        };
+        match exit_code(output.status) {
+            0 => {}
+            code => return Err(git_failed(&step, code)),
+        }
+        match written {
+            Some(Ok(Err(error))) => return Err(cannot(format!("its input could not be written: {error}"))),
+            Some(Err(_)) => return Err(cannot("the writer of its input panicked".to_owned())),
+            Some(Ok(Ok(()))) | None => {}
+        }
+        if output.stdout.len() > cap {
+            return Err(cannot(format!("it printed more than {cap} bytes")));
+        }
+        Ok(output.stdout)
+    }
+
+    /// The run's LFS state, held from before its first checkout through its back commit. For a run that carries an
+    /// `LfsDigest`, which only a run of one repo may, the LFS content of its fetched snapshot, covered and held
+    /// ([`lfs::covered`]): its pointers read from the snapshot itself as the PC reads them
+    /// ([`crate::remote::lfs::pointers_of`]) and checked against the digest; then its scratch folder made
+    /// ([`RunLfs::with_scratch`]). For a run with none, which lists nothing, no scratch folder yet
+    /// ([`RunLfs::without_content`]): each repo's checkout makes it when its snapshot names the LFS filter
+    /// ([`WorkGit::lfs_scratch`]). Else the git step's failure, or why the run is refused `lfs`: its content, or a scratch
+    /// folder that cannot be made.
+    fn run_lfs(&self, request: &Request<'_>, console: &mut Console) -> Result<RunLfs, NotCheckedOut> {
+        let Some(digest) = request.lfs_digest else {
+            return Ok(RunLfs::without_content());
+        };
+        let repo = &request.main;
+        let unreadable = |why: String| Failed::without_status(format!("gate: remote lfs listing failed: {why}"));
+        let listed = crate::remote::lfs::pointers_of(
+            repo.snapshot,
+            &mut |args, feed, cap| self.output("lfs listing", repo, args, feed, cap, console),
+            unreadable,
+        )?;
+        let mut lfs = lfs::covered(&repo.bare, digest, &listed).map_err(NotCheckedOut::Refused)?;
+        lfs.with_scratch(request.work, (request.key, request.nonce), console)
+            .map_err(NotCheckedOut::NoScratch)?;
+        Ok(lfs)
+    }
+
+    /// The run's scratch folder made before the checkout of `repo` ([`RunLfs::with_scratch`]) when the run has none yet
+    /// and a `.gitattributes` file of `repo`'s snapshot, at any depth and whatever the case of its name, holds the text
+    /// `filter=lfs` (`git grep`), so git-lfs reads and writes the run's own `lfs.storage` for every file the snapshot's
+    /// attributes give the filter; a comment naming it makes a scratch folder too, which costs nothing. A scratch folder
+    /// that cannot be made refuses the run `lfs`, as its command has not run; a `git grep` that fails is the step's
+    /// failure, its line ending in the first line git said.
+    fn lfs_scratch(&self, request: &Request<'_>, repo: &Repo<'_>, lfs: &mut RunLfs, console: &mut Console) -> Result<(), NotCheckedOut> {
+        if lfs.has_scratch() {
+            return Ok(());
+        }
+        let step = repo.step("lfs listing");
+        let args = ["grep", "-q", "-F", "-e", "filter=lfs", repo.snapshot, "--", ATTRIBUTES_FILES];
+        match self.quiet_saying(repo, &args) {
+            Ok((0, _)) => lfs
+                .with_scratch(request.work, (request.key, request.nonce), console)
+                .map_err(NotCheckedOut::NoScratch),
+            Ok((1, _)) => Ok(()),
+            Ok((code, said)) => {
+                let mut failed = git_failed(&step, code);
+                if !said.is_empty() {
+                    failed.line = format!("{}: {}", failed.line, escaped(&said));
+                }
+                Err(failed.into())
+            }
+            Err(message) => Err(Failed::without_status(format!("gate: remote {step} failed: {message}")).into()),
+        }
+    }
+
+    /// The checkout of `repo`'s snapshot over its tree, pinned by `lfs`'s pins ([`RunLfs::pins`]), its `lfs.storage`
+    /// the run's scratch folder when it has one, else a folder below the run's lock that cannot be made, and then each
+    /// LFS file checked ([`WorkGit::lfs_post_check`]). A run with no LFS content has no pointer to check and its scratch
+    /// folder, when it has one, is empty: a file committed as its own bytes under a `filter=lfs` rule checks out as
+    /// those bytes, and a pointer finds no object there and no server to fetch it from, so its smudge fails the
+    /// checkout. A run with no scratch folder has no `filter=lfs` in its snapshot's attributes: a file the filter still
+    /// reaches, through attributes the snapshot does not hold, fails the checkout, which says so when the tree's
+    /// attributes name the filter ([`WorkGit::checkout_failed`]).
+    fn checked_out_tree(&self, request: &Request<'_>, repo: &Repo<'_>, lfs: &RunLfs, console: &mut Console) -> Result<(), NotCheckedOut> {
+        let no_storage = lfs::no_storage(request.lock);
+        let pins = lfs.pins(&no_storage);
+        let mut args = repo.at().to_vec();
+        args.extend_from_slice(&pins);
+        args.extend(["checkout", "-q", "--force", "--detach", repo.snapshot]);
+        let step = repo.step("checkout");
+        match self.git_code(&step, &args, console)? {
+            0 => self.lfs_post_check(repo, lfs, &pins, console),
+            code => Err(self.checkout_failed(repo, lfs, (&step, code), console).into()),
+        }
+    }
+
+    /// The failure of `repo`'s checkout `step`, which exited with `code`: on a run with no scratch folder whose tree's
+    /// attributes name the LFS filter ([`WorkGit::names_lfs_in_tree`]), the line saying a file under it was found that
+    /// the snapshot does not declare ([`lfs::NO_STORAGE_CHECKOUT`]), with git's status, once the tree's untracked files
+    /// are cleaned (`clean -fdq`), as a passing checkout's are, so an attributes file a command left there does not
+    /// fail every later run; a clean that fails is said and leaves that line as it is. Else git's own ([`git_failed`]).
+    fn checkout_failed(&self, repo: &Repo<'_>, lfs: &RunLfs, (step, code): (&str, i32), console: &mut Console) -> Failed {
+        if lfs.has_scratch() || !self.names_lfs_in_tree(repo) {
+            return git_failed(step, code);
+        }
+        if let Err(unclean) = self.step("clean", repo, &["clean", "-fdq"], console) {
+            let _held = self.output.lock().unwrap_or_else(PoisonError::into_inner);
+            console.err(&unclean.line);
+        }
+        Failed {
+            line: format!("gate: remote {step} failed: {}", lfs::NO_STORAGE_CHECKOUT),
+            status: code.cast_unsigned(),
+        }
+    }
+
+    /// Whether a `.gitattributes` file of `repo`'s tree, at any depth and whatever the case of its name, tracked or
+    /// untracked, holds the text `filter=lfs` (`git grep`); a file in an ignored folder is passed over, as `add -A`
+    /// reads no attributes there and a package's own, in `node_modules` say, would name a filter the run never ran. A
+    /// `git grep` that fails, or cannot be started, says no, so the caller keeps git's own failure.
+    fn names_lfs_in_tree(&self, repo: &Repo<'_>) -> bool {
+        let args = ["grep", "-q", "-F", "-e", "filter=lfs", "--untracked", "--", ATTRIBUTES_FILES];
+        matches!(self.quiet(repo, &args), Ok(0))
+    }
+
+    /// Every LFS pointer's path in `repo`'s tree checked to be a plain file of the pointer's size, as a checkout whose
+    /// stat finds a file clean leaves a pointer an older run left: the files that are not deleted and checked out again
+    /// once, with the same pins `pins`, and checked again. Else the git step's failure, or the refusal naming the first
+    /// still wrong.
+    fn lfs_post_check(&self, repo: &Repo<'_>, lfs: &RunLfs, pins: &[&str], console: &mut Console) -> Result<(), NotCheckedOut> {
+        let wrong = lfs::wrong_files(&repo.tree, &lfs.pointers);
+        if wrong.is_empty() {
+            return Ok(());
+        }
+        lfs::deleted_files(&repo.tree, &wrong).map_err(NotCheckedOut::Refused)?;
+        let feed: Vec<u8> = wrong.iter().flat_map(|pointer| pointer.path.bytes().chain([0])).collect();
+        let mut args = vec!["--literal-pathspecs"];
+        args.extend_from_slice(pins);
+        args.extend([
+            "checkout",
+            "-q",
+            "--force",
+            repo.snapshot,
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ]);
+        self.output("lfs checkout", repo, &args, Some(&feed), RECHECKOUT_OUTPUT, console)?;
+        let still = lfs::wrong_files(&repo.tree, &lfs.pointers);
+        match still.first() {
+            None => Ok(()),
+            Some(first) => Err(NotCheckedOut::Refused(format!(
+                "{} LFS file(s) are not their content after the checkout, {} among them",
+                still.len(),
+                escaped(&first.path)
+            ))),
+        }
+    }
+
+    /// The fetched snapshot of `repo` checked out by its commit over whatever the last run left, pinned by the run's
+    /// LFS state `lfs` ([`WorkGit::checked_out_tree`]), untracked files removed and ignored ones (build output) kept,
+    /// and no back commit of an earlier run left behind. The commit, never the ref's tip, is what is checked out, so a
+    /// later push of the key changes nothing this run runs.
+    fn checked_out_repo(&self, request: &Request<'_>, repo: &Repo<'_>, lfs: &RunLfs, console: &mut Console) -> Result<(), NotCheckedOut> {
+        self.checked_out_tree(request, repo, lfs, console)?;
+        self.step("clean", repo, &["clean", "-fdq"], console)?;
+        // A pair run cleared every repo's back ref as soon as it held the lock ([`WorkGit::clear_back_refs`]).
+        if request.siblings.is_empty() {
+            self.clear_back_ref(request, repo, console)?;
+        }
+        Ok(())
+    }
+
+    /// The snapshot of `repo` fetched from its bare repository at `refs/gate/<key>`, and its commit found; else the
+    /// failure, the box's own line for a commit the repository lacks after the fetch.
+    fn fetched(&self, request: &Request<'_>, repo: &Repo<'_>, console: &mut Console) -> Result<(), Failed> {
         let refname = format!("refs/gate/{}", request.key);
         self.step("fetch", repo, &["fetch", "-q", &repo.bare, &refname], console)?;
         let commit = format!("{}^{{commit}}", repo.snapshot);
@@ -2484,12 +2798,6 @@ impl WorkGit {
                     status: FAILED_STATUS,
                 });
             }
-        }
-        self.step("checkout", repo, &["checkout", "-q", "--force", "--detach", repo.snapshot], console)?;
-        self.step("clean", repo, &["clean", "-fdq"], console)?;
-        // A pair run cleared every repo's back ref as soon as it held the lock ([`WorkGit::clear_back_refs`]).
-        if request.siblings.is_empty() {
-            self.clear_back_ref(request, repo, console)?;
         }
         Ok(())
     }
@@ -2509,6 +2817,20 @@ impl WorkGit {
         let mut all = repo.at().to_vec();
         all.extend_from_slice(args);
         self.git.code(&self.args(&all), Stdio::null(), Stdio::null())
+    }
+
+    /// git's exit code for `args` in the tree of `repo` and the first line of its standard error, empty when it said
+    /// none, its standard output discarded, so a failure can say git's reason; else why git could not be started.
+    fn quiet_saying(&self, repo: &Repo<'_>, args: &[&str]) -> Result<(i32, String), String> {
+        let mut all = repo.at().to_vec();
+        all.extend_from_slice(args);
+        let mut command = self.git.command(&self.args(&all))?;
+        // Started under the spawn lock, so it inherits no launch's handles.
+        let output = gate_win32::spawn(command.stdout(Stdio::null()).stderr(Stdio::piped()))
+            .and_then(Child::wait_with_output)
+            .map_err(|error| error.to_string())?;
+        let said = String::from_utf8_lossy(&output.stderr).lines().next().unwrap_or_default().to_owned();
+        Ok((exit_code(output.status), said))
     }
 
     /// Deletes `refs/gate-back/<key>` in the bare repository of `repo`, an earlier run's back commit, so the client
@@ -2543,10 +2865,12 @@ impl WorkGit {
     /// back ref this run pushed and, on a pair run, the failing repo's own ([`WorkGit::undo_pushes`]), so the PC finds
     /// a back commit of every changed repo or of none. A pair run then says each repo's commit, or none, on one line
     /// ([`back_commits_line`]). The main repo's commit, `None` when its tree is unchanged; else why one failed.
-    fn back_commit(&self, request: &Request<'_>, console: &mut Console) -> Result<Option<String>, BackFailed> {
+    /// Each repo's `add -A` takes the run's pins ([`RunLfs::pins`]), so a clean writes nothing into the store
+    /// or the work folder's `.git\lfs`.
+    fn back_commit(&self, request: &Request<'_>, lfs: &RunLfs, console: &mut Console) -> Result<Option<String>, BackFailed> {
         let mut commits = Vec::with_capacity(1 + request.siblings.len());
         for repo in request.repos() {
-            commits.push(self.repo_back_commit(request, repo, console)?);
+            commits.push(self.repo_back_commit(request, repo, lfs, console)?);
         }
         let mut pushed = Vec::with_capacity(commits.len());
         for (repo, commit) in request.repos().zip(&commits) {
@@ -2589,7 +2913,7 @@ impl WorkGit {
     /// starts from a copy of the repo's index, which the checkout just refreshed, so `add -A` skips every unchanged
     /// file; a copy that cannot be removed afterwards is said and fails nothing. The run's one `Index` file is used by
     /// each repo in turn. The commit, `None` when the tree is unchanged; else why it failed.
-    fn repo_back_commit(&self, request: &Request<'_>, repo: &Repo<'_>, console: &mut Console) -> Result<Option<String>, BackFailed> {
+    fn repo_back_commit(&self, request: &Request<'_>, repo: &Repo<'_>, lfs: &RunLfs, console: &mut Console) -> Result<Option<String>, BackFailed> {
         let program = self
             .git
             .program
@@ -2604,9 +2928,16 @@ impl WorkGit {
         let index = Path::new(&repo.tree).join(".git").join("index");
         fs::copy(&index, request.index)
             .map_err(|error| BackFailed::Step(format!("cannot copy {} to {}: {error}", index.display(), request.index)))?;
-        let tree = back
-            .status("add", &["add", "-A"], true, console)
-            .and_then(|()| back.line("write-tree", &["write-tree"], true, console));
+        let no_storage = lfs::no_storage(request.lock);
+        let mut add = lfs.pins(&no_storage);
+        add.extend(["add", "-A"]);
+        let added = back.status("add", &add, true, console).map_err(|failed| match failed {
+            // With no scratch folder, git-lfs's clean has no storage it can make: the cause when the tree's attributes
+            // name the filter, and git's own line otherwise.
+            BackFailed::Step(_) if !lfs.has_scratch() && self.names_lfs_in_tree(repo) => BackFailed::Step(lfs::NO_STORAGE_ADD.to_owned()),
+            other => other,
+        });
+        let tree = added.and_then(|()| back.line("write-tree", &["write-tree"], true, console));
         match fs::remove_file(request.index) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => {
                 console.err(&format!("gate: remote could not remove {}: {error}", request.index));
@@ -2662,6 +2993,7 @@ impl BackGit<'_> {
         for name in GIT_REDIRECTS {
             command.env_remove(name);
         }
+        command.env(crate::remote::lfs::NO_SYSTEM_ATTRIBUTES, "1");
         if copied_index {
             command.env("GIT_INDEX_FILE", self.request.index);
         }
@@ -2734,14 +3066,14 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CLOSED_STATUS, GIT_CONFIG_COUNT, GODOT_PATH, Look, Of, One, PATH_VARIABLE, Payload, Request, SHARING_VIOLATION, STARTING_COMMAND, UE_ROOT,
-        before_the_job, client_gone, command_spent, command_variables, gap_spent, handed_job, look, prepared, remaining_budget, resolved_command,
-        with_git_bin_first, with_path_first, with_safe_directory, with_unreal, without_engine, written_retrying,
+        BackGit, CLOSED_STATUS, GIT_CONFIG_COUNT, GODOT_PATH, Look, Of, One, PATH_VARIABLE, Payload, Request, SHARING_VIOLATION, STARTING_COMMAND,
+        UE_ROOT, WorkGit, before_the_job, client_gone, command_spent, command_variables, gap_spent, handed_job, look, prepared, remaining_budget,
+        resolved_command, with_git_bin_first, with_path_first, with_safe_directory, with_unreal, without_engine, written_retrying,
     };
     use crate::boxside::payload::engine_env_name_refused;
     use gate_args::{EnvRefusal, env_refusal};
 
-    use crate::boxside::forward::OutputLock;
+    use crate::boxside::forward::{ClientGone, OutputLock};
     use crate::console::Console;
     use crate::environment::{BOX_EXE_VARIABLE, BOX_JOB_VARIABLE, Variables};
 
@@ -3256,6 +3588,38 @@ mod tests {
             };
             assert_eq!(one.wsl(), wsl, "{words:?}");
         }
+    }
+
+    /// Every git call the run makes in the work folder, and every one of its back commit's, reads a path's attributes
+    /// from the tree's own files alone: no `core.attributesFile`, no system-wide attributes file.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a payload the box cannot read must fail the case loudly")]
+    fn every_work_and_back_git_call_reads_the_tree_s_own_attributes_alone() {
+        let output = OutputLock::default();
+        let work = WorkGit::ready(r"C:\gate-remote\work\app-1a2b3c4d.lock", &output, &ClientGone::default());
+        let pinned = |args: &[&OsStr]| args.windows(2).any(|pair| pair == [OsStr::new("-c"), OsStr::new("core.attributesFile=")]);
+        let payload = run_payload(&json!({}));
+        let request = Request::read(&payload).expect("a run is read");
+        let back = BackGit {
+            program: Path::new("git.exe"),
+            request: &request,
+            repo: &request.main,
+            work: &work,
+        };
+
+        let command = back.command(&["add", "-A"], true);
+
+        assert!(
+            command
+                .get_envs()
+                .any(|pair| pair == (OsStr::new("GIT_ATTR_NOSYSTEM"), Some(OsStr::new("1")))),
+            "the back commit reads no system-wide attributes file: {:?}",
+            command.get_envs().collect::<Vec<_>>()
+        );
+        let back_args: Vec<&OsStr> = command.get_args().collect();
+        assert!(pinned(&back_args), "{back_args:?}");
+        let args: Vec<&OsStr> = work.args(&["status"]).into_iter().map(OsStr::new).collect();
+        assert!(pinned(&args), "{args:?}");
     }
 
     #[test]

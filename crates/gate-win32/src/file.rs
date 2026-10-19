@@ -108,6 +108,29 @@ pub fn make_folder_beneath(folder: &File, name: &str, access: u32, share: Share,
     )
 }
 
+/// Makes a new file `name`, one name, inside the open folder `folder` with the security `security` names, its owner,
+/// DACL and label included, so the file is never seen with any other security, not even the one its folder hands
+/// down; opened with the access `access` (plus `SYNCHRONIZE`), sharing what `share` says.
+///
+/// # Errors
+///
+/// As [`open_beneath_as`]'s with [`Make::NewFile`]: an error of kind [`io::ErrorKind::AlreadyExists`] when anything
+/// has the name, and the system's error when the file cannot be made with that security.
+pub fn make_file_beneath(folder: &File, name: &str, access: u32, share: Share, security: &Descriptor) -> io::Result<File> {
+    one_name(name)?;
+    let wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+    open_wide(
+        folder,
+        &wide,
+        Opening {
+            access,
+            share,
+            make: Make::NewFile,
+            security: Some(security),
+        },
+    )
+}
+
 /// How [`open_wide`] opens or makes its name: with what access (plus `SYNCHRONIZE`), sharing what, making what, and
 /// the security a new file or folder is made with, none for what its folder hands down.
 #[derive(Clone, Copy)]
@@ -687,16 +710,18 @@ mod tests {
     use std::process::Command;
 
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE, READ_CONTROL,
     };
 
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED};
     use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, FILE_ID_128, FILE_ID_INFO};
 
     use super::{
-        Make, Share, delete_opened, delete_tree_opened, identity_by_either, move_no_replace, names_beneath, open_beneath, open_beneath_as,
-        rename_beneath, rename_beneath_no_replace, same_file, verbatim,
+        Make, Share, delete_opened, delete_tree_opened, identity_by_either, make_file_beneath, move_no_replace, names_beneath, open_beneath,
+        open_beneath_as, rename_beneath, rename_beneath_no_replace, same_file, verbatim,
     };
+    use crate::security::{Descriptor, is_protected_file, protected_descriptor, security_text};
+    use crate::token_facts;
 
     /// A read of a file's index that a case expects never to be asked for.
     fn unasked() -> io::Result<BY_HANDLE_FILE_INFORMATION> {
@@ -1033,6 +1058,35 @@ mod tests {
 
         assert_eq!(again.map(drop).map_err(|error| error.kind()), Err(io::ErrorKind::AlreadyExists));
         assert_eq!(std::fs::read_to_string(folder.join("a.txt")).expect("the file is there"), "a");
+        drop(held);
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_file_is_made_new_beneath_with_its_security_and_one_already_there_is_refused() {
+        let folder = folder("new-file-security");
+        let held = held(&folder);
+        let security = Descriptor::from_sddl("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)").expect("the descriptor can be made");
+
+        let made = make_file_beneath(&held, "lock", FILE_GENERIC_READ | READ_CONTROL, Share::NoDelete, &security).expect("a free name is made");
+        let text = security_text(&made).expect("its security can be read");
+        let foreign = is_protected_file(&made).expect("its security can be read");
+        drop(made);
+        let again = make_file_beneath(&held, "lock", FILE_GENERIC_READ, Share::NoDelete, &security);
+        let facts = token_facts().expect("this process's token can be read");
+        let protected = protected_descriptor(&facts).expect("the protected descriptor can be made");
+        let made = make_file_beneath(&held, "protected", FILE_GENERIC_READ | READ_CONTROL, Share::NoDelete, &protected).expect("a free name is made");
+
+        assert!(
+            is_protected_file(&made).expect("its security can be read"),
+            "a file made protected reads as protected: {}",
+            security_text(&made).unwrap_or_default()
+        );
+        assert!(!foreign, "a file made with another DACL is not protected");
+        drop(made);
+        assert!(text.starts_with("D:P"), "the DACL given, not the folder's: {text}");
+        assert!(text.contains("(A;;FA;;;WD)"), "the DACL given, not the folder's: {text}");
+        assert_eq!(again.map(drop).map_err(|error| error.kind()), Err(io::ErrorKind::AlreadyExists));
         drop(held);
         std::fs::remove_dir_all(&folder).expect("the folder can be removed");
     }

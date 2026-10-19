@@ -1394,6 +1394,59 @@ fn check_builder_lists_every_item_and_exits_0_when_nothing_is_missing() {
     assert_eq!(calls(&steps), ["preflight"], "one call reached the builder");
 }
 
+/// The stub of a git-lfs that answers as 3.8.0 does.
+const GIT_LFS_STUB: (&str, &str) = ("git-lfs", "@echo git-lfs/3.8.0 (GitHub; windows amd64; go 1.24.4)\r\n");
+
+#[test]
+fn check_builder_lists_git_lfs_for_a_repo_with_an_lfs_filter() {
+    let case = builder_case("check_builder_git_lfs");
+    write(&case, ".gitattributes", "# assets\n*.bin filter=lfs diff=lfs merge=lfs -text\n");
+    git(&case, &["-C", REPO, "add", ".gitattributes"]);
+    let stub = stubs(&case, &[GIT_LFS_STUB]);
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = check_builder(&case, "builder-1", &[stub], &steps);
+
+    assert!(
+        lines(&outcome.stdout).contains(&"check: builder-1: git-lfs 3.8.0 ok (needs 3.1.3 or later)"),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+#[test]
+fn check_builder_lists_git_lfs_for_an_lfs_filter_in_a_subfolder_alone() {
+    let case = builder_case("check_builder_git_lfs_deep");
+    write(&case, "assets/.gitattributes", "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+    git(&case, &["-C", REPO, "add", "assets/.gitattributes"]);
+    let stub = stubs(&case, &[GIT_LFS_STUB]);
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = check_builder(&case, "builder-1", &[stub], &steps);
+
+    assert!(
+        lines(&outcome.stdout).contains(&"check: builder-1: git-lfs 3.8.0 ok (needs 3.1.3 or later)"),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+#[test]
+fn check_builder_says_nothing_of_git_lfs_without_one() {
+    let case = builder_case("check_builder_no_git_lfs");
+    write(&case, "docs/.gitattributes", "*.txt text\n# *.bin filter=lfs\n");
+    git(&case, &["-C", REPO, "add", "docs/.gitattributes"]);
+    // Untracked, so no routed snapshot's checkout reads it.
+    write(&case, ".gitattributes", "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+    let stub = stubs(&case, &[GIT_LFS_STUB]);
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = check_builder(&case, "builder-1", &[stub], &steps);
+
+    assert!(!outcome.stdout.contains("git-lfs"), "{outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
 #[test]
 fn check_builder_says_a_missing_tool_with_its_builder_hint_and_exits_1() {
     let case = builder_case("check_builder_missing_tool");

@@ -35,8 +35,10 @@ use crate::run::{ERROR_FILE_NOT_FOUND, find_program};
 /// The status of a step that failed with no status of its own: git or a folder that could not be made or written.
 const FAILED_STATUS: u32 = 1;
 
-/// The git variables that would point git at another repository, index, object store or config than the work folder's.
-pub(crate) const GIT_REDIRECTS: [&str; 8] = [
+/// The git variables that would point git at another repository, index, object store or config than the work folder's,
+/// the git variables that would have it read another global or system config file or none, and the git-lfs variables
+/// that would let a checkout leave pointer text or skip an object it cannot download.
+pub(crate) const GIT_REDIRECTS: [&str; 13] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
@@ -45,6 +47,11 @@ pub(crate) const GIT_REDIRECTS: [&str; 8] = [
     "GIT_COMMON_DIR",
     "GIT_CONFIG_PARAMETERS",
     "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_LFS_SKIP_SMUDGE",
+    "GIT_LFS_SKIP_DOWNLOAD_ERRORS",
 ];
 
 /// A preflight step that failed: the line saying so, and the status the gate exits with.
@@ -850,14 +857,15 @@ impl Git {
         Ok(exit_code(status))
     }
 
-    /// git with `args`, reading no standard input and none of the variables that would point it elsewhere; else why
-    /// it cannot be started.
+    /// git with `args`, reading no standard input, none of the variables that would point it elsewhere and no
+    /// system-wide attributes file ([`crate::remote::lfs::NO_SYSTEM_ATTRIBUTES`]); else why it cannot be started.
     pub(crate) fn command(&self, args: &[&str]) -> Result<Command, String> {
         let program = self.program.as_ref().map_err(Clone::clone)?;
         let mut command = Command::new(program);
         for name in GIT_REDIRECTS {
             command.env_remove(name);
         }
+        command.env(crate::remote::lfs::NO_SYSTEM_ATTRIBUTES, "1");
         command.args(args).stdin(Stdio::null());
         Ok(command)
     }
@@ -970,6 +978,24 @@ mod tests {
     use crate::boxside::helper_trusted;
     use crate::boxside::payload::Payload;
     use crate::console::Console;
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "a git that cannot be named must fail the case loudly")]
+    fn a_box_git_call_reads_no_system_wide_attributes_file() {
+        let git = Git {
+            program: Ok(PathBuf::from("git.exe")),
+        };
+
+        let command = git.command(&["status"]).expect("the command is built");
+
+        assert!(
+            command
+                .get_envs()
+                .any(|pair| pair == (std::ffi::OsStr::new("GIT_ATTR_NOSYSTEM"), Some(std::ffi::OsStr::new("1")))),
+            "{:?}",
+            command.get_envs().collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn no_desktop_helper_is_no_refusal() {

@@ -91,6 +91,7 @@ fn probe_of(name: &str) -> Option<ToolProbe> {
         "pnpm" => runs("pnpm", &["--version"]),
         "pwsh" => runs("pwsh", &["--version"]),
         "ffmpeg" => runs("ffmpeg", &["-version"]),
+        "git-lfs" => runs("git-lfs", &["version"]),
         "godot" => Some(ToolProbe::Godot),
         "unreal" => Some(ToolProbe::Unreal),
         _ => None,
@@ -768,6 +769,27 @@ mod tests {
         assert!(is_reparse_point(true, 0), "a link as the file type says");
         assert!(!is_reparse_point(false, ARCHIVE), "a plain file");
         assert!(!is_reparse_point(false, DIRECTORY), "a plain folder");
+    }
+
+    /// `git-lfs version` answers `git-lfs/<x.y.z> (...)`; the version is the one after the slash, never the go or git
+    /// version in the parentheses.
+    #[test]
+    fn git_lfs_version_is_read_from_its_slash_line() {
+        assert_eq!(
+            version_of("git-lfs/3.8.0 (GitHub; windows amd64; go 1.24.4; git 2d2b1a8c)\n", ""),
+            Some("3.8.0".to_owned())
+        );
+        assert_eq!(
+            version_of("git-lfs/3.7.1-rc1 (GitHub; windows arm64; go 1.24.2)\r\n", ""),
+            Some("3.7.1".to_owned())
+        );
+        assert!(matches!(
+            super::probe_of("git-lfs"),
+            Some(super::ToolProbe::Runs {
+                program: "git-lfs",
+                args: &["version"]
+            })
+        ));
     }
 
     #[test]

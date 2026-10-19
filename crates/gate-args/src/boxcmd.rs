@@ -2,7 +2,7 @@
 //! is stdin's first line, which the binary reads and decodes. `gate box register-desktop` takes no `--stdin`: it reads
 //! no request. A `test-seams` build also reads the hidden
 //! `--test-heartbeat-ms <n>`, `--test-box-console fail-before`, `--test-box-token refused`, `--test-box-park-launch <path>`,
-//! `--test-outputs-budget-bytes <n>`, `--test-inputs-budget-bytes <n>`, `--test-dotnet-limit-ms <n>`,
+//! `--test-outputs-budget-bytes <n>`, `--test-inputs-budget-bytes <n>`, `--test-lfs-budget-bytes <n>`, `--test-dotnet-limit-ms <n>`,
 //! `--test-box-sample-ms <n>`, `--test-box-sampler-fail true|false`, `--test-box-free-percent <1-100>`,
 //! `--test-box-kill-leaves <n>`, `--test-probe-limit-ms <n>`, `--test-box-desktop <fault>`,
 //! `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>`, `--test-box-desktop-ms <n>` and
@@ -55,6 +55,7 @@ fn verb(text: &str) -> Option<BoxVerb> {
         "outputs" => Some(BoxVerb::Outputs),
         "inflight" => Some(BoxVerb::Inflight),
         "inputs" => Some(BoxVerb::Inputs),
+        "lfs" => Some(BoxVerb::Lfs),
         "register-desktop" => Some(BoxVerb::RegisterDesktop),
         _ => None,
     }
@@ -76,6 +77,8 @@ enum Seam {
     OutputsBudgetBytes,
     /// `--test-inputs-budget-bytes <n>`: the most bytes one inputs put unpacks, decompressed.
     InputsBudgetBytes,
+    /// `--test-lfs-budget-bytes <n>`: the most bytes one LFS put unpacks.
+    LfsBudgetBytes,
     /// `--test-dotnet-limit-ms <n>`: how long the preflight's `dotnet --list-sdks` may take.
     DotnetLimitMs,
     /// `--test-box-sample-ms <n>`: the period of the run's samples of its machine.
@@ -112,6 +115,7 @@ impl Seam {
             "--test-box-park-launch" => Some(Seam::ParkLaunch),
             "--test-outputs-budget-bytes" => Some(Seam::OutputsBudgetBytes),
             "--test-inputs-budget-bytes" => Some(Seam::InputsBudgetBytes),
+            "--test-lfs-budget-bytes" => Some(Seam::LfsBudgetBytes),
             "--test-dotnet-limit-ms" => Some(Seam::DotnetLimitMs),
             "--test-box-sample-ms" => Some(Seam::SampleMs),
             "--test-box-sampler-fail" => Some(Seam::SamplerFail),
@@ -136,6 +140,7 @@ impl Seam {
             Seam::ParkLaunch => "--test-box-park-launch",
             Seam::OutputsBudgetBytes => "--test-outputs-budget-bytes",
             Seam::InputsBudgetBytes => "--test-inputs-budget-bytes",
+            Seam::LfsBudgetBytes => "--test-lfs-budget-bytes",
             Seam::DotnetLimitMs => "--test-dotnet-limit-ms",
             Seam::SampleMs => "--test-box-sample-ms",
             Seam::SamplerFail => "--test-box-sampler-fail",
@@ -181,7 +186,7 @@ fn seams(words: &mut Peekable<impl Iterator<Item = OsString>>, problems: &mut Ve
 
 /// Sets `seam` from `value`: whole milliseconds above 0 for the heartbeat, the dotnet limit, the sample period, the
 /// probe limit and the desktop waits, `fail-before` for the console, `refused` for the token, any path for the park,
-/// whole bytes above 0 for the outputs and the inputs budgets, `true` or `false` for the sampler's failure, a whole
+/// whole bytes above 0 for the outputs, the inputs and the LFS budgets, `true` or `false` for the sampler's failure, a whole
 /// percent from 1 to 100 for the free share, a whole count above 0 for the processes a kill leaves, one of the desktop
 /// faults for the desktop, one of the session states for the desktop session, 1 to 64 letters, digits and `-` for the
 /// desktop mutex and `ok` or `fail` for the registration. An empty or missing value is no value.
@@ -196,6 +201,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::HeartbeatMs => seams.heartbeat_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::OutputsBudgetBytes => seams.outputs_budget_bytes = Some(crate::values::above_zero(name, &value)?),
         Seam::InputsBudgetBytes => seams.inputs_budget_bytes = Some(crate::values::above_zero(name, &value)?),
+        Seam::LfsBudgetBytes => seams.lfs_budget_bytes = Some(crate::values::above_zero(name, &value)?),
         Seam::DotnetLimitMs => seams.dotnet_limit_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::SampleMs => seams.sample_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::SamplerFail => seams.sampler_fail = crate::values::true_or_false(name, &value)?,

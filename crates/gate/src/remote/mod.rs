@@ -41,6 +41,7 @@ mod held;
 mod inputs;
 mod install;
 mod launch;
+pub(crate) mod lfs;
 mod outputs;
 pub(crate) mod parity;
 pub(crate) mod payload;
@@ -91,6 +92,8 @@ pub(crate) enum Refusal {
     Desktop,
     /// The desktop helper the run would hand its command to is not installed where only administrators can change it.
     Install,
+    /// The repo's LFS store does not hold what the run's snapshot's pointers name as its `LfsDigest` says.
+    Lfs,
 }
 
 impl Refusal {
@@ -103,6 +106,7 @@ impl Refusal {
             Refusal::Inputs => "inputs",
             Refusal::Desktop => "desktop",
             Refusal::Install => "install",
+            Refusal::Lfs => "lfs",
         }
     }
 }
@@ -353,13 +357,14 @@ pub(crate) struct RemoteOutcome {
 }
 
 /// How long a routed run's parts took: the run call, the command's own time, which its ceiling counts; the push; and the
-/// inputs calls, the sync-back's fetch and the outputs fetch, each `None` when the run made none. A client that times
-/// none of them leaves them all at zero and `None`.
+/// inputs calls, the LFS calls, the sync-back's fetch and the outputs fetch, each `None` when the run made none. A
+/// client that times none of them leaves them all at zero and `None`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Split {
     pub command: Duration,
     pub push: Duration,
     pub inputs: Option<Duration>,
+    pub lfs: Option<Duration>,
     pub sync_back: Option<Duration>,
     pub outputs: Option<Duration>,
 }
@@ -664,7 +669,7 @@ mod scripted {
     /// How often `wait` looks for its path and the interrupt.
     const WAIT_STEP: Duration = Duration::from_millis(20);
     /// Every reason a `refuse` step may give.
-    const REASONS: [FallbackReason; 13] = [
+    const REASONS: [FallbackReason; 14] = [
         FallbackReason::Full,
         FallbackReason::Busy,
         FallbackReason::Unreachable,
@@ -678,6 +683,7 @@ mod scripted {
         FallbackReason::Cold,
         FallbackReason::Desktop,
         FallbackReason::Install,
+        FallbackReason::Lfs,
     ];
 
     #[derive(Debug, PartialEq)]

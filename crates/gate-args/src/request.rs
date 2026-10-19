@@ -66,6 +66,8 @@ pub struct BoxSeams {
     /// The most bytes `gate box inputs` unpacks from one put, decompressed, over the built-in 4 GiB; `None` without the
     /// feature.
     pub inputs_budget_bytes: Option<u64>,
+    /// The most bytes `gate box lfs` unpacks from one put, over the built-in 16 GiB; `None` without the feature.
+    pub lfs_budget_bytes: Option<u64>,
     /// How long `gate box preflight`'s `dotnet --list-sdks` may take, in milliseconds, in place of the built-in 30 s;
     /// `None` without the feature.
     pub dotnet_limit_ms: Option<u64>,
@@ -178,6 +180,8 @@ pub enum BoxVerb {
     Inflight,
     /// Which of a routed run's ignored inputs the work folder lacks, or their install.
     Inputs,
+    /// Which of a routed run's Git LFS objects the repository's store lacks, or their install.
+    Lfs,
     /// The registration of the desktop helper's task; the one verb that takes no request.
     RegisterDesktop,
 }
@@ -194,6 +198,7 @@ impl BoxVerb {
             BoxVerb::Outputs => "outputs",
             BoxVerb::Inflight => "inflight",
             BoxVerb::Inputs => "inputs",
+            BoxVerb::Lfs => "lfs",
             BoxVerb::RegisterDesktop => "register-desktop",
         }
     }
@@ -323,6 +328,9 @@ pub struct TestSeams {
     /// The most bytes one put of the remote client's inputs may total, decompressed, in place of 4 GiB: a set past it
     /// is not sent, and the run falls back `inputs`.
     pub remote_inputs_budget_bytes: Option<u64>,
+    /// The most bytes one put of the remote client's LFS objects may total, in place of 16 GiB: a set past it is not
+    /// sent, and the run falls back `lfs`.
+    pub remote_lfs_budget_bytes: Option<u64>,
     /// The most bytes of one remote call's output the remote client writes to the gate's log, in place of 256 MiB.
     pub remote_log_cap_bytes: Option<u64>,
     /// A change the remote client makes to its own folders at one point of its run, as `<point>:<step>`: before it

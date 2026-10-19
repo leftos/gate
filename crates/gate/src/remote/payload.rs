@@ -123,6 +123,9 @@ pub(crate) struct RunCall<'a> {
     pub sibling_snapshots: &'a [(String, String)],
     /// The SHA-256 of the inputs manifest line the inputs calls sent (`InputsDigest`), `None` for a run with no inputs.
     pub inputs_digest: Option<&'a str>,
+    /// The SHA-256 of the LFS manifest line of the objects the snapshot's pointers name, without its newline
+    /// (`LfsDigest`), `None` for a run whose snapshot holds no pointer.
+    pub lfs_digest: Option<&'a str>,
     /// The run's variables, the caller's `--env` pairs and the gate's `SourceRevisionId` (`Env`, sent only when there
     /// is one); a warm-up never sends them.
     pub env: &'a [(String, String)],
@@ -284,6 +287,9 @@ fn insert_siblings_and_inputs(object: &mut Map<String, Value>, run: &RunCall<'_>
     if let Some(digest) = run.inputs_digest {
         object.insert("InputsDigest".to_owned(), json!(digest));
     }
+    if let Some(digest) = run.lfs_digest {
+        object.insert("LfsDigest".to_owned(), json!(digest));
+    }
 }
 
 /// `object` as one word: base64 of its compact UTF-8 JSON.
@@ -383,6 +389,7 @@ mod tests {
             host: "builder",
             sibling_snapshots,
             inputs_digest: None,
+            lfs_digest: None,
             env: &[],
             godot_version: None,
             unreal_version: None,
@@ -506,6 +513,7 @@ mod tests {
             host: "builder",
             sibling_snapshots: &[],
             inputs_digest: None,
+            lfs_digest: None,
             env: &[],
             godot_version: None,
             unreal_version: None,
@@ -550,6 +558,7 @@ mod tests {
             host: "builder",
             sibling_snapshots: &[],
             inputs_digest: Some("ab"),
+            lfs_digest: None,
             env: &[],
             godot_version: None,
             unreal_version: None,
@@ -560,6 +569,19 @@ mod tests {
         let sent = decoded(&run_word(&location(), &run));
 
         assert_eq!(sent["InputsDigest"], json!("ab"), "a run with inputs names their digest");
+        assert!(sent.get("LfsDigest").is_none(), "a run with no LFS pointers sends no LfsDigest: {sent}");
+        let lfs_digest = "cd".repeat(32);
+        let with_lfs = RunCall {
+            lfs_digest: Some(&lfs_digest),
+            ..run
+        };
+        let sent_lfs = decoded(&run_word(&location(), &with_lfs));
+        assert_eq!(sent_lfs["LfsDigest"], json!(lfs_digest), "a run with LFS pointers names their digest");
+        assert_eq!(
+            on_the_box(&run_word(&location(), &with_lfs)).lfs_digest(),
+            Ok(Some(lfs_digest.as_str())),
+            "the box reads it back"
+        );
         let diff = decoded(&inputs_word(&location(), "n2", InputsStep::Diff));
         assert_eq!(
             (&diff["Nonce"], &diff["Step"], &diff["Work"]),
@@ -586,6 +608,7 @@ mod tests {
             host: "builder",
             sibling_snapshots: &[],
             inputs_digest: None,
+            lfs_digest: None,
             env: &env,
             godot_version: None,
             unreal_version: None,
@@ -623,6 +646,7 @@ mod tests {
             host: "builder",
             sibling_snapshots: &[],
             inputs_digest: None,
+            lfs_digest: None,
             env: &[],
             godot_version: Some("4.7.2"),
             unreal_version: None,
@@ -666,6 +690,7 @@ mod tests {
             host: "builder",
             sibling_snapshots: &[],
             inputs_digest: None,
+            lfs_digest: None,
             env: &[],
             godot_version: None,
             unreal_version: Some("5.8.0"),
@@ -710,6 +735,7 @@ mod tests {
             host: "builder",
             sibling_snapshots: &[],
             inputs_digest: None,
+            lfs_digest: None,
             env: &[],
             godot_version: None,
             unreal_version: None,
@@ -758,6 +784,7 @@ mod tests {
             host: "builder",
             sibling_snapshots: &[],
             inputs_digest: None,
+            lfs_digest: None,
             env: &[],
             godot_version: None,
             unreal_version: None,
@@ -813,6 +840,7 @@ mod tests {
             host: "builder",
             sibling_snapshots,
             inputs_digest,
+            lfs_digest: None,
             env: &[],
             godot_version: None,
             unreal_version: None,

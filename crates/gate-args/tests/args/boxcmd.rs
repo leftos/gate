@@ -7,7 +7,7 @@ use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation, USAGE};
 
 use crate::support::{invocation, os, problems, problems_of, unreadable_word};
 
-const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs --stdin (the base64 JSON request as stdin's first line)";
+const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)";
 
 #[test]
 fn each_verb_parses_with_stdin() {

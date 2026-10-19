@@ -119,6 +119,21 @@ pub fn is_protected_folder(folder: &File) -> io::Result<bool> {
     Ok(without_auto_inherit(&text_of(folder, what)?) == without_auto_inherit(&expected))
 }
 
+/// Whether the open file `file`, opened with `READ_CONTROL`, was made with [`protected_descriptor`]'s security, as
+/// [`is_protected_folder`] reads a folder's: the same owner, DACL and label, but for the flags that hand an entry down,
+/// which the system keeps on a file's DACL entries and drops from its label's.
+///
+/// # Errors
+///
+/// The system's error when this process's token or the file's security cannot be read.
+pub fn is_protected_file(file: &File) -> io::Result<bool> {
+    let facts = token_facts()?;
+    let what = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
+    let expected = descriptor_text(protected_descriptor(&facts)?.as_ptr(), what)?;
+    let handed_down = |text: &str| without_auto_inherit(text).replace(";OICI;", ";;");
+    Ok(handed_down(&text_of(file, what)?) == handed_down(&expected))
+}
+
 /// The SDDL `text` with the automatic-inheritance flags (`AI`, `AR`) left out of its DACL and its label, which the
 /// system sets on a list it was given and the descriptor it was given lacks, its ACE list kept whole; public so a
 /// caller may compare two texts whose only difference is those flags.

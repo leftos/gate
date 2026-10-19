@@ -60,7 +60,7 @@ const STAGE_AGE: Duration = Duration::from_hours(24);
 const PAIR_REFUSED: &str = "gate box: inputs for a sibling pair are not taken yet";
 /// The access a staged file is opened with to be moved into the work folder: its stamp read, its name moved, its DACL
 /// and label set.
-const STAGED_ACCESS: u32 = FILE_READ_ATTRIBUTES | DELETE | READ_CONTROL | WRITE_DAC | WRITE_OWNER;
+pub(super) const STAGED_ACCESS: u32 = FILE_READ_ATTRIBUTES | DELETE | READ_CONTROL | WRITE_DAC | WRITE_OWNER;
 
 /// The record of the inputs installed in the work folder `work`: `{work}.inputs`.
 pub(super) fn record_path(work: &str) -> String {
@@ -172,6 +172,27 @@ impl Asked<'_> {
     fn failed(&self, why: &str) -> String {
         format!("gate: remote inputs {} failed: {}", self.step.word(), escaped(why))
     }
+
+    /// The work folder and its lock as [`locked`] takes them.
+    fn work_lock(&self) -> WorkLock<'_> {
+        WorkLock {
+            key: self.key,
+            work: self.work,
+            bare: self.bare,
+            lock: self.lock,
+            nonce: self.nonce,
+        }
+    }
+}
+
+/// The work folder a box verb holds while it works, as [`locked`] takes it: its key, its path, the bare repository it
+/// shares, its lock file, and the nonce a busy refusal names.
+pub(super) struct WorkLock<'a> {
+    pub(super) key: &'a str,
+    pub(super) work: &'a str,
+    pub(super) bare: &'a str,
+    pub(super) lock: &'a str,
+    pub(super) nonce: &'a str,
 }
 
 /// The PC's inputs manifest, and the SHA-256 of its line as received, without its line end.
@@ -230,7 +251,7 @@ pub(super) fn inputs(payload: &Payload, seams: &BoxSeams, console: &mut Console)
         Err(why) => return failed(&asked, &why, console),
     };
     match asked.step {
-        Step::Diff => match locked(&asked, console, |work, console| diff(&asked, &sent, work, console)) {
+        Step::Diff => match locked(&asked.work_lock(), console, |work, console| diff(&asked, &sent, work, console)) {
             Ok(Ok(())) => 0,
             Ok(Err(why)) => failed(&asked, &why, console),
             Err(status) => status,
@@ -248,8 +269,8 @@ fn failed(asked: &Asked<'_>, why: &str, console: &mut Console) -> u32 {
 /// `step` run on the work folder, held, under its lock: the lock taken as a run takes it, a held lock refused `busy`
 /// (75), and the work folder laid out as a run lays it out ([`run::lay_out_alone`]) and held through the step. `Err`
 /// with the status to answer when the step never ran, its lines said.
-fn locked<T>(
-    asked: &Asked<'_>,
+pub(super) fn locked<T>(
+    asked: &WorkLock<'_>,
     console: &mut Console,
     step: impl FnOnce(&File, &mut Console) -> Result<T, String>,
 ) -> Result<Result<T, String>, u32> {
@@ -452,7 +473,7 @@ fn not_a_folder(prefix: &str) -> io::Error {
 }
 
 /// Whether the open `file` is a plain disk file of one name, not a link or a junction; else why not.
-fn plain_copy(file: &File) -> io::Result<()> {
+pub(super) fn plain_copy(file: &File) -> io::Result<()> {
     gate_win32::check_plain_file(file)?;
     if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(io::Error::other("it is a link or a junction"));
@@ -583,14 +604,16 @@ fn staged(asked: &Asked<'_>, sent: &Sent, seams: &BoxSeams, stage: &Stage, conso
         Ok(files) => files,
         Err(why) => return Ok(Err(why)),
     };
-    locked(asked, console, |work, console| installed(asked, sent, (&files, &entries), work, console))
+    locked(&asked.work_lock(), console, |work, console| {
+        installed(asked, sent, (&files, &entries), work, console)
+    })
 }
 
 /// The folder of the unpacked files, opened as itself beneath the held stage and held without delete sharing, once it
 /// is shown to be a folder of its own that the path the archive was unpacked into names too: the folder that path
 /// opens, through whatever links are on its way, is the held one by volume and file id ([`gate_win32::same_file`]).
 /// Else why not.
-fn staged_files(stage: &Stage) -> Result<File, String> {
+pub(super) fn staged_files(stage: &Stage) -> Result<File, String> {
     let path = stage.path.join(STAGED_FILES);
     let cannot = |error: io::Error| format!("cannot open the staged files {}: {error}", path.display());
     let files = gate_win32::open_beneath(&stage.held, STAGED_FILES, Share::NoDelete).map_err(cannot)?;
@@ -614,41 +637,59 @@ fn staged_files(stage: &Stage) -> Result<File, String> {
 /// A put's stage, made and held: the box's root, the stages folder below it and the stage below that, each held
 /// without delete sharing, so none of them can be renamed or swapped for a link while the put works; and the stage's
 /// path, which the archive is unpacked below.
-struct Stage {
+pub(super) struct Stage {
     #[cfg_attr(not(test), expect(dead_code, reason = "held, never read: the handle keeps the root from being renamed"))]
     root: File,
     #[cfg_attr(not(test), expect(dead_code, reason = "held, never read: the handle keeps the folder from being renamed"))]
     stages: File,
     /// The stage itself, opened with `DELETE` access, so it is removed through this handle.
     held: File,
-    path: PathBuf,
+    pub(super) path: PathBuf,
 }
 
 /// This put's stage, `{root}\{stages}\{key}-{nonce}`, made as a new folder with the security that keeps every other
 /// account and every lower process out from the instant it exists ([`gate_win32::protected_descriptor`]), and held
 /// with its root and stages folder ([`Stage`]): the root opened as itself and refused when it is a link, a junction or
-/// not a folder; the stages folder of this box's elevation ([`stages_name`]) readied beneath it ([`stages_folder`]);
+/// not a folder; the stages folder of this box's elevation ([`stages_name`]) readied beneath it ([`protected_folder`]);
 /// every stage older than a day removed first ([`pruned`]). A stage of that name already there is refused, never
 /// shared. Else why not.
 fn made_stage(asked: &Asked<'_>, console: &mut Console) -> Result<Stage, String> {
     let facts = gate_win32::token_facts().map_err(|error| format!("cannot read the box's token: {error}"))?;
-    let security = gate_win32::protected_descriptor(&facts).map_err(|error| format!("cannot make the box's security: {error}"))?;
+    let named = StageNamed {
+        root: asked.root,
+        stages: stages_name(facts.elevated),
+        key: asked.key,
+        nonce: asked.nonce,
+    };
+    made_stage_named(&named, console)
+}
+
+/// Where a put's stage is made: `{root}\{stages}\{key}-{nonce}`.
+pub(super) struct StageNamed<'a> {
+    pub(super) root: &'a str,
+    pub(super) stages: &'a str,
+    pub(super) key: &'a str,
+    pub(super) nonce: &'a str,
+}
+
+/// The stage `named` names, made and held as [`made_stage`] makes one, in the stages folder `named.stages`.
+pub(super) fn made_stage_named(named: &StageNamed<'_>, console: &mut Console) -> Result<Stage, String> {
+    let security = protected_security()?;
     let root = OpenOptions::new()
         .read(true)
         .share_mode(Share::NoDelete.mode())
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(asked.root)
-        .map_err(|error| format!("cannot open {}: {error}", asked.root))?;
-    if !is_folder_itself(&root).map_err(|error| format!("cannot open {}: {error}", asked.root))? {
-        return Err(format!("{} is a link, a junction or not a folder", asked.root));
+        .open(named.root)
+        .map_err(|error| format!("cannot open {}: {error}", named.root))?;
+    if !is_folder_itself(&root).map_err(|error| format!("cannot open {}: {error}", named.root))? {
+        return Err(format!("{} is a link, a junction or not a folder", named.root));
     }
-    let stages_name = stages_name(facts.elevated);
-    let path = Path::new(asked.root).join(stages_name);
-    let stages = stages_folder(&root, &path, stages_name, &security)?;
+    let path = Path::new(named.root).join(named.stages);
+    let stages = protected_folder(&root, &path, named.stages, STAGES_ACCESS, &security)?;
     for line in pruned(&stages, &path, SystemTime::now()) {
         console.err(&line);
     }
-    let name = format!("{}-{}", asked.key, asked.nonce);
+    let name = format!("{}-{}", named.key, named.nonce);
     let stage = gate_win32::make_folder_beneath(&stages, &name, FILE_GENERIC_READ | DELETE, Share::NoDelete, &security)
         .map_err(|error| format!("cannot make the stage {}: {error}", path.join(&name).display()))?;
     Ok(Stage {
@@ -667,24 +708,30 @@ fn stages_name(elevated: bool) -> &'static str {
     if elevated { "inputs-stage" } else { "inputs-stage-medium" }
 }
 
-/// The stages folder `name`, whose path is `path`, readied beneath the held root `root` and held without delete
-/// sharing: made new with the security `security`, so it is never seen with any other, when nothing has the name;
-/// else the folder there adopted ([`adopted`]), so two puts that make it at once share it. Else why not.
-fn stages_folder(root: &File, path: &Path, name: &str, security: &Descriptor) -> Result<File, String> {
-    match gate_win32::make_folder_beneath(root, name, STAGES_ACCESS, Share::NoDelete, security) {
+/// The security every folder the box keeps from other accounts and lower processes is made with
+/// ([`gate_win32::protected_descriptor`]) for the box's own token; else why it cannot be made.
+pub(super) fn protected_security() -> Result<Descriptor, String> {
+    let facts = gate_win32::token_facts().map_err(|error| format!("cannot read the box's token: {error}"))?;
+    gate_win32::protected_descriptor(&facts).map_err(|error| format!("cannot make the box's security: {error}"))
+}
+
+/// The protected folder `name`, whose path is `path`, readied beneath the held folder `root` and held with `access`
+/// without delete sharing: made new with the security `security`, so it is never seen with any other, when nothing has
+/// the name; else the folder there adopted ([`adopted`]), so two puts that make it at once share it. Else why not.
+pub(super) fn protected_folder(root: &File, path: &Path, name: &str, access: u32, security: &Descriptor) -> Result<File, String> {
+    match gate_win32::make_folder_beneath(root, name, access, Share::NoDelete, security) {
         Ok(made) => Ok(made),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => adopted(root, path, name),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => adopted(root, path, name, access),
         Err(error) => Err(format!("cannot ready {}: {error}", path.display())),
     }
 }
 
-/// The stages folder `name` already at `path` beneath the held root `root`, adopted: opened as itself with no more
-/// access than lists it and reads its security ([`STAGES_ACCESS`]), and kept, as [`stages_folder`] holds it, only when
-/// it is a folder of its own whose owner, DACL and label are those this box makes its folders with
-/// ([`gate_win32::is_protected_folder`]), read through that same handle. Anything else at the name is another
-/// account's, one the box may not open included, and is refused: never walked, emptied or replaced, since another
-/// account may have filled it. Else why not.
-fn adopted(root: &File, path: &Path, name: &str) -> Result<File, String> {
+/// The folder `name` already at `path` beneath the held folder `root`, adopted: opened as itself with `access`, no
+/// more than reads it and its security, and kept, as [`protected_folder`] holds it, only when it is a folder of its own
+/// whose owner, DACL and label are those this box makes its folders with ([`gate_win32::is_protected_folder`]), read
+/// through that same handle. Anything else at the name is another account's, one the box may not open included, and is
+/// refused: never walked, emptied or replaced, since another account may have filled it. Else why not.
+fn adopted(root: &File, path: &Path, name: &str, access: u32) -> Result<File, String> {
     let foreign = || {
         format!(
             "cannot use {}: another account made it; remove it, or give it to Administrators",
@@ -692,7 +739,7 @@ fn adopted(root: &File, path: &Path, name: &str) -> Result<File, String> {
         )
     };
     let cannot = |error: io::Error| format!("cannot ready {}: {error}", path.display());
-    let found = match gate_win32::open_beneath_as(root, name, STAGES_ACCESS, Share::NoDelete, Make::Open) {
+    let found = match gate_win32::open_beneath_as(root, name, access, Share::NoDelete, Make::Open) {
         Ok(found) => found,
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Err(foreign()),
         Err(error) => return Err(cannot(error)),
@@ -707,7 +754,7 @@ fn adopted(root: &File, path: &Path, name: &str) -> Result<File, String> {
 /// Whether the stage's path names the held stage itself: the folder it opens, through whatever links are on its way,
 /// is the held stage by volume and file id ([`gate_win32::same_file`]). Else why not, so nothing is unpacked anywhere
 /// else.
-fn same_stage(stage: &Stage) -> Result<(), String> {
+pub(super) fn same_stage(stage: &Stage) -> Result<(), String> {
     let cannot = |error: io::Error| format!("cannot check the stage {}: {error}", stage.path.display());
     let by_path = OpenOptions::new()
         .read(true)
@@ -725,7 +772,7 @@ fn same_stage(stage: &Stage) -> Result<(), String> {
 
 /// Removes the stage beneath its held handle as itself, everything in it first, deepest first and each entry as
 /// itself ([`gate_win32::delete_tree_opened`]), while the stages folder is still held. Else why not.
-fn removed_stage(stage: &Stage) -> Result<(), String> {
+pub(super) fn removed_stage(stage: &Stage) -> Result<(), String> {
     gate_win32::delete_tree_opened(&stage.held).map_err(|error| format!("cannot remove the stage {}: {error}", stage.path.display()))
 }
 
@@ -787,10 +834,20 @@ fn old_stage(stages: &File, name: &str, now: SystemTime) -> Result<Option<File>,
     }
 }
 
-/// Whether `name` is a stage's name, `{key}-{nonce}`: a key and an outputs nonce of lower-case hex.
-fn is_stage_name(name: &str) -> bool {
-    name.rsplit_once('-')
-        .is_some_and(|(key, nonce)| !key.is_empty() && is_lower_hex(nonce, OUTPUTS_NONCE_DIGITS))
+/// The lower-case hex digits of the random suffix of a run's LFS scratch folder's name.
+pub(super) const SCRATCH_SUFFIX_DIGITS: usize = 16;
+
+/// Whether `name` is a stage's name: `{key}-{nonce}`, a key and an outputs nonce of lower-case hex, or a run's LFS
+/// scratch folder's `{key}-{nonce}-{random}`, [`SCRATCH_SUFFIX_DIGITS`] lower-case hex digits after it.
+pub(super) fn is_stage_name(name: &str) -> bool {
+    let keyed = |name: &str| {
+        name.rsplit_once('-')
+            .is_some_and(|(key, nonce)| !key.is_empty() && is_lower_hex(nonce, OUTPUTS_NONCE_DIGITS))
+    };
+    keyed(name)
+        || name
+            .rsplit_once('-')
+            .is_some_and(|(stage, random)| is_lower_hex(random, SCRATCH_SUFFIX_DIGITS) && keyed(stage))
 }
 
 /// Checks every member of `staged`, the held folder of the unpacked files and their entries, against the manifest and

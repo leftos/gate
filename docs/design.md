@@ -369,6 +369,8 @@ On stdout, each line prefixed `check: <host>: `, in this order:
 1. The header `check: <host>: <repo> (work folder <key>)`.
 2. `check: <host>: created <folder>` for each folder the preflight made, at most 20, then `check: <host>: and <n> more created folders`.
 3. The items, worded as on this PC with `<host>` for `here`: the SDK reads `.NET SDK <version> (rollForward <policy>) missing (<host> has <list>)`, the list cut at 20 entries and then `, and <n> more`; `.NET SDK skipped: <host> sent no SDK list`, with `: <last stderr line>` when there is one; a tool that did not answer is `check: <host>: <tool> skipped: the builder gave no answer`; the workloads are `not checked yet`.
+
+   `git-lfs` at 3.1.3 or later (or the manifest's higher minimum) is an item like any tool when a `.gitattributes` git tracks in the worktree, at any depth, names the LFS filter, judged as routing judges it.
 4. The warm-up's items, as on this PC ([The warm-up items](#the-warm-up-items)) and this PC's own: the lock is probed before the record is read, as the route does, and the record is said only when it names `<host>` or cannot be read (`check: <host>: warm-up: the warm-up record <path> cannot be read: <error>`, with the suffix above, only informing), and with consent and a warm-up file that parsed, `check: <host>: warm-up: the work folder is warm` (ok) when the preflight's `gate: remote warm` line holds the hash of the worktree's file, else `check: <host>: warm-up: the work folder is not warm` (only informs).
 5. The install hints `install: <host>: <tool>: <command>`: `cargo install cargo-nextest --locked`, `npm install -g pnpm@<min>` (`npm install -g pnpm` with no minimum), `rustup toolchain install <min> && rustup default <min>`, `dotnet-install.ps1 -Version <v>`, and `run the build-box toolchain script on <host>` for node, pwsh, ffmpeg and a rust with no minimum.
 6. The summary.
@@ -483,9 +485,9 @@ The lines, each on stderr and escaped to one line where it carries a path, a rep
 
 Hidden from the usage and from `--help`. It is the builder side of a routed run, run over ssh on the builder ([The box side](#the-box-side)).
 
-`gate box preflight|run|stop|boot|outputs|inflight|inputs --stdin` takes exactly one verb and the word `--stdin`, and no `--state-dir`: the request is the first line of stdin, and every path comes from it. The one exception is `gate box register-desktop`, which takes no request and no `--stdin`.
+`gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin` takes exactly one verb and the word `--stdin`, and no `--state-dir`: the request is the first line of stdin, and every path comes from it. The one exception is `gate box register-desktop`, which takes no request and no `--stdin`.
 
-Any other shape (no verb, no `--stdin`, any other word in its place, an unknown verb, an extra word) prints `usage: gate box preflight|run|stop|boot|outputs|inflight|inputs --stdin (the base64 JSON request as stdin's first line)` alone on stderr and exits 2.
+Any other shape (no verb, no `--stdin`, any other word in its place, an unknown verb, an extra word) prints `usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)` alone on stderr and exits 2.
 
 ### Later subcommands
 
@@ -517,7 +519,7 @@ Further modes arrive as subcommands of the same binary, each designed with its i
 | 2 | Usage: a missing, unknown or invalid input; a `.cmd` or `.bat` word the gate refuses (C5); a `--log` inside the state root; a critical gate under a heavy or light slot marker (K7); `--alone` with a slot other than critical, or inside a gate's command. Nothing is queued. `gate box` also uses 2 for a refused payload and for a refused subfolder or batch word ([The box side](#the-box-side)). |
 | 124 | The watchdog killed the command: STALLED, TIMED OUT or BACKSTOP (X2), for a routed run by the builder (TIMED OUT, BACKSTOP) or the client (STALLED, BACKSTOP); or a routed run's fetch outlived its transfer ceiling: TRANSFER TIMED OUT. |
 | 127 | The command could not be started (C7); the slot is released at once. `gate box run` uses it for the same failure. |
-| 75 | A builder refused a routed run (`gate box`): busy (`gate box run` finding its work folder's lock held), unreachable, parity, rebooted, tools, layout (the box could not clear or lay out its work folder), inputs, desktop (the box could not give the run the builder's desktop), install (the builder's gate or its desktop helper is not installed where only administrators can change it), version. The PC side reads the refusal and falls back to a local run, so a caller sees 75 only as a command's own status, or as a refusal that carried no reason (T5). |
+| 75 | A builder refused a routed run (`gate box`): busy (`gate box run` finding its work folder's lock held), unreachable, parity, rebooted, tools, layout (the box could not clear or lay out its work folder), inputs, lfs, desktop (the box could not give the run the builder's desktop), install (the builder's gate or its desktop helper is not installed where only administrators can change it), version. The PC side reads the refusal and falls back to a local run, so a caller sees 75 only as a command's own status, or as a refusal that carried no reason (T5). |
 
 The codes are kept (V4), with 75 added for refusals. 124 is the status coreutils `timeout` uses, so no caller mistakes a kill for the command's own status; a command that itself exits 124 is told apart in the journal's `verdict`.
 
@@ -595,13 +597,15 @@ The lines of a run that starts its command:
 
   The line names each sibling in declared order with its root as routing spells it. While it waits for a remote slot: `gate: waiting for a remote slot on <host> (<n> busy)` and `gate: still waiting for a remote slot on <host> (<s> s)`, as a local wait says them, ETA included.
 
-  A run the builder does not take says why and goes on here: `gate: remote <host> <reason>; running here`, with `<reason>` one of `full` (no remote slot within 60 s), `busy`, `unreachable`, `parity`, `rebooted`, `tools`, `layout`, `version`, `inputs` (the run's ignored inputs could not be sent, or the builder's work folder no longer held them at the run), `desktop` (the builder could not give the run its desktop) or `install` (the builder's gate is not installed where only administrators can change it), and `gate: remote <host> client could not start: <detail>; running here` when the remote client cannot start.
+  A run the builder does not take says why and goes on here: `gate: remote <host> <reason>; running here`, with `<reason>` one of `full` (no remote slot within 60 s), `busy`, `unreachable`, `parity`, `rebooted`, `tools`, `layout`, `version`, `inputs` (the run's ignored inputs could not be sent, or the builder's work folder no longer held them at the run), `lfs` (the run's Git LFS content could not be sent or listed, or the builder could not hold it or make the run's LFS scratch folder), `desktop` (the builder could not give the run its desktop) or `install` (the builder's gate is not installed where only administrators can change it), and `gate: remote <host> client could not start: <detail>; running here` when the remote client cannot start.
 
   A `layout` fallback removes the worktree's warm-up record, but only while it is the `warm` record of the builder the run went to, for the warm-up file on disk, under the remote key; another builder's record and the other fallbacks keep it.
 
   The record is not dropped on `version`, `tools` or `inputs`: that would re-warm every worktree after each `gate push` for nothing, since the preflight's `.warm` check catches a folder that really went cold. A removal that fails says `gate: cannot remove the warm-up record <path>: <error>` before that hint.
 
   A routed run whose repo declares `inputs` says `gate: inputs: <n> file(s), <X.X> MB (<Y.Y> MB compressed) in <Z.Z> s` once a put has sent files.
+
+  A routed run whose snapshot holds Git LFS pointers says `gate: lfs: <n> object(s), <X.X> MB in <Z.Z> s` once a put has sent objects, and `gate: lfs: <n> object(s) present` in the log only when the builder's store held them all. The reason of an `lfs` fallback is the log line `gate: remote lfs not sent: <reason>` ([Routing](#routing), Git LFS).
 
   Four lines go to the log only: `gate: inputs: <n> file(s) unchanged` (the manifest's entries, said when the builder needed none), `gate: inputs: <glob> matched nothing`, `gate: inputs: <path> is in the snapshot; not sent as an input` and `gate: inputs: <folder> is another repository; not sent as an input`. The reason of an `inputs` fallback is the log line `gate: remote inputs not sent: <reason>` ([Routing](#routing), Inputs).
 
@@ -615,9 +619,9 @@ The lines of a run that starts its command:
 
   A warm-up lock that cannot be probed says `gate: cannot probe the warm-up lock <path>: <error>` once (path and error escaped) and the wait goes on. A Ctrl+C during that wait, or raised at the key take, says `gate: interrupted while waiting for this worktree's work folder on <host>` and ends the gate with 0xC000013A, never a `busy` fallback.
 
-  A routed run that passed says `gate: passed in <w> s on <host> (load-adjusted <a> s, ceiling <n> s; command <c> s, push <p> s[, inputs <i> s][, sync-back <s> s][, outputs <o> s]). Full output: <log>`, with `past its ceiling of <n> s` in place of `ceiling <n> s` as the local line has it.
+  A routed run that passed says `gate: passed in <w> s on <host> (load-adjusted <a> s, ceiling <n> s; command <c> s, push <p> s[, inputs <i> s][, lfs <l> s][, sync-back <s> s][, outputs <o> s]). Full output: <log>`, with `past its ceiling of <n> s` in place of `ceiling <n> s` as the local line has it.
 
-  In it `<w>` is the attempt's whole wall time; `<a>` is the load-adjusted time the builder counted for the command, the clock `--timeout` bounds; `<c>` is the run call's own wall time; the push is always named, the inputs calls (diff and put together), the sync-back and the outputs fetch only when they ran, in the order they ran, each in whole seconds rounded half to even.
+  In it `<w>` is the attempt's whole wall time; `<a>` is the load-adjusted time the builder counted for the command, the clock `--timeout` bounds; `<c>` is the run call's own wall time; the push is always named, the inputs calls and the LFS calls (diff and put together), the sync-back and the outputs fetch only when they ran, in the order they ran, each in whole seconds rounded half to even.
 
   With no figure from the builder (its sampler failed) the clause reads `load-adjusted unknown: the sampler failed` and the past-ceiling check uses `<c>`. The client's status is the gate's own, passed through as `N`.
 - The stale line, on stderr and in the log, before the passed line, when a routed dotnet build (verb `build`, `test`, `publish`, `pack`, `run` or `msbuild`, with no `--no-build` of its own) passed and did not bring everything back: `gate: routed build left stale: <folders>`.
@@ -979,7 +983,7 @@ Fields beyond J1's:
   `transfer-timed-out` is a routed run's fetch after the command cut at its transfer ceiling.
 
   A routed run is a kill only when the gate killed it; a command that exits 124 on its own is `failed`.
-- `fallback`: `reason`, one of `full` (no remote slot within the 60 s wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `layout` (the box could not clear or lay out its work folder), `version` ([The box side](#the-box-side)), `client` (the remote client could not start, as when it finds no usable ssh), `inputs` (the run's ignored inputs could not be sent, a sibling pair declared inputs, or the box refused the run because its work folder no longer held the inputs sent), `desktop` (the builder could not give the run its desktop; the client reads the box's `desktop` refusal tag as this reason) and `install` (the builder's gate is not installed where only administrators can change it; the client reads the box's install refusal on the preflight, inputs and run calls, and its `install` refusal tag, as this reason). A journal line with the reason `cold` is still read, but no run writes it.
+- `fallback`: `reason`, one of `full` (no remote slot within the 60 s wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `layout` (the box could not clear or lay out its work folder), `version` ([The box side](#the-box-side)), `client` (the remote client could not start, as when it finds no usable ssh), `inputs` (the run's ignored inputs could not be sent, a sibling pair declared inputs, or the box refused the run because its work folder no longer held the inputs sent), `lfs` (the run's Git LFS content could not be listed or sent, or the box refused the run because its store does not hold the content the snapshot's pointers name or it could not make the run's LFS scratch folder), `desktop` (the builder could not give the run its desktop; the client reads the box's `desktop` refusal tag as this reason) and `install` (the builder's gate is not installed where only administrators can change it; the client reads the box's install refusal on the preflight, inputs and run calls, and its `install` refusal tag, as this reason). A journal line with the reason `cold` is still read, but no run writes it.
 
   The `take` after it is the run's local one, untagged, its `waitedSeconds` counted from the `fallback`, except after `full`, where it counts from the run's `queue` line; a Ctrl+C that ends that local wait writes the same figure on its `abandon`.
 - a routed run's `take`, `release` and `abandon` carry the tag; its `release` has the builder's `adjustedSeconds` (null when it said none) and a `wallSeconds` of the whole remote call, and the verdict `timed-out` or `backstop` after a kill by the builder or by the client's backstop.
@@ -1817,7 +1821,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     `toolchain::meets` compares a found version with a minimum. A repo's sibling worktrees are not declared here but in `.gate/siblings.toml` ([Sibling worktrees](#routing)), whose problems keep a run local.
 
-    The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version; a routed run reads the `godot` and `unreal` entries as exact pins instead (below). The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot`, `unreal` and `ffmpeg`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
+    The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version; a routed run reads the `godot` and `unreal` entries as exact pins instead (below). The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot`, `unreal`, `ffmpeg` and `git-lfs`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
 
     An optional `[env]` table of `NAME = "unreal"` names variables the box sets to the root of the Unreal Engine install the run chose, the folder `UE_ROOT` gets (below). `"unreal"` is the only value, and at most 64 entries are read.
 
@@ -1926,17 +1930,42 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     A Ctrl+C during the step ends the run as an interrupt with no fallback. A call whose input could not be fed logs `gate: the inputs call's input was not sent: <error>`.
 
     A sibling pair whose repos declare inputs is refused with reason `inputs` and `a sibling pair does not send inputs yet`, before any inputs call. `--test-remote-watch-call inputs-diff` names the diff and `inputs` the put; `--test-remote-interrupt-at inputs` raises the interrupt after the put's or diff's first output byte.
+  - **Git LFS.** In `remote/lfs.rs`, for a run whose snapshot holds LFS pointers; a run without any makes no LFS call and says nothing. After the snapshot commit the PC lists the tree's blobs of at most 1024 bytes (`git ls-tree`) whose `filter` attribute at that commit is `lfs` (`git check-attr --source <commit>`, which needs git 2.40), and reads them in one `git cat-file --batch`.
+
+    A blob that is exactly a spec-v1 pointer (its `version https://git-lfs.github.com/spec/v1` line, `oid sha256:<64 hex>`, `size <n>`, in that order and nothing else) is a pointer; any other blob, a raw file committed under `filter=lfs` included, is left alone. A tree with no `.gitattributes` is not asked at all. Two pointers naming one object at two sizes, or more than 50,000 objects, refuse the route.
+
+    The listing reads the tree's attributes as the builder's checkout does: `-c core.attributesFile=` and `GIT_ATTR_NOSYSTEM=1` on every call. A repo that uses LFS and whose common git folder's `info/attributes` is not empty is refused `lfs`, since the PC's `check-attr` reads that file and the builder's checkout of the snapshot never sees it.
+
+    The objects come from the worktree's LFS store, `<common>\lfs\objects\<aa>\<bb>\<oid>`, or the `objects` folder of `lfs.storage` when the repo sets it. Each is hashed as it is packed, and one that is missing, of another size or hash than its pointer names, or that changes while it is packed refuses the route `lfs`, the log line naming the pointer's path and saying to run `git lfs fetch`. The PC never downloads: an object its own store lacks is the user's to fetch.
+
+    The calls are made after the push and the inputs and before the run call, and the run call's request carries `LfsDigest`, the SHA-256 of the manifest line (`<oid> <size>` entries, space-separated, in the order of the first pointer naming each). The diff call (`gate box lfs`, `Step` `diff`) is fed the request and the manifest line and answers the oids the builder's store lacks or holds at another size.
+
+    The put call (`Step` `put`) is made only when the diff named an object, fed the request, the manifest line and an archive of exactly those objects in the inputs archive's format, each member named by its oid. A diff that names none says `gate: lfs: <n> object(s) present` in the log.
+
+    Caps: 50,000 objects, a 64 MiB manifest and 16 GiB per put (`--test-remote-lfs-budget-bytes` replaces the 16 GiB). The worktree's `.tmp` is held through the step and the diff's answer (`<key>-<nonce>.lfs-diff`) and the archive (`<key>-<nonce>.lfs.tar.zst`) are made there as the inputs' are.
+
+    Both calls are watched as the inputs' are (the diff by its stall window and its own transfer ceiling, the put by the later of the last byte fed and the last byte of output while it is fed, then by its ceiling) and each is made once more when it failed before the banner. `--test-remote-watch-call lfs-diff` names the diff and `lfs` the put; `--test-remote-interrupt-at lfs` raises the interrupt after the first output byte of either call.
+
+    Any failure of either call, an object the PC lacks, a listing git fails (the log says `cannot list the LFS pointers of <repo>: <why>`) or a manifest past a cap refuses the route with reason `lfs`: console `gate: remote <host> lfs; running here`, log `gate: remote lfs not sent: <reason>`.
+
+    A run the box refuses with the `lfs` tag falls back the same way, saying `the builder's LFS store does not hold the content the snapshot's pointers name`, or `the builder could not make the run's LFS scratch folder` when the box's last line is `gate: remote cannot make the run's LFS scratch folder: <why>`. A sibling pair whose repos hold pointers is refused `lfs` before any call, saying `<repo> holds LFS pointers, and a sibling pair does not send LFS content yet`.
+
+    A Ctrl+C during the step ends the run as an interrupt with no fallback.
+
+    The PC also asks the preflight for `git-lfs` at version 3.1.3 or later whenever the snapshot's tracked `.gitattributes` files use the LFS filter, whether or not it holds a pointer: the box's checkout then runs git-lfs for every file under the filter. A tracked `.gitattributes` is read as it is on disk, its first 1 MiB for a line that is not a comment holding the word `filter=lfs`, and a file over that cap counts as using LFS.
+
+    A manifest that declares `git-lfs` is weighed at the higher of its own minimum and 3.1.3, in the need sent, in the judgement and in `gate check --builder`. A builder without it, or older, falls back `parity` with the line naming the version found. `gate check --builder` reports the same need for a repo whose tracked `.gitattributes` name the filter.
   - **Run call.** The line goes over `ssh -o RequestTTY=no -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ForwardAgent=no -o ClearAllForwardings=yes -o Compression=yes -- <host> <line>`, each argument separate.
 
     `-o RequestTTY=no` leads the options of every `gate box` call and `gate push`'s, so stdin never passes through a pseudo-terminal. The last option, `-o Compression=yes`, is the run call's alone: the preflight, stop, boot and outputs calls, git's ssh command and `gate push` ask for none. The run call's compression covers both directions of its connection: the command's output and protocol lines one way, the request and the outputs manifest the other.
 
-    The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools|layout|inputs|desktop|install`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag and the adjusted line below.
+    The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools|layout|inputs|lfs|desktop|install`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag and the adjusted line below.
 
     The kill tag `gate-remote-killed: <nonce> timed-out|backstop` is said by the box just after its own kill line, and the client counts a box kill only on this run's tag with a status 124 (a status 124 alone is also what a stopped job or the command itself may end with). The client takes the run's verdict from the tag's kind, never from the log's last kill line.
 
     The adjusted line `gate-remote-adjusted: <nonce> <s.sss>` carries the load-adjusted seconds the box counted, said once the command's output has drained unless the sampler failed, read like the tag on stderr only and the last one winning; another run's, a malformed one or one whose seconds are not a finite number is a line like any other.
 
-    A status 75 is a refusal only when this run's refusal tag came on stderr before any start marker (`busy`, `tools`, `layout`, `inputs`, `desktop` or `install`, the fallback reason); a tag after the marker is ignored, so a command that prints the human busy, tools, layout, inputs, desktop or install line, or a tag of its own, and exits 75 ends with status 75 and no fallback.
+    A status 75 is a refusal only when this run's refusal tag came on stderr before any start marker (`busy`, `tools`, `layout`, `inputs`, `lfs`, `desktop` or `install`, the fallback reason); a tag after the marker is ignored, so a command that prints the human busy, tools, layout, inputs, lfs, desktop or install line, or a tag of its own, and exits 75 ends with status 75 and no fallback.
 
     Safety rests on order, not on the nonce being secret (the request is on no command line, but the nonce still appears in the run id, the pipe names and the archive name): the box says the marker before the command can run any code (before it creates the command's process, or, in a desktop run, while the command the helper created is still suspended), and the client ignores every tag once it has heard the marker.
   - **Desktop.** A routed run whose `RemoteRun.desktop` is true (Routing, the desktop paragraphs) sends `Desktop: true` and `DesktopWait` in its run call's payload (`payload::run_word`), `DesktopWait` being the usual remote wait, `REMOTE_LIMIT` (60 s), which the box caps at the run's `Timeout`. No other call sends either key, a warm-up included; the scripted test client's recorded call has a `desktop` key.
@@ -2333,6 +2362,49 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   Built: the `inputs` key and the route's `RemoteRun.inputs`, the box's `inputs` verb with the run's `InputsDigest` check ([The box side](#the-box-side)), and the client's part (the manifest, the diff and put calls, the hash cache, the lines and the `inputs` fallback reason), described under Inputs in [The remote client's run](#routing).
 
   Inputs have their own exclusion set, not the outputs': `.tmp/` is reachable, but a client never sends a path with a `.git` component, `.lfsconfig`, `.env`, `*.env`, `.env.<name>` or `.envrc` (at any depth, matched without regard to case), the gate's own archives and stages, or the run's log and `.err` file. The box refuses a manifest that names a `.git*` name, `.lfsconfig` or a `.env` file, or a path that is not plain and relative.
+- **Git LFS** (GATE-469): a repo that keeps assets in Git LFS routes with them. The PC sends the LFS objects the snapshot's pointers name to a protected store beside the repo's bare repository on the builder, and the box's checkout, whose LFS filter is live, writes their content into the work folder with no network access. It reuses the inputs verb's plumbing (diff, then put, the work folder's lock, a protected stage, the watch and the fallback).
+
+  Built: the PC's listing and calls, the box's `lfs` verb, the run's `LfsDigest` check, the checkout's pins and post-check, the back commit's pins and the `lfs` fallback reason, described under Git LFS in [The remote client's run](#routing) and under `lfs` and the LFS checkout in [The box side](#the-box-side).
+
+  A repo with no tracked `.gitattributes` naming `filter=lfs` is unaffected: it sends nothing, makes no scratch folder and needs no git-lfs on the builder.
+
+  What the design rests on in git-lfs, read in its source:
+  - A smudge trusts a local object by its size alone and never hashes it, and deletes one of the wrong size.
+  - Before reading, a smudge copies or links `<alternate>\..\lfs\objects\<oid>` when present. A work folder's alternates name the repo's `<Bare>\objects`, so `<Bare>\lfs\objects` is already a read path.
+  - A clean keeps an existing object of the same size.
+  - A tracked `.lfsconfig` may set `lfs.url`, `remote.*.lfsurl`, `lfs.fetchinclude`, `lfs.fetchexclude` and `lfs.skipdownloaderrors` but never `lfs.storage`, and git config overrides it.
+  - With `fetchexclude`, `skipdownloaderrors` or `GIT_LFS_SKIP_SMUDGE` a smudge writes the pointer and reports success.
+
+  The store's trust is therefore its writers: nothing re-hashes an object at checkout, so the oid name, a verified install and no lower-integrity writer are the record.
+
+  **One store per repo, not per builder.** The store is `<Bare>\lfs\objects\<aa>\<bb>\<oid>`, beside the bare repository every work folder of the repo shares, so a new worktree resends nothing and git-lfs reads it through the alternates with no config.
+
+  A store shared across repos was rejected: an unelevated box or a command on the box's own token could corrupt every repo's assets, a prune would need every repo's refs and locks, and the diff would tell any PC which other repos' content the builder holds. No prune is built, so a store grows (GATE-471).
+
+  The invariants and where each holds:
+  - **Writers.** Only a put's install writes the store. `<Bare>\lfs`, its `objects` and every folder under it are made with the box's protected security and adopted only when they hold it, an object is installed by a rename that creates it new and never replaces one, and an unelevated box, whose protected folders are labelled Medium, refuses every `lfs` call and any run carrying an `LfsDigest`, so no Medium-integrity process can write it.
+
+    A store lock, `<Bare>\lfs.lock`, made and adopted the same way, is taken shared by every put, diff and run, so a prune that opens it alone waits for them all.
+  - **Content.** Each object is hashed on the PC as it is packed and again on the box as the put unpacks it: a member whose SHA-256 is not its name, or whose size is not the manifest's, refuses the whole archive. A run is checked out only against objects that are plain files of one name and the pointer's size, held open without delete sharing from the cover check through the back commit.
+  - **Readers.** The checkout reads the store only through git-lfs's alternates path, never with a Medium writer in reach. A run's git-lfs writes only into the run's scratch folder.
+  - **No download, no silent pointer.** Every box git call that may run the LFS filter is pinned through `-c`, never written into `.git\config`, where the command's own git would read it:
+
+    `lfs.url=http://127.0.0.1:0/` (a URL that needs no name lookup, is never proxied and nothing can listen on), `lfs.remote.searchall=false`, empty `lfs.fetchinclude` and `lfs.fetchexclude`, `lfs.skipdownloaderrors=false`, `lfs.standalonetransferagent=`, git-lfs's own `filter.lfs.process`, `smudge` and `clean`, and `filter.lfs.required=true`, with `GIT_LFS_SKIP_SMUDGE` and `GIT_LFS_SKIP_DOWNLOAD_ERRORS` stripped from the box's git environment (`GIT_REDIRECTS`).
+
+    The tree's attributes are read as the builder's checkout does, with `-c core.attributesFile=` and `GIT_ATTR_NOSYSTEM=1` on the PC's listing and the box's git calls.
+  - **The command.** A run with an `LfsDigest` never falls back to the box's own token when the restricted start fails; it fails the start, as the pnpm and bun installs do.
+
+  **The scratch folder.** The box alone decides whether a run has one, per repo, after that repo's fetch and before its checkout: when the run carries an `LfsDigest`, or `git grep -q -F -e filter=lfs <snapshot> -- ':(glob,icase)**/.gitattributes'` exits 0.
+
+  It is `{root}\lfs-run\{key}-{nonce}-{16 hex}` (`lfs-run-medium` on an unelevated box), made new with the protected security of a put's stage and removed when the run ends, and it is git-lfs's `lfs.storage` for the run's checkouts and back commit, so no smudge or clean of the run touches the work folder's `.git\lfs` or the store: git-lfs links the store's objects into it through the alternates, and a plain file committed under the filter checks out as its own bytes.
+
+  The 16 hex digits are random, so a run that reuses a killed box's nonce makes its own folder and the old one waits for the 24 h stage prune. A scratch folder that cannot be made, or an `lfs-run` another account made, refuses the run `lfs`.
+
+  A run without a scratch folder checks out and back-commits with `lfs.storage=<lock>\lfs`, a path git-lfs cannot make, so any file that reaches git-lfs fails closed: its snapshot does not declare the filter in a tracked `.gitattributes`, and a case variant, an untracked `.gitattributes` or the repo's `info/attributes` is what made the filter run.
+
+  Known limits are booked: the work folder's and the builder's global git config and `info/attributes` (GATE-470), an untracked `.gitattributes` on the PC (GATE-517), the prune's noise for a held stage (GATE-518), naming `info/attributes` in the refusal (GATE-519), GATE-524 and GATE-525.
+
+  A sibling pair holding pointers is refused `lfs` before any call. A changed LFS path in a back commit is refused at sync-back as before, and a back commit adds nothing to the store.
 - **The per-host failure record** (GATE-27), planned, not built: a record in the state root holds a builder's failure reason and an expiry. A routed gate that finds an unexpired record says `gate: not routed: <host> <reason> <n> s ago`, runs here and journals `fallback` with the reason, rather than paying the snapshot, preflight and push again for the same reason.
 
   The windows per reason: `unreachable` a short one (60 s, distcc's default backoff); `parity` and `tools` until the snapshot's `global.json` or tool manifests change; `busy` and `full` are load, not faults, and are never recorded.
@@ -2362,11 +2434,11 @@ A routed run therefore moves to one long-lived connection carrying every verb, `
 
 The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`.
 
-A `run` payload also holds `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, `GodotVersion` and `EngineEnv`. An `outputs` payload also holds `Name`.
+A `run` payload also holds `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, `LfsDigest`, `GodotVersion` and `EngineEnv`. An `outputs` payload also holds `Name`.
 
 `inflight` reads only `Root`.
 
-`inputs` reads `Key`, `Bare`, `Work`, `Lock`, `Nonce` and `Step`.
+`inputs` and `lfs` read `Key`, `Bare`, `Work`, `Lock`, `Nonce` and `Step`.
 
 A warm-up's `run` payload sets `WarmCommands` (1 to 8 commands, each a non-empty list of non-empty texts) and `WarmHash` (64 lower-case hex digits, the hash of the warm-up file the commands come from), sets no `Command`, and asks for no outputs. The PC's client sends it (The remote client's run, Warm-up call) for `gate warm`. It may carry `GodotVersion` too, and its commands resolve Godot as a run's do.
 
@@ -2395,6 +2467,8 @@ The box seams go in any order before the verb, each also as `--<seam>=<value>`. 
 The box's ceiling has three seams: `--test-box-sample-ms <n>` replaces the 5 s sample period, in milliseconds, `--test-box-sampler-fail true|false` makes every sample fail (`true`), so only the backstop watches and no adjusted line is said, and `--test-box-free-percent <1-100>` makes the samples find that share of the machine free, so the load-adjusted clock runs at that share of wall time.
 
 `--test-box-kill-leaves <n>` stands in for the number of processes the last ending of a ceiling or backstop kill leaves (a whole number above 0), so the box says its note for a job that is still not ended.
+
+`--test-lfs-budget-bytes <n>` replaces the 16 GiB a `gate box lfs` put unpacks, in bytes.
 
 The other four box seams are `--test-outputs-budget-bytes <n>`, which replaces the 50 GiB outputs budget of the box's trim, in bytes, `--test-inputs-budget-bytes <n>`, which replaces the 4 GiB a `gate box inputs` put unpacks, decompressed, in bytes, `--test-dotnet-limit-ms <n>`, which replaces the 30 s bound of the preflight's `dotnet --list-sdks` read, in milliseconds, and `--test-probe-limit-ms <n>`, which replaces the 10 s shared bound of the preflight's tool probes, in milliseconds.
 
@@ -2468,7 +2542,7 @@ Built verbs:
 
   Tool probes (`boxside/probe.rs`): for each tool of the payload's `Needs`, in payload order, the box runs a probe and says one line on stdout after the sdks line, all once every probe has ended: `gate: remote tool <tool> <version>`, `gate: remote tool <tool> present` or `gate: remote tool <tool> missing`, or `gate: remote tool <tool> skipped: <why>`. The box only reports; the PC compares the minimums.
 
-  The probes are `rustc --version` for `rust`, `cargo-nextest nextest --version` for `cargo-nextest` (the plugin directly, never through `cargo`, so no `.cargo\config.toml` above the folder can alias it), `<name> --version` for `node`, `pnpm` and `pwsh`, and `ffmpeg -version`. `godot` and `unreal` are probed as the paragraphs below say.
+  The probes are `rustc --version` for `rust`, `cargo-nextest nextest --version` for `cargo-nextest` (the plugin directly, never through `cargo`, so no `.cargo\config.toml` above the folder can alias it), `<name> --version` for `node`, `pnpm` and `pwsh`, `ffmpeg -version` and `git-lfs version` (read from its `git-lfs/<x.y.z>` line). `godot` and `unreal` are probed as the paragraphs below say.
 
   The `godot` probe reads `GATE_GODOT_ROOT`, an environment variable of the builder naming a folder of side-by-side Godot installs, one per subfolder, each holding `Godot_console.exe`. A subfolder is named for its install's version in full canonical form, `x.y.z` (`4.7.2`: three parts, no leading zero in a part, as `04.7.2` and `4.3` are not), since a run finds an install by that name, `<root>\<version>\Godot_console.exe`.
 
@@ -2625,6 +2699,26 @@ Built verbs:
 
   A payload without `InputsDigest` skips the check. The PC reads the `inputs` tag as fallback reason `inputs` and says `gate: remote <host> inputs; running here`, with `gate: remote inputs not sent: the builder's work folder does not hold the inputs sent` in the log.
 
+  A payload with an `LfsDigest` (64 lower-case hex digits, else `gate: box payload LfsDigest is not 64 lower-case hex digits: <value>` and exit 2) is checked after the fetch and before the checkout, under the work folder's lock; a payload without one makes no such check, and a pair run that carries one is refused `lfs` before any checkout.
+
+  The box lists the pointers from the snapshot itself, as the PC lists them (spec-v1 blobs of at most 1024 bytes whose `filter` is `lfs` at the commit, read with `-c core.attributesFile=` and `GIT_ATTR_NOSYSTEM=1`).
+
+  It requires that their objects' manifest has the digest sent, that the box is elevated, and that each object is in the store as a plain file of one name (a second name, which git-lfs's scratch folder links, is taken) of the pointer's size, opened without following a link and held without delete sharing, with the store's lock held shared, through the back commit.
+
+  Anything else is `gate-remote-refused: <nonce> lfs` then `gate: remote lfs of work folder <key> is not the snapshot's: <why>`, said together under the output lock, the command never started, and exit 75; the PC reads it as fallback reason `lfs`. A scratch folder that cannot be made, or a foreign `lfs-run`, is refused the same way with `gate: remote cannot make the run's LFS scratch folder: <why>` as the second line.
+
+  The scratch folder is made once per run, after each repo's fetch, for a run with an `LfsDigest` or whose snapshot's `.gitattributes` files name the filter (`git grep -q -F -e filter=lfs <snapshot> -- ':(glob,icase)**/.gitattributes'`, [Routing](#routing), Git LFS); a `git grep` that fails prints `gate: remote lfs listing failed (status <n>): <git's first stderr line>` and fails the step.
+
+  The checkout of a repo takes the pins of Git LFS in Routing on every git call that may run the filter, and `lfs.storage` set to the run's scratch folder. After a checkout of a run with pointers the box checks that every pointer's path is a plain file of the pointer's size, since `checkout --force` leaves a file whose stat is clean and a pointer an earlier run left would survive. A pointer path that is not is deleted and checked out again once, and still not is refused `lfs`.
+
+  A file of 1024 bytes or less counts as wrong only when its text is that path's own pointer, so an object whose content is pointer text naming another object is its content.
+
+  A run without a scratch folder pins `lfs.storage=<lock>\lfs`, which cannot be made.
+
+  A checkout that fails there with the tree's attributes (tracked or not, ignored folders passed over) naming the filter removes the tree's untracked files (`clean -fdq`), so a leftover attributes file cannot fail every later run in the folder, and says `gate: remote checkout failed: a file under the LFS filter was found that the run's snapshot does not declare in a tracked .gitattributes; run it with --local`, with git's status.
+
+  Otherwise the line is git's own `gate: remote checkout failed (status <n>)`.
+
   The steps are the layout, fetch, the commit probe, checkout, clean and the back ref reset (each of the three git steps once per repo on a pair run, the main repo first), the dotnet tool restore, the package restore (pnpm, bun or npm), then the command, then the sync-back. A failing step prints `gate: remote <fetch|checkout|clean|back ref reset> failed (status <n>)` and exits `n`.
 
   The clean is `git clean -fdq`, with no `-x`, so a work folder keeps its ignored files between runs; a Godot project's `.godot` folder is one, so it persists from one routed run to the next.
@@ -2767,6 +2861,8 @@ Built verbs:
 
   When the token cannot be made, or a start with it is refused and a start with the box's own token then works, the box prints `gate: the command runs with the builder session's own token: <error>` on stderr, after the start marker, and the command (with the donor and console keeper) runs with the box's own token. A start refused with both tokens says only `could not start`.
 
+  A run with an `LfsDigest` never takes the box's own token: a start with the restricted one that fails says `gate: remote could not start the command with its restricted token, and a run with LFS content never runs with the builder session's own token`, or `cannot make the command's restricted token, and ...` when the token cannot be made, and the run fails.
+
   Every MSYS program of one user in one session (Git's `sh.exe` and the tools in `usr\bin`) shares one section, `msys-2.0S5-<install key>\<SID>.1`, whose first word is both its set-up lock and its ready mark. The box's git, the command and the warm-up commands share it in session 0, on either token.
 
   A start-up killed inside the lock (about 2 ms) while another MSYS process keeps the section open leaves it held: every later `sh.exe` of that user then waits out the runtime's 15 s spinlock and dies with an `add_item ... errno 1` error, until no MSYS process of that user is alive (GATE-387).
@@ -2865,6 +2961,12 @@ Built verbs:
 
   After the command, the sync-back commits the tree when it changed: a copy of the index at `<Work>.index` is staged, and the commit (message `gate-remote back`, parent HEAD) is written to `refs/gate-back/<key>` in `Bare`. A sync-back that fails prints `gate: remote sync-back failed: <message>` and turns a 0 status into 1; an index copy that cannot be removed prints `gate: remote could not remove <index>: <error>` and changes no status.
 
+  The back commit's `add -A` takes the checkout's pins (Routing, Git LFS) with the run's `lfs.storage`, so a clean writes nothing into the store or the work folder's `.git\lfs`; a changed LFS path is refused at the PC's sync-back as before.
+
+  In a run without a scratch folder a failed `add -A` is checked with `git grep -q -F -e filter=lfs --untracked -- ':(glob,icase)**/.gitattributes'` over the work tree, which passes over ignored folders.
+
+  When it exits 0 the failure says `gate: remote sync-back failed: the command added a file under the LFS filter, which a run without LFS content cannot bring back; run it with --local`, and otherwise (or when the check itself fails) it is git's own `add failed (status <n>)` line, with the repo's name on a pair run.
+
   On a pair run the back refs are all or nothing across the repos: every repo's tree is committed first, the main repo's first (the one `Index` file serves each in turn), then every changed repo's commit is pushed to `refs/gate-back/<key>` in its own bare repository. A push that fails deletes the back ref of every repo pushed so far and the failing repo's own, each deletion tried and a failed one said, and the run fails as a sync-back failure.
 
   A client that closed the connection during that undo ends the run with 255 instead. After all pushes, a pair run says under the output lock `gate: remote back commits: <name> <sha|none>, ...`, the main repo first and `none` for a repo whose tree is unchanged. The outputs step packs the main repo's tree only.
@@ -2950,6 +3052,21 @@ Built verbs:
   Caps: an archive of more than 50,000 members, or that decompresses to more than 4 GiB (`--test-inputs-budget-bytes` replaces it), is refused as the outputs archive's are, and the put fails (`gate: remote inputs put failed: <why>`, exit 1). The step is not watched on the box; the PC watches both calls ([The remote client's run](#routing), Inputs).
 
   Deployment prerequisites: the folders above `<root>` are writable by Administrators only; no account outside SYSTEM, Administrators and the builder's user may write in `<root>`; and `<root>\work` is not writable by other accounts. The stage's protection and the beneath-handle walk assume it; the box checks the stages folder it adopts, not the folders above it.
+- **`lfs`** (GATE-469, `boxside/lfs.rs`) installs a routed run's Git LFS objects into the repo's store in two calls, the payload's `Step` being `diff` or `put`, with the payload keys of `inputs`; a payload with a `Pair` is refused with `gate box: lfs for a sibling pair is not taken yet` and exit 2, and any other refused payload exits 2. The store is `<Bare>\lfs\objects\<aa>\<bb>\<oid>` (Routing, Git LFS).
+
+  Stdin is the request line, then the PC's LFS manifest as one line (space-separated `<oid> <size>` entries, each oid 64 lower-case hex digits, no oid twice, at most 50,000 entries and 64 MiB), then for `put` the archive of exactly the objects the diff named, in the outputs archive's format, each member named by its oid, to the end of stdin.
+
+  A manifest that cannot be read, an unelevated box and any failure of the store refuse the step with `gate-remote-refused: <nonce> lfs` then `gate: remote lfs <diff|put> failed: <why>` and exit 1; a work folder that cannot be locked or laid out is refused the same way, and a busy one prints `gate-remote-refused: <nonce> busy` and the busy line, exit 75, as `inputs` does.
+
+  Both steps take the store's lock `<Bare>\lfs.lock` shared and the work folder's lock as `run` does, and ready the store: the bare repository is opened as itself and held without delete sharing, and `lfs`, `objects` and each `<aa>\<bb>` folder are made with the box's protected security or adopted only when they hold exactly it, anything else refusing the call with `cannot use <path>: another account made it; remove it, or give it to Administrators`.
+
+  The diff prints `gate-remote-lfs: need <n>` then `gate-remote-lfs: oid <oid>` per object, in manifest order, that the store lacks or holds as anything but a plain file of that size that carries only the security its folder hands down. The put prints `gate-remote-lfs: installed <n>`.
+
+  The put unpacks the archive before it takes the work folder's lock, into a stage `<root>\lfs-stage\<key>-<nonce>` made as the inputs stage is, and refuses the whole archive when a member is not an object the manifest names, does not hash to its name, or is not of the manifest's size.
+
+  It then installs each object under the work folder's lock by a rename beneath the held folders that creates the file new and gives it its folder's security; an object already in the store at its size, another put's among them, is kept and its staged copy deleted. The stage is removed beneath its handle on every way out, and the stages' day-old prune covers `lfs-stage` and the run scratch folders. The step is not watched on the box; the PC watches both calls.
+
+  Caps: an archive of more than 16 GiB unpacked (`--test-lfs-budget-bytes` replaces it) is refused as the inputs' is.
 - **`register-desktop`** (`boxside/register.rs`) registers the desktop helper's task, `\gate\desktop-helper`, through the Task Scheduler's COM interface (`gate_win32::register_task`, `task.rs`) for the user running the box, and says so on stdout.
 
   It reads no request and never reads stdin: its ssh line is `gate.exe box register-desktop` with no `--stdin`, and any word after the verb is the box usage. It is run by the builder's setup and by `gate push` on every push ([`gate push`](#gate-push)), not by a routed run.
@@ -3300,7 +3417,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-remote-bound-ms <n>` (whole milliseconds above 0) replaces the 30 s bound of the client's `stop` and `boot` calls.
 
-  `--test-remote-interrupt-at <preflight|inputs|run|outputs|install|sdks|stop|manifest|apply>` makes the client raise the console interrupt itself after that call's first output byte (for `inputs`, the first of either inputs call); `install` raises it before the second file's move, so an install of one file is never interrupted, and `sdks` just before the parity check reads this PC's SDK list with `dotnet --list-sdks`; `manifest` just before it reads the snapshot's `.gate/toolchain.toml`; `apply` once a pair's sync-back has checked every patch and before it applies the first (no output byte is waited for); `stop` raises it at the run call's first byte and again while the stop call runs.
+  `--test-remote-interrupt-at <preflight|inputs|lfs|run|outputs|install|sdks|stop|manifest|apply>` makes the client raise the console interrupt itself after that call's first output byte (for `inputs` or `lfs`, the first of either call); `install` raises it before the second file's move, so an install of one file is never interrupted, and `sdks` just before the parity check reads this PC's SDK list with `dotnet --list-sdks`; `manifest` just before it reads the snapshot's `.gate/toolchain.toml`; `apply` once a pair's sync-back has checked every patch and before it applies the first (no output byte is waited for); `stop` raises it at the run call's first byte and again while the stop call runs.
 
   `--test-remote-backstop-ms <n>` (whole milliseconds above 0) replaces the run call's backstop of 5 x `--timeout` + 60 s for the client, counted from the run call's start.
 
@@ -3314,11 +3431,13 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-remote-timeout-ms <n>` (whole milliseconds above 0) applies only under `--test-remote-watch-call` naming a call other than `run`, as that call's transfer ceiling; given with `--test-remote-transport` without such a call it is refused with `gate: --test-remote-timeout-ms needs --test-remote-watch-call naming a call other than run`.
 
-  `--test-remote-watch-call <preflight|push|inputs-diff|inputs|run|ls-remote|fetch|outputs>` makes `--test-stall-ms` and `--test-remote-timeout-ms` apply to that one call alone, its limit counted from the call's own start, every other call keeping the run's own window and limits. For `run` only the stall seam applies (the backstop has its own seam); for any other call `--test-remote-timeout-ms` is that call's transfer ceiling.
+  `--test-remote-watch-call <preflight|push|inputs-diff|inputs|lfs-diff|lfs|run|ls-remote|fetch|outputs>` makes `--test-stall-ms` and `--test-remote-timeout-ms` apply to that one call alone, its limit counted from the call's own start, every other call keeping the run's own window and limits. For `run` only the stall seam applies (the backstop has its own seam); for any other call `--test-remote-timeout-ms` is that call's transfer ceiling.
 
   With `ls-remote`, `--test-remote-timeout-ms` is that call's deadline and `--test-stall-ms` alone leaves it on the git limit. With `fetch`, the stall and ceiling seams apply to the fetch alone; with `outputs`, to the outputs fetch alone; with `inputs-diff`, to the inputs' diff call alone, and with `inputs`, to the inputs' put call alone, whose stall window counts the later of the last byte fed and the last byte of output while the archive is being fed.
 
-  A value outside a seam's calls says `gate: --test-remote-watch-call must be preflight, push, inputs-diff, inputs, run, ls-remote, fetch or outputs, got '<v>'`, and `--test-remote-interrupt-at` says `must be preflight, inputs, run, outputs, install, sdks, stop, manifest or apply`.
+  `lfs-diff` and `lfs` name the LFS diff and put calls the same way.
+
+  A value outside a seam's calls says `gate: --test-remote-watch-call must be preflight, push, inputs-diff, inputs, lfs-diff, lfs, run, ls-remote, fetch or outputs, got '<v>'`, and `--test-remote-interrupt-at` says `must be preflight, inputs, lfs, run, outputs, install, sdks, stop, manifest or apply`.
 
   The five (with `--test-remote-backstop-ms`) need the transport; `--test-print-request` shows them as `testSeams.remoteBoundMs`, `remoteInterruptAt`, `remoteWatchCall`, `remoteTimeoutMs` and `remoteBackstopMs`, after `remoteRetryPauseMs`.
 
@@ -3331,6 +3450,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   Refused without the transport with `gate: --test-remote-outputs-budget-bytes needs --test-remote-transport`, and a value that is not a whole number above 0 with `gate: --test-remote-outputs-budget-bytes must be a whole number above 0, got '<v>'`. `--test-print-request` shows it as `testSeams.remoteOutputsBudgetBytes` (null unless given), after `remoteTimeoutMs`; the fetch-cap and apply-cap seams are not shown.
 
   `--test-remote-inputs-budget-bytes <n>` (a whole number of bytes above 0, default the 4 GiB one put of inputs may total) lowers that budget: a set the diff names past it is not sent, and the run falls back `inputs`. It is refused without the transport with `gate: --test-remote-inputs-budget-bytes needs --test-remote-transport`, and `--test-print-request` shows it as `testSeams.remoteInputsBudgetBytes` (null unless given), after `remoteOutputsBudgetBytes`.
+
+  `--test-remote-lfs-budget-bytes <n>` (a whole number of bytes above 0, default the 16 GiB one put of LFS objects may total) lowers that budget: the objects the diff names past it are not sent, and the run falls back `lfs`. It is refused without the transport with `gate: --test-remote-lfs-budget-bytes needs --test-remote-transport`, and `--test-print-request` shows it as `testSeams.remoteLfsBudgetBytes` (null unless given).
 
   `--test-remote-log-cap-bytes <n>` (a whole number of bytes above 0, default 256 MiB) lowers the log cap, the most bytes of one call's output the client writes to the gate's log.
 
@@ -3369,7 +3490,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   It is copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`).
 
-  A second helper, `fake-ssh`, stands in for ssh in the remote client's cases (`--test-remote-ssh`). Its `ok` step puts the words of the variable `GATE_FAKE_SSH_BOX_SEAMS` before the verb of a `gate box run` call, so a case gives the box its seams; the variable `GATE_FAKE_SSH_PREFLIGHT_SEAMS` does the same for a `gate box preflight` call.
+  A second helper, `fake-ssh`, stands in for ssh in the remote client's cases (`--test-remote-ssh`). Its `ok` step puts the words of the variable `GATE_FAKE_SSH_BOX_SEAMS` before the verb of a `gate box run` call, so a case gives the box its seams (it reaches a `gate box lfs` call too); the variable `GATE_FAKE_SSH_PREFLIGHT_SEAMS` does the same for a `gate box preflight` call.
 
   It reads a box call from the last three words of the line, `box <verb> --stdin`, and the box it runs inherits its stdin, so the request the client feeds reaches the box; a box call whose last word is not `--stdin` is refused by name.
 

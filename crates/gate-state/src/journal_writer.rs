@@ -253,6 +253,8 @@ pub enum FallbackReason {
     Desktop,
     /// The builder's gate is not installed where only administrators can change it.
     Install,
+    /// The run's Git LFS content could not be sent to the builder, or the builder's store did not hold it at the run.
+    Lfs,
 }
 
 impl FallbackReason {
@@ -273,6 +275,7 @@ impl FallbackReason {
             FallbackReason::Cold => "cold",
             FallbackReason::Desktop => "desktop",
             FallbackReason::Install => "install",
+            FallbackReason::Lfs => "lfs",
         }
     }
 }

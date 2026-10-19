@@ -721,9 +721,10 @@ fn a_routed_run_gives_the_builder_s_command_shared_compilation_off() {
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
 }
 
-/// The most git processes the simple pass below starts, on the PC and the box together, children of git counted. One
-/// of them is the PC's `rev-parse --verify -q HEAD` that every routed run asks for its `SourceRevisionId`.
-const SIMPLE_PASS_GIT_STARTS: usize = 31;
+/// The most git processes the simple pass below starts, on the PC and the box together, children of git counted. Among
+/// them are the PC's `rev-parse --verify -q HEAD` that every routed run asks for its `SourceRevisionId`, and the box's
+/// `git grep` of the snapshot's `.gitattributes` files for the LFS filter, before the checkout.
+const SIMPLE_PASS_GIT_STARTS: usize = 32;
 
 /// The `argv` of each git process that wrote a trace into the folder `traces`, the `GIT_TRACE2_EVENT` of the gate that
 /// started them: one `"event":"start"` record a process.

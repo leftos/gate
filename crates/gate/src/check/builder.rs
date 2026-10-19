@@ -1,9 +1,10 @@
 //! The check of a builder `remote.json` lists: the repo's `.gate/toolchain.toml`, `.gate/siblings.toml` (or their
 //! copies in its declarations folder) and root `global.json` read from disk as this PC's check reads them, then one
 //! bounded call of the builder's `gate box preflight`, as a routed run's preflight is made, with the repo's own
-//! work-folder key and the manifest's tools as its `Needs`. The preflight readies only the work folder the next routed
-//! run of the repo would ready, and its answer is read with the remote client's own readers: the builder's gate build,
-//! the folders it created, its SDK list, what it found of each tool, and whether its work folder is warm for the
+//! work-folder key and the manifest's tools as its `Needs`, git-lfs among them when a `.gitattributes` git tracks in
+//! the worktree, at any depth, names the LFS filter. The preflight readies only the work folder the next routed run of
+//! the repo would ready, and its answer is read with the remote client's own readers: the builder's gate build, the
+//! folders it created, its SDK list, what it found of each tool, and whether its work folder is warm for the
 //! worktree's warm-up file. The warm-up's items are this PC's, its record said only when it names the builder checked.
 
 use std::path::Path;
@@ -20,6 +21,7 @@ use crate::check::report::{self, At, Checked, Problem, Tool, Warmup};
 use crate::console::Console;
 use crate::environment::Variables;
 use crate::remote::git::{self, GitError, ProgramCall, ProgramOutput, ProgramPlace};
+use crate::remote::lfs;
 use crate::remote::payload::{self, Location};
 use crate::remote::toolchain::{self, Reported};
 use crate::remote::transport::ssh::Ssh;
@@ -133,6 +135,9 @@ fn asked(transport: &dyn Transport, host: &str, place: &Place, bound: Duration) 
     let repo = repo_name(&place.checkout);
     let mut declarations = Declarations::from_process(&repo);
     let mut declared = local::declared(root, &mut declarations);
+    if uses_lfs(root)? {
+        toolchain::add_git_lfs(&mut declared.manifest);
+    }
     let needs = toolchain::needs_of(&declared.manifest);
     let key = work_folder_key(&place.root);
     let location = Location::under(transport.root(), &repo, &key, &payload::job_nonce());
@@ -158,6 +163,19 @@ fn asked(transport: &dyn Transport, host: &str, place: &Place, bound: Duration) 
     checked.shadowed = warmed.declarations.shadowed;
     checked.declarations_problem = warmed.declarations.problem;
     Ok(Asked { checked, key })
+}
+
+/// Whether the repo at the worktree `root` uses LFS, as routing judges it ([`lfs::tracks_lfs_filter`]); else the line
+/// saying why git could not list its `.gitattributes` files.
+fn uses_lfs(root: &Path) -> Result<bool, String> {
+    // The call is given no interrupt.
+    lfs::tracks_lfs_filter(root, git::GIT_LIMIT, None).map_err(|error| {
+        let why = match error {
+            GitError::Failed(why) | GitError::OverCap(why) => why,
+            GitError::Interrupted => "git was interrupted".to_owned(),
+        };
+        format!("check: cannot list the worktree's .gitattributes files: {why}")
+    })
 }
 
 /// The warm-up of a builder check of `host` for the worktree root `root`, from `sources`: this PC's

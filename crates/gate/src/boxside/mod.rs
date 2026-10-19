@@ -9,6 +9,7 @@ mod forward;
 mod heartbeat;
 mod inflight;
 mod inputs;
+mod lfs;
 mod msys;
 pub(crate) mod outputs;
 mod packages;
@@ -66,6 +67,7 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
         BoxVerb::Outputs => with_request(console, outputs::outputs),
         BoxVerb::Inflight => with_request(console, inflight::inflight),
         BoxVerb::Inputs => with_request(console, |payload, console| inputs::inputs(payload, seams, console)),
+        BoxVerb::Lfs => with_request(console, |payload, console| lfs::lfs(payload, seams, console)),
     }
 }
 

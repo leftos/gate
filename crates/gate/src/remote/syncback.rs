@@ -1241,11 +1241,11 @@ const ATTRIBUTES: [&str; 6] = ["filter", "ident", "working-tree-encoding", "text
 const ATTRIBUTE_ROOM: usize = 256;
 /// The bytes the answer of each slice of paths fed to `git check-attr` is planned within: the runner's cap.
 #[cfg(not(feature = "test-seams"))]
-const SLICE_CAP: usize = git::OUTPUT_CAP;
+pub(super) const SLICE_CAP: usize = git::OUTPUT_CAP;
 /// The bytes the answer of each slice of paths fed to `git check-attr` is planned within, in a `test-seams` build: room
 /// for two paths of up to 32 bytes, so that a suite case's few files span slices.
 #[cfg(feature = "test-seams")]
-const SLICE_CAP: usize = 2 * ATTRIBUTES.len() * (32 + ATTRIBUTE_ROOM);
+pub(super) const SLICE_CAP: usize = 2 * ATTRIBUTES.len() * (32 + ATTRIBUTE_ROOM);
 /// What `git check-attr` says of an attribute no file sets, and of one a file unsets.
 const NOT_GIVEN: [&str; 2] = ["unspecified", "unset"];
 /// What the config keys of a filter driver named as `git check-attr` says of an attribute not given start with: a
@@ -1300,6 +1300,13 @@ fn attributes(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, paths: &[&str]
 /// `paths` cut into slices, in order, each holding as many paths as `git check-attr` can answer within `cap` bytes,
 /// [`ATTRIBUTE_ROOM`] allowed for each attribute beside the path; a path that alone needs more is a slice of its own.
 fn attribute_slices<'a>(paths: &'a [&'a str], cap: usize) -> Vec<&'a [&'a str]> {
+    slices_asking(paths, ATTRIBUTES.len(), cap)
+}
+
+/// `paths` cut into slices, in order, each holding as many paths as `git check-attr` asked `attributes` attributes of
+/// each path can answer within `cap` bytes, [`ATTRIBUTE_ROOM`] allowed for each attribute beside the path; a path that
+/// alone needs more is a slice of its own.
+pub(super) fn slices_asking<'a>(paths: &'a [&'a str], attributes: usize, cap: usize) -> Vec<&'a [&'a str]> {
     let mut slices = Vec::new();
     let mut rest = paths;
     while !rest.is_empty() {
@@ -1307,7 +1314,7 @@ fn attribute_slices<'a>(paths: &'a [&'a str], cap: usize) -> Vec<&'a [&'a str]> 
         let count = rest
             .iter()
             .take_while(|path| {
-                used = used.saturating_add(ATTRIBUTES.len() * (path.len() + ATTRIBUTE_ROOM));
+                used = used.saturating_add(attributes * (path.len() + ATTRIBUTE_ROOM));
                 used <= cap
             })
             .count()
@@ -1322,25 +1329,37 @@ fn attribute_slices<'a>(paths: &'a [&'a str], cap: usize) -> Vec<&'a [&'a str]> 
 /// The attributes of each of `paths` from `git check-attr -z`'s `answer`: a `path`, attribute, value triple for each
 /// attribute of [`ATTRIBUTES`] of each path, in their order; else why the answer cannot be read.
 fn read_attributes(answer: &str, paths: &[&str]) -> Result<Vec<Attributes>, String> {
+    let values = attribute_values(answer, paths, ATTRIBUTES)?;
+    Ok(values
+        .into_iter()
+        .map(|values| {
+            let [filter, ident, encoding, text, eol, crlf] = values.map(str::to_owned);
+            Attributes {
+                filter,
+                ident,
+                encoding,
+                text,
+                eol,
+                crlf,
+            }
+        })
+        .collect())
+}
+
+/// The values of the attributes `names` of each of `paths` from `git check-attr -z`'s `answer`: a `path`, attribute,
+/// value triple for each of `names` of each path, in their order; else why the answer cannot be read.
+pub(super) fn attribute_values<'a, const N: usize>(answer: &'a str, paths: &[&str], names: [&str; N]) -> Result<Vec<[&'a str; N]>, String> {
     let mut fields = answer.split('\0');
     let mut read = Vec::with_capacity(paths.len());
     for path in paths {
-        let mut values = [""; ATTRIBUTES.len()];
-        for (value, name) in values.iter_mut().zip(ATTRIBUTES) {
+        let mut values = [""; N];
+        for (value, name) in values.iter_mut().zip(names) {
             match (fields.next(), fields.next(), fields.next()) {
                 (Some(said), Some(attribute), Some(given)) if said == *path && attribute == name => *value = given,
                 _ => return Err(format!("it did not answer {name} for {path}")),
             }
         }
-        let [filter, ident, encoding, text, eol, crlf] = values.map(str::to_owned);
-        read.push(Attributes {
-            filter,
-            ident,
-            encoding,
-            text,
-            eol,
-            crlf,
-        });
+        read.push(values);
     }
     if fields.any(|field| !field.is_empty()) {
         return Err(format!("it answered more than the {} path(s) it was asked", paths.len()));

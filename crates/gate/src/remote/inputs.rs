@@ -39,7 +39,7 @@ pub(super) const MEMBERS: usize = 50_000;
 /// ([`exclusions`]).
 const EXCLUDED: &str = r"(^|/)\.git/|(^|/)\.env\.[^/]*$|\.env$|(^|/)\.envrc$";
 /// The worktree's folder the inputs' diff answer and archive are made in, held from before the diff until the put ends.
-const TMP: &str = ".tmp";
+pub(super) const TMP: &str = ".tmp";
 /// `GENERIC_READ`, which lives in `Win32_Foundation`, a feature this crate does not enable: the access the diff answer
 /// and the archive are read back through.
 const GENERIC_READ: u32 = 0x8000_0000;
@@ -283,7 +283,7 @@ fn git_failure(code: Option<i32>, errors: &[u8]) -> String {
 /// otherwise.
 pub(super) const INPUTS_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
 /// A megabyte, as the inputs line says sizes.
-const MB: f64 = 1024.0 * 1024.0;
+pub(super) const MB: f64 = 1024.0 * 1024.0;
 /// Why a pair's run sends no inputs.
 const PAIR: &str = "a sibling pair does not send inputs yet";
 /// Why a run the box refused `inputs` falls back.
@@ -363,8 +363,8 @@ pub(super) fn send(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &s
     }
 }
 
-/// How an end no inputs call returns is said: the run call's own ends, and a pair's.
-fn unexpected(end: &End) -> &'static str {
+/// How an end no inputs or LFS call returns is said: the run call's own ends, and a pair's.
+pub(super) fn unexpected(end: &End) -> &'static str {
     match end {
         End::Status(_) => "with a command's status",
         End::Killed => "killed",
@@ -376,18 +376,20 @@ fn unexpected(end: &End) -> &'static str {
     }
 }
 
-/// Why an inputs step was not done: a call that ended the attempt's way, or a reason of the step's own.
+/// Why an inputs or LFS step was not done: a call that ended the attempt's way, or a reason of the step's own.
 #[derive(Debug)]
-enum Unsent {
+pub(super) enum Unsent {
     Ended(End),
     Refused(String),
 }
 
-/// The inputs calls, as their lines name them.
+/// The inputs and LFS calls, as their lines name them.
 #[derive(Clone, Copy)]
-enum Step {
+pub(super) enum Step {
     Diff,
     Put,
+    LfsDiff,
+    LfsPut,
 }
 
 impl Step {
@@ -396,25 +398,27 @@ impl Step {
         match self {
             Step::Diff => "the inputs diff call",
             Step::Put => "the inputs put call",
+            Step::LfsDiff => "the LFS diff call",
+            Step::LfsPut => "the LFS put call",
         }
     }
 
     /// The call as the reason of its cut names it.
     fn short(self) -> &'static str {
         match self {
-            Step::Diff => "the diff",
-            Step::Put => "the put",
+            Step::Diff | Step::LfsDiff => "the diff",
+            Step::Put | Step::LfsPut => "the put",
         }
     }
 }
 
-/// Why the inputs call `step` was cut as `cut`: a stall, the put's counted on the bytes both ways and the diff's on its
-/// output, or its transfer ceiling, each in whole seconds; any other cut as the watchdog words it.
+/// Why the inputs or LFS call `step` was cut as `cut`: a stall, the put's counted on the bytes both ways and the diff's
+/// on its output, or its transfer ceiling, each in whole seconds; any other cut as the watchdog words it.
 fn cut_why(step: Step, cut: Cut) -> String {
     let seconds = watchdog::whole_seconds;
     match (step, cut) {
-        (Step::Put, Cut::Silent(window)) => format!("the put stalled: no bytes sent or received for {} s", seconds(window)),
-        (Step::Diff, Cut::Silent(window)) => format!("the diff stalled: no output for {} s", seconds(window)),
+        (Step::Put | Step::LfsPut, Cut::Silent(window)) => format!("the put stalled: no bytes sent or received for {} s", seconds(window)),
+        (Step::Diff | Step::LfsDiff, Cut::Silent(window)) => format!("the diff stalled: no output for {} s", seconds(window)),
         (_, Cut::Ceiling(ceiling)) => format!("{} passed its transfer ceiling of {} s", step.short(), seconds(ceiling)),
         _ => cut.reason(step.what()),
     }
@@ -464,7 +468,12 @@ fn sent_to(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, buil
 /// killed outright leaves none behind. One whose own final path is not inside the worktree is refused, and goes with
 /// its handle. Else why it cannot be made.
 fn made_in_tmp(root: &Path, path: &Path, what: &str) -> Result<File, Unsent> {
-    let cannot = |error: io::Error| Unsent::Refused(format!("cannot make {what} {}: {error}", path.display()));
+    tmp_file(root, path, what).map_err(Unsent::Refused)
+}
+
+/// The file [`made_in_tmp`] makes; else why not.
+pub(super) fn tmp_file(root: &Path, path: &Path, what: &str) -> Result<File, String> {
+    let cannot = |error: io::Error| format!("cannot make {what} {}: {error}", path.display());
     let inside = fs::canonicalize(root).map_err(cannot)?;
     let file = OpenOptions::new()
         .read(true)
@@ -476,7 +485,7 @@ fn made_in_tmp(root: &Path, path: &Path, what: &str) -> Result<File, Unsent> {
         .open(path)
         .map_err(cannot)?;
     if !final_path(&file).map_err(cannot)?.starts_with(&inside) {
-        return Err(Unsent::Refused(format!("{what} {} is not inside the worktree", path.display())));
+        return Err(format!("{what} {} is not inside the worktree", path.display()));
     }
     Ok(file)
 }
@@ -526,10 +535,10 @@ fn diffed<'b>(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, b
     needed(&String::from_utf8_lossy(&text), built).map_err(Unsent::Refused)
 }
 
-/// Why the inputs call `step` that ended as `called` failed: a cut, said in the reason alone, as the preflight's is,
+/// Why the inputs or LFS call `step` that ended as `called` failed: a cut, said in the reason alone, as the preflight's is,
 /// since the run falls back here and a watchdog line in its log would fail the run here; or a status other than 0, the
 /// box's last error line when it said one.
-fn judged(attempt: &mut Attempt<'_, '_>, called: &Called, step: Step) -> Result<(), Unsent> {
+pub(super) fn judged(attempt: &mut Attempt<'_, '_>, called: &Called, step: Step) -> Result<(), Unsent> {
     if let Some(cut) = called.cut {
         attempt.noted(called);
         return Err(Unsent::Refused(cut_why(step, cut)));
@@ -620,10 +629,10 @@ fn packed(archive: &File, shown: &Path, packing: &Pack<'_>, go_on: &dyn Fn() -> 
 
 /// A writer into the inputs archive that asks `go_on` before each write, and fails the write once it says no, with
 /// `stopped` set, so a Ctrl+C during the pack ends it.
-struct Asking<'a, W: Write> {
-    inner: W,
-    go_on: &'a dyn Fn() -> bool,
-    stopped: &'a Cell<bool>,
+pub(super) struct Asking<'a, W: Write> {
+    pub(super) inner: W,
+    pub(super) go_on: &'a dyn Fn() -> bool,
+    pub(super) stopped: &'a Cell<bool>,
 }
 
 impl<W: Write> Write for Asking<'_, W> {
