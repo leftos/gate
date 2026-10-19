@@ -7,7 +7,7 @@ use std::io::Write;
 use std::ops::{Deref, DerefMut};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, Command};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -3116,6 +3116,63 @@ fn box_run_beats_while_a_busy_command_runs() {
     for line in beats {
         assert!(beat.is_match(line), "a heartbeat is a whole line of its own: {line:?} in {outcome:?}");
     }
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// A fake-tool `burn` running outside any job the case owns, which has no time limit of its own: when dropped it
+/// writes the go file, then kills the burner and waits for it, so a case that fails cannot leave it burning a core or
+/// holding its image in the case folder. A case declares it after its [`Case`], so it drops before the folder goes.
+struct Burner {
+    child: Child,
+    go: PathBuf,
+}
+
+impl Drop for Burner {
+    fn drop(&mut self) {
+        // Best effort on the way out, a failing case's panic included: each step is ended by the next, and a burner
+        // that already ended on the go file makes the kill fail harmlessly.
+        let _ = fs::write(&self.go, "");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn box_run_beats_while_the_wsl_vm_works_for_a_quiet_wsl_command() {
+    let case = Case::new("box_run_beats_wsl_vm");
+    let go = case.folder().join("go");
+    let stand_ins = case.folder().join("stand-ins");
+    fs::create_dir_all(&stand_ins).expect("the stand-ins' folder can be made");
+    let vm = stand_ins.join("vmmemWSL");
+    fs::copy(FAKE_TOOL, &vm).expect("fake-tool can stand for the WSL VM");
+    let wsl = stand_ins.join("wsl.exe");
+    fs::copy(FAKE_TOOL, &wsl).expect("fake-tool can stand for wsl.exe");
+    let mut burning = Burner {
+        child: Command::new(&vm)
+            .args(["burn", &shown(&go)])
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("the VM stand-in starts"),
+        go: go.clone(),
+    };
+    wait_until("the VM stand-in listed as the WSL VM", || {
+        gate_win32::wsl_vm_cpu().is_ok_and(|cpu| cpu.is_some())
+    });
+    let mut payload = box_payload(&case, "k", &[&shown(&wsl), "err", "started", "sleep", "600000"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let running = bare_box_call(&case, &["box", "--test-heartbeat-ms", "30", "run"], &self::payload(&payload)).start();
+    let beats_after_started = |stderr: &str| {
+        stderr.split_once("started\n").map_or(0, |(_, after)| {
+            after.lines().filter(|line| line.starts_with("gate-remote-heartbeat: ")).count()
+        })
+    };
+    // A beat or two may slip in before the watch or come of start-up CPU; twenty need the VM's CPU.
+    running.wait_for_stderr_where("twenty heartbeats while the quiet wsl command's VM works", |s| {
+        beats_after_started(s) >= 20
+    });
+    drop(running); // its stop-tree ends the box and the sleeping command
+    let_go(&go);
+    burning.child.wait().expect("the VM stand-in ends once let go");
     wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 

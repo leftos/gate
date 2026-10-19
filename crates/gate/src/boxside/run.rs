@@ -26,7 +26,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::{BoxSeams, EnvRefusal, env_refusal, is_godot_console, over_cap, repeated_name, shown_name};
-use gate_watchdog::{Kill, Pump};
+use gate_watchdog::{Kill, Pump, is_wsl_command};
 use gate_win32::{
     Donor, EnvironmentBlock, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken, Running, Utf8Console,
 };
@@ -562,10 +562,10 @@ impl Beat<'_> {
         self.gone.load(Ordering::SeqCst)
     }
 
-    /// Has the heartbeat count the CPU of `job` from now on.
-    fn watch(&self, job: &Arc<Job>) {
+    /// Has the heartbeat count the CPU of `job` from now on, and the WSL VM's too for a `wsl` command.
+    fn watch(&self, job: &Arc<Job>, wsl: bool) {
         if let Some(pump) = self.pump {
-            pump.watch(heartbeat::job_cpu(Arc::clone(job)));
+            pump.watch(heartbeat::job_cpu(Arc::clone(job), wsl));
         }
     }
 
@@ -974,6 +974,14 @@ struct One<'w> {
     of: Of,
 }
 
+impl One<'_> {
+    /// Whether the command is a WSL one, by its first word as the local watch tells ([`is_wsl_command`]), so the PC
+    /// and the box agree on it.
+    fn wsl(&self) -> bool {
+        self.words.first().is_some_and(|word| is_wsl_command(word))
+    }
+}
+
 /// What a command [`command`] starts is a command of.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Of {
@@ -1286,6 +1294,7 @@ fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut 
         keep: &keep,
         beat,
         ceiling,
+        wsl: one.wsl(),
     };
     let watched = watch(started, console);
     stopper.armed = false;
@@ -1966,6 +1975,7 @@ fn watch(started: Started<'_, '_>, console: &mut Console) -> Result<Ran, u32> {
         keep,
         beat,
         mut ceiling,
+        wsl,
     } = started;
     let Launched { running, pipes } = launched;
     let forwarders = match Forwarders::start(pipes.stdout, pipes.stderr, beat.lock, beat.gone) {
@@ -1982,7 +1992,7 @@ fn watch(started: Started<'_, '_>, console: &mut Console) -> Result<Ran, u32> {
         forwarders,
         watching: Watching::Command,
     };
-    beat.watch(job);
+    beat.watch(job, wsl);
     // No stop is looked for: a stop ends the command through its job, and the status it ends with passes.
     let waited = watched.wait(
         None,
@@ -2043,13 +2053,15 @@ fn killed(watched: Watched<'_>, kill: Kill, ceiling: &Ceiling<'_>, seams: &BoxSe
 }
 
 /// A command just started that [`watch`] sees to its end: its job, its main process and pipes, the processes of its
-/// job that outlive it by design, the run's output lock and heartbeat, and the box's ceiling on it, `None` for none.
+/// job that outlive it by design, the run's output lock and heartbeat, the box's ceiling on it, `None` for none, and
+/// whether it is a WSL command ([`One::wsl`]), whose WSL VM's CPU the heartbeat counts too.
 struct Started<'s, 'b> {
     job: &'s Arc<Job>,
     launched: Launched,
     keep: &'s [u32],
     beat: &'s Beat<'b>,
     ceiling: Option<Ceiling<'s>>,
+    wsl: bool,
 }
 
 /// Ends what the command that exited left in its `job` as a local run does ([`end_leftovers`]), its gates spared,
@@ -3221,6 +3233,29 @@ mod tests {
         let variables = with_path_first(variables, &folder);
 
         assert_eq!(path_entries(&variables), [r"PATH=C:\a"]);
+    }
+
+    #[test]
+    fn a_command_is_a_wsl_one_by_its_first_word_alone() {
+        let place = std::env::temp_dir();
+        let rows: [(&[&str], bool); 6] = [
+            (&["wsl", "-d", "Ubuntu"], true),
+            (&[r"C:\Windows\System32\wsl.exe", "-d", "Ubuntu"], true),
+            (&["WSL.EXE"], true),
+            (&["pwsh", "-c", "wsl"], false),
+            (&["wslconfig", "/l"], false),
+            (&[], false),
+        ];
+        for (words, wsl) in rows {
+            let words: Vec<String> = words.iter().map(|word| (*word).to_owned()).collect();
+            let one = One {
+                words: &words,
+                place: &place,
+                timeout: None,
+                of: Of::Run,
+            };
+            assert_eq!(one.wsl(), wsl, "{words:?}");
+        }
     }
 
     #[test]

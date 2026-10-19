@@ -1,13 +1,14 @@
 //! `gate box run`'s heartbeat: `gate-remote-heartbeat: <cpu ms>` on stderr every period, on `gate-watchdog`'s
 //! [`Pump`], so the client knows a quiet command is still working. While no command is watched the pump writes every
 //! period; while one is, only when the CPU its job used since the last beat reaches 1% of the time since it, as the
-//! PowerShell wrapper's heartbeat counts it. The command's build servers are its run's own and run in its job, so the
-//! job's CPU counts them. Each line takes the box's output lock, so none lands inside a forwarded line. On a period with
-//! no line due the pump flushes, and the box's flush probes stderr with a zero-byte write under the same lock; a line or
-//! a probe that fails because stderr's reader has gone sets the run's [`ClientGone`], so the run sees a gone client
-//! within a period even while its command writes nothing. A probe that fails any other way ends the probing for the
-//! rest of the run and the lines go on; any other failed line or flush ends the heartbeats. Neither sets the flag. The
-//! heartbeat starts no process.
+//! PowerShell wrapper's heartbeat counts it, or, for a WSL command, the WSL VM's CPU reaches a tenth of it: the VM's
+//! work runs outside the job. The command's build servers are its run's own and run in its job, so the job's CPU counts
+//! them. Each line takes the box's output lock, so none lands inside a forwarded line. On a period with no line due the
+//! pump flushes, and the box's flush probes stderr with a zero-byte write under the same lock; a line or a probe that
+//! fails because stderr's reader has gone sets the run's [`ClientGone`], so the run sees a gone client within a period
+//! even while its command writes nothing. A probe that fails any other way ends the probing for the rest of the run and
+//! the lines go on; any other failed line or flush ends the heartbeats. Neither sets the flag. The heartbeat starts no
+//! process.
 
 use std::io::{self, Write};
 use std::os::windows::io::{AsRawHandle, RawHandle};
@@ -50,9 +51,10 @@ pub(crate) fn start(lock: &OutputLock, gone: &ClientGone, period: Duration) -> i
     Pump::start(writer, Arc::new(BoxClock { started: Instant::now() }), period)
 }
 
-/// The CPU source of the command running in `job`: the job's own CPU, its processes that ended included.
-pub(crate) fn job_cpu(job: Arc<Job>) -> Arc<dyn CpuSource> {
-    Arc::new(JobCpu { job })
+/// The CPU source of the command running in `job`: the job's own CPU, its processes that ended included, and for a
+/// `wsl` command the WSL VM's, where its work runs.
+pub(crate) fn job_cpu(job: Arc<Job>, wsl: bool) -> Arc<dyn CpuSource> {
+    Arc::new(JobCpu { job, wsl })
 }
 
 /// The box's monotonic clock in 100 ns ticks since the heartbeat started.
@@ -157,9 +159,10 @@ fn probe(handle: RawHandle) -> io::Result<()> {
     if wrote == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
-/// The heartbeat's CPU source for one command: its job.
+/// The heartbeat's CPU source for one command: its job, and the WSL VM when `wsl` says the command is a WSL one.
 struct JobCpu {
     job: Arc<Job>,
+    wsl: bool,
 }
 
 impl CpuSource for JobCpu {
@@ -169,6 +172,15 @@ impl CpuSource for JobCpu {
             .accounting()
             .map(|accounting| accounting.cpu)
             .map_err(|error| format!("cannot read the CPU of job {}: {error}", self.job.name()))
+    }
+
+    /// The WSL VM's CPU, in 100 ns ticks, for a WSL command, whose work runs in the VM outside its job; `None` for any
+    /// other command.
+    fn vm_cpu_ticks(&self) -> Result<Option<u64>, String> {
+        if !self.wsl {
+            return Ok(None);
+        }
+        gate_win32::wsl_vm_cpu().map_err(|error| error.to_string())
     }
 }
 
@@ -446,7 +458,7 @@ mod tests {
         let name = format!("gate-heartbeat-test-{}", std::process::id());
         // Kill-on-close, so a failing case leaves no burner spinning.
         let job = Arc::new(gate_win32::Job::create_kill_on_close(&name).expect("the job is created"));
-        let source = job_cpu(Arc::clone(&job));
+        let source = job_cpu(Arc::clone(&job), false);
         let first = source.job_cpu_ticks();
 
         let start = own_cpu();

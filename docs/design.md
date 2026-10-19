@@ -1281,7 +1281,7 @@ All kept, with each knob's default unchanged:
   The free share is 1 for a High-priority command; otherwise `busy` is the share of the interval's system time that was not idle, the cores others held are `max(0, busy * cores - own cores)` with `own cores` the CPU gained over the interval by the job and by the escaped tree (below), and `free = clamp((cores - others) / demand, 0.05, 1)`. `demand` is every core, `min(cores, 2)` for a light gate, or 1 for a gate on no slot, so its ceiling stays near wall time on a loaded PC.
 - The backstop (W4): wall time less paused time reaching 5 times the ceiling, whatever the load: `gate: BACKSTOP: ...`. One sample's precedence is STALLED, TIMED OUT, BACKSTOP.
 - Sampler failure (W5): `gate: sampler failed: <message>; watching by wall time only`, then the backstop alone watches. The pause markers are still read, and a paused stretch, that of the failing sample included and running to the failure's own fresh stamp, is left out of the backstop's wall time.
-- WSL (W6): for a command whose first word is `wsl` or `wsl.exe` (a path allowed, case-insensitive), the VM's CPU since the last progress reaching a tenth of one core over the stall window counts as progress. The VM's CPU is not added to the command's own CPU, since the VM is the only signal of the work inside it; a `wsl` relay among the job members' descendants is an escaped process like any other, and its CPU counts as the command's own. The rule watches a local run only: the box's ceiling runs with no stall window and the WSL rule off (`boxside/ceiling.rs`), and its kill ends `wsl.exe` but not the processes inside the VM.
+- WSL (W6): for a command whose first word is `wsl` or `wsl.exe` (a path allowed, case-insensitive), the VM's CPU since the last progress reaching a tenth of one core over the stall window counts as progress. The VM's CPU is not added to the command's own CPU, since the VM is the only signal of the work inside it; a `wsl` relay among the job members' descendants is an escaped process like any other, and its CPU counts as the command's own. The rule watches a local run; on the box, the ceiling runs with no stall window and the WSL rule off (`boxside/ceiling.rs`), and the heartbeat applies its own VM rule to a `wsl` command (The box side, below). A kill ends `wsl.exe` but not the processes inside the VM.
 
   The reader is `gate_win32::wsl_vm_cpu` (`times.rs`): the sum of kernel and user time over every process named `vmmemWSL`, read in-process through `NtQuerySystemInformation(SystemProcessInformation)`, never through a child process (an unelevated `OpenProcess` on the VM process is denied, and so is HCS). Plain `vmmem` is not read, since it can be any Hyper-V VM.
 
@@ -2485,6 +2485,8 @@ Built verbs:
 
   While the command runs it writes only when the CPU of the command's job since the last beat reaches 1% of the time since it. The command's build servers are its run's own and run in the job, so a build server outside the job counts for nothing.
 
+  For a command whose first word is `wsl` or `wsl.exe` (`is_wsl_command`, the test the local watch uses), the WSL VM's CPU (process `vmmemWSL`, read as W6 reads it) also writes a beat when it reaches a tenth of one core over the beat period, since the work runs in the VM outside the job.
+
   A period with no beat due flushes instead, and the box's flush probes stderr with a zero-byte write under the output lock. A beat, a flush or a probe that fails with a closed, broken or not-connected pipe (`ERROR_NO_DATA`, `ERROR_BROKEN_PIPE`, `ERROR_PIPE_NOT_CONNECTED`) sets the run's client-gone flag, which the stdout and stderr forwarders set on any write error, so a quiet command whose client is gone is found within a period.
 
   A probe that fails any other way stops the probing for the rest of the run while the beats go on, and the box then sees a gone client only when a beat fails to write.
@@ -2509,7 +2511,7 @@ Built verbs:
 
   The first command that ends non-zero or is killed ends the warm-up with `gate: remote warm-up stopped at command <k> of <n>` on stderr and that command's status (124 for a kill). A budget spent before command `k` ends it with `gate: remote warm-up ran out of its <s> s budget before command <k> of <n>` and exit 124. Once every command passed, the box writes `{Work}.warm` holding exactly `WarmHash` and says `gate: remote warm <hash>` last, exit 0. A record that cannot be removed or written says `gate: remote could not remove <Work>.warm: <error>` or `gate: remote could not write <Work>.warm: <error>` and exits 1.
 
-  The `CpuSource` is the job's own CPU, which only rises: the job's accounting keeps what its ended processes used. Another run's busy build on the box does not keep a silent idle command alive.
+  The `CpuSource` is the job's own CPU, which only rises: the job's accounting keeps what its ended processes used. Another run's busy build on the box does not keep a silent idle command alive, except a `wsl` command: the VM is shared, so another run's or Docker Desktop's WSL work counts for it. The VM's idle keep-alive (about 0.03 core) stays under the tenth-of-a-core floor.
 
   A heartbeat line never splits a forwarded line: the pump writes under the output lock the forwarders take. The run's git children (fetch, checkout, clean, the back ref reset, the back commit's add, write-tree, rev-parse, commit-tree and push, and diff-tree) have their output forwarded the same way, line by line; the box's own lines are written whole under std's stream lock, which the pump's writes take too. A line still waiting for the lock when the readers stop is dropped.
 
@@ -2518,6 +2520,8 @@ Built verbs:
   A client that closed the connection while git's output was forwarded ends the run with 255 and `gate: remote the client closed the connection during git <step>`, the step's name saying git once (`during git init`, not `during git git init`). A pipe that cannot be read says `gate: remote could not read git's stderr: <error>` (or `stdout`).
 
   A failed CPU read writes `gate: remote heartbeat stopped: cannot read the CPU of job <name>: <error>` (or `... cannot list the processes of job <name>: <error>`) and a thread that cannot start writes `gate: remote heartbeat stopped: cannot start the heartbeat: <error>`; the heartbeats end and the run does not, and with them the heartbeat's finding of a gone client: a forwarded line's failed write still finds it.
+
+  A failed read of the WSL VM's CPU writes `gate: remote heartbeat cannot read the WSL VM's CPU: <why>` at most once per pump, and the beats go on from the job's CPU. Every later tick reads the VM again; the first good reading after a failure is only a baseline, and the next one can beat.
 
   Ending the heartbeat waits at most 2 s (`Pump::stop_within`), so a pump stuck on a client that stopped reading is left behind and the work folder's lock is released.
 

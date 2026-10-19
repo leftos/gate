@@ -221,6 +221,7 @@ pub(super) fn hand_off(here: &Here<'_, '_>, console: &mut Console) -> Result<Ran
         keep: &[],
         beat,
         ceiling,
+        wsl: here.one.wsl(),
     };
     let watched = watch(started, console);
     stopper.armed = false;

@@ -14,6 +14,9 @@ const PREFIX: &str = "gate-remote-heartbeat:";
 /// The prefix of the line written once the heartbeats stop, with why.
 const STOPPED_PREFIX: &str = "gate: remote heartbeat stopped:";
 
+/// The prefix of the line written once when the WSL VM's CPU cannot be read, with why.
+const VM_UNREAD_PREFIX: &str = "gate: remote heartbeat cannot read the WSL VM's CPU:";
+
 /// The 100 ns ticks in one millisecond.
 const TICKS_PER_MS: u64 = 10_000;
 
@@ -28,6 +31,14 @@ pub trait CpuSource: Send + Sync {
     ///
     /// The message the heartbeats report once and stop for, when the job's CPU cannot be read.
     fn job_cpu_ticks(&self) -> Result<u64, String>;
+
+    /// The WSL VM's total CPU time in 100 ns ticks, for a command whose work runs in the VM, outside its job; `None`
+    /// for a command that is not a WSL one, or when no VM runs.
+    ///
+    /// # Errors
+    ///
+    /// The message the heartbeats report once before going on from the job's CPU alone, when the VM's CPU cannot be read.
+    fn vm_cpu_ticks(&self) -> Result<Option<u64>, String>;
 }
 
 /// A monotonic clock in 100 ns ticks, injected so a test can drive the beat rule.
@@ -36,12 +47,13 @@ pub trait Ticker: Send + Sync {
     fn now_ticks(&self) -> u64;
 }
 
-/// The beat rule: a command's CPU is worth a heartbeat once it has used at least 1% of one core since the last beat,
-/// the CPU carried forward between samples until one is written.
+/// The beat rule: a command's CPU is worth a heartbeat once its job has used at least 1% of one core since the last
+/// beat, or the WSL VM it works in a tenth of one, the CPU of each carried forward between samples until one is written.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BeatClock {
     last_beat: u64,
-    cpu_since_beat: u64,
+    job_carried: u64,
+    vm_carried: u64,
 }
 
 impl BeatClock {
@@ -54,15 +66,19 @@ impl BeatClock {
     /// Restarts the clock at `now_ticks`, with no CPU carried forward.
     pub fn reset(&mut self, now_ticks: u64) {
         self.last_beat = now_ticks;
-        self.cpu_since_beat = 0;
+        self.job_carried = 0;
+        self.vm_carried = 0;
     }
 
-    /// Adds the CPU ticks used since the last sample and says whether a beat is due at `now_ticks`; a due one
-    /// restarts the clock there.
-    pub fn sample(&mut self, cpu_ticks_used: u64, now_ticks: u64) -> bool {
-        self.cpu_since_beat = self.cpu_since_beat.saturating_add(cpu_ticks_used);
-        let elapsed = now_ticks.saturating_sub(self.last_beat);
-        if elapsed == 0 || u128::from(self.cpu_since_beat) * 100 < u128::from(elapsed) {
+    /// Adds the job's and the WSL VM's CPU ticks used since the last sample and says whether a beat is due at
+    /// `now_ticks`; a due one restarts the clock there.
+    pub fn sample(&mut self, cpu_ticks_used: u64, vm_ticks_used: u64, now_ticks: u64) -> bool {
+        self.job_carried = self.job_carried.saturating_add(cpu_ticks_used);
+        self.vm_carried = self.vm_carried.saturating_add(vm_ticks_used);
+        let elapsed = u128::from(now_ticks.saturating_sub(self.last_beat));
+        let job_due = u128::from(self.job_carried) * 100 >= elapsed;
+        let vm_due = u128::from(self.vm_carried) * 10 >= elapsed;
+        if elapsed == 0 || !(job_due || vm_due) {
             return false;
         }
         self.reset(now_ticks);
@@ -73,10 +89,11 @@ impl BeatClock {
 /// The heartbeat pump: every period it writes a heartbeat whatever the CPU while no run is watched — the CPU total
 /// summed over every run watched so far, as the wrapper's `cpuTotal` is, and zero before any — and only when the
 /// watched command's CPU earns one while a run is. Its own thread does the sampling and the writing, so a write a full
-/// pipe blocks holds up no one else. A period with no heartbeat due flushes the writer instead. A write or a flush that
-/// fails, a CPU read that fails and a panic in the thread all end the heartbeats for the rest of the run, and the pump
-/// never ends the run itself; a writer may act on its own failure first, as the box's sets its run's client-gone flag,
-/// which then ends the run.
+/// pipe blocks holds up no one else. A period with no heartbeat due flushes the writer instead. A WSL VM whose CPU
+/// cannot be read is said once in the pump's life, through the same writer; that period counts the job's CPU alone,
+/// and every period still reads the VM again. A write or a flush that fails, a job CPU read that fails and a panic in
+/// the thread all end the heartbeats for the rest of the run, and the pump never ends the run itself; a writer may act
+/// on its own failure first, as the box's sets its run's client-gone flag, which then ends the run.
 pub struct Pump {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
@@ -93,8 +110,14 @@ struct Shared {
 struct State {
     cpu: Option<Arc<dyn CpuSource>>,
     job_ticks: u64,
+    /// The WSL VM's CPU at the last reading, `None` when there was none to count from.
+    vm_ticks: Option<u64>,
+    /// Set once a failed VM read has been said, so a later failure is not said again.
+    vm_said: bool,
     cpu_total: u64,
     clock: BeatClock,
+    /// A line the next tick says before its heartbeat, the heartbeats going on after it.
+    said: Option<String>,
     notice: Option<String>,
     stopped: bool,
     /// Set once the pump's thread has ended, however it ended.
@@ -102,8 +125,68 @@ struct State {
     panicked: Option<String>,
 }
 
-/// What one tick decided: the line due now, if any, and whether the heartbeats end after it.
+impl State {
+    /// The state of a pump that watches no run and has said nothing.
+    fn new() -> Self {
+        Self {
+            cpu: None,
+            job_ticks: 0,
+            vm_ticks: None,
+            vm_said: false,
+            cpu_total: 0,
+            clock: BeatClock::new(),
+            said: None,
+            notice: None,
+            stopped: false,
+            finished: false,
+            panicked: None,
+        }
+    }
+
+    /// Watches `cpu` from now on: its job's CPU and its VM's are baselined, and the beat clock restarted at `ticker`'s
+    /// time. A job CPU read that fails is the notice the heartbeats stop for; a VM read that fails is said once.
+    fn watch(&mut self, cpu: Arc<dyn CpuSource>, ticker: &dyn Ticker) {
+        match cpu.job_cpu_ticks() {
+            Ok(ticks) => {
+                self.job_ticks = ticks;
+                self.vm_ticks = None;
+                self.vm_used(cpu.as_ref());
+                self.clock.reset(ticker.now_ticks());
+                self.cpu = Some(cpu);
+            }
+            Err(message) => self.notice = Some(stopped_line(&message)),
+        }
+    }
+
+    /// The WSL VM CPU ticks `cpu` used since its last reading. A reading of none, or one lower than the last, which a
+    /// VM that restarted gives, is a fresh baseline and counts nothing; a read that fails counts nothing and leaves no
+    /// baseline, so the next good reading is one, and the first failure of the pump's life is said.
+    fn vm_used(&mut self, cpu: &dyn CpuSource) -> u64 {
+        match cpu.vm_cpu_ticks() {
+            Ok(reading) => {
+                let used = match (self.vm_ticks, reading) {
+                    (Some(last), Some(now)) if now >= last => now - last,
+                    _ => 0,
+                };
+                self.vm_ticks = reading;
+                used
+            }
+            Err(message) => {
+                self.vm_ticks = None;
+                if !self.vm_said {
+                    self.vm_said = true;
+                    self.said = Some(format!("{VM_UNREAD_PREFIX} {message}"));
+                }
+                0
+            }
+        }
+    }
+}
+
+/// What one tick decided: a line said before its heartbeat, the heartbeat line due now, if any, and whether the
+/// heartbeats end after them.
 struct Tick {
+    said: Option<String>,
     line: Option<String>,
     ended: bool,
 }
@@ -116,16 +199,7 @@ impl Pump {
     /// Why the pump's thread could not be started.
     pub fn start<W: Write + Send + 'static>(writer: W, ticker: Arc<dyn Ticker>, period: Duration) -> io::Result<Self> {
         let shared = Arc::new(Shared {
-            state: Mutex::new(State {
-                cpu: None,
-                job_ticks: 0,
-                cpu_total: 0,
-                clock: BeatClock::new(),
-                notice: None,
-                stopped: false,
-                finished: false,
-                panicked: None,
-            }),
+            state: Mutex::new(State::new()),
             wake: Condvar::new(),
             ticker,
         });
@@ -142,19 +216,11 @@ impl Pump {
         })
     }
 
-    /// Samples `cpu`, the run watched from now on: its CPU is baselined there, the beat clock restarted, and a
-    /// heartbeat is written only when that CPU earns one. A CPU read that fails here reports why the heartbeats
-    /// stopped, as one during the pump does.
+    /// Samples `cpu`, the run watched from now on: its job's CPU and its WSL VM's are baselined there, the beat clock
+    /// restarted, and a heartbeat is written only when that CPU earns one. A job CPU read that fails here reports why
+    /// the heartbeats stopped, as one during the pump does; a VM read that fails is said once, as one during the pump is.
     pub fn watch(&self, cpu: Arc<dyn CpuSource>) {
-        let mut state = lock(&self.shared.state);
-        match cpu.job_cpu_ticks() {
-            Ok(ticks) => {
-                state.job_ticks = ticks;
-                state.clock.reset(self.shared.ticker.now_ticks());
-                state.cpu = Some(cpu);
-            }
-            Err(message) => state.notice = Some(stopped_line(&message)),
-        }
+        lock(&self.shared.state).watch(cpu, self.shared.ticker.as_ref());
     }
 
     /// Drops the watched run: the pump writes unconditionally again.
@@ -266,14 +332,15 @@ fn pump_loop<W: Write>(writer: &mut W, period: Duration, shared: &Shared) {
                 return;
             }
         }
-        let (line, ended) = {
+        let Tick { said, line, ended } = {
             let mut state = lock(&shared.state);
-            let decided = tick(&mut state, shared.ticker.as_ref());
-            (decided.line, decided.ended)
+            tick(&mut state, shared.ticker.as_ref())
         };
-        let written = match line {
-            Some(line) => write_line(writer, &line),
-            None => writer.flush(),
+        let lines: Vec<String> = said.into_iter().chain(line).collect();
+        let written = if lines.is_empty() {
+            writer.flush()
+        } else {
+            lines.iter().try_for_each(|line| write_line(writer, line))
         };
         if written.is_err() {
             return;
@@ -284,16 +351,18 @@ fn pump_loop<W: Write>(writer: &mut W, period: Duration, shared: &Shared) {
     }
 }
 
-/// One tick under the state lock: the line it decided, and whether the heartbeats end after it.
+/// One tick under the state lock: the lines it decided, and whether the heartbeats end after them.
 fn tick(state: &mut State, ticker: &dyn Ticker) -> Tick {
     if let Some(notice) = state.notice.take() {
         return Tick {
+            said: state.said.take(),
             line: Some(notice),
             ended: true,
         };
     }
     let Some(cpu) = state.cpu.clone() else {
         return Tick {
+            said: state.said.take(),
             line: Some(heartbeat(state.cpu_total)),
             ended: false,
         };
@@ -303,13 +372,16 @@ fn tick(state: &mut State, ticker: &dyn Ticker) -> Tick {
             let used = ticks.saturating_sub(state.job_ticks);
             state.job_ticks = ticks;
             state.cpu_total = state.cpu_total.saturating_add(used);
-            let beat = state.clock.sample(used, ticker.now_ticks());
+            let vm_used = state.vm_used(cpu.as_ref());
+            let beat = state.clock.sample(used, vm_used, ticker.now_ticks());
             Tick {
+                said: state.said.take(),
                 line: beat.then(|| heartbeat(state.cpu_total)),
                 ended: false,
             }
         }
         Err(message) => Tick {
+            said: state.said.take(),
             line: Some(stopped_line(&message)),
             ended: true,
         },
@@ -355,6 +427,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     #![expect(clippy::expect_used, reason = "a test that cannot start its pump must fail loudly")]
 
+    use std::collections::VecDeque;
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, Sender, channel};
@@ -396,6 +469,10 @@ mod tests {
         fn job_cpu_ticks(&self) -> Result<u64, String> {
             Ok(self.0.load(Ordering::SeqCst))
         }
+
+        fn vm_cpu_ticks(&self) -> Result<Option<u64>, String> {
+            Ok(None)
+        }
     }
 
     /// A CPU source that cannot be read at all.
@@ -405,6 +482,178 @@ mod tests {
         fn job_cpu_ticks(&self) -> Result<u64, String> {
             Err("the job is gone".to_string())
         }
+
+        fn vm_cpu_ticks(&self) -> Result<Option<u64>, String> {
+            Ok(None)
+        }
+    }
+
+    /// A CPU source whose job reads what the case stored, and whose WSL VM gives the readings the case scripted, in order.
+    struct ScriptedVm {
+        job: AtomicU64,
+        vm: Mutex<VecDeque<Result<Option<u64>, String>>>,
+    }
+
+    impl CpuSource for ScriptedVm {
+        fn job_cpu_ticks(&self) -> Result<u64, String> {
+            Ok(self.job.load(Ordering::SeqCst))
+        }
+
+        fn vm_cpu_ticks(&self) -> Result<Option<u64>, String> {
+            lock(&self.vm).pop_front().expect("the case scripted every VM read it makes")
+        }
+    }
+
+    /// A clock that reads what the case stored.
+    struct SetTicker(AtomicU64);
+
+    impl Ticker for SetTicker {
+        fn now_ticks(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    /// What a pump says on each tick of a run watched at 0 with the WSL VM read as `baseline`, one tick 5 s after the
+    /// last, each step the job's total CPU in ms and the VM's reading at that tick: the line said, and the heartbeat.
+    fn vm_ticks(baseline: Result<Option<u64>, String>, steps: &[(u64, Result<Option<u64>, String>)]) -> Vec<(Option<String>, Option<String>)> {
+        let readings = std::iter::once(baseline).chain(steps.iter().map(|(_, vm)| vm.clone())).collect();
+        let source = Arc::new(ScriptedVm {
+            job: AtomicU64::new(0),
+            vm: Mutex::new(readings),
+        });
+        let ticker = SetTicker(AtomicU64::new(0));
+        let mut state = State::new();
+        state.watch(Arc::clone(&source) as Arc<dyn CpuSource>, &ticker);
+        (1_u64..)
+            .zip(steps)
+            .map(|(at, (job_ms, _))| {
+                source.job.store(job_ms * MS, Ordering::SeqCst);
+                ticker.0.store(at * 5 * SECOND, Ordering::SeqCst);
+                let decided = tick(&mut state, &ticker);
+                assert!(!decided.ended, "the heartbeats go on");
+                (decided.said, decided.line)
+            })
+            .collect()
+    }
+
+    /// The line a failed read of the WSL VM's CPU is said with, in the VM cases.
+    const VM_UNREAD_LINE: &str = "gate: remote heartbeat cannot read the WSL VM's CPU: the list is gone";
+
+    #[test]
+    fn a_tenth_of_a_core_in_the_wsl_vm_beats_while_the_job_is_under_one_percent() {
+        assert_eq!(
+            vm_ticks(Ok(Some(0)), &[(49, Ok(Some(500 * MS)))]),
+            [(None, Some("gate-remote-heartbeat: 49".to_string()))],
+            "500 ms of VM CPU over 5 s is a tenth of a core"
+        );
+    }
+
+    #[test]
+    fn a_twentieth_of_a_core_in_the_wsl_vm_does_not_beat() {
+        assert_eq!(
+            vm_ticks(Ok(Some(0)), &[(49, Ok(Some(250 * MS)))]),
+            [(None, None)],
+            "250 ms of VM CPU over 5 s is under a tenth of a core"
+        );
+    }
+
+    #[test]
+    fn a_vm_reading_of_none_never_beats_from_the_vm() {
+        assert_eq!(
+            vm_ticks(Ok(None), &[(0, Ok(Some(10 * SECOND))), (0, Ok(None)), (0, Ok(Some(20 * SECOND)))]),
+            [(None, None), (None, None), (None, None)],
+            "a reading after none is a fresh baseline, so nothing counts across the gap"
+        );
+    }
+
+    #[test]
+    fn a_vm_reading_lower_than_the_last_is_a_fresh_baseline() {
+        assert_eq!(
+            vm_ticks(Ok(Some(10 * SECOND)), &[(0, Ok(Some(0))), (0, Ok(Some(SECOND)))]),
+            [(None, None), (None, Some("gate-remote-heartbeat: 0".to_string()))],
+            "the VM restarted at 0, and its 1 s since then over 10 s is a tenth of a core"
+        );
+    }
+
+    #[test]
+    fn a_failed_vm_read_is_said_once_and_the_beats_go_on_from_the_job() {
+        let failed = || Err("the list is gone".to_string());
+        assert_eq!(
+            vm_ticks(Ok(Some(0)), &[(0, failed()), (100, failed()), (200, failed())]),
+            [
+                (Some(VM_UNREAD_LINE.to_string()), None),
+                (None, Some("gate-remote-heartbeat: 100".to_string())),
+                (None, Some("gate-remote-heartbeat: 200".to_string())),
+            ],
+            "the failure is said once, and the job's CPU still beats"
+        );
+    }
+
+    #[test]
+    fn the_vm_is_read_again_after_a_failed_read_and_its_next_good_reading_is_a_baseline() {
+        let failed = || Err("the list is gone".to_string());
+        assert_eq!(
+            vm_ticks(
+                Ok(Some(0)),
+                &[(0, failed()), (100, failed()), (100, Ok(Some(10 * SECOND))), (100, Ok(Some(12 * SECOND)))]
+            ),
+            [
+                (Some(VM_UNREAD_LINE.to_string()), None),
+                (None, Some("gate-remote-heartbeat: 100".to_string())),
+                (None, None),
+                (None, Some("gate-remote-heartbeat: 100".to_string())),
+            ],
+            "the failure is said once; the first good reading after it counts nothing, and the next one's 2 s over 10 s beats"
+        );
+    }
+
+    #[test]
+    fn a_vm_read_that_fails_at_the_watch_is_said_by_the_first_tick_with_its_beat() {
+        assert_eq!(
+            vm_ticks(Err("the list is gone".to_string()), &[(100, Ok(Some(0))), (100, Ok(Some(SECOND)))]),
+            [
+                (Some(VM_UNREAD_LINE.to_string()), Some("gate-remote-heartbeat: 100".to_string())),
+                (None, Some("gate-remote-heartbeat: 100".to_string())),
+            ],
+            "the watch's failure is said by the first tick, whose job CPU beats; its good reading is a baseline, and the \
+             next one's 1 s over 5 s beats"
+        );
+    }
+
+    /// A CPU source whose first reads, the watch's, give no job CPU and no VM, and whose later ones give a second of
+    /// job CPU and a VM that cannot be read.
+    struct VmFailsAfterTheWatch {
+        job_reads: AtomicUsize,
+        vm_reads: AtomicUsize,
+    }
+
+    impl CpuSource for VmFailsAfterTheWatch {
+        fn job_cpu_ticks(&self) -> Result<u64, String> {
+            Ok(if self.job_reads.fetch_add(1, Ordering::SeqCst) == 0 { 0 } else { SECOND })
+        }
+
+        fn vm_cpu_ticks(&self) -> Result<Option<u64>, String> {
+            if self.vm_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(None)
+            } else {
+                Err("the list is gone".to_string())
+            }
+        }
+    }
+
+    #[test]
+    fn pump_writes_a_failed_vm_read_before_the_beat_of_the_same_tick() {
+        let (events, seen) = channel();
+        let (reads, _read) = channel();
+        let pump = Pump::start(ReportingWriter { events }, Arc::new(StepTicker::new(5 * SECOND, reads)), PERIOD).expect("the pump starts");
+        assert_eq!(next_line(&seen), IDLE_LINE);
+        pump.watch(Arc::new(VmFailsAfterTheWatch {
+            job_reads: AtomicUsize::new(0),
+            vm_reads: AtomicUsize::new(0),
+        }));
+        assert_eq!(next_beat(&seen), VM_UNREAD_LINE, "the failed VM read is written first");
+        assert_eq!(next_line(&seen), "gate-remote-heartbeat: 1000", "then the beat its tick's job CPU earned");
+        assert!(pump.stop().is_ok());
     }
 
     /// A CPU source that reads once, baselining the run, and then cannot be read.
@@ -417,6 +666,10 @@ mod tests {
             } else {
                 Err("the job is gone".to_string())
             }
+        }
+
+        fn vm_cpu_ticks(&self) -> Result<Option<u64>, String> {
+            Ok(None)
         }
     }
 
@@ -431,6 +684,10 @@ mod tests {
             } else {
                 panic!("the CPU source blew up")
             }
+        }
+
+        fn vm_cpu_ticks(&self) -> Result<Option<u64>, String> {
+            Ok(None)
         }
     }
 
@@ -671,7 +928,7 @@ mod tests {
             let mut got = Vec::new();
             for ms in cpu_ms {
                 now += period;
-                got.push(clock.sample(ms * MS, now));
+                got.push(clock.sample(ms * MS, 0, now));
             }
             assert_eq!(got, want, "{name}");
         }
@@ -681,7 +938,7 @@ mod tests {
     fn elapsed_zero_is_no_beat() {
         let mut clock = BeatClock::new();
         clock.reset(1000);
-        assert!(!clock.sample(1_000_000, 1000), "no time passed, so no beat");
+        assert!(!clock.sample(1_000_000, 1_000_000, 1000), "no time passed, so no beat");
     }
 
     #[test]
