@@ -1,13 +1,15 @@
 //! A routed run's fetched outputs archive put into the worktree: unpacked into a stage folder beside it, which checks
 //! every member's path and hash and makes each copy the archive lists from its member, or from a PC file holding its bytes,
 //! checked by hashing them as they are copied; each member then checked against the run's output globs, against the PC's manifest
-//! (a file it held must still have its size and last write, one it lacked must still be missing), and one that counts as
+//! (a file it held must still have its size and last write, one it lacked must still be missing, else the PC's file must
+//! already hold the member's bytes, which leaves it in place, and every member failing this is named), and one that counts as
 //! tracked (its git index, a submodule or a nested repository holds it) unless a `--bring-tracked` glob matches it, or
 //! whose PC file is in use or read-only, or that records one of the run's box trees but is not text the install can
 //! rewrite, skipped and said; each of the run's trees on the box rewritten to its root on this PC in the files that
 //! record it (the work folder to the worktree for one repo; for a pair, the main's tree to the worktree and each
 //! sibling's to the sibling's root); and each file, its last write clamped to this PC's clock in the stage and checked
-//! unchanged once more, moved into place. A complete
+//! against the manifest once more, moved into place, unless its PC file now holds the member's bytes, which is left as
+//! it is. A complete
 //! install also keeps the hash of each file it put in place, at the stamp that file's handle reads after the move, in
 //! the worktree's hash cache, so the next run takes it instead of reading the file again. The success line says what
 //! came back; every end removes the archive and the stage this run made, and the pending marker is cleared by a success
@@ -32,6 +34,7 @@ use crate::boxside::payload::{escaped, ordinal_upper};
 use crate::outputs::archive::{Entry, PcFiles, UnpackError, below, check_folder, unpack};
 use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
+use crate::outputs::hash::file_sha256;
 use crate::outputs::manifest::Manifest;
 use crate::outputs::walk::{Stamp, in_context};
 
@@ -55,6 +58,8 @@ const MB: f64 = 1024.0 * 1024.0;
 /// The seam's name for the install, to `--test-remote-interrupt-at`: the interrupt is raised before the second file's
 /// move, never for an install of a single file.
 const INSTALL: &str = "install";
+/// The most members whose PC files changed during the run a refusal names, one line each; the rest are counted.
+const CHANGED_NAMED: usize = 10;
 
 /// What the install of a fetched archive needs: the archive, the stage folder beside it, the pending marker, the PC's
 /// manifest and the run's output globs, the box path of each of the run's trees with the PC root it stands for, and
@@ -73,14 +78,15 @@ pub(super) struct Fetched<'f> {
     pub(super) started: Instant,
 }
 
-/// What an install put into the worktree: its files, their bytes, and the archive's bytes; the paths of the files it
-/// skipped, each with why; and the files it moved into place, for the hash cache it keeps ([`cached`]).
+/// What an install put into the worktree: the files it moved, their bytes, and the archive's bytes; the paths of the
+/// files it skipped, each with why; and the files it moved into place, for the hash cache it keeps ([`cached`]).
 struct Installed {
     count: usize,
     bytes: u64,
     compressed: u64,
     skipped: Vec<(String, Skip)>,
-    /// Each file the install moved into place, with the stamp its handle read after the move.
+    /// Each file the install moved into place, with the stamp its handle read after the move; never a member left as
+    /// it was because the PC's file already held its bytes ([`Pc::InPlace`]).
     moved: Vec<Moved>,
 }
 
@@ -153,11 +159,11 @@ enum Unmet {
     Refused(Refused),
 }
 
-/// Why an install refused to bring the outputs back, and whether a refetch of the same outputs would be refused the
-/// same way.
+/// Why an install refused to bring the outputs back, each reason said on a line of its own, and whether a refetch of the
+/// same outputs would be refused the same way.
 #[derive(Debug, PartialEq, Eq)]
 struct Refused {
-    reason: String,
+    reasons: Vec<String>,
     kind: Kind,
 }
 
@@ -177,7 +183,7 @@ impl Refused {
     /// The refusal a refetch of the same outputs would be refused the same way.
     fn deterministic(reason: impl Into<String>) -> Refused {
         Refused {
-            reason: reason.into(),
+            reasons: vec![reason.into()],
             kind: Kind::Deterministic,
         }
     }
@@ -185,7 +191,22 @@ impl Refused {
     /// The refusal of anything a refetch may clear.
     fn transient(reason: impl Into<String>) -> Refused {
         Refused {
-            reason: reason.into(),
+            reasons: vec![reason.into()],
+            kind: Kind::Transient,
+        }
+    }
+
+    /// The refusal of the members whose PC files changed during the run or could not be checked, `found` holding why for
+    /// each, in archive order: the first [`CHANGED_NAMED`] of them, then one counting the rest when there are more. The
+    /// PC's own worktree decides it, so a refetch may clear it ([`Refused::transient`]).
+    fn changed(mut found: Vec<String>) -> Refused {
+        let more = found.len().saturating_sub(CHANGED_NAMED);
+        found.truncate(CHANGED_NAMED);
+        if more > 0 {
+            found.push(format!("{more} more files changed during the run"));
+        }
+        Refused {
+            reasons: found,
             kind: Kind::Transient,
         }
     }
@@ -237,8 +258,8 @@ pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) ->
         }
         Err(unmet) => {
             let clear = matches!(&unmet, Unmet::Refused(refused) if refused.kind == Kind::Deterministic);
-            let (end, line) = ending(unmet);
-            (end, line.into_iter().collect(), false, clear)
+            let (end, lines) = ending(unmet);
+            (end, lines, false, clear)
         }
     };
     for line in lines {
@@ -257,16 +278,19 @@ pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) ->
     (end, complete)
 }
 
-/// The end of an install that did not complete as `unmet` says, and the line it says: none for a Ctrl+C before any file
-/// was moved, which the run's own interrupt handling says.
-fn ending(unmet: Unmet) -> (End, Option<String>) {
+/// The end of an install that did not complete as `unmet` says, and the lines it says: one for each reason of a refusal,
+/// none for a Ctrl+C before any file was moved, which the run's own interrupt handling says.
+fn ending(unmet: Unmet) -> (End, Vec<String>) {
     match unmet {
-        Unmet::Interrupted { done: 0, .. } => (End::Interrupted, None),
+        Unmet::Interrupted { done: 0, .. } => (End::Interrupted, Vec::new()),
         Unmet::Interrupted { done, total } => {
             let reason = format!("{done} of {total} files were installed before the interrupt");
-            (End::Interrupted, Some(outputs::not_brought_back(&reason)))
+            (End::Interrupted, vec![outputs::not_brought_back(&reason)])
         }
-        Unmet::Refused(refused) => (End::Status(1), Some(outputs::not_brought_back(&refused.reason))),
+        Unmet::Refused(refused) => (
+            End::Status(1),
+            refused.reasons.iter().map(|reason| outputs::not_brought_back(reason)).collect(),
+        ),
     }
 }
 
@@ -298,8 +322,10 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
         }
     })?;
     let globs = Globs::new(fetched.globs).map_err(transient)?;
-    let in_use = checked(&root, &entries, &globs, fetched.manifest).map_err(Unmet::Refused)?;
-    let mut skipped = skips(attempt, &root, &entries, &in_use)?;
+    let checks = checked(&root, &entries, &globs, fetched.manifest).map_err(Unmet::Refused)?;
+    let in_place: HashSet<&str> = checks.in_place.iter().map(String::as_str).collect();
+    let entries: Vec<Entry> = entries.into_iter().filter(|entry| !in_place.contains(entry.path.as_str())).collect();
+    let mut skipped = skips(attempt, &root, &entries, &checks.in_use)?;
     let skipped_paths: HashSet<&str> = skipped.iter().map(|(path, _)| path.as_str()).collect();
     let entries: Vec<Entry> = entries.into_iter().filter(|entry| !skipped_paths.contains(entry.path.as_str())).collect();
     let siblings = fetched.sibling_trees.iter().map(|(tree, pc_root)| {
@@ -332,8 +358,8 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
     })?;
     Ok((
         Installed {
-            count: total,
-            bytes: entries.iter().map(|entry| entry.size).sum(),
+            count: moved.len(),
+            bytes: moved.iter().map(|moved| moved.entry.size).sum(),
             compressed,
             skipped,
             moved,
@@ -569,44 +595,77 @@ fn unpacked(source: impl Read, stage: &Path, limit: u64, pc: &PcFiles<'_>, stopp
     )
 }
 
+/// What the checks before the moves found of an archive's members, each list holding paths in archive order.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Checked {
+    /// The members whose PC file is as the manifest holds it but not replaceable ([`writable`]), which the install skips.
+    in_use: Vec<String>,
+    /// The members whose PC file changed during the run to the member's own bytes ([`Pc::InPlace`]), which the install
+    /// neither moves nor says.
+    in_place: Vec<String>,
+}
+
 /// Whether each of `entries`, to be installed below the worktree `root`, may be: every one under `globs`, then every
-/// one unchanged since `manifest`; else the first refusal. The one kind a refetch of the same archive would be refused
-/// for again is a member outside the globs ([`Refused::deterministic`]); the PC's own worktree decides the rest. The
-/// paths, in order, of those whose PC file is not replaceable ([`writable`]), which the install skips.
-fn checked(root: &Path, entries: &[Entry], globs: &Globs, manifest: &Manifest) -> Result<Vec<String>, Refused> {
+/// one unchanged since `manifest` or already in place ([`pc_file`]); else the refusal. The one kind a refetch of the
+/// same archive would be refused for again is a member outside the globs ([`Refused::deterministic`]); the PC's own
+/// worktree decides the rest. Every member whose PC file changed otherwise, is not a file or cannot be read is collected,
+/// in archive order, and all are refused together ([`Refused::changed`]). What the checks found ([`Checked`]).
+fn checked(root: &Path, entries: &[Entry], globs: &Globs, manifest: &Manifest) -> Result<Checked, Refused> {
     if let Some(outside) = entries.iter().find(|entry| !globs.matches(&entry.path)) {
         return Err(Refused::deterministic(format!(
             "the archive member {} is not under the output globs",
             outside.path
         )));
     }
+    let mut checks = Checked::default();
+    let mut found = Vec::new();
     for entry in entries {
-        unchanged(root, entry, manifest)?;
+        match pc_file(root, entry, manifest) {
+            Ok(Pc::AsHeld) if !writable(root, entry) => checks.in_use.push(entry.path.clone()),
+            Ok(Pc::AsHeld) => {}
+            Ok(Pc::InPlace) => checks.in_place.push(entry.path.clone()),
+            Ok(Pc::Changed) => found.push(format!("{} changed during the run", entry.path)),
+            Err(why) => found.push(why),
+        }
     }
-    Ok(entries
-        .iter()
-        .filter(|entry| !writable(root, entry))
-        .map(|entry| entry.path.clone())
-        .collect())
+    if found.is_empty() { Ok(checks) } else { Err(Refused::changed(found)) }
 }
 
-/// Whether the PC's file of `entry` below `root` is as `manifest` holds it: one it holds still has its size and last
-/// write, one it lacks is still missing; else the refusal, which names a folder in the file's place as not a file.
-/// Every one of these depends on the PC's own worktree, whose next run may find it otherwise, so each is refused as one
-/// a refetch may clear ([`Refused::transient`]).
-fn unchanged(root: &Path, entry: &Entry, manifest: &Manifest) -> Result<(), Refused> {
+/// What the PC's file of a member is, set against the manifest the run sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pc {
+    /// As the manifest holds it: one it holds still has its size and last write, one it lacks is still missing.
+    AsHeld,
+    /// Changed during the run, but to the member's own bytes ([`holds_the_member`]): the member is already in place.
+    InPlace,
+    /// Changed during the run otherwise.
+    Changed,
+}
+
+/// What the PC's file of `entry` below `root` is against `manifest` ([`Pc`]); else why it cannot be told, which names a
+/// folder in the file's place as not a file. Every one of these depends on the PC's own worktree, whose next run may find
+/// it otherwise, so each refuses as one a refetch may clear ([`Refused::transient`]).
+fn pc_file(root: &Path, entry: &Entry, manifest: &Manifest) -> Result<Pc, String> {
     let target = below(root, &entry.path);
     let now = match fs::metadata(&target) {
-        Ok(metadata) if !metadata.is_file() => return Err(Refused::transient(format!("{} is not a file", entry.path))),
+        Ok(metadata) if !metadata.is_file() => return Err(format!("{} is not a file", entry.path)),
         Ok(metadata) => Some(Stamp::of(&metadata)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(Refused::transient(in_context(&target, &error).to_string())),
+        Err(error) => return Err(in_context(&target, &error).to_string()),
     };
-    match (manifest.get(&entry.path), now) {
-        (Some(held), Some(stamp)) if held.stamp == stamp => Ok(()),
-        (None, None) => Ok(()),
-        _ => Err(Refused::transient(format!("{} changed during the run", entry.path))),
-    }
+    Ok(match (manifest.get(&entry.path), now) {
+        (Some(held), Some(stamp)) if held.stamp == stamp => Pc::AsHeld,
+        (None, None) => Pc::AsHeld,
+        (_, Some(stamp)) if holds_the_member(&target, entry, stamp.size) => Pc::InPlace,
+        _ => Pc::Changed,
+    })
+}
+
+/// Whether the PC file at `target`, `size` bytes long, holds the bytes of `entry`, the archive's member for it: the same
+/// size and SHA-256. A file that cannot be read for its hash does not, nor does one that records a root
+/// ([`records_a_root`]), whose installed bytes are the rewritten ones, never the member's.
+fn holds_the_member(target: &Path, entry: &Entry, size: u64) -> bool {
+    !records_a_root(&entry.path) && size == entry.size && file_sha256(target).is_ok_and(|sha256| sha256 == entry.sha256)
 }
 
 /// Whether the PC's file of `entry` below `root`, when there is one, opens for reading and writing with no sharing,
@@ -824,7 +883,7 @@ fn ends_a_component(next: Option<char>) -> bool {
 /// Moves each of `entries` from `stage` into place below `root`, as [`move_one`] does against `manifest`, asking
 /// `go_on`, given the files moved so far, before each one; else the interrupt once `go_on` says no, or why a file
 /// failed, the files moved before it counted and left in place. Each file moved is returned with the stamp its handle
-/// read after the move, none when that read failed.
+/// read after the move, none when that read failed; one whose PC file already held its bytes is not ([`Placed::InPlace`]).
 fn moved(stage: &Path, root: &Path, entries: &[Entry], manifest: &Manifest, mut go_on: impl FnMut(usize) -> bool) -> Result<Vec<Moved>, Unmoved> {
     let now = SystemTime::now();
     let total = entries.len();
@@ -833,20 +892,32 @@ fn moved(stage: &Path, root: &Path, entries: &[Entry], manifest: &Manifest, mut 
         if !go_on(done) {
             return Err(Unmoved::Interrupted { done });
         }
-        let stamp = move_one(stage, root, entry, manifest, now)
+        let placed = move_one(stage, root, entry, manifest, now)
             .map_err(|error| Unmoved::Failed(format!("{done} of {total} files were installed before {} failed: {error}", entry.path)))?;
-        moved.push(Moved { entry: entry.clone(), stamp });
+        if let Placed::Moved(stamp) = placed {
+            moved.push(Moved { entry: entry.clone(), stamp });
+        }
     }
     Ok(moved)
 }
 
+/// How [`move_one`] put a member in place.
+#[derive(Debug, PartialEq, Eq)]
+enum Placed {
+    /// Moved from the stage, with the stamp its handle read after the move; none when that read failed.
+    Moved(Option<Stamp>),
+    /// Left as it was: the PC's file changed during the run to the member's own bytes ([`Pc::InPlace`]).
+    InPlace,
+}
+
 /// Moves the staged file of `entry` below `stage` to the same path below `root`, replacing a file there, each folder
 /// between `root` and it made when missing and refused when it is a link, a junction or not a folder. Its last write,
-/// when past `now`, is set to `now` in the stage, before the move; the PC's file is then checked unchanged since
-/// `manifest` once more ([`unchanged`]), just before the move. The stamp read after the move through a handle opened on
-/// the staged file before it, the clamp included, is returned: the moved file's own, never that of a file put at its
-/// path after the move. None when the handle cannot be opened or read, which costs the file its hash cache entry only.
-fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, now: SystemTime) -> io::Result<Option<Stamp>> {
+/// when past `now`, is set to `now` in the stage, before the move; the PC's file is then checked against `manifest`
+/// once more ([`pc_file`]), just before the move, and one already holding the member's bytes is left ([`Placed::InPlace`]).
+/// The stamp read after the move through a handle opened on the staged file before it, the clamp included, is returned:
+/// the moved file's own, never that of a file put at its path after the move. None when the handle cannot be opened or
+/// read, which costs the file its hash cache entry only.
+fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, now: SystemTime) -> io::Result<Placed> {
     let path = entry.path.as_str();
     let source = below(stage, path);
     let (parents, _) = path.rsplit_once('/').unwrap_or(("", path));
@@ -864,8 +935,12 @@ fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, now: 
         OpenOptions::new().access_mode(FILE_WRITE_ATTRIBUTES).open(&source)?.set_modified(now)?;
     }
     // A file refused here was checked before the moves; one that changed in between is the reason said, of the kind a
-    // refetch may clear ([`Refused::transient`]).
-    unchanged(root, entry, manifest).map_err(|refused| io::Error::other(refused.reason))?;
+    // refetch may clear ([`Refused::transient`]), and one that changed to the member's own bytes is left as it is.
+    match pc_file(root, entry, manifest).map_err(io::Error::other)? {
+        Pc::AsHeld => {}
+        Pc::InPlace => return Ok(Placed::InPlace),
+        Pc::Changed => return Err(io::Error::other(format!("{path} changed during the run"))),
+    }
     // Its attributes alone, every sharing given: the handle neither refuses the move nor any other opener.
     let handle = OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
@@ -873,7 +948,9 @@ fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, now: 
         .open(&source);
     fs::rename(&source, below(root, path))?;
     // No stamp is the right answer for a handle that cannot be opened or read: the file is installed, its hash not kept.
-    Ok(handle.and_then(|file| file.metadata()).ok().map(|metadata| Stamp::of(&metadata)))
+    Ok(Placed::Moved(
+        handle.and_then(|file| file.metadata()).ok().map(|metadata| Stamp::of(&metadata)),
+    ))
 }
 
 /// Writes the hash cache at `path` for the files an install put in place: an entry for each of `installed.moved`, at
@@ -920,8 +997,8 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
 
     use super::{
-        Index, Installed, Moved, Refused, Skip, Unmet, Unmoved, Unrewritable, cached, checked, ending, moved, reasons, rewritten, said, stage_made,
-        success_line, tracked, unmet_of, unpacked,
+        Checked, Index, Installed, Moved, Refused, Skip, Unmet, Unmoved, Unrewritable, cached, checked, ending, moved, reasons, rewritten, said,
+        stage_made, success_line, tracked, unmet_of, unpacked,
     };
     use crate::boxside::outputs::OUTPUTS_BUDGET;
     use crate::outputs::archive::{Entry, PcFiles, UnpackError, pack};
@@ -964,6 +1041,16 @@ mod tests {
             path: path.to_owned(),
             size: 1,
             sha256: "0".repeat(64),
+        }
+    }
+
+    /// The archive's entry for `path` holding `bytes`, its size and hash theirs.
+    fn member(path: &str, bytes: &[u8]) -> Entry {
+        let (sha256, size) = sha256_of(bytes).expect("the bytes hash");
+        Entry {
+            path: path.to_owned(),
+            size,
+            sha256,
         }
     }
 
@@ -1023,7 +1110,7 @@ mod tests {
                 "{path}"
             );
         }
-        assert_eq!(checked(&root, &[entry("src/bin/a.dll")], &bin_globs(), &manifest), Ok(Vec::new()));
+        assert_eq!(checked(&root, &[entry("src/bin/a.dll")], &bin_globs(), &manifest), Ok(Checked::default()));
     }
 
     #[test]
@@ -1050,7 +1137,7 @@ mod tests {
         assert_eq!(folder, Err(Refused::transient("bin/folder.dll is not a file".to_owned())));
         assert_eq!(
             checked(&root, &[entry("bin/same.dll"), entry("bin/absent.dll")], &bin_globs(), &manifest),
-            Ok(Vec::new())
+            Ok(Checked::default())
         );
     }
 
@@ -1066,8 +1153,12 @@ mod tests {
         let skipped = checked(&root, &entries, &bin_globs(), &manifest);
         drop(held);
 
-        assert_eq!(skipped, Ok(vec!["bin/held.dll".to_owned()]), "only the held file is skipped");
-        assert_eq!(checked(&root, &entries, &bin_globs(), &manifest), Ok(Vec::new()), "released");
+        let held_only = Checked {
+            in_use: vec!["bin/held.dll".to_owned()],
+            in_place: Vec::new(),
+        };
+        assert_eq!(skipped, Ok(held_only), "only the held file is skipped");
+        assert_eq!(checked(&root, &entries, &bin_globs(), &manifest), Ok(Checked::default()), "released");
     }
 
     #[test]
@@ -1523,11 +1614,11 @@ mod tests {
             });
             let (end, line) = ending(unmet_of(error));
             assert!(matches!(end, End::Status(1)), "{end:?}");
-            assert_eq!(line, Some(format!("gate: remote outputs not brought back: {why}")));
+            assert_eq!(line, [format!("gate: remote outputs not brought back: {why}")]);
         }
         assert_eq!(unmet_of(GitError::Interrupted), Unmet::Interrupted { done: 0, total: 0 });
         let (end, line) = ending(unmet_of(GitError::Interrupted));
-        assert!(matches!(end, End::Interrupted) && line.is_none(), "{end:?} {line:?}");
+        assert!(matches!(end, End::Interrupted) && line.is_empty(), "{end:?} {line:?}");
     }
 
     /// The reason of a move that failed; else what stopped it, which no failure's reason starts with.
@@ -1806,6 +1897,55 @@ mod tests {
     }
 
     #[test]
+    fn a_pc_file_rewritten_with_the_member_s_bytes_after_the_checks_is_left_in_place() {
+        let folder = scratch("move-same-bytes");
+        let (stage, root) = (folder.join("stage"), folder.join("root"));
+        put(&stage, "bin/a.txt", b"box");
+        let staged = put(&stage, "bin/b.txt", b"box");
+        let pc = put(&root, "bin/b.txt", b"pc");
+        let manifest = manifest_of(&root, &["bin/b.txt"]);
+        let entries = [entry("bin/a.txt"), member("bin/b.txt", b"box")];
+
+        let installed = moved(&stage, &root, &entries, &manifest, |done| {
+            if done == 1 {
+                fs::write(&pc, b"box").expect("the file can be written");
+            }
+            true
+        });
+
+        let paths: Vec<&str> = installed
+            .as_ref()
+            .map(|moved| moved.iter().map(|moved| moved.entry.path.as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(paths, ["bin/a.txt"], "only a is moved: {installed:?}");
+        assert_eq!(fs::read_to_string(&pc).expect("b stays"), "box");
+        assert!(staged.exists(), "the staged b is not moved");
+        assert_eq!(fs::read_to_string(root.join("bin").join("a.txt")).expect("a is moved"), "box");
+    }
+
+    #[test]
+    fn a_pc_file_rewritten_after_the_checks_to_the_member_s_size_but_other_bytes_is_refused_just_before_its_move() {
+        let folder = scratch("move-same-size");
+        let (stage, root) = (folder.join("stage"), folder.join("root"));
+        put(&stage, "bin/a.txt", b"box");
+        put(&stage, "bin/b.txt", b"box");
+        let pc = put(&root, "bin/b.txt", b"pc");
+        let manifest = manifest_of(&root, &["bin/b.txt"]);
+        let entries = [entry("bin/a.txt"), member("bin/b.txt", b"box")];
+
+        let unmoved = moved(&stage, &root, &entries, &manifest, |done| {
+            if done == 1 {
+                fs::write(&pc, b"xyz").expect("the file can be written");
+            }
+            true
+        });
+
+        let reason = "1 of 2 files were installed before bin/b.txt failed: bin/b.txt changed during the run";
+        assert_eq!(unmoved, Err(Unmoved::Failed(reason.to_owned())));
+        assert_eq!(fs::read_to_string(&pc).expect("b stays"), "xyz");
+    }
+
+    #[test]
     fn a_stage_folder_there_before_the_install_is_not_its_to_remove() {
         let folder = scratch("stage-there");
         let source = folder.join("source");
@@ -1834,17 +1974,17 @@ mod tests {
     #[test]
     fn an_interrupt_before_the_first_move_says_no_count() {
         let (end, line) = ending(Unmet::Interrupted { done: 0, total: 3 });
-        assert!(matches!(end, End::Interrupted) && line.is_none(), "{end:?} {line:?}");
+        assert!(matches!(end, End::Interrupted) && line.is_empty(), "{end:?} {line:?}");
 
         let (end, line) = ending(Unmet::Interrupted { done: 1, total: 3 });
         assert!(matches!(end, End::Interrupted), "{end:?}");
         let counted = "gate: remote outputs not brought back: 1 of 3 files were installed before the interrupt";
-        assert_eq!(line.as_deref(), Some(counted));
+        assert_eq!(line, [counted]);
 
         let (end, line) = ending(Unmet::Refused(Refused::transient("bin/a.dll changed during the run".to_owned())));
         assert!(matches!(end, End::Status(1)), "{end:?}");
         let refused = "gate: remote outputs not brought back: bin/a.dll changed during the run";
-        assert_eq!(line.as_deref(), Some(refused));
+        assert_eq!(line, [refused]);
     }
 
     #[test]
@@ -1868,6 +2008,112 @@ mod tests {
         let changed_first = checked(&root, &[entry("bin/both.dll")], &bin_globs(), &manifest);
         drop(held);
         assert_eq!(changed_first, Err(Refused::transient("bin/both.dll changed during the run".to_owned())));
+    }
+
+    #[test]
+    fn a_refusal_names_ten_changed_files_then_counts_the_rest() {
+        let root = scratch("changed-many");
+        let paths: Vec<String> = (10..22).map(|number| format!("bin/f{number}.dll")).collect();
+        for path in &paths {
+            put(&root, path, b"abc");
+        }
+        let manifest = manifest_of(&root, &paths.iter().map(String::as_str).collect::<Vec<_>>());
+        for path in &paths {
+            put(&root, path, b"abcd");
+        }
+        let entries: Vec<Entry> = paths.iter().map(|path| entry(path)).collect();
+
+        let refused = checked(&root, &entries, &bin_globs(), &manifest).expect_err("every file changed");
+        let (end, lines) = ending(Unmet::Refused(refused));
+
+        assert!(matches!(end, End::Status(1)), "{end:?}");
+        let mut expected: Vec<String> = paths[..10]
+            .iter()
+            .map(|path| format!("gate: remote outputs not brought back: {path} changed during the run"))
+            .collect();
+        expected.push("gate: remote outputs not brought back: 2 more files changed during the run".to_owned());
+        assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn a_refusal_of_exactly_ten_changed_files_names_each_and_counts_none() {
+        let root = scratch("changed-ten");
+        let paths: Vec<String> = (10..20).map(|number| format!("bin/f{number}.dll")).collect();
+        for path in &paths {
+            put(&root, path, b"abc");
+        }
+        let manifest = manifest_of(&root, &paths.iter().map(String::as_str).collect::<Vec<_>>());
+        for path in &paths {
+            put(&root, path, b"abcd");
+        }
+        let entries: Vec<Entry> = paths.iter().map(|path| entry(path)).collect();
+
+        let refused = checked(&root, &entries, &bin_globs(), &manifest).expect_err("every file changed");
+        let (_, lines) = ending(Unmet::Refused(refused));
+
+        let expected: Vec<String> = paths
+            .iter()
+            .map(|path| format!("gate: remote outputs not brought back: {path} changed during the run"))
+            .collect();
+        assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn a_pc_file_that_is_not_a_file_is_named_among_the_changed_ones_in_archive_order() {
+        let root = scratch("changed-and-folder");
+        put(&root, "bin/a.dll", b"abc");
+        put(&root, "bin/c.dll", b"abc");
+        let manifest = manifest_of(&root, &["bin/a.dll", "bin/c.dll"]);
+        put(&root, "bin/a.dll", b"abcd");
+        fs::create_dir_all(root.join("bin").join("b.dll")).expect("a folder in a file's place");
+        put(&root, "bin/c.dll", b"abcd");
+        let entries = [entry("bin/a.dll"), entry("bin/b.dll"), entry("bin/c.dll")];
+
+        let refused = checked(&root, &entries, &bin_globs(), &manifest).expect_err("the files changed");
+        let (_, lines) = ending(Unmet::Refused(refused));
+
+        assert_eq!(
+            lines,
+            [
+                "gate: remote outputs not brought back: bin/a.dll changed during the run",
+                "gate: remote outputs not brought back: bin/b.dll is not a file",
+                "gate: remote outputs not brought back: bin/c.dll changed during the run",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pc_file_of_the_member_s_size_counts_in_place_only_with_the_member_s_bytes() {
+        let root = scratch("same-size");
+        put(&root, "bin/other.dll", b"pc");
+        put(&root, "bin/same.dll", b"pc");
+        let manifest = manifest_of(&root, &["bin/other.dll", "bin/same.dll"]);
+        put(&root, "bin/other.dll", b"xyz");
+        put(&root, "bin/same.dll", b"box");
+
+        let other = checked(&root, &[member("bin/other.dll", b"box")], &bin_globs(), &manifest);
+        assert_eq!(other, Err(Refused::transient("bin/other.dll changed during the run")));
+        let same = checked(&root, &[member("bin/same.dll", b"box")], &bin_globs(), &manifest);
+        let in_place = Checked {
+            in_use: Vec::new(),
+            in_place: vec!["bin/same.dll".to_owned()],
+        };
+        assert_eq!(same, Ok(in_place));
+    }
+
+    #[test]
+    fn a_pc_file_the_manifest_lacked_that_now_holds_the_member_s_bytes_counts_in_place() {
+        let root = scratch("absent-in-place");
+        let manifest = Manifest::default();
+        put(&root, "bin/absent.dll", b"box");
+
+        let checks = checked(&root, &[member("bin/absent.dll", b"box")], &bin_globs(), &manifest);
+
+        let in_place = Checked {
+            in_use: Vec::new(),
+            in_place: vec!["bin/absent.dll".to_owned()],
+        };
+        assert_eq!(checks, Ok(in_place));
     }
 
     /// The size of the member the streaming case unpacks.

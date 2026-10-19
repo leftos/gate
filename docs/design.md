@@ -2108,6 +2108,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     Before any move, in order, each member is checked against the run's output globs, against the manifest (the file must still have its size and last write; a file the manifest lacked that now exists counts as changed), for being writable, and against the worktree's git index (Tracked members, below).
 
+    A PC file whose stamp (size and last write) differs from the manifest's, or that the manifest lacked, is hashed: when its size and SHA-256 equal the member's, the member is already in place and is not a change. It is not moved, not counted in the success line, said by no line, and leaves the result and the marker as a complete install does. A member the install rewrites after unpacking (`MvcTestingAppManifest.json`, the coverage roots files) is never in place, since its installed bytes are not the member's. A file with other bytes is a change.
+
     `MvcTestingAppManifest.json` and `.msCoverageSourceRootsMapping_*` are rewritten from the box's path of each tree of the run to that tree's root on the PC (a run of one repo: the work folder to the worktree; a pair: `{Work}\{leaf}` to the worktree and `{Work}\{name}` to that sibling's worktree), the JSON-escaped form first, then the raw one, case-insensitive, the longest path first.
 
     A path is matched only at a whole path component: the next character is not an ASCII letter or digit, `.`, `_` or `-` (the characters a folder name the builder lays out is made of), or the text ends, so `{Work}\yaat` never rewrites part of `{Work}\yaat-server` and `{Work}.lock` is left alone. Each box path is computed in one place (`boxside::payload::trees`), shared by the box and the client.
@@ -2116,7 +2118,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A rewritten file over 16 MiB, or whose body is not text in that encoding (not UTF-8, or UTF-16 of an odd length or with an unpaired surrogate), is skipped, not refused, as below. The client does not skip the back-commit paths again; the box does.
 
-    Each file is then moved with a rename, after a link and junction check on the way, its last write clamped to the PC's clock in the stage before the move and `unchanged` checked once more just before the rename.
+    Each file is then moved with a rename, after a link and junction check on the way, its last write clamped to the PC's clock in the stage before the move and the PC file checked against the manifest once more just before the rename (a file found holding the member's bytes only then is left in place, as above).
 
     A member git tracks, one whose target is in use or read-only, or one of the rewritten files above that cannot be rewritten, is skipped, not refused: `gate: remote outputs not fully brought back: <path> is tracked by git`, `... <path> is in use or read-only`, `... <path> cannot be rewritten (it is not UTF-8 or UTF-16 with a byte order mark)` or `... <path> cannot be rewritten (<n> bytes, over 16 MiB)`.
 
@@ -2126,9 +2128,11 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The tracked and in-use skips keep the pending marker, so the next routed run sends `OutputsFull`; a run whose only skips are files that cannot be rewritten clears it, since a refetch would skip them again.
 
-    The success line is `gate: outputs: <n> file(s), <X.X> MB (<Y.Y> MB compressed) in <Z.Z> s`: `<n>` counts installed files only, the seconds run from the start of the fetch to the end of the install, and each decimal rounds a half away from zero. A fully installed run clears the pending marker.
+    The success line is `gate: outputs: <n> file(s), <X.X> MB (<Y.Y> MB compressed) in <Z.Z> s`: `<n>` counts installed files only (a file left in place is not counted), the seconds run from the start of the fetch to the end of the install, and each decimal rounds a half away from zero. A fully installed run clears the pending marker.
 
     - A passing run becomes 1 with the archive and stage removed and nothing installed, and says `gate: remote outputs not brought back: ` then `the outputs archive <name> cannot be opened: <detail>`, `the archive member <path> is not under the output globs`, `<path> changed during the run`, `<path> is not a file` or `cannot rewrite <path>: <error>` (the file could not be read or written).
+
+      The checks before the moves name every member that fails them, not the first: one `gate: remote outputs not brought back: <path> changed during the run` (or `<path> is not a file`, or the read error) line per member in archive order, at most 10, then `gate: remote outputs not brought back: <n> more files changed during the run` when there are more. These refusals keep the marker.
 
       A refusal that a refetch of the same archive would repeat, because the archive's own members decide it, clears the pending marker, so later routed runs send `Outputs`, not `OutputsFull`.
 
@@ -2137,7 +2141,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
       Every other refusal keeps it, since the next fetch may succeed: a fault reading the stream (an I/O error, a hash mismatch, a stream cut short, a bad zstd frame), the archive cannot be opened, `<path> changed during the run`, `<path> is not a file` (the PC has a folder where the output goes), a failed move, a failed or over-cap `git ls-files`, a `--bring-tracked` glob that cannot be compiled, or an interrupt.
 
       The same holds for the git runner's line when the `git ls-files -z -s` of the tracked check failed or wrote past its 16 MiB cap, and for a `--bring-tracked` glob that cannot be compiled.
-    - A move that fails after others were made says `gate: remote outputs not brought back: <n> of <m> files were installed before <path> failed: <detail>` (a file that changed between the checks and its move gives `<path> changed during the run`); the files already moved stay and the status is 1. `<m>` counts only the files to be moved.
+    - A move that fails after others were made says `gate: remote outputs not brought back: <n> of <m> files were installed before <path> failed: <detail>` (a file that changed between the checks and its move gives `<path> changed during the run`, unless it then holds the member's bytes, which leaves it in place); the files already moved stay and the status is 1. `<m>` counts the files to be moved, and `<n>` the files done, those left in place included.
     - A Ctrl+C during the moves says `gate: remote outputs not brought back: <n> of <m> files were installed before the interrupt`, then the interrupt ending, with the marker kept and no `stop` call; one before the first move says nothing extra.
     - The archive and the stage are removed on every end; a failure says `gate: cannot remove the outputs stage <path>: <error>` or, after a whole fetch, `gate: cannot remove the fetched outputs archive <path>: <error>` (a cut fetch still says "partial").
 

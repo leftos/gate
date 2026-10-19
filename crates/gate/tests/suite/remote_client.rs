@@ -6314,6 +6314,69 @@ fn a_pc_output_edited_during_the_run_is_not_overwritten() {
     assert_refused_install(&case, &outcome, "bin/both.txt changed during the run", "edited during the run");
 }
 
+/// The PC's `bin/both.txt` is rewritten while the run call is held with the bytes the builder writes, as a local build of
+/// the same sources would: it is already in place, so the pass stands, only `bin/new.txt` is moved, and the marker is
+/// cleared.
+#[test]
+fn a_pc_output_rewritten_with_the_same_bytes_during_the_run_counts_as_brought_back() {
+    let case = outputs_case("client-outputs-install-same-bytes", &BIN);
+    write(&case, r"bin\both.txt", "pc");
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path())), "ok"]);
+    let run = start(client_gate(&case, "out.log", &steps, &BOTH_AND_NEW));
+    run.wait_until("the run call", || calls(&steps).len() == 2);
+    write(&case, r"bin\both.txt", "box");
+    fs::write(go.path(), "").expect("the go file can be made");
+
+    let outcome = run.finish();
+
+    assert_eq!(outcome.code, Some(0), "the pass stands: {outcome:?}");
+    assert!(!outcome.stderr.contains("not brought back"), "{outcome:?}");
+    assert_eq!(worktree_text(&case, r"bin\both.txt"), "box", "the file holds the builder's bytes");
+    assert_eq!(worktree_text(&case, r"bin\new.txt"), "built", "the other file is installed");
+    let line = regex::Regex::new(ONE_INSTALLED).expect("the line's pattern");
+    assert!(line.is_match(&outcome.stderr), "only the moved file is counted: {outcome:?}");
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+    assert!(!pending_marker(&case).exists(), "the marker is cleared: {outcome:?}");
+}
+
+/// The PC's `bin/both.txt` and `bin/new.txt` are both edited while the run call is held: the refusal names each, one
+/// line apiece in archive order, and neither is overwritten.
+#[test]
+fn every_pc_output_changed_during_the_run_is_named() {
+    let case = outputs_case("client-outputs-install-changed-all", &BIN);
+    write(&case, r"bin\both.txt", "pc");
+    write(&case, r"bin\new.txt", "pc");
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path())), "ok"]);
+    let run = start(client_gate(&case, "out.log", &steps, &BOTH_AND_NEW));
+    run.wait_until("the run call", || calls(&steps).len() == 2);
+    write(&case, r"bin\both.txt", "edited during the run");
+    write(&case, r"bin\new.txt", "edited too");
+    fs::write(go.path(), "").expect("the go file can be made");
+
+    let outcome = run.finish();
+
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    let refusals: Vec<&str> = outcome
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("gate: remote outputs not brought back:"))
+        .collect();
+    assert_eq!(
+        refusals,
+        [
+            "gate: remote outputs not brought back: bin/both.txt changed during the run",
+            "gate: remote outputs not brought back: bin/new.txt changed during the run",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(worktree_text(&case, r"bin\both.txt"), "edited during the run");
+    assert_eq!(worktree_text(&case, r"bin\new.txt"), "edited too");
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+    assert!(pending_marker(&case).exists(), "the marker stays: {outcome:?}");
+}
+
 /// The PC's `bin/both.txt` is held open, sharing nothing, from the run call to the run's end: it alone is skipped, the
 /// pass stands, and the marker stays for the next run to ask for every output.
 #[test]
