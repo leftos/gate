@@ -85,6 +85,9 @@ pub struct BoxSeams {
     /// How long `gate box preflight`'s tool probes may take together, in milliseconds, in place of the built-in 10 s;
     /// `None` without the feature.
     pub probe_limit_ms: Option<u64>,
+    /// The key under `HKEY_CURRENT_USER` that `gate box preflight`'s netfx-sdk probe reads the installed .NET Framework
+    /// SDKs from, in place of the machine's own list; `None` without the feature.
+    pub netfx_key: Option<String>,
     /// The fault `gate box run`'s desktop run takes, in place of the real task start and helper; `None` without the
     /// feature.
     pub desktop: Option<DesktopMode>,
@@ -468,6 +471,9 @@ pub struct CheckSeams {
     /// How long the check's tool probes may take together, in milliseconds, in place of the built-in 10 s
     /// (`--test-probe-limit-ms`).
     pub probe_limit_ms: Option<u64>,
+    /// The key under `HKEY_CURRENT_USER` the check's netfx-sdk probe reads the installed .NET Framework SDKs from, in
+    /// place of this PC's own list (`--test-netfx-key`).
+    pub netfx_key: Option<String>,
     /// The builder check's local transport, `local:<folder>` or `local-ssh:<folder>`, as a routed run's
     /// (`--test-remote-transport`).
     pub remote_transport: Option<String>,

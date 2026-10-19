@@ -149,6 +149,7 @@ fn check_builder_seams_parse_with_the_feature() {
             builder: Some("box-1".to_owned()),
             seams: CheckSeams {
                 probe_limit_ms: None,
+                netfx_key: None,
                 remote_transport: Some(r"local:C:\builder".to_owned()),
                 remote_ssh: Some(PathBuf::from("fake-ssh.exe")),
                 remote_timeout_ms: Some(250),

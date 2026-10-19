@@ -56,7 +56,11 @@ pub(crate) fn check(request: &CheckRequest, console: &mut Console) -> u32 {
             return u32::from(FAILED_STATUS);
         }
     };
-    super::say(&report::said(report::HERE, &checked(&place, probe_limit(&request.seams))), console)
+    let seams = &request.seams;
+    super::say(
+        &report::said(report::HERE, &checked(&place, probe_limit(seams), seams.netfx_key.as_deref())),
+        console,
+    )
 }
 
 /// How long the tool probes may take together: `--test-probe-limit-ms` when given, else [`probe::PROBE_LIMIT`].
@@ -270,8 +274,9 @@ pub(super) fn read_siblings_file(root: &Path, declarations: &mut Declarations, p
     }
 }
 
-/// What this PC has of what the repo at `place` needs, its tools probed within `limit`.
-fn checked(place: &Place, limit: Duration) -> Checked {
+/// What this PC has of what the repo at `place` needs, its tools probed within `limit`, its .NET Framework SDKs read
+/// from the key `netfx_key` names under `HKEY_CURRENT_USER` when a test seam gives one.
+fn checked(place: &Place, limit: Duration, netfx_key: Option<&str>) -> Checked {
     let root = Path::new(&place.root);
     let repo = repo_name(&place.checkout);
     let mut declarations = Declarations::from_process(&repo);
@@ -280,7 +285,7 @@ fn checked(place: &Place, limit: Duration) -> Checked {
     // The SDK list is read while the tools are probed, so the check waits for the longer of the two bounds.
     let (tools, sdk) = thread::scope(|scope| {
         let sdk = scope.spawn(|| sdk_of(declared.pin.as_ref(), || sdk_list(root)));
-        let tools = probed(needs, limit, root);
+        let tools = probed(needs, limit, root, netfx_key);
         let sdk = sdk
             .join()
             .unwrap_or_else(|panic| Some(Sdk::Skipped(format!("cannot read this PC's SDK list: {}", probe::panic_reason(&*panic)))));
@@ -547,15 +552,16 @@ fn read_manifest(root: &Path, declarations: &mut Declarations) -> Result<Option<
 /// Each of `needs` with what its probe found within `limit`, in their order; an unknown tool runs nothing. The tools
 /// are looked for as this PC's SDK list looks for dotnet: along `PATH` with the folders inside the worktree `root`
 /// dropped, and one found that still lies inside it refused. An unreal on a PC whose environment names no
-/// `GATE_UNREAL_ROOT` is not checked here, as nothing says where its engines are.
-fn probed(needs: Vec<ToolNeed>, limit: Duration, root: &Path) -> Vec<Tool> {
+/// `GATE_UNREAL_ROOT` is not checked here, as nothing says where its engines are. A netfx-sdk is read from this PC's
+/// own list of .NET Framework SDKs, or from the key `netfx_key` names when a test seam gives one.
+fn probed(needs: Vec<ToolNeed>, limit: Duration, root: &Path, netfx_key: Option<&str>) -> Vec<Tool> {
     if needs.is_empty() {
         return Vec::new();
     }
     let names: Vec<String> = needs.iter().map(|need| need.name.clone()).collect();
     let variables = outside_worktree(Variables::from_process(), root);
     let no_unreal_root = variables.as_ref().is_ok_and(|variables| variables.get(probe::UNREAL_ROOT).is_none());
-    probe::probe(&names, limit, variables, &[root])
+    probe::probe(&names, limit, variables, &[root], netfx_key)
         .into_iter()
         .zip(needs)
         .map(|((_, probed), need)| Tool {

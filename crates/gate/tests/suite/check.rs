@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use gate_router::warm::warmup_hash;
 use gate_router::work_folder_key;
@@ -14,8 +15,8 @@ use jiff::Timestamp;
 
 use crate::remote_client::fake_unreal_install;
 use crate::support::{
-    ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, Go, Outcome, PREFLIGHT_SEAMS_VARIABLE, STEPS_VARIABLE, build_version, calls, finish,
-    git, ssh_steps, wait_until_closed, write_remote_json,
+    ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, Go, NetfxKey, Outcome, PREFLIGHT_SEAMS_VARIABLE, STEPS_VARIABLE, build_version, calls,
+    finish, git, ssh_steps, wait_until_closed, write_remote_json,
 };
 
 /// The repo's folder in the case folder.
@@ -82,15 +83,28 @@ fn check(case: &Case, folders: &[PathBuf], extra: &[&str]) -> Outcome {
     finish(command)
 }
 
+/// A stand-in for this PC's .NET Framework SDK list that lists a 4.8 SDK in a folder of the case's, so a check of an
+/// Unreal-pinned repo never reads this machine's own list.
+fn netfx_present(case: &Case) -> NetfxKey {
+    NetfxKey::new().with_sdk("4.8", &case.folder().join("netfx").join("4.8"))
+}
+
+/// The line a check of an Unreal-pinned repo says of the SDK [`netfx_present`] lists, `at` this PC or a builder.
+fn netfx_ok(at: &str) -> String {
+    format!("check: {at}: netfx-sdk 4.8 ok (needs 4.6.0 or later)")
+}
+
 /// `gate check` of a repo whose manifest is `manifest`, with `GATE_UNREAL_ROOT` the folder `root` holding one fake
-/// engine per version of `versions`, each in the folder named for it, its `PATH` git's folder alone.
+/// engine per version of `versions`, each in the folder named for it, its `PATH` git's folder alone, and the 4.8 SDK
+/// of [`netfx_present`].
 fn check_unreal(case: &Case, manifest: &str, root: &Path, versions: &[&str]) -> Outcome {
     write(case, ".gate/toolchain.toml", manifest);
     fs::create_dir_all(root).expect("the unreal root can be made");
     for version in versions {
         fake_unreal_install(&root.join(version), version);
     }
-    let mut command = case.gate_in(REPO, &["check"]);
+    let key = netfx_present(case);
+    let mut command = case.gate_in(REPO, &["check", "--test-netfx-key", key.path()]);
     command.env("PATH", path_with_git(&[]));
     command.env_remove("GATE_GODOT_ROOT");
     command.env("GATE_UNREAL_ROOT", root);
@@ -107,7 +121,11 @@ fn check_a_pinned_unreal_the_root_lists_is_ok() {
 
     assert_eq!(
         lines(&outcome.stdout)[1..],
-        ["check: here: unreal 5.8.0 ok (needs 5.8 exactly)", "check: here: nothing missing"],
+        [
+            "check: here: unreal 5.8.0 ok (needs 5.8 exactly)",
+            &netfx_ok("here"),
+            "check: here: nothing missing"
+        ],
         "{outcome:?}"
     );
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
@@ -125,6 +143,7 @@ fn check_a_pinned_unreal_at_another_version_is_missing() {
         lines(&outcome.stdout)[1..],
         [
             "check: here: unreal missing (needs 5.8 exactly: 5.9.0)",
+            &netfx_ok("here"),
             "check: here: 1 missing, 0 too old"
         ],
         "{outcome:?}"
@@ -137,13 +156,15 @@ fn check_a_pinned_unreal_at_another_version_is_missing() {
 fn check_an_unreal_pin_without_a_root_says_not_checked_here() {
     let case = repo_case("check_unreal_no_root");
     write(&case, ".gate/toolchain.toml", "[tools]\nunreal = \"5.8\"\n");
+    let key = netfx_present(&case);
 
-    let outcome = check(&case, &[], &[]);
+    let outcome = check(&case, &[], &["--test-netfx-key", key.path()]);
 
     assert_eq!(
         lines(&outcome.stdout)[1..],
         [
             "check: here: unreal not checked here: GATE_UNREAL_ROOT is not set",
+            &netfx_ok("here"),
             "check: here: nothing missing"
         ],
         "{outcome:?}"
@@ -167,7 +188,7 @@ fn check_an_unreal_root_inside_the_repo_is_refused() {
     );
     assert_eq!(
         lines(&outcome.stdout)[1..],
-        [said.as_str(), "check: here: nothing missing (1 skipped)"],
+        [said.as_str(), &netfx_ok("here"), "check: here: nothing missing (1 skipped)"],
         "{outcome:?}"
     );
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
@@ -1333,6 +1354,11 @@ fn key(case: &Case) -> String {
 /// steps file `steps`, whose `gate box preflight` runs with probe and SDK bounds no case reaches; the check's `PATH`,
 /// which the builder's probes look along too, the `folders` then git's folder.
 fn check_builder(case: &Case, host: &str, folders: &[PathBuf], steps: &Path) -> Outcome {
+    finish(builder_check(case, host, folders, steps))
+}
+
+/// The command of a [`check_builder`] call, not yet run.
+fn builder_check(case: &Case, host: &str, folders: &[PathBuf], steps: &Path) -> Command {
     let transport = format!("local:{}", builder_root(case).display());
     let args = [
         "check",
@@ -1349,7 +1375,7 @@ fn check_builder(case: &Case, host: &str, folders: &[PathBuf], steps: &Path) -> 
         .env(STEPS_VARIABLE, steps)
         .env(GATE_VARIABLE, GATE)
         .env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING);
-    finish(command)
+    command
 }
 
 /// The header and the created line of a builder case's first check of `host`.
@@ -1444,6 +1470,54 @@ fn check_builder_says_nothing_of_git_lfs_without_one() {
     let outcome = check_builder(&case, "builder-1", &[stub], &steps);
 
     assert!(!outcome.stdout.contains("git-lfs"), "{outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+/// `gate check --builder builder-1` of a repo whose manifest pins unreal 5.8, its builder holding the engine 5.8.0
+/// under a root of the case's and listing the .NET Framework SDKs of the stand-in `key`.
+fn check_builder_unreal(case: &Case, key: &NetfxKey) -> Outcome {
+    write(case, ".gate/toolchain.toml", "[tools]\nunreal = \"5.8\"\n");
+    let root = case.folder().join("ssh").join("unreal");
+    fake_unreal_install(&root.join("5.8.0"), "5.8.0");
+    let steps = ssh_steps(case, "ssh", &["ok"]);
+    let mut command = builder_check(case, "builder-1", &[], &steps);
+    command
+        .env("GATE_UNREAL_ROOT", &root)
+        .env(PREFLIGHT_SEAMS_VARIABLE, format!("{ANSWERING} {}", key.seam()));
+    finish(command)
+}
+
+/// A builder an Unreal-pinned repo would build on without a .NET Framework SDK is said to miss it, with the hint that
+/// names the Developer Pack, though its engine serves the pin.
+#[test]
+fn check_builder_says_a_missing_netfx_sdk_for_an_unreal_pinned_repo() {
+    let case = builder_case("check_builder_netfx_missing");
+    let key = NetfxKey::new();
+
+    let outcome = check_builder_unreal(&case, &key);
+
+    let said = lines(&outcome.stdout);
+    for line in [
+        "check: builder-1: unreal 5.8.0 ok (needs 5.8 exactly)",
+        "check: builder-1: netfx-sdk missing (needs 4.6.0 or later)",
+        "install: builder-1: netfx-sdk: install the .NET Framework 4.8 Developer Pack (UnrealBuildTool needs a .NET Framework SDK 4.6 or later)",
+    ] {
+        assert!(said.contains(&line), "{line}: {outcome:?}");
+    }
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// A builder listing a .NET Framework SDK of 4.6 or later serves an Unreal-pinned repo.
+#[test]
+fn check_builder_says_a_netfx_sdk_ok_for_an_unreal_pinned_repo() {
+    let case = builder_case("check_builder_netfx_ok");
+    let key = netfx_present(&case);
+
+    let outcome = check_builder_unreal(&case, &key);
+
+    let said = lines(&outcome.stdout);
+    assert!(said.contains(&netfx_ok("builder-1").as_str()), "{outcome:?}");
+    assert!(said.contains(&"check: builder-1: nothing missing"), "{outcome:?}");
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
 }
 

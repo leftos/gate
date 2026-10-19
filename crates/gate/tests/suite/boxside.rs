@@ -20,7 +20,7 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::support::{
-    Case, Closed, Escapee, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, Outcome, Running, StderrCloser, UNTIL_KILLED, allow_breakaway, box_payload,
+    Case, Closed, Escapee, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, NetfxKey, Outcome, Running, StderrCloser, UNTIL_KILLED, allow_breakaway, box_payload,
     build_version, copy_tool, finish, junction, shown, start_with_closable_stderr, start_with_closed, start_with_stdin, wait_until,
     wait_until_closed,
 };
@@ -1135,6 +1135,48 @@ fn preflight_says_a_root_holding_no_unreal_is_missing() {
     let outcome = probed_with_unreal_root(&case, Some(&root));
 
     assert_eq!(after_sdks(&outcome), ["gate: remote tool unreal missing"], "{outcome:?}");
+}
+
+/// A `gate box preflight` needing `netfx-sdk`, its probe pointed at the key `key` by `--test-netfx-key`.
+fn probed_netfx(case: &Case, key: &NetfxKey) -> Outcome {
+    let folders = Folders::new(case);
+    let mut command = box_call(
+        case,
+        &[
+            "box",
+            "--test-probe-limit-ms",
+            UNREACHED_PROBE_LIMIT_MS,
+            "--test-netfx-key",
+            key.path(),
+            "preflight",
+        ],
+        &needing(&folders, &json!({"netfx-sdk": "4.6.0"})),
+    );
+    command.env("PATH", path_with_git(&[]));
+    command.finish()
+}
+
+/// Every .NET Framework SDK the key lists with a folder that exists is said, by number.
+#[test]
+fn preflight_says_every_netfx_sdk_the_key_lists() {
+    let case = Case::new("preflight_netfx_sdk");
+    let sdks = case.folder().join("netfx");
+    let key = NetfxKey::new().with_sdk("4.8", &sdks.join("4.8")).with_sdk("4.6.2", &sdks.join("4.6.2"));
+
+    let outcome = probed_netfx(&case, &key);
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool netfx-sdk 4.6.2,4.8"], "{outcome:?}");
+}
+
+/// A key that is not there lists no SDK, so the SDK is missing.
+#[test]
+fn preflight_says_netfx_sdk_is_missing_with_no_key() {
+    let case = Case::new("preflight_netfx_sdk_missing");
+    let key = NetfxKey::new();
+
+    let outcome = probed_netfx(&case, &key);
+
+    assert_eq!(after_sdks(&outcome), ["gate: remote tool netfx-sdk missing"], "{outcome:?}");
 }
 
 /// With no `GATE_UNREAL_ROOT` the engine is missing: nothing is looked for along the `PATH`.

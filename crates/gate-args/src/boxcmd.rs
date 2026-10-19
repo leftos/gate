@@ -91,6 +91,8 @@ enum Seam {
     KillLeaves,
     /// `--test-probe-limit-ms <n>`: how long the preflight's tool probes may take together.
     ProbeLimitMs,
+    /// `--test-netfx-key <path>`: the key under `HKEY_CURRENT_USER` the netfx-sdk probe reads.
+    NetfxKey,
     /// `--test-box-desktop <fault>`: the fault a desktop run takes, in place of the real task start and helper.
     Desktop,
     /// `--test-box-desktop-session <state>`: the state a desktop run finds the console's session in.
@@ -122,6 +124,7 @@ impl Seam {
             "--test-box-free-percent" => Some(Seam::FreePercent),
             "--test-box-kill-leaves" => Some(Seam::KillLeaves),
             "--test-probe-limit-ms" => Some(Seam::ProbeLimitMs),
+            "--test-netfx-key" => Some(Seam::NetfxKey),
             "--test-box-desktop" => Some(Seam::Desktop),
             "--test-box-desktop-session" => Some(Seam::DesktopSession),
             "--test-box-desktop-mutex" => Some(Seam::DesktopMutex),
@@ -147,6 +150,7 @@ impl Seam {
             Seam::FreePercent => "--test-box-free-percent",
             Seam::KillLeaves => "--test-box-kill-leaves",
             Seam::ProbeLimitMs => "--test-probe-limit-ms",
+            Seam::NetfxKey => "--test-netfx-key",
             Seam::Desktop => "--test-box-desktop",
             Seam::DesktopSession => "--test-box-desktop-session",
             Seam::DesktopMutex => "--test-box-desktop-mutex",
@@ -189,7 +193,8 @@ fn seams(words: &mut Peekable<impl Iterator<Item = OsString>>, problems: &mut Ve
 /// whole bytes above 0 for the outputs, the inputs and the LFS budgets, `true` or `false` for the sampler's failure, a whole
 /// percent from 1 to 100 for the free share, a whole count above 0 for the processes a kill leaves, one of the desktop
 /// faults for the desktop, one of the session states for the desktop session, 1 to 64 letters, digits and `-` for the
-/// desktop mutex and `ok` or `fail` for the registration. An empty or missing value is no value.
+/// desktop mutex, `ok` or `fail` for the registration and any key path for the netfx key. An empty or missing value is
+/// no value.
 #[cfg(feature = "test-seams")]
 fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Problem>) -> Result<(), Problem> {
     let name = seam.name();
@@ -208,6 +213,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::FreePercent => seams.free_percent = Some(crate::values::in_range(name, &value, 1, 100)?),
         Seam::KillLeaves => seams.kill_leaves = Some(crate::values::above_zero(name, &value)?),
         Seam::ProbeLimitMs => seams.probe_limit_ms = Some(crate::values::above_zero(name, &value)?),
+        Seam::NetfxKey => seams.netfx_key = Some(value),
         Seam::Desktop => seams.desktop = Some(crate::values::desktop_mode(name, &value)?),
         Seam::DesktopSession => seams.desktop_session = Some(crate::values::desktop_session(name, &value)?),
         Seam::DesktopMutex => seams.desktop_mutex = Some(crate::values::desktop_mutex(name, &value)?),

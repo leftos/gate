@@ -499,7 +499,8 @@ fn install_hint(name: &str, min: Option<Version>, kind: Kind) -> Option<String> 
 
 /// The command that installs the tool `name` on the builder `host` over ssh, missing or too old alike, its minimum
 /// `min` where the command takes one; the builder's toolchain script for a tool no such command installs, and for a
-/// rust with no minimum to name; `None` for a tool with no hint.
+/// rust with no minimum to name; the .NET Framework Developer Pack to install for a netfx-sdk; `None` for a tool with
+/// no hint.
 fn builder_hint(host: &str, name: &str, min: Option<Version>) -> Option<String> {
     let script = |step: &str| {
         format!(
@@ -508,6 +509,7 @@ fn builder_hint(host: &str, name: &str, min: Option<Version>) -> Option<String> 
         )
     };
     Some(match (name, min) {
+        ("netfx-sdk", _) => "install the .NET Framework 4.8 Developer Pack (UnrealBuildTool needs a .NET Framework SDK 4.6 or later)".to_owned(),
         ("cargo-nextest", _) => "cargo install cargo-nextest --locked".to_owned(),
         ("pnpm", Some(min)) => format!("npm install -g pnpm@{min}"),
         ("pnpm", None) => "npm install -g pnpm".to_owned(),
@@ -1650,6 +1652,28 @@ mod tests {
                 "install: box-1: node: copy tools/builder/ from the gate repo to box-1 and run install-toolchains.ps1 -User <user> -Only Node.js there, elevated (docs/routing-a-repo.md, Builder setup)",
             ]
         );
+    }
+
+    /// The .NET Framework SDK an Unreal-pinned repo needs is said as a minimum, as git-lfs is: ok, missing or too old,
+    /// a missing or too old one on a builder with the hint naming the Developer Pack.
+    #[test]
+    fn a_netfx_sdk_on_a_builder_says_its_minimum_and_the_developer_pack_hint() {
+        const HINT: &str =
+            "install: box-1: netfx-sdk: install the .NET Framework 4.8 Developer Pack (UnrealBuildTool needs a .NET Framework SDK 4.6 or later)";
+        let netfx = |probed| checked(vec![tool("netfx-sdk", Some("4.6"), probed)]);
+        assert_eq!(
+            builder_body(&netfx(found("4.6.2,4.8"))),
+            ["check: box-1: netfx-sdk 4.6.2,4.8 ok (needs 4.6.0 or later)"]
+        );
+        assert_eq!(
+            builder_body(&netfx(Probed::Missing)),
+            ["check: box-1: netfx-sdk missing (needs 4.6.0 or later)", HINT]
+        );
+        assert_eq!(
+            builder_body(&netfx(found("4.5.2"))),
+            ["check: box-1: netfx-sdk 4.5.2 too old (needs 4.6.0 or later)", HINT]
+        );
+        assert_eq!(said(BUILDER, &netfx(Probed::Missing)).status, 1);
     }
 
     #[test]

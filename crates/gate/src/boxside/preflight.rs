@@ -139,7 +139,7 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
 /// Says the SDK line, the list read within `--test-dotnet-limit-ms` when `seams` gives it, else
 /// [`git::DOTNET_LIMIT`], then one line on stdout for each tool the payload's `Needs` names, in its order. The tools are
 /// probed within `--test-probe-limit-ms` when `seams` gives it, else [`probe::PROBE_LIMIT`], while dotnet lists the
-/// SDKs. No probe runs a program from the run's own folders ([`refused_folders`]). A `Needs` that is not an object of
+/// SDKs; the netfx-sdk probe reads the key `--test-netfx-key` names, when `seams` gives it, in place of the machine's. No probe runs a program from the run's own folders ([`refused_folders`]). A `Needs` that is not an object of
 /// texts is said on stderr, probes nothing, and fails nothing. The minimum each need carries is not read: the box
 /// reports, the client compares.
 fn say_sdks_and_tools(payload: &Payload, work: &str, seams: &BoxSeams, console: &mut Console) {
@@ -148,13 +148,14 @@ fn say_sdks_and_tools(payload: &Payload, work: &str, seams: &BoxSeams, console: 
         .map(|needs| needs.into_iter().map(|(name, _)| name).collect())
         .map_err(|line| format!("{line}; probing nothing"));
     let probe_limit = seams.probe_limit_ms.map_or(probe::PROBE_LIMIT, Duration::from_millis);
+    let netfx_key = seams.netfx_key.as_deref();
     let refused = refused_folders(payload, work);
     let worktrees: Vec<&Path> = refused.iter().map(PathBuf::as_path).collect();
     thread::scope(|scope| {
         let probes = names.as_ref().ok().filter(|names| !names.is_empty()).map(|names| {
             (
                 names,
-                scope.spawn(move || probe::probe(names, probe_limit, Ok(Variables::from_process()), &worktrees)),
+                scope.spawn(move || probe::probe(names, probe_limit, Ok(Variables::from_process()), &worktrees, netfx_key)),
             )
         });
         say_sdks(seams.dotnet_limit_ms.map_or(git::DOTNET_LIMIT, Duration::from_millis), console);

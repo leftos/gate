@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::durations::seed;
 use crate::support::{
-    ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Junction, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running,
+    ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Junction, NetfxKey, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running,
     STEPS_VARIABLE, allow_breakaway, assert_in_order, beside, build_version, calls, copy_tool, events, finish, git, git_init, heavy_words,
     nothing_back, release, shown, ssh_steps, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
 };
@@ -3218,7 +3218,8 @@ fn a_routed_unreal_run_of(case: &Case, root: &Path, words: &[&str], inherited: O
     let box_path = box_path_with_tools(case, &listing(&[BUILDER_SDK]), &[], &[]);
     let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
     let mut gate = client_gate(case, "out.log", &steps, words);
-    gate.env("PATH", box_path).env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING);
+    let key = netfx_present(case);
+    gate.env("PATH", box_path).env(PREFLIGHT_SEAMS_VARIABLE, netfx_seams(&key));
     match inherited {
         Some(value) => gate.env("UE_ROOT", value),
         None => gate.env_remove("UE_ROOT"),
@@ -3236,6 +3237,17 @@ fn a_routed_unreal_run_of(case: &Case, root: &Path, words: &[&str], inherited: O
     assert_eq!(calls(&steps), ["preflight", "run"]);
     assert_eq!(runs(case), (0, 1), "the command ran once, on the builder: {outcome:?}");
     outcome
+}
+
+/// A stand-in for the builder's .NET Framework SDK list that lists a 4.8 SDK in a folder of the case's, which an
+/// Unreal-pinned repo's run needs, so no case reads this machine's own list.
+fn netfx_present(case: &Case) -> NetfxKey {
+    NetfxKey::new().with_sdk("4.8", &case.folder().join("ssh").join("netfx").join("4.8"))
+}
+
+/// The preflight seams of a tool case whose builder lists the .NET Framework SDKs of the stand-in `key`.
+fn netfx_seams(key: &NetfxKey) -> String {
+    format!("{ANSWERING} {}", key.seam())
 }
 
 /// Whether the routed command printed a `UE_ROOT` naming the engine `version` of `root`.
@@ -3265,9 +3277,27 @@ fn a_repo_pinning_an_unreal_the_builder_lacks_runs_here_saying_the_mismatch() {
     write(&case, MANIFEST, "[tools]\nunreal = \"5.8\"\n");
     let root = unreal_root(&case, &["5.7.3"]);
     let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &[]);
+    let key = netfx_present(&case);
 
     a_toolchain_refusal_with(&case, &box_path, &[mismatch_of(&case, "unreal 5.8 exactly", "5.7.3")], |gate| {
         set_unreal_root(gate, Some(&root));
+        gate.env(PREFLIGHT_SEAMS_VARIABLE, netfx_seams(&key));
+    });
+}
+
+/// A repo pinning an Unreal Engine the builder has runs here when the builder lists no .NET Framework SDK, which
+/// `UnrealBuildTool` needs, saying the SDK the builder lacks.
+#[test]
+fn a_repo_pinning_an_unreal_runs_here_when_the_builder_lacks_a_netfx_sdk() {
+    let case = client_case("client-unreal-no-netfx");
+    write(&case, MANIFEST, "[tools]\nunreal = \"5.8\"\n");
+    let root = unreal_root(&case, &["5.8.0"]);
+    let box_path = box_path_with_tools(&case, &listing(&[BUILDER_SDK]), &[], &[]);
+    let key = NetfxKey::new();
+
+    a_toolchain_refusal_with(&case, &box_path, &[mismatch_of(&case, "netfx-sdk 4.6.0 or later", "none")], |gate| {
+        set_unreal_root(gate, Some(&root));
+        gate.env(PREFLIGHT_SEAMS_VARIABLE, netfx_seams(&key));
     });
 }
 

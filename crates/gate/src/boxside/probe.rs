@@ -3,10 +3,11 @@
 //! installs of is godot: the folder the batch's environment names as its root holds one install per subfolder, and each
 //! is asked for its version, so the line carries every version the box has. The unreal probe reads the folder the
 //! batch's environment names as `GATE_UNREAL_ROOT` likewise, one Unreal Engine install per subfolder, each one's version
-//! read from its `Engine\Build\Build.version` file without running anything. Every probe of a batch that runs a program
-//! runs at once, under one deadline the batch shares, in the system folder and on a hidden console of its own,
-//! as [`git::program_output`] runs a program; a probe still running at the deadline is ended with its job. Nothing here
-//! writes to the console or reads a payload: the caller hands over the names and says the lines.
+//! read from its `Engine\Build\Build.version` file without running anything. The netfx-sdk probe reads the .NET
+//! Framework SDKs the registry lists, as `UnrealBuildTool` looks for one, also running nothing. Every probe of a batch
+//! that runs a program runs at once, under one deadline the batch shares, in the system folder and on a hidden console
+//! of its own, as [`git::program_output`] runs a program; a probe still running at the deadline is ended with its job.
+//! Nothing here writes to the console or reads a payload: the caller hands over the names and says the lines.
 
 use std::any::Any;
 use std::cmp::Ordering;
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::thread::{self, Scope, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
-use gate_win32::PipedConsole;
+use gate_win32::{Hive, PipedConsole, Subkey};
 use serde_json::Value;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
 
@@ -55,6 +56,13 @@ const UNREAL_BUILD_VERSION_MAX: u64 = 64 * 1024;
 /// The most characters of a Godot install's answer the no-version reason carries before it is escaped.
 const GODOT_ANSWER_MAX: usize = 200;
 
+/// The key, in the 32-bit view of `HKEY_LOCAL_MACHINE` (`WOW6432Node`), whose subkeys are the installed .NET Framework
+/// SDKs, one per version, where `UnrealBuildTool` looks for one.
+const NETFX_SDK_KEY: &str = r"SOFTWARE\Microsoft\Microsoft SDKs\NETFXSDK";
+
+/// The value of a .NET Framework SDK's subkey that names the folder it is installed in.
+const NETFX_KITS_FOLDER: &str = "KitsInstallationFolder";
+
 /// What a probe found of one tool.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Probed {
@@ -77,6 +85,8 @@ enum ToolProbe {
     Godot,
     /// Reads the `Build.version` of every Unreal Engine install the batch's environment names, running nothing.
     Unreal,
+    /// Reads the .NET Framework SDKs the registry lists, running nothing.
+    NetfxSdk,
 }
 
 /// The table's probe of the tool `name`; `None` for a name it does not know. cargo-nextest is run as the plugin itself,
@@ -94,6 +104,7 @@ fn probe_of(name: &str) -> Option<ToolProbe> {
         "git-lfs" => runs("git-lfs", &["version"]),
         "godot" => Some(ToolProbe::Godot),
         "unreal" => Some(ToolProbe::Unreal),
+        "netfx-sdk" => Some(ToolProbe::NetfxSdk),
         _ => None,
     }
 }
@@ -106,12 +117,14 @@ enum Pending<'scope> {
 
 /// What one batch of probes shares beyond the place a program is looked for in: the folders no program may come from,
 /// the folders the batch's environment names as `GATE_GODOT_ROOT` and `GATE_UNREAL_ROOT` (the latter `Err` with why
-/// the environment could not be made), and the batch's deadline and its limit.
+/// the environment could not be made), the key under `HKEY_CURRENT_USER` a test seam has the netfx-sdk probe read in
+/// place of the machine's own list, and the batch's deadline and its limit.
 #[derive(Clone, Copy)]
 struct Batch<'a> {
     worktrees: &'a [&'a Path],
     godot_root: Option<&'a OsStr>,
     unreal_root: Result<Option<&'a OsStr>, &'a str>,
+    netfx_key: Option<&'a str>,
     deadline: Instant,
     limit: Duration,
 }
@@ -123,8 +136,16 @@ struct Batch<'a> {
 /// ([`git::program_output`]). Environment `variables` that could not be made, for the reason given, skip every probe
 /// that runs a program. The godot probe reads the folder `variables` names as `GATE_GODOT_ROOT` to find the installs
 /// it runs, and the unreal probe the folder they name as `GATE_UNREAL_ROOT`, refused when it lies inside any of
-/// `worktrees`; it runs no program, so a place no program can be looked for in never skips it.
-pub(crate) fn probe(names: &[String], limit: Duration, variables: Result<Variables, String>, worktrees: &[&Path]) -> Vec<(String, Probed)> {
+/// `worktrees`; it runs no program, so a place no program can be looked for in never skips it. The netfx-sdk probe
+/// reads the machine's list of .NET Framework SDKs, or the key `netfx_key` names under `HKEY_CURRENT_USER` when a test
+/// seam gives one ([`netfx_sdk`]).
+pub(crate) fn probe(
+    names: &[String],
+    limit: Duration,
+    variables: Result<Variables, String>,
+    worktrees: &[&Path],
+    netfx_key: Option<&str>,
+) -> Vec<(String, Probed)> {
     let deadline = Instant::now() + limit;
     let root_of = |name: &str| {
         variables
@@ -139,6 +160,7 @@ pub(crate) fn probe(names: &[String], limit: Duration, variables: Result<Variabl
         worktrees,
         godot_root: godot_root.as_deref(),
         unreal_root: unreal_root.as_ref().map(Option::as_deref).map_err(String::as_str),
+        netfx_key,
         deadline,
         limit,
     };
@@ -177,7 +199,44 @@ fn started<'scope, 'env>(
             Ok(place) => Pending::Running(scope.spawn(move || godot(place, batch))),
         },
         Some(ToolProbe::Unreal) => Pending::Running(scope.spawn(move || unreal(batch))),
+        Some(ToolProbe::NetfxSdk) => Pending::Found(netfx_sdk(batch.netfx_key)),
     }
+}
+
+/// What the netfx-sdk probe finds: the version of every .NET Framework SDK the registry lists, `,`-joined
+/// ([`version_list`]), and `missing` when it lists none. The list is the subkeys of [`NETFX_SDK_KEY`] in the 32-bit view
+/// of `HKEY_LOCAL_MACHINE`, or of the key `user_key` names under `HKEY_CURRENT_USER` when a test seam gives one; a
+/// subkey counts when it is named a version and its [`NETFX_KITS_FOLDER`] names a folder that exists
+/// ([`netfx_installed`]), and at most [`ROOT_ENTRIES`] are looked at. A key that is not there, or cannot be read, lists
+/// none, so the SDK reads as missing, never skipped: a run that needs it must not go where it cannot be found.
+fn netfx_sdk(user_key: Option<&str>) -> Probed {
+    let read = match user_key {
+        Some(key) => gate_win32::registry_subkeys(Hive::CurrentUser, key, NETFX_KITS_FOLDER, ROOT_ENTRIES),
+        None => gate_win32::registry_subkeys(Hive::LocalMachine32, NETFX_SDK_KEY, NETFX_KITS_FOLDER, ROOT_ENTRIES),
+    };
+    let Ok(Some(subkeys)) = read else {
+        return Probed::Missing;
+    };
+    let versions: Vec<String> = subkeys.into_iter().filter(netfx_installed).map(|subkey| subkey.name).collect();
+    if versions.is_empty() {
+        return Probed::Missing;
+    }
+    Probed::Version(version_list(&versions))
+}
+
+/// Whether the subkey `subkey` of the .NET Framework SDK list is an installed SDK: its name is a version
+/// ([`is_version_name`]) and its [`NETFX_KITS_FOLDER`] names, as an absolute path, a folder that exists.
+fn netfx_installed(subkey: &Subkey) -> bool {
+    let folder = subkey.value.as_deref().map(Path::new);
+    is_version_name(&subkey.name) && folder.is_some_and(|folder| folder.is_absolute() && folder.is_dir())
+}
+
+/// Whether `name` is a version as the .NET Framework SDK list names one: one to three dot-separated runs of ASCII
+/// digits, each of 1 to [`MAX_PART_DIGITS`] digits, such as `4.8` or `4.7.2`.
+fn is_version_name(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('.').collect();
+    let part = |part: &&str| (1..=MAX_PART_DIGITS).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_digit());
+    (1..=3).contains(&parts.len()) && parts.iter().all(part)
 }
 
 /// Why a probe did not answer: the batch had no time left for it.
@@ -723,8 +782,8 @@ mod tests {
     use super::GODOT;
     use super::{
         Batch, Candidate, Pending, Probed, build_version, first_version, godot_candidates, godot_gave_no_version, godot_version, is_reparse_point,
-        late_reason, named_as_found, panic_reason, probe, read_godot, started, tool_line, unreal_installs, unreal_read, unreal_version, version_list,
-        version_of,
+        is_version_name, late_reason, named_as_found, netfx_sdk, panic_reason, probe, read_godot, started, tool_line, unreal_installs, unreal_read,
+        unreal_version, version_list, version_of,
     };
     use crate::environment::Variables;
     use crate::remote::git::{ProgramOutput, ProgramPlace};
@@ -903,7 +962,7 @@ mod tests {
     fn a_name_the_table_does_not_know_runs_nothing() {
         let names = ["nodejs".to_owned(), "Node".to_owned()];
         assert_eq!(
-            probe(&names, Duration::from_secs(1), Ok(Variables::from_process()), &[]),
+            probe(&names, Duration::from_secs(1), Ok(Variables::from_process()), &[], None),
             [
                 ("nodejs".to_owned(), Probed::Skipped("unknown tool".to_owned())),
                 ("Node".to_owned(), Probed::Skipped("unknown tool".to_owned())),
@@ -921,7 +980,13 @@ mod tests {
         fs::create_dir_all(root.join("4.7.2")).expect("the root's one entry can be made");
         let root = root.to_string_lossy().into_owned();
         assert_eq!(
-            probe(&names, Duration::ZERO, Ok(Variables::from_process().with("GATE_GODOT_ROOT", &root)), &[]),
+            probe(
+                &names,
+                Duration::ZERO,
+                Ok(Variables::from_process().with("GATE_GODOT_ROOT", &root)),
+                &[],
+                None
+            ),
             [
                 ("node".to_owned(), Probed::Skipped("no answer in 0 s".to_owned())),
                 ("rust".to_owned(), Probed::Skipped("no answer in 0 s".to_owned())),
@@ -1118,11 +1183,11 @@ mod tests {
         let variables = Variables::from_process().with("GATE_UNREAL_ROOT", &root.to_string_lossy());
 
         assert_eq!(
-            probe(&names, Duration::from_secs(10), Ok(variables), &[]),
+            probe(&names, Duration::from_secs(10), Ok(variables), &[], None),
             [("unreal".to_owned(), Probed::Version("5.8.0,5.10.0".to_owned()))]
         );
         assert_eq!(
-            probe(&names, Duration::from_secs(10), Err("no environment".to_owned()), &[]),
+            probe(&names, Duration::from_secs(10), Err("no environment".to_owned()), &[], None),
             [(
                 "unreal".to_owned(),
                 Probed::Skipped("cannot read GATE_UNREAL_ROOT: no environment".to_owned())
@@ -1184,6 +1249,7 @@ mod tests {
             worktrees: &[],
             godot_root: None,
             unreal_root: Ok(None),
+            netfx_key: None,
             deadline: Instant::now(),
             limit: Duration::ZERO,
         };
@@ -1192,6 +1258,115 @@ mod tests {
             let pending = started(scope, "unreal", &place, batch);
             assert!(matches!(pending, Pending::Running(_)), "the unreal probe runs inline");
         });
+    }
+
+    /// A key under `HKEY_CURRENT_USER` of a test's own that stands in for the machine's .NET Framework SDK list,
+    /// removed when dropped; it does not exist until an SDK is listed in it.
+    struct NetfxKey(String);
+
+    impl NetfxKey {
+        /// The key of the test `name` in this process, emptied of what an earlier process of the same id left.
+        fn new(name: &str) -> NetfxKey {
+            let key = NetfxKey(format!(r"Software\gate-tests\unit-netfx-{name}-{}", std::process::id()));
+            key.removed();
+            key
+        }
+
+        /// Lists the subkey `version`, with `folder` as its `KitsInstallationFolder` when given.
+        #[expect(clippy::expect_used, reason = "a test whose key cannot be written must fail loudly")]
+        fn with(self, version: &str, folder: Option<&Path>) -> NetfxKey {
+            let subkey = format!(r"HKCU\{}\{version}", self.0);
+            let mut args = vec!["add".to_owned(), subkey, "/f".to_owned()];
+            if let Some(folder) = folder {
+                args.extend(["/v", "KitsInstallationFolder", "/t", "REG_SZ", "/d"].map(str::to_owned));
+                args.push(folder.display().to_string());
+            }
+            let status = reg(&args).expect("reg.exe runs");
+            assert!(status.success(), "reg.exe {args:?} failed: {status:?}");
+            self
+        }
+
+        /// Removes the key and all it holds; a key that is not there is no failure.
+        fn removed(&self) {
+            // A key that is not there makes reg.exe fail, which is what removing it leaves.
+            let _ = reg(&["delete".to_owned(), format!(r"HKCU\{}", self.0), "/f".to_owned()]);
+        }
+    }
+
+    impl Drop for NetfxKey {
+        fn drop(&mut self) {
+            self.removed();
+        }
+    }
+
+    /// The exit status of the system's `reg.exe` run with `args`, its output dropped.
+    fn reg(args: &[String]) -> std::io::Result<std::process::ExitStatus> {
+        let system = std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows"));
+        let mut command = std::process::Command::new(Path::new(&system).join("System32").join("reg.exe"));
+        command
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        gate_win32::spawn(&mut command)?.wait()
+    }
+
+    /// Every subkey the key lists that is named a version and whose folder exists is an SDK, said by number, through
+    /// the batch's own probe.
+    #[test]
+    fn the_netfx_sdk_probe_says_every_sdk_the_key_lists() {
+        let sdks = unit_root("netfx-several");
+        let key = NetfxKey::new("several")
+            .with("4.8", Some(&sdks))
+            .with("4.6.2", Some(&sdks))
+            .with("4.7.1", Some(&sdks));
+
+        assert_eq!(
+            probe(
+                &["netfx-sdk".to_owned()],
+                Duration::from_secs(10),
+                Err("no environment".to_owned()),
+                &[],
+                Some(&key.0)
+            ),
+            [("netfx-sdk".to_owned(), Probed::Version("4.6.2,4.7.1,4.8".to_owned()))]
+        );
+    }
+
+    /// A subkey with no `KitsInstallationFolder`, one naming a folder that does not exist, one naming a relative path
+    /// and one not named a version are no SDK; with nothing else listed, the SDK is missing.
+    #[test]
+    fn the_netfx_sdk_probe_leaves_out_a_subkey_without_an_existing_folder() {
+        let sdks = unit_root("netfx-left-out");
+        let key = NetfxKey::new("left-out")
+            .with("4.8", None)
+            .with("4.7.2", Some(&sdks.join("not-there")))
+            .with("4.6.2", Some(Path::new("relative")))
+            .with("WinSDK-NetFx40Tools", Some(&sdks));
+
+        assert_eq!(netfx_sdk(Some(&key.0)), Probed::Missing);
+
+        let key = key.with("4.6.1", Some(&sdks));
+        assert_eq!(netfx_sdk(Some(&key.0)), Probed::Version("4.6.1".to_owned()), "the one SDK that counts");
+    }
+
+    /// A key that is not there lists no SDK: the SDK is missing, not skipped.
+    #[test]
+    fn the_netfx_sdk_probe_says_missing_with_no_key() {
+        let key = NetfxKey::new("absent");
+
+        assert_eq!(netfx_sdk(Some(&key.0)), Probed::Missing);
+    }
+
+    /// A version as the SDK list names one: one to three runs of digits, none empty or past the digits a part may have.
+    #[test]
+    fn a_netfx_sdk_subkey_is_named_a_version() {
+        for name in ["4", "4.8", "4.7.2", "10.0.1"] {
+            assert!(is_version_name(name), "{name}");
+        }
+        for name in ["", "4.", ".8", "4.8.1.0", "v4.8", "4.8-preview", "WinSDK-NetFx40Tools", "1.12345678901"] {
+            assert!(!is_version_name(name), "{name}");
+        }
     }
 
     /// A `Build.version` that is a symbolic link is refused when it is opened, as the link itself, so a link put there
@@ -1239,7 +1414,7 @@ mod tests {
         );
         let variables = Variables::from_process().with("GATE_UNREAL_ROOT", &root.to_string_lossy());
         assert_eq!(
-            probe(&["unreal".to_owned()], Duration::ZERO, Ok(variables), &[]),
+            probe(&["unreal".to_owned()], Duration::ZERO, Ok(variables), &[], None),
             [("unreal".to_owned(), Probed::Skipped("no answer in 0 s".to_owned()))]
         );
         fs::remove_dir_all(&root).expect("the test's root can be removed");

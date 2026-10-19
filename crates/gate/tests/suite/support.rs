@@ -1802,3 +1802,74 @@ impl Drop for Escapee {
 pub fn cpu_ticks(pid: u32) -> u64 {
     gate_win32::process_times(pid).ok().flatten().map_or(0, |times| times.cpu)
 }
+
+/// A key under `HKEY_CURRENT_USER` that stands in for the machine's list of installed .NET Framework SDKs, which the seam
+/// `--test-netfx-key` points the netfx-sdk probe at, so no case reads this machine's own list; one per test process,
+/// removed when dropped. Until an SDK is listed in it, it does not exist, and a probe of it finds no SDK.
+pub struct NetfxKey {
+    /// The key's path under `HKEY_CURRENT_USER`.
+    path: String,
+}
+
+impl NetfxKey {
+    /// The key of this test process, emptied of what an earlier process of the same id left.
+    pub fn new() -> NetfxKey {
+        let key = NetfxKey {
+            path: format!(r"Software\gate-tests\netfx-{}", process::id()),
+        };
+        key.removed();
+        key
+    }
+
+    /// The key with an SDK of `version` listed, its `KitsInstallationFolder` the folder `folder`, which is made.
+    pub fn with_sdk(self, version: &str, folder: &Path) -> NetfxKey {
+        fs::create_dir_all(folder).expect("the SDK's folder can be made");
+        let folder = folder.display().to_string();
+        let subkey = format!(r"{}\{version}", self.full());
+        reg(&["add", &subkey, "/v", "KitsInstallationFolder", "/t", "REG_SZ", "/d", &folder, "/f"]);
+        self
+    }
+
+    /// The seam that points a probe at the key, as the words `--test-netfx-key <path>`.
+    pub fn seam(&self) -> String {
+        format!("--test-netfx-key {}", self.path)
+    }
+
+    /// The key's path under `HKEY_CURRENT_USER`, the value the seam takes.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The key's full name, as `reg.exe` takes it.
+    fn full(&self) -> String {
+        format!(r"HKCU\{}", self.path)
+    }
+
+    /// Removes the key and all it holds; a key that is not there is no failure.
+    fn removed(&self) {
+        let _ = reg_status(&["delete", &self.full(), "/f"]);
+    }
+}
+
+impl Drop for NetfxKey {
+    fn drop(&mut self) {
+        self.removed();
+    }
+}
+
+/// Runs the system's `reg.exe` with `args`, which must succeed.
+fn reg(args: &[&str]) {
+    let status = reg_status(args);
+    assert!(status.as_ref().is_ok_and(ExitStatus::success), "reg.exe {args:?} failed: {status:?}");
+}
+
+/// The exit status of the system's `reg.exe` run with `args`, its output dropped.
+fn reg_status(args: &[&str]) -> io::Result<ExitStatus> {
+    let system = std::env::var_os("SystemRoot").expect("SystemRoot is set");
+    Command::new(Path::new(&system).join("System32").join("reg.exe"))
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+}

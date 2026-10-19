@@ -5,7 +5,8 @@
 //! open folder, a file opened again through its reparse point's filter, an open file's volume serial and file id
 //! ([`file_id`]), whether two open files are one, whether an open file is on a network volume ([`on_network_volume`]),
 //! the synchronous I/O a thread waits on cancelled ([`cancel_synchronous_io`]), the GPU's 3D use per adapter over a
-//! window ([`Gpu3dWindow`]), and the Windows message of an error code. And what a run on the interactive desktop needs: a named pipe for one
+//! window ([`Gpu3dWindow`]), the subkeys of a registry key with a string value of each ([`registry_subkeys`]), and the
+//! Windows message of an error code. And what a run on the interactive desktop needs: a named pipe for one
 //! user's local client, handles copied into and out of another process and the checks on a process taken that way, a
 //! command created on the interactive desktop, the console session's state, and a registered scheduled task started in
 //! a given session once its definition is checked ([`run_task`]), and whether an installed file only SYSTEM,
@@ -33,6 +34,7 @@ mod mutex;
 mod pipe;
 mod piped;
 mod priority;
+mod registry;
 mod security;
 mod session;
 mod task;
@@ -93,6 +95,7 @@ pub use tree::{Membership, OpenedJob, StoppableProcess, WaitableProcess};
 pub use trust::{TRUSTED_OWNERS, Untrusted, check_installed_file};
 
 pub use priority::{Priority, priority_of, set_priority};
+pub use registry::{Hive, Subkey, registry_subkeys};
 
 use std::io;
 use std::time::{Duration, SystemTime};

@@ -115,6 +115,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     ProbeLimitMs,
     #[cfg(feature = "test-seams")]
+    NetfxKey,
+    #[cfg(feature = "test-seams")]
     WarmWaitMs,
 }
 
@@ -371,17 +373,30 @@ impl RunBuilder {
             #[cfg(feature = "test-seams")]
             ValueOption::RemoteTamper => self.test_seams.remote_tamper = Some(values::remote_call(spelled, value, values::TAMPERS)?),
             #[cfg(feature = "test-seams")]
+            ValueOption::ConfirmMs
+            | ValueOption::PushSsh
+            | ValueOption::PushBoundMs
+            | ValueOption::PushRegister
+            | ValueOption::ProbeLimitMs
+            | ValueOption::NetfxKey
+            | ValueOption::WarmWaitMs => self.apply_subcommand_seam(option, spelled, value)?,
+        }
+        Ok(())
+    }
+
+    /// Sets the seam of `gate cutover`, `gate push`, `gate check` or `gate warm` that `option` names from `value`; any
+    /// other option is [`Self::apply`]'s and sets nothing here.
+    #[cfg(feature = "test-seams")]
+    fn apply_subcommand_seam(&mut self, option: ValueOption, spelled: &str, value: &str) -> Result<(), Problem> {
+        match option {
             ValueOption::ConfirmMs => self.cutover_seams.confirm_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
             ValueOption::PushSsh => self.push_seams.ssh = Some(PathBuf::from(value)),
-            #[cfg(feature = "test-seams")]
             ValueOption::PushBoundMs => self.push_seams.bound_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
             ValueOption::PushRegister => self.push_seams.register_ok = Some(values::remote_call(spelled, value, PUSH_REGISTER_RESULTS)? == "ok"),
-            #[cfg(feature = "test-seams")]
             ValueOption::ProbeLimitMs => self.check_seams.probe_limit_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
+            ValueOption::NetfxKey => self.check_seams.netfx_key = Some(value.to_owned()),
             ValueOption::WarmWaitMs => self.test_seams.warm_wait_ms = Some(values::above_zero(spelled, value)?),
+            _ => {}
         }
         Ok(())
     }
@@ -668,17 +683,20 @@ impl RunBuilder {
     }
 
     /// Refuses the builder check's seams without `--builder`, which alone reads them, `--test-remote-ssh` without
-    /// `--test-remote-transport`, whose local transport alone starts it, and `--test-probe-limit-ms` with `--builder`,
-    /// whose probes run under the box's own limit. A seam whose value was refused is already a problem of its own.
+    /// `--test-remote-transport`, whose local transport alone starts it, and `--test-probe-limit-ms` and
+    /// `--test-netfx-key` with `--builder`, whose probes run on the box under its own seams. A seam whose value was
+    /// refused is already a problem of its own.
     #[cfg(feature = "test-seams")]
     fn check_builder_seams(&mut self) {
         const BUILDER: &str = "--builder";
         let builder = self.builder.is_some();
-        if builder && self.check_seams.probe_limit_ms.is_some() {
-            self.problems.push(Problem::SeamNotUsedWith {
-                option: "--test-probe-limit-ms",
-                with: BUILDER,
-            });
+        for (read, option) in [
+            (self.check_seams.probe_limit_ms.is_some(), "--test-probe-limit-ms"),
+            (self.check_seams.netfx_key.is_some(), "--test-netfx-key"),
+        ] {
+            if builder && read {
+                self.problems.push(Problem::SeamNotUsedWith { option, with: BUILDER });
+            }
         }
         for (read, spelled) in [
             (self.test_seams.remote_transport.is_some(), "--test-remote-transport"),

@@ -8,6 +8,8 @@
 //! file that does not parse is unreadable whole; a bad entry is skipped alone, with a problem naming it. The entries
 //! read otherwise are `godot` and `unreal`, whose values pin an exact version, as the pins read beside the manifest do:
 //! each local dotnet tool's version in `.config/dotnet-tools.json` and the `Godot.NET.Sdk` version a project file names.
+//! A manifest naming unreal needs a `netfx-sdk`, the .NET Framework SDK `UnrealBuildTool` looks for, at 4.6 or later
+//! besides, read as though it named one.
 
 use serde_json::Value as Json;
 use toml::{Table, Value};
@@ -21,7 +23,18 @@ use crate::remote::git::{FAILURE_BYTES, first_bytes};
 use crate::remote::parity::{Need, NeedKind, number};
 
 /// The tool names the manifest knows, as its `[tools]` keys spell them.
-pub(crate) const KNOWN_TOOLS: [&str; 9] = ["rust", "cargo-nextest", "node", "pnpm", "pwsh", "godot", "ffmpeg", "unreal", "git-lfs"];
+pub(crate) const KNOWN_TOOLS: [&str; 10] = [
+    "rust",
+    "cargo-nextest",
+    "node",
+    "pnpm",
+    "pwsh",
+    "godot",
+    "ffmpeg",
+    "unreal",
+    "git-lfs",
+    "netfx-sdk",
+];
 
 /// A tool whose manifest entry pins an exact version rather than a minimum, as its key spells it; its project files
 /// may pin one too.
@@ -138,10 +151,12 @@ impl std::fmt::Display for Pin {
     }
 }
 
-/// Whether a tool found at the version `found` spells is at or past the minimum `min`; `None` when `found` is no
-/// version [`Version::parse`] reads, so it cannot be compared.
+/// Whether a tool found at the version `found` spells is at or past the minimum `min`, the highest of several versions
+/// weighed when `found` names them `,`-joined, as a probe of several installs does; `None` when `found`, or one of its
+/// members, is no version [`Version::parse`] reads, so it cannot be compared.
 pub(crate) fn meets(min: Version, found: &str) -> Option<bool> {
-    Version::parse(found).map(|found| found >= min)
+    let versions: Option<Vec<Version>> = found.split(',').map(Version::parse).collect();
+    versions?.into_iter().max().map(|found| found >= min)
 }
 
 /// The dot-separated numbers `text` spells, each one or more ASCII digits; `None` when a part is not one.
@@ -848,7 +863,34 @@ pub(crate) fn read(text: &str) -> Result<Manifest, String> {
                 .push(format!("env.{} names the unreal install but the manifest pins no unreal", spelled(name)));
         }
     }
+    add_netfx_sdk(&mut manifest);
     Ok(manifest)
+}
+
+/// The tool an Unreal Engine build needs beside the engine: the .NET Framework SDK `UnrealBuildTool` looks for.
+const NETFX_SDK: &str = "netfx-sdk";
+/// The oldest .NET Framework SDK `UnrealBuildTool` takes, as its own error names it: one older counts as missing.
+const NETFX_SDK_MIN: Version = Version {
+    major: 4,
+    minor: 6,
+    patch: 0,
+};
+
+/// Adds a netfx-sdk of [`NETFX_SDK_MIN`] or later to the tools of a manifest that names unreal, at a version or at
+/// any, as the repo's Unreal Engine builds need one; a netfx-sdk it names already is weighed at the higher of its own
+/// minimum and [`NETFX_SDK_MIN`]. A manifest naming no unreal keeps its tools as they are.
+fn add_netfx_sdk(manifest: &mut Manifest) {
+    if manifest.unreal.is_none() {
+        return;
+    }
+    match manifest.tools.iter_mut().find(|tool| tool.name == NETFX_SDK) {
+        Some(tool) => tool.min = Some(tool.min.map_or(NETFX_SDK_MIN, |min| min.max(NETFX_SDK_MIN))),
+        None => manifest.tools.push(ToolNeed {
+            name: NETFX_SDK.to_owned(),
+            min: Some(NETFX_SDK_MIN),
+            known: true,
+        }),
+    }
 }
 
 /// The one value an `[env]` entry may have: the root of the Unreal Engine install a routed run chose.
@@ -2033,11 +2075,109 @@ mod tests {
         format!("gate: remote tool unreal {what}")
     }
 
+    /// The tool line of a builder listing a .NET Framework SDK that serves an Unreal-pinned repo.
+    const NETFX_SDK_SERVED: &str = "gate: remote tool netfx-sdk 4.6.2,4.8";
+
+    /// What `judge` makes of a manifest pinning unreal at `pin`, when the builder answered `what` of unreal and lists a
+    /// .NET Framework SDK that serves ([`NETFX_SDK_SERVED`]).
+    fn unreal_judged(pin: &str, what: &str) -> Judged {
+        judged(&unreal_manifest(pin), &[&unreal_line(what), NETFX_SDK_SERVED])
+    }
+
+    /// The need of a .NET Framework SDK an Unreal-pinned repo has, of which the builder has `found`.
+    fn netfx_lacks(found: &str) -> Need {
+        lacks("netfx-sdk 4.6.0 or later", found)
+    }
+
+    /// A manifest pinning unreal, at a version or at any, needs a .NET Framework SDK 4.6 or later besides, sent with the
+    /// manifest's own needs, after them.
+    #[test]
+    fn an_unreal_pin_adds_a_netfx_sdk_4_6_or_later() {
+        let netfx = tool("netfx-sdk", Some(version(4, 6, 0)), true);
+        for pin in ["5.8", ""] {
+            let read = manifest(&format!("[tools]\nunreal = \"{pin}\"\nnode = \"24\"\n"));
+            assert_eq!(read.tools.last(), Some(&netfx), "{pin:?}: {read:?}");
+            assert_eq!(read.tools.iter().filter(|tool| tool.name == "netfx-sdk").count(), 1, "{pin:?}");
+            assert_eq!(
+                needs_of(&read).last(),
+                Some(&("netfx-sdk".to_owned(), "4.6.0".to_owned())),
+                "{pin:?}: the need is sent"
+            );
+        }
+    }
+
+    /// A manifest's own netfx-sdk entry beside an unreal pin is weighed at the higher of its minimum and 4.6, once.
+    #[test]
+    fn a_declared_netfx_sdk_beside_an_unreal_pin_is_weighed_at_4_6_or_its_own_minimum_if_higher() {
+        let declared = |text: &str| -> Vec<ToolNeed> {
+            let read = manifest(&format!("[tools]\nnetfx-sdk = \"{text}\"\nunreal = \"5.8\"\n"));
+            read.tools.into_iter().filter(|tool| tool.name == "netfx-sdk").collect()
+        };
+        assert_eq!(declared("4"), [tool("netfx-sdk", Some(version(4, 6, 0)), true)]);
+        assert_eq!(declared(""), [tool("netfx-sdk", Some(version(4, 6, 0)), true)]);
+        assert_eq!(declared("4.8"), [tool("netfx-sdk", Some(version(4, 8, 0)), true)]);
+    }
+
+    /// A manifest with no unreal pin needs no .NET Framework SDK, and one it names itself keeps its own minimum.
+    #[test]
+    fn no_unreal_pin_adds_no_netfx_sdk() {
+        let read = manifest("[tools]\nnode = \"24\"\n");
+        assert!(read.tools.iter().all(|tool| tool.name != "netfx-sdk"), "{read:?}");
+        assert!(needs_of(&read).iter().all(|(name, _)| name != "netfx-sdk"));
+        assert_eq!(
+            manifest("[tools]\nnetfx-sdk = \"4\"\n").tools,
+            [tool("netfx-sdk", Some(version(4, 0, 0)), true)],
+            "a known tool a manifest may name itself"
+        );
+    }
+
+    /// An Unreal-pinned repo's builder with no .NET Framework SDK, or only ones older than 4.6, lacks it; one listing
+    /// 4.6 or later, alone or among older ones, serves it.
+    #[test]
+    fn an_unreal_pin_judges_the_netfx_sdk_missing_too_old_or_ok() {
+        let unreal = unreal_line("5.8.0");
+        let with = |netfx: &str| judged(&unreal_manifest("5.8"), &[&unreal, &format!("gate: remote tool netfx-sdk {netfx}")]);
+        let lacking = |found: &str| Judged {
+            needs: vec![netfx_lacks(found)],
+            skips: Vec::new(),
+        };
+
+        assert_eq!(with("missing"), lacking("none"), "missing");
+        assert_eq!(with("4.5.2"), lacking("4.5.2"), "too old");
+        assert_eq!(with("4.5,4.5.2"), lacking("4.5,4.5.2"), "every one too old");
+        assert_eq!(with("4.6"), Judged::default(), "4.6 itself");
+        assert_eq!(with("4.8"), Judged::default(), "later");
+        assert_eq!(with("4.5.2,4.8"), Judged::default(), "a later one among older ones");
+    }
+
+    /// A builder that says nothing of the .NET Framework SDK an Unreal-pinned repo needs is said not to have probed it.
+    #[test]
+    fn an_unreal_pin_with_no_netfx_sdk_answer_says_it_was_not_probed() {
+        assert_eq!(
+            judged(&unreal_manifest("5.8"), &[&unreal_line("5.8.0")]),
+            Judged {
+                needs: Vec::new(),
+                skips: owned(&["gate: builder did not probe netfx-sdk: the builder gave no answer; not checking it"]),
+            }
+        );
+    }
+
+    /// Several versions, as a probe of several installs names them, meet a minimum when the highest does.
+    #[test]
+    fn meets_weighs_the_highest_of_several_versions() {
+        let min = version(4, 6, 0);
+        assert_eq!(meets(min, "4.5.2,4.8"), Some(true));
+        assert_eq!(meets(min, "4.8,4.5.2"), Some(true), "in any order");
+        assert_eq!(meets(min, "4.5,4.5.2"), Some(false));
+        assert_eq!(meets(min, "4.5,next"), None, "a member that is no version");
+        assert_eq!(meets(min, "4.8,"), None, "an empty member");
+    }
+
     /// An unreal pin is met by any listed engine of that version, first, last or only.
     #[test]
     fn an_unreal_pin_is_met_by_any_listed_install() {
         for list in ["5.8.0", "5.7.3,5.8.0", "5.8.0,5.9.0"] {
-            assert_eq!(judged(&unreal_manifest("5.8.0"), &[&unreal_line(list)]), Judged::default(), "{list}");
+            assert_eq!(unreal_judged("5.8.0", list), Judged::default(), "{list}");
         }
     }
 
@@ -2045,14 +2185,14 @@ mod tests {
     #[test]
     fn an_unreal_pin_missing_from_the_list_is_a_mismatch() {
         assert_eq!(
-            judged(&unreal_manifest("5.8.0"), &[&unreal_line("5.7.3,5.9.0")]),
+            unreal_judged("5.8.0", "5.7.3,5.9.0"),
             Judged {
                 needs: vec![lacks("unreal 5.8.0 exactly", "5.7.3, 5.9.0")],
                 skips: Vec::new(),
             }
         );
         assert_eq!(
-            judged(&unreal_manifest("5.8.0"), &[&unreal_line("next")]),
+            unreal_judged("5.8.0", "next"),
             Judged {
                 needs: vec![lacks("unreal 5.8.0 exactly", "next")],
                 skips: Vec::new(),
@@ -2064,10 +2204,10 @@ mod tests {
     /// An unreal pin of two parts is met by any patch of its major and minor, and by no other minor.
     #[test]
     fn a_two_part_unreal_pin_matches_any_patch() {
-        assert_eq!(judged(&unreal_manifest("5.8"), &[&unreal_line("5.8.0")]), Judged::default());
-        assert_eq!(judged(&unreal_manifest("5.8"), &[&unreal_line("5.8.3")]), Judged::default());
+        assert_eq!(unreal_judged("5.8", "5.8.0"), Judged::default());
+        assert_eq!(unreal_judged("5.8", "5.8.3"), Judged::default());
         assert_eq!(
-            judged(&unreal_manifest("5.8"), &[&unreal_line("5.7.9")]),
+            unreal_judged("5.8", "5.7.9"),
             Judged {
                 needs: vec![lacks("unreal 5.8 exactly", "5.7.9")],
                 skips: Vec::new(),
@@ -2078,9 +2218,9 @@ mod tests {
     /// An empty manifest unreal entry asks for an engine of any version, which one engine at any version serves.
     #[test]
     fn an_empty_manifest_unreal_entry_is_met_by_any_version() {
-        assert_eq!(judged(&unreal_manifest(""), &[&unreal_line("4.27.2")]), Judged::default());
+        assert_eq!(unreal_judged("", "4.27.2"), Judged::default());
         assert_eq!(
-            judged(&unreal_manifest(""), &[&unreal_line("missing")]),
+            unreal_judged("", "missing"),
             Judged {
                 needs: vec![lacks("unreal", "none")],
                 skips: Vec::new(),
@@ -2093,16 +2233,16 @@ mod tests {
     #[test]
     fn a_skipped_unreal_probe_is_a_mismatch_when_a_pin_needs_checking() {
         let why = "GATE_UNREAL_ROOT unreal is not an absolute path on a drive";
-        let skipped = unreal_line(&format!("skipped: {why}"));
+        let skipped = format!("skipped: {why}");
         assert_eq!(
-            judged(&unreal_manifest("5.8"), &[&skipped]),
+            unreal_judged("5.8", &skipped),
             Judged {
                 needs: vec![lacks("unreal 5.8 exactly", &format!("not probed ({why})"))],
                 skips: Vec::new(),
             }
         );
         assert_eq!(
-            judged(&unreal_manifest(""), &[&skipped]),
+            unreal_judged("", &skipped),
             Judged {
                 needs: Vec::new(),
                 skips: owned(&[&format!("gate: builder did not probe unreal: {why}; not checking it")]),
@@ -2114,7 +2254,7 @@ mod tests {
     #[test]
     fn a_missing_unreal_is_a_mismatch_saying_none() {
         assert_eq!(
-            judged(&unreal_manifest("5.8"), &[&unreal_line("missing")]),
+            unreal_judged("5.8", "missing"),
             Judged {
                 needs: vec![lacks("unreal 5.8 exactly", "none")],
                 skips: Vec::new(),
@@ -2198,7 +2338,7 @@ mod tests {
     #[test]
     fn an_unreal_pin_is_not_judged_as_a_minimum() {
         assert_eq!(
-            judged(&unreal_manifest("5.8"), &[&unreal_line("5.9.0")]),
+            unreal_judged("5.8", "5.9.0"),
             Judged {
                 needs: vec![lacks("unreal 5.8 exactly", "5.9.0")],
                 skips: Vec::new(),
