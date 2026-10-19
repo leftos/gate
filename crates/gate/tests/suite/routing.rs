@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use gate_router::{DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE, repo_name};
+use gate_router::{DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE, repo_name, work_folder_key};
 use serde_json::{Value, json};
 
 use crate::nesting::{LOOK_OFTEN, end_parent, first_event, marked, orphaned_as, spawned, test_marker};
@@ -1257,8 +1257,8 @@ fn no_build_and_other_flags_that_are_not_paths_are_left_alone() {
     assert_eq!(recorded_words(&recorded(&other_call))[2..], flags, "the box gets the flags as given");
     assert_eq!(
         recorded_words(&recorded(&dotnet_call))[1..],
-        ["test"],
-        "the box's dotnet drops --no-build"
+        ["test", path_map(&case).as_str()],
+        "the box's dotnet drops --no-build and, at an unborn HEAD, gets the path map alone"
     );
     assert!(stdout_lines(&other.stdout).windows(3).any(|words| words == flags), "{other:?}");
     assert_in_order(&dotnet.stderr, &[DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE, BUSY_LINE]);
@@ -1656,8 +1656,8 @@ fn a_routed_dotnet_build_carries_the_worktree_head_as_its_source_revision() {
     let call = recorded(&call);
     assert_eq!(
         recorded_words(&call)[1..],
-        ["build", stamp.as_str()],
-        "a routed dotnet build is pinned to the worktree HEAD: {call}"
+        ["build", stamp.as_str(), path_map(&case).as_str()],
+        "a routed dotnet build is pinned to the worktree HEAD and maps its work folder to the worktree root: {call}"
     );
     assert_eq!(names(&events(&case)), ["queue", "take", "release"]);
 }
@@ -1695,7 +1695,7 @@ fn no_build_is_dropped_for_the_box_and_the_fallback() {
     );
     assert_eq!(
         recorded_words(&recorded(&pack_call))[1..],
-        ["pack", "--no-build"],
+        ["pack", "--no-build", path_map(&case).as_str()],
         "pack keeps it on the box"
     );
     assert!(!pack.stderr.contains(DROPPED_NO_BUILD_LINE), "{pack:?}");
@@ -2159,7 +2159,15 @@ fn a_wrapped_routed_dotnet_command_is_stamped_before_its_own_separator() {
     let recorded = recorded(&call);
     let words = recorded_words(&recorded);
     let stamp = format!("-p:SourceRevisionId={sha}");
-    assert_eq!(words[5..], ["test", stamp.as_str(), "--", "--x"], "{recorded}");
+    assert_eq!(words[5..], ["test", stamp.as_str(), path_map(&case).as_str(), "--", "--x"], "{recorded}");
+}
+
+/// The path-map word a routed dotnet build of `case`'s worktree gets from a client no transport seam names: its work
+/// folder on the ssh transport's builder root mapped to the worktree root as this PC spells it.
+pub(super) fn path_map(case: &Case) -> String {
+    let root = git(case, &["rev-parse", "--show-toplevel"]);
+    let spelled = std::path::absolute(&root).expect("git names the worktree by a full path");
+    format!(r"-p:PathMap=D:\gate-remote\work\{}\={}", work_folder_key(&root), spelled.display())
 }
 
 #[test]

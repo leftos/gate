@@ -384,15 +384,28 @@ struct Kept<'k> {
 /// call's siblings, so that is a bug, and a sibling paired with no root would keep its box path unseen.
 fn box_trees<'a>(location: &Location, call: &RemoteCall<'a>) -> (String, Vec<(String, &'a str)>) {
     let names: Vec<&str> = location.pair.iter().flat_map(|pair| pair.siblings.iter().map(String::as_str)).collect();
-    let (main, siblings) = trees(&location.work, location.pair.as_ref().map(|pair| (pair.leaf.as_str(), names.as_slice())));
     assert_eq!(
-        siblings.len(),
+        names.len(),
         call.siblings.len(),
         "the run's Pair names {} siblings but the call carries {}",
-        siblings.len(),
+        names.len(),
         call.siblings.len()
     );
-    (main, siblings.into_iter().zip(call.siblings.iter().map(Sibling::root)).collect())
+    let siblings: Vec<(&str, &'a str)> = names.into_iter().zip(call.siblings.iter().map(Sibling::root)).collect();
+    let leaf = location.pair.as_ref().map_or(call.leaf, |pair| pair.leaf.as_str());
+    let ((main, _), siblings) = trees_of(&location.work, leaf, call.root, &siblings);
+    (main, siblings)
+}
+
+/// Each tree a routed run is checked out in, as [`trees`] places it in the work folder `work`, with the PC root it
+/// stands for: the main repo's tree (`work` itself with no sibling, else `{work}\{leaf}`) with `main_root`, then each of
+/// `siblings`, a folder name and its root, in order. The outputs' install ([`box_trees`]) and the path-map word
+/// ([`super::box_trees`]) both pair the trees through this.
+pub(super) fn trees_of<'a>(work: &str, leaf: &str, main_root: &'a str, siblings: &[(&str, &'a str)]) -> ((String, &'a str), Vec<(String, &'a str)>) {
+    let names: Vec<&str> = siblings.iter().map(|(name, _)| *name).collect();
+    let pair = (!names.is_empty()).then_some((leaf, names.as_slice()));
+    let (main, trees) = trees(work, pair);
+    ((main, main_root), trees.into_iter().zip(siblings.iter().map(|(_, root)| *root)).collect())
 }
 
 /// The outputs call of a passing run whose box packed an archive, `synced` its end so far: the archive the run's own

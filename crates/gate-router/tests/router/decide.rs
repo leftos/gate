@@ -1437,6 +1437,198 @@ fn a_head_that_cannot_be_read_leaves_the_build_alone() {
     }
 }
 
+/// The builder's root the path-map fixtures lay the work folder out under.
+const BUILDER: &str = r"D:\b";
+
+/// `facts` with the box's trees laid out under [`BUILDER`].
+fn mapped(facts: FakeFacts) -> FakeFacts {
+    FakeFacts {
+        builder_root: Some(BUILDER.to_owned()),
+        ..facts
+    }
+}
+
+/// The fixture worktree's work folder on [`BUILDER`], or its tree `name` when one is given.
+fn box_tree(name: Option<&str>) -> String {
+    let work = format!(r"{BUILDER}\work\{}", work_folder_key(ROOT));
+    name.map_or_else(|| work.clone(), |name| format!(r"{work}\{name}"))
+}
+
+/// The path-map word of a run of the fixture worktree alone: its work folder mapped to its root.
+fn path_map() -> String {
+    format!(r"-p:PathMap={}\=X:\dev\yaat.wt\a", box_tree(None))
+}
+
+#[test]
+fn a_routed_dotnet_build_maps_its_work_folder_to_the_worktree_root_after_its_source_revision() {
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &mapped(FakeFacts::at_root())));
+    assert_eq!(run.words, ["dotnet".to_owned(), "build".to_owned(), stamp(), path_map()]);
+    assert_eq!(run.fallback, ["dotnet", "build"], "the fallback carries no word of the builder's");
+
+    let command = words(&["dotnet", "test", "proj.csproj", "--", "NUnit.Where=x"]);
+    let run = routed(decide(&heavy(&command), &mapped(FakeFacts::at_root())));
+    assert_eq!(
+        run.words,
+        [
+            "dotnet",
+            "test",
+            "proj.csproj",
+            stamp().as_str(),
+            path_map().as_str(),
+            "--",
+            "NUnit.Where=x"
+        ],
+        "both words stand before the dotnet command's own double dash"
+    );
+}
+
+#[test]
+fn a_pair_run_maps_each_tree_to_its_own_root_joined_by_an_escaped_comma() {
+    let facts = mapped(FakeFacts::with_siblings("", &["b", "c"], &["b", "c"]));
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    let expected = format!(
+        r"-p:PathMap={}\=X:\dev\yaat.wt\a%2C{}\=X:\dev\yaat.wt\b%2C{}\=X:\dev\yaat.wt\c",
+        box_tree(Some("a")),
+        box_tree(Some("b")),
+        box_tree(Some("c"))
+    );
+    assert_eq!(run.words, ["dotnet".to_owned(), "build".to_owned(), stamp(), expected]);
+}
+
+#[test]
+fn the_box_side_ends_in_one_separator_and_the_pc_side_in_none() {
+    let facts = mapped(FakeFacts {
+        given_trees: Some(vec![
+            (r"D:\b\work\k".to_owned(), r"X:\dev\one\".to_owned()),
+            (r"D:\b\work\k\lib\\".to_owned(), r"X:\dev\lib\\".to_owned()),
+        ]),
+        ..FakeFacts::at_root()
+    });
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    let expected = r"-p:PathMap=D:\b\work\k\=X:\dev\one%2CD:\b\work\k\lib\=X:\dev\lib";
+    assert_eq!(run.words, ["dotnet".to_owned(), "build".to_owned(), stamp(), expected.to_owned()]);
+}
+
+#[test]
+fn a_build_whose_head_cannot_be_read_still_maps_its_work_folder() {
+    let heads: [Result<Option<String>, String>; 2] = [Ok(None), Err("git could not be started".to_owned())];
+    for head in heads {
+        let facts = mapped(FakeFacts {
+            head,
+            ..FakeFacts::at_root()
+        });
+        let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+        assert_eq!(run.words, ["dotnet".to_owned(), "build".to_owned(), path_map()], "{:?}", facts.head);
+    }
+}
+
+#[test]
+fn a_build_that_sets_a_path_property_itself_gets_no_path_map_but_keeps_its_source_revision() {
+    let commands: [&[&str]; 5] = [
+        &["dotnet", "build", "-p:PathMap=a=b"],
+        &["dotnet", "build", "/p:ContinuousIntegrationBuild=true"],
+        &["dotnet", "build", "-property:A=1;DeterministicSourcePaths=true"],
+        &["dotnet", "build", "--property:Configuration=Release,pathmap=x"],
+        &["dotnet", "build", "/PROPERTY:continuousintegrationbuild=true"],
+    ];
+    for command in commands {
+        let run = routed(decide(&heavy(&words(command)), &mapped(FakeFacts::with_config(routing_all()))));
+        assert_eq!(run.words, stamped(command), "{command:?}");
+    }
+}
+
+#[test]
+fn a_build_that_sets_a_property_in_two_words_opts_out_of_that_word_alone() {
+    let path_map_set: [&[&str]; 3] = [
+        &["dotnet", "build", "-p", "PathMap=x"],
+        &["dotnet", "build", "--property", "PathMap=x"],
+        &["dotnet", "build", "-PROPERTY", "ContinuousIntegrationBuild=true"],
+    ];
+    for command in path_map_set {
+        let run = routed(decide(&heavy(&words(command)), &mapped(FakeFacts::with_config(routing_all()))));
+        assert_eq!(run.words, stamped(command), "{command:?}");
+    }
+
+    let command = ["dotnet", "build", "/p", "SourceRevisionId=y"];
+    let run = routed(decide(&heavy(&words(&command)), &mapped(FakeFacts::with_config(routing_all()))));
+    let mut expected = words(&command);
+    expected.push(path_map());
+    assert_eq!(run.words, expected, "the caller's revision stands and the path map still goes in");
+}
+
+#[test]
+fn a_build_that_sets_a_property_through_any_switch_spelling_opts_out_of_that_word_alone() {
+    let path_map_set: [&[&str]; 4] = [
+        &["dotnet", "build", "--property=PathMap=x"],
+        &["dotnet", "build", "-p=PathMap=x"],
+        &["dotnet", "build", "--p:PathMap=x"],
+        &["dotnet", "build", "--p", "PathMap=x"],
+    ];
+    for command in path_map_set {
+        let run = routed(decide(&heavy(&words(command)), &mapped(FakeFacts::with_config(routing_all()))));
+        assert_eq!(run.words, stamped(command), "{command:?}");
+    }
+
+    let command = ["dotnet", "build", "/p=SourceRevisionId=y"];
+    let run = routed(decide(&heavy(&words(&command)), &mapped(FakeFacts::with_config(routing_all()))));
+    let mut expected = words(&command);
+    expected.push(path_map());
+    assert_eq!(run.words, expected, "the caller's revision stands and the path map still goes in");
+}
+
+#[test]
+fn a_setting_name_with_space_or_quotes_around_it_still_opts_out() {
+    let commands: [&[&str]; 2] = [&["dotnet", "build", r#"-p:"A=1; PathMap=x""#], &["dotnet", "build", r#"-p:"PathMap=x""#]];
+    for command in commands {
+        let run = routed(decide(&heavy(&words(command)), &mapped(FakeFacts::with_config(routing_all()))));
+        assert_eq!(run.words, stamped(command), "{command:?}");
+    }
+}
+
+#[test]
+fn a_project_after_a_bare_p_sets_no_property() {
+    let command = ["dotnet", "run", "-p", "proj.csproj"];
+    let run = routed(decide(&heavy(&words(&command)), &mapped(FakeFacts::with_config(routing_all()))));
+    let mut expected = stamped(&command);
+    expected.push(path_map());
+    assert_eq!(run.words, expected, "an older SDK's -p names the project");
+}
+
+#[test]
+fn a_build_that_sets_its_own_source_revision_still_maps_its_work_folder() {
+    let command = ["dotnet", "build", "-p:SourceRevisionId=abc"];
+    let run = routed(decide(&heavy(&words(&command)), &mapped(FakeFacts::at_root())));
+    let mut expected = words(&command);
+    expected.push(path_map());
+    assert_eq!(run.words, expected);
+}
+
+#[test]
+fn a_response_file_or_a_command_that_does_not_build_gets_no_path_map() {
+    let commands: [&[&str]; 3] = [&["dotnet", "build", "@x.rsp"], &["dotnet", "--version"], &["dotnet", "restore"]];
+    for command in commands {
+        let run = routed(decide(&heavy(&words(command)), &mapped(FakeFacts::at_root())));
+        assert_eq!(run.words, words(command), "{command:?}");
+    }
+}
+
+#[test]
+fn the_warm_up_words_carry_the_routed_run_path_map() {
+    let (_, built) = assert_builder_words_match(&words(&["dotnet", "build"]), &mapped(FakeFacts::at_root()));
+    assert!(built.contains(&path_map()), "{built:?}");
+
+    let facts = mapped(FakeFacts::with_siblings("", &["b", "c"], &["b", "c"]));
+    let (_, built) = assert_builder_words_match(&words(&["dotnet", "test", "--no-build"]), &facts);
+    assert!(built.iter().any(|word| word.contains("%2C")), "{built:?}");
+
+    let facts = mapped(FakeFacts {
+        head: Ok(None),
+        ..FakeFacts::at_root()
+    });
+    let (_, built) = assert_builder_words_match(&words(&["dotnet", "build"]), &facts);
+    assert_eq!(built, ["dotnet".to_owned(), "build".to_owned(), path_map()]);
+}
+
 #[test]
 fn a_dotnet_program_named_by_an_in_worktree_path_still_builds_stamped() {
     let command = words(&[r"X:\dev\yaat.wt\a\dotnet.exe", "pack"]);

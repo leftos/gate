@@ -15,7 +15,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use gate_args::TestSeams;
-use gate_router::FolderId;
+use gate_router::{FolderId, Target, escaped};
 use gate_state::v1::WarmFailure;
 use gate_state::{FallbackReason, StateRoot, Verdict};
 use gate_win32::{Interrupt, OwnedMutexGuard};
@@ -424,6 +424,56 @@ pub(crate) fn chosen(seams: &TestSeams) -> Result<Box<dyn RemoteClient>, String>
 )]
 pub(crate) fn chosen(seams: &TestSeams) -> Result<Box<dyn RemoteClient>, String> {
     Ok(Box::new(client::RustClient::ssh(seams)))
+}
+
+/// Each tree a routed run of `target` is checked out in on the builder the remote transport `transport` reaches
+/// ([`transport::builder_root`]), with the PC root it stands for, paired and spelled as the outputs' install pairs and
+/// spells them: the main repo's tree first, then each carried sibling's in carried order. Else why they cannot be told,
+/// or why the first PC root holding a character the word cannot carry ([`uncarried`]) leaves out every tree.
+pub(crate) fn box_trees(transport: Option<&str>, target: &Target) -> Result<Vec<(String, String)>, String> {
+    let root = transport::builder_root(transport)?;
+    let siblings: Vec<(&str, &str)> = target
+        .siblings
+        .iter()
+        .map(|sibling| (sibling.name.as_str(), sibling.root.as_str()))
+        .collect();
+    let (main, siblings) = outputs::trees_of(&payload::work(&root, &target.key), &target.leaf, &target.place.root, &siblings);
+    std::iter::once(main)
+        .chain(siblings)
+        .map(|(tree, pc_root)| {
+            let spelled = install::pc_spelling(pc_root)
+                .map(|spelled| spelled.display().to_string())
+                .map_err(|error| format!("cannot read the root {}: {}", escaped(pc_root), escaped(&error.to_string())))?;
+            match uncarried(&spelled) {
+                Some(held) => Err(format!(
+                    "the root {} holds '{}', which the builder's command line cannot carry",
+                    escaped(&spelled),
+                    escaped(&held.to_string())
+                )),
+                None => Ok((tree, spelled)),
+            }
+        })
+        .collect()
+}
+
+/// The first character of the PC root `root` that the path-map word cannot carry to the builder's compiler unescaped,
+/// or `None` when it holds only ASCII letters and digits, `.`, `_`, `-`, `~` and `\`, past a leading drive letter and
+/// its colon, or a leading `\\` of a share. A verbatim (`\\?\`) or device (`\\.\`) prefix is refused by its `?` or `.`.
+fn uncarried(root: &str) -> Option<char> {
+    let rest = if let Some(share) = root.strip_prefix(r"\\") {
+        if let Some(prefix @ ('?' | '.')) = share.chars().next() {
+            return Some(prefix);
+        }
+        share
+    } else {
+        let mut chars = root.chars();
+        match (chars.next(), chars.next()) {
+            (Some(drive), Some(':')) if drive.is_ascii_alphabetic() => chars.as_str(),
+            _ => root,
+        }
+    };
+    rest.chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '~' | '\\')))
 }
 
 /// The client of `--test-remote-snapshot`: makes the snapshot and bridge commits of each of the call's worktrees, the

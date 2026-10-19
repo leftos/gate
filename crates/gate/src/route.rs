@@ -14,7 +14,7 @@ use std::time::Duration;
 use gate_args::{GATE_SET_NAMES, RunRequest, Slot, TestSeams};
 use gate_router::warm::FileRead;
 use gate_router::{
-    Config, ConfigProblem, Facts, FolderId, Inputs, LocalReason, Pattern, Place, RemoteRun, Route, SiblingFolder, decide, dropped_env,
+    Config, ConfigProblem, Facts, FolderId, Inputs, LocalReason, Pattern, Place, RemoteRun, Route, SiblingFolder, Target, decide, dropped_env,
     dropped_env_line, escaped, repo_name,
 };
 use gate_win32::Share;
@@ -24,7 +24,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::console::Console;
-use crate::remote::{git, siblings};
+use crate::remote::{self, git, siblings};
 use crate::resolve::Environment;
 use crate::warm;
 
@@ -148,7 +148,7 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
         Route::Routed(remote) => consented_hash(remote, &machine),
         Route::Local { .. } => None,
     };
-    for line in unsaid(machine.notes.take()) {
+    for line in machine.unsaid_notes() {
         console.note(&line);
     }
     match &route {
@@ -283,12 +283,19 @@ pub(crate) struct Machine<'a> {
     notes: RefCell<Vec<String>>,
     /// Each declaration file the decision read, by name, with how the lines name it ([`Source::said`]).
     said: RefCell<Vec<(String, String)>>,
+    /// The remote transport the test seams name, whose builder root the box trees lie under ([`Facts::box_trees`]);
+    /// `None` for the ssh transport.
+    remote_transport: Option<String>,
 }
 
 impl<'a> Machine<'a> {
-    /// The facts of the gate's working folder now, with `environment`'s LOCALAPPDATA and the git limits `seams` set.
+    /// The facts of the gate's working folder now, with `environment`'s LOCALAPPDATA and the git limits and remote
+    /// transport `seams` set.
     pub(crate) fn new(environment: &'a Environment, seams: &TestSeams) -> Machine<'a> {
-        Machine::at(environment.local_app_data.as_deref(), git::limit(seams), git::drain(seams))
+        Machine {
+            remote_transport: seams.remote_transport.clone(),
+            ..Machine::at(environment.local_app_data.as_deref(), git::limit(seams), git::drain(seams))
+        }
     }
 
     /// The facts of the gate's working folder now, reading `local_app_data`'s routing file, with the decision's git
@@ -305,7 +312,13 @@ impl<'a> Machine<'a> {
             read_head: true,
             notes: RefCell::new(Vec::new()),
             said: RefCell::new(Vec::new()),
+            remote_transport: None,
         }
+    }
+
+    /// The notes gathered so far that this process has not said yet ([`unsaid`]), taken: lines for the log alone.
+    pub(crate) fn unsaid_notes(&self) -> Vec<String> {
+        unsaid(self.notes.take())
     }
 
     /// Holds `config` as the routing file the decision read, as [`Facts::config`] holds the one it reads: `gate warm`
@@ -399,6 +412,14 @@ impl Facts for Machine<'_> {
             .map_err(|error| format!("cannot read git rev-parse's output: {error}"))?;
         let text = String::from_utf8(bytes).map_err(|_| "git rev-parse's output is not valid UTF-8".to_owned())?;
         Ok(parse_head(&text))
+    }
+
+    /// Empty when the trees cannot be told or a PC root cannot stand in the word, saying why in the log.
+    fn box_trees(&self, target: &Target) -> Vec<(String, String)> {
+        remote::box_trees(self.remote_transport.as_deref(), target).unwrap_or_else(|why| {
+            self.notes.borrow_mut().push(format!("gate: no PathMap word: {why}"));
+            Vec::new()
+        })
     }
 
     fn file_in_folder(&self, name: &str) -> bool {
@@ -1044,20 +1065,148 @@ mod tests {
     use std::fs;
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
-    use gate_router::{Config, LocalReason, Place, Route, SiblingFolder};
+    use gate_router::{CarriedSibling, Config, Facts, FolderId, LocalReason, Place, Route, SiblingFolder, Target};
     use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
     use super::{
-        DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, GATE_FILE_NOT_A_FILE, Origin, SIBLING_GIT_LINK, SIBLING_LINK, SIBLING_NOT_A_FOLDER, Source,
-        checkout_of, holds_existing_path, is_fixed_local, is_share_target, judge_declarations, not_routed, parse_head, parse_place, read_declaration,
-        read_siblings, sibling_folder, worktree_of,
+        DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, GATE_FILE_NOT_A_FILE, Machine, Origin, SIBLING_GIT_LINK, SIBLING_LINK, SIBLING_NOT_A_FOLDER,
+        Source, checkout_of, holds_existing_path, is_fixed_local, is_share_target, judge_declarations, not_routed, parse_head, parse_place,
+        read_declaration, read_siblings, sibling_folder, worktree_of,
     };
+    use crate::remote::box_trees;
     use crate::test_support::junction;
     use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
     /// The folder the place cases are asked of, spelled on a subst drive as a gate started there spells it.
     const FOLDER: &str = r"S:\src";
+
+    /// A target of the worktree at `root`, its folder named `leaf`, in the work folder `k`, carrying each of
+    /// `siblings`, a folder name and its root.
+    fn target_at(root: &str, leaf: &str, siblings: &[(&str, &str)]) -> Target {
+        let id = FolderId { volume: 0, file: [0; 16] };
+        Target {
+            host: "builder".to_owned(),
+            slots: 1,
+            place: Place {
+                root: root.to_owned(),
+                prefix: String::new(),
+                checkout: leaf.to_owned(),
+                folder: root.to_owned(),
+            },
+            repo: leaf.to_owned(),
+            leaf: leaf.to_owned(),
+            root_id: id,
+            siblings: siblings
+                .iter()
+                .map(|(name, root)| CarriedSibling {
+                    name: (*name).to_owned(),
+                    root: (*root).to_owned(),
+                    id,
+                })
+                .collect(),
+            key: "k".to_owned(),
+            inputs: Vec::new(),
+        }
+    }
+
+    /// The pairs of each `(box tree, PC root)` as owned text.
+    fn pairs(trees: &[(&str, &str)]) -> Vec<(String, String)> {
+        trees.iter().map(|(tree, root)| ((*tree).to_owned(), (*root).to_owned())).collect()
+    }
+
+    /// Asserts a run of `target` on the ssh transport gets no box tree at all, so no path-map word, and the decision's
+    /// notes say once that the PC root `root` holds `held`.
+    fn assert_refused(target: &Target, root: &str, held: char) {
+        let machine = Machine::at(None, Duration::from_secs(1), Duration::from_secs(1));
+        assert_eq!(machine.box_trees(target), Vec::<(String, String)>::new(), "no tree, not one left out");
+        let line = format!("gate: no PathMap word: the root {root} holds '{held}', which the builder's command line cannot carry");
+        assert_eq!(machine.notes.take(), [line]);
+    }
+
+    #[test]
+    fn a_root_with_a_reordering_mark_is_named_escaped_in_the_note() {
+        let machine = Machine::at(None, Duration::from_secs(1), Duration::from_secs(1));
+        assert_eq!(
+            machine.box_trees(&target_at("X:\\dev\\a\u{202e}b", "a\u{202e}b", &[])),
+            Vec::<(String, String)>::new()
+        );
+        let line = r"gate: no PathMap word: the root X:\dev\a\u{202e}b holds '\u{202e}', which the builder's command line cannot carry";
+        assert_eq!(machine.notes.take(), [line.to_owned()]);
+    }
+
+    #[test]
+    fn a_root_with_a_space_gets_no_path_map() {
+        assert_refused(&target_at(r"X:\dev\my app", "my app", &[]), r"X:\dev\my app", ' ');
+    }
+
+    #[test]
+    fn a_sibling_root_with_a_semicolon_leaves_out_the_whole_path_map() {
+        let target = target_at("X:/dev/app", "app", &[("lib", r"X:\dev\x;y")]);
+        assert_refused(&target, r"X:\dev\x;y", ';');
+    }
+
+    #[test]
+    fn a_root_with_a_comma_gets_no_path_map() {
+        assert_refused(&target_at(r"X:\dev\notes,old", "notes,old", &[]), r"X:\dev\notes,old", ',');
+    }
+
+    #[test]
+    fn a_root_with_an_equals_sign_gets_no_path_map() {
+        assert_refused(&target_at(r"X:\dev\a=b", "a=b", &[]), r"X:\dev\a=b", '=');
+    }
+
+    #[test]
+    fn a_root_with_a_percent_sign_gets_no_path_map() {
+        assert_refused(&target_at(r"X:\dev\100%41x", "100%41x", &[]), r"X:\dev\100%41x", '%');
+    }
+
+    #[test]
+    fn a_root_with_a_letter_outside_ascii_gets_no_path_map() {
+        assert_refused(&target_at(r"X:\dev\café", "café", &[]), r"X:\dev\café", 'é');
+    }
+
+    #[test]
+    fn a_root_with_a_colon_past_the_drive_gets_no_path_map() {
+        assert_refused(&target_at(r"X:\dev\a:b", "a:b", &[]), r"X:\dev\a:b", ':');
+    }
+
+    #[test]
+    fn a_verbatim_or_device_root_gets_no_path_map() {
+        assert_refused(&target_at(r"\\?\X:\dev\app", "app", &[]), r"\\?\X:\dev\app", '?');
+        assert_refused(&target_at(r"\\.\X:\dev\app", "app", &[]), r"\\.\X:\dev\app", '.');
+    }
+
+    #[test]
+    fn a_pair_maps_its_main_tree_then_each_sibling_in_carried_order() {
+        let target = target_at("X:/dev/app.wt/a", "a", &[("lib", "X:/dev/lib"), ("tools", "X:/dev/tools")]);
+        assert_eq!(
+            box_trees(None, &target),
+            Ok(pairs(&[
+                (r"D:\gate-remote\work\k\a", r"X:\dev\app.wt\a"),
+                (r"D:\gate-remote\work\k\lib", r"X:\dev\lib"),
+                (r"D:\gate-remote\work\k\tools", r"X:\dev\tools"),
+            ]))
+        );
+        assert_eq!(
+            box_trees(None, &target_at("X:/dev/app.wt/a", "a", &[])),
+            Ok(pairs(&[(r"D:\gate-remote\work\k", r"X:\dev\app.wt\a")])),
+            "a run with no sibling is checked out in the work folder itself"
+        );
+    }
+
+    #[test]
+    fn a_share_root_and_one_of_the_allowed_marks_get_their_trees() {
+        let target = target_at(r"\\server\share\x", "x", &[("a.b_c-d~1", "X:/dev/a.b_c-d~1")]);
+        assert_eq!(
+            box_trees(None, &target),
+            Ok(pairs(&[
+                (r"D:\gate-remote\work\k\x", r"\\server\share\x"),
+                (r"D:\gate-remote\work\k\a.b_c-d~1", r"X:\dev\a.b_c-d~1"),
+            ]))
+        );
+    }
 
     fn place(root: &str, prefix: &str, checkout: &str) -> Place {
         Place {

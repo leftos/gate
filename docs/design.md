@@ -437,6 +437,8 @@ A warm-up takes no remote slot because queuing for the single default slot would
 - `--cd <folder>` enters the folder as `gate run --cd` does ([Run folder](#run-folder)), with the same refusals, which exit 2. Whatever folder of the worktree the gate starts in, the warm-up is worded and laid out from the worktree root (the gate makes the root its working folder), so its commands, their path rewrite and its work folder are those of a routed run started at the root, and the call's subfolder is empty.
 
   The layout and wording must match a routed run's: a different layout makes the box's `clear_work` wipe the warmth, and a command without the `-p:SourceRevisionId=<HEAD>` stamp makes the next real run rebuild everything.
+
+  The warm-up's log (`remote\warm\<key>.log`) starts with the decision's notes, such as the `gate: no PathMap word` line, which a warm-up does not say on stderr.
 - `--background` keeps a warm-up that does not start quiet: no consent, no warm-up file and a warm-up already running say nothing and exit 0. It detaches nothing; whatever starts a warm-up in the background does that, and no gate command does.
 - `--state-dir` and `GATE_STATE_DIR` resolve the [state root](#state-root) as for `gate stop-tree`.
 - A test-seams build also takes `--test-warm-wait-ms <n>`, which replaces the file's ceiling as the length of the key mutex wait and of the cap wait, and the remote client's seams a routed run takes (`--test-remote-client`, `--test-remote-transport`, and the others that need the transport), but not `--test-print-request`.
@@ -1505,7 +1507,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A dotnet command is one whose first word's file name without extension is `dotnet`, or is `pwsh` or `powershell` with `--` followed by a `dotnet` word (a script handed a dotnet command to run), each compared in any letter case. A dotnet command's own words run from its `dotnet` word to its next `--`, and only they are read: a `--no-build` after that `--`, or before a wrapping script's `--`, belongs to another program and stays, so plain `dotnet test -- --no-build` keeps the word.
 
-  A dotnet command with a word starting with `@` (a response file) is opaque, since the gate cannot see its words: it drops no word, gets no `-p:SourceRevisionId` word, writes no nothing-back record and clears none.
+  A dotnet command with a word starting with `@` (a response file) is opaque, since the gate cannot see its words: it drops no word, gets no `-p:SourceRevisionId` or `-p:PathMap` word, writes no nothing-back record and clears none.
 
   A run that stays local (the Local route) drops the same `--no-build` words before it takes a slot, when it would find no build here, saying `gate: dropped --no-build: <reason>; building on a heavy slot`, or `gate: dropped --no-build: <reason>; building on the parent gate's <heavy|critical|light> slot` under a covering or lending parent. A routed run is never dropped here. `<reason>` is one of two:
   - `the last build ran on <host> and brought nothing back`, when the worktree's nothing-back record stands (`<host>` is the record's builder, else `the builder`).
@@ -1544,11 +1546,33 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A routed dotnet command whose verb (the next non-empty word after `dotnet`, in any letter case) is `build`, `test`, `publish`, `pack`, `run` or `msbuild` therefore gets `-p:SourceRevisionId=<the worktree's HEAD sha>` on the builder's words only: after the dotnet command's own words, before its own `--`, else at the end (a wrapped dotnet command gets it before dotnet's own `--` too).
 
-  The word is not added when one of the dotnet command's own words already sets `SourceRevisionId` (`-p:`, `/p:`, `-property:`, `/property:` or `--property:`, in any letter case, alone or in a list separated by `;` or `,`). The sha comes from `git rev-parse --verify -q HEAD` in the worktree root, asked once of every routed run, whatever its command (the light-slot route hint reads no HEAD); when that fails or the branch is unborn the run routes without it.
+  The word is not added when one of the dotnet command's own words already sets `SourceRevisionId` (a property switch, as [below](#routed-path-map)). The sha comes from `git rev-parse --verify -q HEAD` in the worktree root, asked once of every routed run, whatever its command (the light-slot route hint reads no HEAD); when that fails or the branch is unborn the run routes without it.
 
   The same sha is sent to the builder as the environment variable `SourceRevisionId`, after the caller's `--env` pairs, so the command sees it whatever its words: MSBuild's git targets there would otherwise read the box's HEAD, the run's snapshot commit, and stamp a new revision on every routed MSBuild run. It is not sent when a caller's `--env` names `SourceRevisionId` (in any letter case; the caller's wins), when HEAD is unborn or unreadable, or when adding it would put the variables over the cap of 64 names or 32 KiB. Nothing is printed in any case. A warm-up sends no `Env`, so its commands get no pair. A local or fallback run, the journal and the queue record never show the pair.
 
   The SDK keeps an explicit value (its git targets fill `SourceRevisionId` only when it is empty) and a `-p:` global property overrides a repo's own `<SourceRevisionId>`, so the builder's DLLs read `1.0.0+<HEAD sha>` as a local build's do, and a no-change routed build compiles nothing. The fallback here, the journal and the claim keep the command as given, and no output line says the word was added.
+
+  <a id="routed-path-map"></a>The same dotnet commands also get `-p:PathMap=<box tree>\=<PC root>` on the builder's words, right after the `SourceRevisionId` word (else where it would go), so the builder's dll and pdb record the PC's paths and a routed build's bytes can equal a local build's. It is added whatever the HEAD, since it does not depend on it.
+
+  There is one pair for each tree of the run, the main tree first, then each carried sibling's in carried order, joined by `%2C` (MSBuild reads a bare `,` as the start of another property).
+
+  The pairs are those the outputs install makes (`outputs::trees_of`, shared with the word): the box side is the tree's folder under the builder's work folder and ends in exactly one `\`, so a tree `key` never maps a folder `key2`; the PC side is the root as git spells it, with no trailing `\`, since the compiler adds the separator and a second one would record a doubled one.
+
+  A warm-up's commands get the same word as a routed run's.
+
+  The word is not added when the dotnet command's own words set `PathMap`, `ContinuousIntegrationBuild` or `DeterministicSourcePaths` (the caller chose the recorded paths); the `SourceRevisionId` word has its own opt-out, `SourceRevisionId`, and the two are judged apart.
+
+  A property switch is an optional `-`, `--` or `/`, then `p` or `property` in any letter case, then `:` or `=` and a list of settings separated by `;` or `,`; or the switch as its own word followed by a word holding `=`. A setting's name is read after trimming white space and `"`. `dotnet run -p proj.csproj` sets nothing. A response-file (`@`) word makes the command opaque, so it gets neither word.
+
+  A run whose PC roots (the main tree's and each sibling's) hold anything but ASCII letters and digits, `.`, `_`, `-`, `~`, `\`, a drive colon and a leading `\\server\share`, or that start with a `\\?\` or `\\.\` prefix, gets no `PathMap` word at all: the builder's command line cannot carry the character.
+
+  The run's log (a warm-up's log, `remote\warm\<key>.log`, for a warm-up) gets `gate: no PathMap word: the root {root} holds '{c}', which the builder's command line cannot carry`, the root, the character and any error text escaped as `\u{...}`; it is no output line on stderr. The same note says a root or the builder's root that cannot be told.
+
+  The limits of the word:
+
+  - The PC's full paths now reach the builder: its run log, its `obj` files and its pdbs hold them.
+  - The PC side is git's spelling of the root. A user who builds locally through a `subst` drive or a junction gets a local build recording the path they built through, which differs from the word's, and the in-place output rule does not fire there.
+  - MSBuild reads a `Directory.Build.rsp` on its own, and a props file can set `PathMap` too; the opt-out sees only the dotnet command's own words, so either can set `PathMap` (or the other two) without the opt-out seeing it, and the gate's word is added regardless.
 - **The decision is `gate-router`'s**, pure, over facts the caller gives it and the decision asks for lazily, in this order. A light or critical gate, or one under a covering or lending parent, stays local silently and reads nothing. `--local` stays local, saying `gate: not routed: --local`. Only then is `remote.json` read: no file stays local silently, and a file that is not a file, cannot be read or is refused stays local saying `gate: ignored <path>: <reason>; running locally`.
 
   After the file: a git hook when `hooks` names no repo at all (absent, empty or unusable; the rule then asks git nothing more), a command with no non-empty word, or a first word whose file name without extension is `git` or `prek` (`git.exe` and a full path included, in any letter case) stays local silently, as does a matched command whose first word the path rewrite sends as a program's name that is `git` or `prek` (`C:\x\git.exe.exe status`).

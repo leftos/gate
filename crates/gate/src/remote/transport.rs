@@ -128,11 +128,7 @@ impl Local {
     /// saying why it cannot be used.
     pub(crate) fn new(transport: &str, stub: Option<&Path>) -> Result<Local, String> {
         let cannot = |why: String| format!("gate: cannot use the remote transport '{transport}': {why}");
-        let (folder, over_ssh) = match transport.split_once(':') {
-            Some(("local", folder)) if !folder.is_empty() => (folder, false),
-            Some(("local-ssh", folder)) if !folder.is_empty() => (folder, true),
-            _ => return Err(cannot("it is not local:<folder>".to_owned())),
-        };
+        let (folder, over_ssh) = local_form(transport).ok_or_else(|| cannot("it is not local:<folder>".to_owned()))?;
         let git_ssh = match (over_ssh, stub) {
             (false, _) => None,
             (true, Some(stub)) => Some(ssh::git_ssh_command(stub)),
@@ -142,15 +138,54 @@ impl Local {
                 ));
             }
         };
-        let root = std::path::absolute(folder).map_err(|error| cannot(error.to_string()))?;
+        let root = local_root(folder).map_err(|error| cannot(error.to_string()))?;
         let gate = std::env::current_exe().map_err(|error| cannot(format!("cannot find this gate's own exe: {error}")))?;
         Ok(Local {
-            root: root.to_string_lossy().into_owned(),
+            root,
             gate,
             stub: stub.map(Path::to_path_buf),
             git_ssh,
         })
     }
+}
+
+/// The folder of the local transport `transport` names and whether it is the `local-ssh:` form; `None` when it is
+/// neither `local:<folder>` nor `local-ssh:<folder>`.
+#[cfg(feature = "test-seams")]
+fn local_form(transport: &str) -> Option<(&str, bool)> {
+    match transport.split_once(':') {
+        Some(("local", folder)) if !folder.is_empty() => Some((folder, false)),
+        Some(("local-ssh", folder)) if !folder.is_empty() => Some((folder, true)),
+        _ => None,
+    }
+}
+
+/// The builder's root of a local transport's `folder`: the folder read against the working directory.
+#[cfg(feature = "test-seams")]
+fn local_root(folder: &str) -> std::io::Result<String> {
+    std::path::absolute(folder).map(|root| root.to_string_lossy().into_owned())
+}
+
+/// The builder's root a routed run reaches: that of the local transport `transport` names, read as [`Local::new`] reads
+/// it, else the ssh transport's. Else why the named transport has none.
+#[cfg(feature = "test-seams")]
+pub(crate) fn builder_root(transport: Option<&str>) -> Result<String, String> {
+    let Some(transport) = transport else {
+        return Ok(ssh::BUILDER_ROOT.to_owned());
+    };
+    let said = gate_router::escaped(transport);
+    let (folder, _) = local_form(transport).ok_or_else(|| format!("the remote transport '{said}' is not local:<folder>"))?;
+    local_root(folder).map_err(|error| format!("cannot read the remote transport '{said}': {}", gate_router::escaped(&error.to_string())))
+}
+
+/// The builder's root a routed run reaches: the ssh transport's, in a gate built without the test seams.
+#[cfg(not(feature = "test-seams"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the signature of the test-seams build, whose named transport can be unusable"
+)]
+pub(crate) fn builder_root(_transport: Option<&str>) -> Result<String, String> {
+    Ok(ssh::BUILDER_ROOT.to_owned())
 }
 
 #[cfg(feature = "test-seams")]
@@ -220,7 +255,7 @@ pub(crate) mod ssh {
     use crate::remote::git::judged;
     use crate::run::find_program;
 
-    const BUILDER_ROOT: &str = r"D:\gate-remote";
+    pub(super) const BUILDER_ROOT: &str = r"D:\gate-remote";
     const RECEIVE_PACK: &str = "pwsh -NoProfile -NonInteractive -Command git-receive-pack";
     const UPLOAD_PACK: &str = "pwsh -NoProfile -NonInteractive -Command git-upload-pack";
     /// The one name ssh is looked for by: no `ssh.cmd` or `ssh.bat` shim earlier on `PATH` runs in its place.

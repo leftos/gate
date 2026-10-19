@@ -645,6 +645,25 @@ fn a_routed_command_sees_the_worktree_head_as_its_source_revision() {
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
 }
 
+/// A routed dotnet build gets its source revision, then the path map of the work folder the box checked it out in, on
+/// the transport's builder root, to the worktree root as this PC spells it.
+#[test]
+fn a_routed_dotnet_build_maps_the_box_work_folder_to_the_worktree_root() {
+    let case = outputs_case("client-path-map", &[]);
+    copy_tool(&case, "dotnet.exe");
+    git(&case, &["commit", "--quiet", "--allow-empty", "-m", "a"]);
+    let head = git(&case, &["rev-parse", "HEAD"]);
+    let root = std::path::absolute(git_out(&case, &[], &["rev-parse", "--show-toplevel"])).expect("git names the worktree by a full path");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\dotnet.exe", "test", "argv"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let path_map = format!(r"-p:PathMap={}\={}", work_folder(&case).display(), root.display());
+    let words: Vec<&str> = outcome.stdout.lines().filter(|line| line.starts_with("-p:")).take(2).collect();
+    assert_eq!(words, [format!("-p:SourceRevisionId={head}"), path_map], "{outcome:?}");
+}
+
 /// A forwarded `--env NAME`: the box's command sees the value the PC's environment held, and no line of the gate's or
 /// the journal says it.
 #[test]
@@ -5476,12 +5495,17 @@ fn a_no_build_command_sends_no_manifest() {
         r"bin\new.txt",
         "built",
         "--no-build",
+        "argv",
     ];
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &command));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    assert!(
+        outcome.stdout.lines().any(|line| line.starts_with("-p:PathMap=")),
+        "the box's build gets the path map, printed after argv: {outcome:?}"
+    );
     assert!(
         outcome.stderr.contains("gate: outputs: none brought back for a --no-build command"),
         "{outcome:?}"

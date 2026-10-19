@@ -237,6 +237,12 @@ enum Unmoved {
     Failed(String),
 }
 
+/// A PC root as the install pairs it with its box tree: read against the working directory, with `\` separators. The
+/// worktree root and each sibling's are spelled through this, for the install and for the path-map word alike.
+pub(super) fn pc_spelling(root: &str) -> io::Result<PathBuf> {
+    std::path::absolute(root)
+}
+
 /// The end of a passing run whose outputs archive `fetched` holds was fetched whole: installed, it says the success
 /// line and ends 0, clearing the pending marker unless it skipped a file that keeps it ([`Skip::keeps_marker`]): one git
 /// tracks, one in use or read-only, which it says ([`said`]).
@@ -305,7 +311,7 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
     let unopened = |error: &UnpackError| unpack_refused(format!("the outputs archive {name} cannot be opened: {error}"), error.members());
     let file = File::open(path).map_err(|error| unopened(&error.into()))?;
     let compressed = file.metadata().map_err(|error| unopened(&error.into()))?.len();
-    let root = std::path::absolute(attempt.call.root).map_err(|error| transient(in_context(Path::new(attempt.call.root), &error).to_string()))?;
+    let root = pc_spelling(attempt.call.root).map_err(|error| transient(in_context(Path::new(attempt.call.root), &error).to_string()))?;
     let stopped = Cell::new(false);
     let pc = PcFiles {
         root: &root,
@@ -329,7 +335,7 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
     let skipped_paths: HashSet<&str> = skipped.iter().map(|(path, _)| path.as_str()).collect();
     let entries: Vec<Entry> = entries.into_iter().filter(|entry| !skipped_paths.contains(entry.path.as_str())).collect();
     let siblings = fetched.sibling_trees.iter().map(|(tree, pc_root)| {
-        std::path::absolute(pc_root)
+        pc_spelling(pc_root)
             .map(|pc_root| (tree.clone(), pc_root.display().to_string()))
             .map_err(|error| transient(in_context(Path::new(pc_root), &error).to_string()))
     });

@@ -12,7 +12,7 @@
 //! writes it. A warm-up takes no slot and writes no journal event.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -477,7 +477,8 @@ fn warm_up(prepared: &Prepared<'_>, request: &WarmRequest, started: Timestamp, c
             return End::Failed(line).say(request.background, console);
         }
     };
-    let _log = match fresh_log(&v1::warm_log_path(state, key)) {
+    let log_path = v1::warm_log_path(state, key);
+    let _log = match fresh_log(&log_path).and_then(|log| noted(log, &log_path, &prepared.machine.unsaid_notes())) {
         Ok(log) => log,
         Err(line) => return End::Failed(line).say(request.background, console),
     };
@@ -592,6 +593,19 @@ fn fresh_log(path: &Path) -> Result<File, String> {
         .map_err(|error| cannot("create the", &error))?;
     gate_win32::check_plain_file(&file).map_err(|error| cannot("use the", &error))?;
     Ok(file)
+}
+
+/// The warm-up's new log `log`, at `path`, with `notes` written into it first, each a line, as a routed run's log gets
+/// its decision's notes; else the line saying why they cannot be written.
+fn noted(mut log: File, path: &Path, notes: &[String]) -> Result<File, String> {
+    let mut text = String::new();
+    for note in notes {
+        text.push_str(note);
+        text.push('\n');
+    }
+    log.write_all(text.as_bytes())
+        .map_err(|error| format!("gate: warm: cannot write the warm-up log {}: {error}", shown(path)))?;
+    Ok(log)
 }
 
 /// The key's mutex, waited for up to `wait`: the guard, `None` for a client that takes none; else the ending of a

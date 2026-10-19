@@ -19,7 +19,7 @@ use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 
 use crate::remote_client::{Tuned, client_case, client_gate, client_gate_tuned, fallbacks, godot_csproj, godot_root, no_pin_warning};
-use crate::routing::{CONTROL_C_EXIT, HOST, repo, routed_case};
+use crate::routing::{CONTROL_C_EXIT, HOST, path_map, repo, routed_case};
 use crate::support::{
     ANSWERING, Case, FAKE_SSH, GATE, GATE_VARIABLE, Go, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running, STEPS_VARIABLE, build_version, calls, events,
     finish, git, heavy_words, junction, nothing_back, shown, ssh_steps, start, wait_until, write_remote_json,
@@ -141,8 +141,8 @@ fn a_warm_up_from_a_subfolder_is_worded_and_sent_from_the_root() {
     let stamp = format!("-p:SourceRevisionId={head}");
     assert_eq!(
         call["warmth"],
-        json!({"warmUp": {"commands": [["./tool.exe", "out", "hi"], ["dotnet", "build", stamp]], "hash": hash}}),
-        "tool.exe is marked as the root's file, which sub does not hold, and the build is stamped: {call}"
+        json!({"warmUp": {"commands": [["./tool.exe", "out", "hi"], ["dotnet", "build", stamp, path_map(&case)]], "hash": hash}}),
+        "tool.exe is marked as the root's file, which sub does not hold, and the build is stamped and path-mapped: {call}"
     );
     let log = warm_entry(&case, "log").expect("the warm-up log is written");
     assert!(
@@ -150,6 +150,33 @@ fn a_warm_up_from_a_subfolder_is_worded_and_sent_from_the_root() {
         "the client writes the warm-up log"
     );
     assert_eq!(record(&case).expect("a record")["state"], "warm");
+}
+
+#[test]
+fn a_warm_up_whose_root_the_path_map_cannot_carry_logs_why_it_has_none() {
+    let case = warm_case("warm path-map");
+    warmup_file(&case, b"commands = [[\"dotnet\", \"build\"]]\n");
+    let call = case.folder().join("call.json");
+    let steps = steps(&case, &[&format!("record {}", shown(&call)), "out warming now", "warmed"]);
+
+    let outcome = warm(&case, &steps, &[]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let call = recorded(&call);
+    assert_eq!(
+        call["warmth"]["warmUp"]["commands"],
+        json!([["dotnet", "build"]]),
+        "no path-map word: {call}"
+    );
+    let root = std::path::absolute(git(&case, &["rev-parse", "--show-toplevel"])).expect("git names the worktree by a full path");
+    let line = format!(
+        "gate: no PathMap word: the root {} holds ' ', which the builder's command line cannot carry",
+        root.display()
+    );
+    let log = fs::read_to_string(warm_entry(&case, "log").expect("the warm-up log is written")).expect("the log can be read");
+    assert_eq!(log.lines().filter(|said| *said == line).count(), 1, "the note is logged once: {log}");
+    assert!(log.contains("warming now"), "the client's lines follow it: {log}");
+    assert!(!outcome.stderr.contains("PathMap"), "the note is for the log alone: {outcome:?}");
 }
 
 #[test]

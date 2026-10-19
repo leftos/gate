@@ -42,12 +42,17 @@ pub(crate) struct Pair {
     pub siblings: Vec<String>,
 }
 
+/// The work folder `key` under the builder's `root`, its trailing separators trimmed: `{root}\work\{key}`.
+pub(crate) fn work(root: &str, key: &str) -> String {
+    format!(r"{}\work\{key}", root.trim_end_matches(['\\', '/']))
+}
+
 impl Location {
     /// The work folder `key` of `repo` under the builder's `root`, its job named with `job_nonce`, with no pair.
     pub(crate) fn under(root: &str, repo: &str, key: &str, job_nonce: &str) -> Location {
         let bare = bare(root, repo);
+        let work = work(root, key);
         let root = root.trim_end_matches(['\\', '/']);
-        let work = format!(r"{root}\work\{key}");
         Location {
             key: key.to_owned(),
             bare,

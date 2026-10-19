@@ -3,7 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 
-use gate_router::{CarriedSibling, Config, ConfigProblem, Facts, FolderId, Inputs, Pattern, Place, SiblingFolder, SiblingRoot, Slot};
+use gate_router::{CarriedSibling, Config, ConfigProblem, Facts, FolderId, Inputs, Pattern, Place, SiblingFolder, SiblingRoot, Slot, Target};
 
 /// The worktree root the fixtures use.
 pub const ROOT: &str = "X:/dev/yaat.wt/a";
@@ -105,6 +105,10 @@ pub struct FakeFacts {
     pub checkouts: Vec<(PathBuf, String)>,
     /// What the folder id check gives for these folders as written, in place of the rule [`FakeFacts::root_id`] says.
     pub ids: Vec<(String, Result<FolderId, String>)>,
+    /// The builder's root the work folders lie under, `None` when it cannot be told: then no box tree is given.
+    pub builder_root: Option<String>,
+    /// The box trees and PC roots given as they stand, in place of the layout under [`FakeFacts::builder_root`].
+    pub given_trees: Option<Vec<(String, String)>>,
 }
 
 impl FakeFacts {
@@ -136,6 +140,8 @@ impl FakeFacts {
             trees_asked: RefCell::new(Vec::new()),
             checkouts: Vec::new(),
             ids: Vec::new(),
+            builder_root: None,
+            given_trees: None,
         }
     }
 
@@ -184,6 +190,30 @@ impl Facts for FakeFacts {
     fn head_sha(&self, _place: &Place) -> Result<Option<String>, String> {
         self.ask("head_sha".to_owned());
         self.head.clone()
+    }
+
+    /// The box's layout under [`FakeFacts::builder_root`]: the work folder `{root}\work\{key}` itself with no sibling,
+    /// else `{work}\{leaf}` and `{work}\{name}` for each sibling; each PC root with `\` separators, as the gate spells it.
+    fn box_trees(&self, target: &Target) -> Vec<(String, String)> {
+        if let Some(given) = &self.given_trees {
+            return given.clone();
+        }
+        let Some(root) = &self.builder_root else {
+            return Vec::new();
+        };
+        let work = format!(r"{root}\work\{}", target.key);
+        let spelled = |root: &str| root.replace('/', "\\");
+        if target.siblings.is_empty() {
+            return vec![(work, spelled(&target.place.root))];
+        }
+        std::iter::once((format!(r"{work}\{}", target.leaf), spelled(&target.place.root)))
+            .chain(
+                target
+                    .siblings
+                    .iter()
+                    .map(|sibling| (format!(r"{work}\{}", sibling.name), spelled(&sibling.root))),
+            )
+            .collect()
     }
 
     fn file_in_folder(&self, name: &str) -> bool {

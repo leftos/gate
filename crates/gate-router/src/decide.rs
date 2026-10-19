@@ -31,8 +31,17 @@ const WRAPPERS: [&str; 2] = ["pwsh", "powershell"];
 /// The `MSBuild` property a routed build pins the worktree's `HEAD` sha to, so the builder does not throw away a
 /// build whose revision changed.
 const SOURCE_REVISION: &str = "SourceRevisionId";
-/// The switches that set an `MSBuild` property; their case and the property name's are ignored.
-const PROPERTY_SWITCHES: [&str; 5] = ["-p:", "/p:", "-property:", "/property:", "--property:"];
+/// The `MSBuild` property through which a routed build maps each tree the builder checks the run out in to the PC root
+/// it stands for, so its outputs record the paths a build on this PC records.
+const PATH_MAP: &str = "PathMap";
+/// The `MSBuild` properties that, set by the dotnet command's own words, keep the path-map word off: the caller then
+/// chose the build's recorded paths itself.
+const PATH_MAP_OPT_OUTS: [&str; 3] = [PATH_MAP, "ContinuousIntegrationBuild", "DeterministicSourcePaths"];
+/// The comma between two path-map pairs, escaped: a bare one would end the `-p:` setting and start another property.
+const PATH_MAP_PAIR_SEPARATOR: &str = "%2C";
+/// The names of the switch that sets an `MSBuild` property ([`property_list`]), the longer first; their case and the
+/// property name's are ignored.
+const PROPERTY_SWITCH_NAMES: [&str; 2] = ["property", "p"];
 /// The dotnet verbs that build: the ones a command-line property reaches `MSBuild` through.
 const BUILD_VERBS: [&str; 6] = ["build", "test", "publish", "pack", "run", "msbuild"];
 /// The dotnet verbs whose `--no-build` the gate drops; `pack` and `publish` keep theirs.
@@ -191,6 +200,12 @@ pub trait Facts {
     /// Only when git cannot be started, outlives its limit, or its output cannot be read; the run then routes without
     /// the word, as it does for `Ok(None)`.
     fn head_sha(&self, place: &Place) -> Result<Option<String>, String>;
+
+    /// Each tree the builder checks a run of `target` out in, with the PC root it stands for, as the outputs' install
+    /// pairs them: the main repo's tree with the worktree root, then each carried sibling's with the sibling's root, in
+    /// carried order. Empty when the builder's root or a PC root cannot be told, or a PC root cannot stand in the word;
+    /// the run then routes without the path-map word. Asked only of a dotnet command that gets the word.
+    fn box_trees(&self, target: &Target) -> Vec<(String, String)>;
 
     /// Whether a file of exactly this name is in the gate's folder.
     fn file_in_folder(&self, name: &str) -> bool;
@@ -529,7 +544,7 @@ pub struct Target {
 pub struct BuilderWords {
     /// The words: paths rewritten, a bare first word naming a file of the gate's folder written `./name` (never a first
     /// word sent as a program's name), and the worktree's `HEAD` sha pinned onto a dotnet command that builds as
-    /// `SourceRevisionId`.
+    /// `SourceRevisionId`, then the builder's trees mapped to their PC roots as `PathMap`.
     pub words: Vec<String>,
     /// The first word, as given, that names a path outside the worktree and its siblings, when one does.
     pub outside: Option<String>,
@@ -551,12 +566,14 @@ pub fn target(config: &Config, place: Place, facts: &dyn Facts) -> Result<Target
 }
 
 /// The words the builder of `target` runs for the command `words`: `--no-build` dropped as a routed run drops it, then
-/// the paths rewritten, the bare first word marked and the worktree's `HEAD` sha stamped, as a routed run's are.
+/// the paths rewritten, the bare first word marked and the builder's own words written in ([`stamp`]), as a routed
+/// run's are; the worktree's `HEAD` is asked only when the source-revision word may go in.
 #[must_use]
 pub fn builder_words(target: &Target, words: &[String], facts: &dyn Facts) -> BuilderWords {
     let sent = rewritten(&target.place, &target.leaf, carried_pairs(&target.siblings), words, facts);
     let mut words = without_no_build(sent.words);
-    mark_and_stamp(&mut words, &target.place, facts, sent.program_named);
+    mark_bare_first_word(&mut words, facts, sent.program_named);
+    stamp(&mut words, || head_of(&target.place, facts), target, facts);
     BuilderWords {
         words,
         outside: sent.outside,
@@ -1259,7 +1276,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
     }
     mark_bare_first_word(&mut words, facts, program_named);
     let source_revision = head_of(&target.place, facts);
-    stamp_with(&mut words, source_revision.as_deref());
+    stamp(&mut words, || source_revision.clone(), &target, facts);
     RemoteRun {
         host: target.host,
         slots: target.slots,
@@ -1281,13 +1298,6 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         desktop,
         source_revision,
     }
-}
-
-/// Writes a bare first word naming a file of the gate's folder `./name`, then pins the worktree's `HEAD` sha onto a
-/// dotnet command that builds. A word the rewrite sent as a program's name (`program_named`) is left as it stands.
-fn mark_and_stamp(words: &mut Vec<String>, place: &Place, facts: &dyn Facts, program_named: bool) {
-    mark_bare_first_word(words, facts, program_named);
-    stamp_source_revision(words, place, facts);
 }
 
 /// The words without each of the dotnet command's own words ([`is_dotnet`]) that is exactly `--no-build`, when its
@@ -1324,22 +1334,42 @@ fn mark_bare_first_word(words: &mut [String], facts: &dyn Facts, program_named: 
     }
 }
 
-/// Writes `-p:SourceRevisionId=<the worktree's HEAD sha>` into the builder's words of a dotnet command that builds,
-/// after the dotnet command's own words (before its own `--`, or after the last word when it has none), so the
-/// builder's build is pinned to the revision the snapshot came from. The words of a command that is no such dotnet
-/// command, whose own words already set `SourceRevisionId`, or whose HEAD cannot be read are left as they are.
-fn stamp_source_revision(words: &mut Vec<String>, place: &Place, facts: &dyn Facts) {
-    if stamp_at(words).is_some() {
-        stamp_with(words, head_of(place, facts).as_deref());
-    }
+/// Writes the builder's own words into the words of a dotnet command that builds, after the dotnet command's own words
+/// (before its own `--`, or after the last word when it has none): `-p:SourceRevisionId=<sha>`, `sha` the worktree's
+/// `HEAD`, so the builder's build is pinned to the revision the snapshot came from; then the path-map word
+/// ([`path_map_word`]) of the trees [`Facts::box_trees`] gives for `target`, so its outputs record this PC's paths.
+/// The source-revision word is left out when the command's own words set `SourceRevisionId` or `sha` gives none, which
+/// is asked only when the word may go in; the path-map word when they set any of [`PATH_MAP_OPT_OUTS`] or there is no
+/// tree. The words of a command that is no such dotnet command are left as they are.
+fn stamp(words: &mut Vec<String>, sha: impl FnOnce() -> Option<String>, target: &Target, facts: &dyn Facts) {
+    let Some(own) = dotnet_own(words).filter(|own| builds(&words[own.clone()])) else {
+        return;
+    };
+    let own_words = &words[own.clone()];
+    let sets_any = |names: &[&str]| names.iter().any(|name| sets_property(own_words, name));
+    let revision = if sets_any(&[SOURCE_REVISION]) { None } else { sha() };
+    let path_map = if sets_any(&PATH_MAP_OPT_OUTS) {
+        None
+    } else {
+        path_map_word(&facts.box_trees(target))
+    };
+    let added = revision.map(|sha| format!("-p:{SOURCE_REVISION}={sha}")).into_iter().chain(path_map);
+    words.splice(own.end..own.end, added);
 }
 
-/// Writes `-p:SourceRevisionId=<sha>` where [`stamp_at`] puts it; the words are left as they are when it puts it
-/// nowhere or there is no `sha`.
-fn stamp_with(words: &mut Vec<String>, sha: Option<&str>) {
-    if let (Some(at), Some(sha)) = (stamp_at(words), sha) {
-        words.insert(at, format!("-p:{SOURCE_REVISION}={sha}"));
+/// The `-p:PathMap=` word of `trees`, each a box tree and the PC root it stands for, in order: `tree\=root`, the box
+/// side ending in exactly one `\`, so `work\key` never maps `work\key2`, and the PC side in none, since the compiler adds
+/// it (one more there records a doubled separator once the compiler quotes the value), the pairs joined with
+/// [`PATH_MAP_PAIR_SEPARATOR`]; `None` when there is no tree.
+fn path_map_word(trees: &[(String, String)]) -> Option<String> {
+    if trees.is_empty() {
+        return None;
     }
+    let pairs: Vec<String> = trees
+        .iter()
+        .map(|(tree, root)| format!("{}\\={}", tree.trim_end_matches('\\'), root.trim_end_matches('\\')))
+        .collect();
+    Some(format!("-p:{PATH_MAP}={}", pairs.join(PATH_MAP_PAIR_SEPARATOR)))
 }
 
 /// The worktree's `HEAD` sha at `place`, or `None` when the branch is unborn or git cannot read it: a run without
@@ -1348,32 +1378,47 @@ fn head_of(place: &Place, facts: &dyn Facts) -> Option<String> {
     facts.head_sha(place).ok().flatten()
 }
 
-/// Where the source-revision word goes in the builder's words, or `None` when the command gets none: not a dotnet
-/// command, no verb that builds, or one of the dotnet command's own words already sets `SourceRevisionId`.
-fn stamp_at(words: &[String]) -> Option<usize> {
-    let own = dotnet_own(words)?;
-    let own_words = &words[own.clone()];
-    (builds(own_words) && !own_words.iter().any(|word| sets_property(word, SOURCE_REVISION))).then_some(own.end)
-}
-
 /// Whether a dotnet command's words, its dotnet word first, build: its verb ([`verb`]) is one of [`BUILD_VERBS`].
 fn builds(words: &[String]) -> bool {
     verb_in(words, &BUILD_VERBS)
 }
 
-/// Whether a word sets the `MSBuild` property `name`: one of [`PROPERTY_SWITCHES`] and a `;`- or `,`-separated list in
-/// which one setting's name (the text before its `=`, the whole setting when it has none) is `name`, the case ignored.
-fn sets_property(word: &str, name: &str) -> bool {
-    let Some(switch) = PROPERTY_SWITCHES
-        .iter()
-        .copied()
-        .find(|switch| word.get(..switch.len()).is_some_and(|start| eq_ignoring_case(start, switch)))
-    else {
-        return false;
-    };
-    word[switch.len()..]
-        .split([',', ';'])
-        .any(|setting| eq_ignoring_case(setting.split_once('=').map_or(setting, |(setting, _)| setting), name))
+/// Whether one of `words` sets the `MSBuild` property `name`: its property list ([`property_list`]) is a `;`- or
+/// `,`-separated list in which one setting's name (the text before its `=`, the whole setting when it has none, white
+/// space and double quotes around it trimmed) is `name`, the case ignored.
+fn sets_property(words: &[String], name: &str) -> bool {
+    words.iter().enumerate().any(|(at, word)| {
+        property_list(word, words.get(at + 1)).is_some_and(|list| {
+            list.split([',', ';']).any(|setting| {
+                let setting_name = setting.split_once('=').map_or(setting, |(setting, _)| setting);
+                eq_ignoring_case(setting_name.trim_matches(|c: char| c.is_whitespace() || c == '"'), name)
+            })
+        })
+    })
+}
+
+/// The property list `word` sets, `next` the word after it. A property switch is an optional `--`, `-` or `/`, then one
+/// of [`PROPERTY_SWITCH_NAMES`] (any case): followed in the word by `:` or `=`, the rest of the word is the list; ending
+/// the word, `next` is, when it holds `=`. A word after a bare `-p` without `=` names a project to an older SDK's
+/// `dotnet run`, and sets nothing. A word read as a switch that is none only keeps the gate's word off.
+fn property_list<'w>(word: &'w str, next: Option<&'w String>) -> Option<&'w str> {
+    let unprefixed = word.strip_prefix("--").or_else(|| word.strip_prefix(['-', '/'])).unwrap_or(word);
+    for switch in PROPERTY_SWITCH_NAMES {
+        let Some(rest) = unprefixed
+            .get(..switch.len())
+            .filter(|start| eq_ignoring_case(start, switch))
+            .map(|_| &unprefixed[switch.len()..])
+        else {
+            continue;
+        };
+        if rest.is_empty() {
+            return next.filter(|next| next.contains('=')).map(String::as_str);
+        }
+        if let Some(list) = rest.strip_prefix([':', '=']) {
+            return Some(list);
+        }
+    }
+    None
 }
 
 /// A fact's failure as the reason said, its line breaks and the white space around them folded into one space.
