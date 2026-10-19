@@ -6365,6 +6365,45 @@ fn a_pc_output_rewritten_with_the_same_bytes_during_the_run_counts_as_brought_ba
     assert!(!pending_marker(&case).exists(), "the marker is cleared: {outcome:?}");
 }
 
+/// The PC's coverage roots file is rewritten while the run call is held, as a local build in the same worktree would: it
+/// already records the PC's roots, so it is kept as the PC wrote it, the pass stands, only `bin/new.txt` is moved, and
+/// the marker is cleared.
+#[test]
+fn a_coverage_roots_file_a_pc_build_rewrote_during_the_run_is_kept() {
+    let case = outputs_case("client-outputs-install-roots-kept", &BIN);
+    write(&case, r"bin\.msCoverageSourceRootsMapping_App", "pc");
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", &format!("hold {}", shown(go.path())), "ok"]);
+    let command = [
+        r".\tool.exe",
+        "write",
+        r"bin\.msCoverageSourceRootsMapping_App",
+        "the builder's roots",
+        "write",
+        r"bin\new.txt",
+        "built",
+    ];
+    let run = start(client_gate(&case, "out.log", &steps, &command));
+    run.wait_until("the run call", || calls(&steps).len() == 2);
+    write(&case, r"bin\.msCoverageSourceRootsMapping_App", "the PC build's roots");
+    fs::write(go.path(), "").expect("the go file can be made");
+
+    let outcome = run.finish();
+
+    assert_eq!(outcome.code, Some(0), "the pass stands: {outcome:?}");
+    assert!(!outcome.stderr.contains("not brought back"), "{outcome:?}");
+    assert_eq!(
+        worktree_text(&case, r"bin\.msCoverageSourceRootsMapping_App"),
+        "the PC build's roots",
+        "the PC's file is kept"
+    );
+    assert_eq!(worktree_text(&case, r"bin\new.txt"), "built", "the other file is installed");
+    let line = regex::Regex::new(ONE_INSTALLED).expect("the line's pattern");
+    assert!(line.is_match(&outcome.stderr), "only the moved file is counted: {outcome:?}");
+    assert_eq!(outputs_leftovers(&case), Vec::<PathBuf>::new(), "the archive and the stage are removed");
+    assert!(!pending_marker(&case).exists(), "the marker is cleared: {outcome:?}");
+}
+
 /// The PC's `bin/both.txt` and `bin/new.txt` are both edited while the run call is held: the refusal names each, one
 /// line apiece in archive order, and neither is overwritten.
 #[test]

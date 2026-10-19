@@ -1,19 +1,21 @@
 //! A routed run's fetched outputs archive put into the worktree: unpacked into a stage folder beside it, which checks
-//! every member's path and hash and makes each copy the archive lists from its member, or from a PC file holding its bytes,
-//! checked by hashing them as they are copied; each member then checked against the run's output globs, against the PC's manifest
-//! (a file it held must still have its size and last write, one it lacked must still be missing, else the PC's file must
-//! already hold the member's bytes, which leaves it in place, and every member failing this is named), and one that counts as
-//! tracked (its git index, a submodule or a nested repository holds it) unless a `--bring-tracked` glob matches it, or
-//! whose PC file is in use or read-only, or that records one of the run's box trees but is not text the install can
-//! rewrite, skipped and said; each of the run's trees on the box rewritten to its root on this PC in the files that
-//! record it (the work folder to the worktree for one repo; for a pair, the main's tree to the worktree and each
-//! sibling's to the sibling's root); and each file, its last write clamped to this PC's clock in the stage and checked
-//! against the manifest once more, moved into place, unless its PC file now holds the member's bytes, which is left as
-//! it is. A complete
-//! install also keeps the hash of each file it put in place, at the stamp that file's handle reads after the move, in
-//! the worktree's hash cache, so the next run takes it instead of reading the file again. The success line says what
-//! came back; every end removes the archive and the stage this run made, and the pending marker is cleared by a success
-//! whose skips a refetch would not clear, and by a refusal a refetch of the same archive would be refused the same way.
+//! every member's path and hash and makes each copy the archive lists from its member, or from a PC file holding its
+//! bytes, checked by hashing them as they are copied; each member then checked against the run's output globs, against
+//! the PC's manifest (a file it held must still have its size and last write, one it lacked must still be missing, else
+//! the PC's file must already hold the member's bytes, which leaves it in place; a file that records a root is left in
+//! place whenever a PC writer changed or made it, and one a PC writer deleted counts as unchanged; every member failing
+//! this is named), and one that counts as tracked (its git index, a submodule or a nested repository holds it) unless a
+//! `--bring-tracked` glob matches it, or whose PC file is in use or read-only, or that records one of the run's box
+//! trees but is not text the install can rewrite, skipped and said; each of the run's trees on the box rewritten to its
+//! root on this PC in the files that record it (the work folder to the worktree for one repo; for a pair, the main's
+//! tree to the worktree and each sibling's to the sibling's root); and each file, its last write clamped to this PC's
+//! clock in the stage and checked against the manifest once more, moved into place, unless its PC file is now in place
+//! by the same rule, which is left as it is, or records a root and something holds it open against the move, which is
+//! skipped as in use and said. A complete install also keeps the hash of each file it put in place, at the stamp that
+//! file's handle reads after the move, in the worktree's hash cache, so the next run takes it instead of reading the
+//! file again. The success line says what came back; every end removes the archive and the stage this run made, and
+//! the pending marker is cleared by a success whose skips a refetch would not clear, and by a refusal a refetch of the
+//! same archive would be refused the same way.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -25,6 +27,7 @@ use std::time::{Instant, SystemTime};
 
 use gate_router::is_layout_char;
 use gate_state::v1;
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
 use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES};
 
 use super::client::{Attempt, End};
@@ -85,8 +88,8 @@ struct Installed {
     bytes: u64,
     compressed: u64,
     skipped: Vec<(String, Skip)>,
-    /// Each file the install moved into place, with the stamp its handle read after the move; never a member left as
-    /// it was because the PC's file already held its bytes ([`Pc::InPlace`]).
+    /// Each file the install moved into place, with the stamp its handle read after the move; never a member left in
+    /// place ([`Placed::InPlace`]).
     moved: Vec<Moved>,
 }
 
@@ -350,7 +353,7 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
     let total = entries.len();
     // The file time the moves begin at, from which the racy rule keeps the hash of a file written long enough before.
     let started = file_time_now();
-    let moved = moved(&fetched.stage, &root, &entries, fetched.manifest, |done| {
+    let moves = moved(&fetched.stage, &root, &entries, fetched.manifest, |done| {
         if done == 1
             && let Some(interrupt) = raise
         {
@@ -362,6 +365,8 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
         Unmoved::Interrupted { done } => Unmet::Interrupted { done, total },
         Unmoved::Failed(reason) => transient(reason),
     })?;
+    skipped.extend(moves.in_use.into_iter().map(|path| (path, Skip::InUse)));
+    let moved = moves.moved;
     Ok((
         Installed {
             count: moved.len(),
@@ -606,16 +611,17 @@ fn unpacked(source: impl Read, stage: &Path, limit: u64, pc: &PcFiles<'_>, stopp
 struct Checked {
     /// The members whose PC file is as the manifest holds it but not replaceable ([`writable`]), which the install skips.
     in_use: Vec<String>,
-    /// The members whose PC file changed during the run to the member's own bytes ([`Pc::InPlace`]), which the install
-    /// neither moves nor says.
+    /// The members whose PC file changed during the run to the member's own bytes, or that record a root and whose PC
+    /// file changed during the run at all ([`Pc::InPlace`]), which the install neither moves nor says.
     in_place: Vec<String>,
 }
 
 /// Whether each of `entries`, to be installed below the worktree `root`, may be: every one under `globs`, then every
-/// one unchanged since `manifest` or already in place ([`pc_file`]); else the refusal. The one kind a refetch of the
-/// same archive would be refused for again is a member outside the globs ([`Refused::deterministic`]); the PC's own
-/// worktree decides the rest. Every member whose PC file changed otherwise, is not a file or cannot be read is collected,
-/// in archive order, and all are refused together ([`Refused::changed`]). What the checks found ([`Checked`]).
+/// one unchanged since `manifest` or in place, a root-recording one whose PC file changed counted so ([`pc_file`]); else
+/// the refusal. The one kind a refetch of the same archive would be refused for again is a member outside the globs
+/// ([`Refused::deterministic`]); the PC's own worktree decides the rest. Every member whose PC file changed otherwise,
+/// is not a file or cannot be read is collected, in archive order, and all are refused together ([`Refused::changed`]).
+/// What the checks found ([`Checked`]).
 fn checked(root: &Path, entries: &[Entry], globs: &Globs, manifest: &Manifest) -> Result<Checked, Refused> {
     if let Some(outside) = entries.iter().find(|entry| !globs.matches(&entry.path)) {
         return Err(Refused::deterministic(format!(
@@ -640,9 +646,13 @@ fn checked(root: &Path, entries: &[Entry], globs: &Globs, manifest: &Manifest) -
 /// What the PC's file of a member is, set against the manifest the run sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pc {
-    /// As the manifest holds it: one it holds still has its size and last write, one it lacks is still missing.
+    /// As the manifest holds it: one it holds still has its size and last write, one it lacks is still missing. So is
+    /// one that records a root ([`records_a_root`]) which the manifest held and a PC writer deleted during the run (a
+    /// clean, a rebuild): the rewritten member fills its empty place.
     AsHeld,
-    /// Changed during the run, but to the member's own bytes ([`holds_the_member`]): the member is already in place.
+    /// Changed during the run, but to the member's own bytes ([`holds_the_member`]): the member is already in place. So is
+    /// a member that records a root ([`records_a_root`]) whose PC file a PC writer changed or made during the run: that
+    /// file already records the PC's roots, and the PC's file is kept.
     InPlace,
     /// Changed during the run otherwise.
     Changed,
@@ -662,6 +672,8 @@ fn pc_file(root: &Path, entry: &Entry, manifest: &Manifest) -> Result<Pc, String
     Ok(match (manifest.get(&entry.path), now) {
         (Some(held), Some(stamp)) if held.stamp == stamp => Pc::AsHeld,
         (None, None) => Pc::AsHeld,
+        (Some(_), None) if records_a_root(&entry.path) => Pc::AsHeld,
+        (_, Some(_)) if records_a_root(&entry.path) => Pc::InPlace,
         (_, Some(stamp)) if holds_the_member(&target, entry, stamp.size) => Pc::InPlace,
         _ => Pc::Changed,
     })
@@ -669,7 +681,8 @@ fn pc_file(root: &Path, entry: &Entry, manifest: &Manifest) -> Result<Pc, String
 
 /// Whether the PC file at `target`, `size` bytes long, holds the bytes of `entry`, the archive's member for it: the same
 /// size and SHA-256. A file that cannot be read for its hash does not, nor does one that records a root
-/// ([`records_a_root`]), whose installed bytes are the rewritten ones, never the member's.
+/// ([`records_a_root`]), whose installed bytes are the rewritten ones, never the member's; [`pc_file`] keeps such a file
+/// in place by its own rule.
 fn holds_the_member(target: &Path, entry: &Entry, size: u64) -> bool {
     !records_a_root(&entry.path) && size == entry.size && file_sha256(target).is_ok_and(|sha256| sha256 == entry.sha256)
 }
@@ -886,25 +899,40 @@ fn ends_a_component(next: Option<char>) -> bool {
     next.is_none_or(|next| !is_layout_char(next))
 }
 
+/// What the moves did, each list in archive order.
+#[derive(Debug, PartialEq, Eq)]
+struct Moves {
+    /// Each file moved into place, with the stamp its handle read after the move, none when that read failed.
+    moved: Vec<Moved>,
+    /// The paths of the members recording a root whose PC file something held open against the move
+    /// ([`Placed::InUse`]), which the install skips as in use ([`Skip::InUse`]).
+    in_use: Vec<String>,
+}
+
 /// Moves each of `entries` from `stage` into place below `root`, as [`move_one`] does against `manifest`, asking
 /// `go_on`, given the files moved so far, before each one; else the interrupt once `go_on` says no, or why a file
-/// failed, the files moved before it counted and left in place. Each file moved is returned with the stamp its handle
-/// read after the move, none when that read failed; one whose PC file already held its bytes is not ([`Placed::InPlace`]).
-fn moved(stage: &Path, root: &Path, entries: &[Entry], manifest: &Manifest, mut go_on: impl FnMut(usize) -> bool) -> Result<Vec<Moved>, Unmoved> {
+/// failed, the files handled before it counted and left in place. What the moves did ([`Moves`]); a member left in place
+/// ([`Placed::InPlace`]) is in neither list.
+fn moved(stage: &Path, root: &Path, entries: &[Entry], manifest: &Manifest, mut go_on: impl FnMut(usize) -> bool) -> Result<Moves, Unmoved> {
     let now = SystemTime::now();
     let total = entries.len();
-    let mut moved = Vec::with_capacity(total);
+    let mut moves = Moves {
+        moved: Vec::with_capacity(total),
+        in_use: Vec::new(),
+    };
     for (done, entry) in entries.iter().enumerate() {
         if !go_on(done) {
             return Err(Unmoved::Interrupted { done });
         }
         let placed = move_one(stage, root, entry, manifest, now)
             .map_err(|error| Unmoved::Failed(format!("{done} of {total} files were installed before {} failed: {error}", entry.path)))?;
-        if let Placed::Moved(stamp) = placed {
-            moved.push(Moved { entry: entry.clone(), stamp });
+        match placed {
+            Placed::Moved(stamp) => moves.moved.push(Moved { entry: entry.clone(), stamp }),
+            Placed::InPlace => {}
+            Placed::InUse => moves.in_use.push(entry.path.clone()),
         }
     }
-    Ok(moved)
+    Ok(moves)
 }
 
 /// How [`move_one`] put a member in place.
@@ -912,14 +940,22 @@ fn moved(stage: &Path, root: &Path, entries: &[Entry], manifest: &Manifest, mut 
 enum Placed {
     /// Moved from the stage, with the stamp its handle read after the move; none when that read failed.
     Moved(Option<Stamp>),
-    /// Left as it was: the PC's file changed during the run to the member's own bytes ([`Pc::InPlace`]).
+    /// Left as it was: the PC's file changed during the run to the member's own bytes, or it records a root and changed
+    /// during the run at all ([`Pc::InPlace`]).
     InPlace,
+    /// Not moved: it records a root, and something holds its PC file open against the rename ([`held_open`],
+    /// [`writable`]).
+    InUse,
 }
 
 /// Moves the staged file of `entry` below `stage` to the same path below `root`, replacing a file there, each folder
 /// between `root` and it made when missing and refused when it is a link, a junction or not a folder. Its last write,
 /// when past `now`, is set to `now` in the stage, before the move; the PC's file is then checked against `manifest`
-/// once more ([`pc_file`]), just before the move, and one already holding the member's bytes is left ([`Placed::InPlace`]).
+/// once more ([`pc_file`]), just before the move, and one in place is left ([`Placed::InPlace`]): one already holding the
+/// member's bytes, or one recording a root that a PC writer changed or made. A member recording a root whose rename is
+/// refused because something holds a file open ([`held_open`]) is not moved when its PC file is the one held, as it is
+/// when that file cannot be opened for replacing ([`writable`]) ([`Placed::InUse`]); any other rename error is the
+/// failure, a held staged file included, as when the PC file is missing or opens freely.
 /// The stamp read after the move through a handle opened on the staged file before it, the clamp included, is returned:
 /// the moved file's own, never that of a file put at its path after the move. None when the handle cannot be opened or
 /// read, which costs the file its hash cache entry only.
@@ -941,7 +977,7 @@ fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, now: 
         OpenOptions::new().access_mode(FILE_WRITE_ATTRIBUTES).open(&source)?.set_modified(now)?;
     }
     // A file refused here was checked before the moves; one that changed in between is the reason said, of the kind a
-    // refetch may clear ([`Refused::transient`]), and one that changed to the member's own bytes is left as it is.
+    // refetch may clear ([`Refused::transient`]), and one in place is left as it is.
     match pc_file(root, entry, manifest).map_err(io::Error::other)? {
         Pc::AsHeld => {}
         Pc::InPlace => return Ok(Placed::InPlace),
@@ -952,11 +988,27 @@ fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, now: 
         .access_mode(FILE_READ_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .open(&source);
-    fs::rename(&source, below(root, path))?;
+    let target = below(root, path);
+    if let Err(error) = fs::rename(&source, &target) {
+        return if records_a_root(path) && held_open(&error) && !writable(root, entry) {
+            Ok(Placed::InUse)
+        } else {
+            Err(error)
+        };
+    }
     // No stamp is the right answer for a handle that cannot be opened or read: the file is installed, its hash not kept.
     Ok(Placed::Moved(
         handle.and_then(|file| file.metadata()).ok().map(|metadata| Stamp::of(&metadata)),
     ))
+}
+
+/// Whether a rename failed because something holds one of its files open: a sharing or lock violation, or the access
+/// denial a rename of or onto a file open without delete sharing ends with.
+fn held_open(error: &io::Error) -> bool {
+    error
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+        .is_some_and(|code| [ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, ERROR_ACCESS_DENIED].contains(&code))
 }
 
 /// Writes the hash cache at `path` for the files an install put in place: an entry for each of `installed.moved`, at
@@ -1000,11 +1052,11 @@ mod tests {
     use std::process::Command;
     use std::time::{Duration, SystemTime};
 
-    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
     use super::{
-        Checked, Index, Installed, Moved, Refused, Skip, Unmet, Unmoved, Unrewritable, cached, checked, ending, moved, reasons, rewritten, said,
-        stage_made, success_line, tracked, unmet_of, unpacked,
+        Checked, Index, Installed, Moved, Moves, Refused, Skip, Unmet, Unmoved, Unrewritable, cached, checked, ending, moved, reasons, rewritten,
+        said, stage_made, success_line, tracked, unmet_of, unpacked,
     };
     use crate::boxside::outputs::OUTPUTS_BUDGET;
     use crate::outputs::archive::{Entry, PcFiles, UnpackError, pack};
@@ -1767,7 +1819,9 @@ mod tests {
         aged(&put(&stage, "bin/a.txt", b"box"), Duration::from_hours(2));
         fs::create_dir_all(&root).expect("the root can be made");
 
-        let moved = moved(&stage, &root, &[entry("bin/a.txt")], &Manifest::default(), |_| true).expect("the file is moved");
+        let moved = moved(&stage, &root, &[entry("bin/a.txt")], &Manifest::default(), |_| true)
+            .expect("the file is moved")
+            .moved;
 
         assert_eq!(moved.len(), 1, "{moved:?}");
         assert_eq!(moved[0].entry.path, "bin/a.txt");
@@ -1793,7 +1847,9 @@ mod tests {
         let entries = [entry("bin/ahead.txt"), entry("bin/behind.txt")];
         // Taken before the moves, as the install takes it: the clamp to this clock then falls at or after it.
         let started = file_time_now();
-        let moved = moved(&stage, &root, &entries, &Manifest::default(), |_| true).expect("both files are moved");
+        let moved = moved(&stage, &root, &entries, &Manifest::default(), |_| true)
+            .expect("both files are moved")
+            .moved;
         let clamped = moved
             .iter()
             .find(|file| file.entry.path == "bin/ahead.txt")
@@ -1823,7 +1879,9 @@ mod tests {
         }
         fs::create_dir_all(&root).expect("the root can be made");
         let entries: Vec<Entry> = paths.iter().map(|path| entry(path)).collect();
-        let moved = moved(&stage, &root, &entries, &Manifest::default(), |_| true).expect("every file is moved");
+        let moved = moved(&stage, &root, &entries, &Manifest::default(), |_| true)
+            .expect("every file is moved")
+            .moved;
         let path = cache_path(&folder);
 
         cached(&path, &installed_of(moved), file_time_now());
@@ -1841,7 +1899,9 @@ mod tests {
         let (stage, root) = (folder.join("stage"), folder.join("root"));
         aged(&put(&stage, "bin/a.txt", b"a"), Duration::from_hours(2));
         fs::create_dir_all(&root).expect("the root can be made");
-        let moved = moved(&stage, &root, &[entry("bin/a.txt")], &Manifest::default(), |_| true).expect("the file is moved");
+        let moved = moved(&stage, &root, &[entry("bin/a.txt")], &Manifest::default(), |_| true)
+            .expect("the file is moved")
+            .moved;
         let mut installed = installed_of(moved);
         installed.skipped = vec![("bin/held.dll".to_owned(), Skip::InUse)];
         let path = cache_path(&folder);
@@ -1921,7 +1981,7 @@ mod tests {
 
         let paths: Vec<&str> = installed
             .as_ref()
-            .map(|moved| moved.iter().map(|moved| moved.entry.path.as_str()).collect())
+            .map(|moves| moves.moved.iter().map(|moved| moved.entry.path.as_str()).collect())
             .unwrap_or_default();
         assert_eq!(paths, ["bin/a.txt"], "only a is moved: {installed:?}");
         assert_eq!(fs::read_to_string(&pc).expect("b stays"), "box");
@@ -2120,6 +2180,237 @@ mod tests {
             in_place: vec!["bin/absent.dll".to_owned()],
         };
         assert_eq!(checks, Ok(in_place));
+    }
+
+    /// The checks of `path`, a member recording a root whose PC file a PC writer rewrote during the run after the
+    /// manifest recorded it as `before`, or made when `before` is none: it counts in place, which the install neither
+    /// moves nor says.
+    fn assert_root_recording_pc_file_kept(name: &str, path: &str, before: Option<&[u8]>) {
+        let root = scratch(name);
+        if let Some(before) = before {
+            put(&root, path, before);
+        }
+        let held: Vec<&str> = before.iter().map(|_| path).collect();
+        let manifest = manifest_of(&root, &held);
+        put(&root, path, b"the PC writer's roots");
+
+        let checks = checked(&root, &[member(path, b"the builder's roots")], &bin_globs(), &manifest);
+
+        let kept = Checked {
+            in_use: Vec::new(),
+            in_place: vec![path.to_owned()],
+        };
+        assert_eq!(checks, Ok(kept));
+    }
+
+    #[test]
+    fn the_checks_take_a_root_recording_pc_file_untouched_or_deleted_as_held_and_refuse_another_deleted_one() {
+        let root = scratch("roots-edges");
+        put(&root, "bin/.msCoverageSourceRootsMapping_A", b"pc");
+        let deleted = put(&root, "bin/MvcTestingAppManifest.json", b"pc");
+        let gone = put(&root, "bin/gone.dll", b"pc");
+        let manifest = manifest_of(
+            &root,
+            &["bin/.msCoverageSourceRootsMapping_A", "bin/MvcTestingAppManifest.json", "bin/gone.dll"],
+        );
+        fs::remove_file(&deleted).expect("the file can be removed");
+        fs::remove_file(&gone).expect("the file can be removed");
+        let roots = [
+            member("bin/.msCoverageSourceRootsMapping_A", b"box"),
+            member("bin/MvcTestingAppManifest.json", b"box"),
+        ];
+
+        assert_eq!(checked(&root, &roots, &bin_globs(), &manifest), Ok(Checked::default()));
+        let other = checked(&root, &[member("bin/gone.dll", b"box")], &bin_globs(), &manifest);
+        assert_eq!(other, Err(Refused::transient("bin/gone.dll changed during the run")));
+    }
+
+    #[test]
+    fn a_root_recording_pc_file_deleted_during_the_run_is_installed() {
+        let folder = scratch("roots-deleted");
+        let (stage, root) = (folder.join("stage"), folder.join("root"));
+        let path = "bin/.msCoverageSourceRootsMapping_X";
+        let recorded = format!("{BOX_WORK}\\src\n");
+        put(&stage, path, recorded.as_bytes());
+        let pc = put(&root, path, b"pc");
+        let manifest = manifest_of(&root, &[path]);
+        fs::remove_file(&pc).expect("the file can be removed");
+        let entries = [member(path, recorded.as_bytes())];
+
+        assert_eq!(checked(&root, &entries, &bin_globs(), &manifest), Ok(Checked::default()));
+        assert_eq!(rewritten(&stage, &entries, &one_tree()), Ok(Vec::new()));
+        let installed = moved(&stage, &root, &entries, &manifest, |_| true);
+
+        let paths: Vec<&str> = installed
+            .as_ref()
+            .map(|moves| moves.moved.iter().map(|moved| moved.entry.path.as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(paths, [path], "the member is moved: {installed:?}");
+        assert_eq!(fs::read_to_string(&pc).expect("the file lands"), format!("{PC_ROOT}\\src\n"));
+    }
+
+    /// Moves `bin/a.txt` then `path`, whose PC file something holds open from the second move on ([`moved_holding`]);
+    /// what the moves returned, and the PC file's bytes after them.
+    fn moved_onto_a_held_pc_file(name: &str, path: &str) -> (Result<Moves, Unmoved>, Vec<u8>) {
+        let folder = scratch(name);
+        let (stage, root) = (folder.join("stage"), folder.join("root"));
+        put(&stage, "bin/a.txt", b"box");
+        put(&stage, path, b"box");
+        let pc = put(&root, path, b"pc");
+        let manifest = manifest_of(&root, &[path]);
+        let entries = [entry("bin/a.txt"), member(path, b"box")];
+
+        let installed = moved_holding(&stage, &root, &entries, &manifest, &pc);
+
+        (installed, fs::read(&pc).expect("the PC file stays"))
+    }
+
+    /// Moves `entries` from `stage` to `root` against `manifest`, holding the file at `full` open from the second move
+    /// on, sharing reads and writes but not its deletion; what the moves returned.
+    fn moved_holding(stage: &Path, root: &Path, entries: &[Entry], manifest: &Manifest, full: &Path) -> Result<Moves, Unmoved> {
+        let mut held = None;
+        let installed = moved(stage, root, entries, manifest, |done| {
+            if done == 1 {
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .open(full)
+                    .expect("the file can be held");
+                held = Some(file);
+            }
+            true
+        });
+        drop(held);
+        installed
+    }
+
+    #[test]
+    fn a_root_recording_pc_file_held_open_at_its_move_is_skipped_as_in_use() {
+        let path = "bin/.msCoverageSourceRootsMapping_X";
+        let (installed, pc) = moved_onto_a_held_pc_file("move-roots-held", path);
+
+        let moves = installed.expect("the moves end");
+        let paths: Vec<&str> = moves.moved.iter().map(|moved| moved.entry.path.as_str()).collect();
+        assert_eq!(paths, ["bin/a.txt"], "only a is moved: {moves:?}");
+        assert_eq!(moves.in_use, [path], "the held file is skipped as in use");
+        assert_eq!(pc, b"pc");
+    }
+
+    #[test]
+    fn a_root_recording_member_whose_staged_file_is_held_open_with_no_pc_file_fails_the_install() {
+        let folder = scratch("move-roots-staged-held");
+        let (stage, root) = (folder.join("stage"), folder.join("root"));
+        let path = "bin/.msCoverageSourceRootsMapping_X";
+        put(&stage, "bin/a.txt", b"box");
+        let staged = put(&stage, path, b"box");
+        fs::create_dir_all(&root).expect("the root can be made");
+        let entries = [entry("bin/a.txt"), member(path, b"box")];
+
+        let installed = moved_holding(&stage, &root, &entries, &Manifest::default(), &staged);
+
+        let reason = format!("1 of 2 files were installed before {path} failed:");
+        assert!(
+            matches!(&installed, Err(Unmoved::Failed(why)) if why.starts_with(&reason)),
+            "{installed:?}"
+        );
+        assert!(!super::below(&root, path).exists(), "nothing is put in its place");
+    }
+
+    #[test]
+    fn a_root_recording_member_whose_staged_file_is_held_open_over_a_free_pc_file_fails_the_install() {
+        let folder = scratch("move-roots-staged-held-pc-free");
+        let (stage, root) = (folder.join("stage"), folder.join("root"));
+        let path = "bin/.msCoverageSourceRootsMapping_X";
+        put(&stage, "bin/a.txt", b"box");
+        let staged = put(&stage, path, b"box");
+        let pc = put(&root, path, b"pc");
+        let manifest = manifest_of(&root, &[path]);
+        let entries = [entry("bin/a.txt"), member(path, b"box")];
+
+        let installed = moved_holding(&stage, &root, &entries, &manifest, &staged);
+
+        let reason = format!("1 of 2 files were installed before {path} failed:");
+        assert!(
+            matches!(&installed, Err(Unmoved::Failed(why)) if why.starts_with(&reason)),
+            "{installed:?}"
+        );
+        assert_eq!(fs::read(&pc).expect("the PC file stays"), b"pc");
+    }
+
+    #[test]
+    fn a_pc_file_a_writer_holds_at_its_move_fails_the_install() {
+        let (installed, pc) = moved_onto_a_held_pc_file("move-held", "bin/b.dll");
+
+        let reason = "1 of 2 files were installed before bin/b.dll failed:";
+        assert!(
+            matches!(&installed, Err(Unmoved::Failed(why)) if why.starts_with(reason)),
+            "{installed:?}"
+        );
+        assert_eq!(pc, b"pc");
+    }
+
+    #[test]
+    fn a_failed_move_counts_a_member_left_in_place_among_the_files_before_it() {
+        let folder = scratch("move-count");
+        let (stage, root) = (folder.join("stage"), folder.join("root"));
+        put(&stage, "bin/.msCoverageSourceRootsMapping_X", b"box");
+        put(&stage, "bin/b.txt", b"box");
+        let roots = put(&root, "bin/.msCoverageSourceRootsMapping_X", b"pc");
+        let pc = put(&root, "bin/b.txt", b"pc");
+        let manifest = manifest_of(&root, &["bin/.msCoverageSourceRootsMapping_X", "bin/b.txt"]);
+        fs::write(&roots, b"the PC writer's roots").expect("the file can be written");
+        let entries = [member("bin/.msCoverageSourceRootsMapping_X", b"box"), entry("bin/b.txt")];
+
+        let unmoved = moved(&stage, &root, &entries, &manifest, |done| {
+            if done == 1 {
+                fs::write(&pc, b"edited after the checks").expect("the file can be written");
+            }
+            true
+        });
+
+        let reason = "1 of 2 files were installed before bin/b.txt failed: bin/b.txt changed during the run";
+        assert_eq!(unmoved, Err(Unmoved::Failed(reason.to_owned())));
+    }
+
+    #[test]
+    fn a_root_recording_pc_file_changed_during_the_run_is_kept() {
+        assert_root_recording_pc_file_kept("roots-changed", "bin/.msCoverageSourceRootsMapping_X", Some(b"pc"));
+    }
+
+    #[test]
+    fn a_root_recording_pc_file_the_manifest_lacked_is_kept() {
+        assert_root_recording_pc_file_kept("roots-absent", "bin/.msCoverageSourceRootsMapping_X", None);
+    }
+
+    #[test]
+    fn an_mvc_testing_app_manifest_changed_during_the_run_is_kept() {
+        assert_root_recording_pc_file_kept("mvc-changed", "bin/MvcTestingAppManifest.json", Some(b"pc"));
+    }
+
+    #[test]
+    fn a_root_recording_pc_file_rewritten_after_the_checks_is_kept_just_before_its_move() {
+        let folder = scratch("move-roots-changed");
+        let (stage, root) = (folder.join("stage"), folder.join("root"));
+        put(&stage, "bin/a.txt", b"box");
+        let staged = put(&stage, "bin/.msCoverageSourceRootsMapping_X", b"the builder's roots");
+        let pc = put(&root, "bin/.msCoverageSourceRootsMapping_X", b"pc");
+        let manifest = manifest_of(&root, &["bin/.msCoverageSourceRootsMapping_X"]);
+        let entries = [entry("bin/a.txt"), member("bin/.msCoverageSourceRootsMapping_X", b"the builder's roots")];
+
+        let installed = moved(&stage, &root, &entries, &manifest, |done| {
+            if done == 1 {
+                fs::write(&pc, b"the PC writer's roots").expect("the file can be written");
+            }
+            true
+        });
+
+        let paths: Vec<&str> = installed
+            .as_ref()
+            .map(|moves| moves.moved.iter().map(|moved| moved.entry.path.as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(paths, ["bin/a.txt"], "only a is moved: {installed:?}");
+        assert_eq!(fs::read(&pc).expect("the PC file stays"), b"the PC writer's roots");
+        assert!(staged.exists(), "the staged roots file is not moved");
     }
 
     /// The size of the member the streaming case unpacks.
