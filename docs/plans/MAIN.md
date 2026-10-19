@@ -11,11 +11,10 @@
 - [/] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [/] GATE-440 Map and trial routing all of herdr-gpui's, yaat-server's and agent-park's heavy work — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
-- [/] GATE-508 Map a routed dotnet build's work-folder paths to the PC worktree root — High · Remote
-- [/] GATE-509 Count the WSL VM's CPU so a routed WSL compile is not killed as STALLED — High · Remote
 - [!] GATE-468 Route Unreal Engine packaging to the builder with an unreal toolchain pin — High · Remote
-- [/] GATE-469 Carry Git LFS content to the builder in a routed run — High · Remote
-- [/] GATE-472 Map and trial routing ue-mcp's heavy work — High · Remote
+- [!] GATE-472 Map and trial routing ue-mcp's heavy work — High · Remote
+- [ ] GATE-526 Bring back a routed build's coverage source-roots mapping files with the PC's paths — High · Remote
+- [ ] GATE-527 Find and fix what splits a -name=X:/path argument at the drive colon — High · Remote
 
 ## Remote
 
@@ -146,6 +145,12 @@
 - [ ] GATE-517 Read untracked .gitattributes when judging a routed snapshot's LFS filter
 - [ ] GATE-518 Keep the LFS scratch prune quiet about a stage a live run still holds
 - [ ] GATE-519 Name info/attributes when the box refuses an LFS run whose snapshot holds no pointer
+- [ ] GATE-520 Make the forward hang-guard reader test load-proof
+- [ ] GATE-521 Write a warm-up's notes from its late re-read into its log
+- [ ] GATE-522 Pin the = condition of the two-word property opt-out with a test
+- [ ] GATE-523 Escape the sibling name and root in the routed-with-siblings line
+- [ ] GATE-524 Match .gitattributes case-insensitively on the PC when judging a snapshot's LFS need
+- [ ] GATE-525 Keep install output from forging the box's refusal tag before the start marker
 
 ## Design
 
