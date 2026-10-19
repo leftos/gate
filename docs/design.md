@@ -2296,7 +2296,15 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   Two repositories whose common git folders have one folder id share a repository and keep the run here. The refusals are the `gate: not routed: <who> <why>` lines of [Output lines](#output-lines), the main repository said by the root's folder name.
 - **Inputs** (GATE-22): a routed command can need ignored files only the PC has, and the snapshot sends only tracked and untracked-not-ignored files. A repo's optional `inputs` list of ignored-file globs, beside `outputs` in the routing file, names the ignored files a routed run sends to the builder's work folder before the run, compressed in the outputs archive's format and hash-diffed against what the work folder holds, so an unchanged input costs nothing.
 
-  The design is [plans/remote-inputs.md](plans/remote-inputs.md).
+  The choices behind it:
+
+  - Secrets do not go to a builder, with no opt-in: a `.env` file never travels, so a repo whose command needs a `.env` on the builder cannot route that command, and the run says nothing is wrong and fails on the builder; the repo keeps that command local.
+  - There are two calls (a diff, then a put of what differs) and no PC record of what the builder holds. The rejected shape folds the inputs into the run call and trusts such a record, and a stale record turns into refusals.
+
+    The cost is one more ssh setup (about 2 s) per routed run of a repo that declares inputs, even when nothing changed; a repo with no `inputs` list pays nothing. Both calls come after the push and before the run call, so a refused route uploads nothing and the run's clocks do not count the upload.
+  - A failed step runs the command here, with its own fallback reason, so the journal shows a builder that fails the step for every run of the repo. A repo whose inputs pass the 4 GiB cap never routes those commands, and the line names the cap.
+  - The box writes inputs with the same token and owner as the checkout and rewrites no path, so whatever a command can read of the checkout it can read of its inputs (a desktop run's included).
+  - A repo name in `inputs` that matches no repo sends nothing, and `gate check` says nothing about inputs.
 
   Built: the `inputs` key and the route's `RemoteRun.inputs`, the box's `inputs` verb with the run's `InputsDigest` check ([The box side](#the-box-side)), and the client's part (the manifest, the diff and put calls, the hash cache, the lines and the `inputs` fallback reason), described under Inputs in [The remote client's run](#routing).
 
@@ -2322,7 +2330,7 @@ The box keeps the PowerShell wrapper's lines for the verbs and the refusals, and
 
 The preflight also judges the desktop helper beside the box the same way, and refuses with the same two lines and status 1 when the helper is there and not trusted; a builder with no helper file passes it. A desktop run's hand-off judges the helper again before it makes the control pipe, and refuses with the run's `install` refusal tag bound to its nonce, then the install line, exit 75; a helper file that is not found stays a `desktop` refusal. The `register-desktop` verb judges the helper before it registers the task, so an untrusted helper is its `failed: <why>`.
 
-The client turns the refusal into a fallback to a local run with reason `install` (Preflight, in [Routing](#routing)), and `gate check --builder` reports it. Routed code is trusted, and a refused install falls back to local. The user's own Medium-integrity processes are outside the trust boundary ([desktop-session.md](plans/desktop-session.md), I1).
+The client turns the refusal into a fallback to a local run with reason `install` (Preflight, in [Routing](#routing)), and `gate check --builder` reports it. Routed code is trusted, and a refused install falls back to local. The user's own Medium-integrity processes are outside the trust boundary ([The desktop run's design](#the-desktop-runs-design)).
 
 Each verb is one ssh call today, and the call's cost is its connection, not its work. Measured warm, setup takes about 2.1 s (TCP about 0.2 s, key exchange and auth 1.5 s, the session 0.4 s) against 0.2 to 1.0 s of verb work, so a routed run's three verb calls spend about 6.4 s, 30 to 37% of a 17 to 26 s routed build, before its git transfers pay the same again.
 
@@ -2991,6 +2999,89 @@ Before the command starts, a donor that cannot start, an attach or code page tha
 There is no fallback after the command has started and no relaunch: a command that never shows on the console (a GUI program, one that calls `FreeConsole`, a slow starter) runs once.
 
 The rest of the protocol, the transport of snapshots and outputs, is the remote port's design (GATE-10).
+
+### The desktop run's design
+
+The rules behind the desktop run (GATE-231) that a later change to the helper, the hand-off, the lock or the task keeps.
+
+**Trust boundary.**
+
+- The boundary is the builder's user against everyone else, not the box against the helper. Any Medium-integrity process of that user can already inject into a session-0 restricted command (its token's default DACL grants the user) and could replace a gate.exe the user can write, which the install tripwire refuses. The pid, handle and image checks guard against mistakes, stale helpers and mixed-up runs, not against the user's own processes.
+- Only the builder user's SID may connect to the control pipe, and only locally. The box creates it with an explicit DACL for that SID alone (SYSTEM is refused), `PIPE_REJECT_REMOTE_CLIENTS`, `FILE_FLAG_FIRST_PIPE_INSTANCE`, one instance, a fresh 128-bit random part in the name that is not derived from the run's nonce, access narrowed to read and write (no `WRITE_DAC` or `WRITE_OWNER`), and a Medium mandatory label, so a Low-integrity process of the user cannot take the one instance.
+- The helper checks the server too. The pipe's owner must be the builder's SID and its DACL exactly the entries the box writes, read with `GetSecurityInfo` on the open handle; `GetNamedPipeServerProcessId` must equal the box pid in the helper's argument, as a cross-check only, since a dead box's pid can be reused; and it connects with `SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS`, as an output file is opened.
+
+  Without these, another identity that squatted a pipe name could impersonate the user's interactive token and choose what the helper starts.
+- The read ends, the job handle, the stop event and the desktop lock never leave the box; only the two pipe write ends go out, into the helper and from there into the command. A planted job handle would keep the kill-on-close job, and the command, alive after the box dies.
+
+**Where the command can run.**
+
+- A desktop payload never runs in session 0. The desktop branch is its own function and never reaches the piped launch, the own-token retry or the console donor; a box that cannot get the desktop refuses. The PC's exact-version check keeps an older box, which would ignore the unknown `Desktop` key, from running the command in session 0.
+- A helper's `Failed` is the command's own start failure, so it goes straight to the start marker and `could not start` (127), never through the check for a box job that refuses breakaway: that check asks about the box's own job, which says nothing of a process the helper created.
+- The marker is said after adoption and before the stop look and the resume, which is as safe as saying it before the process exists: a suspended child runs nothing, and what waits in its pipes is forwarded after the marker.
+
+**Adopting the child.**
+
+- The child is taken by handle from the helper's handle table, never by `OpenProcess` on a pid; the pid is only a cross-check. The box copies the reported values out of the helper with `DUPLICATE_SAME_ACCESS` and closes the helper's copies itself with `DUPLICATE_CLOSE_SOURCE`, so it does not depend on the helper tidying up.
+- It accepts the process only when the process id and the thread's process id both equal the reported pid, the parent is the helper and the child was created after it, the child is in the target session, its image is the application the box sent, it is not yet in the box's job, and it is suspended exactly once: `SuspendThread` returns a count of 1 and `ResumeThread` undoes it, and the final resume fails unless it returns 1, so a child suspended twice is never left suspended after the marker.
+- After the assign it checks `IsProcessInJob(process, box_job)` against the box's job specifically; asking whether the process is in any job passes a child that is in some other job.
+- On a failed check the box ends only what is provably the helper's, never the process behind an unverified handle, which could be any process of the user: the sweep of the helper's children also covers a helper that died between creating the command and reporting it, which would otherwise leave a suspended orphan holding the pipe write ends.
+
+**The job.**
+
+- The command is the first member of an empty job and nothing from session 0 ever joins it: no donor, no console keeper, nothing assigned but the child. Microsoft's documentation says the members of a job must share its session; an empty job took the session of its first member when measured, so the membership check is a hard requirement.
+- The helper uses no `CREATE_BREAKAWAY_FROM_JOB` (refused), so the command nests below the Task Scheduler's job, whose most restrictive priority class wins over the command's.
+- The command runs at normal priority, explicitly. A task's default priority of 7 gives its action below-normal CPU, I/O and memory priority, which a child inherits, so the helper passes `NORMAL_PRIORITY_CLASS` and the task is registered at priority 4. Otherwise the box's ceiling arithmetic, which assumes every core is demanded at normal priority, and the comparison with local runs would drift.
+- The job is kill-on-close, unlike a session-0 command's. With one desktop, an orphan that outlived a dead box would hold the console while the next desktop run starts; the box's death ends the command instead. The PC's `stop` after a lost connection then finds no job and exits 0 silently.
+
+**Output pipes and creation.**
+
+- Pipe objects are not tied to a session; handles belong to processes. The write ends go into the helper as non-inheritable copies, so none leaks into a process the helper itself starts. The helper makes its own inheritable copies inside the spawn lock and hands exactly NUL and those two to the command through the handle list. The box's copies close once the command holds its own, the forwarders start only after the marker, and the read ends stay in the box.
+- The helper creates the command by the box's own rules, through a `gate_win32` function and not a copy of them: `check_launch`, the handle list, the desktop-app policy `DISABLE_PROCESS_TREE`, `CREATE_NO_WINDOW` and `CREATE_SUSPENDED`, with `lpDesktop` set to `WinSta0\Default`.
+
+**Environment and folder.**
+
+- The box builds the environment block and the helper passes it on unchanged, by the code path a session-0 run uses (build servers, and the `safe.directory` entry, still needed because the token is non-elevated and the work folders are owned by Administrators). It travels as base64 of UTF-16LE, so unpaired surrogates survive.
+
+  The helper builds its block from those bytes only through a constructor that refuses a block that does not end in two NULs or holds an empty or `=`-only entry, since `CreateProcessW` reads until the double NUL. Session-0 variables such as `SSH_*` go along.
+- Every path sent to the helper must exist in the interactive logon session: the application, the working folder and the program the box resolved. Drive letters are per logon session, so a `subst` or `net use` drive made under the ssh logon does not exist for the helper, and the builder root must be on a real volume. A violation shows as a 127 after the marker.
+
+**Reaching the command.**
+
+- Everything goes through the box's own job handle, so the session does not matter: `gate box stop` opens the job by name from session 0, where the box created it; the kill, the ceiling's accounting, the heartbeat, the leftovers sweep (with no donor to spare), the client-gone path and the panic stopper all use it.
+- The box never calls `IRunningTask::Stop` or `IRegisteredTask::Stop` after adoption, and the task is never registered with `StopExisting`: the Task Scheduler's job sits above the box's, and stopping the instance may end it. A lingering helper is ended with `TerminateProcess` only.
+
+**The desktop lock.**
+
+- The order is the work-folder lock, then the desktop lock, never the other way round. The desktop lock is taken after the checkout and the restores, so it is held only while the command runs, and on the run's main thread, which also releases it, since a mutex belongs to its thread; it is released once the job is empty and the output drained, before the back commit.
+- The wait watches the stop event and has a deadline, and the heartbeats keep beating meanwhile, so the PC's stall check stays quiet. A lock found abandoned is a take: the dead holder's kill-on-close job is ending its command too, and a brief overlap is possible, since abandonment can come before the dead box's handles close.
+
+**Session state.**
+
+- Before the start the target is the active console session, owned by the builder's user, unlocked and on the `Default` input desktop. The box reads the session; the helper confirms from inside it in its hello that `OpenInputDesktop` succeeds and names `Default`, since a UAC prompt or the lock screen is a secure desktop.
+
+  `RunEx` is given that session id, and with no user given the Task Scheduler runs the task as whoever is logged on to the session, which is why the check of the helper's token user matters. The builder logs its user on at the console after every reboot (autologon), and builder setup keeps it.
+- A session change mid-run is a command failure, never a fallback. Logging off ends the session's processes, the box sees the exit and the status stands; locking, an RDP takeover and a disconnection let the command run on and fail as it fails.
+
+**The helper dies, lies, hangs or is impersonated.**
+
+| Case | What happens |
+|---|---|
+| Dies before connecting | The box's wait includes the helper's process handle, so it returns at once and refuses `desktop` with the exit status. |
+| Hangs | Deadlines: connect 10 s, each message 5 s. Then `TerminateProcess`, the sweep and a refusal. |
+| Lies (bad handle values, a pid that does not match, a running process) | Verification fails, the sweep runs, the box refuses. A helper's copy can never carry more access than the helper had. |
+| Impersonated (another client connects first) | Pid mismatch, disconnect, keep listening. Endless reconnects run out the deadline and refuse: a denial of service that ends in a local run. |
+| Squatter of another identity | The box's `CreateNamedPipe` with `FIRST_PIPE_INSTANCE` fails and it refuses before `RunEx`. A pipe the helper reaches is the helper's check, above. |
+| Helper of another build | The hello carries the version text; a mismatch refuses `desktop`. |
+
+**The task's settings.** The registered definition is part of the design, and the box reads it on each desktop run:
+
+- instances `Parallel`, since the default `IgnoreNew` drops a run while an earlier helper is alive;
+- priority 4, enabled and allowed to start on demand (`RunEx` returns `S_OK` for a disabled task, so the box checks it);
+- not kept from starting nor stopped on batteries;
+- no execution time limit (the box bounds the helper itself, and a limit could end the Task Scheduler's job) and no triggers;
+- the builder's SID, interactive token, least privilege, which gives Medium integrity, and the helper's full path as the action with `$(Arg0)`.
+
+A missing, disabled or different task is a refusal whose why names the fix.
 
 ## Install
 
