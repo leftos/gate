@@ -779,7 +779,9 @@ fn found_at_name(folder: &File, name: &str, mut found: File, text: &str) -> Resu
         }
     }
     if metadata.is_dir() && !reparse {
-        return moved_aside(folder, name, &found).map(Found::MovedAside);
+        return moved_aside(folder, name, &found)
+            .map(Found::MovedAside)
+            .map_err(|unmoved| unmoved.why(name));
     }
     gate_win32::delete_opened(&found).map_err(|error| error.to_string())?;
     Ok(Found::Deleted)
@@ -792,18 +794,36 @@ const MOVED_ASIDE_LIMIT: u32 = 100;
 /// `{name}.gate-moved-{n}` beside it, by handle and never replacing what has that name
 /// ([`gate_win32::rename_beneath_no_replace`]), for the first `n` from 1 the rename finds free: the new name. Else why
 /// not: the rename's error, or every `n` up to [`MOVED_ASIDE_LIMIT`] taken.
-pub(super) fn moved_aside(folder: &File, name: &str, found: &File) -> Result<String, String> {
+pub(super) fn moved_aside(folder: &File, name: &str, found: &File) -> Result<String, Unmoved> {
     for n in 1..=MOVED_ASIDE_LIMIT {
         let moved = format!("{name}.gate-moved-{n}");
         match gate_win32::rename_beneath_no_replace(found, folder, &moved) {
             Ok(()) => return Ok(moved),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(format!("cannot move aside the folder {name}: {error}")),
+            Err(error) => return Err(Unmoved::Renamed(error)),
         }
     }
-    Err(format!(
-        "cannot move aside the folder {name}: {name}.gate-moved-1 to {name}.gate-moved-{MOVED_ASIDE_LIMIT} are all taken"
-    ))
+    Err(Unmoved::Taken)
+}
+
+/// Why [`moved_aside`] did not move a folder aside.
+pub(super) enum Unmoved {
+    /// The rename failed with this error.
+    Renamed(io::Error),
+    /// Every name `{name}.gate-moved-{n}` up to [`MOVED_ASIDE_LIMIT`] is taken.
+    Taken,
+}
+
+impl Unmoved {
+    /// The refusal of moving aside the folder `name` for this reason.
+    pub(super) fn why(&self, name: &str) -> String {
+        match self {
+            Unmoved::Renamed(error) => format!("cannot move aside the folder {name}: {error}"),
+            Unmoved::Taken => {
+                format!("cannot move aside the folder {name}: {name}.gate-moved-1 to {name}.gate-moved-{MOVED_ASIDE_LIMIT} are all taken")
+            }
+        }
+    }
 }
 
 /// Removes the entry `path` as itself, never what a link or a junction there leads to: a folder, or a link or a

@@ -30,12 +30,12 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::inputs::{
-    Leftover, SCRATCH_SUFFIX_DIGITS, SHARING_VIOLATION, STAGED_ACCESS, Stage, StageNamed, WorkLock, locked, made_stage_named, not_the_box_s,
-    plain_copy, protected_folder, protected_security, removed_stage, same_stage, staged_files,
+    Leftover, SCRATCH_SUFFIX_DIGITS, STAGED_ACCESS, Stage, StageNamed, WorkLock, locked, made_stage_named, not_the_box_s, plain_copy,
+    protected_folder, protected_security, removed_stage, same_stage, staged_files,
 };
 use crate::boxside::payload::{Payload, escaped, grandparent};
 use crate::boxside::preflight::is_folder_itself;
-use crate::boxside::run::{FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS};
+use crate::boxside::run::{FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS, SHARING_VIOLATION};
 use crate::console::Console;
 use crate::outputs::archive::{Entry, PcFiles, unpack};
 use crate::outputs::hash::{SHA256_DIGITS, is_lower_hex};

@@ -37,7 +37,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use crate::answer::USAGE_STATUS;
 use crate::boxside::payload::{OUTPUTS_NONCE_DIGITS, Payload, escaped, grandparent, ordinal_upper};
 use crate::boxside::preflight::{self, is_folder_itself};
-use crate::boxside::run::{self, FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS};
+use crate::boxside::run::{self, FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS, SHARING_VIOLATION};
 use crate::boxside::tools;
 use crate::console::Console;
 use crate::outputs::archive::{Entry, PcFiles, unpack};
@@ -716,16 +716,15 @@ pub(super) fn protected_security() -> Result<Descriptor, String> {
     gate_win32::protected_descriptor(&facts).map_err(|error| format!("cannot make the box's security: {error}"))
 }
 
-/// The system's error for a file another process holds against the sharing asked for.
-pub(super) const SHARING_VIOLATION: i32 = 32;
-
 /// What [`protected_folder`] does with a folder of its own already at its name whose owner, DACL or label is not the
 /// box's.
 pub(super) enum Leftover<'c> {
     /// Refuses it: it is never walked, emptied or replaced.
     Refuse,
-    /// Moves it aside beside itself, never walked, says so on the console and makes the folder new ([`taken_over`]):
-    /// for the LFS store's `lfs` folder alone, which git-lfs made in a checkout before the box kept the store.
+    /// Moves it aside beside itself, never walked, says so on the console and makes the folder new ([`taken_over`]) when
+    /// it has the security git-lfs's plain `CreateDirectory` gave it ([`gate_win32::is_inheriting_unlabelled`]), and
+    /// refuses any other: for the LFS store's `lfs` folder alone, which git-lfs made in a checkout before the box kept
+    /// the store.
     MoveAside(&'c mut Console),
 }
 
@@ -744,11 +743,19 @@ pub(super) fn protected_folder(root: &File, path: &Path, access: u32, security: 
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(format!("cannot ready {}: {error}", path.display())),
     }
-    match (adopted(&at), leftover) {
+    adopted_or_moved(&at, security, leftover)
+}
+
+/// The folder already at `at`'s name adopted ([`adopted`]); else, under [`Leftover::MoveAside`], one another call holds
+/// adopted once more ([`adopted_again`]), one of git-lfs's leftover security moved aside ([`moved_or_refused`]), and
+/// the folder made new when another call moved it away meanwhile ([`made_or_adopted`]). Else why not.
+fn adopted_or_moved(at: &Beneath<'_>, security: &Descriptor, leftover: Leftover<'_>) -> Result<File, String> {
+    match (adopted(at), leftover) {
         (Ok(found), _) => Ok(found),
-        (Err(Unadopted::Held(_)), Leftover::MoveAside(_)) => adopted_again(&at),
-        (Err(Unadopted::Unprotected), Leftover::MoveAside(console)) => taken_over(&at, security, console),
-        (Err(unadopted), _) => Err(unadopted.why(path)),
+        (Err(Unadopted::Held(_)), Leftover::MoveAside(console)) => adopted_again(at, security, console),
+        (Err(Unadopted::Unprotected), Leftover::MoveAside(console)) => moved_or_refused(at, security, console, false),
+        (Err(Unadopted::Failed(error)), Leftover::MoveAside(_)) if error.kind() == io::ErrorKind::NotFound => made_or_adopted(at, security),
+        (Err(unadopted), _) => Err(unadopted.why(at.path)),
     }
 }
 
@@ -791,6 +798,14 @@ pub(super) fn not_the_box_s(path: &Path) -> String {
     format!("cannot use {}: its owner, DACL or label is not the box's; remove it", path.display())
 }
 
+/// The refusal of the folder at `path`, which another process holds open against its move aside.
+fn held_open(path: &Path) -> String {
+    format!(
+        "cannot use {}: another process holds it open, so the box cannot move it aside; retry, or close what holds it and remove it",
+        path.display()
+    )
+}
+
 /// The folder already at `at`'s name, adopted: opened as itself with its access, no more than reads it and its
 /// security, and kept, as [`protected_folder`] holds it, only when it is a folder of its own whose owner, DACL and label
 /// are those this box makes its folders with ([`gate_win32::is_protected_folder`]), read through that same handle.
@@ -813,29 +828,75 @@ fn adopted(at: &Beneath<'_>) -> Result<File, Unadopted> {
 }
 
 /// The folder at `at` adopted once more ([`adopted`]) after another process held it: another call moving it aside or
-/// making it new. Else why not, a folder still held said as held open by another process.
-fn adopted_again(at: &Beneath<'_>) -> Result<File, String> {
-    adopted(at).map_err(|unadopted| match unadopted {
-        Unadopted::Held(_) => format!(
-            "cannot use {}: another process holds it open, so the box cannot move it aside; remove it",
-            at.path.display()
-        ),
-        other => other.why(at.path),
-    })
+/// making it new. Nothing at the name, as another call moved it away and has not yet made it new, is made new
+/// ([`made_or_adopted`]); a folder still of git-lfs's leftover security is moved aside, with no further retry
+/// ([`moved_or_refused`]). Else why not, a folder still held said as held open by another process.
+fn adopted_again(at: &Beneath<'_>, security: &Descriptor, console: &mut Console) -> Result<File, String> {
+    match adopted(at) {
+        Ok(found) => Ok(found),
+        Err(Unadopted::Held(_)) => Err(held_open(at.path)),
+        Err(Unadopted::Failed(error)) if error.kind() == io::ErrorKind::NotFound => made_or_adopted(at, security),
+        Err(Unadopted::Unprotected) => moved_or_refused(at, security, console, true),
+        Err(other) => Err(other.why(at.path)),
+    }
 }
 
-/// The folder at `at`, whose security is not the box's, taken over once: opened again as itself beneath its held root,
-/// with `DELETE` access and without delete sharing, and checked again through that handle; a folder of its own still
-/// not the box's renamed aside beside itself by that handle ([`preflight::moved_aside`]), never walked, and said on
-/// `console`; then the folder made new with `security` ([`made_or_adopted`]). One another call now holds is adopted
-/// once more ([`adopted_again`]), and one now protected, made new by another call, is adopted. Else why not.
-fn taken_over(at: &Beneath<'_>, security: &Descriptor, console: &mut Console) -> Result<File, String> {
-    let found = match gate_win32::open_beneath_as(at.root, at.name, FILE_GENERIC_READ | DELETE, Share::NoDelete, Make::Open) {
+/// What [`seen_again`] found at a name.
+enum Seen {
+    /// Nothing has the name.
+    Gone,
+    /// A folder of its own with the box's protected security.
+    Protected,
+    /// A folder of its own with the security git-lfs's plain `CreateDirectory` gave it.
+    Leftover,
+    /// A folder of its own of any other security.
+    Other,
+}
+
+/// The folder at `at`'s name, opened as itself only to read it and its security, sharing everything so no other call's
+/// handle stands in its way, judged ([`Seen`]); a link, a junction or not a folder refused. Else why not.
+fn seen_again(at: &Beneath<'_>) -> Result<Seen, String> {
+    let found = match gate_win32::open_beneath_as(at.root, at.name, FILE_GENERIC_READ, Share::All, Make::Open) {
         Ok(found) => found,
-        Err(error) if error.raw_os_error() == Some(SHARING_VIOLATION) => return adopted_again(at),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return made_or_adopted(at, security),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Seen::Gone),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Err(Unadopted::Unopened(error).why(at.path)),
         Err(error) => return Err(Unadopted::Failed(error).why(at.path)),
+    };
+    let cannot = |error: io::Error| Unadopted::Failed(error).why(at.path);
+    if !is_folder_itself(&found).map_err(cannot)? {
+        return Err(Unadopted::NotItself.why(at.path));
+    }
+    if gate_win32::is_protected_folder(&found).map_err(cannot)? {
+        return Ok(Seen::Protected);
+    }
+    if gate_win32::is_inheriting_unlabelled(&found).map_err(cannot)? {
+        return Ok(Seen::Leftover);
+    }
+    Ok(Seen::Other)
+}
+
+/// The folder at `at`, whose security is not the box's, moved aside and made new ([`taken_over`]) when it has git-lfs's
+/// leftover security, `retried` saying whether another call already held it once; one now protected, made new by
+/// another call, adopted, and nothing at the name made new ([`made_or_adopted`]). Any other refused as not the box's.
+fn moved_or_refused(at: &Beneath<'_>, security: &Descriptor, console: &mut Console, retried: bool) -> Result<File, String> {
+    match seen_again(at)? {
+        Seen::Leftover => taken_over(at, security, console, retried),
+        Seen::Protected => adopted(at).map_err(|unadopted| unadopted.why(at.path)),
+        Seen::Gone => made_or_adopted(at, security),
+        Seen::Other => Err(not_the_box_s(at.path)),
+    }
+}
+
+/// The folder at `at`, of git-lfs's leftover security, taken over once: opened again as itself beneath its held root,
+/// with `DELETE` access and without delete sharing, and checked again through that handle; a folder of its own still
+/// of the leftover's security ([`gate_win32::is_inheriting_unlabelled`]) renamed aside beside itself by that handle
+/// ([`preflight::moved_aside`]), never walked, and said on `console`; then the folder made new with `security`
+/// ([`made_or_adopted`]). One now protected, made new by another call, is adopted, and one of any other security
+/// refused. Else why not ([`reopen_failed`]).
+fn taken_over(at: &Beneath<'_>, security: &Descriptor, console: &mut Console, retried: bool) -> Result<File, String> {
+    let found = match gate_win32::open_beneath_as(at.root, at.name, FILE_GENERIC_READ | DELETE, Share::NoDelete, Make::Open) {
+        Ok(found) => found,
+        Err(error) => return reopen_failed(at, security, console, retried, error),
     };
     let cannot = |error: io::Error| Unadopted::Failed(error).why(at.path);
     if !is_folder_itself(&found).map_err(cannot)? {
@@ -845,7 +906,10 @@ fn taken_over(at: &Beneath<'_>, security: &Descriptor, console: &mut Console) ->
         drop(found);
         return adopted(at).map_err(|unadopted| unadopted.why(at.path));
     }
-    let moved = preflight::moved_aside(at.root, at.name, &found).map_err(|why| format!("cannot use {}: {why}", at.path.display()))?;
+    if !gate_win32::is_inheriting_unlabelled(&found).map_err(cannot)? {
+        return Err(not_the_box_s(at.path));
+    }
+    let moved = preflight::moved_aside(at.root, at.name, &found).map_err(|unmoved| unmoved_why(at, &unmoved))?;
     drop(found);
     let line = format!(
         "{}: its owner, DACL or label was not the box's",
@@ -853,6 +917,39 @@ fn taken_over(at: &Beneath<'_>, security: &Descriptor, console: &mut Console) ->
     );
     console.err(&escaped(&line));
     made_or_adopted(at, security)
+}
+
+/// What [`taken_over`] does when its reopen of the folder at `at` with `DELETE` access fails with `error`: another
+/// call holding it adopted once more ([`adopted_again`]) unless `retried` says it already was, and then refused as held
+/// open; nothing at the name made new ([`made_or_adopted`]); else why not.
+fn reopen_failed(at: &Beneath<'_>, security: &Descriptor, console: &mut Console, retried: bool, error: io::Error) -> Result<File, String> {
+    if error.raw_os_error() == Some(SHARING_VIOLATION) {
+        return if retried {
+            Err(held_open(at.path))
+        } else {
+            adopted_again(at, security, console)
+        };
+    }
+    match error.kind() {
+        io::ErrorKind::NotFound => made_or_adopted(at, security),
+        io::ErrorKind::PermissionDenied => Err(format!(
+            "cannot use {}: the box may not move it aside ({error}); remove it",
+            at.path.display()
+        )),
+        _ => Err(Unadopted::Failed(error).why(at.path)),
+    }
+}
+
+/// The refusal of the folder at `at` that [`preflight::moved_aside`] did not move aside for `unmoved`.
+fn unmoved_why(at: &Beneath<'_>, unmoved: &preflight::Unmoved) -> String {
+    match unmoved {
+        preflight::Unmoved::Renamed(error) => format!(
+            "cannot use {}: cannot move aside the folder {} ({error}); retry, or close what holds a file in it and remove it",
+            at.path.display(),
+            at.name
+        ),
+        preflight::Unmoved::Taken => format!("cannot use {}: {}", at.path.display(), unmoved.why(at.name)),
+    }
 }
 
 /// The folder at `at` made new with `security`, or, when another call made it first, adopted ([`adopted`]), never
@@ -1237,12 +1334,14 @@ mod tests {
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
 
-    use gate_win32::{Descriptor, Share, file_id, is_protected_folder, make_folder_beneath, protected_descriptor, same_file, token_facts};
-    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, READ_CONTROL};
+    use gate_win32::{
+        Descriptor, Share, file_id, is_inheriting_unlabelled, is_protected_folder, make_folder_beneath, protected_descriptor, same_file, token_facts,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, READ_CONTROL};
 
     use super::{
-        Asked, Beneath, Copy, Leftover, Record, STAGES_ACCESS, Stage, Stamp, Step, Unadopted, adopted, made_stage, moved_in, not_the_box_s,
-        protected_folder, removed_stage, same_stage, stages_name, swept,
+        Asked, Beneath, Copy, Leftover, Record, STAGES_ACCESS, Stage, Stamp, Step, Unadopted, adopted, adopted_again, made_stage, moved_in,
+        not_the_box_s, protected_folder, removed_stage, same_stage, stages_name, swept,
     };
     use crate::boxside::payload::ordinal_upper;
     use crate::boxside::preflight::written_beneath;
@@ -1614,6 +1713,10 @@ mod tests {
         fs::create_dir_all(left.parent().expect("a folder")).expect("the leftover folder can be made");
         fs::write(&left, "left").expect("a file in it can be written");
         let (old, left_id) = (folder_id(&root.join("lfs")), id_of(&left));
+        assert!(
+            is_inheriting_unlabelled(&held(&root.join("lfs"))).expect("its security can be read"),
+            "the leftover has the security plain CreateDirectory gives: an inheriting DACL and no label"
+        );
         let root_held = held(&root);
 
         let made = protected_folder(
@@ -1699,6 +1802,129 @@ mod tests {
         assert_eq!(id_of(&left), left_id, "the planted file survives as itself");
         assert!(fs::symlink_metadata(root.join("lfs.gate-moved-1")).is_err(), "nothing is moved aside");
         drop(root_held);
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    /// A folder with a protected DACL, as the box or another admin account makes the store, is not the leftover git-lfs
+    /// made, so the move-aside policy refuses it as the refuse policy does.
+    #[test]
+    fn a_protected_folder_that_is_not_the_box_s_is_refused_not_moved() {
+        let folder = folder("leftover-protected");
+        let root = folder.join("root");
+        fs::create_dir_all(&root).expect("the root can be made");
+        let (owner, user, _) = sddl_facts();
+        let unlabelled =
+            Descriptor::from_sddl(&format!("O:{owner}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})")).expect("the SDDL names a descriptor");
+        let root_held = held(&root);
+        drop(make_folder_beneath(&root_held, "lfs", FILE_GENERIC_READ, Share::All, &unlabelled).expect("the folder can be planted"));
+        let old = folder_id(&root.join("lfs"));
+
+        let refused = protected_folder(
+            &root_held,
+            &root.join("lfs"),
+            FILE_GENERIC_READ,
+            &box_security(),
+            Leftover::MoveAside(&mut Console::new()),
+        );
+
+        let why = refused.map(drop).expect_err("the protected folder is refused");
+        assert_eq!(why, not_the_box_s(&root.join("lfs")));
+        assert_eq!(folder_id(&root.join("lfs")), old, "the folder stays as itself");
+        assert!(fs::symlink_metadata(root.join("lfs.gate-moved-1")).is_err(), "nothing is moved aside");
+        drop(root_held);
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_held_open_leftover_is_refused_with_the_held_line() {
+        let folder = folder("leftover-held");
+        let root = folder.join("root");
+        fs::create_dir_all(root.join("lfs")).expect("the leftover folder can be made");
+        let old = folder_id(&root.join("lfs"));
+        let holder = OpenOptions::new()
+            .access_mode(FILE_GENERIC_READ | DELETE)
+            .share_mode(Share::NoDelete.mode())
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(root.join("lfs"))
+            .expect("the leftover can be held with delete access");
+        let root_held = held(&root);
+
+        let refused = protected_folder(
+            &root_held,
+            &root.join("lfs"),
+            FILE_GENERIC_READ,
+            &box_security(),
+            Leftover::MoveAside(&mut Console::new()),
+        );
+
+        let why = refused.map(drop).expect_err("the held leftover is refused");
+        assert_eq!(
+            why,
+            format!(
+                "cannot use {}: another process holds it open, so the box cannot move it aside; retry, or close what holds it and remove it",
+                root.join("lfs").display()
+            )
+        );
+        drop(holder);
+        assert_eq!(folder_id(&root.join("lfs")), old, "the folder stays as itself");
+        assert!(fs::symlink_metadata(root.join("lfs.gate-moved-1")).is_err(), "nothing is moved aside");
+        drop(root_held);
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_planted_moved_aside_name_moves_to_the_next_number() {
+        let folder = folder("leftover-next");
+        let root = folder.join("root");
+        fs::create_dir_all(root.join("lfs")).expect("the leftover folder can be made");
+        let planted = keeping(&root, "lfs.gate-moved-1");
+        let (old, planted_id) = (folder_id(&root.join("lfs")), id_of(&planted.join("keep.txt")));
+        let root_held = held(&root);
+
+        let made = protected_folder(
+            &root_held,
+            &root.join("lfs"),
+            FILE_GENERIC_READ,
+            &box_security(),
+            Leftover::MoveAside(&mut Console::new()),
+        )
+        .expect("the leftover is moved aside to the next name");
+
+        assert!(
+            is_protected_folder(&made).expect("its security can be read"),
+            "the new folder is protected"
+        );
+        assert_eq!(folder_id(&root.join("lfs.gate-moved-2")), old, "the leftover takes the next name");
+        assert_eq!(id_of(&planted.join("keep.txt")), planted_id, "the planted entry stays as itself");
+        assert_eq!(entries(&planted), 1, "nothing is moved into the planted entry");
+        drop((made, root_held));
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    /// Another call moved the leftover aside and has not yet made the folder new: the retry finds nothing at the name
+    /// and makes it.
+    #[test]
+    fn a_leftover_gone_before_the_reopen_is_made_new() {
+        let folder = folder("leftover-gone");
+        let root = folder.join("root");
+        fs::create_dir_all(&root).expect("the root can be made");
+        let root_held = held(&root);
+        let path = root.join("lfs");
+        let at = Beneath {
+            root: &root_held,
+            path: &path,
+            name: "lfs",
+            access: FILE_GENERIC_READ,
+        };
+
+        let made = adopted_again(&at, &box_security(), &mut Console::new()).expect("the folder is made new");
+
+        assert!(
+            is_protected_folder(&made).expect("its security can be read"),
+            "the new folder is protected"
+        );
+        assert!(fs::symlink_metadata(root.join("lfs.gate-moved-1")).is_err(), "nothing is moved aside");
+        drop((made, root_held));
         fs::remove_dir_all(&folder).expect("the folder can be removed");
     }
 

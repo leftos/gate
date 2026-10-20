@@ -1,7 +1,7 @@
 //! The security a folder of this process's is made with, so that from the instant it exists only SYSTEM, Administrators
 //! and this process's user may use it, its owner one of them, and no process below this one's integrity level may
 //! write in it ([`protected_descriptor`], [`Descriptor`]); whether a folder's owner, DACL and label are those
-//! ([`is_protected_folder`]); an open file's DACL and label set back to what its folder hands down
+//! ([`is_protected_folder`]), or those plain `CreateDirectory` gives ([`is_inheriting_unlabelled`]); an open file's DACL and label set back to what its folder hands down
 //! ([`inherit_security`]), and an open file's DACL and label in their string form ([`security_text`]).
 
 use std::fs::File;
@@ -15,8 +15,8 @@ use windows_sys::Win32::Security::Authorization::{
     SE_FILE_OBJECT, SetSecurityInfo,
 };
 use windows_sys::Win32::Security::{
-    ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, InitializeAcl, LABEL_SECURITY_INFORMATION, OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, InitializeAcl, LABEL_SECURITY_INFORMATION,
+    OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows_sys::core::PWSTR;
 
@@ -191,8 +191,32 @@ pub fn security_text(file: &File) -> io::Result<String> {
     text_of(file, DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION)
 }
 
+/// Whether the open folder `folder`, opened with `READ_CONTROL`, has the security a folder made with plain
+/// `CreateDirectory` gets from a parent that hands no label down: a DACL that is not protected, so it takes what its
+/// folder hands down, and no mandatory label. Read through the handle, as [`is_protected_folder`] reads its own.
+///
+/// # Errors
+///
+/// The system's error when the folder's security cannot be read.
+pub fn is_inheriting_unlabelled(folder: &File) -> io::Result<bool> {
+    with_security(folder, DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION, |descriptor| {
+        let (mut control, mut revision) = (0_u16, 0_u32);
+        // SAFETY: `descriptor` is valid for the call, and `control` and `revision` are writable.
+        if unsafe { GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let labelled = descriptor_text(descriptor, LABEL_SECURITY_INFORMATION)?.contains('(');
+        Ok(control & SE_DACL_PROTECTED == 0 && !labelled)
+    })
+}
+
 /// What `what` names of the open `file`'s security, in its string form.
 fn text_of(file: &File, what: OBJECT_SECURITY_INFORMATION) -> io::Result<String> {
+    with_security(file, what, |descriptor| descriptor_text(descriptor, what))
+}
+
+/// What `read` makes of what `what` names of the open `file`'s security, read with `GetSecurityInfo` and freed after.
+fn with_security<T>(file: &File, what: OBJECT_SECURITY_INFORMATION, read: impl FnOnce(PSECURITY_DESCRIPTOR) -> io::Result<T>) -> io::Result<T> {
     let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
     // SAFETY: the handle is open for the whole call, `descriptor` is writable, and no single list is asked for.
     let error = unsafe {
@@ -210,10 +234,10 @@ fn text_of(file: &File, what: OBJECT_SECURITY_INFORMATION) -> io::Result<String>
     if error != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(error.cast_signed()));
     }
-    let text = descriptor_text(descriptor, what);
+    let read = read(descriptor);
     // SAFETY: the descriptor was allocated by `GetSecurityInfo` with `LocalAlloc`, and nothing uses it after this.
     unsafe { LocalFree(descriptor) };
-    text
+    read
 }
 
 /// What `what` names of `descriptor`, in its string form.

@@ -87,8 +87,8 @@ pub use file::{
     on_network_volume, open_beneath, open_beneath_as, rename_beneath, rename_beneath_no_replace, reopen_through_filter, same_file,
 };
 pub use security::{
-    Descriptor, box_job_descriptor, inherit_security, is_protected_file, is_protected_folder, protected_descriptor, security_text,
-    without_auto_inherit,
+    Descriptor, box_job_descriptor, inherit_security, is_inheriting_unlabelled, is_protected_file, is_protected_folder, protected_descriptor,
+    security_text, without_auto_inherit,
 };
 pub use thread::cancel_synchronous_io;
 pub use tree::{Membership, OpenedJob, StoppableProcess, WaitableProcess};
