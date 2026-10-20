@@ -41,7 +41,8 @@ whole, so the words are read from the argv in that case.
 
 Usage: pwsh tools/gate.ps1 -Log <path> -TimeoutSeconds <n> -Slot heavy|light|critical|none [-StallSeconds <n>] [-Tail <n>]
            [-NoMarkers] [-Local] [-Alone] [-Reason "<why>"] [-Cd <folder>] [-Env NAME=value] -- <command> [args...]
-       pwsh tools/gate.ps1 run --log <path> --timeout <n> --slot heavy|light|critical|none [--alone] [--reason "<why>"] [options] -- <command> [args...]
+       pwsh tools/gate.ps1 run --log <path> --timeout <n> --slot heavy|light|critical|none [--alone] [--reason "<why>"]
+           [options] -- <command> [args...]
        pwsh tools/gate.ps1 -StopTree <pid>
        pwsh tools/gate.ps1 stop-tree <pid>
 #>
@@ -54,7 +55,8 @@ $PSNativeCommandUseErrorActionPreference = $false
 $usage = @(
     'usage: pwsh tools/gate.ps1 -Log <path> -TimeoutSeconds <n> -Slot heavy|light|critical|none [-StallSeconds <n>] [-Tail <n>] ' +
     '[-NoMarkers] [-Local] [-Alone] [-Reason "<why>"] [-Cd <folder>] [-Env NAME=value] -- <command> [args...]'
-    '       pwsh tools/gate.ps1 run --log <path> --timeout <n> --slot heavy|light|critical|none [--alone] [--reason "<why>"] [options] -- <command> [args...]'
+    '       pwsh tools/gate.ps1 run --log <path> --timeout <n> --slot heavy|light|critical|none [--alone] [--reason "<why>"] ' +
+    '[options] -- <command> [args...]'
     '       pwsh tools/gate.ps1 -StopTree <pid>'
     '       pwsh tools/gate.ps1 stop-tree <pid>'
 )
