@@ -6,16 +6,13 @@
 
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
-- [ ] GATE-427 Route herdr-gpui's Credential Manager tests and godot-mcp's GL tests over the desktop route — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [/] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
-- [/] GATE-440 Map and trial routing all of herdr-gpui's, yaat-server's and agent-park's heavy work — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [!] GATE-468 Route Unreal Engine packaging to the builder with an unreal toolchain pin — High · Remote
-- [ ] GATE-539 Route the itest headless group where a desktop is available — High · Remote
-- [ ] GATE-541 Bring a routed formatter's rewrites back, or refuse to route it — High · Remote
-- [ ] GATE-542 Repair a builder work folder a killed run left with an unmappable runtimeconfig.json — High · Remote
-- [ ] GATE-544 Bring back the TRX files a routed test run writes — High · Remote
+- [/] GATE-542 Repair a builder work folder a killed run left with an unmappable runtimeconfig.json — High · Remote
+- [ ] GATE-554 Bring a failed routed run's test reports back — High · Remote
+- [ ] GATE-557 Keep parallel test gates from building one tree at once after a dropped --no-build — High · Remote
 
 ## Remote
 
@@ -157,6 +154,10 @@
 - [ ] GATE-546 Strip the box's gate: prefix from a routed outputs failure line
 - [ ] GATE-547 Report or prune the box's moved-aside LFS folders
 - [ ] GATE-548 Run the netfx-sdk probe under the batch deadline and keep a failed read's reason
+- [ ] GATE-553 Say a routed run's sync-back when its tree came back unchanged
+- [ ] GATE-555 Check whether a local kill mid-build leaves half-written outputs in a worktree
+- [/] GATE-556 Give a pair's first routed run the cold ceiling raise, or say it has none
+- [ ] GATE-558 Find why the LFS back-commit sync-back case exits -1 under load
 
 ## Design
 
