@@ -26,7 +26,9 @@ use crate::remote::payload::{self, Location};
 use crate::remote::toolchain::{self, Reported};
 use crate::remote::transport::ssh::Ssh;
 use crate::remote::transport::{Program, Transport, Wire};
-use crate::remote::{BOX_USAGE, CREATED, NOT_RECOGNIZED, SSH_FAILED, Warm, install_why, other_build, sdks_of, their_version, warm_of};
+use crate::remote::{
+    BOX_USAGE, CREATED, NOT_RECOGNIZED, SSH_FAILED, Warm, install_why, other_build, root_busy_why, root_why, sdks_of, their_version, warm_of,
+};
 use crate::route;
 use gate_desktop::version::build_version;
 
@@ -162,6 +164,7 @@ fn asked(transport: &dyn Transport, host: &str, place: &Place, bound: Duration) 
     checked.read_from = warmed.declarations.read_from;
     checked.shadowed = warmed.declarations.shadowed;
     checked.declarations_problem = warmed.declarations.problem;
+    checked.root_problem = root_problem(&heard);
     Ok(Asked { checked, key })
 }
 
@@ -289,7 +292,8 @@ fn heard(output: &ProgramOutput) -> Heard {
 
 /// The one line of a builder `host`, whose root is `root`, that cannot be checked, as its call `heard` ended: ssh's
 /// failure, a builder with no `gate box` that takes the call, a preflight that failed, or a builder that runs another
-/// gate build than this PC's; `None` for one that answered.
+/// gate build than this PC's; `None` for one that answered, and for one whose box refused its work root, which the
+/// report says as an item ([`root_problem`]).
 fn refusal(host: &str, root: &str, heard: &Heard) -> Option<String> {
     let last = heard.last_error.as_deref().map(|line| git::failure_text(&[line]));
     let said = heard.lines.iter().chain(&heard.errors).map(String::as_str);
@@ -298,6 +302,9 @@ fn refusal(host: &str, root: &str, heard: &Heard) -> Option<String> {
             "check: {host}: its gate install is not trusted ({}); reinstall with gate push",
             escaped(why)
         ));
+    }
+    if root_problem(heard).is_some() {
+        return None;
     }
     match heard.status {
         Some(0) => {}
@@ -320,6 +327,18 @@ fn refusal(host: &str, root: &str, heard: &Heard) -> Option<String> {
     }
     let ours = build_version();
     other_build(their_version(&heard.lines), &ours).map(|theirs| format!("check: {host}: runs gate {theirs}, this PC runs {ours}; run gate push"))
+}
+
+/// Why the builder's box refused its work root as its call `heard` ended, as the client reads the refusal: not locked
+/// down, the box's why naming the installer step that locks it ([`root_why`]), or busy, its why naming none
+/// ([`root_busy_why`]); `None` for a call that refused neither.
+fn root_problem(heard: &Heard) -> Option<String> {
+    let status = heard.status?;
+    let said = || heard.lines.iter().chain(&heard.errors).map(String::as_str);
+    if let Some(why) = root_why(status, said()) {
+        return Some(format!("the work root is not locked down: {why}"));
+    }
+    root_busy_why(status, said()).map(|why| format!("the work root is busy: {why}"))
 }
 
 /// The preflight's answer: the builder `host`, the tools `sent` in its `Needs`, the lines its standard output said, and
@@ -370,6 +389,7 @@ impl Answer<'_> {
             workloads: declared.manifest.workloads,
             consent_problem: None,
             hooks_problem: None,
+            root_problem: None,
             read_from: Vec::new(),
             shadowed: Vec::new(),
             declarations_problem: None,
@@ -416,13 +436,13 @@ mod tests {
     use gate_state::v1::{self, WarmRecord, WarmState};
     use jiff::Timestamp;
 
-    use super::{Answer, Failure, Heard, builder_warmth, failure, refusal, warm_items};
+    use super::{Answer, Failure, Heard, builder_warmth, failure, refusal, root_problem, warm_items};
     use crate::check::local::{Consent, Declarations, Declared, SiblingsFile, WarmSources};
     use crate::check::report::{At, Checked, Line, Sdk, Warmup, said};
     use crate::remote::git::GitError;
-    use crate::remote::install_untrusted_line;
     use crate::remote::parity::pin_of;
     use crate::remote::toolchain::{self, Manifest, Pin, Reported, ToolNeed, Version};
+    use crate::remote::{install_untrusted_line, root_busy_line, root_unsafe_line};
     use gate_desktop::version::build_version;
 
     const HOST: &str = "builder-1";
@@ -838,6 +858,85 @@ mod tests {
             ),
             "every line is read, as the client reads them, not the last alone"
         );
+    }
+
+    /// A box that refused its work root, as unsafe or as busy, ends no check: the report says it as an item. Another
+    /// status with the same line is a failed preparation.
+    #[test]
+    fn a_box_that_refuses_its_work_root_is_no_refusal_of_the_check() {
+        let root = r"D:\gate-remote";
+        let version = format!("gate: remote version {}", build_version());
+        let unsafe_root = root_unsafe_line(r"D:\gate-remote lets S-1-5-11 add files to it");
+        let busy_root = root_busy_line(r"D:\gate-remote is open in another process; retry when it is closed");
+        for line in [unsafe_root.as_str(), busy_root.as_str()] {
+            assert_eq!(refusal(HOST, root, &heard(Some(1), lines(&[&version]), Some(line))), None, "{line}");
+            assert_eq!(
+                refusal(HOST, root, &heard(Some(3), Vec::new(), Some(line))),
+                Some(format!(r"check: builder-1: preparing D:\gate-remote failed (status 3): {line}")),
+                "{line}"
+            );
+        }
+    }
+
+    /// A box's refusal of its work root is said as the report's problem: unsafe with the installer step, busy with
+    /// none; another status, the install refusal or no refusal is none.
+    #[test]
+    fn a_box_that_refuses_its_work_root_is_said_as_its_problem() {
+        let version = format!("gate: remote version {}", build_version());
+        let unsafe_root = root_unsafe_line(r"D:\gate-remote lets S-1-5-11 add files to it");
+        let busy_root = root_busy_line(r"D:\gate-remote is open in another process; retry when it is closed");
+        assert_eq!(
+            root_problem(&heard(Some(1), lines(&[&version]), Some(&unsafe_root))),
+            Some(
+                "the work root is not locked down: D:\\gate-remote lets S-1-5-11 add files to it; run the installer's \
+                 \"Gate work root\" step (install-toolchains.ps1 -Only \"Gate work root\")"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            root_problem(&heard(Some(1), lines(&[&version]), Some(&busy_root))),
+            Some(r"the work root is busy: D:\gate-remote is open in another process; retry when it is closed".to_owned())
+        );
+        assert_eq!(root_problem(&heard(Some(3), Vec::new(), Some(&unsafe_root))), None, "another status");
+        assert_eq!(root_problem(&heard(None, Vec::new(), Some(&busy_root))), None, "no status");
+        let install = install_untrusted_line(r"C:\gate\gate.exe is owned by S-1-5-21-1, not SYSTEM");
+        assert_eq!(root_problem(&heard(Some(1), Vec::new(), Some(&install))), None, "the install refusal");
+        assert_eq!(root_problem(&heard(Some(0), lines(&[&version]), None)), None, "an answer");
+    }
+
+    /// A builder that refused its work root answered no probe and read no warm-up: its pinned godot is skipped, not
+    /// missing, and the builder's warm-up is not said, so only the root counts as missing.
+    #[test]
+    fn a_refused_work_root_skips_every_tool_and_the_builder_s_warm_up() {
+        let Some(pin) = Pin::parse("4.7.2") else {
+            unreachable!("4.7.2 is a pin");
+        };
+        let (root, state) = warm_scratch("refused-root");
+        let version = format!("gate: remote version {}", build_version());
+        let line = root_unsafe_line(r"D:\gate-remote lets S-1-5-11 add files to it");
+        let refused = heard(Some(1), lines(&[&version]), Some(&line));
+        let mut pinned = declared(vec![need("godot", "4.7.2")], None);
+        pinned.godot = Some(vec![pin]);
+        let mut problems = Vec::new();
+        let mut refusing = checked(pinned, &["godot"], &refused.lines, refused.last_error.as_deref());
+        refusing.root_problem = root_problem(&refused);
+        refusing.warmup = warm_items(&root, consenting(&state), HOST, &refused.lines, &mut problems).items;
+
+        assert_eq!(
+            said(AT, &refusing).lines,
+            [
+                Line::Out("check: builder-1: app (work folder app-1a2b3c4d)".to_owned()),
+                Line::Out("check: builder-1: godot skipped: the builder gave no answer".to_owned()),
+                Line::Out(
+                    "check: builder-1: the work root is not locked down: D:\\gate-remote lets S-1-5-11 add files to it; run \
+                     the installer's \"Gate work root\" step (install-toolchains.ps1 -Only \"Gate work root\")"
+                        .to_owned()
+                ),
+                Line::Out("check: builder-1: 1 missing, 0 too old, 1 skipped".to_owned()),
+            ]
+        );
+        assert_eq!(said(AT, &refusing).status, 1);
+        assert!(problems.is_empty(), "{problems:?}");
     }
 
     /// An ssh that exits 255 with nothing on its standard error still says why the builder is unreachable.

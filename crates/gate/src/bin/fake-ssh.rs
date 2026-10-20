@@ -12,7 +12,8 @@
 //!
 //! `ok` runs `<gate> box <verb> --stdin` with the gate the variable `GATE_FAKE_SSH_GATE` names, a `run` or `lfs` call
 //! given the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`, when set, before its verb as box seams, and a `preflight` call
-//! those of `GATE_FAKE_SSH_PREFLIGHT_SEAMS` the same way, or `git
+//! those of `GATE_FAKE_SSH_PREFLIGHT_SEAMS` the same way, then `--test-box-root-walk-stop <folder>` when the variable
+//! `GATE_FAKE_SSH_ROOT_WALK_STOP` names the folder, one path never split, or `git
 //! upload-pack <path>` or `git receive-pack <path>`, or a push call's words with this PC's `pwsh`, its `LOCALAPPDATA`
 //! the folder named as the host, the word before the line, in the folder the variable `GATE_FAKE_SSH_BUILDERS` names,
 //! made when missing, fed this process's standard input, which it reads whole first and keeps as `<steps file>.input`;
@@ -438,6 +439,11 @@ impl<'a> BoxCall<'a> {
         };
         if let Some(name) = seams {
             command.args(seams_of(name)?.split_whitespace());
+        }
+        if self.verb == "preflight"
+            && let Some(stop) = std::env::var_os("GATE_FAKE_SSH_ROOT_WALK_STOP")
+        {
+            command.arg("--test-box-root-walk-stop").arg(stop);
         }
         command.args([self.verb, self.rest]);
         Ok(command)

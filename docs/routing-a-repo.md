@@ -62,6 +62,10 @@ This repo's `tools/builder/install-toolchains.ps1` does the rest: the toolchains
   The step logs `event source gate-prune: already registered` or `registered in the Application log`, and `task \build-box\gate-prune-work registered: ...`, adding that the task `will fail until a gate push installs C:\Program Files\gate\bin\gate.exe` when that exe is not there yet.
 - **Gate work root:** the step refuses a root that is a link (reparse point) or a file. When the root's security is not already right it sets the owner to Administrators (`icacls /setowner *S-1-5-32-544`) and applies a protected DACL: SYSTEM, Administrators and the builder user with full control, inherited by objects and containers, no mandatory label.
 
+  The box's preflight judges the same state before it touches anything and refuses a root another account may write in, a folder above it another account may delete, a reparse point at the root or its parent, a `subst` drive and a network volume.
+
+  It says `gate: the builder's work root is not locked down: <why>; run the installer's "Gate work root" step (install-toolchains.ps1 -Only "Gate work root")`, and a routed run then runs here (`gate check --builder` says it as a missing item). A root open in another process with delete access is only busy: retry when it is closed.
+
   It then reads the security back and fails unless it is exactly that, owner included; when it already is, it logs `already protected` and changes nothing. A routed command's restricted token passes access checks through the builder user's own SID, so neither Authenticated Users nor Users needs a grant.
 - **claude-config's `C:\build-box` rules:** its provisioning re-asserts the `C:\build-box` DACL on every run and strips explicit ACEs under it. The gate half therefore re-applies anything it needs under `C:\build-box\gate` on every run: an ACE set on the root that inherits survives, an explicit ACE on a child does not.
 

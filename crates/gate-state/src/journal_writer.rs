@@ -257,6 +257,8 @@ pub enum FallbackReason {
     Install,
     /// The run's Git LFS content could not be sent to the builder, or the builder's store did not hold it at the run.
     Lfs,
+    /// The builder's work root is not locked down, or another process holds it open.
+    Root,
 }
 
 impl FallbackReason {
@@ -278,6 +280,7 @@ impl FallbackReason {
             FallbackReason::Desktop => "desktop",
             FallbackReason::Install => "install",
             FallbackReason::Lfs => "lfs",
+            FallbackReason::Root => "root",
         }
     }
 }

@@ -63,7 +63,7 @@ use super::watchdog::{self, Cut, Kept, Kill, LINE_CAP};
 use super::worktree_lock::{self, Folder, Locked, Wait};
 use super::{
     BoxKill, FAILED, FAILED_RUN, INSTALL_UNTRUSTED, KeyWait, REFUSED, Refusal, RemoteCall, RemoteClient, RemoteOutcome, Split, WarmEnd, Warmth,
-    adjusted_prefix, install_why, killed_line, refused_line, started_line,
+    adjusted_prefix, install_why, killed_line, refused_line, root_busy_why, root_why, started_line,
 };
 use crate::boxside::outputs::{NAMES_SKIPPED, OUTPUTS_BUDGET};
 use crate::boxside::payload::{PairRefused, Payload, escaped};
@@ -1871,12 +1871,12 @@ impl Attempt<'_, '_> {
         let sdks = sdks_of(&called.lines);
         let tools = toolchain::reported(&called.lines, &sent);
         let host = self.call.host;
-        let not_installed = install_refused(host, &called);
+        let refused = preflight_refusal(host, &called);
         self.lines.append(&mut called.lines);
         self.not_started_if_killed("the preflight", &called)?;
-        if let Some(line) = not_installed {
+        if let Some((line, reason)) = refused {
             self.say(line);
-            return Err(End::Refused(FallbackReason::Install));
+            return Err(End::Refused(reason));
         }
         match called.status {
             0 => {}
@@ -4512,6 +4512,29 @@ fn install_refused(host: &str, called: &Called) -> Option<String> {
     install_refusal(host, called.status, called.lines.iter().chain(&called.last_error).map(String::as_str))
 }
 
+/// The line refusing a builder `host` whose box refused the preflight call `called`, and the reason the run falls back
+/// for: its install, read first ([`install_refused`]), then its work root ([`root_refused`]); `None` for any other call.
+fn preflight_refusal(host: &str, called: &Called) -> Option<(String, FallbackReason)> {
+    install_refused(host, called)
+        .map(|line| (line, FallbackReason::Install))
+        .or_else(|| root_refused(host, called).map(|line| (line, FallbackReason::Root)))
+}
+
+/// The line refusing a builder `host` whose box refused its work root in the preflight call `called`: one that exited
+/// [`super::ROOT_STATUS`] having said, before any start marker, that the root is not locked down ([`root_why`]),
+/// which names the installer step that locks it, or that another process holds it open ([`root_busy_why`]), which
+/// names none. `None` for any other call, and for an older box, which says neither.
+fn root_refused(host: &str, called: &Called) -> Option<String> {
+    if called.started {
+        return None;
+    }
+    let said = || called.lines.iter().chain(&called.last_error).map(String::as_str);
+    if let Some(why) = root_why(called.status, said()) {
+        return Some(format!("gate: not routed: {host}'s work root is not locked down: {}", escaped(why)));
+    }
+    root_busy_why(called.status, said()).map(|why| format!("gate: not routed: {host}'s work root is busy: {}", escaped(why)))
+}
+
 /// [`install_refused`] for the run call, whose lines before the start marker relay the work folder's checkout, restore
 /// and hooks: the plain line counts only as the call's one line, as the box says it when it refuses before reading the
 /// run's request. Once it has read it, the box refuses for its install with the run's `install` refusal tag instead.
@@ -4690,8 +4713,8 @@ mod tests {
         Attempt, CallEnd, Called, Capped, Cut, Echo, End, GIT_SSH_FAILED, Heard, LINE_CAP, Limits, Loss, NonZeroU64, OUTPUTS_BUDGET, OneCall,
         ProtocolLines, Push, Raised, Reader, Reading, RustClient, SSH_FAILED, Shared, Split, Ssh, Unfinished, Watch, Watching, after_loss, boot_time,
         called_of, console_of, held, install_refusal, install_refused, install_tag_refusal, install_why, is_heartbeat, last_update,
-        local_sdk_listing, path_outside, paused, push_size, relay, relay_raw, relayed_raw, run_install_refused, sdks_of, seconds, their_version,
-        version_refusal,
+        local_sdk_listing, path_outside, paused, preflight_refusal, push_size, relay, relay_raw, relayed_raw, root_refused, run_install_refused,
+        sdks_of, seconds, their_version, version_refusal,
     };
     use super::{CSPROJ_BYTES, CSPROJ_FILES, Entry, csproj_pins, entries_of, manifest_entry, small_blobs_of};
     use super::{KeyHold, RunEnd, Warm, cold_line, hold_key, hold_key_waiting, new_work_tree, status_end, warm_end, warm_of};
@@ -4706,7 +4729,7 @@ mod tests {
     use crate::remote::transport::{Local, Transport};
     use crate::remote::watchdog::{self, Kill, LOG_CAP};
     use crate::remote::worktree_lock::tests::{held_elsewhere, lock_name};
-    use crate::remote::{INSTALL_UNTRUSTED, install_untrusted_line};
+    use crate::remote::{INSTALL_UNTRUSTED, ROOT_UNSAFE, install_untrusted_line, root_busy_line, root_unsafe_line};
     use crate::remote::{Refusal, RemoteCall, RemoteClient, Sibling, WarmEnd, Warmth, adjusted_line, busy_line, carried, refused_line, started_line};
     use crate::run::CONTROL_C_EXIT;
     use gate_state::v1::WarmFailure;
@@ -6875,6 +6898,61 @@ mod tests {
             install_refused("builder", &after),
             None,
             "a command's own line after the start is its output"
+        );
+    }
+
+    /// A preflight whose box refused its work root, unsafe or busy, at status 1 and before any start marker is not
+    /// routed, saying the box's why escaped; any other status, or a line after the marker, is no root refusal.
+    #[test]
+    fn a_box_that_refuses_its_work_root_is_not_routed_with_its_why() {
+        let unsafe_line = root_unsafe_line(r"D:\gate-remote lets S-1-5-11 add files to it");
+        let busy_line = root_busy_line(r"D:\gate-remote is open in another process; retry when it is closed");
+        let (unsafe_root, _) = run_call_ended("", &format!("{unsafe_line}\n"), 1, "root-unsafe");
+        let (busy_root, _) = run_call_ended("", &format!("{busy_line}\n"), 1, "root-busy");
+        let (other_status, _) = run_call_ended("", &format!("{unsafe_line}\n"), 2, "root-other-status");
+        let (after, _) = run_call_ended("", &format!("{}\n{unsafe_line}\n", started_line(NONCE)), 1, "root-after");
+        let (control, _) = run_call_ended("", &format!("{ROOT_UNSAFE}a\u{1b}b\n"), 1, "root-control");
+
+        assert_eq!(
+            root_refused("builder", &unsafe_root),
+            Some(
+                "gate: not routed: builder's work root is not locked down: D:\\gate-remote lets S-1-5-11 add files to it; \
+                 run the installer's \"Gate work root\" step (install-toolchains.ps1 -Only \"Gate work root\")"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            root_refused("builder", &busy_root),
+            Some(r"gate: not routed: builder's work root is busy: D:\gate-remote is open in another process; retry when it is closed".to_owned())
+        );
+        assert_eq!(root_refused("builder", &other_status), None, "only status 1 is the refusal");
+        assert_eq!(
+            root_refused("builder", &after),
+            None,
+            "a command's own line after the start is its output"
+        );
+        assert_eq!(
+            root_refused("builder", &control),
+            Some(r"gate: not routed: builder's work root is not locked down: a\u{1b}b".to_owned()),
+            "the box's why is escaped"
+        );
+    }
+
+    /// A preflight whose box said both its install refusal and a root refusal falls back for its install, read first.
+    #[test]
+    fn the_install_refusal_is_read_before_the_root_refusal() {
+        let install = install_untrusted_line("the helper is owned by S-1-5-21-1");
+        let root = root_unsafe_line(r"D:\gate-remote is a reparse point");
+        let (both, _) = run_call_ended("", &format!("{root}\n{install}\n"), 1, "root-and-install");
+        let (root_alone, _) = run_call_ended("", &format!("{root}\n"), 1, "root-alone");
+
+        assert_eq!(
+            preflight_refusal("builder", &both).map(|(_, reason)| reason),
+            Some(FallbackReason::Install)
+        );
+        assert_eq!(
+            preflight_refusal("builder", &root_alone).map(|(_, reason)| reason),
+            Some(FallbackReason::Root)
         );
     }
 

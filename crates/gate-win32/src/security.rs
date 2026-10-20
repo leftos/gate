@@ -57,15 +57,17 @@ impl Drop for Descriptor {
     }
 }
 
-/// The SDDL of the security a folder of this process's is made with, for this process's `user` SID, integrity relative
-/// ID `integrity` and elevation `elevated`: owned by Administrators when elevated and by `user` when not, a protected
-/// DACL granting full control to SYSTEM, Administrators and `user`, handed down to files and folders, and a label of
-/// the integrity level that no lower process may write up past, handed down too. The label is not marked protected:
-/// a creation descriptor with a protected SACL needs `SeSecurityPrivilege`, which an unelevated box lacks, and a label
-/// a folder above hands down does not join a label given at creation.
-fn protected_sddl(user: &str, integrity: u32, elevated: bool) -> String {
+/// The SDDL of the security a folder of this process's is made with, for this process's `user` SID, elevation
+/// `elevated` and, when given, integrity relative ID `integrity`: owned by Administrators when elevated and by `user`
+/// when not, a protected DACL granting full control to SYSTEM, Administrators and `user`, handed down to files and
+/// folders, and, with an integrity, a label of that level that no lower process may write up past, handed down too;
+/// without one, no label, as the box's work root is made. The label is not marked protected: a creation descriptor
+/// with a protected SACL needs `SeSecurityPrivilege`, which an unelevated box lacks, and a label a folder above hands
+/// down does not join a label given at creation.
+pub(crate) fn protected_sddl(user: &str, elevated: bool, integrity: Option<u32>) -> String {
     let owner = if elevated { "BA" } else { user };
-    format!("O:{owner}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})S:(ML;OICI;NW;;;S-1-16-{integrity})")
+    let label = integrity.map_or_else(String::new, |integrity| format!("S:(ML;OICI;NW;;;S-1-16-{integrity})"));
+    format!("O:{owner}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user}){label}")
 }
 
 /// The security a folder of the process whose token says `facts` is made with, so that no other account and no lower
@@ -80,7 +82,7 @@ fn protected_sddl(user: &str, integrity: u32, elevated: bool) -> String {
 ///
 /// The system's error when the descriptor cannot be made.
 pub fn protected_descriptor(facts: &TokenFacts) -> io::Result<Descriptor> {
-    Descriptor::from_sddl(&protected_sddl(&facts.user, facts.integrity, facts.elevated))
+    Descriptor::from_sddl(&protected_sddl(&facts.user, facts.elevated, Some(facts.integrity)))
 }
 
 /// The SDDL of the security a box run's job is made with, for the box's `user` SID and elevation `elevated`: a

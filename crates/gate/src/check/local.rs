@@ -318,6 +318,7 @@ fn checked(place: &Place, limit: Duration, netfx_key: Option<&str>) -> Checked {
         workloads: declared.manifest.workloads,
         consent_problem,
         hooks_problem,
+        root_problem: None,
         siblings,
         created: Vec::new(),
         siblings_skipped: false,

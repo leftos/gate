@@ -411,6 +411,10 @@ On stdout, each line prefixed `check: <host>: `, in this order:
 2. `check: <host>: created <folder>` for each folder the preflight made, at most 20, then `check: <host>: and <n> more created folders`.
 3. The items, worded as on this PC with `<host>` for `here`: the SDK reads `.NET SDK <version> (rollForward <policy>) missing (<host> has <list>)`, the list cut at 20 entries and then `, and <n> more`; `.NET SDK skipped: <host> sent no SDK list`, with `: <last stderr line>` when there is one; a tool that did not answer is `check: <host>: <tool> skipped: the builder gave no answer`; the workloads are `not checked yet`.
 
+   A builder whose box refused its work root (Work root in [The box side](#the-box-side)) adds one more item after the `remote.json` consent and hooks items, `check: <host>: the work root is not locked down: <why>; run the installer's "Gate work root" step (install-toolchains.ps1 -Only "Gate work root")` or `check: <host>: the work root is busy: <why>`, counted missing, so the check exits 1.
+
+   That builder answered no probe and read no warm-up, so every tool is then said `<tool> skipped: the builder gave no answer` and no builder warm-up item is said.
+
    `git-lfs` at 3.1.3 or later (or the manifest's higher minimum) is an item like any tool when a `.gitattributes` git tracks in the worktree, at any depth, names the LFS filter, judged as routing judges it.
 4. The warm-up's items, as on this PC ([The warm-up items](#the-warm-up-items)) and this PC's own: the lock is probed before the record is read, as the route does, and the record is said only when it names `<host>` or cannot be read (`check: <host>: warm-up: the warm-up record <path> cannot be read: <error>`, with the suffix above, only informing), and with consent and a warm-up file that parsed, `check: <host>: warm-up: the work folder is warm` (ok) when the preflight's `gate: remote warm` line holds the hash of the worktree's file, else `check: <host>: warm-up: the work folder is not warm` (only informs).
 5. The install hints `install: <host>: <tool>: <command>`: `cargo install cargo-nextest --locked`, `npm install -g pnpm@<min>` (`npm install -g pnpm` with no minimum), `rustup toolchain install <min> && rustup default <min>`, `dotnet-install.ps1 -Version <v>`, and for node, pwsh, ffmpeg and a rust with no minimum a hint that names `tools/builder/install-toolchains.ps1` and points to [routing-a-repo.md, Builder setup](routing-a-repo.md#builder-setup).
@@ -646,7 +650,7 @@ The lines of a run that starts its command:
 
   The line names each sibling in declared order with its root as routing spells it. While it waits for a remote slot: `gate: waiting for a remote slot on <host> (<n> busy)` and `gate: still waiting for a remote slot on <host> (<s> s)`, as a local wait says them, ETA included.
 
-  A run the builder does not take says why and goes on here: `gate: remote <host> <reason>; running here`, with `<reason>` one of `full` (no remote slot within 60 s), `busy`, `unreachable`, `parity`, `rebooted`, `tools`, `layout`, `version`, `inputs` (the run's ignored inputs could not be sent, or the builder's work folder no longer held them at the run), `lfs` (the run's Git LFS content could not be sent or listed, or the builder could not hold it or make the run's LFS scratch folder), `desktop` (the builder could not give the run its desktop) or `install` (the builder's gate is not installed where only administrators can change it), and `gate: remote <host> client could not start: <detail>; running here` when the remote client cannot start.
+  A run the builder does not take says why and goes on here: `gate: remote <host> <reason>; running here`, with `<reason>` one of `full` (no remote slot within 60 s), `busy`, `unreachable`, `parity`, `rebooted`, `tools`, `layout`, `version`, `inputs` (the run's ignored inputs could not be sent, or the builder's work folder no longer held them at the run), `lfs` (the run's Git LFS content could not be sent or listed, or the builder could not hold it or make the run's LFS scratch folder), `desktop` (the builder could not give the run its desktop), `install` (the builder's gate is not installed where only administrators can change it) or `root` (the builder's work root is not locked down, or another process holds it open), and `gate: remote <host> client could not start: <detail>; running here` when the remote client cannot start.
 
   A `layout` fallback removes the worktree's warm-up record, but only while it is the `warm` record of the builder the run went to, for the warm-up file on disk, under the remote key; another builder's record and the other fallbacks keep it.
 
@@ -1041,7 +1045,7 @@ Fields beyond J1's:
   `transfer-timed-out` is a routed run's fetch after the command cut at its transfer ceiling.
 
   A routed run is a kill only when the gate killed it; a command that exits 124 on its own is `failed`.
-- `fallback`: `reason`, one of `full` (no remote slot within the 60 s wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `layout` (the box could not clear or lay out its work folder), `version` ([The box side](#the-box-side)), `client` (the remote client could not start, as when it finds no usable ssh), `inputs` (the run's ignored inputs could not be sent, a sibling pair declared inputs, or the box refused the run because its work folder no longer held the inputs sent), `lfs` (the run's Git LFS content could not be listed or sent, or the box refused the run because its store does not hold the content the snapshot's pointers name or it could not make the run's LFS scratch folder), `desktop` (the builder could not give the run its desktop; the client reads the box's `desktop` refusal tag as this reason) and `install` (the builder's gate is not installed where only administrators can change it; the client reads the box's install refusal on the preflight, inputs and run calls, and its `install` refusal tag, as this reason).
+- `fallback`: `reason`, one of `full` (no remote slot within the 60 s wait), `busy`, `unreachable`, `parity`, `rebooted`, `tools` (T5), `layout` (the box could not clear or lay out its work folder), `version` ([The box side](#the-box-side)), `client` (the remote client could not start, as when it finds no usable ssh), `inputs` (the run's ignored inputs could not be sent, a sibling pair declared inputs, or the box refused the run because its work folder no longer held the inputs sent), `lfs` (the run's Git LFS content could not be listed or sent, or the box refused the run because its store does not hold the content the snapshot's pointers name or it could not make the run's LFS scratch folder), `desktop` (the builder could not give the run its desktop; the client reads the box's `desktop` refusal tag as this reason) `install` (the builder's gate is not installed where only administrators can change it; the client reads the box's install refusal on the preflight, inputs and run calls, and its `install` refusal tag, as this reason) and `root` (the builder's work root is not locked down or is busy; the client reads the box's root lines on the preflight, before the version check, as it reads `install`).
 
   A journal line with the reason `cold` is still read, but no run writes it.
 
@@ -1922,6 +1926,12 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The same line and fallback answer the inputs call, and the run call when the install line is the call's only line, before the start marker; a run call that carries the `install` refusal tag (status 75) says the same line from the box's install line after the tag. No stop call follows a refused install, since nothing started.
 
+    A status 1 with the box's work-root line (`gate: the builder's work root is not locked down: <why>; run the installer's "Gate work root" step (...)` or `gate: the builder's work root is busy: <why>`, Work root in [The box side](#the-box-side)) among the preflight's lines, none after a start marker, says `gate: not routed: <host>'s work root is not locked down: <why>` or `gate: not routed: <host>'s work root is busy: <why>`, then `gate: remote <host> root; running here`, and falls back `root`; the why is cut to 4 KiB and escaped.
+
+    The install line is read first.
+
+    An older box never says the line, so its refusal stays `preparing ... failed (status 1)`, and an older PC gate fails such a run with status 1 rather than falling back.
+
     Any other non-zero status says `gate: preparing <builder root> on <host> failed (status <n>)` and ends the run with that status. A reported version text other than this PC's whole one, build id included, says `gate: not routed: <host> runs gate <theirs|unknown>, this PC <ours>; run gate push` and falls back `version`; the builder's version is its first 4 KiB, escaped.
 
     The client also reads the preflight's `gate: remote warm <none|64 lower-case hex>` line, only the line right after the last `gate: remote version` line: anything else there, no such line, or a warm line elsewhere reads as no warmth.
@@ -2632,6 +2642,22 @@ A desktop run's hand-off judges the helper again before it makes the control pip
 
 The client turns the refusal into a fallback to a local run with reason `install` (Preflight, in [Routing](#routing)), and `gate check --builder` reports it. Routed code is trusted, and a refused install falls back to local. The user's own Medium-integrity processes are outside the trust boundary ([The desktop run's design](#the-desktop-runs-design)).
 
+**Work root.** The box runs elevated and builds in the root `<root>` of its work folder `<root>\work\<key>`, so a root another account may write in could redirect what it runs or deletes. The `preflight` judges and holds the root with `gate_win32::check_work_root` after its payload is read and before any record is read, git step or folder, and refuses it before anything is made or run.
+
+The check refuses: a root DACL with any allow entry, for a SID other than SYSTEM, Administrators and the box's user, that grants a write-class right (CREATOR OWNER and OWNER RIGHTS entries are judged by what they grant, and the owner by the owner rules); a folder above the root up to the volume root that lets another account delete or replace what is below it (DELETE on the folder, FILE_DELETE_CHILD on its parent).
+
+It also refuses a root or root parent that is a reparse point, a root whose final path is not its own path (a `subst` drive, a junction above it), and a root on a network volume. The held root's final path is read again after the walk, so a folder swapped above it meanwhile is refused too.
+
+It also refuses a reparse point at the root or its parent; a final path other than the expected one (a `subst` drive); and a network volume.
+
+A missing root is made, locked, only after its parent and the folders above it pass, and created beneath the held parent; a root this check made and then refuses is deleted through its handle. The root is then held (`FILE_GENERIC_READ`, no delete sharing) until the preflight has readied its folders, so no other account can rename or delete it meanwhile.
+
+A refusal says `gate: remote version <v>` on stdout, then one stderr line and exit 1: `gate: the builder's work root is not locked down: <why>; run the installer's "Gate work root" step (install-toolchains.ps1 -Only "Gate work root")`, the why escaped, with `; it was made by this check and cannot be removed: <error>` added to the why when a root it made and refused cannot be removed.
+
+A root that is otherwise safe but that another process holds open with delete access, or without sharing reading, says `gate: the builder's work root is busy: <root> is open in another process; retry when it is closed` the same way (exit 1, no installer step). On a builder's very first preflight, a concurrent preflight may see the just-made root as busy once; it passes on retry.
+
+A `Work` that is not `<root>\work\<key>` is a usage error, `gate: box payload Work must be <root>\work\<key> to lock its root down: <work>`, and so is a single-repo `Bare` that is not `<root>\<name>.git`, `gate: box payload Bare must be <root>\<name>.git to lock its root down: <bare>`, each exit 2 with no version line. The client turns either line into a fallback to a local run with reason `root` (Preflight, in [Routing](#routing)), and `gate check --builder` reports it.
+
 Each verb is one ssh call today, and the call's cost is its connection, not its work. Measured warm, setup takes about 2.1 s (TCP about 0.2 s, key exchange and auth 1.5 s, the session 0.4 s) against 0.2 to 1.0 s of verb work, so a routed run's three verb calls spend about 6.4 s, 30 to 37% of a 17 to 26 s routed build, before its git transfers pay the same again.
 
 A routed run therefore moves to one long-lived connection carrying every verb, `gate box serve`, and the per-call client stays until that lands (GATE-70 holds the measurement, and GATE-109 the work).
@@ -2673,6 +2699,8 @@ The box's ceiling has three seams: `--test-box-sample-ms <n>` replaces the 5 s s
 `--test-box-kill-leaves <n>` stands in for the number of processes the last ending of a ceiling or backstop kill leaves (a whole number above 0), so the box says its note for a job that is still not ended.
 
 `--test-lfs-budget-bytes <n>` replaces the 16 GiB a `gate box lfs` put unpacks, in bytes.
+
+`--test-box-root-walk-stop <folder>` ends the preflight's walk over the folders above the work root at that folder, which and those above it go unjudged (any path; an empty value is no value), so a case does not depend on the host's folders.
 
 The other four box seams are `--test-outputs-budget-bytes <n>`, which replaces the 50 GiB outputs budget of the box's trim, in bytes, `--test-inputs-budget-bytes <n>`, which replaces the 4 GiB a `gate box inputs` put unpacks, decompressed, in bytes, `--test-dotnet-limit-ms <n>`, which replaces the 30 s bound of the preflight's `dotnet --list-sdks` read, in milliseconds, and `--test-probe-limit-ms <n>`, which replaces the 10 s shared bound of the preflight's tool probes, in milliseconds.
 
@@ -2717,7 +2745,7 @@ Built verbs:
 - **`boot`** prints `gate: remote boot <UTC time>` on stdout (ISO 8601, 7 fractional digits, `Z`; the system time less the tick count since boot) and exits 0.
 
   When the time cannot be read it prints `gate: remote could not read the boot time: <message>` on stderr and exits 1, so the client's boot query after a lost connection says the call failed rather than taking a status 0 with no time. The preflight says the same line and goes on: an unreadable boot time fails no preflight, and the client then makes no boot query.
-- **`preflight`** creates the bare repo at `Bare` when missing and the work folder at `Work` with `.git`, `origin` set to `Bare`, `core.autocrlf false` and `core.eol lf`, and writes `.git\objects\info\alternates` as `<Bare with />/objects` and a line feed, without a byte order mark, unless the file already holds exactly that.
+- **`preflight`** first judges and holds the builder's work root (Work root, above), then creates the bare repo at `Bare` when missing and the work folder at `Work` with `.git`, `origin` set to `Bare`, `core.autocrlf false` and `core.eol lf`, and writes `.git\objects\info\alternates` as `<Bare with />/objects` and a line feed, without a byte order mark, unless the file already holds exactly that.
 
   On a tree it has just made with `git init`, the preflight writes the config itself: it takes `.git\config.lock` (as git does), reads `config` beneath the held `.git`, and when that config is `git init`'s own (a single `[core]` section, no `autocrlf` or `eol`, a plain UTF-8 file with no U+FEFF, last line not ending in `\`) it writes the `origin` remote (`url`, `fetch = +refs/heads/*:refs/remotes/origin/*`) with `core.autocrlf=false` and `core.eol=lf` into the lock in one write, quoted as git quotes values, and renames the lock over `config`.
 
@@ -3833,6 +3861,8 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   It is copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`).
 
   A second helper, `fake-ssh`, stands in for ssh in the remote client's cases (`--test-remote-ssh`). Its `ok` step puts the words of the variable `GATE_FAKE_SSH_BOX_SEAMS` before the verb of a `gate box run` call, so a case gives the box its seams (it reaches a `gate box lfs` call too); the variable `GATE_FAKE_SSH_PREFLIGHT_SEAMS` does the same for a `gate box preflight` call.
+
+  The variable `GATE_FAKE_SSH_ROOT_WALK_STOP`, a folder named as one path (never split), puts `--test-box-root-walk-stop <folder>` before a `gate box preflight` call's verb, after those seams, so the preflight's walk above the work root stops there.
 
   It reads a box call from the last three words of the line, `box <verb> --stdin`, and the box it runs inherits its stdin, so the request the client feeds reaches the box; a box call whose last word is not `--stdin` is refused by name.
 

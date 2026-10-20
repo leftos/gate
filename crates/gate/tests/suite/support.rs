@@ -1257,6 +1257,9 @@ pub const STEPS_VARIABLE: &str = "GATE_FAKE_SSH_STEPS";
 pub const GATE_VARIABLE: &str = "GATE_FAKE_SSH_GATE";
 /// The variable whose words the stand-in gives the box's `preflight` before its verb.
 pub const PREFLIGHT_SEAMS_VARIABLE: &str = "GATE_FAKE_SSH_PREFLIGHT_SEAMS";
+/// The variable naming the folder the stand-in gives the box's `preflight` as `--test-box-root-walk-stop`, so the
+/// walk above the builder's root ends at the case folder and no case depends on the host's folders above it.
+pub const ROOT_WALK_STOP_VARIABLE: &str = "GATE_FAKE_SSH_ROOT_WALK_STOP";
 /// The preflight seams of a tool case whose probes and SDK list must answer: bounds no run reaches, so only an answer
 /// ends them and no load changes what the run says.
 pub const ANSWERING: &str = "--test-probe-limit-ms 3600000 --test-dotnet-limit-ms 3600000";

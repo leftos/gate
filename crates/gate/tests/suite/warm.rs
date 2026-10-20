@@ -767,7 +767,10 @@ fn warm_client_at(worktree: &Case, state: &Path, steps: &Path, extra: &[&str]) -
     args.extend(GIT_HANG_GUARDS);
     args.extend(extra);
     let mut command = worktree.gate(&args);
-    command.env(STEPS_VARIABLE, steps).env(GATE_VARIABLE, GATE);
+    command
+        .env(STEPS_VARIABLE, steps)
+        .env(GATE_VARIABLE, GATE)
+        .env(crate::support::ROOT_WALK_STOP_VARIABLE, worktree.folder());
     command
 }
 

@@ -1,6 +1,8 @@
 //! Whether an installed file may be trusted to run elevated ([`check_installed_file`]): only SYSTEM, Administrators and
 //! `TrustedInstaller` ([`TRUSTED_OWNERS`]) own it, its folder and every folder above it up to the volume root, and no
 //! one else may change the file, add to or empty its folder, or remove, rename, re-permission or take any folder above.
+//! Whether the box's work root is locked down ([`check_work_root`]): only those owners and the box's own user may write
+//! in it, and no one else may empty, remove, re-permission or take a folder above it.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -12,7 +14,7 @@ use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, LocalFree};
+use windows_sys::Win32::Foundation::{ERROR_SHARING_VIOLATION, ERROR_SUCCESS, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACCESS_ALLOWED_OBJECT_ACE, ACE_HEADER, ACE_INHERITED_OBJECT_TYPE_PRESENT, ACE_OBJECT_TYPE_PRESENT, ACL,
@@ -20,16 +22,18 @@ use windows_sys::Win32::Security::{
     OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_NAME_NORMALIZED,
-    FILE_READ_ATTRIBUTES, FILE_REMOTE_PROTOCOL_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
-    FILE_WRITE_EA, FileRemoteProtocolInfo, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, READ_CONTROL, VOLUME_NAME_DOS, WRITE_DAC,
-    WRITE_OWNER,
+    DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_REMOTE_PROTOCOL_INFO, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+    FileRemoteProtocolInfo, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, READ_CONTROL, VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::SystemServices::{
     ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_ALLOWED_OBJECT_ACE_TYPE,
     ACCESS_DENIED_ACE_TYPE, ACCESS_DENIED_CALLBACK_ACE_TYPE, ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_DENIED_OBJECT_ACE_TYPE,
 };
+
+use crate::file::{Share, delete_opened, make_folder_beneath};
+use crate::security::{Descriptor, protected_sddl};
 
 /// The owners a trusted file or folder may have, as SIDs' string forms: SYSTEM, Administrators and `TrustedInstaller`.
 /// Only an elevated process or the system itself acts as one of them.
@@ -74,6 +78,21 @@ enum Problem {
     Network,
     /// Its final path, in its usual form, is this one, not the path given.
     ResolvesTo(PathBuf),
+    /// A work root or a folder above it is a reparse point, such as a symbolic link or a junction.
+    ReparsePoint,
+    /// The work root is on a network volume, whose owner and DACL another machine decides.
+    NetworkVolume,
+    /// The work root's parent folder does not exist.
+    NoParent,
+    /// The work root is a file.
+    NotAFolder,
+    /// The work root was missing and cannot be made, for this reason.
+    Unmade(String),
+    /// The work root is open in another process with delete access, or without sharing reading, so it cannot be held
+    /// without delete sharing, though it and the folders above pass.
+    Busy,
+    /// The work root this check made was refused for this problem and cannot be removed, for this reason.
+    Kept(Box<Problem>, String),
 }
 
 impl fmt::Display for Untrusted {
@@ -94,7 +113,29 @@ impl fmt::Display for Untrusted {
             Problem::LinkOrJunction => write!(formatter, "{object} is a link or junction"),
             Problem::Network => write!(formatter, "{object} is on a network drive"),
             Problem::ResolvesTo(full) => write!(formatter, "{object} resolves to {}", full.display()),
+            Problem::ReparsePoint => write!(formatter, "{object} is a reparse point"),
+            Problem::NetworkVolume => write!(formatter, "{object} is on a network volume"),
+            Problem::NoParent => write!(formatter, "{object} has no parent folder"),
+            Problem::NotAFolder => write!(formatter, "{object} is not a folder"),
+            Problem::Unmade(why) => write!(formatter, "{object} cannot be made: {why}"),
+            Problem::Busy => write!(formatter, "{object} is open in another process; retry when it is closed"),
+            Problem::Kept(problem, why) => {
+                let refused = Untrusted {
+                    object: self.object.clone(),
+                    problem: (**problem).clone(),
+                };
+                write!(formatter, "{refused}; it was made by this check and cannot be removed: {why}")
+            }
         }
+    }
+}
+
+impl Untrusted {
+    /// Whether the work root was refused only because another process has it open with delete access, the root and the
+    /// folders above passing all the same: retrying once that process closes it may pass.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        self.problem == Problem::Busy
     }
 }
 
@@ -117,6 +158,10 @@ enum Right {
     AddFolders,
     /// Delete or rename anything in the folder, whatever that thing's own DACL says.
     DeleteChildren,
+    /// Write the folder's extended attributes.
+    WriteExtendedAttributes,
+    /// Write the folder's attributes.
+    WriteAttributes,
 }
 
 impl Right {
@@ -130,6 +175,8 @@ impl Right {
             Right::AddFiles => FILE_ADD_FILE,
             Right::AddFolders => FILE_ADD_SUBDIRECTORY,
             Right::DeleteChildren => FILE_DELETE_CHILD,
+            Right::WriteExtendedAttributes => FILE_WRITE_EA,
+            Right::WriteAttributes => FILE_WRITE_ATTRIBUTES,
         }
     }
 
@@ -143,11 +190,14 @@ impl Right {
             Right::AddFiles => "add files to it",
             Right::AddFolders => "add folders to it",
             Right::DeleteChildren => "delete what it holds",
+            Right::WriteExtendedAttributes => "write its extended attributes",
+            Right::WriteAttributes => "write its attributes",
         }
     }
 }
 
-/// Where an object stands to the installed file, which decides the rights no one else may hold over it.
+/// Where an object stands to the installed file or to the box's work root, which decides the rights no one else may
+/// hold over it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
     /// The installed file.
@@ -156,6 +206,12 @@ enum Role {
     Folder,
     /// A folder above that one, the volume root among them.
     Above,
+    /// The box's work root, whose every allow entry counts, inherit-only ones included.
+    WorkRoot,
+    /// A folder above the work root, below its volume root.
+    AboveWorkRoot,
+    /// The volume root above the work root, which may let anyone delete it, as a drive root's default does.
+    WorkVolume,
 }
 
 impl Role {
@@ -178,7 +234,74 @@ impl Role {
                 Right::ChangePermissions,
                 Right::TakeOwnership,
             ],
+            Role::WorkRoot => &[
+                Right::AddFiles,
+                Right::AddFolders,
+                Right::DeleteChildren,
+                Right::WriteExtendedAttributes,
+                Right::WriteAttributes,
+                Right::Delete,
+                Right::ChangePermissions,
+                Right::TakeOwnership,
+            ],
+            Role::AboveWorkRoot => &[Right::DeleteChildren, Right::Delete, Right::ChangePermissions, Right::TakeOwnership],
+            Role::WorkVolume => &[Right::DeleteChildren, Right::ChangePermissions, Right::TakeOwnership],
         }
+    }
+
+    /// Whether an inherit-only entry, which does not apply to the object itself, counts: only on the work root, whose
+    /// entries are what every folder a run makes in it is given.
+    fn judges_inherit_only(self) -> bool {
+        self == Role::WorkRoot
+    }
+
+    /// What a folder of this role that is a reparse point is said to be.
+    fn reparse_problem(self) -> Problem {
+        match self {
+            Role::File => Problem::Link,
+            Role::Folder | Role::Above => Problem::LinkOrJunction,
+            Role::WorkRoot | Role::AboveWorkRoot | Role::WorkVolume => Problem::ReparsePoint,
+        }
+    }
+}
+
+/// Whom a judgement trusts besides [`TRUSTED_OWNERS`]: the box's user, read from the box's own token, as a SID an
+/// entry may grant anything, and as an owner when the box is not elevated.
+#[derive(Clone, Copy, Debug)]
+struct Trust<'a> {
+    user: Option<&'a str>,
+    user_owns: bool,
+}
+
+impl<'a> Trust<'a> {
+    /// [`TRUSTED_OWNERS`] alone, as an installed file is judged.
+    const OWNERS: Trust<'static> = Trust {
+        user: None,
+        user_owns: false,
+    };
+
+    /// [`TRUSTED_OWNERS`] and the box's user `user`, an owner too when the box is not `elevated`, as the box makes its
+    /// own folders ([`crate::protected_descriptor`]).
+    fn of_box(user: &'a str, elevated: bool) -> Trust<'a> {
+        Trust {
+            user: Some(user),
+            user_owns: !elevated,
+        }
+    }
+
+    /// Whether `sid` is the box's user this trusts.
+    fn is_user(self, sid: &str) -> bool {
+        self.user.is_some_and(|user| sid.eq_ignore_ascii_case(user))
+    }
+
+    /// Whether an entry allowing `sid` may grant it anything.
+    fn grantee(self, sid: &str) -> bool {
+        is_trusted(sid) || self.is_user(sid)
+    }
+
+    /// Whether `sid` may own the object.
+    fn owner(self, sid: &str) -> bool {
+        is_trusted(sid) || (self.user_owns && self.is_user(sid))
     }
 }
 
@@ -233,7 +356,7 @@ pub fn check_installed_file(path: &Path) -> Result<(), Untrusted> {
     };
     let unreadable = |error: io::Error| refused(Problem::Unreadable(error.to_string()));
     let expected = std::path::absolute(path).map_err(unreadable)?;
-    let file = open_unfollowed(path, 0).map_err(unreadable)?;
+    let file = open_unfollowed(path, 0, Share::All).map_err(unreadable)?;
     if is_reparse_point(&file).map_err(unreadable)? {
         return Err(refused(Problem::Link));
     }
@@ -249,48 +372,322 @@ pub fn check_installed_file(path: &Path) -> Result<(), Untrusted> {
         object: object.clone(),
         problem: Problem::Unreadable(error.to_string()),
     })?;
-    judge(Role::File, &owner, dacl.as_deref()).map_err(|problem| Untrusted { object, problem })?;
+    judge(Role::File, Trust::OWNERS, &owner, dacl.as_deref()).map_err(|problem| Untrusted { object, problem })?;
     for (index, folder) in full.ancestors().skip(1).enumerate() {
-        check_folder(folder, if index == 0 { Role::Folder } else { Role::Above })?;
+        check_folder(folder, if index == 0 { Role::Folder } else { Role::Above }, Trust::OWNERS)?;
     }
     Ok(())
 }
 
-/// Refuses the folder `folder`, a final path, as an object of `role`: opened without following a reparse point and
-/// read through that handle, it must not be a reparse point, its final path must be `folder`, and [`judge`] must pass
-/// its owner and DACL. A refusal names the folder in its usual form.
-fn check_folder(folder: &Path, role: Role) -> Result<(), Untrusted> {
+/// Opens the box's work root `root`, making it first when it is missing, and returns it held: opened as itself, never
+/// followed, without delete sharing, so no one can rename or remove it while the handle lives. Refuses it unless only
+/// SYSTEM, Administrators, `TrustedInstaller` and the box's user, read from this process's token, can write in it.
+///
+/// Its parent is opened as itself first, for its security and attributes alone so no process holding it open keeps
+/// the check out, and kept open until the check ends: it must exist, must not be a reparse point, its final path must
+/// be the root's parent, and it must not be on a network volume. An existing root is judged, then the folders above
+/// it; for a missing one the folders above are judged first, and only then is it made, in one call inside that parent
+/// with [`protected_sddl`]'s security less the label, so it is never seen with any other and nothing is made beneath a
+/// folder that fails. One made by someone else meanwhile is judged as any
+/// other. A root this call made and a later step refuses is deleted through its own handle. Last, the held root's
+/// final path is read again and must still be the root's.
+///
+/// The root must be a folder, not a reparse point, not on a network volume, and its final path must be `root` made
+/// absolute (equal without regard to ASCII case). Its owner must be SYSTEM, Administrators or `TrustedInstaller`, or
+/// the box's user when the box is not elevated; no allow entry of its DACL, whatever its inheritance flags, may grant
+/// anyone else, once generic rights are mapped, a right to add files or folders to it, delete what it holds, write its
+/// extended attributes or attributes, delete it, change its permissions or take ownership. Each folder above it, up to
+/// and including the volume root, must not be a reparse point, must have the owner the root may have, and its entries
+/// that apply to itself may grant no one else a right to delete what it holds, delete it (except on the volume root),
+/// change its permissions or take ownership. Deny entries are passed over, and labels are not read.
+///
+/// `walk_stop`, the suite's seam, ends the walk over the folders above at that folder: it and the folders above it are
+/// not judged, though the parent is still opened, held and its final path compared. A stop the walk never reaches
+/// leaves the walk whole.
+///
+/// # Errors
+///
+/// The first object that fails, with what is wrong with it: the root named as `root` is given, for a missing parent,
+/// a root that cannot be made, opened or read, is open in another process with delete access, or without sharing
+/// reading, while it and the folders above pass ([`Untrusted::is_busy`]; one that fails is refused for that,
+/// [`unheld`]), is not a folder, is a reparse point, is on a network volume, resolves elsewhere, or whose owner or DACL
+/// fails; else the folder above at fault, named in its final path's usual form.
+pub fn check_work_root(root: &Path, walk_stop: Option<&Path>) -> Result<File, Untrusted> {
+    let refused = |problem| Untrusted {
+        object: root.to_owned(),
+        problem,
+    };
+    let unreadable = |error: io::Error| refused(Problem::Unreadable(error.to_string()));
+    let facts = crate::token_facts().map_err(unreadable)?;
+    let expected = std::path::absolute(root).map_err(unreadable)?;
+    let stop = walk_stop
+        .map(|stop| std::path::absolute(stop).map(|full| full.components().collect::<PathBuf>()))
+        .transpose()
+        .map_err(unreadable)?;
+    let walk = Walk {
+        trust: Trust::of_box(&facts.user, facts.elevated),
+        stop: stop.as_deref(),
+    };
+    let Some(parent) = expected.parent() else {
+        // A volume root has no folder above it to walk, nor one to be made in.
+        let held = open_held(&expected).map_err(|error| unheld(&expected, &error, walk.trust, || Ok(())).naming(root))?;
+        judge_held_root(&held, &expected, walk.trust).map_err(refused)?;
+        return Ok(held);
+    };
+    let (held_parent, parent_full) = held_parent(parent, root)?;
+    let opened = open_or_make(&held_parent, &parent_full, &expected, &facts, walk).map_err(|why| why.naming(root))?;
+    let checked = judge_held_root(&opened.held, &expected, walk.trust)
+        .map_err(refused)
+        .and_then(|()| if opened.walked { Ok(()) } else { walk.above(&parent_full) })
+        .and_then(|()| still_at(&opened.held, &expected).map_err(refused));
+    match checked {
+        Ok(()) => Ok(opened.held),
+        Err(why) if opened.made => Err(removed(&opened.held, why)),
+        Err(why) => Err(why),
+    }
+}
+
+/// The walk [`check_work_root`] makes over the folders above the work root: whom it trusts, and the folder, made
+/// absolute and without a trailing separator, at which it ends unjudged.
+#[derive(Clone, Copy)]
+struct Walk<'a> {
+    trust: Trust<'a>,
+    stop: Option<&'a Path>,
+}
+
+impl Walk<'_> {
+    /// Refuses the folder `parent`, a final path in its usual form, or any folder above it up to and including the
+    /// volume root, as [`check_folder`] judges a folder above the work root, the volume root as itself; the walk ends,
+    /// unjudged, at its stop.
+    fn above(self, parent: &Path) -> Result<(), Untrusted> {
+        for folder in parent.ancestors() {
+            if self.stop.is_some_and(|stop| same_path(stop, folder)) {
+                break;
+            }
+            let role = if folder.parent().is_none() {
+                Role::WorkVolume
+            } else {
+                Role::AboveWorkRoot
+            };
+            check_folder(folder, role, self.trust)?;
+        }
+        Ok(())
+    }
+}
+
+/// The work root as [`open_or_make`] opened it: the handle, whether this call made it, and whether the folders above
+/// were judged already, before it was made.
+struct Opened {
+    held: File,
+    made: bool,
+    walked: bool,
+}
+
+/// The folder `path` opened as itself, never followed, to read, without delete sharing. Reading, not only its
+/// attributes and security, is asked for because the system checks sharing only for an open that asks to read, write
+/// or delete: an open asking for less neither keeps another from deleting or renaming the folder nor is kept out by a
+/// handle that may.
+fn open_held(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .access_mode(FILE_GENERIC_READ)
+        .share_mode(Share::NoDelete.mode())
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+/// Why the work root `root`, an absolute path, could not be held for `error`, trusting `trust`. A sharing violation,
+/// which another process's handle with delete access causes, is judged first: the root is opened again as itself for
+/// its security and attributes alone, which the system checks no sharing for, and judged as a held root is
+/// ([`judge_held_root`]), then the folders above by `above`. What they find is the refusal, so a handle another process
+/// holds cannot hide an unsafe root, and [`Problem::Busy`] only when both pass. Any other error is
+/// [`Problem::Unreadable`].
+fn unheld(root: &Path, error: &io::Error, trust: Trust<'_>, above: impl FnOnce() -> Result<(), Untrusted>) -> Refusal {
+    if !matches!(error.raw_os_error().map(u32::try_from), Some(Ok(ERROR_SHARING_VIOLATION))) {
+        return Refusal::Root(Problem::Unreadable(error.to_string()));
+    }
+    let judged = open_unfollowed(root, FILE_FLAG_BACKUP_SEMANTICS, Share::All)
+        .map_err(|error| Problem::Unreadable(error.to_string()))
+        .and_then(|seen| judge_held_root(&seen, root, trust));
+    if let Err(problem) = judged {
+        return Refusal::Root(problem);
+    }
+    match above() {
+        Ok(()) => Refusal::Root(Problem::Busy),
+        Err(why) => Refusal::Above(why),
+    }
+}
+
+/// The parent `parent` of the work root `root`, opened as itself for its security and attributes alone, which the
+/// system checks no sharing for, so no process holding it open keeps the check out, and its final path in its usual
+/// form. The root is made beneath this handle; a folder above renamed meanwhile is caught as the held root's final
+/// path is read again ([`still_at`]). Refuses it, naming the root, when it is missing or on a network volume, and, naming the parent, when it
+/// cannot be opened or read, is a reparse point or resolves elsewhere.
+fn held_parent(parent: &Path, root: &Path) -> Result<(File, PathBuf), Untrusted> {
+    let refused = |object: &Path, problem| Untrusted {
+        object: object.to_owned(),
+        problem,
+    };
+    let unreadable = |error: io::Error| refused(parent, Problem::Unreadable(error.to_string()));
+    let held = match open_unfollowed(parent, FILE_FLAG_BACKUP_SEMANTICS, Share::All) {
+        Ok(held) => held,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(refused(root, Problem::NoParent)),
+        Err(error) => return Err(unreadable(error)),
+    };
+    if is_reparse_point(&held).map_err(unreadable)? {
+        return Err(refused(parent, Problem::ReparsePoint));
+    }
+    let full = final_path(&held).map_err(unreadable)?;
+    if is_remote(&full, &held) {
+        return Err(refused(root, Problem::NetworkVolume));
+    }
+    let full = shown(&full);
+    if !same_path(&full, &shown(parent)) {
+        return Err(refused(parent, Problem::ResolvesTo(full)));
+    }
+    Ok((held, full))
+}
+
+/// The work root `root`, an absolute path below a folder, opened as [`check_work_root`] holds it. When nothing has its
+/// name, the folders above its parent `parent`, opened by [`held_parent`], whose final path is `parent_full`, are
+/// judged by `walk`, and only then is it made inside `parent` with the security of the box whose token says `facts`,
+/// opened with delete access too so a refusal can remove it. Else what stops it, a refusal of the root naming no object yet.
+fn open_or_make(parent: &File, parent_full: &Path, root: &Path, facts: &crate::TokenFacts, walk: Walk<'_>) -> Result<Opened, Refusal> {
+    let open_root = || open_held(root);
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Refusal::Root(Problem::Unreadable("its name is not Unicode".to_owned())))?;
+    match open_root() {
+        Ok(held) => {
+            return Ok(Opened {
+                held,
+                made: false,
+                walked: false,
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(unheld(root, &error, walk.trust, || walk.above(parent_full))),
+    }
+    walk.above(parent_full).map_err(Refusal::Above)?;
+    let sddl = protected_sddl(&facts.user, facts.elevated, None);
+    let security = Descriptor::from_sddl(&sddl).map_err(|error| Refusal::Root(Problem::Unmade(error.to_string())))?;
+    match make_folder_beneath(parent, name, FILE_GENERIC_READ | DELETE, Share::NoDelete, &security) {
+        Ok(held) => Ok(Opened {
+            held,
+            made: true,
+            walked: true,
+        }),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => match open_root() {
+            Ok(held) => Ok(Opened {
+                held,
+                made: false,
+                walked: true,
+            }),
+            Err(error) => Err(unheld(root, &error, walk.trust, || Ok(()))),
+        },
+        Err(error) => Err(Refusal::Root(Problem::Unmade(error.to_string()))),
+    }
+}
+
+/// Why [`open_or_make`] stopped: a problem of the work root, or the refusal of a folder above it.
+enum Refusal {
+    Root(Problem),
+    Above(Untrusted),
+}
+
+impl Refusal {
+    /// The refusal, a problem of the root naming it `root`.
+    fn naming(self, root: &Path) -> Untrusted {
+        match self {
+            Refusal::Root(problem) => Untrusted {
+                object: root.to_owned(),
+                problem,
+            },
+            Refusal::Above(untrusted) => untrusted,
+        }
+    }
+}
+
+/// The refusal `why` of the work root `held`, which this check made: the root deleted through its handle, opened with
+/// delete access, so a refusal leaves nothing made; when it cannot be, the refusal says so too.
+fn removed(held: &File, why: Untrusted) -> Untrusted {
+    match delete_opened(held) {
+        Ok(()) => why,
+        Err(error) => Untrusted {
+            object: why.object.clone(),
+            problem: Problem::Kept(Box::new(why.problem), error.to_string()),
+        },
+    }
+}
+
+/// Refuses the held work root `held` unless its final path, read now, is still `expected`, so a folder above renamed
+/// or replaced while the walk read it is not passed.
+fn still_at(held: &File, expected: &Path) -> Result<(), Problem> {
+    let full = shown(&final_path(held).map_err(|error| Problem::Unreadable(error.to_string()))?);
+    if same_path(&full, &shown(expected)) {
+        Ok(())
+    } else {
+        Err(Problem::ResolvesTo(full))
+    }
+}
+
+/// Refuses the held work root `held` unless it is a folder, not a reparse point and not on a network volume, its final
+/// path is `expected`, and [`judge`] passes its owner and DACL as the work root's.
+fn judge_held_root(held: &File, expected: &Path, trust: Trust<'_>) -> Result<(), Problem> {
+    let unreadable = |error: io::Error| Problem::Unreadable(error.to_string());
+    let attributes = held.metadata().map_err(unreadable)?.file_attributes();
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(Problem::ReparsePoint);
+    }
+    if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(Problem::NotAFolder);
+    }
+    let full = final_path(held).map_err(unreadable)?;
+    if is_remote(&full, held) {
+        return Err(Problem::NetworkVolume);
+    }
+    still_at(held, expected)?;
+    let (owner, dacl) = security_of(held).map_err(unreadable)?;
+    judge(Role::WorkRoot, trust, &owner, dacl.as_deref())
+}
+
+/// Refuses the folder `folder`, a final path, as an object of `role` judged trusting `trust`: opened without following
+/// a reparse point and read through that handle, it must not be a reparse point, its final path must be `folder`, and
+/// [`judge`] must pass its owner and DACL. A refusal names the folder in its usual form.
+fn check_folder(folder: &Path, role: Role, trust: Trust<'_>) -> Result<(), Untrusted> {
     let object = shown(folder);
     let refused = |problem| Untrusted {
         object: object.clone(),
         problem,
     };
     let unreadable = |error: io::Error| refused(Problem::Unreadable(error.to_string()));
-    let handle = open_unfollowed(folder, FILE_FLAG_BACKUP_SEMANTICS).map_err(unreadable)?;
+    let handle = open_unfollowed(folder, FILE_FLAG_BACKUP_SEMANTICS, Share::All).map_err(unreadable)?;
     if is_reparse_point(&handle).map_err(unreadable)? {
-        return Err(refused(Problem::LinkOrJunction));
+        return Err(refused(role.reparse_problem()));
     }
     let full = shown(&final_path(&handle).map_err(unreadable)?);
     if !same_path(&full, &object) {
         return Err(refused(Problem::ResolvesTo(full)));
     }
     let (owner, dacl) = security_of(&handle).map_err(unreadable)?;
-    judge(role, &owner, dacl.as_deref()).map_err(refused)
+    judge(role, trust, &owner, dacl.as_deref()).map_err(refused)
 }
 
 /// The first thing wrong with an object of `role` owned by `owner` and holding the DACL `dacl` (`None` when it has
-/// none): an owner outside [`TRUSTED_OWNERS`], no DACL, then, in the DACL's order and passing over inherit-only and
-/// deny entries, an entry of a type the check does not read or one allowing an untrusted SID one of the role's rights.
-fn judge(role: Role, owner: &str, dacl: Option<&[Ace]>) -> Result<(), Problem> {
-    if !is_trusted(owner) {
+/// none), trusting [`TRUSTED_OWNERS`] and what `trust` adds: an owner it does not trust, no DACL, then, in the DACL's
+/// order and passing over deny entries, and inherit-only ones unless the role judges them, an entry of a type the check
+/// does not read or one allowing a SID it does not trust one of the role's rights.
+fn judge(role: Role, trust: Trust<'_>, owner: &str, dacl: Option<&[Ace]>) -> Result<(), Problem> {
+    if !trust.owner(owner) {
         return Err(Problem::Owner(owner.to_owned()));
     }
     let Some(entries) = dacl else {
         return Err(Problem::NoAccessList);
     };
-    for ace in entries.iter().filter(|ace| u32::from(ace.flags) & INHERIT_ONLY_ACE == 0) {
+    let applies = |ace: &&Ace| role.judges_inherit_only() || u32::from(ace.flags) & INHERIT_ONLY_ACE == 0;
+    for ace in entries.iter().filter(applies) {
         match &ace.kind {
-            Kind::Allow { mask, sid } if !is_trusted(sid) => {
+            Kind::Allow { mask, sid } if !trust.grantee(sid) => {
                 let granted = mapped(*mask);
                 if let Some(right) = role.rights().iter().find(|right| granted & right.mask() != 0) {
                     return Err(Problem::Grants {
@@ -325,12 +722,12 @@ fn mapped(mask: u32) -> u32 {
     )
 }
 
-/// `path` opened for `READ_CONTROL` and its attributes, with every kind of sharing, a reparse point at its own name
+/// `path` opened for `READ_CONTROL` and its attributes, sharing what `share` says, a reparse point at its own name
 /// opened itself rather than followed, and the further flags `flags`.
-fn open_unfollowed(path: &Path, flags: u32) -> io::Result<File> {
+fn open_unfollowed(path: &Path, flags: u32, share: Share) -> io::Result<File> {
     OpenOptions::new()
         .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .share_mode(share.mode())
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | flags)
         .open(path)
 }
@@ -574,11 +971,14 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
 
-    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ};
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ};
 
-    use super::{Ace, Kind, Role, Untrusted, check_folder, check_installed_file, judge, owner_and_dacl, shown};
+    use super::{
+        Ace, Kind, Problem, Role, Trust, Untrusted, check_folder, check_installed_file, check_work_root, judge, open_unfollowed, owner_and_dacl,
+        removed, shown, still_at,
+    };
     use crate::file::{Share, make_folder_beneath};
-    use crate::security::Descriptor;
+    use crate::security::{Descriptor, protected_sddl};
 
     /// Program Files' own descriptor: owned by `TrustedInstaller`, which alone has full control of the folder itself;
     /// SYSTEM and Administrators modify, and Users and the app packages read and run, the rest inherit-only.
@@ -595,12 +995,17 @@ mod tests {
     /// The refusal of an object of `role` at `C:\t\o` whose descriptor the SDDL `sddl` names, read as the real check
     /// reads one, as its line.
     fn judged(role: Role, sddl: &str) -> Result<(), String> {
+        judged_by(role, Trust::OWNERS, sddl)
+    }
+
+    /// [`judged`], trusting what `trust` names.
+    fn judged_by(role: Role, trust: Trust<'_>, sddl: &str) -> Result<(), String> {
         let descriptor = Descriptor::from_sddl(sddl)
             .map_err(|error| format!("{sddl}: {error}"))
             .expect("the SDDL names a descriptor");
         // SAFETY: the descriptor lives for the whole call.
         let (owner, dacl) = unsafe { owner_and_dacl(descriptor.as_ptr()) }.expect("the descriptor's owner and DACL can be read");
-        judge(role, &owner, dacl.as_deref()).map_err(|problem| {
+        judge(role, trust, &owner, dacl.as_deref()).map_err(|problem| {
             Untrusted {
                 object: Path::new(r"C:\t\o").to_owned(),
                 problem,
@@ -723,7 +1128,7 @@ mod tests {
             flags: 0,
             kind: Kind::Unknown(2),
         };
-        let why = judge(Role::File, "S-1-5-18", Some(&[audit])).map_err(|problem| {
+        let why = judge(Role::File, Trust::OWNERS, "S-1-5-18", Some(&[audit])).map_err(|problem| {
             Untrusted {
                 object: Path::new(r"C:\t\o").to_owned(),
                 problem,
@@ -777,6 +1182,178 @@ mod tests {
     fn the_default_volume_root_passes_as_a_folder_above() {
         let root = "O:SYD:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)(A;OICIIO;SDGXGWGR;;;AU)(A;;0x4;;;AU)";
         assert_eq!(judged(Role::Above, root), Ok(()));
+    }
+
+    /// The box user the work-root cases trust, as a box's token would name it.
+    const BOX_USER: &str = "S-1-5-21-1-2-3-1001";
+
+    /// The descriptor the installer's `Gate work root` step gives the root, owned by Administrators.
+    const INSTALLED_ROOT: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)";
+
+    /// What an elevated box makes of a work root whose descriptor the SDDL `sddl` names.
+    fn root_judged(sddl: &str) -> Result<(), String> {
+        judged_by(Role::WorkRoot, Trust::of_box(BOX_USER, true), sddl)
+    }
+
+    #[test]
+    fn the_installer_s_work_root_passes_elevated_and_owned_by_the_user_unelevated() {
+        assert_eq!(root_judged(INSTALLED_ROOT), Ok(()));
+        let owned_by_user = INSTALLED_ROOT.replacen("O:BA", &format!("O:{BOX_USER}"), 1);
+        assert_eq!(judged_by(Role::WorkRoot, Trust::of_box(BOX_USER, false), &owned_by_user), Ok(()));
+    }
+
+    /// GATE-576's open root: Authenticated Users modify, inherit-only, handed down from the drive.
+    #[test]
+    fn an_inherit_only_modify_for_authenticated_users_on_the_work_root_fails() {
+        assert_eq!(
+            root_judged(&format!("{INSTALLED_ROOT}(A;OICIIO;SDGXGWGR;;;AU)")),
+            Err(r"C:\t\o lets S-1-5-11 add files to it".to_owned())
+        );
+    }
+
+    #[test]
+    fn generic_all_or_write_for_an_untrusted_sid_on_the_work_root_fails() {
+        for right in ["GA", "GW"] {
+            assert_eq!(
+                root_judged(&format!("{INSTALLED_ROOT}(A;;{right};;;WD)")),
+                Err(r"C:\t\o lets S-1-1-0 add files to it".to_owned()),
+                "{right}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_write_right_on_the_work_root_is_refused_alone() {
+        let cases = [
+            ("0x2", "add files to it"),
+            ("0x4", "add folders to it"),
+            ("0x10", "write its extended attributes"),
+            ("0x40", "delete what it holds"),
+            ("0x100", "write its attributes"),
+            ("SD", "delete it"),
+            ("WD", "change its permissions"),
+            ("WO", "take ownership of it"),
+        ];
+        for (right, words) in cases {
+            assert_eq!(
+                root_judged(&format!("{INSTALLED_ROOT}(A;;{right};;;WD)")),
+                Err(format!(r"C:\t\o lets S-1-1-0 {words}")),
+                "{right}"
+            );
+        }
+    }
+
+    /// An entry that hands a right down, to folders, files or the next level only, counts on the root whether or not it
+    /// also applies to the root itself.
+    #[test]
+    fn inheritable_entries_on_the_work_root_count_whatever_their_flags() {
+        for flags in ["CI", "OI", "CIIO", "OIIO", "OICINP", "OICINPIO", "CINPIO"] {
+            assert_eq!(
+                root_judged(&format!("{INSTALLED_ROOT}(A;{flags};0x2;;;WD)")),
+                Err(r"C:\t\o lets S-1-1-0 add files to it".to_owned()),
+                "{flags}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_and_run_for_users_on_the_work_root_passes() {
+        assert_eq!(root_judged(&format!("{INSTALLED_ROOT}(A;OICI;0x1200a9;;;BU)")), Ok(()));
+    }
+
+    #[test]
+    fn a_deny_entry_on_the_work_root_is_ignored() {
+        assert_eq!(
+            root_judged(&format!("O:BAD:P(D;OICI;FA;;;WD){}", &INSTALLED_ROOT["O:BAD:P".len()..])),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn object_and_callback_entries_on_the_work_root_count_as_allowing() {
+        let condition = "(Member_of {SID(BA)})";
+        for entry in [
+            format!("(OA;;0x2;{GUID};;WD)"),
+            format!("(XA;;0x2;;;WD;{condition})"),
+            format!("(ZA;;0x2;{GUID};;WD;{condition})"),
+        ] {
+            assert_eq!(
+                root_judged(&format!("{INSTALLED_ROOT}{entry}")),
+                Err(r"C:\t\o lets S-1-1-0 add files to it".to_owned()),
+                "{entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_entry_or_no_access_list_on_the_work_root_fails() {
+        let audit = Ace {
+            flags: 0,
+            kind: Kind::Unknown(2),
+        };
+        let unknown = judge(Role::WorkRoot, Trust::of_box(BOX_USER, true), "S-1-5-18", Some(&[audit]));
+        assert_eq!(unknown, Err(Problem::UnreadableEntry(2)));
+        assert_eq!(root_judged("O:BAD:NO_ACCESS_CONTROL"), Err(r"C:\t\o has no access list".to_owned()));
+    }
+
+    /// The box's user may own the root only when the box is not elevated; no other user ever may.
+    #[test]
+    fn the_work_root_s_owner_is_a_trusted_owner_or_the_unelevated_box_s_user() {
+        let by_user = format!("O:{BOX_USER}D:P(A;OICI;FA;;;SY)");
+        assert_eq!(
+            judged_by(Role::WorkRoot, Trust::of_box(BOX_USER, true), &by_user),
+            Err(format!(r"C:\t\o is owned by {BOX_USER}, not SYSTEM, Administrators or TrustedInstaller"))
+        );
+        assert_eq!(judged_by(Role::WorkRoot, Trust::of_box(BOX_USER, false), &by_user), Ok(()));
+        for elevated in [true, false] {
+            assert_eq!(
+                judged_by(Role::WorkRoot, Trust::of_box(BOX_USER, elevated), "O:BUD:P(A;OICI;FA;;;SY)"),
+                Err(r"C:\t\o is owned by S-1-5-32-545, not SYSTEM, Administrators or TrustedInstaller".to_owned()),
+                "elevated {elevated}"
+            );
+        }
+        assert_eq!(
+            judged_by(Role::WorkRoot, Trust::of_box(BOX_USER, true), "O:SYD:P(A;OICI;FA;;;SY)"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn creator_and_owner_rights_entries_with_a_write_right_fail_and_owner_rights_to_read_passes() {
+        for (alias, sid) in [("CO", "S-1-3-0"), ("CG", "S-1-3-1"), ("OW", "S-1-3-4")] {
+            assert_eq!(
+                root_judged(&format!("{INSTALLED_ROOT}(A;OICIIO;0x2;;;{alias})")),
+                Err(format!(r"C:\t\o lets {sid} add files to it")),
+                "{alias}"
+            );
+        }
+        assert_eq!(root_judged(&format!("{INSTALLED_ROOT}(A;;0x1200a9;;;OW)")), Ok(()));
+    }
+
+    /// The builder's drive root lets Authenticated Users delete the root itself and add to it, which a volume root
+    /// above the work root may; deleting what it holds it may not, and a folder between may not even delete itself.
+    /// Delete-child is written `0x40`: SDDL's `DC` names the directory service's right, `0x2`.
+    #[test]
+    fn the_measured_drive_root_passes_as_the_volume_above_and_a_folder_above_keeps_its_deletes() {
+        let trust = Trust::of_box(BOX_USER, true);
+        let drive = "O:SYD:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICIIO;SDGXGWGR;;;AU)(A;;0x1301bf;;;AU)";
+        assert_eq!(judged_by(Role::WorkVolume, trust, drive), Ok(()));
+        assert_eq!(
+            judged_by(Role::WorkVolume, trust, "O:SYD:(A;;0x40;;;AU)"),
+            Err(r"C:\t\o lets S-1-5-11 delete what it holds".to_owned())
+        );
+        assert_eq!(
+            judged_by(Role::AboveWorkRoot, trust, "O:SYD:(A;;0x40;;;AU)"),
+            Err(r"C:\t\o lets S-1-5-11 delete what it holds".to_owned())
+        );
+        assert_eq!(
+            judged_by(Role::AboveWorkRoot, trust, "O:SYD:(A;;0x1301bf;;;AU)"),
+            Err(r"C:\t\o lets S-1-5-11 delete it".to_owned())
+        );
+        assert_eq!(
+            judged_by(Role::AboveWorkRoot, trust, "O:SYD:(A;OICIIO;GA;;;AU)(A;;FA;;;S-1-5-21-1-2-3-1001)"),
+            Ok(())
+        );
     }
 
     #[test]
@@ -852,7 +1429,7 @@ mod tests {
         let full = shown(&std::fs::canonicalize(system.join("cmd.exe")).expect("cmd.exe's final path can be read"));
 
         let why = check_installed_file(&link.join("cmd.exe")).map_err(|why| why.to_string());
-        let folder = check_folder(&link, Role::Above).map_err(|why| why.to_string());
+        let folder = check_folder(&link, Role::Above, Trust::OWNERS).map_err(|why| why.to_string());
 
         std::fs::remove_dir(&link).expect("the junction can be removed");
         assert_eq!(why, Err(format!(r"{}\cmd.exe resolves to {}", link.display(), full.display())));
@@ -888,5 +1465,185 @@ mod tests {
         let why = check_installed_file(shared).map_err(|why| why.to_string());
 
         assert_eq!(why, Err(format!("{} is on a network drive", shared.display())));
+    }
+
+    /// A fresh folder in the scratch folder, named for `name` and this process, and empty.
+    fn fresh(name: &str) -> PathBuf {
+        let folder = scratch().join(format!("gate-win32-trust-{name}-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&folder));
+        std::fs::create_dir_all(&folder).expect("the folder can be made");
+        folder
+    }
+
+    /// The work root held as `x` whose final path is no longer the root's, as when a folder above was renamed while
+    /// the walk read it, is refused naming where it now is.
+    #[test]
+    fn a_held_work_root_no_longer_at_its_path_is_refused() {
+        let folder = fresh("moved");
+        let (moved, root) = (folder.join("x"), folder.join("root"));
+        std::fs::create_dir(&moved).expect("the folder can be made");
+        let handle = held(&moved);
+
+        let why = still_at(&handle, &root);
+
+        assert_eq!(why, Err(Problem::ResolvesTo(moved.clone())));
+        assert_eq!(still_at(&handle, &moved), Ok(()), "a root still at its path passes");
+        drop(handle);
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    /// Another handle with delete access keeps the check from holding the root without delete sharing; a root that
+    /// passes all the same is said as busy, its own problem.
+    #[test]
+    fn a_work_root_open_elsewhere_with_delete_access_is_busy() {
+        let folder = fresh("busy");
+        let root = folder.join("remote");
+        // Made locked by the check, so the root passes once it is judged.
+        drop(check_work_root(&root, Some(&folder)).expect("a missing root is made locked"));
+        let other = OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(Share::All.mode())
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&root)
+            .expect("the root can be opened with delete access");
+
+        let why = check_work_root(&root, Some(&folder)).expect_err("a root open elsewhere with delete access is refused");
+
+        drop(other);
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+        assert!(why.is_busy(), "{why}");
+        assert_eq!(
+            why.to_string(),
+            format!("{} is open in another process; retry when it is closed", root.display())
+        );
+    }
+
+    /// A root another process holds open is judged all the same, so its handle cannot hide that the root is unsafe.
+    #[test]
+    fn an_unsafe_work_root_open_elsewhere_is_unsafe_not_busy() {
+        let folder = fresh("busy-unsafe");
+        let root = folder.join("remote");
+        drop(check_work_root(&root, Some(&folder)).expect("a missing root is made locked"));
+        grant(&root, "*S-1-0-0:(DE)");
+        let other = OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(Share::All.mode())
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&root)
+            .expect("the root can be opened with delete access");
+
+        let why = check_work_root(&root, Some(&folder)).expect_err("an unsafe root is refused");
+
+        drop(other);
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+        assert!(!why.is_busy(), "{why}");
+        assert_eq!(why.to_string(), format!("{} lets S-1-0-0 delete it", root.display()));
+    }
+
+    /// Runs icacls on `path` granting `grant`, which must succeed.
+    fn grant(path: &Path, grant: &str) {
+        let mut command = Command::new("icacls");
+        command.arg(path).args(["/grant", grant, "/q"]).stdin(Stdio::null()).stdout(Stdio::null());
+        let status = crate::spawn(&mut command).and_then(|mut child| child.wait()).expect("icacls runs");
+        assert!(status.success(), "icacls {} /grant {grant}: {status:?}", path.display());
+    }
+
+    /// The parent is read for its security and attributes alone, which the system checks no sharing for, so another
+    /// process holding it open, sharing nothing, does not keep the root from being made and held.
+    #[test]
+    fn a_parent_open_elsewhere_sharing_nothing_does_not_stop_the_check() {
+        let folder = fresh("parent-open");
+        let root = folder.join("remote");
+        let other = OpenOptions::new()
+            .access_mode(FILE_GENERIC_READ)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&folder)
+            .expect("the parent can be opened sharing nothing");
+
+        let checked = check_work_root(&root, Some(&folder)).map(drop).map_err(|why| why.to_string());
+
+        drop(other);
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+        assert_eq!(checked, Ok(()));
+    }
+
+    /// A folder is made beneath a parent opened for its security and attributes alone, as the check opens the parent.
+    #[test]
+    fn a_folder_is_made_beneath_a_parent_opened_for_its_security_alone() {
+        let folder = fresh("beneath");
+        let parent = open_unfollowed(&folder, FILE_FLAG_BACKUP_SEMANTICS, Share::All).expect("the parent can be opened");
+
+        let made = make_folder_beneath(&parent, "made", FILE_GENERIC_READ, Share::All, &locked()).map(drop);
+
+        let there = folder.join("made").is_dir();
+        drop(parent);
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+        assert_eq!(made.map_err(|error| error.to_string()), Ok(()));
+        assert!(there, "the folder is there");
+    }
+
+    /// The security the check makes a missing work root with, for this process's token.
+    fn locked() -> Descriptor {
+        let facts = crate::token_facts().expect("this process's token can be read");
+        Descriptor::from_sddl(&protected_sddl(&facts.user, facts.elevated, None)).expect("the SDDL names a descriptor")
+    }
+
+    /// The root the check returns is held, whether it made the root or found it: no one can rename or remove it while
+    /// the handle is open.
+    #[test]
+    fn a_held_work_root_cannot_be_renamed_or_removed() {
+        let folder = fresh("held");
+        let root = folder.join("remote");
+        let tried = || {
+            let renamed = std::fs::rename(&root, folder.join("elsewhere")).map_err(|error| error.raw_os_error());
+            let removed = std::fs::remove_dir(&root).map_err(|error| error.raw_os_error());
+            (renamed, removed)
+        };
+        let made = check_work_root(&root, Some(&folder)).expect("a missing root is made and held");
+        let while_made = tried();
+        drop(made);
+        let found = check_work_root(&root, Some(&folder)).expect("the root made is found and held");
+        let while_found = tried();
+        drop(found);
+
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+        let refused = (Err(Some(32)), Err(Some(32)));
+        assert_eq!(
+            while_made, refused,
+            "a rename and a removal of a root the check made are sharing violations"
+        );
+        assert_eq!(
+            while_found, refused,
+            "a rename and a removal of a root the check found are sharing violations"
+        );
+    }
+
+    /// A refused root this check made is removed through its handle; one holding a file cannot be, and says so.
+    #[test]
+    fn a_made_root_is_removed_unless_it_holds_a_file() {
+        let folder = fresh("removed");
+        let parent = held(&folder);
+        let why = |object: &Path| Untrusted {
+            object: object.to_owned(),
+            problem: Problem::NoAccessList,
+        };
+        let made = make_folder_beneath(&parent, "empty", FILE_GENERIC_READ | DELETE, Share::NoDelete, &locked()).expect("the folder is made");
+        let emptied = removed(&made, why(&folder.join("empty")));
+        drop(made);
+        let gone = !folder.join("empty").exists();
+        let full = make_folder_beneath(&parent, "full", FILE_GENERIC_READ | DELETE, Share::NoDelete, &locked()).expect("the folder is made");
+        std::fs::write(folder.join("full").join("f.txt"), "f").expect("the file can be written");
+        let kept = removed(&full, why(&folder.join("full")));
+        drop(full);
+        drop(parent);
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+
+        assert_eq!(emptied, why(&folder.join("empty")), "an empty root's refusal is said as it is");
+        assert!(gone, "the empty root is removed");
+        assert!(
+            matches!(&kept.problem, Problem::Kept(problem, _) if **problem == Problem::NoAccessList),
+            "{kept:?}"
+        );
     }
 }

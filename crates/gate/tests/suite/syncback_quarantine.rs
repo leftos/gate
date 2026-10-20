@@ -63,7 +63,9 @@ fn sync_back_gate(case: &Case, command: &[&str]) -> Command {
     assert_eq!(words[3], "--timeout", "the ceiling's value follows it");
     words[4] = "3600";
     let mut gate = case.gate(&words);
-    gate.env(STEPS_VARIABLE, &steps).env(GATE_VARIABLE, GATE);
+    gate.env(STEPS_VARIABLE, &steps)
+        .env(GATE_VARIABLE, GATE)
+        .env(crate::support::ROOT_WALK_STOP_VARIABLE, case.folder());
     gate
 }
 

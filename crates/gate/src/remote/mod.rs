@@ -139,12 +139,60 @@ pub(crate) fn install_untrusted_line(why: &str) -> String {
 /// [`INSTALL_STATUS`] and one of `said`, the lines it wrote before any start marker, starts [`INSTALL_UNTRUSTED`];
 /// `None` for any other call. The client and `gate check --builder` both read the refusal through it.
 pub(crate) fn install_why<'a>(status: i32, said: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
-    if status != i32::from(INSTALL_STATUS) {
+    refusal_why(status, INSTALL_STATUS, INSTALL_UNTRUSTED, said)
+}
+
+/// Why the box refused a call with the line starting `prefix`, cut to [`git::FAILURE_BYTES`]: the call exited
+/// `expected_status` and one of `said`, the lines it wrote, starts `prefix`; `None` for any other call.
+fn refusal_why<'a>(status: i32, expected_status: u8, prefix: &str, said: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    if status != i32::from(expected_status) {
         return None;
     }
     said.into_iter()
-        .find_map(|line| line.strip_prefix(INSTALL_UNTRUSTED))
+        .find_map(|line| line.strip_prefix(prefix))
         .map(|why| git::first_bytes(why, git::FAILURE_BYTES))
+}
+
+/// What the box says on standard error, before why, when its preflight refuses the builder's work root, the folder
+/// above `work`, because an account other than SYSTEM, Administrators, `TrustedInstaller` and the box's user may write
+/// in it, or anyone else may empty, remove, re-permission or take a folder above it
+/// ([`gate_win32::check_work_root`]). The box says its version line first and exits [`ROOT_STATUS`]; the client and
+/// `gate check --builder` read the refusal by this prefix.
+pub(crate) const ROOT_UNSAFE: &str = "gate: the builder's work root is not locked down: ";
+
+/// The exit status of a box whose preflight refused its work root with [`ROOT_UNSAFE`].
+pub(crate) const ROOT_STATUS: u8 = 1;
+
+/// The box's line refusing its work root for `why`, shown escaped, and naming the installer step that locks it down
+/// ([`ROOT_UNSAFE`]).
+pub(crate) fn root_unsafe_line(why: &str) -> String {
+    format!(
+        "{ROOT_UNSAFE}{}; run the installer's \"Gate work root\" step (install-toolchains.ps1 -Only \"Gate work root\")",
+        gate_router::escaped(why)
+    )
+}
+
+/// Why the box refused its work root, cut to [`git::FAILURE_BYTES`]: the call exited [`ROOT_STATUS`] and one of
+/// `said`, the lines it wrote, starts [`ROOT_UNSAFE`]; `None` for any other call, as [`install_why`] reads its own.
+pub(crate) fn root_why<'a>(status: i32, said: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    refusal_why(status, ROOT_STATUS, ROOT_UNSAFE, said)
+}
+
+/// What the box says on standard error, before why, when its preflight cannot hold the builder's work root because
+/// another process has it open with delete access, or without sharing reading, and the root and the folders above pass
+/// all the same: the root is not unsafe, only busy, so the line carries no installer step. The box says its version
+/// line first and exits [`ROOT_STATUS`].
+pub(crate) const ROOT_BUSY: &str = "gate: the builder's work root is busy: ";
+
+/// The box's line saying its work root is busy for `why`, shown escaped ([`ROOT_BUSY`]).
+pub(crate) fn root_busy_line(why: &str) -> String {
+    format!("{ROOT_BUSY}{}", gate_router::escaped(why))
+}
+
+/// Why the box found its work root busy, cut to [`git::FAILURE_BYTES`]: the call exited [`ROOT_STATUS`] and one of
+/// `said`, the lines it wrote, starts [`ROOT_BUSY`]; `None` for any other call, as [`root_why`] reads an unsafe root.
+pub(crate) fn root_busy_why<'a>(status: i32, said: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    refusal_why(status, ROOT_STATUS, ROOT_BUSY, said)
 }
 
 /// The start marker the box says on stderr just before it starts the command of the run whose payload carries `nonce`:
@@ -690,7 +738,7 @@ mod scripted {
     /// How often `wait` looks for its path and the interrupt.
     const WAIT_STEP: Duration = Duration::from_millis(20);
     /// Every reason a `refuse` step may give.
-    const REASONS: [FallbackReason; 14] = [
+    const REASONS: [FallbackReason; 15] = [
         FallbackReason::Full,
         FallbackReason::Busy,
         FallbackReason::Unreachable,
@@ -705,6 +753,7 @@ mod scripted {
         FallbackReason::Desktop,
         FallbackReason::Install,
         FallbackReason::Lfs,
+        FallbackReason::Root,
     ];
 
     #[derive(Debug, PartialEq)]
@@ -996,5 +1045,81 @@ mod scripted {
                 Err("line 2: unknown step, or a step without its value: 'record'".to_owned())
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{INSTALL_UNTRUSTED, ROOT_BUSY, ROOT_STATUS, ROOT_UNSAFE, git, root_busy_line, root_busy_why, root_unsafe_line, root_why};
+
+    #[test]
+    fn the_root_line_names_why_escaped_and_the_installer_step() {
+        assert_eq!(
+            root_unsafe_line("D:\\gate-remote lets S-1-5-11 add files to it\n"),
+            "gate: the builder's work root is not locked down: D:\\gate-remote lets S-1-5-11 add files to it\\n; run the \
+             installer's \"Gate work root\" step (install-toolchains.ps1 -Only \"Gate work root\")"
+        );
+    }
+
+    #[test]
+    fn the_busy_root_line_names_why_escaped_and_no_installer_step() {
+        assert_eq!(
+            root_busy_line("D:\\gate-remote is open in another process; retry when it is closed\n"),
+            "gate: the builder's work root is busy: D:\\gate-remote is open in another process; retry \
+             when it is closed\\n"
+        );
+    }
+
+    #[test]
+    fn a_root_refusal_is_read_from_its_line_at_its_status() {
+        let line = root_unsafe_line(r"D:\gate-remote has no access list");
+        let said = ["gate: remote version 1.0.0", line.as_str()];
+
+        assert_eq!(root_why(i32::from(ROOT_STATUS), said), line.strip_prefix(ROOT_UNSAFE));
+    }
+
+    #[test]
+    fn another_status_or_no_root_line_is_no_root_refusal() {
+        let line = root_unsafe_line(r"D:\gate-remote is a reparse point");
+        assert_eq!(root_why(2, [line.as_str()]), None, "another status");
+        assert_eq!(root_why(0, [line.as_str()]), None, "a pass");
+        let install = format!("{INSTALL_UNTRUSTED}the helper is owned by S-1-5-21-1");
+        assert_eq!(root_why(i32::from(ROOT_STATUS), [install.as_str()]), None, "the install refusal");
+        assert_eq!(root_why(i32::from(ROOT_STATUS), Vec::<&str>::new()), None, "nothing said");
+    }
+
+    #[test]
+    fn a_root_why_is_cut_to_the_failure_bytes() {
+        let long = format!("{ROOT_UNSAFE}{}", "x".repeat(git::FAILURE_BYTES + 10));
+        assert_eq!(root_why(1, [long.as_str()]).map(str::len), Some(git::FAILURE_BYTES));
+    }
+
+    #[test]
+    fn a_busy_root_is_read_from_its_line_at_its_status() {
+        let line = root_busy_line(r"D:\gate-remote is open in another process; retry when it is closed");
+        let said = ["gate: remote version 1.0.0", line.as_str()];
+
+        assert_eq!(root_busy_why(i32::from(ROOT_STATUS), said), line.strip_prefix(ROOT_BUSY));
+    }
+
+    #[test]
+    fn another_status_or_no_busy_line_is_no_busy_root() {
+        let line = root_busy_line(r"D:\gate-remote is open in another process; retry when it is closed");
+        assert_eq!(root_busy_why(2, [line.as_str()]), None, "another status");
+        assert_eq!(root_busy_why(0, [line.as_str()]), None, "a pass");
+        let unsafe_root = root_unsafe_line(r"D:\gate-remote is a reparse point");
+        assert_eq!(root_busy_why(i32::from(ROOT_STATUS), [unsafe_root.as_str()]), None, "the unsafe root");
+        assert_eq!(
+            root_why(i32::from(ROOT_STATUS), [line.as_str()]),
+            None,
+            "a busy root is not an unsafe one"
+        );
+        assert_eq!(root_busy_why(i32::from(ROOT_STATUS), Vec::<&str>::new()), None, "nothing said");
+    }
+
+    #[test]
+    fn a_busy_why_is_cut_to_the_failure_bytes() {
+        let long = format!("{ROOT_BUSY}{}", "x".repeat(git::FAILURE_BYTES + 10));
+        assert_eq!(root_busy_why(1, [long.as_str()]).map(str::len), Some(git::FAILURE_BYTES));
     }
 }

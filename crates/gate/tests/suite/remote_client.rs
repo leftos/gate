@@ -22,6 +22,7 @@ use proc_table::{ProcessTable as _, ProcessTree, Win32ProcessTable};
 use regex::Regex;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
 use crate::durations::seed;
 use crate::support::{
@@ -504,7 +505,9 @@ pub(super) fn client_gate_tuned(case: &Case, log: &str, steps: &Path, tuned: &Tu
     assert_eq!(words[3], "--timeout", "the ceiling's value follows it");
     words[4] = tuned.timeout;
     let mut gate = case.gate(&words);
-    gate.env(STEPS_VARIABLE, steps).env(GATE_VARIABLE, GATE);
+    gate.env(STEPS_VARIABLE, steps)
+        .env(GATE_VARIABLE, GATE)
+        .env(crate::support::ROOT_WALK_STOP_VARIABLE, case.folder());
     gate
 }
 
@@ -1689,6 +1692,90 @@ fn a_builder_whose_gate_is_not_admin_installed_falls_back_to_local() {
     assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight"]);
     assert_eq!(fallbacks(&events(&case)), ["install"]);
+}
+
+/// Grants the NULL SID, which has no members and so stands for another account, the right to change `folder` and what
+/// it holds: a box whose work root is `folder` refuses it as not locked down.
+pub(super) fn open_to_another_account(folder: &Path) {
+    let output = Command::new("icacls")
+        .arg(folder)
+        .args(["/grant", "*S-1-0-0:(OI)(CI)M", "/q"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("icacls starts");
+    assert!(output.status.success(), "icacls grants the NULL SID {}: {output:?}", folder.display());
+}
+
+/// The real box refuses a work root another account may write in; the run falls back to local, saying the box's why
+/// once, with the installer step that locks the root down.
+#[test]
+fn a_builder_whose_work_root_is_open_falls_back_root() {
+    let case = client_case("client-open-root");
+    let root = case.folder().join("builder");
+    fs::create_dir_all(&root).expect("the builder root can be made");
+    open_to_another_account(&root);
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here", "exit", "3"]));
+
+    assert_eq!(outcome.code, Some(3), "the local command's status: {outcome:?}");
+    let line = format!(
+        "gate: not routed: builder's work root is not locked down: {} lets S-1-0-0 add files to it; run the installer's \
+         \"Gate work root\" step (install-toolchains.ps1 -Only \"Gate work root\")",
+        shown(&root)
+    );
+    assert_eq!(outcome.stderr.lines().filter(|said| *said == line).count(), 1, "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: remote builder root; running here"), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"]);
+    assert_eq!(fallbacks(&events(&case)), ["root"]);
+    assert!(!root.join("work").exists(), "no work folder is made: {outcome:?}");
+}
+
+/// A locked work root another process holds open with delete access is busy, not unsafe: the run falls back to local
+/// for the same reason, saying the box's busy line, which names no installer step.
+#[test]
+fn a_builder_whose_work_root_is_busy_falls_back_root() {
+    let case = client_case("client-busy-root");
+    let root = case.folder().join("builder");
+    fs::create_dir_all(&root).expect("the builder root can be made");
+    let user = gate_win32::current_user_sid().expect("this user's SID can be read");
+    let grant = format!("*{user}:(OI)(CI)F");
+    let locked = Command::new("icacls")
+        .arg(&root)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-5-32-544:(OI)(CI)F",
+            &grant,
+            "/q",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("icacls starts");
+    assert!(locked.status.success(), "the root is locked as the installer locks it: {locked:?}");
+    let other = fs::File::options()
+        .access_mode(DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(&root)
+        .expect("the root can be opened with delete access");
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here", "exit", "3"]));
+
+    drop(other);
+    assert_eq!(outcome.code, Some(3), "the local command's status: {outcome:?}");
+    let line = format!(
+        "gate: not routed: builder's work root is busy: {} is open in another process; retry when it is closed",
+        shown(&root)
+    );
+    assert_eq!(outcome.stderr.lines().filter(|said| *said == line).count(), 1, "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: remote builder root; running here"), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"]);
+    assert_eq!(fallbacks(&events(&case)), ["root"]);
 }
 
 /// A box that passed the preflight and refuses its install at the run call, before the command started, falls back to

@@ -170,6 +170,9 @@ pub(crate) struct Checked {
     pub consent_problem: Option<String>,
     /// Why this PC's routing file's `hooks` value cannot be used, when it cannot.
     pub hooks_problem: Option<String>,
+    /// Why a builder's box refused its work root: not locked down, naming the installer step that locks it, or busy;
+    /// `None` for this PC and for a builder that took its root.
+    pub root_problem: Option<String>,
     /// The declared siblings, in declared order.
     pub siblings: Vec<Sibling>,
     /// The folders a builder's preflight said it created, in its order; none for this PC.
@@ -306,12 +309,15 @@ pub(crate) fn said(place: At<'_>, checked: &Checked) -> Said {
     Said { lines, status }
 }
 
-/// Every item of `checked`, found `at` this PC or a builder, in the order the lines say them.
+/// Every item of `checked`, found `at` this PC or a builder, in the order the lines say them. A builder whose box
+/// refused its work root answered no probe and read no warm-up: its exact pins are not judged, so each tool is said as
+/// its unanswered probe is, skipped, and its builder warm-up item is left out.
 fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
+    let answered = checked.root_problem.is_none();
     let mut items: Vec<Item> = checked
         .tools
         .iter()
-        .map(|tool| tool_item(at, checked.exact_pins(&tool.need.name), tool))
+        .map(|tool| tool_item(at, checked.exact_pins(&tool.need.name).filter(|_| answered), tool))
         .collect();
     items.extend(checked.sdk.as_ref().map(|sdk| sdk_item(at, sdk)));
     if !checked.workloads.is_empty() {
@@ -325,6 +331,9 @@ fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
     if let Some(problem) = &checked.hooks_problem {
         items.push(Item::new(format!("remote.json: {}", escaped(problem)), Kind::Missing));
     }
+    if let Some(problem) = &checked.root_problem {
+        items.push(Item::new(escaped(problem), Kind::Missing));
+    }
     if let Some(why) = &checked.declarations_problem {
         items.push(Item::new(
             format!("declarations for {}: {}", escaped(&checked.repo), escaped(why)),
@@ -335,7 +344,13 @@ fn items(at: At<'_>, checked: &Checked) -> Vec<Item> {
     if checked.siblings_skipped {
         items.push(Item::new("siblings skipped: a routed run lays them out".to_owned(), Kind::Skipped));
     }
-    items.extend(checked.warmup.iter().map(|warmup| warmup_item(checked, warmup)));
+    items.extend(
+        checked
+            .warmup
+            .iter()
+            .filter(|warmup| answered || !matches!(warmup, Warmup::Builder { .. }))
+            .map(|warmup| warmup_item(checked, warmup)),
+    );
     items
 }
 
@@ -628,6 +643,7 @@ mod tests {
             workloads: Vec::new(),
             consent_problem: None,
             hooks_problem: None,
+            root_problem: None,
             siblings: Vec::new(),
             created: Vec::new(),
             siblings_skipped: false,

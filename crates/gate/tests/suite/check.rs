@@ -13,7 +13,7 @@ use gate_router::work_folder_key;
 use gate_state::v1::{self, WarmRecord, WarmState};
 use jiff::Timestamp;
 
-use crate::remote_client::fake_unreal_install;
+use crate::remote_client::{fake_unreal_install, open_to_another_account};
 use crate::support::{
     ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, Go, NetfxKey, Outcome, PREFLIGHT_SEAMS_VARIABLE, STEPS_VARIABLE, build_version, calls,
     finish, git, ssh_steps, wait_until_closed, write_remote_json,
@@ -1419,7 +1419,8 @@ fn builder_check(case: &Case, host: &str, folders: &[PathBuf], steps: &Path) -> 
         .env("PATH", path_with_git(folders))
         .env(STEPS_VARIABLE, steps)
         .env(GATE_VARIABLE, GATE)
-        .env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING);
+        .env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING)
+        .env(crate::support::ROOT_WALK_STOP_VARIABLE, case.folder());
     command
 }
 
@@ -1596,6 +1597,41 @@ fn check_builder_says_a_missing_tool_with_its_builder_hint_and_exits_1() {
         "{outcome:?}"
     );
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
+}
+
+/// A builder whose box refuses its work root says it as a missing item; the rest of the report still shows, its tools
+/// unanswered.
+#[test]
+fn check_builder_reports_an_open_work_root_as_missing() {
+    let case = builder_case("check_builder_open_root");
+    write(&case, ".gate/toolchain.toml", "[tools]\nnode = \"24\"\n");
+    let stub = stubs(&case, &[("node", "@echo v24.19.0\r\n")]);
+    let root = builder_root(&case);
+    fs::create_dir_all(&root).expect("the builder root can be made");
+    open_to_another_account(&root);
+    let steps = ssh_steps(&case, "ssh", &["ok"]);
+
+    let outcome = check_builder(&case, "builder-1", &[stub], &steps);
+
+    let [header, _] = first_lines(&case, "builder-1");
+    let item = format!(
+        "check: builder-1: the work root is not locked down: {} lets S-1-0-0 add files to it; run the installer's \
+         \"Gate work root\" step (install-toolchains.ps1 -Only \"Gate work root\")",
+        root.display()
+    );
+    assert_eq!(
+        lines(&outcome.stdout),
+        [
+            header.as_str(),
+            "check: builder-1: node skipped: the builder gave no answer",
+            item.as_str(),
+            "check: builder-1: 1 missing, 0 too old, 1 skipped",
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"], "one call reached the builder");
 }
 
 #[test]

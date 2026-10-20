@@ -24,12 +24,12 @@ use crate::boxside::boot;
 use crate::boxside::forward::{ChildPipes, ClientGone, DRAIN, Drained, OutputLock};
 use crate::boxside::helper_trusted;
 use crate::boxside::msys;
-use crate::boxside::payload::{Pair, PairSibling, Payload};
+use crate::boxside::payload::{Pair, PairSibling, Payload, bare_stem, escaped, work_root};
 use crate::boxside::probe;
 use crate::boxside::run::{self, FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_SINGLE};
 use crate::console::Console;
 use crate::environment::Variables;
-use crate::remote::{INSTALL_STATUS, NEW_WORK_TREE, git, install_untrusted_line};
+use crate::remote::{INSTALL_STATUS, NEW_WORK_TREE, ROOT_STATUS, git, install_untrusted_line, root_busy_line, root_unsafe_line};
 use crate::run::{ERROR_FILE_NOT_FOUND, find_program};
 
 /// The status of a step that failed with no status of its own: git or a folder that could not be made or written.
@@ -89,6 +89,9 @@ pub(crate) fn git_failed(step: &str, code: i32) -> Failed {
 /// the box that is not trusted ([`helper_trusted`]), judged as the box's own image is ([`crate::boxside::judges_trust`]),
 /// so a builder whose helper any other process could replace is not routed, and `gate check --builder` says so. The
 /// version line comes first, so a PC client of another version falls back on the version rather than a bare status 1.
+/// Then, once the payload is read and before any record is read or folder readied, it makes the work root locked when
+/// it is missing and refuses one another account may write in, after its version line, with the root line and
+/// [`ROOT_STATUS`] ([`held_work_root`]), holding it until the folders are readied.
 pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
     if crate::boxside::judges_trust()
         && let Err(why) = gate_desktop::helper_path()
@@ -109,6 +112,11 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
             return u32::from(USAGE_STATUS);
         }
     };
+    // Held until the folders are readied, so no one can rename or remove the root meanwhile.
+    let held_root = match held_work_root(work, bare, pair.is_some(), seams, console) {
+        Ok(held) => held,
+        Err(status) => return status,
+    };
     // Read once, before the folders are readied, which would make a missing `.git` and so a stale record look current.
     let layout = layout_record(work);
     let warm = warm_state(work, &layout);
@@ -126,6 +134,7 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
         None => ready(bare, work, &layout, console),
         Some(pair) => ready_bares(bare, work, pair, console).map(|()| false),
     };
+    drop(held_root);
     let made = match readied {
         Ok(made) => made,
         Err(failed) => {
@@ -148,6 +157,41 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
     }
     say_sdks_and_tools(payload, work, seams, console);
     0
+}
+
+/// The builder's work root, `<root>` of the work folder `work` (`<root>\work\<key>`), made locked when it is missing,
+/// judged and held by [`gate_win32::check_work_root`], its walk above ending at `--test-box-root-walk-stop` when
+/// `seams` gives it. Else the status to exit with, said first: the usage line and [`USAGE_STATUS`] for a `work` laid
+/// out otherwise, or, unless `paired`, a bare repository `bare` that is not `<root>\<name>.git`; or the version line
+/// and [`ROOT_STATUS`] with the refusal ([`root_unsafe_line`]) for a root another account may write in, or the busy
+/// line ([`root_busy_line`]) for one another process holds open with delete access, or without sharing reading.
+fn held_work_root(work: &str, bare: &str, paired: bool, seams: &BoxSeams, console: &mut Console) -> Result<File, u32> {
+    let Some(root) = work_root(work) else {
+        console.err(&format!(
+            r"gate: box payload Work must be <root>\work\<key> to lock its root down: {}",
+            escaped(work)
+        ));
+        return Err(u32::from(USAGE_STATUS));
+    };
+    // A pair's bare repositories were checked against the root as its layout was read. A drive's own root is compared
+    // without its separator, as the bare repository's folder is cut.
+    if !paired && bare_stem(bare, root.trim_end_matches(['\\', '/'])).is_none() {
+        console.err(&format!(
+            r"gate: box payload Bare must be <root>\<name>.git to lock its root down: {}",
+            escaped(bare)
+        ));
+        return Err(u32::from(USAGE_STATUS));
+    }
+    gate_win32::check_work_root(Path::new(&root), seams.root_walk_stop.as_deref()).map_err(|why| {
+        console.out(&format!("gate: remote version {}", build_version()));
+        let line = if why.is_busy() {
+            root_busy_line(&why.to_string())
+        } else {
+            root_unsafe_line(&why.to_string())
+        };
+        console.err(&line);
+        u32::from(ROOT_STATUS)
+    })
 }
 
 /// Says the SDK line, the list read within `--test-dotnet-limit-ms` when `seams` gives it, else

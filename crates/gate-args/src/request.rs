@@ -105,6 +105,10 @@ pub struct BoxSeams {
     /// What `gate box register-desktop` does in place of the Task Scheduler's work: `true` succeeds, `false` fails as
     /// the test seam refusing; `None` without the feature.
     pub register_ok: Option<bool>,
+    /// The folder at which `gate box preflight`'s walk over the folders above the work root ends, that folder and
+    /// those above it left unjudged, so the suite's cases do not depend on the host's folders; `None` without the
+    /// feature, and the walk goes to the volume root.
+    pub root_walk_stop: Option<PathBuf>,
 }
 
 /// A fault `--test-box-desktop` makes the box's desktop run take, in place of the real task start and helper.

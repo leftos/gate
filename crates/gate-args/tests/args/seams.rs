@@ -1474,6 +1474,72 @@ fn box_seam_console_and_park_launch_are_unknown_words_without_the_feature() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn box_seam_root_walk_stop_is_read_before_the_verb() {
+    use std::path::PathBuf;
+
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    let stopped = Invocation::Box(BoxRequest {
+        verb: BoxVerb::Preflight,
+        seams: BoxSeams {
+            root_walk_stop: Some(PathBuf::from(r"X:\case")),
+            ..BoxSeams::default()
+        },
+        root: None,
+    });
+    assert_eq!(
+        invocation(&["box", "--test-box-root-walk-stop", r"X:\case", "preflight", "--stdin"]),
+        stopped
+    );
+    assert_eq!(
+        invocation(&["box", "--test-box-root-walk-stop=X:\\case", "preflight", "--stdin"]),
+        stopped
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_root_walk_stop_refuses_a_missing_or_repeated_value() {
+    let rows: [(&[&str], &[&str]); 3] = [
+        (
+            &["box", "--test-box-root-walk-stop=", "preflight", "--stdin"],
+            &["gate: --test-box-root-walk-stop needs a value"],
+        ),
+        (
+            &["box", "--test-box-root-walk-stop", "--test-heartbeat-ms", "30", "preflight", "--stdin"],
+            &["gate: --test-box-root-walk-stop needs a value"],
+        ),
+        (
+            &[
+                "box",
+                "--test-box-root-walk-stop",
+                "a",
+                "--test-box-root-walk-stop=b",
+                "preflight",
+                "--stdin",
+            ],
+            &["gate: --test-box-root-walk-stop is given twice"],
+        ),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), want, "{words:?}");
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+#[test]
+fn box_seam_root_walk_stop_is_an_unknown_word_without_the_feature() {
+    assert_eq!(
+        problems(&["box", "--test-box-root-walk-stop", "case", "preflight", "--stdin"]),
+        [BOX_USAGE]
+    );
+    assert_eq!(problems(&["box", "--test-box-root-walk-stop=case", "preflight", "--stdin"]), [BOX_USAGE]);
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn box_seam_token_is_read_before_the_verb() {
     use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
 

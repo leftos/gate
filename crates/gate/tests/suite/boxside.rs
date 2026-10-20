@@ -18,10 +18,13 @@ use jiff::{SignedDuration, Timestamp};
 use proc_table::Win32ProcessTable;
 use regex::Regex;
 use serde_json::{Value, json};
+use windows_sys::Win32::Storage::FileSystem::{
+    DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+};
 
 use crate::support::{
     Case, Closed, Escapee, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, NetfxKey, Outcome, Running, StderrCloser, UNTIL_KILLED, allow_breakaway, box_payload,
-    build_version, copy_tool, finish, junction, shown, start_with_closable_stderr, start_with_closed, start_with_stdin, wait_until,
+    build_version, copy_tool, finish, junction, names, shown, start_with_closable_stderr, start_with_closed, start_with_stdin, wait_until,
     wait_until_closed,
 };
 
@@ -127,9 +130,16 @@ fn send_request(stdin: &mut ChildStdin, request: &str) {
 }
 
 /// `gate box` with `args` after `box` (the seams, then the verb) and `--stdin`, its heartbeat period
-/// [`QUIET_HEARTBEAT_MS`], without the git variables the suite may have inherited; `request` is its stdin's first line.
+/// [`QUIET_HEARTBEAT_MS`] and the walk above its work root ending at the case folder, without the git variables the
+/// suite may have inherited; `request` is its stdin's first line.
 fn box_call(case: &Case, args: &[&str], request: &str) -> BoxCall {
-    let mut words = vec!["box", "--test-heartbeat-ms", QUIET_HEARTBEAT_MS];
+    box_call_stopped_at(case, &case.folder(), args, request)
+}
+
+/// [`box_call`] with the walk above the work root ending at `stop`, unjudged, in place of the case folder.
+fn box_call_stopped_at(case: &Case, stop: &Path, args: &[&str], request: &str) -> BoxCall {
+    let stop = shown(stop);
+    let mut words = vec!["box", "--test-heartbeat-ms", QUIET_HEARTBEAT_MS, "--test-box-root-walk-stop", &stop];
     words.extend_from_slice(args.strip_prefix(&["box"][..]).unwrap_or(args));
     bare_box_call(case, &words, request)
 }
@@ -162,7 +172,8 @@ fn gate_box(case: &Case, verb: &str, request: &str, path: Option<&OsString>) -> 
     call.finish()
 }
 
-/// A preflight's two folders under the case folder, the bare repository's parent not yet made.
+/// A preflight's two folders under the case folder, laid out as the client lays out a builder's root: the bare
+/// repository `remote\k.git` and the work folder `remote\work\k`, the root `remote` not yet made.
 struct Folders {
     bare: String,
     work: String,
@@ -174,7 +185,7 @@ impl Folders {
         let text = |path: PathBuf| path.to_str().expect("the case folder is Unicode").to_owned();
         Folders {
             bare: text(remote.join("k.git")),
-            work: text(remote.join("k")),
+            work: text(remote.join("work").join("k")),
         }
     }
 
@@ -373,8 +384,9 @@ fn preflight_without_git_says_the_step_could_not_start() {
 fn preflight_cannot_create_the_folder_above_work() {
     let case = Case::new("preflight_cannot_create_the_folder_above_work");
     let folders = Folders::new(&case);
-    let remote = case.folder().join("remote");
-    fs::write(&remote, "a file where the folder goes").expect("the blocking file can be written");
+    let above = case.folder().join("remote").join("work");
+    fs::create_dir_all(case.folder().join("remote")).expect("the work root can be made");
+    fs::write(&above, "a file where the folder goes").expect("the blocking file can be written");
 
     let outcome = gate_box(&case, "preflight", &folders.payload(), None);
 
@@ -383,9 +395,243 @@ fn preflight_cannot_create_the_folder_above_work() {
     assert!(
         outcome
             .stderr
-            .starts_with(&format!("gate: remote could not create the folder {}: ", remote.display())),
+            .starts_with(&format!("gate: remote could not create the folder {}: ", above.display())),
         "{outcome:?}"
     );
+}
+
+/// What the preflight says on stderr refusing the work root because of `why`.
+fn root_unsafe(why: &str) -> String {
+    format!(
+        "gate: the builder's work root is not locked down: {why}; run the installer's \"Gate work root\" step \
+         (install-toolchains.ps1 -Only \"Gate work root\")\n"
+    )
+}
+
+/// Runs icacls on `path` with `args`, which must succeed.
+fn icacls(path: &Path, args: &[&str]) {
+    let output = Command::new("icacls")
+        .arg(path)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("icacls starts");
+    assert!(output.status.success(), "icacls {} {args:?}: {output:?}", path.display());
+}
+
+/// The DACL and label of the folder `path`, read through a handle, in their string form less the automatic-inheritance
+/// flags.
+fn folder_security(path: &Path) -> String {
+    let opened = fs::File::options()
+        .access_mode(READ_CONTROL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .expect("the folder can be opened");
+    gate_win32::without_auto_inherit(&gate_win32::security_text(&opened).expect("its security can be read"))
+}
+
+/// A preflight of [`box_payload`]'s layout for the key `k`, whose work root is `{case}\remote`.
+fn root_preflight(case: &Case) -> Outcome {
+    gate_box(case, "preflight", &payload(&box_payload(case, "k", &["unused"])), None)
+}
+
+/// The NULL SID, which has no members, stands for another account: a grant to it lets no one in.
+#[test]
+fn preflight_refuses_a_work_root_another_account_may_write_in() {
+    let case = Case::new("preflight_refuses_a_work_root_another_account_may_write_in");
+    let root = case.folder().join("remote");
+    fs::create_dir_all(&root).expect("the work root can be made");
+    icacls(&case.folder(), &["/grant", "*S-1-0-0:(OI)(CI)M", "/q"]);
+
+    let outcome = root_preflight(&case);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, format!("gate: remote version {}\n", build_version(&case)));
+    assert_eq!(outcome.stderr, root_unsafe(&format!("{} lets S-1-0-0 add files to it", root.display())));
+    assert!(!root.join("work").exists(), "no work folder is made: {outcome:?}");
+    assert!(!root.join("k.git").exists(), "no bare repository is made: {outcome:?}");
+}
+
+#[test]
+fn preflight_passes_a_work_root_locked_as_the_installer_locks_it() {
+    let case = Case::new("preflight_passes_a_work_root_locked_as_the_installer_locks_it");
+    let root = case.folder().join("remote");
+    fs::create_dir_all(&root).expect("the work root can be made");
+    let user = gate_win32::current_user_sid().expect("this user's SID can be read");
+    let grant = format!("*{user}:(OI)(CI)F");
+    icacls(
+        &root,
+        &[
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-5-32-544:(OI)(CI)F",
+            &grant,
+            "/q",
+        ],
+    );
+
+    passed(&root_preflight(&case));
+    assert!(root.join("k.git").is_dir(), "the bare repository is made in the root");
+}
+
+#[test]
+fn preflight_creates_a_missing_work_root_locked() {
+    let case = Case::new("preflight_creates_a_missing_work_root_locked");
+    let root = case.folder().join("remote");
+    let user = gate_win32::current_user_sid().expect("this user's SID can be read");
+
+    passed(&root_preflight(&case));
+
+    assert_eq!(folder_security(&root), format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user})"));
+}
+
+#[test]
+fn preflight_refuses_a_work_root_that_is_a_junction() {
+    let case = Case::new("preflight_refuses_a_work_root_that_is_a_junction");
+    let root = case.folder().join("remote");
+    let elsewhere = case.folder().join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("the junction's target can be made");
+    junction(&root, &elsewhere);
+
+    let outcome = root_preflight(&case);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, format!("gate: remote version {}\n", build_version(&case)));
+    assert_eq!(outcome.stderr, root_unsafe(&format!("{} is a reparse point", root.display())));
+    assert_eq!(names(&elsewhere), Vec::<String>::new(), "nothing is made through the junction");
+}
+
+/// `(DC)`, delete child, on the root's parent lets the NULL SID remove the root whatever the root's own DACL says.
+#[test]
+fn preflight_refuses_a_folder_above_the_work_root_another_account_may_delete_in() {
+    let case = Case::new("preflight_refuses_a_folder_above_the_work_root_another_account_may_delete_in");
+    icacls(&case.folder(), &["/grant", "*S-1-0-0:(DC)", "/q"]);
+    // The walk is stopped above the case folder, so the case folder, the root's parent, is judged.
+    let above = case.folder().parent().expect("the case folder has a parent").to_owned();
+    let request = payload(&box_payload(&case, "k", &["unused"]));
+
+    let outcome = box_call_stopped_at(&case, &above, &["box", "preflight"], &request).finish();
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, format!("gate: remote version {}\n", build_version(&case)));
+    assert_eq!(
+        outcome.stderr,
+        root_unsafe(&format!("{} lets S-1-0-0 delete what it holds", case.folder().display()))
+    );
+    assert!(!case.folder().join("remote").exists(), "no work root is made: {outcome:?}");
+}
+
+/// Locks the work root `root` as the installer does: its inheritance cut, SYSTEM, Administrators and this user given
+/// full control.
+fn lock_as_the_installer(root: &Path) {
+    let user = gate_win32::current_user_sid().expect("this user's SID can be read");
+    let grant = format!("*{user}:(OI)(CI)F");
+    icacls(
+        root,
+        &[
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-5-32-544:(OI)(CI)F",
+            &grant,
+            "/q",
+        ],
+    );
+}
+
+/// Another process holding a locked root open with delete access keeps the preflight from holding it; that says the
+/// root is busy, not unsafe, and names no installer step.
+#[test]
+fn preflight_says_a_work_root_open_elsewhere_with_delete_access_is_busy() {
+    let case = Case::new("preflight_says_a_work_root_open_elsewhere_with_delete_access_is_busy");
+    let root = case.folder().join("remote");
+    fs::create_dir_all(&root).expect("the work root can be made");
+    lock_as_the_installer(&root);
+    let other = fs::File::options()
+        .access_mode(DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(&root)
+        .expect("the root can be opened with delete access");
+
+    let outcome = root_preflight(&case);
+
+    drop(other);
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, format!("gate: remote version {}\n", build_version(&case)));
+    assert_eq!(
+        outcome.stderr,
+        format!(
+            "gate: the builder's work root is busy: {} is open in another process; retry when it is closed\n",
+            root.display()
+        )
+    );
+    assert!(!root.join("work").exists(), "no work folder is made: {outcome:?}");
+}
+
+/// A root another account may delete is refused as unsafe even while another process holds it open with delete
+/// access: the handle that keeps the preflight from holding the root does not hide its security.
+#[test]
+fn preflight_refuses_an_unsafe_work_root_open_elsewhere_as_unsafe_not_busy() {
+    let case = Case::new("preflight_refuses_an_unsafe_work_root_open_elsewhere_as_unsafe_not_busy");
+    let root = case.folder().join("remote");
+    fs::create_dir_all(&root).expect("the work root can be made");
+    lock_as_the_installer(&root);
+    icacls(&root, &["/grant", "*S-1-0-0:(DE)", "/q"]);
+    let other = fs::File::options()
+        .access_mode(DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(&root)
+        .expect("the root can be opened with delete access");
+
+    let outcome = root_preflight(&case);
+
+    drop(other);
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, format!("gate: remote version {}\n", build_version(&case)));
+    assert_eq!(outcome.stderr, root_unsafe(&format!("{} lets S-1-0-0 delete it", root.display())));
+    assert!(!root.join("work").exists(), "no work folder is made: {outcome:?}");
+}
+
+/// Only the root above `Work` is judged, so a single repository's `Bare` elsewhere would be made in a folder nobody
+/// judged.
+#[test]
+fn preflight_refuses_a_bare_repository_outside_the_work_root() {
+    let case = Case::new("preflight_refuses_a_bare_repository_outside_the_work_root");
+    let remote = case.folder().join("remote");
+    let work = shown(&remote.join("work").join("k"));
+    let bare = shown(&case.folder().join("elsewhere").join("k.git"));
+    let request = payload(&json!({"Key": "k", "Bare": bare, "Work": work, "Lock": format!("{work}.lock"), "Job": "unused"}));
+
+    let outcome = gate_box(&case, "preflight", &request, None);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(
+        outcome.stderr,
+        format!("gate: box payload Bare must be <root>\\<name>.git to lock its root down: {bare}\n")
+    );
+    assert_eq!(case.folder_entries(), Vec::<String>::new(), "nothing is made");
+}
+
+#[test]
+fn preflight_refuses_a_work_folder_outside_a_work_root_layout() {
+    let case = Case::new("preflight_refuses_a_work_folder_outside_a_work_root_layout");
+    let remote = case.folder().join("remote");
+    let work = shown(&remote.join("k"));
+    let request = payload(&json!({"Key": "k", "Bare": shown(&remote.join("k.git")), "Work": work, "Lock": format!("{work}.lock"), "Job": "unused"}));
+
+    let outcome = gate_box(&case, "preflight", &request, None);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(
+        outcome.stderr,
+        format!("gate: box payload Work must be <root>\\work\\<key> to lock its root down: {work}\n")
+    );
+    assert_eq!(case.folder_entries(), Vec::<String>::new(), "nothing is made");
 }
 
 #[test]

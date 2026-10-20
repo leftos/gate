@@ -6,7 +6,7 @@
 //! `--test-box-sample-ms <n>`, `--test-box-sampler-fail true|false`, `--test-box-free-percent <1-100>`,
 //! `--test-box-kill-leaves <n>`, `--test-probe-limit-ms <n>`, `--test-box-desktop <fault>`,
 //! `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>`, `--test-box-desktop-ms <n>` and
-//! `--test-box-register ok|fail` (each also as
+//! `--test-box-register ok|fail`, `--test-box-root-walk-stop <folder>` (each also as
 //! `--<seam>=<value>`) before the verb; without the feature each is no verb, and so the box usage.
 
 use std::ffi::{OsStr, OsString};
@@ -111,6 +111,8 @@ enum Seam {
     DesktopMs,
     /// `--test-box-register ok|fail`: what `register-desktop` does in place of the Task Scheduler's work.
     Register,
+    /// `--test-box-root-walk-stop <folder>`: the preflight's walk above the work root ends at this folder, unjudged.
+    RootWalkStop,
 }
 
 #[cfg(feature = "test-seams")]
@@ -138,6 +140,7 @@ impl Seam {
             "--test-box-desktop-mutex" => Some(Seam::DesktopMutex),
             "--test-box-desktop-ms" => Some(Seam::DesktopMs),
             "--test-box-register" => Some(Seam::Register),
+            "--test-box-root-walk-stop" => Some(Seam::RootWalkStop),
             _ => None,
         }
     }
@@ -164,6 +167,7 @@ impl Seam {
             Seam::DesktopMutex => "--test-box-desktop-mutex",
             Seam::DesktopMs => "--test-box-desktop-ms",
             Seam::Register => "--test-box-register",
+            Seam::RootWalkStop => "--test-box-root-walk-stop",
         }
     }
 }
@@ -201,8 +205,8 @@ fn seams(words: &mut Peekable<impl Iterator<Item = OsString>>, problems: &mut Ve
 /// whole bytes above 0 for the outputs, the inputs and the LFS budgets, `true` or `false` for the sampler's failure, a whole
 /// percent from 1 to 100 for the free share, a whole count above 0 for the processes a kill leaves, one of the desktop
 /// faults for the desktop, one of the session states for the desktop session, 1 to 64 letters, digits and `-` for the
-/// desktop mutex, `ok` or `fail` for the registration and any key path for the netfx key. An empty or missing value is
-/// no value.
+/// desktop mutex, `ok` or `fail` for the registration, any key path for the netfx key and any path for the root walk's
+/// stop. An empty or missing value is no value.
 #[cfg(feature = "test-seams")]
 fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Problem>) -> Result<(), Problem> {
     let name = seam.name();
@@ -230,6 +234,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::Console => seams.fail_console = the_word(name, value, "fail-before", |option, value| Problem::BadConsoleFailure { option, value })?,
         Seam::Token => seams.refuse_token = the_word(name, value, "refused", |option, value| Problem::BadTokenRefusal { option, value })?,
         Seam::ParkLaunch => seams.park_launch = Some(std::path::PathBuf::from(value)),
+        Seam::RootWalkStop => seams.root_walk_stop = Some(std::path::PathBuf::from(value)),
     }
     Ok(())
 }

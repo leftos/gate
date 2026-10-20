@@ -744,6 +744,20 @@ pub(crate) fn grandparent(path: &str) -> Option<&str> {
     (!root.is_empty() && middle.eq_ignore_ascii_case("work")).then_some(root)
 }
 
+/// The builder's work root of the work folder `work`, `<root>\work\<key>`, as a path to open: [`grandparent`]'s
+/// `<root>` without a trailing separator, a doubled one included, and a drive's own root with its separator (`D:\`);
+/// `None` when `work` is not laid out so, or its `<root>` is only separators.
+pub(crate) fn work_root(work: &str) -> Option<String> {
+    let root = grandparent(work)?.trim_end_matches(['\\', '/']);
+    if root.is_empty() {
+        None
+    } else if root.ends_with(':') {
+        Some(format!(r"{root}\"))
+    } else {
+        Some(root.to_owned())
+    }
+}
+
 /// Whether `first` and `second` are the same path once made full, without regard to case. Never when a part of
 /// `first` other than `.` or `..` ends in `.` or a space, which making the path full would drop, so the path that
 /// passes is the one opened.
@@ -814,7 +828,7 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use serde_json::json;
 
-    use super::{Payload, escaped};
+    use super::{Payload, escaped, work_root};
 
     fn decoded(json: &str) -> Result<Payload, String> {
         Payload::decode(&STANDARD.encode(json))
@@ -1401,6 +1415,29 @@ mod tests {
 
     fn archive_name(name: &str) -> Result<String, String> {
         decoded(&json!({ "Key": "app-1a2b3c4d", "Name": name }).to_string()).and_then(|payload| payload.archive_name().map(str::to_owned))
+    }
+
+    #[test]
+    fn the_work_root_of_a_drive_s_own_root_keeps_its_separator() {
+        assert_eq!(work_root(r"D:\work\app-1a2b3c4d"), Some(r"D:\".to_owned()));
+        assert_eq!(work_root(r"D:\\work\app-1a2b3c4d"), Some(r"D:\".to_owned()), "a doubled separator");
+        assert_eq!(work_root(r"\\work\app-1a2b3c4d"), None, "a root of separators alone");
+        assert_eq!(work_root(r"D:\gate-remote\app-1a2b3c4d"), None, "no work folder");
+    }
+
+    #[test]
+    fn the_work_root_has_no_trailing_separator() {
+        assert_eq!(work_root(r"D:\gate-remote\work\app-1a2b3c4d"), Some(r"D:\gate-remote".to_owned()));
+        assert_eq!(
+            work_root(r"D:\gate-remote\\work\app-1a2b3c4d"),
+            Some(r"D:\gate-remote".to_owned()),
+            "a doubled separator"
+        );
+        assert_eq!(
+            work_root("D:/gate-remote//work/app-1a2b3c4d"),
+            Some("D:/gate-remote".to_owned()),
+            "forward ones"
+        );
     }
 
     #[test]
