@@ -240,9 +240,19 @@ pub trait Facts {
     /// saying so.
     fn desktop(&self, place: &Place) -> Result<Vec<Pattern>, String>;
 
-    /// How the lines name the declaration file `name` (`siblings.toml` or `desktop.toml`) of the worktree at `place`, as
-    /// [`Facts::siblings`] or [`Facts::desktop`] read it: `.gate/<name>` for the worktree's own, else the full path of
-    /// the copy it was read from. Asked once that file was read, for a line about it.
+    /// The patterns the worktree root's `.gate/local.toml` declares, read from disk as it stands; none when there is no
+    /// such file. Asked only of a command one of its repo's patterns matched, before its siblings are checked.
+    ///
+    /// # Errors
+    ///
+    /// The file's first problem, when it cannot be read, does not parse or has any problem; the gate then runs here,
+    /// saying so.
+    fn local(&self, place: &Place) -> Result<Vec<Pattern>, String>;
+
+    /// How the lines name the declaration file `name` (`siblings.toml`, `desktop.toml` or `local.toml`) of the worktree
+    /// at `place`, as [`Facts::siblings`], [`Facts::desktop`] or [`Facts::local`] read it: `.gate/<name>` for the
+    /// worktree's own, else the full path of the copy it was read from. Asked once that file was read, for a line about
+    /// it.
     fn declaration_said(&self, place: &Place, name: &str) -> String;
 
     /// The folder of the sibling whose root is `root`, which the decision builds as the worktree root's parent and the
@@ -348,6 +358,12 @@ pub enum LocalReason {
     /// The first declared desktop pattern the command matches, `pattern`, is not among those `remote.json`'s `desktop`
     /// allows the repo; `problem` is why that value cannot be used, when it cannot.
     DesktopNotAllowed { pattern: String, problem: Option<String> },
+    /// The local file `file` ([`Facts::declaration_said`]) cannot be read or has a problem; `problem` is its first, on
+    /// one line.
+    LocalFile { file: String, problem: String },
+    /// The local file `file` ([`Facts::declaration_said`]) declares `pattern`, the first of its patterns the command
+    /// matches.
+    DeclaredLocal { file: String, pattern: String },
 }
 
 impl LocalReason {
@@ -364,7 +380,10 @@ impl LocalReason {
             }
             Self::NothingSent { subfolder } => format!("gate: not routed: {subfolder} holds nothing the snapshot sends"),
             Self::Failed { reason } => format!("gate: not routed: {reason}"),
-            Self::SiblingsFile { file, problem } | Self::DesktopFile { file, problem } => format!("gate: not routed: {file}: {problem}"),
+            Self::SiblingsFile { file, problem } | Self::DesktopFile { file, problem } | Self::LocalFile { file, problem } => {
+                format!("gate: not routed: {file}: {problem}")
+            }
+            Self::DeclaredLocal { file, pattern } => format!("gate: not routed: {file} keeps it here ({})", escaped(pattern)),
             Self::SiblingMissing { name } => format!("gate: not routed: sibling {name} not found beside the worktree"),
             Self::SiblingRefused { name, reason } => format!("gate: not routed: sibling {name} {reason}"),
             Self::SiblingsNotAllowed { names, problem } => not_allowed_line(names, problem.as_deref()),
@@ -524,11 +543,14 @@ impl RemoteRun {
 /// is `git` or `prek` keep it here; so does a folder in no git worktree, a repo the routing file does not list, a git
 /// hook whose repo its `hooks` does not name, and words (paths rewritten, joined by single spaces) none of the repo's
 /// patterns match, the first that matches winning. A first word the rewrite sends as a program's name that names `git`
-/// or `prek` keeps it here too. A matched command still runs here, saying why, when the worktree's `.gate/siblings.toml` has a problem or declares a
-/// sibling the routing file's `siblings` does not allow the repo, or declares siblings from a root folder name the builder cannot lay out, a
-/// sibling named like that folder or one with no git worktree beside the root; when its `.gate/desktop.toml` has a problem, or the first pattern it
-/// declares that the words match is not one the routing file's `desktop` allows the repo, listed exactly; when a word names a path outside the
-/// worktree and its siblings; or when the gate's folder holds nothing the snapshot sends; and so does one whose facts cannot be read.
+/// or `prek` keeps it here too. A matched command runs here, saying why, when the worktree's `.gate/local.toml`
+/// declares a pattern its words match or has a problem, before any sibling or desktop check. It still runs here, saying
+/// why, when the worktree's `.gate/siblings.toml` has a problem or declares a sibling the routing file's `siblings` does
+/// not allow the repo, or declares siblings from a root folder name the builder cannot lay out, a sibling named like
+/// that folder or one with no git worktree beside the root; when its `.gate/desktop.toml` has a problem, or the first
+/// pattern it declares that the words match is not one the routing file's `desktop` allows the repo, listed exactly;
+/// when a word names a path outside the worktree and its siblings; or when the gate's folder holds nothing the snapshot
+/// sends; and so does one whose facts cannot be read.
 #[must_use]
 pub fn decide(inputs: &Inputs<'_>, facts: &dyn Facts) -> Route {
     match route(inputs, facts) {
@@ -928,6 +950,7 @@ fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts)
         return Err(None);
     }
     let pattern = first_match(opened.patterns, &sent.words).ok_or(None)?;
+    check_local(&opened.place, &sent.words, facts)?;
     let target = settle(config, opened, facts)?;
     let desktop = check_desktop(config, &target, &sent.words, facts)?;
     Ok(Matched {
@@ -939,6 +962,26 @@ fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts)
         program_named: sent.program_named,
         desktop,
     })
+}
+
+/// Keeps a matched command here, saying why, when the worktree's `.gate/local.toml` at `place` declares a pattern its
+/// rewritten `words` match, joined by single spaces as the repo's patterns see them, naming the first that matches, or
+/// when the file has a problem, shown [`escaped`]: a command the repo keeps here must not route because its file
+/// cannot be read.
+fn check_local(place: &Place, words: &[String], facts: &dyn Facts) -> Result<(), Here> {
+    let declared = facts.local(place).map_err(|problem| {
+        Some(LocalReason::LocalFile {
+            file: escaped(&facts.declaration_said(place, "local.toml")),
+            problem: escaped(&fold_lines(&problem)),
+        })
+    })?;
+    match first_match(&declared, words) {
+        Some(pattern) => Err(Some(LocalReason::DeclaredLocal {
+            file: escaped(&facts.declaration_said(place, "local.toml")),
+            pattern,
+        })),
+        None => Ok(()),
+    }
 }
 
 /// Whether a matched command asks for the builder's desktop: the first pattern of the worktree's `.gate/desktop.toml`
@@ -1465,7 +1508,7 @@ fn failed(reason: &str) -> LocalReason {
     LocalReason::Failed { reason: fold_lines(reason) }
 }
 
-fn fold_lines(text: &str) -> String {
+pub(crate) fn fold_lines(text: &str) -> String {
     let parts: Vec<&str> = text.split(['\r', '\n']).collect();
     let [first, middle @ .., last] = parts.as_slice() else {
         return text.to_owned();

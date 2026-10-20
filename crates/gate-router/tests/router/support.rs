@@ -95,6 +95,10 @@ pub struct FakeFacts {
     pub desktop: Result<Vec<Pattern>, String>,
     /// How many times the desktop file was read, kept apart from [`FakeFacts::asked`].
     pub desktop_read: Cell<u32>,
+    /// What `.gate/local.toml` gives.
+    pub local: Result<Vec<Pattern>, String>,
+    /// How many times the local file was read, kept apart from [`FakeFacts::asked`].
+    pub local_read: Cell<u32>,
     /// Each root asked whether a git worktree is there, in order, kept apart from [`FakeFacts::asked`].
     pub presence_asked: RefCell<Vec<String>>,
     /// The folders that hold a `.git`: the nearest of them a path lies in is its worktree.
@@ -135,6 +139,8 @@ impl FakeFacts {
             siblings_read: Cell::new(0),
             desktop: Ok(Vec::new()),
             desktop_read: Cell::new(0),
+            local: Ok(Vec::new()),
+            local_read: Cell::new(0),
             presence_asked: RefCell::new(Vec::new()),
             trees: Vec::new(),
             trees_asked: RefCell::new(Vec::new()),
@@ -243,6 +249,11 @@ impl Facts for FakeFacts {
     fn desktop(&self, _place: &Place) -> Result<Vec<Pattern>, String> {
         self.desktop_read.set(self.desktop_read.get() + 1);
         self.desktop.clone()
+    }
+
+    fn local(&self, _place: &Place) -> Result<Vec<Pattern>, String> {
+        self.local_read.set(self.local_read.get() + 1);
+        self.local.clone()
     }
 
     fn declaration_said(&self, _place: &Place, name: &str) -> String {

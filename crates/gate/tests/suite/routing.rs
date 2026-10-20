@@ -550,6 +550,110 @@ fn a_routed_run_says_which_watched_variables_it_drops() {
     );
 }
 
+/// The names of the one dropped-variable line of `stderr`.
+fn dropped_names(stderr: &str) -> Vec<String> {
+    let dropped: Vec<&str> = stderr.lines().filter(|line| line.starts_with(DROPPED_LINE)).collect();
+    assert_eq!(dropped.len(), 1, "one line: {stderr}");
+    let names = dropped[0][DROPPED_LINE.len()..]
+        .strip_suffix("; --env NAME sends it")
+        .expect("the line ends as it always has");
+    names.split(", ").map(str::to_owned).collect()
+}
+
+/// Runs the routed fake tool in `case` with `ZZ_REPO_SEED` and `NuGetAudit` set, recording the client's call; the
+/// outcome and whether the client ran.
+fn run_with_repo_variable(case: &Case) -> (Outcome, bool) {
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let mut gate = case.gate(&routed_words("out.log", &steps, &[], &[FAKE_TOOL, "out", "ran"]));
+    gate.env("ZZ_REPO_SEED", "7").env("NuGetAudit", "false");
+    (finish(gate), call.exists())
+}
+
+#[test]
+fn a_routed_run_names_the_variables_its_repo_declares_after_the_route_lines() {
+    let case = routed_case("routing-declared-env");
+    fs::create_dir_all(case.folder().join(".gate")).expect("the .gate folder can be made");
+    fs::write(case.folder().join(".gate").join("env.toml"), "prefixes = ['zz_repo_']\n").expect("the declaration can be written");
+
+    let (outcome, called) = run_with_repo_variable(&case);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(called, "the run routed: {outcome:?}");
+    let names = dropped_names(&outcome.stderr);
+    assert!(
+        names.iter().any(|name| name == "NuGetAudit") && names.iter().any(|name| name == "ZZ_REPO_SEED"),
+        "{outcome:?}"
+    );
+    let routed_line = format!("gate: routed {FAKE_TOOL} as {}", fake_tool_name());
+    assert_in_order(&outcome.stderr, &[routed_line.as_str(), DROPPED_LINE]);
+}
+
+#[test]
+fn an_env_file_with_a_problem_says_it_and_routes_watching_the_build_variables_alone() {
+    let case = routed_case("routing-declared-env-broken");
+    fs::create_dir_all(case.folder().join(".gate")).expect("the .gate folder can be made");
+    fs::write(case.folder().join(".gate").join("env.toml"), "prefixes = 'ZZ_REPO_'\n").expect("the declaration can be written");
+
+    let (outcome, called) = run_with_repo_variable(&case);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(called, "a bad env file never keeps the run here: {outcome:?}");
+    let line = "gate: .gate/env.toml: prefixes is not an array (TOML string); only the build variables are watched";
+    assert!(outcome.stderr.contains(&format!("{line}\n")), "{outcome:?}");
+    let names = dropped_names(&outcome.stderr);
+    assert!(
+        names.iter().any(|name| name == "NuGetAudit") && !names.iter().any(|name| name == "ZZ_REPO_SEED"),
+        "{outcome:?}"
+    );
+    let routed_line = format!("gate: routed {FAKE_TOOL} as {}", fake_tool_name());
+    assert_in_order(&outcome.stderr, &[routed_line.as_str(), line, DROPPED_LINE]);
+}
+
+#[test]
+fn a_declared_prefix_never_names_a_variable_env_cannot_send() {
+    let case = routed_case("routing-declared-env-refused");
+    fs::create_dir_all(case.folder().join(".gate")).expect("the .gate folder can be made");
+    fs::write(case.folder().join(".gate").join("env.toml"), "prefixes = ['GODOT_', 'GIT_CONFIG']\n").expect("the declaration can be written");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let mut gate = case.gate(&routed_words("out.log", &steps, &[], &[FAKE_TOOL, "out", "ran"]));
+    gate.env("GODOT_PATH", r"C:\godot")
+        .env("GODOT_X", "1")
+        .env("GIT_CONFIG_KEY_7", "a.b")
+        .env("GIT_CONFIG_PARAMETERS", "'a.b=c'");
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(call.exists(), "the run routed: {outcome:?}");
+    let names = dropped_names(&outcome.stderr);
+    assert!(names.iter().any(|name| name == "GODOT_X"), "{outcome:?}");
+    for refused in ["GODOT_PATH", "GIT_CONFIG_KEY_7", "GIT_CONFIG_PARAMETERS"] {
+        assert!(!names.iter().any(|name| name == refused), "--env refuses {refused}: {outcome:?}");
+    }
+}
+
+#[test]
+fn an_env_file_in_the_declarations_folder_is_read_when_the_worktree_has_none() {
+    let case = routed_case("routing-declared-env-folder");
+    let folder = declarations_holding(&case, &[("env.toml", "prefixes = ['ZZ_REPO_SEED']\n")]);
+    name_declarations(&case, &folder);
+
+    let (outcome, called) = run_with_repo_variable(&case);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(called, "the run routed: {outcome:?}");
+    let names = dropped_names(&outcome.stderr);
+    assert!(
+        names.iter().any(|name| name == "NuGetAudit") && names.iter().any(|name| name == "ZZ_REPO_SEED"),
+        "{outcome:?}"
+    );
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let read = format!("gate: .gate/env.toml read from {}", folder.join("env.toml").display());
+    assert!(log.lines().any(|line| line == read), "{read}: {log}");
+}
+
 #[test]
 fn a_local_run_says_no_dropped_variables() {
     let case = routed_case("routing-local-dropped-env");
@@ -1473,6 +1577,72 @@ fn declare_desktop(case: &Case, allowed: &[&str]) {
     fs::write(folder.join(".gate").join("desktop.toml"), "patterns = ['*tool* argv*']\n").expect("the declaration can be written");
     let routing = json!({ "host": HOST, "repos": { repo(case): ["*tool*"] }, "desktop": { repo(case): allowed } });
     write_remote_json(case, &routing.to_string());
+}
+
+/// Writes `text` as the case's `.gate/local.toml`.
+fn declare_local(case: &Case, text: &str) {
+    let folder = case.folder().join(".gate");
+    fs::create_dir_all(&folder).expect("the .gate folder can be made");
+    fs::write(folder.join("local.toml"), text).expect("the declaration can be written");
+}
+
+/// Runs `.\tool.exe out ran here` as a routed heavy gate of `case`, recording the client's call; the outcome and
+/// whether the client ran.
+fn run_routed_tool(case: &Case) -> (Outcome, bool) {
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", "ran here"])));
+    (outcome, call.exists())
+}
+
+#[test]
+fn a_command_its_repo_declares_local_runs_here_saying_so_and_journals_declared_local() {
+    let case = routed_case("routing-declared-local");
+    declare_local(&case, "patterns = ['*TOOL* out *']\n");
+
+    let (outcome, called) = run_routed_tool(&case);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!called, "the client never ran: {outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: not routed: .gate/local.toml keeps it here (*TOOL* out *)\n"),
+        "{outcome:?}"
+    );
+    assert!(outcome.stdout.contains("ran here"), "the command ran here: {outcome:?}");
+    assert_local(&events(&case), Some("declared local"));
+}
+
+#[test]
+fn a_command_its_repo_does_not_declare_local_routes() {
+    let case = routed_case("routing-declared-local-other");
+    declare_local(&case, "patterns = ['*tool* argv*']\n");
+
+    let (outcome, called) = run_routed_tool(&case);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(called, "the run routed: {outcome:?}");
+    assert!(!outcome.stderr.contains("local.toml"), "{outcome:?}");
+}
+
+#[test]
+fn a_local_file_with_a_problem_keeps_the_command_here() {
+    let case = routed_case("routing-declared-local-broken");
+    declare_local(&case, "patterns = '*tool*'\n");
+
+    let (outcome, called) = run_routed_tool(&case);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!called, "a file the gate cannot use routes nothing: {outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: not routed: .gate/local.toml: patterns is not an array (TOML string)\n"),
+        "{outcome:?}"
+    );
+    assert!(outcome.stdout.contains("ran here"), "the command ran here: {outcome:?}");
+    assert_local(&events(&case), Some("declared local"));
 }
 
 #[test]

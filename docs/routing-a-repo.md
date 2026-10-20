@@ -16,9 +16,11 @@ Every repo that runs heavy gates is in scope, and every heavy command family in 
 
 Coverage is judged from the journal's history of gated commands per repo, not from the commands guessed to matter. Light-slot runs never route (the router considers heavy runs only), so a repo whose gates are all light, short checks stays local without an entry.
 
-A caller never adds `--local` (`-Local`) to a gate unless that command has been tried routed and failed. It then reruns locally only what failed and always reports the failure to the gate repo's inbox with the command, the gate's lines and the log path. The gate repo fixes the routing or rules that the command stays local, and a command ruled local is kept local by the router, so callers do not carry the flag.
+A caller never adds `--local` (`-Local`) to a gate unless that command has been tried routed and failed. It then reruns locally only what failed and always reports the failure to the gate repo's inbox with the command, the gate's lines and the log path.
 
-Every `--local` run must give `--reason "<why>"` (the gate refuses it otherwise). A heavy one is journalled as `notRouted: --local` with the reason on its `queue` event, which is how stray uses are found; a light one writes the reason without `notRouted`. The reason is also in its claim and ticket and on ops-tower's Gates page.
+The gate repo fixes the routing or rules that the command stays local, and a command ruled local is kept local by the router through the repo's `.gate/local.toml` ([A repo with a command that stays on this PC](#a-repo-with-a-command-that-stays-on-this-pc)), so callers do not carry the flag.
+
+Every `--local` run must give `--reason "<why>"` (the gate refuses it otherwise). A heavy one is journalled as `notRouted: --local` with the reason on its `queue` event, which is how stray uses are found (a command kept here by `.gate/local.toml` is journalled `notRouted: declared local`, never `--local`); a light one writes the reason without `notRouted`. The reason is also in its claim and ticket and on ops-tower's Gates page.
 
 A command run from one worktree that names a path in another worktree of a listed repo stays local, saying `gate: not routed: the command works in <tree>; run it with --cd <tree>`. Run it again with `--cd <tree>` to route it from that worktree ([design.md, Routing](design.md#routing)). A path in an unlisted repo, on a network drive or in no worktree keeps the plain `is outside the worktree` line.
 
@@ -80,11 +82,27 @@ A first routed run in a new work folder is cold, as is the first run after the b
 
 ## A repo with a command that needs the builder's desktop
 
-A repo with a routed command that needs the builder's logged-on desktop (a GUI test run) declares its `-like` patterns in a tracked `.gate/desktop.toml`, `patterns = ["dotnet test *Ui*"]`, at most 32, matched against the same rewritten words as the repo's `repos` patterns. The PC consents in `remote.json`: `"desktop": {"<repo>": ["dotnet test *Ui*"]}`, each pattern listed exactly as the file spells it, letter case included. The first declared pattern a command matches decides,
+A repo with a routed command that needs the builder's logged-on desktop (a GUI test run) declares its `-like` patterns in a tracked `.gate/desktop.toml`, `patterns = ["dotnet test *Ui*"]`, at most 32, matched against the same rewritten words as the repo's `repos` patterns. The PC consents in `remote.json`: `"desktop": {"<repo>": ["dotnet test *Ui*"]}`, each pattern listed exactly as the file spells it, letter case included. The first declared pattern a command matches decides, and a command no pattern matches asks for no desktop.
 
 Without the consent the command runs here with `gate: not routed: desktop pattern '<pattern>' not allowed in remote.json`.
 
 A `.gate/desktop.toml` the gate cannot use keeps every routed command of the repo here with `gate: not routed: .gate/desktop.toml: <problem>`, so fix it before relying on routing. A desktop run holds a remote slot while it waits for the desktop, up to the usual 60 s remote wait. Format and rules: [design.md](design.md#remotejson).
+
+## A repo with a command that stays on this PC
+
+A repo with a command that needs this PC (its WSL state, a service or device only this PC has) declares its `-like` patterns in a tracked `.gate/local.toml`, `patterns = ["dotnet test *Lan*"]`, at most 32, matched against the same rewritten words as the repo's `repos` patterns. No consent in `remote.json` is needed, since the file only keeps commands here.
+
+A command it matches runs here with `gate: not routed: .gate/local.toml keeps it here (<pattern>)` and is journalled `notRouted: declared local`; the check runs right after the repo's patterns match, before the siblings and desktop checks.
+
+A `.gate/local.toml` the gate cannot use keeps every routed command of the repo here with `gate: not routed: .gate/local.toml: <problem>`, so fix it before relying on routing. A repo that cannot commit the file keeps it in its declarations folder ([design.md](design.md#remotejson)). `gate check` does not report it.
+
+## A repo whose builds read its own variables
+
+A routed run sends none of the caller's environment but the `--env` pairs, and warns when the caller holds a variable that run drops. The warning knows the build variables (`NuGetAudit`, `RUSTFLAGS` and the `NUGET_`, `MSBUILD`, `CARGO_BUILD_` and `CARGO_PROFILE_` families); a repo whose commands read others declares their name prefixes in a tracked `.gate/env.toml`, `prefixes = ["COLLIE_"]`, at most 32, each ASCII letters, digits and `_`, none starting `GATE_`.
+
+The line `gate: a routed run does not send the caller's <names>; --env NAME sends it` then names the caller's variables starting one too, so a caller adds `--env NAME` where the command needs it: the gate never sends a declared variable by itself, since it may hold a secret.
+
+A file the gate cannot use says `gate: .gate/env.toml: <problem>; only the build variables are watched` and the run still routes. The file may also sit in the declarations folder; `gate check` does not report it ([design.md](design.md#command-environment)).
 
 ## A repo whose git hooks run heavy checks
 

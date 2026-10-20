@@ -122,6 +122,14 @@ A routed run sends the pairs as the payload's `Env` ([The box side](#the-box-sid
 
 A routed run does not send the rest of the gate's environment: when it holds a variable a repo's builds read (`NuGetAudit`, `RUSTFLAGS`, `RUSTDOCFLAGS`, and the `NUGET_`, `MSBUILD`, `CARGO_BUILD_` and `CARGO_PROFILE_` families) that no `--env` names and the gate does not set itself, the route says so after its other lines: `gate: a routed run does not send the caller's <names>; --env NAME sends it`.
 
+A repo names more of its own variables in its `.gate/env.toml`: `prefixes = ["COLLIE_", ...]`, at most 32 entries, each an ASCII letter, digit or `_` name prefix (an exact name is its own prefix), matched in any letter case, none starting `GATE_`.
+
+The file is read only for a routed run, after the decision, from the worktree's `.gate` or else the repo's declarations folder ([remote.json](#remotejson)), through the same guarded read as the other declaration files, and a declarations-folder copy logs `gate: .gate/env.toml read from <path>`.
+
+The same line then also names the caller's variables starting a declared prefix, under the same conditions, and never one `--env` refuses (a machine path such as `PATH`, `TEMP`, `GODOT_PATH` or `UE_ROOT`, a name the gate sets, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG`, a `GATE_` name or a malformed name). A routed run never sends a declared variable without `--env`, since a variable a repo reads may hold a secret.
+
+A file with a problem does not keep the run here: it says `gate: .gate/env.toml: <problem>; only the build variables are watched` (a declarations-folder copy named by its full path) on stderr after the route lines and before the dropped-variable line, and the run routes watching the build variables alone. `gate check` does not report this file.
+
 ### `gate stop-tree`
 
 `gate stop-tree <pid>` takes one process snapshot (pids, parents and start times, no command lines) and builds the tree: the pid plus its descendants, a child counting only when its creation time is readable and at or after its parent's, so a recycled pid adopts no one (a child whose creation time is unreadable is left out with its subtree).
@@ -608,6 +616,8 @@ The lines of a run that starts its command:
 
   Also a declared sibling `remote.json` does not allow: `gate: not routed: sibling <name> is not allowed in remote.json`, or `siblings <a>, <b> are not allowed in remote.json` for more, with `: <problem>` added when the `siblings` value cannot be used.
 
+  A command the repo's `.gate/local.toml` keeps here says `gate: not routed: .gate/local.toml keeps it here (<pattern>)`, the first pattern its words match, escaped; a file the gate cannot use says `gate: not routed: .gate/local.toml: <problem>`, escaped, and keeps every routed command of the repo here ([Routing](#routing), the decision).
+
   For the builder's desktop: a problem with the repo's `.gate/desktop.toml` (`gate: not routed: .gate/desktop.toml: <problem>`, escaped), and the first declared pattern the command matches when `remote.json` does not allow it (`gate: not routed: desktop pattern '<pattern>' not allowed in remote.json`, with `: <problem>` added when the `desktop` value cannot be used).
 
   A sibling folder that cannot be carried says `gate: not routed: sibling <name> <reason>`, `<reason>` being `is a link or a junction`, `is not a folder`, `has a .git that is a link or a junction`, `is the worktree's own folder` or `is the same folder as sibling <other>`.
@@ -1003,7 +1013,7 @@ The event's own fields:
 
 | Event | Fields after the common ones |
 |---|---|
-| `queue` | `log` (the log's full path), `notRouted` (written right after `log`, only when a heavy gate was kept local with `--local`, with the value `--local`, or when a matched command's outside path lies in another worktree of a listed repo and the run says to `--cd` it, with the value `another worktree`; every other reason for a local run, the plain outside line included, writes none), `reason` (the free text the run gave `--reason`, written after `notRouted`, when it gave one; absent otherwise) |
+| `queue` | `log` (the log's full path), `notRouted` (written right after `log`, only when a heavy gate was kept local with `--local`, with the value `--local`, or when a matched command's outside path lies in another worktree of a listed repo and the run says to `--cd` it, with the value `another worktree`, or when a matched command's repo `.gate/local.toml` keeps it here, by a pattern or by a problem, with the value `declared local`; every other reason for a local run, the plain outside line included, writes none), `reason` (the free text the run gave `--reason`, written after `notRouted`, when it gave one; absent otherwise) |
 | `take` | `slots` (the slot names taken; a critical gate lists every heavy and light slot it holds; a `none` run lists none, `[]`, with `waitedSeconds` 0.0), `waitedSeconds`, optionally `parentPid` (also on the late take of a covered gate), and for a critical gate `counts`, `otherHeld`, then `otherClaims` or `snapshotError` |
 | `release` | `slots` (the same list), `heldSeconds`, `status` (null when the gate failed before its command had one), `wallSeconds`, `adjustedSeconds`, optionally `avgCores`, `peakCores`, `freeCores`, `verdict`, and `cold` for a cold routed run |
 | `abandon` | `waitedSeconds`: the gate ended while still queued (Ctrl+C while waiting for a slot, or, for a routed run, while its client waited to start or while it waited for its work folder's key, remote-tagged) |
@@ -1128,9 +1138,9 @@ The key is for check-only hook commands (a build, clippy, a format check): a rou
 
 **Declarations folder.** `declarations` is an object mapping a repo name, matched in any letter case, to an absolute folder: `{"declarations": {"<repo>": "D:\\notes\\<repo>\\gate"}}`.
 
-For a repo that cannot commit its `.gate` files, the folder holds `toolchain.toml`, `siblings.toml`, `desktop.toml` and `warmup.toml`, each read only when the repo has no file of that name: the snapshot's tree for `toolchain.toml` in a routed run, the worktree on disk otherwise. A file is taken whole from one place, so a repo's own file wins even with problems, and a file the folder lacks is simply absent.
+For a repo that cannot commit its `.gate` files, the folder holds `toolchain.toml`, `siblings.toml`, `desktop.toml`, `local.toml`, `env.toml` and `warmup.toml`, each read only when the repo has no file of that name: the snapshot's tree for `toolchain.toml` in a routed run, the worktree on disk otherwise. A file is taken whole from one place, so a repo's own file wins even with problems, and a file the folder lacks is simply absent.
 
-The folder asks no new consent: `desktop` and `warmup` stay in `remote.json`, and the warm-up hash stays the SHA-256 of the file's bytes wherever they came from.
+The folder asks no new consent: `desktop` and `warmup` stay in `remote.json`, and `local.toml` and `env.toml` need none, and the warm-up hash stays the SHA-256 of the file's bytes wherever they came from.
 
 The folder must be an absolute drive path (a letter, `:`, a separator and a name, with no share, device or `\\?\` path) on a fixed local drive, a real folder and no link or junction. No name of the path may end in `.` or a space or hold `:`, which also refuses `.` and `..`. A drive whose letter is a `subst` onto a share is not local; a letter whose device cannot be read counts as no `subst`.
 
@@ -1155,6 +1165,10 @@ ops-tower reads only `slots`.
 A repo's `.gate/desktop.toml`, which declares the commands that need the builder's desktop, is read by `gate_router::desktop::read_desktop`: one key, `patterns`, an array of at most 32 non-empty `-like` patterns (`patterns = []` declares none). A leading byte order mark is skipped and any other key is a problem.
 
 The first problem wins, the count checked before the entries: `declares no patterns`, `patterns is not an array (TOML <type>)`, `patterns[<i>] is not a string (TOML <type>)`, `patterns[<i>] is empty`, `patterns[<i>] is not a valid wildcard pattern: "<text>"`, `declares more than 32 patterns`, `<key> is not a key (patterns)`, plus the UTF-8 and parse failures. Routing reads it for a matched command ([Routing](#routing)).
+
+`.gate/local.toml` is read by `gate_router::local::read_local` and `.gate/env.toml` by `gate_router::env::read_env`, all three through the shared `list.rs` `read_list`, so the same one key, cap, byte order mark and problem texts hold with `patterns` (`local.toml`) or `prefixes` (`env.toml`) in place of the key.
+
+Each `env.toml` entry must be ASCII letters, digits and `_` (`prefixes[<i>] is not ASCII letters, digits and _: "<text>"`) and not start `GATE_` in any letter case (`prefixes[<i>] starts with GATE_, whose names are the gate's: "<text>"`).
 
 A repo's own `.gate/toolchain.toml`, which declares the tools and workloads a routed run's builder needs, is a separate file in the snapshot, not part of `remote.json`, or the repo's declarations folder's copy when the tree has none: [Routing](#routing) (Toolchain manifest) describes its format.
 
@@ -1745,6 +1759,10 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A root whose id cannot be read keeps the run here with `gate: not routed: cannot read the id of the worktree folder <root>: <error>`, since the worktree lock of every routed run is named by it, and the client checks the folder it opens against it.
 
+  A command the repo keeps on this PC is declared in its `.gate/local.toml`, `patterns = [...]` of at most 32 `-like` patterns matched against the rewritten words joined by single spaces, like the `repos` and `desktop` patterns. The check runs right after the `repos` patterns match and before the siblings and desktop checks, on the file read as `desktop.toml` is (guarded, at most 64 KiB, else from the declarations folder), and needs no consent in `remote.json`, since it only narrows routing.
+
+  The first pattern the words match keeps the run here with `gate: not routed: .gate/local.toml keeps it here (<pattern>)` (escaped). A file that cannot be used keeps every routed command of the repo here with `gate: not routed: .gate/local.toml: <problem>`, the first problem, on one line and escaped. Both journal `notRouted: "declared local"`, a copy from the declarations folder is named by its full path, a light run so kept gets no route hint, and `gate check` does not report the file.
+
   A command that needs the builder's desktop is declared in the repo's `.gate/desktop.toml` and consented to in `remote.json`'s `desktop` ([remote.json](#remotejson)); the check runs after the siblings checks and before the outside-path and nothing-sent checks, on a command the `repos` patterns matched, and the file is read from disk as it stands, through the same guarded read as `siblings.toml` (`.gate` and the file not followed as links, at most 64 KiB), or, when the worktree has no such file, from the repo's declarations folder ([remote.json](#remotejson), Declarations folder).
 
   The first declared pattern the command's rewritten words match decides, matched against the same words joined by single spaces as the repo's `repos` patterns. No file, `patterns = []` or no matching pattern asks for nothing.
@@ -1767,7 +1785,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   It reads (root, prefix below the root and common git folder), and a folder below the root asks `git ls-files` whether the snapshot would send anything there (tracked or untracked and not ignored, and still on disk). A `subst` drive is followed through `gate_win32::device_target`. A word that is not valid Unicode keeps a command that would route here, saying so.
 
-  The queue line carries `notRouted` `--local` for a heavy `--local` gate, the run's `--reason` text after it, and the remote tag for a routed one. When the remote client has a part missing, the routed run falls back before it takes a remote slot: the `fallback` line has reason `client`, the gate says `gate: remote <host> client could not start: ...; running here`, and the later `take` and `release` carry no remote fields.
+  The queue line carries `notRouted` `--local` for a heavy `--local` gate, `another worktree` or `declared local` for the runs those reasons keep here, the run's `--reason` text after it, and the remote tag for a routed one.
+
+  When the remote client has a part missing, the routed run falls back before it takes a remote slot: the `fallback` line has reason `client`, the gate says `gate: remote <host> client could not start: ...; running here`, and the later `take` and `release` carry no remote fields.
 - **The routing file's text** is JSON with `//` and `/* */` comments and trailing commas allowed outside strings, and a leading byte order mark skipped, as the PowerShell gate's reader allows. Keys match in any letter case, and unknown keys are ignored.
 
   An object holding two keys that differ only in letter case anywhere in the file refuses the whole file, with the PowerShell reader's error text. Single-quoted strings are refused (`Conversion from JSON failed with error: ...`), a recorded deviation: the PowerShell reader accepts them.
@@ -1959,7 +1979,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     **Toolchain manifest** (GATE-206, GATE-209): a repo's `.gate/toolchain.toml` declares what a routed run's builder must have beyond the .NET SDK, and `remote/toolchain.rs` reads it as data from text the caller hands over.
 
-    [`gate check`](#gate-check) reads it from the worktree on disk and says what this PC lacks; a routed run with parity reads it from the snapshot's git tree (the only one of the repo's four `.gate` files read there; `siblings.toml`, `desktop.toml` and `warmup.toml` are read from the worktree on disk) and refuses the route when the builder lacks a tool it declares (below).
+    [`gate check`](#gate-check) reads it from the worktree on disk and says what this PC lacks; a routed run with parity reads it from the snapshot's git tree (the only one of the repo's six `.gate` files read there; `siblings.toml`, `desktop.toml`, `local.toml`, `env.toml` and `warmup.toml` are read from the worktree on disk) and refuses the route when the builder lacks a tool it declares (below).
 
     `toolchain::meets` compares a found version with a minimum. A repo's sibling worktrees are not declared here but in `.gate/siblings.toml` ([Sibling worktrees](#routing)), whose problems keep a run local.
 
@@ -3647,7 +3667,7 @@ A virtual Cargo workspace (`resolver = "3"`) with every crate under `crates/`, l
 | `gate-desktop` | The desktop helper exe and the pipe protocol the box speaks with it, its exit codes, and `build_version`, the gate's version text. | no |
 | `gate-watchdog` | Free-share, load-adjusted clock, stall, ceiling and backstop arithmetic over samples with the kill lines, and the box heartbeat, on an injected clock; the cores-hint verdict. | yes; a pure crate |
 | `gate-args` | The gate's own argv: the subcommand CLI, the compatibility layer, the C-runtime and cmd.exe quoting, the `%VAR%` refusals and the PATHEXT resolution rules over an injected environment and file lookup. | yes; a pure crate |
-| `gate-router` | The routing rules (T2-T4) over strings: what routes, the path rewrite, the `--no-build` drop (`test` and `run` only), the wrapped dotnet form, the builder warm-up's file, hash and judge (`warm.rs`), the caller's variables a routed run does not send and the line it says for them (`watch.rs`). | yes; a pure crate |
+| `gate-router` | The routing rules (T2-T4) over strings: what routes, the path rewrite, the `--no-build` drop (`test` and `run` only), the wrapped dotnet form, the builder warm-up's file, hash and judge (`warm.rs`), the caller's variables a routed run does not send, the repo-declared prefixes that add to them (`env.rs`) and the line it says for them (`watch.rs`), the repo's `.gate/local.toml` patterns that keep a command here (`local.rs`), and the one-key list reader the declaration files share (`list.rs`). | yes; a pure crate |
 | `gate` | The `gate` binary: the subcommands, the wait loop, the run, the journal writes, the remote client and `gate box`. | no |
 
 Rules:

@@ -2382,6 +2382,108 @@ fn a_desktop_file_problem_keeps_every_routed_command_here() {
     }
 }
 
+/// A gate at the root whose `.gate/local.toml` declares `declared`, under the routing file [`desktop_facts`] writes
+/// with no `desktop` key.
+fn local_facts(declared: &[&str]) -> FakeFacts {
+    FakeFacts {
+        local: Ok(patterns(declared)),
+        ..desktop_facts(None, &[])
+    }
+}
+
+#[test]
+fn a_command_matching_a_declared_local_pattern_runs_here_naming_the_first_that_matches() {
+    let facts = local_facts(&["dotnet test*", "DOTNET *"]);
+    assert_eq!(
+        local_line(&decide(&heavy(&words(&["dotnet", "test", "x"])), &facts)).as_deref(),
+        Some("gate: not routed: .gate/local.toml keeps it here (dotnet test*)")
+    );
+    assert_eq!(
+        local_line(&decide(&heavy(&words(&["Dotnet", "Build"])), &facts)).as_deref(),
+        Some("gate: not routed: .gate/local.toml keeps it here (DOTNET *)"),
+        "matched in any letter case, as the repo's patterns are"
+    );
+    assert_eq!(facts.local_read.get(), 2);
+}
+
+#[test]
+fn a_routed_command_matching_no_declared_local_pattern_routes() {
+    let facts = local_facts(&["dotnet test*"]);
+    let run = routed(decide(&heavy(&words(&["tool", "x"])), &facts));
+    assert_eq!(run.pattern, "tool *");
+    assert_eq!(facts.local_read.get(), 1);
+    let none = local_facts(&[]);
+    assert_eq!(
+        routed(decide(&heavy(&words(&["dotnet", "test"])), &none)).pattern,
+        "dotnet *",
+        "an empty list keeps nothing here"
+    );
+}
+
+#[test]
+fn a_declared_local_pattern_is_shown_escaped() {
+    let facts = local_facts(&["dotnet test\u{1b}*"]);
+    assert_eq!(
+        local_line(&decide(&heavy(&words(&["dotnet", "test\u{1b}x"])), &facts)).as_deref(),
+        Some(r"gate: not routed: .gate/local.toml keeps it here (dotnet test\u{1b}*)")
+    );
+}
+
+#[test]
+fn a_local_file_problem_keeps_every_routed_command_here() {
+    for command in [&["dotnet", "test"][..], &["tool", "x"]] {
+        let facts = FakeFacts {
+            local: Err("line 1, column 3:\r\n  bad\u{1b}[31m".to_owned()),
+            ..local_facts(&[])
+        };
+        assert_eq!(
+            local_line(&decide(&heavy(&words(command)), &facts)).as_deref(),
+            Some(r"gate: not routed: .gate/local.toml: line 1, column 3: bad\u{1b}[31m"),
+            "{command:?}"
+        );
+    }
+}
+
+#[test]
+fn a_declared_local_pattern_wins_over_a_desktop_match_and_sibling_problems() {
+    let line = Some("gate: not routed: .gate/local.toml keeps it here (dotnet test*)");
+    let desktop = FakeFacts {
+        local: Ok(patterns(&["dotnet test*"])),
+        ..desktop_facts(None, &["dotnet test*"])
+    };
+    assert_eq!(local_line(&decide(&heavy(&words(&["dotnet", "test"])), &desktop)).as_deref(), line);
+    assert_eq!(desktop.desktop_read.get(), 0, "the desktop file is never read");
+    let broken = FakeFacts {
+        siblings: Err("bad".to_owned()),
+        ..local_facts(&["dotnet test*"])
+    };
+    assert_eq!(local_line(&decide(&heavy(&words(&["dotnet", "test"])), &broken)).as_deref(), line);
+    let missing = FakeFacts {
+        siblings: Ok(words(&["b"])),
+        ..local_facts(&["dotnet test*"])
+    };
+    assert_eq!(local_line(&decide(&heavy(&words(&["dotnet", "test"])), &missing)).as_deref(), line);
+    assert!(missing.presence_asked.borrow().is_empty(), "no sibling is looked for");
+    let failing = FakeFacts {
+        local: Err("bad".to_owned()),
+        siblings: Err("worse".to_owned()),
+        ..desktop_facts(None, &["dotnet test*"])
+    };
+    assert_eq!(
+        local_line(&decide(&heavy(&words(&["dotnet", "test"])), &failing)).as_deref(),
+        Some("gate: not routed: .gate/local.toml: bad")
+    );
+}
+
+#[test]
+fn a_command_the_repos_patterns_do_not_route_reads_no_local_file() {
+    for local in [Ok(patterns(&["cargo *"])), Err("bad".to_owned())] {
+        let facts = FakeFacts { local, ..local_facts(&[]) };
+        assert_eq!(decide(&heavy(&words(&["cargo", "test"])), &facts), SILENT);
+        assert_eq!(facts.local_read.get(), 0);
+    }
+}
+
 #[test]
 fn a_command_the_repos_patterns_do_not_route_reads_no_desktop_file() {
     for desktop in [Ok(patterns(&["cargo *"])), Err("bad".to_owned())] {

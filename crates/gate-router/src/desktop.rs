@@ -6,16 +6,11 @@
 //! problem it finds: the count of entries is checked against the cap before any entry, then the entries in file order.
 //! A declaration the gate cannot read keeps every routed command of the repo here.
 
-use toml::{Table, Value};
-
 use crate::like::Pattern;
-use crate::warm::{parse_failure, spelled};
+use crate::list::{pattern_of, read_list};
 
 /// The most patterns a desktop file may declare.
 pub const MOST_PATTERNS: usize = 32;
-
-/// The problem of a file that has no `patterns` key.
-const NO_PATTERNS: &str = "declares no patterns";
 
 /// The patterns the desktop file whose bytes are `bytes` declares, in file order, a leading byte order mark skipped.
 ///
@@ -25,42 +20,7 @@ const NO_PATTERNS: &str = "declares no patterns";
 /// `patterns`, no `patterns`, a `patterns` that is not an array, an entry that is not a string, is empty or is no
 /// valid wildcard pattern, or more than [`MOST_PATTERNS`] entries.
 pub fn read_desktop(bytes: &[u8]) -> Result<Vec<Pattern>, String> {
-    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
-    let text = std::str::from_utf8(bytes).map_err(|error| format!("not valid UTF-8 ({error})"))?;
-    let table = text.parse::<Table>().map_err(|error| parse_failure(text, &error))?;
-    let mut patterns = None;
-    for (key, value) in table {
-        if key != "patterns" {
-            return Err(format!("{} is not a key (patterns)", spelled(&key)));
-        }
-        patterns = Some(read_patterns(value)?);
-    }
-    patterns.ok_or_else(|| NO_PATTERNS.to_owned())
-}
-
-/// The patterns the `patterns` value `value` declares, or its first problem.
-fn read_patterns(value: Value) -> Result<Vec<Pattern>, String> {
-    let entries = match value {
-        Value::Array(entries) => entries,
-        other => return Err(format!("patterns is not an array (TOML {})", other.type_str())),
-    };
-    if entries.len() > MOST_PATTERNS {
-        return Err(format!("declares more than {MOST_PATTERNS} patterns"));
-    }
-    entries.into_iter().enumerate().map(|(index, entry)| pattern_of(index, entry)).collect()
-}
-
-/// The pattern the entry `entry` at `index` gives; `Err` with its problem when it is not a string, is empty or is no
-/// valid wildcard pattern.
-fn pattern_of(index: usize, entry: Value) -> Result<Pattern, String> {
-    let text = match entry {
-        Value::String(text) => text,
-        other => return Err(format!("patterns[{index}] is not a string (TOML {})", other.type_str())),
-    };
-    if text.is_empty() {
-        return Err(format!("patterns[{index}] is empty"));
-    }
-    Pattern::parse(&text).map_err(|_| format!("patterns[{index}] is not a valid wildcard pattern: {text:?}"))
+    read_list(bytes, "patterns", MOST_PATTERNS, pattern_of)
 }
 
 #[cfg(test)]

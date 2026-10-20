@@ -6,7 +6,8 @@
 //! program's name, and the builder warm-up's file, hash, judge and texts ([`warm`]), with the TOML key spelling and
 //! parse failure text its readers share with the gate ([`spelled`], [`parse_failure`]), and the repo's desktop
 //! declaration ([`desktop`]). It holds too the caller's
-//! environment a routed run does not send ([`dropped_env`]).
+//! environment a routed run does not send ([`dropped_env`]) and the repo's declaration of the prefixes its commands
+//! read ([`env`]) and of the commands that stay on this PC ([`local`]).
 //!
 //! The crate is pure: it reads no file, runs no git or other process and reads no environment or clock. The decision
 //! asks the caller for each fact it needs through [`Facts`], and only at the rule that needs it, so it builds and tests
@@ -15,9 +16,12 @@
 mod config;
 mod decide;
 pub mod desktop;
+pub mod env;
 mod escape;
 mod key;
 mod like;
+mod list;
+pub mod local;
 mod rewrite;
 pub mod warm;
 mod watch;

@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use gate_args::{GATE_SET_NAMES, RunRequest, Slot, TestSeams};
+use gate_args::{GATE_SET_NAMES, RunRequest, Slot, TestSeams, env_refusal};
 use gate_router::warm::FileRead;
 use gate_router::{
     Config, ConfigProblem, Facts, FolderId, Inputs, LocalReason, Pattern, Place, RemoteRun, Route, SiblingFolder, Target, decide, dropped_env,
@@ -33,6 +33,10 @@ use crate::warm;
 const LOCAL_FLAG: &str = "--local";
 /// The `notRouted` value of a matched command kept here because its outside path lies in another git worktree.
 const ANOTHER_WORKTREE: &str = "another worktree";
+/// The `notRouted` value of a matched command its repo's `.gate/local.toml` keeps here.
+const DECLARED_LOCAL: &str = "declared local";
+/// The declaration file of the prefixes of the caller's variables a repo's commands read.
+const ENV_NAME: &str = "env.toml";
 /// The largest file of `.gate` the gate reads: 64 KiB.
 const GATE_FILE_MOST_BYTES: usize = 64 * 1024;
 /// The problem of a file of `.gate` that is a link, a junction or a folder.
@@ -129,11 +133,12 @@ impl Decision {
 }
 
 /// Decides where `request`'s command runs and says the decision's lines, on stderr and in the log: why a command runs
-/// here when there is a reason to say, or the lines of a routed run, the line of the watched variables it does not send
-/// ([`dropped_line`]) after them. A command that would route but has a word that is not valid Unicode runs here, saying
-/// so. A gate under a `covering_parent`'s slot runs here, saying nothing. With the route, what the decision learnt of
-/// the gate's place in its git worktree, and, for a routed run of a repo whose warm-up is set up, the hash of its
-/// warm-up file ([`consented_hash`]).
+/// here when there is a reason to say, or the lines of a routed run, then the problem of its repo's `.gate/env.toml`
+/// when it has one ([`declared_prefixes`]), and the line of the watched variables it does not send ([`dropped_line`]),
+/// the names the repo's declared prefixes start among them, after them. A command that would route but has a word that
+/// is not valid Unicode runs here, saying so. A gate under a `covering_parent`'s slot runs here, saying nothing. With
+/// the route, what the decision learnt of the gate's place in its git worktree, and, for a routed run of a repo whose
+/// warm-up is set up, the hash of its warm-up file ([`consented_hash`]).
 pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_parent: bool, console: &mut Console) -> Decided {
     let decision = Decision::of(request, environment, covering_parent);
     let machine = Machine::new(environment, &request.test_seams);
@@ -145,9 +150,9 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
         },
         route => route,
     };
-    let warm_hash = match &route {
-        Route::Routed(remote) => consented_hash(remote, &machine),
-        Route::Local { .. } => None,
+    let (warm_hash, declared) = match &route {
+        Route::Routed(remote) => (consented_hash(remote, &machine), declared_prefixes(remote, &machine)),
+        Route::Local { .. } => (None, Ok(Vec::new())),
     };
     for line in machine.unsaid_notes() {
         console.note(&line);
@@ -157,7 +162,11 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
         Route::Local { reason: None } => {}
         Route::Routed(run) => {
             run.lines().iter().for_each(|line| console.err(line));
-            if let Some(line) = dropped_line(request) {
+            let prefixes = declared.unwrap_or_else(|line| {
+                console.err(&line);
+                Vec::new()
+            });
+            if let Some(line) = dropped_line(request, &prefixes) {
                 console.err(&line);
             }
         }
@@ -190,12 +199,39 @@ pub(crate) fn would_route_on_heavy(decision: &Decision, seams: &TestSeams) -> bo
 }
 
 /// The line a routed run says for the watched variables of the gate's environment it does not send
-/// ([`gate_router::dropped_env`]): those no `--env` pair of `request` names and the gate does not set itself. A name
-/// that is not valid Unicode is left out. `None` when it sends them all.
-fn dropped_line(request: &RunRequest) -> Option<String> {
-    let caller: Vec<String> = std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()).collect();
+/// ([`gate_router::dropped_env`]), the names starting one of the repo's `declared` prefixes among them: those no
+/// `--env` pair of `request` names and the gate does not set itself. A name that is not valid Unicode is left out, and
+/// so is one `--env` refuses ([`env_refusal`]), whose advice the line could not give. `None` when it sends them all.
+fn dropped_line(request: &RunRequest, declared: &[String]) -> Option<String> {
+    let caller: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| env_refusal(name, "").is_none())
+        .collect();
     let sent: Vec<&str> = request.env.iter().map(|(name, _)| name.as_str()).collect();
-    dropped_env_line(&dropped_env(caller.iter().map(String::as_str), &sent, GATE_SET_NAMES))
+    dropped_env_line(&dropped_env(caller.iter().map(String::as_str), &sent, GATE_SET_NAMES, declared))
+}
+
+/// The prefixes the routed `remote`'s repo declares in `.gate/env.toml` ([`gate_router::env::read_env`]), read through
+/// [`read_declaration`] with the declarations folder the routing file the decision read names, its log lines kept
+/// among `machine`'s notes; none when neither place has the file. Read only for a routed run, after the decision, which
+/// it never changes.
+///
+/// # Errors
+///
+/// The line to say when the file cannot be read or has a problem ([`gate_router::env::problem_line`]), naming it as
+/// [`Source::said`] does; the run then routes watching the build variables alone.
+fn declared_prefixes(remote: &RemoteRun, machine: &Machine<'_>) -> Result<Vec<String>, String> {
+    let (read, source) = read_declaration(Path::new(&remote.root), &remote.repo, machine.config.borrow().as_ref(), ENV_NAME);
+    machine.notes.borrow_mut().extend(source.log_lines(&remote.repo, ENV_NAME));
+    let problem = match read {
+        Ok(None) => return Ok(Vec::new()),
+        Ok(Some(bytes)) => match gate_router::env::read_env(&bytes) {
+            Ok(prefixes) => return Ok(prefixes),
+            Err(problem) => problem,
+        },
+        Err(problem) => problem,
+    };
+    Err(gate_router::env::problem_line(&source.said(ENV_NAME), &problem))
 }
 
 /// The hash of `remote`'s warm-up file when its repo has warm-up consent and the file parsed; else `None`. Consent is
@@ -217,7 +253,8 @@ fn consented_hash(remote: &RemoteRun, machine: &Machine<'_>) -> Option<String> {
 }
 
 /// The queue line's `notRouted`: `--local` for a heavy gate its caller kept here with `--local`, `another worktree`
-/// for a matched command whose outside path lies in another git worktree, else none.
+/// for a matched command whose outside path lies in another git worktree, `declared local` for one its repo's
+/// `.gate/local.toml` keeps here, by a pattern or by a problem, else none.
 pub(crate) fn not_routed(route: &Route) -> Option<String> {
     match route {
         Route::Local {
@@ -226,6 +263,9 @@ pub(crate) fn not_routed(route: &Route) -> Option<String> {
         Route::Local {
             reason: Some(LocalReason::OtherWorktree { .. }),
         } => Some(ANOTHER_WORKTREE.to_owned()),
+        Route::Local {
+            reason: Some(LocalReason::DeclaredLocal { .. } | LocalReason::LocalFile { .. }),
+        } => Some(DECLARED_LOCAL.to_owned()),
         _ => None,
     }
 }
@@ -446,7 +486,11 @@ impl Facts for Machine<'_> {
     }
 
     fn desktop(&self, place: &Place) -> Result<Vec<Pattern>, String> {
-        read_desktop(self.declaration(place, "desktop.toml"))
+        read_patterns(self.declaration(place, "desktop.toml"), gate_router::desktop::read_desktop)
+    }
+
+    fn local(&self, place: &Place) -> Result<Vec<Pattern>, String> {
+        read_patterns(self.declaration(place, "local.toml"), gate_router::local::read_local)
     }
 
     /// As the last read of `name` named it; `.gate/<name>` when it was not read.
@@ -648,11 +692,12 @@ fn read_siblings(read: Result<Option<Vec<u8>>, String>) -> Result<Vec<String>, S
     }
 }
 
-/// The patterns a `desktop.toml` declares, from its `read` ([`read_declaration`]): no file declares none, and a file
-/// that cannot be read, does not parse or has any problem gives its first problem.
-fn read_desktop(read: Result<Option<Vec<u8>>, String>) -> Result<Vec<Pattern>, String> {
+/// The patterns a pattern file (`desktop.toml` or `local.toml`) declares, from its `read` ([`read_declaration`]) and
+/// its file's reader `parse`: no file declares none, and a file that cannot be read, does not parse or has any problem
+/// gives its first problem.
+fn read_patterns(read: Result<Option<Vec<u8>>, String>, parse: fn(&[u8]) -> Result<Vec<Pattern>, String>) -> Result<Vec<Pattern>, String> {
     match read? {
-        Some(bytes) => gate_router::desktop::read_desktop(&bytes),
+        Some(bytes) => parse(&bytes),
         None => Ok(Vec::new()),
     }
 }
@@ -724,7 +769,8 @@ impl Source {
 /// answers that there is none. Only when `.gate` is absent, or is a folder without the file, is the copy in the
 /// declarations folder `config` names for `repo` read ([`read_declarations_copy`]). A file of the worktree's own, its
 /// problem included, notes the copy it shadows, when there is one ([`declared_copy`]). Routing, `gate warm` and `gate
-/// check` read `siblings.toml`, `desktop.toml` and `warmup.toml` through this, and `gate check` `toolchain.toml` too.
+/// check` read `siblings.toml`, `desktop.toml` and `warmup.toml` through this, routing `local.toml` and `env.toml` too,
+/// and `gate check` `toolchain.toml`.
 pub(crate) fn read_declaration(root: &Path, repo: &str, config: Option<&Config>, name: &str) -> (Result<Option<Vec<u8>>, String>, Source) {
     match read_repo_file(root, name) {
         RepoRead::File(Ok(None)) => read_declarations_copy(repo, config, name),
@@ -1657,9 +1703,27 @@ mod tests {
     }
 
     #[test]
-    fn only_the_local_flag_and_another_worktree_write_not_routed() {
+    fn only_the_local_flag_another_worktree_and_the_local_file_write_not_routed() {
         let flag = Route::Local {
             reason: Some(LocalReason::LocalFlag),
+        };
+        let declared = Route::Local {
+            reason: Some(LocalReason::DeclaredLocal {
+                file: ".gate/local.toml".to_owned(),
+                pattern: "x*".to_owned(),
+            }),
+        };
+        let unusable = Route::Local {
+            reason: Some(LocalReason::LocalFile {
+                file: ".gate/local.toml".to_owned(),
+                problem: "x".to_owned(),
+            }),
+        };
+        let desktop = Route::Local {
+            reason: Some(LocalReason::DesktopFile {
+                file: ".gate/desktop.toml".to_owned(),
+                problem: "x".to_owned(),
+            }),
         };
         let other = Route::Local {
             reason: Some(LocalReason::OtherWorktree {
@@ -1675,6 +1739,13 @@ mod tests {
 
         assert_eq!(not_routed(&flag).as_deref(), Some("--local"));
         assert_eq!(not_routed(&other).as_deref(), Some("another worktree"));
+        assert_eq!(not_routed(&declared).as_deref(), Some("declared local"));
+        assert_eq!(
+            not_routed(&unusable).as_deref(),
+            Some("declared local"),
+            "a file the gate cannot use keeps it here too"
+        );
+        assert_eq!(not_routed(&desktop), None);
         assert_eq!(not_routed(&outside), None, "an outside word in no other worktree writes none");
         assert_eq!(not_routed(&failed), None);
         assert_eq!(not_routed(&Route::Local { reason: None }), None);

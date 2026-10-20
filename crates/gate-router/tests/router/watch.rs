@@ -1,11 +1,16 @@
-//! The caller's environment a routed run does not send: the watch list, the `--env` and gate-name exclusions, and the
-//! line the gate says for the names it keeps.
+//! The caller's environment a routed run does not send: the watch list, the prefixes a repo declares, the `--env` and
+//! gate-name exclusions, and the line the gate says for the names it keeps.
 
 use gate_router::{dropped_env, dropped_env_line};
 
-/// The names of `caller` a routed run does not send, with no `--env` and no name the gate sets.
+/// The names of `caller` a routed run does not send, with no `--env`, no name the gate sets and no declared prefix.
 fn kept(caller: &[&str]) -> Vec<String> {
-    dropped_env(caller.iter().copied(), &[], &[])
+    dropped_env(caller.iter().copied(), &[], &[], &[])
+}
+
+/// The prefixes `texts`, as a repo's `.gate/env.toml` declares them.
+fn declared(texts: &[&str]) -> Vec<String> {
+    texts.iter().map(|text| (*text).to_owned()).collect()
 }
 
 #[test]
@@ -53,7 +58,7 @@ fn a_name_outside_the_watch_list_is_not_kept() {
 #[test]
 fn a_name_given_by_env_or_set_by_the_gate_is_not_kept() {
     assert_eq!(
-        dropped_env(["NuGetAudit", "RUSTFLAGS"].into_iter(), &["nugetaudit"], &[]),
+        dropped_env(["NuGetAudit", "RUSTFLAGS"].into_iter(), &["nugetaudit"], &[], &[]),
         ["RUSTFLAGS"],
         "--env sends it, in any letter case"
     );
@@ -61,11 +66,55 @@ fn a_name_given_by_env_or_set_by_the_gate_is_not_kept() {
         dropped_env(
             ["MSBUILDUSESERVER", "MSBUILDNODEHANDSHAKESALT", "MSBUILDDISABLENODEREUSE", "NuGetAudit"].into_iter(),
             &[],
-            &["MSBUILDUSESERVER", "MSBUILDNODEHANDSHAKESALT", "MSBUILDDISABLENODEREUSE"]
+            &["MSBUILDUSESERVER", "MSBUILDNODEHANDSHAKESALT", "MSBUILDDISABLENODEREUSE"],
+            &[]
         ),
         ["NuGetAudit"],
         "the gate sets the MSBuild names on every command it starts, so a nested gate's inherited ones never warn"
     );
+}
+
+#[test]
+fn a_declared_prefix_keeps_the_names_it_starts_in_any_letter_case_beside_the_watch_list() {
+    assert_eq!(
+        dropped_env(
+            [
+                "COLLIE_SEED",
+                "collie_x",
+                "Ops_Tower_Lan_Tests",
+                "OPS_TOWER_LAN_TESTSX",
+                "OPS_TOWER",
+                "COLLIE",
+                "NuGetAudit",
+                "PATH",
+            ]
+            .into_iter(),
+            &[],
+            &[],
+            &declared(&["collie_", "OPS_TOWER_LAN_TESTS"])
+        ),
+        ["COLLIE_SEED", "collie_x", "NuGetAudit", "Ops_Tower_Lan_Tests", "OPS_TOWER_LAN_TESTSX"],
+        "an exact name is its own prefix, and the built-in list still holds"
+    );
+}
+
+#[test]
+fn a_declared_name_given_by_env_or_set_by_the_gate_is_not_kept() {
+    assert_eq!(
+        dropped_env(
+            ["COLLIE_SEED", "COLLIE_RUNS", "COLLIE_GATE"].into_iter(),
+            &["collie_seed"],
+            &["COLLIE_GATE"],
+            &declared(&["COLLIE_"])
+        ),
+        ["COLLIE_RUNS"],
+        "--env sends one in any letter case, and the gate sets the other"
+    );
+}
+
+#[test]
+fn no_declared_prefix_keeps_only_the_watch_list() {
+    assert_eq!(kept(&["COLLIE_SEED", "OPS_TOWER_LAN_TESTS", "NuGetAudit"]), ["NuGetAudit"]);
 }
 
 #[test]

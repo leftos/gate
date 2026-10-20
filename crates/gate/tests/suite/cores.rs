@@ -386,6 +386,20 @@ fn a_long_light_pass_whose_command_has_a_word_that_is_not_unicode_says_nothing()
 }
 
 #[test]
+fn a_long_light_pass_whose_command_its_repo_declares_local_says_nothing() {
+    let case = routed_case("a_long_light_pass_whose_command_its_repo_declares_local_says_nothing");
+    fs::create_dir_all(case.folder().join(".gate")).expect("the .gate folder can be made");
+    fs::write(case.folder().join(".gate").join("local.toml"), "patterns = ['*tool* sleep *']\n").expect("the declaration can be written");
+    let mut extra = HINT_FLOOR.to_vec();
+    extra.extend(GIT_HANG_GUARDS);
+
+    let outcome = case.run(&run_words("out.log", &extra, &[r".\tool.exe", "sleep", "2000"]));
+
+    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
+    assert_no_route_hint(&outcome);
+}
+
+#[test]
 fn a_long_light_pass_whose_command_matches_no_pattern_says_nothing() {
     let case = routed_case("a_long_light_pass_whose_command_matches_no_pattern_says_nothing");
     let routing = json!({ "host": HOST, "repos": { repo(&case): ["*nothing*"] } });

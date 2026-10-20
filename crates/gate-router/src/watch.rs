@@ -1,5 +1,6 @@
-//! The caller's environment a routed run does not send: the names whose setting changes what a build does, and the line
-//! the gate says for the caller's names among them.
+//! The caller's environment a routed run does not send: the names whose setting changes what a build does and the names
+//! starting the prefixes a repo's `.gate/env.toml` declares, and the line the gate says for the caller's names among
+//! them.
 
 use crate::escape::escaped;
 
@@ -12,15 +13,16 @@ const WATCHED_NAMES: [&str; 3] = ["NuGetAudit", "RUSTFLAGS", "RUSTDOCFLAGS"];
 /// The prefixes of the names of the caller's environment a routed run does not send ([`WATCHED_NAMES`]).
 const WATCHED_PREFIXES: [&str; 4] = ["NUGET_", "MSBUILD", "CARGO_BUILD_", "CARGO_PROFILE_"];
 
-/// The names of `caller`'s environment a routed run does not send: each watched name ([`WATCHED_NAMES`]) minus the names
+/// The names of `caller`'s environment a routed run does not send: each watched name ([`WATCHED_NAMES`]) and each name
+/// starting one of the `declared` prefixes the repo's `.gate/env.toml` gives ([`crate::env::read_env`]), minus the names
 /// `sent` gives (`--env` sends them) and minus the names `gates` holds (the gate sets them itself, so a gate nested in
 /// the command never warns), de-duplicated without regard to ASCII case, keeping the first spelling seen, and sorted by
 /// their ASCII-lowercase spelling.
 #[must_use]
-pub fn dropped_env<'a>(caller: impl IntoIterator<Item = &'a str>, sent: &[&str], gates: &[&str]) -> Vec<String> {
+pub fn dropped_env<'a>(caller: impl IntoIterator<Item = &'a str>, sent: &[&str], gates: &[&str], declared: &[String]) -> Vec<String> {
     let mut kept: Vec<&str> = Vec::new();
     for name in caller {
-        if !watched(name) || named_by(sent, name) || named_by(gates, name) || named_by(&kept, name) {
+        if !watched(name, declared) || named_by(sent, name) || named_by(gates, name) || named_by(&kept, name) {
             continue;
         }
         kept.push(name);
@@ -39,10 +41,11 @@ pub fn dropped_env_line(names: &[String]) -> Option<String> {
     })
 }
 
-/// Whether `name` is one a routed run does not send.
-fn watched(name: &str) -> bool {
+/// Whether `name` is one a routed run does not send: a watched name, or one starting a watched or `declared` prefix.
+fn watched(name: &str, declared: &[String]) -> bool {
     WATCHED_NAMES.iter().any(|watched| watched.eq_ignore_ascii_case(name))
         || WATCHED_PREFIXES.iter().any(|prefix| starts_with_ignoring_case(name, prefix))
+        || declared.iter().any(|prefix| starts_with_ignoring_case(name, prefix))
 }
 
 /// Whether any name of `names` is `name`, compared without regard to ASCII case.
