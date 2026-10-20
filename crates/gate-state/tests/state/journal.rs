@@ -134,6 +134,15 @@ fn history_of(test: &str, lines: &[String]) -> History {
     read_fresh(&dir)
 }
 
+/// The history of a journal holding just `lines`, a run being live as `is_live` says.
+fn history_with(test: &str, lines: &[String], is_live: impl Fn(u32, &str) -> bool) -> History {
+    let dir = journal_dir(test);
+    fs::write(dir.join("events.jsonl"), text(lines)).expect("the journal can be written");
+    JournalCache::default()
+        .read(&dir, "", ts(NOW), is_live, last_segment)
+        .expect("the journal can be read")
+}
+
 fn states(history: &History) -> Vec<RunState> {
     history.runs.iter().map(|run| run.state).collect()
 }
@@ -253,6 +262,57 @@ fn a_cold_routed_release_parses() {
     let run = &history.runs[0];
     assert_eq!((run.held_seconds, run.status, run.wall_seconds), (Some(4.0), Some(0), Some(3.5)));
     assert_eq!(run.verdict.as_deref(), Some("passed"));
+}
+
+#[test]
+fn a_cold_release_gives_its_run_cold() {
+    let gate = Gate::new(1, START, COMMAND);
+    let cold = json!({"wallSeconds": 3.5, "adjustedSeconds": 2.0, "verdict": "passed", "cold": true});
+    let lines = vec![
+        versioned(&gate.queue(&ago(30)), 1),
+        versioned(&gate.take(&ago(29), 0.5), 1),
+        versioned(&with_fields(&gate.release(&ago(28), 4.0, json!(0)), &cold), 1),
+    ];
+
+    let history = history_of("a_cold_release_gives_its_run_cold", &lines);
+
+    assert_eq!(states(&history), [RunState::Ok]);
+    let run = &history.runs[0];
+    assert_eq!(run.cold, Some(true), "the run carries its release's cold");
+    let shape = serde_json::to_value(run).expect("a run serializes");
+    assert_eq!(shape["cold"], true, "the run serializes its cold");
+}
+
+#[test]
+fn a_release_without_cold_has_no_cold_key() {
+    let gate = Gate::new(1, START, COMMAND);
+    let lines = vec![
+        versioned(&gate.queue(&ago(30)), 1),
+        versioned(&gate.take(&ago(29), 0.5), 1),
+        versioned(&gate.release(&ago(28), 4.0, json!(0)), 1),
+    ];
+
+    let history = history_of("a_release_without_cold_has_no_cold_key", &lines);
+
+    let run = &history.runs[0];
+    assert_eq!(run.cold, None);
+    let shape = serde_json::to_value(run).expect("a run serializes");
+    assert_eq!(shape.get("cold"), None, "a run without one serializes no cold key");
+}
+
+#[test]
+fn cold_on_a_non_release_line_is_ignored() {
+    let gate = Gate::new(1, START, COMMAND);
+    let lines = vec![
+        versioned(&with_fields(&gate.queue(&ago(30)), &json!({"cold": true})), 1),
+        versioned(&with_fields(&gate.take(&ago(29), 0.5), &json!({"cold": true})), 1),
+        versioned(&gate.release(&ago(28), 4.0, json!(0)), 1),
+    ];
+
+    let history = history_of("cold_on_a_non_release_line_is_ignored", &lines);
+
+    assert_eq!(states(&history), [RunState::Ok]);
+    assert_eq!(history.runs[0].cold, None, "only a release sets a run's cold");
 }
 
 #[test]
@@ -533,6 +593,7 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 adjusted_seconds: None,
                 abandoned: Vec::new(),
                 remote_take: None,
+                cold: None,
             },
             HistoryRun {
                 command: "cargo build".to_owned(),
@@ -561,6 +622,7 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 adjusted_seconds: None,
                 abandoned: Vec::new(),
                 remote_take: None,
+                cold: None,
             },
         ]
     );
@@ -691,6 +753,177 @@ fn open_run_is_running_when_live_else_unrecorded() {
     assert_eq!(history.runs[0].started, None, "a run still queued has not started");
     assert_eq!(history.runs[2].held_seconds, None);
     assert!(history.summary.is_empty(), "open runs are not counted: {:?}", history.summary);
+}
+
+#[test]
+fn an_open_run_past_the_50_cap_is_in_open() {
+    let mut lines = Vec::new();
+    for pid in 1..=60_u32 {
+        lines.extend(Gate::new(pid, START, COMMAND).run(200 - i64::from(pid), 1.0, json!(0)));
+    }
+    let long = Gate::new(99, START, "cargo build");
+    let long_lines = [long.queue(&ago(300)), long.take(&ago(299), 5.0)];
+    lines.extend(long_lines.clone());
+    let is_live = |pid: u32, process_start: &str| (pid, process_start) == (99, START);
+    let history = history_with("an_open_run_past_the_50_cap_is_in_open", &lines, is_live);
+
+    assert_eq!(history.runs.len(), 50);
+    assert!(!history.runs.iter().any(|run| run.pid == 99), "the long run is past the 50 cap");
+    assert_eq!(history.open.len(), 1, "{:?}", history.open);
+    assert_eq!(history.open[0].pid, 99);
+
+    let alone = history_with("an_open_run_past_the_50_cap_is_in_open_alone", &long_lines, is_live);
+    assert_eq!(
+        history.open[0], alone.runs[0],
+        "an open row is the row the run would have among the listed runs"
+    );
+}
+
+#[test]
+fn open_lists_only_taken_unreleased_live_runs() {
+    let queued = Gate::new(1, START, "cargo fmt --check");
+    let released = Gate::new(2, START, "cargo build");
+    let dead = Gate::new(3, START, "cargo test");
+    let open = Gate::new(4, START, COMMAND);
+    let mut lines = vec![queued.queue(&ago(40))];
+    lines.extend(released.run(30, 5.0, json!(0)));
+    lines.extend([dead.queue(&ago(20)), dead.take(&ago(19), 1.0)]);
+    lines.extend([open.queue(&ago(10)), open.take(&ago(9), 1.0)]);
+    let covered = Gate::new(5, START, "cargo fmt --check");
+    let late = Gate::new(6, START, "cargo clippy");
+    lines.push(covered.line("covered", &ago(7), json!({"parentPid": 7})));
+    lines.extend([late.line("covered", &ago(5), json!({"parentPid": 7})), late.take(&ago(4), 1.0)]);
+    let is_live = |pid: u32, process_start: &str| process_start == START && pid != 3;
+    let history = history_with("open_lists_only_taken_unreleased_live_runs", &lines, is_live);
+
+    assert_eq!(
+        history.open.iter().map(|run| run.pid).collect::<Vec<_>>(),
+        [6, 4],
+        "the covered run that took its slot late and the plain run are open, newest take first"
+    );
+    assert_eq!(history.open[0].state, RunState::Running);
+    assert!(
+        history.runs.iter().any(|run| run.pid == 1),
+        "the run that never took a slot is still listed among the runs"
+    );
+}
+
+#[test]
+fn open_is_newest_take_first() {
+    let newer = Gate::new(2, START, "cargo build");
+    let older = Gate::new(1, START, COMMAND);
+    let lines = [
+        newer.queue(&ago(40)),
+        older.queue(&ago(30)),
+        older.take(&ago(20), 1.0),
+        newer.take(&ago(10), 1.0),
+    ];
+    let history = history_with("open_is_newest_take_first", &lines, |_, _| true);
+
+    assert_eq!(
+        history.runs.iter().map(|run| run.pid).collect::<Vec<_>>(),
+        [1, 2],
+        "the runs are newest first by their first line"
+    );
+    assert_eq!(
+        history.open.iter().map(|run| run.pid).collect::<Vec<_>>(),
+        [2, 1],
+        "the open runs are newest take first"
+    );
+}
+
+#[test]
+fn a_run_on_its_parent_s_slot_with_a_take_is_not_open() {
+    let parent = Gate::new(100, START, "cargo test");
+    let child = Gate::new(200, START, COMMAND);
+    let mut lines = parent.run(20, 5.0, json!(0));
+    lines.extend([
+        child.queue(&ago(10)),
+        child.take(&ago(9), 1.0),
+        child.line("parent", &ago(8), json!({"parentPid": 100})),
+    ]);
+    let is_live = |pid: u32, process_start: &str| (pid, process_start) == (200, START);
+    let history = history_with("a_run_on_its_parent_s_slot_with_a_take_is_not_open", &lines, is_live);
+
+    let child = history.runs.iter().find(|run| run.pid == 200).expect("the child run is listed");
+    assert_eq!(
+        (child.state, child.running),
+        (RunState::Parent, true),
+        "the child took its slot and is live, but ran on its parent's slot"
+    );
+    assert!(history.open.is_empty(), "a run on its parent's slot is not open: {:?}", history.open);
+}
+
+#[test]
+fn open_probes_liveness_only_for_taken_unreleased_runs_off_a_parent_slot() {
+    use std::cell::RefCell;
+
+    let mut lines = Vec::new();
+    for pid in 1..=60_u32 {
+        lines.extend(Gate::new(pid, START, COMMAND).run(200 - i64::from(pid), 1.0, json!(0)));
+    }
+    // Three runs outside the 50 the history lists, so only the open-run evaluation can ask about them.
+    lines.extend(Gate::new(900, START, "cargo build").run(300, 5.0, json!(0)));
+    lines.push(Gate::new(901, START, "cargo fmt --check").queue(&ago(301)));
+    lines.extend([
+        Gate::new(902, START, "cargo clippy").queue(&ago(302)),
+        Gate::new(902, START, "cargo clippy").take(&ago(301), 1.0),
+        Gate::new(902, START, "cargo clippy").line("parent", &ago(300), json!({"parentPid": 1})),
+    ]);
+    lines.extend([
+        Gate::new(500, START, "cargo test").queue(&ago(10)),
+        Gate::new(500, START, "cargo test").take(&ago(9), 1.0),
+    ]);
+    let asked = RefCell::new(Vec::new());
+    let is_live = |pid: u32, process_start: &str| {
+        asked.borrow_mut().push((pid, process_start.to_owned()));
+        (pid, process_start) == (500, START)
+    };
+    let dir = journal_dir("open_probes_liveness_only_for_taken_unreleased_runs_off_a_parent_slot");
+    fs::write(dir.join("events.jsonl"), text(&lines)).expect("the journal can be written");
+    let history = JournalCache::default()
+        .read(&dir, "", ts(NOW), is_live, last_segment)
+        .expect("the journal can be read");
+
+    assert_eq!(history.open.iter().map(|run| run.pid).collect::<Vec<_>>(), [500]);
+    let asked = asked.borrow();
+    assert!(asked.contains(&(500, START.to_owned())), "the open run is probed");
+    for pid in [900, 901, 902] {
+        assert!(
+            !asked.iter().any(|(asked_pid, _)| *asked_pid == pid),
+            "pid {pid} is not open and is not probed: {asked:?}"
+        );
+    }
+}
+
+#[test]
+fn a_live_open_run_older_than_7_days_survives_prune() {
+    let week = 7 * 24 * 60;
+    let long = Gate::new(99, START, "cargo build");
+    let mut lines = Vec::new();
+    for pid in 1..=60_u32 {
+        lines.extend(Gate::new(pid, START, COMMAND).run(200 - i64::from(pid), 1.0, json!(0)));
+    }
+    lines.extend([long.queue(&ago(week + 120)), long.take(&ago(week + 119), 5.0)]);
+    let dir = journal_dir("a_live_open_run_older_than_7_days_survives_prune");
+    fs::write(dir.join("events.jsonl"), text(&lines)).expect("the journal can be written");
+    let live = |pid: u32, process_start: &str| (pid, process_start) == (99, START);
+    let dead = |_pid: u32, _process_start: &str| false;
+    let mut cache = JournalCache::default();
+
+    let first = cache.read(&dir, "", ts(NOW), live, last_segment).expect("the journal can be read");
+    let second = cache.read(&dir, "", ts(NOW), live, last_segment).expect("the journal can be read again");
+    assert_eq!(first.open.iter().map(|run| run.pid).collect::<Vec<_>>(), [99]);
+    assert_eq!(
+        second.open.iter().map(|run| run.pid).collect::<Vec<_>>(),
+        [99],
+        "an open run is kept by the prune whatever its age"
+    );
+
+    let ended = cache.read(&dir, "", ts(NOW), dead, last_segment).expect("the journal can be read again");
+    assert!(ended.open.is_empty(), "a run whose gate is gone is not open");
+    let after = cache.read(&dir, "", ts(NOW), live, last_segment).expect("the journal can be read again");
+    assert!(after.open.is_empty(), "the prune dropped the old run as soon as its gate was gone");
 }
 
 #[test]

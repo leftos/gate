@@ -150,6 +150,11 @@ pub struct HistoryRun {
     /// Serialized as `remoteTake`, absent for `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_take: Option<RemoteTake>,
+    /// Whether the run's release says it was routed to a builder with a cold work folder: the release line's `cold`,
+    /// `true` only for a cold routed run; `None` when the run has not released or its release has no `cold`. Serialized
+    /// as `cold`, absent for `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cold: Option<bool>,
 }
 
 /// The remote slot a routed run held before it fell back to run here: the `take` of its remote attempt, and when the
@@ -196,6 +201,11 @@ pub struct History {
     /// rolled out of the journal; the `parent` or `covered` line of a gate that never queued, as a covered gate never
     /// does), then by pid and process start.
     pub runs: Vec<HistoryRun>,
+    /// Every open run, uncapped, newest take first, then by pid and process start: a run that took its slot, has not
+    /// released or abandoned it, did not run on its parent's slot, and whose gate is live by the read's liveness check.
+    /// Each row is built as a [`History::runs`] row, a run may be in both lists, and a reader dedupes the two by pid and
+    /// process start. An open run whose take has rolled out of both journal files is not found.
+    pub open: Vec<HistoryRun>,
     /// One row per repository, command and remote flag over the runs taken in the last 7 days that passed, the most run
     /// first, then by command, then by repository (none first), then local before remote.
     pub summary: Vec<CommandSummary>,
@@ -264,6 +274,8 @@ struct Run {
     remote: bool,
     host: Option<String>,
     fallback: Option<String>,
+    /// Whether the run's release says it was routed to a builder with a cold work folder: the release line's `cold`.
+    cold: Option<bool>,
     /// The free text the run's `queue` line carries from `--reason`; the first such line's when more than one names one.
     reason: Option<String>,
     /// The remote take a fallback ended, kept for the reader: its start and wait, and when the run fell back.
@@ -324,6 +336,9 @@ struct Line {
     host: Option<String>,
     #[serde(default)]
     reason: Option<String>,
+    /// Whether the run was routed to a builder with a cold work folder: read from a `release` line only.
+    #[serde(default)]
+    cold: Option<bool>,
     #[serde(default)]
     parent_pid: Option<u32>,
     #[serde(default)]
@@ -357,16 +372,15 @@ impl Line {
 }
 
 impl JournalCache {
-    /// The history in `dir`'s `<prefix>events.jsonl` and `<prefix>events.1.jsonl` as of `now`, an open run being
-    /// [`RunState::Running`] when `is_live(pid, processStart)` says its gate still runs, and a run's repository being
-    /// `repo_of(cwd)`, the caller's rule for naming the repository a folder belongs to.
+    /// The history in `dir`'s `<prefix>events.jsonl` and `<prefix>events.1.jsonl` as of `now`, a run with no release being
+    /// [`RunState::Running`] when `is_live(pid, processStart)` says its gate still runs, and a run's repository being `repo_of(cwd)`,
+    /// the caller's rule for naming the repository a folder belongs to.
     ///
-    /// The first read, and a read after the journal was rolled (it is shorter than the bytes read so far, or its
-    /// creation time changed, or `events.1.jsonl` appeared, went or changed its length or write time) or after `dir` or
-    /// `prefix` changed, reads `events.1.jsonl` and then the journal from its start; any other read parses only the
-    /// journal's complete lines appended since the last, a trailing fragment
-    /// without its line feed being left for the next. Runs older than 7 days are then dropped unless they are among the
-    /// runs the history lists ([`History::runs`]). A missing file reads as an empty one.
+    /// The first read, and a read after the journal was rolled (it is shorter than the bytes read so far, or its creation time changed, or
+    /// `events.1.jsonl` appeared, went or changed its length or write time) or after `dir` or `prefix` changed, reads `events.1.jsonl` and then the
+    /// journal from its start; any other read parses only the journal's complete lines appended since the last, a trailing fragment without its line
+    /// feed being left for the next. Runs older than 7 days are then dropped unless they are among the runs the history lists ([`History::runs`]) or
+    /// are open ([`History::open`]), which it lists whatever their age. A missing file reads as an empty one.
     ///
     /// # Errors
     ///
@@ -384,7 +398,7 @@ impl JournalCache {
             return Err(error);
         }
         let listed = listed(&self.runs);
-        self.prune(now, &listed);
+        self.prune(now, &listed, &is_live);
         Ok(self.history(now, &listed, &is_live, &repo_of))
     }
 
@@ -516,8 +530,9 @@ impl JournalCache {
 
     /// Drops the runs that started more than 7 days before `now`, unless `listed`, the keys [`listed`] gives of the runs
     /// the history lists, names them, or it is the run [`Self::released_parent`] picks for a listed covered or fallen-back
-    /// run, whose row fills its status and held time from it.
-    fn prune(&mut self, now: Timestamp, listed: &[RunKey]) {
+    /// run, whose row fills its status and held time from it, or it is open ([`Run::is_open`]), which the history lists
+    /// whatever its age.
+    fn prune(&mut self, now: Timestamp, listed: &[RunKey], is_live: &impl Fn(u32, &str) -> bool) {
         let cutoff = now - SUMMARY_WINDOW;
         let parents: Vec<RunKey> = listed
             .iter()
@@ -526,7 +541,10 @@ impl JournalCache {
             .filter_map(|parent| self.released_parent(parent).map(|(key, _)| key.clone()))
             .collect();
         self.runs.retain(|key, run| {
-            run.started.as_ref().map_or(run.first, |started| started.at) >= cutoff || listed.contains(key) || parents.contains(key)
+            run.started.as_ref().map_or(run.first, |started| started.at) >= cutoff
+                || listed.contains(key)
+                || parents.contains(key)
+                || run.is_open(key.0, &key.1, is_live)
         });
     }
 
@@ -543,8 +561,26 @@ impl JournalCache {
             .collect();
         History {
             runs,
+            open: self.open_runs(is_live, repo_of),
             summary: summarize(self.runs.values(), now - SUMMARY_WINDOW, repo_of),
         }
+    }
+
+    /// The row of every open run ([`Run::is_open`]), newest take first, then by pid and process start.
+    fn open_runs(&self, is_live: &impl Fn(u32, &str) -> bool, repo_of: &impl Fn(&str) -> Option<String>) -> Vec<HistoryRun> {
+        let mut open: Vec<(&RunKey, &Run)> = self
+            .runs
+            .iter()
+            .filter(|((pid, process_start), run)| run.is_open(*pid, process_start, is_live))
+            .collect();
+        let taken = |run: &Run| run.started.as_ref().map(|stamp| stamp.at);
+        open.sort_by(|(a_key, a_run), (b_key, b_run)| taken(b_run).cmp(&taken(a_run)).then_with(|| b_key.cmp(a_key)));
+        open.into_iter()
+            .map(|(key, run)| {
+                let parent = run.parent.and_then(|parent| self.released_parent(parent)).map(|(_, run)| run);
+                run.row(key, is_live, run.repo(repo_of), parent)
+            })
+            .collect()
     }
 }
 
@@ -564,6 +600,7 @@ impl Run {
             remote: false,
             host: None,
             fallback: None,
+            cold: None,
             reason: None,
             remote_take: None,
             waited_seconds: None,
@@ -612,6 +649,7 @@ impl Run {
                 self.verdict.clone_from(&line.verdict);
                 self.wall_seconds = line.wall_seconds;
                 self.adjusted_seconds = line.adjusted_seconds;
+                self.cold = line.cold;
                 self.end = Some(End::Released);
                 // A release line that says `remote` marks a run whose queue and take rolled out of the journal; one that
                 // does not leaves the run as its take left it.
@@ -671,6 +709,12 @@ impl Run {
         self.parent.is_some() && !self.took_late()
     }
 
+    /// Whether the run is open: it took its slot, has not released or abandoned it, did not run on its parent's slot
+    /// ([`Self::on_parent`]), and its gate is live by `is_live`.
+    fn is_open(&self, pid: u32, process_start: &str, is_live: &impl Fn(u32, &str) -> bool) -> bool {
+        self.started.is_some() && self.end.is_none() && !self.on_parent() && is_live(pid, process_start)
+    }
+
     fn state(&self, (pid, process_start): &RunKey, is_live: &impl Fn(u32, &str) -> bool) -> RunState {
         if self.on_parent() {
             return if self.covered { RunState::Covered } else { RunState::Parent };
@@ -721,6 +765,7 @@ impl Run {
             adjusted_seconds: end.and_then(|end| end.adjusted_seconds),
             abandoned: self.abandoned.clone(),
             remote_take: self.remote_take.clone(),
+            cold: self.cold,
         }
     }
 

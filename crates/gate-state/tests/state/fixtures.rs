@@ -443,69 +443,8 @@ fn captured_journal_is_read_into_runs() {
         ],
         "newest first: the second exit 0, exit 3, the first exit 0, then the hand-written abandoned gate"
     );
-    assert_eq!(
-        history.runs[2],
-        HistoryRun {
-            command: "cmd /c exit 0".to_owned(),
-            cwd: Some(r"C:\work\repo".to_owned()),
-            repo: Some("repo".to_owned()),
-            kind: "light".to_owned(),
-            slot: None,
-            slots: Vec::new(),
-            machine: None,
-            remote: false,
-            host: None,
-            fallback: None,
-            reason: None,
-            pid: 3684,
-            process_start: "2026-10-10T00:12:31.4670650Z".to_owned(),
-            parent_pid: None,
-            state: RunState::Ok,
-            running: false,
-            queued: Some("2026-10-10T00:12:31.4787619Z".to_owned()),
-            started: Some("2026-10-10T00:12:31.4792208Z".to_owned()),
-            waited_seconds: Some(0.0),
-            held_seconds: Some(0.0),
-            status: Some(0),
-            verdict: Some("passed".to_owned()),
-            wall_seconds: Some(0.0),
-            adjusted_seconds: None,
-            abandoned: Vec::new(),
-            remote_take: None,
-        },
-        "the captured run took no slot"
-    );
-    assert_eq!(
-        history.runs[1],
-        HistoryRun {
-            command: "cmd /c exit 3".to_owned(),
-            cwd: Some(r"C:\work\repo".to_owned()),
-            repo: Some("repo".to_owned()),
-            kind: "light".to_owned(),
-            slot: None,
-            slots: Vec::new(),
-            machine: None,
-            remote: false,
-            host: None,
-            fallback: None,
-            reason: None,
-            pid: 71048,
-            process_start: "2026-10-10T00:12:31.4858610Z".to_owned(),
-            parent_pid: None,
-            state: RunState::Failed,
-            running: false,
-            queued: Some("2026-10-10T00:12:31.4965943Z".to_owned()),
-            started: Some("2026-10-10T00:12:31.4968993Z".to_owned()),
-            waited_seconds: Some(0.0),
-            held_seconds: Some(0.0),
-            status: Some(3),
-            verdict: Some("failed".to_owned()),
-            wall_seconds: Some(0.0),
-            adjusted_seconds: None,
-            abandoned: Vec::new(),
-            remote_take: None,
-        }
-    );
+    assert_eq!(history.runs[2], captured_exit_0_row(), "the captured run took no slot");
+    assert_eq!(history.runs[1], captured_exit_3_row());
     assert_eq!(history.runs[3].waited_seconds, Some(1.7), "the abandoned gate's wait");
     assert_eq!(
         history.summary,
@@ -519,6 +458,72 @@ fn captured_journal_is_read_into_runs() {
             max_seconds: 0.0,
         }]
     );
+}
+
+/// The row of the captured run that ran `cmd /c exit 0`: it took no slot.
+fn captured_exit_0_row() -> HistoryRun {
+    HistoryRun {
+        command: "cmd /c exit 0".to_owned(),
+        cwd: Some(r"C:\work\repo".to_owned()),
+        repo: Some("repo".to_owned()),
+        kind: "light".to_owned(),
+        slot: None,
+        slots: Vec::new(),
+        machine: None,
+        remote: false,
+        host: None,
+        fallback: None,
+        reason: None,
+        pid: 3684,
+        process_start: "2026-10-10T00:12:31.4670650Z".to_owned(),
+        parent_pid: None,
+        state: RunState::Ok,
+        running: false,
+        queued: Some("2026-10-10T00:12:31.4787619Z".to_owned()),
+        started: Some("2026-10-10T00:12:31.4792208Z".to_owned()),
+        waited_seconds: Some(0.0),
+        held_seconds: Some(0.0),
+        status: Some(0),
+        verdict: Some("passed".to_owned()),
+        wall_seconds: Some(0.0),
+        adjusted_seconds: None,
+        abandoned: Vec::new(),
+        remote_take: None,
+        cold: None,
+    }
+}
+
+/// The row of the captured run that ran `cmd /c exit 3`, pid 71048: a different run, which took no slot either.
+fn captured_exit_3_row() -> HistoryRun {
+    HistoryRun {
+        command: "cmd /c exit 3".to_owned(),
+        cwd: Some(r"C:\work\repo".to_owned()),
+        repo: Some("repo".to_owned()),
+        kind: "light".to_owned(),
+        slot: None,
+        slots: Vec::new(),
+        machine: None,
+        remote: false,
+        host: None,
+        fallback: None,
+        reason: None,
+        pid: 71048,
+        process_start: "2026-10-10T00:12:31.4858610Z".to_owned(),
+        parent_pid: None,
+        state: RunState::Failed,
+        running: false,
+        queued: Some("2026-10-10T00:12:31.4965943Z".to_owned()),
+        started: Some("2026-10-10T00:12:31.4968993Z".to_owned()),
+        waited_seconds: Some(0.0),
+        held_seconds: Some(0.0),
+        status: Some(3),
+        verdict: Some("failed".to_owned()),
+        wall_seconds: Some(0.0),
+        adjusted_seconds: None,
+        abandoned: Vec::new(),
+        remote_take: None,
+        cold: None,
+    }
 }
 
 #[test]
@@ -575,6 +580,7 @@ fn powershell_journal_is_read_into_runs() {
         adjusted_seconds: None,
         abandoned: Vec::new(),
         remote_take: None,
+        cold: None,
     };
     assert_eq!(history.runs[4], exit_0);
     assert_eq!(

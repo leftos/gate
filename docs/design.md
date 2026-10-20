@@ -1005,9 +1005,15 @@ A covered run that also journals a `take` of its own (it took a slot late) is no
 
 The history that ops-tower serves (`HistoryRun`, `GET /api/gate/history`) carries `verdict`, `wallSeconds` and `adjustedSeconds`, null when a line has none, and `abandoned`: every name any line of the run lists (`parent` and `covered` lines included), in line order without repeats, always present and empty when there are none. It also carries `reason`, the free text the run's `queue` line holds from `--reason`, omitted when the run gave none; the first `queue` line that names one wins. A covered run, and one lent its parent's slot before queueing, writes no `queue` line, so it carries no reason.
 
+It carries `cold` (`true`) when the run's `release` line says `"cold": true` ([Cold run](GLOSSARY.md#cold-run)), and omits it otherwise: a run with no release, and a release without the field, have none.
+
 The history lists the 50 newest runs that are not covered, and at most the 50 newest covered runs newer than the oldest of them: at most 100 runs, newest first by the time of each run's first journal line (its queue line, or the `parent` or `covered` line of a gate that never queued), then by pid and process start.
 
-A run fallen back onto or lent its parent's slot counts toward the 50; a covered run does not (one that took a slot late does), so a parent with many nested covered gates never crowds other runs out. The 7-day prune keeps every run the history lists, and the parent run of each listed covered or fallen-back run, whose row takes its status, held time and verdict from it.
+A run fallen back onto or lent its parent's slot counts toward the 50; a covered run does not (one that took a slot late does), so a parent with many nested covered gates never crowds other runs out. The 7-day prune keeps every run the history lists, the parent run of each listed covered or fallen-back run, whose row takes its status, held time and verdict from it, and every open run.
+
+The history also carries `open`, every [open run](GLOSSARY.md#open-run) uncapped, newest take first, then by pid and process start, each in the same row shape as `runs`. A run can be in both lists, so a reader dedupes them by `pid` and `processStart`.
+
+The prune keeps an open run whatever its age, until its gate stops being live. An open run whose `take` has rolled out of both journal files is not found: every roll makes the cache read both files again from the start. On a busy PC the two files hold about a day of runs, so an open run older than that drops out of `open`.
 
 It also carries `pid` (a number), `processStart` (the ISO string from the journal) and `running` (a bool, true while the run's gate is live by the same pid-and-start check as the tickets', for every run): a covered run's `state` stays `covered` while it runs.
 
