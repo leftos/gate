@@ -7,7 +7,7 @@ use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::os::windows::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -1804,18 +1804,22 @@ pub fn cpu_ticks(pid: u32) -> u64 {
 }
 
 /// A key under `HKEY_CURRENT_USER` that stands in for the machine's list of installed .NET Framework SDKs, which the seam
-/// `--test-netfx-key` points the netfx-sdk probe at, so no case reads this machine's own list; one per test process,
-/// removed when dropped. Until an SDK is listed in it, it does not exist, and a probe of it finds no SDK.
+/// `--test-netfx-key` points the netfx-sdk probe at, so no case reads this machine's own list; one per case of a test
+/// process, removed when dropped. Until an SDK is listed in it, it does not exist, and a probe of it finds no SDK.
 pub struct NetfxKey {
     /// The key's path under `HKEY_CURRENT_USER`.
     path: String,
 }
 
+/// The number of the [`NetfxKey`] made next, so that no two cases of one process share a key.
+static NEXT: AtomicU32 = AtomicU32::new(0);
+
 impl NetfxKey {
-    /// The key of this test process, emptied of what an earlier process of the same id left.
+    /// The key of this test process, numbered so that no other case of it shares the key, and emptied of what an
+    /// earlier process of the same id left.
     pub fn new() -> NetfxKey {
         let key = NetfxKey {
-            path: format!(r"Software\gate-tests\netfx-{}", process::id()),
+            path: format!(r"Software\gate-tests\netfx-{}-{}", process::id(), NEXT.fetch_add(1, Ordering::Relaxed)),
         };
         key.removed();
         key

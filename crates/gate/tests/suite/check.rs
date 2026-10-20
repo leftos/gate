@@ -151,7 +151,8 @@ fn check_a_pinned_unreal_at_another_version_is_missing() {
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
 }
 
-/// With no `GATE_UNREAL_ROOT` on this PC the engine is not checked here, which counts as neither missing nor skipped.
+/// With no `GATE_UNREAL_ROOT` on this PC the engine is not checked here, nor the .NET Framework SDK its builds need,
+/// which counts as neither missing nor skipped.
 #[test]
 fn check_an_unreal_pin_without_a_root_says_not_checked_here() {
     let case = repo_case("check_unreal_no_root");
@@ -164,12 +165,56 @@ fn check_an_unreal_pin_without_a_root_says_not_checked_here() {
         lines(&outcome.stdout)[1..],
         [
             "check: here: unreal not checked here: GATE_UNREAL_ROOT is not set",
-            &netfx_ok("here"),
+            "check: here: netfx-sdk not checked here: GATE_UNREAL_ROOT is not set, so the Unreal builds that need it are not checked here",
             "check: here: nothing missing"
         ],
         "{outcome:?}"
     );
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+/// With no `GATE_UNREAL_ROOT` the .NET Framework SDK those Unreal builds need is not checked here either, its line
+/// saying why, and counts as neither missing nor skipped.
+#[test]
+fn check_a_missing_netfx_sdk_beside_an_unchecked_unreal_is_not_checked() {
+    let case = repo_case("check_unreal_no_root_netfx");
+    write(&case, ".gate/toolchain.toml", "[tools]\nunreal = \"5.8\"\n");
+    let key = NetfxKey::new();
+
+    let outcome = check(&case, &[], &["--test-netfx-key", key.path()]);
+
+    assert_eq!(
+        lines(&outcome.stdout)[1..],
+        [
+            "check: here: unreal not checked here: GATE_UNREAL_ROOT is not set",
+            "check: here: netfx-sdk not checked here: GATE_UNREAL_ROOT is not set, so the Unreal builds that need it are not checked here",
+            "check: here: nothing missing"
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+}
+
+/// A manifest pinning the .NET Framework SDK alone is checked for it, and a missing one is missing with the hint
+/// naming the Developer Pack.
+#[test]
+fn check_a_missing_netfx_sdk_pinned_alone_is_missing_with_its_hint() {
+    let case = repo_case("check_netfx_pinned_alone");
+    write(&case, ".gate/toolchain.toml", "[tools]\nnetfx-sdk = \"4.6\"\n");
+    let key = NetfxKey::new();
+
+    let outcome = check(&case, &[], &["--test-netfx-key", key.path()]);
+
+    assert_eq!(
+        lines(&outcome.stdout)[1..],
+        [
+            "check: here: netfx-sdk missing (needs 4.6.0 or later)",
+            "install: here: netfx-sdk: install the .NET Framework 4.8 Developer Pack (https://dotnet.microsoft.com/download/dotnet-framework/net48)",
+            "check: here: 1 missing, 0 too old"
+        ],
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
 }
 
 /// A root inside the repo is refused as a Godot root inside it is, though it holds an engine.
@@ -1500,7 +1545,7 @@ fn check_builder_says_a_missing_netfx_sdk_for_an_unreal_pinned_repo() {
     for line in [
         "check: builder-1: unreal 5.8.0 ok (needs 5.8 exactly)",
         "check: builder-1: netfx-sdk missing (needs 4.6.0 or later)",
-        "install: builder-1: netfx-sdk: install the .NET Framework 4.8 Developer Pack (UnrealBuildTool needs a .NET Framework SDK 4.6 or later)",
+        "install: builder-1: netfx-sdk: copy tools/builder/ from the gate repo to builder-1 and run install-toolchains.ps1 -User <user> -Only '.NET Framework 4.8 Developer Pack' there, elevated (docs/routing-a-repo.md, Builder setup)",
     ] {
         assert!(said.contains(&line), "{line}: {outcome:?}");
     }

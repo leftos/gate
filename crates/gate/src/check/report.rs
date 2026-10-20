@@ -477,7 +477,8 @@ fn pins_text(pins: &[Pin]) -> String {
 /// The command that installs the tool `name` on this PC, `kind` saying whether it is missing or too old, its minimum
 /// `min` where the command takes one; `None` for a tool with no hint. A rust with a minimum is made the default
 /// toolchain with `rustup default`, which installs it when it is not there: after rustup itself when rust is missing,
-/// alone when rust is there but too old.
+/// alone when rust is there but too old. A netfx-sdk has no command of its own, so its hint names where the
+/// Developer Pack comes from.
 fn install_hint(name: &str, min: Option<Version>, kind: Kind) -> Option<String> {
     let command = match name {
         "rust" => {
@@ -492,6 +493,7 @@ fn install_hint(name: &str, min: Option<Version>, kind: Kind) -> Option<String> 
         "pnpm" => "corepack enable pnpm",
         "pwsh" => "winget install Microsoft.PowerShell",
         "ffmpeg" => "winget install Gyan.FFmpeg",
+        "netfx-sdk" => "install the .NET Framework 4.8 Developer Pack (https://dotnet.microsoft.com/download/dotnet-framework/net48)",
         _ => return None,
     };
     Some(command.to_owned())
@@ -499,8 +501,7 @@ fn install_hint(name: &str, min: Option<Version>, kind: Kind) -> Option<String> 
 
 /// The command that installs the tool `name` on the builder `host` over ssh, missing or too old alike, its minimum
 /// `min` where the command takes one; the builder's toolchain script for a tool no such command installs, and for a
-/// rust with no minimum to name; the .NET Framework Developer Pack to install for a netfx-sdk; `None` for a tool with
-/// no hint.
+/// rust with no minimum to name, the script's step named for a netfx-sdk; `None` for a tool with no hint.
 fn builder_hint(host: &str, name: &str, min: Option<Version>) -> Option<String> {
     let script = |step: &str| {
         format!(
@@ -509,7 +510,7 @@ fn builder_hint(host: &str, name: &str, min: Option<Version>) -> Option<String> 
         )
     };
     Some(match (name, min) {
-        ("netfx-sdk", _) => "install the .NET Framework 4.8 Developer Pack (UnrealBuildTool needs a .NET Framework SDK 4.6 or later)".to_owned(),
+        ("netfx-sdk", _) => script("'.NET Framework 4.8 Developer Pack'"),
         ("cargo-nextest", _) => "cargo install cargo-nextest --locked".to_owned(),
         ("pnpm", Some(min)) => format!("npm install -g pnpm@{min}"),
         ("pnpm", None) => "npm install -g pnpm".to_owned(),
@@ -1658,8 +1659,7 @@ mod tests {
     /// a missing or too old one on a builder with the hint naming the Developer Pack.
     #[test]
     fn a_netfx_sdk_on_a_builder_says_its_minimum_and_the_developer_pack_hint() {
-        const HINT: &str =
-            "install: box-1: netfx-sdk: install the .NET Framework 4.8 Developer Pack (UnrealBuildTool needs a .NET Framework SDK 4.6 or later)";
+        const HINT: &str = "install: box-1: netfx-sdk: copy tools/builder/ from the gate repo to box-1 and run install-toolchains.ps1 -User <user> -Only '.NET Framework 4.8 Developer Pack' there, elevated (docs/routing-a-repo.md, Builder setup)";
         let netfx = |probed| checked(vec![tool("netfx-sdk", Some("4.6"), probed)]);
         assert_eq!(
             builder_body(&netfx(found("4.6.2,4.8"))),

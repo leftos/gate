@@ -35,6 +35,8 @@ const SIBLINGS: &str = "siblings.toml";
 const NO_READABLE_PIN: &str = "global.json has no readable sdk pin";
 /// The manifest tool whose engines this PC is looked for in only when its environment names `GATE_UNREAL_ROOT`.
 const UNREAL: &str = "unreal";
+/// The manifest tool an Unreal Engine build needs beside the engine, at a .NET Framework SDK `UnrealBuildTool` finds.
+const NETFX_SDK: &str = "netfx-sdk";
 /// Why a `.gate` that is not a folder leaves the manifest unreadable.
 const GATE_NOT_A_FOLDER: &str = ".gate is not a folder";
 /// How the siblings file's reader starts the problem of one entry of its array: `siblings[<index>] ...`.
@@ -552,8 +554,9 @@ fn read_manifest(root: &Path, declarations: &mut Declarations) -> Result<Option<
 /// Each of `needs` with what its probe found within `limit`, in their order; an unknown tool runs nothing. The tools
 /// are looked for as this PC's SDK list looks for dotnet: along `PATH` with the folders inside the worktree `root`
 /// dropped, and one found that still lies inside it refused. An unreal on a PC whose environment names no
-/// `GATE_UNREAL_ROOT` is not checked here, as nothing says where its engines are. A netfx-sdk is read from this PC's
-/// own list of .NET Framework SDKs, or from the key `netfx_key` names when a test seam gives one.
+/// `GATE_UNREAL_ROOT` is not checked here, as nothing says where its engines are, and a netfx-sdk beside it is not
+/// checked either, as the Unreal builds that need it are the ones not checked. A netfx-sdk is read from this PC's own
+/// list of .NET Framework SDKs, or from the key `netfx_key` names when a test seam gives one.
 fn probed(needs: Vec<ToolNeed>, limit: Duration, root: &Path, netfx_key: Option<&str>) -> Vec<Tool> {
     if needs.is_empty() {
         return Vec::new();
@@ -561,15 +564,30 @@ fn probed(needs: Vec<ToolNeed>, limit: Duration, root: &Path, netfx_key: Option<
     let names: Vec<String> = needs.iter().map(|need| need.name.clone()).collect();
     let variables = outside_worktree(Variables::from_process(), root);
     let no_unreal_root = variables.as_ref().is_ok_and(|variables| variables.get(probe::UNREAL_ROOT).is_none());
+    let unreal_not_checked = no_unreal_root && names.iter().any(|name| name == UNREAL);
     probe::probe(&names, limit, variables, &[root], netfx_key)
         .into_iter()
         .zip(needs)
         .map(|((_, probed), need)| Tool {
-            not_checked: (no_unreal_root && need.name == UNREAL).then(|| format!("{} is not set", probe::UNREAL_ROOT)),
+            not_checked: not_checked(&need.name, no_unreal_root, unreal_not_checked),
             need,
             reported: Reported::from(&probed),
         })
         .collect()
+}
+
+/// Why the tool `name` is not checked here, `no_unreal_root` saying this PC's environment names no `GATE_UNREAL_ROOT`
+/// and `unreal_not_checked` that a need of unreal is therefore not checked: the unreal tool itself, and the netfx-sdk
+/// its builds need; `None` for a tool that is checked.
+fn not_checked(name: &str, no_unreal_root: bool, unreal_not_checked: bool) -> Option<String> {
+    match name {
+        UNREAL if no_unreal_root => Some(format!("{} is not set", probe::UNREAL_ROOT)),
+        NETFX_SDK if unreal_not_checked => Some(format!(
+            "{} is not set, so the Unreal builds that need it are not checked here",
+            probe::UNREAL_ROOT
+        )),
+        _ => None,
+    }
 }
 
 /// The SDK pin of `<root>\global.json`, read without following a link and up to 64 KiB

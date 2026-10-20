@@ -302,6 +302,9 @@ The tool lines, for each tool of the manifest, probed as the box probes the tool
 
 - `godot <found> ok (needs <pin> exactly)` when the manifest's `godot` pin is met, else `godot missing (needs <pin> exactly: <found>)`, `<found>` being the versions the probe found, `none`, or `not probed (<why>)` for a probe that gave no answer or a version it could not read. The pin is judged as a routed run judges it ([Toolchain manifest](#routing)): exact on the parts it gives, so `4.5` reads `needs 4.5 exactly` and matches any `4.5.x`. A pin not met counts as missing, never as skipped, and has no install hint. Only the manifest entry is read, not the project files' pins;
 - `unreal <found> ok (needs <pin> exactly)` and `unreal missing (needs <pin> exactly: <found>)` for the manifest's `unreal` pin, worded and judged as `godot`'s are (`<found>` is the versions under `GATE_UNREAL_ROOT`, `none`, or `not probed (<why>)`), with no install hint. With `GATE_UNREAL_ROOT` unset on this PC it is `unreal not checked here: GATE_UNREAL_ROOT is not set`, which counts as neither missing nor skipped; a root that overlaps the worktree gives `unreal skipped: GATE_UNREAL_ROOT <root> overlaps <worktree root>, which a run writes`;
+- `netfx-sdk <found> ok (needs 4.6.0 or later)`, `netfx-sdk <found> too old (needs 4.6.0 or later)` and `netfx-sdk missing (needs 4.6.0 or later)`, for the .NET Framework SDK that `UnrealBuildTool` looks for, which a manifest naming `unreal` (at any version) needs besides ([Toolchain manifest](#routing)); `<found>` is every SDK this PC's registry lists, and the highest is judged.
+
+  With `GATE_UNREAL_ROOT` unset on this PC it is `netfx-sdk not checked here: GATE_UNREAL_ROOT is not set, so the Unreal builds that need it are not checked here`, which counts as neither missing nor skipped. Test-seams builds accept the hidden `--test-netfx-key <path>`, a key under `HKEY_CURRENT_USER` read in place of the registry's own list;
 - `<tool> <found> ok (needs <min> or later)`, `<min>` written as `major.minor.patch`, when the found version is the minimum or later, and `<tool> <found> too old (needs <min> or later)` when it is below it;
 - `<tool> missing (needs <min> or later)`, or `(needs it present)` for a tool declared with `""`;
 - `<tool> <found> ok` for a tool declared present at any version, and `<tool> ok (version not readable)` for a present one whose version the probe could not read;
@@ -349,6 +352,7 @@ The install hints, for the items that have one:
 | `rust` | `winget install Rustlang.Rustup`; with a minimum, `rustup default <min>` when rust is too old, and `winget install Rustlang.Rustup, then rustup default <min>` when it is missing |
 | `cargo-nextest` | `cargo install cargo-nextest --locked` |
 | `node` | `winget install OpenJS.NodeJS` |
+| `netfx-sdk` | `install the .NET Framework 4.8 Developer Pack (https://dotnet.microsoft.com/download/dotnet-framework/net48)`; on a builder, the `install-toolchains.ps1` step below |
 | `pnpm` | `corepack enable pnpm` |
 | `pwsh` | `winget install Microsoft.PowerShell` |
 | `ffmpeg` | `winget install Gyan.FFmpeg` |
@@ -376,6 +380,8 @@ On stdout, each line prefixed `check: <host>: `, in this order:
    `git-lfs` at 3.1.3 or later (or the manifest's higher minimum) is an item like any tool when a `.gitattributes` git tracks in the worktree, at any depth, names the LFS filter, judged as routing judges it.
 4. The warm-up's items, as on this PC ([The warm-up items](#the-warm-up-items)) and this PC's own: the lock is probed before the record is read, as the route does, and the record is said only when it names `<host>` or cannot be read (`check: <host>: warm-up: the warm-up record <path> cannot be read: <error>`, with the suffix above, only informing), and with consent and a warm-up file that parsed, `check: <host>: warm-up: the work folder is warm` (ok) when the preflight's `gate: remote warm` line holds the hash of the worktree's file, else `check: <host>: warm-up: the work folder is not warm` (only informs).
 5. The install hints `install: <host>: <tool>: <command>`: `cargo install cargo-nextest --locked`, `npm install -g pnpm@<min>` (`npm install -g pnpm` with no minimum), `rustup toolchain install <min> && rustup default <min>`, `dotnet-install.ps1 -Version <v>`, and for node, pwsh, ffmpeg and a rust with no minimum a hint that names `tools/builder/install-toolchains.ps1` and points to [routing-a-repo.md, Builder setup](routing-a-repo.md#builder-setup).
+
+   `netfx-sdk` gets the same hint, with the script's step `'.NET Framework 4.8 Developer Pack'`.
 6. The summary.
 
 When the repo's `.gate/siblings.toml` names a sibling or cannot be read, one line `check: <host>: siblings skipped: a routed run lays them out` comes instead of the sibling lines and counts as skipped. The sibling folders themselves are not checked on the builder.
@@ -1836,7 +1842,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     `toolchain::meets` compares a found version with a minimum. A repo's sibling worktrees are not declared here but in `.gate/siblings.toml` ([Sibling worktrees](#routing)), whose problems keep a run local.
 
-    The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version; a routed run reads the `godot` and `unreal` entries as exact pins instead (below). The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot`, `unreal`, `ffmpeg` and `git-lfs`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
+    The file has a `[tools]` table of `name = "version"` and a top-level `workloads` array of .NET workload ids. A version is a minimum, "this or later", written `major[.minor[.patch]]` with the missing parts 0 (`"24"` is 24.0.0), and `""` means the tool is present at any version; a routed run reads the `godot` and `unreal` entries as exact pins instead (below).
+
+    The known names are `rust`, `cargo-nextest`, `node`, `pnpm`, `pwsh`, `godot`, `unreal`, `ffmpeg`, `git-lfs` and `netfx-sdk`; an unknown name is kept and flagged unknown, for the consumer to skip with a line. A leading byte order mark is skipped.
 
     An optional `[env]` table of `NAME = "unreal"` names variables the box sets to the root of the Unreal Engine install the run chose, the folder `UE_ROOT` gets (below). `"unreal"` is the only value, and at most 64 entries are read.
 
@@ -1891,6 +1899,10 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     A warm-up counts as a Godot-console command when any of its commands' first word is a Godot console word. It then sends the same `godot` need, follows the same rules with the same lines (said in its log, and on the console of a foreground `gate warm`), and carries the chosen version as its payload's `GodotVersion`. A warm-up the rules refuse is recorded `failed`, refused, with the reason `the builder refused: parity`.
 
     `unreal` is an exact pin judged as `godot` is, and read from the manifest only (no project file names it): `"5.8"` matches any 5.8.x, `"5.8.1"` that one, and `""` any version. A manifest `unreal` entry is sent as an `unreal` need like any manifest tool, and judged on every routed run whatever the command.
+
+    A manifest that names `unreal`, at any version, also needs a `netfx-sdk` of 4.6.0 or later, the .NET Framework SDK `UnrealBuildTool` looks for: `toolchain::read` adds it at the end of the tools, and a `netfx-sdk` the manifest declares itself is raised to at least 4.6.
+
+    It is sent and judged as a minimum like any tool, the highest of the SDKs the builder lists weighed, so a builder with none, or only older ones, falls back with the need `netfx-sdk 4.6.0 or later`; `gate check` here and `--builder` judge it the same way.
 
     The builder's answer is `gate: remote tool unreal <v1>,<v2>,...`, and an unmet pin is the mismatch line `gate: remote toolchain mismatch: <repo> needs unreal <pin> exactly; <host> has <found>` (`needs unreal` for `""`), `<found>` as for godot.
 
@@ -2566,6 +2578,10 @@ Built verbs:
   Tool probes (`boxside/probe.rs`): for each tool of the payload's `Needs`, in payload order, the box runs a probe and says one line on stdout after the sdks line, all once every probe has ended: `gate: remote tool <tool> <version>`, `gate: remote tool <tool> present` or `gate: remote tool <tool> missing`, or `gate: remote tool <tool> skipped: <why>`. The box only reports; the PC compares the minimums.
 
   The probes are `rustc --version` for `rust`, `cargo-nextest nextest --version` for `cargo-nextest` (the plugin directly, never through `cargo`, so no `.cargo\config.toml` above the folder can alias it), `<name> --version` for `node`, `pnpm` and `pwsh`, `ffmpeg -version` and `git-lfs version` (read from its `git-lfs/<x.y.z>` line). `godot` and `unreal` are probed as the paragraphs below say.
+
+  `netfx-sdk` runs no program: it reads the subkeys of `HKLM\SOFTWARE\Microsoft\Microsoft SDKs\NETFXSDK` in the 32-bit registry view, where `UnrealBuildTool` looks, and counts a subkey named as a version (one to three dot-separated runs of digits) whose `KitsInstallationFolder` is an absolute path to a folder that exists, at most 64 looked at. It says `gate: remote tool netfx-sdk <v1>,<v2>,...` ordered by number without repeats.
+
+  With none, or a key that cannot be read, it says `gate: remote tool netfx-sdk missing`, never `skipped`, so a run that needs it does not go where it cannot be found. Test-seams builds accept `--test-netfx-key <path>` on `gate box preflight` and `gate check`, a key under `HKEY_CURRENT_USER` read in place of the machine's.
 
   The `godot` probe reads `GATE_GODOT_ROOT`, an environment variable of the builder naming a folder of side-by-side Godot installs, one per subfolder, each holding `Godot_console.exe`. A subfolder is named for its install's version in full canonical form, `x.y.z` (`4.7.2`: three parts, no leading zero in a part, as `04.7.2` and `4.3` are not), since a run finds an install by that name, `<root>\<version>\Godot_console.exe`.
 

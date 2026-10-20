@@ -139,7 +139,8 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
 /// Says the SDK line, the list read within `--test-dotnet-limit-ms` when `seams` gives it, else
 /// [`git::DOTNET_LIMIT`], then one line on stdout for each tool the payload's `Needs` names, in its order. The tools are
 /// probed within `--test-probe-limit-ms` when `seams` gives it, else [`probe::PROBE_LIMIT`], while dotnet lists the
-/// SDKs; the netfx-sdk probe reads the key `--test-netfx-key` names, when `seams` gives it, in place of the machine's. No probe runs a program from the run's own folders ([`refused_folders`]). A `Needs` that is not an object of
+/// SDKs; the netfx-sdk probe reads the key `--test-netfx-key` names, when `seams` gives it, in place of the machine's.
+/// No probe runs a program from the run's own folders ([`refused_folders`]). A `Needs` that is not an object of
 /// texts is said on stderr, probes nothing, and fails nothing. The minimum each need carries is not read: the box
 /// reports, the client compares.
 fn say_sdks_and_tools(payload: &Payload, work: &str, seams: &BoxSeams, console: &mut Console) {
