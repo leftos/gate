@@ -765,7 +765,7 @@ Invoke-Step "Gate work root $GateRoot" {
     & icacls.exe $GateRoot /L /setowner '*S-1-5-32-544' /q | Out-Null
     if ($LASTEXITCODE) { throw "icacls $GateRoot /setowner exited $LASTEXITCODE" }
     # No /t: the root's children take the change by inheritance, and its protected children keep their own security.
-    & icacls.exe $GateRoot /L /inheritance:r /grant:r'*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*${userSid}:(OI)(CI)F" /q | Out-Null
+    & icacls.exe $GateRoot /L /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*${userSid}:(OI)(CI)F" /q | Out-Null
     if ($LASTEXITCODE) { throw "icacls $GateRoot /inheritance:r /grant:r exited $LASTEXITCODE" }
     Assert-GateRootNotLink -Path $GateRoot
     $after = Get-GateRootSecurityProblem -Root $GateRoot -UserSid $userSid

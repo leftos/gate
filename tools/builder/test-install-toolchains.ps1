@@ -600,6 +600,31 @@ try {
         Get-GateRootRefusalProblem -Sddl $protectedTriple -IcaclsLines $lines -Expect 'mandatory label'
     }
 
+    # The AST's CommandElements are what PowerShell hands the native command: a bareword /grant:r glued to a quoted
+    # string arrives as one argument, so the grant never reaches SYSTEM.
+    Test-Case 'the work root lock-down passes /grant:r as its own argument' {
+        $block = Get-StepBlock 'Gate work root'
+        if (-not $block) { return 'install-toolchains.ps1 has no Gate work root step' }
+        $commands = Get-BlockCommand $block 'icacls.exe'
+        $lockdown = @($commands | Where-Object { $_.Extent.Text -match '/grant:r' })
+        if ($lockdown.Count -ne 1) { return "the step has $($lockdown.Count) icacls.exe calls passing /grant:r, expected 1" }
+        $elements = @($lockdown[0].CommandElements | Select-Object -Skip 1 | ForEach-Object { $_.Extent.Text -replace '^[''"]|[''"]$', '' })
+        $grant = [array]::IndexOf($elements, '/grant:r')
+        if ($grant -lt 0) { return "no '/grant:r' element of its own; icacls receives: $($elements -join ' ')" }
+        if ($grant -eq 0 -or $elements[$grant - 1] -ne '/inheritance:r') {
+            return "the element before /grant:r is '$($elements[$grant - 1])', not /inheritance:r"
+        }
+        if ($elements.Count -lt $grant + 4) { return "/grant:r has $($elements.Count - $grant - 1) arguments, expected 3" }
+        $expected = @('^\*S-1-5-18:\(OI\)\(CI\)F$', '^\*S-1-5-32-544:\(OI\)\(CI\)F$', '^\*[^:]*:\(OI\)\(CI\)F$')
+        foreach ($offset in 0..2) {
+            $argument = $elements[$grant + 1 + $offset]
+            if ($argument -notmatch $expected[$offset]) {
+                return "/grant:r's argument $($offset + 1) is '$argument', not matching $($expected[$offset])"
+            }
+        }
+        return ''
+    }
+
     Test-Case 'the sccache server log is set inside a step, from LOCALAPPDATA, outside C:\build-box' {
         $assignment = $sourceAst.Find({
                 param($node)
