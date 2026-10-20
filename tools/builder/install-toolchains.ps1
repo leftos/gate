@@ -387,6 +387,7 @@ function Merge-CargoBuildWrapper([string[]]$Lines, [string]$Wrapper) {
 # the server inside that run's job, and the job's end would kill it under every concurrent run using it.
 $sccacheTaskPath = '\build-box\'
 $sccacheTaskName = 'sccache-server'
+$pruneTaskName = 'gate-prune-work'
 $sccacheServerScript = Join-Path $scriptFiles 'sccache-server.ps1'
 $sccacheUserVariables = 'SCCACHE_IGNORE_SERVER_IO_ERROR', 'SCCACHE_CLIENT_SIDE'
 function Get-SccacheServerTask { return Get-ScheduledTask -TaskPath $sccacheTaskPath -TaskName $sccacheTaskName -ErrorAction SilentlyContinue }
@@ -726,6 +727,52 @@ Invoke-Step "Gate work root $GateRoot" {
     $after = Get-GateRootSecurityProblem -Root $GateRoot -UserSid $userSid
     if ($after) { throw "gate work root ${GateRoot}: $after" }
     Write-InstallLog "gate work root ${GateRoot}: protected DACL SYSTEM, Administrators, $User full control; no label"
+}
+# Every 6 hours a task runs gate box prune on the work root and writes its lines to the Application event log. The whole
+# command sits in the task's own action, which only an administrator can change, so no script file backs it. The task is
+# not started here: gate.exe arrives with the gate push that follows this installer.
+Invoke-Step 'Work-folder prune task' {
+    $eventSource = 'gate-prune'
+    if ([Diagnostics.EventLog]::SourceExists($eventSource)) {
+        Write-InstallLog "event source ${eventSource}: already registered"
+    }
+    else {
+        New-EventLog -LogName Application -Source $eventSource
+        Write-InstallLog "event source ${eventSource}: registered in the Application log"
+    }
+    $gateExe = 'C:\Program Files\gate\bin\gate.exe'
+    $drive = Split-Path -Qualifier $GateRoot
+    # The closing event is Information on exit 0 and Warning on any other exit, or on none when gate.exe did not run.
+    $closingCommand = "`$code = `$LASTEXITCODE; " +
+        "`$free = [math]::Round([System.IO.DriveInfo]::new('$drive').AvailableFreeSpace / 1GB, 1); " +
+        "`$type = if (`$code -eq 0) { [System.Diagnostics.EventLogEntryType]::Information } " +
+        "else { [System.Diagnostics.EventLogEntryType]::Warning }; " +
+        "`$shown = if (`$null -eq `$code) { '(no exit code)' } else { `$code }; " +
+        "[System.Diagnostics.EventLog]::WriteEntry('$eventSource', 'gate box prune exited ' + `$shown + '; $drive free ' + `$free + ' GB', `$type, 1)"
+    # Windows PowerShell auto-loads a module for a cmdlet from the user's module path, which the builder user (and so a
+    # routed command) can write. Auto-loading is off and the events and free space come from .NET calls, so the task runs
+    # no code from there. $GateRoot and $drive are refused above when they hold a quote, so single quotes keep them whole.
+    $pruneCommand = "`$PSModuleAutoLoadingPreference = 'None'; " +
+        "& '$gateExe' box prune --root '$GateRoot' 2>&1 | ForEach-Object { `$line = [string]`$_; if (`$line) { " +
+        "[System.Diagnostics.EventLog]::WriteEntry('$eventSource', `$line, [System.Diagnostics.EventLogEntryType]::Information, 1) } }; " +
+        $closingCommand
+    $arguments = "-NoProfile -NonInteractive -Command `"$pruneCommand`""
+    $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument $arguments
+    # No -RepetitionDuration: the repetition runs indefinitely, which the read-back below confirms.
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(17) -RepetitionInterval (New-TimeSpan -Hours 6)
+    $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType S4U -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 2) -MultipleInstances IgnoreNew -StartWhenAvailable
+    Register-ScheduledTask -TaskPath $sccacheTaskPath -TaskName $pruneTaskName -Action $action -Trigger $trigger -Principal $principal `
+        -Settings $settings -Force | Out-Null
+    $repetition = @((Get-ScheduledTask -TaskPath $sccacheTaskPath -TaskName $pruneTaskName).Triggers)[0].Repetition
+    if ($repetition.Interval -ne 'PT6H' -or $repetition.Duration) {
+        throw ("task $sccacheTaskPath$pruneTaskName reads back with repetition interval '$($repetition.Interval)' and duration " +
+            "'$($repetition.Duration)', expected PT6H and none (indefinite)")
+    }
+    Write-InstallLog "task $sccacheTaskPath$pruneTaskName registered: every 6 h, gate box prune --root $GateRoot as $User (S4U, Limited)"
+    if (-not (Test-Path -LiteralPath $gateExe)) {
+        Write-InstallLog "task $sccacheTaskPath$pruneTaskName will fail until a gate push installs $gateExe"
+    }
 }
 
 Sync-SessionPath

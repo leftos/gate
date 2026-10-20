@@ -33,7 +33,7 @@ pub enum Invocation {
     Expect(ExpectRequest),
     /// `gate warm`.
     Warm(WarmRequest),
-    /// The hidden `gate box <verb> --stdin`, or `gate box register-desktop`.
+    /// The hidden `gate box <verb> --stdin`, `gate box register-desktop`, or `gate box prune --root <folder>`.
     Box(BoxRequest),
 }
 
@@ -43,6 +43,8 @@ pub enum Invocation {
 pub struct BoxRequest {
     pub verb: BoxVerb,
     pub seams: BoxSeams,
+    /// The builder root `prune` sweeps, the word after its `--root`; `None` for every other verb.
+    pub root: Option<PathBuf>,
 }
 
 /// What the black-box suite sets on `gate box` through the hidden `--test-*` flags given before the verb; each field
@@ -185,8 +187,10 @@ pub enum BoxVerb {
     Inputs,
     /// Which of a routed run's Git LFS objects the repository's store lacks, or their install.
     Lfs,
-    /// The registration of the desktop helper's task; the one verb that takes no request.
+    /// The registration of the desktop helper's task; it takes no request.
     RegisterDesktop,
+    /// The removal of the builder's work folders no run has used for over a day; it takes no request, only its root.
+    Prune,
 }
 
 impl BoxVerb {
@@ -203,14 +207,15 @@ impl BoxVerb {
             BoxVerb::Inputs => "inputs",
             BoxVerb::Lfs => "lfs",
             BoxVerb::RegisterDesktop => "register-desktop",
+            BoxVerb::Prune => "prune",
         }
     }
 
     /// Whether the verb reads a request, as stdin's first line, after the word `--stdin`: every verb but
-    /// `register-desktop`.
+    /// `register-desktop` and `prune`.
     #[must_use]
     pub fn takes_request(self) -> bool {
-        self != BoxVerb::RegisterDesktop
+        !matches!(self, BoxVerb::RegisterDesktop | BoxVerb::Prune)
     }
 }
 

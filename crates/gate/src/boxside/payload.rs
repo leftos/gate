@@ -705,7 +705,7 @@ const COMMIT_SHA_DIGITS: usize = 40;
 const KEY_HASH_DIGITS: usize = 8;
 
 /// Whether `text` is a work-folder key: one or more ASCII letters, digits, `-` and `_`.
-fn is_key(text: &str) -> bool {
+pub(crate) fn is_key(text: &str) -> bool {
     !text.is_empty()
         && text
             .chars()

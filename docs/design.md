@@ -522,9 +522,9 @@ The lines, each on stderr and escaped to one line where it carries a path, a rep
 
 Hidden from the usage and from `--help`. It is the builder side of a routed run, run over ssh on the builder ([The box side](#the-box-side)).
 
-`gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin` takes exactly one verb and the word `--stdin`, and no `--state-dir`: the request is the first line of stdin, and every path comes from it. The one exception is `gate box register-desktop`, which takes no request and no `--stdin`.
+`gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin` takes exactly one verb and the word `--stdin`, and no `--state-dir`: the request is the first line of stdin, and every path comes from it. Two exceptions take no request and no `--stdin`: `gate box register-desktop`, and `gate box prune --root <folder>`, which takes the root as its one option.
 
-Any other shape (no verb, no `--stdin`, any other word in its place, an unknown verb, an extra word) prints `usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)` alone on stderr and exits 2.
+Any other shape (no verb, no `--stdin`, any other word in its place, an unknown verb, an extra word) prints the box usage alone on stderr and exits 2. The usage is two lines: `usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)`, then the `gate box prune --root <folder>` line.
 
 ### Later subcommands
 
@@ -2355,7 +2355,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A repo whose build regenerates a file it tracks under the globs therefore keeps the pending marker on every routed run, and each next run sends `OutputsFull` without the hash cache, until its caller passes `--bring-tracked`.
 
-    **Never `.git*` or `.lfsconfig`** (GATE-155): an output glob such as `*`, `*.*` or `**` would match a root `.lfsconfig` or a `.gitattributes` at any depth, since the exclusion arms (`EXCLUDED_ARMS`, compiled once as `EXCLUDED`) leave out only the `.git/`, `.tmp/` and `TestResults/` folders and `.env` files (a glob naming a `TestResults` folder is held by `EXCLUDED_BEYOND_TEST_RESULTS`, the arms without `EXCLUDED_TEST_RESULTS`). That would give a builder a second way to reach the files a sync-back never writes.
+    **Never `.git*` or `.lfsconfig`** (GATE-155): an output glob such as `*`, `*.*` or `**` would match a root `.lfsconfig` or a `.gitattributes` at any depth, since the exclusion arms (`EXCLUDED_ARMS`, compiled once as `EXCLUDED`) leave out only the `.git/`, `.tmp/` and `TestResults/` folders and `.env` files (a glob naming a `TestResults` folder is held by `EXCLUDED_BEYOND_TEST_RESULTS`, the arms without `EXCLUDED_TEST_RESULTS`).
+
+    That would give a builder a second way to reach the files a sync-back never writes.
 
     `Globs::matches` is therefore false for any `.git*` path component and a `.lfsconfig` name, matched as the sync-back matches them (`is_git_s`, `is_lfs_config` in `outputs/names.rs`, which `remote/syncback.rs` imports), with the same normalised spellings: `\` as a separator, a cut at the first `:`, trailing dots and spaces stripped, and 8.3 aliases. `Globs::enters` is false for a `.git*` folder, so the box's walk never enters one.
 
@@ -3310,6 +3312,20 @@ Built verbs:
 
   A `test-seams` build given `--test-box-register ok|fail` skips the Task Scheduler: `ok` says the registered line, `fail` says `failed: the test seam refused`.
 
+- **`prune`** (`boxside/prune.rs`) removes the work folders of keys idle for over 24 hours, from `gate box prune --root <folder>` (an absolute path on a drive; anything else prints `gate: box prune --root is not an absolute path on a drive: "<value>"` and exits 2). It reads no request and never reads stdin, and any other shape is the box usage. The builder's scheduled task runs it every 6 hours ([Builder setup](routing-a-repo.md#builder-setup)).
+
+  The `root`, `{root}\work` and `{root}\pruned` must each be a plain folder, else `gate: remote could not prune: <path> is not a plain folder` and exit 1; a folder it cannot list prints `gate: remote cannot list <path>: <error>` and exits 1. Leftovers in `pruned` are deleted at the start of each sweep, and one that cannot be removed prints `gate: remote could not remove the pruned folder <path>: <error>`.
+
+  For each key under `work` it takes `{key}.lock` (a lock it cannot open prints `gate: remote could not open the work folder lock <path>: <error>`), so a key whose lock a run or a sweep holds is kept, and `inflight` does not see a key whose lock a sweep holds. Idleness is the newest write time among the folder, each tree's `.git\FETCH_HEAD`, the key's records and the lock's prior write time.
+
+  A key idle for over 24 hours loses its records in this order: `.layout` is written as `changing` first; `.warm`, `.packages`, `.tools`, `.inputs` and `.command` are removed; the folder is renamed by handle into `{root}\pruned\{key}-{pid}-{nanos}`; `.layout` and `.index` are removed. The lock is released and the renamed folder is deleted through its handle. The `.lock` file stays.
+
+  Every step works beneath held handles and never follows a link. A failed rename leaves `.layout` reading `changing`, so the next run clears the folder whole.
+
+  A key it cannot prune prints `gate: remote could not prune <key>: <reason>` on stderr (reasons include `its work folder is not a plain folder` and `its work folder changed during the sweep`), keeps the key, and the exit stays 0.
+
+  On stdout it prints `gate: remote pruned <key>: idle <h> h` per removed folder and, last, always, `gate: remote prune removed <n> of <m> work folders`.
+
 **The outputs module** (GATE-44) is shared by both ends, this exe, in `crates/gate/src/outputs/`. The box's `run` packs with it and the box's `outputs` verb sends the archive. The PC's manifest, the pending marker, the reading of the box's `gate-remote-outputs: ` line, the fetch of the archive and its install are built in the Rust remote client ([The remote client's run](#routing)).
 
 - Globs: each is relative to the work folder's root and `/`-separated, matched without regard to case: `**/` is any number of folders (none included), `**` anything, `*` any run of characters within one name, `?` one character within one name.
@@ -3562,7 +3578,9 @@ During the drain a PowerShell gate neither reads `gate.exe`'s tickets nor signal
 
 ops-tower follows the flag: it reads the PowerShell gate's files until the flag exists and then `v1\`, plus the PowerShell claims of a slot whose mutex is open, and its waiters come from `gate.exe`'s tickets ([Common rules](#common-rules)). The hooks and scripts that read gate command lines or output (inventory section 4) change in the same drain.
 
-The caller sweep keeps each repo's `tools/gate.ps1` as the slim pass-through ([The launcher's hand-over](#the-launchers-hand-over)), so a clone on a machine without `gate.exe` still runs its commands, and switches that repo's docs and scripts to `gate run` where they call the gate directly. Those callers write `gate run --log <path> --timeout <s> --slot <kind> -- <command>` (`--stall`, `--tail`, `--no-markers`, `--local`; `gate stop-tree <pid>`), never `gate.exe` or a path. `tools/install.ps1` builds with a plain `cargo build`, not through a gate, so a broken installed gate can always be replaced.
+The caller sweep keeps each repo's `tools/gate.ps1` as the slim pass-through ([The launcher's hand-over](#the-launchers-hand-over)), so a clone on a machine without `gate.exe` still runs its commands, and switches that repo's docs and scripts to `gate run` where they call the gate directly.
+
+Those callers write `gate run --log <path> --timeout <s> --slot <kind> -- <command>` (`--stall`, `--tail`, `--no-markers`, `--local`; `gate stop-tree <pid>`), never `gate.exe` or a path. `tools/install.ps1` builds with a plain `cargo build`, not through a gate, so a broken installed gate can always be replaced.
 
 A caller that runs `gate ...` on PATH gets "command not found" on a machine without it, and each repo's docs name the install script; a caller that runs the launcher gets the launcher's direct run there, not `gate.exe`'s.
 

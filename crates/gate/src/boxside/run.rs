@@ -114,7 +114,7 @@ const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const SHARE_READ_WRITE: u32 = 0x1 | 0x2;
 /// What the work folder's layout record, `{Work}.layout`, says while its children are being cleared: a record that
 /// still says it when a run reads it is of a clear that did not finish, which clears again.
-const LAYOUT_CHANGING: &str = "changing";
+pub(super) const LAYOUT_CHANGING: &str = "changing";
 /// What the layout record says of a run of one repo's layout, checked out in the work folder itself; no record says the
 /// same.
 pub(super) const LAYOUT_SINGLE: &str = "single";

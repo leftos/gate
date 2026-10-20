@@ -1,6 +1,6 @@
 //! The hidden `gate box`: the builder side of a routed run, one call per verb over ssh, speaking the PowerShell
-//! wrapper's lines and statuses. Every path it touches comes in the payload; it takes no state root and writes nothing
-//! under one.
+//! wrapper's lines and statuses. Every path it touches comes in the payload, or for `prune` as its `--root` word; it
+//! takes no state root and writes nothing under one.
 
 mod boot;
 mod ceiling;
@@ -16,6 +16,7 @@ mod packages;
 pub(crate) mod payload;
 mod preflight;
 pub(crate) mod probe;
+mod prune;
 mod register;
 mod run;
 mod stop;
@@ -24,8 +25,9 @@ mod tools;
 use std::fs;
 use std::io::{self, BufRead, Read};
 use std::path::Path;
+use std::time::SystemTime;
 
-use gate_args::{BoxRequest, BoxVerb};
+use gate_args::{BoxRequest, BoxVerb, Problem};
 use gate_desktop::version::build_version;
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
@@ -60,6 +62,15 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
     match request.verb {
         // A verb with no request never reads stdin, which the push script that runs it keeps for its own files.
         BoxVerb::RegisterDesktop => register::register(seams, console),
+        BoxVerb::Prune => {
+            if let Some(root) = request.root.as_deref() {
+                prune::prune(root, SystemTime::now(), console)
+            } else {
+                // The parse gives `prune` its root always; a request without one is the box's usage error.
+                console.err(&Problem::BoxUsage.to_string());
+                u32::from(USAGE_STATUS)
+            }
+        }
         BoxVerb::Preflight => with_request(console, |payload, console| preflight::preflight(payload, seams, console)),
         BoxVerb::Boot => with_request(console, |_, console| boot_status(boot::say(console))),
         BoxVerb::Run => with_request(console, |payload, console| run::run(payload, seams, console)),

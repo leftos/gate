@@ -1,13 +1,17 @@
-//! The hidden `gate box`: its seven verbs, each followed by the literal `--stdin` (the request comes on stdin), and the one
-//! usage line every other shape gets.
+//! The hidden `gate box`: its eight verbs that read a request, each followed by the literal `--stdin` (the request comes
+//! on stdin), `register-desktop` alone, `prune --root <folder>`, and the one usage every other shape gets.
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation, USAGE};
 
 use crate::support::{invocation, os, problems, problems_of, unreadable_word};
 
-const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)";
+const BOX_USAGE: &str = concat!(
+    "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)\n",
+    "       gate box prune --root <folder>",
+);
 
 #[test]
 fn each_verb_parses_with_stdin() {
@@ -19,12 +23,14 @@ fn each_verb_parses_with_stdin() {
         ("outputs", BoxVerb::Outputs),
         ("inflight", BoxVerb::Inflight),
         ("inputs", BoxVerb::Inputs),
+        ("lfs", BoxVerb::Lfs),
     ] {
         assert_eq!(
             invocation(&["box", word, "--stdin"]),
             Invocation::Box(BoxRequest {
                 verb,
                 seams: BoxSeams::default(),
+                root: None,
             }),
             "{word}"
         );
@@ -32,6 +38,33 @@ fn each_verb_parses_with_stdin() {
         assert!(verb.takes_request(), "{word} reads a request");
     }
     assert!(!BoxVerb::RegisterDesktop.takes_request(), "register-desktop reads none");
+    assert!(!BoxVerb::Prune.takes_request(), "prune reads none");
+}
+
+/// The sweep of idle work folders: a verb that takes no request, only its root as the one word after `--root`.
+#[test]
+fn prune_parses_its_root_and_refuses_any_other_shape() {
+    assert_eq!(
+        invocation(&["box", "prune", "--root", r"C:\x"]),
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Prune,
+            seams: BoxSeams::default(),
+            root: Some(PathBuf::from(r"C:\x")),
+        })
+    );
+    assert_eq!(BoxVerb::Prune.as_str(), "prune", "the verb as the CLI spells it");
+    let shapes: [&[&str]; 7] = [
+        &["box", "prune"],
+        &["box", "prune", "--root"],
+        &["box", "prune", "--stdin"],
+        &["box", "prune", "--root", r"C:\x", "extra"],
+        &["box", "prune", r"--root=C:\x"],
+        &["box", "prune", "--ROOT", r"C:\x"],
+        &["box", "prune", "--root", r"C:\x", "--stdin"],
+    ];
+    for words in shapes {
+        assert_eq!(problems(words), [BOX_USAGE], "{words:?}");
+    }
 }
 
 #[test]
@@ -72,6 +105,7 @@ fn box_takes_the_inflight_verb() {
         Invocation::Box(BoxRequest {
             verb: BoxVerb::Inflight,
             seams: BoxSeams::default(),
+            root: None,
         })
     );
     assert_eq!(BoxVerb::Inflight.as_str(), "inflight", "the verb as the CLI spells it");
@@ -85,6 +119,7 @@ fn register_desktop_parses_alone_and_refuses_stdin_or_another_word() {
         Invocation::Box(BoxRequest {
             verb: BoxVerb::RegisterDesktop,
             seams: BoxSeams::default(),
+            root: None,
         })
     );
     assert_eq!(BoxVerb::RegisterDesktop.as_str(), "register-desktop", "the verb as the CLI spells it");

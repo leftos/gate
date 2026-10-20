@@ -1,6 +1,6 @@
 //! The hidden `gate box <verb> --stdin`: the builder side of a routed run. Only the words are read here; the request
 //! is stdin's first line, which the binary reads and decodes. `gate box register-desktop` takes no `--stdin`: it reads
-//! no request. A `test-seams` build also reads the hidden
+//! no request; nor does `gate box prune --root <folder>`, whose one word is its root. A `test-seams` build also reads the hidden
 //! `--test-heartbeat-ms <n>`, `--test-box-console fail-before`, `--test-box-token refused`, `--test-box-park-launch <path>`,
 //! `--test-outputs-budget-bytes <n>`, `--test-inputs-budget-bytes <n>`, `--test-lfs-budget-bytes <n>`, `--test-dotnet-limit-ms <n>`,
 //! `--test-box-sample-ms <n>`, `--test-box-sampler-fail true|false`, `--test-box-free-percent <1-100>`,
@@ -11,33 +11,40 @@
 
 use std::ffi::{OsStr, OsString};
 use std::iter::Peekable;
+use std::path::PathBuf;
 
 use crate::problem::Problem;
 use crate::request::{BoxRequest, BoxSeams, BoxVerb};
 
 /// The one word after the verb: the request is stdin's first line, never a word.
 const STDIN: &str = "--stdin";
+/// The word after `prune`, before its root.
+const ROOT: &str = "--root";
 
 /// The values `--test-box-register` takes: the registration succeeds, or fails as the seam refusing.
 #[cfg(feature = "test-seams")]
 const REGISTER_RESULTS: &[&str] = &["ok", "fail"];
 
 /// Reads the words after `gate box`: the seams, then a verb, then exactly `--stdin`, and nothing after it; or, for
-/// `register-desktop`, which reads no request, nothing after the verb at all. A seam refused is its own problem, as
-/// `gate run` reports it; any other shape is the one box usage problem, after those.
+/// `register-desktop`, which reads no request, nothing after the verb at all; or, for `prune`, exactly `--root` and
+/// one word, its root. A seam refused is its own problem, as `gate run` reports it; any other shape is the one box
+/// usage problem, after those.
 pub(crate) fn parse(words: impl Iterator<Item = OsString>) -> Result<BoxRequest, Vec<Problem>> {
     let mut words = words.peekable();
     let mut problems = Vec::new();
     let seams = seams(&mut words, &mut problems);
     let verb = words.next().as_deref().and_then(OsStr::to_str).and_then(verb);
-    // A verb that reads no request must have no word after it, which stands where `--stdin` stands for the others.
-    let closed = if verb.is_some_and(|verb| !verb.takes_request()) {
-        words.peek().is_none()
-    } else {
-        words.next().is_some_and(|word| word == STDIN)
+    let (closed, root) = match verb {
+        Some(BoxVerb::Prune) => match (words.next(), words.next()) {
+            (Some(flag), Some(root)) if flag == ROOT => (true, Some(PathBuf::from(root))),
+            _ => (false, None),
+        },
+        // A verb that reads no request must have no word after it, which stands where `--stdin` stands for the others.
+        Some(verb) if !verb.takes_request() => (words.peek().is_none(), None),
+        _ => (words.next().is_some_and(|word| word == STDIN), None),
     };
     match (verb, closed, words.next()) {
-        (Some(verb), true, None) if problems.is_empty() => Ok(BoxRequest { verb, seams }),
+        (Some(verb), true, None) if problems.is_empty() => Ok(BoxRequest { verb, seams, root }),
         (Some(_), true, None) => Err(problems),
         _ => {
             problems.push(Problem::BoxUsage);
@@ -57,6 +64,7 @@ fn verb(text: &str) -> Option<BoxVerb> {
         "inputs" => Some(BoxVerb::Inputs),
         "lfs" => Some(BoxVerb::Lfs),
         "register-desktop" => Some(BoxVerb::RegisterDesktop),
+        "prune" => Some(BoxVerb::Prune),
         _ => None,
     }
 }

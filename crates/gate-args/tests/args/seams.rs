@@ -906,6 +906,7 @@ fn box_seams_of_the_ceiling_are_read_before_the_verb() {
                 kill_leaves: Some(3),
                 ..BoxSeams::default()
             },
+            root: None,
         })
     );
 }
@@ -921,8 +922,11 @@ fn the_bridge_seams_are_unknown_options() {
     }
 }
 
-/// The one line a malformed `gate box` prints.
-const BOX_USAGE: &str = "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)";
+/// The usage a malformed `gate box` prints.
+const BOX_USAGE: &str = concat!(
+    "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)\n",
+    "       gate box prune --root <folder>",
+);
 
 #[cfg(feature = "test-seams")]
 #[test]
@@ -938,6 +942,7 @@ fn box_seam_heartbeat_ms_is_read_before_the_verb() {
                 heartbeat_ms,
                 ..BoxSeams::default()
             },
+            root: None,
         })
     };
     assert_eq!(invocation(&["box", "--test-heartbeat-ms", "30", "run", "--stdin"]), beating(Some(30)));
@@ -1008,6 +1013,7 @@ fn box_seam_outputs_budget_bytes_is_read_before_the_verb() {
                 outputs_budget_bytes,
                 ..BoxSeams::default()
             },
+            root: None,
         })
     };
     assert_eq!(
@@ -1087,6 +1093,7 @@ fn box_seam_inputs_budget_bytes_is_read_before_the_verb() {
                 inputs_budget_bytes,
                 ..BoxSeams::default()
             },
+            root: None,
         })
     };
     assert_eq!(
@@ -1180,6 +1187,7 @@ fn box_seam_dotnet_limit_ms_is_read_before_the_verb() {
                 dotnet_limit_ms,
                 ..BoxSeams::default()
             },
+            root: None,
         })
     };
     assert_eq!(
@@ -1244,6 +1252,7 @@ fn box_seam_probe_limit_ms_is_read_before_the_verb() {
                 probe_limit_ms,
                 ..BoxSeams::default()
             },
+            root: None,
         })
     };
     assert_eq!(
@@ -1312,7 +1321,13 @@ fn box_seam_console_and_park_launch_are_read_before_the_verb() {
 
     use crate::support::invocation;
 
-    let running = |seams| Invocation::Box(BoxRequest { verb: BoxVerb::Run, seams });
+    let running = |seams| {
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Run,
+            seams,
+            root: None,
+        })
+    };
     let failing = || BoxSeams {
         fail_console: true,
         ..BoxSeams::default()
@@ -1361,6 +1376,7 @@ fn box_seam_console_and_park_launch_are_read_before_the_verb() {
                 probe_limit_ms: None,
                 ..BoxSeams::default()
             },
+            root: None,
         }),
         "the seams come in any order before the verb"
     );
@@ -1454,6 +1470,7 @@ fn box_seam_token_is_read_before_the_verb() {
             refuse_token: true,
             ..BoxSeams::default()
         },
+        root: None,
     });
     assert_eq!(invocation(&["box", "--test-box-token", "refused", "run", "--stdin"]), refused);
     assert_eq!(invocation(&["box", "--test-box-token=refused", "run", "--stdin"]), refused);
@@ -1474,6 +1491,7 @@ fn box_seam_token_is_read_before_the_verb() {
                 refuse_token: true,
                 ..BoxSeams::default()
             },
+            root: None,
         }),
         "the token seam comes with the others, in any order"
     );
@@ -1522,6 +1540,7 @@ fn the_register_seam_parses_ok_or_fail_and_refuses_another_value() {
                 register_ok: Some(register_ok),
                 ..BoxSeams::default()
             },
+            root: None,
         })
     };
     for (word, register_ok) in [("ok", true), ("fail", false)] {
@@ -1589,6 +1608,7 @@ fn desktop_mutex_takes_the_longest_name(longest: &str) {
                 desktop_mutex: Some(longest.to_owned()),
                 ..BoxSeams::default()
             },
+            root: None,
         }),
         "a name of the most the seam takes"
     );
@@ -1638,18 +1658,27 @@ fn desktop_seam_refusals_hold(too_long: &str) {
     );
 }
 
+/// The `gate box run --stdin` that `seams` are given before.
+#[cfg(feature = "test-seams")]
+fn box_run(seams: gate_args::BoxSeams) -> gate_args::Invocation {
+    gate_args::Invocation::Box(gate_args::BoxRequest {
+        verb: gate_args::BoxVerb::Run,
+        seams,
+        root: None,
+    })
+}
+
 /// The box's desktop seams: the fault its desktop run takes, the state it finds the console's session in, the unique
 /// part of the private namespace and mutex it takes, and how long its waits may take.
 #[cfg(feature = "test-seams")]
 #[test]
 fn the_desktop_seams_parse_and_refuse_bad_values() {
-    use gate_args::{BoxRequest, BoxSeams, BoxVerb, DesktopMode, DesktopSession, Invocation};
+    use gate_args::{BoxSeams, DesktopMode, DesktopSession};
 
     use crate::support::invocation;
 
-    let run = |seams: BoxSeams| Invocation::Box(BoxRequest { verb: BoxVerb::Run, seams });
     let taking = |desktop| {
-        run(BoxSeams {
+        box_run(BoxSeams {
             desktop: Some(desktop),
             ..BoxSeams::default()
         })
@@ -1681,7 +1710,7 @@ fn the_desktop_seams_parse_and_refuse_bad_values() {
         ("other-user", DesktopSession::OtherUser),
         ("disconnected", DesktopSession::Disconnected),
     ] {
-        let finding = run(BoxSeams {
+        let finding = box_run(BoxSeams {
             desktop_session: Some(session),
             ..BoxSeams::default()
         });
@@ -1695,7 +1724,7 @@ fn the_desktop_seams_parse_and_refuse_bad_values() {
     }
     assert_eq!(
         invocation(&["box", "--test-box-desktop-mutex", "case-1-AB", "run", "--stdin"]),
-        run(BoxSeams {
+        box_run(BoxSeams {
             desktop_mutex: Some("case-1-AB".to_owned()),
             ..BoxSeams::default()
         })
@@ -1703,7 +1732,7 @@ fn the_desktop_seams_parse_and_refuse_bad_values() {
     desktop_mutex_takes_the_longest_name(&"a".repeat(64));
     assert_eq!(
         invocation(&["box", "--test-box-desktop-ms", "250", "run", "--stdin"]),
-        run(BoxSeams {
+        box_run(BoxSeams {
             desktop_ms: Some(250),
             ..BoxSeams::default()
         })
@@ -1722,7 +1751,7 @@ fn the_desktop_seams_parse_and_refuse_bad_values() {
             "run",
             "--stdin"
         ]),
-        run(BoxSeams {
+        box_run(BoxSeams {
             desktop: Some(DesktopMode::TaskNoPid),
             desktop_session: Some(DesktopSession::NoUser),
             desktop_mutex: Some("case-2".to_owned()),
