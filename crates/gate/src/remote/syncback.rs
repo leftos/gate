@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use gate_router::{FolderId, repo_name};
+use gate_router::{FolderId, escaped, repo_name};
 
 use super::RemoteCall;
 use super::client::{Attempt, Called, End, Watch};
@@ -42,7 +42,6 @@ use super::retry::GIT_SSH_FAILED;
 use super::snapshot::{self, BACK, REFS, Snapshot};
 use super::watchdog::{self, Cut};
 use super::worktree_lock::{self, Folder};
-use crate::boxside::payload::escaped;
 use crate::outputs::names::{is_git_s, is_lfs_config};
 use crate::slots::{self, Liveness};
 
@@ -2069,7 +2068,6 @@ mod tests {
         has_back, ignored_line, incoming_name, incoming_owner, listed_paths, move_plan, names_odd_driver, not_applied_line, read_attributes, receive,
         refused_end, see_diff, swept, sync_back, synced_line, total, touched_line, unmoved_line, weight, written_blobs, written_line,
     };
-    use crate::boxside::payload::escaped;
     use crate::remote::RemoteCall;
     use crate::remote::client::{Attempt, End};
     use crate::remote::git::{self, Git};
@@ -2077,6 +2075,7 @@ mod tests {
     use crate::remote::transport::{Local, Program, PushTarget, Transport, Wire};
     use crate::remote::worktree_lock::tests::routed;
     use crate::slots;
+    use gate_router::escaped;
     use gate_router::{CarriedSibling, FolderId, RemoteRun, sibling_root};
 
     const BACK: &str = "8e8777a0e71c530018dc15bdebd7288f4f432aa4";

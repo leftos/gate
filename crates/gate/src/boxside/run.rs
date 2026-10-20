@@ -26,10 +26,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::{BoxSeams, EnvRefusal, env_refusal, is_godot_console, over_cap, repeated_name, shown_name};
+use gate_router::escaped;
 use gate_watchdog::{Kill, Pump, is_wsl_command};
 use gate_win32::{
     Donor, EnvironmentBlock, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken, Running, Utf8Console,
 };
+use gate_wire::{PairSibling, PathForm, Payload, bare_stem, ordinal_upper, trees};
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::boot;
@@ -41,7 +43,6 @@ use crate::boxside::lfs::{self, RunLfs};
 use crate::boxside::msys;
 use crate::boxside::outputs::{self, Asked};
 use crate::boxside::packages;
-use crate::boxside::payload::{self, PairSibling, Payload, bare_stem, escaped, ordinal_upper, trees};
 use crate::boxside::preflight::{self, Failed, GIT_REDIRECTS, Git, GitFailure, Unready, exit_code, git_failed};
 use crate::boxside::probe;
 use crate::boxside::stop::{Ending, STOPPED, stop_event_name, terminate_and_wait};
@@ -306,14 +307,14 @@ impl Request<'_> {
 /// bare repository's whole file name when it is not of that form.
 fn repo_name_of(bare: &str) -> &str {
     let (folder, file) = bare.rsplit_once(['\\', '/']).unwrap_or(("", bare));
-    bare_stem(bare, folder).unwrap_or(file)
+    bare_stem(bare, folder, PathForm::Windows).unwrap_or(file)
 }
 
 /// What the layout step lays out ([`WorkGit::lay_out`]): the work folder, the main repo and the siblings of a pair,
 /// none for one repo. A run and the inputs verb each build one, so both lay the work folder out alike.
 pub(super) struct Laid<'r> {
     work: &'r str,
-    /// The payload's key, which names the work folder's jobs ([`payload::is_job_name`]); the work folder's last name
+    /// The payload's key, which names the work folder's jobs ([`gate_wire::is_job_name`]); the work folder's last name
     /// matches it only without regard to case.
     key: &'r str,
     main: &'r Repo<'r>,
@@ -436,12 +437,12 @@ fn sent_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: &m
 /// its own bare repository and its commit from `SiblingSnapshots`. Else the usage line.
 fn repos<'a>(payload: &'a Payload, work: &str, bare: &str, snapshot: &'a str) -> Result<(Repo<'a>, Vec<Repo<'a>>), String> {
     let Some(pair) = payload.pair()? else {
-        let (tree, _) = trees(work, None);
+        let (tree, _) = trees(work, None, PathForm::Windows);
         return Ok((Repo::new(None, tree, bare, snapshot), Vec::new()));
     };
     let commits = payload.sibling_snapshots(&pair)?;
     let names: Vec<&str> = pair.siblings().iter().map(PairSibling::name).collect();
-    let (main_tree, sibling_trees) = trees(work, Some((pair.leaf(), &names)));
+    let (main_tree, sibling_trees) = trees(work, Some((pair.leaf(), &names)), PathForm::Windows);
     let main = Repo::new(Some(pair.leaf()), main_tree, bare, snapshot);
     let siblings = pair
         .siblings()
@@ -1095,13 +1096,13 @@ struct Interrupted {
 
 impl Interrupted {
     /// Reads the record `text` of the work folder whose key is `key` at `now`: `{start} {job}`, the start a UTC time and
-    /// the job one of the work folder's job names, the key in any case ([`payload::is_recorded_job_name`]); a file
+    /// the job one of the work folder's job names, the key in any case ([`gate_wire::is_recorded_job_name`]); a file
     /// counts from the earlier of the start and `now`, less [`INTERRUPTED_SLACK`]. A record of any other form, an empty
     /// one included, counts every file and names no job.
     fn read(text: &str, key: &str, now: SystemTime) -> Interrupted {
         let parsed = text.split_once(' ').and_then(|(start, job)| {
             let start: jiff::Timestamp = start.parse().ok()?;
-            payload::is_recorded_job_name(job, key).then(|| (SystemTime::from(start), job.to_owned()))
+            gate_wire::is_recorded_job_name(job, key, PathForm::Windows).then(|| (SystemTime::from(start), job.to_owned()))
         });
         match parsed {
             Some((start, job)) => Interrupted {
@@ -3588,8 +3589,8 @@ mod tests {
         UE_ROOT, WorkGit, before_the_job, client_gone, command_spent, command_variables, gap_spent, handed_job, look, prepared, remaining_budget,
         resolved_command, with_git_bin_first, with_path_first, with_safe_directory, with_unreal, without_engine, written_retrying,
     };
-    use crate::boxside::payload::engine_env_name_refused;
     use gate_args::{EnvRefusal, env_refusal};
+    use gate_wire::engine_env_name_refused;
 
     use crate::boxside::forward::{ClientGone, OutputLock};
     use crate::console::Console;
@@ -3819,7 +3820,7 @@ mod tests {
                 json[key] = value.clone();
             }
         }
-        Payload::decode(&STANDARD.encode(json.to_string())).expect("the payload decodes")
+        Payload::decode(&STANDARD.encode(json.to_string()), gate_wire::PathForm::Windows).expect("the payload decodes")
     }
 
     #[test]

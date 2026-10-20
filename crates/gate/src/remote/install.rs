@@ -25,8 +25,9 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
-use gate_router::is_layout_char;
+use gate_router::{escaped, is_layout_char};
 use gate_state::v1;
+use gate_wire::ordinal_upper;
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
@@ -35,7 +36,6 @@ use windows_sys::Win32::Storage::FileSystem::{
 use super::client::{Attempt, End};
 use super::git::{Git, GitError};
 use super::outputs::{self, Archive, Polled};
-use crate::boxside::payload::{escaped, ordinal_upper};
 use crate::outputs::archive::{Entry, PcFiles, UnpackError, below, check_folder, unpack};
 use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;

@@ -20,9 +20,9 @@ use std::time::Instant;
 use sha2::{Digest, Sha256};
 
 use gate_win32::{Job, PipedConsole, PipedLaunch, PipedSuspended};
+use gate_wire::ordinal_upper;
 
 use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
-use crate::boxside::payload::ordinal_upper;
 use crate::boxside::preflight::locate;
 use crate::boxside::run::{
     Beat, FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS, Request, Stopper, WaitEnd, Watched, Watching, before_the_job, box_variables,

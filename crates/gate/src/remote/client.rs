@@ -39,7 +39,8 @@ use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, Pipe
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
-use gate_router::{Config, DROPPED_NO_BUILD_LINE, SendPlan, repo_name};
+use gate_router::{Config, DROPPED_NO_BUILD_LINE, SendPlan, escaped, repo_name};
+use gate_wire::{PairRefused, PathForm, Payload, SHA256_DIGITS, is_lower_hex};
 
 use super::git::{self, Git, GitError, NO_CURRENT_FOLDER, last_update};
 use super::held::{Held, sibling_who};
@@ -66,12 +67,10 @@ use super::{
     adjusted_prefix, install_why, killed_line, refused_line, root_busy_why, root_why, started_line,
 };
 use crate::boxside::outputs::{NAMES_SKIPPED, OUTPUTS_BUDGET};
-use crate::boxside::payload::{PairRefused, Payload, escaped};
 use crate::durations::{Usual, hang_hint, routed_usual};
 use crate::environment::Variables;
 use crate::no_build;
 use crate::outputs::archive::sent_limit;
-use crate::outputs::hash::{SHA256_DIGITS, is_lower_hex};
 use crate::route::{self, open_followed};
 #[cfg(feature = "test-seams")]
 use crate::run::find_program;
@@ -1697,7 +1696,7 @@ impl Attempt<'_, '_> {
         }
         let names: Vec<String> = siblings.iter().map(|repo| repo.name.clone()).collect();
         let location = location.with_pair(self.call.leaf, &names);
-        let decoded = Payload::decode(&payload::location_word(&location)).map_err(PairRefused::from);
+        let decoded = Payload::decode(&payload::location_word(&location), PathForm::Windows).map_err(PairRefused::from);
         let pair = match decoded.and_then(|payload| payload.laid_out()) {
             Ok(Some(pair)) => pair,
             Ok(None) => return Err(End::Failed("the run's payload carries no Pair".to_owned())),

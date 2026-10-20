@@ -13,7 +13,6 @@ mod lfs;
 mod msys;
 pub(crate) mod outputs;
 mod packages;
-pub(crate) mod payload;
 mod preflight;
 pub(crate) mod probe;
 mod prune;
@@ -29,9 +28,9 @@ use std::time::SystemTime;
 
 use gate_args::{BoxRequest, BoxVerb, Problem};
 use gate_desktop::version::build_version;
+use gate_wire::{PathForm, Payload};
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
-use crate::boxside::payload::Payload;
 use crate::console::Console;
 use crate::remote::{INSTALL_STATUS, install_untrusted_line};
 
@@ -145,7 +144,7 @@ fn read_request(input: impl BufRead) -> Result<Payload, String> {
         }
     }
     let word = std::str::from_utf8(&line).map_err(|error| format!("gate: box payload is not base64 JSON: the line is not UTF-8: {error}"))?;
-    Payload::decode(word)
+    Payload::decode(word, PathForm::Windows)
 }
 
 /// Why a line could not be read.
@@ -184,7 +183,7 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
 
     use crate::answer::FAILED_STATUS;
-    use crate::boxside::payload::Payload;
+    use gate_wire::Payload;
 
     use super::{REQUEST_LIMIT, Unread, boot_status, bounded_line, read_request};
 

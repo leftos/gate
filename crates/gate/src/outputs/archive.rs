@@ -18,20 +18,19 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use gate_router::escaped;
+use gate_wire::{SHA256_DIGITS, is_lower_hex, ordinal_upper};
 use serde_json::{Value, json};
 use tar::{EntryType, Header};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
 };
 
-use crate::boxside::payload::{escaped, ordinal_upper};
-use crate::outputs::hash::{Hashing, SHA256_DIGITS, is_lower_hex};
+use crate::outputs::hash::Hashing;
 use crate::outputs::manifest::{Chosen, HeldBy, Manifest};
 use crate::outputs::names::is_plain_path;
 use crate::outputs::walk::{Found, Stamp, in_context};
 
-/// The extension of an outputs archive's name.
-pub(crate) const SUFFIX: &str = ".tar.zst";
 /// The name of the archive's last member, the list of every path the archive brings back.
 pub(crate) const LIST_NAME: &str = ".gate-outputs.json";
 /// The zstd level the archive is compressed at: zstd's default, which keeps pace with a gigabit link. The writer adds
@@ -1076,13 +1075,13 @@ mod tests {
         pack, pack_file, read_members, sent_limit, unpack,
     };
     use crate::boxside::outputs::OUTPUTS_BUDGET;
-    use crate::boxside::payload::escaped;
     use crate::outputs::glob::Globs;
     use crate::outputs::hash::sha256_of;
     use crate::outputs::manifest::{Chosen, Held, HeldBy, Manifest};
     use crate::outputs::names::is_device;
     use crate::outputs::walk::{Found, Stamp, walk};
     use crate::test_support::junction;
+    use gate_router::escaped;
 
     /// The byte limit the cases unpack under, far above what any of them holds.
     const LIMIT: u64 = 1 << 30;

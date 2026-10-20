@@ -8,12 +8,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::time::{Duration, Instant};
 
+use gate_router::escaped as shown;
 use gate_state::{KernelObject, StateRoot};
 use gate_win32::{Job, OpenedJob, ProcessTimes, StoppableProcess, WaitableProcess, file_time_now};
 use jiff::Timestamp;
 use proc_table::{Children, ProcessInfo, ProcessTree, Win32ProcessTable, filetime_to_timestamp};
 
-use crate::boxside::payload::escaped as shown;
 use crate::stopping::{Node, Opened, failure, open_checked};
 
 /// How many of the processes that left the job the kill's line names.

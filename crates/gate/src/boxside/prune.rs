@@ -19,11 +19,12 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use gate_router::escaped;
 use gate_win32::{Make, Share};
+use gate_wire::{is_drive_path, is_key};
 use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES};
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
-use crate::boxside::payload::{escaped, is_drive_path, is_key};
 use crate::boxside::preflight::{is_folder_itself, written_beneath};
 use crate::boxside::run::{FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_CHANGING, LOCK_VIOLATION, SHARING_VIOLATION};
 use crate::console::Console;

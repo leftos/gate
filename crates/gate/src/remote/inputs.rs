@@ -15,6 +15,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use gate_router::escaped;
 use gate_state::{FallbackReason, v1};
 use gate_win32::Interrupt;
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_DELETE_ON_CLOSE, FILE_SHARE_READ};
@@ -24,7 +25,6 @@ use super::git::{Call, Git, GitError, failure_text};
 use super::outputs::{Archive, DELETE, GENERIC_WRITE, Unbuilt, sha256_for};
 use super::payload::{self, InputsStep, Location};
 use super::watchdog::{self, Cut};
-use crate::boxside::payload::escaped;
 use crate::outputs::archive::{final_path, pack};
 use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;

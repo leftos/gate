@@ -22,6 +22,7 @@ use gate_args::BoxSeams;
 use gate_desktop::protocol::{HELPER_FRAME_LIMIT, Message, ReadError, Spawn, WriteError, read_message, write_message};
 use gate_desktop::version::build_version;
 use gate_desktop::{PIPE_PREFIX, TASK_PATH, arg0};
+use gate_router::escaped;
 use gate_win32::{
     ConnectWait, EndWait, Job, OutputPipes, PipeOwner, PipeServer, QueryOnlyProcess, RemoteProcess, Share, StartedTask, StoppableProcess, Suspended,
     TaskArgument, TaskError, TaskStart,
@@ -36,7 +37,6 @@ use crate::boxside::desktop::lines::{DesktopRefusal, Limits, TaskVerdict, could_
 use crate::boxside::desktop::verify::{
     ExpectedHelper, Facts, FileIdentity, HelperFacts, Reported, WrongFact, WrongHelper, sweep_targets, verify, verify_helper,
 };
-use crate::boxside::payload::escaped;
 use crate::boxside::run::{
     Beat, Launched, Look, One, Pipes, Prepared, Ran, Request, STARTING_COMMAND, Started, Stopper, box_run_job, command_record, failed, job_made,
     not_started, record_failed, stopped_before_start, unstarted_record_removed, wait_for_path, watch, written_command_record,

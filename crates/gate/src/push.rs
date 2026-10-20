@@ -28,13 +28,13 @@ use base64::engine::general_purpose::STANDARD;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use gate_args::PushRequest;
+use gate_router::escaped;
 use gate_win32::{EnvironmentBlock, Job, LaunchError, PipedConsole, PipedFed, PipedLaunch, Running};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
 
 use crate::answer::FAILED_STATUS;
-use crate::boxside::payload::escaped;
 use crate::console::Console;
 use crate::remote::git;
 use crate::remote::transport::ssh::Ssh;

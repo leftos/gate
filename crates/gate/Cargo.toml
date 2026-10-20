@@ -21,6 +21,7 @@ gate-router = { path = "../gate-router" }
 gate-state = { path = "../gate-state" }
 gate-watchdog = { path = "../gate-watchdog" }
 gate-win32 = { path = "../gate-win32" }
+gate-wire = { path = "../gate-wire" }
 jiff = "0.2.37"
 proc-table = { path = "../proc-table" }
 regex = "1.13.1"

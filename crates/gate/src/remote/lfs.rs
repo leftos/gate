@@ -16,8 +16,10 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use gate_router::escaped;
 use gate_state::FallbackReason;
 use gate_win32::Interrupt;
+use gate_wire::{SHA256_DIGITS, is_lower_hex};
 
 use super::client::{Attempt, End, RawSink, Watch};
 use super::git::{Call, Git, GitError, OUTPUT_CAP};
@@ -26,9 +28,8 @@ use super::outputs::{Archive, Unbuilt};
 use super::payload::{self, InputsStep, Location};
 use super::snapshot::{self, Bounded};
 use super::syncback::{SLICE_CAP, attribute_values, slices_asking};
-use crate::boxside::payload::escaped;
 use crate::outputs::archive::pack;
-use crate::outputs::hash::{SHA256_DIGITS, is_lower_hex, sha256_of};
+use crate::outputs::hash::sha256_of;
 use crate::outputs::manifest::{Chosen, HeldBy};
 use crate::outputs::walk::{Found, Stamp};
 
@@ -845,11 +846,11 @@ mod tests {
         assert_eq!(args, ["-c", "core.attributesFile=", "check-attr", "filter"]);
         assert_eq!(set, [("GIT_ATTR_NOSYSTEM", std::ffi::OsStr::new("1"))]);
     }
-    use crate::boxside::payload::escaped;
     use crate::outputs::hash::sha256_of;
     use crate::remote::git::GIT_LIMIT;
     use crate::remote::outputs::Unbuilt;
     use crate::remote::snapshot::Bounded;
+    use gate_router::escaped;
 
     /// A test's scratch folder, emptied first.
     fn scratch(name: &str) -> PathBuf {

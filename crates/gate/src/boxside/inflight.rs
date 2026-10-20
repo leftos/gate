@@ -9,10 +9,11 @@ use std::io::{self, ErrorKind};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use gate_router::escaped;
+use gate_wire::Payload;
 use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
-use crate::boxside::payload::{Payload, escaped};
 use crate::boxside::run::{LOCK_VIOLATION, SHARING_VIOLATION};
 use crate::console::Console;
 

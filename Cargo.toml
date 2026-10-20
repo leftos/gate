@@ -8,6 +8,7 @@ members = [
     "crates/gate-state",
     "crates/gate-watchdog",
     "crates/gate-win32",
+    "crates/gate-wire",
     "crates/proc-table",
 ]
 

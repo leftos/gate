@@ -8,10 +8,8 @@
 //! routing decision's to tell.
 
 use gate_router::{is_layout_name, parse_failure, spelled};
+use gate_wire::MOST_SIBLINGS;
 use toml::{Table, Value};
-
-/// The most siblings a repo may declare.
-pub(crate) const MOST_SIBLINGS: usize = 8;
 
 /// The problem of a file that has no `siblings` key.
 const NO_SIBLINGS: &str = "declares no siblings";

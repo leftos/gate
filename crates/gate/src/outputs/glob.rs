@@ -6,9 +6,9 @@
 
 use std::sync::LazyLock;
 
+use gate_router::escaped;
 use regex::Regex;
 
-use crate::boxside::payload::escaped;
 use crate::outputs::archive::LIST_NAME;
 use crate::outputs::names::{PATH_DEPTH_LIMIT, is_git_s, is_lfs_config, is_plain_part, is_plain_path, is_spelled_git_s, is_spelled_lfs_config};
 

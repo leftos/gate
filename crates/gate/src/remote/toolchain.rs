@@ -15,9 +15,9 @@ use serde_json::Value as Json;
 use toml::{Table, Value};
 
 use gate_args::MOST_ENV_NAMES;
-use gate_router::{parse_failure, spelled};
+use gate_router::{escaped, parse_failure, spelled};
+use gate_wire::engine_env_name_refused;
 
-use crate::boxside::payload::{engine_env_name_refused, escaped};
 use crate::boxside::probe::Probed;
 use crate::remote::git::{FAILURE_BYTES, first_bytes};
 use crate::remote::parity::{Need, NeedKind, number};

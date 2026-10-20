@@ -27,10 +27,11 @@ use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
+use gate_router::escaped;
 use gate_win32::{Job, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken, Running};
+use gate_wire::ordinal_upper;
 
 use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
-use crate::boxside::payload::{escaped, ordinal_upper};
 use crate::boxside::preflight::{is_real_folder, locate};
 use crate::boxside::run::{
     Beat, FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, Folders, Look, REFUSED_STATUS, Request, Stopper, WaitEnd, Watched, Watching, WorkGit,

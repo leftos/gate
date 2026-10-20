@@ -355,7 +355,7 @@ mod tests {
         InputsStep, Location, Pair, RunCall, WarmCall, input, inputs_word, job_nonce, line, location_word, preflight_word, run_nonce, run_word,
         warm_word,
     };
-    use crate::boxside::payload::Payload;
+    use gate_wire::Payload;
 
     fn decoded(word: &str) -> Value {
         let bytes = STANDARD.decode(word).expect("the word is base64");
@@ -412,7 +412,7 @@ mod tests {
 
     /// The box's reading of the payload word `word`.
     fn on_the_box(word: &str) -> Payload {
-        Payload::decode(word).expect("the box decodes the client's word")
+        Payload::decode(word, gate_wire::PathForm::Windows).expect("the box decodes the client's word")
     }
 
     #[test]

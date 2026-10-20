@@ -1,22 +1,71 @@
-//! The payload of a `gate box` call: one base64 word (standard alphabet, padded) of UTF-8 JSON holding an object, as
-//! the remote client sends it as the first line of the call's standard input. Keys are read by their exact name; keys
-//! no verb reads are ignored.
+//! The box request payload both the PC client and every box parse: the payload of a `gate box` call, one base64 word
+//! (standard alphabet, padded) of UTF-8 JSON holding an object, as the remote client sends it as the first line of the
+//! call's standard input. Keys are read by their exact name; keys no verb reads are ignored. Its path rules follow the
+//! box's [`PathForm`]; nothing here touches the operating system, so it builds for every box.
+#![expect(
+    clippy::missing_errors_doc,
+    reason = "each reader's own doc names the usage line it refuses with, as the parser's docs always have"
+)]
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use gate_args::{MAX_WHOLE_NUMBER, MOST_ENV_BYTES, MOST_ENV_NAMES, env_refusal, over_cap, shown_name};
 use gate_router::warm::MOST_COMMANDS;
-pub(crate) use gate_router::{escaped, is_reordering_mark};
-use gate_router::{is_layout_name, repo_name};
+use gate_router::{escaped, is_layout_name, repo_name};
 use serde_json::{Map, Value};
 
-use crate::boxside::probe::MAX_PART_DIGITS;
-use crate::outputs::archive::SUFFIX;
-use crate::outputs::hash::{SHA256_DIGITS, is_lower_hex};
-use crate::remote::siblings::MOST_SIBLINGS;
+/// The most digits a part of a version may have: a longer one is no version the client could compare.
+pub const MAX_PART_DIGITS: usize = 10;
 
-/// The decoded JSON object.
-pub(crate) struct Payload(Map<String, Value>);
+/// The extension of an outputs archive's name.
+pub const SUFFIX: &str = ".tar.zst";
+
+/// The hex digits of a SHA-256 as the gate writes it.
+pub const SHA256_DIGITS: usize = 64;
+
+/// The most siblings a repo may declare.
+pub const MOST_SIBLINGS: usize = 8;
+
+/// Whether `text` is exactly `digits` lower-case hex digits, with nothing before or after them.
+#[must_use]
+pub fn is_lower_hex(text: &str, digits: usize) -> bool {
+    text.len() == digits && text.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The path rules a payload is read under, those of the box that reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathForm {
+    /// A Windows box: a path is absolute on a drive ([`is_drive_path`]), two paths are compared as full paths without
+    /// regard to case, a path is joined with `\` and a job name starts `Local\`.
+    Windows,
+    /// A Unix box: a path is absolute in its one spelling ([`is_unix_path`]), two paths are compared byte for byte, a
+    /// path is joined with `/` and a job name has no `Local\`.
+    Unix,
+}
+
+impl PathForm {
+    /// The separator a path of this form is joined with.
+    fn separator(self) -> char {
+        match self {
+            PathForm::Windows => '\\',
+            PathForm::Unix => '/',
+        }
+    }
+
+    /// What a run's job name starts with before its key.
+    fn job_prefix(self) -> &'static str {
+        match self {
+            PathForm::Windows => r"Local\gate-remote-",
+            PathForm::Unix => "gate-remote-",
+        }
+    }
+}
+
+/// The decoded JSON object, and the path rules it is read under.
+pub struct Payload {
+    object: Map<String, Value>,
+    form: PathForm,
+}
 
 /// The key naming the variables a run's commands get set to the chosen Unreal Engine install's root.
 const ENGINE_ENV: &str = "EngineEnv";
@@ -30,7 +79,8 @@ const GIT_NAME_PREFIX: &str = "GIT_";
 /// Whether `name` cannot be a name a repo's toolchain manifest `[env]` sets, as the PC reads the manifest and the box
 /// reads `EngineEnv`: a name that is not an ASCII letter or `_` followed by ASCII letters, digits and `_`, a name
 /// starting with `GIT_` in any ASCII case, and a name `--env` refuses ([`env_refusal`]).
-pub(crate) fn engine_env_name_refused(name: &str) -> bool {
+#[must_use]
+pub fn engine_env_name_refused(name: &str) -> bool {
     let mut bytes = name.bytes();
     let well_formed = bytes.next().is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
@@ -41,40 +91,42 @@ pub(crate) fn engine_env_name_refused(name: &str) -> bool {
 }
 
 impl Payload {
-    /// Decodes the payload word; else the usage line saying why it cannot be read.
-    pub(crate) fn decode(word: &str) -> Result<Payload, String> {
+    /// Decodes the payload word, its paths to be read under `form`; else the usage line saying why it cannot be read.
+    pub fn decode(word: &str, form: PathForm) -> Result<Payload, String> {
         object(word)
-            .map(Payload)
+            .map(|object| Payload { object, form })
             .map_err(|reason| format!("gate: box payload is not base64 JSON: {reason}"))
     }
 
     /// The text of `key`; else the usage line saying the payload lacks it. A key that is absent, empty or not a string
     /// is lacking.
-    pub(crate) fn text(&self, key: &str) -> Result<&str, String> {
-        self.0
+    pub fn text(&self, key: &str) -> Result<&str, String> {
+        self.object
             .get(key)
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
             .ok_or_else(|| format!("gate: box payload lacks {key}"))
     }
 
-    /// The path of `key`: absolute on a drive (`X:\…` or `X:/…`), with no character below U+0020; else the usage line
-    /// saying why, the value shown with its control characters escaped. A relative, UNC or `\\?\` path, or one that
-    /// starts with `-`, is refused, so no such value reaches git as a path or an option.
-    pub(crate) fn path(&self, key: &str) -> Result<&str, String> {
+    /// The path of `key`: under [`PathForm::Windows`] absolute on a drive (`X:\…` or `X:/…`), with no character below
+    /// U+0020; under [`PathForm::Unix`] as [`is_unix_path`] says. Else the usage line saying why, the value shown with
+    /// its control characters escaped. A relative, UNC or `\\?\` path, or one that starts with `-`, is refused, so no
+    /// such value reaches git as a path or an option.
+    pub fn path(&self, key: &str) -> Result<&str, String> {
         let value = self.text(key)?;
-        if is_drive_path(value) {
-            Ok(value)
-        } else {
-            Err(format!("gate: box payload {key} is not an absolute path on a drive: {value:?}"))
+        match self.form {
+            PathForm::Windows if is_drive_path(value) => Ok(value),
+            PathForm::Windows => Err(format!("gate: box payload {key} is not an absolute path on a drive: {value:?}")),
+            PathForm::Unix if is_unix_path(value) => Ok(value),
+            PathForm::Unix => Err(format!("gate: box payload {key} is not an absolute path: {value:?}")),
         }
     }
 
     /// The words of `key`, a list of texts; else the usage line saying the payload lacks it (absent or empty) or that
     /// it is not a list of texts.
-    pub(crate) fn words(&self, key: &str) -> Result<Vec<String>, String> {
+    pub fn words(&self, key: &str) -> Result<Vec<String>, String> {
         let not_words = || format!("gate: box payload {key} is not a list of texts");
-        let list = match self.0.get(key) {
+        let list = match self.object.get(key) {
             None | Some(Value::Null) => return Err(format!("gate: box payload lacks {key}")),
             Some(value) => value.as_array().ok_or_else(not_words)?,
         };
@@ -85,8 +137,8 @@ impl Payload {
     }
 
     /// The text of `key`, empty when the key is absent or null; else the usage line saying it is not a text.
-    pub(crate) fn optional_text(&self, key: &str) -> Result<&str, String> {
-        match self.0.get(key) {
+    pub fn optional_text(&self, key: &str) -> Result<&str, String> {
+        match self.object.get(key) {
             None | Some(Value::Null) => Ok(""),
             Some(value) => value.as_str().ok_or_else(|| format!("gate: box payload {key} is not a text")),
         }
@@ -94,7 +146,7 @@ impl Payload {
 
     /// The name and text of each entry of the object at `key`, none when the key is absent or null; else the usage
     /// line saying it is not an object of texts.
-    pub(crate) fn pairs(&self, key: &str) -> Result<Vec<(String, String)>, String> {
+    pub fn pairs(&self, key: &str) -> Result<Vec<(String, String)>, String> {
         let Some(object) = self.object_at(key)? else {
             return Ok(Vec::new());
         };
@@ -113,7 +165,7 @@ impl Payload {
     /// the object `serde_json` parsed (`serde_json` has already built it, and the 16 MiB request line limit bounds it)
     /// so [`Payload::pairs`] need not copy an object over the box's cap; `None` when the key is absent or null. Else the
     /// usage line saying it is not an object of texts.
-    pub(crate) fn pair_size(&self, key: &str) -> Result<Option<(usize, usize)>, String> {
+    pub fn pair_size(&self, key: &str) -> Result<Option<(usize, usize)>, String> {
         let Some(object) = self.object_at(key)? else {
             return Ok(None);
         };
@@ -123,7 +175,7 @@ impl Payload {
 
     /// The object at `key`, none when the key is absent or null; else the usage line saying it is not an object of texts.
     fn object_at(&self, key: &str) -> Result<Option<&Map<String, Value>>, String> {
-        match self.0.get(key) {
+        match self.object.get(key) {
             None | Some(Value::Null) => Ok(None),
             Some(Value::Object(object)) => Ok(Some(object)),
             Some(_) => Err(not_an_object(key)),
@@ -132,9 +184,9 @@ impl Payload {
 
     /// The run's output globs, `Outputs`: a list of non-empty texts holding no `[` or `]`, as the routing file allows
     /// them; none when the key is absent or null. Else the usage line, a glob shown with its control characters escaped.
-    pub(crate) fn output_globs(&self) -> Result<Vec<String>, String> {
+    pub fn output_globs(&self) -> Result<Vec<String>, String> {
         let not_globs = || "gate: box payload Outputs is not a list of texts".to_owned();
-        let list = match self.0.get("Outputs") {
+        let list = match self.object.get("Outputs") {
             None | Some(Value::Null) => return Ok(Vec::new()),
             Some(value) => value.as_array().ok_or_else(not_globs)?,
         };
@@ -150,8 +202,8 @@ impl Payload {
 
     /// Whether `OutputsFull` is set, as the client sets it when the PC's last outputs step did not complete; false when
     /// the key is absent or null. Else the usage line saying it is not true or false.
-    pub(crate) fn outputs_full(&self) -> Result<bool, String> {
-        match self.0.get("OutputsFull") {
+    pub fn outputs_full(&self) -> Result<bool, String> {
+        match self.object.get("OutputsFull") {
             None | Some(Value::Null) => Ok(false),
             Some(Value::Bool(full)) => Ok(*full),
             Some(_) => Err("gate: box payload OutputsFull is not true or false".to_owned()),
@@ -160,7 +212,7 @@ impl Payload {
 
     /// The run's outputs `Nonce`: 32 lower-case hex digits, as the client draws it; else the usage line, the value
     /// shown with its control characters escaped.
-    pub(crate) fn nonce(&self) -> Result<&str, String> {
+    pub fn nonce(&self) -> Result<&str, String> {
         let nonce = self.text("Nonce")?;
         if is_lower_hex(nonce, OUTPUTS_NONCE_DIGITS) {
             Ok(nonce)
@@ -171,8 +223,8 @@ impl Payload {
 
     /// The run's ceiling, `Timeout`: whole seconds from 1 to 2147483647, the load-adjusted time the box gives the
     /// command; `None` when the key is absent or null, a run with no ceiling on the box. Else the usage line.
-    pub(crate) fn timeout(&self) -> Result<Option<u64>, String> {
-        match self.0.get("Timeout") {
+    pub fn timeout(&self) -> Result<Option<u64>, String> {
+        match self.object.get("Timeout") {
             None | Some(Value::Null) => Ok(None),
             Some(value) => value
                 .as_u64()
@@ -184,8 +236,8 @@ impl Payload {
 
     /// Whether the run asks for the builder's desktop, `Desktop`: true or false, false when the key is absent or null;
     /// else the usage line saying it is not true or false.
-    pub(crate) fn desktop(&self) -> Result<bool, String> {
-        match self.0.get("Desktop") {
+    pub fn desktop(&self) -> Result<bool, String> {
+        match self.object.get("Desktop") {
             None | Some(Value::Null) => Ok(false),
             Some(Value::Bool(desktop)) => Ok(*desktop),
             Some(_) => Err("gate: box payload Desktop is not true or false".to_owned()),
@@ -194,8 +246,8 @@ impl Payload {
 
     /// The run's `DesktopWait`: whole seconds from 1 to 2147483647, how long the box may wait for the builder's
     /// desktop; `None` when the key is absent or null. Else the usage line.
-    pub(crate) fn desktop_wait(&self) -> Result<Option<u64>, String> {
-        match self.0.get("DesktopWait") {
+    pub fn desktop_wait(&self) -> Result<Option<u64>, String> {
+        match self.object.get("DesktopWait") {
             None | Some(Value::Null) => Ok(None),
             Some(value) => value
                 .as_u64()
@@ -208,28 +260,28 @@ impl Payload {
     /// The run's `InputsDigest`, the SHA-256 of the inputs manifest line the client sent the work folder's inputs
     /// with: 64 lower-case hex digits; `None` when the key is absent or null. Else the usage line, the value shown with
     /// its control characters escaped.
-    pub(crate) fn inputs_digest(&self) -> Result<Option<&str>, String> {
+    pub fn inputs_digest(&self) -> Result<Option<&str>, String> {
         self.digest("InputsDigest")
     }
 
     /// The run's `SentDigest`, the SHA-256 of the manifest line of the PC's build the client sent the work folder,
     /// without its newline: 64 lower-case hex digits; `None` when the key is absent or null. Else the usage line, as
     /// [`Payload::inputs_digest`] gives it.
-    pub(crate) fn sent_digest(&self) -> Result<Option<&str>, String> {
+    pub fn sent_digest(&self) -> Result<Option<&str>, String> {
         self.digest("SentDigest")
     }
 
     /// The run's `LfsDigest`, the SHA-256 of the LFS manifest line of the objects the snapshot's pointers name, without
     /// its newline: 64 lower-case hex digits; `None` when the key is absent or null. Else the usage line, as
     /// [`Payload::inputs_digest`] gives it.
-    pub(crate) fn lfs_digest(&self) -> Result<Option<&str>, String> {
+    pub fn lfs_digest(&self) -> Result<Option<&str>, String> {
         self.digest("LfsDigest")
     }
 
     /// The SHA-256 under the key `key`: 64 lower-case hex digits; `None` when the key is absent or null. Else the usage
     /// line, the value shown with its control characters escaped.
     fn digest(&self, key: &str) -> Result<Option<&str>, String> {
-        match self.0.get(key) {
+        match self.object.get(key) {
             None | Some(Value::Null) => Ok(None),
             Some(Value::String(digest)) if is_lower_hex(digest, SHA256_DIGITS) => Ok(Some(digest)),
             Some(other) => Err(format!(
@@ -240,12 +292,12 @@ impl Payload {
     }
 
     /// The version of the builder's Godot install the run uses, `GodotVersion` ([`Payload::install_version`]).
-    pub(crate) fn godot_version(&self) -> Result<Option<&str>, String> {
+    pub fn godot_version(&self) -> Result<Option<&str>, String> {
         self.install_version("GodotVersion")
     }
 
     /// The version of the builder's Unreal Engine install the run uses, `UnrealVersion` ([`Payload::install_version`]).
-    pub(crate) fn unreal_version(&self) -> Result<Option<&str>, String> {
+    pub fn unreal_version(&self) -> Result<Option<&str>, String> {
         self.install_version("UnrealVersion")
     }
 
@@ -253,7 +305,7 @@ impl Payload {
     /// ([`is_canonical_version`]), as it is joined into an install's path; `None` when the key is absent or null. Else
     /// the usage line, the value shortened and shown with its control characters escaped.
     fn install_version(&self, key: &str) -> Result<Option<&str>, String> {
-        match self.0.get(key) {
+        match self.object.get(key) {
             None | Some(Value::Null) => Ok(None),
             Some(Value::String(version)) if is_canonical_version(version) => Ok(Some(version)),
             Some(other) => Err(format!(
@@ -269,7 +321,7 @@ impl Payload {
     /// (`gate_args::MOST_ENV_NAMES`, `gate_args::MOST_ENV_BYTES`), a name the gate refuses ([`engine_env_name_refused`]),
     /// a value other than `"unreal"`, or a name given twice in any ASCII case, the name shortened and escaped. The cap is
     /// counted over the raw objects before any pair is copied.
-    pub(crate) fn engine_env(&self) -> Result<Vec<String>, String> {
+    pub fn engine_env(&self) -> Result<Vec<String>, String> {
         let (names, bytes) = self.pair_size(ENGINE_ENV)?.unwrap_or_default();
         let (env_names, env_bytes) = self.pair_size("Env")?.unwrap_or_default();
         if over_cap(names + env_names, bytes + env_bytes) {
@@ -302,7 +354,7 @@ impl Payload {
     /// What the run runs ([`Commands`]): the one `Command` of a payload that sets no `WarmCommands`, else the warm-up's
     /// `WarmCommands` and its `WarmHash`, in a payload that sets no `Command`, asks for no outputs (no `Outputs` glob,
     /// `OutputsFull` not true) and gives a `Timeout`. Else the usage line.
-    pub(crate) fn commands(&self) -> Result<Commands<'_>, String> {
+    pub fn commands(&self) -> Result<Commands<'_>, String> {
         if !self.sets("WarmCommands") {
             return Ok(Commands {
                 words: vec![self.words("Command")?],
@@ -337,7 +389,7 @@ impl Payload {
         let malformed =
             || format!("gate: box payload WarmCommands is not a list of 1 to {MOST_COMMANDS} commands, each a non-empty list of non-empty texts");
         let commands = self
-            .0
+            .object
             .get("WarmCommands")
             .and_then(Value::as_array)
             .filter(|commands| (1..=MOST_COMMANDS).contains(&commands.len()))
@@ -358,7 +410,7 @@ impl Payload {
     /// Else the usage line saying the payload lacks it (absent or null) or, the value shown with its control characters
     /// escaped, that it is not one.
     fn warm_hash(&self) -> Result<&str, String> {
-        match self.0.get("WarmHash") {
+        match self.object.get("WarmHash") {
             None | Some(Value::Null) => Err("gate: box payload lacks WarmHash".to_owned()),
             Some(Value::String(hash)) if is_lower_hex(hash, SHA256_DIGITS) => Ok(hash),
             Some(other) => Err(format!(
@@ -369,51 +421,54 @@ impl Payload {
     }
 
     /// Whether the payload sets `key` to anything but null.
-    pub(crate) fn sets(&self, key: &str) -> bool {
-        !matches!(self.0.get(key), None | Some(Value::Null))
+    #[must_use]
+    pub fn sets(&self, key: &str) -> bool {
+        !matches!(self.object.get(key), None | Some(Value::Null))
     }
 
     /// The run's `Snapshot`: the payload's commit, exactly 40 lowercase hex digits, as the client sends it; else the
     /// line saying it is not one. This is PowerShell's `-cmatch '^[0-9a-f]{40}$'` without .NET's allowance for a
     /// trailing newline. A missing key and a JSON null are shown as the empty string, any other non-string value as its
     /// compact JSON text, each with its control characters escaped, so a value cannot break or forge the line.
-    pub(crate) fn snapshot(&self) -> Result<&str, String> {
-        commit(self.0.get("Snapshot")).map_err(|shown| not_a_snapshot("Snapshot", &shown))
+    pub fn snapshot(&self) -> Result<&str, String> {
+        commit(self.object.get("Snapshot")).map_err(|shown| not_a_snapshot("Snapshot", &shown))
     }
 }
 
 /// What a run runs, as [`Payload::commands`] reads it.
-pub(crate) struct Commands<'a> {
+pub struct Commands<'a> {
     /// Each command's words, its program first: the one command of a run, or each of a warm-up's in order.
-    pub(crate) words: Vec<Vec<String>>,
+    pub words: Vec<Vec<String>>,
     /// The warm-up file's hash the box records once every command passed; `None` for a run.
-    pub(crate) warm_hash: Option<&'a str>,
+    pub warm_hash: Option<&'a str>,
 }
 
 /// A sibling pair as the box lays it out: the main checkout's folder name, `Leaf`, and each sibling with the bare
 /// repository its snapshot is pushed to.
-pub(crate) struct Pair {
+pub struct Pair {
     leaf: String,
     siblings: Vec<PairSibling>,
 }
 
 impl Pair {
     /// The main checkout's folder name.
-    pub(crate) fn leaf(&self) -> &str {
+    #[must_use]
+    pub fn leaf(&self) -> &str {
         &self.leaf
     }
 
     /// The siblings, in the payload's order.
-    pub(crate) fn siblings(&self) -> &[PairSibling] {
+    #[must_use]
+    pub fn siblings(&self) -> &[PairSibling] {
         &self.siblings
     }
 }
 
 /// Why the box refuses a run's `Pair`: the usage line, and the sibling it names when one sibling alone is refused.
 #[derive(Debug)]
-pub(crate) struct PairRefused {
-    pub(crate) line: String,
-    pub(crate) sibling: Option<String>,
+pub struct PairRefused {
+    pub line: String,
+    pub sibling: Option<String>,
 }
 
 impl From<String> for PairRefused {
@@ -424,17 +479,21 @@ impl From<String> for PairRefused {
 
 /// One sibling of a [`Pair`]: its folder name and its bare repository, `{root}\{repo_name(name)}.git` beside the main's,
 /// derived on the box and never read from the payload.
-pub(crate) struct PairSibling {
+pub struct PairSibling {
     name: String,
     bare: String,
 }
 
 impl PairSibling {
-    pub(crate) fn name(&self) -> &str {
+    /// The sibling's folder name.
+    #[must_use]
+    pub fn name(&self) -> &str {
         &self.name
     }
 
-    pub(crate) fn bare(&self) -> &str {
+    /// The sibling's bare repository on the box.
+    #[must_use]
+    pub fn bare(&self) -> &str {
         &self.bare
     }
 }
@@ -444,16 +503,17 @@ impl Payload {
     /// The run's sibling `Pair`, `{"Leaf": "<name>", "Siblings": ["<name>", …]}`; `None` when the key is absent or null,
     /// a run of one repo. Else the usage line: a name the box cannot lay out ([`is_layout_name`]), no sibling or more
     /// than [`MOST_SIBLINGS`], two names (the leaf included) equal ignoring ASCII case, a `Key` that is not the leaf's
-    /// (`<repo_name(leaf)>-<8 hex>`), a `Bare` that is not `<root>\<name>.git` for the work folder `<root>\work\<key>`,
-    /// or two bare repositories (the main's and each sibling's `<repo_name(name)>.git`) equal ignoring ASCII case.
-    pub(crate) fn pair(&self) -> Result<Option<Pair>, String> {
+    /// (`<repo_name(leaf)>-<8 hex>`), a `Bare` that is not `<root>\<name>.git` for the work folder `<root>\work\<key>`
+    /// (`/` for `\` under [`PathForm::Unix`]), or two bare repositories (the main's and each sibling's
+    /// `<repo_name(name)>.git`) equal ignoring ASCII case.
+    pub fn pair(&self) -> Result<Option<Pair>, String> {
         self.laid_out().map_err(|refused| refused.line)
     }
 
     /// The run's sibling `Pair` as [`Payload::pair`] reads it; else its usage line and, when it refuses one sibling's
     /// bare repository, that sibling's name.
-    pub(crate) fn laid_out(&self) -> Result<Option<Pair>, PairRefused> {
-        let (leaf, names) = match self.0.get("Pair") {
+    pub fn laid_out(&self) -> Result<Option<Pair>, PairRefused> {
+        let (leaf, names) = match self.object.get("Pair") {
             None | Some(Value::Null) => return Ok(None),
             Some(value) => pair_names(value)?,
         };
@@ -463,11 +523,20 @@ impl Payload {
             return Err(format!("gate: box payload Key {key} is not the work-folder key of the Pair's Leaf {leaf}").into());
         }
         let bare = self.path("Bare")?;
+        let separator = self.form.separator();
         let Some(root) = grandparent(work) else {
-            return Err(format!(r"gate: box payload Work must be <root>\work\<key> with a Pair: {}", escaped(work)).into());
+            return Err(format!(
+                "gate: box payload Work must be <root>{separator}work{separator}<key> with a Pair: {}",
+                escaped(work)
+            )
+            .into());
         };
-        let Some(main_stem) = bare_stem(bare, root) else {
-            return Err(format!(r"gate: box payload Bare must be {root}\<name>.git with a Pair: {}", escaped(bare)).into());
+        let Some(main_stem) = bare_stem(bare, root, self.form) else {
+            return Err(format!(
+                "gate: box payload Bare must be {root}{separator}<name>.git with a Pair: {}",
+                escaped(bare)
+            )
+            .into());
         };
         let mut stems = vec![main_stem.to_owned()];
         let mut siblings = Vec::with_capacity(names.len());
@@ -480,7 +549,7 @@ impl Payload {
                 });
             }
             siblings.push(PairSibling {
-                bare: format!(r"{root}\{stem}.git"),
+                bare: format!("{root}{separator}{stem}.git"),
                 name,
             });
             stems.push(stem);
@@ -491,8 +560,8 @@ impl Payload {
     /// The commit of each sibling of `pair`, in its order, from the run's `SiblingSnapshots`, an object whose names are
     /// exactly the siblings' and whose values are each 40 lowercase hex digits, as [`Payload::snapshot`] reads them;
     /// else the line saying why.
-    pub(crate) fn sibling_snapshots(&self, pair: &Pair) -> Result<Vec<&str>, String> {
-        let object = match self.0.get("SiblingSnapshots") {
+    pub fn sibling_snapshots(&self, pair: &Pair) -> Result<Vec<&str>, String> {
+        let object = match self.object.get("SiblingSnapshots") {
             None | Some(Value::Null) => None,
             Some(Value::Object(object)) => Some(object),
             Some(_) => return Err("gate: box payload SiblingSnapshots is not an object".to_owned()),
@@ -516,13 +585,16 @@ impl Payload {
 
 /// The box path of every tree a run checks out in the work folder `work`: the main repo's, then each sibling's in the
 /// order given. With no `pair`, `work` itself and no sibling; with the pair of the main checkout's folder name and the
-/// siblings' folder names, `{work}\{leaf}` and `{work}\{name}` for each sibling. The box lays its trees out at these
-/// paths and the client rewrites recorded box paths from them, so the two never compute them apart.
-pub(crate) fn trees(work: &str, pair: Option<(&str, &[&str])>) -> (String, Vec<String>) {
+/// siblings' folder names, `{work}\{leaf}` and `{work}\{name}` for each sibling, joined with `form`'s separator. The box
+/// lays its trees out at these paths and the client rewrites recorded box paths from them, so the two never compute
+/// them apart.
+#[must_use]
+pub fn trees(work: &str, pair: Option<(&str, &[&str])>, form: PathForm) -> (String, Vec<String>) {
     let Some((leaf, siblings)) = pair else {
         return (work.to_owned(), Vec::new());
     };
-    let tree = |name: &str| format!(r"{work}\{name}");
+    let separator = form.separator();
+    let tree = |name: &str| format!("{work}{separator}{name}");
     (tree(leaf), siblings.iter().map(|name| tree(name)).collect())
 }
 
@@ -576,13 +648,14 @@ fn is_key_of(key: &str, leaf: &str) -> bool {
 }
 
 /// The stem of the bare repository `bare` when it is `<root>\<stem>.git`, `<stem>` one or more ASCII letters, digits,
-/// `-` and `_`, its folder compared with `root` as full paths without regard to case; else `None`.
-pub(super) fn bare_stem<'a>(bare: &'a str, root: &str) -> Option<&'a str> {
+/// `-` and `_`, its folder compared with `root` as `form` compares paths ([`same_path`]); else `None`.
+#[must_use]
+pub fn bare_stem<'a>(bare: &'a str, root: &str, form: PathForm) -> Option<&'a str> {
     let split = bare.rfind(['\\', '/'])?;
     let (folder, file) = (&bare[..split], &bare[split + 1..]);
     let dot = file.len().checked_sub(".git".len())?;
     let (stem, suffix) = (file.get(..dot)?, file.get(dot..)?);
-    (suffix.eq_ignore_ascii_case(".git") && is_key(stem) && same_path(folder, root)).then_some(stem)
+    (suffix.eq_ignore_ascii_case(".git") && is_key(stem) && same_path(folder, root, form)).then_some(stem)
 }
 
 /// The commit `value` names: exactly 40 lowercase hex digits; else the value as a refusal line shows it, a missing key
@@ -600,51 +673,54 @@ fn commit(value: Option<&Value>) -> Result<&str, String> {
 impl Payload {
     /// The work-folder key: ASCII letters, digits, `-` and `_`, as the client builds it from the repo's name; else the
     /// usage line, the key shown with its control characters escaped.
-    pub(crate) fn key(&self) -> Result<&str, String> {
+    pub fn key(&self) -> Result<&str, String> {
         let key = self.text("Key")?;
         if is_key(key) { Ok(key) } else { Err(not_a_key(key)) }
     }
 
-    /// The key and the work folder: `Work` an absolute path on a drive, with no trailing separator, whose last name is
-    /// the key; else the usage line.
-    pub(crate) fn work_folder(&self) -> Result<(&str, &str), String> {
+    /// The key and the work folder: `Work` an absolute path ([`Payload::path`]), with no trailing separator, whose last
+    /// name is the key, without regard to ASCII case under [`PathForm::Windows`] and exactly under [`PathForm::Unix`];
+    /// else the usage line.
+    pub fn work_folder(&self) -> Result<(&str, &str), String> {
         let work = self.path("Work")?;
         if work.ends_with(['\\', '/']) {
             return Err(format!("gate: box payload Work must not end with a separator: {}", escaped(work)));
         }
         let key = self.key()?;
         let last = work.rsplit(['\\', '/']).next();
-        if last.is_some_and(|last| last.eq_ignore_ascii_case(key)) {
-            Ok((key, work))
-        } else {
-            Err(not_a_key(key))
-        }
+        let named = match self.form {
+            PathForm::Windows => last.is_some_and(|last| last.eq_ignore_ascii_case(key)),
+            PathForm::Unix => last == Some(key),
+        };
+        if named { Ok((key, work)) } else { Err(not_a_key(key)) }
     }
 
     /// The path of `key`, which must be `<work>.<extension>`, as the client builds the lock and the index; compared as
-    /// full paths without regard to case. Else the usage line.
-    pub(crate) fn beside_work(&self, key: &str, work: &str, extension: &str) -> Result<&str, String> {
+    /// the payload's form compares paths ([`same_path`]). Else the usage line.
+    pub fn beside_work(&self, key: &str, work: &str, extension: &str) -> Result<&str, String> {
         let value = self.path(key)?;
         let expected = format!("{work}.{extension}");
-        if same_path(value, &expected) {
+        if same_path(value, &expected, self.form) {
             Ok(value)
         } else {
             Err(format!("gate: box payload {key} must be {expected}"))
         }
     }
 
-    /// The `OutputFolder`, which must be `<root>\outputs` for the work folder `work`, `<root>\work\<key>`, as the client
-    /// builds it; compared as full paths without regard to case. Else the usage line.
-    pub(crate) fn output_folder(&self, work: &str) -> Result<&str, String> {
+    /// The `OutputFolder`, which must be `<root>\outputs` for the work folder `work`, `<root>\work\<key>` (`/` for `\`
+    /// under [`PathForm::Unix`]), as the client builds it; compared as the payload's form compares paths
+    /// ([`same_path`]). Else the usage line.
+    pub fn output_folder(&self, work: &str) -> Result<&str, String> {
         let value = self.path("OutputFolder")?;
+        let separator = self.form.separator();
         let Some(root) = grandparent(work) else {
             return Err(format!(
-                r"gate: box payload Work must be <root>\work\<key> to place OutputFolder: {}",
+                "gate: box payload Work must be <root>{separator}work{separator}<key> to place OutputFolder: {}",
                 escaped(work)
             ));
         };
-        let expected = format!(r"{root}\outputs");
-        if same_path(value, &expected) {
+        let expected = format!("{root}{separator}outputs");
+        if same_path(value, &expected, self.form) {
             Ok(value)
         } else {
             Err(format!("gate: box payload OutputFolder must be {expected}"))
@@ -655,7 +731,7 @@ impl Payload {
     /// names a run's archive; else the line refusing it, the name shown with its control characters escaped, or the
     /// usage line saying the payload lacks it. The outputs verb can so reach no file in `OutputFolder` but an archive of
     /// this work folder.
-    pub(crate) fn archive_name(&self) -> Result<&str, String> {
+    pub fn archive_name(&self) -> Result<&str, String> {
         let key = self.key()?;
         let name = self.text("Name")?;
         if archive_key(name) == Some(key) {
@@ -668,11 +744,12 @@ impl Payload {
         }
     }
 
-    /// The run's job name, `Local\gate-remote-<key>-<nonce>` with the payload's own key and a nonce of 12 hex digits,
-    /// as the client names it; else the usage line. A stop can so reach no job but a run's of this work folder.
-    pub(crate) fn job(&self, key: &str) -> Result<&str, String> {
+    /// The run's job name, `Local\gate-remote-<key>-<nonce>` (`gate-remote-<key>-<nonce>` under [`PathForm::Unix`]) with
+    /// the payload's own key and a nonce of 12 hex digits, as the client names it; else the usage line. A stop can so
+    /// reach no job but a run's of this work folder.
+    pub fn job(&self, key: &str) -> Result<&str, String> {
         let job = self.text("Job")?;
-        if is_job_name(job, key) {
+        if is_job_name(job, key, self.form) {
             Ok(job)
         } else {
             Err(format!("gate: box payload Job is not this work folder's job name: {}", escaped(job)))
@@ -680,16 +757,19 @@ impl Payload {
     }
 }
 
-/// Whether `job` is a run's job name of the work folder `key`: `Local\gate-remote-<key>-<nonce>`, the nonce 12 hex
-/// digits, as the client names it.
-pub(crate) fn is_job_name(job: &str, key: &str) -> bool {
-    is_nonce(job.strip_prefix(r"Local\gate-remote-").and_then(|rest| rest.strip_prefix(key)))
+/// Whether `job` is a run's job name of the work folder `key` under `form`: `Local\gate-remote-<key>-<nonce>` under
+/// [`PathForm::Windows`], `gate-remote-<key>-<nonce>` under [`PathForm::Unix`], the nonce 12 hex digits, as the client
+/// names it.
+#[must_use]
+pub fn is_job_name(job: &str, key: &str, form: PathForm) -> bool {
+    is_nonce(job.strip_prefix(form.job_prefix()).and_then(|rest| rest.strip_prefix(key)))
 }
 
 /// Whether `job`, read from an interrupted-command record, is a run's job name of the work folder `key` as
 /// [`is_job_name`] says, but for the key's case, which a record written under another case of the key may differ in.
-pub(crate) fn is_recorded_job_name(job: &str, key: &str) -> bool {
-    let rest = job.strip_prefix(r"Local\gate-remote-");
+#[must_use]
+pub fn is_recorded_job_name(job: &str, key: &str, form: PathForm) -> bool {
+    let rest = job.strip_prefix(form.job_prefix());
     is_nonce(rest.and_then(|rest| {
         let (named, after) = rest.split_at_checked(key.len())?;
         named.eq_ignore_ascii_case(key).then_some(after)
@@ -705,14 +785,15 @@ fn is_nonce(after_key: Option<&str>) -> bool {
 /// The hex digits of a run's nonce, as the client draws it.
 const NONCE_DIGITS: usize = 12;
 /// The hex digits of a run's outputs nonce, as the client draws it.
-pub(crate) const OUTPUTS_NONCE_DIGITS: usize = 32;
+pub const OUTPUTS_NONCE_DIGITS: usize = 32;
 /// The hex digits of a commit's sha.
 const COMMIT_SHA_DIGITS: usize = 40;
 /// The hex digits that end a work-folder key, after the repo name and a `-`.
 const KEY_HASH_DIGITS: usize = 8;
 
 /// Whether `text` is a work-folder key: one or more ASCII letters, digits, `-` and `_`.
-pub(crate) fn is_key(text: &str) -> bool {
+#[must_use]
+pub fn is_key(text: &str) -> bool {
     !text.is_empty()
         && text
             .chars()
@@ -721,13 +802,15 @@ pub(crate) fn is_key(text: &str) -> bool {
 
 /// The name of the outputs archive of the work folder `key` for the outputs nonce `nonce`: `<key>-<nonce>.tar.zst`.
 /// [`archive_key`] reads it back.
-pub(crate) fn archive_file_name(key: &str, nonce: &str) -> String {
+#[must_use]
+pub fn archive_file_name(key: &str, nonce: &str) -> String {
     format!("{key}-{nonce}{SUFFIX}")
 }
 
 /// The work-folder key of `name` when it is an outputs archive's name as [`archive_file_name`] makes it, with a
 /// work-folder key and an outputs nonce of 32 lower-case hex digits; else `None`.
-pub(crate) fn archive_key(name: &str) -> Option<&str> {
+#[must_use]
+pub fn archive_key(name: &str) -> Option<&str> {
     let stem = name.strip_suffix(SUFFIX)?;
     let split = stem.len().checked_sub(OUTPUTS_NONCE_DIGITS + 1)?;
     let key = stem.get(..split)?;
@@ -737,7 +820,8 @@ pub(crate) fn archive_key(name: &str) -> Option<&str> {
 
 /// The `<root>` of the work folder `path`, `<root>\work\<key>` with `work` in any case, without a trailing separator;
 /// `None` when `path` is not one.
-pub(crate) fn grandparent(path: &str) -> Option<&str> {
+#[must_use]
+pub fn grandparent(path: &str) -> Option<&str> {
     let parent = &path[..path.rfind(['\\', '/'])?];
     let split = parent.rfind(['\\', '/'])?;
     let (root, middle) = (&parent[..split], &parent[split + 1..]);
@@ -745,23 +829,35 @@ pub(crate) fn grandparent(path: &str) -> Option<&str> {
 }
 
 /// The builder's work root of the work folder `work`, `<root>\work\<key>`, as a path to open: [`grandparent`]'s
-/// `<root>` without a trailing separator, a doubled one included, and a drive's own root with its separator (`D:\`);
-/// `None` when `work` is not laid out so, or its `<root>` is only separators.
-pub(crate) fn work_root(work: &str) -> Option<String> {
+/// `<root>` without a trailing separator, a doubled one included, and under [`PathForm::Windows`] a drive's own root
+/// with its separator (`D:\`); `None` when `work` is not laid out so, or its `<root>` is only separators, as a Unix
+/// `/work/<key>`'s is.
+#[must_use]
+pub fn work_root(work: &str, form: PathForm) -> Option<String> {
     let root = grandparent(work)?.trim_end_matches(['\\', '/']);
     if root.is_empty() {
         None
-    } else if root.ends_with(':') {
+    } else if form == PathForm::Windows && root.ends_with(':') {
         Some(format!(r"{root}\"))
     } else {
         Some(root.to_owned())
     }
 }
 
+/// Whether `first` and `second` are the same path as `form` compares them: under [`PathForm::Windows`] as
+/// [`same_full_path`] does, under [`PathForm::Unix`] byte for byte, since [`is_unix_path`] admits one spelling of each
+/// path.
+fn same_path(first: &str, second: &str, form: PathForm) -> bool {
+    match form {
+        PathForm::Windows => same_full_path(first, second),
+        PathForm::Unix => first == second,
+    }
+}
+
 /// Whether `first` and `second` are the same path once made full, without regard to case. Never when a part of
 /// `first` other than `.` or `..` ends in `.` or a space, which making the path full would drop, so the path that
 /// passes is the one opened.
-fn same_path(first: &str, second: &str) -> bool {
+fn same_full_path(first: &str, second: &str) -> bool {
     let renamed = first
         .split(['\\', '/'])
         .any(|part| !matches!(part, "." | "..") && part.ends_with(['.', ' ']));
@@ -785,7 +881,8 @@ fn not_a_snapshot(what: &str, value: &str) -> String {
 
 /// `text` with each character mapped to its simple uppercase, as .NET's `OrdinalIgnoreCase` compares: a character
 /// whose uppercase is more than one character is kept.
-pub(crate) fn ordinal_upper(text: &str) -> String {
+#[must_use]
+pub fn ordinal_upper(text: &str) -> String {
     text.chars()
         .map(|character| {
             let mut upper = character.to_uppercase();
@@ -800,7 +897,8 @@ pub(crate) fn ordinal_upper(text: &str) -> String {
 /// Whether `text` is a version in the one spelling a Godot or Unreal Engine install's folder has: three dot-separated
 /// parts, each of one to [`MAX_PART_DIGITS`] ASCII digits with no leading zero unless the part is `0`, as the godot and
 /// unreal probes spell the version an install reports.
-pub(crate) fn is_canonical_version(text: &str) -> bool {
+#[must_use]
+pub fn is_canonical_version(text: &str) -> bool {
     let parts: Vec<&str> = text.split('.').collect();
     let canonical = |part: &&str| {
         (1..=MAX_PART_DIGITS).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_digit()) && (*part == "0" || !part.starts_with('0'))
@@ -808,9 +906,25 @@ pub(crate) fn is_canonical_version(text: &str) -> bool {
     parts.len() == 3 && parts.iter().all(canonical)
 }
 
-pub(crate) fn is_drive_path(value: &str) -> bool {
+/// Whether `value` is a path absolute on a drive, `X:\…` or `X:/…`, with no character below U+0020.
+#[must_use]
+pub fn is_drive_path(value: &str) -> bool {
     let rooted = matches!(value.as_bytes(), [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic());
     rooted && !value.chars().any(|character| character < ' ')
+}
+
+/// Whether `value` is an absolute Unix path in its one spelling: `/` and one or more names, with no `\`, no character
+/// below U+0020, and no name that is empty (`//`), `.` or `..`. A single trailing `/` is allowed here, as a trailing
+/// separator is on a drive; [`Payload::work_folder`] refuses it.
+#[must_use]
+pub fn is_unix_path(value: &str) -> bool {
+    let Some(names) = value.strip_prefix('/') else {
+        return false;
+    };
+    let names = names.strip_suffix('/').unwrap_or(names);
+    !names.is_empty()
+        && !value.chars().any(|character| character < ' ' || character == '\\')
+        && names.split('/').all(|name| !matches!(name, "" | "." | ".."))
 }
 
 fn object(word: &str) -> Result<Map<String, Value>, String> {
@@ -828,10 +942,10 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use serde_json::json;
 
-    use super::{Payload, escaped, work_root};
+    use super::{PathForm, Payload, escaped, work_root};
 
     fn decoded(json: &str) -> Result<Payload, String> {
-        Payload::decode(&STANDARD.encode(json))
+        Payload::decode(&STANDARD.encode(json), PathForm::Windows)
     }
 
     fn text(json: &str, key: &str) -> Result<String, String> {
@@ -1006,11 +1120,11 @@ mod tests {
 
     #[test]
     fn a_word_that_is_not_base64_json_names_why() {
-        assert_names_a_reason(Payload::decode("not base64"), "not base64");
-        assert_names_a_reason(Payload::decode(&STANDARD.encode([0xFF, 0xFE])), "not UTF-8");
+        assert_names_a_reason(Payload::decode("not base64", PathForm::Windows), "not base64");
+        assert_names_a_reason(Payload::decode(&STANDARD.encode([0xFF, 0xFE]), PathForm::Windows), "not UTF-8");
         assert_names_a_reason(decoded("{\"Work\":"), "not JSON");
         let unpadded = STANDARD.encode("{}").trim_end_matches('=').to_owned();
-        assert_names_a_reason(Payload::decode(&unpadded), "the standard engine wants the padding");
+        assert_names_a_reason(Payload::decode(&unpadded, PathForm::Windows), "the standard engine wants the padding");
         assert_eq!(
             decoded("[\"Work\"]").err(),
             Some("gate: box payload is not base64 JSON: the JSON is not an object".to_owned())
@@ -1419,22 +1533,29 @@ mod tests {
 
     #[test]
     fn the_work_root_of_a_drive_s_own_root_keeps_its_separator() {
-        assert_eq!(work_root(r"D:\work\app-1a2b3c4d"), Some(r"D:\".to_owned()));
-        assert_eq!(work_root(r"D:\\work\app-1a2b3c4d"), Some(r"D:\".to_owned()), "a doubled separator");
-        assert_eq!(work_root(r"\\work\app-1a2b3c4d"), None, "a root of separators alone");
-        assert_eq!(work_root(r"D:\gate-remote\app-1a2b3c4d"), None, "no work folder");
+        assert_eq!(work_root(r"D:\work\app-1a2b3c4d", PathForm::Windows), Some(r"D:\".to_owned()));
+        assert_eq!(
+            work_root(r"D:\\work\app-1a2b3c4d", PathForm::Windows),
+            Some(r"D:\".to_owned()),
+            "a doubled separator"
+        );
+        assert_eq!(work_root(r"\\work\app-1a2b3c4d", PathForm::Windows), None, "a root of separators alone");
+        assert_eq!(work_root(r"D:\gate-remote\app-1a2b3c4d", PathForm::Windows), None, "no work folder");
     }
 
     #[test]
     fn the_work_root_has_no_trailing_separator() {
-        assert_eq!(work_root(r"D:\gate-remote\work\app-1a2b3c4d"), Some(r"D:\gate-remote".to_owned()));
         assert_eq!(
-            work_root(r"D:\gate-remote\\work\app-1a2b3c4d"),
+            work_root(r"D:\gate-remote\work\app-1a2b3c4d", PathForm::Windows),
+            Some(r"D:\gate-remote".to_owned())
+        );
+        assert_eq!(
+            work_root(r"D:\gate-remote\\work\app-1a2b3c4d", PathForm::Windows),
             Some(r"D:\gate-remote".to_owned()),
             "a doubled separator"
         );
         assert_eq!(
-            work_root("D:/gate-remote//work/app-1a2b3c4d"),
+            work_root("D:/gate-remote//work/app-1a2b3c4d", PathForm::Windows),
             Some("D:/gate-remote".to_owned()),
             "forward ones"
         );
@@ -1755,7 +1876,7 @@ mod tests {
     #[test]
     fn the_trees_of_a_run_without_a_pair_are_its_work_folder() {
         assert_eq!(
-            super::trees(r"D:\gate-remote\work\app-1a2b3c4d", None),
+            super::trees(r"D:\gate-remote\work\app-1a2b3c4d", None, PathForm::Windows),
             (r"D:\gate-remote\work\app-1a2b3c4d".to_owned(), Vec::<String>::new())
         );
     }
@@ -1763,7 +1884,7 @@ mod tests {
     #[test]
     fn the_trees_of_a_pair_put_the_main_and_each_sibling_in_the_work_folder() {
         assert_eq!(
-            super::trees(r"D:\gate-remote\work\app-1a2b3c4d", Some(("app", &["tools", "lib"]))),
+            super::trees(r"D:\gate-remote\work\app-1a2b3c4d", Some(("app", &["tools", "lib"])), PathForm::Windows),
             (
                 r"D:\gate-remote\work\app-1a2b3c4d\app".to_owned(),
                 vec![
@@ -1771,6 +1892,228 @@ mod tests {
                     r"D:\gate-remote\work\app-1a2b3c4d\lib".to_owned(),
                 ]
             )
+        );
+    }
+
+    /// The payload `json` read under the Unix form.
+    fn decoded_unix(json: &serde_json::Value) -> Result<Payload, String> {
+        Payload::decode(&STANDARD.encode(json.to_string()), PathForm::Unix)
+    }
+
+    /// A work folder on a Unix box.
+    const UNIX_WORK: &str = "/Users/b/gate-remote/work/repo-0123abcd";
+
+    fn unix_path(value: &str) -> Result<String, String> {
+        decoded_unix(&json!({ "Work": value })).and_then(|payload| payload.path("Work").map(str::to_owned))
+    }
+
+    #[test]
+    fn a_unix_path_is_absolute_with_no_backslash_control_character_or_dot_name() {
+        for good in [UNIX_WORK, "/w", "/Users/b/a b/k.git"] {
+            assert_eq!(unix_path(good), Ok(good.to_owned()), "{good}");
+        }
+        assert_eq!(
+            unix_path("/Users/b/"),
+            Ok("/Users/b/".to_owned()),
+            "a trailing separator is the work folder's to refuse"
+        );
+        for bad in [
+            "w",
+            "Users/b/w",
+            "./w",
+            "-bare",
+            r"C:\w",
+            "c:/w",
+            r"/Users/b\w",
+            "/Users/../w",
+            "/Users/b/..",
+            "/Users/./w",
+            "/Users//b",
+            "//Users/b",
+            "/Users/b//",
+            "/",
+            "//",
+            "/Users/b\nx",
+            "/Users/b\u{1}",
+            "/Users/b\u{1f}",
+        ] {
+            assert_eq!(
+                unix_path(bad),
+                Err(format!("gate: box payload Work is not an absolute path: {bad:?}")),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(unix_path(""), Err("gate: box payload lacks Work".to_owned()), "an empty path is lacking");
+    }
+
+    #[test]
+    fn the_windows_form_refuses_a_slash_rooted_path() {
+        for rooted in [UNIX_WORK, "/w"] {
+            assert_eq!(
+                path(rooted),
+                Err(format!("gate: box payload Work is not an absolute path on a drive: {rooted:?}")),
+                "{rooted}"
+            );
+        }
+    }
+
+    /// The key and work folder of a Unix payload of `key` and `work`; else the line refusing them.
+    fn unix_work_folder(key: &str, work: &str) -> Result<(String, String), String> {
+        decoded_unix(&json!({ "Key": key, "Work": work }))
+            .and_then(|payload| payload.work_folder().map(|(key, work)| (key.to_owned(), work.to_owned())))
+    }
+
+    #[test]
+    fn a_unix_work_folder_ends_in_its_key_exactly() {
+        assert_eq!(
+            unix_work_folder("repo-0123abcd", UNIX_WORK),
+            Ok(("repo-0123abcd".to_owned(), UNIX_WORK.to_owned()))
+        );
+        let trailing = format!("{UNIX_WORK}/");
+        assert_eq!(
+            unix_work_folder("repo-0123abcd", &trailing),
+            Err(format!("gate: box payload Work must not end with a separator: {trailing}"))
+        );
+        for key in ["REPO-0123ABCD", "Repo-0123abcd"] {
+            assert_eq!(
+                unix_work_folder(key, UNIX_WORK),
+                Err(format!("gate: box payload Key is not a work-folder key: {key}")),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            unix_work_folder("repo-0123abcd", "/Users/b/gate-remote/work/REPO-0123ABCD"),
+            Err("gate: box payload Key is not a work-folder key: repo-0123abcd".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_unix_lock_is_the_work_folder_and_lock_byte_for_byte() {
+        let lock = |value: &str| {
+            decoded_unix(&json!({ "Lock": value })).and_then(|payload| payload.beside_work("Lock", UNIX_WORK, "lock").map(str::to_owned))
+        };
+        let good = format!("{UNIX_WORK}.lock");
+        assert_eq!(lock(&good), Ok(good.clone()));
+        let refused = Err(format!("gate: box payload Lock must be {UNIX_WORK}.lock"));
+        for bad in [
+            "/Users/b/gate-remote/work/REPO-0123abcd.lock",
+            "/users/b/gate-remote/work/repo-0123abcd.lock",
+            "/Users/b/gate-remote/work/repo-0123abcd.LOCK",
+            "/Users/b/gate-remote/work/other.lock",
+            "/Users/b/gate-remote/work/repo-0123abcd.index",
+        ] {
+            assert_eq!(lock(bad), refused, "{bad}");
+        }
+        let dotted = "/Users/b/gate-remote/work/../work/repo-0123abcd.lock";
+        assert_eq!(
+            lock(dotted),
+            Err(format!("gate: box payload Lock is not an absolute path: {dotted:?}")),
+            "a '..' name never reaches the compare"
+        );
+    }
+
+    #[test]
+    fn a_unix_output_folder_is_outputs_beside_the_work_folders_parent() {
+        let folder = |work: &str, value: &str| {
+            decoded_unix(&json!({ "OutputFolder": value })).and_then(|payload| payload.output_folder(work).map(str::to_owned))
+        };
+        assert_eq!(
+            folder(UNIX_WORK, "/Users/b/gate-remote/outputs"),
+            Ok("/Users/b/gate-remote/outputs".to_owned())
+        );
+        let refused = Err("gate: box payload OutputFolder must be /Users/b/gate-remote/outputs".to_owned());
+        for bad in [
+            "/Users/b/gate-remote/OUTPUTS",
+            "/Users/b/gate-remote/outputs/",
+            "/Users/b/gate-remote/work/outputs",
+            "/Users/b/other/outputs",
+        ] {
+            assert_eq!(folder(UNIX_WORK, bad), refused, "{bad}");
+        }
+        assert_eq!(
+            folder("/Users/b/repo-0123abcd", "/Users/outputs"),
+            Err("gate: box payload Work must be <root>/work/<key> to place OutputFolder: /Users/b/repo-0123abcd".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_unix_work_root_is_the_folder_above_work_and_none_for_the_root() {
+        assert_eq!(work_root("/x/work/k", PathForm::Unix), Some("/x".to_owned()));
+        assert_eq!(work_root(UNIX_WORK, PathForm::Unix), Some("/Users/b/gate-remote".to_owned()));
+        assert_eq!(work_root("/work/k", PathForm::Unix), None, "no root above /work");
+        assert_eq!(work_root("/x/other/k", PathForm::Unix), None, "no work folder");
+        assert_eq!(
+            work_root("/x:/work/k", PathForm::Unix),
+            Some("/x:".to_owned()),
+            "a name ending in ':' is no drive"
+        );
+    }
+
+    #[test]
+    fn a_unix_job_name_has_no_local_prefix() {
+        let key = "repo-0123abcd";
+        let job = |value: &str| decoded_unix(&json!({ "Job": value })).and_then(|payload| payload.job(key).map(str::to_owned));
+        let good = format!("gate-remote-{key}-0123456789ab");
+        assert_eq!(job(&good), Ok(good.clone()));
+        let windows = format!(r"Local\gate-remote-{key}-0123456789ab");
+        assert_eq!(
+            job(&windows),
+            Err(format!("gate: box payload Job is not this work folder's job name: {windows}"))
+        );
+        assert!(!super::is_job_name(&windows, key, PathForm::Unix));
+        assert!(super::is_job_name(&windows, key, PathForm::Windows), "the Windows form keeps its prefix");
+        assert!(
+            super::is_recorded_job_name("gate-remote-REPO-0123ABCD-0123456789ab", key, PathForm::Unix),
+            "a record written under another case of the key"
+        );
+        assert!(!super::is_recorded_job_name(&windows, key, PathForm::Unix));
+    }
+
+    #[test]
+    fn the_trees_of_a_unix_pair_are_joined_with_a_slash() {
+        assert_eq!(
+            super::trees(UNIX_WORK, Some(("app", &["tools", "lib"])), PathForm::Unix),
+            (format!("{UNIX_WORK}/app"), vec![format!("{UNIX_WORK}/tools"), format!("{UNIX_WORK}/lib")])
+        );
+        assert_eq!(
+            super::trees(UNIX_WORK, None, PathForm::Unix),
+            (UNIX_WORK.to_owned(), Vec::<String>::new())
+        );
+    }
+
+    /// Each sibling's bare repository a Unix pair payload with the bare repository `bare` and the work folder `work`
+    /// lays out; else the line refusing it.
+    fn unix_pair_bares(bare: &str, work: &str) -> Result<Option<Vec<String>>, String> {
+        let payload = decoded_unix(&json!({
+            "Key": "app-1a2b3c4d",
+            "Work": work,
+            "Bare": bare,
+            "Pair": {"Leaf": "app", "Siblings": ["lib"]},
+        }))?;
+        let pair = payload.pair()?;
+        Ok(pair.map(|pair| pair.siblings().iter().map(|sibling| sibling.bare().to_owned()).collect()))
+    }
+
+    #[test]
+    fn a_unix_pair_puts_each_bare_repository_beside_the_main_one_byte_for_byte() {
+        let work = "/g/work/app-1a2b3c4d";
+        assert_eq!(unix_pair_bares("/g/app.git", work), Ok(Some(vec!["/g/lib.git".to_owned()])));
+        for bad in ["/G/app.git", "/g/work/app.git", "/other/app.git", "/g/app"] {
+            assert_eq!(
+                unix_pair_bares(bad, work),
+                Err(format!("gate: box payload Bare must be /g/<name>.git with a Pair: {bad}")),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            unix_pair_bares("/g/app.git", "/g/app-1a2b3c4d"),
+            Err("gate: box payload Work must be <root>/work/<key> with a Pair: /g/app-1a2b3c4d".to_owned())
+        );
+        assert_eq!(super::bare_stem("/g/app.git", "/g", PathForm::Unix), Some("app"));
+        assert_eq!(
+            super::bare_stem("/g/app.git", "/G", PathForm::Unix),
+            None,
+            "the folder is compared byte for byte"
         );
     }
 }

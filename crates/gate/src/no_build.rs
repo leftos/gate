@@ -9,11 +9,10 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use gate_router::{BuildSettings, DotnetTarget, OUTPUT_PROPERTIES, PROJECT_EXTENSIONS, is_usable_host};
+use gate_router::{BuildSettings, DotnetTarget, OUTPUT_PROPERTIES, PROJECT_EXTENSIONS, escaped, is_usable_host};
 use gate_state::v1;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
 
-use crate::boxside::payload::escaped;
 use crate::remote::git;
 use crate::run::{is_within, resolved};
 

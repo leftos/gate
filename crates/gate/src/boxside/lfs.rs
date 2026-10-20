@@ -22,7 +22,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gate_args::BoxSeams;
+use gate_router::escaped;
 use gate_win32::{Descriptor, Make, Share};
+use gate_wire::{Payload, SHA256_DIGITS, grandparent, is_lower_hex};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
     READ_CONTROL,
@@ -33,12 +35,10 @@ use crate::boxside::inputs::{
     Leftover, SCRATCH_SUFFIX_DIGITS, STAGED_ACCESS, Stage, StageNamed, WorkLock, locked, made_stage_named, not_the_box_s, plain_copy,
     protected_folder, protected_security, removed_stage, same_stage, staged_files,
 };
-use crate::boxside::payload::{Payload, escaped, grandparent};
 use crate::boxside::preflight::is_folder_itself;
 use crate::boxside::run::{FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS, SHARING_VIOLATION};
 use crate::console::Console;
 use crate::outputs::archive::{Entry, PcFiles, unpack};
-use crate::outputs::hash::{SHA256_DIGITS, is_lower_hex};
 use crate::outputs::manifest::{MANIFEST_LIMIT, Manifest};
 use crate::remote::lfs::{Listed, NO_SCRATCH, Object, POINTER_MOST, Pointer, manifest_digest, parsed_pointer};
 

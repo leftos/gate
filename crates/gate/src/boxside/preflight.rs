@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use gate_args::BoxSeams;
 use gate_desktop::version::build_version;
+use gate_router::escaped;
 use gate_win32::{Make, Share};
+use gate_wire::{Pair, PairSibling, PathForm, Payload, bare_stem, work_root};
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
 };
@@ -24,7 +26,6 @@ use crate::boxside::boot;
 use crate::boxside::forward::{ChildPipes, ClientGone, DRAIN, Drained, OutputLock};
 use crate::boxside::helper_trusted;
 use crate::boxside::msys;
-use crate::boxside::payload::{Pair, PairSibling, Payload, bare_stem, escaped, work_root};
 use crate::boxside::probe;
 use crate::boxside::run::{self, FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_SINGLE};
 use crate::console::Console;
@@ -166,7 +167,7 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
 /// and [`ROOT_STATUS`] with the refusal ([`root_unsafe_line`]) for a root another account may write in, or the busy
 /// line ([`root_busy_line`]) for one another process holds open with delete access, or without sharing reading.
 fn held_work_root(work: &str, bare: &str, paired: bool, seams: &BoxSeams, console: &mut Console) -> Result<File, u32> {
-    let Some(root) = work_root(work) else {
+    let Some(root) = work_root(work, PathForm::Windows) else {
         console.err(&format!(
             r"gate: box payload Work must be <root>\work\<key> to lock its root down: {}",
             escaped(work)
@@ -175,7 +176,7 @@ fn held_work_root(work: &str, bare: &str, paired: bool, seams: &BoxSeams, consol
     };
     // A pair's bare repositories were checked against the root as its layout was read. A drive's own root is compared
     // without its separator, as the bare repository's folder is cut.
-    if !paired && bare_stem(bare, root.trim_end_matches(['\\', '/'])).is_none() {
+    if !paired && bare_stem(bare, root.trim_end_matches(['\\', '/']), PathForm::Windows).is_none() {
         console.err(&format!(
             r"gate: box payload Bare must be <root>\<name>.git to lock its root down: {}",
             escaped(bare)
@@ -273,7 +274,7 @@ fn warm_state(work: &str, layout: &io::Result<Option<String>>) -> Option<String>
         .read_to_end(&mut bytes)
         .ok()?;
     let text = String::from_utf8(bytes).ok()?;
-    crate::outputs::hash::is_lower_hex(&text, crate::outputs::hash::SHA256_DIGITS).then_some(text)
+    gate_wire::is_lower_hex(&text, gate_wire::SHA256_DIGITS).then_some(text)
 }
 
 /// The record `record` beside the work folder opened as the preflight reads one: sharing reading, writing and
@@ -456,8 +457,8 @@ fn ready_new_tree(git: &impl TreeGit, at: &TreeAt<'_>, name: Option<&str>, conso
                 // The preflight leaves the tree to the run, which removes the record under the lock or is refused.
                 console.err(&format!(
                     "gate: remote could not remove {}: {}",
-                    crate::boxside::payload::escaped(at.warm),
-                    crate::boxside::payload::escaped(&error.to_string())
+                    gate_router::escaped(at.warm),
+                    gate_router::escaped(&error.to_string())
                 ));
                 return Ok(true);
             }
@@ -1063,8 +1064,8 @@ mod tests {
     use super::{Git, TreeAt, fresh_config, fresh_config_written, git_failed, ready_tree, refused_folders, replace_config, run_forwarded, sdk_list};
     use crate::boxside::forward::{ClientGone, OutputLock};
     use crate::boxside::helper_trusted;
-    use crate::boxside::payload::Payload;
     use crate::console::Console;
+    use gate_wire::Payload;
 
     #[test]
     #[expect(clippy::expect_used, reason = "a git that cannot be named must fail the case loudly")]
@@ -1131,7 +1132,7 @@ mod tests {
     /// The payload `json` spells, as the box reads it off its own standard input.
     #[expect(clippy::expect_used, reason = "a test payload that does not decode must fail loudly")]
     fn decoded(json: &str) -> Payload {
-        Payload::decode(&base64::engine::general_purpose::STANDARD.encode(json)).expect("the test payload decodes")
+        Payload::decode(&base64::engine::general_purpose::STANDARD.encode(json), gate_wire::PathForm::Windows).expect("the test payload decodes")
     }
 
     /// All four folders of a run's own layout are refused, the folder above `Work` among them: dropping any one of

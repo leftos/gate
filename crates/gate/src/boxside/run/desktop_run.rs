@@ -12,10 +12,10 @@ use std::sync::PoisonError;
 use std::time::{Duration, Instant};
 
 use gate_args::{BoxSeams, DesktopSession};
+use gate_router::escaped;
 use gate_win32::{Account, AcquireError, ConnectState, LockState, MutexGuard, PrivateMutex, PrivateName, QueryOnlyProcess, SessionState};
 
 use crate::boxside::desktop::lines::{DesktopRefusal, Limits, abandoned_line, busy_timeout_line, busy_wait_line, capped_wait, session_verdict};
-use crate::boxside::payload::escaped;
 use crate::boxside::run::{Beat, CLOSED_STATUS, One, REFUSED_STATUS, Ran, Request, STARTING_COMMAND, before_the_job, prepared};
 use crate::console::Console;
 use crate::remote::{Refusal, refused_line};
@@ -328,8 +328,8 @@ mod tests {
 
     use super::{ConsoleRefused, Turns, Unheld, Unread, read_console, settled, waited};
     use crate::boxside::desktop::lines::DesktopRefusal;
-    use crate::boxside::payload::escaped;
     use crate::console::Console;
+    use gate_router::escaped;
 
     /// The box's own account in every case.
     fn account() -> Account {

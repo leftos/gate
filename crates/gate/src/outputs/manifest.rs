@@ -4,10 +4,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 
+use gate_router::escaped;
+use gate_wire::{SHA256_DIGITS, is_lower_hex, ordinal_upper};
 use serde_json::{Map, Value, json};
 
-use crate::boxside::payload::{escaped, ordinal_upper};
-use crate::outputs::hash::{SHA256_DIGITS, is_lower_hex};
 use crate::outputs::walk::{Found, Stamp};
 
 #[cfg(test)]

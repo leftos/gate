@@ -11,11 +11,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use gate_args::{BoxVerb, CheckRequest, CheckSeams};
-use gate_router::{Place, repo_name, work_folder_key};
+use gate_router::{Place, escaped, repo_name, work_folder_key};
 use gate_win32::PipedConsole;
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
-use crate::boxside::payload::escaped;
 use crate::check::local::{self, Declarations, Declared, SiblingsFile, WarmSources, Warmed};
 use crate::check::report::{self, At, Checked, Problem, Tool, Warmup};
 use crate::console::Console;

@@ -7,10 +7,9 @@
 //! nothing is missing or too old: a skipped item, and a warm-up line that only informs, never fails the check.
 
 use gate_router::warm::{shown_value, warming_text};
-use gate_router::{SiblingFolder, spelled};
+use gate_router::{SiblingFolder, escaped, spelled};
 
 use crate::answer::FAILED_STATUS;
-use crate::boxside::payload::escaped;
 use crate::remote::toolchain::{Pin, Pinned, Reported, Standing, ToolNeed, Version, pinned, standing};
 
 /// Where the check looked: this PC, or the builder `host`, whose work folder for the repo is `key`.

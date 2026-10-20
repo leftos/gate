@@ -27,7 +27,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use gate_args::BoxSeams;
+use gate_router::escaped;
 use gate_win32::{Descriptor, Make, Share};
+use gate_wire::{OUTPUTS_NONCE_DIGITS, Payload, SHA256_DIGITS, grandparent, is_lower_hex, ordinal_upper};
 use serde_json::{Map, Value, json};
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, READ_CONTROL,
@@ -35,13 +37,12 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::answer::USAGE_STATUS;
-use crate::boxside::payload::{OUTPUTS_NONCE_DIGITS, Payload, escaped, grandparent, ordinal_upper};
 use crate::boxside::preflight::{self, is_folder_itself};
 use crate::boxside::run::{self, FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS, SHARING_VIOLATION};
 use crate::boxside::tools;
 use crate::console::Console;
 use crate::outputs::archive::{Entry, PcFiles, unpack};
-use crate::outputs::hash::{SHA256_DIGITS, is_lower_hex, sha256_of};
+use crate::outputs::hash::sha256_of;
 use crate::outputs::manifest::{Held, MANIFEST_LIMIT, Manifest};
 use crate::outputs::names::{is_git_s, is_lfs_config, is_plain_path};
 use crate::remote::{Refusal, busy_line, refused_line as tagged_line};
@@ -1644,11 +1645,11 @@ mod tests {
         Asked, Beneath, Book, Copy, Leftover, Record, STAGES_ACCESS, Stage, Stamp, Step, Unadopted, adopted, adopted_again, leftovers_removed,
         made_stage, moved_in, not_the_box_s, protected_folder, removed_stage, same_stage, stages_name, swept,
     };
-    use crate::boxside::payload::ordinal_upper;
     use crate::boxside::preflight::written_beneath;
     use crate::console::Console;
     use crate::outputs::manifest::Manifest;
     use crate::test_support::junction;
+    use gate_wire::ordinal_upper;
 
     /// A new, empty folder of the test `name`'s own.
     fn folder(name: &str) -> PathBuf {

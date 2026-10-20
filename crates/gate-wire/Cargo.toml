@@ -1,0 +1,17 @@
+[package]
+name = "gate-wire"
+version.workspace = true
+edition = "2024"
+publish = false
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = "0.23.1"
+gate-args = { path = "../gate-args" }
+gate-router = { path = "../gate-router" }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }

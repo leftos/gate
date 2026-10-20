@@ -19,20 +19,18 @@ use std::path::{Path, PathBuf};
 use std::thread::{self, Scope, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
+use gate_router::escaped;
 use gate_win32::{Hive, PipedConsole, Subkey};
+use gate_wire::{MAX_PART_DIGITS, is_canonical_version, is_drive_path};
 use serde_json::Value;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
 
-use crate::boxside::payload::{escaped, is_canonical_version, is_drive_path};
 use crate::environment::Variables;
 use crate::remote::git::{self, GitError, ProgramCall, ProgramOutput, ProgramPlace};
 use crate::run::{is_within, resolved};
 
 /// How long a batch of probes may take together, unless a test seam says otherwise.
 pub(crate) const PROBE_LIMIT: Duration = Duration::from_secs(10);
-
-/// The most digits a part of a version may have: a longer one is no version the client could compare.
-pub(crate) const MAX_PART_DIGITS: usize = 10;
 
 /// The console program of a Godot install.
 pub(crate) const GODOT: &str = "Godot_console.exe";
@@ -633,7 +631,7 @@ fn read_godot(output: &ProgramOutput) -> Probed {
 /// taken, and two are given a `.0`, which Godot leaves out of a zero patch (`4.3.stable.mono.official.77dcf97d8` is
 /// `4.3.0`). `None` for any other shape, an output with no line among them.
 ///
-/// [`is_canonical_version`]: crate::boxside::payload::is_canonical_version
+/// [`is_canonical_version`]: gate_wire::is_canonical_version
 fn godot_version(stdout: &str) -> Option<String> {
     let line = stdout.lines().next().unwrap_or("").trim();
     let canonical = |run: &&str| match run.trim_start_matches('0') {

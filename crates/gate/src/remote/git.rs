@@ -20,10 +20,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use gate_args::{TestSeams, command_line, is_batch_target};
+use gate_router::escaped;
 use gate_win32::{Interrupt, Job, PipedConsole, PipedLaunch, Running};
 
 use super::launch::{DRAIN, KILL_WAIT, KILLED, call_job, launched, piped_launch};
-use crate::boxside::payload::escaped;
 use crate::environment::Variables;
 use crate::run::{CONTROL_C_EXIT, ERROR_FILE_NOT_FOUND, Written, find_program, is_within, resolved, written};
 
@@ -901,9 +901,9 @@ mod tests {
         Call, ERRORS_KEPT, FAILURE_BYTES, GIT_LIMIT, Git, GitError, NO_CURRENT_FOLDER, OUTPUT_CAP, ProgramCall, ProgramPlace, capped, failed_line,
         failure_text, is_indexed_config, late_git_line, program_output, sdk_listing, tail, without_verbatim,
     };
-    use crate::boxside::payload::escaped;
     use crate::environment::Variables;
     use crate::remote::snapshot::repository;
+    use gate_router::escaped;
 
     /// How long a case waits for what a passing run always sees: only a broken product reaches it.
     const HANG_GUARD: Duration = Duration::from_secs(600);

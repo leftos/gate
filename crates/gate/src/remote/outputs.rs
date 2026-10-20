@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use gate_router::escaped;
 use gate_state::v1;
+use gate_wire::{PathForm, archive_file_name, trees};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo, GetFileInformationByHandle, SetFileInformationByHandle,
@@ -29,7 +31,6 @@ use super::payload::Location;
 use super::syncback::Synced;
 use super::watchdog::Cut;
 use super::{RemoteCall, Sibling};
-use crate::boxside::payload::{archive_file_name, escaped, trees};
 use crate::outputs::archive::final_path;
 use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
@@ -416,7 +417,7 @@ fn box_trees<'a>(location: &Location, call: &RemoteCall<'a>) -> (String, Vec<(St
 pub(super) fn trees_of<'a>(work: &str, leaf: &str, main_root: &'a str, siblings: &[(&str, &'a str)]) -> ((String, &'a str), Vec<(String, &'a str)>) {
     let names: Vec<&str> = siblings.iter().map(|(name, _)| *name).collect();
     let pair = (!names.is_empty()).then_some((leaf, names.as_slice()));
-    let (main, trees) = trees(work, pair);
+    let (main, trees) = trees(work, pair, PathForm::Windows);
     ((main, main_root), trees.into_iter().zip(siblings.iter().map(|(_, root)| *root)).collect())
 }
 

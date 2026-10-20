@@ -9,9 +9,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use gate_win32::{Job, NamedEvent, OpenedJob};
+use gate_wire::Payload;
 
 use crate::answer::USAGE_STATUS;
-use crate::boxside::payload::Payload;
 use crate::console::Console;
 
 /// The exit code the job's processes are ended with.

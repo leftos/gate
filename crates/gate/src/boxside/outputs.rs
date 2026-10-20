@@ -13,10 +13,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use gate_args::BoxSeams;
+use gate_router::escaped;
+use gate_wire::{Payload, archive_file_name, archive_key};
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
-use crate::boxside::payload::{Payload, archive_file_name, archive_key, escaped};
 use crate::boxside::run::FILE_FLAG_OPEN_REPARSE_POINT;
 use crate::console::Console;
 use crate::outputs::archive::pack;

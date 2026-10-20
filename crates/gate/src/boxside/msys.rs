@@ -26,12 +26,12 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use gate_router::escaped;
 use gate_win32::{Job, PipedConsole, PipedFed, PipedLaunch, RestrictedToken, Running, TRUSTED_OWNERS};
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
 use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
 
-use crate::boxside::payload::escaped;
 use crate::boxside::preflight::Git;
 use crate::environment::Variables;
 use crate::run::{Written, is_within, resolved, written};

@@ -198,6 +198,7 @@ dependencies = [
  "gate-state",
  "gate-watchdog",
  "gate-win32",
+ "gate-wire",
  "jiff",
  "object",
  "proc-table",
@@ -270,6 +271,16 @@ dependencies = [
  "thiserror",
  "windows",
  "windows-sys",
+]
+
+[[package]]
+name = "gate-wire"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "gate-args",
+ "gate-router",
+ "serde_json",
 ]
 
 [[package]]

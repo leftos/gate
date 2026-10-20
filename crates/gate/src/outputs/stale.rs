@@ -6,9 +6,9 @@
 use std::collections::BTreeSet;
 use std::io;
 
+use gate_router::escaped;
 use regex::Regex;
 
-use crate::boxside::payload::escaped;
 use crate::outputs::glob::{Globs, regex_upto};
 
 /// The folders a passing routed build left stale: each folder a glob of `judging` stops at over a file `walk` lists that

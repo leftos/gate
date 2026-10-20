@@ -55,14 +55,6 @@ pub(crate) fn file_sha256(path: &Path) -> io::Result<String> {
     sha256_of(file).map(|(sha256, _)| sha256).map_err(|error| in_context(path, &error))
 }
 
-/// The hex digits of a SHA-256 as this module writes it.
-pub(crate) const SHA256_DIGITS: usize = 64;
-
-/// Whether `text` is exactly `digits` lower-case hex digits, with nothing before or after them.
-pub(crate) fn is_lower_hex(text: &str, digits: usize) -> bool {
-    text.len() == digits && text.bytes().all(|byte| HEX.contains(&byte))
-}
-
 fn hex(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -79,7 +71,9 @@ mod tests {
 
     use sha2::{Digest, Sha256};
 
-    use super::{SHA256_DIGITS, file_sha256, hex, is_lower_hex, sha256_of};
+    use gate_wire::{SHA256_DIGITS, is_lower_hex};
+
+    use super::{file_sha256, hex, sha256_of};
 
     fn is_sha256(text: &str) -> bool {
         is_lower_hex(text, SHA256_DIGITS)

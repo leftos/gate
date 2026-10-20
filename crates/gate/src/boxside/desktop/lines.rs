@@ -7,10 +7,10 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use gate_desktop::HelperExit;
+use gate_router::escaped;
 use gate_win32::{ConnectState, EndReport, LockState, SessionState, StartedTask, TaskError};
 
 use crate::boxside::desktop::verify::{Unproved, WrongFact};
-use crate::boxside::payload::escaped;
 
 /// The box's line refusing a run it cannot hand to the builder's desktop: the box's own prefix, then why.
 const NO_DESKTOP: &str = "gate: not routed: the builder has no desktop session: ";
@@ -315,7 +315,7 @@ mod tests {
         CONNECT_LIMIT, DesktopRefusal, END_LIMIT, Limits, MESSAGE_LIMIT, TaskVerdict, WAIT_STEP, abandoned_line, busy_timeout_line, busy_wait_line,
         capped_wait, could_not_end_line, end_report, session_verdict, task_verdict,
     };
-    use crate::boxside::payload::escaped;
+    use gate_router::escaped;
 
     /// The box's own user in every session case.
     const BOX_USER: &str = "lefto";
