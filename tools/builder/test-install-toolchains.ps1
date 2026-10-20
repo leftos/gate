@@ -265,6 +265,43 @@ function Resolve-BlockExpression {
     return [pscustomobject]@{ Texts = $texts; Variables = $variables }
 }
 
+# Runs the Visual C++ Redistributable step's block against stubs in a scratch download folder: Get-VCRedistVersion
+# answers $Versions in turn, Invoke-Installer throws "<file> exited <InstallerExit>" when that is not 0, Get-File records
+# the URL without writing the file, and Write-InstallLog records. -Cached puts a stale vc_redist.x64.exe in the folder
+# first. Returns what the stubs saw, the block's thrown message, and whether that file survived.
+function Invoke-VCRedistStep {
+    param([Parameter(Mandatory)][version[]]$Versions, [int]$InstallerExit = 0, [switch]$Cached)
+    $block = Get-StepBlock 'Visual C++ Redistributable 14.51'
+    if (-not $block) { throw 'install-toolchains.ps1 has no Visual C++ Redistributable step' }
+    $dir = Join-Path $root "vc-redist-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    if ($Cached) { Set-Content -LiteralPath (Join-Path $dir 'vc_redist.x64.exe') -Value 'stale download' }
+    $pending = [System.Collections.Generic.Queue[object]]::new()
+    foreach ($version in $Versions) { $pending.Enqueue($version) }
+    $log = [System.Collections.Generic.List[string]]::new()
+    $downloads = [System.Collections.Generic.List[string]]::new()
+    $installs = [System.Collections.Generic.List[object]]::new()
+    function Write-InstallLog([string]$Message) { [void]$log.Add($Message) }
+    function Get-VCRedistVersion { if ($pending.Count) { $pending.Dequeue() } else { $null } }
+    function Get-File([string]$Url) { [void]$downloads.Add($Url); return (Join-Path $dir 'vc_redist.x64.exe') }
+    function Invoke-Installer([string]$File, [string[]]$Arguments) {
+        [void]$installs.Add([pscustomobject]@{ File = $File; Arguments = $Arguments })
+        if ($InstallerExit) { throw "$File exited $InstallerExit" }
+    }
+    $dl = $dir
+    $vcRedistFloor = [version]'14.51.36247'
+    $errorMessage = $null
+    try { $null = & ($block.ScriptBlock.GetScriptBlock()) }
+    catch { $errorMessage = $_.Exception.Message }
+    return [pscustomobject]@{
+        Log        = @($log)
+        Downloads  = @($downloads)
+        Installs   = @($installs)
+        Error      = $errorMessage
+        CachedLeft = (Test-Path -LiteralPath (Join-Path $dir 'vc_redist.x64.exe'))
+    }
+}
+
 New-Item -ItemType Directory -Force $root | Out-Null
 $sourceText =Get-Content -LiteralPath $sourceScript -Raw
 $sourceAst = [System.Management.Automation.Language.Parser]::ParseInput($sourceText, [ref]$null, [ref]$null)
@@ -687,6 +724,113 @@ try {
             $text = (Resolve-BlockExpression -Block $block -Expression $write).Texts -join ' '
             if ($text -match '\.ps1\b') { return "the step writes a script file: $($write.Extent.Text)" }
         }
+        return ''
+    }
+
+    Test-Case 'ConvertTo-VCRedistVersion parses the registry version text and refuses the rest' {
+        . ([scriptblock]::Create((Get-InstallerFunctionText 'Get-VCRedistVersion', 'ConvertTo-VCRedistVersion')))
+        $cases = @(
+            @{ Text = 'v14.51.36247.00'; Want = [version]'14.51.36247.0' }
+            @{ Text = 'v14.44.35211.00'; Want = [version]'14.44.35211.0' }
+            @{ Text = ''; Want = $null }
+            @{ Text = 'garbage'; Want = $null }
+        )
+        foreach ($case in $cases) {
+            $got = ConvertTo-VCRedistVersion $case.Text
+            if ($null -eq $case.Want) {
+                if ($null -ne $got) { return "'$($case.Text)' gave '$got', expected null" }
+            }
+            elseif ($got -ne $case.Want) { return "'$($case.Text)' gave '$got', expected $($case.Want)" }
+        }
+        return ''
+    }
+
+    Test-Case 'the Visual C++ redistributable step comes directly before the Visual Studio Build Tools step' {
+        $names = @(Get-StepName $sourceScript)
+        $index = $names.IndexOf('Visual C++ Redistributable 14.51')
+        if ($index -lt 0) { return "the step is missing from: $($names -join ', ')" }
+        $next = if ($index + 1 -lt $names.Count) { $names[$index + 1] } else { '' }
+        if ($next -ne 'Visual Studio Build Tools 2022 (C++)') {
+            return "the step after it is '$next', expected 'Visual Studio Build Tools 2022 (C++)'"
+        }
+        return ''
+    }
+
+    Test-Case 'the Visual C++ redistributable step downloads Microsoft''s link and installs it quietly' {
+        $block = Get-StepBlock 'Visual C++ Redistributable 14.51'
+        if (-not $block) { return 'install-toolchains.ps1 has no Visual C++ Redistributable step' }
+        $fetches = Get-BlockCommand $block 'Get-File'
+        if ($fetches.Count -ne 1) { return "the step has $($fetches.Count) Get-File calls, expected 1" }
+        $url = (Resolve-BlockExpression -Block $block -Expression $fetches[0].CommandElements[1]).Texts -join ' '
+        if ($url -notmatch 'https://aka\.ms/vc14/vc_redist\.x64\.exe') { return "the step fetches '$url'" }
+        $installs = Get-BlockCommand $block 'Invoke-Installer'
+        if ($installs.Count -ne 1) { return "the step has $($installs.Count) Invoke-Installer calls, expected 1" }
+        $arguments = Get-ParameterArgument $installs[0] 'Arguments'
+        if (-not $arguments) {
+            $arrays = @($installs[0].CommandElements | Select-Object -Skip 1 |
+                Where-Object { $_ -is [System.Management.Automation.Language.ArrayExpressionAst] })
+            if ($arrays.Count -ne 1) { return "the Invoke-Installer call gives no argument array: $($installs[0].Extent.Text)" }
+            $arguments = $arrays[0]
+        }
+        $text = (Resolve-BlockExpression -Block $block -Expression $arguments).Texts -join ' '
+        foreach ($wanted in '/install', '/quiet', '/norestart') {
+            if (-not $text.Contains("'$wanted'")) { return "the Invoke-Installer arguments do not name '$wanted': $text" }
+        }
+        return ''
+    }
+
+    Test-Case 'the Visual C++ redistributable floor is 14.51.36247 and the step compares against it' {
+        $pin = $sourceAst.Find({
+                param($node)
+                $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                $node.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                $node.Right.Extent.Text -match "^\[version\]'14\.51\.36247'$"
+            }, $true)
+        if (-not $pin) { return 'install-toolchains.ps1 pins no [version]''14.51.36247'' value' }
+        $block = Get-StepBlock 'Visual C++ Redistributable 14.51'
+        if (-not $block) { return 'install-toolchains.ps1 has no Visual C++ Redistributable step' }
+        $reads = @($block.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                    $node.VariablePath.UserPath -eq 'vcRedistFloor'
+                }, $true))
+        if (-not $reads.Count) { return 'the step block does not read $vcRedistFloor' }
+        return ''
+    }
+
+    Test-Case 'the Visual C++ redistributable step skips the download and the installer at the floor' {
+        $r = Invoke-VCRedistStep -Versions 14.51.36247
+        if ($r.Downloads.Count) { return "the step downloaded $($r.Downloads -join ', ') at the floor" }
+        if ($r.Installs.Count) { return "the step ran the installer at the floor" }
+        if ($r.Error) { return "the step threw: $($r.Error)" }
+        if ($r.Log -notcontains 'Visual C++ redistributable 14.51.36247 found; install skipped') {
+            return "the step logged: $($r.Log -join ' | ')"
+        }
+        return ''
+    }
+
+    Test-Case 'the Visual C++ redistributable step accepts the installer''s 1638 for a newer one' {
+        $r = Invoke-VCRedistStep -Versions 14.44.35211, 14.51.36247 -InstallerExit 1638 -Cached
+        if ($r.Error) { return "the step threw: $($r.Error)" }
+        if ($r.Installs.Count -ne 1) { return "the step ran the installer $($r.Installs.Count) times, expected 1" }
+        if ($r.Log -notcontains 'Visual C++ redistributable: the installer reports a newer one already installed') {
+            return "the step logged: $($r.Log -join ' | ')"
+        }
+        if ($r.CachedLeft) { return 'the step left the cached vc_redist.x64.exe in the download folder' }
+        return ''
+    }
+
+    Test-Case 'the Visual C++ redistributable step re-throws an installer exit other than 1638' {
+        $r = Invoke-VCRedistStep -Versions 14.44.35211 -InstallerExit 1603
+        if (-not $r.Error) { return 'the step swallowed the installer''s exit 1603' }
+        if ($r.Error -notmatch 'exited 1603$') { return "the step threw: $($r.Error)" }
+        return ''
+    }
+
+    Test-Case 'the Visual C++ redistributable step throws when the version after the install is below the floor' {
+        $r = Invoke-VCRedistStep -Versions 14.44.35211, 14.44.35211
+        if (-not $r.Error) { return 'the step passed with 14.44.35211 installed after the install' }
+        if ($r.Error -notmatch 'need 14\.51\.36247 or later') { return "the step threw: $($r.Error)" }
         return ''
     }
 }

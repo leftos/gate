@@ -149,6 +149,25 @@ function Get-VCToolsInstanceProperty([string]$Property) {
     return $lines | Where-Object { $_ } | Select-Object -First 1
 }
 
+# Parses the Runtimes key's Version text, which reads v14.51.36247.00 there, and returns $null for anything else.
+function ConvertTo-VCRedistVersion([string]$Text) {
+    if (-not $Text) { return $null }
+    $clean = $Text.Trim()
+    if ($clean.StartsWith('v') -or $clean.StartsWith('V')) { $clean = $clean.Substring(1) }
+    $parsed = $null
+    if (-not [version]::TryParse($clean, [ref]$parsed)) { return $null }
+    return $parsed
+}
+
+# The installed Visual C++ x64 redistributable's version, or $null when the Runtimes key or its version value is absent.
+function Get-VCRedistVersion {
+    $key = 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\X64'
+    if (-not (Test-Path -LiteralPath $key)) { return $null }
+    $item = Get-ItemProperty -LiteralPath $key -Name 'Version' -ErrorAction SilentlyContinue
+    if (-not $item -or -not $item.PSObject.Properties['Version']) { return $null }
+    return ConvertTo-VCRedistVersion $item.Version
+}
+
 function Sync-SessionPath {
     $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
 }
@@ -244,6 +263,31 @@ Invoke-Step 'Python 3.14.7' {
     Invoke-Installer $f @('/quiet', 'InstallAllUsers=1', 'PrependPath=1', 'Include_test=0')
     $dir = Join-Path $env:ProgramFiles 'Python314'
     Copy-Item -Path (Join-Path $dir 'python.exe') -Destination (Join-Path $dir 'python3.exe') -Force
+}
+# An Unreal 5.8 cook refused the builder's redistributable 14.44.35211 as outdated, and Build Tools installs whatever its
+# release carries. Microsoft's aka.ms/vc14 link always serves the latest supported 14.x x64 redistributable. A cached download of
+# the same name could be older, so it goes before the fetch. Exit 1638 means a newer one is already installed, which
+# satisfies the floor.
+$vcRedistFloor = [version]'14.51.36247'
+Invoke-Step 'Visual C++ Redistributable 14.51' {
+    $have = Get-VCRedistVersion
+    if ($null -ne $have -and $have -ge $vcRedistFloor) {
+        Write-InstallLog "Visual C++ redistributable $have found; install skipped"
+        return
+    }
+    $cached = Join-Path $dl 'vc_redist.x64.exe'
+    if (Test-Path -LiteralPath $cached) { Remove-Item -LiteralPath $cached -Force }
+    $f = Get-File 'https://aka.ms/vc14/vc_redist.x64.exe'
+    try { Invoke-Installer $f @('/install', '/quiet', '/norestart') }
+    catch {
+        if ($_.Exception.Message -notmatch 'exited 1638$') { throw }
+        Write-InstallLog 'Visual C++ redistributable: the installer reports a newer one already installed'
+    }
+    $after = Get-VCRedistVersion
+    if ($null -eq $after -or $after -lt $vcRedistFloor) {
+        $shown = if ($null -eq $after) { 'missing' } else { $after }
+        throw "Visual C++ redistributable is $shown after the install; need $vcRedistFloor or later"
+    }
 }
 Invoke-Step 'Visual Studio Build Tools 2022 (C++)' {
     $installed = Get-VCToolsInstanceProperty 'installationPath'
