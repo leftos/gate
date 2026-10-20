@@ -68,28 +68,71 @@ pub(super) fn record_path(work: &str) -> String {
     format!("{work}.inputs")
 }
 
+/// The record of the PC's build of one project sent to the work folder `work`: `{work}.sent-build`.
+pub(super) fn sent_record_path(work: &str) -> String {
+    format!("{work}.sent-build")
+}
+
+/// Which of the work folder's two records a request installs into or a run checks: the repo's inputs, `{Work}.inputs`,
+/// or the PC's build of one project, `{Work}.sent-build`. Each has its own digest; both share the exclude file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Book {
+    Inputs,
+    SentBuild,
+}
+
+impl Book {
+    /// The record's path beside the work folder `work`.
+    pub(super) fn path(self, work: &str) -> String {
+        match self {
+            Book::Inputs => record_path(work),
+            Book::SentBuild => sent_record_path(work),
+        }
+    }
+
+    /// The other record, whose paths the exclude file keeps too.
+    fn other(self) -> Book {
+        match self {
+            Book::Inputs => Book::SentBuild,
+            Book::SentBuild => Book::Inputs,
+        }
+    }
+
+    /// Whether this record takes the `/`-separated `path` as the builder's own restore file ([`is_restore_file`]):
+    /// only the sent build's does; the repo's inputs install and replace one as any other input.
+    fn restores(self, path: &str) -> bool {
+        self == Book::SentBuild && is_restore_file(path)
+    }
+}
+
 /// The tag a run whose `InputsDigest` the work folder's inputs record does not hold is refused with.
 pub(super) fn refused_line(nonce: &str) -> String {
     format!("gate-remote-refused: {nonce} inputs")
 }
 
-/// Why the work folder `work`, held as `held`, does not hold the inputs of the manifest whose digest is `sent`: no
-/// inputs record, one that cannot be read or of another digest, a recorded copy gone or not the one installed (its
-/// size, last write or file id differs), or a tree whose exclude file cannot be written from the record; `Ok` when it
-/// holds them, the exclude file written, with the line saying where a folder at the exclude file's name was moved
-/// aside, when one was ([`preflight::moved_aside_line`]), for the caller to say.
-pub(super) fn unmatched(work: &str, held: &File, sent: &str) -> Result<Option<String>, String> {
-    let record = matching_record(work, sent)?;
+/// Why the work folder `work`, held as `held`, does not hold the files of the manifest whose digest is `sent`, as the
+/// record `book` says: no record, one that cannot be read or of another digest, a recorded copy gone or not the one
+/// installed (its size, last write or file id differs), or a tree whose exclude file cannot be written from both
+/// records; `Ok` when it holds them, the exclude file written, with the line saying where a folder at the exclude
+/// file's name was moved aside, when one was ([`preflight::moved_aside_line`]), for the caller to say.
+pub(super) fn unmatched(book: Book, work: &str, held: &File, sent: &str) -> Result<Option<String>, String> {
+    let record = matching_record(&book.path(work), sent)?;
     if let Some(why) = changed_copy(held, &record) {
         return Err(why);
     }
-    write_exclude(held, work, &record)
+    write_exclude(held, work, [&record, &other_record(work, book)])
 }
 
-/// The work folder `work`'s inputs record when it holds the digest `sent`; else why not.
-fn matching_record(work: &str, sent: &str) -> Result<Record, String> {
-    let path = record_path(work);
-    match tools::read_record(&path) {
+/// The work folder's record other than `book`'s, for the exclude file both share; empty when it is missing or cannot
+/// be read as a record, as no run then trusts a copy it would name.
+fn other_record(work: &str, book: Book) -> Record {
+    let text = tools::read_record(&book.other().path(work)).ok().flatten();
+    text.and_then(|text| Record::parse(&text).ok()).unwrap_or_default()
+}
+
+/// The record at `path` when it holds the digest `sent`; else why not.
+fn matching_record(path: &str, sent: &str) -> Result<Record, String> {
+    match tools::read_record(path) {
         Ok(None) => Err(format!("{path} does not exist")),
         Ok(Some(text)) => match Record::parse(&text) {
             Ok(record) if record.digest == sent => Ok(record),
@@ -129,6 +172,68 @@ impl Step {
     }
 }
 
+/// The project whose build a request sends, from its `SentBin`, `{project}/bin/{configuration}` below the work folder:
+/// the `/`-ended prefix of that bin folder and the one of the project's `obj` folder.
+struct SentBin {
+    bin: String,
+    obj: String,
+}
+
+impl SentBin {
+    /// The project `payload`'s `SentBin` names, `None` for a request of the repo's inputs; else the usage line.
+    fn read(payload: &Payload) -> Result<Option<SentBin>, String> {
+        if !payload.sets("SentBin") {
+            return Ok(None);
+        }
+        let text = payload.text("SentBin")?;
+        let bad = || {
+            format!(
+                "gate: box payload SentBin is not a plain <project>/bin/<configuration> path: {}",
+                escaped(text)
+            )
+        };
+        if !is_plain_path(text) || is_git_s(text) {
+            return Err(bad());
+        }
+        let mut parts = text.rsplitn(3, '/');
+        let (Some(configuration), Some(bin)) = (parts.next(), parts.next()) else {
+            return Err(bad());
+        };
+        if configuration.is_empty() || !bin.eq_ignore_ascii_case("bin") {
+            return Err(bad());
+        }
+        let obj = parts.next().map_or_else(|| "obj/".to_owned(), |project| format!("{project}/obj/"));
+        Ok(Some(SentBin {
+            bin: format!("{text}/"),
+            obj,
+        }))
+    }
+
+    /// Whether a send takes the manifest's `path`: a file below the bin folder, or a restore file
+    /// ([`is_restore_file`]) of the project's `obj` folder itself.
+    fn takes(&self, path: &str) -> bool {
+        if starts_without_case(path, &self.bin) {
+            return true;
+        }
+        starts_without_case(path, &self.obj) && !path[self.obj.len()..].contains('/') && is_restore_file(path)
+    }
+}
+
+/// Whether `path` starts with `prefix`, without regard to ASCII case.
+fn starts_without_case(path: &str, prefix: &str) -> bool {
+    path.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+/// Whether the `/`-separated `path` is a restore file: one of an `obj` folder whose name ends `.nuget.g.props` or
+/// `.nuget.g.targets`. The builder's own restore writes them, so for a send ([`Book::restores`]) a box copy is never
+/// replaced nor deleted, and one there counts as the PC's.
+fn is_restore_file(path: &str) -> bool {
+    let (folder, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let folder = folder.rsplit('/').next().unwrap_or(folder);
+    let name = name.to_ascii_lowercase();
+    folder.eq_ignore_ascii_case("obj") && (name.ends_with(".nuget.g.props") || name.ends_with(".nuget.g.targets"))
+}
+
 /// What an inputs request reads of its payload.
 struct Asked<'a> {
     key: &'a str,
@@ -139,6 +244,8 @@ struct Asked<'a> {
     step: Step,
     /// The box's root, `{root}\work\{key}` being the work folder, which the stages folder sits in.
     root: &'a str,
+    /// The project whose build the request sends, `None` for the repo's inputs.
+    bin: Option<SentBin>,
 }
 
 impl Asked<'_> {
@@ -158,6 +265,7 @@ impl Asked<'_> {
         };
         let root =
             grandparent(work).ok_or_else(|| format!(r"gate: box payload Work must be <root>\work\<key> to stage inputs: {}", escaped(work)))?;
+        let bin = SentBin::read(payload)?;
         Ok(Asked {
             key,
             work,
@@ -166,7 +274,30 @@ impl Asked<'_> {
             nonce,
             step,
             root,
+            bin,
         })
+    }
+
+    /// The record the request installs into.
+    fn book(&self) -> Book {
+        if self.bin.is_some() { Book::SentBuild } else { Book::Inputs }
+    }
+
+    /// Why a send does not take `manifest`: a path it does not take ([`SentBin::takes`]), or no file below the bin
+    /// folder at all, as a send of none would only delete the folder's files; `None` for the repo's inputs or a
+    /// manifest it takes.
+    fn out_of_scope(&self, manifest: &Manifest) -> Option<String> {
+        let bin = self.bin.as_ref()?;
+        if let Some((path, _)) = manifest.files().find(|(path, _)| !bin.takes(path)) {
+            return Some(format!(
+                "the sent build's manifest names '{}', which is neither below {} nor a restore file of {}",
+                escaped(path),
+                bin.bin,
+                bin.obj
+            ));
+        }
+        let builds = manifest.files().any(|(path, _)| starts_without_case(path, &bin.bin));
+        (!builds).then(|| format!("the sent build's manifest names no file below {}", bin.bin))
     }
 
     /// The line saying the step failed for `why`.
@@ -251,6 +382,9 @@ pub(super) fn inputs(payload: &Payload, seams: &BoxSeams, console: &mut Console)
         Ok(sent) => sent,
         Err(why) => return failed(&asked, &why, console),
     };
+    if let Some(why) = asked.out_of_scope(&sent.manifest) {
+        return failed(&asked, &why, console);
+    }
     match asked.step {
         Step::Diff => match locked(&asked.work_lock(), console, |work, console| diff(&asked, &sent, work, console)) {
             Ok(Ok(())) => 0,
@@ -390,17 +524,15 @@ fn recorded_copy(path: &str, file: &Value) -> Option<Copy> {
 /// The work folder's inputs record. One that is not a record is taken as empty, and one that cannot be read (a link,
 /// a folder, a file of more than one name) is removed as itself, never followed, and taken as empty, each said; else
 /// why such a record could not be removed.
-fn recorded(work: &str, console: &mut Console) -> Result<Record, String> {
-    let path = record_path(work);
-    match tools::read_record(&path) {
+fn recorded(path: &str, console: &mut Console) -> Result<Record, String> {
+    match tools::read_record(path) {
         Ok(None) => Ok(Record::default()),
         Ok(Some(text)) => Ok(Record::parse(&text).unwrap_or_else(|why| {
             console.err(&format!("gate: remote inputs record {path} {why}; every copy is hashed"));
             Record::default()
         })),
         Err(error) => {
-            preflight::remove_entry(Path::new(&path))
-                .map_err(|removal| format!("cannot remove {path}, which cannot be read ({error}): {removal}"))?;
+            preflight::remove_entry(Path::new(path)).map_err(|removal| format!("cannot remove {path}, which cannot be read ({error}): {removal}"))?;
             console.err(&format!(
                 "gate: remote removed the inputs record {path}, which cannot be read: {}; every copy is hashed",
                 escaped(&error.to_string())
@@ -410,10 +542,9 @@ fn recorded(work: &str, console: &mut Console) -> Result<Record, String> {
     }
 }
 
-/// Writes `record` as the work folder `work`'s inputs record; else why not.
-fn write_record(work: &str, record: &Record) -> Result<(), String> {
-    let path = record_path(work);
-    tools::write_record_file(&path, &record.text()).map_err(|error| format!("cannot write {path}: {error}"))
+/// Writes `record` as the record at `path`; else why not.
+fn write_record(path: &str, record: &Record) -> Result<(), String> {
+    tools::write_record_file(path, &record.text()).map_err(|error| format!("cannot write {path}: {error}"))
 }
 
 /// The stamp of the open file `file`.
@@ -505,8 +636,16 @@ fn opened_copy(work: &File, path: &str, access: u32, share: Share) -> io::Result
 /// manifest's `held` says: the record's own entry for a copy whose stamp it holds, trusted without hashing, else the
 /// copy's hash and stamp read now. `None` for a copy missing, that is no plain file, that cannot be read, or that holds
 /// anything else.
-fn matched_copy(work: &File, path: &str, held: &Held, record: &Record) -> Option<Copy> {
+fn matched_copy(book: Book, work: &File, path: &str, held: &Held, record: &Record) -> Option<Copy> {
     let (file, stamp) = opened_copy(work, path, FILE_GENERIC_READ, Share::All).ok().flatten()?;
+    if book.restores(path) {
+        // The builder's own restore file stands for the PC's, whatever it holds.
+        return Some(Copy {
+            path: path.to_owned(),
+            sha256: held.sha256.clone(),
+            stamp,
+        });
+    }
     if stamp.size != held.stamp.size {
         return None;
     }
@@ -527,23 +666,38 @@ fn matched_copy(work: &File, path: &str, held: &Held, record: &Record) -> Option
 /// The diff: `gate-remote-inputs: need <n>`, then `gate-remote-inputs: path <path>` for each file of the manifest the
 /// work folder `work` lacks or holds otherwise, in the manifest's order, each path escaped. One that needs nothing first
 /// finishes the install as a put of nothing would ([`swept`], [`finished`]), from the copies this diff matched, each
-/// untrusted one hashed once. Else why not.
+/// untrusted one hashed once. For a send, a restore file on the box ([`Book::restores`]) whose pair in its folder is
+/// not there fails the diff, and so does a needed path a put could not install to ([`free_target`]). Else why not.
 fn diff(asked: &Asked<'_>, sent: &Sent, work: &File, console: &mut Console) -> Result<(), String> {
-    let record = recorded(asked.work, console)?;
+    let book = asked.book().path(asked.work);
+    let record = recorded(&book, console)?;
     let mut now = Record::default();
     let mut needed = Vec::new();
     for (path, held) in sent.manifest.files() {
-        match matched_copy(work, path, held, &record) {
+        match matched_copy(asked.book(), work, path, held, &record) {
             Some(copy) => {
                 now.files.insert(ordinal_upper(path), copy);
             }
             None => needed.push(path),
         }
     }
+    // A send fails on a path the repo's inputs hold, on unpaired restore files, or on a box file it could not replace,
+    // before anything is uploaded.
+    if asked.bin.is_some() {
+        if let Some(why) = held_by_inputs(asked.work, &sent.manifest) {
+            return Err(why);
+        }
+        if let Some(why) = unpaired(&now, &needed) {
+            return Err(why);
+        }
+        for path in &needed {
+            free_target(asked.book(), work, path, &record, &sent.manifest)?;
+        }
+    }
     if needed.is_empty() {
-        unsealed(asked.work, &record)?;
-        now.kept = swept(work, &record, &sent.manifest, console);
-        if let Some(line) = finished(asked.work, work, sent, &record, now)? {
+        unsealed(&book, &record)?;
+        now.kept = swept(asked.book(), work, &record, &sent.manifest, console);
+        for line in finished(asked, work, sent, &record, now)? {
             console.err(&line);
         }
     }
@@ -552,6 +706,34 @@ fn diff(asked: &Asked<'_>, sent: &Sent, work: &File, console: &mut Console) -> R
         console.out(&format!("gate-remote-inputs: path {}", escaped(path)));
     }
     Ok(())
+}
+
+/// Why a send's `manifest` cannot be installed beside the repo's inputs in the work folder `work`: a path of it that the
+/// inputs record holds, installed or kept, so neither record would own the file alone; `None` when it names none.
+fn held_by_inputs(work: &str, manifest: &Manifest) -> Option<String> {
+    let inputs = other_record(work, Book::SentBuild);
+    manifest.files().find_map(|(path, _)| {
+        let key = ordinal_upper(path);
+        (inputs.files.contains_key(&key) || inputs.kept.contains_key(&key))
+            .then(|| format!("the repo's inputs hold {}, which the sent build names too", escaped(path)))
+    })
+}
+
+/// Why the restore files of a diff are not a pair on the box: one `matched` (there) while one `needed` of the same
+/// folder is not; `None` when each folder's restore files are all there or none is.
+fn unpaired(matched: &Record, needed: &[&str]) -> Option<String> {
+    let folder_of = |path: &str| ordinal_upper(path.rsplit_once('/').map_or("", |(folder, _)| folder));
+    needed.iter().filter(|path| is_restore_file(path)).find_map(|missing| {
+        let there = matched
+            .files
+            .values()
+            .find(|copy| is_restore_file(&copy.path) && folder_of(&copy.path) == folder_of(missing))?;
+        Some(format!(
+            "the restore file '{}' is on the box without '{}'",
+            escaped(&there.path),
+            escaped(missing)
+        ))
+    })
 }
 
 /// The put: its stage made ([`made_stage`]), the archive on stdin unpacked into it before any lock is taken, then
@@ -1067,18 +1249,19 @@ pub(super) fn is_stage_name(name: &str) -> bool {
 /// ([`finished`]). The count of files installed; else why not.
 fn installed(asked: &Asked<'_>, sent: &Sent, staged: (&File, &[Entry]), work: &File, console: &mut Console) -> Result<usize, String> {
     let (files, entries) = staged;
-    let record = recorded(asked.work, console)?;
+    let book = asked.book().path(asked.work);
+    let record = recorded(&book, console)?;
     for entry in entries {
         in_manifest(entry, &sent.manifest)?;
-        free_target(work, &entry.path, &record, &sent.manifest)?;
+        free_target(asked.book(), work, &entry.path, &record, &sent.manifest)?;
     }
-    unsealed(asked.work, &record)?;
+    unsealed(&book, &record)?;
     let mut now = Record {
-        kept: swept(work, &record, &sent.manifest, console),
+        kept: swept(asked.book(), work, &record, &sent.manifest, console),
         ..Record::default()
     };
     for entry in entries {
-        let stamp = moved_in(files, work, &entry.path)?;
+        let stamp = moved_in(asked.book(), files, work, &entry.path)?;
         let copy = Copy {
             path: entry.path.clone(),
             sha256: entry.sha256.clone(),
@@ -1086,17 +1269,17 @@ fn installed(asked: &Asked<'_>, sent: &Sent, staged: (&File, &[Entry]), work: &F
         };
         now.files.insert(ordinal_upper(&entry.path), copy);
     }
-    if let Some(line) = finished(asked.work, work, sent, &record, now)? {
+    for line in finished(asked, work, sent, &record, now)? {
         console.err(&line);
     }
     Ok(entries.len())
 }
 
-/// Writes the work folder `work`'s record with `record`'s files and no digest, before anything below the work folder
-/// changes, so no run passes the digest check until the install finishes. Else why not.
-fn unsealed(work: &str, record: &Record) -> Result<(), String> {
+/// Writes the record at `path` with `record`'s files and no digest, before anything below the work folder changes, so
+/// no run passes the digest check until the install finishes. Else why not.
+fn unsealed(path: &str, record: &Record) -> Result<(), String> {
     write_record(
-        work,
+        path,
         &Record {
             digest: String::new(),
             ..record.clone()
@@ -1107,10 +1290,13 @@ fn unsealed(work: &str, record: &Record) -> Result<(), String> {
 /// Finishes an install whose moved or matched files and newly kept copies are `now`'s: adds every other file of the
 /// manifest the held work folder `work` holds as the manifest says ([`present`]), and keeps every copy `record` kept
 /// that no file of `now` replaces and that is still there (a kept copy gone from its path leaves the record and the
-/// exclude file); fails, the record written with no digest, when a file of the manifest is still missing; else
-/// rewrites the exclude file and, last, writes the record with the manifest's digest. Else why not.
-fn finished(work_path: &str, work: &File, sent: &Sent, record: &Record, mut now: Record) -> Result<Option<String>, String> {
-    present(work, &sent.manifest, record, &mut now);
+/// exclude file); fails, the record written with no digest, when a file of the manifest is still missing; else, for a
+/// send, deletes the leftover files of its bin folder ([`leftovers_removed`]), rewrites the exclude file from both
+/// records and, last, writes the request's record with the manifest's digest. The lines to say: each leftover that
+/// could not be deleted, then where a folder at the exclude file's name was moved aside, when one was. Else why not.
+fn finished(asked: &Asked<'_>, work: &File, sent: &Sent, record: &Record, mut now: Record) -> Result<Vec<String>, String> {
+    let book = &asked.book().path(asked.work);
+    present(asked.book(), work, &sent.manifest, record, &mut now);
     now.kept.extend(record.kept.clone());
     now.kept.retain(|key, _| !now.files.contains_key(key));
     // A copy that cannot be opened or is no plain file stays kept: only one shown gone leaves.
@@ -1120,7 +1306,7 @@ fn finished(work_path: &str, work: &File, sent: &Sent, record: &Record, mut now:
         let mut files = record.files.clone();
         files.extend(now.files);
         write_record(
-            work_path,
+            book,
             &Record {
                 digest: String::new(),
                 files,
@@ -1133,10 +1319,107 @@ fn finished(work_path: &str, work: &File, sent: &Sent, record: &Record, mut now:
             Ok(None) => format!("{path} is missing after the install"),
         });
     }
-    let moved_aside = write_exclude(work, work_path, &now)?;
+    let other = other_record(asked.work, asked.book());
+    let mut lines = match &asked.bin {
+        Some(bin) => leftovers_removed(work, &bin.bin, [&now, &other]),
+        None => Vec::new(),
+    };
+    lines.extend(write_exclude(work, asked.work, [&now, &other])?);
     now.digest.clone_from(&sent.digest);
-    write_record(work_path, &now)?;
-    Ok(moved_aside)
+    write_record(book, &now)?;
+    Ok(lines)
+}
+
+/// Deletes each plain file of one name below the bin folder `bin` (`/`-ended) of the held work folder `work` that
+/// neither of `records` holds, installed or kept, so the folder never mixes two builds; each reached through the
+/// handles of its folders, each held as a folder without delete sharing while it is listed, so none is renamed out of
+/// the tree and nothing below a link or a junction is reached. The walk is iterative, so a tree of any depth is
+/// walked. Folders, links and junctions stay. The lines saying each that could not be listed or deleted.
+fn leftovers_removed(work: &File, bin: &str, records: [&Record; 2]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let folder = match walk(work, bin) {
+        Ok(Walked::Reached(folder, _)) => folder,
+        Ok(Walked::Missing | Walked::Blocked(..)) => return lines,
+        Err(error) => {
+            lines.push(leftover_line(bin, &error));
+            return lines;
+        }
+    };
+    let held = |path: &str| {
+        let key = ordinal_upper(path);
+        records
+            .iter()
+            .any(|record| record.files.contains_key(&key) || record.kept.contains_key(&key))
+    };
+    let mut stack = Vec::new();
+    pushed_level(&mut stack, folder, bin.to_owned(), &mut lines);
+    while let Some(level) = stack.last_mut() {
+        let Some(name) = level.names.pop() else {
+            stack.pop();
+            continue;
+        };
+        let path = format!("{}{name}", level.prefix);
+        match leftover_removed(&level.folder, &name, &path, &held) {
+            Ok(Some(folder)) => pushed_level(&mut stack, folder, format!("{path}/"), &mut lines),
+            Ok(None) => {}
+            Err(error) => lines.push(leftover_line(&path, &error)),
+        }
+    }
+    lines
+}
+
+/// A folder [`leftovers_removed`] is walking: the folder, held, its `/`-ended path below the work folder, and the
+/// names in it not yet looked at.
+struct LeftoverLevel {
+    folder: File,
+    prefix: String,
+    names: Vec<String>,
+}
+
+/// Pushes the held `folder` at the `/`-ended `prefix` onto `stack` with the names in it, in their listed order to pop;
+/// else says why it could not be listed.
+fn pushed_level(stack: &mut Vec<LeftoverLevel>, folder: File, prefix: String, lines: &mut Vec<String>) {
+    match gate_win32::names_beneath(&folder) {
+        // A name that is not UTF-16 text is in no record, and cannot be opened by name: it stays.
+        Ok(names) => {
+            let names = names.into_iter().rev().filter_map(|name| name.into_string().ok()).collect();
+            stack.push(LeftoverLevel { folder, prefix, names });
+        }
+        Err(error) => lines.push(leftover_line(&prefix, &error)),
+    }
+}
+
+/// The entry `name` of the held `folder`, at `path`, opened as itself: deleted by its handle when it is a plain file of
+/// one name no record holds (`held`); `Some` with it held as a folder of its own, without `DELETE` and without delete
+/// sharing, when it is one; `None` when it is gone or stays. Else the system's error.
+fn leftover_removed(folder: &File, name: &str, path: &str, held: &dyn Fn(&str) -> bool) -> io::Result<Option<File>> {
+    let entry = match gate_win32::open_beneath_as(folder, name, FILE_GENERIC_READ | DELETE, Share::All, Make::Open) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        entry => entry?,
+    };
+    if !is_folder_itself(&entry)? {
+        if !held(path) && plain_copy(&entry).is_ok() {
+            gate_win32::delete_opened(&entry)?;
+        }
+        return Ok(None);
+    }
+    // Closed first, as a handle with DELETE would refuse the open that shares no deletion.
+    drop(entry);
+    let folder = match gate_win32::open_beneath_as(folder, name, FILE_GENERIC_READ, Share::NoDelete, Make::Open) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        folder => folder?,
+    };
+    // Swapped for a link, a junction or a file since: it stays.
+    Ok(is_folder_itself(&folder)?.then_some(folder))
+}
+
+/// The line saying the leftover build file or folder `path` could not be removed or listed for `error`.
+fn leftover_line(path: &str, error: &io::Error) -> String {
+    format!(
+        "gate: remote could not remove the leftover build file {}: {}",
+        escaped(path),
+        escaped(&error.to_string())
+    )
 }
 
 /// Whether the manifest holds the member `entry` with its size and SHA-256; else the refusal naming it.
@@ -1159,7 +1442,7 @@ fn in_manifest(entry: &Entry, manifest: &Manifest) -> Result<(), String> {
 /// of its own ([`walk`]), or a file that is an unchanged recorded copy leaving the manifest, which is deleted before
 /// the moves ([`swept`]); and whatever is at its path a plain file of one name ([`plain_copy`]). Else the refusal
 /// naming the path.
-fn free_target(work: &File, path: &str, record: &Record, manifest: &Manifest) -> Result<(), String> {
+fn free_target(book: Book, work: &File, path: &str, record: &Record, manifest: &Manifest) -> Result<(), String> {
     let refused = |why: String| format!("cannot install '{}': {why}", escaped(path));
     match walk(work, path).map_err(|error| refused(error.to_string()))? {
         Walked::Missing => Ok(()),
@@ -1169,6 +1452,7 @@ fn free_target(work: &File, path: &str, record: &Record, manifest: &Manifest) ->
             Err(why) => Err(refused(why)),
         },
         Walked::Reached(folder, leaf) => match gate_win32::open_beneath(&folder, leaf, Share::All) {
+            Ok(_) if book.restores(path) => Err(refused("the builder's own restore file is there".to_owned())),
             Ok(file) => plain_copy(&file).map_err(|error| refused(error.to_string())),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(refused(error.to_string())),
@@ -1192,9 +1476,10 @@ fn is_stale_unchanged(file: &File, path: &str, record: &Record, manifest: &Manif
 /// Moves the staged file `path` below the held folder `files` to the same path below the held work folder `work`,
 /// replacing a file or a link there as itself: each folder on its way made when missing and refused when it is a
 /// link, a junction or not a folder ([`walk_making`]), the file renamed by its handle into the held folder
-/// ([`gate_win32::rename_beneath`]) and its DACL and label then set to what that folder hands down. The moved file's
+/// ([`gate_win32::rename_beneath`]; for a sent build's restore file, [`Book::restores`], one that replaces nothing,
+/// [`gate_win32::rename_beneath_no_replace`]) and its DACL and label then set to what that folder hands down. The moved file's
 /// stamp, read through that handle; else why not.
-fn moved_in(files: &File, work: &File, path: &str) -> Result<Stamp, String> {
+fn moved_in(book: Book, files: &File, work: &File, path: &str) -> Result<Stamp, String> {
     let failed = |why: String| format!("cannot install '{}': {why}", escaped(path));
     let (folder, leaf) = match walk_making(work, path, true).map_err(|error| failed(error.to_string()))? {
         Walked::Reached(folder, leaf) => (folder, leaf),
@@ -1206,7 +1491,13 @@ fn moved_in(files: &File, work: &File, path: &str) -> Result<Stamp, String> {
     };
     let source =
         gate_win32::open_beneath_as(&staged_folder, staged_leaf, STAGED_ACCESS, Share::All, Make::Open).map_err(|error| failed(error.to_string()))?;
-    gate_win32::rename_beneath(&source, &folder, leaf).map_err(|error| failed(error.to_string()))?;
+    // A restore file the builder's restore wrote since the put's check is never replaced.
+    let moved = if book.restores(path) {
+        gate_win32::rename_beneath_no_replace(&source, &folder, leaf)
+    } else {
+        gate_win32::rename_beneath(&source, &folder, leaf)
+    };
+    moved.map_err(|error| failed(error.to_string()))?;
     let stamp = stamp_of(&source).map_err(|error| failed(error.to_string()))?;
     gate_win32::inherit_security(&source).map_err(|error| failed(error.to_string()))?;
     Ok(stamp)
@@ -1214,11 +1505,13 @@ fn moved_in(files: &File, work: &File, path: &str) -> Result<Stamp, String> {
 
 /// Deletes each copy `record` holds whose path left `manifest`, by the handle it was checked through, only while it is
 /// a plain file below the held work folder `work` that still hashes to what the record holds; a copy changed on the box
-/// is kept. Says each copy kept because it could not be opened or hashed, and each that could not be deleted. The
-/// copies kept, by their key: each but those deleted and those no longer there.
-fn swept(work: &File, record: &Record, manifest: &Manifest, console: &mut Console) -> BTreeMap<String, String> {
+/// is kept. A sent build's restore file ([`Book::restores`]) is the builder's own: it is never deleted, and leaves the record. Says
+/// each copy kept because it could not be opened or hashed, and each that could not be deleted. The copies kept, by
+/// their key: each but those deleted, those no longer there and the restore files.
+fn swept(book: Book, work: &File, record: &Record, manifest: &Manifest, console: &mut Console) -> BTreeMap<String, String> {
     let mut kept_copies = BTreeMap::new();
-    for (key, copy) in record.files.iter().filter(|(_, copy)| manifest.get(&copy.path).is_none()) {
+    let leaving = |copy: &&Copy| manifest.get(&copy.path).is_none() && !book.restores(&copy.path);
+    for (key, copy) in record.files.iter().filter(|(_, copy)| leaving(copy)) {
         let kept = |why: String| format!("gate: remote kept the stale input {}: {}", escaped(&copy.path), escaped(&why));
         // No writer may share it, so the copy hashed is the copy deleted.
         let file = match opened_copy(work, &copy.path, FILE_GENERIC_READ | DELETE, Share::NoWrite) {
@@ -1260,24 +1553,25 @@ fn removed_stale(file: &File, copy: &Copy, console: &mut Console) -> bool {
 
 /// Adds to `now`, which holds the files this put installed, every other file of `manifest` the held work folder `work`
 /// holds as the manifest says ([`matched_copy`]).
-fn present(work: &File, manifest: &Manifest, record: &Record, now: &mut Record) {
+fn present(book: Book, work: &File, manifest: &Manifest, record: &Record, now: &mut Record) {
     for (path, held) in manifest.files() {
         let key = ordinal_upper(path);
         if now.files.contains_key(&key) {
             continue;
         }
-        if let Some(copy) = matched_copy(work, path, held, record) {
+        if let Some(copy) = matched_copy(book, work, path, held, record) {
             now.files.insert(key, copy);
         }
     }
 }
 
-/// Rewrites the tree's `.git\info\exclude` from `record`: one line per recorded path, installed or kept, as a literal pattern, anchored
-/// with a leading `/` and each glob character escaped. The `.git` must be a folder of its own, opened beneath the held
-/// work folder `work`, whose path is `work_path`; `.git\info` is made a folder of its own beneath it ([`info_folder`]),
-/// and the file written beneath that ([`preflight::written_beneath`]), so no link there is followed; the line saying
-/// where a folder at the file's name was moved aside, when one was ([`preflight::moved_aside_line`]). Else why not.
-fn write_exclude(work: &File, work_path: &str, record: &Record) -> Result<Option<String>, String> {
+/// Rewrites the tree's `.git\info\exclude` from both `records`, the inputs and the sent build's: one line per path
+/// either names, installed or kept, as a literal pattern, anchored with a leading `/` and each glob character escaped,
+/// in the order of their keys. The `.git` must be a folder of its own, opened beneath the held work folder `work`,
+/// whose path is `work_path`; `.git\info` is made a folder of its own beneath it ([`info_folder`]), and the file
+/// written beneath that ([`preflight::written_beneath`]), so no link there is followed; the line saying where a folder
+/// at the file's name was moved aside, when one was ([`preflight::moved_aside_line`]). Else why not.
+fn write_exclude(work: &File, work_path: &str, records: [&Record; 2]) -> Result<Option<String>, String> {
     let git_path = Path::new(work_path).join(".git");
     let not_own = || format!("{} is not a folder of its own", git_path.display());
     let git = gate_win32::open_beneath(work, ".git", Share::NoDelete).map_err(|_| not_own())?;
@@ -1286,8 +1580,13 @@ fn write_exclude(work: &File, work_path: &str, record: &Record) -> Result<Option
     }
     let info_path = git_path.join("info");
     let info = info_folder(&git, &info_path)?;
+    let paths: BTreeMap<String, &str> = records
+        .iter()
+        .flat_map(|record| record.paths())
+        .map(|path| (ordinal_upper(path), path))
+        .collect();
     let mut text = String::new();
-    for path in record.paths() {
+    for path in paths.into_values() {
         text.push_str(&literal_pattern(path));
         text.push('\n');
     }
@@ -1331,17 +1630,19 @@ fn literal_pattern(path: &str) -> String {
 #[expect(clippy::expect_used, reason = "a test whose folders cannot be made must fail loudly")]
 mod tests {
     use std::fs::{self, File, OpenOptions};
+    use std::io;
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
 
     use gate_win32::{
-        Descriptor, Share, file_id, is_inheriting_unlabelled, is_protected_folder, make_folder_beneath, protected_descriptor, same_file, token_facts,
+        Descriptor, Make, Share, file_id, is_inheriting_unlabelled, is_protected_folder, make_folder_beneath, open_beneath_as, protected_descriptor,
+        same_file, token_facts,
     };
     use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, READ_CONTROL};
 
     use super::{
-        Asked, Beneath, Copy, Leftover, Record, STAGES_ACCESS, Stage, Stamp, Step, Unadopted, adopted, adopted_again, made_stage, moved_in,
-        not_the_box_s, protected_folder, removed_stage, same_stage, stages_name, swept,
+        Asked, Beneath, Book, Copy, Leftover, Record, STAGES_ACCESS, Stage, Stamp, Step, Unadopted, adopted, adopted_again, leftovers_removed,
+        made_stage, moved_in, not_the_box_s, protected_folder, removed_stage, same_stage, stages_name, swept,
     };
     use crate::boxside::payload::ordinal_upper;
     use crate::boxside::preflight::written_beneath;
@@ -1387,6 +1688,7 @@ mod tests {
             nonce: NONCE,
             step: Step::Put,
             root,
+            bin: None,
         }
     }
 
@@ -1940,7 +2242,7 @@ mod tests {
         fs::rename(work.join("data"), work.join("data-away")).expect("the folder can be renamed away");
         junction(&work.join("data"), &outside);
 
-        let moved = moved_in(&files_held, &work_held, "data/b.txt");
+        let moved = moved_in(Book::Inputs, &files_held, &work_held, "data/b.txt");
 
         let why = moved.expect_err("the junction is refused");
         assert!(why.contains("'data' is a link, a junction or not a folder"), "{why}");
@@ -2017,12 +2319,73 @@ mod tests {
         fs::rename(work.join("sub"), work.join("sub-away")).expect("the folder can be renamed away");
         junction(&work.join("sub"), &outside);
 
-        let kept = swept(&work_held, &record, &Manifest::default(), &mut Console::new());
+        let kept = swept(Book::Inputs, &work_held, &record, &Manifest::default(), &mut Console::new());
 
         drop(work_held);
         assert_eq!(kept.values().collect::<Vec<_>>(), ["sub/x.txt"], "the copy is kept");
         assert!(outside.join("x.txt").exists(), "nothing outside is deleted");
         assert!(work.join(r"sub-away\x.txt").exists(), "nothing in the folder renamed away is deleted");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    /// How many folders deep a leftover tree is: several thousand, as one a command can leave below its bin folder.
+    const DEPTH: usize = 3000;
+
+    #[test]
+    fn leftovers_removed_walks_a_tree_thousands_of_folders_deep_without_overflowing_the_stack() {
+        let folder = folder("leftovers-deep");
+        let (work, bin) = (folder.join("work"), folder.join(r"work\app\bin\Release"));
+        fs::create_dir_all(&bin).expect("the bin folder can be made");
+        // Each level is made beneath the one above it by handle, so no long path is ever named.
+        let mut level = open_beneath_as(&held(&bin), "a", FILE_GENERIC_READ, Share::All, Make::NewFolder).expect("a folder is made");
+        for _ in 1..DEPTH {
+            level = open_beneath_as(&level, "a", FILE_GENERIC_READ, Share::All, Make::NewFolder).expect("a folder is made");
+        }
+        drop(open_beneath_as(&level, "old.dll", FILE_GENERIC_READ, Share::All, Make::NewFile).expect("the leftover file is made"));
+        drop(level);
+        let work_held = held(&work);
+
+        // A thread of 64 KiB of stack, which a walk recursing once per level would overflow in a few hundred levels.
+        let (lines, work_held) = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let none = Record::default();
+                (leftovers_removed(&work_held, "app/bin/Release/", [&none, &none]), work_held)
+            })
+            .expect("the thread starts")
+            .join()
+            .expect("the walk neither panics nor overflows its stack");
+
+        assert!(lines.is_empty(), "{lines:?}");
+        let mut level = held(&bin);
+        for _ in 0..DEPTH {
+            level = open_beneath_as(&level, "a", FILE_GENERIC_READ, Share::All, Make::Open).expect("the folders stay");
+        }
+        let gone = open_beneath_as(&level, "old.dll", FILE_GENERIC_READ, Share::All, Make::Open).expect_err("the leftover file is deleted");
+        assert_eq!(gone.kind(), io::ErrorKind::NotFound, "{gone}");
+        drop((level, work_held));
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn moved_in_never_replaces_a_sent_build_s_restore_file_that_appeared_since_its_check() {
+        let folder = folder("moved-in-restore");
+        let (work, files) = (folder.join("work"), folder.join("files"));
+        let path = "obj/app.csproj.nuget.g.props";
+        for made in [work.join("obj"), files.join("obj")] {
+            fs::create_dir_all(made).expect("the folder can be made");
+        }
+        fs::write(files.join(path), "the PC's").expect("the staged file can be written");
+        fs::write(work.join(path), "the builder's").expect("the builder's restore file can be written");
+        let (work_held, files_held) = (held(&work), held(&files));
+
+        let moved = moved_in(Book::SentBuild, &files_held, &work_held, path);
+
+        drop((work_held, files_held));
+        let why = moved.expect_err("the builder's restore file is not replaced");
+        assert!(why.contains(path), "{why}");
+        assert_eq!(fs::read_to_string(work.join(path)).expect("it can be read"), "the builder's");
+        assert!(files.join(path).exists(), "the staged copy stays in the stage");
         fs::remove_dir_all(&folder).expect("the folder can be removed");
     }
 }

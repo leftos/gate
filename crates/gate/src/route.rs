@@ -24,6 +24,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::console::Console;
+use crate::no_build;
 use crate::remote::{self, git, siblings};
 use crate::resolve::Environment;
 use crate::warm;
@@ -419,6 +420,14 @@ impl Facts for Machine<'_> {
         remote::box_trees(self.remote_transport.as_deref(), target).unwrap_or_else(|why| {
             self.notes.borrow_mut().push(format!("gate: no PathMap word: {why}"));
             Vec::new()
+        })
+    }
+
+    /// A build file that cannot be read counts as moving it, saying why in the log.
+    fn moves_build_output(&self, place: &Place, folder: &str, file: Option<&str>) -> bool {
+        no_build::moves_output(Path::new(&place.root), folder, file).unwrap_or_else(|why| {
+            self.notes.borrow_mut().push(format!("gate: not sending the PC's build: {why}"));
+            true
         })
     }
 

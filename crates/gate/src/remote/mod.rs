@@ -15,7 +15,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use gate_args::TestSeams;
-use gate_router::{FolderId, Target, escaped};
+use gate_router::{FolderId, SendPlan, Target, escaped};
 use gate_state::v1::WarmFailure;
 use gate_state::{FallbackReason, StateRoot, Verdict};
 use gate_win32::{Interrupt, OwnedMutexGuard};
@@ -87,6 +87,8 @@ pub(crate) enum Refusal {
     Layout,
     /// The work folder does not hold the inputs the run's `InputsDigest` names.
     Inputs,
+    /// The work folder does not hold the PC's build the run's `SentDigest` names.
+    Sent,
     /// The run asked for the builder's desktop and could not have it: nobody is logged on at the console or it is
     /// locked, another user holds it, or another run held the desktop for the whole wait the run gave.
     Desktop,
@@ -104,6 +106,7 @@ impl Refusal {
             Refusal::Tools => "tools",
             Refusal::Layout => "layout",
             Refusal::Inputs => "inputs",
+            Refusal::Sent => "sent",
             Refusal::Desktop => "desktop",
             Refusal::Install => "install",
             Refusal::Lfs => "lfs",
@@ -258,6 +261,10 @@ pub(crate) enum KeyWait {
         reason = "the Rust client leaves the tail and the markers to the gate's verdict, and only the scripted client records them"
     )
 )]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent fact of the route or the request that the client reads by name"
+)]
 pub(crate) struct RemoteCall<'a> {
     pub host: &'a str,
     pub key: &'a str,
@@ -278,6 +285,11 @@ pub(crate) struct RemoteCall<'a> {
     /// Whether the route withheld the run's outputs, its command a dotnet `--no-build` one whose word the builder
     /// dropped: the builder builds, and nothing comes back.
     pub outputs_withheld: bool,
+    /// Whether [`RemoteCall::words`] are a dotnet command's with `--no-build` dropped ([`gate_router::RemoteRun::dropped_no_build`]).
+    pub dropped_no_build: bool,
+    /// The route's send of the PC's build, which lets the builder keep a `dotnet test`'s `--no-build`
+    /// ([`gate_router::RemoteRun::send`]); `None` for every other run.
+    pub send: Option<&'a SendPlan>,
     /// The input globs the run sends: the repo's `inputs` list, none when it has no entry.
     pub inputs: &'a [String],
     /// Whether the run asks for the builder's desktop, as the route's decision judged it; a warm-up never does.
@@ -354,6 +366,9 @@ pub(crate) struct RemoteOutcome {
     /// The ceiling, in whole seconds, the run call was sent once the builder's preflight found the run's work tree new,
     /// raised from the call's; `None` for a run whose ceiling was its own.
     pub raised: Option<u64>,
+    /// Whether the builder was sent the words with `--no-build` dropped ([`RemoteCall::dropped_no_build`]), a run whose
+    /// send of the PC's build did not land among them: it built there, and brings nothing back.
+    pub dropped_no_build: bool,
 }
 
 /// How long a routed run's parts took: the run call, the command's own time, which its ceiling counts; the push; and the
@@ -365,6 +380,8 @@ pub(crate) struct Split {
     pub push: Duration,
     pub inputs: Option<Duration>,
     pub lfs: Option<Duration>,
+    /// The send of the PC's build of one project, for a routed `dotnet test --no-build` that has one.
+    pub sent_build: Option<Duration>,
     pub sync_back: Option<Duration>,
     pub outputs: Option<Duration>,
 }
@@ -521,12 +538,14 @@ mod snapshot_only {
                     status: FAILED,
                     lines,
                     detail: Some(why),
+                    dropped_no_build: call.dropped_no_build,
                     ..RemoteOutcome::default()
                 };
             }
             RemoteOutcome {
                 status,
                 lines,
+                dropped_no_build: call.dropped_no_build,
                 ..RemoteOutcome::default()
             }
         }
@@ -571,6 +590,8 @@ mod snapshot_only {
                 words: &[],
                 outputs: &[],
                 outputs_withheld: false,
+                dropped_no_build: false,
+                send: None,
                 desktop: false,
                 inputs: &[],
                 log,
@@ -719,7 +740,18 @@ mod scripted {
 
     impl RemoteClient for ScriptedClient {
         fn run(&mut self, call: &RemoteCall<'_>) -> RemoteOutcome {
-            let mut outcome = RemoteOutcome::default();
+            let mut outcome = RemoteOutcome {
+                dropped_no_build: call.dropped_no_build,
+                ..RemoteOutcome::default()
+            };
+            // No script sends the PC's build: a run with a send takes the drop, as the client's does when its send fails,
+            // the line kept among the outcome's so a fallback does not say it again.
+            if call.send.is_some() {
+                if let Err(why) = super::say(call.log, &[gate_router::DROPPED_NO_BUILD_LINE], io::stderr().lock()) {
+                    return RemoteOutcome::not_started(why);
+                }
+                outcome.lines.push(gate_router::DROPPED_NO_BUILD_LINE.to_owned());
+            }
             for step in &self.steps {
                 match perform(step, call, &mut outcome) {
                     Ok(true) => {}

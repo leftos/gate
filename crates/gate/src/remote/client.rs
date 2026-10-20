@@ -33,13 +33,13 @@ use gate_args::BoxVerb;
 use gate_args::TestSeams;
 use gate_args::is_godot_console;
 use gate_desktop::version::build_version;
-use gate_state::v1::WarmFailure;
+use gate_state::v1::{self, WarmFailure};
 use gate_state::{FallbackReason, KernelObject, key_hash};
 use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, Running, Share};
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
-use gate_router::{Config, repo_name};
+use gate_router::{Config, DROPPED_NO_BUILD_LINE, SendPlan, repo_name};
 
 use super::git::{self, Git, GitError, NO_CURRENT_FOLDER, last_update};
 use super::held::{Held, sibling_who};
@@ -69,6 +69,7 @@ use crate::boxside::outputs::{NAMES_SKIPPED, OUTPUTS_BUDGET};
 use crate::boxside::payload::{PairRefused, Payload, escaped};
 use crate::durations::{Usual, hang_hint, routed_usual};
 use crate::environment::Variables;
+use crate::no_build;
 use crate::outputs::archive::sent_limit;
 use crate::outputs::hash::{SHA256_DIGITS, is_lower_hex};
 use crate::route::{self, open_followed};
@@ -353,6 +354,7 @@ impl RemoteClient for RustClient {
             #[cfg(feature = "test-seams")]
             tamper: self.tamper.as_deref(),
             brought_back: None,
+            dropped_no_build: call.dropped_no_build,
             split: Split::default(),
             lines: Vec::new(),
             problem: None,
@@ -510,6 +512,9 @@ pub(super) enum End {
     Status(i64),
     /// The builder cannot take the run, for this reason: status 75, and the run falls back here.
     Refused(FallbackReason),
+    /// The builder's work folder does not hold the PC's build the run's `SentDigest` names: the box's `sent` tag, which
+    /// no fallback answers, as the client runs the call once more with `--no-build` dropped ([`Attempt::run_called`]).
+    SentRefused,
     /// The client failed, for this reason: status 1, with no fallback.
     Failed(String),
     /// The console interrupt ended it.
@@ -1055,8 +1060,8 @@ pub(super) struct Called {
     names_skipped: bool,
     /// Whether the box said the run's start marker on standard error.
     started: bool,
-    /// The reason the box's refusal tag for the run named on standard error, the first when it said more than one.
-    refused: Option<FallbackReason>,
+    /// What the box's refusal tag for the run named on standard error, the first when it said more than one.
+    refused: Option<Tagged>,
     /// The kill the box's kill tag for the run named on standard error, the last when it said more than one.
     box_killed: Option<BoxKill>,
     /// The load-adjusted seconds the box's last adjusted line on standard error said.
@@ -1090,12 +1095,33 @@ impl Called {
     /// command lines. That a command cannot forge a refusal rests on the box saying the marker before it creates the
     /// command's process, and on this ignoring every tag once the marker was seen, whatever order the two came in.
     fn refusal(&self) -> Option<FallbackReason> {
-        self.refused.filter(|_| !self.started)
+        match self.refused.filter(|_| !self.started) {
+            Some(Tagged::Fallback(reason)) => Some(reason),
+            Some(Tagged::Sent) | None => None,
+        }
     }
+
+    /// Whether the box refused the run for the PC's build its `SentDigest` names, by its `sent` tag, read as
+    /// [`Called::refusal`] reads a tag.
+    fn sent_refusal(&self) -> bool {
+        self.refused == Some(Tagged::Sent) && !self.started
+    }
+}
+
+/// What a box's refusal tag names: the fallback reason of the run's refusal, or `sent`, the PC's build the run's
+/// `SentDigest` names, which no fallback answers ([`End::SentRefused`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tagged {
+    Fallback(FallbackReason),
+    Sent,
 }
 
 /// One run of the client: the call, the way to the builder, the limits, every line the attempt wrote to the log, and
 /// the first line that could not be written.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent fact of the attempt, read by name; no two form a state machine"
+)]
 pub(super) struct Attempt<'c, 'a> {
     pub(super) call: &'c RemoteCall<'a>,
     pub(super) transport: &'c dyn Transport,
@@ -1137,6 +1163,8 @@ pub(super) struct Attempt<'c, 'a> {
     /// Whether the run's outputs were brought back, as its outputs step ended ([`outputs::ended`]); `None` for a run
     /// that never reached it.
     pub(super) brought_back: Option<bool>,
+    /// Whether the builder was sent the words with `--no-build` dropped ([`RemoteOutcome::dropped_no_build`]).
+    dropped_no_build: bool,
     /// How long the run call and each transfer took, as far as the attempt got.
     pub(super) split: Split,
     lines: Vec<String>,
@@ -1172,6 +1200,13 @@ pub(super) struct Attempt<'c, 'a> {
     backstop_seam: Option<Duration>,
 }
 
+/// A send of the PC's build that landed ([`Attempt::sent_build`]): the digest of its manifest line, the run call's
+/// `SentDigest`, and the withheld-outputs marker it took out, which a run the box then refuses for that build writes.
+struct Landed {
+    digest: String,
+    withheld: Option<PathBuf>,
+}
+
 /// How a run call ended ([`Attempt::run_call`]): its end, the last standard error lines of the call that counts that
 /// are the box's outputs line and its back commits line, whether that call said on standard error that the box
 /// skipped outputs for names this PC cannot take, whether the box said the run's start marker, and the call's last
@@ -1195,7 +1230,7 @@ impl Attempt<'_, '_> {
         let snapshots = self.snapshots(&repos)?;
         let location = self.location(&mut repos)?;
         let nonce = payload::run_nonce();
-        let sent = outputs_sent(self)?;
+        let mut sent = outputs_sent(self)?;
         let inputs = inputs::sent(self)?;
         let Some((snapshot, siblings)) = snapshots.split_first() else {
             return Err(End::Failed("the snapshot made no commit".to_owned()));
@@ -1218,9 +1253,27 @@ impl Attempt<'_, '_> {
         let prepared = self.preflight(&location, &needs)?;
         let chosen = self.parity(&repos, &snapshots, &trees, &prepared, git_lfs)?;
         let raised = self.cold_ceiling(prepared.new_tree);
-        // After the preflight, whose installs the Godot and Unreal Engine versions are chosen from.
+        self.pushes(&repos, &snapshots, &prepared.created)?;
+        // The pair's folders are let go before the run call, which never runs while they are held.
+        self.release_run()?;
+        // After the push, so a route refused before it sends no input, and before the marker, so one the inputs refuse
+        // leaves none.
+        self.sent_contents(&location, &nonce, inputs.as_ref(), lfs.as_ref())?;
+        let (sent_digest, withheld) = self
+            .sent_build(&location, &mut sent)?
+            .map_or((None, None), |landed| (Some(landed.digest), landed.withheld));
+        // After the push: a run refused before it, at the preflight or by the parity check, leaves no marker.
+        outputs::marked(&sent)?;
+        if let Some(raised) = raised {
+            self.raise_ceiling(raised);
+        }
+        // After the preflight, whose installs the Godot and Unreal Engine versions are chosen from, and after the send,
+        // whose landing keeps `--no-build`.
         let run = RunCall {
-            words: self.call.words,
+            words: match self.call.send {
+                Some(plan) if sent_digest.is_some() => &plan.words,
+                _ => self.call.words,
+            },
             subfolder: self.call.subfolder,
             nonce: &nonce,
             snapshot: &snapshot.commit,
@@ -1231,25 +1284,14 @@ impl Attempt<'_, '_> {
             sibling_snapshots: &sibling_snapshots,
             inputs_digest: inputs.as_ref().map(|built| built.digest.as_str()),
             lfs_digest: lfs.as_ref().map(|sending| sending.digest.as_str()),
+            sent_digest: sent_digest.as_deref(),
             env: self.call.env,
             godot_version: chosen.godot.as_deref(),
             unreal_version: chosen.unreal.as_deref(),
             engine_env: &chosen.engine_env,
             desktop: self.call.desktop,
         };
-        let run_input = payload::input(&self.run_word(&location, &run), sent.manifest.as_deref());
-        self.pushes(&repos, &snapshots, &prepared.created)?;
-        // The pair's folders are let go before the run call, which never runs while they are held.
-        self.release_run()?;
-        // After the push, so a route refused before it sends no input, and before the marker, so one the inputs refuse
-        // leaves none.
-        self.sent_contents(&location, &nonce, inputs.as_ref(), lfs.as_ref())?;
-        // After the push: a run refused before it, at the preflight or by the parity check, leaves no marker.
-        outputs::marked(&sent)?;
-        if let Some(raised) = raised {
-            self.raise_ceiling(raised);
-        }
-        let called = self.run_call(&location, &run_input, &nonce)?;
+        let (called, nonce) = self.run_called(&location, &run, &mut sent, withheld)?;
         // A warm-up brings nothing back: its end is classed, and neither the sync-back nor the outputs step follows.
         if self.warm_ran(&called) {
             return Ok(self.warm_ended(called, &location, prepared.boot.as_deref()));
@@ -1300,6 +1342,83 @@ impl Attempt<'_, '_> {
             lfs::send(self, location, nonce, sending)?;
         }
         Ok(())
+    }
+
+    /// The send of the PC's build the route plans ([`inputs::sent_build`]), after the inputs and the LFS content. Once it
+    /// landed, the builder keeps `--no-build` and builds nothing: the withheld-outputs marker is taken out of `sent`, so
+    /// none is written, and the run's outcome no longer counts `--no-build` dropped. `None` with no send planned, and for
+    /// a send that did not land or was not made while the last build's outputs are not back ([`Attempt::outputs_not_back`]),
+    /// the dropped line then said; else the end a Ctrl+C or an `install` refusal ended it on.
+    fn sent_build(&mut self, location: &Location, sent: &mut outputs::Sent<'_>) -> Result<Option<Landed>, End> {
+        let Some(plan) = self.call.send else {
+            return Ok(None);
+        };
+        if let Some(why) = self.outputs_not_back(plan) {
+            self.logged_kept(inputs::build_not_sent(&why));
+            self.say(DROPPED_NO_BUILD_LINE.to_owned());
+            return Ok(None);
+        }
+        let Some(digest) = inputs::sent_build(self, location, &plan.bin)? else {
+            self.say(DROPPED_NO_BUILD_LINE.to_owned());
+            return Ok(None);
+        };
+        self.dropped_no_build = false;
+        Ok(Some(Landed {
+            digest,
+            withheld: sent.take_withheld(),
+        }))
+    }
+
+    /// Why `plan`'s send is not made while the last build's outputs are not back here: the worktree's nothing-back record
+    /// stands, read as a run here reads it ([`no_build::read_record`]), and names no configuration or the run's own,
+    /// the last folder of [`SendPlan::bin`], in any letter case; a record that cannot be read counts as standing. The
+    /// PC's `bin` would then be older than the builder's build, and the run takes the drop. `None` with no record, or
+    /// one of another configuration.
+    fn outputs_not_back(&self, plan: &SendPlan) -> Option<String> {
+        let path = v1::nothing_back_path(self.call.state_dir, self.call.key);
+        let configuration = plan.bin.rsplit('/').next().unwrap_or_default().to_lowercase();
+        let standing = || format!("the last build's outputs are not back: {} stands", path.display());
+        match no_build::read_record(&path) {
+            Ok(None) => None,
+            Ok(Some(record)) => record
+                .settings
+                .configuration
+                .is_none_or(|named| named.to_lowercase() == configuration)
+                .then(standing),
+            Err(error) => Some(format!("cannot read {}: {error}", path.display())),
+        }
+    }
+
+    /// The run call of `run` to `location`, fed `sent`'s manifest line, and the nonce of the call that counts. A call
+    /// the box refused for the PC's build its `SentDigest` names ([`End::SentRefused`]) is made once more, under a nonce
+    /// new to it, with the words whose `--no-build` the route dropped and no `SentDigest`, as for a send that did not
+    /// land: the dropped line said first, and the withheld-outputs marker the landed send took, `withheld`, written.
+    fn run_called(
+        &mut self,
+        location: &Location,
+        run: &RunCall<'_>,
+        sent: &mut outputs::Sent<'_>,
+        withheld: Option<PathBuf>,
+    ) -> Result<(RunEnd, String), End> {
+        let input = payload::input(&self.run_word(location, run), sent.manifest.as_deref());
+        let called = self.run_call(location, &input, run.nonce)?;
+        if !matches!(called.end, End::SentRefused) {
+            return Ok((called, run.nonce.to_owned()));
+        }
+        self.dropped_no_build = true;
+        self.say(DROPPED_NO_BUILD_LINE.to_owned());
+        sent.withhold(withheld);
+        outputs::marked(sent)?;
+        let nonce = payload::run_nonce();
+        let again = RunCall {
+            words: self.call.words,
+            nonce: &nonce,
+            sent_digest: None,
+            ..*run
+        };
+        let input = payload::input(&self.run_word(location, &again), sent.manifest.as_deref());
+        let called = self.run_call(location, &input, &nonce)?;
+        Ok((called, nonce))
     }
 
     /// The end of a run call that ended at `end`, its last error line `last_error`: a refusal of its inputs or of its
@@ -2970,6 +3089,11 @@ impl Attempt<'_, '_> {
             }
             End::Status(status) => (status, None),
             End::Refused(reason) => (REFUSED, Some(reason)),
+            // Only a run call carrying a `SentDigest` is refused so, and the one run again carries none.
+            End::SentRefused => {
+                self.say(format!("{FAILED_RUN}: the builder refused the PC's build of a run that sent none"));
+                (FAILED, None)
+            }
             End::Interrupted => (i64::from(CONTROL_C_EXIT.cast_signed()), None),
             End::Killed => (i64::from(KILLED), None),
             End::Lost(_) => (i64::from(SSH_FAILED), None),
@@ -2991,6 +3115,7 @@ impl Attempt<'_, '_> {
             lines: self.lines,
             detail: self.problem.or(detail),
             brought_back: self.brought_back,
+            dropped_no_build: self.dropped_no_build,
             split: self.split,
             adjusted: self.adjusted,
             box_killed: self.box_killed,
@@ -3034,6 +3159,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             own_start_fails: false,
             tamper: None,
             brought_back: None,
+            dropped_no_build: call.dropped_no_build,
             split: Split::default(),
             lines: Vec::new(),
             problem: None,
@@ -3609,7 +3735,7 @@ struct Heard {
     back_commits: Option<String>,
     names_skipped: bool,
     started: bool,
-    refused: Option<FallbackReason>,
+    refused: Option<Tagged>,
     box_killed: Option<BoxKill>,
     adjusted: Option<f64>,
     problem: Option<String>,
@@ -3643,7 +3769,10 @@ impl Heard {
         match protocol {
             Protocol::Started => self.started = true,
             Protocol::Refused(reason) => {
-                self.refused.get_or_insert(reason);
+                self.refused.get_or_insert(Tagged::Fallback(reason));
+            }
+            Protocol::SentRefused => {
+                self.refused.get_or_insert(Tagged::Sent);
             }
             Protocol::Killed(kill) => self.box_killed = Some(kill),
             Protocol::Adjusted(seconds) => self.adjusted = Some(seconds),
@@ -4165,7 +4294,7 @@ fn is_heartbeat(line: &str) -> bool {
 
 /// How a run call that ended as `called`, its own lines at `output` among the attempt's, ends the run when neither a
 /// kill nor an interrupt ended it: a lost connection when it exited 255; a refusal when its 75 comes with the box's
-/// refusal tag and no start marker; else the command's own status.
+/// refusal tag and no start marker, its `sent` tag among them ([`End::SentRefused`]); else the command's own status.
 fn status_end(called: &Called, output: Range<usize>) -> End {
     if called.status == SSH_FAILED {
         return End::Lost(output);
@@ -4173,6 +4302,7 @@ fn status_end(called: &Called, output: Range<usize>) -> End {
     let status = i64::from(called.status);
     match called.refusal() {
         Some(reason) if status == REFUSED => End::Refused(reason),
+        None if status == REFUSED && called.sent_refusal() => End::SentRefused,
         _ => End::Status(status),
     }
 }
@@ -4254,6 +4384,7 @@ fn warm_reason(end: &End, started: bool) -> String {
         End::Status(status) if started => format!("command stopped with status {status}"),
         End::Status(status) => format!("the builder ended the warm-up before its commands with status {status}"),
         End::Refused(reason) => format!("the builder refused: {}", reason.as_str()),
+        End::SentRefused => "the builder refused: sent".to_owned(),
         End::Killed => "the warm-up was killed: it ran out of its budget or went silent".to_owned(),
         End::Lost(_) => "the connection to the builder was lost".to_owned(),
         End::NotRouted(_) => "the client could not send the warm-up".to_owned(),
@@ -4433,19 +4564,22 @@ pub(super) fn watchdog_line(cut: Cut, doing: &str) -> Option<String> {
 }
 
 /// A line the box says on a run call's standard error for the client alone, besides its heartbeat: the start marker
-/// said just before the command starts, a refusal tag and the fallback reason it names, a kill tag and the kill it
-/// names, or the adjusted line and the load-adjusted seconds it carries.
+/// said just before the command starts, a refusal tag and the fallback reason it names, the `sent` refusal tag, a kill
+/// tag and the kill it names, or the adjusted line and the load-adjusted seconds it carries.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Protocol {
     Started,
     Refused(FallbackReason),
+    /// The box's refusal tag for a work folder that does not hold the PC's build the run's `SentDigest` names, which
+    /// no fallback answers: the client runs the call again with `--no-build` dropped ([`End::SentRefused`]).
+    SentRefused,
     /// The box's kill tag, said just after its kill line.
     Killed(BoxKill),
     /// The box's adjusted line, said once the command's readers drained.
     Adjusted(f64),
 }
 
-/// The start marker, the seven refusal tags, the two kill tags and the adjusted line's prefix of one run, made once for
+/// The start marker, the eight refusal tags, the two kill tags and the adjusted line's prefix of one run, made once for
 /// its run call's readers.
 struct ProtocolLines {
     started: String,
@@ -4453,6 +4587,7 @@ struct ProtocolLines {
     tools: String,
     layout: String,
     inputs: String,
+    sent: String,
     desktop: String,
     install: String,
     lfs: String,
@@ -4470,6 +4605,7 @@ impl ProtocolLines {
             tools: refused_line(nonce, Refusal::Tools),
             layout: refused_line(nonce, Refusal::Layout),
             inputs: refused_line(nonce, Refusal::Inputs),
+            sent: refused_line(nonce, Refusal::Sent),
             desktop: refused_line(nonce, Refusal::Desktop),
             install: refused_line(nonce, Refusal::Install),
             lfs: refused_line(nonce, Refusal::Lfs),
@@ -4489,6 +4625,7 @@ impl ProtocolLines {
             (&self.tools, Protocol::Refused(FallbackReason::Tools)),
             (&self.layout, Protocol::Refused(FallbackReason::Layout)),
             (&self.inputs, Protocol::Refused(FallbackReason::Inputs)),
+            (&self.sent, Protocol::SentRefused),
             (&self.desktop, Protocol::Refused(FallbackReason::Desktop)),
             (&self.install, Protocol::Refused(FallbackReason::Install)),
             (&self.lfs, Protocol::Refused(FallbackReason::Lfs)),
@@ -4679,6 +4816,8 @@ mod tests {
             words: &[],
             outputs: &[],
             outputs_withheld: false,
+            dropped_no_build: false,
+            send: None,
             desktop: false,
             inputs: &[],
             log,
@@ -4717,6 +4856,7 @@ mod tests {
             inputs_budget: super::inputs::INPUTS_BUDGET,
             lfs_budget: super::lfs::LFS_BUDGET,
             brought_back: None,
+            dropped_no_build: call.dropped_no_build,
             split: Split::default(),
             lines: Vec::new(),
             problem: None,
@@ -7110,6 +7250,8 @@ mod tests {
             words: &[],
             outputs: &[],
             outputs_withheld: false,
+            dropped_no_build: false,
+            send: None,
             desktop: false,
             inputs: &[],
             log,
@@ -7171,6 +7313,8 @@ mod tests {
         let warm_call = RemoteCall {
             outputs: &globs,
             outputs_withheld: true,
+            dropped_no_build: false,
+            send: None,
             desktop: false,
             warmth: Warmth::WarmUp {
                 commands: &warm_up,

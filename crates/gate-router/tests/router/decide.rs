@@ -81,6 +81,7 @@ fn the_control_command_routes_from_the_root() {
             outputs: words(&["**/bin/**", "**/.godot/mono/temp/bin/**"]),
             inputs: Vec::new(),
             dropped_no_build: false,
+            send: None,
             outputs_withheld: false,
             desktop: false,
             source_revision: Some(HEAD.to_owned()),
@@ -653,6 +654,49 @@ fn no_build_is_dropped_from_a_dotnet_command_for_the_builder_and_the_fallback() 
     assert_eq!(
         DROPPED_NO_BUILD_LINE,
         "gate: dropped --no-build: the last build may have run on the other machine"
+    );
+}
+
+/// The facts of a gate at the root whose routing file routes `yaat`'s dotnet commands and, when `send` holds it, lets it
+/// send the PC's build (`sendBuild`).
+fn send_facts(send: &str) -> FakeFacts {
+    let text = format!(r#"{{"host": "builder-1", "repos": {{"yaat": ["dotnet *"]}}, "sendBuild": {send}}}"#);
+    FakeFacts::with_config(Config::parse(&text).expect("usable"))
+}
+
+#[test]
+fn a_no_build_test_of_a_repo_send_build_does_not_list_has_no_send_plan() {
+    let command = words(&["dotnet", "test", "App.csproj", "-c", "Release", "--no-build"]);
+    for send in ["[]", r#"["other"]"#, r#""yaat""#, "[3]"] {
+        let facts = send_facts(send);
+        let run = routed(decide(&heavy(&command), &facts));
+        assert_eq!(run.send, None, "{send}");
+        assert!(run.dropped_no_build, "{send}");
+        assert!(run.lines().iter().any(|line| line == DROPPED_NO_BUILD_LINE), "today's line: {send}");
+        assert!(
+            !facts.asked().iter().any(|asked| asked == "moves_build_output"),
+            "no build file read: {send}"
+        );
+    }
+}
+
+#[test]
+fn a_no_build_test_of_one_project_carries_both_word_sets_and_a_send_plan() {
+    let command = words(&["dotnet", "test", "App.csproj", "-c", "Release", "--no-build"]);
+    let run = routed(decide(&heavy(&command), &send_facts(r#"["Yaat"]"#)));
+    assert_eq!(
+        run.words,
+        ["dotnet", "test", "App.csproj", "-c", "Release", stamp().as_str()],
+        "dropped and stamped"
+    );
+    let send = run.send.as_ref().expect("the run has a send plan");
+    assert_eq!(send.words, command, "kept and never stamped");
+    assert_eq!(send.bin, "bin/Release");
+    assert!(run.dropped_no_build);
+    assert!(
+        !run.lines().iter().any(|line| line == DROPPED_NO_BUILD_LINE),
+        "the client says the dropped line only when the send does not land: {:?}",
+        run.lines()
     );
 }
 

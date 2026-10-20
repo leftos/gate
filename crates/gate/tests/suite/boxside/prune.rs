@@ -98,6 +98,26 @@ fn an_idle_work_folder_and_its_records_are_removed() {
 }
 
 #[test]
+fn an_idle_work_folder_s_sent_build_record_goes_with_it() {
+    let case = Case::new("prune_sent_build");
+    let root = root_with_k(&case);
+    let sent = root.join(r"work\k.sent-build");
+    fs::write(&sent, "").expect("the sent-build record can be written");
+    age(&sent, AGED);
+    age_k(&root);
+
+    let outcome = prune(&case, &root);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout, "gate: remote pruned k: idle 48 h\ngate: remote prune removed 1 of 1 work folders\n",
+        "{outcome:?}"
+    );
+    assert!(!sent.exists(), "k.sent-build is gone: {outcome:?}");
+    assert_k_gone(&root, &outcome);
+}
+
+#[test]
 fn a_work_folder_whose_fetch_head_is_fresh_stays() {
     let case = Case::new("prune_fresh_fetch");
     let root = root_with_k(&case);

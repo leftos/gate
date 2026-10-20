@@ -126,6 +126,9 @@ pub(crate) struct RunCall<'a> {
     /// The SHA-256 of the LFS manifest line of the objects the snapshot's pointers name, without its newline
     /// (`LfsDigest`), `None` for a run whose snapshot holds no pointer.
     pub lfs_digest: Option<&'a str>,
+    /// The SHA-256 of the manifest line of the PC's build the send sent the work folder, without its newline
+    /// (`SentDigest`), `None` for a run whose send did not land or that has none.
+    pub sent_digest: Option<&'a str>,
     /// The run's variables, the caller's `--env` pairs and the gate's `SourceRevisionId` (`Env`, sent only when there
     /// is one); a warm-up never sends them.
     pub env: &'a [(String, String)],
@@ -151,8 +154,9 @@ pub(crate) enum InputsStep {
     Put,
 }
 
-/// The payload word of an inputs call: the location, the run's `Nonce` and the `Step`.
-pub(crate) fn inputs_word(location: &Location, nonce: &str, step: InputsStep) -> String {
+/// The payload word of an inputs call: the location, the run's `Nonce` and the `Step`, and, for a send of the PC's
+/// build of one project, its bin folder `sent_bin` as `SentBin`, `{project}/bin/{configuration}`.
+pub(crate) fn inputs_word(location: &Location, nonce: &str, step: InputsStep, sent_bin: Option<&str>) -> String {
     let mut object = location.object();
     let step = match step {
         InputsStep::Diff => "diff",
@@ -160,6 +164,9 @@ pub(crate) fn inputs_word(location: &Location, nonce: &str, step: InputsStep) ->
     };
     object.insert("Nonce".to_owned(), json!(nonce));
     object.insert("Step".to_owned(), json!(step));
+    if let Some(bin) = sent_bin {
+        object.insert("SentBin".to_owned(), json!(bin));
+    }
     word(&object)
 }
 
@@ -290,6 +297,9 @@ fn insert_siblings_and_inputs(object: &mut Map<String, Value>, run: &RunCall<'_>
     if let Some(digest) = run.lfs_digest {
         object.insert("LfsDigest".to_owned(), json!(digest));
     }
+    if let Some(digest) = run.sent_digest {
+        object.insert("SentDigest".to_owned(), json!(digest));
+    }
 }
 
 /// `object` as one word: base64 of its compact UTF-8 JSON.
@@ -390,6 +400,7 @@ mod tests {
             sibling_snapshots,
             inputs_digest: None,
             lfs_digest: None,
+            sent_digest: None,
             env: &[],
             godot_version: None,
             unreal_version: None,
@@ -514,6 +525,7 @@ mod tests {
             sibling_snapshots: &[],
             inputs_digest: None,
             lfs_digest: None,
+            sent_digest: None,
             env: &[],
             godot_version: None,
             unreal_version: None,
@@ -559,6 +571,7 @@ mod tests {
             sibling_snapshots: &[],
             inputs_digest: Some("ab"),
             lfs_digest: None,
+            sent_digest: None,
             env: &[],
             godot_version: None,
             unreal_version: None,
@@ -582,12 +595,12 @@ mod tests {
             Ok(Some(lfs_digest.as_str())),
             "the box reads it back"
         );
-        let diff = decoded(&inputs_word(&location(), "n2", InputsStep::Diff));
+        let diff = decoded(&inputs_word(&location(), "n2", InputsStep::Diff, None));
         assert_eq!(
             (&diff["Nonce"], &diff["Step"], &diff["Work"]),
             (&json!("n2"), &json!("diff"), &sent["Work"])
         );
-        assert_eq!(decoded(&inputs_word(&location(), "n2", InputsStep::Put))["Step"], json!("put"));
+        assert_eq!(decoded(&inputs_word(&location(), "n2", InputsStep::Put, None))["Step"], json!("put"));
         assert_eq!(sent["Outputs"], json!(["**/bin/**", "out/*.dll"]));
         assert_eq!(sent["OutputsFull"], json!(true));
         assert_eq!(sent["Nonce"], json!("n2"));
@@ -609,6 +622,7 @@ mod tests {
             sibling_snapshots: &[],
             inputs_digest: None,
             lfs_digest: None,
+            sent_digest: None,
             env: &env,
             godot_version: None,
             unreal_version: None,
@@ -647,6 +661,7 @@ mod tests {
             sibling_snapshots: &[],
             inputs_digest: None,
             lfs_digest: None,
+            sent_digest: None,
             env: &[],
             godot_version: Some("4.7.2"),
             unreal_version: None,
@@ -691,6 +706,7 @@ mod tests {
             sibling_snapshots: &[],
             inputs_digest: None,
             lfs_digest: None,
+            sent_digest: None,
             env: &[],
             godot_version: None,
             unreal_version: Some("5.8.0"),
@@ -736,6 +752,7 @@ mod tests {
             sibling_snapshots: &[],
             inputs_digest: None,
             lfs_digest: None,
+            sent_digest: None,
             env: &[],
             godot_version: None,
             unreal_version: None,
@@ -785,6 +802,7 @@ mod tests {
             sibling_snapshots: &[],
             inputs_digest: None,
             lfs_digest: None,
+            sent_digest: None,
             env: &[],
             godot_version: None,
             unreal_version: None,
@@ -841,6 +859,7 @@ mod tests {
             sibling_snapshots,
             inputs_digest,
             lfs_digest: None,
+            sent_digest: None,
             env: &[],
             godot_version: None,
             unreal_version: None,

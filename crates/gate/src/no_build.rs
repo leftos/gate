@@ -3,13 +3,13 @@
 //! calls that find the worktree's root and its tracked projects.
 
 use std::ffi::OsStr;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use gate_router::{BuildSettings, DotnetTarget, PROJECT_EXTENSIONS, is_usable_host};
+use gate_router::{BuildSettings, DotnetTarget, OUTPUT_PROPERTIES, PROJECT_EXTENSIONS, is_usable_host};
 use gate_state::v1;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
 
@@ -147,17 +147,86 @@ fn read_regular(path: &Path) -> io::Result<Vec<u8>> {
 ///
 /// Such a file that is there but cannot be read ([`read_regular`]): `cannot read <path>: <error>`, the path escaped.
 pub(crate) fn moves_intermediates(root: &Path) -> Result<bool, String> {
+    build_files_name(root, &MOVING_PROPERTIES)
+}
+
+/// Whether a build file of the project in `folder` below the worktree root `root` (`/`-separated and `/`-ended, empty at
+/// the root) names one of the properties that move a project's build output ([`OUTPUT_PROPERTIES`]), ignoring letter
+/// case, as text anywhere in it (`IntermediateOutputPath` names `OutputPath` too): the project file `file`, or each
+/// project file `folder` holds when none is named, then each folder's [`BUILD_FILES`] from `folder` up to `root`. The
+/// PC's build of the project may then stand outside its `bin\{configuration}` folder, so no routed run sends it.
+///
+/// # Errors
+///
+/// Such a file that is there but cannot be read ([`read_regular`]), or a project folder that cannot be listed:
+/// `cannot read <path>: <error>`, the path escaped.
+pub(crate) fn moves_output(root: &Path, folder: &str, file: Option<&str>) -> Result<bool, String> {
+    let project = folder
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .fold(root.to_path_buf(), |path, segment| path.join(segment));
+    let cannot = |path: &Path, error: io::Error| format!("cannot read {}: {error}", escaped(&path.to_string_lossy()));
+    let files = match file {
+        Some(file) => vec![project.join(file)],
+        None => project_files(&project).map_err(|error| cannot(&project, error))?,
+    };
+    for path in &files {
+        if names_any(path, &OUTPUT_PROPERTIES).map_err(|error| cannot(path, error))? {
+            return Ok(true);
+        }
+    }
+    let mut at = project.as_path();
+    loop {
+        if build_files_name(at, &OUTPUT_PROPERTIES)? {
+            return Ok(true);
+        }
+        if at == root {
+            return Ok(false);
+        }
+        match at.parent() {
+            Some(parent) => at = parent,
+            None => return Ok(false),
+        }
+    }
+}
+
+/// The files in `folder` whose name ends in a project extension ([`PROJECT_EXTENSIONS`]), ignoring letter case.
+fn project_files(folder: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(folder)? {
+        let path = entry?.path();
+        let named = path.extension().is_some_and(|extension| {
+            PROJECT_EXTENSIONS
+                .iter()
+                .any(|known| extension.eq_ignore_ascii_case(known.trim_start_matches('.')))
+        });
+        if named && path.is_file() {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+/// Whether the file at `path` holds one of `properties` as text, ignoring letter case: `false` when it is missing; else
+/// why it cannot be read ([`read_regular`]).
+fn names_any(path: &Path, properties: &[&str]) -> io::Result<bool> {
+    match read_regular(path) {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes).to_lowercase();
+            Ok(properties.iter().any(|property| text.contains(&property.to_lowercase())))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether either of the folder `root`'s [`BUILD_FILES`] holds one of `properties` as text, ignoring letter case;
+/// else, for such a file that is there but cannot be read, why not.
+fn build_files_name(root: &Path, properties: &[&str]) -> Result<bool, String> {
     for name in BUILD_FILES {
         let path = root.join(name);
-        match read_regular(&path) {
-            Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes).to_lowercase();
-                if MOVING_PROPERTIES.iter().any(|property| text.contains(&property.to_lowercase())) {
-                    return Ok(true);
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("cannot read {}: {error}", escaped(&path.to_string_lossy()))),
+        if names_any(&path, properties).map_err(|error| format!("cannot read {}: {error}", escaped(&path.to_string_lossy())))? {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -393,7 +462,8 @@ mod tests {
     use gate_state::v1;
 
     use super::{
-        NothingBack, drop_reason, first_without_assets, moves_intermediates, named_without_assets, parse_worktree, read_record, solution_projects,
+        NothingBack, drop_reason, first_without_assets, moves_intermediates, moves_output, named_without_assets, parse_worktree, read_record,
+        solution_projects,
     };
 
     /// A folder of this test process's own named `name`, empty.
@@ -696,6 +766,73 @@ mod tests {
             .expect_err("no such solution can be read");
         assert!(error.starts_with(r"cannot read x\u{1b}[31m\u{7}.sln: "), "{error}");
         assert!(!error.contains(['\u{1b}', '\u{7}']), "{error:?}");
+    }
+
+    /// A worktree holding the project `tests/App/App.csproj` and empty build files at the root and in `tests/`, with
+    /// `text` written over the file `name` below it.
+    fn output_case(case: &str, name: &str, text: &str) -> PathBuf {
+        let root = scratch(case);
+        project(&root, "tests/App/App.csproj", false);
+        for build in ["Directory.Build.props", "tests/Directory.Build.targets"] {
+            fs::write(root.join(build), "<Project />").expect("a build file can be written");
+        }
+        fs::write(root.join(name), text).expect("the file can be written");
+        root
+    }
+
+    /// Whether the build files of the project `tests/App/App.csproj` in the worktree at `root` move its output, read of
+    /// the named project file and of its folder alone.
+    fn moved(root: &Path) -> (Result<bool, String>, Result<bool, String>) {
+        (
+            moves_output(root, "tests/App/", Some("App.csproj")),
+            moves_output(root, "tests/App/", None),
+        )
+    }
+
+    #[test]
+    fn the_project_file_naming_an_output_property_moves_the_output() {
+        let root = output_case(
+            "output-project",
+            "tests/App/App.csproj",
+            "<Project><PropertyGroup><OutDir>x</OutDir></PropertyGroup></Project>",
+        );
+        assert_eq!(moved(&root), (Ok(true), Ok(true)), "the file named, and the one the folder holds");
+        fs::write(root.join("tests/App/App.csproj"), "<Project />").expect("the project can be rewritten");
+        assert_eq!(moved(&root), (Ok(false), Ok(false)), "nothing moves it");
+        fs::remove_dir_all(&root).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_nested_directory_build_file_naming_an_output_property_moves_the_output() {
+        let root = output_case(
+            "output-nested",
+            "tests/Directory.Build.props",
+            "<Project><PropertyGroup><Platform>x64</Platform></PropertyGroup></Project>",
+        );
+        assert_eq!(moved(&root), (Ok(true), Ok(true)));
+        fs::remove_dir_all(&root).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn the_root_directory_build_file_naming_an_output_property_moves_the_output() {
+        let root = output_case(
+            "output-root",
+            "Directory.Build.props",
+            "<Project><PropertyGroup><OutputPath>x</OutputPath></PropertyGroup></Project>",
+        );
+        assert_eq!(moved(&root), (Ok(true), Ok(true)));
+        fs::remove_dir_all(&root).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_build_file_that_cannot_be_read_says_why() {
+        let root = output_case("output-unreadable", "tests/Directory.Build.targets", "<Project />");
+        fs::remove_file(root.join("tests/Directory.Build.targets")).expect("the file can be removed");
+        fs::create_dir(root.join("tests/Directory.Build.targets")).expect("a folder can stand at its name");
+        let (named, _) = moved(&root);
+        fs::remove_dir_all(&root).expect("the folder can be removed");
+        let why = named.expect_err("a folder at a build file's name cannot be read");
+        assert!(why.starts_with("cannot read ") && why.contains("Directory.Build.targets"), "{why}");
     }
 
     #[test]

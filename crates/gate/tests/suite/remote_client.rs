@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use gate_router::{repo_name, work_folder_key};
+use gate_router::{DROPPED_NO_BUILD_LINE, repo_name, work_folder_key};
 use proc_table::{ProcessTable as _, ProcessTree, Win32ProcessTable};
 use regex::Regex;
 use serde_json::{Value, json};
@@ -6581,11 +6581,16 @@ fn no_globs_case(name: &str) -> Case {
 /// A [`build_case`] with `record` planted as its worktree's nothing-back record.
 fn planted_case(name: &str, record: &str) -> Case {
     let case = build_case(name);
-    let key = work_folder_key(&git(&case, &["rev-parse", "--show-toplevel"]));
+    plant_record(&case, record);
+    case
+}
+
+/// Plants `record` as the case's worktree's nothing-back record.
+fn plant_record(case: &Case, record: &str) {
+    let key = work_folder_key(&git(case, &["rev-parse", "--show-toplevel"]));
     let path = case.root().join("remote").join(format!("{key}.nothing-back"));
     fs::create_dir_all(path.parent().expect("the record has a folder")).expect("the record's folder can be made");
     fs::write(path, record).expect("the record can be planted");
-    case
 }
 
 /// A [`planted_case`] whose record is [`RELEASE_RECORD`].
@@ -7576,4 +7581,223 @@ fn a_routed_run_of_any_godot_or_no_pin_sends_no_version() {
             "{name}: {outcome:?}"
         );
     }
+}
+
+/// The routed `dotnet test --no-build` of the send cases: the stand-in dotnet prints its words after `argv`, so a case
+/// sees whether the builder kept `--no-build`.
+const SENT_TEST: [&str; 7] = [r".\dotnet.exe", "test", "argv", "App.csproj", "-c", "Release", "--no-build"];
+/// The PC's build of the send cases' one project, below the worktree root.
+const SENT_DLL: &str = r"bin\Release\App.dll";
+/// The log line of a send that did not land, before its reason.
+const BUILD_NOT_SENT: &str = "gate: remote build not sent: ";
+
+/// Writes the case's routing file as an [`outputs_case`]'s bringing back `**/bin/**`, its repo listed in `sendBuild`
+/// when `listed`.
+fn sent_routing(case: &Case, listed: bool) {
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let mut routing = json!({ "host": HOST, "slots": 2, "repos": { &repo: ["*tool*", "*dotnet*"] }, "outputs": { &repo: BIN } });
+    if listed {
+        routing["sendBuild"] = json!([repo]);
+    }
+    write_remote_json(case, &routing.to_string());
+}
+
+/// An [`outputs_case`] bringing back `**/bin/**` whose repo `sendBuild` lists, whose project `App.csproj` at the root the
+/// PC built in Release: its `bin\Release` and the two restore files of its `obj` folder, but the one named `missing`,
+/// both folders ignored by git.
+fn sent_build_case(name: &str, missing: Option<&str>) -> Case {
+    let case = outputs_case(name, &BIN);
+    sent_routing(&case, true);
+    copy_tool(&case, "dotnet.exe");
+    write(&case, ".gitignore", &format!("{CLIENT_IGNORED}bin/\nobj/\n"));
+    write(&case, "App.csproj", "<Project />\n");
+    write(&case, SENT_DLL, "the PC's build");
+    for restore in ["App.csproj.nuget.g.props", "App.csproj.nuget.g.targets"] {
+        if missing != Some(restore) {
+            write(&case, &format!(r"obj\{restore}"), "<Project />\n");
+        }
+    }
+    case
+}
+
+/// Whether the case's log `log` holds a line saying the PC's build was not sent, naming `why` in its reason.
+fn build_not_sent(case: &Case, log: &str, why: &str) -> bool {
+    let said = fs::read_to_string(case.folder().join(log)).expect("the log was written");
+    said.lines()
+        .any(|line| line.strip_prefix(BUILD_NOT_SENT).is_some_and(|reason| reason.contains(why)))
+}
+
+#[test]
+fn a_sent_build_lands_and_the_builder_keeps_no_build() {
+    let case = sent_build_case("client-sent-build-lands", None);
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &SENT_TEST));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "inputs", "inputs", "run"],
+        "the send's diff and put, then the run"
+    );
+    assert!(
+        outcome.stdout.lines().any(|line| line == "--no-build"),
+        "the builder kept it: {outcome:?}"
+    );
+    assert!(!outcome.stderr.contains(DROPPED_NO_BUILD_LINE), "{outcome:?}");
+    assert_eq!(
+        fs::read_to_string(work_folder(&case).join(SENT_DLL)).ok().as_deref(),
+        Some("the PC's build"),
+        "the work folder holds the PC's build"
+    );
+    assert_eq!(nothing_back(&case), None, "a kept --no-build leaves no nothing-back record: {outcome:?}");
+    assert!(!pending_marker(&case).exists(), "nor an outputs-pending marker: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+#[test]
+fn a_send_the_box_fails_takes_the_drop_with_its_line() {
+    let case = sent_build_case("client-sent-build-fails", None);
+    let steps = ssh_steps(&case, "ssh", &["ok", "say-exit 1 gate: remote inputs diff failed: not today", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &SENT_TEST));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "run"], "the send's diff, then the run");
+    assert!(outcome.stderr.contains(DROPPED_NO_BUILD_LINE), "{outcome:?}");
+    assert!(
+        !outcome.stdout.lines().any(|line| line == "--no-build"),
+        "the builder dropped it: {outcome:?}"
+    );
+    assert!(build_not_sent(&case, "out.log", "not today"), "{outcome:?}");
+    assert!(nothing_back(&case).is_some(), "the drop built on the builder: {outcome:?}");
+    assert!(pending_marker(&case).exists(), "and withheld its outputs: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "never a local run");
+}
+
+/// The run call is held until the case removes the file the send installed, so the box's record of the sent build no
+/// longer holds what the work folder does.
+#[test]
+fn a_run_the_box_refuses_for_its_sent_build_runs_again_with_the_drop() {
+    let case = sent_build_case("client-sent-build-refused", None);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", &format!("hold {}", shown(go.path())), "ok"]);
+    let running = start(client_gate(&case, "out.log", &steps, &SENT_TEST));
+    running.wait_until("the run call", || calls(&steps).len() == 4);
+    fs::remove_file(work_folder(&case).join(SENT_DLL)).expect("the sent file can be removed");
+    drop(go);
+
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run", "run"], "one run again");
+    assert!(outcome.stderr.contains(DROPPED_NO_BUILD_LINE), "{outcome:?}");
+    assert!(
+        outcome.stdout.lines().any(|line| line == "-c"),
+        "the run again ran the command: {outcome:?}"
+    );
+    assert!(
+        !outcome.stdout.lines().any(|line| line == "--no-build"),
+        "with --no-build dropped: {outcome:?}"
+    );
+    assert!(nothing_back(&case).is_some(), "the drop built on the builder: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "never a local run");
+}
+
+#[test]
+fn a_restore_file_missing_on_the_pc_sends_nothing_and_takes_the_drop() {
+    let case = sent_build_case("client-sent-build-no-restore", Some("App.csproj.nuget.g.targets"));
+    let steps = ssh_steps(&case, "ssh", &["ok"; 2]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &SENT_TEST));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "no inputs call");
+    assert!(outcome.stderr.contains(DROPPED_NO_BUILD_LINE), "{outcome:?}");
+    assert!(!outcome.stdout.lines().any(|line| line == "--no-build"), "{outcome:?}");
+    assert!(build_not_sent(&case, "out.log", "nuget.g.targets"), "{outcome:?}");
+}
+
+/// How many of `stderr`'s lines are the dropped line.
+fn dropped_lines(stderr: &str) -> usize {
+    stderr.lines().filter(|line| *line == DROPPED_NO_BUILD_LINE).count()
+}
+
+#[test]
+fn a_repo_send_build_does_not_list_takes_the_drop_with_today_s_line() {
+    let case = sent_build_case("client-sent-build-unlisted", None);
+    sent_routing(&case, false);
+    let steps = ssh_steps(&case, "ssh", &["ok"; 2]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &SENT_TEST));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "no inputs call");
+    assert_eq!(dropped_lines(&outcome.stderr), 1, "{outcome:?}");
+    assert!(!outcome.stdout.lines().any(|line| line == "--no-build"), "{outcome:?}");
+    assert!(!build_not_sent(&case, "out.log", ""), "no send was planned: {outcome:?}");
+}
+
+#[test]
+fn a_standing_nothing_back_record_of_the_run_s_configuration_takes_the_drop_and_sends_nothing() {
+    for (name, record) in [
+        ("client-sent-build-record-same", r#"{"v":1,"host":"builder","configuration":"release"}"#),
+        ("client-sent-build-record-any", r#"{"v":1,"host":"builder"}"#),
+        ("client-sent-build-record-unreadable", "not a record"),
+    ] {
+        let case = sent_build_case(name, None);
+        plant_record(&case, record);
+        let steps = ssh_steps(&case, "ssh", &["ok"; 2]);
+
+        let outcome = finish(client_gate(&case, "out.log", &steps, &SENT_TEST));
+
+        assert_eq!(outcome.code, Some(0), "{name}: {outcome:?}");
+        assert_eq!(calls(&steps), ["preflight", "run"], "{name}: nothing sent");
+        assert_eq!(dropped_lines(&outcome.stderr), 1, "{name}: {outcome:?}");
+        assert!(!outcome.stdout.lines().any(|line| line == "--no-build"), "{name}: {outcome:?}");
+        assert!(build_not_sent(&case, "out.log", "nothing-back"), "{name}: {outcome:?}");
+    }
+}
+
+#[test]
+fn a_standing_nothing_back_record_of_another_configuration_still_sends() {
+    let case = sent_build_case("client-sent-build-record-other", None);
+    plant_record(&case, r#"{"v":1,"host":"builder","configuration":"Debug"}"#);
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &SENT_TEST));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run"], "{outcome:?}");
+    assert!(outcome.stdout.lines().any(|line| line == "--no-build"), "{outcome:?}");
+    assert_eq!(dropped_lines(&outcome.stderr), 0, "{outcome:?}");
+}
+
+/// The first run holds the worktree's work folder past the second's bound, so the second, a send's, falls back busy
+/// before any send and runs here with `--no-build` dropped, saying so once.
+#[test]
+fn a_busy_fallback_of_a_send_says_the_dropped_line_once() {
+    let case = sent_build_case("client-sent-build-busy", None);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "100"],
+        ..Tuned::default()
+    };
+
+    let (_, second) = finish_with_pid(client_gate_tuned(&case, "second.log", &second_steps, &tuned, &SENT_TEST));
+    drop(go);
+    let first = first.finish();
+
+    assert_eq!((first.code, second.code), (Some(0), Some(0)), "{first:?} {second:?}");
+    assert_eq!(calls(&second_steps), Vec::<String>::new(), "the second never reached the builder");
+    assert_in_order(&second.stderr, &[BUSY_LINE, DROPPED_NO_BUILD_LINE]);
+    assert_eq!(dropped_lines(&second.stderr), 1, "{second:?}");
+    assert!(
+        second.stdout.lines().any(|line| line == "-c") && !second.stdout.lines().any(|line| line == "--no-build"),
+        "the run here dropped it: {second:?}"
+    );
 }

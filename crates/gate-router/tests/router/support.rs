@@ -192,6 +192,12 @@ impl Facts for FakeFacts {
         self.head.clone()
     }
 
+    /// No build file moves the output.
+    fn moves_build_output(&self, _place: &Place, _folder: &str, _file: Option<&str>) -> bool {
+        self.ask("moves_build_output".to_owned());
+        false
+    }
+
     /// The box's layout under [`FakeFacts::builder_root`]: the work folder `{root}\work\{key}` itself with no sibling,
     /// else `{work}\{leaf}` and `{work}\{name}` for each sibling; each PC root with `\` separators, as the gate spells it.
     fn box_trees(&self, target: &Target) -> Vec<(String, String)> {

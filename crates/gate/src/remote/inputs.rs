@@ -12,7 +12,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::os::windows::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gate_state::{FallbackReason, v1};
@@ -347,7 +347,12 @@ pub(super) fn sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> 
 /// either call refuses the route `inputs`, its reason in the log. An end no inputs call returns fails the run.
 pub(super) fn send(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, built: &Built) -> Result<(), End> {
     let started = Instant::now();
-    let ended = sent_to(attempt, location, nonce, built);
+    let request = Request {
+        location,
+        nonce,
+        kind: Kind::Inputs,
+    };
+    let ended = sent_to(attempt, &request, built);
     attempt.split.inputs = Some(started.elapsed());
     match ended {
         Ok(()) => Ok(()),
@@ -363,6 +368,116 @@ pub(super) fn send(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &s
     }
 }
 
+/// Why the PC's build of a project was not sent, `why`: the log's line, which the dropped line follows on the console.
+pub(super) fn build_not_sent(why: &str) -> String {
+    format!("gate: remote build not sent: {}", escaped(why))
+}
+
+/// The ends of the names a send carries from the project's `obj` folder beside its bin folder: the restore files.
+const RESTORE_ENDS: [&str; 2] = [".nuget.g.props", ".nuget.g.targets"];
+
+/// Sends the PC's build of the project whose bin folder below the worktree root is `bin`, `{project}/bin/{configuration}`,
+/// to the work folder at `location`, so the builder keeps a routed `dotnet test`'s `--no-build`: the manifest of the
+/// files under that folder and of the project's two restore files ([`build_built`]), then the diff and the put of what
+/// the box lacks, as the inputs are sent ([`send`]), under a nonce, `.tmp` names, a hash cache and a part of the split of
+/// its own. The digest of the manifest line once it landed, the run call's `SentDigest`.
+///
+/// `None` for a send that did not land, its reason in the log ([`build_not_sent`]): a restore file missing on the PC, no
+/// file under the bin folder, a manifest past a cap, a refusal, a failure or a lost connection; the run then takes the
+/// drop. Never the route's `inputs` refusal: a Ctrl+C ends the run, and the box's `install` refusal falls back as an
+/// inputs call's does.
+pub(super) fn sent_build(attempt: &mut Attempt<'_, '_>, location: &Location, bin: &str) -> Result<Option<String>, End> {
+    let started = Instant::now();
+    let ended = build_sent(attempt, location, bin);
+    attempt.split.sent_build = Some(started.elapsed());
+    let why = match ended {
+        Ok(digest) => return Ok(Some(digest)),
+        Err(Unsent::Ended(End::Interrupted)) => return Err(End::Interrupted),
+        Err(Unsent::Ended(End::Refused(FallbackReason::Install))) => return Err(End::Refused(FallbackReason::Install)),
+        Err(Unsent::Refused(why) | Unsent::Ended(End::Failed(why))) => why,
+        Err(Unsent::Ended(other)) => format!("the inputs call ended {}", unexpected(&other)),
+    };
+    attempt.logged_kept(build_not_sent(&why));
+    Ok(None)
+}
+
+/// The manifest of the PC's build of the project of `bin` ([`build_built`]), sent under a nonce new to it; its digest,
+/// else why not or the end a call ended on.
+fn build_sent(attempt: &mut Attempt<'_, '_>, location: &Location, bin: &str) -> Result<String, Unsent> {
+    let built = match build_built(attempt, bin) {
+        Ok(built) => built,
+        Err(Unbuilt::Interrupted) => return Err(Unsent::Ended(End::Interrupted)),
+        Err(Unbuilt::Failed(why)) => return Err(Unsent::Refused(why)),
+    };
+    let nonce = payload::run_nonce();
+    let request = Request {
+        location,
+        nonce: &nonce,
+        kind: Kind::Build(bin),
+    };
+    sent_to(attempt, &request, &built)?;
+    Ok(built.digest)
+}
+
+/// The project's `obj` folder of the bin folder `bin`, `/`-ended: `{project}/obj/`, or `obj/` for a project at the root.
+fn obj_of(bin: &str) -> String {
+    match bin.rsplitn(3, '/').nth(2) {
+        Some(project) => format!("{project}/obj/"),
+        None => "obj/".to_owned(),
+    }
+}
+
+/// The manifest of the PC's build of the project of `bin`: every file under `bin` and each file of the project's `obj`
+/// folder whose name ends as a restore file does ([`RESTORE_ENDS`]), ignored by git or not, with the inputs' exclusions,
+/// each hashed as an input is, taking its hash from the sent-build hash cache. A build with no file under `bin`, or
+/// with either restore file missing, is not sent, nor is one past the inputs' caps.
+fn build_built(attempt: &mut Attempt<'_, '_>, bin: &str) -> Result<Built, Unbuilt> {
+    let call = attempt.call;
+    let root = Path::new(call.root);
+    let obj = obj_of(bin);
+    let mut globs = vec![format!("{bin}/**")];
+    globs.extend(RESTORE_ENDS.iter().map(|end| format!("{obj}*{end}")));
+    let matched = Globs::inputs(&globs, &exclusions(root, call.key, call.log)).map_err(Unbuilt::Failed)?;
+    let found = walk(root, &matched).map_err(|error| Unbuilt::Failed(error.to_string()))?;
+    if let Some(index) = (0..globs.len()).find(|index| !found.iter().any(|file| matched.matched_by(*index, &file.path))) {
+        return Err(Unbuilt::Failed(if index == 0 {
+            format!("the PC holds no file under {bin}")
+        } else {
+            format!("the PC holds no restore file {}", globs[index])
+        }));
+    }
+    if found.len() > MEMBERS {
+        return Err(Unbuilt::Failed(format!(
+            "{} files make the PC's build, more than one put carries ({MEMBERS})",
+            found.len()
+        )));
+    }
+    let cache = v1::sent_build_hashes_path(call.state_dir, call.key);
+    let asked = Asked {
+        root,
+        globs: &globs,
+        key: call.key,
+        log: call.log,
+        cache: &cache,
+        caps: Caps::FULL,
+        limit: attempt.limit,
+        interrupt: call.interrupt,
+    };
+    let manifest = hashed(&asked, &found, || attempt.go_on().is_ok())?;
+    let line = manifest.line();
+    if line.len() > asked.caps.manifest {
+        return Err(Unbuilt::Failed(PAST_THE_CAP.to_owned()));
+    }
+    let (digest, _) = sha256_of(line.trim_end_matches('\n').as_bytes()).map_err(|error| Unbuilt::Failed(error.to_string()))?;
+    Ok(Built {
+        line,
+        digest,
+        manifest,
+        found,
+        said: Vec::new(),
+    })
+}
+
 /// How an end no inputs or LFS call returns is said: the run call's own ends, and a pair's.
 pub(super) fn unexpected(end: &End) -> &'static str {
     match end {
@@ -371,6 +486,7 @@ pub(super) fn unexpected(end: &End) -> &'static str {
         End::Lost(_) => "with its connection lost",
         End::NotRouted(_) => "not routed",
         End::Refused(_) => "refused",
+        End::SentRefused => "refused for the PC's build",
         End::Failed(_) => "failed",
         End::Interrupted => "interrupted",
     }
@@ -424,18 +540,69 @@ fn cut_why(step: Step, cut: Cut) -> String {
     }
 }
 
+/// What an inputs call sends: the repo's inputs, or the PC's build of one project, its bin folder below the worktree
+/// root, `{project}/bin/{configuration}`, sent as `SentBin`.
+#[derive(Clone, Copy)]
+enum Kind<'k> {
+    Inputs,
+    Build(&'k str),
+}
+
+impl<'k> Kind<'k> {
+    /// What the step's lines call what it sends.
+    fn label(self) -> &'static str {
+        match self {
+            Kind::Inputs => "inputs",
+            Kind::Build(_) => "sent build",
+        }
+    }
+
+    /// The name of its files in `.tmp`, after `{key}-{nonce}.`: its diff answer `{name}-diff` and its archive
+    /// `{name}.tar.zst`.
+    fn file(self) -> &'static str {
+        match self {
+            Kind::Inputs => "inputs",
+            Kind::Build(_) => "sent-build",
+        }
+    }
+
+    /// Its PC hash cache for the work folder `key` in the state root `state`.
+    fn cache(self, state: &Path, key: &str) -> PathBuf {
+        match self {
+            Kind::Inputs => v1::inputs_hashes_path(state, key),
+            Kind::Build(_) => v1::sent_build_hashes_path(state, key),
+        }
+    }
+
+    /// The bin folder of a send of the PC's build, `None` for the inputs.
+    fn bin(self) -> Option<&'k str> {
+        match self {
+            Kind::Inputs => None,
+            Kind::Build(bin) => Some(bin),
+        }
+    }
+}
+
+/// Where an inputs call sends what, under which nonce.
+struct Request<'r> {
+    location: &'r Location,
+    nonce: &'r str,
+    kind: Kind<'r>,
+}
+
 /// The diff, then the put of what it needs ([`send`]), the worktree's `.tmp` held from before the diff's answer is
 /// made until the put has ended.
-fn sent_to(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, built: &Built) -> Result<(), Unsent> {
+fn sent_to(attempt: &mut Attempt<'_, '_>, request: &Request<'_>, built: &Built) -> Result<(), Unsent> {
+    let (nonce, kind) = (request.nonce, request.kind);
     let root = Path::new(attempt.call.root);
     let folder = root.join(TMP);
     let mut held = Archive::new(root, folder.clone());
     fs::create_dir_all(&folder)
         .and_then(|()| held.hold(&folder))
         .map_err(|error| Unsent::Refused(format!("cannot hold {}: {error}", folder.display())))?;
-    let needed = diffed(attempt, location, nonce, built)?;
+    let needed = diffed(attempt, request, built)?;
     if needed.is_empty() {
-        attempt.logged(&format!("gate: inputs: {} file(s) unchanged", built.manifest.files().count()));
+        attempt.logged(&format!("gate: {}: {} file(s) unchanged", kind.label(), built.manifest.files().count()));
         return Ok(());
     }
     let bytes = needed.iter().fold(0_u64, |total, file| total.saturating_add(file.stamp.size));
@@ -445,10 +612,10 @@ fn sent_to(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, buil
             attempt.inputs_budget
         )));
     }
-    let path = folder.join(format!("{}-{nonce}.inputs.tar.zst", attempt.call.key));
+    let path = folder.join(format!("{}-{nonce}.{}.tar.zst", attempt.call.key, kind.file()));
     let started = Instant::now();
-    let archive = made_in_tmp(root, &path, "the inputs archive")?;
-    let cache = v1::inputs_hashes_path(attempt.call.state_dir, attempt.call.key);
+    let archive = made_in_tmp(root, &path, &format!("the {} archive", kind.label()))?;
+    let cache = kind.cache(attempt.call.state_dir, attempt.call.key);
     let packing = Pack {
         root,
         files: &needed,
@@ -456,10 +623,10 @@ fn sent_to(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, buil
         cache: &cache,
     };
     let compressed = packed(&archive, &path, &packing, &|| attempt.go_on().is_ok())?;
-    put(attempt, location, nonce, built, (&archive, compressed, needed.len()))?;
+    put(attempt, request, built, (&archive, compressed, needed.len()))?;
     drop(archive);
     drop(held);
-    attempt.say(sent_line(needed.len(), bytes, compressed, started.elapsed()));
+    attempt.say(sent_line(kind.label(), needed.len(), bytes, compressed, started.elapsed()));
     Ok(())
 }
 
@@ -490,11 +657,12 @@ pub(super) fn tmp_file(root: &Path, path: &Path, what: &str) -> Result<File, Str
     Ok(file)
 }
 
-/// The console line of a put that sent `count` files of `bytes` bytes, `compressed` as sent, in `took`.
+/// The console line of a put of what `label` names that sent `count` files of `bytes` bytes, `compressed` as sent, in
+/// `took`.
 #[expect(clippy::cast_precision_loss, reason = "a size said to one decimal of a megabyte")]
-fn sent_line(count: usize, bytes: u64, compressed: u64, took: Duration) -> String {
+fn sent_line(label: &str, count: usize, bytes: u64, compressed: u64, took: Duration) -> String {
     format!(
-        "gate: inputs: {count} file(s), {:.1} MB ({:.1} MB compressed) in {:.1} s",
+        "gate: {label}: {count} file(s), {:.1} MB ({:.1} MB compressed) in {:.1} s",
         bytes as f64 / MB,
         compressed as f64 / MB,
         took.as_secs_f64()
@@ -504,11 +672,13 @@ fn sent_line(count: usize, bytes: u64, compressed: u64, took: Duration) -> Strin
 /// The files of `built` the box's diff call says its work folder lacks or holds otherwise; else why not. Its answer is
 /// written raw into a file of the held `.tmp` and read back through the same handle; the call is watched by its own
 /// output and a transfer ceiling counted from its own start, as a fetch is.
-fn diffed<'b>(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, built: &'b Built) -> Result<Vec<&'b Found>, Unsent> {
-    let head = payload::input(&payload::inputs_word(location, nonce, InputsStep::Diff), Some(&built.line));
+fn diffed<'b>(attempt: &mut Attempt<'_, '_>, request: &Request<'_>, built: &'b Built) -> Result<Vec<&'b Found>, Unsent> {
+    let (nonce, kind) = (request.nonce, request.kind);
+    let word = payload::inputs_word(request.location, nonce, InputsStep::Diff, kind.bin());
+    let head = payload::input(&word, Some(&built.line));
     let root = Path::new(attempt.call.root);
-    let path = root.join(TMP).join(format!("{}-{nonce}.inputs-diff", attempt.call.key));
-    let answer = made_in_tmp(root, &path, "the inputs diff answer")?;
+    let path = root.join(TMP).join(format!("{}-{nonce}.{}-diff", attempt.call.key, kind.file()));
+    let answer = made_in_tmp(root, &path, &format!("the {} diff answer", kind.label()))?;
     let cap = NonZeroU64::new(2 * (built.line.len() as u64) + 1024 * 1024).unwrap_or(NonZeroU64::MIN);
     let shown = path.display().to_string();
     // Each attempt writes the answer anew from its start, through a clone of the one handle. The clones share one
@@ -652,9 +822,10 @@ impl<W: Write> Write for Asking<'_, W> {
 /// The put call of the `sent` files packed into the open archive, its compressed length and their count: the request,
 /// the manifest and then the archive, watched as a put; else why not, a builder that installed another count than was
 /// sent included.
-fn put(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, built: &Built, sent: (&File, u64, usize)) -> Result<(), Unsent> {
+fn put(attempt: &mut Attempt<'_, '_>, request: &Request<'_>, built: &Built, sent: (&File, u64, usize)) -> Result<(), Unsent> {
     let (archive, length, count) = sent;
-    let head = payload::input(&payload::inputs_word(location, nonce, InputsStep::Put), Some(&built.line));
+    let word = payload::inputs_word(request.location, request.nonce, InputsStep::Put, request.kind.bin());
+    let head = payload::input(&word, Some(&built.line));
     let watch = Watch::Put(attempt.limits_for("inputs"));
     let called = attempt.inputs_call(&head, Some((archive, length)), None, watch).map_err(Unsent::Ended)?;
     judged(attempt, &called, Step::Put)?;

@@ -207,6 +207,14 @@ pub trait Facts {
     /// the run then routes without the path-map word. Asked only of a dotnet command that gets the word.
     fn box_trees(&self, target: &Target) -> Vec<(String, String)>;
 
+    /// Whether the build files of the project in `folder` below the worktree root of `place` (`/`-separated and
+    /// `/`-ended, empty at the root) may move its build output out of its `bin\{configuration}` folder: the project
+    /// file `file`, or each project file in `folder` when the command named the folder, and every
+    /// `Directory.Build.props` and `Directory.Build.targets` from `folder` up to the root, any of them naming one of
+    /// [`OUTPUT_PROPERTIES`]; `true` too when such a file is there and cannot be read. Asked only of a routed
+    /// `dotnet test --no-build` that could keep its `--no-build` by a send ([`send_bin`]).
+    fn moves_build_output(&self, place: &Place, folder: &str, file: Option<&str>) -> bool;
+
     /// Whether a file of exactly this name is in the gate's folder.
     fn file_in_folder(&self, name: &str) -> bool;
 
@@ -442,6 +450,11 @@ pub struct RemoteRun {
     pub inputs: Vec<String>,
     /// Whether `--no-build` was dropped from the builder's words.
     pub dropped_no_build: bool,
+    /// The send that lets the builder keep a routed `dotnet test`'s `--no-build` ([`send_bin`]), for a repo the routing
+    /// file's `sendBuild` lists ([`Config::send_build_allowed`]): the PC's build of its one project sent first, then the
+    /// kept words run. `None` for every other run; a send that does not land runs
+    /// [`RemoteRun::words`], `--no-build` dropped.
+    pub send: Option<SendPlan>,
     /// Whether outputs were withheld from a `--no-build` command.
     pub outputs_withheld: bool,
     /// Whether the run asks for the builder's desktop: the first `.gate/desktop.toml` pattern its rewritten words match
@@ -453,17 +466,28 @@ pub struct RemoteRun {
     pub source_revision: Option<String>,
 }
 
+/// How a routed `dotnet test --no-build` keeps its `--no-build` ([`RemoteRun::send`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendPlan {
+    /// The words the builder runs once the send lands: the rewritten words with `--no-build` kept and the bare first
+    /// word marked, never stamped, as a command that does not build is not ([`stamp`]).
+    pub words: Vec<String>,
+    /// The project's bin folder of the run's configuration below the worktree root, `/`-separated:
+    /// `{project}/bin/{configuration}`, or `bin/{configuration}` for a project at the root.
+    pub bin: String,
+}
+
 impl RemoteRun {
-    /// The lines the gate says for this route, in order: [`RemoteRun::program_line`], [`DROPPED_NO_BUILD_LINE`],
-    /// [`NO_OUTPUTS_LINE`], then, for a run carrying siblings, `gate: routed with siblings: {name} ({root}), ...` naming
-    /// each in declared order.
+    /// The lines the gate says for this route, in order: [`RemoteRun::program_line`], [`DROPPED_NO_BUILD_LINE`] unless
+    /// the run has a send, whose client says it only when the send does not land, [`NO_OUTPUTS_LINE`], then, for a run
+    /// carrying siblings, `gate: routed with siblings: {name} ({root}), ...` naming each in declared order.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         if let Some(line) = self.program_line() {
             lines.push(line);
         }
-        if self.dropped_no_build {
+        if self.dropped_no_build && self.send.is_none() {
             lines.push(DROPPED_NO_BUILD_LINE.to_owned());
         }
         if self.outputs_withheld {
@@ -1262,6 +1286,15 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
     } = matched;
     let sent_count = sent.len();
     let cargo = is_cargo(&sent);
+    let listed = config.send_build_allowed(&target.repo) == Ok(true);
+    let send = listed
+        .then(|| send_bin(given, &target.place, |folder, file| facts.moves_build_output(&target.place, folder, file)))
+        .flatten()
+        .map(|bin| {
+            let mut kept = sent.clone();
+            mark_bare_first_word(&mut kept, facts, program_named);
+            SendPlan { words: kept, bin }
+        });
     let mut words = without_no_build(sent);
     let dropped_no_build = words.len() != sent_count;
     let fallback = without_no_build(given.to_vec());
@@ -1294,6 +1327,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         outputs,
         inputs: target.inputs,
         dropped_no_build,
+        send,
         outputs_withheld,
         desktop,
         source_revision,
@@ -1340,9 +1374,13 @@ fn mark_bare_first_word(words: &mut [String], facts: &dyn Facts, program_named: 
 /// ([`path_map_word`]) of the trees [`Facts::box_trees`] gives for `target`, so its outputs record this PC's paths.
 /// The source-revision word is left out when the command's own words set `SourceRevisionId` or `sha` gives none, which
 /// is asked only when the word may go in; the path-map word when they set any of [`PATH_MAP_OPT_OUTS`] or there is no
-/// tree. The words of a command that is no such dotnet command are left as they are.
+/// tree. The words of a command that is no such dotnet command, or that does not build ([`dotnet_builds`]), a kept
+/// `--no-build` among them, are left as they are.
 fn stamp(words: &mut Vec<String>, sha: impl FnOnce() -> Option<String>, target: &Target, facts: &dyn Facts) {
-    let Some(own) = dotnet_own(words).filter(|own| builds(&words[own.clone()])) else {
+    if !dotnet_builds(words) {
+        return;
+    }
+    let Some(own) = dotnet_own(words) else {
         return;
     };
     let own_words = &words[own.clone()];
@@ -1435,4 +1473,264 @@ fn fold_lines(text: &str) -> String {
     pieces.extend(middle.iter().map(|part| part.trim()).filter(|part| !part.is_empty()));
     pieces.push(last.trim_start());
     pieces.join(" ")
+}
+
+/// The dotnet verb whose `--no-build` a send lets the builder keep.
+const SEND_VERB: [&str; 1] = ["test"];
+/// The options that move a dotnet command's build output, whose `--no-build` no send keeps.
+const OUTPUT_OPTIONS: [&str; 3] = ["-o", "--output", "--artifacts-path"];
+/// The `MSBuild` properties that move a project's build output out of its `bin\{configuration}` folder, whose
+/// `--no-build` no send keeps: `Platform` among them, as a platform other than `AnyCPU` builds into
+/// `bin\{platform}\{configuration}`.
+pub const OUTPUT_PROPERTIES: [&str; 5] = ["OutputPath", "BaseOutputPath", "UseArtifactsOutput", "OutDir", "Platform"];
+
+/// The bin folder whose files a routed `dotnet test --no-build` sends so the builder keeps its `--no-build`
+/// ([`SendPlan::bin`]), read from the command `words` as given at `place`: the dotnet command's verb is `test`, its own
+/// words hold `--no-build`, name one project ([`DotnetTarget::Project`]) inside the worktree and set the configuration
+/// (`-c` or `--configuration`) to one plain name, and neither name an output option ([`OUTPUT_OPTIONS`]) nor set an
+/// output property ([`OUTPUT_PROPERTIES`]); `moves_output`, asked last of the project's folder below the root and the
+/// project file's name when one is named, says whether its build files may move it ([`Facts::moves_build_output`]).
+/// `None` for every other command, whose `--no-build` is dropped as before.
+fn send_bin(words: &[String], place: &Place, moves_output: impl FnOnce(&str, Option<&str>) -> bool) -> Option<String> {
+    let own = &words[dotnet_own(words)?];
+    if !verb_in(own, &SEND_VERB) || !own.iter().any(|word| word == NO_BUILD) {
+        return None;
+    }
+    let Some(DotnetTarget::Project(project)) = dotnet_target(words) else {
+        return None;
+    };
+    let configuration = option_value(own, &CONFIGURATION_OPTIONS).filter(|value| is_plain_name(value))?;
+    if own.iter().any(|word| is_output_option(word)) || OUTPUT_PROPERTIES.iter().any(|name| sets_property(own, name)) {
+        return None;
+    }
+    let folder = project_folder(&project, place)?;
+    let file = has_extension(&project, &PROJECT_EXTENSIONS).then(|| project.rsplit(['/', '\\']).next().unwrap_or(&project));
+    if moves_output(&folder, file) {
+        return None;
+    }
+    Some(format!("{folder}bin/{configuration}"))
+}
+
+/// Whether `word` is one of [`OUTPUT_OPTIONS`], alone or with its value after `=` or `:`, ignoring letter case.
+fn is_output_option(word: &str) -> bool {
+    OUTPUT_OPTIONS.iter().any(|option| {
+        word.get(..option.len()).is_some_and(|head| eq_ignoring_case(head, option))
+            && matches!(word.as_bytes().get(option.len()), None | Some(b'=' | b':'))
+    })
+}
+
+/// Whether `value` is one folder name: not empty, `.` or `..`, and with no separator, drive colon or wildcard.
+fn is_plain_name(value: &str) -> bool {
+    !value.is_empty() && value != "." && value != ".." && !value.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|'])
+}
+
+/// The folder of the project `project` names (a project file's folder, or the folder `--project` names) below the
+/// worktree root of `place`, `/`-separated and `/`-ended, empty at the root: a relative path is read against the gate's
+/// folder, an absolute one against the root or the gate's folder as spelled. `None` when it climbs out of the worktree
+/// or is absolute elsewhere.
+fn project_folder(project: &str, place: &Place) -> Option<String> {
+    let project = project.replace('\\', "/");
+    let folder = if has_extension(&project, &PROJECT_EXTENSIONS) {
+        project.rsplit_once('/').map_or("", |(folder, _)| folder)
+    } else {
+        project.as_str()
+    };
+    let absolute = folder.starts_with('/') || folder.as_bytes().get(1) == Some(&b':');
+    let below = if absolute {
+        let below = |root: &str| {
+            let root = root.replace('\\', "/").trim_end_matches('/').to_owned();
+            let head = folder.get(..root.len())?;
+            let rest = &folder[root.len()..];
+            (eq_ignoring_case(head, &root) && (rest.is_empty() || rest.starts_with('/'))).then(|| rest.to_owned())
+        };
+        below(&place.root).or_else(|| below(&place.folder).map(|rest| format!("{}{rest}", place.prefix)))?
+    } else {
+        format!("{}{folder}", place.prefix)
+    };
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in below.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            name => segments.push(name),
+        }
+    }
+    let mut folder = String::new();
+    for segment in segments {
+        folder.push_str(segment);
+        folder.push('/');
+    }
+    Some(folder)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Place, send_bin};
+
+    /// The place of a gate at `prefix` below the worktree root `X:/dev/app`.
+    fn place(prefix: &str) -> Place {
+        Place {
+            root: "X:/dev/app".to_owned(),
+            prefix: prefix.to_owned(),
+            checkout: "app".to_owned(),
+            folder: format!(r"X:\dev\app\{}", prefix.replace('/', "\\")),
+        }
+    }
+
+    fn words(text: &str) -> Vec<String> {
+        text.split(' ').map(str::to_owned).collect()
+    }
+
+    /// The bin folder [`send_bin`] gives `text` at the root, the build files moving nothing.
+    fn sent(text: &str) -> Option<String> {
+        send_bin(&words(text), &place(""), |_, _| false)
+    }
+
+    #[test]
+    fn a_test_of_one_project_with_no_build_and_a_configuration_sends_its_bin() {
+        assert_eq!(
+            sent(r"dotnet test --project tests\App.Tests\App.Tests.csproj -c Release --no-build"),
+            Some("tests/App.Tests/bin/Release".to_owned())
+        );
+        assert_eq!(
+            sent("dotnet test App.csproj --configuration=Debug --no-build"),
+            Some("bin/Debug".to_owned())
+        );
+        assert_eq!(
+            sent("dotnet test --project tests/App.Tests -c:Release --no-build"),
+            Some("tests/App.Tests/bin/Release".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_project_is_read_against_the_gate_s_folder_or_the_root() {
+        let relative = send_bin(
+            &words(r"dotnet test ..\other\Other.csproj -c Release --no-build"),
+            &place("tests/"),
+            |_, _| false,
+        );
+        assert_eq!(relative, Some("other/bin/Release".to_owned()));
+        let absolute = send_bin(
+            &words(r"dotnet test X:\dev\app\src\App.csproj -c Release --no-build"),
+            &place("tests/"),
+            |_, _| false,
+        );
+        assert_eq!(absolute, Some("src/bin/Release".to_owned()));
+        assert_eq!(
+            sent(r"dotnet test ..\elsewhere\App.csproj -c Release --no-build"),
+            None,
+            "outside the worktree"
+        );
+        assert_eq!(sent(r"dotnet test D:\elsewhere\App.csproj -c Release --no-build"), None, "another drive");
+    }
+
+    #[test]
+    fn each_output_option_keeps_the_drop() {
+        for option in [
+            "-o out",
+            "--output out",
+            "--artifacts-path out",
+            "-o:out",
+            "--output=out",
+            "--ARTIFACTS-PATH:out",
+        ] {
+            let command = format!("dotnet test App.csproj -c Release --no-build {option}");
+            assert_eq!(sent(&command), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn each_output_property_keeps_the_drop() {
+        for property in [
+            "-p:OutputPath=out",
+            "-p:BaseOutputPath=out",
+            "/p:UseArtifactsOutput=true",
+            "--property:outputpath=x",
+        ] {
+            let command = format!("dotnet test App.csproj -c Release --no-build {property}");
+            assert_eq!(sent(&command), None, "{command}");
+        }
+    }
+
+    /// Each spelling of setting `property` in the words: `-p:`, `/p:` and `-property:`, in any letter case.
+    fn assert_property_keeps_the_drop(property: &str) {
+        let lower = property.to_lowercase();
+        for set in [
+            format!("-p:{property}=x"),
+            format!("/p:{property}=x"),
+            format!("-property:{property}=x"),
+            format!("-P:{lower}=x"),
+            format!("/property:{}=x", property.to_uppercase()),
+        ] {
+            let command = format!("dotnet test App.csproj -c Release --no-build {set}");
+            assert_eq!(sent(&command), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn out_dir_in_the_words_keeps_the_drop() {
+        assert_property_keeps_the_drop("OutDir");
+    }
+
+    #[test]
+    fn platform_in_the_words_keeps_the_drop() {
+        assert_property_keeps_the_drop("Platform");
+    }
+
+    #[test]
+    fn the_build_files_are_asked_of_the_project_s_folder_and_file() {
+        let asked = |text: &str| {
+            let mut asked = None;
+            send_bin(&words(text), &place(""), |folder, file| {
+                asked = Some((folder.to_owned(), file.map(str::to_owned)));
+                false
+            });
+            asked
+        };
+        assert_eq!(
+            asked(r"dotnet test tests\App.Tests\App.Tests.csproj -c Release --no-build"),
+            Some(("tests/App.Tests/".to_owned(), Some("App.Tests.csproj".to_owned())))
+        );
+        assert_eq!(
+            asked("dotnet test --project tests/App.Tests -c Release --no-build"),
+            Some(("tests/App.Tests/".to_owned(), None)),
+            "a folder named: its project files are read"
+        );
+    }
+
+    #[test]
+    fn build_files_that_move_the_output_keep_the_drop() {
+        assert_eq!(
+            send_bin(&words("dotnet test App.csproj -c Release --no-build"), &place(""), |_, _| true),
+            None
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_build_keeps_the_drop() {
+        assert_eq!(sent("dotnet run --project App.csproj -c Release --no-build"), None);
+    }
+
+    #[test]
+    fn a_test_without_a_configuration_keeps_the_drop() {
+        assert_eq!(sent("dotnet test App.csproj --no-build"), None);
+        assert_eq!(
+            sent("dotnet test App.csproj -c ../x --no-build"),
+            None,
+            "a configuration that is no plain name"
+        );
+    }
+
+    #[test]
+    fn a_test_of_a_solution_or_of_nothing_named_keeps_the_drop() {
+        assert_eq!(sent("dotnet test App.slnx -c Release --no-build"), None);
+        assert_eq!(sent("dotnet test -c Release --no-build"), None);
+    }
+
+    #[test]
+    fn a_test_that_builds_sends_nothing() {
+        assert_eq!(sent("dotnet test App.csproj -c Release"), None);
+    }
 }

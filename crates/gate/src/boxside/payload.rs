@@ -212,6 +212,13 @@ impl Payload {
         self.digest("InputsDigest")
     }
 
+    /// The run's `SentDigest`, the SHA-256 of the manifest line of the PC's build the client sent the work folder,
+    /// without its newline: 64 lower-case hex digits; `None` when the key is absent or null. Else the usage line, as
+    /// [`Payload::inputs_digest`] gives it.
+    pub(crate) fn sent_digest(&self) -> Result<Option<&str>, String> {
+        self.digest("SentDigest")
+    }
+
     /// The run's `LfsDigest`, the SHA-256 of the LFS manifest line of the objects the snapshot's pointers name, without
     /// its newline: 64 lower-case hex digits; `None` when the key is absent or null. Else the usage line, as
     /// [`Payload::inputs_digest`] gives it.

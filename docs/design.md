@@ -632,7 +632,7 @@ The lines of a run that starts its command:
 - A local run that drops its dotnet `--no-build`, on stderr and in the log, before it takes a slot: `gate: dropped --no-build: <reason>; building on a heavy slot`, or `gate: dropped --no-build: <reason>; building on the parent gate's <heavy|critical|light> slot` for a gate covered or lent a slot ([Routing](#routing)).
 - A routed run, on stderr and in the log, says first `gate: routed <given> as <name>` when it sent the command's first word, which named a program by an absolute path outside the worktree, as the program's name (`<given>` the word as given, `<name>` the name sent, each escaped; [Routing](#routing), the in-worktree path rewrite).
 
-  After that line and any `gate: dropped --no-build: the last build may have run on the other machine` and `gate: outputs: none brought back for a --no-build command` lines, it says `gate: routed with siblings: <name> (<path>), ...` when the repo declares siblings.
+  After that line and any `gate: dropped --no-build: the last build may have run on the other machine` (the routed dropped line, which a run with a send leaves to its client, as [Routing](#routing) says; the local one is the line above) and `gate: outputs: none brought back for a --no-build command` lines, it says `gate: routed with siblings: <name> (<path>), ...` when the repo declares siblings.
 
   The line names each sibling in declared order with its root as routing spells it. While it waits for a remote slot: `gate: waiting for a remote slot on <host> (<n> busy)` and `gate: still waiting for a remote slot on <host> (<s> s)`, as a local wait says them, ETA included.
 
@@ -658,7 +658,7 @@ The lines of a run that starts its command:
 
   A warm-up lock that cannot be probed says `gate: cannot probe the warm-up lock <path>: <error>` once (path and error escaped) and the wait goes on. A Ctrl+C during that wait, or raised at the key take, says `gate: interrupted while waiting for this worktree's work folder on <host>` and ends the gate with 0xC000013A, never a `busy` fallback.
 
-  A routed run that passed says `gate: passed in <w> s on <host> (load-adjusted <a> s, ceiling <n> s; command <c> s, push <p> s[, inputs <i> s][, lfs <l> s][, sync-back <s> s][, outputs <o> s]). Full output: <log>`, with `past its ceiling of <n> s` in place of `ceiling <n> s` as the local line has it.
+  A routed run that passed says `gate: passed in <w> s on <host> (load-adjusted <a> s, ceiling <n> s; command <c> s, push <p> s[, inputs <i> s][, lfs <l> s][, sent build <b> s][, sync-back <s> s][, outputs <o> s]). Full output: <log>`, with `past its ceiling of <n> s` in place of `ceiling <n> s` as the local line has it.
 
   In it `<w>` is the attempt's whole wall time; `<a>` is the load-adjusted time the builder counted for the command, the clock `--timeout` bounds; `<c>` is the run call's own wall time; the push is always named, the inputs calls and the LFS calls (diff and put together), the sync-back and the outputs fetch only when they ran, in the order they ran, each in whole seconds rounded half to even.
 
@@ -814,10 +814,11 @@ For any other root, every kernel object name carries `<h>`, the first 8 lower-ca
 | `durations.json` | every slot-taking gate that reaches a verdict, inside the journal mutex right after its `release` line; a rebuilding gate swaps one in | gates, `gate expect` (no lock); ops-tower does not read it | The learned durations store, `{"v":1,"keyVersion":1,"keys":{…}}`, at most 30 samples per key ([design/gate-durations.md](design/gate-durations.md), Store). Written to a temporary sibling and moved over. A gate rebuilds a missing, stale or torn file from the journal and the archive once it has released, outside the journal hold, leaving out `--slot none` runs; a run whose release was filed into a current store does not rebuild, and the store is read again just before the rebuild claim. A store whose `keyVersion` is above this build's is read as no history, and neither filed into nor rebuilt. |
 | `durations.rebuilding`, `durations.rebuilding.<pid>.tmp` | the gate rebuilding the store | other gates | JSON `{"pid":<pid>,"start":<ms>}`; one gate rebuilds at a time, and a marker whose holder is dead or that cannot be read is taken over. Both exist only while a rebuild runs; a Ctrl+C during it swaps nothing and removes the marker. |
 | `backfill\<pid>.json` and the backfill bar record | gates | gates | Reserved for backfill guests (GATE-7; [design/gate-durations.md](design/gate-durations.md)). |
-| `remote\<key>.outputs-pending` | the Rust remote client | the same | Empty file. The Rust client writes it after the push and before a routed run's run call when the run has output globs, or when the route withheld its outputs (a dotnet `--no-build` command the builder built; that marker no end clears), so a run refused at the preflight or by the parity check leaves none, removes it after an accepted `gate-remote-outputs: 0`, an install that skipped no file or only files it cannot rewrite, or a refusal of the archive's members for what they are, and sends `OutputsFull` while it stands ([The remote client's run](#routing)). |
+| `remote\<key>.outputs-pending` | the Rust remote client | the same | Empty file. The Rust client writes it after the push and before a routed run's run call when the run has output globs, or when the route withheld its outputs (a dotnet `--no-build` command the builder built; that marker no end clears, and a routed `dotnet test` whose send of the PC's build landed, which builds nothing there, writes none), so a run refused at the preflight or by the parity check leaves none, removes it after an accepted `gate-remote-outputs: 0`, an install that skipped no file or only files it cannot rewrite, or a refusal of the archive's members for what they are, and sends `OutputsFull` while it stands ([The remote client's run](#routing)). |
 | `remote\<key>.outputs-hashes` | the Rust remote client | the same | The hash cache: one outputs manifest line, `{"files":{"<path>":{"size":…,"modified":…,"sha256":"…"}}}`, of the files of the worktree's last built manifest last written at least 2 s before that build. Saved after each manifest the client builds, and by a complete outputs install (one that skipped no file but ones it cannot rewrite), for the files it put in place, through `<key>.outputs-hashes.<pid>.tmp` and a rename; one that cannot be read, is not a manifest line or is over 64 MiB gives no hash and is replaced by the next save, and deleting the file resets the cache ([The remote client's run](#routing), Manifest time). |
 | `remote\<key>.inputs-hashes` | the Rust remote client | the same | The inputs' hash cache, in the outputs cache's shape and saved as it is, kept apart from it since the outputs saves drop every file the outputs walk no longer finds. Saved after an inputs manifest the client builds changes it; a file whose hash the pack finds wrong is dropped from it, and deleting the file resets the cache ([The remote client's run](#routing), Inputs). |
-| `remote\<key>.nothing-back` | the gate, after a routed dotnet build ends on the builder without its outputs known to be brought back, or, when none stands, a routed dotnet `--no-build` command whose word the builder dropped | every gate (the `--no-build` drop and the clear) | JSON `{"v":1,"host":"…","configuration":"…","framework":"…","runtime":"…"}`; the last three are optional and come from the routed build's own `-c`, `-f` and `-r` words. A passing local build of the whole worktree with the same three removes it, as does a passing routed build of that kind that brought all its outputs back ([Routing](#routing)). Written with create-new and the reparse-point flag, and read the same way, 4096 bytes at most; one that cannot be read counts as present. |
+| `remote\<key>.sent-build-hashes` | the Rust remote client | the same | The sent build's hash cache, in the inputs cache's shape and saved as it is, kept apart from it for the same reason: the manifest line of the PC's build last sent to that work folder. Deleting the file resets the cache ([Routing](#routing), the send of the PC's build). |
+| `remote\<key>.nothing-back` | the gate, after a routed dotnet build ends on the builder without its outputs known to be brought back, or, when none stands, a routed dotnet `--no-build` command whose word the builder dropped (a `dotnet test` whose send of the PC's build landed kept it, and writes none) | every gate (the `--no-build` drop and the clear) | JSON `{"v":1,"host":"…","configuration":"…","framework":"…","runtime":"…"}`; the last three are optional and come from the routed build's own `-c`, `-f` and `-r` words. A passing local build of the whole worktree with the same three removes it, as does a passing routed build of that kind that brought all its outputs back ([Routing](#routing)). Written with create-new and the reparse-point flag, and read the same way, 4096 bytes at most; one that cannot be read counts as present. |
 | `remote\<key>.outputs-capped` | the Rust remote client, at an outputs fetch that passed the fetch cap | the same | The outputs cap record: JSON `{"v":1,"hits":<n>}`, the fetches in a row of that worktree that passed the cap. A second hit in a row fails the run; any other end of its outputs fetch but a Ctrl+C during it, and a box that packed nothing, removes it; one that cannot be read counts no hit ([The remote client's run](#routing), Outputs fetch). |
 | `remote\warm\<key>.json` | `gate warm` for the work folder `<key>` (`gate-state` has the writer and reader) | `gate check`'s warm-up item, a `layout` fallback's delete | The warm-up record: JSON `{"v":1,"host":"…","state":"…","at":"<ISO>","hash":"…","gate":"…","pid":<n>,"started":"<ISO>"}`, then `failure` and `reason` when, and only when, `state` is `failed`. `state` is `warming`, `warm` or `failed`; `failure` is `commands` (the commands failed or ran out of time) or `refused` (refused before any command ran); `hash` is the 64 lower-case hex digits of the SHA-256 of the raw bytes of the worktree's `.gate/warmup.toml` or, when the worktree has none, of its copy in the repo's declarations folder, a byte order mark included; `gate` is the build id of the PC gate that wrote it; `pid` and `started` are the warming process's, for the lines only. Written whole or not at all like the nothing-back record; a record that breaks a rule of its shape is refused on read and on write. ops-tower does not read it. A routed run reads it only after a `layout` fallback, without following the leaf link, and removes it while it is the `warm` record of the builder the run went to, for the warm-up file on disk. |
 | `remote\warm\<key>.log`, `remote\warm\<key>.lock` | `gate warm` | `gate check` and a routed run waiting for its key (the lock) | The warm-up's log, made new for each warm-up, opened without following links and held open without delete sharing, and the lock it holds for its whole life, opened without sharing: a `warming` record counts as live only while the lock is held. A routed run probes the lock opened with full sharing and never takes or creates it. |
@@ -1109,7 +1110,7 @@ Two rolls within one second collide on the archive name: the second archive fail
 
 ### remote.json
 
-`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos` and the optional per-repo `outputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
+`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos` and the optional per-repo `outputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks`, `sendBuild` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
 
 The optional `hosts` is an array of strings naming further builders, which only `gate push` reaches; a routed run goes to `host` alone. Each entry passes the checks `host` does, with the same reasons worded `hosts entries ...`.
 
@@ -1606,6 +1607,28 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A step that really did build here pays a second local build on a refusal, a cost accepted. A fallback that drops no word reuses the first plan.
 
+  A routed `dotnet test` of a repo `remote.json`'s `sendBuild` lists keeps its `--no-build` on the builder by sending the PC's build first, when its own words name one project inside the worktree (a project file, or `--project`), set `-c` or `--configuration` to one plain name, and name no output option (`-o`, `--output`, `--artifacts-path`).
+
+  Nor may they set an output property (`OutputPath`, `BaseOutputPath`, `UseArtifactsOutput`, `OutDir`, `Platform`, as `-p:`, `/p:`, `-property:` or `/property:` in any letter case). A run of a repo `sendBuild` does not list has no send and keeps the drop as before.
+
+  Nor may the project's build files name one of those properties as text: the project file named (each project file of the folder `--project` names), and every `Directory.Build.props` and `Directory.Build.targets` from the project's folder up to the worktree root.
+
+  Such a file that cannot be read counts as naming one, and the log says `gate: not sending the PC's build: cannot read <path>: <error>`. Such a route carries both word sets, and says no dropped line at route time. `dotnet run --no-build` and every other `--no-build` run keep the drop.
+
+  The Rust client sends the build after the inputs and the LFS content: the files under `<project>/bin/<configuration>/` and the project's two restore files, `<project>/obj/*.nuget.g.props` and `*.nuget.g.targets`, through the `inputs` verb's diff and put with `SentBin` ([The box side](#the-box-side)).
+
+  It has its own nonce, its own `.tmp` files (`<key>-<nonce>.sent-build-diff` and `<key>-<nonce>.sent-build.tar.zst`), its own PC hash cache `remote\<key>.sent-build-hashes`, and its own part of the passed line's split, `sent build <n> s`. A put says `gate: sent build: <n> file(s), <x> MB (<y> MB compressed) in <s> s`; a diff that needs nothing says `gate: sent build: <n> file(s) unchanged` in the log.
+
+  A send that lands runs the kept words with the run payload's `SentDigest`, and writes neither the outputs-pending marker nor the nothing-back record.
+
+  No send is made while the last build's outputs are not back: when the worktree's `remote\<key>.nothing-back` record stands (one that cannot be read counts as standing) and names no configuration or the run's own `-c`, in any letter case, the PC's `bin` may be older than the builder's build, so the run takes the drop, its log saying `gate: remote build not sent: the last build's outputs are not back: <record> stands`. A record of another configuration does not stop the send.
+
+  A send that does not land takes the drop: a restore file missing on the PC, no file under the bin folder, a manifest past a cap, a refusal, a failure or a lost connection says `gate: remote build not sent: <why>` in the log, then the dropped line, and the builder runs the dropped words. It never falls back here; a Ctrl+C ends the run, and the box's `install` refusal falls back `install` as an inputs call's does.
+
+  A run call the box refuses with the `sent` tag, its work folder no longer holding the build sent, is made once more under a new nonce with the dropped words and no `SentDigest`, after the dropped line; it never runs here.
+
+  A run with a send that falls back here for any other reason (`busy`, `full`, `tools`, `layout`, `parity`, `inputs`, the send's `install`, a client that cannot start) runs the dropped words here and says the dropped line once, after the fallback line, unless the client already said it.
+
   A dotnet command is one whose first word's file name without extension is `dotnet`, or is `pwsh` or `powershell` with `--` followed by a `dotnet` word (a script handed a dotnet command to run), each compared in any letter case. A dotnet command's own words run from its `dotnet` word to its next `--`, and only they are read: a `--no-build` after that `--`, or before a wrapping script's `--`, belongs to another program and stays, so plain `dotnet test -- --no-build` keeps the word.
 
   A dotnet command with a word starting with `@` (a response file) is opaque, since the gate cannot see its words: it drops no word, gets no `-p:SourceRevisionId` or `-p:PathMap` word, writes no nothing-back record and clears none.
@@ -1648,6 +1671,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   A routed dotnet command whose verb (the next non-empty word after `dotnet`, in any letter case) is `build`, `test`, `publish`, `pack`, `run` or `msbuild` therefore gets `-p:SourceRevisionId=<the worktree's HEAD sha>` on the builder's words only: after the dotnet command's own words, before its own `--`, else at the end (a wrapped dotnet command gets it before dotnet's own `--` too).
 
   The word is not added when one of the dotnet command's own words already sets `SourceRevisionId` (a property switch, as [below](#routed-path-map)). The sha comes from `git rev-parse --verify -q HEAD` in the worktree root, asked once of every routed run, whatever its command (the light-slot route hint reads no HEAD); when that fails or the branch is unborn the run routes without it.
+
+  A routed dotnet command that keeps its `--no-build` for a send of the PC's build gets neither this word nor the `PathMap` word, since it builds nothing on the builder.
 
   The same sha is sent to the builder as the environment variable `SourceRevisionId`, after the caller's `--env` pairs, so the command sees it whatever its words: MSBuild's git targets there would otherwise read the box's HEAD, the run's snapshot commit, and stamp a new revision on every routed MSBuild run.
 
@@ -1752,6 +1777,10 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   `slots` is a whole number 1 to 16 (1 when missing), `repos` an object whose values are arrays of non-empty `-like` patterns, and `outputs` an optional object of the same shape whose globs may not hold `[` or `]`; a repo with no `outputs` entry brings back `**/bin/**` and `**/.godot/mono/temp/bin/**`.
 
   `inputs` is an optional object of the same shape with the same `[`/`]` ban (`is not a valid input glob: '[' and ']' are not allowed`), read by the same table reader; a repo with no `inputs` entry sends nothing, and there is no default list. The route carries the repo's list as `RemoteRun.inputs` and `RemoteCall.inputs`, kept for a dotnet `--no-build` command, whose outputs alone are withheld.
+
+  `sendBuild` is an optional array of repo names, matched in any letter case, whose routed `dotnet test --no-build` may send the PC's build so the builder keeps the word (`Config::send_build_allowed`); a repo it does not name, or a file without the key, sends no build.
+
+  A value that is not an array (`sendBuild must be an array of repo names`) or holds an item that is not a non-empty string (`sendBuild[N] is not a non-empty string`) lets no repo send and leaves the rest of the file usable; routing says nothing about it.
 
   A cargo command instead (its first word's file stem is `cargo` in any case; one a `pwsh` script is handed after `--` is not) brings back `target/*/*.exe`, `target/*/*.dll` and `target/*/*.pdb`: each profile folder's own files, never `deps/`, `build/` or `incremental/`. A repo's own `outputs` list replaces either default.
 
@@ -2084,13 +2113,15 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     `-o RequestTTY=no` leads the options of every `gate box` call and `gate push`'s, so stdin never passes through a pseudo-terminal. The last option, `-o Compression=yes`, is the run call's alone: the preflight, stop, boot and outputs calls, git's ssh command and `gate push` ask for none. The run call's compression covers both directions of its connection: the command's output and protocol lines one way, the request and the outputs manifest the other.
 
-    The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools|layout|inputs|lfs|desktop|install`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag and the adjusted line below.
+    The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools|layout|inputs|sent|lfs|desktop|install`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag and the adjusted line below.
 
     The kill tag `gate-remote-killed: <nonce> timed-out|backstop` is said by the box just after its own kill line, and the client counts a box kill only on this run's tag with a status 124 (a status 124 alone is also what a stopped job or the command itself may end with). The client takes the run's verdict from the tag's kind, never from the log's last kill line.
 
     The adjusted line `gate-remote-adjusted: <nonce> <s.sss>` carries the load-adjusted seconds the box counted, said once the command's output has drained unless the sampler failed, read like the tag on stderr only and the last one winning; another run's, a malformed one or one whose seconds are not a finite number is a line like any other.
 
     A status 75 is a refusal only when this run's refusal tag came on stderr before any start marker (`busy`, `tools`, `layout`, `inputs`, `lfs`, `desktop` or `install`, the fallback reason); a tag after the marker is ignored, so a command that prints the human busy, tools, layout, inputs, lfs, desktop or install line, or a tag of its own, and exits 75 ends with status 75 and no fallback.
+
+    The `sent` tag, read the same way, is no fallback: the client makes the run call once more with `--no-build` dropped ([Routing](#routing)).
 
     Safety rests on order, not on the nonce being secret (the request is on no command line, but the nonce still appears in the run id, the pipe names and the archive name): the box says the marker before the command can run any code (before it creates the command's process, or, in a desktop run, while the command the helper created is still suspended), and the client ignores every tag once it has heard the marker.
   - **Desktop.** A routed run whose `RemoteRun.desktop` is true (Routing, the desktop paragraphs) sends `Desktop: true` and `DesktopWait` in its run call's payload (`payload::run_word`), `DesktopWait` being the usual remote wait, `REMOTE_LIMIT` (60 s), which the box caps at the run's `Timeout`. No other call sends either key, a warm-up included; the scripted test client's recorded call has a `desktop` key.
@@ -2585,11 +2616,11 @@ A routed run therefore moves to one long-lived connection carrying every verb, `
 
 The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`.
 
-A `run` payload also holds `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, `LfsDigest`, `GodotVersion` and `EngineEnv`. An `outputs` payload also holds `Name`.
+A `run` payload also holds `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, `SentDigest`, `LfsDigest`, `GodotVersion` and `EngineEnv`. An `outputs` payload also holds `Name`.
 
 `inflight` reads only `Root`.
 
-`inputs` and `lfs` read `Key`, `Bare`, `Work`, `Lock`, `Nonce` and `Step`.
+`inputs` and `lfs` read `Key`, `Bare`, `Work`, `Lock`, `Nonce` and `Step`, and `inputs` the optional `SentBin`.
 
 A warm-up's `run` payload sets `WarmCommands` (1 to 8 commands, each a non-empty list of non-empty texts) and `WarmHash` (64 lower-case hex digits, the hash of the warm-up file the commands come from), sets no `Command`, and asks for no outputs. The PC's client sends it (The remote client's run, Warm-up call) for `gate warm`. It may carry `GodotVersion` too, and its commands resolve Godot as a run's do.
 
@@ -2846,7 +2877,7 @@ Built verbs:
 
   The layout record `<Work>.layout`, beside the lock, says which layout `Work` holds: `single`, `pair {Leaf} {siblings}` (the siblings sorted without regard to ASCII case, one space before each, so the same siblings in another order are one layout) or `changing` while the folder is being cleared. A missing record says `single`. It is read and written as the tools record is, through a handle that refuses a link, a folder or a file with more than one name.
 
-  The records beside the lock, one file each, named `Work` plus: `.lock` (the run's lock), `.index` (the sync-back's copy of the index), `.layout` (above), `.inputs` (the copies the `inputs` verb left), `.tools` (the dotnet tool restore), `.packages` (the pnpm, bun and npm package restore) and `.warm` (the hash of the warm-up file whose commands last passed in the folder, 64 lower-case hex digits, no line end, written only by a warm-up) and `.command` (the interrupted-command record, below).
+  The records beside the lock, one file each, named `Work` plus: `.lock` (the run's lock), `.index` (the sync-back's copy of the index), `.layout` (above), `.inputs` (the copies the `inputs` verb left), `.sent-build` (the PC's build the `inputs` verb's sent build left), `.tools` (the dotnet tool restore), `.packages` (the pnpm, bun and npm package restore) and `.warm` (the hash of the warm-up file whose commands last passed in the folder, 64 lower-case hex digits, no line end, written only by a warm-up) and `.command` (the interrupted-command record, below).
 
   Each is described where its feature is.
 
@@ -2895,6 +2926,8 @@ Built verbs:
   Otherwise the run is refused with `gate-remote-refused: <nonce> inputs` then `gate: remote inputs of work folder <key> are not the ones sent: <why>`, said together under the output lock, the command never started, and exit 75. A folder moved aside from the exclude file's name says its `moved aside` line, under the lock.
 
   A payload without `InputsDigest` skips the check. The PC reads the `inputs` tag as fallback reason `inputs` and says `gate: remote <host> inputs; running here`, with `gate: remote inputs not sent: the builder's work folder does not hold the inputs sent` in the log.
+
+  A payload with a `SentDigest` (64 lower-case hex digits, else `gate: box payload SentDigest is not 64 lower-case hex digits: <value>` and exit 2) is checked the same way against the sent-build record `<Work>.sent-build` (the `inputs` verb's sent build, below), after the `InputsDigest` check. Otherwise the run is refused with `gate-remote-refused: <nonce> sent` then `gate: remote build sent to work folder <key> is not the one there: <why>`, said together under the output lock, the command never started, and exit 75. A payload without `SentDigest` skips the check.
 
   A payload with an `LfsDigest` (64 lower-case hex digits, else `gate: box payload LfsDigest is not 64 lower-case hex digits: <value>` and exit 2) is checked after the fetch and before the checkout, under the work folder's lock; a payload without one makes no such check, and a pair run that carries one is refused `lfs` before any checkout.
 
@@ -3266,6 +3299,16 @@ Built verbs:
 
   Caps: an archive of more than 50,000 members, or that decompresses to more than 4 GiB (`--test-inputs-budget-bytes` replaces it), is refused as the outputs archive's are, and the put fails (`gate: remote inputs put failed: <why>`, exit 1). The step is not watched on the box; the PC watches both calls ([The remote client's run](#routing), Inputs).
 
+  A payload with a `SentBin`, `<project>/bin/<configuration>` below `Work` (`/`-separated, a plain path whose second-last name is `bin`, else `gate: box payload SentBin is not a plain <project>/bin/<configuration> path: <value>` and exit 2), sends the PC's build of that project instead of the repo's inputs. It installs into its own record, `<Work>.sent-build`, of the inputs record's format and with its own digest, beside `<Work>.inputs`; a layout change removes both records before it clears `Work`.
+
+  A sent build's manifest may name only files below `<project>/bin/<configuration>/` and restore files of `<project>/obj/` itself; any other path fails the step (`the sent build's manifest names '<path>', which is neither below <bin>/ nor a restore file of <project>/obj/`).
+
+  Its diff also fails on a needed path a put could not install to, as a file of a second name, and on a path of its manifest the repo's inputs record holds (`the repo's inputs hold <path>, which the sent build names too`), before anything is uploaded; the client then takes the drop, its log saying `gate: remote build not sent:` with the reason.
+
+  A restore file is a file of an `obj` folder whose name ends `.nuget.g.props` or `.nuget.g.targets`, in either step: one on the box counts as matched whatever it holds, recorded with the manifest's hash; one at a member's target refuses the put (`the builder's own restore file is there`); and a put never deletes one. A diff that finds one restore file of a folder on the box without the other the manifest names fails (`the restore file '<path>' is on the box without '<path>'`).
+
+  Once a sent build's put has every file of its manifest, it deletes each plain file of one name below `<project>/bin/<configuration>/` that neither record holds, reached through handles as above; folders, links and junctions stay, and a file that cannot be deleted says `gate: remote could not remove the leftover build file <path>: <error>`. Both records' paths go into the one exclude file, whichever record an install or a run's check writes it from.
+
   Deployment prerequisites: no other account may rename or replace `<root>` (a protected root cannot be renamed away by others, since the Authenticated Users grant on `D:\` has no delete-child right); the installer's `Gate work root` step applies and verifies the root's security (owner Administrators, protected DACL); no account outside SYSTEM, Administrators and the builder's user may write in `<root>`; and `<root>\work` is not writable by other accounts.
 
   The stage's protection and the beneath-handle walk assume it; the box checks the stages folder it adopts, not the folders above it.
@@ -3318,7 +3361,7 @@ Built verbs:
 
   For each key under `work` it takes `{key}.lock` (a lock it cannot open prints `gate: remote could not open the work folder lock <path>: <error>`), so a key whose lock a run or a sweep holds is kept, and `inflight` does not see a key whose lock a sweep holds. Idleness is the newest write time among the folder, each tree's `.git\FETCH_HEAD`, the key's records and the lock's prior write time.
 
-  A key idle for over 24 hours loses its records in this order: `.layout` is written as `changing` first; `.warm`, `.packages`, `.tools`, `.inputs` and `.command` are removed; the folder is renamed by handle into `{root}\pruned\{key}-{pid}-{nanos}`; `.layout` and `.index` are removed. The lock is released and the renamed folder is deleted through its handle. The `.lock` file stays.
+  A key idle for over 24 hours loses its records in this order: `.layout` is written as `changing` first; `.warm`, `.packages`, `.tools`, `.inputs`, `.sent-build` and `.command` are removed; the folder is renamed by handle into `{root}\pruned\{key}-{pid}-{nanos}`; `.layout` and `.index` are removed. The lock is released and the renamed folder is deleted through its handle. The `.lock` file stays.
 
   Every step works beneath held handles and never follows a link. A failed rename leaves `.layout` reading `changing`, so the next run clears the folder whole.
 

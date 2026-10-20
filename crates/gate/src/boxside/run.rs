@@ -194,6 +194,9 @@ pub(super) struct Request<'a> {
     host: &'a str,
     /// The digest of the inputs manifest the client installed the run's inputs from, `None` when it sent none.
     inputs_digest: Option<&'a str>,
+    /// The digest of the manifest of the PC's build the client sent the work folder, `SentDigest`, `None` when it sent
+    /// none.
+    sent_digest: Option<&'a str>,
     /// The digest of the LFS manifest of the objects the snapshot's pointers name, `LfsDigest`, `None` when the client
     /// sent none. Past the checkout's cover check, a run has one exactly when its snapshot holds LFS pointers.
     lfs_digest: Option<&'a str>,
@@ -234,6 +237,7 @@ impl Request<'_> {
         let engine_env = payload.engine_env()?;
         let engine = resolved_engine(payload.unreal_version()?, &refused);
         let inputs_digest = payload.inputs_digest()?;
+        let sent_digest = payload.sent_digest()?;
         let lfs_digest = payload.lfs_digest()?;
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
         let (main, siblings) = repos(payload, work, bare, snapshot)?;
@@ -261,6 +265,7 @@ impl Request<'_> {
             desktop_wait,
             host,
             inputs_digest,
+            sent_digest,
             lfs_digest,
         })
     }
@@ -376,7 +381,7 @@ fn inputs_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: 
     let Some(sent) = request.inputs_digest else {
         return Ok(());
     };
-    let why = match inputs::unmatched(request.work, held, sent) {
+    let why = match inputs::unmatched(inputs::Book::Inputs, request.work, held, sent) {
         Ok(moved_aside) => {
             if let Some(line) = moved_aside {
                 let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -390,6 +395,36 @@ fn inputs_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: 
     console.err(&inputs::refused_line(request.nonce));
     console.err(&format!(
         "gate: remote inputs of work folder {} are not the ones sent: {}",
+        request.key,
+        escaped(&why)
+    ));
+    Err(REFUSED_STATUS)
+}
+
+/// Checks the run's `SentDigest`, when it has one, against the work folder `held`'s sent-build record and the copies
+/// it holds, and rewrites the tree's exclude file from both records ([`inputs::unmatched`]), once the work folder is
+/// laid out and cleared and its inputs checked: a record missing, unreadable or of another digest, a copy changed or
+/// gone, or an exclude file that cannot be written refuses the run `sent`, its tag and line said under the box's
+/// output lock, so the PC runs it again without its `--no-build`; 75. A folder moved aside from the exclude file's
+/// name is said, under the lock too.
+fn sent_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
+    let Some(sent) = request.sent_digest else {
+        return Ok(());
+    };
+    let why = match inputs::unmatched(inputs::Book::SentBuild, request.work, held, sent) {
+        Ok(moved_aside) => {
+            if let Some(line) = moved_aside {
+                let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
+                console.err(&line);
+            }
+            return Ok(());
+        }
+        Err(why) => why,
+    };
+    let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
+    console.err(&refused_line(request.nonce, Refusal::Sent));
+    console.err(&format!(
+        "gate: remote build sent to work folder {} is not the one there: {}",
         request.key,
         escaped(&why)
     ));
@@ -1241,6 +1276,7 @@ fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Bea
         Err(Err(failed)) => return Err(ended_before(said(console, &failed), request, beat, console)),
     };
     inputs_matched(request, &held, beat, console)?;
+    sent_matched(request, &held, beat, console)?;
     let lfs = match git.checkout(request, console) {
         Ok(lfs) => lfs,
         Err(NotCheckedOut::Failed(failed)) => return Err(ended_before(said(console, &failed), request, beat, console)),
@@ -2759,10 +2795,11 @@ impl WorkGit {
     /// readied ([`WorkGit::ready_trees`]) on a pair run, after a clear, or when the main tree's `.git`, `.git\objects`
     /// or `.git\objects\info` is missing or not a folder of its own, or its `.git\config` is there and not a file of
     /// its own, a link there leading git or the alternates file into another repository ([`preflight::git_is_plain`]);
-    /// and the run's layout recorded after a clear. A clear removes the inputs record `{Work}.inputs` too, before the
-    /// work folder's children, so no record outlives the inputs it lists, and the warm record `{Work}.warm` before it
-    /// writes [`LAYOUT_CHANGING`], as it is removed too when the work folder is missing and made here, so no warm
-    /// record outlives the folder state it describes. A run of one repo in a work folder of that
+    /// and the run's layout recorded after a clear. A clear removes the inputs record `{Work}.inputs` and the
+    /// sent-build record `{Work}.sent-build` too, before the work folder's children, so no record outlives the files it
+    /// lists, and the warm record `{Work}.warm` before it writes [`LAYOUT_CHANGING`], as it is removed too when the
+    /// work folder is missing and made here, so no warm record outlives the folder state it describes. A run of one
+    /// repo in a work folder of that
     /// layout whose `.git` is plain readies nothing here: the preflight readied its tree. The interrupted-command record
     /// `{Work}.command` is removed with a missing work folder and after a clear, each once the job it names is ended
     /// ([`WorkGit::job_emptied`]) before anything is removed; a work folder of the run's layout that
@@ -2789,6 +2826,7 @@ impl WorkGit {
             removed(Path::new(&warm))?;
             write_layout(&record, LAYOUT_CHANGING)?;
             removed(Path::new(&inputs::record_path(laid.work)))?;
+            removed(Path::new(&inputs::sent_record_path(laid.work)))?;
             clear_work(work)?;
             // Last, so a clear cut short still finds the record and clears again.
             removed(Path::new(&command))?;

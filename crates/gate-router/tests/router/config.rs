@@ -493,6 +493,47 @@ fn hooks_absent_consents_no_repo() {
     assert!(!config.hooks_name_a_repo(), "no key names no repo");
 }
 
+/// The routing file listing `g` with `sendBuild` holding `value`.
+fn send_build_file(value: &str) -> Config {
+    Config::parse(&format!(
+        r#"{{"host": "builder-1", "slots": 2, "repos": {{"g": ["x"]}}, "siblings": {{"g": ["b"]}}, "sendBuild": {value}}}"#
+    ))
+    .expect("routing reads the file whatever sendBuild holds")
+}
+
+#[test]
+fn send_build_names_a_repo_in_any_letter_case() {
+    let config = send_build_file(r#"["Yaat", "gate"]"#);
+
+    assert_eq!(config.send_build_allowed("yaat"), Ok(true), "the repo name in any case");
+    assert_eq!(config.send_build_allowed("GATE"), Ok(true), "the repo name in any case");
+    assert_eq!(config.send_build_allowed("g"), Ok(false), "a repo it does not list");
+    assert_eq!(send_build_file("[]").send_build_allowed("g"), Ok(false), "an empty list");
+    let keyed = Config::parse(r#"{"host": "builder-1", "repos": {}, "SENDBUILD": ["g"]}"#).expect("usable");
+    assert_eq!(keyed.send_build_allowed("g"), Ok(true), "the key in any case");
+    let absent = Config::parse(r#"{"host": "builder-1", "repos": {"g": ["x"]}}"#).expect("usable");
+    assert_eq!(absent.send_build_allowed("g"), Ok(false), "no key lets no repo send");
+}
+
+#[test]
+fn an_unusable_send_build_value_lets_no_repo_send_and_keeps_the_rest_of_the_file() {
+    for (value, problem) in [
+        (r#"{"g": true}"#, "sendBuild must be an array of repo names"),
+        (r#""g""#, "sendBuild must be an array of repo names"),
+        ("null", "sendBuild must be an array of repo names"),
+        (r#"["g", ""]"#, "sendBuild[1] is not a non-empty string"),
+        (r#"["g", 3]"#, "sendBuild[1] is not a non-empty string"),
+        (r#"[["g"]]"#, "sendBuild[0] is not a non-empty string"),
+    ] {
+        let config = send_build_file(value);
+        assert_eq!(config.send_build_allowed("g"), Err(problem), "{value}");
+        assert_eq!(config.host(), "builder-1", "{value}");
+        assert_eq!(config.slots(), 2, "{value}");
+        assert_eq!(pattern_texts(&config, "g"), ["x"], "{value}");
+        assert_eq!(config.allowed_siblings("g"), Ok(&["b".to_owned()][..]), "{value}");
+    }
+}
+
 /// The routing file listing `g` with `declarations` holding `value`.
 fn declarations_file(value: &str) -> Config {
     Config::parse(&format!(

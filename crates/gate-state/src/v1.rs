@@ -140,6 +140,14 @@ pub fn inputs_hashes_path(root: &Path, key: &str) -> PathBuf {
     remote_dir(root).join(format!("{key}.inputs-hashes"))
 }
 
+/// The sent-build hash cache of the work folder `key`, `<root>\remote\<key>.sent-build-hashes`: the manifest line of the
+/// PC's build of one project last sent to it for a routed `dotnet test --no-build`, its files whose last write came well
+/// before that build, kept apart from the inputs cache, whose saves drop every file the inputs walk no longer finds.
+#[must_use]
+pub fn sent_build_hashes_path(root: &Path, key: &str) -> PathBuf {
+    remote_dir(root).join(format!("{key}.sent-build-hashes"))
+}
+
 /// The nothing-back record of the work folder `key`, `<root>\remote\<key>.nothing-back`: the JSON object
 /// `{"v": 1, "host": "<builder>", "configuration": …, "framework": …, "runtime": …}` ([`NothingBackRecord`]). It is
 /// written when a routed dotnet build of that worktree ends without its outputs known to be brought back, and when a

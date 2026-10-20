@@ -6,7 +6,8 @@
 //! the sibling folder names a routed run of it may carry) and the optional `warmup` (the repo names whose
 //! `.gate/warmup.toml` may warm their builder work folders) and the optional `desktop` (each repo name's list of the
 //! `.gate/desktop.toml` patterns whose commands may run on the builder's desktop) and the optional `hooks` (the repo
-//! names whose gates started inside a git hook may route) and the optional `declarations` (each repo name's folder
+//! names whose gates started inside a git hook may route) and the optional `sendBuild` (the repo names whose routed
+//! `dotnet test --no-build` may send the PC's build) and the optional `declarations` (each repo name's folder
 //! holding the `.gate` files the repo has none of). Keys match in any letter case and unknown keys are ignored.
 //! The text may hold `//` and `/* */` comments and trailing commas, as the
 //! PowerShell gate's JSON reader allows; single-quoted strings are refused. A file that breaks a rule is unusable as a
@@ -50,6 +51,9 @@ pub struct Config {
     /// The repo names whose gates started inside a git hook may route, or why `hooks` cannot be used, which consents to
     /// none.
     hooks: Result<Vec<String>, String>,
+    /// The repo names whose routed `dotnet test --no-build` may send the PC's build, or why `sendBuild` cannot be used,
+    /// which lets none.
+    send_build: Result<Vec<String>, String>,
     /// Each repo name's declarations folder, as written, or why `declarations` cannot be used, which names none.
     declarations: Result<Vec<(String, String)>, String>,
 }
@@ -89,7 +93,8 @@ impl Config {
     /// [`Config::allowed_siblings`] gives its reason. So does a bad `warmup`, consenting to no warm-up, and
     /// [`Config::warmup_consented`] gives its reason, and a bad `desktop`, allowing no desktop pattern, and
     /// [`Config::allowed_desktop`] gives its reason, and a bad `hooks`, consenting to no hook routing, and
-    /// [`Config::hooks_allowed`] gives its reason, and a bad `declarations`, naming no folder, and
+    /// [`Config::hooks_allowed`] gives its reason, and a bad `sendBuild`, letting no repo send its build, and
+    /// [`Config::send_build_allowed`] gives its reason, and a bad `declarations`, naming no folder, and
     /// [`Config::declarations_folder`] gives its reason.
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = strict_json(text.strip_prefix('\u{feff}').unwrap_or(text));
@@ -122,6 +127,7 @@ impl Config {
             warmup: read_warmup_consent(&data),
             desktop: read_desktop_consent(&data),
             hooks: read_hooks_consent(&data),
+            send_build: read_names(&data, "sendBuild"),
             declarations: read_declarations(&data),
         })
     }
@@ -181,6 +187,21 @@ impl Config {
     /// the file is read whatever it holds.
     pub fn hooks_allowed(&self, repo: &str) -> Result<bool, &str> {
         match &self.hooks {
+            Err(problem) => Err(problem),
+            Ok(names) => Ok(names.iter().any(|name| eq_ignoring_case(name, repo))),
+        }
+    }
+
+    /// Whether `sendBuild` lets a routed `dotnet test --no-build` of `repo` send the PC's build of its project, so the
+    /// builder keeps the word, its repo name matched in any letter case: `false` when it does not name the repo or there
+    /// is no such key, and the run's `--no-build` is dropped on the builder as before.
+    ///
+    /// # Errors
+    ///
+    /// Why `sendBuild` cannot be used: not an array of non-empty strings. Such a value lets no repo send, and the rest of
+    /// the file is read whatever it holds.
+    pub fn send_build_allowed(&self, repo: &str) -> Result<bool, &str> {
+        match &self.send_build {
             Err(problem) => Err(problem),
             Ok(names) => Ok(names.iter().any(|name| eq_ignoring_case(name, repo))),
         }
@@ -545,18 +566,24 @@ fn read_warmup_consent(data: &Map<String, Value>) -> Result<Vec<String>, String>
 /// The `hooks` list: the repo names whose gates started inside a git hook may route, in file order; none when the key
 /// is missing.
 fn read_hooks_consent(data: &Map<String, Value>) -> Result<Vec<String>, String> {
-    let Some(value) = property(data, "hooks") else {
+    read_names(data, "hooks")
+}
+
+/// The list of repo names at `key`, in file order; none when the key is missing. A value that is no array, or an entry
+/// that is no non-empty string, is why the list cannot be used.
+fn read_names(data: &Map<String, Value>, key: &str) -> Result<Vec<String>, String> {
+    let Some(value) = property(data, key) else {
         return Ok(Vec::new());
     };
     let Value::Array(items) = value else {
-        return Err("hooks must be an array of repo names".to_owned());
+        return Err(format!("{key} must be an array of repo names"));
     };
     items
         .iter()
         .enumerate()
         .map(|(index, item)| match item {
             Value::String(name) if !name.is_empty() => Ok(name.clone()),
-            _ => Err(format!("hooks[{index}] is not a non-empty string")),
+            _ => Err(format!("{key}[{index}] is not a non-empty string")),
         })
         .collect()
 }

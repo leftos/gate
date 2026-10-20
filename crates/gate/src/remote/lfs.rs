@@ -766,7 +766,7 @@ fn sent_line(count: usize, bytes: u64, took: Duration) -> String {
 /// answer is written raw into a file of the held `.tmp` and read back through the same handle; the call is watched by
 /// its own output and a transfer ceiling counted from its own start, as a fetch is.
 fn diffed<'s>(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, sending: &'s Sending) -> Result<Vec<&'s Object>, Unsent> {
-    let head = payload::input(&payload::inputs_word(location, nonce, InputsStep::Diff), Some(&sending.line));
+    let head = payload::input(&payload::inputs_word(location, nonce, InputsStep::Diff, None), Some(&sending.line));
     let root = Path::new(attempt.call.root);
     let path = root.join(TMP).join(format!("{}-{nonce}.lfs-diff", attempt.call.key));
     let answer = tmp_file(root, &path, "the LFS diff answer").map_err(Unsent::Refused)?;
@@ -800,7 +800,7 @@ fn diffed<'s>(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, s
 /// than was sent included.
 fn put(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, sending: &Sending, sent: (&File, u64, usize)) -> Result<(), Unsent> {
     let (archive, length, count) = sent;
-    let head = payload::input(&payload::inputs_word(location, nonce, InputsStep::Put), Some(&sending.line));
+    let head = payload::input(&payload::inputs_word(location, nonce, InputsStep::Put, None), Some(&sending.line));
     let watch = Watch::Put(attempt.limits_for("lfs"));
     let called = attempt.lfs_call(&head, Some((archive, length)), None, watch).map_err(Unsent::Ended)?;
     judged(attempt, &called, Step::LfsPut)?;

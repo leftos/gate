@@ -20,8 +20,8 @@ use gate_args::{
 };
 use gate_router::warm::{RecordRead, RecordState};
 use gate_router::{
-    BuildSettings, BuildTarget, DEFAULT_OUTPUTS, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target, sdk_build_target,
-    without_no_build, work_folder_key,
+    BuildSettings, BuildTarget, DEFAULT_OUTPUTS, DROPPED_NO_BUILD_LINE, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target,
+    sdk_build_target, without_no_build, work_folder_key,
 };
 use gate_state::{Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RunFacts, StateRoot, Verdict, log_hash, v1};
 use gate_watchdog::{Cores, Hint, SlotKind, hint};
@@ -763,6 +763,8 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         words: &remote.words,
         outputs: &remote.outputs,
         outputs_withheld: remote.outputs_withheld,
+        dropped_no_build: remote.dropped_no_build,
+        send: remote.send.as_ref(),
         inputs: &remote.inputs,
         desktop: remote.desktop,
         log: log.path(),
@@ -817,8 +819,9 @@ enum Remotely {
     Ended(Ended),
     /// A Ctrl+C ended the wait for the remote client to start or for a remote slot.
     Interrupted,
-    /// The run falls back here.
-    Here,
+    /// The run falls back here; `dropped_said` when the client already said [`DROPPED_NO_BUILD_LINE`], as a run whose
+    /// send of the PC's build did not land says it.
+    Here { dropped_said: bool },
 }
 
 /// What a passed line says of how long the command ran: here, by the wall clock and load-adjusted, or on a builder,
@@ -1037,8 +1040,8 @@ impl Run<'_> {
             Route::Routed(remote) => match self.routed(remote, hold, console) {
                 Remotely::Ended(ended) => return Some((ended, None)),
                 Remotely::Interrupted => return None,
-                Remotely::Here => self
-                    .plan_here(remote, plan, console)
+                Remotely::Here { dropped_said } => self
+                    .plan_here(remote, plan, dropped_said, console)
                     .map(|plan| (plan, Some(HereWords::fallback(remote)))),
             },
         };
@@ -1211,8 +1214,9 @@ impl Run<'_> {
     }
 
     /// Updates the worktree's nothing-back record after a routed run that ended on the builder, killed, interrupted or
-    /// unreported among them. A dotnet command whose `--no-build` the builder dropped built there and brings nothing
-    /// back: it writes the record when none stands, and never rewrites or clears one. A dotnet build ([`dotnet_builds`])
+    /// unreported among them. A dotnet command whose `--no-build` the builder dropped, as the client's outcome says
+    /// ([`RemoteOutcome::dropped_no_build`]: a run whose send of the PC's build landed kept it), built there and brings
+    /// nothing back: it writes the record when none stands, and never rewrites or clears one. A dotnet build ([`dotnet_builds`])
     /// that passed with its outputs brought back ([`brought_everything_back`]) clears the record, as a passing build here
     /// of its words would ([`Run::clear_nothing_back`]); any other dotnet build writes it, an unknown counting as not
     /// brought back. The record names the builder and the configuration, framework and runtime the words set
@@ -1224,7 +1228,7 @@ impl Run<'_> {
             return;
         };
         let path = v1::nothing_back_path(&self.root.path, &remote.key);
-        if remote.dropped_no_build {
+        if outcome.dropped_no_build {
             match path.try_exists() {
                 Ok(false) => {}
                 Ok(true) => return,
@@ -1414,16 +1418,23 @@ impl Run<'_> {
         }
         let host = tag.map_or_else(String::new, |tag| tag.host);
         console.err(&fallback_line(&host, reason, outcome.detail.as_deref()));
-        Remotely::Here
+        Remotely::Here {
+            dropped_said: outcome.lines.iter().any(|line| line == DROPPED_NO_BUILD_LINE),
+        }
     }
 
     /// The plan of the run here after a fallback of any reason: the first plan unchanged when the fallback drops no
     /// word, which is the command as given, else a plan of the fallback's words, the command with a dotnet `--no-build`
-    /// dropped. Else how the run ended when that command cannot be planned.
-    fn plan_here(&self, remote: &RemoteRun, plan: Plan, console: &mut Console) -> Result<Plan, Ended> {
+    /// dropped. A run with a send of the PC's build, whose route left the dropped line to the client, says it here
+    /// first, unless the client said it (`dropped_said`), so it is said once. Else how the run ended when that command
+    /// cannot be planned.
+    fn plan_here(&self, remote: &RemoteRun, plan: Plan, dropped_said: bool, console: &mut Console) -> Result<Plan, Ended> {
         let words: Vec<OsString> = remote.fallback.iter().map(OsString::from).collect();
         if words == self.request.command {
             return Ok(plan);
+        }
+        if remote.send.is_some() && !dropped_said {
+            console.err(DROPPED_NO_BUILD_LINE);
         }
         self.replan(&words, console)
     }
@@ -2844,6 +2855,7 @@ fn split_said(split: Split) -> String {
     let mut parts = vec![format!("command {} s", seconds(split.command)), format!("push {} s", seconds(split.push))];
     parts.extend(split.inputs.map(|part| format!("inputs {} s", seconds(part))));
     parts.extend(split.lfs.map(|part| format!("lfs {} s", seconds(part))));
+    parts.extend(split.sent_build.map(|part| format!("sent build {} s", seconds(part))));
     parts.extend(split.sync_back.map(|part| format!("sync-back {} s", seconds(part))));
     parts.extend(split.outputs.map(|part| format!("outputs {} s", seconds(part))));
     parts.join(", ")
@@ -3654,6 +3666,7 @@ mod tests {
             push: 224 * second,
             inputs: None,
             lfs: None,
+            sent_build: None,
             sync_back: None,
             outputs: None,
         };
@@ -3682,6 +3695,17 @@ mod tests {
                 },
                 Some(70.4),
                 "gate: passed in 301 s on builder (load-adjusted 70 s, ceiling 300 s; command 76 s, push 224 s, inputs 2 s, lfs 4 s). \
+                 Full output: out.log",
+            ),
+            (
+                "the inputs and the PC's build sent, in the order they ran",
+                Split {
+                    inputs: Some(2 * second),
+                    sent_build: Some(5 * second),
+                    ..pushed
+                },
+                Some(70.4),
+                "gate: passed in 301 s on builder (load-adjusted 70 s, ceiling 300 s; command 76 s, push 224 s, inputs 2 s, sent build 5 s). \
                  Full output: out.log",
             ),
             (

@@ -1720,8 +1720,8 @@ fn no_build_is_dropped_for_the_box_and_the_fallback() {
     );
     assert_eq!(
         recorded_words(&recorded(&pack_call))[1..],
-        ["pack", "--no-build", path_map(&case).as_str()],
-        "pack keeps it on the box"
+        ["pack", "--no-build"],
+        "pack keeps it on the box, unstamped, as a command that does not build"
     );
     assert!(!pack.stderr.contains(DROPPED_NO_BUILD_LINE), "{pack:?}");
     assert_eq!(command_lines(&pack.stdout), ["pack --no-build"], "and here: {pack:?}");

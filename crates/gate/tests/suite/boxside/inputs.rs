@@ -1081,3 +1081,371 @@ fn a_put_that_fails_after_moving_a_file_in_leaves_the_record_without_the_last_di
     let run = run_box(&case, &digested(&payload, &first));
     assert_refused_inputs(&payload, &run, "the interim record holds no digest");
 }
+
+/// The bin folder a sent build of the project `app` in `Release` installs below.
+const SENT_BIN: &str = "app/bin/Release";
+const BUILT_DLL: Input = ("app/bin/Release/net10.0/app.dll", b"built dll");
+const BUILT_PDB: Input = ("app/bin/Release/net10.0/app.pdb", b"built pdb");
+const RESTORE_PROPS: Input = ("app/obj/app.csproj.nuget.g.props", b"<Project>props</Project>");
+const RESTORE_TARGETS: Input = ("app/obj/app.csproj.nuget.g.targets", b"<Project>targets</Project>");
+
+/// `payload` as a request sending the PC's build of the project `app` in `Release` ([`SENT_BIN`]).
+fn sent(payload: &Value) -> Value {
+    let mut sent = payload.clone();
+    sent["SentBin"] = json!(SENT_BIN);
+    sent
+}
+
+/// A put of a sent build of `files`, all of them sent, which must install every one.
+fn sent_all(case: &Case, payload: &Value, files: &[(&str, &[u8])]) {
+    put_all(case, &sent(payload), files);
+}
+
+/// Writes `bytes` at the `/`-separated `path` of `payload`'s work folder, its folders made.
+fn written(payload: &Value, path: &str, bytes: &[u8]) {
+    let at = work(payload).join(path.replace('/', "\\"));
+    fs::create_dir_all(at.parent().expect("a parent")).expect("the folders can be made");
+    fs::write(at, bytes).expect("the file can be written");
+}
+
+/// `payload` carrying the digest of the manifest line `line` as its `SentDigest`.
+fn sent_digested(payload: &Value, line: &str) -> Value {
+    let mut digested = payload.clone();
+    digested["SentDigest"] = json!(sha256(line.as_bytes()));
+    digested
+}
+
+#[test]
+fn sent_build_restore_files_on_the_box_count_as_matched_and_are_never_replaced() {
+    let case = Case::new("box_sent_restore_matched");
+    let payload = inputs_payload(&case, "diff");
+    let laid = diff(&case, &sent(&payload), &[BUILT_DLL]);
+    assert_eq!(laid.code, Some(0), "the diff lays the work folder out: {laid:?}");
+    written(&payload, RESTORE_PROPS.0, b"the builder's own props");
+    written(&payload, RESTORE_TARGETS.0, b"the builder's own targets");
+    let files = [BUILT_DLL, RESTORE_PROPS, RESTORE_TARGETS];
+
+    let outcome = diff(&case, &sent(&payload), &files);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, needs(&[BUILT_DLL.0]), "only the bin file is needed: {outcome:?}");
+
+    let put = put_with(&case, &sent(&payload), &[], &files, &[BUILT_DLL, RESTORE_PROPS]);
+    assert_eq!(put.code, Some(1), "a restore file on the box refuses the put: {put:?}");
+    assert!(put.stderr.contains(RESTORE_PROPS.0), "the line names the path: {put:?}");
+    let left = tree_files(work(&payload));
+    assert_eq!(left.get(RESTORE_PROPS.0).map(Vec::as_slice), Some(&b"the builder's own props"[..]));
+
+    let installed = put_with(&case, &sent(&payload), &[], &files, &[BUILT_DLL]);
+    assert_eq!(installed.code, Some(0), "{installed:?}");
+    let left = tree_files(work(&payload));
+    assert_eq!(left.get(BUILT_DLL.0).map(Vec::as_slice), Some(BUILT_DLL.1));
+    assert_eq!(
+        left.get(RESTORE_TARGETS.0).map(Vec::as_slice),
+        Some(&b"the builder's own targets"[..]),
+        "the builder's own restore file stays"
+    );
+}
+
+#[test]
+fn sent_build_with_one_restore_file_alone_on_the_box_fails_the_diff() {
+    let case = Case::new("box_sent_restore_pair");
+    let payload = inputs_payload(&case, "diff");
+    let laid = diff(&case, &sent(&payload), &[BUILT_DLL]);
+    assert_eq!(laid.code, Some(0), "{laid:?}");
+    written(&payload, RESTORE_PROPS.0, RESTORE_PROPS.1);
+
+    let outcome = diff(&case, &sent(&payload), &[BUILT_DLL, RESTORE_PROPS, RESTORE_TARGETS]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert!(outcome.stderr.starts_with("gate: remote inputs diff failed: "), "{outcome:?}");
+    assert!(outcome.stderr.contains(RESTORE_TARGETS.0), "the line names the missing one: {outcome:?}");
+}
+
+#[test]
+fn sent_build_restore_file_leaving_the_manifest_is_never_deleted() {
+    let case = Case::new("box_sent_restore_kept");
+    let payload = inputs_payload(&case, "put");
+    sent_all(&case, &payload, &[BUILT_DLL, RESTORE_PROPS, RESTORE_TARGETS]);
+
+    sent_all(&case, &payload, &[BUILT_DLL]);
+
+    let left = tree_files(work(&payload));
+    assert!(left.contains_key(RESTORE_PROPS.0), "the props stay: {:?}", left.keys());
+    assert!(left.contains_key(RESTORE_TARGETS.0), "the targets stay: {:?}", left.keys());
+}
+
+#[test]
+fn sent_build_run_with_its_digest_runs_and_a_changed_bin_file_is_refused_sent() {
+    let case = Case::new("box_sent_run_digest");
+    let payload = snapshot_payload(&case);
+    let files = [BUILT_DLL, RESTORE_PROPS, RESTORE_TARGETS];
+    let digested = sent_digested(&payload, &manifest_line(&files));
+
+    let unrecorded = run_box(&case, &digested);
+    assert_eq!(unrecorded.code, Some(75), "no record: {unrecorded:?}");
+    assert_eq!(lines(&unrecorded.stderr)[0], refused_line(&payload, "sent"), "{unrecorded:?}");
+    assert_eq!(unrecorded.stdout, "", "the command never ran: {unrecorded:?}");
+
+    sent_all(&case, &payload, &files);
+    let matched = run_box(&case, &digested);
+    assert_eq!(matched.code, Some(0), "{matched:?}");
+    assert_eq!(matched.stdout, "ran\n", "{matched:?}");
+
+    let other = run_box(&case, &sent_digested(&payload, "another manifest"));
+    assert_eq!(other.code, Some(75), "{other:?}");
+    assert_eq!(lines(&other.stderr)[0], refused_line(&payload, "sent"), "{other:?}");
+
+    written(&payload, BUILT_DLL.0, b"rebuilt on the box");
+    let changed = run_box(&case, &digested);
+    assert_eq!(changed.code, Some(75), "{changed:?}");
+    assert_eq!(lines(&changed.stderr)[0], refused_line(&payload, "sent"), "{changed:?}");
+    assert!(changed.stderr.contains(BUILT_DLL.0), "the line names the file: {changed:?}");
+}
+
+#[test]
+fn sent_build_record_is_removed_by_a_layout_clear() {
+    let case = Case::new("box_sent_layout_clear");
+    let payload = snapshot_payload(&case);
+    sent_all(&case, &payload, &[BUILT_DLL]);
+    let record = PathBuf::from(format!("{}.sent-build", field(&payload, "Work")));
+    assert!(record.exists(), "the put writes the sent-build record");
+    assert!(
+        !Path::new(&format!("{}.inputs", field(&payload, "Work"))).exists(),
+        "and not the inputs record"
+    );
+    fs::write(format!("{}.layout", field(&payload, "Work")), "pair app lib").expect("the layout record can be changed");
+
+    let run = run_box(&case, &payload);
+
+    assert_eq!(run.code, Some(0), "{run:?}");
+    assert!(!record.exists(), "the layout clear removes the sent-build record");
+}
+
+#[test]
+fn sent_build_put_deletes_bin_files_neither_record_holds_and_no_folder() {
+    let case = Case::new("box_sent_leftovers");
+    let payload = inputs_payload(&case, "put");
+    let input: Input = ("app/bin/Release/settings.local.json", b"an input");
+    put_all(&case, &payload, &[input]);
+    written(&payload, "app/bin/Release/net10.0/old.dll", b"an older build");
+    written(&payload, "app/bin/Release/net10.0/sub/old.xml", b"an older build");
+    written(&payload, "app/bin/Debug/other.dll", b"another configuration");
+    fs::create_dir_all(work(&payload).join(r"app\bin\Release\empty")).expect("a folder can be made");
+
+    sent_all(&case, &payload, &[BUILT_DLL, BUILT_PDB]);
+
+    let left: Vec<String> = tree_files(work(&payload)).into_keys().filter(|path| path.starts_with("app/")).collect();
+    assert_eq!(
+        left,
+        ["app/bin/Debug/other.dll", BUILT_DLL.0, BUILT_PDB.0, "app/bin/Release/settings.local.json"],
+        "only the files of neither record under the bin folder go"
+    );
+    assert!(work(&payload).join(r"app\bin\Release\net10.0\sub").is_dir(), "a folder stays");
+    assert!(work(&payload).join(r"app\bin\Release\empty").is_dir(), "an empty folder stays");
+}
+
+#[test]
+fn sent_build_and_inputs_share_one_exclude_file() {
+    let case = Case::new("box_sent_exclude");
+    let payload = inputs_payload(&case, "put");
+    put_all(&case, &payload, &[DATA]);
+
+    sent_all(&case, &payload, &[BUILT_DLL]);
+    assert_eq!(
+        exclude_of(&payload),
+        format!("/{}\n/data/b.txt\n", BUILT_DLL.0),
+        "the send keeps the inputs' line"
+    );
+
+    put_all(&case, &payload, &[HELPER]);
+    assert_eq!(
+        exclude_of(&payload),
+        format!("/.tmp/helper/a.dll\n/{}\n", BUILT_DLL.0),
+        "an inputs put keeps the send's line"
+    );
+}
+
+/// A path the repo's inputs installed is never also the sent build's: the send's diff fails on it, naming it, before
+/// any upload, and a path the inputs record does not hold still diffs.
+#[test]
+fn sent_build_diff_fails_on_a_path_the_inputs_record_holds() {
+    let case = Case::new("box_sent_held_by_inputs");
+    let payload = inputs_payload(&case, "put");
+    put_all(&case, &payload, &[BUILT_DLL]);
+
+    let outcome = diff(&case, &sent(&payload), &[BUILT_DLL, BUILT_PDB]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "no path is asked for: {outcome:?}");
+    assert!(outcome.stderr.starts_with("gate: remote inputs diff failed: "), "{outcome:?}");
+    assert!(outcome.stderr.contains(BUILT_DLL.0), "the line names the path: {outcome:?}");
+    let other = diff(&case, &sent(&payload), &[BUILT_PDB]);
+    assert_eq!(other.code, Some(0), "{other:?}");
+}
+
+#[test]
+fn sent_build_manifest_path_outside_its_bin_folder_and_restore_names_is_refused() {
+    let case = Case::new("box_sent_scope");
+    let payload = inputs_payload(&case, "diff");
+    let rows: [(&str, Input); 4] = [
+        ("a tracked-tree file", DATA),
+        ("another configuration's bin", ("app/bin/Debug/app.dll", b"debug")),
+        ("another obj file", ("app/obj/project.assets.json", b"{}")),
+        ("another project's restore file", ("lib/obj/lib.csproj.nuget.g.props", b"<Project/>")),
+    ];
+    for (what, file) in rows {
+        let outcome = diff(&case, &sent(&payload), &[BUILT_DLL, file]);
+
+        assert_eq!(outcome.code, Some(1), "{what}: {outcome:?}");
+        assert_eq!(outcome.stdout, "", "{what}: {outcome:?}");
+        assert!(outcome.stderr.contains(file.0), "{what}: the line names the path: {outcome:?}");
+    }
+    let taken = diff(&case, &sent(&payload), &[BUILT_DLL, RESTORE_PROPS, RESTORE_TARGETS]);
+    assert_eq!(taken.code, Some(0), "{taken:?}");
+}
+
+#[test]
+fn sent_build_diff_fails_on_a_needed_bin_file_with_a_second_name_before_any_upload() {
+    let case = Case::new("box_sent_hard_link");
+    let payload = inputs_payload(&case, "put");
+    sent_all(&case, &payload, &[BUILT_DLL]);
+    let twin = case.folder().join("twin.dll");
+    fs::hard_link(work(&payload).join(r"app\bin\Release\net10.0\app.dll"), &twin).expect("a second name can be made");
+    let rebuilt: Input = (BUILT_DLL.0, b"rebuilt on the PC");
+
+    let outcome = diff(&case, &sent(&payload), &[rebuilt]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "no path is asked for: {outcome:?}");
+    assert!(outcome.stderr.contains(BUILT_DLL.0), "the line names the path: {outcome:?}");
+}
+
+#[test]
+#[expect(clippy::print_stderr, reason = "a skipped part says why it skipped")]
+fn sent_build_leftover_delete_follows_no_link_and_leaves_a_file_of_two_names_whole() {
+    let case = Case::new("box_sent_leftover_links");
+    let payload = inputs_payload(&case, "put");
+    sent_all(&case, &payload, &[BUILT_DLL]);
+    let outside = case.folder().join("outside");
+    fs::create_dir_all(&outside).expect("the outside folder can be made");
+    fs::write(outside.join("kept.dll"), "outside").expect("the outside file can be written");
+    fs::write(outside.join("twin.dll"), "a second name").expect("the outside file can be written");
+    let bin = work(&payload).join(r"app\bin\Release");
+    junction(&bin.join("linked"), &outside);
+    fs::hard_link(outside.join("twin.dll"), bin.join("twin.dll")).expect("a second name can be made");
+    let symlinked = match std::os::windows::fs::symlink_file(outside.join("kept.dll"), bin.join("link.dll")) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("no file symlink is planted, as this user may not make one: {error}");
+            false
+        }
+    };
+
+    sent_all(&case, &payload, &[BUILT_DLL, BUILT_PDB]);
+
+    assert_eq!(fs::read(outside.join("kept.dll")).expect("the outside file stays"), b"outside");
+    assert_eq!(
+        fs::read(outside.join("twin.dll")).expect("the other name stays"),
+        b"a second name",
+        "the hard link's other name keeps its content"
+    );
+    assert_eq!(fs::read_dir(&outside).expect("it can be listed").count(), 2, "nothing outside is removed");
+    assert!(fs::symlink_metadata(bin.join("linked")).is_ok(), "the junction stays as itself");
+    if symlinked {
+        assert!(fs::symlink_metadata(bin.join("link.dll")).is_ok(), "the symlink stays as itself");
+    }
+}
+
+#[test]
+fn an_inputs_put_of_a_restore_named_file_installs_and_replaces_it_as_any_input() {
+    let case = Case::new("box_inputs_restore_name");
+    let payload = inputs_payload(&case, "put");
+    let restore: Input = ("obj/x.nuget.g.props", b"<Project>pc</Project>");
+    put_all(&case, &payload, &[restore]);
+    written(&payload, restore.0, b"changed on the box");
+
+    let outcome = diff(&case, &payload, &[restore]);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stdout, needs(&[restore.0]), "a changed copy is needed again: {outcome:?}");
+
+    put_all(&case, &payload, &[restore]);
+    let left = tree_files(work(&payload));
+    assert_eq!(left.get(restore.0).map(Vec::as_slice), Some(restore.1), "the put replaces it");
+
+    put_all(&case, &payload, &[DATA]);
+    let left = tree_files(work(&payload));
+    assert!(!left.contains_key(restore.0), "a copy leaving the manifest is deleted: {:?}", left.keys());
+}
+
+#[test]
+fn sent_build_whose_manifest_names_no_bin_file_is_refused_and_the_bin_keeps_its_build() {
+    let case = Case::new("box_sent_no_bin_file");
+    let payload = inputs_payload(&case, "put");
+    sent_all(&case, &payload, &[BUILT_DLL]);
+    let rows: [(&str, &[Input]); 2] = [("an empty manifest", &[]), ("restore files alone", &[RESTORE_PROPS, RESTORE_TARGETS])];
+    for (what, files) in rows {
+        for outcome in [diff(&case, &sent(&payload), files), put_with(&case, &sent(&payload), &[], files, files)] {
+            assert_eq!(outcome.code, Some(1), "{what}: {outcome:?}");
+            assert_eq!(outcome.stdout, "", "{what}: {outcome:?}");
+            assert!(
+                outcome.stderr.contains("the sent build's manifest names no file below app/bin/Release/"),
+                "{what}: {outcome:?}"
+            );
+        }
+        let left = tree_files(work(&payload));
+        assert_eq!(
+            left.get(BUILT_DLL.0).map(Vec::as_slice),
+            Some(BUILT_DLL.1),
+            "{what}: the bin keeps its build"
+        );
+    }
+}
+
+/// The start of the line a box refuses a malformed `SentBin` with.
+const MALFORMED_SENT_BIN: &str = "gate: box payload SentBin is not a plain <project>/bin/<configuration> path: ";
+
+/// A diff of the built dll in the work folder of `payload` sending the bin folder `bin`.
+fn sent_bin_diff(case: &Case, payload: &Value, bin: &str) -> Outcome {
+    let mut asked = payload.clone();
+    asked["SentBin"] = json!(bin);
+    diff(case, &asked, &[BUILT_DLL])
+}
+
+/// Asserts that `outcome`, of a request sending `what`, is the usage error of a malformed `SentBin`.
+fn assert_malformed_sent_bin(what: &str, outcome: &Outcome) {
+    assert_eq!(outcome.code, Some(2), "{what}: {outcome:?}");
+    assert_eq!(outcome.stdout, "", "{what}: {outcome:?}");
+    assert!(outcome.stderr.starts_with(MALFORMED_SENT_BIN), "{what}: {outcome:?}");
+}
+
+#[test]
+fn sent_bin_that_is_not_a_plain_project_bin_configuration_path_is_a_usage_error() {
+    let case = Case::new("box_sent_bin_malformed");
+    let payload = inputs_payload(&case, "diff");
+    let rows = [
+        ("a parent part", "../bin/Release"),
+        ("a leading slash", "/app/bin/Release"),
+        ("a drive-relative part", "C:x/bin/Release"),
+        ("a UNC path", r"\\server\share\bin\Release"),
+        ("a stream", "app/bin/Release:stream"),
+        ("a trailing dot", "app./bin/Release"),
+        ("a trailing space", "app /bin/Release"),
+        ("an 8.3 alias", "APP~1/bin/Release"),
+        ("a device name", "CON/bin/Release"),
+        ("another folder than bin", "app/obj/Release"),
+        ("an empty configuration", "app/bin/"),
+    ];
+    for (what, bin) in rows {
+        assert_malformed_sent_bin(what, &sent_bin_diff(&case, &payload, bin));
+    }
+}
+
+#[test]
+fn sent_bin_with_a_git_name_is_a_usage_error() {
+    let case = Case::new("box_sent_bin_git");
+    let payload = inputs_payload(&case, "diff");
+    for (what, bin) in [("a .git* project", ".github/bin/Release"), ("a .git* configuration", "app/bin/.gitkeep")] {
+        assert_malformed_sent_bin(what, &sent_bin_diff(&case, &payload, bin));
+    }
+}

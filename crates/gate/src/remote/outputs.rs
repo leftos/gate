@@ -248,6 +248,18 @@ impl Sent<'_> {
             built: Ok(Manifest::default()),
         }
     }
+
+    /// Takes out the withheld-outputs marker [`marked`] would write, for a run whose send of the PC's build landed: it
+    /// keeps its `--no-build` and builds nothing on the builder, so it leaves no marker. The marker taken, for a run
+    /// the box then refuses for that build, which runs again with `--no-build` dropped ([`Sent::withhold`]).
+    pub(super) fn take_withheld(&mut self) -> Option<PathBuf> {
+        self.withheld.take()
+    }
+
+    /// Puts back the withheld-outputs marker [`Sent::take_withheld`] took, for [`marked`] to write.
+    pub(super) fn withhold(&mut self, withheld: Option<PathBuf>) {
+        self.withheld = withheld;
+    }
 }
 
 /// What `attempt`'s run call carries of its outputs. A run with no output globs carries none, and reads no pending
