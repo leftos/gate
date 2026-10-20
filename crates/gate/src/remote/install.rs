@@ -1190,6 +1190,25 @@ mod tests {
     }
 
     #[test]
+    fn a_fetched_trx_a_glob_names_is_installed() {
+        let root = scratch("named-trx");
+        let manifest = Manifest::default();
+        let naming = Globs::new(&["**/bin/**".to_owned(), "tests/*/bin/*/*/TestResults/*.trx".to_owned()]).expect("the globs can be matched");
+        let trx = "tests/p/bin/Release/net10.0/TestResults/sim.trx";
+
+        assert_eq!(
+            checked(&root, &[entry(trx)], &naming, &manifest),
+            Ok(Checked::default()),
+            "the glob that names TestResults brings the TRX in"
+        );
+        assert_eq!(
+            checked(&root, &[entry(trx)], &bin_globs(), &manifest),
+            Err(Refused::deterministic(format!("the archive member {trx} is not under the output globs"))),
+            "the default globs bring in nothing under TestResults"
+        );
+    }
+
+    #[test]
     fn a_pc_file_changed_since_the_manifest_is_refused() {
         let root = scratch("unchanged");
         put(&root, "bin/size.dll", b"abc");

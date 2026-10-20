@@ -378,6 +378,32 @@ fn box_run_packs_the_files_the_pc_lacks_or_holds_otherwise() {
 }
 
 #[test]
+fn a_glob_naming_test_results_packs_the_trx_below_it() {
+    let case = Case::new("box_outputs_test_results");
+    let command = [
+        FAKE_TOOL,
+        "write",
+        r"tests\p\bin\Release\net10.0\TestResults\sim.trx",
+        "trx",
+        "write",
+        r"tests\p\bin\Release\net10.0\app.dll",
+        "dll",
+    ];
+    let mut payload = outputs_payload(&case, &command, &["**/bin/**", "tests/*/bin/*/*/TestResults/*.trx"]);
+    snapshot(&case, &mut payload, &[IGNORE_BIN]);
+
+    let outcome = run_with_manifest(&case, &payload, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(has_line(&outcome.stderr, &packed_line(&payload, 2)), "{outcome:?}");
+    assert_eq!(
+        archive_members(&archive_path(&payload)),
+        ["tests/p/bin/Release/net10.0/TestResults/sim.trx", "tests/p/bin/Release/net10.0/app.dll"],
+        "the glob that names TestResults brings back the TRX, the other glob the DLL"
+    );
+}
+
+#[test]
 fn box_run_packs_identical_files_once_and_lists_every_path() {
     let case = Case::new("box_outputs_identical");
     let command = [

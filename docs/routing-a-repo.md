@@ -23,6 +23,8 @@ A command run from one worktree that names a path in another worktree of a liste
 1. Read the repo's own gate commands (its CLAUDE.md, nextup profile, justfile or package scripts) and the tools each needs: toolchains and their pins (`.gate/toolchain.toml`, `rust-toolchain.toml`, `global.json`), shells and utilities, package managers.
 2. Set the builder up ([Builder setup](#builder-setup)). A session installs what a routed repo needs, at the repo's pinned version, and changes the builder's configuration (PATH, ACLs, environment) directly over ssh. A change to the builder's toolchains, tools, work root or git config is also made in `tools/builder/install-toolchains.ps1` in the same item, so a new builder gets the same setup. A change to the machine's provisioning goes to claude-config as a repo inbox note with what changed and the exact commands. Run `gate check --builder` from the repo.
 3. Back up `remote.json` beside it (`remote.json.bak-<UTC stamp>`), then add the repo's patterns under `repos.<repo>`, plus `outputs`, `inputs`, `siblings`, `desktop` or `warmup` consent where the repo needs them. Re-read the file just before writing and change only the repo's own keys: other sessions edit it too.
+
+   A test report under a `TestResults` folder (an MTP TRX) comes back only through a glob that names the `TestResults` folder, such as `tests/*/bin/*/*/TestResults/*.trx`, and only after a passing command. `**` and `*TestResults*` bring back nothing under it.
 4. Run one routing trial (below). The repo counts as routed once its trial passes.
 
 ## Builder setup

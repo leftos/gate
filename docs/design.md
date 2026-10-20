@@ -2245,13 +2245,13 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     A skipped member carries its reason, so a line ends `is tracked by git`, `is in use or read-only` or `cannot be rewritten (…)`, and each counts as not fully brought back; the first two keep the pending marker, the third does not.
 
-    A repo that checks build outputs into git opts in per call with `--bring-tracked <glob>` (repeatable, matched with the output-glob matcher), which installs tracked members matching it as before. The matcher's exclusions hold for it too, so it never brings back a path the output globs never do (`.git*`, `.lfsconfig`, `.tmp/`, `TestResults/`, `.env` files).
+    A repo that checks build outputs into git opts in per call with `--bring-tracked <glob>` (repeatable, matched with the output-glob matcher), which installs tracked members matching it as before. The matcher's exclusions hold for it too, so it never brings back a path the output globs never do (`.git*`, `.lfsconfig`, `.tmp/`, `.env` files, and `TestResults/` unless the glob names that folder).
 
     A glob the matcher cannot compile refuses the install as `the --bring-tracked glob '<glob>' cannot be matched: <detail>`. Nothing in `remote.json` turns the refusal off for a repo.
 
     A repo whose build regenerates a file it tracks under the globs therefore keeps the pending marker on every routed run, and each next run sends `OutputsFull` without the hash cache, until its caller passes `--bring-tracked`.
 
-    **Never `.git*` or `.lfsconfig`** (GATE-155): an output glob such as `*`, `*.*` or `**` would match a root `.lfsconfig` or a `.gitattributes` at any depth, since the `EXCLUDED` pattern leaves out only the `.git/`, `.tmp/` and `TestResults/` folders and `.env` files. That would give a builder a second way to reach the files a sync-back never writes.
+    **Never `.git*` or `.lfsconfig`** (GATE-155): an output glob such as `*`, `*.*` or `**` would match a root `.lfsconfig` or a `.gitattributes` at any depth, since the exclusion arms (`EXCLUDED_ARMS`, compiled once as `EXCLUDED`) leave out only the `.git/`, `.tmp/` and `TestResults/` folders and `.env` files (a glob naming a `TestResults` folder is held by `EXCLUDED_BEYOND_TEST_RESULTS`, the arms without `EXCLUDED_TEST_RESULTS`). That would give a builder a second way to reach the files a sync-back never writes.
 
     `Globs::matches` is therefore false for any `.git*` path component and a `.lfsconfig` name, matched as the sync-back matches them (`is_git_s`, `is_lfs_config` in `outputs/names.rs`, which `remote/syncback.rs` imports), with the same normalised spellings: `\` as a separator, a cut at the first `:`, trailing dots and spaces stripped, and 8.3 aliases. `Globs::enters` is false for a `.git*` folder, so the box's walk never enters one.
 
@@ -3134,9 +3134,15 @@ Built verbs:
 
 - Globs: each is relative to the work folder's root and `/`-separated, matched without regard to case: `**/` is any number of folders (none included), `**` anything, `*` any run of characters within one name, `?` one character within one name.
 
-  Never brought back, whatever the globs: anything under a `.git`, `.tmp` or `TestResults` folder at any depth, a `.env` file (`.env`, `.env.<name>`, `<name>.env`), any path component starting `.git` (`.git`, `.github`, `.gitattributes`) and a `.lfsconfig` at any depth, spelled any way the sync-back's names check reads (`\` as a separator, a cut at the first `:`, trailing dots and spaces stripped, 8.3 aliases such as `GITATT~1` and `LFSCON~1`).
+  Never brought back, whatever the globs: anything under a `.git` or `.tmp` folder at any depth, a `.env` file (`.env`, `.env.<name>`, `<name>.env`), any path component starting `.git` (`.git`, `.github`, `.gitattributes`) and a `.lfsconfig` at any depth, spelled any way the sync-back's names check reads (`\` as a separator, a cut at the first `:`, trailing dots and spaces stripped, 8.3 aliases such as `GITATT~1` and `LFSCON~1`).
 
-  Nor is a path that is not plain (the member rule below), the archive's own list `.gate-outputs.json` at the root in any letter case, or a name that is not Unicode, each of which the box's pack skips and says.
+  A `TestResults` folder (any letter case) is never brought back either, except by a glob with a `/`-separated segment exactly `TestResults`, such as `tests/*/bin/*/*/TestResults/*.trx`: that glob brings back the files below the folders it matches, and the box's walk and the PC's install both enter such a folder, with `.git`, `.tmp`, `.env` and `.git*`/`.lfsconfig` still excluded below it.
+
+  `**`, `tests/**` and a segment merely containing the word (`*TestResults*`, `TestResults2`) bring back nothing under `TestResults`. The input globs keep their own exclusions, and outputs come back on a passing command only.
+
+  The box and the PC must agree on what a glob selects: a PC whose install check is older than the box refuses the whole archive when the box packs a member it does not select. A change to the matcher is installed on the PC first, then pushed to the builders, the order the reinstall already takes.
+
+  Also never brought back: a path that is not plain (the member rule below), the archive's own list `.gate-outputs.json` at the root in any letter case, or a name that is not Unicode, each of which the box's pack skips and says.
 - Walk: lists the files below a folder that the globs match, ordered by relative path, and does not enter an excluded folder, a `.git*` folder included, or a folder whose name is not plain or not Unicode, however deep.
 
   The box's pack also takes from it the files the globs would select but for their names, those below such a folder included, to say them.
