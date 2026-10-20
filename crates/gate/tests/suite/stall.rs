@@ -192,7 +192,7 @@ fn a_stall_kill_ends_a_child_outside_the_job_whose_launcher_exited_at_once() {
 #[test]
 fn a_silent_idle_command_is_killed_as_stalled() {
     let case = Case::new("a_silent_idle_command_is_killed_as_stalled");
-    let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100"];
+    let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100", "--test-stall-from-output"];
 
     // `sleep` blocks without a tick of CPU, where `wait` would poll.
     let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "out", "hi", "sleep", UNTIL_KILLED]));
@@ -229,13 +229,58 @@ fn a_silent_idle_command_is_killed_as_stalled() {
 }
 
 #[test]
+fn a_stall_window_from_the_first_output_does_not_count_a_quiet_start() {
+    let case = Case::new("a_stall_window_from_the_first_output_does_not_count_a_quiet_start");
+    // The first sleep blocks 3 s, twice the window, without a byte of output or a tick of CPU: with the window starting
+    // at the command's first output, that quiet start is no stall, and the quiet after `hi` is. Without the seam the
+    // command is killed in its first sleep, before it prints anything.
+    let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100", "--test-stall-from-output"];
+
+    let outcome = case.run(&run_words(
+        "out.log",
+        &seams,
+        &[FAKE_TOOL, "sleep", "3000", "pid", "out", "hi", "sleep", UNTIL_KILLED],
+    ));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    let stalled = Regex::new(&format!(
+        concat!(
+            r"(?m)^gate: STALLED: no output and no CPU for \d+ s \(machine free \d+% on average\); ",
+            r"killed {} sleep 3000 pid out hi sleep {} and its children$"
+        ),
+        regex::escape(FAKE_TOOL),
+        UNTIL_KILLED
+    ))
+    .expect("the pattern is valid");
+    let found = stalled.find(&outcome.stderr);
+    assert!(found.is_some(), "no STALLED line on stderr: {outcome:?}");
+    let line = found.expect("checked above").as_str();
+    let after = ["gate: terminated the job's 1 process(es)", "gate: FAILED (status 124)"];
+    assert_in_order(&outcome.stderr, &[&[line][..], &after[..]].concat());
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert_in_order(&log, &[&["hi\n", line][..], &after[..]].concat());
+
+    let release = release(&case);
+    assert_eq!(
+        (&release["verdict"], &release["status"]),
+        (&Value::from("stalled"), &Value::from(124)),
+        "{release}"
+    );
+    let pid = said_pid(&log, "pid ");
+    // A terminated process leaves its job before its object is signalled, so its end is waited for, not read once.
+    wait_until(&format!("the killed command {pid} ending"), || {
+        gate_win32::process_start_of(pid).is_ok_and(|start| start.is_none())
+    });
+}
+
+#[test]
 fn a_stalled_command_is_killed_with_its_grandchild() {
     let case = Case::new("a_stalled_command_is_killed_with_its_grandchild");
     // Never created: the grandchild waits on it until the kill ends it.
     let go = shown(&case.folder().join("go"));
     // The command's own pid, its `pid` line, the grandchild's pid and its `spawned` line each restart the stall
     // window, so the stall can only come once both processes are in the job and the command has gone quiet.
-    let seams = ["--test-stall-ms", "3000", "--test-sample-ms", "100"];
+    let seams = ["--test-stall-ms", "3000", "--test-sample-ms", "100", "--test-stall-from-output"];
 
     let outcome = case.run(&run_words(
         "out.log",

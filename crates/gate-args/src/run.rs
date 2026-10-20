@@ -138,6 +138,8 @@ pub(crate) enum SwitchOption {
     #[cfg(feature = "test-seams")]
     SamplerFail,
     #[cfg(feature = "test-seams")]
+    StallFromOutput,
+    #[cfg(feature = "test-seams")]
     OwnStartFails,
     #[cfg(feature = "test-seams")]
     ParentJobTrusted,
@@ -438,6 +440,8 @@ impl RunBuilder {
             SwitchOption::InterruptAfterFallback => self.test_seams.interrupt_after_fallback = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::SamplerFail => self.test_seams.sampler_fail = on,
+            #[cfg(feature = "test-seams")]
+            SwitchOption::StallFromOutput => self.test_seams.stall_from_output = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::OwnStartFails => self.test_seams.own_start_fails = on,
             #[cfg(feature = "test-seams")]

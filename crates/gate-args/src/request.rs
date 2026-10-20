@@ -254,6 +254,9 @@ pub struct TestSeams {
     pub heartbeat_ms: Option<u64>,
     pub poll_ms: Option<u64>,
     pub stall_ms: Option<u64>,
+    /// Whether the local watchdog's stall window runs only from the command's first output byte, so a quiet start is no
+    /// stall.
+    pub stall_from_output: bool,
     /// The unpaused wall time under which a passed light run is too short to ask whether its command would route on
     /// heavy, in milliseconds, in place of the gate's own floor.
     pub route_hint_floor_ms: Option<u64>,

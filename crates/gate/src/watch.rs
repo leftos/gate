@@ -681,6 +681,7 @@ fn config(request: &RunRequest, ceiling: u64) -> Config {
             .test_seams
             .stall_ms
             .map_or(Duration::from_secs(request.stall), Duration::from_millis),
+        stall_from_output: request.test_seams.stall_from_output,
         wsl: request.command.first().is_some_and(|word| is_wsl_command(&word.to_string_lossy())),
     }
 }

@@ -107,6 +107,21 @@ fn seam_flags_parse_with_the_feature() {
     );
 }
 
+/// The seam that starts the local watchdog's stall window at the command's first output byte is a switch of its own,
+/// off in a run that does not give it.
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_stall_from_output_seam_is_a_switch() {
+    use crate::support::run_request;
+
+    let words = with(&RUN, &["--test-stall-from-output", "--", "cmd"]);
+    assert!(run_request(&refs(&words)).test_seams.stall_from_output);
+    assert!(
+        !run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams.stall_from_output,
+        "off unless given"
+    );
+}
+
 /// The seam that ends a run Ctrl+C during the local wait after a `full` fallback is a switch of its own, off in a run
 /// that does not give it.
 #[cfg(feature = "test-seams")]

@@ -26,6 +26,9 @@ pub struct Config {
     pub timeout: u64,
     /// The window without progress after which the command is killed as `STALLED`.
     pub stall: Duration,
+    /// Whether the stall window runs only from the command's first output byte, so a quiet start is no stall: the test
+    /// seam `--test-stall-from-output`, which keeps a starved command's own start-up out of the window.
+    pub stall_from_output: bool,
     /// Whether the command runs through WSL, so the VM's CPU counts toward its progress.
     pub wsl: bool,
 }
@@ -359,7 +362,8 @@ impl Watch {
     /// ceiling, then the backstop. The stall is judged at the last sample's begin stamp, so the time a starved watcher
     /// spent in its reads, and between them and the check, is not the command's quiet time; the ceiling and the
     /// backstop read `now`. Once the sampler has failed only the backstop is read, since the stall and the load-adjusted
-    /// clock no longer move.
+    /// clock no longer move. With [`Config::stall_from_output`] the stall waits for the command's first output byte, so
+    /// a quiet start is no stall; the ceiling and the backstop are unaffected.
     #[must_use]
     #[expect(
         clippy::cast_precision_loss,
@@ -372,7 +376,9 @@ impl Watch {
             // it spent descheduled between its two stamps is not the command's quiet time.
             let judged_at = if self.sampled { self.last_began.min(now) } else { now };
             let quiet = judged_at.saturating_sub(self.last_progress);
-            if quiet >= self.config.stall {
+            // The seam's quiet start: while the command has written no byte, its window has not begun.
+            let quiet_start = self.config.stall_from_output && self.output_size == 0;
+            if !quiet_start && quiet >= self.config.stall {
                 return Some(Kill::Stalled { quiet, free_percent });
             }
             if self.adjusted >= self.config.timeout as f64 {
@@ -594,6 +600,7 @@ mod tests {
     fn config(stall_ms: u64, timeout_s: u64) -> Config {
         Config {
             stall: Duration::from_millis(stall_ms),
+            stall_from_output: false,
             timeout: timeout_s,
             wsl: false,
         }
@@ -781,6 +788,47 @@ mod tests {
         assert!(
             matches!(watch.kill_check(Duration::from_millis(1)), Some(Kill::Stalled { .. })),
             "the window itself is a stall"
+        );
+    }
+
+    #[test]
+    fn a_quiet_start_is_no_stall_until_the_first_output_when_the_window_starts_at_output() {
+        // Twice the window with nothing written and no CPU used: the quiet start is no stall while the command has not
+        // printed a byte.
+        let mut watch = watching(Config {
+            stall_from_output: true,
+            ..config(1000, 5000)
+        });
+        watch.sample(&tick(600, 0, 0, &[], false));
+        watch.sample(&tick(2600, 0, 0, &[], false));
+        assert!(watch.kill_check(Duration::from_millis(2600)).is_none(), "a quiet start is no stall");
+        // The first byte at 3600 starts the window, and the quiet window after it is a stall.
+        watch.sample(&tick(3600, 0, 1, &[], false));
+        assert!(
+            watch.kill_check(Duration::from_millis(3600)).is_none(),
+            "the first output starts the window"
+        );
+        watch.sample(&tick(4600, 0, 1, &[], false));
+        assert!(
+            matches!(
+                watch.kill_check(Duration::from_millis(4600)),
+                Some(Kill::Stalled { quiet, .. }) if quiet == Duration::from_millis(1000)
+            ),
+            "a quiet window after the first output is a stall"
+        );
+    }
+
+    #[test]
+    fn a_quiet_start_is_a_stall_without_the_setting() {
+        let mut watch = watching(config(1000, 5000));
+        watch.sample(&tick(600, 0, 0, &[], false));
+        watch.sample(&tick(2600, 0, 0, &[], false));
+        assert!(
+            matches!(
+                watch.kill_check(Duration::from_millis(2600)),
+                Some(Kill::Stalled { quiet, .. }) if quiet == Duration::from_millis(2600)
+            ),
+            "without the setting the quiet start is a stall, quiet measured from the start"
         );
     }
 

@@ -100,6 +100,7 @@ impl<'a> Ceiling<'a> {
         let config = Config {
             timeout,
             stall: Duration::MAX,
+            stall_from_output: false,
             wsl: false,
         };
         let sampler = if seams.sampler_fail {

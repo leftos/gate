@@ -26,6 +26,7 @@ fn print_request_shows_the_new_cli_request() {
         "heartbeatMs": null,
         "pollMs": null,
         "stallMs": null,
+        "stallFromOutput": false,
         "loadWindowMs": null,
         "interruptAfterSamples": null,
         "interruptQueued": false,
