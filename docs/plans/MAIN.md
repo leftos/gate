@@ -14,6 +14,10 @@
 - [ ] GATE-554 Bring a failed routed run's test reports back — High · Remote
 - [ ] GATE-557 Keep parallel test gates from building one tree at once after a dropped --no-build — High · Remote
 - [ ] GATE-559 Drain the builder behind a barrier so it can be redeployed — High · Remote
+- [ ] GATE-562 Builder drain 1: the barrier, admission and gated verbs on the box — High · Remote
+- [ ] GATE-563 Builder drain 2: make a routed run wait on its PC for the lift — High · Remote
+- [ ] GATE-564 Builder drain 3: gate drain on the PC, and its docs — High · Remote
+- [ ] GATE-567 Keep --no-build on a busy fallback when no nothing-back record stands — High · Remote
 
 ## Remote
 
@@ -156,6 +160,10 @@
 - [ ] GATE-555 Check whether a local kill mid-build leaves half-written outputs in a worktree
 - [/] GATE-556 Give a pair's first routed run the cold ceiling raise, or say it has none
 - [ ] GATE-558 Find why the LFS back-commit sync-back case exits -1 under load
+- [ ] GATE-565 Make gate push and the builder installer respect a standing builder drain
+- [ ] GATE-566 Gate the builder's git push and fetch by drain session
+- [ ] GATE-568 Check whether an OutputsFull pack puts an older builder build over a newer local one
+- [ ] GATE-569 Finish the interrupted-command clear: pid fallback, undeletable files, warm line
 
 ## Design
 
