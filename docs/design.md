@@ -3213,7 +3213,11 @@ Built verbs:
 
   In a run without a scratch folder a failed `add -A` is checked with `git grep -q -F -e filter=lfs --untracked -- ':(glob,icase)**/.gitattributes'` over the work tree, which passes over ignored folders.
 
-  When it exits 0 the failure says `gate: remote sync-back failed: the command added a file under the LFS filter, which a run without LFS content cannot bring back; run it with --local`, and otherwise (or when the check itself fails) it is git's own `add failed (status <n>)` line, with the repo's name on a pair run.
+  The check, and the one a failed checkout makes, runs with the work tree as its working directory (`WorkGit::quiet_in_tree`): `git grep --untracked` walks the folder git was started in, not the folder `--work-tree` names, and sshd starts the box in the ssh user's profile, where a walk once hung for hours in the profile's junction loop (the ssh token's SeBackupPrivilege gets git past their deny entries). A decoy `.gitattributes` in the box's start folder is not taken for the tree's.
+
+  When it exits 0 the failure says `gate: remote sync-back failed: the command added a file under the LFS filter, which a run without LFS content cannot bring back; run it with --local`, and otherwise it is git's own `add failed (status <n>)` line, with the repo's name on a pair run.
+
+  A check that cannot be started or waited for says `gate: remote leftover-LFS check could not run: <error>` on stderr first, and the checkout's or sync-back's own line follows as for any other answer of no.
 
   On a pair run the back refs are all or nothing across the repos: every repo's tree is committed first, the main repo's first (the one `Index` file serves each in turn), then every changed repo's commit is pushed to `refs/gate-back/<key>` in its own bare repository. A push that fails deletes the back ref of every repo pushed so far and the failing repo's own, each deletion tried and a failed one said, and the run fails as a sync-back failure.
 

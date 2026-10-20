@@ -3155,7 +3155,7 @@ impl WorkGit {
     /// are cleaned (`clean -fdq`), as a passing checkout's are, so an attributes file a command left there does not
     /// fail every later run; a clean that fails is said and leaves that line as it is. Else git's own ([`git_failed`]).
     fn checkout_failed(&self, repo: &Repo<'_>, lfs: &RunLfs, (step, code): (&str, i32), console: &mut Console) -> Failed {
-        if lfs.has_scratch() || !self.names_lfs_in_tree(repo) {
+        if lfs.has_scratch() || !self.names_lfs_in_tree(repo, console) {
             return git_failed(step, code);
         }
         if let Err(unclean) = self.step("clean", repo, &["clean", "-fdq"], console) {
@@ -3169,12 +3169,21 @@ impl WorkGit {
     }
 
     /// Whether a `.gitattributes` file of `repo`'s tree, at any depth and whatever the case of its name, tracked or
-    /// untracked, holds the text `filter=lfs` (`git grep`); a file in an ignored folder is passed over, as `add -A`
-    /// reads no attributes there and a package's own, in `node_modules` say, would name a filter the run never ran. A
-    /// `git grep` that fails, or cannot be started, says no, so the caller keeps git's own failure.
-    fn names_lfs_in_tree(&self, repo: &Repo<'_>) -> bool {
+    /// untracked, holds the text `filter=lfs` (`git grep`), searched in the tree itself ([`WorkGit::quiet_in_tree`]); a
+    /// file in an ignored folder is passed over, as `add -A` reads no attributes there and a package's own, in
+    /// `node_modules` say, would name a filter the run never ran. A `git grep` that fails, or cannot be started, says so
+    /// on the run's stderr and answers no, so the caller keeps git's own failure.
+    fn names_lfs_in_tree(&self, repo: &Repo<'_>, console: &mut Console) -> bool {
         let args = ["grep", "-q", "-F", "-e", "filter=lfs", "--untracked", "--", ATTRIBUTES_FILES];
-        matches!(self.quiet(repo, &args), Ok(0))
+        match self.quiet_in_tree(repo, &args) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(message) => {
+                let _held = self.output.lock().unwrap_or_else(PoisonError::into_inner);
+                console.err(&format!("gate: remote leftover-LFS check could not run: {message}"));
+                false
+            }
+        }
     }
 
     /// Every LFS pointer's path in `repo`'s tree checked to be a plain file of the pointer's size, as a checkout whose
@@ -3260,8 +3269,22 @@ impl WorkGit {
         self.git.code(&self.args(&all), Stdio::null(), Stdio::null())
     }
 
-    /// git's exit code for `args` in the tree of `repo` and the first line of its standard error, empty when it said
-    /// none, its standard output discarded, so a failure can say git's reason; else why git could not be started.
+    /// As [`WorkGit::quiet`], run in the tree itself, the folder its `--work-tree` names: a `git grep --untracked` walks
+    /// the folder it was started in, never that one, so from the box's own working directory, under sshd the ssh user's
+    /// profile, it would answer about the profile instead of the tree. Only a step that walks the tree takes it, and a
+    /// tree folder that is missing or unreachable fails the start instead of reading the wrong folder
+    /// ([`WorkGit::names_lfs_in_tree`] says so).
+    fn quiet_in_tree(&self, repo: &Repo<'_>, args: &[&str]) -> Result<i32, String> {
+        let mut all = repo.at().to_vec();
+        all.extend_from_slice(args);
+        let mut command = self.git.command(&self.args(&all))?;
+        command.current_dir(&repo.tree).stdout(Stdio::null()).stderr(Stdio::null());
+        Git::code_of(&mut command)
+    }
+
+    /// git's exit code for `args` and the first line of its standard error, empty when it said none, its standard output
+    /// discarded, so a failure can say git's reason; else why git could not be started. `args` name the commit they
+    /// search, so no working directory is set.
     fn quiet_saying(&self, repo: &Repo<'_>, args: &[&str]) -> Result<(i32, String), String> {
         let mut all = repo.at().to_vec();
         all.extend_from_slice(args);
@@ -3375,7 +3398,7 @@ impl WorkGit {
         let added = back.status("add", &add, true, console).map_err(|failed| match failed {
             // With no scratch folder, git-lfs's clean has no storage it can make: the cause when the tree's attributes
             // name the filter, and git's own line otherwise.
-            BackFailed::Step(_) if !lfs.has_scratch() && self.names_lfs_in_tree(repo) => BackFailed::Step(lfs::NO_STORAGE_ADD.to_owned()),
+            BackFailed::Step(_) if !lfs.has_scratch() && self.names_lfs_in_tree(repo, console) => BackFailed::Step(lfs::NO_STORAGE_ADD.to_owned()),
             other => other,
         });
         let tree = added.and_then(|()| back.line("write-tree", &["write-tree"], true, console));

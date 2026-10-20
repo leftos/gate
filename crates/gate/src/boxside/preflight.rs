@@ -886,8 +886,15 @@ impl Git {
     /// started.
     pub(crate) fn code(&self, args: &[&str], stdout: Stdio, stderr: Stdio) -> Result<i32, String> {
         let mut command = self.command(args)?;
-        // Started under the spawn lock, so it inherits no launch's handles.
-        let status = gate_win32::spawn(command.stdout(stdout).stderr(stderr))
+        command.stdout(stdout).stderr(stderr);
+        Self::code_of(&mut command)
+    }
+
+    /// The exit code of the built git `command`, started under the spawn lock so it inherits no launch's handles, and
+    /// waited for; else why it could not be started or waited for. The one spawn-and-wait path of every box git call
+    /// that reads only its exit code.
+    pub(crate) fn code_of(command: &mut Command) -> Result<i32, String> {
+        let status = gate_win32::spawn(command)
             .and_then(|mut child| child.wait())
             .map_err(|error| error.to_string())?;
         Ok(exit_code(status))

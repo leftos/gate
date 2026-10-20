@@ -1060,6 +1060,11 @@ fn a_pair_whose_sibling_alone_names_lfs_makes_the_scratch_folder() {
     assert_untouched(&planted, &outcome);
 }
 
+/// What a run with no scratch folder says when its back commit's `add -A` fails and the tree's attributes name the LFS
+/// filter.
+const NO_STORAGE_ADD: &str = "gate: remote sync-back failed: the command added a file under the LFS filter, which a run without LFS content cannot bring back; run it \
+     with --local";
+
 /// A run with no scratch folder commits back with an `lfs.storage` that cannot be made: a command that adds a file
 /// under the LFS filter fails the sync-back, saying so, and nothing reaches the work folder's `.git\lfs`.
 #[test]
@@ -1082,15 +1087,52 @@ fn a_command_adding_an_lfs_file_to_a_repo_without_lfs_fails_its_sync_back() {
     let outcome = run_box(&case, &payload);
 
     assert_ne!(outcome.code, Some(0), "the sync-back fails: {outcome:?}");
-    let line = "gate: remote sync-back failed: the command added a file under the LFS filter, which a run without LFS content \
-                cannot bring back; run it with --local";
-    assert_eq!(lines(&outcome.stderr).iter().filter(|said| **said == line).count(), 1, "{outcome:?}");
+    assert_eq!(
+        lines(&outcome.stderr).iter().filter(|said| **said == NO_STORAGE_ADD).count(),
+        1,
+        "{outcome:?}"
+    );
     assert!(!has_ref(&payload, "refs/gate-back/k"), "nothing is committed back: {outcome:?}");
     assert!(
         !work_file(&payload, r".git\lfs").exists(),
         "no clean wrote the work folder's .git\\lfs: {outcome:?}"
     );
     assert!(scratch_left(&payload).is_empty(), "no scratch folder is made: {outcome:?}");
+}
+
+/// The back commit's failure names the work tree's attributes wherever the box was started, as sshd starts it in the ssh
+/// user's profile: a box whose working directory is a folder outside the work folder still finds the `.gitattributes` the
+/// command wrote and says the filter's line, not git's own.
+#[test]
+fn a_command_s_attributes_file_is_found_by_a_box_started_outside_the_work_folder() {
+    let case = Case::new("box_lfs_run_added_filter_elsewhere");
+    let command = [
+        FAKE_TOOL,
+        "write",
+        ".gitattributes",
+        "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+        "write",
+        "new.bin",
+        "new content",
+        "out",
+        "ran",
+    ];
+    let mut payload = box_payload(&case, "k", &command);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let elsewhere = case.folder().join("profile");
+    fs::create_dir_all(&elsewhere).expect("the box's working directory can be made");
+
+    let mut call = box_call(&case, &["box", "run"], &self::payload(&payload));
+    call.current_dir(&elsewhere);
+    let outcome = call.finish();
+
+    assert_ne!(outcome.code, Some(0), "the sync-back fails: {outcome:?}");
+    assert_eq!(
+        lines(&outcome.stderr).iter().filter(|said| **said == NO_STORAGE_ADD).count(),
+        1,
+        "the tree's attributes are found, not the box's working directory's: {outcome:?}"
+    );
+    assert!(!has_ref(&payload, "refs/gate-back/k"), "nothing is committed back: {outcome:?}");
 }
 
 /// The fake tool's steps that leave `sub` a nested repository with no commit, which fails the back commit's `add -A`.
@@ -1281,6 +1323,28 @@ fn a_case_variant_attributes_file_makes_the_scratch_folder_and_never_reads_the_w
     assert!(!outcome.stderr.contains(UNDECLARED), "the run had its scratch folder: {outcome:?}");
 }
 
+/// The second run of `case`: its first checkout leaves the work folder with a `.gitattributes` naming the LFS filter,
+/// which the next snapshot does not track; the second checks out a snapshot holding a pointer whose object the store
+/// lacks, the object planted in the work folder's `.git\lfs` at its pointer's path, started in `started` when given as
+/// the box's working directory. Its second payload, and what that run did, the planted object asserted untouched.
+fn second_run_over_a_leftover(case: &Case, started: Option<&Path>) -> (Value, Outcome) {
+    let first = pushed_snapshot(case, &[("a.txt", "a\n")], &[]);
+    let ran = run_box(case, &first);
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    fs::write(work_file(&first, ".gitattributes"), "*.bin filter=lfs -text\n").expect("a leftover attributes file can be planted");
+    let pointer = planted_pointer(&first);
+    let second = renamed(&pushed_snapshot(case, &[], &[("a.bin", &pointer)]), 1);
+
+    let mut call = box_call(case, &["box", "run"], &self::payload(&second));
+    if let Some(started) = started {
+        call.current_dir(started);
+    }
+    let outcome = call.finish();
+
+    assert_planted_untouched(&second, "a.bin", &outcome);
+    (second, outcome)
+}
+
 /// A run with no scratch folder checks out with an `lfs.storage` that cannot be made: a `.gitattributes` naming the LFS
 /// filter that its snapshot does not track, left in the work folder, has git-lfs smudge a pointer, and the checkout fails
 /// saying so, the object planted in the work folder's `.git\lfs` at its pointer's path never read. The failed checkout
@@ -1288,16 +1352,8 @@ fn a_case_variant_attributes_file_makes_the_scratch_folder_and_never_reads_the_w
 #[test]
 fn a_leftover_attributes_file_naming_lfs_fails_the_checkout_of_a_run_without_a_scratch_folder() {
     let case = Case::new("box_lfs_run_leftover_attributes");
-    let first = pushed_snapshot(&case, &[("a.txt", "a\n")], &[]);
-    let ran = run_box(&case, &first);
-    assert_eq!(ran.code, Some(0), "{ran:?}");
-    fs::write(work_file(&first, ".gitattributes"), "*.bin filter=lfs -text\n").expect("a leftover attributes file can be planted");
-    let pointer = planted_pointer(&first);
-    let second = renamed(&pushed_snapshot(&case, &[], &[("a.bin", &pointer)]), 1);
+    let (second, outcome) = second_run_over_a_leftover(&case, None);
 
-    let outcome = run_box(&case, &second);
-
-    assert_planted_untouched(&second, "a.bin", &outcome);
     assert_eq!(
         lines(&outcome.stderr).iter().filter(|said| **said == UNDECLARED).count(),
         1,
@@ -1307,6 +1363,56 @@ fn a_leftover_attributes_file_naming_lfs_fails_the_checkout_of_a_run_without_a_s
     let next = run_box(&case, &renamed(&second, 2));
     assert_eq!(next.code, Some(0), "the next run checks out and passes: {next:?}");
     assert_eq!(next.stdout, "ran\n", "{next:?}");
+}
+
+/// The box's search for a leftover attributes file reads the work folder's tree wherever the box was started, as sshd
+/// starts it in the ssh user's profile: a box whose working directory is a folder outside the work folder still finds
+/// the tree's leftover `.gitattributes` naming the LFS filter, says so, and removes it.
+#[test]
+fn a_leftover_attributes_file_is_found_by_a_box_started_outside_the_work_folder() {
+    let case = Case::new("box_lfs_run_leftover_attributes_elsewhere");
+    let elsewhere = case.folder().join("profile");
+    fs::create_dir_all(&elsewhere).expect("the box's working directory can be made");
+    let (second, outcome) = second_run_over_a_leftover(&case, Some(&elsewhere));
+
+    assert_eq!(
+        lines(&outcome.stderr).iter().filter(|said| **said == UNDECLARED).count(),
+        1,
+        "the tree's leftover is found, not the box's working directory's: {outcome:?}"
+    );
+    assert!(!work_file(&second, ".gitattributes").exists(), "the leftover is removed: {outcome:?}");
+}
+
+/// A `.gitattributes` naming the LFS filter in the folder the box was started in is not the work tree's: a box started
+/// there, whose checkout fails for a reason of git's own in a tree holding no leftover, keeps git's own failure and
+/// never says the undeclared-file line.
+#[test]
+fn a_decoy_attributes_file_where_the_box_started_is_not_taken_for_the_tree_s() {
+    let case = Case::new("box_lfs_run_leftover_decoy");
+    let mut first = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &mut first, &[("a.txt", "a\n")]);
+    let ran = run_box(&case, &first);
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    let mut second = renamed(&first, 1);
+    snapshot(&case, &mut second, &[("b.txt", "b\n")]);
+    fs::write(work_file(&second, r".git\index.lock"), "").expect("a stale index lock can be planted");
+    let decoy = case.folder().join("profile");
+    fs::create_dir_all(&decoy).expect("the box's working directory can be made");
+    fs::write(decoy.join(".gitattributes"), "*.bin filter=lfs -text\n").expect("a decoy attributes file can be planted");
+
+    let mut call = box_call(&case, &["box", "run"], &self::payload(&second));
+    call.current_dir(&decoy);
+    let outcome = call.finish();
+
+    assert_ne!(outcome.code, Some(0), "the checkout fails: {outcome:?}");
+    assert_eq!(outcome.stdout, "", "the command never ran: {outcome:?}");
+    let line = "gate: remote checkout failed (status 128)";
+    assert_eq!(
+        lines(&outcome.stderr).iter().filter(|said| **said == line).count(),
+        1,
+        "git's own line: {outcome:?}"
+    );
+    assert!(!outcome.stderr.contains(UNDECLARED), "the decoy is not the tree's: {outcome:?}");
 }
 
 /// A snapshot whose only LFS rule is in a case variant of the attributes file's name, `sub/.GitAttributes`, which NTFS
