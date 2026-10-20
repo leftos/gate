@@ -90,6 +90,15 @@ The engine is not in the worktree and not on the builder's `PATH`: the builder h
 
   The builder needs git-lfs 3.1.3 or later whenever a tracked `.gitattributes` names the LFS filter (a builder without it keeps the run here, `parity`), and the PC must hold the objects: run `git lfs fetch` first, else the run falls back `lfs` with a log line naming the missing object. See [design.md, Routing](design.md#routing) (Git LFS).
 
+## Build files that read back as zeros
+
+When a caller reports build files that are the right size but all zero bytes, check for a crash of the PC before reading any gate code. Three things point to one:
+- System events 41, 6008 or 1001 near the time.
+- A run of NUL bytes in the PC's journal (`events.jsonl`, [design.md](design.md#journal)).
+- A gate with a `take` line and no `release`.
+
+A crash loses data that was not yet written to every drive at once. NTFS can keep a file's new size while its contents never reach the disk. The gate never leaves a file like that: the outputs install unpacks into a stage it removes on any error, and it replaces a worktree file only by renaming a complete, verified copy over it.
+
 ## Taking a builder out for maintenance
 
 A reboot, an install that needs one, or any other work that would break a run on the builder starts by draining it, never by waiting for it to go idle while it stays in `remote.json`: new runs keep arriving, so that wait has no end.

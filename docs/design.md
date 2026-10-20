@@ -962,6 +962,8 @@ The journal keeps ISO 8601 UTC strings for `time` and `processStart` (7 fraction
 
 `v` is a line-level rule, unlike the other formats: the writer always writes `"v":1` first; a reader skips a line whose `v` is present and not 1, and reads a line with no `v` as the PowerShell gate's format until the cutover's drain (GATE-9) makes `v` required.
 
+A reader also skips a line that does not parse. A crash of the PC can leave a run of NUL bytes where the last lines before it were. That run reads as one line, so the crash costs only the lines it lost.
+
 The event's own fields:
 
 | Event | Fields after the common ones |
