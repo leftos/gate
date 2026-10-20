@@ -69,6 +69,8 @@ The key is for check-only hook commands (a build, clippy, a format check). A rou
 
 The hook entry calls the repo's launcher, `pwsh -NoProfile -File tools/gate.ps1 run ... -- <heavy command>`, never a bare `gate run`: a hook runs on every machine that commits, and on a clone without gate.exe the launcher runs the command directly. The repo's patterns must match that command. The `git commit` that runs the hook is gated on `--slot none`, so it does not cover its hook's gate and the hook's gate takes its own slot (and routes). The `git commit` itself stays local.
 
+Only hooks that run with `GIT_INDEX_FILE` set (pre-commit and commit-msg) need the `hooks` consent: a pre-push hook's gate routes by the repo's patterns like any other run. A repo without a launcher copies this repo's `tools/gate.ps1` by hand; nothing publishes it.
+
 ## A repo whose short runs a cold folder would push past their ceiling
 
 A repo whose short routed runs (a filtered test of a minute) would meet a cold builder work folder declares warm-up builds in a tracked `.gate/warmup.toml`, and `remote.json` consents to it under `warmup` ([design.md, gate warm](design.md#gate-warm)). Routed runs go to the builder from a new worktree's first run, warm or not: the first run in a new work folder is cold, with its ceiling raised, and says to prewarm the next new worktree with `gate warm`. Run `gate warm` in a new worktree before its first routed run to find the folder warm.
