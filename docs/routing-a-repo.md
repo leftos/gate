@@ -73,6 +73,17 @@ This repo's `tools/builder/install-toolchains.ps1` does the rest: the toolchains
 - **Test:** `pwsh -NoProfile -File tools/builder/test-install-toolchains.ps1`, run through `tools/gate.ps1 -Slot light`. It installs nothing and needs no admin.
 - **The Unreal engine install is not in the installer.**
 
+### A macOS builder
+
+A macOS builder (an Apple-silicon Mac, a dedicated builder nobody works on) is set up by `tools/builder/install-macos.sh`, run as the builder user over ssh. It is in progress: the Unix box and its install by `gate push` are GATE-607 and GATE-608.
+
+- **Toolchain steps** need no sudo and land under `--prefix` (default `~/gate-tools`), Rust under `CARGO_HOME` and `RUSTUP_HOME`: .NET SDK 10.0.401 and 8.0.425, the wasm-tools workload, PowerShell, Node.js, pnpm, uv and prek, Rust, cargo-nextest, Git LFS, Godot 4.7.2 mono, Bun. FFmpeg is skipped: no official source publishes a macOS arm64 build with a checksum.
+- **Login PATH** writes a marked block to `~/.zprofile`. The box reads its commands' PATH from the builder user's login shell, since a non-login ssh command lacks the prefix's tools.
+- **Git config** sets `core.autocrlf false` and `gc.pruneExpire never`. **Gate work root** (`--root`, default `~/gate-remote`) makes the root, `work` and `bin` at mode 700; the box refuses a root another account may write in.
+- **System** runs only as `sudo bash install-macos.sh --system --user <builder user> --only System`: no sleep, restart after power loss, wake on network, the open-file limits and Remote Login. Without `--system` it prints the commands it would run.
+- **Flags and exits** follow the Windows installer: `--only <prefix>,...` (case-insensitive prefixes, then the summary; `--only Summary` alone), `--list`, exit 2 on a bad argument or a prefix that matches no step, exit 1 when a step failed. Every step logs `OK`, `SKIP` or `FAIL` to stdout and `<prefix>/install.log`.
+- **Test:** `bash tools/builder/test-install-macos.sh`, on this PC or the Mac; it installs nothing.
+
 `gate check --builder` hints at the installer for a missing node, pwsh, ffmpeg, netfx-sdk or a rust with no minimum: the hint names `tools/builder/install-toolchains.ps1` and points to this section.
 
 ## The routing trial
