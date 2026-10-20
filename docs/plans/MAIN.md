@@ -4,26 +4,23 @@
 
 ## Do first
 
-- [ ] GATE-580 Make the full suite green on main 003d1868: a load-starved stall case and a listing stall — Urgent · Remote
+- [ ] GATE-574 Take the work lock in the box preflight and stamp the lock's time on each run — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [/] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
-- [/] GATE-468 Route Unreal Engine packaging to the builder with an unreal toolchain pin — High · Remote
-- [ ] GATE-579 Install a current Visual C++ redistributable on the builder for Unreal 5.8 cooks — High · Remote
-- [/] GATE-542 Repair a builder work folder a killed run left with an unmappable runtimeconfig.json — High · Remote
 - [ ] GATE-554 Bring a failed routed run's test reports back — High · Remote
-- [ ] GATE-557 Keep parallel test gates from building one tree at once after a dropped --no-build — High · Remote
 - [ ] GATE-559 Drain the builder behind a barrier so it can be redeployed — High · Remote
 - [ ] GATE-562 Builder drain 1: the barrier, admission and gated verbs on the box — High · Remote
 - [ ] GATE-563 Builder drain 2: make a routed run wait on its PC for the lift — High · Remote
 - [ ] GATE-564 Builder drain 3: gate drain on the PC, and its docs — High · Remote
 - [ ] GATE-567 Keep --no-build on a busy fallback when no nothing-back record stands — High · Remote
-- [/] GATE-571 Prune idle builder work folders every 6 hours from a scheduled task — High · Remote
-- [ ] GATE-574 Take the work lock in the box preflight and stamp the lock's time on each run — High · Remote
 - [ ] GATE-572 Refuse routing when the builder's work drive is under a free-space floor — High · Remote
-- [ ] GATE-576 Make a routed command's work tree owned by the user it runs as, as on the PC — High · Remote
+- [/] GATE-576 Make a routed command's work tree owned by the user it runs as, as on the PC — High · Remote
+- [ ] GATE-581 Refuse a box work root that another account may write in, at the preflight and in gate check --builder — High · Remote
+- [ ] GATE-583 Run the box's leftover-LFS git grep in the work tree, not the ssh profile it hangs in — High · Remote
+- [ ] GATE-584 Bound the box's git waits and end them when the PC is gone — High · Remote
 
 ## Remote
 
@@ -164,7 +161,6 @@
 - [ ] GATE-548 Run the netfx-sdk probe under the batch deadline and keep a failed read's reason
 - [ ] GATE-553 Say a routed run's sync-back when its tree came back unchanged
 - [ ] GATE-555 Check whether a local kill mid-build leaves half-written outputs in a worktree
-- [/] GATE-556 Give a pair's first routed run the cold ceiling raise, or say it has none
 - [ ] GATE-558 Find why the LFS back-commit sync-back case exits -1 under load
 - [ ] GATE-565 Make gate push and the builder installer respect a standing builder drain
 - [ ] GATE-566 Gate the builder's git push and fetch by drain session
@@ -172,6 +168,11 @@
 - [ ] GATE-569 Finish the interrupted-command clear: pid fallback, undeletable files, warm line
 - [ ] GATE-575 Close the narrow windows in the interrupted-command clear
 - [ ] GATE-577 Follow-ups to the builder work-folder prune: lock files, failure exit, installer guard
+- [ ] GATE-586 Keep a sent build per project, so lanes alternating test projects do not re-upload
+- [ ] GATE-587 Refuse or rewrite a sent restore file whose NuGet package root another account can write
+- [ ] GATE-588 Hold the box's work folder parent against a swap for a junction while records are touched
+- [ ] GATE-589 Match the send's output-moving properties as MSBuild elements, not text anywhere
+- [ ] GATE-590 Say an unusable sendBuild in gate check, and refuse a send when the inputs record cannot be read
 
 ## Design
 
@@ -274,6 +275,7 @@
 - [ ] GATE-560 Point ARCHITECTURE.md's PowerShell references at the behaviour inventory
 - [ ] GATE-561 Promote desktop-session.md's shipped rulings into design.md
 - [ ] GATE-578 Find why a stalled local Unreal package run left a dotnet AutomationTool child alive
+- [ ] GATE-582 Make the box-made folders of a routed work tree owned by the command's user, as on the PC
 
 ## No project
 
