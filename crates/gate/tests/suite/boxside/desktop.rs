@@ -185,6 +185,22 @@ fn a_desktop_refusal_carries_the_tag_and_exit_75_and_no_back_commits_line_on_a_p
 }
 
 #[test]
+fn a_desktop_run_refused_before_its_command_leaves_no_command_record() {
+    let case = Case::new("desktop_refused_no_record");
+    let mut payload = desktop_payload(&case, "k", COMMAND, 1);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let held = HeldDesktop::hold(&case);
+    let outcome = run_desktop(&case, &payload, "ok", "active", DESKTOP_MS);
+    drop(held);
+
+    refused_with(&outcome, &payload, BUSY_FOR_1_S);
+    let record = format!("{}.command", field(&payload, "Work"));
+    assert!(!Path::new(&record).exists(), "a command that never started leaves no record: {outcome:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
 fn a_desktop_run_releases_the_builders_desktop_when_it_ends() {
     let case = Case::new("desktop_released");
     let payload = ready_payload(&case, COMMAND);

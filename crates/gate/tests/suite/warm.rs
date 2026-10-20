@@ -1612,7 +1612,8 @@ fn a_layout_refusal_whose_record_cannot_be_removed_says_so() {
 // A routed run of a consenting repo through the real client over the suite's `local:` transport.
 
 /// The cold note of a run whose `--timeout 60` was raised, in a repo whose warm-up is set up.
-const COLD_NOTE: &str = "gate: remote cold: this worktree's work folder on the builder is new; the ceiling is raised from 60 s to 120 s; \
+const COLD_NOTE: &str = "gate: remote cold: this worktree's work folder on the builder is new or was cleared; \
+             the ceiling is raised from 60 s to 120 s; \
                          prewarm the next new worktree with gate warm";
 
 #[test]

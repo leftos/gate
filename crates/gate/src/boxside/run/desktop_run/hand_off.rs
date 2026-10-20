@@ -38,8 +38,8 @@ use crate::boxside::desktop::verify::{
 };
 use crate::boxside::payload::escaped;
 use crate::boxside::run::{
-    Beat, Launched, Look, One, Pipes, Prepared, Ran, Request, STARTING_COMMAND, Started, Stopper, box_run_job, failed, job_made, not_started,
-    stopped_before_start, wait_for_path, watch,
+    Beat, Launched, Look, One, Pipes, Prepared, Ran, Request, STARTING_COMMAND, Started, Stopper, box_run_job, command_record, failed, job_made,
+    not_started, record_failed, stopped_before_start, unstarted_record_removed, wait_for_path, watch, written_command_record,
 };
 use crate::console::Console;
 use crate::remote::{Refusal, install_untrusted_line, refused_line, started_line};
@@ -203,9 +203,22 @@ pub(super) fn hand_off(here: &Here<'_, '_>, console: &mut Console) -> Result<Ran
         Look::Go(Some(unread)) => beat.say(console, &unread),
         Look::Go(None) => {}
     }
-    let running = suspended
-        .resume()
-        .map_err(|error| DesktopEnd::Ended(failed(console, &error.to_string())))?;
+    // Written only now that the command is in its job and about to run, so a run refused or ended before it leaves none.
+    let record = here.one.recorded.then(|| command_record(here.request.work));
+    if let Some(record) = &record {
+        written_command_record(record, here.request.job).map_err(|error| {
+            let status = record_failed("write", record, &error, beat, console);
+            // A write that failed part way may have left a record: the command never ran.
+            unstarted_record_removed(record, beat, console);
+            DesktopEnd::Ended(status)
+        })?;
+    }
+    let running = suspended.resume().map_err(|error| {
+        if let Some(record) = &record {
+            unstarted_record_removed(record, beat, console);
+        }
+        DesktopEnd::Ended(failed(console, &error.to_string()))
+    })?;
     let launched = Launched { running, pipes };
     let mut stopper = Stopper { job: &job, armed: true };
     let spec = Spec {

@@ -4219,7 +4219,10 @@ fn cold_line(from: u64, to: u64, warm_up: bool) -> String {
     } else {
         "a .gate/warmup.toml lets gate warm prewarm the next new worktree"
     };
-    format!("gate: remote cold: this worktree's work folder on the builder is new; the ceiling is raised from {from} s to {to} s; {prewarm}")
+    format!(
+        "gate: remote cold: this worktree's work folder on the builder is new or was cleared; \
+         the ceiling is raised from {from} s to {to} s; {prewarm}"
+    )
 }
 
 /// Why a warm-up the box ran to status 0 is still not warm.
@@ -6903,12 +6906,14 @@ mod tests {
     fn the_cold_note_names_gate_warm_only_for_a_repo_with_a_warm_up() {
         assert_eq!(
             cold_line(60, 120, true),
-            "gate: remote cold: this worktree's work folder on the builder is new; the ceiling is raised from 60 s to 120 s; \
+            "gate: remote cold: this worktree's work folder on the builder is new or was cleared; \
+             the ceiling is raised from 60 s to 120 s; \
              prewarm the next new worktree with gate warm"
         );
         assert_eq!(
             cold_line(3600, 5400, false),
-            "gate: remote cold: this worktree's work folder on the builder is new; the ceiling is raised from 3600 s to 5400 s; \
+            "gate: remote cold: this worktree's work folder on the builder is new or was cleared; \
+             the ceiling is raised from 3600 s to 5400 s; \
              a .gate/warmup.toml lets gate warm prewarm the next new worktree"
         );
     }

@@ -470,6 +470,78 @@ fn preflight_of_a_new_work_tree_says_so_once() {
     assert_eq!(new_tree(&passed(&second)), 0, "the tree is there the second time: {second:?}");
 }
 
+/// The preflight's lines of `outcome`, a passed one, and whether it says the work folder is cold: the new work tree
+/// line right after the warm line.
+fn said_cold(outcome: &Outcome) -> bool {
+    let printed = passed(outcome);
+    let warm = printed.iter().position(|line| line.starts_with("gate: remote warm "));
+    warm.and_then(|at| printed.get(at + 1)).copied() == Some("gate: remote new work tree")
+}
+
+#[test]
+fn a_preflight_reports_a_work_folder_an_interrupted_command_left_as_cold() {
+    let case = Case::new("preflight_interrupted_cold");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let ran = run_box(&case, &payload);
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    let warm = gate_box(&case, "preflight", &self::payload(&payload), None);
+    assert!(!said_cold(&warm), "a folder a clean run left is warm: {warm:?}");
+    fs::write(command_record(&payload), "").expect("the record can be written");
+
+    let cold = gate_box(&case, "preflight", &self::payload(&payload), None);
+
+    assert!(said_cold(&cold), "{cold:?}");
+    assert!(command_record(&payload).exists(), "the preflight never clears: {cold:?}");
+}
+
+#[test]
+fn a_preflight_reports_a_pair_s_first_run_as_cold() {
+    let case = Case::new("preflight_pair_first_cold");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "out", "ran"]);
+    allow_breakaway();
+    let first = gate_box(&case, "preflight", &self::payload(&payload), None);
+    assert!(said_cold(&first), "a pair's work folder with no layout record yet: {first:?}");
+    pair_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("lib", &[("b.txt", "b\n")])]);
+    let ran = run_box(&case, &payload);
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+
+    let after = gate_box(&case, "preflight", &self::payload(&payload), None);
+
+    assert!(!said_cold(&after), "the run recorded the pair's layout: {after:?}");
+}
+
+#[test]
+fn a_pair_whose_layout_record_names_another_layout_gets_the_cold_raise() {
+    let case = Case::new("preflight_pair_relaid_cold");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "out", "ran"]);
+    allow_breakaway();
+    pair_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("lib", &[("b.txt", "b\n")])]);
+    let ran = run_box(&case, &payload);
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    let record = format!("{}.layout", field(&payload, "Work"));
+
+    for other in ["pair other lib", "changing"] {
+        fs::write(&record, other).expect("the layout record can be written");
+        let cold = gate_box(&case, "preflight", &self::payload(&payload), None);
+        assert!(said_cold(&cold), "a record of {other:?} has the run clear the whole folder: {cold:?}");
+    }
+}
+
+#[test]
+fn a_folder_at_the_command_record_s_name_gets_the_cold_raise() {
+    let case = Case::new("preflight_record_folder_cold");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let ran = run_box(&case, &payload);
+    assert_eq!(ran.code, Some(0), "{ran:?}");
+    fs::create_dir(command_record(&payload)).expect("a folder can stand in for the record");
+
+    let cold = gate_box(&case, "preflight", &self::payload(&payload), None);
+
+    assert!(said_cold(&cold), "a folder at the record's name has the run clear: {cold:?}");
+}
+
 #[test]
 fn preflight_repairs_a_missing_origin() {
     let case = Case::new("preflight_repairs_a_missing_origin");
@@ -4204,10 +4276,11 @@ fn preflight_with_a_pair_creates_each_bare_and_nothing_in_the_work_folder() {
     );
     assert_eq!(
         printed.len(),
-        7,
-        "the created lines, then the version, warm, boot and sdks lines: {outcome:?}"
+        8,
+        "the created lines, then the version, warm, new work tree, boot and sdks lines: {outcome:?}"
     );
     assert_eq!(printed[4], "gate: remote warm none", "{outcome:?}");
+    assert_eq!(printed[5], "gate: remote new work tree", "a pair's first run is cold: {outcome:?}");
     for bare in &bares {
         assert_eq!(
             git(&[&format!("--git-dir={bare}"), "rev-parse", "--is-bare-repository"]),
@@ -7005,6 +7078,640 @@ fn box_run_past_its_load_adjusted_ceiling_is_killed_with_the_ruled_line_and_124(
         !has_ref(&payload, "refs/gate-back/k"),
         "a killed command's tree gets no back commit: {outcome:?}"
     );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_run_after_a_ceiling_kill_removes_what_the_killed_command_wrote_and_keeps_older_outputs() {
+    let case = Case::new("box_run_after_kill_outputs");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "write", r"bin\Release\old.dll", "whole"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n"), ("a.txt", "a\n")]);
+    // The first run is an earlier build that finished; the second is killed by the box's ceiling mid-build.
+    let work = killed_mid_write(&case, &payload);
+    // Older than the clear's slack, as an output of a build that finished minutes before the killed one.
+    backdated(&work.join(r"bin\Release\old.dll"), Duration::from_mins(5));
+
+    let third = run_box(&case, &ran_next(&payload));
+
+    assert_eq!(third.code, Some(0), "{third:?}");
+    assert!(
+        !work.join(HALF_WRITTEN).exists(),
+        "the next run removes what the killed command wrote before its own command: {third:?}"
+    );
+    assert!(
+        work.join(r"bin\Release\old.dll").exists(),
+        "an output written before the killed command started is kept, so the folder stays warm: {third:?}"
+    );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// The file the interrupted-command cases' command writes before it is ended mid-run.
+const HALF_WRITTEN: &str = r"bin\Release\x.runtimeconfig.json";
+/// The line the box says before it clears what an interrupted command left.
+const CLEARING: &str = "gate: remote clearing what an interrupted command left in the work folder";
+
+/// Sets the creation and last-write times of the file `path` back by `by`.
+fn backdated(path: &Path, by: Duration) {
+    use std::os::windows::fs::FileTimesExt;
+    let then = std::time::SystemTime::now() - by;
+    let file = fs::OpenOptions::new().write(true).open(path).expect("the file can be opened");
+    file.set_times(fs::FileTimes::new().set_modified(then).set_created(then))
+        .expect("its times can be set");
+}
+
+/// The interrupted-command record of the work folder of `payload`, `{Work}.command`.
+fn command_record(payload: &Value) -> PathBuf {
+    PathBuf::from(format!("{}.command", field(payload, "Work")))
+}
+
+/// Runs the command of `payload` to its end, then a run whose command writes [`HALF_WRITTEN`] and is killed by the
+/// box's ceiling; the work folder, the half-written file in it and the lock closed.
+fn killed_mid_write(case: &Case, payload: &Value) -> PathBuf {
+    let first = run_box(case, payload);
+    assert_eq!(first.code, Some(0), "the run that lays the work folder out: {first:?}");
+    let mut killed = renamed(payload, 1);
+    killed["Command"] = json!([FAKE_TOOL, "write", HALF_WRITTEN, "{", "err", "started", "sleep", "600000"]);
+    killed["Timeout"] = json!(1);
+    let second = run_box_with_seams(case, &killed, &["--test-box-sample-ms", "20", "--test-box-free-percent", "100"]);
+    assert_eq!(second.code, Some(124), "the box's ceiling killed the command mid-write: {second:?}");
+    let work = PathBuf::from(field(payload, "Work"));
+    assert!(work.join(HALF_WRITTEN).exists(), "the killed command left its file");
+    assert!(command_record(payload).exists(), "a killed command leaves its record");
+    wait_until_closed(Path::new(field(payload, "Lock")));
+    work
+}
+
+/// `payload` renamed for the third run of a case, its command printing `ran`.
+fn ran_next(payload: &Value) -> Value {
+    let mut next = renamed(payload, 2);
+    next["Command"] = json!([FAKE_TOOL, "out", "ran"]);
+    next
+}
+
+#[test]
+fn box_run_after_a_clean_run_clears_nothing() {
+    let case = Case::new("box_run_after_clean");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "write", r"bin\kept.txt", "whole"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n"), ("a.txt", "a\n")]);
+    let first = run_box(&case, &payload);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert!(!command_record(&payload).exists(), "a clean end removes the record: {first:?}");
+
+    let second = run_box(&case, &ran_next(&payload));
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert!(
+        Path::new(field(&payload, "Work")).join(r"bin\kept.txt").exists(),
+        "what a passed command wrote stays: {second:?}"
+    );
+    assert!(!second.stderr.contains("interrupted command"), "no clearing line: {second:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_run_after_a_stopped_run_clears_what_it_wrote() {
+    let case = Case::new("box_run_after_stop");
+    let mut payload = box_payload(
+        &case,
+        "k",
+        &[FAKE_TOOL, "write", HALF_WRITTEN, "{", "err", "mid-write", "sleep", "600000"],
+    );
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n"), ("a.txt", "a\n")]);
+    let running = start_box(&case, &payload);
+    // The command's own line, not the box's start marker, so the stop lands once the command has written.
+    running.wait_for_stderr("mid-write");
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    let outcome = running.finish();
+    assert_eq!(outcome.code, Some(124), "the stop ended the command: {outcome:?}");
+    let work = PathBuf::from(field(&payload, "Work"));
+    assert!(work.join(HALF_WRITTEN).exists(), "the stopped command left its file");
+    assert!(command_record(&payload).exists(), "a stopped command leaves its record");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+
+    let next = run_box(&case, &ran_next(&payload));
+
+    assert_eq!(next.code, Some(0), "{next:?}");
+    assert!(
+        !work.join(HALF_WRITTEN).exists(),
+        "the next run removes what the stopped command wrote: {next:?}"
+    );
+    let said = lines(&next.stderr);
+    assert!(said.contains(&CLEARING), "{next:?}");
+    // The count takes in the files the stopped run's own checkout wrote within the clear's slack, which come back with
+    // the next checkout.
+    let cleared =
+        Regex::new(r"^gate: remote cleared [1-9]\d* file\(s\) an interrupted command left in the work folder$").expect("the pattern compiles");
+    assert!(said.iter().any(|line| cleared.is_match(line)), "{next:?}");
+    assert!(
+        !command_record(&payload).exists(),
+        "the clear and the clean run remove the record: {next:?}"
+    );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_run_clear_never_enters_a_junction_or_git() {
+    let case = Case::new("box_run_clear_junction_git");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "laid"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\nsub/\nlinked/\n"), ("a.txt", "a\n")]);
+    let work = killed_mid_write(&case, &payload);
+    let outside = case.folder().join("outside");
+    fs::create_dir_all(&outside).expect("the folder outside can be made");
+    fs::write(outside.join("fresh.txt"), "x").expect("a fresh file outside can be written");
+    junction(&work.join("linked"), &outside);
+    fs::write(work.join(r".git\fresh-canary"), "x").expect("a fresh file in .git can be written");
+    fs::create_dir_all(work.join("sub")).expect("a subfolder can be made");
+    fs::write(work.join(r"sub\.git"), "x").expect("a fresh .git file can be written");
+
+    let next = run_box(&case, &ran_next(&payload));
+
+    assert_eq!(next.code, Some(0), "{next:?}");
+    assert!(!work.join(HALF_WRITTEN).exists(), "the clear ran: {next:?}");
+    assert!(outside.join("fresh.txt").exists(), "nothing behind the junction is removed: {next:?}");
+    assert!(fs::symlink_metadata(work.join("linked")).is_ok(), "the junction stays: {next:?}");
+    assert!(work.join(r".git\fresh-canary").exists(), "nothing in .git is removed: {next:?}");
+    assert!(work.join(r"sub\.git").exists(), "a .git file at any depth is skipped: {next:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn box_run_clear_that_cannot_remove_a_file_refuses_with_layout() {
+    let case = Case::new("box_run_clear_refuses");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "laid"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n"), ("a.txt", "a\n")]);
+    let work = killed_mid_write(&case, &payload);
+    // Read sharing alone: no delete sharing, so the clear cannot remove it while it is held.
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x1)
+        .open(work.join(HALF_WRITTEN))
+        .expect("the half-written file can be held");
+
+    let next = ran_next(&payload);
+    let outcome = run_box(&case, &next);
+    drop(held);
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    let said = lines(&outcome.stderr);
+    let refusal = format!(
+        "gate: remote could not clear what an interrupted command left in the work folder: {}: ",
+        work.join(HALF_WRITTEN).display()
+    );
+    assert!(said.iter().any(|line| line.starts_with(&refusal)), "{refusal:?} in {outcome:?}");
+    let tag = format!("gate-remote-refused: {} layout", field(&next, "Nonce"));
+    assert!(said.contains(&tag.as_str()), "{outcome:?}");
+    // The layout line does not say the path and the error again.
+    let not_routed = |line: &&str| {
+        line.starts_with("gate: not routed: the builder could not clear ")
+            && line.ends_with("'s work folder: what an interrupted command left in it could not be cleared")
+    };
+    assert!(said.iter().any(not_routed), "{outcome:?}");
+    assert!(!outcome.stdout.contains("ran"), "the command never ran: {outcome:?}");
+    assert!(
+        command_record(&payload).exists(),
+        "a clear that did not finish keeps the record: {outcome:?}"
+    );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// The orphan's last steps when it only sleeps.
+const SLEEPING: &[&str] = &["sleep", "600000"];
+
+/// Starts a run of `payload` renamed for its second run, whose command writes its pid to `pid_file`, then
+/// [`HALF_WRITTEN`], then takes the fake tool's steps `then`; kills the box process alone once the command said it
+/// started, and returns the command, still running, opened to be waited for and ended.
+fn orphaned_by_a_killed_box(case: &Case, payload: &Value, pid_file: &Path, then: &[&str]) -> StoppableProcess {
+    let mut orphaned = renamed(payload, 1);
+    let mut command = vec![
+        FAKE_TOOL.to_owned(),
+        "pid-to".to_owned(),
+        shown(pid_file),
+        "write".to_owned(),
+        HALF_WRITTEN.to_owned(),
+        "{".to_owned(),
+        "err".to_owned(),
+        "orphan-writing".to_owned(),
+    ];
+    command.extend(then.iter().map(|step| (*step).to_owned()));
+    orphaned["Command"] = json!(command);
+    let running = start_box(case, &orphaned);
+    running.wait_for_stderr("orphan-writing");
+    let killed = running.kill();
+    let pid: u32 = fs::read_to_string(pid_file)
+        .expect("the command wrote its pid")
+        .trim()
+        .parse()
+        .expect("the pid file holds a pid");
+    let opened = StoppableProcess::open(pid).expect("the command can be opened");
+    assert!(opened.is_some(), "the command outlived its box: {killed:?}");
+    let orphan = opened.expect("it is there");
+    assert!(
+        !orphan.wait(Duration::ZERO).expect("the command can be waited for"),
+        "the command outlived its box: {killed:?}"
+    );
+    assert!(command_record(payload).exists(), "a box that died leaves the record");
+    wait_until_closed(Path::new(field(payload, "Lock")));
+    orphan
+}
+
+#[test]
+fn a_command_left_running_by_a_killed_box_is_ended_before_the_next_run_clears() {
+    let case = Case::new("box_run_orphan_ended");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "laid"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n"), ("a.txt", "a\n")]);
+    let first = run_box(&case, &payload);
+    assert_eq!(first.code, Some(0), "the run that lays the work folder out: {first:?}");
+    // It writes its file again and again, holding it without delete sharing, so a clear that ran before it was ended
+    // could not remove the file and would refuse the run.
+    let orphan = orphaned_by_a_killed_box(&case, &payload, &case.folder().join("orphan.pid"), &["rewrite", HALF_WRITTEN, "{"]);
+
+    let next = run_box(&case, &ran_next(&payload));
+
+    let ended = orphan.wait(Duration::ZERO).expect("the command can be waited for");
+    if !ended {
+        // Ended here, so a failed case leaves no command sleeping behind it.
+        let _ = orphan.terminate(1);
+    }
+    assert!(ended, "the next run ends the command its killed box left: {next:?}");
+    assert_eq!(next.code, Some(0), "{next:?}");
+    let work = Path::new(field(&payload, "Work"));
+    assert!(!work.join(HALF_WRITTEN).exists(), "the clear ran once the command was ended: {next:?}");
+    assert!(!command_record(&payload).exists(), "the record goes once its command is ended: {next:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// Whether `orphan` has ended; one still running is ended here, so a failed case leaves no command sleeping.
+fn ended_or_ended_now(orphan: &StoppableProcess) -> bool {
+    let ended = orphan.wait(Duration::ZERO).expect("the command can be waited for");
+    if !ended {
+        let _ = orphan.terminate(1);
+    }
+    ended
+}
+
+#[test]
+fn a_layout_change_ends_the_recorded_command_before_it_clears() {
+    let case = Case::new("box_run_layout_change_ends");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "laid"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n"), ("a.txt", "a\n")]);
+    let first = run_box(&case, &payload);
+    assert_eq!(first.code, Some(0), "the run that lays the work folder out: {first:?}");
+    let orphan = orphaned_by_a_killed_box(&case, &payload, &case.folder().join("orphan.pid"), SLEEPING);
+    // The layout record names another layout, as a pair run in this work folder would have left it.
+    fs::write(format!("{}.layout", field(&payload, "Work")), "pair other lib").expect("the layout record can be written");
+
+    let next = run_box(&case, &ran_next(&payload));
+
+    assert!(
+        ended_or_ended_now(&orphan),
+        "the clear of a changed layout ends the recorded command: {next:?}"
+    );
+    assert_eq!(next.code, Some(0), "{next:?}");
+    let work = Path::new(field(&payload, "Work"));
+    assert!(!work.join(HALF_WRITTEN).exists(), "the changed layout's clear ran: {next:?}");
+    assert!(!command_record(&payload).exists(), "the record goes after the clear: {next:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn a_malformed_command_record_clears_the_work_folder_and_ends_no_job() {
+    let case = Case::new("box_run_record_malformed");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "write", r"bin\old.txt", "whole"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n"), ("a.txt", "a\n")]);
+    let first = run_box(&case, &payload);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let work = PathBuf::from(field(&payload, "Work"));
+    backdated(&work.join(r"bin\old.txt"), Duration::from_mins(5));
+    let orphan = orphaned_by_a_killed_box(&case, &payload, &case.folder().join("orphan.pid"), SLEEPING);
+    // The job the killed run's command still runs in, after a start that is no time.
+    fs::write(command_record(&payload), format!("not-a-time {}", field(&renamed(&payload, 1), "Job"))).expect("the record can be written");
+
+    let next = run_box(&case, &ran_next(&payload));
+
+    assert!(!ended_or_ended_now(&orphan), "a record of no form ends no job: {next:?}");
+    assert_eq!(next.code, Some(0), "{next:?}");
+    assert!(!work.join(r"bin\old.txt").exists(), "a record of no form clears every file: {next:?}");
+    assert!(!command_record(&payload).exists(), "{next:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn a_folder_in_place_of_the_command_record_is_removed_and_the_work_folder_cleared() {
+    let case = Case::new("box_run_record_folder");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "write", r"bin\old.txt", "whole"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n"), ("a.txt", "a\n")]);
+    let first = run_box(&case, &payload);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let work = PathBuf::from(field(&payload, "Work"));
+    backdated(&work.join(r"bin\old.txt"), Duration::from_mins(5));
+    fs::create_dir_all(command_record(&payload).join("inside")).expect("a folder can stand in for the record");
+
+    let next = run_box(&case, &ran_next(&payload));
+
+    assert_eq!(next.code, Some(0), "a record that cannot be read never refuses: {next:?}");
+    assert!(!work.join(r"bin\old.txt").exists(), "it counts as a record of no form: {next:?}");
+    assert!(!command_record(&payload).exists(), "the folder is removed: {next:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn a_work_folder_whose_name_differs_in_case_from_the_key_still_reads_its_record() {
+    let case = Case::new("box_run_record_key_case");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "write", r"bin\old.txt", "whole"]);
+    let work = field(&payload, "Work").to_owned();
+    let (parent, last) = work.rsplit_once('\\').expect("the work folder is in a folder");
+    payload["Work"] = json!(format!(r"{parent}\{}", last.to_ascii_uppercase()));
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n"), ("a.txt", "a\n")]);
+    let work = killed_mid_write(&case, &payload);
+    backdated(&work.join(r"bin\old.txt"), Duration::from_mins(5));
+
+    let next = run_box(&case, &ran_next(&payload));
+
+    assert_eq!(next.code, Some(0), "{next:?}");
+    assert!(!work.join(HALF_WRITTEN).exists(), "the clear ran: {next:?}");
+    assert!(
+        work.join(r"bin\old.txt").exists(),
+        "the record is read as of its key, so only what the command wrote goes: {next:?}"
+    );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// A job name of the work folder of `payload`, as a record names one: the payload's own job name, unique to this test
+/// process and case ([`box_payload`]), its run number `0000` turned to `ffff`, which no run of the case takes.
+fn recorded_job_name(payload: &Value) -> String {
+    let job = field(payload, "Job");
+    let unique = job.strip_suffix("0000").expect("the payload's job name ends in its run number 0000");
+    format!("{unique}ffff")
+}
+
+/// Lets the command [`held_in`] started go, and waits for it to end, so the case's folder can be removed.
+fn let_go_and_wait(go: &Path, held: &gate_win32::Running) {
+    let_go(go);
+    let ended = held.wait(Duration::from_mins(1)).expect("the held command is looked at");
+    assert!(ended.is_some(), "the held command ends once let go");
+}
+
+/// A job's security that lets this user only list it (`JOB_OBJECT_QUERY`), never end it.
+fn listed_only() -> gate_win32::Descriptor {
+    let user = gate_win32::current_user_sid().expect("this user's SID can be read");
+    gate_win32::Descriptor::from_sddl(&format!("D:P(A;;0x4;;;{user})")).expect("the DACL parses")
+}
+
+/// Starts the fake tool in the job `job`, from the case's folder, waiting until `go` is made ([`let_go`]).
+fn held_in(case: &Case, job: &Job, go: &Path) -> gate_win32::Running {
+    let launch = Launch {
+        application: PathBuf::from(FAKE_TOOL),
+        command_line: format!("\"{FAKE_TOOL}\" wait \"{}\"", shown(go)).encode_utf16().collect(),
+        directory: case.folder(),
+        environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
+        output: LaunchOutput::Files {
+            log: case.folder().join("held.log"),
+            err_log: case.folder().join("held.log.err"),
+        },
+        priority: None,
+    };
+    launch
+        .start_suspended()
+        .expect("the held command starts")
+        .assign_and_resume(job)
+        .expect("it is assigned and resumed")
+}
+
+#[test]
+fn a_recorded_job_of_this_user_that_denies_ending_and_still_runs_refuses_layout() {
+    let case = Case::new("box_run_record_job_denies_ending");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "write", r"bin\fresh.txt", "whole"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n"), ("a.txt", "a\n")]);
+    let first = run_box(&case, &payload);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let name = recorded_job_name(&payload);
+    let job = Job::create_secured(&name, &listed_only()).expect("the job can be made");
+    let go = case.folder().join("go");
+    let held = held_in(&case, &job, &go);
+    fs::write(command_record(&payload), format!("{} {name}", Timestamp::now())).expect("the record can be written");
+
+    let next = ran_next(&payload);
+    let outcome = run_box(&case, &next);
+    let lived = held.wait(Duration::ZERO).expect("the held command is looked at").is_none();
+    let_go_and_wait(&go, &held);
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    let tag = format!("gate-remote-refused: {} layout", field(&next, "Nonce"));
+    assert!(lines(&outcome.stderr).contains(&tag.as_str()), "{outcome:?}");
+    assert!(!outcome.stdout.contains("ran"), "the command never ran: {outcome:?}");
+    let line = format!(
+        "gate: remote could not clear what an interrupted command left in the work folder: {name}: {}",
+        "it may not be ended and still has 1 process(es)"
+    );
+    assert!(lines(&outcome.stderr).contains(&line.as_str()), "{line:?} in {outcome:?}");
+    assert!(lived, "the job's process is left as it is: {outcome:?}");
+    assert!(command_record(&payload).exists(), "the record is kept: {outcome:?}");
+    assert!(
+        Path::new(field(&payload, "Work")).join(r"bin\fresh.txt").exists(),
+        "nothing is cleared while the job may still write: {outcome:?}"
+    );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn a_missing_work_folder_ends_the_recorded_command_first() {
+    let case = Case::new("box_run_missing_work_ends");
+    let mut payload = pair_payload(&case, &["lib"], &[FAKE_TOOL, "out", "ran"]);
+    allow_breakaway();
+    pair_snapshot(&case, &mut payload, &[("a.txt", "a\n")], &[("lib", &[("b.txt", "b\n")])]);
+    let first = run_box(&case, &payload);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+    let name = recorded_job_name(&payload);
+    let job = Job::create(&name).expect("the job can be made");
+    let go = case.folder().join("go");
+    let held = held_in(&case, &job, &go);
+    fs::write(command_record(&payload), format!("{} {name}", Timestamp::now())).expect("the record can be written");
+    // A pair's preflight leaves the work folder alone, so the run finds it missing.
+    fs::remove_dir_all(field(&payload, "Work")).expect("the work folder can be removed");
+
+    let next = run_box(&case, &ran_next(&payload));
+    let ended = held.wait(Duration::ZERO).expect("the held command is looked at").is_some();
+    if !ended {
+        let_go_and_wait(&go, &held);
+    }
+
+    assert!(ended, "the command the record names is ended: {next:?}");
+    assert_eq!(next.code, Some(0), "{next:?}");
+    assert!(!command_record(&payload).exists(), "the record goes once its command is ended: {next:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn a_record_written_under_another_case_of_the_key_is_read() {
+    let case = Case::new("box_run_record_job_key_case");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "write", r"bin\old.txt", "whole"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n"), ("a.txt", "a\n")]);
+    let work = killed_mid_write(&case, &payload);
+    backdated(&work.join(r"bin\old.txt"), Duration::from_mins(5));
+    let record = command_record(&payload);
+    let text = fs::read_to_string(&record).expect("the record can be read");
+    let (start, job) = text.trim_end().split_once(' ').expect("the record names a job");
+    let key = field(&payload, "Key");
+    let other = job.replacen(key, &key.to_ascii_uppercase(), 1);
+    assert_ne!(other, job, "the key has letters whose case can change");
+    fs::write(&record, format!("{start} {other}")).expect("the record can be written");
+
+    let next = run_box(&case, &ran_next(&payload));
+
+    assert_eq!(next.code, Some(0), "{next:?}");
+    assert!(!work.join(HALF_WRITTEN).exists(), "the clear ran: {next:?}");
+    assert!(
+        work.join(r"bin\old.txt").exists(),
+        "the record is read with its start, so only what the command wrote goes: {next:?}"
+    );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn a_recorded_job_that_may_be_listed_and_holds_no_process_is_left_and_the_clear_goes_on() {
+    let case = Case::new("box_run_record_job_denied");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "write", r"bin\fresh.txt", "whole"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n"), ("a.txt", "a\n")]);
+    let first = run_box(&case, &payload);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    // The record's job name, taken by a job that lets this user only list it, and that holds no process.
+    let name = recorded_job_name(&payload);
+    let _squatter = Job::create_secured(&name, &listed_only()).expect("the job can be made");
+    fs::write(command_record(&payload), format!("{} {name}", Timestamp::now())).expect("the record can be written");
+
+    let next = run_box(&case, &ran_next(&payload));
+
+    assert_eq!(next.code, Some(0), "{next:?}");
+    let line = format!("gate: remote: the recorded job {name} could not be opened (access denied); the clear goes on without ending it");
+    assert!(lines(&next.stderr).contains(&line.as_str()), "{line:?} in {next:?}");
+    let work = Path::new(field(&payload, "Work"));
+    assert!(!work.join(r"bin\fresh.txt").exists(), "the clear went on: {next:?}");
+    assert!(!command_record(&payload).exists(), "{next:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// A named event made at `name`, held until dropped, so the name is taken by an object that is no job.
+struct NamedEvent(windows_sys::Win32::Foundation::HANDLE);
+
+impl NamedEvent {
+    fn new(name: &str) -> NamedEvent {
+        let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        // SAFETY: `wide` is NUL-terminated and outlives the call; no security attributes are given.
+        let handle = unsafe { windows_sys::Win32::System::Threading::CreateEventW(std::ptr::null(), 1, 0, wide.as_ptr()) };
+        assert!(!handle.is_null(), "the event {name} can be made: {}", std::io::Error::last_os_error());
+        NamedEvent(handle)
+    }
+}
+
+impl Drop for NamedEvent {
+    fn drop(&mut self) {
+        // SAFETY: the handle was made by `CreateEventW` and is closed only here.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+#[test]
+fn a_recorded_job_name_taken_by_an_object_that_is_no_job_is_no_job_and_the_clear_goes_on() {
+    let case = Case::new("box_run_record_job_event");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "write", r"bin\fresh.txt", "whole"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n"), ("a.txt", "a\n")]);
+    let first = run_box(&case, &payload);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let name = recorded_job_name(&payload);
+    let _squatter = NamedEvent::new(&name);
+    fs::write(command_record(&payload), format!("{} {name}", Timestamp::now())).expect("the record can be written");
+
+    let next = run_box(&case, &ran_next(&payload));
+
+    assert_eq!(next.code, Some(0), "an event at the job's name never refuses the run: {next:?}");
+    let work = Path::new(field(&payload, "Work"));
+    assert!(!work.join(r"bin\fresh.txt").exists(), "the clear went on: {next:?}");
+    assert!(!command_record(&payload).exists(), "{next:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn a_recorded_job_that_may_be_neither_ended_nor_listed_and_is_owned_as_the_boxs_jobs_refuses_layout() {
+    let case = Case::new("box_run_record_job_owned");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "write", r"bin\fresh.txt", "whole"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n"), ("a.txt", "a\n")]);
+    let first = run_box(&case, &payload);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    // An empty DACL: no one may end or list it, yet its owner, this user (or Administrators when elevated), is the box's.
+    let name = recorded_job_name(&payload);
+    let empty = gate_win32::Descriptor::from_sddl("D:").expect("the DACL parses");
+    let _squatter = Job::create_secured(&name, &empty).expect("the job can be made");
+    fs::write(command_record(&payload), format!("{} {name}", Timestamp::now())).expect("the record can be written");
+
+    let next = ran_next(&payload);
+    let outcome = run_box(&case, &next);
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    let tag = format!("gate-remote-refused: {} layout", field(&next, "Nonce"));
+    assert!(lines(&outcome.stderr).contains(&tag.as_str()), "{outcome:?}");
+    let owned = Regex::new(&format!(
+        "^gate: remote could not clear what an interrupted command left in the work folder: {}: {}$",
+        regex::escape(&name),
+        r"it may be neither ended nor listed, and its owner S-1-5(-\d+)+ owns the box's own jobs"
+    ))
+    .expect("the pattern compiles");
+    assert!(lines(&outcome.stderr).iter().any(|line| owned.is_match(line)), "{outcome:?}");
+    assert!(!outcome.stdout.contains("ran"), "the command never ran: {outcome:?}");
+    assert!(command_record(&payload).exists(), "the record is kept: {outcome:?}");
+    assert!(
+        Path::new(field(&payload, "Work")).join(r"bin\fresh.txt").exists(),
+        "nothing is cleared while the job may be the run's own: {outcome:?}"
+    );
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn a_command_record_that_is_a_hard_link_is_replaced_by_its_own_and_the_file_outside_is_left_whole() {
+    let case = Case::new("box_run_record_hard_link");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\n"), ("a.txt", "a\n")]);
+    let first = run_box(&case, &payload);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let work = PathBuf::from(field(&payload, "Work"));
+    fs::create_dir_all(work.join("bin")).expect("the bin folder can be made");
+    fs::write(work.join(r"bin\old.txt"), "old").expect("the old file can be written");
+    backdated(&work.join(r"bin\old.txt"), Duration::from_mins(5));
+    let outside = case.folder().join("outside.txt");
+    fs::write(&outside, "outside bytes").expect("the outside file can be written");
+    let record = command_record(&payload);
+    fs::hard_link(&outside, &record).expect("the record can be a hard link to the outside file");
+    let renewing = PathBuf::from(format!("{}.new", record.display()));
+    fs::write(&renewing, "stale").expect("a stale renewal can be left beside the record");
+
+    let next = run_box(&case, &ran_next(&payload));
+
+    assert_eq!(next.code, Some(0), "a record of more than one name never refuses: {next:?}");
+    assert_eq!(
+        fs::read_to_string(&outside).expect("the outside file is still there"),
+        "outside bytes",
+        "the file outside the work folder is left whole: {next:?}"
+    );
+    assert!(!renewing.exists(), "the stale renewal goes: {next:?}");
+    assert!(!work.join(r"bin\old.txt").exists(), "a record of no form clears every file: {next:?}");
+    assert!(!record.exists(), "the renewed record goes once the clear is done: {next:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
+fn a_command_that_never_starts_leaves_no_command_record() {
+    let case = Case::new("box_run_unstarted_no_record");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    // Its job's name taken, so the run's job cannot be made and the command never starts.
+    let _taken = Job::create(field(&payload, "Job")).expect("the job can be made");
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(!outcome.stdout.contains("ran"), "the command never ran: {outcome:?}");
+    assert!(!command_record(&payload).exists(), "{outcome:?}");
     wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 

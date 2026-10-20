@@ -43,7 +43,7 @@ fn read() -> Result<Timestamp, String> {
 }
 
 /// `time` in .NET's round-trip `o` format of a UTC time: seven fractional digits (100 ns ticks, truncated), then `Z`.
-fn round_trip(time: Timestamp) -> String {
+pub(super) fn round_trip(time: Timestamp) -> String {
     let utc = time.to_zoned(TimeZone::UTC);
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:07}Z",

@@ -39,6 +39,9 @@ const MANIFEST_NAMES: [&str; 2] = [r".config\dotnet-tools.json", "dotnet-tools.j
 const RESTORE_WORDS: [&str; 2] = ["tool", "restore"];
 /// The hex digit of each hash byte's high nibble, the low nibble reading from the same table.
 const HEX: &[u8; 16] = b"0123456789abcdef";
+/// What follows the work folder's path in its tools record's, `{Work}.tools`; the interrupted-command clear removes the
+/// record by it too.
+pub(super) const TOOLS_SUFFIX: &str = ".tools";
 /// What the box does instead when it cannot read the stop signal just before it starts the restore.
 const STARTING_RESTORE: &str = "starting the restore";
 
@@ -140,6 +143,16 @@ fn write_record(record: &str, digest: &str, console: &mut Console) -> Result<(),
 /// folder's lock is opened. The file is opened without truncating it and emptied only once it is checked, so a record
 /// that is another file's second name is refused with that file's bytes untouched.
 pub(super) fn write_record_file(record: &str, text: &str) -> io::Result<()> {
+    written_record(record, text).map(drop)
+}
+
+/// [`write_record_file`], then the record flushed to the disk, so a box that dies right after finds it written.
+pub(super) fn write_record_synced(record: &str, text: &str) -> io::Result<()> {
+    written_record(record, text)?.sync_all()
+}
+
+/// The record `record`, written with `text` as [`write_record_file`] says, still open.
+fn written_record(record: &str, text: &str) -> io::Result<fs::File> {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -149,7 +162,8 @@ pub(super) fn write_record_file(record: &str, text: &str) -> io::Result<()> {
         .open(record)?;
     gate_win32::check_plain_file(&file)?;
     file.set_len(0)?;
-    file.write_all(text.as_bytes())
+    file.write_all(text.as_bytes())?;
+    Ok(file)
 }
 
 /// How running the restore ended.
@@ -264,7 +278,7 @@ pub(crate) fn update(request: &Request<'_>, work: &Path, place: &Path, beat: &Be
             return Err(FAILED_STATUS);
         }
     };
-    let record = format!("{}.tools", request.work);
+    let record = format!("{}{TOOLS_SUFFIX}", request.work);
     match read_record(&record) {
         // The record holds this walk's hash: the tools are the ones the command will read, so nothing runs.
         Ok(Some(text)) if text == digest => return Ok(()),

@@ -665,16 +665,34 @@ impl Payload {
     /// as the client names it; else the usage line. A stop can so reach no job but a run's of this work folder.
     pub(crate) fn job(&self, key: &str) -> Result<&str, String> {
         let job = self.text("Job")?;
-        let nonce = job
-            .strip_prefix(r"Local\gate-remote-")
-            .and_then(|rest| rest.strip_prefix(key))
-            .and_then(|rest| rest.strip_prefix('-'));
-        if nonce.is_some_and(|nonce| nonce.len() == NONCE_DIGITS && nonce.chars().all(|digit| digit.is_ascii_hexdigit())) {
+        if is_job_name(job, key) {
             Ok(job)
         } else {
             Err(format!("gate: box payload Job is not this work folder's job name: {}", escaped(job)))
         }
     }
+}
+
+/// Whether `job` is a run's job name of the work folder `key`: `Local\gate-remote-<key>-<nonce>`, the nonce 12 hex
+/// digits, as the client names it.
+pub(crate) fn is_job_name(job: &str, key: &str) -> bool {
+    is_nonce(job.strip_prefix(r"Local\gate-remote-").and_then(|rest| rest.strip_prefix(key)))
+}
+
+/// Whether `job`, read from an interrupted-command record, is a run's job name of the work folder `key` as
+/// [`is_job_name`] says, but for the key's case, which a record written under another case of the key may differ in.
+pub(crate) fn is_recorded_job_name(job: &str, key: &str) -> bool {
+    let rest = job.strip_prefix(r"Local\gate-remote-");
+    is_nonce(rest.and_then(|rest| {
+        let (named, after) = rest.split_at_checked(key.len())?;
+        named.eq_ignore_ascii_case(key).then_some(after)
+    }))
+}
+
+/// Whether `after_key`, what follows the key in a job name, is `-` and a nonce of 12 hex digits.
+fn is_nonce(after_key: Option<&str>) -> bool {
+    let nonce = after_key.and_then(|rest| rest.strip_prefix('-'));
+    nonce.is_some_and(|nonce| nonce.len() == NONCE_DIGITS && nonce.chars().all(|digit| digit.is_ascii_hexdigit()))
 }
 
 /// The hex digits of a run's nonce, as the client draws it.

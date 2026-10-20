@@ -287,7 +287,7 @@ pub(super) fn locked<T>(
             return Err(FAILED_STATUS);
         }
     };
-    let held = run::lay_out_alone(asked.work, asked.bare, asked.lock, asked.nonce, console)?;
+    let held = run::lay_out_alone(asked, console)?;
     Ok(step(&held, console))
 }
 

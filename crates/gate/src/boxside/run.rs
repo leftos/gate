@@ -32,6 +32,7 @@ use gate_win32::{
 };
 
 use crate::answer::USAGE_STATUS;
+use crate::boxside::boot;
 use crate::boxside::ceiling::{Ceiling, KILLED, Spec};
 use crate::boxside::forward::{ClientGone, DRAIN, Forwarders, OutputLock};
 use crate::boxside::heartbeat;
@@ -40,7 +41,7 @@ use crate::boxside::lfs::{self, RunLfs};
 use crate::boxside::msys;
 use crate::boxside::outputs::{self, Asked};
 use crate::boxside::packages;
-use crate::boxside::payload::{PairSibling, Payload, bare_stem, escaped, ordinal_upper, trees};
+use crate::boxside::payload::{self, PairSibling, Payload, bare_stem, escaped, ordinal_upper, trees};
 use crate::boxside::preflight::{self, Failed, GIT_REDIRECTS, Git, GitFailure, Unready, exit_code, git_failed};
 use crate::boxside::probe;
 use crate::boxside::stop::{Ending, STOPPED, stop_event_name, terminate_and_wait};
@@ -120,8 +121,18 @@ pub(super) const LAYOUT_SINGLE: &str = "single";
 /// The warm record of the work folder `work`, `{work}.warm`: the hash of the warm-up file whose commands last passed
 /// in it, written once they all did and removed whenever the folder's state changes under it.
 pub(super) fn warm_record(work: &str) -> String {
-    format!("{work}.warm")
+    format!("{work}{WARM_SUFFIX}")
 }
+
+/// What follows the work folder's path in its warm record's ([`warm_record`]).
+const WARM_SUFFIX: &str = ".warm";
+/// What follows the work folder's path in its interrupted-command record's ([`command_record`]).
+const COMMAND_SUFFIX: &str = ".command";
+/// What follows the interrupted-command record's name in the empty record made beside it to replace one that cannot
+/// be read ([`renewed_empty`]).
+const RENEWING_SUFFIX: &str = ".new";
+/// The SID of the Administrators group, which owns what an elevated box makes.
+const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
 
 /// The identity variables the payload may set for the back commit.
 const IDENTITY_NAMES: [&str; 6] = [
@@ -274,6 +285,7 @@ impl Request<'_> {
     fn laid(&self) -> Laid<'_> {
         Laid {
             work: self.work,
+            key: self.key,
             main: &self.main,
             siblings: &self.siblings,
         }
@@ -296,6 +308,9 @@ fn repo_name_of(bare: &str) -> &str {
 /// none for one repo. A run and the inputs verb each build one, so both lay the work folder out alike.
 pub(super) struct Laid<'r> {
     work: &'r str,
+    /// The payload's key, which names the work folder's jobs ([`payload::is_job_name`]); the work folder's last name
+    /// matches it only without regard to case.
+    key: &'r str,
     main: &'r Repo<'r>,
     siblings: &'r [Repo<'r>],
 }
@@ -310,34 +325,45 @@ impl Laid<'_> {
     /// followed by the leaf, then each sibling's name sorted without regard to ASCII case, one space before each, so
     /// the same siblings named in another order are the same layout.
     fn layout(&self) -> String {
-        let Some(leaf) = self.main.name.as_deref() else {
-            return LAYOUT_SINGLE.to_owned();
-        };
-        let mut siblings: Vec<&str> = self.siblings.iter().filter_map(|repo| repo.name.as_deref()).collect();
-        siblings.sort_by_key(|name| name.to_ascii_lowercase());
-        format!("pair {leaf} {}", siblings.join(" "))
+        let siblings = self.siblings.iter().filter_map(|repo| repo.name.as_deref()).collect();
+        layout_text(self.main.name.as_deref(), siblings)
     }
 }
 
-/// Lays out the work folder `work` for one repo, its bare repository `bare`, as a run does before its checkout
-/// ([`WorkGit::lay_out`]), under the work folder's lock file `lock`, which the caller holds; git's output is forwarded
-/// as a run's is. The held work folder; else `Err` with the status, its lines said: a failing git step's, or 75 for a
-/// work folder that could not be laid out, its `layout` tag and line said as a run says them.
-pub(super) fn lay_out_alone(work: &str, bare: &str, lock: &str, nonce: &str, console: &mut Console) -> Result<File, u32> {
-    let main = Repo::new(None, work.to_owned(), bare, "");
+/// The layout a layout record names for a run whose main repo's leaf is `leaf` and whose siblings are `siblings`
+/// ([`Laid::layout`]): [`LAYOUT_SINGLE`] without a leaf, else `pair`, the leaf, then the siblings' names sorted without
+/// regard to ASCII case, one space before each.
+pub(super) fn layout_text(leaf: Option<&str>, mut siblings: Vec<&str>) -> String {
+    let Some(leaf) = leaf else {
+        return LAYOUT_SINGLE.to_owned();
+    };
+    siblings.sort_by_key(|name| name.to_ascii_lowercase());
+    format!("pair {leaf} {}", siblings.join(" "))
+}
+
+/// Lays out the work folder `asked` holds for one repo, its bare repository, as a run does before its checkout
+/// ([`WorkGit::lay_out`]), under the work folder's lock file, which the caller holds; git's output is forwarded as a
+/// run's is. The held work folder; else `Err` with the status, its lines said: a failing git step's, or 75 for a work
+/// folder that could not be laid out, its `layout` tag and line said as a run says them.
+pub(super) fn lay_out_alone(asked: &inputs::WorkLock<'_>, console: &mut Console) -> Result<File, u32> {
+    let main = Repo::new(None, asked.work.to_owned(), asked.bare, "");
     let laid = Laid {
-        work,
+        work: asked.work,
+        key: asked.key,
         main: &main,
         siblings: &[],
     };
-    match WorkGit::ready(lock, &OutputLock::default(), &ClientGone::default()).lay_out(&laid, console) {
-        Ok(held) => Ok(held),
-        Err(NotLaidOut::Failed(failed)) => Err(said(console, &failed)),
-        Err(NotLaidOut::Refused(why)) => {
-            console.err(&refused_line(nonce, Refusal::Layout));
-            console.err(&crate::remote::layout_line(repo_name_of(bare), &escaped(&why)));
+    let not = match WorkGit::ready(asked.lock, &OutputLock::default(), &ClientGone::default()).lay_out(&laid, console) {
+        Ok(held) => return Ok(held),
+        Err(not) => not,
+    };
+    match not.refusal() {
+        Ok(why) => {
+            console.err(&refused_line(asked.nonce, Refusal::Layout));
+            console.err(&crate::remote::layout_line(repo_name_of(asked.bare), &escaped(&why)));
             Err(REFUSED_STATUS)
         }
+        Err(failed) => Err(said(console, &failed)),
     }
 }
 
@@ -785,8 +811,11 @@ fn commanded(
         place: folders.place,
         timeout: request.timeout,
         of: Of::Run,
+        recorded: true,
     };
+    let record = command_record(request.work);
     let ran = ran_command(request, &one, beat, console)?;
+    removed_if_clean(&record, &ran, beat, console);
     let status = match ran {
         Ran::Exited(status) => status,
         // The PC applies nothing of a run the box killed, and a process its kill could not end may still be writing.
@@ -890,8 +919,9 @@ fn warm_commands(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: 
             place,
             timeout,
             of: Of::WarmUp,
+            recorded: false,
         };
-        let ran = command(request, &one, beat, console)?;
+        let ran = warm_command(request, &one, beat, console)?;
         spent += command_spent(beat.adjusted.get(), began.elapsed());
         let status = match ran {
             Ran::Exited(status) => status,
@@ -909,6 +939,21 @@ fn warm_commands(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: 
         }
     }
     Ok(0)
+}
+
+/// One of a warm-up's commands seen to its end as [`command`] sees it, under the interrupted-command record
+/// ([`command_record`]): written just before the command is resumed when there is none ([`One::recorded`]), and then
+/// removed once the command ended clean ([`removed_if_clean`]); one already there, or a name that cannot be looked at,
+/// is left as it is. `Err` as [`command`] gives it.
+fn warm_command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<Ran, u32> {
+    let record = command_record(request.work);
+    let wrote = fs::symlink_metadata(&record).is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
+    let one = One { recorded: wrote, ..*one };
+    let ran = command(request, &one, beat, console)?;
+    if wrote {
+        removed_if_clean(&record, &ran, beat, console);
+    }
+    Ok(ran)
 }
 
 /// How often a warm-up looks for the name of a command's job to be free before the next.
@@ -949,10 +994,16 @@ fn gap_spent(wall: Duration) -> f64 {
 /// Writes `text` as the whole of the warm record `record` ([`tools::write_record_file`], which shares it with no one),
 /// trying again after `between` while another process has it open, as a preflight reading it may, at most
 /// [`WARM_WRITE_WAITS`] times; else the last try's error.
-fn written_retrying(record: &str, text: &str, mut between: impl FnMut()) -> io::Result<()> {
+fn written_retrying(record: &str, text: &str, between: impl FnMut()) -> io::Result<()> {
+    retried(|| tools::write_record_file(record, text), between)
+}
+
+/// What `step`, an open of a record beside the work folder, gave, tried again after `between` while another process
+/// has the record open, as a preflight reading it may, at most [`WARM_WRITE_WAITS`] times; else the last try's error.
+fn retried<T>(mut step: impl FnMut() -> io::Result<T>, mut between: impl FnMut()) -> io::Result<T> {
     let mut waits = 0;
     loop {
-        match tools::write_record_file(record, text) {
+        match step() {
             Err(error) if error.raw_os_error() == Some(SHARING_VIOLATION) && waits < WARM_WRITE_WAITS => {
                 between();
                 waits += 1;
@@ -962,14 +1013,153 @@ fn written_retrying(record: &str, text: &str, mut between: impl FnMut()) -> io::
     }
 }
 
+/// The interrupted-command record of the work folder `work`, `{work}.command`: `{UTC start} {job}`, written just before
+/// a command starts and removed only once it ended clean ([`ended_clean`]), so a record found by a later run is of a
+/// command that was ended mid-run, whose leftovers that run clears ([`WorkGit::cleared_interrupted`]).
+pub(super) fn command_record(work: &str) -> String {
+    format!("{work}{COMMAND_SUFFIX}")
+}
+
+/// Writes the interrupted-command record `record` for a command of the job `job` starting now, flushed to the disk,
+/// tried again while another process holds it ([`retried`]).
+fn written_command_record(record: &str, job: &str) -> io::Result<()> {
+    let text = format!("{} {job}", boot::round_trip(jiff::Timestamp::now()));
+    retried(|| tools::write_record_synced(record, &text), || thread::sleep(WARM_WRITE_WAIT))
+}
+
+/// Whether the command whose wait just ended with an exit ended clean: the run's stop signal unset when read now, as a
+/// stop ends the command with an exit of its own, and the client still there. A signal that cannot be read is no clean
+/// end.
+fn ended_clean(beat: &Beat<'_>) -> bool {
+    !beat.client_gone() && matches!(beat.stop.event.is_set(), Ok(false))
+}
+
+/// Removes the interrupted-command record `record` once the command that `ran` ended clean ([`ended_clean`]); a removal
+/// that fails is said under the box's output lock and changes nothing else.
+fn removed_if_clean(record: &str, ran: &Ran, beat: &Beat<'_>, console: &mut Console) {
+    if matches!(ran, Ran::Exited(_)) && ended_clean(beat) {
+        // Said when it fails; the run's status stands.
+        let _ = record_step(preflight::remove_entry(Path::new(record)), "remove", record, beat, console);
+    }
+}
+
+/// How much earlier than the recorded start a file may have been written and still count as an interrupted command's:
+/// the slack for a clock stepped back and for times a file system keeps coarsely.
+const INTERRUPTED_SLACK: Duration = Duration::from_secs(60);
+/// How many times the clear tries a file another process holds without delete sharing, and how long it waits between.
+const CLEAR_TRIES: u32 = 5;
+const CLEAR_WAIT: Duration = Duration::from_millis(500);
+
+/// What an interrupted-command record says: the time from which a file counts as the command's, `None` to count every
+/// file, and the job to end first, `None` for none.
+#[derive(Debug, PartialEq, Eq)]
+struct Interrupted {
+    since: Option<SystemTime>,
+    job: Option<String>,
+}
+
+impl Interrupted {
+    /// Reads the record `text` of the work folder whose key is `key` at `now`: `{start} {job}`, the start a UTC time and
+    /// the job one of the work folder's job names, the key in any case ([`payload::is_recorded_job_name`]); a file
+    /// counts from the earlier of the start and `now`, less [`INTERRUPTED_SLACK`]. A record of any other form, an empty
+    /// one included, counts every file and names no job.
+    fn read(text: &str, key: &str, now: SystemTime) -> Interrupted {
+        let parsed = text.split_once(' ').and_then(|(start, job)| {
+            let start: jiff::Timestamp = start.parse().ok()?;
+            payload::is_recorded_job_name(job, key).then(|| (SystemTime::from(start), job.to_owned()))
+        });
+        match parsed {
+            Some((start, job)) => Interrupted {
+                since: start.min(now).checked_sub(INTERRUPTED_SLACK),
+                job: Some(job),
+            },
+            None => Interrupted { since: None, job: None },
+        }
+    }
+}
+
+/// What the interrupted-command record of the work folder `work`, whose payload's key is `key`, says
+/// ([`Interrupted::read`]); `None` when there is none. The record is read as the tools record is, tried again while
+/// another process holds it ([`retried`]). One that is not UTF-8 is of no form; one that cannot be read otherwise (a link, a
+/// folder, a file of more than one name) is replaced by an empty record ([`renewed_empty`]), so it is of no form too
+/// and a clear cut short still finds it: neither ends a job, and the clear takes every file. Else why the record could
+/// not be read, removed or written.
+fn interrupted(work: &str, key: &str) -> Result<Option<Interrupted>, NotLaidOut> {
+    let record = command_record(work);
+    let text = match retried(|| tools::read_record(&record), || thread::sleep(WARM_WRITE_WAIT)) {
+        Ok(None) => return Ok(None),
+        Ok(Some(text)) => text,
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => String::new(),
+        Err(error) if error.raw_os_error() == Some(SHARING_VIOLATION) => {
+            return Err(NotLaidOut::Refused(format!("cannot read {record}: {error}")));
+        }
+        Err(_) => {
+            renewed_empty(&record)?;
+            String::new()
+        }
+    };
+    Ok(Some(Interrupted::read(&text, key, SystemTime::now())))
+}
+
+/// Puts an empty interrupted-command record, flushed to the disk, at `record` in place of one that cannot be read:
+/// made new beside it in its folder, held as itself ([`hold_folder`]), and renamed over it by handle
+/// ([`gate_win32::rename_beneath`]), so some record stands at the name at every instant and a clear cut short still
+/// finds one. A folder or a link at the name is removed first, as itself, never followed. Else why not.
+fn renewed_empty(record: &str) -> Result<(), NotLaidOut> {
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_WRITE};
+    let path = Path::new(record);
+    let not_written = |error: &dyn std::fmt::Display| NotLaidOut::Refused(format!("cannot write {record}: {error}"));
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(OsStr::to_str)) else {
+        return Err(not_written(&"it has no folder or no name"));
+    };
+    if fs::symlink_metadata(path).is_ok_and(|entry| entry.is_dir() || entry.file_type().is_symlink()) {
+        removed(path)?;
+    }
+    let folder = hold_folder(&parent.to_string_lossy()).map_err(NotLaidOut::Refused)?;
+    let beside = format!("{name}{RENEWING_SUFFIX}");
+    // One a box that died mid-renewal left is no record: it goes first.
+    removed(&parent.join(&beside))?;
+    let made = gate_win32::open_beneath_as(
+        &folder,
+        &beside,
+        FILE_GENERIC_WRITE | DELETE,
+        gate_win32::Share::NoDelete,
+        gate_win32::Make::NewFile,
+    )
+    .and_then(|file| file.sync_all().map(|()| file))
+    .and_then(|file| gate_win32::rename_beneath(&file, &folder, name));
+    made.map_err(|error| not_written(&error))
+}
+
+/// The line the clear says when the job its record names exists but cannot be opened, `job` escaped.
+fn unopened_job_line(job: &str) -> String {
+    format!(
+        "gate: remote: the recorded job {} could not be opened (access denied); the clear goes on without ending it",
+        escaped(job)
+    )
+}
+
 /// What a step that removes or writes (`what`) the warm record `record` did: on a failure, the line saying it could
 /// not, said under the box's output lock, and `Err` with status 1.
 fn record_step(done: io::Result<()>, what: &str, record: &str, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
-    done.map_err(|error| {
-        let line = format!("gate: remote could not {what} {}: {}", escaped(record), escaped(&error.to_string()));
-        beat.say(console, &line);
-        FAILED_STATUS
-    })
+    done.map_err(|error| record_failed(what, record, &error, beat, console))
+}
+
+/// A step that removes or writes (`what`) a record `record` beside the work folder failed with `error`: the line
+/// saying so, said under the box's output lock; status 1.
+pub(super) fn record_failed(what: &str, record: &str, error: &io::Error, beat: &Beat<'_>, console: &mut Console) -> u32 {
+    let line = format!("gate: remote could not {what} {}: {}", escaped(record), escaped(&error.to_string()));
+    beat.say(console, &line);
+    FAILED_STATUS
+}
+
+/// Removes the interrupted-command record `record` of a command that was never resumed, so no later run takes it for
+/// one ended mid-run; a removal that fails is said ([`record_failed`]) and changes nothing else.
+pub(super) fn unstarted_record_removed(record: &str, beat: &Beat<'_>, console: &mut Console) {
+    if let Err(error) = preflight::remove_entry(Path::new(record)) {
+        // Said; the run's own failure is its answer.
+        let _ = record_failed("remove", record, &error, beat, console);
+    }
 }
 
 /// Ends every process a warm-up's command left in its `job` and waits until it holds none ([`terminate_and_wait`]),
@@ -1008,12 +1198,16 @@ fn command_spent(adjusted: Option<f64>, wall: Duration) -> f64 {
 
 /// One command as [`command`] starts it: its words, its program first; its ceiling in whole seconds of load-adjusted
 /// time, `None` for none; and what it is a command of ([`Of`]).
+#[derive(Clone, Copy)]
 struct One<'w> {
     words: &'w [String],
     /// The folder the command runs in.
     place: &'w Path,
     timeout: Option<u64>,
     of: Of,
+    /// Whether the interrupted-command record ([`command_record`]) is written once the command's job exists and just
+    /// before the command is resumed, so only a command that can be running has one.
+    recorded: bool,
 }
 
 impl One<'_> {
@@ -1041,10 +1235,10 @@ enum Of {
 /// carries an `LfsDigest`, its scratch folder alone, or nothing, otherwise ([`WorkGit::checkout`]); a refusal of it is said as such
 /// ([`lfs_refused`]).
 fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<RunLfs, u32> {
-    let held = match git.lay_out(&request.laid(), console) {
+    let held = match git.lay_out(&request.laid(), console).map_err(NotLaidOut::refusal) {
         Ok(held) => held,
-        Err(NotLaidOut::Failed(failed)) => return Err(ended_before(said(console, &failed), request, beat, console)),
-        Err(NotLaidOut::Refused(why)) => return Err(layout_refused(request, &why, beat, console)),
+        Err(Ok(why)) => return Err(layout_refused(request, &why, beat, console)),
+        Err(Err(failed)) => return Err(ended_before(said(console, &failed), request, beat, console)),
     };
     inputs_matched(request, &held, beat, console)?;
     let lfs = match git.checkout(request, console) {
@@ -1161,8 +1355,27 @@ fn back_commits_line(request: &Request<'_>, commits: &[Option<String>]) -> Strin
 enum NotLaidOut {
     /// A removal or a layout step failed, for this reason: the run is refused `layout`.
     Refused(String),
+    /// The interrupted-command clear did not finish, its reason said already on its own line
+    /// ([`WorkGit::not_cleared`]): the run is refused `layout`, its layout line saying only [`UNCLEARED`].
+    Uncleared,
     /// A git step readying a tree failed.
     Failed(Failed),
+}
+
+/// What the layout line of a run refused for a clear that did not finish says, the clear's own line having named the
+/// file or the job and the error.
+const UNCLEARED: &str = "what an interrupted command left in it could not be cleared";
+
+impl NotLaidOut {
+    /// Why the run is refused `layout`, as its layout line says it, [`UNCLEARED`] for a clear that did not finish; else
+    /// the failed git step, whose own line and status the run ends on.
+    fn refusal(self) -> Result<String, Failed> {
+        match self {
+            NotLaidOut::Refused(why) => Ok(why),
+            NotLaidOut::Uncleared => Ok(UNCLEARED.to_owned()),
+            NotLaidOut::Failed(failed) => Err(failed),
+        }
+    }
 }
 
 impl From<Unready> for NotLaidOut {
@@ -1218,7 +1431,13 @@ fn plain_tree(tree: &str) -> Result<(), NotLaidOut> {
 
 /// Whether the layout record `record` names another layout than `layout`, no record naming a run of one repo's.
 fn layout_changed(record: &str, layout: &str) -> bool {
-    match tools::read_record(record) {
+    names_another_layout(&tools::read_record(record), layout)
+}
+
+/// Whether a layout record that read as `read` names another layout than `layout`, as [`layout_changed`] judges it: no
+/// record names a run of one repo's, and one that cannot be read counts as another.
+pub(super) fn names_another_layout(read: &io::Result<Option<String>>, layout: &str) -> bool {
+    match read {
         Ok(None) => layout != LAYOUT_SINGLE,
         Ok(Some(text)) => !text.eq_ignore_ascii_case(layout),
         // Counted as changed, so the run writes the record before any clear: one that is not a plain file cannot be
@@ -1335,6 +1554,7 @@ fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut 
     if let Some(park) = beat.seams.park_launch.as_deref() {
         wait_for_path(park, console);
     }
+    let record = command_record(request.work);
     let mut start = Start {
         launch,
         job: &job,
@@ -1342,6 +1562,7 @@ fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut 
         word,
         program: &program,
         marker: (one.of == Of::Run).then_some(request.nonce),
+        record: one.recorded.then_some(record.as_str()),
         refuse_token: beat.seams.refuse_token,
         keep_restricted: request.lfs_digest.is_some(),
     };
@@ -1702,9 +1923,11 @@ const ACCESS_DENIED: u32 = 5;
 
 /// The command to start: its launch, its job and the job's stop signal, the word and program a start failure names,
 /// the run's nonce its start marker names, `None` for a warm-up's command, whose marker was said before its first
-/// command, and whether the token seam refuses its start with the restricted token.
+/// command, the interrupted-command record written just before its resume, `None` for none ([`One::recorded`]), and
+/// whether the token seam refuses its start with the restricted token.
 struct Start<'a> {
     launch: PipedLaunch,
+    record: Option<&'a str>,
     job: &'a Job,
     stop: &'a StopSignal<'a>,
     word: &'a str,
@@ -1753,7 +1976,19 @@ fn start_command(start: &mut Start<'_>, donor: Result<&Donor, &str>, beat: &Beat
     ended.say(console);
     match ended.how {
         LaunchEnd::Started(launched) => Ok(launched),
-        LaunchEnd::Refused(error) => Err(start_refused(console, start, error)),
+        LaunchEnd::Refused(error) => {
+            // The record may have been written before a resume that failed: the command never ran.
+            if let Some(record) = start.record {
+                unstarted_record_removed(record, beat, console);
+            }
+            Err(start_refused(console, start, error))
+        }
+        LaunchEnd::Unrecorded(record, error) => {
+            let status = record_failed("write", &record, &error, beat, console);
+            // A write that failed part way may have left a record: the command never ran.
+            unstarted_record_removed(&record, beat, console);
+            Err(Err(status))
+        }
         LaunchEnd::Stopped => Err(Err(stopped_before_start(start.job, beat.lock, console))),
     }
 }
@@ -1823,6 +2058,9 @@ enum LaunchEnd {
     Refused(LaunchError),
     /// A stop was signalled before the command was resumed: the command never ran.
     Stopped,
+    /// The interrupted-command record, this one, could not be written before the resume, for this error: the command
+    /// never ran.
+    Unrecorded(String, io::Error),
 }
 
 /// Creates the command suspended on the console `on`, puts it in its job, then, unless the job's stop signal says a
@@ -1848,7 +2086,16 @@ fn launch(start: &mut Start<'_>, on: PipedConsole) -> Ended {
         Look::Stopped => return ended(LaunchEnd::Stopped, None),
         Look::Go(unread) => unread,
     };
-    let how = match assigned.and_then(|()| suspended.resume()) {
+    if let Err(error) = assigned {
+        return ended(LaunchEnd::Refused(error), unread);
+    }
+    // Written only now that the command is in its job and about to run, so a command that never starts leaves none.
+    if let Some(record) = start.record
+        && let Err(error) = written_command_record(record, start.job.name())
+    {
+        return ended(LaunchEnd::Unrecorded(record.to_owned(), error), unread);
+    }
+    let how = match suspended.resume() {
         Ok(running) => LaunchEnd::Started(Launched {
             running,
             pipes: Pipes { stdout, stderr },
@@ -2516,13 +2763,20 @@ impl WorkGit {
     /// work folder's children, so no record outlives the inputs it lists, and the warm record `{Work}.warm` before it
     /// writes [`LAYOUT_CHANGING`], as it is removed too when the work folder is missing and made here, so no warm
     /// record outlives the folder state it describes. A run of one repo in a work folder of that
-    /// layout whose `.git` is plain readies nothing here: the preflight readied its tree. The held folder, which the
-    /// caller keeps through the checkouts.
+    /// layout whose `.git` is plain readies nothing here: the preflight readied its tree. The interrupted-command record
+    /// `{Work}.command` is removed with a missing work folder and after a clear, each once the job it names is ended
+    /// ([`WorkGit::job_emptied`]) before anything is removed; a work folder of the run's layout that
+    /// holds one has what the interrupted command left cleared before any tree is readied
+    /// ([`WorkGit::cleared_interrupted`]). The held folder, which the caller keeps through the checkouts.
     fn lay_out(&self, laid: &Laid<'_>, console: &mut Console) -> Result<File, NotLaidOut> {
         let work = Path::new(laid.work);
         let warm = warm_record(laid.work);
+        let command = command_record(laid.work);
         if fs::symlink_metadata(work).is_err() {
             removed(Path::new(&warm))?;
+            // A command its record names may still run, though its folder is gone: it is ended before the record goes.
+            self.recorded_command_ended(laid, console)?;
+            removed(Path::new(&command))?;
         }
         fs::create_dir_all(work).map_err(|error| NotLaidOut::Refused(format!("cannot create {}: {error}", laid.work)))?;
         let held = hold_folder(laid.work).map_err(NotLaidOut::Refused)?;
@@ -2530,10 +2784,16 @@ impl WorkGit {
         let layout = laid.layout();
         let changed = layout_changed(&record, &layout);
         if changed {
+            // Ended before anything is cleared, so no command its record names writes into the folder after the clear.
+            self.recorded_command_ended(laid, console)?;
             removed(Path::new(&warm))?;
             write_layout(&record, LAYOUT_CHANGING)?;
             removed(Path::new(&inputs::record_path(laid.work)))?;
             clear_work(work)?;
+            // Last, so a clear cut short still finds the record and clears again.
+            removed(Path::new(&command))?;
+        } else {
+            self.cleared_interrupted(laid.work, laid.key, &held, console)?;
         }
         // A tree readied here removes the warm record itself when its `.git` is made or repaired ([`WorkGit::ready_trees`]).
         if changed || !laid.siblings.is_empty() || !preflight::git_is_plain(Path::new(&laid.main.tree)) {
@@ -2543,6 +2803,149 @@ impl WorkGit {
             write_layout(&record, &layout)?;
         }
         Ok(held)
+    }
+
+    /// Clears what an interrupted command left in the work folder `work`, held as `held`, when its interrupted-command
+    /// record ([`command_record`]) is there: the warm, packages and tools records removed first, so none of their
+    /// skip rules trusts the folder; the recorded job ended until it holds no process, a job no longer there being
+    /// fine; then every file below the work folder written since the recorded start ([`Interrupted::read`]) removed
+    /// by handle ([`gate_win32::delete_fresh_beneath`]), never inside a `.git` or behind a junction; the record
+    /// removed last, so a clear cut short runs again. Its two lines are said under the box's output lock. A file that
+    /// will not go, or a job that will not empty, refuses the run `layout` with the record kept ([`WorkGit::not_cleared`]).
+    fn cleared_interrupted(&self, work: &str, key: &str, held: &File, console: &mut Console) -> Result<(), NotLaidOut> {
+        let Some(interrupted) = interrupted(work, key)? else {
+            return Ok(());
+        };
+        let record = command_record(work);
+        for suffix in [WARM_SUFFIX, packages::PACKAGES_SUFFIX, tools::TOOLS_SUFFIX] {
+            let other = format!("{work}{suffix}");
+            removed(Path::new(&other))?;
+        }
+        self.say(console, "gate: remote clearing what an interrupted command left in the work folder");
+        self.recorded_job_ended(&interrupted, console)?;
+        let fresh = gate_win32::Fresh {
+            since: interrupted.since,
+            tries: CLEAR_TRIES,
+            wait: CLEAR_WAIT,
+        };
+        let count = gate_win32::delete_fresh_beneath(held, fresh)
+            .map_err(|not| self.not_cleared(&Path::new(work).join(&not.path).display().to_string(), &not.error, console))?;
+        self.say(
+            console,
+            &format!("gate: remote cleared {count} file(s) an interrupted command left in the work folder"),
+        );
+        removed(Path::new(&record))
+    }
+
+    /// Ends the job the interrupted-command record of the work folder `laid` lays out names, when there is a record
+    /// ([`interrupted`]) and it names one ([`WorkGit::recorded_job_ended`]).
+    fn recorded_command_ended(&self, laid: &Laid<'_>, console: &mut Console) -> Result<(), NotLaidOut> {
+        match interrupted(laid.work, laid.key)? {
+            Some(interrupted) => self.recorded_job_ended(&interrupted, console),
+            None => Ok(()),
+        }
+    }
+
+    /// Ends the job the interrupted-command record `interrupted` names, when it names one ([`WorkGit::job_emptied`]).
+    fn recorded_job_ended(&self, interrupted: &Interrupted, console: &mut Console) -> Result<(), NotLaidOut> {
+        match &interrupted.job {
+            Some(job) => self.job_emptied(job, console),
+            None => Ok(()),
+        }
+    }
+
+    /// Ends every process of the job `job` an interrupted command ran in and waits until it holds none
+    /// ([`terminate_and_wait`]); a job no longer there is fine, and so is a name an object that is no job holds, as it
+    /// holds no process ([`OpenedJob::open_or_not_a_job`]). One that exists but may not be ended (access denied) is
+    /// judged as [`WorkGit::unended_job`] says. A job that cannot be opened otherwise or ended, or still holds a
+    /// process, refuses the run ([`WorkGit::not_cleared`]).
+    fn job_emptied(&self, job: &str, console: &mut Console) -> Result<(), NotLaidOut> {
+        let ended = match gate_win32::OpenedJob::open_or_not_a_job(job) {
+            Ok(gate_win32::JobOpened::Absent | gate_win32::JobOpened::NotAJob) => return Ok(()),
+            Ok(gate_win32::JobOpened::Job(opened)) => terminate_and_wait(&opened).and_then(|ending| match ending.left {
+                0 => Ok(()),
+                left => Err(io::Error::other(format!("it still has {left} process(es)"))),
+            }),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return self.unended_job(job, console),
+            Err(error) => Err(error),
+        };
+        ended.map_err(|error| self.not_cleared(job, &error, console))
+    }
+
+    /// Judges the job `job`, which exists but may not be ended, as a process whose wait is refused is judged by what
+    /// query access alone shows: opened to be listed, one that holds a process may be the run's own command still
+    /// running and refuses the run ([`WorkGit::not_cleared`]), and one that holds none is left as it is, said under the
+    /// box's output lock ([`unopened_job_line`]), and the clear goes on. One that may not be listed either is judged
+    /// by its owner ([`WorkGit::unlisted_job`]).
+    fn unended_job(&self, job: &str, console: &mut Console) -> Result<(), NotLaidOut> {
+        let held = match gate_win32::OpenedJob::open_to_list(job) {
+            Ok(None) => return Ok(()),
+            Ok(Some(listed)) => listed.process_ids().map(|ids| ids.len()),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return self.unlisted_job(job, console),
+            Err(error) => Err(error),
+        };
+        match held {
+            Ok(0) => {
+                self.say(console, &unopened_job_line(job));
+                Ok(())
+            }
+            Ok(left) => {
+                let still = io::Error::other(format!("it may not be ended and still has {left} process(es)"));
+                Err(self.not_cleared(job, &still, console))
+            }
+            Err(error) => Err(self.not_cleared(job, &error, console)),
+        }
+    }
+
+    /// Judges the job `job`, which exists but may be neither ended nor listed, by its owner, which the system lets read
+    /// a job's security whatever its DACL says: one owned by the box's user or by Administrators, as the box's own jobs
+    /// are, may be the run's own and refuses the run ([`WorkGit::not_cleared`]); one whose owner is another, or that
+    /// does not let the box read its owner, is another principal's of the same name, left as it is, said under the
+    /// box's output lock ([`unopened_job_line`]), and the clear goes on.
+    fn unlisted_job(&self, job: &str, console: &mut Console) -> Result<(), NotLaidOut> {
+        let owner = match gate_win32::OpenedJob::owner_of(job) {
+            Ok(None) => return Ok(()),
+            Ok(Some(owner)) => owner,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                self.say(console, &unopened_job_line(job));
+                return Ok(());
+            }
+            Err(error) => return Err(self.not_cleared(job, &error, console)),
+        };
+        match gate_win32::current_user_sid() {
+            Ok(user) if owner == user || owner == ADMINISTRATORS_SID => {
+                let own = io::Error::other(format!(
+                    "it may be neither ended nor listed, and its owner {owner} owns the box's own jobs"
+                ));
+                Err(self.not_cleared(job, &own, console))
+            }
+            Ok(_) => {
+                self.say(console, &unopened_job_line(job));
+                Ok(())
+            }
+            Err(error) => Err(self.not_cleared(job, &error, console)),
+        }
+    }
+
+    /// The refusal of a clear that could not remove `what`, a file's path or a job's name, for `error`: its line said
+    /// under the box's output lock, `what` and `error` escaped, and the run refused `layout` ([`NotLaidOut::Uncleared`]),
+    /// its layout line not saying the reason again.
+    fn not_cleared(&self, what: &str, error: &io::Error, console: &mut Console) -> NotLaidOut {
+        self.say(
+            console,
+            &format!(
+                "gate: remote could not clear what an interrupted command left in the work folder: {}: {}",
+                escaped(what),
+                escaped(&error.to_string())
+            ),
+        );
+        NotLaidOut::Uncleared
+    }
+
+    /// Says `line` on stderr holding the box's output lock.
+    fn say(&self, console: &mut Console, line: &str) {
+        let _held = self.output.lock().unwrap_or_else(PoisonError::into_inner);
+        console.err(line);
     }
 
     /// Each repo's tree and its `.git` made folders of their own ([`plain_tree`]) and readied as the preflight readies
@@ -3049,6 +3452,60 @@ impl BackGit<'_> {
             .filter(|path| !path.is_empty())
             .map(|path| String::from_utf8(path.to_vec()).map_err(|_| BackFailed::Step("diff-tree printed a path that is not UTF-8".to_owned())))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod interrupted_tests {
+    use std::time::{Duration, SystemTime};
+
+    use super::{INTERRUPTED_SLACK, Interrupted};
+
+    const KEY: &str = "app-1a2b3c4d";
+    const JOB: &str = r"Local\gate-remote-app-1a2b3c4d-0123456789ab";
+
+    /// The UTC time of the record text `2026-10-19T10:00:00.0000000Z`.
+    fn ten_o_clock() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_hours(497_890)
+    }
+
+    #[test]
+    fn a_record_of_a_past_start_counts_files_from_its_start_less_the_slack() {
+        let text = format!("2026-10-19T10:00:00.0000000Z {JOB}");
+        let read = Interrupted::read(&text, KEY, ten_o_clock() + Duration::from_hours(1));
+        assert_eq!(
+            read,
+            Interrupted {
+                since: Some(ten_o_clock() - INTERRUPTED_SLACK),
+                job: Some(JOB.to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_record_dated_in_the_future_counts_files_from_now() {
+        let text = format!("2026-10-19T10:00:00.0000000Z {JOB}");
+        let now = ten_o_clock() - Duration::from_hours(1);
+        let read = Interrupted::read(&text, KEY, now);
+        assert_eq!(read.since, Some(now - INTERRUPTED_SLACK), "the start is past now, so now is used");
+        assert_eq!(read.job.as_deref(), Some(JOB));
+    }
+
+    #[test]
+    fn an_empty_or_malformed_record_counts_every_file_and_names_no_job() {
+        let everything = Interrupted { since: None, job: None };
+        let other_job = r"Local\gate-remote-other-1a2b3c4d-0123456789ab";
+        let cases = [
+            ("empty", String::new()),
+            ("no-job", "2026-10-19T10:00:00.0000000Z".to_owned()),
+            ("not-a-time", format!("yesterday {JOB}")),
+            ("another-work-folder's-job", format!("2026-10-19T10:00:00.0000000Z {other_job}")),
+            ("short-nonce", format!("2026-10-19T10:00:00.0000000Z {}", &JOB[..JOB.len() - 1])),
+            ("trailing-line-end", format!("2026-10-19T10:00:00.0000000Z {JOB}\n")),
+        ];
+        for (name, text) in cases {
+            assert_eq!(Interrupted::read(&text, KEY, ten_o_clock()), everything, "{name}");
+        }
     }
 }
 
@@ -3585,6 +4042,7 @@ mod tests {
                 place: &place,
                 timeout: None,
                 of: Of::Run,
+                recorded: false,
             };
             assert_eq!(one.wsl(), wsl, "{words:?}");
         }
@@ -3635,6 +4093,7 @@ mod tests {
             place: &place,
             timeout: None,
             of: Of::Run,
+            recorded: false,
         };
         let mut console = Console::new();
 

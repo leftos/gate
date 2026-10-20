@@ -76,6 +76,24 @@ fn box_warm_up_runs_every_command_in_order_and_writes_warm() {
 }
 
 #[test]
+fn a_warm_up_writes_and_removes_the_command_record() {
+    let case = Case::new("box_warm_up_command_record");
+    let seen = shown(&case.folder().join("seen.txt"));
+    let record = format!("{}.command", field(&box_payload(&case, "k", &[]), "Work"));
+    // The command copies the record out while it runs.
+    let mut payload = warm_payload(&case, &[&["cmd", "/d", "/c", "copy", "/y", &record, &seen]]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let text = fs::read_to_string(&seen).expect("the command found the record");
+    assert!(text.ends_with(field(&payload, "Job")), "the record names the command's job: {text:?}");
+    assert!(!Path::new(&record).exists(), "a clean end removes it: {outcome:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+#[test]
 fn box_warm_up_puts_git_s_bin_first_on_its_command_s_path() {
     let case = Case::new("box_warm_up_git_bin");
     let bin = case.folder().join("fake-git").join("bin");

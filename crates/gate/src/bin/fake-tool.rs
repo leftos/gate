@@ -21,6 +21,8 @@
 //! creating it when missing, so a case can count how many times its command ran;
 //! `free-console` leaves this process's console, as a GUI program or one that detaches early does, its standard handles
 //! kept; `write <path> <text>` writes the text to the file at the path, replacing it, its folders made when missing;
+//! `rewrite <path> <text>` writes it so again and again until the process is ended, each time holding it open 20 ms
+//! without delete sharing, and never goes on to a later step;
 //! `fill <path> <bytes>` writes a file of that many `x` bytes at the path, its folders made when missing, through a
 //! fixed buffer, so its size never sits in memory;
 //! `noise <path> <bytes>` writes a file of that many bytes no compression shrinks at the path, the same bytes on every
@@ -67,6 +69,8 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcess
 
 /// How often `wait` looks for its path.
 const WAIT_STEP: Duration = Duration::from_millis(20);
+/// How long `rewrite` holds its file after each write.
+const REWRITE_STEP: Duration = Duration::from_millis(20);
 /// How long `wait` looks for its path before it gives up: the suite's hang guard, so a loaded machine never ends a
 /// helper its case still means to let go.
 const WAIT_LIMIT: Duration = Duration::from_secs(600);
@@ -162,6 +166,7 @@ fn run(args: &[OsString]) -> Result<i32, String> {
                 let path = operand(&mut steps, "write")?;
                 write_file(&path, &operand(&mut steps, "write")?)?;
             }
+            "rewrite" => rewrite(&operand(&mut steps, "rewrite")?, &operand(&mut steps, "rewrite")?)?,
             "fill" => {
                 let path = operand(&mut steps, "fill")?;
                 let text = operand(&mut steps, "fill")?;
@@ -536,6 +541,33 @@ fn make_folders(path: &str) -> Result<(), String> {
         }
         _ => Ok(()),
     }
+}
+
+/// The `rewrite` step: writes `text` as the whole of the file `path` again and again, holding it [`REWRITE_STEP`] each
+/// time ([`written_held`]), until the process is ended; else why a write failed.
+fn rewrite(path: &str, text: &str) -> Result<(), String> {
+    make_folders(path)?;
+    loop {
+        let held = written_held(path, text)?;
+        thread::sleep(REWRITE_STEP);
+        drop(held);
+    }
+}
+
+/// Writes `text` as the whole of the file `path` and returns it still open, shared for reading alone, so no other
+/// process may delete it while it is held.
+fn written_held(path: &str, text: &str) -> Result<std::fs::File, String> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .map_err(|error| format!("cannot write {path}: {error}"))?;
+    file.write_all(text.as_bytes()).map_err(|error| format!("cannot write {path}: {error}"))?;
+    Ok(file)
 }
 
 /// Writes `text` to the file at `path`, replacing it, its folders made when missing.

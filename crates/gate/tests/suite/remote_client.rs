@@ -808,7 +808,8 @@ fn last_request(steps: &Path) -> Value {
 }
 
 /// The cold note of a run whose `--timeout 60` was raised, in a repo with no warm-up.
-const COLD_NOTE: &str = "gate: remote cold: this worktree's work folder on the builder is new; the ceiling is raised from 60 s to 120 s; \
+const COLD_NOTE: &str = "gate: remote cold: this worktree's work folder on the builder is new or was cleared; \
+             the ceiling is raised from 60 s to 120 s; \
                          a .gate/warmup.toml lets gate warm prewarm the next new worktree";
 
 /// The first routed run of a worktree meets a work folder the preflight lays out now: the box is sent twice the
@@ -865,6 +866,51 @@ fn a_routed_run_in_a_new_work_folder_is_given_a_raised_ceiling_and_told_to_prewa
     let (cold, warm) = (release_of(first_pid), release_of(second_pid));
     assert_eq!(cold["cold"], true, "{cold}");
     assert!(warm.get("cold").is_none(), "{warm}");
+}
+
+/// A run after one whose command was ended mid-run meets a work folder holding the interrupted-command record, which
+/// the box clears what that command wrote from: the run is given the raised ceiling, as in a new work folder.
+#[test]
+fn a_routed_run_after_an_interrupted_one_gets_the_cold_ceiling() {
+    let case = client_case("client-interrupted-cold");
+    let fed = format!("fed-hold {}", shown(&case.folder()));
+    let steps = ssh_steps(&case, "ssh", &["ok", &fed, "ok", &fed]);
+    let tuned = Tuned {
+        timeout: "60",
+        ..Tuned::default()
+    };
+    let notes = |outcome: &Outcome| outcome.stderr.lines().filter(|line| *line == COLD_NOTE).count();
+    let first = finish(client_gate_tuned(
+        &case,
+        "first.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran there"],
+    ));
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let first_request = last_request(&steps);
+    let work = first_request["Work"].as_str().expect("the request names its work folder");
+    let job = first_request["Job"].as_str().expect("the request names its job");
+    // As a command the box's ceiling killed leaves it: written just before the command, of the run's job.
+    fs::write(format!("{work}.command"), format!("{} {job}", jiff::Timestamp::now())).expect("the record can be written");
+
+    let second = finish(client_gate_tuned(
+        &case,
+        "second.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran there"],
+    ));
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "preflight", "run"]);
+    assert_eq!(notes(&second), 1, "said once: {second:?}");
+    assert_eq!(last_request(&steps)["Timeout"], 120, "the box is sent the raised ceiling");
+    assert!(second.stdout.contains(", ceiling 120 s; command "), "{second:?}");
+    assert!(
+        !Path::new(&format!("{work}.command")).exists(),
+        "the run cleared the folder and ended clean"
+    );
 }
 
 /// A folder a case made outside its own, removed with all it holds when it drops; a removal that fails is said.

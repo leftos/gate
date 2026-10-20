@@ -24,9 +24,9 @@ use crate::boxside::boot;
 use crate::boxside::forward::{ChildPipes, ClientGone, DRAIN, Drained, OutputLock};
 use crate::boxside::helper_trusted;
 use crate::boxside::msys;
-use crate::boxside::payload::{Pair, Payload};
+use crate::boxside::payload::{Pair, PairSibling, Payload};
 use crate::boxside::probe;
-use crate::boxside::run::{FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_SINGLE};
+use crate::boxside::run::{self, FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_SINGLE};
 use crate::console::Console;
 use crate::environment::Variables;
 use crate::remote::{INSTALL_STATUS, NEW_WORK_TREE, git, install_untrusted_line};
@@ -76,7 +76,11 @@ pub(crate) fn git_failed(step: &str, code: i32) -> Failed {
 }
 
 /// Readies the folders the payload's `Bare` and `Work` name, then says the version and warm lines, [`NEW_WORK_TREE`]
-/// when the work folder of a run of one repo had no `.git` ([`ready_new_tree`]), the boot line, the path line
+/// when the work folder of a run of one repo had no `.git` ([`ready_new_tree`]), when the work folder holds an
+/// interrupted-command record ([`crate::boxside::run::command_record`]; anything at its name counts, looked at as
+/// itself and never opened or followed) and when its layout record names another layout than the run's, or a pair's has none yet, as the run then
+/// clears the whole folder ([`run::names_another_layout`]), so the client raises the ceiling of a run that
+/// meets a cold folder; then the boot line, the path line
 /// [`msys::NO_GIT_BIN`] when no trusted Git `bin` was found for the command's `PATH`, the SDK line, its list read
 /// within `--test-dotnet-limit-ms` when `seams` gives it, else [`git::DOTNET_LIMIT`], and the tool lines, probed
 /// within `--test-probe-limit-ms` when `seams` gives it, else [`probe::PROBE_LIMIT`]; returns the status.
@@ -108,6 +112,16 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
     // Read once, before the folders are readied, which would make a missing `.git` and so a stale record look current.
     let layout = layout_record(work);
     let warm = warm_state(work, &layout);
+    // A command ended mid-run left the record: the run clears what it wrote, so the folder is cold again. A record
+    // naming another layout than the run's, a pair's first run having none, or one cut short mid-change, has the run
+    // clear the whole folder and lay its trees out again. Any entry at the record's name counts, a folder or a link
+    // included, looked at as itself, never followed: the run takes one it cannot read as a record of no form.
+    let interrupted = fs::symlink_metadata(crate::boxside::run::command_record(work)).is_ok();
+    let wanted = match &pair {
+        None => run::layout_text(None, Vec::new()),
+        Some(pair) => run::layout_text(Some(pair.leaf()), pair.siblings().iter().map(PairSibling::name).collect()),
+    };
+    let relaid = run::names_another_layout(&layout, &wanted);
     let readied = match &pair {
         None => ready(bare, work, &layout, console),
         Some(pair) => ready_bares(bare, work, pair, console).map(|()| false),
@@ -121,7 +135,7 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
     };
     console.out(&format!("gate: remote version {}", build_version()));
     console.out(&format!("gate: remote warm {}", warm.as_deref().unwrap_or("none")));
-    if made {
+    if made || interrupted || relaid {
         console.out(NEW_WORK_TREE);
     }
     boot::say(console);

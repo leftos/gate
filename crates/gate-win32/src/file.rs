@@ -5,13 +5,15 @@
 //! file is on a network volume ([`on_network_volume`]).
 
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
+use std::fs::{File, Metadata};
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
+use std::thread;
+use std::time::{Duration, SystemTime};
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
@@ -19,15 +21,15 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, GENERIC_READ, INVALID_HANDLE_VALUE,
-    OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+    ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, ERROR_SHARING_VIOLATION, GENERIC_READ,
+    INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_DELETE_PENDING, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-    FILE_DISPOSITION_INFO_EX, FILE_FULL_DIR_INFO, FILE_GENERIC_READ, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-    FILE_REMOTE_PROTOCOL_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfoEx, FileFullDirectoryInfo,
-    FileFullDirectoryRestartInfo, FileIdInfo, FileRemoteProtocolInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, MoveFileExW,
-    ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle,
+    BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
+    FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_FULL_DIR_INFO, FILE_GENERIC_READ, FILE_ID_INFO, FILE_LIST_DIRECTORY,
+    FILE_READ_ATTRIBUTES, FILE_REMOTE_PROTOCOL_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfoEx,
+    FileFullDirectoryInfo, FileFullDirectoryRestartInfo, FileIdInfo, FileRemoteProtocolInfo, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, MoveFileExW, ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -144,6 +146,33 @@ struct Opening<'a> {
 /// [`open_beneath_as`] of the UTF-16 `name`, which is taken as it is, unchecked: one name a listing gave, or none at
 /// all, which opens `folder` itself again.
 fn open_wide(folder: &File, name: &[u16], opening: Opening<'_>) -> io::Result<File> {
+    open_wide_status(folder, name, opening)?.map_err(status_error)
+}
+
+/// [`open_wide`] for [`delete_fresh_beneath`]'s walk: `None` when the entry is gone, a file whose delete is pending (a
+/// legacy delete while another handle holds it, which the open refuses with `STATUS_DELETE_PENDING`) included, as it
+/// goes with that handle and cannot be opened by anyone.
+fn open_walked(folder: &File, name: &[u16], opening: Opening<'_>) -> io::Result<Option<File>> {
+    match open_wide_status(folder, name, opening)? {
+        Ok(file) => Ok(Some(file)),
+        Err(STATUS_DELETE_PENDING) => Ok(None),
+        Err(status) => match status_error(status) {
+            error if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            error => Err(error),
+        },
+    }
+}
+
+/// The system's error for the failing NT `status`, as `GetLastError` would give it.
+fn status_error(status: NTSTATUS) -> io::Error {
+    // SAFETY: the call reads nothing but the status it is given.
+    let code = unsafe { RtlNtStatusToDosError(status) };
+    io::Error::from_raw_os_error(code.cast_signed())
+}
+
+/// [`open_wide`] before its failing NT status is converted: the inner error is the status `NtCreateFile` gave, the
+/// outer one a name or a structure the call could not be made with.
+fn open_wide_status(folder: &File, name: &[u16], opening: Opening<'_>) -> io::Result<Result<File, NTSTATUS>> {
     let Opening {
         access,
         share,
@@ -192,12 +221,10 @@ fn open_wide(folder: &File, name: &[u16], opening: Opening<'_>) -> io::Result<Fi
         )
     };
     if status < 0 {
-        // SAFETY: the call reads nothing but the status it is given.
-        let code = unsafe { RtlNtStatusToDosError(status) };
-        return Err(io::Error::from_raw_os_error(code.cast_signed()));
+        return Ok(Err(status));
     }
     // SAFETY: a success is a fresh handle nothing else owns; the returned file owns and closes it from now on.
-    Ok(unsafe { File::from_raw_handle(handle) })
+    Ok(Ok(unsafe { File::from_raw_handle(handle) }))
 }
 
 /// Renames the open file `file`, opened with `DELETE` access, to `name`, one name, inside the open folder `folder` on
@@ -308,10 +335,21 @@ pub fn delete_opened(file: &File) -> io::Result<()> {
 ///
 /// The system's error, such as an invalid-parameter error for a handle that is not a folder's.
 pub fn names_beneath(folder: &File) -> io::Result<Vec<OsString>> {
+    Ok(entries_beneath(folder)?.into_iter().map(|entry| entry.name).collect())
+}
+
+/// One entry of a folder's listing as the full directory class gives it: its name and its attributes.
+struct Listed {
+    name: OsString,
+    attributes: u32,
+}
+
+/// Every entry inside the open folder `folder`, as [`names_beneath`] lists them, each with what the listing says of it.
+fn entries_beneath(folder: &File) -> io::Result<Vec<Listed>> {
     // Eight-byte units, so each entry the system writes is aligned for its structure.
     let mut buffer = vec![0_u64; DIRECTORY_BUFFER_UNITS];
     let size = u32::try_from(size_of_val(buffer.as_slice())).map_err(io::Error::other)?;
-    let mut names = Vec::new();
+    let mut entries = Vec::new();
     let mut class = FileFullDirectoryRestartInfo;
     loop {
         // SAFETY: the handle is open for the whole call, and `buffer` is writable for `size` bytes.
@@ -319,21 +357,21 @@ pub fn names_beneath(folder: &File) -> io::Result<Vec<OsString>> {
         if read == 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(ERROR_NO_MORE_FILES.cast_signed()) {
-                return Ok(names);
+                return Ok(entries);
             }
             return Err(error);
         }
         class = FileFullDirectoryInfo;
-        entry_names(&buffer, &mut names)?;
+        listed_in(&buffer, &mut entries)?;
     }
 }
 
 /// The 64 KiB the directory listing reads into at once, in eight-byte units.
 const DIRECTORY_BUFFER_UNITS: usize = 8 * 1024;
 
-/// Adds to `names` the name of each entry the system wrote in `buffer`, `.` and `..` left out. Each entry is read only
-/// as far as its name ends, so a short last entry near the buffer's end is read whole.
-fn entry_names(buffer: &[u64], names: &mut Vec<OsString>) -> io::Result<()> {
+/// Adds to `entries` each entry the system wrote in `buffer`, `.` and `..` left out. Each entry is read only as far as
+/// its name ends, so a short last entry near the buffer's end is read whole.
+fn listed_in(buffer: &[u64], entries: &mut Vec<Listed>) -> io::Result<()> {
     const DOT: u16 = b'.' as u16;
     // SAFETY: the bytes of `buffer`, which it holds for as long as the slice lives; a byte needs no alignment.
     let raw = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), size_of_val(buffer)) };
@@ -348,7 +386,10 @@ fn entry_names(buffer: &[u64], names: &mut Vec<OsString>) -> io::Result<()> {
         let name_bytes = raw.get(name_start..name_start + length).ok_or_else(past)?;
         let wide: Vec<u16> = name_bytes.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
         if wide != [DOT] && wide != [DOT, DOT] {
-            names.push(OsString::from_wide(&wide));
+            entries.push(Listed {
+                name: OsString::from_wide(&wide),
+                attributes: u32_at(header, std::mem::offset_of!(FILE_FULL_DIR_INFO, FileAttributes))?,
+            });
         }
         if next == 0 {
             return Ok(());
@@ -357,13 +398,17 @@ fn entry_names(buffer: &[u64], names: &mut Vec<OsString>) -> io::Result<()> {
     }
 }
 
+/// The `N` bytes at byte `at` of a directory entry's `header`.
+fn bytes_at<const N: usize>(header: &[u8], at: usize) -> io::Result<[u8; N]> {
+    header
+        .get(at..at + N)
+        .and_then(|bytes| <[u8; N]>::try_from(bytes).ok())
+        .ok_or_else(|| io::Error::other("a directory entry's header is cut short"))
+}
+
 /// The little-endian `u32` at byte `at` of a directory entry's `header`.
 fn u32_at(header: &[u8], at: usize) -> io::Result<u32> {
-    let bytes = header
-        .get(at..at + size_of::<u32>())
-        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-        .ok_or_else(|| io::Error::other("a directory entry's header is cut short"))?;
-    Ok(u32::from_le_bytes(bytes))
+    Ok(u32::from_le_bytes(bytes_at(header, at)?))
 }
 
 /// Deletes the open file or folder `top`, opened with `DELETE` access and with read sharing given, as itself: a folder
@@ -459,6 +504,229 @@ fn is_own_folder(file: &File) -> io::Result<bool> {
 /// `error`, of its kind, saying it was met deleting the entry `name`.
 fn named(name: &OsStr, error: &io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("cannot delete {}: {error}", name.to_string_lossy()))
+}
+
+/// Which files [`delete_fresh_beneath`] deletes, and how hard it tries.
+#[derive(Clone, Copy, Debug)]
+pub struct Fresh {
+    /// A file is fresh when the later of its creation and last-write times, as its own handle gives them, is at or
+    /// after this time; `None` makes every file fresh.
+    pub since: Option<SystemTime>,
+    /// How many times an open another process's handle refuses with a sharing violation is tried in all before the
+    /// walk stops on it: a fresh file's open for deletion, and a folder's open to be held while the walk is inside it.
+    pub tries: u32,
+    /// How long the walk waits between two tries.
+    pub wait: Duration,
+}
+
+/// Where [`delete_fresh_beneath`] stopped: the entry's path below the top folder, empty for the top folder itself,
+/// and the system's error met on it.
+#[derive(Debug)]
+pub struct NotDeleted {
+    pub path: PathBuf,
+    pub error: io::Error,
+}
+
+/// Deletes every fresh file ([`Fresh`]) at any depth below the open folder `top`, by handle descent alone, judging each
+/// entry's kind by what its folder's listing says of it (its attributes), and each file's freshness by its own times
+/// ([`written_since`]), so every entry is opened beneath the folder it is in, by the name the listing gave, as itself,
+/// never through a reparse point. A fresh file is opened with `DELETE` access and deleted as itself ([`delete_opened`]), so a hard link
+/// loses only the name below `top`; one that is a folder by the time it is opened is left. A folder of its own is
+/// opened and held without delete sharing while the walk is inside it, so it cannot be renamed out of `top`, listed,
+/// descended into, and stays, emptied or not; a folder that is a reparse point (a junction or a folder link) is neither
+/// descended into nor deleted; an entry named `.git` in any letter case, file or folder, is skipped at every depth with
+/// all it holds. A sharing violation on either open is tried again as `fresh` says; an entry gone between the listing
+/// and its open is skipped. How many files were deleted.
+///
+/// The listing's times are never used: NTFS keeps a stale time in the listing for a name the file was not written
+/// through, such as a second hard link to it, so each file is opened with attribute access alone and judged by its
+/// own times.
+///
+/// # Errors
+///
+/// The first entry that could not be listed, opened or deleted, with the system's error; what was deleted before it
+/// stays deleted.
+pub fn delete_fresh_beneath(top: &File, fresh: Fresh) -> Result<usize, NotDeleted> {
+    let stopped = |path: &Path| {
+        let path = path.to_path_buf();
+        move |error| NotDeleted { path, error }
+    };
+    let mut deleted = 0;
+    let mut stack = vec![FreshLevel {
+        folder: None,
+        path: PathBuf::new(),
+        entries: listed_entries(top).map_err(stopped(Path::new("")))?,
+    }];
+    while let Some(level) = stack.last_mut() {
+        let Some(entry) = level.entries.pop() else {
+            stack.pop();
+            continue;
+        };
+        if is_git_name(&entry.name) {
+            continue;
+        }
+        let path = level.path.join(&entry.name);
+        let parent = level.folder.as_ref().unwrap_or(top);
+        match fresh_visit(parent, &entry, fresh).map_err(stopped(&path))? {
+            Visit::Descend(folder, entries) => stack.push(FreshLevel {
+                folder: Some(folder),
+                path,
+                entries,
+            }),
+            Visit::Deleted => deleted += 1,
+            Visit::Kept => {}
+        }
+    }
+    Ok(deleted)
+}
+
+/// A folder [`delete_fresh_beneath`] walks: the folder, held without delete sharing (`None` for the top one, which the
+/// caller holds), its path below the top folder, and the entries in it not yet visited.
+struct FreshLevel {
+    folder: Option<File>,
+    path: PathBuf,
+    entries: Vec<Listed>,
+}
+
+/// What [`fresh_visit`] did with an entry.
+enum Visit {
+    /// A folder of its own, held without delete sharing, and the entries in it.
+    Descend(File, Vec<Listed>),
+    /// A fresh file, deleted.
+    Deleted,
+    /// Anything else, left as it is: a file that is not fresh, a folder that is a reparse point, or an entry gone.
+    Kept,
+}
+
+/// Visits the listed `entry` of the open folder `parent` for [`delete_fresh_beneath`].
+fn fresh_visit(parent: &File, entry: &Listed, fresh: Fresh) -> io::Result<Visit> {
+    let wide: Vec<u16> = entry.name.encode_wide().collect();
+    if entry.attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        if entry.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Ok(Visit::Kept);
+        }
+        let Some(folder) = held_folder(parent, &wide, fresh)? else {
+            return Ok(Visit::Kept);
+        };
+        // The listing may be older than the entry: one that is no folder of its own by now is left as it is.
+        if !is_own_folder(&folder)? {
+            return Ok(Visit::Kept);
+        }
+        let entries = entries_beneath(&folder)?;
+        return Ok(Visit::Descend(folder, entries));
+    }
+    if let Some(since) = fresh.since
+        && !written_since(parent, &wide, since)?
+    {
+        return Ok(Visit::Kept);
+    }
+    Ok(if deleted_retrying(parent, &wide, fresh)? {
+        Visit::Deleted
+    } else {
+        Visit::Kept
+    })
+}
+
+/// Whether the file `name` of the open folder `parent` was made or written at or after `since`, by the later of its
+/// creation and last-write times read through its own handle: opened beneath `parent` as itself, never followed, with
+/// attribute access alone, which no other process's sharing refuses. Not when it is gone.
+fn written_since(parent: &File, name: &[u16], since: SystemTime) -> io::Result<bool> {
+    let opening = Opening {
+        access: FILE_READ_ATTRIBUTES,
+        share: Share::All,
+        make: Make::Open,
+        security: None,
+    };
+    let Some(file) = open_walked(parent, name, opening)? else {
+        return Ok(false);
+    };
+    written_at_or_after(&file.metadata()?, since)
+}
+
+/// Whether the file `metadata` describes was made or written at or after `since`, by the later of its creation and
+/// last-write times.
+fn written_at_or_after(metadata: &Metadata, since: SystemTime) -> io::Result<bool> {
+    Ok(metadata.created()?.max(metadata.modified()?) >= since)
+}
+
+/// The entries in the open folder `folder`, listed through a second handle of it with list access alone, closed once
+/// listed.
+fn listed_entries(folder: &File) -> io::Result<Vec<Listed>> {
+    let opening = Opening {
+        access: FILE_LIST_DIRECTORY,
+        share: Share::All,
+        make: Make::Open,
+        security: None,
+    };
+    entries_beneath(&open_wide(folder, &[], opening)?)
+}
+
+/// The folder `name` of the open folder `parent`, opened as itself to be listed and held without delete sharing, as
+/// the work folder is held; `None` when it is gone. A sharing violation is tried again after `fresh.wait`, up to
+/// `fresh.tries` tries in all.
+fn held_folder(parent: &File, name: &[u16], fresh: Fresh) -> io::Result<Option<File>> {
+    let opening = Opening {
+        access: FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+        share: Share::NoDelete,
+        make: Make::Open,
+        security: None,
+    };
+    retried_open(parent, name, opening, fresh)
+}
+
+/// Deletes the file `name` of the open folder `parent` as itself: opened beneath it with `DELETE` access and deleted
+/// through that handle ([`delete_opened`]); a sharing violation on the open is tried again after `fresh.wait`, up to
+/// `fresh.tries` tries in all. Whether it was deleted: not when it is gone, or is a folder by now.
+fn deleted_retrying(parent: &File, name: &[u16], fresh: Fresh) -> io::Result<bool> {
+    let opening = Opening {
+        access: DELETE | FILE_READ_ATTRIBUTES,
+        share: Share::All,
+        make: Make::Open,
+        security: None,
+    };
+    let Some(file) = retried_open(parent, name, opening, fresh)? else {
+        return Ok(false);
+    };
+    deleted_if_fresh(&file, fresh.since)
+}
+
+/// Deletes the open file `file`, opened with `DELETE` and `FILE_READ_ATTRIBUTES` access, through that handle
+/// ([`delete_opened`]) when its own times, read through the same handle, say it was made or written at or after
+/// `since` ([`written_at_or_after`]), so a stale file renamed over the name after a first look is kept. Whether it was
+/// deleted: not when it is a folder by now, or is not fresh.
+fn deleted_if_fresh(file: &File, since: Option<SystemTime>) -> io::Result<bool> {
+    let metadata = file.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        return Ok(false);
+    }
+    if let Some(since) = since
+        && !written_at_or_after(&metadata, since)?
+    {
+        return Ok(false);
+    }
+    delete_opened(file)?;
+    Ok(true)
+}
+
+/// The entry `name` of the open folder `parent` opened with `opening`, `None` when it is gone; a sharing violation is
+/// tried again after `fresh.wait`, up to `fresh.tries` tries in all.
+fn retried_open(parent: &File, name: &[u16], opening: Opening<'_>, fresh: Fresh) -> io::Result<Option<File>> {
+    let mut tried = 1;
+    loop {
+        match open_walked(parent, name, opening) {
+            Ok(opened) => return Ok(opened),
+            Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION.cast_signed()) && tried < fresh.tries => {
+                thread::sleep(fresh.wait);
+                tried += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Whether `name` is `.git` in any letter case.
+fn is_git_name(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|name| name.eq_ignore_ascii_case(".git"))
 }
 
 /// What others may do with a file or folder while a handle holds it open, [`open_beneath`]'s or another open's.
@@ -706,20 +974,82 @@ mod tests {
     use std::fs::{File, OpenOptions};
     use std::io::{self, Read, Write};
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE, READ_CONTROL,
+        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_READ_ATTRIBUTES, FileDispositionInfo, READ_CONTROL, SetFileInformationByHandle,
     };
 
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED};
     use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, FILE_ID_128, FILE_ID_INFO};
 
     use super::{
-        Make, Share, delete_opened, delete_tree_opened, identity_by_either, make_file_beneath, move_no_replace, names_beneath, open_beneath,
-        open_beneath_as, rename_beneath, rename_beneath_no_replace, same_file, verbatim,
+        Fresh, Make, Share, delete_fresh_beneath, delete_opened, delete_tree_opened, deleted_if_fresh, identity_by_either, make_file_beneath,
+        move_no_replace, names_beneath, open_beneath, open_beneath_as, rename_beneath, rename_beneath_no_replace, same_file, verbatim,
     };
+
+    #[test]
+    fn the_delete_judges_freshness_again_through_the_handle_it_deletes_by() {
+        let folder = folder("fresh-judged-by-delete-handle");
+        let (stale, fresh) = (folder.join("stale.txt"), folder.join("fresh.txt"));
+        std::fs::write(&stale, "stale").expect("the stale file can be written");
+        std::fs::write(&fresh, "fresh").expect("the fresh file can be written");
+        let opened = |path: &Path| {
+            OpenOptions::new()
+                .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+                .share_mode(Share::All.mode())
+                .open(path)
+                .expect("the file can be opened to delete")
+        };
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+
+        let stale_deleted = deleted_if_fresh(&opened(&stale), Some(later)).expect("a stale file is judged, not an error");
+        let fresh_deleted = deleted_if_fresh(&opened(&fresh), Some(earlier)).expect("the fresh file is deleted");
+
+        assert!(!stale_deleted, "a file the delete handle's times say is stale is not deleted");
+        assert!(stale.exists(), "the stale file stays");
+        assert!(fresh_deleted, "a file the delete handle's times say is fresh is deleted");
+        assert!(!fresh.exists(), "the fresh file goes");
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_file_whose_delete_is_pending_counts_as_gone() {
+        let folder = folder("fresh-delete-pending");
+        let (pending, fresh_file) = (folder.join("pending.txt"), folder.join("fresh.txt"));
+        std::fs::write(&pending, "pending").expect("the pending file can be written");
+        std::fs::write(&fresh_file, "fresh").expect("the fresh file can be written");
+        let holder = File::open(&pending).expect("a second handle holds the pending file");
+        let marker = OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(Share::All.mode())
+            .open(&pending)
+            .expect("the pending file can be opened to delete");
+        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        let size = u32::try_from(size_of::<FILE_DISPOSITION_INFO>()).expect("the structure is small");
+        // SAFETY: the handle is open for the whole call, and `info` is a filled-in structure of `size` bytes.
+        let marked = unsafe { SetFileInformationByHandle(marker.as_raw_handle(), FileDispositionInfo, (&raw const info).cast(), size) };
+        assert_ne!(marked, 0, "the legacy delete is set: {}", io::Error::last_os_error());
+        drop(marker);
+        assert!(pending.exists(), "the name stays while the holder's handle is open");
+        let fresh = Fresh {
+            since: Some(std::time::SystemTime::now() - std::time::Duration::from_secs(60)),
+            tries: 1,
+            wait: std::time::Duration::ZERO,
+        };
+
+        let deleted = delete_fresh_beneath(&held(&folder), fresh).expect("a file whose delete is pending does not refuse the walk");
+
+        assert_eq!(deleted, 1, "the fresh file is the one deleted; the pending one counts as gone");
+        assert!(!fresh_file.exists(), "the fresh file goes");
+        drop(holder);
+        assert!(!pending.exists(), "the pending file goes with its last handle");
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
     use crate::security::{Descriptor, is_protected_file, protected_descriptor, security_text};
     use crate::token_facts;
 
@@ -844,6 +1174,74 @@ mod tests {
         drop(held);
         assert!(!stage.exists(), "the held folder itself is deleted");
         assert!(outside.join("keep.txt").exists(), "nothing the junction leads to is deleted");
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn the_clear_never_deletes_through_a_hard_link_the_name_outside_work() {
+        let folder = folder("fresh-hard-link");
+        let (work, outside) = (folder.join("work"), folder.join("outside"));
+        std::fs::create_dir_all(work.join("bin")).expect("the work folder can be made");
+        std::fs::create_dir(&outside).expect("the outside folder can be made");
+        std::fs::write(outside.join("target.txt"), "kept").expect("the outside file can be written");
+        std::fs::hard_link(outside.join("target.txt"), work.join(r"bin\link.txt")).expect("the hard link can be made");
+        let fresh = Fresh {
+            since: Some(std::time::SystemTime::now() - std::time::Duration::from_secs(60)),
+            tries: 1,
+            wait: std::time::Duration::ZERO,
+        };
+
+        let deleted = delete_fresh_beneath(&held(&work), fresh).expect("the fresh files are deleted");
+
+        assert_eq!(deleted, 1, "the fresh link is the one file below the work folder");
+        assert!(!work.join(r"bin\link.txt").exists(), "the work folder's name goes");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("target.txt")).expect("the outside name is still there"),
+            "kept",
+            "the name outside the work folder stays, its bytes whole"
+        );
+        assert!(work.join("bin").is_dir(), "a folder is never deleted");
+        std::fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_file_written_through_its_other_hard_link_name_is_fresh_under_both_names() {
+        use std::os::windows::fs::FileTimesExt as _;
+        let folder = folder("fresh-written-through-link");
+        let (written, other) = (folder.join("written.txt"), folder.join("other.txt"));
+        std::fs::write(&written, "old").expect("the file can be written");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let backdate = |path: &Path| {
+            let times = std::fs::FileTimes::new().set_modified(old).set_created(old);
+            OpenOptions::new()
+                .write(true)
+                .open(path)
+                .and_then(|file| file.set_times(times))
+                .expect("the file's times can be set");
+        };
+        backdate(&written);
+        std::fs::hard_link(&written, &other).expect("the hard link can be made");
+        backdate(&other);
+        let since = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+        OpenOptions::new()
+            .append(true)
+            .open(&written)
+            .and_then(|mut file| file.write_all(b" and new"))
+            .expect("the file can be written through one name");
+        let fresh = Fresh {
+            since: Some(since),
+            tries: 1,
+            wait: std::time::Duration::ZERO,
+        };
+
+        let deleted = delete_fresh_beneath(&held(&folder), fresh).expect("the fresh files are deleted");
+
+        assert!(!written.exists(), "the name written through goes");
+        assert!(
+            !other.exists(),
+            "the other name of the same written file goes too, its listing's times stale"
+        );
+        assert_eq!(deleted, 2, "both names are deleted");
         std::fs::remove_dir_all(&folder).expect("the folder can be removed");
     }
 

@@ -42,6 +42,10 @@ use crate::console::Console;
 use crate::remote::{Refusal, refused_line};
 use crate::run::{ERROR_FILE_NOT_FOUND, Written, written};
 
+/// What follows the work folder's path in its packages record's, `{Work}.packages`; the interrupted-command clear
+/// removes the record by it too.
+pub(super) const PACKAGES_SUFFIX: &str = ".packages";
+
 /// A package manager whose packages the box installs before a routed command of it.
 struct Manager {
     /// Its name in the box's lines.
@@ -812,7 +816,7 @@ fn update_folder(request: &Request<'_>, git: &WorkGit, lockfile: &Lockfile<'_>, 
     })?;
     let place = relative(lockfile.work, folder);
     let key = record_key(manager, &place);
-    let path = format!("{}.packages", request.work);
+    let path = format!("{}{PACKAGES_SUFFIX}", request.work);
     let mut record = read(&path, console);
     if installed(&record, &key, &digest, folder) || !ignored(manager, git, lockfile.work, &place, console) {
         return Ok(());

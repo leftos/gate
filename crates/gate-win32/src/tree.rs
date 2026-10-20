@@ -6,7 +6,13 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use proc_table::win32::OwnedHandle;
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_SUCCESS, LocalFree, NTSTATUS, STATUS_OBJECT_TYPE_MISMATCH,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 use windows_sys::Win32::System::JobObjects::OpenJobObjectW;
 use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
 use windows_sys::Win32::System::Threading::{
@@ -14,7 +20,25 @@ use windows_sys::Win32::System::Threading::{
     TerminateProcess, WaitForSingleObject,
 };
 
+use crate::token::sid_string;
 use crate::{Job, exit_of, job, own_handle, start_of, wait_millis, wide};
+
+#[link(name = "ntdll", kind = "raw-dylib")]
+unsafe extern "system" {
+    /// The NT status the last system call made on this thread left in its thread block, which the Win32 error
+    /// `GetLastError` gives was converted from; neither `windows-sys` nor `windows` binds it.
+    fn RtlGetLastNtStatus() -> NTSTATUS;
+}
+
+/// What [`OpenedJob::open_or_not_a_job`] found at a name.
+pub enum JobOpened {
+    /// A job, opened to list and end its processes.
+    Job(OpenedJob),
+    /// No object has the name.
+    Absent,
+    /// An object that is no job (an event, a mutex) holds the name.
+    NotAJob,
+}
 
 /// A job another process created, opened by its name with the access to list its processes, and to end them when it
 /// was opened to be stopped. Dropping it only closes this handle.
@@ -44,6 +68,44 @@ impl OpenedJob {
         Self::open_with(name, JOB_OBJECT_QUERY)
     }
 
+    /// The owner of the job `name`, its SID in its string form (`S-1-5-21-…`), read through a handle opened with
+    /// `READ_CONTROL` alone, which the system grants a job's owner whatever its DACL says; `None` when no job has that
+    /// name.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the job exists but its security cannot be read, such as access denied to a process that
+    /// does not own it and that its DACL does not let read it.
+    pub fn owner_of(name: &str) -> io::Result<Option<String>> {
+        let Some(opened) = Self::open_with(name, READ_CONTROL)? else {
+            return Ok(None);
+        };
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: the handle is open for the whole call with `READ_CONTROL`, and `owner` and `descriptor` are writable;
+        // no other part is asked for.
+        let error = unsafe {
+            GetSecurityInfo(
+                opened.handle.raw(),
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &raw mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut descriptor,
+            )
+        };
+        if error != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(error.cast_signed()));
+        }
+        // SAFETY: `owner` points into `descriptor`, which is freed only after this.
+        let text = unsafe { sid_string(owner) };
+        // SAFETY: the descriptor was allocated by `GetSecurityInfo` with `LocalAlloc`, and nothing uses it after this.
+        unsafe { LocalFree(descriptor) };
+        text.map(Some)
+    }
+
     /// Opens the job `name` with `access`; `None` when no job has that name.
     fn open_with(name: &str, access: u32) -> io::Result<Option<OpenedJob>> {
         let wide_name = wide(name);
@@ -55,6 +117,37 @@ impl OpenedJob {
             })),
             // `OpenJobObjectW` reports a name no job has as `ERROR_FILE_NOT_FOUND`.
             Err(error) if is_error(&error, ERROR_FILE_NOT_FOUND) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Opens the job `name` as [`OpenedJob::open`] does, telling a name no object has from one an object that is no
+    /// job (an event, a mutex) holds, for a clear that judges a recorded job's name: such an object holds no process.
+    /// `OpenJobObjectW` reports both a wrong type and a closed handle as `ERROR_INVALID_HANDLE`, so the NT status it
+    /// left is read ([`RtlGetLastNtStatus`]), and only `STATUS_OBJECT_TYPE_MISMATCH` is [`JobOpened::NotAJob`].
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the name cannot be opened otherwise, `STATUS_INVALID_HANDLE` included.
+    pub fn open_or_not_a_job(name: &str) -> io::Result<JobOpened> {
+        let wide_name = wide(name);
+        // SAFETY: `wide_name` is NUL-terminated and outlives the call. A success is a fresh handle nothing else owns.
+        let opened = unsafe { own_handle(OpenJobObjectW(JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE, 0, wide_name.as_ptr())) };
+        match opened {
+            Ok(handle) => Ok(JobOpened::Job(OpenedJob {
+                handle,
+                name: name.to_owned(),
+            })),
+            Err(error) if is_error(&error, ERROR_FILE_NOT_FOUND) => Ok(JobOpened::Absent),
+            Err(error) if is_error(&error, ERROR_INVALID_HANDLE) => {
+                // SAFETY: the call takes nothing and reads the status the failed open left in this thread's block.
+                let status = unsafe { RtlGetLastNtStatus() };
+                if status == STATUS_OBJECT_TYPE_MISMATCH {
+                    Ok(JobOpened::NotAJob)
+                } else {
+                    Err(error)
+                }
+            }
             Err(error) => Err(error),
         }
     }
@@ -289,7 +382,29 @@ pub(crate) fn is_error(error: &io::Error, code: u32) -> bool {
 mod tests {
     use std::process::{Command, Stdio};
 
-    use super::StoppableProcess;
+    use super::{JobOpened, OpenedJob, StoppableProcess};
+
+    #[test]
+    fn a_name_an_event_holds_is_no_job_a_missing_one_is_absent_and_a_job_is_opened() {
+        let pid = std::process::id();
+        let event_name = format!(r"Local\gate-win32-tree-event-{pid}");
+        let job_name = format!(r"Local\gate-win32-tree-job-{pid}");
+        let missing_name = format!(r"Local\gate-win32-tree-missing-{pid}");
+        let _event = crate::NamedEvent::create(&event_name).expect("the event is made");
+        let _job = crate::Job::create(&job_name).expect("the job is made");
+
+        let at_event = OpenedJob::open_or_not_a_job(&event_name).expect("a name an event holds is no error");
+        let at_missing = OpenedJob::open_or_not_a_job(&missing_name).expect("a missing name is no error");
+        let at_job = OpenedJob::open_or_not_a_job(&job_name).expect("the job opens");
+
+        assert!(matches!(at_event, JobOpened::NotAJob), "a name an event holds is no job");
+        assert!(matches!(at_missing, JobOpened::Absent), "a name no object has is absent");
+        let opened_name = match at_job {
+            JobOpened::Job(opened) => Some(opened.name().to_owned()),
+            JobOpened::Absent | JobOpened::NotAJob => None,
+        };
+        assert_eq!(opened_name.as_deref(), Some(job_name.as_str()), "the job is opened, by its name");
+    }
 
     #[test]
     fn a_child_s_parent_read_through_its_handle_is_this_process() {
