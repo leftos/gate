@@ -128,6 +128,8 @@ After each landing whose diff changes code the local gate runs (the run, watchdo
 
 The landing's report names the installed version and each builder's result line.
 
+A landing that changes `tools/builder/install-toolchains.ps1` is followed by a run of each changed step on every builder: stage the landed copy (and `wsl-setup.sh`) in `C:\build-box\gate\` and run it elevated with `-User {builder user} -Only "<step>",...`, as `docs/routing-a-repo.md` ("Builder setup") gives it, once no gate is running there. `gate push` installs only `gate.exe`, so an installer step that is never rerun stays missing on the builder; the landing's report names each step's `OK` or `FAIL` line.
+
 A push that fails is reported in the landing's report and never undoes the local install; the next reinstall pushes again. A landing that changes only dormant code (the Rust remote client under `test-seams`) waits for the checkpoint, where one install and one push cover them.
 
 A landing that changes `tools/gate.ps1`, the slim launcher, is followed by `pwsh -NoProfile -File ~/.claude/tools/sync-launchers.ps1` (claude-config's): it copies the launcher into every repo that opted in by carrying one and sends each an inbox note to commit it, and never gives a copy to a repo that has none. `-Check` lists the drift.
