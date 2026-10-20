@@ -1289,8 +1289,8 @@ fn no_build_and_other_flags_that_are_not_paths_are_left_alone() {
     assert_in_order(&dotnet.stderr, &[DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE, BUSY_LINE]);
     assert_eq!(
         command_lines(&dotnet.stdout),
-        ["test"],
-        "a fallback after any refusal drops --no-build: {dotnet:?}"
+        ["test --no-build"],
+        "a fallback that finds no build here keeps --no-build: {dotnet:?}"
     );
     let events = events(&case);
     assert_refused(&events[..5], "busy");
@@ -1298,7 +1298,7 @@ fn no_build_and_other_flags_that_are_not_paths_are_left_alone() {
 }
 
 #[test]
-fn a_dotnet_no_build_command_on_a_full_pool_runs_here_without_it() {
+fn a_dotnet_no_build_command_on_a_full_pool_keeps_it_here() {
     let case = routed_case("routing-no-build-full");
     dotnet_cmd(&case);
     let go = case.folder().join("go");
@@ -1318,8 +1318,8 @@ fn a_dotnet_no_build_command_on_a_full_pool_runs_here_without_it() {
     assert_in_order(&outcome.stderr, &[DROPPED_NO_BUILD_LINE, FULL_LINE]);
     assert_eq!(
         command_lines(&outcome.stdout),
-        ["test"],
-        "the fallback runs here as `test`, without --no-build: {outcome:?}"
+        ["test --no-build"],
+        "the fallback runs here with --no-build kept: {outcome:?}"
     );
     assert!(!call.exists(), "the waiter's client never ran");
     let own = own(&case, pid);
@@ -1688,7 +1688,7 @@ fn a_routed_dotnet_build_carries_the_worktree_head_as_its_source_revision() {
 }
 
 #[test]
-fn no_build_is_dropped_for_the_box_and_the_fallback() {
+fn no_build_is_dropped_for_the_box_and_kept_by_the_fallback() {
     let case = routed_case("routing-no-build");
     dotnet_cmd(&case);
     let (busy_call, tool_call) = (case.folder().join("busy.json"), case.folder().join("tool.json"));
@@ -1710,10 +1710,10 @@ fn no_build_is_dropped_for_the_box_and_the_fallback() {
     assert_in_order(&before.stderr, &[DROPPED_NO_BUILD_LINE, NO_OUTPUTS_LINE, BUSY_LINE]);
     assert_eq!(
         command_lines(&before.stdout),
-        ["test"],
-        "a fallback after any refusal drops --no-build: {before:?}"
+        ["test --no-build"],
+        "a fallback that finds no build here keeps --no-build: {before:?}"
     );
-    assert_eq!(command_lines(&after.stdout), ["test"], "{after:?}");
+    assert_eq!(command_lines(&after.stdout), ["test --no-build"], "{after:?}");
     assert!(
         recorded_words(&recorded(&tool_call)).contains(&"--no-build"),
         "a non-dotnet command keeps it"
@@ -1725,6 +1725,124 @@ fn no_build_is_dropped_for_the_box_and_the_fallback() {
     );
     assert!(!pack.stderr.contains(DROPPED_NO_BUILD_LINE), "{pack:?}");
     assert_eq!(command_lines(&pack.stdout), ["pack --no-build"], "and here: {pack:?}");
+}
+
+/// A fallback of a routed `--no-build` command whose worktree has no nothing-back record runs here with the word
+/// kept, whatever refused the routed run, and says no drop of its own.
+#[test]
+fn a_fallback_with_no_record_keeps_no_build() {
+    let case = routed_case("routing-fallback-kept");
+    dotnet_cmd(&case);
+    let busy = shown(&stub(&case, &["refuse busy"]));
+    let rebooted = shown(&stub(&case, &["refuse rebooted"]));
+    let busy_run = finish(case.gate(&routed_words("busy.log", &busy, &[], &NO_BUILD_TEST)));
+    let rebooted_run = finish(case.gate(&routed_words("rebooted.log", &rebooted, &[], &NO_BUILD_TEST)));
+    let go = case.folder().join("go");
+    let holder = remote_holder(&case, "holder.log", &go);
+    let full = shown(&stub(&case, &["status 0"]));
+    let full_run = finish(case.gate(&routed_words("full.log", &full, &["--test-remote-wait-ms", "1"], &NO_BUILD_TEST)));
+    let_go(&go);
+    assert_eq!(holder.finish().code, Some(0));
+
+    for (reason, outcome) in [("busy", &busy_run), ("rebooted", &rebooted_run), ("full", &full_run)] {
+        assert_eq!(outcome.code, Some(0), "{reason}: {outcome:?}");
+        assert_eq!(command_lines(&outcome.stdout), ["test --no-build"], "{reason}: {outcome:?}");
+        assert!(
+            !outcome.stderr.contains("building on a heavy slot"),
+            "{reason}: the fallback drops nothing and says no drop of its own: {outcome:?}"
+        );
+    }
+}
+
+/// A fallback whose worktree has a nothing-back record drops `--no-build`, says why as a run here does, and leaves
+/// the record standing.
+#[test]
+fn a_fallback_with_a_record_drops_no_build_and_says_the_local_line() {
+    let case = routed_case("routing-fallback-record");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    routed_build(&case, "routed.log");
+    let busy = shown(&stub(&case, &["refuse busy"]));
+
+    let outcome = finish(case.gate(&routed_words("busy.log", &busy, &[], &[r".\dotnet.cmd", "test", "bad", "--no-build"])));
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(outcome.stderr.contains(NOTHING_BACK_LINE), "{outcome:?}");
+    assert_eq!(command_lines(&outcome.stdout), ["test bad"], "{outcome:?}");
+    assert_eq!(
+        nothing_back(&case).as_deref(),
+        Some(NOTHING_BACK_RECORD),
+        "the run here failed, so the record that dropped the word stands: {outcome:?}"
+    );
+    assert!(
+        took_heavy(&case, r".\dotnet.cmd test bad --no-build"),
+        "a fallback journals the command as given, on a heavy slot: {:#?}",
+        events(&case)
+    );
+}
+
+/// A fallback whose worktree has a tracked project with no assets file drops `--no-build`, naming the project; one
+/// whose project is restored keeps the word.
+#[test]
+fn a_fallback_whose_project_has_no_assets_file_drops_no_build() {
+    let case = routed_case("routing-fallback-assets");
+    dotnet_cmd(&case);
+    tracked_project(&case, "app/App.csproj", false);
+
+    let busy = shown(&stub(&case, &["refuse busy"]));
+    let missing = finish(case.gate(&routed_words("missing.log", &busy, &[], &NO_BUILD_TEST)));
+    fs::write(case.folder().join(r"app\obj\project.assets.json"), "{}\n").expect("the assets file can be written");
+    let busy = shown(&stub(&case, &["refuse busy"]));
+    let present = finish(case.gate(&routed_words("present.log", &busy, &[], &NO_BUILD_TEST)));
+
+    let line = r"gate: dropped --no-build: app/App.csproj has no obj\project.assets.json here; building on a heavy slot";
+    assert!(missing.stderr.contains(line), "{missing:?}");
+    assert_eq!(command_lines(&missing.stdout), ["test"], "{missing:?}");
+    assert!(!present.stderr.contains("building on a heavy slot"), "{present:?}");
+    assert_eq!(command_lines(&present.stdout), ["test --no-build"], "{present:?}");
+}
+
+/// A fallback that drops `--no-build` and passes rebuilds the whole worktree here, so it clears the record that made
+/// it drop, as a passing run here of the dropped words does (`Run::cleared_record`).
+#[test]
+fn a_passing_fallback_that_drops_no_build_clears_the_record() {
+    let case = routed_case("routing-fallback-clears");
+    copy_tool(&case, "dotnet.exe");
+    dotnet_cmd(&case);
+    routed_build(&case, "routed.log");
+    let busy = shown(&stub(&case, &["refuse busy"]));
+
+    let outcome = finish(case.gate(&routed_words("busy.log", &busy, &[], &NO_BUILD_TEST)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(NOTHING_BACK_LINE), "{outcome:?}");
+    assert_eq!(command_lines(&outcome.stdout), ["test"], "{outcome:?}");
+    assert_eq!(
+        nothing_back(&case),
+        None,
+        "a passing fallback builds the whole worktree here, which clears the record: {outcome:?}"
+    );
+}
+
+/// A fallback that keeps `--no-build`, its worktree holding no nothing-back record and its restored project's assets
+/// file, runs the words as given and leaves no record: a passing run here clears a record (`Run::cleared_record`) but
+/// writes none, which only a routed run does (`Run::leave_nothing_back`).
+#[test]
+fn a_passing_fallback_that_keeps_no_build_leaves_the_record_alone() {
+    let case = routed_case("routing-fallback-keeps-record");
+    dotnet_cmd(&case);
+    tracked_project(&case, "app/App.csproj", true);
+    let busy = shown(&stub(&case, &["refuse busy"]));
+
+    let outcome = finish(case.gate(&routed_words("busy.log", &busy, &[], &NO_BUILD_TEST)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(command_lines(&outcome.stdout), ["test --no-build"], "{outcome:?}");
+    assert_eq!(
+        nothing_back(&case),
+        None,
+        "a kept --no-build writes no record and clears none: {outcome:?}"
+    );
 }
 
 /// The line a run here that takes a slot of its own says as it drops `--no-build` after a routed build on [`HOST`]

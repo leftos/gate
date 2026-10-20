@@ -1603,7 +1603,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A matched command still runs here, saying why, when a word names a path outside the worktree (a drive-relative, root-relative, share, device or climbing form included, see [the path rewrite](#routing)) or the gate's folder holds nothing the snapshot sends. The one exception is a first word naming a program by an absolute path, which the path rewrite sends as the program's name unless it refuses the name.
 
-  `--no-build` is dropped from the builder's words of a dotnet `test` or `run` command, saying so (T4); `build`, `msbuild`, `pack` and `publish` keep it everywhere. The fallback here drops the same words after every refusal, rebuilding locally as the builder would have, because an earlier routed step (a repo's test-all build) may have built only on the builder, so a later `dotnet test --no-build` that falls back here would find no build output.
+  `--no-build` is dropped from the builder's words of a dotnet `test` or `run` command, saying so (T4); `build`, `msbuild`, `pack` and `publish` keep it everywhere. A fallback here decides `--no-build` again for the run here, as a Local route does (below), whatever the refusal: the word stays when the worktree has no nothing-back record and every project the command builds has `obj\project.assets.json`, so the run tests the PC's own build, else it drops. The record is what an earlier routed step (a repo's test-all build) leaves when it built only on the builder, where a `dotnet test --no-build` here would find no build output.
+
+  The route-time dropped line of a non-send run is true of the builder run it planned, so it can precede a fallback that keeps the word.
 
   A step that really did build here pays a second local build on a refusal, a cost accepted. A fallback that drops no word reuses the first plan.
 
@@ -1627,13 +1629,13 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A run call the box refuses with the `sent` tag, its work folder no longer holding the build sent, is made once more under a new nonce with the dropped words and no `SentDigest`, after the dropped line; it never runs here.
 
-  A run with a send that falls back here for any other reason (`busy`, `full`, `tools`, `layout`, `parity`, `inputs`, the send's `install`, a client that cannot start) runs the dropped words here and says the dropped line once, after the fallback line, unless the client already said it.
+  A run with a send that falls back here for any other reason (`busy`, `full`, `tools`, `layout`, `parity`, `inputs`, the send's `install`, a client that cannot start) decides `--no-build` again for the run here, as every fallback does, and says the local dropped line, after the fallback line, only when it drops the word. The builder's dropped line from the send is not repeated by the fallback.
 
   A dotnet command is one whose first word's file name without extension is `dotnet`, or is `pwsh` or `powershell` with `--` followed by a `dotnet` word (a script handed a dotnet command to run), each compared in any letter case. A dotnet command's own words run from its `dotnet` word to its next `--`, and only they are read: a `--no-build` after that `--`, or before a wrapping script's `--`, belongs to another program and stays, so plain `dotnet test -- --no-build` keeps the word.
 
   A dotnet command with a word starting with `@` (a response file) is opaque, since the gate cannot see its words: it drops no word, gets no `-p:SourceRevisionId` or `-p:PathMap` word, writes no nothing-back record and clears none.
 
-  A run that stays local (the Local route) drops the same `--no-build` words before it takes a slot, when it would find no build here, saying `gate: dropped --no-build: <reason>; building on a heavy slot`, or `gate: dropped --no-build: <reason>; building on the parent gate's <heavy|critical|light> slot` under a covering or lending parent. A routed run is never dropped here. `<reason>` is one of two:
+  A run that stays local (the Local route) drops the same `--no-build` words before it takes a slot, when it would find no build here, saying `gate: dropped --no-build: <reason>; building on a heavy slot`, or `gate: dropped --no-build: <reason>; building on the parent gate's <heavy|critical|light> slot` under a covering or lending parent. A routed run is never dropped here, but its fallback here is, by the same rule, before its plan is made. `<reason>` is one of two:
   - `the last build ran on <host> and brought nothing back`, when the worktree's nothing-back record stands (`<host>` is the record's builder, else `the builder`).
   - `<project> has no obj\project.assets.json here`, asked only when no record stands.
 

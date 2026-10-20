@@ -20,8 +20,8 @@ use gate_args::{
 };
 use gate_router::warm::{RecordRead, RecordState};
 use gate_router::{
-    BuildSettings, BuildTarget, DEFAULT_OUTPUTS, DROPPED_NO_BUILD_LINE, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target,
-    sdk_build_target, without_no_build, work_folder_key,
+    BuildSettings, BuildTarget, DEFAULT_OUTPUTS, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target, sdk_build_target,
+    without_no_build, work_folder_key,
 };
 use gate_state::{Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RunFacts, StateRoot, Verdict, log_hash, v1};
 use gate_watchdog::{Cores, Hint, SlotKind, hint};
@@ -819,9 +819,8 @@ enum Remotely {
     Ended(Ended),
     /// A Ctrl+C ended the wait for the remote client to start or for a remote slot.
     Interrupted,
-    /// The run falls back here; `dropped_said` when the client already said [`DROPPED_NO_BUILD_LINE`], as a run whose
-    /// send of the PC's build did not land says it.
-    Here { dropped_said: bool },
+    /// The run falls back here.
+    Here,
 }
 
 /// What a passed line says of how long the command ran: here, by the wall clock and load-adjusted, or on a builder,
@@ -1040,9 +1039,7 @@ impl Run<'_> {
             Route::Routed(remote) => match self.routed(remote, hold, console) {
                 Remotely::Ended(ended) => return Some((ended, None)),
                 Remotely::Interrupted => return None,
-                Remotely::Here { dropped_said } => self
-                    .plan_here(remote, plan, dropped_said, console)
-                    .map(|plan| (plan, Some(HereWords::fallback(remote)))),
+                Remotely::Here => self.plan_here(remote, plan, console),
             },
         };
         let (plan, here) = match planned {
@@ -1418,25 +1415,25 @@ impl Run<'_> {
         }
         let host = tag.map_or_else(String::new, |tag| tag.host);
         console.err(&fallback_line(&host, reason, outcome.detail.as_deref()));
-        Remotely::Here {
-            dropped_said: outcome.lines.iter().any(|line| line == DROPPED_NO_BUILD_LINE),
-        }
+        Remotely::Here
     }
 
-    /// The plan of the run here after a fallback of any reason: the first plan unchanged when the fallback drops no
-    /// word, which is the command as given, else a plan of the fallback's words, the command with a dotnet `--no-build`
-    /// dropped. A run with a send of the PC's build, whose route left the dropped line to the client, says it here
-    /// first, unless the client said it (`dropped_said`), so it is said once. Else how the run ended when that command
-    /// cannot be planned.
-    fn plan_here(&self, remote: &RemoteRun, plan: Plan, dropped_said: bool, console: &mut Console) -> Result<Plan, Ended> {
-        let words: Vec<OsString> = remote.fallback.iter().map(OsString::from).collect();
-        if words == self.request.command {
-            return Ok(plan);
-        }
-        if remote.send.is_some() && !dropped_said {
-            console.err(DROPPED_NO_BUILD_LINE);
-        }
-        self.replan(&words, console)
+    /// The plan of the run here after a fallback of any reason, and the words it runs: the first plan, the command as
+    /// given, unless it is a dotnet `--no-build` command that would find no build here ([`Run::no_build_words`]), which
+    /// drops the word, says the line a run here that drops it says ([`Run::dropped_line`]), and plans the words it left.
+    /// A command with a word that is not valid Unicode is never routed ([`route`]), so the branch that keeps it as given
+    /// cannot be reached. Else how the run ended when the dropped command cannot be planned.
+    fn plan_here(&self, remote: &RemoteRun, plan: Plan, console: &mut Console) -> Result<(Plan, Option<HereWords>), Ended> {
+        let Some(words) = unicode_words(&self.request.command) else {
+            return Ok((plan, None));
+        };
+        let (words, dropped) = self.no_build_words(words, |_| Some(remote.root.clone()), console);
+        let Some(reason) = dropped else {
+            return Ok((plan, Some(HereWords::routed(remote, words))));
+        };
+        console.err(&self.dropped_line(&reason));
+        let plan = self.replan(&words.iter().map(OsString::from).collect::<Vec<_>>(), console)?;
+        Ok((plan, Some(HereWords::routed(remote, words))))
     }
 
     /// The plan of a run here from the start: the first plan, unless `local` dropped the command's `--no-build`
@@ -1452,40 +1449,58 @@ impl Run<'_> {
         }
     }
 
-    /// The words of a run here from the start, its worktree when it is known, and why its `--no-build` was dropped: a
-    /// dotnet command with an exact `--no-build` word of its own that would find no build here
-    /// ([`Run::no_build_reason`]) loses each such word. Its worktree comes from the route's `place`, else from one git
-    /// call; a command outside a worktree keeps its words. `None` for a routed run, and for a command with a word that
-    /// is not valid Unicode, which runs as it is.
+    /// The words of a run here from the start, its worktree when it is known, and why its `--no-build` was dropped
+    /// ([`Run::no_build_words`]). Its worktree comes from the route's `place`, else from one git call, asked only when
+    /// the words have a `--no-build` word to drop; a command outside a worktree keeps its words. `None` for a routed
+    /// run, and for a command with a word that is not valid Unicode, which runs as it is.
     fn local_words(&self, route: &Route, place: Option<&Place>, console: &mut Console) -> Option<HereWords> {
         if matches!(route, Route::Routed(_)) {
             return None;
         }
         let words = unicode_words(&self.request.command)?;
-        let known = place.map(|place| Worktree {
+        let mut found = place.map(|place| Worktree {
             root: place.root.clone(),
             prefix: place.prefix.clone(),
         });
-        let dropped = without_no_build(words.clone());
-        let kept = |words, worktree| HereWords {
+        let (words, dropped) = self.no_build_words(
             words,
-            worktree,
-            dropped: None,
-        };
-        if dropped.len() == words.len() {
-            return Some(kept(words, known));
-        }
-        let Some(worktree) = known.or_else(|| self.worktree(false, console)) else {
-            return Some(kept(words, None));
-        };
-        let Some(reason) = self.no_build_reason(&worktree.root, &words, console) else {
-            return Some(kept(words, Some(worktree)));
-        };
+            |console| {
+                if found.is_none() {
+                    found = self.worktree(false, console);
+                }
+                found.as_ref().map(|worktree| worktree.root.clone())
+            },
+            console,
+        );
         Some(HereWords {
-            words: dropped,
-            worktree: Some(worktree),
-            dropped: Some(reason),
+            words,
+            worktree: found,
+            dropped,
         })
+    }
+
+    /// The words a dotnet `--no-build` command of `words` runs in the worktree `root` finds, and why the word was
+    /// dropped, `None` when it is kept: each exact `--no-build` word of a dotnet command that builds dropped
+    /// ([`without_no_build`]) when the worktree has a nothing-back record or a project without
+    /// `obj\project.assets.json` ([`Run::no_build_reason`]), else the words as given. `root` is asked once the words have
+    /// one to drop, so a command that drops nothing pays no git call ([`Run::worktree`]).
+    fn no_build_words(
+        &self,
+        words: Vec<String>,
+        root: impl FnOnce(&mut Console) -> Option<String>,
+        console: &mut Console,
+    ) -> (Vec<String>, Option<String>) {
+        let dropped = without_no_build(words.clone());
+        if dropped.len() == words.len() {
+            return (words, None);
+        }
+        let Some(root) = root(console) else {
+            return (words, None);
+        };
+        match self.no_build_reason(&root, &words, console) {
+            Some(reason) => (dropped, Some(reason)),
+            None => (words, None),
+        }
     }
 
     /// The request and nesting of this run once its `--no-build` is dropped: the run here is a build, so it asks for a
@@ -3060,11 +3075,6 @@ impl HereWords {
             }),
             dropped: None,
         }
-    }
-
-    /// The words of the run here after `remote`'s fallback, in the worktree and folder the route placed it in.
-    fn fallback(remote: &RemoteRun) -> HereWords {
-        HereWords::routed(remote, remote.fallback.clone())
     }
 }
 

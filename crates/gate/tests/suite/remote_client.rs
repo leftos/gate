@@ -7774,10 +7774,11 @@ fn a_standing_nothing_back_record_of_another_configuration_still_sends() {
 }
 
 /// The first run holds the worktree's work folder past the second's bound, so the second, a send's, falls back busy
-/// before any send and runs here with `--no-build` dropped, saying so once.
+/// before any send and runs here with `--no-build` kept over the PC's own build, saying no dropped line.
 #[test]
-fn a_busy_fallback_of_a_send_says_the_dropped_line_once() {
+fn a_busy_fallback_of_a_send_keeps_no_build_and_says_no_dropped_line() {
     let case = sent_build_case("client-sent-build-busy", None);
+    write(&case, r"obj\project.assets.json", "{}\n");
     let go = Go(case.folder().join("ssh").join("go"));
     let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
     let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
@@ -7794,10 +7795,52 @@ fn a_busy_fallback_of_a_send_says_the_dropped_line_once() {
 
     assert_eq!((first.code, second.code), (Some(0), Some(0)), "{first:?} {second:?}");
     assert_eq!(calls(&second_steps), Vec::<String>::new(), "the second never reached the builder");
-    assert_in_order(&second.stderr, &[BUSY_LINE, DROPPED_NO_BUILD_LINE]);
-    assert_eq!(dropped_lines(&second.stderr), 1, "{second:?}");
+    assert!(second.stderr.contains(BUSY_LINE), "{second:?}");
+    assert_eq!(dropped_lines(&second.stderr), 0, "{second:?}");
     assert!(
-        second.stdout.lines().any(|line| line == "-c") && !second.stdout.lines().any(|line| line == "--no-build"),
+        second.stdout.lines().any(|line| line == "-c") && second.stdout.lines().any(|line| line == "--no-build"),
+        "the run here kept it: {second:?}"
+    );
+}
+
+/// A send's busy fallback whose worktree holds a nothing-back record for its configuration drops `--no-build` and
+/// says the local line once; the client never reached the builder to say its own.
+#[test]
+fn a_busy_fallback_of_a_send_with_a_record_drops_no_build_and_says_the_local_line() {
+    let case = sent_build_case("client-sent-build-busy-record", None);
+    write(&case, r"obj\project.assets.json", "{}\n");
+    plant_record(&case, r#"{"v":1,"host":"builder","configuration":"release"}"#);
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "100"],
+        ..Tuned::default()
+    };
+
+    let (_, second) = finish_with_pid(client_gate_tuned(&case, "second.log", &second_steps, &tuned, &SENT_TEST));
+    drop(go);
+    let first = first.finish();
+
+    assert_eq!((first.code, second.code), (Some(0), Some(0)), "{first:?} {second:?}");
+    assert_eq!(calls(&second_steps), Vec::<String>::new(), "the second never reached the builder");
+    assert_eq!(dropped_lines(&second.stderr), 0, "the client never said the builder's line: {second:?}");
+    assert_eq!(
+        second
+            .stderr
+            .matches("gate: dropped --no-build: the last build ran on builder and brought nothing back; building on a heavy slot")
+            .count(),
+        1,
+        "the local line once: {second:?}"
+    );
+    assert!(
+        !second.stdout.lines().any(|line| line == "--no-build"),
         "the run here dropped it: {second:?}"
+    );
+    assert!(
+        nothing_back(&case).is_some(),
+        "the run here builds one project, which clears no record: {second:?}"
     );
 }

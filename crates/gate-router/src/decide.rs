@@ -437,8 +437,9 @@ pub struct RemoteRun {
     /// gate's folder written `./name`, and a first word naming a program by a path outside the worktree sent as the
     /// program's name ([`RemoteRun::program_named`]), which is never the file of the folder.
     pub words: Vec<String>,
-    /// The words every fallback here runs: the command as given, each exact `--no-build` word dropped from a dotnet
-    /// command.
+    /// The command as given, each exact `--no-build` word of a dotnet command dropped from it: read only to say the
+    /// first word the caller gave, for a run whose first word was sent as a program's name
+    /// ([`RemoteRun::program_line`]). A run here after a fallback decides its own words.
     pub fallback: Vec<String>,
     /// Whether the rewrite sent the command's first word as a program's name ([`Rewritten::program_named`]):
     /// [`RemoteRun::lines`] says the word as given and the name it is sent as.
