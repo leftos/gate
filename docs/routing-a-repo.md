@@ -69,7 +69,7 @@ The key is for check-only hook commands (a build, clippy, a format check). A rou
 
 The hook entry calls the repo's launcher, `pwsh -NoProfile -File tools/gate.ps1 run ... -- <heavy command>`, never a bare `gate run`: a hook runs on every machine that commits, and on a clone without gate.exe the launcher runs the command directly. The repo's patterns must match that command. The `git commit` that runs the hook is gated on `--slot none`, so it does not cover its hook's gate and the hook's gate takes its own slot (and routes). The `git commit` itself stays local.
 
-Only hooks that run with `GIT_INDEX_FILE` set (pre-commit and commit-msg) need the `hooks` consent: a pre-push hook's gate routes by the repo's patterns like any other run. A repo without a launcher copies this repo's `tools/gate.ps1` by hand; nothing publishes it.
+Only hooks that run with `GIT_INDEX_FILE` set (pre-commit and commit-msg) need the `hooks` consent: a pre-push hook's gate routes by the repo's patterns like any other run. A repo opts in to the launcher by committing a copy of this repo's `tools/gate.ps1`; claude-config's `tools/sync-launchers.ps1` keeps every listed copy current and never adds one to a repo that has none.
 
 ## A repo whose short runs a cold folder would push past their ceiling
 

@@ -130,6 +130,8 @@ The landing's report names the installed version and each builder's result line.
 
 A push that fails is reported in the landing's report and never undoes the local install; the next reinstall pushes again. A landing that changes only dormant code (the Rust remote client under `test-seams`) waits for the checkpoint, where one install and one push cover them.
 
+A landing that changes `tools/gate.ps1`, the slim launcher, is followed by `pwsh -NoProfile -File ~/.claude/tools/sync-launchers.ps1` (claude-config's): it copies the launcher into every repo that opted in by carrying one and sends each an inbox note to commit it, and never gives a copy to a repo that has none. `-Check` lists the drift.
+
 The install is safe while gates run (rename-aside). A bad build is taken back by reinstalling the previous commit.
 
 ## Repo traps
