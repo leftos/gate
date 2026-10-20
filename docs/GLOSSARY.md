@@ -53,7 +53,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Critical request**: a critical gate's queued ticket and run, from its arrival until it releases the machine; critical requests run one at a time in arrival order.
 - **Cutover**: switching a machine's gates from the PowerShell gate to `gate.exe`; `gate cutover` runs the local one.
 - **Cutover flag**: the file `%LOCALAPPDATA%\gate\cutover.flag`, whose existence tells ops-tower's state to read `gate.exe`'s files; the launcher does not read it.
-- **Cutover sweep**: the later change of every calling repo from the PowerShell launcher to `gate` on PATH, after which the PowerShell gate is deleted.
+- **Cutover sweep**: the change of every calling repo from the PowerShell launcher to the slim wrapper (`tools/gate.ps1`), after which the PowerShell gate is deleted.
 - **Declarations folder**: the PC-owned folder `remote.json`'s `declarations` names for a repo, holding the `.gate/toolchain.toml`, `siblings.toml`, `desktop.toml` and `warmup.toml` the repo cannot commit; a file is read from it only when the repo has none of that name.
 - **Delete pending**: a file marked for deletion when its last handle closes (the classic delete, not the POSIX one `fs::remove_file` takes); until then its name stays listed and every open or delete of it is refused with access denied, so the gate passes it over as going away.
 - **Deny-only**: the state of a token group that still matches deny entries in an access check but no longer matches allow entries; a routed command's token holds the ssh logon's NETWORK group so.
@@ -246,3 +246,4 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Work-folder key**: the name of a work folder: the worktree folder's name plus 8 hex digits of the SHA-256 of its lower-cased path.
 - **Work-folder lock**: the file `<Work>.lock` that `gate box run` opens with no sharing and holds for the run's life, so one run at a time uses a work folder; a held lock is the `busy` refusal.
 - **Worktree lock**: the mutex `Local\gate-[<root hash>-]worktree-<volume>-<file id>`, named for a worktree folder's id, that a routed run takes for its main root and each sibling, in id order, from before its snapshots until its last push is saved, and a sync-back takes again for each worktree it has a back commit for, from before its fetch to its end, so two runs never write one folder at once; another run's hold is waited for up to the git limit.
+- **Wrapper**: a repo's copy of this repo's `tools/gate.ps1`, the only way anything calls the gate: it hands every word to the installed gate.exe, and on a machine without one runs the command directly, without slots or watchdog.
