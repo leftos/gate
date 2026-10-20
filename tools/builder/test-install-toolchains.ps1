@@ -4,7 +4,9 @@
 # -ExecutionPolicy Bypass as the box does, and checks an unknown parameter or a -Only prefix that matches no step exits
 # non-zero before creating anything. Every copy carries an exit 0 guard before its elevation check, so no case needs
 # admin or can ever run a step on this PC. It also pins the step list the script reads from its own AST against a plain
-# regex over the file. Prints ok/FAIL per case and exits with the failure count.
+# regex over the file. The gate work root checks (its owner, DACL, mandatory label and link refusal) run on their
+# function definitions taken from the AST, fed SDDL strings, icacls lines and a scratch junction, and the sccache server
+# log's assignment is read from the AST. Prints ok/FAIL per case and exits with the failure count.
 #
 #   pwsh -NoProfile -File tools/builder/test-install-toolchains.ps1
 param()
@@ -83,8 +85,99 @@ function Get-CreatedProblem {
     return ''
 }
 
+# The definitions of install-toolchains.ps1's functions $Name, taken from its AST, for the caller to dot-source; the whole
+# script is never dot-sourced. A missing function throws, which fails the case.
+function Get-InstallerFunctionText {
+    param([Parameter(Mandatory)][string[]]$Name)
+    $texts = foreach ($each in $Name) {
+        $definition = $sourceAst.Find({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $each
+            }.GetNewClosure(), $true)
+        if (-not $definition) { throw "install-toolchains.ps1 defines no $each" }
+        $definition.Extent.Text
+    }
+    return $texts -join "`n"
+}
+
+# Runs install-toolchains.ps1's Assert-GateRootSecurity and its helpers and returns the message it threw, or '' when it
+# passed.
+function Invoke-GateRootSecurityCheck {
+    param([Parameter(Mandatory)][string]$Sddl, [string[]]$IcaclsLines = @(), [string]$UserSid = $testUserSid)
+    . ([scriptblock]::Create((Get-InstallerFunctionText 'Assert-GateRootSecurity', 'Get-GateRootAce', 'Assert-GateRootNoLabel')))
+    try {
+        Assert-GateRootSecurity -Sddl $Sddl -IcaclsLines $IcaclsLines -UserSid $UserSid
+        return ''
+    }
+    catch {
+        return $_.Exception.Message
+    }
+}
+
+# A gate root check that must throw: returns '' when it threw a message matching $Expect, else what went wrong.
+function Get-GateRootRefusalProblem {
+    param([Parameter(Mandatory)][string]$Sddl, [string[]]$IcaclsLines = @(), [Parameter(Mandatory)][string]$Expect)
+    $message = Invoke-GateRootSecurityCheck -Sddl $Sddl -IcaclsLines $IcaclsLines
+    if (-not $message) { return "passed $Sddl, expected a refusal" }
+    if ($message -notmatch $Expect) { return "the refusal does not match '$Expect': $message" }
+    return ''
+}
+
+# Makes a scratch link to a scratch folder with mklink $MklinkSwitch, grants this user read through the link with
+# icacls /L and then without it, and returns '' when the target's SDDL stayed unchanged under /L and changed without it
+# exactly when $PlainChangesTarget. A link this account may not create (a symbolic link without Developer Mode or
+# elevation) returns a skip line.
+function Get-IcaclsLinkProblem {
+    param([Parameter(Mandatory)][string]$MklinkSwitch, [Parameter(Mandatory)][bool]$PlainChangesTarget)
+    $tag = [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $target = Join-Path $root "icacls-target-$tag"
+    $link = Join-Path $root "icacls-link-$tag"
+    New-Item -ItemType Directory -Force $target | Out-Null
+    $made = (& cmd.exe /c "mklink $MklinkSwitch `"$link`" `"$target`" 2>&1") -join ' '
+    if ($LASTEXITCODE) {
+        if ($MklinkSwitch -eq '/D') { return "skipped: this account cannot create a symbolic link (needs Developer Mode or elevation): $made" }
+        return "mklink $MklinkSwitch exited $LASTEXITCODE`: $made"
+    }
+    try {
+        $grant = "*$($identity.User.Value):(R)"
+        $before = (Get-Acl -LiteralPath $target).Sddl
+        & icacls.exe $link /L /grant $grant /q | Out-Null
+        if ($LASTEXITCODE) { return "icacls /L /grant exited $LASTEXITCODE" }
+        $afterL = (Get-Acl -LiteralPath $target).Sddl
+        if ($afterL -ne $before) { return "icacls /L changed the link's target: $before -> $afterL" }
+        & icacls.exe $link /grant $grant /q | Out-Null
+        if ($LASTEXITCODE) { return "icacls /grant exited $LASTEXITCODE" }
+        $changed = (Get-Acl -LiteralPath $target).Sddl -ne $before
+        if ($changed -ne $PlainChangesTarget) { return "icacls without /L changed the target: $changed, expected $PlainChangesTarget" }
+        return ''
+    }
+    finally {
+        & cmd.exe /c "rmdir `"$link`"" | Out-Null
+    }
+}
+
+# Runs install-toolchains.ps1's Assert-GateRootNotLink on $Path and returns the message it threw, or '' when it passed.
+function Invoke-GateRootLinkCheck {
+    param([Parameter(Mandatory)][string]$Path)
+    . ([scriptblock]::Create((Get-InstallerFunctionText 'Assert-GateRootNotLink')))
+    try {
+        Assert-GateRootNotLink -Path $Path
+        return ''
+    }
+    catch {
+        return $_.Exception.Message
+    }
+}
+
 New-Item -ItemType Directory -Force $root | Out-Null
 $sourceText = Get-Content -LiteralPath $sourceScript -Raw
+$sourceAst = [System.Management.Automation.Language.Parser]::ParseInput($sourceText, [ref]$null, [ref]$null)
+# The gate root's three ACEs: SYSTEM, Administrators and a made-up builder user, full control, inherited by both.
+$testUserSid = 'S-1-5-21-1-2-3-1001'
+$aceSystem = '(A;OICI;FA;;;SY)'
+$aceAdmins = '(A;OICI;FA;;;BA)'
+$aceUser = "(A;OICI;FA;;;$testUserSid)"
+$protectedTriple = "O:BAG:SYD:PAI$aceSystem$aceAdmins$aceUser"
 $scratchText = $sourceText.Replace('C:\build-box', $buildBox).Replace('C:\Tools\bin', $tools)
 # A missed replacement would let a case write to the real C:\build-box on this machine, so fail before any run.
 if ($scratchText.Contains('C:\build-box')) { throw 'the scratch copy still names C:\build-box' }
@@ -264,6 +357,136 @@ try {
             return "stderr is not the not-a-string message: $($r.StdErr)"
         }
         Get-CreatedProblem
+    }
+
+    Test-Case 'gate root: the protected SYSTEM, Administrators and user triple passes' {
+        $lines = @("D:\gate-remote NT AUTHORITY\SYSTEM:(OI)(CI)(F)", 'Successfully processed 1 files; Failed processing 0 files')
+        Invoke-GateRootSecurityCheck -Sddl $protectedTriple -IcaclsLines $lines
+    }
+
+    Test-Case 'gate root: the triple passes in another ACE order' {
+        Invoke-GateRootSecurityCheck -Sddl "O:BAG:SYD:PAI$aceUser$aceSystem$aceAdmins"
+    }
+
+    Test-Case 'gate root: the triple passes with SYSTEM and Administrators written as SIDs, under D:P' {
+        Invoke-GateRootSecurityCheck -Sddl "O:S-1-5-32-544G:SYD:P(A;OICI;FA;;;S-1-5-32-544)$aceUser(A;OICI;FA;;;S-1-5-18)"
+    }
+
+    Test-Case 'gate root: the builder user as owner fails' {
+        Get-GateRootRefusalProblem -Sddl "O:${testUserSid}G:SYD:PAI$aceSystem$aceAdmins$aceUser" `
+            -Expect ([regex]::Escape("its owner is $testUserSid, not Administrators; rerun -Only ""Gate work root"""))
+    }
+
+    Test-Case 'gate root: a foreign owner fails' {
+        Get-GateRootRefusalProblem -Sddl "O:AUG:SYD:PAI$aceSystem$aceAdmins$aceUser" -Expect ([regex]::Escape('its owner is AU, not Administrators'))
+    }
+
+    Test-Case 'gate root: an inherited ACE says to rerun' {
+        Get-GateRootRefusalProblem -Sddl "$protectedTriple(A;ID;0x1301bf;;;AU)" `
+            -Expect ([regex]::Escape('it is inherited; rerun -Only "Gate work root", whose icacls /inheritance:r drops it'))
+    }
+
+    Test-Case 'gate root: a deny ACE says /remove:d with its SID' {
+        Get-GateRootRefusalProblem -Sddl "$protectedTriple(D;OICI;FA;;;BU)" -Expect ([regex]::Escape('/remove:d *S-1-5-32-545'))
+    }
+
+    Test-Case 'gate root: another allow ACE says /remove:g with its SID' {
+        Get-GateRootRefusalProblem -Sddl "$protectedTriple(A;OICI;0x1301bf;;;AU)" -Expect ([regex]::Escape('/remove:g *S-1-5-11'))
+    }
+
+    Test-Case 'gate root: a junction is refused as a link' {
+        $target = Join-Path $root 'junction-target'
+        $link = Join-Path $root 'junction-link'
+        New-Item -ItemType Directory -Force $target | Out-Null
+        & cmd.exe /c "mklink /J `"$link`" `"$target`"" | Out-Null
+        if ($LASTEXITCODE) { return "mklink /J exited $LASTEXITCODE" }
+        try {
+            $message = Invoke-GateRootLinkCheck -Path $link
+            $expect = "gate work root ${link}: it is a link (reparse point), not a folder; remove the link and rerun -Only ""Gate work root"""
+            if ($message -ne $expect) { return "expected '$expect', got '$message'" }
+            return ''
+        }
+        finally {
+            & cmd.exe /c "rmdir `"$link`"" | Out-Null
+        }
+    }
+
+    # Probed on Windows 11 26200: icacls and Get-Acl act on a junction itself, /L or not, so a junction's target is never
+    # touched. A directory symbolic link is followed without /L, which is what the step's /L guards against.
+    Test-Case 'icacls on a junction leaves its target alone, with /L and without' {
+        Get-IcaclsLinkProblem -MklinkSwitch '/J' -PlainChangesTarget $false
+    }
+
+    Test-Case 'icacls /L on a directory symbolic link leaves its target alone, and without /L changes it' {
+        Get-IcaclsLinkProblem -MklinkSwitch '/D' -PlainChangesTarget $true
+    }
+
+    Test-Case 'gate root: a plain folder passes the link check' {
+        $folder = Join-Path $root 'plain-folder'
+        New-Item -ItemType Directory -Force $folder | Out-Null
+        Invoke-GateRootLinkCheck -Path $folder
+    }
+
+    Test-Case 'gate root: an unprotected DACL fails' {
+        Get-GateRootRefusalProblem -Sddl "O:BAG:SYD:AI$aceSystem$aceAdmins$aceUser" -Expect 'not protected'
+    }
+
+    Test-Case 'gate root: an inherited Authenticated Users ACE fails' {
+        Get-GateRootRefusalProblem -Sddl "$protectedTriple(A;ID;0x1301bf;;;AU)" -Expect ([regex]::Escape('(A;ID;0x1301bf;;;AU)'))
+    }
+
+    Test-Case 'gate root: a Users read ACE fails' {
+        Get-GateRootRefusalProblem -Sddl "$protectedTriple(A;OICI;0x1200a9;;;BU)" -Expect ([regex]::Escape('(A;OICI;0x1200a9;;;BU)'))
+    }
+
+    Test-Case 'gate root: a missing user ACE fails' {
+        Get-GateRootRefusalProblem -Sddl "O:BAG:SYD:PAI$aceSystem$aceAdmins" -Expect "lacks.*$testUserSid"
+    }
+
+    Test-Case 'gate root: a read-only user ACE fails' {
+        $sddl = "O:BAG:SYD:PAI$aceSystem$aceAdmins(A;OICI;0x1200a9;;;$testUserSid)"
+        Get-GateRootRefusalProblem -Sddl $sddl -Expect ([regex]::Escape("(A;OICI;0x1200a9;;;$testUserSid)"))
+    }
+
+    Test-Case 'gate root: an added deny ACE fails' {
+        Get-GateRootRefusalProblem -Sddl "O:BAG:SYD:PAI(D;OICI;FA;;;BU)$aceSystem$aceAdmins$aceUser" `
+            -Expect ([regex]::Escape('(D;OICI;FA;;;BU)'))
+    }
+
+    Test-Case 'gate root: a mandatory label in the icacls lines fails' {
+        $lines = @("D:\gate-remote NT AUTHORITY\SYSTEM:(OI)(CI)(F)", '               Mandatory Label\High Mandatory Level:(OI)(CI)(NW)')
+        Get-GateRootRefusalProblem -Sddl $protectedTriple -IcaclsLines $lines -Expect 'mandatory label'
+    }
+
+    Test-Case 'the sccache server log is set inside a step, from LOCALAPPDATA, outside C:\build-box' {
+        $assignment = $sourceAst.Find({
+                param($node)
+                $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                $node.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                $node.Left.VariablePath.UserPath -eq 'sccacheServerLog'
+            }, $true)
+        if (-not $assignment) { return 'install-toolchains.ps1 assigns no $sccacheServerLog' }
+        $value = $assignment.Right.Extent.Text
+        $variables = @($assignment.Right.FindAll({ param($node) $node -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) |
+            ForEach-Object { $_.VariablePath.UserPath })
+        # $scriptFiles, $dl and $log are the script's C:\build-box paths.
+        $boxVariables = @($variables | Where-Object { $_ -in 'scriptFiles', 'dl', 'log' })
+        if ($boxVariables.Count) {
+            return "`$sccacheServerLog = $value builds on `$$($boxVariables[0]), a C:\build-box path the builder user cannot write"
+        }
+        $strings = @($assignment.Right.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
+                    $node -is [System.Management.Automation.Language.ExpandableStringExpressionAst]
+                }, $true) | ForEach-Object { $_.Value })
+        if (@($strings | Where-Object { $_ -match '^[A-Za-z]:\\build-box' }).Count) {
+            return "`$sccacheServerLog = $value names C:\build-box, which the builder user cannot write"
+        }
+        if ('env:LOCALAPPDATA' -notin $variables) { return "`$sccacheServerLog = $value does not build on `$env:LOCALAPPDATA" }
+        $step = $assignment.Parent
+        while ($step -and $step -isnot [System.Management.Automation.Language.ScriptBlockExpressionAst]) { $step = $step.Parent }
+        if (-not $step) { return "`$sccacheServerLog is set at top level, so an unset LOCALAPPDATA stops the whole script" }
+        return ''
     }
 }
 finally {

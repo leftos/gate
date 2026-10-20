@@ -388,7 +388,6 @@ function Merge-CargoBuildWrapper([string[]]$Lines, [string]$Wrapper) {
 $sccacheTaskPath = '\build-box\'
 $sccacheTaskName = 'sccache-server'
 $sccacheServerScript = Join-Path $scriptFiles 'sccache-server.ps1'
-$sccacheServerLog = 'C:\build-box\sccache-server.log'
 $sccacheUserVariables = 'SCCACHE_IGNORE_SERVER_IO_ERROR', 'SCCACHE_CLIENT_SIDE'
 function Get-SccacheServerTask { return Get-ScheduledTask -TaskPath $sccacheTaskPath -TaskName $sccacheTaskName -ErrorAction SilentlyContinue }
 function Get-SccacheProcess([string]$Exe) { return @(Get-Process sccache -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $Exe }) }
@@ -403,7 +402,7 @@ function Stop-SccacheServer([string]$Exe) {
     if ($left) { throw "sccache pid $(($left.Id) -join ',') still running 10 s after --stop-server; end it and rerun -Only sccache" }
 }
 # Registers and starts the task that keeps sccache's server running in the foreground for as long as the box is up.
-function Start-SccacheServerTask([string]$Exe) {
+function Start-SccacheServerTask([string]$Exe, [string]$Log) {
     # "SCCACHE_IDLE_TIMEOUT how long the local daemon process waits for more client requests before exiting, in seconds. Set
     # to 0 to run sccache permanently" and "SCCACHE_NO_DAEMON set to 1 to disable putting the server to the background"
     # (docs/Configuration.md). The README's foreground form is "SCCACHE_START_SERVER=1 SCCACHE_NO_DAEMON=1 sccache";
@@ -417,7 +416,7 @@ function Start-SccacheServerTask([string]$Exe) {
         "`$env:SCCACHE_CLIENT_SIDE = '1'"
         'while ($true) {'
         "    & '$Exe'"
-        "    Add-Content -Path '$sccacheServerLog' -Value ('{0:s} sccache server exited {1}; restarting in 2 s' -f (Get-Date), `$LASTEXITCODE)"
+        "    Add-Content -LiteralPath '$Log' -Value ('{0:s} sccache server exited {1}; restarting in 2 s' -f (Get-Date), `$LASTEXITCODE)"
         '    Start-Sleep -Seconds 2'
         '}'
     ) -join "`n"
@@ -441,10 +440,18 @@ function Start-SccacheServerTask([string]$Exe) {
         throw "task $sccacheTaskPath$sccacheTaskName is $($task.State) after Start-ScheduledTask (last result $result)"
     }
     $ids = @(Get-SccacheProcess $Exe | ForEach-Object { $_.Id }) -join ','
-    if (-not $ids) { throw "task $sccacheTaskPath$sccacheTaskName is running but no $Exe process is; see $sccacheServerLog" }
+    if (-not $ids) { throw "task $sccacheTaskPath$sccacheTaskName is running but no $Exe process is; see $Log" }
     Write-InstallLog "task $sccacheTaskPath$sccacheTaskName running: $sccacheServerScript as $User (S4U, Limited); sccache pid $ids"
 }
 Invoke-Step 'sccache 0.18.0' {
+    # The task runs as the builder user, who cannot write C:\build-box, so its log sits in that user's own profile; -User
+    # is the running account, so this LOCALAPPDATA is its. Set here, an unset LOCALAPPDATA fails only this step, and
+    # first, so a refused path fails before the server is stopped or cargo is pointed at sccache.
+    $sccacheServerLog = Join-Path $env:LOCALAPPDATA 'build-box\sccache-server.log'
+    if ($sccacheServerLog -match "['\[\]\u2018-\u201B]") {
+        $problem = 'the path holds a quote or bracket, which the wrapper script cannot carry; set a plain LOCALAPPDATA'
+        throw "sccache server log ${sccacheServerLog}: $problem"
+    }
     $exe = Join-Path $tools 'sccache.exe'
     # A routed run whose client finds no server while this step runs starts one inside its own job: rerun only while
     # the gate is idle.
@@ -493,7 +500,8 @@ Invoke-Step 'sccache 0.18.0' {
         if ($value -ne '1') { throw "user variable $name reads '$value' after setting it; expected 1" }
         Write-InstallLog "user $name -> 1"
     }
-    Start-SccacheServerTask $exe
+    New-Item -ItemType Directory -Force (Split-Path -Parent $sccacheServerLog) | Out-Null
+    Start-SccacheServerTask -Exe $exe -Log $sccacheServerLog
 }
 # just runs recipe lines through sh, and recipes call bash, wc and tr. The user Path reaches new ssh sessions without an
 # sshd restart, which a machine Path change needs; appended last, so the System32 names still win.
@@ -623,10 +631,101 @@ Invoke-Step "keeper: MSYS sleep task $keeperTask" {
     }
     Write-InstallLog "task $keeperTask running: $keeperExe infinity as $User (S4U, Limited)"
 }
+# Throws unless $Path is a plain folder: New-Item -Force returns an existing junction or symbolic link, and icacls and
+# Get-Acl would then act on its target.
+function Assert-GateRootNotLink([string]$Path) {
+    $attributes = (Get-Item -LiteralPath $Path -Force).Attributes
+    if ($attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "gate work root ${Path}: it is a link (reparse point), not a folder; remove the link and rerun -Only ""Gate work root"""
+    }
+    if (-not ($attributes -band [IO.FileAttributes]::Directory)) {
+        throw "gate work root ${Path}: it is a file, not a folder; remove it and rerun -Only ""Gate work root"""
+    }
+}
+# One ACE of an SDDL, its text without parentheses as $Body: Normal is it with the SID aliases SY, BA, AU and BU written
+# as SIDs, Fix the way to remove it when it does not belong.
+function Get-GateRootAce([string]$Body, [string]$Retry) {
+    $aliases = @{ SY = 'S-1-5-18'; BA = 'S-1-5-32-544'; AU = 'S-1-5-11'; BU = 'S-1-5-32-545' }
+    $fields = $Body -split ';'
+    $sid = if ($fields.Count -eq 6) { $fields[5] } else { '' }
+    if ($aliases.ContainsKey($sid)) { $sid = $aliases[$sid] }
+    $fix = if ($fields[1] -match 'ID') { "it is inherited; $Retry, whose icacls /inheritance:r drops it" }
+    elseif ($fields[0] -eq 'D') { "remove it with icacls on the root, /remove:d *$sid, and $Retry" }
+    else { "remove it with icacls on the root, /remove:g *$sid, and $Retry" }
+    return [pscustomobject]@{ Normal = (@($fields[0..4]) + $sid) -join ';'; Fix = $fix }
+}
+# Throws when icacls's listing of the root shows a mandatory label.
+function Assert-GateRootNoLabel([string[]]$IcaclsLines, [string]$Retry) {
+    $label = @($IcaclsLines | Where-Object { $_ -like '*Mandatory Label\*' })
+    if ($label.Count) {
+        $shown = $label[0].Trim()
+        throw "icacls shows a mandatory label on it, '$shown', which the root must not carry; clear the label (the ML ACE in its SACL) and $Retry"
+    }
+}
+# The gate work root's security: Administrators as owner, a protected DACL of exactly SYSTEM, Administrators and the builder user $UserSid, each
+# full control inherited by objects and containers, and no mandatory label. $Sddl is Get-Acl's SDDL for the root and
+# $IcaclsLines icacls's listing of it, the only one of the two that shows a label. Throws naming what it found and the fix.
+function Assert-GateRootSecurity([string]$Sddl, [string[]]$IcaclsLines, [string]$UserSid) {
+    $retry = 'rerun -Only "Gate work root"'
+    # An owner can always rewrite the DACL, so only Administrators may own the root.
+    $owner = [regex]::Match($Sddl, '^O:(S-1(?:-\d+)+|[A-Z]{2})').Groups[1].Value
+    if ($owner -notin 'BA', 'S-1-5-32-544') { throw "its owner is $owner, not Administrators; $retry" }
+    $dacl =[regex]::Match($Sddl, 'D:(?<flags>[A-Z]*)(?<aces>(?:\([^()]*\))*)(?:S:|$)')
+    if (-not $dacl.Success) { throw "its security descriptor $Sddl holds no DACL this check can read; $retry" }
+    $flags = $dacl.Groups['flags'].Value
+    if ($flags -notmatch 'P') {
+        throw "its DACL is not protected (flags '$flags'), so it takes its parent's ACEs; $retry, whose icacls /inheritance:r protects it"
+    }
+    $wanted = @('A;OICI;FA;;;S-1-5-18', 'A;OICI;FA;;;S-1-5-32-544', "A;OICI;FA;;;$UserSid")
+    $found = @()
+    foreach ($match in [regex]::Matches($dacl.Groups['aces'].Value, '\(([^()]*)\)')) {
+        $ace = Get-GateRootAce -Body $match.Groups[1].Value -Retry $retry
+        if ($ace.Normal -notin $wanted) {
+            throw "its DACL holds $($match.Value), which is not SYSTEM, Administrators or $UserSid full control; $($ace.Fix)"
+        }
+        $found += $ace.Normal
+    }
+    foreach ($ace in $wanted) {
+        if ($ace -notin $found) { throw "its DACL lacks ($ace), full control for $($ace.Split(';')[-1]); $retry, whose icacls /grant:r adds it" }
+    }
+    Assert-GateRootNoLabel -IcaclsLines $IcaclsLines -Retry $retry
+}
+# Reads the root's security with Get-Acl and icacls and returns what Assert-GateRootSecurity finds wrong, or ''.
+function Get-GateRootSecurityProblem([string]$Root, [string]$UserSid) {
+    $sddl = (Get-Acl -LiteralPath $Root).Sddl
+    $icaclsLines = @(& icacls.exe $Root /L)
+    if ($LASTEXITCODE) { throw "icacls $Root exited $LASTEXITCODE reading its security" }
+    try {
+        Assert-GateRootSecurity -Sddl $sddl -IcaclsLines $icaclsLines -UserSid $UserSid
+        return ''
+    }
+    catch {
+        return $_.Exception.Message
+    }
+}
+# The root's owner, DACL and label are set only when the check finds them wrong, so a rerun leaves a correct tree alone.
 Invoke-Step "Gate work root $GateRoot" {
     $drive = Split-Path -Qualifier $GateRoot
     if (-not (Test-Path "$drive\")) { throw "drive $drive does not exist; the gate work root $GateRoot belongs on a Dev Drive" }
     New-Item -ItemType Directory -Force $GateRoot | Out-Null
+    Assert-GateRootNotLink -Path $GateRoot
+    $before = Get-GateRootSecurityProblem -Root $GateRoot -UserSid $userSid
+    if (-not $before) {
+        Write-InstallLog "gate work root ${GateRoot}: already protected"
+        return
+    }
+    Write-InstallLog "gate work root ${GateRoot}: $before; setting its owner and DACL"
+    # /L: icacls acts on a link itself, never its target, and the read-back below refuses a link swapped in meanwhile.
+    Assert-GateRootNotLink -Path $GateRoot
+    & icacls.exe $GateRoot /L /setowner '*S-1-5-32-544' /q | Out-Null
+    if ($LASTEXITCODE) { throw "icacls $GateRoot /setowner exited $LASTEXITCODE" }
+    # No /t: the root's children take the change by inheritance, and its protected children keep their own security.
+    & icacls.exe $GateRoot /L /inheritance:r /grant:r'*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*${userSid}:(OI)(CI)F" /q | Out-Null
+    if ($LASTEXITCODE) { throw "icacls $GateRoot /inheritance:r /grant:r exited $LASTEXITCODE" }
+    Assert-GateRootNotLink -Path $GateRoot
+    $after = Get-GateRootSecurityProblem -Root $GateRoot -UserSid $userSid
+    if ($after) { throw "gate work root ${GateRoot}: $after" }
+    Write-InstallLog "gate work root ${GateRoot}: protected DACL SYSTEM, Administrators, $User full control; no label"
 }
 
 Sync-SessionPath
