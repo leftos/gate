@@ -3648,7 +3648,7 @@ Rules:
 
 - No pure crate's API exposes `windows` or `windows-sys` types; Windows-only code sits in `cfg(windows)` modules. `proc-table` is not a pure crate: its `win32` module's API carries `windows-sys` handle and access-right types.
 - `gate-state` and `proc-table` are also ops-tower's dependencies, by one pinned git rev, so their types unify there.
-- The pure crates build with `cargo clippy` and `cargo test` on Linux in CI.
+- The pure crates are kept buildable off Windows, but nothing builds them there: the repo has no CI.
 
 ## Black-box suite harness
 
