@@ -3370,9 +3370,9 @@ During the drain a PowerShell gate neither reads `gate.exe`'s tickets nor signal
 
 ops-tower follows the flag: it reads the PowerShell gate's files until the flag exists and then `v1\`, plus the PowerShell claims of a slot whose mutex is open, and its waiters come from `gate.exe`'s tickets ([Common rules](#common-rules)). The hooks and scripts that read gate command lines or output (inventory section 4) change in the same drain.
 
-The caller sweep deletes each repo's `tools/gate.ps1` in the same change that switches that repo's docs and scripts to `gate run`; no hand-over shim is kept. Callers write `gate run --log <path> --timeout <s> --slot <kind> -- <command>` (`--stall`, `--tail`, `--no-markers`, `--local`; `gate stop-tree <pid>`), never `gate.exe` or a path. `tools/install.ps1` builds with a plain `cargo build`, not through a gate, so a broken installed gate can always be replaced.
+The caller sweep keeps each repo's `tools/gate.ps1` as the slim pass-through ([The launcher's hand-over](#the-launchers-hand-over)), so a clone on a machine without `gate.exe` still runs its commands, and switches that repo's docs and scripts to `gate run` where they call the gate directly. Those callers write `gate run --log <path> --timeout <s> --slot <kind> -- <command>` (`--stall`, `--tail`, `--no-markers`, `--local`; `gate stop-tree <pid>`), never `gate.exe` or a path. `tools/install.ps1` builds with a plain `cargo build`, not through a gate, so a broken installed gate can always be replaced.
 
-After the caller sweep there is no fallback: callers run `gate ...` on PATH, a machine without it gets "command not found", and each repo's docs name the install script. Before the sweep, the launcher's direct run on a machine without the gate is the launcher's, not `gate.exe`'s.
+A caller that runs `gate ...` on PATH gets "command not found" on a machine without it, and each repo's docs name the install script; a caller that runs the launcher gets the launcher's direct run there, not `gate.exe`'s.
 
 The compatibility layer is deleted once no caller uses `-Log`, `-TimeoutSeconds` or `-Slot`. The guard launcher stays.
 
