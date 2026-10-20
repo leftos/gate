@@ -16,9 +16,9 @@
 - [ ] GATE-563 Builder drain 2: make a routed run wait on its PC for the lift — High · Remote
 - [ ] GATE-564 Builder drain 3: gate drain on the PC, and its docs — High · Remote
 - [ ] GATE-572 Refuse routing when the builder's work drive is under a free-space floor — High · Remote
-- [/] GATE-581 Refuse a box work root that another account may write in, at the preflight and in gate check --builder — High · Remote
 - [/] GATE-584 Bound the box's git waits and end them when the PC is gone — High · Remote
 - [ ] GATE-600 Print a routed run's command tail once, not twice — High · Remote
+- [ ] GATE-592 Set up the Mac builder and time the portable .NET repos on it by hand — High · Backlog
 
 ## Remote
 
@@ -116,7 +116,6 @@
 - [ ] GATE-423 Make the desktop hand-off suite cases hold on a busy PC
 - [ ] GATE-424 Report .gate/desktop.toml and the desktop consent in gate check
 - [ ] GATE-430 Check the unverified review findings on the bun install and desktop routing code
-- [ ] GATE-431 Warn when a routed run drops a variable the repo declares its commands read
 - [ ] GATE-435 Check whether the SourceRevisionId stamp makes a routed script's builds and direct dotnet builds rebuild each other
 - [ ] GATE-437 Say when a routed run took the desktop route
 - [ ] GATE-438 Stop the elevated ssh session trusting the builder user's profile (bare pwsh, HKCU environment, cmd AutoRun)
@@ -173,6 +172,9 @@
 - [ ] GATE-590 Say an unusable sendBuild in gate check, and refuse a send when the inputs record cannot be read
 - [ ] GATE-596 Journal and file durations under the dropped command when a routed run's fallback drops --no-build
 - [ ] GATE-599 Keep the restricted routed command from planting links the elevated box follows in the work root
+- [ ] GATE-602 End a builder's ssh sessions within minutes of the PC going silent
+- [ ] GATE-603 Make the box desktop cases hold under a loaded builder (helper did not connect in time)
+- [ ] GATE-604 Keep a -name=X:/path word whole through the launcher from pwsh
 
 ## Design
 
@@ -196,7 +198,6 @@
 - [ ] GATE-595 Route to more than one builder, choosing by what each builder can run
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder
 - [ ] GATE-593 Build a gate box for a macOS builder
-- [ ] GATE-592 Set up the Mac builder and time the portable .NET repos on it by hand
 - [ ] GATE-140 End an escaped tree at the box, remote client and push kill sites
 - [ ] GATE-536 docs: Task Index row for changing the remote client
 - [ ] GATE-143 Measure whether mspdbsrv or a Framework MSBuild node leaves a gate's job
