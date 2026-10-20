@@ -12,9 +12,10 @@
 - [/] GATE-440 Map and trial routing all of herdr-gpui's, yaat-server's and agent-park's heavy work — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [!] GATE-468 Route Unreal Engine packaging to the builder with an unreal toolchain pin — High · Remote
-- [/] GATE-529 Take over or plainly refuse a builder's empty LFS folder left by a checkout before GATE-469 — High · Remote
-- [/] GATE-530 Check for the .NET Framework SDK an Unreal-pinned repo's builds need — High · Remote
-- [ ] GATE-533 Give the builder's work root the security the box's deployment prerequisites state — High · Remote
+- [ ] GATE-539 Route the itest headless group where a desktop is available — High · Remote
+- [ ] GATE-541 Bring a routed formatter's rewrites back, or refuse to route it — High · Remote
+- [ ] GATE-542 Repair a builder work folder a killed run left with an unmappable runtimeconfig.json — High · Remote
+- [ ] GATE-544 Bring back the TRX files a routed test run writes — High · Remote
 
 ## Remote
 
@@ -152,6 +153,10 @@
 - [ ] GATE-524 Match .gitattributes case-insensitively on the PC when judging a snapshot's LFS need
 - [ ] GATE-525 Keep install output from forging the box's refusal tag before the start marker
 - [ ] GATE-535 Stop the elevated builder installer from running files a routed command can write
+- [ ] GATE-540 Mirror Unreal Engine and windows-gnu/WinLibs setup into the builder installer
+- [ ] GATE-546 Strip the box's gate: prefix from a routed outputs failure line
+- [ ] GATE-547 Report or prune the box's moved-aside LFS folders
+- [ ] GATE-548 Run the netfx-sdk probe under the batch deadline and keep a failed read's reason
 
 ## Design
 
@@ -173,7 +178,9 @@
 ## Backlog
 
 - [ ] GATE-140 End an escaped tree at the box, remote client and push kill sites
+- [ ] GATE-536 docs: Task Index row for changing the remote client
 - [ ] GATE-143 Measure whether mspdbsrv or a Framework MSBuild node leaves a gate's job
+- [ ] GATE-538 Resolve a relative --log against --cd
 - [ ] GATE-144 Harden the slot marker against a same-user forger: job DACL, parent claim check, job-name squatting
 - [ ] GATE-160 gate run --burn: a capped CPU burn on a critical slot, retiring load-burn.ps1
 - [ ] GATE-162 Suite: make the remaining timer-raced interrupt and remote-client git cases load-proof
@@ -249,7 +256,6 @@
 - [ ] GATE-515 Count a git-lfs probe that does not answer as missing for an LFS run
 - [ ] GATE-516 Let a pair whose sibling cannot be listed route when no repo of it uses LFS
 - [ ] GATE-534 Map the builder's NuGet root to the PC's on the original side of a routed build's coverage mapping files
-
-## No project
-
-- [ ] GATE-536 docs: Task Index row for changing the remote client
+- [ ] GATE-549 Narrow the builder user's rights on the gate work root and audit what predates its lock-down
+- [ ] GATE-550 Find why remote_client's deduplicated-archive case aborts with no output under load
+- [ ] GATE-551 Find why a lent auto run misses its seeded history under load
