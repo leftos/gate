@@ -1461,13 +1461,13 @@ pub fn wait_until_closed(path: &Path) {
 /// The payload of a `gate box run` of `command` for the work folder `key`, as the remote client sends it, laid out as
 /// the client lays out a builder's root: under the case folder's `remote` folder, the bare repository `<key>.git`, the
 /// work folder `work\<key>` with its lock and index beside it, and the `outputs` folder. A job name unique to the case
-/// and the key, its 12-hex nonce ending in the run's number `0000`, and a 32-hex outputs nonce, unique the same way and
-/// ending in the same `0000`.
+/// run and the key ([`job_unique`]), its 12-hex nonce ending in the run's number `0000`, and a 32-hex outputs nonce,
+/// unique the same way and ending in the same `0000`.
 pub fn box_payload(case: &Case, key: &str, command: &[&str]) -> Value {
     let remote = case.folder().join("remote");
     let path = |name: String| remote.join(name).to_str().expect("the case folder is Unicode").to_owned();
     let work = path(format!(r"work\{key}"));
-    let unique = format!("{:04x}{:04x}", process::id() & 0xffff, case.number & 0xffff);
+    let unique = job_unique(process::id(), suite_started(), case.number);
     json!({
         "Key": key,
         "Bare": path(format!("{key}.git")),
@@ -1488,6 +1488,52 @@ pub fn box_payload(case: &Case, key: &str, command: &[&str]) -> Value {
         "Nonce": format!("{unique}{}0000", "0".repeat(20)),
         "OutputsFull": false,
     })
+}
+
+/// When this suite process first built a box payload, in nanoseconds since the Unix epoch: with the full pid, it tells
+/// this process from an earlier one Windows gave the same pid, whose box may still hold its stop event.
+fn suite_started() -> u128 {
+    static STARTED: OnceLock<u128> = OnceLock::new();
+    *STARTED.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is past the Unix epoch")
+            .as_nanos()
+    })
+}
+
+/// The 8 hex digits that make a box payload's job name and nonce unique to one case run: a hash of the suite process's
+/// full pid, its start `started` and the case's `number`. The box's job nonce is 12 hex digits whose last 4 are the
+/// run's number, so 8 are left, too few to hold the pid and the case number whole.
+fn job_unique(pid: u32, started: u128, number: u64) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    (pid, started, number).hash(&mut hasher);
+    format!("{:08x}", hasher.finish() & 0xffff_ffff)
+}
+
+#[test]
+fn box_payloads_of_two_cases_or_two_processes_sharing_a_pids_low_bits_have_different_jobs() {
+    let (first, second) = (Case::new("box-payload-job-first"), Case::new("box-payload-job-second"));
+    let job = |case: &Case| box_payload(case, "k", &["x"])["Job"].as_str().expect("the job is text").to_owned();
+    assert_ne!(job(&first), job(&second), "two cases of one process");
+    assert_eq!(
+        job(&first),
+        format!(r"Local\gate-remote-k-{}0000", job_unique(process::id(), suite_started(), first.number)),
+        "a payload's job is named from the full pid, the suite's start and the case's number"
+    );
+
+    let started = suite_started();
+    assert_ne!(
+        job_unique(0x0001_2434, started, 0),
+        job_unique(0x0002_2434, started, 0),
+        "two processes whose pids share the low 16 bits, each in its first case"
+    );
+    assert_ne!(
+        job_unique(0x2434, started, 0),
+        job_unique(0x2434, started + 1, 0),
+        "one pid reused by a later process"
+    );
 }
 
 /// The unique part of the case's own desktop namespace and lock, which the box's `--test-box-desktop-mutex` takes: the

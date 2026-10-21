@@ -672,9 +672,21 @@ fn orphaned(case: &Case, inner: &[&str], release: &Path) -> (Running, Orphan) {
 
 /// [`orphaned`], the outer gate taking a slot of `outer_kind`.
 pub(crate) fn orphaned_as(case: &Case, outer_kind: &str, inner: &[&str], release: &Path) -> (Running, Orphan) {
+    orphaned_by(case, outer_kind, inner, release, None)
+}
+
+/// [`orphaned_as`], the covered gate's stderr sent to the file `stderr` when there is one, where a case reads what it
+/// says while it runs: its log takes its own lines only at its end, and the outer gate's pipe it would inherit is gone
+/// with the parent.
+fn orphaned_by(case: &Case, outer_kind: &str, inner: &[&str], release: &Path, stderr: Option<&Path>) -> (Running, Orphan) {
     let pid_file = case.folder().join("inner.pid");
     let (pid_text, release_text) = (shown(&pid_file), shown(release));
-    let mut command = vec![FAKE_TOOL, "spawn-pid", &pid_text, &release_text, GATE];
+    let stderr_text = stderr.map(shown);
+    let mut command = match &stderr_text {
+        Some(stderr_text) => vec![FAKE_TOOL, "spawn-pid-err", stderr_text.as_str()],
+        None => vec![FAKE_TOOL, "spawn-pid"],
+    };
+    command.extend([pid_text.as_str(), release_text.as_str(), GATE]);
     command.extend(inner);
     let mut extra = Vec::new();
     if outer_kind == "critical" {
@@ -735,13 +747,35 @@ fn takers_but(case: &Case, but: u32) -> Vec<u64> {
 
 /// Waits until the file at `path` holds a line containing `needle`, and returns that line.
 fn line_with(path: &Path, needle: &str) -> String {
+    line_with_unless_ended(path, needle, || false)
+}
+
+/// [`line_with`], failing at once when `ended` says the process that writes the file has ended without writing the
+/// line. `ended` is asked before the file is read, so a line written just before the end is still found. A missing
+/// file holds no line yet; any other failure to read it fails the case. The bytes are read as UTF-8 with U+FFFD for a
+/// character torn by a write still under way.
+fn line_with_unless_ended(path: &Path, needle: &str, ended: impl Fn() -> bool) -> String {
     let found = || {
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|text| text.lines().find(|line| line.contains(needle)).map(str::to_owned))
+        let bytes = match fs::read(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (None, String::new()),
+            read => read.expect("a file a case waits on can be read"),
+        };
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        (text.lines().find(|line| line.contains(needle)).map(str::to_owned), text)
     };
-    wait_until(&format!("a line with {needle:?} in {}", path.display()), || found().is_some());
-    found().expect("checked above")
+    let mut line = None;
+    wait_until(&format!("a line with {needle:?} in {}", path.display()), || {
+        let had_ended = ended();
+        let (found, text) = found();
+        assert!(
+            found.is_some() || !had_ended,
+            "it ended without writing {needle:?} to {}:\n{text}",
+            path.display()
+        );
+        line = found;
+        line.is_some()
+    });
+    line.expect("checked above")
 }
 
 #[test]
@@ -1192,11 +1226,12 @@ fn a_covered_gate_waits_for_a_slot_without_pausing_its_command() {
     let release = case.folder().join("outer.release");
     let go_text = shown(&go);
     let inner = run_words("inner.log", &LOOK_OFTEN, &[FAKE_TOOL, "chatter", &go_text]);
-    let (outer, orphan) = orphaned(&case, &inner, &release);
+    let stderr = case.folder().join("inner.stderr");
+    let (outer, orphan) = orphaned_by(&case, "heavy", &inner, &release, Some(&stderr));
 
     let outer_pid = end_parent(outer, &release);
-    wait_until("the covered gate queueing for a light slot", || has_tickets(&case));
     let log = case.folder().join("inner.log");
+    wait_until_said(&orphan, &stderr, WAITING_FOR_THE_LIGHT_SLOT);
     let queued_size = size(&log);
     wait_until("the covered gate's command writing on as the gate waits", || size(&log) > queued_size);
     assert_eq!(events_of(&case, orphan.pid), ["covered"], "no take while the one light slot is held");
@@ -1211,11 +1246,23 @@ fn a_covered_gate_waits_for_a_slot_without_pausing_its_command() {
     let_go(&go);
     assert_eq!(orphan.ended(), 0);
     assert_eq!(events_of(&case, orphan.pid), ["covered", "take", "release"]);
+    let order = [parent_ended_line(outer_pid, "light"), WAITING_FOR_THE_LIGHT_SLOT.to_owned()];
+    let order: Vec<&str> = order.iter().map(String::as_str).collect();
+    let said = fs::read_to_string(&stderr).expect("the covered gate's stderr can be read");
+    assert_in_order(&said, &order);
     let inner_log = fs::read_to_string(&log).expect("the covered gate wrote its log");
-    assert_in_order(
-        &inner_log,
-        &[&parent_ended_line(outer_pid, "light"), "gate: waiting for a light slot (1 busy)"],
-    );
+    assert_in_order(&inner_log, &order);
+}
+
+/// What a covered gate that finds the one light slot held says, once.
+const WAITING_FOR_THE_LIGHT_SLOT: &str = "gate: waiting for a light slot (1 busy)";
+
+/// Returns once the covered gate `orphan` has said `line` on its stderr, sent to the file `stderr`; fails at once when
+/// the gate ended without saying it. A ticket shows only that the gate queued: a gate held back before its first pass
+/// finds the slot free once the holder lets go, and rightly says nothing, so a case that needs the gate to have found
+/// the slot held waits for the line that says so.
+fn wait_until_said(orphan: &Orphan, stderr: &Path, line: &str) {
+    line_with_unless_ended(stderr, line, || orphan.has_ended());
 }
 
 #[test]
@@ -1230,10 +1277,11 @@ fn a_covered_gate_whose_command_ends_while_waiting_says_nothing_more() {
     // A still-waiting line is due on every pass of the wait, so a pass after the command's end would say one.
     let seams = ["--test-sample-ms", "100", "--test-poll-ms", "20", "--test-heartbeat-ms", "1"];
     let inner = run_words("inner.log", &seams, &[FAKE_TOOL, "wait", &go_text]);
-    let (outer, orphan) = orphaned(&case, &inner, &release);
+    let stderr = case.folder().join("inner.stderr");
+    let (outer, orphan) = orphaned_by(&case, "heavy", &inner, &release, Some(&stderr));
 
     let outer_pid = end_parent(outer, &release);
-    wait_until("the covered gate queueing for a light slot", || has_tickets(&case));
+    wait_until_said(&orphan, &stderr, WAITING_FOR_THE_LIGHT_SLOT);
     let_go(&go);
     assert_eq!(orphan.ended(), 0);
 
@@ -1242,10 +1290,7 @@ fn a_covered_gate_whose_command_ends_while_waiting_says_nothing_more() {
     assert_eq!(claimant(&case, KernelObject::LightSlot(0)), holder.id(), "only the holder claims a slot");
     assert_eq!(covered_files(&case), Vec::<String>::new(), "the covered marker goes with the run");
     let inner_log = fs::read_to_string(case.folder().join("inner.log")).expect("the covered gate wrote its log");
-    assert_in_order(
-        &inner_log,
-        &[&parent_ended_line(outer_pid, "light"), "gate: waiting for a light slot (1 busy)"],
-    );
+    assert_in_order(&inner_log, &[&parent_ended_line(outer_pid, "light"), WAITING_FOR_THE_LIGHT_SLOT]);
     let (waiting, ended) = inner_log.split_once("gate: passed in").expect("the covered gate passed");
     assert!(
         !waiting.contains("gate: interrupted") && !waiting.contains("gate: took"),

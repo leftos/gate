@@ -12,7 +12,9 @@
 //! `spawn-pid <path> <release> <program> [words]` starts the program with those words and this process's handles,
 //! writes its pid to the file at the path, whole, through a file beside it moved over it, prints `spawned <its pid>`,
 //! and goes on holding the program's handle until the file at the release path comes, so the program's parent outlives
-//! the case's own opening of it; `exit <n>` exits with status n, any 32-bit code, negative ones as Windows reads them back;
+//! the case's own opening of it; `spawn-pid-err <err-path> <path> <release> <program> [words]` does the same with the
+//! program's stderr sent to a file it creates at the err path; `exit <n>` exits with status n, any 32-bit code,
+//! negative ones as Windows reads them back;
 //! `env <name>` prints the variable's value, or `fake-tool: <name> is not set`, on its own line; `bytes <hex>` writes the
 //! bytes the hex digits spell to stdout as they are, with no line feed added; `lines <n> <text>` prints n lines on
 //! stdout, the i-th `<text><i>` counting from 1; `pid` prints `pid <its own pid>` on stdout; `session` prints
@@ -152,8 +154,8 @@ fn run(args: &[OsString]) -> Result<i32, String> {
                 stdout.flush().map_err(|error| write_failed(&error))?;
                 spawn_orphan(&operand(&mut steps, "spawn-orphan")?)?;
             }
-            "spawn-pid" => {
-                spawn_pid(&mut steps, &mut stdout)?;
+            name @ ("spawn-pid" | "spawn-pid-err") => {
+                spawn_pid(name, &mut steps, &mut stdout)?;
                 break;
             }
             "exit" => {
@@ -490,15 +492,21 @@ fn spawn_wait(path: &str) -> Result<u32, String> {
 /// The `spawn-pid` step: starts the program it names with the words after it and this process's handles, writes its pid
 /// to the file it names, prints `spawned <its pid>`, then holds the program's handle until the release file comes. The
 /// program's parent is this process until then, so its pid cannot be taken by another process before a case opens it.
-fn spawn_pid<'a>(steps: &mut impl Iterator<Item = &'a OsString>, stdout: &mut impl Write) -> Result<(), String> {
-    let pid_path = operand(steps, "spawn-pid")?;
-    let release = operand(steps, "spawn-pid")?;
-    let program = operand(steps, "spawn-pid")?;
+/// The step is `name`; as `spawn-pid-err`, its first operand is a path where the program's stderr goes, to a file
+/// created there, so a case can read what the program says on it while it runs, after this process's own stderr is gone.
+fn spawn_pid<'a>(name: &str, steps: &mut impl Iterator<Item = &'a OsString>, stdout: &mut impl Write) -> Result<(), String> {
+    let err_path = if name == "spawn-pid-err" { Some(operand(steps, name)?) } else { None };
+    let pid_path = operand(steps, name)?;
+    let release = operand(steps, name)?;
+    let program = operand(steps, name)?;
     let words: Vec<OsString> = steps.by_ref().cloned().collect();
-    let child = Command::new(program.as_str())
-        .args(&words)
-        .spawn()
-        .map_err(|error| format!("cannot start {program}: {error}"))?;
+    let mut command = Command::new(program.as_str());
+    command.args(&words);
+    if let Some(err_path) = &err_path {
+        let file = std::fs::File::create(err_path).map_err(|error| format!("cannot create {err_path}: {error}"))?;
+        command.stderr(file);
+    }
+    let child = command.spawn().map_err(|error| format!("cannot start {program}: {error}"))?;
     let pid = child.id();
     write_whole(&pid_path, &pid.to_string())?;
     writeln!(stdout, "spawned {pid}").map_err(|error| write_failed(&error))?;

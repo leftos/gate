@@ -425,13 +425,14 @@ impl LineSplitter {
 #[cfg(test)]
 mod tests {
     use std::fs::File;
-    use std::io::{self, PipeWriter, Read, Write};
+    use std::io::{self, PipeReader, PipeWriter, Read, Write};
     use std::os::windows::io::{AsRawHandle, OwnedHandle};
     use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::sync::{Arc, Mutex, PoisonError, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
     use windows_sys::Win32::System::Threading::{ResumeThread, SuspendThread};
 
     use super::{Behind, ClientGone, Forwarder, Forwarders, LineSplitter, OutputLock, Stream};
@@ -545,8 +546,9 @@ mod tests {
     /// The guard the case gives [`Forwarders::drain_within`] in place of [`super::HANG_GUARD`].
     const GUARD: Duration = Duration::from_secs(1);
 
-    /// How often the guard case's stand-in writes a line, keeping the reader it holds busy past the guard.
-    const KEEP_WRITING: Duration = Duration::from_millis(20);
+    /// The longest the guard case waits for its reader to hold the line it read, and then for its drain to return: it
+    /// never runs out unless the reader never reads the line or the drain waits for it past the guard.
+    const HOLDS_LINE_GUARD: Duration = Duration::from_secs(300);
 
     /// How long the starved case keeps its reader suspended, so the read the kernel completed for it is not picked up
     /// before the drain looks.
@@ -619,37 +621,58 @@ mod tests {
     #[expect(clippy::expect_used, reason = "a test whose pipe or thread cannot be made must fail loudly")]
     fn a_reader_kept_behind_past_the_hang_guard_is_stopped_not_waited_for_forever() {
         let (reader, mut writer) = io::pipe().expect("the pipe is made");
+        let peek = reader.try_clone().expect("the pipe's read end can be shared");
         let lock = OutputLock::default();
-        // Held for the whole drain, so the reader read its first line and waits to write it: it never finishes.
+        // Held for the whole drain, so the reader, once it has read the line, waits to write it: it never finishes.
         let held = lock.lock().unwrap_or_else(PoisonError::into_inner);
-        let stop = Arc::new(AtomicBool::new(false));
-        let writing = {
-            let stop = Arc::clone(&stop);
-            thread::spawn(move || {
-                while !stop.load(Ordering::SeqCst) {
-                    if writer.write_all(b"more\n").is_err() {
-                        break;
-                    }
-                    thread::sleep(KEEP_WRITING);
-                }
-            })
-        };
+        // The write end stays open until the drain is over, as a process still running holds it.
+        writer.write_all(b"more\n").expect("the line is written");
         let pipe = File::from(OwnedHandle::from(reader));
         let forwarders = Forwarders::start_each([(pipe, Stream::Err)], "the test's", &lock, &ClientGone::default()).expect("the reader starts");
+        // A reader not yet past its read is not behind but in its read, which the drain cancels after the limit: the
+        // case drains only once the reader holds the line, read out of the pipe (a failed read takes nothing from it),
+        // and waits to write it.
+        let holding = Instant::now() + HOLDS_LINE_GUARD;
+        while !(forwarders.behind[0].in_flight.load(Ordering::SeqCst) && bytes_waiting(&peek) == 0) {
+            assert!(!forwarders.behind[0].thread.is_finished(), "the reader ended before holding the line");
+            assert!(Instant::now() < holding, "the reader reads the line and holds it");
+            thread::sleep(Duration::from_millis(10));
+        }
+        // The drain runs on a thread of its own, so a drain that waited for the reader forever fails the case rather
+        // than hanging it.
+        let (finished, verdict) = mpsc::channel();
         let started = Instant::now();
+        thread::spawn(move || {
+            let drained = forwarders.drain_within(LIMIT, GUARD);
+            let _ = finished.send((drained.all_ended, started.elapsed()));
+        });
+        let (all_ended, elapsed) = verdict.recv_timeout(HOLDS_LINE_GUARD).expect("the guard ends the drain");
 
-        let drained = forwarders.drain_within(LIMIT, GUARD);
-
-        let elapsed = started.elapsed();
-        stop.store(true, Ordering::SeqCst);
-        writing.join().expect("the writer does not panic");
+        drop(writer);
         drop(held);
-        assert!(!drained.all_ended, "a reader kept behind past the guard is stopped with its bytes unread");
+        assert!(!all_ended, "a reader kept behind past the guard is stopped with its bytes unread");
         assert!(
             elapsed >= GUARD,
             "the drain waits for a reader that is behind until the guard passes: {elapsed:?}"
         );
-        assert!(elapsed < Duration::from_secs(10), "the guard ends the wait, not the reader: {elapsed:?}");
+    }
+
+    /// How many bytes the pipe whose read end `peek` shares holds unread.
+    fn bytes_waiting(peek: &PipeReader) -> u32 {
+        let mut available = 0_u32;
+        // SAFETY: `peek`'s handle is open for the whole call, which reads no data and writes only `available`.
+        let peeked = unsafe {
+            PeekNamedPipe(
+                peek.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &raw mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(peeked, 0, "the pipe can be peeked: {}", io::Error::last_os_error());
+        available
     }
 
     /// How many readers each drain of the start-up case judges: they start together, so its first look finds several

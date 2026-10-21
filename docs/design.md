@@ -3915,6 +3915,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `Running::kill` kills the pid alone and leaves the command running, for the abandoned-claim cases. Output readers are joined with a deadline, so a grandchild holding the pipes cannot hang the suite. A run's `Outcome` carries `raw_stdout`, the bytes as the gate wrote them, beside the decoded text.
 - **Holding and killing a gate.** A case holds a run with a real command, `fake-tool wait <go>`, and lets it go by creating `<go>`. A case that kills a gate lets its command go and waits until the command's log is closed (`support::wait_until_closed`), since the job has no kill-on-close. `support::run_words(log, extra, command)` builds the words of a light run.
+- **Box payloads name their own job.** `support::box_payload` gives each case's `gate box run` payload a `Job` name and nonces whose unique part is `support::job_unique`: a hash of the suite process's full pid, the suite's start time and the case's number, since the box's 12-hex job nonce ends in the run's number and leaves 8 digits, too few to hold the pid and case number whole. Two cases, or a process that reuses an earlier one's pid or shares its low 16 bits, never share a job whose stop event an earlier box may still hold.
 - **Ordering, never elapsed time.** A case asserts the order of events in the journal and the log (a waiter's `take` after the holder's `release`, a heartbeat line before the inner gate's take, a kill line before the exit), never a wall-clock bound a busy machine could cross. A case's own deadline only guards against a hang and is generous.
 - **Injected clock.** The watchdog arithmetic is unit-tested in `gate-watchdog` with an injected clock and scripted samples, not through the binary.
 - **Fake process trees.** A small helper executable, `fake-tool`, is built only with the `test-seams` feature.
@@ -3932,6 +3933,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   - `spawn-wait <path>` starts `fake-tool wait <path>` with the caller's handles, prints `spawned <pid>` and does not wait.
   - `spawn-orphan <path>` runs `fake-tool spawn-wait <path>` as a child, waits for it to end, then continues with its next step, so the waiting helper is left without a parent and its `spawned <pid>` line is the up signal.
   - `spawn-pid <pidfile> <release-path> <program> [words]` starts the program with those words and the caller's handles, writes its pid to the pidfile, prints `spawned <pid>` and holds the program's handle until the release path exists, so the pid cannot be reused while a case opens it as the parent of a `gate burn`. It ends the steps: nothing after it runs.
+  - `spawn-pid-err <err-path> <pidfile> <release-path> <program> [words]` is `spawn-pid` with the program's stderr sent to a file created at `<err-path>`, so a case reads what the program says while it runs (the nesting cases read a covered gate's stderr there, since its log takes its own lines only at its end and the outer gate's pipe is gone with the parent).
 
   It is copied under the names the gate classifies (`VBCSCompiler.exe`, `dotnet.exe`, `MSBuild.exe`).
 
