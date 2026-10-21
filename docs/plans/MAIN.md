@@ -4,22 +4,17 @@
 
 ## Do first
 
-- [ ] GATE-668 Keep the watchdog's CPU sampler from failing on a reading that overflows — Urgent · Local gate
+- [ ] GATE-675 Make the sampler-failed parent pause case hold when its child's wait line comes late — Urgent · Local gate
 - [ ] GATE-595 Route to more than one builder, choosing by what each builder can run — Urgent · Remote
-- [/] GATE-609 Try the next capable builder before falling back to the PC — Urgent · Remote
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [/] GATE-607 Unix gate box: version, preflight, boot, run, stop — Urgent · Remote
 - [ ] GATE-592 Set up the Mac builder and time the portable .NET repos on it by hand — Urgent · Remote
-- [/] GATE-631 Make box_run_a_node_modules_junction_installs_again hold under a loaded parallel run — Urgent · Remote
 - [ ] GATE-255 Suite: three cases ended with exit 1 and no output mid-run, and a box-kill case failed under load — Urgent · Backlog
-- [ ] GATE-366 Find why a between-two-fetches outputs case hung its last run on a busy PC — Urgent · Backlog
-- [/] GATE-551 Find why a lent auto run misses its seeded history under load — Urgent · Backlog
 - [ ] GATE-641 Keep a first launch of freshly built binaries from looking stalled while a scanner loads them — High · Local gate
 - [ ] GATE-616 Move the box's shared wire rules into gate-wire so both boxes say the same bytes — High · Remote
 - [ ] GATE-615 Tie the Unix box's job record to its process group leader's start time — High · Remote
 - [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root — High · Remote
 - [ ] GATE-648 Restore pnpm, bun and npm packages on the Unix box, as the Windows box does — High · Remote
-- [ ] GATE-657 Install Homebrew and FFmpeg on a macOS builder in install-macos.sh — High · Remote
 - [ ] GATE-574 Take the work lock in the box preflight and stamp the lock's time on each run — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
@@ -41,6 +36,7 @@
 - [ ] GATE-649 Bring back every test project's output a routed dotnet test build made — High · Remote
 - [ ] GATE-650 Fall back when a builder's box program is missing (ssh status 126/127) — High · Remote
 - [ ] GATE-653 Route towercab-3d's cargo commands: the snapshot lacks its gitignored dist/ and converter exe — High · Remote
+- [ ] GATE-669 Re-add yaat-server routing and run its trial now YAAT-646 is fixed — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Local gate
@@ -54,6 +50,9 @@
 - [ ] GATE-663 Keep the Unix box's preflight from racing a run's git lock sweep on the same key
 - [ ] GATE-666 Let the Unix box's stop reach a run between two steps with a stop marker
 - [ ] GATE-667 Keep the Unix box's stop under the client's stop limit when it follows several groups
+- [ ] GATE-672 Harden what the Unix box's command inherits: PATH entries, descriptors, umask, signals, PWD
+- [ ] GATE-673 Settle how the Unix box reports a command that never started or ended oddly
+- [ ] GATE-674 Make gate check's missing-ffmpeg hint name the admin Homebrew run on a macOS builder
 - [ ] GATE-432 Harden the push script's registration run and helper rollback
 - [ ] GATE-429 Measure which Task Scheduler call frees its string argument, and quote the desktop task's command
 - [ ] GATE-618 Turn off auto gc in the box's shared bare repositories
@@ -325,3 +324,5 @@
 - [ ] GATE-646 Start the box's ceiling clock before the command is resumed
 - [ ] GATE-661 Let the no-build git listing take the git drain seam
 - [ ] GATE-665 Give the no-build and snapshot worktree placements the placing drain
+- [ ] GATE-670 Let a Ctrl+C end the routing decision's and gate check's placement call during its long drain
+- [ ] GATE-671 Bound the job process list's buffer before allocating it, and keep a box stop waiting through a failed list read
