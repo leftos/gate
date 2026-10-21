@@ -10,6 +10,11 @@ doctest = false
 [lints]
 workspace = true
 
+[features]
+# Says so in the version text, as `+seams`, so a build with the test seams never matches the exact version of the clean
+# build it is installed beside. Forwarded by every crate whose own `test-seams` feature is the gate's.
+test-seams = []
+
 [dependencies]
 base64 = "0.23.1"
 gate-args = { path = "../gate-args" }

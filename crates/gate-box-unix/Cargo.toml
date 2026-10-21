@@ -16,7 +16,7 @@ workspace = true
 
 [features]
 # Builds the box with `gate-args`' hidden `--test-*` seams, read before the verb.
-test-seams = ["gate-args/test-seams"]
+test-seams = ["gate-args/test-seams", "gate-wire/test-seams"]
 
 [dependencies]
 gate-args = { path = "../gate-args" }

@@ -9,7 +9,9 @@ use std::process::{Command, Stdio};
 
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
-use crate::support::{Case, DenyEntry, FAKE_TOOL, Outcome, finish, names, shown, start, version_of, wait_for_journal_line, wait_until_closed};
+use crate::support::{
+    Case, DenyEntry, FAKE_TOOL, Outcome, finish, git, git_init, junction, names, shown, start, version_of, wait_for_journal_line, wait_until_closed,
+};
 
 /// `tools/install.ps1`, the script under test: a checked-in file a case runs.
 fn script() -> PathBuf {
@@ -1038,4 +1040,482 @@ fn a_new_helper_beside_the_same_gate_replaces_only_the_helper() {
     assert_same_bytes(&installed_gate(&case), &first);
     assert_same_bytes(&installed_helper(&case), &new_helper);
     assert!(aside_copies(&case).is_empty(), "gate.exe was not moved aside: {:?}", aside_copies(&case));
+}
+
+/// Makes the case folder the scratch repository a `-Source` case records, holding one commit of `file` with `text`.
+fn commit_a_file(case: &Case, file: &str, text: &str) {
+    git_init(case);
+    commit_changed_file(case, file, text);
+}
+
+/// Writes `file` with `text` and commits it in the case folder's scratch repository, so the tree is clean again.
+fn commit_changed_file(case: &Case, file: &str, text: &str) {
+    fs::write(case.folder().join(file), text).expect("the tracked file can be written");
+    git(case, &["add", "--", file]);
+    git(case, &["commit", "--quiet", "-m", "a commit of the source tree"]);
+}
+
+/// The `source.json` a case's install folder holds, parsed, and the text it was written as.
+fn source_json(case: &Case) -> (serde_json::Value, String) {
+    let text = fs::read_to_string(install_dir(case).join("source.json")).expect("the source record can be read");
+    let record = serde_json::from_str(&text).expect("the source record is one JSON object");
+    (record, text)
+}
+
+#[test]
+fn an_exe_install_with_source_records_the_commit_and_build_id() {
+    let case = Case::new("an_exe_install_with_source_records_the_commit_and_build_id");
+    let key = EnvironmentKey::new("an_exe_install_with_source_records_the_commit_and_build_id");
+    commit_a_file(&case, "notes.txt", "the tracked file\n");
+    let head = git(&case, &["rev-parse", "HEAD"]);
+    let short = git(&case, &["rev-parse", "--short=12", "HEAD"]);
+    let exe = copy_gate(&case, "gate-a.exe");
+    let source = shown(&case.folder());
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&exe), "-Source", &source]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    let (record, text) = source_json(&case);
+    assert_eq!(record["repoRoot"].as_str(), Some(source.as_str()), "{text}");
+    assert_eq!(record["commit"].as_str(), Some(head.as_str()), "{text}");
+    assert_eq!(record["buildId"].as_str(), Some(short.as_str()), "{text}");
+    assert_eq!(record["dirty"].as_bool(), Some(false), "{text}");
+    let keys: Vec<&str> = record
+        .as_object()
+        .expect("the record is one JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, ["repoRoot", "commit", "buildId", "dirty"], "the four keys, in this order: {text}");
+    assert!(text.starts_with(r#"{"repoRoot":"#), "the record opens with the repo folder: {text}");
+    assert!(text.ends_with("}\n"), "the record ends with one LF after its object: {text}");
+    assert!(!text.starts_with('\u{feff}'), "the record is written without a byte order mark: {text}");
+    assert!(!text.contains('\r'), "the record is one line, ended with LF and no CR: {text}");
+}
+
+#[test]
+fn a_dirty_source_tree_is_recorded_as_dirty() {
+    let case = Case::new("a_dirty_source_tree_is_recorded_as_dirty");
+    let key = EnvironmentKey::new("a_dirty_source_tree_is_recorded_as_dirty");
+    commit_a_file(&case, "notes.txt", "the tracked file\n");
+    let short = git(&case, &["rev-parse", "--short=12", "HEAD"]);
+    // A tracked file changed after the commit: the build is of no commit alone, and its id and the record say so.
+    fs::write(case.folder().join("notes.txt"), "changed after the commit\n").expect("the tracked file can be changed");
+    let exe = copy_gate(&case, "gate-a.exe");
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&exe), "-Source", &shown(&case.folder())]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let (record, text) = source_json(&case);
+    let dirty = format!("{short}-dirty.");
+    let id = record["buildId"].as_str().expect("the record names a build id");
+    assert!(id.starts_with(&dirty), "a changed tree names a build of its own: {text}");
+    assert_eq!(
+        id.len(),
+        dirty.len() + 8,
+        "the build id, `-dirty.` and 8 hex of the changed bytes' hash: {text}"
+    );
+    assert!(
+        id.bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.'),
+        "the id is lowercase hex, a `-` and a `.`: {text}"
+    );
+    assert_eq!(record["dirty"].as_bool(), Some(true), "the record says the tree was changed: {text}");
+}
+
+#[test]
+fn an_exe_install_without_a_source_removes_the_record() {
+    let case = Case::new("an_exe_install_without_a_source_removes_the_record");
+    let key = EnvironmentKey::new("an_exe_install_without_a_source_removes_the_record");
+    commit_a_file(&case, "notes.txt", "the tracked file\n");
+    let exe = copy_gate(&case, "gate-a.exe");
+    let first = install(&case, &key, &["-Exe", &shown(&exe), "-Source", &shown(&case.folder())]);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let record = install_dir(&case).join("source.json");
+    assert!(record.exists(), "the source is recorded: {first:?}");
+
+    let second = install(&case, &key, &["-Exe", &shown(&exe)]);
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert_eq!(second.stderr, "", "{second:?}");
+    assert!(!record.exists(), "a prebuilt exe names no source, so no record is left: {second:?}");
+}
+
+#[test]
+fn install_whatif_leaves_the_source_record_as_it_was() {
+    let case = Case::new("install_whatif_leaves_the_source_record_as_it_was");
+    let key = EnvironmentKey::new("install_whatif_leaves_the_source_record_as_it_was");
+    commit_a_file(&case, "notes.txt", "the tracked file\n");
+    let exe = copy_gate(&case, "gate-a.exe");
+    let first = install(&case, &key, &["-Exe", &shown(&exe), "-Source", &shown(&case.folder())]);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let record = install_dir(&case).join("source.json");
+    let before = fs::read(&record).expect("the record can be read");
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&exe), "-WhatIf"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(fs::read(&record).expect("the record can still be read"), before, "nothing was rewritten");
+    assert!(
+        unix(&outcome.stdout).contains(&format!(
+            "What if: Performing the operation \"Delete\" on target \"{}\".\n",
+            shown(&record)
+        )),
+        "the delete a real run would take is listed: {outcome:?}"
+    );
+}
+
+#[test]
+fn source_without_exe_is_refused() {
+    let case = Case::new("source_without_exe_is_refused");
+    let key = EnvironmentKey::new("source_without_exe_is_refused");
+    commit_a_file(&case, "notes.txt", "the tracked file\n");
+
+    let outcome = finish(bare_install_command(&case, &key, &["-Source", &shown(&case.folder())]));
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(unix(&outcome.stderr), "install: -Source is given only with -Exe\n", "{outcome:?}");
+    assert!(!install_dir(&case).exists(), "nothing was changed: {outcome:?}");
+}
+
+/// A folder where `source.json` goes, holding a file, so neither a write of the record nor a delete of it can take it:
+/// the record's name holds a folder its rename cannot replace and its file delete cannot remove.
+fn a_folder_at_the_record(case: &Case) -> PathBuf {
+    let record = install_dir(case).join("source.json");
+    fs::create_dir_all(&record).expect("the folder at the record's name can be made");
+    fs::write(record.join("a file"), "left here\n").expect("the file in it can be written");
+    record
+}
+
+#[test]
+fn source_that_is_not_a_git_work_tree_is_refused() {
+    let case = Case::new("source_that_is_not_a_git_work_tree_is_refused");
+    let key = EnvironmentKey::new("source_that_is_not_a_git_work_tree_is_refused");
+    let exe = copy_gate(&case, "gate-a.exe");
+    let missing = case.folder().join("no-such-folder");
+    // A folder naming a git folder of its own that is no repository: git refuses to read a commit there, so the install
+    // would have no commit and no build id to record.
+    let broken = case.folder().join("not-a-tree");
+    fs::create_dir_all(&broken).expect("the folder can be made");
+    fs::write(broken.join(".git"), "gitdir: nowhere\n").expect("the git marker can be written");
+    // A plain folder that is in a work tree without being its root: its commit is the tree's, not its own.
+    let inner = case.folder().join("inner");
+    fs::create_dir_all(&inner).expect("the inner folder can be made");
+
+    for source in [&missing, &broken, &inner] {
+        let outcome = install(&case, &key, &["-Exe", &shown(&exe), "-Source", &shown(source)]);
+
+        assert_eq!(outcome.code, Some(1), "{outcome:?}");
+        assert_eq!(outcome.stdout, "", "{outcome:?}");
+        assert_eq!(
+            unix(&outcome.stderr),
+            format!("install: -Source {} is not a git work tree\n", shown(source)),
+            "{outcome:?}"
+        );
+        assert!(!install_dir(&case).exists(), "nothing was changed: {outcome:?}");
+    }
+}
+
+/// The install script with `args` and the desktop helper at `helper`, run as a pwsh command under a shell that turns a
+/// native command's non-zero exit into a terminating error, as a caller's profile may: `git diff --quiet` exits 1 to say
+/// the tree differs, and the installer must read that status rather than be stopped by it.
+fn install_command_under_native_errors(case: &Case, key: &EnvironmentKey, helper: &Path, args: &[&str]) -> Command {
+    let mut line = format!(
+        "$PSNativeCommandUseErrorActionPreference = $true; & '{}' -EnvironmentKey '{}' -HelperExe '{}'",
+        shown(&script()),
+        key.0,
+        shown(helper)
+    );
+    for arg in args {
+        // A parameter's name is a bare word, never a quoted one: only the value after it is quoted, so a path stays one
+        // word and the name still binds.
+        line.push(' ');
+        if arg.starts_with('-') {
+            line.push_str(arg);
+        } else {
+            line.push('\'');
+            line.push_str(arg);
+            line.push('\'');
+        }
+    }
+    let mut command = Command::new("pwsh");
+    case.prepare_without_state_dir(&mut command, &["-NoProfile", "-Command", &line]);
+    command
+}
+
+#[test]
+fn a_dirty_tree_read_under_native_command_errors_still_records_its_source() {
+    let case = Case::new("a_dirty_tree_read_under_native_command_errors_still_records_its_source");
+    let key = EnvironmentKey::new("a_dirty_tree_read_under_native_command_errors_still_records_its_source");
+    commit_a_file(&case, "notes.txt", "the tracked file\n");
+    let head = git(&case, &["rev-parse", "HEAD"]);
+    fs::write(case.folder().join("notes.txt"), "changed after the commit\n").expect("the tracked file can be changed");
+    let exe = copy_gate(&case, "gate-a.exe");
+
+    let outcome = finish(install_command_under_native_errors(
+        &case,
+        &key,
+        &default_helper(&case),
+        &["-Exe", &shown(&exe), "-Source", &shown(&case.folder())],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    let (record, text) = source_json(&case);
+    assert_eq!(record["commit"].as_str(), Some(head.as_str()), "{text}");
+    assert_eq!(record["dirty"].as_bool(), Some(true), "a changed tree is still recorded as dirty: {text}");
+}
+
+#[test]
+fn source_through_a_junction_and_a_trailing_separator_is_accepted() {
+    let case = Case::new("source_through_a_junction_and_a_trailing_separator_is_accepted");
+    let key = EnvironmentKey::new("source_through_a_junction_and_a_trailing_separator_is_accepted");
+    commit_a_file(&case, "notes.txt", "the tracked file\n");
+    let head = git(&case, &["rev-parse", "HEAD"]);
+    let exe = copy_gate(&case, "gate-a.exe");
+    let link = case.folder().join("link");
+    junction(&link, &case.folder());
+    let trailing = format!("{}\\", shown(&case.folder()));
+
+    for source in [shown(&link), trailing] {
+        let outcome = install(&case, &key, &["-Exe", &shown(&exe), "-Source", &source]);
+
+        assert_eq!(outcome.code, Some(0), "{source}: {outcome:?}");
+        assert_eq!(outcome.stderr, "", "{source}: {outcome:?}");
+        let (record, text) = source_json(&case);
+        let written = record["repoRoot"].as_str().expect("the record names its folder");
+        assert_eq!(written.trim_end_matches('\\'), source.trim_end_matches('\\'), "{source}: {text}");
+        assert_eq!(record["commit"].as_str(), Some(head.as_str()), "{source}: {text}");
+    }
+}
+
+#[test]
+fn source_in_a_repository_with_no_commits_is_refused() {
+    let case = Case::new("source_in_a_repository_with_no_commits_is_refused");
+    let key = EnvironmentKey::new("source_in_a_repository_with_no_commits_is_refused");
+    let exe = copy_gate(&case, "gate-a.exe");
+    let empty = case.folder().join("empty");
+    fs::create_dir_all(&empty).expect("the folder can be made");
+    git(&case, &["-C", &shown(&empty), "init", "--quiet"]);
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&exe), "-Source", &shown(&empty)]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(outcome.stdout, "", "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        format!("install: -Source {} has no commits yet\n", shown(&empty)),
+        "{outcome:?}"
+    );
+    assert!(!install_dir(&case).exists(), "nothing was changed: {outcome:?}");
+}
+
+#[test]
+fn install_whatif_of_a_gate_that_does_not_answer_lists_the_record_delete() {
+    let case = Case::new("install_whatif_of_a_gate_that_does_not_answer_lists_the_record_delete");
+    let key = EnvironmentKey::new("install_whatif_of_a_gate_that_does_not_answer_lists_the_record_delete");
+    commit_a_file(&case, "notes.txt", "the tracked file\n");
+    let exe = copy_gate(&case, "gate-a.exe");
+    let source = shown(&case.folder());
+    let first = install(&case, &key, &["-Exe", &shown(&exe), "-Source", &source]);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let record = install_dir(&case).join("source.json");
+    let before = fs::read(&record).expect("the record can be read");
+    // The installed gate cannot start, so the record a real run would leave is no record at all.
+    let denied = DenyEntry::new(&install_dir(&case), NO_RUNNING_IN);
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&exe), "-Source", &source, "-WhatIf"]);
+
+    drop(denied);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        unix(&outcome.stdout).contains(&format!(
+            "What if: Performing the operation \"Delete\" on target \"{}\".\n",
+            shown(&record)
+        )),
+        "the delete a real run would take is listed, not a write: {outcome:?}"
+    );
+    assert_eq!(
+        fs::read(&record).expect("the record can still be read"),
+        before,
+        "nothing was removed: {outcome:?}"
+    );
+}
+
+#[test]
+fn install_whatif_of_an_exe_that_does_not_answer_lists_the_record_write() {
+    let case = Case::new("install_whatif_of_an_exe_that_does_not_answer_lists_the_record_write");
+    let key = EnvironmentKey::new("install_whatif_of_an_exe_that_does_not_answer_lists_the_record_write");
+    commit_a_file(&case, "notes.txt", "the tracked file\n");
+    let exe = copy_gate(&case, "gate-a.exe");
+    let source = shown(&case.folder());
+    let first = install(&case, &key, &["-Exe", &shown(&exe), "-Source", &source]);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let record = install_dir(&case).join("source.json");
+    let before = fs::read(&record).expect("the record can be read");
+    // An -Exe whose version cannot be read stops a real run before the record step, so the only record action a
+    // preview can name is the one a real run that gets there takes: a write.
+    let not_a_gate = stand_in_helper(&case, "not-a-gate.exe", b"not a gate");
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&not_a_gate), "-Source", &source, "-WhatIf"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let stdout = unix(&outcome.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "What if: Performing the operation \"Write\" on target \"{}\".\n",
+            shown(&record)
+        )),
+        "the write a real run would take is listed: {outcome:?}"
+    );
+    assert!(
+        !stdout.contains(&format!(
+            "What if: Performing the operation \"Delete\" on target \"{}\".\n",
+            shown(&record)
+        )),
+        "no delete of the record is listed: {outcome:?}"
+    );
+    assert_eq!(
+        fs::read(&record).expect("the record can still be read"),
+        before,
+        "nothing was rewritten: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_refused_source_leaves_the_record_as_it_was() {
+    let case = Case::new("a_refused_source_leaves_the_record_as_it_was");
+    let key = EnvironmentKey::new("a_refused_source_leaves_the_record_as_it_was");
+    commit_a_file(&case, "notes.txt", "the tracked file\n");
+    let exe = copy_gate(&case, "gate-a.exe");
+    let first = install(&case, &key, &["-Exe", &shown(&exe), "-Source", &shown(&case.folder())]);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let record = install_dir(&case).join("source.json");
+    let before = fs::read(&record).expect("the record can be read");
+    let inner = case.folder().join("inner");
+    fs::create_dir_all(&inner).expect("the inner folder can be made");
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&exe), "-Source", &shown(&inner)]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        format!("install: -Source {} is not a git work tree\n", shown(&inner)),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        fs::read(&record).expect("the record can still be read"),
+        before,
+        "the refused install removed nothing: {outcome:?}"
+    );
+}
+
+#[test]
+fn an_install_whose_gate_does_not_answer_removes_the_record() {
+    let case = Case::new("an_install_whose_gate_does_not_answer_removes_the_record");
+    let key = EnvironmentKey::new("an_install_whose_gate_does_not_answer_removes_the_record");
+    commit_a_file(&case, "notes.txt", "the tracked file\n");
+    let exe = copy_gate(&case, "gate-a.exe");
+    let source = shown(&case.folder());
+    let first = install(&case, &key, &["-Exe", &shown(&exe), "-Source", &source]);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let record = install_dir(&case).join("source.json");
+    assert!(record.exists(), "the source is recorded: {first:?}");
+    // Nothing put in the install folder can start, though it can still be read, so the installed gate answers nothing
+    // while its bytes are the same ones it was installed with.
+    let denied = DenyEntry::new(&install_dir(&case), NO_RUNNING_IN);
+
+    let second = install(&case, &key, &["-Exe", &shown(&exe), "-Source", &source]);
+
+    drop(denied);
+    assert_eq!(second.code, Some(0), "the install keeps its own outcome: {second:?}");
+    assert!(!record.exists(), "a gate that does not answer keeps no record: {second:?}");
+    assert_eq!(
+        unix(&second.stderr),
+        format!("install: the installed gate does not answer --version; removed {}\n", shown(&record)),
+        "{second:?}"
+    );
+}
+
+#[test]
+fn a_source_record_that_cannot_be_written_fails_the_install() {
+    let case = Case::new("a_source_record_that_cannot_be_written_fails_the_install");
+    let key = EnvironmentKey::new("a_source_record_that_cannot_be_written_fails_the_install");
+    commit_a_file(&case, "notes.txt", "the tracked file\n");
+    let exe = copy_gate(&case, "gate-a.exe");
+    let record = a_folder_at_the_record(&case);
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&exe), "-Source", &shown(&case.folder())]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(unix(&outcome.stderr).lines().count(), 1, "the failure is one line: {outcome:?}");
+    assert!(
+        unix(&outcome.stderr).starts_with(&format!("install: could not write {}: ", shown(&record))),
+        "{outcome:?}"
+    );
+    assert_same_bytes(&installed_gate(&case), &exe);
+    assert_eq!(
+        path_value(&key),
+        Some(("ExpandString".to_owned(), shown(&install_dir(&case)))),
+        "the gate is installed and on the PATH before the record is tried: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_source_record_that_cannot_be_removed_fails_the_install() {
+    let case = Case::new("a_source_record_that_cannot_be_removed_fails_the_install");
+    let key = EnvironmentKey::new("a_source_record_that_cannot_be_removed_fails_the_install");
+    let exe = copy_gate(&case, "gate-a.exe");
+    let record = a_folder_at_the_record(&case);
+
+    let outcome = install(&case, &key, &["-Exe", &shown(&exe)]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(
+        unix(&outcome.stdout).contains("install: installed gate "),
+        "the gate was installed first: {outcome:?}"
+    );
+    assert!(
+        unix(&outcome.stderr).starts_with(&format!("install: could not remove {}: ", shown(&record))),
+        "{outcome:?}"
+    );
+    assert_same_bytes(&installed_gate(&case), &exe);
+    assert_eq!(
+        path_value(&key),
+        Some(("ExpandString".to_owned(), shown(&install_dir(&case)))),
+        "the gate is on the PATH before the record is tried: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_second_install_with_a_source_records_the_new_commit() {
+    let case = Case::new("a_second_install_with_a_source_records_the_new_commit");
+    let key = EnvironmentKey::new("a_second_install_with_a_source_records_the_new_commit");
+    commit_a_file(&case, "notes.txt", "the tracked file\n");
+    let first_commit = git(&case, &["rev-parse", "HEAD"]);
+    let exe = copy_gate(&case, "gate-a.exe");
+    let source = shown(&case.folder());
+    let first = install(&case, &key, &["-Exe", &shown(&exe), "-Source", &source]);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(
+        source_json(&case).0["commit"].as_str(),
+        Some(first_commit.as_str()),
+        "the first install records the first commit"
+    );
+
+    commit_changed_file(&case, "notes.txt", "the tracked file, committed again\n");
+    let second_commit = git(&case, &["rev-parse", "HEAD"]);
+    let again = install(&case, &key, &["-Exe", &shown(&exe), "-Source", &source]);
+
+    assert_eq!(again.code, Some(0), "{again:?}");
+    assert_eq!(again.stderr, "", "{again:?}");
+    assert_ne!(first_commit, second_commit, "the scratch repository has a second commit");
+    let (record, text) = source_json(&case);
+    assert_eq!(
+        record["commit"].as_str(),
+        Some(second_commit.as_str()),
+        "the same files installed again record the commit they would now be built from: {text}"
+    );
 }

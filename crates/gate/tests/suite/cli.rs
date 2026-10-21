@@ -17,10 +17,25 @@ fn version_names_the_package_version_and_the_build() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stderr, "", "{outcome:?}");
-    // A test build carries no `GATE_BUILD_ID`, so this is the package version and the `+dev` build, never a literal id.
+    // A test build carries no `GATE_BUILD_ID`, so this is the package version and the `+dev` build, and it has the
+    // `test-seams` feature, so it ends `+seams`: never a literal id.
     assert!(
         outcome.stdout.starts_with(&format!("gate {}+", env!("CARGO_PKG_VERSION"))),
         "the version is the package version and the build: {outcome:?}"
+    );
+}
+
+/// The suite's gate is built with the `test-seams` feature, which it says in its version, so it can never pass the exact
+/// version match a clean build's push, routing or preflight compares against.
+#[test]
+fn version_names_the_test_seams_the_suite_is_built_with() {
+    let outcome = Case::new("version_names_the_test_seams_the_suite_is_built_with").run(&["--version"]);
+
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        outcome.stdout.ends_with("+seams\n"),
+        "the suite's build says it has the seams: {outcome:?}"
     );
 }
 

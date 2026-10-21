@@ -10,7 +10,7 @@ workspace = true
 [features]
 # The hidden `--test-*` flags, the `fake-tool` helper and the stand-in desktop helper the black-box suite needs; an
 # installed gate is built without. The stand-in runs `gate-desktop`'s own code, so its seams come on too.
-test-seams = ["gate-args/test-seams", "gate-win32/test-seams", "gate-desktop/test-seams"]
+test-seams = ["gate-args/test-seams", "gate-win32/test-seams", "gate-desktop/test-seams", "gate-wire/test-seams"]
 
 [dependencies]
 base64 = "0.23.1"

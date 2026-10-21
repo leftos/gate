@@ -20,13 +20,19 @@ use serde_json::{Map, Value};
 const BUILD_ID: Option<&str> = option_env!("GATE_BUILD_ID");
 
 /// The version this build names itself by: `<package version>+<build id>` for a build `tools/install.ps1` made, else
-/// `<package version>+dev`. Two builds of one package version are told apart by the id, so a builder running another
-/// build of it is refused as one running another version, and a hand-built `+dev` compares equal only to another `+dev`.
-/// The gate, its desktop helper and every box name themselves by it.
+/// `<package version>+dev`, and `+seams` after either for a build with the `test-seams` feature, as `SEAMS` says. Two builds
+/// of one package version are told apart by the id, so a builder running another build of it is refused as one running
+/// another version, and a hand-built `+dev` compares equal only to another `+dev`. The gate, its desktop helper and every
+/// box name themselves by it.
 #[must_use]
 pub fn build_version() -> String {
-    version_text(BUILD_ID)
+    version_text(BUILD_ID) + SEAMS
 }
+
+/// `+seams` for a build with this crate's `test-seams` feature, nothing for one without it: a build with the test seams
+/// installed beside a clean one of the same commit and id is another version, so the exact match of a push, a routing
+/// and a box's own preflight refuses it.
+const SEAMS: &str = if cfg!(feature = "test-seams") { "+seams" } else { "" };
 
 /// The version a build with the id `id` names itself by: `<package version>+<id>`, or `<package version>+dev` for no
 /// id or an empty one.
@@ -1314,6 +1320,19 @@ mod tests {
     #[test]
     fn no_build_id_is_dev() {
         assert_eq!(version_text(None), format!("{}+dev", env!("CARGO_PKG_VERSION")));
+    }
+
+    /// A build with the test seams says so at the end of its version, and one without them never does, so a seams build
+    /// is another version from the clean build it may be installed beside.
+    #[test]
+    fn the_version_names_the_seams_only_a_build_with_them_has() {
+        let version = super::build_version();
+
+        if cfg!(feature = "test-seams") {
+            assert!(version.ends_with("+seams"), "a seams build says so: {version}");
+        } else {
+            assert!(!version.contains("seams"), "a build without the seams never says so: {version}");
+        }
     }
 
     /// `git-lfs version` answers `git-lfs/<x.y.z> (...)`; the version is the one after the slash, never the go or git

@@ -3689,6 +3689,15 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   For the exe already in place it prints `install: gate <version> already installed at <path>` and a Delete line for each aside copy a real run would delete, when the installed gate answers `--version`. The helper is listed too.
 
   `-Exe` (install a prebuilt exe, skipping the build), `-HelperExe` (the prebuilt helper; each is given only with the other, else `install: -Exe and -HelperExe are given together or not at all`, and a missing or unreadable one is `install: no desktop helper at '<path>'` or `install: could not read the desktop helper at '<path>': <message>`), `-EnvironmentKey` (the registry key the PATH entry lives in) and `-PrintBuild` (prints the build's cargo arguments on one line and exits 0) exist for the suite, which runs the script against a temporary `LOCALAPPDATA` and registry key.
+- The script records which commit the installed gate was built from in `%LOCALAPPDATA%\gate\bin\source.json`, one JSON object and one LF in UTF-8 without a byte order mark: `{"repoRoot":"<abs path>","commit":"<40 hex>","buildId":"<id>","dirty":true|false}`. `commit`, `buildId` and `dirty` come from one read of HEAD, the id being the first 12 hex of the full sha.
+
+  The record is written or removed only for an install that happened under `push.lock` (or found the files already installed), and only once the installed gate answers `--version`, using that answer, never a second call. A gate that does not answer gets the record removed, with `install: the installed gate does not answer --version; removed <path>`.
+
+  A leftover `source.json.<pid>.tmp` from a killed run is removed first; the write goes through a temp file and a move. A write or removal that fails leaves the gate installed and the PATH entry added, prints `install: could not write <path>: <message>` or `install: could not remove <path>: <message>` and exits 1.
+
+  `-Source <folder>` (the suite's; given only with `-Exe`, else `install: -Source is given only with -Exe`) names the work tree the record describes in place of the script's own. It must be the root of a git work tree (a junction to one or a trailing separator is accepted); a subfolder or a non-repo is refused with `install: -Source <folder> is not a git work tree`, a repo with no commits with `install: -Source <folder> has no commits yet`, each exit 1 with nothing changed.
+
+  `-WhatIf` lists `What if: Performing the operation "Write" on target "<bin>\source.json".`, or `"Delete"` when the files are already installed and the installed gate does not answer, and writes and deletes nothing. The script sets `$PSNativeCommandUseErrorActionPreference = $false`, so a caller profile's `$true` does not turn git's exit 1 into a throw.
 - Every install deletes a leftover `remote-bridge.ps1` file in the install folder, which no gate starts. When it cannot, it prints `install: cannot remove the old remote-bridge.ps1 (<reason>); it is unused` on stderr and carries on with exit 0; a folder at that name is left alone.
 - The script installs locally only. `gate push` copies the installed gate.exe and the desktop helper to each builder in `remote.json` (`host`, then `hosts`), into the builder's `C:\Program Files\gate\bin` with the same rename-aside, and registers the desktop task there on every push, so a machine with builders runs `pwsh tools/install.ps1` and then `gate push` ([`gate push`](#gate-push)).
 
@@ -3697,7 +3706,9 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
 ### Build id
 
-`gate --version` prints `gate <package version>+<build id>`, and the box preflight's `gate: remote version` line says the same text. The id is the 12-hex head commit, or `<12-hex>-dirty.<8-hex>` for a build of changed tracked files, the 8 hex being the first 8 of the SHA-256 of `git diff HEAD --binary`. Untracked files do not count.
+`gate --version` prints `gate <package version>+<build id>`, and the box preflight's `gate: remote version` line says the same text. The id is the text between the first `+` and the next `+` or the end: the 12-hex head commit, or `<12-hex>-dirty.<8-hex>` for a build of changed tracked files, the 8 hex being the first 8 of the SHA-256 of `git diff HEAD --binary`. Untracked files do not count.
+
+A build with the `test-seams` feature (the suite's) ends its version text with `+seams` after the id or after `dev`: `gate 0.1.0+dev+seams`, `0.1.0+<12hex>+seams`, `0.1.0+<12hex>-dirty.<8hex>+seams`. Everything that shows or compares the version, `gate --version` and the box's `gate: remote version` line included, shows it, so a seams build never equals the clean build installed beside it.
 
 `tools/install.ps1` works the id out and sets `GATE_BUILD_ID` for its release build only, running git with `--no-optional-locks`. An empty id removes any `GATE_BUILD_ID` the caller had set, so the build never takes an outer one. The build runs with the launcher's `-Local`, so it is never routed to a builder.
 

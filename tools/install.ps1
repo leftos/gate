@@ -23,8 +23,10 @@
     runs for a later install; an install that ends with no gate.exe that answers keeps every one. It then adds
     %LOCALAPPDATA%\gate\bin to the user's PATH when it is missing, by reading and writing the raw Path value of the
     user environment registry key, which keeps that value's kind and its unexpanded %NAME% entries, and tells the
-    running windows the environment changed. It never touches the state root's files. Run with -WhatIf to list every
-    step without taking it.
+    running windows the environment changed. Once the installed gate.exe answers, it records the commit and build id the
+    gate was built from in source.json beside it, or removes the record an earlier install left when this install's gate
+    was built from no commit, and it never touches the state root's files. Run with -WhatIf to list every step without
+    taking it.
 
 .PARAMETER Exe
     Installs this prebuilt executable instead of building one; the build is skipped. Given only with -HelperExe. For
@@ -32,6 +34,10 @@
 
 .PARAMETER HelperExe
     Installs this prebuilt desktop helper beside the -Exe executable. Given only with -Exe. For tests only.
+
+.PARAMETER Source
+    Records the folder's commit and build id in source.json, as a build in that folder would, instead of those of a
+    build this install makes. Given only with -Exe. For tests only.
 
 .PARAMETER EnvironmentKey
     The user environment registry key the PATH entry is read from and written to, HKCU:\Environment by default. For
@@ -48,12 +54,16 @@
 param(
     [string]$Exe,
     [string]$HelperExe,
+    [string]$Source,
     [string]$EnvironmentKey = 'HKCU:\Environment',
     [switch]$PrintBuild
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# A native command's status is the installer's to read: a caller's $true must not turn git's `diff --quiet` exit 1, how
+# it says the tree differs from the commit, into a throw.
+$PSNativeCommandUseErrorActionPreference = $false
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
@@ -104,13 +114,14 @@ function Get-GateVersion {
     return $Matches[1]
 }
 
-# The first 8 hex of the SHA-256 of what `git diff HEAD --binary` writes in $Root, hashed as the bytes git writes them;
-# $null when git cannot be run or fails.
+# The first 8 hex of the SHA-256 of what `git diff <Commit> --binary` writes in $Root, hashed as the bytes git writes
+# them: the changed bytes of the tree against the commit already read, so the dirty part describes that commit and no
+# other; $null when git cannot be run or fails.
 function Get-DiffHash {
-    param([string]$Root)
+    param([string]$Root, [string]$Commit)
 
     $start = [Diagnostics.ProcessStartInfo]::new('git')
-    foreach ($arg in '--no-optional-locks', '-C', $Root, 'diff', 'HEAD', '--binary') { $start.ArgumentList.Add($arg) }
+    foreach ($arg in '--no-optional-locks', '-C', $Root, 'diff', '--binary', $Commit, '--') { $start.ArgumentList.Add($arg) }
     $start.UseShellExecute = $false
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
@@ -139,28 +150,51 @@ function Get-DiffHash {
     return -join ($digest[0..3] | ForEach-Object { $_.ToString('x2') })
 }
 
-# The commit this build is being made from, as `gate --version` names it: `git rev-parse --short=12 HEAD`, with
-# `-dirty.<hash>` added when tracked files differ, <hash> the first 8 hex of the SHA-256 of `git diff HEAD --binary`, so a
-# build of a dirty tree is told apart from a build of its commit and from a build of other changes to it. Git runs with
-# --no-optional-locks, so reading the tree never takes the index lock. $null when git cannot be run here or any of its
-# calls fails, which builds a gate that names no commit and so says `+dev`.
-function Get-BuildId {
+# The tree the gate this install places is built from, from one read of HEAD, so the commit source.json records and the
+# build id gate --version names always describe the same commit: Commit, the full SHA `git rev-parse HEAD` gives, and
+# BuildId, that same sha's `rev-parse --short=12` form with `-dirty.<hash>` added when the tree differs from it, <hash>
+# the first 8 hex of the SHA-256 of `git diff <sha> --binary`, so a build of a dirty tree is told apart from a build of
+# its commit and from a build of other changes to it. The dirty check and the hash both name the sha already read, never
+# HEAD again. Git runs with --no-optional-locks, so reading the tree never takes the index lock. $null when git cannot be
+# run here or any of its calls fails, which builds a gate that names no commit and so says `+dev`.
+function Get-BuildSource {
     param([string]$Root)
 
     try {
-        $head = & git --no-optional-locks -C $Root rev-parse --short=12 HEAD 2>$null
+        $head = & git --no-optional-locks -C $Root rev-parse HEAD 2>$null
         if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$head)) { return $null }
-        $dirty = & git --no-optional-locks -C $Root status --porcelain --untracked-files=no 2>$null
-        if ($LASTEXITCODE -ne 0) { return $null }
+        $commit = ([string]$head).Trim()
+        $short = & git --no-optional-locks -C $Root rev-parse --short=12 $commit 2>$null
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$short)) { return $null }
+        & git --no-optional-locks -C $Root diff --quiet $commit -- 2>$null
+        $changed = $LASTEXITCODE
     }
     catch {
         return $null
     }
-    $id = ([string]$head).Trim()
-    if ([string]::IsNullOrWhiteSpace([string]$dirty)) { return $id }
-    $hash = Get-DiffHash -Root $Root
+    $id = ([string]$short).Trim()
+    if ($changed -eq 0) { return @{ Commit = $commit; BuildId = $id } }
+    if ($changed -ne 1) { return $null }
+    $hash = Get-DiffHash -Root $Root -Commit $commit
     if ($null -eq $hash) { return $null }
-    return "$id-dirty.$hash"
+    return @{ Commit = $commit; BuildId = "$id-dirty.$hash" }
+}
+
+# Whether $Root is the root of a git work tree, as -Source must name: `rev-parse --is-inside-work-tree` says yes from
+# anywhere in a tree, and `--show-prefix` says how far below its root the folder is, which is nothing at all only at the
+# root itself. Git resolves the folder it was given, so a junction to a root and a path with a trailing separator are
+# accepted as the root they name.
+function Test-WorkTreeRoot {
+    param([string]$Root)
+
+    try {
+        $said = @(& git --no-optional-locks -C $Root rev-parse --is-inside-work-tree --show-prefix 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $said.Count -ne 2) { return $false }
+    }
+    catch {
+        return $false
+    }
+    return ([string]$said[0] -eq 'true') -and [string]::IsNullOrEmpty([string]$said[1])
 }
 
 # The arguments the release build gives cargo: gate.exe and its desktop helper in one call, with their default features
@@ -255,6 +289,96 @@ function Remove-AsideCopy {
             }
         }
     }
+}
+
+# Removes the record at $Path, when one is there: a gate built from no commit names no source, a prebuilt exe names
+# none, and a gate that does not answer --version cannot be trusted to name one, which -NotAnswering says. Returns
+# $false when it could not be removed, with the line why on standard error.
+function Remove-SourceJson {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([string]$Path, [switch]$NotAnswering)
+
+    if (-not (Test-Path -LiteralPath $Path)) { return $true }
+    if (-not $PSCmdlet.ShouldProcess($Path, 'Delete')) { return $true }
+    try {
+        # A file delete, never Remove-Item: a folder at the record's name fails here, where Remove-Item would ask
+        # whether to remove its children.
+        [IO.File]::Delete($Path)
+    }
+    catch {
+        Write-InstallError "install: could not remove ${Path}: $($_.Exception.Message)"
+        return $false
+    }
+    if ($NotAnswering) {
+        Write-InstallError "install: the installed gate does not answer --version; removed $Path"
+    }
+    return $true
+}
+
+# Removes the source.json temps in $Dir that a run killed between its write and its rename left behind, so no earlier
+# run's record is read back instead of this one's and the folder never holds more than the one this run writes. Each is
+# tried on its own: one that cannot be removed is noted at verbose and the rest still go.
+function Remove-LeftoverSourceTemp {
+    param([string]$Dir)
+
+    try {
+        $leftovers = [IO.Directory]::GetFiles($Dir, 'source.json.*.tmp')
+    }
+    catch {
+        Write-Verbose "The leftover record temps in ${Dir} could not be listed: $($_.Exception.Message)"
+        return
+    }
+    foreach ($leftover in $leftovers) {
+        try {
+            [IO.File]::Delete($leftover)
+        }
+        catch {
+            Write-Verbose "A leftover record temp, ${leftover}, could not be removed: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Records where the installed gate was built from beside it, in source.json, the one file gate push reads to know which
+# commit to send to a macOS builder: one JSON object naming the repo folder the build ran in, the full commit, the exact
+# build id cargo was given and whether tracked files were changed, which the id's `-dirty.` says. It is written as
+# source.json.<pid>.tmp and renamed over source.json, so a reader never sees half a record, and a temp a killed run left
+# behind goes before a new one is written. An empty $Commit or $BuildId removes the record instead, as
+# Remove-SourceJson does. Returns $false when the record could not be written or removed, with the line why on standard
+# error; the caller decides when to stop.
+function Set-SourceJson {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([string]$Dir, [string]$Root, [string]$Commit, [string]$BuildId, [switch]$NotAnswering)
+
+    $path = Join-Path $Dir 'source.json'
+    if ([string]::IsNullOrEmpty($Commit) -or [string]::IsNullOrEmpty($BuildId)) {
+        return Remove-SourceJson -Path $path -NotAnswering:$NotAnswering -WhatIf:$WhatIfPreference
+    }
+    if (-not $PSCmdlet.ShouldProcess($path, 'Write')) { return $true }
+    Remove-LeftoverSourceTemp -Dir $Dir
+    $record = [ordered]@{
+        repoRoot = $Root
+        commit = $Commit
+        buildId = $BuildId
+        dirty = $BuildId.Contains('-dirty.', [StringComparison]::Ordinal)
+    }
+    $temp = Join-Path $Dir "source.json.$PID.tmp"
+    try {
+        [IO.File]::WriteAllText($temp, ($record | ConvertTo-Json -Compress) + "`n", [Text.UTF8Encoding]::new($false))
+        [IO.File]::Move($temp, $path, $true)
+    }
+    catch {
+        Write-InstallError "install: could not write ${path}: $($_.Exception.Message)"
+        if (Test-Path -LiteralPath $temp) {
+            try {
+                [IO.File]::Delete($temp)
+            }
+            catch {
+                Write-InstallError "install: could not remove ${temp}: $($_.Exception.Message)"
+            }
+        }
+        return $false
+    }
+    return $true
 }
 
 # Adds GateFile, the interop the install's file checks use, once per run, and exits 1 when it cannot be added, as in
@@ -613,6 +737,11 @@ if ([string]::IsNullOrEmpty($Exe) -ne [string]::IsNullOrEmpty($HelperExe)) {
     exit 1
 }
 
+if ((-not [string]::IsNullOrEmpty($Source)) -and [string]::IsNullOrEmpty($Exe)) {
+    Write-InstallError 'install: -Source is given only with -Exe'
+    exit 1
+}
+
 if ($PrintBuild) {
     Write-Output ((Get-BuildArguments) -join ' ')
     exit 0
@@ -630,8 +759,11 @@ $helperDest = Join-Path $installDir 'gate-desktop-helper.exe'
 if ([string]::IsNullOrEmpty($Exe)) {
     $built = Join-Path $repoRoot 'target\release\gate.exe'
     $builtHelper = Join-Path $repoRoot 'target\release\gate-desktop-helper.exe'
+    # Read before the preview decides, so a -WhatIf run lists the source.json a real run would write.
+    $sourceRoot = $repoRoot
+    $buildSource = Get-BuildSource -Root $repoRoot
+    $buildId = if ($null -eq $buildSource) { $null } else { $buildSource.BuildId }
     if ($PSCmdlet.ShouldProcess($repoRoot, "cargo $((Get-BuildArguments) -join ' ')")) {
-        $buildId = Get-BuildId -Root $repoRoot
         if ($null -eq $buildId) {
             Write-InstallError 'install: git could not say which commit this is or what changed in it; building a gate whose version ends +dev'
         }
@@ -666,6 +798,34 @@ else {
         Write-InstallError "install: no desktop helper at '$HelperExe'"
         exit 1
     }
+    # A prebuilt exe names no commit, so an -Exe install records no source and removes the record an earlier install
+    # left. -Source names the folder a test build would have run in, whose commit and build id are recorded instead. It
+    # must be the root of a git work tree, since only there is its commit the tree's own: a folder that cannot be
+    # resolved, that git calls something other than a tree's top, or whose HEAD names no commit, names no source, and is
+    # refused rather than left to remove the record.
+    if ([string]::IsNullOrEmpty($Source)) {
+        $sourceRoot = $null
+        $buildSource = $null
+    }
+    else {
+        $sourceRoot = $null
+        try {
+            $resolved = (Resolve-Path -LiteralPath $Source -ErrorAction Stop).ProviderPath
+            if (Test-WorkTreeRoot -Root $resolved) { $sourceRoot = $resolved }
+        }
+        catch {
+            Write-Verbose "The -Source folder $Source could not be resolved: $($_.Exception.Message)"
+        }
+        if ($null -eq $sourceRoot) {
+            Write-InstallError "install: -Source $Source is not a git work tree"
+            exit 1
+        }
+        $buildSource = Get-BuildSource -Root $sourceRoot
+        if ($null -eq $buildSource) {
+            Write-InstallError "install: -Source $sourceRoot has no commits yet"
+            exit 1
+        }
+    }
 }
 
 # A helper built with its test seams is never installed. A -WhatIf run that would build checks none: nothing is built in
@@ -693,6 +853,9 @@ $same = $false
 $sameGate = $false
 $sameHelper = $false
 $previewSame = $false
+# Whether the installed gate.exe answered --version on this run, read once on each path and shared with the record step
+# below, which never asks the gate again.
+$answered = $false
 $withHelper = " with its desktop helper at $helperDest"
 if ($WhatIfPreference -and ($null -ne $newVersion)) {
     try {
@@ -708,7 +871,8 @@ try {
         # The preview of an install of the files already in place, decided without the lock, since it changes nothing
         # but the aside copies a real run deletes once the installed gate answers.
         Write-Output "install: gate $newVersion already installed at $dest$withHelper"
-        if ($null -ne (Get-GateVersion $dest)) { Remove-AsideCopy -Dir $installDir -WhatIf }
+        $answered = $null -ne (Get-GateVersion $dest)
+        if ($answered) { Remove-AsideCopy -Dir $installDir -WhatIf }
     }
     else {
         # Both installs are asked for, so -WhatIf lists the helper's and gate.exe's.
@@ -740,7 +904,8 @@ try {
     # Declined or -WhatIf, the lock is not held and nothing is installed.
     if ($same) {
         Write-Output "install: gate $newVersion already installed at $dest$withHelper"
-        if ($null -ne (Get-GateVersion $dest)) { Remove-AsideCopy -Dir $installDir }
+        $answered = $null -ne (Get-GateVersion $dest)
+        if ($answered) { Remove-AsideCopy -Dir $installDir }
     }
     elseif ($null -ne $lock) {
         # The helper is placed first; one that cannot be is put back as it was, and gate.exe is not touched.
@@ -797,8 +962,10 @@ try {
                     -Own $swap.Own -Helper $helperSwap
             }
         }
-        # A gate.exe kept as it was is asked too: the aside copies go only once the installed gate answers.
-        if ((-not $sameGate) -or ($null -ne (Get-GateVersion $dest))) {
+        # A gate.exe kept as it was is asked too: the aside copies go only once the installed gate answers, and a
+        # gate.exe placed just above answered already, or the previous one would have been put back.
+        $answered = if ($sameGate) { $null -ne (Get-GateVersion $dest) } else { $true }
+        if ($answered) {
             Remove-AsideCopy -Dir $installDir -Keep $gateAside, $helperAside
         }
         if ($sameGate) {
@@ -808,6 +975,26 @@ try {
             if ($null -ne $oldVersion) { Write-Output "install: replaced gate $oldVersion" }
             Write-Output "install: installed gate $newVersion at $dest$withHelper"
         }
+    }
+
+    # The record gate push reads to know which commit the installed gate was built from, beside it, written only for an
+    # install that happened under push.lock, or for the files already installed under it, and only while the installed
+    # gate answers --version: a gate that does not answer, an -Exe install with no source and a `+dev` build all name no
+    # source, so any record an earlier install left goes. An install declined with -Confirm keeps the record as it was,
+    # and a -WhatIf run lists the step and takes none. The gate is never asked again here: $answered is the answer the
+    # install's own path already read.
+    $recordFailed = $false
+    if ($WhatIfPreference -or ($null -ne $lock)) {
+        # A -WhatIf run names the action a real run would take: for the files already installed, the one the installed
+        # gate's answer decides; otherwise a write, since a real run reaches this step only with a gate that answered (an
+        # -Exe that does not answer stops it first, and a gate.exe placed that does not answer is put back). A real run
+        # uses the answer its own path already read.
+        $answering = if ($WhatIfPreference -and (-not $previewSame)) { $true } else { $answered }
+        $keepSource = $answering -and ($null -ne $buildSource)
+        $sourceCommit = if ($keepSource) { $buildSource.Commit } else { $null }
+        $sourceBuildId = if ($keepSource) { $buildSource.BuildId } else { $null }
+        $recordFailed = -not (Set-SourceJson -Dir $installDir -Root $sourceRoot -Commit $sourceCommit `
+            -BuildId $sourceBuildId -NotAnswering:(-not $answering) -WhatIf:$WhatIfPreference)
     }
 
     # The remote.ps1 bridge script an earlier install put beside gate.exe, which no gate starts any more. One that cannot
@@ -823,6 +1010,10 @@ try {
     }
 
     Add-UserPath -Folder $installDir -Key $EnvironmentKey -WhatIf:$WhatIfPreference
+
+    # A record that could not be written or removed fails the install here, after the PATH step, so a gate this run
+    # installed is still on the PATH; the line why was said above.
+    if ($recordFailed) { exit 1 }
 }
 finally {
     if ($null -ne $lock) { $lock.Dispose() }

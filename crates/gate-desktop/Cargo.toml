@@ -16,7 +16,7 @@ workspace = true
 # one step of its run to break; `GATE_DESKTOP_TEST_RECORD`, which names a file it adds each child's pid to; and
 # `GATE_DESKTOP_TEST_INPUT_DESKTOP`, which names the input desktop in place of the one it reads. It also turns on
 # gate-win32's own test seams. An installed helper is built without.
-test-seams = ["gate-win32/test-seams"]
+test-seams = ["gate-win32/test-seams", "gate-wire/test-seams"]
 
 [dependencies]
 base64 = "0.23.1"
