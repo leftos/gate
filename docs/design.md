@@ -175,7 +175,7 @@ Test-seams builds accept hidden options on `cutover`: `--test-poll-ms`, `--test-
 
 `gate push` takes no words; its usage line is `       gate push`, after `gate cutover`. A word prints `gate: unexpected argument <word>` and any option, `--state-dir` included, prints `gate: unknown option <opt>`, each followed by the usage, exit 2. It reads `%LOCALAPPDATA%` only; `GATE_STATE_DIR` is ignored. What it does is [Install](#install); this is what it says.
 
-It copies the installed `%LOCALAPPDATA%\gate\bin\gate.exe` and the desktop helper `gate-desktop-helper.exe` beside it to each builder, one after another, in the order `host` then `hosts` of `remote.json` ([remote.json](#remotejson)), into the builder's admin-owned `C:\Program Files\gate\bin` (so the builder's ssh session runs elevated), and registers the desktop task there by running the builder's installed `gate box register-desktop`.
+It copies the installed `%LOCALAPPDATA%\gate\bin\gate.exe` and the desktop helper `gate-desktop-helper.exe` beside it to each builder, one after another, in the order `host` then `hosts` of `remote.json` ([remote.json](#remotejson)), into the builder's admin-owned `C:\Program Files\gate\bin` (so the builder's ssh session runs elevated), and registers the desktop task there by running the builder's installed `gate box register-desktop`. A macOS `builders` entry is pushed to after them, by building its `gate-box` from the installed gate's commit (macOS builders, below).
 
 The routing file must be one routing accepts, so `repos` and the other keys are checked as routing checks them. Every builder is tried, whatever happened to an earlier one. The exit is 1 if any builder failed or nothing could be pushed, else 0; a registration that failed is said on that builder's line and does not change the exit.
 
@@ -280,6 +280,55 @@ The helper's aside copies thus go with a later verified push. The `kept <n> asid
 Each version read on the builder is bounded at 30 s.
 
 The ssh a push runs is `ssh.exe` found along `PATH`, never `ssh.cmd` or `ssh.bat`.
+
+**macOS builders.** After the Windows builders, each `builders` entry with `"os": "macos"` is pushed to in file order, one after another; an entry whose alias is also `host` or a `hosts` entry is left out. A Mac gets no copy of `gate.exe`: it builds its own `gate-box` ([The Unix box](#the-unix-box)) from the commit the installed gate was built from, so the box on the Mac carries the installed gate's version text.
+
+The commit comes from `%LOCALAPPDATA%\gate\bin\source.json` ([Install](#install)), read once under `push.lock` with the exe. The Mac is refused, with no ssh call to it, when `source.json` is:
+
+- missing: `no source.json beside the installed gate; reinstall it with tools/install.ps1`;
+- unreadable: `source.json is unreadable: <why>`, for a file that is not an object with a string `repoRoot`, `commit` and `buildId` and a boolean `dirty`, a `commit` that is not 40 lower-case hex digits, a `buildId` that does not start it, or a `repoRoot` that is not absolute;
+- dirty: `the installed gate was built from uncommitted changes; commit them and reinstall`;
+- without a build id, or with one that is not the installed gate's: `source.json does not match the installed gate (<id> vs <version>); reinstall it with tools/install.ps1`;
+- naming a commit its repo lacks: `the repo <repoRoot> does not hold commit <sha>`, asked with `git cat-file -e`.
+
+Each refusal is a `push: <alias> failed: <reason>` line on stderr and fails the push.
+
+Per Mac, on stdout, after the sending line and any other lines:
+
+1. `push: <alias>: sending gate-box <v>`, `<v>` the installed gate's version text.
+2. One ssh call, `/bin/sh -s -- prepare <root>`, runs the embedded POSIX script (`MAC_SCRIPT`) and says the installed `gate-box`'s version. When that is `<v>`, the push ends with `push: <alias>: gate-box <v> already installed`, with no git push and no build.
+3. Otherwise this PC runs `git push --no-verify -- <alias>:<root>/gate-push/src.git +<sha>:refs/gate-push/src` in the repo `source.json` names, through the ssh it found, then says `push: <alias>: building gate-box <v>` and makes a second call, `/bin/sh -s -- build <root> <sha> <id> <v>`.
+4. The build ends with `push: <alias>: replaced gate-box <old>` (only when an old box answered a version) and `push: <alias>: installed gate-box <new>`, or with `push: <alias> failed: <reason>` on stderr.
+
+The script's notes are said on stderr as `push: <alias>: <note>`: `could not read the login shell's PATH; using the ssh PATH`, `<root>/gate-push/src.git is not a repository; making it again` (the prepare call, for a half-made bare repo an interrupted `git init --bare` left), and `<why>; making <root>/gate-push/src again` (the checkout failed once and is remade).
+
+A `src.git` that is not a bare repository is made again only by the prepare call, after the folder checks below have passed; the build call fails on one with `<root>/gate-push/src.git is not a repository` and leaves it as it is. A `src.git` that is a link or a plain file is refused by those checks in both calls and never removed.
+
+Both calls check their words again and refuse a builder without `/usr/bin/perl`, git, cc or cargo (git and cc in `/usr/bin` count only when `xcode-select -p` finds the developer tools) and without `/usr/bin/lockf` (`the builder needs macOS 15 or later (/usr/bin/lockf)`).
+
+They run with every `GIT_*` variable removed, no global or system git config and `PATH` read from the login shell as the box reads it, and judge `<root>`, `<root>/bin` and `<root>/gate-push` as the Unix box judges a root, making each missing one at mode 700.
+
+They hold `<root>/gate-push/push.lock` with `/usr/bin/lockf`, not waiting, for the whole call: a second push to the Mac says `another gate push is installing on this builder`.
+
+`push.lock`, `build.log` and `building` are refused unless each is a plain file with one name.
+
+`gate-push/src.git` is a bare repository whose files are mode 0600 and whose automatic gc is off (`receive.autogc` and `gc.auto`, each written only when it differs), so no gc a git push starts prunes objects the checkout borrows. Ref locks under it and its `packed-refs.lock`, `HEAD.lock` and `config.lock` older than 30 minutes, which a cut push or config write leaves, are deleted.
+
+Every git call on the Mac runs with no hooks, no automatic gc or maintenance and no file-system monitor, and closes the lock's descriptor.
+
+The build step refuses a `bin/gate-box` that is a link or a folder and sweeps `bin/gate-box.*.tmp`. It makes `gate-push/src/.git` afresh every build, a repo borrowing `src.git`'s objects, then fetches the pushed ref, checks out its commit detached with `core.autocrlf` false and cleans the tree; when any of that fails it says a note, removes `gate-push/src` and tries once more. It then requires the checkout to be `<sha>` and to differ from it in no file.
+
+The build is `cargo build --release --locked --manifest-path <root>/gate-push/src/Cargo.toml -p gate-box-unix --target-dir <root>/gate-push/target`, run from `/` so no cargo config or toolchain file above the checkout is read, with `GATE_BUILD_ID=<id>`, empty `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER` and `RUSTFLAGS` (which override cargo's config), and no `CARGO_BUILD_*` or `CARGO_ENCODED_RUSTFLAGS`.
+
+It runs in a process group of its own, killed whole after 1800 s (`cargo build did not finish in 1800 s; see <root>/gate-push/build.log`); the PC's call is bounded at that plus 600 s.
+
+The build's output is `gate-push/build.log`, named in each failure reason.
+
+A `building` marker is written before the build and removed when cargo ends by itself or at its bound. One left by a build something else killed makes the next build wipe `gate-push/target` first, so a cold build follows an interrupted one and never a build the bound killed.
+
+The built binary is copied to `<root>/bin/gate-box.<pid>.tmp`, made mode 700, and installed only when its `--version` is `gate <v>` (`the built gate-box says gate <new>, not gate <v>`; each version read is bounded at 30 s). It is renamed over `<root>/bin/gate-box` without following a link there, so a push never leaves a half-written box.
+
+`--test-push-bound-ms` replaces the 300 s bound and the Mac build's 2400 s bound alike.
 
 Test-seams builds accept hidden options on `push`: `--test-push-ssh <path>` (the program each builder's call runs in place of the ssh found along `PATH`), `--test-push-bound-ms <n>` (the 300 s bound, in milliseconds above 0) and `--test-push-register ok|fail` (each builder's registration runs the pushed gate's `box --test-box-register <ok|fail> register-desktop`, the box's seam, so no Task Scheduler is reached; any other value is `gate: --test-push-register must be ok or fail, got '<value>'`).
 

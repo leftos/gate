@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::install::unix;
 use crate::support::{
-    Case, FAKE_DESKTOP_HELPER, FAKE_TOOL, GATE, Outcome, beside, finish, junction, names, shown, start, version_of, write_remote_json,
+    Case, FAKE_DESKTOP_HELPER, FAKE_TOOL, GATE, Outcome, beside, finish, git, junction, names, shown, start, version_of, write_remote_json,
 };
 
 /// The suite's stand-in for ssh, which `--test-push-ssh` names.
@@ -795,4 +795,727 @@ fn a_failed_helper_install_fails_the_push() {
         "one failure line naming the helper: {outcome:?}"
     );
     assert!(helper.is_dir(), "the folder is left as it was");
+}
+
+/// The root the routing file gives every macOS builder; the stand-in makes it the builder's own `root` folder.
+const MAC_ROOT: &str = "/gate-mac";
+/// The macOS builders a case's `builders` entries add.
+const MAC_HOST: &str = "pushmac-a";
+const OTHER_MAC: &str = "pushmac-c";
+/// The variable naming the macOS builders' root to the stand-in.
+const UNIX_ROOT_VARIABLE: &str = "GATE_FAKE_SSH_UNIX_ROOT";
+/// The variable naming the version the stand-in says to `--version`, which a macOS case's installed gate says.
+const VERSION_VARIABLE: &str = "GATE_FAKE_SSH_VERSION";
+/// The macOS calls of a push that builds: the prepare, the git push and the build.
+const MAC_CALLS: [&str; 3] = ["mac-prepare", "git-receive-pack", "mac-build"];
+
+/// A macOS case: its folder, the commit its repo holds, which `source.json` names, and the version its installed gate
+/// says, `0.1.0+<the commit's first 12 digits>`.
+struct MacCase {
+    case: Case,
+    commit: String,
+    version: String,
+}
+
+impl MacCase {
+    /// The build id `source.json` names.
+    fn id(&self) -> &str {
+        &self.commit[..12]
+    }
+
+    /// Writes `source.json` naming the case's repo, its commit and `build_id`, `dirty` as given.
+    fn write_source(&self, build_id: &str, dirty: bool) {
+        self.write_source_of(&self.case.folder().join("repo"), build_id, dirty);
+    }
+
+    /// Writes `source.json` naming `repo`, the case's commit and `build_id`, `dirty` as given.
+    fn write_source_of(&self, repo: &Path, build_id: &str, dirty: bool) {
+        let source = json!({ "repoRoot": shown(repo), "commit": self.commit, "buildId": build_id, "dirty": dirty });
+        fs::write(source_path(&self.case), source.to_string()).expect("source.json can be written");
+    }
+}
+
+/// A case whose installed gate is a copy of the stand-in, saying the version of a build of a commit of the case's own
+/// repo, with the stand-in helper beside it, `source.json` naming that repo, commit and id, and `routing` as its
+/// `remote.json`.
+fn mac_case(name: &str, routing: &Value) -> MacCase {
+    let case = Case::new(name);
+    let exe = installed_gate(&case);
+    fs::create_dir_all(exe.parent().expect("the installed gate has a folder")).expect("the install folder can be made");
+    fs::copy(FAKE_SSH, &exe).expect("the stand-in can be installed as the gate");
+    fs::copy(FAKE_DESKTOP_HELPER, installed_helper(&case)).expect("the helper can be installed");
+    git(&case, &["init", "--quiet", "repo"]);
+    fs::write(case.folder().join("repo").join("file.txt"), "built\n").expect("the repo's file can be written");
+    git(&case, &["-C", "repo", "add", "file.txt"]);
+    git(&case, &["-C", "repo", "commit", "--quiet", "-m", "built"]);
+    let commit = git(&case, &["-C", "repo", "rev-parse", "HEAD"]);
+    route(&case, routing);
+    let version = format!("0.1.0+{}", &commit[..12]);
+    let mac = MacCase { case, commit, version };
+    mac.write_source(mac.id(), false);
+    mac
+}
+
+/// The case's `source.json`.
+fn source_path(case: &Case) -> PathBuf {
+    installed_gate(case).with_file_name("source.json")
+}
+
+/// A routing file naming [`HOST`], `hosts` as its `hosts`, and the macOS builders `macs` as `builders` entries in that
+/// order.
+fn mac_routing(hosts: &[&str], macs: &[&str]) -> Value {
+    let entries: Vec<Value> = macs
+        .iter()
+        .map(|mac| json!({ "host": mac, "os": "macos", "root": MAC_ROOT, "repos": { "app": ["*"] } }))
+        .collect();
+    json!({ "host": HOST, "hosts": hosts, "builders": entries, "repos": {} })
+}
+
+/// `gate push` for the macOS case `mac` through the stand-in acting on `steps`.
+fn mac_push(mac: &MacCase, steps: &Path) -> Outcome {
+    let mut command = push_command(&mac.case, steps, FAKE_SSH, &[]);
+    let root = MAC_ROOT.strip_prefix('/').expect("the macOS root is absolute");
+    command.env(UNIX_ROOT_VARIABLE, root).env(VERSION_VARIABLE, &mac.version);
+    // The user's wrappers and flags, which the builder's build must not take.
+    command
+        .env("RUSTC_WRAPPER", "a-wrapper")
+        .env("RUSTC_WORKSPACE_WRAPPER", "a-wrapper")
+        .env("RUSTFLAGS", "-Dwarnings");
+    finish(command)
+}
+
+/// The macOS builder `host`'s stand-in root.
+fn mac_root(case: &Case, host: &str) -> PathBuf {
+    builders(case).join(host).join("root")
+}
+
+/// Writes a `gate-box` on the macOS builder `host` that says `gate <version>`; its path.
+fn mac_box(case: &Case, host: &str, version: &str) -> PathBuf {
+    let bin = mac_root(case, host).join("bin");
+    fs::create_dir_all(&bin).expect("the builder's bin folder can be made");
+    let path = bin.join("gate-box");
+    fs::write(&path, format!("#!/bin/sh\necho 'gate {version}'\n")).expect("the builder's box can be written");
+    path
+}
+
+/// The lines a push says on stdout that installed the case's gate on [`HOST`], then for each macOS builder and its lines
+/// in `macs`, `push: <mac>: sending gate-box <version>` and those lines.
+fn mac_stdout(version: &str, macs: &[(&str, &str)]) -> String {
+    let host = format!(
+        "push: {HOST}: sending gate {version}\npush: {HOST}: installed gate {version}\n{}",
+        desktop_lines(HOST)
+    );
+    let parts: Vec<String> = macs.iter().map(|(mac, lines)| mac_lines(mac, version, lines)).collect();
+    host + &parts.concat()
+}
+
+/// The macOS builder `mac`'s lines when it is sent `version`: its sending line, then `lines`.
+fn mac_lines(mac: &str, version: &str, lines: &str) -> String {
+    format!("push: {mac}: sending gate-box {version}\n{lines}")
+}
+
+/// The lines of the macOS builder `mac` after its sending line when it built and installed `version`, having replaced
+/// the box `replaced` names.
+fn built_lines(mac: &str, version: &str, replaced: Option<&str>) -> String {
+    let replaced = replaced.map_or_else(String::new, |old| format!("push: {mac}: replaced gate-box {old}\n"));
+    format!("push: {mac}: building gate-box {version}\n{replaced}push: {mac}: installed gate-box {version}\n")
+}
+
+/// The commit the macOS builder `host`'s stand-in bare repo holds as the pushed ref.
+fn pushed_commit(case: &Case, host: &str) -> String {
+    let bare = mac_root(case, host).join("gate-push").join("src.git");
+    git(case, &["--git-dir", &shown(&bare), "rev-parse", "refs/gate-push/src"])
+}
+
+/// `["push"]` and [`MAC_CALLS`]: the call order of a push to [`HOST`] and a macOS builder that builds.
+fn host_and_mac_calls() -> Vec<&'static str> {
+    std::iter::once("push").chain(MAC_CALLS).collect()
+}
+
+#[test]
+fn a_push_builds_the_box_on_a_macos_builder_after_host() {
+    let mac = mac_case("a_push_builds_the_box_on_a_macos_builder_after_host", &mac_routing(&[], &[MAC_HOST]));
+    // A repo that signs its pushes by its own config still pushes to the builder, which takes no signed push.
+    git(&mac.case, &["-C", "repo", "config", "push.gpgSign", "true"]);
+    let steps = steps(&mac.case, &["ok", "ok", "ok", "ok"]);
+    assert!(!mac_root(&mac.case, MAC_HOST).exists(), "the builder has no root yet");
+
+    let outcome = mac_push(&mac, &steps);
+
+    let version = &mac.version;
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let bare = mac_root(&mac.case, MAC_HOST).join("gate-push").join("src.git");
+    assert_eq!(
+        git(&mac.case, &["--git-dir", &shown(&bare), "config", "core.sharedRepository"]),
+        "0600",
+        "the bare repo keeps its files to the builder's user"
+    );
+    for (key, value) in [("receive.autogc", "false"), ("gc.auto", "0")] {
+        assert_eq!(
+            git(&mac.case, &["--git-dir", &shown(&bare), "config", "--local", key]),
+            value,
+            "no gc a git push starts prunes objects the checkout borrows"
+        );
+    }
+    let env = fs::read_to_string(builders(&mac.case).join(MAC_HOST).join("cargo.env")).expect("cargo's wrappers were logged");
+    assert_eq!(
+        env.trim_end(),
+        "RUSTC_WRAPPER=[] RUSTC_WORKSPACE_WRAPPER=[] RUSTFLAGS=[] PWD=[/]",
+        "the user's wrappers and flags are set empty, which overrides cargo's config, and cargo runs from /, so it reads no \
+         config above the checkout"
+    );
+    assert_eq!(
+        unix(&outcome.stdout),
+        mac_stdout(version, &[(MAC_HOST, &built_lines(MAC_HOST, version, None))]),
+        "a first install says no replaced line: {outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_eq!(calls(&steps), host_and_mac_calls());
+    assert_eq!(pushed_commit(&mac.case, MAC_HOST), mac.commit, "the commit landed as the pushed ref");
+    let root = mac_root(&mac.case, MAC_HOST);
+    assert_eq!(names(&root.join("bin")), ["gate-box"], "no temporary copy is left");
+    assert_eq!(
+        names(&root.join("gate-push")),
+        ["build.log", "push.lock", "src", "src.git", "target"],
+        "every file the push keeps is in its own folder, and the building marker is gone"
+    );
+    let built = fs::read_to_string(root.join("bin").join("gate-box")).expect("the box can be read");
+    assert!(built.contains(&format!("gate {version}")), "the installed box is the one built: {built}");
+    let cargo = fs::read_to_string(builders(&mac.case).join(MAC_HOST).join("cargo.args")).expect("cargo's call was logged");
+    let cargo = cargo.trim_end();
+    let start = format!("GATE_BUILD_ID={} build --release --locked --manifest-path /", mac.id());
+    assert!(
+        cargo.starts_with(&start)
+            && cargo.contains("/gate-push/src/Cargo.toml -p gate-box-unix --target-dir /")
+            && cargo.ends_with("/gate-push/target --message-format=json")
+            && cargo.lines().count() == 1,
+        "one locked build of the box alone with the build id and no features: {cargo}"
+    );
+}
+
+/// The routing file refuses an alias both `hosts` and `builders` name, so only file order is left to see here.
+#[test]
+fn a_push_reaches_macos_builders_after_host_and_hosts_in_file_order() {
+    let mac = mac_case(
+        "a_push_reaches_macos_builders_after_host_and_hosts_in_file_order",
+        &mac_routing(&[OTHER_HOST], &[OTHER_MAC, MAC_HOST]),
+    );
+    let steps = steps(&mac.case, &["ok"; 8]);
+
+    let outcome = mac_push(&mac, &steps);
+
+    let version = &mac.version;
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let host_lines = mac_stdout(version, &[]);
+    let hosts_lines = format!(
+        "push: {OTHER_HOST}: sending gate {version}\npush: {OTHER_HOST}: installed gate {version}\n{}",
+        desktop_lines(OTHER_HOST)
+    );
+    let macs: Vec<String> = [OTHER_MAC, MAC_HOST]
+        .iter()
+        .map(|mac| mac_lines(mac, version, &built_lines(mac, version, None)))
+        .collect();
+    let mac_lines = macs.concat();
+    assert_eq!(
+        unix(&outcome.stdout),
+        format!("{host_lines}{hosts_lines}{mac_lines}"),
+        "host, then hosts, then the macOS entries in file order: {outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    let expected: Vec<&str> = ["push", "push"].into_iter().chain(MAC_CALLS).chain(MAC_CALLS).collect();
+    assert_eq!(calls(&steps), expected);
+    assert_eq!(pushed_commit(&mac.case, OTHER_MAC), mac.commit);
+    assert_eq!(pushed_commit(&mac.case, MAC_HOST), mac.commit);
+}
+
+/// Asserts a push of the macOS case `mac`, with the `source.json` the case left, refused its macOS builder with `reason`
+/// before any call to it, and still pushed to [`HOST`].
+fn assert_source_refused(mac: &MacCase, reason: &str) {
+    let steps = steps(&mac.case, &["ok"]);
+
+    let outcome = mac_push(mac, &steps);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(unix(&outcome.stdout), mac_stdout(&mac.version, &[(MAC_HOST, "")]), "{outcome:?}");
+    assert_eq!(unix(&outcome.stderr), format!("push: {MAC_HOST} failed: {reason}\n"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["push"], "the macOS builder got no call");
+    assert!(!builders(&mac.case).join(MAC_HOST).exists(), "nothing reached the macOS builder");
+}
+
+#[test]
+fn a_push_with_no_source_json_refuses_a_macos_builder() {
+    let mac = mac_case("a_push_with_no_source_json_refuses_a_macos_builder", &mac_routing(&[], &[MAC_HOST]));
+    fs::remove_file(source_path(&mac.case)).expect("source.json can be removed");
+    assert_source_refused(&mac, "no source.json beside the installed gate; reinstall it with tools/install.ps1");
+}
+
+#[test]
+fn a_push_with_an_unreadable_source_json_refuses_a_macos_builder() {
+    let mac = mac_case(
+        "a_push_with_an_unreadable_source_json_refuses_a_macos_builder",
+        &mac_routing(&[], &[MAC_HOST]),
+    );
+    fs::write(source_path(&mac.case), "[1]").expect("source.json can be written");
+    assert_source_refused(&mac, "source.json is unreadable: it is not a JSON object");
+}
+
+#[test]
+fn a_push_of_a_dirty_build_refuses_a_macos_builder() {
+    let mac = mac_case("a_push_of_a_dirty_build_refuses_a_macos_builder", &mac_routing(&[], &[MAC_HOST]));
+    mac.write_source(mac.id(), true);
+    assert_source_refused(&mac, "the installed gate was built from uncommitted changes; commit them and reinstall");
+}
+
+#[test]
+fn a_push_whose_source_json_names_another_build_refuses_a_macos_builder() {
+    let mac = mac_case(
+        "a_push_whose_source_json_names_another_build_refuses_a_macos_builder",
+        &mac_routing(&[], &[MAC_HOST]),
+    );
+    let other = mac.commit[..13].to_owned();
+    mac.write_source(&other, false);
+    let reason = format!(
+        "source.json does not match the installed gate ({other} vs {}); reinstall it with tools/install.ps1",
+        mac.version
+    );
+    assert_source_refused(&mac, &reason);
+}
+
+#[test]
+fn a_push_whose_source_json_names_no_build_refuses_a_macos_builder() {
+    let mac = mac_case(
+        "a_push_whose_source_json_names_no_build_refuses_a_macos_builder",
+        &mac_routing(&[], &[MAC_HOST]),
+    );
+    mac.write_source("", false);
+    let reason = format!(
+        "source.json does not match the installed gate ( vs {}); reinstall it with tools/install.ps1",
+        mac.version
+    );
+    assert_source_refused(&mac, &reason);
+}
+
+#[test]
+fn a_push_whose_repo_lacks_the_commit_refuses_a_macos_builder() {
+    let mac = mac_case(
+        "a_push_whose_repo_lacks_the_commit_refuses_a_macos_builder",
+        &mac_routing(&[], &[MAC_HOST]),
+    );
+    let elsewhere = mac.case.folder().join("elsewhere");
+    git(&mac.case, &["init", "--quiet", "elsewhere"]);
+    mac.write_source_of(&elsewhere, mac.id(), false);
+    assert_source_refused(&mac, &format!("the repo {} does not hold commit {}", shown(&elsewhere), mac.commit));
+}
+
+#[test]
+fn a_push_replaces_an_older_box_on_a_macos_builder() {
+    let mac = mac_case("a_push_replaces_an_older_box_on_a_macos_builder", &mac_routing(&[], &[MAC_HOST]));
+    let old = "0.1.0+aaaaaaaaaaaa";
+    mac_box(&mac.case, MAC_HOST, old);
+    let steps = steps(&mac.case, &["ok", "ok", "ok", "ok"]);
+
+    let outcome = mac_push(&mac, &steps);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stdout),
+        mac_stdout(&mac.version, &[(MAC_HOST, &built_lines(MAC_HOST, &mac.version, Some(old)))]),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_eq!(calls(&steps), host_and_mac_calls());
+}
+
+#[test]
+fn a_macos_builder_whose_box_is_the_gate_s_build_gets_no_git_push_and_no_build() {
+    let mac = mac_case(
+        "a_macos_builder_whose_box_is_the_gate_s_build_gets_no_git_push_and_no_build",
+        &mac_routing(&[], &[MAC_HOST]),
+    );
+    mac_box(&mac.case, MAC_HOST, &mac.version);
+    let steps = steps(&mac.case, &["ok", "ok"]);
+
+    let outcome = mac_push(&mac, &steps);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let lines = format!("push: {MAC_HOST}: gate-box {} already installed\n", mac.version);
+    assert_eq!(unix(&outcome.stdout), mac_stdout(&mac.version, &[(MAC_HOST, &lines)]), "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert_eq!(calls(&steps), ["push", "mac-prepare"], "one prepare call only");
+}
+
+#[test]
+fn a_macos_builder_another_push_is_installing_on_says_so() {
+    let mac = mac_case("a_macos_builder_another_push_is_installing_on_says_so", &mac_routing(&[], &[MAC_HOST]));
+    let steps = steps(&mac.case, &["ok", "lock-busy"]);
+
+    let outcome = mac_push(&mac, &steps);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(unix(&outcome.stdout), mac_stdout(&mac.version, &[(MAC_HOST, "")]), "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stderr),
+        format!("push: {MAC_HOST} failed: another gate push is installing on this builder\n"),
+        "{outcome:?}"
+    );
+    assert_eq!(calls(&steps), ["push", "mac-prepare"]);
+}
+
+#[test]
+fn a_failed_build_on_a_macos_builder_fails_the_push_and_leaves_its_box() {
+    let mac = mac_case(
+        "a_failed_build_on_a_macos_builder_fails_the_push_and_leaves_its_box",
+        &mac_routing(&[], &[MAC_HOST]),
+    );
+    let existing = mac_box(&mac.case, MAC_HOST, "0.1.0+aaaaaaaaaaaa");
+    let before = fs::read(&existing).expect("the box can be read");
+    let steps = steps(&mac.case, &["ok", "ok", "ok", "cargo-fail"]);
+
+    let outcome = mac_push(&mac, &steps);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let building = format!("push: {MAC_HOST}: building gate-box {}\n", mac.version);
+    assert_eq!(unix(&outcome.stdout), mac_stdout(&mac.version, &[(MAC_HOST, &building)]), "{outcome:?}");
+    let stderr = unix(&outcome.stderr);
+    assert!(
+        stderr.starts_with(&format!("push: {MAC_HOST} failed: cargo build exited 101; see /"))
+            && stderr.ends_with("/gate-push/build.log\n")
+            && stderr.lines().count() == 1,
+        "one failure line naming the build log: {outcome:?}"
+    );
+    assert_holds(&existing, &before);
+    assert_eq!(
+        names(&mac_root(&mac.case, MAC_HOST).join("bin")),
+        ["gate-box"],
+        "no temporary copy is left"
+    );
+    assert_eq!(calls(&steps), host_and_mac_calls());
+}
+
+/// A build its own bound killed leaves no `building` marker.
+#[test]
+fn a_macos_build_killed_at_its_bound_leaves_no_building_marker() {
+    let mac = mac_case(
+        "a_macos_build_killed_at_its_bound_leaves_no_building_marker",
+        &mac_routing(&[], &[MAC_HOST]),
+    );
+    let steps = steps(&mac.case, &["ok", "ok", "ok", "cargo-bound"]);
+
+    let outcome = mac_push(&mac, &steps);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let stderr = unix(&outcome.stderr);
+    assert!(
+        stderr.starts_with(&format!("push: {MAC_HOST} failed: cargo build did not finish in 1800 s; see /"))
+            && stderr.ends_with("/gate-push/build.log\n")
+            && stderr.lines().count() == 1,
+        "one failure line naming the bound: {outcome:?}"
+    );
+    let push_folder = mac_root(&mac.case, MAC_HOST).join("gate-push");
+    assert!(push_folder.join("build.log").exists(), "the build ran: {outcome:?}");
+    assert!(!push_folder.join("building").exists(), "the bound's kill leaves no building marker");
+}
+
+/// Asserts a push of the macOS case `mac`, whose builder's prepare call takes the step `step`, failed that builder with
+/// stderr's one line `push: <mac> failed: ` and what `reason` accepts, after that call alone, and still pushed to
+/// [`HOST`].
+fn assert_prepare_refused(mac: &MacCase, step: &str, reason: impl Fn(&str) -> bool) {
+    let steps = steps(&mac.case, &["ok", step]);
+
+    let outcome = mac_push(mac, &steps);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(unix(&outcome.stdout), mac_stdout(&mac.version, &[(MAC_HOST, "")]), "{outcome:?}");
+    let stderr = unix(&outcome.stderr);
+    let failed = stderr
+        .strip_prefix(&format!("push: {MAC_HOST} failed: "))
+        .and_then(|rest| rest.strip_suffix('\n'));
+    assert!(failed.is_some_and(|failed| !failed.contains('\n') && reason(failed)), "{outcome:?}");
+    assert_eq!(calls(&steps), ["push", "mac-prepare"], "no git push and no build");
+}
+
+#[test]
+fn a_macos_builder_without_perl_is_refused_before_the_git_push() {
+    let mac = mac_case(
+        "a_macos_builder_without_perl_is_refused_before_the_git_push",
+        &mac_routing(&[], &[MAC_HOST]),
+    );
+    assert_prepare_refused(&mac, "no-perl", |failed| failed == "the builder has no /usr/bin/perl");
+    assert!(!mac_root(&mac.case, MAC_HOST).exists(), "nothing was made on the builder");
+}
+
+#[test]
+fn a_macos_builder_without_cargo_is_refused_before_the_git_push() {
+    let mac = mac_case(
+        "a_macos_builder_without_cargo_is_refused_before_the_git_push",
+        &mac_routing(&[], &[MAC_HOST]),
+    );
+    assert_prepare_refused(&mac, "no-cargo", |failed| {
+        failed == r#"the builder has no cargo; run install-macos.sh --only "Rust""#
+    });
+    assert!(!mac_root(&mac.case, MAC_HOST).exists(), "nothing was made on the builder");
+}
+
+#[test]
+fn a_macos_builder_whose_build_log_is_a_hard_link_is_refused() {
+    let mac = mac_case(
+        "a_macos_builder_whose_build_log_is_a_hard_link_is_refused",
+        &mac_routing(&[], &[MAC_HOST]),
+    );
+    let push_folder = mac_root(&mac.case, MAC_HOST).join("gate-push");
+    fs::create_dir_all(&push_folder).expect("the push folder can be made");
+    let other = mac.case.folder().join("other.txt");
+    fs::write(&other, "another file\n").expect("the other file can be written");
+    fs::hard_link(&other, push_folder.join("build.log")).expect("build.log can be made a second name of the other file");
+
+    assert_prepare_refused(&mac, "ok", |failed| {
+        failed.starts_with('/') && failed.ends_with("/gate-push/build.log is a link")
+    });
+    assert_eq!(
+        fs::read_to_string(&other).expect("the other file can be read"),
+        "another file\n",
+        "it is untouched"
+    );
+}
+
+#[test]
+fn a_macos_builder_whose_box_is_a_folder_is_refused_before_the_build() {
+    let mac = mac_case(
+        "a_macos_builder_whose_box_is_a_folder_is_refused_before_the_build",
+        &mac_routing(&[], &[MAC_HOST]),
+    );
+    let folder = mac_root(&mac.case, MAC_HOST).join("bin").join("gate-box");
+    fs::create_dir_all(&folder).expect("the box's name can be made a folder");
+    let steps = steps(&mac.case, &["ok", "ok", "ok", "ok"]);
+
+    let outcome = mac_push(&mac, &steps);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let building = format!("push: {MAC_HOST}: building gate-box {}\n", mac.version);
+    assert_eq!(unix(&outcome.stdout), mac_stdout(&mac.version, &[(MAC_HOST, &building)]), "{outcome:?}");
+    let stderr = unix(&outcome.stderr);
+    assert!(
+        stderr.starts_with(&format!("push: {MAC_HOST} failed: /")) && stderr.ends_with("/bin/gate-box is a folder\n"),
+        "{outcome:?}"
+    );
+    assert_eq!(calls(&steps), host_and_mac_calls());
+    assert!(names(&folder).is_empty(), "nothing was moved into the folder");
+    assert!(!builders(&mac.case).join(MAC_HOST).join("cargo.args").exists(), "nothing was built");
+}
+
+/// Makes a new commit in the macOS case's repo, its file saying `text`, and points `source.json` and the case's version
+/// at it.
+fn commit_again(mac: &mut MacCase, text: &str) {
+    fs::write(mac.case.folder().join("repo").join("file.txt"), text).expect("the repo's file can be changed");
+    git(&mac.case, &["-C", "repo", "commit", "--quiet", "-am", "again"]);
+    mac.commit = git(&mac.case, &["-C", "repo", "rev-parse", "HEAD"]);
+    mac.version = format!("0.1.0+{}", &mac.commit[..12]);
+    mac.write_source(mac.id(), false);
+}
+
+/// The script's no-hooks and no-replace-refs settings have no plant that reaches the fresh `.git` this case shows (its
+/// git reads no user config or template), so script-text tests in `push.rs` pin them.
+#[test]
+fn a_macos_build_makes_its_checkout_s_git_folder_afresh() {
+    let mut mac = mac_case("a_macos_build_makes_its_checkout_s_git_folder_afresh", &mac_routing(&[], &[MAC_HOST]));
+    let steps = steps(&mac.case, &["ok"; 8]);
+    let first = mac_push(&mac, &steps);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let replaced = mac.version.clone();
+    commit_again(&mut mac, "built again\n");
+    let push_folder = mac_root(&mac.case, MAC_HOST).join("gate-push");
+    let planted = push_folder.join("src").join(".git").join("planted");
+    fs::write(&planted, "left by an earlier build\n").expect("a file can be planted in the checkout's .git");
+
+    let outcome = mac_push(&mac, &steps);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let lines = mac_lines(MAC_HOST, &mac.version, &built_lines(MAC_HOST, &mac.version, Some(&replaced)));
+    assert!(unix(&outcome.stdout).ends_with(&lines), "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "the checkout was readied once: {outcome:?}");
+    assert_eq!(
+        fs::read_to_string(push_folder.join("src").join("file.txt")).expect("the checkout's file can be read"),
+        "built again\n",
+        "the pushed commit's tree is checked out"
+    );
+    assert!(!planted.exists(), "the checkout's .git was made afresh");
+}
+
+#[test]
+fn a_macos_prepare_deletes_old_ref_locks_a_cut_push_left() {
+    let mut mac = mac_case("a_macos_prepare_deletes_old_ref_locks_a_cut_push_left", &mac_routing(&[], &[MAC_HOST]));
+    let steps = steps(&mac.case, &["ok"; 8]);
+    let first = mac_push(&mac, &steps);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let bare = mac_root(&mac.case, MAC_HOST).join("gate-push").join("src.git");
+    let refs = bare.join("refs");
+    let old = [
+        refs.join("gate-push").join("src.lock"),
+        bare.join("packed-refs.lock"),
+        bare.join("HEAD.lock"),
+    ];
+    let hour_ago = SystemTime::now() - Duration::from_secs(3600);
+    for lock in &old {
+        fs::write(lock, "").expect("a lock can be written");
+        File::options()
+            .write(true)
+            .open(lock)
+            .and_then(|file| file.set_modified(hour_ago))
+            .expect("the lock can be made an hour old");
+    }
+    let replaced = mac.version.clone();
+    let young = refs.join("young.lock");
+    fs::write(&young, "").expect("a young ref lock can be written");
+    commit_again(&mut mac, "built again\n");
+
+    let outcome = mac_push(&mac, &steps);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let lines = mac_lines(MAC_HOST, &mac.version, &built_lines(MAC_HOST, &mac.version, Some(&replaced)));
+    assert!(unix(&outcome.stdout).ends_with(&lines), "{outcome:?}");
+    assert_eq!(
+        outcome.stderr, "",
+        "the locks alone were swept and the checkout was readied once: {outcome:?}"
+    );
+    assert_eq!(pushed_commit(&mac.case, MAC_HOST), mac.commit, "the new commit landed as the pushed ref");
+    for lock in &old {
+        assert!(!lock.exists(), "the old lock {} is gone", lock.display());
+    }
+    assert!(young.exists(), "a ref lock a push may still hold is kept");
+}
+
+/// Writes an empty `path` last modified an hour ago.
+fn old_file(path: &Path) {
+    fs::write(path, "").expect("the file can be written");
+    File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(SystemTime::now() - Duration::from_secs(3600)))
+        .expect("the file can be made an hour old");
+}
+
+#[test]
+fn a_macos_push_sweeps_an_old_config_lock_before_it_turns_gc_off() {
+    let mut mac = mac_case(
+        "a_macos_push_sweeps_an_old_config_lock_before_it_turns_gc_off",
+        &mac_routing(&[], &[MAC_HOST]),
+    );
+    let steps = steps(&mac.case, &["ok"; 8]);
+    let first = mac_push(&mac, &steps);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let bare = mac_root(&mac.case, MAC_HOST).join("gate-push").join("src.git");
+    git(&mac.case, &["--git-dir", &shown(&bare), "config", "receive.autogc", "true"]);
+    let lock = bare.join("config.lock");
+    old_file(&lock);
+    let replaced = mac.version.clone();
+    commit_again(&mut mac, "built again\n");
+
+    let outcome = mac_push(&mac, &steps);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let lines = mac_lines(MAC_HOST, &mac.version, &built_lines(MAC_HOST, &mac.version, Some(&replaced)));
+    assert!(unix(&outcome.stdout).ends_with(&lines), "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert!(!lock.exists(), "the old config lock was swept");
+    assert_eq!(
+        git(&mac.case, &["--git-dir", &shown(&bare), "config", "--local", "receive.autogc"]),
+        "false",
+        "gc was turned off again once the lock was gone"
+    );
+}
+
+/// A `config.lock` younger than the sweep's 30 minutes would fail any config write, so a push that succeeds past one
+/// wrote none.
+#[test]
+fn a_macos_push_writes_no_config_when_gc_is_already_off() {
+    let mut mac = mac_case("a_macos_push_writes_no_config_when_gc_is_already_off", &mac_routing(&[], &[MAC_HOST]));
+    let steps = steps(&mac.case, &["ok"; 8]);
+    let first = mac_push(&mac, &steps);
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let lock = mac_root(&mac.case, MAC_HOST).join("gate-push").join("src.git").join("config.lock");
+    fs::write(&lock, "").expect("a fresh config lock can be written");
+    let replaced = mac.version.clone();
+    commit_again(&mut mac, "built again\n");
+
+    let outcome = mac_push(&mac, &steps);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let lines = mac_lines(MAC_HOST, &mac.version, &built_lines(MAC_HOST, &mac.version, Some(&replaced)));
+    assert!(unix(&outcome.stdout).ends_with(&lines), "{outcome:?}");
+    assert_eq!(outcome.stderr, "", "{outcome:?}");
+    assert!(lock.exists(), "a config lock a writer may still hold is kept");
+}
+
+/// An interrupted `git init --bare` leaves a `src.git` that is no repository, which the next push makes again.
+#[test]
+fn a_macos_push_makes_a_src_git_that_is_no_repository_again() {
+    let mac = mac_case("a_macos_push_makes_a_src_git_that_is_no_repository_again", &mac_routing(&[], &[MAC_HOST]));
+    let bare = mac_root(&mac.case, MAC_HOST).join("gate-push").join("src.git");
+    fs::create_dir_all(bare.join("objects")).expect("a half-made src.git can be planted");
+    let steps = steps(&mac.case, &["ok", "ok", "ok", "ok"]);
+
+    let outcome = mac_push(&mac, &steps);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        unix(&outcome.stdout),
+        mac_stdout(&mac.version, &[(MAC_HOST, &built_lines(MAC_HOST, &mac.version, None))]),
+        "{outcome:?}"
+    );
+    let stderr = unix(&outcome.stderr);
+    assert!(
+        stderr.starts_with(&format!("push: {MAC_HOST}: /"))
+            && stderr.ends_with("/gate-push/src.git is not a repository; making it again\n")
+            && stderr.lines().count() == 1,
+        "one note that src.git was made again: {outcome:?}"
+    );
+    assert_eq!(pushed_commit(&mac.case, MAC_HOST), mac.commit, "the commit landed in the remade src.git");
+}
+
+/// A `src.git` that is no folder is refused as every push folder is, before the remake could touch it.
+#[test]
+fn a_macos_src_git_that_is_a_plain_file_is_refused_and_kept() {
+    let mac = mac_case("a_macos_src_git_that_is_a_plain_file_is_refused_and_kept", &mac_routing(&[], &[MAC_HOST]));
+    let bare = mac_root(&mac.case, MAC_HOST).join("gate-push").join("src.git");
+    fs::create_dir_all(bare.parent().expect("src.git has a folder")).expect("the push folder can be made");
+    fs::write(&bare, "not a repository\n").expect("a file can be planted as src.git");
+
+    assert_prepare_refused(&mac, "ok", |failed| {
+        failed.starts_with("could not create the folder /") && failed.ends_with("/gate-push/src.git: it is not a folder")
+    });
+
+    assert_holds(&bare, b"not a repository\n");
+}
+
+/// A `src.git` broken after the prepare call fails the build with its own line; only the prepare call makes one again.
+#[test]
+fn a_macos_build_meeting_a_broken_src_git_fails_and_leaves_it() {
+    let mac = mac_case(
+        "a_macos_build_meeting_a_broken_src_git_fails_and_leaves_it",
+        &mac_routing(&[], &[MAC_HOST]),
+    );
+    let existing = mac_box(&mac.case, MAC_HOST, "0.1.0+aaaaaaaaaaaa");
+    let before = fs::read(&existing).expect("the box can be read");
+    let steps = steps(&mac.case, &["ok", "ok", "ok", "broken-src-git"]);
+
+    let outcome = mac_push(&mac, &steps);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let building = format!("push: {MAC_HOST}: building gate-box {}\n", mac.version);
+    assert_eq!(unix(&outcome.stdout), mac_stdout(&mac.version, &[(MAC_HOST, &building)]), "{outcome:?}");
+    let stderr = unix(&outcome.stderr);
+    assert!(
+        stderr.starts_with(&format!("push: {MAC_HOST} failed: /"))
+            && stderr.ends_with("/gate-push/src.git is not a repository\n")
+            && stderr.lines().count() == 1,
+        "one failure line naming src.git: {outcome:?}"
+    );
+    let bare = mac_root(&mac.case, MAC_HOST).join("gate-push").join("src.git");
+    assert!(
+        bare.join("refs").join("gate-push").join("src").exists(),
+        "the broken src.git keeps the pushed ref"
+    );
+    assert!(!bare.join("HEAD").exists(), "src.git was not made again");
+    assert_holds(&existing, &before);
+    assert_eq!(calls(&steps), host_and_mac_calls());
 }

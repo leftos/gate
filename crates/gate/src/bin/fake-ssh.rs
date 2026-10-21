@@ -9,7 +9,31 @@
 //! one line to `<steps file>.lines`, and acts on the step of its call, counted by that log: the
 //! first call takes the first step. A line that holds none of these, as git's `-G` probe of which ssh it runs, fails
 //! with no step taken. Started with `--version` alone, as a push case starts a copy of it standing in for a builder's
-//! old gate, it says `gate 0.0.0-old` and exits 0.
+//! old gate, it says `gate 0.0.0-old`, or `gate <v>` when the variable `GATE_FAKE_SSH_VERSION` holds `<v>`, and exits 0;
+//! started with `box --test-box-register ok register-desktop`, as a builder registers the desktop task with such a copy
+//! installed, it says the verb's `gate-register: registered` line and exits 0.
+//!
+//! `gate push` starts it for a macOS builder with a line that starts with `/bin/sh -s -- `, the words after it the
+//! script's: its verb is `mac-prepare` or `mac-build`, after the script's first word. Such a call runs Git for Windows'
+//! `sh` (found beside a `git.exe` on `PATH`) with those words, fed the script it reads whole from its standard input and
+//! keeps as `<steps file>.input`, with `/usr/bin/lockf`, `/usr/bin/stat` and `/bin/mv` in it made the paths of
+//! stand-ins in the builder's `system` folder, which is on no `PATH`, so a call by a bare name reaches Git for Windows'
+//! own GNU tool, which does not take macOS's words. The builder's root, `/` and the
+//! variable `GATE_FAKE_SSH_UNIX_ROOT`'s value as a word of the line, is made `<builder>/root` in the builder's folder, the
+//! folder named as the host in `GATE_FAKE_SSH_BUILDERS`, made when missing, its `root` left for the script to make; a git
+//! service's path under that root is made the same folder's. The stand-ins are written afresh on every call: in
+//! `system`, `lockf`, which locks nothing; `stat`, which answers macOS's `stat -f %l` with the link count; and `mv`,
+//! which takes macOS's `mv -fh` as `mv -fT`; in `tools`, `cc`; `cargo`, which logs `GATE_BUILD_ID=<id>` and its words as
+//! a line of `<builder>/cargo.args` and the `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER` and `RUSTFLAGS` it was given, each
+//! in brackets and `unset` for one it was not, and its working folder, as a line of `<builder>/cargo.env`, writes
+//! `<target dir>/release/gate-box`, a script saying `gate 0.1.0+<id>`, and names it on a JSON artifact line; and
+//! `login-shell`, the call's `SHELL`, which runs
+//! its command with `tools` first on `PATH`. `lock-busy` runs a macOS call as `ok` does with its `lockf` answering 75,
+//! busy; `cargo-fail` runs it with its `cargo` failing with 101; `cargo-bound` with its `cargo` exiting 142, the status
+//! the script's bound says for a build it killed; `broken-src-git` runs it as `ok` does with the builder's
+//! `gate-push/src.git/HEAD` removed first, as a push cut short after its prepare call leaves it; `no-perl` runs it with the script's check for
+//! `/usr/bin/perl` looking for a path that does not exist; `no-cargo` runs it with no `cargo` stand-in and a login `PATH`
+//! of `tools`, `/usr/bin` and the first folder holding a `git.exe` along `PATH` alone.
 //!
 //! `ok` runs `<gate> box <verb> --stdin` with the gate the variable `GATE_FAKE_SSH_GATE` names, a `run` or `lfs` call
 //! given the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`, when set, before its verb as box seams, and a `preflight` call
@@ -70,6 +94,63 @@ const GIT_SERVICES: [&str; 2] = ["git-upload-pack", "git-receive-pack"];
 const PUSH: &str = "push";
 /// The version this program says to `--version`, standing in for a builder's old gate.
 const OLD_VERSION: &str = "0.0.0-old";
+/// The variable whose value this program says to `--version` in place of [`OLD_VERSION`].
+const VERSION_VARIABLE: &str = "GATE_FAKE_SSH_VERSION";
+/// The words a builder registers the desktop task with through the push's seam.
+const REGISTER_WORDS: [&str; 4] = ["box", "--test-box-register", "ok", "register-desktop"];
+/// What starts a macOS builder's push line: `/bin/sh` reading its script from stdin.
+const MAC_LINE: &str = "/bin/sh -s -- ";
+/// The verbs of a macOS builder's two script calls.
+const MAC_PREPARE: &str = "mac-prepare";
+const MAC_BUILD: &str = "mac-build";
+/// The marks the `no-perl` and `no-cargo` steps give a macOS call, among its variables.
+const NO_PERL: &str = "GATE_FAKE_NO_PERL";
+const NO_CARGO: &str = "GATE_FAKE_NO_CARGO";
+/// The variable naming the root the routing file gives the macOS builders.
+const UNIX_ROOT_VARIABLE: &str = "GATE_FAKE_SSH_UNIX_ROOT";
+/// The stand-in `lockf`: busy when `GATE_FAKE_LOCKF` is `busy`, else it takes the words the script gives and locks
+/// nothing.
+const LOCKF: &str = r#"#!/bin/sh
+if [ "${GATE_FAKE_LOCKF-}" = busy ]; then exit 75; fi
+[ "$*" = '-s -t 0 9' ] || { echo "stand-in lockf: unexpected words: $*" >&2; exit 64; }
+exit 0
+"#;
+/// The stand-in `cc`.
+const CC: &str = "#!/bin/sh\nexit 0\n";
+/// The stand-in `cargo`, `@ARGS@` the file it logs its calls to and `@ENV@` the one it logs their wrappers and flags to.
+const CARGO: &str = r#"#!/bin/sh
+printf '%s\n' "GATE_BUILD_ID=${GATE_BUILD_ID-} $*" >>'@ARGS@'
+printf 'RUSTC_WRAPPER=[%s] RUSTC_WORKSPACE_WRAPPER=[%s] RUSTFLAGS=[%s] PWD=[%s]\n' "${RUSTC_WRAPPER-unset}" \
+  "${RUSTC_WORKSPACE_WRAPPER-unset}" "${RUSTFLAGS-unset}" "$(pwd)" >>'@ENV@'
+if [ "${GATE_FAKE_CARGO-}" = fail ]; then echo 'error: could not compile gate-box-unix' >&2; exit 101; fi
+if [ "${GATE_FAKE_CARGO-}" = bound ]; then exit 142; fi
+target=''
+while [ "$#" -gt 0 ]; do if [ "$1" = --target-dir ]; then target=$2; fi; shift; done
+[ -n "$target" ] || { echo 'stand-in cargo: no --target-dir' >&2; exit 2; }
+mkdir -p "$target/release" || exit 2
+exe=$target/release/gate-box
+printf '#!/bin/sh\necho "gate 0.1.0+%s"\n' "$GATE_BUILD_ID" >"$exe" || exit 2
+printf '{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"gate-box"},"executable":"%s","fresh":false}\n' "$exe"
+printf '{"reason":"build-finished","success":true}\n'
+"#;
+/// The stand-in `stat`: macOS's `stat -f %l <file>`, the link count, as GNU `stat -c %h`.
+const STAT: &str = r#"#!/bin/sh
+if [ "$1" = -f ] && [ "$2" = %l ]; then shift 2; exec /usr/bin/stat -c %h "$@"; fi
+exec /usr/bin/stat "$@"
+"#;
+/// The stand-in `mv`: macOS's `mv -fh`, which never moves into a folder a link names, as GNU `mv -fT`.
+const MV: &str = r#"#!/bin/sh
+if [ "$1" = -fh ]; then shift; exec /usr/bin/mv -fT "$@"; fi
+exec /usr/bin/mv "$@"
+"#;
+/// The stand-in login shell, `@TOOLS@` the folder it puts first on `PATH` and `@PATH@` what follows it.
+const LOGIN_SHELL: &str = r#"#!/bin/sh
+PATH='@TOOLS@':@PATH@
+export PATH
+if [ "$1" = -l ]; then shift; fi
+if [ "$1" = -c ]; then shift; fi
+exec /bin/sh -c "$1"
+"#;
 /// `CREATE_BREAKAWAY_FROM_JOB`: the call `away` starts is in none of this process's jobs below the one that allows it.
 const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
@@ -93,7 +174,13 @@ fn main() {
 fn run() -> Result<i32, String> {
     let words: Vec<String> = std::env::args().skip(1).collect();
     if words == ["--version"] {
-        writeln!(io::stdout().lock(), "gate {OLD_VERSION}").map_err(|error| format!("cannot write: {error}"))?;
+        let version = std::env::var(VERSION_VARIABLE).unwrap_or_else(|_| OLD_VERSION.to_owned());
+        writeln!(io::stdout().lock(), "gate {version}").map_err(|error| format!("cannot write: {error}"))?;
+        return Ok(0);
+    }
+    if words == REGISTER_WORDS {
+        writeln!(io::stdout().lock(), r"gate-register: registered \gate\desktop-helper for the stand-in")
+            .map_err(|error| format!("cannot write: {error}"))?;
         return Ok(0);
     }
     let (host, line) = match &words[..] {
@@ -240,6 +327,12 @@ fn bare_step(step: &str, call: &BoxCall<'_>) -> Result<i32, String> {
         "ok" => call.ok(),
         "away" => call.away(),
         "no-boot" => call.rewritten(BOOT, None),
+        "lock-busy" => call.mac_call(&[("GATE_FAKE_LOCKF", "busy")]),
+        "cargo-fail" => call.mac_call(&[("GATE_FAKE_CARGO", "fail")]),
+        "cargo-bound" => call.mac_call(&[("GATE_FAKE_CARGO", "bound")]),
+        "broken-src-git" => call.broken_src_git().and_then(|()| call.mac_call(&[])),
+        "no-perl" => call.mac_call(&[(NO_PERL, "1")]),
+        "no-cargo" => call.mac_call(&[(NO_CARGO, "1")]),
         "drop" => Ok(SSH_FAILED),
         "fail-banner" => said(&mut io::stderr().lock(), PRE_BANNER),
         "fail-other" => said(&mut io::stderr().lock(), "ssh: connect to host builder port 22: Connection refused"),
@@ -306,7 +399,16 @@ fn appended(path: &Path, line: &str) -> Result<(), String> {
 /// Runs the call `command` fed this process's standard input, read whole first and kept beside the steps file `steps`
 /// as `<steps file>.input`, so a case can tell what the call sent, once the path `after` exists when one is given; its
 /// status.
-fn fed_call(mut command: Command, steps: &Path, after: Option<&Path>) -> Result<i32, String> {
+fn fed_call(command: Command, steps: &Path, after: Option<&Path>) -> Result<i32, String> {
+    let input = kept_input(steps)?;
+    if let Some(path) = after {
+        hold(path)?;
+    }
+    fed_with(command, &input)
+}
+
+/// This process's standard input, read whole and kept beside the steps file `steps` as `<steps file>.input`.
+fn kept_input(steps: &Path) -> Result<Vec<u8>, String> {
     let mut input = Vec::new();
     io::stdin()
         .lock()
@@ -314,12 +416,14 @@ fn fed_call(mut command: Command, steps: &Path, after: Option<&Path>) -> Result<
         .map_err(|error| format!("cannot read the call's input: {error}"))?;
     let kept = beside(steps, ".input");
     fs::write(&kept, &input).map_err(|error| format!("cannot write {}: {error}", kept.display()))?;
-    if let Some(path) = after {
-        hold(path)?;
-    }
+    Ok(input)
+}
+
+/// Runs `command` fed `input`; its status.
+fn fed_with(mut command: Command, input: &[u8]) -> Result<i32, String> {
     let mut child = command.stdin(Stdio::piped()).spawn().map_err(|error| cannot_run(&command, &error))?;
     let mut stdin = child.stdin.take().ok_or("the call has no input pipe")?;
-    stdin.write_all(&input).map_err(|error| format!("cannot feed the call: {error}"))?;
+    stdin.write_all(input).map_err(|error| format!("cannot feed the call: {error}"))?;
     drop(stdin);
     let status = child.wait().map_err(|error| format!("cannot wait for the call: {error}"))?;
     status.code().ok_or_else(|| "the call ended with no status".to_owned())
@@ -372,6 +476,38 @@ fn relayed(from: &mut impl Read, to: &mut impl Write) -> Result<(), String> {
     }
 }
 
+/// The root the routing file gives the macOS builders: `/` and the value of `GATE_FAKE_SSH_UNIX_ROOT`, which leaves the
+/// leading `/` out, since Git for Windows' `sh`, which git starts its ssh through, rewrites a value starting with `/` as
+/// a path of its own.
+fn unix_root() -> Result<String, String> {
+    variable(UNIX_ROOT_VARIABLE).map(|root| format!("/{root}"))
+}
+
+/// `path` as Git for Windows' `sh` names it: `/`, the drive letter in lower case, then the rest with `/` separators.
+fn msys(path: &Path) -> String {
+    let text = path.display().to_string().replace('\\', "/");
+    match text.as_bytes() {
+        [drive, b':', ..] => format!("/{}{}", char::from(*drive).to_ascii_lowercase(), text.get(2..).unwrap_or_default()),
+        _ => text,
+    }
+}
+
+/// Git for Windows' `sh.exe`: `usr\bin\sh.exe` in the folder of the first `git.exe` along `PATH`, or one or two folders
+/// above it.
+fn git_sh() -> Result<PathBuf, String> {
+    git_folders()?
+        .into_iter()
+        .flat_map(|folder| folder.ancestors().take(3).map(|above| above.join(r"usr\bin\sh.exe")).collect::<Vec<_>>())
+        .find(|sh| sh.is_file())
+        .ok_or_else(|| "no Git for Windows sh.exe beside a git.exe on PATH".to_owned())
+}
+
+/// The folders along `PATH` that hold a `git.exe`, in `PATH`'s order.
+fn git_folders() -> Result<Vec<PathBuf>, String> {
+    let path = std::env::var_os("PATH").ok_or("PATH is not set")?;
+    Ok(std::env::split_paths(&path).filter(|folder| folder.join("git.exe").is_file()).collect())
+}
+
 fn hold(path: &Path) -> Result<(), String> {
     let deadline = Instant::now() + HOLD_LIMIT;
     while !path.exists() {
@@ -406,6 +542,14 @@ impl<'a> BoxCall<'a> {
                 steps,
             });
         }
+        if let Some(rest) = line.strip_prefix(MAC_LINE) {
+            let verb = match rest.split(' ').next() {
+                Some("prepare") => MAC_PREPARE,
+                Some("build") => MAC_BUILD,
+                _ => return Err(format!("the macOS line names no script step: {line}")),
+            };
+            return Ok(BoxCall { verb, rest, host, steps });
+        }
         let words: Vec<&'a str> = line.split(' ').collect();
         let script = words.iter().skip_while(|word| **word != "-EncodedCommand").nth(1);
         if words.first() == Some(&"pwsh") && script.is_some_and(|script| !script.is_empty()) {
@@ -429,8 +573,11 @@ impl<'a> BoxCall<'a> {
         }
         if let Some(service) = self.verb.strip_prefix("git-") {
             let mut command = Command::new("git");
-            command.args([service, self.rest]);
+            command.arg(service).arg(self.unix_mapped(self.rest)?);
             return Ok(command);
+        }
+        if self.is_mac() {
+            return Err(format!("the {} call runs only through a step that feeds it its script", self.verb));
         }
         let mut command = Command::new(variable("GATE_FAKE_SSH_GATE")?);
         command.arg("box");
@@ -454,11 +601,7 @@ impl<'a> BoxCall<'a> {
     /// This PC's `pwsh` with the push call's words after `pwsh`, its `LOCALAPPDATA` the host's folder in the folder
     /// `GATE_FAKE_SSH_BUILDERS` names, made when missing.
     fn push_command(&self) -> Result<Command, String> {
-        if self.host.is_empty() {
-            return Err("the push call names no host".to_owned());
-        }
-        let folder = PathBuf::from(variable("GATE_FAKE_SSH_BUILDERS")?).join(self.host);
-        fs::create_dir_all(&folder).map_err(|error| format!("cannot make {}: {error}", folder.display()))?;
+        let folder = self.builder_folder()?;
         let mut command = Command::new("pwsh");
         command.args(self.rest.split(' ').skip(1)).env("LOCALAPPDATA", folder);
         Ok(command)
@@ -467,12 +610,118 @@ impl<'a> BoxCall<'a> {
     /// Runs the call with this process's streams; its status. A push call is fed its standard input as [`fed_push`]
     /// feeds it.
     fn ok(&self) -> Result<i32, String> {
+        if self.is_mac() {
+            return self.mac_call(&[]);
+        }
         let mut command = self.command()?;
         if self.verb == PUSH {
             return fed_call(command, self.steps, None);
         }
         let status = command.status().map_err(|error| cannot_run(&command, &error))?;
         status.code().ok_or_else(|| "the gate ended with no status".to_owned())
+    }
+
+    /// Whether the call runs a macOS builder's script.
+    fn is_mac(&self) -> bool {
+        self.verb == MAC_PREPARE || self.verb == MAC_BUILD
+    }
+
+    /// The builder's folder, the host's in the folder `GATE_FAKE_SSH_BUILDERS` names, made when missing.
+    fn builder_folder(&self) -> Result<PathBuf, String> {
+        if self.host.is_empty() {
+            return Err("the call names no host".to_owned());
+        }
+        let folder = PathBuf::from(variable("GATE_FAKE_SSH_BUILDERS")?).join(self.host);
+        fs::create_dir_all(&folder).map_err(|error| format!("cannot make {}: {error}", folder.display()))?;
+        Ok(folder)
+    }
+
+    /// `path` with the macOS builders' root ([`unix_root`]) made the builder's `root` folder; as it is when it is not
+    /// under that root or the variable is unset.
+    fn unix_mapped(&self, path: &str) -> Result<String, String> {
+        let Ok(root) = unix_root() else {
+            return Ok(path.to_owned());
+        };
+        match path.strip_prefix(root.as_str()).filter(|rest| rest.starts_with('/')) {
+            Some(rest) => Ok(format!("{}{}", self.builder_folder()?.join("root").display(), rest.replace('/', "\\"))),
+            None => Ok(path.to_owned()),
+        }
+    }
+
+    /// Removes the builder's `gate-push/src.git/HEAD`, which leaves `src.git` no repository.
+    fn broken_src_git(&self) -> Result<(), String> {
+        let head = self.builder_folder()?.join("root").join("gate-push").join("src.git").join("HEAD");
+        fs::remove_file(&head).map_err(|error| format!("cannot remove {}: {error}", head.display()))
+    }
+
+    /// Runs a macOS builder's script call in Git for Windows' `sh` as the file's header says, `variables` added to its
+    /// environment; its status.
+    fn mac_call(&self, variables: &[(&str, &str)]) -> Result<i32, String> {
+        if !self.is_mac() {
+            return Err(format!("the step runs only a macOS builder's call, not {}", self.verb));
+        }
+        let set = |name: &str| variables.iter().any(|(set, _)| *set == name);
+        let builder = self.builder_folder()?;
+        let root = builder.join("root");
+        let tools = builder.join("tools");
+        let system = builder.join("system");
+        for folder in [&tools, &system] {
+            fs::create_dir_all(folder).map_err(|error| format!("cannot make {}: {error}", folder.display()))?;
+        }
+        let system_tools = [("/usr/bin/lockf", "lockf", LOCKF), ("/usr/bin/stat", "stat", STAT), ("/bin/mv", "mv", MV)];
+        for (_, name, text) in system_tools {
+            let path = system.join(name);
+            fs::write(&path, text).map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        }
+        let tools_word = msys(&tools);
+        let cargo = CARGO
+            .replace("@ARGS@", &msys(&builder.join("cargo.args")))
+            .replace("@ENV@", &msys(&builder.join("cargo.env")));
+        let after_tools = if set(NO_CARGO) {
+            let git = git_folders()?.first().map(|folder| msys(folder)).ok_or("no git.exe on PATH")?;
+            format!("/usr/bin:'{git}'")
+        } else {
+            "$PATH".to_owned()
+        };
+        let login = LOGIN_SHELL.replace("@TOOLS@", &tools_word).replace("@PATH@", &after_tools);
+        let mut stand_ins = vec![("cc", CC), ("login-shell", login.as_str())];
+        let cargo_path = tools.join("cargo");
+        if set(NO_CARGO) {
+            fs::remove_file(&cargo_path)
+                .or_else(|error| if error.kind() == io::ErrorKind::NotFound { Ok(()) } else { Err(error) })
+                .map_err(|error| format!("cannot remove {}: {error}", cargo_path.display()))?;
+        } else {
+            stand_ins.push(("cargo", cargo.as_str()));
+        }
+        for (name, text) in stand_ins {
+            let path = tools.join(name);
+            fs::write(&path, text).map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        }
+        let sh = git_sh()?;
+        let unix_root = unix_root()?;
+        let root_word = msys(&root);
+        let words = self
+            .rest
+            .split(' ')
+            .map(|word| if word == unix_root { root_word.clone() } else { word.to_owned() });
+        let mut command = Command::new(&sh);
+        command.args(["-s", "--"]).args(words);
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let folders = sh.parent().map(Path::to_path_buf).into_iter().chain(std::env::split_paths(&path));
+        let path = std::env::join_paths(folders).map_err(|error| format!("cannot make sh's PATH: {error}"))?;
+        command
+            .env("PATH", path)
+            .env("SHELL", msys(&tools.join("login-shell")))
+            .envs(variables.iter().copied());
+        let input = kept_input(self.steps)?;
+        let mut script = String::from_utf8(input).map_err(|error| format!("the script is not UTF-8: {error}"))?;
+        for (path, name, _) in system_tools {
+            script = script.replace(path, &msys(&system.join(name)));
+        }
+        if set(NO_PERL) {
+            script = script.replace("[ -x /usr/bin/perl ]", "[ -x /usr/bin/no-such-perl ]");
+        }
+        fed_with(command, script.as_bytes())
     }
 
     /// Runs the call outside this process's job, its standard input fed from this process's and its standard output and

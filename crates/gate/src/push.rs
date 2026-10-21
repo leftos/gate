@@ -11,14 +11,19 @@
 //! it runs the installed gate's `box register-desktop`, and says what it did on `gate-push: ` lines, which this side
 //! reads into the `push: ` lines. Every builder is tried; one whose install failed makes the exit 1, and a
 //! registration that failed is said on that builder's line alone.
+//!
+//! After them, each macOS `builders` entry builds its own `gate-box` from the commit `source.json` beside the installed
+//! gate names: one ssh call runs [`MAC_SCRIPT`]'s prepare, which reports the installed box's version, then, unless that
+//! is the installed gate's own, git pushes the commit to `<root>/gate-push/src.git` and a second ssh call runs the
+//! script's build, which builds the box with the gate's build id and renames it into `<root>/bin/gate-box`.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::thread;
 use std::time::Duration;
@@ -28,16 +33,17 @@ use base64::engine::general_purpose::STANDARD;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use gate_args::PushRequest;
-use gate_router::escaped;
+use gate_router::{BuilderOs, Config, escaped, is_unix_root};
 use gate_win32::{EnvironmentBlock, Job, LaunchError, PipedConsole, PipedFed, PipedLaunch, Running};
 use regex::Regex;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
 
 use crate::answer::FAILED_STATUS;
 use crate::console::Console;
 use crate::remote::git;
-use crate::remote::transport::ssh::Ssh;
+use crate::remote::transport::ssh::{Ssh, git_ssh_command};
 use crate::remote::transport::{Wire, ssh_words};
 use crate::resolve::Environment;
 use crate::route::read_remote_json;
@@ -149,7 +155,8 @@ function Say($k,$t){$t="$t" -replace '[\r\n]+',' ';[Console]::Out.WriteLine("gat
 function Tally{try{$n=@(Get-ChildItem -LiteralPath $dir -File|?{$_.Name -like 'gate.exe.*.old'}).Count;if($n){Say kept $n}}
 catch{Say note "could not list ${dir}: $($_.Exception.Message)"}}
 function Fail($t){if($locked -and ($st.u -or !(Test-Path -LiteralPath $g))){Tally};Say failed $t;exit 1}
-function Ver($p){try{$x=[Diagnostics.Process]::Start([Diagnostics.ProcessStartInfo]@{FileName=$p;Arguments='--version';RedirectStandardOutput=1;RedirectStandardError=1;UseShellExecute=0})}catch{return ''}
+function Ver($p){try{$x=[Diagnostics.Process]::Start([Diagnostics.ProcessStartInfo]@{FileName=$p;Arguments='--version'
+RedirectStandardOutput=1;RedirectStandardError=1;UseShellExecute=0})}catch{return ''}
 $o=$x.StandardOutput.ReadToEndAsync();$e=$x.StandardError.ReadToEndAsync()
 if(!$x.WaitForExit(30000)){try{$x.Kill($true)}catch{Say note "could not stop the version read of ${p}: $($_.Exception.Message)"}
 [void]$x.WaitForExit(10000);return ''}
@@ -157,7 +164,8 @@ if(($o.Result -split '\r?\n')[0] -notmatch '^gate\s+(.+?)\s*$'){return ''};$Matc
 function Held($p){try{[IO.File]::Open($p,'Open','ReadWrite','None').Dispose();$false}catch{$_.Exception.GetBaseException().HResult -eq -2147024864}}
 function Drop($p){Remove-Item -LiteralPath $p -Force -EA Ignore}
 function Purge($p){try{Remove-Item -LiteralPath $p -Force}catch{if(!(Held $p)){Say note "could not delete ${p}: $($_.Exception.Message)"}}}
-function Clean{try{$fs=@(Get-ChildItem -LiteralPath $dir -File|?{($_.Name -like 'gate.exe.*.old' -or $_.Name -like 'gate-desktop-helper.exe.*.old') -and (Join-Path $dir $_.Name) -ne $a})}
+function Clean{try{$fs=@(Get-ChildItem -LiteralPath $dir -File|?{($_.Name -like 'gate.exe.*.old' -or
+$_.Name -like 'gate-desktop-helper.exe.*.old') -and (Join-Path $dir $_.Name) -ne $a})}
 catch{Say note "could not delete the aside copies in ${dir}: $($_.Exception.Message)";return}
 foreach($f in $fs){Purge $f.FullName}}
 function Mine{foreach($i in 1..3){if(!(Test-Path -LiteralPath $g)){return 'missing'}
@@ -196,7 +204,8 @@ function Unzip($t){$u=[IO.MemoryStream]::new();$z=[IO.MemoryStream]::new([Conver
 [IO.Compression.GZipStream]::new($z,[IO.Compression.CompressionMode]::Decompress).CopyTo($u);,$u.ToArray()}
 function Sha($x){[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($x))}
 function Hash($s){[Convert]::ToHexString([Security.Cryptography.SHA256]::Create().ComputeHash($s))}
-function Reg($p,$w,$n){try{$x=[Diagnostics.Process]::Start([Diagnostics.ProcessStartInfo]@{FileName=$p;Arguments=$w;RedirectStandardOutput=1;RedirectStandardError=1;UseShellExecute=0})}
+function Reg($p,$w,$n){try{$x=[Diagnostics.Process]::Start([Diagnostics.ProcessStartInfo]@{FileName=$p;Arguments=$w
+RedirectStandardOutput=1;RedirectStandardError=1;UseShellExecute=0})}
 catch{return @{x="could not run ${p}: $($_.Exception.Message)"}}
 $o=$x.StandardOutput.ReadToEndAsync();$e=$x.StandardError.ReadToEndAsync()
 if(!$x.WaitForExit($n*1000)){try{$x.Kill($true)}catch{Say note "could not stop the registration: $($_.Exception.Message)"}
@@ -236,8 +245,10 @@ try{$lock=[GateFile]::OpenLock($pl)}catch{$x=$_.Exception.GetBaseException()
 if($x.HResult -eq -2147024864){Fail 'another gate push is installing on this builder'};Fail "could not lock ${dir}: $($x.Message)"}
 if($null -eq $lock){Fail "$pl is a link"}
 $locked=1
-foreach($f in Get-ChildItem -LiteralPath $dir -File|?{$_.Name -match '^gate(-desktop-helper)?\.exe\.(\d+)\.tmp$' -and $Matches[2] -ne $PID}){Purge $f.FullName}
-if((Test-Path -LiteralPath $g) -and (Get-FileHash -LiteralPath $g).Hash -eq '@SHA@'){if($pin){Trust $g $xm 'change it'};$v=Ver $g;if($v){Clean}else{Tally};Say same $v
+foreach($f in Get-ChildItem -LiteralPath $dir -File|?{$_.Name -match '^gate(-desktop-helper)?\.exe\.(\d+)\.tmp$' -and
+$Matches[2] -ne $PID}){Purge $f.FullName}
+if((Test-Path -LiteralPath $g) -and (Get-FileHash -LiteralPath $g).Hash -eq '@SHA@'){if($pin){Trust $g $xm 'change it'}
+$v=Ver $g;if($v){Clean}else{Tally};Say same $v
 $gs=if($v){"; gate $v was already installed"}else{'; the same gate.exe was already installed'}}else{
 $tmp="$g.$PID.tmp";Drop $tmp
 try{$s=[IO.File]::Open($tmp,'CreateNew','Write','None');try{$s.Write($b,0,$b.Length);$st.i=[GateFile]::Id($s.SafeFileHandle)}finally{$s.Dispose()}}
@@ -263,7 +274,8 @@ $st.u=0;$hp=Join-Path $dir 'gate-desktop-helper.exe';$hc="could not install ${hp
 function HFail($t){Fail "$t$gs"}
 function HMine{if(!(Test-Path -LiteralPath $hp)){return 'missing'};try{if([GateFile]::Of($hp) -eq $hi){'mine'}else{'foreign'}}catch{'foreign'}}
 function HBack($m){$w=HMine
-if($w -eq 'foreign'){$t="$m; another desktop helper was placed meanwhile and was left as it is";if($ha){$t+=", the previous desktop helper is at $ha"};HFail $t}
+if($w -eq 'foreign'){$t="$m; another desktop helper was placed meanwhile and was left as it is"
+if($ha){$t+=", the previous desktop helper is at $ha"};HFail $t}
 if(!$ha){if($w -eq 'mine'){try{Remove-Item -LiteralPath $hp -Force}catch{HFail "$m; the copy at $hp could not be removed: $($_.Exception.Message)"}}
 HFail "$m; no earlier desktop helper existed"}
 try{if($w -eq 'mine'){Move-Item -LiteralPath $ha -Destination $hp -Force}else{Move-Item -LiteralPath $ha -Destination $hp}}
@@ -278,7 +290,8 @@ if($hs){$ha="$hp.$(Get-Date -Format yyyyMMddHHmmss).$PID.old"
 try{Move-Item -LiteralPath $hp -Destination $ha -Force}catch{Drop $ht;HFail "$hc $($_.Exception.Message)"}}
 try{Move-Item -LiteralPath $ht -Destination $hp}catch{$m=$_.Exception.Message;Drop $ht;HBack "$hc $m"}
 $ok=$false
-try{$hh=[IO.File]::Open($hp,'Open','Read','Read');try{$ok=([GateFile]::Id($hh.SafeFileHandle) -eq $hi) -and ((Hash $hh) -eq '@HSHA@')}finally{$hh.Dispose()}}
+try{$hh=[IO.File]::Open($hp,'Open','Read','Read')
+try{$ok=([GateFile]::Id($hh.SafeFileHandle) -eq $hi) -and ((Hash $hh) -eq '@HSHA@')}finally{$hh.Dispose()}}
 catch{HBack "$hc $($_.Exception.Message)"}
 if(!$ok){HBack "$hc the installed copy does not match"}
 Say helper-installed}elseif($pin){$t=Judge $hp $xm 'change it';if($t){HFail $t}}
@@ -293,6 +306,246 @@ elseif($rg.c -eq 0 -and $f.Count -and $f[-1] -match '^gate-register: registered 
 elseif($f.Count -and $f[-1] -match '(?s)^gate-register: failed: (.*)$'){Say unregistered $Matches[1]}
 elseif($l.Count){Say unregistered $l[-1]}else{Say unregistered "exit $($rg.c)"}}
 exit 0
+"#;
+
+/// What a macOS builder's ssh line starts with: `/bin/sh` reading [`MAC_SCRIPT`] from stdin, the words after `--` its
+/// arguments.
+const MAC_SH: &str = "/bin/sh -s --";
+/// How long [`MAC_SCRIPT`]'s `cargo build` may run before it and every process it started are killed: a cold build of
+/// the box takes minutes.
+const CARGO_BOUND: Duration = Duration::from_mins(30);
+/// How long a macOS builder's build call may take before it is killed: [`CARGO_BOUND`] and 10 minutes more for the
+/// checkout, the `--version` reads and the install around the build, so the script's own line for a build past its
+/// bound reaches the PC.
+const BUILD_BOUND: Duration = CARGO_BOUND.saturating_add(Duration::from_mins(10));
+/// The file beside the installed gate that names the repo, commit and build id it was built from.
+const SOURCE_FILE: &str = "source.json";
+/// The ref a macOS builder's push lands the commit as, in `<root>/gate-push/src.git`.
+const PUSHED_REF: &str = "refs/gate-push/src";
+/// Why a macOS builder is not pushed to when there is no `source.json`.
+const NO_SOURCE: &str = "no source.json beside the installed gate; reinstall it with tools/install.ps1";
+/// Why a macOS builder is not pushed to when `source.json` says the installed gate was built from a dirty tree.
+const DIRTY: &str = "the installed gate was built from uncommitted changes; commit them and reinstall";
+
+/// The macOS builder script, POSIX sh run as `/bin/sh -s -- prepare <root>` or `/bin/sh -s -- build <root> <sha> <id>
+/// <version>` with this text on stdin. Its body is one function called on the last line, so a stream cut short runs
+/// nothing; it reads nothing more from stdin, ignores `SIGPIPE` and `SIGHUP`, so a PC that went away never stops it
+/// midway, runs in the C locale, and says what it did on `gate-push: ` lines whose write failures it ignores. It checks
+/// every argument again, refuses a builder without `/usr/bin/perl`, removes every `GIT_*` variable, sets
+/// `GIT_CEILING_DIRECTORIES` to the root, points git at no global or system config and at no replace refs, and reads
+/// the login shell's `PATH` as the box does; the file tools it runs (`stat`, `mv`, `find`, `cp`, `rm`, `mkdir`,
+/// `chmod`) are named by their macOS paths, so a GNU tool first on that `PATH` is never taken. It refuses a builder
+/// without git, cc or cargo, a git or cc in `/usr/bin` counting only when `xcode-select -p` finds the developer tools
+/// those stubs run. It makes the root 0700 when missing and judges it as the box does, makes `<root>/bin` and
+/// `<root>/gate-push` 0700 when missing, and takes `gate-push/push.lock` with `/usr/bin/lockf` on descriptor 9, not
+/// waiting. `push.lock`, `build.log` and `building` are each refused when they are anything but a plain file with one
+/// name. Every git call closes descriptor 9 and runs with no automatic gc or maintenance, no file-system monitor and no
+/// hooks, so nothing git leaves running holds the lock. Every bounded call runs in a process group of its own, killed
+/// whole at its bound, and is said as status 142 then.
+///
+/// Both steps make the bare `gate-push/src.git` when missing, its files 0600, and judge it as every push folder; one
+/// that is there but not a bare repository, as an interrupted `git init --bare` leaves it, `prepare` makes again with a
+/// note and `build` fails on. Both delete the ref locks under `src.git/refs` and its `packed-refs.lock`, `HEAD.lock`
+/// and `config.lock` older than 30 minutes, which a git push or a config write cut short leaves, and turn off its
+/// automatic gc, writing each setting only when it differs, so no gc a git push starts prunes objects the checkout
+/// borrows. `prepare` says `version` and the installed `gate-box`'s version, empty when there is none or it is a link,
+/// then `ready`. `build`, under the lock to its end, refuses a `bin/gate-box` that is a link or a folder, sweeps
+/// `bin/gate-box.*.tmp`, wipes `gate-push/target` when the `building` marker a build killed by something but its own
+/// bound left is there, and readies the checkout `gate-push/src`: it makes its `.git` afresh, a repo borrowing
+/// `src.git`'s objects, then
+/// fetches, checks out and cleans the pushed ref, and on a failure of those says a note, removes the checkout and
+/// readies it once more. It checks the checkout is `<sha>` and differs from it in no file, then builds `gate-box-unix`
+/// from `/`, so no cargo config or toolchain file above the checkout is read, with `GATE_BUILD_ID=<id>` into
+/// `gate-push/target`, with no features, the user's `RUSTFLAGS` and wrappers set empty, which overrides cargo's config,
+/// and no `CARGO_BUILD_*`, bounded at [`CARGO_BOUND`]. It copies the binary cargo names to a fresh
+/// `bin/gate-box.<pid>.tmp`, requires its `--version` to be `gate <version>`, and renames it over `bin/gate-box`
+/// without following a link there, saying `replaced` and the old version when one answered, then `installed`. Every
+/// `--version` read is bounded at 30 s.
+const MAC_SCRIPT: &str = r#"
+main() {
+exec </dev/null
+trap '' PIPE HUP
+umask 077
+LC_ALL=C
+export LC_ALL
+say() { printf 'gate-push: %s\n' "$*" 2>/dev/null || :; }
+fail() { say "failed $*"; exit 1; }
+bounded() {
+/usr/bin/perl -e '
+my $t = shift; my $p = fork; defined $p or exit 127;
+if (!$p) { setpgrp(0, 0); exec { $ARGV[0] } @ARGV or exit 127 }
+setpgrp($p, $p);
+$SIG{ALRM} = sub { kill "KILL", -$p; waitpid $p, 0; exit 142 };
+alarm $t; waitpid $p, 0; alarm 0;
+exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' "$@"
+}
+version_of() {
+if [ -L "$1" ] || [ ! -f "$1" ]; then return 0; fi
+l=$(bounded 30 "$1" --version 9>&- 2>/dev/null | head -n 1)
+case $l in 'gate '*) printf '%s' "${l#gate }";; esac
+}
+folder() {
+if [ -L "$1" ]; then fail "could not create the folder $1: it is a symbolic link"; fi
+if [ ! -e "$1" ]; then /bin/mkdir -m 700 "$1" || fail "could not create the folder $1"; fi
+[ -d "$1" ] || fail "could not create the folder $1: it is not a folder"
+owned "$1" || fail "could not create the folder $1: it is not owned by $user"
+}
+owned() { [ -n "$(/usr/bin/find "$1" -prune -user "$uid" 2>/dev/null)" ]; }
+plain() {
+if [ -L "$1" ]; then fail "$1 is a link"; fi
+if [ -e "$1" ]; then
+[ -f "$1" ] || fail "$1 is not a plain file"
+[ "$(/usr/bin/stat -f %l "$1" 2>/dev/null)" = 1 ] || fail "$1 is a link"
+fi
+}
+# No user-writable config or template reaches the fresh src/.git, so a script-text test alone pins core.hooksPath here.
+g() { git -c gc.auto=0 -c maintenance.auto=false -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@" 9>&-; }
+tool() {
+t=$(command -v "$1") || fail "the builder has no $1; $2"
+case $t in /usr/bin/*) xcode-select -p >/dev/null 2>&1 || fail "the builder has no $1; $2";; esac
+}
+locks() { f=$1; shift; if [ -d "$f" ]; then /usr/bin/find "$f" "$@" -type f -exec /bin/rm -f {} + 2>>build.log; fi; }
+setting() {
+[ "$(g --git-dir=src.git config --local --get "$1" 2>>build.log)" = "$2" ] ||
+g --git-dir=src.git config --local "$1" "$2" >>build.log 2>&1
+}
+readied() {
+folder "$gp/src"
+if [ -L src/.git ] || { [ -e src/.git ] && [ ! -d src/.git ]; }; then fail "$gp/src/.git is not a plain folder"; fi
+why="could not remove $gp/src/.git"
+/bin/rm -rf src/.git || return 1
+why="git init $gp/src failed"
+g init -q src >>build.log 2>&1 || return 1
+why="could not write $gp/src/.git/objects/info/alternates"
+printf '%s\n' ../../../src.git/objects >src/.git/objects/info/alternates || return 1
+why="git fetch into $gp/src failed"
+g -C src fetch -q --no-tags ../src.git '+refs/gate-push/src:refs/gate-push/src' >>build.log 2>&1 || return 1
+why="git checkout in $gp/src failed"
+g -C src -c core.autocrlf=false checkout -q -f --detach refs/gate-push/src >>build.log 2>&1 || return 1
+why="git clean in $gp/src failed"
+g -C src clean -q -ffdx >>build.log 2>&1
+}
+clt='install the Xcode Command Line Tools (xcode-select --install)'
+case ${1-} in
+prepare) [ "$#" = 2 ] || fail "the push sent $# words, not 2";;
+build) [ "$#" = 5 ] || fail "the push sent $# words, not 5";;
+*) fail 'the push sent no step this script knows';;
+esac
+mode=$1 root=$2
+case $root in /*) ;; *) fail "the root $root is not an absolute path";; esac
+case $root in */|*//*|*/./*|*/../*|*/.|*/..|*[!A-Za-z0-9._/-]*) fail "the root $root is not one a macOS builder may have";; esac
+if [ "$mode" = build ]; then
+sha=$3 id=$4 version=$5
+case $sha in *[!0-9a-f]*) fail "the commit $sha is not 40 lower-case hex digits";; esac
+[ "${#sha}" = 40 ] || fail "the commit $sha is not 40 lower-case hex digits"
+case $id in ''|*[!0-9a-f]*) fail "the build id $id does not start the commit $sha";; esac
+case $sha in "$id"*) ;; *) fail "the build id $id does not start the commit $sha";; esac
+[ "${#id}" -ge 12 ] || fail "the build id $id does not start the commit $sha"
+num=${version%"+$id"}
+case $num in *[!0-9.]*|.*|*.|*..*|*.*.*.*) num='';; *.*.*) ;; *) num='';; esac
+[ -n "$num" ] && [ "$num+$id" = "$version" ] || fail "the version $version is not <x.y.z>+$id"
+fi
+[ -x /usr/bin/perl ] || fail 'the builder has no /usr/bin/perl'
+for v in $(env | sed -n 's/^\(GIT_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
+GIT_CEILING_DIRECTORIES=$root
+GIT_CONFIG_GLOBAL=/dev/null
+GIT_CONFIG_NOSYSTEM=1
+GIT_NO_REPLACE_OBJECTS=1
+# No replace ref reaches a fresh src/.git fetching one sha, so a script-text test alone pins this export.
+export GIT_CEILING_DIRECTORIES GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM GIT_NO_REPLACE_OBJECTS
+user=$(id -un)
+uid=$(id -u)
+# shellcheck disable=SC2016 # the login shell expands its own PATH
+p=$(bounded 30 "${SHELL:-/bin/zsh}" -l -c 'printf "\n@gate-path@%s@gate-path@\n" "$PATH"' 2>/dev/null |
+sed -n 's/^@gate-path@\(.*\)@gate-path@$/\1/p' | tail -n 1)
+if [ -n "$p" ]; then PATH=$p; export PATH; else say "note could not read the login shell's PATH; using the ssh PATH"; fi
+tool git "$clt"
+tool cc "$clt"
+tool cargo 'run install-macos.sh --only "Rust"'
+if [ -L "$root" ]; then fail "$root is a symbolic link"; fi
+if [ ! -e "$root" ]; then /bin/mkdir -p -m 700 "$root" || fail "could not create the folder $root"; fi
+[ -d "$root" ] || fail "$root is not a folder"
+m=$(ls -ld "$root") || fail "could not read $root"
+case $m in ?????w*|????????w*) fail "$root is not owned by $user or is writable by others";; esac
+owned "$root" || fail "$root is not owned by $user or is writable by others"
+folder "$root/bin"
+gp=$root/gate-push
+folder "$gp"
+lock=$gp/push.lock
+plain "$lock"
+[ -x /usr/bin/lockf ] || fail 'the builder needs macOS 15 or later (/usr/bin/lockf)'
+command exec 9>>"$lock" || fail "could not lock $gp"
+/usr/bin/lockf -s -t 0 9
+case $? in 0) ;; 75) fail 'another gate push is installing on this builder';; *) fail "could not lock $gp";; esac
+cd "$gp" || fail "could not enter $gp"
+plain "$gp/build.log"
+plain "$gp/building"
+box=$root/bin/gate-box
+if [ ! -e src.git ] && [ ! -L src.git ]; then
+g init -q --bare --shared=0600 src.git >>build.log 2>&1 || fail "git init --bare $gp/src.git failed; see $gp/build.log"
+fi
+folder "$gp/src.git"
+if [ "$(g --git-dir=src.git rev-parse --is-bare-repository 2>>build.log)" != true ]; then
+[ "$mode" = prepare ] || fail "$gp/src.git is not a repository"
+say "note $gp/src.git is not a repository; making it again"
+/bin/rm -rf src.git || fail "could not remove $gp/src.git"
+g init -q --bare --shared=0600 src.git >>build.log 2>&1 || fail "git init --bare $gp/src.git failed; see $gp/build.log"
+fi
+locks src.git/refs -name '*.lock' -mmin +30
+locks src.git -maxdepth 1 '(' -name packed-refs.lock -o -name HEAD.lock -o -name config.lock ')' -mmin +30
+{ setting receive.autogc false && setting gc.auto 0; } || fail "could not turn off gc in $gp/src.git; see $gp/build.log"
+if [ "$mode" = prepare ]; then
+say "version $(version_of "$box")"
+say ready
+exit 0
+fi
+true >build.log || fail "could not write $gp/build.log"
+if [ -L "$box" ]; then fail "$box is a symbolic link"; fi
+if [ -d "$box" ]; then fail "$box is a folder"; fi
+/bin/rm -f "$root"/bin/gate-box.*.tmp
+if [ -e building ]; then /bin/rm -rf target || fail "could not wipe $gp/target after an interrupted build"; fi
+if ! readied; then
+say "note $why; making $gp/src again"
+/bin/rm -rf src || fail "could not remove $gp/src after: $why"
+readied || fail "$why; see $gp/build.log"
+fi
+g -C src update-index -q --refresh >>build.log 2>&1
+g -C src diff-index --quiet HEAD -- 2>>build.log || fail "the checkout in $gp/src differs from its commit; see $gp/build.log"
+head=$(g -C src rev-parse HEAD 2>>build.log) || fail "git rev-parse in $gp/src failed; see $gp/build.log"
+[ "$head" = "$sha" ] || fail "the pushed commit is $head, not $sha"
+plain "$gp/building"
+true >building || fail "could not write $gp/building"
+RUSTFLAGS='' RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER=''
+export RUSTFLAGS RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER
+unset CARGO_ENCODED_RUSTFLAGS
+for v in $(env | sed -n 's/^\(CARGO_BUILD_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
+GATE_BUILD_ID=$id
+export GATE_BUILD_ID
+out=$(cd / && bounded 1800 cargo build --release --locked --manifest-path "$gp/src/Cargo.toml" -p gate-box-unix \
+--target-dir "$gp/target" --message-format=json 2>>"$gp/build.log")
+rc=$?
+printf '%s\n' "$out" >>build.log
+if [ "$rc" -lt 128 ] || [ "$rc" = 142 ]; then /bin/rm -f building; fi
+if [ "$rc" = 142 ]; then fail "cargo build did not finish in 1800 s; see $gp/build.log"; fi
+[ "$rc" = 0 ] || fail "cargo build exited $rc; see $gp/build.log"
+exe=$(printf '%s\n' "$out" | grep '"reason":"compiler-artifact"' | grep '"name":"gate-box"' |
+sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)
+case $exe in "$gp/target/"*) ;; *) fail "cargo named no gate-box under $gp/target; see $gp/build.log";; esac
+[ -f "$exe" ] || fail "cargo named $exe, which is not a file"
+tmp=$root/bin/gate-box.$$.tmp
+trap '/bin/rm -f "$tmp"' EXIT
+/bin/rm -f "$tmp"
+/bin/cp "$exe" "$tmp" || fail "could not copy $exe to $tmp"
+/bin/chmod 700 "$tmp" || fail "could not make $tmp runnable"
+new=$(version_of "$tmp")
+[ "$new" = "$version" ] || fail "the built gate-box says gate $new, not gate $version"
+old=$(version_of "$box")
+/bin/mv -fh "$tmp" "$box" || fail "could not move $tmp to $box"
+if [ -n "$old" ]; then say "replaced $old"; fi
+say "installed $new"
+exit 0
+}
+main "$@"
 "#;
 
 /// `gate --version`'s line, matched in any letter case as PowerShell's `-match` does: the version is what follows
@@ -339,16 +592,69 @@ pub(crate) fn push(request: &PushRequest, environment: &Environment, console: &m
             status = u32::from(FAILED_STATUS);
         }
     }
+    if let Some(source) = prepared.source {
+        let source = source.and_then(|source| held(&source, &variables).map(|()| source));
+        let push = MacPush {
+            ssh: &ssh,
+            source: &source,
+            variables: &variables,
+            version: &prepared.raw_version,
+            bound,
+            build_bound: request.seams.bound_ms.map_or(BUILD_BOUND, Duration::from_millis),
+        };
+        for mac in &prepared.macs {
+            if mac_pushed(mac, &push, console) {
+                status = u32::from(FAILED_STATUS);
+            }
+        }
+    }
     status
 }
 
-/// What every builder is sent: the builders, the exe as its call is fed it, [`pushed_input`], the exe's version as
-/// shown, and the ssh line.
+/// What every builder is sent: the Windows builders, the exe as its call is fed it, [`pushed_input`], the exe's version
+/// as shown and as read, and the ssh line; then the macOS builders and, when there are any, what `source.json` says
+/// the installed gate was built from, or why it cannot be used.
 struct Prepared {
     builders: Vec<String>,
     input: String,
     version: String,
     line: String,
+    raw_version: String,
+    macs: Vec<Mac>,
+    source: Option<Result<Source, String>>,
+}
+
+/// The builders a push reaches: `host` and each `hosts` entry, Windows builders, then the macOS `builders` entries.
+struct Listed {
+    hosts: Vec<String>,
+    macs: Vec<Mac>,
+}
+
+/// A macOS `builders` entry the push builds `gate-box` on: its alias and its root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Mac {
+    alias: String,
+    root: String,
+}
+
+/// What the installed gate was built from, as `source.json` says it: the repo, the commit and the build id, checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Source {
+    repo_root: PathBuf,
+    commit: String,
+    build_id: String,
+}
+
+/// What every macOS builder's push uses: the ssh found or why there is none, the source or why it cannot be used, the
+/// environment of every call, the installed gate's version as read, and the bounds of the prepare and git calls and of
+/// the build call.
+struct MacPush<'a> {
+    ssh: &'a Result<PathBuf, String>,
+    source: &'a Result<Source, String>,
+    variables: &'a [(OsString, OsString)],
+    version: &'a str,
+    bound: Duration,
+    build_bound: Duration,
 }
 
 /// The push's builders, exe, desktop helper and line, read from `LOCALAPPDATA`, the exe's version read with `variables`
@@ -362,7 +668,7 @@ fn prepared(environment: &Environment, variables: &[(OsString, OsString)], regis
         .filter(|folder| folder.is_absolute())
         .ok_or_else(|| "push: no remote.json: LOCALAPPDATA is not an absolute folder".to_owned())?;
     let gate = folder.join("gate");
-    let builders = builders(&gate.join("remote.json"))?;
+    let Listed { hosts: builders, macs } = builders(&gate.join("remote.json"))?;
     let bin = gate.join("bin");
     let exe = bin.join("gate.exe");
     // The lock tools/install.ps1 holds while it replaces and checks the exe and the helper, held for their reads and the
@@ -370,7 +676,9 @@ fn prepared(environment: &Environment, variables: &[(OsString, OsString)], regis
     let lock = if bin.is_dir() { Some(local_lock(&bin)?) } else { None };
     let bytes = installed(&exe)?;
     let helper = installed_helper(&bin.join(gate_desktop::HELPER_FILE))?;
-    let version = shown(&local_version(&exe, variables)?);
+    let raw_version = local_version(&exe, variables)?;
+    let source = (!macs.is_empty()).then(|| source_of(&bin.join(SOURCE_FILE), &raw_version));
+    let version = shown(&raw_version);
     drop(lock);
     let line = push_line();
     let slots = Slots {
@@ -385,6 +693,9 @@ fn prepared(environment: &Environment, variables: &[(OsString, OsString)], regis
         input,
         version,
         line,
+        raw_version,
+        macs,
+        source,
     })
 }
 
@@ -453,12 +764,377 @@ fn gzipped(exe: &[u8]) -> String {
 
 /// The builders the routing file at `path` names, read as routing reads it; else the line saying it is missing or why
 /// it is ignored, a bad `hosts` included.
-fn builders(path: &Path) -> Result<Vec<String>, String> {
+fn builders(path: &Path) -> Result<Listed, String> {
     let ignored = |reason: &str| format!("push: ignored {}: {reason}", path.display());
     match read_remote_json(path) {
         Ok(None) => Err(format!("push: no remote.json at {}", path.display())),
         Err(problem) => Err(ignored(&problem.reason)),
-        Ok(Some(config)) => config.builders().map(<[String]>::to_vec).map_err(ignored),
+        Ok(Some(config)) => {
+            let hosts = config.builders().map(<[String]>::to_vec).map_err(ignored)?;
+            let macs = macs_of(&config, &hosts);
+            Ok(Listed { hosts, macs })
+        }
+    }
+}
+
+/// The `builders` entries of `config` with `os: macos`, in file order, each alias `hosts` (the Windows builders, `host`
+/// first) holds in any letter case left out; the routing file refuses an alias two entries name.
+fn macs_of(config: &Config, hosts: &[String]) -> Vec<Mac> {
+    config
+        .builder_entries()
+        .filter(|builder| builder.os == BuilderOs::Macos && !hosts.iter().any(|host| host.eq_ignore_ascii_case(&builder.alias)))
+        // The routing file refuses a macOS entry with no root, so every one read has its own.
+        .filter_map(|builder| {
+            builder.root.as_ref().map(|root| Mac {
+                alias: builder.alias.clone(),
+                root: root.clone(),
+            })
+        })
+        .collect()
+}
+
+/// What `source.json` at `path` says the installed gate, whose version is `version`, was built from; else why a macOS
+/// builder is not pushed to: the file is missing or unreadable, not an object with a string `repoRoot`, `commit` and
+/// `buildId` and a boolean `dirty`, its commit is not 40 lower-case hex digits, it was built from a dirty tree, its
+/// build id is empty or not the version's, its build id does not start its commit, or its repo is no absolute path.
+fn source_of(path: &Path, version: &str) -> Result<Source, String> {
+    let SourceFile {
+        repo_root,
+        commit,
+        build_id,
+        dirty,
+    } = source_file(path)?;
+    if !is_commit(&commit) {
+        return Err(unreadable("commit is not 40 lower-case hex digits"));
+    }
+    if dirty {
+        return Err(DIRTY.to_owned());
+    }
+    if build_id.is_empty() || version_id(version) != Some(build_id.as_str()) {
+        return Err(format!(
+            "source.json does not match the installed gate ({} vs {}); reinstall it with tools/install.ps1",
+            shown(&build_id),
+            shown(version)
+        ));
+    }
+    if !is_build_id(&build_id, &commit) {
+        return Err(unreadable(&format!("buildId {} does not start commit {commit}", shown(&build_id))));
+    }
+    let repo_root = PathBuf::from(repo_root);
+    if !repo_root.is_absolute() {
+        return Err(unreadable("repoRoot is not an absolute path"));
+    }
+    Ok(Source { repo_root, commit, build_id })
+}
+
+/// The fields of `source.json`, read but not judged.
+struct SourceFile {
+    repo_root: String,
+    commit: String,
+    build_id: String,
+    dirty: bool,
+}
+
+/// The fields of `source.json` at `path`; else why they cannot be read: the file is missing or unreadable, or not an
+/// object with a string `repoRoot`, `commit` and `buildId` and a boolean `dirty`.
+fn source_file(path: &Path) -> Result<SourceFile, String> {
+    let bytes = match fs::read(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(NO_SOURCE.to_owned()),
+        Err(error) => return Err(unreadable(&error.to_string())),
+        Ok(bytes) => bytes,
+    };
+    let value: Value = serde_json::from_slice(&bytes).map_err(|error| unreadable(&error.to_string()))?;
+    let object = value.as_object().ok_or_else(|| unreadable("it is not a JSON object"))?;
+    let text = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| unreadable(&format!("{key} is missing or not a string")))
+    };
+    let (repo_root, commit, build_id) = (text("repoRoot")?, text("commit")?, text("buildId")?);
+    let dirty = object
+        .get("dirty")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| unreadable("dirty is missing or not true or false"))?;
+    Ok(SourceFile {
+        repo_root,
+        commit,
+        build_id,
+        dirty,
+    })
+}
+
+/// Why `source.json` cannot be used when it says something it should not: `why`.
+fn unreadable(why: &str) -> String {
+    format!("source.json is unreadable: {why}")
+}
+
+/// Whether `text` is all lower-case hex digits.
+fn is_lower_hex(text: &str) -> bool {
+    text.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Whether `sha` is a whole commit id: 40 lower-case hex digits.
+fn is_commit(sha: &str) -> bool {
+    sha.len() == 40 && is_lower_hex(sha)
+}
+
+/// Whether `id` is a build id of the commit `sha`: 12 to 40 lower-case hex digits that start it.
+fn is_build_id(id: &str, sha: &str) -> bool {
+    (12..=40).contains(&id.len()) && is_lower_hex(id) && sha.starts_with(id)
+}
+
+/// What follows the `+` of `version` when what comes before it is three numbers of ASCII digits joined by `.`.
+fn version_id(version: &str) -> Option<&str> {
+    let (number, id) = version.split_once('+')?;
+    let parts: Vec<&str> = number.split('.').collect();
+    let numbered = parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+    numbered.then_some(id)
+}
+
+/// `root` when a macOS builder may have it ([`is_unix_root`]), else why it is refused.
+fn checked_root(root: &str) -> Result<(), String> {
+    if is_unix_root(root) {
+        Ok(())
+    } else {
+        Err(format!("the root {} is not one a macOS builder may have", shown(root)))
+    }
+}
+
+/// The line that runs [`MAC_SCRIPT`]'s prepare on a macOS builder whose root is `root`; else why `root` is refused.
+fn mac_prepare_line(root: &str) -> Result<String, String> {
+    checked_root(root)?;
+    Ok(format!("{MAC_SH} prepare {root}"))
+}
+
+/// The line that runs [`MAC_SCRIPT`]'s build on a macOS builder whose root is `root`, of the commit `sha` with the build
+/// id `id`, whose box must say `version`; else why a word is refused: every word is one no shell splits or expands.
+fn mac_build_line(root: &str, sha: &str, id: &str, version: &str) -> Result<String, String> {
+    checked_root(root)?;
+    if !is_commit(sha) {
+        return Err(format!("the commit {} is not 40 lower-case hex digits", shown(sha)));
+    }
+    if !is_build_id(id, sha) {
+        return Err(format!("the build id {} does not start the commit {sha}", shown(id)));
+    }
+    if version_id(version) != Some(id) {
+        return Err(format!("the version {} is not <x.y.z>+{id}", shown(version)));
+    }
+    Ok(format!("{MAC_SH} build {root} {sha} {id} {version}"))
+}
+
+/// A git call in the repo `repo`, set up as the client's git calls are ([`git::Git::command`]): git found along the
+/// gate's own `PATH`, its first words (`-C <repo>`, no file-system monitor, no hook a config names), and `variables`
+/// with that setup's variables removed and set; else why git cannot be found.
+struct GitCall {
+    program: PathBuf,
+    args: Vec<OsString>,
+    variables: Vec<(OsString, OsString)>,
+}
+
+impl GitCall {
+    fn new(repo: &Path, variables: &[(OsString, OsString)]) -> Result<GitCall, String> {
+        let folder = std::env::current_dir().map_err(|error| format!("cannot read the working directory: {error}"))?;
+        let command = git::Git::find(&folder)?.command(repo);
+        let mut kept: Vec<(OsString, OsString)> = variables.to_vec();
+        for (name, value) in command.get_envs() {
+            kept.retain(|(kept_name, _)| !kept_name.eq_ignore_ascii_case(name));
+            if let Some(value) = value {
+                kept.push((name.to_owned(), value.to_owned()));
+            }
+        }
+        Ok(GitCall {
+            program: PathBuf::from(command.get_program()),
+            args: command.get_args().map(OsStr::to_owned).collect(),
+            variables: kept,
+        })
+    }
+}
+
+/// Whether the repo `source` names holds its commit, asked of git with `variables` as its environment; else why not.
+fn held(source: &Source, variables: &[(OsString, OsString)]) -> Result<(), String> {
+    let GitCall {
+        program,
+        mut args,
+        variables,
+    } = GitCall::new(&source.repo_root, variables)?;
+    args.extend(["cat-file".into(), "-e".into(), format!("{}^{{commit}}", source.commit).into()]);
+    let heard = called(&Call {
+        program: &program,
+        args,
+        input: b"",
+        variables: &variables,
+        bound: VERSION_BOUND,
+    });
+    match heard.end {
+        End::Exited(0) => Ok(()),
+        End::Exited(_) => Err(format!(
+            "the repo {} does not hold commit {}",
+            shown(&source.repo_root.display().to_string()),
+            source.commit
+        )),
+        End::TimedOut => Err(format!("git cat-file did not answer in {} s", VERSION_BOUND.as_secs())),
+        End::Failed(why) => Err(why),
+    }
+}
+
+/// Pushes to the macOS builder `mac` as `push` says, saying its lines; whether it failed.
+fn mac_pushed(mac: &Mac, push: &MacPush<'_>, console: &mut Console) -> bool {
+    let alias = &mac.alias;
+    console.out(&format!("push: {alias}: sending gate-box {}", shown(push.version)));
+    match mac_installed(mac, push, console) {
+        Ok(lines) => {
+            for line in &lines {
+                console.out(line);
+            }
+            false
+        }
+        Err(reason) => {
+            console.err(&format!("push: {alias} failed: {reason}"));
+            true
+        }
+    }
+}
+
+/// The lines after the sending line of a push to `mac`, its notes said on stderr as they come: the box already
+/// installed, else after the git push and the build what it replaced and installed; else why it failed. Nothing reaches
+/// the builder when the source or ssh cannot be used, and a builder whose box already says the version gets no git push
+/// and no build.
+fn mac_installed(mac: &Mac, push: &MacPush<'_>, console: &mut Console) -> Result<Vec<String>, String> {
+    let source = push.source.as_ref().map_err(Clone::clone)?;
+    let ssh = push.ssh.as_ref().map_err(Clone::clone)?;
+    let (alias, version) = (&mac.alias, shown(push.version));
+    let prepare = mac_prepare_line(&mac.root)?;
+    let build = mac_build_line(&mac.root, &source.commit, &source.build_id, push.version)?;
+    let heard = mac_called(ssh, alias, &prepare, push, push.bound);
+    let facts = mac_facts(alias, &heard, console);
+    mac_ended(&heard, &facts, push.bound)?;
+    if !facts.contains(&Fact::Ready) {
+        return Err(no_answer(&heard));
+    }
+    if facts.contains(&Fact::Version(push.version.to_owned())) {
+        return Ok(vec![format!("push: {alias}: gate-box {version} already installed")]);
+    }
+    sent(mac, ssh, source, push)?;
+    console.out(&format!("push: {alias}: building gate-box {version}"));
+    let heard = mac_called(ssh, alias, &build, push, push.build_bound);
+    let facts = mac_facts(alias, &heard, console);
+    mac_ended(&heard, &facts, push.build_bound)?;
+    installed_lines(alias, "gate-box", &version, &facts).ok_or_else(|| no_answer(&heard))
+}
+
+/// The call of `line` on the macOS builder `alias` through `ssh`, fed [`MAC_SCRIPT`], bounded at `bound`.
+fn mac_called(ssh: &Path, alias: &str, line: &str, push: &MacPush<'_>, bound: Duration) -> Heard {
+    called(&Call {
+        program: ssh,
+        args: ssh_words(alias, line, Wire::Plain),
+        input: MAC_SCRIPT.as_bytes(),
+        variables: push.variables,
+        bound,
+    })
+}
+
+/// The facts the call `heard` stated, each note said on stderr as `push: <alias>: <note>` first.
+fn mac_facts(alias: &str, heard: &Heard, console: &mut Console) -> Vec<Fact> {
+    let facts: Vec<Fact> = heard.marked.iter().filter_map(|line| fact(line)).collect();
+    for fact in &facts {
+        if let Fact::Note(text) = fact {
+            console.err(&format!("push: {alias}: {}", shown(text)));
+        }
+    }
+    facts
+}
+
+/// Why the macOS builder's call `heard`, bounded at `bound`, failed, its `facts` read: its bound, why it could not be
+/// made, the script's `failed` reason, or for any status but 0 ssh's last stderr line; `Ok` when it exited 0.
+fn mac_ended(heard: &Heard, facts: &[Fact], bound: Duration) -> Result<(), String> {
+    if status_of(heard, facts, bound)? == 0 {
+        Ok(())
+    } else {
+        Err(no_answer(heard))
+    }
+}
+
+/// The exit status of the call `heard`, bounded at `bound`, whose `facts` were read; else why it failed: its bound, why
+/// it could not be made, or the `failed` reason it said, whatever its status.
+fn status_of(heard: &Heard, facts: &[Fact], bound: Duration) -> Result<u32, String> {
+    let status = match &heard.end {
+        End::TimedOut => return Err(format!("timed out after {} s", bound.as_millis().div_ceil(1000))),
+        End::Failed(why) => return Err(why.clone()),
+        End::Exited(status) => *status,
+    };
+    match facts.iter().find_map(|fact| match fact {
+        Fact::Failed(reason) => Some(reason),
+        _ => None,
+    }) {
+        Some(reason) => Err(shown(reason)),
+        None => Ok(status),
+    }
+}
+
+/// Why a call that said nothing usable failed: its last stderr line, else the problem feeding or reading it, else
+/// `no answer`.
+fn no_answer(heard: &Heard) -> String {
+    let reason = heard.last_error.as_deref().map(shown).or_else(|| heard.problem.clone());
+    reason.unwrap_or_else(|| "no answer".to_owned())
+}
+
+/// The lines of a push to `host` whose builder said it installed `what` (`gate` or `gate-box`), `version` when it said
+/// no version: `replaced` when it said the version it replaced, then `installed`; `None` when it said it installed
+/// nothing.
+fn installed_lines(host: &str, what: &str, version: &str, facts: &[Fact]) -> Option<Vec<String>> {
+    let installed = facts.iter().find_map(|fact| match fact {
+        Fact::Installed(new) => Some(new),
+        _ => None,
+    })?;
+    let new = if installed.is_empty() { version.to_owned() } else { shown(installed) };
+    let replaced = facts.iter().find_map(|fact| match fact {
+        Fact::Replaced(old) if !old.is_empty() => Some(format!("push: {host}: replaced {what} {}", shown(old))),
+        _ => None,
+    });
+    Some(replaced.into_iter().chain([format!("push: {host}: installed {what} {new}")]).collect())
+}
+
+/// Pushes the commit `source` names from its repo to `<root>/gate-push/src.git` on `mac` as [`PUSHED_REF`], forced, git
+/// reaching the builder through `ssh`, bounded at the push's call bound; else why it failed.
+fn sent(mac: &Mac, ssh: &Path, source: &Source, push: &MacPush<'_>) -> Result<(), String> {
+    let GitCall {
+        program,
+        mut args,
+        mut variables,
+    } = GitCall::new(&source.repo_root, push.variables)?;
+    variables.retain(|(name, _)| !["GIT_SSH_COMMAND", "GIT_ALLOW_PROTOCOL"].iter().any(|set| name.eq_ignore_ascii_case(set)));
+    variables.push(("GIT_SSH_COMMAND".into(), git_ssh_command(ssh).into()));
+    variables.push(("GIT_ALLOW_PROTOCOL".into(), "ssh".into()));
+    let url = format!("{}:{}/gate-push/src.git", mac.alias, mac.root);
+    let refspec = format!("+{}:{PUSHED_REF}", source.commit);
+    let words = [
+        "-c",
+        "push.gpgSign=false",
+        "push",
+        "--no-verify",
+        "--no-recurse-submodules",
+        "--",
+        &url,
+        &refspec,
+    ];
+    args.extend(words.map(OsString::from));
+    let heard = called(&Call {
+        program: &program,
+        args,
+        input: b"",
+        variables: &variables,
+        bound: push.bound,
+    });
+    match heard.end {
+        End::Exited(0) => Ok(()),
+        End::Exited(_) => Err(format!("git push failed: {}", no_answer(&heard))),
+        End::TimedOut => Err(format!("git push timed out after {} s", push.bound.as_millis().div_ceil(1000))),
+        End::Failed(why) => Err(why),
     }
 }
 
@@ -783,6 +1459,10 @@ enum Fact {
     /// The desktop task was not registered, for this reason.
     Unregistered(String),
     Failed(String),
+    /// A macOS builder's installed box says this version, empty for none.
+    Version(String),
+    /// A macOS builder is ready for the git push.
+    Ready,
 }
 
 /// The fact `line` states, `None` for a line that states none.
@@ -800,6 +1480,8 @@ fn fact(line: &str) -> Option<Fact> {
         "registered" => Some(Fact::Registered),
         "unregistered" => Some(Fact::Unregistered(text)),
         "failed" => Some(Fact::Failed(text)),
+        "version" => Some(Fact::Version(text)),
+        "ready" => Some(Fact::Ready),
         _ => None,
     }
 }
@@ -839,24 +1521,12 @@ fn said(host: &str, version: &str, heard: &Heard, bound: Duration) -> Said {
 
 /// The stdout lines of a push that succeeded, else why it failed.
 fn ended(host: &str, version: &str, heard: &Heard, facts: &[Fact], bound: Duration) -> Result<Vec<String>, String> {
-    let status = match &heard.end {
-        End::TimedOut => return Err(format!("timed out after {} s", bound.as_millis().div_ceil(1000))),
-        End::Failed(why) => return Err(why.clone()),
-        End::Exited(status) => *status,
-    };
-    if let Some(reason) = facts.iter().find_map(|fact| match fact {
-        Fact::Failed(reason) => Some(reason),
-        _ => None,
-    }) {
-        return Err(shown(reason));
-    }
-    if status == 0
+    if status_of(heard, facts, bound)? == 0
         && let Some(out) = succeeded(host, version, facts)
     {
         return Ok(out);
     }
-    let reason = heard.last_error.as_deref().map(shown).or_else(|| heard.problem.clone());
-    Err(reason.unwrap_or_else(|| "no answer".to_owned()))
+    Err(no_answer(heard))
 }
 
 /// The lines of a push whose builder said it holds `version` already, or installed it, then what it did with the
@@ -881,26 +1551,13 @@ fn desktop<'a>(host: &'a str, facts: &'a [Fact]) -> impl Iterator<Item = String>
 
 /// The lines of a push whose builder said it holds `version` already, or installed it: `None` when it said neither.
 fn gate_lines(host: &str, version: &str, facts: &[Fact]) -> Option<Vec<String>> {
-    let theirs = |text: &str| if text.is_empty() { version.to_owned() } else { shown(text) };
     for fact in facts {
         if let Fact::Same(same) = fact {
-            return Some(vec![format!("push: {host}: gate {} already installed", theirs(same))]);
+            let same = if same.is_empty() { version.to_owned() } else { shown(same) };
+            return Some(vec![format!("push: {host}: gate {same} already installed")]);
         }
     }
-    let installed = facts.iter().find_map(|fact| match fact {
-        Fact::Installed(new) => Some(new),
-        _ => None,
-    })?;
-    let replaced = facts.iter().find_map(|fact| match fact {
-        Fact::Replaced(old) if !old.is_empty() => Some(format!("push: {host}: replaced gate {}", shown(old))),
-        _ => None,
-    });
-    Some(
-        replaced
-            .into_iter()
-            .chain([format!("push: {host}: installed gate {}", theirs(installed))])
-            .collect(),
-    )
+    installed_lines(host, "gate", version, facts)
 }
 
 /// Text a `push: ` line shows: escaped as the remote client escapes a builder's text, then cut to its first
@@ -928,8 +1585,9 @@ mod tests {
     use flate2::read::GzDecoder;
 
     use super::{
-        BOOTSTRAP, Call, End, Fact, Heard, LINE_CAP, MARKED_CAP, PWSH, Place, REGISTER, Said, Slots, called, encoded_line, fact, filled, gzipped,
-        kept, place, push_line, pushed_input, register_command, said, sha256_hex, version_of,
+        BOOTSTRAP, BUILD_BOUND, CARGO_BOUND, Call, End, Fact, Heard, LINE_CAP, MAC_SCRIPT, MARKED_CAP, PWSH, Place, REGISTER, Said, Slots, called,
+        encoded_line, fact, filled, gzipped, installed_lines, kept, mac_build_line, mac_ended, mac_prepare_line, place, push_line, pushed_input,
+        register_command, said, sha256_hex, version_of,
     };
     use crate::environment::Variables;
     use crate::run::find_program;
@@ -1028,6 +1686,309 @@ mod tests {
         assert_eq!(register_command(None), "Reg $g 'box register-desktop' 60");
         assert_eq!(register_command(Some(true)), "Reg $g 'box --test-box-register ok register-desktop' 60");
         assert_eq!(register_command(Some(false)), "Reg $g 'box --test-box-register fail register-desktop' 60");
+    }
+
+    /// A commit a macOS builder's line names.
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn a_mac_prepare_line_carries_only_a_root_a_macos_builder_may_have() {
+        assert_eq!(
+            mac_prepare_line("/Users/b/gate-remote"),
+            Ok("/bin/sh -s -- prepare /Users/b/gate-remote".to_owned())
+        );
+        assert_eq!(mac_prepare_line("/r_1/x.y-z"), Ok("/bin/sh -s -- prepare /r_1/x.y-z".to_owned()));
+        for root in [
+            "",
+            "/",
+            "relative/root",
+            "/a/../b",
+            "/a/./b",
+            "/a//b",
+            "/a/",
+            "/a b",
+            "/a;rm",
+            "/a/$(x)",
+            "/a'b",
+            "/a:b",
+            "/a\nb",
+            "/a`b",
+        ] {
+            assert!(mac_prepare_line(root).is_err(), "{root:?} is refused");
+        }
+    }
+
+    #[test]
+    fn a_mac_build_line_carries_only_checked_words() {
+        let id = &COMMIT[..12];
+        let version = format!("0.1.0+{id}");
+        assert_eq!(
+            mac_build_line("/r", COMMIT, id, &version),
+            Ok(format!("/bin/sh -s -- build /r {COMMIT} {id} {version}"))
+        );
+        assert!(
+            mac_build_line("/r", COMMIT, COMMIT, &format!("10.20.30+{COMMIT}")).is_ok(),
+            "an id of all 40 digits and a version of many-digit numbers"
+        );
+        assert!(
+            mac_build_line("/r/", COMMIT, id, &version).is_err(),
+            "the root is checked as the prepare line's"
+        );
+        let upper = COMMIT.to_uppercase();
+        let lettered = COMMIT.replacen('0', "g", 1);
+        let longer = format!("{COMMIT}0");
+        for sha in [&COMMIT[..39], longer.as_str(), upper.as_str(), lettered.as_str(), ""] {
+            assert!(mac_build_line("/r", sha, id, &version).is_err(), "the sha {sha:?} is refused");
+        }
+        for bad in [&COMMIT[..11], "123456789abc", "0123456789AB", "0123456789ab-dirty.12345678", ""] {
+            assert!(
+                mac_build_line("/r", COMMIT, bad, &format!("0.1.0+{bad}")).is_err(),
+                "the id {bad:?} is refused"
+            );
+        }
+        for version in [
+            format!("0.1.0+{}", &COMMIT[..13]),
+            format!("0.1+{id}"),
+            format!("v0.1.0+{id}"),
+            format!("0.1.0.1+{id}"),
+            format!("0..1+{id}"),
+            format!("0.1.0+{id} "),
+            format!("0.1.0+{id}\n"),
+            format!("0.1.0+{id};x"),
+            format!("0.1.0-rc+{id}"),
+            format!("0.1.0 +{id}"),
+            format!(r"0.1.0+{id}\u{{7}}"),
+            id.to_owned(),
+        ] {
+            assert!(mac_build_line("/r", COMMIT, id, &version).is_err(), "the version {version:?} is refused");
+        }
+    }
+
+    #[test]
+    fn a_mac_build_s_facts_map_to_the_box_lines() {
+        let facts = |lines: &[&str]| -> Vec<Fact> { lines.iter().filter_map(|line| fact(line)).collect() };
+        let box_lines = |lines: &[&str]| installed_lines("m1", "gate-box", "0.2.0", &facts(lines));
+        assert_eq!(
+            box_lines(&["gate-push: replaced 0.1.0", "gate-push: installed 0.2.0"]),
+            Some(vec![
+                "push: m1: replaced gate-box 0.1.0".to_owned(),
+                "push: m1: installed gate-box 0.2.0".to_owned()
+            ])
+        );
+        assert_eq!(
+            box_lines(&["gate-push: installed 0.2.0"]),
+            Some(vec!["push: m1: installed gate-box 0.2.0".to_owned()]),
+            "a first install says no replaced line"
+        );
+        assert_eq!(box_lines(&["gate-push: ready"]), None);
+        assert_eq!(fact("gate-push: version "), Some(Fact::Version(String::new())), "no installed box");
+        assert_eq!(fact("gate-push: version 0.2.0"), Some(Fact::Version("0.2.0".to_owned())));
+        let failed = heard(1, &["gate-push: failed another gate push is installing on this builder"], Some("noise"));
+        assert_eq!(
+            mac_ended(&failed, &facts(&failed.marked.iter().map(String::as_str).collect::<Vec<_>>()), BOUND),
+            Err("another gate push is installing on this builder".to_owned())
+        );
+        assert_eq!(
+            mac_ended(&heard(255, &[], Some("Connection refused")), &[], BOUND),
+            Err("Connection refused".to_owned())
+        );
+        assert_eq!(mac_ended(&heard(0, &[], None), &[], BOUND), Ok(()));
+    }
+
+    #[test]
+    fn the_mac_script_builds_without_seams_and_runs_only_when_whole() {
+        for word in ["--features", "--all-features", "test-seams"] {
+            assert!(!MAC_SCRIPT.contains(word), "the script never names {word}");
+        }
+        assert!(
+            MAC_SCRIPT.contains(concat!(
+                "out=$(cd / && bounded 1800 cargo build --release --locked --manifest-path \"$gp/src/Cargo.toml\" -p gate-box-unix \\\n",
+                "--target-dir \"$gp/target\" --message-format=json 2>>\"$gp/build.log\")\n"
+            )),
+            "the script builds the box alone, locked, from /, so no cargo config above the checkout is read, into the push's own \
+             target folder"
+        );
+        assert!(MAC_SCRIPT.trim_start().starts_with("main() {"), "the body is one function");
+        assert!(
+            MAC_SCRIPT.ends_with("\n}\nmain \"$@\"\n"),
+            "the function is called on the last line alone"
+        );
+        for needed in [
+            "exec </dev/null",
+            "trap '' PIPE HUP",
+            "umask 077",
+            "/usr/bin/lockf -s -t 0 9",
+            "GIT_CEILING_DIRECTORIES",
+        ] {
+            assert!(MAC_SCRIPT.contains(needed), "the script holds {needed}");
+        }
+        assert!(
+            MAC_SCRIPT.is_ascii() && !MAC_SCRIPT.contains('\r'),
+            "the script is plain ASCII with LF line ends"
+        );
+    }
+
+    #[test]
+    fn every_mac_script_git_call_closes_the_lock_and_reads_no_user_config() {
+        let wrapper = r#"g() { git -c gc.auto=0 -c maintenance.auto=false -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@" 9>&-; }"#;
+        assert!(MAC_SCRIPT.lines().any(|line| line == wrapper), "git runs through one wrapper");
+        for line in MAC_SCRIPT.lines().filter(|line| *line != wrapper && !line.starts_with("tool git ")) {
+            let words = line.split(|c: char| c.is_whitespace() || c == '(');
+            assert!(!words.into_iter().any(|word| word == "git"), "git is called only through g: {line}");
+        }
+        for needed in [
+            "GIT_CONFIG_GLOBAL=/dev/null\n",
+            "GIT_CONFIG_NOSYSTEM=1\n",
+            "GIT_NO_REPLACE_OBJECTS=1\n",
+            "export GIT_CEILING_DIRECTORIES GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM GIT_NO_REPLACE_OBJECTS\n",
+            "RUSTFLAGS='' RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER=''\nexport RUSTFLAGS RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER\n",
+            "\nLC_ALL=C\nexport LC_ALL\n",
+        ] {
+            assert!(MAC_SCRIPT.contains(needed), "the script holds {needed:?}");
+        }
+        let scrub = MAC_SCRIPT.find("GIT_[A-Za-z0-9_]*").expect("the GIT_ variables are removed");
+        for set in ["GIT_CONFIG_GLOBAL=", "GIT_NO_REPLACE_OBJECTS="] {
+            let at = MAC_SCRIPT.find(set).expect("the variable is set");
+            assert!(scrub < at, "{set} is set after the scrub");
+        }
+        assert!(!MAC_SCRIPT.contains("unset RUSTFLAGS"), "the wrappers are set empty, not unset");
+    }
+
+    #[test]
+    fn the_mac_script_bounds_cargo_and_refuses_what_would_break_the_install() {
+        for needed in [
+            "[ -x /usr/bin/perl ] || fail 'the builder has no /usr/bin/perl'",
+            "xcode-select -p",
+            "tool cargo 'run install-macos.sh --only \"Rust\"'",
+            "if [ ! -e \"$root\" ]; then /bin/mkdir -p -m 700 \"$root\"",
+            "--shared=0600 src.git",
+            "/bin/mv -fh \"$tmp\" \"$box\"",
+            "if [ -L \"$box\" ]; then fail \"$box is a symbolic link\"; fi",
+            "if [ -d \"$box\" ]; then fail \"$box is a folder\"; fi",
+            "[ \"$(/usr/bin/stat -f %l \"$1\" 2>/dev/null)\" = 1 ] || fail \"$1 is a link\"",
+        ] {
+            assert!(MAC_SCRIPT.contains(needed), "the script holds {needed:?}");
+        }
+        let prepare = MAC_SCRIPT.find("if [ \"$mode\" = prepare ]; then\n").expect("the prepare step");
+        for tool in ["tool git", "tool cc", "tool cargo", "[ -x /usr/bin/perl ]"] {
+            assert!(
+                MAC_SCRIPT.find(tool).is_some_and(|at| at < prepare),
+                "{tool} is checked before prepare returns"
+            );
+        }
+        for file in ["plain \"$lock\"", "plain \"$gp/build.log\"", "plain \"$gp/building\""] {
+            assert!(MAC_SCRIPT.contains(file), "{file} is checked before it is opened");
+        }
+    }
+
+    #[test]
+    fn the_pc_waits_for_a_mac_build_past_the_script_s_own_cargo_bound() {
+        let cargo = CARGO_BOUND.as_secs();
+        assert_eq!(cargo, 1800, "a cold build of the box takes minutes");
+        assert_eq!(
+            BUILD_BOUND,
+            CARGO_BOUND + Duration::from_secs(600),
+            "the PC waits 10 minutes past cargo's bound, so the script's line for it reaches the PC"
+        );
+        for needed in [
+            format!("bounded {cargo} cargo build"),
+            format!("fail \"cargo build did not finish in {cargo} s; see $gp/build.log\""),
+        ] {
+            assert!(MAC_SCRIPT.contains(&needed), "the script holds {needed:?}");
+        }
+    }
+
+    #[test]
+    fn the_mac_script_s_bound_kills_the_whole_process_group() {
+        let helper = concat!(
+            "if (!$p) { setpgrp(0, 0); exec { $ARGV[0] } @ARGV or exit 127 }\n",
+            "setpgrp($p, $p);\n",
+            "$SIG{ALRM} = sub { kill \"KILL\", -$p; waitpid $p, 0; exit 142 };\n",
+            "alarm $t; waitpid $p, 0; alarm 0;\n",
+            "exit($? & 127 ? 128 + ($? & 127) : $? >> 8)' \"$@\"\n",
+        );
+        assert!(
+            MAC_SCRIPT.contains(helper),
+            "the child leads a group of its own, which is killed whole at the bound"
+        );
+        assert!(!MAC_SCRIPT.contains("alarm shift; exec"), "no bound signals the program alone");
+        let bounded: Vec<&str> = MAC_SCRIPT.lines().filter(|line| line.contains("bounded ")).collect();
+        assert_eq!(bounded.len(), 3, "the login PATH, the --version reads and cargo are bounded: {bounded:?}");
+    }
+
+    #[test]
+    fn the_mac_script_names_the_file_tools_by_their_macos_paths() {
+        let bare = ["stat", "mv", "find", "cp", "rm", "mkdir", "chmod", "pgrep"];
+        for line in MAC_SCRIPT.lines() {
+            let words = line.split(|c: char| c.is_whitespace() || "(){};|&`\"'$".contains(c));
+            for word in words {
+                assert!(!bare.contains(&word), "{word} is called by its path: {line}");
+            }
+        }
+        for needed in [
+            "/usr/bin/stat -f %l",
+            "/bin/mv -fh",
+            "/usr/bin/find \"$1\" -prune",
+            "/bin/cp \"$exe\"",
+            "/bin/rm -rf src/.git",
+            "/bin/mkdir -m 700",
+            "/bin/chmod 700",
+        ] {
+            assert!(MAC_SCRIPT.contains(needed), "the script holds {needed:?}");
+        }
+    }
+
+    #[test]
+    fn the_mac_script_makes_the_checkout_s_git_folder_afresh_and_checks_the_tree() {
+        let readied = MAC_SCRIPT
+            .split_once("readied() {\n")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("the checkout is readied by one function");
+        let removed = readied.find("/bin/rm -rf src/.git || return 1").expect("the checkout's .git is removed");
+        let made = readied.find("g init -q src ").expect("and made again");
+        let alternates = readied
+            .find(">src/.git/objects/info/alternates || return 1")
+            .expect("its alternates written");
+        assert!(removed < made && made < alternates, "removed, made, then pointed at src.git: {readied}");
+        assert!(!MAC_SCRIPT.contains("locks src/.git"), "no lock is swept in a .git that is made afresh");
+        assert!(!MAC_SCRIPT.contains("rev-parse --git-dir"), "no .git is judged before it is made again");
+        assert!(
+            MAC_SCRIPT.contains("g -C src diff-index --quiet HEAD -- 2>>build.log || fail"),
+            "the checkout differs from its commit in no file"
+        );
+    }
+
+    #[test]
+    fn the_mac_script_keeps_src_git_whole() {
+        let made = MAC_SCRIPT.find("g init -q --bare --shared=0600 src.git").expect("src.git is made");
+        let judged = MAC_SCRIPT
+            .find("folder \"$gp/src.git\"\n")
+            .expect("src.git is judged as every push folder");
+        let swept = MAC_SCRIPT
+            .find("locks src.git -maxdepth 1 '(' -name packed-refs.lock -o -name HEAD.lock -o -name config.lock ')' -mmin +30\n")
+            .expect("old locks in src.git are swept");
+        let gc = MAC_SCRIPT
+            .find("{ setting receive.autogc false && setting gc.auto 0; }")
+            .expect("src.git runs no automatic gc");
+        let prepare = MAC_SCRIPT.find("if [ \"$mode\" = prepare ]; then\n").expect("the prepare step");
+        assert!(
+            made < judged && judged < swept && swept < gc && gc < prepare,
+            "both steps make, judge, sweep and set up src.git first"
+        );
+        assert!(
+            MAC_SCRIPT.contains("locks src.git/refs -name '*.lock' -mmin +30\n"),
+            "old ref locks are swept"
+        );
+    }
+
+    #[test]
+    fn every_script_line_fits_150_characters() {
+        for script in [super::SCRIPT, MAC_SCRIPT] {
+            for line in script.lines() {
+                assert!(line.chars().count() <= 150, "{} characters: {line}", line.chars().count());
+            }
+        }
     }
 
     #[test]

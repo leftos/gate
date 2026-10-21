@@ -712,8 +712,11 @@ fn read_builder_root(object: &Map<String, Value>, os: BuilderOs, prefix: &str) -
     }
 }
 
-/// Whether `root` is an absolute macOS path a builder root may be ([`read_builder_root`]).
-fn is_unix_root(root: &str) -> bool {
+/// Whether `root` is an absolute macOS path a builder root may be ([`read_builder_root`]): `/`, then names separated by
+/// single `/`, none empty, `.` or `..`, each of ASCII letters, digits, `.`, `_` and `-` only, so no shell reads any of
+/// it as more than one plain word.
+#[must_use]
+pub fn is_unix_root(root: &str) -> bool {
     root.strip_prefix('/')
         .is_some_and(|rest| rest.split('/').all(|name| root_name(name) && name.chars().all(is_layout_char)))
 }

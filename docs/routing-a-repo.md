@@ -76,7 +76,7 @@ This repo's `tools/builder/install-toolchains.ps1` does the rest: the toolchains
 
 ### A macOS builder
 
-A macOS builder (an Apple-silicon Mac, a dedicated builder nobody works on) is set up by `tools/builder/install-macos.sh`, run as the builder user over ssh. It is in progress: the Unix box and its install by `gate push` are GATE-607 and GATE-608.
+A macOS builder (an Apple-silicon Mac, a dedicated builder nobody works on) is set up by `tools/builder/install-macos.sh`, run as the builder user over ssh. The box gets onto the Mac by `gate push`, which builds it there ([design.md, `gate push`](design.md#gate-push)): the Mac needs git, cc (the Xcode Command Line Tools, `xcode-select --install`) and the Rust step below, and the PC needs a clean, committed `tools/install.ps1` install, whose `source.json` names the commit the Mac builds. The box lands in `<root>/bin/gate-box`, and the build's checkout, target folder and `build.log` live in `<root>/gate-push`.
 
 `remote.json`'s `builders` array (an entry with `os` `macos` and a `root`) is read and routes ([design.md, remote.json](design.md#remotejson)), and the transport, payload layout, path map and PC caches follow the entry's profile.
 
@@ -87,7 +87,7 @@ The words a macOS builder is sent are spelled for the Mac: the recognised paths 
 - **Git config** sets `core.autocrlf false` and `gc.pruneExpire never`. **Gate work root** (`--root`, default `~/gate-remote`) makes the root, `work` and `bin` at mode 700; the box refuses a root another account may write in.
 - **System** runs only as `sudo bash install-macos.sh --system --user <builder user> --only System`: no sleep, restart after power loss, wake on network, the open-file limits and Remote Login. Without `--system` it prints the commands it would run.
 - **Flags and exits** follow the Windows installer: `--only <prefix>,...` (case-insensitive prefixes, then the summary; `--only Summary` alone), `--list`, exit 2 on a bad argument or a prefix that matches no step, exit 1 when a step failed. Every step logs `OK`, `SKIP` or `FAIL` to stdout and `<prefix>/install.log`.
-- **Test:** `bash tools/builder/test-install-macos.sh`, on this PC or the Mac; it installs nothing.
+- **Test:** `bash tools/builder/test-install-macos.sh`, on this PC or the Mac; it installs nothing. `bash tools/builder/test-build-box-macos.sh` runs the script `gate push` sends (`MAC_SCRIPT`) against a scratch root with a real cargo build of the box; it runs on macOS only.
 
 `gate check --builder` hints at the installer for a missing node, pwsh, ffmpeg, netfx-sdk or a rust with no minimum: the hint names `tools/builder/install-toolchains.ps1` and points to this section.
 

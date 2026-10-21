@@ -474,7 +474,7 @@ pub(crate) mod ssh {
 
     /// The ssh command git runs: ssh's path with `/` separators, single-quoted for the shell git starts it through, and
     /// the options.
-    pub(super) fn git_ssh_command(ssh: &Path) -> String {
+    pub(crate) fn git_ssh_command(ssh: &Path) -> String {
         let path = ssh.to_string_lossy().replace('\\', "/");
         let quoted = format!("'{}'", path.replace('\'', r"'\''"));
         [quoted.as_str()].into_iter().chain(SSH_OPTIONS).collect::<Vec<_>>().join(" ")
