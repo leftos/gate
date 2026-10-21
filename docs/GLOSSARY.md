@@ -108,7 +108,6 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Heartbeat**: a line printed so a gate around the printer does not read quiet as a stall; the wait heartbeat is a waiting gate's `still waiting` line every 30 s, and the box heartbeat is the `gate-remote-heartbeat: <cpu ms>` line a box (the Windows box wrapper, or the Unix box every 5 s) writes while its command's CPU use earns one.
 - **Heavy**: the slot kind for work that keeps several cores busy; its pool's thread budget is 4.
 - **Held folders**: a pair's root parent, root, siblings and their `.git` entries (and each repo's git and common folder) opened by the client without delete sharing from the check until its last push is saved, so none can be renamed, removed or swapped for a link meanwhile (`remote/held.rs`).
-- **High-water map**: the Unix box's CPU source's record of each command-group member by (pid, start), kept at the highest CPU read so a member that exits keeps what it used; it only rises (`cpu.rs`).
 - **History key**: a journal run's `command` after `gate_state::normalize_command`: split with the C runtime's argument rules, tree flags and their paths dropped, `.tmp` and worktree paths shortened, each word re-quoted; runs with the same key count together.
 - **Holds the machine**: said of a critical gate once it has taken every heavy slot and every light slot but the beside allowance, and no gate runs lent a light parent's slot; its ticket then says `holds`.
 - **In-box gate**: a gate started inside a routed run's box job, trusted by `GATE_BOX_JOB`: it takes no slot and runs its command under its own watchdog ([design.md](design.md#critical-drain-and-nesting)).
@@ -124,7 +123,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Journal**: the append-only `events.jsonl` in the state root, one JSON line per gate event (`queue`, `take`, `release` and others), with its rolled file and gzip archive.
 - **Journal mutex**: the named mutex `Local\gate-journal` (with the root hash under a non-default root) that every gate holds, waiting up to 2 s, while it appends to the journal, rolls it and archives.
 - **Judging glob**: an output glob that decides which folders the stale line may name: the run's `outputs` (the defaults when the repo's entry is absent or `[]`) and the defaults `**/bin/**` and `**/.godot/mono/temp/bin/**`.
-- **Key folder**: the work folder one work-folder key names (`{root}\work\{key}`), with the records beside it: its lock, sync-back index, tools record and layout record; a prune removes an idle one whole except its lock.
+- **Key folder**: the work folder one work-folder key names (`{root}\work\{key}`), with the records beside it, `{key}.<extension>` for the lock, warm, layout, inputs, sent-build, tools, packages, index and command records; a prune removes an idle one whole except its lock.
 - **Key version**: `keyVersion` in the durations store, naming the rule set that made its keys; a store written under another one is rebuilt.
 - **Late arrival**: a PowerShell gate whose earliest claim or ticket `since` is later than the cutover flag's write time, because its caller bypassed the launcher; the cutover's drain names it.
 - **Late take**: the slot of its own kind that a covered gate takes, beside its running command, when its parent gate ends first; its `take` names the ended parent in `parentPid`.
@@ -241,6 +240,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Tagged line**: a `gate-remote-<tag>: ...` line the box writes on stderr for the client: `started`, `refused`, `heartbeat`, `outputs`, `killed` (the box killed the command, naming the run's nonce and `timed-out` or `backstop`) and `adjusted` (naming the run's nonce and the load-adjusted seconds the box counted).
 - **Take**: a gate acquiring its slot, journalled as `take`; **release** is letting it go, journalled as `release` before the slot is freed.
 - **Take-back**: undoing a bad install by reinstalling the previous commit with `tools/install.ps1`; the PowerShell gate it once returned to is gone.
+- **Tally**: the Unix box's CPU source's count of the command group's CPU, each process once: the processes read at the last tick by (pid, start), plus a retired sum of those that vanished with their reaper outside the group; it only rises (`cpu.rs`).
 - **Test map**: [test-map.md](test-map.md), which maps each source area to the suite modules and unit tests that reach it, as nextest filtersets; a step's proving loop runs only those, and so does an item's last gate in test mode `unstable`.
 - **Test mode**: the `gate-nextup` profile's `test mode: unstable|stable` line; `unstable` runs each item's reached tests and the full suite before a push or reinstall, `stable` runs the full suite for every item.
 - **Test seam**: a hidden `--test-*` flag, compiled only with the `test-seams` cargo feature, by which the suite sets a timing knob or prints the parsed request.
