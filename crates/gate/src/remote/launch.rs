@@ -23,7 +23,7 @@ pub(super) const KILL_WAIT: Duration = Duration::from_secs(30);
 /// no other process can open by a name. With `breakaway`, a process in it may start one outside it, as a box run on
 /// this machine starts its command; without, it refuses that, so no ssh or git started in it can leave it and outlive
 /// a kill.
-pub(super) fn call_job(breakaway: bool) -> io::Result<Job> {
+pub(crate) fn call_job(breakaway: bool) -> io::Result<Job> {
     if breakaway {
         Job::anonymous_kill_on_close_breakaway()
     } else {
@@ -33,7 +33,7 @@ pub(super) fn call_job(breakaway: bool) -> io::Result<Job> {
 
 /// The launch of `command`, created suspended on `console`: its program, words and working folder, and this process's
 /// environment with the command's own changes.
-pub(super) fn piped_launch(command: &Command, console: PipedConsole) -> io::Result<PipedLaunch> {
+pub(crate) fn piped_launch(command: &Command, console: PipedConsole) -> io::Result<PipedLaunch> {
     let words: Vec<Vec<u16>> = std::iter::once(command.get_program())
         .chain(command.get_args())
         .map(|word| word.encode_wide().collect())
@@ -54,7 +54,7 @@ pub(super) fn piped_launch(command: &Command, console: PipedConsole) -> io::Resu
 
 /// `launch` created suspended within `job`: the process, the read ends of its stdout and stderr, and the write end of
 /// its stdin when `fed`, else `None` and its stdin `NUL`.
-pub(super) fn launched(launch: &PipedLaunch, job: &Job, fed: bool) -> Result<(Suspended, File, File, Option<File>), LaunchError> {
+pub(crate) fn launched(launch: &PipedLaunch, job: &Job, fed: bool) -> Result<(Suspended, File, File, Option<File>), LaunchError> {
     if fed {
         let PipedFed {
             suspended,

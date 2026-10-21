@@ -153,6 +153,20 @@ pub(crate) fn remote_call(option: &str, value: &str, calls: &'static [&'static s
     })
 }
 
+/// The step and the whole milliseconds above 0 that `--test-box-git-limit`'s `<step>:<ms>` names, split at its last
+/// `:`, so a step whose name holds one is named whole; else the problem naming the value as given: no `:` or no step
+/// before it, or milliseconds [`above_zero`] refuses.
+#[cfg(feature = "test-seams")]
+pub(crate) fn git_limit(option: &str, value: &str) -> Result<(String, u64), Problem> {
+    match value.rsplit_once(':') {
+        Some((step, ms)) if !step.is_empty() => Ok((step.to_owned(), above_zero_shown(option, ms, value)?)),
+        _ => Err(Problem::BadGitLimit {
+            option: option.to_owned(),
+            value: value.to_owned(),
+        }),
+    }
+}
+
 /// The fault `--test-box-desktop` names, one of [`DESKTOP_MODES`]; else the problem naming the value.
 #[cfg(feature = "test-seams")]
 pub(crate) fn desktop_mode(option: &str, value: &str) -> Result<DesktopMode, Problem> {

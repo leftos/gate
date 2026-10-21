@@ -231,7 +231,7 @@ fn restore(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
     };
     // No ceiling watches the restore, so no kill ends its wait.
     Ok(match watched.wait(Some(&beat.stop), |_| None::<Infallible>, console) {
-        WaitEnd::Failed(status) => Restored::Ended(status),
+        WaitEnd::Failed { status, .. } => Restored::Ended(status),
         WaitEnd::ClientGone => Restored::Ended(watched.client_gone(console)),
         WaitEnd::Exited { stopped: true, .. } => Restored::Ended(stopped(watched, beat.lock, console)),
         WaitEnd::Exited { code, stopped: false } => {

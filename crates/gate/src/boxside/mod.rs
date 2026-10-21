@@ -58,6 +58,8 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
         return u32::from(INSTALL_STATUS);
     }
     let seams = &request.seams;
+    // Before any verb runs git, so every git step of this box takes the seam's bound.
+    preflight::set_git_limit(seams);
     match request.verb {
         // A verb with no request never reads stdin, which the push script that runs it keeps for its own files.
         BoxVerb::RegisterDesktop => register::register(seams, console),

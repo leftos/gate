@@ -738,6 +738,9 @@ pub enum Share {
     NoDelete,
     /// Read and delete it, but not write it, so what a reader hashed stays what the handle holds.
     NoWrite,
+    /// Nothing: no other open of it at all until the handle is closed, so an open that finds another handle already
+    /// there fails with a sharing violation.
+    None,
 }
 
 impl Share {
@@ -748,6 +751,7 @@ impl Share {
             Share::All => FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             Share::NoDelete => FILE_SHARE_READ | FILE_SHARE_WRITE,
             Share::NoWrite => FILE_SHARE_READ | FILE_SHARE_DELETE,
+            Share::None => 0,
         }
     }
 }

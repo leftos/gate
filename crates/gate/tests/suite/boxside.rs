@@ -346,8 +346,11 @@ fn preflight_rewrites_alternates_with_other_content_and_an_empty_one() {
 fn preflight_a_failing_git_step_exits_with_its_status() {
     let case = Case::new("preflight_a_failing_git_step");
     let folders = Folders::new(&case);
-    // An empty `.git` folder is no repository, so its first git step fails; a `.git` that is not a folder is skipped.
-    fs::create_dir_all(Path::new(&folders.work).join(".git")).expect("an empty .git folder can be made");
+    // A `.git` folder holding only an empty `HEAD` is no repository, so its first git step fails; one with no `HEAD` is
+    // made again, as an `init` cut short leaves it, and a `.git` that is not a folder is skipped.
+    let git_folder = Path::new(&folders.work).join(".git");
+    fs::create_dir_all(&git_folder).expect("an empty .git folder can be made");
+    fs::write(git_folder.join("HEAD"), "").expect("an empty HEAD can be written");
     let shape = Regex::new(r"(?m)^gate: remote git [a-z .-]+ failed \(status (-?\d+)\)$").expect("the pattern compiles");
 
     let outcome = gate_box(&case, "preflight", &folders.payload(), None);
@@ -860,6 +863,130 @@ fn preflight_a_dotnet_that_does_not_answer_is_an_unreadable_sdk_list() {
     assert!(!outcome.stdout.contains("gate: remote sdks"), "{outcome:?}");
     let unreadable = "gate: remote could not read the SDK list: dotnet --list-sdks did not answer in 1 s";
     assert!(outcome.stderr.lines().any(|line| line == unreadable), "{unreadable}: {outcome:?}");
+}
+
+/// How long a box whose git step parks may take to end once its bound passes or its client goes: a hang guard only, as
+/// the bound and the probe each end the step within a second or two of their own.
+const PARKED_GIT_GUARD: Duration = Duration::from_secs(120);
+
+/// The bound `--test-box-git-limit` gives a parked step whose own child's pid a case reads: long enough that the stub
+/// has started its child and written the pid on a loaded machine before the bound ends the step.
+const PARKED_PID_LIMIT_MS: u64 = 20_000;
+
+/// The preflight's first git step, the bare repository's `init`, never answers: it is ended with its tree at the bound
+/// `--test-box-git-limit` sets for it, and the preflight fails with status 1 and the bound line naming the step. Only
+/// the bound ends the step, so no load changes what the preflight says.
+#[test]
+fn preflight_ends_a_git_step_that_does_not_answer_within_its_limit() {
+    let case = Case::new("preflight_git_bound");
+    let folders = Folders::new(&case);
+    let stub = case.folder().join("stub");
+    let parked = case.folder().join("parked");
+    stub_git_on(&stub, "init", &parked);
+    let limit = format!("git init --bare:{PARKED_PID_LIMIT_MS}");
+    let mut call = box_call(&case, &["box", "--test-box-git-limit", &limit, "preflight"], &folders.payload());
+    call.env("PATH", path_with_git(&[stub]));
+
+    let outcome = ended_within(call.start(), PARKED_GIT_GUARD);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let bound = format!(
+        "gate: remote git init --bare failed: git did not answer within {} s",
+        PARKED_PID_LIMIT_MS / 1000
+    );
+    assert!(outcome.stderr.lines().any(|line| line == bound), "{bound}: {outcome:?}");
+    assert!(parked.exists(), "the parked step wrote its child's pid before its bound: {outcome:?}");
+    wait_until_gone(parked_pid(&parked));
+}
+
+/// The preflight's parked `init` of the work tree ends with its tree once the client closes the box's stderr, though no
+/// heartbeat runs in a preflight: the git wait probes stderr itself, and the box exits 255 as a lost connection does.
+/// The bare repository's `init` before it runs to its end, as a write of the shared bare repository does.
+#[test]
+fn preflight_ends_a_parked_git_step_when_the_client_goes() {
+    let case = Case::new("preflight_git_gone");
+    let folders = Folders::new(&case);
+    let stub = case.folder().join("stub");
+    let parked = case.folder().join("parked");
+    // The tree's `init` is the first step whose words hold the tree itself.
+    stub_git_on(&stub, &folders.work, &parked);
+    let mut call = bare_box_call(&case, &["box", "preflight"], &folders.payload());
+    call.env("PATH", path_with_git(&[stub]));
+    let (running, stderr) = call.start_with_closable_stderr();
+    let pid = parked_pid(&parked);
+
+    stderr.close();
+    let outcome = ended_within(running, PARKED_GIT_GUARD);
+
+    assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
+    wait_until_gone(pid);
+}
+
+/// A bare repository an `init` cut short left without its `HEAD` is initialised by the next preflight, which says it
+/// created it, rather than taken as made.
+#[test]
+fn preflight_initialises_a_bare_repository_left_without_its_head() {
+    let case = Case::new("preflight_half_made_bare");
+    let folders = Folders::new(&case);
+    fs::create_dir_all(Path::new(&folders.bare).join("objects")).expect("a half-made bare repository can be made");
+
+    let outcome = gate_box(&case, "preflight", &folders.payload(), None);
+
+    let printed = passed(&outcome);
+    assert!(
+        Path::new(&folders.bare).join("HEAD").is_file(),
+        "the bare repository has its HEAD: {outcome:?}"
+    );
+    let created = format!("gate: remote created {}", folders.bare);
+    assert!(printed.contains(&created.as_str()), "{created}: {outcome:?}");
+}
+
+/// A preflight's `config --get` of an existing tree's origin that does not answer fails at its bound with its own line,
+/// and is never read as a tree with no origin: no `remote add` follows it.
+#[test]
+fn preflight_a_config_read_at_its_bound_fails_with_its_own_line() {
+    let case = Case::new("preflight_config_bound");
+    let folders = Folders::new(&case);
+    passed(&gate_box(&case, "preflight", &folders.payload(), None));
+    let stub = case.folder().join("stub");
+    let parked = case.folder().join("parked");
+    stub_git_on(&stub, "--get", &parked);
+    let mut call = box_call(
+        &case,
+        &["box", "--test-box-git-limit", "git config:2000", "preflight"],
+        &folders.payload(),
+    );
+    call.env("PATH", path_with_git(&[stub]));
+
+    let outcome = ended_within(call.start(), PARKED_GIT_GUARD);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let bound = "gate: remote git config failed: git did not answer within 2 s";
+    assert!(outcome.stderr.lines().any(|line| line == bound), "{bound}: {outcome:?}");
+    assert!(!outcome.stderr.contains("remote add"), "no remote add follows: {outcome:?}");
+}
+
+/// The client closes the box's stderr while a second preflight's `config --get` of the tree's origin parks: the box
+/// exits 255, never reading the gone client as a tree with no origin, which a `remote add` would then fail on with its
+/// own status.
+#[test]
+fn preflight_ends_a_parked_config_read_when_the_client_goes() {
+    let case = Case::new("preflight_config_gone");
+    let folders = Folders::new(&case);
+    passed(&gate_box(&case, "preflight", &folders.payload(), None));
+    let stub = case.folder().join("stub");
+    let parked = case.folder().join("parked");
+    stub_git_on(&stub, "--get", &parked);
+    let mut call = bare_box_call(&case, &["box", "preflight"], &folders.payload());
+    call.env("PATH", path_with_git(&[stub]));
+    let (running, stderr) = call.start_with_closable_stderr();
+    let pid = parked_pid(&parked);
+
+    stderr.close();
+    let outcome = ended_within(running, PARKED_GIT_GUARD);
+
+    assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
+    wait_until_gone(pid);
 }
 
 /// The builder's `dotnet --list-sdks` runs in the system folder, not the folder `gate box` was started in: the stub
@@ -1993,26 +2120,596 @@ fn stub_dotnet_running(case: &Case, exit: i32, before: &str) -> PathBuf {
     stub
 }
 
-/// Puts a `git.cmd` in the stub folder `stub` that parks the box on its first git step — the fetch, before the
-/// restore — making `parked` and waiting for `go`, then running the real git with the same words. A case can so order
-/// a stop between the work folder's lock and the restore: it waits for `parked`, stops the run, and makes `go` to let
-/// the run go on to the restore's first look at the stop signal. Without it no step before the restore can be held.
-fn stub_git(stub: &Path, parked: &Path, go: &Path) {
-    let real = git_folder().join("git.exe");
-    fs::write(
-        stub.join("git.cmd"),
+/// Puts a `git.cmd` in the stub folder `stub` that holds the run's back ref reset, its `update-ref -d` in the bare
+/// repository just after the checkout and before the restore, until `go` exists ([`Does::WaitFor`]), `<go>.parked`
+/// made as it starts waiting. A case can so order a stop between the work folder's lock and the restore: it waits for
+/// `<go>.parked`, stops the run, and makes `go` to let the run go on to the restore's first look at the stop signal.
+/// The reset writes the shared bare repository, which a stop does not cut short, so the stop is the restore's to see.
+fn stub_git(stub: &Path, go: &Path) {
+    stub_git_doing(stub, &[("update-ref", Does::WaitFor(go))]);
+}
+
+/// What a [`stub_git_doing`] stub does for a git step one of whose words is the rule's word.
+enum Does<'a> {
+    /// Parks, starting fake-tool, which writes its pid to the path and waits for a go file no case makes, so only the
+    /// box's end of the step ends it.
+    Park(&'a Path),
+    /// Runs the real git the first time and parks as [`Does::Park`] does from the second time on.
+    ParkSecond(&'a Path),
+    /// Makes `<go>.parked`, waits for the go file `go`, then makes `<go>.ran` and runs the real git: a case sees the step
+    /// ran to its end after the go.
+    WaitFor(&'a Path),
+    /// Exits with this status, running no git.
+    Exit(u8),
+    /// Makes this file, then runs the real git: a case sees the step started.
+    Mark(&'a Path),
+}
+
+/// Puts a `git.cmd` in the folder `stub`, made when missing, that runs the real git with the same words, except for a
+/// git step one of whose words is a rule's word: the first such word, in the step's order, has the stub do what its
+/// rule says.
+fn stub_git_doing(stub: &Path, rules: &[(&str, Does<'_>)]) {
+    fs::create_dir_all(stub).expect("the stub folder can be made");
+    let park = |parked: &Path| {
         format!(
-            concat!(
-                "@echo off\r\nif exist \"{go}\" goto real\r\necho parked>\"{parked}\"\r\n",
-                ":wait\r\nif exist \"{go}\" goto real\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n",
-                ":real\r\n\"{real}\" %*\r\n",
+            "\"{FAKE_TOOL}\" pid-to \"{}\" wait \"{}\"\r\nexit /b 1\r\n",
+            shown(parked),
+            shown(&parked.with_extension("go"))
+        )
+    };
+    let mut script = vec!["@echo off\r\n:scan\r\nif \"%~1\"==\"\" goto real\r\n".to_owned()];
+    for (at, (word, _)) in rules.iter().enumerate() {
+        script.push(format!("if \"%~1\"==\"{word}\" goto rule{at}\r\n"));
+    }
+    script.push("shift\r\ngoto scan\r\n".to_owned());
+    for (at, (_, does)) in rules.iter().enumerate() {
+        script.push(format!(":rule{at}\r\n"));
+        script.push(match does {
+            Does::Park(parked) => park(parked),
+            Does::ParkSecond(parked) => {
+                let seen = shown(&parked.with_extension("seen"));
+                format!(
+                    "if exist \"{seen}\" goto again{at}\r\necho.>\"{seen}\"\r\ngoto real\r\n:again{at}\r\n{}",
+                    park(parked)
+                )
+            }
+            Does::WaitFor(go) => format!(
+                concat!(
+                    "echo.>\"{parked}\"\r\n:wait{at}\r\nif exist \"{go}\" goto went{at}\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait{at}\r\n",
+                    ":went{at}\r\necho.>\"{ran}\"\r\ngoto real\r\n",
+                ),
+                at = at,
+                parked = shown(&go.with_extension("parked")),
+                go = shown(go),
+                ran = shown(&go.with_extension("ran")),
             ),
-            go = shown(go),
-            parked = shown(parked),
-            real = shown(&real),
-        ),
-    )
-    .expect("the git stub can be written");
+            Does::Exit(code) => format!("exit /b {code}\r\n"),
+            Does::Mark(marker) => format!("echo.>\"{}\"\r\ngoto real\r\n", shown(marker)),
+        });
+    }
+    script.push(format!(":real\r\n\"{}\" %*\r\n", shown(&git_folder().join("git.exe"))));
+    fs::write(stub.join("git.cmd"), script.concat()).expect("the git stub can be written");
+}
+
+/// Puts a `git.cmd` in the folder `stub` that parks the git step one of whose words is `step` ([`Does::Park`]), its
+/// child's pid written to `parked`, and runs the real git for every other step.
+fn stub_git_on(stub: &Path, step: &str, parked: &Path) {
+    stub_git_doing(stub, &[(step, Does::Park(parked))]);
+}
+
+/// The pid of the fake-tool a [`stub_git_on`] stub parked on, once it has written it to `parked`.
+fn parked_pid(parked: &Path) -> u32 {
+    let mut pid = None;
+    wait_until("the git stub parked", || {
+        pid = fs::read_to_string(parked).ok().and_then(|text| text.trim().parse().ok());
+        pid.is_some()
+    });
+    pid.expect("the parked pid was read")
+}
+
+/// The payload of a run of one file whose command prints `command-ran`, its snapshot pushed, and a `PATH` whose git does
+/// what `rules` say ([`stub_git_doing`]).
+fn run_with_git_doing(case: &Case, rules: &[(&str, Does<'_>)]) -> (Value, OsString) {
+    let mut payload = box_payload(case, "k", &[FAKE_TOOL, "out", "command-ran"]);
+    snapshot(case, &mut payload, &[("a.txt", "a\n")]);
+    let stub = case.folder().join("stub");
+    stub_git_doing(&stub, rules);
+    (payload, path_for_run(&[stub]))
+}
+
+/// The payload of a run of one file, its snapshot pushed, and a `PATH` whose git parks on the run's `checkout`
+/// ([`stub_git_on`]), the pid of the parked step written to the case's `parked` file.
+fn parking_checkout(case: &Case) -> (Value, OsString, PathBuf) {
+    let parked = case.folder().join("parked");
+    let (payload, path) = run_with_git_doing(case, &[("checkout", Does::Park(&parked))]);
+    (payload, path, parked)
+}
+
+/// `gate box run` of `payload` with `PATH` set to `path`, `seams` before the verb and the suite's quiet heartbeat, to
+/// its end, failing once [`PARKED_GIT_GUARD`] has passed.
+fn run_box_parked(case: &Case, payload: &Value, path: &OsString, seams: &[&str]) -> Outcome {
+    let mut words = vec!["box"];
+    words.extend_from_slice(seams);
+    words.push("run");
+    let mut call = box_call(case, &words, &self::payload(payload));
+    call.env("PATH", path);
+    ended_within(call.start(), PARKED_GIT_GUARD)
+}
+
+/// `gate box run` of `payload` with `PATH` set to `path`, `seams` before the verb and a heartbeat every 200 ms: once
+/// the stub's parked step wrote its child's pid to `parked`, the client closes the box's stderr, and the box is waited
+/// for, failing once [`PARKED_GIT_GUARD`] has passed. Its outcome and the parked child's pid.
+fn run_box_gone_while_parked(case: &Case, payload: &Value, path: &OsString, (seams, parked): (&[&str], &Path)) -> (Outcome, u32) {
+    let mut words = vec!["box", "--test-heartbeat-ms", "200"];
+    words.extend_from_slice(seams);
+    words.push("run");
+    let mut call = bare_box_call(case, &words, &self::payload(payload));
+    call.env("PATH", path);
+    let (running, stderr) = call.start_with_closable_stderr();
+    let pid = parked_pid(parked);
+    stderr.close();
+    (ended_within(running, PARKED_GIT_GUARD), pid)
+}
+
+/// Asserts that `outcome` is a run that exited 255 for its client closing the connection, before its command. The
+/// line naming the step goes to the stderr the client closed, so no case reads it.
+fn assert_gone_before_the_command(outcome: &Outcome) {
+    assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
+    assert!(!outcome.stdout.contains("command-ran"), "the command never ran: {outcome:?}");
+}
+
+/// The run's checkout never answers: it is ended at the bound `--test-box-git-limit` sets for it, and the run fails
+/// with status 1 and the bound line naming the step, before its command. Only the bound ends the step, and every other
+/// step keeps its own bound, so no load changes what the run says.
+#[test]
+fn box_run_ends_a_git_step_that_does_not_answer_within_its_limit() {
+    let case = Case::new("box_run_git_bound");
+    let (payload, path, _parked) = parking_checkout(&case);
+
+    let outcome = run_box_parked(&case, &payload, &path, &["--test-box-git-limit", "checkout:2000"]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let bound = "gate: remote checkout failed: git did not answer within 2 s";
+    assert!(outcome.stderr.lines().any(|line| line == bound), "{bound}: {outcome:?}");
+    assert!(!outcome.stdout.contains("command-ran"), "the command never ran: {outcome:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// A git step the bound ends is ended with everything it started: the parked stub's own child, fake-tool, is gone once
+/// the run ends, as git for Windows' launcher would leave its inner git otherwise.
+#[test]
+fn box_run_ends_the_git_tree_of_a_step_it_bounded() {
+    let case = Case::new("box_run_git_bound_tree");
+    let (payload, path, parked) = parking_checkout(&case);
+    let limit = format!("checkout:{PARKED_PID_LIMIT_MS}");
+
+    let outcome = run_box_parked(&case, &payload, &path, &["--test-box-git-limit", &limit]);
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(parked.exists(), "the parked step wrote its child's pid before its bound: {outcome:?}");
+    wait_until_gone(parked_pid(&parked));
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// The client closes the box's stderr while the run's checkout parks: the heartbeat's probe finds it gone, the wait ends
+/// git's tree, and the box exits 255 as a lost connection does.
+#[test]
+fn box_run_ends_a_parked_git_step_when_the_client_goes() {
+    let case = Case::new("box_run_git_gone");
+    let (payload, path, parked) = parking_checkout(&case);
+
+    let (outcome, pid) = run_box_gone_while_parked(&case, &payload, &path, (&[], &parked));
+
+    assert_gone_before_the_command(&outcome);
+    wait_until_gone(pid);
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// A client gone while the run's `cat-file -e` after the fetch parks ends the run with 255, never read as a snapshot
+/// the fetch did not bring.
+#[test]
+fn box_run_ends_a_parked_cat_file_when_the_client_goes() {
+    let case = Case::new("box_run_cat_file_gone");
+    let parked = case.folder().join("parked");
+    let (payload, path) = run_with_git_doing(&case, &[("cat-file", Does::Park(&parked))]);
+
+    let (outcome, pid) = run_box_gone_while_parked(&case, &payload, &path, (&[], &parked));
+
+    assert_gone_before_the_command(&outcome);
+    wait_until_gone(pid);
+}
+
+/// A client gone while the run's `git grep` of the snapshot's attributes, the LFS listing, parks ends the run with 255,
+/// never read as a snapshot that names no LFS filter.
+#[test]
+fn box_run_ends_a_parked_lfs_listing_when_the_client_goes() {
+    let case = Case::new("box_run_listing_gone");
+    let parked = case.folder().join("parked");
+    let (payload, path) = run_with_git_doing(&case, &[("grep", Does::Park(&parked))]);
+
+    let (outcome, pid) = run_box_gone_while_parked(&case, &payload, &path, (&[], &parked));
+
+    assert_gone_before_the_command(&outcome);
+    wait_until_gone(pid);
+}
+
+/// A client gone while a pnpm run's `check-ignore` of `node_modules` parks ends the run with 255, and no install
+/// starts: the gone client is never read as a folder git does not ignore.
+#[test]
+fn box_run_ends_a_parked_check_ignore_when_the_client_goes() {
+    let case = Case::new("box_run_check_ignore_gone");
+    let mut payload = box_payload(&case, "k", &["pnpm", "run", "x"]);
+    snapshot(&case, &mut payload, &[(PNPM_LOCKFILE_PATH, PNPM_LOCKFILE)]);
+    let stub = case.folder().join("stub");
+    let parked = case.folder().join("parked");
+    stub_git_on(&stub, "check-ignore", &parked);
+    let path = path_for_pnpm(&[stub_pnpm(&case, 0, ""), stub]);
+
+    let (outcome, pid) = run_box_gone_while_parked(&case, &payload, &path, (&[], &parked));
+
+    assert_gone_before_the_command(&outcome);
+    assert!(pnpm_calls(&case).is_empty(), "no install and no command: {outcome:?}");
+    wait_until_gone(pid);
+}
+
+/// After a checkout that failed, a client gone while the clean of the tree's untracked files parks ends the run with
+/// 255, not the checkout's status.
+#[test]
+fn box_run_ends_with_255_when_the_client_goes_during_the_clean_after_a_failed_checkout() {
+    let case = Case::new("box_run_clean_gone");
+    let parked = case.folder().join("parked");
+    // The checkout fails and the tree's grep finds the LFS filter, so the clean runs.
+    let rules = [
+        ("checkout", Does::Exit(1)),
+        ("--untracked", Does::Exit(0)),
+        ("clean", Does::Park(&parked)),
+    ];
+    let (payload, path) = run_with_git_doing(&case, &rules);
+
+    let (outcome, pid) = run_box_gone_while_parked(&case, &payload, &path, (&[], &parked));
+
+    assert_gone_before_the_command(&outcome);
+    wait_until_gone(pid);
+}
+
+/// After a checkout that failed, the leftover-LFS check's `git grep` of the tree that does not answer is ended at its
+/// bound and says its line, and the run fails with the checkout's own status.
+#[test]
+fn box_run_says_the_leftover_lfs_check_could_not_run_at_its_bound_before_the_command() {
+    let case = Case::new("box_run_lfs_check_bound_before");
+    let parked = case.folder().join("parked");
+    let rules = [("checkout", Does::Exit(1)), ("--untracked", Does::Park(&parked))];
+    let (payload, path) = run_with_git_doing(&case, &rules);
+
+    let outcome = run_box_parked(&case, &payload, &path, &["--test-box-git-limit", "grep:2000"]);
+
+    assert_eq!(outcome.code, Some(1), "the checkout's own status: {outcome:?}");
+    let said = lines(&outcome.stderr);
+    assert!(
+        said.contains(&"gate: remote leftover-LFS check could not run: git did not answer within 2 s"),
+        "{outcome:?}"
+    );
+    assert!(said.contains(&"gate: remote checkout failed (status 1)"), "{outcome:?}");
+    assert!(!outcome.stdout.contains("command-ran"), "the command never ran: {outcome:?}");
+}
+
+/// After the command, an `add -A` that failed has the leftover-LFS check's `git grep` of the tree run; one that does
+/// not answer is ended at its bound and says its line, and the back commit fails with `add`'s own line.
+#[test]
+fn box_run_says_the_leftover_lfs_check_could_not_run_at_its_bound_after_the_command() {
+    let case = Case::new("box_run_lfs_check_bound_after");
+    let parked = case.folder().join("parked");
+    let rules = [("-A", Does::Exit(1)), ("--untracked", Does::Park(&parked))];
+    let (payload, path) = run_with_git_doing(&case, &rules);
+
+    let outcome = run_box_parked(&case, &payload, &path, &["--test-box-git-limit", "grep:2000"]);
+
+    assert!(outcome.stdout.contains("command-ran"), "the command ran: {outcome:?}");
+    let said = lines(&outcome.stderr);
+    assert!(
+        said.contains(&"gate: remote leftover-LFS check could not run: git did not answer within 2 s"),
+        "{outcome:?}"
+    );
+    assert!(outcome.stderr.contains("add failed (status 1)"), "{outcome:?}");
+}
+
+/// A write of the shared bare repository runs on past a gone client to its bound, which ends it with its tree; the run
+/// then exits 255 as a lost connection does, not 1 as for a step its bound alone ended.
+#[test]
+fn box_run_exits_255_when_a_bare_write_s_bound_ends_it_after_the_client_went() {
+    let case = Case::new("box_run_bare_bound_gone");
+    let parked = case.folder().join("parked");
+    let (payload, path) = run_with_git_doing(&case, &[("update-ref", Does::Park(&parked))]);
+    let limit = format!("back ref reset:{PARKED_PID_LIMIT_MS}");
+
+    let (outcome, pid) = run_box_gone_while_parked(&case, &payload, &path, (&["--test-box-git-limit", &limit], &parked));
+
+    assert_gone_before_the_command(&outcome);
+    wait_until_gone(pid);
+}
+
+/// A pair run whose second push the bound ends after the client went still deletes every back ref it pushed: the
+/// undo's `update-ref -d`, writes of the shared bare repository, start though the client is gone, and the run exits 255.
+#[test]
+fn box_run_undoes_its_pushes_when_the_client_went_during_a_failed_push() {
+    let case = Case::new("box_run_undo_after_gone");
+    let payload = changing_two_of_three(&case);
+    let stub = case.folder().join("stub");
+    let parked = case.folder().join("parked");
+    stub_git_doing(&stub, &[("push", Does::ParkSecond(&parked))]);
+    let path = path_for_run(&[stub]);
+    let limit = format!("push lib:{PARKED_PID_LIMIT_MS}");
+
+    let (outcome, pid) = run_box_gone_while_parked(&case, &payload, &path, (&["--test-box-git-limit", &limit], &parked));
+
+    assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
+    let back = format!("refs/gate-back/{PAIR_KEY}");
+    assert!(!has_ref(&payload, &back), "the main repo's pushed back ref was deleted: {outcome:?}");
+    assert!(
+        !has_ref_in(&sibling_bare(&payload, "lib"), &back),
+        "the sibling's back ref is gone: {outcome:?}"
+    );
+    wait_until_gone(pid);
+}
+
+/// A stop while the run's fetch parks ends the fetch and its tree at once, through the stop signal its wait looks at,
+/// and the run fails with status 1 naming the stop, before its command.
+#[test]
+fn box_run_a_stop_during_a_parked_fetch_ends_it_and_its_tree() {
+    let case = Case::new("box_run_stop_fetch");
+    let parked = case.folder().join("parked");
+    let (payload, path) = run_with_git_doing(&case, &[("fetch", Does::Park(&parked))]);
+    let running = start_box_with_path(&case, &payload, Some(&path));
+    let pid = parked_pid(&parked);
+
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    let outcome = ended_within(running, PARKED_GIT_GUARD);
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let line = format!("gate: remote fetch failed: the job {} was stopped", field(&payload, "Job"));
+    assert!(outcome.stderr.lines().any(|said| said == line), "{line}: {outcome:?}");
+    assert!(!outcome.stdout.contains("command-ran"), "the command never ran: {outcome:?}");
+    wait_until_gone(pid);
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// A stop while the run's `update-ref -d` in the bare repository waits lets it run to its end: the write of the shared
+/// bare repository is not cut short, and the run then ends for the stop before its command.
+#[test]
+fn box_run_a_stop_during_a_bare_write_lets_it_run_to_its_end() {
+    let case = Case::new("box_run_stop_bare_write");
+    let go = case.folder().join("go");
+    let (payload, path) = run_with_git_doing(&case, &[("update-ref", Does::WaitFor(&go))]);
+    let running = start_box_with_path(&case, &payload, Some(&path));
+    wait_until("the back ref reset waits for its go", || go.with_extension("parked").exists());
+
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    let_go(&go);
+    let outcome = ended_within(running, PARKED_GIT_GUARD);
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert!(
+        go.with_extension("ran").exists(),
+        "the bare write ran on to its end after the stop: {outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let said = stopped_line_for(field(&payload, "Job"));
+    assert!(outcome.stderr.lines().any(|line| line == said), "{said}: {outcome:?}");
+    assert!(!outcome.stdout.contains("command-ran"), "the command never ran: {outcome:?}");
+}
+
+/// The lock files a git step the box ended can leave, which the next run removes before its first git step: the
+/// tree's `.git\index.lock`, `.git\HEAD.lock` and `.git\config.lock`, `{Work}.index.lock`, and the key's own back ref's
+/// lock in the bare repository.
+fn left_locks(payload: &Value) -> [PathBuf; 5] {
+    let git_folder = Path::new(field(payload, "Work")).join(".git");
+    let gate_back = Path::new(field(payload, "Bare")).join(r"refs\gate-back");
+    [
+        git_folder.join("index.lock"),
+        git_folder.join("HEAD.lock"),
+        git_folder.join("config.lock"),
+        PathBuf::from(format!("{}.index.lock", field(payload, "Work"))),
+        gate_back.join(format!("{}.lock", field(payload, "Key"))),
+    ]
+}
+
+/// Each lock file an ended git step can leave is removed by the next run before its first git step, which then passes.
+#[test]
+fn box_run_removes_the_lock_files_an_ended_git_step_left() {
+    let case = Case::new("box_run_sweeps_locks");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "command-ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    for lock in left_locks(&payload) {
+        fs::create_dir_all(lock.parent().expect("a lock has a folder")).expect("the lock's folder can be made");
+        fs::write(&lock, "").expect("a lock file can be left");
+    }
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("command-ran"), "{outcome:?}");
+    for lock in left_locks(&payload) {
+        assert!(fs::symlink_metadata(&lock).is_err(), "{} was removed: {outcome:?}", lock.display());
+    }
+}
+
+/// The sweep removes nothing else in the bare repository: its `packed-refs.lock` and another key's back ref lock may
+/// be another work folder's run's, and stay.
+#[test]
+fn box_run_leaves_the_bare_repository_s_other_locks_alone() {
+    let case = Case::new("box_run_keeps_bare_locks");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "command-ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let bare = Path::new(field(&payload, "Bare"));
+    let kept = [bare.join("packed-refs.lock"), bare.join(r"refs\gate-back\other.lock")];
+    for lock in &kept {
+        fs::create_dir_all(lock.parent().expect("a lock has a folder")).expect("the lock's folder can be made");
+        fs::write(lock, "").expect("a lock file can be left");
+    }
+
+    // The run's own ref writes may refuse while another's lock stands; only what the sweep leaves is looked at.
+    let outcome = run_box(&case, &payload);
+
+    for lock in &kept {
+        assert!(lock.is_file(), "{} stays: {outcome:?}", lock.display());
+    }
+    wait_until_closed(Path::new(field(&payload, "Lock")));
+}
+
+/// A junction named `index.lock` in the tree's `.git` is removed as itself: the folder it leads to and the file in it
+/// stay, and the run passes.
+#[test]
+fn box_run_removes_a_junction_named_index_lock_without_following_it() {
+    let case = Case::new("box_run_sweeps_junction_lock");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "command-ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let lock = Path::new(field(&payload, "Work")).join(r".git\index.lock");
+    let target = canary(&case, "lock-target");
+    junction(&lock, &target);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(fs::symlink_metadata(&lock).is_err(), "the junction was removed: {outcome:?}");
+    assert_eq!(
+        fs::read_to_string(target.join("keep.txt")).expect("the junction's target keeps its file"),
+        "keep"
+    );
+}
+
+/// A `.git` that is a junction leads the sweep nowhere: the `index.lock` in the folder it leads to stays.
+#[test]
+fn box_run_leaves_the_index_lock_behind_a_git_junction_alone() {
+    let case = Case::new("box_run_sweep_git_junction");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "command-ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let target = canary(&case, "git-target");
+    let held_lock = target.join("index.lock");
+    fs::write(&held_lock, "").expect("a lock can be left in the junction's target");
+    let git_folder = Path::new(field(&payload, "Work")).join(".git");
+    if git_folder.exists() {
+        fs::remove_dir_all(&git_folder).expect("the tree's .git can be removed");
+    }
+    fs::create_dir_all(field(&payload, "Work")).expect("the work folder can be made");
+    junction(&git_folder, &target);
+
+    let outcome = run_box(&case, &payload);
+
+    assert!(held_lock.is_file(), "the lock behind the junction stays: {outcome:?}");
+    assert_eq!(
+        fs::read_to_string(target.join("keep.txt")).expect("the junction's target keeps its file"),
+        "keep"
+    );
+    assert_eq!(
+        outcome.code,
+        Some(0),
+        "the junction is no repository of the tree's, and the run readies one: {outcome:?}"
+    );
+}
+
+/// A folder where git's `index.lock` goes is no lock git left: the run is refused as a lay-out, and the folder stays.
+#[test]
+fn box_run_refuses_a_folder_named_index_lock_and_leaves_it() {
+    let case = Case::new("box_run_sweep_lock_folder");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "command-ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let lock = Path::new(field(&payload, "Work")).join(r".git\index.lock");
+    fs::create_dir_all(&lock).expect("a folder can be put where the lock goes");
+    fs::write(lock.join("inside.txt"), "inside").expect("a file can be put in it");
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(75), "{outcome:?}");
+    assert!(outcome.stderr.contains("is a folder where git's lock file goes"), "{outcome:?}");
+    assert!(!outcome.stdout.contains("command-ran"), "the command never ran: {outcome:?}");
+    assert!(lock.join("inside.txt").is_file(), "the folder stays whole: {outcome:?}");
+}
+
+/// A lock another handle holds open, a live git's or preflight's, is left to it: the sweep neither removes it nor
+/// refuses the run for it.
+#[test]
+fn box_run_leaves_a_lock_another_handle_holds_open() {
+    let case = Case::new("box_run_sweep_held_lock");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "command-ran"]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let lock = PathBuf::from(format!("{}.index.lock", field(&payload, "Work")));
+    fs::create_dir_all(lock.parent().expect("a lock has a folder")).expect("the lock's folder can be made");
+    let held = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(0)
+        .open(&lock)
+        .expect("the lock is made and held with no sharing");
+
+    let outcome = run_box(&case, &payload);
+    drop(held);
+
+    assert_ne!(outcome.code, Some(75), "the sweep refuses nothing for a held lock: {outcome:?}");
+    assert!(!outcome.stderr.contains("where git's lock file goes"), "{outcome:?}");
+    assert!(lock.is_file(), "the held lock stays: {outcome:?}");
+}
+
+/// A stop during the command keeps the back commit's git from starting: its first step, `add -A`, says the stop and
+/// never runs, so it leaves no `{Work}.index.lock` behind.
+#[test]
+fn box_run_after_a_stop_during_the_command_starts_no_back_commit_step() {
+    let case = Case::new("box_run_stop_no_back_commit");
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "spawn-wait", &go_word, "wait", &go_word]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let stub = case.folder().join("stub");
+    let added = case.folder().join("added");
+    stub_git_doing(&stub, &[("-A", Does::Mark(&added))]);
+    let running = start_box_with_path(&case, &payload, Some(&path_for_run(&[stub])));
+    let helper = spawned_pid(&running.wait_for_stdout("\n"));
+
+    let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
+    wait_until_gone(helper);
+    let outcome = running.finish();
+
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    let line = format!("failed: the job {} was stopped", field(&payload, "Job"));
+    assert!(outcome.stderr.contains(&line), "{line}: {outcome:?}");
+    assert!(!added.exists(), "no add was started: {outcome:?}");
+    let index_lock = PathBuf::from(format!("{}.index.lock", field(&payload, "Work")));
+    assert!(!index_lock.exists(), "no index lock is left: {outcome:?}");
+}
+
+/// A bare repository an `init` cut short left with its `objects` and `refs` and the `HEAD.lock` and `config.lock` it
+/// was writing, but no `HEAD`, is initialised by the next preflight: the locks are removed first, so `init` does not
+/// fail on them.
+#[test]
+fn preflight_initialises_a_bare_left_with_its_init_s_locks() {
+    let case = Case::new("preflight_half_made_bare_locks");
+    let folders = Folders::new(&case);
+    let bare = Path::new(&folders.bare);
+    for folder in ["objects", "refs"] {
+        fs::create_dir_all(bare.join(folder)).expect("a half-made bare repository can be made");
+    }
+    for lock in ["HEAD.lock", "config.lock"] {
+        fs::write(bare.join(lock), "").expect("an init's lock can be left");
+    }
+
+    let outcome = gate_box(&case, "preflight", &folders.payload(), None);
+
+    passed(&outcome);
+    assert!(bare.join("HEAD").is_file(), "the bare repository has its HEAD: {outcome:?}");
+}
+
+/// A `git clean` after a failed checkout that exits 255 itself, the client still there, is the clean's own failure:
+/// the run ends with the checkout's status, never read as a gone client.
+#[test]
+fn box_run_a_clean_that_exits_255_is_no_gone_client() {
+    let case = Case::new("box_run_clean_255");
+    let rules = [("checkout", Does::Exit(1)), ("--untracked", Does::Exit(0)), ("clean", Does::Exit(255))];
+    let (payload, path) = run_with_git_doing(&case, &rules);
+
+    let outcome = run_box_parked(&case, &payload, &path, &[]);
+
+    assert_eq!(outcome.code, Some(1), "the checkout's own status: {outcome:?}");
+    assert!(outcome.stderr.contains("clean failed (status 255)"), "the clean's own line: {outcome:?}");
 }
 
 /// `gate box run` of `payload`, started.
@@ -3706,8 +4403,11 @@ fn box_run_a_closed_stderr_pipe_stops_the_job_and_exits_255() {
     let mut payload = box_payload(&case, "k", &[r".\run.cmd"]);
     snapshot(&case, &mut payload, &[("a.txt", "a\n"), ("run.cmd", &script)]);
 
-    let running = box_call(&case, &["box", "run"], &self::payload(&payload)).start_with_closed(Closed::Stderr);
+    // Closed once the command runs: every git wait before it probes stderr, so a pipe closed from the start ends the
+    // run at its first git step.
+    let (running, stderr) = box_call(&case, &["box", "run"], &self::payload(&payload)).start_with_closable_stderr();
     running.wait_for_stdout("started");
+    stderr.close();
     let_go(&go);
 
     let outcome = running.finish();
@@ -4877,6 +5577,9 @@ fn box_run_with_a_pair_names_the_repo_after_its_failing_tree_step() {
     let lib_git = Path::new(&pair_tree(&json, "lib")).join(".git");
     fs::remove_dir_all(&lib_git).expect("lib's .git can be removed");
     fs::create_dir(&lib_git).expect("an empty .git folder can be made");
+    // An empty HEAD, so the folder is taken as made and read as no repository, rather than made again as a `.git` an
+    // `init` cut short left without its HEAD.
+    fs::write(lib_git.join("HEAD"), "").expect("an empty HEAD can be written");
 
     let outcome = run_box(&case, &renamed(&json, 1));
 
@@ -6036,11 +6739,12 @@ fn box_run_a_stop_before_the_restore_runs_no_restore() {
     let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
     snapshot(&case, &mut payload, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
     let stub = stub_dotnet(&case, 0);
-    let parked = case.folder().join("parked");
     let go = case.folder().join("go");
-    stub_git(&stub, &parked, &go);
+    stub_git(&stub, &go);
     let running = start_box_with_path(&case, &payload, Some(&path_for_run(std::slice::from_ref(&stub))));
-    wait_until("the box parked in its first git step, before the restore", || parked.exists());
+    wait_until("the box parked in its back ref reset, before the restore", || {
+        go.with_extension("parked").exists()
+    });
 
     let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
     let_go(&go);
@@ -6662,11 +7366,12 @@ fn box_run_a_stop_set_before_the_pnpm_install_runs_none() {
     let case = Case::new("box_run_pnpm_stop_before_install");
     let payload = pnpm_payload(&case, &[]);
     let stub = stub_pnpm(&case, 0, "");
-    let parked = case.folder().join("parked");
     let go = case.folder().join("go");
-    stub_git(&stub, &parked, &go);
+    stub_git(&stub, &go);
     let running = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).start();
-    wait_until("the box parked in its first git step, before the install", || parked.exists());
+    wait_until("the box parked in its back ref reset, before the install", || {
+        go.with_extension("parked").exists()
+    });
 
     let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
     let_go(&go);

@@ -13,7 +13,7 @@
 use std::io::{self, Write};
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, PoisonError};
+use std::sync::{Arc, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
 use gate_args::BoxSeams;
@@ -140,6 +140,21 @@ impl Probed for io::Stderr {
     /// is always the box's own stderr.
     fn probe(&mut self) -> io::Result<()> {
         probe(self.as_raw_handle())
+    }
+}
+
+/// Probes the box's stderr as the heartbeat's flush does ([`probe`]), setting `gone` when its reader has gone; any
+/// other failure sets nothing. Under `lock`, and only when it is free: a probe never waits on a forwarded line whose
+/// write the client is not taking, which holds it, nor on a box away on the command's UTF-8 console, and the next look
+/// probes again.
+pub(crate) fn probe_stderr(lock: &OutputLock, gone: &ClientGone) {
+    let _held = match lock.try_lock() {
+        Ok(held) => held,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => return,
+    };
+    if let Err(error) = probe(io::stderr().as_raw_handle()) {
+        mark_if_gone(gone, &error);
     }
 }
 

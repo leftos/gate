@@ -6,7 +6,7 @@
 //! `--test-box-sample-ms <n>`, `--test-box-sampler-fail true|false`, `--test-box-free-percent <1-100>`,
 //! `--test-box-kill-leaves <n>`, `--test-probe-limit-ms <n>`, `--test-box-desktop <fault>`,
 //! `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>`, `--test-box-desktop-ms <n>` and
-//! `--test-box-register ok|fail`, `--test-box-root-walk-stop <folder>` (each also as
+//! `--test-box-register ok|fail`, `--test-box-root-walk-stop <folder>`, `--test-box-git-limit <step>:<ms>` (each also as
 //! `--<seam>=<value>`) before the verb; without the feature each is no verb, and so the box usage.
 
 use std::ffi::{OsStr, OsString};
@@ -113,6 +113,8 @@ enum Seam {
     Register,
     /// `--test-box-root-walk-stop <folder>`: the preflight's walk above the work root ends at this folder, unjudged.
     RootWalkStop,
+    /// `--test-box-git-limit <step>:<ms>`: how long the box's git step `step` may take, in milliseconds.
+    GitLimit,
 }
 
 #[cfg(feature = "test-seams")]
@@ -141,6 +143,7 @@ impl Seam {
             "--test-box-desktop-ms" => Some(Seam::DesktopMs),
             "--test-box-register" => Some(Seam::Register),
             "--test-box-root-walk-stop" => Some(Seam::RootWalkStop),
+            "--test-box-git-limit" => Some(Seam::GitLimit),
             _ => None,
         }
     }
@@ -168,6 +171,7 @@ impl Seam {
             Seam::DesktopMs => "--test-box-desktop-ms",
             Seam::Register => "--test-box-register",
             Seam::RootWalkStop => "--test-box-root-walk-stop",
+            Seam::GitLimit => "--test-box-git-limit",
         }
     }
 }
@@ -201,7 +205,8 @@ fn seams(words: &mut Peekable<impl Iterator<Item = OsString>>, problems: &mut Ve
 }
 
 /// Sets `seam` from `value`: whole milliseconds above 0 for the heartbeat, the dotnet limit, the sample period, the
-/// probe limit and the desktop waits, `fail-before` for the console, `refused` for the token, any path for the park,
+/// probe limit and the desktop waits, a step and whole milliseconds above 0 after its last `:` for the git limit,
+/// `fail-before` for the console, `refused` for the token, any path for the park,
 /// whole bytes above 0 for the outputs, the inputs and the LFS budgets, `true` or `false` for the sampler's failure, a whole
 /// percent from 1 to 100 for the free share, a whole count above 0 for the processes a kill leaves, one of the desktop
 /// faults for the desktop, one of the session states for the desktop session, 1 to 64 letters, digits and `-` for the
@@ -230,6 +235,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::DesktopSession => seams.desktop_session = Some(crate::values::desktop_session(name, &value)?),
         Seam::DesktopMutex => seams.desktop_mutex = Some(crate::values::desktop_mutex(name, &value)?),
         Seam::DesktopMs => seams.desktop_ms = Some(crate::values::above_zero(name, &value)?),
+        Seam::GitLimit => seams.git_limit = Some(crate::values::git_limit(name, &value)?),
         Seam::Register => seams.register_ok = Some(crate::values::remote_call(name, &value, REGISTER_RESULTS)? == "ok"),
         Seam::Console => seams.fail_console = the_word(name, value, "fail-before", |option, value| Problem::BadConsoleFailure { option, value })?,
         Seam::Token => seams.refuse_token = the_word(name, value, "refused", |option, value| Problem::BadTokenRefusal { option, value })?,

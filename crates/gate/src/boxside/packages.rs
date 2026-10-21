@@ -21,7 +21,6 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::PoisonError;
 use std::time::Instant;
 
@@ -32,10 +31,10 @@ use gate_win32::{Job, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken
 use gate_wire::ordinal_upper;
 
 use crate::boxside::forward::{DRAIN, Forwarders, OutputLock};
-use crate::boxside::preflight::{is_real_folder, locate};
+use crate::boxside::preflight::{GitFailure, is_real_folder, locate};
 use crate::boxside::run::{
     Beat, FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, Folders, Look, REFUSED_STATUS, Request, Stopper, WaitEnd, Watched, Watching, WorkGit,
-    before_the_job, box_variables, end_job, full_path, said_stopped, with_safe_directory,
+    before_the_job, box_variables, client_gone, end_job, full_path, said_stopped, with_safe_directory,
 };
 use crate::boxside::stop::{packages_job_name, terminate_and_wait};
 use crate::boxside::tools::{read_record, write_record_file};
@@ -507,8 +506,9 @@ fn installed(record: &Record, key: &str, digest: &str, folder: &Path) -> bool {
 
 /// Whether git ignores `node_modules` in the folder `key` below the work root `work`, asked with the box's own git as
 /// it runs in the work tree ([`WorkGit::args`]), its repository and work tree named, never found from the folder;
-/// when it does not, or cannot say, the line saying why `manager`'s install is skipped is said.
-fn ignored(manager: &Manager, git: &WorkGit, work: &Path, key: &str, console: &mut Console) -> bool {
+/// when it does not, or cannot say, the line saying why `manager`'s install is skipped is said. A client gone while git
+/// runs is `Err` with the status the run ends on, its line said ([`client_gone`]), so no install starts.
+fn ignored(manager: &Manager, git: &WorkGit, work: &Path, key: &str, console: &mut Console) -> Result<bool, u32> {
     let work_text = work.to_string_lossy();
     let git_dir = format!(r"--git-dir={work_text}\.git");
     let work_tree = format!("--work-tree={work_text}");
@@ -519,24 +519,29 @@ fn ignored(manager: &Manager, git: &WorkGit, work: &Path, key: &str, console: &m
         format!(":(top){}/{NODE_MODULES}", key.replace('\\', "/"))
     };
     let args = git.args(&[&git_dir, &work_tree, "check-ignore", "-q", &path]);
-    let why = match git.git.code(&args, Stdio::null(), Stdio::null()) {
-        Ok(0) => return true,
+    let why = match git.quiet_code("check-ignore", &args, console) {
+        Ok(0) => return Ok(true),
         Ok(1) => {
             console.err(&format!(
                 "gate: remote {} install skipped: node_modules is not ignored in {}",
                 manager.name,
                 escaped(key)
             ));
-            return false;
+            return Ok(false);
         }
         Ok(status) => format!("status {status}"),
-        Err(message) => escaped(&message),
+        Err(GitFailure::NotStarted(message) | GitFailure::Failed(message)) => escaped(&message),
+        Err(GitFailure::ClientGone) => {
+            let gone = client_gone("check-ignore");
+            console.err(&gone.line);
+            return Err(gone.status);
+        }
     };
     console.err(&format!(
         "gate: remote could not ask git whether node_modules is ignored in {}: {why}",
         escaped(key)
     ));
-    false
+    Ok(false)
 }
 
 /// How running the install ended.
@@ -599,7 +604,7 @@ fn install(request: &Request<'_>, lockfile: &Lockfile<'_>, key: &str, beat: &Bea
     };
     // No ceiling watches the install, so no kill ends its wait.
     Ok(match watched.wait(Some(&beat.stop), |_| None::<Infallible>, console) {
-        WaitEnd::Failed(status) => Installed::Ended(status),
+        WaitEnd::Failed { status, .. } => Installed::Ended(status),
         WaitEnd::ClientGone => Installed::Ended(watched.client_gone(console)),
         WaitEnd::Exited { stopped: true, .. } => Installed::Ended(stopped(watched, beat.lock, console)),
         WaitEnd::Exited { code, stopped: false } => {
@@ -819,7 +824,7 @@ fn update_folder(request: &Request<'_>, git: &WorkGit, lockfile: &Lockfile<'_>, 
     let key = record_key(manager, &place);
     let path = format!("{}{PACKAGES_SUFFIX}", request.work);
     let mut record = read(&path, console);
-    if installed(&record, &key, &digest, folder) || !ignored(manager, git, lockfile.work, &place, console) {
+    if installed(&record, &key, &digest, folder) || !ignored(manager, git, lockfile.work, &place, console)? {
         return Ok(());
     }
     let mut dropped = false;

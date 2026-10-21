@@ -1,10 +1,10 @@
 //! `gate box run`: the work folder's lock taken, the subfolder checked, the snapshot checked out, the repo's dotnet tools
 //! restored, the command started in the payload's job with its output forwarded, the tree it left committed back, the
 //! outputs of a passed command packed ([`crate::boxside::outputs`]), and the command's status passed whole, as the
-//! PowerShell wrapper's `Invoke-Run` does. git starts through [`gate_win32::spawn`], under the spawn lock the command's
-//! own launch holds while its inheritable handle copies are open, so no git inherits a handle meant for the command; what
-//! git writes is forwarded line by line under the box's output lock, as the command's output is, so no heartbeat lands
-//! inside a line of git's ([`Git::forwarded`]). The command runs on a console whose code pages are UTF-8
+//! PowerShell wrapper's `Invoke-Run` does. git starts suspended in a kill-on-close job of its own and is waited for
+//! within its step's bound, ended once the client is gone or a stop came unless it writes the shared bare repository
+//! ([`preflight::run_git`]); what git writes is forwarded line by line under the box's output lock, as the command's
+//! output is, so no heartbeat lands inside a line of git's. The command runs on a console whose code pages are UTF-8
 //! ([`Utf8Console`]), or, when it cannot have one, on the box's default code page, which the box says and never fails
 //! the run for.
 //!
@@ -16,10 +16,11 @@
 use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError, TryLockError};
 use std::thread;
@@ -43,7 +44,9 @@ use crate::boxside::lfs::{self, RunLfs};
 use crate::boxside::msys;
 use crate::boxside::outputs::{self, Asked};
 use crate::boxside::packages;
-use crate::boxside::preflight::{self, Failed, GIT_REDIRECTS, Git, GitFailure, Unready, exit_code, git_failed};
+use crate::boxside::preflight::{
+    self, Failed, GIT_REDIRECTS, Git, GitClass, GitFailure, GitOutput, GitStep, GitStop, Pipe, Shared, Streams, Unready, git_failed,
+};
 use crate::boxside::probe;
 use crate::boxside::stop::{Ending, STOPPED, stop_event_name, terminate_and_wait};
 use crate::boxside::tools;
@@ -93,7 +96,7 @@ impl From<Failed> for NotCheckedOut {
 }
 /// How long one wait for a watched process's exit lasts before the box looks again whether the client is still there
 /// and, for the restore, whether a stop came.
-const WAIT_STEP: Duration = Duration::from_millis(100);
+pub(super) const WAIT_STEP: Duration = Duration::from_millis(100);
 /// What the box does instead when it cannot read the stop signal just before it starts the command.
 const STARTING_COMMAND: &str = "starting the command";
 /// How often the park seam looks for its path, and how long it looks before the launch goes on.
@@ -359,18 +362,96 @@ pub(super) fn lay_out_alone(asked: &inputs::WorkLock<'_>, console: &mut Console)
         main: &main,
         siblings: &[],
     };
-    let not = match WorkGit::ready(asked.lock, &OutputLock::default(), &ClientGone::default()).lay_out(&laid, console) {
+    let laid_out = swept(&laid)
+        .map_err(NotLaidOut::Refused)
+        .and_then(|()| WorkGit::ready(asked.lock, &OutputLock::default(), &ClientGone::default(), None).lay_out(&laid, console));
+    let not = match laid_out {
         Ok(held) => return Ok(held),
         Err(not) => not,
     };
     match not.refusal() {
-        Ok(why) => {
-            console.err(&refused_line(asked.nonce, Refusal::Layout));
-            console.err(&crate::remote::layout_line(repo_name_of(asked.bare), &escaped(&why)));
-            Err(REFUSED_STATUS)
-        }
+        Ok(why) => Err(layout_refused_alone(asked.nonce, repo_name_of(asked.bare), &why, console)),
         Err(failed) => Err(said(console, &failed)),
     }
+}
+
+/// Refuses a run or a verb that lays the work folder out `layout` for `why`, before its output lock is shared with a
+/// heartbeat: its refusal tag naming `nonce`, then the line naming the repo `repo` and why
+/// ([`crate::remote::layout_line`]); 75.
+fn layout_refused_alone(nonce: &str, repo: &str, why: &str, console: &mut Console) -> u32 {
+    console.err(&refused_line(nonce, Refusal::Layout));
+    console.err(&crate::remote::layout_line(repo, &escaped(why)));
+    REFUSED_STATUS
+}
+
+/// Removes the lock files a git step the box ended can leave where the work folder's lock covers them, before a
+/// lay-out's first git step: each tree's `.git\index.lock`, `.git\HEAD.lock` and `.git\config.lock`, the copied index's
+/// `{Work}.index.lock`, and in each bare repository the run's own back ref's `refs\gate-back\{key}.lock`. Nothing else
+/// in a bare repository is touched, its `packed-refs.lock` and every other ref's lock among them. Every folder on the
+/// way, from the work folder, its parent or the bare repository down, is opened as itself and held beneath its
+/// parent's handle, so no link or junction put there before or during the sweep leads it elsewhere: a folder on the
+/// way that is a link, a junction or missing has none of its locks looked at. Each lock is removed through a handle of
+/// its own that shares nothing ([`preflight::removed_lock`]): one another git, a preflight of the same key or the
+/// shared bare repository's `gc --auto` holds open is left to it. Else why not, a folder at a lock's name refused.
+fn swept(laid: &Laid<'_>) -> Result<(), String> {
+    let cannot = |path: &Path| {
+        let path = path.to_owned();
+        move |error: io::Error| format!("cannot open {}: {error}", path.display())
+    };
+    let work = Path::new(laid.work);
+    if let (Some(parent), Some(name)) = (work.parent(), work.file_name().and_then(|name| name.to_str()))
+        && let Some(held) = preflight::held_folder_at(parent).map_err(cannot(parent))?
+    {
+        let lock = format!("{name}.index.lock");
+        preflight::removed_lock(&held, &lock, &parent.join(&lock))?;
+    }
+    for repo in laid.repos() {
+        let tree = Path::new(&repo.tree);
+        if let Some(git_folder) = held_git_folder(work, tree).map_err(cannot(tree))? {
+            for lock in ["index.lock", "HEAD.lock", "config.lock"] {
+                preflight::removed_lock(&git_folder, lock, &tree.join(".git").join(lock))?;
+            }
+        }
+        let bare = Path::new(&repo.bare);
+        if let Some(gate_back) = held_beneath(bare, &["refs", "gate-back"]).map_err(cannot(bare))? {
+            let lock = format!("{}.lock", laid.key);
+            preflight::removed_lock(&gate_back, &lock, &bare.join(r"refs\gate-back").join(&lock))?;
+        }
+    }
+    Ok(())
+}
+
+/// The `.git` folder of the tree `tree` within the work folder `work`, held with every folder from `work` down to it
+/// ([`held_beneath`]); `None` when the tree does not lie in `work`, or one of them is missing or not a folder itself.
+fn held_git_folder(work: &Path, tree: &Path) -> io::Result<Option<File>> {
+    let Ok(within) = tree.strip_prefix(work) else {
+        return Ok(None);
+    };
+    let mut names: Vec<&str> = Vec::new();
+    for part in within.components() {
+        match (part, part.as_os_str().to_str()) {
+            (std::path::Component::Normal(_), Some(name)) => names.push(name),
+            _ => return Ok(None),
+        }
+    }
+    names.push(".git");
+    held_beneath(work, &names)
+}
+
+/// The folder `names` lead to from the folder `top`, `top` opened by its path and each name beneath the handle of the
+/// one before it, all as themselves ([`preflight::held_folder_beneath`]); `None` when one is missing or not a folder
+/// itself.
+fn held_beneath(top: &Path, names: &[&str]) -> io::Result<Option<File>> {
+    let Some(mut held) = preflight::held_folder_at(top)? else {
+        return Ok(None);
+    };
+    for name in names {
+        match preflight::held_folder_beneath(&held, name)? {
+            Some(next) => held = next,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(held))
 }
 
 /// Checks the run's `InputsDigest`, when it has one, against the work folder `held`'s inputs record and the copies it
@@ -578,7 +659,8 @@ pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
     // Made as soon as the lock is held and kept for the run, so a stop that comes before the job exists, during the
     // checkout, is kept for the look just before the job is created.
     let stop = match create_stop_event(request.job, console) {
-        Ok(stop) => stop,
+        // Shared with the run's git, whose waits look at it ([`WorkGit::shared`]).
+        Ok(stop) => Rc::new(stop),
         Err(status) => {
             no_back_commits(&request, console);
             return status;
@@ -610,29 +692,37 @@ pub(super) struct StopSignal<'a> {
     event: &'a NamedEvent,
     /// The run's job, which the signal belongs to and its line names.
     job: &'a str,
-    unread_said: Cell<bool>,
+    /// Whether the line saying the signal cannot be read was said, shared by every look of the run at the signal.
+    unread_said: Rc<Cell<bool>>,
 }
 
 impl<'a> StopSignal<'a> {
-    fn new(event: &'a NamedEvent, job: &'a str) -> StopSignal<'a> {
+    /// The signal `event` of the job `job`, whose unreadable line is said once across every signal sharing
+    /// `unread_said`: the run's own looks and each of its git waits.
+    pub(super) fn sharing(event: &'a NamedEvent, job: &'a str, unread_said: &Rc<Cell<bool>>) -> StopSignal<'a> {
         StopSignal {
             event,
             job,
-            unread_said: Cell::new(false),
+            unread_said: Rc::clone(unread_said),
         }
     }
 
     /// What a look at the signal finds, the line saying it cannot be read, ending with `then`, returned unsaid for the
     /// caller to say, and only the first time.
     pub(super) fn look(&self, then: &str) -> Look {
-        match look(|| self.event.is_set(), self.job, then) {
+        self.looked(self.event.is_set(), then)
+    }
+
+    /// What a look that read `read` off the signal finds, as [`StopSignal::look`] says it.
+    fn looked(&self, read: io::Result<bool>, then: &str) -> Look {
+        match look(|| read, self.job, then) {
             Look::Go(Some(_)) if self.unread_said.replace(true) => Look::Go(None),
             seen => seen,
         }
     }
 
     /// Whether a stop came, the line saying the signal cannot be read, ending with `then`, said the first time.
-    fn seen(&self, then: &str, console: &mut Console) -> bool {
+    pub(super) fn seen(&self, then: &str, console: &mut Console) -> bool {
         match self.look(then) {
             Look::Stopped => true,
             Look::Go(unread) => {
@@ -753,11 +843,22 @@ impl<'a> RunOutputs<'a> {
 
 /// The run once the lock is held: `Ok` with the status after the back commit, or `Err` with the status of a run that
 /// ended before it, its lines said. The heartbeat starts once the subfolder is checked and stops on every way out.
-fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, console: &mut Console) -> Result<u32, u32> {
+fn in_work_folder(request: &Request<'_>, stop: &Rc<NamedEvent>, seams: &BoxSeams, console: &mut Console) -> Result<u32, u32> {
+    // Before the run's first git call, so no lock an earlier run's ended git left fails it.
+    if let Err(why) = swept(&request.laid()) {
+        return Err(layout_refused_alone(request.nonce, request.repo_name(), &why, console));
+    }
     let lock = OutputLock::default();
     // Made with the lock, before the run's first git call, so git's forwarded output and the heartbeat share it.
     let gone = ClientGone::default();
-    let git = WorkGit::ready(request.lock, &lock, &gone);
+    // One flag for the run, so a stop signal that cannot be read is said once, however many of its waits look.
+    let unread_said = Rc::new(Cell::new(false));
+    let work_stop = WorkStop {
+        event: Rc::clone(stop),
+        job: request.job.to_owned(),
+        unread_said: Rc::clone(&unread_said),
+    };
+    let git = WorkGit::ready(request.lock, &lock, &gone, Some(work_stop));
     git.clear_back_refs(request, console).map_err(|failed| {
         let status = said(console, &failed);
         no_back_commits(request, console);
@@ -786,7 +887,7 @@ fn in_work_folder(request: &Request<'_>, stop: &NamedEvent, seams: &BoxSeams, co
         gone: &gone,
         pump: pump.as_ref(),
         seams,
-        stop: StopSignal::new(stop, request.job),
+        stop: StopSignal::sharing(stop, request.job, &unread_said),
         adjusted: Cell::new(None),
     };
     // The MSYS keeper (`boxside::msys`): up once the heartbeat beats and before the checkout's first git call, held
@@ -2401,7 +2502,7 @@ fn watch(started: Started<'_, '_>, console: &mut Console) -> Result<Ran, u32> {
             killed(watched, kill, &ceiling, beat.seams, console)
         }
         WaitEnd::ClientGone => Err(watched.client_gone(console)),
-        WaitEnd::Failed(status) => Err(watched.wait_failed(status, console)),
+        WaitEnd::Failed { status, .. } => Err(watched.wait_failed(status, console)),
     }
 }
 
@@ -2465,6 +2566,8 @@ pub(super) enum Watching {
     Command,
     Restore,
     Packages,
+    /// A git step of the box's own ([`preflight::run_git`]), whose failed wait its step's own line says.
+    Git,
 }
 
 impl Watching {
@@ -2474,24 +2577,27 @@ impl Watching {
             Watching::Command => "the command",
             Watching::Restore => "the restore",
             Watching::Packages => "the package restore",
+            Watching::Git => "git",
         }
     }
 
     /// What the box does instead when it cannot read the stop signal while it waits.
-    fn while_waiting(self) -> &'static str {
+    pub(super) fn while_waiting(self) -> &'static str {
         match self {
             Watching::Command => "watching the command",
             Watching::Restore => "watching the restore",
             Watching::Packages => "watching the package restore",
+            Watching::Git => "watching git",
         }
     }
 
     /// The line said when a leftover process still holds its output open once its main process exited.
-    fn leftover(self) -> &'static str {
+    pub(super) fn leftover(self) -> &'static str {
         match self {
             Watching::Command => "gate: remote command's output is still held open by a leftover process; stopped reading",
             Watching::Restore => "gate: remote the restore's output is still held open by a leftover process; stopped reading",
             Watching::Packages => "gate: remote the package restore's output is still held open by a leftover process; stopped reading",
+            Watching::Git => preflight::GIT_LEFTOVER,
         }
     }
 }
@@ -2514,8 +2620,9 @@ pub(super) enum WaitEnd<K> {
     /// The run's [`ClientGone`] was set first, by a forwarded line or a heartbeat line or probe whose write to the box's
     /// own output found its reader gone: the client closed the connection.
     ClientGone,
-    /// The box could not wait for it: the status 1, its line said and its job terminated.
-    Failed(u32),
+    /// The box could not wait for it, for `why`: the status 1, its job terminated and its line said, but for git, whose
+    /// step says `why` in its own failure line.
+    Failed { status: u32, why: String },
 }
 
 impl Watched<'_> {
@@ -2551,16 +2658,26 @@ impl Watched<'_> {
         console: &mut Console,
     ) -> Option<WaitEnd<K>> {
         match self.running.wait(WAIT_STEP) {
+            // git's job is its own, which `gate box stop` cannot reach: a git that exited was stopped only when this
+            // wait ended its job.
             Ok(Some(code)) => Some(WaitEnd::Exited {
                 code,
-                stopped: stopped || self.stop_seen(stop, console),
+                stopped: stopped || (!matches!(self.watching, Watching::Git) && self.stop_seen(stop, console)),
             }),
             Ok(None) if self.forwarders.client_gone() => Some(WaitEnd::ClientGone),
             Ok(None) => look(console).map(WaitEnd::Killed),
             Err(error) => {
-                let status = failed(console, &format!("cannot wait for {}: {error}", self.watching.what()));
-                end_job(self.job, console);
-                Some(WaitEnd::Failed(status))
+                let why = format!("cannot wait for {}: {error}", self.watching.what());
+                // git's step ends its own job and says a terminate that failed with its own line.
+                let status = match self.watching {
+                    Watching::Git => FAILED_STATUS,
+                    Watching::Command | Watching::Restore | Watching::Packages => {
+                        let status = failed(console, &why);
+                        end_job(self.job, console);
+                        status
+                    }
+                };
+                Some(WaitEnd::Failed { status, why })
             }
         }
     }
@@ -2680,7 +2797,7 @@ fn missing_snapshot(repo: &Repo<'_>) -> Failed {
 /// The failure of git `step` whose forwarded output found the client gone: the run ends as it ends when the command's
 /// forwarded output finds it gone, with [`CLOSED_STATUS`], git having already ended. The line names git once, though a
 /// tree-readying step's name starts with it.
-fn client_gone(step: &str) -> Failed {
+pub(super) fn client_gone(step: &str) -> Failed {
     let step = step.strip_prefix("git ").unwrap_or(step);
     Failed {
         line: format!("gate: remote the client closed the connection during git {step}"),
@@ -2709,12 +2826,12 @@ impl BackFailed {
 /// The run readies a tree with git as it runs every other step, under the lock it holds.
 impl preflight::TreeGit for WorkGit {
     fn run_step(&self, step: &str, args: &[&str], console: &mut Console) -> Result<(), Failed> {
-        self.git_step(step, args, console)
+        self.git_step(step, args, GitClass::Short, console)
     }
 
     /// Both of git's streams discarded, so nothing it says lands outside the box's output lock.
-    fn run_code(&self, args: &[&str]) -> Result<i32, String> {
-        self.git.code(&self.args(args), Stdio::null(), Stdio::null())
+    fn run_code(&self, step: &str, args: &[&str], console: &mut Console) -> Result<i32, GitFailure> {
+        self.quiet_code(step, &self.args(args), console)
     }
 
     /// A [`WorkGit`] is made only once the run holds the lock ([`WorkGit::ready`]).
@@ -2733,45 +2850,73 @@ pub(super) struct WorkGit {
     hooks: String,
     /// The box's output lock, which every line git writes is forwarded under.
     output: OutputLock,
-    /// The run's client-gone flag, which a failed forward of git's output sets and each git step reads once git ended.
+    /// The run's client-gone flag, which a failed forward of git's output or a probe of stderr sets and every git wait
+    /// reads.
     gone: ClientGone,
+    /// The run's stop signal, its job's name and whether the signal's unreadable line was said in the run
+    /// ([`StopSignal::sharing`]), which every git step a stop ends looks at; `None` for the inputs and LFS verbs, which
+    /// no stop reaches.
+    stop: Option<WorkStop>,
+}
+
+/// The run's stop signal as its git steps share it: the event, its job's name, and whether the signal's unreadable
+/// line was said in the run ([`StopSignal::sharing`]).
+struct WorkStop {
+    event: Rc<NamedEvent>,
+    job: String,
+    unread_said: Rc<Cell<bool>>,
 }
 
 impl WorkGit {
-    /// Finds git, its output to be forwarded under `output`, a failed forward setting `gone`; called only once the
-    /// caller holds the work folder's lock file `lock`.
-    fn ready(lock: &str, output: &OutputLock, gone: &ClientGone) -> WorkGit {
+    /// Finds git, its output to be forwarded under `output`, a failed forward setting `gone`, its steps ended by the
+    /// run's stop signal `stop`, when given; called only once the caller holds the work folder's lock file `lock`.
+    fn ready(lock: &str, output: &OutputLock, gone: &ClientGone, stop: Option<WorkStop>) -> WorkGit {
         WorkGit {
             git: Git::find(),
             hooks: format!(r"core.hooksPath={lock}\hooks"),
             output: Arc::clone(output),
             gone: Arc::clone(gone),
+            stop,
         }
     }
 
-    /// Runs git with the safety options and `args`, both of its streams forwarded ([`Git::forwarded`]); a non-zero
-    /// status, or a git that cannot be started, fails `step`, said as [`Git::step`] says it, and a client gone ends the
-    /// run ([`client_gone`]).
-    fn git_step(&self, step: &str, args: &[&str], console: &mut Console) -> Result<(), Failed> {
-        match self.git_code(step, args, console)? {
+    /// The box's output lock, the run's client-gone flag and its stop signal, which each of its git steps shares.
+    fn shared(&self) -> Shared<'_> {
+        Shared {
+            lock: &self.output,
+            gone: &self.gone,
+            stop: self.stop.as_ref().map(|stop| GitStop {
+                event: &stop.event,
+                job: &stop.job,
+                unread_said: &stop.unread_said,
+            }),
+        }
+    }
+
+    /// Runs git with the safety options and `args` as `step` of `class`, both of its streams forwarded; a non-zero
+    /// status, or a git that cannot be started or did not run to its end, fails `step`, said as [`Git::step`] says it,
+    /// and a client gone ends the run ([`client_gone`]).
+    fn git_step(&self, step: &str, args: &[&str], class: GitClass, console: &mut Console) -> Result<(), Failed> {
+        match self.git_code(step, args, class, console)? {
             0 => Ok(()),
             code => Err(git_failed(step, code)),
         }
     }
 
-    /// git's exit code for the safety options and `args`, both of its streams forwarded ([`Git::forwarded`]); a git that
-    /// cannot be started fails `step`, said as [`Git::step`] says it, and a client gone ends the run ([`client_gone`]).
-    fn git_code(&self, step: &str, args: &[&str], console: &mut Console) -> Result<i32, Failed> {
-        let ran = self
-            .git
-            .command(&self.args(args))
-            .map_err(GitFailure::Failed)
-            .and_then(|command| Git::forwarded(command, false, &self.output, &self.gone, console));
-        match ran {
-            Ok(output) => Ok(exit_code(output.status)),
-            Err(GitFailure::Failed(message)) => Err(Failed::without_status(format!("gate: remote {step} failed: {message}"))),
-            Err(GitFailure::ClientGone) => Err(client_gone(step)),
-        }
+    /// git's exit code for the safety options and `args` as `step` of `class`, both of its streams forwarded
+    /// ([`Git::run`]); a git that cannot be started or did not run to its end fails `step`, said as [`Git::step`] says
+    /// it, and a client gone ends the run ([`client_gone`]).
+    fn git_code(&self, step: &str, args: &[&str], class: GitClass, console: &mut Console) -> Result<i32, Failed> {
+        self.git
+            .run(
+                &self.args(args),
+                GitStep { name: step, class },
+                &Streams::FORWARDED,
+                self.shared(),
+                console,
+            )
+            .map(|ran| ran.code)
+            .map_err(|failure| failure.of_step(step))
     }
 
     /// The safety options, no `core.attributesFile` among them ([`crate::remote::lfs::NO_ATTRIBUTES_FILE`]), so the
@@ -2783,11 +2928,12 @@ impl WorkGit {
         all
     }
 
-    /// Runs `step` in the tree of `repo` with `args`, its output forwarded, its line naming the repo on a pair run.
-    fn step(&self, step: &str, repo: &Repo<'_>, args: &[&str], console: &mut Console) -> Result<(), Failed> {
+    /// Runs `step` as `class` in the tree of `repo` with `args`, its output forwarded, its line naming the repo on a
+    /// pair run.
+    fn step(&self, step: &str, class: GitClass, repo: &Repo<'_>, args: &[&str], console: &mut Console) -> Result<(), Failed> {
         let mut all = repo.at().to_vec();
         all.extend_from_slice(args);
-        self.git_step(&repo.step(step), &all, console)
+        self.git_step(&repo.step(step), &all, class, console)
     }
 
     /// Lays out the work folder for the run, before any checkout: the folder made when missing, opened as itself and
@@ -3037,43 +3183,37 @@ impl WorkGit {
         }
     }
 
-    /// git's standard output for `args` in the tree of `repo`, fed `feed` on its standard input when given, at most
-    /// `cap` bytes, its stderr forwarded; else the failure of `step`, said as [`WorkGit::git_step`] says it.
-    fn output(&self, step: &str, repo: &Repo<'_>, args: &[&str], feed: Option<&[u8]>, cap: usize, console: &mut Console) -> Result<Vec<u8>, Failed> {
+    /// git's standard output for `args` as `class` in the tree of `repo`, fed `feed` on its standard input when given,
+    /// at most `cap` bytes, its stderr forwarded; else the failure of `step`, said as [`WorkGit::git_step`] says it.
+    fn output(
+        &self,
+        (step, class): (&str, GitClass),
+        repo: &Repo<'_>,
+        args: &[&str],
+        (feed, cap): (Option<&[u8]>, usize),
+        console: &mut Console,
+    ) -> Result<Vec<u8>, Failed> {
         let step = repo.step(step);
-        let cannot = |message: String| Failed::without_status(format!("gate: remote {step} failed: {message}"));
         let mut all = repo.at().to_vec();
         all.extend_from_slice(args);
-        let mut command = self.git.command(&self.args(&all)).map_err(cannot)?;
-        let writer = match feed {
-            None => None,
-            Some(bytes) => {
-                let (reader, mut writer) = io::pipe().map_err(|error| cannot(format!("cannot make the pipe of its input: {error}")))?;
-                command.stdin(reader);
-                let bytes = bytes.to_vec();
-                Some(thread::spawn(move || writer.write_all(&bytes)))
-            }
+        let streams = Streams {
+            stdout: Pipe::Read,
+            stderr: Pipe::Forward,
+            feed,
         };
-        let ran = Git::forwarded(command, true, &self.output, &self.gone, console);
-        let written = writer.map(thread::JoinHandle::join);
-        let output = match ran {
-            Ok(output) => output,
-            Err(GitFailure::Failed(message)) => return Err(cannot(message)),
-            Err(GitFailure::ClientGone) => return Err(client_gone(&step)),
-        };
-        match exit_code(output.status) {
-            0 => {}
-            code => return Err(git_failed(&step, code)),
+        let ran = self
+            .git
+            .run(&self.args(&all), GitStep { name: &step, class }, &streams, self.shared(), console)
+            .map_err(|failure| failure.of_step(&step))?;
+        if ran.code != 0 {
+            return Err(git_failed(&step, ran.code));
         }
-        match written {
-            Some(Ok(Err(error))) => return Err(cannot(format!("its input could not be written: {error}"))),
-            Some(Err(_)) => return Err(cannot("the writer of its input panicked".to_owned())),
-            Some(Ok(Ok(()))) | None => {}
+        if ran.stdout.len() > cap {
+            return Err(Failed::without_status(format!(
+                "gate: remote {step} failed: it printed more than {cap} bytes"
+            )));
         }
-        if output.stdout.len() > cap {
-            return Err(cannot(format!("it printed more than {cap} bytes")));
-        }
-        Ok(output.stdout)
+        Ok(ran.stdout)
     }
 
     /// The run's LFS state, held from before its first checkout through its back commit. For a run that carries an
@@ -3092,7 +3232,7 @@ impl WorkGit {
         let unreadable = |why: String| Failed::without_status(format!("gate: remote lfs listing failed: {why}"));
         let listed = crate::remote::lfs::pointers_of(
             repo.snapshot,
-            &mut |args, feed, cap| self.output("lfs listing", repo, args, feed, cap, console),
+            &mut |args, feed, cap| self.output(("lfs listing", GitClass::Short), repo, args, (feed, cap), console),
             unreadable,
         )?;
         let mut lfs = lfs::covered(&repo.bare, digest, &listed).map_err(NotCheckedOut::Refused)?;
@@ -3113,7 +3253,7 @@ impl WorkGit {
         }
         let step = repo.step("lfs listing");
         let args = ["grep", "-q", "-F", "-e", "filter=lfs", repo.snapshot, "--", ATTRIBUTES_FILES];
-        match self.quiet_saying(repo, &args) {
+        match self.quiet_saying(repo, &step, &args, console) {
             Ok((0, _)) => lfs
                 .with_scratch(request.work, (request.key, request.nonce), console)
                 .map_err(NotCheckedOut::NoScratch),
@@ -3125,7 +3265,7 @@ impl WorkGit {
                 }
                 Err(failed.into())
             }
-            Err(message) => Err(Failed::without_status(format!("gate: remote {step} failed: {message}")).into()),
+            Err(failure) => Err(failure.of_step(&step).into()),
         }
     }
 
@@ -3144,7 +3284,7 @@ impl WorkGit {
         args.extend_from_slice(&pins);
         args.extend(["checkout", "-q", "--force", "--detach", repo.snapshot]);
         let step = repo.step("checkout");
-        match self.git_code(&step, &args, console)? {
+        match self.git_code(&step, &args, GitClass::Long, console)? {
             0 => self.lfs_post_check(repo, lfs, &pins, console),
             code => Err(self.checkout_failed(repo, lfs, (&step, code), console).into()),
         }
@@ -3154,12 +3294,23 @@ impl WorkGit {
     /// attributes name the LFS filter ([`WorkGit::names_lfs_in_tree`]), the line saying a file under it was found that
     /// the snapshot does not declare ([`lfs::NO_STORAGE_CHECKOUT`]), with git's status, once the tree's untracked files
     /// are cleaned (`clean -fdq`), as a passing checkout's are, so an attributes file a command left there does not
-    /// fail every later run; a clean that fails is said and leaves that line as it is. Else git's own ([`git_failed`]).
+    /// fail every later run; a clean that fails is said and leaves that line as it is, and a client gone during it is
+    /// the failure the run ends on ([`client_gone`]). Else git's own ([`git_failed`]).
     fn checkout_failed(&self, repo: &Repo<'_>, lfs: &RunLfs, (step, code): (&str, i32), console: &mut Console) -> Failed {
-        if lfs.has_scratch() || !self.names_lfs_in_tree(repo, console) {
+        if lfs.has_scratch() {
             return git_failed(step, code);
         }
-        if let Err(unclean) = self.step("clean", repo, &["clean", "-fdq"], console) {
+        match self.names_lfs_in_tree(repo, console) {
+            Ok(true) => {}
+            Ok(false) => return git_failed(step, code),
+            Err(gone) => return gone,
+        }
+        if let Err(unclean) = self.step("clean", GitClass::Long, repo, &["clean", "-fdq"], console) {
+            // A client gone during the clean ends the run as it does at every other step.
+            // Told by its line, as a clean that exits 255 itself is no gone client.
+            if unclean.line == client_gone(&repo.step("clean")).line {
+                return unclean;
+            }
             let _held = self.output.lock().unwrap_or_else(PoisonError::into_inner);
             console.err(&unclean.line);
         }
@@ -3172,17 +3323,19 @@ impl WorkGit {
     /// Whether a `.gitattributes` file of `repo`'s tree, at any depth and whatever the case of its name, tracked or
     /// untracked, holds the text `filter=lfs` (`git grep`), searched in the tree itself ([`WorkGit::quiet_in_tree`]); a
     /// file in an ignored folder is passed over, as `add -A` reads no attributes there and a package's own, in
-    /// `node_modules` say, would name a filter the run never ran. A `git grep` that fails, or cannot be started, says so
-    /// on the run's stderr and answers no, so the caller keeps git's own failure.
-    fn names_lfs_in_tree(&self, repo: &Repo<'_>, console: &mut Console) -> bool {
+    /// `node_modules` say, would name a filter the run never ran. A `git grep` that fails, cannot be started or that its
+    /// bound ended says so on the run's stderr and answers no, so the caller keeps git's own failure; a client gone
+    /// during it is `Err` with the failure the run ends on ([`client_gone`]).
+    fn names_lfs_in_tree(&self, repo: &Repo<'_>, console: &mut Console) -> Result<bool, Failed> {
         let args = ["grep", "-q", "-F", "-e", "filter=lfs", "--untracked", "--", ATTRIBUTES_FILES];
-        match self.quiet_in_tree(repo, &args) {
-            Ok(0) => true,
-            Ok(_) => false,
-            Err(message) => {
+        let step = repo.step("grep");
+        match self.quiet_in_tree(repo, &step, &args, console) {
+            Ok(code) => Ok(code == 0),
+            Err(GitFailure::ClientGone) => Err(client_gone(&step)),
+            Err(GitFailure::NotStarted(message) | GitFailure::Failed(message)) => {
                 let _held = self.output.lock().unwrap_or_else(PoisonError::into_inner);
                 console.err(&format!("gate: remote leftover-LFS check could not run: {message}"));
-                false
+                Ok(false)
             }
         }
     }
@@ -3208,7 +3361,7 @@ impl WorkGit {
             "--pathspec-from-file=-",
             "--pathspec-file-nul",
         ]);
-        self.output("lfs checkout", repo, &args, Some(&feed), RECHECKOUT_OUTPUT, console)?;
+        self.output(("lfs checkout", GitClass::Long), repo, &args, (Some(&feed), RECHECKOUT_OUTPUT), console)?;
         let still = lfs::wrong_files(&repo.tree, &lfs.pointers);
         match still.first() {
             None => Ok(()),
@@ -3226,7 +3379,7 @@ impl WorkGit {
     /// later push of the key changes nothing this run runs.
     fn checked_out_repo(&self, request: &Request<'_>, repo: &Repo<'_>, lfs: &RunLfs, console: &mut Console) -> Result<(), NotCheckedOut> {
         self.checked_out_tree(request, repo, lfs, console)?;
-        self.step("clean", repo, &["clean", "-fdq"], console)?;
+        self.step("clean", GitClass::Long, repo, &["clean", "-fdq"], console)?;
         // A pair run cleared every repo's back ref as soon as it held the lock ([`WorkGit::clear_back_refs`]).
         if request.siblings.is_empty() {
             self.clear_back_ref(request, repo, console)?;
@@ -3238,19 +3391,14 @@ impl WorkGit {
     /// failure, the box's own line for a commit the repository lacks after the fetch.
     fn fetched(&self, request: &Request<'_>, repo: &Repo<'_>, console: &mut Console) -> Result<(), Failed> {
         let refname = format!("refs/gate/{}", request.key);
-        self.step("fetch", repo, &["fetch", "-q", &repo.bare, &refname], console)?;
+        self.step("fetch", GitClass::Long, repo, &["fetch", "-q", &repo.bare, &refname], console)?;
         let commit = format!("{}^{{commit}}", repo.snapshot);
-        match self.quiet(repo, &["cat-file", "-e", &commit]) {
-            Ok(0) => {}
-            Ok(_) => return Err(missing_snapshot(repo)),
-            Err(message) => {
-                return Err(Failed {
-                    line: format!("gate: remote {} failed: {message}", repo.step("cat-file")),
-                    status: FAILED_STATUS,
-                });
-            }
+        let step = repo.step("cat-file");
+        match self.quiet(repo, &step, &["cat-file", "-e", &commit], console) {
+            Ok(0) => Ok(()),
+            Ok(_) => Err(missing_snapshot(repo)),
+            Err(failure) => Err(failure.of_step(&step)),
         }
-        Ok(())
     }
 
     /// On a pair run, every repo's back ref deleted ([`WorkGit::clear_back_ref`]), so no repo keeps an earlier run's
@@ -3262,12 +3410,22 @@ impl WorkGit {
         request.repos().try_for_each(|repo| self.clear_back_ref(request, repo, console))
     }
 
-    /// git's exit code for `args` in the tree of `repo`, both of its streams discarded, as the wrapper discards
-    /// `cat-file`'s own; else why git could not be started.
-    fn quiet(&self, repo: &Repo<'_>, args: &[&str]) -> Result<i32, String> {
+    /// git's exit code for `args` as the short step `step` in the tree of `repo`, both of its streams discarded, as the
+    /// wrapper discards `cat-file`'s own; else why git did not run to its end.
+    fn quiet(&self, repo: &Repo<'_>, step: &str, args: &[&str], console: &mut Console) -> Result<i32, GitFailure> {
         let mut all = repo.at().to_vec();
         all.extend_from_slice(args);
-        self.git.code(&self.args(&all), Stdio::null(), Stdio::null())
+        self.quiet_code(step, &self.args(&all), console)
+    }
+
+    /// git's exit code for `args` as they are, which the caller made with [`WorkGit::args`], as the short step `step`
+    /// with both of its streams discarded; else why git did not run to its end.
+    pub(super) fn quiet_code(&self, step: &str, args: &[&str], console: &mut Console) -> Result<i32, GitFailure> {
+        let step = GitStep {
+            name: step,
+            class: GitClass::Short,
+        };
+        self.git.run(args, step, &Streams::QUIET, self.shared(), console).map(|ran| ran.code)
     }
 
     /// As [`WorkGit::quiet`], run in the tree itself, the folder its `--work-tree` names: a `git grep --untracked` walks
@@ -3275,39 +3433,55 @@ impl WorkGit {
     /// profile, it would answer about the profile instead of the tree. Only a step that walks the tree takes it, and a
     /// tree folder that is missing or unreachable fails the start instead of reading the wrong folder
     /// ([`WorkGit::names_lfs_in_tree`] says so).
-    fn quiet_in_tree(&self, repo: &Repo<'_>, args: &[&str]) -> Result<i32, String> {
+    fn quiet_in_tree(&self, repo: &Repo<'_>, step: &str, args: &[&str], console: &mut Console) -> Result<i32, GitFailure> {
         let mut all = repo.at().to_vec();
         all.extend_from_slice(args);
-        let mut command = self.git.command(&self.args(&all))?;
-        command.current_dir(&repo.tree).stdout(Stdio::null()).stderr(Stdio::null());
-        Git::code_of(&mut command)
+        let mut command = self.git.command(&self.args(&all)).map_err(GitFailure::NotStarted)?;
+        command.current_dir(&repo.tree);
+        let step = GitStep {
+            name: step,
+            class: GitClass::Short,
+        };
+        preflight::run_git(&command, step, &Streams::QUIET, self.shared(), console).map(|ran| ran.code)
     }
 
-    /// git's exit code for `args` and the first line of its standard error, empty when it said none, its standard output
-    /// discarded, so a failure can say git's reason; else why git could not be started. `args` name the commit they
-    /// search, so no working directory is set.
-    fn quiet_saying(&self, repo: &Repo<'_>, args: &[&str]) -> Result<(i32, String), String> {
+    /// git's exit code for `args` as the short step `step` and the first line of its standard error, empty when it said
+    /// none, its standard output discarded, so a failure can say git's reason; else why git did not run to its end.
+    /// `args` name the commit they search, so no working directory is set.
+    fn quiet_saying(&self, repo: &Repo<'_>, step: &str, args: &[&str], console: &mut Console) -> Result<(i32, String), GitFailure> {
         let mut all = repo.at().to_vec();
         all.extend_from_slice(args);
-        let mut command = self.git.command(&self.args(&all))?;
-        // Started under the spawn lock, so it inherits no launch's handles.
-        let output = gate_win32::spawn(command.stdout(Stdio::null()).stderr(Stdio::piped()))
-            .and_then(Child::wait_with_output)
-            .map_err(|error| error.to_string())?;
-        let said = String::from_utf8_lossy(&output.stderr).lines().next().unwrap_or_default().to_owned();
-        Ok((exit_code(output.status), said))
+        let streams = Streams {
+            stdout: Pipe::Discard,
+            stderr: Pipe::Read,
+            feed: None,
+        };
+        let step = GitStep {
+            name: step,
+            class: GitClass::Short,
+        };
+        let ran = self.git.run(&self.args(&all), step, &streams, self.shared(), console)?;
+        let said = String::from_utf8_lossy(&ran.stderr).lines().next().unwrap_or_default().to_owned();
+        Ok((ran.code, said))
     }
 
     /// Deletes `refs/gate-back/<key>` in the bare repository of `repo`, an earlier run's back commit, so the client
-    /// finds none to fetch after a run that makes none.
+    /// finds none to fetch after a run that makes none. A write of the shared bare repository, which a gone client does
+    /// not cut short ([`GitClass::ShortBare`]).
     fn clear_back_ref(&self, request: &Request<'_>, repo: &Repo<'_>, console: &mut Console) -> Result<(), Failed> {
         let bare = format!("--git-dir={}", repo.bare);
         let back = format!("refs/gate-back/{}", request.key);
-        self.git_step(&repo.step(BACK_REF_RESET), &[&bare, "update-ref", "-d", &back], console)
+        self.git_step(
+            &repo.step(BACK_REF_RESET),
+            &[&bare, "update-ref", "-d", &back],
+            GitClass::ShortBare,
+            console,
+        )
     }
 
     /// After a failed push, the back ref of each repo of `pushed` deleted ([`WorkGit::clear_back_ref`]), every one
-    /// tried: a failure is said under the output lock, and the first client gone during one is given back once every
+    /// tried, a client already gone included, as a write of the shared bare repository still starts then
+    /// ([`preflight::run_git`]): a failure is said under the output lock, and the first client gone during one is given back once every
     /// ref has been tried, so the run ends on it as on any client gone ([`client_gone`]).
     fn undo_pushes(&self, request: &Request<'_>, pushed: &[&Repo<'_>], console: &mut Console) -> Option<Failed> {
         let mut gone = None;
@@ -3371,7 +3545,7 @@ impl WorkGit {
             work: self,
         };
         let target = format!("{commit}:refs/gate-back/{}", request.key);
-        back.status("push", &["push", "-q", &repo.bare, &target], false, console)
+        back.status(("push", GitClass::LongBare), &["push", "-q", &repo.bare, &target], false, console)
     }
 
     /// The tree the command left in `repo`, committed on `HEAD`, unpushed; nothing when the tree is unchanged. It
@@ -3396,13 +3570,17 @@ impl WorkGit {
         let no_storage = lfs::no_storage(request.lock);
         let mut add = lfs.pins(&no_storage);
         add.extend(["add", "-A"]);
-        let added = back.status("add", &add, true, console).map_err(|failed| match failed {
+        let added = match back.status(("add", GitClass::Long), &add, true, console) {
             // With no scratch folder, git-lfs's clean has no storage it can make: the cause when the tree's attributes
             // name the filter, and git's own line otherwise.
-            BackFailed::Step(_) if !lfs.has_scratch() && self.names_lfs_in_tree(repo, console) => BackFailed::Step(lfs::NO_STORAGE_ADD.to_owned()),
+            Err(BackFailed::Step(why)) if !lfs.has_scratch() => Err(match self.names_lfs_in_tree(repo, console) {
+                Ok(true) => BackFailed::Step(lfs::NO_STORAGE_ADD.to_owned()),
+                Ok(false) => BackFailed::Step(why),
+                Err(gone) => BackFailed::ClientGone(gone),
+            }),
             other => other,
-        });
-        let tree = added.and_then(|()| back.line("write-tree", &["write-tree"], true, console));
+        };
+        let tree = added.and_then(|()| back.line(("write-tree", GitClass::Short), &["write-tree"], true, console));
         match fs::remove_file(request.index) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => {
                 console.err(&format!("gate: remote could not remove {}: {error}", request.index));
@@ -3410,11 +3588,11 @@ impl WorkGit {
             _ => {}
         }
         let tree = tree?;
-        if tree == back.line("rev-parse", &["rev-parse", "HEAD^{tree}"], false, console)? {
+        if tree == back.line(("rev-parse", GitClass::Short), &["rev-parse", "HEAD^{tree}"], false, console)? {
             return Ok(None);
         }
         let commit = back.line(
-            "commit-tree",
+            ("commit-tree", GitClass::Short),
             &["commit-tree", &tree, "-p", "HEAD", "-m", "gate-remote back"],
             false,
             console,
@@ -3468,37 +3646,50 @@ impl BackGit<'_> {
         command
     }
 
-    /// Runs `step` to its end, its stderr, and its stdout unless `read_stdout`, forwarded ([`Git::forwarded`]); its
-    /// output, else why it could not run or that the client is gone.
-    fn run(&self, step: &str, args: &[&str], copied_index: bool, read_stdout: bool, console: &mut Console) -> Result<Output, BackFailed> {
+    /// Runs `step` as `class` to its end, its stderr, and its stdout unless `read_stdout`, forwarded
+    /// ([`preflight::run_git`]); its output, else why it could not run, that its bound or a stop ended it, or that the
+    /// client is gone.
+    fn run(
+        &self,
+        (step, class): (&str, GitClass),
+        args: &[&str],
+        copied_index: bool,
+        read_stdout: bool,
+        console: &mut Console,
+    ) -> Result<GitOutput, BackFailed> {
         let step = self.repo.step(step);
-        Git::forwarded(self.command(args, copied_index), read_stdout, &self.work.output, &self.work.gone, console).map_err(|failure| match failure {
-            GitFailure::Failed(error) => BackFailed::Step(format!("{step} failed: {error}")),
+        let streams = Streams {
+            stdout: if read_stdout { Pipe::Read } else { Pipe::Forward },
+            ..Streams::FORWARDED
+        };
+        let named = GitStep { name: &step, class };
+        preflight::run_git(&self.command(args, copied_index), named, &streams, self.work.shared(), console).map_err(|failure| match failure {
+            GitFailure::NotStarted(error) | GitFailure::Failed(error) => BackFailed::Step(format!("{step} failed: {error}")),
             GitFailure::ClientGone => BackFailed::ClientGone(client_gone(&step)),
         })
     }
 
-    /// Runs `step`, its output forwarded; else why it failed.
-    fn status(&self, step: &str, args: &[&str], copied_index: bool, console: &mut Console) -> Result<(), BackFailed> {
-        let output = self.run(step, args, copied_index, false, console)?;
-        match exit_code(output.status) {
+    /// Runs `step` as `class`, its output forwarded; else why it failed.
+    fn status(&self, (step, class): (&str, GitClass), args: &[&str], copied_index: bool, console: &mut Console) -> Result<(), BackFailed> {
+        let ran = self.run((step, class), args, copied_index, false, console)?;
+        match ran.code {
             0 => Ok(()),
             code => Err(BackFailed::Step(format!("{} failed (status {code})", self.repo.step(step)))),
         }
     }
 
-    /// Runs `step` and returns its stdout, its stderr forwarded; else why it failed.
-    fn stdout(&self, step: &str, args: &[&str], copied_index: bool, console: &mut Console) -> Result<Vec<u8>, BackFailed> {
-        let output = self.run(step, args, copied_index, true, console)?;
-        match exit_code(output.status) {
-            0 => Ok(output.stdout),
+    /// Runs `step` as `class` and returns its stdout, its stderr forwarded; else why it failed.
+    fn stdout(&self, (step, class): (&str, GitClass), args: &[&str], copied_index: bool, console: &mut Console) -> Result<Vec<u8>, BackFailed> {
+        let ran = self.run((step, class), args, copied_index, true, console)?;
+        match ran.code {
+            0 => Ok(ran.stdout),
             code => Err(BackFailed::Step(format!("{} failed (status {code})", self.repo.step(step)))),
         }
     }
 
-    /// Runs `step` and returns the first line of its stdout, its stderr forwarded; else why it failed.
-    fn line(&self, step: &str, args: &[&str], copied_index: bool, console: &mut Console) -> Result<String, BackFailed> {
-        let stdout = self.stdout(step, args, copied_index, console)?;
+    /// Runs `step` as `class` and returns the first line of its stdout, its stderr forwarded; else why it failed.
+    fn line(&self, (step, class): (&str, GitClass), args: &[&str], copied_index: bool, console: &mut Console) -> Result<String, BackFailed> {
+        let stdout = self.stdout((step, class), args, copied_index, console)?;
         String::from_utf8_lossy(&stdout)
             .lines()
             .next()
@@ -3508,7 +3699,12 @@ impl BackGit<'_> {
 
     /// The `/`-separated paths `commit` changes against `HEAD`; else why they could not be read.
     fn changed(&self, commit: &str, console: &mut Console) -> Result<Vec<String>, BackFailed> {
-        let stdout = self.stdout("diff-tree", &["diff-tree", "--name-only", "-r", "-z", "HEAD", commit], false, console)?;
+        let stdout = self.stdout(
+            ("diff-tree", GitClass::Short),
+            &["diff-tree", "--name-only", "-r", "-z", "HEAD", commit],
+            false,
+            console,
+        )?;
         stdout
             .split(|byte| *byte == 0)
             .filter(|path| !path.is_empty())
@@ -3573,11 +3769,13 @@ mod interrupted_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::ffi::OsStr;
     use std::fs::{self, File, OpenOptions};
     use std::io;
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
+    use std::rc::Rc;
     use std::time::Duration;
 
     use base64::Engine;
@@ -3586,8 +3784,8 @@ mod tests {
 
     use super::{
         BackGit, CLOSED_STATUS, GIT_CONFIG_COUNT, GODOT_PATH, Look, Of, One, PATH_VARIABLE, Payload, Request, SHARING_VIOLATION, STARTING_COMMAND,
-        UE_ROOT, WorkGit, before_the_job, client_gone, command_spent, command_variables, gap_spent, handed_job, look, prepared, remaining_budget,
-        resolved_command, with_git_bin_first, with_path_first, with_safe_directory, with_unreal, without_engine, written_retrying,
+        StopSignal, UE_ROOT, WorkGit, before_the_job, client_gone, command_spent, command_variables, gap_spent, handed_job, look, prepared,
+        remaining_budget, resolved_command, with_git_bin_first, with_path_first, with_safe_directory, with_unreal, without_engine, written_retrying,
     };
     use gate_args::{EnvRefusal, env_refusal};
     use gate_wire::engine_env_name_refused;
@@ -3764,6 +3962,25 @@ mod tests {
             look(|| Err(io::Error::other("the wait failed")), JOB, STARTING_COMMAND),
             Look::Go(Some(unread()))
         );
+    }
+
+    /// Each git step of a run looks at the stop signal through a signal of its own that shares the run's flag: one
+    /// that cannot be read is said by the first look, and by no later step's.
+    #[test]
+    #[expect(clippy::expect_used, reason = "an event the case cannot make must fail it loudly")]
+    fn an_unreadable_stop_signal_is_said_once_across_the_run_s_git_steps() {
+        let event = gate_win32::NamedEvent::create_new_manual(&format!(r"Local\gate-test-unread-stop-{}", std::process::id()))
+            .expect("the case's event is made");
+        let unread_said = Rc::new(Cell::new(false));
+        let unreadable = || Err(io::Error::other("the wait failed"));
+        let (fetch, checkout) = (
+            StopSignal::sharing(&event, JOB, &unread_said),
+            StopSignal::sharing(&event, JOB, &unread_said),
+        );
+
+        assert_eq!(fetch.looked(unreadable(), STARTING_COMMAND), Look::Go(Some(unread())));
+        assert_eq!(fetch.looked(unreadable(), STARTING_COMMAND), Look::Go(None), "said once by its step");
+        assert_eq!(checkout.looked(unreadable(), STARTING_COMMAND), Look::Go(None), "and by no later step");
     }
 
     #[test]
@@ -4116,7 +4333,7 @@ mod tests {
     #[expect(clippy::expect_used, reason = "a payload the box cannot read must fail the case loudly")]
     fn every_work_and_back_git_call_reads_the_tree_s_own_attributes_alone() {
         let output = OutputLock::default();
-        let work = WorkGit::ready(r"C:\gate-remote\work\app-1a2b3c4d.lock", &output, &ClientGone::default());
+        let work = WorkGit::ready(r"C:\gate-remote\work\app-1a2b3c4d.lock", &output, &ClientGone::default(), None);
         let pinned = |args: &[&OsStr]| args.windows(2).any(|pair| pair == [OsStr::new("-c"), OsStr::new("core.attributesFile=")]);
         let payload = run_payload(&json!({}));
         let request = Request::read(&payload).expect("a run is read");

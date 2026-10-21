@@ -103,6 +103,12 @@ pub enum Problem {
         option: String,
         value: String,
     },
+    /// A `--test-box-git-limit` value that is not a step, a `:` and whole milliseconds.
+    #[cfg(feature = "test-seams")]
+    BadGitLimit {
+        option: String,
+        value: String,
+    },
     NeedsValue(String),
     /// A bare `--timeout auto`, which carries no floor.
     AutoNeedsFloor(String),
@@ -204,6 +210,8 @@ impl fmt::Display for Problem {
                     "gate: {option} must be 1 to {MAX_MUTEX_NAME} ASCII letters, digits and '-', got '{value}'"
                 )
             }
+            #[cfg(feature = "test-seams")]
+            Problem::BadGitLimit { option, value } => write!(f, "gate: {option} must be <step>:<ms>, got '{value}'"),
             Problem::NeedsValue(option) => write!(f, "gate: {option} needs a value"),
             Problem::AutoNeedsFloor(option) => write!(f, "gate: {option} auto needs a floor in seconds: auto:<n>"),
             Problem::GivenTwice(option) => write!(f, "gate: {option} is given twice"),

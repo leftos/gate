@@ -40,7 +40,7 @@ pub(crate) mod git;
 mod held;
 mod inputs;
 mod install;
-mod launch;
+pub(crate) mod launch;
 pub(crate) mod lfs;
 mod outputs;
 pub(crate) mod parity;

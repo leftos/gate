@@ -14,8 +14,6 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::windows::io::OwnedHandle;
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -45,7 +43,7 @@ fn was_cancelled(error: &io::Error) -> bool {
 /// not take it: each is said on the run's own thread, never while that thread is away, and written with its line feed
 /// under std's lock on the stream, which every line written under this lock also takes, so no locked line lands inside
 /// one. git, a process of its own, could write inside a heartbeat if it shared the box's stderr, so its output is
-/// forwarded through [`ChildPipes`] instead.
+/// forwarded through [`Forwarders::start_git`] instead.
 pub(crate) type OutputLock = Arc<Mutex<()>>;
 
 /// The run's one client-gone flag: set once a write to the box's own output fails, a forwarded line's or the
@@ -91,6 +89,21 @@ impl Forwarders {
     /// The system's error when a thread cannot be started; a reader started before it goes on.
     pub(crate) fn start(stdout: File, stderr: File, lock: &OutputLock, gone: &ClientGone) -> io::Result<Forwarders> {
         Forwarders::start_each([(stdout, Stream::Out), (stderr, Stream::Err)], "the command's", lock, gone)
+    }
+
+    /// Starts a reader for each of git's `stdout` and `stderr` pipes that is given, writing its lines to the box's own
+    /// stream of its name under `lock`, a failed write setting `gone`; a read that fails is said naming git's pipe. No
+    /// pipe given is no reader, and a drain of none finds every reader ended.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when a thread cannot be started; a reader started before it goes on.
+    pub(crate) fn start_git(stdout: Option<File>, stderr: Option<File>, lock: &OutputLock, gone: &ClientGone) -> io::Result<Forwarders> {
+        let pipes = stdout
+            .map(|pipe| (pipe, Stream::Out))
+            .into_iter()
+            .chain(stderr.map(|pipe| (pipe, Stream::Err)));
+        Forwarders::start_each(pipes, "git's", lock, gone)
     }
 
     /// Starts a reader for each of `pipes`, writing its lines to the box's stream it names under `lock`, a failed write
@@ -268,45 +281,6 @@ impl Behind {
     /// A reader whose thread exited without saying so reached no end the drain can see.
     fn reached_end(&self) -> bool {
         !self.aborted.load(Ordering::SeqCst) && self.ended.load(Ordering::SeqCst)
-    }
-}
-
-/// The streams a child the box starts itself is given, and the readers forwarding what it writes to the box's own
-/// streams line by line under the output lock, as the command's output is forwarded.
-pub(crate) struct ChildPipes {
-    /// The child's stdout: a pipe forwarded to the box's stdout, or, when the caller reads it itself,
-    /// [`Stdio::piped`].
-    pub(crate) stdout: Stdio,
-    /// The child's stderr: a pipe forwarded to the box's stderr.
-    pub(crate) stderr: Stdio,
-    pub(crate) forwarders: Forwarders,
-}
-
-impl ChildPipes {
-    /// A pipe forwarded to the box's stderr and, when `forward_stdout`, one forwarded to its stdout, written under
-    /// `lock`, a failed write setting `gone`, a read that fails said naming the pipe `source`'s. The readers end once
-    /// every copy of the write ends is closed, the child's and the [`Stdio`]s given here.
-    ///
-    /// # Errors
-    ///
-    /// The system's error when a pipe cannot be made or a reader cannot be started.
-    pub(crate) fn open(source: &'static str, forward_stdout: bool, lock: &OutputLock, gone: &ClientGone) -> io::Result<ChildPipes> {
-        let (err_reader, err_writer) = io::pipe()?;
-        let mut readers = Vec::new();
-        let stdout = if forward_stdout {
-            let (out_reader, out_writer) = io::pipe()?;
-            readers.push((File::from(OwnedHandle::from(out_reader)), Stream::Out));
-            Stdio::from(out_writer)
-        } else {
-            Stdio::piped()
-        };
-        readers.push((File::from(OwnedHandle::from(err_reader)), Stream::Err));
-        let forwarders = Forwarders::start_each(readers, source, lock, gone)?;
-        Ok(ChildPipes {
-            stdout,
-            stderr: Stdio::from(err_writer),
-            forwarders,
-        })
     }
 }
 

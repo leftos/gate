@@ -802,7 +802,7 @@ fn ended(running: &Running, job: &Job) -> Result<(), String> {
 }
 
 /// The line a git that outlived `limit` is killed under, the limit as [`spelled_limit`] says it.
-fn late_git_line(limit: Duration) -> String {
+pub(crate) fn late_git_line(limit: Duration) -> String {
     format!("git did not answer within {}", spelled_limit(limit))
 }
 

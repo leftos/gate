@@ -3,35 +3,42 @@
 //! it laid the work folder's tree out now, the boot and SDK lines, a line for each tool the payload's `Needs` names,
 //! and the path line when no trusted Git `bin` was found for the command's `PATH`.
 
+use std::cell::Cell;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
-use std::sync::PoisonError;
-use std::thread;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::rc::Rc;
+use std::sync::atomic::Ordering;
+use std::sync::{OnceLock, PoisonError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use gate_args::BoxSeams;
 use gate_router::escaped;
-use gate_win32::{Make, Share};
+use gate_win32::{Job, LaunchError, Make, NamedEvent, PipedConsole, PipedLaunch, Share};
 use gate_wire::build_version;
 use gate_wire::{Pair, PairSibling, PathForm, Payload, bare_stem, work_root};
+use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
 };
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::boot;
-use crate::boxside::forward::{ChildPipes, ClientGone, DRAIN, Drained, OutputLock};
+use crate::boxside::forward::{ClientGone, DRAIN, Forwarders, OutputLock};
+use crate::boxside::heartbeat;
 use crate::boxside::helper_trusted;
 use crate::boxside::msys;
 use crate::boxside::probe;
-use crate::boxside::run::{self, FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_SINGLE};
+use crate::boxside::run::{self, FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_SINGLE, StopSignal, WaitEnd, Watched, Watching};
+use crate::boxside::stop::terminate_and_wait;
 use crate::console::Console;
 use crate::environment::Variables;
-use crate::remote::{INSTALL_STATUS, NEW_WORK_TREE, ROOT_STATUS, git, install_untrusted_line, root_busy_line, root_unsafe_line};
-use crate::run::{ERROR_FILE_NOT_FOUND, find_program};
+use crate::remote::{INSTALL_STATUS, NEW_WORK_TREE, ROOT_STATUS, git, install_untrusted_line, launch, root_busy_line, root_unsafe_line};
+use crate::run::{ERROR_FILE_NOT_FOUND, Written, find_program};
 
 /// The status of a step that failed with no status of its own: git or a folder that could not be made or written.
 const FAILED_STATUS: u32 = 1;
@@ -379,16 +386,41 @@ fn create_folder(folder: &Path) -> Result<(), Failed> {
         .map_err(|error| Failed::without_status(format!("gate: remote could not create the folder {}: {error}", folder.display())))
 }
 
-/// Creates the bare repository `bare` when it is missing, said as created; a failure's line names the repo `name` on a
-/// pair run ([`failed_for`]).
+/// Creates the bare repository `bare` when it is missing or lacks what `git init --bare` makes ([`is_whole_bare`]), as
+/// one an `init` cut short leaves, said as created; a failure's line names the repo `name` on a pair run
+/// ([`failed_for`]). A write of the shared bare repository, which a gone client does not cut short
+/// ([`GitClass::ShortBare`]).
 fn create_bare(git: &Git, bare: &str, name: Option<&str>, console: &mut Console) -> Result<(), Failed> {
-    if !Path::new(bare).exists() {
+    if !is_whole_bare(Path::new(bare)) {
         let step = "git init --bare";
-        git.step(&for_repo(step, name), &["init", "--bare", "-q", "--", bare])
+        unlock_half_made_bare(Path::new(bare))
+            .map_err(|why| failed_for(Failed::without_status(format!("gate: remote {step} failed: {why}")), step, name))?;
+        git.step(&for_repo(step, name), &["init", "--bare", "-q", "--", bare], GitClass::ShortBare, console)
             .map_err(|failed| failed_for(failed, step, name))?;
         console.out(&format!("gate: remote created {bare}"));
     }
     Ok(())
+}
+
+/// Removes the `HEAD.lock` and `config.lock` an `init` cut short can leave in the root of the bare repository `bare`
+/// that is not whole ([`is_whole_bare`]), so the `init` that makes it again does not fail on them: through handles, the
+/// bare repository held as itself and each lock removed as [`removed_lock`] removes it, one a live git holds left to
+/// it. No git can use a bare repository with no `HEAD`, so these are the only names of a bare repository's root the box
+/// ever removes. Nothing when `bare` is missing or not a folder itself; else why not.
+fn unlock_half_made_bare(bare: &Path) -> Result<(), String> {
+    let Some(held) = held_folder_at(bare).map_err(|error| format!("cannot open {}: {error}", bare.display()))? else {
+        return Ok(());
+    };
+    for lock in ["HEAD.lock", "config.lock"] {
+        removed_lock(&held, lock, &bare.join(lock))?;
+    }
+    Ok(())
+}
+
+/// Whether the bare repository `bare` holds what `git init --bare` makes first: its `HEAD` file and its `objects` and
+/// `refs` folders. `git init` over a repository that has them changes nothing in it.
+fn is_whole_bare(bare: &Path) -> bool {
+    bare.join("HEAD").is_file() && bare.join("objects").is_dir() && bare.join("refs").is_dir()
 }
 
 /// Where [`ready_tree`] readies a repository: the tree, its repo's bare repository, and the warm record of the work
@@ -404,20 +436,30 @@ pub(super) struct TreeAt<'a> {
 pub(super) trait TreeGit {
     /// Runs git with `args`; a non-zero status, or a git that cannot be started, fails `step`.
     fn run_step(&self, step: &str, args: &[&str], console: &mut Console) -> Result<(), Failed>;
-    /// git's exit code for `args`, its stdout discarded; else why it could not be started.
-    fn run_code(&self, args: &[&str]) -> Result<i32, String>;
+    /// git's exit code for `args` as the short step `step`, its stdout discarded; else why it did not run to its end.
+    fn run_code(&self, step: &str, args: &[&str], console: &mut Console) -> Result<i32, GitFailure>;
     /// Whether the caller holds the work folder's lock, so a link where a folder should be may be removed and the
     /// folder made again ([`write_alternates`]).
     fn holds_the_lock(&self) -> bool;
 }
 
 impl TreeGit for Git {
-    fn run_step(&self, step: &str, args: &[&str], _console: &mut Console) -> Result<(), Failed> {
-        self.step(step, args)
+    fn run_step(&self, step: &str, args: &[&str], console: &mut Console) -> Result<(), Failed> {
+        self.step(step, args, GitClass::Short, console)
     }
 
-    fn run_code(&self, args: &[&str]) -> Result<i32, String> {
-        self.code(args, Stdio::null(), Stdio::inherit())
+    /// Its stderr forwarded to the box's ([`Git::alone`]).
+    fn run_code(&self, step: &str, args: &[&str], console: &mut Console) -> Result<i32, GitFailure> {
+        let streams = Streams {
+            stdout: Pipe::Discard,
+            stderr: Pipe::Forward,
+            feed: None,
+        };
+        let step = GitStep {
+            name: step,
+            class: GitClass::Short,
+        };
+        self.alone(args, step, &streams, console).map(|ran| ran.code)
     }
 
     /// The preflight takes no lock.
@@ -426,7 +468,8 @@ impl TreeGit for Git {
     }
 }
 
-/// Readies the repository of the tree `tree`: created when nothing has the name `.git` there, read without following a
+/// Readies the repository of the tree `tree`: created when nothing has the name `.git` there or its `.git` has no
+/// `HEAD`, read without following a
 /// link, its `origin` the bare repository `bare`, its line-ending config, and its alternates file pointing at `bare`'s
 /// objects ([`write_alternates`]). Without the lock, a link, a junction or a file at the tree's `.git`, `.git\objects`
 /// or `.git\objects\info`, or anything but a file at its `.git\config` ([`has_a_link_in_its_git`]), readies nothing:
@@ -440,8 +483,8 @@ pub(super) fn ready_tree(git: &impl TreeGit, at: &TreeAt<'_>, name: Option<&str>
     ready_new_tree(git, at, name, console).map(|_| ())
 }
 
-/// [`ready_tree`], and whether the tree is new to this run: nothing had the name `.git` there, so its repository is
-/// made now, or by the run when the preflight leaves it to the run.
+/// [`ready_tree`], and whether the tree is new to this run: nothing had the name `.git` there, or its `.git` had no
+/// `HEAD`, so its repository is made now, or by the run when the preflight leaves it to the run.
 fn ready_new_tree(git: &impl TreeGit, at: &TreeAt<'_>, name: Option<&str>, console: &mut Console) -> Result<bool, Unready> {
     let (bare, tree) = (at.bare, at.tree);
     if git.holds_the_lock() {
@@ -449,8 +492,9 @@ fn ready_new_tree(git: &impl TreeGit, at: &TreeAt<'_>, name: Option<&str>, conso
     } else if has_a_link_in_its_git(Path::new(tree)) {
         return Ok(false);
     }
-    // A run removes a link, a junction or a file named `.git` before it readies a tree (`plain_tree` in the run).
-    let made = fs::symlink_metadata(Path::new(tree).join(".git")).is_err();
+    // A run removes a link, a junction or a file named `.git` before it readies a tree (`plain_tree` in the run). A
+    // `.git` with no `HEAD`, as an `init` cut short leaves it, is made again: `git init` over it keeps what is there.
+    let made = !fs::symlink_metadata(Path::new(tree).join(".git").join("HEAD")).is_ok_and(|metadata| metadata.is_file());
     if made {
         if let Err(error) = remove_entry(Path::new(at.warm)) {
             if !git.holds_the_lock() {
@@ -482,10 +526,19 @@ fn configure(git: &impl TreeGit, bare: &str, tree: &str, name: Option<&str>, con
     let work_tree = format!("--work-tree={tree}");
     let (git_dir, work_tree) = (git_dir.as_str(), work_tree.as_str());
     // Checked apart from .git, so a preflight cut short between the two steps is finished by the next one. A git that
-    // cannot be started here fails the next step, which names it.
-    if git.run_code(&[git_dir, work_tree, "config", "--get", "remote.origin.url"]) != Ok(0) {
-        let args = [git_dir, work_tree, "remote", "add", "--", "origin", bare];
-        tree_step(git, "git remote add", name, &args, console)?;
+    // cannot be started here fails the next step, which names it; one that started and did not end fails this one.
+    let step = "git config";
+    match git.run_code(
+        &for_repo(step, name),
+        &[git_dir, work_tree, "config", "--get", "remote.origin.url"],
+        console,
+    ) {
+        Ok(0) => {}
+        Ok(_) | Err(GitFailure::NotStarted(_)) => {
+            let args = [git_dir, work_tree, "remote", "add", "--", "origin", bare];
+            tree_step(git, "git remote add", name, &args, console)?;
+        }
+        Err(failure) => return Err(Unready::Git(failed_for(failure.of_step(&for_repo(step, name)), step, name))),
     }
     // The tree's own config, so the checkout and the sync-back keep the snapshot's bytes whatever the builder's system
     // and global git config say.
@@ -906,6 +959,196 @@ pub(super) fn is_real_folder(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
 }
 
+/// The folder `path` opened by its path as itself, sharing no deletion, so it is neither removed nor renamed while
+/// held; `None` when nothing has the name or it is a link, a junction or a file. Else the system's error.
+pub(super) fn held_folder_at(path: &Path) -> io::Result<Option<File>> {
+    let opened = OpenOptions::new()
+        .read(true)
+        .share_mode(Share::NoDelete.mode())
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path);
+    match opened {
+        Ok(folder) => Ok(is_folder_itself(&folder)?.then_some(folder)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The entry `name` of the held folder `folder` opened beneath its handle as itself and held as [`held_folder_at`]
+/// holds a folder; `None` when nothing has the name or it is a link, a junction or a file. Else the system's error.
+pub(super) fn held_folder_beneath(folder: &File, name: &str) -> io::Result<Option<File>> {
+    match gate_win32::open_beneath_as(folder, name, FILE_GENERIC_READ, Share::NoDelete, Make::Open) {
+        Ok(entry) => Ok(is_folder_itself(&entry)?.then_some(entry)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Removes git's lock file `name` beneath the held folder `folder`, at `path`: opened beneath the handle as itself with
+/// `DELETE` and no sharing at all, and deleted through that handle, so a link or a junction of that name is deleted
+/// itself, never what it leads to. Nothing when nothing has the name, or when another handle holds it open: a live git
+/// or preflight writes through it, and git says so itself if it needs it. Else why not, a folder of its own at the
+/// name refused and left, as git could not have left it.
+pub(super) fn removed_lock(folder: &File, name: &str, path: &Path) -> Result<(), String> {
+    let lock = match gate_win32::open_beneath_as(folder, name, FILE_GENERIC_READ | DELETE, Share::None, Make::Open) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION.cast_signed()) => return Ok(()),
+        Err(error) => return Err(format!("cannot open {}: {error}", path.display())),
+    };
+    if is_folder_itself(&lock).map_err(|error| format!("cannot read {}: {error}", path.display()))? {
+        return Err(format!("{} is a folder where git's lock file goes", path.display()));
+    }
+    gate_win32::delete_opened(&lock).map_err(|error| format!("cannot remove {}: {error}", path.display()))
+}
+
+/// The bound of a box git step that reads or writes refs, config or a listing: `init`, `config`, `remote add`,
+/// `cat-file`, `grep`, `check-ignore`, `write-tree`, `commit-tree`, `rev-parse`, `diff-tree`, `update-ref` and the LFS
+/// listing.
+pub(crate) const GIT_SHORT_LIMIT: Duration = Duration::from_mins(5);
+/// The bound of a box git step that moves a tree's or a repository's content: `fetch`, `checkout`, `lfs checkout`,
+/// `clean`, `add -A` and `push`.
+pub(crate) const GIT_LONG_LIMIT: Duration = Duration::from_mins(30);
+
+/// `--test-box-git-limit <step>:<ms>`, set once before the box's verb runs ([`set_git_limit`]): the step, as the box's
+/// lines name it, and the bound it takes in place of its class's.
+static GIT_LIMIT_SEAM: OnceLock<(String, Duration)> = OnceLock::new();
+
+/// Makes `--test-box-git-limit`, when `seams` gives it, the bound of the git step it names in place of
+/// [`GIT_SHORT_LIMIT`] or [`GIT_LONG_LIMIT`], every other step keeping its own; called once, before the box's verb
+/// runs.
+pub(crate) fn set_git_limit(seams: &BoxSeams) {
+    if let Some((step, ms)) = &seams.git_limit {
+        GIT_LIMIT_SEAM.get_or_init(|| (step.clone(), Duration::from_millis(*ms)));
+    }
+}
+
+/// Which bound a box git step takes, and whether a gone client or a stop ends it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GitClass {
+    /// Bounded by [`GIT_SHORT_LIMIT`], and ended once the client is gone or a stop came.
+    Short,
+    /// Bounded by [`GIT_LONG_LIMIT`], and ended once the client is gone or a stop came.
+    Long,
+    /// A write of the shared bare repository bounded by [`GIT_SHORT_LIMIT`], run to its end or its bound when the
+    /// client is gone or a stop came: a killed one could leave `packed-refs.lock`, which the box never removes.
+    ShortBare,
+    /// A write of the shared bare repository bounded by [`GIT_LONG_LIMIT`], run on past a gone client and a stop as
+    /// [`GitClass::ShortBare`] is.
+    LongBare,
+}
+
+impl GitClass {
+    /// Its built-in bound.
+    fn limit(self) -> Duration {
+        match self {
+            GitClass::Short | GitClass::ShortBare => GIT_SHORT_LIMIT,
+            GitClass::Long | GitClass::LongBare => GIT_LONG_LIMIT,
+        }
+    }
+
+    /// Whether a gone client or a stop ends the step: every step but a write of the shared bare repository.
+    fn ends_early(self) -> bool {
+        matches!(self, GitClass::Short | GitClass::Long)
+    }
+}
+
+/// A box git step: its name, as the box's lines name it (`checkout`, `git init --bare`, `push lib`), and its class.
+#[derive(Clone, Copy)]
+pub(crate) struct GitStep<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) class: GitClass,
+}
+
+impl GitStep<'_> {
+    /// Its bound: `--test-box-git-limit`'s when the box was given it for this step, else its class's.
+    fn limit(&self) -> Duration {
+        match GIT_LIMIT_SEAM.get() {
+            Some((step, limit)) if step == self.name => *limit,
+            _ => self.class.limit(),
+        }
+    }
+}
+
+/// How the box takes one of git's output streams.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pipe {
+    /// Read to its end and dropped.
+    Discard,
+    /// Forwarded line by line to the box's own stream of its name, under the box's output lock ([`Forwarders`]).
+    Forward,
+    /// Read to its end and given back.
+    Read,
+}
+
+/// How a box git step's two output streams are taken, and the bytes fed on its standard input, `NUL` without.
+pub(crate) struct Streams<'a> {
+    pub(crate) stdout: Pipe,
+    pub(crate) stderr: Pipe,
+    pub(crate) feed: Option<&'a [u8]>,
+}
+
+impl Streams<'static> {
+    /// Both streams forwarded, nothing fed.
+    pub(crate) const FORWARDED: Streams<'static> = Streams {
+        stdout: Pipe::Forward,
+        stderr: Pipe::Forward,
+        feed: None,
+    };
+    /// Both streams dropped, nothing fed.
+    pub(crate) const QUIET: Streams<'static> = Streams {
+        stdout: Pipe::Discard,
+        stderr: Pipe::Discard,
+        feed: None,
+    };
+}
+
+/// The run's stop signal as a git step looks at it, the run's job, which the signal belongs to and the line of a step
+/// it ended names, and the run's flag of whether the signal's unreadable line was said ([`StopSignal::sharing`]).
+#[derive(Clone, Copy)]
+pub(crate) struct GitStop<'a> {
+    pub(crate) event: &'a NamedEvent,
+    pub(crate) job: &'a str,
+    pub(crate) unread_said: &'a Rc<Cell<bool>>,
+}
+
+impl GitStop<'_> {
+    /// The run's signal as one look of a git step reads it, sharing the run's unreadable line.
+    fn signal(&self) -> StopSignal<'_> {
+        StopSignal::sharing(self.event, self.job, self.unread_said)
+    }
+
+    /// The failure of a step the stop ended or kept from starting: its job named.
+    fn stopped(&self) -> GitFailure {
+        GitFailure::Failed(format!("the job {} was stopped", self.job))
+    }
+}
+
+/// The box's output lock, which git's forwarded lines and the wait's stderr probe take; the run's client-gone flag,
+/// which a failed forward or probe sets and every git wait reads; and the run's stop signal, which the wait of every
+/// step a stop ends looks at, `None` where no stop reaches git: the preflight and the inputs and LFS verbs.
+#[derive(Clone, Copy)]
+pub(crate) struct Shared<'a> {
+    pub(crate) lock: &'a OutputLock,
+    pub(crate) gone: &'a ClientGone,
+    pub(crate) stop: Option<GitStop<'a>>,
+}
+
+impl<'a> Shared<'a> {
+    /// `lock` and `gone`, with no stop signal.
+    pub(crate) fn alone(lock: &'a OutputLock, gone: &'a ClientGone) -> Shared<'a> {
+        Shared { lock, gone, stop: None }
+    }
+}
+
+/// A git step that ran to its end: its exit code, and what it wrote on each stream taken as [`Pipe::Read`], empty
+/// for the others.
+pub(crate) struct GitOutput {
+    pub(crate) code: i32,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+}
+
 /// git, found once along the gate's own `PATH` and `PATHEXT`.
 pub(crate) struct Git {
     pub(crate) program: Result<PathBuf, String>,
@@ -917,32 +1160,36 @@ impl Git {
         Git { program }
     }
 
-    /// Runs git with `args`, its output passed through; a non-zero status, or a git that cannot be started, fails
-    /// `step`, named as the wrapper names it.
-    pub(crate) fn step(&self, step: &str, args: &[&str]) -> Result<(), Failed> {
-        match self.code(args, Stdio::inherit(), Stdio::inherit()) {
-            Ok(0) => Ok(()),
-            Ok(code) => Err(git_failed(step, code)),
-            Err(message) => Err(Failed::without_status(format!("gate: remote {step} failed: {message}"))),
+    /// Runs git with `args` as `step` of `class` ([`Git::alone`]), its output forwarded to the box's own streams; a
+    /// non-zero status, or a git that cannot be started or did not run to its end, fails `step`, named as the wrapper
+    /// names it, and a gone client fails it with [`run::client_gone`]'s line and status.
+    pub(crate) fn step(&self, step: &str, args: &[&str], class: GitClass, console: &mut Console) -> Result<(), Failed> {
+        match self.alone(args, GitStep { name: step, class }, &Streams::FORWARDED, console) {
+            Ok(GitOutput { code: 0, .. }) => Ok(()),
+            Ok(ran) => Err(git_failed(step, ran.code)),
+            Err(failure) => Err(failure.of_step(step)),
         }
     }
 
-    /// git's exit code for `args`, its stdout sent to `stdout` and its stderr to `stderr`; else why it could not be
-    /// started.
-    pub(crate) fn code(&self, args: &[&str], stdout: Stdio, stderr: Stdio) -> Result<i32, String> {
-        let mut command = self.command(args)?;
-        command.stdout(stdout).stderr(stderr);
-        Self::code_of(&mut command)
+    /// git with `args` run as `step` ([`Git::run`]) under an output lock and a client-gone flag of its own, with no
+    /// stop signal: the preflight has no heartbeat to share them with and no stop to watch.
+    fn alone(&self, args: &[&str], step: GitStep<'_>, streams: &Streams<'_>, console: &mut Console) -> Result<GitOutput, GitFailure> {
+        let (lock, gone) = (OutputLock::default(), ClientGone::default());
+        self.run(args, step, streams, Shared::alone(&lock, &gone), console)
     }
 
-    /// The exit code of the built git `command`, started under the spawn lock so it inherits no launch's handles, and
-    /// waited for; else why it could not be started or waited for. The one spawn-and-wait path of every box git call
-    /// that reads only its exit code.
-    pub(crate) fn code_of(command: &mut Command) -> Result<i32, String> {
-        let status = gate_win32::spawn(command)
-            .and_then(|mut child| child.wait())
-            .map_err(|error| error.to_string())?;
-        Ok(exit_code(status))
+    /// git with `args` run as `step` ([`run_git`]), its streams taken as `streams` says; else why it did not run to
+    /// its end.
+    pub(crate) fn run(
+        &self,
+        args: &[&str],
+        step: GitStep<'_>,
+        streams: &Streams<'_>,
+        shared: Shared<'_>,
+        console: &mut Console,
+    ) -> Result<GitOutput, GitFailure> {
+        let command = self.command(args).map_err(GitFailure::NotStarted)?;
+        run_git(&command, step, streams, shared, console)
     }
 
     /// git with `args`, reading no standard input, none of the variables that would point it elsewhere and no
@@ -957,59 +1204,286 @@ impl Git {
         command.args(args).stdin(Stdio::null());
         Ok(command)
     }
-
-    /// Starts the git `command` under the spawn lock, its stderr, and its stdout unless `read_stdout`, forwarded line by
-    /// line under `lock` ([`ChildPipes`]), so no heartbeat lands inside a line of git's, and waits for it to end. A
-    /// process still holding git's output once the readers have drained for [`DRAIN`] is said under `lock`, and the
-    /// run goes on. git's output, its stdout empty unless read; else why it could not be started or waited for, or that
-    /// the run's `gone` was set by the time git's output drained, by a line of git's that could not be written to the
-    /// box's own output or by the heartbeat: the client closed the connection.
-    pub(crate) fn forwarded(
-        command: Command,
-        read_stdout: bool,
-        lock: &OutputLock,
-        gone: &ClientGone,
-        console: &mut Console,
-    ) -> Result<Output, GitFailure> {
-        let (output, drained) = run_forwarded(command, read_stdout, lock, gone).map_err(GitFailure::Failed)?;
-        if drained.client_gone {
-            return Err(GitFailure::ClientGone);
-        }
-        if !drained.all_ended {
-            let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
-            console.err(GIT_LEFTOVER);
-        }
-        Ok(output)
-    }
 }
 
 /// The line said when a leftover process still holds git's output open once git exited.
-const GIT_LEFTOVER: &str = "gate: remote git's output is still held open by a leftover process; stopped reading";
+pub(crate) const GIT_LEFTOVER: &str = "gate: remote git's output is still held open by a leftover process; stopped reading";
 
-/// Why a git whose output the box forwards gave no output.
+/// Why a box git step did not run to its end.
+#[derive(Debug)]
 pub(crate) enum GitFailure {
-    /// It could not be started or waited for, for this reason.
+    /// It could not be started, for this reason: no git was found, or the system would not create its process.
+    NotStarted(String),
+    /// It could not be read or waited for, or its bound or a stop ended it, for this reason.
     Failed(String),
-    /// A line of its could not be written to the box's own output: the client closed the connection.
+    /// The client closed the connection: a line of git's could not be written to the box's own output, or the
+    /// heartbeat or the wait's own probe found stderr's reader gone. git's tree is ended, unless the step writes the
+    /// shared bare repository, which ran to its end or its bound.
     ClientGone,
 }
 
-/// [`Git::forwarded`] up to the drain: git's output, and what the readers' drain found; else why it could not be
-/// started or waited for. `command` is dropped once git is started, so the readers see the end of its pipes once git
-/// and whatever it started have closed them.
-fn run_forwarded(mut command: Command, read_stdout: bool, lock: &OutputLock, gone: &ClientGone) -> Result<(Output, Drained), String> {
-    let ChildPipes { stdout, stderr, forwarders } = ChildPipes::open("git's", !read_stdout, lock, gone).map_err(|error| error.to_string())?;
-    // Started under the spawn lock, so it inherits no launch's handles.
-    let started = gate_win32::spawn(command.stdout(stdout).stderr(stderr));
-    drop(command);
-    let output = started.and_then(Child::wait_with_output);
-    let drained = forwarders.drain(DRAIN);
-    Ok((output.map_err(|error| error.to_string())?, drained))
+impl GitFailure {
+    /// The failure of the git step `step` this is: `gate: remote {step} failed: {why}` with status 1, or, for a gone
+    /// client, [`run::client_gone`]'s.
+    pub(crate) fn of_step(self, step: &str) -> Failed {
+        match self {
+            GitFailure::NotStarted(why) | GitFailure::Failed(why) => Failed::without_status(format!("gate: remote {step} failed: {why}")),
+            GitFailure::ClientGone => run::client_gone(step),
+        }
+    }
 }
 
-/// The exit code of a process that ran to its end; on Windows every such process has one.
-pub(crate) fn exit_code(status: ExitStatus) -> i32 {
-    status.code().unwrap_or(FAILED_STATUS.cast_signed())
+/// How the wait for a git step ended other than in git's exit.
+enum GitEnd {
+    /// The step's bound passed.
+    Bound,
+    /// The client is gone, and the step is one a gone client ends.
+    Gone,
+}
+
+/// A thread reading one of git's output streams to its end: the bytes it read, kept or dropped; else why it could not.
+type Reading = JoinHandle<io::Result<Vec<u8>>>;
+
+/// The readers of a started git's output: the forwarders of the streams taken as [`Pipe::Forward`], a thread for
+/// each other one, and the thread feeding its input.
+struct Readers {
+    forwarders: Forwarders,
+    stdout: Option<Reading>,
+    stderr: Option<Reading>,
+    fed: Option<JoinHandle<io::Result<()>>>,
+}
+
+/// Runs a box git step, every box git call going through here: once `shared`'s flag is set, none starts but a write of
+/// the shared bare repository, so a failed push's undo still tries every ref. git is created suspended inside a
+/// kill-on-close job of its own that refuses breakaway, and only then run, so ending the job ends git's whole tree,
+/// the inner git Git for Windows' launcher starts included; a batch stand-in runs through cmd.exe
+/// ([`crate::run::written`]). The wait ([`Watched::wait`]) looks every [`run::WAIT_STEP`] whether git exited, probes
+/// the box's stderr ([`heartbeat::probe_stderr`]), and ends the job at `step`'s bound, failing the step with
+/// [`git::late_git_line`]'s text; for a step a gone client or a stop ends ([`GitClass::ends_early`]), once the flag is
+/// set, as [`GitFailure::ClientGone`], or once `shared`'s stop signal is, naming the run's job. A step that fails while
+/// the flag is set is [`GitFailure::ClientGone`], whatever ended it. Once git exited, the readers drain for [`DRAIN`],
+/// a leftover process still holding git's output then said ([`GIT_LEFTOVER`]) and ended with the job, and a flag set
+/// by then is a gone client.
+pub(crate) fn run_git(
+    command: &Command,
+    step: GitStep<'_>,
+    streams: &Streams<'_>,
+    shared: Shared<'_>,
+    console: &mut Console,
+) -> Result<GitOutput, GitFailure> {
+    let (ran, all_ended) = git_ran(command, step, streams, shared, console)?;
+    if !all_ended {
+        let _held = shared.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        console.err(Watching::Git.leftover());
+    }
+    if shared.gone.load(Ordering::SeqCst) {
+        return Err(GitFailure::ClientGone);
+    }
+    Ok(ran)
+}
+
+/// [`run_git`] up to the drain: what git gave, and whether every forwarder reached the end of its pipe.
+fn git_ran(
+    command: &Command,
+    step: GitStep<'_>,
+    streams: &Streams<'_>,
+    shared: Shared<'_>,
+    console: &mut Console,
+) -> Result<(GitOutput, bool), GitFailure> {
+    if step.class.ends_early() && shared.gone.load(Ordering::SeqCst) {
+        return Err(GitFailure::ClientGone);
+    }
+    // One signal for the step, so its look before the start and its wait's looks share the run's unreadable line.
+    let stop = shared.stop.filter(|_| step.class.ends_early());
+    let signal = stop.as_ref().map(GitStop::signal);
+    if let (Some(stop), Some(signal)) = (&stop, &signal) {
+        let _held = shared.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        if signal.seen(Watching::Git.while_waiting(), console) {
+            return Err(stop.stopped());
+        }
+    }
+    let failed = |error: &dyn std::fmt::Display| GitFailure::Failed(error.to_string());
+    let launch = git_launch(command, step.class).map_err(GitFailure::NotStarted)?;
+    let job = launch::call_job(false).map_err(|error| GitFailure::Failed(format!("cannot make its job: {error}")))?;
+    let (suspended, stdout, stderr, stdin) = launch::launched(&launch, &job, streams.feed.is_some()).map_err(|error| match error {
+        LaunchError::CreateProcess { .. } => GitFailure::NotStarted(error.to_string()),
+        LaunchError::Setup { .. } => failed(&error),
+    })?;
+    let running = suspended.assign_and_resume(&job).map_err(|error| failed(&error))?;
+    // A reader that cannot start leaves git to the job, which ends it as it is dropped.
+    let readers = readers(stdout, stderr, stdin, streams, shared).map_err(|error| GitFailure::Failed(format!("cannot read its output: {error}")))?;
+    let watched = Watched {
+        job: &job,
+        running: &running,
+        forwarders: readers.forwarders,
+        watching: Watching::Git,
+    };
+    let deadline = Instant::now() + step.limit();
+    let end = waited(&watched, (step.class, deadline), signal.as_ref(), shared, console);
+    let Watched { forwarders, .. } = watched;
+    let failure = match end {
+        WaitEnd::Exited { code, stopped: false } => {
+            let drained = forwarders.drain(DRAIN);
+            // Whatever git left running ends with its job, so the readers of the other streams reach their ends.
+            drop(job);
+            let ran = GitOutput {
+                code: code.cast_signed(),
+                stdout: joined(readers.stdout)?,
+                stderr: joined(readers.stderr)?,
+            };
+            fed_whole(&ran, readers.fed)?;
+            return Ok((ran, drained.all_ended));
+        }
+        // Only a wait given the run's stop signal sees a stop, and only when it ended the job.
+        WaitEnd::Exited { stopped: true, .. } => stop.map_or_else(|| GitFailure::Failed("its job was stopped".to_owned()), |stop| stop.stopped()),
+        WaitEnd::Killed(GitEnd::Bound) => GitFailure::Failed(git::late_git_line(step.limit())),
+        WaitEnd::Killed(GitEnd::Gone) | WaitEnd::ClientGone => GitFailure::ClientGone,
+        WaitEnd::Failed { why, .. } => GitFailure::Failed(why),
+    };
+    // A bare write the bound ended after the client went ends the run as a gone client does.
+    let failure = if shared.gone.load(Ordering::SeqCst) {
+        GitFailure::ClientGone
+    } else {
+        failure
+    };
+    Err(ended(&job, forwarders, failure, step, shared.lock, console))
+}
+
+/// The wait for a started git ([`Watched::wait`]), each look probing stderr and ending the wait at `deadline`; for a
+/// step a gone client or a stop ends, once `shared`'s flag is set, and on the run's stop `signal`, which ends the job,
+/// given only to such a step. A write of the shared bare repository waits on past both, to its exit or its bound.
+fn waited(
+    watched: &Watched<'_>,
+    (class, deadline): (GitClass, Instant),
+    signal: Option<&StopSignal<'_>>,
+    shared: Shared<'_>,
+    console: &mut Console,
+) -> WaitEnd<GitEnd> {
+    loop {
+        let end = watched.wait(
+            signal,
+            |_| {
+                heartbeat::probe_stderr(shared.lock, shared.gone);
+                if Instant::now() >= deadline {
+                    return Some(GitEnd::Bound);
+                }
+                (class.ends_early() && shared.gone.load(Ordering::SeqCst)).then_some(GitEnd::Gone)
+            },
+            console,
+        );
+        match end {
+            // Each wait looks for git's exit for a step before it answers a gone client, so this loop is not a spin.
+            WaitEnd::ClientGone if !class.ends_early() => {
+                if Instant::now() >= deadline {
+                    return WaitEnd::Killed(GitEnd::Bound);
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
+/// `failure`, the end of the git step `step` whose wait did not end in git's exit, once its whole job is ended and its
+/// forwarders drained, so no line of git's comes after the box's next one. A job that still holds processes, or could
+/// not be ended, is said under `lock` naming the step, as a lost connection's job is said
+/// ([`crate::boxside::stop::Ending::say`]).
+fn ended(job: &Job, forwarders: Forwarders, failure: GitFailure, step: GitStep<'_>, lock: &OutputLock, console: &mut Console) -> GitFailure {
+    let ending = terminate_and_wait(job);
+    forwarders.drain(DRAIN);
+    let name = format!("git {}", step.name.strip_prefix("git ").unwrap_or(step.name));
+    let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    match ending {
+        Ok(ending) => ending.say(&name, console),
+        Err(error) => console.err(&format!("gate: remote could not stop job {name}: {error}")),
+    }
+    failure
+}
+
+/// The launch of the git `command` as a step of `class`, created suspended: its program, words, working folder and
+/// environment, a batch file run through the system folder's cmd.exe ([`crate::run::written`]); else why it cannot be
+/// launched.
+fn git_launch(command: &Command, class: GitClass) -> Result<PipedLaunch, String> {
+    // A write of the shared bare repository runs on a hidden console of its own, as the PC's git calls that hold a lock
+    // do, so no console event of the box's ends it mid-write; every other step stays on the box's console, as a plain
+    // start left it, which a gone client or a stop ends anyway, so no conhost is made per call.
+    let console = if class.ends_early() {
+        PipedConsole::Attached
+    } else {
+        PipedConsole::Hidden
+    };
+    let mut launch = launch::piped_launch(command, console).map_err(|error| format!("cannot build its launch: {error}"))?;
+    let rest: Vec<OsString> = command.get_args().map(OsStr::to_owned).collect();
+    match crate::run::written(Path::new(command.get_program()), &rest, &Variables::from_process()) {
+        Written::Line(application, command_line) => {
+            launch.application = application;
+            launch.command_line = command_line;
+            Ok(launch)
+        }
+        Written::Refused(why) | Written::NoShell(why) => Err(why),
+    }
+}
+
+/// The readers of a started git's `stdout` and `stderr`, each taken as `streams` says, the forwarded ones under
+/// `shared`'s lock, a failed write setting its flag; and a thread writing `streams`' feed to `stdin` and closing it.
+fn readers(stdout: File, stderr: File, stdin: Option<File>, streams: &Streams<'_>, shared: Shared<'_>) -> io::Result<Readers> {
+    let (forward_out, read_out) = taken(stdout, streams.stdout)?;
+    let (forward_err, read_err) = taken(stderr, streams.stderr)?;
+    let forwarders = Forwarders::start_git(forward_out, forward_err, shared.lock, shared.gone)?;
+    let fed = match stdin.zip(streams.feed) {
+        Some((mut pipe, bytes)) => {
+            let bytes = bytes.to_vec();
+            Some(
+                thread::Builder::new()
+                    .name("git input".to_owned())
+                    .spawn(move || pipe.write_all(&bytes))?,
+            )
+        }
+        None => None,
+    };
+    Ok(Readers {
+        forwarders,
+        stdout: read_out,
+        stderr: read_err,
+        fed,
+    })
+}
+
+/// `pipe` taken as `how`: given back to be forwarded, or read to its end on a thread of its own, kept or dropped.
+fn taken(mut pipe: File, how: Pipe) -> io::Result<(Option<File>, Option<Reading>)> {
+    let keep = match how {
+        Pipe::Forward => return Ok((Some(pipe), None)),
+        Pipe::Read => true,
+        Pipe::Discard => false,
+    };
+    let reading = thread::Builder::new().name("git output".to_owned()).spawn(move || {
+        if keep {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).map(|_| bytes)
+        } else {
+            io::copy(&mut pipe, &mut io::sink()).map(|_| Vec::new())
+        }
+    })?;
+    Ok((None, Some(reading)))
+}
+
+/// What the reader `reading` read, empty for a stream it did not read; else why it could not.
+fn joined(reading: Option<Reading>) -> Result<Vec<u8>, GitFailure> {
+    match reading.map(JoinHandle::join) {
+        None => Ok(Vec::new()),
+        Some(Ok(Ok(bytes))) => Ok(bytes),
+        Some(Ok(Err(error))) => Err(GitFailure::Failed(format!("cannot read its output: {error}"))),
+        Some(Err(_)) => Err(GitFailure::Failed("the reader of its output panicked".to_owned())),
+    }
+}
+
+/// Whether git, which ran to its end as `ran`, was fed its whole input by `fed`: a git that failed says why in its own
+/// lines, so a feed it cut short by exiting is no failure of its own, and a step with no input has nothing to check.
+fn fed_whole(ran: &GitOutput, fed: Option<JoinHandle<io::Result<()>>>) -> Result<(), GitFailure> {
+    match fed.filter(|_| ran.code == 0).map(JoinHandle::join) {
+        None | Some(Ok(Ok(()))) => Ok(()),
+        Some(Ok(Err(error))) => Err(GitFailure::Failed(format!("its input could not be written: {error}"))),
+        Some(Err(_)) => Err(GitFailure::Failed("the writer of its input panicked".to_owned())),
+    }
 }
 
 /// The file `word` names, found as `gate run` finds a command's program: along the gate's own `PATH` and `PATHEXT`,
@@ -1055,16 +1529,24 @@ mod tests {
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Stdio};
+    use std::rc::Rc;
     use std::sync::PoisonError;
+    use std::time::{Duration, Instant};
 
     use base64::Engine as _;
+    use gate_win32::NamedEvent;
     use serde_json::json;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
-    use super::{Git, TreeAt, fresh_config, fresh_config_written, git_failed, ready_tree, refused_folders, replace_config, run_forwarded, sdk_list};
+    use super::{
+        Git, GitClass, GitFailure, GitStep, Shared, Streams, TreeAt, fresh_config, fresh_config_written, git_failed, git_launch, git_ran, readers,
+        ready_tree, refused_folders, replace_config, sdk_list, waited,
+    };
     use crate::boxside::forward::{ClientGone, OutputLock};
     use crate::boxside::helper_trusted;
+    use crate::boxside::run::{StopSignal, WaitEnd, Watched, Watching};
     use crate::console::Console;
+    use crate::remote::launch;
     use gate_wire::Payload;
 
     #[test]
@@ -1116,17 +1598,74 @@ mod tests {
             .command(&[&git_dir, "rev-parse", "HEAD"])
             .expect("git is on PATH; the unit tests need it");
         let held = output.lock().unwrap_or_else(PoisonError::into_inner);
+        let gone = ClientGone::default();
+        let step = GitStep {
+            name: "rev-parse",
+            class: GitClass::Short,
+        };
 
         // git says on stderr that the repository does not exist, then exits.
-        let ran = run_forwarded(command, false, &output, &ClientGone::default());
+        let ran = git_ran(&command, step, &Streams::FORWARDED, Shared::alone(&output, &gone), &mut Console::new());
         drop(held);
 
-        let (ran, drained) = ran.expect("git starts");
-        assert_eq!(ran.status.code(), Some(128), "git's own status");
+        let (ran, all_ended) = ran.expect("git starts and runs to its end");
+        assert_eq!(ran.code, 128, "git's own status");
         assert!(
-            !drained.all_ended,
+            !all_ended,
             "the reader of git's stderr waits for the held output lock, so it cannot end within the drain"
         );
+    }
+
+    /// A git that exited by itself while the run's stop signal is set was not stopped: `gate box stop` cannot reach
+    /// git's own job, so a stop counts for a git wait only when that wait ended the job.
+    #[test]
+    #[expect(clippy::expect_used, reason = "a test whose git or event cannot be made must fail loudly")]
+    fn a_git_that_exited_while_a_stop_is_set_is_not_reported_stopped() {
+        let command = Git::find().command(&["--version"]).expect("git is on PATH; the unit tests need it");
+        let launch = git_launch(&command, GitClass::Short).expect("git's launch is built");
+        let job = launch::call_job(false).expect("git's job is made");
+        let (suspended, stdout, stderr, _) = launch::launched(&launch, &job, false).expect("git is created");
+        let running = suspended.assign_and_resume(&job).expect("git runs");
+        let (lock, gone) = (OutputLock::default(), ClientGone::default());
+        let shared = Shared::alone(&lock, &gone);
+        let readers = readers(stdout, stderr, None, &Streams::QUIET, shared).expect("git's output is read");
+        assert!(running.wait(Duration::from_secs(600)).expect("git is waited for").is_some(), "git exits");
+        let event = NamedEvent::create_new_manual(&format!(r"Local\gate-test-git-exited-stop-{}", std::process::id())).expect("the event is made");
+        event.set().expect("the stop is set");
+        let signal = StopSignal::sharing(&event, "k", &Rc::default());
+        let watched = Watched {
+            job: &job,
+            running: &running,
+            forwarders: readers.forwarders,
+            watching: Watching::Git,
+        };
+
+        let end = waited(
+            &watched,
+            (GitClass::Short, Instant::now() + Duration::from_secs(600)),
+            Some(&signal),
+            shared,
+            &mut Console::new(),
+        );
+
+        assert!(
+            matches!(end, WaitEnd::Exited { code: 0, stopped: false }),
+            "git ran to its end, unstopped"
+        );
+    }
+
+    /// git's exit code for `args` as a short step with both of its streams dropped; else why it did not run to its end.
+    fn quiet_code(git: &Git, args: &[&str]) -> Result<i32, String> {
+        let step = GitStep {
+            name: "git",
+            class: GitClass::Short,
+        };
+        git.alone(args, step, &Streams::QUIET, &mut Console::new())
+            .map(|ran| ran.code)
+            .map_err(|failure| match failure {
+                GitFailure::NotStarted(why) | GitFailure::Failed(why) => why,
+                GitFailure::ClientGone => "the client is gone".to_owned(),
+            })
     }
 
     /// The payload `json` spells, as the box reads it off its own standard input.
@@ -1213,11 +1752,7 @@ mod tests {
             assert!(readied.is_ok(), "the tree is readied for {bare}");
             let called_dir = format!(r"--git-dir={}\.git", called.display());
             let called_tree = called.to_string_lossy();
-            assert_eq!(
-                git.code(&["init", "-q", "--", &called_tree], Stdio::null(), Stdio::null()),
-                Ok(0),
-                "git init"
-            );
+            assert_eq!(quiet_code(&git, &["init", "-q", "--", &called_tree]), Ok(0), "git init");
             let initialised = fs::read_to_string(called.join(".git").join("config")).expect("git init's config reads");
             assert!(
                 fresh_config(&initialised, bare).is_some(),
@@ -1228,7 +1763,7 @@ mod tests {
                 &[&called_dir, "config", "core.autocrlf", "false"],
                 &[&called_dir, "config", "core.eol", "lf"],
             ] {
-                assert_eq!(git.code(args, Stdio::null(), Stdio::null()), Ok(0), "git {args:?}");
+                assert_eq!(quiet_code(&git, args), Ok(0), "git {args:?}");
             }
             assert_eq!(config_of(&git, &written), config_of(&git, &called), "{bare}");
             fs::remove_dir_all(&folder).expect("the test's folder can be removed");

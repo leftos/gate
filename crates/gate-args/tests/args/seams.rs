@@ -1313,6 +1313,71 @@ fn box_seam_probe_limit_ms_refuses_what_the_dotnet_limit_refuses() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn box_seam_git_limit_names_a_step_and_its_bound_before_the_verb() {
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    let limited = |git_limit: Option<(&str, u64)>| {
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Run,
+            seams: BoxSeams {
+                git_limit: git_limit.map(|(step, ms)| (step.to_owned(), ms)),
+                ..BoxSeams::default()
+            },
+            root: None,
+        })
+    };
+    assert_eq!(
+        invocation(&["box", "--test-box-git-limit", "checkout:2000", "run", "--stdin"]),
+        limited(Some(("checkout", 2000)))
+    );
+    assert_eq!(
+        invocation(&["box", "--test-box-git-limit=git init --bare:1500", "run", "--stdin"]),
+        limited(Some(("git init --bare", 1500))),
+        "a step of several words"
+    );
+    assert_eq!(
+        invocation(&["box", "--test-box-git-limit", "a:b:30", "run", "--stdin"]),
+        limited(Some(("a:b", 30))),
+        "split at the last colon"
+    );
+    assert_eq!(invocation(&["box", "run", "--stdin"]), limited(None), "no seam given, none set");
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_git_limit_refuses_a_value_without_a_step_or_whole_milliseconds() {
+    let rows: [(&[&str], &[&str]); 6] = [
+        (
+            &["box", "--test-box-git-limit", "checkout", "run", "--stdin"],
+            &["gate: --test-box-git-limit must be <step>:<ms>, got 'checkout'"],
+        ),
+        (
+            &["box", "--test-box-git-limit", ":2000", "run", "--stdin"],
+            &["gate: --test-box-git-limit must be <step>:<ms>, got ':2000'"],
+        ),
+        (
+            &["box", "--test-box-git-limit", "checkout:0", "run", "--stdin"],
+            &["gate: --test-box-git-limit must be a whole number above 0, got 'checkout:0'"],
+        ),
+        (
+            &["box", "--test-box-git-limit", "checkout:fast", "run", "--stdin"],
+            &["gate: --test-box-git-limit must be a whole number above 0, got 'checkout:fast'"],
+        ),
+        (
+            &["box", "--test-box-git-limit", "a:1", "--test-box-git-limit=b:2", "run", "--stdin"],
+            &["gate: --test-box-git-limit is given twice"],
+        ),
+        (&["box", "--test-box-git-limit"], &["gate: --test-box-git-limit needs a value", BOX_USAGE]),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), want, "{words:?}");
+    }
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn the_probe_limit_seam_is_refused_outside_gate_box() {
     assert_eq!(
         problems(&refs(&with(&RUN, &["--test-probe-limit-ms", "5", "--", "cmd"]))),
@@ -1903,6 +1968,7 @@ fn the_desktop_seams_without_the_feature_are_no_verb() {
         ("--test-box-desktop-session", "active"),
         ("--test-box-desktop-mutex", "case-1"),
         ("--test-box-desktop-ms", "250"),
+        ("--test-box-git-limit", "checkout:2000"),
     ] {
         assert_eq!(problems(&["box", seam, value, "run", "--stdin"]), [BOX_USAGE], "{seam}");
         let joined = format!("{seam}={value}");

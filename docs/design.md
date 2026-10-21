@@ -2716,6 +2716,8 @@ The box's ceiling has three seams: `--test-box-sample-ms <n>` replaces the 5 s s
 
 `--test-box-kill-leaves <n>` stands in for the number of processes the last ending of a ceiling or backstop kill leaves (a whole number above 0), so the box says its note for a job that is still not ended.
 
+`--test-box-git-limit <step>:<ms>` replaces the bound of the one git step it names (as the box's lines name it, `checkout`, `git init --bare`, `push lib`) with `ms` milliseconds, every other step keeping its own; a value that is not `<step>:<ms>` with `ms` a whole number above 0 is `gate: --test-box-git-limit must be <step>:<ms>, got '<value>'`.
+
 `--test-lfs-budget-bytes <n>` replaces the 16 GiB a `gate box lfs` put unpacks, in bytes.
 
 `--test-box-root-walk-stop <folder>` ends the preflight's walk over the folders above the work root at that folder, which and those above it go unjudged (any path; an empty value is no value), so a case does not depend on the host's folders.
@@ -2791,6 +2793,18 @@ Built verbs:
   The same `failed: <message>` form covers a config read or write the preflight made itself: `gate: remote git remote add failed: cannot write <config>: <why>`, `gate: remote git remote add failed: cannot open|read <path>: <why>` and `gate: remote git remote add failed: cannot write <config>: config.lock could not be removed: <why>`. The steps are `git init --bare`, `git init`, `git remote add`, `git config core.autocrlf` and `git config core.eol`.
 
   On a pair run a step's line names its repo after the step: `gate: remote git init --bare failed for <leaf|sibling>` (status `n` and message forms as above), `gate: remote git init failed for <name>`, `gate: remote git remote add failed for <name>`, `gate: remote git config core.autocrlf failed for <name> (status <n>)`; a run of one repo says them as above.
+
+  Every git step the box runs has a bound: 5 minutes for a step that reads or writes refs, config or a listing (`init`, `config`, `remote add`, `cat-file`, `grep`, `check-ignore`, `write-tree`, `commit-tree`, `rev-parse`, `diff-tree`, `update-ref`, the LFS listing), 30 minutes for one that moves content (`fetch`, `checkout`, `lfs checkout`, `clean`, `add -A`, `push`). A git that does not answer in time is ended with its process tree and the step says `gate: remote <step> failed: git did not answer within <n> s` and exits 1 (a sync-back step says it in the `gate: remote sync-back failed: <message>` form, after the command). A git that cannot be waited on says `gate: remote <step> failed: cannot wait for git: <error>`.
+
+  A git step that ends with processes left in its job says a line naming the step, and one whose job could not be terminated says `gate: remote could not stop job git <step>: <error>`.
+
+  While a git step waits, the box probes stderr, so a client that is gone ends it: the run exits 255, a `git clean` after a failed checkout included. A `git clean` that exits 255 by itself is the clean's failure (`gate: remote clean failed (status 255)`), not a gone client. A step that writes the shared bare repository (`update-ref -d` in the bare, `push`, `git init --bare`) is the exception: it runs on a hidden console to its end or its bound, and still starts after the client is gone, so a killed git leaves no `packed-refs.lock` the box never removes; every other step is not started once the client is gone.
+
+  `gate box stop` during a git step that is not such a write ends that step and its process tree at once: `gate: remote <step> failed: the job <job> was stopped` and status 1. After a stop no git step that a stop ends is started (nothing is synced back, no `add -A`). A git that exits by itself is never reported stopped. A stop signal that cannot be read says `gate: remote cannot read the stop signal of job <job>: <error>`, at most once per run.
+
+  Before its first git step a run, or the lay-out of a work folder, removes each tree's `.git\index.lock`, `.git\HEAD.lock`, `.git\config.lock`, `{Work}.index.lock` and the bare's `refs\gate-back\<key>.lock` (the lock sweep), through handles held one folder beneath another, never following a link: behind a junction at `.git` it touches nothing. A lock another handle holds open is skipped, and the git that needs it reports it. A folder at a lock's name is left and refuses the run (75) with `<path> is a folder where git's lock file goes`.
+
+  A bare repository that is missing its `HEAD`, `objects` or `refs`, or a tree whose `.git` holds no `HEAD`, is initialised again, said as `gate: remote created <Bare>`. Before it re-initialises a bare with no `HEAD`, the box removes the bare's root `HEAD.lock` and `config.lock` the same way (the only names in a bare's root it removes); a folder at either fails the step `gate: remote git init --bare failed: <why>` with status 1.
 
   A folder or file that cannot be made prints `gate: remote could not create the folder <path>: <error>` or `gate: remote could not write <path>: <error>` and exits 1. An SDK list that cannot be read prints `gate: remote could not read the SDK list: <message>`, omits the sdks line and still exits 0; the client then skips the parity check.
 
@@ -3027,7 +3041,7 @@ Built verbs:
 
   On a pair run every repo's back ref `refs/gate-back/<key>` is deleted before any checkout, so no repo keeps an earlier run's back commit whatever step of this run fails; a run of one repo deletes it in its checkout step.
 
-  The checkout is `checkout -q --force --detach <sha>`, the payload's commit and not `FETCH_HEAD`, so a later push of the key changes nothing a running run runs. The box's git calls for preflight and the probe share one start path (`preflight::Git::code`).
+  The checkout is `checkout -q --force --detach <sha>`, the payload's commit and not `FETCH_HEAD`, so a later push of the key changes nothing a running run runs. The box's git calls for preflight, the probe and the run's own steps share one start and wait path (`preflight::Git`), which carries the bounds, the gone-client probe, the stop and the lock sweep of the preflight section above.
 
   The tool restore (`boxside/tools.rs`) runs `dotnet tool restore` in `{Work}\{Subfolder}` (`{Work}\{Leaf}\{Subfolder}` on a pair run) on a hidden console, in a job of its own named `{job}-tools`, created kill-on-close and never handed to dotnet, so the box's own handle keeps it: a box that dies or is killed takes the restore and everything it started with it, and a process the restore leaves running is terminated before the command starts.
 

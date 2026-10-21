@@ -109,6 +109,9 @@ pub struct BoxSeams {
     /// those above it left unjudged, so the suite's cases do not depend on the host's folders; `None` without the
     /// feature, and the walk goes to the volume root.
     pub root_walk_stop: Option<PathBuf>,
+    /// A git step of `gate box`, named as the box's lines name it (`checkout`, say), and how long it may take, in
+    /// milliseconds, in place of its built-in bound; every other step keeps its own. `None` without the feature.
+    pub git_limit: Option<(String, u64)>,
 }
 
 /// A fault `--test-box-desktop` makes the box's desktop run take, in place of the real task start and helper.

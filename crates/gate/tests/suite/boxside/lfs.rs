@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, READ_CONTROL};
 
 use super::{
-    box_call, field, gate_box, git, has_ref, lines, pair_payload, pair_snapshot, passed, payload, refused_line, renamed, run_box, run_box_with_env,
-    snapshot, started_line,
+    Does, box_call, field, gate_box, git, has_ref, lines, pair_payload, pair_snapshot, passed, path_for_run, payload, refused_line, renamed, run_box,
+    run_box_with_env, run_box_with_path, snapshot, started_line, stub_git_doing,
 };
 use crate::support::{Case, FAKE_TOOL, Outcome, box_payload};
 
@@ -1187,8 +1187,9 @@ fn an_lfs_attributes_file_in_an_ignored_folder_leaves_an_add_failure_git_s_own_l
     assert_add_failed_as_git_says(&payload, &outcome);
 }
 
-/// A run with no scratch folder whose checkout fails for a reason of git's own, a stale `index.lock`, in a tree whose
-/// attributes name no LFS filter, says git's own failure, not an LFS one.
+/// A run with no scratch folder whose checkout fails for a reason of git's own, status 128 from a stub, in a tree whose
+/// attributes name no LFS filter, says git's own failure, not an LFS one. A stale `index.lock` cannot stand in: the run
+/// removes it before its first git step.
 #[test]
 fn a_checkout_failure_in_a_tree_without_an_lfs_filter_keeps_git_s_own_line() {
     let case = Case::new("box_lfs_run_checkout_fails_plain");
@@ -1198,9 +1199,10 @@ fn a_checkout_failure_in_a_tree_without_an_lfs_filter_keeps_git_s_own_line() {
     assert_eq!(ran.code, Some(0), "{ran:?}");
     let mut second = renamed(&first, 1);
     snapshot(&case, &mut second, &[("b.txt", "b\n")]);
-    fs::write(work_file(&second, r".git\index.lock"), "").expect("a stale index lock can be planted");
+    let stub = case.folder().join("stub");
+    stub_git_doing(&stub, &[("checkout", Does::Exit(128))]);
 
-    let outcome = run_box(&case, &second);
+    let outcome = run_box_with_path(&case, &second, Some(&path_for_run(&[stub])));
 
     assert_ne!(outcome.code, Some(0), "the checkout fails: {outcome:?}");
     assert_eq!(outcome.stdout, "", "the command never ran: {outcome:?}");
@@ -1395,13 +1397,15 @@ fn a_decoy_attributes_file_where_the_box_started_is_not_taken_for_the_tree_s() {
     assert_eq!(ran.code, Some(0), "{ran:?}");
     let mut second = renamed(&first, 1);
     snapshot(&case, &mut second, &[("b.txt", "b\n")]);
-    fs::write(work_file(&second, r".git\index.lock"), "").expect("a stale index lock can be planted");
+    let stub = case.folder().join("stub");
+    stub_git_doing(&stub, &[("checkout", Does::Exit(128))]);
     let decoy = case.folder().join("profile");
     fs::create_dir_all(&decoy).expect("the box's working directory can be made");
     fs::write(decoy.join(".gitattributes"), "*.bin filter=lfs -text\n").expect("a decoy attributes file can be planted");
 
     let mut call = box_call(&case, &["box", "run"], &self::payload(&second));
     call.current_dir(&decoy);
+    call.env("PATH", path_for_run(&[stub]));
     let outcome = call.finish();
 
     assert_ne!(outcome.code, Some(0), "the checkout fails: {outcome:?}");
