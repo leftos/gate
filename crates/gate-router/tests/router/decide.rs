@@ -95,6 +95,7 @@ fn the_control_command_routes_from_the_root() {
             outputs_withheld: false,
             desktop: false,
             source_revision: Some(HEAD.to_owned()),
+            later: Vec::new(),
         }
     );
     assert_eq!(run.lines(), Vec::<&str>::new());
@@ -2585,6 +2586,80 @@ fn a_warm_up_target_goes_to_host_even_when_a_builder_entry_lists_the_repo() {
     let place = facts.place().expect("the place reads").expect("there is a worktree");
     let warm = target(&config, place, &facts).expect("the worktree has a target");
     assert_eq!(warm.builder, host_builder("builder-1", 1));
+}
+
+/// The builders [`RemoteRun::later`] lists after the first pick, in try order, by alias.
+fn later_aliases(run: &RemoteRun) -> Vec<&str> {
+    run.later.iter().map(|later| later.builder.alias.as_str()).collect()
+}
+
+#[test]
+fn a_routed_command_lists_every_other_matching_builder_in_file_order_then_host() {
+    let config = with_builders(
+        r#"{"yaat": ["dotnet *"]}"#,
+        r#"[{"host": "mac-1", "os": "macos", "root": "/Users/me/gate", "repos": {"yaat": ["dotnet build*"]}},
+            {"host": "win-2", "os": "windows", "slots": 3, "repos": {"yaat": ["cargo *", "dotnet build*"]}}]"#,
+    );
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &FakeFacts::with_config(config)));
+    assert_eq!(run.builder, mac_builder());
+    assert_eq!(later_aliases(&run), ["win-2", "builder-1"]);
+    assert_eq!(
+        run.later.iter().map(|later| later.pattern.as_str()).collect::<Vec<_>>(),
+        ["dotnet build*", "dotnet *"],
+        "each candidate keeps the first pattern of its own list that matched"
+    );
+}
+
+#[test]
+fn a_builder_whose_patterns_do_not_match_is_not_a_later_candidate() {
+    let config = with_builders(
+        r#"{"yaat": ["dotnet *"]}"#,
+        r#"[{"host": "win-2", "os": "windows", "repos": {"yaat": ["cargo *"]}},
+            {"host": "win-3", "os": "windows", "repos": {"yaat": ["dotnet build*"]}},
+            {"host": "mac-1", "os": "macos", "root": "/Users/me/gate", "repos": {"yaat": ["cargo build*"]}}]"#,
+    );
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &FakeFacts::with_config(config)));
+    assert_eq!(run.builder.alias, "win-3", "the first entry whose patterns match");
+    assert_eq!(later_aliases(&run), ["builder-1"], "only host's patterns match too");
+}
+
+#[test]
+fn a_single_builder_route_has_no_later_candidates() {
+    let facts = FakeFacts::with_config(routing_all());
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.builder.alias, "builder-1");
+    assert!(run.later.is_empty(), "{:?}", later_aliases(&run));
+}
+
+#[test]
+fn building_the_later_candidates_asks_no_fact() {
+    let builders = r#"[{"host": "win-2", "os": "windows", "repos": {"yaat": ["*"]}},
+        {"host": "mac-1", "os": "macos", "root": "/Users/me/gate", "repos": {"yaat": ["*"]}}]"#;
+    let with = FakeFacts::with_config(with_builders(r#"{"yaat": ["*"]}"#, builders));
+    let alone = FakeFacts::with_config(routing_all());
+    let tool = words(&[r".\tool.exe"]);
+    let run = routed(decide(&heavy(&tool), &with));
+    assert_eq!(run.builder.alias, "win-2");
+    assert_eq!(later_aliases(&run), ["mac-1", "builder-1"], "both later builders are listed");
+    assert_eq!(routed(decide(&heavy(&tool), &alone)).builder.alias, "builder-1");
+    assert_eq!(with.asked(), alone.asked(), "the later candidates ask nothing");
+
+    let mac = r#"[{"host": "mac-1", "os": "macos", "root": "/Users/me/gate", "repos": {"yaat": ["*"]}}]"#;
+    let listed = |host_repos: &str, builders: Option<&str>| {
+        let builders = builders.map_or_else(String::new, |builders| format!(r#", "builders": {builders}"#));
+        Config::parse(&format!(
+            r#"{{"host": "builder-1", "repos": {host_repos}, "sendBuild": ["yaat"]{builders}}}"#
+        ))
+        .expect("usable")
+    };
+    let with = FakeFacts::with_config(listed(r#"{"yaat": ["*"]}"#, Some(mac)));
+    let alone = FakeFacts::with_config(listed("{}", Some(mac)));
+    let command = words(&["dotnet", "test", "App.csproj", "-c", "Release", "--no-build"]);
+    let run = routed(decide(&heavy(&command), &with));
+    assert_eq!(run.builder.alias, "mac-1");
+    assert_eq!(later_aliases(&run), ["builder-1"], "host may be tried next");
+    assert_eq!(routed(decide(&heavy(&command), &alone)).builder.alias, "mac-1");
+    assert_eq!(with.asked(), alone.asked(), "listing host asks no fact");
 }
 
 #[test]

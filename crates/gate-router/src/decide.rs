@@ -434,8 +434,8 @@ fn not_allowed_line(names: &[String], problem: Option<&str>) -> String {
     reason = "each flag is an independent fact of the route that a caller reads by name; no two form a state machine"
 )]
 pub struct RemoteRun {
-    /// The builder the command's pick chose: the first `builders` entry listing the repo, in file order, with a pattern
-    /// that matches, else `host`.
+    /// The builder this run goes to: the command's pick, the first `builders` entry listing the repo, in file order,
+    /// with a pattern that matches, else `host`.
     pub builder: Builder,
     /// The worktree root as git gives it.
     pub root: String,
@@ -488,6 +488,21 @@ pub struct RemoteRun {
     /// `SourceRevisionId` variable so any build there is pinned to it; `None` when the branch is unborn or git cannot
     /// read it.
     pub source_revision: Option<String>,
+    /// The builders the run may try next when it falls back, in the order it would try them, from the config alone:
+    /// each `builders` entry listing the repo, in file order, then `host`, minus the builder this run goes to, each
+    /// with the first pattern of its own list that the command matched. A caller that falls back checks a candidate
+    /// through the pick's steer-off rules and builds its run when it tries it; nothing is built here.
+    pub later: Vec<LaterCandidate>,
+}
+
+/// A builder a routed run may try next when it falls back: the builder, and the first pattern of its own list for the
+/// repo that the command matched ([`first_match`]), as the config gives them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaterCandidate {
+    /// The builder the run would go to.
+    pub builder: Builder,
+    /// The first pattern of the builder's own list for the repo that the command matched.
+    pub pattern: String,
 }
 
 /// How a routed `dotnet test --no-build` keeps its `--no-build` ([`RemoteRun::send`]).
@@ -645,6 +660,8 @@ struct Matched {
     program_named: bool,
     /// Whether the command asks for the builder's desktop ([`check_desktop`]).
     desktop: bool,
+    /// The builders the run may try next, in try order ([`later_candidates`]).
+    later: Vec<LaterCandidate>,
 }
 
 fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<RemoteRun, Here> {
@@ -965,6 +982,7 @@ fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts)
     let (builder, pattern, unix_words) = steer_off_backslashes(config, &opened, &sent.words, facts, (builder, pattern, slashed))?;
     let target = settle(config, opened, builder, facts)?;
     let desktop = check_desktop(config, &target, found, &sent.words, facts)?;
+    let later = later_candidates(config, &target, &sent.words);
     Ok(Matched {
         target,
         pattern,
@@ -973,7 +991,26 @@ fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts)
         outside_path: sent.outside_path,
         program_named: sent.program_named,
         desktop,
+        later,
     })
+}
+
+/// The builders the run may try next, in the order it would try them: [`Config::routes`] order, minus the pick, each
+/// with the first of its own patterns that matches the `sent` words. The config alone decides them; no fact is asked.
+fn later_candidates(config: &Config, target: &Target, sent: &[String]) -> Vec<LaterCandidate> {
+    let mut later = Vec::new();
+    for (builder, patterns) in config.routes(&target.repo) {
+        if *builder == target.builder {
+            continue;
+        }
+        if let Some(pattern) = first_match(patterns, sent) {
+            later.push(LaterCandidate {
+                builder: builder.clone(),
+                pattern,
+            });
+        }
+    }
+    later
 }
 
 /// The pick `picked` of the opened worktree's command, with the words a macOS pick runs, rewritten with `/`: kept, its
@@ -1554,7 +1591,8 @@ fn device_path(letter: char, facts: &dyn Facts, answers: &mut Vec<(char, Option<
 }
 
 /// The routed run of a matched command: its target, its rewritten words with `--no-build` dropped, then marked and
-/// stamped as [`builder_words`] marks and stamps them, and the worktree's `HEAD` sha, asked once whatever the command.
+/// stamped as [`builder_words`] marks and stamps them, the worktree's `HEAD` sha, asked once whatever the command, and
+/// the builders the run may try next ([`RemoteRun::later`]), which the config alone gives.
 fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[String], facts: &dyn Facts) -> RemoteRun {
     let Matched {
         target,
@@ -1562,6 +1600,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         words: sent,
         program_named,
         desktop,
+        later,
         ..
     } = matched;
     let sent_count = sent.len();
@@ -1612,6 +1651,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         outputs_withheld,
         desktop,
         source_revision,
+        later,
     }
 }
 

@@ -428,6 +428,7 @@ pub(super) mod tests {
                 outputs_withheld: false,
                 desktop: false,
                 source_revision: None,
+                later: Vec::new(),
             }
         }
     }

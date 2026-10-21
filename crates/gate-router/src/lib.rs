@@ -28,10 +28,10 @@ mod watch;
 
 pub use config::{Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAULT_OUTPUTS, ignored_line, is_usable_host};
 pub use decide::{
-    BuildSettings, BuildTarget, BuilderWords, CarriedSibling, DROPPED_NO_BUILD_LINE, DotnetTarget, Facts, FolderId, Inputs, LocalReason,
-    NO_OUTPUTS_LINE, OUTPUT_PROPERTIES, PROJECT_EXTENSIONS, Place, RemoteRun, Route, SendPlan, SiblingFolder, Slot, Target, build_settings,
-    builder_words, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, names_program, sdk_build_target, sibling_root, stays_local, target,
-    without_no_build,
+    BuildSettings, BuildTarget, BuilderWords, CarriedSibling, DROPPED_NO_BUILD_LINE, DotnetTarget, Facts, FolderId, Inputs, LaterCandidate,
+    LocalReason, NO_OUTPUTS_LINE, OUTPUT_PROPERTIES, PROJECT_EXTENSIONS, Place, RemoteRun, Route, SendPlan, SiblingFolder, Slot, Target,
+    build_settings, builder_words, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, names_program, sdk_build_target, sibling_root,
+    stays_local, target, without_no_build,
 };
 pub use escape::{escaped, is_reordering_mark};
 pub use key::{is_layout_char, is_layout_name, repo_name, work_folder_key};
