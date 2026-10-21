@@ -3292,9 +3292,9 @@ Built verbs:
 
   A failure after the box has sent the command ends the helper's side before the box answers.
 
-  The box drops the pipe without `Done` (the helper then ends its own child), waits once, for at most the end limit and watching the run's stop signal, for the helper to exit, ends the helper if it is still there, and sweeps: from a process snapshot (without command lines) it ends each process whose parent is the helper, created after it and in the console's session, re-checking each by its own handle first.
+  The box drops the pipe without `Done` (the helper then ends its own child), waits once, for at most the end limit and watching the run's stop signal, for the helper to exit, ends the helper if it is still there, and sweeps: from a process snapshot (without command lines) it ends each process whose parent is the helper, created after it and in the console's session, re-checking each by its own handle first: it asks every one of them to end, then waits for them all within one end limit for the whole sweep.
 
-  A process the box could not end is said as `gate: remote could not end the desktop command (process <pid>): <error>`, the helper as `gate: remote could not end the desktop helper (process <pid>): <error>`, and a snapshot that failed as `gate: remote could not list processes to end after the desktop command: <error>`. The stop lines of a desktop run are written under the output lock, as the heartbeat is.
+  A process the box could not end is said as `gate: remote could not end the desktop command (process <pid>): <error>` (the error `it had not ended in time` for one still running when the sweep's bound runs out), the helper as `gate: remote could not end the desktop helper (process <pid>): <error>`, and a snapshot that failed as `gate: remote could not list processes to end after the desktop command: <error>`. The stop lines of a desktop run are written under the output lock, as the heartbeat is.
 
   The command runs outside the box's own job, created with `CREATE_BREAKAWAY_FROM_JOB` so it leaves the ssh session's job (the box's job refusing breakaway prints `gate: the box cannot start a command outside its own job: <message>` and exits 1). Its console is a donor's UTF-8 console (the console, below), else a hidden console of its own (`CREATE_NO_WINDOW`).
 

@@ -650,16 +650,36 @@ fn unlisted_line(error: &io::Error) -> String {
     )
 }
 
-/// Ends every process a failed hand-off left that is provably the helper's ([`sweep_targets`]): each re-checked by the
-/// handle opened to end it, its parent still the helper and its creation time the snapshot's, and one that cannot be
-/// opened or ended said. A snapshot that cannot be taken is said, and nothing is ended.
-fn sweep(here: &Here<'_, '_>, helper: u32, created: Timestamp, console: &mut Console) {
-    sweep_on(&Machine, helper, created, here.session, &mut |line| here.beat.say(console, line));
+/// The helper a sweep is of: its pid, when it was created, and the session its children run in.
+#[derive(Clone, Copy)]
+struct SweptHelper {
+    /// The helper's pid.
+    pid: u32,
+    /// When it was created, as the pinned helper's handle gave it.
+    created: Timestamp,
+    /// The session the builder's desktop runs in.
+    session: u32,
 }
 
-/// [`sweep`] over the processes of `machine`, of the helper `helper` created at `created` in the session `session`,
-/// each line it says given to `say`.
-fn sweep_on(machine: &impl SweptMachine, helper: u32, created: Timestamp, session: u32, say: &mut impl FnMut(&str)) {
+/// Ends every process a failed hand-off left that is provably the helper's ([`sweep_targets`]): each re-checked by the
+/// handle opened to end it, its parent still the helper and its creation time the snapshot's, and one that cannot be
+/// opened or ended said. Every target is asked to end before any is waited on, and all are waited on within one end
+/// limit for the whole sweep. A snapshot that cannot be taken is said, and nothing is ended.
+fn sweep(here: &Here<'_, '_>, helper: u32, created: Timestamp, console: &mut Console) {
+    let swept = SweptHelper {
+        pid: helper,
+        created,
+        session: here.session,
+    };
+    sweep_on(&Machine, swept, here.limits.end, Instant::now, &mut |line| {
+        here.beat.say(console, line);
+    });
+}
+
+/// [`sweep`] over the processes of `machine`, of the helper `swept`, each line it says given to `say`: every target
+/// opened and re-checked is asked to end, then all of them are waited on against one deadline, `bound` on from `now`,
+/// and one still running at that deadline is said, with the error its end was refused with when it was.
+fn sweep_on(machine: &impl SweptMachine, swept: SweptHelper, bound: Duration, now: impl Fn() -> Instant, say: &mut impl FnMut(&str)) {
     let snapshot = match machine.snapshot() {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -667,23 +687,47 @@ fn sweep_on(machine: &impl SweptMachine, helper: u32, created: Timestamp, sessio
             return;
         }
     };
-    for (pid, at) in sweep_targets(&snapshot, helper, created, session, |pid| machine.session_of(pid)) {
+    let mut targets = Vec::new();
+    for (pid, at) in sweep_targets(&snapshot, swept.pid, swept.created, swept.session, |pid| machine.session_of(pid)) {
         let process = match machine.open(pid) {
             Ok(Some(process)) => process,
             Ok(None) => continue,
             Err(error) => {
-                say(&could_not_end_line(pid, &error));
+                targets.push(Target::Unopened { pid, error });
                 continue;
             }
         };
-        let still_the_helpers = process.parent_pid().ok() == Some(helper) && process.created().ok() == Some(at);
+        let still_the_helpers = process.parent_pid().ok() == Some(swept.pid) && process.created().ok() == Some(at);
         if !still_the_helpers {
             continue;
         }
-        if let Err(error) = process.terminate(ENDED_UNSTARTED) {
-            say(&could_not_end_line(pid, &error));
+        let refused = process.terminate(ENDED_UNSTARTED).err();
+        targets.push(Target::Opened { pid, process, refused });
+    }
+    let deadline = now() + bound;
+    for target in &targets {
+        match target {
+            Target::Unopened { pid, error } => say(&could_not_end_line(*pid, error)),
+            Target::Opened { pid, process, refused } => {
+                let why = match process.wait(deadline.saturating_duration_since(now())) {
+                    Ok(true) => None,
+                    Ok(false) => Some(io::Error::other("it had not ended in time")),
+                    Err(error) => Some(error),
+                };
+                if let Some(why) = why {
+                    say(&could_not_end_line(*pid, refused.as_ref().unwrap_or(&why)));
+                }
+            }
         }
     }
+}
+
+/// A target of the sweep: the process opened and re-checked, or why it could not be opened.
+enum Target<P> {
+    /// The process, still the helper's, and the error asking it to end was refused with, when it was.
+    Opened { pid: u32, process: P, refused: Option<io::Error> },
+    /// Why the process could not be opened.
+    Unopened { pid: u32, error: io::Error },
 }
 
 /// The machine's processes as a sweep reads and ends them.
@@ -709,8 +753,11 @@ trait SweptProcess {
     /// When it was created.
     fn created(&self) -> io::Result<Timestamp>;
 
-    /// Ends it with the exit code `exit_code`.
+    /// Asks it to end with the exit code `exit_code`, without waiting for the end.
     fn terminate(&self, exit_code: u32) -> io::Result<()>;
+
+    /// Waits at most `bound` for it to end: true when it has ended, false when it still runs.
+    fn wait(&self, bound: Duration) -> io::Result<bool>;
 }
 
 /// This machine's own processes.
@@ -743,6 +790,10 @@ impl SweptProcess for StoppableProcess {
 
     fn terminate(&self, exit_code: u32) -> io::Result<()> {
         StoppableProcess::terminate(self, exit_code)
+    }
+
+    fn wait(&self, bound: Duration) -> io::Result<bool> {
+        StoppableProcess::wait(self, bound)
     }
 }
 
@@ -1020,7 +1071,9 @@ mod tests {
 
     use crate::boxside::desktop::lines::DesktopRefusal;
 
-    use super::{EndingHelper, HelperEnd, SweptMachine, SweptProcess, end_within, helper_not_ended, identity_of, sweep_on, unlisted_line};
+    use super::{
+        EndingHelper, HelperEnd, SweptHelper, SweptMachine, SweptProcess, end_within, helper_not_ended, identity_of, sweep_on, unlisted_line,
+    };
 
     /// A case's own temp folder, removed with everything in it when the case ends, also when it fails.
     struct Removed(PathBuf);
@@ -1253,8 +1306,12 @@ mod tests {
     const HELPER: u32 = 4000;
     /// The session the builder's desktop runs in, in every sweep case.
     const SESSION: u32 = 3;
-    /// The pid of the one process every sweep case's snapshot holds under the helper.
+    /// The pid of the one process most sweep cases' snapshots hold under the helper.
     const TARGET: u32 = 4100;
+    /// The pid of the second target in the sweep cases that hold two.
+    const OTHER: u32 = 4200;
+    /// The end limit every sweep case runs to, which its fakes never wait on.
+    const END_BOUND: Duration = Duration::from_secs(600);
 
     /// The time `second` seconds after the epoch.
     fn time(second: i64) -> Timestamp {
@@ -1271,35 +1328,48 @@ mod tests {
         time(200)
     }
 
-    /// What opening the target of a sweep case gives.
+    /// What opening a target of a sweep case gives, and how its end goes.
+    #[derive(Clone, Copy)]
     enum Opened {
         /// No process has its pid any more.
         Gone,
         /// It cannot be opened, for this error.
         Refused(&'static str),
-        /// A process with this parent and creation time, whose end fails with this error when there is one.
+        /// A process with this parent and creation time, whose end fails with this error when there is one, whose wait
+        /// finds it ended only when `ends`, and which spends `spends` of the clock to end, or its whole bound when it
+        /// does not end.
         Process {
             parent: u32,
             created: Timestamp,
             end_error: Option<&'static str>,
+            ends: bool,
+            spends: Duration,
         },
     }
 
-    /// A machine of a sweep case: a snapshot holding the target, or the error taking it fails with, and the target as
-    /// opening it gives it; every pid it ended is kept.
+    /// A machine of a sweep case: a snapshot holding its targets, or the error taking it fails with, each target as
+    /// opening it gives it, the clock its waits run on, and what its sweep asked of them.
     struct Scripted {
         snapshot: Result<(), &'static str>,
-        opened: Opened,
+        targets: Vec<(u32, Opened)>,
+        clock: Rc<Cell<Instant>>,
         ended: Rc<RefCell<Vec<u32>>>,
+        ops: Rc<RefCell<Vec<String>>>,
+        waits: Rc<RefCell<Vec<Duration>>>,
     }
 
-    /// The target as a sweep case opened it.
+    /// The target a sweep case opened, as the sweep saw it.
     struct ScriptedProcess {
         pid: u32,
         parent: u32,
         created: Timestamp,
         end_error: Option<&'static str>,
+        ends: bool,
+        spends: Duration,
+        clock: Rc<Cell<Instant>>,
         ended: Rc<RefCell<Vec<u32>>>,
+        ops: Rc<RefCell<Vec<String>>>,
+        waits: Rc<RefCell<Vec<Duration>>>,
     }
 
     impl SweptMachine for Scripted {
@@ -1307,13 +1377,17 @@ mod tests {
 
         fn snapshot(&self) -> io::Result<Vec<ProcessInfo>> {
             self.snapshot.map_err(io::Error::other)?;
-            Ok(vec![ProcessInfo {
-                pid: TARGET,
-                parent_pid: HELPER,
-                name: "fake-tool.exe".to_owned(),
-                command_line: None,
-                created: Some(target_created()),
-            }])
+            Ok(self
+                .targets
+                .iter()
+                .map(|(pid, _)| ProcessInfo {
+                    pid: *pid,
+                    parent_pid: HELPER,
+                    name: "fake-tool.exe".to_owned(),
+                    command_line: None,
+                    created: Some(target_created()),
+                })
+                .collect())
         }
 
         fn session_of(&self, _pid: u32) -> Option<u32> {
@@ -1321,15 +1395,29 @@ mod tests {
         }
 
         fn open(&self, pid: u32) -> io::Result<Option<ScriptedProcess>> {
-            match self.opened {
+            let Some((_, opened)) = self.targets.iter().find(|(target, _)| *target == pid) else {
+                return Ok(None);
+            };
+            match *opened {
                 Opened::Gone => Ok(None),
                 Opened::Refused(error) => Err(io::Error::other(error)),
-                Opened::Process { parent, created, end_error } => Ok(Some(ScriptedProcess {
+                Opened::Process {
+                    parent,
+                    created,
+                    end_error,
+                    ends,
+                    spends,
+                } => Ok(Some(ScriptedProcess {
                     pid,
                     parent,
                     created,
                     end_error,
+                    ends,
+                    spends,
+                    clock: Rc::clone(&self.clock),
                     ended: Rc::clone(&self.ended),
+                    ops: Rc::clone(&self.ops),
+                    waits: Rc::clone(&self.waits),
                 })),
             }
         }
@@ -1345,36 +1433,68 @@ mod tests {
         }
 
         fn terminate(&self, _exit_code: u32) -> io::Result<()> {
+            let pid = self.pid;
+            self.ops.borrow_mut().push(format!("end {pid}"));
             if let Some(error) = self.end_error {
                 return Err(io::Error::other(error));
             }
             self.ended.borrow_mut().push(self.pid);
             Ok(())
         }
-    }
 
-    /// A sweep case's machine: its snapshot taken as `snapshot` says, and its target opened as `opened`.
-    fn scripted(snapshot: Result<(), &'static str>, opened: Opened) -> Scripted {
-        Scripted {
-            snapshot,
-            opened,
-            ended: Rc::new(RefCell::new(Vec::new())),
+        fn wait(&self, bound: Duration) -> io::Result<bool> {
+            let pid = self.pid;
+            self.ops.borrow_mut().push(format!("wait {pid}"));
+            self.waits.borrow_mut().push(bound);
+            let spent = if self.ends { self.spends } else { bound };
+            self.clock.set(self.clock.get() + spent);
+            Ok(self.ends)
         }
     }
 
-    /// The target opened still the helper's: its parent the helper and its creation time the snapshot's.
+    /// A sweep case's machine: its snapshot taken as `snapshot` says, and its one target opened as `opened`.
+    fn scripted(snapshot: Result<(), &'static str>, opened: Opened) -> Scripted {
+        scripted_targets(snapshot, vec![(TARGET, opened)])
+    }
+
+    /// A sweep case's machine with the targets `targets`, its snapshot taken as `snapshot` says.
+    fn scripted_targets(snapshot: Result<(), &'static str>, targets: Vec<(u32, Opened)>) -> Scripted {
+        Scripted {
+            snapshot,
+            targets,
+            clock: Rc::new(Cell::new(Instant::now())),
+            ended: Rc::new(RefCell::new(Vec::new())),
+            ops: Rc::new(RefCell::new(Vec::new())),
+            waits: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    /// The target opened still the helper's: its parent the helper and its creation time the snapshot's, whose end
+    /// fails with `end_error` when there is one, and which has ended by its wait unless that end was refused.
     fn still_the_helpers(end_error: Option<&'static str>) -> Opened {
         Opened::Process {
             parent: HELPER,
             created: target_created(),
             end_error,
+            ends: end_error.is_none(),
+            spends: Duration::ZERO,
         }
     }
 
-    /// The lines a sweep of `machine` says, and the pids it ended.
+    /// The helper every sweep case sweeps for.
+    fn swept_helper() -> SweptHelper {
+        SweptHelper {
+            pid: HELPER,
+            created: helper_created(),
+            session: SESSION,
+        }
+    }
+
+    /// The lines a sweep of `machine` says, and the pids it asked to end.
     fn swept(machine: &Scripted) -> (Vec<String>, Vec<u32>) {
         let mut said = Vec::new();
-        sweep_on(machine, HELPER, helper_created(), SESSION, &mut |line| said.push(line.to_owned()));
+        let mut say = |line: &str| said.push(line.to_owned());
+        sweep_on(machine, swept_helper(), END_BOUND, || machine.clock.get(), &mut say);
         (said, machine.ended.borrow().clone())
     }
 
@@ -1393,6 +1513,8 @@ mod tests {
                 parent: 4200,
                 created: target_created(),
                 end_error: None,
+                ends: true,
+                spends: Duration::ZERO,
             },
         );
 
@@ -1407,6 +1529,8 @@ mod tests {
                 parent: HELPER,
                 created: time(300),
                 end_error: None,
+                ends: true,
+                spends: Duration::ZERO,
             },
         );
 
@@ -1443,6 +1567,94 @@ mod tests {
                 vec!["gate: remote could not end the desktop command (process 4100): access denied".to_owned()],
                 Vec::new()
             )
+        );
+    }
+
+    #[test]
+    fn a_sweep_says_a_target_that_has_not_ended_when_its_bound_runs_out() {
+        let machine = scripted(
+            Ok(()),
+            Opened::Process {
+                parent: HELPER,
+                created: target_created(),
+                end_error: None,
+                ends: false,
+                spends: Duration::ZERO,
+            },
+        );
+
+        assert_eq!(
+            swept(&machine),
+            (
+                vec!["gate: remote could not end the desktop command (process 4100): it had not ended in time".to_owned()],
+                vec![TARGET]
+            ),
+            "an end only asked for is not an end"
+        );
+    }
+
+    #[test]
+    fn a_sweep_asks_every_target_to_end_before_it_waits_on_any() {
+        let machine = scripted_targets(Ok(()), vec![(TARGET, still_the_helpers(None)), (OTHER, still_the_helpers(None))]);
+
+        swept(&machine);
+
+        assert_eq!(
+            *machine.ops.borrow(),
+            ["end 4100", "end 4200", "wait 4100", "wait 4200"],
+            "every target is asked to end before the first is waited on"
+        );
+    }
+
+    #[test]
+    fn a_sweep_waits_on_its_targets_within_one_deadline() {
+        let slow = Opened::Process {
+            parent: HELPER,
+            created: target_created(),
+            end_error: None,
+            ends: true,
+            spends: Duration::from_secs(400),
+        };
+        let stuck = Opened::Process {
+            parent: HELPER,
+            created: target_created(),
+            end_error: None,
+            ends: false,
+            spends: Duration::ZERO,
+        };
+        let machine = scripted_targets(Ok(()), vec![(TARGET, slow), (OTHER, stuck)]);
+
+        swept(&machine);
+
+        assert_eq!(
+            *machine.waits.borrow(),
+            [END_BOUND, END_BOUND.saturating_sub(Duration::from_secs(400))],
+            "the second wait gets what the first left of one deadline, never more"
+        );
+        assert!(
+            machine.waits.borrow().iter().all(|wait| *wait <= END_BOUND),
+            "no wait goes past the deadline: {:?}",
+            machine.waits.borrow()
+        );
+    }
+
+    #[test]
+    fn a_target_whose_end_was_refused_but_that_ended_is_not_said() {
+        let machine = scripted(
+            Ok(()),
+            Opened::Process {
+                parent: HELPER,
+                created: target_created(),
+                end_error: Some("access denied"),
+                ends: true,
+                spends: Duration::ZERO,
+            },
+        );
+
+        assert_eq!(
+            swept(&machine),
+            (Vec::new(), Vec::new()),
+            "an end already under way, then seen ended, is an end"
         );
     }
 
