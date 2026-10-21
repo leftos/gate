@@ -80,9 +80,9 @@ fn failed(console: &mut Console, line: &str) -> u32 {
     u32::from(FAILED_STATUS)
 }
 
-/// The builder `remote.json` lists as `host` or in `hosts` ([`gate_router::Config::builders`]) that is `host` in any
-/// ASCII letter case, as the file spells it. Else the status and the line: 2 for a host it does not list, 1 for a
-/// routing file that is not there or cannot be used.
+/// The builder `remote.json` lists as `host`, in `hosts` ([`gate_router::Config::builders`]) or as a `builders` entry
+/// ([`gate_router::Config::builder`]) that is `host` in any ASCII letter case, as the file spells it. Else the status
+/// and the line: 2 for a host it does not list, 1 for a routing file that is not there or cannot be used.
 fn listed(host: &str) -> Result<String, (u8, String)> {
     let cannot = |why: String| (FAILED_STATUS, format!("check: {}: remote.json {why}", escaped(host)));
     let path = route::remote_json_path(std::env::var_os("LOCALAPPDATA").as_deref())
@@ -97,6 +97,7 @@ fn listed(host: &str) -> Result<String, (u8, String)> {
         .iter()
         .find(|builder| builder.eq_ignore_ascii_case(host))
         .cloned()
+        .or_else(|| config.builder(host).map(|builder| builder.alias.clone()))
         .ok_or_else(|| (USAGE_STATUS, format!("gate check: {} is not a builder remote.json lists", escaped(host))))
 }
 

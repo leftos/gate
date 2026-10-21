@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use gate_router::{Config, DEFAULT_OUTPUTS, Pattern, ignored_line};
+use gate_router::{Builder, BuilderOs, Config, Pattern, ignored_line};
 
 fn reason(text: &str) -> String {
     Config::parse(text).expect_err("the file is unusable")
@@ -24,8 +24,8 @@ fn a_good_file_gives_host_slots_patterns_and_outputs() {
     assert_eq!(patterns, ["cargo test *", "cargo build*"]);
     assert_eq!(config.patterns("other").expect("listed").len(), 0);
     assert!(config.patterns("missing").is_none());
-    assert_eq!(config.outputs("gate"), ["target/**"]);
-    assert_eq!(config.outputs("other"), DEFAULT_OUTPUTS);
+    assert_eq!(config.own_outputs("gate"), Some(vec!["target/**".to_owned()]));
+    assert_eq!(config.own_outputs("other"), None, "a repo outputs does not name has no list of its own");
 }
 
 #[test]
@@ -659,4 +659,156 @@ fn an_ssh_alias_or_user_at_host_of_allowed_characters_is_accepted() {
         let config = Config::parse(&host_file(host)).expect("usable");
         assert_eq!(config.host(), host);
     }
+}
+
+#[test]
+fn a_builders_alias_that_repeats_a_hosts_entry_refuses_the_file() {
+    let text = r#"{"host": "builder-1", "hosts": [3, "b-2", "Mac-1"], "repos": {},
+        "builders": [{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"g": []}}]}"#;
+    assert_eq!(reason(text), "builders[0].host repeats hosts[2]");
+}
+
+#[test]
+fn a_macos_root_of_letters_digits_dots_underscores_and_dashes_is_accepted() {
+    let config = Config::parse(&builders_file(
+        r#"[{"host": "mac-1", "os": "macos", "root": "/Users/me_2/gate-remote.d", "repos": {"gate": []}}]"#,
+    ))
+    .expect("usable");
+    assert_eq!(
+        config.builder("mac-1").and_then(|builder| builder.root.as_deref()),
+        Some("/Users/me_2/gate-remote.d")
+    );
+}
+
+#[test]
+fn a_repo_listed_only_in_a_builders_entry_is_routed() {
+    let config = Config::parse(&builders_file(
+        r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"Solo": ["*"]}}]"#,
+    ))
+    .expect("usable");
+    assert!(config.is_routed("solo"));
+    assert!(config.is_routed("gate"), "the top-level repos");
+    assert!(!config.is_routed("other"));
+}
+
+/// A routing file whose `host` is `builder-1`, with `builders` holding `builders`.
+fn builders_file(builders: &str) -> String {
+    format!(r#"{{"host": "builder-1", "slots": 2, "repos": {{"gate": ["x"]}}, "builders": {builders}}}"#)
+}
+
+#[test]
+fn a_builders_entry_parses_a_macos_builder_with_its_root_and_a_windows_one_with_the_default_root() {
+    let config = Config::parse(&builders_file(
+        r#"[{"Host": "mac-1", "OS": "macos", "Root": "/Users/me/gate", "Slots": 3, "Repos": {"gate": ["cargo *"]}},
+            {"host": "win-2", "os": "Windows", "repos": {"other": []}},
+            {"host": "win-3", "os": "windows", "root": "E:\\gate", "repos": {"gate": []}}]"#,
+    ))
+    .expect("usable");
+    let mac = Builder {
+        alias: "mac-1".to_owned(),
+        os: BuilderOs::Macos,
+        root: Some("/Users/me/gate".to_owned()),
+        slots: 3,
+        id: Some("1f0efc62".to_owned()),
+    };
+    let win = Builder {
+        alias: "win-2".to_owned(),
+        os: BuilderOs::Windows,
+        root: None,
+        slots: 1,
+        id: Some("084c286b".to_owned()),
+    };
+    let entries: Vec<&Builder> = config.builder_entries().collect();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0], &mac);
+    assert_eq!(entries[1], &win);
+    assert_eq!(entries[2].root.as_deref(), Some(r"E:\gate"));
+    assert_eq!(config.builder("MAC-1"), Some(&mac), "found in any ASCII letter case");
+    let host = config.builder("builder-1").expect("host is a builder");
+    assert_eq!(
+        (host.alias.as_str(), host.os, host.root.as_deref(), host.slots, host.id.as_deref()),
+        ("builder-1", BuilderOs::Windows, None, 2, None)
+    );
+    assert_eq!(config.builder("nobody"), None);
+    assert_eq!(config.host(), "builder-1", "host is unchanged");
+    assert_eq!(config.slots(), 2, "the top-level slots are host's");
+    assert_eq!(config.builders(), Ok(&["builder-1".to_owned()][..]), "builders() stays host and hosts");
+}
+
+#[test]
+fn a_bad_builders_entry_makes_the_whole_file_unusable() {
+    let entry = |fields: &str| format!(r#"[{{"host": "mac-1", "os": "macos", {fields}}}]"#);
+    let repos = r#""repos": {"gate": ["x"]}"#;
+    let macos_root = "builders[0].root must be an absolute path for a macos builder";
+    let windows_root = "builders[0].root must be an absolute drive path for a windows builder";
+    let slots = "builders[0].slots must be a whole number 1 to 16";
+    let cases = [
+        (r#"{"mac-1": {}}"#.to_owned(), "builders must be an array of objects"),
+        ("[5]".to_owned(), "builders[0] must be a JSON object"),
+        (entry(repos), macos_root),
+        (entry(&format!(r#""root": "Users/me", {repos}"#)), macos_root),
+        (entry(&format!(r#""root": "/Users\\me", {repos}"#)), macos_root),
+        (entry(&format!(r#""root": "/Users/../me", {repos}"#)), macos_root),
+        (entry(&format!(r#""root": "/Users/./me", {repos}"#)), macos_root),
+        (entry(&format!(r#""root": "/", {repos}"#)), macos_root),
+        (entry(&format!(r#""root": "/Users/me/", {repos}"#)), macos_root),
+        (entry(&format!(r#""root": "/Users/m\te", {repos}"#)), macos_root),
+        (entry(&format!(r#""root": 5, {repos}"#)), macos_root),
+        (
+            format!(r#"[{{"host": "w", "os": "windows", "root": "gate", {repos}}}]"#),
+            "builders[0].host must not be a single letter, which a git host:path URL reads as a drive",
+        ),
+        (format!(r#"[{{"host": "win", "os": "windows", "root": "gate", {repos}}}]"#), windows_root),
+        (
+            format!(r#"[{{"host": "win", "os": "windows", "root": "D:\\..\\gate", {repos}}}]"#),
+            windows_root,
+        ),
+        (format!(r#"[{{"host": "win", "os": "windows", "root": "D:\\", {repos}}}]"#), windows_root),
+        (
+            format!(r#"[{{"host": "Builder-1", "os": "windows", {repos}}}]"#),
+            "builders[0].host repeats host",
+        ),
+        (
+            format!(r#"[{{"host": "win", "os": "windows", {repos}}}, {{"host": "WIN", "os": "windows", {repos}}}]"#),
+            "builders[1].host repeats builders[0].host",
+        ),
+        (entry(r#""root": "/m", "repos": {}"#), "builders[0].repos must name at least one repo"),
+        (entry(r#""root": "/m""#), "builders[0].repos is missing"),
+        (entry(r#""root": "/m", "repos": []"#), "builders[0].repos must be a JSON object"),
+        (
+            entry(r#""root": "/m", "repos": {"gate": [""]}"#),
+            "builders[0].repos.gate[0] is not a non-empty string",
+        ),
+        (
+            entry(&format!(r#""root": "/m", {repos}, "outputs": {{"gate": ["[x]"]}}"#)),
+            "builders[0].outputs.gate[0] is not a valid output glob: '[' and ']' are not allowed",
+        ),
+        (entry(&format!(r#""root": "/m", "slots": 0, {repos}"#)), slots),
+        (entry(&format!(r#""root": "/m", "slots": 17, {repos}"#)), slots),
+        (
+            format!(r#"[{{"host": "mac-1", "os": "linux", "root": "/m", {repos}}}]"#),
+            r#"builders[0].os must be "windows" or "macos""#,
+        ),
+        (format!(r#"[{{"host": "mac-1", "root": "/m", {repos}}}]"#), "builders[0].os is missing"),
+        (format!(r#"[{{"os": "macos", "root": "/m", {repos}}}]"#), "builders[0].host is missing"),
+        (
+            format!(r#"[{{"host": "x;y", "os": "macos", "root": "/m", {repos}}}]"#),
+            "builders[0].host must be an ssh alias or user@host of letters, digits, '.', '_' and '-', not starting with '-'",
+        ),
+        (entry(&format!(r#""root": "/Users/me gate", {repos}"#)), macos_root),
+        (entry(&format!(r#""root": "/Users/me\"gate", {repos}"#)), macos_root),
+        (entry(&format!(r#""root": "/Users/$HOME", {repos}"#)), macos_root),
+    ];
+    let failures: Vec<String> = cases
+        .iter()
+        .filter_map(|(builders, expected)| {
+            let got = Config::parse(&builders_file(builders)).map(|_| ());
+            (got != Err((*expected).to_owned())).then(|| format!("{builders}: expected {expected:?}, got {got:?}"))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+    assert_eq!(
+        ignored_line(Path::new("remote.json"), &reason(&builders_file(&entry(repos)))),
+        format!("gate: ignored remote.json: {macos_root}; running locally")
+    );
 }

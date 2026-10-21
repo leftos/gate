@@ -6,11 +6,11 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use crate::config::{CARGO_OUTPUTS, Config, ConfigProblem, ignored_line};
+use crate::config::{Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAULT_OUTPUTS, ignored_line};
 use crate::escape::escaped;
 use crate::key::{is_layout_name, repo_name, work_folder_key};
 use crate::like::{Pattern, eq_ignoring_case};
-use crate::rewrite::{RewritePlace, Rewritten, SiblingRoot, drive_letters, rewrite_named, root_letter, split_root};
+use crate::rewrite::{RewritePlace, Rewritten, Separators, SiblingRoot, drive_letters, rewrite_named, root_letter, split_root};
 
 /// The line said when `--no-build` was dropped from the builder's words.
 pub const DROPPED_NO_BUILD_LINE: &str = "gate: dropped --no-build: the last build may have run on the other machine";
@@ -429,10 +429,9 @@ fn not_allowed_line(names: &[String], problem: Option<&str>) -> String {
     reason = "each flag is an independent fact of the route that a caller reads by name; no two form a state machine"
 )]
 pub struct RemoteRun {
-    /// The builder's host alias.
-    pub host: String,
-    /// The remote pool's size.
-    pub slots: u32,
+    /// The builder the command's pick chose: the first `builders` entry listing the repo, in file order, with a pattern
+    /// that matches, else `host`.
+    pub builder: Builder,
     /// The worktree root as git gives it.
     pub root: String,
     /// The id of the worktree root's folder, read following links ([`Facts::root_id`]): what the run's worktree lock
@@ -566,10 +565,8 @@ type Here = Option<LocalReason>;
 /// run of the worktree and for its warm-up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
-    /// The builder's host alias.
-    pub host: String,
-    /// The remote pool's size.
-    pub slots: u32,
+    /// The builder: the one a command's pick chose, and `host` for a warm-up's target ([`target`]).
+    pub builder: Builder,
     /// The gate's place in the worktree.
     pub place: Place,
     /// The repo name the routing file lists.
@@ -600,24 +597,27 @@ pub struct BuilderWords {
     pub program_named: bool,
 }
 
-/// The target of the worktree at `place` under the routing file `config`, asked of the facts in the order a routed
-/// run asks them: the siblings file, then each sibling's folder and the root's id. A repo the routing file does not
-/// list has none, saying nothing; a siblings problem keeps the work here as it keeps a routed run ([`decide`]).
+/// The target of the worktree at `place` under the routing file `config`, on `host`, asked of the facts in the order a
+/// routed run asks them: the siblings file, then each sibling's folder and the root's id. A repo the routing file's
+/// top-level `repos` does not list has none, saying nothing, even when a `builders` entry lists it; a siblings problem
+/// keeps the work here as it keeps a routed run ([`decide`]).
 ///
 /// # Errors
 ///
 /// The reason to say, if any, when the worktree has no target.
 pub fn target(config: &Config, place: Place, facts: &dyn Facts) -> Result<Target, Option<LocalReason>> {
-    let opened = open(config, place, facts)?;
-    settle(config, opened, facts)
+    let opened = open(place, facts, |repo| config.patterns(repo).is_some())?;
+    settle(config, opened, config.host_builder().clone(), facts)
 }
 
 /// The words the builder of `target` runs for the command `words`: `--no-build` dropped as a routed run drops it, then
-/// the paths rewritten, the bare first word marked and the builder's own words written in ([`stamp`]), as a routed
-/// run's are; the worktree's `HEAD` is asked only when the source-revision word may go in.
+/// the paths rewritten as for `host`, the bare first word marked and the builder's own words written in ([`stamp`]), as
+/// a routed run's are; the worktree's `HEAD` is asked only when the source-revision word may go in.
 #[must_use]
 pub fn builder_words(target: &Target, words: &[String], facts: &dyn Facts) -> BuilderWords {
-    let sent = rewritten(&target.place, &target.leaf, carried_pairs(&target.siblings), words, facts);
+    let drives = subst_drives(&target.place.root, words, facts);
+    let siblings = carried_pairs(&target.siblings);
+    let sent = rewritten(&target.place, siblings, words, &drives, Separators::AsWritten);
     let mut words = without_no_build(sent.words);
     mark_bare_first_word(&mut words, facts, sent.program_named);
     stamp(&mut words, || head_of(&target.place, facts), target, facts);
@@ -666,11 +666,7 @@ fn outside_reason(config: &Config, word: String, matched: &Matched, facts: &dyn 
         .as_deref()
         .and_then(|path| facts.worktree_of(path))
         .filter(|tree| !is_own_tree(tree, &matched.target, facts))
-        .filter(|tree| {
-            facts
-                .checkout_of(tree)
-                .is_some_and(|checkout| config.patterns(&repo_name(&checkout)).is_some())
-        });
+        .filter(|tree| facts.checkout_of(tree).is_some_and(|checkout| config.is_routed(&repo_name(&checkout))));
     match tree {
         Some(tree) => LocalReason::OtherWorktree { tree },
         None => LocalReason::Outside { word },
@@ -944,19 +940,25 @@ fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts)
     if git_hook && config.hooks_allowed(&repo_name(&place.checkout)) != Ok(true) {
         return Err(None);
     }
-    let opened = open(config, place, facts)?;
-    let sent = rewritten(&opened.place, &opened.leaf, declared_pairs(&opened.siblings), words, facts);
+    let opened = open(place, facts, |repo| config.is_routed(repo))?;
+    let drives = subst_drives(&opened.place.root, words, facts);
+    let sent = rewritten(&opened.place, declared_pairs(&opened.siblings), words, &drives, Separators::AsWritten);
     if sent.program_named && stays_local(&sent.words) {
         return Err(None);
     }
-    let pattern = first_match(opened.patterns, &sent.words).ok_or(None)?;
+    let first = pick(config, &opened.repo, &sent.words, |_| true).ok_or(None)?;
     check_local(&opened.place, &sent.words, facts)?;
-    let target = settle(config, opened, facts)?;
-    let desktop = check_desktop(config, &target, &sent.words, facts)?;
+    let (builder, pattern, found) = steer_off_macos(config, &opened, &sent.words, facts, first)?;
+    let unix_words = (builder.os == BuilderOs::Macos).then(|| {
+        let siblings = declared_pairs(&opened.siblings);
+        rewritten(&opened.place, siblings, words, &drives, Separators::Slash).words
+    });
+    let target = settle(config, opened, builder, facts)?;
+    let desktop = check_desktop(config, &target, found, &sent.words, facts)?;
     Ok(Matched {
         target,
         pattern,
-        words: sent.words,
+        words: unix_words.unwrap_or(sent.words),
         outside: sent.outside,
         outside_path: sent.outside_path,
         program_named: sent.program_named,
@@ -984,19 +986,61 @@ fn check_local(place: &Place, words: &[String], facts: &dyn Facts) -> Result<(),
     }
 }
 
+/// The first pattern of the worktree's `.gate/desktop.toml` at `place` that the rewritten `words` match, joined by single
+/// spaces; `None` when none does. Keeps the command here, saying why, when the file has a problem, shown [`escaped`].
+fn desktop_pattern(place: &Place, words: &[String], facts: &dyn Facts) -> Result<Option<String>, Here> {
+    let declared = facts.desktop(place).map_err(|problem| {
+        Some(LocalReason::DesktopFile {
+            file: escaped(&facts.declaration_said(place, "desktop.toml")),
+            problem: escaped(&fold_lines(&problem)),
+        })
+    })?;
+    Ok(first_match(&declared, words))
+}
+
+/// The pick `first` of the opened worktree's command `words`, kept unless it is a macOS builder and a declared desktop
+/// pattern matches the command ([`desktop_pattern`]): a macOS builder has no desktop to run it on, so the pick goes on
+/// to the next builder that is no macOS one. Also what it read of the desktop file; `Err(None)` when no other
+/// builder's pattern matches.
+fn steer_off_macos(
+    config: &Config,
+    opened: &Opened,
+    words: &[String],
+    facts: &dyn Facts,
+    first: (Builder, String),
+) -> Result<(Builder, String, DesktopRead), Here> {
+    if first.0.os != BuilderOs::Macos {
+        return Ok((first.0, first.1, DesktopRead::NotRead));
+    }
+    let found = desktop_pattern(&opened.place, words, facts)?;
+    if found.is_none() {
+        return Ok((first.0, first.1, DesktopRead::Read(found)));
+    }
+    let (builder, pattern) = pick(config, &opened.repo, words, |builder| builder.os != BuilderOs::Macos).ok_or(None)?;
+    Ok((builder, pattern, DesktopRead::Read(found)))
+}
+
+/// What the pick read of the worktree's `.gate/desktop.toml` ([`steer_off_macos`]).
+enum DesktopRead {
+    /// The pick did not read it.
+    NotRead,
+    /// The first declared pattern the command matches, if any.
+    Read(Option<String>),
+}
+
 /// Whether a matched command asks for the builder's desktop: the first pattern of the worktree's `.gate/desktop.toml`
 /// that its rewritten `words` match, joined by single spaces as the repo's patterns see them, is one `remote.json`'s
 /// `desktop` allows the repo, listed exactly (letter case included); `false` when no declared pattern matches. Keeps the
 /// command here, saying why, when the file has a problem, shown [`escaped`], or when that pattern is not allowed, every
 /// one when `desktop` cannot be used.
-fn check_desktop(config: &Config, target: &Target, words: &[String], facts: &dyn Facts) -> Result<bool, Here> {
-    let declared = facts.desktop(&target.place).map_err(|problem| {
-        Some(LocalReason::DesktopFile {
-            file: escaped(&facts.declaration_said(&target.place, "desktop.toml")),
-            problem: escaped(&fold_lines(&problem)),
-        })
-    })?;
-    let Some(pattern) = first_match(&declared, words) else {
+///
+/// `read` is what the pick already read of the file ([`steer_off_macos`]); a file it did not read is read here.
+fn check_desktop(config: &Config, target: &Target, read: DesktopRead, words: &[String], facts: &dyn Facts) -> Result<bool, Here> {
+    let found = match read {
+        DesktopRead::Read(found) => found,
+        DesktopRead::NotRead => desktop_pattern(&target.place, words, facts)?,
+    };
+    let Some(pattern) = found else {
         return Ok(false);
     };
     let (allowed, problem) = match config.allowed_desktop(&target.repo) {
@@ -1009,14 +1053,11 @@ fn check_desktop(config: &Config, target: &Target, words: &[String], facts: &dyn
     Err(Some(LocalReason::DesktopNotAllowed { pattern, problem }))
 }
 
-/// A worktree whose repo the routing file lists, with the patterns it lists and the siblings its siblings file declares,
-/// not yet checked.
-struct Opened<'a> {
+/// A worktree whose repo the routing file lists, with the siblings its siblings file declares, not yet checked.
+struct Opened {
     place: Place,
     repo: String,
     leaf: String,
-    /// The patterns the routing file lists for the repo.
-    patterns: &'a [Pattern],
     /// The declared siblings, in declared order; none when the file has a problem.
     siblings: Vec<SiblingRoot>,
     /// The siblings file's problem, when it has one.
@@ -1025,11 +1066,13 @@ struct Opened<'a> {
     file: String,
 }
 
-/// The worktree at `place` when the routing file lists its repo, with the patterns it lists and its siblings file read;
-/// `Err(None)` when it does not list it, whose file is then not read at all.
-fn open<'a>(config: &'a Config, place: Place, facts: &dyn Facts) -> Result<Opened<'a>, Here> {
+/// The worktree at `place` when `listed` says the routing file lists its repo, with its siblings file read; `Err(None)`
+/// when it does not list it, whose file is then not read at all.
+fn open(place: Place, facts: &dyn Facts, listed: impl FnOnce(&str) -> bool) -> Result<Opened, Here> {
     let repo = repo_name(&place.checkout);
-    let patterns = config.patterns(&repo).ok_or(None)?;
+    if !listed(&repo) {
+        return Err(None);
+    }
     let leaf = split_root(&place.root).2.to_owned();
     let (siblings, problem) = match facts.siblings(&place) {
         Ok(names) => (sibling_roots(&place.root, names), None),
@@ -1040,24 +1083,39 @@ fn open<'a>(config: &'a Config, place: Place, facts: &dyn Facts) -> Result<Opene
         place,
         repo,
         leaf,
-        patterns,
         siblings,
         problem,
         file,
     })
 }
 
-/// `words` rewritten for the builder of the worktree at `place`, whose folder name is `leaf`, carrying the siblings
-/// `siblings`, each a declared name and its root.
-fn rewritten<'s>(place: &Place, leaf: &str, siblings: impl Iterator<Item = (&'s str, &'s str)>, words: &[String], facts: &dyn Facts) -> Rewritten {
-    let drives = subst_drives(&place.root, words, facts);
+/// `words` rewritten for the builder of the worktree at `place` carrying the siblings `siblings`, each a declared name
+/// and its root, under the subst table `drives` ([`subst_drives`]), each rewritten path's separators written as
+/// `separators` says.
+fn rewritten<'s>(
+    place: &Place,
+    siblings: impl Iterator<Item = (&'s str, &'s str)>,
+    words: &[String],
+    drives: &[(char, String)],
+    separators: Separators,
+) -> Rewritten {
     let rewrite_place = RewritePlace {
         root: &place.root,
         prefix: &place.prefix,
         folder: &place.folder,
-        leaf,
+        leaf: split_root(&place.root).2,
     };
-    rewrite_named(&rewrite_place, words, &drives, siblings)
+    rewrite_named(&rewrite_place, words, drives, siblings, separators)
+}
+
+/// The builder that runs `repo`'s command `words`, rewritten for Windows, and the pattern that chose it: the first of
+/// [`Config::routes`] that `eligible` lets run it with a pattern that matches, the first such pattern of its list.
+fn pick(config: &Config, repo: &str, words: &[String], eligible: impl Fn(&Builder) -> bool) -> Option<(Builder, String)> {
+    config
+        .routes(repo)
+        .into_iter()
+        .filter(|(builder, _)| eligible(builder))
+        .find_map(|(builder, patterns)| first_match(patterns, words).map(|pattern| (builder.clone(), pattern)))
 }
 
 /// The declared siblings as the rewrite reads them: each declared name and its root, borrowed.
@@ -1070,8 +1128,8 @@ fn carried_pairs(siblings: &[CarriedSibling]) -> impl Iterator<Item = (&str, &st
     siblings.iter().map(|sibling| (sibling.name.as_str(), sibling.root.as_str()))
 }
 
-/// The target of an opened worktree once its siblings pass their checks ([`check_siblings`]).
-fn settle(config: &Config, opened: Opened<'_>, facts: &dyn Facts) -> Result<Target, Here> {
+/// The target on `builder` of an opened worktree once its siblings pass their checks ([`check_siblings`]).
+fn settle(config: &Config, opened: Opened, builder: Builder, facts: &dyn Facts) -> Result<Target, Here> {
     let Opened {
         place,
         repo,
@@ -1095,8 +1153,7 @@ fn settle(config: &Config, opened: Opened<'_>, facts: &dyn Facts) -> Result<Targ
         .map(|(SiblingRoot { name, root }, id)| CarriedSibling { name, root, id })
         .collect();
     Ok(Target {
-        host: config.host().to_owned(),
-        slots: config.slots(),
+        builder,
         key: work_folder_key(&place.root),
         inputs: config.inputs(&repo),
         place,
@@ -1330,7 +1387,8 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
     } = matched;
     let sent_count = sent.len();
     let cargo = is_cargo(&sent);
-    let listed = config.send_build_allowed(&target.repo) == Ok(true);
+    // A macOS builder builds the project itself: the PC's Windows build is no use to it.
+    let listed = target.builder.os == BuilderOs::Windows && config.send_build_allowed(&target.repo) == Ok(true);
     let send = listed
         .then(|| send_bin(given, &target.place, |folder, file| facts.moves_build_output(&target.place, folder, file)))
         .flatten()
@@ -1342,10 +1400,11 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
     let mut words = without_no_build(sent);
     let dropped_no_build = words.len() != sent_count;
     let fallback = without_no_build(given.to_vec());
-    let mut outputs = match config.own_outputs(&target.repo) {
+    let mut outputs = match config.own_outputs_on(&target.builder, &target.repo) {
         Some(globs) => globs,
+        None if target.builder.os == BuilderOs::Macos => Vec::new(),
         None if cargo => CARGO_OUTPUTS.iter().map(|glob| (*glob).to_owned()).collect(),
-        None => config.outputs(&target.repo),
+        None => DEFAULT_OUTPUTS.iter().map(|glob| (*glob).to_owned()).collect(),
     };
     let outputs_withheld = fallback.len() != given.len() && !outputs.is_empty();
     if outputs_withheld {
@@ -1355,8 +1414,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
     let source_revision = head_of(&target.place, facts);
     stamp(&mut words, || source_revision.clone(), &target, facts);
     RemoteRun {
-        host: target.host,
-        slots: target.slots,
+        builder: target.builder,
         key: target.key,
         leaf: target.leaf,
         root_id: target.root_id,

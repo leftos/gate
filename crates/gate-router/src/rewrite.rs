@@ -110,17 +110,29 @@ pub fn rewrite_words(place: &RewritePlace<'_>, words: &[String], drives: &[(char
         words,
         drives,
         siblings.iter().map(|sibling| (sibling.name.as_str(), sibling.root.as_str())),
+        Separators::AsWritten,
     )
 }
 
+/// How the rewrite writes the separators of a path it rewrites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Separators {
+    /// `\` when the path held one, else `/`, its unedited rest as written: a Windows builder's words.
+    AsWritten,
+    /// `/` throughout the path, its unedited rest included: a Unix builder's words.
+    Slash,
+}
+
 /// [`rewrite_words`] for siblings the caller holds as a declared name and a root each, in declared order: a routed run's
-/// carried siblings need not be rebuilt as [`SiblingRoot`]s for it.
+/// carried siblings need not be rebuilt as [`SiblingRoot`]s for it. `separators` says how each rewritten path's
+/// separators are written; the paths it leaves as written keep theirs either way.
 #[must_use]
 pub(crate) fn rewrite_named<'s>(
     place: &RewritePlace<'_>,
     words: &[String],
     drives: &[(char, String)],
     siblings: impl Iterator<Item = (&'s str, &'s str)>,
+    separators: Separators,
 ) -> Rewritten {
     let cwd: Vec<&str> = place.prefix.split(['\\', '/']).filter(|segment| !segment.is_empty()).collect();
     let bases = Bases {
@@ -128,6 +140,7 @@ pub(crate) fn rewrite_named<'s>(
         leaf: place.leaf,
         siblings: siblings.map(|(name, root)| (name, root_spellings(root, drives))).collect(),
         floor: drive_floor(place.folder, cwd.len()),
+        separators,
     };
     let mut outside = None;
     let mut path = None;
@@ -356,15 +369,24 @@ pub(crate) fn split_root(root: &str) -> (&str, char, &str) {
 
 /// What a word's paths are judged against: the root's spellings ([`root_spellings`]) and its last segment, each
 /// sibling's declared name with its root's, and how many folders below the root a relative path's `..` stop
-/// ([`drive_floor`]).
+/// ([`drive_floor`]), and how a rewritten path's separators are written.
 struct Bases<'s> {
     root: Vec<Spelling>,
     leaf: &'s str,
     siblings: Vec<(&'s str, Vec<Spelling>)>,
     floor: Option<usize>,
+    separators: Separators,
 }
 
 impl<'s> Bases<'s> {
+    /// The separator the rewritten `path` is written with: `/` for [`Separators::Slash`], else [`separator_of`].
+    fn separator(&self, path: &str) -> &'static str {
+        match self.separators {
+            Separators::AsWritten => separator_of(path),
+            Separators::Slash => "/",
+        }
+    }
+
     /// The declared name of the sibling `segment` names, ASCII letter case aside.
     fn sibling_named(&self, segment: &str) -> Option<&'s str> {
         self.siblings
@@ -388,19 +410,31 @@ fn rewrite_word(bases: &Bases<'_>, cwd: &[&str], word: &str) -> (String, bool) {
     let mut text = String::with_capacity(word.len());
     let mut outside = judged || starts.iter().any(|&index| after_device_prefix(word, index));
     let mut at = 0;
+    let mut slash_until = 0;
     for index in starts {
         match path_edit(bases, cwd, word, index, script) {
             None => outside = true,
             Some(edit) if index >= at => {
-                text.push_str(&word[at..index]);
+                push_copied(&mut text, word, at..index, slash_until);
                 text.push_str(&edit.text);
                 at = edit.end;
+                if bases.separators == Separators::Slash {
+                    slash_until = edit.path_end;
+                }
             }
             Some(_) => {}
         }
     }
-    text.push_str(&word[at..]);
+    push_copied(&mut text, word, at..word.len(), slash_until);
     (text, outside)
+}
+
+/// Pushes `word[range]` to `text`, each `\` before `slash_until` written `/`: the rest of a rewritten path its edit left
+/// as written, when the rewrite writes paths with `/` ([`Separators::Slash`]).
+fn push_copied(text: &mut String, word: &str, range: std::ops::Range<usize>, slash_until: usize) {
+    let cut = slash_until.clamp(range.start, range.end);
+    text.push_str(&word[range.start..cut].replace('\\', "/"));
+    text.push_str(&word[cut..range.end]);
 }
 
 /// The name the command's first non-empty word `word` is sent as, when `first` and [`rewrite_word`] judged it outside
@@ -506,10 +540,11 @@ fn follows_word_character(word: &str, index: usize) -> bool {
         .is_some_and(|before| before.is_alphanumeric() || before == '_' || before == '-')
 }
 
-/// The span `index..end` of a word replaced by `text`.
+/// The span `index..end` of a word replaced by `text`, in a path that ends at `path_end`.
 struct Edit {
     end: usize,
     text: String,
+    path_end: usize,
 }
 
 /// How the path at `index` is sent when it lies inside the worktree or a sibling in one of their roots' spellings;
@@ -524,9 +559,10 @@ fn path_edit(bases: &Bases<'_>, cwd: &[&str], word: &str, index: usize, script: 
             .find_map(|(name, spellings)| spelled_at(spellings, word, index, script).map(|(spelling, after)| (spelling, after, Some(*name))))?,
     };
     let span = Span::new(word, index, after, script);
+    let separator = bases.separator(&word[span.index..span.end]);
     let direct = match sibling {
-        None => worktree_edit(cwd, word, span),
-        Some(name) => sibling_edit(cwd, word, span, name),
+        None => worktree_edit(cwd, word, span, separator),
+        Some(name) => sibling_edit(cwd, word, span, name, separator),
     };
     if direct.is_some() || spelling.drive_root {
         return direct;
@@ -545,14 +581,17 @@ fn spelled_at<'b>(spellings: &'b [Spelling], word: &str, index: usize, script: b
 
 /// How the path `span` of `word` is sent when it lies below the root of the sibling `name`: `..` a level of the gate's
 /// folder and one more, then the name in place of the root's spelling, the rest as written; `None` when its `..` climb
-/// out of the sibling.
-fn sibling_edit(cwd: &[&str], word: &str, span: Span, name: &str) -> Option<Edit> {
+/// out of the sibling. The `..` and the name are joined by `separator`.
+fn sibling_edit(cwd: &[&str], word: &str, span: Span, name: &str, separator: &str) -> Option<Edit> {
     resolve(&[], &word[span.after..span.end])?;
-    let separator = separator_of(&word[span.index..span.end]);
     let mut text = vec![".."; cwd.len() + 1].join(separator);
     text.push_str(separator);
     text.push_str(name);
-    Some(Edit { end: span.after, text })
+    Some(Edit {
+        end: span.after,
+        text,
+        path_end: span.end,
+    })
 }
 
 /// A path in a word: the byte index it starts at, the one just past its root's spelling and the one it ends at.
@@ -588,16 +627,25 @@ enum Landing<'a> {
 
 /// How the path `span` of `word` is sent when its `..` climb out of the root it starts below, `start`, as [`land`]
 /// walks them: the landing as [`landing_text`] writes it, ending with the separator that ends the path, if any, unless
-/// it is `.`; `None` when the path lands anywhere but inside the worktree or a sibling.
+/// it is `.`; `None` when the path lands anywhere but inside the worktree or a sibling. The separators are written as
+/// [`Bases::separator`] says, the ending one too.
 fn climb_edit<'a>(bases: &Bases<'a>, cwd: &[&str], word: &'a str, span: Span, start: Landing<'a>) -> Option<Edit> {
     let path = &word[span.index..span.end];
     let landing = land(bases, start, &word[span.after..span.end])?;
-    let mut text = landing_text(cwd, landing, separator_of(path));
+    let separator = bases.separator(path);
+    let mut text = landing_text(cwd, landing, separator);
     let trailing = path.chars().next_back().filter(|last| matches!(last, '\\' | '/'));
     if let Some(last) = trailing.filter(|_| text != ".") {
-        text.push(last);
+        match bases.separators {
+            Separators::AsWritten => text.push(last),
+            Separators::Slash => text.push_str(separator),
+        }
     }
-    Some(Edit { end: span.end, text })
+    Some(Edit {
+        end: span.end,
+        text,
+        path_end: span.end,
+    })
 }
 
 /// Where `rest`, a path below the root `start` lands in with its segments, climbs to as [`Level::step`] walks an
@@ -648,24 +696,28 @@ fn landing_text(cwd: &[&str], landing: Landing<'_>, separator: &str) -> String {
     parts.join(separator)
 }
 
-/// How the path `span` of `word` is sent when it lies below the worktree root; `None` when its `..` climb out of it.
-fn worktree_edit(cwd: &[&str], word: &str, span: Span) -> Option<Edit> {
+/// How the path `span` of `word` is sent when it lies below the worktree root, its `..` joined by `separator`; `None`
+/// when its `..` climb out of it.
+fn worktree_edit(cwd: &[&str], word: &str, span: Span, separator: &str) -> Option<Edit> {
     let target = resolve(&[], &word[span.after..span.end])?;
     if eq_ignoring_case(&target.join("/"), &cwd.join("/")) {
         return Some(Edit {
             end: span.end,
             text: ".".to_owned(),
+            path_end: span.end,
         });
     }
     if cwd.is_empty() {
         return Some(Edit {
             end: separator_end(word, span.after),
             text: String::new(),
+            path_end: span.end,
         });
     }
     Some(Edit {
         end: span.after,
-        text: vec![".."; cwd.len()].join(separator_of(&word[span.index..span.end])),
+        text: vec![".."; cwd.len()].join(separator),
+        path_end: span.end,
     })
 }
 

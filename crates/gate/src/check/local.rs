@@ -707,7 +707,9 @@ fn hooks_problem(repo: &str) -> Option<String> {
 fn allowed_siblings(repo: &str) -> Option<Result<Vec<String>, String>> {
     let path = route::remote_json_path(std::env::var_os("LOCALAPPDATA").as_deref())?;
     let config = route::read_remote_json(&path).ok().flatten()?;
-    config.patterns(repo)?;
+    if !config.is_routed(repo) {
+        return None;
+    }
     Some(config.allowed_siblings(repo).map(<[String]>::to_vec).map_err(str::to_owned))
 }
 

@@ -396,8 +396,13 @@ pub(super) mod tests {
         /// A routed run from the root `root` carrying the siblings `names`, each with its folder's id as it is now.
         pub(in crate::remote) fn run(&self, root: &str, names: &[&str]) -> RemoteRun {
             RemoteRun {
-                host: "builder".to_owned(),
-                slots: 1,
+                builder: gate_router::Builder {
+                    alias: "builder".to_owned(),
+                    os: gate_router::BuilderOs::Windows,
+                    root: None,
+                    slots: 1,
+                    id: None,
+                },
                 root: root.to_owned(),
                 root_id: id_of(&self.folder("app")),
                 leaf: "app".to_owned(),

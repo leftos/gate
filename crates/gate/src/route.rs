@@ -1142,8 +1142,13 @@ mod tests {
     fn target_at(root: &str, leaf: &str, siblings: &[(&str, &str)]) -> Target {
         let id = FolderId { volume: 0, file: [0; 16] };
         Target {
-            host: "builder".to_owned(),
-            slots: 1,
+            builder: gate_router::Builder {
+                alias: "builder".to_owned(),
+                os: gate_router::BuilderOs::Windows,
+                root: None,
+                slots: 1,
+                id: None,
+            },
             place: Place {
                 root: root.to_owned(),
                 prefix: String::new(),

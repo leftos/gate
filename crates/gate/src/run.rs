@@ -752,7 +752,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         env,
     } = parts;
     Ok(RemoteCall {
-        host: &remote.host,
+        host: &remote.builder.alias,
         key: &remote.key,
         root: &remote.root,
         root_id: remote.root_id,
@@ -889,7 +889,7 @@ impl Run<'_> {
         self.would = Some(decision);
         self.tag = match &route {
             Route::Routed(remote) => Some(RemoteTag {
-                host: remote.host.clone(),
+                host: remote.builder.alias.clone(),
                 key: remote.key.clone(),
             }),
             Route::Local { .. } => None,
@@ -1181,7 +1181,7 @@ impl Run<'_> {
         self.leave_nothing_back(remote, &outcome, words.as_deref(), console);
         let stale = stale_lines(remote, &outcome, words.as_deref());
         let passing = Passing {
-            pass: Pass::On(&remote.host, wall, outcome.split, outcome.adjusted),
+            pass: Pass::On(&remote.builder.alias, wall, outcome.split, outcome.adjusted),
             // A cold run's line names the ceiling the box was given.
             ceiling: outcome.raised.unwrap_or(figures.ceiling),
             stale: &stale,
@@ -1199,7 +1199,10 @@ impl Run<'_> {
             return None;
         }
         let path = v1::warm_record_path(&self.root.path, &remote.key);
-        let current = self.warm_hash.as_deref().is_some_and(|hash| record_is_current(&path, &remote.host, hash));
+        let current = self
+            .warm_hash
+            .as_deref()
+            .is_some_and(|hash| record_is_current(&path, &remote.builder.alias, hash));
         match current.then(|| fs::remove_file(&path)) {
             Some(Err(error)) if error.kind() != io::ErrorKind::NotFound => Some(format!(
                 "gate: cannot remove the warm-up record {}: {}",
@@ -1242,7 +1245,7 @@ impl Run<'_> {
         }
         let settings = build_settings(words);
         let record = v1::NothingBackRecord {
-            host: remote.host.clone(),
+            host: remote.builder.alias.clone(),
             configuration: settings.configuration,
             framework: settings.framework,
             runtime: settings.runtime,
@@ -1261,7 +1264,7 @@ impl Run<'_> {
         // The key lock reads neither figure of the call; no take has resolved them yet. A sibling that fails its check
         // again sends nothing: the run falls back here before it takes the lock or a slot.
         let key = self.take_key(remote, console)?;
-        let figures = match self.take(Pool::Remote(remote.slots), None, &mut hold.taken, console) {
+        let figures = match self.take(Pool::Remote(remote.builder.slots), None, &mut hold.taken, console) {
             Taking::Took(took, figures) => {
                 hold.took = took;
                 figures
@@ -1325,7 +1328,7 @@ impl Run<'_> {
         let heartbeat = self.request.test_seams.heartbeat_ms.map_or(wait::HEARTBEAT, Duration::from_millis);
         let mut next = heartbeat;
         let left = holder_time_left(&mut self.survey, &self.root.path, call.key, console);
-        console.err(&key_wait_line(&remote.host, left));
+        console.err(&key_wait_line(&remote.builder.alias, left));
         // The seam raises the console interrupt once the gate has said it waits, the key wait's line among them.
         if self.request.test_seams.interrupt_queued
             && let Some(interrupt) = self.host.interrupt
@@ -1358,7 +1361,7 @@ impl Run<'_> {
                 }
                 console.err(&format!(
                     "gate: still waiting for this worktree's work folder on {} ({} s)",
-                    remote.host,
+                    remote.builder.alias,
                     waited.as_secs()
                 ));
                 while next <= waited {
@@ -1374,7 +1377,7 @@ impl Run<'_> {
     fn interrupted_key_wait(&mut self, remote: &RemoteRun, waited: Duration, console: &mut Console) -> Remotely {
         console.err(&format!(
             "gate: interrupted while waiting for this worktree's work folder on {}",
-            remote.host
+            remote.builder.alias
         ));
         self.journal.write(
             &JournalEvent::Abandon {

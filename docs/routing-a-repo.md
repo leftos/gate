@@ -77,6 +77,8 @@ This repo's `tools/builder/install-toolchains.ps1` does the rest: the toolchains
 
 A macOS builder (an Apple-silicon Mac, a dedicated builder nobody works on) is set up by `tools/builder/install-macos.sh`, run as the builder user over ssh. It is in progress: the Unix box and its install by `gate push` are GATE-607 and GATE-608.
 
+`remote.json`'s `builders` array (an entry with `os` `macos` and a `root`) is read and routes ([design.md, remote.json](design.md#remotejson)), but the transport, payload layout, path map, remote pool and PC caches still use the Windows builder's constants for every builder. Do not add a `builders` entry to a live `remote.json` until GATE-606 part B lands.
+
 - **Toolchain steps** need no sudo and land under `--prefix` (default `~/gate-tools`), Rust under `CARGO_HOME` and `RUSTUP_HOME`: .NET SDK 10.0.401 and 8.0.425, the wasm-tools workload, PowerShell, Node.js, pnpm, uv and prek, Rust, cargo-nextest, Git LFS, Godot 4.7.2 mono, Bun. FFmpeg is skipped: no official source publishes a macOS arm64 build with a checksum.
 - **Login PATH** writes a marked block to `~/.zprofile`. The box reads its commands' PATH from the builder user's login shell, since a non-login ssh command lacks the prefix's tools.
 - **Git config** sets `core.autocrlf false` and `gc.pruneExpire never`. **Gate work root** (`--root`, default `~/gate-remote`) makes the root, `work` and `bin` at mode 700; the box refuses a root another account may write in.
@@ -163,7 +165,7 @@ A crash loses data that was not yet written to every drive at once. NTFS can kee
 
 A reboot, an install that needs one, or any other work that would break a run on the builder starts by draining it, never by waiting for it to go idle while it stays in `remote.json`: new runs keep arriving, so that wait has no end.
 
-1. Back up `remote.json` beside it (`remote.json.bak-<UTC stamp>`) and save the builder's exact entry. Then, in one quick read-modify-write, take the builder out by removing `host`: routed runs go to `host` alone, and `hosts` names only the builders `gate push` and `gate check --builder` reach. With no `host` left, every gate on the PC runs here and says the routing file is unusable, which is expected while the builder is out.
+1. Back up `remote.json` beside it (`remote.json.bak-<UTC stamp>`) and save the builder's exact entry. Then, in one quick read-modify-write, take the builder out by removing `host`: routed runs go to `host` or a `builders` entry, and `hosts` names only the builders `gate push` and `gate check --builder` reach. With no `host` left, every gate on the PC runs here and says the routing file is unusable, which is expected while the builder is out.
 2. Wait for the runs already on the builder to end. No `gate.exe` box process and no routed command may still be live under the builder user, besides your own ssh session. There is no cutoff, since each routed run ends at its own ceiling. A run still live past the longest routed ceiling is looked into, never cut off by the reboot.
 3. Do the work. After a reboot, confirm that the console session logged back on (autologon), which the desktop route needs.
 4. Put the builder back with the saved entry, in a read-modify-write that keeps every other key as it stands then, and check it with `gate check --builder <host>`. If anything blocks the work partway, put the builder back first, so routing never stays off.

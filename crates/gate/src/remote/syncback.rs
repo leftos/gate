@@ -3655,8 +3655,13 @@ mod tests {
         let case = PairCase::new("unmatched");
         let root = case.roots[0].clone();
         let run = RemoteRun {
-            host: "builder".to_owned(),
-            slots: 1,
+            builder: gate_router::Builder {
+                alias: "builder".to_owned(),
+                os: gate_router::BuilderOs::Windows,
+                root: None,
+                slots: 1,
+                id: None,
+            },
             root: root.clone(),
             root_id: crate::route::root_id(&root).expect("the main worktree's id is read"),
             leaf: "app".to_owned(),

@@ -20,7 +20,7 @@ Non-goals:
 
 - Sharing slots with the PowerShell gate. The two generations share the default root's slot mutexes and take turns on them; each cutover drains the PowerShell gates first ([Cutover](#cutover)).
 - A daemon. Every gate is a short-lived process; coordination is through named kernel objects and files in the state root.
-- Running on Linux or macOS. Only the pure crates do.
+- Running on Linux or macOS. The PC stays Windows, and only the pure crates run elsewhere; a builder may run macOS (GATE-591).
 - Configurable failure markers. The marker regex is built in ([Log and tail](#log-and-tail)).
 
 ## CLI
@@ -399,7 +399,7 @@ Test-seams builds accept the hidden `--test-probe-limit-ms <n>` (the 10 s probe 
 
 #### With `--builder`
 
-`gate check --builder <host>` says what one builder lacks for the repo in the current folder. It needs one host (`gate: --builder needs a value`; given twice, `gate: --builder is given twice`), which must be a builder `remote.json` lists (`host` or `hosts`), matched ignoring ASCII case and printed in `remote.json`'s spelling. Any other host prints `gate check: <host> is not a builder remote.json lists` and exits 2.
+`gate check --builder <host>` says what one builder lacks for the repo in the current folder. It needs one host (`gate: --builder needs a value`; given twice, `gate: --builder is given twice`), which must be a builder `remote.json` lists (`host`, `hosts` or a `builders` entry), matched ignoring ASCII case and printed in `remote.json`'s spelling. Any other host prints `gate check: <host> is not a builder remote.json lists` and exits 2.
 
 The repo is found as for the local check (outside a git worktree is `check: not in a git repository`, exit 1). A `remote.json` that is missing, ignored or cannot be found is a stderr line with exit 1: `check: <host>: remote.json not found at <path>`, `check: <host>: remote.json is ignored: <reason>` or `check: <host>: remote.json cannot be found: LOCALAPPDATA is not an absolute folder`.
 
@@ -1124,11 +1124,22 @@ Two rolls within one second collide on the archive name: the second archive fail
 
 ### remote.json
 
-`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos` and the optional per-repo `outputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks`, `sendBuild` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
+`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos`, the optional `builders` and the optional per-repo `outputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks`, `sendBuild` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
 
-The optional `hosts` is an array of strings naming further builders, which only `gate push` reaches; a routed run goes to `host` alone. Each entry passes the checks `host` does, with the same reasons worded `hosts entries ...`.
+The optional `hosts` is an array of strings naming further builders, which only `gate push` reaches; a routed run goes to `host` or a `builders` entry, never to a `hosts` entry. Each entry passes the checks `host` does, with the same reasons worded `hosts entries ...`.
 
 The push order is `host`, then `hosts` in file order, an entry equal to an earlier one in any letter case skipped. A `hosts` that is not an array of strings, or holds a bad entry, never affects routing: `gate push` alone refuses the file with `push: ignored <path>: <reason>`.
+
+The optional `builders` is an array of further builders that a routed run can go to, each `{"host", "os", "root", "slots", "repos", "outputs"}`:
+- `host` is the builder's ssh alias, passing the checks the top-level `host` does (`Builder::alias`).
+- `os` is `windows` or `macos` in any letter case.
+- `root` is the builder's work root. It is required for `macos`: an absolute path rooted at `/`, each name made of ASCII letters, digits, `.`, `_` and `-`, none empty, `.` or `..`. For `windows` it defaults to `D:\gate-remote` and must be an absolute drive path.
+- `slots` is 1 to 16, default 1.
+- `repos` and `outputs` are the entry's own, shaped like the top-level ones.
+
+A bad entry, an alias that repeats the top-level `host`, an earlier `builders` entry or a `hosts` entry in any ASCII letter case, or a `builders` that is not an array makes the whole file unusable: `gate: ignored <path>: builders[N]...; running locally`. The top-level `outputs` apply to `host` alone; a `builders` entry with no `outputs` brings nothing back when it is `macos` and uses the default output globs when it is `windows`.
+
+The transport, the payload layout, the path map, the remote pool and the PC's caches still use the Windows builder's constants for every builder, so a `builders` entry must not stand in a live `remote.json` until they follow the entry's `os` and `root` (GATE-606).
 
 `warmup` is an array of repo names, matched in any letter case, that consent to the repo's `.gate/warmup.toml` warming its builder work folders (`Config::warmup_consented`); a repo it does not name, or a file without the key, has no consent.
 
@@ -1618,6 +1629,8 @@ A period with no beat due flushes instead, and the box's flush probes stderr for
 Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: nothing is read and nothing is written.
 
 - **What routes** is kept (T2): a heavy gate, not `--local`, under no covering or lending parent, outside a git hook (`GIT_INDEX_FILE` set to a non-empty value) unless `remote.json`'s `hooks` names the repo, whose first word is not `git` or `prek`, in a git worktree of a repo `remote.json` lists, whose words with in-worktree paths rewritten (T3) match one of that repo's patterns.
+
+  **Which builder.** The run goes to the first `builders` entry, in file order, whose own `repos.<repo>` patterns match the Windows-form rewritten words, else to `host` when the top-level patterns match. A warm-up always goes to `host`. A command matching a `.gate/desktop.toml` pattern is never picked by a `macos` entry. A `sendBuild` repo's `--no-build` test picked by a `macos` entry drops `--no-build` and sends no build. The words sent to a `macos` builder use `/` inside the recognised path spans. A repo listed only in a `builders` entry is routed ([`gate check`](#gate-check) treats it so).
 
   A matched command still runs here, saying why, when a word names a path outside the worktree (a drive-relative, root-relative, share, device or climbing form included, see [the path rewrite](#routing)) or the gate's folder holds nothing the snapshot sends. The one exception is a first word naming a program by an absolute path, which the path rewrite sends as the program's name unless it refuses the name.
 

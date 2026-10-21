@@ -8,7 +8,9 @@
 //! `.gate/desktop.toml` patterns whose commands may run on the builder's desktop) and the optional `hooks` (the repo
 //! names whose gates started inside a git hook may route) and the optional `sendBuild` (the repo names whose routed
 //! `dotnet test --no-build` may send the PC's build) and the optional `declarations` (each repo name's folder
-//! holding the `.gate` files the repo has none of). Keys match in any letter case and unknown keys are ignored.
+//! holding the `.gate` files the repo has none of) and the optional `builders` (further builders a routed run may go
+//! to, each with its own `host`, `os`, `root`, `slots`, `repos` and `outputs`). Keys match in any letter case and
+//! unknown keys are ignored.
 //! The text may hold `//` and `/* */` comments and trailing commas, as the
 //! PowerShell gate's JSON reader allows; single-quoted strings are refused. A file that breaks a rule is unusable as a
 //! whole, for the reason the PowerShell gate gives (or, for a host ssh or git would misread, a reason of its own),
@@ -17,8 +19,9 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
-use crate::key::is_layout_name;
+use crate::key::{is_layout_char, is_layout_name};
 use crate::like::{Pattern, eq_ignoring_case};
 
 /// The output globs of a repo the `outputs` key does not name.
@@ -31,6 +34,39 @@ pub const CARGO_OUTPUTS: [&str; 3] = ["target/*/*.exe", "target/*/*.dll", "targe
 /// The most slots the remote pool may have.
 const MAX_SLOTS: u32 = 16;
 
+/// The operating system a builder runs, which sets how a routed run's paths are written for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuilderOs {
+    /// A Windows builder: paths keep the separator they were written with.
+    Windows,
+    /// A macOS builder: every path the rewrite recognises is written with `/`.
+    Macos,
+}
+
+/// A builder a routed run may go to: the top-level `host`, or a `builders` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Builder {
+    /// The builder's ssh host alias, as the file spells it.
+    pub alias: String,
+    /// The builder's operating system; `host` is always Windows.
+    pub os: BuilderOs,
+    /// The builder's root as the file writes it; `None` for the Windows default.
+    pub root: Option<String>,
+    /// The builder's remote pool size.
+    pub slots: u32,
+    /// The first 8 lower-case hex digits of the SHA-256 of the lower-cased alias for a `builders` entry; `None` for
+    /// `host`.
+    pub id: Option<String>,
+}
+
+/// A `builders` entry: the builder, the repos it runs with their patterns, and its own output globs.
+#[derive(Debug, Clone)]
+struct BuilderEntry {
+    builder: Builder,
+    repos: RepoTable,
+    outputs: RepoTable,
+}
+
 /// A usable routing file.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -38,7 +74,10 @@ pub struct Config {
     builders: Vec<String>,
     /// Why `hosts` cannot be used, which routing ignores.
     hosts_problem: Option<String>,
-    slots: u32,
+    /// `host` as a builder, with the top-level `slots`.
+    host: Builder,
+    /// The `builders` entries, in file order.
+    entries: Vec<BuilderEntry>,
     repos: Vec<(String, Vec<Pattern>)>,
     outputs: Vec<(String, Vec<Pattern>)>,
     inputs: Vec<(String, Vec<Pattern>)>,
@@ -87,6 +126,12 @@ impl Config {
     /// that is not a whole number 1 to 16, a missing `repos`, a `repos`, `outputs` or `inputs` that is not an object of
     /// arrays of non-empty valid patterns, or an output or input glob holding `[` or `]`.
     ///
+    /// A `builders` that is not an array of objects, or an entry with a bad `host`, `os`, `root`, `slots`, `repos` or
+    /// `outputs`, or whose `host` repeats the top-level `host`, a `hosts` entry or an earlier entry's in any ASCII letter
+    /// case, is refused
+    /// with a reason of the gate's own naming the entry (`builders[0].root must be an absolute path for a macos
+    /// builder`): it changes where commands go.
+    ///
     /// A `host` that is not an ssh alias or `user@host` of letters, digits, `.`, `_` and `-` is refused with a reason of
     /// the gate's own, since the PowerShell gate accepts it. A bad `hosts` leaves the file usable for routing, and
     /// [`Config::builders`] gives its reason. A bad `siblings` leaves it usable too, allowing no sibling, and
@@ -108,18 +153,26 @@ impl Config {
             return Err("not a JSON object".to_owned());
         };
         let host = read_host(&data)?;
-        let slots = read_slots(&data)?;
-        let repos = read_table(&data, "repos", true)?;
-        let outputs = read_table(&data, "outputs", false)?;
-        let inputs = read_table(&data, "inputs", false)?;
+        let slots = read_slots(&data, "")?;
+        let repos = read_table(&data, "repos", true, "")?;
+        let outputs = read_table(&data, "outputs", false, "")?;
+        let inputs = read_table(&data, "inputs", false, "")?;
+        let entries = read_builder_entries(&data, &host)?;
         let (builders, hosts_problem) = match read_builders(&data, &host) {
             Ok(builders) => (builders, None),
-            Err(problem) => (vec![host], Some(problem)),
+            Err(problem) => (vec![host.clone()], Some(problem)),
         };
         Ok(Self {
             builders,
             hosts_problem,
-            slots,
+            host: Builder {
+                alias: host,
+                os: BuilderOs::Windows,
+                root: None,
+                slots,
+                id: None,
+            },
+            entries,
             repos,
             outputs,
             inputs,
@@ -254,7 +307,53 @@ impl Config {
     /// The remote pool's size.
     #[must_use]
     pub fn slots(&self) -> u32 {
-        self.slots
+        self.host.slots
+    }
+
+    /// The `builders` entries' builders, in file order.
+    pub fn builder_entries(&self) -> impl Iterator<Item = &Builder> {
+        self.entries.iter().map(|entry| &entry.builder)
+    }
+
+    /// The builder whose alias is `alias` in any ASCII letter case: `host`, else a `builders` entry; `None` for any
+    /// other alias, a `hosts` entry among them.
+    #[must_use]
+    pub fn builder(&self, alias: &str) -> Option<&Builder> {
+        std::iter::once(&self.host)
+            .chain(self.builder_entries())
+            .find(|builder| builder.alias.eq_ignore_ascii_case(alias))
+    }
+
+    /// `host` as a builder.
+    pub(crate) fn host_builder(&self) -> &Builder {
+        &self.host
+    }
+
+    /// The builders that may run `repo`'s commands, in the order a command's pick tries them, each with the patterns
+    /// listed for the repo: each `builders` entry whose `repos` lists it, in file order, then `host` when `repos` does.
+    pub(crate) fn routes(&self, repo: &str) -> Vec<(&Builder, &[Pattern])> {
+        let entries = self
+            .entries
+            .iter()
+            .filter_map(|entry| find(&entry.repos, repo).map(|patterns| (&entry.builder, patterns)));
+        entries.chain(self.patterns(repo).map(|patterns| (&self.host, patterns))).collect()
+    }
+
+    /// Whether any builder may run `repo`'s commands: `repos` or a `builders` entry's `repos` lists it, its name matched
+    /// in any letter case.
+    #[must_use]
+    pub fn is_routed(&self, repo: &str) -> bool {
+        !self.routes(repo).is_empty()
+    }
+
+    /// The output globs listed for `repo` on `builder`: the top-level `outputs` for `host`, the entry's own `outputs`
+    /// for a `builders` entry; `None` when that list does not name the repo.
+    pub(crate) fn own_outputs_on(&self, builder: &Builder, repo: &str) -> Option<Vec<String>> {
+        if builder.id.is_none() {
+            return self.own_outputs(repo);
+        }
+        let entry = self.entries.iter().find(|entry| entry.builder == *builder)?;
+        find(&entry.outputs, repo).map(globs_text)
     }
 
     /// The patterns `repos` lists for `repo`, matched in any letter case, or `None` when it does not list it.
@@ -266,14 +365,7 @@ impl Config {
     /// The output globs `outputs` lists for `repo`, or `None` when it does not name it.
     #[must_use]
     pub fn own_outputs(&self, repo: &str) -> Option<Vec<String>> {
-        find(&self.outputs, repo).map(|globs| globs.iter().map(|glob| glob.as_str().to_owned()).collect())
-    }
-
-    /// The output globs of `repo`: its own `outputs` list, or [`DEFAULT_OUTPUTS`] when `outputs` does not name it.
-    #[must_use]
-    pub fn outputs(&self, repo: &str) -> Vec<String> {
-        self.own_outputs(repo)
-            .unwrap_or_else(|| DEFAULT_OUTPUTS.iter().map(|glob| (*glob).to_owned()).collect())
+        find(&self.outputs, repo).map(globs_text)
     }
 
     /// The input globs `inputs` lists for `repo`, matched in any letter case: none when it does not name it.
@@ -356,6 +448,11 @@ fn drop_trailing_commas(text: &str) -> String {
             if trailing { ' ' } else { ch }
         })
         .collect()
+}
+
+/// The globs' texts.
+fn globs_text(globs: &[Pattern]) -> Vec<String> {
+    globs.iter().map(|glob| glob.as_str().to_owned()).collect()
 }
 
 /// The list `table` holds for `repo`, its name matched in any letter case.
@@ -490,27 +587,157 @@ fn host_part_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')
 }
 
-/// `slots`, 1 when missing: any JSON number that is a whole number 1 to 16, so `2` and `2.0` are both 2.
-fn read_slots(data: &Map<String, Value>) -> Result<u32, String> {
+/// `slots`, 1 when missing: any JSON number that is a whole number 1 to 16, so `2` and `2.0` are both 2. A reason
+/// starts with `prefix`, which names the object holding the key (`builders[0].`), empty at the top level.
+fn read_slots(data: &Map<String, Value>, prefix: &str) -> Result<u32, String> {
     let Some(value) = property(data, "slots") else {
         return Ok(1);
     };
     value
         .as_f64()
         .and_then(|number| (1..=MAX_SLOTS).find(|count| f64::from(*count).total_cmp(&number).is_eq()))
-        .ok_or_else(|| format!("slots must be a whole number 1 to {MAX_SLOTS}"))
+        .ok_or_else(|| format!("{prefix}slots must be a whole number 1 to {MAX_SLOTS}"))
 }
 
 /// The `repos`, `outputs` or `inputs` table: each repo name's pattern list, in file order; an empty table when the key is
-/// missing and not `required`.
-fn read_table(data: &Map<String, Value>, key: &str, required: bool) -> Result<RepoTable, String> {
+/// missing and not `required`. A reason starts with `prefix`, which names the object holding the key
+/// (`builders[0].`), empty at the top level.
+fn read_table(data: &Map<String, Value>, key: &str, required: bool, prefix: &str) -> Result<RepoTable, String> {
     let Some(value) = property(data, key) else {
-        return if required { Err(format!("{key} is missing")) } else { Ok(Vec::new()) };
+        return if required {
+            Err(format!("{prefix}{key} is missing"))
+        } else {
+            Ok(Vec::new())
+        };
     };
     let Value::Object(table) = value else {
-        return Err(format!("{key} must be a JSON object"));
+        return Err(format!("{prefix}{key} must be a JSON object"));
     };
-    table.iter().map(|(name, list)| Ok((name.clone(), read_list(key, name, list)?))).collect()
+    table
+        .iter()
+        .map(|(name, list)| Ok((name.clone(), read_list(prefix, key, name, list)?)))
+        .collect()
+}
+
+/// The `builders` entries, in file order; none when the key is missing. Any problem refuses the file.
+fn read_builder_entries(data: &Map<String, Value>, host: &str) -> Result<Vec<BuilderEntry>, String> {
+    let Some(value) = property(data, "builders") else {
+        return Ok(Vec::new());
+    };
+    let Value::Array(items) = value else {
+        return Err("builders must be an array of objects".to_owned());
+    };
+    let hosts: Vec<(usize, &str)> = match property(data, "hosts") {
+        Some(Value::Array(hosts)) => hosts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.as_str().map(|entry| (index, entry)))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut entries: Vec<BuilderEntry> = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let prefix = format!("builders[{index}].");
+        let Value::Object(object) = item else {
+            return Err(format!("builders[{index}] must be a JSON object"));
+        };
+        let entry = read_builder_entry(object, &prefix)?;
+        if let Some(named) = named_already(&entry.builder.alias, host, &hosts, &entries) {
+            return Err(format!("{prefix}host repeats {named}"));
+        }
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+/// Where the file already names the builder `alias`, in any ASCII letter case: `host`, a string entry of `hosts`
+/// (`hosts[M]`, `hosts` holding each string entry with its index) or an earlier `builders` entry (`builders[M].host`).
+fn named_already(alias: &str, host: &str, hosts: &[(usize, &str)], entries: &[BuilderEntry]) -> Option<String> {
+    if alias.eq_ignore_ascii_case(host) {
+        return Some("host".to_owned());
+    }
+    if let Some((index, _)) = hosts.iter().find(|(_, entry)| entry.eq_ignore_ascii_case(alias)) {
+        return Some(format!("hosts[{index}]"));
+    }
+    entries
+        .iter()
+        .position(|earlier| earlier.builder.alias.eq_ignore_ascii_case(alias))
+        .map(|earlier| format!("builders[{earlier}].host"))
+}
+
+/// One `builders` entry, its reasons starting with `prefix` (`builders[0].`): `host` checked as the top-level one is,
+/// `os` `windows` or `macos` in any ASCII letter case, `root` ([`read_builder_root`]), `slots` as the top-level one,
+/// `repos` an object naming at least one repo and `outputs` as the top-level one.
+fn read_builder_entry(object: &Map<String, Value>, prefix: &str) -> Result<BuilderEntry, String> {
+    let host = property(object, "host").ok_or_else(|| format!("{prefix}host is missing"))?;
+    let alias = checked_host(host, &HOST_REFUSALS).map_err(|reason| format!("{prefix}{reason}"))?;
+    let os = match property(object, "os") {
+        None => return Err(format!("{prefix}os is missing")),
+        Some(Value::String(os)) if os.eq_ignore_ascii_case("windows") => BuilderOs::Windows,
+        Some(Value::String(os)) if os.eq_ignore_ascii_case("macos") => BuilderOs::Macos,
+        Some(_) => return Err(format!(r#"{prefix}os must be "windows" or "macos""#)),
+    };
+    let root = read_builder_root(object, os, prefix)?;
+    let slots = read_slots(object, prefix)?;
+    let repos = read_table(object, "repos", true, prefix)?;
+    if repos.is_empty() {
+        return Err(format!("{prefix}repos must name at least one repo"));
+    }
+    let outputs = read_table(object, "outputs", false, prefix)?;
+    let id = Some(builder_id(&alias));
+    Ok(BuilderEntry {
+        builder: Builder { alias, os, root, slots, id },
+        repos,
+        outputs,
+    })
+}
+
+/// A `builders` entry's `root`. A macOS builder needs one: `/`, then names separated by single `/`, none empty, `.` or
+/// `..`, each of ASCII letters, digits, `.`, `_` and `-` only. A Windows builder's is `None` when missing, the default root, else
+/// an absolute drive path: a letter, `:`, a separator, then names separated by single `\` or `/`, none empty, `.` or
+/// `..` and none holding `:`, `*`, `?`, `"`, `<`, `>`, `|` or a control character.
+fn read_builder_root(object: &Map<String, Value>, os: BuilderOs, prefix: &str) -> Result<Option<String>, String> {
+    let value = property(object, "root");
+    match os {
+        BuilderOs::Macos => match value {
+            Some(Value::String(root)) if is_unix_root(root) => Ok(Some(root.clone())),
+            _ => Err(format!("{prefix}root must be an absolute path for a macos builder")),
+        },
+        BuilderOs::Windows => match value {
+            None => Ok(None),
+            Some(Value::String(root)) if is_drive_root(root) => Ok(Some(root.clone())),
+            Some(_) => Err(format!("{prefix}root must be an absolute drive path for a windows builder")),
+        },
+    }
+}
+
+/// Whether `root` is an absolute macOS path a builder root may be ([`read_builder_root`]).
+fn is_unix_root(root: &str) -> bool {
+    root.strip_prefix('/')
+        .is_some_and(|rest| rest.split('/').all(|name| root_name(name) && name.chars().all(is_layout_char)))
+}
+
+/// Whether `root` is an absolute drive path a Windows builder root may be ([`read_builder_root`]).
+fn is_drive_root(root: &str) -> bool {
+    let bytes = root.as_bytes();
+    let drive = bytes.len() > 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/');
+    drive
+        && root[3..]
+            .split(['\\', '/'])
+            .all(|name| root_name(name) && !name.contains([':', '*', '?', '"', '<', '>', '|']))
+}
+
+/// Whether `name`, one name of a builder root, is neither empty, `.` nor `..` and holds no control character.
+fn root_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.chars().any(char::is_control)
+}
+
+/// A `builders` entry's id: the first 8 lower-case hex digits of the SHA-256 of `alias` in ASCII lower case.
+fn builder_id(alias: &str) -> String {
+    let digest = Sha256::digest(alias.to_ascii_lowercase().as_bytes());
+    let mut id = String::with_capacity(8);
+    id.extend(digest.iter().take(4).map(|byte| format!("{byte:02x}")));
+    id
 }
 
 /// The `siblings` table: each repo name's allowed sibling names, in file order, each a folder name the builder can lay
@@ -636,13 +863,14 @@ fn read_desktop_consent(data: &Map<String, Value>) -> Result<Vec<(String, Vec<St
         .collect()
 }
 
-fn read_list(key: &str, name: &str, list: &Value) -> Result<Vec<Pattern>, String> {
+/// The pattern list of the repo `name` in the table `key`, a reason starting with `prefix` ([`read_table`]).
+fn read_list(prefix: &str, key: &str, name: &str, list: &Value) -> Result<Vec<Pattern>, String> {
     let Value::Array(items) = list else {
-        return Err(format!("{key}.{name} is not an array of strings"));
+        return Err(format!("{prefix}{key}.{name} is not an array of strings"));
     };
     let mut patterns = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
-        patterns.push(read_pattern(key, item).map_err(|problem| format!("{key}.{name}[{index}] {problem}"))?);
+        patterns.push(read_pattern(key, item).map_err(|problem| format!("{prefix}{key}.{name}[{index}] {problem}"))?);
     }
     Ok(patterns)
 }

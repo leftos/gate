@@ -460,7 +460,7 @@ enum Ending {
 fn warm_up(prepared: &Prepared<'_>, request: &WarmRequest, started: Timestamp, console: &mut Console) -> u32 {
     let state = &prepared.root.path;
     let key = &prepared.target.key;
-    let host = &prepared.target.host;
+    let host = &prepared.target.builder.alias;
     if let Err(error) = fs::create_dir_all(v1::warm_dir(state)) {
         let line = format!("gate: warm: cannot make {}: {error}", shown(&v1::warm_dir(state)));
         return End::Failed(line).say(request.background, console);
@@ -627,10 +627,10 @@ fn recheck(prepared: &Prepared<'_>) -> Result<Warmup, End> {
     let early = &prepared.target;
     let config = routing(prepared.environment).map_err(End::quiet)?;
     consented(&config, &early.repo)?;
-    if config.host() != early.host {
+    if config.host() != early.builder.alias {
         return Err(End::Quiet(format!(
             "gate: warm: remote.json's builder changed from {} to {}",
-            escaped(&early.host),
+            escaped(&early.builder.alias),
             escaped(config.host())
         )));
     }
@@ -668,7 +668,7 @@ fn call_of<'a>(
     let target = &prepared.target;
     let siblings = remote::carried(&target.place.root, &target.siblings)?;
     Ok(RemoteCall {
-        host: &target.host,
+        host: &target.builder.alias,
         key: &target.key,
         root: &target.place.root,
         root_id: target.root_id,

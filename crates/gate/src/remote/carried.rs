@@ -70,8 +70,13 @@ mod tests {
     /// A routed run from the root `X:/dev/app` carrying `siblings`, each `(name, root)`.
     fn run(siblings: &[(&str, &str)]) -> RemoteRun {
         RemoteRun {
-            host: "builder".to_owned(),
-            slots: 1,
+            builder: gate_router::Builder {
+                alias: "builder".to_owned(),
+                os: gate_router::BuilderOs::Windows,
+                root: None,
+                slots: 1,
+                id: None,
+            },
             root: "X:/dev/app".to_owned(),
             root_id: ID,
             leaf: "app".to_owned(),

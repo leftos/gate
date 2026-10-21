@@ -5,9 +5,9 @@
 use std::path::PathBuf;
 
 use gate_router::{
-    BuildSettings, BuildTarget, Config, ConfigProblem, DROPPED_NO_BUILD_LINE, DotnetTarget, Facts, Inputs, LocalReason, NO_OUTPUTS_LINE,
-    PROJECT_EXTENSIONS, Pattern, Place, RemoteRun, Route, SiblingFolder, Slot, Target, build_settings, builder_words, decide, dotnet_builds,
-    dotnet_target, is_cargo, is_dotnet, is_usable_host, sdk_build_target, target, without_no_build, work_folder_key,
+    BuildSettings, BuildTarget, Builder, BuilderOs, Config, ConfigProblem, DROPPED_NO_BUILD_LINE, DotnetTarget, Facts, Inputs, LocalReason,
+    NO_OUTPUTS_LINE, PROJECT_EXTENSIONS, Pattern, Place, RemoteRun, Route, SiblingFolder, Slot, Target, build_settings, builder_words, decide,
+    dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host, sdk_build_target, target, without_no_build, work_folder_key,
 };
 
 use crate::support::{FakeFacts, HEAD, ROOT, carried, fake_id, heavy, place_at, sibling_root, words};
@@ -33,6 +33,17 @@ fn place(prefix: &str, checkout: &str) -> Place {
     Place {
         checkout: checkout.to_owned(),
         ..place_at(prefix)
+    }
+}
+
+/// The top-level `host` of a routing file as the builder a run goes to: Windows, the default root, no id.
+fn host_builder(alias: &str, slots: u32) -> Builder {
+    Builder {
+        alias: alias.to_owned(),
+        os: BuilderOs::Windows,
+        root: None,
+        slots,
+        id: None,
     }
 }
 
@@ -65,8 +76,7 @@ fn the_control_command_routes_from_the_root() {
     assert_eq!(
         run,
         RemoteRun {
-            host: "builder-1".to_owned(),
-            slots: 2,
+            builder: host_builder("builder-1", 2),
             root: ROOT.to_owned(),
             root_id: fake_id(ROOT),
             leaf: "a".to_owned(),
@@ -740,8 +750,7 @@ fn assert_builder_words_match(command: &[String], facts: &FakeFacts) -> (Target,
     let built = builder_words(&builder_target, command, facts);
     assert_eq!(built.words, run.words, "{command:?}");
     assert_eq!(built.outside, None, "{command:?}");
-    assert_eq!(builder_target.host, run.host, "{command:?}");
-    assert_eq!(builder_target.slots, run.slots, "{command:?}");
+    assert_eq!(builder_target.builder, run.builder, "{command:?}");
     assert_eq!(builder_target.key, run.key, "{command:?}");
     assert_eq!(builder_target.repo, run.repo, "{command:?}");
     assert_eq!(builder_target.leaf, run.leaf, "{command:?}");
@@ -2494,4 +2503,243 @@ fn a_command_the_repos_patterns_do_not_route_reads_no_desktop_file() {
         assert_eq!(decide(&heavy(&words(&["cargo", "test"])), &facts), SILENT);
         assert_eq!(facts.desktop_read.get(), 0);
     }
+}
+
+/// A routing file whose `host`, `builder-1`, lists the repos `host_repos`, with the `builders` entries `builders`.
+fn with_builders(host_repos: &str, builders: &str) -> Config {
+    Config::parse(&format!(r#"{{"host": "builder-1", "repos": {host_repos}, "builders": {builders}}}"#)).expect("usable")
+}
+
+/// The `builders` entry `mac-1`, a macOS builder, as a run goes to it.
+fn mac_builder() -> Builder {
+    Builder {
+        alias: "mac-1".to_owned(),
+        os: BuilderOs::Macos,
+        root: Some("/Users/me/gate".to_owned()),
+        slots: 1,
+        id: Some("1f0efc62".to_owned()),
+    }
+}
+
+/// The `builders` list of the one entry `mac-1`, running `yaat`'s `dotnet build` commands.
+const MAC_BUILD: &str = r#"[{"host": "mac-1", "os": "macos", "root": "/Users/me/gate", "repos": {"yaat": ["dotnet build*"]}}]"#;
+
+#[test]
+fn a_command_matching_a_builder_entry_s_pattern_routes_to_that_builder() {
+    let config = with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_BUILD);
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &FakeFacts::with_config(config)));
+    assert_eq!(run.builder, mac_builder());
+    assert_eq!(run.pattern, "dotnet build*");
+}
+
+#[test]
+fn a_command_matching_only_the_top_level_patterns_routes_to_host_without_an_id() {
+    let config = with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_BUILD);
+    let run = routed(decide(&heavy(&words(&["dotnet", "test"])), &FakeFacts::with_config(config)));
+    assert_eq!(run.builder, host_builder("builder-1", 1));
+    assert_eq!(run.pattern, "dotnet *");
+}
+
+#[test]
+fn the_first_builder_entry_in_file_order_wins_when_two_match() {
+    let config = with_builders(
+        r#"{"yaat": ["dotnet *"]}"#,
+        r#"[{"host": "mac-1", "os": "macos", "root": "/Users/me/gate", "repos": {"yaat": ["dotnet *"]}},
+            {"host": "win-2", "os": "windows", "slots": 3, "repos": {"yaat": ["*"]}}]"#,
+    );
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &FakeFacts::with_config(config.clone())));
+    assert_eq!(run.builder, mac_builder());
+    let run = routed(decide(&heavy(&words(&["cargo", "build"])), &FakeFacts::with_config(config)));
+    assert_eq!(
+        run.builder,
+        Builder {
+            alias: "win-2".to_owned(),
+            os: BuilderOs::Windows,
+            root: None,
+            slots: 3,
+            id: Some("084c286b".to_owned()),
+        }
+    );
+}
+
+#[test]
+fn a_repo_named_only_in_a_builder_entry_routes_to_that_builder_alone() {
+    let config = with_builders(r#"{"other": ["*"]}"#, MAC_BUILD);
+    let facts = FakeFacts::with_config(config.clone());
+    assert_eq!(routed(decide(&heavy(&words(&["dotnet", "build"])), &facts)).builder, mac_builder());
+    let facts = FakeFacts::with_config(config.clone());
+    assert_eq!(decide(&heavy(&words(&["dotnet", "test"])), &facts), SILENT);
+    let facts = FakeFacts::with_config(config.clone());
+    let place = facts.place().expect("the place reads").expect("there is a worktree");
+    assert_eq!(
+        target(&config, place, &facts),
+        Err(None),
+        "a warm-up goes to host, which does not list the repo"
+    );
+}
+
+#[test]
+fn a_warm_up_target_goes_to_host_even_when_a_builder_entry_lists_the_repo() {
+    let config = with_builders(r#"{"yaat": ["dotnet test *"]}"#, MAC_BUILD);
+    let facts = FakeFacts::with_config(config.clone());
+    let place = facts.place().expect("the place reads").expect("there is a worktree");
+    let warm = target(&config, place, &facts).expect("the worktree has a target");
+    assert_eq!(warm.builder, host_builder("builder-1", 1));
+}
+
+#[test]
+fn a_macos_pick_writes_a_worktree_path_with_slashes_while_host_keeps_the_backslashes() {
+    let command = words(&["dotnet", "build", r"X:\dev\yaat.wt\a\src\Duel.sln"]);
+    let mac = with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_BUILD);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(mac)));
+    assert_eq!(run.words, stamped(&["dotnet", "build", "src/Duel.sln"]));
+    assert_eq!(run.fallback, command, "the fallback runs here as given");
+
+    let elsewhere = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["cargo *"]}}]"#;
+    let host = with_builders(r#"{"yaat": ["dotnet *"]}"#, elsewhere);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(host)));
+    assert_eq!(run.builder.alias, "builder-1");
+    assert_eq!(run.words, stamped(&["dotnet", "build", r"src\Duel.sln"]));
+}
+
+#[test]
+fn a_macos_pick_below_the_root_climbs_with_slashes() {
+    let command = words(&["dotnet", "build", r"X:\dev\yaat.wt\a\lib\x.csproj", r"X:\dev\yaat.wt\a\src\"]);
+    let facts = FakeFacts {
+        config: Ok(Some(with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_BUILD))),
+        ..FakeFacts::at("src/")
+    };
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.words, stamped(&["dotnet", "build", "../lib/x.csproj", "."]));
+    assert_eq!(run.subfolder, "src");
+}
+
+#[test]
+fn a_builder_entry_s_outputs_are_its_own_and_a_macos_entry_without_them_brings_none_back() {
+    let command = words(&["dotnet", "build"]);
+    let top = r#"{"yaat": ["*"]}, "outputs": {"yaat": ["top/**"]}"#;
+    let mac = with_builders(top, MAC_BUILD);
+    assert_eq!(
+        routed(decide(&heavy(&command), &FakeFacts::with_config(mac))).outputs,
+        Vec::<String>::new()
+    );
+
+    let own = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["*"]}, "outputs": {"Yaat": ["bin/**"]}}]"#;
+    let mac = with_builders(top, own);
+    assert_eq!(routed(decide(&heavy(&command), &FakeFacts::with_config(mac))).outputs, ["bin/**"]);
+
+    let windows = with_builders(top, r#"[{"host": "win-2", "os": "windows", "repos": {"yaat": ["*"]}}]"#);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(windows.clone())));
+    assert_eq!(
+        run.outputs,
+        ["**/bin/**", "**/.godot/mono/temp/bin/**"],
+        "the top-level outputs are host's alone"
+    );
+    let run = routed(decide(&heavy(&words(&["cargo", "build"])), &FakeFacts::with_config(windows)));
+    assert_eq!(run.outputs, ["target/*/*.exe", "target/*/*.dll", "target/*/*.pdb"]);
+}
+
+#[test]
+fn a_send_build_repo_s_no_build_test_picked_by_a_macos_builder_has_no_send_plan_and_drops_no_build() {
+    let file = |mac_patterns: &str| {
+        let text = format!(
+            r#"{{"host": "builder-1", "repos": {{"yaat": ["dotnet *"]}}, "sendBuild": ["yaat"],
+                "builders": [{{"host": "mac-1", "os": "macos", "root": "/m", "repos": {{"yaat": {mac_patterns}}}}}]}}"#
+        );
+        FakeFacts::with_config(Config::parse(&text).expect("usable"))
+    };
+    let command = words(&["dotnet", "test", "App.csproj", "-c", "Release", "--no-build"]);
+    let run = routed(decide(&heavy(&command), &file(r#"["dotnet test*"]"#)));
+    assert_eq!(run.builder.alias, "mac-1");
+    assert_eq!(run.send, None, "the Mac builds the project itself");
+    assert!(run.dropped_no_build);
+    assert_eq!(run.words, ["dotnet", "test", "App.csproj", "-c", "Release", stamp().as_str()]);
+
+    let run = routed(decide(&heavy(&command), &file(r#"["cargo *"]"#)));
+    assert_eq!(run.builder.alias, "builder-1");
+    assert!(run.send.is_some(), "host still gets the send plan");
+}
+
+/// A gate at the root whose `.gate/desktop.toml` declares `declared` and whose `.gate/local.toml` declares `local`,
+/// under a routing file whose `host` lists `yaat` as `host_repos` says, allowing the desktop pattern `dotnet build*` and
+/// `dotnet build src\Duel.sln`, with the `builders` entries `builders`.
+fn builder_desktop_facts(host_repos: &str, builders: &str, declared: &[&str], local: &[&str]) -> FakeFacts {
+    let text = format!(
+        r#"{{"host": "builder-1", "repos": {host_repos}, "builders": {builders},
+            "desktop": {{"yaat": ["dotnet build*", "dotnet build src\\Duel.sln"]}}}}"#
+    );
+    FakeFacts {
+        desktop: Ok(patterns(declared)),
+        local: Ok(patterns(local)),
+        ..FakeFacts::with_config(Config::parse(&text).expect("usable"))
+    }
+}
+
+#[test]
+fn a_command_matching_a_desktop_pattern_is_never_picked_by_a_macos_builder() {
+    let command = words(&["dotnet", "build"]);
+    let facts = builder_desktop_facts(r#"{"yaat": ["dotnet *"]}"#, MAC_BUILD, &["dotnet build*"], &[]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "builder-1", "the pick goes on to host");
+    assert!(run.desktop);
+    assert_eq!(facts.desktop_read.get(), 1, "the desktop file is read once");
+
+    let mac_then_windows = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet *"]}},
+        {"host": "win-2", "os": "windows", "repos": {"yaat": ["dotnet build*"]}}]"#;
+    let facts = builder_desktop_facts(r#"{"yaat": ["dotnet *"]}"#, mac_then_windows, &["dotnet build*"], &[]);
+    assert_eq!(
+        routed(decide(&heavy(&command), &facts)).builder.alias,
+        "win-2",
+        "the next entry that is no macOS one"
+    );
+
+    let facts = builder_desktop_facts(r#"{"other": ["*"]}"#, MAC_BUILD, &["dotnet build*"], &[]);
+    assert_eq!(decide(&heavy(&command), &facts), SILENT, "no other builder runs it");
+
+    let facts = builder_desktop_facts(r#"{"yaat": ["dotnet *"]}"#, MAC_BUILD, &["dotnet test*"], &[]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "mac-1", "a command no desktop pattern matches stays on the Mac");
+    assert!(!run.desktop);
+    assert_eq!(facts.desktop_read.get(), 1, "the desktop file is read once");
+}
+
+#[test]
+fn on_a_macos_pick_a_local_pattern_written_with_backslashes_still_matches() {
+    let command = words(&["dotnet", "build", r"X:\dev\yaat.wt\a\src\Duel.sln"]);
+    let facts = builder_desktop_facts(r#"{"yaat": ["dotnet *"]}"#, MAC_BUILD, &[], &[r"dotnet build src\Duel.sln"]);
+    let route = decide(&heavy(&command), &facts);
+    assert!(
+        matches!(&route, Route::Local { reason: Some(LocalReason::DeclaredLocal { pattern, .. }) } if pattern == r"dotnet build src\Duel.sln"),
+        "{:?}",
+        local_line(&route)
+    );
+}
+
+#[test]
+fn on_a_macos_pick_a_desktop_pattern_written_with_backslashes_still_matches() {
+    let command = words(&["dotnet", "build", r"X:\dev\yaat.wt\a\src\Duel.sln"]);
+    let facts = builder_desktop_facts(r#"{"yaat": ["dotnet *"]}"#, MAC_BUILD, &[r"dotnet build src\Duel.sln"], &[]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert!(run.desktop);
+    assert_eq!(run.builder.alias, "builder-1", "the desktop command leaves the Mac");
+    assert_eq!(run.words, stamped(&["dotnet", "build", r"src\Duel.sln"]));
+}
+
+#[test]
+fn a_file_without_builders_gives_the_target_it_always_gave() {
+    let facts = FakeFacts::at_root();
+    let place = facts.place().expect("the place reads").expect("there is a worktree");
+    assert_eq!(
+        target(&crate::support::config(), place, &facts),
+        Ok(Target {
+            builder: host_builder("builder-1", 2),
+            place: place_at(""),
+            repo: "yaat".to_owned(),
+            leaf: "a".to_owned(),
+            root_id: fake_id(ROOT),
+            siblings: Vec::new(),
+            key: work_folder_key(ROOT),
+            inputs: Vec::new(),
+        })
+    );
 }
