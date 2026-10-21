@@ -512,6 +512,10 @@ pub struct Ticket {
     /// True while queued for the remote pool. Written only when `Some(true)`, so a local queue's ticket is `None`.
     #[serde(skip_serializing_if = "is_not_true")]
     pub remote: Option<bool>,
+    /// The id of the `builders` entry's own remote pool a remote ticket queues for ([`crate::PoolId`]); absent for
+    /// `host`'s pool and for a local ticket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
     /// The free text the run gave `--reason`, for a local, critical or alone run or any run that said one; absent when
     /// it said none.
     #[serde(skip_serializing_if = "Option::is_none")]

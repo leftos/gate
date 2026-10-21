@@ -77,7 +77,7 @@ This repo's `tools/builder/install-toolchains.ps1` does the rest: the toolchains
 
 A macOS builder (an Apple-silicon Mac, a dedicated builder nobody works on) is set up by `tools/builder/install-macos.sh`, run as the builder user over ssh. It is in progress: the Unix box and its install by `gate push` are GATE-607 and GATE-608.
 
-`remote.json`'s `builders` array (an entry with `os` `macos` and a `root`) is read and routes ([design.md, remote.json](design.md#remotejson)), but the transport, payload layout, path map, remote pool and PC caches still use the Windows builder's constants for every builder. Do not add a `builders` entry to a live `remote.json` until GATE-606 part B lands.
+`remote.json`'s `builders` array (an entry with `os` `macos` and a `root`) is read and routes ([design.md, remote.json](design.md#remotejson)), but the transport, payload layout, path map and PC caches still use the Windows builder's constants for every builder. Do not add a `builders` entry to a live `remote.json` until GATE-606 part B lands.
 
 - **Toolchain steps** need no sudo and land under `--prefix` (default `~/gate-tools`), Rust under `CARGO_HOME` and `RUSTUP_HOME`: .NET SDK 10.0.401 and 8.0.425, the wasm-tools workload, PowerShell, Node.js, pnpm, uv and prek, Rust, cargo-nextest, Git LFS, Godot 4.7.2 mono, Bun. FFmpeg is skipped: no official source publishes a macOS arm64 build with a checksum.
 - **Login PATH** writes a marked block to `~/.zprofile`. The box reads its commands' PATH from the builder user's login shell, since a non-login ssh command lacks the prefix's tools.

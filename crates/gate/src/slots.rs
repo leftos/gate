@@ -10,8 +10,9 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use gate_args::{RunRequest, Slot};
+use gate_router::Builder;
 use gate_state::v1::{self, Claim, ClaimKind, Counts, FormatError, PoolSetting, Ticket, TicketKind};
-use gate_state::{JournalIdentity, KernelObject, RemoteTag, SlotKind};
+use gate_state::{JournalIdentity, KernelObject, PoolId, RemoteTag, SlotKind};
 use gate_win32::{NamedEvent, OwnedMutexGuard, mutex_exists};
 use jiff::Timestamp;
 use serde_json::{Map, Value};
@@ -20,12 +21,29 @@ use crate::acquire;
 use crate::console::Console;
 use crate::resolve::ResolvedRoot;
 
-/// The pool of slots a gate takes from: this machine's pool of one kind, or the builder's remote pool.
+/// The pool of slots a gate takes from: this machine's pool of one kind, or a builder's remote pool.
 #[derive(Clone, Copy)]
 pub(crate) enum Pool {
     Local(SlotKind),
-    /// The remote pool, of this many slots, whose waiters' tickets are heavy and marked remote.
-    Remote(u32),
+    /// A builder's remote pool, whose waiters' tickets are heavy and marked remote.
+    Remote(BuilderPool),
+}
+
+/// A builder's remote pool: its size and its id, `None` for `host`'s pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BuilderPool {
+    pub slots: u32,
+    pub id: Option<PoolId>,
+}
+
+impl BuilderPool {
+    /// The remote pool of `builder`: its slots, and its id for a `builders` entry.
+    pub(crate) fn of(builder: &Builder) -> BuilderPool {
+        let id = builder.id.as_deref().map(|text| {
+            PoolId::parse(text).unwrap_or_else(|| unreachable!("remote.json's reader gives a builder's id as 8 lower-case hex digits, not {text:?}"))
+        });
+        BuilderPool { slots: builder.slots, id }
+    }
 }
 
 /// What a gate of a slot kind takes here: a slot of a pool, the whole machine, or nothing.
@@ -57,7 +75,16 @@ impl Pool {
         match self {
             Pool::Local(SlotKind::Heavy) => KernelObject::HeavySlot(index),
             Pool::Local(SlotKind::Light) => KernelObject::LightSlot(index),
-            Pool::Remote(_) => KernelObject::RemoteSlot(index),
+            Pool::Remote(BuilderPool { id: None, .. }) => KernelObject::RemoteSlot(index),
+            Pool::Remote(BuilderPool { id: Some(pool), .. }) => KernelObject::PooledRemoteSlot { pool, index },
+        }
+    }
+
+    /// The id of a builder's own remote pool; `None` for `host`'s pool and for a local one.
+    pub(crate) fn remote_id(self) -> Option<PoolId> {
+        match self {
+            Pool::Remote(builder) => builder.id,
+            Pool::Local(_) => None,
         }
     }
 

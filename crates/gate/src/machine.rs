@@ -146,6 +146,7 @@ impl<'a> MachineWait<'a> {
             lends_closed: false,
             alone: arrival.request.alone,
             remote: None,
+            pool: None,
             reason: arrival.request.reason.clone(),
             expected: arrival.expected.cloned(),
         };
@@ -841,6 +842,7 @@ mod tests {
             lends_closed: false,
             alone: false,
             remote: None,
+            pool: None,
             reason: None,
             expected: None,
         }

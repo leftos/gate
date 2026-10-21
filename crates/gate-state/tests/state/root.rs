@@ -1,7 +1,7 @@
 //! The state root: which root is the machine's default, the hash a non-default root carries, and the kernel object names
 //! each root gives.
 
-use gate_state::{KernelObject, StateRoot, default_root, key_hash, log_hash, normalize_root, root_hash};
+use gate_state::{KernelObject, PoolId, StateRoot, default_root, key_hash, log_hash, normalize_root, root_hash};
 
 const LOCAL_APP_DATA: &str = r"C:\Users\someone\AppData\Local";
 const DEFAULT_ROOT: &str = r"C:\Users\someone\AppData\Local\gate\v1";
@@ -122,6 +122,27 @@ fn claim_files_drop_local_and_the_root_hash() {
         KernelObject::Worktree { volume: 1, file: [2; 16] },
     ] {
         assert_eq!(object.claim_file_name(), None, "{object:?} has no claim");
+    }
+}
+
+#[test]
+fn a_builders_pool_names_its_slots_by_its_pool_id() {
+    let pool = PoolId::parse("0a1b2c3d").expect("8 lower-case hex digits are a pool id");
+    let slot = KernelObject::PooledRemoteSlot { pool, index: 2 };
+
+    assert_eq!(pool.to_string(), "0a1b2c3d");
+    assert_eq!(slot.claim_file_name().as_deref(), Some("gate-remote-0a1b2c3d-slot-2.json"));
+    assert_eq!(root(DEFAULT_ROOT).object_name(slot), r"Local\gate-remote-0a1b2c3d-slot-2");
+    assert_eq!(
+        root(r"C:\gate-test\root").object_name(slot),
+        format!(r"Local\gate-{TEST_ROOT_HASH}-remote-0a1b2c3d-slot-2")
+    );
+}
+
+#[test]
+fn a_pool_id_is_exactly_8_lower_case_hex_digits() {
+    for refused in ["0A1B2C3D", "0a1b2c3", "0a1b2c3d4", "0a1b2c3g", ""] {
+        assert_eq!(PoolId::parse(refused), None, "{refused:?}");
     }
 }
 

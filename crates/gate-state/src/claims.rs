@@ -10,6 +10,7 @@ use jiff::Timestamp;
 use serde_json::{Map, Value};
 
 use crate::counts::powershell_text;
+use crate::root::PoolId;
 
 /// How much of a log's end is read for its last line.
 const LOG_TAIL_BYTES: u64 = 4096;
@@ -81,8 +82,9 @@ pub(crate) struct Ticket {
 }
 
 /// The claim files of the slots and of the critical gate in `dir`, keyed by mutex name in lower case: the files named
-/// `<prefix>gate-slot-<n>`, `<prefix>gate-light-slot-<n>`, `<prefix>gate-remote-slot-<n>` or `<prefix>gate-critical`
-/// with a `.json` extension, in any letter case. A claim without the prefix is left out, so is one that is gone, and a
+/// `<prefix>gate-slot-<n>`, `<prefix>gate-light-slot-<n>`, `<prefix>gate-remote-slot-<n>`,
+/// `<prefix>gate-remote-<pool id>-slot-<n>` or `<prefix>gate-critical` with a `.json` extension, in any letter case but
+/// the pool id's, which is lower case. A claim without the prefix is left out, so is one that is gone, and a
 /// missing folder holds none, and so does one that cannot be listed.
 pub(crate) fn read_claims(dir: &Path, prefix: &str) -> HashMap<String, Claim> {
     try_read_claims(dir, prefix).unwrap_or_default()
@@ -120,7 +122,7 @@ pub(crate) fn try_read_claims(dir: &Path, prefix: &str) -> io::Result<HashMap<St
 fn mutex_name(path: &Path, prefix: &str) -> Option<String> {
     let base = json_base_name(path)?;
     let name = base.strip_prefix(prefix)?;
-    if name == "gate-critical" {
+    if name == "gate-critical" || is_pooled_remote_slot(path, prefix) {
         return Some(base);
     }
     let digits = name
@@ -128,6 +130,31 @@ fn mutex_name(path: &Path, prefix: &str) -> Option<String> {
         .or_else(|| name.strip_prefix("gate-remote-slot-"))
         .or_else(|| name.strip_prefix("gate-slot-"))?;
     (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())).then_some(base)
+}
+
+/// Whether the claim file at `path` is a `builders` entry's remote slot's under the lowered `prefix`,
+/// `<prefix>gate-remote-<pool id>-slot-<n>.json`: the pool id exactly as a gate writes it ([`PoolId::parse`]), the rest
+/// in any letter case.
+fn is_pooled_remote_slot(path: &Path, prefix: &str) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(rest) = strip_prefix_any_case(name, prefix).and_then(|rest| strip_prefix_any_case(rest, "gate-remote-")) else {
+        return false;
+    };
+    let Some(at) = rest.to_ascii_lowercase().find("-slot-") else {
+        return false;
+    };
+    let (pool, slot) = rest.split_at(at);
+    let tail = slot["-slot-".len()..].to_ascii_lowercase();
+    let digits = tail.strip_suffix(".json");
+    PoolId::parse(pool).is_some() && digits.is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// `text` less `prefix`, matched in any ASCII letter case; `None` when `text` does not start with it.
+fn strip_prefix_any_case<'t>(text: &'t str, prefix: &str) -> Option<&'t str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then(|| &text[prefix.len()..])
 }
 
 /// A file's name lowered, without its `.json` extension; `None` for another extension.
@@ -321,9 +348,11 @@ fn open_shared(path: &Path) -> io::Result<File> {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test whose own moments do not parse must fail loudly")]
 mod tests {
+    use std::path::Path;
+
     use jiff::{SignedDuration, Timestamp};
 
-    use super::{MAX_TICKS, UNIX_EPOCH_TICKS, claim_started_by, read_claim, ticket_started_by, ticks_of, timestamp_of_ticks};
+    use super::{MAX_TICKS, UNIX_EPOCH_TICKS, claim_started_by, mutex_name, read_claim, ticket_started_by, ticks_of, timestamp_of_ticks};
 
     const START: &str = "2026-10-01T11:00:00.5Z";
 
@@ -377,6 +406,31 @@ mod tests {
             Some("0001-01-01T00:00:00Z".parse().expect("year one is a timestamp")),
             "the first tick"
         );
+    }
+
+    #[test]
+    fn a_builders_remote_claim_names_its_mutex_with_its_pool_id() {
+        let name = |file: &str, prefix: &str| mutex_name(Path::new(file), prefix);
+
+        assert_eq!(
+            name("gate-remote-0a1b2c3d-slot-2.json", "").as_deref(),
+            Some("gate-remote-0a1b2c3d-slot-2")
+        );
+        assert_eq!(
+            name("ops225-gate-remote-0a1b2c3d-slot-2.json", "ops225-").as_deref(),
+            Some("ops225-gate-remote-0a1b2c3d-slot-2"),
+            "under a prefix"
+        );
+        assert_eq!(name("gate-remote-slot-2.json", "").as_deref(), Some("gate-remote-slot-2"), "host's pool");
+        for refused in [
+            "gate-remote-0A1B2C3D-slot-2.json",
+            "gate-remote-0a1b2c3-slot-2.json",
+            "gate-remote-0a1b2c3d4-slot-2.json",
+            "gate-remote-0a1b2c3d-slot-.json",
+            "gate-remote-0a1b2c3d-slot-x.json",
+        ] {
+            assert_eq!(name(refused, ""), None, "{refused}");
+        }
     }
 
     #[test]

@@ -61,6 +61,7 @@ fn ticket(pid: u32, arrived: u64) -> Ticket {
         lends_closed: false,
         alone: false,
         remote: None,
+        pool: None,
         reason: None,
         expected: None,
     }
@@ -672,6 +673,30 @@ fn a_written_ticket_reads_back_equal_and_omits_remote_when_local() {
     let text = fs::read_to_string(&path).expect("the remote ticket is there");
     assert!(text.ends_with(r#""holds":false,"remote":true}"#), "{text}");
     assert_eq!(v1::read_ticket(&path).expect("the written remote ticket reads"), remote);
+}
+
+#[test]
+fn a_ticket_of_a_builders_pool_carries_its_pool_and_one_of_host_s_pool_none() {
+    let dir = scratch("pool");
+    let path = v1::ticket_path(&dir, 60080, 1);
+    let host = Ticket {
+        kind: TicketKind::Heavy,
+        remote: Some(true),
+        ..ticket(60080, 1)
+    };
+    v1::write_ticket(&path, &host).expect("host's ticket is written");
+    let text = fs::read_to_string(&path).expect("host's ticket is there");
+    assert!(text.ends_with(r#""holds":false,"remote":true}"#), "host's ticket is as it was: {text}");
+    assert!(!text.contains("pool"), "{text}");
+
+    let pooled = Ticket {
+        pool: Some("1f0efc62".to_owned()),
+        ..host
+    };
+    v1::write_ticket(&path, &pooled).expect("the pooled ticket is written");
+    let text = fs::read_to_string(&path).expect("the pooled ticket is there");
+    assert!(text.ends_with(r#""remote":true,"pool":"1f0efc62"}"#), "{text}");
+    assert_eq!(v1::read_ticket(&path).expect("the pooled ticket reads"), pooled);
 }
 
 #[test]

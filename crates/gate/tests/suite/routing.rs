@@ -1493,6 +1493,39 @@ fn a_routed_run_goes_to_the_client_and_passes_its_output_and_status_through() {
     assert!(!remote_claim(&case).exists(), "the remote claim is gone after the release");
 }
 
+/// The claim file of slot 0 of the `builders` entry `mac-1`'s own remote pool, whose id is the first 8 hex digits of
+/// the SHA-256 of `mac-1`.
+const MAC_CLAIM: &str = "gate-remote-1f0efc62-slot-0.json";
+/// The claim file of slot 0 of `host`'s remote pool.
+const HOST_CLAIM: &str = "gate-remote-slot-0.json";
+
+#[test]
+fn a_run_to_a_builders_entry_takes_a_slot_of_that_builders_own_pool() {
+    let case = routed_case("routing-own-pool");
+    copy_tool(&case, "mac.exe");
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["*tool.exe*"] },
+        "builders": [{ "host": "mac-1", "os": "macos", "root": "/m", "repos": { repo(&case): ["*mac.exe*"] } }],
+    });
+    write_remote_json(&case, &routing.to_string());
+    let slots = case.root().join("slots");
+
+    for (program, claim, other) in [(r".\mac.exe", MAC_CLAIM, HOST_CLAIM), (r".\tool.exe", HOST_CLAIM, MAC_CLAIM)] {
+        let go = case.folder().join(format!("go-{claim}"));
+        let steps = stub(&case, &[&format!("wait {}", shown(&go))]);
+        let log = format!("{claim}.log");
+        let running = case.start(&routed_words(&log, &shown(&steps), &[], &[program, "out", "hi"]));
+        wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, running.id()));
+        let held = (slots.join(claim).exists(), slots.join(other).exists());
+        let_go(&go);
+        let outcome = running.finish();
+
+        assert_eq!(held, (true, false), "{program} holds a slot of its builder's pool alone: {outcome:?}");
+        assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    }
+}
+
 #[test]
 fn a_heavy_gate_routed_from_under_a_light_parent_does_not_say_the_parent_does_not_cover_it() {
     let case = routed_case("routing-under-light");

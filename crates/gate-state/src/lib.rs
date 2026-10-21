@@ -47,7 +47,7 @@ pub use model::{
     CRITICAL_BESIDE_LIGHT, CoveredRun, CriticalState, CwdReader, DashboardState, Generation, MutexProbe, ParseError, PoolState, QueueTicket,
     RemotePool, SlotCount, SlotCounts, SlotKind, SlotRow, SlotState, StateInputs, Waiting, beside_allowance,
 };
-pub use root::{KernelObject, StateRoot, default_root, key_hash, log_hash, normalize_root, root_hash};
+pub use root::{KernelObject, PoolId, StateRoot, default_root, key_hash, log_hash, normalize_root, root_hash};
 pub use state::dashboard_state;
 pub use verdict::Verdict;
 #[cfg(all(windows, target_pointer_width = "64"))]

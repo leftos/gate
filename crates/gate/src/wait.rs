@@ -294,6 +294,7 @@ impl<'a> Wait<'a> {
             lends_closed: false,
             alone: false,
             remote: pool.is_remote().then_some(true),
+            pool: pool.remote_id().map(|id| id.to_string()),
             reason: request.reason.clone(),
             expected: expected.cloned(),
         };
@@ -396,7 +397,7 @@ impl<'a> Wait<'a> {
     /// line said once a wait.
     fn counts(&mut self, console: &mut Console) -> u32 {
         let kind = match self.pool {
-            Pool::Remote(slots) => return slots,
+            Pool::Remote(builder) => return builder.slots,
             Pool::Local(kind) => kind,
         };
         let counts = read_counts(self.root, self.processors);
@@ -537,22 +538,25 @@ impl<'a> Wait<'a> {
     }
 
     /// When the first holder of the busy slots of `range` frees its slot, by `probe`, that range's probe, and the
-    /// other gates' live claims as they stand ([`holder_eta`]); `None` when a slot of the probe could not be probed.
+    /// other gates' live claims as they stand ([`pool_eta`]); `None` when a slot of the probe could not be probed.
     fn eta(&self, probe: &[Option<bool>], range: Range<u32>, survey: &mut Survey, console: &mut Console) -> Option<String> {
         if probe.iter().any(Option::is_none) {
             return None;
         }
-        let kind = self.pool.claim_kind();
-        let busy: Vec<(ClaimKind, u32)> = range
+        let busy: Vec<u32> = range
             .zip(probe)
             .filter(|(_, slot)| **slot == Some(true))
-            .map(|(index, _)| (kind, index))
+            .map(|(index, _)| index)
             .collect();
         if busy.is_empty() {
             return None;
         }
-        let claims = survey.live_claims(&self.root.path, console).ok()?;
-        holder_eta(&claims, &busy, Which::First, Timestamp::now())
+        let dir = v1::slots_dir(&self.root.path);
+        let claims = survey
+            .other_claims(&self.root.path, console)
+            .inspect_err(|error| survey.say_once("cannot read the claims in", &dir.display().to_string(), error, console))
+            .ok()?;
+        pool_eta(&claims, self.pool, &busy, Which::First, Timestamp::now())
     }
 
     /// The first line of a gate the critical request of the last pass holds back; `None` when none did.
@@ -565,16 +569,10 @@ impl<'a> Wait<'a> {
         Some(line)
     }
 
-    /// How many live tickets of the gate's kind and pool of `others`, local or remote, are ahead of it, so a local and
-    /// a remote waiter never count each other. A ticket whose gate a live claim names is not counted: that gate holds
-    /// a slot already, and only failed to delete its ticket.
+    /// How many live tickets of the gate's kind and pool of `others` are ahead of it ([`queued_ahead`]). A ticket whose
+    /// gate a live claim names is not counted: that gate holds a slot already, and only failed to delete its ticket.
     fn ahead(&self, others: &[Ticket], survey: &mut Survey, console: &mut Console) -> usize {
-        let kind = self.pool.ticket_kind();
-        let remote = self.pool.is_remote();
-        let ahead: Vec<&Ticket> = others
-            .iter()
-            .filter(|ticket| ticket.kind == kind && (ticket.remote == Some(true)) == remote && ticket.queue_order() < self.order)
-            .collect();
+        let ahead: Vec<&Ticket> = others.iter().filter(|ticket| queued_ahead(ticket, self.pool, self.order)).collect();
         if ahead.is_empty() {
             return 0;
         }
@@ -629,6 +627,16 @@ impl<'a> Wait<'a> {
     }
 }
 
+/// Whether `ticket` waits ahead of a gate at the place `order` in the queue of `pool`: of the pool's ticket kind,
+/// remote exactly when the pool is, so a local and a remote waiter never count each other, of the same builder's pool
+/// when remote (a ticket without a pool is `host`'s), and earlier.
+fn queued_ahead(ticket: &Ticket, pool: Pool, order: (u64, u32)) -> bool {
+    let remote = pool.is_remote();
+    let id = pool.remote_id().map(|id| id.to_string());
+    let same_pool = !remote || ticket.pool == id;
+    ticket.kind == pool.ticket_kind() && (ticket.remote == Some(true)) == remote && same_pool && ticket.queue_order() < order
+}
+
 /// `figures` of a wait line, followed by `eta` when there is one.
 fn with_eta(figures: String, eta: Option<String>) -> String {
     match eta {
@@ -670,6 +678,22 @@ pub(crate) fn usual(claim: &Claim, now: Timestamp) -> Option<Usual> {
 /// usual and its ceiling ([`eta_text`]). `None` when no slot is busy, or a busy slot has no claim carrying a usual.
 pub(crate) fn holder_eta(claims: &[Claim], busy: &[(ClaimKind, u32)], which: Which, now: Timestamp) -> Option<String> {
     named_eta(holder_usuals(claims, busy, now)?, which)
+}
+
+/// When the holders of the busy slots `busy` of `pool` free them, by the other gates' live claims `claims`, each with its
+/// file name, at `now`, as [`holder_eta`] says it: a slot's holder is the claim named as that slot's claim file, so a
+/// remote pool's estimate never names the holder of another builder's pool, whose claims are of the same kind. `None`
+/// when a busy slot has no claim carrying a usual.
+fn pool_eta(claims: &[(String, Claim)], pool: Pool, busy: &[u32], which: Which, now: Timestamp) -> Option<String> {
+    let files: Vec<String> = busy.iter().filter_map(|&index| pool.object(index).claim_file_name()).collect();
+    let own: Vec<Claim> = claims
+        .iter()
+        .filter(|(name, _)| files.contains(name))
+        .map(|(_, claim)| claim.clone())
+        .collect();
+    let kind = pool.claim_kind();
+    let slots: Vec<(ClaimKind, u32)> = busy.iter().map(|&index| (kind, index)).collect();
+    holder_eta(&own, &slots, which, now)
 }
 
 /// The holders of the busy slots `busy`, each a claim kind and slot index, as their ETAs read them at `now` by their
@@ -1054,7 +1078,7 @@ pub(crate) mod scratch {
 mod tests {
     use gate_args::Slot;
     use gate_state::v1::{self, Ticket, TicketKind};
-    use gate_state::{KernelObject, SlotKind, beside_allowance};
+    use gate_state::{KernelObject, PoolId, SlotKind, beside_allowance};
 
     use std::time::{Duration, Instant};
 
@@ -1064,11 +1088,11 @@ mod tests {
     use super::scratch::{Holder, Scratch, holding, request};
     use super::{
         Arrival, Barrier, Beside, Host, LendFacts, Wait, Waited, Which, barrier, beside_of, beside_place, beside_room, first_heartbeat, holder_eta,
-        lends, light_barrier, may_take, slot_range,
+        lends, light_barrier, may_take, pool_eta, queued_ahead, slot_range,
     };
     use crate::console::Console;
     use crate::slots::BesideTry;
-    use crate::slots::{self, Pool, Survey, ThisGate};
+    use crate::slots::{self, BuilderPool, Pool, Survey, ThisGate};
 
     /// The fixed moment the ETA cases count from.
     fn now() -> Timestamp {
@@ -1135,6 +1159,22 @@ mod tests {
             "a busy slot with no claim of its kind"
         );
         assert_eq!(holder_eta(&[with_history], &[], Which::First, now()), None, "no busy slot");
+    }
+
+    #[test]
+    fn a_remote_waiters_eta_names_the_holder_of_its_own_builders_pool() {
+        let mac = PoolId::parse("1f0efc62").expect("8 lower-case hex digits are a pool id");
+        let claims = [
+            ("gate-remote-slot-0.json".to_owned(), holding(ClaimKind::Remote, 0, now(), Some(600.0))),
+            (
+                "gate-remote-1f0efc62-slot-0.json".to_owned(),
+                holding(ClaimKind::Remote, 0, now(), Some(60.0)),
+            ),
+        ];
+        let eta = |id| pool_eta(&claims, Pool::Remote(BuilderPool { slots: 1, id }), &[0], Which::First, now());
+
+        assert_eq!(eta(None).as_deref(), Some("the first frees in about 10 min"), "host's holder");
+        assert_eq!(eta(Some(mac)).as_deref(), Some("the first frees in about 60 s"), "mac-1's holder");
     }
 
     #[test]
@@ -1266,9 +1306,56 @@ mod tests {
             lends_closed: false,
             alone: false,
             remote: None,
+            pool: None,
             reason: None,
             expected: None,
         }
+    }
+
+    #[test]
+    fn a_remote_waiter_counts_ahead_only_the_tickets_of_its_own_builders_pool() {
+        let mac = PoolId::parse("1f0efc62").expect("8 lower-case hex digits are a pool id");
+        let remote = |arrived: u64, pid: u32, pool: Option<&str>| Ticket {
+            remote: Some(true),
+            pool: pool.map(str::to_owned),
+            ..ticket(TicketKind::Heavy, arrived, pid)
+        };
+        let local_with_pool = Ticket {
+            pool: Some("1f0efc62".to_owned()),
+            ..ticket(TicketKind::Heavy, 40, 5)
+        };
+        let others = [
+            remote(10, 1, None),
+            remote(20, 2, Some("1f0efc62")),
+            remote(30, 3, Some("0a1b2c3d")),
+            ticket(TicketKind::Heavy, 5, 4),
+            local_with_pool,
+            remote(200, 6, Some("1f0efc62")),
+        ];
+        let order = (100, 9);
+        let ahead = |pool: Pool| -> Vec<u32> {
+            others
+                .iter()
+                .filter(|ticket| queued_ahead(ticket, pool, order))
+                .map(|ticket| ticket.pid)
+                .collect()
+        };
+
+        assert_eq!(
+            ahead(Pool::Remote(BuilderPool { slots: 1, id: None })),
+            [1],
+            "host's pool: tickets without a pool"
+        );
+        assert_eq!(
+            ahead(Pool::Remote(BuilderPool { slots: 1, id: Some(mac) })),
+            [2],
+            "the mac's pool: its own tickets"
+        );
+        assert_eq!(
+            ahead(Pool::Local(SlotKind::Heavy)),
+            [4, 5],
+            "a local waiter counts local tickets, whatever their pool"
+        );
     }
 
     #[test]

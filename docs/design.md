@@ -723,8 +723,11 @@ A slot is a named mutex in the logon session's `Local\` namespace, held by the g
 |---|---|---|
 | heavy | `Local\gate-slot-<i>` | `--slot heavy`; a critical gate takes every heavy slot. |
 | light | `Local\gate-light-slot-<i>` | `--slot light`; a critical gate takes every light slot but the beside allowance of its count (K2), and an `--alone` one every light slot. |
-| remote | `Local\gate-remote-slot-<i>` | a routed heavy run, for the length of its remote attempt (T5). |
+| remote | `Local\gate-remote-slot-<i>` | a heavy run routed to `host`, for the length of its remote attempt (T5). |
+| builder's remote | `Local\gate-remote-<pool id>-slot-<i>` | a heavy run routed to a `builders` entry, one pool per entry, so a run to one builder never waits behind runs to another. |
 | critical | `Local\gate-critical` | a critical gate, for its whole run, so two critical requests run one at a time in arrival order (K1). |
+
+A pool id is the first 8 lower-case hex digits of the SHA-256 of the entry's lower-cased alias (`mac-1` is `1f0efc62`); `host` has none and keeps the plain names.
 
 The pools never wait on each other, so a serial test run does not queue behind builds (S1). A gate takes and releases its mutexes on one OS thread, since Windows mutex ownership is per thread.
 
@@ -736,14 +739,14 @@ It still has its job, so `gate stop-tree` reaches it, and it runs at BelowNormal
 
 The default count of a pool is `max(1, floor((logical processors - 1) / threads))`, with threads 4 for heavy and 2 for light (kept, S2). `slot-counts.json` in the state root overrides either count with a whole number from 1 to 64. It is re-read on every pass of the wait loop, so a count changed while gates wait applies to them, and a gate holding a slot the new count leaves out keeps it.
 
-A missing file or key means the default; an unreadable or invalid value is ignored for that pool with one line, `gate: ignored <path>: <reason>; using <n> <kind> slots`, said once per wait and only for the waiting gate's own kind (S2). A processor count the system will not give is taken as 1, with `gate: cannot read the processor count: <error>; counting 1`, said once. The remote pool's size comes from `remote.json` (T1).
+A missing file or key means the default; an unreadable or invalid value is ignored for that pool with one line, `gate: ignored <path>: <reason>; using <n> <kind> slots`, said once per wait and only for the waiting gate's own kind (S2). A processor count the system will not give is taken as 1, with `gate: cannot read the processor count: <error>; counting 1`, said once. The remote pool's size comes from `remote.json` (T1): the top-level `slots` for `host`'s pool, the entry's own `slots` for a `builders` entry's.
 
 ### Taking a slot
 
 1. A gate that needs a slot creates its wake event, then writes its arrival [ticket](#ticket), both before its first try, so no wake is lost. A gate a parent's slot covers takes no slot and writes no ticket (N1).
 
    A gate its light parent lends the slot while a critical request drains (N2) writes no ticket when it is lent before it queues, only a lend marker ([Claim](#claim)); one lent as it waits has queued with a ticket, which it deletes when lent, writing its lend marker and waking the waiters.
-2. Waiters of one kind take slots in ticket `arrived` order, ties broken by pid. A gate tries a slot only when fewer live tickets of its kind are ahead of it than the pool has free slots (indices whose mutex no handle holds, a probe that fails counting as not free), not counting a ticket whose gate already holds a live claim (it holds a slot and only failed to delete its ticket), so a try never takes the slot an earlier waiter would get.
+2. Waiters of one kind take slots in ticket `arrived` order, ties broken by pid; a remote waiter counts only the tickets of its own pool (a ticket without `pool` is `host`'s). A gate tries a slot only when fewer live tickets of its kind are ahead of it than the pool has free slots (indices whose mutex no handle holds, a probe that fails counting as not free), not counting a ticket whose gate already holds a live claim (it holds a slot and only failed to delete its ticket), so a try never takes the slot an earlier waiter would get.
 
    It then tries indices 0 up to the count in order and takes the first free one. A live critical ticket that arrived before the gate (by `arrived`, then pid; the barrier, Q3) narrows that: a heavy gate tries no slot, and a light gate tries any light slot, and none once as many light gates run beside the critical request as the beside allowance (K3), which is 0 while a critical ticket says `alone`. See [Critical drain and nesting](#critical-drain-and-nesting).
 3. A take deletes the gate's own ticket, writes the claim, journals `take` and wakes the waiters, so the next in line tries at once. A release deletes the claim, journals `release`, lets the mutex go and wakes the waiters. A critical gate takes the machine instead ([Critical drain and nesting](#critical-drain-and-nesting)): its `take` and `release` list every slot it holds, and it writes one claim, `gate-critical.json`, and none for the slots.
@@ -850,6 +853,7 @@ The temporary sibling is made new, a link or junction at its name opened as itse
 | heavy slot | `Local\gate-slot-<i>` | `Local\gate-<h>-slot-<i>` |
 | light slot | `Local\gate-light-slot-<i>` | `Local\gate-<h>-light-slot-<i>` |
 | remote slot | `Local\gate-remote-slot-<i>` | `Local\gate-<h>-remote-slot-<i>` |
+| builder's remote slot | `Local\gate-remote-<p>-slot-<i>` | `Local\gate-<h>-remote-<p>-slot-<i>` |
 | critical | `Local\gate-critical` | `Local\gate-<h>-critical` |
 | critical-beside | `Local\gate-critical-beside` | `Local\gate-<h>-critical-beside` |
 | journal mutex | `Local\gate-journal` | `Local\gate-<h>-journal` |
@@ -932,7 +936,7 @@ The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Criti
 | `reason` | string | optional: the free text the run gave `--reason`; absent when it gave none. A local, critical or alone run always has one, since it is required |
 | `expected` | object | optional, last: what the durations store expects of the run, `{"p50": <s>, "p90": <s>, "n": <runs>, "key": "<key>"}` with the seconds to 3 decimals, rounded half to even; absent for a run without history. It is the builder's estimate for a remote take and `crit`'s for a critical gate. The wait lines read `p50` ([Slots](#slots), step 6); `null` reads as absent, any other non-object is unreadable |
 
-The file name `<name>` is `gate-slot-<i>`, `gate-light-slot-<i>`, `gate-remote-slot-<i>` or `gate-critical`, the same whatever the root: a non-default root's claims sit in that root's own `slots\` folder, so the file name carries no root hash.
+The file name `<name>` is `gate-slot-<i>`, `gate-light-slot-<i>`, `gate-remote-slot-<i>`, `gate-remote-<pool id>-slot-<i>` (a `builders` entry's slot; the pool id is exactly 8 lower-case hex digits, any other spelling is not a claim) or `gate-critical`, the same whatever the root: a non-default root's claims sit in that root's own `slots\` folder, so the file name carries no root hash.
 
 A claim is live while its `pid` runs with that `processStart` (L2), the start compared in whole milliseconds. A killed gate leaves its file; the next holder overwrites it and readers treat it as stale. A gate that cannot write its claim says so once and runs on (L1). The claim is written before the gate's `take` line ([Journal](#journal)), so a gate paused or killed before that line shows a claim with no `take` line: a reader, ops-tower included, must not expect a `take` line for every claim.
 
@@ -961,6 +965,7 @@ A pid the checking gate may not query is dead too, since it is another user's pr
 | `lendsClosed` | bool | optional, written only when true: a critical gate that holds every slot it takes while gates lent a light parent's slot still run writes it once, under the beside mutex, so no light parent lends its slot again and the gate waits only for the lends already made; it is replaced by `holds` when the lends have ended. A ticket without it reads as false, and a build that does not know the key ignores it |
 | `alone` | bool | optional, written only when true: a critical gate asked for `--alone`, from its first ticket on, kept by the holding rewrite. While a live ticket says it, the beside allowance is 0 for every gate. A ticket without it reads as false, and a build that does not know the key ignores it, so it treats the request as a plain critical one |
 | `remote` | bool | present and true only while queued for the remote pool |
+| `pool` | string | optional, after `remote`: the pool id of the `builders` entry's pool the ticket queues for; absent for `host`'s pool and for a local ticket, so their tickets are unchanged. A build that does not know the key ignores it and counts the ticket as `host`'s, so every gate on a machine is reinstalled together |
 | `reason` | string | optional: the free text the run gave `--reason`; absent when it gave none. A critical (and therefore alone) run always has one, since it is required; a critical gate's rewritten holding ticket keeps it |
 | `expected` | object | optional, last: the same object as a claim's `expected`, written when the gate has history for its command; a critical gate's rewritten holding ticket keeps it; `null` reads as absent |
 
@@ -1139,7 +1144,7 @@ The optional `builders` is an array of further builders that a routed run can go
 
 A bad entry, an alias that repeats the top-level `host`, an earlier `builders` entry or a `hosts` entry in any ASCII letter case, or a `builders` that is not an array makes the whole file unusable: `gate: ignored <path>: builders[N]...; running locally`. The top-level `outputs` apply to `host` alone; a `builders` entry with no `outputs` brings nothing back when it is `macos` and uses the default output globs when it is `windows`.
 
-The transport, the payload layout, the path map, the remote pool and the PC's caches still use the Windows builder's constants for every builder, so a `builders` entry must not stand in a live `remote.json` until they follow the entry's `os` and `root` (GATE-606).
+The transport, the payload layout, the path map and the PC's caches still use the Windows builder's constants for every builder, so a `builders` entry must not stand in a live `remote.json` until they follow the entry's `os` and `root` (GATE-606).
 
 `warmup` is an array of repo names, matched in any letter case, that consent to the repo's `.gate/warmup.toml` warming its builder work folders (`Config::warmup_consented`); a repo it does not name, or a file without the key, has no consent.
 

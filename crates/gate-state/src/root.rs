@@ -4,6 +4,8 @@
 //! slots. Paths are compared as Windows compares them, but by string rules alone, so this module builds and tests on
 //! every platform.
 
+use std::fmt;
+
 use sha2::{Digest, Sha256};
 
 const VERBATIM_PREFIX: &str = r"\\?\";
@@ -60,6 +62,36 @@ pub fn default_root(local_app_data: &str) -> String {
     format!(r"{}\gate\v1", local_app_data.trim_end_matches(['\\', '/']))
 }
 
+/// The id of a `builders` entry's own remote pool: the first 8 lower-case hex digits of the SHA-256 of the lower-cased
+/// alias, as `remote.json`'s reader computes it. `host`'s pool has none.
+/// It shows as those 8 digits.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PoolId(u32);
+
+impl PoolId {
+    /// `text` as a pool id when it is exactly 8 lower-case hex digits; else `None`.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<PoolId> {
+        let lower_hex = text.len() == 8 && text.bytes().all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f'));
+        if !lower_hex {
+            return None;
+        }
+        u32::from_str_radix(text, 16).ok().map(PoolId)
+    }
+}
+
+impl fmt::Display for PoolId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:08x}", self.0)
+    }
+}
+
+impl fmt::Debug for PoolId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "PoolId({self})")
+    }
+}
+
 /// A kernel object a gate names under its state root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelObject {
@@ -67,8 +99,10 @@ pub enum KernelObject {
     HeavySlot(u32),
     /// A light slot's mutex, by index.
     LightSlot(u32),
-    /// A remote slot's mutex, by index.
+    /// A slot's mutex of `host`'s remote pool, by index.
     RemoteSlot(u32),
+    /// A slot's mutex of a `builders` entry's own remote pool, by the pool's id and the slot's index.
+    PooledRemoteSlot { pool: PoolId, index: u32 },
     /// The critical gates' mutex.
     Critical,
     /// The mutex a light gate behind a critical request holds while it counts the light gates beside the request, takes
@@ -97,6 +131,7 @@ impl KernelObject {
             KernelObject::HeavySlot(index) => format!("slot-{index}"),
             KernelObject::LightSlot(index) => format!("light-slot-{index}"),
             KernelObject::RemoteSlot(index) => format!("remote-slot-{index}"),
+            KernelObject::PooledRemoteSlot { pool, index } => format!("remote-{pool}-slot-{index}"),
             KernelObject::Critical => "critical".to_owned(),
             KernelObject::CriticalBeside => "critical-beside".to_owned(),
             KernelObject::Journal => "journal".to_owned(),
@@ -114,9 +149,11 @@ impl KernelObject {
     #[must_use]
     pub fn claim_file_name(self) -> Option<String> {
         match self {
-            KernelObject::HeavySlot(_) | KernelObject::LightSlot(_) | KernelObject::RemoteSlot(_) | KernelObject::Critical => {
-                Some(format!("gate-{}.json", self.suffix()))
-            }
+            KernelObject::HeavySlot(_)
+            | KernelObject::LightSlot(_)
+            | KernelObject::RemoteSlot(_)
+            | KernelObject::PooledRemoteSlot { .. }
+            | KernelObject::Critical => Some(format!("gate-{}.json", self.suffix())),
             KernelObject::CriticalBeside
             | KernelObject::Journal
             | KernelObject::WakeEvent { .. }

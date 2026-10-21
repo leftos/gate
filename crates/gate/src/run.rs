@@ -52,7 +52,7 @@ use crate::outputs::{stale, walk::walk};
 use crate::remote::{self, KEY_WAIT_SLICE, KeyWait, RemoteCall, RemoteClient, RemoteOutcome, Split, git};
 use crate::resolve::{Environment, ResolvedRoot};
 use crate::route::{self, Placed};
-use crate::slots::{self, ClaimOf, LendMarker, Pool, Survey, Taken, Takes, ThisGate, epoch_ms};
+use crate::slots::{self, BuilderPool, ClaimOf, LendMarker, Pool, Survey, Taken, Takes, ThisGate, epoch_ms};
 use crate::stopping::{TERMINATE_CHECK, failure};
 use crate::wait::{self, Arrival, Host, UnderParent, Wait, Waited};
 use crate::warm;
@@ -1264,7 +1264,7 @@ impl Run<'_> {
         // The key lock reads neither figure of the call; no take has resolved them yet. A sibling that fails its check
         // again sends nothing: the run falls back here before it takes the lock or a slot.
         let key = self.take_key(remote, console)?;
-        let figures = match self.take(Pool::Remote(remote.builder.slots), None, &mut hold.taken, console) {
+        let figures = match self.take(Pool::Remote(BuilderPool::of(&remote.builder)), None, &mut hold.taken, console) {
             Taking::Took(took, figures) => {
                 hold.took = took;
                 figures
