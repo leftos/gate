@@ -29,7 +29,7 @@ mod watch;
 pub use config::{Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAULT_OUTPUTS, ignored_line, is_unix_root, is_usable_host};
 pub use decide::{
     BuildSettings, BuildTarget, BuilderWords, CarriedSibling, DROPPED_NO_BUILD_LINE, DotnetTarget, Facts, FolderId, Inputs, LaterCandidate,
-    LocalReason, NO_OUTPUTS_LINE, OUTPUT_PROPERTIES, PROJECT_EXTENSIONS, Place, RemoteRun, Route, SendPlan, SiblingFolder, Slot, Target,
+    LocalReason, NO_OUTPUTS_LINE, OUTPUT_PROPERTIES, PROJECT_EXTENSIONS, PinRefusal, Place, RemoteRun, Route, SendPlan, SiblingFolder, Slot, Target,
     build_settings, builder_words, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, later_run, names_program, sdk_build_target,
     sibling_root, stays_local, target, without_no_build,
 };

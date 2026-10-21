@@ -204,7 +204,7 @@ pub(crate) struct RunBuilder {
     cutover_seams: CutoverSeams,
     /// `gate push`'s own seams, `--test-push-ssh`, `--test-push-bound-ms` and `--test-push-register`.
     push_seams: PushSeams,
-    /// `gate check`'s `--builder <host>`.
+    /// `--builder <host>`: `gate check`'s builder, or the one builder a run is pinned to.
     builder: Option<String>,
     /// `gate check`'s own seams (`CheckSeams`); its builder seams are read into `test_seams`, as a run's are.
     check_seams: CheckSeams,
@@ -480,6 +480,7 @@ impl RunBuilder {
         if self.alone && self.slot.is_some_and(|slot| slot != Slot::Critical) {
             self.problems.push(Problem::AloneNeedsCritical(spelling));
         }
+        self.check_builder_routes();
         if !self.given.contains(&RunOption::Value(ValueOption::Reason)) {
             let local = self.local;
             let critical = self.slot == Some(Slot::Critical);
@@ -509,6 +510,7 @@ impl RunBuilder {
                 no_markers: self.no_markers,
                 local: self.local,
                 alone: self.alone,
+                builder: self.builder,
                 reason: self.reason,
                 bring_tracked: self.bring_tracked,
                 env: self.env,
@@ -521,6 +523,22 @@ impl RunBuilder {
             }),
             _ => Err(self.problems),
         }
+    }
+
+    /// Refuses a `--builder` pin on a run that can never route: one given `--local`, or one on a slot other than heavy.
+    fn check_builder_routes(&mut self) {
+        let Some(host) = &self.builder else {
+            return;
+        };
+        let why = if self.local {
+            "--local keeps it here".to_owned()
+        } else {
+            match self.slot {
+                Some(slot) if slot != Slot::Heavy => format!("only a heavy run routes, and this one is --slot {}", slot.as_str()),
+                _ => return,
+            }
+        };
+        self.problems.push(Problem::BuilderCannotRoute { host: host.clone(), why });
     }
 
     /// Refuses the `--env` pairs: more pairs or bytes than its cap ([`values::over_cap`]), counted over the accepted

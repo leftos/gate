@@ -29,7 +29,7 @@ pub(crate) enum Pool {
     Remote(BuilderPool),
 }
 
-/// A builder's remote pool: its size and its id, `None` for `host`'s pool.
+/// A builder's remote pool: its size and its id, which a `builders` or `hosts` entry's pool has and `host`'s lacks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BuilderPool {
     pub slots: u32,
@@ -37,7 +37,8 @@ pub(crate) struct BuilderPool {
 }
 
 impl BuilderPool {
-    /// The remote pool of `builder`: its slots, and its id for a `builders` entry.
+    /// The remote pool of `builder`: its slots, and its id for a `builders` or `hosts` entry ([`Builder::id`]); `host`'s
+    /// pool has none.
     pub(crate) fn of(builder: &Builder) -> BuilderPool {
         let id = builder.id.as_deref().map(|text| {
             PoolId::parse(text).unwrap_or_else(|| unreachable!("remote.json's reader gives a builder's id as 8 lower-case hex digits, not {text:?}"))

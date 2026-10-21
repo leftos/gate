@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 use crate::durations::seed;
 use crate::nesting::{marked, test_marker};
+use crate::routing::{HOST, routed_case, routed_words, stub};
 use crate::support::{
     Case, FAKE_TOOL, GATE, POLL, Running, UNTIL_KILLED, USAGE, assert_in_order, critical_words, events, events_of, finish, heavy_words, none_words,
     run_words, shown, start, take_of, wait_for_file, wait_for_journal_line, wait_until, write_counts,
@@ -610,6 +611,36 @@ fn a_parent_on_the_highest_light_slot_lends_while_a_critical_request_drains() {
         "a parent lends whatever light slot it holds, so the child journals no queue"
     );
     assert_eq!(events_of(&case, critical_pid), ["queue"], "the child ran while the critical gate drains");
+    let_go(&go);
+    assert_passed(&critical.finish());
+    assert_passed(&held.finish());
+}
+
+/// A run pinned with `--builder` asks its light parent for no lend: while a critical request drains, it routes to its
+/// builder as it does at any other time.
+#[test]
+fn a_pinned_run_under_a_light_parent_routes_while_a_critical_request_drains() {
+    let case = routed_case("a_pinned_run_under_a_light_parent_routes_while_a_critical_request_drains");
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":4}"#);
+    let go = case.folder().join("go");
+    let go_word = shown(&go);
+    let local = ["--local", "--reason", "holds the heavy slot here"];
+    let held = holder(&case, &heavy_words("holder.log", &local, &[FAKE_TOOL, "wait", &go_word, "exit", "0"]));
+    let critical = case.start(&critical_words("critical.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
+    critical.wait_for_stderr(WAITING);
+    write_claim(&case, KernelObject::LightSlot(3), ClaimKind::Light, (process::id(), own_start()));
+
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let words = routed_words("child.log", &steps, &["--builder", HOST], &[r".\tool.exe", "out", "ran there"]);
+    let outcome = finish(marked(&case, &words, &test_marker(&case, "light")));
+
+    assert_passed(&outcome);
+    assert!(
+        !outcome.stderr.contains(&lent(process::id())),
+        "the pinned run is lent nothing: {outcome:?}"
+    );
+    assert!(call.exists(), "the builder ran the command: {outcome:?}");
     let_go(&go);
     assert_passed(&critical.finish());
     assert_passed(&held.finish());

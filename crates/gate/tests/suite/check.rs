@@ -1817,6 +1817,29 @@ fn check_builder_of_a_macos_entry_calls_its_gate_box_and_names_its_root() {
     assert_eq!(lines, "mac-1 /Users/b/gate-remote/bin/gate-box box preflight --stdin\n");
 }
 
+/// A `builders` entry marked `"routed": false`, which lists no repo, is checked as any `builders` entry is: its own
+/// `gate-box` under its own root.
+#[test]
+fn check_builder_finds_a_not_routed_macos_entry() {
+    let case = builder_case("check_builder_not_routed");
+    write_remote_json(
+        &case,
+        r#"{"host": "builder-1", "repos": {"app": ["*"]},
+            "builders": [{"host": "mac-9", "os": "macos", "root": "/Users/t/gate-remote", "routed": false}]}"#,
+    );
+    let steps = ssh_steps(&case, "ssh", &["exit 1"]);
+
+    let outcome = check_builder(&case, "mac-9", &[], &steps);
+
+    assert_eq!(
+        outcome.stderr, "check: mac-9: preparing /Users/t/gate-remote failed (status 1)\n",
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let lines = fs::read_to_string(crate::support::beside(&steps, ".lines")).expect("the stand-in kept the call's line");
+    assert_eq!(lines, "mac-9 /Users/t/gate-remote/bin/gate-box box preflight --stdin\n");
+}
+
 /// The first check readies the work folder a routed run of the repo would, and says the bare repository it created; a
 /// second creates nothing and says nothing of it. The builder root holds only what a routed run's preflight makes.
 #[test]

@@ -980,6 +980,7 @@ mod tests {
             no_markers: false,
             local: false,
             alone: false,
+            builder: None,
             reason: None,
             bring_tracked: Vec::new(),
             env: Vec::new(),

@@ -691,6 +691,80 @@ fn a_repo_listed_only_in_a_builders_entry_is_routed() {
     assert!(!config.is_routed("other"));
 }
 
+#[test]
+fn a_builder_entry_marked_not_routed_is_read_with_no_repos() {
+    for entry in [
+        r#"[{"host": "mac-1", "os": "macos", "root": "/m", "routed": false}]"#,
+        r#"[{"host": "mac-1", "os": "macos", "root": "/m", "Routed": false, "repos": {}}]"#,
+    ] {
+        let config = Config::parse(&builders_file(entry)).expect("usable");
+        let mac = config.builder("MAC-1").expect("a not-routed entry is still a builder");
+        assert_eq!(
+            (mac.alias.as_str(), mac.os, mac.root.as_deref()),
+            ("mac-1", BuilderOs::Macos, Some("/m")),
+            "{entry}"
+        );
+        assert_eq!(config.builder_entries().count(), 1, "{entry}");
+    }
+    let routed = Config::parse(&builders_file(r#"[{"host": "mac-1", "os": "macos", "root": "/m", "routed": true}]"#));
+    assert_eq!(
+        routed.err(),
+        Some("builders[0].repos is missing".to_owned()),
+        "a routed entry still needs its repos"
+    );
+}
+
+#[test]
+fn a_not_routed_builder_is_not_among_the_routes() {
+    let config = Config::parse(&builders_file(
+        r#"[{"host": "mac-1", "os": "macos", "root": "/m", "routed": false, "repos": {"Solo": ["*"]}},
+            {"host": "mac-2", "os": "macos", "root": "/n", "routed": true, "repos": {"pair": ["*"]}}]"#,
+    ))
+    .expect("usable");
+    assert!(!config.is_routed("solo"), "only the not-routed entry lists it");
+    assert!(config.is_routed("pair"), "routed: true is the default's meaning");
+    assert!(config.builder("mac-1").is_some());
+}
+
+#[test]
+fn routed_must_be_a_boolean() {
+    for value in ["\"false\"", "0", "null", "[]"] {
+        let file = builders_file(&format!(
+            r#"[{{"host": "mac-1", "os": "macos", "root": "/m", "routed": {value}, "repos": {{"gate": ["x"]}}}}]"#
+        ));
+        assert_eq!(reason(&file), "builders[0].routed must be true or false", "{value}");
+    }
+}
+
+#[test]
+fn a_repo_listed_only_by_a_not_routed_entry_is_listed_but_not_routed() {
+    let config = Config::parse(&builders_file(
+        r#"[{"host": "mac-1", "os": "macos", "root": "/m", "routed": false, "repos": {"Solo": ["*"]}}]"#,
+    ))
+    .expect("usable");
+    assert!(config.lists("solo"), "a not-routed entry's repos list it");
+    assert!(!config.is_routed("solo"));
+    assert!(config.lists("gate"), "the top-level repos list it");
+    assert!(!config.lists("other"));
+}
+
+#[test]
+fn a_pin_to_a_builders_entry_is_found_beside_an_unusable_hosts_value() {
+    let config = Config::parse(
+        r#"{"host": "builder-1", "hosts": ["a b"], "repos": {"gate": ["x"]},
+            "builders": [{"host": "mac-1", "os": "macos", "root": "/m", "routed": false}]}"#,
+    )
+    .expect("usable for routing");
+    let found = |host: &str| config.named_builder(host).map(|builder| builder.map(|builder| builder.alias));
+    assert_eq!(found("MAC-1"), Ok(Some("mac-1".to_owned())), "a builders entry");
+    assert_eq!(found("Builder-1"), Ok(Some("builder-1".to_owned())), "host");
+    assert_eq!(
+        found("win-7"),
+        Err("hosts entries must each be an ssh alias or user@host of letters, digits, '.', '_' and '-', not starting with '-'"),
+        "a name found nowhere else is refused for why hosts cannot be used"
+    );
+}
+
 /// A Windows entry's root reaches the payload, the push URL, git's pack command and the `PathMap` word as written, so
 /// it is held to the names the builder lays out, joined by `\`: a character pwsh, cmd or `MSBuild` reads, a `/`, or a
 /// device name refuses the file.

@@ -315,6 +315,13 @@ impl Nesting {
         }
     }
 
+    /// Whether routing asks for this gate as one a parent's slot covers, which never routes: a gate a parent's slot
+    /// covers, unless that parent is the commit run whose hooks it runs in ([`Nesting::under_commit`]), which routes as
+    /// one under no parent, and a gate inside a box run.
+    pub(crate) fn routes_as_covered(&self) -> bool {
+        (self.covering().is_some() && self.under_commit().is_none()) || matches!(self, Nesting::InBox)
+    }
+
     /// Whether this gate runs inside the hooks of a live commit run, whether its slot covers the gate, refuses it or
     /// does not cover it ([`Nesting::marked_for_commit`]).
     pub(crate) fn in_commit(&self) -> bool {

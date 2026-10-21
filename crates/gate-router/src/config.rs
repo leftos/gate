@@ -54,17 +54,19 @@ pub struct Builder {
     pub root: Option<String>,
     /// The builder's remote pool size.
     pub slots: u32,
-    /// The first 8 lower-case hex digits of the SHA-256 of the lower-cased alias for a `builders` entry; `None` for
-    /// `host`.
+    /// The first 8 lower-case hex digits of the SHA-256 of the lower-cased alias for a `builders` entry and for a `hosts`
+    /// entry ([`Config::named_builder`]), so neither shares `host`'s remote pool or hash caches; `None` for `host`.
     pub id: Option<String>,
 }
 
-/// A `builders` entry: the builder, the repos it runs with their patterns, and its own output globs.
+/// A `builders` entry: the builder, the repos it runs with their patterns, its own output globs, and whether a pick
+/// may send a run to it; a not-routed entry is reached only by a run pinned to it, `gate push` and `gate check`.
 #[derive(Debug, Clone)]
 struct BuilderEntry {
     builder: Builder,
     repos: RepoTable,
     outputs: RepoTable,
+    routed: bool,
 }
 
 /// A usable routing file.
@@ -324,17 +326,53 @@ impl Config {
             .find(|builder| builder.alias.eq_ignore_ascii_case(alias))
     }
 
+    /// The builder the file lists as `host` in any ASCII letter case, its alias as the file spells it: `host`, a `hosts`
+    /// entry, or a `builders` entry, routed or not. A `hosts` entry that is no `builders` entry is a Windows builder with
+    /// the default root and the top-level slots, as `host` is, and an id of its own as a `builders` entry has, so its
+    /// remote pool and its hash caches are not `host`'s. `host` and the `builders` entries are looked at first, so an
+    /// unusable `hosts` value refuses only a name found nowhere else. `Ok(None)` for a host the file does not list.
+    /// What `gate run --builder` and `gate check --builder` both name a builder by.
+    ///
+    /// # Errors
+    ///
+    /// Why `hosts` cannot be used ([`Config::builders`]), for a host that is neither `host` nor a `builders` entry.
+    pub fn named_builder(&self, host: &str) -> Result<Option<Builder>, &str> {
+        if let Some(builder) = self.builder(host) {
+            return Ok(Some(builder.clone()));
+        }
+        let in_hosts = self.builders()?.iter().find(|alias| alias.eq_ignore_ascii_case(host));
+        Ok(in_hosts.map(|alias| Builder {
+            alias: alias.clone(),
+            os: BuilderOs::Windows,
+            root: None,
+            slots: self.slots(),
+            id: Some(builder_id(alias)),
+        }))
+    }
+
+    /// The patterns `builder`'s own listing gives `repo`: its `builders` entry's `repos`, routed or not, or the top-level
+    /// `repos` for `host`; `None` when that listing does not name the repo, and for a `hosts` entry, which lists none.
+    pub(crate) fn own_patterns(&self, builder: &Builder, repo: &str) -> Option<&[Pattern]> {
+        match self.entries.iter().find(|entry| entry.builder == *builder) {
+            Some(entry) => find(&entry.repos, repo),
+            None if *builder == self.host => self.patterns(repo),
+            None => None,
+        }
+    }
+
     /// `host` as a builder.
     pub(crate) fn host_builder(&self) -> &Builder {
         &self.host
     }
 
     /// The builders that may run `repo`'s commands, in the order a command's pick tries them, each with the patterns
-    /// listed for the repo: each `builders` entry whose `repos` lists it, in file order, then `host` when `repos` does.
+    /// listed for the repo: each routed `builders` entry whose `repos` lists it, in file order, then `host` when `repos`
+    /// does. An entry marked `"routed": false` is never among them.
     pub(crate) fn routes(&self, repo: &str) -> Vec<(&Builder, &[Pattern])> {
         let entries = self
             .entries
             .iter()
+            .filter(|entry| entry.routed)
             .filter_map(|entry| find(&entry.repos, repo).map(|patterns| (&entry.builder, patterns)));
         entries.chain(self.patterns(repo).map(|patterns| (&self.host, patterns))).collect()
     }
@@ -346,14 +384,20 @@ impl Config {
         !self.routes(repo).is_empty()
     }
 
-    /// The output globs listed for `repo` on `builder`: the top-level `outputs` for `host`, the entry's own `outputs`
-    /// for a `builders` entry; `None` when that list does not name the repo.
+    /// Whether any listing names `repo`, matched in any letter case: the top-level `repos`, or a `builders` entry's
+    /// `repos`, routed or not. A repo only a not-routed entry lists is reached only by a run pinned to that entry.
+    #[must_use]
+    pub fn lists(&self, repo: &str) -> bool {
+        self.patterns(repo).is_some() || self.entries.iter().any(|entry| find(&entry.repos, repo).is_some())
+    }
+
+    /// The output globs listed for `repo` on `builder`: the entry's own `outputs` for a `builders` entry, the top-level
+    /// `outputs` for `host` and a `hosts` entry; `None` when that list does not name the repo.
     pub(crate) fn own_outputs_on(&self, builder: &Builder, repo: &str) -> Option<Vec<String>> {
-        if builder.id.is_none() {
-            return self.own_outputs(repo);
+        match self.entries.iter().find(|entry| entry.builder == *builder) {
+            Some(entry) => find(&entry.outputs, repo).map(globs_text),
+            None => self.own_outputs(repo),
         }
-        let entry = self.entries.iter().find(|entry| entry.builder == *builder)?;
-        find(&entry.outputs, repo).map(globs_text)
     }
 
     /// The patterns `repos` lists for `repo`, matched in any letter case, or `None` when it does not list it.
@@ -667,7 +711,8 @@ fn named_already(alias: &str, host: &str, hosts: &[(usize, &str)], entries: &[Bu
 
 /// One `builders` entry, its reasons starting with `prefix` (`builders[0].`): `host` checked as the top-level one is,
 /// `os` `windows` or `macos` in any ASCII letter case, `root` ([`read_builder_root`]), `slots` as the top-level one,
-/// `repos` an object naming at least one repo and `outputs` as the top-level one.
+/// `routed` `true` (the default) or `false`, `repos` an object naming at least one repo, which a not-routed entry may
+/// leave empty or missing, and `outputs` as the top-level one.
 fn read_builder_entry(object: &Map<String, Value>, prefix: &str) -> Result<BuilderEntry, String> {
     let host = property(object, "host").ok_or_else(|| format!("{prefix}host is missing"))?;
     let alias = checked_host(host, &HOST_REFUSALS).map_err(|reason| format!("{prefix}{reason}"))?;
@@ -679,8 +724,13 @@ fn read_builder_entry(object: &Map<String, Value>, prefix: &str) -> Result<Build
     };
     let root = read_builder_root(object, os, prefix)?;
     let slots = read_slots(object, prefix)?;
-    let repos = read_table(object, "repos", true, prefix)?;
-    if repos.is_empty() {
+    let routed = match property(object, "routed") {
+        None => true,
+        Some(Value::Bool(routed)) => *routed,
+        Some(_) => return Err(format!("{prefix}routed must be true or false")),
+    };
+    let repos = read_table(object, "repos", routed, prefix)?;
+    if routed && repos.is_empty() {
         return Err(format!("{prefix}repos must name at least one repo"));
     }
     let outputs = read_table(object, "outputs", false, prefix)?;
@@ -689,6 +739,7 @@ fn read_builder_entry(object: &Map<String, Value>, prefix: &str) -> Result<Build
         builder: Builder { alias, os, root, slots, id },
         repos,
         outputs,
+        routed,
     })
 }
 

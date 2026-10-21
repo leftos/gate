@@ -3190,6 +3190,32 @@ fn a_gate_started_inside_a_box_run_keeps_its_ceiling_and_takes_no_slot() {
     assert_took_no_slot(&case, "inner");
 }
 
+/// A gate pinned with `--builder` inside a box run is refused as one under a covering parent's slot is: exit 2, said
+/// before it readies its log, journals or runs anything.
+#[test]
+fn a_pinned_gate_inside_a_box_run_is_refused() {
+    let case = Case::new("box_inner_gate_pinned");
+    let mut words = inner_gate(&case, "inner", "heavy", "120", &owned(&[FAKE_TOOL, "out", "inner ran"]));
+    let command = words.iter().position(|word| word == "--").expect("the words have a command");
+    words.splice(command..command, ["--builder", "mac-1"].map(str::to_owned));
+
+    let outcome = box_run_of(&case, &words);
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    let said = format!("{}{}", outcome.stdout, outcome.stderr);
+    assert!(
+        said.lines()
+            .any(|line| line == "gate: --builder mac-1 cannot route this run: a parent gate's slot covers this gate"),
+        "{outcome:?}"
+    );
+    assert!(!said.contains("inner ran"), "the command never ran: {outcome:?}");
+    assert!(!case.folder().join("inner.log").exists(), "the inner gate readied no log");
+    assert!(
+        !case.folder().join("inner-state").join("events.jsonl").exists(),
+        "the inner gate journals nothing"
+    );
+}
+
 #[test]
 fn a_gate_started_inside_a_box_run_passes_its_command_s_status() {
     let case = Case::new("box_inner_gate_passes");

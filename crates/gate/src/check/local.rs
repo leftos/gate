@@ -698,10 +698,6 @@ fn sibling(root: &str, name: String) -> Sibling {
     }
 }
 
-/// The sibling names this PC's routing file allows the repo `repo`, as routing reads them
-/// ([`gate_router::Config::allowed_siblings`], an exact match), or why its `siblings` value cannot be used, which
-/// allows none. `None` when routing would never route the repo, so asks no consent: no routing file, one routing
-/// ignores, or one whose `repos` does not list it.
 /// Why this PC's routing file's `hooks` value cannot be used, if it cannot: the reason the router's `hooks_allowed`
 /// gives, whatever the repo. A routing file that cannot be read at all is no such problem, as its own line says it.
 fn hooks_problem(repo: &str) -> Option<String> {
@@ -712,10 +708,15 @@ fn hooks_problem(repo: &str) -> Option<String> {
     config.hooks_allowed(repo).err().map(str::to_owned)
 }
 
+/// The sibling names this PC's routing file allows the repo `repo`, as routing reads them
+/// ([`gate_router::Config::allowed_siblings`], an exact match), or why its `siblings` value cannot be used, which
+/// allows none. `None` when no run of the repo would ever route, so asks no consent: no routing file, one routing
+/// ignores, or one no listing names the repo in, a `builders` entry's routed or not ([`gate_router::Config::lists`]),
+/// since a run pinned to a not-routed entry that lists the repo needs the consent too.
 fn allowed_siblings(repo: &str) -> Option<Result<Vec<String>, String>> {
     let path = route::remote_json_path(std::env::var_os("LOCALAPPDATA").as_deref())?;
     let config = route::read_remote_json(&path).ok().flatten()?;
-    if !config.is_routed(repo) {
+    if !config.lists(repo) {
         return None;
     }
     Some(config.allowed_siblings(repo).map(<[String]>::to_vec).map_err(str::to_owned))

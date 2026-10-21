@@ -99,6 +99,16 @@ List each further builder in `remote.json`'s `builders` array, beside `host`. A 
 
 Which refusals hand the run on, the order, the one wait shared by every builder and the lines the run says are in [design.md, The next builder](design.md#routing); a repo owner adds nothing beyond the list.
 
+A new builder is trialled before it joins that list ([Trialling a new builder](#trialling-a-new-builder)).
+
+### Trialling a new builder
+
+Add the builder as a `builders` entry with `"routed": false` (its `os`, `root` and `slots`; `repos` may stay empty or missing). No unpinned run picks or tries a not-routed builder, so the repos' ordinary runs are unaffected. Then run `gate push`, and `gate check --builder <alias>` from the repo.
+
+Route trial commands to it with `gate run --builder <alias> --slot heavy -- <command>`. The pin needs the repo listed in `remote.json` and a command matching its patterns there; list the repo under the not-routed entry itself to trial it on patterns of its own, without routing it anywhere else. A refusal or an unreachable builder fails the run (exit 1) instead of running here, so a trial that passes ran on the new builder.
+
+Once the trials are clean, set `routed` to `true` (or drop the key) and list the repos the builder runs ([design.md, remote.json](design.md#remotejson)).
+
 ## The routing trial
 
 A trial runs the repo's full command routed, once, and assumes a local run passes: it never runs the full command locally to compare. If the routed run fails, only the failing steps or tests are rerun locally, with the narrowest command that reproduces them:
@@ -180,7 +190,7 @@ A crash loses data that was not yet written to every drive at once. NTFS can kee
 
 A reboot, an install that needs one, or any other work that would break a run on the builder starts by draining it, never by waiting for it to go idle while it stays in `remote.json`: new runs keep arriving, so that wait has no end.
 
-1. Back up `remote.json` beside it (`remote.json.bak-<UTC stamp>`) and save the builder's exact entry. Then, in one quick read-modify-write, take the builder out by removing `host`: routed runs go to `host` or a `builders` entry, and `hosts` names only the builders `gate push` and `gate check --builder` reach. With no `host` left, every gate on the PC runs here and says the routing file is unusable, which is expected while the builder is out.
+1. Back up `remote.json` beside it (`remote.json.bak-<UTC stamp>`) and save the builder's exact entry. Then, in one quick read-modify-write, take the builder out by removing `host`: routed runs go to `host` or a `builders` entry, and `hosts` names only the builders `gate push`, `gate check --builder` and a pinned `gate run --builder` reach. With no `host` left, every gate on the PC runs here and says the routing file is unusable, which is expected while the builder is out.
 2. Wait for the runs already on the builder to end. No `gate.exe` box process and no routed command may still be live under the builder user, besides your own ssh session. There is no cutoff, since each routed run ends at its own ceiling. A run still live past the longest routed ceiling is looked into, never cut off by the reboot.
 3. Do the work. After a reboot, confirm that the console session logged back on (autologon), which the desktop route needs.
 4. Put the builder back with the saved entry, in a read-modify-write that keeps every other key as it stands then, and check it with `gate check --builder <host>`. If anything blocks the work partway, put the builder back first, so routing never stays off.

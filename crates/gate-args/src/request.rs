@@ -419,6 +419,8 @@ pub struct RunRequest {
     pub local: bool,
     /// `--alone`, given only with `--slot critical`: the critical gate holds the machine alone, light slots included.
     pub alone: bool,
+    /// `--builder <host>` as given: the one builder this run may go to, never another and never this PC.
+    pub builder: Option<String>,
     /// The `--reason` text the caller gave, recorded with the run; required when `local` or a critical slot.
     pub reason: Option<String>,
     /// The `--bring-tracked` globs, in the order given: a fetched output git tracks is installed only when one matches it.

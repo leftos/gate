@@ -131,6 +131,11 @@ pub enum Problem {
     },
     /// `--alone` given with a slot other than critical, in the caller's spelling.
     AloneNeedsCritical(Spelling),
+    /// `--builder <host>` given on a run that can never route, for `why`: `--local`, or a slot other than heavy.
+    BuilderCannotRoute {
+        host: String,
+        why: String,
+    },
     /// A run that must state its reason (`local`, `slot critical`, or both) and gave no `--reason`, in the caller's
     /// spelling.
     ReasonNeeded {
@@ -229,6 +234,7 @@ impl fmt::Display for Problem {
             Problem::SeamNeeds { option, needs } => write!(f, "gate: {option} needs {needs}"),
             Problem::AloneNeedsCritical(Spelling::Cli) => f.write_str("gate: --alone needs --slot critical"),
             Problem::AloneNeedsCritical(Spelling::Compat) => f.write_str("gate: -Alone needs -Slot critical"),
+            Problem::BuilderCannotRoute { host, why } => write!(f, "gate: --builder {} cannot route this run: {why}", escaped(host)),
             Problem::ReasonNeeded { local, critical, spelling } => f.write_str(match (local, critical, spelling) {
                 (true, false, Spelling::Cli) => "gate: --local needs --reason \"<why>\"",
                 (false, true, Spelling::Cli) => "gate: --slot critical needs --reason \"<why>\"",

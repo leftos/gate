@@ -217,6 +217,7 @@ fn a_routed_queue_line_ends_with_the_remote_fields_as_the_fixture_does() {
         log: r"C:\work\repo\.tmp\remote-ok.log".to_owned(),
         not_routed: None,
         reason: None,
+        pinned: false,
     };
     let line = journal_line(&identity(), ts(NOW), &queue, Some(&tag()), None);
 
@@ -230,6 +231,7 @@ fn a_queue_kept_local_writes_not_routed_after_the_log() {
         log: r"C:\work\repo\.tmp\local.log".to_owned(),
         not_routed: Some("--local".to_owned()),
         reason: None,
+        pinned: false,
     };
     let line = journal_line(&identity(), ts(NOW), &queue, None, None);
 
@@ -246,6 +248,7 @@ fn a_queue_with_a_reason_writes_it_after_not_routed() {
         log: "x".to_owned(),
         not_routed: Some("--local".to_owned()),
         reason: Some("checking routing".to_owned()),
+        pinned: false,
     };
     let line = journal_line(&identity(), ts(NOW), &queue, None, None);
 
@@ -256,8 +259,27 @@ fn a_queue_with_a_reason_writes_it_after_not_routed() {
         log: "x".to_owned(),
         not_routed: None,
         reason: Some("checking routing".to_owned()),
+        pinned: false,
     };
     assert_eq!(own_keys(&journal_line(&identity(), ts(NOW), &without, None, None)), ["log", "reason"]);
+}
+
+#[test]
+fn a_pinned_run_s_queue_line_says_pinned() {
+    let queue = |pinned: bool| JournalEvent::Queue {
+        log: "x".to_owned(),
+        not_routed: None,
+        reason: Some("trial".to_owned()),
+        pinned,
+    };
+    let line = journal_line(&identity(), ts(NOW), &queue(true), None, None);
+    assert_eq!(own_keys(&line), ["log", "reason", "pinned"]);
+    assert_eq!(parsed(&line)["pinned"], true);
+    assert_eq!(
+        own_keys(&journal_line(&identity(), ts(NOW), &queue(false), None, None)),
+        ["log", "reason"],
+        "an unpinned run writes no pinned field"
+    );
 }
 
 #[test]
@@ -467,6 +489,7 @@ fn a_line_without_a_remote_tag_has_no_remote_field() {
             log: "x".to_owned(),
             not_routed: None,
             reason: None,
+            pinned: false,
         },
         JournalEvent::Take {
             slots: Vec::new(),
@@ -507,6 +530,7 @@ fn line_starts_with_v_then_the_common_keys_in_order() {
             log: r"C:\work\repo\.tmp\f1.log".to_owned(),
             not_routed: None,
             reason: None,
+            pinned: false,
         },
         None,
         None,
@@ -596,6 +620,7 @@ fn time_has_seven_fractional_digits_and_z() {
             log: "x".to_owned(),
             not_routed: None,
             reason: None,
+            pinned: false,
         },
         None,
         None,
@@ -612,6 +637,7 @@ fn time_has_seven_fractional_digits_and_z() {
             log: "x".to_owned(),
             not_routed: None,
             reason: None,
+            pinned: false,
         },
         None,
         None,
@@ -1070,6 +1096,7 @@ fn journal_line_lists_the_lock_on_a_queue_line() {
             log: "x".to_owned(),
             not_routed: None,
             reason: None,
+            pinned: false,
         },
         None,
         Some(r"Local\gate-test-journal"),
@@ -1115,6 +1142,7 @@ fn a_line_appended_under_an_abandoned_journal_lock_lists_the_lock() {
                     log: "x".to_owned(),
                     not_routed: None,
                     reason: None,
+                    pinned: false,
                 },
                 None,
                 abandoned,

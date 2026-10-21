@@ -168,6 +168,7 @@ fn run_option(name: &str) -> Option<RunOption> {
         "no-markers" => RunOption::Switch(SwitchOption::NoMarkers),
         "local" => RunOption::Switch(SwitchOption::Local),
         "alone" => RunOption::Switch(SwitchOption::Alone),
+        "builder" => RunOption::Value(ValueOption::Builder),
         _ => return seam_option(name),
     };
     Some(option)

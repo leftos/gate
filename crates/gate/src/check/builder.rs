@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use gate_args::{BoxVerb, CheckRequest, CheckSeams};
-use gate_router::{Builder, BuilderOs, Place, escaped, repo_name, work_folder_key};
+use gate_router::{Builder, Place, escaped, repo_name, work_folder_key};
 use gate_win32::PipedConsole;
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
@@ -80,9 +80,7 @@ fn failed(console: &mut Console, line: &str) -> u32 {
     u32::from(FAILED_STATUS)
 }
 
-/// The builder `remote.json` lists as `host`, in `hosts` ([`gate_router::Config::builders`]) or as a `builders` entry
-/// ([`gate_router::Config::builder`]) that is `host` in any ASCII letter case, its alias as the file spells it: a
-/// `hosts` entry is a Windows builder with the default root and no id, as `host` is. Else the status and the line: 2
+/// The builder `remote.json` lists as `host` ([`gate_router::Config::named_builder`]). Else the status and the line: 2
 /// for a host it does not list, 1 for a routing file that is not there or cannot be used.
 fn listed(host: &str) -> Result<Builder, (u8, String)> {
     let cannot = |why: String| (FAILED_STATUS, format!("check: {}: remote.json {why}", escaped(host)));
@@ -93,18 +91,9 @@ fn listed(host: &str) -> Result<Builder, (u8, String)> {
         Ok(None) => return Err(cannot(format!("not found at {}", path.display()))),
         Err(problem) => return Err(cannot(format!("is ignored: {}", problem.reason))),
     };
-    let builders = config.builders().map_err(|why| cannot(format!("is ignored: {why}")))?;
-    let in_hosts = builders.iter().find(|builder| builder.eq_ignore_ascii_case(host)).map(|alias| {
-        config.builder(alias).cloned().unwrap_or_else(|| Builder {
-            alias: alias.clone(),
-            os: BuilderOs::Windows,
-            root: None,
-            slots: config.slots(),
-            id: None,
-        })
-    });
-    in_hosts
-        .or_else(|| config.builder(host).cloned())
+    config
+        .named_builder(host)
+        .map_err(|why| cannot(format!("is ignored: {why}")))?
         .ok_or_else(|| (USAGE_STATUS, format!("gate check: {} is not a builder remote.json lists", escaped(host))))
 }
 

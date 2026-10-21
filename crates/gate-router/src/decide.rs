@@ -148,6 +148,8 @@ pub struct Inputs<'a> {
     pub git_hook: bool,
     /// The command's words as given.
     pub words: &'a [String],
+    /// `--builder <host>`: the one builder the run may go to, as given; `None` for a run the pick routes.
+    pub pin: Option<&'a str>,
 }
 
 /// The gate's place in its git worktree.
@@ -327,6 +329,46 @@ pub enum Route {
     Local { reason: Option<LocalReason> },
     /// On the builder.
     Routed(Box<RemoteRun>),
+    /// Nowhere: a run pinned to one builder that cannot go to it, which the gate refuses before anything runs.
+    Refused(PinRefusal),
+}
+
+/// Why a run pinned to one builder with `--builder <host>` cannot go to it; `host` is as given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinRefusal {
+    /// The routing file is not there or cannot be used, for `why`.
+    NoConfig { why: String },
+    /// The routing file lists no builder `host`.
+    Unlisted { host: String },
+    /// The repo does not route the command, for `why`: it is not listed, or none of its patterns matches.
+    NotRouted { host: String, why: String },
+    /// The run cannot route at all, for `why`.
+    CannotRoute { host: String, why: String },
+}
+
+/// Why a pinned run on a covering parent's slot, or inside a box run, cannot route.
+const PIN_COVERED: &str = "a parent gate's slot covers this gate";
+
+impl PinRefusal {
+    /// The refusal of a run pinned to `host` that runs on a covering parent's slot or inside a box run.
+    #[must_use]
+    pub fn covered(host: &str) -> PinRefusal {
+        PinRefusal::CannotRoute {
+            host: host.to_owned(),
+            why: PIN_COVERED.to_owned(),
+        }
+    }
+
+    /// The line the gate says on standard error and in the log, the host shown [`escaped`].
+    #[must_use]
+    pub fn line(&self) -> String {
+        match self {
+            Self::NoConfig { why } => format!("gate: --builder needs a usable remote.json: {why}"),
+            Self::Unlisted { host } => format!("gate: --builder {} is not a builder remote.json lists", escaped(host)),
+            Self::NotRouted { host, why } => format!("gate: --builder {}: this command is not one the repo routes ({why})", escaped(host)),
+            Self::CannotRoute { host, why } => format!("gate: --builder {} cannot route this run: {why}", escaped(host)),
+        }
+    }
 }
 
 /// Why a command runs here, for each case that says so.
@@ -576,8 +618,17 @@ impl RemoteRun {
 /// pattern it declares that the words match is not one the routing file's `desktop` allows the repo, listed exactly;
 /// when a word names a path outside the worktree and its siblings; or when the gate's folder holds nothing the snapshot
 /// sends; and so does one whose facts cannot be read.
+///
+/// A run pinned to one builder ([`Inputs::pin`]) goes to that builder alone, with no later candidates, or is refused
+/// ([`pinned`]).
 #[must_use]
 pub fn decide(inputs: &Inputs<'_>, facts: &dyn Facts) -> Route {
+    if let Some(host) = inputs.pin {
+        return match pinned(inputs, host, facts) {
+            Ok(run) => Route::Routed(Box::new(run)),
+            Err(refusal) => Route::Refused(refusal),
+        };
+    }
     match route(inputs, facts) {
         Ok(run) => Route::Routed(Box::new(run)),
         Err(reason) => Route::Local { reason },
@@ -957,7 +1008,8 @@ fn file_stem(path: &str) -> &str {
 /// written with `/` ([`unix_form`]); a pick whose words still hold a `\` goes on, silently, to the next builder that is
 /// no macOS one ([`steer_off_backslashes`]).
 fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts) -> Result<Matched, Here> {
-    let (opened, drives, sent) = opened_and_sent(config, git_hook, words, facts)?;
+    let (opened, drives, sent) =
+        opened_and_sent(config, git_hook, words, facts, |repo| config.is_routed(repo)).map_err(|unopened| unopened.here(git_hook))?;
     let first = pick(config, &opened.repo, &sent.words, |_| true).ok_or(None)?;
     check_local(&opened.place, &sent.words, facts)?;
     let (builder, pattern, found) = steer_off_macos(config, &opened, &sent.words, facts, first)?;
@@ -1033,26 +1085,62 @@ fn slashed(builder: &Builder, opened: &Opened, words: &[String], drives: &[(char
 /// ([`opened_and_sent`]).
 type OpenedAndSent = (Opened, Vec<(char, String)>, Rewritten);
 
-/// The worktree of the gate's place when the routing file lists its repo, the subst table of `words` and the words
-/// rewritten for Windows ([`Separators::AsWritten`]): what every pick of the command starts from ([`matched`],
-/// [`later_run`]). A gate inside a git hook whose repo `hooks` does not name stays here silently, before its siblings file
-/// is read, as does one whose place cannot be read, and one whose first word the rewrite sent as the name of a program
-/// that stays on this PC ([`stays_local`]).
-fn opened_and_sent(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts) -> Result<OpenedAndSent, Here> {
+/// Why [`opened_and_sent`] did not open the gate's worktree, which each caller says its own way.
+enum Unopened {
+    /// The gate's folder is in no git worktree.
+    NoWorktree,
+    /// The gate's place could not be read, for this reason.
+    PlaceFailed(LocalReason),
+    /// The gate runs inside a git hook, and `hooks` does not name its repo.
+    HookNotAllowed,
+    /// The repo, named, is not one the caller's listing names.
+    NotListed(String),
+    /// The command's first word, as the rewrite sent it, names a program that stays on this PC ([`stays_local`]).
+    StaysLocal,
+}
+
+impl Unopened {
+    /// How a run the pick routes stays here for this: silently, but for a place that cannot be read by a gate outside a
+    /// git hook, which says why.
+    fn here(self, git_hook: bool) -> Here {
+        match self {
+            Unopened::PlaceFailed(reason) if !git_hook => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// The worktree of the gate's place when `listed` says the routing file lists its repo, the subst table of `words` and
+/// the words rewritten for Windows ([`Separators::AsWritten`]): what every pick of the command and a pinned run start
+/// from ([`matched`], [`later_run`], [`pinned`]). A gate inside a git hook whose repo `hooks` does not name is not
+/// opened, before its siblings file is read, nor is one whose place cannot be read, nor one whose first word the
+/// rewrite sent as the name of a program that stays on this PC ([`stays_local`]).
+///
+/// # Errors
+///
+/// Why the worktree was not opened ([`Unopened`]).
+fn opened_and_sent(
+    config: &Config,
+    git_hook: bool,
+    words: &[String],
+    facts: &dyn Facts,
+    listed: impl FnOnce(&str) -> bool,
+) -> Result<OpenedAndSent, Unopened> {
     let place = match facts.place() {
         Ok(Some(place)) => place,
-        Ok(None) => return Err(None),
-        Err(_) if git_hook => return Err(None),
-        Err(reason) => return Err(Some(failed(&reason))),
+        Ok(None) => return Err(Unopened::NoWorktree),
+        Err(reason) => return Err(Unopened::PlaceFailed(failed(&reason))),
     };
-    if git_hook && config.hooks_allowed(&repo_name(&place.checkout)) != Ok(true) {
-        return Err(None);
+    let repo = repo_name(&place.checkout);
+    if git_hook && config.hooks_allowed(&repo) != Ok(true) {
+        return Err(Unopened::HookNotAllowed);
     }
-    let opened = open(place, facts, |repo| config.is_routed(repo))?;
+    let is_listed = listed(&repo);
+    let opened = open(place, facts, |_| is_listed).map_err(|_| Unopened::NotListed(repo))?;
     let drives = subst_drives(&opened.place.root, words, facts);
     let sent = rewritten(&opened.place, declared_pairs(&opened.siblings), words, &drives, Separators::AsWritten);
     if sent.program_named && stays_local(&sent.words) {
-        return Err(None);
+        return Err(Unopened::StaysLocal);
     }
     Ok((opened, drives, sent))
 }
@@ -1072,7 +1160,8 @@ fn opened_and_sent(config: &Config, git_hook: bool, words: &[String], facts: &dy
 /// keep here. The caller goes on to the next.
 pub fn later_run(inputs: &Inputs<'_>, facts: &dyn Facts, candidate: &LaterCandidate) -> Result<RemoteRun, Option<String>> {
     let config = eligible(inputs, facts).map_err(|here| Some(kept_here(here)))?;
-    let (opened, drives, sent) = opened_and_sent(&config, inputs.git_hook, inputs.words, facts).map_err(|here| Some(kept_here(here)))?;
+    let (opened, drives, sent) = opened_and_sent(&config, inputs.git_hook, inputs.words, facts, |repo| config.is_routed(repo))
+        .map_err(|unopened| Some(kept_here(unopened.here(inputs.git_hook))))?;
     let alias = &candidate.alias;
     let (builder, patterns) = config
         .routes(&opened.repo)
@@ -1081,13 +1170,40 @@ pub fn later_run(inputs: &Inputs<'_>, facts: &dyn Facts, candidate: &LaterCandid
         .ok_or_else(|| Some(format!("remote.json no longer lists it for {}", opened.repo)))?;
     let builder = builder.clone();
     let pattern = first_match(patterns, &sent.words).ok_or_else(|| Some("none of its patterns matches the command now".to_owned()))?;
-    check_local(&opened.place, &sent.words, facts).map_err(|here| Some(kept_here(here)))?;
-    let found = macos_desktop(&builder, &opened, &sent.words, facts).map_err(|here| Some(kept_here(here)))?;
+    kept_run(&config, (opened, drives, sent), (builder, pattern), inputs.words, facts).map_err(|unkept| match unkept {
+        Unkept::Here(here) => Some(kept_here(here)),
+        Unkept::Desktop | Unkept::Backslash => None,
+    })
+}
+
+/// Why [`kept_run`] did not keep the builder it was handed.
+enum Unkept {
+    /// The decision would keep the run here, saying why or silently.
+    Here(Here),
+    /// A macOS builder, and the command asks for a desktop ([`DesktopRead::steers_off`]).
+    Desktop,
+    /// A macOS builder, and a word of the command's Unix form still holds a `\` ([`Slashed::Backslash`]).
+    Backslash,
+}
+
+/// The routed run of the opened worktree's command, its subst table and its words `sent` ([`opened_and_sent`]), on the
+/// `chosen` builder whose pattern matched it: the worktree's `.gate/local.toml` checked ([`check_local`]), the builder
+/// kept unless a macOS one's steer-off rule would move a pick off it, then built and ended ([`built`], [`ended`]) for
+/// the command as `given`. What [`later_run`] and a pinned run ([`pinned`]) both build once they have their builder.
+///
+/// # Errors
+///
+/// Why the builder is not kept ([`Unkept`]); each caller says it its own way.
+fn kept_run(config: &Config, sent: OpenedAndSent, chosen: (Builder, String), given: &[String], facts: &dyn Facts) -> Result<RemoteRun, Unkept> {
+    let (opened, drives, sent) = sent;
+    let (builder, pattern) = chosen;
+    check_local(&opened.place, &sent.words, facts).map_err(Unkept::Here)?;
+    let found = macos_desktop(&builder, &opened, &sent.words, facts).map_err(Unkept::Here)?;
     if found.steers_off() {
-        return Err(None);
+        return Err(Unkept::Desktop);
     }
-    let unix = match slashed(&builder, &opened, inputs.words, &drives, facts) {
-        Slashed::Backslash => return Err(None),
+    let unix = match slashed(&builder, &opened, given, &drives, facts) {
+        Slashed::Backslash => return Err(Unkept::Backslash),
         Slashed::Unix(words) => Some(words),
         Slashed::NotMacos => None,
     };
@@ -1097,8 +1213,117 @@ pub fn later_run(inputs: &Inputs<'_>, facts: &dyn Facts, candidate: &LaterCandid
         found,
         unix,
     };
-    let matched = built(&config, opened, sent, kept, facts).map_err(|here| Some(kept_here(here)))?;
-    ended(&config, matched, inputs.words, facts).map_err(|here| Some(kept_here(here)))
+    let matched = built(config, opened, sent, kept, facts).map_err(Unkept::Here)?;
+    ended(config, matched, given, facts).map_err(Unkept::Here)
+}
+
+/// Why a pinned run whose command is `git`, `prek` or empty cannot route.
+const PIN_STAYS_LOCAL: &str = "git, prek and an empty command never route";
+
+/// Why a pinned run started inside a git hook cannot route when `hooks` does not name its repo.
+const PIN_HOOK: &str = "a gate started in a git hook routes only for a repo remote.json's hooks names";
+
+/// The routed run of a run pinned to the builder `host` ([`Inputs::pin`]): the decision's pipeline with that builder in
+/// place of the pick and no later candidates. The builder is found as [`Config::named_builder`] finds it, routed or
+/// not. When its own listing names the repo ([`Config::own_patterns`]), one of those patterns must match the command;
+/// else the repo must be listed for some builder and one of its patterns, of any builder in [`Config::routes`] order,
+/// must match. That pattern is the run's. The worktree's `.gate/local.toml`, siblings and desktop files are read as for
+/// any routed run ([`kept_run`]).
+///
+/// # Errors
+///
+/// Every way the decision would keep the run here, silently or saying why, and every steer-off from a macOS builder, as
+/// a refusal: the run is not run here, nor on any other builder.
+fn pinned(inputs: &Inputs<'_>, host: &str, facts: &dyn Facts) -> Result<RemoteRun, PinRefusal> {
+    let cannot = |why: &str| PinRefusal::CannotRoute {
+        host: host.to_owned(),
+        why: why.to_owned(),
+    };
+    let here = |here: Here| cannot(&here.map_or_else(|| "the routing decision runs it here".to_owned(), |reason| reason.reason()));
+    let (config, builder) = pinned_builder(inputs, host, facts)?;
+    let listed = |repo: &str| config.own_patterns(&builder, repo).is_some() || config.is_routed(repo);
+    let (opened, drives, sent) =
+        opened_and_sent(&config, inputs.git_hook, inputs.words, facts, listed).map_err(|unopened| pin_unopened(host, unopened))?;
+    let pattern = match config.own_patterns(&builder, &opened.repo) {
+        Some(patterns) => first_match(patterns, &sent.words),
+        None => pick(&config, &opened.repo, &sent.words, |_| true).map(|(_, pattern)| pattern),
+    };
+    let pattern = pattern.ok_or_else(|| PinRefusal::NotRouted {
+        host: host.to_owned(),
+        why: "none of its patterns matches the command".to_owned(),
+    })?;
+    kept_run(&config, (opened, drives, sent), (builder, pattern), inputs.words, facts).map_err(|unkept| match unkept {
+        Unkept::Here(reason) => here(reason),
+        Unkept::Desktop => cannot("it asks for a desktop, which a macOS builder does not have"),
+        Unkept::Backslash => cannot(r"a word still holds a \, which a macOS builder reads another way"),
+    })
+}
+
+/// The routing file and the builder `host` names in it ([`Config::named_builder`]) for a run pinned to it, once the
+/// run may route at all ([`pin_eligible`]) and its command is no `git`, `prek` or empty one.
+fn pinned_builder(inputs: &Inputs<'_>, host: &str, facts: &dyn Facts) -> Result<(Config, Builder), PinRefusal> {
+    pin_eligible(inputs, host)?;
+    let config = pinned_config(facts)?;
+    let builder = match config.named_builder(host) {
+        Ok(Some(builder)) => builder,
+        Ok(None) => return Err(PinRefusal::Unlisted { host: host.to_owned() }),
+        Err(why) => return Err(PinRefusal::NoConfig { why: why.to_owned() }),
+    };
+    if stays_local(inputs.words) {
+        return Err(PinRefusal::CannotRoute {
+            host: host.to_owned(),
+            why: PIN_STAYS_LOCAL.to_owned(),
+        });
+    }
+    Ok((config, builder))
+}
+
+/// Whether a run pinned to `host` may route at all: a heavy gate on no covering parent's slot, without `--local`.
+fn pin_eligible(inputs: &Inputs<'_>, host: &str) -> Result<(), PinRefusal> {
+    let why = if inputs.slot != Slot::Heavy {
+        "only a heavy run routes"
+    } else if inputs.covering_parent {
+        PIN_COVERED
+    } else if inputs.local {
+        "--local keeps it here"
+    } else {
+        return Ok(());
+    };
+    Err(PinRefusal::CannotRoute {
+        host: host.to_owned(),
+        why: why.to_owned(),
+    })
+}
+
+/// The routing file a pinned run reads; a refusal when there is none or it cannot be used.
+fn pinned_config(facts: &dyn Facts) -> Result<Config, PinRefusal> {
+    match facts.config() {
+        Ok(Some(config)) => Ok(config),
+        Ok(None) => Err(PinRefusal::NoConfig {
+            why: "there is none".to_owned(),
+        }),
+        Err(ConfigProblem { path, reason }) => Err(PinRefusal::NoConfig {
+            why: format!("{}: {reason}", path.display()),
+        }),
+    }
+}
+
+/// The refusal of a run pinned to `host` whose worktree was not opened ([`opened_and_sent`]); a repo not listed is
+/// said for what was checked: the pinned builder's own listing and the routed builders'.
+fn pin_unopened(host: &str, unopened: Unopened) -> PinRefusal {
+    let why = match unopened {
+        Unopened::NoWorktree => "the gate's folder is in no git worktree".to_owned(),
+        Unopened::PlaceFailed(reason) => reason.reason(),
+        Unopened::HookNotAllowed => PIN_HOOK.to_owned(),
+        Unopened::StaysLocal => PIN_STAYS_LOCAL.to_owned(),
+        Unopened::NotListed(repo) => {
+            return PinRefusal::NotRouted {
+                host: host.to_owned(),
+                why: format!("neither {} nor a routed builder lists repo {}", escaped(host), escaped(&repo)),
+            };
+        }
+    };
+    PinRefusal::CannotRoute { host: host.to_owned(), why }
 }
 
 /// Why a later candidate is not tried when the decision would now keep the run here: its reason

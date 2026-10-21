@@ -28,6 +28,7 @@ fn run_reads_every_option_and_the_defaults() {
             no_markers: false,
             local: false,
             alone: false,
+            builder: None,
             reason: None,
             bring_tracked: Vec::new(),
             env: Vec::new(),
@@ -670,6 +671,86 @@ fn run_records_a_reason_on_a_heavy_and_a_none_run() {
         "cmd",
     ]);
     assert_eq!(none.reason.as_deref(), Some("a deploy"));
+}
+
+#[test]
+fn run_takes_a_builder() {
+    assert_eq!(run_with(&["--builder", "mac-1", "--", "cmd"]).builder.as_deref(), Some("mac-1"));
+    assert_eq!(
+        run_with(&["--builder=mac-2", "--", "cmd"]).builder.as_deref(),
+        Some("mac-2"),
+        "the inline form"
+    );
+    assert_eq!(run_with(&["--", "cmd"]).builder, None, "none by default");
+    assert_eq!(problems_with(&["--builder", "--", "cmd"]), ["gate: --builder needs a value"]);
+    assert_eq!(problems_with(&["--builder=", "--", "cmd"]), ["gate: --builder needs a value"]);
+    assert!(
+        USAGE.lines().any(|line| line.starts_with("  --builder <host> ")),
+        "the usage lists --builder:\n{USAGE}"
+    );
+}
+
+#[test]
+fn a_builder_given_twice_is_refused() {
+    assert_eq!(
+        problems_with(&["--builder", "mac-1", "--builder", "mac-2", "--", "cmd"]),
+        ["gate: --builder is given twice"]
+    );
+}
+
+#[test]
+fn a_builder_with_local_is_refused() {
+    assert_eq!(
+        problems_with(&["--builder", "mac-1", "--local", "--reason", "trial", "--", "cmd"]),
+        ["gate: --builder mac-1 cannot route this run: --local keeps it here"]
+    );
+}
+
+#[test]
+fn a_builder_refusal_shows_its_host_escaped() {
+    assert_eq!(
+        problems_with(&["--builder", "mac \"1\"\tx", "--local", "--reason", "trial", "--", "cmd"]),
+        [r#"gate: --builder mac "1"\tx cannot route this run: --local keeps it here"#],
+        "a space and a quote shown as given, a control character escaped as the router's line escapes it"
+    );
+}
+
+#[test]
+fn a_builder_on_a_light_slot_is_refused() {
+    let on = |slot: &str| {
+        problems(&[
+            "run",
+            "--slot",
+            slot,
+            "--timeout",
+            "5",
+            "--log",
+            "out.log",
+            "--builder",
+            "mac-1",
+            "--reason",
+            "r",
+            "--",
+            "cmd",
+        ])
+    };
+    assert_eq!(
+        on("light"),
+        ["gate: --builder mac-1 cannot route this run: only a heavy run routes, and this one is --slot light"]
+    );
+    assert_eq!(
+        on("none"),
+        ["gate: --builder mac-1 cannot route this run: only a heavy run routes, and this one is --slot none"]
+    );
+    assert_eq!(
+        on("critical"),
+        ["gate: --builder mac-1 cannot route this run: only a heavy run routes, and this one is --slot critical"]
+    );
+    assert_eq!(
+        run_with(&["--builder", "mac-1", "--", "cmd"]).slot,
+        Slot::Heavy,
+        "a heavy run may be pinned"
+    );
 }
 
 #[test]

@@ -70,6 +70,7 @@ pub fn heavy(words: &[String]) -> Inputs<'_> {
         local: false,
         git_hook: false,
         words,
+        pin: None,
     }
 }
 

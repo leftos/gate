@@ -6,8 +6,9 @@ use std::path::PathBuf;
 
 use gate_router::{
     BuildSettings, BuildTarget, Builder, BuilderOs, Config, ConfigProblem, DROPPED_NO_BUILD_LINE, DotnetTarget, Facts, Inputs, LocalReason,
-    NO_OUTPUTS_LINE, PROJECT_EXTENSIONS, Pattern, Place, RemoteRun, Route, SiblingFolder, Slot, Target, build_settings, builder_words, decide,
-    dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host, later_run, sdk_build_target, target, without_no_build, work_folder_key,
+    NO_OUTPUTS_LINE, PROJECT_EXTENSIONS, Pattern, PinRefusal, Place, RemoteRun, Route, SiblingFolder, Slot, Target, build_settings, builder_words,
+    decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host, later_run, sdk_build_target, target, without_no_build,
+    work_folder_key,
 };
 
 use crate::support::{FakeFacts, HEAD, ROOT, carried, fake_id, heavy, place_at, sibling_root, words};
@@ -18,13 +19,14 @@ fn routed(route: Route) -> RemoteRun {
     assert!(matches!(route, Route::Routed(_)), "the command runs here: {:?}", local_line(&route));
     match route {
         Route::Routed(run) => *run,
-        Route::Local { .. } => unreachable!("asserted to route"),
+        Route::Local { .. } | Route::Refused(_) => unreachable!("asserted to route"),
     }
 }
 
 fn local_line(route: &Route) -> Option<String> {
     match route {
         Route::Local { reason } => reason.as_ref().map(LocalReason::line),
+        Route::Refused(refusal) => Some(refusal.line()),
         Route::Routed(_) => Some("routed".to_owned()),
     }
 }
@@ -2737,6 +2739,251 @@ fn a_later_candidate_the_local_file_now_keeps_here_is_skipped_with_its_reason() 
     assert!(
         matches!(&skipped, Err(Some(why)) if why.starts_with(".gate/local.toml keeps it here")),
         "{skipped:?}"
+    );
+}
+
+/// A heavy gate running `command`, pinned to the builder `host` with `--builder`.
+fn pinned_to<'a>(command: &'a [String], host: &'a str) -> Inputs<'a> {
+    Inputs {
+        pin: Some(host),
+        ..heavy(command)
+    }
+}
+
+/// The refusal of a pinned decision, which must not route or run here.
+fn refused(route: Route) -> PinRefusal {
+    assert!(matches!(route, Route::Refused(_)), "expected a refused pin, got {route:?}");
+    match route {
+        Route::Refused(refusal) => refusal,
+        Route::Local { .. } | Route::Routed(_) => unreachable!("asserted to be refused"),
+    }
+}
+
+/// `mac-1` and `win-2`, both routed, under a `host` running `yaat`'s `dotnet` commands.
+const MAC_AND_WIN: &str = r#"[{"host": "mac-1", "os": "macos", "root": "/Users/me/gate", "repos": {"yaat": ["dotnet build*"]}},
+    {"host": "win-2", "os": "windows", "slots": 3, "repos": {"yaat": ["cargo *", "dotnet build*"]}}]"#;
+
+#[test]
+fn a_pin_routes_to_the_named_builder_alone() {
+    let command = words(&["dotnet", "build"]);
+    let facts = FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_AND_WIN));
+    let run = routed(decide(&pinned_to(&command, "WIN-2"), &facts));
+    assert_eq!(
+        run.builder.alias, "win-2",
+        "matched in any ASCII letter case, named as the file spells it"
+    );
+    assert!(run.later.is_empty(), "a pin has no next builder: {:?}", later_aliases(&run));
+    assert_eq!(run.pattern, "dotnet build*", "the first pattern of the repo's routes that matches");
+    let host = routed(decide(&pinned_to(&command, "builder-1"), &facts));
+    assert_eq!(
+        host.builder,
+        host_builder("builder-1", 1),
+        "host may be pinned too, ahead of the entries the pick prefers"
+    );
+    assert_eq!(host.later, []);
+}
+
+#[test]
+fn a_pin_names_a_not_routed_builder() {
+    let config = Config::parse(
+        r#"{"host": "builder-1", "hosts": ["win-7"], "repos": {"yaat": ["dotnet *"]},
+            "builders": [{"host": "mac-9", "os": "macos", "root": "/Users/t/gate", "routed": false}]}"#,
+    )
+    .expect("usable");
+    let command = words(&["dotnet", "build"]);
+    let facts = FakeFacts::with_config(config.clone());
+    assert_eq!(
+        routed(decide(&heavy(&command), &facts)).builder.alias,
+        "builder-1",
+        "the pick never chooses a not-routed builder"
+    );
+    let run = routed(decide(&pinned_to(&command, "mac-9"), &FakeFacts::with_config(config.clone())));
+    assert_eq!(
+        (run.builder.alias.as_str(), run.builder.os, run.builder.root.as_deref()),
+        ("mac-9", BuilderOs::Macos, Some("/Users/t/gate"))
+    );
+    assert_eq!(run.later, []);
+    assert_eq!(run.pattern, "dotnet *");
+    let hosts = routed(decide(&pinned_to(&command, "win-7"), &FakeFacts::with_config(config)));
+    assert_eq!(
+        hosts.builder,
+        Builder {
+            alias: "win-7".to_owned(),
+            os: BuilderOs::Windows,
+            root: None,
+            slots: 1,
+            id: Some("c1aaea5e".to_owned()),
+        },
+        "a hosts entry is a Windows builder with the default root and an id of its own, so it shares no pool with host"
+    );
+}
+
+#[test]
+fn a_pin_to_an_unlisted_host_is_refused() {
+    let command = words(&["dotnet", "build"]);
+    let facts = FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_AND_WIN));
+    let refusal = refused(decide(&pinned_to(&command, "nobody"), &facts));
+    assert_eq!(refusal.line(), "gate: --builder nobody is not a builder remote.json lists");
+    assert_eq!(facts.asked(), ["config"], "refused before git is asked");
+
+    let none = FakeFacts {
+        config: Ok(None),
+        ..FakeFacts::at_root()
+    };
+    assert_eq!(
+        refused(decide(&pinned_to(&command, "mac-1"), &none)).line(),
+        "gate: --builder needs a usable remote.json: there is none"
+    );
+    let unusable = FakeFacts {
+        config: Err(ConfigProblem {
+            path: PathBuf::from(r"C:\l\gate\remote.json"),
+            reason: "slots must be a whole number 1 to 16".to_owned(),
+        }),
+        ..FakeFacts::at_root()
+    };
+    assert_eq!(
+        refused(decide(&pinned_to(&command, "mac-1"), &unusable)).line(),
+        r"gate: --builder needs a usable remote.json: C:\l\gate\remote.json: slots must be a whole number 1 to 16"
+    );
+}
+
+#[test]
+fn a_pin_whose_command_the_repo_does_not_route_is_refused() {
+    let facts = FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_AND_WIN));
+    let npm = words(&["npm", "test"]);
+    assert_eq!(
+        refused(decide(&pinned_to(&npm, "win-2"), &facts)).line(),
+        "gate: --builder win-2: this command is not one the repo routes (none of its patterns matches the command)"
+    );
+    let other = FakeFacts::with_config(with_builders(r#"{"other": ["*"]}"#, "[]"));
+    assert_eq!(
+        refused(decide(&pinned_to(&words(&["dotnet", "build"]), "builder-1"), &other)).line(),
+        "gate: --builder builder-1: this command is not one the repo routes (neither builder-1 nor a routed builder lists repo yaat)"
+    );
+}
+
+#[test]
+fn a_pin_under_a_covering_parent_is_refused() {
+    let command = words(&["dotnet", "build"]);
+    let facts = FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_AND_WIN));
+    let covered = Inputs {
+        covering_parent: true,
+        ..pinned_to(&command, "win-2")
+    };
+    let refusal = refused(decide(&covered, &facts));
+    assert_eq!(refusal, PinRefusal::covered("win-2"));
+    assert_eq!(
+        refusal.line(),
+        "gate: --builder win-2 cannot route this run: a parent gate's slot covers this gate"
+    );
+    assert!(facts.asked().is_empty(), "asked {:?}", facts.asked());
+}
+
+#[test]
+fn a_pin_of_a_backslash_command_to_a_mac_is_refused() {
+    let facts = FakeFacts {
+        config: Ok(Some(with_builders(r#"{"yaat": ["*"]}"#, TWO_MACS))),
+        ..FakeFacts::at("")
+    };
+    let command = words(&["dotnet", "test", "--filter", r"Name~Foo\.Bar"]);
+    assert_eq!(
+        refused(decide(&pinned_to(&command, "mac-1"), &facts)).line(),
+        r"gate: --builder mac-1 cannot route this run: a word still holds a \, which a macOS builder reads another way"
+    );
+    let desktop = builder_desktop_facts(r#"{"yaat": ["dotnet *"]}"#, MAC_BUILD, &["dotnet build*"], &[]);
+    assert_eq!(
+        refused(decide(&pinned_to(&words(&["dotnet", "build"]), "mac-1"), &desktop)).line(),
+        "gate: --builder mac-1 cannot route this run: it asks for a desktop, which a macOS builder does not have"
+    );
+}
+
+#[test]
+fn a_pin_of_git_is_refused() {
+    let facts = FakeFacts::with_config(with_builders(r#"{"yaat": ["*"]}"#, MAC_AND_WIN));
+    for command in [words(&["git", "commit"]), words(&[r"C:\Program Files\Git\cmd\prek.exe", "run"])] {
+        assert_eq!(
+            refused(decide(&pinned_to(&command, "builder-1"), &facts)).line(),
+            "gate: --builder builder-1 cannot route this run: git, prek and an empty command never route",
+            "{command:?}"
+        );
+    }
+}
+
+#[test]
+fn without_a_pin_the_choice_is_unchanged() {
+    let command = words(&["dotnet", "build"]);
+    let facts = FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_AND_WIN));
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder, mac_builder());
+    assert_eq!(later_aliases(&run), ["win-2", "builder-1"]);
+    assert_eq!(run.pattern, "dotnet build*");
+}
+
+/// A not-routed `mac-9` whose own entry runs `yaat`'s `dotnet build` commands, under a `host` whose `repos` is
+/// `host_repos`.
+fn trial_mac(host_repos: &str) -> Config {
+    with_builders(
+        host_repos,
+        r#"[{"host": "mac-9", "os": "macos", "root": "/Users/t/gate", "routed": false, "repos": {"yaat": ["dotnet build*"]}}]"#,
+    )
+}
+
+#[test]
+fn a_pin_to_a_not_routed_builder_uses_its_own_repos_patterns() {
+    let build = words(&["dotnet", "build"]);
+    let test = words(&["dotnet", "test"]);
+    let alone = trial_mac(r#"{"other": ["*"]}"#);
+    let run = routed(decide(&pinned_to(&build, "mac-9"), &FakeFacts::with_config(alone.clone())));
+    assert_eq!(
+        (run.builder.alias.as_str(), run.pattern.as_str()),
+        ("mac-9", "dotnet build*"),
+        "a repo only the trial builder's own entry lists"
+    );
+    assert_eq!(run.later, []);
+    assert_eq!(
+        refused(decide(&pinned_to(&test, "mac-9"), &FakeFacts::with_config(alone.clone()))).line(),
+        "gate: --builder mac-9: this command is not one the repo routes (none of its patterns matches the command)"
+    );
+    assert!(
+        matches!(decide(&heavy(&build), &FakeFacts::with_config(alone)), Route::Local { reason: None }),
+        "the pick never sends a run to it"
+    );
+
+    let beside_host = trial_mac(r#"{"yaat": ["dotnet *"]}"#);
+    assert_eq!(
+        routed(decide(&pinned_to(&build, "mac-9"), &FakeFacts::with_config(beside_host.clone()))).pattern,
+        "dotnet build*",
+        "its own pattern, not host's first match"
+    );
+    assert_eq!(
+        refused(decide(&pinned_to(&test, "mac-9"), &FakeFacts::with_config(beside_host))).line(),
+        "gate: --builder mac-9: this command is not one the repo routes (none of its patterns matches the command)",
+        "host's pattern does not stand in for the trial builder's own"
+    );
+}
+
+#[test]
+fn a_pin_to_a_builder_whose_entry_lacks_the_repo_uses_the_first_routed_match() {
+    let build = words(&["dotnet", "build"]);
+    let config = with_builders(
+        r#"{"yaat": ["dotnet *"]}"#,
+        r#"[{"host": "mac-1", "os": "macos", "root": "/Users/me/gate", "repos": {"yaat": ["dotnet build*"]}},
+            {"host": "win-9", "os": "windows", "routed": false, "repos": {"other": ["*"]}}]"#,
+    );
+    let run = routed(decide(&pinned_to(&build, "win-9"), &FakeFacts::with_config(config)));
+    assert_eq!(
+        (run.builder.alias.as_str(), run.pattern.as_str()),
+        ("win-9", "dotnet build*"),
+        "the first match across the routes, mac-1's"
+    );
+    assert_eq!(run.later, []);
+    let unlisted = with_builders(
+        r#"{"other": ["*"]}"#,
+        r#"[{"host": "win-9", "os": "windows", "routed": false, "repos": {"other": ["*"]}}]"#,
+    );
+    assert_eq!(
+        refused(decide(&pinned_to(&build, "win-9"), &FakeFacts::with_config(unlisted))).line(),
+        "gate: --builder win-9: this command is not one the repo routes (neither win-9 nor a routed builder lists repo yaat)"
     );
 }
 

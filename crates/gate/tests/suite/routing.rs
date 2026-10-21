@@ -3139,6 +3139,11 @@ fn has_line(text: &str, line: &str) -> bool {
     text.lines().any(|said| said == line)
 }
 
+/// Whether `text` holds `line` as exactly one of its lines.
+fn has_line_once(text: &str, line: &str) -> bool {
+    text.lines().filter(|said| *said == line).count() == 1
+}
+
 #[test]
 fn a_mac_refusing_version_sends_the_run_on_to_host_which_runs_it() {
     let case = two_builder_case("routing-next-builder");
@@ -3158,6 +3163,285 @@ fn a_mac_refusing_version_sends_the_run_on_to_host_which_runs_it() {
     assert_eq!(hosts(&own), [Some(MAC), Some(MAC), Some(MAC), Some(HOST), Some(HOST)], "{own:#?}");
     assert_eq!(own[2]["reason"], "version", "{own:#?}");
     assert!(own.iter().all(|event| event["remote"] == true), "{own:#?}");
+}
+
+/// A run pinned with `--builder` whose command the repo does not route is a usage error said before anything runs: it
+/// exits 2 with the pin's line, runs nothing here or on a builder, and writes no journal line.
+#[test]
+fn a_pin_the_router_refuses_exits_2_and_journals_nothing() {
+    let case = two_builder_case("routing-pin-refused");
+    let steps = shown(&stub(&case, &["on mac-1", "status 0"]));
+    let running = case.start(&routed_words("out.log", &steps, &["--builder", "MAC-1"], &["cmd", "/c", "echo ran here"]));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert!(
+        has_line_once(
+            &outcome.stderr,
+            "gate: --builder MAC-1: this command is not one the repo routes (none of its patterns matches the command)"
+        ),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stdout.contains("ran here"), "nothing ran here: {outcome:?}");
+    let journal = fs::read_to_string(case.root().join("events.jsonl")).unwrap_or_default();
+    let own: Vec<Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("a journal line is JSON"))
+        .filter(|event| event["pid"] == pid)
+        .collect();
+    assert!(own.is_empty(), "no journal line of the refused run: {own:#?}");
+}
+
+/// The `builders` entry marked not routed that a pinned case names.
+const TRIAL: &str = "win-9";
+
+/// A [`routed_case`] whose `host` runs its `*tool*` commands, with the Windows `builders` entry `win-9` marked
+/// `"routed": false`, which lists no repo.
+fn not_routed_case(name: &str) -> Case {
+    let case = routed_case(name);
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["*tool*"] },
+        "builders": [{ "host": TRIAL, "os": "windows", "routed": false }],
+    });
+    write_remote_json(&case, &routing.to_string());
+    case
+}
+
+#[test]
+fn a_pinned_run_goes_to_a_not_routed_builder_and_runs_there() {
+    let case = not_routed_case("routing-pin-trial");
+    let call = case.folder().join("call.json");
+    let record = format!("record {}", shown(&call));
+    let steps = shown(&stub(&case, &["on win-9", &record, "status 0"]));
+    let running = case.start(&routed_words(
+        "out.log",
+        &steps,
+        &["--builder", TRIAL],
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(recorded(&call)["host"], TRIAL, "the trial builder ran the command");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "take", "release"], "{own:#?}");
+    assert_eq!(hosts(&own), [Some(TRIAL), Some(TRIAL), Some(TRIAL)], "{own:#?}");
+    assert_eq!(own[0]["pinned"], true, "{own:#?}");
+}
+
+#[test]
+fn an_unpinned_run_never_picks_a_not_routed_builder() {
+    let case = not_routed_case("routing-not-routed-skipped");
+    let call = case.folder().join("call.json");
+    let record = format!("record {}", shown(&call));
+    let steps = shown(&stub(&case, &["on win-9", "refuse version", "on builder", &record, "status 0"]));
+    let running = case.start(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", "ran here"]));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(recorded(&call)["host"], HOST, "host ran the command");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "take", "release"], "{own:#?}");
+    assert_eq!(hosts(&own), [Some(HOST), Some(HOST), Some(HOST)], "{own:#?}");
+    assert!(own[0].get("pinned").is_none(), "an unpinned queue line has no pinned field: {own:#?}");
+}
+
+/// Runs the two-builder case `name` pinned to `mac-1`, which refuses with `reason` while host would run it: the run
+/// ends failed with the pin's line, host is never called, nothing runs here, and no fallback is journaled.
+fn assert_pinned_refusal_ends_the_run(name: &str, reason: &str) {
+    let case = two_builder_case(name);
+    let call = case.folder().join("call.json");
+    let record = format!("record {}", shown(&call));
+    let refuse = format!("refuse {reason}");
+    let steps = shown(&stub(&case, &["on mac-1", &refuse, "on builder", &record, "status 0"]));
+    let running = case.start(&routed_words("out.log", &steps, &["--builder", MAC], &[r".\tool.exe", "out", "ran here"]));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    let line = format!("gate: remote mac-1 {reason}; --builder given, so not running here");
+    assert!(has_line(&outcome.stderr, &line), "{outcome:?}");
+    assert!(!outcome.stderr.contains("trying builder"), "no other builder is tried: {outcome:?}");
+    assert!(!outcome.stdout.contains("ran here"), "nothing ran here: {outcome:?}");
+    assert!(!call.exists(), "host was never called");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "take", "release"], "no fallback line: {own:#?}");
+    assert_eq!(hosts(&own), [Some(MAC), Some(MAC), Some(MAC)], "{own:#?}");
+    assert_eq!(own[0]["pinned"], true, "{own:#?}");
+}
+
+#[test]
+fn a_pinned_run_the_builder_refuses_exits_1_and_runs_nothing_here() {
+    assert_pinned_refusal_ends_the_run("routing-pin-version", "version");
+}
+
+#[test]
+fn a_pinned_run_to_an_unreachable_builder_exits_1_without_trying_another() {
+    assert_pinned_refusal_ends_the_run("routing-pin-unreachable", "unreachable");
+}
+
+/// What a run pinned with `--builder` says after its builder's fallback head when the builder did not run it.
+const PIN_NOT_HERE: &str = "; --builder given, so not running here";
+
+/// Asserts the gate `pid` of `case` ended its pinned run, its `outcome`, before the builder ran it: exit 1, a line
+/// starting with `head` and ending with [`PIN_NOT_HERE`], nothing run here, no other builder tried, and its journal's
+/// queue line pinned with no `fallback` line after it.
+fn assert_pin_ended(case: &Case, pid: u32, outcome: &Outcome, head: &str) {
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(
+        outcome.stderr.lines().any(|line| line.starts_with(head) && line.ends_with(PIN_NOT_HERE)),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("; running here"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("; trying "), "no other builder is tried: {outcome:?}");
+    assert!(!outcome.stdout.contains("ran here"), "nothing ran here: {outcome:?}");
+    let own = own(case, pid);
+    assert_eq!(names(&own).first(), Some(&"queue"), "{own:#?}");
+    assert_eq!(own[0]["pinned"], true, "{own:#?}");
+    assert!(!names(&own).contains(&"fallback"), "no fallback line: {own:#?}");
+}
+
+#[test]
+fn a_pinned_run_whose_client_cannot_start_exits_1_and_runs_nothing_here() {
+    let case = ssh_case("routing-pin-no-ssh");
+    let git = git_folder();
+    let mut gate = case.gate(&heavy_words_with_limit(
+        "out.log",
+        &["--builder", HOST],
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+    gate.env("PATH", &git).env("GATE_FAKE_SSH_STEPS", case.folder().join("no-ssh.steps"));
+    let running = start(gate);
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_pin_ended(&case, pid, &outcome, "gate: remote builder client could not start: cannot run ssh: ");
+}
+
+#[test]
+fn a_pinned_run_whose_work_folder_is_busy_exits_1_and_runs_nothing_here() {
+    let case = client_case("routing-pin-key-busy");
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "100", "--builder", HOST],
+        ..Tuned::default()
+    };
+    let second = start(client_gate_tuned(
+        &case,
+        "second.log",
+        &second_steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+    let pid = second.id();
+    let outcome = second.finish();
+
+    assert_pin_ended(&case, pid, &outcome, "gate: remote builder busy");
+    assert_eq!(calls(&second_steps), Vec::<String>::new(), "the pinned run made no ssh call");
+    drop(go);
+    assert_eq!(first.finish().code, Some(0));
+}
+
+/// The pinned `mac-1`'s pool is full while host's is free, so a hand-off to host would be seen. The run waited for the
+/// pool but never held a slot, so its release counts no time held.
+#[test]
+fn a_pinned_run_whose_builder_pool_is_full_exits_1_and_runs_nothing_here() {
+    let case = two_builder_case("routing-pin-full");
+    let go = case.folder().join("go");
+    let holder = remote_holder(&case, "holder.log", &go);
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let waiter = case.start(&routed_words(
+        "waiter.log",
+        &steps,
+        &["--test-remote-wait-ms", "1500", "--builder", MAC],
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+    let pid = waiter.id();
+    let outcome = waiter.finish();
+
+    assert_pin_ended(&case, pid, &outcome, "gate: remote mac-1 full");
+    assert!(!call.exists(), "neither builder's client ran the pinned run");
+    let own = own(&case, pid);
+    let release = own
+        .iter()
+        .find(|event| event["event"] == "release")
+        .expect("the run journals its release");
+    let held = release["heldSeconds"].as_f64().expect("the release says how long it held");
+    assert!(held < 1.0, "the run held no slot through its wait: {release}");
+    let_go(&go);
+    assert_eq!(holder.finish().code, Some(0));
+}
+
+/// Every pin refusal is said before the gate readies its log: one the router gives leaves an earlier log as it was.
+#[test]
+fn a_pin_to_an_unlisted_host_leaves_an_earlier_log_untouched() {
+    let case = routed_case("routing-pin-unlisted-log");
+    let log = case.folder().join("out.log");
+    fs::write(&log, "an earlier run's log\n").expect("the earlier log can be written");
+    let steps = shown(&stub(&case, &["status 0"]));
+    let outcome = finish(case.gate(&routed_words(
+        "out.log",
+        &steps,
+        &["--builder", "nobody"],
+        &[r".\tool.exe", "out", "ran here"],
+    )));
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert!(
+        has_line_once(&outcome.stderr, "gate: --builder nobody is not a builder remote.json lists"),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stdout.contains("ran here"), "nothing ran here: {outcome:?}");
+    assert_eq!(
+        fs::read_to_string(&log).expect("the earlier log is still there"),
+        "an earlier run's log\n",
+        "the refusal leaves the earlier log as it was"
+    );
+}
+
+/// A pin under a covering parent's slot is a usage error said before the gate readies its log: an earlier run's log
+/// at `--log` is left as it was, as every usage refusal leaves it.
+#[test]
+fn a_pin_under_a_covering_parent_is_refused_leaving_an_earlier_log_untouched() {
+    let case = routed_case("routing-pin-covered");
+    let log = case.folder().join("out.log");
+    fs::write(&log, "an earlier run's log\n").expect("the earlier log can be written");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
+    let words = routed_words("out.log", &steps, &["--builder", HOST], &[r".\tool.exe", "out", "ran here"]);
+    let running = start(marked(&case, &words, &test_marker(&case, "heavy")));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(2), "{outcome:?}");
+    assert!(
+        has_line_once(
+            &outcome.stderr,
+            "gate: --builder builder cannot route this run: a parent gate's slot covers this gate"
+        ),
+        "{outcome:?}"
+    );
+    assert!(!outcome.stdout.contains("ran here"), "nothing ran here: {outcome:?}");
+    assert!(!call.exists(), "no builder was tried");
+    assert_eq!(
+        fs::read_to_string(&log).expect("the earlier log is still there"),
+        "an earlier run's log\n",
+        "the refusal leaves the earlier log as it was"
+    );
+    let journal = fs::read_to_string(case.root().join("events.jsonl")).unwrap_or_default();
+    assert!(
+        !journal.contains(&format!(r#""pid":{pid},"#)),
+        "the refused gate journals nothing: {journal}"
+    );
 }
 
 #[test]

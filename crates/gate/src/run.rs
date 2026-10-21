@@ -20,7 +20,7 @@ use gate_args::{
 };
 use gate_router::warm::{RecordRead, RecordState};
 use gate_router::{
-    BuildSettings, BuildTarget, DEFAULT_OUTPUTS, LaterCandidate, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target,
+    BuildSettings, BuildTarget, DEFAULT_OUTPUTS, LaterCandidate, PinRefusal, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target,
     sdk_build_target, without_no_build, work_folder_key,
 };
 use gate_state::{
@@ -95,7 +95,8 @@ const KEY_WAIT: Duration = Duration::from_secs(90);
 /// it started, 124 for a command killed as stalled, timed out or past the backstop, 127 when it could not be started,
 /// 0xC000013A for a Ctrl+C in the queue, before the command started, or with the command still running 5 s after it,
 /// or 2 for a log inside the state root, a critical gate under a heavy or light parent's slot, a critical or `--alone`
-/// gate inside a commit run's hooks or a batch word refused before anything was queued.
+/// gate inside a commit run's hooks, a batch word refused before anything was queued or a `--builder` pin refused
+/// before anything was queued. A run pinned with `--builder` that its builder did not run ends with 1.
 pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: &Environment, console: &mut Console) -> u32 {
     let (nesting, asked) = match admitted(request, log, root, environment, console) {
         Ok(admitted) => admitted,
@@ -131,9 +132,11 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
             return exit_status(GATE_FAILED);
         }
     };
-    if let Err(problem) = log.prepare() {
-        console.err(&format!("gate: {problem}"));
-        return exit_status(GATE_FAILED);
+    // A pinned run readies its log only once routing accepted the pin, so a refused pin leaves an earlier log alone.
+    if request.builder.is_none()
+        && let Err(status) = prepare_log(&log, console)
+    {
+        return status;
     }
     // The request and nesting of a run here that dropped its `--no-build` and asks for a heavy slot.
     let mut heavy = None;
@@ -166,6 +169,9 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         trace: RunTrace::default(),
     };
     let (route, placed) = run.route(environment, console);
+    if let Some(status) = ended_at_route(&route, request, &run.log, console) {
+        return status;
+    }
     run.route_beside_commit(&route, &mut beside);
     let local = run.local_words(&route, placed.place(), console);
     take_heavy(&mut run, local.as_ref(), console);
@@ -271,7 +277,8 @@ fn admitted<'r>(
 
 /// The status of a gate of `request` the `nesting` it runs under refuses, its lines said: a critical or `--alone` gate
 /// inside a commit run's hooks; an `--alone` gate under a parent whose slot covers it or refuses it or inside a box run;
-/// and a critical gate under a heavy or light parent's slot. `None` for a gate it lets run.
+/// a critical gate under a heavy or light parent's slot; and a gate pinned with `--builder` that a parent's slot covers
+/// or that runs inside a box run, which can never route. `None` for a gate it lets run.
 fn refusal(nesting: &Nesting, request: &RunRequest, console: &mut Console) -> Option<u32> {
     if (request.slot == Slot::Critical || request.alone) && nesting.in_commit() {
         console.err(commit::IN_COMMIT_LINE);
@@ -287,6 +294,12 @@ fn refusal(nesting: &Nesting, request: &RunRequest, console: &mut Console) -> Op
     }
     if matches!(nesting, Nesting::Refused(_)) {
         say_nesting(nesting, request, console);
+        return Some(u32::from(USAGE_STATUS));
+    }
+    if let Some(host) = &request.builder
+        && nesting.routes_as_covered()
+    {
+        console.err(&PinRefusal::covered(host).line());
         return Some(u32::from(USAGE_STATUS));
     }
     None
@@ -1016,20 +1029,42 @@ impl<'a> Run<'a> {
     }
 }
 
+/// The status a run of `request` ends with as soon as it is routed by `route`: a refused pin's usage status, said by the
+/// decision with every note it gathered before the log is readied; or, for a run pinned with `--builder`, whose log is
+/// readied only once routing accepted the pin, the failed status of a log that cannot be readied. `None` for a run that
+/// goes on.
+fn ended_at_route(route: &Route, request: &RunRequest, log: &Log, console: &mut Console) -> Option<u32> {
+    if matches!(route, Route::Refused(_)) {
+        return Some(u32::from(USAGE_STATUS));
+    }
+    if request.builder.is_some() {
+        return prepare_log(log, console).err();
+    }
+    None
+}
+
+/// Readies `log` for the run ([`Log::prepare`]); else says why, and the gate's failed status.
+fn prepare_log(log: &Log, console: &mut Console) -> Result<(), u32> {
+    log.prepare().map_err(|problem| {
+        console.err(&format!("gate: {problem}"));
+        exit_status(GATE_FAILED)
+    })
+}
+
 impl Run<'_> {
     /// Decides where the command runs, and sets the remote tag of a routed run. A gate a parent's slot covers runs
     /// here, as does one whose light parent lends it its slot before it queues, while a critical request drains, which
-    /// is not routed ([`Run::on_parent`]). The route, and what the decision learnt of the gate's place in its worktree.
+    /// is not routed ([`Run::on_parent`]); a run pinned with `--builder` asks for no lend, so it routes whatever a
+    /// critical request is doing. The route, and what the decision learnt of the gate's place in its worktree.
     /// The hash of the warm-up file the route asks the builder's work folder to be warm with is kept for the call.
     fn route(&mut self, environment: &Environment, console: &mut Console) -> (Route, Placed) {
-        if self.lend_before_queue(console) {
+        if self.request.builder.is_none() && self.lend_before_queue(console) {
             self.lent = true;
             return (Route::Local { reason: None }, Placed::NotAsked);
         }
         // A gate inside a box run stays here as a covered gate does, saying nothing. A gate a commit run's slot covers
         // is asked as one under no parent, so a build in the commit's hooks still routes.
-        let under_commit = self.nesting.under_commit().is_some();
-        let covering = (self.nesting.covering().is_some() && !under_commit) || matches!(self.nesting, Nesting::InBox);
+        let covering = self.nesting.routes_as_covered();
         let route::Decided {
             route,
             placed: place,
@@ -1043,7 +1078,7 @@ impl Run<'_> {
                 host: remote.builder.alias.clone(),
                 key: remote.key.clone(),
             }),
-            Route::Local { .. } => None,
+            Route::Local { .. } | Route::Refused(_) => None,
         };
         (route, place)
     }
@@ -1112,9 +1147,9 @@ impl Run<'_> {
 
     /// Asks a light parent whose slot does not cover this run, once it dropped its `--no-build` and asks for a heavy
     /// slot, whether it lends that slot before the run queues, as [`Run::route`] asked of the nesting the run was read
-    /// with; a run already lent its parent's slot keeps it.
+    /// with; a run already lent its parent's slot keeps it, and a run pinned with `--builder` asks for none.
     fn lend_again(&mut self, console: &mut Console) {
-        if !self.lent {
+        if !self.lent && self.request.builder.is_none() {
             self.lent = self.lend_before_queue(console);
         }
     }
@@ -1168,6 +1203,7 @@ impl Run<'_> {
             log: self.log.path().to_string_lossy().into_owned(),
             not_routed: route::not_routed(route),
             reason: self.request.reason.clone(),
+            pinned: self.request.builder.is_some(),
         };
         self.journal.write(&event, self.tag.as_ref(), console);
     }
@@ -1198,6 +1234,7 @@ impl Run<'_> {
                 Remotely::Interrupted => return None,
                 Remotely::Here => self.plan_here(remote, plan, console),
             },
+            Route::Refused(_) => unreachable!("run returns a refused pin's usage status before the run goes through"),
         };
         let (plan, here) = match planned {
             Ok(planned) => planned,
@@ -1306,11 +1343,12 @@ impl Run<'_> {
     /// a walk over the later builders a Ctrl+C ended after it included; `None` when the run fell back before any
     /// attempt, or an attempt ended it.
     fn try_builders(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> (Remotely, Option<FallbackReason>) {
+        // Nothing is held until an attempt takes a remote slot: a pinned run that ends before then counts no time held,
+        // and a run that falls back here sets it again at its local take.
+        hold.took = None;
+        let pinned = self.request.builder.is_some();
         if let Err(why) = self.client.ready() {
-            return (
-                self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), None, console),
-                None,
-            );
+            return (self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), console), None);
         }
         // The key lock reads neither figure of the call; no take has resolved them yet. A sibling that fails its check
         // again sends nothing: the run falls back here before it takes the lock or a slot.
@@ -1327,6 +1365,14 @@ impl Run<'_> {
                 Attempt::Done(remotely) => return (remotely, None),
                 Attempt::Refused(refusal) => refusal,
             };
+            if pinned {
+                // A pinned run ends on its builder's refusal, its slot kept in the hold its release lets go; one the
+                // full pool turned away took none, so its take is still unset.
+                let Refusal { reason, outcome, held } = refusal;
+                hold.taken = held;
+                let said = self.drop_warm_record(current, reason);
+                return (self.pin_ended(reason, &outcome, said.as_deref(), console), Some(reason));
+            }
             // The refused attempt's slot is let go below: the run holds nothing until it takes another.
             hold.took = None;
             let reason = refusal.reason;
@@ -1583,10 +1629,10 @@ impl Run<'_> {
         };
         let call = match call_of(parts, remote) {
             Ok(call) => call,
-            Err(why) => return Err(self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), None, console)),
+            Err(why) => return Err(self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), console)),
         };
         // The key is the worktree's on every builder: a key held elsewhere is busy on all of them, so the run runs here.
-        let busy = |run: &mut Run<'_>, console: &mut Console| run.fell_back(FallbackReason::Busy, &RemoteOutcome::default(), None, console);
+        let busy = |run: &mut Run<'_>, console: &mut Console| run.fell_back(FallbackReason::Busy, &RemoteOutcome::default(), console);
         // The seam raises the console interrupt before the take, so the zero wait meets it as the lock's busy.
         if self.request.test_seams.interrupt_before_key
             && let Some(interrupt) = self.host.interrupt
@@ -1676,11 +1722,35 @@ impl Run<'_> {
         Remotely::Interrupted
     }
 
-    /// Gives up the remote attempt for `reason` ([`Run::give_up`]) and says the run goes on here.
-    fn fell_back(&mut self, reason: FallbackReason, outcome: &RemoteOutcome, held: Option<Taken>, console: &mut Console) -> Remotely {
-        let host = self.give_up(reason, outcome, held, console);
+    /// Gives up the remote attempt for `reason`, before it took a remote slot ([`Run::give_up`]), and says the run goes
+    /// on here; a run pinned with `--builder` ends instead ([`Run::pin_ended`]).
+    fn fell_back(&mut self, reason: FallbackReason, outcome: &RemoteOutcome, console: &mut Console) -> Remotely {
+        if self.request.builder.is_some() {
+            return self.pin_ended(reason, outcome, None, console);
+        }
+        let host = self.give_up(reason, outcome, None, console);
         console.err(&fallback_line(&host, reason, outcome.detail.as_deref(), None));
         Remotely::Here
+    }
+
+    /// Ends a run pinned with `--builder` whose builder did not run it, for `reason`: no other builder is tried, nothing
+    /// runs here and no fallback is journaled. Says why with [`PIN_NOT_HERE`] after the fallback head, then `said`, the
+    /// line of a warm-up record the refusal dropped, and ends the log; the run ends failed, its release journaled with
+    /// the run's remote tag.
+    fn pin_ended(&mut self, reason: FallbackReason, outcome: &RemoteOutcome, said: Option<&str>, console: &mut Console) -> Remotely {
+        let host = self.tag.as_ref().map_or_else(String::new, |tag| tag.host.clone());
+        console.err(&format!("{}; {PIN_NOT_HERE}", fallback_head(&host, reason, outcome.detail.as_deref())));
+        if let Some(line) = said {
+            console.err(line);
+        }
+        self.log_owed_end_load(None, console);
+        if let Err(error) = self.log.finish(console) {
+            console.err(&format!("gate: could not write to {}: {error}", self.log.path().display()));
+        }
+        Remotely::Ended(Ended {
+            status: GATE_FAILED,
+            facts: None,
+        })
     }
 
     /// Gives up the remote attempt for `reason`: journals the fallback, the attempt's last line with the remote tag,
@@ -3390,6 +3460,9 @@ fn fallback_head(host: &str, reason: FallbackReason, detail: Option<&str>) -> St
         _ => format!("gate: remote {host} {}", reason.as_str()),
     }
 }
+
+/// What a run pinned with `--builder` says after its builder's fallback head, in place of where the run goes.
+const PIN_NOT_HERE: &str = "--builder given, so not running here";
 
 /// The fallback reasons worth another builder: a builder that is full, busy, cannot be reached, or lacks the version,
 /// parity, install or tools the run needs may be one another builder has. Every other reason runs here: the PC's own

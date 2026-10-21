@@ -14,8 +14,8 @@ use std::time::Duration;
 use gate_args::{GATE_SET_NAMES, RunRequest, Slot, TestSeams, env_refusal};
 use gate_router::warm::FileRead;
 use gate_router::{
-    Config, ConfigProblem, Facts, FolderId, Inputs, LaterCandidate, LocalReason, Pattern, Place, RemoteRun, Route, SiblingFolder, Target, decide,
-    dropped_env, dropped_env_line, escaped, repo_name,
+    Config, ConfigProblem, Facts, FolderId, Inputs, LaterCandidate, LocalReason, Pattern, PinRefusal, Place, RemoteRun, Route, SiblingFolder, Target,
+    decide, dropped_env, dropped_env_line, escaped, repo_name,
 };
 use gate_win32::Share;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -105,6 +105,8 @@ pub(crate) struct Decision {
     words: Vec<String>,
     unicode: bool,
     local_app_data: Option<OsString>,
+    /// `--builder <host>`, the one builder the run is pinned to.
+    pin: Option<String>,
 }
 
 impl Decision {
@@ -117,6 +119,7 @@ impl Decision {
             words: request.command.iter().map(|word| word.to_string_lossy().into_owned()).collect(),
             unicode: request.command.iter().all(|word| word.to_str().is_some()),
             local_app_data: environment.local_app_data.clone(),
+            pin: request.builder.clone(),
         }
     }
 
@@ -128,6 +131,7 @@ impl Decision {
             local: self.local,
             git_hook: self.git_hook,
             words: &self.words,
+            pin: self.pin.as_deref(),
         }
     }
 }
@@ -143,23 +147,36 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
     let decision = Decision::of(request, environment, covering_parent);
     let machine = Machine::new(environment, &request.test_seams);
     let route = match decide(&decision.inputs(slot(request.slot)), &machine) {
-        Route::Routed(_) if !decision.unicode => Route::Local {
-            reason: Some(LocalReason::Failed {
-                reason: NOT_UNICODE.to_owned(),
+        Route::Routed(_) if !decision.unicode => match &decision.pin {
+            Some(host) => Route::Refused(PinRefusal::CannotRoute {
+                host: host.clone(),
+                why: NOT_UNICODE.to_owned(),
             }),
+            None => Route::Local {
+                reason: Some(LocalReason::Failed {
+                    reason: NOT_UNICODE.to_owned(),
+                }),
+            },
         },
         route => route,
     };
     let (warm_hash, declared) = match &route {
         Route::Routed(remote) => (consented_hash(remote, &machine), declared_prefixes(remote, &machine)),
-        Route::Local { .. } => (None, Ok(Vec::new())),
+        Route::Local { .. } | Route::Refused(_) => (None, Ok(Vec::new())),
     };
+    // A refused pin never readies its log, so the notes it would have written there are said now.
+    let refused = matches!(route, Route::Refused(_));
     for line in machine.unsaid_notes() {
-        console.note(&line);
+        if refused {
+            console.err(&line);
+        } else {
+            console.note(&line);
+        }
     }
     match &route {
         Route::Local { reason: Some(reason) } => console.err(&reason.line()),
         Route::Local { reason: None } => {}
+        Route::Refused(refusal) => console.err(&refusal.line()),
         Route::Routed(run) => {
             run.lines().iter().for_each(|line| console.err(line));
             let prefixes = declared.unwrap_or_else(|line| {
