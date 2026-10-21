@@ -1,12 +1,14 @@
 //! The formats `gate.exe` writes under a state root: claims, tickets and the counts file, read strictly, plus the count
 //! formula and the paths they sit at.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use gate_state::v1::{self, Claim, ClaimKind, Counts, CoveredMarker, FormatError, PoolSetting, Ticket, TicketKind};
 use gate_state::{KernelObject, SlotKind, beside_allowance};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::json;
 
 use crate::support::{Machine, ts};
@@ -388,6 +390,140 @@ fn an_outputs_cap_record_of_another_shape_holds_no_count() {
     for (label, bytes) in rows {
         assert!(v1::outputs_capped_record(bytes).is_err(), "{label}");
     }
+}
+
+/// The moment the worktree record tests count from.
+fn worktree_now() -> Timestamp {
+    "2026-10-21T12:00:00Z".parse().expect("a time")
+}
+
+/// [`worktree_now`] less `age`.
+fn worktree_ago(age: SignedDuration) -> Timestamp {
+    worktree_now().checked_sub(age).expect("a moment after the epoch")
+}
+
+/// A worktree record of the worktree `X:/dev/repo.wt/a` of `repo`, last routed at `last_routed`.
+fn worktree(last_routed: Timestamp) -> v1::WorktreeRecord {
+    v1::WorktreeRecord {
+        root: "X:/dev/repo.wt/a".to_owned(),
+        common_dir: r"X:\dev\repo\.git".to_owned(),
+        repo: "repo".to_owned(),
+        last_routed,
+    }
+}
+
+#[test]
+fn the_worktree_record_sits_in_the_remote_folder() {
+    let root = Path::new("state-root");
+
+    assert_eq!(
+        parts_under(root, &v1::worktree_record_path(root, "app-1a2b3c4d")),
+        ["remote", "app-1a2b3c4d.worktree"]
+    );
+}
+
+#[test]
+fn a_worktree_record_is_written_with_v_and_its_four_keys_and_read_back() {
+    let root = scratch("worktree-record");
+    let path = v1::worktree_record_path(&root, "app-1a2b3c4d");
+    let written = worktree(worktree_now());
+
+    v1::write_worktree_record(&path, &written).expect("the record can be written");
+
+    let text = fs::read_to_string(&path).expect("the record can be read");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("the record is JSON");
+    let keys: BTreeSet<&str> = value.as_object().expect("an object").keys().map(String::as_str).collect();
+    assert_eq!(keys, BTreeSet::from(["v", "root", "commonDir", "repo", "lastRouted"]), "{text}");
+    assert_eq!(value["v"], 1, "{text}");
+    assert_eq!(value["lastRouted"], "2026-10-21T12:00:00.0000000Z", "{text}");
+    assert_eq!(v1::worktree_record(text.as_bytes()).expect("the record reads"), written);
+    let names: Vec<_> = fs::read_dir(v1::remote_dir(&root))
+        .expect("the remote folder can be listed")
+        .map(|entry| entry.expect("an entry can be read").file_name())
+        .collect();
+    assert_eq!(names, ["app-1a2b3c4d.worktree"], "no temp file is left beside it");
+}
+
+#[test]
+fn a_worktree_record_with_a_field_it_does_not_know_reads() {
+    let text = r#"{"v":1,"root":"X:/dev/repo.wt/a","commonDir":"X:\\dev\\repo\\.git","repo":"repo","lastRouted":"2026-10-21T12:00:00Z","goneSince":"2026-10-21T13:00:00Z"}"#;
+
+    assert_eq!(v1::worktree_record(text.as_bytes()).expect("the record reads"), worktree(worktree_now()));
+}
+
+#[test]
+fn a_worktree_record_of_another_shape_is_refused() {
+    let fields = r#""root":"X:/a","commonDir":"X:\\a\\.git","repo":"a","lastRouted":"2026-10-21T12:00:00Z""#;
+    let rows: [(&str, Vec<u8>); 6] = [
+        ("no version", format!("{{{fields}}}").into_bytes()),
+        ("another version", format!(r#"{{"v":2,{fields}}}"#).into_bytes()),
+        ("a duplicate key", format!(r#"{{"v":1,{fields},"repo":"b"}}"#).into_bytes()),
+        ("fields missing", br#"{"v":1,"root":"X:/a"}"#.to_vec()),
+        (
+            "a time that is no time",
+            format!(r#"{{"v":1,{}}}"#, fields.replace("2026-10-21T12:00:00Z", "noon")).into_bytes(),
+        ),
+        ("not UTF-8", b"\xff".to_vec()),
+    ];
+    for (label, bytes) in rows {
+        assert!(v1::worktree_record(&bytes).is_err(), "{label}");
+    }
+}
+
+#[test]
+fn needs_write_when_the_worktree_record_is_missing_or_unreadable() {
+    assert!(v1::needs_write(None, &worktree(worktree_now())));
+}
+
+#[test]
+fn needs_write_when_the_root_changed() {
+    let existing = v1::WorktreeRecord {
+        root: "X:/dev/repo.wt/b".to_owned(),
+        ..worktree(worktree_ago(SignedDuration::from_mins(1)))
+    };
+
+    assert!(v1::needs_write(Some(&existing), &worktree(worktree_now())));
+}
+
+#[test]
+fn needs_write_when_the_common_dir_changed() {
+    let existing = v1::WorktreeRecord {
+        common_dir: r"X:\dev\other\.git".to_owned(),
+        ..worktree(worktree_ago(SignedDuration::from_mins(1)))
+    };
+
+    assert!(v1::needs_write(Some(&existing), &worktree(worktree_now())));
+}
+
+#[test]
+fn needs_write_when_the_repo_changed() {
+    let existing = v1::WorktreeRecord {
+        repo: "other".to_owned(),
+        ..worktree(worktree_ago(SignedDuration::from_mins(1)))
+    };
+
+    assert!(v1::needs_write(Some(&existing), &worktree(worktree_now())));
+}
+
+#[test]
+fn needs_write_not_for_the_same_record_routed_59_minutes_ago() {
+    let existing = worktree(worktree_ago(SignedDuration::from_mins(59)));
+
+    assert!(!v1::needs_write(Some(&existing), &worktree(worktree_now())));
+}
+
+#[test]
+fn needs_write_for_a_record_routed_exactly_an_hour_ago() {
+    let existing = worktree(worktree_ago(SignedDuration::from_hours(1)));
+
+    assert!(v1::needs_write(Some(&existing), &worktree(worktree_now())));
+}
+
+#[test]
+fn needs_write_for_a_record_routed_after_now() {
+    let existing = worktree(worktree_now().checked_add(SignedDuration::from_mins(5)).expect("a time"));
+
+    assert!(v1::needs_write(Some(&existing), &worktree(worktree_now())));
 }
 
 const WARM_HASH: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";

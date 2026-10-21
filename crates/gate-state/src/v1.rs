@@ -12,12 +12,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use serde::de::{self, DeserializeOwned, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-use crate::counts::{PoolCount, ignored_line, write_replacing};
+use crate::counts::{PoolCount, ignored_line, write_replacing, write_replacing_once};
 use crate::model::{SlotCount, SlotCounts, SlotKind};
 use crate::root::KernelObject;
 
@@ -243,6 +243,68 @@ pub fn write_outputs_capped(path: &Path, record: &OutputsCappedRecord) -> io::Re
 ///
 /// Bytes that are not UTF-8 or not the record's format.
 pub fn outputs_capped_record(bytes: &[u8]) -> Result<OutputsCappedRecord, FormatError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| FormatError::Syntax("not UTF-8".to_owned()))?;
+    parse_strict(text)
+}
+
+/// The worktree record of the work folder `key`, `<root>\remote\<key>.worktree` ([`WorktreeRecord`]): which worktree
+/// the key, a one-way hash of its root, was made from, written by a routed run as [`needs_write`] says.
+#[must_use]
+pub fn worktree_record_path(root: &Path, key: &str) -> PathBuf {
+    remote_dir(root).join(format!("{key}.worktree"))
+}
+
+/// How long a worktree record's `lastRouted` stands before a routed run of the same worktree writes it again.
+const WORKTREE_RECORD_FRESH: SignedDuration = SignedDuration::from_hours(1);
+
+/// The worktree record of a work folder ([`worktree_record_path`]): the JSON object `{"v": 1, "root": …, "commonDir": …,
+/// "repo": …, "lastRouted": …}`. A field it does not know is ignored when read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeRecord {
+    /// The worktree root as routing spells it: the text the key hashes.
+    pub root: String,
+    /// The absolute path of the worktree's git common folder.
+    pub common_dir: String,
+    /// The repo name the routing file listed.
+    pub repo: String,
+    /// When a routed run last wrote the record, written as a claim's times are.
+    #[serde(with = "iso_time")]
+    pub last_routed: Timestamp,
+}
+
+/// Whether a routed run whose record would be `fresh` writes it over `existing`, the record on disk, `None` when there
+/// is none or it cannot be read: when there is none, when its root, common folder or repo differ from `fresh`'s, or
+/// when its `lastRouted` is an hour or more before `fresh`'s, or after it (a clock that went back).
+#[must_use]
+pub fn needs_write(existing: Option<&WorktreeRecord>, fresh: &WorktreeRecord) -> bool {
+    let Some(existing) = existing else {
+        return true;
+    };
+    if existing.root != fresh.root || existing.common_dir != fresh.common_dir || existing.repo != fresh.repo {
+        return true;
+    }
+    let age = fresh.last_routed.duration_since(existing.last_routed);
+    age.is_negative() || age >= WORKTREE_RECORD_FRESH
+}
+
+/// Writes the worktree `record` at `path` whole or not at all, as [`write_nothing_back`] writes, but with one move over
+/// the record and no retry, since a routed run writes it on its way to the builder.
+///
+/// # Errors
+///
+/// A folder, temp file or move that fails.
+pub fn write_worktree_record(path: &Path, record: &WorktreeRecord) -> io::Result<()> {
+    write_replacing_once(path, &versioned_text(record)?)
+}
+
+/// The worktree record a file's bytes hold, read strictly as every file of this module is; fields it does not know
+/// are ignored.
+///
+/// # Errors
+///
+/// Bytes that are not UTF-8 or not the record's format, its `v` missing or not 1 among them.
+pub fn worktree_record(bytes: &[u8]) -> Result<WorktreeRecord, FormatError> {
     let text = std::str::from_utf8(bytes).map_err(|_| FormatError::Syntax("not UTF-8".to_owned()))?;
     parse_strict(text)
 }
@@ -822,8 +884,12 @@ struct Versioned<'a, T> {
 }
 
 fn write_versioned<T: Serialize>(path: &Path, body: &T) -> io::Result<()> {
-    let text = serde_json::to_string(&Versioned { v: FORMAT_VERSION, body }).map_err(io::Error::other)?;
-    write_replacing(path, &text)
+    write_replacing(path, &versioned_text(body)?)
+}
+
+/// The text of a format's file: compact JSON, `v` first, then `body`.
+fn versioned_text<T: Serialize>(body: &T) -> io::Result<String> {
+    serde_json::to_string(&Versioned { v: FORMAT_VERSION, body }).map_err(io::Error::other)
 }
 
 /// The counts file's text as `gate.exe` reads it: compact JSON, `v` first, then the set counts heavy then light, such as

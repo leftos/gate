@@ -119,6 +119,14 @@ pub(crate) fn read_record(path: &Path) -> io::Result<Option<NothingBack>> {
     }))
 }
 
+/// The worktree record at `path` ([`v1::worktree_record_path`]), read as the nothing-back record is: opened as itself,
+/// at most [`RECORD_CAP`] bytes. `None` when there is none, or it cannot be read: a link, a junction, a folder, a
+/// longer file or one not of its format.
+pub(crate) fn read_worktree_record(path: &Path) -> Option<v1::WorktreeRecord> {
+    let bytes = read_regular_within(path, usize::try_from(RECORD_CAP).ok()?).ok()?;
+    v1::worktree_record(&bytes).ok()
+}
+
 /// The bytes of the regular file at `path`, opened as itself: a link, a junction, a folder or a file larger than
 /// [`FILE_CAP`] cannot be read.
 ///
@@ -126,15 +134,27 @@ pub(crate) fn read_record(path: &Path) -> io::Result<Option<NothingBack>> {
 ///
 /// A file that is missing (`NotFound`), cannot be opened or read, is not a regular file or is too large.
 fn read_regular(path: &Path) -> io::Result<Vec<u8>> {
+    read_regular_within(path, FILE_CAP).map_err(|error| match error.kind() {
+        io::ErrorKind::FileTooLarge => io::Error::other("it is larger than 1 MiB"),
+        _ => error,
+    })
+}
+
+/// [`read_regular`] with `cap` bytes the most it reads.
+///
+/// # Errors
+///
+/// As [`read_regular`]'s, a file longer than `cap` bytes as [`io::ErrorKind::FileTooLarge`].
+fn read_regular_within(path: &Path, cap: usize) -> io::Result<Vec<u8>> {
     let file = OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path)?;
     let metadata = file.metadata()?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_file() {
         return Err(io::Error::other("it is a link, a junction or not a file"));
     }
     let mut bytes = Vec::new();
-    file.take(u64::try_from(FILE_CAP + 1).unwrap_or(u64::MAX)).read_to_end(&mut bytes)?;
-    if bytes.len() > FILE_CAP {
-        return Err(io::Error::other("it is larger than 1 MiB"));
+    file.take(u64::try_from(cap + 1).unwrap_or(u64::MAX)).read_to_end(&mut bytes)?;
+    if bytes.len() > cap {
+        return Err(io::Error::new(io::ErrorKind::FileTooLarge, format!("it is larger than {cap} bytes")));
     }
     Ok(bytes)
 }
@@ -462,7 +482,7 @@ mod tests {
 
     use super::{
         NothingBack, drop_reason, first_without_assets, moves_intermediates, moves_output, named_without_assets, parse_worktree, read_record,
-        solution_projects,
+        read_worktree_record, solution_projects,
     };
 
     /// A folder of this test process's own named `name`, empty.
@@ -542,6 +562,45 @@ mod tests {
         junction(&path, &target);
 
         assert!(!matches!(read_record(&path), Ok(None)), "a junction is not read as no record");
+        fs::remove_dir(&path).expect("the junction can be removed");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    /// A worktree record of the worktree `X:/dev/app`.
+    fn worktree_record() -> v1::WorktreeRecord {
+        v1::WorktreeRecord {
+            root: "X:/dev/app".to_owned(),
+            common_dir: r"X:\dev\app\.git".to_owned(),
+            repo: "app".to_owned(),
+            last_routed: "2026-10-21T12:00:00Z".parse().expect("a time"),
+        }
+    }
+
+    #[test]
+    fn a_worktree_record_reads_and_a_missing_or_longer_one_reads_as_none() {
+        let folder = scratch("worktree-record");
+        let path = folder.join("app-1a2b3c4d.worktree");
+        assert_eq!(read_worktree_record(&path), None, "no record");
+
+        v1::write_worktree_record(&path, &worktree_record()).expect("the record can be written");
+        assert_eq!(read_worktree_record(&path), Some(worktree_record()));
+
+        let mut longer = fs::read(&path).expect("the record can be read");
+        longer.resize(4097, b' ');
+        fs::write(&path, &longer).expect("the longer record can be written");
+        assert_eq!(read_worktree_record(&path), None, "a record longer than 4096 bytes, though JSON");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_junction_at_the_worktree_record_name_reads_as_none() {
+        let folder = scratch("worktree-record-junction");
+        let target = folder.join("elsewhere");
+        fs::create_dir_all(&target).expect("the target can be made");
+        let path = folder.join("app-1a2b3c4d.worktree");
+        junction(&path, &target);
+
+        assert_eq!(read_worktree_record(&path), None, "a junction is no record");
         fs::remove_dir(&path).expect("the junction can be removed");
         fs::remove_dir_all(&folder).expect("the folder can be removed");
     }

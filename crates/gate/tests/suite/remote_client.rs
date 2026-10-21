@@ -633,6 +633,147 @@ fn a_routed_run_runs_on_the_box_and_passes_its_output_and_status() {
     assert!(log.contains(&format!("gate: pushed snapshot {} in ", &snapshot[..8])), "{log}");
 }
 
+/// The case's worktree root as git gives it, which routing hashes into the work-folder key.
+fn git_root(case: &Case) -> String {
+    git_out(case, &[], &["rev-parse", "--show-toplevel"])
+}
+
+/// A routed run leaves `remote\<key>.worktree` in the state root: the worktree root the key was made from, the repo's
+/// git common folder, the repo name and when it was routed.
+#[test]
+fn a_routed_run_records_which_worktree_its_key_came_from() {
+    let case = client_case("client-worktree-record");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there", "exit", "0"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let root = git_root(&case);
+    let key = key_of(&events(&case));
+    assert_eq!(key, work_folder_key(&root), "the key is the root's");
+    let path = case.root().join("remote").join(format!("{key}.worktree"));
+    let text = fs::read_to_string(&path).expect("the worktree record was written");
+    let record: Value = serde_json::from_str(&text).expect("the record is JSON");
+    assert_eq!(record["v"], 1, "{text}");
+    assert_eq!(record["root"], root.as_str(), "{text}");
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    assert_eq!(record["repo"], repo.as_str(), "{text}");
+    let common = record["commonDir"].as_str().expect("the common folder is text");
+    assert!(Path::new(common).ends_with(".git"), "{text}");
+    assert_eq!(
+        fs::canonicalize(common).expect("the common folder exists"),
+        fs::canonicalize(case.folder().join(".git")).expect("the case's git folder exists"),
+        "{text}"
+    );
+    let routed = record["lastRouted"].as_str().expect("the time is text");
+    routed.parse::<jiff::Timestamp>().expect("lastRouted is a time");
+}
+
+/// A worktree record that cannot be written is said once, and the routed run ends as it would have.
+#[test]
+fn a_record_that_cannot_be_written_leaves_the_routed_run_as_it_was() {
+    let case = client_case("client-worktree-unwritable");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let blocker = case.root().join("remote").join(format!("{}.worktree", work_folder_key(&git_root(&case))));
+    fs::create_dir_all(&blocker).expect("a folder can stand at the record's path");
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran there", "exit", "0"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"]);
+    assert_eq!(record_unwritten_lines(&outcome), 1, "{outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+    assert!(blocker.is_dir(), "the folder is left as it was");
+}
+
+/// How many of the run's error lines say a worktree record could not be written.
+fn record_unwritten_lines(outcome: &Outcome) -> usize {
+    outcome
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("gate: cannot write ") && line.contains(".worktree"))
+        .count()
+}
+
+/// A routed run of a linked worktree records the linked worktree's root and the main checkout's git folder, which
+/// every worktree of the clone shares.
+#[test]
+fn a_routed_run_from_a_linked_worktree_records_its_main_checkouts_git_folder() {
+    let case = client_case("client-worktree-linked");
+    git(&case, &["add", "-A"]);
+    git(&case, &["commit", "--quiet", "-m", "start"]);
+    let mut name = case.folder().file_name().expect("the case folder has a name").to_owned();
+    name.push("-wt2");
+    // Outside the case folder, so the main checkout's snapshot does not take it for a repository inside it.
+    let linked = Removed(case.folder().with_file_name(name));
+    git(&case, &["worktree", "add", "--quiet", "--detach", &shown(&linked.0)]);
+    let root = git_out(&case, &[], &["-C", &shown(&linked.0), "rev-parse", "--show-toplevel"]);
+    let log = linked.0.join("out.log");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let mut gate = client_gate(&case, &shown(&log), &steps, &[r".\tool.exe", "out", "ran there"]);
+    gate.current_dir(&linked.0);
+
+    let (pid, outcome) = finish_with_pid(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let key = key_of(&own(&case, pid));
+    assert_eq!(key, work_folder_key(&root), "the key is the linked worktree's");
+    let text = fs::read_to_string(case.root().join("remote").join(format!("{key}.worktree"))).expect("the record was written");
+    let record: Value = serde_json::from_str(&text).expect("the record is JSON");
+    assert_eq!(record["root"], root.as_str(), "{text}");
+    let common = record["commonDir"].as_str().expect("the common folder is text");
+    assert_eq!(
+        fs::canonicalize(common).expect("the common folder exists"),
+        fs::canonicalize(case.folder().join(".git")).expect("the main checkout's git folder exists"),
+        "{text}"
+    );
+}
+
+/// A second routed run of a worktree within the hour of the first, with nothing changed, leaves the record's bytes, its
+/// `lastRouted` among them, as the first wrote them.
+#[test]
+fn a_second_routed_run_within_the_hour_leaves_the_record_as_it_was() {
+    let case = client_case("client-worktree-fresh");
+    let first_steps = ssh_steps(&case, "first", &["ok", "ok"]);
+    let first = finish(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "a"]));
+    assert_eq!(first.code, Some(0), "{first:?}");
+    let path = case.root().join("remote").join(format!("{}.worktree", work_folder_key(&git_root(&case))));
+    let written = fs::read(&path).expect("the first run wrote the record");
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+
+    let second = finish(client_gate(&case, "second.log", &second_steps, &[r".\tool.exe", "out", "b"]));
+
+    assert_eq!(second.code, Some(0), "{second:?}");
+    assert_eq!(calls(&second_steps), ["preflight", "run"], "the second run was routed");
+    assert_eq!(
+        fs::read(&path).expect("the record is still there"),
+        written,
+        "the record is as the first run wrote it"
+    );
+}
+
+/// A run whose first builder turns it away and whose second runs it says once that the record cannot be written:
+/// the record is the worktree's, written once a run, not once a builder.
+#[test]
+fn an_unwritable_record_is_said_once_when_the_run_tries_two_builders() {
+    let case = next_builder_case("client-worktree-two-builders");
+    let blocker = case.root().join("remote").join(format!("{}.worktree", work_folder_key(&git_root(&case))));
+    fs::create_dir_all(&blocker).expect("a folder can stand at the record's path");
+    let steps = ssh_steps(&case, "ssh", &["on builder-a", "version 0.0.0-other", "on builder", "ok", "ok"]);
+    let folders = map_folders(&case);
+    let tuned = Tuned {
+        folders: Some(&folders),
+        ..Tuned::default()
+    };
+
+    let (pid, outcome) = finish_with_pid(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_handed_on(&case, pid, &outcome, &steps, "version");
+    assert_eq!(record_unwritten_lines(&outcome), 1, "{outcome:?}");
+}
+
 /// A routed run's `--env` pairs travel in the run call's `Env`: the command on the box sees the value the PC gave, a
 /// variable the box's own environment does not hold.
 #[test]

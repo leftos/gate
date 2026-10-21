@@ -1356,6 +1356,8 @@ impl Run<'_> {
             Ok(key) => key,
             Err(remotely) => return (remotely, None),
         };
+        // Under the key lock, once a run: the key is the same for every builder the run tries.
+        self.leave_worktree_record(remote, console);
         let mut waited = Duration::ZERO;
         let mut looked = 0;
         let mut later: Option<Box<RemoteRun>> = None;
@@ -1540,6 +1542,34 @@ impl Run<'_> {
             stale: &stale,
         };
         Attempt::Done(Remotely::Ended(self.remote_ended(&outcome, passing, wall, console)))
+    }
+
+    /// Writes the worktree record of the routed run `remote`'s work-folder key ([`v1::worktree_record_path`]) once the
+    /// run holds the key, before any builder is called, when [`v1::needs_write`] says so: one that cannot be read
+    /// ([`no_build::read_worktree_record`]) is written again. A worktree whose git common folder cannot be read
+    /// ([`route::common_folder_of`]) or is no Unicode path writes none and says nothing. A write is tried once; one that
+    /// fails is said and changes nothing else of the run.
+    fn leave_worktree_record(&self, remote: &RemoteRun, console: &mut Console) {
+        let Some(common) = route::common_folder_of(Path::new(&remote.root)) else {
+            return;
+        };
+        let Some(common) = common.to_str() else {
+            return;
+        };
+        let fresh = v1::WorktreeRecord {
+            root: remote.root.clone(),
+            common_dir: common.to_owned(),
+            repo: remote.repo.clone(),
+            last_routed: Timestamp::now(),
+        };
+        let path = v1::worktree_record_path(&self.root.path, &remote.key);
+        let existing = no_build::read_worktree_record(&path);
+        if !v1::needs_write(existing.as_ref(), &fresh) {
+            return;
+        }
+        if let Err(error) = v1::write_worktree_record(&path, &fresh) {
+            console.err(&format!("gate: cannot write {}: {error}", path.display()));
+        }
     }
 
     /// Drops the work folder's warm-up record after the client's refusal for `reason`, while the run still holds the

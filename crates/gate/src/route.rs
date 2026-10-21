@@ -670,20 +670,25 @@ fn drive_type(letter: char) -> u32 {
 }
 
 /// The folder name of the main checkout of the worktree at `tree`, as git's common folder gives the run's own: the
-/// parent of `tree\.git` when that is a folder; for a `.git` file, the parent of the common folder of the git folder its
-/// `gitdir:` line names ([`common_folder`]). `None` when any of it cannot be read, the `.git` is a link or a junction,
-/// or the folder the `gitdir:` line names is on no local drive ([`on_local_drive`]). No git is started.
+/// parent of its common folder ([`common_folder_of`]). No git is started.
 fn checkout_of(tree: &Path) -> Option<String> {
+    common_folder_of(tree)?.parent()?.file_name()?.to_str().map(str::to_owned)
+}
+
+/// The git common folder of the worktree at `tree`, made absolute: `tree\.git` when that is a folder; for a `.git`
+/// file, the common folder of the git folder its `gitdir:` line names ([`common_folder`]). `None` when any of it cannot
+/// be read, the `.git` is a link or a junction, or the folder the `gitdir:` line names is on no local drive
+/// ([`on_local_drive`]). No git is started.
+pub(crate) fn common_folder_of(tree: &Path) -> Option<PathBuf> {
     let dot_git = tree.join(".git");
     let metadata = fs::symlink_metadata(&dot_git).ok()?;
-    let common = if metadata.is_dir() {
-        dot_git
+    if metadata.is_dir() {
+        std::path::absolute(dot_git).ok()
     } else if metadata.is_file() {
-        common_folder(&linked_git_folder(tree, &dot_git)?)?
+        common_folder(&linked_git_folder(tree, &dot_git)?)
     } else {
-        return None;
-    };
-    common.parent()?.file_name()?.to_str().map(str::to_owned)
+        None
+    }
 }
 
 /// The git folder the `.git` file `dot_git` of the worktree `tree` names on its first line, `gitdir: <folder>`, read

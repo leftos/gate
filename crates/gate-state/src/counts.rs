@@ -277,7 +277,7 @@ fn write_counts_file(path: &Path, counts: SlotCounts, text: fn(SlotCounts) -> se
         if !path.exists() {
             return Ok(());
         }
-        return with_retry(|| remove_if_present(path)).map_err(fail);
+        return with_retry(WRITE_ATTEMPTS, || remove_if_present(path)).map_err(fail);
     }
     let text = text(counts).map_err(|error| fail(io::Error::other(error)))?;
     write_replacing(path, &text).map_err(fail)
@@ -288,14 +288,20 @@ fn write_counts_file(path: &Path, counts: SlotCounts, text: fn(SlotCounts) -> se
 /// parent folder is made. A reader holding the file blocks the move for that moment, so the move
 /// is tried up to ten times, 100 ms apart.
 pub(crate) fn write_replacing(path: &Path, text: &str) -> io::Result<()> {
-    replace_with(path, |file| file.write_all(text.as_bytes()))
+    replace_with(path, WRITE_ATTEMPTS, |file| file.write_all(text.as_bytes()))
+}
+
+/// [`write_replacing`] with the move over `path` tried once: for a writer on a run's path, which says a failure and
+/// goes on at once rather than wait out a reader.
+pub(crate) fn write_replacing_once(path: &Path, text: &str) -> io::Result<()> {
+    replace_with(path, 1, |file| file.write_all(text.as_bytes()))
 }
 
 /// [`write_replacing`] with the temp file written by `stage`, which is handed it open: the temp file is made new, a
 /// link or junction standing at its name opened as itself; a name something already stands at is passed over for the
 /// next, up to [`TEMP_NAMES`] names, and what stands there is left. A temp file `stage` fails to write is removed, and
-/// the move over `path` is tried as [`write_replacing`] tries it.
-fn replace_with(path: &Path, stage: impl FnOnce(&mut fs::File) -> io::Result<()>) -> io::Result<()> {
+/// the move over `path` is tried up to `attempts` times, [`WRITE_RETRY_DELAY`] apart.
+fn replace_with(path: &Path, attempts: u32, stage: impl FnOnce(&mut fs::File) -> io::Result<()>) -> io::Result<()> {
     if let Some(folder) = path.parent()
         && !folder.as_os_str().is_empty()
     {
@@ -307,7 +313,7 @@ fn replace_with(path: &Path, stage: impl FnOnce(&mut fs::File) -> io::Result<()>
         return Err(remove_partial(&temp, error));
     }
     drop(file);
-    let moved = with_retry(|| fs::rename(&temp, path));
+    let moved = with_retry(attempts, || fs::rename(&temp, path));
     if moved.is_err() {
         // The write has failed and says so; a temp file this cannot remove stays beside the target, since no later write uses its name.
         let _ = fs::remove_file(&temp);
@@ -348,16 +354,16 @@ pub(crate) fn remove_partial(temp: &Path, error: io::Error) -> io::Error {
     }
 }
 
-/// Runs `operation` until it succeeds, up to [`WRITE_ATTEMPTS`] times, [`WRITE_RETRY_DELAY`] apart, returning the
-/// last error when every try fails.
-fn with_retry(mut operation: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+/// Runs `operation` until it succeeds, up to `attempts` times, [`WRITE_RETRY_DELAY`] apart, returning the last error
+/// when every try fails.
+fn with_retry(attempts: u32, mut operation: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     let mut failure = io::Error::other("no attempt was made");
-    for attempt in 1..=WRITE_ATTEMPTS {
+    for attempt in 1..=attempts {
         match operation() {
             Ok(()) => return Ok(()),
             Err(error) => failure = error,
         }
-        if attempt < WRITE_ATTEMPTS {
+        if attempt < attempts {
             thread::sleep(WRITE_RETRY_DELAY);
         }
     }
@@ -463,7 +469,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
 
-    use super::{TEMP_COUNTER, TEMP_NAMES, replace_with};
+    use super::{TEMP_COUNTER, TEMP_NAMES, WRITE_ATTEMPTS, replace_with};
 
     /// The temp name the `n`th write of this process beside `path` takes.
     fn temp_name(path: &Path, n: u64) -> PathBuf {
@@ -478,7 +484,7 @@ mod tests {
         let planted = temp_name(&path, TEMP_COUNTER.load(Ordering::Relaxed));
         fs::write(&planted, "planted").expect("an entry can be planted");
 
-        replace_with(&path, |file| file.write_all(b"written")).expect("the next name is free");
+        replace_with(&path, WRITE_ATTEMPTS, |file| file.write_all(b"written")).expect("the next name is free");
 
         assert_eq!(fs::read_to_string(&path).expect("the file reads"), "written");
         assert_eq!(fs::read_to_string(&planted).expect("the planted entry stays"), "planted");
@@ -488,7 +494,7 @@ mod tests {
         for name in &names {
             fs::write(name, "planted").expect("an entry can be planted");
         }
-        let error = replace_with(&path, |file| file.write_all(b"other")).expect_err("no temp name is free");
+        let error = replace_with(&path, WRITE_ATTEMPTS, |file| file.write_all(b"other")).expect_err("no temp name is free");
 
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists, "{error}");
         assert_eq!(fs::read_to_string(&path).expect("the file reads"), "written", "the file stands");
