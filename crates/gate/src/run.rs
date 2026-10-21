@@ -20,8 +20,8 @@ use gate_args::{
 };
 use gate_router::warm::{RecordRead, RecordState};
 use gate_router::{
-    BuildSettings, BuildTarget, DEFAULT_OUTPUTS, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target, sdk_build_target,
-    without_no_build, work_folder_key,
+    BuildSettings, BuildTarget, DEFAULT_OUTPUTS, LaterCandidate, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target,
+    sdk_build_target, without_no_build, work_folder_key,
 };
 use gate_state::{
     Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RunFacts, RunTrace, StateRoot, Verdict, log_hash, v1,
@@ -830,7 +830,9 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
 struct Hold {
     taken: Option<Taken>,
     machine: Option<Machine>,
-    took: Instant,
+    /// When the run took what it holds; `None` once a builder's refusal let the remote slot go, until the run takes
+    /// another, so a release journalled then counts no time held.
+    took: Option<Instant>,
 }
 
 impl Hold {
@@ -839,8 +841,14 @@ impl Hold {
         Hold {
             taken: None,
             machine: None,
-            took: Instant::now(),
+            took: Some(Instant::now()),
         }
+    }
+
+    /// How long the run has held what it holds, in seconds: none once a refusal let the remote slot go
+    /// ([`Hold::took`]).
+    fn held_seconds(&self) -> f64 {
+        self.took.map_or(0.0, |took| took.elapsed().as_secs_f64())
     }
 }
 
@@ -855,6 +863,42 @@ enum Taking {
     Interrupted,
     /// The remote pool stayed full past the wait's limit.
     Full,
+}
+
+/// How one builder's attempt of a routed run ended ([`Run::attempt`]).
+enum Attempt {
+    /// The run ends as this says.
+    Done(Remotely),
+    /// The builder sent the run back.
+    Refused(Refusal),
+}
+
+impl Attempt {
+    /// The attempt the builder refused for `reason`, with the client's `outcome` and the remote slot `held`.
+    fn refused(reason: FallbackReason, outcome: RemoteOutcome, held: Option<Taken>) -> Attempt {
+        Attempt::Refused(Refusal {
+            reason,
+            outcome: Box::new(outcome),
+            held,
+        })
+    }
+}
+
+/// A builder's refusal of a routed run's attempt: the reason, the client's outcome and the remote slot still held.
+struct Refusal {
+    reason: FallbackReason,
+    outcome: Box<RemoteOutcome>,
+    held: Option<Taken>,
+}
+
+/// Where a routed run goes after a builder's attempt fell back ([`Run::next_candidate`]).
+enum Next {
+    /// To this later builder.
+    Builder(Box<RemoteRun>),
+    /// Here.
+    Here,
+    /// Nowhere: a Ctrl+C ended the walk over the later builders.
+    Interrupted,
 }
 
 /// How a routed run's remote attempt ended.
@@ -1181,7 +1225,7 @@ impl Run<'_> {
         }
         match self.take_own(hold, console) {
             Taking::Took(took, figures) => {
-                hold.took = took;
+                hold.took = Some(took);
                 Some(self.command(plan, figures, console))
             }
             Taking::Lent(figures) => Some(self.lent_as_it_waited(plan, hold, figures, console)),
@@ -1195,7 +1239,7 @@ impl Run<'_> {
     /// takes nothing and waits for nothing ([`Run::take_nothing`]).
     fn take_own(&mut self, hold: &mut Hold, console: &mut Console) -> Taking {
         match Takes::of(self.nesting.takes(self.request.slot)) {
-            Takes::Pool(pool) => self.take(pool, self.queued_at, &mut hold.taken, console),
+            Takes::Pool(pool) => self.take(pool, self.queued_at, None, &mut hold.taken, console),
             Takes::Machine => self.take_machine(&mut hold.machine, console),
             Takes::Nothing => self.take_nothing(console),
         }
@@ -1219,7 +1263,7 @@ impl Run<'_> {
         let Nesting::Under(parent) = nesting else {
             unreachable!("only a gate under a light parent is lent its parent's slot")
         };
-        hold.took = Instant::now();
+        hold.took = Some(Instant::now());
         self.on_parent(parent, plan, figures, console)
     }
 
@@ -1239,26 +1283,181 @@ impl Run<'_> {
         self.command(plan, figures, console)
     }
 
-    /// Runs the routed command on the builder: takes the client's work-folder key lock and a remote slot into `hold`,
-    /// calls the client and ends the run as the client ended it, the lock held until then. A key lock another run of the
-    /// worktree holds is waited for up to its bound; a full remote pool, a refusal or a client that cannot start falls
-    /// back here; with a client not ready, the run falls back before it takes a remote slot. A Ctrl+C ends the run here,
-    /// with the remote slot released: one raised before the call, or during it over a refusal. A client that ended on its
-    /// own keeps its own status, and the run writes or clears the worktree's nothing-back record
-    /// ([`Run::leave_nothing_back`]).
+    /// Runs the routed command on the builder, and on the later builders of the route after a refusal for a reason
+    /// worth another builder ([`RETRIED`]): takes the client's work-folder key lock once, the worktree's on every
+    /// builder, held until the run ends, then tries each builder in turn ([`Run::attempt`]), its remote slot taken into
+    /// `hold` and freed when it falls back. A key lock another run of the worktree holds is waited for up to its bound,
+    /// and one that stays held, like a client not ready, falls back here before any remote slot is taken. Each later
+    /// candidate is built when it is tried ([`Run::next_candidate`]) and says its route lines once the fallback line
+    /// naming it is said; the run's remote tag names it from its take on. A run whose last attempt fell back runs
+    /// here, its local take counting from the run's queue line only when that fallback was the full remote pool; one a
+    /// Ctrl+C or the client ended ends as it did.
     fn routed(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> Remotely {
-        if let Err(why) = self.client.ready() {
-            return self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), None, console);
+        let (remotely, last) = self.try_builders(remote, hold, console);
+        // Only a run whose last fallback is the full remote pool counts its local take from its own queue line; the
+        // local take of every other fallback counts from the take itself, as a run that never fell back does.
+        if last != Some(FallbackReason::Full) {
+            self.queued_at = None;
         }
-        let (_key, figures) = match self.hold_remote(remote, hold, console) {
-            Ok(held) => held,
-            Err(remotely) => return remotely,
+        remotely
+    }
+
+    /// The attempts of [`Run::routed`], and the reason of the last builder's fallback when a builder's attempt fell back,
+    /// a walk over the later builders a Ctrl+C ended after it included; `None` when the run fell back before any
+    /// attempt, or an attempt ended it.
+    fn try_builders(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> (Remotely, Option<FallbackReason>) {
+        if let Err(why) = self.client.ready() {
+            return (
+                self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), None, console),
+                None,
+            );
+        }
+        // The key lock reads neither figure of the call; no take has resolved them yet. A sibling that fails its check
+        // again sends nothing: the run falls back here before it takes the lock or a slot.
+        let _key = match self.take_key(remote, console) {
+            Ok(key) => key,
+            Err(remotely) => return (remotely, None),
+        };
+        let mut waited = Duration::ZERO;
+        let mut looked = 0;
+        let mut later: Option<Box<RemoteRun>> = None;
+        loop {
+            let current = later.as_deref().unwrap_or(remote);
+            let refusal = match self.attempt(current, hold, &mut waited, console) {
+                Attempt::Done(remotely) => return (remotely, None),
+                Attempt::Refused(refusal) => refusal,
+            };
+            // The refused attempt's slot is let go below: the run holds nothing until it takes another.
+            hold.took = None;
+            let reason = refusal.reason;
+            match self.after_refusal(remote, current, refusal, &mut looked, console) {
+                Ok(next) => later = Some(next),
+                Err(remotely) => return (remotely, Some(reason)),
+            }
+        }
+    }
+
+    /// Ends the attempt on `current` that the builder refused ([`Refusal`]): drops the warm-up record a `layout` refusal
+    /// leaves stale ([`Run::drop_warm_record`]), gives the attempt up ([`Run::give_up`]), its slot let go and its lines
+    /// noted before anything of the next builder is built, then looks for the next builder of the routed run `first`
+    /// ([`Run::next_candidate`]). The next builder's run, once the fallback line naming it and its route lines are said
+    /// and the run's remote tag names it; else how the run ends: here, saying so, or, when a Ctrl+C ended the walk, as
+    /// an interrupt before the command started, saying only why the builder did not run it.
+    fn after_refusal(
+        &mut self,
+        first: &RemoteRun,
+        current: &RemoteRun,
+        refusal: Refusal,
+        looked: &mut usize,
+        console: &mut Console,
+    ) -> Result<Box<RemoteRun>, Remotely> {
+        let Refusal { reason, outcome, held } = refusal;
+        let said = self.drop_warm_record(current, reason);
+        let host = self.give_up(reason, &outcome, held, console);
+        let next = match self.next_candidate(first, reason, looked, console) {
+            Next::Interrupted => {
+                console.err(&fallback_head(&host, reason, outcome.detail.as_deref()));
+                return Err(Remotely::Ended(self.interrupted_before_start(console)));
+            }
+            Next::Here => None,
+            Next::Builder(next) => Some(next),
+        };
+        let goes = next.as_ref().map(|next| next.builder.alias.as_str());
+        console.err(&fallback_line(&host, reason, outcome.detail.as_deref(), goes));
+        if let Some(line) = &said {
+            console.err(line);
+        }
+        let next = next.ok_or(Remotely::Here)?;
+        next.lines().iter().for_each(|line| console.err(line));
+        self.tag = Some(RemoteTag {
+            host: next.builder.alias.clone(),
+            key: next.key.clone(),
+        });
+        Ok(next)
+    }
+
+    /// Where the routed run `first` goes after a fallback for `reason`: the first of its later candidates after the
+    /// `looked` already looked at that is built ([`route::later_run`]), each looked at counted, and one skipped for a
+    /// reason noted in the log naming it; here when the reason is not worth another builder ([`RETRIED`]) or no
+    /// candidate is left. A Ctrl+C raised before a candidate is built, or by the time its build returned, built or
+    /// skipped, ends the walk.
+    fn next_candidate(&self, first: &RemoteRun, reason: FallbackReason, looked: &mut usize, console: &mut Console) -> Next {
+        if !RETRIED.contains(&reason) {
+            return Next::Here;
+        }
+        let Some(decision) = self.would.as_ref() else {
+            return Next::Here;
+        };
+        let interrupted = || self.host.interrupt.is_some_and(Interrupt::is_raised);
+        while let Some(candidate) = first.later.get(*looked) {
+            *looked += 1;
+            if interrupted() {
+                return Next::Interrupted;
+            }
+            let built = self.build_candidate(decision, candidate, console);
+            if interrupted() {
+                return Next::Interrupted;
+            }
+            if let Some(run) = built {
+                return Next::Builder(Box::new(run));
+            }
+        }
+        Next::Here
+    }
+
+    /// The run of the later builder `candidate` ([`route::later_run`]) under the routing `decision`; `None` when it is
+    /// skipped, noting in the log why, naming it, when the skip says why.
+    fn build_candidate(&self, decision: &route::Decision, candidate: &LaterCandidate, console: &mut Console) -> Option<RemoteRun> {
+        let built = route::later_run(self.request, decision, candidate, console);
+        // The seam raises the console interrupt once the walk has built a candidate, before the run tries it.
+        if self.request.test_seams.interrupt_before_later
+            && let Some(interrupt) = self.host.interrupt
+        {
+            interrupt.raise();
+        }
+        match built {
+            Ok(run) => Some(run),
+            Err(why) => {
+                if let Some(why) = why {
+                    console.note(&format!("gate: not trying {}: {why}", candidate.alias));
+                }
+                None
+            }
+        }
+    }
+
+    /// One builder's attempt of the routed run `remote`: takes a remote slot of the builder's pool into `hold`, waiting
+    /// only for what is left of the run's remote budget ([`wait::remote_budget`]) after the `waited` of its earlier
+    /// attempts, which this wait adds to, then calls the client ([`Run::call_builder`]). A full pool is a refusal. A
+    /// Ctrl+C ends the run here, with the remote slot released: one raised before the call, or during it over a refusal.
+    fn attempt(&mut self, remote: &RemoteRun, hold: &mut Hold, waited: &mut Duration, console: &mut Console) -> Attempt {
+        let left = wait::remote_budget(self.request).saturating_sub(*waited);
+        let begun = Instant::now();
+        let taking = self.take(Pool::Remote(BuilderPool::of(&remote.builder)), None, Some(left), &mut hold.taken, console);
+        *waited += begun.elapsed();
+        let figures = match taking {
+            Taking::Took(took, figures) => {
+                hold.took = Some(took);
+                figures
+            }
+            Taking::Lent(_) => unreachable!("only a local wait is lent a parent's slot"),
+            Taking::Interrupted => return Attempt::Done(Remotely::Interrupted),
+            Taking::Full => return Attempt::refused(FallbackReason::Full, RemoteOutcome::default(), None),
         };
         // A Ctrl+C that came once the remote slot was held, before the client was called, ends the run as an
         // interrupt before a command starts does here; the caller releases the slot with the run's tag.
         if self.host.interrupt.is_some_and(Interrupt::is_raised) {
-            return Remotely::Ended(self.interrupted_before_start(console));
+            return Attempt::Done(Remotely::Ended(self.interrupted_before_start(console)));
         }
+        self.call_builder(remote, hold, figures, console)
+    }
+
+    /// Calls the client for the routed run `remote` under `figures`, the remote slot held in `hold`, and ends the run as
+    /// the client ended it. A refusal or a client that cannot start is a refusal, with the slot still held. A Ctrl+C
+    /// during the call over a refusal ends the run here, with the remote slot released. A client that ended on its own
+    /// keeps its own status, and the run writes or clears the worktree's nothing-back record
+    /// ([`Run::leave_nothing_back`]).
+    fn call_builder(&mut self, remote: &RemoteRun, hold: &mut Hold, figures: Figures, console: &mut Console) -> Attempt {
         let started = Instant::now();
         let env = routed_env(&self.request.env, remote.source_revision.as_deref());
         let parts = CallParts {
@@ -1272,21 +1471,16 @@ impl Run<'_> {
         };
         let call = match call_of(parts, remote) {
             Ok(call) => call,
-            Err(why) => return self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), hold.taken.take(), console),
+            Err(why) => return Attempt::refused(FallbackReason::Client, RemoteOutcome::not_started(why), hold.taken.take()),
         };
         let outcome = self.client.run(&call);
         let fallback = outcome.fallback();
         // A Ctrl+C during the call wins over a refusal: the command never runs here.
         if fallback.is_some() && self.host.interrupt.is_some_and(Interrupt::is_raised) {
-            return Remotely::Ended(self.interrupted_before_start(console));
+            return Attempt::Done(Remotely::Ended(self.interrupted_before_start(console)));
         }
         if let Some(reason) = fallback {
-            let said = self.drop_warm_record(remote, reason);
-            let here = self.fell_back(reason, &outcome, hold.taken.take(), console);
-            if let Some(line) = &said {
-                console.err(line);
-            }
-            return here;
+            return Attempt::refused(reason, outcome, hold.taken.take());
         }
         let wall = started.elapsed();
         self.cold = outcome.raised.is_some();
@@ -1299,7 +1493,7 @@ impl Run<'_> {
             ceiling: outcome.raised.unwrap_or(figures.ceiling),
             stale: &stale,
         };
-        Remotely::Ended(self.remote_ended(&outcome, passing, wall, console))
+        Attempt::Done(Remotely::Ended(self.remote_ended(&outcome, passing, wall, console)))
     }
 
     /// Drops the work folder's warm-up record after the client's refusal for `reason`, while the run still holds the
@@ -1368,27 +1562,6 @@ impl Run<'_> {
         }
     }
 
-    /// Takes the work-folder key lock the run's client takes, waiting up to the run's key-wait bound for another run of
-    /// the worktree to let it go, then a remote slot into `hold`: the lock, held until the remote attempt ends, with the
-    /// figures of the remote take. Else how the run goes on: here, `busy`, when the lock is held elsewhere past the
-    /// bound, or by a warm-up of the work folder, or cannot be opened or taken, which says why; here, `full`, when the
-    /// pool stayed full; or interrupted during the wait, which journals the abandon.
-    fn hold_remote(&mut self, remote: &RemoteRun, hold: &mut Hold, console: &mut Console) -> Result<(Option<OwnedMutexGuard>, Figures), Remotely> {
-        // The key lock reads neither figure of the call; no take has resolved them yet. A sibling that fails its check
-        // again sends nothing: the run falls back here before it takes the lock or a slot.
-        let key = self.take_key(remote, console)?;
-        let figures = match self.take(Pool::Remote(BuilderPool::of(&remote.builder)), None, &mut hold.taken, console) {
-            Taking::Took(took, figures) => {
-                hold.took = took;
-                figures
-            }
-            Taking::Lent(_) => unreachable!("only a local wait is lent a parent's slot"),
-            Taking::Interrupted => return Err(Remotely::Interrupted),
-            Taking::Full => return Err(self.fell_back(FallbackReason::Full, &RemoteOutcome::default(), None, console)),
-        };
-        Ok((key, figures))
-    }
-
     /// Takes the lock of the call's work-folder key: at once when no other run of the worktree holds it, and else after
     /// waiting up to the run's key-wait bound for the holder to let it go, saying the wait in a line with the holder's
     /// time left when its remote claim carries a usual run time, and a still-waiting line each heartbeat. When a warm-up
@@ -1412,6 +1585,7 @@ impl Run<'_> {
             Ok(call) => call,
             Err(why) => return Err(self.fell_back(FallbackReason::Client, &RemoteOutcome::not_started(why), None, console)),
         };
+        // The key is the worktree's on every builder: a key held elsewhere is busy on all of them, so the run runs here.
         let busy = |run: &mut Run<'_>, console: &mut Console| run.fell_back(FallbackReason::Busy, &RemoteOutcome::default(), None, console);
         // The seam raises the console interrupt before the take, so the zero wait meets it as the lock's busy.
         if self.request.test_seams.interrupt_before_key
@@ -1502,17 +1676,19 @@ impl Run<'_> {
         Remotely::Interrupted
     }
 
-    /// Gives up the remote attempt for `reason`: journals the fallback, the run's last line with the remote tag, while
-    /// the remote slot `held` is still held, then deletes its claim, lets it go and wakes the waiters, removes the log
-    /// so the client's own bytes do not stand beside the notes that say them, gathers the attempt's lines into the
-    /// log's notes unsaid, and says the run goes on here.
+    /// Gives up the remote attempt for `reason` ([`Run::give_up`]) and says the run goes on here.
     fn fell_back(&mut self, reason: FallbackReason, outcome: &RemoteOutcome, held: Option<Taken>, console: &mut Console) -> Remotely {
+        let host = self.give_up(reason, outcome, held, console);
+        console.err(&fallback_line(&host, reason, outcome.detail.as_deref(), None));
+        Remotely::Here
+    }
+
+    /// Gives up the remote attempt for `reason`: journals the fallback, the attempt's last line with the remote tag,
+    /// while the remote slot `held` is still held, then deletes its claim, lets it go and wakes the waiters, removes the
+    /// log so the client's own bytes do not stand beside the notes that say them, and gathers the attempt's lines into
+    /// the log's notes unsaid. The host the tag named, which the fallback line names.
+    fn give_up(&mut self, reason: FallbackReason, outcome: &RemoteOutcome, held: Option<Taken>, console: &mut Console) -> String {
         let tag = self.tag.take();
-        // Only the run the full remote pool sent back counts its local take from its own queue line; the local take of
-        // every other fallback counts from the take itself, as a run that never fell back does.
-        if reason != FallbackReason::Full {
-            self.queued_at = None;
-        }
         self.journal.write(&JournalEvent::Fallback { reason }, tag.as_ref(), console);
         if let Some(taken) = held {
             slots::delete_claim(&taken.held, console);
@@ -1529,9 +1705,7 @@ impl Run<'_> {
         for line in &outcome.lines {
             console.note(line);
         }
-        let host = tag.map_or_else(String::new, |tag| tag.host);
-        console.err(&fallback_line(&host, reason, outcome.detail.as_deref()));
-        Remotely::Here
+        tag.map_or_else(String::new, |tag| tag.host)
     }
 
     /// The plan of the run here after a fallback of any reason, and the words it runs: the first plan, the command as
@@ -1844,11 +2018,12 @@ impl Run<'_> {
     /// Waits its turn for a slot of `pool` and takes it into `held` the moment it has it, then writes the claim and
     /// journals the take, with the remote tag while the run has one. `since` is the moment the wait counts from, the run's
     /// own `queue` line for a run the full remote pool sent back and `None` for every other wait, which counts from now;
-    /// the wait, its still-waiting lines and its journal all count from that one instant.
+    /// the wait, its still-waiting lines and its journal all count from that one instant. `left` limits a remote wait
+    /// to what is left of the run's remote budget, `None` waiting for the whole budget ([`Wait::limit_to`]).
     /// When the slot was taken; else a Ctrl+C ended the wait, which deletes the ticket at once, wakes the waiters and
     /// journals the abandon, or a remote pool stayed full past the wait's limit, which deletes the ticket, or a light
     /// parent lent the run its slot, which deletes the ticket and wakes the waiters.
-    fn take(&mut self, pool: Pool, since: Option<Instant>, held: &mut Option<Taken>, console: &mut Console) -> Taking {
+    fn take(&mut self, pool: Pool, since: Option<Instant>, left: Option<Duration>, held: &mut Option<Taken>, console: &mut Console) -> Taking {
         let queued = since.unwrap_or_else(Instant::now);
         let estimate = self.estimate(console);
         let expected = estimate.as_ref().map(expected_field);
@@ -1876,6 +2051,9 @@ impl Run<'_> {
             expected: expected.as_ref(),
         };
         let mut wait = Wait::queue(self.root, pool, arrival, self.host, console);
+        if let Some(left) = left {
+            wait.limit_to(left);
+        }
         let taken = loop {
             match wait.until_taken(&mut self.survey, console) {
                 Waited::Taken(taken) => break held.insert(taken),
@@ -2057,24 +2235,24 @@ impl Run<'_> {
             covered.end(console);
         }
         if let Some(LateSlot { taken, took }) = self.late.take() {
-            self.let_go(Some(taken), took, ended, console);
+            self.let_go(Some(taken), took.elapsed().as_secs_f64(), ended, console);
         }
         if self.nesting.covering().is_some() || self.lent {
             return;
         }
-        let Hold { taken, machine, took } = hold;
+        let held_seconds = hold.held_seconds();
+        let Hold { taken, machine, .. } = hold;
         if let Some(machine) = machine {
-            self.write_release(machine.names(), took.elapsed().as_secs_f64(), ended, console);
+            self.write_release(machine.names(), held_seconds, ended, console);
             machine.release(self.root, &mut self.survey, console);
             return;
         }
-        self.let_go(taken, took, ended, console);
+        self.let_go(taken, held_seconds, ended, console);
     }
 
-    /// Deletes the claim of `taken`, the slot of a pool the run took at `took`, journals the release with how the run
-    /// `ended` and lets the slot go, then wakes the waiters; a run that took no slot journals a release of none.
-    fn let_go(&mut self, taken: Option<Taken>, took: Instant, ended: Option<&Ended>, console: &mut Console) {
-        let held_seconds = took.elapsed().as_secs_f64();
+    /// Deletes the claim of `taken`, the slot of a pool the run held `held_seconds`, journals the release with how the
+    /// run `ended` and lets the slot go, then wakes the waiters; a run that took no slot journals a release of none.
+    fn let_go(&mut self, taken: Option<Taken>, held_seconds: f64, ended: Option<&Ended>, console: &mut Console) {
         let slots = match &taken {
             Some(taken) => {
                 slots::delete_claim(&taken.held, console);
@@ -3197,17 +3375,34 @@ fn warm_up_holds(state: &Path, key: &str, console: &mut Console, said: &mut bool
     }
 }
 
-/// The line a routed run says as it falls back here for `reason` from the builder `host`; a client that could not
-/// start says why, `detail`.
-fn fallback_line(host: &str, reason: FallbackReason, detail: Option<&str>) -> String {
+/// The line a routed run says as it falls back for `reason` from the builder `host`: to the `next` builder it tries,
+/// `trying <next>`, else here, `running here`; a client that could not start says why, `detail`.
+fn fallback_line(host: &str, reason: FallbackReason, detail: Option<&str>, next: Option<&str>) -> String {
+    let goes = next.map_or_else(|| "running here".to_owned(), |next| format!("trying {next}"));
+    format!("{}; {goes}", fallback_head(host, reason, detail))
+}
+
+/// Why the builder `host` did not run the command, as a fallback line says it before where the run goes
+/// ([`fallback_line`]): `gate: remote <host> <reason>`, or for a client that could not start, why, `detail`.
+fn fallback_head(host: &str, reason: FallbackReason, detail: Option<&str>) -> String {
     match reason {
-        FallbackReason::Client => format!(
-            "gate: remote {host} client could not start: {}; running here",
-            detail.unwrap_or("no reason given")
-        ),
-        _ => format!("gate: remote {host} {}; running here", reason.as_str()),
+        FallbackReason::Client => format!("gate: remote {host} client could not start: {}", detail.unwrap_or("no reason given")),
+        _ => format!("gate: remote {host} {}", reason.as_str()),
     }
 }
+
+/// The fallback reasons worth another builder: a builder that is full, busy, cannot be reached, or lacks the version,
+/// parity, install or tools the run needs may be one another builder has. Every other reason runs here: the PC's own
+/// failures (`client`, `inputs`, `lfs`) and those of the worktree, the desktop or a lost run.
+const RETRIED: [FallbackReason; 7] = [
+    FallbackReason::Full,
+    FallbackReason::Busy,
+    FallbackReason::Unreachable,
+    FallbackReason::Version,
+    FallbackReason::Parity,
+    FallbackReason::Install,
+    FallbackReason::Tools,
+];
 
 /// A line holding a failure marker: its number, counted from 1, and its text as printed.
 type Marker = (usize, String);

@@ -30,8 +30,14 @@ pub(crate) const HEARTBEAT: Duration = Duration::from_secs(30);
 /// The longest a waiter sleeps after a pass that found the beside mutex held by another gate: that gate wakes the
 /// waiters only once it took or lent something, so a pass that found no room for this reason alone looks again soon.
 const BUSY_RETRY: Duration = Duration::from_millis(100);
-/// How long a routed run waits for a remote slot before it falls back here.
+/// How long a routed run waits for a remote slot before it falls back here: one budget its builders share.
 pub(crate) const REMOTE_LIMIT: Duration = Duration::from_secs(60);
+
+/// The whole time a routed run of `request` waits for remote slots, across every builder it tries:
+/// `--test-remote-wait-ms`, else [`REMOTE_LIMIT`].
+pub(crate) fn remote_budget(request: &RunRequest) -> Duration {
+    request.test_seams.remote_wait_ms.map_or(REMOTE_LIMIT, Duration::from_millis)
+}
 
 /// A probe of a pool's slots: for each, whether some gate has it open, `None` for a slot that could not be probed.
 type Probe = Vec<Option<bool>>;
@@ -306,9 +312,7 @@ impl<'a> Wait<'a> {
             pool,
             order: ticket.queue_order(),
             processors: host.processors,
-            limit: pool
-                .is_remote()
-                .then(|| request.test_seams.remote_wait_ms.map_or(REMOTE_LIMIT, Duration::from_millis)),
+            limit: pool.is_remote().then(|| remote_budget(request)),
             place: match builder.filter(|_| pool.is_remote()) {
                 Some(builder) => format!("remote slot on {builder}"),
                 None => format!("{} slot", pool.name()),
@@ -320,6 +324,14 @@ impl<'a> Wait<'a> {
             waiter,
             said_waiting: false,
             said_ignored: false,
+        }
+    }
+
+    /// Limits a remote wait to `left`, what is left of the run's remote budget ([`remote_budget`]), in place of the whole
+    /// budget: a wait with nothing left takes a free slot and is otherwise full at once, saying no wait.
+    pub(crate) fn limit_to(&mut self, left: Duration) {
+        if self.limit.is_some() {
+            self.limit = Some(left);
         }
     }
 
@@ -365,7 +377,8 @@ impl<'a> Wait<'a> {
             return Some(Waited::Taken(taken));
         }
         drop(beside);
-        if !self.said_waiting {
+        // A wait with nothing left of its remote budget says no wait.
+        if !self.said_waiting && self.limit != Some(Duration::ZERO) {
             self.say_waiting(probe, range, survey, console);
         }
         self.pass_ended()

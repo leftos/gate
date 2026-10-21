@@ -14,10 +14,11 @@ use serde_json::{Value, json};
 
 use crate::nesting::{LOOK_OFTEN, end_parent, first_event, marked, orphaned_as, spawned, test_marker};
 
+use crate::remote_client::{Tuned, client_case, client_gate, client_gate_tuned};
 use crate::support::{
-    Case, DenyEntry, FAKE_TOOL, GATE, Go, Junction, LOCAL_REASON, Outcome, Running, assert_in_order, beside, copy_tool, events, finish, git,
-    git_init, heavy_words, nothing_back, powershell_folder, record_path, release, run_words, shown, start, wait_for_journal_line, wait_until,
-    write_counts, write_remote_json,
+    Case, DenyEntry, FAKE_TOOL, GATE, Go, Junction, LOCAL_REASON, Outcome, Running, assert_in_order, beside, calls, copy_tool, events, finish, git,
+    git_init, heavy_words, nothing_back, powershell_folder, record_path, release, run_words, shown, ssh_steps, start, wait_for_journal_line,
+    wait_until, write_counts, write_remote_json,
 };
 
 pub(crate) const HOST: &str = "builder";
@@ -3109,4 +3110,385 @@ fn a_git_that_does_not_answer_within_the_limit_runs_here_saying_so() {
     );
     assert!(outcome.stdout.contains("ran here"), "the command ran here: {outcome:?}");
     assert_local(&events(&case), None);
+}
+
+/// The `builders` entry a two-builder case tries first.
+const MAC: &str = "mac-1";
+
+/// A [`routed_case`] whose routing file sends its `*tool*` commands to the `builders` entry `mac-1`, a macOS builder,
+/// then to `host`, which alone runs its `*host.exe*` commands; the case holds fake-tool as `host.exe` too.
+fn two_builder_case(name: &str) -> Case {
+    let case = routed_case(name);
+    copy_tool(&case, "host.exe");
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["*tool*", "*host.exe*"] },
+        "builders": [{ "host": MAC, "os": "macos", "root": "/m", "repos": { repo(&case): ["*tool*"] } }],
+    });
+    write_remote_json(&case, &routing.to_string());
+    case
+}
+
+/// The `host` of each journal line, `None` for one without.
+fn hosts(events: &[Value]) -> Vec<Option<&str>> {
+    events.iter().map(|event| event["host"].as_str()).collect()
+}
+
+/// Whether `text` holds `line` as one of its lines.
+fn has_line(text: &str, line: &str) -> bool {
+    text.lines().any(|said| said == line)
+}
+
+#[test]
+fn a_mac_refusing_version_sends_the_run_on_to_host_which_runs_it() {
+    let case = two_builder_case("routing-next-builder");
+    let call = case.folder().join("call.json");
+    let record = format!("record {}", shown(&call));
+    let steps = shown(&stub(&case, &["on mac-1", "refuse version", "on builder", &record, "status 0"]));
+    let running = case.start(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", "ran here"]));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(has_line(&outcome.stderr, "gate: remote mac-1 version; trying builder"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("running here"), "{outcome:?}");
+    assert_eq!(recorded(&call)["host"], HOST, "host ran the command");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "take", "fallback", "take", "release"], "{own:#?}");
+    assert_eq!(hosts(&own), [Some(MAC), Some(MAC), Some(MAC), Some(HOST), Some(HOST)], "{own:#?}");
+    assert_eq!(own[2]["reason"], "version", "{own:#?}");
+    assert!(own.iter().all(|event| event["remote"] == true), "{own:#?}");
+}
+
+#[test]
+fn a_run_both_builders_refuse_runs_here_after_trying_each_once() {
+    let case = two_builder_case("routing-both-refuse");
+    let steps = shown(&stub(&case, &["on mac-1", "refuse version", "on builder", "refuse unreachable"]));
+    let running = case.start(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", "ran here"]));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "the command ran here: {outcome:?}");
+    assert_in_order(
+        &outcome.stderr,
+        &[
+            "gate: remote mac-1 version; trying builder",
+            "gate: remote builder unreachable; running here",
+        ],
+    );
+    assert_eq!(outcome.stderr.matches("running here").count(), 1, "{outcome:?}");
+    let own = own(&case, pid);
+    assert_eq!(
+        names(&own),
+        ["queue", "take", "fallback", "take", "fallback", "take", "release"],
+        "{own:#?}"
+    );
+    assert_eq!(
+        hosts(&own),
+        [Some(MAC), Some(MAC), Some(MAC), Some(HOST), Some(HOST), None, None],
+        "{own:#?}"
+    );
+    assert_eq!((&own[2]["reason"], &own[4]["reason"]), (&json!("version"), &json!("unreachable")));
+    assert!(own[5..].iter().all(has_no_remote_fields), "{own:#?}");
+}
+
+#[test]
+fn every_retried_reason_from_the_first_builder_tries_the_next() {
+    let case = two_builder_case("routing-retried-reasons");
+    for reason in ["full", "busy", "unreachable", "version", "parity", "install", "tools"] {
+        let refuse = format!("refuse {reason}");
+        let steps = shown(&stub(&case, &["on mac-1", &refuse, "on builder", "status 0"]));
+        let log = format!("{reason}.log");
+        let running = case.start(&routed_words(&log, &steps, &[], &[r".\tool.exe", "out", "ran here"]));
+        let pid = running.id();
+        let outcome = running.finish();
+
+        assert_eq!(outcome.code, Some(0), "{reason}: {outcome:?}");
+        let line = format!("gate: remote mac-1 {reason}; trying builder");
+        assert!(has_line(&outcome.stderr, &line), "{reason}: {outcome:?}");
+        assert!(!outcome.stderr.contains("running here"), "{reason}: {outcome:?}");
+        let own = own(&case, pid);
+        assert_eq!(names(&own), ["queue", "take", "fallback", "take", "release"], "{reason}: {own:#?}");
+        assert_eq!(own[3]["host"], HOST, "{reason}: {own:#?}");
+    }
+}
+
+#[test]
+fn every_other_reason_from_the_first_builder_runs_here_without_trying_host() {
+    let case = two_builder_case("routing-not-retried");
+    for reason in ["client", "inputs", "lfs", "layout", "desktop", "rebooted", "root"] {
+        let call = case.folder().join(format!("{reason}.json"));
+        let refuse = format!("refuse {reason}");
+        let record = format!("record {}", shown(&call));
+        let steps = shown(&stub(&case, &["on mac-1", &refuse, "on builder", &record, "status 0"]));
+        let log = format!("{reason}.log");
+        let running = case.start(&routed_words(&log, &steps, &[], &[r".\tool.exe", "out", "ran here"]));
+        let pid = running.id();
+        let outcome = running.finish();
+
+        assert_eq!(outcome.code, Some(0), "{reason}: {outcome:?}");
+        assert!(outcome.stdout.contains("ran here"), "{reason}: {outcome:?}");
+        let fell = outcome
+            .stderr
+            .lines()
+            .find(|line| line.starts_with("gate: remote mac-1 "))
+            .expect("the fallback line names the Mac");
+        assert!(fell.ends_with("; running here"), "{reason}: {fell}");
+        assert!(!outcome.stderr.contains("trying"), "{reason}: {outcome:?}");
+        assert!(!call.exists(), "{reason}: host was never called");
+        let own = own(&case, pid);
+        assert_eq!(names(&own), ["queue", "take", "fallback", "take", "release"], "{reason}: {own:#?}");
+        assert_eq!(hosts(&own), [Some(MAC), Some(MAC), Some(MAC), None, None], "{reason}: {own:#?}");
+        assert_eq!(own[2]["reason"], reason, "{own:#?}");
+    }
+}
+
+#[test]
+fn a_held_work_folder_key_runs_here_without_trying_the_next_builder() {
+    // The key is the worktree's on every builder: a key another run holds is busy on host too.
+    let case = client_case("routing-key-busy");
+    copy_tool(&case, "win.exe");
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["*tool*", "*win.exe*"] },
+        "outputs": { repo(&case): [] },
+        "builders": [{ "host": "win-2", "os": "windows", "repos": { repo(&case): ["*win.exe*"] } }],
+    });
+    write_remote_json(&case, &routing.to_string());
+    let go = Go(case.folder().join("ssh").join("go"));
+    let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
+    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
+    let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-key-wait-ms", "100"],
+        ..Tuned::default()
+    };
+    let second = start(client_gate_tuned(
+        &case,
+        "second.log",
+        &second_steps,
+        &tuned,
+        &[r".\win.exe", "out", "ran here"],
+    ));
+    let pid = second.id();
+    let outcome = second.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(has_line(&outcome.stderr, "gate: remote win-2 busy; running here"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("trying"), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(calls(&second_steps), Vec::<String>::new(), "the second run made no ssh call");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "fallback", "take", "release"], "{own:#?}");
+    assert_eq!(own[1]["host"], "win-2", "{own:#?}");
+    fs::write(go.path(), "").expect("the go file can be made");
+    assert_eq!(first.finish().code, Some(0));
+}
+
+#[test]
+fn full_pools_on_both_builders_share_one_remote_wait() {
+    let case = two_builder_case("routing-shared-budget");
+    let go = case.folder().join("go");
+    let wait_go = format!("wait {}", shown(&go));
+    let mut holders = Vec::new();
+    for (log, program) in [("mac.log", r".\tool.exe"), ("host.log", r".\host.exe")] {
+        let steps = shown(&stub(&case, &[&wait_go]));
+        let holder = case.start(&routed_words(log, &steps, &[], &[program, "out", "hi"]));
+        wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, holder.id()));
+        holders.push(holder);
+    }
+    let steps = shown(&stub(&case, &["status 0"]));
+    let waiter = case.start(&routed_words(
+        "waiter.log",
+        &steps,
+        &["--test-remote-wait-ms", "400"],
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+    let pid = waiter.id();
+    let outcome = waiter.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_in_order(
+        &outcome.stderr,
+        &[
+            "gate: waiting for a remote slot on mac-1",
+            "gate: remote mac-1 full; trying builder",
+            "gate: remote builder full; running here",
+        ],
+    );
+    assert_eq!(
+        outcome.stderr.matches("gate: waiting for a remote slot").count(),
+        1,
+        "host's pool, with nothing left of the budget, is not waited for: {outcome:?}"
+    );
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "fallback", "fallback", "take", "release"], "{own:#?}");
+    assert_eq!(hosts(&own), [Some(MAC), Some(MAC), Some(HOST), None, None], "{own:#?}");
+    let waited = own[3]["waitedSeconds"].as_f64().expect("the local take says how long the run waited");
+    assert!(
+        waited >= 0.35,
+        "the last fallback is full, so the local take counts from the queue line: {waited} s"
+    );
+    let_go(&go);
+    for holder in holders {
+        assert_eq!(holder.finish().code, Some(0));
+    }
+}
+
+#[test]
+fn a_skipped_candidate_is_noted_in_the_log_after_the_refusing_attempt_s_lines() {
+    let case = two_builder_case("routing-skipped-noted");
+    // The Mac's attempt writes over the routing file, so host is no longer one the run can be built for.
+    let routing = case.local_app_data().join("gate").join("remote.json");
+    let spoil = format!("record {}", shown(&routing));
+    let steps = shown(&stub(&case, &["on mac-1", "out attempt line", &spoil, "refuse version"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", "ran here"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert!(has_line(&outcome.stderr, "gate: remote mac-1 version; running here"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("not trying"), "the skip is for the log alone: {outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    assert_in_order(
+        &log,
+        &["attempt line", "gate: not trying builder: ", "gate: remote mac-1 version; running here"],
+    );
+    let note = format!("gate: not trying builder: ignored {}: repos is missing", routing.display());
+    assert!(has_line(&log, &note), "the reason alone, after the builder: {log}");
+}
+
+#[test]
+fn a_ctrl_c_as_the_next_builder_is_built_ends_the_run_without_saying_where_it_goes() {
+    let case = two_builder_case("routing-ctrl-c-walk");
+    let call = case.folder().join("call.json");
+    let record = format!("record {}", shown(&call));
+    let steps = shown(&stub(&case, &["on mac-1", "refuse version", "on builder", &record, "status 0"]));
+    let running = case.start(&routed_words(
+        "out.log",
+        &steps,
+        &["--test-interrupt-before-later"],
+        &[r".\tool.exe", "out", "ran here"],
+    ));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert!(!outcome.stderr.contains("trying"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("running here"), "{outcome:?}");
+    assert_in_order(
+        &outcome.stderr,
+        &["gate: remote mac-1 version\n", "gate: interrupted before the command started"],
+    );
+    assert!(!outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert!(!call.exists(), "host was never called");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "take", "fallback", "release"], "{own:#?}");
+    assert_eq!(hosts(&own), [Some(MAC), Some(MAC), Some(MAC), None], "{own:#?}");
+    assert_eq!(
+        own[3]["heldSeconds"].as_f64(),
+        Some(0.0),
+        "the release holds no slot, the Mac's ended with its fallback: {own:#?}"
+    );
+}
+
+#[test]
+fn a_run_going_on_to_the_next_builder_says_the_refusing_attempt_s_lines_first() {
+    let case = two_builder_case("routing-next-order");
+    let folder = declarations_holding(&case, &[]);
+    name_declarations(&case, &folder);
+    let go = case.folder().join("go");
+    let wait_go = format!("wait {}", shown(&go));
+    let steps = shown(&stub(
+        &case,
+        &[
+            "on mac-1",
+            "err attempt line",
+            &wait_go,
+            "refuse version",
+            "on builder",
+            "err host line",
+            "status 0",
+        ],
+    ));
+    let running = case.start(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", "hi"]));
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, running.id()));
+    // The route has read the declarations by the Mac's take, so host's build is the first read to find this file.
+    let local = folder.join("local.toml");
+    fs::write(&local, "patterns = ['*matches nothing*']\n").expect("the local file can be written");
+    let_go(&go);
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let trying = "gate: remote mac-1 version; trying builder";
+    assert_in_order(&outcome.stderr, &["attempt line", trying, "host line"]);
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let read = format!("gate: .gate/local.toml read from {}", local.display());
+    assert_in_order(&log, &["attempt line", &read, trying]);
+}
+
+#[test]
+fn the_refusing_builder_s_slot_is_let_go_before_the_next_builder_takes_its_own() {
+    let case = two_builder_case("routing-next-slot");
+    let (host_go, mac_go) = (case.folder().join("host-go"), case.folder().join("mac-go"));
+    let host_steps = shown(&stub(&case, &[&format!("wait {}", shown(&host_go))]));
+    let host_holder = case.start(&routed_words("holder.log", &host_steps, &[], &[r".\host.exe", "out", "hi"]));
+    let holder_pid = host_holder.id();
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{holder_pid},"#));
+    let wait_mac = format!("wait {}", shown(&mac_go));
+    let steps = shown(&stub(&case, &["on mac-1", &wait_mac, "refuse version", "on builder", "status 0"]));
+    // Both remote waits last as long as the hang guard, so only the awaited events end them, however loaded the PC.
+    let budget = ["--test-remote-wait-ms", "600000"];
+    let running = case.start(&routed_words("out.log", &steps, &budget, &[r".\tool.exe", "out", "hi"]));
+    let pid = running.id();
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{pid},"#));
+    // A run waiting on the Mac's pool takes its slot once the refusing run lets it go.
+    let waiter_steps = shown(&stub(&case, &["status 0"]));
+    let waiter = case.start(&routed_words("waiter.log", &waiter_steps, &budget, &[r".\tool.exe", "out", "hi"]));
+    let waiter_pid = waiter.id();
+    wait_for_journal_line(&case.root(), &format!(r#""event":"queue","pid":{waiter_pid},"#));
+    let_go(&mac_go);
+    // Host's pool stays full until the waiter holds the Mac's slot: the refusing run cannot take its own before.
+    wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{waiter_pid},"#));
+    let_go(&host_go);
+    let outcome = running.finish();
+    let waited = waiter.finish();
+
+    assert_eq!((outcome.code, waited.code), (Some(0), Some(0)), "{outcome:?} {waited:?}");
+    assert_eq!(host_holder.finish().code, Some(0));
+    let journal = events(&case);
+    let at = |pid: u32, event: &str, host: &str| {
+        journal
+            .iter()
+            .position(|line| line["pid"] == pid && line["event"] == event && line["host"] == host)
+    };
+    let found = (at(pid, "fallback", MAC), at(waiter_pid, "take", MAC), at(pid, "take", HOST));
+    assert!(
+        matches!(found, (Some(fallback), Some(waiter_take), Some(host_take)) if fallback < waiter_take && waiter_take < host_take),
+        "the Mac's slot is let go, and taken by the waiter, before host's take: {found:?} {journal:#?}"
+    );
+}
+
+#[test]
+fn a_ctrl_c_on_the_first_builder_tries_no_other() {
+    let case = two_builder_case("routing-ctrl-c-next");
+    let call = case.folder().join("call.json");
+    let record = format!("record {}", shown(&call));
+    let steps = shown(&stub(
+        &case,
+        &["on mac-1", "interrupt", "refuse version", "on builder", &record, "status 0"],
+    ));
+    let running = case.start(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", "ran here"]));
+    let pid = running.id();
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    assert!(!outcome.stderr.contains("trying"), "{outcome:?}");
+    assert!(!outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert!(!call.exists(), "host was never called");
+    let own = own(&case, pid);
+    assert_eq!(names(&own), ["queue", "take", "release"], "{own:#?}");
+    assert_eq!(hosts(&own), [Some(MAC); 3], "{own:#?}");
 }

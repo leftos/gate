@@ -142,6 +142,22 @@ fn the_interrupt_after_fallback_seam_is_a_switch() {
     );
 }
 
+/// The seam that raises Ctrl+C once a fallback walk has built the next builder is a switch of its own, off unless given.
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_interrupt_before_later_seam_parses_as_its_own_switch() {
+    use crate::support::run_request;
+
+    let words = with(&RUN, &["--test-interrupt-before-later", "--", "cmd"]);
+    let seams = run_request(&refs(&words)).test_seams;
+    assert!(seams.interrupt_before_later);
+    assert!(!seams.interrupt_before_key, "it is its own switch");
+    assert!(
+        !run_request(&refs(&with(&RUN, &["--", "cmd"]))).test_seams.interrupt_before_later,
+        "off unless given"
+    );
+}
+
 /// The seams of the key wait: its bound is a whole number above zero, and the raise before the take is a switch of its
 /// own, off unless given.
 #[cfg(feature = "test-seams")]

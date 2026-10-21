@@ -372,33 +372,41 @@ pub enum LocalReason {
 }
 
 impl LocalReason {
-    /// The line the gate says, on standard error and in the log.
+    /// The line the gate says, on standard error and in the log: [`LocalReason::reason`] after `gate: not routed: `,
+    /// or, for an ignored routing file, [`ignored_line`].
     #[must_use]
     pub fn line(&self) -> String {
         match self {
-            Self::LocalFlag => "gate: not routed: --local".to_owned(),
             Self::Ignored { path, reason } => ignored_line(path, reason),
-            Self::Outside { word } => format!("gate: not routed: {word} is outside the worktree"),
+            _ => format!("gate: not routed: {}", self.reason()),
+        }
+    }
+
+    /// Why the command runs here, on its own: the line's text after its `gate: not routed: ` or `gate: ` prefix, and
+    /// without an ignored routing file's `; running locally`.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        match self {
+            Self::LocalFlag => "--local".to_owned(),
+            Self::Ignored { path, reason } => format!("ignored {}: {reason}", path.display()),
+            Self::Outside { word } => format!("{word} is outside the worktree"),
             Self::OtherWorktree { tree } => {
                 let tree = cd_value(tree);
-                format!("gate: not routed: the command works in {tree}; run it with --cd {tree}")
+                format!("the command works in {tree}; run it with --cd {tree}")
             }
-            Self::NothingSent { subfolder } => format!("gate: not routed: {subfolder} holds nothing the snapshot sends"),
-            Self::Failed { reason } => format!("gate: not routed: {reason}"),
+            Self::NothingSent { subfolder } => format!("{subfolder} holds nothing the snapshot sends"),
+            Self::Failed { reason } => reason.clone(),
             Self::SiblingsFile { file, problem } | Self::DesktopFile { file, problem } | Self::LocalFile { file, problem } => {
-                format!("gate: not routed: {file}: {problem}")
+                format!("{file}: {problem}")
             }
-            Self::DeclaredLocal { file, pattern } => format!("gate: not routed: {file} keeps it here ({})", escaped(pattern)),
-            Self::SiblingMissing { name } => format!("gate: not routed: sibling {name} not found beside the worktree"),
-            Self::SiblingRefused { name, reason } => format!("gate: not routed: sibling {name} {reason}"),
-            Self::SiblingsNotAllowed { names, problem } => not_allowed_line(names, problem.as_deref()),
-            Self::LeafNotLaidOut { leaf } => format!("gate: not routed: the worktree folder name {leaf} cannot be laid out on the builder"),
+            Self::DeclaredLocal { file, pattern } => format!("{file} keeps it here ({})", escaped(pattern)),
+            Self::SiblingMissing { name } => format!("sibling {name} not found beside the worktree"),
+            Self::SiblingRefused { name, reason } => format!("sibling {name} {reason}"),
+            Self::SiblingsNotAllowed { names, problem } => not_allowed_reason(names, problem.as_deref()),
+            Self::LeafNotLaidOut { leaf } => format!("the worktree folder name {leaf} cannot be laid out on the builder"),
             Self::DesktopNotAllowed { pattern, problem } => {
                 let problem = problem.as_ref().map_or_else(String::new, |problem| format!(": {problem}"));
-                format!(
-                    "gate: not routed: desktop pattern '{}' not allowed in remote.json{problem}",
-                    escaped(pattern)
-                )
+                format!("desktop pattern '{}' not allowed in remote.json{problem}", escaped(pattern))
             }
         }
     }
@@ -414,17 +422,17 @@ fn cd_value(tree: &Path) -> String {
     if tree.contains(CD_QUOTED) { format!("\"{tree}\"") } else { tree }
 }
 
-/// The line of declared siblings `remote.json` does not allow: `sibling b is` for one, `siblings b, c are` for more,
-/// then `not allowed in remote.json`, and the reason its `siblings` value cannot be used after a colon when it cannot.
-/// Each name is shown [`escaped`].
-fn not_allowed_line(names: &[String], problem: Option<&str>) -> String {
+/// Why declared siblings `remote.json` does not allow keep the command here: `sibling b is` for one, `siblings b, c
+/// are` for more, then `not allowed in remote.json`, and the reason its `siblings` value cannot be used after a colon
+/// when it cannot. Each name is shown [`escaped`].
+fn not_allowed_reason(names: &[String], problem: Option<&str>) -> String {
     let names: Vec<String> = names.iter().map(|name| escaped(name)).collect();
     let refused = match names.as_slice() {
         [name] => format!("sibling {name} is"),
         _ => format!("siblings {} are", names.join(", ")),
     };
     let problem = problem.map_or_else(String::new, |problem| format!(": {problem}"));
-    format!("gate: not routed: {refused} not allowed in remote.json{problem}")
+    format!("{refused} not allowed in remote.json{problem}")
 }
 
 /// A command routed to the builder.
@@ -490,19 +498,17 @@ pub struct RemoteRun {
     pub source_revision: Option<String>,
     /// The builders the run may try next when it falls back, in the order it would try them, from the config alone:
     /// each `builders` entry listing the repo, in file order, then `host`, minus the builder this run goes to, each
-    /// with the first pattern of its own list that the command matched. A caller that falls back checks a candidate
-    /// through the pick's steer-off rules and builds its run when it tries it; nothing is built here.
+    /// one a pattern of whose own list the command matched, held by its alias alone. A caller that falls back builds a
+    /// candidate's run when it tries it ([`later_run`]); nothing is built here.
     pub later: Vec<LaterCandidate>,
 }
 
-/// A builder a routed run may try next when it falls back: the builder, and the first pattern of its own list for the
-/// repo that the command matched ([`first_match`]), as the config gives them.
+/// A builder a routed run may try next when it falls back, by its alias; its entry is read from the routing file when
+/// it is tried ([`later_run`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaterCandidate {
-    /// The builder the run would go to.
-    pub builder: Builder,
-    /// The first pattern of the builder's own list for the repo that the command matched.
-    pub pattern: String,
+    /// The builder's alias.
+    pub alias: String,
 }
 
 /// How a routed `dotnet test --no-build` keeps its `--no-build` ([`RemoteRun::send`]).
@@ -667,15 +673,7 @@ struct Matched {
 fn route(inputs: &Inputs<'_>, facts: &dyn Facts) -> Result<RemoteRun, Here> {
     let config = eligible(inputs, facts)?;
     let matched = matched(&config, inputs.git_hook, inputs.words, facts)?;
-    if let Some(word) = matched.outside.clone() {
-        return Err(Some(outside_reason(&config, word, &matched, facts)));
-    }
-    let place = &matched.target.place;
-    let subfolder = place.prefix.trim_end_matches('/').to_owned();
-    if !place.prefix.is_empty() && !facts.folder_has_files(place).map_err(|reason| Some(failed(&reason)))? {
-        return Err(Some(LocalReason::NothingSent { subfolder }));
-    }
-    Ok(remote_run(&config, matched, subfolder, inputs.words, facts))
+    ended(&config, matched, inputs.words, facts)
 }
 
 /// Why the `matched` command whose `word` names a path outside the worktree runs here: the git worktree its outside
@@ -959,6 +957,88 @@ fn file_stem(path: &str) -> &str {
 /// written with `/` ([`unix_form`]); a pick whose words still hold a `\` goes on, silently, to the next builder that is
 /// no macOS one ([`steer_off_backslashes`]).
 fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts) -> Result<Matched, Here> {
+    let (opened, drives, sent) = opened_and_sent(config, git_hook, words, facts)?;
+    let first = pick(config, &opened.repo, &sent.words, |_| true).ok_or(None)?;
+    check_local(&opened.place, &sent.words, facts)?;
+    let (builder, pattern, found) = steer_off_macos(config, &opened, &sent.words, facts, first)?;
+    let unix = slashed(&builder, &opened, words, &drives, facts);
+    let (builder, pattern, unix) = steer_off_backslashes(config, &opened, &sent.words, (builder, pattern, unix))?;
+    let later = later_candidates(config, &opened.repo, &builder, &sent.words);
+    let kept = Kept {
+        builder,
+        pattern,
+        found,
+        unix,
+    };
+    let mut matched = built(config, opened, sent, kept, facts)?;
+    matched.later = later;
+    Ok(matched)
+}
+
+/// A builder the pipeline kept for the command, once its steer-off rules let it run it.
+struct Kept {
+    builder: Builder,
+    /// The pattern of the builder's own list that matched.
+    pattern: String,
+    /// What the pick read of the worktree's `.gate/desktop.toml` ([`macos_desktop`]).
+    found: DesktopRead,
+    /// A macOS pick's words in their Unix form; `None` for another builder, which runs the words as sent.
+    unix: Option<Vec<String>>,
+}
+
+/// The matched command on the `kept` builder, from the opened worktree and the words `sent` rewritten for Windows: its
+/// target settled ([`settle`]) and whether it asks for the desktop ([`check_desktop`]), with no later candidates. What
+/// [`matched`] and [`later_run`] both build.
+fn built(config: &Config, opened: Opened, sent: Rewritten, kept: Kept, facts: &dyn Facts) -> Result<Matched, Here> {
+    let target = settle(config, opened, kept.builder, facts)?;
+    let desktop = check_desktop(config, &target, kept.found, &sent.words, facts)?;
+    Ok(Matched {
+        target,
+        pattern: kept.pattern,
+        words: kept.unix.unwrap_or(sent.words),
+        outside: sent.outside,
+        outside_path: sent.outside_path,
+        program_named: sent.program_named,
+        desktop,
+        later: Vec::new(),
+    })
+}
+
+/// The routed run of the `matched` command, as the decision ends: here, saying why, when a word names a path outside
+/// the worktree ([`outside_reason`]), or when the gate's folder below the root holds nothing the snapshot sends; else
+/// the run on its builder ([`remote_run`]), for the command as `given`. What [`route`] and [`later_run`] both end
+/// with.
+fn ended(config: &Config, matched: Matched, given: &[String], facts: &dyn Facts) -> Result<RemoteRun, Here> {
+    if let Some(word) = matched.outside.clone() {
+        return Err(Some(outside_reason(config, word, &matched, facts)));
+    }
+    let place = &matched.target.place;
+    let subfolder = place.prefix.trim_end_matches('/').to_owned();
+    if !place.prefix.is_empty() && !facts.folder_has_files(place).map_err(|reason| Some(failed(&reason)))? {
+        return Err(Some(LocalReason::NothingSent { subfolder }));
+    }
+    Ok(remote_run(config, matched, subfolder, given, facts))
+}
+
+/// What a pick of `builder` runs as far as a macOS builder's rewrite goes: for a macOS builder, the opened worktree's
+/// command `words` in their Unix form ([`unix_words`]), or that a `\` is left; nothing for another builder.
+fn slashed(builder: &Builder, opened: &Opened, words: &[String], drives: &[(char, String)], facts: &dyn Facts) -> Slashed {
+    match builder.os {
+        BuilderOs::Macos => unix_words(opened, words, drives, facts).map_or(Slashed::Backslash, Slashed::Unix),
+        BuilderOs::Windows => Slashed::NotMacos,
+    }
+}
+
+/// The opened worktree, the subst table of the command's words and the words rewritten for Windows
+/// ([`opened_and_sent`]).
+type OpenedAndSent = (Opened, Vec<(char, String)>, Rewritten);
+
+/// The worktree of the gate's place when the routing file lists its repo, the subst table of `words` and the words
+/// rewritten for Windows ([`Separators::AsWritten`]): what every pick of the command starts from ([`matched`],
+/// [`later_run`]). A gate inside a git hook whose repo `hooks` does not name stays here silently, before its siblings file
+/// is read, as does one whose place cannot be read, and one whose first word the rewrite sent as the name of a program
+/// that stays on this PC ([`stays_local`]).
+fn opened_and_sent(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts) -> Result<OpenedAndSent, Here> {
     let place = match facts.place() {
         Ok(Some(place)) => place,
         Ok(None) => return Err(None),
@@ -974,66 +1054,110 @@ fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts)
     if sent.program_named && stays_local(&sent.words) {
         return Err(None);
     }
-    let first = pick(config, &opened.repo, &sent.words, |_| true).ok_or(None)?;
-    check_local(&opened.place, &sent.words, facts)?;
-    let (builder, pattern, found) = steer_off_macos(config, &opened, &sent.words, facts, first)?;
-    let slashed =
-        (builder.os == BuilderOs::Macos).then(|| rewritten(&opened.place, declared_pairs(&opened.siblings), words, &drives, Separators::Slash).words);
-    let (builder, pattern, unix_words) = steer_off_backslashes(config, &opened, &sent.words, facts, (builder, pattern, slashed))?;
-    let target = settle(config, opened, builder, facts)?;
-    let desktop = check_desktop(config, &target, found, &sent.words, facts)?;
-    let later = later_candidates(config, &target, &sent.words);
-    Ok(Matched {
-        target,
-        pattern,
-        words: unix_words.unwrap_or(sent.words),
-        outside: sent.outside,
-        outside_path: sent.outside_path,
-        program_named: sent.program_named,
-        desktop,
-        later,
-    })
+    Ok((opened, drives, sent))
 }
 
-/// The builders the run may try next, in the order it would try them: [`Config::routes`] order, minus the pick, each
-/// with the first of its own patterns that matches the `sent` words. The config alone decides them; no fact is asked.
-fn later_candidates(config: &Config, target: &Target, sent: &[String]) -> Vec<LaterCandidate> {
-    let mut later = Vec::new();
-    for (builder, patterns) in config.routes(&target.repo) {
-        if *builder == target.builder {
-            continue;
-        }
-        if let Some(pattern) = first_match(patterns, sent) {
-            later.push(LaterCandidate {
-                builder: builder.clone(),
-                pattern,
-            });
-        }
+/// The routed run on the later `candidate` of a run its first builder sent back ([`RemoteRun::later`]), built when the
+/// caller tries it, through the pick's pipeline with the candidate in place of the pick: the decision's `inputs` and
+/// `facts` asked again, the candidate's builder and the first of its patterns that matches taken from the routing file
+/// as it reads now, the worktree's `.gate/local.toml` checked as the first pick's is ([`check_local`]), then the
+/// builder kept unless a macOS one's steer-off rule would move a pick off it ([`steer_off_macos`],
+/// [`steer_off_backslashes`]), then built and ended as the first pick's run is ([`built`], [`ended`]), with its own
+/// words, outputs, send plan and desktop flag, and no later candidates of its own.
+///
+/// # Errors
+///
+/// `Err(None)` for a candidate a steer-off rule moves off, which says nothing; `Err(Some(why))`, on one line, for one
+/// the routing file no longer lists for the repo or whose patterns no longer match, and for one the decision would now
+/// keep here. The caller goes on to the next.
+pub fn later_run(inputs: &Inputs<'_>, facts: &dyn Facts, candidate: &LaterCandidate) -> Result<RemoteRun, Option<String>> {
+    let config = eligible(inputs, facts).map_err(|here| Some(kept_here(here)))?;
+    let (opened, drives, sent) = opened_and_sent(&config, inputs.git_hook, inputs.words, facts).map_err(|here| Some(kept_here(here)))?;
+    let alias = &candidate.alias;
+    let (builder, patterns) = config
+        .routes(&opened.repo)
+        .into_iter()
+        .find(|(builder, _)| builder.alias == *alias)
+        .ok_or_else(|| Some(format!("remote.json no longer lists it for {}", opened.repo)))?;
+    let builder = builder.clone();
+    let pattern = first_match(patterns, &sent.words).ok_or_else(|| Some("none of its patterns matches the command now".to_owned()))?;
+    check_local(&opened.place, &sent.words, facts).map_err(|here| Some(kept_here(here)))?;
+    let found = macos_desktop(&builder, &opened, &sent.words, facts).map_err(|here| Some(kept_here(here)))?;
+    if found.steers_off() {
+        return Err(None);
     }
-    later
+    let unix = match slashed(&builder, &opened, inputs.words, &drives, facts) {
+        Slashed::Backslash => return Err(None),
+        Slashed::Unix(words) => Some(words),
+        Slashed::NotMacos => None,
+    };
+    let kept = Kept {
+        builder,
+        pattern,
+        found,
+        unix,
+    };
+    let matched = built(&config, opened, sent, kept, facts).map_err(|here| Some(kept_here(here)))?;
+    ended(&config, matched, inputs.words, facts).map_err(|here| Some(kept_here(here)))
 }
 
-/// The pick `picked` of the opened worktree's command, with the words a macOS pick runs, rewritten with `/`: kept, its
-/// words in their Unix form ([`unix_form`]), unless a word of that form still holds a `\`, which the Mac would read
-/// another way; then the pick goes on, silently, to the next builder that is no macOS one, which runs the `sent` words,
-/// as [`steer_off_macos`] does. A pick of another builder carries no rewritten words and is kept as it is. `Err(None)`
-/// when no other builder's pattern matches.
+/// Why a later candidate is not tried when the decision would now keep the run here: its reason
+/// ([`LocalReason::reason`]), or that it would stay here silently.
+fn kept_here(here: Here) -> String {
+    here.map_or_else(|| "the routing decision would now run it here".to_owned(), |reason| reason.reason())
+}
+
+/// The builders `repo`'s run may try next after the `chosen` one, in the order it would try them: [`Config::routes`]
+/// order, minus the chosen builder, each with one of its own patterns that matches the `sent` words. The config alone
+/// decides them; no fact is asked.
+fn later_candidates(config: &Config, repo: &str, chosen: &Builder, sent: &[String]) -> Vec<LaterCandidate> {
+    config
+        .routes(repo)
+        .into_iter()
+        .filter(|(builder, patterns)| *builder != chosen && first_match(patterns, sent).is_some())
+        .map(|(builder, _)| LaterCandidate {
+            alias: builder.alias.clone(),
+        })
+        .collect()
+}
+
+/// The words a macOS builder runs for the opened worktree's command `words`: rewritten with `/` under the subst table
+/// `drives`, in their Unix form ([`unix_form`]); `None` when a word of that form still holds a `\`, which the Mac would
+/// read another way.
+fn unix_words(opened: &Opened, words: &[String], drives: &[(char, String)], facts: &dyn Facts) -> Option<Vec<String>> {
+    let slashed = rewritten(&opened.place, declared_pairs(&opened.siblings), words, drives, Separators::Slash).words;
+    unix_form(&opened.place, slashed, facts)
+}
+
+/// What a pick's builder runs of the command as far as a macOS builder's rewrite goes ([`unix_words`]).
+enum Slashed {
+    /// The pick is no macOS builder: it runs the words rewritten for Windows.
+    NotMacos,
+    /// A macOS pick's words in their Unix form.
+    Unix(Vec<String>),
+    /// A macOS pick whose words still hold a `\`.
+    Backslash,
+}
+
+/// The pick `chosen` of the opened worktree's command, with what a macOS pick runs ([`unix_words`]): kept, with its
+/// Unix words, unless they could not be had; then the pick goes on, silently, to the next builder that is no macOS one,
+/// which runs the `sent` words, as [`steer_off_macos`] does. A pick of another builder carries no Unix words and is kept
+/// as it is. `Err(None)` when no other builder's pattern matches.
 fn steer_off_backslashes(
     config: &Config,
     opened: &Opened,
     sent: &[String],
-    facts: &dyn Facts,
-    picked: (Builder, String, Option<Vec<String>>),
+    chosen: (Builder, String, Slashed),
 ) -> Result<(Builder, String, Option<Vec<String>>), Here> {
-    let (builder, pattern, slashed) = picked;
-    let Some(slashed) = slashed else {
-        return Ok((builder, pattern, None));
-    };
-    if let Some(unix) = unix_form(&opened.place, slashed, facts) {
-        return Ok((builder, pattern, Some(unix)));
+    let (builder, pattern, unix) = chosen;
+    match unix {
+        Slashed::NotMacos => Ok((builder, pattern, None)),
+        Slashed::Unix(unix) => Ok((builder, pattern, Some(unix))),
+        Slashed::Backslash => {
+            let (builder, pattern) = pick(config, &opened.repo, sent, |other| other.os != BuilderOs::Macos).ok_or(None)?;
+            Ok((builder, pattern, None))
+        }
     }
-    let (builder, pattern) = pick(config, &opened.repo, sent, |other| other.os != BuilderOs::Macos).ok_or(None)?;
-    Ok((builder, pattern, None))
 }
 
 /// The PowerShell programs whose `-c` or `-Command` switch, in any letter case, makes every later word a script's text.
@@ -1225,15 +1349,21 @@ fn steer_off_macos(
     facts: &dyn Facts,
     first: (Builder, String),
 ) -> Result<(Builder, String, DesktopRead), Here> {
-    if first.0.os != BuilderOs::Macos {
-        return Ok((first.0, first.1, DesktopRead::NotRead));
-    }
-    let found = desktop_pattern(&opened.place, words, facts)?;
-    if found.is_none() {
-        return Ok((first.0, first.1, DesktopRead::Read(found)));
+    let read = macos_desktop(&first.0, opened, words, facts)?;
+    if !read.steers_off() {
+        return Ok((first.0, first.1, read));
     }
     let (builder, pattern) = pick(config, &opened.repo, words, |builder| builder.os != BuilderOs::Macos).ok_or(None)?;
-    Ok((builder, pattern, DesktopRead::Read(found)))
+    Ok((builder, pattern, read))
+}
+
+/// What a pick of `builder` reads of the opened worktree's `.gate/desktop.toml` for the command `words`: the first
+/// declared pattern they match ([`desktop_pattern`]) for a macOS builder, nothing for another.
+fn macos_desktop(builder: &Builder, opened: &Opened, words: &[String], facts: &dyn Facts) -> Result<DesktopRead, Here> {
+    if builder.os != BuilderOs::Macos {
+        return Ok(DesktopRead::NotRead);
+    }
+    Ok(DesktopRead::Read(desktop_pattern(&opened.place, words, facts)?))
 }
 
 /// What the pick read of the worktree's `.gate/desktop.toml` ([`steer_off_macos`]).
@@ -1242,6 +1372,14 @@ enum DesktopRead {
     NotRead,
     /// The first declared pattern the command matches, if any.
     Read(Option<String>),
+}
+
+impl DesktopRead {
+    /// Whether the pick goes off the macOS builder it read the file for ([`macos_desktop`]): a declared pattern
+    /// matches the command, and a macOS builder has no desktop to run it on.
+    fn steers_off(&self) -> bool {
+        matches!(self, DesktopRead::Read(Some(_)))
+    }
 }
 
 /// Whether a matched command asks for the builder's desktop: the first pattern of the worktree's `.gate/desktop.toml`

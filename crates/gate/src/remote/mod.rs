@@ -625,7 +625,9 @@ mod snapshot_only {
 /// when the path exists or the interrupt is raised, the latter ending the run with `STATUS_CONTROL_C_EXIT`;
 /// `interrupt` raises the call's interrupt; `killed` marks the run killed; `status <n>` sets the status; `refuse
 /// <reason>` refuses with status 75; `fail-start <why>` ends the run as a client that could not start; `warmed`,
-/// `warm-failed commands|refused <reason>` and `warm-deleted` set how a warm-up ended.
+/// `warm-failed commands|refused <reason>` and `warm-deleted` set how a warm-up ended. `on <alias>` starts a block of
+/// steps that run only for a call to that builder; the steps before the first `on` line run for every builder without a
+/// block of its own, and an alias has one block at most.
 #[cfg(feature = "test-seams")]
 mod scripted {
     use std::fs;
@@ -663,8 +665,10 @@ mod scripted {
         FallbackReason::Root,
     ];
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, Clone, PartialEq)]
     pub(super) enum Step {
+        /// Starts the block of steps that run only for a call to this builder alias.
+        On(String),
         Out(String),
         Err(String),
         Record(PathBuf),
@@ -708,7 +712,7 @@ mod scripted {
                 }
                 outcome.lines.push(gate_router::DROPPED_NO_BUILD_LINE.to_owned());
             }
-            for step in &self.steps {
+            for step in steps_for(&self.steps, call.host()) {
                 match perform(step, call, &mut outcome) {
                     Ok(true) => {}
                     Ok(false) => break,
@@ -719,13 +723,32 @@ mod scripted {
         }
     }
 
-    /// The steps of `text`, blank lines skipped, or the first line that is no step, by its number.
+    /// The steps of `text`, blank lines skipped, or the first line that is no step, by its number: an `on` line whose
+    /// alias an earlier one named is none.
     pub(super) fn parse(text: &str) -> Result<Vec<Step>, String> {
-        text.lines()
-            .enumerate()
-            .filter(|(_, line)| !line.trim().is_empty())
-            .map(|(index, line)| step(line).map_err(|why| format!("line {}: {why}", index + 1)))
-            .collect()
+        let mut steps = Vec::new();
+        for (index, line) in text.lines().enumerate().filter(|(_, line)| !line.trim().is_empty()) {
+            let step = step(line).map_err(|why| format!("line {}: {why}", index + 1))?;
+            if let Step::On(alias) = &step
+                && steps.contains(&step)
+            {
+                return Err(format!("line {}: {alias} already has its own steps", index + 1));
+            }
+            steps.push(step);
+        }
+        Ok(steps)
+    }
+
+    /// The steps of `steps` a call to `host` runs: those after its own `on` line, up to the next `on` line, when it has
+    /// one; else those before the first `on` line.
+    pub(super) fn steps_for<'s>(steps: &'s [Step], host: &str) -> &'s [Step] {
+        let own = steps.iter().position(|step| matches!(step, Step::On(alias) if alias == host));
+        let start = own.map_or(0, |at| at + 1);
+        let end = steps[start..]
+            .iter()
+            .position(|step| matches!(step, Step::On(_)))
+            .map_or(steps.len(), |at| start + at);
+        &steps[start..end]
     }
 
     fn step(line: &str) -> Result<Step, String> {
@@ -737,6 +760,7 @@ mod scripted {
 
     fn bare_step(word: &str) -> Result<Step, String> {
         match word {
+            "on" => Err("on takes a builder's alias".to_owned()),
             "interrupt" => Ok(Step::Interrupt),
             "killed" => Ok(Step::Killed),
             "warmed" => Ok(Step::Warmed),
@@ -771,6 +795,8 @@ mod scripted {
                 .map(Step::Refuse)
                 .ok_or_else(|| format!("refuse takes a reason, got '{operand}'")),
             "warm-failed" => warm_failed(operand),
+            "on" if !operand.is_empty() && !operand.contains(' ') => Ok(Step::On(operand.to_owned())),
+            "on" => Err(format!("on takes one builder's alias, got '{operand}'")),
             other => Err(format!("unknown step '{other}'")),
         }
     }
@@ -829,7 +855,7 @@ mod scripted {
                 });
             }
             Step::WarmDeleted => outcome.warm = Some(WarmEnd::Deleted),
-            Step::Out(_) | Step::Err(_) | Step::Record(_) | Step::Wait(_) => {}
+            Step::Out(_) | Step::Err(_) | Step::Record(_) | Step::Wait(_) | Step::On(_) => {}
         }
         true
     }
@@ -912,7 +938,46 @@ mod scripted {
         use gate_state::FallbackReason;
         use gate_state::v1::WarmFailure;
 
-        use super::{Step, parse};
+        use super::{Step, parse, steps_for};
+
+        /// The steps the file `text` runs for a call to `host`.
+        fn run_for(text: &str, host: &str) -> Result<Vec<Step>, String> {
+            parse(text).map(|steps| steps_for(&steps, host).to_vec())
+        }
+
+        #[test]
+        fn an_on_block_runs_only_for_a_call_to_its_host() {
+            let text = "on mac-1\nrefuse version\non host-a\nstatus 0\n";
+            assert_eq!(run_for(text, "mac-1"), Ok(vec![Step::Refuse(FallbackReason::Version)]));
+            assert_eq!(run_for(text, "host-a"), Ok(vec![Step::Status(0)]));
+            assert_eq!(run_for(text, "host-b"), Ok(Vec::new()), "no shared steps and no block of its own");
+        }
+
+        #[test]
+        fn a_file_without_an_on_line_runs_every_step_for_every_host() {
+            assert_eq!(run_for("refuse full\n", "mac-1"), Ok(vec![Step::Refuse(FallbackReason::Full)]));
+            assert_eq!(run_for("refuse full\n", "host-a"), Ok(vec![Step::Refuse(FallbackReason::Full)]));
+        }
+
+        #[test]
+        fn the_steps_before_the_first_on_line_run_for_a_host_without_a_block() {
+            let text = "out hi\non mac-1\nrefuse install\n";
+            assert_eq!(run_for(text, "mac-1"), Ok(vec![Step::Refuse(FallbackReason::Install)]), "no out hi");
+            assert_eq!(run_for(text, "host-a"), Ok(vec![Step::Out("hi".to_owned())]));
+        }
+
+        #[test]
+        fn an_on_line_takes_exactly_one_alias_never_twice() {
+            assert_eq!(parse("out a\non\n"), Err("line 2: on takes a builder's alias".to_owned()));
+            assert_eq!(
+                parse("on mac-1 extra\n"),
+                Err("line 1: on takes one builder's alias, got 'mac-1 extra'".to_owned())
+            );
+            assert_eq!(
+                parse("on mac-1\nstatus 0\non mac-1\n"),
+                Err("line 3: mac-1 already has its own steps".to_owned())
+            );
+        }
 
         #[test]
         fn each_step_parses_from_its_line() {

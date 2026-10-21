@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use gate_router::{
     BuildSettings, BuildTarget, Builder, BuilderOs, Config, ConfigProblem, DROPPED_NO_BUILD_LINE, DotnetTarget, Facts, Inputs, LocalReason,
     NO_OUTPUTS_LINE, PROJECT_EXTENSIONS, Pattern, Place, RemoteRun, Route, SiblingFolder, Slot, Target, build_settings, builder_words, decide,
-    dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host, sdk_build_target, target, without_no_build, work_folder_key,
+    dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host, later_run, sdk_build_target, target, without_no_build, work_folder_key,
 };
 
 use crate::support::{FakeFacts, HEAD, ROOT, carried, fake_id, heavy, place_at, sibling_root, words};
@@ -2590,7 +2590,7 @@ fn a_warm_up_target_goes_to_host_even_when_a_builder_entry_lists_the_repo() {
 
 /// The builders [`RemoteRun::later`] lists after the first pick, in try order, by alias.
 fn later_aliases(run: &RemoteRun) -> Vec<&str> {
-    run.later.iter().map(|later| later.builder.alias.as_str()).collect()
+    run.later.iter().map(|later| later.alias.as_str()).collect()
 }
 
 #[test]
@@ -2600,13 +2600,18 @@ fn a_routed_command_lists_every_other_matching_builder_in_file_order_then_host()
         r#"[{"host": "mac-1", "os": "macos", "root": "/Users/me/gate", "repos": {"yaat": ["dotnet build*"]}},
             {"host": "win-2", "os": "windows", "slots": 3, "repos": {"yaat": ["cargo *", "dotnet build*"]}}]"#,
     );
-    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &FakeFacts::with_config(config)));
+    let command = words(&["dotnet", "build"]);
+    let facts = FakeFacts::with_config(config);
+    let run = routed(decide(&heavy(&command), &facts));
     assert_eq!(run.builder, mac_builder());
     assert_eq!(later_aliases(&run), ["win-2", "builder-1"]);
+    let patterns: Vec<String> = (0..2)
+        .map(|at| later_of(&run, at, &command, &facts).expect("each candidate can be tried").pattern)
+        .collect();
     assert_eq!(
-        run.later.iter().map(|later| later.pattern.as_str()).collect::<Vec<_>>(),
+        patterns,
         ["dotnet build*", "dotnet *"],
-        "each candidate keeps the first pattern of its own list that matched"
+        "each candidate runs under the first pattern of its own list that matches"
     );
 }
 
@@ -2660,6 +2665,124 @@ fn building_the_later_candidates_asks_no_fact() {
     assert_eq!(later_aliases(&run), ["builder-1"], "host may be tried next");
     assert_eq!(routed(decide(&heavy(&command), &alone)).builder.alias, "mac-1");
     assert_eq!(with.asked(), alone.asked(), "listing host asks no fact");
+}
+
+/// The run of the later candidate `at` of `run`, built for the command `command` as the first pick was.
+fn later_of(run: &RemoteRun, at: usize, command: &[String], facts: &FakeFacts) -> Result<RemoteRun, Option<String>> {
+    later_run(&heavy(command), facts, &run.later[at])
+}
+
+#[test]
+fn a_windows_candidate_after_a_macos_pick_runs_the_path_word_with_backslashes() {
+    let command = words(&["dotnet", "build", r"X:\dev\yaat.wt\a\src\Duel.sln"]);
+    let facts = FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_BUILD));
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder, mac_builder());
+    assert_eq!(run.words, stamped(&["dotnet", "build", "src/Duel.sln"]));
+    let host = later_of(&run, 0, &command, &facts).expect("host can be tried");
+    assert_eq!(host.builder, host_builder("builder-1", 1));
+    assert_eq!(host.words, stamped(&["dotnet", "build", r"src\Duel.sln"]));
+    assert_eq!(host.outputs, ["**/bin/**", "**/.godot/mono/temp/bin/**"], "host's own outputs");
+    assert_eq!(host.key, run.key, "the work folder is the worktree's");
+}
+
+#[test]
+fn each_later_candidate_runs_under_its_own_pattern() {
+    let config = with_builders(
+        r#"{"yaat": ["dotnet *"]}"#,
+        r#"[{"host": "mac-1", "os": "macos", "root": "/Users/me/gate", "repos": {"yaat": ["dotnet build*"]}},
+            {"host": "win-2", "os": "windows", "slots": 3, "repos": {"yaat": ["cargo *", "dotnet build*"]}}]"#,
+    );
+    let command = words(&["dotnet", "build"]);
+    let facts = FakeFacts::with_config(config);
+    let run = routed(decide(&heavy(&command), &facts));
+    let second = later_of(&run, 0, &command, &facts).expect("win-2 can be tried");
+    assert_eq!((second.builder.alias.as_str(), second.pattern.as_str()), ("win-2", "dotnet build*"));
+    let third = later_of(&run, 1, &command, &facts).expect("host can be tried");
+    assert_eq!((third.builder.alias.as_str(), third.pattern.as_str()), ("builder-1", "dotnet *"));
+}
+
+#[test]
+fn a_later_candidate_is_built_from_the_routing_file_as_it_reads_at_the_fallback() {
+    let builders = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet *"]}},
+        {"host": "win-2", "os": "windows", "repos": {"yaat": ["dotnet *"]}}]"#;
+    let command = words(&["dotnet", "build"]);
+    let at_route = FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, builders));
+    let run = routed(decide(&heavy(&command), &at_route));
+    assert_eq!(later_aliases(&run), ["win-2", "builder-1"]);
+
+    let edited = r#"{"host": "builder-1", "slots": 4, "repos": {"yaat": ["dotnet build*"]},
+        "builders": [{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet *"]}}]}"#;
+    let at_fallback = FakeFacts::with_config(Config::parse(edited).expect("usable"));
+    assert!(
+        matches!(later_of(&run, 0, &command, &at_fallback), Err(Some(_))),
+        "win-2 is no longer listed, which is a reason, not a steer-off"
+    );
+    let host = later_of(&run, 1, &command, &at_fallback).expect("host can be tried");
+    assert_eq!(host.builder, host_builder("builder-1", 4), "host as the routing file now reads");
+    assert_eq!(host.pattern, "dotnet build*", "the pattern matched again from its fresh entry");
+}
+
+#[test]
+fn a_later_candidate_the_local_file_now_keeps_here_is_skipped_with_its_reason() {
+    let command = words(&["dotnet", "build"]);
+    let config = with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_BUILD);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config.clone())));
+    assert_eq!(later_aliases(&run), ["builder-1"]);
+    let now = FakeFacts {
+        local: Ok(patterns(&["dotnet build*"])),
+        ..FakeFacts::with_config(config)
+    };
+    let skipped = later_of(&run, 0, &command, &now);
+    assert!(
+        matches!(&skipped, Err(Some(why)) if why.starts_with(".gate/local.toml keeps it here")),
+        "{skipped:?}"
+    );
+}
+
+/// Two `builders` entries, `mac-1` and `mac-2`, both macOS, running every `yaat` command, under a `host` that does too.
+const TWO_MACS: &str = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["*"]}},
+    {"host": "mac-2", "os": "macos", "root": "/n", "repos": {"yaat": ["*"]}}]"#;
+
+#[test]
+fn a_second_mac_keeps_the_slash_words_and_is_left_out_after_a_backslash_steer_off() {
+    let facts = FakeFacts {
+        config: Ok(Some(with_builders(r#"{"yaat": ["*"]}"#, TWO_MACS))),
+        snapshot: words(&["src/Duel.sln"]),
+        ..FakeFacts::at("")
+    };
+    let command = words(&["dotnet", "build", r"src\Duel.sln"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "mac-1");
+    assert_eq!(later_aliases(&run), ["mac-2", "builder-1"]);
+    let second = later_of(&run, 0, &command, &facts).expect("mac-2 can be tried");
+    assert_eq!(second.builder.alias, "mac-2");
+    assert_eq!(second.words, run.words, "the slash words are the same on every Mac");
+
+    let command = words(&["dotnet", "test", "--filter", r"Name~Foo\.Bar"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "builder-1", "the backslash word steers the pick off both Macs");
+    assert_eq!(later_aliases(&run), ["mac-1", "mac-2"]);
+    assert_eq!(
+        later_of(&run, 0, &command, &facts),
+        Err(None),
+        "mac-1 is steered off again, saying nothing"
+    );
+    assert_eq!(later_of(&run, 1, &command, &facts), Err(None), "and so is mac-2");
+}
+
+#[test]
+fn a_mac_candidate_is_left_out_of_a_desktop_command() {
+    let command = words(&["dotnet", "build"]);
+    let mac_last = r#"[{"host": "win-2", "os": "windows", "repos": {"yaat": ["dotnet *"]}},
+        {"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet *"]}}]"#;
+    let facts = builder_desktop_facts(r#"{"yaat": ["dotnet *"]}"#, mac_last, &["dotnet build*"], &[]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "win-2");
+    assert_eq!(later_aliases(&run), ["mac-1", "builder-1"]);
+    assert_eq!(later_of(&run, 0, &command, &facts), Err(None), "a Mac has no desktop, which says nothing");
+    let host = later_of(&run, 1, &command, &facts).expect("host can be tried");
+    assert!(host.desktop);
 }
 
 #[test]

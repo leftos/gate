@@ -14,8 +14,8 @@ use std::time::Duration;
 use gate_args::{GATE_SET_NAMES, RunRequest, Slot, TestSeams, env_refusal};
 use gate_router::warm::FileRead;
 use gate_router::{
-    Config, ConfigProblem, Facts, FolderId, Inputs, LocalReason, Pattern, Place, RemoteRun, Route, SiblingFolder, Target, decide, dropped_env,
-    dropped_env_line, escaped, repo_name,
+    Config, ConfigProblem, Facts, FolderId, Inputs, LaterCandidate, LocalReason, Pattern, Place, RemoteRun, Route, SiblingFolder, Target, decide,
+    dropped_env, dropped_env_line, escaped, repo_name,
 };
 use gate_win32::Share;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -179,6 +179,24 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
     }
 }
 
+/// The routed run of `request` on `candidate`, a later builder of the run its decision `decision` routed
+/// ([`gate_router::later_run`]), its facts asked again of this machine as the decision asked them, the log lines of the
+/// declaration files it reads noted for the log. `Err(None)` when the candidate is steered off, `Err(Some(why))` when
+/// it is skipped for a reason ([`gate_router::later_run`]).
+pub(crate) fn later_run(
+    request: &RunRequest,
+    decision: &Decision,
+    candidate: &LaterCandidate,
+    console: &mut Console,
+) -> Result<RemoteRun, Option<String>> {
+    let machine = Machine::of(decision.local_app_data.as_deref(), &request.test_seams);
+    let run = gate_router::later_run(&decision.inputs(slot(request.slot)), &machine, candidate);
+    for line in machine.unsaid_notes() {
+        console.note(&line);
+    }
+    run
+}
+
 /// Whether a light run whose routing decision saw `decision` would route on heavy: the decision asked again with the
 /// heavy slot and every other input exactly as the run's own had it, routed only when every word of the command is valid
 /// Unicode (the [`NOT_UNICODE`] rule [`route`] applies). Its git calls run under [`HINT_GIT_LIMIT`], since the run still
@@ -333,9 +351,15 @@ impl<'a> Machine<'a> {
     /// The facts of the gate's working folder now, with `environment`'s LOCALAPPDATA and the git limits and remote
     /// transport `seams` set.
     pub(crate) fn new(environment: &'a Environment, seams: &TestSeams) -> Machine<'a> {
+        Machine::of(environment.local_app_data.as_deref(), seams)
+    }
+
+    /// The facts of the gate's working folder now, reading `local_app_data`'s routing file, with the git limits and
+    /// remote transport `seams` set.
+    fn of(local_app_data: Option<&'a OsStr>, seams: &TestSeams) -> Machine<'a> {
         Machine {
             remote_transport: seams.remote_transport.clone(),
-            ..Machine::at(environment.local_app_data.as_deref(), git::limit(seams), git::drain(seams))
+            ..Machine::at(local_app_data, git::limit(seams), git::drain(seams))
         }
     }
 

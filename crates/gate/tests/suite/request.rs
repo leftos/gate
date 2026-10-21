@@ -31,6 +31,7 @@ fn print_request_shows_the_new_cli_request() {
         "interruptAfterSamples": null,
         "interruptQueued": false,
         "interruptBeforeKey": false,
+        "interruptBeforeLater": false,
         "interruptAfterFallback": false,
         "samplerFail": false,
         "diagnosticsFail": false,

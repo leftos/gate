@@ -138,6 +138,8 @@ pub(crate) enum SwitchOption {
     #[cfg(feature = "test-seams")]
     InterruptBeforeKey,
     #[cfg(feature = "test-seams")]
+    InterruptBeforeLater,
+    #[cfg(feature = "test-seams")]
     InterruptAfterFallback,
     #[cfg(feature = "test-seams")]
     SamplerFail,
@@ -444,6 +446,8 @@ impl RunBuilder {
             SwitchOption::InterruptQueued => self.test_seams.interrupt_queued = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::InterruptBeforeKey => self.test_seams.interrupt_before_key = on,
+            #[cfg(feature = "test-seams")]
+            SwitchOption::InterruptBeforeLater => self.test_seams.interrupt_before_later = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::InterruptAfterFallback => self.test_seams.interrupt_after_fallback = on,
             #[cfg(feature = "test-seams")]

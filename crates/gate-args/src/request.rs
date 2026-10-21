@@ -285,6 +285,9 @@ pub struct TestSeams {
     pub interrupt_queued: bool,
     /// Raise the console interrupt just before a routed run's zero-wait take of its work folder's key.
     pub interrupt_before_key: bool,
+    /// Raise the console interrupt as soon as a routed run that fell back has built the next builder it may try, before
+    /// it tries it.
+    pub interrupt_before_later: bool,
     /// Raise the console interrupt once the gate has said it is waiting for a slot here, after the remote pool sent the
     /// run back with reason `full`, so the wait counts from the run's own queue line.
     pub interrupt_after_fallback: bool,
