@@ -4392,21 +4392,69 @@ fn a_run_call_past_its_backstop_is_killed_with_the_backstop_line() {
     assert!(made_but_maybe(&made, &["preflight", "run", "stop"], "run"), "{made:?}");
 }
 
+/// How long a box-kill case goes on with fresh runs while the box's ceiling kills each command before it marked its
+/// file: a hang guard a passing run never reaches.
+const MARKED_BEFORE_THE_KILL_GUARD: Duration = Duration::from_secs(300);
+
+/// A routed run whose command marks `made-on-box.txt` on the builder, then sleeps past its 1 s ceiling, the box's `run`
+/// given `box_seams` when some: its case, steps file and outcome, from the first run whose command marked the file
+/// before the box killed it. A command starved past its ceiling before it marked leaves nothing to sync back, which
+/// proves nothing of the skip, so such a run is followed by a fresh one, up to the hang guard. A run that did not end
+/// 124, or whose journal never reached its queue line, is returned at once, so the caller's asserts fail with its own
+/// output.
+fn box_killed_after_its_mark(name: &str, box_seams: Option<&str>) -> (Case, PathBuf, Outcome) {
+    let guard = Instant::now() + MARKED_BEFORE_THE_KILL_GUARD;
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let case = client_case(name);
+        let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", "ok"]);
+        let tuned = Tuned {
+            timeout: "1",
+            ..Tuned::default()
+        };
+        let mut gate = client_gate_tuned(
+            &case,
+            "out.log",
+            &steps,
+            &tuned,
+            &[r".\tool.exe", "mark", "made-on-box.txt", "sleep", "600000"],
+        );
+        if let Some(seams) = box_seams {
+            gate.env(BOX_SEAMS_VARIABLE, seams);
+        }
+        let outcome = finish(gate);
+        let queued = work_folder_if_queued(&case);
+        let marked = queued.as_ref().is_some_and(|work| work.join("made-on-box.txt").exists());
+        if outcome.code != Some(124) || queued.is_none() || marked {
+            return (case, steps, outcome);
+        }
+        assert!(
+            Instant::now() < guard,
+            "every one of {attempts} commands was killed before made-on-box.txt was in its work folder, until the hang guard: \
+             starved each time, or the box no longer leaves the killed command's file; last outcome: {outcome:?}"
+        );
+    }
+}
+
+/// The builder's work folder the journal's queue line names, as [`work_folder`] has it, `None` when the journal is not
+/// there or has yet to name a key: a run killed before its queue line has no work folder to look in.
+fn work_folder_if_queued(case: &Case) -> Option<PathBuf> {
+    let journal = fs::read_to_string(case.root().join("events.jsonl")).ok()?;
+    let key = serde_json::from_str::<Value>(journal.lines().next()?)
+        .ok()?
+        .get("key")?
+        .as_str()?
+        .to_owned();
+    Some(case.folder().join("builder").join("work").join(key))
+}
+
 /// The real box, given a ceiling of 1 s, kills a command that would run for ten minutes: by its backstop of 5 s of wall
 /// time at the latest, or at its ceiling first when its machine is free enough. The client ends the run as killed on
 /// the box's kill tag, with no stop and no sync-back.
 #[test]
 fn a_command_the_box_kills_at_its_ceiling_ends_the_run_killed_with_no_stop_or_sync_back() {
-    let case = client_case("client-box-killed");
-    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", "ok"]);
-    let tuned = Tuned {
-        timeout: "1",
-        ..Tuned::default()
-    };
-
-    let command = [r".\tool.exe", "mark", "made-on-box.txt", "sleep", "600000"];
-
-    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &command));
+    let (case, steps, outcome) = box_killed_after_its_mark("client-box-killed", None);
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     let verdict = verdict(&case);
@@ -4443,22 +4491,7 @@ const BOX_SEAMS_VARIABLE: &str = "GATE_FAKE_SSH_BOX_SEAMS";
 /// line and tag, so the client journals the kill's verdict and syncs nothing back of what the command wrote.
 #[test]
 fn a_box_kill_that_leaves_a_process_is_still_timed_out_with_no_sync_back() {
-    let case = client_case("client-box-kill-leaves");
-    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", "ok"]);
-    let tuned = Tuned {
-        timeout: "1",
-        ..Tuned::default()
-    };
-    let mut gate = client_gate_tuned(
-        &case,
-        "out.log",
-        &steps,
-        &tuned,
-        &[r".\tool.exe", "mark", "made-on-box.txt", "sleep", "600000"],
-    );
-    gate.env(BOX_SEAMS_VARIABLE, format!("{FREE_BOX} --test-box-kill-leaves 1"));
-
-    let outcome = finish(gate);
+    let (case, steps, outcome) = box_killed_after_its_mark("client-box-kill-leaves", Some(&format!("{FREE_BOX} --test-box-kill-leaves 1")));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     assert_eq!(verdict(&case), "timed-out", "{outcome:?}");
