@@ -1,7 +1,7 @@
-//! `gate-box box run`, up to its command: the request read and checked as the Windows box reads it, what this builder
-//! does not build refused so the PC runs the command itself, the work root checked, the work lock taken, the subfolder
-//! placed, the work folder laid out and the payload's snapshot checked out. Each line is said as the Windows box says
-//! it, byte for byte.
+//! `gate-box box run`: the request read and checked as the Windows box reads it, what this builder does not build
+//! refused so the PC runs the command itself, the work root checked, the work lock taken, the subfolder placed, the work
+//! folder laid out and the payload's snapshot checked out; then the command run and the tree it left synced back
+//! ([`run`]). Each line is said as the Windows box says it, byte for byte.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -10,17 +10,23 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use gate_args::BoxSeams;
 use gate_wire::{PathForm, Payload, Refusal, bare_stem, busy_line, escaped, layout_line, refused_line};
 
 use gate_watchdog::Pump;
 
+use crate::back::{self, BackFailed};
+use crate::command::{Launch, Sampler, run_command};
 use crate::console::{Forwarding, LineSink, Output, Stream};
 use crate::files::{self, HeldLock, Locked};
 use crate::git::{self, AlternatesFailure, Failed, Git, GitClass, RunGit, Steps, Tree, line_ends_set, origin_set};
 use crate::heartbeat::{self, Periods};
-use crate::lines::{FAILED_STATUS, Translation, USAGE_STATUS, recorded_group, rosetta_lines, signal_guard, translation, work_layout};
+use crate::lines::{
+    CommandEnd, FAILED_STATUS, Translation, USAGE_STATUS, command_status, login_path_line, recorded_group, rosetta_lines, signal_guard, translation,
+    work_layout,
+};
 use crate::preflight::checked_root;
-use crate::process::GroupRecord;
+use crate::process::{self, GroupRecord};
 use crate::stop::{Record, own_group, record_current, records_folder};
 
 /// The status of a run refused: another run holds the work folder, it could not be laid out, or it asks for what this
@@ -177,7 +183,12 @@ pub struct Ready<'p> {
     pub pump: Option<Pump>,
     /// How often the run's watches look.
     pub periods: Periods,
+    /// The login shell's `PATH` the git steps ran along and the command runs along; `None` for the box's own.
+    pub login_path: Option<String>,
 }
+
+/// Where a run reads the login shell's `PATH` from: [`process::login_path`], or a test's own.
+pub type LoginPath = fn() -> Result<String, String>;
 
 /// Readies the run of `payload` for its command, saying its lines through `output`: the payload read ([`Request::read`]),
 /// each failure one line and [`USAGE_STATUS`]; what this builder does not build refused with its tag and a line said
@@ -189,17 +200,165 @@ pub struct Ready<'p> {
 /// group is gone removed ([`earlier_group_cleared`]); the lock files a git step cut short left removed ([`swept`]), else
 /// refused `layout`;
 /// the subfolder placed inside the work folder, else refused with [`USAGE_STATUS`] once the earlier run's back ref is
-/// deleted; the work folder laid out ([`laid_out`]), refused `layout` when it cannot be; the snapshot fetched and checked
-/// out ([`checked_out`]); and the subfolder found in it, a folder inside the work folder once its links are followed,
-/// else [`USAGE_STATUS`]. Each git step's process group is recorded in `<work>.pgid` under the run's job while it runs.
-/// The heartbeat starts once the subfolder is placed, before the layout and the checkout, beating every
-/// `periods.heartbeat` ([`heartbeat::start`]). No start marker is said.
+/// deleted; the work folder's files checked ([`layout_checked`]) and it laid out ([`laid_out`]), refused `layout` when
+/// it cannot be; the snapshot fetched and checked out ([`checked_out`]); and the subfolder found in it, a folder inside
+/// the work folder once its links are followed, else [`USAGE_STATUS`]. Each git step's process group is recorded in
+/// `<work>.pgid` under the run's job while it runs. The heartbeat starts once the subfolder is placed, before the layout
+/// and the checkout, beating every `periods.heartbeat` ([`heartbeat::start`]). The login shell's `PATH` is read from
+/// `login` just before the first git step, after every refusal said before it ([`login_path_read`]). No start marker
+/// is said.
 ///
 /// # Errors
 ///
 /// The status the run ends on, its lines said.
-pub fn prepare<'p, S: LineSink + 'static>(payload: &'p Payload, output: &Arc<Output<S>>, periods: Periods) -> Result<Ready<'p>, u8> {
-    prepared(payload, output, periods, heartbeat::start)
+pub fn prepare<'p, S: LineSink + 'static>(
+    payload: &'p Payload,
+    output: &Arc<Output<S>>,
+    periods: Periods,
+    login: LoginPath,
+) -> Result<Ready<'p>, u8> {
+    prepared(payload, output, periods, login, heartbeat::start)
+}
+
+/// The login shell's `PATH` read from `login`, its empty and relative folders left out; `None`, with the box's own
+/// `PATH` kept and [`login_path_line`] said, when it cannot be read or holds no absolute folder.
+fn login_path_read<S: LineSink>(output: &Output<S>, login: LoginPath) -> Option<String> {
+    let read = login().and_then(|path| {
+        let folders: Vec<&str> = path.split(':').filter(|folder| folder.starts_with('/')).collect();
+        if folders.is_empty() {
+            Err("said a PATH with no absolute folder".to_owned())
+        } else {
+            Ok(folders.join(":"))
+        }
+    });
+    read.inspect_err(|why| {
+        // A note: the run goes on, and a client gone finds out at the next line.
+        let _ = output.say(Stream::Err, &login_path_line(why));
+    })
+    .ok()
+}
+
+/// The run's git for `request`, holding the work lock `lock`, found along `login_path`, its lines said through
+/// `output` and each step's group recorded in `<work>.pgid` under the run's job: the checkout's and the back commit's
+/// alike, so both run with the same pins.
+pub(crate) fn run_git<'a, S: LineSink + 'static>(
+    request: &'a Request<'_>,
+    lock: &'a HeldLock,
+    login_path: Option<&'a str>,
+    output: &'a Arc<Output<S>>,
+) -> RunGit<'a, S> {
+    let record = GroupRecord::new(PathBuf::from(group_record(request.work)), request.job, lock);
+    RunGit::new(
+        Git::of(&request.root, request.parent).along(login_path),
+        request.lock,
+        output,
+        Some(record),
+    )
+}
+
+/// How a run's watches look and where its ceiling reads the machine's load from: the defaults, or the test seams'.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Watches {
+    /// How often the heartbeat looks and the ceiling samples.
+    pub periods: Periods,
+    /// Where the ceiling reads the machine's load from.
+    pub sampler: Sampler,
+}
+
+impl Watches {
+    /// The watches `seams` ask for: `--test-heartbeat-ms` and `--test-box-sample-ms` over [`Periods::default`];
+    /// `--test-box-sampler-fail`, else `--test-box-free-percent`, over [`Sampler::Machine`], as the Windows box reads
+    /// them. All defaults in a box built without the `test-seams` feature.
+    #[must_use]
+    pub fn of(seams: &BoxSeams) -> Watches {
+        let defaults = Periods::default();
+        let periods = Periods {
+            heartbeat: seams.heartbeat_ms.map_or(defaults.heartbeat, Duration::from_millis),
+            sample: seams.sample_ms.map_or(defaults.sample, Duration::from_millis),
+        };
+        let sampler = match (seams.sampler_fail, seams.free_percent) {
+            (true, _) => Sampler::Failing,
+            (false, Some(percent)) => Sampler::FreePercent(percent),
+            (false, None) => Sampler::Machine,
+        };
+        Watches { periods, sampler }
+    }
+}
+
+/// Runs `payload`'s run, saying its lines through `output`, watched as `watches` says; the status the box exits with.
+///
+/// The login shell's `PATH` is read once, by [`prepare`] ([`process::login_path`]); the git steps and the command run
+/// along it ([`run_along`]).
+pub fn run<S: LineSink + 'static>(payload: &Payload, output: &Arc<Output<S>>, watches: Watches) -> u8 {
+    run_along(payload, output, watches, process::login_path)
+}
+
+/// [`run`], the login shell's `PATH` read from `login`, in the Windows box's order: the run readied ([`prepare`]), the
+/// heartbeat beating from the subfolder's check; the command run ([`run_command`]); the back commit made and pushed
+/// when the command reached an end of its own ([`synced_back`]); then the heartbeat stopped ([`heartbeat::stop`]), then
+/// the work lock let go.
+fn run_along<S: LineSink + 'static>(payload: &Payload, output: &Arc<Output<S>>, watches: Watches, login: LoginPath) -> u8 {
+    let ready = match prepare(payload, output, watches.periods, login) {
+        Ok(ready) => ready,
+        Err(status) => return status,
+    };
+    let status = commanded(&ready, output, watches.sampler);
+    let Ready { pump, lock, .. } = ready;
+    if let Some(pump) = pump {
+        heartbeat::stop(pump);
+    }
+    drop(lock);
+    status
+}
+
+/// The status of the run `ready` once its command has run, sampled from `sampler`: the command's own
+/// ([`command_status`]), the back commit made only after an end of its own ([`of_its_own`]).
+fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, sampler: Sampler) -> u8 {
+    let request = &ready.request;
+    let login_path = ready.login_path.as_deref();
+    let launch = Launch {
+        words: &request.command,
+        place: &ready.place,
+        work: request.work,
+        job: request.job,
+        nonce: request.nonce,
+        env: &request.env,
+        login_path,
+        lock: &ready.lock,
+        timeout: request.timeout,
+        host: request.host,
+        sample: ready.periods.sample,
+        sampler,
+        pump: ready.pump.as_ref(),
+    };
+    let end = run_command(&launch, output);
+    let status = command_status(end);
+    if !of_its_own(end) {
+        return status;
+    }
+    synced_back(ready, output, status)
+}
+
+/// Whether the command that ended as `end` reached an end of its own, an exit or a signal the box did not send, which
+/// alone is followed by a back commit: one the box killed for its ceiling or backstop, whose client is gone, that never
+/// started or that the box could not see to its end makes none, as the PC applies nothing of it. A `box stop`'s
+/// `SIGTERM` reads as any other signal.
+fn of_its_own(end: CommandEnd) -> bool {
+    matches!(end, CommandEnd::Exited(_) | CommandEnd::Signalled(_))
+}
+
+/// The status of the run `ready`, whose command ended with `status`, once its back commit was made and pushed
+/// ([`back::back_commit`]): `status`; a back commit that failed says `gate: remote sync-back failed: <why>` and gives
+/// [`FAILED_STATUS`] for a command that exited 0, else `status`; a client gone gives the closed status.
+fn synced_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, status: u8) -> u8 {
+    match back::back_commit(&ready.request, &ready.lock, ready.login_path.as_deref(), output) {
+        Ok(_) => status,
+        Err(BackFailed::Gone(failed)) => failure(output, &failed),
+        Err(BackFailed::Step(why)) => {
+            let failed = if status == 0 { FAILED_STATUS } else { status };
+            said(output, &[&format!("gate: remote sync-back failed: {why}")], failed)
+        }
+    }
 }
 
 /// How a run starts its heartbeat: [`heartbeat::start`], or a test's own.
@@ -207,7 +366,13 @@ type StartBeat = fn(Arc<dyn Forwarding>, Duration) -> io::Result<Pump>;
 
 /// [`prepare`], the heartbeat started with `start`; a heartbeat that cannot start is said and the run goes on without
 /// one.
-fn prepared<'p, S: LineSink + 'static>(payload: &'p Payload, output: &Arc<Output<S>>, periods: Periods, start: StartBeat) -> Result<Ready<'p>, u8> {
+fn prepared<'p, S: LineSink + 'static>(
+    payload: &'p Payload,
+    output: &Arc<Output<S>>,
+    periods: Periods,
+    login: LoginPath,
+    start: StartBeat,
+) -> Result<Ready<'p>, u8> {
     let request = Request::read(payload).map_err(|line| said(output, &[&line], USAGE_STATUS))?;
     if let Some(unbuilt) = request.unbuilt {
         return Err(refused(output, &request, unbuilt.refusal, &unbuilt.line(request.bare)));
@@ -234,14 +399,14 @@ fn prepared<'p, S: LineSink + 'static>(payload: &'p Payload, output: &Arc<Output
     };
     // Before the sweep, so a git an earlier run left running keeps its lock files.
     earlier_group_cleared(&request).map_err(|not| not_laid_out(output, &request, not))?;
-    let record = GroupRecord::new(PathBuf::from(group_record(request.work)), request.job, &lock);
-    let git = RunGit::new(Git::of(&request.root, request.parent), request.lock, output, Some(record));
     // Before the run's first git step, so no lock file an earlier run's ended git left fails it.
     swept(&request).map_err(|not| not_laid_out(output, &request, not))?;
     // Refused before the layout, so a payload naming a folder outside the work folder changes nothing there; the
     // earlier run's back ref goes, as the checkout's would, so the client finds none to fetch.
     let Some(place) = place_of(request.work, request.subfolder) else {
         said(output, &[&not_inside(request.subfolder)], USAGE_STATUS);
+        let login_path = login_path_read(output, login);
+        let git = run_git(&request, &lock, login_path.as_deref(), output);
         back_ref_cleared(&git, &request).map_err(|failed| failure(output, &failed))?;
         return Err(USAGE_STATUS);
     };
@@ -256,7 +421,10 @@ fn prepared<'p, S: LineSink + 'static>(payload: &'p Payload, output: &Arc<Output
             );
         })
         .ok();
-    laid_out(&request, &git).map_err(|not| not_laid_out(output, &request, not))?;
+    let fresh = layout_checked(&request).map_err(|not| not_laid_out(output, &request, not))?;
+    let login_path = login_path_read(output, login);
+    let git = run_git(&request, &lock, login_path.as_deref(), output);
+    laid_out(&request, &git, fresh).map_err(|not| not_laid_out(output, &request, not))?;
     checked_out(&request, &git).map_err(|failed| failure(output, &failed))?;
     if !place.is_dir() {
         let line = format!("gate: remote subfolder {} does not exist in the snapshot", escaped(request.subfolder));
@@ -272,6 +440,7 @@ fn prepared<'p, S: LineSink + 'static>(payload: &'p Payload, output: &Arc<Output
         place,
         pump,
         periods,
+        login_path,
     })
 }
 
@@ -454,16 +623,15 @@ fn lock_removed(path: &Path) -> Result<(), NotLaidOut> {
     }
 }
 
-/// Lays out the work folder of `request` for its checkout, under the work lock: the interrupted-command record
+/// Checks the work folder of `request` before its layout, under the work lock: the interrupted-command record
 /// `<work>.command` refused unless it is missing or a file itself, not followed, as the run could neither write nor
 /// remove anything else there; when it is there, the warm record `<work>.warm` and the tools record `<work>.tools` removed, so neither
 /// trusts a tree a command was cut short in, the checkout remaking the tree; the work folder failed unless it is
 /// missing or the box user's own folder ([`files::unusable_folder`]); `.git`, `.git/objects` and `.git/objects/info`
 /// refused unless each is missing or a folder itself, and `.git/config` and `.git/HEAD` unless each is missing or a
-/// file itself, none followed; a tree with no `.git/HEAD` or no `.git/objects` made with `git init`, its warm record
-/// removed first; then its `origin`, its line-ending config and its alternates file naming the bare repository's
-/// objects, written whole ([`git::alternates_written`]).
-fn laid_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>) -> Result<(), NotLaidOut> {
+/// file itself, none followed; and, for a tree with no `.git/HEAD` or no `.git/objects`, which [`laid_out`] makes
+/// anew, the warm record removed. No git step runs. Whether the tree is made anew.
+fn layout_checked(request: &Request<'_>) -> Result<bool, NotLaidOut> {
     let work = request.work;
     let command = format!("{work}.command");
     plain_or_missing(Path::new(&command), false)?;
@@ -484,10 +652,22 @@ fn laid_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>) -> Result<(
     for file in [dot_git.join("config"), dot_git.join("HEAD")] {
         plain_or_missing(&file, false)?;
     }
-    if !files::exists(&dot_git.join("HEAD")) || !files::exists(&objects) {
+    let fresh = !files::exists(&dot_git.join("HEAD")) || !files::exists(&objects);
+    if fresh {
         removed(&format!("{work}.warm"))?;
+    }
+    Ok(fresh)
+}
+
+/// Lays out the work folder of `request`, its files checked ([`layout_checked`]): a `fresh` tree made with `git init`;
+/// then its `origin`, its line-ending config and its alternates file naming the bare repository's objects, written
+/// whole ([`git::alternates_written`]).
+fn laid_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>, fresh: bool) -> Result<(), NotLaidOut> {
+    let work = request.work;
+    if fresh {
         git.step("git init", &["init", "-q", work])?;
     }
+    let info = Path::new(work).join(".git").join("objects").join("info");
     let tree = Tree::at(work);
     origin_set(git, &tree, request.bare)?;
     line_ends_set(git, &tree)?;
@@ -574,13 +754,14 @@ mod tests {
 
     use gate_watchdog::Pump;
 
-    use super::{REFUSED_STATUS, Ready, place_of, prepare, prepared};
+    use super::{REFUSED_STATUS, Ready, Watches, place_of, prepare, prepared, run_along};
     use crate::command::{Launch, Sampler, run_command};
     use crate::console::Forwarding;
     use crate::console::{LineSink, Output, RecordingSink, Stream};
     use crate::files::{self, Locked, effective_uid, take_lock};
-    use crate::git::{GitClass, test_limit};
+    use crate::git::{GitClass, test_limit, test_program};
     use crate::heartbeat::{self, Periods};
+    use crate::lines::command_status;
 
     const KEY: &str = "repo-0123abcd";
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
@@ -741,7 +922,7 @@ mod tests {
     fn ran(json: &Value) -> (u8, Vec<String>) {
         let payload = decoded(json);
         let output = Arc::new(Output::new(RecordingSink::default()));
-        let status = match prepare(&payload, &output, quiet_periods()) {
+        let status = match prepare(&payload, &output, quiet_periods(), own_path) {
             Ok(_) => 0,
             Err(status) => status,
         };
@@ -792,7 +973,7 @@ mod tests {
         let commit = case.snapshot(&[("a.txt", "a\n")]);
         let payload = decoded(&case.json(&commit, &json!({})));
         let output = Arc::new(Output::new(RecordingSink::default()));
-        let ready = prepared(&payload, &output, quiet_periods(), no_beat);
+        let ready = prepared(&payload, &output, quiet_periods(), own_path, no_beat);
         assert!(ready.as_ref().is_ok_and(|ready| ready.pump.is_none()), "{:?}", output.sink().lines());
         assert_eq!(
             stderr_of(&output),
@@ -818,12 +999,7 @@ mod tests {
         );
         fs::write(&shim, script).expect("the shim is written");
         fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("the shim is made runnable");
-        let path = std::env::var_os("PATH").expect("PATH is set");
-        let shimmed = std::env::join_paths(std::iter::once(shims).chain(std::env::split_paths(&path))).expect("the PATH joins");
-        // SAFETY: nextest runs this case in a process of its own, and no other thread reads the environment now.
-        unsafe {
-            std::env::set_var("PATH", &shimmed);
-        }
+        test_program::set(&shim);
         let payload = decoded(&case.json(&commit, &json!({})));
         let output = Arc::new(Output::new(MarkingSink {
             lines: Mutex::new(Vec::new()),
@@ -833,7 +1009,7 @@ mod tests {
             heartbeat: Duration::from_millis(1),
             ..Periods::default()
         };
-        let ready = prepare(&payload, &output, periods);
+        let ready = prepare(&payload, &output, periods, own_path);
         let lines = || output.sink().lines.lock().unwrap_or_else(PoisonError::into_inner).clone();
         assert!(ready.is_ok(), "the run is ready: {:?}", lines());
         let ready = ready.expect("the run is ready");
@@ -852,14 +1028,10 @@ mod tests {
             sampler: Sampler::Machine,
             pump: ready.pump.as_ref(),
         };
-        let status = run_command(&launch, &output);
+        let status = command_status(run_command(&launch, &output));
         let Ready { pump, .. } = ready;
         if let Some(pump) = pump {
             heartbeat::stop(pump);
-        }
-        // SAFETY: as above.
-        unsafe {
-            std::env::set_var("PATH", &path);
         }
         assert_eq!(status, 0, "{:?}", lines());
         let said = lines();
@@ -873,6 +1045,272 @@ mod tests {
             beat.is_some() && started.is_some() && beat < started,
             "a beat before the start marker: {said:?}"
         );
+    }
+
+    /// Watches that never beat within a case and sample the whole machine free every 20 ms, so a ceiling runs with
+    /// wall time however loaded the machine is.
+    fn free_watches() -> Watches {
+        Watches {
+            periods: Periods {
+                sample: Duration::from_millis(20),
+                ..quiet_periods()
+            },
+            sampler: Sampler::FreePercent(100),
+        }
+    }
+
+    /// The identity a case's payload gives the back commit.
+    fn identity() -> Value {
+        json!({
+            "GIT_AUTHOR_NAME": "Box Author",
+            "GIT_AUTHOR_EMAIL": "author@example.com",
+            "GIT_COMMITTER_NAME": "Box Committer",
+            "GIT_COMMITTER_EMAIL": "committer@example.com",
+        })
+    }
+
+    /// Runs the whole run of `json` on the box's own `PATH`; the status and every line said, with its stream.
+    fn whole_run(json: &Value) -> (u8, Vec<(Stream, String)>) {
+        let payload = decoded(json);
+        let output = Arc::new(Output::new(RecordingSink::default()));
+        let status = run_along(&payload, &output, free_watches(), own_path);
+        (status, output.sink().lines())
+    }
+
+    impl Case {
+        /// The back ref's commit, `None` when there is none.
+        fn back_commit(&self) -> Option<String> {
+            let back = format!("refs/gate-back/{KEY}");
+            let (said, found) = git_said(&[&format!("--git-dir={}", self.bare()), "rev-parse", "--verify", "-q", &back]);
+            found.then_some(said)
+        }
+
+        /// The words of `format` shown for `commit` in the bare repository.
+        fn shown(&self, format: &str, commit: &str) -> String {
+            git(&[&format!("--git-dir={}", self.bare()), "show", "-s", &format!("--format={format}"), commit])
+        }
+
+        /// The run payload of `snapshot` running `command`, with the case's identity.
+        fn commanded(&self, snapshot: &str, command: &[&str]) -> Value {
+            self.json(snapshot, &json!({"Command": command, "Identity": identity()}))
+        }
+    }
+
+    #[test]
+    fn a_command_that_changes_the_tree_pushes_a_back_commit_on_head_with_the_payload_s_identity() {
+        let case = Case::new("back-changed");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.back_ref_set(&commit);
+        let (status, said) = whole_run(&case.commanded(&commit, &["/bin/sh", "-c", "echo new > new.txt; echo b > a.txt"]));
+        assert_eq!(status, 0, "{said:?}");
+        let back = case.back_commit().expect("the back ref is pushed");
+        assert_ne!(back, commit, "a new commit, not the earlier run's ref");
+        assert_eq!(case.shown("%P", &back), commit, "its parent is the snapshot");
+        assert_eq!(
+            case.shown("%an <%ae>|%cn <%ce>|%s", &back),
+            "Box Author <author@example.com>|Box Committer <committer@example.com>|gate-remote back"
+        );
+        let bare = format!("--git-dir={}", case.bare());
+        assert_eq!(git(&[&bare, "show", &format!("{back}:new.txt")]), "new");
+        assert_eq!(git(&[&bare, "show", &format!("{back}:a.txt")]), "b");
+        assert!(!Path::new(&format!("{}.index", case.work())).exists(), "the copied index is removed");
+        assert!(matches!(take_lock(Path::new(&case.lock())), Ok(Locked::Held(_))), "the lock is let go");
+    }
+
+    #[test]
+    fn a_command_that_changes_nothing_makes_no_commit_and_leaves_no_back_ref() {
+        let case = Case::new("back-unchanged");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.back_ref_set(&commit);
+        let (status, said) = whole_run(&case.commanded(&commit, &["/bin/sh", "-c", "cat a.txt"]));
+        assert_eq!(status, 0, "{said:?}");
+        assert!(!case.has_back_ref(), "no back ref: {said:?}");
+    }
+
+    #[test]
+    fn a_stale_copied_index_is_replaced() {
+        let case = Case::new("back-stale-index");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let index = format!("{}.index", case.work());
+        fs::create_dir_all(Path::new(&case.work()).parent().expect("the work folder has a parent")).expect("the parent is made");
+        fs::write(&index, "not an index").expect("a stale index is left");
+        let (status, said) = whole_run(&case.commanded(&commit, &["/bin/sh", "-c", "echo c > c.txt"]));
+        assert_eq!(status, 0, "{said:?}");
+        let back = case.back_commit().expect("the back ref is pushed");
+        assert_eq!(
+            git(&[&format!("--git-dir={}", case.bare()), "show", &format!("{back}:a.txt")]),
+            "a",
+            "the tree kept a.txt"
+        );
+        assert!(!Path::new(&index).exists(), "the copy is removed");
+    }
+
+    #[test]
+    fn a_push_that_fails_says_the_sync_back_line_and_fails_a_command_that_exited_0() {
+        let case = Case::new("back-push-fails");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        // The command puts a folder holding a file at the back ref's name once the checkout reset the ref, which fails
+        // the push's ref update; git would remove an empty one.
+        let in_the_way = format!("{}/refs/gate-back/{KEY}", case.bare());
+        let script = format!("echo x > x.txt; mkdir -p '{in_the_way}'; echo x > '{in_the_way}/in-the-way'");
+        let payload = decoded(&case.commanded(&commit, &["/bin/sh", "-c", &script]));
+        let output = Arc::new(Output::new(RecordingSink::default()));
+        let status = run_along(&payload, &output, free_watches(), own_path);
+        let err: Vec<String> = output
+            .sink()
+            .lines()
+            .into_iter()
+            .filter(|(stream, _)| *stream == Stream::Err)
+            .map(|(_, line)| line)
+            .collect();
+        assert_eq!(status, 1, "{err:?}");
+        assert!(
+            err.last()
+                .is_some_and(|line| line.starts_with("gate: remote sync-back failed: push failed")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_command_the_box_killed_makes_no_back_commit() {
+        let case = Case::new("back-killed");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.back_ref_set(&commit);
+        let json = case.json(
+            &commit,
+            &json!({"Command": ["/bin/sh", "-c", "echo x > x.txt; sleep 600"], "Identity": identity(), "Timeout": 1}),
+        );
+        let (status, said) = whole_run(&json);
+        assert_eq!(status, 124, "{said:?}");
+        assert!(!case.has_back_ref(), "no back ref, the earlier one deleted: {said:?}");
+    }
+
+    /// The box's own `PATH` as the login shell's, so a case starts no login shell.
+    fn own_path() -> Result<String, String> {
+        std::env::var("PATH").map_err(|error| error.to_string())
+    }
+
+    /// Whether [`counted_login`] was called.
+    static LOGIN_READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// A login shell's `PATH` that cannot be read, noting that it was asked for.
+    fn counted_login() -> Result<String, String> {
+        LOGIN_READ.store(true, std::sync::atomic::Ordering::SeqCst);
+        Err("the case's login shell".to_owned())
+    }
+
+    /// Runs every git step of this thread through a shim that runs `after_add` once git's `add -A` on the copied index
+    /// has run, `$GIT_INDEX_FILE` naming the copy; every other step is the real git's.
+    fn shim_after_add(case: &Case, after_add: &str) {
+        let shim = case.base.with_file_name("git-shim");
+        let script = format!(
+            "#!/bin/sh\n'{git}' \"$@\"\nstatus=$?\ncase \" $* \" in\n*\" add -A \"*) [ -n \"$GIT_INDEX_FILE\" ] && {{ {after_add}; }};;\nesac\nexit $status\n",
+            git = real_git().display()
+        );
+        fs::write(&shim, script).expect("the shim is written");
+        fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("the shim is made runnable");
+        test_program::set(&shim);
+    }
+
+    /// The lines `output` said on stderr.
+    fn err_of(output: &Output<RecordingSink>) -> Vec<String> {
+        output
+            .sink()
+            .lines()
+            .into_iter()
+            .filter(|(stream, _)| *stream == Stream::Err)
+            .map(|(_, line)| line)
+            .collect()
+    }
+
+    #[test]
+    fn a_busy_run_reads_no_login_path_and_says_no_path_line() {
+        let case = Case::new("busy-no-login");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let held = take_lock(Path::new(&case.lock()));
+        assert!(matches!(held, Ok(Locked::Held(_))), "the case holds the work lock");
+        let payload = decoded(&case.json(&commit, &json!({})));
+        let output = Arc::new(Output::new(RecordingSink::default()));
+        let status = run_along(&payload, &output, free_watches(), counted_login);
+        assert_eq!(status, REFUSED_STATUS);
+        assert!(!LOGIN_READ.load(std::sync::atomic::Ordering::SeqCst), "no login shell was asked for");
+        let err = err_of(&output);
+        assert!(!err.iter().any(|line| line.starts_with("gate: remote path:")), "{err:?}");
+        assert_eq!(err, [refused_line(NONCE, Refusal::Busy), busy_line(KEY)]);
+    }
+
+    #[test]
+    fn a_copied_index_that_is_gone_before_write_tree_fails_the_sync_back_and_commits_nothing() {
+        let case = Case::new("back-index-gone");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        shim_after_add(&case, "rm -f \"$GIT_INDEX_FILE\"");
+        let payload = decoded(&case.commanded(&commit, &["/bin/sh", "-c", "echo x > x.txt"]));
+        let output = Arc::new(Output::new(RecordingSink::default()));
+        let status = run_along(&payload, &output, free_watches(), own_path);
+        let err = err_of(&output);
+        assert_eq!(status, 1, "{err:?}");
+        assert_eq!(
+            err.last().map(String::as_str),
+            Some(
+                format!(
+                    "gate: remote sync-back failed: write-tree failed: the copied index {}.index is gone",
+                    case.work()
+                )
+                .as_str()
+            )
+        );
+        assert!(!case.has_back_ref(), "no commit is pushed");
+    }
+
+    #[test]
+    fn a_lost_lock_leaves_the_copied_index_in_place() {
+        let case = Case::new("back-lock-lost");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        shim_after_add(&case, &format!("rm -f '{}'", case.lock()));
+        let payload = decoded(&case.commanded(&commit, &["/bin/sh", "-c", "echo x > x.txt"]));
+        let output = Arc::new(Output::new(RecordingSink::default()));
+        let status = run_along(&payload, &output, free_watches(), own_path);
+        let err = err_of(&output);
+        assert_eq!(status, 1, "{err:?}");
+        // The lock goes inside the add step, which may see it lost itself, else the look before write-tree does.
+        let lost = format!("the work folder lock {} is no longer held", case.lock());
+        assert!(
+            err.last()
+                .is_some_and(|line| line.starts_with("gate: remote sync-back failed: ") && line.ends_with(&lost)),
+            "{err:?}"
+        );
+        assert!(
+            Path::new(&format!("{}.index", case.work())).exists(),
+            "the copy is left, the lock being lost"
+        );
+        assert!(!case.has_back_ref(), "no commit is pushed");
+    }
+
+    #[test]
+    fn a_link_at_the_index_copy_fails_the_sync_back() {
+        let case = Case::new("back-index-link");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let target = case.base.with_file_name("elsewhere");
+        fs::write(&target, "kept").expect("the link's target is written");
+        let copy = format!("{}.index", case.work());
+        symlink(&target, &copy).expect("a link takes the copy's name");
+        let payload = decoded(&case.commanded(&commit, &["/bin/sh", "-c", "echo x > x.txt"]));
+        let output = Arc::new(Output::new(RecordingSink::default()));
+        let status = run_along(&payload, &output, free_watches(), own_path);
+        let err = err_of(&output);
+        assert_eq!(status, 1, "{err:?}");
+        assert!(
+            err.last()
+                .is_some_and(|line| line.starts_with("gate: remote sync-back failed: cannot copy ")
+                    && line.ends_with(&format!("{copy} is a link or not a file"))),
+            "{err:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).expect("the target is read"),
+            "kept",
+            "the link's target is untouched"
+        );
+        assert!(!case.has_back_ref(), "no commit is pushed");
     }
 
     fn stderr_of(output: &Output<RecordingSink>) -> Vec<String> {
@@ -893,7 +1331,7 @@ mod tests {
         let payload = decoded(&case.json(&commit, &json!({})));
         let output = Arc::new(Output::new(RecordingSink::default()));
 
-        let ready: Ready<'_> = prepare(&payload, &output, quiet_periods()).expect("the run is ready");
+        let ready: Ready<'_> = prepare(&payload, &output, quiet_periods(), own_path).expect("the run is ready");
 
         assert_eq!(ready.place, PathBuf::from(case.work()));
         assert_eq!(case.head(), commit);

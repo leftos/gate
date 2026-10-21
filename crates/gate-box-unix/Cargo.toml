@@ -11,6 +11,12 @@ doctest = false
 name = "gate-box"
 path = "src/main.rs"
 
+[[test]]
+# `gate-box box run` end to end through the built binary, which takes the hidden `--test-*` seams only with the feature.
+name = "run"
+path = "tests/run.rs"
+required-features = ["test-seams"]
+
 [lints]
 workspace = true
 

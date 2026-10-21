@@ -37,8 +37,7 @@ pub fn action(args: Vec<OsString>) -> Action {
 #[must_use]
 pub fn unbuilt(verb: BoxVerb) -> Option<String> {
     match verb {
-        BoxVerb::Preflight | BoxVerb::Boot | BoxVerb::Stop => None,
-        BoxVerb::Run => Some("gate: box run is not built yet".to_owned()),
+        BoxVerb::Preflight | BoxVerb::Boot | BoxVerb::Stop | BoxVerb::Run => None,
         BoxVerb::Outputs | BoxVerb::Inflight | BoxVerb::Inputs | BoxVerb::Lfs | BoxVerb::RegisterDesktop | BoxVerb::Prune => {
             Some(format!("gate: box {} is not built on this builder", verb.as_str()))
         }
@@ -68,7 +67,7 @@ pub fn main(args: Vec<OsString>) -> std::process::ExitCode {
 /// Answers `action` through `console`, reading a verb's request from stdin; the status.
 #[cfg(unix)]
 fn answer(action: Action, console: &mut crate::console::Console) -> u8 {
-    let (verb, _seams) = match action {
+    let (verb, seams) = match action {
         Action::Version => {
             console.out(&version_text());
             return 0;
@@ -96,6 +95,11 @@ fn answer(action: Action, console: &mut crate::console::Console) -> u8 {
         BoxVerb::Preflight => crate::preflight::preflight(&payload, console),
         BoxVerb::Stop => crate::stop::stop(&payload, console),
         BoxVerb::Boot => crate::boot::status(crate::boot::say(console)),
+        BoxVerb::Run => {
+            // The run says its lines through an output its threads share; the console says nothing more.
+            let output = std::sync::Arc::new(crate::console::Output::new(crate::console::StdioSink));
+            crate::run::run(&payload, &output, crate::run::Watches::of(&seams))
+        }
         // Every other verb was refused as unbuilt above.
         _ => crate::lines::USAGE_STATUS,
     }
@@ -153,11 +157,10 @@ mod tests {
     }
 
     #[test]
-    fn run_is_not_built_yet_and_the_windows_only_verbs_are_not_built_here() {
-        for verb in [BoxVerb::Preflight, BoxVerb::Boot, BoxVerb::Stop] {
+    fn run_is_built_and_the_windows_only_verbs_are_not_built_here() {
+        for verb in [BoxVerb::Preflight, BoxVerb::Boot, BoxVerb::Stop, BoxVerb::Run] {
             assert_eq!(unbuilt(verb), None, "{verb:?}");
         }
-        assert_eq!(unbuilt(BoxVerb::Run).as_deref(), Some("gate: box run is not built yet"));
         for verb in [
             BoxVerb::Outputs,
             BoxVerb::Inputs,

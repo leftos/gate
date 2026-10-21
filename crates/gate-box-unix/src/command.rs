@@ -1,8 +1,9 @@
 //! `gate-box box run`'s command: the payload's words started directly, with no shell, in the run's place, found along
 //! the login shell's `PATH`, as the leader of a process group of its own that the bounded runner watches
 //! ([`run_watched`]), both its streams forwarded line by line. The start marker is said first; the interrupted-command
-//! record `<Work>.command` is written just before the start and removed only once the command ended clean; the status
-//! the run ends on is the command's own, or the box's ([`command_status`]).
+//! record `<Work>.command` is written just before the start and removed only once the command ended clean. How the
+//! command ended is given back ([`CommandEnd`]); the status the run ends on is derived from it in one place,
+//! [`crate::lines::command_status`].
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,7 +23,7 @@ use gate_wire::{BoxKill, adjusted_line, escaped, killed_line, started_line};
 use crate::console::{Forwarding, LineSink, Output, Stream};
 use crate::cpu::{GroupCpu, LoadTotals, host_cpu_load};
 use crate::files::{self, HeldLock};
-use crate::lines::{CommandEnd, FAILED_STATUS, command_environment, command_status, round_trip, write_failure};
+use crate::lines::{CommandEnd, command_environment, round_trip, write_failure};
 use crate::process::{EndedBy, Ending, Forward, GroupRecord, Halt, NotRan, Ran, Watch, is_still_there, run_watched};
 use crate::run::group_record;
 
@@ -308,21 +309,23 @@ pub fn command_record(work: &str) -> String {
     format!("{work}.command")
 }
 
-/// Runs the run's command as `launch` says, saying its lines through `output`, and gives the status the run ends on.
+/// Runs the run's command as `launch` says, saying its lines through `output`, and gives how it ended, whose status
+/// ([`crate::lines::command_status`]) the run ends on: a command that exits 127 itself is [`CommandEnd::Exited`], one
+/// that never started [`CommandEnd::NotStarted`], both status 127.
 ///
 /// The start marker is said first; the client is probed, the interrupted-command record written
 /// (`{UTC start} {job}`, [`files::replace_plain`]), and the client probed again, so a client gone at either probe
-/// ends the run with [`crate::lines::GONE_STATUS`] and nothing started; then the command runs ([`run_watched`]) with standard input
+/// ends the run as [`CommandEnd::Gone`] and nothing started; then the command runs ([`run_watched`]) with standard input
 /// null, its group written to `<work>.pgid` from the child, ended `SIGTERM` first on a gone client. The record is kept
 /// unless the command exited of itself, the client still there and no leftover holding its output; it is removed for a
 /// command that never started. Every removal looks first that the work lock is still held.
 ///
 /// Once the command's readers start, the heartbeat watches its group's CPU ([`GroupCpu`]) and the box's ceiling begins
 /// ([`Ceiling`]), reading the same source; the heartbeat stops watching, and the ceiling's clock stops, once the runner
-/// stops watching the leader, before the group is ended. A command the ceiling ends gives
-/// [`crate::lines::KILLED_STATUS`] after the kill line, the kill tag and its load-adjusted seconds, its records kept
+/// stops watching the leader, before the group is ended. A command the ceiling ends is [`CommandEnd::Killed`] after
+/// the kill line, the kill tag and its load-adjusted seconds, its records kept
 /// ([`killed`]); a command that exited or was ended by a signal is followed by its load-adjusted seconds ([`ended`]).
-pub fn run_command<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>) -> u8 {
+pub fn run_command<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>) -> CommandEnd {
     let beat = Beat {
         cpu_of: &|group| Arc::new(GroupCpu::new(group)) as Arc<dyn CpuSource>,
         unwatched: &|| {},
@@ -339,15 +342,15 @@ struct Beat<'a> {
 }
 
 /// [`run_command`], the heartbeat watching the command as `beat` says.
-fn run_with<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>, beat: &Beat<'_>) -> u8 {
+fn run_with<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>, beat: &Beat<'_>) -> CommandEnd {
     let Some((program, rest)) = launch.words.split_first() else {
         let _ = output.say(Stream::Err, &failed_line("the run has no command"));
-        return FAILED_STATUS;
+        return CommandEnd::Failed;
     };
     // A client that has gone has no one left to tell; the probe below ends the run.
     let _ = output.say(Stream::Out, &started_line(launch.nonce));
     if output.client_gone_probe() {
-        return command_status(CommandEnd::Gone);
+        return CommandEnd::Gone;
     }
     let record = command_record(launch.work);
     if let Err(failure) = files::replace_plain(Path::new(&record), record_text(launch.job).as_bytes()) {
@@ -356,11 +359,11 @@ fn run_with<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>,
         let _ = output.say(Stream::Err, &write_failure(&record, &error.to_string()));
         // A record put in place but not synced is still at the name: the command never ran.
         removed_if_held(&record, launch.lock, output);
-        return FAILED_STATUS;
+        return CommandEnd::Failed;
     }
     if output.client_gone_probe() {
         removed_if_held(&record, launch.lock, output);
-        return command_status(CommandEnd::Gone);
+        return CommandEnd::Gone;
     }
     let group = GroupRecord::new(PathBuf::from(group_record(launch.work)), launch.job, launch.lock);
     let forwarding: Arc<dyn Forwarding> = Arc::clone(output) as Arc<dyn Forwarding>;
@@ -396,11 +399,11 @@ fn run_with<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>,
     ended(launch, &record, ran, &ceiling.verdict(), output)
 }
 
-/// The status of the run whose command, `launch`'s words, ran as `ran`, its record `record` removed when the command
+/// How the run's command, `launch`'s words, ended, having run as `ran`, its record `record` removed when the command
 /// ended clean or never started, and the line of a start that failed or of the box's own failure said, after the line
 /// of the ceiling's sampler's failure when `verdict` holds one; a command that ran is followed by the ceiling's end
 /// lines ([`said_end_lines`]). For a command the box killed, what [`killed`] gives.
-fn ended<S: LineSink>(launch: &Launch<'_>, record: &str, ran: Result<Ran, NotRan>, verdict: &Verdict, output: &Output<S>) -> u8 {
+fn ended<S: LineSink>(launch: &Launch<'_>, record: &str, ran: Result<Ran, NotRan>, verdict: &Verdict, output: &Output<S>) -> CommandEnd {
     if let Some(kill) = verdict.kill {
         return killed(launch, kill, ran, verdict, output);
     }
@@ -411,16 +414,16 @@ fn ended<S: LineSink>(launch: &Launch<'_>, record: &str, ran: Result<Ran, NotRan
             let program = launch.words.first().map_or("", String::as_str);
             let line = format!("gate: remote could not start {}: {}", escaped(program), escaped(&error.to_string()));
             let _ = output.say(Stream::Err, &line);
-            return command_status(CommandEnd::NotStarted);
+            return CommandEnd::NotStarted;
         }
         Err(not) => {
             // The records stay: the group may still be there, or the lock is lost.
             if output.client_gone() {
-                return command_status(CommandEnd::Gone);
+                return CommandEnd::Gone;
             }
             let lines: Vec<String> = verdict.failed.iter().cloned().chain([failed_line(&unran(not))]).collect();
             said_together(output, &lines);
-            return command_status(CommandEnd::Failed);
+            return CommandEnd::Failed;
         }
     };
     let end = end_of(&ran, output.client_gone());
@@ -428,7 +431,7 @@ fn ended<S: LineSink>(launch: &Launch<'_>, record: &str, ran: Result<Ran, NotRan
         removed_if_held(record, launch.lock, output);
     }
     said_end_lines(launch, verdict, end, output);
-    command_status(end)
+    end
 }
 
 /// Says the ceiling's end lines after a command that ran and ended as `end`, nothing once the client is gone: the line
@@ -456,15 +459,15 @@ fn said_together<S: LineSink>(output: &Output<S>, lines: &[String]) {
     let _ = output.say_together(&lines);
 }
 
-/// The status of the run whose command the box killed for `kill`, its group's ending as `ran` says, every record kept:
-/// [`crate::lines::GONE_STATUS`] and nothing said once the client is gone; else, said together, the line of the
+/// How the run whose command the box killed for `kill` ended, its group's ending as `ran` says, every record kept:
+/// [`CommandEnd::Gone`] and nothing said once the client is gone; else, said together, the line of the
 /// ceiling's sampler's failure when `verdict` holds one, a note when the ending failed (that the group could not be
 /// ended when it was still there after `SIGKILL`, else what failed after the kill), the kill line, the kill tag and the
-/// load-adjusted seconds when `verdict` has them, then [`crate::lines::KILLED_STATUS`], as the run is a kill whatever
-/// its ending left.
-fn killed<S: LineSink>(launch: &Launch<'_>, kill: Kill, ran: Result<Ran, NotRan>, verdict: &Verdict, output: &Output<S>) -> u8 {
+/// load-adjusted seconds when `verdict` has them, then [`CommandEnd::Killed`], as the run is a kill whatever its
+/// ending left.
+fn killed<S: LineSink>(launch: &Launch<'_>, kill: Kill, ran: Result<Ran, NotRan>, verdict: &Verdict, output: &Output<S>) -> CommandEnd {
     if output.client_gone() {
-        return command_status(CommandEnd::Gone);
+        return CommandEnd::Gone;
     }
     let (tag, what) = tag_of(kill);
     let note = ran.err().map(|not| match not {
@@ -481,7 +484,7 @@ fn killed<S: LineSink>(launch: &Launch<'_>, kill: Kill, ran: Result<Ran, NotRan>
     let adjusted = verdict.adjusted.map(|seconds| adjusted_line(launch.nonce, seconds));
     let lines: Vec<String> = verdict.failed.iter().cloned().chain(note).chain([line, tagged]).chain(adjusted).collect();
     said_together(output, &lines);
-    command_status(CommandEnd::Killed(tag))
+    CommandEnd::Killed(tag)
 }
 
 /// How the command that ran as `ran` ended, its client gone when `gone`.
@@ -523,7 +526,7 @@ fn record_text(job: &str) -> String {
 /// Removes the record `record` and syncs its folder while the work lock `lock` is still held, so a record another run
 /// put at the name once this one's lock was lost is left; a removal that fails is said and changes nothing else. The
 /// lock is looked at just before the unlink, not with it: a lock lost in the gap between the two is accepted.
-fn removed_if_held<S: LineSink>(record: &str, lock: &HeldLock, output: &Output<S>) {
+pub(crate) fn removed_if_held<S: LineSink>(record: &str, lock: &HeldLock, output: &Output<S>) {
     if !matches!(lock.still_held(), Ok(true)) {
         return;
     }
@@ -630,6 +633,7 @@ mod tests {
     use crate::console::{Forwarding, HungUpSink, LineSink, Output, RecordingSink, Stream};
     use crate::files::{HeldLock, held_for_test};
     use crate::heartbeat;
+    use crate::lines::{CommandEnd, command_status};
     use crate::process::{EndedBy, Halt, NotRan, Ran, still_there_why};
 
     const NONCE: &str = "0123456789ab";
@@ -674,13 +678,13 @@ mod tests {
                 login_path,
                 ..self.launch(&words, &unwatched())
             };
-            run_command(&launch, output)
+            command_status(run_command(&launch, output))
         }
 
         /// Runs `words` watched as `watched` says, the heartbeat watching as `beat` says.
         fn watched<S: LineSink + 'static>(&self, words: &[&str], watched: &Watched<'_>, beat: &Beat<'_>, output: &Arc<Output<S>>) -> u8 {
             let words: Vec<String> = words.iter().map(|word| (*word).to_owned()).collect();
-            run_with(&self.launch(&words, watched), output, beat)
+            command_status(run_with(&self.launch(&words, watched), output, beat))
         }
 
         /// The launch of `words` in this case's work folder, watched as `watched` says.
@@ -998,7 +1002,7 @@ mod tests {
             ended_by: Some(EndedBy::Halted(Halt("backstop".to_owned()))),
         };
         let record = command_record(&case.work);
-        let status = ended(&case.launch(&words, &unwatched()), &record, Ok(ran), &backstop_verdict(), &output);
+        let status = command_status(ended(&case.launch(&words, &unwatched()), &record, Ok(ran), &backstop_verdict(), &output));
         assert_eq!(status, 255);
         assert!(output.sink().lines().is_empty(), "{:?}", output.sink().lines());
         assert!(case.record().exists(), "the record is kept");
@@ -1020,13 +1024,13 @@ mod tests {
             fs::write(case.record(), "ours").expect("the record is written");
             let words = ["/bin/sh".to_owned()];
             let record = command_record(&case.work);
-            let status = ended(
+            let status = command_status(ended(
                 &case.launch(&words, &unwatched()),
                 &record,
                 Err(NotRan::Failed(why.to_owned())),
                 &backstop_verdict(),
                 &output,
-            );
+            ));
             assert_eq!(status, 124, "{why}");
             assert_eq!(
                 said(&output, Stream::Err),
@@ -1221,6 +1225,21 @@ mod tests {
             lines.len() == 1 && lines[0].starts_with("gate: remote could not start gate-box-no-such-program: "),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn a_command_that_exits_127_itself_ended_of_itself_and_a_missing_program_never_started_both_status_127() {
+        let case = Case::new("127-apart");
+        let words = |words: &[&str]| words.iter().map(|word| (*word).to_owned()).collect::<Vec<String>>();
+        let exits = words(&["/bin/sh", "-c", "exit 127"]);
+        let output = recording();
+        let ran = run_command(&case.launch(&exits, &unwatched()), &output);
+        assert_eq!(ran, CommandEnd::Exited(127), "{:?}", output.sink().lines());
+        let missing = words(&["gate-box-no-such-program"]);
+        let output = recording();
+        let never = run_command(&case.launch(&missing, &unwatched()), &output);
+        assert_eq!(never, CommandEnd::NotStarted, "{:?}", output.sink().lines());
+        assert_eq!((command_status(ran), command_status(never)), (127, 127));
     }
 
     #[test]

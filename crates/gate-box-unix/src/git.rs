@@ -46,6 +46,10 @@ const GIT_ERROR_LINES: usize = 10;
 pub const CLOSED_STATUS: u8 = 255;
 /// The variable, set to `1`, that has git read no system-wide attributes file, as the Windows box sets it.
 const NO_SYSTEM_ATTRIBUTES: &str = "GIT_ATTR_NOSYSTEM";
+/// The variable, set to `1`, that has git read no system-wide config file, as `gate push` sets it.
+const NO_SYSTEM_CONFIG: &str = "GIT_CONFIG_NOSYSTEM";
+/// The git every step runs: macOS's own, owned by root, so no folder on a `PATH` can put another in its place.
+const GIT_PROGRAM: &str = "/usr/bin/git";
 
 /// A step that failed: the lines saying so, on stderr, and the status the box exits with.
 #[derive(Debug)]
@@ -71,30 +75,41 @@ impl Failed {
 /// repository, config or program; in `folder`, the work root's `<root>/work`, so a step that names no repository
 /// starts its search there and not in the box's inherited folder; and with `GIT_CEILING_DIRECTORIES` at `ceiling`, the
 /// work root, which git never searches up into, so that search ends at `<root>/work` (git ignores a ceiling that is
-/// the starting folder itself). The tree's steps name their repository besides ([`Tree`]).
+/// the starting folder itself). The tree's steps name their repository besides ([`Tree`]). A run's git is found along,
+/// and runs with, the login shell's `PATH` ([`Git::along`]).
 pub struct Git<'a> {
     folder: &'a Path,
     ceiling: &'a str,
+    path: Option<&'a str>,
 }
 
 impl<'a> Git<'a> {
-    /// The git of the work root `root`, whose work folders are in `parent`, its `<root>/work`.
+    /// The git of the work root `root`, whose work folders are in `parent`, its `<root>/work`, on the box's own `PATH`.
     #[must_use]
     pub fn of(root: &'a str, parent: &'a Path) -> Git<'a> {
         Git {
             folder: parent,
             ceiling: root,
+            path: None,
         }
     }
 
-    /// The command running git with `args` as this git runs it.
+    /// This git found along, and run with, `path` as its `PATH`; `None` keeps the box's own.
+    #[must_use]
+    pub fn along(self, path: Option<&'a str>) -> Git<'a> {
+        Git { path, ..self }
+    }
+
+    /// The command running git with `args` as this git runs it: [`GIT_PROGRAM`] by its path, never one found along a
+    /// `PATH`, which still reaches git's own helpers and filters; no system-wide config read.
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new("git");
+        let mut command = Command::new(test_program::get().unwrap_or_else(|| PathBuf::from(GIT_PROGRAM)));
+        crate::process::with_path(&mut command, self.path);
         command.args(args).current_dir(self.folder);
         for (name, _) in std::env::vars_os().filter(|(name, _)| is_git_variable(name)) {
             command.env_remove(name);
         }
-        command.env("GIT_CEILING_DIRECTORIES", self.ceiling);
+        command.env("GIT_CEILING_DIRECTORIES", self.ceiling).env(NO_SYSTEM_CONFIG, "1");
         command
     }
 
@@ -375,7 +390,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
             forward: true,
             ends_on_gone: true,
         };
-        self.ran_as(step, args, mode, class)
+        self.ran_as(step, args, mode, class, &[])
     }
 
     /// Runs the step `step` of the class `class` with `args`, its standard output when it exits 0, else its failure.
@@ -384,7 +399,20 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
     ///
     /// The failure of a git that did not run to an exit or exited non-zero, or a client gone.
     pub fn step_as(&self, step: &str, args: &[&str], class: GitClass) -> Result<Vec<u8>, Failed> {
-        let ran = self.forwarded(step, args, class)?;
+        self.step_with(step, args, class, &[])
+    }
+
+    /// [`RunGit::step_as`], git given the variables `env` besides, set after the inherited git variables are removed.
+    ///
+    /// # Errors
+    ///
+    /// The failure of a git that did not run to an exit or exited non-zero, or a client gone.
+    pub fn step_with(&self, step: &str, args: &[&str], class: GitClass, env: &[(&str, &str)]) -> Result<Vec<u8>, Failed> {
+        let mode = Mode {
+            forward: true,
+            ends_on_gone: true,
+        };
+        let ran = self.ran_as(step, args, mode, class, env)?;
         self.passed(step, ran)
     }
 
@@ -399,7 +427,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
             forward: false,
             ends_on_gone: true,
         };
-        self.ran_as(step, args, mode, class)
+        self.ran_as(step, args, mode, class, &[])
     }
 
     /// Runs the step `step` of the class `class`, which writes the shared bare repository, with `args`, its standard
@@ -414,18 +442,19 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
             forward: true,
             ends_on_gone: false,
         };
-        let ran = self.ran_as(step, args, mode, class)?;
+        let ran = self.ran_as(step, args, mode, class, &[])?;
         self.passed(step, ran).map(drop)
     }
 
-    /// Runs the step `step` with `args` as `mode` says, to its exit or the bound of `class`. A client gone, seen by a
-    /// failed write of any kind or by a probe of the box's output, fails the step with [`client_gone`].
-    fn ran_as(&self, step: &str, args: &[&str], mode: Mode, class: GitClass) -> Result<Ran, Failed> {
+    /// Runs the step `step` with `args` as `mode` says, to its exit or the bound of `class`, git given the variables
+    /// `env` besides. A client gone, seen by a failed write of any kind or by a probe of the box's output, fails the step
+    /// with [`client_gone`].
+    fn ran_as(&self, step: &str, args: &[&str], mode: Mode, class: GitClass, env: &[(&str, &str)]) -> Result<Ran, Failed> {
         if mode.ends_on_gone && self.output.client_gone_probe() {
             return Err(client_gone(step));
         }
         let mut command = self.git.command(&self.args(args));
-        command.env(NO_SYSTEM_ATTRIBUTES, "1");
+        command.env(NO_SYSTEM_ATTRIBUTES, "1").envs(env.iter().copied());
         let limit = step_limit(step, class);
         let output: Arc<dyn Forwarding> = Arc::clone(self.output) as Arc<dyn Forwarding>;
         let watch = Watch {
@@ -534,6 +563,40 @@ mod test_limit {
 
     /// Nothing is noted.
     pub fn note(_step: &str, _class: GitClass) {}
+}
+
+/// A git program a test puts in place of [`GIT_PROGRAM`] for every step on its own thread, such as a shim that acts
+/// between steps.
+#[cfg(test)]
+pub mod test_program {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static PROGRAM: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Runs every git step this thread runs from now on with `program`.
+    pub fn set(program: &Path) {
+        PROGRAM.with(|cell| *cell.borrow_mut() = Some(program.to_owned()));
+    }
+
+    /// The program this thread set, if any.
+    #[must_use]
+    pub fn get() -> Option<PathBuf> {
+        PROGRAM.with(|cell| cell.borrow().clone())
+    }
+}
+
+/// No test program outside the tests.
+#[cfg(not(test))]
+mod test_program {
+    use std::path::PathBuf;
+
+    /// None.
+    pub fn get() -> Option<PathBuf> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -944,6 +1007,28 @@ mod tests {
             assert!(!ran.status.success());
         });
         assert!(output.sink().lines().is_empty(), "{:?}", output.sink().lines());
+    }
+
+    #[test]
+    fn every_git_step_runs_macos_s_own_git_by_its_path_reading_no_system_config() {
+        let case = Case::new("program");
+        let parent = case.parent();
+        let command = Git::of(case.root(), &parent)
+            .along(Some("/opt/homebrew/bin:/usr/bin"))
+            .command(&["status"]);
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("/usr/bin/git"));
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for wanted in [("GIT_CONFIG_NOSYSTEM", "1"), ("PATH", "/opt/homebrew/bin:/usr/bin")] {
+            assert!(envs.contains(&(wanted.0.to_owned(), Some(wanted.1.to_owned()))), "{wanted:?}: {envs:?}");
+        }
     }
 
     #[test]
