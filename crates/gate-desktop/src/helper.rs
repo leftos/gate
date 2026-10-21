@@ -31,7 +31,7 @@ const RETRY_PAUSE: Duration = Duration::from_millis(20);
 /// The exit code a child the helper ends is given: a command that never ran, as `gate_win32` ends one.
 const ENDED_UNSTARTED: u32 = 1;
 
-/// The seam that caps every limit, in milliseconds, in a build with the `test-seams` feature.
+/// The seam that sets every limit, raising or lowering it, in milliseconds, in a build with the `test-seams` feature.
 #[cfg(feature = "test-seams")]
 const TEST_LIMIT_VARIABLE: &str = "GATE_DESKTOP_TEST_LIMIT_MS";
 
@@ -82,7 +82,7 @@ impl Fault {
 }
 
 /// How long each step may take.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Limits {
     connect: Duration,
     message: Duration,
@@ -97,18 +97,24 @@ impl Limits {
         done: DONE_LIMIT,
     };
 
-    /// The built limits, each capped by `GATE_DESKTOP_TEST_LIMIT_MS` when it is set. `None` for a seam that is set but
-    /// is not a whole number of milliseconds.
+    /// The limits `GATE_DESKTOP_TEST_LIMIT_MS` gives ([`Limits::from_seam`]).
     #[cfg(feature = "test-seams")]
     fn with_seam() -> Option<Limits> {
-        let Some(cap) = std::env::var_os(TEST_LIMIT_VARIABLE) else {
+        Limits::from_seam(std::env::var_os(TEST_LIMIT_VARIABLE).as_deref())
+    }
+
+    /// The built limits when `seam` is absent, else its whole number of milliseconds as each limit. `None` for a seam
+    /// that is not a whole number of milliseconds.
+    #[cfg(feature = "test-seams")]
+    fn from_seam(seam: Option<&std::ffi::OsStr>) -> Option<Limits> {
+        let Some(seam) = seam else {
             return Some(Limits::BUILT);
         };
-        let cap = Duration::from_millis(cap.to_str()?.parse::<u64>().ok()?);
+        let limit = Duration::from_millis(seam.to_str()?.parse::<u64>().ok()?);
         Some(Limits {
-            connect: Limits::BUILT.connect.min(cap),
-            message: Limits::BUILT.message.min(cap),
-            done: Limits::BUILT.done.min(cap),
+            connect: limit,
+            message: limit,
+            done: limit,
         })
     }
 }
@@ -462,6 +468,46 @@ mod tests {
 
     /// The longest the test waits for the child to end: it never runs out unless the code is broken.
     const HANG_GUARD: Duration = Duration::from_secs(600);
+
+    #[cfg(feature = "test-seams")]
+    #[test]
+    fn the_test_seam_sets_every_limit_raising_or_lowering_it() {
+        use std::ffi::OsStr;
+
+        use super::Limits;
+        use crate::{CONNECT_LIMIT, DONE_LIMIT, MESSAGE_LIMIT};
+
+        assert_eq!(
+            Limits::from_seam(None),
+            Some(Limits {
+                connect: CONNECT_LIMIT,
+                message: MESSAGE_LIMIT,
+                done: DONE_LIMIT
+            }),
+            "no seam keeps the built limits"
+        );
+        let low = Duration::from_millis(100);
+        assert_eq!(
+            Limits::from_seam(Some(OsStr::new("100"))),
+            Some(Limits {
+                connect: low,
+                message: low,
+                done: low
+            }),
+            "a seam below every limit lowers each"
+        );
+        let high = Duration::from_mins(8);
+        assert_eq!(
+            Limits::from_seam(Some(OsStr::new("480000"))),
+            Some(Limits {
+                connect: high,
+                message: high,
+                done: high
+            }),
+            "a seam above every limit raises each"
+        );
+        assert_eq!(Limits::from_seam(Some(OsStr::new("soon"))), None, "a seam that is no number");
+    }
 
     #[test]
     #[expect(clippy::expect_used, reason = "a test whose child cannot be made must fail loudly")]

@@ -1797,6 +1797,10 @@ fn desktop_seam_refusals_hold(too_long: &str) {
             &["box", "--test-box-desktop-ms", bad, "run", "--stdin"],
             format!("gate: --test-box-desktop-ms must be a whole number above 0, got '{bad}'"),
         );
+        refused(
+            &["box", "--test-box-desktop-message-ms", bad, "run", "--stdin"],
+            format!("gate: --test-box-desktop-message-ms must be a whole number above 0, got '{bad}'"),
+        );
     }
     refused(
         &["box", "--test-box-desktop=", "run", "--stdin"],
@@ -1815,7 +1819,7 @@ fn box_run(seams: gate_args::BoxSeams) -> gate_args::Invocation {
 }
 
 /// The box's desktop seams: the fault its desktop run takes, the state it finds the console's session in, the unique
-/// part of the private namespace and mutex it takes, and how long its waits may take.
+/// part of the private namespace and mutex it takes, how long its waits may take, and its message limit.
 #[cfg(feature = "test-seams")]
 #[test]
 fn the_desktop_seams_parse_and_refuse_bad_values() {
@@ -1894,6 +1898,8 @@ fn the_desktop_seams_parse_and_refuse_bad_values() {
             "case-2",
             "--test-box-desktop-ms",
             "100",
+            "--test-box-desktop-message-ms",
+            "40",
             "run",
             "--stdin"
         ]),
@@ -1902,6 +1908,7 @@ fn the_desktop_seams_parse_and_refuse_bad_values() {
             desktop_session: Some(DesktopSession::NoUser),
             desktop_mutex: Some("case-2".to_owned()),
             desktop_ms: Some(100),
+            desktop_message_ms: Some(40),
             ..BoxSeams::default()
         }),
         "the desktop seams come with the others, in any order"
@@ -1920,10 +1927,26 @@ fn the_desktop_seams_parse_and_refuse_bad_values() {
     );
 }
 
+/// The box's desktop message seam, alone, in either form; its refusals are with the other desktop seams'.
+#[cfg(feature = "test-seams")]
+#[test]
+fn the_desktop_message_seam_parses() {
+    use gate_args::BoxSeams;
+
+    use crate::support::invocation;
+
+    let taking = box_run(BoxSeams {
+        desktop_message_ms: Some(5000),
+        ..BoxSeams::default()
+    });
+    assert_eq!(invocation(&["box", "--test-box-desktop-message-ms", "5000", "run", "--stdin"]), taking);
+    assert_eq!(invocation(&["box", "--test-box-desktop-message-ms=5000", "run", "--stdin"]), taking);
+}
+
 #[cfg(feature = "test-seams")]
 #[test]
 fn the_desktop_seams_are_each_given_once() {
-    let rows: [(&[&str], &[&str]); 4] = [
+    let rows: [(&[&str], &[&str]); 5] = [
         (
             &["box", "--test-box-desktop", "ok", "--test-box-desktop=hang", "run", "--stdin"],
             &["gate: --test-box-desktop is given twice"],
@@ -1954,6 +1977,17 @@ fn the_desktop_seams_are_each_given_once() {
             &["box", "--test-box-desktop-ms", "1", "--test-box-desktop-ms=2", "run", "--stdin"],
             &["gate: --test-box-desktop-ms is given twice"],
         ),
+        (
+            &[
+                "box",
+                "--test-box-desktop-message-ms",
+                "1",
+                "--test-box-desktop-message-ms=2",
+                "run",
+                "--stdin",
+            ],
+            &["gate: --test-box-desktop-message-ms is given twice"],
+        ),
     ];
     for (words, want) in rows {
         assert_eq!(problems(words), want, "{words:?}");
@@ -1968,6 +2002,7 @@ fn the_desktop_seams_without_the_feature_are_no_verb() {
         ("--test-box-desktop-session", "active"),
         ("--test-box-desktop-mutex", "case-1"),
         ("--test-box-desktop-ms", "250"),
+        ("--test-box-desktop-message-ms", "5000"),
         ("--test-box-git-limit", "checkout:2000"),
     ] {
         assert_eq!(problems(&["box", seam, value, "run", "--stdin"]), [BOX_USAGE], "{seam}");

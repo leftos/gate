@@ -5,9 +5,9 @@
 //! `--test-outputs-budget-bytes <n>`, `--test-inputs-budget-bytes <n>`, `--test-lfs-budget-bytes <n>`, `--test-dotnet-limit-ms <n>`,
 //! `--test-box-sample-ms <n>`, `--test-box-sampler-fail true|false`, `--test-box-free-percent <1-100>`,
 //! `--test-box-kill-leaves <n>`, `--test-probe-limit-ms <n>`, `--test-box-desktop <fault>`,
-//! `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>`, `--test-box-desktop-ms <n>` and
-//! `--test-box-register ok|fail`, `--test-box-root-walk-stop <folder>`, `--test-box-git-limit <step>:<ms>` (each also as
-//! `--<seam>=<value>`) before the verb; without the feature each is no verb, and so the box usage.
+//! `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>`, `--test-box-desktop-ms <n>`,
+//! `--test-box-desktop-message-ms <n>` and `--test-box-register ok|fail`, `--test-box-root-walk-stop <folder>`,
+//! `--test-box-git-limit <step>:<ms>` (each also as `--<seam>=<value>`) before the verb; without the feature each is no verb, and so the box usage.
 
 use std::ffi::{OsStr, OsString};
 use std::iter::Peekable;
@@ -109,6 +109,9 @@ enum Seam {
     DesktopMutex,
     /// `--test-box-desktop-ms <n>`: how long a desktop run's waits may take, in milliseconds.
     DesktopMs,
+    /// `--test-box-desktop-message-ms <n>`: how long a desktop run waits for each message of the helper, in
+    /// milliseconds.
+    DesktopMessageMs,
     /// `--test-box-register ok|fail`: what `register-desktop` does in place of the Task Scheduler's work.
     Register,
     /// `--test-box-root-walk-stop <folder>`: the preflight's walk above the work root ends at this folder, unjudged.
@@ -141,6 +144,7 @@ impl Seam {
             "--test-box-desktop-session" => Some(Seam::DesktopSession),
             "--test-box-desktop-mutex" => Some(Seam::DesktopMutex),
             "--test-box-desktop-ms" => Some(Seam::DesktopMs),
+            "--test-box-desktop-message-ms" => Some(Seam::DesktopMessageMs),
             "--test-box-register" => Some(Seam::Register),
             "--test-box-root-walk-stop" => Some(Seam::RootWalkStop),
             "--test-box-git-limit" => Some(Seam::GitLimit),
@@ -169,6 +173,7 @@ impl Seam {
             Seam::DesktopSession => "--test-box-desktop-session",
             Seam::DesktopMutex => "--test-box-desktop-mutex",
             Seam::DesktopMs => "--test-box-desktop-ms",
+            Seam::DesktopMessageMs => "--test-box-desktop-message-ms",
             Seam::Register => "--test-box-register",
             Seam::RootWalkStop => "--test-box-root-walk-stop",
             Seam::GitLimit => "--test-box-git-limit",
@@ -205,7 +210,7 @@ fn seams(words: &mut Peekable<impl Iterator<Item = OsString>>, problems: &mut Ve
 }
 
 /// Sets `seam` from `value`: whole milliseconds above 0 for the heartbeat, the dotnet limit, the sample period, the
-/// probe limit and the desktop waits, a step and whole milliseconds above 0 after its last `:` for the git limit,
+/// probe limit, the desktop waits and the desktop message limit, a step and whole milliseconds above 0 after its last `:` for the git limit,
 /// `fail-before` for the console, `refused` for the token, any path for the park,
 /// whole bytes above 0 for the outputs, the inputs and the LFS budgets, `true` or `false` for the sampler's failure, a whole
 /// percent from 1 to 100 for the free share, a whole count above 0 for the processes a kill leaves, one of the desktop
@@ -235,6 +240,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::DesktopSession => seams.desktop_session = Some(crate::values::desktop_session(name, &value)?),
         Seam::DesktopMutex => seams.desktop_mutex = Some(crate::values::desktop_mutex(name, &value)?),
         Seam::DesktopMs => seams.desktop_ms = Some(crate::values::above_zero(name, &value)?),
+        Seam::DesktopMessageMs => seams.desktop_message_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::GitLimit => seams.git_limit = Some(crate::values::git_limit(name, &value)?),
         Seam::Register => seams.register_ok = Some(crate::values::remote_call(name, &value, REGISTER_RESULTS)? == "ok"),
         Seam::Console => seams.fail_console = the_word(name, value, "fail-before", |option, value| Problem::BadConsoleFailure { option, value })?,

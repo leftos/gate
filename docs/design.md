@@ -2765,11 +2765,11 @@ Three seams of the MSYS keeper and the command's `PATH` are environment variable
 
 A seam is refused as the `gate run` seams are: no value, given twice, and a value outside its rule (`gate: --test-outputs-budget-bytes must be a whole number above 0, got '<v>'`, `... must be at most 2147483647 ...`, `... needs a value`, `... is given twice`).
 
-The desktop run has four more: `--test-box-desktop-session active|none|locked|other-user|disconnected` makes the box read the console session as that state (the box's own session, with the box's account at it, or nobody, another user, a locked or a disconnected one), `--test-box-desktop <mode>` starts the stand-in helper (`fake-desktop-helper.exe`, beside the box's program) in place of the registered task, at below normal priority in a kill-on-close job, with the helper's own seams set and every other variable of the box's environment inherited (the three seams the box sets itself are never inherited): `ok`, or a fault of the helper (`exit-before-hello`, `hang`, `wrong-version`, `lie-handle`, `exit-after-create`), or a task mode (`task-not-registered`, `task-set-up-wrong`, `task-failed`, `task-no-pid`) that stands for that refusal of the task without starting anything.
+The desktop run has five more: `--test-box-desktop-session active|none|locked|other-user|disconnected` makes the box read the console session as that state (the box's own session, with the box's account at it, or nobody, another user, a locked or a disconnected one), `--test-box-desktop <mode>` starts the stand-in helper (`fake-desktop-helper.exe`, beside the box's program) in place of the registered task, at below normal priority in a kill-on-close job, with the helper's own seams set and every other variable of the box's environment inherited (the three seams the box sets itself are never inherited): `ok`, or a fault of the helper (`exit-before-hello`, `hang`, `wrong-version`, `lie-handle`, `exit-after-create`), or a task mode (`task-not-registered`, `task-set-up-wrong`, `task-failed`, `task-no-pid`) that stands for that refusal of the task without starting anything.
 
 `--test-box-desktop`, given without a session seam, also stands for an `active` session. A desktop run uses no console donor and ignores the console and token seams.
 
-`--test-box-desktop-mutex <unique>` names the desktop lock by a unique part under the box's own user in place of `gate\desktop`, and `--test-box-desktop-ms <n>` lowers each of the desktop run's waits to at most `n` milliseconds, one turn of the wait for the desktop lock included.
+`--test-box-desktop-mutex <unique>` names the desktop lock by a unique part under the box's own user in place of `gate\desktop`, and `--test-box-desktop-ms <n>` sets the desktop run's connect, message and end limits to `n` milliseconds, raising or lowering each, and lowers one turn of the wait for the desktop lock to at most `n`. `--test-box-desktop-message-ms <n>` sets only the message limit, over `--test-box-desktop-ms` in either order, leaving the connect and end limits to it or to their built values (refused as `gate: --test-box-desktop-message-ms must be a whole number above 0, got '<v>'` and `... is given twice`).
 
 `--test-box-register ok|fail` is the seam of the `register-desktop` verb: the registration succeeds, or fails as the seam refusing, in place of the Task Scheduler's work (the verb takes no `--stdin`, so the seam goes before it).
 
@@ -3180,7 +3180,7 @@ Built verbs:
 
   Before the start marker every failure is a refusal (the `desktop` tag, exit 75, no back commits line), except a helper that is there and not installed where only administrators can change it: that is refused with the `install` tag (Install tripwire, above), also exit 75 with no back commits line. A helper file that is not found stays a `desktop` refusal.
 
-  The whys after `gate: not routed: the builder has no desktop session: ` are `the desktop helper did not start: ` and one of `the control pipe cannot be made: <error>`, `it did not connect in time`, `it did not answer in time`, `it sent a message the box cannot read`, `it sent a message the box did not expect`, `it did not take the box's message in time`, `it closed the control pipe`, `the control pipe failed: <error>`.
+  Every hand-off refusal line starts with `gate: not routed: the builder has no desktop session: `, a helper that never started or connected included, so the prefix names the refusal's tag and does not report the builder's session state. The whys after it are `the desktop helper did not start: ` and one of `the control pipe cannot be made: <error>`, `it did not connect in time`, `it did not answer in time`, `it sent a message the box cannot read`, `it sent a message the box did not expect`, `it did not take the box's message in time`, `it closed the control pipe`, `the control pipe failed: <error>`.
 
   Of the same prefix, about the process the task started: `the process the task started cannot be opened: <error>`, `its exit code cannot be read: <error>`, `it cannot be waited for: <error>`.
 
@@ -3968,9 +3968,9 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   The box writes the line `stand-in <pid> <created>` (the stand-in's pid and creation time) there first, before it resumes the stand-in, and starts the stand-in in no job of its own, so a child the box failed to end outlives the run and a case can read the record.
 
-  `GATE_DESKTOP_TEST_LIMIT_MS` caps each of its waits (connect, message, done) at that many whole milliseconds. `GATE_DESKTOP_TEST_PIPE_OWNER=user` makes it take a control pipe its own user owns in place of Administrators. A value of either that it cannot read (a limit that is not a whole number of milliseconds, an owner other than `user`) ends the helper at once with its bad-argument exit, 10.
+  `GATE_DESKTOP_TEST_LIMIT_MS` sets each of its waits (connect, message, done) to that many whole milliseconds, raising or lowering each. `GATE_DESKTOP_TEST_PIPE_OWNER=user` makes it take a control pipe its own user owns in place of Administrators. A value of either that it cannot read (a limit that is not a whole number of milliseconds, an owner other than `user`) ends the helper at once with its bad-argument exit, 10.
 
-  The box sets the stand-in's cap to twice its own `--test-box-desktop-ms` cap, so the box's limits pass before the stand-in's.
+  The box sets the stand-in's limit to twice its own `--test-box-desktop-ms` limit, so the box's limits pass before the stand-in's.
 
   `GATE_DESKTOP_TEST_INPUT_DESKTOP` names the input desktop the helper reports in its hello in place of the one it reads, and the helper still judges that name against `Default`; unlike the fault seam, an empty value names the empty desktop.
 

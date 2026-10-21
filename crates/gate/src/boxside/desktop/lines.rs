@@ -23,19 +23,19 @@ const SCHEDULER_SILENT: &str = "the Task Scheduler did not answer in time";
 /// words it after `the desktop helper did not start: `.
 const NO_PID: &str = "the Task Scheduler gave no process id";
 
-/// The longest the box waits, in its own budget, for the helper to connect its control pipe, unless a test cap lowers
+/// The longest the box waits, in its own budget, for the helper to connect its control pipe, unless a test cap sets
 /// it. The waits the helper keeps are its own budgets, which no box limit changes.
 pub(crate) const CONNECT_LIMIT: Duration = Duration::from_secs(10);
 
 /// The longest the box waits, in its own budget, for one message from the helper, or for the helper to take one,
-/// unless a test cap lowers it. The waits the helper keeps are its own budgets, which no box limit changes.
+/// unless a test cap sets it. The waits the helper keeps are its own budgets, which no box limit changes.
 pub(crate) const MESSAGE_LIMIT: Duration = Duration::from_secs(5);
 
-/// The longest the box waits, in its own budget, for the helper to end after it said `Done`, unless a test cap lowers
+/// The longest the box waits, in its own budget, for the helper to end after it said `Done`, unless a test cap sets
 /// it. The waits the helper keeps are its own budgets, which no box limit changes.
 pub(crate) const END_LIMIT: Duration = Duration::from_secs(10);
 
-/// How long one turn of the wait for the builder's desktop lasts, unless a test cap lowers it.
+/// How long one turn of the wait for the builder's desktop lasts, unless a test cap below it lowers it.
 pub(crate) const WAIT_STEP: Duration = Duration::from_millis(100);
 
 /// Why the box cannot hand a run's command to the builder's desktop, in the box's own words.
@@ -243,16 +243,17 @@ pub(crate) struct Limits {
 }
 
 impl Limits {
-    /// The built limits, each lowered to `cap` when a test cap gives one. A cap lowers every limit above it and leaves
-    /// those below it alone.
+    /// The limits one run keeps: the built ones, or, when the test seam `limit` gives one, its value as the connect,
+    /// message and end limits, raising or lowering each, and as the turn of the wait for the builder's desktop only
+    /// when it is below [`WAIT_STEP`]. The test seam `message`, when given, is the message limit over both.
     #[must_use]
-    pub(crate) fn capped(cap: Option<Duration>) -> Limits {
-        let lowered = |built: Duration| cap.map_or(built, |cap| built.min(cap));
+    pub(crate) fn for_run(limit: Option<Duration>, message: Option<Duration>) -> Limits {
+        let set = |built: Duration| limit.unwrap_or(built);
         Limits {
-            connect: lowered(CONNECT_LIMIT),
-            message: lowered(MESSAGE_LIMIT),
-            end: lowered(END_LIMIT),
-            wait_step: lowered(WAIT_STEP),
+            connect: set(CONNECT_LIMIT),
+            message: message.unwrap_or_else(|| set(MESSAGE_LIMIT)),
+            end: set(END_LIMIT),
+            wait_step: limit.map_or(WAIT_STEP, |limit| WAIT_STEP.min(limit)),
         }
     }
 }
@@ -544,8 +545,8 @@ mod tests {
     }
 
     #[test]
-    fn the_limits_are_the_built_ones_and_one_cap_lowers_them_all() {
-        let built = Limits::capped(None);
+    fn the_limits_are_the_built_ones_and_a_test_cap_sets_them() {
+        let built = Limits::for_run(None, None);
         assert_eq!(
             (built.connect, built.message, built.end, built.wait_step),
             (CONNECT_LIMIT, MESSAGE_LIMIT, END_LIMIT, WAIT_STEP),
@@ -563,7 +564,7 @@ mod tests {
         );
 
         let cap = Duration::from_millis(50);
-        let capped = Limits::capped(Some(cap));
+        let capped = Limits::for_run(Some(cap), None);
         assert_eq!(
             (capped.connect, capped.message, capped.end, capped.wait_step),
             (cap, cap, cap, cap),
@@ -571,11 +572,33 @@ mod tests {
         );
 
         let between = Duration::from_secs(2);
-        let partly = Limits::capped(Some(between));
+        let partly = Limits::for_run(Some(between), None);
         assert_eq!(
             (partly.connect, partly.message, partly.end, partly.wait_step),
             (between, between, between, WAIT_STEP),
-            "a cap between the limits lowers those above it and leaves the step"
+            "a cap between the limits sets the connect, message and end limits and leaves the step"
+        );
+
+        let above = Duration::from_mins(5);
+        let raised = Limits::for_run(Some(above), None);
+        assert_eq!(
+            (raised.connect, raised.message, raised.end, raised.wait_step),
+            (above, above, above, WAIT_STEP),
+            "a cap above every limit raises the connect, message and end limits and leaves the step"
+        );
+
+        let message = Duration::from_secs(1);
+        let own = Limits::for_run(Some(above), Some(message));
+        assert_eq!(
+            (own.connect, own.message, own.end, own.wait_step),
+            (above, message, above, WAIT_STEP),
+            "a message seam sets the message limit alone, over the cap"
+        );
+        let alone = Limits::for_run(None, Some(message));
+        assert_eq!(
+            (alone.connect, alone.message, alone.end, alone.wait_step),
+            (CONNECT_LIMIT, message, END_LIMIT, WAIT_STEP),
+            "a message seam without a cap leaves the other limits built"
         );
     }
 

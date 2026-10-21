@@ -29,12 +29,19 @@ const UNFETCHED: &str = "0123456789abcdef0123456789abcdef01234567";
 /// The command of every desktop case that gives none of its own: it says `ran` once it runs.
 const COMMAND: &[&str] = &[FAKE_TOOL, "out", "ran"];
 
-/// The cap on every desktop wait of a case that ends before the hand-off, in milliseconds.
+/// The box's desktop limits, and its turn of the wait for the builder's desktop, of a case that ends before the
+/// hand-off, in milliseconds.
 const DESKTOP_MS: &str = "50";
 
-/// The cap on every desktop wait of a case whose run hands its command to the stand-in helper, in milliseconds: large
-/// enough for a real helper's start and connect on a busy machine, and never reached by a passing run.
-const HAND_OFF_MS: &str = "10000";
+/// The box's connect, message and end limits of a case whose run hands its command to the stand-in helper, in
+/// milliseconds, and half the stand-in's own: a hang guard a passing run never reaches, however long a freshly built
+/// helper takes to start on a busy machine. The box's message and end waits, chained after the command is sent, stay
+/// together under the suite's 600 s hang guard.
+const HAND_OFF_MS: &str = "240000";
+
+/// The box's message limit of the case whose stand-in helper hangs, in milliseconds: the limit that case sees fire,
+/// the box's built one, far under the stand-in's own wait.
+const HANG_MESSAGE_MS: &str = "5000";
 
 /// `NORMAL_PRIORITY_CLASS`, which the helper gives the command although it runs below normal itself.
 const NORMAL_PRIORITY: &str = "priority 0x20";
@@ -64,7 +71,7 @@ fn desktop_box_call(case: &Case, args: &[&str], request: &str) -> BoxCall {
 }
 
 /// `gate box run` of `payload` with the desktop seams of `case`: the fault `mode`, the console session `session` and the
-/// cap `ms` on its desktop waits.
+/// desktop limits `ms`.
 fn run_desktop(case: &Case, payload: &Value, mode: &str, session: &str, ms: &str) -> Outcome {
     let seams = desktop_seams(case, mode, session, ms);
     let mut args = vec!["box"];
@@ -79,7 +86,7 @@ fn handed_off(case: &Case, payload: &Value, mode: &str) -> Outcome {
 }
 
 /// `gate box run` of `payload` with the desktop seams of a hand-off with the fault `mode` at an active console, and the
-/// box's `extra` seams, not yet started.
+/// box's `extra` seams, its limits [`HAND_OFF_MS`], not yet started.
 fn desktop_call(case: &Case, payload: &Value, mode: &str, extra: &[&str]) -> BoxCall {
     let seams = desktop_seams(case, mode, "active", HAND_OFF_MS);
     let mut args = vec!["box"];
@@ -697,7 +704,7 @@ fn a_helper_that_hangs_refuses_desktop_after_the_message_limit() {
     let case = Case::new("desktop_hang");
     let payload = ready_payload(&case, COMMAND);
 
-    let outcome = handed_off(&case, &payload, "hang");
+    let outcome = desktop_call(&case, &payload, "hang", &["--test-box-desktop-message-ms", HANG_MESSAGE_MS]).finish();
 
     refused_with(
         &outcome,
@@ -715,7 +722,7 @@ fn a_desktop_run_parks_after_the_command_is_adopted_and_before_it_runs() {
     let (park_word, mark_word) = (shown(&park), shown(&mark));
     let payload = ready_payload(&case, &[FAKE_TOOL, "mark", &mark_word, "out", "ran"]);
     let running = desktop_call(&case, &payload, "ok", &["--test-box-park-launch", &park_word]).start();
-    wait_until("the box parked before the command's marker", || parked.exists());
+    running.wait_until("the box parked before the command's marker", || parked.exists());
 
     let members = OpenedJob::open_to_list(field(&payload, "Job"))
         .expect("the job can be opened")

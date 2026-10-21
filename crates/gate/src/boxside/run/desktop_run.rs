@@ -106,7 +106,7 @@ pub(super) fn desktop_command(request: &Request<'_>, one: &One<'_>, wait: u64, b
     let mutex = desktop_name(beat.seams)
         .and_then(|name| PrivateMutex::open(&name))
         .map_err(|error| desktop_refused(request, &DesktopRefusal::DesktopLock(error.to_string()).into(), beat, console))?;
-    let limits = Limits::capped(beat.seams.desktop_ms.map(Duration::from_millis));
+    let limits = run_limits(beat.seams);
     let total = capped_wait(Duration::from_secs(wait), request.timeout.map(Duration::from_secs));
     let guard = match wait_for_desktop(&mutex, total, limits.wait_step, beat, console) {
         Ok(guard) => guard,
@@ -297,6 +297,15 @@ fn seam_session(state: DesktopSession, account: &Account) -> io::Result<SessionS
     })
 }
 
+/// The limits of a desktop run's waits: the built ones, or those the desktop limit and message seams set
+/// ([`Limits::for_run`]).
+fn run_limits(seams: &BoxSeams) -> Limits {
+    Limits::for_run(
+        seams.desktop_ms.map(Duration::from_millis),
+        seams.desktop_message_ms.map(Duration::from_millis),
+    )
+}
+
 /// The builder's desktop lock's name: the production `gate\desktop`, or, under the mutex seam, a namespace of the
 /// box's own user named by the seam's unique part.
 fn desktop_name(seams: &BoxSeams) -> io::Result<PrivateName> {
@@ -330,6 +339,35 @@ mod tests {
     use crate::boxside::desktop::lines::DesktopRefusal;
     use crate::console::Console;
     use gate_router::escaped;
+
+    #[test]
+    fn the_desktop_seams_set_the_runs_limits() {
+        use gate_args::BoxSeams;
+
+        use super::run_limits;
+        use crate::boxside::desktop::lines::{CONNECT_LIMIT, END_LIMIT, Limits, MESSAGE_LIMIT, WAIT_STEP};
+
+        let seamed = run_limits(&BoxSeams {
+            desktop_ms: Some(240_000),
+            desktop_message_ms: Some(5000),
+            ..BoxSeams::default()
+        });
+        assert_eq!(
+            (seamed.connect, seamed.message, seamed.end),
+            (Duration::from_mins(4), Duration::from_secs(5), Duration::from_mins(4)),
+            "the limit seam sets connect and end, the message seam the message limit"
+        );
+        assert_eq!(
+            run_limits(&BoxSeams::default()),
+            Limits {
+                connect: CONNECT_LIMIT,
+                message: MESSAGE_LIMIT,
+                end: END_LIMIT,
+                wait_step: WAIT_STEP
+            },
+            "no seams give the built limits"
+        );
+    }
 
     /// The box's own account in every case.
     fn account() -> Account {

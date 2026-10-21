@@ -941,7 +941,7 @@ fn run_helper_task(
 
 /// The stand-in helper started in the box's own session, as the task would start the helper: below normal priority,
 /// with `argument` as its one argument, its environment the box's with the helper's seams set: the fault `fault` (none
-/// when empty), a cap on its limits of twice the box's cap `cap_ms`, and a pipe its user owns. It runs in a
+/// when empty), its limits set to twice the box's limit `cap_ms`, and a pipe its user owns. It runs in a
 /// kill-on-close job that allows no breakaway, unless the box's environment asks it to record its children
 /// ([`RECORD_VARIABLE`]), when it runs in none of the box's. Its pid, and the job, which the caller keeps for as long as
 /// the command runs.
