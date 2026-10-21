@@ -514,6 +514,10 @@ step_system() {
         log 'would set kern.maxfiles=524288 and kern.maxfilesperproc=524288 in /etc/sysctl.conf, replacing their lines'
     fi
     sys systemsetup -setremotelogin on
+    # Spotlight indexing of build trees costs CPU and disk on every build; nobody searches this machine.
+    sys mdutil -a -i off
+    # Some .NET packages ship x86_64-only macOS tools (Grpc.Tools' protoc), which run only under Rosetta.
+    sys softwareupdate --install-rosetta --agree-to-license
     [ "$system" = 1 ] || skip 'run with sudo and --system'
 }
 

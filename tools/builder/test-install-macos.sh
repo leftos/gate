@@ -118,6 +118,8 @@ case_system_dry_run() {
         expect has 'would run: sysctl -w kern.maxfiles=524288' &&
         expect has 'would run: sysctl -w kern.maxfilesperproc=524288' &&
         expect has 'would run: systemsetup -setremotelogin on' &&
+        expect has 'would run: mdutil -a -i off' &&
+        expect has 'would run: softwareupdate --install-rosetta --agree-to-license' &&
         expect has 'SKIP System: run with sudo and --system' &&
         expect grep -qF 'SKIP System: run with sudo and --system' "$p/install.log" &&
         expect [ "$(ls -A "$p")" = install.log ] &&
