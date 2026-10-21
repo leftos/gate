@@ -493,6 +493,9 @@ pub(super) struct Tuned<'a> {
     pub(super) ssh: Option<&'a str>,
     /// The builder's preflight seams, [`ANSWERING`] unless the case is about a probe's bound or the SDKs it lists.
     pub(super) preflight_seams: &'a str,
+    /// The folders part after the transport's form, `alias=folder|alias=folder` giving each builder of a map its own
+    /// folder; the case's `builder` folder for every builder when `None`.
+    pub(super) folders: Option<&'a str>,
 }
 
 impl Default for Tuned<'_> {
@@ -504,13 +507,15 @@ impl Default for Tuned<'_> {
             extra: &[],
             ssh: None,
             preflight_seams: ANSWERING,
+            folders: None,
         }
     }
 }
 
 /// [`client_gate`] with the words `tuned` changes.
 pub(super) fn client_gate_tuned(case: &Case, log: &str, steps: &Path, tuned: &Tuned<'_>, command: &[&str]) -> Command {
-    let transport = format!("{}:{}", tuned.kind, shown(&case.folder().join("builder")));
+    let folders = tuned.folders.map_or_else(|| shown(&case.folder().join("builder")), str::to_owned);
+    let transport = format!("{}:{folders}", tuned.kind);
     let ssh = tuned.ssh.unwrap_or(FAKE_SSH);
     let mut seams = vec![
         "--test-remote-transport",
@@ -1757,6 +1762,102 @@ fn a_box_of_another_version_is_not_routed() {
     let events = events(&case);
     assert_eq!(fallbacks(&events), ["version"]);
     assert_eq!(builder_ref(&case, &format!("refs/gate/{}", key_of(&events))), "", "nothing was pushed");
+}
+
+/// The alias of the `builders` entry a run of [`next_builder_case`] tries before `host`.
+const FIRST_BUILDER: &str = "builder-a";
+
+/// A [`client_case`] whose routing file lists the one `builders` entry `builder-a`, in file order before `host`, both
+/// matching the case's `*tool*` commands: a run that builder turns away may try `host` next.
+fn next_builder_case(name: &str) -> Case {
+    let case = client_case(name);
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({
+        "host": HOST,
+        "repos": { &repo: ["*tool*"] },
+        "outputs": { &repo: [] },
+        "builders": [{ "host": FIRST_BUILDER, "os": "windows", "repos": { &repo: ["*tool*"] } }],
+    });
+    write_remote_json(&case, &routing.to_string());
+    // Each builder's folder is a child of the case folder's own `builder` folder, so the box's preflight finds its parent.
+    for letter in ["a", "b"] {
+        fs::create_dir_all(builder_folder(&case, letter)).expect("a builder's folder can be made");
+    }
+    case
+}
+
+/// The folders part of a map transport: `builder-a` laid out under `builder\a`, `host` under `builder\b`, both in the
+/// case folder, which [`CLIENT_IGNORED`]'s `builder/` leaves out of every snapshot.
+fn map_folders(case: &Case) -> String {
+    let folder = |letter: &str| shown(&case.folder().join("builder").join(letter));
+    format!("{FIRST_BUILDER}={}|{HOST}={}", folder("a"), folder("b"))
+}
+
+/// The folder the run of a [`next_builder_case`] lays `builder-a` (`"a"`) or `host` (`"b"`) out under.
+fn builder_folder(case: &Case, letter: &str) -> PathBuf {
+    case.folder().join("builder").join(letter)
+}
+
+/// Asserts a run that `builder-a` turned away for `reason` went on to `host` and ran the command there: the line saying
+/// so, no `running here`, the command's own output, one attempt of each builder, and host's folder holding the run.
+fn assert_handed_on(case: &Case, pid: u32, outcome: &Outcome, steps: &Path, reason: &str) {
+    let line = format!("gate: remote {FIRST_BUILDER} {reason}; trying {HOST}");
+    assert!(
+        outcome.stderr.lines().any(|said| said == line),
+        "the line names the next builder: {outcome:?}"
+    );
+    assert!(!outcome.stderr.contains("running here"), "nothing ran here: {outcome:?}");
+    assert!(
+        outcome.stdout.contains("ran there"),
+        "the command's own output came back from host: {outcome:?}"
+    );
+    assert_eq!(calls(steps), ["preflight", "preflight", "run"], "builder-a's one call, then host's two");
+    let own = own(case, pid);
+    let tagged = |event: &str, host: &str| own.iter().filter(|said| said["event"] == event && said["host"] == host).count();
+    assert_eq!(tagged("take", FIRST_BUILDER), 1, "{own:#?}");
+    assert_eq!(tagged("fallback", FIRST_BUILDER), 1, "{own:#?}");
+    assert_eq!(tagged("take", HOST), 1, "{own:#?}");
+    assert_eq!(fallbacks(&own), [reason], "{own:#?}");
+    let key = key_of(&events(case));
+    assert!(
+        builder_folder(case, "b").join("work").join(&key).is_dir(),
+        "host laid the run out in its own work folder"
+    );
+}
+
+/// A `builders` entry of another gate version is tried first, refuses, and the run goes on to `host` and runs there.
+#[test]
+fn a_builder_of_another_version_hands_the_run_to_the_next_builder() {
+    let case = next_builder_case("client-next-builder-version");
+    let steps = ssh_steps(&case, "ssh", &["on builder-a", "version 0.0.0-other", "on builder", "ok", "ok"]);
+    let folders = map_folders(&case);
+    let tuned = Tuned {
+        folders: Some(&folders),
+        ..Tuned::default()
+    };
+
+    let (pid, outcome) = finish_with_pid(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_handed_on(&case, pid, &outcome, &steps, "version");
+}
+
+/// A `builders` entry whose connection drops is tried first, is unreachable, and the run goes on to `host` and runs
+/// there.
+#[test]
+fn an_unreachable_builder_hands_the_run_to_the_next_builder() {
+    let case = next_builder_case("client-next-builder-unreachable");
+    let steps = ssh_steps(&case, "ssh", &["on builder-a", "drop", "on builder", "ok", "ok"]);
+    let folders = map_folders(&case);
+    let tuned = Tuned {
+        folders: Some(&folders),
+        ..Tuned::default()
+    };
+
+    let (pid, outcome) = finish_with_pid(client_gate_tuned(&case, "out.log", &steps, &tuned, &[r".\tool.exe", "out", "ran there"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_handed_on(&case, pid, &outcome, &steps, "unreachable");
 }
 
 /// The real box, judging its own image under `GATE_TEST_BOX_TRUST=check`, refuses the `target\` gate this user owns;

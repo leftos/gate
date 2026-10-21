@@ -2036,7 +2036,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   Ctrl+C ends it with `STATUS_CONTROL_C_EXIT` and no line. A log that cannot be written gives status 1, with no fallback.
 - **The remote client's run** (GATE-43, parts B1, B2, C1 and C2) is built in `remote/{client,parity,payload,retry,syncback,transport,watchdog}.rs`, in every build. Every routed run goes through the Rust client over ssh (`RustClient` in `remote/client.rs`, chosen in `remote/mod.rs`).
 
-  In a build with the `test-seams` feature, `gate run --test-remote-transport local:<folder>` stands in for the builder with a local folder, and `--test-remote-snapshot` and `--test-remote-client` take precedence over the ssh client.
+  In a build with the `test-seams` feature, `gate run --test-remote-transport local:<folder>` (or `local:{alias}={folder}|{alias}={folder}`, a folder for each builder) stands in for the builder with a local folder, and `--test-remote-snapshot` and `--test-remote-client` take precedence over the ssh client.
 
   The Rust client's builder root is `D:\gate-remote`, and its ssh is `ssh.exe` found along the gate's own `PATH`: `ssh.cmd` and `ssh.bat` are never looked for, in the client and in `gate push` alike ([`gate push`](#gate-push)). ssh is looked up only when a run routes, in the client's `ready()` as the routed attempt starts, before any key lock, ticket or slot; a run that never routes never looks for it.
 
@@ -3979,6 +3979,11 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-remote-transport local:<folder>` (on `gate run` only) sends the run to the Rust remote client with a local folder standing in for the builder; `local-ssh:<folder>` does the same but pushes and fetches to `<host>:<folder>/<repo>.git` with the `--test-remote-ssh` program as git's ssh (which it needs), so git's own ssh calls reach the stand-in.
 
+  After either prefix the folder may be a map, `{alias}={folder}|{alias}={folder}…`, giving each builder its own folder (a case that routes one run across several builders); plain `local:<folder>` is unchanged and serves every builder.
+  A part is a map when it holds `|`, or starts with `{alias}=` for an alias `remote.json` could name (gate-router's host rule: letters, digits, `.`, `_`, `-` and one `@`), so a drive path stays a plain folder. Aliases match case-insensitively. A malformed map (an empty folder, an alias named twice) is refused with the same `it is not local:<folder>` line as any other bad form.
+  A map that lacks a folder for an alias the run's `remote.json` names (each `builders` entry and `host`) ends the run before any call with `gate: --test-remote-transport names no folder for builder {alias}`; a missing or unreadable `remote.json` checks nothing, and extra entries pass.
+  `gate check --builder` takes the same forms.
+
   `--test-remote-ssh <exe>` replaces ssh with a program (the test bin `fake-ssh`), found as the gate finds its own programs ([Command launching](#command-launching)): a name with a folder part against the working folder, a bare name along PATH only. One it cannot find ends the run before any call with `gate: cannot use the remote transport '<transport>': cannot find --test-remote-ssh <word>: <why>` and status 1, after the transport's own form is checked.
 
   `--test-remote-retry-pause-ms <n>` (whole milliseconds above 0) replaces the 2 s pause before the pre-banner retry; it and `--test-remote-ssh` need the transport, and `--test-remote-snapshot` cannot be given with it. `--test-print-request` shows them as `testSeams.remoteTransport`, `testSeams.remoteSsh` and `testSeams.remoteRetryPauseMs`, after `remoteSnapshot`.
@@ -4071,6 +4076,9 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
   It reads a box call from the last three words of the line, `box <verb> --stdin`, and the box it runs inherits its stdin, so the request the client feeds reaches the box; a box call whose last word is not `--stdin` is refused by name.
 
   Its steps are `ok`, `hold`, `version`, `boot <time>` (as `version`, for the box's boot line), `no-boot` (drops the box's boot line), `drop` (exits 255 at once, writing nothing), `exit`, `fail-banner`, `fail-other`, `out-then-drop`.
+
+  An `on {alias}` line starts a block of steps that answer only calls to that host, numbered by that host's own calls; the steps before the first `on` line answer the hosts with no block, and a file with no `on` line keeps one order for every call.
+  An `on` with no alias, with more than one alias, or for an alias that already has a block is refused with its line number: `line N: on takes a builder's alias`, `line N: on takes one builder's alias, got '<a b>'`, `line N: <alias> already has its own steps`.
 
   They also include `ok-then-out <line>` (as `ok`, then writes the line on stdout), `say-exit <n> <line>` (writes the line on stderr and exits `<n>`, as a call that fails with a line of its own does).
 

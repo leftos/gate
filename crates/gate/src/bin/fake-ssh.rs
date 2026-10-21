@@ -6,10 +6,13 @@
 //! a push call, whose verb is `push`. It reads the steps file the variable `GATE_FAKE_SSH_STEPS` names, one step a line,
 //! appends the verb it was called with to `<steps file>.log`, and the verb and ssh's options, the words before the
 //! host with a last `--` left out, as one line to `<steps file>.words`, and the host and the line, a space between, as
-//! one line to `<steps file>.lines`, and acts on the step of its call, counted by that log: the
-//! first call takes the first step. A line that holds none of these, as git's `-G` probe of which ssh it runs, fails
-//! with no step taken. Started with `--version` alone, as a push case starts a copy of it standing in for a builder's
-//! old gate, it says `gate 0.0.0-old`, or `gate <v>` when the variable `GATE_FAKE_SSH_VERSION` holds `<v>`, and exits 0;
+//! one line to `<steps file>.lines`, and acts on the step of its call: the first call takes the first step, a file
+//! without an `on {alias}` line counted by that log as a whole. An `on {alias}` line starts a block of steps that answer
+//! only calls to that host, numbered by that host's own lines of `<steps file>.lines`; the steps before the first `on`
+//! line answer the hosts with no block, numbered the same way; an alias has one block at most. A line that holds none of
+//! these, as git's `-G` probe of which ssh it runs, fails with no step taken. Started with `--version` alone, as a push
+//! case starts a copy of it standing in for a builder's old gate, it says `gate 0.0.0-old`, or `gate <v>` when the
+//! variable `GATE_FAKE_SSH_VERSION` holds `<v>`, and exits 0;
 //! started with `box --test-box-register ok register-desktop`, as a builder registers the desktop task with such a copy
 //! installed, it says the verb's `gate-register: registered` line and exits 0.
 //!
@@ -196,7 +199,7 @@ fn run() -> Result<i32, String> {
         Some((last, options)) if last == "--" => options,
         _ => before_host,
     };
-    let step = next_step(&steps, call.verb, options)?;
+    let step = next_step(&steps, host, call.verb, options)?;
     match step.split_once(' ') {
         None => bare_step(&step, &call),
         Some(("hold", path)) => {
@@ -360,9 +363,11 @@ fn seams_of(name: &str) -> Result<String, String> {
     }
 }
 
-/// The step of this call: the one after as many steps as the log holds calls, the call's `verb` appended to the log,
-/// and the verb and the call's ssh `options` appended as one line to `<steps file>.words`.
-fn next_step(steps: &Path, verb: &str, options: &[String]) -> Result<String, String> {
+/// The step of this call: a step of `host`'s own `on {alias}` block, numbered by the calls made to that host, else of
+/// the steps before the first `on` line, numbered the same way; a file with no `on` line at all numbers all its steps by
+/// the log as a whole. The call's `verb` is appended to the log, and the verb and the call's ssh `options` as one line to
+/// `<steps file>.words`.
+fn next_step(steps: &Path, host: &str, verb: &str, options: &[String]) -> Result<String, String> {
     let text = fs::read_to_string(steps).map_err(|error| format!("cannot read {}: {error}", steps.display()))?;
     let log = beside(steps, ".log");
     let made = fs::read_to_string(&log).map_or(0, |calls| calls.lines().count());
@@ -372,11 +377,76 @@ fn next_step(steps: &Path, verb: &str, options: &[String]) -> Result<String, Str
         .collect::<Vec<_>>()
         .join(" ");
     appended(&beside(steps, ".words"), &said)?;
-    text.lines()
-        .filter(|line| !line.trim().is_empty())
-        .nth(made)
-        .map(|step| step.trim().to_owned())
-        .ok_or_else(|| format!("no step left for call {} ({verb})", made + 1))
+    let blocks = Blocks::of(&text)?;
+    let index = if blocks.any() {
+        // The current call is one of the host's lines, `run` having appended it before the step is chosen.
+        calls_to(steps, host).saturating_sub(1)
+    } else {
+        made
+    };
+    blocks
+        .step(host, index)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("no step left for call {} ({verb})", index + 1))
+}
+
+/// The calls made so far to `host`, counting this one, which `run` appends to `<steps file>.lines` before the step is
+/// chosen.
+fn calls_to(steps: &Path, host: &str) -> usize {
+    let prefix = format!("{host} ");
+    fs::read_to_string(beside(steps, ".lines")).map_or(0, |lines| lines.lines().filter(|line| line.starts_with(&prefix)).count())
+}
+
+/// The steps file's `on {alias}` blocks: the steps before the first, and each alias's own.
+struct Blocks<'a> {
+    shared: Vec<&'a str>,
+    named: Vec<(&'a str, Vec<&'a str>)>,
+}
+
+impl<'a> Blocks<'a> {
+    /// The blocks of the steps file `text`, one step a line and blank lines skipped; else the line naming the first `on`
+    /// line that cannot be one.
+    fn of(text: &'a str) -> Result<Blocks<'a>, String> {
+        let mut blocks = Blocks {
+            shared: Vec::new(),
+            named: Vec::new(),
+        };
+        for (index, line) in text.lines().enumerate().filter(|(_, line)| !line.trim().is_empty()) {
+            let step = line.trim();
+            let Some(alias) = step.strip_prefix("on ") else {
+                match blocks.named.last_mut() {
+                    Some((_, steps)) => steps.push(step),
+                    None => blocks.shared.push(step),
+                }
+                continue;
+            };
+            if alias.is_empty() {
+                return Err(format!("line {}: on takes a builder's alias", index + 1));
+            }
+            if alias.contains(' ') {
+                return Err(format!("line {}: on takes one builder's alias, got '{alias}'", index + 1));
+            }
+            if blocks.named.iter().any(|(named, _)| *named == alias) {
+                return Err(format!("line {}: {alias} already has its own steps", index + 1));
+            }
+            blocks.named.push((alias, Vec::new()));
+        }
+        Ok(blocks)
+    }
+
+    /// Whether the file holds any `on` line.
+    fn any(&self) -> bool {
+        !self.named.is_empty()
+    }
+
+    /// The step numbered `index` of a call to `host`: its own block's, else the steps before the first `on` line.
+    fn step(&self, host: &str, index: usize) -> Option<&'a str> {
+        let steps = match self.named.iter().find(|(alias, _)| *alias == host) {
+            Some((_, steps)) => steps,
+            None => &self.shared,
+        };
+        steps.get(index).copied()
+    }
 }
 
 /// The path of `steps` with `suffix` after its name.

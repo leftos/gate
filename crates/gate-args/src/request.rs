@@ -302,10 +302,12 @@ pub struct TestSeams {
     /// How long a routed run waits for its work folder's key, held by another run of the same worktree, before it falls
     /// back with reason `busy`.
     pub key_wait_ms: Option<u64>,
-    /// How long each git call of the routing decision may take before git is killed and the run goes ahead here.
+    /// How long each git call of the routing decision may take before git is killed and the run goes ahead here, and
+    /// each git call the remote client's bounds give before that call fails, in place of their defaults.
     pub git_limit_ms: Option<u64>,
-    /// How long the readers of a routing-decision git call that has exited may take to reach their pipes' ends before
-    /// the call fails, in place of 2 s.
+    /// How long the readers of a git call that has exited may take to reach their pipes' ends before the call fails, in
+    /// place of 2 s: the routing decision's calls, the remote client's, the `--test-remote-snapshot` client's, the call
+    /// that places a run's folder for its duration key, and the drain of this PC's `dotnet --list-sdks` read.
     pub git_drain_ms: Option<u64>,
     /// The file a local light gate waits for, holding the beside mutex, between taking its slot and writing its claim,
     /// its arrival written to `<file>.reached` before the wait: it writes the claim, then journals its take, once the file
@@ -318,7 +320,8 @@ pub struct TestSeams {
     /// and nothing pushed.
     pub remote_snapshot: bool,
     /// The transport of the Rust remote client a routed run calls, as given: `local:<folder>`, the builder's root a
-    /// folder here and every ssh call this gate's own `box`.
+    /// folder here and every ssh call this gate's own `box`, or `local:{alias}={folder}|…`, each builder the map names
+    /// laid out under its own; the same after `local-ssh:`.
     pub remote_transport: Option<String>,
     /// The program each ssh call of the local transport starts with ssh's own words, in place of this gate's `box`.
     pub remote_ssh: Option<PathBuf>,
@@ -503,8 +506,8 @@ pub struct CheckSeams {
     /// The key under `HKEY_CURRENT_USER` the check's netfx-sdk probe reads the installed .NET Framework SDKs from, in
     /// place of this PC's own list (`--test-netfx-key`).
     pub netfx_key: Option<String>,
-    /// The builder check's local transport, `local:<folder>` or `local-ssh:<folder>`, as a routed run's
-    /// (`--test-remote-transport`).
+    /// The builder check's local transport, `local:<folder>` or `local-ssh:<folder>` — or either with a map of
+    /// `{alias}={folder}` entries — as a routed run's (`--test-remote-transport`).
     pub remote_transport: Option<String>,
     /// The program the local transport's call starts with ssh's own words (`--test-remote-ssh`).
     pub remote_ssh: Option<PathBuf>,

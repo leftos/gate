@@ -3,7 +3,8 @@
 //! own and `--` before the host. The local transport of the test seams has its builder root in a folder here, runs
 //! this gate's own `box` with the words the line carries after the builder's gate, or a stand-in for ssh with ssh's own
 //! words, and pushes to the bare repository's own path; its `local-ssh:` form pushes and fetches as the ssh transport
-//! does, to `<host>:<path>` with the stand-in as git's ssh.
+//! does, to `<host>:<path>` with the stand-in as git's ssh. Either form gives one folder every builder is laid out under,
+//! or a map, `local:<alias>=<folder>|…`, giving each builder its own.
 //!
 //! A gate built without the `test-seams` feature has the ssh transport alone.
 
@@ -254,23 +255,53 @@ pub(crate) fn ssh_words(host: &str, line: &str, wire: Wire) -> Vec<OsString> {
 
 /// The local transport of `--test-remote-transport local:<folder>`: the builder's root `<folder>`, every call this
 /// gate's own exe, or the stand-in `stub` of `--test-remote-ssh` given ssh's words. Of `local-ssh:<folder>`, git's ssh
-/// command too, the stand-in's, which git runs for the push and the sync-back's calls.
+/// command too, the stand-in's, which git runs for the push and the sync-back's calls. Either form may give a map of
+/// `{alias}={folder}` entries a `|` between ([`folders_of`]), each builder laid out under its own.
 #[cfg(feature = "test-seams")]
 pub(crate) struct Local {
-    root: String,
+    folders: Folders,
     gate: PathBuf,
     stub: Option<PathBuf>,
     git_ssh: Option<String>,
 }
 
+/// The folders a local transport names: one every builder is laid out under, or each builder's own by its alias.
+#[cfg(feature = "test-seams")]
+enum Folders {
+    /// `local:<folder>`: every builder under the one folder.
+    One(String),
+    /// `local:<alias>=<folder>|…`: the alias as the map spells it, and the folder read against the working directory.
+    Map(Vec<(String, String)>),
+}
+
+#[cfg(feature = "test-seams")]
+impl Folders {
+    /// The folder [`Transport::root`] gives: the plain form's one folder, which every builder of that form is laid out
+    /// under. A map's builders are laid out under their own entries ([`folder_for`]), never under this.
+    fn one(&self) -> &str {
+        match self {
+            Folders::One(folder) => folder,
+            Folders::Map(entries) => entries.first().map_or("", |(_, folder)| folder.as_str()),
+        }
+    }
+}
+
 #[cfg(feature = "test-seams")]
 impl Local {
-    /// The local transport `transport` names, `local:<folder>` or `local-ssh:<folder>` with the folder read against the
-    /// working directory, its calls made through `stub` when one is given, which `local-ssh:` needs; else the line
-    /// saying why it cannot be used.
+    /// The local transport `transport` names, `local:<folder>` or `local-ssh:<folder>` — or either with a map of
+    /// `{alias}={folder}` entries — with each folder read against the working directory, its calls made through `stub`
+    /// when one is given, which `local-ssh:` needs; else the line saying why it cannot be used.
     pub(crate) fn new(transport: &str, stub: Option<&Path>) -> Result<Local, String> {
+        Local::new_beside(transport, stub, std::env::var_os("LOCALAPPDATA").as_deref())
+    }
+
+    /// [`Local::new`] with the folder holding the routing file a map form is checked against given as `local_app_data`.
+    fn new_beside(transport: &str, stub: Option<&Path>, local_app_data: Option<&std::ffi::OsStr>) -> Result<Local, String> {
         let cannot = |why: String| format!("gate: cannot use the remote transport '{transport}': {why}");
-        let (folder, over_ssh) = local_form(transport).ok_or_else(|| cannot("it is not local:<folder>".to_owned()))?;
+        let (part, over_ssh) = local_form(transport).ok_or_else(|| cannot("it is not local:<folder>".to_owned()))?;
+        let folders = folders_of(part)
+            .map_err(|error| cannot(error.to_string()))?
+            .ok_or_else(|| cannot("it is not local:<folder>".to_owned()))?;
         let git_ssh = match (over_ssh, stub) {
             (false, _) => None,
             (true, Some(stub)) => Some(ssh::git_ssh_command(stub)),
@@ -280,10 +311,10 @@ impl Local {
                 ));
             }
         };
-        let root = local_root(folder).map_err(|error| cannot(error.to_string()))?;
+        check_map(&folders, local_app_data)?;
         let gate = std::env::current_exe().map_err(|error| cannot(format!("cannot find this gate's own exe: {error}")))?;
         Ok(Local {
-            root,
+            folders,
             gate,
             stub: stub.map(Path::to_path_buf),
             git_ssh,
@@ -291,8 +322,8 @@ impl Local {
     }
 }
 
-/// The folder of the local transport `transport` names and whether it is the `local-ssh:` form; `None` when it is
-/// neither `local:<folder>` nor `local-ssh:<folder>`.
+/// What the local transport `transport` names after its form — one folder, or a map of them ([`folders_of`]) — and
+/// whether it is the `local-ssh:` form; `None` when it is neither `local:<folder>` nor `local-ssh:<folder>`.
 #[cfg(feature = "test-seams")]
 fn local_form(transport: &str) -> Option<(&str, bool)> {
     match transport.split_once(':') {
@@ -308,19 +339,104 @@ fn local_root(folder: &str) -> std::io::Result<String> {
     std::path::absolute(folder).map(|root| root.to_string_lossy().into_owned())
 }
 
+/// The folders the part of a local transport's name after its form gives: `{folder}` for every builder, or
+/// `{alias}={folder}` entries a `|` between for each builder's own, each folder read against the working directory;
+/// `None` for a part that is neither form, which the caller refuses as not `local:<folder>`.
+#[cfg(feature = "test-seams")]
+fn folders_of(part: &str) -> std::io::Result<Option<Folders>> {
+    if !part.contains('|') && map_alias(part).is_none() {
+        return local_root(part).map(|folder| Some(Folders::One(folder)));
+    }
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for entry in part.split('|') {
+        let Some((alias, folder)) = map_entry(entry) else {
+            return Ok(None);
+        };
+        if entries.iter().any(|(named, _)| named.eq_ignore_ascii_case(alias)) {
+            return Ok(None);
+        }
+        entries.push((alias.to_owned(), local_root(folder)?));
+    }
+    Ok(Some(Folders::Map(entries)))
+}
+
+/// The map entry `{alias}={folder}`, split at its first `=`: the alias, one a routing file may name a builder by
+/// ([`map_alias`]), and the folder it names, which is not empty; `None` for a part that is no entry, such as a drive
+/// path, whose `C:\` comes before its `=`.
+#[cfg(feature = "test-seams")]
+fn map_entry(entry: &str) -> Option<(&str, &str)> {
+    let (alias, folder) = entry.split_once('=')?;
+    (!folder.is_empty() && gate_router::is_usable_host(alias)).then_some((alias, folder))
+}
+
+/// The alias a map part starts with and an `=` after, whether or not a folder follows: a routing file's builder alias,
+/// so a drive path's `C:` before its `=` names none, and a part shaped `{alias}=` is a map entry whose folder is
+/// missing rather than a plain folder serving every builder.
+#[cfg(feature = "test-seams")]
+fn map_alias(part: &str) -> Option<&str> {
+    let (alias, _) = part.split_once('=')?;
+    gate_router::is_usable_host(alias).then_some(alias)
+}
+
+/// The folder the builder `alias` is laid out under: the plain form's one folder, else the map's entry for the alias,
+/// matched in any ASCII letter case; else the line naming the builder the map leaves out.
+#[cfg(feature = "test-seams")]
+fn folder_for<'f>(folders: &'f Folders, alias: &str) -> Result<&'f str, String> {
+    match folders {
+        Folders::One(folder) => Ok(folder),
+        Folders::Map(entries) => entries
+            .iter()
+            .find(|(named, _)| named.eq_ignore_ascii_case(alias))
+            .map(|(_, folder)| folder.as_str())
+            .ok_or_else(|| format!("gate: --test-remote-transport names no folder for builder {alias}")),
+    }
+}
+
+/// Refuses the map `folders` holds when the routing file under `local_app_data` names a builder it leaves out: the run
+/// cannot say where that builder's work folder would lie, and no folder stands in for it. A routing file that is not
+/// there or cannot be read names no builder, so the transport leaves its own report to the routing.
+#[cfg(feature = "test-seams")]
+fn check_map(folders: &Folders, local_app_data: Option<&std::ffi::OsStr>) -> Result<(), String> {
+    if !matches!(folders, Folders::Map(_)) {
+        return Ok(());
+    }
+    let Some(path) = crate::route::remote_json_path(local_app_data) else {
+        return Ok(());
+    };
+    let Ok(Some(config)) = crate::route::read_remote_json(&path) else {
+        return Ok(());
+    };
+    // `host`, each `hosts` entry (which `gate check --builder` resolves to a builder) and each `builders` entry: every
+    // builder a routed run or a check can lay out. A file whose `hosts` holds no list names `host` all the same.
+    let hosts = config
+        .builders()
+        .ok()
+        .into_iter()
+        .flat_map(|builders| builders.iter().map(String::as_str));
+    let named = std::iter::once(config.host())
+        .chain(hosts)
+        .chain(config.builder_entries().map(|builder| builder.alias.as_str()));
+    for alias in named {
+        folder_for(folders, alias)?;
+    }
+    Ok(())
+}
+
 /// The profile a routed run of `builder` reaches it by: over the local transport `transport` names, its folder read as
 /// [`Local::new`] reads it ([`Profile::in_folder`]), else over the ssh transport ([`Profile::of`]). Else why the named
-/// transport has none.
+/// transport has none, a map leaving the builder out among them.
 #[cfg(feature = "test-seams")]
 pub(crate) fn builder_profile(builder: &Builder, transport: Option<&str>) -> Result<Profile, String> {
     let Some(transport) = transport else {
         return Ok(Profile::of(builder, ssh::BUILDER_ROOT));
     };
     let said = gate_router::escaped(transport);
-    let (folder, _) = local_form(transport).ok_or_else(|| format!("the remote transport '{said}' is not local:<folder>"))?;
-    let folder =
-        local_root(folder).map_err(|error| format!("cannot read the remote transport '{said}': {}", gate_router::escaped(&error.to_string())))?;
-    Ok(Profile::in_folder(builder, &folder))
+    let not_form = || format!("the remote transport '{said}' is not local:<folder>");
+    let (part, _) = local_form(transport).ok_or_else(not_form)?;
+    let folders = folders_of(part)
+        .map_err(|error| format!("cannot read the remote transport '{said}': {}", gate_router::escaped(&error.to_string())))?
+        .ok_or_else(not_form)?;
+    Ok(Profile::in_folder(builder, folder_for(&folders, &builder.alias)?))
 }
 
 /// The profile a routed run of `builder` reaches it by: the ssh transport's ([`Profile::of`]), in a gate built without
@@ -337,11 +453,16 @@ pub(crate) fn builder_profile(builder: &Builder, _transport: Option<&str>) -> Re
 #[cfg(feature = "test-seams")]
 impl Transport for Local {
     fn root(&self) -> &str {
-        &self.root
+        self.folders.one()
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "a map is checked against the routing file when the transport is chosen, so no routed builder is missing"
+    )]
     fn profile(&self, builder: &Builder) -> Profile {
-        Profile::in_folder(builder, &self.root)
+        let folder = folder_for(&self.folders, &builder.alias).expect("the map was checked against remote.json when the transport was chosen");
+        Profile::in_folder(builder, folder)
     }
 
     /// The stand-in is given ssh's words, `wire`'s among them; this gate's own `box` runs with no connection to carry.
@@ -576,6 +697,174 @@ mod tests {
             id: Some("1f0efc62".to_owned()),
         };
         assert_eq!(local.profile(&mac).root(), "/Users/b/gate-remote", "a macOS entry keeps its own root");
+    }
+
+    /// The Windows builder `alias` of a routing file entry with no root of its own.
+    fn entry(alias: &str) -> Builder {
+        Builder {
+            alias: alias.to_owned(),
+            os: BuilderOs::Windows,
+            root: None,
+            slots: 1,
+            id: None,
+        }
+    }
+
+    /// The local transport `transport` names, checked against no routing file: [`Local::new_beside`] with none.
+    fn local(transport: &str, stub: Option<&std::path::Path>) -> Local {
+        Local::new_beside(transport, stub, None).expect("a local transport")
+    }
+
+    /// Each map entry lays its builder out under its own folder, and the routing's profile agrees, in both forms.
+    #[test]
+    fn a_transport_map_gives_each_builder_its_own_folder() {
+        let stub = PathBuf::from(r"C:\suite\fake-ssh.exe");
+        for transport in [r"local:builder-a=C:\one|builder-b=C:\two", r"local-ssh:builder-a=C:\one|builder-b=C:\two"] {
+            let stubbed = transport.starts_with("local-ssh:").then_some(stub.as_path());
+            let local = local(transport, stubbed);
+            for (alias, folder) in [("builder-a", r"C:\one"), ("builder-b", r"C:\two")] {
+                assert_eq!(local.profile(&entry(alias)).root(), folder, "{transport}");
+                let named = super::builder_profile(&entry(alias), Some(transport)).expect("the map is read");
+                assert_eq!(
+                    named,
+                    local.profile(&entry(alias)),
+                    "the routing's trees are laid out as the client's run is"
+                );
+            }
+        }
+    }
+
+    /// The plain form, one folder, still serves every builder as it did.
+    #[test]
+    fn a_single_folder_transport_keeps_serving_every_builder() {
+        let stub = PathBuf::from(r"C:\suite\fake-ssh.exe");
+        for transport in [r"local:C:\builder", r"local-ssh:C:\builder"] {
+            let stubbed = transport.starts_with("local-ssh:").then_some(stub.as_path());
+            let local = local(transport, stubbed);
+            for alias in ["builder", "builder-a"] {
+                assert_eq!(local.profile(&entry(alias)).root(), r"C:\builder", "{transport}");
+                let named = super::builder_profile(&entry(alias), Some(transport)).expect("the folder is read");
+                assert_eq!(named.root(), r"C:\builder", "{transport}");
+            }
+        }
+    }
+
+    /// A map that leaves the builder out names it in the line that refuses it, never a default root.
+    #[test]
+    fn a_transport_map_without_the_builder_fails_with_its_alias() {
+        assert_eq!(
+            super::builder_profile(&entry("builder-b"), Some(r"local:builder-a=C:\one")).err(),
+            Some("gate: --test-remote-transport names no folder for builder builder-b".to_owned())
+        );
+    }
+
+    /// A folder holding `=` keeps it: an entry splits at its first `=` and no other.
+    #[test]
+    fn a_map_entry_splits_at_its_first_equals_sign() {
+        let local = local(r"local:builder-a=C:\one=two|builder-b=C:\three", None);
+        assert_eq!(local.profile(&entry("builder-a")).root(), r"C:\one=two");
+        assert_eq!(local.profile(&entry("builder-b")).root(), r"C:\three");
+    }
+
+    /// A builder alias gate-router accepts — one with a dot, or a `user@host` — is a map entry, not a plain folder,
+    /// whether the map holds one entry or several.
+    #[test]
+    fn a_map_entry_takes_every_alias_gate_router_accepts() {
+        let both = local(r"local:mac-mini.lan=C:\m|user@host=C:\h", None);
+        assert_eq!(both.profile(&entry("mac-mini.lan")).root(), r"C:\m");
+        assert_eq!(both.profile(&entry("user@host")).root(), r"C:\h");
+        let alone = local(r"local:mac-mini.lan=C:\m", None);
+        assert_eq!(alone.profile(&entry("mac-mini.lan")).root(), r"C:\m", "a single entry is a map too");
+    }
+
+    /// An alias with no folder after its `=` is a malformed map, refused, never a plain folder serving every builder.
+    #[test]
+    fn a_map_entry_with_no_folder_is_refused() {
+        assert_eq!(
+            Local::new_beside(r"local:builder-a=", None, None).err(),
+            Some(r"gate: cannot use the remote transport 'local:builder-a=': it is not local:<folder>".to_owned())
+        );
+    }
+
+    /// A drive path's `C:` comes before its `=`, so a folder holding one stays the plain form, one for every builder.
+    #[test]
+    fn a_drive_path_holding_an_equals_sign_stays_one_folder() {
+        let local = local(r"local:C:\a=b", None);
+        for alias in ["builder", "builder-a"] {
+            assert_eq!(local.profile(&entry(alias)).root(), r"C:\a=b");
+        }
+    }
+
+    /// Two entries naming one alias in different letter cases are refused: the map would take the first silently.
+    #[test]
+    fn a_map_naming_an_alias_twice_is_refused() {
+        let transport = r"local:builder-a=C:\one|Builder-A=C:\two";
+        assert_eq!(
+            Local::new_beside(transport, None, None).err(),
+            Some(format!("gate: cannot use the remote transport '{transport}': it is not local:<folder>"))
+        );
+    }
+
+    /// The `hosts` entries a `gate check --builder` resolves are checked too, not the `builders` entries alone.
+    #[test]
+    fn a_map_the_routing_file_leaves_out_a_hosts_entry_for_fails_before_the_run() {
+        let root = crate::test_support::temp_dir().join(format!("gate-map-hosts-{}", std::process::id()));
+        let folder = root.join("gate");
+        fs::create_dir_all(&folder).expect("the routing folder can be made");
+        fs::write(
+            folder.join("remote.json"),
+            r#"{"host": "builder", "hosts": ["hosts-a"], "repos": {"app": ["*tool*"]}}"#,
+        )
+        .expect("the routing file can be written");
+        let map = super::Folders::Map(vec![("builder".to_owned(), r"C:\two".to_owned())]);
+
+        assert_eq!(
+            super::check_map(&map, Some(root.as_os_str())),
+            Err("gate: --test-remote-transport names no folder for builder hosts-a".to_owned())
+        );
+        fs::remove_dir_all(&root).expect("the folder can be removed");
+    }
+
+    /// A map is checked against the routing file's builders before the run starts: one it leaves out fails with the
+    /// alias the file spells, an extra map entry passes, and a routing file that is not there passes too.
+    #[test]
+    fn a_map_the_routing_file_leaves_out_a_builder_for_fails_before_the_run() {
+        let root = crate::test_support::temp_dir().join(format!("gate-map-check-{}", std::process::id()));
+        let folder = root.join("gate");
+        fs::create_dir_all(&folder).expect("the routing folder can be made");
+        let map = || {
+            super::Folders::Map(vec![
+                ("builder-a".to_owned(), r"C:\one".to_owned()),
+                ("builder".to_owned(), r"C:\two".to_owned()),
+            ])
+        };
+        let routing = |host: &str| {
+            format!(
+                concat!(
+                    r#"{{"host": "{}", "repos": {{"a": ["*x*"]}}, "#,
+                    r#""builders": [{{"host": "builder-a", "os": "windows", "repos": {{"a": ["*x*"]}}}}]}}"#
+                ),
+                host
+            )
+        };
+
+        assert_eq!(
+            super::check_map(&map(), Some(root.as_os_str())),
+            Ok(()),
+            "no routing file names no builder"
+        );
+        fs::write(folder.join("remote.json"), routing("host-1")).expect("the routing file can be written");
+        assert_eq!(
+            super::check_map(&map(), Some(root.as_os_str())),
+            Err("gate: --test-remote-transport names no folder for builder host-1".to_owned())
+        );
+        fs::write(folder.join("remote.json"), routing("builder")).expect("the routing file can be written");
+        assert_eq!(
+            super::check_map(&map(), Some(root.as_os_str())),
+            Ok(()),
+            "an extra map entry names no builder of the file"
+        );
+        fs::remove_dir_all(&root).expect("the folder can be removed");
     }
 
     #[test]

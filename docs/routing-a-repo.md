@@ -91,6 +91,12 @@ The words a macOS builder is sent are spelled for the Mac: the recognised paths 
 
 `gate check --builder` hints at the installer for a missing node, pwsh, ffmpeg, netfx-sdk or a rust with no minimum: the hint names `tools/builder/install-toolchains.ps1` and points to this section.
 
+### Several builders
+
+List each further builder in `remote.json`'s `builders` array, beside `host`. A builder that refuses a routed run or cannot be reached hands the run to the next builder that matches the command, then `host`, and the PC runs it only when none takes it.
+
+Which refusals hand the run on, the order, the one wait shared by every builder and the lines the run says are in [design.md, The next builder](design.md#routing); a repo owner adds nothing beyond the list.
+
 ## The routing trial
 
 A trial runs the repo's full command routed, once, and assumes a local run passes: it never runs the full command locally to compare. If the routed run fails, only the failing steps or tests are rerun locally, with the narrowest command that reproduces them:
