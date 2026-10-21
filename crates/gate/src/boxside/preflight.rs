@@ -205,7 +205,9 @@ fn held_work_root(work: &str, bare: &str, paired: bool, seams: &BoxSeams, consol
 /// Says the SDK line, the list read within `--test-dotnet-limit-ms` when `seams` gives it, else
 /// [`git::DOTNET_LIMIT`], then one line on stdout for each tool the payload's `Needs` names, in its order. The tools are
 /// probed within `--test-probe-limit-ms` when `seams` gives it, else [`probe::PROBE_LIMIT`], while dotnet lists the
-/// SDKs; the netfx-sdk probe reads the key `--test-netfx-key` names, when `seams` gives it, in place of the machine's.
+/// SDKs; the readers of dotnet and of each probed tool get `--test-probe-drain-ms` to end once it has exited, when
+/// `seams` gives it. The netfx-sdk probe reads the key `--test-netfx-key` names, when `seams` gives it, in place of the
+/// machine's.
 /// No probe runs a program from the run's own folders ([`refused_folders`]). A `Needs` that is not an object of
 /// texts is said on stderr, probes nothing, and fails nothing. The minimum each need carries is not read: the box
 /// reports, the client compares.
@@ -214,7 +216,7 @@ fn say_sdks_and_tools(payload: &Payload, work: &str, seams: &BoxSeams, console: 
         .pairs("Needs")
         .map(|needs| needs.into_iter().map(|(name, _)| name).collect())
         .map_err(|line| format!("{line}; probing nothing"));
-    let probe_limit = seams.probe_limit_ms.map_or(probe::PROBE_LIMIT, Duration::from_millis);
+    let windows = probe::Windows::of(seams.probe_limit_ms, seams.probe_drain_ms);
     let netfx_key = seams.netfx_key.as_deref();
     let refused = refused_folders(payload, work);
     let worktrees: Vec<&Path> = refused.iter().map(PathBuf::as_path).collect();
@@ -222,10 +224,14 @@ fn say_sdks_and_tools(payload: &Payload, work: &str, seams: &BoxSeams, console: 
         let probes = names.as_ref().ok().filter(|names| !names.is_empty()).map(|names| {
             (
                 names,
-                scope.spawn(move || probe::probe(names, probe_limit, Ok(Variables::from_process()), &worktrees, netfx_key)),
+                scope.spawn(move || probe::probe(names, windows, Ok(Variables::from_process()), &worktrees, netfx_key)),
             )
         });
-        say_sdks(seams.dotnet_limit_ms.map_or(git::DOTNET_LIMIT, Duration::from_millis), console);
+        say_sdks(
+            seams.dotnet_limit_ms.map_or(git::DOTNET_LIMIT, Duration::from_millis),
+            windows.drain,
+            console,
+        );
         if let Err(line) = &names {
             console.err(line);
         }
@@ -1499,10 +1505,10 @@ pub(crate) fn locate(word: &str) -> Result<Option<PathBuf>, String> {
     }
 }
 
-/// Says the SDK line on stdout, the list read within `limit`; a list that cannot be read is said on stderr instead, and
-/// fails nothing.
-fn say_sdks(limit: Duration, console: &mut Console) {
-    match sdks(limit) {
+/// Says the SDK line on stdout, the list read within `limit`, dotnet's readers given `drain` once it has exited; a list
+/// that cannot be read is said on stderr instead, and fails nothing.
+fn say_sdks(limit: Duration, drain: Duration, console: &mut Console) {
+    match sdks(limit, drain) {
         Ok(list) => console.out(&format!("gate: remote sdks {list}")),
         Err(message) => console.err(&format!("gate: remote could not read the SDK list: {message}")),
     }
@@ -1510,9 +1516,9 @@ fn say_sdks(limit: Duration, console: &mut Console) {
 
 /// The SDK list of `dotnet --list-sdks`, `none` when no dotnet is found along the gate's own `PATH`; else why it could
 /// not be read. dotnet is run as [`git::sdk_listing`] runs it, with no console interrupt and no worktree to keep it out
-/// of, ended with its job past `limit`.
-fn sdks(limit: Duration) -> Result<String, String> {
-    let listing = git::sdk_listing(Variables::from_process(), limit, None, &[])?;
+/// of, ended with its job past `limit`, its readers given `drain` once it has exited.
+fn sdks(limit: Duration, drain: Duration) -> Result<String, String> {
+    let listing = git::sdk_listing(Variables::from_process(), limit, drain, None, &[])?;
     Ok(sdk_list(&listing))
 }
 

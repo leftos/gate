@@ -27,10 +27,30 @@ use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE
 
 use crate::environment::Variables;
 use crate::remote::git::{self, GitError, ProgramCall, ProgramOutput, ProgramPlace};
+use crate::remote::launch;
 use crate::run::{is_within, resolved};
 
 /// How long a batch of probes may take together, unless a test seam says otherwise.
 pub(crate) const PROBE_LIMIT: Duration = Duration::from_secs(10);
+
+/// The time windows of one batch of probes: how long the batch may take together, and how long the readers of each
+/// program a probe runs get to end once it has exited.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Windows {
+    pub limit: Duration,
+    pub drain: Duration,
+}
+
+impl Windows {
+    /// The windows test seams give, in milliseconds: `limit_ms` (`--test-probe-limit-ms`), else [`PROBE_LIMIT`], and
+    /// `drain_ms` (`--test-probe-drain-ms`), else [`launch::DRAIN`].
+    pub(crate) fn of(limit_ms: Option<u64>, drain_ms: Option<u64>) -> Windows {
+        Windows {
+            limit: limit_ms.map_or(PROBE_LIMIT, Duration::from_millis),
+            drain: drain_ms.map_or(launch::DRAIN, Duration::from_millis),
+        }
+    }
+}
 
 /// The console program of a Godot install.
 pub(crate) const GODOT: &str = "Godot_console.exe";
@@ -116,7 +136,8 @@ enum Pending<'scope> {
 /// What one batch of probes shares beyond the place a program is looked for in: the folders no program may come from,
 /// the folders the batch's environment names as `GATE_GODOT_ROOT` and `GATE_UNREAL_ROOT` (the latter `Err` with why
 /// the environment could not be made), the key under `HKEY_CURRENT_USER` a test seam has the netfx-sdk probe read in
-/// place of the machine's own list, and the batch's deadline and its limit.
+/// place of the machine's own list, the batch's deadline and its limit, and how long the readers of each program it runs
+/// get to end once it has exited.
 #[derive(Clone, Copy)]
 struct Batch<'a> {
     worktrees: &'a [&'a Path],
@@ -125,26 +146,27 @@ struct Batch<'a> {
     netfx_key: Option<&'a str>,
     deadline: Instant,
     limit: Duration,
+    drain: Duration,
 }
 
-/// Probes each tool of `names`, all within `limit` from now, and gives back each name with what its probe found, in
-/// the order of `names`. The probes that run a program run at once, each on a thread of its own, sharing the system
-/// folder and the environment `variables` for the batch, whose programs are looked for along its `PATH`, and none of
-/// them from a folder of `worktrees`: a program found that still lies inside any of them is refused
-/// ([`git::program_output`]). Environment `variables` that could not be made, for the reason given, skip every probe
-/// that runs a program. The godot probe reads the folder `variables` names as `GATE_GODOT_ROOT` to find the installs
-/// it runs, and the unreal probe the folder they name as `GATE_UNREAL_ROOT`, refused when it lies inside any of
-/// `worktrees`; it runs no program, so a place no program can be looked for in never skips it. The netfx-sdk probe
-/// reads the machine's list of .NET Framework SDKs, or the key `netfx_key` names under `HKEY_CURRENT_USER` when a test
-/// seam gives one ([`netfx_sdk`]).
+/// Probes each tool of `names`, all within the limit of `windows` from now, the readers of each program run given its
+/// drain once it has exited, and gives back each name with what its probe found, in the order of `names`. The probes that
+/// run a program run at once, each on a thread of its own, sharing the system folder and the environment `variables` for
+/// the batch, whose programs are looked for along its `PATH`, and none of them from a folder of `worktrees`: a program
+/// found that still lies inside any of them is refused ([`git::program_output`]). Environment `variables` that could not
+/// be made, for the reason given, skip every probe that runs a program. The godot probe reads the folder `variables`
+/// names as `GATE_GODOT_ROOT` to find the installs it runs, and the unreal probe the folder they name as
+/// `GATE_UNREAL_ROOT`, refused when it lies inside any of `worktrees`; it runs no program, so a place no program can be
+/// looked for in never skips it. The netfx-sdk probe reads the machine's list of .NET Framework SDKs, or the key
+/// `netfx_key` names under `HKEY_CURRENT_USER` when a test seam gives one ([`netfx_sdk`]).
 pub(crate) fn probe(
     names: &[String],
-    limit: Duration,
+    windows: Windows,
     variables: Result<Variables, String>,
     worktrees: &[&Path],
     netfx_key: Option<&str>,
 ) -> Vec<(String, Probed)> {
-    let deadline = Instant::now() + limit;
+    let deadline = Instant::now() + windows.limit;
     let root_of = |name: &str| {
         variables
             .as_ref()
@@ -160,7 +182,8 @@ pub(crate) fn probe(
         unreal_root: unreal_root.as_ref().map(Option::as_deref).map_err(String::as_str),
         netfx_key,
         deadline,
-        limit,
+        limit: windows.limit,
+        drain: windows.drain,
     };
     thread::scope(|scope| {
         let pending: Vec<Pending<'_>> = names.iter().map(|name| started(scope, name, &place, batch)).collect();
@@ -254,6 +277,7 @@ fn ran(program: &str, args: &[&str], place: &ProgramPlace, batch: Batch<'_>, rea
         program,
         args,
         limit: remaining,
+        drain: batch.drain,
         interrupt: None,
         worktrees: batch.worktrees,
         console: PipedConsole::Hidden,
@@ -736,9 +760,9 @@ mod tests {
 
     use super::GODOT;
     use super::{
-        Batch, Candidate, Pending, Probed, build_version, godot_candidates, godot_gave_no_version, godot_version, is_reparse_point, is_version_name,
-        late_reason, named_as_found, netfx_sdk, panic_reason, probe, read_godot, started, tool_line, unreal_installs, unreal_read, unreal_version,
-        version_list,
+        Batch, Candidate, Pending, Probed, Windows, build_version, godot_candidates, godot_gave_no_version, godot_version, is_reparse_point,
+        is_version_name, late_reason, named_as_found, netfx_sdk, panic_reason, probe, read_godot, started, tool_line, unreal_installs, unreal_read,
+        unreal_version, version_list,
     };
     use crate::environment::Variables;
     use crate::remote::git::{ProgramOutput, ProgramPlace};
@@ -843,7 +867,7 @@ mod tests {
     fn a_name_the_table_does_not_know_runs_nothing() {
         let names = ["nodejs".to_owned(), "Node".to_owned()];
         assert_eq!(
-            probe(&names, Duration::from_secs(1), Ok(Variables::from_process()), &[], None),
+            probe(&names, Windows::of(Some(1000), None), Ok(Variables::from_process()), &[], None),
             [
                 ("nodejs".to_owned(), Probed::Skipped("unknown tool".to_owned())),
                 ("Node".to_owned(), Probed::Skipped("unknown tool".to_owned())),
@@ -863,7 +887,7 @@ mod tests {
         assert_eq!(
             probe(
                 &names,
-                Duration::ZERO,
+                Windows::of(Some(0), None),
                 Ok(Variables::from_process().with("GATE_GODOT_ROOT", &root)),
                 &[],
                 None
@@ -1064,11 +1088,11 @@ mod tests {
         let variables = Variables::from_process().with("GATE_UNREAL_ROOT", &root.to_string_lossy());
 
         assert_eq!(
-            probe(&names, Duration::from_secs(10), Ok(variables), &[], None),
+            probe(&names, Windows::of(Some(10_000), None), Ok(variables), &[], None),
             [("unreal".to_owned(), Probed::Version("5.8.0,5.10.0".to_owned()))]
         );
         assert_eq!(
-            probe(&names, Duration::from_secs(10), Err("no environment".to_owned()), &[], None),
+            probe(&names, Windows::of(Some(10_000), None), Err("no environment".to_owned()), &[], None),
             [(
                 "unreal".to_owned(),
                 Probed::Skipped("cannot read GATE_UNREAL_ROOT: no environment".to_owned())
@@ -1133,6 +1157,7 @@ mod tests {
             netfx_key: None,
             deadline: Instant::now(),
             limit: Duration::ZERO,
+            drain: Duration::ZERO,
         };
 
         thread::scope(|scope| {
@@ -1205,7 +1230,7 @@ mod tests {
         assert_eq!(
             probe(
                 &["netfx-sdk".to_owned()],
-                Duration::from_secs(10),
+                Windows::of(Some(10_000), None),
                 Err("no environment".to_owned()),
                 &[],
                 Some(&key.0)
@@ -1295,7 +1320,7 @@ mod tests {
         );
         let variables = Variables::from_process().with("GATE_UNREAL_ROOT", &root.to_string_lossy());
         assert_eq!(
-            probe(&["unreal".to_owned()], Duration::ZERO, Ok(variables), &[], None),
+            probe(&["unreal".to_owned()], Windows::of(Some(0), None), Ok(variables), &[], None),
             [("unreal".to_owned(), Probed::Skipped("no answer in 0 s".to_owned()))]
         );
         fs::remove_dir_all(&root).expect("the test's root can be removed");

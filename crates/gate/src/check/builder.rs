@@ -20,6 +20,7 @@ use crate::check::report::{self, At, Checked, Problem, Tool, Warmup};
 use crate::console::Console;
 use crate::environment::Variables;
 use crate::remote::git::{self, GitError, ProgramCall, ProgramOutput, ProgramPlace};
+use crate::remote::launch;
 use crate::remote::lfs;
 use crate::remote::payload::{self, Location};
 use crate::remote::toolchain::{self, Reported};
@@ -63,7 +64,8 @@ pub(crate) fn check(request: &CheckRequest, host: &str, console: &mut Console) -
         return failed(console, &format!("check: {host}: {why}"));
     }
     let bound = request.seams.remote_timeout_ms.map_or(BOUND, Duration::from_millis);
-    match asked(&*transport, &builder, &place, bound) {
+    let drain = request.seams.probe_drain_ms.map_or(launch::DRAIN, Duration::from_millis);
+    match asked(&*transport, &builder, &place, bound, drain) {
         Ok(asked) => {
             let at = At::Builder { host, key: &asked.key };
             super::say(&report::said(at, &asked.checked), console)
@@ -135,9 +137,10 @@ struct Asked {
     key: String,
 }
 
-/// What `builder`, reached over `transport` within `bound` and laid out by its profile ([`Transport::profile`]), has
-/// of what the repo at `place` declares; else the line saying why it could not be checked.
-fn asked(transport: &dyn Transport, builder: &Builder, place: &Place, bound: Duration) -> Result<Asked, String> {
+/// What `builder`, reached over `transport` within `bound`, the call's readers given `drain` once it has exited, and laid
+/// out by its profile ([`Transport::profile`]), has of what the repo at `place` declares; else the line saying why it
+/// could not be checked.
+fn asked(transport: &dyn Transport, builder: &Builder, place: &Place, bound: Duration, drain: Duration) -> Result<Asked, String> {
     let host = builder.alias.as_str();
     let profile = transport.profile(builder);
     let root = Path::new(&place.root);
@@ -153,7 +156,7 @@ fn asked(transport: &dyn Transport, builder: &Builder, place: &Place, bound: Dur
     let input = payload::input(&payload::preflight_word(&location, &needs), None);
     let sent: Vec<String> = needs.into_iter().map(|(name, _)| name).collect();
     let program = transport.call(host, &profile.line(BoxVerb::Preflight), Wire::Plain);
-    let heard = called(&program, bound, input.as_bytes()).map_err(|failure| failure.line(host))?;
+    let heard = called(&program, bound, drain, input.as_bytes()).map_err(|failure| failure.line(host))?;
     if let Some(line) = refusal(host, profile.root(), &heard) {
         return Err(line);
     }
@@ -233,10 +236,10 @@ impl Failure {
     }
 }
 
-/// Makes the one call `program`, fed `input` on its standard input, bounded at `bound` and never made again, as the
-/// client's programs other than git run ([`git::program_output`]); else why it could not be made or did not end in
-/// time.
-fn called(program: &Program, bound: Duration, input: &[u8]) -> Result<Heard, Failure> {
+/// Makes the one call `program`, fed `input` on its standard input, bounded at `bound`, its readers given `drain` once
+/// it has exited, and never made again, as the client's programs other than git run ([`git::program_output`]); else why
+/// it could not be made or did not end in time.
+fn called(program: &Program, bound: Duration, drain: Duration, input: &[u8]) -> Result<Heard, Failure> {
     let shown = program.program.to_string_lossy();
     let words: Vec<String> = program.args.iter().map(|word| word.to_string_lossy().into_owned()).collect();
     let args: Vec<&str> = words.iter().map(String::as_str).collect();
@@ -244,6 +247,7 @@ fn called(program: &Program, bound: Duration, input: &[u8]) -> Result<Heard, Fai
         program: &shown,
         args: &args,
         limit: bound,
+        drain,
         interrupt: None,
         worktrees: &[],
         console: PipedConsole::Attached,

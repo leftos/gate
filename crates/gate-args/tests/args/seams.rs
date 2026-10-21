@@ -1385,6 +1385,71 @@ fn the_probe_limit_seam_is_refused_outside_gate_box() {
     );
 }
 
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_probe_drain_ms_is_read_before_the_verb() {
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    let drained = |probe_drain_ms| {
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Preflight,
+            seams: BoxSeams {
+                probe_drain_ms,
+                ..BoxSeams::default()
+            },
+            root: None,
+        })
+    };
+    assert_eq!(
+        invocation(&["box", "--test-probe-drain-ms", "200", "preflight", "--stdin"]),
+        drained(Some(200))
+    );
+    assert_eq!(
+        invocation(&["box", "--test-probe-drain-ms=1500", "preflight", "--stdin"]),
+        drained(Some(1500))
+    );
+    assert_eq!(invocation(&["box", "preflight", "--stdin"]), drained(None), "no seam given, none set");
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_probe_drain_ms_refuses_what_the_probe_limit_refuses() {
+    let rows: [(&[&str], &[&str]); 5] = [
+        (
+            &["box", "--test-probe-drain-ms", "1", "--test-probe-drain-ms=2", "preflight", "--stdin"],
+            &["gate: --test-probe-drain-ms is given twice"],
+        ),
+        (
+            &["box", "--test-probe-drain-ms", "0", "preflight", "--stdin"],
+            &["gate: --test-probe-drain-ms must be a whole number above 0, got '0'"],
+        ),
+        (
+            &["box", "--test-probe-drain-ms", "fast", "preflight", "--stdin"],
+            &["gate: --test-probe-drain-ms must be a whole number above 0, got 'fast'"],
+        ),
+        (
+            &["box", "--test-probe-drain-ms=", "preflight", "--stdin"],
+            &["gate: --test-probe-drain-ms needs a value"],
+        ),
+        (
+            &["box", "--test-probe-drain-ms"],
+            &["gate: --test-probe-drain-ms needs a value", BOX_USAGE],
+        ),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), want, "{words:?}");
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+#[test]
+fn box_seam_probe_drain_ms_is_an_unknown_word_without_the_feature() {
+    assert_eq!(problems(&["box", "--test-probe-drain-ms", "1000", "preflight", "--stdin"]), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-probe-drain-ms=1000", "preflight", "--stdin"]), [BOX_USAGE]);
+}
+
 #[cfg(not(feature = "test-seams"))]
 #[test]
 fn box_seam_probe_limit_ms_is_an_unknown_word_without_the_feature() {

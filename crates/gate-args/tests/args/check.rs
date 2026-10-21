@@ -149,6 +149,8 @@ fn check_builder_seams_parse_with_the_feature() {
             builder: Some("box-1".to_owned()),
             seams: CheckSeams {
                 probe_limit_ms: None,
+                probe_drain_ms: None,
+                sdk_limit_ms: None,
                 netfx_key: None,
                 remote_transport: Some(r"local:C:\builder".to_owned()),
                 remote_ssh: Some(PathBuf::from("fake-ssh.exe")),
@@ -198,6 +200,77 @@ fn check_probe_limit_is_not_used_with_builder() {
     );
 }
 
+/// The check request of `gate check` alone with `seams`.
+#[cfg(feature = "test-seams")]
+fn checked_with(seams: CheckSeams) -> Invocation {
+    Invocation::Check(CheckRequest { builder: None, seams })
+}
+
+/// The whole-milliseconds check seam `seam` parses into what `set` makes of its value, in both spellings, and refuses
+/// 0, a missing value, a second use and use on `gate run`.
+#[cfg(feature = "test-seams")]
+fn assert_ms_check_seam(seam: &str, set: fn(u64) -> CheckSeams) {
+    use crate::support::{RUN, refs, with};
+
+    assert_eq!(invocation(&["check", seam, "200"]), checked_with(set(200)));
+    assert_eq!(invocation(&["check", &format!("{seam}=1500")]), checked_with(set(1500)));
+    assert_eq!(
+        problems(&["check", seam, "0"]),
+        [format!("gate: {seam} must be a whole number above 0, got '0'")]
+    );
+    assert_eq!(problems(&["check", seam]), [format!("gate: {seam} needs a value")]);
+    assert_eq!(problems(&["check", seam, "5", seam, "6"]), [format!("gate: {seam} is given twice")]);
+    assert_eq!(
+        problems(&refs(&with(&RUN, &[seam, "5", "--", "cmd"]))),
+        [format!("gate: unknown option {seam}"), "gate: unexpected argument 5".to_owned()],
+        "the check seam is not a run seam"
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn check_seam_probe_drain_ms_parses_with_the_feature() {
+    assert_ms_check_seam("--test-probe-drain-ms", |ms| CheckSeams {
+        probe_drain_ms: Some(ms),
+        ..CheckSeams::default()
+    });
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn check_seam_sdk_limit_ms_parses_with_the_feature() {
+    assert_ms_check_seam("--test-sdk-limit-ms", |ms| CheckSeams {
+        sdk_limit_ms: Some(ms),
+        ..CheckSeams::default()
+    });
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn check_sdk_limit_is_not_used_with_builder() {
+    assert_eq!(
+        problems(&["check", "--builder", "box-1", "--test-sdk-limit-ms", "5"]),
+        ["gate: --test-sdk-limit-ms is not used with --builder"],
+        "a builder's SDK list is read under the box's own limit"
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn check_probe_drain_is_used_with_builder() {
+    assert_eq!(
+        invocation(&["check", "--builder", "box-1", "--test-probe-drain-ms", "5"]),
+        Invocation::Check(CheckRequest {
+            builder: Some("box-1".to_owned()),
+            seams: CheckSeams {
+                probe_drain_ms: Some(5),
+                ..CheckSeams::default()
+            },
+        }),
+        "the drain also bounds the builder call's readers"
+    );
+}
+
 #[cfg(not(feature = "test-seams"))]
 #[test]
 fn check_seam_probe_limit_ms_is_unknown_without_the_feature() {
@@ -205,6 +278,17 @@ fn check_seam_probe_limit_ms_is_unknown_without_the_feature() {
         problems(&["check", "--test-probe-limit-ms", "5"]),
         ["gate: unknown option --test-probe-limit-ms", "gate: unexpected argument 5"]
     );
+}
+
+#[cfg(not(feature = "test-seams"))]
+#[test]
+fn check_seams_probe_drain_and_sdk_limit_are_unknown_without_the_feature() {
+    for seam in ["--test-probe-drain-ms", "--test-sdk-limit-ms"] {
+        assert_eq!(
+            problems(&["check", seam, "5"]),
+            [format!("gate: unknown option {seam}"), "gate: unexpected argument 5".to_owned()]
+        );
+    }
 }
 
 #[cfg(not(feature = "test-seams"))]

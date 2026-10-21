@@ -395,7 +395,8 @@ A tool not in the table (`godot`, `unreal`) gets no hint line, nor does a siblin
 
 The exit is 0 when nothing is missing or too old and every file read, whatever was skipped and whatever warm-up line only informs; 1 when anything is missing or too old, or the check could not run (not in a git repository, an unreadable `.gate/toolchain.toml`, `.gate/siblings.toml`, `.gate/warmup.toml` or `global.json`, `.gate` not a folder); 2 for a usage error.
 
-Test-seams builds accept the hidden `--test-probe-limit-ms <n>` (the 10 s probe bound, in milliseconds above 0), which `--builder` refuses.
+Test-seams builds accept the hidden `--test-probe-limit-ms <n>` (the 10 s probe bound, in milliseconds above 0), `--test-probe-drain-ms <n>` (how long the output readers of each tool probe, of this PC's `dotnet --list-sdks` and, with `--builder`, of the builder check's call get to finish after the program exits, 2 s by default) and `--test-sdk-limit-ms <n>` (this PC's SDK list limit in milliseconds above 0, in place of 30 s).
+`--builder` refuses `--test-probe-limit-ms` and `--test-sdk-limit-ms` ("gate: --test-sdk-limit-ms is not used with --builder"), and accepts `--test-probe-drain-ms`.
 
 #### With `--builder`
 
@@ -1941,7 +1942,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A patch that applied but cannot be removed fails the run (`gate: the remote run failed: cannot remove <patch>: <error>`) and keeps nothing: the changes are already in the worktree.
 
-  Once git has exited, its readers get 2 s to reach their pipes' ends (the routing decision's calls, `--test-git-drain-ms` of them), else the call fails with `cannot read git's output: it did not end within <n> s of git's exit`, `<n>` being the call's own drain in whole seconds. A failure line carries the last 10 of git's lines joined by ` | `, escaped and cut to the last 4 KiB at a whole escape.
+  Once git has exited, its readers get 2 s to reach their pipes' ends (the routing decision's calls, `--test-git-drain-ms` of them), else the call fails with `cannot read git's output: it did not end within <n> s of git's exit`, `<n>` being the call's own drain in whole seconds (a drain that is not a whole number of seconds is spelled in ms, `<n> ms`; the same holds for `dotnet --list-sdks` and the tool probes, with `<name>` their program). A failure line carries the last 10 of git's lines joined by ` | `, escaped and cut to the last 4 KiB at a whole escape.
 
   Of the test seams, `--test-remote-snapshot` and `--test-remote-transport` give the client a stand-in. The first makes the snapshot of each worktree of the call, the main one then a pair's siblings in declared order, says `gate: remote snapshot <sha> bridge <sha or none>` on stderr and in the log, one line a worktree, and ends with status 0.
 
@@ -2008,7 +2009,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     This PC's SDKs come from `dotnet --list-sdks`; if that cannot be read the run says `gate: cannot read this PC's SDK list: <why>; checking no SDK major` and checks no major. A snapshot whose file listing passes 16 MiB, or holds a path that is not UTF-8, says `gate: cannot list the snapshot's files: <why>; skipping the toolchain check` (`<why>` the over-cap line, or `a path is not valid UTF-8`), and the run goes remote unchecked.
 
-    **Bounded SDK read**: `dotnet --list-sdks` runs like the client's git calls, through the same start-and-wait function in `remote/git.rs`: in an anonymous kill-on-close job of its own, on the gate's console, with the run's interrupt and a 30 s bound (the test seam `--test-dotnet-limit-ms` lowers it), its standard output read up to 16 MiB and the last 64 KiB of its standard error kept.
+    **Bounded SDK read**: `dotnet --list-sdks` runs like the client's git calls, through the same start-and-wait function in `remote/git.rs`: in an anonymous kill-on-close job of its own, on the gate's console, with the run's interrupt and a 30 s bound (the test seams `--test-dotnet-limit-ms` and, for `gate check`, `--test-sdk-limit-ms` lower it), its standard output read up to 16 MiB and the last 64 KiB of its standard error kept.
 
     A `dotnet` that hangs (a broken install, a first-run prompt) is killed with its whole job at the bound. One that exits non-zero gives the reason `dotnet --list-sdks exited with status <n>`, followed, when it wrote any, by `: ` and the last lines of its standard error as a failed git call's line carries them (at most 10, joined by ` | `, escaped, at most 4096 bytes), so a broken SDK shows its cause.
 
@@ -2753,7 +2754,7 @@ The box's ceiling has three seams: `--test-box-sample-ms <n>` replaces the 5 s s
 
 `--test-box-root-walk-stop <folder>` ends the preflight's walk over the folders above the work root at that folder, which and those above it go unjudged (any path; an empty value is no value), so a case does not depend on the host's folders.
 
-The other four box seams are `--test-outputs-budget-bytes <n>`, which replaces the 50 GiB outputs budget of the box's trim, in bytes, `--test-inputs-budget-bytes <n>`, which replaces the 4 GiB a `gate box inputs` put unpacks, decompressed, in bytes, `--test-dotnet-limit-ms <n>`, which replaces the 30 s bound of the preflight's `dotnet --list-sdks` read, in milliseconds, and `--test-probe-limit-ms <n>`, which replaces the 10 s shared bound of the preflight's tool probes, in milliseconds.
+The other five box seams are `--test-outputs-budget-bytes <n>`, which replaces the 50 GiB outputs budget of the box's trim, in bytes, `--test-inputs-budget-bytes <n>`, which replaces the 4 GiB a `gate box inputs` put unpacks, decompressed, in bytes, `--test-dotnet-limit-ms <n>`, which replaces the 30 s bound of the preflight's `dotnet --list-sdks` read, in milliseconds, `--test-probe-limit-ms <n>`, which replaces the 10 s shared bound of the preflight's tool probes, in milliseconds, and `--test-probe-drain-ms <n>`, which replaces the 2 s the output readers of each probe and of the preflight's `dotnet --list-sdks` get to finish after the program exits, in milliseconds.
 
 Three seams of the MSYS keeper and the command's `PATH` are environment variables, read only in a `test-seams` build (the installed binary ignores them), because a stand-in is a program plus words or a folder the box reads in several places.
 
@@ -2879,7 +2880,7 @@ Built verbs:
 
   Each program is found through `PATH` and `PATHEXT` as `dotnet` is (a `.cmd` shim runs through the system folder's cmd.exe; a `.ps1` is not run) and runs in the system folder on a hidden console, in the bounded runner of `remote/git.rs` (`program_output`).
 
-  The probes run in parallel, started at the same time as `dotnet --list-sdks`, under one shared 10 s deadline (`--test-probe-limit-ms` lowers it); one still running at the deadline is killed with its process tree, and one with no time left is skipped without being launched.
+  The probes run in parallel, started at the same time as `dotnet --list-sdks`, under one shared 10 s deadline (`--test-probe-limit-ms` lowers it), each given 2 s after the tool exits for its output readers to finish (`--test-probe-drain-ms` changes it, for `dotnet --list-sdks` too); one still running at the deadline is killed with its process tree, and one with no time left is skipped without being launched.
 
   The version is read from the first non-blank line of stdout, else of stderr: the first run of two or more dot-separated numbers after an optional `v`, its first three kept. A line with no such run, a number longer than 10 digits or a non-zero exit gives `present`; a program that cannot be found gives `missing`.
 
@@ -3829,7 +3830,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   On `push` the seams are `--test-push-ssh <path>` (the ssh program to run instead of the one found along `PATH`, the suite's `fake-ssh`) and `--test-push-bound-ms <n>` (each builder's bound); `push` has no `--test-print-request` ([`gate push`](#gate-push)).
 
-  On `check` the seams are `--test-probe-limit-ms <n>` (refused with `--builder`) and, each needing `--builder`, `--test-remote-transport`, `--test-remote-ssh` (which also needs `--test-remote-transport`) and `--test-remote-timeout-ms` ([`gate check`](#gate-check)).
+  On `check` the seams are `--test-probe-limit-ms <n>` and `--test-sdk-limit-ms <n>` (each refused with `--builder`), `--test-probe-drain-ms <n>` (also bounding the drain of the builder check's call with `--builder`) and, each needing `--builder`, `--test-remote-transport`, `--test-remote-ssh` (which also needs `--test-remote-transport`) and `--test-remote-timeout-ms` ([`gate check`](#gate-check)).
 
   `--test-print-request`, on `run`, `stop-tree`, `cutover` and the compatibility form, prints the parsed request as one JSON line on stdout and exits 0, so the suite sees what a command line asked for; it is the one hidden switch the compatibility layer accepts. On `run`, `"timeout"` is the number given, or the floor of `auto:<n>`, and `"timeoutAuto": true|false` follows it, always present.
 

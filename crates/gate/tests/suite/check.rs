@@ -72,9 +72,29 @@ fn path_with_git(folders: &[PathBuf]) -> OsString {
     std::env::join_paths(folders.iter().cloned().chain([git_folder()])).expect("the folders join into a PATH")
 }
 
-/// `gate check` with `extra` in the repo, its `PATH` the `folders` then git's folder and no `GATE_GODOT_ROOT`, so the
-/// godot probe reads that `PATH` alone, nor `GATE_UNREAL_ROOT`, so this machine's own engines are never read.
+/// The windows every case gives `gate check` but the one about the probe limit: the probes' limit, the drain of a
+/// probed tool's or dotnet's output after its exit, and the SDK list's limit, bounds no program reaches however slow a
+/// loaded machine makes it, so only an answer ends one and no load changes what the check says.
+const UNREACHED_WINDOWS: [&str; 6] = [
+    "--test-probe-limit-ms",
+    UNREACHED_MS,
+    "--test-probe-drain-ms",
+    UNREACHED_MS,
+    "--test-sdk-limit-ms",
+    UNREACHED_MS,
+];
+
+/// A window no case reaches, in milliseconds: an hour.
+const UNREACHED_MS: &str = "3600000";
+
+/// `gate check` with [`UNREACHED_WINDOWS`] and `extra` in the repo, as [`check_as_given`] runs it.
 fn check(case: &Case, folders: &[PathBuf], extra: &[&str]) -> Outcome {
+    check_as_given(case, folders, &[&UNREACHED_WINDOWS[..], extra].concat())
+}
+
+/// `gate check` with `extra` alone in the repo, its `PATH` the `folders` then git's folder and no `GATE_GODOT_ROOT`, so
+/// the godot probe reads that `PATH` alone, nor `GATE_UNREAL_ROOT`, so this machine's own engines are never read.
+fn check_as_given(case: &Case, folders: &[PathBuf], extra: &[&str]) -> Outcome {
     let args: Vec<&str> = ["check"].iter().chain(extra).copied().collect();
     let mut command = case.gate_in(REPO, &args);
     command.env("PATH", path_with_git(folders));
@@ -104,7 +124,8 @@ fn check_unreal(case: &Case, manifest: &str, root: &Path, versions: &[&str]) -> 
         fake_unreal_install(&root.join(version), version);
     }
     let key = netfx_present(case);
-    let mut command = case.gate_in(REPO, &["check", "--test-netfx-key", key.path()]);
+    let args: Vec<&str> = ["check", "--test-netfx-key", key.path()].into_iter().chain(UNREACHED_WINDOWS).collect();
+    let mut command = case.gate_in(REPO, &args);
     command.env("PATH", path_with_git(&[]));
     command.env_remove("GATE_GODOT_ROOT");
     command.env("GATE_UNREAL_ROOT", root);
@@ -323,7 +344,8 @@ fn check_a_godot_root_inside_the_repo_is_refused() {
     fs::create_dir_all(&install).expect("the install folder can be made");
     fs::copy(FAKE_TOOL, install.join("Godot_console.exe")).expect("the fake godot can be copied");
     fs::write(install.join("version.txt"), "4.7.2.stable.mono.official.x\n").expect("the fake's answer can be written");
-    let mut command = case.gate_in(REPO, &["check"]);
+    let args: Vec<&str> = ["check"].into_iter().chain(UNREACHED_WINDOWS).collect();
+    let mut command = case.gate_in(REPO, &args);
     command.env("PATH", path_with_git(&[]));
     command.env("GATE_GODOT_ROOT", &root);
 
@@ -355,7 +377,8 @@ fn check_a_pinned_godot_the_probe_cannot_run_is_missing() {
     fs::create_dir_all(&install).expect("the install folder can be made");
     fs::copy(FAKE_TOOL, install.join("Godot_console.exe")).expect("the fake godot can be copied");
     fs::write(install.join("version.txt"), "4.7.2.stable.mono.official.x\n").expect("the fake's answer can be written");
-    let mut command = case.gate_in(REPO, &["check"]);
+    let args: Vec<&str> = ["check"].into_iter().chain(UNREACHED_WINDOWS).collect();
+    let mut command = case.gate_in(REPO, &args);
     command.env("PATH", path_with_git(&[]));
     command.env("GATE_GODOT_ROOT", &root);
 
@@ -674,7 +697,7 @@ fn check_a_hanging_probe_is_skipped_and_exits_0() {
     );
     let stub = stubs(&case, &[("node", &hang)]);
 
-    let outcome = check(&case, &[stub], &["--test-probe-limit-ms", "1000"]);
+    let outcome = check_as_given(&case, &[stub], &["--test-probe-limit-ms", "1000"]);
 
     // A stub that started holds its output file open until its job's kill ends it; one the kill came first never made it.
     if held.exists() {
@@ -998,7 +1021,8 @@ fn warm_case(name: &str) -> Case {
 
 /// `gate check` in the repo, its state root the case's through `GATE_STATE_DIR`, since check takes no `--state-dir`.
 fn check_warm(case: &Case) -> Outcome {
-    let mut command = case.gate_in(REPO, &["check"]);
+    let args: Vec<&str> = ["check"].into_iter().chain(UNREACHED_WINDOWS).collect();
+    let mut command = case.gate_in(REPO, &args);
     command
         .env("PATH", path_with_git(&[]))
         .env_remove("GATE_GODOT_ROOT")
@@ -1396,8 +1420,9 @@ fn key(case: &Case) -> String {
 }
 
 /// `gate check --builder <host>` in the repo over the local transport, its one call made through the stand-in of the
-/// steps file `steps`, whose `gate box preflight` runs with probe and SDK bounds no case reaches; the check's `PATH`,
-/// which the builder's probes look along too, the `folders` then git's folder.
+/// steps file `steps` and its output given a drain no case reaches, whose `gate box preflight` runs with probe and SDK
+/// bounds no case reaches; the check's `PATH`, which the builder's probes look along too, the `folders` then git's
+/// folder.
 fn check_builder(case: &Case, host: &str, folders: &[PathBuf], steps: &Path) -> Outcome {
     finish(builder_check(case, host, folders, steps))
 }
@@ -1413,6 +1438,8 @@ fn builder_check(case: &Case, host: &str, folders: &[PathBuf], steps: &Path) -> 
         &transport,
         "--test-remote-ssh",
         FAKE_SSH,
+        "--test-probe-drain-ms",
+        UNREACHED_MS,
     ];
     let mut command = case.gate_in(REPO, &args);
     command

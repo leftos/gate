@@ -58,16 +58,14 @@ pub(crate) fn check(request: &CheckRequest, console: &mut Console) -> u32 {
             return u32::from(FAILED_STATUS);
         }
     };
-    let seams = &request.seams;
-    super::say(
-        &report::said(report::HERE, &checked(&place, probe_limit(seams), seams.netfx_key.as_deref())),
-        console,
-    )
+    super::say(&report::said(report::HERE, &checked(&place, &request.seams)), console)
 }
 
-/// How long the tool probes may take together: `--test-probe-limit-ms` when given, else [`probe::PROBE_LIMIT`].
-fn probe_limit(seams: &CheckSeams) -> Duration {
-    seams.probe_limit_ms.map_or(probe::PROBE_LIMIT, Duration::from_millis)
+/// How long the tool probes may take together, `--test-probe-limit-ms` when given, else [`probe::PROBE_LIMIT`], and
+/// how long each probe's readers, and dotnet's, get to end once its program has exited, `--test-probe-drain-ms` when
+/// given.
+fn probe_windows(seams: &CheckSeams) -> probe::Windows {
+    probe::Windows::of(seams.probe_limit_ms, seams.probe_drain_ms)
 }
 
 /// The place in its git worktree of the gate's working folder; `None` when it is in none; else why git could not
@@ -276,9 +274,13 @@ pub(super) fn read_siblings_file(root: &Path, declarations: &mut Declarations, p
     }
 }
 
-/// What this PC has of what the repo at `place` needs, its tools probed within `limit`, its .NET Framework SDKs read
-/// from the key `netfx_key` names under `HKEY_CURRENT_USER` when a test seam gives one.
-fn checked(place: &Place, limit: Duration, netfx_key: Option<&str>) -> Checked {
+/// What this PC has of what the repo at `place` needs, its tools probed within the windows `seams` give
+/// ([`probe_windows`]), its SDK list read within `--test-sdk-limit-ms` when given, else [`git::DOTNET_LIMIT`], and its
+/// .NET Framework SDKs read from the key `--test-netfx-key` names under `HKEY_CURRENT_USER` when given.
+fn checked(place: &Place, seams: &CheckSeams) -> Checked {
+    let windows = probe_windows(seams);
+    let sdk_limit = seams.sdk_limit_ms.map_or(git::DOTNET_LIMIT, Duration::from_millis);
+    let netfx_key = seams.netfx_key.as_deref();
     let root = Path::new(&place.root);
     let repo = repo_name(&place.checkout);
     let mut declarations = Declarations::from_process(&repo);
@@ -286,8 +288,8 @@ fn checked(place: &Place, limit: Duration, netfx_key: Option<&str>) -> Checked {
     let needs = std::mem::take(&mut declared.manifest.tools);
     // The SDK list is read while the tools are probed, so the check waits for the longer of the two bounds.
     let (tools, sdk) = thread::scope(|scope| {
-        let sdk = scope.spawn(|| sdk_of(declared.pin.as_ref(), || sdk_list(root)));
-        let tools = probed(needs, limit, root, netfx_key);
+        let sdk = scope.spawn(|| sdk_of(declared.pin.as_ref(), || sdk_list(root, sdk_limit, windows.drain)));
+        let tools = probed(needs, windows, root, netfx_key);
         let sdk = sdk
             .join()
             .unwrap_or_else(|panic| Some(Sdk::Skipped(format!("cannot read this PC's SDK list: {}", probe::panic_reason(&*panic)))));
@@ -552,13 +554,13 @@ fn read_manifest(root: &Path, declarations: &mut Declarations) -> Result<Option<
     }
 }
 
-/// Each of `needs` with what its probe found within `limit`, in their order; an unknown tool runs nothing. The tools
+/// Each of `needs` with what its probe found within `windows`, in their order; an unknown tool runs nothing. The tools
 /// are looked for as this PC's SDK list looks for dotnet: along `PATH` with the folders inside the worktree `root`
 /// dropped, and one found that still lies inside it refused. An unreal on a PC whose environment names no
 /// `GATE_UNREAL_ROOT` is not checked here, as nothing says where its engines are, and a netfx-sdk beside it is not
 /// checked either, as the Unreal builds that need it are the ones not checked. A netfx-sdk is read from this PC's own
 /// list of .NET Framework SDKs, or from the key `netfx_key` names when a test seam gives one.
-fn probed(needs: Vec<ToolNeed>, limit: Duration, root: &Path, netfx_key: Option<&str>) -> Vec<Tool> {
+fn probed(needs: Vec<ToolNeed>, windows: probe::Windows, root: &Path, netfx_key: Option<&str>) -> Vec<Tool> {
     if needs.is_empty() {
         return Vec::new();
     }
@@ -566,7 +568,7 @@ fn probed(needs: Vec<ToolNeed>, limit: Duration, root: &Path, netfx_key: Option<
     let variables = outside_worktree(Variables::from_process(), root);
     let no_unreal_root = variables.as_ref().is_ok_and(|variables| variables.get(probe::UNREAL_ROOT).is_none());
     let unreal_not_checked = no_unreal_root && names.iter().any(|name| name == UNREAL);
-    probe::probe(&names, limit, variables, &[root], netfx_key)
+    probe::probe(&names, windows, variables, &[root], netfx_key)
         .into_iter()
         .zip(needs)
         .map(|((_, probed), need)| Tool {
@@ -634,9 +636,10 @@ pub(super) fn sdk_listed(pin: Option<&parity::Pin>, sdks: impl FnOnce() -> Resul
 }
 
 /// The SDKs this PC's `dotnet --list-sdks` lists, run with the folders inside the worktree `root` dropped from
-/// `PATH`; none when no dotnet is found; else why the list cannot be read.
-fn sdk_list(root: &Path) -> Result<Vec<String>, String> {
-    let listing = local_sdk_listing(Variables::from_process(), &[root], git::DOTNET_LIMIT, None)?;
+/// `PATH`, within `limit` and its readers given `drain` once it has exited; none when no dotnet is found; else why the
+/// list cannot be read.
+fn sdk_list(root: &Path, limit: Duration, drain: Duration) -> Result<Vec<String>, String> {
+    let listing = local_sdk_listing(Variables::from_process(), &[root], limit, drain, None)?;
     Ok(parity::sdk_versions(&listing).into_iter().map(str::to_owned).collect())
 }
 

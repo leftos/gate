@@ -2300,7 +2300,7 @@ impl Attempt<'_, '_> {
         let worktrees: Vec<&Path> = std::iter::once(Path::new(call.root))
             .chain(call.siblings.iter().map(|sibling| Path::new(sibling.root())))
             .collect();
-        match local_sdk_listing(Variables::from_process(), &worktrees, self.dotnet_limit, call.interrupt) {
+        match local_sdk_listing(Variables::from_process(), &worktrees, self.dotnet_limit, DRAIN, call.interrupt) {
             Ok(listing) => parity::newest_major(parity::sdk_versions(&listing)),
             Err(_) if self.call.interrupt.is_some_and(Interrupt::is_raised) => 0,
             Err(error) => {
@@ -4453,7 +4453,7 @@ fn dotnet_limit(seams: &TestSeams) -> Duration {
     seams.dotnet_limit_ms.map_or(git::DOTNET_LIMIT, Duration::from_millis)
 }
 
-/// What `dotnet --list-sdks` lists on this PC, as [`git::sdk_listing`] reads it, with the folders inside each of
+/// What `dotnet --list-sdks` lists on this PC, as [`git::sdk_listing`] reads it within `limit` and `drain`, with the folders inside each of
 /// `worktrees` dropped from the `PATH` of `variables`, each compared by its canonical path so a junction does not get
 /// around it, and a dotnet found that still lies inside any of them refused. A `PATH` that cannot be read that way
 /// cannot be read at all.
@@ -4461,13 +4461,14 @@ pub(crate) fn local_sdk_listing(
     variables: Variables,
     worktrees: &[&Path],
     limit: Duration,
+    drain: Duration,
     interrupt: Option<Interrupt>,
 ) -> Result<String, GitError> {
     let variables = worktrees
         .iter()
         .try_fold(variables, |variables, worktree| outside_worktree(variables, worktree))
         .map_err(GitError::Failed)?;
-    git::sdk_listing(variables, limit, interrupt, worktrees)
+    git::sdk_listing(variables, limit, drain, interrupt, worktrees)
 }
 
 /// `variables` with the folders inside `worktree` dropped from their `PATH`, as [`path_outside`] rebuilds it, so a
@@ -4755,7 +4756,7 @@ mod tests {
         sdks_of, seconds, their_version, version_refusal,
     };
     use super::{CSPROJ_BYTES, CSPROJ_FILES, Entry, csproj_pins, entries_of, manifest_entry, small_blobs_of};
-    use super::{KILLED, Received};
+    use super::{DRAIN, KILLED, Received};
     use super::{KeyHold, RunEnd, Warm, cold_line, hold_key, hold_key_waiting, new_work_tree, status_end, warm_end, warm_of};
     use crate::environment::Variables;
     use crate::remote::git::{self, DOTNET_LIMIT, GIT_LIMIT, Git, GitError};
@@ -4798,7 +4799,7 @@ mod tests {
         let variables = Variables::from_process().with("PATH", &folder.to_string_lossy());
         let worktree = Path::new(env!("CARGO_MANIFEST_DIR"));
 
-        let read = local_sdk_listing(variables, &[worktree], DOTNET_LIMIT, Some(raised()));
+        let read = local_sdk_listing(variables, &[worktree], DOTNET_LIMIT, DRAIN, Some(raised()));
 
         let ran = marker.exists();
         fs::remove_dir_all(&folder).expect("the stub's folder can be removed");

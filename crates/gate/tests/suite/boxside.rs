@@ -818,7 +818,20 @@ fn preflight_sdks_line_from_dotnet() {
     )
     .expect("the dotnet stub can be written");
 
-    let outcome = gate_box(&case, "preflight", &folders.payload(), Some(&path_with_git(&[stub])));
+    let mut command = box_call(
+        &case,
+        &[
+            "box",
+            "--test-dotnet-limit-ms",
+            UNREACHED_PROBE_DRAIN_MS,
+            "--test-probe-drain-ms",
+            UNREACHED_PROBE_DRAIN_MS,
+            "preflight",
+        ],
+        &folders.payload(),
+    );
+    command.env("PATH", path_with_git(&[stub]));
+    let outcome = command.finish();
 
     assert_eq!(passed(&outcome).last(), Some(&"gate: remote sdks 8.0.404,9.0.100"), "{outcome:?}");
 }
@@ -1001,7 +1014,20 @@ fn preflight_runs_dotnet_in_the_system_folder() {
     let body = format!("@echo off\r\n>\"{}\" echo %CD%\r\necho 8.0.404 [C:\\stub]\r\n", ran_in.display());
     fs::write(stub.join("dotnet.cmd"), body).expect("the dotnet stub can be written");
 
-    let outcome = gate_box(&case, "preflight", &folders.payload(), Some(&path_with_git(&[stub])));
+    let mut command = box_call(
+        &case,
+        &[
+            "box",
+            "--test-dotnet-limit-ms",
+            UNREACHED_PROBE_DRAIN_MS,
+            "--test-probe-drain-ms",
+            UNREACHED_PROBE_DRAIN_MS,
+            "preflight",
+        ],
+        &folders.payload(),
+    );
+    command.env("PATH", path_with_git(&[stub]));
+    let outcome = command.finish();
 
     assert_eq!(passed(&outcome).last(), Some(&"gate: remote sdks 8.0.404"), "{outcome:?}");
     let ran_in = fs::read_to_string(&ran_in).expect("the stub wrote the folder it ran in");
@@ -1058,7 +1084,14 @@ fn probed(case: &Case, needs: &Value, tools: &[(&str, &str)]) -> Outcome {
     let stub = tool_stubs(case, tools);
     let mut command = box_call(
         case,
-        &["box", "--test-probe-limit-ms", UNREACHED_PROBE_LIMIT_MS, "preflight"],
+        &[
+            "box",
+            "--test-probe-limit-ms",
+            UNREACHED_PROBE_LIMIT_MS,
+            "--test-probe-drain-ms",
+            UNREACHED_PROBE_DRAIN_MS,
+            "preflight",
+        ],
         &needing(&folders, needs),
     );
     command.env("PATH", path_with_git(&[stub]));
@@ -1068,6 +1101,11 @@ fn probed(case: &Case, needs: &Value, tools: &[(&str, &str)]) -> Outcome {
 /// The probe bound every probe case passes but the one about the bound: long enough that no probe of a case reaches it
 /// however slow a loaded machine makes the run, so only that one case depends on a deadline.
 const UNREACHED_PROBE_LIMIT_MS: &str = "120000";
+
+/// The drain every probe case but the one about the bound gives a probed tool's output, and dotnet's, after its exit,
+/// and the limit the dotnet cases give dotnet's SDK read: an hour, which no case reaches however slow a loaded machine
+/// makes the run.
+const UNREACHED_PROBE_DRAIN_MS: &str = "3600000";
 
 /// The stdout lines of a passed preflight after its sdks line.
 fn after_sdks(outcome: &Outcome) -> Vec<&str> {
@@ -1169,6 +1207,8 @@ fn preflight_probes_the_tools_while_dotnet_lists_the_sdks() {
             UNREACHED_PROBE_LIMIT_MS,
             "--test-probe-limit-ms",
             UNREACHED_PROBE_LIMIT_MS,
+            "--test-probe-drain-ms",
+            UNREACHED_PROBE_DRAIN_MS,
             "preflight",
         ],
         &needing(&folders, &json!({"node": ""})),
@@ -1326,7 +1366,14 @@ fn preflight_call(case: &Case, needs: &Value, stubs: &[PathBuf]) -> BoxCall {
     let folders = Folders::new(case);
     let mut command = box_call(
         case,
-        &["box", "--test-probe-limit-ms", UNREACHED_PROBE_LIMIT_MS, "preflight"],
+        &[
+            "box",
+            "--test-probe-limit-ms",
+            UNREACHED_PROBE_LIMIT_MS,
+            "--test-probe-drain-ms",
+            UNREACHED_PROBE_DRAIN_MS,
+            "preflight",
+        ],
         &needing(&folders, needs),
     );
     command.env("PATH", path_with_git(stubs));
@@ -1594,6 +1641,8 @@ fn probed_netfx(case: &Case, key: &NetfxKey) -> Outcome {
             "box",
             "--test-probe-limit-ms",
             UNREACHED_PROBE_LIMIT_MS,
+            "--test-probe-drain-ms",
+            UNREACHED_PROBE_DRAIN_MS,
             "--test-netfx-key",
             key.path(),
             "preflight",

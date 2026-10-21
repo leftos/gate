@@ -249,13 +249,15 @@ struct Spawn<'a> {
 }
 
 /// A program other than git started, bounded and ended as the client's git calls are ([`program_output`]): its name,
-/// looked for along a `PATH`, its arguments, how long it may take, the console interrupt that ends it, the worktrees it
-/// must not be found inside, none for no such check, the console it is created on: this process's, or a hidden one of
-/// its own; and the bytes fed on its standard input, which is then closed, `None` for none.
+/// looked for along a `PATH`, its arguments, how long it may take, how long its readers get to end once it has exited,
+/// the console interrupt that ends it, the worktrees it must not be found inside, none for no such check, the console
+/// it is created on: this process's, or a hidden one of its own; and the bytes fed on its standard input, which is then
+/// closed, `None` for none.
 pub(crate) struct ProgramCall<'a> {
     pub program: &'a str,
     pub args: &'a [&'a str],
     pub limit: Duration,
+    pub drain: Duration,
     pub interrupt: Option<Interrupt>,
     pub worktrees: &'a [&'a Path],
     pub console: PipedConsole,
@@ -330,6 +332,7 @@ pub(crate) fn program_output(call: &ProgramCall<'_>, place: &ProgramPlace) -> Re
         judged_among(&found, call.worktrees).map_err(cannot_run)?
     };
     let bounds = Call {
+        drain: call.drain,
         interrupt: call.interrupt,
         console: call.console,
         stdin: call.stdin,
@@ -346,14 +349,21 @@ pub(crate) fn program_output(call: &ProgramCall<'_>, place: &ProgramPlace) -> Re
 }
 
 /// What `dotnet --list-sdks` lists, empty when no dotnet is found; dotnet is run as [`program_output`] runs a program,
-/// with `variables`, `limit`, `interrupt` and `worktrees`, and a failed read's reason carries the last lines of its
+/// with `variables`, `limit`, `drain`, `interrupt` and `worktrees`, and a failed read's reason carries the last lines of its
 /// standard error. This PC's parity check and the builder's preflight both read the list this way. Else why the list
 /// cannot be read, or [`GitError::Interrupted`].
-pub(crate) fn sdk_listing(variables: Variables, limit: Duration, interrupt: Option<Interrupt>, worktrees: &[&Path]) -> Result<String, GitError> {
+pub(crate) fn sdk_listing(
+    variables: Variables,
+    limit: Duration,
+    drain: Duration,
+    interrupt: Option<Interrupt>,
+    worktrees: &[&Path],
+) -> Result<String, GitError> {
     let call = ProgramCall {
         program: "dotnet",
         args: &["--list-sdks"],
         limit,
+        drain,
         interrupt,
         worktrees,
         console: PipedConsole::Attached,
@@ -521,8 +531,8 @@ where
     let until = Instant::now() + call.drain;
     let unread = || {
         GitError::Failed(format!(
-            "cannot read {name}'s output: it did not end within {} s of {name}'s exit",
-            call.drain.as_secs()
+            "cannot read {name}'s output: it did not end within {} of {name}'s exit",
+            spelled_limit(call.drain)
         ))
     };
     let output = received(&output, until).ok_or_else(unread)?;
@@ -550,8 +560,8 @@ fn fed_whole(fed: Option<&Receiver<io::Result<()>>>, status: ExitStatus, until: 
         Some(Ok(())) => Ok(()),
         Some(Err(error)) => Err(GitError::Failed(format!("cannot feed {name} its input: {error}"))),
         None => Err(GitError::Failed(format!(
-            "cannot feed {name} its input: it did not end within {} s of {name}'s exit",
-            drain.as_secs()
+            "cannot feed {name} its input: it did not end within {} of {name}'s exit",
+            spelled_limit(drain)
         ))),
     }
 }
@@ -898,8 +908,8 @@ mod tests {
     use jiff::Timestamp;
 
     use super::{
-        Call, ERRORS_KEPT, FAILURE_BYTES, GIT_LIMIT, Git, GitError, NO_CURRENT_FOLDER, OUTPUT_CAP, ProgramCall, ProgramPlace, capped, failed_line,
-        failure_text, is_indexed_config, late_git_line, program_output, sdk_listing, tail, without_verbatim,
+        Call, DRAIN, ERRORS_KEPT, FAILURE_BYTES, GIT_LIMIT, Git, GitError, NO_CURRENT_FOLDER, OUTPUT_CAP, ProgramCall, ProgramPlace, capped,
+        failed_line, failure_text, is_indexed_config, late_git_line, program_output, sdk_listing, tail, without_verbatim,
     };
     use crate::environment::Variables;
     use crate::remote::snapshot::repository;
@@ -1094,7 +1104,7 @@ mod tests {
         let interrupt = Interrupt::install().expect("the console handler is installed");
         // The hang guard as limit: in a passing run only the interrupt ends the call.
         let (ended, pid, started) = thread::scope(|scope| {
-            let running = scope.spawn(|| sdk_listing(variables, HANG_GUARD, Some(interrupt), &[]));
+            let running = scope.spawn(|| sdk_listing(variables, HANG_GUARD, DRAIN, Some(interrupt), &[]));
             let pid = pid_while_running(&pid_file, &running);
             let started = gate_win32::process_start_of(pid).expect("the stub can be looked for");
             interrupt.raise();
@@ -1109,7 +1119,7 @@ mod tests {
         let (folder, variables) = dotnet_folder("failing", ">&2 echo first\r\n>&2 echo the SDK resolver failed\r\nexit /b 3\r\n");
         let _removed = Removed(folder);
 
-        let read = sdk_listing(variables, HANG_GUARD, None, &[]);
+        let read = sdk_listing(variables, HANG_GUARD, DRAIN, None, &[]);
 
         let said = "dotnet --list-sdks exited with status 3: first | the SDK resolver failed";
         assert_eq!(read, Err(GitError::Failed(said.to_owned())));
@@ -1120,7 +1130,7 @@ mod tests {
         let (folder, variables) = dotnet_folder("failing-quiet", "exit /b 3\r\n");
         let _removed = Removed(folder);
 
-        let read = sdk_listing(variables, HANG_GUARD, None, &[]);
+        let read = sdk_listing(variables, HANG_GUARD, DRAIN, None, &[]);
 
         assert_eq!(read, Err(GitError::Failed("dotnet --list-sdks exited with status 3".to_owned())));
     }
@@ -1146,10 +1156,10 @@ mod tests {
         fs::write(folder.join("dotnet.cmd"), stub).expect("the stub dotnet can be written");
 
         // The dotnet lies inside the second of two worktrees, as one inside a pair's sibling does.
-        let refused = sdk_listing(variables, HANG_GUARD, None, &[Path::new(env!("CARGO_MANIFEST_DIR")), &folder]);
+        let refused = sdk_listing(variables, HANG_GUARD, DRAIN, None, &[Path::new(env!("CARGO_MANIFEST_DIR")), &folder]);
         let ran_inside = marker.exists();
         let again = Variables::from_process().with("PATH", &folder.to_string_lossy());
-        let elsewhere = sdk_listing(again, HANG_GUARD, None, &[Path::new(env!("CARGO_MANIFEST_DIR"))]);
+        let elsewhere = sdk_listing(again, HANG_GUARD, DRAIN, None, &[Path::new(env!("CARGO_MANIFEST_DIR"))]);
 
         let Err(GitError::Failed(why)) = refused else {
             panic!("a dotnet inside the worktree was read: {refused:?}");
@@ -1484,6 +1494,7 @@ mod tests {
             program: "tool",
             args: &["-NoProfile", "-NonInteractive", "-Command", "[Environment]::CommandLine"],
             limit: HANG_GUARD,
+            drain: DRAIN,
             interrupt: None,
             worktrees: &[Path::new(env!("CARGO_MANIFEST_DIR"))],
             console: PipedConsole::Hidden,

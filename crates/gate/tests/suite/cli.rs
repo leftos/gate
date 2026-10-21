@@ -105,7 +105,7 @@ fn a_local_run_without_a_reason_is_a_usage_error() {
         "--slot",
         "heavy",
         "--timeout",
-        "5",
+        "600",
         "--log",
         "out.log",
         "--local",
@@ -121,7 +121,7 @@ fn a_local_run_without_a_reason_is_a_usage_error() {
         "-Log",
         "out.log",
         "-TimeoutSeconds",
-        "5",
+        "600",
         "-Slot",
         "heavy",
         "-Local",
@@ -141,7 +141,7 @@ fn a_critical_run_without_a_reason_is_a_usage_error() {
         "--slot",
         "critical",
         "--timeout",
-        "5",
+        "600",
         "--log",
         "out.log",
         "--",
@@ -162,7 +162,7 @@ fn an_alone_run_without_a_reason_is_a_usage_error() {
         "critical",
         "--alone",
         "--timeout",
-        "5",
+        "600",
         "--log",
         "out.log",
         "--",
@@ -182,7 +182,7 @@ fn a_blank_reason_is_a_usage_error() {
         "--slot",
         "heavy",
         "--timeout",
-        "5",
+        "600",
         "--log",
         "out.log",
         "--reason",
@@ -200,7 +200,7 @@ fn a_blank_reason_is_a_usage_error() {
 fn an_env_name_given_twice_in_any_case_is_refused() {
     let case = Case::new("an_env_name_given_twice_in_any_case_is_refused");
     let env = ["--env", "ZZ_A_X=a", "--env", "zz_a_x=b"];
-    let mut run = vec!["run", "--slot", "heavy", "--timeout", "5", "--log", "out.log"];
+    let mut run = vec!["run", "--slot", "heavy", "--timeout", "600", "--log", "out.log"];
     run.extend(env);
     let mut printed = run.clone();
     printed.push("--test-print-request");
@@ -229,7 +229,7 @@ fn an_env_name_outside_ascii_is_refused() {
         "--slot",
         "heavy",
         "--timeout",
-        "5",
+        "600",
         "--log",
         "out.log",
         "--env",
@@ -258,7 +258,7 @@ fn valid_run_runs_its_command_and_exits_with_its_status() {
         "--slot",
         "heavy",
         "--timeout",
-        "5",
+        "600",
         "--log",
         "out.log",
         "--",
@@ -272,7 +272,7 @@ fn valid_run_runs_its_command_and_exits_with_its_status() {
     assert_eq!(outcome.stderr, "", "{outcome:?}");
     assert!(outcome.stdout.starts_with("gate: passed in "), "{outcome:?}");
     let passed = format!(
-        r"\Agate: passed in \d+ s \(load-adjusted \d+ s, ceiling 5 s\)\. Full output: {}\n\z",
+        r"\Agate: passed in \d+ s \(load-adjusted \d+ s, ceiling 600 s\)\. Full output: {}\n\z",
         regex::escape(&log)
     );
     assert!(

@@ -15,7 +15,7 @@ use gate_win32::{EnvironmentBlock, Job, LaunchError, PipedConsole, PipedFed, Pip
 /// call's job ends its processes with.
 pub(super) const KILLED: i32 = 124;
 /// How long a killed call's output is waited for to end before the wait on it stops.
-pub(super) const DRAIN: Duration = Duration::from_secs(2);
+pub(crate) const DRAIN: Duration = Duration::from_secs(2);
 /// How long a killed call is waited for to exit.
 pub(super) const KILL_WAIT: Duration = Duration::from_secs(30);
 

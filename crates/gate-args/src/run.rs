@@ -115,6 +115,10 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     ProbeLimitMs,
     #[cfg(feature = "test-seams")]
+    ProbeDrainMs,
+    #[cfg(feature = "test-seams")]
+    SdkLimitMs,
+    #[cfg(feature = "test-seams")]
     NetfxKey,
     #[cfg(feature = "test-seams")]
     WarmWaitMs,
@@ -200,7 +204,7 @@ pub(crate) struct RunBuilder {
     push_seams: PushSeams,
     /// `gate check`'s `--builder <host>`.
     builder: Option<String>,
-    /// `gate check`'s own seam, `--test-probe-limit-ms`; its builder seams are read into `test_seams`, as a run's are.
+    /// `gate check`'s own seams (`CheckSeams`); its builder seams are read into `test_seams`, as a run's are.
     check_seams: CheckSeams,
     given: Vec<RunOption>,
     pub(crate) problems: Vec<Problem>,
@@ -380,6 +384,8 @@ impl RunBuilder {
             | ValueOption::PushBoundMs
             | ValueOption::PushRegister
             | ValueOption::ProbeLimitMs
+            | ValueOption::ProbeDrainMs
+            | ValueOption::SdkLimitMs
             | ValueOption::NetfxKey
             | ValueOption::WarmWaitMs => self.apply_subcommand_seam(option, spelled, value)?,
         }
@@ -396,6 +402,8 @@ impl RunBuilder {
             ValueOption::PushBoundMs => self.push_seams.bound_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::PushRegister => self.push_seams.register_ok = Some(values::remote_call(spelled, value, PUSH_REGISTER_RESULTS)? == "ok"),
             ValueOption::ProbeLimitMs => self.check_seams.probe_limit_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::ProbeDrainMs => self.check_seams.probe_drain_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::SdkLimitMs => self.check_seams.sdk_limit_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::NetfxKey => self.check_seams.netfx_key = Some(value.to_owned()),
             ValueOption::WarmWaitMs => self.test_seams.warm_wait_ms = Some(values::above_zero(spelled, value)?),
             _ => {}
@@ -687,15 +695,17 @@ impl RunBuilder {
     }
 
     /// Refuses the builder check's seams without `--builder`, which alone reads them, `--test-remote-ssh` without
-    /// `--test-remote-transport`, whose local transport alone starts it, and `--test-probe-limit-ms` and
-    /// `--test-netfx-key` with `--builder`, whose probes run on the box under its own seams. A seam whose value was
-    /// refused is already a problem of its own.
+    /// `--test-remote-transport`, whose local transport alone starts it, and `--test-probe-limit-ms`,
+    /// `--test-sdk-limit-ms` and `--test-netfx-key` with `--builder`, whose probes and SDK list run on the box under its
+    /// own seams. `--test-probe-drain-ms` is read either way: with `--builder` it bounds the drain of the builder's call.
+    /// A seam whose value was refused is already a problem of its own.
     #[cfg(feature = "test-seams")]
     fn check_builder_seams(&mut self) {
         const BUILDER: &str = "--builder";
         let builder = self.builder.is_some();
         for (read, option) in [
             (self.check_seams.probe_limit_ms.is_some(), "--test-probe-limit-ms"),
+            (self.check_seams.sdk_limit_ms.is_some(), "--test-sdk-limit-ms"),
             (self.check_seams.netfx_key.is_some(), "--test-netfx-key"),
         ] {
             if builder && read {

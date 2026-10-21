@@ -241,6 +241,8 @@ fn check_option(name: &str) -> Option<RunOption> {
 fn check_seam_option(name: &str) -> Option<RunOption> {
     match name {
         "test-probe-limit-ms" => Some(RunOption::Value(ValueOption::ProbeLimitMs)),
+        "test-probe-drain-ms" => Some(RunOption::Value(ValueOption::ProbeDrainMs)),
+        "test-sdk-limit-ms" => Some(RunOption::Value(ValueOption::SdkLimitMs)),
         "test-netfx-key" => Some(RunOption::Value(ValueOption::NetfxKey)),
         "test-remote-transport" => Some(RunOption::Value(ValueOption::RemoteTransport)),
         "test-remote-ssh" => Some(RunOption::Value(ValueOption::RemoteSsh)),
