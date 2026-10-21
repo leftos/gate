@@ -543,21 +543,34 @@ pub fn round_trip(seconds: i64, hundreds: i64) -> String {
 /// The variable the run's command reads its job's name from, as on the Windows box (`gate`'s `environment.rs`).
 pub const BOX_JOB_VARIABLE: &str = "GATE_BOX_JOB";
 
-/// The command's environment: `start` (the box's own), its `PATH` the login shell's `login_path` when there is one, the
-/// payload's `Env` pairs `caller` set over that, each replacing its name, then the build-server settings of the run
-/// `run` ([`gate_wire::build_server_settings`]) and [`BOX_JOB_VARIABLE`] the job `job`, each first removing every name
-/// that differs from it only in case, so the command sees one value per name, as on the Windows box.
+/// What the box sets over its own environment for a run's command and its tool restore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Along<'a> {
+    /// The login shell's `PATH`, `None` to keep the box's own.
+    pub path: Option<&'a str>,
+    /// The run's own temp folder with a trailing `/`, the `TMPDIR`; `None` to keep the box's own.
+    pub tmp: Option<&'a str>,
+}
+
+/// The command's environment: `start` (the box's own), its `PATH` the login shell's `along.path` and its `TMPDIR` the
+/// run's folder `along.tmp` when there are, the payload's `Env` pairs `caller` set over that, each replacing its name,
+/// then the build-server settings of the run `run` ([`gate_wire::build_server_settings`]) and [`BOX_JOB_VARIABLE`] the
+/// job `job`, each first removing every name that differs from it only in case, so the command sees one value per
+/// name, as on the Windows box.
 #[must_use]
 pub fn command_environment(
     start: Vec<(OsString, OsString)>,
-    login_path: Option<&str>,
+    along: Along<'_>,
     caller: &[(String, String)],
     run: &str,
     job: &str,
 ) -> Vec<(OsString, OsString)> {
     let mut environment = start;
-    if let Some(path) = login_path {
+    if let Some(path) = along.path {
         set_variable(&mut environment, "PATH", path, false);
+    }
+    if let Some(tmp) = along.tmp {
+        set_variable(&mut environment, "TMPDIR", tmp, false);
     }
     for (name, value) in caller {
         set_variable(&mut environment, name, value, false);
@@ -590,7 +603,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BOX_JOB_VARIABLE, CommandEnd, ROSETTA_LINE, Translation, command_environment, command_status, rosetta_lines, round_trip, translation,
+        Along, BOX_JOB_VARIABLE, CommandEnd, ROSETTA_LINE, Translation, command_environment, command_status, rosetta_lines, round_trip, translation,
     };
     use super::{
         JobRecord, PATH_MARKER, Probed, Recorded, RootFacts, boot_line, created_line, folder_failure, folder_flaw, is_git_variable, job_record,
@@ -664,11 +677,17 @@ mod tests {
             .collect()
     }
 
+    /// What a case's command runs along: the login `PATH` `path` and no folder of the box's own for `TMPDIR`.
+    fn along_path(path: Option<&str>) -> Along<'_> {
+        Along { path, tmp: None }
+    }
+
     #[test]
-    fn the_command_s_environment_is_the_login_path_then_the_payload_s_env_then_the_box_s_own_names_once() {
+    fn the_command_s_environment_is_the_login_path_and_tmp_then_the_payload_s_env_then_the_box_s_own_names_once() {
         let start = vec![
             (OsString::from("PATH"), OsString::from("/ssh/bin")),
             (OsString::from("HOME"), OsString::from("/Users/b")),
+            (OsString::from("TMPDIR"), OsString::from("/var/folders/xy/long/T/")),
             (OsString::from("msbuilduseserver"), OsString::from("1")),
         ];
         let caller = [
@@ -676,8 +695,13 @@ mod tests {
             ("gate_box_job".to_owned(), "theirs".to_owned()),
             ("MY_VAR".to_owned(), "v".to_owned()),
         ];
-        let environment = command_environment(start.clone(), Some("/login/bin:/usr/bin"), &caller, "gate-box-n", "gate-remote-k-n");
+        let along = Along {
+            path: Some("/login/bin:/usr/bin"),
+            tmp: Some("/tmp/gate.abcdefgh/"),
+        };
+        let environment = command_environment(start.clone(), along, &caller, "gate-box-n", "gate-remote-k-n");
         assert_eq!(values_of(&environment, "PATH"), [("PATH", "/login/bin:/usr/bin")]);
+        assert_eq!(values_of(&environment, "TMPDIR"), [("TMPDIR", "/tmp/gate.abcdefgh/")]);
         assert_eq!(values_of(&environment, "HOME"), [("HOME", "/Users/b")]);
         assert_eq!(values_of(&environment, "MY_VAR"), [("MY_VAR", "v")]);
         assert_eq!(values_of(&environment, "SharedCompilationId"), [("SharedCompilationId", "gate-box-n")]);
@@ -686,14 +710,51 @@ mod tests {
         assert_eq!(values_of(&environment, "UseSharedCompilation"), [("UseSharedCompilation", "false")]);
 
         let theirs = [("PATH".to_owned(), "/payload/bin".to_owned())];
-        let over = command_environment(start.clone(), Some("/login/bin"), &theirs, "r", "j");
+        let over = command_environment(start.clone(), along_path(Some("/login/bin")), &theirs, "r", "j");
         assert_eq!(
             values_of(&over, "PATH"),
             [("PATH", "/payload/bin")],
             "the payload's Env comes after the login PATH"
         );
-        let unread = command_environment(start, None, &[], "r", "j");
+        let unread = command_environment(start, along_path(None), &[], "r", "j");
         assert_eq!(values_of(&unread, "PATH"), [("PATH", "/ssh/bin")], "no login PATH keeps the box's");
+        assert_eq!(
+            values_of(&unread, "TMPDIR"),
+            [("TMPDIR", "/var/folders/xy/long/T/")],
+            "no folder of the box's own keeps the box's TMPDIR"
+        );
+    }
+
+    #[test]
+    fn a_tmp_folder_given_is_the_command_environment_s_one_tmpdir() {
+        let start = vec![
+            (OsString::from("TMPDIR"), OsString::from("/var/folders/xy/long/T/")),
+            (OsString::from("TMPDIR"), OsString::from("/second/")),
+        ];
+        let along = Along {
+            path: None,
+            tmp: Some("/tmp/gate.abcdefgh/"),
+        };
+        let environment = command_environment(start, along, &[], "r", "j");
+        assert_eq!(values_of(&environment, "TMPDIR"), [("TMPDIR", "/tmp/gate.abcdefgh/")]);
+        let unset = command_environment(Vec::new(), along, &[], "r", "j");
+        assert_eq!(
+            values_of(&unset, "TMPDIR"),
+            [("TMPDIR", "/tmp/gate.abcdefgh/")],
+            "set where the box had none"
+        );
+    }
+
+    #[test]
+    fn a_caller_s_tmpdir_wins_over_the_box_s_folder_in_the_command_environment() {
+        let start = vec![(OsString::from("TMPDIR"), OsString::from("/var/folders/xy/long/T/"))];
+        let caller = [("TMPDIR".to_owned(), "/theirs/".to_owned())];
+        let along = Along {
+            path: None,
+            tmp: Some("/tmp/gate.abcdefgh/"),
+        };
+        let environment = command_environment(start, along, &caller, "r", "j");
+        assert_eq!(values_of(&environment, "TMPDIR"), [("TMPDIR", "/theirs/")]);
     }
 
     #[test]

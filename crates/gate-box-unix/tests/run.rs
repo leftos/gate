@@ -369,6 +369,22 @@ mod unix {
     }
 
     #[test]
+    fn a_run_s_command_has_a_short_tmpdir_of_its_own_which_is_gone_after_the_run() {
+        let case = Case::new("tmpdir");
+        let commit = case.snapshot();
+        let script = "printf '%s\\n' \"$TMPDIR\"; test -d \"$TMPDIR\" || exit 9; touch \"$TMPDIR/left\"";
+        let request = case.request(&commit, &json!({"Command": ["/bin/sh", "-c", script]}));
+        let ended = ran(&[], &request, Reading::All, &case.base.join("beaten"));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(ended.out.len(), 2, "the start marker and the TMPDIR: {:?}", ended.out);
+        assert_eq!(ended.out.first(), Some(&started_line(NONCE)));
+        let tmpdir = ended.out.last().expect("the command said its TMPDIR");
+        assert!(tmpdir.starts_with("/tmp/gate.") && tmpdir.ends_with('/') && tmpdir.len() < 38, "{tmpdir}");
+        assert!(!Path::new(tmpdir).exists(), "the run's temp folder is gone: {tmpdir}");
+        case.ended_clean();
+    }
+
+    #[test]
     fn a_failing_sampler_says_no_adjusted_line() {
         let case = Case::new("sampler-fail");
         let commit = case.snapshot();

@@ -23,7 +23,7 @@ use gate_wire::{BoxKill, adjusted_line, escaped, killed_line, started_line};
 use crate::console::{Forwarding, LineSink, Output, Stream};
 use crate::cpu::{GroupCpu, LoadTotals, host_cpu_load};
 use crate::files::{self, HeldLock};
-use crate::lines::{CommandEnd, command_environment, round_trip, write_failure};
+use crate::lines::{Along, CommandEnd, command_environment, round_trip, write_failure};
 use crate::process::{EndedBy, Ending, Forward, GroupRecord, Halt, NotRan, Ran, Watch, is_still_there, run_watched};
 use crate::run::group_record;
 
@@ -48,6 +48,8 @@ pub struct Launch<'a> {
     pub env: &'a [(String, String)],
     /// The login shell's `PATH`, `None` to keep the box's own.
     pub login_path: Option<&'a str>,
+    /// The run's own temp folder with a trailing `/`, the command's `TMPDIR`; `None` to keep the box's own.
+    pub tmp: Option<&'a str>,
     /// The work lock, held: no record is written or removed once it is lost.
     pub lock: &'a HeldLock,
     /// The run's ceiling in whole seconds of load-adjusted time, `None` for none.
@@ -542,7 +544,11 @@ pub(crate) fn removed_if_held<S: LineSink>(record: &str, lock: &HeldLock, output
 /// [`command_environment`] composes, the build servers named by the run id `gate-box-<nonce>`.
 fn command_of(launch: &Launch<'_>, program: &str, rest: &[String]) -> Command {
     let run = format!("gate-box-{}", launch.nonce);
-    let environment = command_environment(std::env::vars_os().collect(), launch.login_path, launch.env, &run, launch.job);
+    let along = Along {
+        path: launch.login_path,
+        tmp: launch.tmp,
+    };
+    let environment = command_environment(std::env::vars_os().collect(), along, launch.env, &run, launch.job);
     let mut command = Command::new(program);
     command.args(rest).current_dir(launch.place).env_clear().envs(environment);
     // SAFETY: the closure runs in the child between fork and exec, and calls only `sigaction`, `sigemptyset` and
@@ -697,6 +703,7 @@ mod tests {
                 nonce: NONCE,
                 env: &[],
                 login_path: None,
+                tmp: None,
                 lock: &self.lock,
                 timeout: watched.timeout,
                 host: watched.host,
@@ -1301,11 +1308,19 @@ mod tests {
             ("sharedcompilationid".to_owned(), "theirs".to_owned()),
             ("MY_VAR".to_owned(), "v".to_owned()),
         ];
-        let status = case.run(&["/usr/bin/env"], &env, Some("/login/first:/usr/bin:/bin"), &output);
+        let words = ["/usr/bin/env".to_owned()];
+        let launch = Launch {
+            env: &env,
+            login_path: Some("/login/first:/usr/bin:/bin"),
+            tmp: Some("/tmp/gate.abcdefgh/"),
+            ..case.launch(&words, &unwatched())
+        };
+        let status = command_status(run_command(&launch, &output));
         assert_eq!(status, 0);
         let lines = said(&output, Stream::Out);
         for wanted in [
             "PATH=/login/first:/usr/bin:/bin",
+            "TMPDIR=/tmp/gate.abcdefgh/",
             "MY_VAR=v",
             "GATE_BOX_JOB=gate-remote-k-0123456789ab",
             "SharedCompilationId=gate-box-0123456789ab",

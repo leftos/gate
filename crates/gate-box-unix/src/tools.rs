@@ -23,7 +23,7 @@ use crate::command::signals_reset;
 use crate::console::{Forwarding, LineSink, Output, Stream};
 use crate::files::{self, HeldLock};
 use crate::git::CLOSED_STATUS;
-use crate::lines::FAILED_STATUS;
+use crate::lines::{Along, FAILED_STATUS};
 use crate::process::{self, EndedBy, Ending, Forward, GroupRecord, NotRan, Watch, run_watched};
 use crate::run::{REFUSED_STATUS, Request};
 
@@ -107,7 +107,7 @@ enum Restored {
 /// Restores the work folder's dotnet tools before the command runs, under the work lock `lock`: the manifests `dotnet`
 /// would read for `place` ([`manifests`]), hashed ([`hash`]) and compared with the record `<work>.tools`, so nothing
 /// runs when there is no manifest or the record already holds the hash; else `dotnet tool restore` runs in `place`,
-/// found along `login_path` ([`restored`]), and its hash is written to the record ([`files::replace_plain`]) once it
+/// along `along` ([`restored`]), and its hash is written to the record ([`files::replace_plain`]) once it
 /// exits 0. Its lines are said through `output`.
 ///
 /// # Errors
@@ -120,7 +120,7 @@ pub(crate) fn update<S: LineSink + 'static>(
     request: &Request<'_>,
     place: &Path,
     lock: &HeldLock,
-    login_path: Option<&str>,
+    along: Along<'_>,
     output: &Arc<Output<S>>,
 ) -> Result<(), u8> {
     let (work, paths) = walk(Path::new(request.work), place).map_err(|error| {
@@ -149,7 +149,7 @@ pub(crate) fn update<S: LineSink + 'static>(
             );
         }
     }
-    let status = match restored(request, place, lock, login_path, output) {
+    let status = match restored(request, place, lock, along, output) {
         Restored::Exited(0) => return record_written(&record, &digest, lock, output),
         Restored::Exited(status) => status,
         Restored::Signalled(signal) => {
@@ -180,21 +180,18 @@ fn record_written<S: LineSink>(record: &str, digest: &str, lock: &HeldLock, outp
     written.map_err(|why| said(output, &[&format!("gate: remote could not write {record}: {why}")], FAILED_STATUS))
 }
 
-/// Runs `dotnet tool restore` in `place`, found along `login_path`, as the leader of a process group of its own
-/// recorded in `<work>.tools.pgid` under the job `<job>-tools`, which `box stop` reads; both its streams forwarded
-/// through `output`, no deadline, and a client gone ending its group. A restore that exited or was ended by a signal is
-/// followed by a line saying how long it ran.
-fn restored<S: LineSink + 'static>(
-    request: &Request<'_>,
-    place: &Path,
-    lock: &HeldLock,
-    login_path: Option<&str>,
-    output: &Arc<Output<S>>,
-) -> Restored {
+/// Runs `dotnet tool restore` in `place`, found along `along.path` and its `TMPDIR` `along.tmp` when given, as the
+/// leader of a process group of its own recorded in `<work>.tools.pgid` under the job `<job>-tools`, which `box stop`
+/// reads; both its streams forwarded through `output`, no deadline, and a client gone ending its group. A restore that
+/// exited or was ended by a signal is followed by a line saying how long it ran.
+fn restored<S: LineSink + 'static>(request: &Request<'_>, place: &Path, lock: &HeldLock, along: Along<'_>, output: &Arc<Output<S>>) -> Restored {
     let record = GroupRecord::new(PathBuf::from(tools_group_record(request.work)), &format!("{}-tools", request.job), lock);
     let mut command = Command::new("dotnet");
     command.args(["tool", "restore"]).current_dir(place);
-    process::with_path(&mut command, login_path);
+    process::with_path(&mut command, along.path);
+    if let Some(tmp) = along.tmp {
+        command.env("TMPDIR", tmp);
+    }
     // SAFETY: the closure runs in the child between fork and exec and only resets signal dispositions and the mask with
     // async-signal-safe calls ([`signals_reset`]), as the command's does.
     unsafe {

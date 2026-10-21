@@ -3,9 +3,10 @@
 //! folder laid out and the payload's snapshot checked out; then the command run and the tree it left synced back
 //! ([`run`]). Each line is said as the Windows box says it, byte for byte.
 
-use std::ffi::OsStr;
+use std::ffi::{CStr, OsStr};
 use std::fs;
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,8 +23,8 @@ use crate::files::{self, HeldLock, Locked};
 use crate::git::{self, AlternatesFailure, Failed, Git, GitClass, RunGit, Steps, Tree, line_ends_set, origin_set};
 use crate::heartbeat::{self, Periods};
 use crate::lines::{
-    CommandEnd, FAILED_STATUS, Translation, USAGE_STATUS, command_status, login_path_line, recorded_group, rosetta_lines, signal_guard, translation,
-    work_layout,
+    Along, CommandEnd, FAILED_STATUS, Translation, USAGE_STATUS, command_status, login_path_line, recorded_group, rosetta_lines, signal_guard,
+    translation, work_layout,
 };
 use crate::preflight::checked_root;
 use crate::process::{self, GroupRecord};
@@ -186,6 +187,147 @@ pub struct Ready<'p> {
     pub periods: Periods,
     /// The login shell's `PATH` the git steps ran along and the command runs along; `None` for the box's own.
     pub login_path: Option<String>,
+    /// The run's own temp folder, the command's `TMPDIR`, removed at the run's end ([`temp_removed`]); `None` when the
+    /// caller's `Env` sets `TMPDIR`.
+    pub temp: Option<RunTemp>,
+}
+
+/// The template `mkdtemp(3)` names each run's temp folder from: short, so the sockets .NET makes under it fit.
+const TEMP_TEMPLATE: &CStr = c"/tmp/gate.XXXXXXXX";
+/// How long a run's `TMPDIR` may be, in bytes, so the pipes .NET names `CoreFxPipe_<name>` under it still fit a
+/// socket path's 104.
+const TEMP_LIMIT: usize = 37;
+const _: () = assert!(
+    TEMP_TEMPLATE.count_bytes() < TEMP_LIMIT,
+    "the TMPDIR, with its trailing /, fits TEMP_LIMIT"
+);
+
+/// A run's own temp folder, made by `mkdtemp(3)` ([`temp_made`]) and removed at the run's end ([`temp_removed`]).
+#[derive(Debug)]
+pub struct RunTemp {
+    /// The folder, as `mkdtemp` named it.
+    path: PathBuf,
+    /// The folder with a trailing `/`: the run's `TMPDIR`.
+    tmpdir: String,
+    /// The folder's device and inode as `mkdtemp` made it, so the removal leaves a folder of that name it did not make.
+    identity: (u64, u64),
+}
+
+/// The template a test's thread makes its runs' temp folders from, in place of [`TEMP_TEMPLATE`].
+#[cfg(test)]
+pub(crate) mod test_template {
+    use std::cell::RefCell;
+    use std::ffi::{CStr, CString};
+
+    thread_local! {
+        static TEMPLATE: RefCell<Option<CString>> = const { RefCell::new(None) };
+    }
+
+    /// Makes every temp folder this thread's runs make from now on from `template`.
+    pub fn set(template: &CStr) {
+        TEMPLATE.with(|cell| *cell.borrow_mut() = Some(template.to_owned()));
+    }
+
+    /// The template this thread set, if any.
+    pub fn get() -> Option<CString> {
+        TEMPLATE.with(|cell| cell.borrow().clone())
+    }
+}
+
+/// No test template outside the tests.
+#[cfg(not(test))]
+mod test_template {
+    use std::ffi::CString;
+
+    /// None.
+    pub fn get() -> Option<CString> {
+        None
+    }
+}
+
+impl RunTemp {
+    /// The folder, as `mkdtemp` named it.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The folder with a trailing `/`: the run's `TMPDIR`.
+    #[must_use]
+    pub fn tmpdir(&self) -> &str {
+        &self.tmpdir
+    }
+}
+
+/// A new temp folder for the run, made by `mkdtemp(3)` from [`TEMP_TEMPLATE`]: at mode 0700, owned by the builder
+/// user, and never at a name that is already there, so no other account can plant it or a link in its place.
+fn temp_made() -> io::Result<RunTemp> {
+    let template = test_template::get().unwrap_or_else(|| TEMP_TEMPLATE.to_owned());
+    let mut template = template.into_bytes_with_nul();
+    // SAFETY: `template` is a NUL-terminated buffer that lives across the call, which only writes its X's in place.
+    let made = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+    if made.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    template.pop();
+    // `mkdtemp` fills the X's from letters and digits only, so the name stays ASCII.
+    let path = String::from_utf8_lossy(&template).into_owned();
+    let tmpdir = format!("{path}/");
+    let path = PathBuf::from(path);
+    let made = fs::symlink_metadata(&path).inspect_err(|_| {
+        // The run is refused with this look's error; the folder just made is empty, and `remove_dir` takes no link.
+        let _ = fs::remove_dir(&path);
+    })?;
+    Ok(RunTemp {
+        path,
+        tmpdir,
+        identity: (made.dev(), made.ino()),
+    })
+}
+
+/// The temp folder of the run `request`, saying its lines through `output`: `None` when the caller's `Env` sets
+/// `TMPDIR`, which the command then keeps as given, else a new one ([`temp_made`]).
+///
+/// # Errors
+///
+/// [`REFUSED_STATUS`] when the folder cannot be made, refused `layout` with the line saying why, so the PC runs the
+/// command itself.
+fn temp_for<S: LineSink>(request: &Request<'_>, output: &Output<S>) -> Result<Option<RunTemp>, u8> {
+    if request.env.iter().any(|(name, _)| name == "TMPDIR") {
+        return Ok(None);
+    }
+    temp_made().map(Some).map_err(|error| {
+        let line = format!("gate: remote could not make the run's temp folder in /tmp: {error}");
+        refused(output, request, Refusal::Layout, &line)
+    })
+}
+
+/// Removes the run's temp folder `temp` and everything in it, following no link at any depth: a link is removed as
+/// itself ([`fs::remove_dir_all`]). A folder already gone counts as removed; one at its name that is not the folder
+/// `mkdtemp` made (another device or inode) is left and says `gate: remote did not remove <path>: it is no longer the
+/// run's temp folder`; one that cannot be removed says `gate: remote could not remove the run's temp folder <path>:
+/// <why>`. Each through `output`, changing nothing else.
+fn temp_removed<S: LineSink>(temp: RunTemp, output: &Output<S>) {
+    let RunTemp { path, identity, .. } = temp;
+    let removed = match fs::symlink_metadata(&path) {
+        Ok(found) if (found.dev(), found.ino()) != identity => {
+            let line = format!("gate: remote did not remove {}: it is no longer the run's temp folder", path.display());
+            // Said; the run's status stands.
+            let _ = output.say(Stream::Err, &line);
+            return;
+        }
+        Ok(_) => fs::remove_dir_all(&path),
+        Err(error) => Err(error),
+    };
+    match removed {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            let line = format!("gate: remote could not remove the run's temp folder {}: {error}", path.display());
+            // Said; the run's status stands.
+            let _ = output.say(Stream::Err, &line);
+        }
+    }
 }
 
 /// Where a run reads the login shell's `PATH` from: [`process::login_path`], or a test's own.
@@ -203,8 +345,10 @@ pub type LoginPath = fn() -> Result<String, String>;
 /// the subfolder placed inside the work folder, else refused with [`USAGE_STATUS`] once the earlier run's back ref is
 /// deleted; the work folder's files checked ([`layout_checked`]) and it laid out ([`laid_out`]), refused `layout` when
 /// it cannot be; the snapshot fetched and checked out ([`checked_out`]); and the subfolder found in it, a folder inside
-/// the work folder once its links are followed, else [`USAGE_STATUS`]; then the repo's dotnet tools restored when a
-/// manifest changed ([`tools::update`]), a restore that fails refused `tools`. Each git step's process group is recorded in
+/// the work folder once its links are followed, else [`USAGE_STATUS`]; then the run's temp folder made ([`temp_for`]),
+/// one that cannot be made refused `layout`; then the repo's dotnet tools restored when a
+/// manifest changed ([`tools::update`]), with the folder as its `TMPDIR`, a restore that fails refused `tools` once the
+/// folder is removed ([`temp_removed`]). Each git step's process group is recorded in
 /// `<work>.pgid` under the run's job while it runs. The heartbeat starts once the subfolder is placed, before the layout
 /// and the checkout, beating every `periods.heartbeat` ([`heartbeat::start`]). The login shell's `PATH` is read from
 /// `login` just before the first git step, after every refusal said before it ([`login_path_read`]). No start marker
@@ -297,15 +441,18 @@ pub fn run<S: LineSink + 'static>(payload: &Payload, output: &Arc<Output<S>>, wa
 
 /// [`run`], the login shell's `PATH` read from `login`, in the Windows box's order: the run readied ([`prepare`]), the
 /// heartbeat beating from the subfolder's check; the command run ([`run_command`]); the back commit made and pushed
-/// when the command reached an end of its own ([`synced_back`]); then the heartbeat stopped ([`heartbeat::stop`]), then
-/// the work lock let go.
+/// when the command reached an end of its own ([`synced_back`]); then the run's temp folder removed
+/// ([`temp_removed`]), the heartbeat stopped ([`heartbeat::stop`]), and the work lock let go.
 fn run_along<S: LineSink + 'static>(payload: &Payload, output: &Arc<Output<S>>, watches: Watches, login: LoginPath) -> u8 {
     let ready = match prepare(payload, output, watches.periods, login) {
         Ok(ready) => ready,
         Err(status) => return status,
     };
     let status = commanded(&ready, output, watches.sampler);
-    let Ready { pump, lock, .. } = ready;
+    let Ready { pump, lock, temp, .. } = ready;
+    if let Some(temp) = temp {
+        temp_removed(temp, output);
+    }
     if let Some(pump) = pump {
         heartbeat::stop(pump);
     }
@@ -326,6 +473,7 @@ fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, 
         nonce: request.nonce,
         env: &request.env,
         login_path,
+        tmp: ready.temp.as_ref().map(RunTemp::tmpdir),
         lock: &ready.lock,
         timeout: request.timeout,
         host: request.host,
@@ -436,7 +584,17 @@ fn prepared<'p, S: LineSink + 'static>(
     if !inside_work(request.work, &place) {
         return Err(said(output, &[&not_inside(request.subfolder)], USAGE_STATUS));
     }
-    tools::update(&request, &place, &lock, login_path.as_deref(), output)?;
+    let temp = temp_for(&request, output)?;
+    let along = Along {
+        path: login_path.as_deref(),
+        tmp: temp.as_ref().map(RunTemp::tmpdir),
+    };
+    if let Err(status) = tools::update(&request, &place, &lock, along, output) {
+        if let Some(temp) = temp {
+            temp_removed(temp, output);
+        }
+        return Err(status);
+    }
     Ok(Ready {
         request,
         lock,
@@ -444,6 +602,7 @@ fn prepared<'p, S: LineSink + 'static>(
         pump,
         periods,
         login_path,
+        temp,
     })
 }
 
@@ -752,7 +911,7 @@ fn back_ref_cleared<S: LineSink>(git: &RunGit<'_, S>, request: &Request<'_>) -> 
 )]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt, symlink};
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
@@ -767,7 +926,7 @@ mod tests {
 
     use gate_watchdog::Pump;
 
-    use super::{REFUSED_STATUS, Ready, Watches, place_of, prepare, prepared, run_along};
+    use super::{REFUSED_STATUS, Ready, Watches, place_of, prepare, prepared, run_along, test_template};
     use crate::command::{Launch, Sampler, run_command};
     use crate::console::{Console, Forwarding};
     use crate::console::{LineSink, Output, RecordingSink, Stream};
@@ -937,10 +1096,21 @@ mod tests {
         let payload = decoded(json);
         let output = Arc::new(Output::new(RecordingSink::default()));
         let status = match prepare(&payload, &output, quiet_periods(), own_path) {
-            Ok(_) => 0,
+            Ok(mut ready) => {
+                tmp_cleared(&mut ready);
+                0
+            }
             Err(status) => status,
         };
         (status, stderr_of(&output))
+    }
+
+    /// Removes the temp folder `ready` made, failing the case unless it goes, so a case that keeps a readied run
+    /// leaves nothing in `/tmp`.
+    fn tmp_cleared(ready: &mut Ready<'_>) {
+        if let Some(temp) = ready.temp.take() {
+            fs::remove_dir_all(temp.path()).expect("the run's temp folder is removed");
+        }
     }
 
     /// Periods whose heartbeat never beats within a case, so a case's lines are exactly the run's own.
@@ -987,7 +1157,10 @@ mod tests {
         let commit = case.snapshot(&[("a.txt", "a\n")]);
         let payload = decoded(&case.json(&commit, &json!({})));
         let output = Arc::new(Output::new(RecordingSink::default()));
-        let ready = prepared(&payload, &output, quiet_periods(), own_path, no_beat);
+        let mut ready = prepared(&payload, &output, quiet_periods(), own_path, no_beat);
+        if let Ok(ready) = ready.as_mut() {
+            tmp_cleared(ready);
+        }
         assert!(ready.as_ref().is_ok_and(|ready| ready.pump.is_none()), "{:?}", output.sink().lines());
         assert_eq!(
             stderr_of(&output),
@@ -1026,7 +1199,8 @@ mod tests {
         let ready = prepare(&payload, &output, periods, own_path);
         let lines = || output.sink().lines.lock().unwrap_or_else(PoisonError::into_inner).clone();
         assert!(ready.is_ok(), "the run is ready: {:?}", lines());
-        let ready = ready.expect("the run is ready");
+        let mut ready = ready.expect("the run is ready");
+        tmp_cleared(&mut ready);
         let launch = Launch {
             words: &ready.request.command,
             place: &ready.place,
@@ -1035,6 +1209,7 @@ mod tests {
             nonce: ready.request.nonce,
             env: &ready.request.env,
             login_path: None,
+            tmp: None,
             lock: &ready.lock,
             timeout: None,
             host: "",
@@ -1327,6 +1502,162 @@ mod tests {
         assert!(!case.has_back_ref(), "no commit is pushed");
     }
 
+    /// The `TMPDIR` a case's command wrote to `seen`.
+    fn tmpdir_seen(seen: &Path) -> String {
+        fs::read_to_string(seen).expect("the command wrote its TMPDIR")
+    }
+
+    #[test]
+    fn a_run_s_tmp_folder_is_made_by_mkdtemp_private_to_the_builder_and_short() {
+        let case = Case::new("tmp-made");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let payload = decoded(&case.json(&commit, &json!({})));
+        let output = Arc::new(Output::new(RecordingSink::default()));
+        let mut ready = prepare(&payload, &output, quiet_periods(), own_path).expect("the run is ready");
+        let temp = ready.temp.as_ref().expect("the run made a temp folder");
+        let (path, tmpdir) = (temp.path().to_owned(), temp.tmpdir().to_owned());
+        tmp_cleared(&mut ready);
+        drop(ready);
+        let name = path.to_str().expect("the folder's name is UTF-8").to_owned();
+        assert!(name.starts_with("/tmp/gate.") && name.len() == "/tmp/gate.".len() + 8, "{name}");
+        assert_eq!(tmpdir, format!("{name}/"));
+        assert!(tmpdir.len() < 38, "the TMPDIR leaves room for .NET's pipes: {tmpdir}");
+        assert!(!path.exists(), "the case removed it");
+        assert_eq!(stderr_of(&output), Vec::<String>::new());
+
+        let mut again = prepare(&payload, &output, quiet_periods(), own_path).expect("the run is ready again");
+        let other = again.temp.as_ref().expect("the run made a temp folder").path().to_owned();
+        let meta = fs::symlink_metadata(&other).expect("the folder is there");
+        tmp_cleared(&mut again);
+        assert_ne!(other, path, "each run makes a folder of its own");
+        assert!(meta.is_dir(), "a folder, not a link");
+        assert_eq!(meta.mode() & 0o7777, 0o700, "private to its owner");
+        assert_eq!(meta.uid(), effective_uid(), "owned by the builder user");
+    }
+
+    #[test]
+    fn a_run_s_tmp_folder_is_its_command_s_tmpdir_and_gone_after_a_passing_or_a_failing_command() {
+        for (name, code) in [("tmp-passing", 0_u8), ("tmp-failing", 3)] {
+            let case = Case::new(name);
+            let commit = case.snapshot(&[("a.txt", "a\n")]);
+            let seen = case.base.with_file_name("seen");
+            let script = format!("printf %s \"$TMPDIR\" > '{}'; test -d \"$TMPDIR\" || exit 9; exit {code}", seen.display());
+            let (status, said) = whole_run(&case.commanded(&commit, &["/bin/sh", "-c", &script]));
+            assert_eq!(status, code, "{said:?}");
+            let tmpdir = tmpdir_seen(&seen);
+            assert!(tmpdir.starts_with("/tmp/gate.") && tmpdir.ends_with('/'), "{tmpdir}");
+            assert!(!Path::new(&tmpdir).exists(), "the folder is gone after the run: {tmpdir}");
+            assert!(matches!(take_lock(Path::new(&case.lock())), Ok(Locked::Held(_))), "the lock is let go");
+        }
+    }
+
+    #[test]
+    fn a_caller_s_tmpdir_is_the_command_s_as_given_and_no_tmp_folder_is_made() {
+        let case = Case::new("tmp-caller");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let theirs = case.base.with_file_name("theirs");
+        fs::create_dir_all(&theirs).expect("the caller's folder is made");
+        let given = format!("{}/", theirs.display());
+        let seen = case.base.with_file_name("seen");
+        let script = format!("printf %s \"$TMPDIR\" > '{}'", seen.display());
+        let json = case.json(
+            &commit,
+            &json!({"Command": ["/bin/sh", "-c", script], "Identity": identity(), "Env": {"TMPDIR": given}}),
+        );
+        let payload = decoded(&json);
+        let output = Arc::new(Output::new(RecordingSink::default()));
+        let ready = prepare(&payload, &output, quiet_periods(), own_path).expect("the run is ready");
+        assert!(ready.temp.is_none(), "no folder of the box's own");
+        drop(ready);
+        let (status, said) = whole_run(&json);
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(tmpdir_seen(&seen), given);
+        assert!(theirs.is_dir(), "the caller's folder is left");
+    }
+
+    #[test]
+    fn a_tmp_folder_that_cannot_be_made_refuses_the_run_75_with_the_layout_tag() {
+        let case = Case::new("tmp-unmade");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        test_template::set(c"/nonexistent-gate-box-unix-folder/gate.XXXXXXXX");
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+        assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert_eq!(said.first(), Some(&refused_line(NONCE, Refusal::Layout)), "{said:?}");
+        assert!(
+            said.last()
+                .is_some_and(|line| line.starts_with("gate: remote could not make the run's temp folder in /tmp: ")),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_caller_s_lower_case_tmpdir_is_another_name_and_the_run_still_makes_its_tmp_folder() {
+        let case = Case::new("tmp-lower");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let seen = case.base.with_file_name("seen");
+        let script = format!("printf '%s|%s' \"$TMPDIR\" \"$tmpdir\" > '{}'", seen.display());
+        let json = case.json(
+            &commit,
+            &json!({"Command": ["/bin/sh", "-c", script], "Identity": identity(), "Env": {"tmpdir": "/theirs/"}}),
+        );
+        let (status, said) = whole_run(&json);
+        assert_eq!(status, 0, "{said:?}");
+        let both = tmpdir_seen(&seen);
+        let (tmpdir, theirs) = both.split_once('|').expect("both names were written");
+        assert!(tmpdir.starts_with("/tmp/gate.") && tmpdir.ends_with('/'), "{both}");
+        assert_eq!(theirs, "/theirs/");
+        assert!(!Path::new(tmpdir).exists(), "the folder is gone: {tmpdir}");
+    }
+
+    #[test]
+    fn a_folder_that_took_the_tmp_folder_s_name_during_the_run_is_left_and_said() {
+        let case = Case::new("tmp-replaced");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let seen = case.base.with_file_name("seen");
+        let script = format!(
+            "printf %s \"$TMPDIR\" > '{}'; rm -rf \"$TMPDIR\"; mkdir \"$TMPDIR\"; echo theirs > \"$TMPDIR/theirs.txt\"",
+            seen.display()
+        );
+        let (status, said) = whole_run(&case.commanded(&commit, &["/bin/sh", "-c", &script]));
+        let tmpdir = tmpdir_seen(&seen);
+        let folder = Path::new(tmpdir.trim_end_matches('/')).to_owned();
+        let survived = fs::read_to_string(folder.join("theirs.txt"));
+        fs::remove_dir_all(&folder).expect("the case removes the folder left");
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(survived.expect("the other folder survived"), "theirs\n");
+        let line = format!("gate: remote did not remove {}: it is no longer the run's temp folder", folder.display());
+        assert!(said.contains(&(Stream::Err, line)), "{said:?}");
+    }
+
+    #[test]
+    fn a_link_planted_in_the_run_s_tmp_folder_is_removed_and_what_it_names_is_left() {
+        let case = Case::new("tmp-links");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let outside = case.base.with_file_name("outside");
+        fs::create_dir_all(&outside).expect("the outside folder is made");
+        let kept = outside.join("kept.txt");
+        fs::write(&kept, "kept").expect("the outside file is written");
+        let seen = case.base.with_file_name("seen");
+        let script = format!(
+            "printf %s \"$TMPDIR\" > '{seen}'; ln -s '{kept}' \"$TMPDIR/file-link\"; ln -s '{outside}' \"$TMPDIR/folder-link\"; \
+             mkdir \"$TMPDIR/sub\"; ln -s '{outside}' \"$TMPDIR/sub/deep-link\"; echo own > \"$TMPDIR/sub/own.txt\"",
+            seen = seen.display(),
+            kept = kept.display(),
+            outside = outside.display()
+        );
+        let (status, said) = whole_run(&case.commanded(&commit, &["/bin/sh", "-c", &script]));
+        assert_eq!(status, 0, "{said:?}");
+        let tmpdir = tmpdir_seen(&seen);
+        assert!(!Path::new(&tmpdir).exists(), "the folder is gone: {tmpdir}");
+        assert_eq!(fs::read_to_string(&kept).expect("the outside file is there"), "kept");
+        assert_eq!(
+            fs::read_dir(&outside).expect("the outside folder is there").count(),
+            1,
+            "nothing outside was removed"
+        );
+    }
+
     fn stderr_of(output: &Output<RecordingSink>) -> Vec<String> {
         let lines = output.sink().lines();
         assert!(lines.iter().all(|(stream, _)| *stream == Stream::Err), "{lines:?}");
@@ -1345,7 +1676,8 @@ mod tests {
         let payload = decoded(&case.json(&commit, &json!({})));
         let output = Arc::new(Output::new(RecordingSink::default()));
 
-        let ready: Ready<'_> = prepare(&payload, &output, quiet_periods(), own_path).expect("the run is ready");
+        let mut ready: Ready<'_> = prepare(&payload, &output, quiet_periods(), own_path).expect("the run is ready");
+        tmp_cleared(&mut ready);
 
         assert_eq!(ready.place, PathBuf::from(case.work()));
         assert_eq!(case.head(), commit);
@@ -2164,7 +2496,13 @@ mod tests {
     fn ran_along_shim(json: &Value) -> (u8, Vec<String>) {
         let payload = decoded(json);
         let output = Arc::new(Output::new(RecordingSink::default()));
-        let status = prepare(&payload, &output, quiet_periods(), shim_login).map_or_else(|status| status, |_| 0);
+        let status = prepare(&payload, &output, quiet_periods(), shim_login).map_or_else(
+            |status| status,
+            |mut ready| {
+                tmp_cleared(&mut ready);
+                0
+            },
+        );
         (status, stderr_of(&output))
     }
 
@@ -2232,11 +2570,18 @@ mod tests {
     #[test]
     fn a_restore_that_fails_refuses_the_run_75_with_the_tools_tag() {
         let case = Case::new("tools-fails");
-        let log = case.dotnet_shim("exit 3");
+        let seen = case.base.with_file_name("restore-tmpdir");
+        let log = case.dotnet_shim(&format!("printf %s \"$TMPDIR\" > '{}'\nexit 3", seen.display()));
         let commit = case.snapshot(&[(MANIFEST_PATH, MANIFEST)]);
         let (status, said) = ran_along_shim(&case.json(&commit, &json!({})));
         assert_eq!(status, REFUSED_STATUS, "{said:?}");
         assert_eq!(restores(&log).len(), 1, "{said:?}");
+        let tmpdir = fs::read_to_string(&seen).expect("the restore wrote its TMPDIR");
+        assert!(
+            tmpdir.starts_with("/tmp/gate.") && tmpdir.ends_with('/'),
+            "the restore ran in the run's folder: {tmpdir}"
+        );
+        assert!(!Path::new(&tmpdir).exists(), "the refused run removed its folder: {tmpdir}");
         let failed = said.iter().position(|line| line == "gate: remote tool restore failed (status 3)");
         assert!(
             failed.is_some_and(|at| said[at + 1..] == [refused_line(NONCE, Refusal::Tools), tools_line(KEY)]),
