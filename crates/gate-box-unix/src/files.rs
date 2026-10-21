@@ -11,6 +11,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use crate::lines::{RootFacts, folder_failure, folder_flaw, job_record_text};
 
@@ -24,16 +25,59 @@ pub const RECORD_LIMIT: u64 = 64 * 1024;
 ///
 /// The open, the read, or `path` not being a plain file.
 pub fn read_plain(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    read_plain_dated(path, limit).map(|(bytes, _)| bytes)
+}
+
+/// [`read_plain`], and when the file was last written, looked at on the file read.
+///
+/// # Errors
+///
+/// As [`read_plain`].
+pub fn read_plain_dated(path: &Path, limit: u64) -> io::Result<(Vec<u8>, SystemTime)> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(io::Error::other(format!("{} is not a plain file", path.display())));
     }
     let mut bytes = Vec::new();
     file.take(limit).read_to_end(&mut bytes)?;
-    Ok(bytes)
+    Ok((bytes, metadata.modified()?))
+}
+
+/// Removes the file `path`; a missing one is fine.
+///
+/// # Errors
+///
+/// Why it could not be removed.
+pub fn remove_if_there(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// Syncs the folder `path` is in, so a name made or removed there is on the drive.
+///
+/// # Errors
+///
+/// The folder's open or sync.
+pub fn folder_synced(path: &Path) -> io::Result<()> {
+    synced(&folder_of(path)?)
+}
+
+/// The folder `path` is in, opened for its sync: a link at it never followed.
+fn folder_of(path: &Path) -> io::Result<File> {
+    let folder_path = match path.parent() {
+        Some(folder) if !folder.as_os_str().is_empty() => folder,
+        _ => Path::new("."),
+    };
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(folder_path)
 }
 
 /// How many temp files this process has made for [`replace_plain`], so two replaces at once never pick one name.
@@ -85,31 +129,9 @@ fn replace_numbered(path: &Path, bytes: &[u8], number: u64) -> Result<(), Replac
 
 /// Puts `bytes` at `path` through the temp file numbered `number` ([`replace_plain`]); the folder, open, for its sync.
 fn put_in_place(path: &Path, bytes: &[u8], number: u64) -> io::Result<File> {
-    let Some(name) = path.file_name() else {
-        return Err(io::Error::other(format!("{} names no file", path.display())));
-    };
-    let folder_path = match path.parent() {
-        Some(folder) if !folder.as_os_str().is_empty() => folder,
-        _ => Path::new("."),
-    };
     replaceable(path)?;
-    let folder = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(folder_path)?;
-    let temp = folder_path.join(temp_name(name, number));
-    let mut file = match new_temp(&temp) {
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            fs::remove_file(&temp).map_err(|left| {
-                io::Error::new(
-                    left.kind(),
-                    format!("the leftover temp file {} could not be removed: {left}", temp.display()),
-                )
-            })?;
-            new_temp(&temp)?
-        }
-        made => made?,
-    };
+    let folder = folder_of(path)?;
+    let (temp, mut file) = temp_beside(path, number)?;
     let replaced = file
         .write_all(bytes)
         .and_then(|()| synced(&file))
@@ -146,13 +168,36 @@ fn temp_name(name: &OsStr, number: u64) -> OsString {
     temp
 }
 
-/// Makes the temp file `temp` of [`replace_plain`]: new, mode 0600, a link at it never followed.
+/// Makes the temp file numbered `number` beside `path` ([`temp_name`]), [`new_temp`]; a leftover of that name, which
+/// only an ended process with this one's pid can have left, removed and the making tried once more. Its path and file.
+fn temp_beside(path: &Path, number: u64) -> io::Result<(PathBuf, File)> {
+    let Some(name) = path.file_name() else {
+        return Err(io::Error::other(format!("{} names no file", path.display())));
+    };
+    let temp = path.with_file_name(temp_name(name, number));
+    let file = match new_temp(&temp) {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            fs::remove_file(&temp).map_err(|left| {
+                io::Error::new(
+                    left.kind(),
+                    format!("the leftover temp file {} could not be removed: {left}", temp.display()),
+                )
+            })?;
+            new_temp(&temp)?
+        }
+        made => made?,
+    };
+    Ok((temp, file))
+}
+
+/// Makes the temp file `temp` of [`replace_plain`]: new, mode 0600, a link at it never followed, without waiting on a
+/// FIFO, and closed in every program the box starts.
 fn new_temp(temp: &Path) -> io::Result<File> {
     OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(temp)
 }
 
@@ -182,14 +227,25 @@ fn replaceable(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Writes the job record `path`, naming the job `job` and its process group `group` ([`job_record_text`]), whole
-/// and synced ([`replace_plain`]).
+/// The temp file beside the record `path` that a record written from a child before its exec goes through, renamed
+/// over `path` once written and synced: named and made as [`replace_plain`]'s are, so no two writes pick one name.
+/// Its path and the file, open for writing.
+///
+/// # Errors
+///
+/// `path` names no file, or the temp file could not be made.
+pub fn staged_temp(path: &Path) -> io::Result<(PathBuf, File)> {
+    temp_beside(path, REPLACES.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Writes the job record `path`, naming the job `job`, its process group `group` and the group's session `session`
+/// ([`job_record_text`]), whole and synced ([`replace_plain`]).
 ///
 /// # Errors
 ///
 /// Why the record could not be replaced, or its folder synced after.
-pub fn write_job_record(path: &Path, job: &str, group: i32) -> Result<(), ReplaceFailure> {
-    replace_plain(path, job_record_text(job, group).as_bytes())
+pub fn write_job_record(path: &Path, job: &str, group: i32, session: i32) -> Result<(), ReplaceFailure> {
+    replace_plain(path, job_record_text(job, group, session).as_bytes())
 }
 
 /// A work lock this box holds: an exclusive `flock` on its file, released when this is dropped and the file closed.
@@ -200,6 +256,12 @@ pub struct HeldLock {
 }
 
 impl HeldLock {
+    /// The lock's name.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Whether the lock's name still names the file this box locked, looked at as itself: false once it is removed or
     /// another file is put at it, when another box could lock that one.
     ///
@@ -213,6 +275,21 @@ impl HeldLock {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),
         }
+    }
+}
+
+/// The work lock `path`, taken for a test that needs one held.
+///
+/// # Panics
+///
+/// The lock is not held: the test fails.
+#[cfg(test)]
+#[expect(clippy::panic, reason = "a test whose lock cannot be taken must fail loudly")]
+#[must_use]
+pub fn held_for_test(path: &Path) -> HeldLock {
+    match take_lock(path) {
+        Ok(Locked::Held(held)) => held,
+        other => panic!("the lock {} is not held: {other:?}", path.display()),
     }
 }
 
@@ -362,7 +439,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{HeldLock, Locked, replace_numbered, replace_plain, take_lock, take_lock_between, temp_name, write_job_record};
-    use crate::lines::{JobRecord, job_record};
+    use crate::lines::{JobRecord, Recorded, job_record};
 
     /// How long a write may take before the case calls it hung: a hang guard, never reached by a write that works.
     const HANG_GUARD: Duration = Duration::from_secs(300);
@@ -544,10 +621,13 @@ mod tests {
     fn a_job_record_is_written_as_the_stop_reads_it() {
         let case = Case::new("job-record");
         let record = case.base.join("k.pgid");
-        write_job_record(&record, "gate-remote-k-0123456789ab", 4242).expect("the record is written");
-        write_job_record(&record, "gate-remote-k-ffffffffffff", 99).expect("the record is replaced");
+        write_job_record(&record, "gate-remote-k-0123456789ab", 4242, 7).expect("the record is written");
+        write_job_record(&record, "gate-remote-k-ffffffffffff", 99, 8).expect("the record is replaced");
         let bytes = fs::read(&record).expect("the record is read");
-        assert_eq!(job_record(&bytes, "gate-remote-k-ffffffffffff"), JobRecord::Group(99));
+        assert_eq!(
+            job_record(&bytes, "gate-remote-k-ffffffffffff"),
+            JobRecord::Group(Recorded { group: 99, session: Some(8) })
+        );
         assert_eq!(case.names(), ["k.pgid"]);
     }
 

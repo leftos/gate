@@ -27,7 +27,7 @@ pub fn status(read: bool) -> u8 {
 
 /// The boot time as seconds and microseconds after the Unix epoch, from `sysctl kern.boottime`; else why not.
 #[cfg(target_os = "macos")]
-fn boot_time() -> Result<(i64, i64), String> {
+pub(crate) fn boot_time() -> Result<(i64, i64), String> {
     let mut time = libc::timeval { tv_sec: 0, tv_usec: 0 };
     let mut size = std::mem::size_of::<libc::timeval>();
     // SAFETY: the name is a NUL-terminated C string, and the old value and its size point at a `timeval` and its size,
@@ -44,7 +44,7 @@ fn boot_time() -> Result<(i64, i64), String> {
 
 /// The boot time cannot be read on a Unix other than macOS.
 #[cfg(not(target_os = "macos"))]
-fn boot_time() -> Result<(i64, i64), String> {
+pub(crate) fn boot_time() -> Result<(i64, i64), String> {
     Err(format!("reading the boot time is not built for {}", std::env::consts::OS))
 }
 

@@ -1,20 +1,34 @@
 //! The box's process helpers: the bounded runner every program the box starts runs in (the tool probes, `dotnet
 //! --list-sdks`, the git steps and the login shell), and the login shell's `PATH` those programs are found along.
+//!
+//! The runner starts its program as the leader of a process group of its own, its pipes read by threads of their own
+//! ([`crate::forward`]), and watches the leader without reaping it (`waitid` with `WNOWAIT`), so the group's id stays
+//! the leader's while anything in it is signalled: once the leader exits, or its bound passes, or its client is gone,
+//! what is left of the group is ended, the group's record removed, and only then is the leader reaped and its readers
+//! drained. No signal is sent to the group after the reap.
 
-use std::ffi::OsString;
-use std::io::{self, Read};
+use std::ffi::{CString, OsString};
+use std::fs::File;
+use std::io;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::console::{Forwarding, Stream};
+use crate::files::{self, HeldLock};
+use crate::forward::{Readers, Take};
 
 /// The most bytes of a program's standard error kept: its tail.
 const STDERR_TAIL: usize = 64 * 1024;
 /// How often the runner looks whether its program has exited.
 const POLL: Duration = Duration::from_millis(10);
-/// How long the runner waits for its readers once the group is killed.
-const READER_GRACE: Duration = Duration::from_secs(1);
+/// How often the runner probes whether its client has gone ([`Forwarding::client_gone_probe`]).
+const PROBE: Duration = Duration::from_millis(100);
 
 /// The most bytes the login shell may write for its `PATH`.
 pub const LOGIN_PATH_CAP: usize = 64 * 1024;
@@ -30,8 +44,10 @@ pub struct Ran {
     pub status: ExitStatus,
     /// Its standard output, at most the cap given.
     pub stdout: Vec<u8>,
-    /// The end of its standard error.
+    /// The end of its standard error, empty when it was forwarded.
     pub stderr: Vec<u8>,
+    /// Whether a process it left, out of its group's reach, still held its output open once the drain gave up on it.
+    pub leftover: bool,
 }
 
 /// Why a program did not run to an exit the runner could read.
@@ -39,283 +55,644 @@ pub struct Ran {
 pub enum NotRan {
     /// It could not be started.
     Start(io::Error),
-    /// It was still running, or its output still open, at the deadline; its process group was killed.
+    /// It was still running at the deadline; its process group was ended.
     TimedOut {
-        /// The process group that was killed.
+        /// The process group that was ended.
         group: i32,
     },
     /// It wrote more than the cap to its standard output.
     OverCap,
-    /// Its exit or its output could not be read.
+    /// Its exit or its output could not be read, or its group record not written or removed.
     Failed(String),
 }
 
-/// The most bytes of one line of standard error the runner hands on ([`Stderr::Lines`]): the rest of a longer line is
-/// dropped.
-pub const LINE_CAP: usize = 64 * 1024;
-
-/// How the runner ends a program's process group: at once, or asked first.
+/// How the runner ends what is left of a program's process group: at once, or asked first.
 #[derive(Clone, Copy, Debug)]
 pub enum Ending {
     /// `SIGKILL` at once.
     Kill,
-    /// `SIGTERM`, then `SIGKILL` once this grace has passed or the program has exited, whichever comes first.
+    /// `SIGTERM`, then `SIGKILL` once this grace has passed with anything of the group still running.
     TermThenKill(Duration),
 }
 
-/// What takes each line of a program's standard error ([`Stderr::Lines`]): `false` once no more are wanted.
-pub type TakeLine<'a> = &'a mut dyn FnMut(&[u8]) -> bool;
+/// The job record a program's process group is written to as the program starts, so `box stop` finds it: the job's
+/// name, the group, then the group's session in decimal ([`crate::lines::job_record`]). It is written and removed only while the run's work
+/// lock is held.
+#[derive(Debug)]
+pub struct GroupRecord<'a> {
+    path: PathBuf,
+    job: String,
+    lock: &'a HeldLock,
+}
 
-/// What the runner does with the program's standard error.
-pub enum Stderr<'a> {
-    /// Keeps its last bytes in [`Ran::stderr`].
-    Tail,
-    /// Hands each line, without its end, to `take` on the calling thread as it comes: a line feed, a carriage return
-    /// and the two together each end a line, as the Windows box cuts them, and a line keeps at most [`LINE_CAP`] bytes.
-    /// [`Ran::stderr`] stays empty. Once `take` answers `false` it is handed no more lines, and the program's group is
-    /// ended as the run's [`Ending`] says when `end` is set.
-    Lines {
-        /// Takes one line; `false` once no more are wanted.
-        take: TakeLine<'a>,
-        /// Whether a `false` from `take` ends the program.
-        end: bool,
-    },
+impl<'a> GroupRecord<'a> {
+    /// The record `path` naming the job `job`, changed only while `lock` is held.
+    #[must_use]
+    pub fn new(path: PathBuf, job: &str, lock: &'a HeldLock) -> GroupRecord<'a> {
+        GroupRecord {
+            path,
+            job: job.to_owned(),
+            lock,
+        }
+    }
+
+    /// Why the record may not be changed now: the work lock no longer held ([`HeldLock::still_held`]), or not looked
+    /// at; `None` while it is held.
+    fn lock_lost(&self) -> Option<String> {
+        let shown = self.lock.path().display();
+        match self.lock.still_held() {
+            Ok(true) => None,
+            Ok(false) => Some(format!("the work folder lock {shown} is no longer held")),
+            Err(error) => Some(format!("the work folder lock {shown} could not be looked at: {error}")),
+        }
+    }
+
+    /// Removes the record, a missing one fine, and syncs its folder, while the work lock is held; else why not, the
+    /// record left as it is when the lock is lost.
+    fn removed(&self) -> Result<(), String> {
+        if let Some(why) = self.lock_lost() {
+            return Err(why);
+        }
+        files::remove_if_there(&self.path)
+            .and_then(|()| files::folder_synced(&self.path))
+            .map_err(|error| format!("its group record could not be removed: {error}"))
+    }
+}
+
+/// How the runner watches one program.
+pub struct Watch<'a> {
+    /// The most bytes of standard output kept; more is [`NotRan::OverCap`].
+    pub cap: usize,
+    /// When the program's group is ended and the run is [`NotRan::TimedOut`].
+    pub deadline: Instant,
+    /// How the group is ended, at the deadline, for a client gone, or for what the leader left once it exited.
+    pub ending: Ending,
+    /// The box's output: standard error's lines are said through it when `forward` is set, and its client watched
+    /// when `ends_on_gone` is.
+    pub output: Option<Arc<dyn Forwarding>>,
+    /// Whether standard error's lines are said through `output`, as standard error; else its tail is kept.
+    pub forward: bool,
+    /// Whether a client gone ends the group: looked at every [`POLL`], and probed every [`PROBE`].
+    pub ends_on_gone: bool,
+    /// The record the group is written to from the child before its program runs, and removed before the reap.
+    pub record: Option<&'a GroupRecord<'a>>,
 }
 
 /// Runs `command` in a process group of its own, standard input null, its standard output kept up to `cap` bytes and
-/// the end of its standard error, until `deadline`: past it the whole group is killed (`SIGKILL`) and the program
-/// reaped. Output a descendant still holds open once the program has exited is waited for until the deadline too.
+/// the end of its standard error, until `deadline`: past it the whole group is killed (`SIGKILL`). What the program
+/// left in its group once it exited is killed too, before the program is reaped.
 ///
 /// # Errors
 ///
 /// [`NotRan`]: it could not start, it ran past the deadline, it wrote more than `cap`, or its exit could not be read.
 pub fn run_bounded(command: Command, cap: usize, deadline: Instant) -> Result<Ran, NotRan> {
-    run_watched(command, cap, deadline, Stderr::Tail, Ending::Kill)
+    run_watched(
+        command,
+        &Watch {
+            cap,
+            deadline,
+            ending: Ending::Kill,
+            output: None,
+            forward: false,
+            ends_on_gone: false,
+            record: None,
+        },
+    )
 }
 
-/// [`run_bounded`], its standard error handled as `stderr` says, and its group ended as `ending` says at the deadline
-/// or when `stderr`'s lines ask for it.
+/// Runs `command` as `watch` says: started as the leader of a process group of its own, standard input null, its
+/// group written to `watch.record` from the child before the program runs; watched until the leader exits, the
+/// deadline passes, or (`ends_on_gone`) the client is gone. Then what is left of the group is ended as `watch.ending`
+/// says while the leader is still unreaped, the record removed, the leader reaped, and the readers drained
+/// ([`Readers::drain`]). A program that exited keeps its status, whatever its leftovers did. A group still there after
+/// `SIGKILL`, or a leader whose exit could not be read, is not reaped: its readers are stopped and its record kept, so
+/// the next run refuses `busy`, unless the leader is no child of the box's and its group has no process left
+/// ([`settled`]).
 ///
 /// # Errors
 ///
-/// [`NotRan`], as [`run_bounded`] gives it.
-pub fn run_watched(mut command: Command, cap: usize, deadline: Instant, stderr: Stderr<'_>, ending: Ending) -> Result<Ran, NotRan> {
+/// [`NotRan`], as [`run_bounded`] gives it, or a group record that could not be written or removed.
+pub fn run_watched(command: Command, watch: &Watch<'_>) -> Result<Ran, NotRan> {
+    let mut child = spawned_recorded(command, watch)?;
+    let Ok(group) = i32::try_from(child.id()) else {
+        // A pid that is no pid_t cannot be signalled as a group; the child alone is ended.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(NotRan::Failed(format!("the process id {} is no pid_t", child.id())));
+    };
+    let mut readers = Readers::default();
+    let started = readers_started(&mut readers, &mut child, watch);
+    let leader = Leader { child, group };
+    let why = match started {
+        Ok(()) => watched(&leader, watch),
+        Err(error) => Why::Failed(format!("its output could not be read: {error}")),
+    };
+    match settled(&leader, &why, watch.ending, KILL_WAIT) {
+        Settled::Ended => {}
+        Settled::StillThere => {
+            // Neither reaped nor unrecorded: the group still exists, so the next run's busy refusal is right.
+            readers.stop();
+            let wait = KILL_WAIT.as_secs();
+            return Err(NotRan::Failed(format!(
+                "its process group {group} was still there {wait} s after SIGKILL"
+            )));
+        }
+        Settled::Unread { error, keep } => {
+            // Not reaped: the leader's exit was not seen, so its group may still be there.
+            readers.stop();
+            let unrecorded = if keep {
+                Ok(())
+            } else {
+                watch.record.map_or(Ok(()), GroupRecord::removed)
+            };
+            let why = format!("its exit could not be read: {error}");
+            return Err(NotRan::Failed(match unrecorded {
+                Ok(()) => why,
+                Err(lost) => format!("{why}; {lost}"),
+            }));
+        }
+    }
+    let unrecorded = watch.record.map_or(Ok(()), GroupRecord::removed);
+    let status = leader.reap();
+    let drained = readers.drain();
+    let ended = Ended { why, unrecorded, status };
+    let status = ended.status(group)?;
+    let mut kept = drained.kept.into_iter();
+    let unread = |error: io::Error| NotRan::Failed(format!("its output could not be read: {error}"));
+    let (stdout, over) = kept.next().unwrap_or(Ok((Vec::new(), false))).map_err(unread)?;
+    let (stderr, _) = kept.next().unwrap_or(Ok((Vec::new(), false))).map_err(unread)?;
+    if over {
+        return Err(NotRan::OverCap);
+    }
+    Ok(Ran {
+        status,
+        stdout,
+        stderr,
+        leftover: !drained.all_ended && !drained.stalled,
+    })
+}
+
+/// Starts `command` as the leader of a process group of its own, standard input null, its output piped, its group
+/// written to `watch.record` from the child before the program runs, the work lock checked first.
+///
+/// # Errors
+///
+/// The work lock no longer held, the record's temp file not made, or the start failing ([`NotRan::Start`]), the
+/// record and its temp file then removed.
+fn spawned_recorded(mut command: Command, watch: &Watch<'_>) -> Result<Child, NotRan> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    let mut child = spawned(&mut command).map_err(NotRan::Start)?;
-    let group = i32::try_from(child.id()).map_err(|error| NotRan::Failed(format!("the process id is no pid_t: {error}")))?;
-    let (sender, receiver) = mpsc::channel();
-    let split = matches!(stderr, Stderr::Lines { .. });
-    let mut watch = Watch::new(group, (deadline, ending), stderr, receiver);
+    if let Some(why) = watch.record.and_then(GroupRecord::lock_lost) {
+        return Err(NotRan::Failed(why));
+    }
+    let staged = watch
+        .record
+        .map(Staged::new)
+        .transpose()
+        .map_err(|error| NotRan::Failed(format!("its group record could not be readied: {error}")))?;
+    if let Some(staged) = &staged {
+        let child_side = staged.child_side();
+        // SAFETY: the closure runs in the child between fork and exec, and calls only `getpid`, `getsid`, `write`,
+        // `fsync` and `rename` on a descriptor and names made before the fork; it allocates nothing and takes no lock.
+        unsafe {
+            command.pre_exec(move || child_side.write());
+        }
+    }
+    spawned(&mut command).map_err(|error| {
+        if let Some(staged) = &staged {
+            staged.abandon();
+        }
+        NotRan::Start(error)
+    })
+}
+
+/// Starts the readers of `child`'s standard output, kept up to the cap, and of its standard error, forwarded or its
+/// tail kept as `watch` says; output first, so the drain gives it first.
+fn readers_started(readers: &mut Readers, child: &mut Child, watch: &Watch<'_>) -> io::Result<()> {
     match child.stdout.take() {
-        Some(pipe) => {
-            let sender = sender.clone();
-            thread::spawn(move || sender.send(Event::Out(capped(pipe, cap))));
-        }
-        None => watch.stdout = Some(Ok((Vec::new(), false))),
+        Some(pipe) => readers.read(pipe, Take::Capped(watch.cap))?,
+        None => readers.read(io::empty(), Take::Capped(watch.cap))?,
     }
+    let take = match (&watch.output, watch.forward) {
+        (Some(output), true) => Take::Lines(Arc::clone(output), Stream::Err),
+        _ => Take::Tail(STDERR_TAIL),
+    };
     match child.stderr.take() {
-        Some(pipe) => {
-            thread::spawn(move || stderr_read(pipe, split, &sender));
-        }
-        None => watch.stderr = Some(Ok(Vec::new())),
+        Some(pipe) => readers.read(pipe, take),
+        None => readers.read(io::empty(), take),
     }
-    let status = watch.exited(&mut child)?;
-    watch.drained()?;
-    watch.ran(status)
 }
 
-/// What a reader thread read: all of one stream, or one line of standard error.
-enum Event {
-    Out(io::Result<(Vec<u8>, bool)>),
-    Err(io::Result<Vec<u8>>),
-    Line(Vec<u8>),
+/// Why the runner stopped watching the leader.
+enum Why {
+    /// The leader exited.
+    Exited,
+    /// The deadline passed.
+    Deadline,
+    /// The client is gone.
+    Gone,
+    /// The leader's exit could not be read: this.
+    Unread(io::Error),
+    /// Its readers could not be started: this.
+    Failed(String),
 }
 
-/// The runner's watch of one program: its deadline and ending, what it does with each line of standard error, and
-/// what its readers gave.
-struct Watch<'a> {
+/// How a run whose group was ended ended, step by step.
+struct Ended {
+    why: Why,
+    unrecorded: Result<(), String>,
+    status: io::Result<ExitStatus>,
+}
+
+impl Ended {
+    /// The leader's status, or why the run gives none: the first step that failed, or the deadline of the group
+    /// `group`.
+    fn status(self, group: i32) -> Result<ExitStatus, NotRan> {
+        match self.why {
+            Why::Failed(why) => return Err(NotRan::Failed(why)),
+            Why::Unread(error) => return Err(NotRan::Failed(format!("its exit could not be read: {error}"))),
+            Why::Exited | Why::Deadline | Why::Gone => {}
+        }
+        let status = self
+            .status
+            .map_err(|error| NotRan::Failed(format!("its exit could not be read: {error}")))?;
+        if matches!(self.why, Why::Deadline) {
+            return Err(NotRan::TimedOut { group });
+        }
+        self.unrecorded.map_err(NotRan::Failed)?;
+        Ok(status)
+    }
+}
+
+/// Watches `leader` every [`POLL`] until it exits, the deadline passes or, when `watch` asks, the client is gone.
+/// Takes no output lock and writes nothing.
+fn watched(leader: &Leader, watch: &Watch<'_>) -> Why {
+    let gone_watch = watch.output.as_ref().filter(|_| watch.ends_on_gone);
+    let mut probed: Option<Instant> = None;
+    loop {
+        match leader.exited() {
+            Ok(true) => return Why::Exited,
+            Ok(false) => {}
+            Err(error) => return Why::Unread(error),
+        }
+        if Instant::now() >= watch.deadline {
+            return Why::Deadline;
+        }
+        if let Some(output) = gone_watch
+            && client_gone(output.as_ref(), &mut probed)
+        {
+            return Why::Gone;
+        }
+        thread::sleep(POLL);
+    }
+}
+
+/// Whether `output`'s client is gone: a write found it, or a probe, run when [`PROBE`] has passed since `probed`.
+fn client_gone(output: &dyn Forwarding, probed: &mut Option<Instant>) -> bool {
+    if output.client_gone() {
+        return true;
+    }
+    if probed.is_none_or(|at| at.elapsed() >= PROBE) {
+        *probed = Some(Instant::now());
+        return output.client_gone_probe();
+    }
+    false
+}
+
+/// How long the runner waits for the leader to exit once its group was sent `SIGKILL`.
+const KILL_WAIT: Duration = Duration::from_secs(10);
+
+/// How the ending of a group went.
+#[derive(Debug, PartialEq, Eq)]
+enum GroupEnd {
+    /// The leader has exited, unreaped, and the group is ended.
+    Ended,
+    /// The leader had not exited when the wait after `SIGKILL` passed: the group is still there.
+    StillThere,
+}
+
+/// A program's process group as the runner ends it, its leader unreaped.
+trait Group {
+    /// Whether the leader has exited, without reaping it.
+    ///
+    /// # Errors
+    ///
+    /// Why its exit could not be read.
+    fn exited(&self) -> io::Result<bool>;
+
+    /// Whether a process other than the leader is in the group, the group's processes listed into `pids`; a group
+    /// that cannot be listed counts as one with a process left.
+    fn others_left(&self, pids: &mut Vec<i32>) -> bool;
+
+    /// Sends `signal` to every process of the group.
+    fn signal(&self, signal: i32);
+}
+
+/// How the end of a watched group went, its leader not yet reaped.
+#[derive(Debug)]
+enum Settled {
+    /// The leader has exited and the group is ended: the record goes, the leader is reaped and the readers drained.
+    Ended,
+    /// The leader had not exited when the wait after `SIGKILL` passed: the record stays, the leader is not reaped.
+    StillThere,
+    /// The leader's exit could not be read, for `error`: the leader is not reaped and the readers are stopped; the
+    /// record stays when `keep`.
+    Unread {
+        /// Why the exit could not be read.
+        error: io::Error,
+        /// Whether the record stays: the group may still be there.
+        keep: bool,
+    },
+}
+
+/// Ends what is left of `group` once the runner stopped watching it for `why`: as `ending` says ([`end_group`]) for an
+/// exit, the deadline or a gone client; with `SIGKILL` and up to `kill_wait` for the leader's exit when the readers
+/// could not start; with `SIGKILL` alone ([`killed_unless_reaped`]) when the leader's exit could not be read. A look
+/// at the leader that fails leaves it unreaped ([`Settled::Unread`]).
+fn settled(group: &impl Group, why: &Why, ending: Ending, kill_wait: Duration) -> Settled {
+    let ended = match why {
+        Why::Unread(error) => {
+            killed_unless_reaped(group, error);
+            Err(copied(error))
+        }
+        Why::Failed(_) => {
+            group.signal(libc::SIGKILL);
+            exited_within(group, kill_wait)
+        }
+        Why::Exited | Why::Deadline | Why::Gone => end_group(group, ending, kill_wait),
+    };
+    match ended {
+        Ok(GroupEnd::Ended) => Settled::Ended,
+        Ok(GroupEnd::StillThere) => Settled::StillThere,
+        Err(error) => unread(group, error),
+    }
+}
+
+/// The look at `group`'s leader failed with `error`: its record is kept unless the failure was `ECHILD`, the leader
+/// no child of the box's to look at, and no process is left in the group.
+fn unread(group: &impl Group, error: io::Error) -> Settled {
+    let keep = error.raw_os_error() != Some(libc::ECHILD) || {
+        let mut pids = Vec::new();
+        group.others_left(&mut pids) || !pids.is_empty()
+    };
+    Settled::Unread { error, keep }
+}
+
+/// `error` again: its OS error, or its kind and text.
+fn copied(error: &io::Error) -> io::Error {
+    error
+        .raw_os_error()
+        .map_or_else(|| io::Error::new(error.kind(), error.to_string()), io::Error::from_raw_os_error)
+}
+
+/// Ends what is left of `group` as `ending` says, the leader not reaped: nothing when the leader has exited and no
+/// other process is in the group; else `SIGTERM` and the grace for the group to empty, when asked first, then
+/// `SIGKILL` and up to `kill_wait` for the leader's exit ([`GroupEnd::StillThere`] past it). A look at the leader that
+/// fails sends `SIGKILL` before the failure is given, as the leader is unreaped and the group still the runner's,
+/// unless it failed with `ECHILD`, the leader no child of the box's to look at.
+///
+/// # Errors
+///
+/// The leader's exit could not be read.
+fn end_group(group: &impl Group, ending: Ending, kill_wait: Duration) -> io::Result<GroupEnd> {
+    let mut pids = Vec::new();
+    if quiet_or_killed(group, &mut pids)? {
+        return Ok(GroupEnd::Ended);
+    }
+    if let Ending::TermThenKill(grace) = ending {
+        group.signal(libc::SIGTERM);
+        let until = Instant::now() + grace;
+        while Instant::now() < until {
+            if quiet_or_killed(group, &mut pids)? {
+                return Ok(GroupEnd::Ended);
+            }
+            thread::sleep(POLL);
+        }
+    }
+    group.signal(libc::SIGKILL);
+    exited_within(group, kill_wait)
+}
+
+/// Whether `group`'s leader has exited and no other process is left in it; a look that fails is given after `SIGKILL`
+/// is sent ([`killed_unless_reaped`]).
+fn quiet_or_killed(group: &impl Group, pids: &mut Vec<i32>) -> io::Result<bool> {
+    match group.exited() {
+        Ok(exited) => Ok(exited && !group.others_left(pids)),
+        Err(error) => {
+            killed_unless_reaped(group, &error);
+            Err(error)
+        }
+    }
+}
+
+/// Sends `group` `SIGKILL` after the look at its leader failed with `error`, unless with `ECHILD`: then the leader is
+/// no child of the box's to look at, and its id may be another's.
+fn killed_unless_reaped(group: &impl Group, error: &io::Error) {
+    if error.raw_os_error() != Some(libc::ECHILD) {
+        group.signal(libc::SIGKILL);
+    }
+}
+
+/// Waits up to `wait` for `group`'s leader to exit, looking every [`POLL`].
+///
+/// # Errors
+///
+/// The leader's exit could not be read.
+fn exited_within(group: &impl Group, wait: Duration) -> io::Result<GroupEnd> {
+    let until = Instant::now() + wait;
+    loop {
+        if group.exited()? {
+            return Ok(GroupEnd::Ended);
+        }
+        if Instant::now() >= until {
+            return Ok(GroupEnd::StillThere);
+        }
+        thread::sleep(POLL);
+    }
+}
+
+/// Removes the group record `path`, a missing one fine, best effort, after a spawn that failed.
+fn abandoned(path: &Path) {
+    // Best effort: the start's own failure is the one said, and the next run removes a record naming no process.
+    let _ = files::remove_if_there(path);
+}
+
+/// The leader of a program's process group, its group's id its own pid, until it is reaped: a group is signalled only
+/// through this, so never once its id may be another's.
+struct Leader {
+    child: Child,
     group: i32,
-    deadline: Instant,
-    ending: Ending,
-    take: Option<TakeLine<'a>>,
-    end_on_stop: bool,
-    /// Set when a line's `take` answered `false` and the group is to be ended.
-    stop_asked: bool,
-    receiver: mpsc::Receiver<Event>,
-    stdout: Option<io::Result<(Vec<u8>, bool)>>,
-    stderr: Option<io::Result<Vec<u8>>>,
 }
 
-impl<'a> Watch<'a> {
-    fn new(group: i32, (deadline, ending): (Instant, Ending), stderr: Stderr<'a>, receiver: mpsc::Receiver<Event>) -> Watch<'a> {
-        let (take, end_on_stop) = match stderr {
-            Stderr::Tail => (None, false),
-            Stderr::Lines { take, end } => (Some(take), end),
-        };
-        Watch {
-            group,
-            deadline,
-            ending,
-            take,
-            end_on_stop,
-            stop_asked: false,
-            receiver,
-            stdout: None,
-            stderr: None,
+impl Leader {
+    /// Reaps the leader: its status. The group is never signalled again.
+    fn reap(mut self) -> io::Result<ExitStatus> {
+        self.child.wait()
+    }
+}
+
+impl Group for Leader {
+    fn exited(&self) -> io::Result<bool> {
+        exit_seen(self.group)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn others_left(&self, pids: &mut Vec<i32>) -> bool {
+        crate::stop::group_pids_into(self.group, pids).map_or(true, |()| pids.iter().any(|pid| *pid != self.group))
+    }
+
+    /// A process group is listed only on macOS: elsewhere what is left counts as left, so it is asked and then killed.
+    #[cfg(not(target_os = "macos"))]
+    fn others_left(&self, _pids: &mut Vec<i32>) -> bool {
+        true
+    }
+
+    /// A group already gone is no failure.
+    fn signal(&self, signal: i32) {
+        #[cfg(test)]
+        signal_log::note(self.group, signal);
+        // SAFETY: `killpg` takes two integers and touches no memory; the group's leader is unreaped, so its id is the
+        // group this runner made.
+        unsafe {
+            libc::killpg(self.group, signal);
+        }
+    }
+}
+
+/// Whether the child `pid` has exited, looked at with `waitid(P_PID, WEXITED | WNOWAIT | WNOHANG)`, which answers at
+/// once and leaves it unreaped.
+fn exit_seen(pid: i32) -> io::Result<bool> {
+    let id = libc::id_t::try_from(pid).map_err(io::Error::other)?;
+    loop {
+        // SAFETY: an all-zero `siginfo_t` is a valid value, which `waitid` fills when a child has changed state.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` lives across the call, which writes only into it.
+        let waited = unsafe { libc::waitid(libc::P_PID, id, &raw mut info, libc::WEXITED | libc::WNOWAIT | libc::WNOHANG) };
+        if waited == 0 {
+            // SAFETY: `waitid` succeeded, so `info` holds a child's state, or zeros when none had changed.
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// A group record readied before the fork: its temp file open, and the names and text the child writes.
+struct Staged {
+    file: File,
+    temp: PathBuf,
+    path: PathBuf,
+    job: Vec<u8>,
+}
+
+impl Staged {
+    /// Makes the temp file of `record` beside it ([`files::staged_temp`]), `O_CLOEXEC`, so only the child that writes
+    /// it before its exec has it.
+    fn new(record: &GroupRecord<'_>) -> io::Result<Staged> {
+        let (temp, file) = files::staged_temp(&record.path)?;
+        Ok(Staged {
+            file,
+            temp,
+            path: record.path.clone(),
+            job: format!("{}\n", record.job).into_bytes(),
+        })
+    }
+
+    /// What the child needs to write the record: owned, so the child allocates nothing.
+    fn child_side(&self) -> ChildSide {
+        ChildSide {
+            fd: self.file.as_raw_fd(),
+            job: self.job.clone(),
+            temp: c_path(&self.temp),
+            path: c_path(&self.path),
         }
     }
 
-    /// Takes what a reader sent.
-    fn handle(&mut self, event: Event) {
-        match event {
-            Event::Out(read) => self.stdout = Some(read),
-            Event::Err(read) => self.stderr = Some(read),
-            Event::Line(line) => {
-                if let Some(take) = self.take.as_mut()
-                    && !take(&line)
-                {
-                    self.take = None;
-                    self.stop_asked = self.end_on_stop;
-                }
-            }
+    /// Removes what a spawn that failed may have left: the temp file, and the record when the child renamed it into
+    /// place before its exec failed; a missing one is fine.
+    fn abandon(&self) {
+        for path in [&self.temp, &self.path] {
+            abandoned(path);
         }
     }
+}
 
-    /// Takes the next thing a reader sends within `wait`; else waits that long.
-    fn next_event(&mut self, wait: Duration) {
-        match self.receiver.recv_timeout(wait) {
-            Ok(event) => self.handle(event),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => thread::sleep(wait),
+/// `path` as a C string; a path holding a NUL, which no file has, is the empty name, which every call refuses.
+fn c_path(path: &Path) -> CString {
+    CString::new(path.as_os_str().as_bytes()).unwrap_or_default()
+}
+
+/// The child's side of a [`Staged`] record.
+struct ChildSide {
+    fd: RawFd,
+    job: Vec<u8>,
+    temp: CString,
+    path: CString,
+}
+
+impl ChildSide {
+    /// Writes the job's name, the child's pid, its group, and its session to the temp file, syncs it and renames it
+    /// over the record: async-signal-safe calls only, on what was made before the fork.
+    fn write(&self) -> io::Result<()> {
+        // SAFETY: `getpid` takes nothing and always succeeds.
+        let pid = unsafe { libc::getpid() };
+        // SAFETY: `getsid(0)` asks for the caller's own session, touches no memory and fails only for another pid.
+        let session = unsafe { libc::getsid(0) };
+        if session < 0 {
+            return Err(io::Error::last_os_error());
         }
-    }
-
-    /// Waits for `child`, the leader of the group, to exit, taking what the readers send meanwhile; at the deadline
-    /// ends the group and reaps it.
-    fn exited(&mut self, child: &mut Child) -> Result<ExitStatus, NotRan> {
-        loop {
-            if std::mem::take(&mut self.stop_asked) {
-                end_group(child, self.group, self.ending);
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => return Ok(status),
-                Ok(None) if Instant::now() >= self.deadline => {
-                    end_group(child, self.group, self.ending);
-                    return match child.wait() {
-                        Ok(_) => Err(NotRan::TimedOut { group: self.group }),
-                        Err(error) => Err(NotRan::Failed(format!("it could not be reaped after its kill: {error}"))),
-                    };
-                }
-                Ok(None) => self.next_event(POLL),
-                Err(error) => {
-                    kill_group(self.group);
-                    // Reaped if it can be; the wait's own failure is the one said.
-                    let _ = child.wait();
-                    return Err(NotRan::Failed(format!("its exit could not be read: {error}")));
-                }
-            }
+        let mut digits = [0_u8; 12];
+        written_all(self.fd, &self.job)?;
+        written_all(self.fd, decimal(pid, &mut digits))?;
+        written_all(self.fd, b"\n")?;
+        written_all(self.fd, decimal(session, &mut digits))?;
+        written_all(self.fd, b"\n")?;
+        // SAFETY: `fsync` takes a descriptor, the temp file's, open in this child until its exec.
+        if unsafe { libc::fsync(self.fd) } != 0 {
+            return Err(io::Error::last_os_error());
         }
-    }
-
-    /// Waits until both readers have ended, until the deadline: past it the group is killed, so its holders let the
-    /// pipes go, and a reader still held after [`READER_GRACE`] is left behind.
-    fn drained(&mut self) -> Result<(), NotRan> {
-        while self.stdout.is_none() || self.stderr.is_none() {
-            if std::mem::take(&mut self.stop_asked) {
-                kill_group(self.group);
-            }
-            if Instant::now() >= self.deadline {
-                kill_group(self.group);
-                let grace = Instant::now() + READER_GRACE;
-                while (self.stdout.is_none() || self.stderr.is_none()) && Instant::now() < grace {
-                    self.next_event(POLL);
-                }
-                return Err(NotRan::TimedOut { group: self.group });
-            }
-            self.next_event(POLL);
+        // SAFETY: both names are NUL-terminated strings that live across the call, which only reads them.
+        if unsafe { libc::rename(self.temp.as_ptr(), self.path.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
         }
         Ok(())
     }
-
-    /// What the program gave once it exited with `status` and its readers ended.
-    fn ran(self, status: ExitStatus) -> Result<Ran, NotRan> {
-        let unread = |error: io::Error| NotRan::Failed(format!("its output could not be read: {error}"));
-        let (stdout, over) = self.stdout.unwrap_or(Ok((Vec::new(), false))).map_err(unread)?;
-        let stderr = self.stderr.unwrap_or(Ok(Vec::new())).map_err(unread)?;
-        if over {
-            return Err(NotRan::OverCap);
-        }
-        Ok(Ran { status, stdout, stderr })
-    }
 }
 
-/// Reads the standard error `pipe` to its end and sends what it read: each line ([`Stderr::Lines`]) when `split`,
-/// then the end of the stream, its tail when not `split`.
-fn stderr_read(mut pipe: ChildStderr, split: bool, sender: &mpsc::Sender<Event>) {
-    let read = if split {
-        lines_sent(&mut pipe, sender).map(|()| Vec::new())
-    } else {
-        tail(pipe)
-    };
-    // A runner that stopped receiving has stopped waiting for this reader.
-    let _ = sender.send(Event::Err(read));
-}
-
-/// Sends each line of `pipe` as it ends ([`LineSplitter`]), and the bytes after the last end.
-fn lines_sent(pipe: &mut ChildStderr, sender: &mpsc::Sender<Event>) -> io::Result<()> {
-    let mut splitter = LineSplitter::default();
-    let mut chunk = [0_u8; 8192];
-    let send = |line: &[u8]| {
-        // A runner that stopped receiving has stopped waiting for this reader.
-        let _ = sender.send(Event::Line(line.to_vec()));
-    };
+/// `value`, not negative, in decimal, written into the end of `buffer` without allocating: the digits.
+fn decimal(value: i32, buffer: &mut [u8; 12]) -> &[u8] {
+    let mut left = value.unsigned_abs();
+    let mut at = buffer.len();
     loop {
-        let read = pipe.read(&mut chunk)?;
-        if read == 0 {
-            splitter.finish(send);
-            return Ok(());
+        at -= 1;
+        buffer[at] = b"0123456789"[(left % 10) as usize];
+        left /= 10;
+        if left == 0 {
+            return &buffer[at..];
         }
-        splitter.feed(&chunk[..read], send);
     }
 }
 
-/// Cuts bytes into lines as the Windows box's forwarder does (.NET's `ReadLine`): CR LF, LF and a lone CR each end a
-/// line, and the bytes after the last end are a line of their own when there are any. A line keeps its first
-/// [`LINE_CAP`] bytes, the rest dropped.
-#[derive(Default)]
-struct LineSplitter {
-    line: Vec<u8>,
-    after_cr: bool,
-}
-
-impl LineSplitter {
-    /// Takes `bytes`, giving `emit` each line they end, without its end.
-    fn feed(&mut self, bytes: &[u8], mut emit: impl FnMut(&[u8])) {
-        for &byte in bytes {
-            let after_cr = std::mem::take(&mut self.after_cr);
-            match byte {
-                b'\n' if after_cr => {}
-                b'\n' | b'\r' => {
-                    emit(&self.line);
-                    self.line.clear();
-                    self.after_cr = byte == b'\r';
-                }
-                _ if self.line.len() < LINE_CAP => self.line.push(byte),
-                _ => {}
+/// Writes all of `bytes` to `fd` with `write`, retrying an interrupted one.
+fn written_all(fd: RawFd, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        // SAFETY: `bytes` lives across the call, which reads at most its length.
+        let wrote = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if let Ok(wrote) = usize::try_from(wrote) {
+            bytes = &bytes[wrote..];
+        } else {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
             }
         }
     }
-
-    /// Gives `emit` the bytes after the last line end, when there are any.
-    fn finish(self, mut emit: impl FnMut(&[u8])) {
-        if !self.line.is_empty() {
-            emit(&self.line);
-        }
-    }
+    Ok(())
 }
 
 /// Starts `command`. Every program the box starts goes through the bounded runner, which owns its process group.
@@ -327,62 +704,47 @@ fn spawned(command: &mut Command) -> io::Result<Child> {
     command.spawn()
 }
 
-/// Ends the group `group`, whose leader is `child`, as `ending` says: `SIGTERM` first and a wait for the leader's exit
-/// within the grace, then `SIGKILL` for whatever is left.
-fn end_group(child: &mut Child, group: i32, ending: Ending) {
-    if let Ending::TermThenKill(grace) = ending {
-        signal_group(group, libc::SIGTERM);
-        let until = Instant::now() + grace;
-        while Instant::now() < until && matches!(child.try_wait(), Ok(None)) {
-            thread::sleep(POLL);
-        }
+/// Every group signal the runner sends on this thread, and whether its leader was still unreaped when it was sent, so
+/// a test proves no signal reaches a group after its reap.
+#[cfg(test)]
+pub mod signal_log {
+    use std::cell::RefCell;
+    use std::io;
+    use std::time::Instant;
+
+    /// One signal sent.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Sent {
+        /// The group.
+        pub group: i32,
+        /// The signal.
+        pub signal: i32,
+        /// Whether the group's leader was still unreaped, so the group's id still its own.
+        pub unreaped: bool,
+        /// When it was sent.
+        pub at: Instant,
     }
-    kill_group(group);
-}
 
-/// Kills every process of the group `group` with `SIGKILL`. A group already gone is no failure, and the caller reaps
-/// what it started, so nothing is said.
-fn kill_group(group: i32) {
-    signal_group(group, libc::SIGKILL);
-}
-
-/// Sends `signal` to every process of the group `group`; a group already gone is no failure.
-fn signal_group(group: i32, signal: i32) {
-    // SAFETY: `killpg` takes two integers and touches no memory; `group` is the group the runner made for its own child.
-    unsafe {
-        libc::killpg(group, signal);
+    thread_local! {
+        static SENT: RefCell<Vec<Sent>> = const { RefCell::new(Vec::new()) };
     }
-}
 
-/// All of `pipe`, its first `cap` bytes kept, and whether it held more.
-fn capped(mut pipe: ChildStdout, cap: usize) -> io::Result<(Vec<u8>, bool)> {
-    let mut kept = Vec::new();
-    let mut over = false;
-    let mut chunk = [0_u8; 8192];
-    loop {
-        let read = pipe.read(&mut chunk)?;
-        if read == 0 {
-            return Ok((kept, over));
-        }
-        let room = cap.saturating_sub(kept.len());
-        kept.extend_from_slice(&chunk[..read.min(room)]);
-        over |= read > room;
+    /// Notes `signal` sent to `group`, looking whether its leader is unreaped: `waitid` with `WNOWAIT` still finds it.
+    pub(super) fn note(group: i32, signal: i32) {
+        let unreaped = match super::exit_seen(group) {
+            Ok(_) => true,
+            Err(error) => error.raw_os_error() != Some(libc::ECHILD) && error.kind() != io::ErrorKind::InvalidInput,
+        };
+        let at = Instant::now();
+        SENT.with(|sent| {
+            sent.borrow_mut().push(Sent { group, signal, unreaped, at });
+        });
     }
-}
 
-/// The last [`STDERR_TAIL`] bytes of `pipe`.
-fn tail(mut pipe: ChildStderr) -> io::Result<Vec<u8>> {
-    let mut kept = Vec::new();
-    let mut chunk = [0_u8; 8192];
-    loop {
-        let read = pipe.read(&mut chunk)?;
-        if read == 0 {
-            return Ok(kept);
-        }
-        kept.extend_from_slice(&chunk[..read]);
-        if kept.len() > STDERR_TAIL {
-            kept.drain(..kept.len() - STDERR_TAIL);
-        }
+    /// The signals sent on this thread since the last take.
+    #[must_use]
+    pub fn take() -> Vec<Sent> {
+        SENT.with(|sent| std::mem::take(&mut *sent.borrow_mut()))
     }
 }
 
@@ -447,14 +809,24 @@ pub fn with_path<'c>(command: &'c mut Command, path: Option<&str>) -> &'c mut Co
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a runner that cannot start sh must fail the test loudly")]
 mod tests {
+    use std::cell::RefCell;
     use std::io;
     use std::process::Command;
+    use std::sync::Arc;
+    use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{Ending, LINE_CAP, LineSplitter, NotRan, Stderr, login_path, login_path_of, run_bounded, run_watched, status_text};
+    use super::{
+        Ending, Group, GroupEnd, GroupRecord, NotRan, Settled, Watch, Why, end_group, login_path, login_path_of, run_bounded, run_watched, settled,
+        signal_log, status_text,
+    };
+    use crate::console::{FailingSink, Forwarding, LineSink, Output, RecordingSink, Stream};
+    use crate::files::held_for_test;
 
     /// How long a program the tests expect to end may take: a hang guard only.
     const HANG_GUARD: Duration = Duration::from_secs(120);
+    /// Far past what a run whose leftovers are ended takes, far short of the leftover's own sleep.
+    const ENDED_WELL_BEFORE: Duration = Duration::from_secs(20);
 
     fn sh(script: &str) -> Command {
         let mut command = Command::new("/bin/sh");
@@ -469,6 +841,42 @@ mod tests {
         sent == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 
+    /// Whether the process `pid` is still there, a zombie not yet reaped by its new parent included, waited for to go
+    /// within the hang guard.
+    fn gone_soon(pid: i32) -> bool {
+        let guard = Instant::now() + HANG_GUARD;
+        loop {
+            // SAFETY: signal 0 only asks whether the process exists; it touches no memory.
+            let gone = unsafe { libc::kill(pid, 0) } != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            if gone || Instant::now() >= guard {
+                return gone;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The pid a script printed as the first line of its standard output.
+    fn first_pid(stdout: &[u8]) -> i32 {
+        String::from_utf8_lossy(stdout)
+            .lines()
+            .next()
+            .and_then(|line| line.trim().parse().ok())
+            .expect("the script printed a pid")
+    }
+
+    /// A watch forwarding standard error through `output`, ended on a gone client, TERM first with a 2 s grace.
+    fn forwarding(output: Arc<dyn Forwarding>, deadline: Instant) -> Watch<'static> {
+        Watch {
+            cap: 1024,
+            deadline,
+            ending: Ending::TermThenKill(Duration::from_secs(2)),
+            output: Some(output),
+            forward: true,
+            ends_on_gone: true,
+            record: None,
+        }
+    }
+
     #[test]
     fn the_runner_kills_the_whole_group_at_its_deadline() {
         let ran = run_bounded(sh("sleep 600 & sleep 600"), 1024, Instant::now());
@@ -481,9 +889,12 @@ mod tests {
         // The killed sleeps are reaped by the runner and by launchd; the guard only ends a broken run.
         let guard = Instant::now() + HANG_GUARD;
         while group_alive(group) && Instant::now() < guard {
-            std::thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(50));
         }
         assert!(!group_alive(group), "the background sleep of the group was killed too");
+        let sent = signal_log::take();
+        assert!(!sent.is_empty(), "the group was signalled");
+        assert!(sent.iter().all(|sent| sent.unreaped), "a signal after the reap: {sent:?}");
     }
 
     #[test]
@@ -492,6 +903,8 @@ mod tests {
         assert_eq!(ran.stdout, b"out");
         assert_eq!(ran.stderr, b"err");
         assert_eq!(status_text(ran.status), "status 3");
+        assert!(!ran.leftover);
+        assert!(signal_log::take().is_empty(), "a program that left nothing is not signalled");
     }
 
     #[test]
@@ -502,58 +915,96 @@ mod tests {
         assert_eq!(fits.stdout, b"1234", "exactly the cap fits");
     }
 
-    /// The lines `bytes`, fed in `chunks` of the given sizes, are cut into.
-    fn split(bytes: &[u8], chunk: usize) -> Vec<Vec<u8>> {
-        let mut lines = Vec::new();
-        let mut splitter = LineSplitter::default();
-        for part in bytes.chunks(chunk) {
-            splitter.feed(part, |line| lines.push(line.to_vec()));
-        }
-        splitter.finish(|line| lines.push(line.to_vec()));
-        lines
-    }
-
     #[test]
-    fn lines_end_at_a_line_feed_a_carriage_return_or_both_as_the_windows_box_cuts_them() {
-        for chunk in [1, 3, 64] {
-            assert_eq!(
-                split(b"a\r\nb\nc\rd", chunk),
-                [b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]
-            );
-            assert_eq!(split(b"\r\r\n", chunk), [Vec::<u8>::new(), Vec::new()], "a lone CR, then CR LF");
-            assert_eq!(split(&[0xff, b'\n'], chunk), [vec![0xff]], "bytes are handed on as they are");
-        }
-    }
-
-    #[test]
-    fn a_line_past_the_line_cap_keeps_its_first_bytes_and_the_next_line_is_whole() {
-        let mut bytes = vec![b'x'; LINE_CAP + 10];
-        bytes.extend_from_slice(b"\nnext\n");
-        assert_eq!(split(&bytes, 8192), [vec![b'x'; LINE_CAP], b"next".to_vec()]);
-    }
-
-    #[test]
-    fn each_line_of_stderr_is_handed_on_as_it_comes_and_a_refusal_ends_the_group_asked_first() {
-        let mut lines = Vec::new();
-        let mut take = |line: &[u8]| {
-            lines.push(String::from_utf8_lossy(line).into_owned());
-            false
-        };
+    fn a_leader_that_exits_while_its_child_holds_stdout_keeps_its_status_and_the_child_is_ended_before_the_reap() {
+        let output: Arc<dyn Forwarding> = Arc::new(Output::new(RecordingSink::default()));
         let started = Instant::now();
-        let stderr = Stderr::Lines { take: &mut take, end: true };
-        let ran = run_watched(
-            sh("trap 'echo termed; exit 7' TERM; echo first >&2; echo second >&2; sleep 600 & wait"),
+        let ran = run_watched(sh("sleep 600 & echo $!; exit 3"), &forwarding(output, started + HANG_GUARD)).expect("sh runs");
+        assert!(started.elapsed() < ENDED_WELL_BEFORE, "the step ended within the drain bound");
+        assert_eq!(status_text(ran.status), "status 3", "the leader's status is kept");
+        assert!(!ran.leftover, "the ended child let its pipe go");
+        assert!(gone_soon(first_pid(&ran.stdout)), "the child holding stdout was ended");
+
+        let sent = signal_log::take();
+        assert_eq!(sent.first().map(|sent| sent.signal), Some(libc::SIGTERM), "asked first: {sent:?}");
+        assert!(
+            sent.iter().all(|sent| sent.unreaped),
+            "every signal reached the group before the reap: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_process_that_leaves_the_group_and_holds_stdout_is_left_behind_and_the_status_kept() {
+        // The shell exits only once the perl has left its group, so the perl is out of reach of the leftovers' ending.
+        let marker = std::env::temp_dir().join(format!("gate-box-unix-escaped-{}", std::process::id()));
+        let started = Instant::now();
+        let ran = run_bounded(
+            sh(&format!(
+                "perl -e 'use POSIX; POSIX::setsid(); open(F, \">\", $ARGV[0]); close F; sleep 60' '{0}' & \
+                 while [ ! -e '{0}' ]; do sleep 0.05; done; echo $!; exit 4",
+                marker.display()
+            )),
             1024,
             started + HANG_GUARD,
-            stderr,
-            Ending::TermThenKill(Duration::from_secs(2)),
+        )
+        .expect("sh runs");
+        // Best effort: the marker is in the temp folder and named for this process.
+        let _ = std::fs::remove_file(&marker);
+        let escaped = first_pid(&ran.stdout);
+        // SAFETY: `escaped` is the perl this case started; the kill only ends it.
+        unsafe {
+            libc::kill(escaped, libc::SIGKILL);
+        }
+        assert!(started.elapsed() < ENDED_WELL_BEFORE, "the drain gave up on a reader in its read");
+        assert_eq!(status_text(ran.status), "status 4");
+        assert!(ran.leftover, "the escaped process held stdout open");
+        assert!(signal_log::take().iter().all(|sent| sent.unreaped));
+    }
+
+    /// A sink whose every write waits `stall` before it succeeds: a client that is not reading.
+    struct StalledSink {
+        stall: Duration,
+    }
+
+    impl LineSink for StalledSink {
+        fn write_line(&self, _stream: Stream, _line: &str) -> io::Result<()> {
+            thread::sleep(self.stall);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_stalled_client_does_not_hold_back_the_deadline_kill() {
+        let output: Arc<dyn Forwarding> = Arc::new(Output::new(StalledSink {
+            stall: Duration::from_secs(5),
+        }));
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(500);
+        let ran = run_watched(sh("echo a >&2; echo b >&2; sleep 60"), &forwarding(output, deadline));
+        assert!(matches!(ran, Err(NotRan::TimedOut { .. })), "{ran:?}");
+        let sent = signal_log::take();
+        let first = sent.first().expect("the group was signalled");
+        assert!(
+            first.at.duration_since(started) < Duration::from_secs(3),
+            "the kill came at the deadline, not after the stalled write: {sent:?}"
+        );
+        assert!(sent.iter().all(|sent| sent.unreaped), "{sent:?}");
+    }
+
+    #[test]
+    fn a_client_gone_ends_the_group_asked_first_with_sigterm() {
+        let output: Arc<dyn Forwarding> = Arc::new(Output::new(FailingSink::new(io::ErrorKind::BrokenPipe)));
+        let started = Instant::now();
+        let ran = run_watched(
+            sh("trap 'echo termed; exit 7' TERM; echo first >&2; sleep 600 & wait"),
+            &forwarding(Arc::clone(&output), started + HANG_GUARD),
         )
         .expect("sh runs to its end");
-        assert!(started.elapsed() < Duration::from_secs(60), "ended long before its sleep");
-        assert_eq!(lines, ["first"], "no line after the refusal");
+        assert!(started.elapsed() < ENDED_WELL_BEFORE, "ended long before its sleep");
+        assert!(output.client_gone());
         assert_eq!(String::from_utf8_lossy(&ran.stdout), "termed\n", "asked with SIGTERM first");
         assert_eq!(status_text(ran.status), "status 7");
-        assert!(ran.stderr.is_empty());
+        assert!(ran.stderr.is_empty(), "standard error was forwarded");
     }
 
     #[test]
@@ -563,6 +1014,156 @@ mod tests {
             matches!(ran, Err(NotRan::Start(ref error)) if error.kind() == io::ErrorKind::NotFound),
             "{ran:?}"
         );
+    }
+
+    #[test]
+    fn a_program_whose_exec_fails_after_its_group_was_recorded_leaves_no_record() {
+        let folder = std::env::temp_dir().join(format!("gate-box-unix-record-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).expect("the case folder is made");
+        // Beside the folder, so the folder holds only what the record leaves.
+        let lock_path = folder.with_extension("lock");
+        let lock = held_for_test(&lock_path);
+        let record = GroupRecord::new(folder.join("k.pgid"), "gate-remote-k-0123456789ab", &lock);
+        let watch = Watch {
+            cap: 4,
+            deadline: Instant::now() + HANG_GUARD,
+            ending: Ending::Kill,
+            output: None,
+            forward: false,
+            ends_on_gone: false,
+            record: Some(&record),
+        };
+        let ran = run_watched(Command::new("gate-box-no-such-program"), &watch);
+        let left: Vec<_> = std::fs::read_dir(&folder).expect("the folder is read").collect();
+        // Best effort: a folder left behind is in the temp folder and named for this process.
+        let _ = std::fs::remove_dir_all(&folder);
+        // Best effort: as above.
+        let _ = std::fs::remove_file(&lock_path);
+        assert!(matches!(ran, Err(NotRan::Start(_))), "{ran:?}");
+        assert!(left.is_empty(), "neither the record nor its temp file is left: {left:?}");
+    }
+
+    /// A group whose leader's looks answer `looks` in turn, then the last of them again, with a process besides the
+    /// leader in it unless made [`Fake::emptied`]; it notes each signal sent.
+    struct Fake {
+        looks: RefCell<Vec<Option<i32>>>,
+        sent: RefCell<Vec<i32>>,
+        others: bool,
+    }
+
+    impl Fake {
+        /// `looks`: `None` for a leader not yet exited, `Some(errno)` for a look that fails.
+        fn new(looks: &[Option<i32>]) -> Fake {
+            Fake {
+                looks: RefCell::new(looks.iter().rev().copied().collect()),
+                sent: RefCell::new(Vec::new()),
+                others: true,
+            }
+        }
+
+        /// The group with no process left in it.
+        fn emptied(self) -> Fake {
+            Fake { others: false, ..self }
+        }
+    }
+
+    impl Group for Fake {
+        fn exited(&self) -> io::Result<bool> {
+            let mut looks = self.looks.borrow_mut();
+            let look = if looks.len() > 1 { looks.pop() } else { looks.last().copied() };
+            match look.flatten() {
+                Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+                None => Ok(false),
+            }
+        }
+
+        fn others_left(&self, pids: &mut Vec<i32>) -> bool {
+            pids.clear();
+            self.others
+        }
+
+        fn signal(&self, signal: i32) {
+            self.sent.borrow_mut().push(signal);
+        }
+    }
+
+    #[test]
+    fn a_look_at_the_leader_that_fails_during_the_grace_still_kills_the_group() {
+        let group = Fake::new(&[None, Some(libc::EIO)]);
+        let ended = end_group(&group, Ending::TermThenKill(Duration::from_secs(60)), Duration::ZERO);
+        assert!(ended.is_err(), "{ended:?}");
+        assert_eq!(*group.sent.borrow(), [libc::SIGTERM, libc::SIGKILL]);
+    }
+
+    #[test]
+    fn a_leader_that_is_no_child_to_look_at_is_sent_no_signal() {
+        let group = Fake::new(&[Some(libc::ECHILD)]);
+        let ended = end_group(&group, Ending::TermThenKill(Duration::from_secs(60)), Duration::ZERO);
+        assert!(ended.is_err(), "{ended:?}");
+        assert!(group.sent.borrow().is_empty(), "{:?}", group.sent.borrow());
+    }
+
+    #[test]
+    fn a_leader_that_has_not_exited_once_the_wait_after_sigkill_passed_leaves_its_group_still_there() {
+        let group = Fake::new(&[None]);
+        let started = Instant::now();
+        let ended = end_group(&group, Ending::Kill, Duration::from_millis(200));
+        assert_eq!(ended.ok(), Some(GroupEnd::StillThere));
+        assert!(started.elapsed() < ENDED_WELL_BEFORE, "the wait is bounded");
+        assert_eq!(*group.sent.borrow(), [libc::SIGKILL]);
+    }
+
+    /// Whether `settled` leaves the leader unreaped with its record kept.
+    fn kept(settled: &Settled) -> bool {
+        matches!(settled, Settled::Unread { keep: true, .. })
+    }
+
+    #[test]
+    fn a_leader_whose_exit_cannot_be_read_is_killed_left_unreaped_and_its_record_kept() {
+        let group = Fake::new(&[None]);
+        let settled = settled(
+            &group,
+            &Why::Unread(io::Error::from_raw_os_error(libc::EIO)),
+            Ending::Kill,
+            Duration::ZERO,
+        );
+        assert!(kept(&settled), "{settled:?}");
+        assert_eq!(*group.sent.borrow(), [libc::SIGKILL]);
+    }
+
+    #[test]
+    fn a_look_that_fails_while_the_leftovers_are_ended_leaves_the_leader_unreaped_and_its_record_kept() {
+        let group = Fake::new(&[None, Some(libc::EIO)]);
+        let ending = Ending::TermThenKill(Duration::from_secs(60));
+        let settled = settled(&group, &Why::Exited, ending, Duration::ZERO);
+        assert!(kept(&settled), "{settled:?}");
+        assert_eq!(*group.sent.borrow(), [libc::SIGTERM, libc::SIGKILL]);
+    }
+
+    #[test]
+    fn a_look_that_fails_after_the_sigkill_leaves_the_leader_unreaped_and_its_record_kept() {
+        let group = Fake::new(&[Some(libc::EIO)]);
+        let failed = Why::Failed("its output could not be read".to_owned());
+        let settled = settled(&group, &failed, Ending::Kill, Duration::from_secs(60));
+        assert!(kept(&settled), "{settled:?}");
+        assert_eq!(*group.sent.borrow(), [libc::SIGKILL]);
+    }
+
+    #[test]
+    fn a_leader_that_is_no_child_to_look_at_keeps_its_record_while_its_group_may_have_a_process() {
+        let echild = || Why::Unread(io::Error::from_raw_os_error(libc::ECHILD));
+        let group = Fake::new(&[Some(libc::ECHILD)]);
+        let settled_with_others = settled(&group, &echild(), Ending::Kill, Duration::ZERO);
+        assert!(kept(&settled_with_others), "{settled_with_others:?}");
+        assert!(group.sent.borrow().is_empty(), "no signal: {:?}", group.sent.borrow());
+
+        let emptied = Fake::new(&[Some(libc::ECHILD)]).emptied();
+        let settled_empty = settled(&emptied, &echild(), Ending::Kill, Duration::ZERO);
+        assert!(
+            matches!(settled_empty, Settled::Unread { keep: false, .. }),
+            "no process left, so the record goes: {settled_empty:?}"
+        );
+        assert!(emptied.sent.borrow().is_empty());
     }
 
     #[test]

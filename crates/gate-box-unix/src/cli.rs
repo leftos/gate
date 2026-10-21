@@ -55,6 +55,12 @@ pub fn version_text() -> String {
 #[cfg(unix)]
 #[must_use]
 pub fn main(args: Vec<OsString>) -> std::process::ExitCode {
+    // An ignored SIGCHLD, inherited from whatever started the box, has the kernel reap its children unasked, so the
+    // runner could not see a program's exit (`waitid` fails with `ECHILD`) and its group's id could be another's.
+    // SAFETY: `signal` with `SIG_DFL` installs no handler and touches no memory; no thread of the box runs yet.
+    unsafe {
+        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+    }
     let mut console = crate::console::Console::stdio();
     std::process::ExitCode::from(answer(action(args), &mut console))
 }

@@ -64,9 +64,13 @@ fn said(stream: &mut impl Write, line: &str) {
     let _ = written(stream, line);
 }
 
-/// Writes `line` and a newline to `stream` and flushes it; else why not.
+/// Writes `line` and a newline to `stream` in one write of one buffer, so nothing cuts the line from its end, and
+/// flushes it; else why not.
 fn written(stream: &mut impl Write, line: &str) -> io::Result<()> {
-    writeln!(stream, "{line}")?;
+    let mut whole = String::with_capacity(line.len() + 1);
+    whole.push_str(line);
+    whole.push('\n');
+    stream.write_all(whole.as_bytes())?;
     stream.flush()
 }
 
@@ -87,6 +91,12 @@ pub trait LineSink: Send + Sync {
     ///
     /// Why the line could not be written; a client that has gone is [`io::ErrorKind::BrokenPipe`].
     fn write_line(&self, stream: Stream, line: &str) -> io::Result<()>;
+
+    /// Whether the sink's reader is seen to have hung up, looked at without writing and without waiting. A sink that
+    /// cannot tell answers `false`.
+    fn hung_up(&self) -> bool {
+        false
+    }
 }
 
 /// The process's stdout and stderr. A write to a closed pipe fails with `EPIPE` ([`io::ErrorKind::BrokenPipe`]), as
@@ -101,9 +111,66 @@ impl LineSink for StdioSink {
             Stream::Err => written(&mut io::stderr().lock(), line),
         }
     }
+
+    /// Polls fds 1 and 2 with timeout 0 for `POLLHUP` or `POLLERR`: sshd gives a command pipes, and once the client's
+    /// connection is gone it closes their reading ends, which `poll` reports at once though nothing is written.
+    #[cfg(unix)]
+    fn hung_up(&self) -> bool {
+        let mut fds = [1, 2].map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        });
+        // SAFETY: `fds` is an array of two `pollfd` that lives across the call, and its length is passed with it.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, 0) };
+        ready > 0 && fds.iter().any(|fd| fd.revents & (libc::POLLHUP | libc::POLLERR) != 0)
+    }
 }
 
-/// Whether the client has gone: set by the first write that failed with a broken pipe, and never cleared.
+/// What a reader thread forwards each line through: the box's [`Output`], behind a pointer every thread may hold.
+pub trait Forwarding: Send + Sync {
+    /// Says `line` on `stream` unless `stopped` is set, looked at under the output lock, so no line is written after
+    /// the one who set it says its last.
+    ///
+    /// # Errors
+    ///
+    /// Why the line could not be written.
+    fn say_unless(&self, stopped: &AtomicBool, stream: Stream, line: &str) -> io::Result<()>;
+
+    /// Whether the client has gone, a write having failed or [`Output::client_gone_probe`] having seen it.
+    fn client_gone(&self) -> bool;
+
+    /// [`Output::client_gone_probe`].
+    fn client_gone_probe(&self) -> bool;
+
+    /// Marks the client gone without a write: one that is still connected but takes no line.
+    fn mark_gone(&self);
+}
+
+impl<S: LineSink> Forwarding for Output<S> {
+    fn say_unless(&self, stopped: &AtomicBool, stream: Stream, line: &str) -> io::Result<()> {
+        let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        if stopped.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.write_held(stream, line)
+    }
+
+    fn client_gone(&self) -> bool {
+        Output::client_gone(self)
+    }
+
+    fn client_gone_probe(&self) -> bool {
+        Output::client_gone_probe(self)
+    }
+
+    fn mark_gone(&self) {
+        self.gone.set();
+    }
+}
+
+/// Whether the client has gone: set by the first write that failed, or by a probe that saw its pipes hung up, and
+/// never cleared.
 #[derive(Debug, Default)]
 pub struct ClientGone(AtomicBool);
 
@@ -121,7 +188,7 @@ impl ClientGone {
 }
 
 /// The box's output, shared by its threads: each line, or each group of lines said together, is written whole to the
-/// sink under one lock, so no other thread's line comes between them; a write that fails with a broken pipe sets
+/// sink under one lock, so no other thread's line comes between them; a write that fails in any way sets
 /// [`ClientGone`].
 #[derive(Debug)]
 pub struct Output<S: LineSink> {
@@ -160,19 +227,30 @@ impl<S: LineSink> Output<S> {
         // A thread that panicked while holding the lock left no state behind it: the lock guards only the writes.
         let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         for (stream, line) in lines {
-            if let Err(error) = self.sink.write_line(*stream, line) {
-                if error.kind() == io::ErrorKind::BrokenPipe {
-                    self.gone.set();
-                }
-                return Err(error);
-            }
+            self.write_held(*stream, line)?;
         }
         Ok(())
     }
 
-    /// Whether a write found the client gone.
+    /// Writes `line` to `stream`, the lock held by the caller; any failure, a broken pipe or another, sets
+    /// [`ClientGone`]: a stream that cannot be written has no client left on it.
+    fn write_held(&self, stream: Stream, line: &str) -> io::Result<()> {
+        self.sink.write_line(stream, line).inspect_err(|_| self.gone.set())
+    }
+
+    /// Whether a write found the client gone, or a probe saw it ([`Output::client_gone_probe`]).
     #[must_use]
     pub fn client_gone(&self) -> bool {
+        self.gone.is_set()
+    }
+
+    /// Looks whether the sink's reader has hung up ([`LineSink::hung_up`]), without taking the output lock, so a
+    /// write the client is not taking never holds the look up; sets [`ClientGone`] when it has. Whether the client is
+    /// gone.
+    pub fn client_gone_probe(&self) -> bool {
+        if self.sink.hung_up() {
+            self.gone.set();
+        }
         self.gone.is_set()
     }
 
@@ -231,12 +309,72 @@ impl LineSink for FailingSink {
     }
 }
 
+/// A sink whose reader has hung up, seen by a probe only: its writes still succeed, as a quiet run never writes.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct HungUpSink;
+
+#[cfg(test)]
+impl LineSink for HungUpSink {
+    fn write_line(&self, _stream: Stream, _line: &str) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn hung_up(&self) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::io::{self, Write};
+    use std::sync::atomic::AtomicBool;
     use std::thread;
 
-    use super::{FailingSink, Output, RecordingSink, Stream};
+    use super::{FailingSink, Forwarding, HungUpSink, Output, RecordingSink, Stream, written};
+
+    /// A stream that keeps the bytes of each write call apart.
+    #[derive(Default)]
+    struct Calls(Vec<Vec<u8>>);
+
+    impl Write for Calls {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.push(bytes.to_vec());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_line_and_its_line_end_go_out_in_one_write() {
+        let mut calls = Calls::default();
+        assert!(written(&mut calls, "gate-remote-heartbeat: 5").is_ok());
+        assert_eq!(calls.0, [b"gate-remote-heartbeat: 5\n".to_vec()]);
+    }
+
+    #[test]
+    fn a_probe_that_sees_the_reader_hung_up_sets_client_gone_without_a_write() {
+        let quiet = Output::new(RecordingSink::default());
+        assert!(!quiet.client_gone_probe());
+        assert!(!quiet.client_gone());
+        let hung_up = Output::new(HungUpSink);
+        assert!(!hung_up.client_gone(), "nothing is seen before the probe");
+        assert!(hung_up.client_gone_probe());
+        assert!(hung_up.client_gone());
+    }
+
+    #[test]
+    fn a_line_forwarded_once_stopped_is_dropped() {
+        let output = Output::new(RecordingSink::default());
+        let stopped = AtomicBool::new(false);
+        assert!(output.say_unless(&stopped, Stream::Err, "before").is_ok());
+        stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(output.say_unless(&stopped, Stream::Err, "after").is_ok());
+        assert_eq!(output.sink().lines(), [(Stream::Err, "before".to_owned())]);
+    }
 
     #[test]
     fn a_recording_sink_keeps_each_line_and_its_stream_in_order() {
@@ -284,9 +422,11 @@ mod tests {
     }
 
     #[test]
-    fn a_write_that_fails_otherwise_leaves_client_gone_unset() {
-        let output = Output::new(FailingSink::new(io::ErrorKind::Other));
-        assert!(output.say_together(&[(Stream::Out, "a"), (Stream::Err, "b")]).is_err());
-        assert!(!output.client_gone());
+    fn a_write_that_fails_any_other_way_sets_client_gone_too() {
+        for kind in [io::ErrorKind::ConnectionReset, io::ErrorKind::NotConnected, io::ErrorKind::Other] {
+            let output = Output::new(FailingSink::new(kind));
+            assert!(output.say_together(&[(Stream::Out, "a"), (Stream::Err, "b")]).is_err());
+            assert!(output.client_gone(), "{kind:?}");
+        }
     }
 }

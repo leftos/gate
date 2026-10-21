@@ -7,15 +7,17 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use gate_wire::{PathForm, Payload, Refusal, bare_stem, busy_line, escaped, layout_line, refused_line};
 
 use crate::console::{LineSink, Output, Stream};
 use crate::files::{self, HeldLock, Locked};
-use crate::git::{self, AlternatesFailure, Failed, Git, RunGit, Steps, Tree, line_ends_set, origin_set};
-use crate::lines::{FAILED_STATUS, USAGE_STATUS, work_layout};
+use crate::git::{self, AlternatesFailure, Failed, Git, GitClass, RunGit, Steps, Tree, line_ends_set, origin_set};
+use crate::lines::{FAILED_STATUS, USAGE_STATUS, recorded_group, signal_guard, work_layout};
 use crate::preflight::checked_root;
-use crate::stop::records_folder;
+use crate::process::GroupRecord;
+use crate::stop::{Record, own_group, record_current, records_folder};
 
 /// The status of a run refused: another run holds the work folder, it could not be laid out, or it asks for what this
 /// builder does not build. Said with a refusal tag and before any start marker, so the PC runs the command itself.
@@ -172,16 +174,19 @@ pub struct Ready<'p> {
 /// each failure one line and [`USAGE_STATUS`]; what this builder does not build refused with its tag and a line said
 /// together, [`REFUSED_STATUS`]; the work root, `<root>/work` and `Bare` checked as the preflight checks them
 /// ([`root_checked`]); the work lock taken, a held one refused `busy` with the busy line, one that cannot be opened
-/// failing with [`FAILED_STATUS`]; the lock files a git step cut short left removed ([`swept`]), else refused `layout`;
+/// failing with [`FAILED_STATUS`]; an earlier run's group record whose group still runs refused `busy`, and one whose
+/// group is gone removed ([`earlier_group_cleared`]); the lock files a git step cut short left removed ([`swept`]), else
+/// refused `layout`;
 /// the subfolder placed inside the work folder, else refused with [`USAGE_STATUS`] once the earlier run's back ref is
 /// deleted; the work folder laid out ([`laid_out`]), refused `layout` when it cannot be; the snapshot fetched and checked
 /// out ([`checked_out`]); and the subfolder found in it, a folder inside the work folder once its links are followed,
-/// else [`USAGE_STATUS`]. No start marker is said.
+/// else [`USAGE_STATUS`]. Each git step's process group is recorded in `<work>.pgid` under the run's job while it runs.
+/// No start marker is said.
 ///
 /// # Errors
 ///
 /// The status the run ends on, its lines said.
-pub fn prepare<'p, S: LineSink>(payload: &'p Payload, output: &Output<S>) -> Result<Ready<'p>, u8> {
+pub fn prepare<'p, S: LineSink + 'static>(payload: &'p Payload, output: &Arc<Output<S>>) -> Result<Ready<'p>, u8> {
     let request = Request::read(payload).map_err(|line| said(output, &[&line], USAGE_STATUS))?;
     if let Some(unbuilt) = request.unbuilt {
         return Err(refused(output, &request, unbuilt.refusal, &unbuilt.line(request.bare)));
@@ -195,7 +200,10 @@ pub fn prepare<'p, S: LineSink>(payload: &'p Payload, output: &Output<S>) -> Res
             return Err(said(output, &[&line], FAILED_STATUS));
         }
     };
-    let git = RunGit::new(Git::of(&request.root, request.parent), request.lock, output);
+    // Before the sweep, so a git an earlier run left running keeps its lock files.
+    earlier_group_cleared(&request).map_err(|not| not_laid_out(output, &request, not))?;
+    let record = GroupRecord::new(PathBuf::from(group_record(request.work)), request.job, &lock);
+    let git = RunGit::new(Git::of(&request.root, request.parent), request.lock, output, Some(record));
     // Before the run's first git step, so no lock file an earlier run's ended git left fails it.
     swept(&request).map_err(|not| not_laid_out(output, &request, not))?;
     // Refused before the layout, so a payload naming a folder outside the work folder changes nothing there; the
@@ -218,10 +226,14 @@ pub fn prepare<'p, S: LineSink>(payload: &'p Payload, output: &Output<S>) -> Res
     Ok(Ready { request, lock, place })
 }
 
-/// Says `lines` on stderr together; `status`.
+/// Says `lines` on stderr together, unless the client is gone; `status`.
 fn said<S: LineSink>(output: &Output<S>, lines: &[&str], status: u8) -> u8 {
+    // A client that has gone has no one left to tell, and the status still ends the ssh session; one still connected
+    // but no longer reading would hold the write, and the output lock, for good.
+    if output.client_gone() {
+        return status;
+    }
     let lines: Vec<(Stream, &str)> = lines.iter().map(|line| (Stream::Err, *line)).collect();
-    // A client that has gone has no one left to tell, and the status still ends the ssh session.
     let _ = output.say_together(&lines);
     status
 }
@@ -241,6 +253,7 @@ fn refused<S: LineSink>(output: &Output<S>, request: &Request<'_>, refusal: Refu
 /// line naming the repo and why, or failed with a step's lines; the status.
 fn not_laid_out<S: LineSink>(output: &Output<S>, request: &Request<'_>, not: NotLaidOut) -> u8 {
     match not {
+        NotLaidOut::Busy => refused(output, request, Refusal::Busy, &busy_line(request.key)),
         NotLaidOut::Refused(why) => {
             let line = layout_line(repo_name(request.bare), &escaped(&why));
             refused(output, request, Refusal::Layout, &line)
@@ -314,6 +327,8 @@ fn inside_work(work: &str, place: &Path) -> bool {
 
 /// Why the work folder could not be laid out.
 enum NotLaidOut {
+    /// An earlier run's recorded process group still runs in it: the run is refused `busy`.
+    Busy,
     /// A file-system step failed, or a path is not what the run uses, for this reason: the run is refused `layout`.
     Refused(String),
     /// A git step failed, or the work folder is not one the box uses: the lines and the status.
@@ -324,6 +339,33 @@ impl From<Failed> for NotLaidOut {
     fn from(failed: Failed) -> NotLaidOut {
         NotLaidOut::Failed(failed)
     }
+}
+
+/// The group record of the work folder `work`, `<work>.pgid`, which `box stop` reads.
+fn group_record(work: &str) -> String {
+    format!("{work}.pgid")
+}
+
+/// Looks at the group record an earlier run of `request`'s work folder left, a box that ended without removing it:
+/// whatever job it names, a group that is still the one its run made ([`record_current`]) refuses the run
+/// [`NotLaidOut::Busy`], the group never signalled and its git's lock files never swept; a record naming no group a
+/// run makes (malformed, init, or the box's own), or a group that is no longer its run's (no process left, one the box
+/// may not signal, or its id another's since), is removed under the work lock and the run goes on. A record that
+/// cannot be read, a link or a folder at its name, refuses the run `layout`.
+fn earlier_group_cleared(request: &Request<'_>) -> Result<(), NotLaidOut> {
+    let record = group_record(request.work);
+    let (bytes, written) = match files::read_plain_dated(Path::new(&record), files::RECORD_LIMIT) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(NotLaidOut::Refused(format!("cannot read {record}: {error}"))),
+        Ok(read) => read,
+    };
+    if let Some(recorded) = recorded_group(&bytes)
+        && signal_guard(recorded.group, own_group()).is_ok()
+        && record_current(recorded, written) == Record::Current
+    {
+        return Err(NotLaidOut::Busy);
+    }
+    removed(&record)
 }
 
 /// Removes the lock files a git step the box ended can leave where the work lock covers them, before the run's first
@@ -407,10 +449,7 @@ fn laid_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>) -> Result<(
 
 /// Removes the file `path`; a missing one is fine. Else why not, refusing the run `layout`.
 fn removed(path: &str) -> Result<(), NotLaidOut> {
-    match fs::remove_file(path) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(NotLaidOut::Refused(format!("cannot remove {path}: {error}"))),
-        _ => Ok(()),
-    }
+    files::remove_if_there(Path::new(path)).map_err(|error| NotLaidOut::Refused(format!("cannot remove {path}: {error}")))
 }
 
 /// Whether `path` is missing or, looked at without following a link, a folder itself (`folder`) or a file itself.
@@ -433,16 +472,24 @@ fn plain_or_missing(path: &Path, folder: bool) -> Result<(), NotLaidOut> {
 fn checked_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>) -> Result<(), Failed> {
     let tree = Tree::at(request.work);
     let refname = format!("refs/gate/{}", request.key);
-    git.step("fetch", &tree.args(&["fetch", "-q", request.bare, &refname]))?;
+    git.step_as("fetch", &tree.args(&["fetch", "-q", request.bare, &refname]), GitClass::Long)?;
     let commit = format!("{}^{{commit}}", request.snapshot);
-    if !git.quiet("cat-file", &tree.args(&["cat-file", "-e", &commit]))?.status.success() {
+    if !git
+        .quiet("cat-file", &tree.args(&["cat-file", "-e", &commit]), GitClass::Short)?
+        .status
+        .success()
+    {
         return Err(Failed::line(format!(
             "gate: remote snapshot {} is not in the work folder's repository after the fetch",
             request.snapshot
         )));
     }
-    git.step("checkout", &tree.args(&["checkout", "-q", "--force", "--detach", request.snapshot]))?;
-    git.step("clean", &tree.args(&["clean", "-fdq"]))?;
+    git.step_as(
+        "checkout",
+        &tree.args(&["checkout", "-q", "--force", "--detach", request.snapshot]),
+        GitClass::Long,
+    )?;
+    git.step_as("clean", &tree.args(&["clean", "-fdq"]), GitClass::Long)?;
     back_ref_cleared(git, request)
 }
 
@@ -451,7 +498,7 @@ fn checked_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>) -> Resul
 fn back_ref_cleared<S: LineSink>(git: &RunGit<'_, S>, request: &Request<'_>) -> Result<(), Failed> {
     let bare = format!("--git-dir={}", request.bare);
     let back = format!("refs/gate-back/{}", request.key);
-    git.bare_step("back ref reset", &[&bare, "update-ref", "-d", &back])
+    git.bare_step("back ref reset", &[&bare, "update-ref", "-d", &back], GitClass::Short)
 }
 
 #[cfg(test)]
@@ -462,8 +509,11 @@ fn back_ref_cleared<S: LineSink>(git: &RunGit<'_, S>, request: &Request<'_>) -> 
 mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
+    use std::process::{Child, Command, Stdio};
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -473,6 +523,7 @@ mod tests {
     use super::{REFUSED_STATUS, Ready, place_of, prepare};
     use crate::console::{Output, RecordingSink, Stream};
     use crate::files::{self, Locked, effective_uid, take_lock};
+    use crate::git::{GitClass, test_limit};
 
     const KEY: &str = "repo-0123abcd";
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
@@ -632,7 +683,7 @@ mod tests {
     /// lines it said, each checked to be on stderr.
     fn ran(json: &Value) -> (u8, Vec<String>) {
         let payload = decoded(json);
-        let output = Output::new(RecordingSink::default());
+        let output = Arc::new(Output::new(RecordingSink::default()));
         let status = match prepare(&payload, &output) {
             Ok(_) => 0,
             Err(status) => status,
@@ -656,7 +707,7 @@ mod tests {
         let case = Case::new("first");
         let commit = case.snapshot(&[("a.txt", "a\n")]);
         let payload = decoded(&case.json(&commit, &json!({})));
-        let output = Output::new(RecordingSink::default());
+        let output = Arc::new(Output::new(RecordingSink::default()));
 
         let ready: Ready<'_> = prepare(&payload, &output).expect("the run is ready");
 
@@ -1207,5 +1258,199 @@ mod tests {
         assert_eq!(status, REFUSED_STATUS, "{said:?}");
         assert_eq!(said, layout_refusal(&format!("cannot write {alternates}: it is not a plain file")));
         assert!(Path::new(&alternates).is_dir(), "the folder is kept");
+    }
+
+    /// A `sleep 600` leading a process group of its own, as a git an earlier run left running does.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the spawn lock is the Windows gate's; this test stands in for an earlier run's git"
+    )]
+    fn sleeping_group() -> Child {
+        Command::new("sleep").arg("600").process_group(0).spawn().expect("sleep starts")
+    }
+
+    /// The group record of the case's work folder.
+    fn record_of(case: &Case) -> String {
+        format!("{}.pgid", case.work())
+    }
+
+    #[test]
+    fn each_git_step_of_a_run_is_given_the_windows_box_s_bound_class_and_no_record_is_left() {
+        let case = Case::new("classes");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let _ = test_limit::classes();
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        assert_eq!(status, 0, "{said:?}");
+        let classes = test_limit::classes();
+        let of = |class: GitClass| -> Vec<String> {
+            classes
+                .iter()
+                .filter(|(_, given)| *given == class)
+                .map(|(step, _)| step.clone())
+                .collect()
+        };
+        assert_eq!(of(GitClass::Long), ["fetch", "checkout", "clean"]);
+        assert_eq!(
+            of(GitClass::Short),
+            [
+                "git init",
+                "git config remote.origin.url",
+                "git remote add",
+                "git config core.autocrlf",
+                "git config core.eol",
+                "cat-file",
+                "back ref reset"
+            ]
+        );
+        assert!(!Path::new(&record_of(&case)).exists(), "each step's group record is removed");
+    }
+
+    #[test]
+    fn a_run_finding_an_earlier_run_s_group_still_running_is_refused_busy_and_leaves_it_and_its_locks() {
+        let case = Case::new("earlier-live");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.laid_out(&commit);
+        let mut child = sleeping_group();
+        let record = record_of(&case);
+        fs::write(&record, format!("gate-remote-{KEY}-ffffffffffff\n{}\n", child.id())).expect("the record is written");
+        let index_lock = format!("{}/.git/index.lock", case.work());
+        fs::write(&index_lock, "").expect("the earlier git's lock is planted");
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        let alive = child.try_wait().expect("the sleep is looked at").is_none();
+        // Best effort: the sleep is this case's own.
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        assert_eq!(said, [refused_line(NONCE, Refusal::Busy), busy_line(KEY)]);
+        assert!(alive, "the earlier group is never signalled");
+        assert!(Path::new(&index_lock).exists(), "its git's lock file is not swept");
+        assert!(Path::new(&record).exists(), "its record stands");
+    }
+
+    #[test]
+    fn a_record_naming_a_group_with_no_process_left_is_removed_and_the_run_goes_on() {
+        let case = Case::new("earlier-dead");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let mut child = sleeping_group();
+        let group = i32::try_from(child.id()).expect("a pid is a pid_t");
+        child.kill().expect("the sleep is killed");
+        child.wait().expect("the sleep is reaped");
+        // SAFETY: signal 0 only asks whether the group exists; it touches no memory.
+        assert!(unsafe { libc::killpg(group, 0) } != 0, "the group is gone");
+        let record = record_of(&case);
+        fs::write(&record, format!("gate-remote-{KEY}-ffffffffffff\n{group}\n")).expect("the record is written");
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(case.head(), commit);
+        assert!(!Path::new(&record).exists(), "the stale record is removed");
+    }
+
+    /// Writes the group record of the case naming `group` in this process's session, as a box's git step writes it,
+    /// its time set `back` before now.
+    fn record_written_back(case: &Case, group: u32, back: Duration) -> String {
+        let record = record_of(case);
+        // SAFETY: `getsid(0)` asks for the caller's session and touches no memory.
+        let session = unsafe { libc::getsid(0) };
+        fs::write(&record, format!("gate-remote-{KEY}-ffffffffffff\n{group}\n{session}\n")).expect("the record is written");
+        let file = fs::File::options().write(true).open(&record).expect("the record opens");
+        file.set_modified(SystemTime::now() - back).expect("the record's time is set");
+        record
+    }
+
+    #[test]
+    fn a_record_whose_group_id_is_a_process_started_after_it_was_written_is_removed_and_the_process_left_alone() {
+        let case = Case::new("earlier-reused");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let mut child = sleeping_group();
+        // The record is older than the process its id now names: a pid reused since the record was written.
+        let record = record_written_back(&case, child.id(), Duration::from_secs(120));
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        let alive = child.try_wait().expect("the sleep is looked at").is_none();
+        // Best effort: the sleep is this case's own.
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(status, 0, "{said:?}");
+        assert!(alive, "the process the stale record names is never signalled");
+        assert!(!Path::new(&record).exists(), "the stale record is removed");
+    }
+
+    /// A shell leading a group of its own that leaves a `sleep 600` in it and exits, reaped: the sleep's pid.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the spawn lock is the Windows gate's; this test stands in for an earlier run's git"
+    )]
+    fn group_without_its_leader() -> (u32, i32) {
+        let shell = Command::new("/bin/sh")
+            .args(["-c", "sleep 600 >/dev/null 2>&1 & echo $!"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("sh starts");
+        let group = shell.id();
+        let said = shell.wait_with_output().expect("sh is reaped");
+        let member = String::from_utf8_lossy(&said.stdout).trim().parse().expect("the sleep's pid is said");
+        (group, member)
+    }
+
+    #[test]
+    fn a_record_whose_group_lost_its_leader_but_keeps_a_member_is_refused_busy() {
+        let case = Case::new("earlier-leaderless");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.laid_out(&commit);
+        let (group, member) = group_without_its_leader();
+        let record = record_written_back(&case, group, Duration::ZERO);
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        // SAFETY: `member` is the sleep this case started; the kill only ends it.
+        let alive = unsafe { libc::kill(member, 0) } == 0;
+        // SAFETY: as above.
+        unsafe {
+            libc::kill(member, libc::SIGKILL);
+        }
+        assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        assert_eq!(said, [refused_line(NONCE, Refusal::Busy), busy_line(KEY)]);
+        assert!(alive, "the group's member is never signalled");
+        assert!(Path::new(&record).exists(), "its record stands");
+    }
+
+    #[test]
+    fn a_malformed_record_is_removed_and_a_folder_at_its_name_refused_layout() {
+        let case = Case::new("earlier-malformed");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let record = record_of(&case);
+        fs::write(&record, "not a record").expect("the record is written");
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+        assert_eq!(status, 0, "{said:?}");
+        assert!(!Path::new(&record).exists());
+
+        fs::create_dir(&record).expect("a folder takes the record's name");
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+        assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        assert_eq!(said[0], refused_line(NONCE, Refusal::Layout));
+    }
+
+    #[test]
+    fn a_malformed_outputs_glob_is_a_usage_error_before_any_unbuilt_refusal() {
+        let case = Case::new("outputs-shape");
+        for (outputs, line) in [
+            (json!([""]), "gate: box payload Outputs holds an empty glob"),
+            (json!(["a[b"]), "gate: box payload Outputs glob 'a[b' holds '[' or ']'"),
+            (json!("bin"), "gate: box payload Outputs is not a list of texts"),
+        ] {
+            let extra = json!({ "Outputs": outputs, "Desktop": true, "DesktopWait": 60, "Pair": { "Leaf": "repo", "Siblings": ["lib"] } });
+            let (status, said) = ran(&case.json(&"a".repeat(40), &extra));
+            assert_eq!(status, 2, "{line}: {said:?}");
+            assert_eq!(said, [line]);
+        }
     }
 }

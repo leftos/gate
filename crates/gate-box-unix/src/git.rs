@@ -7,22 +7,35 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gate_wire::escaped;
 
-use crate::console::{LineSink, Output, Stream};
+use crate::console::{Forwarding, LineSink, Output, Stream};
 use crate::files::{self, ReplaceFailure};
 use crate::lines::{FAILED_STATUS, is_git_variable, step_unran};
-use crate::process::{Ending, NotRan, Ran, Stderr, run_bounded, run_watched, status_text};
+use crate::process::{Ending, GroupRecord, NotRan, Ran, Watch, run_bounded, run_watched, status_text};
 
 /// How long one preflight git step may take.
 const GIT_LIMIT: Duration = Duration::from_secs(120);
-/// The bound of a run's git step that reads or writes refs, config or a listing, as the Windows box's.
+/// The bound of a run's [`GitClass::Short`] step, as the Windows box's.
 const GIT_SHORT_LIMIT: Duration = Duration::from_mins(5);
-/// The bound of a run's git step that moves a tree's or a repository's content (`fetch`, `checkout`, `clean`), as the
-/// Windows box's.
+/// The bound of a run's [`GitClass::Long`] step, as the Windows box's.
 const GIT_LONG_LIMIT: Duration = Duration::from_mins(30);
+/// The line said when a process a git step left, out of its group's reach, still holds git's output open, as the
+/// Windows box says it.
+pub const GIT_LEFTOVER: &str = "gate: remote git's output is still held open by a leftover process; stopped reading";
+
+/// The bound class a run's git step is given by its caller, as the Windows box gives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitClass {
+    /// A step that reads or writes refs, config or a listing: [`GIT_SHORT_LIMIT`].
+    Short,
+    /// A step that moves a tree's or a repository's content (`fetch`, `checkout`, `clean`, `lfs checkout`, `add`):
+    /// [`GIT_LONG_LIMIT`].
+    Long,
+}
 /// How long a run's git step asked to end with `SIGTERM` has before its group is killed.
 const END_GRACE: Duration = Duration::from_secs(2);
 /// The most a git step may write on its standard output.
@@ -124,6 +137,15 @@ pub trait Steps {
     /// The failure of a git that did not run to an exit or exited non-zero.
     fn step(&self, step: &str, args: &[&str]) -> Result<Vec<u8>, Failed> {
         let ran = self.ran(step, args)?;
+        self.passed(step, ran)
+    }
+
+    /// The standard output of the git step `step` that `ran` when it exited 0, else its failure ([`Steps::failed`]).
+    ///
+    /// # Errors
+    ///
+    /// The failure of a git that exited non-zero.
+    fn passed(&self, step: &str, ran: Ran) -> Result<Vec<u8>, Failed> {
         if ran.status.success() {
             Ok(ran.stdout)
         } else {
@@ -294,13 +316,16 @@ pub fn alternates_written(info: &Path, bare: &str) -> Result<(), AlternatesFailu
 /// How a run runs git ([`Git`]), with the Windows box's safety options before every step's words: its hooks read from
 /// `<Lock>/hooks`, which cannot exist as the lock is a file; no file-system monitor; no attributes file but the tree's
 /// own, nor the system's; and an LFS store below the lock, which cannot be made. Its standard error is forwarded to the
-/// client line by line as git says it, and its standard output kept for the caller, up to [`GIT_OUTPUT_CAP`]. A step
-/// is bounded as the Windows box bounds it ([`step_limit`]); past its bound, or when a forward fails, its group is
-/// asked to end with `SIGTERM` and killed after [`END_GRACE`], unless the step writes the shared bare repository.
-pub struct RunGit<'a, S: LineSink> {
+/// client line by line as git says it, from the readers' own threads, and its standard output kept for the caller, up
+/// to [`GIT_OUTPUT_CAP`]. A step is bounded by the [`GitClass`] its caller gives it ([`step_limit`]); past its bound, or
+/// once the client is gone, its group is asked to end with `SIGTERM` and killed after [`END_GRACE`], unless the step
+/// writes the shared bare repository. Each step's group is written to the run's group record while it runs, when the
+/// run gives one, so `box stop` ends it.
+pub struct RunGit<'a, S: LineSink + 'static> {
     git: Git<'a>,
     options: [String; 8],
-    output: &'a Output<S>,
+    output: &'a Arc<Output<S>>,
+    record: Option<GroupRecord<'a>>,
 }
 
 /// What a run's git step does with git's standard error and with a client gone.
@@ -312,10 +337,11 @@ struct Mode {
     ends_on_gone: bool,
 }
 
-impl<'a, S: LineSink> RunGit<'a, S> {
-    /// The run's git `git`, the run holding the work lock `lock`, its lines said through `output`.
+impl<'a, S: LineSink + 'static> RunGit<'a, S> {
+    /// The run's git `git`, the run holding the work lock `lock`, its lines said through `output`, each step's group
+    /// written to `record` while it runs when one is given.
     #[must_use]
-    pub fn new(git: Git<'a>, lock: &str, output: &'a Output<S>) -> RunGit<'a, S> {
+    pub fn new(git: Git<'a>, lock: &str, output: &'a Arc<Output<S>>, record: Option<GroupRecord<'a>>) -> RunGit<'a, S> {
         let options = [
             "-c".to_owned(),
             format!("core.hooksPath={lock}/hooks"),
@@ -326,7 +352,12 @@ impl<'a, S: LineSink> RunGit<'a, S> {
             "-c".to_owned(),
             format!("lfs.storage={lock}/lfs"),
         ];
-        RunGit { git, options, output }
+        RunGit {
+            git,
+            options,
+            output,
+            record,
+        }
     }
 
     /// The safety options, then `args`.
@@ -334,84 +365,86 @@ impl<'a, S: LineSink> RunGit<'a, S> {
         self.options.iter().map(String::as_str).chain(args.iter().copied()).collect()
     }
 
-    /// Runs the step `step` with `args`, its standard error forwarded.
+    /// Runs the step `step` of the class `class` with `args`, its standard error forwarded.
     ///
     /// # Errors
     ///
     /// The failure of a git that did not run to an exit, or a client gone.
-    pub fn forwarded(&self, step: &str, args: &[&str]) -> Result<Ran, Failed> {
-        self.ran_as(
-            step,
-            args,
-            Mode {
-                forward: true,
-                ends_on_gone: true,
-            },
-        )
+    pub fn forwarded(&self, step: &str, args: &[&str], class: GitClass) -> Result<Ran, Failed> {
+        let mode = Mode {
+            forward: true,
+            ends_on_gone: true,
+        };
+        self.ran_as(step, args, mode, class)
     }
 
-    /// Runs the step `step` with `args`, its standard error dropped, as the Windows box drops `cat-file`'s.
-    ///
-    /// # Errors
-    ///
-    /// The failure of a git that did not run to an exit.
-    pub fn quiet(&self, step: &str, args: &[&str]) -> Result<Ran, Failed> {
-        self.ran_as(
-            step,
-            args,
-            Mode {
-                forward: false,
-                ends_on_gone: true,
-            },
-        )
-    }
-
-    /// Runs the step `step`, which writes the shared bare repository, with `args`, its standard error forwarded: a
-    /// client gone neither keeps it from starting nor cuts it short, so the bare repository is never left half
-    /// written, though the step still fails with [`client_gone`].
+    /// Runs the step `step` of the class `class` with `args`, its standard output when it exits 0, else its failure.
     ///
     /// # Errors
     ///
     /// The failure of a git that did not run to an exit or exited non-zero, or a client gone.
-    pub fn bare_step(&self, step: &str, args: &[&str]) -> Result<(), Failed> {
+    pub fn step_as(&self, step: &str, args: &[&str], class: GitClass) -> Result<Vec<u8>, Failed> {
+        let ran = self.forwarded(step, args, class)?;
+        self.passed(step, ran)
+    }
+
+    /// Runs the step `step` of the class `class` with `args`, its standard error dropped, as the Windows box drops
+    /// `cat-file`'s.
+    ///
+    /// # Errors
+    ///
+    /// The failure of a git that did not run to an exit, or a client gone.
+    pub fn quiet(&self, step: &str, args: &[&str], class: GitClass) -> Result<Ran, Failed> {
+        let mode = Mode {
+            forward: false,
+            ends_on_gone: true,
+        };
+        self.ran_as(step, args, mode, class)
+    }
+
+    /// Runs the step `step` of the class `class`, which writes the shared bare repository, with `args`, its standard
+    /// error forwarded: a client gone neither keeps it from starting nor cuts it short, so the bare repository is never
+    /// left half written, though the step still fails with [`client_gone`].
+    ///
+    /// # Errors
+    ///
+    /// The failure of a git that did not run to an exit or exited non-zero, or a client gone.
+    pub fn bare_step(&self, step: &str, args: &[&str], class: GitClass) -> Result<(), Failed> {
         let mode = Mode {
             forward: true,
             ends_on_gone: false,
         };
-        let ran = self.ran_as(step, args, mode)?;
-        if ran.status.success() {
-            Ok(())
-        } else {
-            Err(exit_failed(step, ran.status))
-        }
+        let ran = self.ran_as(step, args, mode, class)?;
+        self.passed(step, ran).map(drop)
     }
 
-    /// Runs the step `step` with `args` as `mode` says, to its exit or its bound. A forward that fails, a broken pipe
-    /// or any other failure, is a client gone.
-    fn ran_as(&self, step: &str, args: &[&str], mode: Mode) -> Result<Ran, Failed> {
-        if mode.ends_on_gone && self.output.client_gone() {
+    /// Runs the step `step` with `args` as `mode` says, to its exit or the bound of `class`. A client gone, seen by a
+    /// failed write of any kind or by a probe of the box's output, fails the step with [`client_gone`].
+    fn ran_as(&self, step: &str, args: &[&str], mode: Mode, class: GitClass) -> Result<Ran, Failed> {
+        if mode.ends_on_gone && self.output.client_gone_probe() {
             return Err(client_gone(step));
         }
         let mut command = self.git.command(&self.args(args));
         command.env(NO_SYSTEM_ATTRIBUTES, "1");
-        let limit = step_limit(step);
-        let mut gone = false;
-        let mut take = |line: &[u8]| {
-            let forwarded = self.output.say(Stream::Err, &String::from_utf8_lossy(line)).is_ok();
-            gone |= !forwarded;
-            forwarded
+        let limit = step_limit(step, class);
+        let output: Arc<dyn Forwarding> = Arc::clone(self.output) as Arc<dyn Forwarding>;
+        let watch = Watch {
+            cap: GIT_OUTPUT_CAP,
+            deadline: Instant::now() + limit,
+            ending: Ending::TermThenKill(END_GRACE),
+            output: Some(output),
+            forward: mode.forward,
+            ends_on_gone: mode.ends_on_gone,
+            record: self.record.as_ref(),
         };
-        let stderr = if mode.forward {
-            Stderr::Lines {
-                take: &mut take,
-                end: mode.ends_on_gone,
-            }
-        } else {
-            Stderr::Tail
-        };
-        let ran = run_watched(command, GIT_OUTPUT_CAP, Instant::now() + limit, stderr, Ending::TermThenKill(END_GRACE));
-        if gone {
+        let ran = run_watched(command, &watch);
+        if self.output.client_gone() {
             return Err(client_gone(step));
+        }
+        // A quiet step forwards nothing, so, as on the Windows box, a leftover holding its output is not said.
+        if mode.forward && ran.as_ref().is_ok_and(|ran| ran.leftover) {
+            // A client that has gone has no one left to tell; the next step finds it gone.
+            let _ = self.output.say(Stream::Err, GIT_LEFTOVER);
         }
         ran.map_err(|not| {
             let why = match not {
@@ -425,9 +458,9 @@ impl<'a, S: LineSink> RunGit<'a, S> {
     }
 }
 
-impl<S: LineSink> Steps for RunGit<'_, S> {
+impl<S: LineSink + 'static> Steps for RunGit<'_, S> {
     fn ran(&self, step: &str, args: &[&str]) -> Result<Ran, Failed> {
-        self.forwarded(step, args)
+        self.forwarded(step, args, GitClass::Short)
     }
 
     fn failed(&self, step: &str, ran: &Ran) -> Failed {
@@ -435,28 +468,31 @@ impl<S: LineSink> Steps for RunGit<'_, S> {
     }
 }
 
-/// The bound of the run's git step `step`, as the Windows box bounds it: [`GIT_LONG_LIMIT`] for a step that moves
-/// content, `fetch`, `checkout` and `clean`, else [`GIT_SHORT_LIMIT`]; a test's own bound in place of both when it set
-/// one.
-fn step_limit(step: &str) -> Duration {
+/// The bound of the run's git step `step` of the class `class`, as the Windows box bounds it; a test's own bound in
+/// place of both classes when it set one. A test build notes each step's class ([`test_limit::classes`]).
+fn step_limit(step: &str, class: GitClass) -> Duration {
+    test_limit::note(step, class);
     if let Some(limit) = test_limit::get() {
         return limit;
     }
-    if matches!(step, "fetch" | "checkout" | "clean") {
-        GIT_LONG_LIMIT
-    } else {
-        GIT_SHORT_LIMIT
+    match class {
+        GitClass::Short => GIT_SHORT_LIMIT,
+        GitClass::Long => GIT_LONG_LIMIT,
     }
 }
 
-/// A bound a test sets for every run git step on its own thread, so it proves a bound in seconds.
+/// A bound a test sets for every run git step on its own thread, so it proves a bound in seconds; and the class each
+/// step on the thread was given.
 #[cfg(test)]
 pub mod test_limit {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::time::Duration;
+
+    use super::GitClass;
 
     thread_local! {
         static LIMIT: Cell<Option<Duration>> = const { Cell::new(None) };
+        static CLASSES: RefCell<Vec<(String, GitClass)>> = const { RefCell::new(Vec::new()) };
     }
 
     /// Sets the bound of every run git step this thread runs from now on.
@@ -468,6 +504,17 @@ pub mod test_limit {
     pub fn get() -> Option<Duration> {
         LIMIT.with(Cell::get)
     }
+
+    /// Notes that the step `step` was given `class`.
+    pub fn note(step: &str, class: GitClass) {
+        CLASSES.with(|classes| classes.borrow_mut().push((step.to_owned(), class)));
+    }
+
+    /// Each step this thread ran since the last call, with its class, in order.
+    #[must_use]
+    pub fn classes() -> Vec<(String, GitClass)> {
+        CLASSES.with(|classes| std::mem::take(&mut *classes.borrow_mut()))
+    }
 }
 
 /// No test bound outside the tests.
@@ -475,10 +522,15 @@ pub mod test_limit {
 mod test_limit {
     use std::time::Duration;
 
+    use super::GitClass;
+
     /// None.
     pub fn get() -> Option<Duration> {
         None
     }
+
+    /// Nothing is noted.
+    pub fn note(_step: &str, _class: GitClass) {}
 }
 
 #[cfg(test)]
@@ -487,10 +539,15 @@ mod tests {
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError, mpsc};
+    use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{CLOSED_STATUS, GIT_OUTPUT_CAP, Git, RunGit, Steps, test_limit};
-    use crate::console::{FailingSink, LineSink, Output, RecordingSink, Stream};
+    use super::{CLOSED_STATUS, GIT_LEFTOVER, GIT_OUTPUT_CAP, Git, GitClass, RunGit, Steps, test_limit};
+    use crate::console::{FailingSink, HungUpSink, LineSink, Output, RecordingSink, Stream};
+    use crate::files::held_for_test;
+    use crate::process::{GroupRecord, signal_log};
 
     /// A test's hang guard: far past what a step the case ends early takes, far short of the sleep it ends.
     const ENDED_WELL_BEFORE: Duration = Duration::from_secs(20);
@@ -522,11 +579,24 @@ mod tests {
             format!("{}/k.lock", self.parent().display())
         }
 
-        /// Runs `check` with the run's git of this case writing to `output`.
-        fn with_git<S: LineSink>(&self, output: &Output<S>, check: impl FnOnce(&RunGit<'_, S>)) {
+        fn record(&self) -> PathBuf {
+            self.parent().join("k.pgid")
+        }
+
+        /// Runs `check` with the run's git of this case writing to `output`, its groups recorded when `recorded`.
+        fn with_git_recorded<S: LineSink + 'static>(&self, output: &Arc<Output<S>>, recorded: bool, check: impl FnOnce(&RunGit<'_, S>)) {
             let parent = self.parent();
             let lock = self.lock();
-            check(&RunGit::new(Git::of(self.root(), Path::new(&parent)), &lock, output));
+            let held = recorded.then(|| held_for_test(Path::new(&lock)));
+            let record = held
+                .as_ref()
+                .map(|held| GroupRecord::new(self.record(), "gate-remote-k-0123456789ab", held));
+            check(&RunGit::new(Git::of(self.root(), Path::new(&parent)), &lock, output, record));
+        }
+
+        /// Runs `check` with the run's git of this case writing to `output`.
+        fn with_git<S: LineSink + 'static>(&self, output: &Arc<Output<S>>, check: impl FnOnce(&RunGit<'_, S>)) {
+            self.with_git_recorded(output, false, check);
         }
     }
 
@@ -546,10 +616,14 @@ mod tests {
         owned.iter().map(String::as_str).collect()
     }
 
+    fn recording() -> Arc<Output<RecordingSink>> {
+        Arc::new(Output::new(RecordingSink::default()))
+    }
+
     #[test]
     fn a_run_step_forwards_each_line_git_says_on_stderr_and_fails_with_git_s_status() {
         let case = Case::new("forward");
-        let output = Output::new(RecordingSink::default());
+        let output = recording();
         case.with_git(&output, |git| {
             let failed = git
                 .step("rev-parse", &["rev-parse", "--verify", "nope"])
@@ -566,7 +640,7 @@ mod tests {
     #[test]
     fn a_forwarded_line_is_handed_on_unescaped() {
         let case = Case::new("unescaped");
-        let output = Output::new(RecordingSink::default());
+        let output = recording();
         let script = alias(r"printf 'a\033[1mb\tc\n' >&2");
         case.with_git(&output, |git| {
             git.step("x", &words(&script)).expect("the alias runs");
@@ -577,44 +651,139 @@ mod tests {
     #[test]
     fn a_run_step_whose_forward_finds_the_client_gone_is_ended_at_once_with_the_closed_status() {
         let case = Case::new("gone");
-        let output = Output::new(FailingSink::new(io::ErrorKind::BrokenPipe));
+        let output = Arc::new(Output::new(FailingSink::new(io::ErrorKind::BrokenPipe)));
         let script = alias("echo a >&2; sleep 60");
         case.with_git(&output, |git| {
             let started = Instant::now();
-            let failed = git.forwarded("fetch", &words(&script)).expect_err("the client is gone");
+            let failed = git.forwarded("fetch", &words(&script), GitClass::Long).expect_err("the client is gone");
             assert!(started.elapsed() < ENDED_WELL_BEFORE, "the step is ended, not waited for");
             assert_eq!(failed.lines, ["gate: remote the client closed the connection during git fetch"]);
             assert_eq!(failed.status, CLOSED_STATUS);
 
-            let again = git.forwarded("git init", &["--version"]).expect_err("a gone client starts no more steps");
+            let again = git
+                .forwarded("git init", &["--version"], GitClass::Short)
+                .expect_err("a gone client starts no more steps");
             assert_eq!(again.lines, ["gate: remote the client closed the connection during git init"]);
         });
     }
 
     #[test]
-    fn a_forward_that_fails_otherwise_ends_the_step_as_a_gone_client_does() {
+    fn a_forward_that_fails_with_a_reset_connection_sets_the_shared_flag_and_ends_the_step() {
         let case = Case::new("failed-forward");
-        let output = Output::new(FailingSink::new(io::ErrorKind::Other));
+        let output = Arc::new(Output::new(FailingSink::new(io::ErrorKind::ConnectionReset)));
         let script = alias("echo a >&2; sleep 60");
         case.with_git(&output, |git| {
             let started = Instant::now();
-            let failed = git.forwarded("clean", &words(&script)).expect_err("the forward failed");
+            let failed = git.forwarded("clean", &words(&script), GitClass::Long).expect_err("the forward failed");
             assert!(started.elapsed() < ENDED_WELL_BEFORE, "the step is ended, not waited for");
             assert_eq!(failed.status, CLOSED_STATUS);
         });
+        assert!(output.client_gone(), "the shared flag is set");
+    }
+
+    #[test]
+    fn a_quiet_step_whose_client_hung_up_is_ended_by_the_probe() {
+        let case = Case::new("probe");
+        let output = Arc::new(Output::new(HungUpSink));
+        let script = alias("sleep 60");
+        case.with_git(&output, |git| {
+            let started = Instant::now();
+            let failed = git.quiet("cat-file", &words(&script), GitClass::Short).expect_err("the client hung up");
+            assert!(started.elapsed() < ENDED_WELL_BEFORE, "the step is not started, or ended at once");
+            assert_eq!(failed.status, CLOSED_STATUS);
+        });
+    }
+
+    /// A sink whose reader hangs up only once `marker` is made, which the step's own program makes after its spawn.
+    struct HangsUpLater {
+        marker: PathBuf,
+    }
+
+    impl LineSink for HangsUpLater {
+        fn write_line(&self, _stream: Stream, _line: &str) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn hung_up(&self) -> bool {
+            self.marker.exists()
+        }
+    }
+
+    #[test]
+    fn a_client_that_hangs_up_while_a_quiet_step_waits_ends_it_at_the_next_probe_with_the_closed_status() {
+        let case = Case::new("probe-later");
+        let marker = case.base.join("spawned");
+        let output = Arc::new(Output::new(HangsUpLater { marker: marker.clone() }));
+        let script = alias(&format!("touch '{}'; sleep 60", marker.display()));
+        case.with_git(&output, |git| {
+            let started = Instant::now();
+            let failed = git.quiet("cat-file", &words(&script), GitClass::Short).expect_err("the client hung up");
+            assert!(started.elapsed() < ENDED_WELL_BEFORE, "ended at a probe, well inside its bound");
+            assert_eq!(failed.status, CLOSED_STATUS);
+        });
+        assert!(marker.exists(), "the step was spawned before the client hung up");
+    }
+
+    /// A sink whose first write never returns, a client still connected that has stopped reading; every later write
+    /// is kept.
+    #[derive(Default)]
+    struct StuckSink {
+        stuck: AtomicBool,
+        later: Mutex<Vec<String>>,
+    }
+
+    impl LineSink for StuckSink {
+        fn write_line(&self, _stream: Stream, line: &str) -> io::Result<()> {
+            if !self.stuck.swap(true, Ordering::SeqCst) {
+                loop {
+                    thread::park();
+                }
+            }
+            self.later.lock().unwrap_or_else(PoisonError::into_inner).push(line.to_owned());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_client_stalled_in_a_write_ends_the_step_closed_within_the_drain_bound_and_says_no_leftover_line() {
+        let case = Case::new("stalled");
+        let output = Arc::new(Output::new(StuckSink::default()));
+        let script = alias("echo a >&2; echo b >&2");
+        let (sender, receiver) = mpsc::channel();
+        let started = Instant::now();
+        let stepping = Arc::clone(&output);
+        // On a thread of its own: a step that writes to the stalled client after the drain would never return.
+        thread::spawn(move || {
+            case.with_git(&stepping, |git| {
+                let _ = sender.send(git.forwarded("fetch", &words(&script), GitClass::Long).map(|ran| ran.status));
+            });
+        });
+        let ended = receiver
+            .recv_timeout(Duration::from_secs(90))
+            .expect("the step ends within the drain bound");
+        assert!(started.elapsed() < Duration::from_secs(45), "the drain's whole bound is 30 s");
+        let failed = ended.expect_err("the client is taken for gone");
+        assert_eq!(failed.status, CLOSED_STATUS);
+        assert!(output.client_gone(), "the shared flag is set");
+        let later = output.sink().later.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert!(later.is_empty(), "nothing more is written: {later:?}");
     }
 
     #[test]
     fn a_bare_step_runs_to_its_end_though_the_client_is_gone() {
         let case = Case::new("bare-gone");
-        let output = Output::new(FailingSink::new(io::ErrorKind::BrokenPipe));
+        let output = Arc::new(Output::new(FailingSink::new(io::ErrorKind::BrokenPipe)));
         let marker = case.base.join("finished");
         let script = alias(&format!("echo a >&2; sleep 1; touch '{}'", marker.display()));
         case.with_git(&output, |git| {
-            let failed = git.bare_step("back ref reset", &words(&script)).expect_err("the client is gone");
+            let failed = git
+                .bare_step("back ref reset", &words(&script), GitClass::Short)
+                .expect_err("the client is gone");
             assert_eq!(failed.status, CLOSED_STATUS);
             assert!(marker.exists(), "the step was not cut short");
-            let again = git.bare_step("back ref reset", &words(&script)).expect_err("the client is still gone");
+            let again = git
+                .bare_step("back ref reset", &words(&script), GitClass::Short)
+                .expect_err("the client is still gone");
             assert_eq!(again.status, CLOSED_STATUS, "a bare step still starts");
         });
     }
@@ -622,28 +791,141 @@ mod tests {
     #[test]
     fn a_step_past_its_bound_is_ended_with_the_windows_box_s_line() {
         let case = Case::new("bound");
-        let output = Output::new(RecordingSink::default());
+        let output = recording();
         let script = alias("sleep 60");
         test_limit::set(Duration::from_millis(500));
         case.with_git(&output, |git| {
             let started = Instant::now();
-            let failed = git.forwarded("fetch", &words(&script)).expect_err("the step is past its bound");
+            let failed = git
+                .forwarded("fetch", &words(&script), GitClass::Long)
+                .expect_err("the step is past its bound");
             assert!(started.elapsed() < ENDED_WELL_BEFORE, "the step is ended at its bound");
             assert_eq!(failed.lines, ["gate: remote fetch failed: git did not answer within 500 ms"]);
             assert_eq!(failed.status, 1);
         });
+        let sent = signal_log::take();
+        assert!(!sent.is_empty() && sent.iter().all(|sent| sent.unreaped), "{sent:?}");
+    }
+
+    #[test]
+    fn a_step_s_group_is_recorded_while_it_runs_and_the_record_removed_after() {
+        let case = Case::new("record");
+        let output = recording();
+        let record = case.record();
+        let script = alias(&format!("cat '{}'", record.display()));
+        case.with_git_recorded(&output, true, |git| {
+            let said = git.step("x", &words(&script)).expect("the alias runs");
+            let said = String::from_utf8_lossy(&said).into_owned();
+            let mut lines = said.lines();
+            assert_eq!(lines.next(), Some("gate-remote-k-0123456789ab"), "{said}");
+            let group: i32 = lines.next().and_then(|line| line.parse().ok()).expect("the group is recorded");
+            assert!(group > 1, "{said}");
+        });
+        assert!(!record.exists(), "the record is removed once the step ends");
+        let names: Vec<String> = fs::read_dir(case.parent())
+            .expect("the folder is read")
+            .map(|entry| entry.expect("an entry is read").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|name| !name.contains("gate-new")), "no temp file is left: {names:?}");
+    }
+
+    #[test]
+    fn a_step_whose_work_lock_is_no_longer_held_is_not_started() {
+        let case = Case::new("lock-lost-before");
+        let output = recording();
+        let marker = case.base.join("started");
+        let script = alias(&format!("touch '{}'", marker.display()));
+        let lock = case.lock();
+        case.with_git_recorded(&output, true, |git| {
+            fs::remove_file(&lock).expect("the lock file is removed");
+            let failed = git.step("x", &words(&script)).expect_err("the lock is lost");
+            assert_eq!(
+                failed.lines,
+                [format!("gate: remote x failed: the work folder lock {lock} is no longer held")]
+            );
+            assert_eq!(failed.status, 1);
+        });
+        assert!(!marker.exists(), "the step was not started");
+        assert!(!case.record().exists(), "no record is written");
+    }
+
+    #[test]
+    fn a_step_whose_work_lock_is_lost_while_it_runs_fails_and_leaves_its_record() {
+        let case = Case::new("lock-lost-during");
+        let output = recording();
+        let lock = case.lock();
+        let script = alias(&format!("rm '{lock}'"));
+        case.with_git_recorded(&output, true, |git| {
+            let failed = git.step("x", &words(&script)).expect_err("the lock is lost");
+            assert_eq!(
+                failed.lines,
+                [format!("gate: remote x failed: the work folder lock {lock} is no longer held")]
+            );
+            assert_eq!(failed.status, 1);
+        });
+        assert!(case.record().exists(), "the record is changed only under a held lock");
+    }
+
+    #[test]
+    fn a_leftover_holding_git_s_output_is_said_and_git_s_status_kept() {
+        let case = Case::new("leftover");
+        let output = recording();
+        // Git exits only once the perl has left its group, so the perl is out of reach of the leftovers' ending.
+        let marker = case.base.join("escaped");
+        let script = alias(&format!(
+            "perl -e 'use POSIX; POSIX::setsid(); open(F, \">\", $ARGV[0]); close F; sleep 30' '{0}' >&2 & \
+             while [ ! -e '{0}' ]; do sleep 0.05; done; echo $!",
+            marker.display()
+        ));
+        case.with_git(&output, |git| {
+            let started = Instant::now();
+            let ran = git.forwarded("x", &words(&script), GitClass::Short).expect("the alias runs");
+            let escaped: i32 = String::from_utf8_lossy(&ran.stdout).trim().parse().expect("the pid is said");
+            // SAFETY: `escaped` is the perl this case started; the kill only ends it.
+            unsafe {
+                libc::kill(escaped, libc::SIGKILL);
+            }
+            assert!(started.elapsed() < ENDED_WELL_BEFORE);
+            assert!(ran.status.success());
+        });
+        assert_eq!(output.sink().lines(), [(Stream::Err, GIT_LEFTOVER.to_owned())]);
+    }
+
+    #[test]
+    fn a_leftover_holding_a_quiet_step_s_output_is_not_said_as_the_windows_box_says_none() {
+        let case = Case::new("quiet-leftover");
+        let output = recording();
+        let marker = case.base.join("escaped");
+        let script = alias(&format!(
+            "perl -e 'use POSIX; POSIX::setsid(); open(F, \">\", $ARGV[0]); close F; sleep 30' '{0}' >&2 & \
+             while [ ! -e '{0}' ]; do sleep 0.05; done; echo $!",
+            marker.display()
+        ));
+        case.with_git(&output, |git| {
+            let ran = git.quiet("x", &words(&script), GitClass::Short).expect("the alias runs");
+            let escaped: i32 = String::from_utf8_lossy(&ran.stdout).trim().parse().expect("the pid is said");
+            // SAFETY: `escaped` is the perl this case started; the kill only ends it.
+            unsafe {
+                libc::kill(escaped, libc::SIGKILL);
+            }
+            assert!(ran.leftover, "the escaped perl held git's standard error open");
+            assert!(ran.status.success());
+        });
+        assert!(output.sink().lines().is_empty(), "{:?}", output.sink().lines());
     }
 
     #[test]
     fn standard_output_past_one_mib_fails_the_step_and_one_mib_fits() {
         let case = Case::new("stdout-cap");
-        let output = Output::new(RecordingSink::default());
+        let output = recording();
         let over = alias(&format!("head -c {} /dev/zero", GIT_OUTPUT_CAP + 1));
         let fits = alias(&format!("head -c {GIT_OUTPUT_CAP} /dev/zero"));
         case.with_git(&output, |git| {
-            let failed = git.forwarded("x", &words(&over)).expect_err("the output is over the cap");
+            let failed = git
+                .forwarded("x", &words(&over), GitClass::Short)
+                .expect_err("the output is over the cap");
             assert_eq!(failed.lines, ["gate: remote x failed: it printed more than 1048576 bytes"]);
-            let ran = git.forwarded("x", &words(&fits)).expect("exactly the cap fits");
+            let ran = git.forwarded("x", &words(&fits), GitClass::Short).expect("exactly the cap fits");
             assert_eq!(ran.stdout.len(), GIT_OUTPUT_CAP);
         });
     }
@@ -651,9 +933,11 @@ mod tests {
     #[test]
     fn a_quiet_run_step_says_nothing_of_git_s_stderr() {
         let case = Case::new("quiet");
-        let output = Output::new(RecordingSink::default());
+        let output = recording();
         case.with_git(&output, |git| {
-            let ran = git.quiet("cat-file", &["rev-parse", "--verify", "nope"]).expect("git runs to its exit");
+            let ran = git
+                .quiet("cat-file", &["rev-parse", "--verify", "nope"], GitClass::Short)
+                .expect("git runs to its exit");
             assert!(!ran.status.success());
         });
         assert!(output.sink().lines().is_empty(), "{:?}", output.sink().lines());
@@ -662,7 +946,7 @@ mod tests {
     #[test]
     fn a_run_step_carries_the_windows_box_s_safety_options() {
         let case = Case::new("options");
-        let output = Output::new(RecordingSink::default());
+        let output = recording();
         let lock = case.lock();
         case.with_git(&output, |git| {
             for (key, value) in [

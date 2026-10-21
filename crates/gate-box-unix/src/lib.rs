@@ -2,11 +2,13 @@
 //! lines and statuses a Windows box's `gate box` says, so the PC's remote client reads both alike. The request is read
 //! as the Windows box reads it and parsed by `gate-wire` under [`gate_wire::PathForm::Unix`].
 //!
-//! The modules that read no operating system state (the request, the CLI words, the lines and the console) build on
-//! every target, so their tests run on Windows too; the verbs and the process helpers are Unix only.
+//! The modules that read no operating system state (the request, the CLI words, the lines, the console and the readers
+//! that forward a program's output) build on every target, so their tests run on Windows too; the verbs and the
+//! process helpers are Unix only.
 
 pub mod cli;
 pub mod console;
+pub mod forward;
 pub mod lines;
 pub mod request;
 

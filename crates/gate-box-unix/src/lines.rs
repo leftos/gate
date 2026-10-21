@@ -372,35 +372,62 @@ pub fn readies_single(read: &io::Result<Option<String>>) -> bool {
 pub enum JobRecord {
     /// The record is another job's, or names no job: the stop finds no such job.
     Other,
-    /// The record is the job's, and its process group is this.
-    Group(i32),
-    /// The record is the job's, and its second line is no process group.
+    /// The record is the job's, and records this.
+    Group(Recorded),
+    /// The record is the job's, and its second line is no process group, or its third no session.
     Malformed,
 }
 
-/// What the job record holding `bytes` says of the job `job`: two lines, the job's name then its process group in
-/// decimal, a final line end optional.
+/// What a job record records of its job's process group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Recorded {
+    /// The process group.
+    pub group: i32,
+    /// The session the group's leader was in when it wrote the record; `None` for a two-line record of an older box.
+    pub session: Option<i32>,
+}
+
+/// What the job record holding `bytes` says of the job `job`: the job's name, then its process group in decimal, then
+/// optionally its session in decimal, each on a line, a final line end optional.
 #[must_use]
 pub fn job_record(bytes: &[u8], job: &str) -> JobRecord {
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return JobRecord::Other;
-    };
-    let mut lines = text.lines();
-    if lines.next() != Some(job) {
-        return JobRecord::Other;
-    }
-    let group = lines.next().and_then(|line| line.parse::<i32>().ok());
-    match (group, lines.next()) {
-        (Some(group), None) => JobRecord::Group(group),
-        _ => JobRecord::Malformed,
+    match record_lines(bytes) {
+        Some((named, recorded)) if named == job => recorded.map_or(JobRecord::Malformed, JobRecord::Group),
+        _ => JobRecord::Other,
     }
 }
 
-/// The text of the job record of the job `job` whose process group is `group`, as [`job_record`] reads it: the job's
-/// name, then the group in decimal, each on a line.
+/// What a job record holding `bytes` records, whatever its job, read as [`job_record`] reads it; `None` for a record
+/// of any other form.
 #[must_use]
-pub fn job_record_text(job: &str, group: i32) -> String {
-    format!("{job}\n{group}\n")
+pub fn recorded_group(bytes: &[u8]) -> Option<Recorded> {
+    record_lines(bytes).filter(|(job, _)| !job.is_empty())?.1
+}
+
+/// A job record holding `bytes` read as its lines: the job it names, its first line, and what it records
+/// ([`recorded_lines`]). `None` for bytes that are not UTF-8 or hold no line.
+fn record_lines(bytes: &[u8]) -> Option<(&str, Option<Recorded>)> {
+    let mut lines = std::str::from_utf8(bytes).ok()?.lines();
+    let job = lines.next()?;
+    Some((job, recorded_lines(&mut lines)))
+}
+
+/// The lines after a job record's first: its process group in decimal, then optionally its session in decimal, and
+/// nothing after; else `None`.
+fn recorded_lines(lines: &mut std::str::Lines<'_>) -> Option<Recorded> {
+    let group = lines.next()?.parse::<i32>().ok()?;
+    let session = match lines.next() {
+        None => None,
+        Some(line) => Some(line.parse::<i32>().ok()?),
+    };
+    lines.next().is_none().then_some(Recorded { group, session })
+}
+
+/// The text of the job record of the job `job` whose process group is `group`, made in the session `session`, as
+/// [`job_record`] reads it: the job's name, the group, then the session in decimal, each on a line.
+#[must_use]
+pub fn job_record_text(job: &str, group: i32, session: i32) -> String {
+    format!("{job}\n{group}\n{session}\n")
 }
 
 /// Refuses to signal the process group `group` when it is no run's: 1 or below (init, or every process the box may
@@ -426,10 +453,38 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        JobRecord, PATH_MARKER, Probed, RootFacts, boot_line, created_line, folder_failure, folder_flaw, is_git_variable, job_record,
+        JobRecord, PATH_MARKER, Probed, Recorded, RootFacts, boot_line, created_line, folder_failure, folder_flaw, is_git_variable, job_record,
         job_record_text, layout_text, marked_path, names_another_layout, no_answer, probed, readies_single, record_unread, record_without_group,
-        root_flaw, root_unsafe_line, sdk_list, sdks_line, signal_guard, step_unran, tool_line, version_line, warm_text, work_layout, write_failure,
+        recorded_group, root_flaw, root_unsafe_line, sdk_list, sdks_line, signal_guard, step_unran, tool_line, version_line, warm_text, work_layout,
+        write_failure,
     };
+
+    #[test]
+    fn a_recorded_group_is_read_whatever_job_the_record_names() {
+        assert_eq!(
+            recorded_group(job_record_text("gate-remote-k-0123456789ab", 4242, 99).as_bytes()),
+            Some(Recorded {
+                group: 4242,
+                session: Some(99)
+            })
+        );
+        assert_eq!(
+            recorded_group(b"another-job\n17"),
+            Some(Recorded { group: 17, session: None }),
+            "a two-line record of an older box, a final line end optional"
+        );
+        for malformed in [
+            &b""[..],
+            b"job\n",
+            b"job\nx\n",
+            b"\n17\n",
+            b"job\n17\nmore\n",
+            b"job\n17\n5\n6\n",
+            &[0xff, b'\n', b'1'],
+        ] {
+            assert_eq!(recorded_group(malformed), None, "{malformed:?}");
+        }
+    }
 
     #[test]
     fn a_work_root_holding_a_colon_is_a_usage_error() {
@@ -656,23 +711,45 @@ mod tests {
 
     const JOB: &str = "gate-remote-repo-0123abcd-0123456789ab";
 
+    /// What a two-line record of `group` records.
+    fn two_line(group: i32) -> JobRecord {
+        JobRecord::Group(Recorded { group, session: None })
+    }
+
     #[test]
     fn a_job_record_names_its_job_then_its_process_group() {
-        assert_eq!(job_record(format!("{JOB}\n4242\n").as_bytes(), JOB), JobRecord::Group(4242));
+        assert_eq!(job_record(format!("{JOB}\n4242\n").as_bytes(), JOB), two_line(4242));
         assert_eq!(
             job_record(format!("{JOB}\r\n4242").as_bytes(), JOB),
-            JobRecord::Group(4242),
+            two_line(4242),
             "CRLF, no final line end"
+        );
+        assert_eq!(
+            job_record(format!("{JOB}\n4242\n77").as_bytes(), JOB),
+            JobRecord::Group(Recorded {
+                group: 4242,
+                session: Some(77)
+            }),
+            "then its session"
         );
     }
 
     #[test]
-    fn a_job_record_s_text_reads_back_as_its_job_and_group() {
-        assert_eq!(job_record_text(JOB, 4242), format!("{JOB}\n4242\n"));
-        assert_eq!(job_record(job_record_text(JOB, 4242).as_bytes(), JOB), JobRecord::Group(4242));
+    fn a_job_record_s_text_reads_back_as_its_job_group_and_session() {
+        assert_eq!(job_record_text(JOB, 4242, 77), format!("{JOB}\n4242\n77\n"));
         assert_eq!(
-            job_record(job_record_text(JOB, -7).as_bytes(), JOB),
-            JobRecord::Group(-7),
+            job_record(job_record_text(JOB, 4242, 77).as_bytes(), JOB),
+            JobRecord::Group(Recorded {
+                group: 4242,
+                session: Some(77)
+            })
+        );
+        assert_eq!(
+            job_record(job_record_text(JOB, -7, 77).as_bytes(), JOB),
+            JobRecord::Group(Recorded {
+                group: -7,
+                session: Some(77)
+            }),
             "read back, refused by the guard"
         );
     }
@@ -690,6 +767,7 @@ mod tests {
             format!("{JOB}\n"),
             format!("{JOB}\nabc\n"),
             format!("{JOB}\n42\nmore\n"),
+            format!("{JOB}\n42\n7\n8\n"),
             format!("{JOB}\n 42\n"),
         ] {
             assert_eq!(job_record(bad.as_bytes(), JOB), JobRecord::Malformed, "{bad:?}");
