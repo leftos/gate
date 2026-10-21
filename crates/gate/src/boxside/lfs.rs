@@ -41,6 +41,7 @@ use crate::console::Console;
 use crate::outputs::archive::{Entry, PcFiles, unpack};
 use crate::outputs::manifest::{MANIFEST_LIMIT, Manifest};
 use crate::remote::lfs::{Listed, NO_SCRATCH, Object, POINTER_MOST, Pointer, manifest_digest, parsed_pointer};
+use crate::remote::{Refusal, refused_line as tagged_line};
 
 /// The bytes in one gibibyte.
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -160,7 +161,7 @@ pub(super) fn lfs(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
 
 /// Says the step is refused `lfs` and failed for `why`: the tag line, then the step's failure line; 1.
 fn refused(asked: &Asked<'_>, why: &str, console: &mut Console) -> u32 {
-    console.err(&format!("gate-remote-refused: {} lfs", asked.nonce));
+    console.err(&refused_line(asked.nonce));
     console.err(&format!("gate: remote lfs {} failed: {}", asked.step.word(), escaped(why)));
     FAILED_STATUS
 }
@@ -570,7 +571,7 @@ pub(super) const CHECKOUT_PINS: [&str; 20] = [
 
 /// The line refusing a run `lfs`, for the run's `nonce`.
 pub(super) fn refused_line(nonce: &str) -> String {
-    format!("gate-remote-refused: {nonce} lfs")
+    tagged_line(nonce, Refusal::Lfs)
 }
 
 /// The line after [`refused_line`] of a run whose LFS content is not what the snapshot of the work folder `key` needs,

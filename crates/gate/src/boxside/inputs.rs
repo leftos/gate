@@ -108,7 +108,7 @@ impl Book {
 
 /// The tag a run whose `InputsDigest` the work folder's inputs record does not hold is refused with.
 pub(super) fn refused_line(nonce: &str) -> String {
-    format!("gate-remote-refused: {nonce} inputs")
+    tagged_line(nonce, Refusal::Inputs)
 }
 
 /// Why the work folder `work`, held as `held`, does not hold the files of the manifest whose digest is `sent`, as the

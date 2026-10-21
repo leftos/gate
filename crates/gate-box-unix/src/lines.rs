@@ -231,13 +231,18 @@ pub struct RootFacts {
 }
 
 /// The work root of the work folder `work`, `<root>/work/<key>` ([`gate_wire::work_root`]), and the folder holding
-/// the work folders, `<root>/work`; else the usage line.
+/// the work folders, `<root>/work`; else the usage line. A root holding a `:` is refused: the git steps set
+/// `GIT_CEILING_DIRECTORIES` to the root, a list that git splits at every `:` with no escape.
 ///
 /// # Errors
 ///
-/// The usage line of a `work` not laid out so.
+/// The usage line of a `work` not laid out so, or of a root holding a `:`.
 pub fn work_layout(work: &str) -> Result<(String, &Path), String> {
     match (work_root(work, PathForm::Unix), Path::new(work).parent()) {
+        (Some(root), Some(_)) if root.contains(':') => Err(format!(
+            "gate: box payload Work must be <root>/work/<key> with no ':' in <root>, which GIT_CEILING_DIRECTORIES cannot hold: {}",
+            escaped(work)
+        )),
         (Some(root), Some(parent)) => Ok((root, parent)),
         _ => Err(format!(
             "gate: box payload Work must be <root>/work/<key> to lock its root down: {}",
@@ -289,6 +294,17 @@ pub fn folder_failure(path: &str, why: &str) -> String {
 #[must_use]
 pub fn write_failure(path: &str, error: &str) -> String {
     format!("gate: remote could not write {}: {}", escaped(path), escaped(error))
+}
+
+/// `gate: remote <path> was written but its folder could not be synced: <error>`, both escaped: the new text is in
+/// place, its rename not yet on the drive.
+#[must_use]
+pub fn unsynced_failure(path: &str, error: &str) -> String {
+    format!(
+        "gate: remote {} was written but its folder could not be synced: {}",
+        escaped(path),
+        escaped(error)
+    )
 }
 
 /// `gate: remote <step> failed: <why>`, the line of a git step that did not run to an exit, `why` escaped.
@@ -380,6 +396,13 @@ pub fn job_record(bytes: &[u8], job: &str) -> JobRecord {
     }
 }
 
+/// The text of the job record of the job `job` whose process group is `group`, as [`job_record`] reads it: the job's
+/// name, then the group in decimal, each on a line.
+#[must_use]
+pub fn job_record_text(job: &str, group: i32) -> String {
+    format!("{job}\n{group}\n")
+}
+
 /// Refuses to signal the process group `group` when it is no run's: 1 or below (init, or every process the box may
 /// signal) or the box's own `own`. Else why, as the stop line says it.
 ///
@@ -403,10 +426,25 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        JobRecord, PATH_MARKER, Probed, RootFacts, boot_line, created_line, folder_failure, folder_flaw, is_git_variable, job_record, layout_text,
-        marked_path, names_another_layout, no_answer, probed, readies_single, record_unread, record_without_group, root_flaw, root_unsafe_line,
-        sdk_list, sdks_line, signal_guard, step_unran, tool_line, version_line, warm_text, write_failure,
+        JobRecord, PATH_MARKER, Probed, RootFacts, boot_line, created_line, folder_failure, folder_flaw, is_git_variable, job_record,
+        job_record_text, layout_text, marked_path, names_another_layout, no_answer, probed, readies_single, record_unread, record_without_group,
+        root_flaw, root_unsafe_line, sdk_list, sdks_line, signal_guard, step_unran, tool_line, version_line, warm_text, work_layout, write_failure,
     };
+
+    #[test]
+    fn a_work_root_holding_a_colon_is_a_usage_error() {
+        let refused = |shown: &str| {
+            Err(format!(
+                "gate: box payload Work must be <root>/work/<key> with no ':' in <root>, which GIT_CEILING_DIRECTORIES cannot hold: {shown}"
+            ))
+        };
+        assert_eq!(work_layout("/Volumes/Build:1/work/k"), refused("/Volumes/Build:1/work/k"));
+        assert_eq!(work_layout("/g/a:b\n/work/k"), refused(r"/g/a:b\n/work/k"), "the path is escaped");
+        assert_eq!(
+            work_layout("/g/work/k").map(|(root, parent)| (root, parent.to_owned())),
+            Ok(("/g".to_owned(), std::path::PathBuf::from("/g/work")))
+        );
+    }
 
     #[test]
     fn the_boot_time_has_seven_fractional_digits_and_a_z() {
@@ -625,6 +663,17 @@ mod tests {
             job_record(format!("{JOB}\r\n4242").as_bytes(), JOB),
             JobRecord::Group(4242),
             "CRLF, no final line end"
+        );
+    }
+
+    #[test]
+    fn a_job_record_s_text_reads_back_as_its_job_and_group() {
+        assert_eq!(job_record_text(JOB, 4242), format!("{JOB}\n4242\n"));
+        assert_eq!(job_record(job_record_text(JOB, 4242).as_bytes(), JOB), JobRecord::Group(4242));
+        assert_eq!(
+            job_record(job_record_text(JOB, -7).as_bytes(), JOB),
+            JobRecord::Group(-7),
+            "read back, refused by the guard"
         );
     }
 

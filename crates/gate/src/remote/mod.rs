@@ -71,54 +71,8 @@ const FAILED: i64 = 1;
 /// What a client failure says: `gate: the remote run failed: <why>`.
 const FAILED_RUN: &str = "gate: the remote run failed";
 
-/// The line the box says when another run holds the work folder `key`, just after its refusal tag.
-pub(crate) fn busy_line(key: &str) -> String {
-    format!("gate: remote work folder {key} is busy")
-}
-
-/// Why the box refused a run, as its refusal tag names it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Refusal {
-    /// Another run holds the work folder.
-    Busy,
-    /// The work folder's dotnet tools could not be restored.
-    Tools,
-    /// The work folder could not be cleared or laid out for the run's repos.
-    Layout,
-    /// The work folder does not hold the inputs the run's `InputsDigest` names.
-    Inputs,
-    /// The work folder does not hold the PC's build the run's `SentDigest` names.
-    Sent,
-    /// The run asked for the builder's desktop and could not have it: nobody is logged on at the console or it is
-    /// locked, another user holds it, or another run held the desktop for the whole wait the run gave.
-    Desktop,
-    /// The desktop helper the run would hand its command to is not installed where only administrators can change it.
-    Install,
-    /// The repo's LFS store does not hold what the run's snapshot's pointers name as its `LfsDigest` says.
-    Lfs,
-}
-
-impl Refusal {
-    /// The word the refusal tag names it by.
-    fn word(self) -> &'static str {
-        match self {
-            Refusal::Busy => "busy",
-            Refusal::Tools => "tools",
-            Refusal::Layout => "layout",
-            Refusal::Inputs => "inputs",
-            Refusal::Sent => "sent",
-            Refusal::Desktop => "desktop",
-            Refusal::Install => "install",
-            Refusal::Lfs => "lfs",
-        }
-    }
-}
-
-/// The line the box says when it could not clear or lay out the work folder of the repo `repo` for `why`, just after
-/// its refusal tag; the PC passes it on as it runs the command itself.
-pub(crate) fn layout_line(repo: &str, why: &str) -> String {
-    format!("gate: not routed: the builder could not clear {repo}'s work folder: {why}")
-}
+// The protocol lines the box says and the client matches, built once in `gate-wire` for every box.
+pub(crate) use gate_wire::{BoxKill, Refusal, adjusted_line, adjusted_prefix, busy_line, killed_line, layout_line, refused_line, started_line};
 
 /// What the box says on standard error, before why, when it refuses to act because the builder's gate install is not
 /// trusted: its own program, or the desktop helper a desktop run hands its command to, is not installed where only
@@ -195,72 +149,12 @@ pub(crate) fn root_busy_why<'a>(status: i32, said: impl IntoIterator<Item = &'a 
     refusal_why(status, ROOT_STATUS, ROOT_BUSY, said)
 }
 
-/// The start marker the box says on stderr just before it starts the command of the run whose payload carries `nonce`:
-/// `gate-remote-started: <nonce>`. A call that said it is past the banner, so the client never makes it again.
-///
-/// The nonce only tells runs apart: it is no secret, as it is on the box's and ssh's command lines. That a command
-/// cannot forge a refusal rests on the box saying this line before the command can run any code (before it creates
-/// the command's process, or, in a desktop run, before it resumes the process the helper created suspended), and on
-/// the client ignoring every refusal tag once it has seen this line, whatever order the two came in.
-pub(crate) fn started_line(nonce: &str) -> String {
-    format!("gate-remote-started: {nonce}")
-}
-
-/// The refusal tag the box says on stderr just before the human line of a refusal of the run whose payload carries
-/// `nonce`: `gate-remote-refused: <nonce> busy|tools|layout|inputs|desktop|install`. The client reads a refusal from this line
-/// alone.
-///
-/// The nonce is no secret, as [`started_line`] says: a command can say this line too, and the client ignores it
-/// because the box's start marker came before anything the command says.
-pub(crate) fn refused_line(nonce: &str, refusal: Refusal) -> String {
-    format!("gate-remote-refused: {nonce} {}", refusal.word())
-}
-
-/// Why the box killed the command of a run itself: its load-adjusted ceiling, or the backstop of five ceilings of wall
-/// time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BoxKill {
-    /// The command's load-adjusted clock reached its ceiling.
-    TimedOut,
-    /// The command ran five ceilings of wall time, its clock not having reached the ceiling, or its sampler failed.
-    Backstop,
-}
-
-impl BoxKill {
-    /// The verdict a run the box killed for this is journalled with.
-    pub(crate) fn verdict(self) -> Verdict {
-        match self {
-            BoxKill::TimedOut => Verdict::TimedOut,
-            BoxKill::Backstop => Verdict::Backstop,
-        }
+/// The verdict a run the box killed for `kill` is journalled with.
+pub(crate) fn box_kill_verdict(kill: BoxKill) -> Verdict {
+    match kill {
+        BoxKill::TimedOut => Verdict::TimedOut,
+        BoxKill::Backstop => Verdict::Backstop,
     }
-
-    /// The word the kill tag names it by, the verdict it gives the run.
-    pub(crate) fn word(self) -> &'static str {
-        match self {
-            BoxKill::TimedOut => "timed-out",
-            BoxKill::Backstop => "backstop",
-        }
-    }
-}
-
-/// The kill tag the box says on stderr just after its kill line, when it killed the command of the run whose payload
-/// carries `nonce` itself: `gate-remote-killed: <nonce> timed-out|backstop`. The client reads the box's kill from this
-/// line alone, as a status 124 is also what a stopped job or the command itself may end with.
-pub(crate) fn killed_line(nonce: &str, kill: BoxKill) -> String {
-    format!("gate-remote-killed: {nonce} {}", kill.word())
-}
-
-/// The line the box says on stderr once its watch of the command of the run whose payload carries `nonce` ended and its
-/// readers drained: the load-adjusted seconds it counted, to three decimals, as the journal keeps them,
-/// `gate-remote-adjusted: <nonce> <s.sss>`. Never said once its sampler failed.
-pub(crate) fn adjusted_line(nonce: &str, seconds: f64) -> String {
-    format!("gate-remote-adjusted: {nonce} {seconds:.3}")
-}
-
-/// The prefix of the adjusted line ([`adjusted_line`]) of the run whose payload carries `nonce`, its seconds after it.
-pub(crate) fn adjusted_prefix(nonce: &str) -> String {
-    format!("gate-remote-adjusted: {nonce} ")
 }
 
 /// What runs a routed command on the builder.

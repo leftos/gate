@@ -26,7 +26,7 @@ use std::sync::{Arc, PoisonError, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use gate_args::{BoxSeams, EnvRefusal, env_refusal, is_godot_console, over_cap, repeated_name, shown_name};
+use gate_args::{BoxSeams, is_godot_console};
 use gate_router::escaped;
 use gate_watchdog::{Kill, Pump, is_wsl_command};
 use gate_win32::{
@@ -138,16 +138,6 @@ const RENEWING_SUFFIX: &str = ".new";
 /// The SID of the Administrators group, which owns what an elevated box makes.
 const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
 
-/// The identity variables the payload may set for the back commit.
-const IDENTITY_NAMES: [&str; 6] = [
-    "GIT_AUTHOR_NAME",
-    "GIT_AUTHOR_EMAIL",
-    "GIT_AUTHOR_DATE",
-    "GIT_COMMITTER_NAME",
-    "GIT_COMMITTER_EMAIL",
-    "GIT_COMMITTER_DATE",
-];
-
 /// What a run reads of its payload. `work` is the work folder, which the lock, the index and the tools record sit beside;
 /// it is the main repo's tree on a run of one repo, and holds the tree of each repo of a sibling pair.
 pub(super) struct Request<'a> {
@@ -233,8 +223,8 @@ impl Request<'_> {
             return Err("gate: box payload asks a warm-up for the desktop".to_owned());
         }
         let subfolder = payload.optional_text("Subfolder")?;
-        let identity = identity(payload)?;
-        let env = caller_env(payload)?;
+        let identity = payload.identity()?;
+        let env = payload.caller_env()?;
         let godot = payload.godot_version()?;
         let refused = preflight::refused_folders(payload, work);
         // Before the engine is resolved, so a malformed one is refused before any engine folder is probed.
@@ -568,53 +558,6 @@ impl<'a> Repo<'a> {
     fn step(&self, step: &str) -> String {
         preflight::named_step(step, self.name.as_deref())
     }
-}
-
-/// The payload's `Identity`: only the git author and committer variables, none holding a NUL; else the usage line.
-fn identity(payload: &Payload) -> Result<Vec<(String, String)>, String> {
-    let pairs = payload.pairs("Identity")?;
-    for (name, value) in &pairs {
-        if !IDENTITY_NAMES.contains(&name.as_str()) {
-            return Err(format!(
-                "gate: box payload Identity may set only GIT_AUTHOR_* and GIT_COMMITTER_* names: {}",
-                name.escape_debug()
-            ));
-        }
-        if value.contains('\0') {
-            return Err(format!("gate: box payload Identity {name} holds a NUL"));
-        }
-    }
-    Ok(pairs)
-}
-
-/// The payload's `Env`: the caller's variables for the command, each pair a name and a value the gate can set; none when
-/// the key is absent or null. Else the usage line: a list over its cap (`gate_args::MOST_ENV_NAMES`,
-/// `gate_args::MOST_ENV_BYTES`), a name the gate sets itself, a `GATE_` name, a machine path, a name or value no
-/// environment block carries ([`env_refusal`]), or a name given twice in any ASCII case.
-///
-/// The cap is read from the raw object before any pair of it is checked, so a request over the cap is refused without
-/// its pairs being copied.
-fn caller_env(payload: &Payload) -> Result<Vec<(String, String)>, String> {
-    let (names, bytes) = payload.pair_size("Env")?.unwrap_or_default();
-    if over_cap(names, bytes) {
-        return Err(EnvRefusal::OverCap.box_line(""));
-    }
-    let pairs = payload.pairs("Env")?;
-    for (name, value) in &pairs {
-        if let Some(refusal) = env_refusal(name, value) {
-            return Err(refusal.box_line(&shown_escaped(name)));
-        }
-    }
-    if let Some(twice) = repeated_name(pairs.iter().map(|(name, _)| name.as_str())) {
-        return Err(EnvRefusal::Twice.box_line(&shown_escaped(twice)));
-    }
-    Ok(pairs)
-}
-
-/// The name `name` a refusal line shows: shortened to [`shown_name`]'s limit and escaped as the box escapes a payload
-/// value, so a long or forged name cannot fill or break the line.
-fn shown_escaped(name: &str) -> String {
-    escaped(&shown_name(name))
 }
 
 /// Runs the payload's command in its work folder and returns the status: the command's own whole 32-bit code, 127

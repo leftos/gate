@@ -45,10 +45,7 @@ pub(super) const TOOLS_SUFFIX: &str = ".tools";
 /// What the box does instead when it cannot read the stop signal just before it starts the restore.
 const STARTING_RESTORE: &str = "starting the restore";
 
-/// The line the box says when the work folder `key` could not restore its dotnet tools, just after its refusal tag.
-pub(crate) fn tools_line(key: &str) -> String {
-    format!("gate: remote work folder {key} could not restore its dotnet tools")
-}
+pub(crate) use gate_wire::tools_line;
 
 /// The manifests `dotnet` would read for `place`: from `place` up to the work folder's root, never above it, each
 /// folder's `.config\dotnet-tools.json` else its `dotnet-tools.json`, the folder itself first. Both are full paths and

@@ -3,15 +3,16 @@
 
 use std::ffi::OsString;
 
-use gate_args::{BoxVerb, Invocation, Problem};
+use gate_args::{BoxSeams, BoxVerb, Invocation, Problem};
 
 /// What the words ask for.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     /// `--version`: say `gate <version>`, as `gate --version` does.
     Version,
-    /// `box <verb> --stdin`, or a verb that reads no request.
-    Verb(BoxVerb),
+    /// `box <verb> --stdin`, or a verb that reads no request, with the hidden test seams given before the verb (all
+    /// defaults in a box built without the `test-seams` feature).
+    Verb(BoxVerb, Box<BoxSeams>),
     /// Words the box does not take: say these lines on stderr and exit [`crate::lines::USAGE_STATUS`].
     Usage(Vec<String>),
 }
@@ -24,7 +25,7 @@ pub fn action(args: Vec<OsString>) -> Action {
     }
     match gate_args::parse(args) {
         Ok(Invocation::Version) => Action::Version,
-        Ok(Invocation::Box(request)) => Action::Verb(request.verb),
+        Ok(Invocation::Box(request)) => Action::Verb(request.verb, Box::new(request.seams)),
         Ok(_) => Action::Usage(vec![Problem::BoxUsage.to_string()]),
         Err(problems) if problems.is_empty() => Action::Usage(vec![Problem::BoxUsage.to_string()]),
         Err(problems) => Action::Usage(problems.iter().map(ToString::to_string).collect()),
@@ -61,7 +62,7 @@ pub fn main(args: Vec<OsString>) -> std::process::ExitCode {
 /// Answers `action` through `console`, reading a verb's request from stdin; the status.
 #[cfg(unix)]
 fn answer(action: Action, console: &mut crate::console::Console) -> u8 {
-    let verb = match action {
+    let (verb, _seams) = match action {
         Action::Version => {
             console.out(&version_text());
             return 0;
@@ -72,7 +73,7 @@ fn answer(action: Action, console: &mut crate::console::Console) -> u8 {
             }
             return crate::lines::USAGE_STATUS;
         }
-        Action::Verb(verb) => verb,
+        Action::Verb(verb, seams) => (verb, seams),
     };
     if let Some(line) = unbuilt(verb) {
         console.err(&line);
@@ -114,10 +115,26 @@ mod tests {
 
     #[test]
     fn a_box_verb_with_stdin_is_that_verb() {
-        assert_eq!(action(words("box preflight --stdin")), Action::Verb(BoxVerb::Preflight));
-        assert_eq!(action(words("box boot --stdin")), Action::Verb(BoxVerb::Boot));
-        assert_eq!(action(words("box stop --stdin")), Action::Verb(BoxVerb::Stop));
-        assert_eq!(action(words("box run --stdin")), Action::Verb(BoxVerb::Run));
+        let verb = |verb| Action::Verb(verb, Box::default());
+        assert_eq!(action(words("box preflight --stdin")), verb(BoxVerb::Preflight));
+        assert_eq!(action(words("box boot --stdin")), verb(BoxVerb::Boot));
+        assert_eq!(action(words("box stop --stdin")), verb(BoxVerb::Stop));
+        assert_eq!(action(words("box run --stdin")), verb(BoxVerb::Run));
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[test]
+    fn the_seams_given_before_the_verb_reach_the_verb() {
+        use gate_args::BoxSeams;
+
+        let seams = BoxSeams {
+            heartbeat_ms: Some(50),
+            ..BoxSeams::default()
+        };
+        assert_eq!(
+            action(words("box --test-heartbeat-ms 50 run --stdin")),
+            Action::Verb(BoxVerb::Run, Box::new(seams))
+        );
     }
 
     #[test]

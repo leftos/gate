@@ -16,7 +16,7 @@ use crate::console::Console;
 use crate::lines::{
     FAILED_STATUS, NEEDS_REFUSED, NEW_WORK_TREE, PAIR_NOT_BUILT, ROOT_STATUS, USAGE_STATUS, created_line, folder_failure, is_git_variable,
     layout_text, login_path_line, names_another_layout, readies_single, root_flaw, root_unsafe_line, sdks_failure, sdks_line, step_unran, tool_line,
-    version_line, warm_line, warm_text, work_layout, write_failure,
+    unsynced_failure, version_line, warm_line, warm_text, work_layout, write_failure,
 };
 use crate::process::{NotRan, Ran, run_bounded, status_text};
 use crate::{boot, files, probe, process};
@@ -277,7 +277,9 @@ fn origin_set(git: &Git<'_>, tree: &Tree, bare: &str) -> Result<(), Failed> {
 }
 
 /// Writes `<work>/.git/objects/info/alternates` as `<bare>/objects` and a line feed unless it already holds exactly
-/// that; `info` is made when missing. A link or anything but a folder at `objects` or `info` leaves it unwritten.
+/// that, whole, so a git reading it meanwhile never finds it empty ([`files::replace_plain`]); `info` is made when
+/// missing. A link or anything but a folder at `objects` or `info` leaves it unwritten. A folder that cannot be synced
+/// after the rename fails the preflight with its own line, the new text in place.
 fn alternates_written(work: &str, bare: &str) -> Result<(), Failed> {
     let objects = Path::new(work).join(".git").join("objects");
     if !files::plain_folder(&objects) {
@@ -296,7 +298,13 @@ fn alternates_written(work: &str, bare: &str) -> Result<(), Failed> {
     if files::read_plain(&file, RECORD_LIMIT).is_ok_and(|held| held == wanted.as_bytes()) {
         return Ok(());
     }
-    files::write_plain(&file, wanted.as_bytes()).map_err(|error| Failed::line(write_failure(&file.display().to_string(), &error.to_string())))
+    files::replace_plain(&file, wanted.as_bytes()).map_err(|failure| {
+        let shown = file.display().to_string();
+        Failed::line(match failure {
+            files::ReplaceFailure::NotWritten(error) => write_failure(&shown, &error.to_string()),
+            files::ReplaceFailure::Unsynced(error) => unsynced_failure(&shown, &error.to_string()),
+        })
+    })
 }
 
 /// How the preflight runs git: with no variable of git's own inherited ([`is_git_variable`]), so none points git at
@@ -421,20 +429,27 @@ mod tests {
     /// A temp folder of the case `name`, private to this process, removed when the case ends.
     struct Case {
         base: PathBuf,
+        /// The work root's name in [`Case::base`].
+        leaf: &'static str,
     }
 
     impl Case {
         fn new(name: &str) -> Case {
+            Case::rooted(name, "gate-remote")
+        }
+
+        /// A case whose work root is named `leaf`.
+        fn rooted(name: &str, leaf: &'static str) -> Case {
             let base = std::env::temp_dir().join(format!("gate-box-unix-{}-{name}", std::process::id()));
             if base.exists() {
                 fs::remove_dir_all(&base).expect("a stale case folder is removed");
             }
             fs::create_dir_all(&base).expect("the case folder is made");
-            Case { base }
+            Case { base, leaf }
         }
 
         fn root(&self) -> String {
-            self.base.join("gate-remote").to_str().expect("the temp folder is UTF-8").to_owned()
+            self.base.join(self.leaf).to_str().expect("the temp folder is UTF-8").to_owned()
         }
 
         fn work(&self) -> String {
@@ -724,6 +739,22 @@ mod tests {
             console.err,
             [format!("gate: box payload Bare must be <root>/<name>.git to lock its root down: {bare}")]
         );
+        assert!(!PathBuf::from(case.root()).exists(), "nothing is made");
+    }
+
+    #[test]
+    fn a_work_root_holding_a_colon_is_a_usage_error_and_nothing_is_made() {
+        let case = Case::rooted("colon-root", "gate:remote");
+        let (status, console) = preflighted(&case.payload(&json!({})));
+        assert_eq!(status, 2, "{:?}", console.out);
+        assert_eq!(
+            console.err,
+            [format!(
+                "gate: box payload Work must be <root>/work/<key> with no ':' in <root>, which GIT_CEILING_DIRECTORIES cannot hold: {}",
+                case.work()
+            )]
+        );
+        assert!(console.out.is_empty(), "{:?}", console.out);
         assert!(!PathBuf::from(case.root()).exists(), "nothing is made");
     }
 

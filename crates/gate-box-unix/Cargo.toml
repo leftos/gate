@@ -14,6 +14,10 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# Builds the box with `gate-args`' hidden `--test-*` seams, read before the verb.
+test-seams = ["gate-args/test-seams"]
+
 [dependencies]
 gate-args = { path = "../gate-args" }
 gate-wire = { path = "../gate-wire" }

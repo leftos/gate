@@ -9,7 +9,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use gate_args::{MAX_WHOLE_NUMBER, MOST_ENV_BYTES, MOST_ENV_NAMES, env_refusal, over_cap, shown_name};
+use gate_args::{EnvRefusal, MAX_WHOLE_NUMBER, MOST_ENV_BYTES, MOST_ENV_NAMES, env_refusal, over_cap, repeated_name, shown_name};
 pub use gate_router::escaped;
 use gate_router::warm::MOST_COMMANDS;
 use gate_router::{is_layout_name, repo_name};
@@ -1004,6 +1004,191 @@ fn object(word: &str) -> Result<Map<String, Value>, String> {
     }
 }
 
+/// The identity variables a run's payload may set for its back commit.
+pub const IDENTITY_NAMES: [&str; 6] = [
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_AUTHOR_DATE",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_COMMITTER_DATE",
+];
+
+impl Payload {
+    /// The payload's `Identity`: only the git author and committer variables ([`IDENTITY_NAMES`]), none holding a
+    /// NUL; else the usage line.
+    ///
+    /// # Errors
+    ///
+    /// The usage line of an `Identity` that is no object of texts, names another variable, or holds a NUL.
+    pub fn identity(&self) -> Result<Vec<(String, String)>, String> {
+        let pairs = self.pairs("Identity")?;
+        for (name, value) in &pairs {
+            if !IDENTITY_NAMES.contains(&name.as_str()) {
+                return Err(format!(
+                    "gate: box payload Identity may set only GIT_AUTHOR_* and GIT_COMMITTER_* names: {}",
+                    name.escape_debug()
+                ));
+            }
+            if value.contains('\0') {
+                return Err(format!("gate: box payload Identity {name} holds a NUL"));
+            }
+        }
+        Ok(pairs)
+    }
+
+    /// The payload's `Env`: the caller's variables for the command, each pair a name and a value the gate can set; none
+    /// when the key is absent or null. Else the usage line: a list over its cap (`gate_args::MOST_ENV_NAMES`,
+    /// `gate_args::MOST_ENV_BYTES`), a name the gate sets itself, a `GATE_` name, a machine path, a name or value no
+    /// environment block carries ([`env_refusal`]), or a name given twice in any ASCII case.
+    ///
+    /// The cap is read from the raw object before any pair of it is checked, so a request over the cap is refused
+    /// without its pairs being copied.
+    ///
+    /// # Errors
+    ///
+    /// The usage line of an `Env` refused so, or that is no object of texts.
+    pub fn caller_env(&self) -> Result<Vec<(String, String)>, String> {
+        let (names, bytes) = self.pair_size("Env")?.unwrap_or_default();
+        if over_cap(names, bytes) {
+            return Err(EnvRefusal::OverCap.box_line(""));
+        }
+        let pairs = self.pairs("Env")?;
+        for (name, value) in &pairs {
+            if let Some(refusal) = env_refusal(name, value) {
+                return Err(refusal.box_line(&escaped(&shown_name(name))));
+            }
+        }
+        if let Some(twice) = repeated_name(pairs.iter().map(|(name, _)| name.as_str())) {
+            return Err(EnvRefusal::Twice.box_line(&escaped(&shown_name(twice))));
+        }
+        Ok(pairs)
+    }
+}
+
+/// The line the box says when another run holds the work folder `key`, just after its refusal tag.
+#[must_use]
+pub fn busy_line(key: &str) -> String {
+    format!("gate: remote work folder {key} is busy")
+}
+
+/// Why the box refused a run, as its refusal tag names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// Another run holds the work folder.
+    Busy,
+    /// The work folder's dotnet tools could not be restored.
+    Tools,
+    /// The work folder could not be cleared or laid out for the run's repos.
+    Layout,
+    /// The work folder does not hold the inputs the run's `InputsDigest` names.
+    Inputs,
+    /// The work folder does not hold the PC's build the run's `SentDigest` names.
+    Sent,
+    /// The run asked for the builder's desktop and could not have it: nobody is logged on at the console or it is
+    /// locked, another user holds it, or another run held the desktop for the whole wait the run gave.
+    Desktop,
+    /// The desktop helper the run would hand its command to is not installed where only administrators can change it.
+    Install,
+    /// The repo's LFS store does not hold what the run's snapshot's pointers name as its `LfsDigest` says.
+    Lfs,
+}
+
+impl Refusal {
+    /// The word the refusal tag names it by.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Refusal::Busy => "busy",
+            Refusal::Tools => "tools",
+            Refusal::Layout => "layout",
+            Refusal::Inputs => "inputs",
+            Refusal::Sent => "sent",
+            Refusal::Desktop => "desktop",
+            Refusal::Install => "install",
+            Refusal::Lfs => "lfs",
+        }
+    }
+}
+
+/// The line the box says when it could not clear or lay out the work folder of the repo `repo` for `why`, just after
+/// its refusal tag; the PC passes it on as it runs the command itself.
+#[must_use]
+pub fn layout_line(repo: &str, why: &str) -> String {
+    format!("gate: not routed: the builder could not clear {repo}'s work folder: {why}")
+}
+
+/// The line the box says when the work folder `key` could not restore its dotnet tools, just after its refusal tag.
+#[must_use]
+pub fn tools_line(key: &str) -> String {
+    format!("gate: remote work folder {key} could not restore its dotnet tools")
+}
+
+/// The start marker the box says on stderr just before it starts the command of the run whose payload carries `nonce`:
+/// `gate-remote-started: <nonce>`. A call that said it is past the banner, so the client never makes it again.
+///
+/// The nonce only tells runs apart: it is no secret, as it is on the box's and ssh's command lines. That a command
+/// cannot forge a refusal rests on the box saying this line before the command can run any code (before it creates
+/// the command's process, or, in a desktop run, before it resumes the process the helper created suspended), and on
+/// the client ignoring every refusal tag once it has seen this line, whatever order the two came in.
+#[must_use]
+pub fn started_line(nonce: &str) -> String {
+    format!("gate-remote-started: {nonce}")
+}
+
+/// The refusal tag the box says on stderr just before the human line of a refusal of the run whose payload carries
+/// `nonce`: `gate-remote-refused: <nonce> <word>` ([`Refusal::word`]). The client reads a refusal from this line alone.
+///
+/// The nonce is no secret, as [`started_line`] says: a command can say this line too, and the client ignores it
+/// because the box's start marker came before anything the command says.
+#[must_use]
+pub fn refused_line(nonce: &str, refusal: Refusal) -> String {
+    format!("gate-remote-refused: {nonce} {}", refusal.word())
+}
+
+/// Why the box killed the command of a run itself: its load-adjusted ceiling, or the backstop of five ceilings of wall
+/// time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoxKill {
+    /// The command's load-adjusted clock reached its ceiling.
+    TimedOut,
+    /// The command ran five ceilings of wall time, its clock not having reached the ceiling, or its sampler failed.
+    Backstop,
+}
+
+impl BoxKill {
+    /// The word the kill tag names it by, the verdict it gives the run.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            BoxKill::TimedOut => "timed-out",
+            BoxKill::Backstop => "backstop",
+        }
+    }
+}
+
+/// The kill tag the box says on stderr just after its kill line, when it killed the command of the run whose payload
+/// carries `nonce` itself: `gate-remote-killed: <nonce> timed-out|backstop`. The client reads the box's kill from this
+/// line alone, as a status 124 is also what a stopped job or the command itself may end with.
+#[must_use]
+pub fn killed_line(nonce: &str, kill: BoxKill) -> String {
+    format!("gate-remote-killed: {nonce} {}", kill.word())
+}
+
+/// The line the box says on stderr once its watch of the command of the run whose payload carries `nonce` ended and its
+/// readers drained: the load-adjusted seconds it counted, to three decimals, as the journal keeps them,
+/// `gate-remote-adjusted: <nonce> <s.sss>`. Never said once its sampler failed.
+#[must_use]
+pub fn adjusted_line(nonce: &str, seconds: f64) -> String {
+    format!("{}{seconds:.3}", adjusted_prefix(nonce))
+}
+
+/// The prefix of the adjusted line ([`adjusted_line`]) of the run whose payload carries `nonce`, its seconds after it.
+#[must_use]
+pub fn adjusted_prefix(nonce: &str) -> String {
+    format!("gate-remote-adjusted: {nonce} ")
+}
+
 #[cfg(test)]
 mod tests {
     use base64::Engine;
@@ -1011,6 +1196,107 @@ mod tests {
     use serde_json::json;
 
     use super::{PathForm, Payload, escaped, first_version, version_of, version_text, work_root};
+
+    #[expect(clippy::expect_used, reason = "a payload a case cannot build must fail the case loudly")]
+    mod run_lines {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+        use gate_args::{EnvRefusal, MOST_ENV_NAMES};
+        use serde_json::{Value, json};
+
+        use crate::{
+            BoxKill, IDENTITY_NAMES, PathForm, Payload, Refusal, adjusted_line, adjusted_prefix, busy_line, killed_line, layout_line, refused_line,
+            started_line, tools_line,
+        };
+
+        const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+        fn payload(json: &Value) -> Payload {
+            Payload::decode(&STANDARD.encode(json.to_string()), PathForm::Unix).expect("the payload decodes")
+        }
+
+        #[test]
+        fn the_refusal_tags_name_each_refusal_by_its_word() {
+            for (refusal, word) in [
+                (Refusal::Busy, "busy"),
+                (Refusal::Tools, "tools"),
+                (Refusal::Layout, "layout"),
+                (Refusal::Inputs, "inputs"),
+                (Refusal::Sent, "sent"),
+                (Refusal::Desktop, "desktop"),
+                (Refusal::Install, "install"),
+                (Refusal::Lfs, "lfs"),
+            ] {
+                assert_eq!(refusal.word(), word);
+                assert_eq!(refused_line(NONCE, refusal), format!("gate-remote-refused: {NONCE} {word}"));
+            }
+        }
+
+        #[test]
+        fn the_kill_tags_name_each_kill_by_its_verdict_word() {
+            assert_eq!(killed_line(NONCE, BoxKill::TimedOut), format!("gate-remote-killed: {NONCE} timed-out"));
+            assert_eq!(killed_line(NONCE, BoxKill::Backstop), format!("gate-remote-killed: {NONCE} backstop"));
+        }
+
+        #[test]
+        fn the_start_marker_and_the_adjusted_line_carry_the_nonce() {
+            assert_eq!(started_line(NONCE), format!("gate-remote-started: {NONCE}"));
+            assert_eq!(adjusted_line(NONCE, 12.3456), format!("gate-remote-adjusted: {NONCE} 12.346"));
+            assert_eq!(
+                adjusted_line(NONCE, 0.0),
+                format!("gate-remote-adjusted: {NONCE} 0.000"),
+                "three decimals always"
+            );
+            assert!(adjusted_line(NONCE, 7.5).starts_with(&adjusted_prefix(NONCE)));
+        }
+
+        #[test]
+        fn the_human_lines_after_a_tag_name_the_work_folder_or_repo() {
+            assert_eq!(busy_line("repo-0123abcd"), "gate: remote work folder repo-0123abcd is busy");
+            assert_eq!(
+                tools_line("repo-0123abcd"),
+                "gate: remote work folder repo-0123abcd could not restore its dotnet tools"
+            );
+            assert_eq!(
+                layout_line("app", "the folder is held"),
+                "gate: not routed: the builder could not clear app's work folder: the folder is held"
+            );
+        }
+
+        #[test]
+        fn an_identity_sets_only_the_git_author_and_committer_names() {
+            assert_eq!(payload(&json!({})).identity(), Ok(Vec::new()), "no Identity sets nothing");
+            let all: serde_json::Map<String, Value> = IDENTITY_NAMES.iter().map(|name| ((*name).to_owned(), json!("x"))).collect();
+            assert_eq!(payload(&json!({ "Identity": all })).identity().map(|pairs| pairs.len()), Ok(6));
+            assert_eq!(
+                payload(&json!({ "Identity": { "GIT_DIR\n": "/x" } })).identity(),
+                Err(r"gate: box payload Identity may set only GIT_AUTHOR_* and GIT_COMMITTER_* names: GIT_DIR\n".to_owned())
+            );
+            assert_eq!(
+                payload(&json!({ "Identity": { "GIT_AUTHOR_NAME": "a\u{0}b" } })).identity(),
+                Err("gate: box payload Identity GIT_AUTHOR_NAME holds a NUL".to_owned())
+            );
+        }
+
+        #[test]
+        fn a_caller_env_is_kept_unless_a_pair_is_refused() {
+            assert_eq!(payload(&json!({})).caller_env(), Ok(Vec::new()), "no Env sets nothing");
+            assert_eq!(
+                payload(&json!({ "Env": { "FOO": "1", "BAR": "two" } })).caller_env(),
+                Ok(vec![("FOO".to_owned(), "1".to_owned()), ("BAR".to_owned(), "two".to_owned())])
+            );
+            assert_eq!(
+                payload(&json!({ "Env": { "GATE_X": "1" } })).caller_env(),
+                Err(EnvRefusal::GateName.box_line("GATE_X"))
+            );
+            assert_eq!(
+                payload(&json!({ "Env": { "Foo": "1", "FOO": "2" } })).caller_env(),
+                Err(EnvRefusal::Twice.box_line("FOO"))
+            );
+            let over: serde_json::Map<String, Value> = (0..=MOST_ENV_NAMES).map(|n| (format!("V{n}"), json!("1"))).collect();
+            assert_eq!(payload(&json!({ "Env": over })).caller_env(), Err(EnvRefusal::OverCap.box_line("")));
+        }
+    }
 
     #[test]
     fn a_build_id_follows_the_package_version() {

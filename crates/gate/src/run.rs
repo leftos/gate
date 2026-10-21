@@ -1764,7 +1764,7 @@ impl Run<'_> {
         match self.verdict(outcome.status, Some(passing), outcome.killed || interrupted, &[], console) {
             Ok(status) => {
                 let verdict = if let Some(kill) = outcome.box_killed {
-                    kill.verdict()
+                    crate::remote::box_kill_verdict(kill)
                 } else {
                     let kill = if outcome.killed { self.kill_line(console) } else { None };
                     Verdict::of(kill.as_deref(), outcome.status, status)
