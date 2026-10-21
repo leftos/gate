@@ -653,6 +653,31 @@ Invoke-Step 'Git system config for gate runs' {
         if ($LASTEXITCODE) { throw "git config --system --add safe.directory exited $LASTEXITCODE" }
     }
 }
+Invoke-Step 'Smart App Control off' {
+    # Smart App Control in evaluation mode asks the cloud for the reputation of every unsigned image the first time it is
+    # mapped, whatever the Defender exclusions, so each freshly built exe in the work root waits on that query before its
+    # first start. Evaluation mode never blocks anything; it ends in Off or, by Windows' own choice, On, which would refuse
+    # every unsigned build output. Off leaves Defender's real-time, cloud and behaviour protection as they are.
+    $ciPolicyKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy'
+    # A missing value read through Get-ItemProperty trips strict mode, so it is read with GetValue, $null when absent.
+    $state = $null
+    $policyKey = Get-Item -LiteralPath $ciPolicyKey -ErrorAction SilentlyContinue
+    if ($policyKey) { $state = $policyKey.GetValue('VerifiedAndReputablePolicyState') }
+    if ($null -eq $state) { Write-InstallLog 'Smart App Control: not present'; return }
+    if ($state -eq 0) { Write-InstallLog 'Smart App Control: already off'; return }
+    Write-InstallLog "Smart App Control: state $state (1 on, 2 evaluation); turning it off"
+    Set-ItemProperty -LiteralPath $ciPolicyKey -Name VerifiedAndReputablePolicyState -Type DWord -Value 0
+    & "$env:SystemRoot\System32\CiTool.exe" --refresh --json | Out-Null
+    if ($LASTEXITCODE) { throw "CiTool --refresh exited $LASTEXITCODE" }
+    $active = @((& "$env:SystemRoot\System32\CiTool.exe" --list-policies --json | ConvertFrom-Json).Policies |
+            Where-Object { $_.IsEnforced -and $_.FriendlyName -like 'VerifiedAndReputableDesktop*' })
+    if ($active) {
+        $names = $active.FriendlyName -join ', '
+        $retry = 'restart the drained builder and rerun -Only "Smart App Control"'
+        throw "Smart App Control policies still enforced after CiTool --refresh: $names; $retry"
+    }
+    Write-InstallLog 'Smart App Control: off (VerifiedAndReputablePolicyState 0, policies refreshed)'
+}
 # An sh.exe killed in the first moments of its start leaves the builder's shared MSYS section locked for every later one,
 # unless an MSYS process from before stays alive. Rerunning the step restarts the task, as a Git for Windows update needs.
 $keeperTask = 'build-box-msys-keeper'

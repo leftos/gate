@@ -6,7 +6,8 @@
 # admin or can ever run a step on this PC. It also pins the step list the script reads from its own AST against a plain
 # regex over the file. The gate work root checks (its owner, DACL, mandatory label and link refusal) run on their
 # function definitions taken from the AST, fed SDDL strings, icacls lines and a scratch junction, and the sccache server
-# log's assignment is read from the AST. Prints ok/FAIL per case and exits with the failure count.
+# log's assignment is read from the AST. The Smart App Control step's block runs against a stubbed registry read and
+# write. Prints ok/FAIL per case and exits with the failure count.
 #
 #   pwsh -NoProfile -File tools/builder/test-install-toolchains.ps1
 param()
@@ -300,6 +301,34 @@ function Invoke-VCRedistStep {
         Error      = $errorMessage
         CachedLeft = (Test-Path -LiteralPath (Join-Path $dir 'vc_redist.x64.exe'))
     }
+}
+
+# Runs the Smart App Control step's block against stubs: Get-Item answers a fake CI policy key whose GetValue returns
+# $State, or $null when -NoKey; Set-ItemProperty records its arguments and throws, so a branch that would change the
+# setting stops before CiTool runs; Write-InstallLog records. Returns the log, the recorded sets and the thrown message.
+function Invoke-SmartAppControlStep {
+    param($State, [switch]$NoKey)
+    $block = Get-StepBlock 'Smart App Control off'
+    if (-not $block) { throw 'install-toolchains.ps1 has no Smart App Control off step' }
+    $log = [System.Collections.Generic.List[string]]::new()
+    $sets = [System.Collections.Generic.List[string]]::new()
+    $policyKey = [pscustomobject]@{} | Add-Member -MemberType ScriptMethod -Name GetValue -Value { param($Name) $State }.GetNewClosure() -PassThru
+    function Write-InstallLog([string]$Message) { [void]$log.Add($Message) }
+    function Get-Item { if ($NoKey) { $null } else { $policyKey } }
+    function Set-ItemProperty { [void]$sets.Add("$args"); throw 'stub: Set-ItemProperty called' }
+    $errorMessage = $null
+    try { $null = & ($block.ScriptBlock.GetScriptBlock()) }
+    catch { $errorMessage = $_.Exception.Message }
+    return [pscustomobject]@{ Log = @($log); Sets = @($sets); Error = $errorMessage }
+}
+
+# What went wrong when the Smart App Control step changed something or did not log exactly $Expect, or ''.
+function Get-SmartAppControlNoChangeProblem {
+    param([Parameter(Mandatory)]$Result, [Parameter(Mandatory)][string]$Expect)
+    if ($Result.Sets.Count) { return "the step set $($Result.Sets -join '; ')" }
+    if ($Result.Error) { return "the step threw: $($Result.Error)" }
+    if (($Result.Log -join ' | ') -ne $Expect) { return "the step logged: $($Result.Log -join ' | ')" }
+    return ''
 }
 
 New-Item -ItemType Directory -Force $root | Out-Null
@@ -856,6 +885,39 @@ try {
         $r = Invoke-VCRedistStep -Versions 14.44.35211, 14.44.35211
         if (-not $r.Error) { return 'the step passed with 14.44.35211 installed after the install' }
         if ($r.Error -notmatch 'need 14\.51\.36247 or later') { return "the step threw: $($r.Error)" }
+        return ''
+    }
+
+    Test-Case 'the Smart App Control step comes directly after the Git system config step' {
+        $names = @(Get-StepName $sourceScript)
+        $index = $names.IndexOf('Git system config for gate runs')
+        if ($index -lt 0) { return "the Git system config step is missing from: $($names -join ', ')" }
+        $next = if ($index + 1 -lt $names.Count) { $names[$index + 1] } else { '' }
+        if ($next -ne 'Smart App Control off') { return "the step after it is '$next', expected 'Smart App Control off'" }
+        return ''
+    }
+
+    Test-Case 'the Smart App Control step logs not present and changes nothing without the CI policy key' {
+        Get-SmartAppControlNoChangeProblem -Result (Invoke-SmartAppControlStep -NoKey) -Expect 'Smart App Control: not present'
+    }
+
+    Test-Case 'the Smart App Control step logs not present and changes nothing without the state value' {
+        Get-SmartAppControlNoChangeProblem -Result (Invoke-SmartAppControlStep -State $null) -Expect 'Smart App Control: not present'
+    }
+
+    Test-Case 'the Smart App Control step logs already off and changes nothing at state 0' {
+        Get-SmartAppControlNoChangeProblem -Result (Invoke-SmartAppControlStep -State 0) -Expect 'Smart App Control: already off'
+    }
+
+    Test-Case 'the Smart App Control step sets the state to 0 from evaluation' {
+        $r = Invoke-SmartAppControlStep -State 2
+        if ($r.Sets.Count -ne 1) { return "the step set $($r.Sets.Count) values, expected 1" }
+        if ($r.Sets[0] -notmatch 'VerifiedAndReputablePolicyState' -or $r.Sets[0] -notmatch '-Value 0$') {
+            return "the step set: $($r.Sets[0])"
+        }
+        if ($r.Log -notcontains 'Smart App Control: state 2 (1 on, 2 evaluation); turning it off') {
+            return "the step logged: $($r.Log -join ' | ')"
+        }
         return ''
     }
 }

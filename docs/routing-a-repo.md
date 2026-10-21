@@ -51,7 +51,7 @@ This repo's `tools/builder/install-toolchains.ps1` does the rest: the toolchains
 - **Exit codes:** a missing or unknown `-User` exits 2, a `-Only` prefix that matches no step exits 2 before anything is written, and a session that is not elevated exits 1 with `install-toolchains: not elevated; ...`.
 - **Steps**, each a valid `-Only` prefix, run in this order: Git, PowerShell, .NET SDK 10.0.401, .NET SDK 8.0.425, .NET Framework 4.8 Developer Pack, .NET workload wasm-tools, Node.js, uv and prek, Python, Visual C++ Redistributable 14.51, Visual Studio Build Tools 2022 (C++), Rust, cargo-nextest and just.
 
-  The remaining steps are WSL Ubuntu (registers and starts the `gate-wsl-keepalive` logon task and waits for the VM before the elevated setup), sccache, Git usr\bin on the builder user Path, Bun, Godot, FFmpeg, pnpm, Playwright browsers, Git system config for gate runs, keeper: MSYS sleep task, Gate work root, Work-folder prune task and Summary.
+  The remaining steps are WSL Ubuntu (registers and starts the `gate-wsl-keepalive` logon task and waits for the VM before the elevated setup), sccache, Git usr\bin on the builder user Path, Bun, Godot, FFmpeg, pnpm, Playwright browsers, Git system config for gate runs, Smart App Control off, keeper: MSYS sleep task, Gate work root, Work-folder prune task and Summary.
 - **Tasks:** `\build-box\sccache-server`, `build-box-msys-keeper`, `gate-wsl-keepalive` and `\build-box\gate-prune-work`. All four run as the builder user at the Limited run level: all but `gate-wsl-keepalive` by S4U, whether or not the user is logged on, and `gate-wsl-keepalive` in the user's interactive logon.
 
   The sccache server's log is `%LOCALAPPDATA%\build-box\sccache-server.log` in the builder user's profile, not under `C:\build-box`; the step refuses a `LOCALAPPDATA` that holds a quote or bracket.
@@ -70,6 +70,7 @@ This repo's `tools/builder/install-toolchains.ps1` does the rest: the toolchains
 - **claude-config's `C:\build-box` rules:** its provisioning re-asserts the `C:\build-box` DACL on every run and strips explicit ACEs under it. The gate half therefore re-applies anything it needs under `C:\build-box\gate` on every run: an ACE set on the root that inherits survives, an explicit ACE on a child does not.
 
   Any SYSTEM or highest-run-level task the gate half adds whose action names a script under `C:\build-box` goes through claude-config's `C:\Program Files\build-box\run-pinned.ps1`; the gate half adds none today.
+- **Smart App Control off:** in Evaluation, Smart App Control asks the cloud for the reputation of every unsigned image the first time it is mapped, whatever the Defender exclusions, so each freshly built exe in the work root waited 1.5-16 s before its first start (0.05 s with it off). The step sets `VerifiedAndReputablePolicyState` to 0 and refreshes the policies with `CiTool`; Defender's real-time, cloud and behaviour protection stay as they are. A policy still enforced after the refresh asks for a restart of the drained builder.
 - **Test:** `pwsh -NoProfile -File tools/builder/test-install-toolchains.ps1`, run through `tools/gate.ps1 -Slot light`. It installs nothing and needs no admin.
 - **The Unreal engine install is not in the installer.**
 
