@@ -5740,8 +5740,28 @@ fn named_archive(stderr: &str) -> String {
     line.rsplit(' ').next().expect("the line names its archive").to_owned()
 }
 
-/// The line of a fetch the watchdog stopped.
+/// The start of the line of a fetch the watchdog stopped, which goes on with what it had fetched by then.
 const FETCH_STOPPED_LINE: &str = "gate: remote outputs not brought back: the fetch was stopped by the watchdog";
+
+/// Where in `stderr` the line of a fetch the watchdog stopped starts, once it says that either none or all of the
+/// stand-in's `bytes`, fewer than 1024 and sent in one write, came in its whole seconds, at least 1, at the rate they
+/// make together. A busy machine can start the stand-in after the watch's 300 ms, so the cut can come before its bytes.
+fn fetch_stopped_at(stderr: &str, bytes: u64) -> usize {
+    let pattern = format!(
+        r"(?m)^{} after (0|{bytes}) B in (\d+) s \((\d+) B/s\)\r?$",
+        regex::escape(FETCH_STOPPED_LINE)
+    );
+    let line = Regex::new(&pattern).expect("the line's pattern");
+    let found = line.captures(stderr);
+    assert!(found.is_some(), "the outputs line saying 0 or {bytes} B: {stderr}");
+    let found = found.expect("the outputs line");
+    let bytes: u64 = found[1].parse().expect("whole bytes");
+    let seconds: u64 = found[2].parse().expect("whole seconds");
+    let rate: u64 = found[3].parse().expect("a whole rate");
+    assert!(seconds >= 1, "a fetch counts at least 1 s: {stderr}");
+    assert_eq!(rate, bytes / seconds, "the rate is the bytes over the seconds: {stderr}");
+    found.get(0).expect("the whole line").start()
+}
 
 /// What the case's `.tmp` folder holds of its outputs steps: the archives and the stage folders beside them, each named
 /// for the case's work-folder key, `<key>-<nonce>` and `<key>-<nonce>.tar.zst`.
@@ -5929,7 +5949,7 @@ fn a_fetch_the_watchdog_stops_between_two_fetches_past_the_cap_clears_the_count(
     let (middle, after, last) = between_two_hits(&case, |_| {}, &between);
 
     assert_eq!(middle.code, Some(124), "{middle:?}");
-    assert!(middle.stderr.contains(FETCH_STOPPED_LINE), "{middle:?}");
+    fetch_stopped_at(&middle.stderr, 100);
     assert_eq!(after, None, "a fetch the watchdog stopped clears the count: {middle:?}");
     assert_eq!(last.code, Some(0), "a hit after it is the first in a row: {last:?}");
 }
@@ -6082,7 +6102,7 @@ fn a_fetch_the_watchdog_stops_keeps_124_and_says_so() {
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     let stalled = outcome.stderr.find(STALLED_LINE).expect("the STALLED line");
-    let stopped = outcome.stderr.find(FETCH_STOPPED_LINE).expect("the outputs line");
+    let stopped = fetch_stopped_at(&outcome.stderr, 100);
     assert!(stalled < stopped, "the kill line comes first: {outcome:?}");
     let made = calls(&steps);
     assert!(made_but_maybe(&made, &["preflight", "run", "outputs"], "outputs"), "no stop: {made:?}");
@@ -6160,7 +6180,7 @@ fn an_outputs_fetch_past_its_transfer_ceiling_is_transfer_timed_out() {
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     let line = "gate: TRANSFER TIMED OUT after 1 s fetching the outputs";
     let timed_out = outcome.stderr.find(line).expect("the TRANSFER TIMED OUT line");
-    let stopped = outcome.stderr.find(FETCH_STOPPED_LINE).expect("the outputs line");
+    let stopped = fetch_stopped_at(&outcome.stderr, 100);
     assert!(timed_out < stopped, "the kill line comes first: {outcome:?}");
     assert_eq!(verdict(&case), "transfer-timed-out");
     let made = calls(&steps);

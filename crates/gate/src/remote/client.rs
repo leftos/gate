@@ -1068,6 +1068,17 @@ pub(super) struct Called {
     /// The bytes its job had written at the last look, for a call whose watch caps them; `None` for any other call, or
     /// when no look succeeded.
     written: Option<u64>,
+    /// What its raw copy had written into its sink when the watch cut it, for a call with a raw copy the watch cut;
+    /// `None` for any other.
+    pub(super) received: Option<Received>,
+}
+
+/// What a call's raw copy had written into its sink when the watch cut the call: the bytes, and how long the call had
+/// run by then, counted from its own start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Received {
+    pub(super) bytes: u64,
+    pub(super) after: Duration,
 }
 
 impl Called {
@@ -2895,6 +2906,7 @@ impl Attempt<'_, '_> {
             lines: starts.nonce.as_deref().map(|nonce| Arc::new(ProtocolLines::new(nonce))),
             log_cap: self.log_cap,
         };
+        let copied = starts.sink.is_some();
         let raw = if let Some(sink) = starts.sink {
             Some(relayed_raw(
                 stdout,
@@ -2948,6 +2960,7 @@ impl Attempt<'_, '_> {
                 }
                 Ok(Called {
                     written: looks.written,
+                    received: looks.received.filter(|_| copied),
                     ..called
                 })
             }
@@ -3254,6 +3267,7 @@ fn called_of(ended: CallEnd, raised: Raised, mut heard: Heard) -> Result<Called,
         box_killed: heard.box_killed,
         adjusted: heard.adjusted,
         written: None,
+        received: None,
     })
 }
 
@@ -3281,11 +3295,13 @@ struct RunHang<'w> {
 }
 
 /// What the looks at the bytes a capped call's job wrote found: the count at the last look that succeeded, and the
-/// line saying the first look that failed.
+/// line saying the first look that failed; and, for a call the watch cut, what a raw copy of its output had written
+/// into its sink by then.
 #[derive(Default)]
 struct Looks {
     written: Option<u64>,
     unread: Option<String>,
+    received: Option<Received>,
 }
 
 /// What the looks at the bytes a call's feeder wrote to its standard input found: the count at the last look, and
@@ -3386,6 +3402,10 @@ impl Watched<'_> {
             let now = Instant::now();
             let idle = self.idle(watch, &mut sending, now);
             if let Some(cut) = watch.cut(now, begun, idle, self.progress.raised(), written) {
+                looks.received = Some(Received {
+                    bytes: self.progress.received(),
+                    after: now.saturating_duration_since(begun),
+                });
                 let ended = CallEnd::Cut(cut, self.end(open));
                 return Ok((ended, looks));
             }
@@ -3607,6 +3627,7 @@ impl<W: Write> Write for Capped<W> {
         let taken = usize::try_from(room).unwrap_or(usize::MAX).min(buffer.len());
         let written = self.inner.write(buffer.get(..taken).unwrap_or(buffer))?;
         self.written += written as u64;
+        self.shared.progress.took(written as u64);
         Ok(written)
     }
 
@@ -3807,6 +3828,8 @@ struct Progress {
     too_long: AtomicBool,
     /// The cap a raw copy of the call's standard output passed, 0 until one did: every cap is above 0.
     passed: AtomicU64,
+    /// The bytes a raw copy of the call's standard output has written into its sink.
+    received: AtomicU64,
     /// Milliseconds from `begun` to the box's start marker of the run, [`NOT_STARTED`] until it came.
     started: AtomicU64,
 }
@@ -3840,6 +3863,7 @@ impl Progress {
             any: AtomicBool::new(false),
             too_long: AtomicBool::new(false),
             passed: AtomicU64::new(0),
+            received: AtomicU64::new(0),
             started: AtomicU64::new(NOT_STARTED),
         }
     }
@@ -3894,6 +3918,16 @@ impl Progress {
     /// Raises the flag for a raw copy that passed `cap` bytes.
     fn cap_passed(&self, cap: u64) {
         self.passed.store(cap, Ordering::Relaxed);
+    }
+
+    /// Counts `bytes` more that a raw copy of the call's standard output wrote into its sink.
+    fn took(&self, bytes: u64) {
+        self.received.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// The bytes a raw copy of the call's standard output has written into its sink so far.
+    fn received(&self) -> u64 {
+        self.received.load(Ordering::Relaxed)
     }
 
     /// What the call's readers have raised by now.
@@ -4716,6 +4750,7 @@ mod tests {
         sdks_of, seconds, their_version, version_refusal,
     };
     use super::{CSPROJ_BYTES, CSPROJ_FILES, Entry, csproj_pins, entries_of, manifest_entry, small_blobs_of};
+    use super::{KILLED, Received};
     use super::{KeyHold, RunEnd, Warm, cold_line, hold_key, hold_key_waiting, new_work_tree, status_end, warm_end, warm_of};
     use crate::environment::Variables;
     use crate::remote::git::{self, DOTNET_LIMIT, GIT_LIMIT, Git, GitError};
@@ -5329,6 +5364,7 @@ mod tests {
             box_killed: None,
             adjusted: None,
             written: None,
+            received: None,
         }
     }
 
@@ -5587,6 +5623,59 @@ mod tests {
         assert_eq!(sink.inner.len(), 0, "nothing is written into an archive the fetch is about to remove");
         assert_eq!(shared.progress.passed(), None, "the cap is not raised by a copy that writes nothing");
         assert_eq!(held(&shared.heard).problem, None, "and it is no write failure");
+        assert_eq!(shared.progress.received(), 0, "a copy that writes nothing counts nothing");
+    }
+
+    /// The call's progress counts the bytes the copy wrote into the archive, and none it kept out past the cap.
+    #[test]
+    fn a_raw_copy_counts_the_bytes_it_wrote_into_its_sink() {
+        let cap = NonZeroU64::new(1_000).expect("the cap is above 0");
+        let shared = Arc::new(Shared::new());
+        let mut sink = Capped {
+            inner: Vec::new(),
+            cap,
+            shared: Arc::clone(&shared),
+            written: 0,
+        };
+
+        relay_raw(&mut Cursor::new(vec![b'x'; 100]), &mut sink, "the archive", &shared);
+        let under = shared.progress.received();
+        relay_raw(&mut Cursor::new(vec![b'x'; 3_000]), &mut sink, "the archive", &shared);
+
+        assert_eq!(under, 100, "every byte under the cap is counted");
+        assert_eq!(shared.progress.received(), cap.get(), "no byte past the cap is counted");
+    }
+
+    /// An outputs call the watchdog stopped once its raw copy had written 100 bytes into the archive says them, with
+    /// the seconds the call ran and the rate over them.
+    #[test]
+    fn an_outputs_call_the_watchdog_stopped_says_what_its_copy_had_written() {
+        let log = unwritten_log();
+        let mut given = call(&log);
+        given.interrupt = None;
+        let transport = nowhere();
+        let mut attempt = attempt(&given, &transport);
+        let archive = outputs::Archive::new(
+            Path::new(r"C:\gate-client-tests-no-such-folder"),
+            PathBuf::from(r"C:\gate-client-tests-no-such-folder\app.tar.zst"),
+        );
+        let mut stalled = ended_with(KILLED, "");
+        stalled.cut = Some(Cut::Silent(Duration::from_millis(300)));
+        stalled.received = Some(Received {
+            bytes: 100,
+            after: Duration::from_millis(2_500),
+        });
+
+        let end = outputs::judged(&mut attempt, &archive, &stalled, End::Status(0));
+
+        assert!(matches!(end, End::Killed), "{end:?}");
+        assert_eq!(
+            attempt.lines,
+            [
+                "gate: STALLED: no output or remote CPU for 1 s",
+                "gate: remote outputs not brought back: the fetch was stopped by the watchdog after 100 B in 2 s (50 B/s)"
+            ]
+        );
     }
 
     #[test]

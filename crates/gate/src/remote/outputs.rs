@@ -496,7 +496,7 @@ pub(super) fn judged(attempt: &mut Attempt<'_, '_>, archive: &Archive, called: &
         if let Some(line) = client::watchdog_line(cut, "fetching the outputs") {
             attempt.say(line);
             attempt.noted(called);
-            return unfetched(attempt, archive, STOPPED, End::Killed);
+            return unfetched(attempt, archive, &stopped_reason(called.received), End::Killed);
         }
         attempt.noted(called);
         if let Cut::ArchiveTooBig(_) = cut {
@@ -512,6 +512,18 @@ pub(super) fn judged(attempt: &mut Attempt<'_, '_>, archive: &Archive, called: &
         return unfetched(attempt, archive, &reason, End::Status(1));
     }
     synced
+}
+
+/// Why a fetch the watchdog stopped brings nothing back: [`STOPPED`], and, when its raw copy's count is known
+/// (`received`), the bytes it had written into the archive by the cut, the whole seconds the call had run by then, at
+/// least 1, and the average rate over them, each size as [`size`](super::watchdog::size) spells it.
+fn stopped_reason(received: Option<client::Received>) -> String {
+    let Some(client::Received { bytes, after }) = received else {
+        return STOPPED.to_owned();
+    };
+    let seconds = after.as_secs().max(1);
+    let (fetched, rate) = (super::watchdog::size(bytes), super::watchdog::size(bytes / seconds));
+    format!("{STOPPED} after {fetched} in {seconds} s ({rate}/s)")
 }
 
 /// The end of a fetch cut for the archive it passed, `reason` saying so, the run's end so far `synced`: the outputs are
@@ -776,7 +788,7 @@ mod tests {
 
     use super::{
         Archive, Brought, MANIFEST_LIMIT, NonZeroU64, PARTIAL, PAST_THE_CAP, Unbuilt, accepted, hashed, keep_outputs_line, manifest_line, pending,
-        sha256_for, turned_reason, within_cap,
+        sha256_for, stopped_reason, turned_reason, within_cap,
     };
     use crate::outputs::cache::{HashCache, file_time_now};
     use crate::outputs::glob::Globs;
@@ -788,6 +800,40 @@ mod tests {
     const KEY: &str = "app-1a2b3c4d";
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
     const OTHER_NONCE: &str = "fedcba9876543210fedcba9876543210";
+
+    #[test]
+    fn a_stopped_fetch_says_the_bytes_it_had_fetched_in_whole_seconds_and_their_rate() {
+        let stopped = |bytes: u64, millis: u64| {
+            stopped_reason(Some(crate::remote::client::Received {
+                bytes,
+                after: Duration::from_millis(millis),
+            }))
+        };
+        assert_eq!(
+            stopped(3 << 20, 2_000),
+            "the fetch was stopped by the watchdog after 3.0 MiB in 2 s (1.5 MiB/s)"
+        );
+        assert_eq!(
+            stopped(1 << 30, 1_800_400),
+            "the fetch was stopped by the watchdog after 1.0 GiB in 1800 s (582.5 KiB/s)",
+            "the seconds are whole, cut down"
+        );
+        assert_eq!(
+            stopped(100, 300),
+            "the fetch was stopped by the watchdog after 100 B in 1 s (100 B/s)",
+            "under 1 s counts as 1 s"
+        );
+        assert_eq!(
+            stopped(0, 0),
+            "the fetch was stopped by the watchdog after 0 B in 1 s (0 B/s)",
+            "nothing came"
+        );
+        assert_eq!(
+            stopped_reason(None),
+            "the fetch was stopped by the watchdog",
+            "an unknown count says what it always said"
+        );
+    }
     const ERR: bool = true;
     const OUT: bool = false;
 
