@@ -71,6 +71,8 @@ A test that asserts on timing must hold on a busy machine: no wall-clock bound a
 
 A case that fails once and passes alone, or runs to nextest's per-case limit, is never a known red left in the backlog: its issue is booked or raised Urgent at once and is worked next (the `load-proof-tests` skill, "A flaky or timing-out test is Urgent"). A brief may name such a case as not the implementer's for that one run only.
 
+A routed suite case that ends -1 (0xFFFFFFFF) or ABORTs with no output was ended from outside the gate: the gate's own kills give 124, 1 or 0xC000013A, a job close gives 0 and a console close 0xC000013A. Before suspecting the case, check the journal (`%LOCALAPPDATA%\gate\v1\events*.jsonl` and `archive\`) for other repos' routed runs that overlapped it on the builder.
+
 The machine-alone case is `stall::a_command_whose_only_work_is_a_child_outside_its_job_is_not_stalled`.
 
 The machine-alone cases also include the escapee kill cases `stall::a_stall_kill_ends_a_child_outside_the_job_whose_launcher_has_ended`, `stall::a_stall_kill_ends_a_child_outside_the_job_whose_launcher_exited_at_once`, `ceiling::a_ceiling_kill_ends_a_child_outside_the_job_whose_launcher_has_ended` and `interrupt::a_ctrl_c_ends_a_child_outside_the_job_whose_launcher_has_ended`.
