@@ -1496,6 +1496,10 @@ All kept, with each knob's default unchanged:
   The stall clock also resets, for a `wsl` command, when the WSL VM's CPU counts as progress (see WSL below).
 
   A build server outside the command's job and its escaped tree is not progress: only the job's own processes and the escaped tree count, a per-run server inside the job or under a member included.
+
+  A process waiting in the kernel on another process's work is not progress either. With Smart App Control on, a first launch of freshly built images waits in each new image's reputation check through Defender, with no output and next to no CPU of its own: about 0.4-1.15 s per image was measured on the PC, so a freshly built engine loading a few hundred new DLLs can be killed as STALLED.
+
+  With it off, a fresh exe starts in about 8 ms and a fresh DLL loads in about 2 ms. The builders turn it off (`install-toolchains.ps1`, step `Smart App Control off`); elsewhere, turn it off or pass a longer `--stall` to the first run after such a build. The watchdog does not read that wait per sample, because nothing it can read tells it from a hang: a hung pipe read waits with the same wait reason, a scanner's CPU runs whether or not the job waits, and a polling hang moves the I/O counters.
 - The load-adjusted clock and the ceiling (W3): each sample adds `interval * free`, the interval running between the samples' `at` stamps, to the clock `--timeout` runs on (for `auto:<n>`, the ceiling the take resolved; the backstop below uses it too); a sample taken while a nested gate is paused adds to the paused time instead; `gate: TIMED OUT after ...`.
 
   The free share is 1 for a High-priority command; otherwise `busy` is the share of the interval's system time that was not idle, the cores others held are `max(0, busy * cores - own cores)` with `own cores` the CPU gained over the interval by the job and by the escaped tree (below), and `free = clamp((cores - others) / demand, 0.05, 1)`. `demand` is every core, `min(cores, 2)` for a light gate, or 1 for a gate on no slot, so its ceiling stays near wall time on a loaded PC.

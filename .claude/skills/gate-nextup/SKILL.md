@@ -105,6 +105,10 @@ Never suspend a thread during its start-up: it holds the loader lock, and the ri
 
 `cdb -pv` plus `llvm-symbolizer --relative-address` reads a hung test's stacks without disturbing it.
 
+A gated command run in a worktree from elsewhere takes an absolute `-Log`: the launcher reads a relative one against the caller's folder before `-Cd` (design.md P5), so it lands in the main checkout's `.tmp`, where two agents' logs of one name overwrite each other. Every brief that names `-Cd` names its logs by absolute path under that worktree.
+
+A rig that reads `SystemProcessInformation` back to back holds a lock every `CreateProcess` on the PC waits on (a reused start went from 4 ms to 590 ms): sample at 100 ms or slower, or the rig measures itself. ESET's CPU (`ekrn`, 12-35% of a core with other sessions active) is never evidence about one job.
+
 nextest's default profile ends a case after 15 periods of 60 s (`.config/nextest.toml`). A case that needs longer gets its own override there.
 
 A heartbeat test's command sleeps (fake-tool `sleep`), never `wait`, whose 20 ms poll earns CPU ticks on its own.
