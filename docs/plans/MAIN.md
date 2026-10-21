@@ -4,18 +4,16 @@
 
 ## Do first
 
+- [ ] GATE-668 Keep the watchdog's CPU sampler from failing on a reading that overflows — Urgent · Local gate
 - [ ] GATE-595 Route to more than one builder, choosing by what each builder can run — Urgent · Remote
 - [/] GATE-609 Try the next capable builder before falling back to the PC — Urgent · Remote
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [/] GATE-607 Unix gate box: version, preflight, boot, run, stop — Urgent · Remote
-- [/] GATE-608 Install the Unix box on a macOS builder: gate push builds it there, plus a Mac setup script — Urgent · Remote
 - [ ] GATE-592 Set up the Mac builder and time the portable .NET repos on it by hand — Urgent · Remote
 - [/] GATE-631 Make box_run_a_node_modules_junction_installs_again hold under a loaded parallel run — Urgent · Remote
-- [/] GATE-162 Suite: make the remaining timer-raced interrupt and remote-client git cases load-proof — Urgent · Backlog
 - [ ] GATE-255 Suite: three cases ended with exit 1 and no output mid-run, and a box-kill case failed under load — Urgent · Backlog
 - [ ] GATE-366 Find why a between-two-fetches outputs case hung its last run on a busy PC — Urgent · Backlog
-- [ ] GATE-551 Find why a lent auto run misses its seeded history under load — Urgent · Backlog
-- [ ] GATE-658 Find why a lent child's parent journal line is missing right after its lent line under load — Urgent · Backlog
+- [/] GATE-551 Find why a lent auto run misses its seeded history under load — Urgent · Backlog
 - [ ] GATE-641 Keep a first launch of freshly built binaries from looking stalled while a scanner loads them — High · Local gate
 - [ ] GATE-616 Move the box's shared wire rules into gate-wire so both boxes say the same bytes — High · Remote
 - [ ] GATE-615 Tie the Unix box's job record to its process group leader's start time — High · Remote
@@ -53,6 +51,9 @@
 ## Remote
 
 - [ ] GATE-610 Show each builder's remote pool on the dashboard
+- [ ] GATE-663 Keep the Unix box's preflight from racing a run's git lock sweep on the same key
+- [ ] GATE-666 Let the Unix box's stop reach a run between two steps with a stop marker
+- [ ] GATE-667 Keep the Unix box's stop under the client's stop limit when it follows several groups
 - [ ] GATE-432 Harden the push script's registration run and helper rollback
 - [ ] GATE-429 Measure which Task Scheduler call frees its string argument, and quote the desktop task's command
 - [ ] GATE-618 Turn off auto gc in the box's shared bare repositories
@@ -215,6 +216,7 @@
 - [ ] GATE-659 Measure and cut Defender's load from builds on the builder (sccache and TEMP unexcluded)
 - [ ] GATE-660 Harden the macOS push script against files routed code plants under the work root
 - [ ] GATE-662 Test install.ps1's leftover source.json temp sweep
+- [ ] GATE-664 Keep a routed command that names a path outside its tree on this PC
 
 ## Design
 
@@ -322,3 +324,4 @@
 - [ ] GATE-645 A run's journal line is lost when the journal lock is busy for 2 s on a loaded PC
 - [ ] GATE-646 Start the box's ceiling clock before the command is resumed
 - [ ] GATE-661 Let the no-build git listing take the git drain seam
+- [ ] GATE-665 Give the no-build and snapshot worktree placements the placing drain
