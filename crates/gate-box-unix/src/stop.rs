@@ -1,7 +1,8 @@
 //! `gate-box box stop`: ends the process group of the run whose job the payload names, and the group of its tool
 //! restore, `<job>-tools`. A run records each group beside its work folder, `<Work>.pgid` and `<Work>.tools.pgid`: the
-//! job's name, then the group in decimal. A group is signalled only when its record names the payload's own job, so a
-//! stop that arrives late finds another run's record, or none, and signals nothing.
+//! job's name, the group, then the group's session in decimal, one per line. A group is signalled only while its
+//! record names it for the payload's own job, so a stop that arrives late finds another run's record, or none, and
+//! signals nothing; once a group ends, the stop follows the record to a later group of the same job.
 
 use std::io;
 use std::path::Path;
@@ -72,70 +73,190 @@ pub(crate) fn records_folder(root: &str, parent: &Path) -> Result<bool, (String,
     files::unusable_folder(parent).map_or(Ok(true), |line| Err((line, FAILED_STATUS)))
 }
 
-/// Stops the process group the record `record` holds for the job `job`, and says how it went: nothing for no record or
-/// another job's, `gate: remote stopped job <job>` on stdout once the group is gone, else why on stderr. The status.
+/// The most process groups of one job a stop ends: once one has ended, the record may name the group of a later step
+/// of the same run.
+const STOP_GROUPS: usize = 3;
+
+/// Stops the process groups the record `record` holds for the job `job` ([`groups_ended`]), and says how it went:
+/// nothing for no record, another job's or a stale one, `gate: remote stopped job <job>` on stdout once the groups are
+/// gone, else why on stderr. The status.
 fn stopped(record: &Path, job: &str, console: &mut Console) -> u8 {
-    let could_not = |why: &str| format!("gate: remote could not stop job {job}: {why}");
-    let read = files::read_plain_dated(record, RECORD_LIMIT).map(|(bytes, written)| (job_record(&bytes, job), written));
-    let (recorded, written) = match read {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return 0,
-        Ok((JobRecord::Other, _)) => return 0,
-        Err(error) => {
-            console.err(&could_not(&record_unread(&record.display().to_string(), &error.to_string())));
-            return FAILED_STATUS;
-        }
-        Ok((JobRecord::Malformed, _)) => {
-            console.err(&could_not(&record_without_group(&record.display().to_string())));
-            return FAILED_STATUS;
-        }
-        Ok((JobRecord::Group(recorded), written)) => (recorded, written),
-    };
-    let group = recorded.group;
-    if let Err(why) = signal_guard(group, own_group()) {
-        console.err(&could_not(&why));
-        return FAILED_STATUS;
-    }
-    if record_current(recorded, written) == Record::Stale {
-        // A record naming no group of its run's is no job: the stop finds nothing, as for no record. It holds no work
-        // lock, so the record is left for the next run, which removes it under the lock.
-        return 0;
-    }
-    match ended(group) {
-        Ok(()) => {
+    stopped_through(&JobGroups { record, job }, job, console)
+}
+
+/// [`stopped`], reading and signalling the job `job`'s groups through `view`.
+fn stopped_through(view: &impl StopView, job: &str, console: &mut Console) -> u8 {
+    match groups_ended(view) {
+        Ok(0) => 0,
+        Ok(_) => {
             console.out(&format!("gate: remote stopped job {job}"));
             0
         }
         Err(why) => {
-            console.err(&could_not(&why));
+            console.err(&format!("gate: remote could not stop job {job}: {why}"));
             FAILED_STATUS
         }
     }
 }
 
-/// Ends the process group `group`: `SIGTERM`, a wait of [`TERM_WAIT`] for it to be gone, then `SIGKILL` and a wait of
-/// [`KILL_WAIT`]. A group already gone at the first signal is ended. Else why not: a signal refused, or the processes
-/// left.
-fn ended(group: i32) -> Result<(), String> {
-    for (signal, wait) in [(libc::SIGTERM, TERM_WAIT), (libc::SIGKILL, KILL_WAIT)] {
-        match signalled(group, signal) {
-            Ok(true) => {}
-            Ok(false) => return Ok(()),
-            Err(error) => return Err(error.to_string()),
-        }
-        if gone_within(group, wait) {
-            return Ok(());
+/// What a stop reads and signals of one job's groups: its record and the live groups ([`JobGroups`]), or a test's.
+trait StopView {
+    /// The group the record names for the job now ([`current_group`]).
+    ///
+    /// # Errors
+    ///
+    /// Why the stop cannot go on, as [`current_group`] gives it.
+    fn current(&self) -> Result<Option<i32>, String>;
+
+    /// Whether the record still names `group` for the job ([`still_named`]).
+    ///
+    /// # Errors
+    ///
+    /// Why the record could not be read again.
+    fn still_named(&self, group: i32) -> Result<bool, String>;
+
+    /// Sends `signal` to `group` ([`signalled`]): whether the group was there.
+    ///
+    /// # Errors
+    ///
+    /// Why the signal was refused.
+    fn send(&self, group: i32, signal: i32) -> io::Result<bool>;
+
+    /// Whether `group` is gone within `wait` ([`gone_within`]).
+    fn gone_within(&self, group: i32, wait: Duration) -> bool;
+
+    /// What is left of `group`, said when it could not be ended.
+    fn left(&self, group: i32) -> String;
+}
+
+/// The job `job`'s record `record` and the live groups it names.
+struct JobGroups<'a> {
+    record: &'a Path,
+    job: &'a str,
+}
+
+impl StopView for JobGroups<'_> {
+    fn current(&self) -> Result<Option<i32>, String> {
+        current_group(self.record, self.job)
+    }
+
+    fn still_named(&self, group: i32) -> Result<bool, String> {
+        still_named(self.record, self.job, group)
+    }
+
+    fn send(&self, group: i32, signal: i32) -> io::Result<bool> {
+        signalled(group, signal)
+    }
+
+    fn gone_within(&self, group: i32, wait: Duration) -> bool {
+        gone_within(group, wait)
+    }
+
+    fn left(&self, group: i32) -> String {
+        match group_pids(group) {
+            Ok(left) => format!("{} process(es) left", left.len()),
+            Err(why) => format!("its process group {group} is still there ({why})"),
         }
     }
-    Err(match group_pids(group) {
-        Ok(left) => format!("{} process(es) left", left.len()),
-        Err(why) => format!("its process group {group} is still there ({why})"),
-    })
+}
+
+/// Ends the group the record names for the job ([`ended`]), then, while the record names a later current group of the
+/// job, that one too, up to [`STOP_GROUPS`] groups: how many the stop signalled, a group the record stopped naming
+/// before its first signal not counted. Else why not: the record not read or malformed, a group no run makes, one not
+/// ended, or a group still named after the last.
+fn groups_ended(view: &impl StopView) -> Result<usize, String> {
+    let (mut signalled, mut looked) = (0, 0);
+    let mut last = None;
+    while let Some(group) = view.current()? {
+        if last == Some(group) {
+            break;
+        }
+        if looked == STOP_GROUPS {
+            return Err(format!(
+                "its process group {group} is still running after {STOP_GROUPS} of its groups were stopped"
+            ));
+        }
+        if ended(view, group)? {
+            signalled += 1;
+        }
+        looked += 1;
+        last = Some(group);
+    }
+    Ok(signalled)
+}
+
+/// The group the record `record` names for the job `job` now: `None` for no record, another job's, or a stale one
+/// ([`record_current`]), which, holding no work lock, the stop leaves for the next run to remove. Else why the stop
+/// cannot go on: the record not read or malformed, or a group no run makes ([`signal_guard`]).
+fn current_group(record: &Path, job: &str) -> Result<Option<i32>, String> {
+    let shown = record.display().to_string();
+    let read = files::read_plain_dated(record, RECORD_LIMIT).map(|(bytes, written)| (job_record(&bytes, job), written));
+    let (recorded, written) = match read {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Ok((JobRecord::Other, _)) => return Ok(None),
+        Err(error) => return Err(record_unread(&shown, &error.to_string())),
+        Ok((JobRecord::Malformed, _)) => return Err(record_without_group(&shown)),
+        Ok((JobRecord::Group(recorded), written)) => (recorded, written),
+    };
+    signal_guard(recorded.group, own_group())?;
+    Ok((record_current(recorded, written) == Record::Current).then_some(recorded.group))
+}
+
+/// Whether the record `record` still names `group` for the job `job`: not when it is gone or names another job or
+/// group. Else why the stop cannot go on: the record not read, or malformed.
+fn still_named(record: &Path, job: &str, group: i32) -> Result<bool, String> {
+    let shown = record.display().to_string();
+    match files::read_plain_dated(record, RECORD_LIMIT) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(record_unread(&shown, &error.to_string())),
+        Ok((bytes, _)) => match job_record(&bytes, job) {
+            JobRecord::Group(recorded) => Ok(recorded.group == group),
+            JobRecord::Other => Ok(false),
+            JobRecord::Malformed => Err(record_without_group(&shown)),
+        },
+    }
+}
+
+/// Ends the process group `group`, which the record `view` reads names for its job: `SIGTERM`, with `SIGCONT` right
+/// after it so a stopped group takes it, a wait of [`TERM_WAIT`] for it to be gone, then `SIGKILL` and a wait of
+/// [`KILL_WAIT`]. The record is read again before each signal, and a group it no longer names is not signalled: its run
+/// has reaped it, so its id may be another's; a record that cannot be read again stops the stop, nothing signalled
+/// after it. A group already gone at a signal is ended. A signal refused with `EPERM` to a group the record still names
+/// counts as sent: only the run's unreaped leader is left, a zombie the box may not signal, and the group goes once the
+/// run reaps it. Whether the stop signalled the group: not when the record stopped naming it before its `SIGTERM`. Else
+/// why not: a signal refused otherwise, or the processes left.
+fn ended(view: &impl StopView, group: i32) -> Result<bool, String> {
+    for (signal, wait) in [(libc::SIGTERM, TERM_WAIT), (libc::SIGKILL, KILL_WAIT)] {
+        if !view.still_named(group)? {
+            return Ok(signal != libc::SIGTERM);
+        }
+        if !sent_unless_gone(view, group, signal)? {
+            return Ok(true);
+        }
+        if signal == libc::SIGTERM {
+            // The TERM's own result decides: a group gone since needs no SIGCONT.
+            let _ = sent_unless_gone(view, group, libc::SIGCONT);
+        }
+        if view.gone_within(group, wait) {
+            return Ok(true);
+        }
+    }
+    Err(view.left(group))
+}
+
+/// Sends `signal` to `group`, which the record still names: whether the group was there, `EPERM` counting as there
+/// (only its unreaped leader is left); else why the signal was refused.
+fn sent_unless_gone(view: &impl StopView, group: i32, signal: i32) -> Result<bool, String> {
+    match view.send(group, signal) {
+        Err(error) if error.raw_os_error() == Some(libc::EPERM) => Ok(true),
+        sent => sent.map_err(|error| error.to_string()),
+    }
 }
 
 /// Sends `signal` to the process group `group`: whether the group was there; else why the signal was refused.
 fn signalled(group: i32, signal: i32) -> io::Result<bool> {
-    // SAFETY: `killpg` takes two integers and touches no memory; `group` was read from the job's own record and passed
-    // `signal_guard`, so it is neither init nor the box's own group.
+    // SAFETY: `killpg` takes two integers and touches no memory; `group` was read from the job's own record, which names
+    // no group of 1 or below, and passed `signal_guard`, so it is neither init nor the box's own group.
     let sent = unsafe { libc::killpg(group, signal) };
     if sent == 0 {
         return Ok(true);
@@ -226,7 +347,8 @@ pub(crate) enum Members {
         /// Whether a process of the group is in the record's session.
         in_session: bool,
     },
-    /// Its processes could not be listed, or one's session could not be read.
+    /// Its processes could not be listed, one's session could not be read, or every listed process was gone before its
+    /// session was read on each listing while `killpg(group, 0)` still found the group ([`members_of`]).
     Unknown,
 }
 
@@ -310,32 +432,115 @@ fn group_facts(recorded: Recorded) -> GroupFacts {
     }
 }
 
-/// The processes of the process group `group`, and whether one is in the session `session` (`getsid`); none is in no
-/// session. A process gone before its session is read is not counted.
-fn members(group: i32, session: Option<i32>) -> Members {
-    let mut pids = Vec::new();
-    if group_pids_into(group, &mut pids).is_err() {
-        return Members::Unknown;
+/// What [`members_of`] looks at of one process group: the box's view of a live group ([`LiveGroup`]), or a test's.
+trait GroupView {
+    /// Lists the group's processes into `pids`.
+    ///
+    /// # Errors
+    ///
+    /// Why the group could not be listed.
+    fn listed(&self, pids: &mut Vec<i32>) -> Result<(), String>;
+
+    /// The session of the process `pid` (`getsid`), else the `errno` it failed with.
+    ///
+    /// # Errors
+    ///
+    /// The `errno` of the failed read, `None` when it gave none.
+    fn session_of(&self, pid: i32) -> Result<i32, Option<i32>>;
+
+    /// Whether the group has no process left: `killpg(group, 0)` fails with `ESRCH`.
+    fn emptied(&self) -> bool;
+}
+
+/// The box's view of the live process group with this id.
+struct LiveGroup(i32);
+
+impl GroupView for LiveGroup {
+    fn listed(&self, pids: &mut Vec<i32>) -> Result<(), String> {
+        group_pids_into(self.0, pids)
     }
-    if pids.is_empty() {
-        return Members::Empty;
-    }
-    let Some(session) = session else {
-        return Members::Listed { in_session: false };
-    };
-    let mut unread = false;
-    for pid in pids {
+
+    fn session_of(&self, pid: i32) -> Result<i32, Option<i32>> {
         // SAFETY: `getsid` takes a pid and touches no memory.
         let sid = unsafe { libc::getsid(pid) };
-        if sid == session {
-            return Members::Listed { in_session: true };
+        if sid < 0 {
+            Err(io::Error::last_os_error().raw_os_error())
+        } else {
+            Ok(sid)
         }
-        unread |= sid < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+    }
+
+    fn emptied(&self) -> bool {
+        // SAFETY: signal 0 only asks whether the group exists; it touches no memory.
+        let sent = unsafe { libc::killpg(self.0, 0) };
+        sent != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+}
+
+/// The processes of the process group `group`, and whether one is in the session `session` ([`members_of`]).
+fn members(group: i32, session: Option<i32>) -> Members {
+    members_of(&LiveGroup(group), session)
+}
+
+/// How many times a group is listed while every process listed is gone before its session is read.
+const MEMBER_PASSES: usize = 3;
+/// The pause between those listings.
+const MEMBER_PAUSE: Duration = Duration::from_millis(50);
+
+/// The processes of the group `view` shows, and whether one is in the session `session` (`getsid`); none is in no
+/// session. A process gone before its session is read is not counted; when every listed one is, the group may have
+/// gained a process it forked before it went, so unless `killpg(group, 0)` finds the group empty it is listed again,
+/// up to [`MEMBER_PASSES`] times [`MEMBER_PAUSE`] apart, and a group still not judged then is [`Members::Unknown`].
+fn members_of(view: &impl GroupView, session: Option<i32>) -> Members {
+    let mut pids = Vec::new();
+    for pass in 1..=MEMBER_PASSES {
+        if view.listed(&mut pids).is_err() {
+            return Members::Unknown;
+        }
+        if pids.is_empty() {
+            return Members::Empty;
+        }
+        let Some(session) = session else {
+            return Members::Listed { in_session: false };
+        };
+        if let Seen::Judged(members) = sessions_seen(view, &pids, session) {
+            return members;
+        }
+        if view.emptied() {
+            return Members::Empty;
+        }
+        if pass < MEMBER_PASSES {
+            thread::sleep(MEMBER_PAUSE);
+        }
+    }
+    Members::Unknown
+}
+
+/// What the sessions of a group's listed processes show.
+enum Seen {
+    /// They decide the group's members: one is in the record's session, one's could not be read, or one is in another.
+    Judged(Members),
+    /// Every listed process was gone before its session was read.
+    AllGone,
+}
+
+/// Reads the session of each of `pids`, of the group `view` shows, against the record's `session`.
+fn sessions_seen(view: &impl GroupView, pids: &[i32], session: i32) -> Seen {
+    let (mut unread, mut read) = (false, false);
+    for pid in pids {
+        match view.session_of(*pid) {
+            Ok(sid) if sid == session => return Seen::Judged(Members::Listed { in_session: true }),
+            Ok(_) => read = true,
+            Err(Some(libc::ESRCH)) => {}
+            Err(_) => unread = true,
+        }
     }
     if unread {
-        Members::Unknown
+        Seen::Judged(Members::Unknown)
+    } else if read {
+        Seen::Judged(Members::Listed { in_session: false })
     } else {
-        Members::Listed { in_session: false }
+        Seen::AllGone
     }
 }
 
@@ -382,7 +587,9 @@ fn leader_facts(_pid: i32) -> LeaderFacts {
     reason = "a test whose temp folder, payload or sleep cannot be made must fail loudly"
 )]
 mod tests {
+    use std::cell::{Cell, RefCell};
     use std::fs;
+    use std::io;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
@@ -396,11 +603,14 @@ mod tests {
     use gate_wire::{PathForm, Payload};
     use serde_json::json;
 
-    use super::{GroupFacts, LeaderFacts, Members, Record, own_group, record_current, record_decision, stop};
+    use super::{
+        GroupFacts, GroupView, LeaderFacts, Members, Record, StopView, groups_ended, members_of, own_group, record_current, record_decision,
+        still_named, stop, stopped_through,
+    };
     use crate::console::{Console, Output, RecordingSink};
     use crate::files::{effective_uid, held_for_test, user_name};
     use crate::git::{Git, GitClass, RunGit};
-    use crate::lines::{Recorded, root_unsafe_line};
+    use crate::lines::{Recorded, record_unread, record_without_group, root_unsafe_line};
     use crate::process::GroupRecord;
 
     const KEY: &str = "repo-0123abcd";
@@ -474,6 +684,138 @@ mod tests {
         assert_eq!(console.out, [format!("gate: remote stopped job {JOB}")]);
         let ended = reaper.join().expect("the reaper ends").expect("the sleep is reaped");
         assert!(!ended.success(), "the sleep was ended by the stop: {ended:?}");
+    }
+
+    /// Waits for the file `path` to be made, within a minute: a hang guard only.
+    fn made(path: &Path) -> bool {
+        let guard = Instant::now() + Duration::from_secs(60);
+        while !path.exists() && Instant::now() < guard {
+            thread::sleep(Duration::from_millis(10));
+        }
+        path.exists()
+    }
+
+    /// A perl leading a process group of its own that makes `ready` once it handles `SIGTERM`, and on each TERM makes
+    /// `termed` and runs the perl `on_term`: with none, a TERM never ends it.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the spawn lock is the Windows gate's; this test stands in for a run's step"
+    )]
+    fn term_handling_group(on_term: &str, ready: &Path, termed: &Path) -> Child {
+        let script = format!("$SIG{{TERM}} = sub {{ open(my $f, '>', $ARGV[1]); {on_term} }}; open(my $r, '>', $ARGV[0]); close $r; sleep 1 while 1");
+        let child = Command::new("perl")
+            .args(["-e", &script])
+            .arg(ready)
+            .arg(termed)
+            .process_group(0)
+            .spawn()
+            .expect("perl starts");
+        assert!(made(ready), "perl handles SIGTERM");
+        child
+    }
+
+    #[test]
+    fn the_record_read_again_names_the_group_only_for_this_job_and_this_group() {
+        let case = Case::new("still-named");
+        let record = PathBuf::from(format!("{}.pgid", case.work()));
+        let shown = record.display().to_string();
+        let written = |text: String| fs::write(&record, text).expect("the record is written");
+        assert_eq!(still_named(&record, JOB, 4242), Ok(false), "no record");
+
+        written("gate-remote-repo-0123abcd-ffffffffffff\n4242\n77\n".to_owned());
+        assert_eq!(still_named(&record, JOB, 4242), Ok(false), "another job's record");
+
+        written(format!("{JOB}\n4243\n77\n"));
+        assert_eq!(still_named(&record, JOB, 4242), Ok(false), "this job, another group");
+
+        written(format!("{JOB}\n1\n77\n"));
+        assert_eq!(still_named(&record, JOB, 4242), Err(record_without_group(&shown)), "a malformed record");
+
+        written(format!("{JOB}\n4242\n77\n"));
+        assert_eq!(still_named(&record, JOB, 4242), Ok(true), "this job, this group");
+    }
+
+    #[test]
+    fn stop_follows_the_record_to_a_later_group_of_its_job_and_never_kills_the_group_whose_record_went() {
+        // Group 5 outlives its TERM; before its KILL the record names the job's later group 6, which its TERM ends.
+        let moved = FakeStop::new(&[Some(5), Some(6), None], &[true, false, true], &[], &[false, true]);
+        let mut console = Console::captured();
+        assert_eq!(stopped_through(&moved, JOB, &mut console), 0, "{:?}", console.err);
+        assert_eq!(console.out, [format!("gate: remote stopped job {JOB}")]);
+        let sent = moved.sent.borrow();
+        assert!(
+            !sent.contains(&(5, libc::SIGKILL)),
+            "the group whose record went is never sent SIGKILL: {sent:?}"
+        );
+        assert_eq!(
+            *sent,
+            [(5, libc::SIGTERM), (5, libc::SIGCONT), (6, libc::SIGTERM), (6, libc::SIGCONT)],
+            "the job's later group was ended by the stop"
+        );
+    }
+
+    #[test]
+    fn stop_never_signals_a_group_another_job_s_record_names() {
+        // Group 5 outlives its TERM; before its KILL the record names another job's group, which the stop never reads
+        // as its own.
+        let moved = FakeStop::new(&[Some(5), None], &[true, false], &[], &[false]);
+        let mut console = Console::captured();
+        assert_eq!(stopped_through(&moved, JOB, &mut console), 0, "{:?}", console.err);
+        let sent = moved.sent.borrow();
+        assert!(
+            !sent.contains(&(5, libc::SIGKILL)),
+            "the group whose record went is never sent SIGKILL: {sent:?}"
+        );
+        assert!(
+            sent.iter().all(|(group, _)| *group == 5),
+            "another job's group is never signalled: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_read_again_fails_the_stop_and_nothing_more_is_signalled() {
+        let line = format!("gate: remote could not stop job {JOB}: {}", record_unread(FAKE_RECORD, FAKE_READ_ERROR));
+        let before_term = FakeStop::new(&[Some(5)], &[true], &[], &[true]).unreadable_after(0);
+        let mut console = Console::captured();
+        assert_eq!(stopped_through(&before_term, JOB, &mut console), 1);
+        assert_eq!(console.err, std::slice::from_ref(&line));
+        assert!(console.out.is_empty());
+        assert!(before_term.sent.borrow().is_empty(), "{:?}", before_term.sent.borrow());
+
+        let before_kill = FakeStop::new(&[Some(5)], &[true], &[], &[false]).unreadable_after(1);
+        let mut console = Console::captured();
+        assert_eq!(stopped_through(&before_kill, JOB, &mut console), 1);
+        assert_eq!(console.err, [line]);
+        assert_eq!(
+            *before_kill.sent.borrow(),
+            [(5, libc::SIGTERM), (5, libc::SIGCONT)],
+            "no SIGKILL after the failed read"
+        );
+    }
+
+    #[test]
+    fn stop_continues_a_stopped_group_so_its_sigterm_ends_it() {
+        let case = Case::new("stopped-group");
+        // A stopped process that handles SIGTERM holds it pending until it is continued.
+        let child = term_handling_group("exit 7", &case.base.join("ready"), &case.base.join("termed"));
+        let pid = i32::try_from(child.id()).expect("a pid is a pid_t");
+        let mut waited = 0;
+        // SAFETY: the perl is this case's own child; `waited` lives across the `waitpid`, which writes only into it.
+        let stopped_child = unsafe {
+            libc::kill(pid, libc::SIGSTOP);
+            libc::waitpid(pid, &raw mut waited, libc::WUNTRACED)
+        };
+        assert_eq!(stopped_child, pid, "the perl is stopped");
+        case.record(".pgid", JOB, &child.id().to_string());
+        let reaper = thread::spawn(move || {
+            let mut child = child;
+            child.wait()
+        });
+
+        let (status, console) = stopped(&case);
+        let ended = reaper.join().expect("the reaper ends").expect("the perl is reaped");
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert_eq!(ended.code(), Some(7), "ended by its TERM's handler, not by the KILL: {ended:?}");
     }
 
     #[test]
@@ -655,6 +997,174 @@ mod tests {
         assert_eq!(two_line, Record::Stale, "a two-line record names no session");
     }
 
+    /// A group whose listings answer `lists` in turn, then the last again, each process's session read from
+    /// `sessions`, and `killpg(group, 0)` finding a process unless `emptied`.
+    struct FakeView {
+        lists: RefCell<Vec<Vec<i32>>>,
+        sessions: Vec<(i32, Result<i32, Option<i32>>)>,
+        emptied: bool,
+    }
+
+    impl FakeView {
+        fn new(lists: &[&[i32]], sessions: &[(i32, Result<i32, Option<i32>>)], emptied: bool) -> FakeView {
+            FakeView {
+                lists: RefCell::new(lists.iter().rev().map(|list| list.to_vec()).collect()),
+                sessions: sessions.to_vec(),
+                emptied,
+            }
+        }
+    }
+
+    impl GroupView for FakeView {
+        fn listed(&self, pids: &mut Vec<i32>) -> Result<(), String> {
+            let mut lists = self.lists.borrow_mut();
+            let list = if lists.len() > 1 { lists.pop() } else { lists.last().cloned() };
+            *pids = list.unwrap_or_default();
+            Ok(())
+        }
+
+        fn session_of(&self, pid: i32) -> Result<i32, Option<i32>> {
+            self.sessions
+                .iter()
+                .find(|(listed, _)| *listed == pid)
+                .map_or(Err(Some(libc::ESRCH)), |(_, session)| *session)
+        }
+
+        fn emptied(&self) -> bool {
+            self.emptied
+        }
+    }
+
+    /// The next of `answers`, given in turn, then the last of them again.
+    fn next_of<T: Copy>(answers: &RefCell<Vec<T>>) -> Option<T> {
+        let mut answers = answers.borrow_mut();
+        if answers.len() > 1 { answers.pop() } else { answers.last().copied() }
+    }
+
+    /// The record a [`FakeStop`] fails to read, and why.
+    const FAKE_RECORD: &str = "/w/k.pgid";
+    const FAKE_READ_ERROR: &str = "Permission denied (os error 13)";
+
+    /// A job whose record names `named` in turn, still names the group being ended as `still` says in turn (each read
+    /// after the first [`FakeStop::unreadable_after`] fails), whose signals fail with the `errno` paired with them in
+    /// `refused` and are sent otherwise, and whose groups are gone within a wait as `gone` says in turn; it notes each
+    /// signal sent.
+    struct FakeStop {
+        named: RefCell<Vec<Option<i32>>>,
+        still: RefCell<Vec<bool>>,
+        reads: Cell<usize>,
+        readable: usize,
+        refused: Vec<(i32, i32)>,
+        gone: RefCell<Vec<bool>>,
+        sent: RefCell<Vec<(i32, i32)>>,
+    }
+
+    impl FakeStop {
+        fn new(named: &[Option<i32>], still: &[bool], refused: &[(i32, i32)], gone: &[bool]) -> FakeStop {
+            FakeStop {
+                named: RefCell::new(named.iter().rev().copied().collect()),
+                still: RefCell::new(still.iter().rev().copied().collect()),
+                reads: Cell::new(0),
+                readable: usize::MAX,
+                refused: refused.to_vec(),
+                gone: RefCell::new(gone.iter().rev().copied().collect()),
+                sent: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// The job whose record reads again only `readable` times before a stop's signals; every later read fails.
+        fn unreadable_after(self, readable: usize) -> FakeStop {
+            FakeStop { readable, ..self }
+        }
+    }
+
+    impl StopView for FakeStop {
+        fn current(&self) -> Result<Option<i32>, String> {
+            Ok(next_of(&self.named).flatten())
+        }
+
+        fn still_named(&self, _group: i32) -> Result<bool, String> {
+            let reads = self.reads.get() + 1;
+            self.reads.set(reads);
+            if reads > self.readable {
+                return Err(record_unread(FAKE_RECORD, FAKE_READ_ERROR));
+            }
+            Ok(next_of(&self.still).unwrap_or(false))
+        }
+
+        fn send(&self, group: i32, signal: i32) -> io::Result<bool> {
+            self.sent.borrow_mut().push((group, signal));
+            match self.refused.iter().find(|(refused, _)| *refused == signal) {
+                Some((_, errno)) => Err(io::Error::from_raw_os_error(*errno)),
+                None => Ok(true),
+            }
+        }
+
+        fn gone_within(&self, _group: i32, _wait: Duration) -> bool {
+            next_of(&self.gone).unwrap_or(false)
+        }
+
+        fn left(&self, group: i32) -> String {
+            format!("group {group} left")
+        }
+    }
+
+    #[test]
+    fn a_group_left_with_only_its_unreaped_leader_refuses_signals_and_is_still_stopped() {
+        let (term, cont, kill) = (libc::SIGTERM, libc::SIGCONT, libc::SIGKILL);
+        let refused_term = FakeStop::new(&[Some(5), None], &[true], &[(term, libc::EPERM), (cont, libc::EPERM)], &[true]);
+        assert_eq!(groups_ended(&refused_term), Ok(1), "EPERM: only the zombie leader is left");
+        assert_eq!(*refused_term.sent.borrow(), [(5, term), (5, cont)]);
+
+        let refused_kill = FakeStop::new(&[Some(5), None], &[true], &[(kill, libc::EPERM)], &[false, true]);
+        assert_eq!(groups_ended(&refused_kill), Ok(1), "the KILL found only the zombie leader");
+        assert_eq!(*refused_kill.sent.borrow(), [(5, term), (5, cont), (5, kill)]);
+
+        let refused_otherwise = FakeStop::new(&[Some(5), None], &[true], &[(term, libc::EINVAL)], &[true]);
+        assert!(groups_ended(&refused_otherwise).is_err(), "another refusal still fails the stop");
+    }
+
+    #[test]
+    fn a_group_the_record_stops_naming_before_its_first_signal_is_not_counted() {
+        let moved_away = FakeStop::new(&[Some(5), None], &[false], &[], &[true]);
+        assert_eq!(groups_ended(&moved_away), Ok(0), "nothing was signalled, so nothing was stopped");
+        assert!(moved_away.sent.borrow().is_empty());
+
+        let moved_on = FakeStop::new(&[Some(5), Some(6), None], &[false, true], &[], &[true]);
+        assert_eq!(groups_ended(&moved_on), Ok(1), "only the later group was signalled");
+        assert_eq!(*moved_on.sent.borrow(), [(6, libc::SIGTERM), (6, libc::SIGCONT)]);
+    }
+
+    #[test]
+    fn a_leaderless_group_whose_listed_members_all_went_is_listed_again_before_it_is_judged() {
+        let gone = Err(Some(libc::ESRCH));
+        let forked = FakeView::new(&[&[10], &[11]], &[(10, gone), (11, Ok(77))], false);
+        assert_eq!(
+            members_of(&forked, Some(77)),
+            Members::Listed { in_session: true },
+            "the member forked before it exited is found on the second listing"
+        );
+
+        let still_there = FakeView::new(&[&[10]], &[(10, gone)], false);
+        let unknown = members_of(&still_there, Some(77));
+        assert_eq!(unknown, Members::Unknown, "a group never seen empty is not judged gone");
+        let written = SystemTime::UNIX_EPOCH + Duration::from_secs(5000);
+        assert_eq!(
+            record_decision(written, Some(77), &facts(None, LeaderFacts::Absent, unknown)),
+            Record::Current
+        );
+
+        let emptied = FakeView::new(&[&[10]], &[(10, gone)], true);
+        assert_eq!(members_of(&emptied, Some(77)), Members::Empty, "killpg finds no process left");
+
+        let elsewhere = FakeView::new(&[&[10, 12]], &[(10, gone), (12, Ok(5))], false);
+        assert_eq!(
+            members_of(&elsewhere, Some(77)),
+            Members::Listed { in_session: false },
+            "a live member of another session: the id is another's"
+        );
+    }
+
     #[test]
     fn stop_without_a_record_or_with_another_job_s_is_silent() {
         let case = Case::new("silent");
@@ -781,15 +1291,15 @@ mod tests {
     #[test]
     fn stop_never_signals_init_or_its_own_group() {
         let case = Case::new("guard");
+        let record = format!("{}.pgid", case.work());
         for group in ["1", "0", "-5"] {
             case.record(".pgid", JOB, group);
             let (status, console) = stopped(&case);
             assert_eq!(status, 1, "{group}");
             assert_eq!(
                 console.err,
-                [format!(
-                    "gate: remote could not stop job {JOB}: its recorded process group {group} is not a run's"
-                )]
+                [format!("gate: remote could not stop job {JOB}: {}", record_without_group(&record))],
+                "no run records the group {group}"
             );
         }
         let own = own_group();

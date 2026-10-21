@@ -129,8 +129,8 @@ impl LineSink for StdioSink {
 
 /// What a reader thread forwards each line through: the box's [`Output`], behind a pointer every thread may hold.
 pub trait Forwarding: Send + Sync {
-    /// Says `line` on `stream` unless `stopped` is set, looked at under the output lock, so no line is written after
-    /// the one who set it says its last.
+    /// Says `line` on `stream` unless `stopped` is set or the client is gone, both looked at under the output lock, so
+    /// no line is written after the one who set `stopped` says its last.
     ///
     /// # Errors
     ///
@@ -150,7 +150,7 @@ pub trait Forwarding: Send + Sync {
 impl<S: LineSink> Forwarding for Output<S> {
     fn say_unless(&self, stopped: &AtomicBool, stream: Stream, line: &str) -> io::Result<()> {
         let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        if stopped.load(Ordering::SeqCst) {
+        if stopped.load(Ordering::SeqCst) || self.gone.is_set() {
             return Ok(());
         }
         self.write_held(stream, line)
@@ -218,14 +218,21 @@ impl<S: LineSink> Output<S> {
     }
 
     /// Says `lines` in order under one hold of the lock, so no other line comes between them; the first line that
-    /// cannot be written ends the group.
+    /// cannot be written ends the group. Once the client is gone, nothing is written: looked at before the lock is
+    /// taken, so a gone client never waits on it, and again under it.
     ///
     /// # Errors
     ///
     /// Why a line could not be written.
     pub fn say_together(&self, lines: &[(Stream, &str)]) -> io::Result<()> {
+        if self.gone.is_set() {
+            return Ok(());
+        }
         // A thread that panicked while holding the lock left no state behind it: the lock guards only the writes.
         let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.gone.is_set() {
+            return Ok(());
+        }
         for (stream, line) in lines {
             self.write_held(*stream, line)?;
         }
@@ -411,6 +418,16 @@ mod tests {
             assert!(tag.is_some(), "{pair:?}");
             assert_eq!(pair[1].1.strip_prefix("human "), tag, "{pair:?}");
         }
+    }
+
+    #[test]
+    fn nothing_is_said_once_the_client_is_gone() {
+        let output = Output::new(RecordingSink::default());
+        output.mark_gone();
+        assert!(output.say_together(&[(Stream::Out, "a"), (Stream::Err, "b")]).is_ok());
+        assert!(output.say(Stream::Err, "c").is_ok());
+        assert!(output.say_unless(&AtomicBool::new(false), Stream::Err, "d").is_ok());
+        assert!(output.sink().lines().is_empty(), "{:?}", output.sink().lines());
     }
 
     #[test]

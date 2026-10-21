@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
-use crate::lines::{RootFacts, folder_failure, folder_flaw, job_record_text};
+use crate::lines::{RootFacts, folder_failure, folder_flaw};
 
 /// The most bytes of a record beside the work folder, or of a tree's alternates file, read.
 pub const RECORD_LIMIT: u64 = 64 * 1024;
@@ -238,16 +238,6 @@ pub fn staged_temp(path: &Path) -> io::Result<(PathBuf, File)> {
     temp_beside(path, REPLACES.fetch_add(1, Ordering::Relaxed))
 }
 
-/// Writes the job record `path`, naming the job `job`, its process group `group` and the group's session `session`
-/// ([`job_record_text`]), whole and synced ([`replace_plain`]).
-///
-/// # Errors
-///
-/// Why the record could not be replaced, or its folder synced after.
-pub fn write_job_record(path: &Path, job: &str, group: i32, session: i32) -> Result<(), ReplaceFailure> {
-    replace_plain(path, job_record_text(job, group, session).as_bytes())
-}
-
 /// A work lock this box holds: an exclusive `flock` on its file, released when this is dropped and the file closed.
 #[derive(Debug)]
 pub struct HeldLock {
@@ -438,8 +428,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use super::{HeldLock, Locked, replace_numbered, replace_plain, take_lock, take_lock_between, temp_name, write_job_record};
-    use crate::lines::{JobRecord, Recorded, job_record};
+    use super::{HeldLock, Locked, replace_numbered, replace_plain, take_lock, take_lock_between, temp_name};
 
     /// How long a write may take before the case calls it hung: a hang guard, never reached by a write that works.
     const HANG_GUARD: Duration = Duration::from_secs(300);
@@ -615,20 +604,6 @@ mod tests {
         replace_plain(&file, b"new\n").expect("the file is replaced");
         let mode = fs::metadata(&file).expect("the file is looked at").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "{mode:o}");
-    }
-
-    #[test]
-    fn a_job_record_is_written_as_the_stop_reads_it() {
-        let case = Case::new("job-record");
-        let record = case.base.join("k.pgid");
-        write_job_record(&record, "gate-remote-k-0123456789ab", 4242, 7).expect("the record is written");
-        write_job_record(&record, "gate-remote-k-ffffffffffff", 99, 8).expect("the record is replaced");
-        let bytes = fs::read(&record).expect("the record is read");
-        assert_eq!(
-            job_record(&bytes, "gate-remote-k-ffffffffffff"),
-            JobRecord::Group(Recorded { group: 99, session: Some(8) })
-        );
-        assert_eq!(case.names(), ["k.pgid"]);
     }
 
     #[test]

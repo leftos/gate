@@ -413,33 +413,42 @@ fn record_lines(bytes: &[u8]) -> Option<(&str, Option<Recorded>)> {
 }
 
 /// The lines after a job record's first: its process group in decimal, then optionally its session in decimal, and
-/// nothing after; else `None`.
+/// nothing after; else `None`. A run writes only digits, a group above 1 and a session above 0, so any other value,
+/// a sign included, is no record of a run's.
 fn recorded_lines(lines: &mut std::str::Lines<'_>) -> Option<Recorded> {
-    let group = lines.next()?.parse::<i32>().ok()?;
+    let group = digits_above(lines.next()?, 1)?;
     let session = match lines.next() {
         None => None,
-        Some(line) => Some(line.parse::<i32>().ok()?),
+        Some(line) => Some(digits_above(line, 0)?),
     };
     lines.next().is_none().then_some(Recorded { group, session })
 }
 
+/// `line` read as a decimal number above `least`, written in digits only; else `None`.
+fn digits_above(line: &str, least: i32) -> Option<i32> {
+    if line.is_empty() || !line.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    line.parse::<i32>().ok().filter(|value| *value > least)
+}
+
 /// The text of the job record of the job `job` whose process group is `group`, made in the session `session`, as
-/// [`job_record`] reads it: the job's name, the group, then the session in decimal, each on a line.
+/// [`job_record`] reads it: the job's name, the group, then the session in decimal, each on a line. The child writes
+/// the record itself, so only the tests make its text.
+#[cfg(test)]
 #[must_use]
-pub fn job_record_text(job: &str, group: i32, session: i32) -> String {
+fn job_record_text(job: &str, group: i32, session: i32) -> String {
     format!("{job}\n{group}\n{session}\n")
 }
 
-/// Refuses to signal the process group `group` when it is no run's: 1 or below (init, or every process the box may
-/// signal) or the box's own `own`. Else why, as the stop line says it.
+/// Refuses to signal the process group `group` when it is the box's own `own`; a group of 1 or below is never read
+/// from a record ([`job_record`]). Else why, as the stop line says it.
 ///
 /// # Errors
 ///
 /// Why the group is not signalled.
 pub fn signal_guard(group: i32, own: i32) -> Result<(), String> {
-    if group <= 1 {
-        Err(format!("its recorded process group {group} is not a run's"))
-    } else if group == own {
+    if group == own {
         Err(format!("its recorded process group {group} is the box's own"))
     } else {
         Ok(())
@@ -746,11 +755,8 @@ mod tests {
         );
         assert_eq!(
             job_record(job_record_text(JOB, -7, 77).as_bytes(), JOB),
-            JobRecord::Group(Recorded {
-                group: -7,
-                session: Some(77)
-            }),
-            "read back, refused by the guard"
+            JobRecord::Malformed,
+            "a group no run writes"
         );
     }
 
@@ -775,12 +781,29 @@ mod tests {
     }
 
     #[test]
+    fn a_record_whose_group_or_session_no_run_writes_is_malformed() {
+        for group in ["0", "1", "+7", "-1", "-7"] {
+            let bad = format!("{JOB}\n{group}\n77\n");
+            assert_eq!(job_record(bad.as_bytes(), JOB), JobRecord::Malformed, "group {group:?}");
+        }
+        for session in ["-1", "0", "+7"] {
+            let bad = format!("{JOB}\n4242\n{session}\n");
+            assert_eq!(job_record(bad.as_bytes(), JOB), JobRecord::Malformed, "session {session:?}");
+        }
+        assert_eq!(
+            job_record(format!("{JOB}\n2\n1\n").as_bytes(), JOB),
+            JobRecord::Group(Recorded { group: 2, session: Some(1) }),
+            "the least group and session a run writes"
+        );
+    }
+
+    #[test]
     fn init_any_group_below_it_and_the_box_s_own_group_are_never_signalled() {
         for group in [1, 0, -1, i32::MIN] {
             assert_eq!(
-                signal_guard(group, 900),
-                Err(format!("its recorded process group {group} is not a run's")),
-                "{group}"
+                job_record(format!("{JOB}\n{group}\n").as_bytes(), JOB),
+                JobRecord::Malformed,
+                "the record reader refuses the group {group}"
             );
         }
         assert_eq!(signal_guard(900, 900), Err("its recorded process group 900 is the box's own".to_owned()));

@@ -76,8 +76,8 @@ pub enum Ending {
 }
 
 /// The job record a program's process group is written to as the program starts, so `box stop` finds it: the job's
-/// name, the group, then the group's session in decimal ([`crate::lines::job_record`]). It is written and removed only while the run's work
-/// lock is held.
+/// name, the group, then the group's session in decimal ([`crate::lines::job_record`]). It is written and removed
+/// only while the run's work lock is held.
 #[derive(Debug)]
 pub struct GroupRecord<'a> {
     path: PathBuf,
@@ -370,7 +370,8 @@ const KILL_WAIT: Duration = Duration::from_secs(10);
 enum GroupEnd {
     /// The leader has exited, unreaped, and the group is ended.
     Ended,
-    /// The leader had not exited when the wait after `SIGKILL` passed: the group is still there.
+    /// The leader had not exited, or a process besides it was still in the group, when the wait after `SIGKILL`
+    /// passed: the group is still there.
     StillThere,
 }
 
@@ -396,7 +397,8 @@ trait Group {
 enum Settled {
     /// The leader has exited and the group is ended: the record goes, the leader is reaped and the readers drained.
     Ended,
-    /// The leader had not exited when the wait after `SIGKILL` passed: the record stays, the leader is not reaped.
+    /// The leader had not exited, or a process besides it was still in the group, when the wait after `SIGKILL`
+    /// passed: the record stays, the leader is not reaped.
     StillThere,
     /// The leader's exit could not be read, for `error`: the leader is not reaped and the readers are stopped; the
     /// record stays when `keep`.
@@ -409,9 +411,9 @@ enum Settled {
 }
 
 /// Ends what is left of `group` once the runner stopped watching it for `why`: as `ending` says ([`end_group`]) for an
-/// exit, the deadline or a gone client; with `SIGKILL` and up to `kill_wait` for the leader's exit when the readers
-/// could not start; with `SIGKILL` alone ([`killed_unless_reaped`]) when the leader's exit could not be read. A look
-/// at the leader that fails leaves it unreaped ([`Settled::Unread`]).
+/// exit, the deadline or a gone client; with `SIGKILL` and up to `kill_wait` for the leader's exit and the group to
+/// empty when the readers could not start; with `SIGKILL` alone ([`killed_unless_reaped`]) when the leader's exit
+/// could not be read. A look at the leader that fails leaves it unreaped ([`Settled::Unread`]).
 fn settled(group: &impl Group, why: &Why, ending: Ending, kill_wait: Duration) -> Settled {
     let ended = match why {
         Why::Unread(error) => {
@@ -449,10 +451,11 @@ fn copied(error: &io::Error) -> io::Error {
 }
 
 /// Ends what is left of `group` as `ending` says, the leader not reaped: nothing when the leader has exited and no
-/// other process is in the group; else `SIGTERM` and the grace for the group to empty, when asked first, then
-/// `SIGKILL` and up to `kill_wait` for the leader's exit ([`GroupEnd::StillThere`] past it). A look at the leader that
-/// fails sends `SIGKILL` before the failure is given, as the leader is unreaped and the group still the runner's,
-/// unless it failed with `ECHILD`, the leader no child of the box's to look at.
+/// other process is in the group; else `SIGTERM`, with `SIGCONT` right after it, and the grace for the group to empty,
+/// when asked first, then `SIGKILL` and up to `kill_wait` for the leader's exit and the group to empty
+/// ([`GroupEnd::StillThere`] past it). A look at the leader that fails sends `SIGKILL` before the failure is given, as
+/// the leader is unreaped and the group still the runner's, unless it failed with `ECHILD`, the leader no child of the
+/// box's to look at.
 ///
 /// # Errors
 ///
@@ -464,6 +467,8 @@ fn end_group(group: &impl Group, ending: Ending, kill_wait: Duration) -> io::Res
     }
     if let Ending::TermThenKill(grace) = ending {
         group.signal(libc::SIGTERM);
+        // A stopped process holds its SIGTERM pending until it is continued.
+        group.signal(libc::SIGCONT);
         let until = Instant::now() + grace;
         while Instant::now() < until {
             if quiet_or_killed(group, &mut pids)? {
@@ -496,15 +501,17 @@ fn killed_unless_reaped(group: &impl Group, error: &io::Error) {
     }
 }
 
-/// Waits up to `wait` for `group`'s leader to exit, looking every [`POLL`].
+/// Waits up to `wait` for `group`'s leader to exit and for no other process to be left in the group, looking every
+/// [`POLL`]: the leader's exit alone does not end a group a member is still in.
 ///
 /// # Errors
 ///
 /// The leader's exit could not be read.
 fn exited_within(group: &impl Group, wait: Duration) -> io::Result<GroupEnd> {
     let until = Instant::now() + wait;
+    let mut pids = Vec::new();
     loop {
-        if group.exited()? {
+        if group.exited()? && !group.others_left(&mut pids) {
             return Ok(GroupEnd::Ended);
         }
         if Instant::now() >= until {
@@ -636,12 +643,14 @@ struct ChildSide {
 }
 
 impl ChildSide {
-    /// Writes the job's name, the child's pid, its group, and its session to the temp file, syncs it and renames it
-    /// over the record: async-signal-safe calls only, on what was made before the fork.
+    /// Writes the job's name, the child's pid, which is its group's id, on one line, and its session to the temp
+    /// file, syncs it and renames it over the record: async-signal-safe calls only, on what was made before the fork.
     fn write(&self) -> io::Result<()> {
         // SAFETY: `getpid` takes nothing and always succeeds.
         let pid = unsafe { libc::getpid() };
         // SAFETY: `getsid(0)` asks for the caller's own session, touches no memory and fails only for another pid.
+        // POSIX does not list it as async-signal-safe, but on macOS it is a bare system call stub, which takes no lock
+        // and allocates nothing.
         let session = unsafe { libc::getsid(0) };
         if session < 0 {
             return Err(io::Error::last_os_error());
@@ -1043,43 +1052,66 @@ mod tests {
         assert!(left.is_empty(), "neither the record nor its temp file is left: {left:?}");
     }
 
+    /// What one look at a fake group's leader answers.
+    #[derive(Clone, Copy, Debug)]
+    enum Look {
+        /// The leader has not exited.
+        Running,
+        /// The leader has exited, unreaped.
+        Exited,
+        /// The look fails with this `errno`.
+        Fails(i32),
+    }
+
+    /// The next of `answers`, given in turn, then the last of them again.
+    fn next_of<T: Copy>(answers: &RefCell<Vec<T>>) -> Option<T> {
+        let mut answers = answers.borrow_mut();
+        if answers.len() > 1 { answers.pop() } else { answers.last().copied() }
+    }
+
     /// A group whose leader's looks answer `looks` in turn, then the last of them again, with a process besides the
-    /// leader in it unless made [`Fake::emptied`]; it notes each signal sent.
+    /// leader in it unless made [`Fake::emptied`] or listed otherwise ([`Fake::listing`]); it notes each signal sent.
     struct Fake {
-        looks: RefCell<Vec<Option<i32>>>,
+        looks: RefCell<Vec<Look>>,
         sent: RefCell<Vec<i32>>,
-        others: bool,
+        others: RefCell<Vec<bool>>,
     }
 
     impl Fake {
-        /// `looks`: `None` for a leader not yet exited, `Some(errno)` for a look that fails.
-        fn new(looks: &[Option<i32>]) -> Fake {
+        fn new(looks: &[Look]) -> Fake {
             Fake {
                 looks: RefCell::new(looks.iter().rev().copied().collect()),
                 sent: RefCell::new(Vec::new()),
-                others: true,
+                others: RefCell::new(vec![true]),
             }
         }
 
         /// The group with no process left in it.
         fn emptied(self) -> Fake {
-            Fake { others: false, ..self }
+            self.listing(&[false])
+        }
+
+        /// The group whose listings find a process besides the leader as `others` says, in turn, then the last again.
+        fn listing(self, others: &[bool]) -> Fake {
+            Fake {
+                others: RefCell::new(others.iter().rev().copied().collect()),
+                ..self
+            }
         }
     }
 
     impl Group for Fake {
         fn exited(&self) -> io::Result<bool> {
-            let mut looks = self.looks.borrow_mut();
-            let look = if looks.len() > 1 { looks.pop() } else { looks.last().copied() };
-            match look.flatten() {
-                Some(errno) => Err(io::Error::from_raw_os_error(errno)),
-                None => Ok(false),
+            match next_of(&self.looks) {
+                Some(Look::Fails(errno)) => Err(io::Error::from_raw_os_error(errno)),
+                Some(Look::Exited) => Ok(true),
+                Some(Look::Running) | None => Ok(false),
             }
         }
 
         fn others_left(&self, pids: &mut Vec<i32>) -> bool {
             pids.clear();
-            self.others
+            next_of(&self.others).unwrap_or(true)
         }
 
         fn signal(&self, signal: i32) {
@@ -1089,15 +1121,109 @@ mod tests {
 
     #[test]
     fn a_look_at_the_leader_that_fails_during_the_grace_still_kills_the_group() {
-        let group = Fake::new(&[None, Some(libc::EIO)]);
+        let group = Fake::new(&[Look::Running, Look::Fails(libc::EIO)]);
         let ended = end_group(&group, Ending::TermThenKill(Duration::from_secs(60)), Duration::ZERO);
         assert!(ended.is_err(), "{ended:?}");
-        assert_eq!(*group.sent.borrow(), [libc::SIGTERM, libc::SIGKILL]);
+        assert_eq!(*group.sent.borrow(), [libc::SIGTERM, libc::SIGCONT, libc::SIGKILL]);
+    }
+
+    #[test]
+    fn a_leader_that_exited_with_a_member_left_past_the_wait_after_sigkill_leaves_its_group_still_there() {
+        let group = Fake::new(&[Look::Exited]);
+        let started = Instant::now();
+        let settled = settled(&group, &Why::Exited, Ending::Kill, Duration::from_millis(200));
+        assert!(
+            matches!(settled, Settled::StillThere),
+            "the member keeps the record and the leader unreaped: {settled:?}"
+        );
+        assert!(started.elapsed() < ENDED_WELL_BEFORE, "the wait is bounded");
+        assert_eq!(*group.sent.borrow(), [libc::SIGKILL]);
+    }
+
+    #[test]
+    fn a_leader_that_exited_is_ended_once_its_member_is_gone_within_the_wait() {
+        let group = Fake::new(&[Look::Exited]).listing(&[true, true, false]);
+        let settled = settled(&group, &Why::Exited, Ending::Kill, HANG_GUARD);
+        assert!(matches!(settled, Settled::Ended), "{settled:?}");
+        assert_eq!(*group.sent.borrow(), [libc::SIGKILL]);
+    }
+
+    #[test]
+    fn a_group_asked_to_end_with_sigterm_is_continued_at_once() {
+        let group = Fake::new(&[Look::Exited]).listing(&[true, false]);
+        let settled = settled(&group, &Why::Exited, Ending::TermThenKill(HANG_GUARD), HANG_GUARD);
+        assert!(matches!(settled, Settled::Ended), "{settled:?}");
+        assert_eq!(*group.sent.borrow(), [libc::SIGTERM, libc::SIGCONT], "a stopped group gets its TERM");
+    }
+
+    /// A perl, out of any step's group, whose child joins the process group whose id the step writes to `group_file`,
+    /// then writes its pid to `joined` and sleeps; once the child is killed, the perl leaves it a zombie, still listed
+    /// in the group, for a second before it reaps it.
+    #[cfg(target_os = "macos")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the spawn lock is the Windows gate's; this test stands in for a process of the step's"
+    )]
+    fn joining_member(group_file: &std::path::Path, joined: &std::path::Path) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        let script = r#"use POSIX; alarm 120; my ($g_file, $joined) = @ARGV;
+            my $c = fork();
+            if ($c == 0) {
+                sleep 0.01 until -e $g_file;
+                open(my $f, '<', $g_file) or die; my $g = <$f>; chomp $g;
+                POSIX::setpgid(0, $g) or die "setpgid: $!";
+                open(my $j, '>', "$joined.tmp") or die; print $j "$$\n"; close $j; rename("$joined.tmp", $joined) or die;
+                sleep 600; exit 0;
+            }
+            sleep 0.01 until -e $joined;
+            sleep 0.05 until `ps -o stat= -p $c` =~ /Z/;
+            sleep 1; waitpid($c, 0);"#;
+        Command::new("perl")
+            .args(["-MTime::HiRes=sleep", "-e", script])
+            .arg(group_file)
+            .arg(joined)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("perl starts")
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_member_left_in_the_group_once_its_leader_exits_is_gone_before_the_run_returns() {
+        let folder = std::env::temp_dir().join(format!("gate-box-unix-member-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).expect("the case folder is made");
+        let (group_file, joined) = (folder.join("group"), folder.join("joined"));
+        let mut helper = joining_member(&group_file, &joined);
+        let script = format!(
+            "echo $$ > '{0}.tmp' && mv '{0}.tmp' '{0}'; while [ ! -e '{1}' ]; do sleep 0.01; done; echo $$; exit 3",
+            group_file.display(),
+            joined.display()
+        );
+        let ran = run_bounded(sh(&script), 1024, Instant::now() + HANG_GUARD).expect("sh runs");
+        let group = first_pid(&ran.stdout);
+        let left = crate::stop::group_pids(group).expect("the group is listed");
+        let member: i32 = std::fs::read_to_string(&joined)
+            .expect("the member wrote its pid")
+            .trim()
+            .parse()
+            .expect("the member's pid is a number");
+        // Best effort: the perl is this case's own and reaps its child within a second of its kill.
+        let _ = helper.wait();
+        // Best effort: the folder is in the temp folder and named for this process.
+        let _ = std::fs::remove_dir_all(&folder);
+        assert!(
+            !left.contains(&member),
+            "the killed member was still in the group when the run ended: {left:?}"
+        );
+        assert_eq!(status_text(ran.status), "status 3");
     }
 
     #[test]
     fn a_leader_that_is_no_child_to_look_at_is_sent_no_signal() {
-        let group = Fake::new(&[Some(libc::ECHILD)]);
+        let group = Fake::new(&[Look::Fails(libc::ECHILD)]);
         let ended = end_group(&group, Ending::TermThenKill(Duration::from_secs(60)), Duration::ZERO);
         assert!(ended.is_err(), "{ended:?}");
         assert!(group.sent.borrow().is_empty(), "{:?}", group.sent.borrow());
@@ -1105,7 +1231,7 @@ mod tests {
 
     #[test]
     fn a_leader_that_has_not_exited_once_the_wait_after_sigkill_passed_leaves_its_group_still_there() {
-        let group = Fake::new(&[None]);
+        let group = Fake::new(&[Look::Running]);
         let started = Instant::now();
         let ended = end_group(&group, Ending::Kill, Duration::from_millis(200));
         assert_eq!(ended.ok(), Some(GroupEnd::StillThere));
@@ -1120,7 +1246,7 @@ mod tests {
 
     #[test]
     fn a_leader_whose_exit_cannot_be_read_is_killed_left_unreaped_and_its_record_kept() {
-        let group = Fake::new(&[None]);
+        let group = Fake::new(&[Look::Running]);
         let settled = settled(
             &group,
             &Why::Unread(io::Error::from_raw_os_error(libc::EIO)),
@@ -1133,16 +1259,16 @@ mod tests {
 
     #[test]
     fn a_look_that_fails_while_the_leftovers_are_ended_leaves_the_leader_unreaped_and_its_record_kept() {
-        let group = Fake::new(&[None, Some(libc::EIO)]);
+        let group = Fake::new(&[Look::Running, Look::Fails(libc::EIO)]);
         let ending = Ending::TermThenKill(Duration::from_secs(60));
         let settled = settled(&group, &Why::Exited, ending, Duration::ZERO);
         assert!(kept(&settled), "{settled:?}");
-        assert_eq!(*group.sent.borrow(), [libc::SIGTERM, libc::SIGKILL]);
+        assert_eq!(*group.sent.borrow(), [libc::SIGTERM, libc::SIGCONT, libc::SIGKILL]);
     }
 
     #[test]
     fn a_look_that_fails_after_the_sigkill_leaves_the_leader_unreaped_and_its_record_kept() {
-        let group = Fake::new(&[Some(libc::EIO)]);
+        let group = Fake::new(&[Look::Fails(libc::EIO)]);
         let failed = Why::Failed("its output could not be read".to_owned());
         let settled = settled(&group, &failed, Ending::Kill, Duration::from_secs(60));
         assert!(kept(&settled), "{settled:?}");
@@ -1152,12 +1278,12 @@ mod tests {
     #[test]
     fn a_leader_that_is_no_child_to_look_at_keeps_its_record_while_its_group_may_have_a_process() {
         let echild = || Why::Unread(io::Error::from_raw_os_error(libc::ECHILD));
-        let group = Fake::new(&[Some(libc::ECHILD)]);
+        let group = Fake::new(&[Look::Fails(libc::ECHILD)]);
         let settled_with_others = settled(&group, &echild(), Ending::Kill, Duration::ZERO);
         assert!(kept(&settled_with_others), "{settled_with_others:?}");
         assert!(group.sent.borrow().is_empty(), "no signal: {:?}", group.sent.borrow());
 
-        let emptied = Fake::new(&[Some(libc::ECHILD)]).emptied();
+        let emptied = Fake::new(&[Look::Fails(libc::ECHILD)]).emptied();
         let settled_empty = settled(&emptied, &echild(), Ending::Kill, Duration::ZERO);
         assert!(
             matches!(settled_empty, Settled::Unread { keep: false, .. }),
