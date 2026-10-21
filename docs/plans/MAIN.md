@@ -5,15 +5,24 @@
 ## Do first
 
 - [ ] GATE-595 Route to more than one builder, choosing by what each builder can run — Urgent · Remote
-- [/] GATE-606 Choose a builder per command from a builders list in remote.json — Urgent · Remote
-- [ ] GATE-609 Try the next capable builder before falling back to the PC — Urgent · Remote
+- [/] GATE-609 Try the next capable builder before falling back to the PC — Urgent · Remote
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [/] GATE-607 Unix gate box: version, preflight, boot, run, stop — Urgent · Remote
 - [ ] GATE-608 Install the Unix box on a macOS builder: gate push builds it there, plus a Mac setup script — Urgent · Remote
 - [ ] GATE-592 Set up the Mac builder and time the portable .NET repos on it by hand — Urgent · Remote
-- [/] GATE-619 Route a commit's pre-commit hooks as one run: one slot, one push, every hook on the builder, fixes brought back — Urgent · Remote
-- [/] GATE-620 Journal where a run's time went: job CPU, priority, load, long child processes, routed phases — Urgent · Remote
-- [/] GATE-613 Send a relative backslash path to a macOS builder with forward slashes — High · Remote
+- [!] GATE-558 Find why the LFS back-commit sync-back case exits -1 under load — Urgent · Remote
+- [/] GATE-631 Make box_run_a_node_modules_junction_installs_again hold under a loaded parallel run — Urgent · Remote
+- [ ] GATE-637 Find why freshly built exes start in ~14 s on the builder (on-access scanning?) — Urgent · Remote
+- [ ] GATE-162 Suite: make the remaining timer-raced interrupt and remote-client git cases load-proof — Urgent · Backlog
+- [ ] GATE-255 Suite: three cases ended with exit 1 and no output mid-run, and a box-kill case failed under load — Urgent · Backlog
+- [ ] GATE-366 Find why a between-two-fetches outputs case hung its last run on a busy PC — Urgent · Backlog
+- [!] GATE-550 Find why remote_client's deduplicated-archive case aborts with no output under load — Urgent · Backlog
+- [ ] GATE-551 Find why a lent auto run misses its seeded history under load — Urgent · Backlog
+- [ ] GATE-641 Keep a first launch of freshly built binaries from looking stalled while a scanner loads them — High · Local gate
+- [ ] GATE-616 Move the box's shared wire rules into gate-wire so both boxes say the same bytes — High · Remote
+- [ ] GATE-615 Tie the Unix box's job record to its process group leader's start time — High · Remote
+- [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root — High · Remote
+- [ ] GATE-648 Restore pnpm, bun and npm packages on the Unix box, as the Windows box does — High · Remote
 - [ ] GATE-574 Take the work lock in the box preflight and stamp the lock's time on each run — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
@@ -26,17 +35,19 @@
 - [ ] GATE-563 Builder drain 2: make a routed run wait on its PC for the lift — High · Remote
 - [ ] GATE-564 Builder drain 3: gate drain on the PC, and its docs — High · Remote
 - [ ] GATE-572 Refuse routing when the builder's work drive is under a free-space floor — High · Remote
-- [/] GATE-584 Bound the box's git waits and end them when the PC is gone — High · Remote
 - [ ] GATE-600 Print a routed run's command tail once, not twice — High · Remote
+- [ ] GATE-621 Ask for a full outputs send when a worktree's routed runs switch builder — High · Remote
+- [ ] GATE-639 Test the macOS snapshot from a subfolder and list the repo once per decision — High · Remote
+- [ ] GATE-640 Refuse a macOS builder root holding ':' when remote.json is read — High · Remote
+- [ ] GATE-643 Say why a routed command naming a project under .tmp cannot route, and check --no-build after a routed build — High · Remote
+- [ ] GATE-647 Find whether the shared snapshot ref gives a second builder a wrong bridge base; key it per builder if so — High · Remote
+- [ ] GATE-649 Bring back every test project's output a routed dotnet test build made — High · Remote
+- [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Remote
 
-- [ ] GATE-616 Move the box's shared wire rules into gate-wire so both boxes say the same bytes
-- [ ] GATE-615 Tie the Unix box's job record to its process group leader's start time
-- [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root
 - [ ] GATE-610 Show each builder's remote pool on the dashboard
 - [ ] GATE-432 Harden the push script's registration run and helper rollback
-- [ ] GATE-617 Make check_with_every_tool_present_exits_0 hold on a loaded builder
 - [ ] GATE-429 Measure which Task Scheduler call frees its string argument, and quote the desktop task's command
 - [ ] GATE-618 Turn off auto gc in the box's shared bare repositories
 - [ ] GATE-428 Report a desktop task whose instance already ended as started with no process, not unknown
@@ -76,10 +87,7 @@
 - [ ] GATE-296 Name the box's own reason when a preflight exits 2 and the run falls back
 - [ ] GATE-297 Bound each field of a box request, now that the command line no longer does
 - [ ] GATE-300 Find whether a routed run call's stdin read end leaks into the client's later children
-- [ ] GATE-302 Make a_pair_fetch_stopped_at_its_cap_names_its_repo's cleanup hold on a loaded PC
-- [ ] GATE-303 Make the box-kill note case hold on a loaded PC
 - [ ] GATE-262 Escape the outputs key and read global.json only as a regular file
-- [ ] GATE-263 Give the suite's box runs stop-event names that concurrent suite runs cannot share
 - [ ] GATE-307 Move the PC's outputs install rename onto a handle chain beneath the held worktree
 - [ ] GATE-308 Let a routed input turn from a folder back into a file on the builder
 - [ ] GATE-309 Keep a fallback's own output in the printed tail after a failed routed attempt
@@ -129,7 +137,6 @@
 - [ ] GATE-401 Close the test-rig gaps the desktop and session-0 box cases share
 - [ ] GATE-403 Journal why a heavy run stayed on the PC
 - [ ] GATE-405 Check whether the stall and ceiling kill paths count an exited job member as left
-- [ ] GATE-423 Make the desktop hand-off suite cases hold on a busy PC
 - [ ] GATE-424 Report .gate/desktop.toml and the desktop consent in gate check
 - [ ] GATE-430 Check the unverified review findings on the bun install and desktop routing code
 - [ ] GATE-435 Check whether the SourceRevisionId stamp makes a routed script's builds and direct dotnet builds rebuild each other
@@ -161,7 +168,6 @@
 - [ ] GATE-517 Read untracked .gitattributes when judging a routed snapshot's LFS filter
 - [ ] GATE-518 Keep the LFS scratch prune quiet about a stage a live run still holds
 - [ ] GATE-519 Name info/attributes when the box refuses an LFS run whose snapshot holds no pointer
-- [ ] GATE-520 Make the forward hang-guard reader test load-proof
 - [ ] GATE-521 Write a warm-up's notes from its late re-read into its log
 - [ ] GATE-522 Pin the = condition of the two-word property opt-out with a test
 - [ ] GATE-523 Escape the sibling name and root in the routed-with-siblings line
@@ -174,7 +180,6 @@
 - [ ] GATE-548 Run the netfx-sdk probe under the batch deadline and keep a failed read's reason
 - [ ] GATE-553 Say a routed run's sync-back when its tree came back unchanged
 - [ ] GATE-555 Check whether a local kill mid-build leaves half-written outputs in a worktree
-- [ ] GATE-558 Find why the LFS back-commit sync-back case exits -1 under load
 - [ ] GATE-565 Make gate push and the builder installer respect a standing builder drain
 - [ ] GATE-566 Gate the builder's git push and fetch by drain session
 - [ ] GATE-568 Check whether an OutputsFull pack puts an older builder build over a newer local one
@@ -189,10 +194,15 @@
 - [ ] GATE-596 Journal and file durations under the dropped command when a routed run's fallback drops --no-build
 - [ ] GATE-599 Keep the restricted routed command from planting links the elevated box follows in the work root
 - [ ] GATE-602 End a builder's ssh sessions within minutes of the PC going silent
-- [ ] GATE-603 Make the box desktop cases hold under a loaded builder (helper did not connect in time)
 - [ ] GATE-604 Keep a -name=X:/path word whole through the launcher from pwsh
-- [ ] GATE-621 Ask for a full outputs send when a worktree's routed runs switch builder
 - [ ] GATE-622 Move the box's remaining path-based removals to handle-based deletes
+- [ ] GATE-625 Redact the journal's command field and the kill diagnostics' command lines
+- [ ] GATE-626 Journal the rest of where a run's time went: phase bytes, nested gates, ready time
+- [ ] GATE-627 Read a repo's outputs, inputs and routed-command wishes from its tracked .gate/, not remote.json
+- [ ] GATE-633 Give a commit hook gate's heavy fallback build its durations
+- [ ] GATE-634 Route a commit's whole pre-commit hook stage to a builder as one run
+- [ ] GATE-642 Give the remaining suite probe and git reads seam windows above load
+- [ ] GATE-644 Harden the desktop closed-pipe cases: stdout's must-beat sleep, job-gone checks, the 60 s guard
 
 ## Design
 
@@ -211,18 +221,19 @@
 - [ ] GATE-8 `--slot auto` picks heavy or light from the command's history
 - [ ] GATE-305 Re-read docs/design/gate-durations.md against the 14 commits on its named files
 - [ ] GATE-306 Cap how many of a repo's full suites run at once, per repo, queued by the gate
+- [ ] GATE-630 Record each gated output line's write time in a sidecar beside the log
+- [ ] GATE-635 Close the remaining secret forms the journaled command-line redaction misses
+- [ ] GATE-636 Bound the trace naming thread's command-line read and free its queue at job end
 
 ## Backlog
 
 - [ ] GATE-611 Prune the PC cache folder of a builder removed from remote.json
-- [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder
 - [ ] GATE-140 End an escaped tree at the box, remote client and push kill sites
 - [ ] GATE-536 docs: Task Index row for changing the remote client
 - [ ] GATE-143 Measure whether mspdbsrv or a Framework MSBuild node leaves a gate's job
 - [ ] GATE-538 Resolve a relative --log against --cd
 - [ ] GATE-144 Harden the slot marker against a same-user forger: job DACL, parent claim check, job-name squatting
 - [ ] GATE-160 gate run --burn: a capped CPU burn on a critical slot, retiring load-burn.ps1
-- [ ] GATE-162 Suite: make the remaining timer-raced interrupt and remote-client git cases load-proof
 - [ ] GATE-163 A process starved during its kill can outlive the gate that killed it
 - [ ] GATE-168 Run the gate's watch, sampler and kill threads at time-critical priority
 - [ ] GATE-188 A freed slot sits idle up to one watch slice while a late ticket heads the queue
@@ -230,14 +241,12 @@
 - [ ] GATE-203 Retire gate cutover, cutover.flag and the PowerShell-layout readers
 - [ ] GATE-185 A nested critical gate whose parent gate ends runs on uncounted
 - [ ] GATE-222 Run end misses a nested gate's job under a state root of its own when the ender is on the default root
-- [ ] GATE-225 Suite: covered-gate slot wait case fails under load (the slot frees before the wait)
 - [ ] GATE-236 gate.exe can exit non-zero after writing a passed verdict (seen once)
 - [ ] GATE-238 A run can end with 'cannot end the run's job: number too large to fit in target type' from the job's process list
 - [ ] GATE-243 Suite: launch nested-launcher case reads spawn-pid's file without waiting for it
 - [ ] GATE-244 Share compiled Rust dependencies across repos and worktrees (sccache on the builder and this PC)
 - [ ] GATE-245 gate check: quote the repo root and sibling paths in its lines
 - [ ] GATE-254 gate check: install hints that install what it accepts; keep git's reason; build the filtered PATH once
-- [ ] GATE-255 Suite: three cases ended with exit 1 and no output mid-run, and a box-kill case failed under load
 - [ ] GATE-266 Check the builder's Git for Windows version before routing
 - [ ] GATE-268 Two PCs with the same worktree path share one key folder on a builder
 - [ ] GATE-269 Retire this PC's D: paths, and decide whether the router keeps its subst-drive model
@@ -254,10 +263,7 @@
 - [ ] GATE-328 Critical drain: unreadable tickets, a lendsClosed never cleared, a failed beside mutex, the lent-marker ETA test
 - [ ] GATE-331 Gates nested in a lent gate: their history rows and a command that outlives the lend
 - [ ] GATE-338 Bring back or refuse a routed command's own commit on the box
-- [ ] GATE-340 Keep the check suite's stub probes off the 10 s limit under load
-- [ ] GATE-363 Let the warm-up budget case pass when its first command uses the whole budget on a busy machine
 - [ ] GATE-364 Open the state root's own folders without following junctions
-- [ ] GATE-366 Find why a between-two-fetches outputs case hung its last run on a busy PC
 - [ ] GATE-372 Keep a warm-up or run log that a reader holds open from blocking every later run of its key
 - [ ] GATE-379 Say the routed-as line for a warm-up command sent by its program's name
 - [ ] GATE-382 Open the PC state root's folders without following links before reading, writing or deleting a file in them
@@ -267,12 +273,10 @@
 - [ ] GATE-394 Keep the suite's box cases independent of whether this PC's Git is an admin install
 - [ ] GATE-404 Route a repo whose checkout folder name the push refuses, such as claude-config's .claude
 - [ ] GATE-406 Check from the restricted token that a mono Godot install's assemblies folder can be entered
-- [ ] GATE-414 Let the console-session smoke test pass while no session holds the console
 - [ ] GATE-415 Report the builder's desktop task in gate check --builder
 - [ ] GATE-418 Let tools/gate.ps1 run a worktree's command (-Cd)
 - [ ] GATE-420 Say why when install cannot read the installed gate.exe
 - [ ] GATE-433 Stop the test suite leaving gate-* scratch folders in TEMP
-- [ ] GATE-434 Give the cli suite's plain-run cases a ceiling a busy machine cannot cross
 - [ ] GATE-454 Give a first install's failed build a log to point at
 - [ ] GATE-457 Close the slim launcher's leftover edge cases
 - [ ] GATE-458 Make gate cutover's flag lines true now that the launcher ignores the flag
@@ -293,11 +297,15 @@
 - [ ] GATE-516 Let a pair whose sibling cannot be listed route when no repo of it uses LFS
 - [ ] GATE-534 Map the builder's NuGet root to the PC's on the original side of a routed build's coverage mapping files
 - [ ] GATE-549 Narrow the builder user's rights on the gate work root and audit what predates its lock-down
-- [ ] GATE-550 Find why remote_client's deduplicated-archive case aborts with no output under load
-- [ ] GATE-551 Find why a lent auto run misses its seeded history under load
 - [ ] GATE-560 Point ARCHITECTURE.md's PowerShell references at the behaviour inventory
 - [ ] GATE-561 Promote desktop-session.md's shipped rulings into design.md
 - [ ] GATE-578 Find why a stalled local Unreal package run left a dotnet AutomationTool child alive
 - [ ] GATE-582 Make the box-made folders of a routed work tree owned by the command's user, as on the PC
 - [ ] GATE-597 Replace RemoteRun::fallback with what its readers need
 - [ ] GATE-598 Stop a process tree in the wrapper when no gate.exe is installed
+- [ ] GATE-624 Make gate-args doc comments pass clippy 1.93's doc_markdown
+- [ ] GATE-628 Make cargo doc warning-free and check it in the fast gates
+- [ ] GATE-629 Carry a commit run's flag in the slot marker instead of GATE_COMMIT_SLOT
+- [ ] GATE-632 Bring decide.rs matched under the complexity limit
+- [ ] GATE-645 A run's journal line is lost when the journal lock is busy for 2 s on a loaded PC
+- [ ] GATE-646 Start the box's ceiling clock before the command is resumed
