@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Tests install-macos.sh without downloading anything or touching the real HOME: the argument handling, the System
-# step's dry run, the Login PATH block in a temporary HOME and the root refusal. Runs on macOS and in Git Bash.
+# Tests install-macos.sh without downloading anything or touching the real HOME: the argument handling, the Homebrew
+# and FFmpeg steps' dry run, their --admin refusals, the System step's dry run, the Login PATH block in a temporary
+# HOME and the root refusal. Runs on macOS and in Git Bash.
 # Usage: bash tools/builder/test-install-macos.sh
 set -euo pipefail
 
@@ -23,6 +24,22 @@ run_as() {
     set -e
 }
 run() { run_as 501 "$@"; }
+
+# Runs the installer as uid $1 with INSTALL_MACOS_TEST_GROUPS in $2, the script's stand-in for `id -Gn`'s output.
+run_groups_as() {
+    local uid="$1" groups="$2"
+    shift 2
+    set +e
+    env HOME="$home" CARGO_HOME="$scratch/cargo" INSTALL_MACOS_TEST_UID="$uid" INSTALL_MACOS_TEST_GROUPS="$groups" \
+        bash "$script" "$@" >"$scratch/out" 2>&1
+    rc=$?
+    set -e
+}
+run_admin_as() {
+    local groups="$1"
+    shift
+    run_groups_as 501 "$groups" "$@"
+}
 
 # Each expectation runs its arguments as a command and, when that fails, prints it and fails the case.
 expect() {
@@ -63,7 +80,8 @@ cargo-nextest 0.9.148
 Git LFS 3.8.0
 Godot 4.7.2 mono
 Bun 1.4.2
-FFmpeg 9.0.2
+Homebrew
+FFmpeg
 Login PATH
 Git config
 Gate work root
@@ -114,6 +132,7 @@ case_system_needs_root() {
 # The step's tool check needs the installed tools, so it may FAIL here; what is tested is the block itself.
 case_login_path_block() {
     local zp="$home/.zprofile" second="$scratch/p-second"
+    local want_path="export PATH=\"$second/bin:$second/dotnet:$second/node/bin:$scratch/cargo/bin:/opt/homebrew/bin:\$PATH\""
     printf '%s\n' 'export KEEP_ME=1' >"$zp"
     run --prefix "$scratch/p-first" --only 'Login PATH'
     expect [ "$rc" -le 1 ] && expect grep -qF "$scratch/p-first/bin" "$zp" || return 1
@@ -122,10 +141,12 @@ case_login_path_block() {
         expect [ "$(line_count '# >>> gate builder >>>' "$zp")" = 1 ] &&
         expect [ "$(line_count '# <<< gate builder <<<' "$zp")" = 1 ] &&
         expect lacks "$scratch/p-first" "$zp" &&
-        expect [ "$(line_count "export PATH=\"$second/bin:$second/dotnet:$second/node/bin:$scratch/cargo/bin:\$PATH\"" "$zp")" = 1 ] &&
+        expect [ "$(line_count "$want_path" "$zp")" = 1 ] &&
         expect [ "$(line_count "export DOTNET_ROOT=\"$second/dotnet\"" "$zp")" = 1 ] &&
         expect [ "$(line_count 'export DOTNET_CLI_TELEMETRY_OPTOUT=1' "$zp")" = 1 ] &&
         expect [ "$(line_count "export GATE_GODOT_ROOT=\"$second/godot\"" "$zp")" = 1 ] &&
+        expect [ "$(line_count 'export HOMEBREW_NO_AUTO_UPDATE=1' "$zp")" = 1 ] &&
+        expect [ "$(line_count 'export HOMEBREW_NO_ANALYTICS=1' "$zp")" = 1 ] &&
         expect [ "$(head -n 1 "$zp")" = 'export KEEP_ME=1' ]
 }
 
@@ -141,7 +162,101 @@ case_root_step_beside_system_refused() {
         expect absent "$scratch/p-root-system"
 }
 
+case_list_homebrew() {
+    run --list
+    expect rc_is 0 &&
+        expect [ "$(sed -n '13p' "$scratch/out")" = 'Homebrew' ] &&
+        expect [ "$(sed -n '14p' "$scratch/out")" = 'FFmpeg' ] &&
+        expect [ "$(sed -n '15p' "$scratch/out")" = 'Login PATH' ]
+}
+
+# The dry run comes before the steps may change the machine: it prints both steps' commands and logs SKIP for both.
+case_admin_steps_dry_run() {
+    local p="$scratch/p-admin-dry" before after
+    before=$(ls -A /opt 2>/dev/null || true)
+    run --prefix "$p" --only Homebrew,FFmpeg
+    after=$(ls -A /opt 2>/dev/null || true)
+    expect rc_is 0 &&
+        expect has 'would run: sudo -v (asks for the admin password)' &&
+        expect has 'would download https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh' &&
+        expect has 'run it with NONINTERACTIVE=1 /bin/bash' &&
+        expect has 'would run: /opt/homebrew/bin/brew analytics off' &&
+        expect has 'would run: HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 /opt/homebrew/bin/brew install ffmpeg' &&
+        expect has 'would run: /opt/homebrew/bin/ffmpeg -version' &&
+        expect has 'SKIP Homebrew: run with --admin as an admin account' &&
+        expect has 'SKIP FFmpeg: run with --admin as an admin account' &&
+        expect grep -qF 'SKIP Homebrew: run with --admin as an admin account' "$p/install.log" &&
+        expect grep -qF 'SKIP FFmpeg: run with --admin as an admin account' "$p/install.log" &&
+        expect [ "$before" = "$after" ]
+}
+
+# Every --admin case passes --user nobody: after its --admin checks and before anything is written, the script refuses
+# --user without --system, so a refusal that regressed stops there instead of reaching sudo, the installer or brew.
+case_admin_refused_as_root() {
+    run_groups_as 0 'staff admin' --admin --user nobody --prefix "$scratch/p-admin-root" --only Homebrew,FFmpeg
+    expect rc_is 2 && expect has '--admin runs as an admin account, not root: run it without sudo' &&
+        expect absent "$scratch/p-admin-root"
+}
+
+case_admin_refused_non_admin() {
+    run_admin_as 'staff' --admin --user nobody --prefix "$scratch/p-admin-grp" --only Homebrew,FFmpeg
+    expect rc_is 2 && expect has '--admin needs an account in the admin group' &&
+        expect absent "$scratch/p-admin-grp"
+}
+
+# The group is matched as a whole word: a name that merely holds or ends in 'admin' is not the group.
+case_admin_group_words() {
+    local p="$scratch/p-admin-words"
+    run_admin_as 'staff _lpadmin' --admin --user nobody --prefix "$p" --only Homebrew,FFmpeg
+    expect rc_is 2 && expect has '--admin needs an account in the admin group' || return 1
+    run_admin_as 'staff admins' --admin --user nobody --prefix "$p" --only Homebrew,FFmpeg
+    expect rc_is 2 && expect has '--admin needs an account in the admin group' && expect absent "$p"
+}
+
+case_admin_accepted() {
+    local p="$scratch/p-admin-ok"
+    run_admin_as 'staff admin' --admin --user nobody --prefix "$p" --only homebrew,FFMPEG
+    expect rc_is 2 && expect has '--user only goes with --system' && expect lacks '--admin' "$scratch/out" &&
+        expect absent "$p"
+}
+
+case_admin_refused_with_system() {
+    run_admin_as 'staff admin' --admin --system --user nobody --prefix "$scratch/p-admin-sys" --only Homebrew,FFmpeg
+    expect rc_is 2 && expect has '--admin and --system are separate runs' &&
+        expect absent "$scratch/p-admin-sys"
+}
+
+case_admin_refused_other_step() {
+    run_admin_as 'staff admin' --admin --user nobody --prefix "$scratch/p-admin-rust" --only Rust
+    expect rc_is 2 && expect has '--admin runs only the Homebrew and FFmpeg steps: pass --only Homebrew,FFmpeg' &&
+        expect absent "$scratch/p-admin-rust"
+}
+
+case_admin_refused_without_only() {
+    run_admin_as 'staff admin' --admin --user nobody --prefix "$scratch/p-admin-all"
+    expect rc_is 2 && expect has '--admin runs only the Homebrew and FFmpeg steps: pass --only Homebrew,FFmpeg' &&
+        expect absent "$scratch/p-admin-all"
+}
+
+# The root rule exempts Homebrew and FFmpeg: as root they are reachable only beside --system, and without --admin both
+# dry-run. The run stops at --user naming no account, so no step changes anything.
+case_root_exempts_admin_steps() {
+    run_as 0 --system --user 'no-such-builder-user' --only 'System,Homebrew,FFmpeg'
+    expect rc_is 2 && expect lacks 'refuses to run as root' "$scratch/out" &&
+        expect has "--user 'no-such-builder-user' is not an account on this machine"
+}
+
 check '--list prints every step and exits 0' case_list
+check '--list names the Homebrew and FFmpeg steps where FFmpeg was' case_list_homebrew
+check 'the Homebrew and FFmpeg steps print their commands, log SKIP and touch nothing without --admin' case_admin_steps_dry_run
+check '--admin as root exits 2' case_admin_refused_as_root
+check '--admin outside the admin group exits 2' case_admin_refused_non_admin
+check 'the admin group is matched as a whole word' case_admin_group_words
+check 'a valid --admin run passes every --admin check' case_admin_accepted
+check '--admin with --system exits 2' case_admin_refused_with_system
+check '--admin with a --only naming another step exits 2' case_admin_refused_other_step
+check '--admin without --only exits 2' case_admin_refused_without_only
+check 'as root, Homebrew and FFmpeg are not refused as toolchain steps' case_root_exempts_admin_steps
 check '--only with a prefix matching no step exits 2 and creates nothing' case_only_bogus
 check 'an unknown flag exits 2' case_unknown_flag
 check 'a relative --prefix exits 2' case_relative_prefix

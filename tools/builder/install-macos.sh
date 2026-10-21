@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Installs the macOS (Apple-silicon) builder's toolchains at pinned versions from official release URLs, its login PATH,
 # its git config and the gate's work root, all as the builder user without sudo. A separate System step, run only under
-# sudo with --system, keeps the machine awake, raises the open-file limits and turns on Remote Login.
+# sudo with --system, keeps the machine awake, raises the open-file limits and turns on Remote Login. Two more steps,
+# Homebrew and FFmpeg, need an admin account and change the machine only under --admin.
 #
 # Run it as the builder user, over ssh or copied to the machine:
 #   ssh <builder> 'bash -s' -- [flags] < tools/builder/install-macos.sh
 #   bash install-macos.sh [flags]
-# and the System step once, separately:
+# the System step once, separately:
 #   sudo bash install-macos.sh --system --user <builder user> --only System
+# and the Homebrew and FFmpeg steps once, as an admin account, in an interactive terminal (an ssh -t session works):
+# creating /opt/homebrew needs sudo, so the Homebrew step runs sudo -v and asks for that account's password up front.
+#   bash install-macos.sh --admin --only Homebrew,FFmpeg
 #
 # Flags:
 #   --prefix <dir>   where every tool lands (default $HOME/gate-tools): dotnet, pwsh, node, godot, bin, downloads and
@@ -20,16 +24,19 @@
 #   --system         lets the System step change the machine; needs root and --user. Without it the System step
 #                    prints the commands it would run and logs SKIP.
 #   --user <name>    the builder user, named in the System step's log; only taken with --system.
-# An unknown argument exits 2. Every step but System refuses to run as root (exit 2): the toolchains must land in the
-# builder user's home. Rust and cargo-nextest go to $CARGO_HOME (default ~/.cargo) and rustup's $RUSTUP_HOME, as
-# rustup itself places them.
+#   --admin          lets the Homebrew and FFmpeg steps change the machine; needs an account in the admin group, not
+#                    root, not --system, and --only Homebrew,FFmpeg. Without it both print the commands they would run
+#                    and log SKIP. An --admin run logs to stdout only, never into that account's prefix.
+# An unknown argument exits 2. Every step but System, Homebrew and FFmpeg refuses to run as root (exit 2): the
+# toolchains must land in the builder user's home, and --admin refuses root itself. Rust and cargo-nextest go to
+# $CARGO_HOME (default ~/.cargo) and rustup's $RUSTUP_HOME, as rustup itself places them.
 #
 # Each step logs BEGIN, then OK, SKIP or FAIL with the reason, to stdout and timestamped to <prefix>/install.log; a
 # failed step does not stop the later ones, and the script exits 1 when any step failed. Rerunnable: finished downloads
 # in <prefix>/downloads are reused, and each step replaces what it installed before.
 #
-# Test hook: INSTALL_MACOS_TEST_UID, when set, stands in for `id -u`, so test-install-macos.sh can check the root
-# refusal without root.
+# Test hooks: INSTALL_MACOS_TEST_UID, when set, stands in for `id -u`, so test-install-macos.sh can check the root
+# refusal without root; INSTALL_MACOS_TEST_GROUPS, when set, stands in for `id -Gn`'s output for the --admin check.
 set -euo pipefail
 
 prog='install-macos'
@@ -38,6 +45,7 @@ root="$HOME/gate-remote"
 only=''
 list=0
 system=0
+admin=0
 builder_user=''
 
 die2() {
@@ -64,7 +72,7 @@ check_path_arg() {
     esac
 }
 
-usage_flags='--prefix <dir>, --root <dir>, --only <prefix>[,<prefix>...], --list, --system, --user <name>'
+usage_flags='--prefix <dir>, --root <dir>, --only <prefix>[,<prefix>...], --list, --system, --user <name>, --admin'
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --prefix | --root | --only | --user)
@@ -79,6 +87,7 @@ while [ "$#" -gt 0 ]; do
             ;;
         --list) list=1 && shift ;;
         --system) system=1 && shift ;;
+        --admin) admin=1 && shift ;;
         *) die2 "unknown argument '$1'. Flags: $usage_flags" ;;
     esac
 done
@@ -302,18 +311,72 @@ step_bun() {
     rm -rf "$unpacked"
 }
 
+brew_bin='/opt/homebrew/bin/brew'
+ffmpeg_bin='/opt/homebrew/bin/ffmpeg'
+# Homebrew's documented install method. Unlike this script's other downloads it is unpinned by nature: the installer
+# always fetches Homebrew's current HEAD.
+homebrew_url='https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh'
+
+step_homebrew() {
+    local out tmp
+    if [ "$admin" != 1 ]; then
+        log 'would run: sudo -v (asks for the admin password)'
+        log "would download $homebrew_url and run it with NONINTERACTIVE=1 /bin/bash"
+        log "would run: $brew_bin analytics off"
+        skip 'run with --admin as an admin account'
+    fi
+    if [ ! -x "$brew_bin" ]; then
+        # NONINTERACTIVE makes the installer call sudo -n, which never asks for a password, so the timestamp has to be
+        # live before it runs: sudo -v asks for the password on the terminal and keeps it live for the install.
+        sudo -v || fail "the admin's password is needed to create /opt/homebrew: run it interactively, over ssh -t"
+        tmp=$(mktemp "${TMPDIR:-/tmp}/homebrew-install.XXXXXX") ||
+            fail 'a temporary file for the Homebrew installer could not be made'
+        if ! curl -fsSL -o "$tmp" "$homebrew_url"; then
+            rm -f "$tmp"
+            fail "downloading the Homebrew installer from $homebrew_url failed"
+        fi
+        if ! NONINTERACTIVE=1 /bin/bash "$tmp" </dev/null; then
+            rm -f "$tmp"
+            fail 'the Homebrew install failed'
+        fi
+        rm -f "$tmp"
+        [ -x "$brew_bin" ] || fail "the Homebrew install finished without $brew_bin"
+    fi
+    if ! out=$("$brew_bin" --version 2>&1 </dev/null); then
+        fail "$brew_bin --version failed: ${out%%$'\n'*}"
+    fi
+    log "$brew_bin --version: ${out%%$'\n'*}"
+    "$brew_bin" analytics off </dev/null || fail "$brew_bin analytics off failed"
+}
+
 step_ffmpeg() {
-    skip 'no official or well-known source publishes a static macOS arm64 FFmpeg 9.0.2 build with a checksum (the macOS build ffmpeg.org links, evermeet.cx, is Intel only)'
+    local out
+    if [ "$admin" != 1 ]; then
+        log "would run: HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 $brew_bin install ffmpeg"
+        log "would run: $ffmpeg_bin -version"
+        skip 'run with --admin as an admin account'
+    fi
+    [ -x "$brew_bin" ] || fail "$brew_bin is missing: run the Homebrew step first"
+    HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 "$brew_bin" install ffmpeg </dev/null ||
+        fail "$brew_bin install ffmpeg failed"
+    if ! out=$("$ffmpeg_bin" -version 2>&1 </dev/null); then
+        fail "$ffmpeg_bin -version failed: ${out%%$'\n'*}"
+    fi
+    log "${out%%$'\n'*}"
 }
 
 zprofile_begin='# >>> gate builder >>>'
 zprofile_end='# <<< gate builder <<<'
+# /opt/homebrew/bin comes after the gate-tools folders, so the pinned tools win over brew's. The block is written whether
+# or not Homebrew is installed: a missing folder on PATH is harmless.
 zprofile_block() {
     printf '%s\n' "$zprofile_begin" \
-        "export PATH=\"$prefix/bin:$prefix/dotnet:$prefix/node/bin:$cargo_home/bin:\$PATH\"" \
+        "export PATH=\"$prefix/bin:$prefix/dotnet:$prefix/node/bin:$cargo_home/bin:/opt/homebrew/bin:\$PATH\"" \
         "export DOTNET_ROOT=\"$prefix/dotnet\"" \
         'export DOTNET_CLI_TELEMETRY_OPTOUT=1' \
         "export GATE_GODOT_ROOT=\"$prefix/godot\"" \
+        'export HOMEBREW_NO_AUTO_UPDATE=1' \
+        'export HOMEBREW_NO_ANALYTICS=1' \
         "$zprofile_end"
 }
 
@@ -466,6 +529,21 @@ version_of() {
     fi
 }
 
+# The builder reaches ffmpeg through its login shell, so the summary asks a fresh zsh -l as the Login PATH step does.
+# A missing ffmpeg only reports: it never fails the run.
+ffmpeg_summary() {
+    local out path ver
+    # shellcheck disable=SC2016 # the zsh script expands its own variables
+    if out=$(env -i HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-}" TERM=dumb /bin/zsh -l -c \
+        'p=$(command -v ffmpeg) || exit 3; printf "%s\n" "$p"; ffmpeg -version 2>&1 | head -n 1' 2>&1); then
+        path=${out%%$'\n'*}
+        ver=${out#*$'\n'}
+        log "  ffmpeg $ver at $path"
+    else
+        log '  ffmpeg: not installed (run the Homebrew and FFmpeg steps with --admin as an admin account)'
+    fi
+}
+
 summary() {
     log 'Summary:'
     version_of dotnet "$prefix/dotnet/dotnet" --version
@@ -480,6 +558,7 @@ summary() {
     version_of git-lfs "$prefix/bin/git-lfs" --version
     version_of godot "$prefix/godot/4.7.2/Godot.app/Contents/MacOS/Godot" --headless --version
     version_of bun "$prefix/bin/bun" --version
+    ffmpeg_summary
 }
 
 step '.NET SDK 10.0.401' step_dotnet_10
@@ -494,7 +573,8 @@ step 'cargo-nextest 0.9.148' step_nextest
 step 'Git LFS 3.8.0' step_git_lfs
 step 'Godot 4.7.2 mono' step_godot
 step 'Bun 1.4.2' step_bun
-step 'FFmpeg 9.0.2' step_ffmpeg
+step 'Homebrew' step_homebrew
+step 'FFmpeg' step_ffmpeg
 step 'Login PATH' step_login_path
 step 'Git config' step_git_config
 step 'Gate work root' step_gate_root
@@ -520,10 +600,40 @@ if [ -n "$only" ]; then
 fi
 
 uid="${INSTALL_MACOS_TEST_UID:-$(id -u)}"
+
+in_admin_group() {
+    local groups
+    if [ -n "${INSTALL_MACOS_TEST_GROUPS+x}" ]; then
+        groups="$INSTALL_MACOS_TEST_GROUPS"
+    else
+        groups=$(id -Gn 2>/dev/null) || return 1
+    fi
+    case " $groups " in
+        *' admin '*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if [ "$admin" = 1 ]; then
+    [ "$system" = 0 ] || die2 '--admin and --system are separate runs'
+    [ "$uid" != 0 ] || die2 '--admin runs as an admin account, not root: run it without sudo'
+    in_admin_group || die2 '--admin needs an account in the admin group'
+    for n in "${step_names[@]}"; do
+        case "$n" in
+            Homebrew | FFmpeg) ;;
+            *)
+                if selected "$n"; then
+                    die2 '--admin runs only the Homebrew and FFmpeg steps: pass --only Homebrew,FFmpeg'
+                fi
+                ;;
+        esac
+    done
+fi
+
 if [ "$uid" = 0 ]; then
     [ "$system" = 1 ] || die2 "running as root: the toolchain steps must land in the builder user's home; run without sudo, and use sudo only for --system --only System"
     for n in "${step_names[@]}"; do
-        if selected "$n" && [ "$n" != System ]; then
+        if selected "$n" && [ "$n" != System ] && [ "$n" != Homebrew ] && [ "$n" != FFmpeg ]; then
             die2 "step '$n' refuses to run as root: it must land in the builder user's home; under sudo pass --only System"
         fi
     done
@@ -539,8 +649,9 @@ elif [ -n "$builder_user" ]; then
 fi
 
 # A root-owned log in the builder user's prefix would stop the user's next run appending to it, so a root run logs to
-# stdout only and skips the summary, which reads the user's tools.
-if [ "$uid" != 0 ]; then
+# stdout only and skips the summary, which reads the user's tools. An --admin run belongs to the admin's home, so it
+# writes no log there either and prints only the ffmpeg summary line.
+if [ "$uid" != 0 ] && [ "$admin" = 0 ]; then
     mkdir -p "$prefix"
     log_file="$prefix/install.log"
 fi
@@ -557,7 +668,9 @@ while [ "$i" -lt "${#step_names[@]}" ]; do
     if selected "${step_names[$i]}"; then run_step "${step_names[$i]}" "${step_fns[$i]}"; fi
     i=$((i + 1))
 done
-if [ "$uid" != 0 ]; then summary; fi
+if [ "$uid" != 0 ]; then
+    if [ "$admin" = 1 ]; then ffmpeg_summary; else summary; fi
+fi
 if [ -n "$failed" ]; then
     log "failed steps: $failed"
     exit 1
