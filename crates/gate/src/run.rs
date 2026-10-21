@@ -23,7 +23,9 @@ use gate_router::{
     BuildSettings, BuildTarget, DEFAULT_OUTPUTS, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target, sdk_build_target,
     without_no_build, work_folder_key,
 };
-use gate_state::{Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RunFacts, StateRoot, Verdict, log_hash, v1};
+use gate_state::{
+    Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RunFacts, RunTrace, StateRoot, Verdict, log_hash, v1,
+};
 use gate_watchdog::{Cores, Hint, SlotKind, hint};
 use gate_win32::{
     AcquireError, Interrupt, Job, Launch, LaunchError, LaunchOutput, NamedMutex, OpenedJob, OwnedMutexGuard, PriorityClass, Running, StoppableProcess,
@@ -161,6 +163,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         load_blocks: Vec::new(),
         here_nesting: None,
         heavy_store: Some(&mut heavy),
+        trace: RunTrace::default(),
     };
     let (route, placed) = run.route(environment, console);
     run.route_beside_commit(&route, &mut beside);
@@ -612,6 +615,9 @@ struct Run<'a> {
     /// Each block of load lines a run holding the machine alone wrote to its log ([`Run::log_load`]), which the log's
     /// tail leaves out, so they reach the log only.
     load_blocks: Vec<Vec<String>>,
+    /// Where the run's time went, which its `release` line says: what the watch of a command run here found
+    /// ([`Watcher::trace`]), or the parts of a routed run the client timed; empty for a run that reached neither.
+    trace: RunTrace,
 }
 
 /// What a take of a pool's slot is journalled and claimed with: the run's state root, gate, request, ceiling and log,
@@ -1036,6 +1042,7 @@ impl Run<'_> {
             held_seconds,
             status: ended.map(|ended| ended.status),
             facts,
+            trace: std::mem::take(&mut self.trace),
             cold: self.cold,
         };
         let remote = self.tag.as_ref();
@@ -1755,6 +1762,7 @@ impl Run<'_> {
     /// seconds the box said. It is a kill only when the box's kill tag named one, whose kind is the verdict, or when the
     /// client killed it, by the kill line in the log.
     fn remote_ended(&mut self, outcome: &RemoteOutcome, passing: Passing<'_>, wall: Duration, console: &mut Console) -> Ended {
+        self.trace.phases = phases(&outcome.split);
         let interrupted = self.host.interrupt.is_some_and(Interrupt::is_raised);
         // A client that wrote nothing left no log; the verdict reads one.
         if let Err(error) = OpenOptions::new().append(true).create(true).open(self.log.path()) {
@@ -2208,6 +2216,9 @@ impl Run<'_> {
             cores: watcher.cores(),
             nested_took_slot: false,
         };
+        let trace = watcher.trace();
+        drop(watcher);
+        self.trace = trace;
         Ok((watched, timing))
     }
 
@@ -2976,17 +2987,55 @@ fn against_ceiling(adjusted: Option<f64>, wall: Duration, ceiling: u64) -> Strin
     }
 }
 
-/// What a routed run's passed line says of its parts, `split`: the command's own time, then each transfer the run made,
-/// the push always, in the order they ran, each in whole seconds.
+/// One part of a routed run's time, as its passed line and its release's `phases` both name it.
+struct Part {
+    /// Its name in the passed line, such as `sent build`.
+    said: &'static str,
+    /// Its name in the release's `phases`, such as `sentBuild`.
+    journalled: &'static str,
+    /// How long it took.
+    took: Duration,
+}
+
+/// The parts of a routed run's time, `split`, in the order they ran: the command's own time, then each transfer the run
+/// made, the push always. The one list the passed line ([`split_said`]) and the release ([`phases`]) both read.
+fn split_parts(split: Split) -> Vec<Part> {
+    let part = |said, journalled, took| Part { said, journalled, took };
+    let optional = [
+        ("inputs", "inputs", split.inputs),
+        ("lfs", "lfs", split.lfs),
+        ("sent build", "sentBuild", split.sent_build),
+        ("sync-back", "syncBack", split.sync_back),
+        ("outputs", "outputs", split.outputs),
+    ];
+    let mut parts = vec![part("command", "command", split.command), part("push", "push", split.push)];
+    parts.extend(
+        optional
+            .into_iter()
+            .filter_map(|(said, journalled, took)| took.map(|took| part(said, journalled, took))),
+    );
+    parts
+}
+
+/// What a routed run's passed line says of its parts, `split` ([`split_parts`]), each in whole seconds.
 fn split_said(split: Split) -> String {
-    let seconds = |part: Duration| whole_seconds(part.as_secs_f64());
-    let mut parts = vec![format!("command {} s", seconds(split.command)), format!("push {} s", seconds(split.push))];
-    parts.extend(split.inputs.map(|part| format!("inputs {} s", seconds(part))));
-    parts.extend(split.lfs.map(|part| format!("lfs {} s", seconds(part))));
-    parts.extend(split.sent_build.map(|part| format!("sent build {} s", seconds(part))));
-    parts.extend(split.sync_back.map(|part| format!("sync-back {} s", seconds(part))));
-    parts.extend(split.outputs.map(|part| format!("outputs {} s", seconds(part))));
+    let parts: Vec<String> = split_parts(split)
+        .into_iter()
+        .map(|part| format!("{} {} s", part.said, whole_seconds(part.took.as_secs_f64())))
+        .collect();
     parts.join(", ")
+}
+
+/// The `phases` a routed run's release gives of its parts, `split`: the parts its passed line says ([`split_parts`]),
+/// in its order, by their journal names, in seconds; none for a client that timed none of them.
+fn phases(split: &Split) -> Vec<(&'static str, f64)> {
+    if *split == Split::default() {
+        return Vec::new();
+    }
+    split_parts(*split)
+        .into_iter()
+        .map(|part| (part.journalled, part.took.as_secs_f64()))
+        .collect()
 }
 
 /// `seconds` in whole seconds, rounded half to even as the PowerShell gate's `[math]::Round` rounds.

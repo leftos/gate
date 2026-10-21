@@ -11,7 +11,7 @@ use std::time::Duration;
 use flate2::read::GzDecoder;
 use gate_state::{
     FallbackReason, HeavyLight, Held, JOURNAL_CAP_BYTES, JournalEvent, JournalIdentity, JournalLock, JournalNote, LockError, MachineSnapshot,
-    OtherClaim, RemoteTag, RunFacts, Verdict, append_line, journal_line,
+    OtherClaim, RemoteTag, RunFacts, RunTrace, TracedChild, Verdict, append_line, journal_line,
 };
 use serde_json::{Value, json};
 
@@ -159,6 +159,7 @@ fn release(facts: Option<RunFacts>) -> JournalEvent {
         held_seconds: 0.105,
         status: Some(0),
         facts,
+        trace: RunTrace::default(),
         cold: false,
     }
 }
@@ -342,6 +343,7 @@ fn a_routed_release_line_puts_the_remote_fields_after_the_verdict() {
             free_cores: None,
             verdict: Verdict::Passed,
         }),
+        trace: RunTrace::default(),
         cold,
     };
     let line = journal_line(&identity(), ts(NOW), &release(false), Some(&tag()), None);
@@ -662,6 +664,7 @@ fn seconds_round_to_three_decimals() {
                 free_cores: None,
                 verdict: Verdict::Failed,
             }),
+            trace: RunTrace::default(),
             cold: false,
         },
         None,
@@ -745,6 +748,118 @@ fn release_without_cores_omits_them() {
             "{line}"
         );
     }
+}
+
+/// A trace with every field set, as a routed run's would not be: the writer writes whatever it is given.
+pub fn full_trace() -> RunTrace {
+    RunTrace {
+        cpu_seconds: Some(41.26),
+        processes: Some(37),
+        peak_processes: Some(9),
+        priority: Some("belowNormal"),
+        load_free_share: Some(0.734),
+        children: vec![
+            TracedChild {
+                cmd: "dotnet build".to_owned(),
+                image: Some(r"C:\Program Files\dotnet\dotnet.exe".to_owned()),
+                start: 1.04,
+                end: Some(30.66),
+                cpu: 28.04,
+            },
+            TracedChild {
+                cmd: "node.exe".to_owned(),
+                image: None,
+                start: 2.0,
+                end: None,
+                cpu: 1.0,
+            },
+        ],
+        phases: vec![("command", 12.0004), ("push", 1.5)],
+    }
+}
+
+#[test]
+fn a_release_s_trace_is_written_after_the_verdict_and_before_cold() {
+    let facts = RunFacts {
+        wall_seconds: 12.0,
+        adjusted_seconds: Some(11.0),
+        avg_cores: None,
+        peak_cores: None,
+        free_cores: None,
+        verdict: Verdict::Passed,
+    };
+    let event = JournalEvent::Release {
+        slots: vec![r"Local\gate-light-slot-0".to_owned()],
+        held_seconds: 0.105,
+        status: Some(0),
+        facts: Some(facts),
+        trace: full_trace(),
+        cold: true,
+    };
+    let released = journal_line(&identity(), ts(NOW), &event, None, None);
+
+    assert_eq!(
+        own_keys(&released),
+        [
+            "slots",
+            "heldSeconds",
+            "status",
+            "wallSeconds",
+            "adjustedSeconds",
+            "verdict",
+            "cpuSeconds",
+            "processes",
+            "peakProcesses",
+            "priority",
+            "loadFreeShare",
+            "children",
+            "phases",
+            "cold"
+        ]
+    );
+    let line = parsed(&released);
+    assert_eq!(
+        (
+            &line["cpuSeconds"],
+            &line["processes"],
+            &line["peakProcesses"],
+            &line["priority"],
+            &line["loadFreeShare"]
+        ),
+        (&json!(41.3), &json!(37), &json!(9), &json!("belowNormal"), &json!(0.73))
+    );
+    assert_eq!(
+        line["children"],
+        json!([
+            {"cmd": "dotnet build", "image": r"C:\Program Files\dotnet\dotnet.exe", "start": 1.0, "end": 30.7, "cpu": 28.0},
+            {"cmd": "node.exe", "start": 2.0, "end": null, "cpu": 1.0}
+        ])
+    );
+    assert!(
+        released.contains(r#"{"cmd":"dotnet build","image":"C:\\Program Files\\dotnet\\dotnet.exe","start":1.0,"end":30.7,"cpu":28.0}"#),
+        "a child's fields are cmd, image, start, end and cpu, in that order: {released}"
+    );
+    assert!(
+        released.contains(r#"{"cmd":"node.exe","start":2.0,"#),
+        "an unread image is left out: {released}"
+    );
+    assert_eq!(line["phases"], json!({"command": 12.0, "push": 1.5}));
+}
+
+#[test]
+fn an_empty_trace_writes_none_of_its_fields() {
+    let released = journal_line(&identity(), ts(NOW), &release(None), None, None);
+
+    let trace_keys = [
+        "cpuSeconds",
+        "processes",
+        "peakProcesses",
+        "priority",
+        "loadFreeShare",
+        "children",
+        "phases",
+    ];
+    assert!(trace_keys.iter().all(|key| parsed(&released).get(key).is_none()), "{released}");
 }
 
 #[test]

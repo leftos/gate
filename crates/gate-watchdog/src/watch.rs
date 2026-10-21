@@ -89,6 +89,9 @@ pub struct Watch {
     sampled: bool,
     sampler_failed: bool,
     tally: Tally,
+    /// The wall time `adjusted` counted at a share the samples found: every unpaused sample's interval, and the stretch
+    /// after the last sample to the exit, which a failed sampler leaves out.
+    share_wall: Duration,
 }
 
 /// The command's busy and free cores counted so far, which [`Watch::cores`] reads.
@@ -136,6 +139,7 @@ impl Watch {
             sampled: false,
             sampler_failed: false,
             tally: Tally::default(),
+            share_wall: Duration::ZERO,
         }
     }
 
@@ -173,6 +177,7 @@ impl Watch {
             self.paused += interval;
         } else {
             self.adjusted += interval.as_secs_f64() * free;
+            self.share_wall += interval;
             self.count_cores(own_gained, interval, free_cores);
         }
         self.last_free = free;
@@ -300,7 +305,9 @@ impl Watch {
         if self.sampler_failed {
             return;
         }
-        self.adjusted += now.saturating_sub(self.last_at).as_secs_f64() * self.last_free;
+        let stretch = now.saturating_sub(self.last_at);
+        self.adjusted += stretch.as_secs_f64() * self.last_free;
+        self.share_wall += stretch;
         self.last_at = now;
         self.last_began = now;
     }
@@ -326,6 +333,15 @@ impl Watch {
             return 100.0;
         }
         (100.0 * self.adjusted / counted.as_secs_f64()).round_ties_even()
+    }
+
+    /// The share of the machine free on average over the wall time counted at a share the samples found, from 0 to 1,
+    /// unrounded: the paused stretches are left out, and so is the time after a sampler failed, so a failure keeps the
+    /// mean of the samples before it. The stretch after a paused last sample, up to the command's exit, is counted at
+    /// that sample's share, as the load-adjusted clock counts it. `None` until an unpaused sample has counted one.
+    #[must_use]
+    pub fn free_share(&self) -> Option<f64> {
+        (self.tally.unpaused_samples > 0 && !self.share_wall.is_zero()).then(|| self.adjusted / self.share_wall.as_secs_f64())
     }
 
     /// The share of the machine the last sample found free, as a whole percent with halves to even: `None` before the
@@ -1183,6 +1199,32 @@ mod tests {
             (watch.adjusted_seconds() - 1.0).abs() < f64::EPSILON,
             "a failed sampler leaves no share to count the stretch at"
         );
+    }
+
+    #[test]
+    fn the_free_share_is_the_mean_the_unpaused_samples_counted_and_outlives_a_later_sampler_failure() {
+        let machine = Machine::new(16, 16, false);
+        let mut watch = Watch::new(config(60_000, 5000), machine, IDLE, Ticks(0), None);
+        assert_eq!(watch.free_share(), None, "no sample");
+        watch.sample(&half_sample(2000));
+        watch.exited(Duration::from_millis(3000));
+        assert_near(watch.free_share().unwrap_or(f64::NAN), 0.5, "half free over the run");
+
+        let mut watch = Watch::new(config(60_000, 5000), machine, IDLE, Ticks(0), None);
+        watch.sample(&half_sample(2000));
+        watch.sampler_failed("the job is gone");
+        watch.wall_only(Duration::from_millis(8000), false);
+        watch.exited(Duration::from_millis(9000));
+        assert_near(
+            watch.free_share().unwrap_or(f64::NAN),
+            0.5,
+            "the stretch after the failure is left out, not counted as busy",
+        );
+
+        let mut watch = watching(config(60_000, 5000));
+        watch.sample(&tick(5000, 0, 0, &[], true));
+        watch.exited(Duration::from_millis(6000));
+        assert_eq!(watch.free_share(), None, "only a paused sample");
     }
 
     #[test]

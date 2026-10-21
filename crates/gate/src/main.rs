@@ -48,6 +48,7 @@ mod stop_tree;
 mod stopping;
 #[cfg(test)]
 mod test_support;
+mod trace;
 mod wait;
 mod warm;
 mod watch;

@@ -14,7 +14,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use gate_state::{
     DurationKey, DurationStore, Held, JournalEvent, JournalIdentity, JournalLock, KEY_VERSION, KeyInputs, KeyPlace, LockError, RebuildOwner,
-    RebuildReads, RebuildReason, Recorded, RemoteTag, RunFacts, StoreError, StoreRead, StoreReadError, Swapped, Verdict, append_line_then,
+    RebuildReads, RebuildReason, Recorded, RemoteTag, RunFacts, RunTrace, StoreError, StoreRead, StoreReadError, Swapped, Verdict, append_line_then,
     archive_rolled_journal, begin_rebuild, duration_key, durations_path, journal_line, normalize_for_durations, place_by_shape, read_store,
     rebuild_store, rebuilding_path, record_run, swap_rebuilt, write_store,
 };
@@ -609,8 +609,15 @@ fn odd_release_values_are_not_samples() {
     let root = fresh_dir("durations_odd_release_values");
     let line = |verdict: &str, wall: &str| {
         format!(
-            r#"{{"v":1,"time":"2026-10-03T01:00:00Z","event":"release","pid":{},"kind":"heavy","cwd":"{ROOT}","command":"cargo build","wallSeconds":{wall},"verdict":"{verdict}"}}"#,
-            verdict.len()
+            concat!(
+                r#"{{"v":1,"time":"2026-10-03T01:00:00Z","event":"release","pid":{},"kind":"heavy","cwd":"{ROOT}","#,
+                r#""command":"cargo build","wallSeconds":{wall},"verdict":"{verdict}"}}"#
+            ),
+            verdict.len(),
+            // A format string a macro builds cannot take its names from the scope.
+            ROOT = ROOT,
+            wall = wall,
+            verdict = verdict,
         )
     };
     write_lines(
@@ -780,6 +787,7 @@ impl Release<'_> {
             held_seconds: 99.0,
             status: Some(i64::from(self.facts.verdict != Verdict::Passed)),
             facts: Some(self.facts),
+            trace: RunTrace::default(),
             cold: false,
         };
         let tag = self.host.map(|host| RemoteTag {
@@ -902,6 +910,41 @@ fn rebuild_reads_the_live_journal_and_the_archive() {
             "skipped 1 release line(s) of {} that do not parse",
             root.join("events.jsonl").display()
         )]
+    );
+}
+
+#[test]
+fn a_release_s_trace_fields_neither_fail_its_parse_nor_change_what_is_filed() {
+    let root = fresh_dir("durations_rebuild_ignores_the_trace");
+    let identity = JournalIdentity {
+        pid: 4242,
+        process_start: ts("2026-10-01T00:00:00Z"),
+        kind: "heavy".to_owned(),
+        cwd: ROOT.to_owned(),
+        command: "cargo build".to_owned(),
+        commit: false,
+    };
+    let traced = JournalEvent::Release {
+        slots: vec![r"Local\gate-heavy-slot-0".to_owned()],
+        held_seconds: 99.0,
+        status: Some(0),
+        facts: Some(passed(10.0)),
+        trace: crate::journal_write::full_trace(),
+        cold: false,
+    };
+    let line = journal_line(&identity, ts("2026-10-03T01:00:00Z"), &traced, None, None);
+    assert!(line.contains(r#""children":"#), "the line carries the trace: {line}");
+    write_lines(&root.join("events.jsonl"), &[line, build_at("2026-10-03T02:00:00Z", 12.0)]);
+
+    let rebuilt = rebuild_store(&root, Some(TEMP), ts(NOW), lookup);
+
+    assert_eq!(rebuilt.notes, Vec::<String>::new(), "every release line parses");
+    let build = rebuilt.store.history("local::repo | cargo build").expect("the local build has a history");
+    assert_eq!(walls_of(&rebuilt.store, "local::repo | cargo build"), [10.0, 12.0]);
+    assert_eq!(
+        (build.samples[0].adjusted, build.samples[0].avg_cores, build.samples[0].peak_cores),
+        (Some(20.0), Some(1.5), Some(3.0)),
+        "the traced line is filed from its run facts alone"
     );
 }
 

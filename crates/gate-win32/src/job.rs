@@ -2,6 +2,7 @@
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
@@ -28,6 +29,7 @@ use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use crate::launch::struct_size;
 use crate::security::Descriptor;
 use crate::times::file_time_now;
+use crate::traced::{self, Naming, ProcessSpan, TracedMember, Traces, span_of};
 use crate::{own_handle, start_and_exit_of, timestamp_of, wide};
 
 /// The completion key a job's drop posts to its port to wake its drain thread; the job's own messages carry the key 0
@@ -41,7 +43,14 @@ const DRAIN_WAIT_MS: u32 = 100;
 /// How many of the members a memory could not read its trouble names; the rest it counts.
 const UNREAD_NAMED: usize = 3;
 
-/// What a job has used and holds: its CPU time and its live processes.
+/// How many joined members can wait for the naming thread; one that finds the queue full is left unnamed, so the drain
+/// thread never waits for a name.
+const NAMING_QUEUE: usize = 256;
+
+/// A member's identity: its pid and its start.
+type Key = (u32, Timestamp);
+
+/// What a job has used and holds: its CPU time, its live processes and every process it has held.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Accounting {
     /// The user and kernel time of every process that has ever been in the job, those that have exited and those in
@@ -49,6 +58,8 @@ pub struct Accounting {
     pub cpu: u64,
     /// The processes in the job now.
     pub active_processes: u32,
+    /// The processes that have ever been in the job, those that have exited included (`TotalProcesses`).
+    pub total_processes: u32,
 }
 
 /// A member a job remembers that has ended ([`Job::departed`]).
@@ -94,6 +105,8 @@ struct Memory {
     shared: Arc<Shared>,
     /// The thread that takes the port's messages, until the job's drop ends it.
     drainer: Option<JoinHandle<()>>,
+    /// What names the members, shared with the naming thread, which the job's drop closes and never waits for.
+    traces: Arc<Mutex<Traces<Key>>>,
 }
 
 /// What a remembering job shares with its drain thread.
@@ -116,6 +129,17 @@ struct Remembered {
     stopped: Option<String>,
     /// The members dropped from the memory, or never remembered, because their times could not be read.
     unread: Unread,
+    /// What names each running member, and the members that have ended worth naming, their last times read before
+    /// their handles closed ([`Job::traced`]); the naming thread fills in the names.
+    traces: Arc<Mutex<Traces<Key>>>,
+}
+
+/// What a member's join read of it for [`Job::traced`]: a copy of its handle for the naming thread, and its times
+/// when it had ended already.
+#[derive(Default)]
+struct Joined {
+    process: Option<OwnedHandle>,
+    span: Option<ProcessSpan>,
 }
 
 /// The members a memory could not read: how many, and a line for each of the first [`UNREAD_NAMED`].
@@ -222,6 +246,7 @@ impl Drop for Job {
         // The job posts nothing more; a failure leaves the association to end when the port's last handle closes.
         let _ = associate(&self.handle, std::ptr::null_mut());
         memory.shared.closing.store(true, Ordering::Release);
+        traced::lock(&memory.traces).close();
         // Wakes the thread at once; without the message, it sees `closing` when its current wait ends.
         // SAFETY: the port is open for the whole call, and no `OVERLAPPED` is passed.
         let _ = unsafe { PostQueuedCompletionStatus(memory.shared.port.raw(), 0, CLOSE_KEY, std::ptr::null()) };
@@ -314,18 +339,28 @@ impl Job {
         // SAFETY: an invalid file handle with no existing port asks for a new port, which takes no pointers. A success is
         // a fresh handle nothing else owns.
         let port = unsafe { own_handle(CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1)) }?;
+        let traces = Arc::new(Mutex::new(Traces::default()));
         let shared = Arc::new(Shared {
             job: duplicate(&self.handle)?,
             port,
             closing: AtomicBool::new(false),
-            remembered: Mutex::new(Remembered::default()),
+            remembered: Mutex::new(Remembered {
+                traces: Arc::clone(&traces),
+                ..Remembered::default()
+            }),
         });
+        let (namer, joins) = std::sync::mpsc::sync_channel(NAMING_QUEUE);
+        let named = Arc::clone(&traces);
+        // Never joined: it holds no handle of the job's, and ends when the drain thread drops `namer`.
+        std::thread::Builder::new()
+            .name("job-naming".to_owned())
+            .spawn(move || traced::name_each(&named, &joins))?;
         associate(&self.handle, shared.port.raw())?;
         let drained = Arc::clone(&shared);
         let created_at = self.created_at;
         let spawned = std::thread::Builder::new()
             .name("job-memory".to_owned())
-            .spawn(move || drained.drain(created_at));
+            .spawn(move || drained.drain(created_at, &namer));
         let drainer = match spawned {
             Ok(drainer) => drainer,
             Err(error) => {
@@ -337,6 +372,7 @@ impl Job {
         self.memory = Some(Memory {
             shared,
             drainer: Some(drainer),
+            traces,
         });
         Ok(())
     }
@@ -507,7 +543,8 @@ impl Job {
     }
 
     /// Forgets each remembered member named in `gone` by its pid, its start and its exit: a look has taken what it
-    /// started, and a process that has ended starts nothing more. Nothing of a member forgotten is kept.
+    /// started, and a process that has ended starts nothing more. The kill memory keeps nothing of a member forgotten;
+    /// its trace stays, so the ended record still names it.
     pub fn forget(&self, gone: &[(u32, Timestamp, Timestamp)]) {
         if let Some(memory) = &self.memory {
             memory
@@ -516,6 +553,26 @@ impl Job {
                 .members
                 .retain(|member| !member.last().is_some_and(|last| gone.contains(&(member.pid, member.start, last))));
         }
+    }
+
+    /// The members the job remembers as its release can name them: each running one, its times read now through the
+    /// handle the memory holds, and each that has ended worth naming, its times as they were read before its handle
+    /// closed (at most 256, those with the most CPU). A member whose times cannot be read is
+    /// left out. Empty for a job not told to [`Job::remember`].
+    #[must_use]
+    pub fn traced(&self) -> Vec<TracedMember> {
+        let Some(memory) = &self.memory else {
+            return Vec::new();
+        };
+        let remembered = memory.shared.lock();
+        let traces = traced::lock(&remembered.traces);
+        let running = remembered.members.iter().filter_map(|member| {
+            let Until::Running(process) = &member.until else {
+                return None;
+            };
+            Some(traces.running(&member.key())?.with(span_of(process).ok()?))
+        });
+        running.chain(traces.ended_members()).collect()
     }
 }
 
@@ -529,8 +586,9 @@ impl Shared {
     /// The drain thread: remembers each process the port reports joining the job, the job having been created at
     /// `created_at`, until the job's drop asks it to end; a failure is kept for [`Job::departed`] to say. A member's exit
     /// message, and each wait that finds no message, keep the exits of the members that have ended, closing their
-    /// handles.
-    fn drain(&self, created_at: Timestamp) {
+    /// handles. Each member is remembered before it is named: a copy of its handle goes to the naming thread through
+    /// `namer`, and a full queue or an ended naming thread leaves it unnamed.
+    fn drain(&self, created_at: Timestamp, namer: &SyncSender<Naming<Key>>) {
         let take = |wait| {
             if self.closing.load(Ordering::Acquire) {
                 Ok(Message::Close)
@@ -539,7 +597,13 @@ impl Shared {
             }
         };
         let found = |pid| match member(&self.job, pid, created_at) {
-            Ok(member) => self.lock().add(member),
+            Ok((member, joined)) => {
+                let naming = self.lock().add(member, joined);
+                // An unnamed member is still traced, under its image's file name or its pid.
+                if let Some(naming) = naming {
+                    drop(namer.try_send(naming));
+                }
+            }
             Err(missed) => self.lock().missed(pid, missed),
         };
         let exited = |pid| self.lock().exited(pid);
@@ -550,11 +614,27 @@ impl Shared {
 }
 
 impl Remembered {
-    /// Adds `member`, unless the same member, by its pid and start, is remembered already.
-    fn add(&mut self, member: Member) {
-        if !self.members.iter().any(|known| known.key() == member.key()) {
-            self.members.push(member);
+    /// Adds `member`, with what its join read of it, `joined`, unless the same member, by its pid and start, is
+    /// remembered already: a running member is traced until it ends, and one that had ended already goes to the book
+    /// when it is worth naming. What the naming thread is to name, when the member is traced and its handle was copied.
+    fn add(&mut self, member: Member, joined: Joined) -> Option<Naming<Key>> {
+        if self.members.iter().any(|known| known.key() == member.key()) {
+            return None;
         }
+        let key = member.key();
+        let traced = {
+            let mut traces = traced::lock(&self.traces);
+            match (&member.until, joined.span) {
+                (Until::Running(_), _) => {
+                    traces.joined(key, member.pid);
+                    true
+                }
+                (Until::Ended(_), Some(span)) => traces.joined_ended(key, member.pid, span),
+                (Until::Ended(_), None) => false,
+            }
+        };
+        self.members.push(member);
+        joined.process.filter(|_| traced).map(|process| Naming { key, process })
     }
 
     /// Notes the process `pid` the port reported joining the job, which is remembered as no member for `missed`: one
@@ -578,9 +658,11 @@ impl Remembered {
         self.settle_where(|member| member.pid == pid);
     }
 
-    /// Settles each running member `chosen` picks, as [`Remembered::settle`] says.
+    /// Settles each running member `chosen` picks, as [`Remembered::settle`] says. One that has ended has its last
+    /// times read through its handle before it closes, and goes to the book with its name.
     fn settle_where(&mut self, chosen: impl Fn(&Member) -> bool) {
         let unread = &mut self.unread;
+        let mut traces = traced::lock(&self.traces);
         self.members.retain_mut(|member| {
             if !chosen(member) {
                 return true;
@@ -592,10 +674,13 @@ impl Remembered {
             match settled(unsafe { start_and_exit_of(process.raw()) }) {
                 Settled::Running => true,
                 Settled::Ended(exit) => {
+                    // An exited process's times are final: read once more, they are its last.
+                    traces.ended(member.key(), span_of(process).ok());
                     member.until = Until::Ended(exit);
                     true
                 }
                 Settled::Unread(why) => {
+                    traces.forget(member.key());
                     unread.add(format!("the exit of member {} could not be read: {why}", member.pid));
                     false
                 }
@@ -697,12 +782,24 @@ fn take_message(port: &OwnedHandle, wait: u32) -> io::Result<Message> {
 }
 
 /// The process `pid` the port reported joining the job behind `job`, which was created at `created_at`, as
-/// [`remembered_as`] remembers it.
-fn member(job: &OwnedHandle, pid: u32, created_at: Timestamp) -> Result<Member, Missed> {
-    // SAFETY: the handle passed is the one `open_any` opened with `PROCESS_QUERY_LIMITED_INFORMATION` access, borrowed,
-    // so open, for the whole call.
-    let times = |process: &OwnedHandle| unsafe { start_and_exit_of(process.raw()) };
-    remembered_as(pid, kept(open_any(pid), |process| holds(job, process)), times, created_at)
+/// [`remembered_as`] remembers it, with a copy of its handle for the naming thread and, when it has ended already, its
+/// times, read while its process object is held; nothing is read of a process that is no member.
+fn member(job: &OwnedHandle, pid: u32, created_at: Timestamp) -> Result<(Member, Joined), Missed> {
+    let mut joined = Joined::default();
+    let times = |process: &OwnedHandle| {
+        // SAFETY: the handle passed is the one `open_any` opened with `PROCESS_QUERY_LIMITED_INFORMATION` access,
+        // borrowed, so open, for the whole call.
+        let times = unsafe { start_and_exit_of(process.raw()) };
+        // Read after the exit: one the exit saw ended is ended in its span too, and one that ends between the two
+        // reads stays running, for its settle to book.
+        joined = Joined {
+            process: duplicate(process).ok(),
+            span: span_of(process).ok().filter(|span| span.exited.is_some()),
+        };
+        times
+    };
+    let member = remembered_as(pid, kept(open_any(pid), |process| holds(job, process)), times, created_at)?;
+    Ok((member, joined))
 }
 
 /// The process `pid` the port reported joining the job created at `created_at`, `opened` at its pid: while the job
@@ -910,6 +1007,7 @@ pub(crate) fn accounting(job: &OwnedHandle) -> io::Result<Accounting> {
     Ok(Accounting {
         cpu: user + kernel,
         active_processes: information.ActiveProcesses,
+        total_processes: information.TotalProcesses,
     })
 }
 

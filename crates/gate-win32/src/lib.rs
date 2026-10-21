@@ -1,6 +1,7 @@
 //! The gate's Win32 layer: named mutexes and events, job objects and their accounting, commands created suspended and
 //! the UTF-8 console a command can be created on, the restricted token a command can be created with, the start time
-//! of the gate process or of another, the system's, a process's and the WSL VM's CPU times, the console interrupt, the
+//! of the gate process or of another, the system's, a process's and the WSL VM's CPU times, what a job remembers of
+//! each process that joined it for its release to name ([`TracedMember`]), the console interrupt, the
 //! system's boot time, what a drive letter stands for, a rename that never replaces its target, a name opened inside an
 //! open folder, a file opened again through its reparse point's filter, an open file's volume serial and file id
 //! ([`file_id`]), whether two open files are one, whether an open file is on a network volume ([`on_network_volume`]),
@@ -35,6 +36,7 @@ mod pipe;
 mod piped;
 mod priority;
 mod registry;
+mod scrub;
 mod security;
 mod session;
 mod task;
@@ -43,6 +45,7 @@ mod test_support;
 mod thread;
 mod times;
 mod token;
+mod traced;
 mod tree;
 mod trust;
 
@@ -69,6 +72,7 @@ pub use session::{ConnectState, LockState, SessionState, active_console_session,
 pub use task::{StartedTask, TaskArgument, TaskError, TaskStart, register_task, run_task};
 pub use times::{ProcessTimes, SystemTimes, file_time_now, process_times, system_times, wsl_vm_cpu};
 pub use token::{Account, Grant, NetworkGroup, RestrictedToken, TokenFacts, current_account, current_user_sid, token_facts};
+pub use traced::{ProcessSpan, TracedMember, worth_naming};
 
 /// Refuses an open file that is not a plain disk file: one that is not on a disk, is a reparse point (a link or a
 /// junction, when opened with `FILE_FLAG_OPEN_REPARSE_POINT`), or has more than one name.

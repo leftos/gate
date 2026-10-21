@@ -16,7 +16,9 @@ use gate_win32::NamedMutex;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::support::{Case, FAKE_TOOL, Outcome, assert_in_order, finish, none_words, run_words, shown, wait_for_journal_line};
+use crate::support::{
+    CORE_SECOND, Case, FAKE_TOOL, Outcome, assert_in_order, cpu_ticks, finish, none_words, run_words, shown, wait_for_journal_line, wait_until,
+};
 
 /// The words of a light run logging to `log` whose command exits with `status`.
 fn exiting<'a>(log: &'a str, status: &'a str) -> Vec<&'a str> {
@@ -160,12 +162,13 @@ fn a_run_journals_queue_take_release_in_order() {
         ],
     );
     assert!(
-        regex::Regex::new(
-            r#""event":"release".*"adjustedSeconds":\d+(\.\d+)?(,"avgCores":[\d.]+,"peakCores":[\d.]+,"freeCores":[\d.]+)?,"verdict":"passed"\}\n"#
-        )
+        regex::Regex::new(concat!(
+            r#""event":"release".*"adjustedSeconds":\d+(\.\d+)?"#,
+            r#"(,"avgCores":[\d.]+,"peakCores":[\d.]+,"freeCores":[\d.]+)?,"verdict":"passed"(,"cpuSeconds":[^\n]*)?\}\n"#
+        ))
         .expect("the pattern is valid")
         .is_match(&journal),
-        "the release's load-adjusted seconds are a number, then the verdict: {journal}"
+        "the release's load-adjusted seconds are a number, then the verdict, then any trace: {journal}"
     );
     let lines: Vec<Value> = journal.lines().map(parsed).collect();
     assert_eq!(lines.len(), 3);
@@ -183,6 +186,102 @@ fn a_run_journals_queue_take_release_in_order() {
     assert_eq!(lines[0]["log"], shown(&case.folder().join("out.log")));
     assert!(lines[1]["waitedSeconds"].is_f64(), "the take says how long it waited: {}", lines[1]);
     assert!(lines[1].get("abandoned").is_none(), "a clean take names no abandoned slot: {}", lines[1]);
+}
+
+/// The release line of a run, sampled every `sample_ms`, whose command starts a child that spins until it has used
+/// `burned` core-seconds, then exits while the command still runs.
+fn release_of_a_spinning_child(case: &Case, sample_ms: &str, burned: u64) -> Value {
+    let (pid_file, release_file, stop_file) = (case.folder().join("child.pid"), case.folder().join("release"), case.folder().join("stop"));
+    let (pid_word, release_word, stop_word) = (shown(&pid_file), shown(&release_file), shown(&stop_file));
+    let command = [FAKE_TOOL, "spawn-pid", &pid_word, &release_word, FAKE_TOOL, "spin", "1", &stop_word];
+
+    let mut running = case.start(&run_words("out.log", &["--test-sample-ms", sample_ms], &command));
+    let read_pid = || fs::read_to_string(&pid_file).ok().and_then(|text| text.trim().parse::<u32>().ok());
+    wait_until("the spinning child's pid written", || read_pid().is_some() || !running.is_running());
+    let child = read_pid().expect("the command wrote its child's pid");
+    wait_until(&format!("the child using {burned} core-seconds"), || {
+        cpu_ticks(child) >= burned * CORE_SECOND
+    });
+    fs::write(&stop_file, "").expect("the stop file can be written");
+    wait_until("the child exited", || gate_win32::process_times(child).ok().flatten().is_none());
+    fs::write(&release_file, "").expect("the release file can be written");
+    let outcome = running.finish();
+
+    assert_quiet(&outcome, 0);
+    let lines: Vec<Value> = lines_of(&case.root().join("events.jsonl")).iter().map(|line| parsed(line)).collect();
+    lines.into_iter().find(|line| line["event"] == "release").expect("the run released")
+}
+
+/// The entry of `release`'s `children` that names fake-tool's spinning child.
+fn spinner_of(release: &Value) -> &Value {
+    let children = release["children"].as_array().expect("the release names the busy child");
+    let spinner = children.iter().find(|entry| {
+        entry["cmd"]
+            .as_str()
+            .is_some_and(|cmd| cmd.contains("fake-tool") && cmd.contains(" spin "))
+    });
+    assert!(spinner.is_some(), "a child entry names the spinning child: {release}");
+    spinner.expect("checked above")
+}
+
+#[test]
+fn a_release_says_where_the_run_s_time_went() {
+    // The core-seconds the child burns before the case stops it: the gate's samples, every 100 ms, see it long before.
+    const BURNED: u64 = 2;
+    let case = Case::new("a_release_says_where_the_run_s_time_went");
+
+    let release = release_of_a_spinning_child(&case, "100", BURNED);
+
+    let cpu = release["cpuSeconds"].as_f64().expect("the release has the job's CPU");
+    assert!(cpu >= 1.9, "the job's CPU counts the child's {BURNED} core-seconds: {release}");
+    let processes = release["processes"].as_u64().expect("the release counts the job's processes");
+    assert!(processes >= 2, "the command and its child: {release}");
+    assert!(release["peakProcesses"].as_u64().is_some_and(|peak| peak >= 1), "{release}");
+    assert_eq!(release["priority"], "belowNormal", "{release}");
+    let share = release["loadFreeShare"].as_f64().expect("a sampled run has the machine's free share");
+    assert!((0.0..=1.0).contains(&share), "{release}");
+    let spinner = spinner_of(&release);
+    assert!(spinner["cpu"].as_f64().is_some_and(|cpu| cpu >= 1.9), "{spinner}");
+    assert!(spinner["start"].as_f64().is_some_and(|start| start >= 0.0), "{spinner}");
+    assert!(spinner["end"].as_f64().is_some(), "the child exited before the release: {spinner}");
+}
+
+#[test]
+fn a_child_that_lives_between_two_samples_is_named_with_its_image() {
+    // The samples are ten minutes apart, so none falls inside the child's life: the job's own memory of its members
+    // names it, not a sample's listing.
+    const BURNED: u64 = 1;
+    let case = Case::new("a_child_that_lives_between_two_samples_is_named_with_its_image");
+
+    let release = release_of_a_spinning_child(&case, "600000", BURNED);
+
+    let spinner = spinner_of(&release);
+    assert!(spinner["cpu"].as_f64().is_some_and(|cpu| cpu >= 0.9), "{spinner}");
+    assert!(spinner["end"].as_f64().is_some(), "the child exited before the release: {spinner}");
+    let image = spinner["image"].as_str().expect("the child's image path is given");
+    let tool = Path::new(FAKE_TOOL)
+        .file_name()
+        .expect("fake-tool's path has a file name")
+        .to_string_lossy()
+        .to_lowercase();
+    assert!(image.to_lowercase().ends_with(&tool), "the image is fake-tool's own path: {spinner}");
+    assert!(Path::new(image).is_absolute(), "the image is a full path: {spinner}");
+}
+
+#[test]
+fn a_run_of_more_than_256_short_children_counts_them_all_and_passes() {
+    const CHILDREN: u64 = 300;
+    let case = Case::new("a_run_of_more_than_256_short_children_counts_them_all_and_passes");
+    let count = CHILDREN.to_string();
+
+    let outcome = case.run(&run_words("out.log", &["--test-sample-ms", "100"], &[FAKE_TOOL, "run-each", &count]));
+
+    assert_quiet(&outcome, 0);
+    let lines: Vec<Value> = lines_of(&case.root().join("events.jsonl")).iter().map(|line| parsed(line)).collect();
+    let release = lines.iter().find(|line| line["event"] == "release").expect("the run released");
+    assert_eq!(release["verdict"], "passed", "{release}");
+    let processes = release["processes"].as_u64().expect("the release counts the job's processes");
+    assert!(processes > CHILDREN, "the command and each of its {CHILDREN} children: {release}");
 }
 
 #[test]

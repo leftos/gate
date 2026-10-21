@@ -57,6 +57,24 @@ impl Priority {
     }
 }
 
+impl crate::Running {
+    /// The command's priority class, read through the handle its launch holds (`GetPriorityClass`), so no process is
+    /// opened by its pid; `None` for a class Windows never answers with.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the class cannot be read.
+    pub fn priority(&self) -> io::Result<Option<Priority>> {
+        // SAFETY: the handle is open for as long as `self` holds it, with the query access the creation of a process
+        // gives its handle.
+        let class = unsafe { GetPriorityClass(self.process.raw()) };
+        if class == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Priority::of(class))
+    }
+}
+
 /// The priority class of the process `pid`; `None` when no process of that pid runs. The process is opened with
 /// `PROCESS_QUERY_INFORMATION`, as .NET's `Process.PriorityClass` getter opens it, so a class that getter cannot read,
 /// such as an elevated process's, is an error here too.

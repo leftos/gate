@@ -116,6 +116,8 @@ pub enum JournalEvent {
         status: Option<i64>,
         /// The run's facts, or `None` when the gate ended before its command had a verdict.
         facts: Option<RunFacts>,
+        /// Where the run's time went, written after the verdict and before `cold`; an empty trace writes nothing.
+        trace: RunTrace,
         /// Whether the run was routed to a work tree the builder's preflight found new, so its ceiling was raised:
         /// written as `cold: true`, the last of the event's own fields, and left out when false.
         cold: bool,
@@ -314,6 +316,46 @@ pub struct RunFacts {
     pub verdict: Verdict,
 }
 
+/// Where a run's time went, as its `release` line says it: each field is left out of the line when it is `None` or
+/// empty, so a run that measured none of them writes none.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RunTrace {
+    /// The user and kernel CPU every process of the command's job used, in seconds (`cpuSeconds`, one decimal).
+    pub cpu_seconds: Option<f64>,
+    /// The processes the job ever held (`processes`).
+    pub processes: Option<u32>,
+    /// The most processes the job held at one sample (`peakProcesses`).
+    pub peak_processes: Option<u32>,
+    /// The priority class the command started in, as `belowNormal` and the like (`priority`).
+    pub priority: Option<&'static str>,
+    /// The share of the machine free on average over the run, as the load-adjusted clock counted it (`loadFreeShare`,
+    /// two decimals).
+    pub load_free_share: Option<f64>,
+    /// The job's processes that used the most CPU among those worth naming, most CPU first (`children`).
+    pub children: Vec<TracedChild>,
+    /// How long a routed run's parts took, by the names the passed line gives them, in its order (`phases`, seconds
+    /// to three decimals).
+    pub phases: Vec<(&'static str, f64)>,
+}
+
+/// One process of a run's `children`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TracedChild {
+    /// Its command line, redacted, its control and direction characters spaces, and cut to 200 characters, or its
+    /// program's file name when the line could not be read (`cmd`). The process reports the line itself and can rewrite
+    /// it, so it says what the process claims to run.
+    pub cmd: String,
+    /// The full path of its program, as the system gives it (`image`, after `cmd`); `None`, and left out, when it could
+    /// not be read.
+    pub image: Option<String>,
+    /// When it started, in seconds after the command started (`start`, one decimal).
+    pub start: f64,
+    /// When it exited, in the same seconds; `None` for one still running at the release (`end`, `null`).
+    pub end: Option<f64>,
+    /// The CPU it used, in seconds (`cpu`, one decimal).
+    pub cpu: f64,
+}
+
 /// What an append did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Appended {
@@ -449,6 +491,7 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
             held_seconds,
             status,
             facts,
+            trace,
             cold,
         } => {
             line.insert("slots".to_owned(), Value::from(slots.clone()));
@@ -471,6 +514,7 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
             }
             let verdict = facts.map_or(Verdict::Unknown, |facts| facts.verdict);
             line.insert("verdict".to_owned(), Value::from(verdict.as_str()));
+            insert_trace(line, trace);
             if *cold {
                 line.insert("cold".to_owned(), Value::Bool(true));
             }
@@ -485,6 +529,47 @@ fn insert_own_fields(line: &mut Map<String, Value>, event: &JournalEvent) {
             line.insert("parentPid".to_owned(), Value::from(*parent_pid));
         }
     }
+}
+
+/// Inserts the fields of `trace` a release has: `cpuSeconds`, `processes`, `peakProcesses`, `priority`,
+/// `loadFreeShare`, `children` and `phases`, in that order.
+fn insert_trace(line: &mut Map<String, Value>, trace: &RunTrace) {
+    if let Some(cpu) = trace.cpu_seconds {
+        line.insert("cpuSeconds".to_owned(), tenths(cpu));
+    }
+    if let Some(processes) = trace.processes {
+        line.insert("processes".to_owned(), Value::from(processes));
+    }
+    if let Some(peak) = trace.peak_processes {
+        line.insert("peakProcesses".to_owned(), Value::from(peak));
+    }
+    if let Some(priority) = trace.priority {
+        line.insert("priority".to_owned(), Value::from(priority));
+    }
+    if let Some(share) = trace.load_free_share {
+        line.insert("loadFreeShare".to_owned(), Value::from((share * 100.0).round_ties_even() / 100.0));
+    }
+    if !trace.children.is_empty() {
+        line.insert("children".to_owned(), Value::Array(trace.children.iter().map(child_value).collect()));
+    }
+    if !trace.phases.is_empty() {
+        let phases = trace.phases.iter().map(|(name, value)| ((*name).to_owned(), seconds(*value)));
+        line.insert("phases".to_owned(), Value::Object(phases.collect()));
+    }
+}
+
+/// `child` as a release's `children` entry: `cmd`, `image` when it was read, `start`, `end` (null while it runs) and
+/// `cpu`, in that order.
+fn child_value(child: &TracedChild) -> Value {
+    let mut fields = Map::new();
+    fields.insert("cmd".to_owned(), Value::from(child.cmd.as_str()));
+    if let Some(image) = &child.image {
+        fields.insert("image".to_owned(), Value::from(image.as_str()));
+    }
+    fields.insert("start".to_owned(), tenths(child.start));
+    fields.insert("end".to_owned(), child.end.map_or(Value::Null, tenths));
+    fields.insert("cpu".to_owned(), tenths(child.cpu));
+    Value::Object(fields)
 }
 
 /// Inserts a critical take's snapshot: `counts`, `otherHeld`, then `otherClaims` or `snapshotError`.

@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gate_args::{RunRequest, Slot};
-use gate_state::SlotKind;
+use gate_state::{RunTrace, SlotKind};
 use gate_watchdog::{
     Config, Cores, JOB_LINES, Machine, OUTSIDE_LINES, ProcessFacts, Report, Sample, SampleFacts, SampleHistory, SystemTimes, Ticks, Watch, WslVm,
     failed_block, is_wsl_command, lines, wsl_unavailable_line,
@@ -29,6 +29,7 @@ use crate::nesting::Parent;
 use crate::pause::PauseReader;
 use crate::resolve::ResolvedRoot;
 use crate::slots::{Pool, Takes, ThisGate, epoch_ms};
+use crate::trace;
 
 /// How long the watch waits for the command between two samples.
 const SAMPLE_PERIOD: Duration = Duration::from_secs(5);
@@ -107,6 +108,10 @@ pub(crate) struct Watcher<'a> {
     processors: usize,
     /// The hang hint of a run with a usual p90 ([`Watching::usual`]), which a run says once.
     hang: Option<HangHint>,
+    /// The most processes the job held at one sample; `None` before the first.
+    peak: Option<u32>,
+    /// The priority class the command started in, read as the watch began; `None` when it could not be read.
+    priority: Option<Priority>,
 }
 
 /// The usual p90 a run's hang hint compares with, and whether the hint was said.
@@ -266,7 +271,27 @@ impl<'a> Watcher<'a> {
             kind: request.slot,
             processors,
             hang: usual.map(|usual| HangHint { usual, said: false }),
+            peak: None,
+            // A class the handle cannot read, or one Windows never answers with, is not said.
+            priority: running.priority().ok().flatten(),
         })
+    }
+
+    /// Where the run's time went, read now: the job's CPU and the processes it ever held (both left out when its
+    /// accounting cannot be read), the most it held at one sample, the class the command started in, the machine's
+    /// mean free share once an unpaused sample counted one, and the processes the job remembers that are worth naming
+    /// ([`trace::children`]).
+    pub(crate) fn trace(&self) -> RunTrace {
+        let accounting = self.job.accounting().ok();
+        RunTrace {
+            cpu_seconds: accounting.map(|accounting| trace::ticks_as_seconds(accounting.cpu)),
+            processes: accounting.map(|accounting| accounting.total_processes),
+            peak_processes: self.peak,
+            priority: self.priority.map(priority_name),
+            load_free_share: self.watch.free_share(),
+            children: trace::children(self.job.traced(), self.since, gate_win32::file_time_now()),
+            phases: Vec::new(),
+        }
     }
 
     /// Waits for the command to exit, sampling it every period, until it exits, is killed or the console is
@@ -611,8 +636,11 @@ impl<'a> Watcher<'a> {
             console.err(&line);
         }
         let system = system_times()?;
-        let job_cpu = Ticks(self.job.accounting()?.cpu);
+        let accounting = self.job.accounting()?;
+        let job_cpu = Ticks(accounting.cpu);
         let at = self.started.elapsed();
+        let active = accounting.active_processes;
+        self.peak = Some(self.peak.map_or(active, |peak| peak.max(active)));
         let sample = Sample {
             began,
             at,
@@ -820,6 +848,18 @@ pub(crate) fn machine(slot: Slot, processors: usize) -> Machine {
         Takes::Pool(_) | Takes::Machine => processors,
     };
     Machine::new(cores, u32::try_from(demand).unwrap_or(u32::MAX), slot == Slot::Critical)
+}
+
+/// The word a release's `priority` gives `priority`.
+fn priority_name(priority: Priority) -> &'static str {
+    match priority {
+        Priority::Idle => "idle",
+        Priority::BelowNormal => "belowNormal",
+        Priority::Normal => "normal",
+        Priority::AboveNormal => "aboveNormal",
+        Priority::High => "high",
+        Priority::RealTime => "realTime",
+    }
 }
 
 /// The system's CPU times, as the watchdog takes them.

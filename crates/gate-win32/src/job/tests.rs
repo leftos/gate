@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use jiff::Timestamp;
 
 use super::{
-    DRAIN_WAIT_MS, Departure, Job, Member, Message, Missed, Opened, Remembered, Settled, Unread, Until, drain_loop, holds, kept, member, open_any,
-    remembered_as, settled, trouble,
+    DRAIN_WAIT_MS, Departure, Job, Joined, Member, Message, Missed, Opened, Remembered, Settled, Unread, Until, drain_loop, holds, kept, member,
+    open_any, remembered_as, settled, trouble,
 };
 use crate::{EnvironmentBlock, Launch, LaunchOutput, Running, Suspended, start_and_exit_of, system_directory, timestamp_of};
 
@@ -19,6 +19,11 @@ impl Job {
         self.memory
             .as_ref()
             .is_some_and(|memory| memory.shared.lock().members.iter().any(|member| member.pid == pid))
+    }
+
+    /// How many members the job remembers, running or ended.
+    fn remembered(&self) -> usize {
+        self.memory.as_ref().map_or(0, |memory| memory.shared.lock().members.len())
     }
 
     /// How many remembered members still have their handle open.
@@ -224,7 +229,7 @@ fn a_member_that_exited_before_it_was_opened_keeps_its_exact_window_while_its_pr
         .expect("the pid is opened")
         .expect("the exited member's object lives");
     let inside = holds(&job.handle, &process).expect("IsProcessInJob answers for an exited process");
-    let found = member(&job.handle, ended.pid(), job.created_at).expect("a member");
+    let (found, _) = member(&job.handle, ended.pid(), job.created_at).expect("a member");
 
     assert!(inside, "an exited process is still told to be in its job");
     let (start, exit) = window(&ended);
@@ -275,12 +280,15 @@ fn an_exit_message_closes_the_handle_of_that_member_alone() {
         assert_eq!(process.wait(HANG_GUARD).expect("the wait answers"), Some(0), "the member ended");
         let handle = open_any(process.pid()).expect("the pid is opened").expect("the member's object lives");
         let (start, _) = window(process);
-        remembered.add(Member {
-            pid: process.pid(),
-            start,
-            from: start,
-            until: Until::Running(handle),
-        });
+        remembered.add(
+            Member {
+                pid: process.pid(),
+                start,
+                from: start,
+                until: Until::Running(handle),
+            },
+            Joined::default(),
+        );
     }
 
     remembered.exited(first.pid());
@@ -294,13 +302,66 @@ fn an_exit_message_closes_the_handle_of_that_member_alone() {
 }
 
 #[test]
+fn a_running_member_is_traced_by_its_line_and_image_and_once_ended_only_with_its_last_times() {
+    const MARKER: &str = "GATE_JOB_TRACE_MARKER";
+    let mut job = Job::anonymous_kill_on_close().expect("the job is created");
+    job.remember().expect("the job remembers");
+    let member = started(&job, &format!("ping -n 600 127.0.0.1 >nul & rem {MARKER}"));
+    let marked = |job: &Job| job.traced().into_iter().filter(|traced| traced.cmd.contains(MARKER)).collect::<Vec<_>>();
+
+    wait_until("the job traces its running member", || !marked(&job).is_empty());
+    let running = marked(&job);
+    job.terminate(1).expect("the job's members are ended");
+    assert!(member.wait(HANG_GUARD).expect("the wait answers").is_some(), "the member ended");
+    wait_until("the job's members settle", || job.running_handles() == 0);
+    let ended = marked(&job);
+
+    assert_eq!(running.len(), 1, "{running:?}");
+    let image = running[0].image.as_deref().expect("the member's image is read");
+    assert!(image.to_ascii_lowercase().ends_with(r"\cmd.exe"), "{image}");
+    assert_eq!(running[0].span.exited, None, "{running:?}");
+    // A quiet member is dropped as it ends; one the machine kept alive 10 s is kept, with its exit.
+    assert!(
+        ended
+            .iter()
+            .all(|traced| traced.span.exited.is_some() && crate::traced::worth_naming(&traced.span, 0)),
+        "{ended:?}"
+    );
+}
+
+#[test]
+fn a_burst_of_short_members_is_remembered_whole_while_they_are_named_apart() {
+    const CHILDREN: u32 = 40;
+    let mut job = Job::anonymous_kill_on_close().expect("the job is created");
+    job.remember().expect("the job remembers");
+    // Each child waits on stdin, a pipe whose write end the test holds, so none is gone before the drain thread opens it.
+    let mut parent = suspended(&format!("for /L %i in (1,1,{CHILDREN}) do @start /b cmd /d /c set /p line="));
+    let release = parent.take_pipes().expect("a piped launch has pipes");
+    let parent = parent.assign_and_resume(&job).expect("the parent is assigned and resumed");
+    assert_eq!(parent.wait(HANG_GUARD).expect("the wait answers"), Some(0), "the burst started");
+    let total = job.accounting().expect("the job's accounting is read").total_processes;
+    let count = usize::try_from(total).expect("a small count");
+    wait_until("the kill memory holds every member while the children wait", || job.remembered() >= count);
+
+    drop(release);
+    wait_until("every member counted in processes is found by the kill memory", || {
+        job.departed().0.len() >= count
+    });
+    let (departed, trouble) = job.departed();
+
+    assert_eq!(total, CHILDREN + 1, "the parent and each child joined the job");
+    assert_eq!(departed.len(), usize::try_from(total).expect("a small count"), "{departed:?}");
+    assert_eq!(trouble, None, "no member went unread");
+}
+
+#[test]
 fn a_member_reported_twice_is_remembered_once_and_nothing_of_a_forgotten_one_is_kept() {
     let mut job = Job::anonymous_kill_on_close().expect("the job is created");
     job.remember().expect("the job remembers");
     let shared = Arc::clone(&job.memory.as_ref().expect("the job remembers").shared);
-    shared.lock().add(ended_member(7, 1, 4));
-    shared.lock().add(ended_member(7, 1, 4));
-    shared.lock().add(ended_member(9, 2, 6));
+    shared.lock().add(ended_member(7, 1, 4), Joined::default());
+    shared.lock().add(ended_member(7, 1, 4), Joined::default());
+    shared.lock().add(ended_member(9, 2, 6), Joined::default());
     let pids = |job: &Job| job.departed().0.iter().map(|departed| departed.pid).collect::<Vec<u32>>();
     assert_eq!(pids(&job), vec![7, 9], "the second report of member 7 adds nothing");
 

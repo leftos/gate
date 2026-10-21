@@ -244,6 +244,39 @@ fn reserved_release_fields_are_accepted() {
 }
 
 #[test]
+fn a_release_with_every_trace_field_reads_as_one_without() {
+    let gate = Gate::new(1, START, COMMAND);
+    let facts = json!({"wallSeconds": 3.5, "adjustedSeconds": 2.0, "verdict": "passed"});
+    let mut traced = facts.clone();
+    let trace = json!({
+        "cpuSeconds": 41.3, "processes": 37, "peakProcesses": 9, "priority": "belowNormal", "loadFreeShare": 0.73,
+        "children": [
+            {"cmd": "dotnet build", "image": r"C:\Program Files\dotnet\dotnet.exe", "start": 1.0, "end": 30.7, "cpu": 28.0},
+            {"cmd": "node.exe", "start": 2.0, "end": null, "cpu": 1.0}
+        ],
+        "phases": {"command": 12.0, "push": 1.5},
+    });
+    traced
+        .as_object_mut()
+        .expect("the facts are an object")
+        .extend(trace.as_object().expect("the trace is an object").clone());
+    let run = |test: &str, fields: &Value| {
+        let lines = vec![
+            versioned(&gate.queue(&ago(30)), 1),
+            versioned(&gate.take(&ago(29), 0.5), 1),
+            versioned(&with_fields(&gate.release(&ago(28), 4.0, json!(0)), fields), 1),
+        ];
+        serde_json::to_value(history_of(test, &lines).runs).expect("the runs serialize")
+    };
+
+    let with_trace = run("a_release_with_every_trace_field_reads", &traced);
+    let without = run("a_release_without_trace_fields_reads", &facts);
+
+    assert_eq!(with_trace.as_array().map(Vec::len), Some(1), "{with_trace}");
+    assert_eq!(with_trace, without, "the history reads the traced release as the same run");
+}
+
+#[test]
 fn a_cold_routed_release_parses() {
     let gate = Gate::new(1, START, COMMAND);
     let cold = json!({

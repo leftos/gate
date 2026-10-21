@@ -46,7 +46,8 @@
 //! `echo` writes each line it reads on stdin back to stdout, flushed, until stdin ends; `swallow` reads stdin to its end
 //! and writes nothing; `pid-to <path>` writes this process's pid to the file at the path, its folders made when
 //! missing; `alive <path>` reads a pid from the file at the path and prints `alive <pid>` when that process runs, else
-//! fails with `fake-tool: process <pid> is not running`;
+//! fails with `fake-tool: process <pid> is not running`; `run-each <n>` runs this program with no steps n times, one
+//! after another, each waited for;
 //! `argv` prints every word after it, each on its own line, and ends, so it is always the last step;
 //! `--version` adds the line `run` to the file `ran` beside this program's own file, then prints the first line of the
 //! file `version.txt` beside it, and nothing when there is no such file, so a copy named `Godot_console.exe` stands in
@@ -213,6 +214,7 @@ fn keeper_step<'a>(step: &str, steps: &mut impl Iterator<Item = &'a OsString>, s
             .map_err(|error| format!("cannot read stdin: {error}")),
         "pid-to" => write_file(&operand(steps, "pid-to")?, &std::process::id().to_string()),
         "alive" => alive(&operand(steps, "alive")?, stdout),
+        "run-each" => run_each(&operand(steps, "run-each")?),
         other => Err(format!("unknown step '{other}'")),
     }
 }
@@ -487,6 +489,25 @@ fn spawn_wait(path: &str) -> Result<u32, String> {
         .spawn()
         .map(|helper| helper.id())
         .map_err(|error| format!("cannot start the waiting helper: {error}"))
+}
+
+/// The `run-each <n>` step: runs this program with no steps n times, one after another, each waited for, so the job a
+/// case's command runs in has held many short processes.
+fn run_each(text: &str) -> Result<(), String> {
+    let count: u32 = text.parse().map_err(|_| format!("run-each takes a count, got '{text}'"))?;
+    let me = std::env::current_exe().map_err(|error| format!("cannot find this program: {error}"))?;
+    for _ in 0..count {
+        let status = Command::new(&me)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("cannot run {}: {error}", me.display()))?;
+        if !status.success() {
+            return Err(format!("a run of {} ended with {status}", me.display()));
+        }
+    }
+    Ok(())
 }
 
 /// The `spawn-pid` step: starts the program it names with the words after it and this process's handles, writes its pid
