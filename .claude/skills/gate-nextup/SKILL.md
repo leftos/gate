@@ -93,6 +93,8 @@ load-burn does not starve a BelowNormal process: its critical gate runs the comm
 
 Suspending gate.exe cannot starve a test stand-in such as `fake-ssh`: to reproduce a stand-in that gets no CPU in time, put a wrapper that delays before running the real one in place of `target\test-release\fake-ssh.exe` (an untracked build file) and restore it afterwards; GATE-488 was found that way.
 
+To make a gate wait on its journal, hold the case root's journal mutex, `Local\gate-<first 8 hex of the SHA-256 of the lower-cased state path>-journal`, for under 2 s: past 2 s the gate drops the line by design. To freeze a child gate outside a journal write, take the mutex first, suspend the child, then let the mutex go; GATE-658 was settled that way.
+
 The rig needs the case's gate.exe on this PC, but the launcher routes nextest to the builder: build once with `-Local -Reason "the rig needs this PC's gate.exe"` and `--no-run`, then run the suite binary directly under the rig. A fault in a parent gate's timing shows by freezing the child gate it waits on, not the parent (GATE-480). A rig that reads the case folder opens its files with delete sharing, or it causes the case's `os error 32` on folder removal itself.
 
 A builder run over plain ssh has only a pseudo-console, so a fault that needs a real console (as the box gives a routed command) never shows there. Start such a repro with `CREATE_NEW_CONSOLE`, or route it.
