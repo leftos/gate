@@ -50,6 +50,38 @@ pub enum NotRan {
     Failed(String),
 }
 
+/// The most bytes of one line of standard error the runner hands on ([`Stderr::Lines`]): the rest of a longer line is
+/// dropped.
+pub const LINE_CAP: usize = 64 * 1024;
+
+/// How the runner ends a program's process group: at once, or asked first.
+#[derive(Clone, Copy, Debug)]
+pub enum Ending {
+    /// `SIGKILL` at once.
+    Kill,
+    /// `SIGTERM`, then `SIGKILL` once this grace has passed or the program has exited, whichever comes first.
+    TermThenKill(Duration),
+}
+
+/// What takes each line of a program's standard error ([`Stderr::Lines`]): `false` once no more are wanted.
+pub type TakeLine<'a> = &'a mut dyn FnMut(&[u8]) -> bool;
+
+/// What the runner does with the program's standard error.
+pub enum Stderr<'a> {
+    /// Keeps its last bytes in [`Ran::stderr`].
+    Tail,
+    /// Hands each line, without its end, to `take` on the calling thread as it comes: a line feed, a carriage return
+    /// and the two together each end a line, as the Windows box cuts them, and a line keeps at most [`LINE_CAP`] bytes.
+    /// [`Ran::stderr`] stays empty. Once `take` answers `false` it is handed no more lines, and the program's group is
+    /// ended as the run's [`Ending`] says when `end` is set.
+    Lines {
+        /// Takes one line; `false` once no more are wanted.
+        take: TakeLine<'a>,
+        /// Whether a `false` from `take` ends the program.
+        end: bool,
+    },
+}
+
 /// Runs `command` in a process group of its own, standard input null, its standard output kept up to `cap` bytes and
 /// the end of its standard error, until `deadline`: past it the whole group is killed (`SIGKILL`) and the program
 /// reaped. Output a descendant still holds open once the program has exited is waited for until the deadline too.
@@ -57,7 +89,17 @@ pub enum NotRan {
 /// # Errors
 ///
 /// [`NotRan`]: it could not start, it ran past the deadline, it wrote more than `cap`, or its exit could not be read.
-pub fn run_bounded(mut command: Command, cap: usize, deadline: Instant) -> Result<Ran, NotRan> {
+pub fn run_bounded(command: Command, cap: usize, deadline: Instant) -> Result<Ran, NotRan> {
+    run_watched(command, cap, deadline, Stderr::Tail, Ending::Kill)
+}
+
+/// [`run_bounded`], its standard error handled as `stderr` says, and its group ended as `ending` says at the deadline
+/// or when `stderr`'s lines ask for it.
+///
+/// # Errors
+///
+/// [`NotRan`], as [`run_bounded`] gives it.
+pub fn run_watched(mut command: Command, cap: usize, deadline: Instant, stderr: Stderr<'_>, ending: Ending) -> Result<Ran, NotRan> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -65,41 +107,215 @@ pub fn run_bounded(mut command: Command, cap: usize, deadline: Instant) -> Resul
         .process_group(0);
     let mut child = spawned(&mut command).map_err(NotRan::Start)?;
     let group = i32::try_from(child.id()).map_err(|error| NotRan::Failed(format!("the process id is no pid_t: {error}")))?;
-    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
     let (sender, receiver) = mpsc::channel();
-    let out_sender = sender.clone();
-    thread::spawn(move || out_sender.send(Stream::Out(stdout.map(|pipe| capped(pipe, cap)))));
-    thread::spawn(move || sender.send(Stream::Err(stderr.map(tail))));
-    let status = exited(&mut child, group, deadline)?;
-    let mut ran = Ran {
-        status,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-    };
-    let mut over = false;
-    for _ in 0..2 {
-        let Ok(stream) = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) else {
-            kill_group(group);
-            // The readers end once the group's holders are gone; one held past that is left behind.
-            let _ = receiver.recv_timeout(READER_GRACE);
-            return Err(NotRan::TimedOut { group });
-        };
-        match stream {
-            Stream::Out(Some(Ok((bytes, more)))) => (ran.stdout, over) = (bytes, more),
-            Stream::Err(Some(Ok(bytes))) => ran.stderr = bytes,
-            Stream::Out(Some(Err(error))) | Stream::Err(Some(Err(error))) => {
-                return Err(NotRan::Failed(format!("its output could not be read: {error}")));
-            }
-            Stream::Out(None) | Stream::Err(None) => {}
+    let split = matches!(stderr, Stderr::Lines { .. });
+    let mut watch = Watch::new(group, (deadline, ending), stderr, receiver);
+    match child.stdout.take() {
+        Some(pipe) => {
+            let sender = sender.clone();
+            thread::spawn(move || sender.send(Event::Out(capped(pipe, cap))));
         }
+        None => watch.stdout = Some(Ok((Vec::new(), false))),
     }
-    if over { Err(NotRan::OverCap) } else { Ok(ran) }
+    match child.stderr.take() {
+        Some(pipe) => {
+            thread::spawn(move || stderr_read(pipe, split, &sender));
+        }
+        None => watch.stderr = Some(Ok(Vec::new())),
+    }
+    let status = watch.exited(&mut child)?;
+    watch.drained()?;
+    watch.ran(status)
 }
 
-/// What a reader thread read of one stream; `None` for a stream that was not piped.
-enum Stream {
-    Out(Option<io::Result<(Vec<u8>, bool)>>),
-    Err(Option<io::Result<Vec<u8>>>),
+/// What a reader thread read: all of one stream, or one line of standard error.
+enum Event {
+    Out(io::Result<(Vec<u8>, bool)>),
+    Err(io::Result<Vec<u8>>),
+    Line(Vec<u8>),
+}
+
+/// The runner's watch of one program: its deadline and ending, what it does with each line of standard error, and
+/// what its readers gave.
+struct Watch<'a> {
+    group: i32,
+    deadline: Instant,
+    ending: Ending,
+    take: Option<TakeLine<'a>>,
+    end_on_stop: bool,
+    /// Set when a line's `take` answered `false` and the group is to be ended.
+    stop_asked: bool,
+    receiver: mpsc::Receiver<Event>,
+    stdout: Option<io::Result<(Vec<u8>, bool)>>,
+    stderr: Option<io::Result<Vec<u8>>>,
+}
+
+impl<'a> Watch<'a> {
+    fn new(group: i32, (deadline, ending): (Instant, Ending), stderr: Stderr<'a>, receiver: mpsc::Receiver<Event>) -> Watch<'a> {
+        let (take, end_on_stop) = match stderr {
+            Stderr::Tail => (None, false),
+            Stderr::Lines { take, end } => (Some(take), end),
+        };
+        Watch {
+            group,
+            deadline,
+            ending,
+            take,
+            end_on_stop,
+            stop_asked: false,
+            receiver,
+            stdout: None,
+            stderr: None,
+        }
+    }
+
+    /// Takes what a reader sent.
+    fn handle(&mut self, event: Event) {
+        match event {
+            Event::Out(read) => self.stdout = Some(read),
+            Event::Err(read) => self.stderr = Some(read),
+            Event::Line(line) => {
+                if let Some(take) = self.take.as_mut()
+                    && !take(&line)
+                {
+                    self.take = None;
+                    self.stop_asked = self.end_on_stop;
+                }
+            }
+        }
+    }
+
+    /// Takes the next thing a reader sends within `wait`; else waits that long.
+    fn next_event(&mut self, wait: Duration) {
+        match self.receiver.recv_timeout(wait) {
+            Ok(event) => self.handle(event),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => thread::sleep(wait),
+        }
+    }
+
+    /// Waits for `child`, the leader of the group, to exit, taking what the readers send meanwhile; at the deadline
+    /// ends the group and reaps it.
+    fn exited(&mut self, child: &mut Child) -> Result<ExitStatus, NotRan> {
+        loop {
+            if std::mem::take(&mut self.stop_asked) {
+                end_group(child, self.group, self.ending);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) if Instant::now() >= self.deadline => {
+                    end_group(child, self.group, self.ending);
+                    return match child.wait() {
+                        Ok(_) => Err(NotRan::TimedOut { group: self.group }),
+                        Err(error) => Err(NotRan::Failed(format!("it could not be reaped after its kill: {error}"))),
+                    };
+                }
+                Ok(None) => self.next_event(POLL),
+                Err(error) => {
+                    kill_group(self.group);
+                    // Reaped if it can be; the wait's own failure is the one said.
+                    let _ = child.wait();
+                    return Err(NotRan::Failed(format!("its exit could not be read: {error}")));
+                }
+            }
+        }
+    }
+
+    /// Waits until both readers have ended, until the deadline: past it the group is killed, so its holders let the
+    /// pipes go, and a reader still held after [`READER_GRACE`] is left behind.
+    fn drained(&mut self) -> Result<(), NotRan> {
+        while self.stdout.is_none() || self.stderr.is_none() {
+            if std::mem::take(&mut self.stop_asked) {
+                kill_group(self.group);
+            }
+            if Instant::now() >= self.deadline {
+                kill_group(self.group);
+                let grace = Instant::now() + READER_GRACE;
+                while (self.stdout.is_none() || self.stderr.is_none()) && Instant::now() < grace {
+                    self.next_event(POLL);
+                }
+                return Err(NotRan::TimedOut { group: self.group });
+            }
+            self.next_event(POLL);
+        }
+        Ok(())
+    }
+
+    /// What the program gave once it exited with `status` and its readers ended.
+    fn ran(self, status: ExitStatus) -> Result<Ran, NotRan> {
+        let unread = |error: io::Error| NotRan::Failed(format!("its output could not be read: {error}"));
+        let (stdout, over) = self.stdout.unwrap_or(Ok((Vec::new(), false))).map_err(unread)?;
+        let stderr = self.stderr.unwrap_or(Ok(Vec::new())).map_err(unread)?;
+        if over {
+            return Err(NotRan::OverCap);
+        }
+        Ok(Ran { status, stdout, stderr })
+    }
+}
+
+/// Reads the standard error `pipe` to its end and sends what it read: each line ([`Stderr::Lines`]) when `split`,
+/// then the end of the stream, its tail when not `split`.
+fn stderr_read(mut pipe: ChildStderr, split: bool, sender: &mpsc::Sender<Event>) {
+    let read = if split {
+        lines_sent(&mut pipe, sender).map(|()| Vec::new())
+    } else {
+        tail(pipe)
+    };
+    // A runner that stopped receiving has stopped waiting for this reader.
+    let _ = sender.send(Event::Err(read));
+}
+
+/// Sends each line of `pipe` as it ends ([`LineSplitter`]), and the bytes after the last end.
+fn lines_sent(pipe: &mut ChildStderr, sender: &mpsc::Sender<Event>) -> io::Result<()> {
+    let mut splitter = LineSplitter::default();
+    let mut chunk = [0_u8; 8192];
+    let send = |line: &[u8]| {
+        // A runner that stopped receiving has stopped waiting for this reader.
+        let _ = sender.send(Event::Line(line.to_vec()));
+    };
+    loop {
+        let read = pipe.read(&mut chunk)?;
+        if read == 0 {
+            splitter.finish(send);
+            return Ok(());
+        }
+        splitter.feed(&chunk[..read], send);
+    }
+}
+
+/// Cuts bytes into lines as the Windows box's forwarder does (.NET's `ReadLine`): CR LF, LF and a lone CR each end a
+/// line, and the bytes after the last end are a line of their own when there are any. A line keeps its first
+/// [`LINE_CAP`] bytes, the rest dropped.
+#[derive(Default)]
+struct LineSplitter {
+    line: Vec<u8>,
+    after_cr: bool,
+}
+
+impl LineSplitter {
+    /// Takes `bytes`, giving `emit` each line they end, without its end.
+    fn feed(&mut self, bytes: &[u8], mut emit: impl FnMut(&[u8])) {
+        for &byte in bytes {
+            let after_cr = std::mem::take(&mut self.after_cr);
+            match byte {
+                b'\n' if after_cr => {}
+                b'\n' | b'\r' => {
+                    emit(&self.line);
+                    self.line.clear();
+                    self.after_cr = byte == b'\r';
+                }
+                _ if self.line.len() < LINE_CAP => self.line.push(byte),
+                _ => {}
+            }
+        }
+    }
+
+    /// Gives `emit` the bytes after the last line end, when there are any.
+    fn finish(self, mut emit: impl FnMut(&[u8])) {
+        if !self.line.is_empty() {
+            emit(&self.line);
+        }
+    }
 }
 
 /// Starts `command`. Every program the box starts goes through the bounded runner, which owns its process group.
@@ -111,36 +327,30 @@ fn spawned(command: &mut Command) -> io::Result<Child> {
     command.spawn()
 }
 
-/// Waits for `child`, the leader of the process group `group`, to exit, looking every [`POLL`]; at `deadline` kills
-/// the group and reaps it.
-fn exited(child: &mut Child, group: i32, deadline: Instant) -> Result<ExitStatus, NotRan> {
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) if Instant::now() >= deadline => {
-                kill_group(group);
-                return match child.wait() {
-                    Ok(_) => Err(NotRan::TimedOut { group }),
-                    Err(error) => Err(NotRan::Failed(format!("it could not be reaped after its kill: {error}"))),
-                };
-            }
-            Ok(None) => thread::sleep(POLL),
-            Err(error) => {
-                kill_group(group);
-                // Reaped if it can be; the wait's own failure is the one said.
-                let _ = child.wait();
-                return Err(NotRan::Failed(format!("its exit could not be read: {error}")));
-            }
+/// Ends the group `group`, whose leader is `child`, as `ending` says: `SIGTERM` first and a wait for the leader's exit
+/// within the grace, then `SIGKILL` for whatever is left.
+fn end_group(child: &mut Child, group: i32, ending: Ending) {
+    if let Ending::TermThenKill(grace) = ending {
+        signal_group(group, libc::SIGTERM);
+        let until = Instant::now() + grace;
+        while Instant::now() < until && matches!(child.try_wait(), Ok(None)) {
+            thread::sleep(POLL);
         }
     }
+    kill_group(group);
 }
 
 /// Kills every process of the group `group` with `SIGKILL`. A group already gone is no failure, and the caller reaps
 /// what it started, so nothing is said.
 fn kill_group(group: i32) {
+    signal_group(group, libc::SIGKILL);
+}
+
+/// Sends `signal` to every process of the group `group`; a group already gone is no failure.
+fn signal_group(group: i32, signal: i32) {
     // SAFETY: `killpg` takes two integers and touches no memory; `group` is the group the runner made for its own child.
     unsafe {
-        libc::killpg(group, libc::SIGKILL);
+        libc::killpg(group, signal);
     }
 }
 
@@ -241,7 +451,7 @@ mod tests {
     use std::process::Command;
     use std::time::{Duration, Instant};
 
-    use super::{NotRan, login_path, login_path_of, run_bounded, status_text};
+    use super::{Ending, LINE_CAP, LineSplitter, NotRan, Stderr, login_path, login_path_of, run_bounded, run_watched, status_text};
 
     /// How long a program the tests expect to end may take: a hang guard only.
     const HANG_GUARD: Duration = Duration::from_secs(120);
@@ -290,6 +500,60 @@ mod tests {
         assert!(matches!(ran, Err(NotRan::OverCap)), "{ran:?}");
         let fits = run_bounded(sh("printf 1234"), 4, Instant::now() + HANG_GUARD).expect("sh runs");
         assert_eq!(fits.stdout, b"1234", "exactly the cap fits");
+    }
+
+    /// The lines `bytes`, fed in `chunks` of the given sizes, are cut into.
+    fn split(bytes: &[u8], chunk: usize) -> Vec<Vec<u8>> {
+        let mut lines = Vec::new();
+        let mut splitter = LineSplitter::default();
+        for part in bytes.chunks(chunk) {
+            splitter.feed(part, |line| lines.push(line.to_vec()));
+        }
+        splitter.finish(|line| lines.push(line.to_vec()));
+        lines
+    }
+
+    #[test]
+    fn lines_end_at_a_line_feed_a_carriage_return_or_both_as_the_windows_box_cuts_them() {
+        for chunk in [1, 3, 64] {
+            assert_eq!(
+                split(b"a\r\nb\nc\rd", chunk),
+                [b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]
+            );
+            assert_eq!(split(b"\r\r\n", chunk), [Vec::<u8>::new(), Vec::new()], "a lone CR, then CR LF");
+            assert_eq!(split(&[0xff, b'\n'], chunk), [vec![0xff]], "bytes are handed on as they are");
+        }
+    }
+
+    #[test]
+    fn a_line_past_the_line_cap_keeps_its_first_bytes_and_the_next_line_is_whole() {
+        let mut bytes = vec![b'x'; LINE_CAP + 10];
+        bytes.extend_from_slice(b"\nnext\n");
+        assert_eq!(split(&bytes, 8192), [vec![b'x'; LINE_CAP], b"next".to_vec()]);
+    }
+
+    #[test]
+    fn each_line_of_stderr_is_handed_on_as_it_comes_and_a_refusal_ends_the_group_asked_first() {
+        let mut lines = Vec::new();
+        let mut take = |line: &[u8]| {
+            lines.push(String::from_utf8_lossy(line).into_owned());
+            false
+        };
+        let started = Instant::now();
+        let stderr = Stderr::Lines { take: &mut take, end: true };
+        let ran = run_watched(
+            sh("trap 'echo termed; exit 7' TERM; echo first >&2; echo second >&2; sleep 600 & wait"),
+            1024,
+            started + HANG_GUARD,
+            stderr,
+            Ending::TermThenKill(Duration::from_secs(2)),
+        )
+        .expect("sh runs to its end");
+        assert!(started.elapsed() < Duration::from_secs(60), "ended long before its sleep");
+        assert_eq!(lines, ["first"], "no line after the refusal");
+        assert_eq!(String::from_utf8_lossy(&ran.stdout), "termed\n", "asked with SIGTERM first");
+        assert_eq!(status_text(ran.status), "status 7");
+        assert!(ran.stderr.is_empty());
     }
 
     #[test]

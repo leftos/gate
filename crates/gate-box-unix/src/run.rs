@@ -1,0 +1,1211 @@
+//! `gate-box box run`, up to its command: the request read and checked as the Windows box reads it, what this builder
+//! does not build refused so the PC runs the command itself, the work root checked, the work lock taken, the subfolder
+//! placed, the work folder laid out and the payload's snapshot checked out. Each line is said as the Windows box says
+//! it, byte for byte.
+
+use std::ffi::OsStr;
+use std::fs;
+use std::io;
+use std::path::{Component, Path, PathBuf};
+
+use gate_wire::{PathForm, Payload, Refusal, bare_stem, busy_line, escaped, layout_line, refused_line};
+
+use crate::console::{LineSink, Output, Stream};
+use crate::files::{self, HeldLock, Locked};
+use crate::git::{self, AlternatesFailure, Failed, Git, RunGit, Steps, Tree, line_ends_set, origin_set};
+use crate::lines::{FAILED_STATUS, USAGE_STATUS, work_layout};
+use crate::preflight::checked_root;
+use crate::stop::records_folder;
+
+/// The status of a run refused: another run holds the work folder, it could not be laid out, or it asks for what this
+/// builder does not build. Said with a refusal tag and before any start marker, so the PC runs the command itself.
+pub const REFUSED_STATUS: u8 = 75;
+
+/// What a run asks for that this builder does not build, refused with the tag of its refusal.
+#[derive(Clone, Copy, Debug)]
+struct Unbuilt {
+    refusal: Refusal,
+    /// The payload key that asks for it.
+    key: &'static str,
+}
+
+impl Unbuilt {
+    /// The line said after the refusal's tag: the layout line naming the repo of the bare repository `bare` for a
+    /// `layout` refusal ([`layout_line`]), else `gate: remote <key> is not built on this builder`.
+    fn line(self, bare: &str) -> String {
+        let why = format!("{} is not built on this builder", self.key);
+        if self.refusal == Refusal::Layout {
+            layout_line(repo_name(bare), &escaped(&why))
+        } else {
+            format!("gate: remote {why}")
+        }
+    }
+}
+
+/// What a run reads of its payload.
+pub struct Request<'p> {
+    /// The commit checked out, 40 lower-case hex digits.
+    pub snapshot: &'p str,
+    /// The work folder's key.
+    pub key: &'p str,
+    /// The work folder, `<root>/work/<key>`, which holds the repo's tree.
+    pub work: &'p str,
+    /// The work root, which git never searches up into.
+    pub root: String,
+    /// The folder holding the work folders, `<root>/work`, which git runs in.
+    pub parent: &'p Path,
+    /// The run's nonce, which its refusal tags and its start marker name.
+    pub nonce: &'p str,
+    /// The run's ceiling in whole seconds of load-adjusted time, `None` for none.
+    pub timeout: Option<u64>,
+    /// The PC's name for the builder, empty when the payload gives none.
+    pub host: &'p str,
+    /// The repo's bare repository, which the snapshot is fetched from.
+    pub bare: &'p str,
+    /// The work lock, `<work>.lock`.
+    pub lock: &'p str,
+    /// The index the back commit is made with, `<work>.index`.
+    pub index: &'p str,
+    /// The run's job name.
+    pub job: &'p str,
+    /// The command's words, its program first.
+    pub command: Vec<String>,
+    /// The folder the command runs in, relative to the work folder; empty for the work folder itself.
+    pub subfolder: &'p str,
+    /// The back commit's author and committer variables.
+    pub identity: Vec<(String, String)>,
+    /// The caller's variables for the command.
+    pub env: Vec<(String, String)>,
+    /// The first thing the payload asks for that this builder does not build, in the order the payload is read.
+    unbuilt: Option<Unbuilt>,
+}
+
+impl<'p> Request<'p> {
+    /// Reads `payload` in the order the Windows box reads it, each key checked as it does; then notes the first key
+    /// asking for what this builder does not build: `Outputs`, `OutputsFull`, `Desktop`, a warm-up's
+    /// `WarmCommands`, `GodotVersion`, `EngineEnv`, `UnrealVersion`, `InputsDigest`, `SentDigest`, `LfsDigest` or
+    /// `Pair`. A work root holding a `:` is refused just after the work folder is read ([`work_layout`]).
+    ///
+    /// # Errors
+    ///
+    /// The usage line of the first key that cannot be read.
+    pub fn read(payload: &'p Payload) -> Result<Request<'p>, String> {
+        let snapshot = payload.snapshot()?;
+        let (key, work) = payload.work_folder()?;
+        let (root, parent) = work_layout(work)?;
+        let (globs, full) = (payload.output_globs()?, payload.outputs_full()?);
+        let nonce = payload.nonce()?;
+        payload.output_folder(work)?;
+        let (timeout, host) = (payload.timeout()?, payload.optional_text("Host")?);
+        let desktop = payload.desktop()?;
+        if desktop && payload.desktop_wait()?.is_none() {
+            return Err("gate: box payload lacks DesktopWait".to_owned());
+        }
+        let bare = payload.path("Bare")?;
+        let lock = payload.beside_work("Lock", work, "lock")?;
+        let index = payload.beside_work("Index", work, "index")?;
+        let job = payload.job(key)?;
+        let commands = payload.commands()?;
+        let warm = commands.warm_hash.is_some();
+        if desktop && warm {
+            return Err("gate: box payload asks a warm-up for the desktop".to_owned());
+        }
+        let subfolder = payload.optional_text("Subfolder")?;
+        let identity = payload.identity()?;
+        let env = payload.caller_env()?;
+        let godot = payload.godot_version()?.is_some();
+        let engine_env = !payload.engine_env()?.is_empty();
+        let unreal = payload.unreal_version()?.is_some();
+        let inputs = payload.inputs_digest()?.is_some();
+        let sent = payload.sent_digest()?.is_some();
+        let lfs = payload.lfs_digest()?.is_some();
+        let pair = payload.pair()?.is_some();
+        let unbuilt = [
+            (!globs.is_empty(), Refusal::Layout, "Outputs"),
+            (full, Refusal::Layout, "OutputsFull"),
+            (desktop, Refusal::Desktop, "Desktop"),
+            (warm, Refusal::Layout, "WarmCommands"),
+            (godot, Refusal::Layout, "GodotVersion"),
+            (engine_env, Refusal::Layout, "EngineEnv"),
+            (unreal, Refusal::Layout, "UnrealVersion"),
+            (inputs, Refusal::Inputs, "InputsDigest"),
+            (sent, Refusal::Sent, "SentDigest"),
+            (lfs, Refusal::Lfs, "LfsDigest"),
+            (pair, Refusal::Layout, "Pair"),
+        ]
+        .into_iter()
+        .find_map(|(asked, refusal, key)| asked.then_some(Unbuilt { refusal, key }));
+        Ok(Request {
+            snapshot,
+            key,
+            work,
+            root,
+            parent,
+            nonce,
+            timeout,
+            host,
+            bare,
+            lock,
+            index,
+            job,
+            command: commands.words.into_iter().next().unwrap_or_default(),
+            subfolder,
+            identity,
+            env,
+            unbuilt,
+        })
+    }
+}
+
+/// A run ready for its command: the work lock held until this is dropped, the snapshot checked out, and the folder
+/// the command runs in.
+pub struct Ready<'p> {
+    /// What the run read of its payload.
+    pub request: Request<'p>,
+    /// The work lock, held.
+    pub lock: HeldLock,
+    /// The folder the command runs in: the work folder, or its subfolder.
+    pub place: PathBuf,
+}
+
+/// Readies the run of `payload` for its command, saying its lines through `output`: the payload read ([`Request::read`]),
+/// each failure one line and [`USAGE_STATUS`]; what this builder does not build refused with its tag and a line said
+/// together, [`REFUSED_STATUS`]; the work root, `<root>/work` and `Bare` checked as the preflight checks them
+/// ([`root_checked`]); the work lock taken, a held one refused `busy` with the busy line, one that cannot be opened
+/// failing with [`FAILED_STATUS`]; the lock files a git step cut short left removed ([`swept`]), else refused `layout`;
+/// the subfolder placed inside the work folder, else refused with [`USAGE_STATUS`] once the earlier run's back ref is
+/// deleted; the work folder laid out ([`laid_out`]), refused `layout` when it cannot be; the snapshot fetched and checked
+/// out ([`checked_out`]); and the subfolder found in it, a folder inside the work folder once its links are followed,
+/// else [`USAGE_STATUS`]. No start marker is said.
+///
+/// # Errors
+///
+/// The status the run ends on, its lines said.
+pub fn prepare<'p, S: LineSink>(payload: &'p Payload, output: &Output<S>) -> Result<Ready<'p>, u8> {
+    let request = Request::read(payload).map_err(|line| said(output, &[&line], USAGE_STATUS))?;
+    if let Some(unbuilt) = request.unbuilt {
+        return Err(refused(output, &request, unbuilt.refusal, &unbuilt.line(request.bare)));
+    }
+    root_checked(&request).map_err(|(line, status)| said(output, &[&line], status))?;
+    let lock = match files::take_lock(Path::new(request.lock)) {
+        Ok(Locked::Held(lock)) => lock,
+        Ok(Locked::Busy) => return Err(refused(output, &request, Refusal::Busy, &busy_line(request.key))),
+        Err(error) => {
+            let line = format!("gate: remote could not open the work folder lock {}: {error}", request.lock);
+            return Err(said(output, &[&line], FAILED_STATUS));
+        }
+    };
+    let git = RunGit::new(Git::of(&request.root, request.parent), request.lock, output);
+    // Before the run's first git step, so no lock file an earlier run's ended git left fails it.
+    swept(&request).map_err(|not| not_laid_out(output, &request, not))?;
+    // Refused before the layout, so a payload naming a folder outside the work folder changes nothing there; the
+    // earlier run's back ref goes, as the checkout's would, so the client finds none to fetch.
+    let Some(place) = place_of(request.work, request.subfolder) else {
+        said(output, &[&not_inside(request.subfolder)], USAGE_STATUS);
+        back_ref_cleared(&git, &request).map_err(|failed| failure(output, &failed))?;
+        return Err(USAGE_STATUS);
+    };
+    laid_out(&request, &git).map_err(|not| not_laid_out(output, &request, not))?;
+    checked_out(&request, &git).map_err(|failed| failure(output, &failed))?;
+    if !place.is_dir() {
+        let line = format!("gate: remote subfolder {} does not exist in the snapshot", escaped(request.subfolder));
+        return Err(said(output, &[&line], USAGE_STATUS));
+    }
+    // A link the snapshot holds may lead the place out of the work folder, which only the checkout shows.
+    if !inside_work(request.work, &place) {
+        return Err(said(output, &[&not_inside(request.subfolder)], USAGE_STATUS));
+    }
+    Ok(Ready { request, lock, place })
+}
+
+/// Says `lines` on stderr together; `status`.
+fn said<S: LineSink>(output: &Output<S>, lines: &[&str], status: u8) -> u8 {
+    let lines: Vec<(Stream, &str)> = lines.iter().map(|line| (Stream::Err, *line)).collect();
+    // A client that has gone has no one left to tell, and the status still ends the ssh session.
+    let _ = output.say_together(&lines);
+    status
+}
+
+/// Says the lines of `failed`; its status.
+fn failure<S: LineSink>(output: &Output<S>, failed: &Failed) -> u8 {
+    let lines: Vec<&str> = failed.lines.iter().map(String::as_str).collect();
+    said(output, &lines, failed.status)
+}
+
+/// Refuses the run of `request` for `refusal`: its tag, then `line`, said together; [`REFUSED_STATUS`].
+fn refused<S: LineSink>(output: &Output<S>, request: &Request<'_>, refusal: Refusal, line: &str) -> u8 {
+    said(output, &[&refused_line(request.nonce, refusal), line], REFUSED_STATUS)
+}
+
+/// Ends the run of `request` whose work folder could not be laid out as `not` says: refused `layout` with the layout
+/// line naming the repo and why, or failed with a step's lines; the status.
+fn not_laid_out<S: LineSink>(output: &Output<S>, request: &Request<'_>, not: NotLaidOut) -> u8 {
+    match not {
+        NotLaidOut::Refused(why) => {
+            let line = layout_line(repo_name(request.bare), &escaped(&why));
+            refused(output, request, Refusal::Layout, &line)
+        }
+        NotLaidOut::Failed(failed) => failure(output, &failed),
+    }
+}
+
+/// `gate: remote subfolder <sub> is not a folder inside the work folder`, as the Windows box says it.
+fn not_inside(sub: &str) -> String {
+    format!("gate: remote subfolder {} is not a folder inside the work folder", escaped(sub))
+}
+
+/// Checks, making nothing and before the lock, what the run's lock and git steps lie in, as the preflight checks it:
+/// `Bare` at `<root>/<name>.git` ([`checked_root`]); the work root trusted and `<root>/work` the box user's own folder
+/// when they are there ([`records_folder`]); and `Bare` the box user's own folder when it is there
+/// ([`files::unusable_folder`]). Else the line and the status.
+fn root_checked(request: &Request<'_>) -> Result<(), (String, u8)> {
+    checked_root(request.work, request.bare, false).map_err(|line| (line, USAGE_STATUS))?;
+    records_folder(&request.root, request.parent)?;
+    files::unusable_folder(Path::new(request.bare)).map_or(Ok(()), |line| Err((line, FAILED_STATUS)))
+}
+
+/// The name routing gives the repo of the bare repository `bare`: the stem of `<name>.git` ([`bare_stem`]), or the
+/// bare repository's whole file name when it is not of that form.
+fn repo_name(bare: &str) -> &str {
+    let (folder, file) = bare.rsplit_once('/').unwrap_or(("", bare));
+    bare_stem(bare, folder, PathForm::Unix).unwrap_or(file)
+}
+
+/// The folder the command runs in: `work` itself for an empty `sub`, else `sub` below it, its `.` and `..` folded
+/// without reading the file system; `None` when `sub` is rooted or climbs out of `work`.
+fn place_of(work: &str, sub: &str) -> Option<PathBuf> {
+    if sub.is_empty() {
+        return Some(PathBuf::from(work));
+    }
+    if sub.starts_with('/') {
+        return None;
+    }
+    let joined = Path::new(work).join(sub);
+    let folded = folded_names(&joined);
+    if !folded.starts_with(&folded_names(Path::new(work))) {
+        return None;
+    }
+    Some(Path::new("/").join(folded.iter().collect::<PathBuf>()))
+}
+
+/// The names of `path`, each `..` dropping the name before it, `.` and the root left out.
+fn folded_names(path: &Path) -> Vec<&OsStr> {
+    let mut folded = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => folded.push(name),
+            Component::ParentDir => {
+                folded.pop();
+            }
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    folded
+}
+
+/// Whether `place`, every link on its way followed, lies in the work folder `work`, its links followed too; a path
+/// that cannot be followed lies nowhere.
+fn inside_work(work: &str, place: &Path) -> bool {
+    match (fs::canonicalize(work), fs::canonicalize(place)) {
+        (Ok(work), Ok(place)) => place.starts_with(work),
+        _ => false,
+    }
+}
+
+/// Why the work folder could not be laid out.
+enum NotLaidOut {
+    /// A file-system step failed, or a path is not what the run uses, for this reason: the run is refused `layout`.
+    Refused(String),
+    /// A git step failed, or the work folder is not one the box uses: the lines and the status.
+    Failed(Failed),
+}
+
+impl From<Failed> for NotLaidOut {
+    fn from(failed: Failed) -> NotLaidOut {
+        NotLaidOut::Failed(failed)
+    }
+}
+
+/// Removes the lock files a git step the box ended can leave where the work lock covers them, before the run's first
+/// git step, as the Windows box sweeps them: the copied index's `<work>.index.lock`; the tree's `.git/index.lock`,
+/// `.git/HEAD.lock` and `.git/config.lock`; and in the bare repository the run's own back ref's
+/// `refs/gate-back/<key>.lock`, nothing else there touched. A folder on the way that is a link, not a folder or missing
+/// has none of its locks looked at; a link, a folder or anything but a file at a lock's name refuses the run `layout`.
+fn swept(request: &Request<'_>) -> Result<(), NotLaidOut> {
+    if files::plain_folder(request.parent) {
+        lock_removed(Path::new(&format!("{}.index.lock", request.work)))?;
+    }
+    let work = Path::new(request.work);
+    let dot_git = work.join(".git");
+    if files::plain_folder(work) && files::plain_folder(&dot_git) {
+        for lock in ["index.lock", "HEAD.lock", "config.lock"] {
+            lock_removed(&dot_git.join(lock))?;
+        }
+    }
+    let bare = Path::new(request.bare);
+    let refs = bare.join("refs");
+    let gate_back = refs.join("gate-back");
+    if [bare, &refs, &gate_back].into_iter().all(files::plain_folder) {
+        lock_removed(&gate_back.join(format!("{}.lock", request.key)))?;
+    }
+    Ok(())
+}
+
+/// Removes git's lock file `path`, a plain file; a missing one is fine. Else why not.
+fn lock_removed(path: &Path) -> Result<(), NotLaidOut> {
+    let shown = path.display();
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(NotLaidOut::Refused(format!("cannot open {shown}: {error}"))),
+        Ok(metadata) if metadata.is_file() => fs::remove_file(path).map_err(|error| NotLaidOut::Refused(format!("cannot remove {shown}: {error}"))),
+        Ok(metadata) if metadata.is_dir() => Err(NotLaidOut::Refused(format!("{shown} is a folder where git's lock file goes"))),
+        Ok(_) => Err(NotLaidOut::Refused(format!("{shown} is a link or not a file where git's lock file goes"))),
+    }
+}
+
+/// Lays out the work folder of `request` for its checkout, under the work lock: when the interrupted-command record
+/// `<work>.command` is there, the warm record `<work>.warm` and the tools record `<work>.tools` removed, so neither
+/// trusts a tree a command was cut short in, the checkout remaking the tree; the work folder failed unless it is
+/// missing or the box user's own folder ([`files::unusable_folder`]); `.git`, `.git/objects` and `.git/objects/info`
+/// refused unless each is missing or a folder itself, and `.git/config` and `.git/HEAD` unless each is missing or a
+/// file itself, none followed; a tree with no `.git/HEAD` or no `.git/objects` made with `git init`, its warm record
+/// removed first; then its `origin`, its line-ending config and its alternates file naming the bare repository's
+/// objects, written whole ([`git::alternates_written`]).
+fn laid_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>) -> Result<(), NotLaidOut> {
+    let work = request.work;
+    if files::exists(Path::new(&format!("{work}.command"))) {
+        for suffix in [".warm", ".tools"] {
+            removed(&format!("{work}{suffix}"))?;
+        }
+    }
+    if let Some(line) = files::unusable_folder(Path::new(work)) {
+        return Err(NotLaidOut::Failed(Failed::line(line)));
+    }
+    let dot_git = Path::new(work).join(".git");
+    let objects = dot_git.join("objects");
+    let info = objects.join("info");
+    for folder in [&dot_git, &objects, &info] {
+        plain_or_missing(folder, true)?;
+    }
+    for file in [dot_git.join("config"), dot_git.join("HEAD")] {
+        plain_or_missing(&file, false)?;
+    }
+    if !files::exists(&dot_git.join("HEAD")) || !files::exists(&objects) {
+        removed(&format!("{work}.warm"))?;
+        git.step("git init", &["init", "-q", work])?;
+    }
+    let tree = Tree::at(work);
+    origin_set(git, &tree, request.bare)?;
+    line_ends_set(git, &tree)?;
+    git::alternates_written(&info, request.bare).map_err(|failure| {
+        NotLaidOut::Refused(match failure {
+            AlternatesFailure::Folder { path, error } => format!("cannot create {}: {error}", path.display()),
+            AlternatesFailure::Write { path, failure } => format!("cannot write {}: {failure}", path.display()),
+        })
+    })
+}
+
+/// Removes the file `path`; a missing one is fine. Else why not, refusing the run `layout`.
+fn removed(path: &str) -> Result<(), NotLaidOut> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(NotLaidOut::Refused(format!("cannot remove {path}: {error}"))),
+        _ => Ok(()),
+    }
+}
+
+/// Whether `path` is missing or, looked at without following a link, a folder itself (`folder`) or a file itself.
+fn plain_or_missing(path: &Path, folder: bool) -> Result<(), NotLaidOut> {
+    let shown = path.display();
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(NotLaidOut::Refused(format!("cannot read {shown}: {error}"))),
+        Ok(metadata) if folder && metadata.is_dir() => Ok(()),
+        Ok(metadata) if !folder && metadata.is_file() => Ok(()),
+        Ok(_) if folder => Err(NotLaidOut::Refused(format!("{shown} is a link or not a folder"))),
+        Ok(_) => Err(NotLaidOut::Refused(format!("{shown} is a link or not a file"))),
+    }
+}
+
+/// The snapshot of `request` fetched from its bare repository at `refs/gate/<key>`, its commit found, and checked out
+/// by its commit over whatever the last run left, untracked files removed and ignored ones (build output) kept; then
+/// the earlier run's back ref deleted. The commit, never the ref's tip, is what is checked out, so a later push of the
+/// key changes nothing this run runs.
+fn checked_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>) -> Result<(), Failed> {
+    let tree = Tree::at(request.work);
+    let refname = format!("refs/gate/{}", request.key);
+    git.step("fetch", &tree.args(&["fetch", "-q", request.bare, &refname]))?;
+    let commit = format!("{}^{{commit}}", request.snapshot);
+    if !git.quiet("cat-file", &tree.args(&["cat-file", "-e", &commit]))?.status.success() {
+        return Err(Failed::line(format!(
+            "gate: remote snapshot {} is not in the work folder's repository after the fetch",
+            request.snapshot
+        )));
+    }
+    git.step("checkout", &tree.args(&["checkout", "-q", "--force", "--detach", request.snapshot]))?;
+    git.step("clean", &tree.args(&["clean", "-fdq"]))?;
+    back_ref_cleared(git, request)
+}
+
+/// Deletes `refs/gate-back/<key>` in the bare repository, an earlier run's back commit, so the client finds none to
+/// fetch after a run that makes none.
+fn back_ref_cleared<S: LineSink>(git: &RunGit<'_, S>, request: &Request<'_>) -> Result<(), Failed> {
+    let bare = format!("--git-dir={}", request.bare);
+    let back = format!("refs/gate-back/{}", request.key);
+    git.bare_step("back ref reset", &[&bare, "update-ref", "-d", &back])
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "a test whose temp folder, repository or payload cannot be made must fail loudly"
+)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use gate_wire::{PathForm, Payload, Refusal, busy_line, layout_line, refused_line};
+    use serde_json::{Value, json};
+
+    use super::{REFUSED_STATUS, Ready, place_of, prepare};
+    use crate::console::{Output, RecordingSink, Stream};
+    use crate::files::{self, Locked, effective_uid, take_lock};
+
+    const KEY: &str = "repo-0123abcd";
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+    const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// Runs git with `args` to set a case up or look at it; its standard output, trimmed, and whether it exited 0.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the spawn lock is the Windows gate's; this sets a case's repository up"
+    )]
+    fn git_said(args: &[&str]) -> (String, bool) {
+        let ran = Command::new("git")
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .expect("git starts");
+        (String::from_utf8_lossy(&ran.stdout).trim().to_owned(), ran.status.success())
+    }
+
+    /// Runs git with `args`; its standard output, trimmed. Fails the case unless git exits 0.
+    fn git(args: &[&str]) -> String {
+        let (said, passed) = git_said(args);
+        assert!(passed, "git {args:?}");
+        said
+    }
+
+    /// A work root in a temp folder of the case `name`, private to this process and removed when the case ends,
+    /// with its `<root>/work` and an empty bare repository.
+    struct Case {
+        base: PathBuf,
+    }
+
+    impl Case {
+        fn new(name: &str) -> Case {
+            Case::rooted(name, "gate-remote")
+        }
+
+        /// A case whose work root is named `leaf`.
+        fn rooted(name: &str, leaf: &str) -> Case {
+            let base = std::env::temp_dir().join(format!("gate-box-unix-run-{}-{name}", std::process::id()));
+            if base.exists() {
+                fs::remove_dir_all(&base).expect("a stale case folder is removed");
+            }
+            let case = Case { base: base.join(leaf) };
+            fs::create_dir_all(format!("{}/work", case.root())).expect("the work folders' parent is made");
+            git(&["init", "--bare", "-q", &case.bare()]);
+            case
+        }
+
+        fn root(&self) -> String {
+            self.base.to_str().expect("the temp folder is UTF-8").to_owned()
+        }
+
+        fn work(&self) -> String {
+            format!("{}/work/{KEY}", self.root())
+        }
+
+        fn bare(&self) -> String {
+            format!("{}/repo.git", self.root())
+        }
+
+        fn lock(&self) -> String {
+            format!("{}.lock", self.work())
+        }
+
+        fn source(&self) -> PathBuf {
+            self.base.with_file_name("source")
+        }
+
+        /// The run payload of this case's work folder checking out `snapshot`, with `extra` keys set over it.
+        fn json(&self, snapshot: &str, extra: &Value) -> Value {
+            let (root, work) = (self.root(), self.work());
+            let mut json = json!({
+                "Key": KEY,
+                "Bare": self.bare(),
+                "Work": work,
+                "Lock": format!("{work}.lock"),
+                "Index": format!("{work}.index"),
+                "OutputFolder": format!("{root}/outputs"),
+                "Job": format!("gate-remote-{KEY}-0123456789ab"),
+                "Nonce": NONCE,
+                "Snapshot": snapshot,
+                "Command": ["true"],
+            });
+            if let (Some(object), Some(extra)) = (json.as_object_mut(), extra.as_object()) {
+                object.extend(extra.clone());
+            }
+            json
+        }
+
+        /// A commit holding `files`, written over the case's source tree, pushed to the bare repository as
+        /// `refs/gate/<key>`; its sha.
+        fn snapshot(&self, files: &[(&str, &str)]) -> String {
+            let source = self.source();
+            let source = source.to_str().expect("the temp folder is UTF-8");
+            if !Path::new(source).exists() {
+                git(&["init", "-q", source]);
+            }
+            for (name, text) in files {
+                let path = Path::new(source).join(name);
+                fs::create_dir_all(path.parent().expect("a file has a folder")).expect("the file's folder is made");
+                fs::write(path, text).expect("the file is written");
+            }
+            git(&["-C", source, "add", "-A"]);
+            let identity = ["-c", "user.name=gate", "-c", "user.email=gate@example.com", "-c", "commit.gpgsign=false"];
+            let mut commit = vec!["-C", source];
+            commit.extend(identity);
+            commit.extend(["commit", "-q", "--allow-empty", "-m", "snapshot"]);
+            git(&commit);
+            let refspec = format!("HEAD:refs/gate/{KEY}");
+            git(&["-C", source, "push", "-q", "--force", &self.bare(), &refspec]);
+            git(&["-C", source, "rev-parse", "HEAD"])
+        }
+
+        /// Points the earlier run's back ref at `commit`.
+        fn back_ref_set(&self, commit: &str) {
+            git(&[
+                &format!("--git-dir={}", self.bare()),
+                "update-ref",
+                &format!("refs/gate-back/{KEY}"),
+                commit,
+            ]);
+        }
+
+        fn has_back_ref(&self) -> bool {
+            let back = format!("refs/gate-back/{KEY}");
+            git_said(&[&format!("--git-dir={}", self.bare()), "rev-parse", "--verify", "-q", &back]).1
+        }
+
+        /// The commit the work folder's tree has checked out.
+        fn head(&self) -> String {
+            git(&["-C", &self.work(), "rev-parse", "HEAD"])
+        }
+
+        /// Runs a first run of `commit`, which lays the tree out; fails the case unless it is ready.
+        fn laid_out(&self, commit: &str) {
+            let (status, said) = ran(&self.json(commit, &json!({})));
+            assert_eq!(status, 0, "{said:?}");
+        }
+    }
+
+    impl Drop for Case {
+        fn drop(&mut self) {
+            // Best effort: a folder left behind is in the temp folder and named for this process.
+            if let Some(base) = self.base.parent() {
+                let _ = fs::remove_dir_all(base);
+            }
+        }
+    }
+
+    fn decoded(json: &Value) -> Payload {
+        Payload::decode(&STANDARD.encode(json.to_string()), PathForm::Unix).expect("the payload decodes")
+    }
+
+    /// Readies the run of `json`; the status it ended on, 0 for a run ready for its command (its lock let go), and the
+    /// lines it said, each checked to be on stderr.
+    fn ran(json: &Value) -> (u8, Vec<String>) {
+        let payload = decoded(json);
+        let output = Output::new(RecordingSink::default());
+        let status = match prepare(&payload, &output) {
+            Ok(_) => 0,
+            Err(status) => status,
+        };
+        (status, stderr_of(&output))
+    }
+
+    fn stderr_of(output: &Output<RecordingSink>) -> Vec<String> {
+        let lines = output.sink().lines();
+        assert!(lines.iter().all(|(stream, _)| *stream == Stream::Err), "{lines:?}");
+        lines.into_iter().map(|(_, line)| line).collect()
+    }
+
+    /// The layout refusal of `why`: its tag, then the layout line.
+    fn layout_refusal(why: &str) -> [String; 2] {
+        [refused_line(NONCE, Refusal::Layout), layout_line("repo", why)]
+    }
+
+    #[test]
+    fn a_first_run_lays_the_tree_out_checks_the_snapshot_out_and_is_ready_holding_the_lock() {
+        let case = Case::new("first");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let payload = decoded(&case.json(&commit, &json!({})));
+        let output = Output::new(RecordingSink::default());
+
+        let ready: Ready<'_> = prepare(&payload, &output).expect("the run is ready");
+
+        assert_eq!(ready.place, PathBuf::from(case.work()));
+        assert_eq!(case.head(), commit);
+        assert_eq!(fs::read_to_string(format!("{}/a.txt", case.work())).expect("a.txt is checked out"), "a\n");
+        let alternates = fs::read_to_string(format!("{}/.git/objects/info/alternates", case.work())).expect("the alternates are written");
+        assert_eq!(alternates, format!("{}/objects\n", case.bare()));
+        let config = fs::read_to_string(format!("{}/.git/config", case.work())).expect("the tree's config is written");
+        assert!(config.contains(&format!("url = {}", case.bare())), "{config}");
+        assert!(config.contains("autocrlf = false") && config.contains("eol = lf"), "{config}");
+        assert!(matches!(take_lock(Path::new(&case.lock())), Ok(Locked::Busy)), "the lock is held");
+        assert!(
+            !stderr_of(&output).iter().any(|line| line.starts_with("gate")),
+            "no gate line: {:?}",
+            output.sink().lines()
+        );
+        drop(ready);
+        assert!(matches!(take_lock(Path::new(&case.lock())), Ok(Locked::Held(_))), "let go once dropped");
+    }
+
+    #[test]
+    fn a_run_on_a_held_lock_is_refused_busy_its_tag_just_before_the_busy_line_and_nothing_else() {
+        let case = Case::new("busy");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let held = take_lock(Path::new(&case.lock())).expect("the lock opens");
+        assert!(matches!(held, Locked::Held(_)));
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        assert_eq!(status, REFUSED_STATUS);
+        assert_eq!(said, [refused_line(NONCE, Refusal::Busy), busy_line(KEY)]);
+        assert!(!Path::new(&case.work()).exists(), "nothing is laid out or checked out");
+    }
+
+    #[test]
+    fn a_lock_that_cannot_be_opened_fails_the_run_with_its_line() {
+        let case = Case::new("lock-folder");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        fs::create_dir(case.lock()).expect("a folder takes the lock's name");
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        assert_eq!(status, 1);
+        let start = format!("gate: remote could not open the work folder lock {}: ", case.lock());
+        assert!(said.len() == 1 && said[0].starts_with(&start), "{said:?}");
+    }
+
+    #[test]
+    fn a_bare_repository_outside_the_root_is_a_usage_error_before_the_lock() {
+        let case = Case::new("bare-outside");
+        let bare = format!("{}/other/repo.git", case.root());
+
+        let (status, said) = ran(&case.json(&"a".repeat(40), &json!({ "Bare": bare })));
+
+        assert_eq!(status, 2);
+        assert_eq!(
+            said,
+            [format!("gate: box payload Bare must be <root>/<name>.git to lock its root down: {bare}")]
+        );
+        assert!(!Path::new(&case.lock()).exists(), "the lock is not taken");
+    }
+
+    #[test]
+    fn a_link_at_the_bare_repository_fails_the_run_before_the_lock_and_its_target_is_untouched() {
+        let case = Case::new("bare-link");
+        let target = format!("{}/elsewhere.git", case.root());
+        fs::rename(case.bare(), &target).expect("the bare repository is moved aside");
+        symlink(&target, case.bare()).expect("the link is made");
+
+        let (status, said) = ran(&case.json(&"a".repeat(40), &json!({})));
+
+        assert_eq!(status, 1);
+        assert_eq!(
+            said,
+            [format!("gate: remote could not create the folder {}: it is a symbolic link", case.bare())]
+        );
+        assert!(!Path::new(&case.lock()).exists(), "the lock is not taken");
+    }
+
+    #[test]
+    fn a_lock_file_a_cut_short_git_left_is_removed_and_a_folder_there_is_refused_layout() {
+        let case = Case::new("swept");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.laid_out(&commit);
+        let index_lock = format!("{}/.git/index.lock", case.work());
+        fs::write(&index_lock, "").expect("a stale index lock is planted");
+        let back_lock = format!("{}/refs/gate-back/{KEY}.lock", case.bare());
+        fs::create_dir_all(Path::new(&back_lock).parent().expect("a lock has a folder")).expect("refs/gate-back is made");
+        fs::write(&back_lock, "").expect("a stale back ref lock is planted");
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        assert_eq!(status, 0, "{said:?}");
+        assert!(
+            !Path::new(&index_lock).exists() && !Path::new(&back_lock).exists(),
+            "the stale locks are removed"
+        );
+
+        let head_lock = format!("{}/.git/HEAD.lock", case.work());
+        fs::create_dir(&head_lock).expect("a folder takes the lock's name");
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+        assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        assert_eq!(said, layout_refusal(&format!("{head_lock} is a folder where git's lock file goes")));
+    }
+
+    #[test]
+    fn a_subfolder_outside_the_work_folder_is_refused_and_the_back_ref_deleted() {
+        let case = Case::new("subfolder-outside");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        for sub in ["/x", "../k-sibling", "sub/../../x", "..", "../../x"] {
+            case.back_ref_set(&commit);
+
+            let (status, said) = ran(&case.json(&commit, &json!({ "Subfolder": sub })));
+
+            assert_eq!(status, 2, "{sub}: {said:?}");
+            assert_eq!(said, [format!("gate: remote subfolder {sub} is not a folder inside the work folder")]);
+            assert!(!case.has_back_ref(), "{sub}: the back ref is deleted");
+            assert!(!Path::new(&case.work()).exists(), "{sub}: nothing is laid out or checked out");
+        }
+    }
+
+    #[test]
+    fn a_subfolder_the_snapshot_links_out_of_the_work_folder_is_refused_after_the_checkout() {
+        let case = Case::new("subfolder-link");
+        case.snapshot(&[("a.txt", "a\n")]);
+        symlink("../..", case.source().join("sub")).expect("the link is made in the snapshot");
+        let commit = case.snapshot(&[]);
+
+        let (status, said) = ran(&case.json(&commit, &json!({ "Subfolder": "sub" })));
+
+        assert_eq!(status, 2, "{said:?}");
+        assert_eq!(said, ["gate: remote subfolder sub is not a folder inside the work folder"]);
+    }
+
+    #[test]
+    fn a_subfolder_is_placed_below_the_work_folder_its_dots_folded() {
+        let work = "/r/work/k";
+        assert_eq!(place_of(work, ""), Some(PathBuf::from(work)));
+        assert_eq!(place_of(work, "sub"), Some(PathBuf::from("/r/work/k/sub")));
+        assert_eq!(place_of(work, "sub/../x/./y"), Some(PathBuf::from("/r/work/k/x/y")));
+        assert_eq!(place_of(work, "sub/.."), Some(PathBuf::from(work)));
+        assert_eq!(place_of(work, "../k/x"), Some(PathBuf::from("/r/work/k/x")), "it climbs out and back in");
+        assert_eq!(place_of(work, "../k-sibling"), None);
+        assert_eq!(place_of(work, "/r/work/k/x"), None, "a rooted subfolder");
+    }
+
+    #[test]
+    fn a_work_folder_ending_in_a_separator_is_a_usage_error() {
+        let case = Case::new("work-separator");
+        let work = format!("{}/", case.work());
+
+        let (status, said) = ran(&case.json(&"a".repeat(40), &json!({ "Work": work })));
+
+        assert_eq!(status, 2);
+        assert_eq!(said, [format!("gate: box payload Work must not end with a separator: {work}")]);
+    }
+
+    #[test]
+    fn an_index_or_a_lock_other_than_the_work_folders_is_a_usage_error() {
+        let case = Case::new("index-lock");
+        let precious = format!("{}/precious.txt", case.root());
+        fs::write(&precious, "keep").expect("the precious file is written");
+
+        let (status, said) = ran(&case.json(&"a".repeat(40), &json!({ "Index": precious })));
+        assert_eq!(status, 2);
+        assert_eq!(said, [format!("gate: box payload Index must be {}.index", case.work())]);
+
+        let (status, said) = ran(&case.json(&"a".repeat(40), &json!({ "Lock": precious })));
+        assert_eq!(status, 2);
+        assert_eq!(said, [format!("gate: box payload Lock must be {}.lock", case.work())]);
+        assert_eq!(fs::read_to_string(&precious).expect("the precious file is read"), "keep");
+    }
+
+    #[test]
+    fn a_work_root_holding_a_colon_is_a_usage_error_before_the_lock() {
+        let case = Case::rooted("colon-root", "gate:remote");
+
+        let (status, said) = ran(&case.json(&"a".repeat(40), &json!({})));
+
+        assert_eq!(status, 2);
+        assert_eq!(
+            said,
+            [format!(
+                "gate: box payload Work must be <root>/work/<key> with no ':' in <root>, which GIT_CEILING_DIRECTORIES cannot hold: {}",
+                case.work()
+            )]
+        );
+        assert!(!Path::new(&case.lock()).exists(), "the lock is not taken");
+    }
+
+    #[test]
+    fn a_failed_fetch_exits_with_git_s_status() {
+        let case = Case::new("fetch-failed");
+
+        let (status, said) = ran(&case.json(&"0".repeat(40), &json!({})));
+
+        assert_eq!(status, 128, "{said:?}");
+        assert_eq!(
+            said.last().map(String::as_str),
+            Some("gate: remote fetch failed (status 128)"),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_subfolder_the_snapshot_lacks_is_a_usage_error() {
+        let case = Case::new("subfolder-missing");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.laid_out(&commit);
+
+        let (status, said) = ran(&case.json(&commit, &json!({ "Subfolder": "nope" })));
+
+        assert_eq!(status, 2);
+        assert_eq!(said, ["gate: remote subfolder nope does not exist in the snapshot"]);
+    }
+
+    #[test]
+    fn the_checkout_keeps_ignored_files_removes_untracked_ones_and_deletes_the_back_ref() {
+        let case = Case::new("checkout");
+        let first = case.snapshot(&[("a.txt", "a\n"), (".gitignore", "ignored.txt\n")]);
+        case.back_ref_set(&first);
+        case.laid_out(&first);
+        assert_eq!(case.head(), first);
+        assert!(!case.has_back_ref(), "the earlier run's back ref is deleted");
+
+        let work = PathBuf::from(case.work());
+        fs::write(work.join("ignored.txt"), "build output").expect("an ignored file is written");
+        fs::write(work.join("untracked.txt"), "stray").expect("an untracked file is written");
+        let second = case.snapshot(&[("a.txt", "b\n")]);
+
+        let (status, said) = ran(&case.json(&second, &json!({})));
+
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(said, Vec::<String>::new());
+        assert_eq!(case.head(), second);
+        assert_eq!(fs::read_to_string(work.join("a.txt")).expect("a.txt is checked out"), "b\n");
+        assert!(work.join("ignored.txt").exists(), "an ignored file survives");
+        assert!(!work.join("untracked.txt").exists(), "an untracked file is removed");
+    }
+
+    #[test]
+    fn a_snapshot_that_is_not_40_hex_is_a_usage_error_before_the_lock() {
+        let case = Case::new("snapshot-refused");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let held = take_lock(Path::new(&case.lock())).expect("the lock opens");
+        assert!(matches!(held, Locked::Held(_)));
+        let mut absent = case.json(&commit, &json!({}));
+        absent.as_object_mut().expect("the payload is an object").remove("Snapshot");
+        let (short, upper) = (commit[..39].to_owned(), commit.to_uppercase());
+
+        for (what, json, quoted) in [
+            ("a missing key", absent, ""),
+            ("a 39-character value", case.json(&short, &json!({})), short.as_str()),
+            ("an upper-case sha", case.json(&upper, &json!({})), upper.as_str()),
+            ("a non-string value", case.json("", &json!({ "Snapshot": 3 })), "3"),
+        ] {
+            let (status, said) = ran(&json);
+
+            assert_eq!(status, 2, "{what}: refused before the lock, never busy");
+            assert_eq!(
+                said,
+                [format!("gate: remote run payload's Snapshot '{quoted}' is not a 40-hex commit sha")],
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_payload_s_snapshot_is_checked_out_not_the_ref_s_tip() {
+        let case = Case::new("not-ref-tip");
+        let a = case.snapshot(&[("a.txt", "a\n")]);
+        let b = case.snapshot(&[("a.txt", "b\n")]);
+        assert_ne!(a, b);
+
+        let (status, said) = ran(&case.json(&a, &json!({})));
+
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(case.head(), a, "the payload's commit is what is checked out");
+        assert_eq!(fs::read_to_string(format!("{}/a.txt", case.work())).expect("a.txt is read"), "a\n");
+    }
+
+    #[test]
+    fn a_snapshot_missing_after_the_fetch_fails_with_status_1_and_leaves_the_tree_and_the_back_ref() {
+        let case = Case::new("snapshot-missing");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.laid_out(&commit);
+        let untracked = format!("{}/untracked.txt", case.work());
+        fs::write(&untracked, "stray").expect("an untracked file is written");
+        case.back_ref_set(&commit);
+        let absent = "0".repeat(40);
+
+        let (status, said) = ran(&case.json(&absent, &json!({})));
+
+        assert_eq!(status, 1);
+        assert_eq!(
+            said,
+            [format!(
+                "gate: remote snapshot {absent} is not in the work folder's repository after the fetch"
+            )]
+        );
+        assert_eq!(case.head(), commit, "HEAD stands");
+        assert!(Path::new(&untracked).exists(), "the untracked file stands");
+        assert!(case.has_back_ref(), "the back ref stands");
+    }
+
+    #[test]
+    fn an_identity_name_outside_the_git_identity_is_a_usage_error() {
+        let case = Case::new("identity");
+        let identity = json!({ "Identity": { "GIT_AUTHOR_NAME": "a", "GIT_CONFIG_COUNT": "1" } });
+
+        let (status, said) = ran(&case.json(&"a".repeat(40), &identity));
+
+        assert_eq!(status, 2);
+        assert_eq!(
+            said,
+            ["gate: box payload Identity may set only GIT_AUTHOR_* and GIT_COMMITTER_* names: GIT_CONFIG_COUNT"]
+        );
+        assert!(!Path::new(&case.lock()).exists(), "the lock is not taken");
+    }
+
+    #[test]
+    fn a_malformed_env_is_a_usage_error() {
+        let case = Case::new("env");
+        for (env, line) in [
+            (json!("A=b"), "gate: box payload Env is not an object of texts"),
+            (json!({"A": 1}), "gate: box payload Env is not an object of texts"),
+            (json!({"ZZ_A_X": "a", "zz_a_x": "b"}), "gate: box payload Env names zz_a_x twice"),
+            (
+                json!({"MSBUILDUSESERVER": "1"}),
+                "gate: box payload Env sets MSBUILDUSESERVER, which the gate sets itself",
+            ),
+        ] {
+            let (status, said) = ran(&case.json(&"a".repeat(40), &json!({ "Env": env })));
+
+            assert_eq!(status, 2, "{line}");
+            assert_eq!(said, [line]);
+        }
+    }
+
+    /// Checks the run of `case` with `extra` set is refused for `refusal` with `line` after its tag, before the lock,
+    /// and nothing is laid out.
+    fn assert_refused(case: &Case, extra: &Value, refusal: Refusal, line: &str) {
+        let (status, said) = ran(&case.json(&"a".repeat(40), extra));
+        assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        assert_eq!(said, [refused_line(NONCE, refusal), line.to_owned()]);
+        assert!(!Path::new(&case.lock()).exists(), "the lock is not taken");
+        assert!(!Path::new(&case.work()).exists(), "nothing is laid out");
+    }
+
+    /// The layout line of this builder refusing what `key` asks for.
+    fn unbuilt_layout(key: &str) -> String {
+        layout_line("repo", &format!("{key} is not built on this builder"))
+    }
+
+    #[test]
+    fn a_pair_is_refused_layout() {
+        let case = Case::new("pair");
+        let pair = json!({ "Pair": { "Leaf": "repo", "Siblings": ["lib"] } });
+        assert_refused(&case, &pair, Refusal::Layout, &unbuilt_layout("Pair"));
+    }
+
+    #[test]
+    fn a_desktop_run_is_refused_desktop() {
+        let case = Case::new("desktop");
+        let desktop = json!({ "Desktop": true, "DesktopWait": 60 });
+        assert_refused(&case, &desktop, Refusal::Desktop, "gate: remote Desktop is not built on this builder");
+    }
+
+    #[test]
+    fn an_inputs_digest_is_refused_inputs() {
+        let case = Case::new("inputs");
+        let inputs = json!({ "InputsDigest": DIGEST });
+        assert_refused(&case, &inputs, Refusal::Inputs, "gate: remote InputsDigest is not built on this builder");
+    }
+
+    #[test]
+    fn a_sent_digest_is_refused_sent() {
+        let case = Case::new("sent");
+        let sent = json!({ "SentDigest": DIGEST });
+        assert_refused(&case, &sent, Refusal::Sent, "gate: remote SentDigest is not built on this builder");
+    }
+
+    #[test]
+    fn an_lfs_digest_is_refused_lfs() {
+        let case = Case::new("lfs");
+        let lfs = json!({ "LfsDigest": DIGEST });
+        assert_refused(&case, &lfs, Refusal::Lfs, "gate: remote LfsDigest is not built on this builder");
+    }
+
+    #[test]
+    fn a_warm_up_is_refused_layout() {
+        let case = Case::new("warm-up");
+        let warm = json!({ "Command": null, "WarmCommands": [["true"]], "WarmHash": DIGEST, "Timeout": 60 });
+        assert_refused(&case, &warm, Refusal::Layout, &unbuilt_layout("WarmCommands"));
+    }
+
+    #[test]
+    fn outputs_or_outputs_full_are_refused_layout_naming_the_key() {
+        let case = Case::new("outputs");
+        assert_refused(&case, &json!({ "Outputs": ["bin/**"] }), Refusal::Layout, &unbuilt_layout("Outputs"));
+        assert_refused(&case, &json!({ "OutputsFull": true }), Refusal::Layout, &unbuilt_layout("OutputsFull"));
+    }
+
+    #[test]
+    fn an_engine_version_or_engine_env_is_refused_layout_naming_the_key() {
+        let case = Case::new("engines");
+        assert_refused(
+            &case,
+            &json!({ "GodotVersion": "4.3.0" }),
+            Refusal::Layout,
+            &unbuilt_layout("GodotVersion"),
+        );
+        assert_refused(
+            &case,
+            &json!({ "UnrealVersion": "5.4.0" }),
+            Refusal::Layout,
+            &unbuilt_layout("UnrealVersion"),
+        );
+        let engine_env = json!({ "EngineEnv": { "MY_ENGINE": "unreal" } });
+        assert_refused(&case, &engine_env, Refusal::Layout, &unbuilt_layout("EngineEnv"));
+    }
+
+    #[test]
+    fn an_interrupted_command_record_removes_the_warm_and_tools_records_before_the_checkout() {
+        let case = Case::new("interrupted");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.laid_out(&commit);
+        let (warm, tools) = (format!("{}.warm", case.work()), format!("{}.tools", case.work()));
+        for record in [&warm, &tools] {
+            fs::write(record, DIGEST).expect("the record is written");
+        }
+
+        case.laid_out(&commit);
+        assert!(
+            Path::new(&warm).exists() && Path::new(&tools).exists(),
+            "no interrupted command, the records stand"
+        );
+
+        fs::write(format!("{}.command", case.work()), "x").expect("the interrupted-command record is written");
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        assert_eq!(status, 0, "{said:?}");
+        assert!(!Path::new(&warm).exists(), "the warm record is removed");
+        assert!(!Path::new(&tools).exists(), "the tools record is removed");
+    }
+
+    #[test]
+    fn a_folder_at_the_warm_or_tools_record_of_an_interrupted_command_is_refused_layout() {
+        for suffix in [".warm", ".tools"] {
+            let case = Case::new("record-folder");
+            let commit = case.snapshot(&[("a.txt", "a\n")]);
+            case.laid_out(&commit);
+            fs::write(format!("{}.command", case.work()), "x").expect("the interrupted-command record is written");
+            let record = format!("{}{suffix}", case.work());
+            fs::create_dir(&record).expect("a folder takes the record's name");
+
+            let (status, said) = ran(&case.json(&commit, &json!({})));
+
+            assert_eq!(status, REFUSED_STATUS, "{suffix}: {said:?}");
+            let start = layout_line("repo", &format!("cannot remove {record}: "));
+            assert!(said.len() == 2 && said[1].starts_with(&start), "{suffix}: {said:?}");
+            assert_eq!(said[0], refused_line(NONCE, Refusal::Layout));
+        }
+    }
+
+    #[test]
+    fn a_link_or_a_file_at_the_work_folder_fails_the_run_with_the_folder_line() {
+        for linked in [true, false] {
+            let case = Case::new("work-flaw");
+            let commit = case.snapshot(&[("a.txt", "a\n")]);
+            if linked {
+                let target = format!("{}/elsewhere", case.root());
+                fs::create_dir(&target).expect("the link's target is made");
+                symlink(&target, case.work()).expect("the link is made");
+            } else {
+                fs::write(case.work(), "kept\n").expect("a file takes the work folder's name");
+            }
+
+            let (status, said) = ran(&case.json(&commit, &json!({})));
+
+            let why = if linked { "it is a symbolic link" } else { "it is not a folder" };
+            assert_eq!(status, 1, "{said:?}");
+            assert_eq!(said, [format!("gate: remote could not create the folder {}: {why}", case.work())]);
+        }
+    }
+
+    #[test]
+    fn another_user_s_folder_is_not_one_the_layout_uses() {
+        if effective_uid() == 0 {
+            // The case runs as root, whose own folder `/usr` is; no other user's folder is at hand.
+            return;
+        }
+        let line = files::unusable_folder(Path::new("/usr")).expect("a root-owned folder is not the box user's");
+        let user = files::user_name(effective_uid());
+        assert_eq!(line, format!("gate: remote could not create the folder /usr: it is not owned by {user}"));
+    }
+
+    #[test]
+    fn a_tree_without_its_head_is_made_again_with_git_init() {
+        let case = Case::new("no-head");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.laid_out(&commit);
+        fs::remove_file(format!("{}/.git/HEAD", case.work())).expect("HEAD is removed");
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(case.head(), commit, "the tree is made again and checked out");
+    }
+
+    #[test]
+    fn a_link_at_the_tree_s_git_folders_or_files_is_refused_layout_and_its_target_untouched() {
+        for (at, kind) in [
+            (".git", "folder"),
+            (".git/objects", "folder"),
+            (".git/objects/info", "folder"),
+            (".git/config", "file"),
+            (".git/HEAD", "file"),
+        ] {
+            let case = Case::new("git-link");
+            let commit = case.snapshot(&[("a.txt", "a\n")]);
+            case.laid_out(&commit);
+            let linked = format!("{}/{at}", case.work());
+            let target = format!("{}/elsewhere", case.root());
+            fs::rename(&linked, &target).expect("the original is moved aside");
+            symlink(&target, &linked).expect("the link is made");
+
+            let (status, said) = ran(&case.json(&commit, &json!({})));
+
+            assert_eq!(status, REFUSED_STATUS, "{at}: {said:?}");
+            assert_eq!(said, layout_refusal(&format!("{linked} is a link or not a {kind}")), "{at}");
+            assert!(fs::symlink_metadata(&linked).expect("the link stands").file_type().is_symlink(), "{at}");
+        }
+    }
+
+    #[test]
+    fn a_folder_at_the_alternates_file_is_refused_layout_and_kept() {
+        let case = Case::new("alternates-folder");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.laid_out(&commit);
+        let alternates = format!("{}/.git/objects/info/alternates", case.work());
+        fs::remove_file(&alternates).expect("the alternates file is removed");
+        fs::create_dir(&alternates).expect("a folder takes its name");
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        assert_eq!(said, layout_refusal(&format!("cannot write {alternates}: it is not a plain file")));
+        assert!(Path::new(&alternates).is_dir(), "the folder is kept");
+    }
+}

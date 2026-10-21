@@ -15,10 +15,14 @@ pub mod boot;
 #[cfg(unix)]
 pub mod files;
 #[cfg(unix)]
+pub mod git;
+#[cfg(unix)]
 pub mod preflight;
 #[cfg(unix)]
 pub mod probe;
 #[cfg(unix)]
 pub mod process;
+#[cfg(unix)]
+pub mod run;
 #[cfg(unix)]
 pub mod stop;

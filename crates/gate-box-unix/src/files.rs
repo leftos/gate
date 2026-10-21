@@ -2,15 +2,20 @@
 //! it is a plain file. A record is replaced whole, through a synced temp file renamed over it, and the work lock is an
 //! `flock` on a plain file.
 
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::lines::{RootFacts, folder_failure, folder_flaw, job_record_text};
+
+/// The most bytes of a record beside the work folder, or of a tree's alternates file, read.
+pub const RECORD_LIMIT: u64 = 64 * 1024;
 
 /// Opens `path` without following a link at it and without waiting on a FIFO, and reads at most `limit` bytes of it;
 /// else why not, a link (`ELOOP`) and anything but a plain file included.
@@ -55,7 +60,7 @@ impl fmt::Display for ReplaceFailure {
 }
 
 /// Writes `bytes` as the whole of `path` at once, so a reader finds the old text or the new one and never a part: into
-/// a new temp file beside it, `<name>.gate-new-<pid>-<n>`, made with `O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600, and
+/// a new temp file beside it, `<name>.gate-new-<pid>-<n>` ([`temp_name`]), made with `O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600, and
 /// synced, then renamed over `path`; the folder, opened before the temp file is made, is synced after. A leftover temp
 /// file of that name, which only an ended process with this one's pid can have left, is removed and the making tried
 /// once more. Only a missing path or a plain file is replaced, looked at before the temp file is made and again before
@@ -92,9 +97,7 @@ fn put_in_place(path: &Path, bytes: &[u8], number: u64) -> io::Result<File> {
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(folder_path)?;
-    let mut temp_name = name.to_owned();
-    temp_name.push(format!(".gate-new-{}-{number}", std::process::id()));
-    let temp = folder_path.join(temp_name);
+    let temp = folder_path.join(temp_name(name, number));
     let mut file = match new_temp(&temp) {
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             fs::remove_file(&temp).map_err(|left| {
@@ -123,6 +126,24 @@ fn put_in_place(path: &Path, bytes: &[u8], number: u64) -> io::Result<File> {
         };
     }
     Ok(folder)
+}
+
+/// The longest name a file may have on the box's volumes, in bytes (`NAME_MAX`).
+const NAME_MAX: usize = 255;
+
+/// The name of [`replace_plain`]'s temp file numbered `number` for the file `name`: `<name>.gate-new-<pid>-<n>`, the
+/// kept part of `name` shortened, ending on a UTF-8 character's boundary, when the whole would pass [`NAME_MAX`].
+fn temp_name(name: &OsStr, number: u64) -> OsString {
+    let suffix = format!(".gate-new-{}-{number}", std::process::id());
+    let bytes = name.as_bytes();
+    let mut kept = bytes.len().min(NAME_MAX.saturating_sub(suffix.len()));
+    // A continuation byte (`10xxxxxx`) at the cut is inside a character, which is left out whole.
+    while kept > 0 && kept < bytes.len() && bytes[kept] & 0xC0 == 0x80 {
+        kept -= 1;
+    }
+    let mut temp = OsString::from_vec(bytes[..kept].to_vec());
+    temp.push(suffix);
+    temp
 }
 
 /// Makes the temp file `temp` of [`replace_plain`]: new, mode 0600, a link at it never followed.
@@ -331,7 +352,7 @@ pub fn exists(path: &Path) -> bool {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test whose temp folder cannot be made must fail loudly")]
 mod tests {
-    use std::ffi::CString;
+    use std::ffi::{CString, OsStr, OsString};
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
@@ -340,7 +361,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use super::{HeldLock, Locked, replace_numbered, replace_plain, take_lock, take_lock_between, write_job_record};
+    use super::{HeldLock, Locked, replace_numbered, replace_plain, take_lock, take_lock_between, temp_name, write_job_record};
     use crate::lines::{JobRecord, job_record};
 
     /// How long a write may take before the case calls it hung: a hang guard, never reached by a write that works.
@@ -404,6 +425,33 @@ mod tests {
         replace_plain(&file, b"new\n").expect("a plain file is replaced");
         assert_eq!(fs::read(&file).expect("the file is read"), b"new\n");
         assert_eq!(case.names(), ["alternates"]);
+    }
+
+    #[test]
+    fn a_record_whose_name_is_250_bytes_is_replaced_through_a_temp_name_within_the_name_limit() {
+        let case = Case::new("long-name");
+        let name = "a".repeat(250);
+        let file = case.base.join(&name);
+        replace_plain(&file, b"new\n").expect("a 250-byte name is replaced");
+        assert_eq!(fs::read(&file).expect("the file is read"), b"new\n");
+        assert_eq!(case.names(), [name], "no temp file is left");
+    }
+
+    #[test]
+    fn a_shortened_temp_name_keeps_whole_characters_and_fits_the_name_limit() {
+        // 250 bytes: two-byte characters between single-byte ones, so some cuts fall inside a character.
+        let name = format!("a{}a", "é".repeat(124));
+        for number in [0, 7, 1234, u64::MAX] {
+            let temp = temp_name(OsStr::new(&name), number);
+            assert!(temp.len() <= 255, "{number}: {} bytes", temp.len());
+            let text = temp.to_str().expect("the temp name is UTF-8");
+            let suffix = format!(".gate-new-{}-{number}", std::process::id());
+            let kept = text.strip_suffix(&suffix).expect("the suffix is whole");
+            assert!(name.starts_with(kept), "{number}: {kept}");
+            assert!(255 - suffix.len() - kept.len() <= 1, "{number}: at most one byte short of the limit");
+        }
+        let short = temp_name(OsStr::new("alternates"), 3);
+        assert_eq!(short, OsString::from(format!("alternates.gate-new-{}-3", std::process::id())));
     }
 
     #[test]

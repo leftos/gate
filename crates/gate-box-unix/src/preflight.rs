@@ -6,48 +6,21 @@ use std::fs::{self, DirBuilder};
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
-use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant};
 
 use gate_wire::{Pair, PairSibling, PathForm, Payload, bare_stem, escaped};
 
 use crate::console::Console;
+use crate::git::{self, AlternatesFailure, Failed, Git, Steps, Tree, line_ends_set, origin_set};
 use crate::lines::{
-    FAILED_STATUS, NEEDS_REFUSED, NEW_WORK_TREE, PAIR_NOT_BUILT, ROOT_STATUS, USAGE_STATUS, created_line, folder_failure, is_git_variable,
-    layout_text, login_path_line, names_another_layout, readies_single, root_flaw, root_unsafe_line, sdks_failure, sdks_line, step_unran, tool_line,
-    unsynced_failure, version_line, warm_line, warm_text, work_layout, write_failure,
+    FAILED_STATUS, NEEDS_REFUSED, NEW_WORK_TREE, PAIR_NOT_BUILT, ROOT_STATUS, USAGE_STATUS, created_line, folder_failure, layout_text,
+    login_path_line, names_another_layout, readies_single, root_flaw, root_unsafe_line, sdks_failure, sdks_line, tool_line, unsynced_failure,
+    version_line, warm_line, warm_text, work_layout, write_failure,
 };
-use crate::process::{NotRan, Ran, run_bounded, status_text};
 use crate::{boot, files, probe, process};
 
-/// How long one git step may take.
-const GIT_LIMIT: Duration = Duration::from_secs(120);
-/// The most a git step may write on its standard output.
-const GIT_OUTPUT_CAP: usize = 1024 * 1024;
-/// The most bytes of a record beside the work folder read.
-const RECORD_LIMIT: u64 = 64 * 1024;
 /// The most bytes of the warm record read: one past a hash, so a longer record is seen as not one.
 const WARM_READ_LIMIT: u64 = 65;
-/// The most lines of a failed git step's standard error said before its failure line.
-const GIT_ERROR_LINES: usize = 10;
-
-/// A step that failed: the lines saying so, on stderr, and the status the box exits with.
-#[derive(Debug)]
-struct Failed {
-    lines: Vec<String>,
-    status: u8,
-}
-
-impl Failed {
-    /// A failure said in one line, with [`FAILED_STATUS`].
-    fn line(line: String) -> Failed {
-        Failed {
-            lines: vec![line],
-            status: FAILED_STATUS,
-        }
-    }
-}
 
 /// Why the work root is not used.
 enum Refusal {
@@ -129,7 +102,7 @@ fn folders(payload: &Payload) -> Result<(&str, &str, Option<Pair>), String> {
 
 /// The work root of `work`, `<root>/work/<key>`, and its `<root>/work`, with `bare` at `<root>/<name>.git` unless
 /// `paired` (a pair's bare repositories were checked as its layout was read); else the usage line.
-fn checked_root<'w>(work: &'w str, bare: &str, paired: bool) -> Result<(String, &'w Path), String> {
+pub(crate) fn checked_root<'w>(work: &'w str, bare: &str, paired: bool) -> Result<(String, &'w Path), String> {
     let (root, parent) = work_layout(work)?;
     if !paired && bare_stem(bare, &root, PathForm::Unix).is_none() {
         return Err(format!(
@@ -173,7 +146,7 @@ fn wanted_layout(pair: Option<&Pair>) -> String {
 
 /// The work folder's layout record, `<work>.layout`, read as a plain file; `None` when it is missing.
 fn layout_record(work: &str) -> io::Result<Option<String>> {
-    match files::read_plain(Path::new(&format!("{work}.layout")), RECORD_LIMIT) {
+    match files::read_plain(Path::new(&format!("{work}.layout")), files::RECORD_LIMIT) {
         Ok(bytes) => String::from_utf8(bytes)
             .map(Some)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
@@ -216,9 +189,7 @@ fn ready(git: &Git<'_>, bare: &str, work: &str, layout: &io::Result<Option<Strin
     };
     let tree = Tree::at(work);
     origin_set(git, &tree, bare)?;
-    for (setting, value) in [("core.autocrlf", "false"), ("core.eol", "lf")] {
-        git.step(&format!("git config {setting}"), &tree.args(&["config", setting, value]))?;
-    }
+    line_ends_set(git, &tree)?;
     alternates_written(work, bare)?;
     Ok(made)
 }
@@ -237,45 +208,6 @@ fn warm_removed(work: &str) -> Result<(), Failed> {
     }
 }
 
-/// The words naming a work folder's repository to git: its `.git` and its tree, so git never looks for another.
-struct Tree {
-    git_dir: String,
-    work_tree: String,
-}
-
-impl Tree {
-    /// The repository of the tree at `work`.
-    fn at(work: &str) -> Tree {
-        Tree {
-            git_dir: format!("--git-dir={work}/.git"),
-            work_tree: format!("--work-tree={work}"),
-        }
-    }
-
-    /// The git words running `rest` in this repository.
-    fn args<'a>(&'a self, rest: &[&'a str]) -> Vec<&'a str> {
-        [self.git_dir.as_str(), self.work_tree.as_str()]
-            .into_iter()
-            .chain(rest.iter().copied())
-            .collect()
-    }
-}
-
-/// Sets the `origin` of the repository `tree` to `bare`: added when it has none, set when it names another.
-fn origin_set(git: &Git<'_>, tree: &Tree, bare: &str) -> Result<(), Failed> {
-    let step = "git config remote.origin.url";
-    let ran = git.run(step, &tree.args(&["config", "--get", "remote.origin.url"]))?;
-    match ran.status.code() {
-        Some(0) if String::from_utf8_lossy(&ran.stdout).trim_end_matches(['\r', '\n']) == bare => Ok(()),
-        Some(0) => git
-            .step("git remote set-url", &tree.args(&["remote", "set-url", "origin", bare]))
-            .map(drop),
-        // `config --get` exits 1 for a key that is not set.
-        Some(1) => git.step("git remote add", &tree.args(&["remote", "add", "origin", bare])).map(drop),
-        _ => Err(step_failed(step, &ran)),
-    }
-}
-
 /// Writes `<work>/.git/objects/info/alternates` as `<bare>/objects` and a line feed unless it already holds exactly
 /// that, whole, so a git reading it meanwhile never finds it empty ([`files::replace_plain`]); `info` is made when
 /// missing. A link or anything but a folder at `objects` or `info` leaves it unwritten. A folder that cannot be synced
@@ -286,92 +218,21 @@ fn alternates_written(work: &str, bare: &str) -> Result<(), Failed> {
         return Ok(());
     }
     let info = objects.join("info");
-    match fs::symlink_metadata(&info) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(&info).map_err(|error| Failed::line(folder_failure(&info.display().to_string(), &error.to_string())))?;
-        }
-        Ok(metadata) if metadata.is_dir() => {}
-        _ => return Ok(()),
-    }
-    let file = info.join("alternates");
-    let wanted = format!("{bare}/objects\n");
-    if files::read_plain(&file, RECORD_LIMIT).is_ok_and(|held| held == wanted.as_bytes()) {
+    if files::exists(&info) && !files::plain_folder(&info) {
         return Ok(());
     }
-    files::replace_plain(&file, wanted.as_bytes()).map_err(|failure| {
-        let shown = file.display().to_string();
+    git::alternates_written(&info, bare).map_err(|failure| {
         Failed::line(match failure {
-            files::ReplaceFailure::NotWritten(error) => write_failure(&shown, &error.to_string()),
-            files::ReplaceFailure::Unsynced(error) => unsynced_failure(&shown, &error.to_string()),
+            AlternatesFailure::Folder { path, error } => folder_failure(&path.display().to_string(), &error.to_string()),
+            AlternatesFailure::Write { path, failure } => {
+                let shown = path.display().to_string();
+                match failure {
+                    files::ReplaceFailure::NotWritten(error) => write_failure(&shown, &error.to_string()),
+                    files::ReplaceFailure::Unsynced(error) => unsynced_failure(&shown, &error.to_string()),
+                }
+            }
         })
     })
-}
-
-/// How the preflight runs git: with no variable of git's own inherited ([`is_git_variable`]), so none points git at
-/// another repository, config or program; in `folder`, the work root's `<root>/work`, so a step that names no
-/// repository starts its search there and not in the box's inherited folder; and with `GIT_CEILING_DIRECTORIES` at
-/// `ceiling`, the work root, which git never searches up into, so that search ends at `<root>/work` (git ignores a
-/// ceiling that is the starting folder itself). The tree's steps name their repository besides ([`Tree`]).
-struct Git<'a> {
-    folder: &'a Path,
-    ceiling: &'a str,
-}
-
-impl<'a> Git<'a> {
-    /// The git of the work root `root`, whose work folders are in `parent`, its `<root>/work`.
-    fn of(root: &'a str, parent: &'a Path) -> Git<'a> {
-        Git {
-            folder: parent,
-            ceiling: root,
-        }
-    }
-
-    /// Runs git with `args`, the git step `step`, to its exit; else the failure that it could not run.
-    fn run(&self, step: &str, args: &[&str]) -> Result<Ran, Failed> {
-        let mut command = Command::new("git");
-        command.args(args).current_dir(self.folder);
-        for (name, _) in std::env::vars_os().filter(|(name, _)| is_git_variable(name)) {
-            command.env_remove(name);
-        }
-        command.env("GIT_CEILING_DIRECTORIES", self.ceiling);
-        run_bounded(command, GIT_OUTPUT_CAP, Instant::now() + GIT_LIMIT).map_err(|not| {
-            let why = match not {
-                NotRan::Start(error) => error.to_string(),
-                NotRan::TimedOut { .. } => format!("git did not answer in {} s", GIT_LIMIT.as_secs()),
-                NotRan::OverCap => format!("git wrote more than {} MiB", GIT_OUTPUT_CAP / 1024 / 1024),
-                NotRan::Failed(why) => why,
-            };
-            Failed::line(step_unran(step, &why))
-        })
-    }
-
-    /// Runs the git step `step` with `args`; its standard output when it exits 0, else its failure.
-    fn step(&self, step: &str, args: &[&str]) -> Result<Vec<u8>, Failed> {
-        let ran = self.run(step, args)?;
-        if ran.status.success() {
-            Ok(ran.stdout)
-        } else {
-            Err(step_failed(step, &ran))
-        }
-    }
-}
-
-/// The failure of the git step `step` that `ran` to a non-zero exit: the last lines of git's standard error, then
-/// `gate: remote <step> failed (status <n>)`, exiting with git's status; a git a signal ended fails with
-/// [`FAILED_STATUS`].
-fn step_failed(step: &str, ran: &Ran) -> Failed {
-    let stderr = String::from_utf8_lossy(&ran.stderr);
-    let said: Vec<&str> = stderr.lines().filter(|line| !line.trim().is_empty()).collect();
-    let mut lines: Vec<String> = said[said.len().saturating_sub(GIT_ERROR_LINES)..].iter().copied().map(escaped).collect();
-    let status = match ran.status.code() {
-        Some(code) => u8::try_from(code).ok().filter(|code| *code != 0).unwrap_or(FAILED_STATUS),
-        None => FAILED_STATUS,
-    };
-    lines.push(match ran.status.code() {
-        Some(code) => format!("gate: remote {step} failed (status {code})"),
-        None => format!("gate: remote {step} failed: git ended with {}", status_text(ran.status)),
-    });
-    Failed { lines, status }
 }
 
 /// Says the SDK line and one line for each tool the payload's `Needs` names, in its order, the SDK list and the probes
@@ -418,9 +279,10 @@ mod tests {
     use gate_wire::{PathForm, Payload};
     use serde_json::{Value, json};
 
-    use super::{Git, preflight};
+    use super::preflight;
     use crate::console::Console;
     use crate::files::{effective_uid, user_name};
+    use crate::git::Git;
     use crate::lines::{NEW_WORK_TREE, PAIR_NOT_BUILT, created_line, root_unsafe_line, version_line, warm_line};
 
     const KEY: &str = "repo-0123abcd";

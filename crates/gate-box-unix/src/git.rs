@@ -1,0 +1,681 @@
+//! How the box runs git: with no variable of git's own inherited, in the work folders' parent and under the work root's
+//! ceiling ([`Git`]); the preflight's steps bounded and their standard error kept for the failure line, and a run's
+//! steps ([`RunGit`]) bounded as the Windows box bounds them, with their standard error forwarded to the client line by
+//! line as git says it.
+
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
+use std::time::{Duration, Instant};
+
+use gate_wire::escaped;
+
+use crate::console::{LineSink, Output, Stream};
+use crate::files::{self, ReplaceFailure};
+use crate::lines::{FAILED_STATUS, is_git_variable, step_unran};
+use crate::process::{Ending, NotRan, Ran, Stderr, run_bounded, run_watched, status_text};
+
+/// How long one preflight git step may take.
+const GIT_LIMIT: Duration = Duration::from_secs(120);
+/// The bound of a run's git step that reads or writes refs, config or a listing, as the Windows box's.
+const GIT_SHORT_LIMIT: Duration = Duration::from_mins(5);
+/// The bound of a run's git step that moves a tree's or a repository's content (`fetch`, `checkout`, `clean`), as the
+/// Windows box's.
+const GIT_LONG_LIMIT: Duration = Duration::from_mins(30);
+/// How long a run's git step asked to end with `SIGTERM` has before its group is killed.
+const END_GRACE: Duration = Duration::from_secs(2);
+/// The most a git step may write on its standard output.
+const GIT_OUTPUT_CAP: usize = 1024 * 1024;
+/// The most lines of a failed preflight git step's standard error said before its failure line.
+const GIT_ERROR_LINES: usize = 10;
+/// The status of a run whose client closed the connection, as a lost connection ends.
+pub const CLOSED_STATUS: u8 = 255;
+/// The variable, set to `1`, that has git read no system-wide attributes file, as the Windows box sets it.
+const NO_SYSTEM_ATTRIBUTES: &str = "GIT_ATTR_NOSYSTEM";
+
+/// A step that failed: the lines saying so, on stderr, and the status the box exits with.
+#[derive(Debug)]
+pub struct Failed {
+    /// The lines, in order.
+    pub lines: Vec<String>,
+    /// The status.
+    pub status: u8,
+}
+
+impl Failed {
+    /// A failure said in one line, with [`FAILED_STATUS`].
+    #[must_use]
+    pub fn line(line: String) -> Failed {
+        Failed {
+            lines: vec![line],
+            status: FAILED_STATUS,
+        }
+    }
+}
+
+/// How the box runs git: with no variable of git's own inherited ([`is_git_variable`]), so none points git at another
+/// repository, config or program; in `folder`, the work root's `<root>/work`, so a step that names no repository
+/// starts its search there and not in the box's inherited folder; and with `GIT_CEILING_DIRECTORIES` at `ceiling`, the
+/// work root, which git never searches up into, so that search ends at `<root>/work` (git ignores a ceiling that is
+/// the starting folder itself). The tree's steps name their repository besides ([`Tree`]).
+pub struct Git<'a> {
+    folder: &'a Path,
+    ceiling: &'a str,
+}
+
+impl<'a> Git<'a> {
+    /// The git of the work root `root`, whose work folders are in `parent`, its `<root>/work`.
+    #[must_use]
+    pub fn of(root: &'a str, parent: &'a Path) -> Git<'a> {
+        Git {
+            folder: parent,
+            ceiling: root,
+        }
+    }
+
+    /// The command running git with `args` as this git runs it.
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new("git");
+        command.args(args).current_dir(self.folder);
+        for (name, _) in std::env::vars_os().filter(|(name, _)| is_git_variable(name)) {
+            command.env_remove(name);
+        }
+        command.env("GIT_CEILING_DIRECTORIES", self.ceiling);
+        command
+    }
+
+    /// Runs git with `args`, the git step `step`, to its exit within [`GIT_LIMIT`], its standard error kept; else the
+    /// failure that it could not run.
+    ///
+    /// # Errors
+    ///
+    /// The failure of a git that could not start, ran past the limit, wrote more than the cap or whose exit could not
+    /// be read.
+    pub fn run(&self, step: &str, args: &[&str]) -> Result<Ran, Failed> {
+        run_bounded(self.command(args), GIT_OUTPUT_CAP, Instant::now() + GIT_LIMIT).map_err(|not| {
+            let why = match not {
+                NotRan::Start(error) => error.to_string(),
+                NotRan::TimedOut { .. } => format!("git did not answer in {} s", GIT_LIMIT.as_secs()),
+                NotRan::OverCap => format!("git wrote more than {} MiB", GIT_OUTPUT_CAP / 1024 / 1024),
+                NotRan::Failed(why) => why,
+            };
+            Failed::line(step_unran(step, &why))
+        })
+    }
+}
+
+/// The steps a git runs, each to its exit, and how a step that exited non-zero fails.
+pub trait Steps {
+    /// Runs git with `args`, the git step `step`, to its exit; else the failure that it could not run.
+    ///
+    /// # Errors
+    ///
+    /// The failure of a git that did not run to an exit.
+    fn ran(&self, step: &str, args: &[&str]) -> Result<Ran, Failed>;
+
+    /// The failure of the git step `step` that `ran` to a non-zero exit.
+    fn failed(&self, step: &str, ran: &Ran) -> Failed;
+
+    /// Runs the git step `step` with `args`; its standard output when it exits 0, else its failure.
+    ///
+    /// # Errors
+    ///
+    /// The failure of a git that did not run to an exit or exited non-zero.
+    fn step(&self, step: &str, args: &[&str]) -> Result<Vec<u8>, Failed> {
+        let ran = self.ran(step, args)?;
+        if ran.status.success() {
+            Ok(ran.stdout)
+        } else {
+            Err(self.failed(step, &ran))
+        }
+    }
+}
+
+impl Steps for Git<'_> {
+    fn ran(&self, step: &str, args: &[&str]) -> Result<Ran, Failed> {
+        self.run(step, args)
+    }
+
+    fn failed(&self, step: &str, ran: &Ran) -> Failed {
+        step_failed(step, ran)
+    }
+}
+
+/// The failure of the preflight's git step `step` that `ran` to a non-zero exit: the last lines of git's standard
+/// error, then the exit's line ([`exit_failed`]).
+#[must_use]
+pub fn step_failed(step: &str, ran: &Ran) -> Failed {
+    let stderr = String::from_utf8_lossy(&ran.stderr);
+    let said: Vec<&str> = stderr.lines().filter(|line| !line.trim().is_empty()).collect();
+    let mut lines: Vec<String> = said[said.len().saturating_sub(GIT_ERROR_LINES)..].iter().copied().map(escaped).collect();
+    let exited = exit_failed(step, ran.status);
+    lines.extend(exited.lines);
+    Failed {
+        lines,
+        status: exited.status,
+    }
+}
+
+/// The failure of the git step `step` that exited with `status`, not 0: `gate: remote <step> failed (status <n>)`,
+/// exiting with git's status; a git a signal ended fails with [`FAILED_STATUS`] and says so.
+#[must_use]
+pub fn exit_failed(step: &str, status: ExitStatus) -> Failed {
+    match status.code() {
+        Some(code) => Failed {
+            lines: vec![format!("gate: remote {step} failed (status {code})")],
+            status: u8::try_from(code).ok().filter(|code| *code != 0).unwrap_or(FAILED_STATUS),
+        },
+        None => Failed::line(format!("gate: remote {step} failed: git ended with {}", status_text(status))),
+    }
+}
+
+/// The failure of the git step `step` whose forwarded output found the client gone: the run ends with
+/// [`CLOSED_STATUS`], as the Windows box ends it, the line naming git once though a tree-readying step's name starts
+/// with it.
+#[must_use]
+pub fn client_gone(step: &str) -> Failed {
+    let step = step.strip_prefix("git ").unwrap_or(step);
+    Failed {
+        lines: vec![format!("gate: remote the client closed the connection during git {step}")],
+        status: CLOSED_STATUS,
+    }
+}
+
+/// Why a git step past its bound `limit` failed, as the Windows box says it: `git did not answer within <n> s`, or
+/// `<n> ms` for a bound that is not whole seconds.
+fn late_git_line(limit: Duration) -> String {
+    let spelled = match limit.as_millis() % 1000 {
+        0 => format!("{} s", limit.as_secs()),
+        _ => format!("{} ms", limit.as_millis()),
+    };
+    format!("git did not answer within {spelled}")
+}
+
+/// The words naming a work folder's repository to git: its `.git` and its tree, so git never looks for another.
+pub struct Tree {
+    git_dir: String,
+    work_tree: String,
+}
+
+impl Tree {
+    /// The repository of the tree at `work`.
+    #[must_use]
+    pub fn at(work: &str) -> Tree {
+        Tree {
+            git_dir: format!("--git-dir={work}/.git"),
+            work_tree: format!("--work-tree={work}"),
+        }
+    }
+
+    /// The git words running `rest` in this repository.
+    #[must_use]
+    pub fn args<'a>(&'a self, rest: &[&'a str]) -> Vec<&'a str> {
+        [self.git_dir.as_str(), self.work_tree.as_str()]
+            .into_iter()
+            .chain(rest.iter().copied())
+            .collect()
+    }
+}
+
+/// Sets the `origin` of the repository `tree` to `bare`: added when it has none, set when it names another.
+///
+/// # Errors
+///
+/// The failure of a git step.
+pub fn origin_set(git: &impl Steps, tree: &Tree, bare: &str) -> Result<(), Failed> {
+    let step = "git config remote.origin.url";
+    let ran = git.ran(step, &tree.args(&["config", "--get", "remote.origin.url"]))?;
+    match ran.status.code() {
+        Some(0) if String::from_utf8_lossy(&ran.stdout).trim_end_matches(['\r', '\n']) == bare => Ok(()),
+        Some(0) => git
+            .step("git remote set-url", &tree.args(&["remote", "set-url", "origin", bare]))
+            .map(drop),
+        // `config --get` exits 1 for a key that is not set.
+        Some(1) => git.step("git remote add", &tree.args(&["remote", "add", "origin", bare])).map(drop),
+        _ => Err(git.failed(step, &ran)),
+    }
+}
+
+/// Writes the line-ending config of the repository `tree`, so the checkout and the sync-back keep the snapshot's bytes
+/// whatever the builder's system and global git config say.
+///
+/// # Errors
+///
+/// The failure of a git step.
+pub fn line_ends_set(git: &impl Steps, tree: &Tree) -> Result<(), Failed> {
+    for (setting, value) in [("core.autocrlf", "false"), ("core.eol", "lf")] {
+        git.step(&format!("git config {setting}"), &tree.args(&["config", setting, value]))?;
+    }
+    Ok(())
+}
+
+/// Why a tree's alternates file was not written ([`alternates_written`]).
+#[derive(Debug)]
+pub enum AlternatesFailure {
+    /// The folder `path`, `.git/objects/info`, could not be made.
+    Folder {
+        /// The folder.
+        path: PathBuf,
+        /// Why not.
+        error: io::Error,
+    },
+    /// The file `path` could not be replaced, or its folder synced after.
+    Write {
+        /// The alternates file.
+        path: PathBuf,
+        /// Why not.
+        failure: ReplaceFailure,
+    },
+}
+
+/// Writes `<info>/alternates`, `info` a tree's `.git/objects/info`, as `<bare>/objects` and a line feed unless it
+/// already holds exactly that, whole, so a git reading it meanwhile never finds it empty ([`files::replace_plain`]);
+/// `info` is made when nothing is at its name. The caller judges a link at `info` before.
+///
+/// # Errors
+///
+/// The folder that could not be made, or the file that could not be replaced.
+pub fn alternates_written(info: &Path, bare: &str) -> Result<(), AlternatesFailure> {
+    if !files::exists(info) {
+        fs::create_dir(info).map_err(|error| AlternatesFailure::Folder {
+            path: info.to_owned(),
+            error,
+        })?;
+    }
+    let file = info.join("alternates");
+    let wanted = format!("{bare}/objects\n");
+    if files::read_plain(&file, files::RECORD_LIMIT).is_ok_and(|held| held == wanted.as_bytes()) {
+        return Ok(());
+    }
+    files::replace_plain(&file, wanted.as_bytes()).map_err(|failure| AlternatesFailure::Write { path: file, failure })
+}
+
+/// How a run runs git ([`Git`]), with the Windows box's safety options before every step's words: its hooks read from
+/// `<Lock>/hooks`, which cannot exist as the lock is a file; no file-system monitor; no attributes file but the tree's
+/// own, nor the system's; and an LFS store below the lock, which cannot be made. Its standard error is forwarded to the
+/// client line by line as git says it, and its standard output kept for the caller, up to [`GIT_OUTPUT_CAP`]. A step
+/// is bounded as the Windows box bounds it ([`step_limit`]); past its bound, or when a forward fails, its group is
+/// asked to end with `SIGTERM` and killed after [`END_GRACE`], unless the step writes the shared bare repository.
+pub struct RunGit<'a, S: LineSink> {
+    git: Git<'a>,
+    options: [String; 8],
+    output: &'a Output<S>,
+}
+
+/// What a run's git step does with git's standard error and with a client gone.
+#[derive(Clone, Copy)]
+struct Mode {
+    /// Whether git's standard error is forwarded; else it is read and dropped.
+    forward: bool,
+    /// Whether a failed forward ends git, and a client already gone keeps it from starting.
+    ends_on_gone: bool,
+}
+
+impl<'a, S: LineSink> RunGit<'a, S> {
+    /// The run's git `git`, the run holding the work lock `lock`, its lines said through `output`.
+    #[must_use]
+    pub fn new(git: Git<'a>, lock: &str, output: &'a Output<S>) -> RunGit<'a, S> {
+        let options = [
+            "-c".to_owned(),
+            format!("core.hooksPath={lock}/hooks"),
+            "-c".to_owned(),
+            "core.fsmonitor=false".to_owned(),
+            "-c".to_owned(),
+            "core.attributesFile=".to_owned(),
+            "-c".to_owned(),
+            format!("lfs.storage={lock}/lfs"),
+        ];
+        RunGit { git, options, output }
+    }
+
+    /// The safety options, then `args`.
+    fn args<'s>(&'s self, args: &[&'s str]) -> Vec<&'s str> {
+        self.options.iter().map(String::as_str).chain(args.iter().copied()).collect()
+    }
+
+    /// Runs the step `step` with `args`, its standard error forwarded.
+    ///
+    /// # Errors
+    ///
+    /// The failure of a git that did not run to an exit, or a client gone.
+    pub fn forwarded(&self, step: &str, args: &[&str]) -> Result<Ran, Failed> {
+        self.ran_as(
+            step,
+            args,
+            Mode {
+                forward: true,
+                ends_on_gone: true,
+            },
+        )
+    }
+
+    /// Runs the step `step` with `args`, its standard error dropped, as the Windows box drops `cat-file`'s.
+    ///
+    /// # Errors
+    ///
+    /// The failure of a git that did not run to an exit.
+    pub fn quiet(&self, step: &str, args: &[&str]) -> Result<Ran, Failed> {
+        self.ran_as(
+            step,
+            args,
+            Mode {
+                forward: false,
+                ends_on_gone: true,
+            },
+        )
+    }
+
+    /// Runs the step `step`, which writes the shared bare repository, with `args`, its standard error forwarded: a
+    /// client gone neither keeps it from starting nor cuts it short, so the bare repository is never left half
+    /// written, though the step still fails with [`client_gone`].
+    ///
+    /// # Errors
+    ///
+    /// The failure of a git that did not run to an exit or exited non-zero, or a client gone.
+    pub fn bare_step(&self, step: &str, args: &[&str]) -> Result<(), Failed> {
+        let mode = Mode {
+            forward: true,
+            ends_on_gone: false,
+        };
+        let ran = self.ran_as(step, args, mode)?;
+        if ran.status.success() {
+            Ok(())
+        } else {
+            Err(exit_failed(step, ran.status))
+        }
+    }
+
+    /// Runs the step `step` with `args` as `mode` says, to its exit or its bound. A forward that fails, a broken pipe
+    /// or any other failure, is a client gone.
+    fn ran_as(&self, step: &str, args: &[&str], mode: Mode) -> Result<Ran, Failed> {
+        if mode.ends_on_gone && self.output.client_gone() {
+            return Err(client_gone(step));
+        }
+        let mut command = self.git.command(&self.args(args));
+        command.env(NO_SYSTEM_ATTRIBUTES, "1");
+        let limit = step_limit(step);
+        let mut gone = false;
+        let mut take = |line: &[u8]| {
+            let forwarded = self.output.say(Stream::Err, &String::from_utf8_lossy(line)).is_ok();
+            gone |= !forwarded;
+            forwarded
+        };
+        let stderr = if mode.forward {
+            Stderr::Lines {
+                take: &mut take,
+                end: mode.ends_on_gone,
+            }
+        } else {
+            Stderr::Tail
+        };
+        let ran = run_watched(command, GIT_OUTPUT_CAP, Instant::now() + limit, stderr, Ending::TermThenKill(END_GRACE));
+        if gone {
+            return Err(client_gone(step));
+        }
+        ran.map_err(|not| {
+            let why = match not {
+                NotRan::Start(error) => error.to_string(),
+                NotRan::TimedOut { .. } => late_git_line(limit),
+                NotRan::OverCap => format!("it printed more than {GIT_OUTPUT_CAP} bytes"),
+                NotRan::Failed(why) => why,
+            };
+            Failed::line(step_unran(step, &why))
+        })
+    }
+}
+
+impl<S: LineSink> Steps for RunGit<'_, S> {
+    fn ran(&self, step: &str, args: &[&str]) -> Result<Ran, Failed> {
+        self.forwarded(step, args)
+    }
+
+    fn failed(&self, step: &str, ran: &Ran) -> Failed {
+        exit_failed(step, ran.status)
+    }
+}
+
+/// The bound of the run's git step `step`, as the Windows box bounds it: [`GIT_LONG_LIMIT`] for a step that moves
+/// content, `fetch`, `checkout` and `clean`, else [`GIT_SHORT_LIMIT`]; a test's own bound in place of both when it set
+/// one.
+fn step_limit(step: &str) -> Duration {
+    if let Some(limit) = test_limit::get() {
+        return limit;
+    }
+    if matches!(step, "fetch" | "checkout" | "clean") {
+        GIT_LONG_LIMIT
+    } else {
+        GIT_SHORT_LIMIT
+    }
+}
+
+/// A bound a test sets for every run git step on its own thread, so it proves a bound in seconds.
+#[cfg(test)]
+pub mod test_limit {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    thread_local! {
+        static LIMIT: Cell<Option<Duration>> = const { Cell::new(None) };
+    }
+
+    /// Sets the bound of every run git step this thread runs from now on.
+    pub fn set(limit: Duration) {
+        LIMIT.with(|cell| cell.set(Some(limit)));
+    }
+
+    /// The bound this thread set, if any.
+    pub fn get() -> Option<Duration> {
+        LIMIT.with(Cell::get)
+    }
+}
+
+/// No test bound outside the tests.
+#[cfg(not(test))]
+mod test_limit {
+    use std::time::Duration;
+
+    /// None.
+    pub fn get() -> Option<Duration> {
+        None
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test whose temp folder cannot be made must fail loudly")]
+mod tests {
+    use std::fs;
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    use super::{CLOSED_STATUS, GIT_OUTPUT_CAP, Git, RunGit, Steps, test_limit};
+    use crate::console::{FailingSink, LineSink, Output, RecordingSink, Stream};
+
+    /// A test's hang guard: far past what a step the case ends early takes, far short of the sleep it ends.
+    const ENDED_WELL_BEFORE: Duration = Duration::from_secs(20);
+
+    /// A temp folder of the case `name`, private to this process, removed when the case ends.
+    struct Case {
+        base: PathBuf,
+    }
+
+    impl Case {
+        fn new(name: &str) -> Case {
+            let base = std::env::temp_dir().join(format!("gate-box-unix-git-{}-{name}", std::process::id()));
+            if base.exists() {
+                fs::remove_dir_all(&base).expect("a stale case folder is removed");
+            }
+            fs::create_dir_all(base.join("work")).expect("the case folder is made");
+            Case { base }
+        }
+
+        fn root(&self) -> &str {
+            self.base.to_str().expect("the temp folder is UTF-8")
+        }
+
+        fn parent(&self) -> PathBuf {
+            self.base.join("work")
+        }
+
+        fn lock(&self) -> String {
+            format!("{}/k.lock", self.parent().display())
+        }
+
+        /// Runs `check` with the run's git of this case writing to `output`.
+        fn with_git<S: LineSink>(&self, output: &Output<S>, check: impl FnOnce(&RunGit<'_, S>)) {
+            let parent = self.parent();
+            let lock = self.lock();
+            check(&RunGit::new(Git::of(self.root(), Path::new(&parent)), &lock, output));
+        }
+    }
+
+    impl Drop for Case {
+        fn drop(&mut self) {
+            // Best effort: a folder left behind is in the temp folder and named for this process.
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    /// The words running the shell `script` as the git alias `x`.
+    fn alias(script: &str) -> [String; 3] {
+        ["-c".to_owned(), format!("alias.x=!{script}"), "x".to_owned()]
+    }
+
+    fn words(owned: &[String]) -> Vec<&str> {
+        owned.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn a_run_step_forwards_each_line_git_says_on_stderr_and_fails_with_git_s_status() {
+        let case = Case::new("forward");
+        let output = Output::new(RecordingSink::default());
+        case.with_git(&output, |git| {
+            let failed = git
+                .step("rev-parse", &["rev-parse", "--verify", "nope"])
+                .expect_err("no repository is found");
+            assert_eq!(failed.lines, ["gate: remote rev-parse failed (status 128)"]);
+            assert_eq!(failed.status, 128);
+        });
+        let said = output.sink().lines();
+        assert!(!said.is_empty(), "git's own error is forwarded");
+        assert!(said.iter().all(|(stream, _)| *stream == Stream::Err), "{said:?}");
+        assert!(said.iter().all(|(_, line)| !line.ends_with('\n')), "{said:?}");
+    }
+
+    #[test]
+    fn a_forwarded_line_is_handed_on_unescaped() {
+        let case = Case::new("unescaped");
+        let output = Output::new(RecordingSink::default());
+        let script = alias(r"printf 'a\033[1mb\tc\n' >&2");
+        case.with_git(&output, |git| {
+            git.step("x", &words(&script)).expect("the alias runs");
+        });
+        assert_eq!(output.sink().lines(), [(Stream::Err, "a\u{1b}[1mb\tc".to_owned())]);
+    }
+
+    #[test]
+    fn a_run_step_whose_forward_finds_the_client_gone_is_ended_at_once_with_the_closed_status() {
+        let case = Case::new("gone");
+        let output = Output::new(FailingSink::new(io::ErrorKind::BrokenPipe));
+        let script = alias("echo a >&2; sleep 60");
+        case.with_git(&output, |git| {
+            let started = Instant::now();
+            let failed = git.forwarded("fetch", &words(&script)).expect_err("the client is gone");
+            assert!(started.elapsed() < ENDED_WELL_BEFORE, "the step is ended, not waited for");
+            assert_eq!(failed.lines, ["gate: remote the client closed the connection during git fetch"]);
+            assert_eq!(failed.status, CLOSED_STATUS);
+
+            let again = git.forwarded("git init", &["--version"]).expect_err("a gone client starts no more steps");
+            assert_eq!(again.lines, ["gate: remote the client closed the connection during git init"]);
+        });
+    }
+
+    #[test]
+    fn a_forward_that_fails_otherwise_ends_the_step_as_a_gone_client_does() {
+        let case = Case::new("failed-forward");
+        let output = Output::new(FailingSink::new(io::ErrorKind::Other));
+        let script = alias("echo a >&2; sleep 60");
+        case.with_git(&output, |git| {
+            let started = Instant::now();
+            let failed = git.forwarded("clean", &words(&script)).expect_err("the forward failed");
+            assert!(started.elapsed() < ENDED_WELL_BEFORE, "the step is ended, not waited for");
+            assert_eq!(failed.status, CLOSED_STATUS);
+        });
+    }
+
+    #[test]
+    fn a_bare_step_runs_to_its_end_though_the_client_is_gone() {
+        let case = Case::new("bare-gone");
+        let output = Output::new(FailingSink::new(io::ErrorKind::BrokenPipe));
+        let marker = case.base.join("finished");
+        let script = alias(&format!("echo a >&2; sleep 1; touch '{}'", marker.display()));
+        case.with_git(&output, |git| {
+            let failed = git.bare_step("back ref reset", &words(&script)).expect_err("the client is gone");
+            assert_eq!(failed.status, CLOSED_STATUS);
+            assert!(marker.exists(), "the step was not cut short");
+            let again = git.bare_step("back ref reset", &words(&script)).expect_err("the client is still gone");
+            assert_eq!(again.status, CLOSED_STATUS, "a bare step still starts");
+        });
+    }
+
+    #[test]
+    fn a_step_past_its_bound_is_ended_with_the_windows_box_s_line() {
+        let case = Case::new("bound");
+        let output = Output::new(RecordingSink::default());
+        let script = alias("sleep 60");
+        test_limit::set(Duration::from_millis(500));
+        case.with_git(&output, |git| {
+            let started = Instant::now();
+            let failed = git.forwarded("fetch", &words(&script)).expect_err("the step is past its bound");
+            assert!(started.elapsed() < ENDED_WELL_BEFORE, "the step is ended at its bound");
+            assert_eq!(failed.lines, ["gate: remote fetch failed: git did not answer within 500 ms"]);
+            assert_eq!(failed.status, 1);
+        });
+    }
+
+    #[test]
+    fn standard_output_past_one_mib_fails_the_step_and_one_mib_fits() {
+        let case = Case::new("stdout-cap");
+        let output = Output::new(RecordingSink::default());
+        let over = alias(&format!("head -c {} /dev/zero", GIT_OUTPUT_CAP + 1));
+        let fits = alias(&format!("head -c {GIT_OUTPUT_CAP} /dev/zero"));
+        case.with_git(&output, |git| {
+            let failed = git.forwarded("x", &words(&over)).expect_err("the output is over the cap");
+            assert_eq!(failed.lines, ["gate: remote x failed: it printed more than 1048576 bytes"]);
+            let ran = git.forwarded("x", &words(&fits)).expect("exactly the cap fits");
+            assert_eq!(ran.stdout.len(), GIT_OUTPUT_CAP);
+        });
+    }
+
+    #[test]
+    fn a_quiet_run_step_says_nothing_of_git_s_stderr() {
+        let case = Case::new("quiet");
+        let output = Output::new(RecordingSink::default());
+        case.with_git(&output, |git| {
+            let ran = git.quiet("cat-file", &["rev-parse", "--verify", "nope"]).expect("git runs to its exit");
+            assert!(!ran.status.success());
+        });
+        assert!(output.sink().lines().is_empty(), "{:?}", output.sink().lines());
+    }
+
+    #[test]
+    fn a_run_step_carries_the_windows_box_s_safety_options() {
+        let case = Case::new("options");
+        let output = Output::new(RecordingSink::default());
+        let lock = case.lock();
+        case.with_git(&output, |git| {
+            for (key, value) in [
+                ("core.hooksPath", format!("{lock}/hooks")),
+                ("core.fsmonitor", "false".to_owned()),
+                ("core.attributesFile", String::new()),
+                ("lfs.storage", format!("{lock}/lfs")),
+            ] {
+                let said = git.step("git config", &["config", key]).expect("the option is set");
+                assert_eq!(String::from_utf8_lossy(&said).trim_end(), value, "{key}");
+            }
+            let said = git.step("x", &words(&alias("printf %s \"$GIT_ATTR_NOSYSTEM\""))).expect("the alias runs");
+            assert_eq!(said, b"1");
+        });
+    }
+}

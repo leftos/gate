@@ -57,7 +57,7 @@ pub fn stop(payload: &Payload, console: &mut Console) -> u8 {
 /// judges them and making nothing: `true` when the root is trusted ([`root_flaw`]) and `parent` is the box user's own
 /// plain folder, `false` when either is missing, so no run of this builder recorded a job there. Else the line refusing
 /// it and the status: the work-root line, [`ROOT_STATUS`], or the folder's line, [`FAILED_STATUS`].
-fn records_folder(root: &str, parent: &Path) -> Result<bool, (String, u8)> {
+pub(crate) fn records_folder(root: &str, parent: &Path) -> Result<bool, (String, u8)> {
     let facts = match files::facts(Path::new(root)) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err((root_unsafe_line(&format!("cannot read {root}: {error}")), ROOT_STATUS)),
