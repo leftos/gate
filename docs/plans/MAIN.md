@@ -8,15 +8,13 @@
 - [/] GATE-609 Try the next capable builder before falling back to the PC — Urgent · Remote
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [/] GATE-607 Unix gate box: version, preflight, boot, run, stop — Urgent · Remote
-- [ ] GATE-608 Install the Unix box on a macOS builder: gate push builds it there, plus a Mac setup script — Urgent · Remote
+- [/] GATE-608 Install the Unix box on a macOS builder: gate push builds it there, plus a Mac setup script — Urgent · Remote
 - [ ] GATE-592 Set up the Mac builder and time the portable .NET repos on it by hand — Urgent · Remote
-- [!] GATE-558 Find why the LFS back-commit sync-back case exits -1 under load — Urgent · Remote
 - [/] GATE-631 Make box_run_a_node_modules_junction_installs_again hold under a loaded parallel run — Urgent · Remote
 - [ ] GATE-637 Find why freshly built exes start in ~14 s on the builder (on-access scanning?) — Urgent · Remote
 - [ ] GATE-162 Suite: make the remaining timer-raced interrupt and remote-client git cases load-proof — Urgent · Backlog
 - [ ] GATE-255 Suite: three cases ended with exit 1 and no output mid-run, and a box-kill case failed under load — Urgent · Backlog
 - [ ] GATE-366 Find why a between-two-fetches outputs case hung its last run on a busy PC — Urgent · Backlog
-- [!] GATE-550 Find why remote_client's deduplicated-archive case aborts with no output under load — Urgent · Backlog
 - [ ] GATE-551 Find why a lent auto run misses its seeded history under load — Urgent · Backlog
 - [ ] GATE-641 Keep a first launch of freshly built binaries from looking stalled while a scanner loads them — High · Local gate
 - [ ] GATE-616 Move the box's shared wire rules into gate-wire so both boxes say the same bytes — High · Remote
@@ -42,7 +40,14 @@
 - [ ] GATE-643 Say why a routed command naming a project under .tmp cannot route, and check --no-build after a routed build — High · Remote
 - [ ] GATE-647 Find whether the shared snapshot ref gives a second builder a wrong bridge base; key it per builder if so — High · Remote
 - [ ] GATE-649 Bring back every test project's output a routed dotnet test build made — High · Remote
+- [ ] GATE-650 Fall back when a builder's box program is missing (ssh status 126/127) — High · Remote
+- [ ] GATE-653 Route towercab-3d's cargo commands: the snapshot lacks its gitignored dist/ and converter exe — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
+
+## Local gate
+
+- [ ] GATE-651 Resolve a relative --log against the --cd folder
+- [ ] GATE-652 Refuse a gate.exe built with its test seams at install
 
 ## Remote
 
