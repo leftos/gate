@@ -5,6 +5,7 @@
 use std::fs;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
@@ -157,39 +158,98 @@ fn box_warm_up_deletes_an_old_warm_before_its_first_command() {
     wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 
-#[test]
-fn box_warm_up_shares_one_budget_across_its_commands() {
-    let case = Case::new("box_warm_up_one_budget");
-    let mut payload = warm_payload(&case, &[&[FAKE_TOOL, "sleep", "1500"], ENDLESS]);
-    payload["Timeout"] = json!(3);
-    payload["Host"] = json!("builder");
-    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+/// How long the case below goes on with fresh warm-ups while each one's first command counted less than a second of
+/// the budget, which leaves the second the whole of it and so shows nothing of the sharing: a hang guard a passing
+/// run never reaches.
+const ONE_BUDGET_GUARD: Duration = Duration::from_secs(300);
 
-    // The whole machine free, so the clock runs with wall time however loaded the machine running the case is.
-    let outcome = run_box_with_seams(&case, &payload, &["--test-box-sample-ms", "20", "--test-box-free-percent", "100"]);
-
-    assert_eq!(outcome.code, Some(124), "{outcome:?}");
-    let ran_out = "gate: remote warm-up ran out of its 3 s budget before command 2 of 2";
+/// The ceilings, in whole seconds, the kill lines of `outcome` name, in order.
+fn killed_after(outcome: &Outcome) -> Vec<u64> {
     let kill = Regex::new(r"^gate: TIMED OUT on builder after (\d+) s of load-adjusted time").expect("the pattern compiles");
-    let killed_after: Vec<u64> = outcome
+    outcome
         .stderr
         .lines()
         .filter_map(|line| kill.captures(line).map(|captures| captures[1].parse().expect("the seconds are a number")))
-        .collect();
-    if outcome.stderr.lines().any(|line| line == ran_out) {
-        // A machine slow enough that the first command spent the whole budget: the second never started.
-        assert!(killed_after.is_empty(), "{outcome:?}");
-    } else {
-        assert_eq!(killed_after.len(), 1, "one kill: {outcome:?}");
-        assert!(killed_after[0] < 3, "the second command's ceiling is what the first left: {outcome:?}");
-        assert_eq!(
-            lines_starting(&outcome, "gate: remote warm-up "),
-            ["gate: remote warm-up stopped at command 2 of 2"],
-            "{outcome:?}"
+        .collect()
+}
+
+/// The load-adjusted seconds each command of `payload`'s run counted, as its adjusted lines in `outcome` say, in order.
+fn adjusted_each(outcome: &Outcome, payload: &Value) -> Vec<f64> {
+    let adjusted = super::adjusted_pattern(payload);
+    outcome
+        .stderr
+        .lines()
+        .filter_map(|line| {
+            adjusted
+                .captures(line)
+                .map(|captures| captures[1].parse().expect("the seconds are a number"))
+        })
+        .collect()
+}
+
+/// The box gives each warm-up command what the earlier ones left of the budget, and says it in the kill line as that
+/// command's ceiling; what the first command counted is its adjusted line. A machine so slow that the first command
+/// spent the whole budget (killed at the full 3 s ceiling, or charged it all) never starts the second, which the case
+/// accepts. A first command that counted under a second leaves the second the whole budget, sharing or not, so such a
+/// run is followed by a fresh one, up to the hang guard.
+#[test]
+fn box_warm_up_shares_one_budget_across_its_commands() {
+    let guard = Instant::now() + ONE_BUDGET_GUARD;
+    loop {
+        let case = Case::new("box_warm_up_one_budget");
+        let mut payload = warm_payload(&case, &[&[FAKE_TOOL, "sleep", "1500"], ENDLESS]);
+        payload["Timeout"] = json!(3);
+        payload["Host"] = json!("builder");
+        snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+
+        // The whole machine free, so the clock runs with wall time however loaded the machine running the case is.
+        let outcome = run_box_with_seams(&case, &payload, &["--test-box-sample-ms", "20", "--test-box-free-percent", "100"]);
+        wait_until_closed(Path::new(field(&payload, "Lock")));
+
+        assert_eq!(outcome.code, Some(124), "{outcome:?}");
+        not_warm(&outcome, &payload);
+        let killed = killed_after(&outcome);
+        let stopped = lines_starting(&outcome, "gate: remote warm-up ");
+        if stopped == ["gate: remote warm-up stopped at command 1 of 2"] {
+            assert_eq!(killed, [3], "the first command's ceiling is the whole budget: {outcome:?}");
+            assert!(
+                !outcome.stderr.lines().any(|line| line == "started"),
+                "the second never started: {outcome:?}"
+            );
+            return;
+        }
+        if stopped == ["gate: remote warm-up ran out of its 3 s budget before command 2 of 2"] {
+            assert!(killed.is_empty(), "the first command was charged the whole budget: {outcome:?}");
+            assert!(
+                !outcome.stderr.lines().any(|line| line == "started"),
+                "the second never started: {outcome:?}"
+            );
+            return;
+        }
+        assert_eq!(stopped, ["gate: remote warm-up stopped at command 2 of 2"], "{outcome:?}");
+        assert_eq!(killed.len(), 1, "one kill: {outcome:?}");
+        let adjusted = adjusted_each(&outcome, &payload);
+        assert_eq!(adjusted.len(), 2, "an adjusted line for each command: {outcome:?}");
+        let first = adjusted.first().copied().expect("the first command's adjusted line");
+        // What the first left, rounded up as the box rounds it, the said seconds' last decimal given its benefit.
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the remainder of a 3 s budget ceils to a whole number at most 4, and a negative one saturates to 0, which the assert rejects"
+        )]
+        let left = (3.0 - (first - 0.0005)).ceil() as u64;
+        assert!(
+            (1..=left).contains(&killed[0]),
+            "the second command's ceiling is at most what the first left of the budget: {outcome:?}"
+        );
+        if left < 3 {
+            return;
+        }
+        assert!(
+            Instant::now() < guard,
+            "every first command counted under a second of the budget, until the hang guard: {outcome:?}"
         );
     }
-    not_warm(&outcome, &payload);
-    wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 
 #[test]

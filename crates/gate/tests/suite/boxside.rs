@@ -7439,17 +7439,31 @@ fn box_run_a_node_modules_junction_installs_again() {
     let case = Case::new("box_run_pnpm_node_modules_junction");
     let payload = pnpm_payload(&case, &[]);
     let path = path_for_pnpm(&[stub_pnpm(&case, 0, "")]);
-    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+    let first = pnpm_box(&case, &payload, &path).finish();
+    assert_eq!(first.code, Some(0), "the first run, which lays node_modules out: {first:?}");
+    wait_until_closed(Path::new(field(&payload, "Lock")));
     let node_modules = Path::new(field(&payload, "Work")).join("node_modules");
     fs::remove_dir_all(&node_modules).expect("node_modules can be removed");
     let elsewhere = case.folder().join("elsewhere");
     fs::create_dir_all(&elsewhere).expect("the junction's target can be made");
     junction(&node_modules, &elsewhere);
 
-    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+    let renamed_payload = renamed(&payload, 1);
+    let second = pnpm_box(&case, &renamed_payload, &path).finish();
 
-    assert_eq!(second.code, Some(0), "{second:?}");
-    assert_eq!(installs(&case), 2, "a junction is no node_modules: {second:?}");
+    assert_eq!(
+        second.code,
+        Some(0),
+        "the second run, over the junction: {second:?}; the calls the stub saw: {:?}; the first run: {first:?}",
+        pnpm_calls(&case)
+    );
+    assert_eq!(
+        installs(&case),
+        2,
+        "a junction is no node_modules: {second:?}; the calls the stub saw: {:?}",
+        pnpm_calls(&case)
+    );
+    wait_until_closed(Path::new(field(&renamed_payload, "Lock")));
 }
 
 #[test]
@@ -8036,10 +8050,15 @@ fn lines_starting<'a>(outcome: &'a Outcome, prefix: &str) -> Vec<&'a str> {
     outcome.stderr.lines().filter(|line| line.starts_with(prefix)).collect()
 }
 
+/// The pattern of the `gate-remote-adjusted:` line that names the nonce of `payload` and has three decimals.
+fn adjusted_pattern(payload: &Value) -> Regex {
+    Regex::new(&format!(r"^gate-remote-adjusted: {} (\d+\.\d{{3}})$", field(payload, "Nonce"))).expect("the pattern compiles")
+}
+
 /// The seconds of the one `gate-remote-adjusted:` line in `outcome`'s stderr, which names the nonce of `payload` and
 /// has three decimals.
 fn adjusted_seconds(outcome: &Outcome, payload: &Value) -> f64 {
-    let adjusted = Regex::new(&format!(r"^gate-remote-adjusted: {} (\d+\.\d{{3}})$", field(payload, "Nonce"))).expect("the pattern compiles");
+    let adjusted = adjusted_pattern(payload);
     let lines = lines_starting(outcome, "gate-remote-adjusted:");
     assert_eq!(lines.len(), 1, "one adjusted line: {outcome:?}");
     assert!(adjusted.is_match(lines[0]), "this run's adjusted line, of three decimals: {outcome:?}");
@@ -8836,23 +8855,49 @@ fn a_box_run_that_ends_by_itself_says_its_load_adjusted_seconds() {
     );
 }
 
+/// How long the case below goes on with fresh runs while the box's 1 s ceiling kills each command before it wrote its
+/// output: a hang guard a passing run never reaches.
+const WRITTEN_BEFORE_THE_KILL_GUARD: Duration = Duration::from_secs(300);
+
+/// A box run whose command writes `drained` on stderr, then marks a file, then sleeps past its 1 s ceiling, the kill
+/// said to leave a process: its payload and outcome, from the first run whose command marked the file, so the output
+/// was in the pipe before the kill. A command starved past its ceiling before it wrote is killed with nothing to drain,
+/// which proves nothing of the drain, so such a run is followed by a fresh one, up to the hang guard. A run that was
+/// not the ceiling kill this case expects is returned at once, so the caller's asserts fail with its own output.
+fn killed_after_its_output() -> (Value, Outcome) {
+    let guard = Instant::now() + WRITTEN_BEFORE_THE_KILL_GUARD;
+    let kill = Regex::new(r"^gate: TIMED OUT on builder after 1 s of load-adjusted time ").expect("the pattern compiles");
+    loop {
+        let case = Case::new("box_run_ceiling_kill_leaves");
+        let written = case.folder().join("written");
+        let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "err", "drained", "mark", &shown(&written), "sleep", "600000"]);
+        payload["Timeout"] = json!(1);
+        payload["Host"] = json!("builder");
+        snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+        let seams = [
+            "--test-box-sample-ms",
+            "20",
+            "--test-box-free-percent",
+            "100",
+            "--test-box-kill-leaves",
+            "1",
+        ];
+        let outcome = run_box_with_seams(&case, &payload, &seams);
+        wait_until_closed(Path::new(field(&payload, "Lock")));
+        let was_the_kill = outcome.code == Some(124) && outcome.stderr.lines().any(|line| kill.is_match(line));
+        if !was_the_kill || written.exists() {
+            return (payload, outcome);
+        }
+        assert!(
+            Instant::now() < guard,
+            "every command was killed before it wrote its output, until the hang guard: {outcome:?}"
+        );
+    }
+}
+
 #[test]
 fn a_box_kill_that_leaves_a_process_says_a_note_then_still_the_kill_line_and_tag_and_124() {
-    let case = Case::new("box_run_ceiling_kill_leaves");
-    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "err", "drained", "sleep", "600000"]);
-    payload["Timeout"] = json!(1);
-    payload["Host"] = json!("builder");
-    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
-
-    let seams = [
-        "--test-box-sample-ms",
-        "20",
-        "--test-box-free-percent",
-        "100",
-        "--test-box-kill-leaves",
-        "1",
-    ];
-    let outcome = run_box_with_seams(&case, &payload, &seams);
+    let (payload, outcome) = killed_after_its_output();
 
     assert_eq!(outcome.code, Some(124), "a kill whatever its ending left: {outcome:?}");
     let note = Regex::new(r"^gate: note: the box's ceiling kill left 1 process\(es\) running in job \S+$").expect("the pattern compiles");
@@ -8875,7 +8920,6 @@ fn a_box_kill_that_leaves_a_process_says_a_note_then_still_the_kill_line_and_tag
         Some(format!("gate-remote-killed: {} timed-out", field(&payload, "Nonce")).as_str()),
         "the kill tag right after the kill line: {outcome:?}"
     );
-    wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 
 /// The test seam that starts a stand-in in place of Git's MSYS keeper: its program, then each of its words, separated by

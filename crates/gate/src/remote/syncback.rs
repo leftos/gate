@@ -2058,7 +2058,7 @@ mod tests {
     use std::fs::{File, FileTimes, OpenOptions};
     use std::os::windows::fs::{FileTimesExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
 
     use gate_state::StateRoot;
     use gate_win32::Interrupt;
@@ -2068,7 +2068,7 @@ mod tests {
         ATTRIBUTE_ROOM, ATTRIBUTES, Attributes, AutoCrlf, Back, BackCommit, FETCH_WORDS, LineEnds, Quarantine, Remote, Synced, Target, Worktree,
         advertised, after_keep, alternates, attribute_slices, auto_crlf, converts_to_crlf, entries, fetch, filtered, forbidden, from_snapshot,
         has_back, ignored_line, incoming_name, incoming_owner, listed_paths, move_plan, names_odd_driver, not_applied_line, read_attributes, receive,
-        refused_end, see_diff, swept, sync_back, synced_line, total, touched_line, unmoved_line, weight, written_blobs, written_line,
+        refused_end, see_diff, swept, sync_back, synced_line, total, touched_line, tree_removed, unmoved_line, weight, written_blobs, written_line,
     };
     use crate::remote::RemoteCall;
     use crate::remote::client::{Attempt, End};
@@ -3190,6 +3190,9 @@ mod tests {
     const PAIR: [&str; 2] = ["app", "lib"];
     /// The ref every pair test's kept back commits live at.
     const KEPT: &str = "refs/gate-remote/app-1a2b3c4d-back";
+    /// How long a pair test's cleanup waits for the processes it started to let go of the pair's files: a hang guard a
+    /// passing run never reaches.
+    const PAIR_REMOVAL_GUARD: Duration = Duration::from_secs(300);
     /// How a pair test's back commits are said to be kept.
     const KEPT_PAIR: &str = "; the changes are kept: see git diff in each repo at refs/gate-remote/app-1a2b3c4d-back";
 
@@ -3321,8 +3324,11 @@ mod tests {
                 .count()
         }
 
+        /// Removes the pair's folder and log. A git process the case started (a fetch stopped at its cap, the builder's
+        /// upload-pack beside it) may still be ending and hold a file of the folder open, so the removal is tried again
+        /// while one is held, up to a hang guard of minutes.
         fn remove(self) {
-            std::fs::remove_dir_all(&self.folder).expect("the pair can be removed");
+            tree_removed(&self.folder, Instant::now() + PAIR_REMOVAL_GUARD, &mut || {}).expect("the pair can be removed");
             if self.log.exists() {
                 std::fs::remove_file(&self.log).expect("the log can be removed");
             }
