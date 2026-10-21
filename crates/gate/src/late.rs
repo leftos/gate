@@ -390,6 +390,7 @@ mod tests {
                     marker: format!("heavy:{parent_pid}:{start_ms}"),
                     unjudged: None,
                     stand_in: false,
+                    commit: false,
                 },
             }
         }

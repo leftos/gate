@@ -34,19 +34,20 @@ use serde_json::{Map, Value};
 
 use crate::acquire;
 use crate::answer::USAGE_STATUS;
+use crate::commit;
 use crate::console::Console;
 use crate::covered::Covered;
 use crate::durations::{
     Resolved, RunDurations, RunIdentity, Usual, ceiling_hint, expected_field, expected_line, raised_ceiling_line, resolve_ceiling, span_text,
 };
-use crate::environment::{self, BOX_JOB_VARIABLE, SLOT_HELD_VARIABLE, Variables};
+use crate::environment::{self, BOX_JOB_VARIABLE, COMMIT_SLOT_VARIABLE, SLOT_HELD_VARIABLE, Variables};
 use crate::escaped::{self, Found, Reach, Reached, Recorded};
 use crate::journal::{self, RunJournal};
 use crate::late::{Late, LateOf, LateSlot};
 use crate::load::{self, Measuring, When};
 use crate::log::Log;
 use crate::machine::{self, Machine, MachineWait, MachineWaited};
-use crate::nesting::{Nesting, Parent, enclosing_of};
+use crate::nesting::{Nesting, Parent, covers, enclosing_of};
 use crate::no_build::{self, NothingBack, Unfound, Worktree};
 use crate::outputs::{stale, walk::walk};
 use crate::remote::{self, KEY_WAIT_SLICE, KeyWait, RemoteCall, RemoteClient, RemoteOutcome, Split, git};
@@ -91,8 +92,8 @@ const KEY_WAIT: Duration = Duration::from_secs(90);
 /// The status is the command's own whole 32-bit code, 1 for a failure marker in its log or a failure of the gate after
 /// it started, 124 for a command killed as stalled, timed out or past the backstop, 127 when it could not be started,
 /// 0xC000013A for a Ctrl+C in the queue, before the command started, or with the command still running 5 s after it,
-/// or 2 for a log inside the state root, a critical gate under a heavy or light parent's slot or a batch word refused
-/// before anything was queued.
+/// or 2 for a log inside the state root, a critical gate under a heavy or light parent's slot, a critical or `--alone`
+/// gate inside a commit run's hooks or a batch word refused before anything was queued.
 pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: &Environment, console: &mut Console) -> u32 {
     let (nesting, asked) = match admitted(request, log, root, environment, console) {
         Ok(admitted) => admitted,
@@ -134,6 +135,8 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
     }
     // The request and nesting of a run here that dropped its `--no-build` and asks for a heavy slot.
     let mut heavy = None;
+    // The nesting a gate a commit run's slot covers routes under, beside that run.
+    let mut beside = None;
     let mut run = Run {
         request,
         root,
@@ -156,10 +159,13 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         late: None,
         durations: None,
         load_blocks: Vec::new(),
+        here_nesting: None,
+        heavy_store: Some(&mut heavy),
     };
     let (route, placed) = run.route(environment, console);
+    run.route_beside_commit(&route, &mut beside);
     let local = run.local_words(&route, placed.place(), console);
-    take_heavy(&mut run, &mut heavy, local.as_ref(), console);
+    take_heavy(&mut run, local.as_ref(), console);
     run.durations = run.open_durations(&placed);
     say_nesting(run.nesting, run.request, console);
     run.queue(&route, console);
@@ -204,11 +210,9 @@ fn host(console: &mut Console) -> Host {
     }
 }
 
-/// Has `run` take the request and nesting of a run here that asks for a heavy slot ([`Run::as_heavy`]), kept in
-/// `heavy`, when `local` dropped its `--no-build` ([`Run::local_words`]), and says the line saying so. Its journal
-/// lines, ticket and claim then name the heavy kind and the command it runs. A light parent whose slot no longer covers
-/// it is asked again whether it lends that slot before the run queues ([`Run::lend_again`]).
-fn take_heavy<'a>(run: &mut Run<'a>, heavy: &'a mut Option<(RunRequest, Nesting)>, local: Option<&HereWords>, console: &mut Console) {
+/// Has `run` run as a run here that asks for a heavy slot ([`Run::run_as_heavy`]) when `local` dropped its
+/// `--no-build` ([`Run::local_words`]), and says the line saying so.
+fn take_heavy(run: &mut Run<'_>, local: Option<&HereWords>, console: &mut Console) {
     let Some(HereWords {
         words,
         dropped: Some(reason),
@@ -217,20 +221,16 @@ fn take_heavy<'a>(run: &mut Run<'a>, heavy: &'a mut Option<(RunRequest, Nesting)
     else {
         return;
     };
-    let (request, nesting) = heavy.insert(run.as_heavy(words, console));
-    run.request = request;
-    run.nesting = nesting;
-    run.gate = run.gate.running(request);
-    run.journal = RunJournal::open(run.root, &run.gate);
-    run.lend_again(console);
+    run.run_as_heavy(words, console);
     console.err(&run.dropped_line(reason));
 }
 
 /// The nesting `request` runs under, or the status of a run refused before anything is taken or written, its lines
-/// said: a log inside the state root, a critical gate under a heavy or light parent's slot, or an `--alone` gate under
-/// a parent whose slot covers it or refuses it or inside a box run, which leaves an earlier log in place. Any other
-/// nesting's lines are said once the run knows the slot it asks for ([`say_nesting`]). With the nesting, `request` as
-/// the gate runs it: a critical gate inside a box run runs as heavy ([`Nesting::requested`]).
+/// said: a log inside the state root, or a gate its nesting refuses ([`refusal`]), which leaves an earlier log in
+/// place. Any other nesting's lines are said once the run knows the slot it asks for
+/// ([`say_nesting`]); a commit run asked for on no slot says [`commit::NO_SLOT_LINE`] now when it takes its light slot
+/// itself. With the nesting, `request` as the gate runs it: a commit run on no slot runs on a light one
+/// ([`commit::as_run`]), and a critical gate inside a box run runs as heavy ([`Nesting::requested`]).
 fn admitted<'r>(
     request: &'r RunRequest,
     log: &Path,
@@ -246,26 +246,47 @@ fn admitted<'r>(
         ));
         return Err(u32::from(USAGE_STATUS));
     }
+    let (request, no_slot_commit) = commit::as_run(request);
     let nesting = Nesting::read(environment, request.slot, root, request.test_seams.parent_job_trusted, console);
+    if let Some(status) = refusal(&nesting, &request, console) {
+        return Err(status);
+    }
+    if no_slot_commit && takes_own_slot(&nesting, false) {
+        console.err(commit::NO_SLOT_LINE);
+    }
+    let slot = nesting.requested(request.slot);
+    let request = if slot == request.slot {
+        request
+    } else {
+        Cow::Owned(RunRequest {
+            slot,
+            ..request.into_owned()
+        })
+    };
+    Ok((nesting, request))
+}
+
+/// The status of a gate of `request` the `nesting` it runs under refuses, its lines said: a critical or `--alone` gate
+/// inside a commit run's hooks; an `--alone` gate under a parent whose slot covers it or refuses it or inside a box run;
+/// and a critical gate under a heavy or light parent's slot. `None` for a gate it lets run.
+fn refusal(nesting: &Nesting, request: &RunRequest, console: &mut Console) -> Option<u32> {
+    if (request.slot == Slot::Critical || request.alone) && nesting.in_commit() {
+        console.err(commit::IN_COMMIT_LINE);
+        return Some(u32::from(USAGE_STATUS));
+    }
     if request.alone && matches!(nesting, Nesting::Covered(_) | Nesting::Refused(_) | Nesting::InBox) {
         let flag = match request.spelling {
             Spelling::Cli => "--alone",
             Spelling::Compat => "-Alone",
         };
         console.err(&format!("gate: {flag} cannot hold the machine alone from inside a gate's command"));
-        return Err(u32::from(USAGE_STATUS));
+        return Some(u32::from(USAGE_STATUS));
     }
     if matches!(nesting, Nesting::Refused(_)) {
-        say_nesting(&nesting, request, console);
-        return Err(u32::from(USAGE_STATUS));
+        say_nesting(nesting, request, console);
+        return Some(u32::from(USAGE_STATUS));
     }
-    let slot = nesting.requested(request.slot);
-    let request = if slot == request.slot {
-        Cow::Borrowed(request)
-    } else {
-        Cow::Owned(RunRequest { slot, ..request.clone() })
-    };
-    Ok((nesting, request))
+    None
 }
 
 /// Says the lines of the `nesting` a gate of `request` runs under, once it is final: the line of a marker whose binding
@@ -422,6 +443,17 @@ impl Plan {
             Nesting::InBox => variables.without(SLOT_HELD_VARIABLE),
             _ => variables.without(BOX_JOB_VARIABLE),
         };
+        // A commit run that hands on its own marker names it as a commit run's, so a gate in its hooks its slot covers
+        // still routes ([`Nesting::under_commit`]); a gate that commit covers hands that name on with its marker. Any
+        // other hands on no commit's name, so it never reaches a gate the named commit does not cover.
+        let hands_on_own = nesting.covering().is_none() && !matches!(nesting, Nesting::InBox);
+        let variables = if hands_on_own && gate.commit() {
+            variables.with(COMMIT_SLOT_VARIABLE, &marker)
+        } else if nesting.under_commit().is_some() {
+            variables
+        } else {
+            variables.without(COMMIT_SLOT_VARIABLE)
+        };
         let environment = variables
             .block()
             .map_err(|error| NotRun::failed(format!("gate: cannot build the command's environment: {error}")))?;
@@ -532,6 +564,12 @@ struct Run<'a> {
     root: &'a ResolvedRoot,
     /// The parent gate's slot the run is under, read once before it started.
     nesting: &'a Nesting,
+    /// The nesting read for a gate a commit run's slot covers while it routes beside that run, which it runs under
+    /// again once it falls back here ([`Run::route_beside_commit`]); `None` for every other run.
+    here_nesting: Option<&'a Nesting>,
+    /// Where the request and nesting of the run go once it drops its `--no-build` and asks for a heavy slot
+    /// ([`Run::run_as_heavy`]), which a run does at most once; `None` once it has.
+    heavy_store: Option<&'a mut Option<(RunRequest, Nesting)>>,
     gate: ThisGate,
     log: Log,
     journal: RunJournal,
@@ -867,6 +905,67 @@ struct Ended {
     facts: Option<RunFacts>,
 }
 
+impl<'a> Run<'a> {
+    /// Has a routed gate a commit run's slot covers route beside that run, its nesting kept in `beside`: it queues,
+    /// takes and releases a remote slot of its own as a gate under no covering parent does, its lines naming the commit
+    /// run as its parent. Once it falls back here it runs under the commit run's slot again
+    /// ([`Run::back_under_commit`]). Any other run is left as it is.
+    fn route_beside_commit(&mut self, route: &Route, beside: &'a mut Option<Nesting>) {
+        if !matches!(route, Route::Routed(_)) {
+            return;
+        }
+        let Some(parent) = self.nesting.under_commit() else {
+            return;
+        };
+        self.here_nesting = Some(self.nesting);
+        self.nesting = beside.insert(Nesting::Beside(parent.clone()));
+    }
+
+    /// Has the run take the request and nesting of a run here that runs `words` and asks for a heavy slot
+    /// ([`Run::as_heavy`]), kept in [`Run::heavy_store`]. Its journal lines, ticket and claim then name the heavy kind and
+    /// the command it runs. A light parent whose slot no longer covers it is asked again whether it lends that slot
+    /// before the run takes one ([`Run::lend_again`]).
+    ///
+    /// # Panics
+    ///
+    /// When the run already ran as heavy: a run drops its `--no-build` once, here from the start or after a fallback.
+    fn run_as_heavy(&mut self, words: &[String], console: &mut Console) {
+        #[expect(clippy::expect_used, reason = "a run drops its --no-build once, here from the start or after a fallback")]
+        let store = self.heavy_store.take().expect("a run runs as heavy at most once");
+        let (request, nesting) = store.insert(self.as_heavy(words, console));
+        self.request = request;
+        self.nesting = nesting;
+        self.gate = self.gate.running(request);
+        self.journal = RunJournal::open(self.root, &self.gate);
+        self.lend_again(console);
+    }
+
+    /// Puts a gate that routed beside a commit run ([`Run::route_beside_commit`]) back under that run's slot as it falls
+    /// back here, with no durations, which it opened for its run on the builder. One that drops its `--no-build`
+    /// (`dropped` holds the words it runs) where the commit's slot does not cover a heavy gate runs as heavy
+    /// ([`Run::run_as_heavy`]), as such a run here from the start does. One the commit's slot then covers says and
+    /// journals its cover now, before its plan, so its journal ends whatever comes next. Any other run is left as it is.
+    fn back_under_commit(&mut self, dropped: Option<&[String]>, console: &mut Console) {
+        let Some(nesting) = self.here_nesting.take() else {
+            return;
+        };
+        self.nesting = nesting;
+        self.durations = None;
+        let uncovered_heavy = nesting.covering().is_some_and(|parent| !covers(parent.held, Slot::Heavy));
+        if let Some(words) = dropped
+            && uncovered_heavy
+        {
+            self.run_as_heavy(words, console);
+        }
+        if let Some(parent) = self.nesting.covering() {
+            if let Some(line) = self.nesting.line(self.request.slot, self.request.spelling) {
+                console.err(&line);
+            }
+            self.cover(parent.pid, console);
+        }
+    }
+}
+
 impl Run<'_> {
     /// Decides where the command runs, and sets the remote tag of a routed run. A gate a parent's slot covers runs
     /// here, as does one whose light parent lends it its slot before it queues, while a critical request drains, which
@@ -877,8 +976,10 @@ impl Run<'_> {
             self.lent = true;
             return (Route::Local { reason: None }, Placed::NotAsked);
         }
-        // A gate inside a box run stays here as a covered gate does, saying nothing.
-        let covering = self.nesting.covering().is_some() || matches!(self.nesting, Nesting::InBox);
+        // A gate inside a box run stays here as a covered gate does, saying nothing. A gate a commit run's slot covers
+        // is asked as one under no parent, so a build in the commit's hooks still routes.
+        let under_commit = self.nesting.under_commit().is_some();
+        let covering = (self.nesting.covering().is_some() && !under_commit) || matches!(self.nesting, Nesting::InBox);
         let route::Decided {
             route,
             placed: place,
@@ -899,7 +1000,8 @@ impl Run<'_> {
 
     /// The durations of a run that takes a slot of its own, read once it knows the command it journals and before it
     /// queues, its folder placed as the routing decision `placed` it when the decision asked git: `None` for a no-slot
-    /// run, one a parent's slot covers or lends, and one whose journal lines cannot be written.
+    /// run, one a parent's slot covers or lends, and one whose journal lines cannot be written. A gate that routes beside
+    /// the commit run whose slot covers it has them for its run on the builder ([`Run::back_under_commit`]).
     fn open_durations(&self, placed: &Placed) -> Option<RunDurations> {
         if matches!(self.request.slot, Slot::None) || !takes_own_slot(self.nesting, self.lent) {
             return None;
@@ -1004,22 +1106,26 @@ impl Run<'_> {
         if self.lent {
             return;
         }
-        let covering = self.nesting.covering().map(|parent| parent.pid);
-        let event = match covering {
-            Some(parent_pid) => JournalEvent::Covered { parent_pid },
-            None => JournalEvent::Queue {
-                log: self.log.path().to_string_lossy().into_owned(),
-                not_routed: route::not_routed(route),
-                reason: self.request.reason.clone(),
-            },
-        };
         if matches!(route, Route::Routed(_)) {
             self.queued_at = Some(Instant::now());
         }
-        self.journal.write(&event, self.tag.as_ref(), console);
-        if let Some(parent_pid) = covering {
-            self.covered = Some(Covered::write(&self.root.path, &self.gate, parent_pid, console));
+        if let Some(parent) = self.nesting.covering() {
+            self.cover(parent.pid, console);
+            return;
         }
+        let event = JournalEvent::Queue {
+            log: self.log.path().to_string_lossy().into_owned(),
+            not_routed: route::not_routed(route),
+            reason: self.request.reason.clone(),
+        };
+        self.journal.write(&event, self.tag.as_ref(), console);
+    }
+
+    /// Journals `covered` with the pid of the parent gate `parent_pid` whose slot covers the run, then writes its covered
+    /// marker ([`Covered`]).
+    fn cover(&mut self, parent_pid: u32, console: &mut Console) {
+        self.journal.write(&JournalEvent::Covered { parent_pid }, self.tag.as_ref(), console);
+        self.covered = Some(Covered::write(&self.root.path, &self.gate, parent_pid, console));
     }
 
     /// Runs the command where `route` sends it: on the builder, and here after a fallback; or here ([`Run::here`]), as
@@ -1425,12 +1531,15 @@ impl Run<'_> {
     /// given, unless it is a dotnet `--no-build` command that would find no build here ([`Run::no_build_words`]), which
     /// drops the word, says the line a run here that drops it says ([`Run::dropped_line`]), and plans the words it left.
     /// A command with a word that is not valid Unicode is never routed ([`route`]), so the branch that keeps it as given
-    /// cannot be reached. Else how the run ended when the dropped command cannot be planned.
-    fn plan_here(&self, remote: &RemoteRun, plan: Plan, console: &mut Console) -> Result<(Plan, Option<HereWords>), Ended> {
+    /// cannot be reached. A gate that routed beside a commit run is put back under it first ([`Run::back_under_commit`]).
+    /// Else how the run ended when the dropped command cannot be planned.
+    fn plan_here(&mut self, remote: &RemoteRun, plan: Plan, console: &mut Console) -> Result<(Plan, Option<HereWords>), Ended> {
         let Some(words) = unicode_words(&self.request.command) else {
+            self.back_under_commit(None, console);
             return Ok((plan, None));
         };
         let (words, dropped) = self.no_build_words(words, |_| Some(remote.root.clone()), console);
+        self.back_under_commit(dropped.as_ref().map(|_| words.as_slice()), console);
         let Some(reason) = dropped else {
             return Ok((plan, Some(HereWords::routed(remote, words))));
         };
@@ -2277,6 +2386,7 @@ impl Run<'_> {
             passed: true,
             own_slot: takes_own_slot(self.nesting, self.lent),
             slot: self.request.slot,
+            commit: self.gate.commit(),
             timing: match pass {
                 Pass::Here(timing) => Some(timing),
                 Pass::On(..) => None,
@@ -2885,12 +2995,14 @@ fn whole_seconds(seconds: f64) -> f64 {
 }
 
 /// What the cores line of a run is decided from: whether it passed, whether it took its own slot (not covered by a
-/// parent's, nor lent one), the slot kind it asked for, and how long it ran here, `None` for a run on a builder.
+/// parent's, nor lent one), the slot kind it asked for, whether it is a commit run ([`ThisGate::commit`]), and
+/// how long it ran here, `None` for a run on a builder.
 #[derive(Clone, Copy)]
 struct Judged {
     passed: bool,
     own_slot: bool,
     slot: Slot,
+    commit: bool,
     timing: Option<Timing>,
 }
 
@@ -2927,18 +3039,22 @@ fn cores_hint_for(judged: Judged) -> Option<String> {
         Slot::None => SlotKind::None,
     };
     let cores = timing.cores?;
-    hint(cores, slot).map(|misfit| cores_line(cores, misfit))
+    hint(cores, slot).map(|misfit| cores_line(cores, misfit, judged.commit))
 }
 
 /// The line that tells a run its slot did not fit, `misfit` as `cores` show it: the average and free cores to one
-/// decimal, the peak to a whole number, halves to even. A run on no slot is told without the free cores.
-fn cores_line(cores: Cores, misfit: Hint) -> String {
-    let used = format!("gate: used {:.1} cores on average (peak {}", cores.avg, cores.peak.round_ties_even());
+/// decimal, the peak to a whole number, halves to even. A run on no slot is told without the free cores. A commit run
+/// (`commit`) is told of its hooks and of the `--slot` to pass.
+fn cores_line(cores: Cores, misfit: Hint, commit: bool) -> String {
+    let who = if commit { "the commit's hooks used" } else { "used" };
+    let used = format!("gate: {who} {:.1} cores on average (peak {}", cores.avg, cores.peak.round_ties_even());
     let free = cores.free;
-    match misfit {
-        Hint::Hot => format!("{used}, {free:.1} free) on a light slot; work that keeps more than 2 busy belongs on heavy"),
-        Hint::Cold => format!("{used}, {free:.1} free) on a heavy slot; work that keeps under 1.5 busy fits on light"),
-        Hint::Busy => format!("{used}) on no slot; work that keeps 1.5 or more busy belongs on light or heavy"),
+    match (misfit, commit) {
+        (Hint::Hot, false) => format!("{used}, {free:.1} free) on a light slot; work that keeps more than 2 busy belongs on heavy"),
+        (Hint::Hot, true) => format!("{used}, {free:.1} free) on a light slot; hooks that keep more than 2 busy belong on --slot heavy"),
+        (Hint::Cold, false) => format!("{used}, {free:.1} free) on a heavy slot; work that keeps under 1.5 busy fits on light"),
+        (Hint::Cold, true) => format!("{used}, {free:.1} free) on a heavy slot; hooks that keep under 1.5 busy fit on --slot light"),
+        (Hint::Busy, _) => format!("{used}) on no slot; work that keeps 1.5 or more busy belongs on light or heavy"),
     }
 }
 
@@ -3415,6 +3531,7 @@ mod tests {
             marker: "light:4242:1".to_owned(),
             unjudged: None,
             stand_in: false,
+            commit: false,
         };
         let rows: [(&str, Nesting, bool, bool); 7] = [
             ("covered by its parent's slot", Nesting::Covered(parent.clone()), false, false),
@@ -3448,6 +3565,7 @@ mod tests {
             marker: "light:4242:1".to_owned(),
             unjudged: None,
             stand_in: false,
+            commit: false,
         };
         assert_eq!(
             dropped_line(reason, None, true),
@@ -3480,6 +3598,7 @@ mod tests {
             passed: true,
             own_slot: true,
             slot,
+            commit: false,
             timing: Some(Timing {
                 wall: Duration::from_secs(wall_s),
                 adjusted: Some(1.0),
@@ -3500,7 +3619,8 @@ mod tests {
             }),
             ..hot
         };
-        let rows: [(&str, Judged, Option<&str>); 11] = [
+        let commit = |judged: Judged| Judged { commit: true, ..judged };
+        let rows: [(&str, Judged, Option<&str>); 15] = [
             ("failed", Judged { passed: false, ..hot }, None),
             ("routed", Judged { timing: None, ..hot }, None),
             ("not on its own slot", Judged { own_slot: false, ..hot }, None),
@@ -3512,6 +3632,14 @@ mod tests {
             ("fitted", judged(Slot::Heavy, 12, 0, HOT), None),
             ("no slot, busy", judged(Slot::None, 12, 0, HOT), Some("on no slot")),
             ("no slot, quiet", judged(Slot::None, 12, 0, COLD), None),
+            ("a hot commit", commit(hot), Some("the commit's hooks used 3.0 cores")),
+            (
+                "a cold commit",
+                commit(judged(Slot::Heavy, 10, 0, COLD)),
+                Some("hooks that keep under 1.5 busy fit on --slot light"),
+            ),
+            ("a fitted commit", commit(judged(Slot::Heavy, 12, 0, HOT)), None),
+            ("a commit under 10 s unpaused", commit(judged(Slot::Light, 12, 3, HOT)), None),
         ];
         for (name, judged, want) in rows {
             let line = cores_hint_for(judged);
@@ -3530,8 +3658,15 @@ mod tests {
             free: 9.26,
         };
         assert_eq!(
-            cores_line(hot, Hint::Hot),
+            cores_line(hot, Hint::Hot, false),
             "gate: used 7.4 cores on average (peak 15, 9.3 free) on a light slot; work that keeps more than 2 busy belongs on heavy"
+        );
+        assert_eq!(
+            cores_line(hot, Hint::Hot, true),
+            concat!(
+                "gate: the commit's hooks used 7.4 cores on average (peak 15, 9.3 free) on a light slot; ",
+                "hooks that keep more than 2 busy belong on --slot heavy"
+            )
         );
         let cold = Cores {
             avg: 0.04,
@@ -3539,8 +3674,15 @@ mod tests {
             free: 12.0,
         };
         assert_eq!(
-            cores_line(cold, Hint::Cold),
+            cores_line(cold, Hint::Cold, false),
             "gate: used 0.0 cores on average (peak 0, 12.0 free) on a heavy slot; work that keeps under 1.5 busy fits on light"
+        );
+        assert_eq!(
+            cores_line(cold, Hint::Cold, true),
+            concat!(
+                "gate: the commit's hooks used 0.0 cores on average (peak 0, 12.0 free) on a heavy slot; ",
+                "hooks that keep under 1.5 busy fit on --slot light"
+            )
         );
         let busy = Cores {
             avg: 1.54,
@@ -3548,7 +3690,7 @@ mod tests {
             free: 3.0,
         };
         assert_eq!(
-            cores_line(busy, Hint::Busy),
+            cores_line(busy, Hint::Busy, false),
             "gate: used 1.5 cores on average (peak 2) on no slot; work that keeps 1.5 or more busy belongs on light or heavy"
         );
     }

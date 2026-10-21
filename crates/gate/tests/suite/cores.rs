@@ -12,10 +12,11 @@ use std::process::Command;
 
 use serde_json::{Value, json};
 
-use crate::routing::{HOST, repo, routed_case};
+use crate::nesting::{first_event, let_go};
+use crate::routing::{HOST, repo, routed_case, routed_words, stub};
 use crate::support::{
-    CORE_SECOND, Case, Escapee, FAKE_TOOL, GATE, LOCAL_REASON, Outcome, cpu_ticks, events, finish, heavy_words, none_words, run_words, shown,
-    wait_until, write_remote_json,
+    CORE_SECOND, Case, Escapee, FAKE_TOOL, GATE, LOCAL_REASON, Outcome, copy_tool, cpu_ticks, events, finish, heavy_words, none_words, run_words,
+    shown, start, wait_until, write_remote_json,
 };
 
 /// The fields the release line carries the cores in.
@@ -62,6 +63,27 @@ fn assert_said_before_passed(outcome: &Outcome, cores: (f64, f64, f64), slot: &s
         regex::escape(advice)
     );
     assert_matched_before_passed(outcome, &pattern, peak);
+}
+
+/// Asserts that `outcome` passed with a commit run's cores line of `cores` on `slot` with `advice` just before the
+/// passed line, as [`assert_said_before_passed`] asserts any other run's.
+fn assert_commit_said_before_passed(outcome: &Outcome, cores: (f64, f64, f64), slot: &str, advice: &str) {
+    let (avg, peak, free) = cores;
+    let pattern = format!(
+        r"\Agate: the commit's hooks used {avg:.1} cores on average \(peak (\d+), {free:.1} free\) on a {slot} slot; {}\z",
+        regex::escape(advice)
+    );
+    assert_matched_before_passed(outcome, &pattern, peak);
+}
+
+/// Asserts that `outcome`'s commit run said no cores line: the line before its passed line is not one.
+fn assert_no_commit_cores_line(outcome: &Outcome) {
+    assert_no_cores_line(outcome);
+    let lines: Vec<&str> = outcome.stdout.lines().collect();
+    assert!(
+        lines.len() < 2 || !lines[lines.len() - 2].starts_with("gate: the commit's hooks used "),
+        "{outcome:?}"
+    );
 }
 
 /// Asserts that `outcome` passed with the no-slot cores line of `cores` just before the passed line, as
@@ -317,6 +339,51 @@ fn a_no_slot_run_whose_nested_gate_took_a_slot_prints_no_hint() {
         "the parent journals no cores: {release}"
     );
     assert_no_cores_line(&outcome);
+}
+
+#[test]
+fn a_heavy_commit_whose_hook_gate_routes_keeps_its_cores_hint() {
+    let case = routed_case("a_heavy_commit_whose_hook_gate_routes_keeps_its_cores_hint");
+    let routing = json!({ "host": HOST, "repos": { repo(&case): ["*tool*"] }, "hooks": [repo(&case)] });
+    write_remote_json(&case, &routing.to_string());
+    copy_tool(&case, "git.exe");
+    let steps = shown(&stub(&case, &["status 0"]));
+    let (pid_file, release) = (case.folder().join("inner.pid"), case.folder().join("outer.release"));
+    let (pid_text, release_text) = (shown(&pid_file), shown(&release));
+    // The commit sleeps 11 s, long enough to be judged, then its hook starts a gate that routes and waits for it.
+    let mut command = vec![r".\git.exe", "commit", "sleep", "11000", "spawn-pid", &pid_text, &release_text, GATE];
+    command.extend(routed_words("inner.log", &steps, &[], &[r".\tool.exe", "out", "ran there"]));
+    let mut outer = case.gate(&heavy_words("outer.log", &["--test-sample-ms", "1000"], &command));
+    // Inside a pre-commit hook, as git sets it for the hook and every gate the hook starts.
+    outer.env("GIT_INDEX_FILE", "x");
+    let outer = start(outer);
+    let pid = outer.id();
+
+    let (inner, first) = first_event(&case, &pid_file);
+    assert!(first["event"] == "queue" && first["remote"] == true, "the hook gate routes: {first}");
+    assert_eq!(inner.ended(), 0);
+    let_go(&release);
+    let outcome = outer.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let lines = events(&case);
+    let nested_take = lines.iter().find(|line| line["event"] == "take" && line["pid"] == inner.pid);
+    assert!(
+        nested_take.is_some_and(|take| take["parentPid"] == pid && take["remote"] == true),
+        "the hook gate's take is of a remote slot, naming the commit: {lines:?}"
+    );
+    let release = release_of(&case, pid);
+    let cores = journalled_cores(&release);
+    assert!(
+        cores.is_some(),
+        "the commit journals its cores, as its hook gate took no slot here: {release}"
+    );
+    match cores {
+        Some(cores) if cores.0 < 1.5 && cores.2 >= 4.0 => {
+            assert_commit_said_before_passed(&outcome, cores, "heavy", "hooks that keep under 1.5 busy fit on --slot light");
+        }
+        _ => assert_no_commit_cores_line(&outcome),
+    }
 }
 
 /// Asserts that `outcome`'s gate said the route hint just before its passed line, which stays last, so any cores line

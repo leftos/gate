@@ -12,6 +12,7 @@ mod answer;
 mod boxside;
 mod burn;
 mod check;
+mod commit;
 mod console;
 mod covered;
 mod cutover;

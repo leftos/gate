@@ -245,11 +245,12 @@ pub(crate) fn pid(value: &str) -> Result<u32, Problem> {
         .ok_or_else(|| Problem::BadPid(value.to_owned()))
 }
 
-/// The names the gate sets on every command it starts, over the environment it starts it in: the slot marker and the
-/// state root, the build-server settings of the run, the `GIT_CONFIG_COUNT` entry the box gives git, and the Event Log
+/// The names the gate sets on every command it starts, over the environment it starts it in: the slot marker, a commit
+/// run's own marker and the state root, the build-server settings of the run, the `GIT_CONFIG_COUNT` entry the box gives git, and the Event Log
 /// logging provider turned off. A caller may set none of them; the gate sets each after the caller's own pairs.
 pub const GATE_SET_NAMES: &[&str] = &[
     "GATE_SLOT_HELD",
+    "GATE_COMMIT_SLOT",
     "GATE_STATE_DIR",
     "SharedCompilationId",
     "MSBUILDNODEHANDSHAKESALT",

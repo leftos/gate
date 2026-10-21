@@ -149,6 +149,7 @@ fn identity() -> JournalIdentity {
         kind: "light".to_owned(),
         cwd: r"C:\work\repo".to_owned(),
         command: "cmd /c exit 0".to_owned(),
+        commit: false,
     }
 }
 
@@ -560,6 +561,7 @@ fn abandon_line_is_the_one_the_reader_fixture_holds() {
         kind: "light".to_owned(),
         cwd: r"C:\work\repo".to_owned(),
         command: "cmd /c exit 0".to_owned(),
+        commit: false,
     };
     let line = journal_line(
         &gate,

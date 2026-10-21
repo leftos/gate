@@ -147,6 +147,8 @@ pub(crate) struct ThisGate {
     cwd: Result<String, String>,
     /// The command's words as given, each quoted for the C runtime and joined by spaces ([`gate_args::command_text`]).
     command: String,
+    /// Whether the gate runs a commit run ([`crate::commit::is_commit_run`]), which its slot's journal lines say.
+    commit: bool,
 }
 
 impl ThisGate {
@@ -164,6 +166,7 @@ impl ThisGate {
             kind: request.slot.as_str(),
             cwd,
             command,
+            commit: crate::commit::is_commit_run(request),
         })
     }
 
@@ -177,7 +180,13 @@ impl ThisGate {
             kind: request.slot.as_str(),
             cwd: self.cwd.clone(),
             command: gate_args::command_text(&request.command),
+            commit: crate::commit::is_commit_run(request),
         }
+    }
+
+    /// Whether the gate runs a commit run ([`crate::commit::is_commit_run`]).
+    pub(crate) fn commit(&self) -> bool {
+        self.commit
     }
 
     /// What every journal line of this gate carries, or why the journal cannot be written.
@@ -188,6 +197,7 @@ impl ThisGate {
             kind: self.kind.to_owned(),
             cwd: self.cwd.clone()?,
             command: self.command.clone(),
+            commit: self.commit,
         })
     }
 }

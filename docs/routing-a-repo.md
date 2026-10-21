@@ -127,7 +127,11 @@ A heavy gate started inside a git hook stays local silently unless `remote.json`
 
 The key is for check-only hook commands (a build, clippy, a format check). A routed fixer's patch comes back to the worktree under prek's stash, so a fixing hook stays local.
 
-The hook entry calls the repo's launcher, `pwsh -NoProfile -File tools/gate.ps1 run ... -- <heavy command>`, never a bare `gate run`, as every other call does (scripts, docs and agents' own commands alike): a hook runs on every machine that commits, and on a clone without gate.exe the launcher runs the command directly. The repo's patterns must match that command. The `git commit` that runs the hook is gated on `--slot none`, so it does not cover its hook's gate and the hook's gate takes its own slot (and routes). The `git commit` itself stays local.
+The hook entry calls the repo's launcher, `pwsh -NoProfile -File tools/gate.ps1 run ... -- <heavy command>`, never a bare `gate run`, as every other call does (scripts, docs and agents' own commands alike): a hook runs on every machine that commits, and on a clone without gate.exe the launcher runs the command directly. The repo's patterns must match that command.
+
+The `git commit` that runs the hook is gated on `--slot heavy` when its hooks build or run analyzers, else on `--slot light`: the commit holds that slot for all its hooks, and a `--slot none` commit runs on a light slot and says to pass one of the two.
+
+A heavy commit covers its hook's gate, which still routes and takes its own remote slot; a light commit does not cover a heavy hook gate, which takes a heavy slot of its own (and routes). The commit's end-of-run line says whether the hooks fit the slot. The `git commit` itself stays local.
 
 Only hooks that run with `GIT_INDEX_FILE` set (pre-commit and commit-msg) need the `hooks` consent: a pre-push hook's gate routes by the repo's patterns like any other run. Every gated repo carries a committed copy of this repo's `tools/gate.ps1`; claude-config's `tools/sync-launchers.ps1` gives a first copy to each repo it lists that has none and keeps every copy current, and `~/.claude/tools/gate.ps1` is the same wrapper for a caller outside any repo.
 

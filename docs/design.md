@@ -72,7 +72,7 @@ The watchdog samples the command and kills its job on a stall, at the ceiling an
 
 | Flag | PowerShell option | Meaning | Source |
 |---|---|---|---|
-| `--slot heavy\|light\|critical\|none` | `-Slot` | The slot kind ([Slots](#slots)); `none` takes no slot and is for a command that only dispatches or watches remote work. | ruling |
+| `--slot heavy\|light\|critical\|none` | `-Slot` | The slot kind ([Slots](#slots)); `none` takes no slot and is for a command that only dispatches or watches remote work, except for a `git commit`, a commit run, which takes the slot asked (light for `none`; [Commit run](#critical-drain-and-nesting)). | ruling |
 | `--alone` | `-Alone` | With `--slot critical` only: hold the whole machine, the light slots a plain critical gate leaves beside it included ([Critical drain and nesting](#critical-drain-and-nesting), Alone). Any other slot, or a gate's own command, is a usage error (exit 2). Ungated processes keep running: the gate cannot stop them, and the load snapshot it logs is the evidence, not a guarantee. | ruling (GATE-482) |
 | `--timeout <seconds>` | `-TimeoutSeconds` | The ceiling in load-adjusted seconds, a whole number above 0 (W3). `auto:<n>` makes `n` a floor: each take resolves the ceiling to `max(n, ceil(3 x the command's adjusted p99))`, capped at 2147483647, and to `n` with no adjusted p99 ([Output lines](#output-lines), [design/gate-durations.md](design/gate-durations.md), part 4). The new CLI only: `-TimeoutSeconds` refuses it. | ruling |
 | `--log <path>` | `-Log` | The command's log; a relative path is read against the caller's working directory once, at start, before `--cd` (P5). | ruling |
@@ -106,7 +106,7 @@ It is how a caller in a main checkout gates a command that names another worktre
 
 A name is one or more printable ASCII characters, U+0021 to U+007E, `=` excepted. ASCII only keeps the ASCII-case check of the refused names below equal to Windows' own comparison of names, so a name that is not ASCII can never pass that check and then be read as one the gate protects. A value may hold anything but NUL (CR and LF included) and may be empty.
 
-The gate refuses a name it sets itself (the build-server settings, `UseSharedCompilation`, `GATE_SLOT_HELD`, `GATE_STATE_DIR`, the box's `GATE_BOX_JOB` and `GATE_BOX_EXE` and the rest listed under [Command launching](#command-launching) and [The box side](#the-box-side)), any `GATE_` name, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG` and the machine paths the box keeps (`GODOT_PATH` and `UE_ROOT` among them, which a routed run sets itself).
+The gate refuses a name it sets itself (the build-server settings, `UseSharedCompilation`, `GATE_SLOT_HELD`, `GATE_COMMIT_SLOT`, `GATE_STATE_DIR`, the box's `GATE_BOX_JOB` and `GATE_BOX_EXE` and the rest listed under [Command launching](#command-launching) and [The box side](#the-box-side)), any `GATE_` name, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG` and the machine paths the box keeps (`GODOT_PATH` and `UE_ROOT` among them, which a routed run sets itself).
 
 The refusal is the same on both sides so one `--env` means the same on the PC and on a builder.
 
@@ -594,6 +594,7 @@ The lines of a run that starts its command:
 
   Two notes go to the log only, and the hint is left out: `gate: cannot read the command's CPU at its end: <error>; its cores are unknown` and `gate: cannot tell whether a gate under this one took a slot of its own: <error>; its cores are unknown`.
 - The cores hint of a run on no slot, in the same place and under the same conditions, has no free cores: `gate: used <avg> cores on average (peak <peak>) on no slot; work that keeps 1.5 or more busy belongs on light or heavy`.
+- The cores hint of a commit run ([Commit run](#critical-drain-and-nesting)), in the same place, names the commit's hooks: `gate: the commit's hooks used <avg> cores on average (peak <peak>, <free> free) on a light slot; hooks that keep more than 2 busy belong on --slot heavy` or `... on a heavy slot; hooks that keep under 1.5 busy fit on --slot light`. A commit run gets no route hint.
 - The route hint, on stdout after any cores line and just before the passed line, when its conditions hold ([Cores hint](#cores-hint)): `gate: ran <n> s on a light slot; on heavy, remote.json would send this command to a builder`, `<n>` the whole unpaused seconds, rounded down.
 - Failed, on stderr: `gate: FAILED (status <n>). Full output: <log>`. A command that exited 0 with a marker in its log first says `gate: command exited 0 but its log reports a failure -> <log>` on stderr, and its status is 1.
 - On a non-zero status, up to 40 `<line number>:<line>` marker lines on stdout, before the tail.
@@ -643,6 +644,7 @@ The lines of a run that starts its command:
   A lock another routed run holds past the lock wait says `gate: not routed: <who> is busy with another routed run`. A pair's root spelled other than it was at its check has no git location recorded, and fails the run with `gate: the remote run failed: the git location of <root> was not recorded at its check`, status 1 and no fallback.
 
   A gate that is not heavy, has a covering parent, matches no pattern or has no `remote.json` says nothing.
+- A commit run ([Commit run](#critical-drain-and-nesting)), on stderr and in the log: asked for on no slot, `gate: a commit's hooks take a slot: pass --slot heavy or --slot light` once, before its slot wait (not said under a covering parent or inside a box run). A critical or `--alone` gate inside a commit's hooks is refused, exit 2, on stderr only, with the earlier log left in place: `gate: inside a git commit's hooks; a critical or --alone gate cannot run there`.
 - A local run that drops its dotnet `--no-build`, on stderr and in the log, before it takes a slot: `gate: dropped --no-build: <reason>; building on a heavy slot`, or `gate: dropped --no-build: <reason>; building on the parent gate's <heavy|critical|light> slot` for a gate covered or lent a slot ([Routing](#routing)).
 - A routed run, on stderr and in the log, says first `gate: routed <given> as <name>` when it sent the command's first word, which named a program by an absolute path outside the worktree, as the program's name (`<given>` the word as given, `<name>` the name sent, each escaped; [Routing](#routing), the in-worktree path rewrite).
 
@@ -731,7 +733,7 @@ A pool id is the first 8 lower-case hex digits of the SHA-256 of the entry's low
 
 The pools never wait on each other, so a serial test run does not queue behind builds (S1). A gate takes and releases its mutexes on one OS thread, since Windows mutex ownership is per thread.
 
-A `none` run is in no pool: it takes no slot, mutex, ticket, claim or covered marker, never waits, wakes no waiters and starts at once, even while a critical gate holds the machine. It is for a command that only dispatches or watches remote work (`gh run watch`, a deploy script polling a server, a remote image build).
+Except for a commit run ([Commit run](#critical-drain-and-nesting)), a `none` run is in no pool: it takes no slot, mutex, ticket, claim or covered marker, never waits, wakes no waiters and starts at once, even while a critical gate holds the machine. It is for a command that only dispatches or watches remote work (`gh run watch`, a deploy script polling a server, a remote image build).
 
 It still has its job, so `gate stop-tree` reaches it, and it runs at BelowNormal. A critical drain does not wait for it, it is not in the take's `otherClaims`, and the barrier never holds it.
 
@@ -883,7 +885,7 @@ The box command's job name comes from the payload's `Job` (`<key>` is the payloa
 
 Every routed run takes it for its main root and each carried sibling before its snapshots and holds it until its last push is saved, and a sync-back takes it again for each worktree it has a back commit for, each waiting for another run's hold ([Routing](#routing), The worktree lock).
 
-The environment carries one more name: `GATE_SLOT_HELD`, the slot marker ([Critical drain and nesting](#critical-drain-and-nesting)).
+The environment carries two more names: `GATE_SLOT_HELD`, the slot marker, and `GATE_COMMIT_SLOT`, a commit run's own marker ([Critical drain and nesting](#critical-drain-and-nesting)).
 
 ## Formats
 
@@ -1041,7 +1043,8 @@ Fields beyond J1's:
 
   `gate-state`'s reader accepts it and does not treat the run as on the parent's slot, except for a covered run, which it reads as a run with a slot of its own.
 - `take` of a `none` run: `"kind":"none"` on its `queue`, `take` and `release`, and a `take` with `"slots":[]` and `"waitedSeconds":0.0`, no `abandoned`, no machine fields, and `parentPid` only under a live no-slot parent. Its `release` has `"slots":[]` and is written like any run's, unlike a covered or lent run's. `v` stays 1. The history reader gives the run `kind` `none`, no `slot`, and `started` from the `take`.
-- `release`: `avgCores`, `peakCores`, `freeCores`, optional numbers of one decimal after `adjustedSeconds` and before `verdict` ([Cores hint](#cores-hint)). They are omitted when there is no unpaused sample, the sampler failed, the read of the command's CPU at its end failed, a gate under the run took a slot of its own (or the machine), the journal could not be read to tell, or the run was routed.
+- `queue`, `take` and `release` of a commit run ([Commit run](#critical-drain-and-nesting)): the slot kind the run took as `kind` (light for a commit asked for on `none`) and `"commit": true` after the event's own fields, before `remote`, `host` and `key` of a routed line. No other event and no other run has `commit`.
+- `release`: `avgCores`, `peakCores`, `freeCores`, optional numbers of one decimal after `adjustedSeconds` and before `verdict` ([Cores hint](#cores-hint)). They are omitted when there is no unpaused sample, the sampler failed, the read of the command's CPU at its end failed, a gate under the run took a local slot of its own (or the machine; a routed gate's remote slot does not count), the journal could not be read to tell, or the run was routed.
 
   Covered and lent runs write no `release`, except a covered run that took a slot late, which writes one when it lets that slot go: its `slots` the one it took, its `heldSeconds` counted from that take.
 - `release`: `wallSeconds` (the command's wall time less the seconds paused behind a critical request; a routed run's whole remote wall time), `adjustedSeconds` (load-adjusted seconds, 3 decimals, a number for every run that started; for a routed run the builder's figure, null when it said none; null for a run whose sampler failed) and `verdict`, one of `passed`, `failed`, `log-failure`, `stalled`, `timed-out`, `backstop`, `transfer-timed-out`, `unknown` (kept, J5).
@@ -1154,7 +1157,9 @@ A value that is not an array of non-empty strings consents to none and leaves th
 
 A value that is not an array (`hooks must be an array of repo names`) or holds an item that is not a non-empty string (`hooks[N] is not a non-empty string`) consents to no repo and leaves the rest of the file usable; routing says nothing about it, and `gate check` says it as a missing item, `check: here: remote.json: <problem>`. A hook gate whose place git cannot read stays local silently too. A consented hook run whose first word is `git` or `prek` still stays local silently.
 
-The key is for check-only hook commands (a build, clippy, a format check): a routed fixer's patch comes back to the worktree under prek's stash. The hook entry calls `gate run ... -- <heavy command>`. The `git commit` that runs the hook is itself gated on `--slot none`, so its gate does not cover the hook's gate (a `none` parent is `Beside`, [Critical drain and nesting](#critical-drain-and-nesting)) and the hook's gate takes its own slot.
+The key is for check-only hook commands (a build, clippy, a format check): a routed fixer's patch comes back to the worktree under prek's stash. The hook entry calls `gate run ... -- <heavy command>`.
+
+The `git commit` that runs the hook is a commit run ([Commit run](#critical-drain-and-nesting)) on `--slot heavy` or `light`, so it holds a slot for its hooks: a heavy commit covers the hook's gate, which still routes when its patterns match and takes its own remote slot, and a light commit does not cover a heavy hook gate, which takes a heavy slot of its own.
 
 **Declarations folder.** `declarations` is an object mapping a repo name, matched in any letter case, to an absolute folder: `{"declarations": {"<repo>": "D:\\notes\\<repo>\\gate"}}`.
 
@@ -1307,6 +1312,19 @@ What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K
   It counts the lend markers and rewrites the ticket under the beside mutex, so a gate lent a slot after the count sees the ticket and is not lent. A rewrite that fails is said once, is no hold and is tried again on the next pass; so is a claims folder that cannot be listed or holds an entry that cannot be read.
 
   While lend markers are live the gate rewrites its ticket once with `lendsClosed: true` and waits for those lent gates to end. No light parent lends its slot again, so the drain waits only for the lends already made.
+- **Commit run.** A gated command whose first word's file stem is `git` (any letter case, `git.exe` and a full path included) and whose first non-option word is `commit`, on any slot but critical.
+
+  Git options before the subcommand that take a value (`-C`, `-c`, `--git-dir`, `--work-tree`, `--namespace`, `--super-prefix`, `--config-env`, `--attr-source`) are skipped with their value unless joined by `=`; `--help`, `-h`, `--version`, `--exec-path` without `=`, `--html-path`, `--man-path` and `--info-path` before it make it no commit run, as does `commit-tree`. A wrapper or an alias is not recognised. It never routes (a `git` first word never does).
+
+  Its slot is the caller's: `--slot heavy` or `light` takes that slot, and `--slot none` takes a light one and says `gate: a commit's hooks take a slot: pass --slot heavy or --slot light` once on stderr and in the log, before the slot wait (not under a covering parent, nor inside a box run).
+
+  The command runs at BelowNormal like any run. The slot is held for the whole command, hooks included, and the journal's `queue`, `take` and `release` carry the kind and `"commit": true` ([Journal](#journal)).
+
+  It hands its command `GATE_COMMIT_SLOT=<its marker>` besides `GATE_SLOT_HELD`. A gate in its hooks whose `GATE_COMMIT_SLOT` equals its parent's marker knows it runs in a commit's hooks: a heavy commit covers every gate there but a critical one (a `covered` line), while under a light commit a heavy gate takes a heavy slot of its own or is lent one, as under any light parent.
+
+  A covered gate still routes as a gate under no parent would: one that routes takes its own remote slot (a routed gate keeps its durations), and on a fallback says the `running under` line once and journals `covered` before it replans. A dropped `--no-build` under a light commit says `gate: dropped --no-build: <reason>; building on a heavy slot`.
+
+  A critical gate, or an `--alone` one, in a commit's hooks is refused, exit 2, on stderr only with the earlier log left in place: `gate: inside a git commit's hooks; a critical or --alone gate cannot run there`. The commit's own cores hint names its hooks ([Cores hint](#cores-hint)).
 - **The barrier.** A gate that finds a live critical ticket that arrived before its own (by `arrived`, then pid; its own ticket never counts) is held back by the earliest such request, whether or not that request holds the machine yet. Gates that arrived before the request run first and are waited for. A heavy gate tries no slot. A light gate tries any light slot while fewer light gates than the beside allowance run beside the request, and none once that many do.
 
   While a live critical ticket says `alone` (the earliest such ticket, ahead of the gate or not, once a request holds the gate back) the allowance is 0 and no light gate tries a slot.
@@ -1603,6 +1621,8 @@ A period with no beat due flushes instead, and the box's flush probes stderr for
 
   The caller's `--env` pairs ([Command environment](#command-environment)) are set over the gate's environment first, so the settings above come last and no pair can undo one.
 
+  A commit run ([Commit run](#critical-drain-and-nesting)) also gives its command `GATE_COMMIT_SLOT=<its marker>`, the same text as its `GATE_SLOT_HELD`; any other gate removes `GATE_COMMIT_SLOT` from its command's environment.
+
   `GATE_BOX_JOB` and `GATE_BOX_EXE`, given to a box run's command ([The box side](#the-box-side)), pass through a trusted in-box gate to its command, which gets no `GATE_SLOT_HELD`; any other gate removes `GATE_BOX_JOB` from its command's environment.
 
   `UseSharedCompilation=false` keeps Roslyn's compiler server from idling in the command's job for up to ten minutes after a build: a command that waits for its whole job, as Godot's console wrapper does, never ended while the server held it, and the stall kill fired. The same setting is on a `gate box run` command and a routed one.
@@ -1633,7 +1653,7 @@ A period with no beat due flushes instead, and the box's flush probes stderr for
 
 Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: nothing is read and nothing is written.
 
-- **What routes** is kept (T2): a heavy gate, not `--local`, under no covering or lending parent, outside a git hook (`GIT_INDEX_FILE` set to a non-empty value) unless `remote.json`'s `hooks` names the repo, whose first word is not `git` or `prek`, in a git worktree of a repo `remote.json` lists, whose words with in-worktree paths rewritten (T3) match one of that repo's patterns.
+- **What routes** is kept (T2): a heavy gate, not `--local`, under no covering or lending parent (a commit run's slot is not one for this rule, [Commit run](#critical-drain-and-nesting)), outside a git hook (`GIT_INDEX_FILE` set to a non-empty value) unless `remote.json`'s `hooks` names the repo, whose first word is not `git` or `prek`, in a git worktree of a repo `remote.json` lists, whose words with in-worktree paths rewritten (T3) match one of that repo's patterns.
 
   **Which builder.** The run goes to the first `builders` entry, in file order, whose own `repos.<repo>` patterns match the Windows-form rewritten words, else to `host` when the top-level patterns match. A warm-up always goes to `host`. A command matching a `.gate/desktop.toml` pattern is never picked by a `macos` entry. A `sendBuild` repo's `--no-build` test picked by a `macos` entry drops `--no-build` and sends no build. The words sent to a `macos` builder use `/` inside the recognised path spans. A repo listed only in a `builders` entry is routed ([`gate check`](#gate-check) treats it so).
 
@@ -2937,7 +2957,7 @@ Built verbs:
 
   `Env` is the variables for the command, the PC's `--env` pairs ([Command environment](#command-environment)) and the gate's `SourceRevisionId` pair after them, sent only when there is one: an object of texts of at most 64 names and 32 KiB of names and values together, the cap read from the parsed object before any pair is checked. A name is one or more printable ASCII characters (U+0021 to U+007E) but `=`; a value may hold anything but NUL.
 
-  It refuses a name the gate sets (`GATE_SLOT_HELD`, `GATE_STATE_DIR`, `SharedCompilationId`, `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `UseSharedCompilation`, `MSBUILDDISABLENODEREUSE`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`, and .NET's Event Log logging settings in any spelling: the `__` and `:` forms, a `DOTNET_` or `ASPNETCORE_` prefix, the provider's full type name).
+  It refuses a name the gate sets (`GATE_SLOT_HELD`, `GATE_COMMIT_SLOT`, `GATE_STATE_DIR`, `SharedCompilationId`, `MSBUILDNODEHANDSHAKESALT`, `MSBUILDUSESERVER`, `DOTNET_CLI_USE_MSBUILD_SERVER`, `UseSharedCompilation`, `MSBUILDDISABLENODEREUSE`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_VALUE_<n>`, and .NET's Event Log logging settings in any spelling: the `__` and `:` forms, a `DOTNET_` or `ASPNETCORE_` prefix, the provider's full type name).
 
   It also refuses `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG` (git reads them over the gate's own `safe.directory` entry), any `GATE_` name, and the machine paths `PATH`, `PATHEXT`, `TEMP`, `TMP`, `SystemRoot`, `windir`, `ComSpec`, `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA` and `ProgramData`, and `GODOT_PATH` and `UE_ROOT`, which a run sets itself (the command's environment, below). Names are compared without regard to ASCII case.
 
@@ -3960,6 +3980,7 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 When a run that passed did not fit its slot, the gate says how many cores the command kept busy, so the caller learns whether heavy or light was right (GATE-6). For example: `gate: used 7.4 cores on average (peak 15, 0.6 free) on a light slot; work that keeps more than 2 busy belongs on heavy`.
 
 - The line is said on stdout, just before the passed line, only for a passed run that took its own light or heavy slot or ran on no slot, ran 10 s or more of unpaused wall time, and had no gate under it take a slot of its own. A critical run is never judged, and a covered or lent run takes no slot.
+- A commit run ([Commit run](#critical-drain-and-nesting)) is judged the same way and says the hooks' cores: `gate: the commit's hooks used <avg> cores on average (peak <peak>, <free> free) on a light slot; hooks that keep more than 2 busy belong on --slot heavy`, or `... on a heavy slot; hooks that keep under 1.5 busy fit on --slot light`. It gets no route hint.
 - `avg` is the job's CPU (user plus kernel time of every process ever in the job, exited ones included, with a final read at exit) plus the CPU of the escaped tree under the job's members ([Watchdog](#watchdog); read per sample, the final stretch counted with the last sample's processes that still run), over the run's unpaused wall time.
 
   The CPU of paused samples is left out.
@@ -3967,7 +3988,7 @@ When a run that passed did not fit its slot, the gate says how many cores the co
   `peak` is the highest own CPU over one sampler interval, paused samples skipped. `free` is the mean over the unpaused samples of the cores others left free. `avg` and `free` show one decimal; `peak` is rounded to a whole number, ties to even.
 - A light run averaging over 2 cores is told heavy would fit. A heavy run averaging under 1.5 cores with at least 4.0 free on average is told light would fit. The peak is reported but does not change the verdict.
 - A run on no slot averaging 1.5 cores or more is told `gate: used <avg> cores on average (peak <peak>) on no slot; work that keeps 1.5 or more busy belongs on light or heavy`, whatever was free; the line has no free cores. The conditions above are otherwise unchanged.
-- Whether a gate under the run took a slot of its own is read from the journal (`nested_took_slot`): a gate under `Nesting::Under` or `Nesting::Beside` writes `parentPid` on its `take`, and the parent drops its hint and cores only when that `take` lists a slot or took the machine (a critical `take`).
+- Whether a gate under the run took a slot of its own is read from the journal (`nested_took_slot`): a gate under `Nesting::Under` or `Nesting::Beside` writes `parentPid` on its `take`, and the parent drops its hint and cores only when that `take` lists a slot of a local pool or took the machine (a critical `take`); a routed gate's `take` of a remote slot does not, for any parent.
 - A nested no-slot gate takes nothing, so it leaves its parent's hint and cores. When the CPU at the end or the journal cannot be read, the hint is left out with a log-only note ([Output lines](#output-lines)).
 - A routed run is never judged: it says no cores hint and its `release` journals no cores. The hint answers which slot fits a command on this PC, and a routed heavy run does its work on the builder, so "light fits" would bring the run back onto the PC, where light never routes.
 - The route hint tells the caller of a light run that it could have gone to a builder. It is said on stdout after any cores line and before the passed line: `gate: ran <n> s on a light slot; on heavy, remote.json would send this command to a builder`, `<n>` the whole unpaused seconds, rounded down.

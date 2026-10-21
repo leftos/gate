@@ -74,6 +74,9 @@ pub struct JournalIdentity {
     pub cwd: String,
     /// The gated command as one line.
     pub command: String,
+    /// Whether the gate runs a commit run, a `git commit` on the heavy or light slot it asked for (light for
+    /// `--slot none`): its `queue`, `take` and `release` lines then carry `commit: true` after the event's own fields.
+    pub commit: bool,
 }
 
 /// One journal event with its own fields.
@@ -361,8 +364,9 @@ impl fmt::Display for JournalNote {
 }
 
 /// The v1 journal line of `event`, written by the gate `identity` at `time`: `v`, `time`, `event`, `pid`,
-/// `processStart`, `kind`, `cwd` and `command`, then the event's own fields, times as ISO 8601 UTC with seven
-/// fractional digits and seconds rounded to three decimals. A `release` without facts writes null times and the verdict
+/// `processStart`, `kind`, `cwd` and `command`, then the event's own fields, then `commit: true` on a commit run's
+/// `queue`, `take` and `release`, times as ISO 8601 UTC with seven fractional digits and seconds rounded to three
+/// decimals. A `release` without facts writes null times and the verdict
 /// `unknown`.
 ///
 /// `remote` is the tag of a routed run up to its fallback: when it is `Some`, the event's own fields are followed by
@@ -389,6 +393,13 @@ pub fn journal_line(
     line.insert("cwd".to_owned(), Value::from(identity.cwd.as_str()));
     line.insert("command".to_owned(), Value::from(identity.command.as_str()));
     insert_own_fields(&mut line, event);
+    let slot_event = matches!(
+        event,
+        JournalEvent::Queue { .. } | JournalEvent::Take { .. } | JournalEvent::Release { .. }
+    );
+    if identity.commit && slot_event {
+        line.insert("commit".to_owned(), Value::Bool(true));
+    }
     if let Some(tag) = remote {
         line.insert("remote".to_owned(), Value::Bool(true));
         line.insert("host".to_owned(), Value::from(tag.host.as_str()));

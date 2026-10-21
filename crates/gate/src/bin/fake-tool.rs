@@ -200,9 +200,11 @@ fn run(args: &[OsString]) -> Result<i32, String> {
 }
 
 /// The steps a stand-in for the box's MSYS keeper and the command watching it take: `echo`, `swallow`, `pid-to` and
-/// `alive`; any other step is unknown.
+/// `alive`; and `commit`, which does nothing, so a copy named `git.exe` stands in for `git commit`; any other step is
+/// unknown.
 fn keeper_step<'a>(step: &str, steps: &mut impl Iterator<Item = &'a OsString>, stdout: &mut impl Write) -> Result<(), String> {
     match step {
+        "commit" => Ok(()),
         "echo" => echo(stdout),
         "swallow" => io::copy(&mut io::stdin().lock(), &mut io::sink())
             .map(drop)

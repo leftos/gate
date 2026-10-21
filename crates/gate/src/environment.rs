@@ -17,6 +17,9 @@ pub(crate) const BOX_JOB_VARIABLE: &str = "GATE_BOX_JOB";
 pub(crate) const BOX_EXE_VARIABLE: &str = "GATE_BOX_EXE";
 /// The variable a gate gives its command holding its slot marker ([`slot_marker`]).
 pub(crate) const SLOT_HELD_VARIABLE: &str = "GATE_SLOT_HELD";
+/// The variable a commit run gives its command holding its own slot marker, so a gate in its hooks that the marker's
+/// slot covers knows it runs under a commit run ([`crate::nesting::Nesting::under_commit`]).
+pub(crate) const COMMIT_SLOT_VARIABLE: &str = "GATE_COMMIT_SLOT";
 
 /// The variables a command is started with.
 pub(crate) struct Variables(Vec<(OsString, OsString)>);

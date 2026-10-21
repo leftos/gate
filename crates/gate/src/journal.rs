@@ -160,16 +160,17 @@ fn read_if_present(path: &Path) -> io::Result<String> {
 }
 
 /// Whether one of the journal lines in `text` is a `take` of a slot or of the machine naming `pid` as its `parentPid` at
-/// or after `since`: a take that lists a slot, or a critical gate's, which carries what it found of the machine. A
-/// no-slot gate's take lists none and counts for nothing. A line that does not parse, as a torn last line may not,
-/// names no one.
+/// or after `since`: a take that lists a slot of a local pool, or a critical gate's, which carries what it found of the
+/// machine. A no-slot gate's take lists none, and a routed gate's take of a remote slot uses no CPU here, so neither
+/// counts. A line that does not parse, as a torn last line may not, names no one.
 fn names_nested_take(text: &str, pid: u32, since: Timestamp) -> bool {
     text.lines()
         .filter(|line| line.contains(r#""event":"take""#) && line.contains(r#""parentPid":"#))
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .any(|line| {
             let took = line["slots"].as_array().is_some_and(|slots| !slots.is_empty()) || line.get("counts").is_some();
-            took && line["parentPid"].as_u64() == Some(u64::from(pid))
+            took && line["remote"] != true
+                && line["parentPid"].as_u64() == Some(u64::from(pid))
                 && line["time"]
                     .as_str()
                     .and_then(|time| time.parse::<Timestamp>().ok())
@@ -203,9 +204,13 @@ mod tests {
         let of_no_slot =
             |extra: &str| format!(r#"{{"v":1,"time":"2026-10-11T10:00:01.0000000Z","event":"take","pid":9,"slots":[]{extra},"parentPid":42}}"#);
         let machine = r#","counts":{"heavy":0,"light":0},"otherHeld":{"heavy":0,"light":0},"otherClaims":[]"#;
+        let remote = of_no_slot(r#","waitedSeconds":0.0"#)
+            .replace(r#""slots":[]"#, r#""slots":["Local\\gate-remote-slot-0"]"#)
+            .replace(r#""parentPid":42}"#, r#""parentPid":42,"remote":true,"host":"builder","key":"k"}"#);
         let rows = [
             ("a take of no slot", of_no_slot(r#","waitedSeconds":0.0"#), false),
             ("a take of the machine that listed no slot", of_no_slot(machine), true),
+            ("a take of a remote slot, which uses no CPU here", remote, false),
         ];
         for (name, line, want) in rows {
             assert_eq!(names_nested_take(&format!("{line}\n"), 42, since), want, "{name}");

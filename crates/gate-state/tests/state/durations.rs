@@ -773,6 +773,7 @@ impl Release<'_> {
             kind: self.kind.to_owned(),
             cwd: self.cwd.to_owned(),
             command: self.command.to_owned(),
+            commit: false,
         };
         let event = JournalEvent::Release {
             slots: vec![r"Local\gate-heavy-slot-0".to_owned()],

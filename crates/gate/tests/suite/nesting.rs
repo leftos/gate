@@ -21,7 +21,7 @@ use serde_json::Value;
 
 use crate::support::{
     Case, Escapee, FAKE_TOOL, GATE, Outcome, POLL, Running, assert_in_order, critical_words, events, events_of, finish, heavy_words, none_words,
-    run_words, said_pid, shown, start, take_of, wait_for_file, wait_for_journal_line, wait_until, write_counts,
+    run_words, said_pid, shown, start, take_of, tool, wait_for_file, wait_for_journal_line, wait_until, write_counts,
 };
 
 /// A heavy pool of one slot.
@@ -1375,4 +1375,234 @@ fn a_gate_given_a_box_job_it_does_not_run_inside_ignores_it() {
         .expect("the gate journalled its take");
     let slot = StateRoot::new(&shown(&case.root()), None).object_name(KernelObject::HeavySlot(0));
     assert_eq!(take["slots"], Value::from(vec![slot]), "its heavy slot, as usual: {take}");
+}
+
+/// The line fake-tool's `priority` step prints at `BELOW_NORMAL_PRIORITY_CLASS`.
+const BELOW_NORMAL_LINE: &str = "priority 0x4000";
+
+/// The lines of the log `name` in the case folder.
+fn log_lines(case: &Case, name: &str) -> Vec<String> {
+    let text = fs::read_to_string(case.folder().join(name)).expect("the gate wrote its log");
+    text.lines().map(str::to_owned).collect()
+}
+
+/// The line a commit run asked for on no slot says once, before it waits for the light slot it takes.
+const NO_SLOT_COMMIT_LINE: &str = "gate: a commit's hooks take a slot: pass --slot heavy or --slot light";
+
+/// The line a critical or `--alone` gate inside a commit's hooks says as it is refused.
+const IN_COMMIT_LINE: &str = "gate: inside a git commit's hooks; a critical or --alone gate cannot run there";
+
+/// The words of a run on a slot of some kind, as [`run_words`] and its siblings give them.
+type Words = for<'a> fn(&'a str, &[&'a str], &[&'a str]) -> Vec<&'a str>;
+
+/// How many times `line` is among `lines`.
+fn count_of<'a>(lines: impl IntoIterator<Item = &'a str>, line: &str) -> usize {
+    lines.into_iter().filter(|said| *said == line).count()
+}
+
+/// Asserts that the one gate journalled in `case` is a commit run: its `queue`, `take` and `release` carry `kind` and
+/// `commit: true`, and its take names the slot `slot`.
+fn assert_commit_lines(case: &Case, kind: &str, slot: KernelObject) {
+    let lines = events(case);
+    let names: Vec<&str> = lines.iter().filter_map(|line| line["event"].as_str()).collect();
+    assert_eq!(names, ["queue", "take", "release"], "{lines:#?}");
+    for line in &lines {
+        assert_eq!((&line["kind"], &line["commit"]), (&Value::from(kind), &Value::Bool(true)), "{line}");
+    }
+    let slot = slot_name(case, slot);
+    assert_eq!(lines[1]["slots"], Value::from(vec![slot]), "its slot taken: {}", lines[1]);
+}
+
+#[test]
+fn a_no_slot_git_commit_takes_a_light_slot_says_so_once_and_runs_its_command_below_normal() {
+    let case = Case::new("a_no_slot_git_commit_takes_a_light_slot_says_so_once_and_runs_its_command_below_normal");
+    let git = tool(&case, "git.exe");
+    let outcome = case.run(&none_words("commit.log", &[], &[&git, "commit", "priority"]));
+    assert_passed(&outcome);
+
+    assert_eq!(count_of(outcome.stderr.lines(), NO_SLOT_COMMIT_LINE), 1, "{outcome:?}");
+    let log = log_lines(&case, "commit.log");
+    assert_eq!(count_of(log.iter().map(String::as_str), NO_SLOT_COMMIT_LINE), 1, "{log:#?}");
+    assert!(log.iter().any(|line| line == BELOW_NORMAL_LINE), "the commit runs below normal: {log:#?}");
+    assert_commit_lines(&case, "light", KernelObject::LightSlot(0));
+}
+
+#[test]
+fn a_light_or_heavy_git_commit_takes_the_slot_it_asked_for_and_says_nothing_of_it() {
+    let kinds: [(&str, KernelObject, Words); 2] = [
+        ("light", KernelObject::LightSlot(0), run_words),
+        ("heavy", KernelObject::HeavySlot(0), heavy_words),
+    ];
+    for (kind, slot, words) in kinds {
+        let case = Case::new(&format!("a_{kind}_git_commit_takes_the_slot_it_asked_for_and_says_nothing_of_it"));
+        let git = tool(&case, "git.exe");
+        let outcome = case.run(&words("commit.log", &[], &[&git, "commit", "priority"]));
+        assert_passed(&outcome);
+
+        assert!(!outcome.stderr.contains(NO_SLOT_COMMIT_LINE), "{kind}: {outcome:?}");
+        let log = log_lines(&case, "commit.log");
+        assert_eq!(count_of(log.iter().map(String::as_str), NO_SLOT_COMMIT_LINE), 0, "{kind}: {log:#?}");
+        assert!(
+            log.iter().any(|line| line == BELOW_NORMAL_LINE),
+            "the {kind} commit runs below normal: {log:#?}"
+        );
+        assert_commit_lines(&case, kind, slot);
+    }
+}
+
+#[test]
+fn a_no_slot_run_that_is_no_commit_takes_no_slot_and_runs_below_normal() {
+    let case = Case::new("a_no_slot_run_that_is_no_commit_takes_no_slot_and_runs_below_normal");
+    let git = tool(&case, "git.exe");
+    let other = case.run(&none_words("other.log", &[], &[FAKE_TOOL, "priority"]));
+    assert_passed(&other);
+    // git whose first word after it is no `commit`.
+    let not_commit = case.run(&none_words("git.log", &[], &[&git, "priority"]));
+    assert_passed(&not_commit);
+
+    for outcome in [&other, &not_commit] {
+        assert!(!outcome.stderr.contains(NO_SLOT_COMMIT_LINE), "{outcome:?}");
+    }
+    for log in ["other.log", "git.log"] {
+        let lines = log_lines(&case, log);
+        assert!(lines.iter().any(|line| line == BELOW_NORMAL_LINE), "{log} runs below normal");
+        assert_eq!(count_of(lines.iter().map(String::as_str), NO_SLOT_COMMIT_LINE), 0, "{log}: {lines:#?}");
+    }
+    let lines = events(&case);
+    let names: Vec<&str> = lines.iter().filter_map(|line| line["event"].as_str()).collect();
+    assert_eq!(names, ["queue", "take", "release", "queue", "take", "release"], "{lines:#?}");
+    for line in &lines {
+        assert_eq!((&line["kind"], line.get("commit")), (&Value::from("none"), None), "{line}");
+    }
+    assert_eq!((&lines[1]["slots"], &lines[4]["slots"]), (&json_empty(), &json_empty()), "no slot taken");
+}
+
+#[test]
+fn a_no_slot_git_commit_under_a_covering_parent_says_nothing_of_its_slot() {
+    let case = Case::new("a_no_slot_git_commit_under_a_covering_parent_says_nothing_of_its_slot");
+    let git = tool(&case, "git.exe");
+    let mut inner = vec![GATE];
+    inner.extend(none_words("commit.log", &[], &[&git, "commit", "exit", "0"]));
+    let outcome = case.run(&heavy_words("outer.log", &[], &inner));
+    assert_passed(&outcome);
+
+    let log = log_lines(&case, "commit.log");
+    assert_eq!(count_of(log.iter().map(String::as_str), NO_SLOT_COMMIT_LINE), 0, "{log:#?}");
+}
+
+/// An empty JSON array, as a `take` of no slot lists its slots.
+fn json_empty() -> Value {
+    Value::Array(Vec::new())
+}
+
+/// A commit run of `outer` words in `case` whose hooks start a gate of `inner` words, logging to `inner.log`, and wait
+/// for it to end: the commit's pid, the nested gate's pid and the nested gate's exit status, once the commit passed.
+fn commit_with_hook_gate(case: &Case, outer: Words, inner: &[&str]) -> (u32, u32, u32) {
+    let git = tool(case, "git.exe");
+    let (pid_file, release) = (case.folder().join("inner.pid"), case.folder().join("outer.release"));
+    let (pid_text, release_text) = (shown(&pid_file), shown(&release));
+    let mut command = vec![git.as_str(), "commit", "spawn-pid", &pid_text, &release_text, GATE];
+    command.extend(inner);
+    let running = case.start(&outer("outer.log", &[], &command));
+    let outer_pid = running.id();
+
+    let nested = started_gate(&pid_file);
+    let status = nested.ended();
+    let_go(&release);
+    assert_passed(&running.finish());
+    (outer_pid, nested.pid, status)
+}
+
+#[test]
+fn a_heavy_gate_in_a_light_commit_run_s_hooks_takes_a_heavy_slot_of_its_own() {
+    let case = Case::new("a_heavy_gate_in_a_light_commit_run_s_hooks_takes_a_heavy_slot_of_its_own");
+    let inner = heavy_words("inner.log", &[], &[FAKE_TOOL, "exit", "0"]);
+    let (outer_pid, inner_pid, status) = commit_with_hook_gate(&case, none_words, &inner);
+
+    assert_eq!(status, 0, "the nested gate passed");
+    assert_eq!(
+        events_of(&case, inner_pid),
+        ["queue", "take", "release"],
+        "the nested gate takes its own slot"
+    );
+    let inner_take = take_of(&case, inner_pid);
+    assert_eq!(
+        (&inner_take["slots"], &inner_take["parentPid"]),
+        (&Value::from(vec![slot_name(&case, KernelObject::HeavySlot(0))]), &Value::from(outer_pid)),
+        "{inner_take}"
+    );
+    let outer_take = take_of(&case, outer_pid);
+    assert_eq!(
+        outer_take["slots"],
+        Value::from(vec![slot_name(&case, KernelObject::LightSlot(0))]),
+        "{outer_take}"
+    );
+}
+
+#[test]
+fn a_heavy_gate_in_a_heavy_commit_run_s_hooks_runs_under_its_slot_without_waiting_for_another() {
+    let case = Case::new("a_heavy_gate_in_a_heavy_commit_run_s_hooks_runs_under_its_slot_without_waiting_for_another");
+    // The commit holds the heavy pool's one slot: a nested gate that waited for a heavy slot would never end.
+    write_counts(&case.root(), ONE_HEAVY);
+    let inner = heavy_words("inner.log", &[], &[FAKE_TOOL, "exit", "0"]);
+    let (outer_pid, inner_pid, status) = commit_with_hook_gate(&case, heavy_words, &inner);
+
+    assert_eq!(status, 0, "the nested gate ran under the commit's slot");
+    assert_eq!(events_of(&case, inner_pid), ["covered"]);
+    assert_eq!(covered(&case)["parentPid"], Value::from(outer_pid));
+    assert_eq!(events_of(&case, outer_pid), ["queue", "take", "release"]);
+}
+
+#[test]
+fn a_critical_gate_in_a_commit_run_s_hooks_is_refused_naming_the_commit() {
+    let rows: [(&str, &[&str]); 2] = [("critical", &[]), ("alone", &["--alone"])];
+    for (name, extra) in rows {
+        let case = Case::new(&format!("a_{name}_gate_in_a_commit_run_s_hooks_is_refused_naming_the_commit"));
+        fs::write(case.folder().join("inner.log"), "earlier\n").expect("an earlier log can be written");
+        let inner = critical_words("inner.log", extra, &[FAKE_TOOL, "exit", "0"]);
+        let (outer_pid, inner_pid, status) = commit_with_hook_gate(&case, none_words, &inner);
+
+        assert_eq!(status, 2, "{name}: refused");
+        assert_eq!(log_lines(&case, "inner.log"), ["earlier"], "{name}: the earlier log is left in place");
+        // The hook gate's stderr is the commit's command's, which the commit's log holds.
+        let outer_log = log_lines(&case, "outer.log");
+        assert_eq!(
+            count_of(outer_log.iter().map(String::as_str), IN_COMMIT_LINE),
+            1,
+            "{name}: {outer_log:#?}"
+        );
+        assert!(events_of(&case, inner_pid).is_empty(), "{name}: the refused gate journals nothing");
+        assert_eq!(events_of(&case, outer_pid), ["queue", "take", "release"], "{name}");
+    }
+}
+
+#[test]
+fn a_critical_gate_under_a_commit_run_s_marker_says_its_refusal_on_stderr() {
+    let rows: [(&str, &[&str]); 2] = [("critical", &[TRUSTED]), ("alone", &[TRUSTED, "--alone"])];
+    for (name, extra) in rows {
+        let case_name = format!("a_{name}_gate_under_a_commit_run_s_marker_says_its_refusal_on_stderr");
+        let (outcome, _case) = refused(&case_name, "light", |case| {
+            let mut gate = case.gate(&critical_words("refused.log", extra, &[FAKE_TOOL, "exit", "0"]));
+            // The marker a commit run hands its command, naming this test process's light slot as the commit's.
+            gate.env("GATE_COMMIT_SLOT", test_marker(case, "light"));
+            gate
+        });
+        assert_eq!(outcome.stderr, format!("{IN_COMMIT_LINE}\n"), "{name}");
+    }
+}
+
+#[test]
+fn a_critical_gate_under_a_light_gate_that_is_no_commit_keeps_today_s_refusal() {
+    let case = Case::new("a_critical_gate_under_a_light_gate_that_is_no_commit_keeps_today_s_refusal");
+    let mut inner = vec![GATE];
+    inner.extend(critical_words("inner.log", &[], &[FAKE_TOOL, "exit", "0"]));
+    let outcome = case.run(&run_words("outer.log", &[], &inner));
+
+    assert_eq!(outcome.code, Some(2), "the nested gate's refusal fails the run: {outcome:?}");
+    let said = format!("{}{}", outcome.stdout, outcome.stderr);
+    assert!(
+        said.contains("gate: --slot critical cannot run under the light slot of gate "),
+        "{outcome:?}"
+    );
+    assert!(!said.contains(IN_COMMIT_LINE), "{outcome:?}");
 }

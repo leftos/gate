@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use gate_state::{StateRoot, default_root};
 
-use crate::environment::{BOX_JOB_VARIABLE, SLOT_HELD_VARIABLE};
+use crate::environment::{BOX_JOB_VARIABLE, COMMIT_SLOT_VARIABLE, SLOT_HELD_VARIABLE};
 
 /// The environment variables the gate reads.
 pub(crate) struct Environment {
@@ -19,6 +19,8 @@ pub(crate) struct Environment {
     pub slot_held: Option<OsString>,
     /// `GATE_BOX_JOB`, the job of the box run this gate may run inside, if any.
     pub box_job: Option<OsString>,
+    /// `GATE_COMMIT_SLOT`, the slot marker of the commit run this gate may run in the hooks of, if any.
+    pub commit_slot: Option<OsString>,
 }
 
 impl Environment {
@@ -29,6 +31,7 @@ impl Environment {
             git_index_file: std::env::var_os("GIT_INDEX_FILE"),
             slot_held: std::env::var_os(SLOT_HELD_VARIABLE),
             box_job: std::env::var_os(BOX_JOB_VARIABLE),
+            commit_slot: std::env::var_os(COMMIT_SLOT_VARIABLE),
         }
     }
 }
@@ -106,6 +109,7 @@ mod tests {
             git_index_file: None,
             slot_held: None,
             box_job: None,
+            commit_slot: None,
         };
         let variable = Environment {
             state_dir: Some(given.clone().into_os_string()),
@@ -113,6 +117,7 @@ mod tests {
             git_index_file: None,
             slot_held: None,
             box_job: None,
+            commit_slot: None,
         };
 
         assert_eq!(root(None, &no_root).err().as_deref(), Some("gate: cannot read the LOCALAPPDATA variable"));

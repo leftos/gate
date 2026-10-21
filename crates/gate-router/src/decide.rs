@@ -740,7 +740,7 @@ pub fn is_dotnet(words: &[String]) -> bool {
 /// `--` is not read as one.
 #[must_use]
 pub fn is_cargo(words: &[String]) -> bool {
-    first_word(words).is_some_and(|(_, word)| is_named(word, CARGO))
+    first_word(words).is_some_and(|(_, word)| names_program(word, CARGO))
 }
 
 /// Whether the words are a dotnet command ([`is_dotnet`]) that builds: the dotnet command's verb, the next non-empty
@@ -875,14 +875,14 @@ fn has_extension(word: &str, extensions: &[&str]) -> bool {
 /// The index of the dotnet word of a dotnet command ([`is_dotnet`]); `None` for any other command.
 fn dotnet_start(words: &[String]) -> Option<usize> {
     let (index, first) = first_word(words)?;
-    if is_named(first, DOTNET) {
+    if names_program(first, DOTNET) {
         return Some(index);
     }
-    if !WRAPPERS.iter().any(|wrapper| is_named(first, wrapper)) {
+    if !WRAPPERS.iter().any(|wrapper| names_program(first, wrapper)) {
         return None;
     }
     let after = index + words[index..].iter().position(|word| word == SEPARATOR)? + 1;
-    words.get(after).filter(|word| is_named(word, DOTNET)).map(|_| after)
+    words.get(after).filter(|word| names_program(word, DOTNET)).map(|_| after)
 }
 
 /// The dotnet command's own words: from its dotnet word up to, not including, the first `--` after it, whose words go
@@ -898,8 +898,10 @@ fn dotnet_own(words: &[String]) -> Option<Range<usize>> {
     (!opaque).then_some(start..end)
 }
 
-/// Whether a word names the program `name`: its file name without extension is `name`, ignoring letter case.
-fn is_named(word: &str, name: &str) -> bool {
+/// Whether a word names the program `name`: its file name without extension, as Windows reads a path, is `name`,
+/// ignoring letter case (`git`, `git.exe` and a full path to it all name `git`).
+#[must_use]
+pub fn names_program(word: &str, name: &str) -> bool {
     eq_ignoring_case(file_stem(word), name)
 }
 

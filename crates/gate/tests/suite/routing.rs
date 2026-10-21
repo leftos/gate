@@ -16,8 +16,8 @@ use crate::nesting::{LOOK_OFTEN, end_parent, first_event, marked, orphaned_as, s
 
 use crate::support::{
     Case, DenyEntry, FAKE_TOOL, GATE, Go, Junction, LOCAL_REASON, Outcome, Running, assert_in_order, beside, copy_tool, events, finish, git,
-    git_init, heavy_words, nothing_back, powershell_folder, record_path, release, run_words, shown, wait_for_journal_line, wait_until, write_counts,
-    write_remote_json,
+    git_init, heavy_words, nothing_back, powershell_folder, record_path, release, run_words, shown, start, wait_for_journal_line, wait_until,
+    write_counts, write_remote_json,
 };
 
 pub(crate) const HOST: &str = "builder";
@@ -418,6 +418,114 @@ fn a_gate_inside_a_git_hook_routes_when_remote_json_consents_its_repo() {
     let events = events(&case);
     assert_eq!(names(&events), ["queue", "take", "release"], "{events:#?}");
     assert!(events.iter().all(has_remote_tag), "{events:#?}");
+}
+
+/// A routed case named `name` whose `remote.json` consents its hooks, with a heavy pool of one slot and a `git.exe`
+/// stand-in.
+fn commit_hook_case(name: &str) -> Case {
+    let case = routed_case(name);
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["*tool*"] },
+        "hooks": [repo(&case)],
+    });
+    write_remote_json(&case, &routing.to_string());
+    write_counts(&case.root(), r#"{"v":1,"heavy":1}"#);
+    copy_tool(&case, "git.exe");
+    case
+}
+
+/// A heavy commit run in `case`, holding the heavy pool's one slot, whose pre-commit hook starts a routed gate through
+/// the scripted client of `steps`, logging to `inner.log`, which its slot covers: the commit's pid and the nested
+/// gate's pid, once both passed.
+fn run_heavy_commit_with_routed_hook(case: &Case, steps: &[&str]) -> (u32, u32) {
+    let steps = shown(&stub(case, steps));
+    let (pid_file, release) = (case.folder().join("inner.pid"), case.folder().join("outer.release"));
+    for file in [&pid_file, &release] {
+        let removed = fs::remove_file(file);
+        assert!(
+            removed.as_ref().is_ok() || removed.as_ref().is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "an earlier run's {} can be removed: {removed:?}",
+            file.display()
+        );
+    }
+    let (pid_text, release_text) = (shown(&pid_file), shown(&release));
+    let mut command = vec![r".\git.exe", "commit", "spawn-pid", &pid_text, &release_text, GATE];
+    command.extend(routed_words("inner.log", &steps, &[], &[r".\tool.exe", "out", "ran there"]));
+    let mut outer = case.gate(&heavy_words("outer.log", &[], &command));
+    // Inside a pre-commit hook, as git sets it for the hook and every gate the hook starts.
+    outer.env("GIT_INDEX_FILE", "x");
+    let outer = start(outer);
+    let outer_pid = outer.id();
+
+    let (inner, first) = first_event(case, &pid_file);
+    assert_eq!(first["event"], "queue", "the nested gate queues for a remote slot: {first}");
+    assert_eq!(inner.ended(), 0);
+    let_go(&release);
+    assert_eq!(outer.finish().code, Some(0));
+
+    let outer_lines = own(case, outer_pid);
+    assert_eq!(names(&outer_lines), ["queue", "take", "release"], "{outer_lines:#?}");
+    assert!(
+        outer_lines.iter().all(|line| line["commit"] == true && line["kind"] == "heavy"),
+        "{outer_lines:#?}"
+    );
+    (outer_pid, inner.pid)
+}
+
+/// [`run_heavy_commit_with_routed_hook`] once in a case of its own named `name`: the case and both pids.
+fn heavy_commit_with_routed_hook(name: &str, steps: &[&str]) -> (Case, u32, u32) {
+    let case = commit_hook_case(name);
+    let (outer_pid, inner_pid) = run_heavy_commit_with_routed_hook(&case, steps);
+    (case, outer_pid, inner_pid)
+}
+
+#[test]
+fn a_gate_in_a_commit_run_s_hooks_routes_and_takes_a_remote_slot_of_its_own() {
+    let (case, outer_pid, inner_pid) = heavy_commit_with_routed_hook("routing-commit-hook", &["status 0"]);
+
+    let inner_lines = own(&case, inner_pid);
+    assert_eq!(names(&inner_lines), ["queue", "take", "release"], "{inner_lines:#?}");
+    assert!(inner_lines.iter().all(has_remote_tag), "{inner_lines:#?}");
+    assert_eq!(inner_lines[1]["parentPid"], Value::from(outer_pid), "{}", inner_lines[1]);
+    let slot = inner_lines[1]["slots"][0].as_str();
+    assert!(
+        slot.is_some_and(|slot| slot.ends_with("remote-slot-0")),
+        "a remote slot: {}",
+        inner_lines[1]
+    );
+}
+
+#[test]
+fn a_gate_in_a_commit_run_s_hooks_that_ends_on_the_builder_files_its_release_in_the_durations_history() {
+    let case = commit_hook_case("routing-commit-hook-durations");
+    // A key says its expected time from its sixth run on: five runs on the builder file five releases.
+    for _ in 0..5 {
+        run_heavy_commit_with_routed_hook(&case, &["status 0"]);
+    }
+    let (_, inner_pid) = run_heavy_commit_with_routed_hook(&case, &["status 0"]);
+
+    let release = own(&case, inner_pid).into_iter().find(|line| line["event"] == "release");
+    assert!(release.is_some_and(|line| has_remote_tag(&line)), "the hook gate released on the builder");
+    let log = fs::read_to_string(case.folder().join("inner.log")).expect("the hook gate wrote its log");
+    assert!(
+        log.contains("gate: expected"),
+        "the hook gate reads its history and says its expected time: {log}"
+    );
+}
+
+#[test]
+fn a_gate_in_a_commit_run_s_hooks_that_falls_back_runs_under_the_commit_s_slot_saying_so_once() {
+    let (case, outer_pid, inner_pid) = heavy_commit_with_routed_hook("routing-commit-hook-fallback", &["refuse busy"]);
+
+    let inner_lines = own(&case, inner_pid);
+    // It queues and takes a remote slot beside the commit, then falls back under the commit's slot.
+    assert_eq!(names(&inner_lines), ["queue", "take", "fallback", "covered"], "{inner_lines:#?}");
+    assert_eq!(inner_lines[3]["parentPid"], Value::from(outer_pid), "{}", inner_lines[3]);
+    let log = fs::read_to_string(case.folder().join("inner.log")).expect("the nested gate wrote its log");
+    let covered = format!("gate: running under the heavy slot of gate {outer_pid}");
+    assert_eq!(log.lines().filter(|line| *line == covered).count(), 1, "one nesting line: {log}");
+    assert!(log.contains("ran there"), "the command ran here: {log}");
 }
 
 #[test]

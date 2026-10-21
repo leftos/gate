@@ -28,8 +28,9 @@ const START_DIGITS: usize = 18;
 const MARKER_SHOWN: usize = 64;
 
 /// A live parent gate named by the marker: the slot kind it holds, its pid, the start it runs since in Unix epoch
-/// milliseconds, its marker as written, why this gate's binding to it could not be judged, when it could not, and
-/// whether it stands in for the ended gate the marker names ([`Parent::standing_in`]).
+/// milliseconds, its marker as written, why this gate's binding to it could not be judged, when it could not, whether
+/// it stands in for the ended gate the marker names ([`Parent::standing_in`]), and whether it is the commit run whose
+/// hooks this gate runs in ([`Nesting::marked_for_commit`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Parent {
     pub held: Slot,
@@ -38,6 +39,7 @@ pub(crate) struct Parent {
     pub marker: String,
     pub unjudged: Option<String>,
     pub stand_in: bool,
+    pub commit: bool,
 }
 
 /// What a gate does under the marker it was started with.
@@ -170,7 +172,8 @@ impl Nesting {
             console.err(&line);
         }
         let inside = |pid, start_ms| bound(&root.root, pid, start_ms, job_trusted);
-        let nesting = Nesting::decide(environment.slot_held.as_deref(), kind, root.root.hash(), gate_liveness, inside);
+        let nesting = Nesting::decide(environment.slot_held.as_deref(), kind, root.root.hash(), gate_liveness, inside)
+            .marked_for_commit(environment.commit_slot.as_deref());
         let (Nesting::Ended { marker, .. } | Nesting::Unbound { marker, .. }) = &nesting else {
             return nesting;
         };
@@ -227,9 +230,24 @@ impl Nesting {
                 marker: text.into_owned(),
                 unjudged,
                 stand_in: false,
+                commit: false,
             },
             kind,
         )
+    }
+
+    /// This nesting with its live parent marked as the commit run whose hooks this gate runs in, when its marker is
+    /// `commit_marker`, the one the commit run hands its command (`GATE_COMMIT_SLOT`); it covers the gate as any parent
+    /// holding its slot does. Any other nesting, and a parent with another marker, as it is.
+    fn marked_for_commit(self, commit_marker: Option<&OsStr>) -> Nesting {
+        let commit_s = |parent: &Parent| commit_marker == Some(OsStr::new(&parent.marker));
+        let marked = |parent: Parent| Parent { commit: true, ..parent };
+        match self {
+            Nesting::Covered(parent) if commit_s(&parent) => Nesting::Covered(marked(parent)),
+            Nesting::Refused(parent) if commit_s(&parent) => Nesting::Refused(marked(parent)),
+            Nesting::Under(parent) if commit_s(&parent) => Nesting::Under(marked(parent)),
+            other => other,
+        }
     }
 
     /// The nesting of a gate of `kind` under the live parent `parent`, whose command it runs inside.
@@ -284,6 +302,23 @@ impl Nesting {
             Nesting::Covered(parent) => Some(parent),
             _ => None,
         }
+    }
+
+    /// The parent whose slot covers this gate when it is the commit run whose hooks this gate runs in
+    /// ([`Nesting::marked_for_commit`]). A gate under it runs here under its slot, as any covered gate does, but routes as
+    /// a gate under no parent would, so a build in a commit's hooks still routes. None for every other nesting, a parent
+    /// standing in for an ended one included.
+    pub(crate) fn under_commit(&self) -> Option<&Parent> {
+        match self {
+            Nesting::Covered(parent) if parent.commit => Some(parent),
+            _ => None,
+        }
+    }
+
+    /// Whether this gate runs inside the hooks of a live commit run, whether its slot covers the gate, refuses it or
+    /// does not cover it ([`Nesting::marked_for_commit`]).
+    pub(crate) fn in_commit(&self) -> bool {
+        matches!(self, Nesting::Covered(parent) | Nesting::Refused(parent) | Nesting::Under(parent) if parent.commit)
     }
 
     /// The parent this gate takes a slot of its own under: one whose slot does not cover it, or one that holds no slot.
@@ -360,6 +395,7 @@ impl Parent {
             marker,
             unjudged: None,
             stand_in: true,
+            commit: false,
         }
     }
 
@@ -650,6 +686,7 @@ mod tests {
             marker: marker(held.as_str()),
             unjudged: None,
             stand_in: false,
+            commit: false,
         };
         assert_eq!(decided(&marker("heavy"), Slot::Light), Nesting::Covered(parent(Slot::Heavy)));
         assert_eq!(decided(&marker("heavy"), Slot::Critical), Nesting::Refused(parent(Slot::Heavy)));
@@ -684,6 +721,7 @@ mod tests {
             marker: marker(held),
             unjudged: None,
             stand_in: false,
+            commit: false,
         }
     }
 
@@ -765,6 +803,7 @@ mod tests {
                 marker: hashless.clone(),
                 unjudged: None,
                 stand_in: false,
+                commit: false,
             }),
             "no hash under the default root"
         );
@@ -1151,6 +1190,7 @@ mod tests {
                 marker: marker(Slot::Critical),
                 unjudged: None,
                 stand_in: true,
+                commit: false,
             },
             "the stand-in's own kind, not the ended parent's"
         );
@@ -1214,6 +1254,7 @@ mod tests {
             git_index_file: None,
             slot_held: marker.map(OsString::from),
             box_job: job.map(OsString::from),
+            commit_slot: None,
         }
     }
 

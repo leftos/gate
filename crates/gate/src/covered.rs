@@ -145,6 +145,7 @@ mod tests {
             kind: "light".to_owned(),
             cwd: r"C:\work\repo".to_owned(),
             command: "cargo fmt --check".to_owned(),
+            commit: false,
         };
 
         let mut covered = Covered::write_as(&root, Ok(&identity), 52000, &mut console);
@@ -184,6 +185,7 @@ mod tests {
             kind: "heavy".to_owned(),
             cwd: r"C:\work\repo".to_owned(),
             command: "cargo build".to_owned(),
+            commit: false,
         };
         let kinds = || -> Vec<Option<String>> {
             v1::read_covered(&v1::covered_dir(&root))
