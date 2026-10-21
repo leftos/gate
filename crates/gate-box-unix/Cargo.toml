@@ -1,0 +1,27 @@
+[package]
+name = "gate-box-unix"
+version.workspace = true
+edition = "2024"
+publish = false
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "gate-box"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+gate-args = { path = "../gate-args" }
+gate-wire = { path = "../gate-wire" }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.190"
+
+[dev-dependencies]
+# The tests build request words as the PC's client does: base64 of the JSON payload.
+base64 = "0.23.1"

@@ -41,7 +41,7 @@ pub const DEFAULT_DESKTOP: &str = "Default";
 pub enum Message {
     /// Helper to box, first: the helper's build and the desktop that takes input in its session.
     Hello {
-        /// The helper's version text, as [`crate::version::build_version`] gives it.
+        /// The helper's version text, as [`gate_wire::build_version`] gives it.
         version: String,
         /// The input desktop's name, or empty when it could not be read.
         desktop: String,

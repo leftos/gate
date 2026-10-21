@@ -13,9 +13,9 @@ use std::thread;
 use std::time::Duration;
 
 use gate_args::BoxSeams;
-use gate_desktop::version::build_version;
 use gate_router::escaped;
 use gate_win32::{Make, Share};
+use gate_wire::build_version;
 use gate_wire::{Pair, PairSibling, PathForm, Payload, bare_stem, work_root};
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,

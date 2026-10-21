@@ -20,13 +20,13 @@ use std::time::{Duration, Instant};
 
 use gate_args::BoxSeams;
 use gate_desktop::protocol::{HELPER_FRAME_LIMIT, Message, ReadError, Spawn, WriteError, read_message, write_message};
-use gate_desktop::version::build_version;
 use gate_desktop::{PIPE_PREFIX, TASK_PATH, arg0};
 use gate_router::escaped;
 use gate_win32::{
     ConnectWait, EndWait, Job, OutputPipes, PipeOwner, PipeServer, QueryOnlyProcess, RemoteProcess, Share, StartedTask, StoppableProcess, Suspended,
     TaskArgument, TaskError, TaskStart,
 };
+use gate_wire::build_version;
 use jiff::Timestamp;
 use proc_table::{ProcessInfo, Win32ProcessTable};
 use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;

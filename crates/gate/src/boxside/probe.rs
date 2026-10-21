@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use gate_router::escaped;
 use gate_win32::{Hive, PipedConsole, Subkey};
-use gate_wire::{MAX_PART_DIGITS, is_canonical_version, is_drive_path};
+use gate_wire::{MAX_PART_DIGITS, is_canonical_version, is_drive_path, version_of};
 use serde_json::Value;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
 
@@ -684,55 +684,12 @@ pub(crate) fn panic_reason(panic: &(dyn Any + Send)) -> String {
 }
 
 /// What a probe that ran to its exit with `output` found: present when it exited non-zero or its first line holds no
-/// version; else that version.
+/// version ([`version_of`]); else that version.
 fn read(output: &ProgramOutput) -> Probed {
     if !output.status.success() {
         return Probed::Present;
     }
     version_of(&String::from_utf8_lossy(&output.stdout), &String::from_utf8_lossy(&output.stderr)).map_or(Probed::Present, Probed::Version)
-}
-
-/// The version a probe wrote: the first version of the first non-blank line of its standard output, or of its standard
-/// error when its standard output holds nothing but blanks. Only that line is read: a tool's later lines may name
-/// another program's version, as ffmpeg's `built with gcc 14.2.0` does.
-fn version_of(stdout: &str, stderr: &str) -> Option<String> {
-    let chosen = if stdout.trim().is_empty() { stderr } else { stdout };
-    chosen.lines().find(|line| !line.trim().is_empty()).and_then(first_version)
-}
-
-/// The first version `text` spells: the first run of two or more dot-separated runs of ASCII digits, after an optional
-/// `v`, that starts no word or number already begun (so not after a letter, a digit or a `.`), cut to its first three
-/// numbers; what follows it, such as a `-` build label, is no part of it. `None` when there is no such run, or when a
-/// number of the first one has more than [`MAX_PART_DIGITS`] digits.
-pub(crate) fn first_version(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    let parts = (0..bytes.len())
-        .filter(|&at| starts_number(bytes, at))
-        .find_map(|at| dotted(&text[at..]))?;
-    let readable = parts.iter().all(|part| part.len() <= MAX_PART_DIGITS);
-    readable.then(|| parts[..parts.len().min(3)].join("."))
-}
-
-/// Whether a version may start at `at` in `bytes`: a digit not after a letter, a digit or a `.`, or after a `v` that
-/// is itself not after one of them.
-fn starts_number(bytes: &[u8], at: usize) -> bool {
-    let free = |before: Option<&u8>| before.is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'.');
-    let before = at.checked_sub(1).and_then(|index| bytes.get(index));
-    bytes[at].is_ascii_digit()
-        && match before {
-            Some(b'v' | b'V') => free(at.checked_sub(2).and_then(|index| bytes.get(index))),
-            _ => free(before),
-        }
-}
-
-/// The dot-separated runs of digits `text` starts with, up to the first empty one, when there are two or more; `None`
-/// when there are fewer.
-fn dotted(text: &str) -> Option<Vec<&str>> {
-    let end = text
-        .find(|character: char| !character.is_ascii_digit() && character != '.')
-        .unwrap_or(text.len());
-    let parts: Vec<&str> = text[..end].split('.').take_while(|part| !part.is_empty()).collect();
-    (parts.len() >= 2).then_some(parts)
 }
 
 /// The versions `versions` names, deduplicated and ordered by number, joined by `,`.
@@ -779,9 +736,9 @@ mod tests {
 
     use super::GODOT;
     use super::{
-        Batch, Candidate, Pending, Probed, build_version, first_version, godot_candidates, godot_gave_no_version, godot_version, is_reparse_point,
-        is_version_name, late_reason, named_as_found, netfx_sdk, panic_reason, probe, read_godot, started, tool_line, unreal_installs, unreal_read,
-        unreal_version, version_list, version_of,
+        Batch, Candidate, Pending, Probed, build_version, godot_candidates, godot_gave_no_version, godot_version, is_reparse_point, is_version_name,
+        late_reason, named_as_found, netfx_sdk, panic_reason, probe, read_godot, started, tool_line, unreal_installs, unreal_read, unreal_version,
+        version_list,
     };
     use crate::environment::Variables;
     use crate::remote::git::{ProgramOutput, ProgramPlace};
@@ -828,18 +785,9 @@ mod tests {
         assert!(!is_reparse_point(false, DIRECTORY), "a plain folder");
     }
 
-    /// `git-lfs version` answers `git-lfs/<x.y.z> (...)`; the version is the one after the slash, never the go or git
-    /// version in the parentheses.
+    /// `git-lfs` is probed by `git-lfs version`, whose `git-lfs/<x.y.z>` line `gate_wire::version_of` reads.
     #[test]
-    fn git_lfs_version_is_read_from_its_slash_line() {
-        assert_eq!(
-            version_of("git-lfs/3.8.0 (GitHub; windows amd64; go 1.24.4; git 2d2b1a8c)\n", ""),
-            Some("3.8.0".to_owned())
-        );
-        assert_eq!(
-            version_of("git-lfs/3.7.1-rc1 (GitHub; windows arm64; go 1.24.2)\r\n", ""),
-            Some("3.7.1".to_owned())
-        );
+    fn git_lfs_is_probed_by_its_version_verb() {
         assert!(matches!(
             super::probe_of("git-lfs"),
             Some(super::ToolProbe::Runs {
@@ -847,71 +795,6 @@ mod tests {
                 args: &["version"]
             })
         ));
-    }
-
-    #[test]
-    fn the_version_is_the_first_dotted_number_after_an_optional_v() {
-        for (text, version) in [
-            ("rustc 1.99.0 (b940084d7 2026-09-28)", "1.99.0"),
-            ("v24.19.0", "24.19.0"),
-            ("12.5.1", "12.5.1"),
-            ("PowerShell 7.6.6", "7.6.6"),
-            ("ffmpeg version 9.0.2-full_build-www.gyan.dev Copyright (c) 2000-2026", "9.0.2"),
-            ("cargo-nextest 0.9.100 (abc 2026-01-01)", "0.9.100"),
-            ("cargo-nextest 0.9.148 (cd1d6d546 2026-10-07)", "0.9.148"),
-            ("10.12", "10.12"),
-            ("tool 1.2.3.4", "1.2.3"),
-            ("tool 1.2.", "1.2"),
-            ("tool 1234567890.1", "1234567890.1"),
-        ] {
-            assert_eq!(first_version(text).as_deref(), Some(version), "{text:?}");
-        }
-    }
-
-    #[test]
-    fn text_with_no_dotted_number_has_no_version() {
-        for text in [
-            "ffmpeg version N-112345-gabcdef",
-            "",
-            "24",
-            "x1.2 rev2.3",
-            "abc1.2.3",
-            "1..2",
-            "release 7.",
-        ] {
-            assert_eq!(first_version(text), None, "{text:?}");
-        }
-    }
-
-    #[test]
-    fn a_number_of_more_than_ten_digits_is_no_readable_version() {
-        for text in [
-            "tool 12345678901.2",
-            "tool 1.12345678901",
-            "tool 1.2.3.12345678901",
-            "v99999999999.0 then 1.2.3",
-        ] {
-            assert_eq!(first_version(text), None, "{text:?}");
-        }
-    }
-
-    #[test]
-    fn only_the_first_line_of_the_chosen_stream_is_read() {
-        let gyan = "ffmpeg version 9.0.2-full_build-www.gyan.dev Copyright (c) 2000-2026\r\nbuilt with gcc 14.2.0\r\n";
-        assert_eq!(version_of(gyan, "").as_deref(), Some("9.0.2"));
-        let git_build = "ffmpeg version N-117456-gabc Copyright (c) 2000-2026\r\nbuilt with gcc 14.2.0\r\n";
-        assert_eq!(version_of(git_build, ""), None, "the compiler's version is not the tool's");
-        assert_eq!(version_of("\r\n  \r\nv24.19.0\r\n", "").as_deref(), Some("24.19.0"), "blank lines first");
-        assert_eq!(
-            version_of(" \r\n", "PowerShell 7.6.6\r\n").as_deref(),
-            Some("7.6.6"),
-            "stderr when stdout is blank"
-        );
-        assert_eq!(
-            version_of("no version here\r\n", "7.6.6\r\n"),
-            None,
-            "stderr is not read when stdout has text"
-        );
     }
 
     #[test]

@@ -9,10 +9,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gate_win32::{DesktopLaunch, EnvironmentBlock, LaunchError, PipeClient, PipeOwner, Released, Suspended};
+use gate_wire::build_version;
 use windows_sys::Win32::System::SystemServices::SECURITY_MANDATORY_MEDIUM_RID;
 
 use crate::protocol::{DEFAULT_DESKTOP, FRAME_LIMIT, Message, ReadError, Spawn, WriteError, read_message, write_message};
-use crate::version::build_version;
 use crate::{CONNECT_LIMIT, DONE_LIMIT, HelperExit, MESSAGE_LIMIT, parse_arg0};
 
 /// `ERROR_FILE_NOT_FOUND`: no pipe of the name exists yet.

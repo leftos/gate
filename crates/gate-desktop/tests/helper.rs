@@ -185,7 +185,7 @@ impl Session {
             _ => None,
         }
         .expect("the helper's first message is a hello");
-        assert_eq!(version, gate_desktop::version::build_version());
+        assert_eq!(version, gate_wire::build_version());
         assert_eq!(ok, desktop == "Default", "ok says whether the input desktop is Default ({desktop:?})");
         let remote = RemoteProcess::open(helper.id()).expect("the helper opens");
         Session { server, helper, remote }
@@ -707,7 +707,7 @@ fn wrong_version_mode_says_another_build() {
 
     assert_eq!(ok, desktop == "Default", "the desktop half is the helper's own ({desktop:?})");
     assert_eq!(version, "0.0.0+fault", "the build the wrong-version fault names");
-    assert_ne!(version, gate_desktop::version::build_version(), "which is no build of this helper");
+    assert_ne!(version, gate_wire::build_version(), "which is no build of this helper");
 
     drop(server);
     assert_eq!(exit_of(&mut helper), code(HelperExit::BoxGone), "the helper ends with its pipe");

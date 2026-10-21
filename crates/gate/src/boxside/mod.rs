@@ -27,7 +27,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use gate_args::{BoxRequest, BoxVerb, Problem};
-use gate_desktop::version::build_version;
+use gate_wire::build_version;
 use gate_wire::{PathForm, Payload};
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};

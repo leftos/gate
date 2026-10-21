@@ -25,7 +25,7 @@ use crate::remote::{git, local_sdk_listing, outside_worktree, parity, siblings};
 use crate::resolve::{self, Environment};
 use crate::route::{self, Origin, PLACE_ARGS, read_place};
 use crate::warm;
-use gate_desktop::version::build_version;
+use gate_wire::build_version;
 
 /// The manifest's name in `.gate`.
 const TOOLCHAIN: &str = "toolchain.toml";

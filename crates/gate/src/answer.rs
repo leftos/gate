@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Component, Path, Prefix};
 
 use gate_args::{ExpectRequest, Invocation, Problem, RunRequest, Spelling, StopRequest, USAGE, parse};
-use gate_desktop::version::build_version;
+use gate_wire::build_version;
 
 use crate::console::Console;
 use crate::request_json;

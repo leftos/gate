@@ -19,11 +19,11 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use gate_args::{DEFAULT_STALL_SECONDS, Spelling, TestSeams, WarmRequest};
-use gate_desktop::version::build_version;
 use gate_router::warm::{FailureClass, FileRead, Record, RecordRead, RecordState, WarmupFile, read_warmup, warmup_hash};
 use gate_router::{Config, Facts, Place, Target, builder_words, escaped, repo_name, stays_local, target};
 use gate_state::v1::{self, WarmFailure, WarmRecord, WarmState};
 use gate_win32::{Interrupt, OwnedMutexGuard};
+use gate_wire::build_version;
 use jiff::Timestamp;
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 

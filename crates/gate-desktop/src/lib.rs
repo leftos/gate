@@ -6,7 +6,6 @@
 
 mod helper;
 pub mod protocol;
-pub mod version;
 
 use std::io;
 use std::path::PathBuf;

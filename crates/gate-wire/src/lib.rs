@@ -10,9 +10,77 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use gate_args::{MAX_WHOLE_NUMBER, MOST_ENV_BYTES, MOST_ENV_NAMES, env_refusal, over_cap, shown_name};
+pub use gate_router::escaped;
 use gate_router::warm::MOST_COMMANDS;
-use gate_router::{escaped, is_layout_name, repo_name};
+use gate_router::{is_layout_name, repo_name};
 use serde_json::{Map, Value};
+
+/// The commit this build was made from, from `GATE_BUILD_ID` at compile time; `None` for a build made without one, or
+/// with an empty one.
+const BUILD_ID: Option<&str> = option_env!("GATE_BUILD_ID");
+
+/// The version this build names itself by: `<package version>+<build id>` for a build `tools/install.ps1` made, else
+/// `<package version>+dev`. Two builds of one package version are told apart by the id, so a builder running another
+/// build of it is refused as one running another version, and a hand-built `+dev` compares equal only to another `+dev`.
+/// The gate, its desktop helper and every box name themselves by it.
+#[must_use]
+pub fn build_version() -> String {
+    version_text(BUILD_ID)
+}
+
+/// The version a build with the id `id` names itself by: `<package version>+<id>`, or `<package version>+dev` for no
+/// id or an empty one.
+fn version_text(id: Option<&str>) -> String {
+    match id {
+        Some(id) if !id.is_empty() => format!("{}+{id}", env!("CARGO_PKG_VERSION")),
+        _ => format!("{}+dev", env!("CARGO_PKG_VERSION")),
+    }
+}
+
+/// The version a tool probe's program wrote: the first version of the first non-blank line of its standard output, or
+/// of its standard error when its standard output holds nothing but blanks ([`first_version`]). Only that line is read:
+/// a tool's later lines may name another program's version, as ffmpeg's `built with gcc 14.2.0` does.
+#[must_use]
+pub fn version_of(stdout: &str, stderr: &str) -> Option<String> {
+    let chosen = if stdout.trim().is_empty() { stderr } else { stdout };
+    chosen.lines().find(|line| !line.trim().is_empty()).and_then(first_version)
+}
+
+/// The first version `text` spells: the first run of two or more dot-separated runs of ASCII digits, after an optional
+/// `v`, that starts no word or number already begun (so not after a letter, a digit or a `.`), cut to its first three
+/// numbers; what follows it, such as a `-` build label, is no part of it. `None` when there is no such run, or when a
+/// number of the first one has more than [`MAX_PART_DIGITS`] digits.
+#[must_use]
+pub fn first_version(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let parts = (0..bytes.len())
+        .filter(|&at| starts_number(bytes, at))
+        .find_map(|at| dotted(&text[at..]))?;
+    let readable = parts.iter().all(|part| part.len() <= MAX_PART_DIGITS);
+    readable.then(|| parts[..parts.len().min(3)].join("."))
+}
+
+/// Whether a version may start at `at` in `bytes`: a digit not after a letter, a digit or a `.`, or after a `v` that
+/// is itself not after one of them.
+fn starts_number(bytes: &[u8], at: usize) -> bool {
+    let free = |before: Option<&u8>| before.is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'.');
+    let before = at.checked_sub(1).and_then(|index| bytes.get(index));
+    bytes[at].is_ascii_digit()
+        && match before {
+            Some(b'v' | b'V') => free(at.checked_sub(2).and_then(|index| bytes.get(index))),
+            _ => free(before),
+        }
+}
+
+/// The dot-separated runs of digits `text` starts with, up to the first empty one, when there are two or more; `None`
+/// when there are fewer.
+fn dotted(text: &str) -> Option<Vec<&str>> {
+    let end = text
+        .find(|character: char| !character.is_ascii_digit() && character != '.')
+        .unwrap_or(text.len());
+    let parts: Vec<&str> = text[..end].split('.').take_while(|part| !part.is_empty()).collect();
+    (parts.len() >= 2).then_some(parts)
+}
 
 /// The most digits a part of a version may have: a longer one is no version the client could compare.
 pub const MAX_PART_DIGITS: usize = 10;
@@ -942,7 +1010,104 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use serde_json::json;
 
-    use super::{PathForm, Payload, escaped, work_root};
+    use super::{PathForm, Payload, escaped, first_version, version_of, version_text, work_root};
+
+    #[test]
+    fn a_build_id_follows_the_package_version() {
+        assert_eq!(
+            version_text(Some("0123456789ab-dirty.89abcdef")),
+            format!("{}+0123456789ab-dirty.89abcdef", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn an_empty_build_id_is_dev() {
+        assert_eq!(version_text(Some("")), format!("{}+dev", env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn no_build_id_is_dev() {
+        assert_eq!(version_text(None), format!("{}+dev", env!("CARGO_PKG_VERSION")));
+    }
+
+    /// `git-lfs version` answers `git-lfs/<x.y.z> (...)`; the version is the one after the slash, never the go or git
+    /// version in the parentheses.
+    #[test]
+    fn git_lfs_version_is_read_from_its_slash_line() {
+        assert_eq!(
+            version_of("git-lfs/3.8.0 (GitHub; windows amd64; go 1.24.4; git 2d2b1a8c)\n", ""),
+            Some("3.8.0".to_owned())
+        );
+        assert_eq!(
+            version_of("git-lfs/3.7.1-rc1 (GitHub; windows arm64; go 1.24.2)\r\n", ""),
+            Some("3.7.1".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_version_is_the_first_dotted_number_after_an_optional_v() {
+        for (text, version) in [
+            ("rustc 1.99.0 (b940084d7 2026-09-28)", "1.99.0"),
+            ("v24.19.0", "24.19.0"),
+            ("12.5.1", "12.5.1"),
+            ("PowerShell 7.6.6", "7.6.6"),
+            ("ffmpeg version 9.0.2-full_build-www.gyan.dev Copyright (c) 2000-2026", "9.0.2"),
+            ("cargo-nextest 0.9.100 (abc 2026-01-01)", "0.9.100"),
+            ("cargo-nextest 0.9.148 (cd1d6d546 2026-10-07)", "0.9.148"),
+            ("10.12", "10.12"),
+            ("tool 1.2.3.4", "1.2.3"),
+            ("tool 1.2.", "1.2"),
+            ("tool 1234567890.1", "1234567890.1"),
+        ] {
+            assert_eq!(first_version(text).as_deref(), Some(version), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn text_with_no_dotted_number_has_no_version() {
+        for text in [
+            "ffmpeg version N-112345-gabcdef",
+            "",
+            "24",
+            "x1.2 rev2.3",
+            "abc1.2.3",
+            "1..2",
+            "release 7.",
+        ] {
+            assert_eq!(first_version(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_number_of_more_than_ten_digits_is_no_readable_version() {
+        for text in [
+            "tool 12345678901.2",
+            "tool 1.12345678901",
+            "tool 1.2.3.12345678901",
+            "v99999999999.0 then 1.2.3",
+        ] {
+            assert_eq!(first_version(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_first_line_of_the_chosen_stream_is_read() {
+        let gyan = "ffmpeg version 9.0.2-full_build-www.gyan.dev Copyright (c) 2000-2026\r\nbuilt with gcc 14.2.0\r\n";
+        assert_eq!(version_of(gyan, "").as_deref(), Some("9.0.2"));
+        let git_build = "ffmpeg version N-117456-gabc Copyright (c) 2000-2026\r\nbuilt with gcc 14.2.0\r\n";
+        assert_eq!(version_of(git_build, ""), None, "the compiler's version is not the tool's");
+        assert_eq!(version_of("\r\n  \r\nv24.19.0\r\n", "").as_deref(), Some("24.19.0"), "blank lines first");
+        assert_eq!(
+            version_of(" \r\n", "PowerShell 7.6.6\r\n").as_deref(),
+            Some("7.6.6"),
+            "stderr when stdout is blank"
+        );
+        assert_eq!(
+            version_of("no version here\r\n", "7.6.6\r\n"),
+            None,
+            "stderr is not read when stdout has text"
+        );
+    }
 
     fn decoded(json: &str) -> Result<Payload, String> {
         Payload::decode(&STANDARD.encode(json), PathForm::Windows)
@@ -1497,6 +1662,8 @@ mod tests {
         decoded(&json!({ "OutputFolder": folder }).to_string()).and_then(|payload| payload.output_folder(work).map(str::to_owned))
     }
 
+    // Tests drive paths through std::path::absolute, which reads them as drive paths only on Windows.
+    #[cfg(windows)]
     #[test]
     fn the_output_folder_is_outputs_beside_the_work_folders_parent() {
         for good in [r"D:\gate-remote\outputs", "d:/GATE-REMOTE/outputs", r"D:\gate-remote\work\..\outputs"] {
@@ -1791,6 +1958,8 @@ mod tests {
         }
     }
 
+    // Tests drive paths through std::path::absolute, which reads them as drive paths only on Windows.
+    #[cfg(windows)]
     #[test]
     fn a_pair_needs_a_bare_repository_beside_the_work_folders() {
         assert!(

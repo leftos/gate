@@ -29,7 +29,7 @@ use crate::remote::{
     BOX_USAGE, CREATED, NOT_RECOGNIZED, SSH_FAILED, Warm, install_why, other_build, root_busy_why, root_why, sdks_of, their_version, warm_of,
 };
 use crate::route;
-use gate_desktop::version::build_version;
+use gate_wire::build_version;
 
 /// How long the builder's call may take before it is ended: the box's tool probes and SDK list take up to 30 s, and
 /// ssh's connection up to 10 s more.
@@ -443,7 +443,7 @@ mod tests {
     use crate::remote::parity::pin_of;
     use crate::remote::toolchain::{self, Manifest, Pin, Reported, ToolNeed, Version};
     use crate::remote::{install_untrusted_line, root_busy_line, root_unsafe_line};
-    use gate_desktop::version::build_version;
+    use gate_wire::build_version;
 
     const HOST: &str = "builder-1";
     const AT: At<'static> = At::Builder {

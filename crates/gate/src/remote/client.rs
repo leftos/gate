@@ -32,10 +32,10 @@ use std::time::{Duration, Instant};
 use gate_args::BoxVerb;
 use gate_args::TestSeams;
 use gate_args::is_godot_console;
-use gate_desktop::version::build_version;
 use gate_state::v1::{self, WarmFailure};
 use gate_state::{FallbackReason, KernelObject, key_hash};
 use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, Running, Share};
+use gate_wire::build_version;
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
