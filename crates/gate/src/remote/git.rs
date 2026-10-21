@@ -91,9 +91,19 @@ pub(crate) fn limit(seams: &TestSeams) -> Duration {
 }
 
 /// How long the readers of each git call of a run, and of the remote client's read of this PC's `dotnet --list-sdks`,
-/// get to end once the program has exited: `--test-git-drain-ms` when given, else [`DRAIN`].
+/// get to end once the program has exited or the call ended otherwise: `--test-git-drain-ms` when given, else [`DRAIN`].
+/// A placement call's readers get [`placing_drain`] instead when git exits by itself ([`Call::placing`]).
 pub(crate) fn drain(seams: &TestSeams) -> Duration {
     seams.git_drain_ms.map_or(DRAIN, Duration::from_millis)
+}
+
+/// How long the readers of a call that places a folder get once git has exited by itself: as long as git itself may
+/// take, or the call's own drain when that is longer. A starved gate may not run a reader within [`DRAIN`] of git's
+/// exit, and the place is then lost. The long drain costs time only when a process outside git's job holds a pipe — a
+/// Store-installed program git starts runs outside the job — and `rev-parse` with [`PLACE_ARGS`](crate::route::PLACE_ARGS)
+/// starts none, since the job is ended at git's exit and its own readers end as soon as they get CPU.
+pub(crate) fn placing_drain(limit: Duration, drain: Duration) -> Duration {
+    limit.max(drain)
 }
 
 /// The bounds of one git call: how long it may take, and how long its readers get to reach their pipes' ends once git
@@ -367,13 +377,7 @@ pub(crate) fn program_output(call: &ProgramCall<'_>, place: &ProgramPlace) -> Re
     } else {
         judged_among(&found, call.worktrees).map_err(cannot_run)?
     };
-    let bounds = Call {
-        drain: call.drain,
-        interrupt: call.interrupt,
-        console: call.console,
-        stdin: call.stdin,
-        ..Call::plain(folder, call.args, call.limit)
-    };
+    let bounds = program_call(folder, call);
     let spawn = Spawn {
         name: program,
         late: call.late_line(),
@@ -382,6 +386,18 @@ pub(crate) fn program_output(call: &ProgramCall<'_>, place: &ProgramPlace) -> Re
     let over = format!("{} wrote more than {} MiB", call.named(), OUTPUT_CAP / (1024 * 1024));
     let (status, stdout, stderr) = output_of(&spawn, &bounds, over)?;
     Ok(Some(ProgramOutput { status, stdout, stderr }))
+}
+
+/// The git call the program of [`program_output`] is run as: [`ProgramCall`]'s limit, drain, interrupt, console and
+/// standard input, in `folder`.
+fn program_call<'a>(folder: &'a Path, call: &ProgramCall<'a>) -> Call<'a> {
+    Call {
+        drain: call.drain,
+        interrupt: call.interrupt,
+        console: call.console,
+        stdin: call.stdin,
+        ..Call::plain(folder, call.args, call.limit)
+    }
 }
 
 /// What `dotnet --list-sdks` lists, empty when no dotnet is found; dotnet is run as [`program_output`] runs a program,
@@ -564,18 +580,22 @@ where
     // The process has exited; whatever it left running, which would hold its pipes open, ends with the job, and the
     // readers then reach their pipes' ends within a short while.
     drop(job);
-    let until = Instant::now() + call.drain;
-    let unread = || {
+    let drain = call.drain_once_exited();
+    let until = Instant::now() + drain;
+    let not_read = || {
+        if call.interrupt.is_some_and(Interrupt::is_raised) {
+            return GitError::Interrupted;
+        }
         GitError::Failed(format!(
             "cannot read {name}'s output: it did not end within {} of {name}'s exit",
-            spelled_limit(call.drain)
+            spelled_limit(drain)
         ))
     };
-    let output = received(&output, until).ok_or_else(unread)?;
-    let errors = received(&errors, until).ok_or_else(unread)?;
+    let output = received_or_interrupted(&output, until, call.interrupt).ok_or_else(not_read)?;
+    let errors = received_or_interrupted(&errors, until, call.interrupt).ok_or_else(not_read)?;
     let cannot_read = |error: io::Error| GitError::Failed(format!("cannot read {name}'s output: {error}"));
     let status = ExitStatus::from_raw(code);
-    fed_whole(fed.as_ref(), status, until, call.drain, name)?;
+    fed_whole(fed.as_ref(), status, until, call, name)?;
     Ok((status, output.map_err(cannot_read)?, errors.map_err(cannot_read)?))
 }
 
@@ -587,17 +607,19 @@ fn dropped(mut pipe: File) -> io::Result<()> {
 /// Whether the process `name`, which exited with `status`, was fed its whole input by `fed`, waited for until `until`:
 /// one that failed says why in its own lines, so a feed it cut short by exiting is no failure of its own, and a call
 /// with no input has nothing to check. One that succeeded while its feed failed, or whose feed did not end within the
-/// call's `drain`, fails the call.
-fn fed_whole(fed: Option<&Receiver<io::Result<()>>>, status: ExitStatus, until: Instant, drain: Duration, name: &str) -> Result<(), GitError> {
+/// call's drain once it exited by itself, fails the call; an interrupt raised during the wait ends it as
+/// [`GitError::Interrupted`].
+fn fed_whole(fed: Option<&Receiver<io::Result<()>>>, status: ExitStatus, until: Instant, call: &Call<'_>, name: &str) -> Result<(), GitError> {
     let Some(fed) = fed.filter(|_| status.success()) else {
         return Ok(());
     };
-    match received(fed, until) {
+    match received_or_interrupted(fed, until, call.interrupt) {
         Some(Ok(())) => Ok(()),
         Some(Err(error)) => Err(GitError::Failed(format!("cannot feed {name} its input: {error}"))),
+        None if call.interrupt.is_some_and(Interrupt::is_raised) => Err(GitError::Interrupted),
         None => Err(GitError::Failed(format!(
             "cannot feed {name} its input: it did not end within {} of {name}'s exit",
-            spelled_limit(drain)
+            spelled_limit(call.drain_once_exited())
         ))),
     }
 }
@@ -649,6 +671,34 @@ fn received<T>(from: &Receiver<io::Result<T>>, until: Instant) -> Option<io::Res
         Ok(result) => Some(result),
         Err(RecvTimeoutError::Timeout) => None,
         Err(RecvTimeoutError::Disconnected) => Some(Err(io::Error::other("its reader ended with no result"))),
+    }
+}
+
+/// How long a wait between looks at a raised interrupt: short enough that a Ctrl+C during a drain as long as a call's
+/// limit ends the call at once.
+const INTERRUPT_SLICE: Duration = Duration::from_millis(50);
+
+/// What [`received`] reads, unless the call's `interrupt` is raised before a result arrives: `None` when neither came
+/// before `until`. As [`waited`] gives a signalled handle the win over a raised interrupt, a result already in the
+/// channel is taken first, and a drain as long as the call's limit is waited for in slices so an interrupt ends it.
+fn received_or_interrupted<T>(from: &Receiver<io::Result<T>>, until: Instant, interrupt: Option<Interrupt>) -> Option<io::Result<T>> {
+    let Some(interrupt) = interrupt else {
+        return received(from, until);
+    };
+    loop {
+        if let Some(read) = received(from, Instant::now()) {
+            return Some(read);
+        }
+        if interrupt.is_raised() {
+            return None;
+        }
+        let now = Instant::now();
+        if now >= until {
+            return None;
+        }
+        if let Some(read) = received(from, now + (until - now).min(INTERRUPT_SLICE)) {
+            return Some(read);
+        }
     }
 }
 
@@ -725,8 +775,13 @@ pub(crate) struct Call<'a> {
     /// The variables git is not given, beside [`GIT_LOCATION`].
     pub unset: &'a [&'a str],
     pub limit: Duration,
-    /// How long git's readers get to reach their pipes' ends once git has exited, or once the call's job was ended.
+    /// How long git's readers get to reach their pipes' ends once the call ended otherwise than by git's own exit: its
+    /// interrupt raised, or its limit outlived.
     pub drain: Duration,
+    /// How long git's readers get to reach their pipes' ends once git has exited by itself and its job is dropped, when
+    /// that is not `drain`: `None` for every call but a placement call, whose readers get [`placing_drain`]
+    /// ([`Call::placing`]), and set by [`Call::drain_once_exited`].
+    pub exit_drain: Option<Duration>,
     /// The console interrupt a Ctrl+C raises: git is ended with it, and the call is [`GitError::Interrupted`].
     pub interrupt: Option<Interrupt>,
     /// The console git is created on: this process's, so a Ctrl+C reaches git as it reaches the gate, or a hidden one
@@ -754,10 +809,28 @@ impl<'a> Call<'a> {
             unset: &[],
             limit: bounds.limit,
             drain: bounds.drain,
+            exit_drain: None,
             interrupt: None,
             console: PipedConsole::Attached,
             stdin: None,
         }
+    }
+
+    /// A call that places a folder ([`PLACE_ARGS`](crate::route::PLACE_ARGS) asked): ended after `limit`, or when
+    /// `interrupt` is raised, its readers given `drain` when the call ends otherwise than by git's own exit and
+    /// [`placing_drain`] when git exits by itself.
+    pub(crate) fn placing(folder: &'a Path, args: &'a [&'a str], limit: Duration, drain: Duration, interrupt: Option<Interrupt>) -> Call<'a> {
+        Call {
+            interrupt,
+            exit_drain: Some(placing_drain(limit, drain)),
+            ..Call::bounded(folder, args, GitBounds { limit, drain })
+        }
+    }
+
+    /// How long git's readers get to reach their pipes' ends once git has exited by itself and its job is dropped: the
+    /// call's own `drain`, or the longer one a placement call sets.
+    pub(crate) fn drain_once_exited(&self) -> Duration {
+        self.exit_drain.unwrap_or(self.drain)
     }
 
     /// A call as [`Call::bounded`] makes it, but on a hidden console of its own, which no Ctrl+C reaches: a call that
@@ -943,6 +1016,7 @@ mod tests {
     use std::io;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc;
     use std::thread::{self, ScopedJoinHandle};
     use std::time::{Duration, Instant};
 
@@ -951,7 +1025,8 @@ mod tests {
 
     use super::{
         Call, DRAIN, ERRORS_KEPT, FAILURE_BYTES, GIT_LIMIT, Git, GitError, NO_CURRENT_FOLDER, OUTPUT_CAP, ProgramCall, ProgramPlace, capped,
-        failed_line, failure_text, is_indexed_config, late_git_line, program_output, sdk_listing, tail, without_verbatim,
+        failed_line, failure_text, is_indexed_config, late_git_line, program_call, program_output, received_or_interrupted, sdk_listing, tail,
+        without_verbatim,
     };
     use crate::environment::Variables;
     use crate::remote::snapshot::repository;
@@ -1500,6 +1575,65 @@ mod tests {
         assert_eq!(late_git_line(Duration::from_secs(60)), "git did not answer within 60 s");
         assert_eq!(late_git_line(Duration::from_secs(10)), "git did not answer within 10 s");
         assert_eq!(late_git_line(Duration::from_millis(1)), "git did not answer within 1 ms");
+    }
+
+    #[test]
+    fn a_placement_call_keeps_the_ordinary_drain_and_its_interrupt() {
+        let interrupt = Interrupt::install().expect("the console handler can be installed");
+        let call = Call::placing(Path::new(r"C:\work\app"), &["rev-parse"], GIT_LIMIT, DRAIN, Some(interrupt));
+        assert_eq!(
+            call.drain, DRAIN,
+            "a call its interrupt ends gives its readers the ordinary drain, not the limit"
+        );
+        assert_eq!(call.drain_once_exited(), GIT_LIMIT, "git's own exit gives its readers the whole limit");
+    }
+
+    #[test]
+    fn a_program_call_keeps_the_drain_it_was_given_once_the_program_exits_by_itself() {
+        let call = ProgramCall {
+            program: "tool",
+            args: &["version"],
+            limit: GIT_LIMIT,
+            drain: Duration::from_secs(600),
+            interrupt: None,
+            worktrees: &[],
+            console: PipedConsole::Hidden,
+            stdin: None,
+        };
+        let bounds = program_call(Path::new(r"C:\work\app"), &call);
+        assert_eq!(bounds.drain, Duration::from_secs(600));
+        assert_eq!(
+            bounds.drain_once_exited(),
+            Duration::from_secs(600),
+            "a program call's readers keep the drain it was given once the program exits by itself"
+        );
+    }
+
+    #[test]
+    fn an_arrived_result_wins_over_a_raised_interrupt() {
+        let interrupt = Interrupt::install().expect("the console handler can be installed");
+        interrupt.raise();
+        let (sent, read) = mpsc::channel();
+        drop(sent.send(Ok("read")));
+        let got = received_or_interrupted(&read, Instant::now() + Duration::from_secs(30), Some(interrupt));
+        assert!(
+            matches!(got, Some(Ok("read"))),
+            "a result already in the channel wins over a raised interrupt, as it wins over the wait's end"
+        );
+    }
+
+    #[test]
+    fn a_raised_interrupt_ends_the_wait_after_a_clean_exit_at_once() {
+        let interrupt = Interrupt::install().expect("the console handler can be installed");
+        let (sent, read) = mpsc::channel::<io::Result<&'static str>>();
+        let reader = thread::spawn(move || {
+            interrupt.raise();
+            // The sender stays alive, so the channel is neither closed nor answered: only the interrupt ends the wait.
+            sent
+        });
+        let got = received_or_interrupted(&read, Instant::now() + Duration::from_secs(30), Some(interrupt));
+        let _sent = reader.join().expect("the reader's thread ends");
+        assert!(got.is_none(), "a raised interrupt ends the drain when no result arrives");
     }
 
     #[test]

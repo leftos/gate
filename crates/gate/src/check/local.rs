@@ -73,7 +73,12 @@ fn probe_windows(seams: &CheckSeams) -> probe::Windows {
 pub(super) fn placed() -> Result<Option<Place>, String> {
     let folder = std::env::current_dir().map_err(|error| format!("cannot read the working directory: {error}"))?;
     let git = git::Git::find(&folder)?;
-    read_place(&git, &git::Call::plain(&folder, &PLACE_ARGS, git::GIT_LIMIT))
+    read_place(&git, &place_call(&folder))
+}
+
+/// The call that places `folder`, as every placement call is built ([`git::Call::placing`]).
+fn place_call(folder: &Path) -> git::Call<'_> {
+    git::Call::placing(folder, &PLACE_ARGS, git::GIT_LIMIT, git::GitBounds::DEFAULT.drain, None)
 }
 
 /// What the repo's own files in its worktree root declare, as both checks read them from disk: the manifest, its
@@ -724,8 +729,9 @@ mod tests {
 
     use gate_router::SiblingFolder;
 
-    use super::{Declarations, Declared, read_manifest, read_pin, read_siblings, read_siblings_file, sdk_of, sibling};
+    use super::{Declarations, Declared, place_call, read_manifest, read_pin, read_siblings, read_siblings_file, sdk_of, sibling};
     use crate::check::report::{Found, Sdk, Sibling};
+    use crate::remote::git;
     use crate::remote::parity::{Pin, pin_of};
     use crate::remote::toolchain::{Manifest, ToolNeed, Version};
     use crate::test_support::junction;
@@ -769,6 +775,21 @@ mod tests {
     fn write(path: &Path, text: &str) {
         fs::create_dir_all(path.parent().expect("a file has a folder")).expect("the file's folder can be made");
         fs::write(path, text).expect("the file can be written");
+    }
+
+    #[test]
+    fn a_placement_call_gets_the_whole_limit_once_git_exits_by_itself_and_the_drain_otherwise() {
+        let call = place_call(Path::new("C:/work"));
+        assert_eq!(
+            call.drain_once_exited(),
+            git::GIT_LIMIT,
+            "a starved PC's readers get the whole git limit once git exits by itself"
+        );
+        assert_eq!(
+            call.drain,
+            git::GitBounds::DEFAULT.drain,
+            "a call its interrupt or limit ends keeps the ordinary drain"
+        );
     }
 
     #[test]

@@ -204,15 +204,7 @@ pub(crate) fn later_run(
 /// decision would, and never reads the warm-up file ([`consented_hash`]) or says a line; nor does it look up the
 /// worktree an outside path lies in, which only changes the line of a run kept here.
 pub(crate) fn would_route_on_heavy(decision: &Decision, seams: &TestSeams) -> bool {
-    let machine = Machine {
-        look_up_trees: false,
-        read_head: false,
-        ..Machine::at(
-            decision.local_app_data.as_deref(),
-            git::limit(seams).min(HINT_GIT_LIMIT),
-            git::drain(seams),
-        )
-    };
+    let machine = Machine::hint(decision.local_app_data.as_deref(), seams);
     decision.unicode && matches!(decide(&decision.inputs(gate_router::Slot::Heavy), &machine), Route::Routed(_))
 }
 
@@ -329,6 +321,10 @@ pub(crate) struct Machine<'a> {
     local_app_data: Option<&'a OsStr>,
     git_limit: Duration,
     git_drain: Duration,
+    /// Whether a placement call's readers get as long as git itself may take once it exits by itself
+    /// ([`git::placing_drain`]): true for the decision, false for the hint's, which keeps the ordinary drain while the
+    /// run holds its light slot ([`would_route_on_heavy`]).
+    placing: bool,
     found: RefCell<Placed>,
     /// The routing file the decision read, when it read one: the warm-up's judgement reads its consent from this.
     config: RefCell<Option<Config>>,
@@ -371,6 +367,7 @@ impl<'a> Machine<'a> {
             local_app_data,
             git_limit,
             git_drain,
+            placing: true,
             found: RefCell::new(Placed::NotAsked),
             config: RefCell::new(None),
             look_up_trees: true,
@@ -378,6 +375,18 @@ impl<'a> Machine<'a> {
             notes: RefCell::new(Vec::new()),
             said: RefCell::new(Vec::new()),
             remote_transport: None,
+        }
+    }
+
+    /// The facts of the hint's decision ([`would_route_on_heavy`]): the routing file `local_app_data` names, its git
+    /// calls under [`HINT_GIT_LIMIT`] or the seams' limit when that is shorter, its readers under the seams' drain,
+    /// which its placement call keeps, and neither the worktree of an outside path nor the worktree's `HEAD` read.
+    fn hint(local_app_data: Option<&'a OsStr>, seams: &TestSeams) -> Machine<'a> {
+        Machine {
+            look_up_trees: false,
+            read_head: false,
+            placing: false,
+            ..Machine::at(local_app_data, git::limit(seams).min(HINT_GIT_LIMIT), git::drain(seams))
         }
     }
 
@@ -438,6 +447,17 @@ impl<'a> Machine<'a> {
             ..git::Call::plain(folder, args, self.git_limit)
         }
     }
+
+    /// The decision's placement call in `folder`: [`PLACE_ARGS`] asked and built as every placement call is
+    /// ([`git::Call::placing`]), but for the hint's decision, which keeps the ordinary drain while the run holds its
+    /// light slot ([`would_route_on_heavy`]).
+    fn place_call<'b>(&self, folder: &'b Path) -> git::Call<'b> {
+        if self.placing {
+            git::Call::placing(folder, &PLACE_ARGS, self.git_limit, self.git_drain, None)
+        } else {
+            self.git_call(folder, &PLACE_ARGS)
+        }
+    }
 }
 
 impl Facts for Machine<'_> {
@@ -458,7 +478,7 @@ impl Facts for Machine<'_> {
             .map_err(|error| format!("cannot read the working directory: {error}"))
             .and_then(|folder| {
                 let git = git::Git::find(folder)?;
-                read_place(&git, &self.git_call(folder, &PLACE_ARGS))
+                read_place(&git, &self.place_call(folder))
             });
         self.found.replace(Placed::Asked(placed.as_ref().ok().and_then(Option::clone)));
         placed
@@ -1194,12 +1214,14 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
     use super::{
-        DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, GATE_FILE_NOT_A_FILE, Machine, Origin, SIBLING_GIT_LINK, SIBLING_LINK, SIBLING_NOT_A_FOLDER,
-        Source, checkout_of, holds_existing_path, is_fixed_local, is_share_target, judge_declarations, not_routed, parse_head, parse_place,
-        read_declaration, read_siblings, sibling_folder, worktree_of,
+        DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, GATE_FILE_NOT_A_FILE, HINT_GIT_LIMIT, Machine, Origin, SIBLING_GIT_LINK, SIBLING_LINK,
+        SIBLING_NOT_A_FOLDER, Source, checkout_of, holds_existing_path, is_fixed_local, is_share_target, judge_declarations, not_routed, parse_head,
+        parse_place, read_declaration, read_siblings, sibling_folder, worktree_of,
     };
     use crate::remote::box_trees;
+    use crate::remote::git;
     use crate::test_support::junction;
+    use gate_args::TestSeams;
     use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
     /// The folder the place cases are asked of, spelled on a subst drive as a gate started there spells it.
@@ -1251,6 +1273,58 @@ mod tests {
         assert_eq!(machine.box_trees(target), Vec::<(String, String)>::new(), "no tree, not one left out");
         let line = format!("gate: no PathMap word: the root {root} holds '{held}', which the builder's command line cannot carry");
         assert_eq!(machine.notes.take(), [line]);
+    }
+
+    #[test]
+    fn the_placement_call_gets_the_whole_limit_once_git_exits_by_itself_and_the_drain_otherwise() {
+        let folder = Path::new(FOLDER);
+        let starved = Machine::at(None, Duration::from_mins(15), Duration::from_secs(2));
+        assert_eq!(
+            starved.place_call(folder).drain_once_exited(),
+            Duration::from_mins(15),
+            "a starved gate's readers get the whole git limit once git exits by itself"
+        );
+        assert_eq!(
+            starved.place_call(folder).drain,
+            Duration::from_secs(2),
+            "a call its interrupt ends keeps the ordinary drain"
+        );
+        let longer = Machine::at(None, Duration::from_secs(2), Duration::from_secs(30));
+        assert_eq!(
+            longer.place_call(folder).drain_once_exited(),
+            Duration::from_secs(30),
+            "a drain above the limit still wins"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_git_call_keeps_its_drain_once_git_exits_by_itself() {
+        let machine = Machine::at(None, Duration::from_secs(60), Duration::from_secs(600));
+        let call = machine.git_call(Path::new(FOLDER), &["ls-files"]);
+        assert_eq!(call.exit_drain, None, "only a placement call sets a drain of its own after git's exit");
+        assert_eq!(call.drain, Duration::from_secs(600));
+        assert_eq!(
+            call.drain_once_exited(),
+            Duration::from_secs(600),
+            "the drain an ordinary git call was given is kept after a clean exit too"
+        );
+    }
+
+    #[test]
+    fn the_hint_s_placement_call_keeps_the_ordinary_drain() {
+        let hint = Machine::hint(None, &TestSeams::default());
+        let call = hint.place_call(Path::new(FOLDER));
+        assert_eq!(
+            call.limit, HINT_GIT_LIMIT,
+            "the hint holds its light slot, so its calls keep the hint's limit"
+        );
+        assert_eq!(call.drain, git::GitBounds::DEFAULT.drain, "the hint's readers get the seams' drain");
+        assert_eq!(call.exit_drain, None, "the hint's placement call is built as an ordinary git call");
+        assert_eq!(
+            call.drain_once_exited(),
+            git::GitBounds::DEFAULT.drain,
+            "the hint keeps the ordinary drain once git exits by itself too"
+        );
     }
 
     #[test]

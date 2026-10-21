@@ -238,12 +238,13 @@ impl GitLimits {
     /// `interrupt` is raised: in its worktree, under the main checkout's name. `None` when git fails, says the folder
     /// is in no worktree, does not answer in time, or writes what does not read as a place.
     fn place(self, git: &Git, folder: &Path, interrupt: Option<Interrupt>) -> Option<KeyPlace> {
-        let call = git::Call {
-            drain: self.drain,
-            interrupt,
-            ..git::Call::plain(folder, &route::PLACE_ARGS, self.limit)
-        };
+        let call = self.place_call(folder, interrupt);
         route::read_place(git, &call).ok().flatten().as_ref().map(from_route)
+    }
+
+    /// The call that places `folder`, as every placement call is built ([`git::Call::placing`]).
+    fn place_call(self, folder: &Path, interrupt: Option<Interrupt>) -> git::Call<'_> {
+        git::Call::placing(folder, &route::PLACE_ARGS, self.limit, self.drain, interrupt)
     }
 }
 
@@ -551,6 +552,35 @@ mod tests {
             key: "local:: | cargo build".to_owned(),
             family,
         }
+    }
+
+    #[test]
+    fn a_placement_call_gets_the_whole_limit_once_git_exits_by_itself_and_the_drain_otherwise() {
+        let folder = Path::new("C:/work");
+        let starved = GitLimits {
+            limit: Duration::from_mins(15),
+            drain: Duration::from_secs(2),
+        };
+        let call = starved.place_call(folder, None);
+        assert_eq!(
+            call.drain_once_exited(),
+            Duration::from_mins(15),
+            "a starved gate's readers get the whole git limit once git exits by itself"
+        );
+        assert_eq!(
+            call.drain,
+            Duration::from_secs(2),
+            "a call its interrupt or limit ends keeps the ordinary drain"
+        );
+        let longer = GitLimits {
+            limit: Duration::from_secs(2),
+            drain: Duration::from_secs(30),
+        };
+        assert_eq!(
+            longer.place_call(folder, None).drain_once_exited(),
+            Duration::from_secs(30),
+            "a drain above the limit still wins"
+        );
     }
 
     #[test]

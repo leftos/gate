@@ -2017,7 +2017,15 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A patch that applied but cannot be removed fails the run (`gate: the remote run failed: cannot remove <patch>: <error>`) and keeps nothing: the changes are already in the worktree.
 
-  Once git has exited, its readers get 2 s to reach their pipes' ends (`--test-git-drain-ms` replaces it for the routing decision's calls, the client's, the `--test-remote-snapshot` client's and the drain of this PC's `dotnet --list-sdks` read), else the call fails with `cannot read git's output: it did not end within <n> s of git's exit`, `<n>` being the call's own drain in whole seconds (a drain that is not a whole number of seconds is spelled in ms, `<n> ms`; the same holds for `dotnet --list-sdks` and the tool probes, with `<name>` their program). A failure line carries the last 10 of git's lines joined by ` | `, escaped and cut to the last 4 KiB at a whole escape.
+  Once git has exited, its readers get the call's drain, 2 s, to reach their pipes' ends, else the call fails with `cannot read git's output: it did not end within <n> s of git's exit`, `<n>` being the drain in whole seconds (a drain that is not a whole number of seconds is spelled in ms, `<n> ms`; the same holds for `dotnet --list-sdks` and the tool probes, with `<name>` their program).
+
+  `--test-git-drain-ms` replaces the 2 s for the routing decision's calls, the run's duration-key place, the client's, the `--test-remote-snapshot` client's and the drain of this PC's `dotnet --list-sdks` read. A failure line carries the last 10 of git's lines joined by ` | `, escaped and cut to the last 4 KiB at a whole escape.
+
+  A call that places a folder (`route::PLACE_ARGS`, a `git rev-parse`: the run's duration-key place, the routing decision's place and `gate check`'s place) gives its readers, once git exits by itself, as long as git itself may take, or the call's drain when that is longer (`git::placing_drain`), the seam's drain included; a git past its limit keeps the ordinary drain.
+
+  The places the duration store's rebuild makes answer the run's Ctrl+C: a raised interrupt ends the call at once, its drain included, unless git's output has already arrived. The other placement calls take no interrupt.
+
+  The call's job is ended at git's exit, so a reader that is not starved ends at once and the longer drain costs nothing; a starved gate that lost the place would key the folder by its path's shape, and `gate check` would fail with `check: cannot read git's output: it did not end within 2 s of git's exit`. The heavy hint's placement call, made while the run holds its light slot, keeps the ordinary drain.
 
   Of the test seams, `--test-remote-snapshot` and `--test-remote-transport` give the client a stand-in. The first makes the snapshot of each worktree of the call, the main one then a pair's siblings in declared order, says `gate: remote snapshot <sha> bridge <sha or none>` on stderr and in the log, one line a worktree, and ends with status 0.
 
@@ -3948,7 +3956,9 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-interrupt-before-later` (a switch) raises the interrupt once a run that fell back has built the next builder it may try, before it tries it, so a case can pin a Ctrl+C during the walk over the later builders; `--test-print-request` shows it as `testSeams.interruptBeforeLater`, after `interruptBeforeKey`.
 
-  `--test-git-drain-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 2 s the readers of each git call of the routing decision, of the remote client and of the `--test-remote-snapshot` client, and of this PC's `dotnet --list-sdks` read, get to end once the program has exited; `--test-print-request` shows it as `testSeams.gitDrainMs`, after `gitLimitMs`. The suite's routing, remote client, `warm` and `cores` cases pass both seams with very long values (`GIT_HANG_GUARDS`), so a starved gate does not fail a call that a loaded machine only delays.
+  `--test-git-drain-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 2 s the readers of each git call of the routing decision, of the remote client and of the `--test-remote-snapshot` client, and of this PC's `dotnet --list-sdks` read, get to end once the program has exited (a call that places a folder gives its readers the larger of this and its git limit).
+
+  `--test-print-request` shows it as `testSeams.gitDrainMs`, after `gitLimitMs`. The suite's routing, remote client, `warm` and `cores` cases pass both seams with very long values (`GIT_HANG_GUARDS`), so a starved gate does not fail a call that a loaded machine only delays.
 
   `--test-beside-claim-wait <file>` (on `gate run` only) makes a local light gate that took its slot holding the beside mutex wait, after it takes the slot and before it writes its claim and journals its `take`, until `<file>` exists, so a case can hold a gate between its take and its claim.
 
