@@ -6,8 +6,6 @@
 
 - [ ] GATE-595 Route to more than one builder, choosing by what each builder can run — Urgent · Remote
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
-- [/] GATE-607 Unix gate box: version, preflight, boot, run, stop — Urgent · Remote
-- [ ] GATE-694 Make the desktop helper's dies-after-creating-the-child case hold under load — Urgent · Remote
 - [ ] GATE-641 Keep a first launch of freshly built binaries from looking stalled while a scanner loads them — High · Local gate
 - [ ] GATE-616 Move the box's shared wire rules into gate-wire so both boxes say the same bytes — High · Remote
 - [ ] GATE-615 Tie the Unix box's job record to its process group leader's start time — High · Remote
@@ -36,12 +34,10 @@
 - [ ] GATE-647 Find whether the shared snapshot ref gives a second builder a wrong bridge base; key it per builder if so — High · Remote
 - [ ] GATE-649 Bring back every test project's output a routed dotnet test build made — High · Remote
 - [ ] GATE-650 Fall back when a builder's box program is missing (ssh status 126/127) — High · Remote
-- [ ] GATE-653 Route towercab-3d's cargo commands: the snapshot lacks its gitignored dist/ and converter exe — High · Remote
-- [ ] GATE-669 Re-add yaat-server routing and run its trial now YAAT-646 is fixed — High · Remote
+- [!] GATE-653 Route towercab-3d's cargo commands: the snapshot lacks its gitignored dist/ and converter exe — High · Remote
 - [ ] GATE-682 Explain or track a stall when a gated command is plain ssh to another machine — High · Remote
 - [/] GATE-683 Prune a deleted worktree's folders from every builder, and prune the Mac by space — High · Remote
-- [ ] GATE-688 Record which worktree each routed key came from — High · Remote
-- [ ] GATE-689 Prune a gone worktree's keys from the Windows builders and the PC — High · Remote
+- [/] GATE-689 Prune a gone worktree's keys from the Windows builders and the PC — High · Remote
 - [ ] GATE-690 Prune the Unix box by age, free space and gone keys, on a launchd schedule — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
@@ -227,6 +223,7 @@
 - [ ] GATE-687 Find why audiomxd and configd stay busy on the idle Mac builder
 - [ ] GATE-691 Collect the objects a pruned key's refs kept in a builder's bare repos
 - [ ] GATE-692 Give the pin decision its own result type instead of Route::Refused
+- [ ] GATE-695 Skip or guard the Unix box's back commit when a process escaped the command's group
 
 ## Design
 
