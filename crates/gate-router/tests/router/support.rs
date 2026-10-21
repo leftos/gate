@@ -79,6 +79,8 @@ pub struct FakeFacts {
     pub has_files: Result<bool, String>,
     pub head: Result<Option<String>, String>,
     pub files: Vec<String>,
+    /// The files the snapshot carries, `/`-separated from the root; a folder above one is carried too.
+    pub snapshot: Vec<String>,
     pub devices: Vec<(char, String)>,
     /// What `.gate/siblings.toml` gives.
     pub siblings: Result<Vec<String>, String>,
@@ -130,6 +132,7 @@ impl FakeFacts {
             has_files: Ok(true),
             head: Ok(Some(HEAD.to_owned())),
             files: Vec::new(),
+            snapshot: Vec::new(),
             devices: Vec::new(),
             siblings: Ok(Vec::new()),
             present: Vec::new(),
@@ -231,6 +234,17 @@ impl Facts for FakeFacts {
     fn file_in_folder(&self, name: &str) -> bool {
         self.ask(format!("file_in_folder {name}"));
         self.files.iter().any(|file| file == name)
+    }
+
+    /// Each path that is a file of [`FakeFacts::snapshot`] or a folder above one.
+    fn snapshot_carries(&self, _place: &Place, paths: &[String]) -> Vec<String> {
+        self.ask(format!("snapshot_carries {}", paths.join(" ")));
+        let carried = |path: &str| {
+            self.snapshot
+                .iter()
+                .any(|file| file == path || file.strip_prefix(path).is_some_and(|rest| rest.starts_with('/')))
+        };
+        paths.iter().filter(|path| carried(path)).cloned().collect()
     }
 
     fn subst_target(&self, letter: char) -> Option<String> {

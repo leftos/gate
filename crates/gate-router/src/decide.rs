@@ -10,7 +10,7 @@ use crate::config::{Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DE
 use crate::escape::escaped;
 use crate::key::{is_layout_name, repo_name, work_folder_key};
 use crate::like::{Pattern, eq_ignoring_case};
-use crate::rewrite::{RewritePlace, Rewritten, Separators, SiblingRoot, drive_letters, rewrite_named, root_letter, split_root};
+use crate::rewrite::{RewritePlace, Rewritten, Separators, SiblingRoot, drive_letters, is_script_text, rewrite_named, root_letter, split_root};
 
 /// The line said when `--no-build` was dropped from the builder's words.
 pub const DROPPED_NO_BUILD_LINE: &str = "gate: dropped --no-build: the last build may have run on the other machine";
@@ -217,6 +217,11 @@ pub trait Facts {
 
     /// Whether a file of exactly this name is in the gate's folder.
     fn file_in_folder(&self, name: &str) -> bool;
+
+    /// Which of `paths`, each `/`-separated and relative to the worktree root of `place`, the snapshot carries: a file
+    /// `git ls-files --cached --others --exclude-standard` lists, or a folder holding one. None when that cannot be told.
+    /// Asked once, with every candidate, only of a macOS pick whose words hold a relative path written with `\`.
+    fn snapshot_carries(&self, place: &Place, paths: &[String]) -> Vec<String>;
 
     /// What the drive `letter` (upper case) stands for, as `QueryDosDevice` gives it (`\??\X:\dev` for a subst drive);
     /// `None` when there is no such device.
@@ -932,6 +937,10 @@ fn file_stem(path: &str) -> &str {
 /// is no match: a `git` or `prek` under a path is read as one however the path is spelled. A gate started inside a git
 /// hook whose repo the routing file's `hooks` does not name stays here silently, before its siblings file is read, and
 /// so does one whose place cannot be read.
+///
+/// A macOS pick runs the words rewritten with `/` ([`Separators::Slash`]) and its relative `\` paths the snapshot carries
+/// written with `/` ([`unix_form`]); a pick whose words still hold a `\` goes on, silently, to the next builder that is
+/// no macOS one ([`steer_off_backslashes`]).
 fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts) -> Result<Matched, Here> {
     let place = match facts.place() {
         Ok(Some(place)) => place,
@@ -951,10 +960,9 @@ fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts)
     let first = pick(config, &opened.repo, &sent.words, |_| true).ok_or(None)?;
     check_local(&opened.place, &sent.words, facts)?;
     let (builder, pattern, found) = steer_off_macos(config, &opened, &sent.words, facts, first)?;
-    let unix_words = (builder.os == BuilderOs::Macos).then(|| {
-        let siblings = declared_pairs(&opened.siblings);
-        rewritten(&opened.place, siblings, words, &drives, Separators::Slash).words
-    });
+    let slashed =
+        (builder.os == BuilderOs::Macos).then(|| rewritten(&opened.place, declared_pairs(&opened.siblings), words, &drives, Separators::Slash).words);
+    let (builder, pattern, unix_words) = steer_off_backslashes(config, &opened, &sent.words, facts, (builder, pattern, slashed))?;
     let target = settle(config, opened, builder, facts)?;
     let desktop = check_desktop(config, &target, found, &sent.words, facts)?;
     Ok(Matched {
@@ -966,6 +974,175 @@ fn matched(config: &Config, git_hook: bool, words: &[String], facts: &dyn Facts)
         program_named: sent.program_named,
         desktop,
     })
+}
+
+/// The pick `picked` of the opened worktree's command, with the words a macOS pick runs, rewritten with `/`: kept, its
+/// words in their Unix form ([`unix_form`]), unless a word of that form still holds a `\`, which the Mac would read
+/// another way; then the pick goes on, silently, to the next builder that is no macOS one, which runs the `sent` words,
+/// as [`steer_off_macos`] does. A pick of another builder carries no rewritten words and is kept as it is. `Err(None)`
+/// when no other builder's pattern matches.
+fn steer_off_backslashes(
+    config: &Config,
+    opened: &Opened,
+    sent: &[String],
+    facts: &dyn Facts,
+    picked: (Builder, String, Option<Vec<String>>),
+) -> Result<(Builder, String, Option<Vec<String>>), Here> {
+    let (builder, pattern, slashed) = picked;
+    let Some(slashed) = slashed else {
+        return Ok((builder, pattern, None));
+    };
+    if let Some(unix) = unix_form(&opened.place, slashed, facts) {
+        return Ok((builder, pattern, Some(unix)));
+    }
+    let (builder, pattern) = pick(config, &opened.repo, sent, |other| other.os != BuilderOs::Macos).ok_or(None)?;
+    Ok((builder, pattern, None))
+}
+
+/// The PowerShell programs whose `-c` or `-Command` switch, in any letter case, makes every later word a script's text.
+const PWSH_HOSTS: [&str; 2] = ["pwsh", "powershell"];
+
+/// The Unix shells whose `-c` switch makes every later word a script's text and its arguments.
+const SH_HOSTS: [&str; 2] = ["bash", "sh"];
+
+/// `words`, a macOS pick's words rewritten with `/`, with each relative path written with `\` that the snapshot carries
+/// ([`slash_candidate`]) written with `/`: the snapshot is asked once, for every candidate before a script's text
+/// ([`script_start`]) in word order, and only when there is one. `None` when a word still holds a `\`, script text
+/// included: a regex, an escape, a list, a response file or a path the snapshot does not carry.
+fn unix_form(place: &Place, mut words: Vec<String>, facts: &dyn Facts) -> Option<Vec<String>> {
+    let plain = script_start(&words);
+    let candidates: Vec<(usize, SlashCandidate)> = words[..plain]
+        .iter()
+        .enumerate()
+        .filter_map(|(index, word)| slash_candidate(&place.prefix, word).map(|found| (index, found)))
+        .collect();
+    if !candidates.is_empty() {
+        let mut asked: Vec<String> = Vec::new();
+        for (_, found) in &candidates {
+            if !asked.contains(&found.path) {
+                asked.push(found.path.clone());
+            }
+        }
+        let carried = facts.snapshot_carries(place, &asked);
+        for (index, found) in candidates {
+            if carried.contains(&found.path) {
+                words[index] = found.slashed;
+            }
+        }
+    }
+    let leftover = words.iter().any(|word| word.contains('\\'));
+    (!leftover).then_some(words)
+}
+
+/// The index of the first word of a script's text: the word after the host's own `-c` switch, of a command whose first
+/// non-empty word names one of [`PWSH_HOSTS`] ([`pwsh_script_at`]) or [`SH_HOSTS`] ([`sh_script_at`]); the word count
+/// for any other command, and for one whose host runs a script file instead.
+fn script_start(words: &[String]) -> usize {
+    let Some((first, program)) = first_word(words) else {
+        return words.len();
+    };
+    let switches = &words[first + 1..];
+    let found = if PWSH_HOSTS.iter().any(|host| names_program(program, host)) {
+        pwsh_script_at(switches)
+    } else if SH_HOSTS.iter().any(|host| names_program(program, host)) {
+        sh_script_at(switches)
+    } else {
+        None
+    };
+    found.map_or(words.len(), |at| first + 1 + at)
+}
+
+/// The index in a PowerShell host's `switches` of the word after its `-c` or `-Command`, in any letter case; `None` when
+/// a `-File`, `-f` or `--` comes first, which ends the host's own switches.
+fn pwsh_script_at(switches: &[String]) -> Option<usize> {
+    for (at, word) in switches.iter().enumerate() {
+        if word == SEPARATOR || eq_ignoring_case(word, "-file") || eq_ignoring_case(word, "-f") {
+            return None;
+        }
+        if eq_ignoring_case(word, "-c") || eq_ignoring_case(word, "-command") {
+            return Some(at + 1);
+        }
+    }
+    None
+}
+
+/// The index in a Unix shell's `switches` of the word after its `-c`, matched in its letter case (`-C` is another
+/// switch); `None` when a `--` or a word that is no switch (the script's path) comes first. The value of `-o`, `-O`,
+/// `+o` and `+O` is skipped.
+fn sh_script_at(switches: &[String]) -> Option<usize> {
+    let mut words = switches.iter().enumerate();
+    while let Some((at, word)) = words.next() {
+        match word.as_str() {
+            "-c" => return Some(at + 1),
+            "-o" | "-O" | "+o" | "+O" => {
+                words.next();
+            }
+            SEPARATOR => return None,
+            switch if switch.starts_with(['-', '+']) => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// A word of a macOS pick that may name a relative path written with `\` ([`slash_candidate`]).
+struct SlashCandidate {
+    /// The word with its value written with `/`.
+    slashed: String,
+    /// The path the snapshot is asked about, `/`-separated from the worktree root.
+    path: String,
+}
+
+/// The candidate `word` is: its value ([`switch_value`]) written with `/` ([`relative_backslash_value`]), and the path it
+/// names ([`judged_path`]) below the gate's folder `prefix` (`sub/dir/`, empty at the root). `None` for script text, a
+/// response file (`@`), a switch without an `=`, a value the rewrite of a relative `\` path refuses, and a path that
+/// names nothing or starts with `/`.
+fn slash_candidate(prefix: &str, word: &str) -> Option<SlashCandidate> {
+    if word.starts_with(RESPONSE_FILE) || is_script_text(word) {
+        return None;
+    }
+    let at = switch_value(word)?;
+    let slashed = relative_backslash_value(&word[at..])?;
+    let path = format!("{prefix}{}", judged_path(&slashed)?);
+    if path.starts_with('/') {
+        return None;
+    }
+    Some(SlashCandidate {
+        slashed: format!("{}{slashed}", &word[..at]),
+        path,
+    })
+}
+
+/// Where the value judged in `word` starts: after the first `=` of a switch (a word starting with `-`, or with `/` and
+/// holding a `:`, as in `/p:Name=value`), at the start of any other word; `None` for a switch without an `=`.
+fn switch_value(word: &str) -> Option<usize> {
+    let switch = word.starts_with('-') || (word.starts_with('/') && word.contains(':'));
+    if switch { word.find('=').map(|equals| equals + 1) } else { Some(0) }
+}
+
+/// `value` with each `\` written as `/`, when it is a relative path written with `\`; `None` for a value holding no
+/// `\`, starting with one, starting with a drive or holding a `..` segment.
+fn relative_backslash_value(value: &str) -> Option<String> {
+    let drive = matches!(value.as_bytes(), [letter, b':', ..] if letter.is_ascii_alphabetic());
+    if !value.contains('\\') || value.starts_with('\\') || drive {
+        return None;
+    }
+    let slashed = value.replace('\\', "/");
+    (!slashed.split('/').any(|segment| segment == "..")).then_some(slashed)
+}
+
+/// The path a `/`-separated relative value names: its leading `./` dropped, a glob cut to the folder before its first
+/// wildcard (`*`, `?`, `[`), a trailing `/` dropped; `None` when nothing is left.
+fn judged_path(slashed: &str) -> Option<&str> {
+    let mut path = slashed;
+    while let Some(rest) = path.strip_prefix("./") {
+        path = rest;
+    }
+    if let Some(wildcard) = path.find(['*', '?', '[']) {
+        path = &path[..path[..wildcard].rfind('/').unwrap_or(0)];
+    }
+    let path = path.trim_end_matches('/');
+    (!path.is_empty()).then_some(path)
 }
 
 /// Keeps a matched command here, saying why, when the worktree's `.gate/local.toml` at `place` declares a pattern its

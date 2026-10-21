@@ -2745,6 +2745,224 @@ fn on_a_macos_pick_a_desktop_pattern_written_with_backslashes_still_matches() {
     assert_eq!(run.words, stamped(&["dotnet", "build", r"src\Duel.sln"]));
 }
 
+/// A gate at `prefix` below the root whose snapshot carries `snapshot`, under a routing file whose `host` lists `yaat`
+/// as `host_repos` says and whose one `builders` entry, `mac-1`, runs `yaat`'s commands matching `mac_patterns`.
+fn mac_facts(prefix: &str, host_repos: &str, mac_patterns: &str, snapshot: &[&str]) -> FakeFacts {
+    let mac = format!(r#"[{{"host": "mac-1", "os": "macos", "root": "/m", "repos": {{"yaat": {mac_patterns}}}}}]"#);
+    FakeFacts {
+        config: Ok(Some(with_builders(host_repos, &mac))),
+        snapshot: words(snapshot),
+        ..FakeFacts::at(prefix)
+    }
+}
+
+/// The snapshot questions `facts` was asked, in order.
+fn snapshot_asks(facts: &FakeFacts) -> Vec<String> {
+    facts
+        .asked()
+        .into_iter()
+        .filter(|question| question.starts_with("snapshot_carries"))
+        .collect()
+}
+
+#[test]
+fn a_macos_pick_writes_a_relative_backslash_path_the_snapshot_carries_with_slashes() {
+    let command = words(&["dotnet", "build", r"src\Duel.sln"]);
+    let facts = mac_facts("", r#"{"yaat": ["dotnet *"]}"#, r#"["dotnet *"]"#, &["src/Duel.sln"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "mac-1");
+    assert_eq!(run.words, stamped(&["dotnet", "build", "src/Duel.sln"]));
+    assert_eq!(run.fallback, command, "the fallback runs here as given");
+    assert_eq!(snapshot_asks(&facts), ["snapshot_carries src/Duel.sln"], "asked once");
+}
+
+#[test]
+fn a_relative_backslash_path_below_the_root_is_judged_from_the_gate_s_folder() {
+    let command = words(&["dotnet", "test", r"tests\Foo.Tests"]);
+    let facts = mac_facts(
+        "src/",
+        r#"{"yaat": ["dotnet *"]}"#,
+        r#"["dotnet *"]"#,
+        &["src/tests/Foo.Tests/Foo.Tests.csproj"],
+    );
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "mac-1");
+    assert_eq!(&run.words[..3], ["dotnet", "test", "tests/Foo.Tests"]);
+    assert_eq!(snapshot_asks(&facts), ["snapshot_carries src/tests/Foo.Tests"]);
+}
+
+#[test]
+fn a_switch_s_value_after_its_equals_sign_is_written_with_slashes() {
+    let command = words(&["dotnet", "build", r"--project=tests\Foo.Tests\Foo.Tests.csproj", r"-p:Thing=src\a.props"]);
+    let snapshot = ["tests/Foo.Tests/Foo.Tests.csproj", "src/a.props"];
+    let facts = mac_facts("", r#"{"yaat": ["dotnet *"]}"#, r#"["dotnet *"]"#, &snapshot);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "mac-1");
+    assert_eq!(
+        run.words,
+        stamped(&["dotnet", "build", "--project=tests/Foo.Tests/Foo.Tests.csproj", "-p:Thing=src/a.props"])
+    );
+    assert_eq!(snapshot_asks(&facts), ["snapshot_carries tests/Foo.Tests/Foo.Tests.csproj src/a.props"]);
+}
+
+#[test]
+fn a_backslash_glob_is_judged_by_the_folder_before_its_first_wildcard() {
+    let command = words(&["dotnet", "build", r"tests\*\*.csproj"]);
+    let facts = mac_facts("", r#"{"yaat": ["dotnet *"]}"#, r#"["dotnet *"]"#, &["tests/a/a.csproj"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "mac-1");
+    assert_eq!(run.words, stamped(&["dotnet", "build", "tests/*/*.csproj"]));
+    assert_eq!(snapshot_asks(&facts), ["snapshot_carries tests"]);
+}
+
+#[test]
+fn a_backslash_word_naming_nothing_the_snapshot_carries_steers_the_command_off_the_mac() {
+    let command = words(&["dotnet", "test", "--filter", r"Name~Foo\.Bar"]);
+    let facts = mac_facts("", r#"{"yaat": ["dotnet *"]}"#, r#"["dotnet *"]"#, &["src/Duel.sln"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "builder-1", "the pick goes on to host");
+    assert!(run.words.starts_with(&command), "host runs the words as written: {:?}", run.words);
+    assert_eq!(snapshot_asks(&facts), ["snapshot_carries Name~Foo/.Bar"]);
+
+    let facts = mac_facts("", r#"{"other": ["*"]}"#, r#"["dotnet *"]"#, &[]);
+    assert_eq!(decide(&heavy(&command), &facts), SILENT, "no other builder runs it");
+}
+
+#[test]
+fn an_output_path_the_snapshot_does_not_carry_steers_the_command_off_the_mac() {
+    let command = words(&["dotnet", "build", "-o", r"bin\out"]);
+    let facts = mac_facts("", r#"{"yaat": ["dotnet *"]}"#, r#"["dotnet *"]"#, &["src/Duel.sln"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "builder-1");
+    assert_eq!(run.words, stamped(&["dotnet", "build", "-o", r"bin\out"]));
+    assert_eq!(snapshot_asks(&facts), ["snapshot_carries bin/out"]);
+}
+
+#[test]
+fn a_host_pick_keeps_a_relative_backslash_path_and_asks_no_snapshot() {
+    let command = words(&["dotnet", "build", r"src\Duel.sln"]);
+    let facts = mac_facts("", r#"{"yaat": ["dotnet *"]}"#, r#"["cargo *"]"#, &["src/Duel.sln"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "builder-1");
+    assert_eq!(run.words, stamped(&["dotnet", "build", r"src\Duel.sln"]));
+    assert_eq!(snapshot_asks(&facts), Vec::<String>::new());
+}
+
+#[test]
+fn script_text_holding_a_backslash_steers_the_command_off_the_mac_and_asks_no_snapshot() {
+    let command = words(&["pwsh", "-Command", r"dotnet build src\Duel.sln"]);
+    let facts = mac_facts("", r#"{"yaat": ["pwsh *"]}"#, r#"["pwsh *"]"#, &["src/Duel.sln"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "builder-1", "the Mac's pwsh would pass the backslash on as written");
+    assert!(run.words.starts_with(&command), "{:?}", run.words);
+    assert_eq!(snapshot_asks(&facts), Vec::<String>::new());
+}
+
+#[test]
+fn a_script_file_s_own_dash_c_is_no_script_text_and_its_paths_are_written_with_slashes() {
+    let command = words(&[
+        "pwsh",
+        "-NoProfile",
+        "-File",
+        r"tools\run.ps1",
+        "--",
+        "dotnet",
+        "test",
+        "-c",
+        "Release",
+        "--project",
+        r"tests\Foo.Tests\Foo.Tests.csproj",
+    ]);
+    let snapshot = ["tools/run.ps1", "tests/Foo.Tests/Foo.Tests.csproj"];
+    let facts = mac_facts("", r#"{"yaat": ["pwsh *"]}"#, r#"["pwsh *"]"#, &snapshot);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "mac-1");
+    assert_eq!(run.words[3], "tools/run.ps1");
+    assert_eq!(run.words[10], "tests/Foo.Tests/Foo.Tests.csproj");
+    assert!(run.words.iter().all(|word| !word.contains('\\')), "{:?}", run.words);
+    assert_eq!(snapshot_asks(&facts), ["snapshot_carries tools/run.ps1 tests/Foo.Tests/Foo.Tests.csproj"]);
+}
+
+#[test]
+fn a_list_word_holding_a_backslash_steers_the_command_off_the_mac() {
+    let command = words(&["dotnet", "test", "--logger", r"trx;LogFileName=TestResults\run.trx"]);
+    let facts = mac_facts("", r#"{"yaat": ["dotnet *"]}"#, r#"["dotnet *"]"#, &["TestResults/run.trx"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "builder-1");
+    assert!(run.words.starts_with(&command), "host runs the words as written: {:?}", run.words);
+    assert_eq!(snapshot_asks(&facts), Vec::<String>::new());
+}
+
+#[test]
+fn an_msbuild_slash_switch_s_value_is_written_with_slashes() {
+    let command = words(&["dotnet", "build", r"src\Duel.sln", r"/p:Props=src\a.props"]);
+    let facts = mac_facts("", r#"{"yaat": ["dotnet *"]}"#, r#"["dotnet *"]"#, &["src/Duel.sln", "src/a.props"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "mac-1");
+    assert_eq!(run.words, stamped(&["dotnet", "build", "src/Duel.sln", "/p:Props=src/a.props"]));
+    assert_eq!(snapshot_asks(&facts), ["snapshot_carries src/Duel.sln src/a.props"]);
+}
+
+#[test]
+fn a_value_starting_with_a_slash_is_never_asked_of_the_snapshot() {
+    let command = words(&["dotnet", "build", r"src\Duel.sln", r"/x\y"]);
+    let facts = mac_facts("", r#"{"yaat": ["dotnet *"]}"#, r#"["dotnet *"]"#, &["src/Duel.sln"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "builder-1");
+    assert_eq!(snapshot_asks(&facts), ["snapshot_carries src/Duel.sln"]);
+}
+
+#[test]
+fn a_unix_shell_s_script_text_starts_after_its_own_dash_c_alone() {
+    let shells = r#"{"yaat": ["sh *", "bash *"]}"#;
+    let mac = r#"["sh *", "bash *"]"#;
+
+    let command = words(&["sh", r"tools\run.sh", "-c", r"out\x"]);
+    let facts = mac_facts("", shells, mac, &["tools/run.sh", "out/x/a.txt"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "mac-1", "the script's own -c is no script text");
+    assert_eq!(run.words, words(&["sh", "tools/run.sh", "-c", "out/x"]));
+
+    let command = words(&["bash", "-C", r"tools\run.sh"]);
+    let facts = mac_facts("", shells, mac, &["tools/run.sh"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "mac-1", "-C is no -c");
+    assert_eq!(run.words, words(&["bash", "-C", "tools/run.sh"]));
+
+    let command = words(&["bash", "-o", "pipefail", "-c", r"cat src\a.txt"]);
+    let facts = mac_facts("", shells, mac, &["src/a.txt"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "builder-1", "the script's backslash steers");
+    assert_eq!(
+        snapshot_asks(&facts),
+        Vec::<String>::new(),
+        "the value of -o is skipped, so the script is never asked"
+    );
+}
+
+#[test]
+fn a_response_file_word_with_a_backslash_is_no_candidate_and_steers_off_the_mac() {
+    let command = words(&["dotnet", "build", r"@src\args.rsp"]);
+    let facts = mac_facts("", r#"{"yaat": ["dotnet *"]}"#, r#"["dotnet *"]"#, &["src/args.rsp"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "builder-1");
+    assert_eq!(snapshot_asks(&facts), Vec::<String>::new());
+}
+
+#[test]
+fn the_gate_s_own_path_map_word_never_steers_a_macos_build() {
+    let command = words(&["dotnet", "build"]);
+    let facts = mapped(mac_facts("", r#"{"yaat": ["dotnet *"]}"#, r#"["dotnet *"]"#, &[]));
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "mac-1");
+    let last = run.words.last().map_or("", String::as_str);
+    assert!(
+        last.starts_with("-p:PathMap=") && last.contains('\\'),
+        "the word holds a backslash: {last}"
+    );
+    assert_eq!(snapshot_asks(&facts), Vec::<String>::new());
+}
+
 #[test]
 fn a_file_without_builders_gives_the_target_it_always_gave() {
     let facts = FakeFacts::at_root();

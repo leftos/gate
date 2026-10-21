@@ -21,6 +21,11 @@ use crate::like::{eq_ignoring_case, lower_char};
 /// Characters that end a path in a word.
 const PATH_ENDS: [char; 9] = [',', ';', '"', '\'', ')', '|', '&', '<', '>'];
 
+/// Whether the rewrite reads `word` as a script's text or a list: it holds one of [`PATH_ENDS`] or a line break.
+pub(crate) fn is_script_text(word: &str) -> bool {
+    word.contains(PATH_ENDS) || word.contains(['\n', '\r'])
+}
+
 /// Characters a program's file name cannot hold: the wildcards, the redirections and a quote. A line break and the
 /// characters Win32 reads another way are refused elsewhere ([`program_file_name`], [`plain_segment`]).
 const BANNED_NAME_CHARS: [char; 6] = ['*', '?', '"', '<', '>', '|'];

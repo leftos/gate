@@ -380,6 +380,33 @@ impl<'a> Machine<'a> {
         read
     }
 
+    /// Which of `paths`, relative to the root of `place`, one `git ls-files --cached --others --exclude-standard` of the
+    /// gate's folder lists as a file or as a folder holding one, compared byte for byte ([`Facts::snapshot_carries`]).
+    /// The only pathspec is the folder's prefix, as git spells it (none at the root): a pathspec naming a candidate
+    /// in another letter case would be listed in that case on a disk that ignores it.
+    fn listed_paths(&self, place: &Place, paths: &[String]) -> Result<Vec<String>, String> {
+        let root = Path::new(&place.root);
+        let mut args = vec!["--literal-pathspecs", "ls-files", "-z", "--cached", "--others", "--exclude-standard"];
+        if !place.prefix.is_empty() {
+            args.extend(["--", place.prefix.as_str()]);
+        }
+        let mut ran = git::Git::find(root)?.run(&self.git_call(root, &args))?;
+        if !ran.status.success() {
+            let code = ran.status.code().map_or_else(|| "unknown".to_owned(), |code| code.to_string());
+            return Err(format!("git ls-files failed with status {code}"));
+        }
+        let mut listing = Vec::new();
+        ran.stdout
+            .read_to_end(&mut listing)
+            .map_err(|error| format!("cannot read git ls-files' output: {error}"))?;
+        let listed: Vec<&[u8]> = listing.split(|byte| *byte == 0).filter(|path| !path.is_empty()).collect();
+        Ok(paths
+            .iter()
+            .filter(|path| listed.iter().any(|file| lists_path(file, path.as_bytes())))
+            .cloned()
+            .collect())
+    }
+
     /// The decision's git call in `folder` with `args`, under the decision's limit and drain.
     fn git_call<'b>(&self, folder: &'b Path, args: &'b [&'b str]) -> git::Call<'b> {
         git::Call {
@@ -473,6 +500,18 @@ impl Facts for Machine<'_> {
 
     fn file_in_folder(&self, name: &str) -> bool {
         self.folder.as_ref().is_ok_and(|folder| folder.join(name).is_file())
+    }
+
+    /// One `git ls-files` of the gate's folder, each path matched against what it lists in its letter case
+    /// ([`Machine::listed_paths`]). A git that cannot be started, fails or writes what cannot be read carries none, which
+    /// keeps the command off the Mac, saying why in the log.
+    fn snapshot_carries(&self, place: &Place, paths: &[String]) -> Vec<String> {
+        self.listed_paths(place, paths).unwrap_or_else(|why| {
+            self.notes
+                .borrow_mut()
+                .push(format!("gate: cannot tell what the snapshot carries: {why}"));
+            Vec::new()
+        })
     }
 
     fn subst_target(&self, letter: char) -> Option<String> {
@@ -1110,6 +1149,11 @@ fn holds_existing_path(listing: impl BufRead, root: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
+/// Whether the listed `file` is `path` or lies in the folder `path`.
+fn lists_path(file: &[u8], path: &[u8]) -> bool {
+    file.strip_prefix(path).is_some_and(|rest| rest.is_empty() || rest.starts_with(b"/"))
+}
+
 #[cfg(test)]
 #[expect(
     clippy::expect_used,
@@ -1321,6 +1365,92 @@ mod tests {
         assert!(!found(b"sub/gone.txt\0"), "an unstaged delete");
         assert!(!found(b""), "nothing listed");
         fs::remove_dir_all(&root).expect("the test folder can be removed");
+    }
+
+    /// Runs git with `args` in `folder`, failing the test when it fails.
+    #[expect(clippy::disallowed_methods, reason = "a test's git setup takes no spawn lock")]
+    fn git_in(folder: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(folder)
+            .args(args)
+            .status()
+            .expect("git can be run");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// The place of a gate at the root of the worktree `root`.
+    fn place_of(root: &Path) -> Place {
+        let root = root.to_string_lossy().into_owned();
+        Place {
+            prefix: String::new(),
+            checkout: "g".to_owned(),
+            folder: root.clone(),
+            root,
+        }
+    }
+
+    /// Writes a file at the `/`-separated `path` below `root`, its folders made.
+    fn put(root: &Path, path: &str) {
+        let full = root.join(path);
+        fs::create_dir_all(full.parent().expect("the file has a folder")).expect("the folder can be made");
+        fs::write(full, "x").expect("the file can be written");
+    }
+
+    #[test]
+    fn the_snapshot_carries_listed_files_and_folders_holding_one_and_nothing_ignored() {
+        let (root, _removed) = scratch("snapshot");
+        git_in(&root, &["init", "--quiet"]);
+        for path in ["src/Duel.sln", "tests/a.cs", "bin/x", ".gitignore"] {
+            put(&root, path);
+        }
+        fs::write(root.join(".gitignore"), "bin/\n").expect("the ignore file can be written");
+        git_in(&root, &["add", "--", "src/Duel.sln"]);
+        let machine = Machine::at(None, Duration::from_secs(60), Duration::from_secs(5));
+        let asked = ["src/Duel.sln", "src", "tests", "bin/x", "nope"].map(str::to_owned);
+        assert_eq!(machine.snapshot_carries(&place_of(&root), &asked), ["src/Duel.sln", "src", "tests"]);
+    }
+
+    #[test]
+    fn a_git_that_fails_carries_nothing() {
+        let (root, _removed) = scratch("snapshot-not-a-repo");
+        fs::write(root.join(".git"), "gitdir: missing\n").expect("a broken .git file can be written");
+        put(&root, "a.txt");
+        let machine = Machine::at(None, Duration::from_secs(60), Duration::from_secs(5));
+        assert_eq!(machine.snapshot_carries(&place_of(&root), &["a.txt".to_owned()]), Vec::<String>::new());
+        let notes = machine.notes.take();
+        assert_eq!(notes.len(), 1, "one line says why: {notes:?}");
+        assert!(notes[0].starts_with("gate: cannot tell what the snapshot carries: "), "{notes:?}");
+    }
+
+    #[test]
+    fn the_snapshot_carries_no_path_written_in_another_letter_case() {
+        let (root, _removed) = scratch("snapshot-case");
+        git_in(&root, &["init", "--quiet"]);
+        for path in ["src/Duel.sln", "src/a.props", "tests/a.cs"] {
+            put(&root, path);
+        }
+        git_in(&root, &["add", "--", "src/Duel.sln", "src/a.props"]);
+        let machine = Machine::at(None, Duration::from_secs(60), Duration::from_secs(5));
+        let place = place_of(&root);
+        let carried = |asked: &[&str]| machine.snapshot_carries(&place, &asked.iter().map(|path| (*path).to_owned()).collect::<Vec<_>>());
+        assert_eq!(
+            carried(&["Src/Duel.sln"]),
+            Vec::<String>::new(),
+            "a file below a wrong-case folder, alone"
+        );
+        assert_eq!(
+            carried(&["Src/Duel.sln", "Src/a.props"]),
+            Vec::<String>::new(),
+            "two sharing a wrong-case folder"
+        );
+        assert_eq!(
+            carried(&["Tests/a.cs"]),
+            Vec::<String>::new(),
+            "an untracked file below a wrong-case folder"
+        );
+        assert_eq!(carried(&["SRC", "TESTS"]), Vec::<String>::new(), "wrong-case folders");
+        assert_eq!(carried(&["src/Duel.sln", "tests"]), ["src/Duel.sln", "tests"]);
     }
 
     /// Folders a test made, removed when it ends, failed or not: a junction inside one is removed as the link, its
