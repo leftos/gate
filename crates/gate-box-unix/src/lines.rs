@@ -2,12 +2,12 @@
 //! the PC parses it, and the judgements (the work root's trust, the warm record, the layout record, the job record)
 //! as functions of facts the verbs read, so they are tested on every target.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use gate_wire::{PathForm, SHA256_DIGITS, build_version, escaped, is_lower_hex, work_root};
+use gate_wire::{PathForm, Refusal, SHA256_DIGITS, build_version, escaped, is_lower_hex, refused_line, work_root};
 
 /// The line saying the work folder's tree is new, which the client raises a run's ceiling for.
 pub const NEW_WORK_TREE: &str = "gate: remote new work tree";
@@ -99,16 +99,7 @@ pub fn boot_line(seconds: i64, micros: i64) -> Result<String, String> {
     if !(0..1_000_000).contains(&micros) {
         return Err(format!("the boot time's microseconds {micros} are not within a second"));
     }
-    let days = seconds.div_euclid(86_400);
-    let of_day = seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    Ok(format!(
-        "gate: remote boot {year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:07}Z",
-        of_day / 3600,
-        of_day % 3600 / 60,
-        of_day % 60,
-        micros * 10
-    ))
+    Ok(format!("gate: remote boot {}", round_trip(seconds, micros * 10)))
 }
 
 /// The proleptic Gregorian year, month and day of the day `days` after 1970-01-01 (Howard Hinnant's
@@ -455,18 +446,237 @@ pub fn signal_guard(group: i32, own: i32) -> Result<(), String> {
     }
 }
 
+/// The status of a run whose client closed the connection: the PC reads it as a lost connection.
+pub const GONE_STATUS: u8 = 255;
+/// The status of a run whose command could not be started.
+pub const NOT_STARTED_STATUS: u8 = 127;
+
+/// How the run's command ended, as its status says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandEnd {
+    /// It exited with this code.
+    Exited(i32),
+    /// A signal, this one, ended it.
+    Signalled(i32),
+    /// Its client is gone.
+    Gone,
+    /// It could not be started.
+    NotStarted,
+    /// The box could not see it to its end: its exit unread, its group still there, or a record not changed.
+    Failed,
+}
+
+/// The status a run whose command ended as `end` exits with: the command's own code; 128 plus the signal for a command
+/// a signal ended, never 124 or 255, which the PC reads as killed and as a lost connection; [`GONE_STATUS`],
+/// [`NOT_STARTED_STATUS`], or [`FAILED_STATUS`] for the box's own failure. A code or signal outside a status is the
+/// box's failure.
+#[must_use]
+pub fn command_status(end: CommandEnd) -> u8 {
+    let status = match end {
+        CommandEnd::Exited(code) => u8::try_from(code).ok(),
+        // 1 to 126, so the status is 129 to 254 and never the lost connection's 255.
+        CommandEnd::Signalled(signal) if (1..127).contains(&signal) => u8::try_from(128 + signal).ok(),
+        CommandEnd::Signalled(_) | CommandEnd::Failed => None,
+        CommandEnd::Gone => Some(GONE_STATUS),
+        CommandEnd::NotStarted => Some(NOT_STARTED_STATUS),
+    };
+    status.unwrap_or(FAILED_STATUS)
+}
+
+/// The line a box running under Rosetta says after its `install` refusal tag: its CPU times read about 41.7 times low.
+pub const ROSETTA_LINE: &str = "gate: remote gate-box runs under Rosetta on this builder, whose CPU times it cannot read: install the arm64 build";
+
+/// What `sysctl.proc_translated` says of the box.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Translation {
+    /// It runs natively.
+    Native,
+    /// It is taken as native, as the value could not be read: the line saying so.
+    Unread(String),
+    /// It runs under Rosetta: the run is refused `install`, so the PC tries the next builder.
+    Rosetta,
+}
+
+/// What the read `read` of `sysctl.proc_translated` says: 1 is Rosetta; any other value, or no such name (an Intel
+/// Mac), native; any other failure native too, with the line saying it could not be read.
+#[must_use]
+pub fn translation(read: io::Result<i32>) -> Translation {
+    match read {
+        Ok(1) => Translation::Rosetta,
+        Ok(_) => Translation::Native,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Translation::Native,
+        Err(error) => Translation::Unread(format!(
+            "gate: remote could not read sysctl.proc_translated: {error}; taking the box as native"
+        )),
+    }
+}
+
+/// The lines a box under Rosetta refuses the run of the nonce `nonce` with: the `install` refusal tag, so the PC tries
+/// the next builder and then itself, then [`ROSETTA_LINE`].
+#[must_use]
+pub fn rosetta_lines(nonce: &str) -> [String; 2] {
+    [refused_line(nonce, Refusal::Install), ROSETTA_LINE.to_owned()]
+}
+
+/// The time `seconds` and `hundreds` of 100 ns after the Unix epoch in .NET's round-trip `o` format of a UTC time:
+/// seven fractional digits and a `Z`, as the Windows box writes its times.
+#[must_use]
+pub fn round_trip(seconds: i64, hundreds: i64) -> String {
+    let days = seconds.div_euclid(86_400);
+    let of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{hundreds:07}Z",
+        of_day / 3600,
+        of_day % 3600 / 60,
+        of_day % 60
+    )
+}
+
+/// The variable the run's command reads its job's name from, as on the Windows box (`gate`'s `environment.rs`).
+pub const BOX_JOB_VARIABLE: &str = "GATE_BOX_JOB";
+
+/// The command's environment: `start` (the box's own), its `PATH` the login shell's `login_path` when there is one, the
+/// payload's `Env` pairs `caller` set over that, each replacing its name, then the build-server settings of the run
+/// `run` ([`gate_wire::build_server_settings`]) and [`BOX_JOB_VARIABLE`] the job `job`, each first removing every name
+/// that differs from it only in case, so the command sees one value per name, as on the Windows box.
+#[must_use]
+pub fn command_environment(
+    start: Vec<(OsString, OsString)>,
+    login_path: Option<&str>,
+    caller: &[(String, String)],
+    run: &str,
+    job: &str,
+) -> Vec<(OsString, OsString)> {
+    let mut environment = start;
+    if let Some(path) = login_path {
+        set_variable(&mut environment, "PATH", path, false);
+    }
+    for (name, value) in caller {
+        set_variable(&mut environment, name, value, false);
+    }
+    for (name, value) in gate_wire::build_server_settings(run) {
+        set_variable(&mut environment, name, &value, true);
+    }
+    set_variable(&mut environment, BOX_JOB_VARIABLE, job, true);
+    environment
+}
+
+/// Sets `name` to `value` in `environment`, last: every value it holds for that name removed first, and with
+/// `any_case` every value for a name that differs from it only in ASCII case.
+fn set_variable(environment: &mut Vec<(OsString, OsString)>, name: &str, value: &str, any_case: bool) {
+    environment.retain(|(set, _)| {
+        let same = if any_case {
+            set.to_str().is_some_and(|set| set.eq_ignore_ascii_case(name))
+        } else {
+            set.as_os_str() == OsStr::new(name)
+        };
+        !same
+    });
+    environment.push((OsString::from(name), OsString::from(value)));
+}
+
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::io;
     use std::time::Duration;
 
+    use super::{
+        BOX_JOB_VARIABLE, CommandEnd, ROSETTA_LINE, Translation, command_environment, command_status, rosetta_lines, round_trip, translation,
+    };
     use super::{
         JobRecord, PATH_MARKER, Probed, Recorded, RootFacts, boot_line, created_line, folder_failure, folder_flaw, is_git_variable, job_record,
         job_record_text, layout_text, marked_path, names_another_layout, no_answer, probed, readies_single, record_unread, record_without_group,
         recorded_group, root_flaw, root_unsafe_line, sdk_list, sdks_line, signal_guard, step_unran, tool_line, version_line, warm_text, work_layout,
         write_failure,
     };
+
+    #[test]
+    fn a_command_s_status_is_its_code_or_128_and_its_signal_and_the_box_s_own_ends_have_theirs() {
+        assert_eq!(command_status(CommandEnd::Exited(0)), 0);
+        assert_eq!(command_status(CommandEnd::Exited(3)), 3);
+        assert_eq!(command_status(CommandEnd::Exited(255)), 255);
+        assert_eq!(command_status(CommandEnd::Signalled(9)), 137);
+        assert_eq!(command_status(CommandEnd::Signalled(15)), 143);
+        assert_eq!(command_status(CommandEnd::Signalled(1)), 129);
+        assert_eq!(command_status(CommandEnd::Gone), 255);
+        assert_eq!(command_status(CommandEnd::NotStarted), 127);
+        assert_eq!(command_status(CommandEnd::Failed), 1);
+        assert_eq!(command_status(CommandEnd::Exited(256)), 1, "no status holds it");
+        assert_eq!(command_status(CommandEnd::Exited(-1)), 1, "no status holds it");
+        assert_eq!(command_status(CommandEnd::Signalled(128)), 1, "past a status");
+    }
+
+    #[test]
+    fn rosetta_is_refused_install_and_a_native_or_unread_box_runs() {
+        assert_eq!(translation(Ok(1)), Translation::Rosetta);
+        assert_eq!(translation(Ok(0)), Translation::Native);
+        assert_eq!(
+            translation(Err(io::Error::from(io::ErrorKind::NotFound))),
+            Translation::Native,
+            "an Intel Mac"
+        );
+        assert_eq!(
+            translation(Err(io::Error::other("busy"))),
+            Translation::Unread("gate: remote could not read sysctl.proc_translated: busy; taking the box as native".to_owned())
+        );
+        assert_eq!(
+            rosetta_lines("0123456789ab"),
+            [
+                "gate-remote-refused: 0123456789ab install".to_owned(),
+                "gate: remote gate-box runs under Rosetta on this builder, whose CPU times it cannot read: install the arm64 build".to_owned()
+            ]
+        );
+        assert_eq!(rosetta_lines("n")[1], ROSETTA_LINE);
+    }
+
+    #[test]
+    fn a_round_trip_time_has_seven_fractional_digits_and_a_z() {
+        assert_eq!(round_trip(0, 0), "1970-01-01T00:00:00.0000000Z");
+        assert_eq!(round_trip(1_000_000_000, 1_234_567), "2001-09-09T01:46:40.1234567Z");
+    }
+
+    /// The value `environment` gives each name that equals `name` but for case, in order.
+    fn values_of<'e>(environment: &'e [(OsString, OsString)], name: &str) -> Vec<(&'e str, &'e str)> {
+        environment
+            .iter()
+            .filter(|(set, _)| set.to_string_lossy().eq_ignore_ascii_case(name))
+            .map(|(set, value)| (set.to_str().unwrap_or_default(), value.to_str().unwrap_or_default()))
+            .collect()
+    }
+
+    #[test]
+    fn the_command_s_environment_is_the_login_path_then_the_payload_s_env_then_the_box_s_own_names_once() {
+        let start = vec![
+            (OsString::from("PATH"), OsString::from("/ssh/bin")),
+            (OsString::from("HOME"), OsString::from("/Users/b")),
+            (OsString::from("msbuilduseserver"), OsString::from("1")),
+        ];
+        let caller = [
+            ("SHAREDCOMPILATIONID".to_owned(), "theirs".to_owned()),
+            ("gate_box_job".to_owned(), "theirs".to_owned()),
+            ("MY_VAR".to_owned(), "v".to_owned()),
+        ];
+        let environment = command_environment(start.clone(), Some("/login/bin:/usr/bin"), &caller, "gate-box-n", "gate-remote-k-n");
+        assert_eq!(values_of(&environment, "PATH"), [("PATH", "/login/bin:/usr/bin")]);
+        assert_eq!(values_of(&environment, "HOME"), [("HOME", "/Users/b")]);
+        assert_eq!(values_of(&environment, "MY_VAR"), [("MY_VAR", "v")]);
+        assert_eq!(values_of(&environment, "SharedCompilationId"), [("SharedCompilationId", "gate-box-n")]);
+        assert_eq!(values_of(&environment, "MSBUILDUSESERVER"), [("MSBUILDUSESERVER", "0")]);
+        assert_eq!(values_of(&environment, BOX_JOB_VARIABLE), [("GATE_BOX_JOB", "gate-remote-k-n")]);
+        assert_eq!(values_of(&environment, "UseSharedCompilation"), [("UseSharedCompilation", "false")]);
+
+        let theirs = [("PATH".to_owned(), "/payload/bin".to_owned())];
+        let over = command_environment(start.clone(), Some("/login/bin"), &theirs, "r", "j");
+        assert_eq!(
+            values_of(&over, "PATH"),
+            [("PATH", "/payload/bin")],
+            "the payload's Env comes after the login PATH"
+        );
+        let unread = command_environment(start, None, &[], "r", "j");
+        assert_eq!(values_of(&unread, "PATH"), [("PATH", "/ssh/bin")], "no login PATH keeps the box's");
+    }
 
     #[test]
     fn a_recorded_group_is_read_whatever_job_the_record_names() {

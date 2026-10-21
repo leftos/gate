@@ -48,6 +48,33 @@ pub struct Ran {
     pub stderr: Vec<u8>,
     /// Whether a process it left, out of its group's reach, still held its output open once the drain gave up on it.
     pub leftover: bool,
+    /// Why the runner ended the program's group before its leader exited, when it did: its client gone, or a
+    /// [`Watch::check`]. `None` for a leader that exited of itself.
+    pub ended_by: Option<EndedBy>,
+}
+
+/// Why a [`Watch::check`] ends a program's group: its own word for the ending, for the caller to act on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Halt(pub String);
+
+/// Why the runner ended a program's group before its leader exited.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EndedBy {
+    /// Its client was gone ([`Watch::ends_on_gone`]).
+    Gone,
+    /// A [`Watch::check`] ended it, for this.
+    Halted(Halt),
+}
+
+/// What the runner does with a program's output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Forward {
+    /// Standard output kept up to the cap, the end of standard error kept.
+    Kept,
+    /// Standard output kept up to the cap, standard error's lines said through the output as standard error.
+    Err,
+    /// Both streams' lines said through the output, each as itself; nothing kept.
+    Both,
 }
 
 /// Why a program did not run to an exit the runner could read.
@@ -123,19 +150,26 @@ impl<'a> GroupRecord<'a> {
 pub struct Watch<'a> {
     /// The most bytes of standard output kept; more is [`NotRan::OverCap`].
     pub cap: usize,
-    /// When the program's group is ended and the run is [`NotRan::TimedOut`].
-    pub deadline: Instant,
-    /// How the group is ended, at the deadline, for a client gone, or for what the leader left once it exited.
+    /// When the program's group is ended and the run is [`NotRan::TimedOut`]; `None` for no deadline.
+    pub deadline: Option<Instant>,
+    /// How the group is ended, at the deadline, for a client gone or a check, or for what the leader left once it
+    /// exited.
     pub ending: Ending,
-    /// The box's output: standard error's lines are said through it when `forward` is set, and its client watched
-    /// when `ends_on_gone` is.
+    /// The box's output: the lines `forward` names are said through it, and its client watched when `ends_on_gone`
+    /// is set.
     pub output: Option<Arc<dyn Forwarding>>,
-    /// Whether standard error's lines are said through `output`, as standard error; else its tail is kept.
-    pub forward: bool,
+    /// What is done with the program's output: kept, or its lines said through `output`; with no `output`, kept.
+    pub forward: Forward,
     /// Whether a client gone ends the group: looked at every [`POLL`], and probed every [`PROBE`].
     pub ends_on_gone: bool,
     /// The record the group is written to from the child before its program runs, and removed before the reap.
     pub record: Option<&'a GroupRecord<'a>>,
+    /// Called on the waiting thread every [`POLL`] while the leader runs: a [`Halt`] ends the group as `ending` says,
+    /// through the runner's own ending, and the run gives [`EndedBy::Halted`].
+    pub check: Option<&'a dyn Fn() -> Option<Halt>>,
+    /// Called once, when the runner stops watching the leader (its exit seen, or its group's ending decided), before
+    /// the group is ended and the leader reaped.
+    pub on_leader_exit: Option<&'a dyn Fn()>,
 }
 
 /// Runs `command` in a process group of its own, standard input null, its standard output kept up to `cap` bytes and
@@ -150,20 +184,23 @@ pub fn run_bounded(command: Command, cap: usize, deadline: Instant) -> Result<Ra
         command,
         &Watch {
             cap,
-            deadline,
+            deadline: Some(deadline),
             ending: Ending::Kill,
             output: None,
-            forward: false,
+            forward: Forward::Kept,
             ends_on_gone: false,
             record: None,
+            check: None,
+            on_leader_exit: None,
         },
     )
 }
 
 /// Runs `command` as `watch` says: started as the leader of a process group of its own, standard input null, its
 /// group written to `watch.record` from the child before the program runs; watched until the leader exits, the
-/// deadline passes, or (`ends_on_gone`) the client is gone. Then what is left of the group is ended as `watch.ending`
-/// says while the leader is still unreaped, the record removed, the leader reaped, and the readers drained
+/// deadline passes, `watch.check` halts it, or (`ends_on_gone`) the client is gone. Then `watch.on_leader_exit` is
+/// called once, what is left of the group is ended as `watch.ending` says while the leader is still unreaped, the
+/// record removed, the leader reaped, and the readers drained
 /// ([`Readers::drain`]). A program that exited keeps its status, whatever its leftovers did. A group still there after
 /// `SIGKILL`, or a leader whose exit could not be read, is not reaped: its readers are stopped and its record kept, so
 /// the next run refuses `busy`, unless the leader is no child of the box's and its group has no process left
@@ -183,10 +220,7 @@ pub fn run_watched(command: Command, watch: &Watch<'_>) -> Result<Ran, NotRan> {
     let mut readers = Readers::default();
     let started = readers_started(&mut readers, &mut child, watch);
     let leader = Leader { child, group };
-    let why = match started {
-        Ok(()) => watched(&leader, watch),
-        Err(error) => Why::Failed(format!("its output could not be read: {error}")),
-    };
+    let why = stopped_watching(&leader, started, watch);
     match settled(&leader, &why, watch.ending, KILL_WAIT) {
         Settled::Ended => {}
         Settled::StillThere => {
@@ -215,6 +249,11 @@ pub fn run_watched(command: Command, watch: &Watch<'_>) -> Result<Ran, NotRan> {
     let unrecorded = watch.record.map_or(Ok(()), GroupRecord::removed);
     let status = leader.reap();
     let drained = readers.drain();
+    let ended_by = match &why {
+        Why::Gone => Some(EndedBy::Gone),
+        Why::Halted(halt) => Some(EndedBy::Halted(halt.clone())),
+        _ => None,
+    };
     let ended = Ended { why, unrecorded, status };
     let status = ended.status(group)?;
     let mut kept = drained.kept.into_iter();
@@ -229,7 +268,21 @@ pub fn run_watched(command: Command, watch: &Watch<'_>) -> Result<Ran, NotRan> {
         stdout,
         stderr,
         leftover: !drained.all_ended && !drained.stalled,
+        ended_by,
     })
+}
+
+/// Watches `leader` until the runner stops watching it ([`watched`]), unless its readers did not start, `started`
+/// giving why; then calls `watch.on_leader_exit` once, before the group is ended and the leader reaped. Why it stopped.
+fn stopped_watching(leader: &impl Group, started: io::Result<()>, watch: &Watch<'_>) -> Why {
+    let why = match started {
+        Ok(()) => watched(leader, watch),
+        Err(error) => Why::Failed(format!("its output could not be read: {error}")),
+    };
+    if let Some(hook) = watch.on_leader_exit {
+        hook();
+    }
+    why
 }
 
 /// Starts `command` as the leader of a process group of its own, standard input null, its output piped, its group
@@ -272,17 +325,18 @@ fn spawned_recorded(mut command: Command, watch: &Watch<'_>) -> Result<Child, No
 /// Starts the readers of `child`'s standard output, kept up to the cap, and of its standard error, forwarded or its
 /// tail kept as `watch` says; output first, so the drain gives it first.
 fn readers_started(readers: &mut Readers, child: &mut Child, watch: &Watch<'_>) -> io::Result<()> {
-    match child.stdout.take() {
-        Some(pipe) => readers.read(pipe, Take::Capped(watch.cap))?,
-        None => readers.read(io::empty(), Take::Capped(watch.cap))?,
-    }
-    let take = match (&watch.output, watch.forward) {
-        (Some(output), true) => Take::Lines(Arc::clone(output), Stream::Err),
-        _ => Take::Tail(STDERR_TAIL),
+    let (out, err) = match (&watch.output, watch.forward) {
+        (Some(output), Forward::Both) => (Take::Lines(Arc::clone(output), Stream::Out), Take::Lines(Arc::clone(output), Stream::Err)),
+        (Some(output), Forward::Err) => (Take::Capped(watch.cap), Take::Lines(Arc::clone(output), Stream::Err)),
+        _ => (Take::Capped(watch.cap), Take::Tail(STDERR_TAIL)),
     };
+    match child.stdout.take() {
+        Some(pipe) => readers.read(pipe, out)?,
+        None => readers.read(io::empty(), out)?,
+    }
     match child.stderr.take() {
-        Some(pipe) => readers.read(pipe, take),
-        None => readers.read(io::empty(), take),
+        Some(pipe) => readers.read(pipe, err),
+        None => readers.read(io::empty(), err),
     }
 }
 
@@ -294,6 +348,8 @@ enum Why {
     Deadline,
     /// The client is gone.
     Gone,
+    /// A [`Watch::check`] ended the group.
+    Halted(Halt),
     /// The leader's exit could not be read: this.
     Unread(io::Error),
     /// Its readers could not be started: this.
@@ -314,7 +370,7 @@ impl Ended {
         match self.why {
             Why::Failed(why) => return Err(NotRan::Failed(why)),
             Why::Unread(error) => return Err(NotRan::Failed(format!("its exit could not be read: {error}"))),
-            Why::Exited | Why::Deadline | Why::Gone => {}
+            Why::Exited | Why::Deadline | Why::Gone | Why::Halted(_) => {}
         }
         let status = self
             .status
@@ -327,9 +383,9 @@ impl Ended {
     }
 }
 
-/// Watches `leader` every [`POLL`] until it exits, the deadline passes or, when `watch` asks, the client is gone.
-/// Takes no output lock and writes nothing.
-fn watched(leader: &Leader, watch: &Watch<'_>) -> Why {
+/// Watches `leader` every [`POLL`] until it exits, the deadline passes, `watch.check` halts it or, when `watch` asks,
+/// the client is gone. Takes no output lock and writes nothing.
+fn watched(leader: &impl Group, watch: &Watch<'_>) -> Why {
     let gone_watch = watch.output.as_ref().filter(|_| watch.ends_on_gone);
     let mut probed: Option<Instant> = None;
     loop {
@@ -338,8 +394,11 @@ fn watched(leader: &Leader, watch: &Watch<'_>) -> Why {
             Ok(false) => {}
             Err(error) => return Why::Unread(error),
         }
-        if Instant::now() >= watch.deadline {
+        if watch.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Why::Deadline;
+        }
+        if let Some(halt) = watch.check.and_then(|check| check()) {
+            return Why::Halted(halt);
         }
         if let Some(output) = gone_watch
             && client_gone(output.as_ref(), &mut probed)
@@ -424,7 +483,7 @@ fn settled(group: &impl Group, why: &Why, ending: Ending, kill_wait: Duration) -
             group.signal(libc::SIGKILL);
             exited_within(group, kill_wait)
         }
-        Why::Exited | Why::Deadline | Why::Gone => end_group(group, ending, kill_wait),
+        Why::Exited | Why::Deadline | Why::Gone | Why::Halted(_) => end_group(group, ending, kill_wait),
     };
     match ended {
         Ok(GroupEnd::Ended) => Settled::Ended,
@@ -590,23 +649,25 @@ fn exit_seen(pid: i32) -> io::Result<bool> {
 }
 
 /// A group record readied before the fork: its temp file open, and the names and text the child writes.
-struct Staged {
+struct Staged<'a> {
     file: File,
     temp: PathBuf,
     path: PathBuf,
     job: Vec<u8>,
+    lock: &'a HeldLock,
 }
 
-impl Staged {
+impl<'a> Staged<'a> {
     /// Makes the temp file of `record` beside it ([`files::staged_temp`]), `O_CLOEXEC`, so only the child that writes
     /// it before its exec has it.
-    fn new(record: &GroupRecord<'_>) -> io::Result<Staged> {
+    fn new(record: &GroupRecord<'a>) -> io::Result<Staged<'a>> {
         let (temp, file) = files::staged_temp(&record.path)?;
         Ok(Staged {
             file,
             temp,
             path: record.path.clone(),
             job: format!("{}\n", record.job).into_bytes(),
+            lock: record.lock,
         })
     }
 
@@ -620,11 +681,14 @@ impl Staged {
         }
     }
 
-    /// Removes what a spawn that failed may have left: the temp file, and the record when the child renamed it into
-    /// place before its exec failed; a missing one is fine.
+    /// Removes what a spawn that failed may have left: the temp file, its name this run's own, and the record when the
+    /// child renamed it into place before its exec failed, only while the work lock is held, so another run's record at
+    /// the name once the lock was lost is left; a missing one is fine. The lock is looked at just before the unlink, not
+    /// with it: a lock lost in the gap between the two is accepted.
     fn abandon(&self) {
-        for path in [&self.temp, &self.path] {
-            abandoned(path);
+        abandoned(&self.temp);
+        if matches!(self.lock.still_held(), Ok(true)) {
+            abandoned(&self.path);
         }
     }
 }
@@ -818,7 +882,7 @@ pub fn with_path<'c>(command: &'c mut Command, path: Option<&str>) -> &'c mut Co
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a runner that cannot start sh must fail the test loudly")]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::io;
     use std::process::Command;
     use std::sync::Arc;
@@ -826,8 +890,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        Ending, Group, GroupEnd, GroupRecord, NotRan, Settled, Watch, Why, end_group, login_path, login_path_of, run_bounded, run_watched, settled,
-        signal_log, status_text,
+        EndedBy, Ending, Forward, Group, GroupEnd, GroupRecord, Halt, NotRan, Settled, Staged, Watch, Why, end_group, login_path, login_path_of,
+        run_bounded, run_watched, settled, signal_log, status_text, stopped_watching,
     };
     use crate::console::{FailingSink, Forwarding, LineSink, Output, RecordingSink, Stream};
     use crate::files::held_for_test;
@@ -877,12 +941,14 @@ mod tests {
     fn forwarding(output: Arc<dyn Forwarding>, deadline: Instant) -> Watch<'static> {
         Watch {
             cap: 1024,
-            deadline,
+            deadline: Some(deadline),
             ending: Ending::TermThenKill(Duration::from_secs(2)),
             output: Some(output),
-            forward: true,
+            forward: Forward::Err,
             ends_on_gone: true,
             record: None,
+            check: None,
+            on_leader_exit: None,
         }
     }
 
@@ -1035,12 +1101,14 @@ mod tests {
         let record = GroupRecord::new(folder.join("k.pgid"), "gate-remote-k-0123456789ab", &lock);
         let watch = Watch {
             cap: 4,
-            deadline: Instant::now() + HANG_GUARD,
+            deadline: Some(Instant::now() + HANG_GUARD),
             ending: Ending::Kill,
             output: None,
-            forward: false,
+            forward: Forward::Kept,
             ends_on_gone: false,
             record: Some(&record),
+            check: None,
+            on_leader_exit: None,
         };
         let ran = run_watched(Command::new("gate-box-no-such-program"), &watch);
         let left: Vec<_> = std::fs::read_dir(&folder).expect("the folder is read").collect();
@@ -1050,6 +1118,27 @@ mod tests {
         let _ = std::fs::remove_file(&lock_path);
         assert!(matches!(ran, Err(NotRan::Start(_))), "{ran:?}");
         assert!(left.is_empty(), "neither the record nor its temp file is left: {left:?}");
+    }
+
+    #[test]
+    fn an_abandoned_spawn_once_the_lock_name_was_replaced_leaves_the_other_run_s_record() {
+        let folder = std::env::temp_dir().join(format!("gate-box-unix-abandon-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).expect("the case folder is made");
+        let lock_path = folder.join("k.lock");
+        let lock = held_for_test(&lock_path);
+        let path = folder.join("k.pgid");
+        let record = GroupRecord::new(path.clone(), "gate-remote-k-0123456789ab", &lock);
+        let staged = Staged::new(&record).expect("the record is staged");
+        std::fs::remove_file(&lock_path).expect("the lock's name is freed");
+        std::fs::write(&lock_path, "").expect("another run's lock takes the name");
+        std::fs::write(&path, "other").expect("the other run writes its record");
+        staged.abandon();
+        let kept = std::fs::read_to_string(&path);
+        let temp_left = staged.temp.exists();
+        // Best effort: a folder left behind is in the temp folder and named for this process.
+        let _ = std::fs::remove_dir_all(&folder);
+        assert_eq!(kept.ok().as_deref(), Some("other"), "the other run's record is kept");
+        assert!(!temp_left, "this run's own temp file is removed");
     }
 
     /// What one look at a fake group's leader answers.
@@ -1075,6 +1164,9 @@ mod tests {
         looks: RefCell<Vec<Look>>,
         sent: RefCell<Vec<i32>>,
         others: RefCell<Vec<bool>>,
+        /// What happened to the group, in order: each look's answer (`running`, `exited`), each `signal`, and what a
+        /// test's hooks note.
+        events: RefCell<Vec<&'static str>>,
     }
 
     impl Fake {
@@ -1083,6 +1175,7 @@ mod tests {
                 looks: RefCell::new(looks.iter().rev().copied().collect()),
                 sent: RefCell::new(Vec::new()),
                 others: RefCell::new(vec![true]),
+                events: RefCell::new(Vec::new()),
             }
         }
 
@@ -1104,8 +1197,14 @@ mod tests {
         fn exited(&self) -> io::Result<bool> {
             match next_of(&self.looks) {
                 Some(Look::Fails(errno)) => Err(io::Error::from_raw_os_error(errno)),
-                Some(Look::Exited) => Ok(true),
-                Some(Look::Running) | None => Ok(false),
+                Some(Look::Exited) => {
+                    self.events.borrow_mut().push("exited");
+                    Ok(true)
+                }
+                Some(Look::Running) | None => {
+                    self.events.borrow_mut().push("running");
+                    Ok(false)
+                }
             }
         }
 
@@ -1115,8 +1214,125 @@ mod tests {
         }
 
         fn signal(&self, signal: i32) {
+            self.events.borrow_mut().push("signal");
             self.sent.borrow_mut().push(signal);
         }
+    }
+
+    /// A watch with no deadline, no output and no hooks, ending with `SIGKILL`.
+    fn quiet_watch<'a>() -> Watch<'a> {
+        Watch {
+            cap: 1024,
+            deadline: None,
+            ending: Ending::Kill,
+            output: None,
+            forward: Forward::Kept,
+            ends_on_gone: false,
+            record: None,
+            check: None,
+            on_leader_exit: None,
+        }
+    }
+
+    #[test]
+    fn a_check_that_halts_ends_the_group_through_the_runner_s_own_ending() {
+        let group = Fake::new(&[Look::Running, Look::Running, Look::Running, Look::Running, Look::Exited]).emptied();
+        let checks = Cell::new(0);
+        let check = || {
+            checks.set(checks.get() + 1);
+            (checks.get() >= 3).then(|| Halt("ceiling".to_owned()))
+        };
+        let watch = Watch {
+            check: Some(&check),
+            ..quiet_watch()
+        };
+        let why = stopped_watching(&group, Ok(()), &watch);
+        assert!(matches!(&why, Why::Halted(halt) if halt.0 == "ceiling"), "halted at the third check");
+        assert_eq!(checks.get(), 3, "the check is made once per poll");
+        let settled = settled(&group, &why, Ending::TermThenKill(HANG_GUARD), HANG_GUARD);
+        assert!(matches!(settled, Settled::Ended), "{settled:?}");
+        assert_eq!(*group.sent.borrow(), [libc::SIGTERM, libc::SIGCONT], "ended as the watch's ending says");
+    }
+
+    #[test]
+    fn the_leader_exit_hook_is_called_once_after_the_exit_is_seen_and_before_the_group_is_ended() {
+        let group = Fake::new(&[Look::Running, Look::Exited]).listing(&[true, false]);
+        let hook = || group.events.borrow_mut().push("hook");
+        let watch = Watch {
+            on_leader_exit: Some(&hook),
+            ..quiet_watch()
+        };
+        let why = stopped_watching(&group, Ok(()), &watch);
+        let settled = settled(&group, &why, Ending::TermThenKill(HANG_GUARD), HANG_GUARD);
+        assert!(matches!(settled, Settled::Ended), "{settled:?}");
+        assert_eq!(
+            *group.events.borrow(),
+            ["running", "exited", "hook", "exited", "signal", "signal", "exited"],
+            "once, after the exit is seen, before the leftovers are ended"
+        );
+
+        let unread = Fake::new(&[Look::Exited]).emptied();
+        let hook = || unread.events.borrow_mut().push("hook");
+        let watch = Watch {
+            on_leader_exit: Some(&hook),
+            ..quiet_watch()
+        };
+        let why = stopped_watching(&unread, Err(io::Error::other("no pipe")), &watch);
+        assert!(matches!(why, Why::Failed(_)));
+        assert_eq!(*unread.events.borrow(), ["hook"], "called once when the readers did not start too");
+    }
+
+    #[test]
+    fn a_check_that_halts_a_program_ends_its_group_before_the_reap_and_the_run_says_so() {
+        let check = || Some(Halt("ceiling".to_owned()));
+        let started = Instant::now();
+        let watch = Watch {
+            deadline: Some(started + HANG_GUARD),
+            ending: Ending::TermThenKill(Duration::from_secs(2)),
+            check: Some(&check),
+            ..quiet_watch()
+        };
+        let ran = run_watched(sh("sleep 600"), &watch).expect("sh runs to its end");
+        assert!(started.elapsed() < ENDED_WELL_BEFORE, "ended long before its sleep");
+        assert_eq!(ran.ended_by, Some(EndedBy::Halted(Halt("ceiling".to_owned()))));
+        assert_eq!(status_text(ran.status), "signal 15", "the leader was signalled");
+        let sent = signal_log::take();
+        assert_eq!(sent.first().map(|sent| sent.signal), Some(libc::SIGTERM), "{sent:?}");
+        assert!(sent.iter().all(|sent| sent.unreaped), "{sent:?}");
+    }
+
+    #[test]
+    fn both_streams_are_forwarded_each_as_itself_and_a_leader_that_exits_of_itself_is_not_ended_by_the_runner() {
+        let sink = Arc::new(Output::new(RecordingSink::default()));
+        let output: Arc<dyn Forwarding> = Arc::clone(&sink) as Arc<dyn Forwarding>;
+        let hooked = Cell::new(0);
+        let hook = || hooked.set(hooked.get() + 1);
+        let watch = Watch {
+            deadline: Some(Instant::now() + HANG_GUARD),
+            output: Some(output),
+            forward: Forward::Both,
+            ends_on_gone: true,
+            on_leader_exit: Some(&hook),
+            ..quiet_watch()
+        };
+        let ran = run_watched(sh("echo out; echo err >&2; exit 5"), &watch).expect("sh runs");
+        let mut lines = sink.sink().lines();
+        lines.sort_by_key(|(stream, _)| *stream == Stream::Err);
+        assert_eq!(lines, [(Stream::Out, "out".to_owned()), (Stream::Err, "err".to_owned())]);
+        assert!(ran.stdout.is_empty() && ran.stderr.is_empty(), "nothing kept");
+        assert_eq!(status_text(ran.status), "status 5");
+        assert_eq!(ran.ended_by, None);
+        assert_eq!(hooked.get(), 1, "the hook is called once");
+    }
+
+    #[test]
+    fn a_client_gone_says_the_runner_ended_the_group_for_it() {
+        let output: Arc<dyn Forwarding> = Arc::new(Output::new(FailingSink::new(io::ErrorKind::BrokenPipe)));
+        let started = Instant::now();
+        let ran = run_watched(sh("echo first >&2; sleep 600"), &forwarding(output, started + HANG_GUARD)).expect("sh runs to its end");
+        assert!(started.elapsed() < ENDED_WELL_BEFORE, "ended long before its sleep");
+        assert_eq!(ran.ended_by, Some(EndedBy::Gone));
+        assert!(signal_log::take().iter().all(|sent| sent.unreaped));
     }
 
     #[test]

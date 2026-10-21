@@ -15,7 +15,7 @@ use gate_wire::escaped;
 use crate::console::{Forwarding, LineSink, Output, Stream};
 use crate::files::{self, ReplaceFailure};
 use crate::lines::{FAILED_STATUS, is_git_variable, step_unran};
-use crate::process::{Ending, GroupRecord, NotRan, Ran, Watch, run_bounded, run_watched, status_text};
+use crate::process::{Ending, Forward, GroupRecord, NotRan, Ran, Watch, run_bounded, run_watched, status_text};
 
 /// How long one preflight git step may take.
 const GIT_LIMIT: Duration = Duration::from_secs(120);
@@ -430,12 +430,14 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
         let output: Arc<dyn Forwarding> = Arc::clone(self.output) as Arc<dyn Forwarding>;
         let watch = Watch {
             cap: GIT_OUTPUT_CAP,
-            deadline: Instant::now() + limit,
+            deadline: Some(Instant::now() + limit),
             ending: Ending::TermThenKill(END_GRACE),
             output: Some(output),
-            forward: mode.forward,
+            forward: if mode.forward { Forward::Err } else { Forward::Kept },
             ends_on_gone: mode.ends_on_gone,
             record: self.record.as_ref(),
+            check: None,
+            on_leader_exit: None,
         };
         let ran = run_watched(command, &watch);
         if self.output.client_gone() {

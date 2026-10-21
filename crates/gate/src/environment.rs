@@ -116,14 +116,10 @@ fn overrides(root: &ResolvedRoot, run: &str, marker: &str) -> Vec<Override> {
 /// that waits for its whole job (Godot's console wrapper waits for every process in it) never ends while an idle process
 /// holds it, and Roslyn's compiler server idles there for up to ten minutes.
 fn build_servers(run: &str) -> Vec<Override> {
-    vec![
-        (OsString::from("SharedCompilationId"), Some(OsString::from(run))),
-        (OsString::from("MSBUILDNODEHANDSHAKESALT"), Some(OsString::from(run))),
-        (OsString::from("MSBUILDUSESERVER"), Some(OsString::from("0"))),
-        (OsString::from("DOTNET_CLI_USE_MSBUILD_SERVER"), Some(OsString::from("0"))),
-        (OsString::from("UseSharedCompilation"), Some(OsString::from("false"))),
-        (OsString::from("MSBUILDDISABLENODEREUSE"), Some(OsString::from("1"))),
-    ]
+    gate_wire::build_server_settings(run)
+        .into_iter()
+        .map(|(name, value)| (OsString::from(name), Some(OsString::from(value))))
+        .collect()
 }
 
 /// The run id of `gate` under `root`: `gate-<pid>-<start ms>`, and `-<h>` after it under a non-default root, so a run

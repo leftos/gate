@@ -15,6 +15,8 @@ pub mod request;
 #[cfg(unix)]
 pub mod boot;
 #[cfg(unix)]
+pub mod command;
+#[cfg(unix)]
 pub mod files;
 #[cfg(unix)]
 pub mod git;

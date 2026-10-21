@@ -14,7 +14,7 @@ use gate_wire::{PathForm, Payload, Refusal, bare_stem, busy_line, escaped, layou
 use crate::console::{LineSink, Output, Stream};
 use crate::files::{self, HeldLock, Locked};
 use crate::git::{self, AlternatesFailure, Failed, Git, GitClass, RunGit, Steps, Tree, line_ends_set, origin_set};
-use crate::lines::{FAILED_STATUS, USAGE_STATUS, recorded_group, signal_guard, work_layout};
+use crate::lines::{FAILED_STATUS, Translation, USAGE_STATUS, recorded_group, rosetta_lines, signal_guard, translation, work_layout};
 use crate::preflight::checked_root;
 use crate::process::GroupRecord;
 use crate::stop::{Record, own_group, record_current, records_folder};
@@ -172,7 +172,9 @@ pub struct Ready<'p> {
 
 /// Readies the run of `payload` for its command, saying its lines through `output`: the payload read ([`Request::read`]),
 /// each failure one line and [`USAGE_STATUS`]; what this builder does not build refused with its tag and a line said
-/// together, [`REFUSED_STATUS`]; the work root, `<root>/work` and `Bare` checked as the preflight checks them
+/// together, [`REFUSED_STATUS`]; a box running under Rosetta refused `install` the same way
+/// ([`crate::lines::rosetta_lines`]), and one whose `sysctl.proc_translated` cannot be read said and taken as native; the
+/// work root, `<root>/work` and `Bare` checked as the preflight checks them
 /// ([`root_checked`]); the work lock taken, a held one refused `busy` with the busy line, one that cannot be opened
 /// failing with [`FAILED_STATUS`]; an earlier run's group record whose group still runs refused `busy`, and one whose
 /// group is gone removed ([`earlier_group_cleared`]); the lock files a git step cut short left removed ([`swept`]), else
@@ -190,6 +192,17 @@ pub fn prepare<'p, S: LineSink + 'static>(payload: &'p Payload, output: &Arc<Out
     let request = Request::read(payload).map_err(|line| said(output, &[&line], USAGE_STATUS))?;
     if let Some(unbuilt) = request.unbuilt {
         return Err(refused(output, &request, unbuilt.refusal, &unbuilt.line(request.bare)));
+    }
+    match translation(crate::command::proc_translated()) {
+        Translation::Native => {}
+        Translation::Unread(line) => {
+            // A note: the run goes on, and a client gone finds out at the next line.
+            let _ = output.say(Stream::Err, &line);
+        }
+        Translation::Rosetta => {
+            let [tag, line] = rosetta_lines(request.nonce);
+            return Err(said(output, &[&tag, &line], REFUSED_STATUS));
+        }
     }
     root_checked(&request).map_err(|(line, status)| said(output, &[&line], status))?;
     let lock = match files::take_lock(Path::new(request.lock)) {
@@ -342,7 +355,7 @@ impl From<Failed> for NotLaidOut {
 }
 
 /// The group record of the work folder `work`, `<work>.pgid`, which `box stop` reads.
-fn group_record(work: &str) -> String {
+pub(crate) fn group_record(work: &str) -> String {
     format!("{work}.pgid")
 }
 
@@ -405,8 +418,9 @@ fn lock_removed(path: &Path) -> Result<(), NotLaidOut> {
     }
 }
 
-/// Lays out the work folder of `request` for its checkout, under the work lock: when the interrupted-command record
-/// `<work>.command` is there, the warm record `<work>.warm` and the tools record `<work>.tools` removed, so neither
+/// Lays out the work folder of `request` for its checkout, under the work lock: the interrupted-command record
+/// `<work>.command` refused unless it is missing or a file itself, not followed, as the run could neither write nor
+/// remove anything else there; when it is there, the warm record `<work>.warm` and the tools record `<work>.tools` removed, so neither
 /// trusts a tree a command was cut short in, the checkout remaking the tree; the work folder failed unless it is
 /// missing or the box user's own folder ([`files::unusable_folder`]); `.git`, `.git/objects` and `.git/objects/info`
 /// refused unless each is missing or a folder itself, and `.git/config` and `.git/HEAD` unless each is missing or a
@@ -415,7 +429,9 @@ fn lock_removed(path: &Path) -> Result<(), NotLaidOut> {
 /// objects, written whole ([`git::alternates_written`]).
 fn laid_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>) -> Result<(), NotLaidOut> {
     let work = request.work;
-    if files::exists(Path::new(&format!("{work}.command"))) {
+    let command = format!("{work}.command");
+    plain_or_missing(Path::new(&command), false)?;
+    if files::exists(Path::new(&command)) {
         for suffix in [".warm", ".tools"] {
             removed(&format!("{work}{suffix}"))?;
         }
@@ -1172,6 +1188,21 @@ mod tests {
             assert!(said.len() == 2 && said[1].starts_with(&start), "{suffix}: {said:?}");
             assert_eq!(said[0], refused_line(NONCE, Refusal::Layout));
         }
+    }
+
+    #[test]
+    fn a_folder_at_the_interrupted_command_record_is_refused_layout_with_no_started_line() {
+        let case = Case::new("command-folder");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.laid_out(&commit);
+        let record = format!("{}.command", case.work());
+        fs::create_dir(&record).expect("a folder takes the record's name");
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        assert_eq!(said, layout_refusal(&format!("{record} is a link or not a file")));
+        assert!(Path::new(&record).is_dir(), "the folder is left");
     }
 
     #[test]

@@ -1142,6 +1142,21 @@ pub fn started_line(nonce: &str) -> String {
     format!("gate-remote-started: {nonce}")
 }
 
+/// The build-server settings a gate gives its command for the run `run`, each name with its value: the compiler
+/// server's pipe and `MSBuild`'s node handshake named by the run, so no other run's command uses the servers this one
+/// starts, and the `MSBuild` server, the compiler server and node reuse off. Both boxes and the PC's gate set these.
+#[must_use]
+pub fn build_server_settings(run: &str) -> [(&'static str, String); 6] {
+    [
+        ("SharedCompilationId", run.to_owned()),
+        ("MSBUILDNODEHANDSHAKESALT", run.to_owned()),
+        ("MSBUILDUSESERVER", "0".to_owned()),
+        ("DOTNET_CLI_USE_MSBUILD_SERVER", "0".to_owned()),
+        ("UseSharedCompilation", "false".to_owned()),
+        ("MSBUILDDISABLENODEREUSE", "1".to_owned()),
+    ]
+}
+
 /// The refusal tag the box says on stderr just before the human line of a refusal of the run whose payload carries
 /// `nonce`: `gate-remote-refused: <nonce> <word>` ([`Refusal::word`]). The client reads a refusal from this line alone.
 ///
