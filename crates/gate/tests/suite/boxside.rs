@@ -23,8 +23,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::support::{
-    Case, Closed, Escapee, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, NetfxKey, Outcome, Running, StderrCloser, UNTIL_KILLED, allow_breakaway, box_payload,
-    build_version, copy_tool, finish, junction, names, shown, start_with_closable_stderr, start_with_closed, start_with_stdin, wait_until,
+    Case, Escapee, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, NetfxKey, Outcome, Running, StderrCloser, UNTIL_KILLED, allow_breakaway, box_payload,
+    build_version, copy_tool, finish, junction, names, shown, start_with_closable_stderr, start_with_closed_stdout, start_with_stdin, wait_until,
     wait_until_closed,
 };
 
@@ -77,9 +77,9 @@ impl BoxCall {
         self.start().finish()
     }
 
-    /// Starts the box as [`start_with_closed`] does, its request line written and its stdin then closed.
-    fn start_with_closed(self, closed: Closed) -> Running {
-        let (running, mut stdin) = start_with_closed(closed, self.command);
+    /// Starts the box as [`start_with_closed_stdout`] does, its request line written and its stdin then closed.
+    fn start_with_closed_stdout(self) -> Running {
+        let (running, mut stdin) = start_with_closed_stdout(self.command);
         send_request(&mut stdin, &self.request);
         drop(stdin);
         running
@@ -4370,7 +4370,7 @@ fn box_run_a_closed_stdout_pipe_stops_the_job_and_exits_255() {
     let mut payload = box_payload(&case, "k", &[r".\run.cmd"]);
     snapshot(&case, &mut payload, &[("a.txt", "a\n"), ("run.cmd", &script)]);
 
-    let running = box_call(&case, &["box", "run"], &self::payload(&payload)).start_with_closed(Closed::Stdout);
+    let running = box_call(&case, &["box", "run"], &self::payload(&payload)).start_with_closed_stdout();
     running.wait_for_stderr("started");
     let_go(&go);
 

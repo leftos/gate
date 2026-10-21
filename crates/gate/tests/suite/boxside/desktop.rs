@@ -16,8 +16,8 @@ use super::{
     payload as request_line, refused_line, run_box, snapshot, started_line, stopped_line_for, unreal_root,
 };
 use crate::support::{
-    Case, Closed, FAKE_TOOL, HeldDesktop, KeptDesktop, Outcome, box_payload, build_version, copy_tool, desktop_payload, desktop_seams, junction,
-    shown, wait_until, wait_until_closed,
+    Case, FAKE_TOOL, HeldDesktop, KeptDesktop, Outcome, box_payload, build_version, copy_tool, desktop_payload, desktop_seams, junction, shown,
+    wait_until, wait_until_closed,
 };
 
 /// The box's prefix of every line refusing a run the builder's desktop cannot take.
@@ -1160,7 +1160,7 @@ fn a_closed_stdout_pipe_stops_a_desktop_job_and_exits_255() {
     let go = case.folder().join("go");
     let go_word = shown(&go);
     let payload = ready_payload(&case, &[FAKE_TOOL, "err", "started", "wait", &go_word, "out", "x", "sleep", "10000"]);
-    let running = desktop_call(&case, &payload, "ok", &[]).start_with_closed(Closed::Stdout);
+    let running = desktop_call(&case, &payload, "ok", &[]).start_with_closed_stdout();
     running.wait_for_stderr("started");
     let_go(&go);
 
@@ -1173,14 +1173,21 @@ fn a_closed_stdout_pipe_stops_a_desktop_job_and_exits_255() {
     );
 }
 
+/// The client's stderr closes while the desktop command runs: the command's next line on stderr, or the heartbeat's
+/// probe, finds it gone, and the box stops the job and exits 255. Stderr closes only once the command has started: closed
+/// from the box's start, the box's probe during the checkout's git finds it first and the run ends before any command.
+/// The command then waits for a file the case never writes, so only the stop ends it.
 #[test]
 fn a_closed_stderr_pipe_stops_a_desktop_job_and_exits_255() {
     let case = Case::new("desktop_closed_stderr");
     let go = case.folder().join("go");
+    let never = case.folder().join("never");
     let go_word = shown(&go);
-    let payload = ready_payload(&case, &[FAKE_TOOL, "out", "started", "wait", &go_word, "err", "x", "sleep", "10000"]);
-    let running = desktop_call(&case, &payload, "ok", &[]).start_with_closed(Closed::Stderr);
+    let never_word = shown(&never);
+    let payload = ready_payload(&case, &[FAKE_TOOL, "out", "started", "wait", &go_word, "err", "x", "wait", &never_word]);
+    let (running, stderr) = desktop_call(&case, &payload, "ok", &[]).start_with_closable_stderr();
     running.wait_for_stdout("started");
+    stderr.close();
     let_go(&go);
 
     let outcome = running.finish();

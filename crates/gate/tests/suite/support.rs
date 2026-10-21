@@ -288,38 +288,21 @@ fn gathered(mut command: Command) -> Running {
     }
 }
 
-/// Which of a program's output streams a caller stops reading at once.
-#[derive(Clone, Copy)]
-pub enum Closed {
-    Stdout,
-    Stderr,
-}
-
 /// Starts `command` with its stdin a pipe, whose write end it returns as [`start_with_stdin`] does, and both output
-/// streams piped, dropping this process's read end of `closed` at once, so the program's next write to that stream
-/// fails; the other stream is gathered as [`start`] gathers it.
-pub fn start_with_closed(closed: Closed, mut command: Command) -> (Running, ChildStdin) {
+/// streams piped, dropping this process's read end of stdout at once, so the program's next write to stdout fails;
+/// stderr is gathered as [`start`] gathers it.
+pub fn start_with_closed_stdout(mut command: Command) -> (Running, ChildStdin) {
     command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let stop_tree = stop_tree_of(&command);
     let mut child = command.spawn().expect("the program starts");
     let stdin = child.stdin.take().expect("stdin is piped");
     let out_pipe = child.stdout.take().expect("stdout is piped");
     let err_pipe = child.stderr.take().expect("stderr is piped");
-    let (stdout, stderr, reader) = match closed {
-        Closed::Stdout => {
-            drop(out_pipe);
-            let (stderr, reader) = gather(err_pipe);
-            (Buffer::default(), stderr, reader)
-        }
-        Closed::Stderr => {
-            drop(err_pipe);
-            let (stdout, reader) = gather(out_pipe);
-            (stdout, Buffer::default(), reader)
-        }
-    };
+    drop(out_pipe);
+    let (stderr, reader) = gather(err_pipe);
     let running = Running {
         child,
-        stdout,
+        stdout: Buffer::default(),
         stderr,
         readers: vec![reader],
         stop_tree,
