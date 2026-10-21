@@ -1491,23 +1491,28 @@ fn stamp(words: &mut Vec<String>, sha: impl FnOnce() -> Option<String>, target: 
     let path_map = if sets_any(&PATH_MAP_OPT_OUTS) {
         None
     } else {
-        path_map_word(&facts.box_trees(target))
+        path_map_word(&facts.box_trees(target), target.builder.os)
     };
     let added = revision.map(|sha| format!("-p:{SOURCE_REVISION}={sha}")).into_iter().chain(path_map);
     words.splice(own.end..own.end, added);
 }
 
-/// The `-p:PathMap=` word of `trees`, each a box tree and the PC root it stands for, in order: `tree\=root`, the box
-/// side ending in exactly one `\`, so `work\key` never maps `work\key2`, and the PC side in none, since the compiler adds
-/// it (one more there records a doubled separator once the compiler quotes the value), the pairs joined with
-/// [`PATH_MAP_PAIR_SEPARATOR`]; `None` when there is no tree.
-fn path_map_word(trees: &[(String, String)]) -> Option<String> {
+/// The `-p:PathMap=` word of `trees`, each a tree on a builder running `os` and the PC root it stands for, in order:
+/// `tree\=root`, the box side ending in exactly one of the builder's separators (`/` on macOS: `tree/=root`), so
+/// `work\key` never maps `work\key2`, and the PC side in no `\`, since the compiler adds it (one more there records a
+/// doubled separator once the compiler quotes the value), the pairs joined with [`PATH_MAP_PAIR_SEPARATOR`]; `None`
+/// when there is no tree.
+fn path_map_word(trees: &[(String, String)], os: BuilderOs) -> Option<String> {
     if trees.is_empty() {
         return None;
     }
+    let separator = match os {
+        BuilderOs::Windows => '\\',
+        BuilderOs::Macos => '/',
+    };
     let pairs: Vec<String> = trees
         .iter()
-        .map(|(tree, root)| format!("{}\\={}", tree.trim_end_matches('\\'), root.trim_end_matches('\\')))
+        .map(|(tree, root)| format!("{}{separator}={}", tree.trim_end_matches(separator), root.trim_end_matches('\\')))
         .collect();
     Some(format!("-p:{PATH_MAP}={}", pairs.join(PATH_MAP_PAIR_SEPARATOR)))
 }

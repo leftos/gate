@@ -262,7 +262,11 @@ pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) ->
     let staged = Cell::new(false);
     let (end, lines, complete, clear) = match install(attempt, fetched, &staged) {
         Ok((done, started)) => {
-            cached(&v1::outputs_hashes_path(attempt.call.state_dir, attempt.call.key), &done, started);
+            cached(
+                &v1::outputs_hashes_path(attempt.call.state_dir, attempt.call.builder.id.as_deref(), attempt.call.key),
+                &done,
+                started,
+            );
             let lines = said(&done, fetched.started.elapsed().as_secs_f64());
             let complete = done.complete();
             (End::Status(0), lines, complete, complete)

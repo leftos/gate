@@ -11,7 +11,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use gate_args::{BoxVerb, CheckRequest, CheckSeams};
-use gate_router::{Place, escaped, repo_name, work_folder_key};
+use gate_router::{Builder, BuilderOs, Place, escaped, repo_name, work_folder_key};
 use gate_win32::PipedConsole;
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
@@ -41,19 +41,20 @@ const NOT_STOPPED: &str = "could not be stopped: ";
 /// the exit status: 0 when nothing is missing, 1 when something is or the check could not run, 2 for a host
 /// `remote.json` does not list.
 pub(crate) fn check(request: &CheckRequest, host: &str, console: &mut Console) -> u32 {
-    let host = match listed(host) {
-        Ok(host) => host,
+    let builder = match listed(host) {
+        Ok(builder) => builder,
         Err((status, line)) => {
             console.err(&line);
             return u32::from(status);
         }
     };
+    let host = builder.alias.as_str();
     let place = match local::placed() {
         Ok(Some(place)) => place,
         Ok(None) => return failed(console, "check: not in a git repository"),
         Err(why) => return failed(console, &format!("check: {why}")),
     };
-    let mut transport = match transport(&request.seams, &host) {
+    let mut transport = match transport(&request.seams, host) {
         Ok(transport) => transport,
         Err(line) => return failed(console, &line),
     };
@@ -62,12 +63,9 @@ pub(crate) fn check(request: &CheckRequest, host: &str, console: &mut Console) -
         return failed(console, &format!("check: {host}: {why}"));
     }
     let bound = request.seams.remote_timeout_ms.map_or(BOUND, Duration::from_millis);
-    match asked(&*transport, &host, &place, bound) {
+    match asked(&*transport, &builder, &place, bound) {
         Ok(asked) => {
-            let at = At::Builder {
-                host: &host,
-                key: &asked.key,
-            };
+            let at = At::Builder { host, key: &asked.key };
             super::say(&report::said(at, &asked.checked), console)
         }
         Err(line) => failed(console, &line),
@@ -81,9 +79,10 @@ fn failed(console: &mut Console, line: &str) -> u32 {
 }
 
 /// The builder `remote.json` lists as `host`, in `hosts` ([`gate_router::Config::builders`]) or as a `builders` entry
-/// ([`gate_router::Config::builder`]) that is `host` in any ASCII letter case, as the file spells it. Else the status
-/// and the line: 2 for a host it does not list, 1 for a routing file that is not there or cannot be used.
-fn listed(host: &str) -> Result<String, (u8, String)> {
+/// ([`gate_router::Config::builder`]) that is `host` in any ASCII letter case, its alias as the file spells it: a
+/// `hosts` entry is a Windows builder with the default root and no id, as `host` is. Else the status and the line: 2
+/// for a host it does not list, 1 for a routing file that is not there or cannot be used.
+fn listed(host: &str) -> Result<Builder, (u8, String)> {
     let cannot = |why: String| (FAILED_STATUS, format!("check: {}: remote.json {why}", escaped(host)));
     let path = route::remote_json_path(std::env::var_os("LOCALAPPDATA").as_deref())
         .ok_or_else(|| cannot("cannot be found: LOCALAPPDATA is not an absolute folder".to_owned()))?;
@@ -93,11 +92,17 @@ fn listed(host: &str) -> Result<String, (u8, String)> {
         Err(problem) => return Err(cannot(format!("is ignored: {}", problem.reason))),
     };
     let builders = config.builders().map_err(|why| cannot(format!("is ignored: {why}")))?;
-    builders
-        .iter()
-        .find(|builder| builder.eq_ignore_ascii_case(host))
-        .cloned()
-        .or_else(|| config.builder(host).map(|builder| builder.alias.clone()))
+    let in_hosts = builders.iter().find(|builder| builder.eq_ignore_ascii_case(host)).map(|alias| {
+        config.builder(alias).cloned().unwrap_or_else(|| Builder {
+            alias: alias.clone(),
+            os: BuilderOs::Windows,
+            root: None,
+            slots: config.slots(),
+            id: None,
+        })
+    });
+    in_hosts
+        .or_else(|| config.builder(host).cloned())
         .ok_or_else(|| (USAGE_STATUS, format!("gate check: {} is not a builder remote.json lists", escaped(host))))
 }
 
@@ -130,9 +135,11 @@ struct Asked {
     key: String,
 }
 
-/// What the builder `host`, reached over `transport` within `bound`, has of what the repo at `place` declares; else
-/// the line saying why it could not be checked.
-fn asked(transport: &dyn Transport, host: &str, place: &Place, bound: Duration) -> Result<Asked, String> {
+/// What `builder`, reached over `transport` within `bound` and laid out by its profile ([`Transport::profile`]), has
+/// of what the repo at `place` declares; else the line saying why it could not be checked.
+fn asked(transport: &dyn Transport, builder: &Builder, place: &Place, bound: Duration) -> Result<Asked, String> {
+    let host = builder.alias.as_str();
+    let profile = transport.profile(builder);
     let root = Path::new(&place.root);
     let repo = repo_name(&place.checkout);
     let mut declarations = Declarations::from_process(&repo);
@@ -142,12 +149,12 @@ fn asked(transport: &dyn Transport, host: &str, place: &Place, bound: Duration) 
     }
     let needs = toolchain::needs_of(&declared.manifest);
     let key = work_folder_key(&place.root);
-    let location = Location::under(transport.root(), &repo, &key, &payload::job_nonce());
+    let location = Location::under(&profile, &repo, &key, &payload::job_nonce());
     let input = payload::input(&payload::preflight_word(&location, &needs), None);
     let sent: Vec<String> = needs.into_iter().map(|(name, _)| name).collect();
-    let program = transport.call(host, &payload::line(BoxVerb::Preflight), Wire::Plain);
+    let program = transport.call(host, &profile.line(BoxVerb::Preflight), Wire::Plain);
     let heard = called(&program, bound, input.as_bytes()).map_err(|failure| failure.line(host))?;
-    if let Some(line) = refusal(host, transport.root(), &heard) {
+    if let Some(line) = refusal(host, profile.root(), &heard) {
         return Err(line);
     }
     let answer = Answer {

@@ -752,7 +752,7 @@ fn call_of<'r>(parts: CallParts<'r>, remote: &'r RemoteRun) -> Result<RemoteCall
         env,
     } = parts;
     Ok(RemoteCall {
-        host: &remote.builder.alias,
+        builder: &remote.builder,
         key: &remote.key,
         root: &remote.root,
         root_id: remote.root_id,

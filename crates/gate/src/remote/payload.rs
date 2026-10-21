@@ -9,9 +9,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use gate_args::BoxVerb;
+use gate_wire::PathForm;
 use serde_json::{Map, Value, json};
 
 use crate::remote::snapshot::IDENTITY;
+use crate::remote::transport::Profile;
 use crate::wait::REMOTE_LIMIT;
 
 /// The gate a builder runs, from its admin-owned `C:\Program Files\gate\bin`, named literally.
@@ -21,8 +23,8 @@ const JOB_NONCE_DIGITS: usize = 12;
 const RUN_NONCE_DIGITS: usize = 32;
 
 /// Where one work folder's state lives on the builder: the bare repository, the work folder, its lock and sync-back
-/// index files, the folder outputs wait in, the job of this run, named with a nonce new to it, and the sibling pair the
-/// box lays out in the work folder, `None` for a run of one repo.
+/// index files, the folder outputs wait in, the job of this run, named with a nonce new to it, the sibling pair the
+/// box lays out in the work folder, `None` for a run of one repo, and the path rules the builder's box reads them under.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Location {
     pub key: String,
@@ -33,6 +35,7 @@ pub(crate) struct Location {
     pub output_folder: String,
     pub job: String,
     pub pair: Option<Pair>,
+    pub form: PathForm,
 }
 
 /// A sibling pair as the payload's `Pair` carries it: the main checkout's folder name and each sibling's, in order.
@@ -42,26 +45,21 @@ pub(crate) struct Pair {
     pub siblings: Vec<String>,
 }
 
-/// The work folder `key` under the builder's `root`, its trailing separators trimmed: `{root}\work\{key}`.
-pub(crate) fn work(root: &str, key: &str) -> String {
-    format!(r"{}\work\{key}", root.trim_end_matches(['\\', '/']))
-}
-
 impl Location {
-    /// The work folder `key` of `repo` under the builder's `root`, its job named with `job_nonce`, with no pair.
-    pub(crate) fn under(root: &str, repo: &str, key: &str, job_nonce: &str) -> Location {
-        let bare = bare(root, repo);
-        let work = work(root, key);
-        let root = root.trim_end_matches(['\\', '/']);
+    /// The work folder `key` of `repo` on the builder of `profile`, laid out as its profile lays it out, its job named
+    /// with `job_nonce`, with no pair.
+    pub(crate) fn under(profile: &Profile, repo: &str, key: &str, job_nonce: &str) -> Location {
+        let work = profile.work(key);
         Location {
             key: key.to_owned(),
-            bare,
+            bare: profile.bare(repo),
             lock: format!("{work}.lock"),
             index: format!("{work}.index"),
             work,
-            output_folder: format!(r"{root}\outputs"),
-            job: format!(r"Local\gate-remote-{key}-{job_nonce}"),
+            output_folder: profile.output_folder(),
+            job: profile.job(key, job_nonce),
             pair: None,
+            form: profile.form(),
         }
     }
 
@@ -95,11 +93,6 @@ impl Location {
         }
         object
     }
-}
-
-/// The bare repository of `repo` under the builder's `root`.
-pub(crate) fn bare(root: &str, repo: &str) -> String {
-    format!(r"{}\{repo}.git", root.trim_end_matches(['\\', '/']))
 }
 
 /// What a run call carries beside the location: the words the builder runs, the folder below the work folder they run
@@ -307,13 +300,14 @@ fn word(object: &Map<String, Value>) -> String {
     STANDARD.encode(Value::Object(object.clone()).to_string())
 }
 
-/// The line ssh carries for `verb`, the same whatever the call sends: the builder's gate, `box`, the verb and, for a
-/// verb that reads a request, `--stdin`, as the request comes on the call's standard input ([`input`]).
-pub(crate) fn line(verb: BoxVerb) -> String {
+/// The line ssh carries for `verb`, the same whatever the call sends: the builder's gate `gate` ([`Profile::line`]),
+/// `box`, the verb and, for a verb that reads a request, `--stdin`, as the request comes on the call's standard input
+/// ([`input`]).
+pub(crate) fn line(gate: &str, verb: BoxVerb) -> String {
     if verb.takes_request() {
-        format!("{BOX_EXE} box {} --stdin", verb.as_str())
+        format!("{gate} box {} --stdin", verb.as_str())
     } else {
-        format!("{BOX_EXE} box {}", verb.as_str())
+        format!("{gate} box {}", verb.as_str())
     }
 }
 
@@ -352,18 +346,80 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        InputsStep, Location, Pair, RunCall, WarmCall, input, inputs_word, job_nonce, line, location_word, preflight_word, run_nonce, run_word,
-        warm_word,
+        InputsStep, Location, Pair, RunCall, WarmCall, input, inputs_word, job_nonce, location_word, preflight_word, run_nonce, run_word, warm_word,
     };
-    use gate_wire::Payload;
+    use crate::remote::transport::Profile;
+    use gate_router::{Builder, BuilderOs};
+    use gate_wire::{PathForm, Payload};
 
     fn decoded(word: &str) -> Value {
         let bytes = STANDARD.decode(word).expect("the word is base64");
         serde_json::from_str(&String::from_utf8(bytes).expect("the JSON is UTF-8")).expect("the word is JSON")
     }
 
+    /// `host`, a Windows builder, under its root with a trailing separator.
+    fn host() -> Profile {
+        Profile::new("builder", BuilderOs::Windows, r"D:\gate-remote\")
+    }
+
     fn location() -> Location {
-        Location::under(r"D:\gate-remote\", "app", "app-1a2b3c4d", "0123456789ab")
+        Location::under(&host(), "app", "app-1a2b3c4d", "0123456789ab")
+    }
+
+    /// The macOS builder `mac-1` under `/Users/b/gate-remote`, reached over the ssh transport.
+    fn mac() -> Profile {
+        let builder = Builder {
+            alias: "mac-1".to_owned(),
+            os: BuilderOs::Macos,
+            root: Some("/Users/b/gate-remote".to_owned()),
+            slots: 1,
+            id: Some("00000000".to_owned()),
+        };
+        Profile::of(&builder, r"D:\gate-remote")
+    }
+
+    #[test]
+    fn a_macos_builder_s_location_is_laid_out_with_slashes_under_its_root() {
+        let location = Location::under(&mac(), "duel", "duel-0a1b2c3d", "0123456789ab");
+        let work = "/Users/b/gate-remote/work/duel-0a1b2c3d";
+        assert_eq!(
+            location,
+            Location {
+                key: "duel-0a1b2c3d".to_owned(),
+                bare: "/Users/b/gate-remote/duel.git".to_owned(),
+                work: work.to_owned(),
+                lock: format!("{work}.lock"),
+                index: format!("{work}.index"),
+                output_folder: "/Users/b/gate-remote/outputs".to_owned(),
+                job: "gate-remote-duel-0a1b2c3d-0123456789ab".to_owned(),
+                pair: None,
+                form: PathForm::Unix,
+            }
+        );
+        assert!(gate_wire::is_job_name(&location.job, "duel-0a1b2c3d", PathForm::Unix), "{}", location.job);
+        assert!(!gate_wire::is_job_name(&location.job, "duel-0a1b2c3d", PathForm::Windows), "no Local\\");
+    }
+
+    #[test]
+    fn a_macos_builder_s_payload_is_read_back_by_the_unix_box() {
+        let location = Location::under(&mac(), "duel", "duel-0a1b2c3d", &job_nonce());
+        let payload = Payload::decode(&location_word(&location), PathForm::Unix).expect("the Unix box decodes the word");
+        let (key, work) = payload.work_folder().expect("the Unix box takes the work folder");
+        assert_eq!((key, work), ("duel-0a1b2c3d", "/Users/b/gate-remote/work/duel-0a1b2c3d"));
+        assert_eq!(payload.path("Bare"), Ok("/Users/b/gate-remote/duel.git"));
+        assert_eq!(payload.output_folder(work), Ok("/Users/b/gate-remote/outputs"));
+        assert_eq!(payload.job(key), Ok(location.job.as_str()));
+        for path in ["Bare", "Work", "Lock", "Index", "OutputFolder"] {
+            assert!(payload.path(path).is_ok(), "{path} is a Unix path: {:?}", payload.path(path));
+        }
+        let paired = Location::under(&mac(), "duel", "duel-0a1b2c3d", &job_nonce()).with_pair("duel", &["lib".to_owned()]);
+        let pair = Payload::decode(&location_word(&paired), PathForm::Unix)
+            .expect("the Unix box decodes the word")
+            .laid_out()
+            .expect("the Unix box lays the pair out")
+            .expect("the pair is there");
+        let bares: Vec<&str> = pair.siblings().iter().map(gate_wire::PairSibling::bare).collect();
+        assert_eq!(bares, ["/Users/b/gate-remote/lib.git"]);
     }
 
     #[test]
@@ -379,6 +435,7 @@ mod tests {
                 output_folder: r"D:\gate-remote\outputs".to_owned(),
                 job: r"Local\gate-remote-app-1a2b3c4d-0123456789ab".to_owned(),
                 pair: None,
+                form: PathForm::Windows,
             }
         );
     }
@@ -935,10 +992,13 @@ mod tests {
 
     #[test]
     fn the_line_is_the_fixed_box_line_for_the_verb() {
-        assert_eq!(line(BoxVerb::Run), r#""C:\Program Files\gate\bin\gate.exe" box run --stdin"#);
-        assert_eq!(line(BoxVerb::Preflight), r#""C:\Program Files\gate\bin\gate.exe" box preflight --stdin"#);
+        assert_eq!(host().line(BoxVerb::Run), r#""C:\Program Files\gate\bin\gate.exe" box run --stdin"#);
         assert_eq!(
-            line(BoxVerb::RegisterDesktop),
+            host().line(BoxVerb::Preflight),
+            r#""C:\Program Files\gate\bin\gate.exe" box preflight --stdin"#
+        );
+        assert_eq!(
+            host().line(BoxVerb::RegisterDesktop),
             r#""C:\Program Files\gate\bin\gate.exe" box register-desktop"#,
             "a verb that reads no request has no --stdin"
         );

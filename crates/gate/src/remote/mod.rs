@@ -15,7 +15,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use gate_args::TestSeams;
-use gate_router::{FolderId, SendPlan, Target, escaped};
+use gate_router::{Builder, FolderId, SendPlan, Target, escaped};
 use gate_state::v1::WarmFailure;
 use gate_state::{FallbackReason, StateRoot, Verdict};
 use gate_win32::{Interrupt, OwnedMutexGuard};
@@ -314,7 +314,9 @@ pub(crate) enum KeyWait {
     reason = "each flag is an independent fact of the route or the request that the client reads by name"
 )]
 pub(crate) struct RemoteCall<'a> {
-    pub host: &'a str,
+    /// The builder the route picked, whose alias is [`RemoteCall::host`]: its profile ([`transport::Transport::profile`]) lays
+    /// out the run's paths and words on it, and its id names the PC folder of its per-worktree caches.
+    pub builder: &'a Builder,
     pub key: &'a str,
     pub root: &'a str,
     /// The id the route's decision read for the worktree root's folder, following links: the worktree lock refuses a
@@ -364,6 +366,15 @@ pub(crate) struct RemoteCall<'a> {
     pub state_dir: &'a Path,
     /// What the call asks of the work folder's warm-up.
     pub warmth: Warmth<'a>,
+}
+
+impl<'a> RemoteCall<'a> {
+    /// The alias the call reaches its builder by, the picked builder's own, so the box line and the paths and caches
+    /// the call lays out by never name two builders.
+    pub(crate) fn host(&self) -> &'a str {
+        let builder: &'a Builder = self.builder;
+        &builder.alias
+    }
 }
 
 /// What a call knows of or asks of the work folder's warm-up: nothing, for a repo without warm-up consent or without a
@@ -496,18 +507,20 @@ pub(crate) fn chosen(seams: &TestSeams) -> Result<Box<dyn RemoteClient>, String>
     Ok(Box::new(client::RustClient::ssh(seams)))
 }
 
-/// Each tree a routed run of `target` is checked out in on the builder the remote transport `transport` reaches
-/// ([`transport::builder_root`]), with the PC root it stands for, paired and spelled as the outputs' install pairs and
-/// spells them: the main repo's tree first, then each carried sibling's in carried order. Else why they cannot be told,
-/// or why the first PC root holding a character the word cannot carry ([`uncarried`]) leaves out every tree.
+/// Each tree a routed run of `target` is checked out in on its builder, laid out by the profile the remote transport
+/// `transport` reaches the builder by ([`transport::builder_profile`]), with the PC root it stands for, paired and
+/// spelled as the outputs' install pairs and spells them: the main repo's tree first, then each carried sibling's in
+/// carried order. Else why they cannot be told, or why the first PC root holding a character the word cannot carry
+/// ([`uncarried`]) leaves out every tree.
 pub(crate) fn box_trees(transport: Option<&str>, target: &Target) -> Result<Vec<(String, String)>, String> {
-    let root = transport::builder_root(transport)?;
+    let profile = transport::builder_profile(&target.builder, transport)?;
     let siblings: Vec<(&str, &str)> = target
         .siblings
         .iter()
         .map(|sibling| (sibling.name.as_str(), sibling.root.as_str()))
         .collect();
-    let (main, siblings) = outputs::trees_of(&payload::work(&root, &target.key), &target.leaf, &target.place.root, &siblings);
+    let work = profile.work(&target.key);
+    let (main, siblings) = outputs::trees_of(&work, &target.leaf, &target.place.root, &siblings, profile.form());
     std::iter::once(main)
         .chain(siblings)
         .map(|(tree, pc_root)| {
@@ -627,7 +640,7 @@ mod snapshot_only {
         /// call before it starts.
         fn call<'a>(root: &'a str, log: &'a Path, interrupt: Option<Interrupt>) -> RemoteCall<'a> {
             RemoteCall {
-                host: "builder",
+                builder: &crate::test_support::HOST,
                 key: "app-1a2b3c4d",
                 root,
                 root_id: gate_router::FolderId { volume: 0, file: [0; 16] },
@@ -937,7 +950,7 @@ mod scripted {
     /// Writes the call to `path` as one JSON object.
     fn record(call: &RemoteCall<'_>, path: &Path) -> Result<bool, String> {
         let recorded = json!({
-            "host": call.host,
+            "host": call.host(),
             "key": call.key,
             "root": call.root,
             "rootId": recorded_id(call.root_id),

@@ -668,7 +668,7 @@ fn call_of<'a>(
     let target = &prepared.target;
     let siblings = remote::carried(&target.place.root, &target.siblings)?;
     Ok(RemoteCall {
-        host: &target.builder.alias,
+        builder: &target.builder,
         key: &target.key,
         root: &target.place.root,
         root_id: target.root_id,

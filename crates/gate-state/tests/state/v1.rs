@@ -225,11 +225,40 @@ fn the_outputs_pending_marker_sits_in_the_remote_folder() {
 }
 
 #[test]
+fn a_builder_s_cache_folder_is_the_remote_folder_for_host_and_its_id_folder_for_an_entry() {
+    let root = Path::new("state-root");
+
+    assert_eq!(parts_under(root, &v1::builder_cache_dir(root, None)), ["remote"]);
+    assert_eq!(parts_under(root, &v1::builder_cache_dir(root, Some("1f0efc62"))), ["remote", "1f0efc62"]);
+    let id = Some("1f0efc62");
+    let key = "app-1a2b3c4d";
+    for (path, name) in [
+        (v1::outputs_hashes_path(root, id, key), "app-1a2b3c4d.outputs-hashes"),
+        (v1::outputs_capped_path(root, id, key), "app-1a2b3c4d.outputs-capped"),
+        (v1::inputs_hashes_path(root, id, key), "app-1a2b3c4d.inputs-hashes"),
+        (v1::sent_build_hashes_path(root, id, key), "app-1a2b3c4d.sent-build-hashes"),
+    ] {
+        assert_eq!(parts_under(root, &path), ["remote", "1f0efc62", name]);
+    }
+    assert_eq!(
+        parts_under(root, &v1::nothing_back_path(root, key)),
+        ["remote", "app-1a2b3c4d.nothing-back"],
+        "nothing-back stays PC-wide"
+    );
+    assert_eq!(
+        parts_under(root, &v1::outputs_pending_path(root, key)),
+        ["remote", "app-1a2b3c4d.outputs-pending"],
+        "the outputs-pending marker stays PC-wide"
+    );
+    assert_eq!(parts_under(root, &v1::warm_cap_lock_path(root)), ["remote", "warm.lock"]);
+}
+
+#[test]
 fn the_outputs_hash_cache_sits_in_the_remote_folder() {
     let root = Path::new("state-root");
 
     assert_eq!(
-        parts_under(root, &v1::outputs_hashes_path(root, "app-1a2b3c4d")),
+        parts_under(root, &v1::outputs_hashes_path(root, None, "app-1a2b3c4d")),
         ["remote", "app-1a2b3c4d.outputs-hashes"]
     );
 }
@@ -316,7 +345,7 @@ fn the_outputs_cap_record_sits_in_the_remote_folder() {
     let root = Path::new("state-root");
 
     assert_eq!(
-        parts_under(root, &v1::outputs_capped_path(root, "app-1a2b3c4d")),
+        parts_under(root, &v1::outputs_capped_path(root, None, "app-1a2b3c4d")),
         ["remote", "app-1a2b3c4d.outputs-capped"]
     );
 }
@@ -324,7 +353,7 @@ fn the_outputs_cap_record_sits_in_the_remote_folder() {
 #[test]
 fn an_outputs_cap_record_is_written_whole_over_any_other_and_read_back() {
     let root = scratch("outputs-capped");
-    let path = v1::outputs_capped_path(&root, "app-1a2b3c4d");
+    let path = v1::outputs_capped_path(&root, None, "app-1a2b3c4d");
 
     v1::write_outputs_capped(&path, &v1::OutputsCappedRecord { hits: 1 }).expect("the record can be written");
     let first = fs::read(&path).expect("the record can be read");

@@ -1655,6 +1655,68 @@ fn a_builder_without_a_usable_gate_box_is_not_routed() {
     assert!(!case.folder().join("builder").exists(), "nothing reached the builder");
 }
 
+/// The id of the `builders` entry `mac-1`: the first 8 hex digits of the SHA-256 of its alias.
+const MAC_ID: &str = "1f0efc62";
+
+/// A command a macOS `builders` entry picks is sent that builder's Unix wire: its `gate-box` line under its root, a
+/// payload laid out with `/` under that root and a job with no `Local\`; the run's per-worktree caches go in the
+/// builder's own PC folder, `remote\<id>`. The PC's stand-in box reads Windows paths only, so it refuses the preflight
+/// and the run falls back here.
+#[test]
+fn a_command_a_macos_builder_picks_is_sent_its_unix_wire_and_caches_in_its_own_folder() {
+    let case = client_case("client-macos-wire");
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({
+        "host": HOST,
+        "repos": { &repo: ["*never*"] },
+        "builders": [{
+            "host": "mac-1",
+            "os": "macos",
+            "root": "/Users/b/gate-remote",
+            "repos": { &repo: ["*tool*"] },
+            "outputs": { &repo: BIN },
+        }],
+    });
+    write_remote_json(&case, &routing.to_string());
+    write(&case, ".gitignore", &format!("{CLIENT_IGNORED}bin/\n"));
+    write(&case, r"bin\old.txt", "built before");
+    backdate(&case, r"bin\old.txt", HOUR);
+    let fed = format!("fed-hold {}", shown(&case.folder()));
+    let steps = ssh_steps(&case, "ssh", &[&fed]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    let refused = "gate: not routed: mac-1 has no gate box that takes this run (preflight status 2)";
+    assert!(outcome.stderr.contains(refused), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"]);
+    let lines = fs::read_to_string(beside(&steps, ".lines")).expect("the stand-in kept the call's line");
+    assert_eq!(
+        lines.lines().collect::<Vec<_>>(),
+        ["mac-1 /Users/b/gate-remote/bin/gate-box box preflight --stdin"]
+    );
+    let key = key_of(&events(&case));
+    let sent = last_request(&steps);
+    let work = format!("/Users/b/gate-remote/work/{key}");
+    assert_eq!(sent["Bare"], json!(format!("/Users/b/gate-remote/{repo}.git")), "{sent}");
+    assert_eq!(sent["Work"], json!(work), "{sent}");
+    assert_eq!(sent["Lock"], json!(format!("{work}.lock")), "{sent}");
+    assert_eq!(sent["OutputFolder"], json!("/Users/b/gate-remote/outputs"), "{sent}");
+    let job = Regex::new(&format!("^gate-remote-{key}-[0-9a-f]{{12}}$")).expect("the pattern is valid");
+    assert!(sent["Job"].as_str().is_some_and(|said| job.is_match(said)), "{sent}");
+    let remote = case.root().join("remote");
+    let hashes = format!("{key}.outputs-hashes");
+    let listed = |folder: &Path| fs::read_dir(folder).map(|entries| entries.flatten().map(|entry| entry.file_name()).collect::<Vec<_>>());
+    assert!(
+        remote.join(MAC_ID).join(&hashes).is_file(),
+        "the cache is in mac-1's folder: {:?} {:?}",
+        listed(&remote),
+        listed(&remote.join(MAC_ID))
+    );
+    assert!(!remote.join(&hashes).exists(), "host's folder holds no cache of mac-1's");
+}
+
 #[test]
 fn a_box_of_another_version_is_not_routed() {
     let case = client_case("client-version");

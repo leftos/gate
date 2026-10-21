@@ -40,7 +40,7 @@ use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
 use gate_router::{Config, DROPPED_NO_BUILD_LINE, SendPlan, escaped, repo_name};
-use gate_wire::{PairRefused, PathForm, Payload, SHA256_DIGITS, is_lower_hex};
+use gate_wire::{PairRefused, Payload, SHA256_DIGITS, is_lower_hex};
 
 use super::git::{self, Git, GitError, NO_CURRENT_FOLDER, last_update};
 use super::held::{Held, sibling_who};
@@ -59,7 +59,7 @@ use super::toolchain::{self, GodotChoice, Manifest, NoChosenGodot, Pin, Reported
 #[cfg(feature = "test-seams")]
 use super::transport::Local;
 use super::transport::ssh::Ssh;
-use super::transport::{Program, Transport, Wire};
+use super::transport::{Profile, Program, Transport, Wire};
 use super::watchdog::{self, Cut, Kept, Kill, LINE_CAP};
 use super::worktree_lock::{self, Folder, Locked, Wait};
 use super::{
@@ -1231,6 +1231,11 @@ struct RunEnd {
 }
 
 impl Attempt<'_, '_> {
+    /// The profile of the call's builder over the transport ([`super::transport::Transport::profile`]).
+    pub(super) fn profile(&self) -> Profile {
+        self.transport.profile(self.call.builder)
+    }
+
     /// The phases in order; `Err` for an end before the run call.
     fn phases(&mut self) -> Result<End, End> {
         #[cfg(feature = "test-seams")]
@@ -1290,7 +1295,7 @@ impl Attempt<'_, '_> {
             outputs: sent.globs,
             full: sent.full,
             timeout: raised.unwrap_or(self.call.timeout),
-            host: self.call.host,
+            host: self.call.host(),
             sibling_snapshots: &sibling_snapshots,
             inputs_digest: inputs.as_ref().map(|built| built.digest.as_str()),
             lfs_digest: lfs.as_ref().map(|sending| sending.digest.as_str()),
@@ -1697,7 +1702,7 @@ impl Attempt<'_, '_> {
     /// reader before anything is sent, which names each sibling's bare repository; each of `repos` is given its bare. A
     /// pair the box would refuse keeps the run here naming the sibling.
     fn location(&mut self, repos: &mut [Repo]) -> Result<Location, End> {
-        let location = Location::under(self.transport.root(), self.call.repo, self.call.key, &payload::job_nonce());
+        let location = Location::under(&self.profile(), self.call.repo, self.call.key, &payload::job_nonce());
         let Some((main, siblings)) = repos.split_first_mut() else {
             return Ok(location);
         };
@@ -1707,7 +1712,7 @@ impl Attempt<'_, '_> {
         }
         let names: Vec<String> = siblings.iter().map(|repo| repo.name.clone()).collect();
         let location = location.with_pair(self.call.leaf, &names);
-        let decoded = Payload::decode(&payload::location_word(&location), PathForm::Windows).map_err(PairRefused::from);
+        let decoded = Payload::decode(&payload::location_word(&location), location.form).map_err(PairRefused::from);
         let pair = match decoded.and_then(|payload| payload.laid_out()) {
             Ok(Some(pair)) => pair,
             Ok(None) => return Err(End::Failed("the run's payload carries no Pair".to_owned())),
@@ -1880,7 +1885,7 @@ impl Attempt<'_, '_> {
         let boot = boot_time(&called.lines).map(str::to_owned);
         let sdks = sdks_of(&called.lines);
         let tools = toolchain::reported(&called.lines, &sent);
-        let host = self.call.host;
+        let host = self.call.host();
         let refused = preflight_refusal(host, &called);
         self.lines.append(&mut called.lines);
         self.not_started_if_killed("the preflight", &called)?;
@@ -1902,7 +1907,7 @@ impl Attempt<'_, '_> {
                 return Err(End::Refused(FallbackReason::Version));
             }
             status => {
-                self.say(format!("gate: preparing {} on {host} failed (status {status})", self.transport.root()));
+                self.say(format!("gate: preparing {} on {host} failed (status {status})", self.profile().root()));
                 return Err(End::Status(i64::from(status)));
             }
         }
@@ -2134,7 +2139,7 @@ impl Attempt<'_, '_> {
                 continue;
             }
             let sdks = prepared.sdks.as_deref().unwrap_or_default();
-            for line in parity::lines(&repo.on_builder, &needs, self.call.host, sdks) {
+            for line in parity::lines(&repo.on_builder, &needs, self.call.host(), sdks) {
                 self.say(line);
             }
             refused = true;
@@ -2142,7 +2147,7 @@ impl Attempt<'_, '_> {
         let mut warning = None;
         let godot_command = self.godot_command();
         let chosen = match toolchain::godot_choice(required.as_deref(), &prepared.tools) {
-            GodotChoice::None => match toolchain::no_chosen_godot(required.as_deref(), pins_read, godot_command, &prepared.tools, self.call.host) {
+            GodotChoice::None => match toolchain::no_chosen_godot(required.as_deref(), pins_read, godot_command, &prepared.tools, self.call.host()) {
                 NoChosenGodot::None => None,
                 NoChosenGodot::Newest { version, warning: why } => {
                     warning = why;
@@ -2194,7 +2199,7 @@ impl Attempt<'_, '_> {
     /// tracked attributes name the LFS filter ([`Attempt::lfs_filtered`]), git-lfs at 3.1.3 or later, or the manifest's
     /// own minimum when higher, too ([`toolchain::judge_with_git_lfs`]).
     fn tool_needs(&mut self, tree: &Tree, prepared: &Prepared, godot: Option<&[Pin]>, lfs: bool) -> Vec<parity::Need> {
-        let host = self.call.host;
+        let host = self.call.host();
         let file = tree.manifest_file.as_deref().unwrap_or(toolchain::MANIFEST_SAID);
         let manifest = tree.manifest.as_ref().map(|read| (read, file));
         let judge = if lfs { toolchain::judge_with_git_lfs } else { toolchain::judge };
@@ -2356,7 +2361,7 @@ impl Attempt<'_, '_> {
         self.go_on()?;
         let Push { at, repo, snapshot, created } = *push;
         let (root, key, pair) = (Path::new(&repo.root), self.call.key, !self.call.siblings.is_empty());
-        let target = self.transport.push_target(self.call.host, &repo.on_builder);
+        let target = self.transport.push_target(&self.profile(), &repo.on_builder);
         let target = target.map_err(|why| repo_end(at, &repo.name, End::Failed(why)))?;
         // Only the transport's own protocol may carry the push, so no `pushInsteadOf` a repository's config names can
         // turn it into a protocol helper: ssh to a builder, a local path for the test transport's bare repositories.
@@ -2426,7 +2431,7 @@ impl Attempt<'_, '_> {
         let Some(cut) = called.cut else {
             return Ok(());
         };
-        self.say(format!("gate: remote {} unreachable: {}", self.call.host, cut.reason(what)));
+        self.say(format!("gate: remote {} unreachable: {}", self.call.host(), cut.reason(what)));
         self.noted(called);
         Err(End::Refused(FallbackReason::Unreachable))
     }
@@ -2539,10 +2544,10 @@ impl Attempt<'_, '_> {
             }
             Err(end) => return Err(end),
         };
-        let not_installed = run_install_refused(self.call.host, &called);
+        let not_installed = run_install_refused(self.call.host(), &called);
         // The run call's refusal tag for its install is followed by the box's install line, which the client turns into
         // the same `gate check --builder` line the preflight and inputs paths say. Read before the call's lines are kept.
-        let tagged = install_tag_refusal(self.call.host, called.lines.iter().chain(&called.last_error).map(String::as_str));
+        let tagged = install_tag_refusal(self.call.host(), called.lines.iter().chain(&called.last_error).map(String::as_str));
         let kept = self.lines.len();
         self.lines.append(&mut called.lines);
         let output = kept..self.lines.len();
@@ -2552,7 +2557,7 @@ impl Attempt<'_, '_> {
                 limits.stall,
                 limits.backstop,
                 limits.command.as_secs(),
-                self.call.host,
+                self.call.host(),
             ));
             self.noted(&called);
             self.stop(location);
@@ -2602,7 +2607,7 @@ impl Attempt<'_, '_> {
             }
             self.lines.append(&mut called.lines);
             self.go_on()?;
-            self.say(retry::retry_line(self.call.host, retry, retry::PRE_BANNER_RETRIES));
+            self.say(retry::retry_line(self.call.host(), retry, retry::PRE_BANNER_RETRIES));
             paused(self.pause, self.call.interrupt)?;
             self.go_on()?;
             called = make(self)?;
@@ -2618,7 +2623,7 @@ impl Attempt<'_, '_> {
     /// came meanwhile ends the run as an interrupt; one that came by the end of the stop ends it there, with no boot
     /// call.
     fn connection_lost(&mut self, location: &Location, before: Option<&str>, output: Range<usize>) -> End {
-        let host = self.call.host;
+        let host = self.call.host();
         self.stop(location);
         if self.go_on().is_err() {
             self.say(format!("gate: lost the connection to {host}"));
@@ -2653,7 +2658,7 @@ impl Attempt<'_, '_> {
     /// The builder's boot time now, from the `boot` call to `location`, a bounded call; `None` when the call failed,
     /// did not finish or said none.
     fn boot_now(&mut self, location: &Location) -> Option<String> {
-        let what = format!("asking {} for its boot time", self.call.host);
+        let what = format!("asking {} for its boot time", self.call.host());
         let called = self.bounded(BoxVerb::Boot, location, &what)?;
         (called.status == 0 && called.cut.is_none())
             .then(|| boot_time(&called.lines).map(str::to_owned))
@@ -2663,7 +2668,7 @@ impl Attempt<'_, '_> {
     /// Stops the command the run call started on the builder at `location`, with the `stop` call, a bounded call; the
     /// run's end is the caller's however it went.
     fn stop(&mut self, location: &Location) {
-        let what = format!("stopping the command on {}", self.call.host);
+        let what = format!("stopping the command on {}", self.call.host());
         self.bounded(BoxVerb::Stop, location, &what);
     }
 
@@ -2671,7 +2676,7 @@ impl Attempt<'_, '_> {
     /// wait that follows the Ctrl+C is explained. A Ctrl+C during the stop does not end it and says nothing more.
     fn stop_after_ctrl_c(&mut self, location: &Location) {
         let bound = watchdog::whole_seconds(self.limits.bound);
-        self.say(format!("gate: stopping the command on {} (up to {bound} s)", self.call.host));
+        self.say(format!("gate: stopping the command on {} (up to {bound} s)", self.call.host()));
         self.stop(location);
     }
 
@@ -2691,7 +2696,7 @@ impl Attempt<'_, '_> {
             if let Ok(first) = &mut made {
                 self.lines.append(&mut first.lines);
             }
-            self.say(retry::retry_line(self.call.host, 1, 1));
+            self.say(retry::retry_line(self.call.host(), 1, 1));
             thread::sleep(self.pause);
             made = self.ssh(
                 verb,
@@ -2734,12 +2739,12 @@ impl Attempt<'_, '_> {
         }
     }
 
-    /// One call of `gate box` on the builder for `verb`, its line [`payload::line`], fed its request on its standard
+    /// One call of `gate box` on the builder for `verb`, its line [`Profile::line`], fed its request on its standard
     /// input; watched as `watch` says; the console interrupt raised after its first output byte when `raise`; what only
     /// this call gives it, `only`.
     fn ssh(&mut self, verb: BoxVerb, echo: Echo, watch: Watch, raise: bool, only: CallOnly) -> Result<Called, End> {
         let system = gate_win32::system_directory().map_err(|error| End::Failed(format!("cannot read the system folder: {error}")))?;
-        let command = call_command(self.transport.call(self.call.host, &payload::line(verb), only.wire), &system);
+        let command = call_command(self.transport.call(self.call.host(), &self.profile().line(verb), only.wire), &system);
         let starts = Starts {
             breakaway: self.transport.box_runs_here(),
             raise,
@@ -2831,7 +2836,7 @@ impl Attempt<'_, '_> {
             attempt.ssh(verb, Echo::LogOnly, watch, raise, only)
         })?;
         self.lines.extend(called.lines.iter().cloned());
-        if let Some(line) = install_refused(self.call.host, &called) {
+        if let Some(line) = install_refused(self.call.host(), &called) {
             self.say(line);
             return Err(End::Refused(FallbackReason::Install));
         }
@@ -4760,12 +4765,13 @@ mod tests {
     use crate::remote::payload::Location;
     use crate::remote::snapshot::Snapshot;
     use crate::remote::toolchain::Pin;
-    use crate::remote::transport::{Local, Transport};
+    use crate::remote::transport::{Local, Profile, Transport};
     use crate::remote::watchdog::{self, Kill, LOG_CAP};
     use crate::remote::worktree_lock::tests::{held_elsewhere, lock_name};
     use crate::remote::{INSTALL_UNTRUSTED, ROOT_UNSAFE, install_untrusted_line, root_busy_line, root_unsafe_line};
     use crate::remote::{Refusal, RemoteCall, RemoteClient, Sibling, WarmEnd, Warmth, adjusted_line, busy_line, carried, refused_line, started_line};
     use crate::run::CONTROL_C_EXIT;
+    use gate_router::BuilderOs;
     use gate_state::v1::WarmFailure;
 
     /// A state root no gate uses; no test here takes its key's lock.
@@ -4862,7 +4868,7 @@ mod tests {
     /// A call whose interrupt is raised, logging to `log`, which no test here writes.
     fn call(log: &Path) -> RemoteCall<'_> {
         RemoteCall {
-            host: "builder",
+            builder: &crate::test_support::HOST,
             key: "app-1a2b3c4d",
             root: r"C:\no-such-worktree",
             root_id: gate_router::FolderId { volume: 0, file: [0; 16] },
@@ -4941,6 +4947,51 @@ mod tests {
             interrupt: None,
             ..call(log)
         }
+    }
+
+    /// The outputs-pending marker says the PC's outputs may be wrong, whichever builder ran: one a `mac-1` run leaves
+    /// makes the next run of the worktree on `host` ask for every output that differs (`OutputsFull`).
+    #[test]
+    fn an_outputs_pending_marker_a_macos_run_leaves_makes_the_next_host_run_send_full() {
+        let folder = crate::test_support::temp_dir().join(format!("gate-client-pending-{}", std::process::id()));
+        if folder.exists() {
+            fs::remove_dir_all(&folder).expect("a folder an earlier run left can be removed");
+        }
+        let worktree = folder.join("app");
+        fs::create_dir_all(worktree.join("bin")).expect("the worktree can be made");
+        fs::write(worktree.join("bin").join("app.dll"), "built").expect("an output can be written");
+        let state = folder.join("state");
+        let log = folder.join("out.log");
+        let root = worktree.to_string_lossy().into_owned();
+        let globs = ["**/bin/**".to_owned()];
+        let mac = gate_router::Builder {
+            alias: "mac-1".to_owned(),
+            os: BuilderOs::Macos,
+            root: Some("/Users/b/gate-remote".to_owned()),
+            slots: 1,
+            id: Some("1f0efc62".to_owned()),
+        };
+        let on_mac = RemoteCall {
+            builder: &mac,
+            root: &root,
+            outputs: &globs,
+            state_dir: &state,
+            interrupt: None,
+            ..call(&log)
+        };
+        let transport = nowhere();
+
+        let left = outputs::sent(&mut attempt(&on_mac, &transport)).expect("the mac run's manifest is built");
+        outputs::marked(&left).expect("the mac run's marker can be written");
+        let on_host = RemoteCall {
+            builder: &crate::test_support::HOST,
+            ..on_mac
+        };
+        let next = outputs::sent(&mut attempt(&on_host, &transport)).expect("the host run's manifest is built");
+
+        assert!(!left.full, "the mac run found no marker");
+        assert!(next.full, "the host run sees the marker the mac run left");
+        fs::remove_dir_all(&folder).expect("the test's folder can be removed");
     }
 
     /// A pair run holds its folders before anything else ([`super::Held::hold`]): a sibling made a junction after
@@ -5281,7 +5332,7 @@ mod tests {
         let call = pair_call(&run, carried(&run.root, &run.siblings).expect("the run's siblings check"), &log);
         let transport = nowhere();
         let target = transport
-            .push_target(call.host, call.repo)
+            .push_target(&transport.profile(call.builder), call.repo)
             .expect("the main repository has a push target");
         git_at(&app, &["config", &helper, &target.url]);
         let (mut attempt, repos) = held_pair(&call, &transport);
@@ -5343,7 +5394,12 @@ mod tests {
 
     /// The location of a run call no test makes.
     fn location() -> Location {
-        Location::under(r"C:\builder", "app", "app-1a2b3c4d", "0123456789ab")
+        Location::under(
+            &Profile::new("builder", BuilderOs::Windows, r"C:\builder"),
+            "app",
+            "app-1a2b3c4d",
+            "0123456789ab",
+        )
     }
 
     /// A call that ended with `status` and wrote `first_error`, its first and only line, on standard error.
@@ -5895,7 +5951,7 @@ mod tests {
 
     /// The outputs cap record of the unit call's key under `state`.
     fn capped_record(state: &Path) -> PathBuf {
-        gate_state::v1::outputs_capped_path(state, "app-1a2b3c4d")
+        gate_state::v1::outputs_capped_path(state, None, "app-1a2b3c4d")
     }
 
     /// An outputs call cut for the archive it passed, judged for a passing run whose state folder is `state`: its end
@@ -6760,7 +6816,12 @@ mod tests {
             bridge: None,
             objects: PathBuf::from(r"C:\app\.git\objects"),
         };
-        let location = Location::under(r"C:\builder", "app", "app-1a2b3c4d", "0123456789ab");
+        let location = Location::under(
+            &Profile::new("builder", BuilderOs::Windows, r"C:\builder"),
+            "app",
+            "app-1a2b3c4d",
+            "0123456789ab",
+        );
 
         assert!(matches!(attempt.preflight(&location, &[]), Err(End::Interrupted)), "the preflight");
         let repos = attempt.repos();
@@ -7405,7 +7466,7 @@ mod tests {
     /// test raises: [`call`] raises its own.
     fn key_call<'a>(log: &'a Path, state: &'a StateRoot, interrupt: Option<Interrupt>) -> RemoteCall<'a> {
         RemoteCall {
-            host: "builder",
+            builder: &crate::test_support::HOST,
             key: "app-1a2b3c4d",
             root: r"C:\no-such-worktree",
             root_id: gate_router::FolderId { volume: 0, file: [0; 16] },

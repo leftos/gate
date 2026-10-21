@@ -116,36 +116,55 @@ pub fn remote_dir(root: &Path) -> PathBuf {
     root.join("remote")
 }
 
-/// The pending marker of the work folder `key`, `<root>\remote\<key>.outputs-pending`: written before a routed run
-/// with output globs makes its run call and removed once its outputs step completes, so the next routed run of that
-/// worktree asks for every output that differs from the PC's (`OutputsFull`).
+/// The folder of the per-worktree caches of the builder whose id is `id`: [`remote_dir`] for `host`, which has none,
+/// else `<root>\remote\<id>`, so two builders' caches of one worktree never mix.
+#[must_use]
+pub fn builder_cache_dir(root: &Path, id: Option<&str>) -> PathBuf {
+    debug_assert!(
+        id.is_none_or(|id| id.len() == 8 && id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))),
+        "a builder's id is 8 lower-case hex digits: {id:?}"
+    );
+    let remote = remote_dir(root);
+    match id {
+        Some(id) => remote.join(id),
+        None => remote,
+    }
+}
+
+/// The pending marker of the work folder `key`, `<root>\remote\<key>.outputs-pending`, whichever builder the run went
+/// to, since it says the PC's outputs may be wrong: written before a routed run with output globs makes its run call
+/// and removed once its outputs step completes, so the next routed run of that worktree, on any builder, asks for every
+/// output that differs from the PC's (`OutputsFull`).
 #[must_use]
 pub fn outputs_pending_path(root: &Path, key: &str) -> PathBuf {
     remote_dir(root).join(format!("{key}.outputs-pending"))
 }
 
-/// The hash cache of the work folder `key`, `<root>\remote\<key>.outputs-hashes`: the outputs manifest line of the
-/// worktree's last built manifest, its files whose last write came well before that build, so the next build reuses
-/// the hash of each file whose size and last write still match instead of reading it again.
+/// The hash cache of the work folder `key` on the builder whose id is `id`, `<folder>\<key>.outputs-hashes` in its
+/// folder ([`builder_cache_dir`]): the outputs manifest line of the worktree's last built manifest, its files whose
+/// last write came well before that build, so the next build reuses the hash of each file whose size and last write
+/// still match instead of reading it again.
 #[must_use]
-pub fn outputs_hashes_path(root: &Path, key: &str) -> PathBuf {
-    remote_dir(root).join(format!("{key}.outputs-hashes"))
+pub fn outputs_hashes_path(root: &Path, id: Option<&str>, key: &str) -> PathBuf {
+    builder_cache_dir(root, id).join(format!("{key}.outputs-hashes"))
 }
 
-/// The inputs hash cache of the work folder `key`, `<root>\remote\<key>.inputs-hashes`: the inputs manifest line of
-/// the worktree's last built inputs manifest, its files whose last write came well before that build, kept apart from
-/// the outputs cache, whose saves drop every file the outputs walk no longer finds.
+/// The inputs hash cache of the work folder `key` on the builder whose id is `id`, `<folder>\<key>.inputs-hashes` in
+/// its folder ([`builder_cache_dir`]): the inputs manifest line of the worktree's last built inputs manifest, its
+/// files whose last write came well before that build, kept apart from the outputs cache, whose saves drop every file
+/// the outputs walk no longer finds.
 #[must_use]
-pub fn inputs_hashes_path(root: &Path, key: &str) -> PathBuf {
-    remote_dir(root).join(format!("{key}.inputs-hashes"))
+pub fn inputs_hashes_path(root: &Path, id: Option<&str>, key: &str) -> PathBuf {
+    builder_cache_dir(root, id).join(format!("{key}.inputs-hashes"))
 }
 
-/// The sent-build hash cache of the work folder `key`, `<root>\remote\<key>.sent-build-hashes`: the manifest line of the
-/// PC's build of one project last sent to it for a routed `dotnet test --no-build`, its files whose last write came well
-/// before that build, kept apart from the inputs cache, whose saves drop every file the inputs walk no longer finds.
+/// The sent-build hash cache of the work folder `key` on the builder whose id is `id`, `<folder>\<key>.sent-build-hashes`
+/// in its folder ([`builder_cache_dir`]): the manifest line of the PC's build of one project last sent to it for a
+/// routed `dotnet test --no-build`, its files whose last write came well before that build, kept apart from the inputs
+/// cache, whose saves drop every file the inputs walk no longer finds.
 #[must_use]
-pub fn sent_build_hashes_path(root: &Path, key: &str) -> PathBuf {
-    remote_dir(root).join(format!("{key}.sent-build-hashes"))
+pub fn sent_build_hashes_path(root: &Path, id: Option<&str>, key: &str) -> PathBuf {
+    builder_cache_dir(root, id).join(format!("{key}.sent-build-hashes"))
 }
 
 /// The nothing-back record of the work folder `key`, `<root>\remote\<key>.nothing-back`: the JSON object
@@ -194,12 +213,13 @@ pub fn nothing_back_record(bytes: &[u8]) -> Result<NothingBackRecord, FormatErro
     parse_strict(text)
 }
 
-/// The outputs cap record of the work folder `key`, `<root>\remote\<key>.outputs-capped`: the JSON object
-/// `{"v": 1, "hits": <n>}` ([`OutputsCappedRecord`]), the number of that worktree's routed runs in a row whose outputs
-/// fetch passed the fetch cap; written at each such fetch and removed when a fetch ends any other way.
+/// The outputs cap record of the work folder `key` on the builder whose id is `id`, `<folder>\<key>.outputs-capped` in
+/// its folder ([`builder_cache_dir`]): the JSON object `{"v": 1, "hits": <n>}` ([`OutputsCappedRecord`]), the number
+/// of that worktree's routed runs in a row whose outputs fetch passed the fetch cap; written at each such fetch and
+/// removed when a fetch ends any other way.
 #[must_use]
-pub fn outputs_capped_path(root: &Path, key: &str) -> PathBuf {
-    remote_dir(root).join(format!("{key}.outputs-capped"))
+pub fn outputs_capped_path(root: &Path, id: Option<&str>, key: &str) -> PathBuf {
+    builder_cache_dir(root, id).join(format!("{key}.outputs-capped"))
 }
 
 /// The body of an outputs cap record ([`outputs_capped_path`]) after its `v`: the fetches in a row that passed the cap.

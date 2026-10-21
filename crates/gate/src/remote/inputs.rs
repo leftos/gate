@@ -319,7 +319,7 @@ pub(super) fn sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> 
     if !call.siblings.is_empty() {
         return Err(refused(attempt, PAIR));
     }
-    let cache = v1::inputs_hashes_path(call.state_dir, call.key);
+    let cache = v1::inputs_hashes_path(call.state_dir, call.builder.id.as_deref(), call.key);
     let asked = Asked {
         root: Path::new(call.root),
         globs: call.inputs,
@@ -452,7 +452,7 @@ fn build_built(attempt: &mut Attempt<'_, '_>, bin: &str) -> Result<Built, Unbuil
             found.len()
         )));
     }
-    let cache = v1::sent_build_hashes_path(call.state_dir, call.key);
+    let cache = v1::sent_build_hashes_path(call.state_dir, call.builder.id.as_deref(), call.key);
     let asked = Asked {
         root,
         globs: &globs,
@@ -566,11 +566,11 @@ impl<'k> Kind<'k> {
         }
     }
 
-    /// Its PC hash cache for the work folder `key` in the state root `state`.
-    fn cache(self, state: &Path, key: &str) -> PathBuf {
+    /// Its PC hash cache for the work folder `key` on the builder whose id is `id` in the state root `state`.
+    fn cache(self, state: &Path, id: Option<&str>, key: &str) -> PathBuf {
         match self {
-            Kind::Inputs => v1::inputs_hashes_path(state, key),
-            Kind::Build(_) => v1::sent_build_hashes_path(state, key),
+            Kind::Inputs => v1::inputs_hashes_path(state, id, key),
+            Kind::Build(_) => v1::sent_build_hashes_path(state, id, key),
         }
     }
 
@@ -615,7 +615,7 @@ fn sent_to(attempt: &mut Attempt<'_, '_>, request: &Request<'_>, built: &Built) 
     let path = folder.join(format!("{}-{nonce}.{}.tar.zst", attempt.call.key, kind.file()));
     let started = Instant::now();
     let archive = made_in_tmp(root, &path, &format!("the {} archive", kind.label()))?;
-    let cache = kind.cache(attempt.call.state_dir, attempt.call.key);
+    let cache = kind.cache(attempt.call.state_dir, attempt.call.builder.id.as_deref(), attempt.call.key);
     let packing = Pack {
         root,
         files: &needed,

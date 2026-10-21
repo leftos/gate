@@ -2588,6 +2588,26 @@ fn a_warm_up_target_goes_to_host_even_when_a_builder_entry_lists_the_repo() {
 }
 
 #[test]
+fn a_macos_pick_s_path_map_ends_its_box_tree_in_one_slash_while_host_s_keeps_the_backslash() {
+    let key = work_folder_key(ROOT);
+    let mac_tree = format!("/Users/b/gate-remote/work/{key}/");
+    let trees = |tree: &str| FakeFacts {
+        given_trees: Some(vec![(tree.to_owned(), r"X:\dev\yaat.wt\a\".to_owned())]),
+        ..FakeFacts::with_config(with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_BUILD))
+    };
+    let mac = routed(decide(&heavy(&words(&["dotnet", "build"])), &trees(&mac_tree)));
+    assert_eq!(mac.builder, mac_builder());
+    assert_eq!(
+        mac.words.last().map(String::as_str),
+        Some(format!(r"-p:PathMap=/Users/b/gate-remote/work/{key}/=X:\dev\yaat.wt\a").as_str())
+    );
+
+    let host = routed(decide(&heavy(&words(&["dotnet", "test"])), &trees(&box_tree(None))));
+    assert_eq!(host.builder, host_builder("builder-1", 1));
+    assert_eq!(host.words.last(), Some(&path_map()), "host's word is unchanged");
+}
+
+#[test]
 fn a_macos_pick_writes_a_worktree_path_with_slashes_while_host_keeps_the_backslashes() {
     let command = words(&["dotnet", "build", r"X:\dev\yaat.wt\a\src\Duel.sln"]);
     let mac = with_builders(r#"{"yaat": ["dotnet *"]}"#, MAC_BUILD);

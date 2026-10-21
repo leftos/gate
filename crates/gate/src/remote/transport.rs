@@ -10,8 +10,144 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-#[cfg(feature = "test-seams")]
+use gate_args::BoxVerb;
+use gate_router::{Builder, BuilderOs};
+use gate_wire::PathForm;
+
 use crate::remote::payload::{self, BOX_EXE};
+
+/// The pack commands a Windows builder's git is served through: pwsh reads the single-quoted path git sends through cmd.
+const RECEIVE_PACK: &str = "pwsh -NoProfile -NonInteractive -Command git-receive-pack";
+const UPLOAD_PACK: &str = "pwsh -NoProfile -NonInteractive -Command git-upload-pack";
+/// The box a macOS builder runs, below its root.
+const UNIX_BOX: &str = "/bin/gate-box";
+
+/// How the client speaks to one builder: its alias, the operating system it runs, which sets how its paths are written
+/// and joined ([`PathForm`]), its box line and its pack commands, and the root every work folder and bare repository
+/// lives under. A Windows builder runs the gate of [`BOX_EXE`] and serves git through pwsh; a macOS builder runs
+/// `<root>/bin/gate-box`, git's own pack commands serve it, and its paths are joined with `/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Profile {
+    alias: String,
+    os: BuilderOs,
+    root: String,
+}
+
+impl Profile {
+    /// The profile of `builder` reached over the ssh transport, whose own root is `transport_root`: the builder's root
+    /// as the routing file writes it, else the transport's. A test transport lays a Windows builder out under its own
+    /// folder whatever root the routing file gives, and keeps a macOS builder's own (`Profile::in_folder`).
+    pub(crate) fn of(builder: &Builder, transport_root: &str) -> Profile {
+        Profile::new(&builder.alias, builder.os, builder.root.as_deref().unwrap_or(transport_root))
+    }
+
+    /// The profile of `builder` reached over a test transport whose builder root is `folder`: a Windows builder lays out
+    /// under `folder` whatever root the routing file gives it, so no case writes outside its own folder; a macOS builder
+    /// keeps its own root, which the PC's stand-in box refuses at the preflight before any write, so its cases pin the
+    /// Unix path forms.
+    #[cfg(feature = "test-seams")]
+    pub(crate) fn in_folder(builder: &Builder, folder: &str) -> Profile {
+        let root = match builder.os {
+            BuilderOs::Windows => folder,
+            BuilderOs::Macos => builder.root.as_deref().unwrap_or(folder),
+        };
+        Profile::new(&builder.alias, builder.os, root)
+    }
+
+    /// The profile of the builder `alias` running `os` under `root`.
+    pub(crate) fn new(alias: &str, os: BuilderOs, root: &str) -> Profile {
+        Profile {
+            alias: alias.to_owned(),
+            os,
+            root: root.to_owned(),
+        }
+    }
+
+    /// The builder's root, as given.
+    pub(crate) fn root(&self) -> &str {
+        &self.root
+    }
+
+    /// The path rules the builder's box reads a payload under.
+    pub(crate) fn form(&self) -> PathForm {
+        match self.os {
+            BuilderOs::Windows => PathForm::Windows,
+            BuilderOs::Macos => PathForm::Unix,
+        }
+    }
+
+    /// The separator the builder's paths are joined with.
+    fn separator(&self) -> char {
+        match self.os {
+            BuilderOs::Windows => '\\',
+            BuilderOs::Macos => '/',
+        }
+    }
+
+    /// The root without its trailing separators: `\` and `/` on Windows, `/` on macOS.
+    fn base(&self) -> &str {
+        match self.os {
+            BuilderOs::Windows => self.root.trim_end_matches(['\\', '/']),
+            BuilderOs::Macos => self.root.trim_end_matches('/'),
+        }
+    }
+
+    /// The work folder `key`: `{root}\work\{key}`, or `{root}/work/{key}` on macOS.
+    pub(crate) fn work(&self, key: &str) -> String {
+        let separator = self.separator();
+        format!("{}{separator}work{separator}{key}", self.base())
+    }
+
+    /// The bare repository of `repo`: `{root}\{repo}.git`, or `{root}/{repo}.git` on macOS.
+    pub(crate) fn bare(&self, repo: &str) -> String {
+        format!("{}{}{repo}.git", self.base(), self.separator())
+    }
+
+    /// The folder outputs wait in: `{root}\outputs`, or `{root}/outputs` on macOS.
+    pub(crate) fn output_folder(&self) -> String {
+        format!("{}{}outputs", self.base(), self.separator())
+    }
+
+    /// The job of a run of the work folder `key` named with `nonce`: `Local\gate-remote-{key}-{nonce}`, or
+    /// `gate-remote-{key}-{nonce}` on macOS, which has no `Local\` namespace.
+    pub(crate) fn job(&self, key: &str, nonce: &str) -> String {
+        match self.os {
+            BuilderOs::Windows => format!(r"Local\gate-remote-{key}-{nonce}"),
+            BuilderOs::Macos => format!("gate-remote-{key}-{nonce}"),
+        }
+    }
+
+    /// The line ssh carries for `verb` ([`payload::line`]): the builder's gate [`BOX_EXE`], or `<root>/bin/gate-box` on
+    /// macOS.
+    pub(crate) fn line(&self, verb: BoxVerb) -> String {
+        match self.os {
+            BuilderOs::Windows => payload::line(BOX_EXE, verb),
+            BuilderOs::Macos => payload::line(&format!("{}{UNIX_BOX}", self.base()), verb),
+        }
+    }
+
+    /// The URL a snapshot of `repo` is pushed to over ssh: `{alias}:{bare}`, the bare repository's path with `/`
+    /// separators.
+    pub(crate) fn push_url(&self, repo: &str) -> String {
+        format!("{}:{}", self.alias, self.bare(repo).replace('\\', "/"))
+    }
+
+    /// The receive-pack the push names: pwsh's on Windows, `None`, git's own, on macOS.
+    pub(crate) fn receive_pack(&self) -> Option<String> {
+        match self.os {
+            BuilderOs::Windows => Some(RECEIVE_PACK.to_owned()),
+            BuilderOs::Macos => None,
+        }
+    }
+
+    /// The upload-pack the sync-back's fetch names: pwsh's on Windows, `None`, git's own, on macOS.
+    pub(crate) fn upload_pack(&self) -> Option<String> {
+        match self.os {
+            BuilderOs::Windows => Some(UPLOAD_PACK.to_owned()),
+            BuilderOs::Macos => None,
+        }
+    }
+}
 
 /// The options of every ssh call, git's own included: no prompt, the timeouts, and nothing forwarded to the builder.
 pub(crate) const SSH_OPTIONS: [&str; 12] = [
@@ -63,15 +199,21 @@ pub(crate) struct PushTarget {
 
 /// The way to the builder.
 pub(crate) trait Transport {
-    /// The builder's root, which every work folder and bare repository lives under.
+    /// The root of a builder the routing file gives none ([`Profile::of`]), which every work folder and bare repository
+    /// lives under.
     fn root(&self) -> &str;
+    /// The profile `builder` is laid out and spoken to by over this transport: the ssh transport's rule
+    /// ([`Profile::of`]) unless the transport gives its own.
+    fn profile(&self, builder: &Builder) -> Profile {
+        Profile::of(builder, self.root())
+    }
     /// The program that runs `line` on the builder `host`, over a connection `wire` says how to carry.
     fn call(&self, host: &str, line: &str, wire: Wire) -> Program;
-    /// Where the snapshot of `repo` is pushed on the builder `host`; else why the repo's name cannot be sent there.
-    fn push_target(&self, host: &str, repo: &str) -> Result<PushTarget, String>;
-    /// The command git runs on the builder to serve the sync-back's fetch, the upload-pack counterpart of the push's
-    /// receive-pack; `None` for a bare repository on this machine, where the push names none either.
-    fn upload_pack(&self) -> Option<String>;
+    /// Where the snapshot of `repo` is pushed on the builder of `profile`; else why the repo's name cannot be sent there.
+    fn push_target(&self, profile: &Profile, repo: &str) -> Result<PushTarget, String>;
+    /// The command git runs on the builder of `profile` to serve the sync-back's fetch, the upload-pack counterpart of
+    /// the push's receive-pack; `None` for a bare repository on this machine, where the push names none either.
+    fn upload_pack(&self, profile: &Profile) -> Option<String>;
     /// Whether `gate box` runs on this machine, as a call's child: then a call's job must let the box start its
     /// command outside it, and else it lets nothing leave.
     fn box_runs_here(&self) -> bool;
@@ -166,32 +308,40 @@ fn local_root(folder: &str) -> std::io::Result<String> {
     std::path::absolute(folder).map(|root| root.to_string_lossy().into_owned())
 }
 
-/// The builder's root a routed run reaches: that of the local transport `transport` names, read as [`Local::new`] reads
-/// it, else the ssh transport's. Else why the named transport has none.
+/// The profile a routed run of `builder` reaches it by: over the local transport `transport` names, its folder read as
+/// [`Local::new`] reads it ([`Profile::in_folder`]), else over the ssh transport ([`Profile::of`]). Else why the named
+/// transport has none.
 #[cfg(feature = "test-seams")]
-pub(crate) fn builder_root(transport: Option<&str>) -> Result<String, String> {
+pub(crate) fn builder_profile(builder: &Builder, transport: Option<&str>) -> Result<Profile, String> {
     let Some(transport) = transport else {
-        return Ok(ssh::BUILDER_ROOT.to_owned());
+        return Ok(Profile::of(builder, ssh::BUILDER_ROOT));
     };
     let said = gate_router::escaped(transport);
     let (folder, _) = local_form(transport).ok_or_else(|| format!("the remote transport '{said}' is not local:<folder>"))?;
-    local_root(folder).map_err(|error| format!("cannot read the remote transport '{said}': {}", gate_router::escaped(&error.to_string())))
+    let folder =
+        local_root(folder).map_err(|error| format!("cannot read the remote transport '{said}': {}", gate_router::escaped(&error.to_string())))?;
+    Ok(Profile::in_folder(builder, &folder))
 }
 
-/// The builder's root a routed run reaches: the ssh transport's, in a gate built without the test seams.
+/// The profile a routed run of `builder` reaches it by: the ssh transport's ([`Profile::of`]), in a gate built without
+/// the test seams.
 #[cfg(not(feature = "test-seams"))]
 #[expect(
     clippy::unnecessary_wraps,
     reason = "the signature of the test-seams build, whose named transport can be unusable"
 )]
-pub(crate) fn builder_root(_transport: Option<&str>) -> Result<String, String> {
-    Ok(ssh::BUILDER_ROOT.to_owned())
+pub(crate) fn builder_profile(builder: &Builder, _transport: Option<&str>) -> Result<Profile, String> {
+    Ok(Profile::of(builder, ssh::BUILDER_ROOT))
 }
 
 #[cfg(feature = "test-seams")]
 impl Transport for Local {
     fn root(&self) -> &str {
         &self.root
+    }
+
+    fn profile(&self, builder: &Builder) -> Profile {
+        Profile::in_folder(builder, &self.root)
     }
 
     /// The stand-in is given ssh's words, `wire`'s among them; this gate's own `box` runs with no connection to carry.
@@ -208,23 +358,22 @@ impl Transport for Local {
         }
     }
 
-    fn push_target(&self, host: &str, repo: &str) -> Result<PushTarget, String> {
-        let bare = payload::bare(&self.root, repo);
+    fn push_target(&self, profile: &Profile, repo: &str) -> Result<PushTarget, String> {
         Ok(match &self.git_ssh {
             Some(ssh_command) => PushTarget {
-                url: format!("{host}:{}", bare.replace('\\', "/")),
+                url: profile.push_url(repo),
                 receive_pack: None,
                 ssh_command: Some(ssh_command.clone()),
             },
             None => PushTarget {
-                url: bare,
+                url: profile.bare(repo),
                 receive_pack: None,
                 ssh_command: None,
             },
         })
     }
 
-    fn upload_pack(&self) -> Option<String> {
+    fn upload_pack(&self, _profile: &Profile) -> Option<String> {
         None
     }
 
@@ -233,10 +382,17 @@ impl Transport for Local {
     }
 }
 
-/// The words `line` carries after the builder's gate: `box`, the verb and `--stdin`.
+/// The words `line` carries after the builder's gate, [`BOX_EXE`] or a macOS builder's `<root>/bin/gate-box`: `box`,
+/// the verb and `--stdin`.
 #[cfg(feature = "test-seams")]
 fn box_words(line: &str) -> Vec<OsString> {
+    let unix_gate = || {
+        line.split_once(' ')
+            .filter(|(gate, _)| gate.starts_with('/') && gate.ends_with(UNIX_BOX))
+            .map(|(_, rest)| rest)
+    };
     line.strip_prefix(BOX_EXE)
+        .or_else(unix_gate)
         .unwrap_or(line)
         .split_whitespace()
         .map(OsString::from)
@@ -250,14 +406,12 @@ fn box_words(line: &str) -> Vec<OsString> {
 pub(crate) mod ssh {
     use std::path::{Path, PathBuf};
 
-    use super::{Program, PushTarget, SSH_OPTIONS, Transport, Wire, sent_repo, ssh_words};
+    use super::{Profile, Program, PushTarget, SSH_OPTIONS, Transport, Wire, sent_repo, ssh_words};
     use crate::environment::Variables;
     use crate::remote::git::judged;
     use crate::run::find_program;
 
     pub(super) const BUILDER_ROOT: &str = r"D:\gate-remote";
-    const RECEIVE_PACK: &str = "pwsh -NoProfile -NonInteractive -Command git-receive-pack";
-    const UPLOAD_PACK: &str = "pwsh -NoProfile -NonInteractive -Command git-upload-pack";
     /// The one name ssh is looked for by: no `ssh.cmd` or `ssh.bat` shim earlier on `PATH` runs in its place.
     const SSH_EXE: &str = "ssh.exe";
 
@@ -293,17 +447,17 @@ pub(crate) mod ssh {
             }
         }
 
-        fn push_target(&self, host: &str, repo: &str) -> Result<PushTarget, String> {
+        fn push_target(&self, profile: &Profile, repo: &str) -> Result<PushTarget, String> {
             let repo = sent_repo(repo)?;
             Ok(PushTarget {
-                url: format!("{host}:{}/{repo}.git", BUILDER_ROOT.replace('\\', "/")),
-                receive_pack: Some(RECEIVE_PACK.to_owned()),
+                url: profile.push_url(repo),
+                receive_pack: profile.receive_pack(),
                 ssh_command: Some(git_ssh_command(&self.program)),
             })
         }
 
-        fn upload_pack(&self) -> Option<String> {
-            Some(UPLOAD_PACK.to_owned())
+        fn upload_pack(&self, profile: &Profile) -> Option<String> {
+            profile.upload_pack()
         }
 
         fn box_runs_here(&self) -> bool {
@@ -334,12 +488,132 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use gate_args::BoxVerb;
+    use gate_router::{Builder, BuilderOs};
+
     use super::ssh::{Ssh, git_ssh_command};
-    use super::{Local, Program, PushTarget, Transport, Wire, box_words, ssh_words};
+    use super::{Local, Profile, Program, PushTarget, Transport, Wire, box_words, ssh_words};
     use crate::environment::Variables;
 
     fn words(texts: &[&str]) -> Vec<OsString> {
         texts.iter().map(OsString::from).collect()
+    }
+
+    /// The Windows builder `builder` under `transport`'s own root, as `host` is reached.
+    fn windows(transport: &dyn Transport) -> Profile {
+        Profile::new("builder", BuilderOs::Windows, transport.root())
+    }
+
+    /// The macOS builder `mac-1` under `/Users/b/gate-remote`.
+    fn mac() -> Profile {
+        let builder = Builder {
+            alias: "mac-1".to_owned(),
+            os: BuilderOs::Macos,
+            root: Some("/Users/b/gate-remote".to_owned()),
+            slots: 1,
+            id: Some("00000000".to_owned()),
+        };
+        Profile::of(&builder, r"D:\gate-remote")
+    }
+
+    #[test]
+    fn host_s_profile_is_the_windows_constants() {
+        let host = Builder {
+            alias: "builder".to_owned(),
+            os: BuilderOs::Windows,
+            root: None,
+            slots: 1,
+            id: None,
+        };
+        let ssh = Ssh {
+            program: PathBuf::from(r"C:\Program Files\OpenSSH\ssh.exe"),
+        };
+        let profile = Profile::of(&host, ssh.root());
+        assert_eq!(profile.root(), r"D:\gate-remote");
+        assert_eq!(profile.line(BoxVerb::Run), RUN_LINE);
+        assert_eq!(profile.push_url("app"), "builder:D:/gate-remote/app.git");
+        assert_eq!(
+            profile.receive_pack().as_deref(),
+            Some("pwsh -NoProfile -NonInteractive -Command git-receive-pack")
+        );
+        assert_eq!(
+            profile.upload_pack().as_deref(),
+            Some("pwsh -NoProfile -NonInteractive -Command git-upload-pack")
+        );
+        assert_eq!(profile.form(), gate_wire::PathForm::Windows);
+    }
+
+    /// Under a test transport a Windows entry's own root gives way to the transport's folder, so a case's run lays out,
+    /// and pushes, inside the case folder; over ssh the entry's root stands. A macOS entry keeps its root either way.
+    #[test]
+    fn a_windows_entry_s_root_gives_way_to_the_local_transport_s_folder() {
+        let entry = Builder {
+            alias: "win-2".to_owned(),
+            os: BuilderOs::Windows,
+            root: Some(r"E:\remote".to_owned()),
+            slots: 1,
+            id: Some("084c286b".to_owned()),
+        };
+        let local = Local::new(r"local:C:\builder", None).expect("a local transport");
+        let ssh = Ssh {
+            program: PathBuf::from(r"C:\Program Files\OpenSSH\ssh.exe"),
+        };
+
+        let profile = local.profile(&entry);
+        let named = super::builder_profile(&entry, Some(r"local:C:\builder")).expect("the local transport is read");
+
+        assert_eq!(profile.root(), r"C:\builder");
+        assert_eq!(profile.work("app-1a2b3c4d"), r"C:\builder\work\app-1a2b3c4d");
+        let pushed = local.push_target(&profile, "app").expect("the repo can be pushed");
+        assert_eq!(pushed.url, r"C:\builder\app.git");
+        assert_eq!(named, profile, "the routing's trees are laid out as the client's run is");
+        assert_eq!(ssh.profile(&entry).root(), r"E:\remote", "over ssh the entry's root stands");
+        let mac = Builder {
+            alias: "mac-1".to_owned(),
+            os: BuilderOs::Macos,
+            root: Some("/Users/b/gate-remote".to_owned()),
+            slots: 1,
+            id: Some("1f0efc62".to_owned()),
+        };
+        assert_eq!(local.profile(&mac).root(), "/Users/b/gate-remote", "a macOS entry keeps its own root");
+    }
+
+    #[test]
+    fn a_macos_builder_s_profile_runs_its_gate_box_and_git_s_own_pack_commands() {
+        let profile = mac();
+        assert_eq!(profile.root(), "/Users/b/gate-remote", "its own root, not the transport's");
+        assert_eq!(
+            profile.line(BoxVerb::Preflight),
+            "/Users/b/gate-remote/bin/gate-box box preflight --stdin"
+        );
+        assert_eq!(
+            profile.line(BoxVerb::RegisterDesktop),
+            "/Users/b/gate-remote/bin/gate-box box register-desktop"
+        );
+        assert_eq!(profile.push_url("duel"), "mac-1:/Users/b/gate-remote/duel.git");
+        assert_eq!((profile.receive_pack(), profile.upload_pack()), (None, None), "git's own");
+        assert_eq!(profile.form(), gate_wire::PathForm::Unix);
+
+        let ssh = Ssh {
+            program: PathBuf::from(r"C:\Program Files\OpenSSH\ssh.exe"),
+        };
+        assert_eq!(
+            ssh.push_target(&profile, "duel"),
+            Ok(PushTarget {
+                url: "mac-1:/Users/b/gate-remote/duel.git".to_owned(),
+                receive_pack: None,
+                ssh_command: Some(git_ssh_command(&ssh.program)),
+            })
+        );
+        assert_eq!(ssh.upload_pack(&profile), None);
+    }
+
+    #[test]
+    fn the_local_transport_runs_the_words_after_a_macos_builder_s_gate_box() {
+        let line = mac().line(BoxVerb::Preflight);
+        assert_eq!(box_words(&line), words(&["box", "preflight", "--stdin"]));
+        let local = Local::new(r"local:C:\builder", None).expect("a local transport");
+        assert_eq!(local.call("mac-1", &line, Wire::Plain).args, words(&["box", "preflight", "--stdin"]));
     }
 
     const RUN_LINE: &str = r#""C:\Program Files\gate\bin\gate.exe" box run --stdin"#;
@@ -444,7 +718,7 @@ mod tests {
             }
         );
         assert_eq!(
-            ssh.push_target("builder", "app"),
+            ssh.push_target(&windows(&ssh), "app"),
             Ok(PushTarget {
                 url: "builder:D:/gate-remote/app.git".to_owned(),
                 receive_pack: Some("pwsh -NoProfile -NonInteractive -Command git-receive-pack".to_owned()),
@@ -452,7 +726,7 @@ mod tests {
             })
         );
         assert_eq!(
-            ssh.upload_pack(),
+            ssh.upload_pack(&windows(&ssh)),
             Some("pwsh -NoProfile -NonInteractive -Command git-upload-pack".to_owned()),
             "the fetch's pack command is the push's own with git's other verb"
         );
@@ -472,8 +746,11 @@ mod tests {
         let local = Local::new(r"local:C:\builder", None).expect("a local transport");
         assert_eq!(local.root(), r"C:\builder");
         assert_eq!(local.call("builder", line, Wire::Plain).args, words(&["box", "preflight", "--stdin"]));
-        assert_eq!(local.push_target("builder", "app").expect("a push target").url, r"C:\builder\app.git");
-        assert_eq!(local.upload_pack(), None, "a bare repository here names no pack command");
+        assert_eq!(
+            local.push_target(&windows(&local), "app").expect("a push target").url,
+            r"C:\builder\app.git"
+        );
+        assert_eq!(local.upload_pack(&windows(&local)), None, "a bare repository here names no pack command");
         let stubbed = Local::new(r"local:C:\builder", Some(PathBuf::from("fake-ssh.exe").as_path())).expect("a local transport");
         assert_eq!(
             stubbed.call("builder", line, Wire::Plain),
@@ -494,14 +771,14 @@ mod tests {
         let local = Local::new(r"local-ssh:C:\builder", Some(stub.as_path())).expect("a local-ssh transport");
         assert_eq!(local.root(), r"C:\builder");
         assert_eq!(
-            local.push_target("builder", "app"),
+            local.push_target(&windows(&local), "app"),
             Ok(PushTarget {
                 url: "builder:C:/builder/app.git".to_owned(),
                 receive_pack: None,
                 ssh_command: Some(git_ssh_command(&stub)),
             })
         );
-        assert_eq!(local.upload_pack(), None, "git runs its own service names");
+        assert_eq!(local.upload_pack(&windows(&local)), None, "git runs its own service names");
         assert_eq!(
             Local::new(r"local-ssh:C:\builder", None).err(),
             Some(
@@ -522,11 +799,11 @@ mod tests {
         };
 
         assert_eq!(
-            ssh.push_target("builder", "app'x"),
+            ssh.push_target(&windows(&ssh), "app'x"),
             Err("cannot push to the repo 'app'x': a repo name is letters, digits, '_' and '-'".to_owned())
         );
-        assert!(ssh.push_target("builder", "").is_err(), "an empty name is refused too");
-        assert!(ssh.push_target("builder", "App_1-b").is_ok(), "a name gate-router makes is sent");
+        assert!(ssh.push_target(&windows(&ssh), "").is_err(), "an empty name is refused too");
+        assert!(ssh.push_target(&windows(&ssh), "App_1-b").is_ok(), "a name gate-router makes is sent");
     }
 
     #[test]

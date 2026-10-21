@@ -5,6 +5,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+/// `host`, the Windows builder `builder` with no id, as the unit tests' calls go to it.
+#[cfg(feature = "test-seams")]
+pub(crate) static HOST: std::sync::LazyLock<gate_router::Builder> = std::sync::LazyLock::new(|| gate_router::Builder {
+    alias: "builder".to_owned(),
+    os: gate_router::BuilderOs::Windows,
+    root: None,
+    slots: 1,
+    id: None,
+});
+
 /// The folder the unit tests make their own folders and files in, in place of the system temp folder:
 /// `target\tmp\unit-gate` in the workspace, made on first use, under the worktree so no virus scanner of the system
 /// temp folder reads what they write. Each test makes its own subfolder or file in it.

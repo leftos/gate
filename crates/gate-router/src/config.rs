@@ -693,9 +693,10 @@ fn read_builder_entry(object: &Map<String, Value>, prefix: &str) -> Result<Build
 }
 
 /// A `builders` entry's `root`. A macOS builder needs one: `/`, then names separated by single `/`, none empty, `.` or
-/// `..`, each of ASCII letters, digits, `.`, `_` and `-` only. A Windows builder's is `None` when missing, the default root, else
-/// an absolute drive path: a letter, `:`, a separator, then names separated by single `\` or `/`, none empty, `.` or
-/// `..` and none holding `:`, `*`, `?`, `"`, `<`, `>`, `|` or a control character.
+/// `..`, each of ASCII letters, digits, `.`, `_` and `-` only. A Windows builder's is `None` when missing, the default
+/// root, else an absolute drive path the wire can carry as written: a letter, `:`, `\`, then names separated by single
+/// `\`, each a name the builder can lay out ([`is_layout_name`]): ASCII letters, digits, `.`, `_` and `-`, neither
+/// starting nor ending with `.`, and no reserved device name.
 fn read_builder_root(object: &Map<String, Value>, os: BuilderOs, prefix: &str) -> Result<Option<String>, String> {
     let value = property(object, "root");
     match os {
@@ -720,11 +721,8 @@ fn is_unix_root(root: &str) -> bool {
 /// Whether `root` is an absolute drive path a Windows builder root may be ([`read_builder_root`]).
 fn is_drive_root(root: &str) -> bool {
     let bytes = root.as_bytes();
-    let drive = bytes.len() > 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/');
-    drive
-        && root[3..]
-            .split(['\\', '/'])
-            .all(|name| root_name(name) && !name.contains([':', '*', '?', '"', '<', '>', '|']))
+    let drive = bytes.len() > 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
+    drive && root[3..].split('\\').all(is_layout_name)
 }
 
 /// Whether `name`, one name of a builder root, is neither empty, `.` nor `..` and holds no control character.

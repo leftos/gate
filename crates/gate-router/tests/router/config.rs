@@ -691,6 +691,32 @@ fn a_repo_listed_only_in_a_builders_entry_is_routed() {
     assert!(!config.is_routed("other"));
 }
 
+/// A Windows entry's root reaches the payload, the push URL, git's pack command and the `PathMap` word as written, so
+/// it is held to the names the builder lays out, joined by `\`: a character pwsh, cmd or `MSBuild` reads, a `/`, or a
+/// device name refuses the file.
+#[test]
+fn a_windows_root_is_held_to_layout_names_joined_by_backslashes() {
+    let entry = |root: &str| {
+        let root = serde_json::to_string(root).expect("a root can be written as JSON");
+        builders_file(&format!(
+            r#"[{{"host": "win-2", "os": "windows", "root": {root}, "repos": {{"gate": []}}}}]"#
+        ))
+    };
+    for root in [
+        r"D:\x&y", r"D:\it's", r"D:\a;b", r"D:\a,b", "D:/a", r"D:\con", r"D:\a=b", r"D:\a b", r"D:\a.", r"D:\100%", r"D:\a^b", r"D:\.x",
+    ] {
+        assert_eq!(
+            reason(&entry(root)),
+            "builders[0].root must be an absolute drive path for a windows builder",
+            "{root}"
+        );
+    }
+    for root in [r"D:\gate-remote", r"E:\build_2"] {
+        let config = Config::parse(&entry(root)).expect("usable");
+        assert_eq!(config.builder("win-2").and_then(|builder| builder.root.as_deref()), Some(root));
+    }
+}
+
 /// A routing file whose `host` is `builder-1`, with `builders` holding `builders`.
 fn builders_file(builders: &str) -> String {
     format!(r#"{{"host": "builder-1", "slots": 2, "repos": {{"gate": ["x"]}}, "builders": {builders}}}"#)

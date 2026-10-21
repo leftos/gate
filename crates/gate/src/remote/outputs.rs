@@ -281,7 +281,7 @@ pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
     }
     let marker = v1::outputs_pending_path(call.state_dir, call.key);
     let full = pending(&marker);
-    let hashes = v1::outputs_hashes_path(call.state_dir, call.key);
+    let hashes = v1::outputs_hashes_path(call.state_dir, call.builder.id.as_deref(), call.key);
     // The full send is the recovery path: it reuses no hash that may be wrong, and its own then replace the cache's.
     let previous = if full { None } else { HashCache::load(&hashes) };
     let none = HashCache::default();
@@ -406,18 +406,25 @@ fn box_trees<'a>(location: &Location, call: &RemoteCall<'a>) -> (String, Vec<(St
     );
     let siblings: Vec<(&str, &'a str)> = names.into_iter().zip(call.siblings.iter().map(Sibling::root)).collect();
     let leaf = location.pair.as_ref().map_or(call.leaf, |pair| pair.leaf.as_str());
-    let ((main, _), siblings) = trees_of(&location.work, leaf, call.root, &siblings);
+    let ((main, _), siblings) = trees_of(&location.work, leaf, call.root, &siblings, location.form);
     (main, siblings)
 }
 
-/// Each tree a routed run is checked out in, as [`trees`] places it in the work folder `work`, with the PC root it
-/// stands for: the main repo's tree (`work` itself with no sibling, else `{work}\{leaf}`) with `main_root`, then each of
-/// `siblings`, a folder name and its root, in order. The outputs' install ([`box_trees`]) and the path-map word
-/// ([`super::box_trees`]) both pair the trees through this.
-pub(super) fn trees_of<'a>(work: &str, leaf: &str, main_root: &'a str, siblings: &[(&str, &'a str)]) -> ((String, &'a str), Vec<(String, &'a str)>) {
+/// Each tree a routed run is checked out in, as [`trees`] places it in the work folder `work` of a box reading paths
+/// under `form`, with the PC root it stands for: the main repo's tree (`work` itself with no sibling, else
+/// `{work}\{leaf}`, `/` under [`PathForm::Unix`]) with `main_root`, then each of `siblings`, a folder name and its root,
+/// in order. The outputs' install ([`box_trees`]) and the path-map word ([`super::box_trees`]) both pair the trees
+/// through this.
+pub(super) fn trees_of<'a>(
+    work: &str,
+    leaf: &str,
+    main_root: &'a str,
+    siblings: &[(&str, &'a str)],
+    form: PathForm,
+) -> ((String, &'a str), Vec<(String, &'a str)>) {
     let names: Vec<&str> = siblings.iter().map(|(name, _)| *name).collect();
     let pair = (!names.is_empty()).then_some((leaf, names.as_slice()));
-    let (main, trees) = trees(work, pair, PathForm::Windows);
+    let (main, trees) = trees(work, pair, form);
     ((main, main_root), trees.into_iter().zip(siblings.iter().map(|(_, root)| *root)).collect())
 }
 
@@ -545,7 +552,7 @@ fn capped(attempt: &mut Attempt<'_, '_>, archive: &Archive, reason: &str, synced
 /// The cap hits in a row of the worktree's outputs cap record once this one is added, the record written with them. A
 /// record that is missing or cannot be read holds none; one that cannot be written is said, and the count stands.
 fn counted_hit(attempt: &mut Attempt<'_, '_>) -> u64 {
-    let path = v1::outputs_capped_path(attempt.call.state_dir, attempt.call.key);
+    let path = v1::outputs_capped_path(attempt.call.state_dir, attempt.call.builder.id.as_deref(), attempt.call.key);
     let hits = hits_read(&path).saturating_add(1);
     if let Err(error) = v1::write_outputs_capped(&path, &v1::OutputsCappedRecord { hits }) {
         attempt.say(format!("gate: cannot write the outputs cap record {}: {error}", path.display()));
@@ -569,7 +576,7 @@ fn hits_read(path: &Path) -> u64 {
 /// Removes the worktree's outputs cap record, its outputs step having ended other than at the fetch cap; one already
 /// gone counts as removed, and one that cannot be removed is said and changes no end.
 pub(super) fn uncapped(attempt: &mut Attempt<'_, '_>) {
-    let path = v1::outputs_capped_path(attempt.call.state_dir, attempt.call.key);
+    let path = v1::outputs_capped_path(attempt.call.state_dir, attempt.call.builder.id.as_deref(), attempt.call.key);
     if let Err(error) = fs::remove_file(&path)
         && error.kind() != io::ErrorKind::NotFound
     {

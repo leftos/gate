@@ -5,7 +5,8 @@
 //! the service's name. `gate push` starts it with a line that starts with `pwsh ` and holds `-EncodedCommand <bootstrap>`,
 //! a push call, whose verb is `push`. It reads the steps file the variable `GATE_FAKE_SSH_STEPS` names, one step a line,
 //! appends the verb it was called with to `<steps file>.log`, and the verb and ssh's options, the words before the
-//! host with a last `--` left out, as one line to `<steps file>.words`, and acts on the step of its call, counted by that log: the
+//! host with a last `--` left out, as one line to `<steps file>.words`, and the host and the line, a space between, as
+//! one line to `<steps file>.lines`, and acts on the step of its call, counted by that log: the
 //! first call takes the first step. A line that holds none of these, as git's `-G` probe of which ssh it runs, fails
 //! with no step taken. Started with `--version` alone, as a push case starts a copy of it standing in for a builder's
 //! old gate, it says `gate 0.0.0-old` and exits 0.
@@ -102,6 +103,7 @@ fn run() -> Result<i32, String> {
     };
     let steps = PathBuf::from(variable("GATE_FAKE_SSH_STEPS")?);
     let call = BoxCall::of(line, host, &steps)?;
+    appended(&beside(&steps, ".lines"), &format!("{host} {line}"))?;
     let before_host = words.get(..words.len().saturating_sub(2)).unwrap_or_default();
     let options = match before_host.split_last() {
         Some((last, options)) if last == "--" => options,

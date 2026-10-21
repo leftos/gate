@@ -200,8 +200,9 @@ pub(super) fn sync_back(
 /// The sync-back of a single repository, `target`, as [`sync_back`] ends it.
 fn one(attempt: &mut Attempt<'_, '_>, target: &Target<'_>, status: i64) -> Result<End, End> {
     attempt.go_on()?;
-    let pushed = attempt.transport.push_target(attempt.call.host, &target.repo).map_err(End::Failed)?;
-    let pack = attempt.transport.upload_pack();
+    let profile = attempt.profile();
+    let pushed = attempt.transport.push_target(&profile, &target.repo).map_err(End::Failed)?;
+    let pack = attempt.transport.upload_pack(&profile);
     let remote = Remote {
         url: &pushed.url,
         pack: pack.as_deref(),
@@ -378,8 +379,9 @@ fn pair_phases<'t>(attempt: &mut Attempt<'_, '_>, backed: &[Repo<'t, '_>], fetch
 /// in the pair, and pushed onto `fetched` however its checks end.
 fn first_phase<'t>(attempt: &mut Attempt<'_, '_>, repo: &Repo<'t, '_>, fetched: &mut Vec<Fetched<'t>>, status: i64) -> Result<bool, End> {
     let target = repo.target;
-    let pushed = attempt.transport.push_target(attempt.call.host, &target.repo).map_err(End::Failed)?;
-    let pack = attempt.transport.upload_pack();
+    let profile = attempt.profile();
+    let pushed = attempt.transport.push_target(&profile, &target.repo).map_err(End::Failed)?;
+    let pack = attempt.transport.upload_pack(&profile);
     let remote = Remote {
         url: &pushed.url,
         pack: pack.as_deref(),
@@ -2072,7 +2074,7 @@ mod tests {
     use crate::remote::client::{Attempt, End};
     use crate::remote::git::{self, Git};
     use crate::remote::snapshot::{Snapshot, repository};
-    use crate::remote::transport::{Local, Program, PushTarget, Transport, Wire};
+    use crate::remote::transport::{Local, Profile, Program, PushTarget, Transport, Wire};
     use crate::remote::worktree_lock::tests::routed;
     use crate::slots;
     use gate_router::escaped;
@@ -2147,7 +2149,7 @@ mod tests {
         let interrupt = Interrupt::install().expect("the console handler is installed");
         interrupt.raise();
         let call = RemoteCall {
-            host: "builder",
+            builder: &crate::test_support::HOST,
             key: "app-1a2b3c4d",
             root: &root,
             root_id: crate::route::root_id(&root).expect("the test's folder's id is read"),
@@ -2960,7 +2962,7 @@ mod tests {
     /// The call of a wiring test in the repository `root`, its lines written to `log`.
     fn call_in<'a>(root: &'a str, log: &'a Path, state: &'a StateRoot) -> RemoteCall<'a> {
         RemoteCall {
-            host: "builder",
+            builder: &crate::test_support::HOST,
             key: KEY,
             root,
             root_id: crate::route::root_id(root).expect("the wiring test's repository's id is read"),
@@ -3528,11 +3530,11 @@ mod tests {
             self.local.call(host, line, wire)
         }
 
-        fn push_target(&self, host: &str, repo: &str) -> Result<PushTarget, String> {
-            self.local.push_target(host, repo)
+        fn push_target(&self, profile: &Profile, repo: &str) -> Result<PushTarget, String> {
+            self.local.push_target(profile, repo)
         }
 
-        fn upload_pack(&self) -> Option<String> {
+        fn upload_pack(&self, _profile: &Profile) -> Option<String> {
             self.readied.set(self.readied.get() + 1);
             if self.readied.get() == 2
                 && let Some(interrupt) = self.interrupt
