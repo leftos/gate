@@ -5,6 +5,7 @@
 //! the run ends on is the command's own, or the box's ([`command_status`]).
 
 use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(target_os = "macos")]
 use std::ffi::c_int;
 use std::io;
@@ -15,11 +16,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use gate_watchdog::{Config, CpuSource, Kill, Machine, Pump, SystemTimes, Ticks};
-use gate_wire::{BoxKill, escaped, killed_line, started_line};
+use gate_watchdog::{Config, CpuSource, Kill, Machine, Pump, Sample, SystemTimes, Ticks};
+use gate_wire::{BoxKill, adjusted_line, escaped, killed_line, started_line};
 
 use crate::console::{Forwarding, LineSink, Output, Stream};
-use crate::cpu::GroupCpu;
+use crate::cpu::{GroupCpu, LoadTotals, host_cpu_load};
 use crate::files::{self, HeldLock};
 use crate::lines::{CommandEnd, FAILED_STATUS, command_environment, command_status, round_trip, write_failure};
 use crate::process::{EndedBy, Ending, Forward, GroupRecord, Halt, NotRan, Ran, Watch, is_still_there, run_watched};
@@ -27,6 +28,8 @@ use crate::run::group_record;
 
 /// How long the command's group has, once asked to end with `SIGTERM`, before `SIGKILL`: the git steps' grace.
 const END_GRACE: Duration = Duration::from_secs(2);
+/// The failing sampler's failure, as the Windows box's seam says it.
+const SAMPLER_FAIL: &str = "--test-box-sampler-fail makes every sample fail (test seam only)";
 
 /// What the command of a run is started with.
 pub struct Launch<'a> {
@@ -52,42 +55,130 @@ pub struct Launch<'a> {
     pub host: &'a str,
     /// How often the box's ceiling samples the command.
     pub sample: Duration,
+    /// Where the box's ceiling reads the machine's load from.
+    pub sampler: Sampler,
     /// The heartbeat, which watches the command's group while it runs; `None` when it could not start.
     pub pump: Option<&'a Pump>,
 }
 
+/// Where the box's ceiling reads the machine's load from: the machine's own counters, or a test seam's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sampler {
+    /// The machine's own CPU-load counters.
+    Machine,
+    /// None: every read fails (`--test-box-sampler-fail`).
+    Failing,
+    /// Others hold all of the machine but this whole percent of it, the command's own CPU counted on top of theirs
+    /// (`--test-box-free-percent`).
+    FreePercent(u32),
+}
+
 /// The box's ceiling on the command, looked at on the runner's waiting thread every poll, without the output lock:
-/// gate-watchdog's watch, begun when the command started, sampled every period and asked for its kill on every look.
-/// The watch reads no system times: it goes by wall time alone from its start, so only the backstop, five ceilings of
-/// wall time, can fire. The kill it decides is kept for the run's end.
+/// gate-watchdog's watch, begun when the command started, sampled every period from the machine's CPU load and the
+/// CPU of the command's group, and asked for its kill on every look. A read that fails is the sampler's failure: from
+/// then on the watch goes by wall time alone, so only the backstop, five ceilings of wall time, can fire. The kill it
+/// decides and the line of its sampler's failure are kept for the run's end, as this thread writes nothing.
 struct Ceiling {
     timeout: Option<u64>,
     sample: Duration,
+    sampler: Sampler,
     watching: RefCell<Option<Watching>>,
     kill: Cell<Option<Kill>>,
 }
 
-/// A begun watch: since when, and when it samples next.
+/// A begun watch: since when, when it samples next, what its samples read, and the line of its sampler's failure once
+/// one failed.
 struct Watching {
     watch: gate_watchdog::Watch,
     started: Instant,
     next: Duration,
+    reads: Reads,
+    failed: Option<String>,
+}
+
+/// What a sample reads: the command's group's CPU, and the system's times from where the run's [`Sampler`] says, the
+/// machine's counters as running totals or the seam's made-up times.
+struct Reads {
+    sampler: Sampler,
+    cpu: Arc<dyn CpuSource>,
+    totals: LoadTotals,
+    synthetic: Synthetic,
+}
+
+impl Reads {
+    /// The group's CPU, the time on `started`'s clock just after it was read, and the system's times; why not when one
+    /// cannot be read, and before any read for the failing seam.
+    fn read(&mut self, started: Instant) -> Result<(Ticks, Duration, SystemTimes), String> {
+        let machine = match self.sampler {
+            Sampler::Failing => return Err(SAMPLER_FAIL.to_owned()),
+            Sampler::Machine => true,
+            Sampler::FreePercent(_) => false,
+        };
+        let job_cpu = Ticks(self.cpu.job_cpu_ticks()?);
+        let at = started.elapsed();
+        let system = if machine {
+            self.totals.add(host_cpu_load()?)
+        } else {
+            self.synthetic.next(at, job_cpu)
+        };
+        Ok((job_cpu, at, system))
+    }
+}
+
+/// System times made up sample by sample so others hold all of a machine of `cores` but `percent` of it, the command's
+/// own CPU counted on top of theirs: the times last made, and the group's CPU and the watch's time they were made at.
+struct Synthetic {
+    percent: u64,
+    cores: u64,
+    times: SystemTimes,
+    job_cpu: Ticks,
+    at: Duration,
+}
+
+impl Synthetic {
+    /// The times at `at`, the command's group at `job_cpu`.
+    fn next(&mut self, at: Duration, job_cpu: Ticks) -> SystemTimes {
+        let interval = u64::try_from(at.saturating_sub(self.at).as_nanos() / 100).unwrap_or(u64::MAX);
+        let capacity = interval.saturating_mul(self.cores);
+        let others = u64::try_from(u128::from(capacity) * u128::from(100 - self.percent) / 100).unwrap_or(u64::MAX);
+        let busy = others.saturating_add(job_cpu.saturating_sub(self.job_cpu).0).min(capacity);
+        let idle = capacity - busy;
+        self.times = SystemTimes {
+            idle: self.times.idle.saturating_add(idle),
+            kernel: self.times.kernel.saturating_add(idle),
+            user: self.times.user.saturating_add(busy),
+        };
+        self.job_cpu = job_cpu;
+        self.at = at;
+        self.times
+    }
+}
+
+/// What the ceiling leaves for the run's end lines: the kill it decided, the line of its sampler's failure, and the
+/// load-adjusted seconds of its closed watch, `None` for no ceiling or once the sampler failed.
+#[derive(Default)]
+struct Verdict {
+    kill: Option<Kill>,
+    failed: Option<String>,
+    adjusted: Option<f64>,
 }
 
 impl Ceiling {
-    /// The ceiling of `timeout` seconds, `None` for none, sampled every `sample`; not begun.
-    fn new(timeout: Option<u64>, sample: Duration) -> Ceiling {
+    /// The ceiling of `timeout` seconds, `None` for none, sampled every `sample` from `sampler`; not begun.
+    fn new(timeout: Option<u64>, sample: Duration, sampler: Sampler) -> Ceiling {
         Ceiling {
             timeout,
             sample,
+            sampler,
             watching: RefCell::new(None),
             kill: Cell::new(None),
         }
     }
 
-    /// Begins the watch now, the command started, on every core of the builder, by wall time alone; nothing for a
-    /// run with no ceiling.
-    fn begin(&self) {
+    /// Begins the watch now, the command started, on every core of the builder, with a first read of `cpu`, the
+    /// command's group's CPU, and of the machine's times; nothing for a run with no ceiling. A first read that fails is
+    /// the sampler's failure, its line kept.
+    fn begin(&self, cpu: Arc<dyn CpuSource>) {
         let Some(timeout) = self.timeout else {
             return;
         };
@@ -99,29 +190,106 @@ impl Ceiling {
             wsl: false,
         };
         let none = SystemTimes { idle: 0, kernel: 0, user: 0 };
-        let mut watch = gate_watchdog::Watch::new(config, Machine::new(cores, cores, false), none, Ticks(0), None);
-        // Nothing failed, so its line is not said: the watch only goes by wall time from its start.
-        let _ = watch.sampler_failed("no system times are read");
+        let percent = match self.sampler {
+            Sampler::FreePercent(percent) => percent.min(100),
+            Sampler::Machine | Sampler::Failing => 100,
+        };
+        let mut reads = Reads {
+            sampler: self.sampler,
+            cpu,
+            totals: LoadTotals::default(),
+            synthetic: Synthetic {
+                percent: u64::from(percent),
+                cores: u64::from(cores),
+                times: none,
+                job_cpu: Ticks(0),
+                at: Duration::ZERO,
+            },
+        };
+        let started = Instant::now();
+        let first = reads.read(started);
+        let (job_cpu, system) = first.as_ref().map_or((Ticks(0), none), |&(job_cpu, _, system)| (job_cpu, system));
+        let mut watch = gate_watchdog::Watch::new(config, Machine::new(cores, cores, false), system, job_cpu, None);
+        let failed = first.err().map(|why| watch.sampler_failed(&why));
         *self.watching.borrow_mut() = Some(Watching {
             watch,
-            started: Instant::now(),
+            started,
             next: self.sample,
+            reads,
+            failed,
         });
     }
 
-    /// One look: a wall-time sample once its period has passed, then the kill that holds now, kept and given as the
-    /// halt that ends the group; `None` before the watch began, for no ceiling, and while no kill holds.
+    /// One look: a sample once its period has passed, then the kill that holds now, kept and given as the halt that
+    /// ends the group; `None` before the watch began, for no ceiling, and while no kill holds.
     fn check(&self) -> Option<Halt> {
         let mut watching = self.watching.borrow_mut();
         let watching = watching.as_mut()?;
-        let now = watching.started.elapsed();
-        if now >= watching.next {
-            watching.next = now + self.sample;
-            watching.watch.wall_only(now, false);
+        let began = watching.started.elapsed();
+        if began >= watching.next {
+            watching.next = began + self.sample;
+            watching.take_sample(began);
         }
-        let kill = watching.watch.kill_check(now)?;
+        let kill = watching.watch.kill_check(watching.started.elapsed())?;
         self.kill.set(Some(kill));
         Some(Halt(tag_of(kill).1.to_owned()))
+    }
+
+    /// The watch is over, the runner having stopped watching the leader: the stretch since the last sample is counted,
+    /// so the load-adjusted seconds stop here.
+    fn close(&self) {
+        if let Some(watching) = self.watching.borrow_mut().as_mut() {
+            let now = watching.started.elapsed();
+            watching.watch.exited(now);
+        }
+    }
+
+    /// What the run's end lines say of the ceiling.
+    fn verdict(&self) -> Verdict {
+        let watching = self.watching.borrow();
+        let watching = watching.as_ref();
+        Verdict {
+            kill: self.kill.get(),
+            failed: watching.and_then(|watching| watching.failed.clone()),
+            adjusted: watching
+                .filter(|watching| !watching.watch.sampler_has_failed())
+                .map(|watching| watching.watch.adjusted_seconds()),
+        }
+    }
+}
+
+impl Watching {
+    /// Takes the sample whose reads begin at `began`, or, once the sampler has failed, brings the watch's wall time up
+    /// to it; a sample that fails is the sampler's failure, its line kept.
+    fn take_sample(&mut self, began: Duration) {
+        if self.watch.sampler_has_failed() {
+            self.watch.wall_only(began, false);
+            return;
+        }
+        match self.read(began) {
+            Ok(sample) => self.watch.sample(&sample),
+            Err(why) => {
+                self.failed = Some(self.watch.sampler_failed(&why));
+                self.watch.wall_only(began, false);
+            }
+        }
+    }
+
+    /// The sample whose reads begin at `began`: the group's CPU, then the system's times, stamped with the watch's time.
+    fn read(&mut self, began: Duration) -> Result<Sample, String> {
+        let (job_cpu, at, system) = self.reads.read(self.started)?;
+        Ok(Sample {
+            began,
+            at,
+            system,
+            job_cpu,
+            output_size: 0,
+            pids: BTreeSet::new(),
+            paused: false,
+            nested_gate: false,
+            escaped: BTreeMap::new(),
+            vm_cpu: None,
+        })
     }
 }
 
@@ -129,8 +297,7 @@ impl Ceiling {
 fn tag_of(kill: Kill) -> (BoxKill, &'static str) {
     match kill {
         Kill::Backstop { .. } => (BoxKill::Backstop, "backstop"),
-        // Not reached while the watch reads no system times, as only the backstop fires; the box's watch has no stall
-        // window either.
+        // The box's watch has no stall window, so a ceiling is the only other kill it can find.
         Kill::TimedOut { .. } | Kill::Stalled { .. } => (BoxKill::TimedOut, "ceiling"),
     }
 }
@@ -151,9 +318,10 @@ pub fn command_record(work: &str) -> String {
 /// command that never started. Every removal looks first that the work lock is still held.
 ///
 /// Once the command's readers start, the heartbeat watches its group's CPU ([`GroupCpu`]) and the box's ceiling begins
-/// ([`Ceiling`]); the heartbeat stops watching once the runner stops watching the leader, before the group is ended.
-/// A command the ceiling ends gives [`crate::lines::KILLED_STATUS`] after the kill line and the kill tag, its records
-/// kept ([`killed`]).
+/// ([`Ceiling`]), reading the same source; the heartbeat stops watching, and the ceiling's clock stops, once the runner
+/// stops watching the leader, before the group is ended. A command the ceiling ends gives
+/// [`crate::lines::KILLED_STATUS`] after the kill line, the kill tag and its load-adjusted seconds, its records kept
+/// ([`killed`]); a command that exited or was ended by a signal is followed by its load-adjusted seconds ([`ended`]).
 pub fn run_command<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>) -> u8 {
     let beat = Beat {
         cpu_of: &|group| Arc::new(GroupCpu::new(group)) as Arc<dyn CpuSource>,
@@ -196,14 +364,16 @@ fn run_with<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>,
     }
     let group = GroupRecord::new(PathBuf::from(group_record(launch.work)), launch.job, launch.lock);
     let forwarding: Arc<dyn Forwarding> = Arc::clone(output) as Arc<dyn Forwarding>;
-    let ceiling = Ceiling::new(launch.timeout, launch.sample);
+    let ceiling = Ceiling::new(launch.timeout, launch.sample, launch.sampler);
     let started = |group: i32| {
-        ceiling.begin();
+        let cpu = (beat.cpu_of)(group);
+        ceiling.begin(Arc::clone(&cpu));
         if let Some(pump) = launch.pump {
-            pump.watch((beat.cpu_of)(group));
+            pump.watch(cpu);
         }
     };
     let leader_exited = || {
+        ceiling.close();
         if let Some(pump) = launch.pump {
             pump.unwatch();
         }
@@ -223,15 +393,16 @@ fn run_with<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>,
         on_leader_exit: Some(&leader_exited),
     };
     let ran = run_watched(command_of(launch, program, rest), &watch);
-    ended(launch, &record, ran, ceiling.kill.get(), output)
+    ended(launch, &record, ran, &ceiling.verdict(), output)
 }
 
 /// The status of the run whose command, `launch`'s words, ran as `ran`, its record `record` removed when the command
-/// ended clean or never started, and the line of a start that failed or of the box's own failure said; for a command
-/// the box killed for `kill`, what [`killed`] gives.
-fn ended<S: LineSink>(launch: &Launch<'_>, record: &str, ran: Result<Ran, NotRan>, kill: Option<Kill>, output: &Output<S>) -> u8 {
-    if let Some(kill) = kill {
-        return killed(launch, kill, ran, output);
+/// ended clean or never started, and the line of a start that failed or of the box's own failure said, after the line
+/// of the ceiling's sampler's failure when `verdict` holds one; a command that ran is followed by the ceiling's end
+/// lines ([`said_end_lines`]). For a command the box killed, what [`killed`] gives.
+fn ended<S: LineSink>(launch: &Launch<'_>, record: &str, ran: Result<Ran, NotRan>, verdict: &Verdict, output: &Output<S>) -> u8 {
+    if let Some(kill) = verdict.kill {
+        return killed(launch, kill, ran, verdict, output);
     }
     let ran = match ran {
         Ok(ran) => ran,
@@ -247,7 +418,8 @@ fn ended<S: LineSink>(launch: &Launch<'_>, record: &str, ran: Result<Ran, NotRan
             if output.client_gone() {
                 return command_status(CommandEnd::Gone);
             }
-            let _ = output.say(Stream::Err, &failed_line(&unran(not)));
+            let lines: Vec<String> = verdict.failed.iter().cloned().chain([failed_line(&unran(not))]).collect();
+            said_together(output, &lines);
             return command_status(CommandEnd::Failed);
         }
     };
@@ -255,15 +427,42 @@ fn ended<S: LineSink>(launch: &Launch<'_>, record: &str, ran: Result<Ran, NotRan
     if matches!(end, CommandEnd::Exited(_)) && ran.ended_by.is_none() && !ran.leftover {
         removed_if_held(record, launch.lock, output);
     }
+    said_end_lines(launch, verdict, end, output);
     command_status(end)
 }
 
+/// Says the ceiling's end lines after a command that ran and ended as `end`, nothing once the client is gone: the line
+/// of its sampler's failure when `verdict` holds one, then, after an exit or a signal, its load-adjusted seconds when
+/// `verdict` has them.
+fn said_end_lines<S: LineSink>(launch: &Launch<'_>, verdict: &Verdict, end: CommandEnd, output: &Output<S>) {
+    if matches!(end, CommandEnd::Gone) {
+        return;
+    }
+    let adjusted = verdict
+        .adjusted
+        .filter(|_| matches!(end, CommandEnd::Exited(_) | CommandEnd::Signalled(_)))
+        .map(|seconds| adjusted_line(launch.nonce, seconds));
+    let lines: Vec<String> = verdict.failed.iter().cloned().chain(adjusted).collect();
+    said_together(output, &lines);
+}
+
+/// Says `lines` on standard error together, nothing for none; a client gone meanwhile hears nothing, and the run's
+/// status stands.
+fn said_together<S: LineSink>(output: &Output<S>, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let lines: Vec<(Stream, &str)> = lines.iter().map(|line| (Stream::Err, line.as_str())).collect();
+    let _ = output.say_together(&lines);
+}
+
 /// The status of the run whose command the box killed for `kill`, its group's ending as `ran` says, every record kept:
-/// [`crate::lines::GONE_STATUS`] and nothing said once the client is gone; else, said together, a note when the
-/// ending failed (that the group could not be ended when it was still there after `SIGKILL`, else what failed after
-/// the kill), the kill line and the kill tag, then [`crate::lines::KILLED_STATUS`], as the run is a kill
-/// whatever its ending left.
-fn killed<S: LineSink>(launch: &Launch<'_>, kill: Kill, ran: Result<Ran, NotRan>, output: &Output<S>) -> u8 {
+/// [`crate::lines::GONE_STATUS`] and nothing said once the client is gone; else, said together, the line of the
+/// ceiling's sampler's failure when `verdict` holds one, a note when the ending failed (that the group could not be
+/// ended when it was still there after `SIGKILL`, else what failed after the kill), the kill line, the kill tag and the
+/// load-adjusted seconds when `verdict` has them, then [`crate::lines::KILLED_STATUS`], as the run is a kill whatever
+/// its ending left.
+fn killed<S: LineSink>(launch: &Launch<'_>, kill: Kill, ran: Result<Ran, NotRan>, verdict: &Verdict, output: &Output<S>) -> u8 {
     if output.client_gone() {
         return command_status(CommandEnd::Gone);
     }
@@ -279,10 +478,9 @@ fn killed<S: LineSink>(launch: &Launch<'_>, kill: Kill, ran: Result<Ran, NotRan>
         kill.line_on(&spoken, &escaped(launch.host))
     };
     let tagged = killed_line(launch.nonce, tag);
-    let mut lines: Vec<(Stream, &str)> = note.iter().map(|note| (Stream::Err, note.as_str())).collect();
-    lines.extend([(Stream::Err, line.as_str()), (Stream::Err, tagged.as_str())]);
-    // A client gone meanwhile hears nothing, and the status stands.
-    let _ = output.say_together(&lines);
+    let adjusted = verdict.adjusted.map(|seconds| adjusted_line(launch.nonce, seconds));
+    let lines: Vec<String> = verdict.failed.iter().cloned().chain(note).chain([line, tagged]).chain(adjusted).collect();
+    said_together(output, &lines);
     command_status(CommandEnd::Killed(tag))
 }
 
@@ -426,9 +624,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use gate_watchdog::{CpuSource, Kill, Pump};
-    use gate_wire::{BoxKill, killed_line, started_line};
+    use gate_wire::{BoxKill, adjusted_prefix, killed_line, started_line};
 
-    use super::{Beat, Ceiling, Launch, command_record, ended, removed_if_held, run_command, run_with};
+    use super::{Beat, Ceiling, Launch, Sampler, Verdict, command_record, ended, removed_if_held, run_command, run_with};
     use crate::console::{Forwarding, HungUpSink, LineSink, Output, RecordingSink, Stream};
     use crate::files::{HeldLock, held_for_test};
     use crate::heartbeat;
@@ -499,6 +697,7 @@ mod tests {
                 timeout: watched.timeout,
                 host: watched.host,
                 sample: watched.sample,
+                sampler: watched.sampler,
                 pump: watched.pump,
             }
         }
@@ -513,6 +712,7 @@ mod tests {
         timeout: Option<u64>,
         host: &'a str,
         sample: Duration,
+        sampler: Sampler,
         pump: Option<&'a Pump>,
     }
 
@@ -522,8 +722,17 @@ mod tests {
             timeout: None,
             host: "",
             sample: Duration::from_secs(5),
+            sampler: Sampler::Machine,
             pump: None,
         }
+    }
+
+    /// The line the box says once the failing sampler's first read failed.
+    const SAMPLER_FAILED: &str = "gate: sampler failed: --test-box-sampler-fail makes every sample fail (test seam only); watching by wall time only";
+
+    /// The seconds of `line` when it is this run's adjusted line.
+    fn adjusted_of(line: &str) -> Option<f64> {
+        line.strip_prefix(&adjusted_prefix(NONCE)).and_then(|seconds| seconds.parse().ok())
     }
 
     /// A CPU source that has used nothing.
@@ -654,6 +863,14 @@ mod tests {
         }
     }
 
+    /// The ceiling's verdict of a [`backstop`] kill, with no sampler failure and no adjusted seconds.
+    fn backstop_verdict() -> Verdict {
+        Verdict {
+            kill: Some(backstop()),
+            ..Verdict::default()
+        }
+    }
+
     #[test]
     fn the_pump_is_unwatched_before_the_group_is_ended() {
         let case = Case::new("unwatched");
@@ -707,10 +924,11 @@ mod tests {
         let watched = Watched {
             timeout: Some(1),
             sample: Duration::from_millis(50),
+            sampler: Sampler::FreePercent(100),
             pump: Some(&pump),
             ..unwatched()
         };
-        // The command runs once the pump is stuck in a beat after the start marker, and the box's backstop ends it; its
+        // The command runs once the pump is stuck in a beat after the start marker, and the box's ceiling ends it; its
         // end-of-run lines are the says that wait on the stuck pump. Nothing is forwarded, so no reader waits on it.
         let script = format!(
             "echo $$ > '{pid}'; i=0; while [ ! -e '{held}' ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done; sleep 600",
@@ -741,6 +959,7 @@ mod tests {
             timeout: Some(1),
             host: "mac-mini",
             sample: Duration::from_millis(50),
+            sampler: Sampler::Failing,
             ..unwatched()
         };
         let status = case.watched(&["/bin/sh", "-c", "echo $$; sleep 600"], &watched, &idle_beat(), &output);
@@ -748,7 +967,9 @@ mod tests {
         let out = said(&output, Stream::Out);
         let group: i32 = out.get(1).and_then(|line| line.parse().ok()).expect("the command said its pid");
         let err = said(&output, Stream::Err);
-        assert!(err.len() >= 2, "the kill line and the tag: {err:?}");
+        assert!(err.len() >= 3, "the sampler's failure, the kill line and the tag: {err:?}");
+        assert_eq!(err[err.len() - 3], SAMPLER_FAILED, "the sampler's failure is said with the end lines");
+        assert!(err.iter().all(|line| adjusted_of(line).is_none()), "no adjusted line: {err:?}");
         let (line, tag) = (&err[err.len() - 2], &err[err.len() - 1]);
         assert!(
             line.starts_with("gate: BACKSTOP on mac-mini: ")
@@ -777,7 +998,7 @@ mod tests {
             ended_by: Some(EndedBy::Halted(Halt("backstop".to_owned()))),
         };
         let record = command_record(&case.work);
-        let status = ended(&case.launch(&words, &unwatched()), &record, Ok(ran), Some(backstop()), &output);
+        let status = ended(&case.launch(&words, &unwatched()), &record, Ok(ran), &backstop_verdict(), &output);
         assert_eq!(status, 255);
         assert!(output.sink().lines().is_empty(), "{:?}", output.sink().lines());
         assert!(case.record().exists(), "the record is kept");
@@ -803,7 +1024,7 @@ mod tests {
                 &case.launch(&words, &unwatched()),
                 &record,
                 Err(NotRan::Failed(why.to_owned())),
-                Some(backstop()),
+                &backstop_verdict(),
                 &output,
             );
             assert_eq!(status, 124, "{why}");
@@ -824,17 +1045,121 @@ mod tests {
             let stuck = scope.spawn(|| output.say(Stream::Err, "gate-remote-heartbeat: 0"));
             assert!(beaten.recv_timeout(GUARD).is_ok(), "the other thread holds the output lock in its write");
             // A check that took the lock would wait for the stuck write, which is let go only after it.
-            let ceiling = Ceiling::new(Some(0), Duration::from_millis(1));
-            ceiling.begin();
+            // The failing sampler leaves the backstop the only kill, and its failure is kept, not said.
+            let ceiling = Ceiling::new(Some(0), Duration::from_millis(1), Sampler::Failing);
+            ceiling.begin(idle_cpu(0));
             let halt = ceiling.check();
+            // A sampler that reads: its first read and a sample, at once, then the ceiling.
+            let reading = Ceiling::new(Some(0), Duration::ZERO, Sampler::FreePercent(100));
+            reading.begin(idle_cpu(0));
+            let timed_out = reading.check();
             let _ = release.send(());
             assert!(stuck.join().is_ok_and(|said| said.is_ok()));
             assert_eq!(halt, Some(Halt("backstop".to_owned())), "a 0 s ceiling's backstop holds at once");
             assert!(matches!(ceiling.kill.get(), Some(Kill::Backstop { .. })), "the kill is kept");
+            assert_eq!(timed_out, Some(Halt("ceiling".to_owned())), "a 0 s ceiling holds at once");
+            assert!(matches!(reading.kill.get(), Some(Kill::TimedOut { .. })), "the kill is kept");
         });
-        let none = Ceiling::new(None, Duration::from_millis(1));
-        none.begin();
+        let none = Ceiling::new(None, Duration::from_millis(1), Sampler::Machine);
+        none.begin(idle_cpu(0));
         assert_eq!(none.check(), None, "no ceiling, no kill");
+    }
+
+    #[test]
+    fn a_command_past_its_load_adjusted_ceiling_is_timed_out_with_the_tag_then_its_adjusted_seconds() {
+        let case = Case::new("timed-out");
+        let output = recording();
+        // The whole machine free, so the clock runs with wall time however loaded the machine is.
+        let watched = Watched {
+            timeout: Some(1),
+            host: "builder",
+            sample: Duration::from_millis(20),
+            sampler: Sampler::FreePercent(100),
+            ..unwatched()
+        };
+        let status = case.watched(&["/bin/sh", "-c", "echo $$; sleep 600"], &watched, &idle_beat(), &output);
+        assert_eq!(status, 124, "{:?}", output.sink().lines());
+        let group: i32 = said(&output, Stream::Out)
+            .get(1)
+            .and_then(|line| line.parse().ok())
+            .expect("the command said its pid");
+        let err = said(&output, Stream::Err);
+        assert!(err.len() >= 3, "the kill line, the tag and the adjusted line: {err:?}");
+        let (line, tag, adjusted) = (&err[err.len() - 3], &err[err.len() - 2], &err[err.len() - 1]);
+        assert!(
+            line.starts_with("gate: TIMED OUT on builder after 1 s of load-adjusted time (wall ")
+                && line.contains("machine free 100% on average")
+                && line.ends_with("and its children"),
+            "{line}"
+        );
+        assert_eq!(*tag, killed_line(NONCE, BoxKill::TimedOut), "the tag right after the kill line");
+        let seconds = adjusted_of(adjusted).expect("this run's adjusted line, last");
+        assert!(seconds >= 1.0, "the clock reached the ceiling: {seconds}");
+        assert!(case.record().exists(), "a killed command's record is kept");
+        assert!(!case.group_record().exists(), "the group record is removed");
+        assert!(group_gone_soon(group), "the command's group is ended");
+    }
+
+    #[test]
+    fn a_command_that_ends_by_itself_says_its_adjusted_seconds_after_its_output() {
+        let case = Case::new("ended-adjusted");
+        let output = recording();
+        let watched = Watched {
+            timeout: Some(60),
+            sample: Duration::from_millis(20),
+            sampler: Sampler::FreePercent(100),
+            ..unwatched()
+        };
+        let began = Instant::now();
+        let status = case.watched(&["/bin/sh", "-c", "echo hi; echo there >&2; sleep 0.3"], &watched, &idle_beat(), &output);
+        let wall = began.elapsed().as_secs_f64();
+        assert_eq!(status, 0, "{:?}", output.sink().lines());
+        let lines = output.sink().lines();
+        let seconds = lines
+            .last()
+            .filter(|(stream, _)| *stream == Stream::Err)
+            .and_then(|(_, line)| adjusted_of(line))
+            .expect("the adjusted line on standard error, after every line of the command");
+        // The clock runs inside the case's wall time at most at its pace, so any load only lowers it.
+        assert!(
+            (0.0..60.0).contains(&seconds) && seconds <= wall + 0.001,
+            "under the 60 s ceiling and within the case's {wall} s: {seconds}"
+        );
+        assert_eq!(said(&output, Stream::Err).first().map(String::as_str), Some("there"));
+    }
+
+    #[test]
+    fn a_command_ended_by_a_signal_says_its_adjusted_seconds() {
+        let case = Case::new("signalled-adjusted");
+        let output = recording();
+        let watched = Watched {
+            timeout: Some(60),
+            sample: Duration::from_millis(20),
+            sampler: Sampler::FreePercent(100),
+            ..unwatched()
+        };
+        let status = case.watched(&["/bin/sh", "-c", "kill -TERM $$"], &watched, &idle_beat(), &output);
+        assert_eq!(status, 143, "{:?}", output.sink().lines());
+        let err = said(&output, Stream::Err);
+        assert!(
+            err.last().and_then(|line| adjusted_of(line)).is_some_and(|seconds| seconds >= 0.0),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_command_whose_sampler_failed_says_the_failure_with_its_end_lines_and_no_adjusted_seconds() {
+        let case = Case::new("sampler-failed");
+        let output = recording();
+        let watched = Watched {
+            timeout: Some(60),
+            sample: Duration::from_millis(20),
+            sampler: Sampler::Failing,
+            ..unwatched()
+        };
+        let status = case.watched(&["/bin/sh", "-c", "echo hi; sleep 0.1"], &watched, &idle_beat(), &output);
+        assert_eq!(status, 0, "{:?}", output.sink().lines());
+        assert_eq!(said(&output, Stream::Err), [SAMPLER_FAILED]);
     }
 
     impl Drop for Case {

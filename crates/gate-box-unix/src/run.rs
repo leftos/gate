@@ -575,7 +575,7 @@ mod tests {
     use gate_watchdog::Pump;
 
     use super::{REFUSED_STATUS, Ready, place_of, prepare, prepared};
-    use crate::command::{Launch, run_command};
+    use crate::command::{Launch, Sampler, run_command};
     use crate::console::Forwarding;
     use crate::console::{LineSink, Output, RecordingSink, Stream};
     use crate::files::{self, Locked, effective_uid, take_lock};
@@ -849,6 +849,7 @@ mod tests {
             timeout: None,
             host: "",
             sample: periods.sample,
+            sampler: Sampler::Machine,
             pump: ready.pump.as_ref(),
         };
         let status = run_command(&launch, &output);

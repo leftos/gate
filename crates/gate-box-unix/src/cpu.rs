@@ -24,6 +24,8 @@
 
 use std::collections::BTreeMap;
 
+use gate_watchdog::SystemTimes;
+
 /// The nanoseconds in one 100 ns tick.
 const NANOS_PER_TICK: u128 = 100;
 
@@ -36,6 +38,86 @@ pub const UNKNOWN_PARENT: i32 = 0;
 pub fn mach_to_ticks(mach: u64, numer: u32, denom: u32) -> u64 {
     let nanos = u128::from(mach) * u128::from(numer) / u128::from(denom.max(1));
     u64::try_from(nanos / NANOS_PER_TICK).unwrap_or(u64::MAX)
+}
+
+/// The machine's CPU load as running totals, for the box's ceiling: the kernel's `HOST_CPU_LOAD_INFO` counters (user,
+/// system, idle and nice ticks, summed over the processors, at 1/hz) are 32 bits wide and wrap, so each read adds its
+/// wrapping difference from the read before to a 64-bit total. A difference over half the counter's range is a counter
+/// that fell, not one that wrapped, and adds nothing. Only the totals' differences mean anything; the first read gives
+/// zeros.
+#[derive(Debug, Default)]
+pub struct LoadTotals {
+    last: Option<[u32; 4]>,
+    totals: [u64; 4],
+}
+
+impl LoadTotals {
+    /// Adds the counters `ticks`, in the kernel's order (user, system, idle, nice), and gives the totals as the
+    /// watchdog's system times: idle as idle, kernel as system and idle, user as user and nice.
+    pub fn add(&mut self, ticks: [u32; 4]) -> SystemTimes {
+        let last = self.last.unwrap_or(ticks);
+        for ((total, now), before) in self.totals.iter_mut().zip(ticks).zip(last) {
+            let gained = now.wrapping_sub(before);
+            if gained <= u32::MAX / 2 {
+                *total = total.wrapping_add(u64::from(gained));
+            }
+        }
+        self.last = Some(ticks);
+        let [user, system, idle, nice] = self.totals;
+        SystemTimes {
+            idle,
+            kernel: system.saturating_add(idle),
+            user: user.saturating_add(nice),
+        }
+    }
+}
+
+/// The kernel's CPU-load counters of the whole machine, `host_statistics(HOST_CPU_LOAD_INFO)`: user, system, idle and
+/// nice ticks summed over the processors.
+///
+/// # Errors
+///
+/// Why they could not be read.
+#[cfg(target_os = "macos")]
+pub fn host_cpu_load() -> Result<[u32; 4], String> {
+    static HOST: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+    let host = *HOST.get_or_init(host_port);
+    let mut info = libc::host_cpu_load_info { cpu_ticks: [0; 4] };
+    let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
+    // SAFETY: `info` is one `host_cpu_load_info`, `count` integers long, and both live across the call, which writes no
+    // more than `count` integers into `info` and the count it wrote into `count`.
+    let read = unsafe { libc::host_statistics(host, libc::HOST_CPU_LOAD_INFO, (&raw mut info).cast(), &raw mut count) };
+    if read != libc::KERN_SUCCESS {
+        return Err(format!("cannot read the machine's CPU load: kern_return {read}"));
+    }
+    if count != libc::HOST_CPU_LOAD_INFO_COUNT {
+        return Err(format!(
+            "the machine's CPU load read {count} counters, not {}",
+            libc::HOST_CPU_LOAD_INFO_COUNT
+        ));
+    }
+    Ok(info.cpu_ticks)
+}
+
+/// The host port, asked for once: each `mach_host_self` adds a reference to it, which this process keeps.
+#[cfg(target_os = "macos")]
+#[expect(
+    deprecated,
+    reason = "libc's mach_host_self points at the mach2 crate; this one call needs no new dependency"
+)]
+fn host_port() -> libc::mach_port_t {
+    // SAFETY: `mach_host_self` takes nothing and gives the unprivileged host port's name.
+    unsafe { libc::mach_host_self() }
+}
+
+/// The machine's CPU load is read only on macOS: elsewhere every read fails, which fails the ceiling's sampler.
+///
+/// # Errors
+///
+/// Always: the counters are not read here.
+#[cfg(not(target_os = "macos"))]
+pub fn host_cpu_load() -> Result<[u32; 4], String> {
+    Err(format!("the machine's CPU load is not read on {}", std::env::consts::OS))
 }
 
 /// One process as one tick's read of it found it.
@@ -391,7 +473,7 @@ mod mac {
         use gate_watchdog::CpuSource;
 
         use super::{GroupCpu, bsd_read, timebase, usage};
-        use crate::cpu::mach_to_ticks;
+        use crate::cpu::{LoadTotals, host_cpu_load, mach_to_ticks};
 
         /// How long a case waits for what it expects: a hang guard only.
         const HANG_GUARD: Duration = Duration::from_secs(120);
@@ -425,6 +507,33 @@ mod mac {
             crate::stop::group_pids_into(group, pids)?;
             pids.push(i32::MAX - 1);
             Ok(())
+        }
+
+        #[test]
+        fn two_reads_of_the_machine_s_load_count_every_core_s_ticks_between_them() {
+            // Each core's ticks between the two reads are at least the time between them and at most the time around
+            // them, at 100 a second, give or take the tick each read can cut on each core; a loaded machine only widens
+            // the outer time.
+            let mut totals = LoadTotals::default();
+            let around = Instant::now();
+            let first = totals.add(host_cpu_load().expect("the machine's load is read"));
+            let between = Instant::now();
+            thread::sleep(Duration::from_secs(1));
+            let inner = between.elapsed().as_secs_f64();
+            let second = totals.add(host_cpu_load().expect("the machine's load is read again"));
+            let outer = around.elapsed().as_secs_f64();
+            let idle = second.idle - first.idle;
+            let total = (second.kernel - first.kernel) + (second.user - first.user);
+            let cores = thread::available_parallelism().map_or(1, std::num::NonZero::get);
+            #[expect(clippy::cast_precision_loss, reason = "a core count and a tick count are far below 2^52")]
+            let (cores_f, counted) = (cores as f64, total as f64);
+            let (least, most) = (cores_f * (inner * 100.0 - 2.0), cores_f * (outer * 100.0 + 2.0));
+            assert!(idle <= total, "idle {idle} of {total} ticks");
+            assert!(
+                (least..=most).contains(&counted),
+                "{counted} ticks on {cores} cores at 100 a second, {inner:.3} s between the reads and {outer:.3} s \
+                 around them: {least:.0} to {most:.0} expected"
+            );
         }
 
         #[test]
@@ -573,7 +682,52 @@ mod mac {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProcRead, Tally, UNKNOWN_PARENT, mach_to_ticks};
+    use gate_watchdog::SystemTimes;
+
+    use super::{LoadTotals, ProcRead, Tally, UNKNOWN_PARENT, mach_to_ticks};
+
+    #[test]
+    fn load_totals_count_each_counter_s_difference_across_a_u32_wrap() {
+        let mut totals = LoadTotals::default();
+        let first = totals.add([u32::MAX - 10, 100, u32::MAX - 4, 0]);
+        assert_eq!(first, SystemTimes { idle: 0, kernel: 0, user: 0 }, "the first read is the baseline");
+        let wrapped = totals.add([20, 130, 5, 0]);
+        assert_eq!(
+            wrapped,
+            SystemTimes {
+                idle: 10,
+                kernel: 30 + 10,
+                user: 31,
+            },
+            "user wrapped by 31 and idle by 10, read as the ticks gained, not as a fall"
+        );
+        let next = totals.add([25, 131, 6, 2]);
+        assert_eq!(
+            next,
+            SystemTimes {
+                idle: 11,
+                kernel: 31 + 11,
+                user: 36 + 2,
+            },
+            "totals keep rising past the wrap, nice counted as user"
+        );
+    }
+
+    #[test]
+    fn a_counter_that_falls_by_a_tick_adds_nothing_rather_than_reading_as_a_wrap() {
+        let mut totals = LoadTotals::default();
+        totals.add([10, 10, 10, 0]);
+        assert_eq!(
+            totals.add([10, 10, 9, 0]),
+            SystemTimes { idle: 0, kernel: 0, user: 0 },
+            "idle fell by one tick: nothing gained, not 2^32 - 1"
+        );
+        assert_eq!(
+            totals.add([10, 10, 11, 0]),
+            SystemTimes { idle: 2, kernel: 2, user: 0 },
+            "counted again from where it fell"
+        );
+    }
 
     fn proc(pid: i32, start: u64, ppid: i32, own: u64, children: u64) -> ProcRead {
         ProcRead {
