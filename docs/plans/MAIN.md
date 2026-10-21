@@ -4,17 +4,18 @@
 
 ## Do first
 
-- [ ] GATE-675 Make the sampler-failed parent pause case hold when its child's wait line comes late — Urgent · Local gate
 - [ ] GATE-595 Route to more than one builder, choosing by what each builder can run — Urgent · Remote
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [/] GATE-607 Unix gate box: version, preflight, boot, run, stop — Urgent · Remote
-- [ ] GATE-592 Set up the Mac builder and time the portable .NET repos on it by hand — Urgent · Remote
-- [ ] GATE-255 Suite: three cases ended with exit 1 and no output mid-run, and a box-kill case failed under load — Urgent · Backlog
+- [ ] GATE-694 Make the desktop helper's dies-after-creating-the-child case hold under load — Urgent · Remote
 - [ ] GATE-641 Keep a first launch of freshly built binaries from looking stalled while a scanner loads them — High · Local gate
 - [ ] GATE-616 Move the box's shared wire rules into gate-wire so both boxes say the same bytes — High · Remote
 - [ ] GATE-615 Tie the Unix box's job record to its process group leader's start time — High · Remote
 - [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root — High · Remote
 - [ ] GATE-648 Restore pnpm, bun and npm packages on the Unix box, as the Windows box does — High · Remote
+- [ ] GATE-684 Send a Godot command to a Mac builder with the Mac's Godot binary — High · Remote
+- [ ] GATE-685 Give a routed run on the Unix box a short TMPDIR so .NET named pipes fit — High · Remote
+- [ ] GATE-686 Lay out a sibling pair on the Unix box as the Windows box does — High · Remote
 - [ ] GATE-574 Take the work lock in the box preflight and stamp the lock's time on each run — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
@@ -37,12 +38,18 @@
 - [ ] GATE-650 Fall back when a builder's box program is missing (ssh status 126/127) — High · Remote
 - [ ] GATE-653 Route towercab-3d's cargo commands: the snapshot lacks its gitignored dist/ and converter exe — High · Remote
 - [ ] GATE-669 Re-add yaat-server routing and run its trial now YAAT-646 is fixed — High · Remote
+- [ ] GATE-682 Explain or track a stall when a gated command is plain ssh to another machine — High · Remote
+- [/] GATE-683 Prune a deleted worktree's folders from every builder, and prune the Mac by space — High · Remote
+- [ ] GATE-688 Record which worktree each routed key came from — High · Remote
+- [ ] GATE-689 Prune a gone worktree's keys from the Windows builders and the PC — High · Remote
+- [ ] GATE-690 Prune the Unix box by age, free space and gone keys, on a launchd schedule — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Local gate
 
 - [ ] GATE-651 Resolve a relative --log against the --cd folder
 - [ ] GATE-652 Refuse a gate.exe built with its test seams at install
+- [ ] GATE-678 Make pause suite cases fail at once when the gate they wait on exits
 
 ## Remote
 
@@ -53,6 +60,7 @@
 - [ ] GATE-672 Harden what the Unix box's command inherits: PATH entries, descriptors, umask, signals, PWD
 - [ ] GATE-673 Settle how the Unix box reports a command that never started or ended oddly
 - [ ] GATE-674 Make gate check's missing-ffmpeg hint name the admin Homebrew run on a macOS builder
+- [ ] GATE-681 Say when a Unix box kill leaves something holding the command's output
 - [ ] GATE-432 Harden the push script's registration run and helper rollback
 - [ ] GATE-429 Measure which Task Scheduler call frees its string argument, and quote the desktop task's command
 - [ ] GATE-618 Turn off auto gc in the box's shared bare repositories
@@ -216,6 +224,9 @@
 - [ ] GATE-660 Harden the macOS push script against files routed code plants under the work root
 - [ ] GATE-662 Test install.ps1's leftover source.json temp sweep
 - [ ] GATE-664 Keep a routed command that names a path outside its tree on this PC
+- [ ] GATE-687 Find why audiomxd and configd stay busy on the idle Mac builder
+- [ ] GATE-691 Collect the objects a pruned key's refs kept in a builder's bare repos
+- [ ] GATE-692 Give the pin decision its own result type instead of Route::Refused
 
 ## Design
 
@@ -326,3 +337,6 @@
 - [ ] GATE-665 Give the no-build and snapshot worktree placements the placing drain
 - [ ] GATE-670 Let a Ctrl+C end the routing decision's and gate check's placement call during its long drain
 - [ ] GATE-671 Bound the job process list's buffer before allocating it, and keep a box stop waiting through a failed list read
+- [ ] GATE-676 Hold the box's ceiling clock until a box-kill case's command has marked its file
+- [ ] GATE-679 Correct design.md's note on the priority a suite case's gates run at
+- [ ] GATE-693 End a run that never ran its command with a verdict line
