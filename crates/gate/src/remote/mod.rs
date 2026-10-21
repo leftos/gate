@@ -379,8 +379,8 @@ fn say<S: AsRef<str>>(log: &Path, lines: &[S], mut stream: impl Write) -> Result
 #[cfg(feature = "test-seams")]
 pub(crate) fn chosen(seams: &TestSeams) -> Result<Box<dyn RemoteClient>, String> {
     if seams.remote_snapshot {
-        let limit = git::limit(seams);
-        return Ok(Box::new(snapshot_only::SnapshotOnly { limit }));
+        let bounds = git::GitBounds::of(seams);
+        return Ok(Box::new(snapshot_only::SnapshotOnly { bounds }));
     }
     if let Some(transport) = &seams.remote_transport {
         return client::RustClient::local(seams, transport).map(|client| Box::new(client) as Box<dyn RemoteClient>);
@@ -463,16 +463,15 @@ fn uncarried(root: &str) -> Option<char> {
 mod snapshot_only {
     use std::io;
     use std::path::PathBuf;
-    use std::time::Duration;
 
-    use super::git::GitError;
+    use super::git::{GitBounds, GitError};
     use super::snapshot::{self, Snapshot};
     use super::{FAILED, FAILED_RUN, RemoteCall, RemoteClient, RemoteOutcome};
     use crate::run::CONTROL_C_EXIT;
 
     pub(crate) struct SnapshotOnly {
-        /// How long each git call may take.
-        pub(crate) limit: Duration,
+        /// The bounds of each git call.
+        pub(crate) bounds: GitBounds,
     }
 
     impl RemoteClient for SnapshotOnly {
@@ -481,7 +480,7 @@ mod snapshot_only {
                 .chain(call.siblings.iter().map(super::Sibling::root))
                 .map(PathBuf::from)
                 .collect();
-            let (status, lines) = match snapshot::take(&roots, call.key, self.limit, call.interrupt) {
+            let (status, lines) = match snapshot::take(&roots, call.key, self.bounds, call.interrupt) {
                 Ok(snapshots) => (0, snapshots.iter().map(said).collect()),
                 // An interrupt is no failure, so it says no line: the run is the interrupt, as the client's `wait`.
                 Err(GitError::Interrupted) => (i64::from(CONTROL_C_EXIT.cast_signed()), Vec::new()),
@@ -522,7 +521,7 @@ mod snapshot_only {
         use gate_win32::Interrupt;
 
         use super::SnapshotOnly;
-        use crate::remote::git::GIT_LIMIT;
+        use crate::remote::git::GIT_BOUNDS;
         use crate::remote::snapshot;
         use crate::remote::{RemoteCall, RemoteClient};
         use crate::run::CONTROL_C_EXIT;
@@ -570,7 +569,7 @@ mod snapshot_only {
             interrupt.raise();
             let log = crate::test_support::temp_dir().join(format!("gate-snapshot-interrupt-{}.log", std::process::id()));
 
-            let outcome = SnapshotOnly { limit: GIT_LIMIT }.run(&call(r"C:\no-such-worktree", &log, Some(interrupt)));
+            let outcome = SnapshotOnly { bounds: GIT_BOUNDS }.run(&call(r"C:\no-such-worktree", &log, Some(interrupt)));
 
             assert_eq!(outcome.status, i64::from(CONTROL_C_EXIT.cast_signed()), "{outcome:?}");
             assert!(outcome.lines.is_empty(), "an interrupt says no failure line: {:?}", outcome.lines);
@@ -585,7 +584,7 @@ mod snapshot_only {
             let shown = root.to_string_lossy().into_owned();
             let log = root.join("no-such-folder").join("out.log");
 
-            let outcome = SnapshotOnly { limit: GIT_LIMIT }.run(&call(&shown, &log, None));
+            let outcome = SnapshotOnly { bounds: GIT_BOUNDS }.run(&call(&shown, &log, None));
 
             assert_eq!(outcome.status, 1, "{outcome:?}");
             assert_eq!(outcome.fallback(), None, "the snapshot's commits are already made");
@@ -607,7 +606,7 @@ mod snapshot_only {
             let shown = root.to_string_lossy().into_owned();
             let log = root.join("out.log");
 
-            let outcome = SnapshotOnly { limit: GIT_LIMIT }.run(&call(&shown, &log, None));
+            let outcome = SnapshotOnly { bounds: GIT_BOUNDS }.run(&call(&shown, &log, None));
 
             assert_eq!(outcome.status, 1, "{outcome:?}");
             assert_eq!(outcome.fallback(), None, "a snapshot that cannot be made falls back nowhere");

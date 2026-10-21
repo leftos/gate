@@ -21,7 +21,7 @@ use gate_win32::Interrupt;
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_DELETE_ON_CLOSE, FILE_SHARE_READ};
 
 use super::client::{Attempt, Called, End, RawSink, Watch};
-use super::git::{Call, Git, GitError, failure_text};
+use super::git::{Call, Git, GitBounds, GitError, failure_text};
 use super::outputs::{Archive, DELETE, GENERIC_WRITE, Unbuilt, sha256_for};
 use super::payload::{self, InputsStep, Location};
 use super::watchdog::{self, Cut};
@@ -61,7 +61,7 @@ impl Caps {
 
 /// What a run's inputs manifest is built from: the worktree `root`, the repo's input `globs`, the work folder's `key`,
 /// which names the gate's own archives and stages under `.tmp`, the run's `log`, the inputs hash cache's file `cache`,
-/// the `caps` it is built under, and how long the `git check-ignore` call may take, answering to the console
+/// the `caps` it is built under, and the bounds of the `git check-ignore` call, answering to the console
 /// `interrupt`.
 pub(super) struct Asked<'a> {
     pub(super) root: &'a Path,
@@ -70,7 +70,7 @@ pub(super) struct Asked<'a> {
     pub(super) log: &'a Path,
     pub(super) cache: &'a Path,
     pub(super) caps: Caps,
-    pub(super) limit: Duration,
+    pub(super) bounds: GitBounds,
     pub(super) interrupt: Option<Interrupt>,
 }
 
@@ -245,7 +245,7 @@ fn ignored(asked: &Asked<'_>, found: &[Found]) -> Result<HashSet<String>, Unbuil
     let call = Call {
         stdin: Some(&input),
         interrupt: asked.interrupt,
-        ..Call::plain(asked.root, &args, asked.limit)
+        ..Call::bounded(asked.root, &args, asked.bounds)
     };
     let failed = |why: String| Unbuilt::Failed(format!("git check-ignore failed: {why}"));
     let (ran, errors) = git.run_kept(&call).map_err(|error| match error {
@@ -327,7 +327,7 @@ pub(super) fn sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> 
         log: call.log,
         cache: &cache,
         caps: Caps::FULL,
-        limit: attempt.limit,
+        bounds: attempt.git,
         interrupt: call.interrupt,
     };
     match built(&asked, || attempt.go_on().is_ok()) {
@@ -460,7 +460,7 @@ fn build_built(attempt: &mut Attempt<'_, '_>, bin: &str) -> Result<Built, Unbuil
         log: call.log,
         cache: &cache,
         caps: Caps::FULL,
-        limit: attempt.limit,
+        bounds: attempt.git,
         interrupt: call.interrupt,
     };
     let manifest = hashed(&asked, &found, || attempt.go_on().is_ok())?;
@@ -860,7 +860,7 @@ mod tests {
     use super::{Asked, Built, Caps, End, PAST_THE_CAP, Pack, Unsent, built, installed_all, made_in_tmp, needed, packed, relative};
     use crate::outputs::hash::sha256_of;
     use crate::outputs::walk::Found;
-    use crate::remote::git::GIT_LIMIT;
+    use crate::remote::git::GIT_BOUNDS;
     use crate::remote::outputs::Unbuilt;
 
     const KEY: &str = "app-1a2b3c4d";
@@ -927,7 +927,7 @@ mod tests {
             log,
             cache: &cache_of(root),
             caps,
-            limit: GIT_LIMIT,
+            bounds: GIT_BOUNDS,
             interrupt: None,
         };
         built(&asked, || true)

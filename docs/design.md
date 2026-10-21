@@ -1955,7 +1955,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   The bridge commit has the snapshot's tree and, as its parent, the newest local `refs/gate-remote/*` not ending `-back`; with none it has no parent. The push writes `refs/gate-remote/<key>` once the builder has the snapshot.
 
-  Every git call of the client goes through `remote/git.rs`, which the routing decision's git calls share: it removes the `GIT_*` location variables, applies the routing decision's time limit (`--test-git-limit-ms`), starts git through `remote/launch.rs` (suspended, assigned to an anonymous kill-on-close job of its own and resumed, with its output on pipes read by a thread per stream), reads and drops stderr where nothing reads it and ends git's whole job on Ctrl+C.
+  Every git call of the client goes through `remote/git.rs`, which the routing decision's git calls share: it removes the `GIT_*` location variables, applies the call's time limit (`--test-git-limit-ms`, one value for the routing decision's calls, the client's and the `--test-remote-snapshot` client's), starts git through `remote/launch.rs` (suspended, assigned to an anonymous kill-on-close job of its own and resumed, with its output on pipes read by a thread per stream), reads and drops stderr where nothing reads it and ends git's whole job on Ctrl+C.
 
   The calls the client reads (`Git::output`: the sync-back's and the snapshot's) read git's output up to 16 MiB and keep the last 64 KiB of its stderr; a call past the cap is ended and fails with `git <args> failed in <folder>: its output passed 16 MiB`. The routing decision's calls are not capped. A Ctrl+C that ends git is an interrupt.
 
@@ -1968,7 +1968,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   A patch that applied but cannot be removed fails the run (`gate: the remote run failed: cannot remove <patch>: <error>`) and keeps nothing: the changes are already in the worktree.
 
-  Once git has exited, its readers get 2 s to reach their pipes' ends (the routing decision's calls, `--test-git-drain-ms` of them), else the call fails with `cannot read git's output: it did not end within <n> s of git's exit`, `<n>` being the call's own drain in whole seconds (a drain that is not a whole number of seconds is spelled in ms, `<n> ms`; the same holds for `dotnet --list-sdks` and the tool probes, with `<name>` their program). A failure line carries the last 10 of git's lines joined by ` | `, escaped and cut to the last 4 KiB at a whole escape.
+  Once git has exited, its readers get 2 s to reach their pipes' ends (`--test-git-drain-ms` replaces it for the routing decision's calls, the client's, the `--test-remote-snapshot` client's and the drain of this PC's `dotnet --list-sdks` read), else the call fails with `cannot read git's output: it did not end within <n> s of git's exit`, `<n>` being the call's own drain in whole seconds (a drain that is not a whole number of seconds is spelled in ms, `<n> ms`; the same holds for `dotnet --list-sdks` and the tool probes, with `<name>` their program). A failure line carries the last 10 of git's lines joined by ` | `, escaped and cut to the last 4 KiB at a whole escape.
 
   Of the test seams, `--test-remote-snapshot` and `--test-remote-transport` give the client a stand-in. The first makes the snapshot of each worktree of the call, the main one then a pair's siblings in declared order, says `gate: remote snapshot <sha> bridge <sha or none>` on stderr and in the log, one line a worktree, and ends with status 0.
 
@@ -3891,13 +3891,13 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-remote-wait-ms <n>` (whole milliseconds above 0) replaces the 60 s budget of the waits for a remote slot, which all the builders of a run share. `--test-print-request` shows them as `testSeams.remoteClient` and `testSeams.remoteWaitMs`.
 
-  `--test-git-limit-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 60 s limit of each git call of the routing decision; `--test-print-request` shows it as `testSeams.gitLimitMs`, after `remoteWaitMs`.
+  `--test-git-limit-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 60 s limit of each git call of the routing decision, of the remote client and of the `--test-remote-snapshot` client; `--test-print-request` shows it as `testSeams.gitLimitMs`, after `remoteWaitMs`.
 
   `--test-key-wait-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 90 s bound of a routed run's wait for its work folder's key, and the switch `--test-interrupt-before-key` raises the interrupt before the key is taken; `--test-heartbeat-ms` sets the wait's step. `--test-print-request` shows them as `testSeams.keyWaitMs` and `testSeams.interruptBeforeKey`.
 
   `--test-interrupt-before-later` (a switch) raises the interrupt once a run that fell back has built the next builder it may try, before it tries it, so a case can pin a Ctrl+C during the walk over the later builders; `--test-print-request` shows it as `testSeams.interruptBeforeLater`, after `interruptBeforeKey`.
 
-  `--test-git-drain-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 2 s the readers of each git call of the routing decision get to end once git has exited; `--test-print-request` shows it as `testSeams.gitDrainMs`, after `gitLimitMs`. The suite's routing cases pass it with a very long drain, so a starved gate does not fail a call that a loaded machine only delays.
+  `--test-git-drain-ms <n>` (whole milliseconds above 0, on `gate run` only) replaces the 2 s the readers of each git call of the routing decision, of the remote client and of the `--test-remote-snapshot` client, and of this PC's `dotnet --list-sdks` read, get to end once the program has exited; `--test-print-request` shows it as `testSeams.gitDrainMs`, after `gitLimitMs`. The suite's routing, remote client, `warm` and `cores` cases pass both seams with very long values (`GIT_HANG_GUARDS`), so a starved gate does not fail a call that a loaded machine only delays.
 
   `--test-beside-claim-wait <file>` (on `gate run` only) makes a local light gate that took its slot holding the beside mutex wait, after it takes the slot and before it writes its claim and journals its `take`, until `<file>` exists, so a case can hold a gate between its take and its claim.
 

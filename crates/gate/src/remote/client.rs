@@ -42,7 +42,7 @@ use regex::Regex;
 use gate_router::{Config, DROPPED_NO_BUILD_LINE, SendPlan, escaped, repo_name};
 use gate_wire::{PairRefused, Payload, SHA256_DIGITS, is_lower_hex};
 
-use super::git::{self, Git, GitError, NO_CURRENT_FOLDER, last_update};
+use super::git::{self, Git, GitBounds, GitError, NO_CURRENT_FOLDER, last_update};
 use super::held::{Held, sibling_who};
 use super::inputs;
 use super::launch::{DRAIN, KILL_WAIT, KILLED, call_job, launched, piped_launch};
@@ -113,8 +113,9 @@ pub(crate) struct RustClient {
     /// The way to the builder: `None` for the ssh transport until a routed attempt first needs it ([`found`]), so a
     /// run that never routes never looks for ssh.
     transport: Option<Box<dyn Transport>>,
-    /// How long each git call of the snapshot and the saved ref may take.
-    limit: Duration,
+    /// The bounds of each git call of the attempt, its limit and its readers' drain; the drain also bounds the readers
+    /// of this PC's `dotnet --list-sdks` read.
+    git: GitBounds,
     /// The pause before a retry.
     pause: Duration,
     /// How long a bounded call, the `stop` or the `boot`, may take.
@@ -176,7 +177,7 @@ impl RustClient {
     fn over(transport: Option<Box<dyn Transport>>, seams: &TestSeams) -> RustClient {
         RustClient {
             transport,
-            limit: git::limit(seams),
+            git: GitBounds::of(seams),
             pause: retry::pause(seams),
             bound: retry::bound(seams),
             stall_ms: seams.stall_ms,
@@ -324,8 +325,8 @@ impl RemoteClient for RustClient {
         let mut attempt = Attempt {
             call,
             transport: &*transport,
-            limit: self.limit,
-            lock_wait: self.limit,
+            git: self.git,
+            lock_wait: self.git.limit,
             pause: self.pause,
             limits: Limits {
                 started,
@@ -1135,7 +1136,9 @@ enum Tagged {
 pub(super) struct Attempt<'c, 'a> {
     pub(super) call: &'c RemoteCall<'a>,
     pub(super) transport: &'c dyn Transport,
-    pub(super) limit: Duration,
+    /// The bounds of each git call of the attempt, its limit and its readers' drain; the drain also bounds the readers
+    /// of this PC's `dotnet --list-sdks` read.
+    pub(super) git: GitBounds,
     /// How long the sync-back waits for a worktree's lock another run holds: the git limit, which the sync-back's tests
     /// shorten without shortening its git calls.
     pub(super) lock_wait: Duration,
@@ -1528,7 +1531,7 @@ impl Attempt<'_, '_> {
     /// The snapshot of the call's worktree.
     fn snapshot(&self) -> Result<Snapshot, End> {
         let roots = [PathBuf::from(self.call.root)];
-        snapshot::take(&roots, self.call.key, self.limit, self.call.interrupt)
+        snapshot::take(&roots, self.call.key, self.git, self.call.interrupt)
             .map_err(git_end)?
             .pop()
             .ok_or_else(|| End::Failed("the snapshot made no commit".to_owned()))
@@ -1664,7 +1667,7 @@ impl Attempt<'_, '_> {
         let mut commons: Vec<(&str, gate_router::FolderId)> = Vec::with_capacity(repos.len());
         for (at, repo) in repos.iter().enumerate() {
             self.go_on()?;
-            let place = snapshot::place_of(bounded(repo, &ceiling), self.limit, self.call.interrupt)
+            let place = snapshot::place_of(bounded(repo, &ceiling), self.git, self.call.interrupt)
                 .map_err(|error| repo_end(at, &repo.name, git_end(error)))?;
             let who = who(at, &repo.name);
             if !same_path(&place.top, &repo.root) {
@@ -1687,7 +1690,7 @@ impl Attempt<'_, '_> {
                 place: Some(self.place_at(root).map_err(End::Failed)?),
                 ..bounded(repo, &ceiling)
             };
-            let taken = snapshot::take_bounded(bound, self.call.key, self.limit, self.call.interrupt);
+            let taken = snapshot::take_bounded(bound, self.call.key, self.git, self.call.interrupt);
             snapshots.push(taken.map_err(|error| repo_end(at, &repo.name, git_end(error)))?);
             #[cfg(feature = "test-seams")]
             if at == 0 {
@@ -1776,7 +1779,7 @@ impl Attempt<'_, '_> {
     #[expect(clippy::option_option, reason = "the main repository's listing, given, may be one that could not be made")]
     fn lfs_listed(&mut self, repo: &Repo, snapshot: &Snapshot, main: Option<Option<&lfs::Small>>) -> Result<Option<lfs::Listed>, End> {
         let root = Path::new(&repo.root);
-        let (limit, interrupt) = (self.limit, self.call.interrupt);
+        let (bounds, interrupt) = (self.git, self.call.interrupt);
         let small = match main {
             Some(None) => return Ok(None),
             Some(Some(small)) => Some(small),
@@ -1784,17 +1787,17 @@ impl Attempt<'_, '_> {
         };
         if small.is_some_and(|small| small.attributes) {
             let unseen = self.lfs_bound(root).map_err(Unbuilt::Failed);
-            let unseen = unseen.and_then(|bound| lfs::unseen_attributes(bound, limit, interrupt));
+            let unseen = unseen.and_then(|bound| lfs::unseen_attributes(bound, bounds, interrupt));
             if let Some(why) = self.lfs_unbuilt(repo, unseen)? {
-                let uses = lfs::tracks_lfs_filter(root, limit, interrupt).map_err(lfs::unbuilt);
+                let uses = lfs::tracks_lfs_filter(root, bounds, interrupt).map_err(lfs::unbuilt);
                 if self.lfs_unbuilt(repo, uses)? {
                     return Err(lfs::refused(self, &why));
                 }
             }
         }
         let listed = match (self.lfs_bound(root), small) {
-            (Ok(bound), Some(small)) => lfs::listed_among(bound, &snapshot.commit, small, limit, interrupt),
-            (Ok(bound), None) => lfs::listed(bound, &snapshot.commit, limit, interrupt),
+            (Ok(bound), Some(small)) => lfs::listed_among(bound, &snapshot.commit, small, bounds, interrupt),
+            (Ok(bound), None) => lfs::listed(bound, &snapshot.commit, bounds, interrupt),
             (Err(why), _) => Err(Unbuilt::Failed(why)),
         };
         self.lfs_unbuilt(repo, listed).map(Some)
@@ -1806,12 +1809,12 @@ impl Attempt<'_, '_> {
     /// for a sibling, or a main tree that could not be listed, as [`lfs::tracks_lfs_filter`] reads it. A listing git
     /// fails refuses the route `lfs`, naming the repository; a Ctrl+C ends the run.
     fn lfs_filtered(&mut self, repos: &[Repo], trees: &[Option<Tree>]) -> Result<bool, End> {
-        let (limit, interrupt) = (self.limit, self.call.interrupt);
+        let (bounds, interrupt) = (self.git, self.call.interrupt);
         for (at, repo) in repos.iter().enumerate() {
             let root = Path::new(&repo.root);
             let uses = match trees.first().and_then(Option::as_ref) {
                 Some(tree) if at == 0 => Ok(lfs::names_lfs_filter_among(root, &tree.attributes)),
-                _ => lfs::tracks_lfs_filter(root, limit, interrupt).map_err(lfs::unbuilt),
+                _ => lfs::tracks_lfs_filter(root, bounds, interrupt).map_err(lfs::unbuilt),
             };
             if self.lfs_unbuilt(repo, uses)? {
                 return Ok(true);
@@ -2264,13 +2267,24 @@ impl Attempt<'_, '_> {
             .map_err(GitError::Failed)?
             .map(|bound| bound.variables())
             .unwrap_or_default();
-        let call = git::Call {
-            set: &set,
+        git.output_bytes_within(&self.git_call(folder, args, &set, stdin), cap)
+    }
+
+    /// The attempt's git call in `folder` with `args`, given the variables `set` and fed `stdin`: under the attempt's
+    /// git bounds, and ended by the call's console interrupt.
+    fn git_call<'b>(
+        &self,
+        folder: &'b Path,
+        args: &'b [&'b str],
+        set: &'b [(&'b str, &'b std::ffi::OsStr)],
+        stdin: Option<&'b [u8]>,
+    ) -> git::Call<'b> {
+        git::Call {
+            set,
             interrupt: self.call.interrupt,
             stdin,
-            ..git::Call::plain(folder, args, self.limit)
-        };
-        git.output_bytes_within(&call, cap)
+            ..git::Call::bounded(folder, args, self.git)
+        }
     }
 
     /// This PC's newest .NET SDK major, from `--test-local-sdks` when given, else from `dotnet --list-sdks`, read once
@@ -2300,7 +2314,7 @@ impl Attempt<'_, '_> {
         let worktrees: Vec<&Path> = std::iter::once(Path::new(call.root))
             .chain(call.siblings.iter().map(|sibling| Path::new(sibling.root())))
             .collect();
-        match local_sdk_listing(Variables::from_process(), &worktrees, self.dotnet_limit, DRAIN, call.interrupt) {
+        match local_sdk_listing(Variables::from_process(), &worktrees, self.dotnet_limit, self.git.drain, call.interrupt) {
             Ok(listing) => parity::newest_major(parity::sdk_versions(&listing)),
             Err(_) if self.call.interrupt.is_some_and(Interrupt::is_raised) => 0,
             Err(error) => {
@@ -2344,7 +2358,7 @@ impl Attempt<'_, '_> {
     /// `commondir` or a `gitdir:` written while it was held would.
     fn kept_its_place(&self, at: usize, repo: &Repo, bound: Bounded<'_>) -> Result<(), End> {
         let unplaced = Bounded { place: None, ..bound };
-        let again = snapshot::place_of(unplaced, self.limit, self.call.interrupt);
+        let again = snapshot::place_of(unplaced, self.git, self.call.interrupt);
         let again = again.map_err(|error| repo_end(at, &repo.name, git_end(error)))?;
         if bound.place == Some(&again) {
             Ok(())
@@ -2400,7 +2414,7 @@ impl Attempt<'_, '_> {
             ));
             return Err(End::Refused(FallbackReason::Unreachable));
         }
-        let saved = snapshot::save(root, &variables, key, &snapshot.commit, self.limit);
+        let saved = snapshot::save(root, &variables, key, &snapshot.commit, self.git);
         saved.map_err(|error| repo_end(at, &repo.name, git_end(error)))?;
         // The push is timed to its save; the check of where git finds the repository is not part of it.
         let took = started.elapsed();
@@ -3159,8 +3173,8 @@ impl<'c, 'a> Attempt<'c, 'a> {
         Attempt {
             call,
             transport,
-            limit: git::GIT_LIMIT,
-            lock_wait: git::GIT_LIMIT,
+            git: git::GIT_BOUNDS,
+            lock_wait: git::TEST_HANG_GUARD,
             pause: Duration::ZERO,
             limits: Limits::for_tests(),
             one_call: None,
@@ -4759,7 +4773,7 @@ mod tests {
     use super::{DRAIN, KILLED, Received};
     use super::{KeyHold, RunEnd, Warm, cold_line, hold_key, hold_key_waiting, new_work_tree, status_end, warm_end, warm_of};
     use crate::environment::Variables;
-    use crate::remote::git::{self, DOTNET_LIMIT, GIT_LIMIT, Git, GitError};
+    use crate::remote::git::{self, DOTNET_LIMIT, GIT_BOUNDS, Git, GitBounds, GitError};
     use crate::remote::held::tests::{Pair, junction};
     use crate::remote::outputs;
     use crate::remote::payload;
@@ -4903,8 +4917,8 @@ mod tests {
         Attempt {
             call,
             transport,
-            limit: GIT_LIMIT,
-            lock_wait: GIT_LIMIT,
+            git: GIT_BOUNDS,
+            lock_wait: git::TEST_HANG_GUARD,
             pause: LONG,
             limits: Limits::for_tests(),
             one_call: None,
@@ -8175,8 +8189,31 @@ mod tests {
             r"D:\gate-remote",
             "every work folder and bare repository lives there"
         );
-        assert_eq!(client.limit, GIT_LIMIT, "a request with no seams keeps the constants");
+        assert_eq!(client.git, GitBounds::DEFAULT, "a request with no seams keeps the constants");
         assert_eq!(client.dotnet_limit, DOTNET_LIMIT, "a request with no seams keeps the constants");
+    }
+
+    #[test]
+    fn the_git_limit_and_drain_seams_bound_the_attempt_s_git_calls() {
+        let seams = TestSeams {
+            git_limit_ms: Some(1_800_000),
+            git_drain_ms: Some(600_000),
+            ..TestSeams::default()
+        };
+        let log = crate::test_support::temp_dir().join(format!("gate-client-git-bounds-{}.log", std::process::id()));
+        let call = call(&log);
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+        attempt.git = RustClient::over(None, &seams).git;
+
+        let asked = attempt.git_call(Path::new(r"C:\work\app"), &["write-tree"], &[], None);
+
+        let (limit, drain) = (Duration::from_mins(30), Duration::from_mins(10));
+        assert_eq!(
+            (asked.limit, asked.drain),
+            (limit, drain),
+            "the attempt's git call is bounded by both seams"
+        );
     }
 
     #[test]

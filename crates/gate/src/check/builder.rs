@@ -182,7 +182,7 @@ fn asked(transport: &dyn Transport, builder: &Builder, place: &Place, bound: Dur
 /// saying why git could not list its `.gitattributes` files.
 fn uses_lfs(root: &Path) -> Result<bool, String> {
     // The call is given no interrupt.
-    lfs::tracks_lfs_filter(root, git::GIT_LIMIT, None).map_err(|error| {
+    lfs::tracks_lfs_filter(root, git::GitBounds::DEFAULT, None).map_err(|error| {
         let why = match error {
             GitError::Failed(why) | GitError::OverCap(why) => why,
             GitError::Interrupted => "git was interrupted".to_owned(),

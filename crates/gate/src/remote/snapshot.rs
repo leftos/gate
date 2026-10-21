@@ -8,11 +8,10 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use gate_win32::Interrupt;
 
-use crate::remote::git::{self, Git, GitError};
+use crate::remote::git::{self, Git, GitBounds, GitError};
 
 /// The author and committer of every commit the snapshot makes, and of the builder's back commit.
 pub(crate) const IDENTITY: [(&str, &str); 4] = [
@@ -39,14 +38,14 @@ pub(crate) struct Snapshot {
     pub objects: PathBuf,
 }
 
-/// The snapshot of each of `roots`, in order, under the work-folder `key`, each git call ended after `limit` or by the
+/// The snapshot of each of `roots`, in order, under the work-folder `key`, each git call under `bounds` or ended by the
 /// console `interrupt`; else why the call could not be made. git is found once, for every call of every root.
-pub(crate) fn take(roots: &[PathBuf], key: &str, limit: Duration, interrupt: Option<Interrupt>) -> Result<Vec<Snapshot>, GitError> {
+pub(crate) fn take(roots: &[PathBuf], key: &str, bounds: GitBounds, interrupt: Option<Interrupt>) -> Result<Vec<Snapshot>, GitError> {
     let Some(first) = roots.first() else {
         return Ok(Vec::new());
     };
     let git = Git::find(first).map_err(GitError::Failed)?;
-    roots.iter().map(|root| take_one(&git, root, &[], key, limit, interrupt)).collect()
+    roots.iter().map(|root| take_one(&git, root, &[], key, bounds, interrupt)).collect()
 }
 
 /// A repository of a sibling pair as its git calls ask about it: its worktree's folder; the folder git's search for a
@@ -90,21 +89,21 @@ pub(crate) struct Place {
 pub(crate) const CEILING: &str = "GIT_CEILING_DIRECTORIES";
 
 /// The snapshot of the pair's repository `repo`, as [`take`] takes one, under the work-folder `key`.
-pub(crate) fn take_bounded(repo: Bounded<'_>, key: &str, limit: Duration, interrupt: Option<Interrupt>) -> Result<Snapshot, GitError> {
+pub(crate) fn take_bounded(repo: Bounded<'_>, key: &str, bounds: GitBounds, interrupt: Option<Interrupt>) -> Result<Snapshot, GitError> {
     let git = Git::find(repo.root).map_err(GitError::Failed)?;
-    take_one(&git, repo.root, &repo.variables(), key, limit, interrupt)
+    take_one(&git, repo.root, &repo.variables(), key, bounds, interrupt)
 }
 
 /// Where git finds the pair's repository `repo`, searching from its root up to its ceiling and given no place, as one
 /// `git rev-parse --show-toplevel --path-format=absolute --absolute-git-dir --git-common-dir` prints it.
-pub(crate) fn place_of(repo: Bounded<'_>, limit: Duration, interrupt: Option<Interrupt>) -> Result<Place, GitError> {
+pub(crate) fn place_of(repo: Bounded<'_>, bounds: GitBounds, interrupt: Option<Interrupt>) -> Result<Place, GitError> {
     let git = Git::find(repo.root).map_err(GitError::Failed)?;
     let ceiling = [(CEILING, repo.ceiling.as_os_str())];
     let calls = Calls {
         git: &git,
         root: repo.root,
         bound: &ceiling,
-        limit,
+        bounds,
         interrupt,
     };
     let args = [
@@ -133,27 +132,27 @@ pub(crate) fn place_of(repo: Bounded<'_>, limit: Duration, interrupt: Option<Int
 /// Points `refs/gate-remote/<key>` at `commit` in the repository of `root`, once the builder has the snapshot, so the
 /// next bridge commit builds on it, git given `bound`, a pair's repository's [`Bounded::variables`], none for a run
 /// of one. git holds the ref's lock while it runs, so it is a [`git::Call::locked`] call, which no Ctrl+C ends: it ends
-/// on its own or after `limit`.
-pub(crate) fn save(root: &Path, bound: &[(&str, &OsStr)], key: &str, commit: &str, limit: Duration) -> Result<(), GitError> {
+/// on its own or at `bounds`' limit.
+pub(crate) fn save(root: &Path, bound: &[(&str, &OsStr)], key: &str, commit: &str, bounds: GitBounds) -> Result<(), GitError> {
     let git = Git::find(root).map_err(GitError::Failed)?;
     let args = ["update-ref", &format!("{REFS}{key}"), commit];
     git.output(&git::Call {
         set: bound,
-        ..git::Call::locked(root, &args, limit)
+        ..git::Call::locked(root, &args, bounds)
     })
     .map(drop)
 }
 
 /// The tree of the worktree at `root` as `git add -A` and `git write-tree` write it through a copy of its index: what
-/// the sync-back compares against the snapshot's tree, and no commit. git is ended after `limit` or by the console
+/// the sync-back compares against the snapshot's tree, and no commit. git is ended at `bounds`' limit or by the console
 /// `interrupt`.
-pub(super) fn worktree(root: &Path, limit: Duration, interrupt: Option<Interrupt>) -> Result<String, GitError> {
+pub(super) fn worktree(root: &Path, bounds: GitBounds, interrupt: Option<Interrupt>) -> Result<String, GitError> {
     let git = Git::find(root).map_err(GitError::Failed)?;
     worktree_tree(&Calls {
         git: &git,
         root,
         bound: &[],
-        limit,
+        bounds,
         interrupt,
     })
     .map(|(tree, _)| tree)
@@ -164,14 +163,14 @@ fn take_one(
     root: &Path,
     bound: &[(&str, &OsStr)],
     key: &str,
-    limit: Duration,
+    bounds: GitBounds,
     interrupt: Option<Interrupt>,
 ) -> Result<Snapshot, GitError> {
     let calls = Calls {
         git,
         root,
         bound,
-        limit,
+        bounds,
         interrupt,
     };
     let listing = calls.output(
@@ -200,13 +199,13 @@ fn previous(listing: &str, key: &str) -> Option<String> {
         .map(|(_, sha)| (*sha).to_owned())
 }
 
-/// git asked about one worktree, with the variables of a pair's repository ([`Bounded::variables`]), the limit and the
+/// git asked about one worktree, with the variables of a pair's repository ([`Bounded::variables`]), the bounds and the
 /// interrupt every call of one snapshot shares.
 struct Calls<'a> {
     git: &'a Git,
     root: &'a Path,
     bound: &'a [(&'a str, &'a OsStr)],
-    limit: Duration,
+    bounds: GitBounds,
     interrupt: Option<Interrupt>,
 }
 
@@ -236,7 +235,7 @@ impl Calls<'_> {
             set,
             unset,
             interrupt: self.interrupt,
-            ..git::Call::plain(self.root, args, self.limit)
+            ..git::Call::bounded(self.root, args, self.bounds)
         }
     }
 }
@@ -345,7 +344,7 @@ fn git_path(root: &Path, printed: &str) -> PathBuf {
 #[cfg(test)]
 fn asked(root: &Path, args: &[&str]) -> Result<String, GitError> {
     let git = Git::find(root).map_err(GitError::Failed)?;
-    git.output(&git::Call::plain(root, args, git::GIT_LIMIT))
+    git.output(&git::Call::bounded(root, args, git::GIT_BOUNDS))
 }
 
 /// A new git repository in the unit tests' temp folder for the test `name`, holding `a.txt`.
@@ -370,7 +369,7 @@ mod tests {
     use std::slice;
 
     use super::{Bounded, DATES, IDENTITY, asked, copy_name, git_path, lock_of, place_of, previous, repository, save, take, worktree};
-    use crate::remote::git::{GIT_LIMIT, GitError};
+    use crate::remote::git::{GIT_BOUNDS, GitError};
 
     const OWN: &str = "app-1a2b3c4d";
 
@@ -388,7 +387,7 @@ mod tests {
             place: None,
         };
 
-        let found = place_of(bounded, GIT_LIMIT, None);
+        let found = place_of(bounded, GIT_BOUNDS, None);
 
         let outer_shown = outer.to_string_lossy().replace('\\', "/");
         fs::remove_dir_all(&outer).expect("the repository can be removed");
@@ -464,13 +463,13 @@ mod tests {
     fn a_saved_snapshot_is_the_parent_of_the_next_bridge_commit() {
         let root = repository("saved");
         let roots = slice::from_ref(&root);
-        let first = take(roots, OWN, GIT_LIMIT, None).expect("the first snapshot is made");
+        let first = take(roots, OWN, GIT_BOUNDS, None).expect("the first snapshot is made");
         assert_eq!(first.len(), 1, "one snapshot for one root");
         assert_eq!(first[0].bridge, None, "no snapshot before the first");
-        save(&root, &[], OWN, &first[0].commit, GIT_LIMIT).expect("the ref is saved");
+        save(&root, &[], OWN, &first[0].commit, GIT_BOUNDS).expect("the ref is saved");
         fs::write(root.join("a.txt"), "b\n").expect("a file can be changed");
 
-        let second = take(roots, OWN, GIT_LIMIT, None).expect("the second snapshot is made");
+        let second = take(roots, OWN, GIT_BOUNDS, None).expect("the second snapshot is made");
 
         let bridge = second[0].bridge.as_deref().expect("a bridge commit");
         let ask = |args: &[&str]| asked(&root, args).expect("git answers");
@@ -488,9 +487,9 @@ mod tests {
         let root = repository("worktree-tree");
         fs::write(root.join("b.txt"), "b\n").expect("a file can be written");
         let roots = slice::from_ref(&root);
-        let made = take(roots, OWN, GIT_LIMIT, None).expect("the snapshot is made");
+        let made = take(roots, OWN, GIT_BOUNDS, None).expect("the snapshot is made");
 
-        let tree = worktree(&root, GIT_LIMIT, None).expect("the worktree tree is written");
+        let tree = worktree(&root, GIT_BOUNDS, None).expect("the worktree tree is written");
 
         let snapshot = asked(&root, &["rev-parse", &format!("{}^{{tree}}", made[0].commit)]).expect("git answers");
         assert_eq!(
@@ -499,7 +498,7 @@ mod tests {
             "the tree the sync-back compares against, with no commit of its own"
         );
         fs::write(root.join("b.txt"), "c\n").expect("a file can be changed");
-        assert_ne!(worktree(&root, GIT_LIMIT, None).expect("the tree is written again"), tree, "read afresh");
+        assert_ne!(worktree(&root, GIT_BOUNDS, None).expect("the tree is written again"), tree, "read afresh");
         fs::remove_dir_all(&root).expect("the repository can be removed");
     }
 
@@ -510,7 +509,7 @@ mod tests {
         let root = repository("objects");
         let store = fs::canonicalize(root.join(".git").join("objects")).expect("the store is there");
         let objects_of = |folder: &Path| {
-            let made = take(slice::from_ref(&folder.to_path_buf()), OWN, GIT_LIMIT, None).expect("the snapshot is made");
+            let made = take(slice::from_ref(&folder.to_path_buf()), OWN, GIT_BOUNDS, None).expect("the snapshot is made");
             fs::canonicalize(&made[0].objects).expect("the named store is there")
         };
         assert_eq!(objects_of(&root), store, "a plain repository's own");

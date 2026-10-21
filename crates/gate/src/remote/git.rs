@@ -90,11 +90,47 @@ pub(crate) fn limit(seams: &TestSeams) -> Duration {
     seams.git_limit_ms.map_or(GIT_LIMIT, Duration::from_millis)
 }
 
-/// How long the readers of each git call of a run get to end once git has exited: `--test-git-drain-ms` when given,
-/// else [`DRAIN`].
+/// How long the readers of each git call of a run, and of the remote client's read of this PC's `dotnet --list-sdks`,
+/// get to end once the program has exited: `--test-git-drain-ms` when given, else [`DRAIN`].
 pub(crate) fn drain(seams: &TestSeams) -> Duration {
     seams.git_drain_ms.map_or(DRAIN, Duration::from_millis)
 }
+
+/// The bounds of one git call: how long it may take, and how long its readers get to reach their pipes' ends once git
+/// has exited. One value, so no call takes one bound and misses the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GitBounds {
+    pub limit: Duration,
+    pub drain: Duration,
+}
+
+impl GitBounds {
+    /// The bounds of a run given neither git seam: [`GIT_LIMIT`] and [`DRAIN`].
+    pub(crate) const DEFAULT: GitBounds = GitBounds {
+        limit: GIT_LIMIT,
+        drain: DRAIN,
+    };
+
+    /// The bounds of each git call of a run: [`limit`] and [`drain`] of `seams`, [`GitBounds::DEFAULT`] with neither.
+    pub(crate) fn of(seams: &TestSeams) -> GitBounds {
+        GitBounds {
+            limit: limit(seams),
+            drain: drain(seams),
+        }
+    }
+}
+
+/// A unit test's bound on a git call, its readers' drain or a lock wait: a hang guard no passing call reaches, however
+/// loaded the machine.
+#[cfg(test)]
+pub(crate) const TEST_HANG_GUARD: Duration = Duration::from_hours(1);
+
+/// The bounds of a unit test's git calls: [`TEST_HANG_GUARD`] for both.
+#[cfg(test)]
+pub(crate) const GIT_BOUNDS: GitBounds = GitBounds {
+    limit: TEST_HANG_GUARD,
+    drain: TEST_HANG_GUARD,
+};
 
 /// Why a git call did not finish: the console interrupt ended it, or it failed, with the failure in the words the
 /// PowerShell client uses.
@@ -702,29 +738,35 @@ pub(crate) struct Call<'a> {
 }
 
 impl<'a> Call<'a> {
-    /// A call on this process's console that sets and removes no variables of its own, answers to no interrupt and
-    /// gives its readers [`DRAIN`]: the routing decision asks git this way, before a command is started.
+    /// A call as [`Call::bounded`] makes it, ended after `limit`, its readers given [`GitBounds::DEFAULT`]'s drain.
     pub(crate) fn plain(folder: &'a Path, args: &'a [&'a str], limit: Duration) -> Call<'a> {
+        Call::bounded(folder, args, GitBounds { limit, ..GitBounds::DEFAULT })
+    }
+
+    /// A call on this process's console that sets and removes no variables of its own, answers to no interrupt, reads
+    /// nothing on its standard input, is ended after `bounds`' limit and gives its readers `bounds`' drain once git has
+    /// exited: the remote client asks git this way, with the run's bounds.
+    pub(crate) fn bounded(folder: &'a Path, args: &'a [&'a str], bounds: GitBounds) -> Call<'a> {
         Call {
             folder,
             args,
             set: &[],
             unset: &[],
-            limit,
-            drain: DRAIN,
+            limit: bounds.limit,
+            drain: bounds.drain,
             interrupt: None,
             console: PipedConsole::Attached,
             stdin: None,
         }
     }
 
-    /// A call as [`Call::plain`] makes it, but on a hidden console of its own, which no Ctrl+C reaches: a call that
+    /// A call as [`Call::bounded`] makes it, but on a hidden console of its own, which no Ctrl+C reaches: a call that
     /// takes a lock in the git folder and lets it go ends only on its own or at its limit, so no Ctrl+C kills git
     /// while it holds the lock.
-    pub(crate) fn locked(folder: &'a Path, args: &'a [&'a str], limit: Duration) -> Call<'a> {
+    pub(crate) fn locked(folder: &'a Path, args: &'a [&'a str], bounds: GitBounds) -> Call<'a> {
         Call {
             console: PipedConsole::Hidden,
-            ..Call::plain(folder, args, limit)
+            ..Call::bounded(folder, args, bounds)
         }
     }
 }

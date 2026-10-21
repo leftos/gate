@@ -22,7 +22,7 @@ use gate_win32::Interrupt;
 use gate_wire::{SHA256_DIGITS, is_lower_hex};
 
 use super::client::{Attempt, End, RawSink, Watch};
-use super::git::{Call, Git, GitError, OUTPUT_CAP};
+use super::git::{Call, Git, GitBounds, GitError, OUTPUT_CAP};
 use super::inputs::{Asking, MB, Step, TMP, Unsent, judged, tmp_file, unexpected};
 use super::outputs::{Archive, Unbuilt};
 use super::payload::{self, InputsStep, Location};
@@ -78,12 +78,12 @@ pub(crate) struct Listed {
     pub(crate) objects: Vec<Object>,
 }
 
-/// The git calls about one repository: the git found, the repository as its calls ask about it, how long each may
-/// take and the console interrupt that ends it.
+/// The git calls about one repository: the git found, the repository as its calls ask about it, the bounds of each
+/// and the console interrupt that ends it.
 struct Calls<'a> {
     git: &'a Git,
     repo: Bounded<'a>,
-    limit: Duration,
+    bounds: GitBounds,
     interrupt: Option<Interrupt>,
 }
 
@@ -97,7 +97,7 @@ impl Calls<'_> {
             set: &set,
             stdin,
             interrupt: self.interrupt,
-            ..Call::plain(self.repo.root, &pinned, self.limit)
+            ..Call::bounded(self.repo.root, &pinned, self.bounds)
         };
         self.git.output_bytes_within(&call, cap).map_err(unbuilt)
     }
@@ -122,12 +122,12 @@ pub(super) fn unbuilt(error: GitError) -> Unbuilt {
 
 /// The pointers of `commit`'s tree in the repository `repo`, and the objects they name, as [`pointers_of`] reads them;
 /// else the interrupt, or why git or its answer failed.
-pub(super) fn listed(repo: Bounded<'_>, commit: &str, limit: Duration, interrupt: Option<Interrupt>) -> Result<Listed, Unbuilt> {
+pub(super) fn listed(repo: Bounded<'_>, commit: &str, bounds: GitBounds, interrupt: Option<Interrupt>) -> Result<Listed, Unbuilt> {
     let git = Git::find(repo.root).map_err(Unbuilt::Failed)?;
     let calls = Calls {
         git: &git,
         repo,
-        limit,
+        bounds,
         interrupt,
     };
     pointers_of(commit, &mut |args, stdin, cap| calls.output(args, stdin, cap), Unbuilt::Failed)
@@ -135,7 +135,13 @@ pub(super) fn listed(repo: Bounded<'_>, commit: &str, limit: Duration, interrupt
 
 /// The pointers of `commit`'s tree in the repository `repo` among its blobs `small`, read from a listing the caller
 /// made, as [`pointers_among`] reads them; else the interrupt, or why git or its answer failed.
-pub(super) fn listed_among(repo: Bounded<'_>, commit: &str, small: &Small, limit: Duration, interrupt: Option<Interrupt>) -> Result<Listed, Unbuilt> {
+pub(super) fn listed_among(
+    repo: Bounded<'_>,
+    commit: &str,
+    small: &Small,
+    bounds: GitBounds,
+    interrupt: Option<Interrupt>,
+) -> Result<Listed, Unbuilt> {
     if !small.worth_asking() {
         return Ok(Listed::default());
     }
@@ -143,7 +149,7 @@ pub(super) fn listed_among(repo: Bounded<'_>, commit: &str, small: &Small, limit
     let calls = Calls {
         git: &git,
         repo,
-        limit,
+        bounds,
         interrupt,
     };
     pointers_among(commit, small, &mut |args, stdin, cap| calls.output(args, stdin, cap), Unbuilt::Failed)
@@ -152,10 +158,10 @@ pub(super) fn listed_among(repo: Bounded<'_>, commit: &str, small: &Small, limit
 /// Why the builder would read other attributes of the repository `repo`'s tree than this PC does: its common git
 /// folder's `info/attributes` is there and not empty, which this PC's `git check-attr` reads and the builder's checkout
 /// of the snapshot never sees. `None` when it is missing or empty; else the interrupt, or why git or the file failed.
-pub(super) fn unseen_attributes(repo: Bounded<'_>, limit: Duration, interrupt: Option<Interrupt>) -> Result<Option<String>, Unbuilt> {
+pub(super) fn unseen_attributes(repo: Bounded<'_>, bounds: GitBounds, interrupt: Option<Interrupt>) -> Result<Option<String>, Unbuilt> {
     let common = match repo.place {
         Some(place) => place.common.clone(),
-        None => snapshot::place_of(repo, limit, interrupt).map_err(unbuilt)?.common,
+        None => snapshot::place_of(repo, bounds, interrupt).map_err(unbuilt)?.common,
     };
     // git prints the folder with `/`; the line names the file as Windows spells a path.
     let path = PathBuf::from(common.replace('/', "\\")).join("info").join("attributes");
@@ -173,12 +179,12 @@ const ATTRIBUTES_MOST: u64 = 1024 * 1024;
 /// Whether the repo at the worktree `root` uses LFS at all: a `.gitattributes` file git tracks there, at any depth (`git
 /// ls-files`), names the LFS filter as it is on disk ([`names_lfs_filter`]). Else the interrupt, or why git could not
 /// list them.
-pub(crate) fn tracks_lfs_filter(root: &Path, limit: Duration, interrupt: Option<Interrupt>) -> Result<bool, GitError> {
+pub(crate) fn tracks_lfs_filter(root: &Path, bounds: GitBounds, interrupt: Option<Interrupt>) -> Result<bool, GitError> {
     let git = Git::find(root).map_err(GitError::Failed)?;
     let args = ["ls-files", "-z", "--", ":(glob)**/.gitattributes"];
     let call = Call {
         interrupt,
-        ..Call::plain(root, &args, limit)
+        ..Call::bounded(root, &args, bounds)
     };
     let listing = git.output_bytes_within(&call, OUTPUT_CAP)?;
     Ok(String::from_utf8_lossy(&listing)
@@ -481,8 +487,8 @@ pub(crate) fn manifest_digest(objects: &[Object]) -> Result<String, String> {
 /// The folder the repository `repo` keeps its LFS objects in: `objects` below `lfs.storage` when its git config sets
 /// it, relative to its common git folder when relative, else `<common>\lfs\objects`; `<common>` as
 /// [`snapshot::place_of`] finds it. Else the interrupt, or why git failed.
-pub(super) fn objects_folder(repo: Bounded<'_>, limit: Duration, interrupt: Option<Interrupt>) -> Result<PathBuf, Unbuilt> {
-    let place = snapshot::place_of(repo, limit, interrupt).map_err(unbuilt)?;
+pub(super) fn objects_folder(repo: Bounded<'_>, bounds: GitBounds, interrupt: Option<Interrupt>) -> Result<PathBuf, Unbuilt> {
+    let place = snapshot::place_of(repo, bounds, interrupt).map_err(unbuilt)?;
     let placed = Bounded { place: Some(&place), ..repo };
     let git = Git::find(repo.root).map_err(Unbuilt::Failed)?;
     let set = placed.variables();
@@ -491,7 +497,7 @@ pub(super) fn objects_folder(repo: Bounded<'_>, limit: Duration, interrupt: Opti
     let call = Call {
         set: &set,
         interrupt,
-        ..Call::plain(repo.root, &args, limit)
+        ..Call::bounded(repo.root, &args, bounds)
     };
     let failed = |why: String| Unbuilt::Failed(format!("git config --get lfs.storage failed: {why}"));
     let (ran, errors) = git.run_kept(&call).map_err(unbuilt)?;
@@ -733,7 +739,7 @@ fn sent_to(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, send
         ceiling: root.parent().unwrap_or(root),
         place: None,
     };
-    let objects = objects_folder(alone, attempt.limit, attempt.call.interrupt).map_err(unsent)?;
+    let objects = objects_folder(alone, attempt.git, attempt.call.interrupt).map_err(unsent)?;
     let path = folder.join(format!("{}-{nonce}.lfs.tar.zst", attempt.call.key));
     let archive = tmp_file(root, &path, "the LFS archive").map_err(Unsent::Refused)?;
     let compressed = packed(&archive, &objects, &needed, &|| attempt.go_on().is_ok()).map_err(unsent)?;
@@ -847,7 +853,7 @@ mod tests {
         assert_eq!(set, [("GIT_ATTR_NOSYSTEM", std::ffi::OsStr::new("1"))]);
     }
     use crate::outputs::hash::sha256_of;
-    use crate::remote::git::GIT_LIMIT;
+    use crate::remote::git::GIT_BOUNDS;
     use crate::remote::outputs::Unbuilt;
     use crate::remote::snapshot::Bounded;
     use gate_router::escaped;
@@ -909,7 +915,7 @@ mod tests {
     }
 
     fn list(root: &Path, ceiling: &Path) -> Listed {
-        listed(bounded(root, ceiling), "HEAD", GIT_LIMIT, None).expect("the pointers are listed")
+        listed(bounded(root, ceiling), "HEAD", GIT_BOUNDS, None).expect("the pointers are listed")
     }
 
     fn sha(bytes: &[u8]) -> String {
@@ -927,7 +933,7 @@ mod tests {
 
     /// Packs every object of `listed`, read from the objects folder of `root`, into a new archive in `folder`.
     fn pack_all(folder: &Path, root: &Path, listed: &Listed) -> Result<u64, Unbuilt> {
-        let objects = objects_folder(bounded(root, folder), GIT_LIMIT, None).expect("the objects folder is found");
+        let objects = objects_folder(bounded(root, folder), GIT_BOUNDS, None).expect("the objects folder is found");
         let path = folder.join("objects.tar.zst");
         // A previous pack of the same test may have left it.
         let _ = fs::remove_file(&path);
@@ -1138,7 +1144,7 @@ mod tests {
         put(&root, "a.bin", b"gone");
         commit(&root);
         let listed = list(&root, &folder);
-        let objects = objects_folder(bounded(&root, &folder), GIT_LIMIT, None).expect("the objects folder is found");
+        let objects = objects_folder(bounded(&root, &folder), GIT_BOUNDS, None).expect("the objects folder is found");
         fs::remove_file(object_path(&objects, &sha(b"gone"))).expect("the object can be removed");
 
         let why = failure(pack_all(&folder, &root, &listed));
@@ -1155,7 +1161,7 @@ mod tests {
         put(&root, "a.bin", b"true");
         commit(&root);
         let listed = list(&root, &folder);
-        let objects = objects_folder(bounded(&root, &folder), GIT_LIMIT, None).expect("the objects folder is found");
+        let objects = objects_folder(bounded(&root, &folder), GIT_BOUNDS, None).expect("the objects folder is found");
         fs::write(object_path(&objects, &sha(b"true")), b"lies").expect("the object can be rewritten at its size");
 
         let why = failure(pack_all(&folder, &root, &listed));
@@ -1177,7 +1183,7 @@ mod tests {
         commit(&root);
         let listed = list(&root, &folder);
 
-        let objects = objects_folder(bounded(&root, &folder), GIT_LIMIT, None).expect("the objects folder is found");
+        let objects = objects_folder(bounded(&root, &folder), GIT_BOUNDS, None).expect("the objects folder is found");
 
         let expected = root.join(r".git\lfs-store\objects");
         assert_eq!(
@@ -1199,7 +1205,7 @@ mod tests {
         repo(&root);
         git(&root, &["config", "lfs.storage", "~/gate-lfs-store"]);
 
-        let objects = objects_folder(bounded(&root, &folder), GIT_LIMIT, None).expect("the objects folder is found");
+        let objects = objects_folder(bounded(&root, &folder), GIT_BOUNDS, None).expect("the objects folder is found");
 
         assert!(objects.is_absolute(), "{}", objects.display());
         assert!(!objects.to_string_lossy().contains('~'), "{}", objects.display());
@@ -1219,7 +1225,7 @@ mod tests {
         );
         let listed = list(&other, &folder);
 
-        let objects = objects_folder(bounded(&other, &folder), GIT_LIMIT, None).expect("the objects folder is found");
+        let objects = objects_folder(bounded(&other, &folder), GIT_BOUNDS, None).expect("the objects folder is found");
 
         assert_eq!(
             fs::canonicalize(&objects).expect("the folder is there"),

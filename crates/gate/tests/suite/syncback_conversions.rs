@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 use gate_router::repo_name;
 use serde_json::json;
 
+use crate::remote_client::GIT_HANG_GUARDS;
 use crate::support::{
     Case, GATE, GIT_REDIRECTS, Outcome, allow_breakaway, copy_tool, events, finish, git, git_init, heavy_words, shown, write_remote_json,
 };
@@ -73,9 +74,8 @@ fn conversion_gate(case: &Case, extra: &[&str], command: &[&str]) -> Command {
         FAKE_SSH,
         "--test-remote-retry-pause-ms",
         "1",
-        "--test-git-limit-ms",
-        "3600000",
     ];
+    seams.extend(GIT_HANG_GUARDS);
     seams.extend_from_slice(extra);
     let mut words = heavy_words("out.log", &seams, command);
     assert_eq!(words[3], "--timeout", "the ceiling's value follows it");

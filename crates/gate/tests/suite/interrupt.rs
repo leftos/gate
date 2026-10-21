@@ -8,7 +8,8 @@ use gate_state::v1::ticket_path;
 use serde_json::Value;
 
 use crate::support::{
-    Case, Escapee, FAKE_TOOL, assert_in_order, events, release, run_words, said_pid, shown, wait_for_journal_line, wait_until, write_counts,
+    Case, Escapee, FAKE_TOOL, UNTIL_KILLED, assert_in_order, events, release, run_words, said_pid, shown, wait_for_journal_line, wait_until,
+    write_counts,
 };
 
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
@@ -20,7 +21,7 @@ fn a_command_still_running_5_s_after_a_ctrl_c_has_its_job_terminated() {
     let seams = ["--test-sample-ms", "100", "--test-interrupt-after-samples", "1"];
 
     // The seam raises only the gate's own interrupt: the command never sees a Ctrl+C, so it is still running 5 s later.
-    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "out", "hi", "sleep", "30000"]));
+    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "out", "hi", "sleep", UNTIL_KILLED]));
 
     assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
     assert_in_order(

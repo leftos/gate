@@ -66,7 +66,8 @@ fn snapshot_case(name: &str) -> Case {
 
 /// The words of a routed run logging to `log` that stops after its snapshot, `extra` before `--`.
 fn snapshot_words<'a>(log: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
-    let mut before = vec!["--test-remote-snapshot", "--test-git-limit-ms", "3600000"];
+    let mut before = vec!["--test-remote-snapshot"];
+    before.extend(GIT_HANG_GUARDS);
     before.extend(extra);
     heavy_words(log, &before, &[r".\tool.exe", "out", "hi"])
 }
@@ -273,7 +274,8 @@ fn a_left_over_index_copy_is_replaced() {
     let steps = case.folder().join("holder.steps");
     fs::write(&steps, format!("wait {}", shown(&go))).expect("the holder's steps can be written");
     let steps = shown(&steps);
-    let holder_seams = ["--test-remote-client", &steps, "--test-git-limit-ms", "3600000"];
+    let mut holder_seams = vec!["--test-remote-client", steps.as_str()];
+    holder_seams.extend(GIT_HANG_GUARDS);
     let holder = case.start(&heavy_words("holder.log", &holder_seams, &[r".\tool.exe", "out", "hi"]));
     wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, holder.id()));
     let waiter = case.start(&snapshot_words("waiter.log", &["--test-remote-wait-ms", "3600000"]));
@@ -460,6 +462,25 @@ fn client_gate_through(case: &Case, kind: &str, log: &str, steps: &Path, command
 /// first call has said anything.
 const CLIENT_STALL: &str = "600";
 
+/// The git seams of a client run: hang guards on each git call and on its readers once git has exited, so a starved
+/// gate is late, never failed.
+pub(crate) const GIT_HANG_GUARDS: [&str; 4] = ["--test-git-limit-ms", "3600000", "--test-git-drain-ms", "600000"];
+
+/// The bound of this PC's `dotnet --list-sdks` read, for a case that reads it: a hang guard. Given by the case or its
+/// helper, never by [`client_gate_tuned`], since a case about the bound gives its own and the seam is refused given
+/// twice.
+const PC_SDKS_ANSWERING: [&str; 2] = ["--test-dotnet-limit-ms", "3600000"];
+
+/// [`client_gate`] for a case whose tree is a .NET one with no SDK pin, so the run reads this PC's SDK list: with
+/// [`PC_SDKS_ANSWERING`].
+fn dotnet_gate(case: &Case, log: &str, steps: &Path, command: &[&str]) -> Command {
+    let tuned = Tuned {
+        extra: &PC_SDKS_ANSWERING,
+        ..Tuned::default()
+    };
+    client_gate_tuned(case, log, steps, &tuned, command)
+}
+
 /// What a case changes in the words of a client run: the transport's form, the ceiling, the stall window, and more
 /// options before the command.
 pub(super) struct Tuned<'a> {
@@ -470,6 +491,8 @@ pub(super) struct Tuned<'a> {
     pub(super) extra: &'a [&'a str],
     /// The stand-in `--test-remote-ssh` names, [`FAKE_SSH`] when none.
     pub(super) ssh: Option<&'a str>,
+    /// The builder's preflight seams, [`ANSWERING`] unless the case is about a probe's bound or the SDKs it lists.
+    pub(super) preflight_seams: &'a str,
 }
 
 impl Default for Tuned<'_> {
@@ -480,6 +503,7 @@ impl Default for Tuned<'_> {
             stall: CLIENT_STALL,
             extra: &[],
             ssh: None,
+            preflight_seams: ANSWERING,
         }
     }
 }
@@ -495,11 +519,10 @@ pub(super) fn client_gate_tuned(case: &Case, log: &str, steps: &Path, tuned: &Tu
         ssh,
         "--test-remote-retry-pause-ms",
         "1",
-        "--test-git-limit-ms",
-        "3600000",
         "--stall",
         tuned.stall,
     ];
+    seams.extend(GIT_HANG_GUARDS);
     seams.extend(tuned.extra);
     let mut words = heavy_words(log, &seams, command);
     assert_eq!(words[3], "--timeout", "the ceiling's value follows it");
@@ -507,6 +530,7 @@ pub(super) fn client_gate_tuned(case: &Case, log: &str, steps: &Path, tuned: &Tu
     let mut gate = case.gate(&words);
     gate.env(STEPS_VARIABLE, steps)
         .env(GATE_VARIABLE, GATE)
+        .env(PREFLIGHT_SEAMS_VARIABLE, tuned.preflight_seams)
         .env(crate::support::ROOT_WALK_STOP_VARIABLE, case.folder());
     gate
 }
@@ -2281,7 +2305,7 @@ fn a_pair_needing_the_pcs_major(case: &Case, sibling: &Path, name: &str, path: &
     fs::create_dir_all(sibling.join("src")).expect("the sibling's src folder can be made");
     fs::write(sibling.join("src").join("Lib.csproj"), "<Project />\n").expect("the sibling's project can be written");
     let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
-    let mut gate = client_gate(case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]);
+    let mut gate = dotnet_gate(case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]);
     gate.env("PATH", path);
 
     let (pid, outcome) = finish_with_pid(gate);
@@ -2568,7 +2592,7 @@ fn a_dotnet_in_the_repo_root_is_not_run_for_the_sdk_list() {
     );
     let dotnet = box_path_with_pc_dotnet(&case, &["8.0.404"], "echo 999.0.100 [C:\\stub]\r\n");
 
-    a_parity_refusal(&case, &[], "a .NET 999 SDK", Some(&dotnet.path));
+    a_parity_refusal(&case, &PC_SDKS_ANSWERING, "a .NET 999 SDK", Some(&dotnet.path));
 
     assert!(!marker.exists(), "the repo root's dotnet.cmd ran");
 }
@@ -2623,7 +2647,7 @@ fn a_dotnet_on_path_inside_the_worktree_is_not_run_for_the_sdk_list() {
     let later = pc_dotnet(&case, "echo 999.0.100 [C:\\stub]\r\n");
     let path = std::env::join_paths(std::iter::once(inside).chain(std::env::split_paths(&later.path))).expect("the folders join into a PATH");
 
-    a_parity_refusal(&case, &[], "a .NET 999 SDK", Some(&path));
+    a_parity_refusal(&case, &PC_SDKS_ANSWERING, "a .NET 999 SDK", Some(&path));
 
     let ran = fs::read_to_string(&marker).expect("the builder ran the dotnet.cmd inside the worktree");
     assert_eq!(
@@ -2651,7 +2675,7 @@ fn a_junction_on_path_into_the_worktree_is_not_run_for_the_sdk_list() {
     let folders = std::iter::once(junction.0.clone()).chain(std::env::split_paths(&later.path));
     let path = std::env::join_paths(folders).expect("the folders join into a PATH");
 
-    a_parity_refusal(&case, &[], "a .NET 999 SDK", Some(&path));
+    a_parity_refusal(&case, &PC_SDKS_ANSWERING, "a .NET 999 SDK", Some(&path));
 
     let ran = fs::read_to_string(&marker).expect("the builder ran the dotnet.cmd behind the junction");
     assert_eq!(
@@ -2847,7 +2871,7 @@ fn the_pcs_dotnet_runs_in_the_system_folder() {
     let folders = case.folder().join("ssh").join("dotnet-folders");
     let body = format!(">>\"{}\" echo %CD%\r\n{}", folders.display(), listing(&["999.0.100"]));
     let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
-    let mut gate = client_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", RAN, "out", "ran there"]);
+    let mut gate = dotnet_gate(&case, "out.log", &steps, &[r".\tool.exe", "mark", RAN, "out", "ran there"]);
     let dotnet = pc_dotnet(&case, &body);
     gate.env("PATH", &dotnet.path);
 
@@ -2984,8 +3008,8 @@ fn a_toolchain_refusal(case: &Case, box_path: &OsString, said: &[String], godot:
 /// [`a_toolchain_refusal`] with the builder's install roots set by `roots` on the gate's command.
 fn a_toolchain_refusal_with(case: &Case, box_path: &OsString, said: &[String], roots: impl FnOnce(&mut Command)) -> Outcome {
     let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
-    let mut gate = client_gate(case, "out.log", &steps, &[r".\tool.exe", "mark", RAN, "out", "ran"]);
-    gate.env("PATH", box_path).env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING);
+    let mut gate = dotnet_gate(case, "out.log", &steps, &[r".\tool.exe", "mark", RAN, "out", "ran"]);
+    gate.env("PATH", box_path);
     roots(&mut gate);
 
     let (pid, outcome) = finish_with_pid(gate);
@@ -3010,8 +3034,13 @@ fn a_toolchain_refusal_with(case: &Case, box_path: &OsString, said: &[String], r
 /// command once, on the builder.
 fn a_toolchain_served(case: &Case, box_path: &OsString, seams: &str, godot: Option<&Path>) -> Outcome {
     let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
-    let mut gate = client_gate(case, "out.log", &steps, &[r".\tool.exe", "mark", RAN, "out", "ran there"]);
-    gate.env("PATH", box_path).env(PREFLIGHT_SEAMS_VARIABLE, seams);
+    let tuned = Tuned {
+        extra: &PC_SDKS_ANSWERING,
+        preflight_seams: seams,
+        ..Tuned::default()
+    };
+    let mut gate = client_gate_tuned(case, "out.log", &steps, &tuned, &[r".\tool.exe", "mark", RAN, "out", "ran there"]);
+    gate.env("PATH", box_path);
     set_godot_root(&mut gate, godot);
 
     let (pid, outcome) = finish_with_pid(gate);
@@ -3412,9 +3441,14 @@ fn a_routed_unreal_run_of(case: &Case, root: &Path, words: &[&str], inherited: O
     write_remote_json(case, &routing.to_string());
     let box_path = box_path_with_tools(case, &listing(&[BUILDER_SDK]), &[], &[]);
     let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
-    let mut gate = client_gate(case, "out.log", &steps, words);
     let key = netfx_present(case);
-    gate.env("PATH", box_path).env(PREFLIGHT_SEAMS_VARIABLE, netfx_seams(&key));
+    let seams = netfx_seams(&key);
+    let tuned = Tuned {
+        preflight_seams: &seams,
+        ..Tuned::default()
+    };
+    let mut gate = client_gate_tuned(case, "out.log", &steps, &tuned, words);
+    gate.env("PATH", box_path);
     match inherited {
         Some(value) => gate.env("UE_ROOT", value),
         None => gate.env_remove("UE_ROOT"),
@@ -7451,10 +7485,8 @@ fn a_routed_godot_run(case: &Case, root: &Path, command: &[&str]) -> Outcome {
     let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
     let mut words = command.to_vec();
     words.extend(["mark", RAN]);
-    let mut gate = client_gate(case, "out.log", &steps, &words);
-    gate.env("PATH", box_path)
-        .env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING)
-        .env_remove("GODOT_PATH");
+    let mut gate = dotnet_gate(case, "out.log", &steps, &words);
+    gate.env("PATH", box_path).env_remove("GODOT_PATH");
     set_godot_root(&mut gate, Some(root));
 
     let (pid, outcome) = finish_with_pid(gate);
@@ -7537,10 +7569,8 @@ fn a_godot_run_of_a_repo_pinning_several_godot_versions_falls_back_saying_why() 
     local_path.push(";");
     local_path.push(&box_path);
     let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
-    let mut gate = client_gate(&case, "out.log", &steps, &["Godot_console.exe", "--version", "mark", RAN]);
-    gate.env("PATH", &local_path)
-        .env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING)
-        .env_remove("GODOT_PATH");
+    let mut gate = dotnet_gate(&case, "out.log", &steps, &["Godot_console.exe", "--version", "mark", RAN]);
+    gate.env("PATH", &local_path).env_remove("GODOT_PATH");
     set_godot_root(&mut gate, Some(&root));
 
     let (pid, outcome) = finish_with_pid(gate);
@@ -7568,10 +7598,8 @@ fn a_godot_run_refused_saying_why(case: &Case, root: &Path, local: &Path, why: &
     local_path.push(";");
     local_path.push(&box_path);
     let steps = ssh_steps(case, "ssh", &["ok", "ok"]);
-    let mut gate = client_gate(case, "out.log", &steps, &["Godot_console.exe", "--version", "mark", RAN]);
-    gate.env("PATH", &local_path)
-        .env(PREFLIGHT_SEAMS_VARIABLE, ANSWERING)
-        .env_remove("GODOT_PATH");
+    let mut gate = dotnet_gate(case, "out.log", &steps, &["Godot_console.exe", "--version", "mark", RAN]);
+    gate.env("PATH", &local_path).env_remove("GODOT_PATH");
     set_godot_root(&mut gate, Some(root));
 
     let (pid, outcome) = finish_with_pid(gate);
@@ -7801,7 +7829,7 @@ fn a_sent_build_lands_and_the_builder_keeps_no_build() {
     let case = sent_build_case("client-sent-build-lands", None);
     let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
 
-    let outcome = finish(client_gate(&case, "out.log", &steps, &SENT_TEST));
+    let outcome = finish(dotnet_gate(&case, "out.log", &steps, &SENT_TEST));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(
@@ -7829,7 +7857,7 @@ fn a_send_the_box_fails_takes_the_drop_with_its_line() {
     let case = sent_build_case("client-sent-build-fails", None);
     let steps = ssh_steps(&case, "ssh", &["ok", "say-exit 1 gate: remote inputs diff failed: not today", "ok"]);
 
-    let outcome = finish(client_gate(&case, "out.log", &steps, &SENT_TEST));
+    let outcome = finish(dotnet_gate(&case, "out.log", &steps, &SENT_TEST));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight", "inputs", "run"], "the send's diff, then the run");
@@ -7851,7 +7879,7 @@ fn a_run_the_box_refuses_for_its_sent_build_runs_again_with_the_drop() {
     let case = sent_build_case("client-sent-build-refused", None);
     let go = Go(case.folder().join("ssh").join("go"));
     let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", &format!("hold {}", shown(go.path())), "ok"]);
-    let running = start(client_gate(&case, "out.log", &steps, &SENT_TEST));
+    let running = start(dotnet_gate(&case, "out.log", &steps, &SENT_TEST));
     running.wait_until("the run call", || calls(&steps).len() == 4);
     fs::remove_file(work_folder(&case).join(SENT_DLL)).expect("the sent file can be removed");
     drop(go);
@@ -7878,7 +7906,7 @@ fn a_restore_file_missing_on_the_pc_sends_nothing_and_takes_the_drop() {
     let case = sent_build_case("client-sent-build-no-restore", Some("App.csproj.nuget.g.targets"));
     let steps = ssh_steps(&case, "ssh", &["ok"; 2]);
 
-    let outcome = finish(client_gate(&case, "out.log", &steps, &SENT_TEST));
+    let outcome = finish(dotnet_gate(&case, "out.log", &steps, &SENT_TEST));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight", "run"], "no inputs call");
@@ -7898,7 +7926,7 @@ fn a_repo_send_build_does_not_list_takes_the_drop_with_today_s_line() {
     sent_routing(&case, false);
     let steps = ssh_steps(&case, "ssh", &["ok"; 2]);
 
-    let outcome = finish(client_gate(&case, "out.log", &steps, &SENT_TEST));
+    let outcome = finish(dotnet_gate(&case, "out.log", &steps, &SENT_TEST));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight", "run"], "no inputs call");
@@ -7918,7 +7946,7 @@ fn a_standing_nothing_back_record_of_the_run_s_configuration_takes_the_drop_and_
         plant_record(&case, record);
         let steps = ssh_steps(&case, "ssh", &["ok"; 2]);
 
-        let outcome = finish(client_gate(&case, "out.log", &steps, &SENT_TEST));
+        let outcome = finish(dotnet_gate(&case, "out.log", &steps, &SENT_TEST));
 
         assert_eq!(outcome.code, Some(0), "{name}: {outcome:?}");
         assert_eq!(calls(&steps), ["preflight", "run"], "{name}: nothing sent");
@@ -7934,7 +7962,7 @@ fn a_standing_nothing_back_record_of_another_configuration_still_sends() {
     plant_record(&case, r#"{"v":1,"host":"builder","configuration":"Debug"}"#);
     let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
 
-    let outcome = finish(client_gate(&case, "out.log", &steps, &SENT_TEST));
+    let outcome = finish(dotnet_gate(&case, "out.log", &steps, &SENT_TEST));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run"], "{outcome:?}");
@@ -7950,11 +7978,11 @@ fn a_busy_fallback_of_a_send_keeps_no_build_and_says_no_dropped_line() {
     write(&case, r"obj\project.assets.json", "{}\n");
     let go = Go(case.folder().join("ssh").join("go"));
     let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
-    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    let first = start(dotnet_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
     first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
     let tuned = Tuned {
-        extra: &["--test-key-wait-ms", "100"],
+        extra: &["--test-key-wait-ms", "100", "--test-dotnet-limit-ms", "3600000"],
         ..Tuned::default()
     };
 
@@ -7981,11 +8009,11 @@ fn a_busy_fallback_of_a_send_with_a_record_drops_no_build_and_says_the_local_lin
     plant_record(&case, r#"{"v":1,"host":"builder","configuration":"release"}"#);
     let go = Go(case.folder().join("ssh").join("go"));
     let first_steps = ssh_steps(&case, "first", &["ok", &format!("hold {}", shown(go.path()))]);
-    let first = start(client_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
+    let first = start(dotnet_gate(&case, "first.log", &first_steps, &[r".\tool.exe", "out", "ran there"]));
     first.wait_until("the first run's run call", || calls(&first_steps).len() == 2);
     let second_steps = ssh_steps(&case, "second", &["ok", "ok"]);
     let tuned = Tuned {
-        extra: &["--test-key-wait-ms", "100"],
+        extra: &["--test-key-wait-ms", "100", "--test-dotnet-limit-ms", "3600000"],
         ..Tuned::default()
     };
 

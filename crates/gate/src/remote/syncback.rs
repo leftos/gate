@@ -641,7 +641,7 @@ struct Back<'a> {
 fn has_back(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, remote: &Remote<'_>) -> Result<Option<String>, End> {
     let ls_remote = Network {
         verb: "ls-remote",
-        watch: Watch::Deadline(attempt.deadline_for("ls-remote", attempt.limit)),
+        watch: Watch::Deadline(attempt.deadline_for("ls-remote", attempt.git.limit)),
         set: &[],
     };
     let called = to_the_builder(attempt, worktree, remote, &ls_remote, &remote.args(&["ls-remote"]))?;
@@ -1191,7 +1191,7 @@ fn written_size(
         interrupt: attempt.call.interrupt,
         stdin: Some(ids.as_bytes()),
         set,
-        ..git::Call::plain(worktree.root(), &args, attempt.limit)
+        ..git::Call::bounded(worktree.root(), &args, attempt.git)
     };
     let answer = worktree.git.output(&call).map_err(escaped_end)?;
     total(&answer, &blobs, weights).map_err(|why| unreadable(worktree.target, &args, &why))
@@ -1290,7 +1290,7 @@ fn attributes(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, paths: &[&str]
         let call = git::Call {
             interrupt: attempt.call.interrupt,
             stdin: Some(fed.as_bytes()),
-            ..git::Call::plain(worktree.root(), &args, attempt.limit)
+            ..git::Call::bounded(worktree.root(), &args, attempt.git)
         };
         let answer = worktree.git.output(&call).map_err(escaped_end)?;
         read.extend(read_attributes(&answer, slice).map_err(|why| unreadable(worktree.target, &args, &why))?);
@@ -1634,7 +1634,7 @@ fn see_diff(snapshot: &str, back: &str) -> String {
 /// Whether the worktree no longer matches the snapshot: the tree `git add -A` would write for it now is not the
 /// snapshot's own.
 fn changed(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>) -> Result<bool, End> {
-    let now = snapshot::worktree(worktree.root(), attempt.limit, attempt.call.interrupt).map_err(escaped_end)?;
+    let now = snapshot::worktree(worktree.root(), attempt.git, attempt.call.interrupt).map_err(escaped_end)?;
     let then = line(attempt, worktree, &["rev-parse", &format!("{}^{{tree}}", worktree.snapshot())], &[])?;
     Ok(now != then)
 }
@@ -1643,7 +1643,7 @@ fn changed(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>) -> Result<bool, E
 /// escaped.
 fn keep(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, back: &str) -> Result<(), String> {
     let args = ["update-ref", worktree.target.kept.as_str(), back];
-    let call = git::Call::locked(worktree.root(), &args, attempt.limit);
+    let call = git::Call::locked(worktree.root(), &args, attempt.git);
     worktree.git.output(&call).map(drop).map_err(|error| escaped(&String::from(error)))
 }
 
@@ -1722,7 +1722,7 @@ fn git_call(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, args: &[&str], s
     let call = git::Call {
         interrupt: attempt.call.interrupt,
         set,
-        ..git::Call::plain(worktree.root(), args, attempt.limit)
+        ..git::Call::bounded(worktree.root(), args, attempt.git)
     };
     worktree.git.output(&call).map_err(escaped_end)
 }
@@ -1730,7 +1730,7 @@ fn git_call(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, args: &[&str], s
 /// Runs git with `args` in the worktree as [`git_call`] does, but as a [`git::Call::locked`] call, which no Ctrl+C
 /// ends while it holds a lock in the git folder.
 fn locked_call(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, args: &[&str]) -> Result<String, End> {
-    let call = git::Call::locked(worktree.root(), args, attempt.limit);
+    let call = git::Call::locked(worktree.root(), args, attempt.git);
     worktree.git.output(&call).map_err(escaped_end)
 }
 
@@ -2180,7 +2180,7 @@ mod tests {
         let transport = Local::new(r"local:C:\gate-sync-back-tests", None).expect("a local transport");
         let mut attempt = Attempt::for_tests(&call, &transport);
         let git = Git::find(&folder).expect("git is found");
-        git.output(&git::Call::plain(&folder, &["init", "--quiet"], git::GIT_LIMIT))
+        git.output(&git::Call::bounded(&folder, &["init", "--quiet"], git::GIT_BOUNDS))
             .expect("the test's folder is made a repository");
         let objects = folder.join(".git").join("objects");
         let quarantine = Quarantine::made(&objects, &incoming_name(std::process::id(), 1, NONCE)).expect("the quarantine is made");
@@ -2867,7 +2867,7 @@ mod tests {
         let git = Git::find(root).expect("git is found");
         git.output(&git::Call {
             set,
-            ..git::Call::plain(root, args, git::GIT_LIMIT)
+            ..git::Call::bounded(root, args, git::GIT_BOUNDS)
         })
     }
 
