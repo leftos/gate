@@ -2,6 +2,7 @@
 //! cover it, rewritten on every pass of that wait and gone once the wait ends.
 
 use std::fs::{self, File};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -48,8 +49,9 @@ const CANNOT_READ: &str = "gate: could not read the pause markers in ";
 /// The seams of a gate whose hung command its watchdog stalls within one case: a 1.5 s stall window, sampled every
 /// 100 ms.
 const HUNG_WATCH: [&str; 6] = ["--test-poll-ms", "20", "--test-stall-ms", "1500", "--test-sample-ms", "100"];
-/// The wall and load-adjusted seconds of a passed line, as a gate that ran its command here says it.
-const PASSED: &str = r"gate: passed in (\d+) s \(load-adjusted (\d+) s";
+/// The start of a passed line, up to its whole wall seconds and the `(` of its load note: the one spelling of the line
+/// every reader below builds its pattern on.
+const PASSED_WALL: &str = r"gate: passed in (\d+) s \(";
 /// The seams of a nested gate whose own watchdog stalls its hung command within one case: a 15 s stall window, three
 /// of the [`PARENT_WATCH`] windows of the gate above it, with the default 5 s sampling and a slow poll, so its own
 /// watching costs too little CPU to hold the parent's window open by itself.
@@ -132,11 +134,32 @@ fn wait_for_child_stderr(case: &Case, log: &str, needle: &str) {
     wait_until(&format!("{needle:?} on the child's stderr"), || child_stderr(case, log).contains(needle));
 }
 
-/// The wall and load-adjusted whole seconds of the last passed line in `text`: a gate's own line comes after the tail
-/// of its log, which can hold the passed line of a gate under it.
+/// Waits on the parent gate's own `wait_until`, and on a failed wait says what the child under it said by then, so a red
+/// run shows how far the child got.
+#[expect(clippy::panic, reason = "a wait that failed fails the case again, with what the child said beside it")]
+fn wait_showing_child(parent: &Running, case: &Case, log: &str, what: &str, check: impl FnMut() -> bool) {
+    let Err(payload) = catch_unwind(AssertUnwindSafe(|| parent.wait_until(what, check))) else {
+        return;
+    };
+    let message = payload.downcast_ref::<String>().map_or("the wait failed", String::as_str);
+    panic!("{message}\nwhat the child said by then:\n{}", child_stderr(case, log));
+}
+
+/// The gate's own passed line in `text`, the last whole line that starts with [`PASSED_WALL`]: a gate says its passed
+/// line last, so a passed line printed in the tail of its log cannot stand in for it, and a line that stops matching the
+/// format fails the reader's own `expect` rather than reading a line under it.
+fn passed_line(text: &str) -> &str {
+    let pattern = Regex::new(&format!(r"(?m)^{PASSED_WALL}")).expect("the pattern is valid");
+    let start = pattern.find_iter(text).last().expect("a passed line of the gate's own").start();
+    let line = &text[start..];
+    &line[..line.find('\n').unwrap_or(line.len())]
+}
+
+/// The wall and load-adjusted whole seconds of the gate's own passed line in `text`, which comes after the tail of its
+/// log, a tail that can hold the passed line of a gate under it.
 fn passed_seconds(text: &str) -> (u64, u64) {
-    let pattern = Regex::new(PASSED).expect("the pattern is valid");
-    let last = pattern.captures_iter(text).last().expect("a passed line with its load-adjusted seconds");
+    let pattern = Regex::new(&format!("{PASSED_WALL}load-adjusted (\\d+) s")).expect("the pattern is valid");
+    let last = pattern.captures(passed_line(text)).expect("a passed line with its load-adjusted seconds");
     let seconds = |index: usize| -> u64 {
         last.get(index)
             .and_then(|found| found.as_str().parse().ok())
@@ -145,10 +168,21 @@ fn passed_seconds(text: &str) -> (u64, u64) {
     (seconds(1), seconds(2))
 }
 
+/// The whole wall seconds of the gate's own passed line in `text`, whatever its load note says: a gate whose sampler
+/// failed says its load-adjusted seconds are unknown.
+fn passed_wall(text: &str) -> u64 {
+    let pattern = Regex::new(PASSED_WALL).expect("the pattern is valid");
+    pattern
+        .captures(passed_line(text))
+        .and_then(|found| found[1].parse().ok())
+        .expect("a passed line's whole wall seconds")
+}
+
 /// Asserts that the gate whose own passed line ends `text` left most of its run out of its load-adjusted clock, as the
 /// time a gate under it waited behind a critical request is. Load only lowers the load-adjusted seconds, so this is red
-/// only on a mostly idle machine, where an unpaused run's clock keeps up with its wall time; the STALLED kill is the
-/// case's primary red signal.
+/// only on a mostly idle machine, where an unpaused run's clock keeps up with its wall time. Any live nested gate in the
+/// job is stall progress, so a parent whose child waits is not STALLED: this and [`assert_release_less_paused`] are the
+/// case's red signals.
 fn assert_wait_left_out(text: &str) {
     let (wall, adjusted) = passed_seconds(text);
     assert!(
@@ -159,12 +193,14 @@ fn assert_wait_left_out(text: &str) {
 
 /// Asserts that the release line `case`'s journal holds for the gate `pid`, whose own passed line ends `text`, left out of
 /// its `wallSeconds` at least half of `waited`: the stretch the case itself saw the child wait behind the critical
-/// request, from its pause marker seen to its second still-waiting line, with the critical gate holding throughout. The
-/// parent counts paused time sample by sample, so each edge of the pause can lose at most one sample interval; the
-/// gates' start-up and the child's take and exit after the release, which load stretches without bound, are never
-/// compared. The passed line's whole seconds round the wall time half to even, so the wall is taken half a second short.
+/// request, from the pause marker it saw to the still-waiting line it names, with the critical gate holding throughout.
+/// A parent starved across an edge of that stretch books the whole stretch as unpaused, since `Watch::wall_only` counts
+/// a stretch as paused only when its sample saw the pause (`gate-watchdog`'s `watch.rs`), which the half of `waited`
+/// this asks for leaves room for; the gates' start-up and the child's take and exit after the release, which load
+/// stretches without bound, are never compared. The passed line's whole seconds round the wall time half to even, so the
+/// wall is taken half a second short.
 fn assert_release_less_paused(case: &Case, pid: u32, text: &str, waited: Duration) {
-    let (wall, _) = passed_seconds(text);
+    let wall = passed_wall(text);
     let wall = u32::try_from(wall).map(f64::from).expect("a passed line's wall seconds fit in 32 bits");
     let released = events(case)
         .into_iter()
@@ -371,8 +407,9 @@ fn a_parent_whose_child_waits_behind_a_critical_request_is_not_stalled() {
     let critical_pid = critical.id();
 
     // The critical gate holds the machine, so the parent lends its heavy child nothing on its light slot, and the child
-    // waits behind the critical request and keeps its pause marker. Only that marker tells the parent's watchdog the
-    // wait is progress, since the child's still-waiting line comes every 6 s, longer than the parent's 5 s window.
+    // waits behind the critical request and keeps its pause marker. That marker is not the only stall progress the
+    // parent's watchdog sees: any live nested gate in its job is progress too, though the child's still-waiting line
+    // comes every 6 s, longer than the parent's 5 s window.
     let child = child_gate("child.log", &CHILD_WAIT);
     let mut parent = case.start(&run_words("parent.log", &PARENT_WATCH, &child));
     let parent_pid = parent.id();
@@ -432,7 +469,9 @@ fn a_covered_gate_whose_grandchild_waits_behind_a_critical_request_is_not_stalle
         marker_of(&case, parent_pid, parent_start).is_some_and(|marker| started(marker.pid) == Some(marker.start_ms))
     });
 
-    // As in the case above: the grandchild's second still-waiting line is over two of the covered gate's stall windows.
+    // As in the case above, the grandchild's second still-waiting line gives the case a stretch of its wait to measure.
+    // The live covered gate under this one is stall progress, so this gate cannot be STALLED while the grandchild waits;
+    // the clock assertions are the case's red signal.
     wait_until("the grandchild's still-waiting line said again, or the gates ending", || {
         child_stderr(&case, "covered.log").matches(STILL_WAITING).count() >= 2 || !parent.is_running()
     });
@@ -452,47 +491,47 @@ fn a_covered_gate_whose_grandchild_waits_behind_a_critical_request_is_not_stalle
 }
 
 #[test]
-fn a_parent_whose_sampler_failed_is_not_killed_by_the_backstop_while_its_child_waits() {
-    let case = Case::new("a_parent_whose_sampler_failed_is_not_killed_by_the_backstop_while_its_child_waits");
+fn a_parent_whose_sampler_failed_leaves_its_child_s_paused_wait_out_of_its_wall_time() {
+    let case = Case::new("a_parent_whose_sampler_failed_leaves_its_child_s_paused_wait_out_of_its_wall_time");
     write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":1}"#);
     let (go, critical) = holding_critical(&case);
     let critical_pid = critical.id();
 
-    // With its sampler failed the parent goes by wall time alone, and its backstop is five of its 3 s ceilings: only the
-    // child's pause marker keeps the child's 18 s wait out of the wall time the backstop counts.
+    // With its sampler failed the parent goes by wall time alone: its backstop kills at five ceilings of wall time less
+    // the time it counted paused, the paused time its release leaves out of `wallSeconds`. The ceiling stays far past the
+    // hang guard, so no kill races the child's start-up, which counts as wall time until its first pass writes the
+    // marker; the backstop's arithmetic on the paused time is the watchdog's own unit case.
     let child = child_gate("child.log", &CHILD_WAIT);
-    let mut words = run_words("parent.log", &SAMPLER_FAILS, &child);
-    set_timeout(&mut words, "3");
-    let mut parent = case.start(&words);
+    let parent = case.start(&run_words("parent.log", &SAMPLER_FAILS, &child));
     let parent_pid = parent.id();
-    wait_for_child_stderr(
+    let barrier = format!("gate: waiting for a heavy slot behind the critical request of gate {critical_pid}");
+    wait_showing_child(&parent, &case, "parent.log", &format!("{barrier:?} on the child's stderr"), || {
+        child_stderr(&case, "parent.log").contains(&barrier)
+    });
+    let parent_start = started(parent_pid).expect("the parent gate runs");
+    wait_showing_child(
+        &parent,
         &case,
         "parent.log",
-        &format!("gate: waiting for a heavy slot behind the critical request of gate {critical_pid}"),
+        "the pause marker of the waiting child, naming a child that runs",
+        || marker_of(&case, parent_pid, parent_start).is_some_and(|marker| started(marker.pid) == Some(marker.start_ms)),
     );
-    let parent_start = started(parent_pid).expect("the parent gate runs");
-    wait_until("the pause marker of the waiting child, naming a child that runs", || {
-        marker_of(&case, parent_pid, parent_start).is_some_and(|marker| started(marker.pid) == Some(marker.start_ms))
-    });
+    let marker_seen = Instant::now();
 
-    // The child's third still-waiting line is 18 s into its wait, past the parent's 15 s backstop.
-    wait_until("the child's third still-waiting line, or the parent ending", || {
-        child_stderr(&case, "parent.log").matches(STILL_WAITING).count() >= 3 || !parent.is_running()
+    // The child's third still-waiting line is 18 s into its wait.
+    wait_showing_child(&parent, &case, "parent.log", "the child's third still-waiting line", || {
+        child_stderr(&case, "parent.log").matches(STILL_WAITING).count() >= 3
     });
-    let waited_out = parent.is_running();
+    let waited = marker_seen.elapsed();
 
     let_go(&go);
     let outcome = parent.finish();
-    assert!(waited_out, "the parent gate was killed while its child waited: {outcome:?}");
     assert_passed(&outcome);
     assert!(
         outcome.stderr.contains("gate: sampler failed: "),
         "the parent's sampler failed: {outcome:?}"
     );
-    assert!(
-        !outcome.stderr.contains("BACKSTOP"),
-        "a parent whose child waits behind a critical request is not past its backstop: {outcome:?}"
-    );
+    assert_release_less_paused(&case, parent_pid, &outcome.stdout, waited);
     assert_passed(&critical.finish());
 }
 
