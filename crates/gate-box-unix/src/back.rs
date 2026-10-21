@@ -80,9 +80,11 @@ pub fn back_commit<S: LineSink + 'static>(
 }
 
 /// The work folder's `.git/index` copied to `request`'s `<work>.index` while the work lock `lock` is held: `.git` a
-/// plain folder and `.git/index` a plain file, neither a link; an earlier copy, a plain file, removed, and anything
-/// else at the name refused; the copy made new (`O_CREAT | O_EXCL | O_NOFOLLOW`, mode 0600) and, when the copying
-/// fails partway, removed again. Else why not.
+/// plain folder, not a link; an earlier copy, a plain file, removed, and anything else at the name refused;
+/// `.git/index` opened without following a link and without waiting on a FIFO (`O_NOFOLLOW | O_NONBLOCK`), and the
+/// opened file checked a plain file before it is read, so nothing swapped in at its name can hold the run; the copy
+/// made new (`O_CREAT | O_EXCL | O_NOFOLLOW`, mode 0600) and, when the copying fails partway, removed again. Git's
+/// `add -A` then replaces the copy through `<work>.index.lock`, which leaves it with git's own mode. Else why not.
 fn index_copied<S: LineSink>(request: &Request<'_>, lock: &HeldLock, output: &Output<S>) -> Result<(), BackFailed> {
     let dot_git = Path::new(request.work).join(".git");
     let index = dot_git.join("index");
@@ -94,9 +96,6 @@ fn index_copied<S: LineSink>(request: &Request<'_>, lock: &HeldLock, output: &Ou
     if !files::plain_folder(&dot_git) {
         return Err(not_copied(format!("{} is a link or not a folder", dot_git.display())));
     }
-    if !fs::symlink_metadata(&index).is_ok_and(|metadata| metadata.is_file()) {
-        return Err(not_copied(format!("{} is missing, a link or not a file", index.display())));
-    }
     match fs::symlink_metadata(copy) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Ok(metadata) if metadata.is_file() => removed_if_held(request.index, lock, output),
@@ -105,9 +104,16 @@ fn index_copied<S: LineSink>(request: &Request<'_>, lock: &HeldLock, output: &Ou
     }
     let mut source = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&index)
-        .map_err(|error| not_copied(error.to_string()))?;
+        .map_err(|error| match error.raw_os_error() {
+            Some(libc::ENOENT | libc::ELOOP) => not_copied(format!("{} is missing or a link", index.display())),
+            _ => not_copied(error.to_string()),
+        })?;
+    let metadata = source.metadata().map_err(|error| not_copied(error.to_string()))?;
+    if !metadata.is_file() {
+        return Err(not_copied(format!("{} is not a plain file", index.display())));
+    }
     let mut made: File = OpenOptions::new()
         .write(true)
         .create_new(true)

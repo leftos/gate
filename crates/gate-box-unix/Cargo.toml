@@ -29,6 +29,7 @@ gate-args = { path = "../gate-args" }
 gate-watchdog = { path = "../gate-watchdog" }
 gate-wire = { path = "../gate-wire" }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
+sha2 = "0.11.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.190"

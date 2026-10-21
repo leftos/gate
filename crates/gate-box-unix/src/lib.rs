@@ -34,3 +34,5 @@ pub mod process;
 pub mod run;
 #[cfg(unix)]
 pub mod stop;
+#[cfg(unix)]
+mod tools;

@@ -86,10 +86,20 @@ mod unix {
         /// A commit holding `a.txt`, pushed to the bare repository as `refs/gate/<key>`, the back ref pointed at it as
         /// an earlier run's; its sha.
         fn snapshot(&self) -> String {
+            self.snapshot_holding(&[])
+        }
+
+        /// [`Case::snapshot`], the commit also holding `files`, each a path and its text.
+        fn snapshot_holding(&self, files: &[(&str, &str)]) -> String {
             let source = self.base.join("source");
             let source = source.to_str().expect("the temp folder is UTF-8");
             git(&["init", "-q", source]);
             fs::write(Path::new(source).join("a.txt"), "a\n").expect("the file is written");
+            for (name, text) in files {
+                let path = Path::new(source).join(name);
+                fs::create_dir_all(path.parent().expect("a file has a folder")).expect("the file's folder is made");
+                fs::write(path, text).expect("the file is written");
+            }
             git(&["-C", source, "add", "-A"]);
             git(&[
                 "-C",
@@ -210,10 +220,19 @@ mod unix {
     /// its stdin, and reads it as `reading` says until it ends. Once the start marker and then a heartbeat were read,
     /// `beaten` is made, which a command can wait on.
     fn ran(seams: &[&str], request: &str, reading: Reading, beaten: &Path) -> Ended {
+        ran_in(seams, request, reading, beaten, None)
+    }
+
+    /// [`ran`], the box's `SHELL`, which its login `PATH` is read from, set to `shell` when one is given.
+    fn ran_in(seams: &[&str], request: &str, reading: Reading, beaten: &Path, shell: Option<&Path>) -> Ended {
         let mut words = vec!["box", "--test-heartbeat-ms", "50", "--test-box-sample-ms", "50"];
         words.extend(seams);
         words.extend(["run", "--stdin"]);
-        let mut child: Child = Command::new(env!("CARGO_BIN_EXE_gate-box"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_gate-box"));
+        if let Some(shell) = shell {
+            command.env("SHELL", shell);
+        }
+        let mut child: Child = command
             .args(&words)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -413,5 +432,44 @@ mod unix {
         assert_eq!(case.back(), None, "no back commit for a client gone");
         assert!(!Path::new(&format!("{}.pgid", case.work())).exists(), "no .pgid left");
         assert!(case.lock_free(), "the work lock is free");
+    }
+
+    /// Writes `script` at `path`, runnable.
+    fn runnable(path: &Path, script: &str) {
+        fs::write(path, script).expect("the script is written");
+        fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("the script is made runnable");
+    }
+
+    #[test]
+    fn a_run_with_a_tool_manifest_restores_its_tools_before_the_command() {
+        let case = Case::new("tools");
+        let shims = case.base.join("shims");
+        fs::create_dir_all(&shims).expect("the shim folder is made");
+        let log = case.base.join("dotnet.log");
+        runnable(&shims.join("dotnet"), &format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()));
+        // The login shell the box reads its PATH from puts the shim's folder first, then runs as `sh`.
+        let shell = case.base.join("login-shell");
+        runnable(
+            &shell,
+            &format!(
+                "#!/bin/sh\nPATH='{}':\"$PATH\"\nexport PATH\nshift\nexec /bin/sh \"$@\"\n",
+                shims.display()
+            ),
+        );
+        let commit = case.snapshot_holding(&[(".config/dotnet-tools.json", "{\n  \"version\": 1\n}\n")]);
+        // The command fails unless the restore ran before it.
+        let command = json!(["/bin/sh", "-c", format!("test -s '{}'", log.display())]);
+        let request = case.request(&commit, &json!({ "Command": command }));
+        let ended = ran_in(&[], &request, Reading::All, &case.base.join("beaten"), Some(&shell));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(fs::read_to_string(&log).expect("the shim ran"), "tool restore\n", "one restore");
+        assert!(
+            ended.err.iter().any(|line| line.starts_with("gate: dotnet tool restore took ")),
+            "{:?}",
+            ended.err
+        );
+        assert_eq!(ended.out, [started_line(NONCE)], "{:?}", ended.err);
+        assert!(Path::new(&format!("{}.tools", case.work())).exists(), "the tools record is written");
+        case.ended_clean();
     }
 }

@@ -28,6 +28,7 @@ use crate::lines::{
 use crate::preflight::checked_root;
 use crate::process::{self, GroupRecord};
 use crate::stop::{Record, own_group, record_current, records_folder};
+use crate::tools;
 
 /// The status of a run refused: another run holds the work folder, it could not be laid out, or it asks for what this
 /// builder does not build. Said with a refusal tag and before any start marker, so the PC runs the command itself.
@@ -202,7 +203,8 @@ pub type LoginPath = fn() -> Result<String, String>;
 /// the subfolder placed inside the work folder, else refused with [`USAGE_STATUS`] once the earlier run's back ref is
 /// deleted; the work folder's files checked ([`layout_checked`]) and it laid out ([`laid_out`]), refused `layout` when
 /// it cannot be; the snapshot fetched and checked out ([`checked_out`]); and the subfolder found in it, a folder inside
-/// the work folder once its links are followed, else [`USAGE_STATUS`]. Each git step's process group is recorded in
+/// the work folder once its links are followed, else [`USAGE_STATUS`]; then the repo's dotnet tools restored when a
+/// manifest changed ([`tools::update`]), a restore that fails refused `tools`. Each git step's process group is recorded in
 /// `<work>.pgid` under the run's job while it runs. The heartbeat starts once the subfolder is placed, before the layout
 /// and the checkout, beating every `periods.heartbeat` ([`heartbeat::start`]). The login shell's `PATH` is read from
 /// `login` just before the first git step, after every refusal said before it ([`login_path_read`]). No start marker
@@ -434,6 +436,7 @@ fn prepared<'p, S: LineSink + 'static>(
     if !inside_work(request.work, &place) {
         return Err(said(output, &[&not_inside(request.subfolder)], USAGE_STATUS));
     }
+    tools::update(&request, &place, &lock, login_path.as_deref(), output)?;
     Ok(Ready {
         request,
         lock,
@@ -564,15 +567,24 @@ pub(crate) fn group_record(work: &str) -> String {
     format!("{work}.pgid")
 }
 
-/// Looks at the group record an earlier run of `request`'s work folder left, a box that ended without removing it:
+/// Looks at each group record an earlier run of `request`'s work folder left, its git step's `<work>.pgid` and its tool
+/// restore's `<work>.tools.pgid` ([`earlier_record_cleared`]), a box that ended without removing it:
 /// whatever job it names, a group that is still the one its run made ([`record_current`]) refuses the run
 /// [`NotLaidOut::Busy`], the group never signalled and its git's lock files never swept; a record naming no group a
 /// run makes (malformed, init, or the box's own), or a group that is no longer its run's (no process left, one the box
 /// may not signal, or its id another's since), is removed under the work lock and the run goes on. A record that
 /// cannot be read, a link or a folder at its name, refuses the run `layout`.
 fn earlier_group_cleared(request: &Request<'_>) -> Result<(), NotLaidOut> {
-    let record = group_record(request.work);
-    let (bytes, written) = match files::read_plain_dated(Path::new(&record), files::RECORD_LIMIT) {
+    for record in [group_record(request.work), tools::tools_group_record(request.work)] {
+        earlier_record_cleared(&record)?;
+    }
+    Ok(())
+}
+
+/// [`earlier_group_cleared`] for the one group record `record`: a git step's `<work>.pgid` or a tool restore's
+/// `<work>.tools.pgid`.
+fn earlier_record_cleared(record: &str) -> Result<(), NotLaidOut> {
+    let (bytes, written) = match files::read_plain_dated(Path::new(record), files::RECORD_LIMIT) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(NotLaidOut::Refused(format!("cannot read {record}: {error}"))),
         Ok(read) => read,
@@ -583,7 +595,7 @@ fn earlier_group_cleared(request: &Request<'_>) -> Result<(), NotLaidOut> {
     {
         return Err(NotLaidOut::Busy);
     }
-    removed(&record)
+    removed(record)
 }
 
 /// Removes the lock files a git step the box ended can leave where the work lock covers them, before the run's first
@@ -744,24 +756,26 @@ mod tests {
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
-    use std::sync::{Arc, Mutex, PoisonError};
-    use std::time::{Duration, SystemTime};
+    use std::sync::{Arc, Mutex, PoisonError, mpsc};
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime};
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use gate_wire::{PathForm, Payload, Refusal, busy_line, layout_line, refused_line, started_line};
+    use gate_wire::{PathForm, Payload, Refusal, busy_line, layout_line, refused_line, started_line, tools_line};
     use serde_json::{Value, json};
 
     use gate_watchdog::Pump;
 
     use super::{REFUSED_STATUS, Ready, Watches, place_of, prepare, prepared, run_along};
     use crate::command::{Launch, Sampler, run_command};
-    use crate::console::Forwarding;
+    use crate::console::{Console, Forwarding};
     use crate::console::{LineSink, Output, RecordingSink, Stream};
     use crate::files::{self, Locked, effective_uid, take_lock};
     use crate::git::{GitClass, test_limit, test_program};
     use crate::heartbeat::{self, Periods};
     use crate::lines::command_status;
+    use crate::stop::stop;
 
     const KEY: &str = "repo-0123abcd";
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
@@ -2089,5 +2103,324 @@ mod tests {
             assert_eq!(status, 2, "{line}: {said:?}");
             assert_eq!(said, [line]);
         }
+    }
+
+    /// How long a case waits for a run or a restore it expects to end: a hang guard only.
+    const HANG_GUARD: Duration = Duration::from_secs(120);
+    /// A dotnet tool manifest's text.
+    const MANIFEST: &str = "{\n  \"version\": 1\n}\n";
+    /// Where `dotnet` reads its tool manifest.
+    const MANIFEST_PATH: &str = ".config/dotnet-tools.json";
+
+    thread_local! {
+        /// The login shell's `PATH` [`shim_login`] gives this thread's runs.
+        static SHIM_PATH: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
+
+    /// The login shell's `PATH` this thread's case set ([`Case::dotnet_shim`]).
+    #[expect(clippy::unnecessary_wraps, reason = "a run reads its login PATH through a `LoginPath`, which may fail")]
+    fn shim_login() -> Result<String, String> {
+        Ok(SHIM_PATH.with(|path| path.borrow().clone()))
+    }
+
+    /// Writes `script` at `path`, runnable.
+    fn runnable(path: &Path, script: &str) {
+        fs::write(path, script).expect("the script is written");
+        fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("the script is made runnable");
+    }
+
+    impl Case {
+        /// A `dotnet` in a folder of its own, found first along this thread's login `PATH` ([`shim_login`]), that notes
+        /// the folder it ran in and its words in a log, says a line on stderr, then runs `then`; the log's path.
+        fn dotnet_shim(&self, then: &str) -> PathBuf {
+            let shims = self.base.with_file_name("dotnet-shims");
+            fs::create_dir_all(&shims).expect("the shim folder is made");
+            let log = self.base.with_file_name("dotnet.log");
+            let script = format!(
+                "#!/bin/sh\necho \"$(pwd -P) $*\" >> '{log}'\necho restoring >&2\n{then}\n",
+                log = log.display()
+            );
+            runnable(&shims.join("dotnet"), &script);
+            let path = std::env::var("PATH").unwrap_or_default();
+            SHIM_PATH.with(|cell| *cell.borrow_mut() = format!("{}:{path}", shims.display()));
+            log
+        }
+
+        /// The work folder's tools record, `<work>.tools`.
+        fn tools_record(&self) -> PathBuf {
+            PathBuf::from(format!("{}.tools", self.work()))
+        }
+    }
+
+    /// The restores the dotnet shim noted in `log`, each its folder and words; none when it never ran.
+    fn restores(log: &Path) -> Vec<String> {
+        fs::read_to_string(log)
+            .map(|text| text.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    /// Readies the run of `json` along this thread's login `PATH` ([`shim_login`]); the status, 0 for a run ready for
+    /// its command (its lock let go), and the lines it said, each checked to be on stderr.
+    fn ran_along_shim(json: &Value) -> (u8, Vec<String>) {
+        let payload = decoded(json);
+        let output = Arc::new(Output::new(RecordingSink::default()));
+        let status = prepare(&payload, &output, quiet_periods(), shim_login).map_or_else(|status| status, |_| 0);
+        (status, stderr_of(&output))
+    }
+
+    /// Whether `said` holds the line of a restore's time.
+    fn said_took(said: &[String]) -> bool {
+        said.iter().any(|line| line.starts_with("gate: dotnet tool restore took "))
+    }
+
+    #[test]
+    fn a_tree_with_no_tool_manifest_restores_nothing() {
+        let case = Case::new("tools-none");
+        let log = case.dotnet_shim("exit 0");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let (status, said) = ran_along_shim(&case.json(&commit, &json!({})));
+        assert_eq!(status, 0, "{said:?}");
+        assert!(restores(&log).is_empty(), "no restore ran: {said:?}");
+        assert!(!said_took(&said), "{said:?}");
+        assert!(!case.tools_record().exists(), "no tools record");
+    }
+
+    #[test]
+    fn a_changed_manifest_runs_the_restore_once_and_records_its_hash() {
+        let case = Case::new("tools-changed");
+        let log = case.dotnet_shim("exit 0");
+        let first = case.snapshot(&[(MANIFEST_PATH, MANIFEST)]);
+        let (status, said) = ran_along_shim(&case.json(&first, &json!({})));
+        assert_eq!(status, 0, "{said:?}");
+        let work = fs::canonicalize(case.work()).expect("the work folder is there");
+        assert_eq!(
+            restores(&log),
+            [format!("{} tool restore", work.display())],
+            "one restore in the work folder"
+        );
+        assert!(said_took(&said), "{said:?}");
+        let recorded = fs::read_to_string(case.tools_record()).expect("the tools record is written");
+        assert!(
+            recorded.len() == 64 && recorded.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "a SHA-256 in hex: {recorded:?}"
+        );
+
+        let second = case.snapshot(&[(MANIFEST_PATH, "{\n  \"version\": 2\n}\n")]);
+        let (status, said) = ran_along_shim(&case.json(&second, &json!({})));
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(restores(&log).len(), 2, "one more restore for the changed manifest: {said:?}");
+        let rerecorded = fs::read_to_string(case.tools_record()).expect("the tools record is written");
+        assert_ne!(rerecorded, recorded, "the changed manifest's hash is recorded");
+    }
+
+    #[test]
+    fn an_unchanged_manifest_skips_the_restore() {
+        let case = Case::new("tools-unchanged");
+        let log = case.dotnet_shim("exit 0");
+        let first = case.snapshot(&[(MANIFEST_PATH, MANIFEST)]);
+        let (status, said) = ran_along_shim(&case.json(&first, &json!({})));
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(restores(&log).len(), 1, "the first run restores: {said:?}");
+
+        let second = case.snapshot(&[("b.txt", "b\n")]);
+        let (status, said) = ran_along_shim(&case.json(&second, &json!({})));
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(restores(&log).len(), 1, "no restore for the unchanged manifest: {said:?}");
+        assert!(!said_took(&said), "{said:?}");
+    }
+
+    #[test]
+    fn a_restore_that_fails_refuses_the_run_75_with_the_tools_tag() {
+        let case = Case::new("tools-fails");
+        let log = case.dotnet_shim("exit 3");
+        let commit = case.snapshot(&[(MANIFEST_PATH, MANIFEST)]);
+        let (status, said) = ran_along_shim(&case.json(&commit, &json!({})));
+        assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        assert_eq!(restores(&log).len(), 1, "{said:?}");
+        let failed = said.iter().position(|line| line == "gate: remote tool restore failed (status 3)");
+        assert!(
+            failed.is_some_and(|at| said[at + 1..] == [refused_line(NONCE, Refusal::Tools), tools_line(KEY)]),
+            "the failed line, then the tools tag and line, last: {said:?}"
+        );
+        assert!(!case.tools_record().exists(), "no tools record");
+    }
+
+    #[test]
+    fn a_missing_dotnet_refuses_the_run_75_with_the_tools_tag() {
+        let case = Case::new("tools-missing");
+        let empty = case.base.with_file_name("no-dotnet");
+        fs::create_dir_all(&empty).expect("the empty folder is made");
+        // The git steps run the real git by its path; the login PATH holds no dotnet.
+        test_program::set(&real_git());
+        SHIM_PATH.with(|cell| *cell.borrow_mut() = empty.display().to_string());
+        let commit = case.snapshot(&[(MANIFEST_PATH, MANIFEST)]);
+        let (status, said) = ran_along_shim(&case.json(&commit, &json!({})));
+        assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        let start = said
+            .iter()
+            .position(|line| line.starts_with("gate: remote could not start the dotnet tool restore: "));
+        let after = [
+            "gate: remote tool restore failed (status 1)".to_owned(),
+            refused_line(NONCE, Refusal::Tools),
+            tools_line(KEY),
+        ];
+        assert!(
+            start.is_some_and(|at| said[at + 1..] == after),
+            "the could-not-start line, the failed line, then the tools tag and line, last: {said:?}"
+        );
+        assert!(!case.tools_record().exists(), "no tools record");
+    }
+
+    #[test]
+    fn a_stop_during_the_restore_ends_its_group() {
+        let case = Case::new("tools-stop");
+        let (status, said) = stopped_restore(&case);
+        assert_eq!(status, 1, "{said:?}");
+        assert!(said.iter().any(|line| line == "gate: remote tool restore failed (signal 15)"), "{said:?}");
+    }
+
+    #[test]
+    fn a_restore_under_a_box_that_ignores_sigterm_still_ends_on_the_first_signal() {
+        let case = Case::new("tools-stop-ignored");
+        // An ssh session can start the box with SIGTERM ignored, which a child keeps across its exec unless reset.
+        // SAFETY: `SIG_IGN` for SIGTERM in this case's own process (nextest runs each case in one) touches no memory.
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        }
+        let (status, said) = stopped_restore(&case);
+        assert_eq!(status, 1, "{said:?}");
+        assert!(
+            said.iter().any(|line| line == "gate: remote tool restore failed (signal 15)"),
+            "the restore ends on the stop's SIGTERM, not its SIGKILL: {said:?}"
+        );
+    }
+
+    /// Readies a run of `case` whose restore waits, stops it with `box stop` once the restore has started, and checks
+    /// that its group record is removed, no tools record written and the restore ran once; the run's status and lines.
+    fn stopped_restore(case: &Case) -> (u8, Vec<String>) {
+        let started = case.base.with_file_name("restore-started");
+        let log = case.dotnet_shim(&format!(": > '{}'\nsleep 600", started.display()));
+        let commit = case.snapshot(&[(MANIFEST_PATH, MANIFEST)]);
+        let json = case.json(&commit, &json!({}));
+        let (path, run_json) = (shim_login().expect("the shim's PATH is set"), json.clone());
+        let (sent, got) = mpsc::channel();
+        thread::spawn(move || {
+            SHIM_PATH.with(|cell| *cell.borrow_mut() = path);
+            let _ = sent.send(ran_along_shim(&run_json));
+        });
+        let guard = Instant::now() + HANG_GUARD;
+        while !started.exists() {
+            let ended = got.try_recv();
+            assert!(ended.is_err(), "the run ended before its restore started: {ended:?}");
+            assert!(Instant::now() < guard, "the restore never started");
+            thread::sleep(Duration::from_millis(50));
+        }
+        let record = format!("{}.tools.pgid", case.work());
+        assert!(Path::new(&record).exists(), "the restore's group is recorded");
+        let mut console = Console::captured();
+        assert_eq!(stop(&decoded(&json), &mut console), 0, "the stop ends the restore's group");
+        let ended = got.recv_timeout(HANG_GUARD).expect("the run ends once its restore is stopped");
+        assert!(!Path::new(&record).exists(), "the restore's group record is removed");
+        assert!(!case.tools_record().exists(), "no tools record");
+        assert_eq!(restores(&log).len(), 1);
+        ended
+    }
+
+    /// The restore's group record of the case's work folder.
+    fn tools_group_of(case: &Case) -> String {
+        format!("{}.tools.pgid", case.work())
+    }
+
+    #[test]
+    fn a_live_restore_group_left_by_an_earlier_run_refuses_the_next_run_busy() {
+        let case = Case::new("tools-earlier-live");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.laid_out(&commit);
+        let mut child = sleeping_group();
+        let record = tools_group_of(&case);
+        fs::write(&record, format!("gate-remote-{KEY}-ffffffffffff-tools\n{}\n", child.id())).expect("the record is written");
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        let alive = child.try_wait().expect("the sleep is looked at").is_none();
+        // Best effort: the sleep is this case's own.
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        assert_eq!(said, [refused_line(NONCE, Refusal::Busy), busy_line(KEY)]);
+        assert!(alive, "the earlier restore's group is never signalled");
+        assert!(Path::new(&record).exists(), "its record stands");
+    }
+
+    #[test]
+    fn a_restore_group_record_naming_no_process_is_removed_and_the_run_goes_on() {
+        let case = Case::new("tools-earlier-dead");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let mut child = sleeping_group();
+        let group = i32::try_from(child.id()).expect("a pid is a pid_t");
+        child.kill().expect("the sleep is killed");
+        child.wait().expect("the sleep is reaped");
+        // SAFETY: signal 0 only asks whether the group exists; it touches no memory.
+        assert!(unsafe { libc::killpg(group, 0) } != 0, "the group is gone");
+        let record = tools_group_of(&case);
+        fs::create_dir_all(Path::new(&record).parent().expect("the record has a folder")).expect("the folder is made");
+        fs::write(&record, format!("gate-remote-{KEY}-ffffffffffff-tools\n{group}\n")).expect("the record is written");
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(case.head(), commit);
+        assert!(!Path::new(&record).exists(), "the stale record is removed");
+    }
+
+    #[test]
+    fn a_restore_whose_record_cannot_be_written_refuses_the_run_75() {
+        let case = Case::new("tools-record-unwritable");
+        let log = case.dotnet_shim("exit 0");
+        let commit = case.snapshot(&[(MANIFEST_PATH, MANIFEST)]);
+        // A folder at every temp name the restore's group record can be staged under in this process, which the
+        // staging cannot remove: the record is never readied, so the restore never starts.
+        let record = tools_group_of(&case);
+        for number in 0..1000 {
+            let temp = format!("{record}.gate-new-{}-{number}", std::process::id());
+            fs::create_dir_all(Path::new(&temp).join("kept")).expect("a folder takes the temp name");
+        }
+        let (status, said) = ran_along_shim(&case.json(&commit, &json!({})));
+        assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        let start = said
+            .iter()
+            .position(|line| line.starts_with("gate: remote could not start the dotnet tool restore: "));
+        let after = [
+            "gate: remote tool restore failed (status 1)".to_owned(),
+            refused_line(NONCE, Refusal::Tools),
+            tools_line(KEY),
+        ];
+        assert!(
+            start.is_some_and(|at| said[at + 1..] == after),
+            "the could-not-start line, the failed line, then the tools tag and line, last: {said:?}"
+        );
+        assert!(restores(&log).is_empty(), "the restore never ran");
+        assert!(!case.tools_record().exists(), "no tools record");
+    }
+
+    #[test]
+    fn an_index_source_that_is_a_fifo_fails_the_sync_back_without_hanging() {
+        let case = Case::new("back-index-fifo");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let json = case.commanded(&commit, &["/bin/sh", "-c", "echo x > x.txt; rm -f .git/index; mkfifo .git/index"]);
+        let (sent, got) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sent.send(whole_run(&json));
+        });
+        let (status, said) = got.recv_timeout(HANG_GUARD).expect("the run ends without waiting on the FIFO");
+        assert_eq!(status, 1, "{said:?}");
+        let work = case.work();
+        let failed = format!("gate: remote sync-back failed: cannot copy {work}/.git/index to {work}.index: ");
+        assert!(
+            said.last()
+                .is_some_and(|(stream, line)| *stream == Stream::Err && line.starts_with(&failed)),
+            "{said:?}"
+        );
+        assert!(!case.has_back_ref(), "no back commit");
     }
 }

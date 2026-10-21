@@ -556,7 +556,7 @@ fn command_of(launch: &Launch<'_>, program: &str, rest: &[String]) -> Command {
 /// Puts `SIGTERM`, `SIGINT`, `SIGHUP` and `SIGQUIT` back to their default action and clears the signal mask, in the
 /// child before its exec: an ignored signal stays ignored across `exec`, so a command whose ssh session ignored
 /// `SIGTERM` would wait out every ending's grace; std resets only `SIGPIPE` and keeps the parent's mask.
-fn signals_reset() -> io::Result<()> {
+pub(crate) fn signals_reset() -> io::Result<()> {
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
         // SAFETY: an all-zero `sigaction` is a valid value: no flags and an empty mask; its handler is set below.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
