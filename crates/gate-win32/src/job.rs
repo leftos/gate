@@ -47,6 +47,9 @@ const UNREAD_NAMED: usize = 3;
 /// thread never waits for a name.
 const NAMING_QUEUE: usize = 256;
 
+/// How many times a job's process id list is read before a job that keeps outgrowing its buffer is an error.
+const PROCESS_ID_READS: usize = 8;
+
 /// A member's identity: its pid and its start.
 type Key = (u32, Timestamp);
 
@@ -947,14 +950,10 @@ fn associate(job: &OwnedHandle, port: HANDLE) -> io::Result<()> {
 /// The ids of every process in the job behind `job` now, those in the jobs nested inside it included. A handle
 /// without `JOB_OBJECT_QUERY` access gets the system's error.
 pub(crate) fn process_ids(job: &OwnedHandle) -> io::Result<Vec<u32>> {
-    let first = std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList) / size_of::<usize>();
-    let mut capacity = 64;
-    loop {
-        let mut buffer = vec![0_usize; first + capacity];
-        let length = u32::try_from(size_of_val(buffer.as_slice())).map_err(io::Error::other)?;
+    listed_ids(|buffer, length| {
         // SAFETY: the handle is open for the whole call, and one without the `JOB_OBJECT_QUERY` access the call asks
-        // for only makes it fail; `buffer` is writable for `length` bytes and aligned as the list is, and no returned
-        // length is asked for.
+        // for only makes it fail; `buffer` is writable for `length` bytes and aligned as the list is, relying on
+        // `listed_ids` to pass the buffer's own byte length, and no returned length is asked for.
         let read = unsafe {
             QueryInformationJobObject(
                 job.raw(),
@@ -964,23 +963,51 @@ pub(crate) fn process_ids(job: &OwnedHandle) -> io::Result<Vec<u32>> {
                 std::ptr::null_mut(),
             )
         } != 0;
-        // SAFETY: `GetLastError` takes no pointers; it is read before anything else can set it.
-        let error = if read { 0 } else { unsafe { GetLastError() } };
-        if !read && error != ERROR_MORE_DATA {
-            return Err(io::Error::from_raw_os_error(error.cast_signed()));
+        if read {
+            Ok(())
+        } else {
+            // SAFETY: `GetLastError` takes no pointers; it is read before anything else can set it.
+            Err(unsafe { GetLastError() })
         }
+    })
+}
+
+/// The ids of a job's processes, read through `query`, which fills `buffer` — a whole
+/// `JOBOBJECT_BASIC_PROCESS_ID_LIST` and its ids — `length` bytes long, and returns the system's error code when the
+/// read fails.
+///
+/// A read that succeeds with room to spare is complete whatever its assigned count says: a process counted while it
+/// exits is not listed, so a list shorter than its assigned count has not outgrown its buffer. Only a read that fails
+/// with `ERROR_MORE_DATA`, or one that fills the buffer exactly while listing fewer ids than assigned, asks to be read
+/// again into a buffer the assigned count and a margin fit; a job still outgrowing its buffer after
+/// `PROCESS_ID_READS` reads is an error rather than a further growth.
+fn listed_ids(mut query: impl FnMut(&mut [usize], u32) -> Result<(), u32>) -> io::Result<Vec<u32>> {
+    let first = std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList) / size_of::<usize>();
+    let mut capacity = 64;
+    let mut assigned = 0;
+    for _ in 0..PROCESS_ID_READS {
+        let mut buffer = vec![0_usize; first + capacity];
+        let length = u32::try_from(size_of_val(buffer.as_slice())).map_err(io::Error::other)?;
+        let read = match query(&mut buffer, length) {
+            Ok(()) => true,
+            Err(error) if error == ERROR_MORE_DATA => false,
+            Err(error) => return Err(io::Error::from_raw_os_error(error.cast_signed())),
+        };
         // SAFETY: `buffer` is aligned as the list is and longer than it, and the call wrote its two counts.
         let list = unsafe { &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
-        let assigned = list.NumberOfAssignedProcesses as usize;
+        assigned = list.NumberOfAssignedProcesses as usize;
         let listed = list.NumberOfProcessIdsInList as usize;
-        if read && listed >= assigned {
+        if read && (listed >= assigned || listed < capacity) {
             let ids = buffer
                 .get(first..first + listed)
                 .ok_or_else(|| io::Error::other("the job listed more process ids than its buffer holds"))?;
             return ids.iter().map(|&id| u32::try_from(id).map_err(io::Error::other)).collect();
         }
-        capacity = (capacity * 2).max(assigned + 16);
+        capacity = (assigned + 16).max(capacity + 16);
     }
+    Err(io::Error::other(format!(
+        "the job's process list kept growing past {assigned} entries over {PROCESS_ID_READS} reads"
+    )))
 }
 
 /// The accounting of the job behind `job`: the user and kernel time of every process ever in it, and the processes it

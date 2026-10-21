@@ -3,10 +3,11 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
+use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 
 use super::{
-    DRAIN_WAIT_MS, Departure, Job, Joined, Member, Message, Missed, Opened, Remembered, Settled, Unread, Until, drain_loop, holds, kept, member,
-    open_any, remembered_as, settled, trouble,
+    DRAIN_WAIT_MS, Departure, ERROR_MORE_DATA, JOBOBJECT_BASIC_PROCESS_ID_LIST, Job, Joined, Member, Message, Missed, Opened, Remembered, Settled,
+    Unread, Until, drain_loop, holds, kept, listed_ids, member, open_any, remembered_as, settled, trouble,
 };
 use crate::{EnvironmentBlock, Launch, LaunchOutput, Running, Suspended, start_and_exit_of, system_directory, timestamp_of};
 
@@ -478,4 +479,131 @@ fn a_job_not_told_to_remember_remembers_nothing() {
     assert_eq!(ended.wait(HANG_GUARD).expect("the wait answers"), Some(0), "the member ended");
 
     assert_eq!(job.departed(), (Vec::new(), None), "no port, so no member");
+}
+
+/// Where a `JOBOBJECT_BASIC_PROCESS_ID_LIST`'s ids begin, after its header.
+fn first_id() -> usize {
+    std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList) / std::mem::size_of::<usize>()
+}
+
+/// Lays into `buffer` the list the system would have written into it: its two counts, and `ids` after them.
+fn list_in(buffer: &mut [usize], assigned: u32, ids: &[u32]) {
+    let first = first_id();
+    // SAFETY: `buffer` is a whole list and its ids, aligned as the list is, and the ids fit after its header.
+    let list = unsafe { &mut *buffer.as_mut_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
+    list.NumberOfAssignedProcesses = assigned;
+    list.NumberOfProcessIdsInList = u32::try_from(ids.len()).expect("the test lists few ids");
+    for (slot, &id) in buffer[first..].iter_mut().zip(ids) {
+        *slot = usize::try_from(id).expect("a process id fits a usize");
+    }
+}
+
+#[test]
+fn a_successful_list_shorter_than_its_assigned_count_is_taken_as_it_is() {
+    let mut reads = 0;
+    let ids = listed_ids(|buffer, _length| {
+        reads += 1;
+        list_in(buffer, 12, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        Ok(())
+    })
+    .expect("a read with room to spare is complete");
+    let listed: Vec<u32> = (1..=11).collect();
+
+    assert_eq!(ids, listed, "the ids it listed, as they are");
+    assert_eq!(reads, 1, "the list is not read again");
+}
+
+#[test]
+fn a_list_that_needs_more_room_grows_to_the_assigned_count() {
+    let mut reads = 0;
+    let mut slots = Vec::new();
+    let ids = listed_ids(|buffer, _length| {
+        reads += 1;
+        slots.push(buffer.len() - first_id());
+        if reads == 1 {
+            list_in(buffer, 100, &[]);
+            return Err(ERROR_MORE_DATA);
+        }
+        list_in(buffer, 100, &(1..=100).collect::<Vec<u32>>());
+        Ok(())
+    })
+    .expect("the second read holds the list");
+    let listed: Vec<u32> = (1..=100).collect();
+
+    assert_eq!(ids, listed, "every id the second read listed");
+    assert_eq!(reads, 2, "the second read has the room the assigned count asks for");
+    assert_eq!(
+        slots,
+        [64, 116],
+        "the second buffer holds the 100 assigned and the margin of 16, not a doubling"
+    );
+}
+
+#[test]
+fn a_list_needing_more_room_with_a_smaller_count_still_grows() {
+    let mut reads = 0;
+    let mut slots = Vec::new();
+    let ids = listed_ids(|buffer, _length| {
+        reads += 1;
+        slots.push(buffer.len() - first_id());
+        if reads == 1 {
+            list_in(buffer, 40, &[]);
+            return Err(ERROR_MORE_DATA);
+        }
+        list_in(buffer, 40, &(1..=40).collect::<Vec<u32>>());
+        Ok(())
+    })
+    .expect("the second read holds the list");
+    let listed: Vec<u32> = (1..=40).collect();
+
+    assert_eq!(ids, listed, "every id the second read listed");
+    assert_eq!(reads, 2, "an assigned count below the buffer's own still asks for one more read");
+    assert_eq!(slots, [64, 80], "the smaller count still grows the buffer by the margin of 16");
+}
+
+#[test]
+fn a_successful_read_that_fills_its_buffer_reads_again() {
+    let mut reads = 0;
+    let mut slots = Vec::new();
+    let ids = listed_ids(|buffer, _length| {
+        reads += 1;
+        slots.push(buffer.len() - first_id());
+        if reads == 1 {
+            list_in(buffer, 70, &(1..=64).collect::<Vec<u32>>());
+            return Ok(());
+        }
+        list_in(buffer, 70, &(1..=70).collect::<Vec<u32>>());
+        Ok(())
+    })
+    .expect("the second read holds the list");
+    let listed: Vec<u32> = (1..=70).collect();
+
+    assert_eq!(ids, listed, "every id the second read listed");
+    assert_eq!(reads, 2, "a full buffer listing fewer ids than assigned is read again");
+    assert_eq!(slots, [64, 86], "the second read has the assigned count and the margin of 16");
+}
+
+#[test]
+fn a_list_that_keeps_needing_more_room_fails_after_eight_reads() {
+    let mut reads = 0_u32;
+    let error = listed_ids(|buffer, _length| {
+        reads += 1;
+        list_in(buffer, 100 * reads, &[]);
+        Err(ERROR_MORE_DATA)
+    })
+    .expect_err("a job still outgrowing its buffer is an error");
+
+    assert_eq!(reads, 8, "no ninth read is made");
+    assert_eq!(error.to_string(), "the job's process list kept growing past 800 entries over 8 reads");
+}
+
+#[test]
+fn a_failed_read_other_than_more_data_is_an_error() {
+    let error = listed_ids(|buffer, _length| {
+        list_in(buffer, 1, &[]);
+        Err(ERROR_ACCESS_DENIED)
+    })
+    .expect_err("the system's error is reported");
+
+    assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED.cast_signed()));
 }
