@@ -7,7 +7,7 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use gate_wire::{PathForm, Refusal, SHA256_DIGITS, build_version, escaped, is_lower_hex, refused_line, work_root};
+use gate_wire::{BoxKill, PathForm, Refusal, SHA256_DIGITS, build_version, escaped, is_lower_hex, refused_line, work_root};
 
 /// The line saying the work folder's tree is new, which the client raises a run's ceiling for.
 pub const NEW_WORK_TREE: &str = "gate: remote new work tree";
@@ -464,15 +464,22 @@ pub enum CommandEnd {
     NotStarted,
     /// The box could not see it to its end: its exit unread, its group still there, or a record not changed.
     Failed,
+    /// The box killed it, for its ceiling or its backstop.
+    Killed(BoxKill),
 }
 
+/// The status of a run whose command the box killed for its ceiling or its backstop, said with the kill tag, as a
+/// local kill's.
+pub const KILLED_STATUS: u8 = 124;
+
 /// The status a run whose command ended as `end` exits with: the command's own code; 128 plus the signal for a command
-/// a signal ended, never 124 or 255, which the PC reads as killed and as a lost connection; [`GONE_STATUS`],
-/// [`NOT_STARTED_STATUS`], or [`FAILED_STATUS`] for the box's own failure. A code or signal outside a status is the
-/// box's failure.
+/// a signal ended, never 124 or 255, which the PC reads as killed and as a lost connection; [`KILLED_STATUS`] for the
+/// box's own kill; [`GONE_STATUS`], [`NOT_STARTED_STATUS`], or [`FAILED_STATUS`] for the box's own failure. A code or
+/// signal outside a status is the box's failure.
 #[must_use]
 pub fn command_status(end: CommandEnd) -> u8 {
     let status = match end {
+        CommandEnd::Killed(_) => Some(KILLED_STATUS),
         CommandEnd::Exited(code) => u8::try_from(code).ok(),
         // 1 to 126, so the status is 129 to 254 and never the lost connection's 255.
         CommandEnd::Signalled(signal) if (1..127).contains(&signal) => u8::try_from(128 + signal).ok(),
@@ -591,6 +598,7 @@ mod tests {
         recorded_group, root_flaw, root_unsafe_line, sdk_list, sdks_line, signal_guard, step_unran, tool_line, version_line, warm_text, work_layout,
         write_failure,
     };
+    use gate_wire::BoxKill;
 
     #[test]
     fn a_command_s_status_is_its_code_or_128_and_its_signal_and_the_box_s_own_ends_have_theirs() {
@@ -606,6 +614,16 @@ mod tests {
         assert_eq!(command_status(CommandEnd::Exited(256)), 1, "no status holds it");
         assert_eq!(command_status(CommandEnd::Exited(-1)), 1, "no status holds it");
         assert_eq!(command_status(CommandEnd::Signalled(128)), 1, "past a status");
+    }
+
+    #[test]
+    fn the_box_s_kill_gives_124_and_a_signal_still_never_does() {
+        assert_eq!(command_status(CommandEnd::Killed(BoxKill::Backstop)), 124);
+        assert_eq!(command_status(CommandEnd::Killed(BoxKill::TimedOut)), 124);
+        assert_eq!(command_status(CommandEnd::Signalled(15)), 143, "SIGTERM is 143, not the kill's 124");
+        for signal in 1..127 {
+            assert_ne!(command_status(CommandEnd::Signalled(signal)), 124, "signal {signal}");
+        }
     }
 
     #[test]

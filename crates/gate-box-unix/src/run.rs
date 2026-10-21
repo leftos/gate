@@ -8,12 +8,16 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use gate_wire::{PathForm, Payload, Refusal, bare_stem, busy_line, escaped, layout_line, refused_line};
 
-use crate::console::{LineSink, Output, Stream};
+use gate_watchdog::Pump;
+
+use crate::console::{Forwarding, LineSink, Output, Stream};
 use crate::files::{self, HeldLock, Locked};
 use crate::git::{self, AlternatesFailure, Failed, Git, GitClass, RunGit, Steps, Tree, line_ends_set, origin_set};
+use crate::heartbeat::{self, Periods};
 use crate::lines::{FAILED_STATUS, Translation, USAGE_STATUS, recorded_group, rosetta_lines, signal_guard, translation, work_layout};
 use crate::preflight::checked_root;
 use crate::process::GroupRecord;
@@ -168,6 +172,11 @@ pub struct Ready<'p> {
     pub lock: HeldLock,
     /// The folder the command runs in: the work folder, or its subfolder.
     pub place: PathBuf,
+    /// The heartbeat, beating since before the checkout; `None` when its thread could not start, which ends the
+    /// heartbeats, never the run. Stopped at the run's end with [`heartbeat::stop`]; dropped, it is only told to stop.
+    pub pump: Option<Pump>,
+    /// How often the run's watches look.
+    pub periods: Periods,
 }
 
 /// Readies the run of `payload` for its command, saying its lines through `output`: the payload read ([`Request::read`]),
@@ -183,12 +192,22 @@ pub struct Ready<'p> {
 /// deleted; the work folder laid out ([`laid_out`]), refused `layout` when it cannot be; the snapshot fetched and checked
 /// out ([`checked_out`]); and the subfolder found in it, a folder inside the work folder once its links are followed,
 /// else [`USAGE_STATUS`]. Each git step's process group is recorded in `<work>.pgid` under the run's job while it runs.
-/// No start marker is said.
+/// The heartbeat starts once the subfolder is placed, before the layout and the checkout, beating every
+/// `periods.heartbeat` ([`heartbeat::start`]). No start marker is said.
 ///
 /// # Errors
 ///
 /// The status the run ends on, its lines said.
-pub fn prepare<'p, S: LineSink + 'static>(payload: &'p Payload, output: &Arc<Output<S>>) -> Result<Ready<'p>, u8> {
+pub fn prepare<'p, S: LineSink + 'static>(payload: &'p Payload, output: &Arc<Output<S>>, periods: Periods) -> Result<Ready<'p>, u8> {
+    prepared(payload, output, periods, heartbeat::start)
+}
+
+/// How a run starts its heartbeat: [`heartbeat::start`], or a test's own.
+type StartBeat = fn(Arc<dyn Forwarding>, Duration) -> io::Result<Pump>;
+
+/// [`prepare`], the heartbeat started with `start`; a heartbeat that cannot start is said and the run goes on without
+/// one.
+fn prepared<'p, S: LineSink + 'static>(payload: &'p Payload, output: &Arc<Output<S>>, periods: Periods, start: StartBeat) -> Result<Ready<'p>, u8> {
     let request = Request::read(payload).map_err(|line| said(output, &[&line], USAGE_STATUS))?;
     if let Some(unbuilt) = request.unbuilt {
         return Err(refused(output, &request, unbuilt.refusal, &unbuilt.line(request.bare)));
@@ -226,6 +245,17 @@ pub fn prepare<'p, S: LineSink + 'static>(payload: &'p Payload, output: &Arc<Out
         back_ref_cleared(&git, &request).map_err(|failed| failure(output, &failed))?;
         return Err(USAGE_STATUS);
     };
+    // A heartbeat that cannot start ends the heartbeats, never the run. On an error below the pump is dropped, which
+    // tells it to stop, and the box exits right after.
+    let pump = start(Arc::clone(output) as Arc<dyn Forwarding>, periods.heartbeat)
+        .inspect_err(|error| {
+            // A note: the run goes on, and a client gone finds out at the next line.
+            let _ = output.say(
+                Stream::Err,
+                &format!("gate: remote heartbeat stopped: cannot start the heartbeat: {error}"),
+            );
+        })
+        .ok();
     laid_out(&request, &git).map_err(|not| not_laid_out(output, &request, not))?;
     checked_out(&request, &git).map_err(|failed| failure(output, &failed))?;
     if !place.is_dir() {
@@ -236,7 +266,13 @@ pub fn prepare<'p, S: LineSink + 'static>(payload: &'p Payload, output: &Arc<Out
     if !inside_work(request.work, &place) {
         return Err(said(output, &[&not_inside(request.subfolder)], USAGE_STATUS));
     }
-    Ok(Ready { request, lock, place })
+    Ok(Ready {
+        request,
+        lock,
+        place,
+        pump,
+        periods,
+    })
 }
 
 /// Says `lines` on stderr together, unless the client is gone; `status`.
@@ -528,18 +564,23 @@ mod tests {
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, PoisonError};
     use std::time::{Duration, SystemTime};
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use gate_wire::{PathForm, Payload, Refusal, busy_line, layout_line, refused_line};
+    use gate_wire::{PathForm, Payload, Refusal, busy_line, layout_line, refused_line, started_line};
     use serde_json::{Value, json};
 
-    use super::{REFUSED_STATUS, Ready, place_of, prepare};
-    use crate::console::{Output, RecordingSink, Stream};
+    use gate_watchdog::Pump;
+
+    use super::{REFUSED_STATUS, Ready, place_of, prepare, prepared};
+    use crate::command::{Launch, run_command};
+    use crate::console::Forwarding;
+    use crate::console::{LineSink, Output, RecordingSink, Stream};
     use crate::files::{self, Locked, effective_uid, take_lock};
     use crate::git::{GitClass, test_limit};
+    use crate::heartbeat::{self, Periods};
 
     const KEY: &str = "repo-0123abcd";
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
@@ -700,11 +741,137 @@ mod tests {
     fn ran(json: &Value) -> (u8, Vec<String>) {
         let payload = decoded(json);
         let output = Arc::new(Output::new(RecordingSink::default()));
-        let status = match prepare(&payload, &output) {
+        let status = match prepare(&payload, &output, quiet_periods()) {
             Ok(_) => 0,
             Err(status) => status,
         };
         (status, stderr_of(&output))
+    }
+
+    /// Periods whose heartbeat never beats within a case, so a case's lines are exactly the run's own.
+    fn quiet_periods() -> Periods {
+        Periods {
+            heartbeat: Duration::from_secs(3600),
+            ..Periods::default()
+        }
+    }
+
+    /// A sink that keeps every line and its stream, and makes `marker` once it is given a heartbeat.
+    struct MarkingSink {
+        lines: Mutex<Vec<(Stream, String)>>,
+        marker: PathBuf,
+    }
+
+    impl LineSink for MarkingSink {
+        fn write_line(&self, stream: Stream, line: &str) -> std::io::Result<()> {
+            if line.starts_with("gate-remote-heartbeat:") && !self.marker.exists() {
+                fs::write(&self.marker, "")?;
+            }
+            self.lines.lock().unwrap_or_else(PoisonError::into_inner).push((stream, line.to_owned()));
+            Ok(())
+        }
+    }
+
+    /// The first folder along `PATH` holding `git`.
+    fn real_git() -> PathBuf {
+        let path = std::env::var_os("PATH").expect("PATH is set");
+        std::env::split_paths(&path)
+            .map(|folder| folder.join("git"))
+            .find(|git| git.is_file())
+            .expect("git is on PATH")
+    }
+
+    /// A heartbeat whose thread cannot start.
+    fn no_beat(_output: Arc<dyn Forwarding>, _period: Duration) -> std::io::Result<Pump> {
+        Err(std::io::Error::other("no thread"))
+    }
+
+    #[test]
+    fn a_heartbeat_that_cannot_start_is_said_and_the_run_goes_on() {
+        let case = Case::new("no-beat");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let payload = decoded(&case.json(&commit, &json!({})));
+        let output = Arc::new(Output::new(RecordingSink::default()));
+        let ready = prepared(&payload, &output, quiet_periods(), no_beat);
+        assert!(ready.as_ref().is_ok_and(|ready| ready.pump.is_none()), "{:?}", output.sink().lines());
+        assert_eq!(
+            stderr_of(&output),
+            ["gate: remote heartbeat stopped: cannot start the heartbeat: no thread"]
+        );
+        assert_eq!(case.head(), commit, "the run went on to its checkout");
+    }
+
+    #[test]
+    fn the_pump_beats_before_the_checkout() {
+        let case = Case::new("beats");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let marker = case.base.with_file_name("beaten");
+        let shims = case.base.with_file_name("shims");
+        fs::create_dir_all(&shims).expect("the shim folder is made");
+        // The fetch, the checkout's first step, waits for the first heartbeat, within a hang guard.
+        let shim = shims.join("git");
+        let script = format!(
+            "#!/bin/sh\ncase \" $* \" in\n*\" fetch \"*)\n  i=0\n  while [ ! -e '{marker}' ]; do\n    [ $i -ge 1200 ] && exit 97\n    \
+             sleep 0.1; i=$((i+1))\n  done;;\nesac\nexec '{git}' \"$@\"\n",
+            marker = marker.display(),
+            git = real_git().display()
+        );
+        fs::write(&shim, script).expect("the shim is written");
+        fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("the shim is made runnable");
+        let path = std::env::var_os("PATH").expect("PATH is set");
+        let shimmed = std::env::join_paths(std::iter::once(shims).chain(std::env::split_paths(&path))).expect("the PATH joins");
+        // SAFETY: nextest runs this case in a process of its own, and no other thread reads the environment now.
+        unsafe {
+            std::env::set_var("PATH", &shimmed);
+        }
+        let payload = decoded(&case.json(&commit, &json!({})));
+        let output = Arc::new(Output::new(MarkingSink {
+            lines: Mutex::new(Vec::new()),
+            marker: marker.clone(),
+        }));
+        let periods = Periods {
+            heartbeat: Duration::from_millis(1),
+            ..Periods::default()
+        };
+        let ready = prepare(&payload, &output, periods);
+        let lines = || output.sink().lines.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert!(ready.is_ok(), "the run is ready: {:?}", lines());
+        let ready = ready.expect("the run is ready");
+        let launch = Launch {
+            words: &ready.request.command,
+            place: &ready.place,
+            work: ready.request.work,
+            job: ready.request.job,
+            nonce: ready.request.nonce,
+            env: &ready.request.env,
+            login_path: None,
+            lock: &ready.lock,
+            timeout: None,
+            host: "",
+            sample: periods.sample,
+            pump: ready.pump.as_ref(),
+        };
+        let status = run_command(&launch, &output);
+        let Ready { pump, .. } = ready;
+        if let Some(pump) = pump {
+            heartbeat::stop(pump);
+        }
+        // SAFETY: as above.
+        unsafe {
+            std::env::set_var("PATH", &path);
+        }
+        assert_eq!(status, 0, "{:?}", lines());
+        let said = lines();
+        let beat = said
+            .iter()
+            .position(|(stream, line)| *stream == Stream::Err && line.starts_with("gate-remote-heartbeat:"));
+        let started = said
+            .iter()
+            .position(|(stream, line)| *stream == Stream::Out && *line == started_line(NONCE));
+        assert!(
+            beat.is_some() && started.is_some() && beat < started,
+            "a beat before the start marker: {said:?}"
+        );
     }
 
     fn stderr_of(output: &Output<RecordingSink>) -> Vec<String> {
@@ -725,7 +892,7 @@ mod tests {
         let payload = decoded(&case.json(&commit, &json!({})));
         let output = Arc::new(Output::new(RecordingSink::default()));
 
-        let ready: Ready<'_> = prepare(&payload, &output).expect("the run is ready");
+        let ready: Ready<'_> = prepare(&payload, &output, quiet_periods()).expect("the run is ready");
 
         assert_eq!(ready.place, PathBuf::from(case.work()));
         assert_eq!(case.head(), commit);

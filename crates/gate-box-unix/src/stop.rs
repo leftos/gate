@@ -779,7 +779,7 @@ mod tests {
         let mut console = Console::captured();
         assert_eq!(stopped_through(&before_term, JOB, &mut console), 1);
         assert_eq!(console.err, std::slice::from_ref(&line));
-        assert!(console.out.is_empty());
+        assert!(console.out.is_empty(), "{:?}", console.out);
         assert!(before_term.sent.borrow().is_empty(), "{:?}", before_term.sent.borrow());
 
         let before_kill = FakeStop::new(&[Some(5)], &[true], &[], &[false]).unreadable_after(1);

@@ -6,7 +6,14 @@
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use crate::forward::HANG_GUARD;
+
+/// How often a say waiting for the output lock tries it again ([`Output::held_within`]).
+const LOCK_RETRY: Duration = Duration::from_millis(5);
 
 /// The box's two output streams, written at once or kept for a test.
 pub struct Console {
@@ -195,17 +202,32 @@ pub struct Output<S: LineSink> {
     sink: S,
     lock: Mutex<()>,
     gone: ClientGone,
+    /// How long [`Output::say_together`] waits for the lock: [`HANG_GUARD`], shorter in a test.
+    lock_bound: Duration,
 }
 
 impl<S: LineSink> Output<S> {
     /// An output writing to `sink`, its client not gone.
     #[must_use]
     pub fn new(sink: S) -> Output<S> {
+        Output::with_lock_bound(sink, HANG_GUARD)
+    }
+
+    /// An output writing to `sink` whose says wait at most `lock_bound` for the lock.
+    fn with_lock_bound(sink: S, lock_bound: Duration) -> Output<S> {
         Output {
             sink,
             lock: Mutex::new(()),
             gone: ClientGone::default(),
+            lock_bound,
         }
+    }
+
+    /// An output writing to `sink` whose says wait at most `lock_bound` for the lock, for a test of a stuck writer.
+    #[cfg(test)]
+    #[must_use]
+    pub fn bounded(sink: S, lock_bound: Duration) -> Output<S> {
+        Output::with_lock_bound(sink, lock_bound)
     }
 
     /// Says `line` on `stream`.
@@ -219,7 +241,9 @@ impl<S: LineSink> Output<S> {
 
     /// Says `lines` in order under one hold of the lock, so no other line comes between them; the first line that
     /// cannot be written ends the group. Once the client is gone, nothing is written: looked at before the lock is
-    /// taken, so a gone client never waits on it, and again under it.
+    /// taken, so a gone client never waits on it, and again under it. The lock is waited for at most the drain's
+    /// [`HANG_GUARD`]: a thread stuck in a write to a client that is not reading holds it, and once the guard has
+    /// passed the client is marked gone and nothing is written ([`Output::held_within`]).
     ///
     /// # Errors
     ///
@@ -228,8 +252,9 @@ impl<S: LineSink> Output<S> {
         if self.gone.is_set() {
             return Ok(());
         }
-        // A thread that panicked while holding the lock left no state behind it: the lock guards only the writes.
-        let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(_held) = self.held_within(self.lock_bound) else {
+            return Ok(());
+        };
         if self.gone.is_set() {
             return Ok(());
         }
@@ -237,6 +262,29 @@ impl<S: LineSink> Output<S> {
             self.write_held(*stream, line)?;
         }
         Ok(())
+    }
+
+    /// The output lock, tried every [`LOCK_RETRY`] for at most `bound`, so a thread that decides the run's end never
+    /// waits for good behind a write the client is not taking (the heartbeat's or a reader's): past `bound` the client
+    /// is marked gone and `None` is given, as it is once the client is seen gone while waiting.
+    fn held_within(&self, bound: Duration) -> Option<MutexGuard<'_, ()>> {
+        let until = Instant::now() + bound;
+        loop {
+            match self.lock.try_lock() {
+                Ok(held) => return Some(held),
+                // A thread that panicked while holding the lock left no state behind it: the lock guards only the writes.
+                Err(TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+                Err(TryLockError::WouldBlock) => {}
+            }
+            if self.gone.is_set() {
+                return None;
+            }
+            if Instant::now() >= until {
+                self.gone.set();
+                return None;
+            }
+            thread::sleep(LOCK_RETRY);
+        }
     }
 
     /// Writes `line` to `stream`, the lock held by the caller; any failure, a broken pipe or another, sets
@@ -335,10 +383,16 @@ impl LineSink for HungUpSink {
 #[cfg(test)]
 mod tests {
     use std::io::{self, Write};
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::sync::{Mutex, PoisonError};
     use std::thread;
+    use std::time::Duration;
 
-    use super::{FailingSink, Forwarding, HungUpSink, Output, RecordingSink, Stream, written};
+    use super::{FailingSink, Forwarding, HungUpSink, LineSink, Output, RecordingSink, Stream, written};
+
+    /// How long a test waits for an event before it calls the case hung: a hang guard only.
+    const GUARD: Duration = Duration::from_secs(120);
 
     /// A stream that keeps the bytes of each write call apart.
     #[derive(Default)]
@@ -428,6 +482,51 @@ mod tests {
         assert!(output.say(Stream::Err, "c").is_ok());
         assert!(output.say_unless(&AtomicBool::new(false), Stream::Err, "d").is_ok());
         assert!(output.sink().lines().is_empty(), "{:?}", output.sink().lines());
+    }
+
+    /// A sink whose first write says it is inside it and then blocks until the test lets it go; it keeps the lines
+    /// written.
+    struct HeldSink {
+        entered: Mutex<Sender<()>>,
+        release: Mutex<Receiver<()>>,
+        blocked: AtomicBool,
+        lines: Mutex<Vec<String>>,
+    }
+
+    impl LineSink for HeldSink {
+        fn write_line(&self, _stream: Stream, line: &str) -> io::Result<()> {
+            if !self.blocked.swap(true, Ordering::SeqCst) {
+                let _ = self.entered.lock().unwrap_or_else(PoisonError::into_inner).send(());
+                let _ = self.release.lock().unwrap_or_else(PoisonError::into_inner).recv();
+            }
+            self.lines.lock().unwrap_or_else(PoisonError::into_inner).push(line.to_owned());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_say_that_cannot_take_the_lock_in_the_bound_marks_the_client_gone_and_returns() {
+        let (entered, inside) = channel();
+        let (release, held) = channel();
+        let sink = HeldSink {
+            entered: Mutex::new(entered),
+            release: Mutex::new(held),
+            blocked: AtomicBool::new(false),
+            lines: Mutex::new(Vec::new()),
+        };
+        let output = Output::bounded(sink, Duration::from_millis(50));
+        thread::scope(|scope| {
+            let stuck = scope.spawn(|| output.say_unless(&AtomicBool::new(false), Stream::Err, "stuck"));
+            assert!(inside.recv_timeout(GUARD).is_ok(), "the other thread reached its write");
+            // A wait for the stuck write would never end: the write is let go only after this returns.
+            let said = output.say_together(&[(Stream::Err, "main")]);
+            assert!(said.is_ok(), "{said:?}");
+            assert!(output.client_gone(), "the client is marked gone");
+            let _ = release.send(());
+            assert!(stuck.join().is_ok_and(|written| written.is_ok()));
+        });
+        let lines = output.sink().lines.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert_eq!(lines, ["stuck"], "nothing of the main thread's is written");
     }
 
     #[test]

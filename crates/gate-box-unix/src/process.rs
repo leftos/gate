@@ -167,6 +167,9 @@ pub struct Watch<'a> {
     /// Called on the waiting thread every [`POLL`] while the leader runs: a [`Halt`] ends the group as `ending` says,
     /// through the runner's own ending, and the run gives [`EndedBy::Halted`].
     pub check: Option<&'a dyn Fn() -> Option<Halt>>,
+    /// Called once on the waiting thread with the program's process group, once its readers started and before the
+    /// first look at the leader; never when the readers could not start.
+    pub on_started: Option<&'a dyn Fn(i32)>,
     /// Called once, when the runner stops watching the leader (its exit seen, or its group's ending decided), before
     /// the group is ended and the leader reaped.
     pub on_leader_exit: Option<&'a dyn Fn()>,
@@ -191,6 +194,7 @@ pub fn run_bounded(command: Command, cap: usize, deadline: Instant) -> Result<Ra
             ends_on_gone: false,
             record: None,
             check: None,
+            on_started: None,
             on_leader_exit: None,
         },
     )
@@ -220,16 +224,13 @@ pub fn run_watched(command: Command, watch: &Watch<'_>) -> Result<Ran, NotRan> {
     let mut readers = Readers::default();
     let started = readers_started(&mut readers, &mut child, watch);
     let leader = Leader { child, group };
-    let why = stopped_watching(&leader, started, watch);
+    let why = stopped_watching(&leader, group, started, watch);
     match settled(&leader, &why, watch.ending, KILL_WAIT) {
         Settled::Ended => {}
         Settled::StillThere => {
             // Neither reaped nor unrecorded: the group still exists, so the next run's busy refusal is right.
             readers.stop();
-            let wait = KILL_WAIT.as_secs();
-            return Err(NotRan::Failed(format!(
-                "its process group {group} was still there {wait} s after SIGKILL"
-            )));
+            return Err(NotRan::Failed(still_there_why(group, KILL_WAIT)));
         }
         Settled::Unread { error, keep } => {
             // Not reaped: the leader's exit was not seen, so its group may still be there.
@@ -272,11 +273,39 @@ pub fn run_watched(command: Command, watch: &Watch<'_>) -> Result<Ran, NotRan> {
     })
 }
 
-/// Watches `leader` until the runner stops watching it ([`watched`]), unless its readers did not start, `started`
-/// giving why; then calls `watch.on_leader_exit` once, before the group is ended and the leader reaped. Why it stopped.
-fn stopped_watching(leader: &impl Group, started: io::Result<()>, watch: &Watch<'_>) -> Why {
+/// Why a run whose process group `group` was still there `wait` after `SIGKILL` gives [`NotRan::Failed`]
+/// ([`Settled::StillThere`]).
+pub(crate) fn still_there_why(group: i32, wait: Duration) -> String {
+    format!("{STILL_THERE_HEAD}{group}{STILL_THERE_MIDDLE}{}{STILL_THERE_TAIL}", wait.as_secs())
+}
+
+/// The start of [`still_there_why`]'s text, before the group.
+const STILL_THERE_HEAD: &str = "its process group ";
+/// [`still_there_why`]'s text between the group and the wait.
+const STILL_THERE_MIDDLE: &str = " was still there ";
+/// The end of [`still_there_why`]'s text, after the wait.
+const STILL_THERE_TAIL: &str = " s after SIGKILL";
+
+/// Whether `why`, a [`NotRan::Failed`]'s, says the program's group was still there after `SIGKILL`
+/// ([`still_there_why`]), rather than any other failure.
+#[must_use]
+pub fn is_still_there(why: &str) -> bool {
+    why.strip_prefix(STILL_THERE_HEAD)
+        .and_then(|rest| rest.split_once(STILL_THERE_MIDDLE))
+        .is_some_and(|(group, wait)| group.parse::<i32>().is_ok() && wait.ends_with(STILL_THERE_TAIL))
+}
+
+/// Watches `leader`, of the process group `group`, until the runner stops watching it ([`watched`]), `watch.on_started`
+/// called once first, unless its readers did not start, `started` giving why; then calls `watch.on_leader_exit` once,
+/// before the group is ended and the leader reaped. Why it stopped.
+fn stopped_watching(leader: &impl Group, group: i32, started: io::Result<()>, watch: &Watch<'_>) -> Why {
     let why = match started {
-        Ok(()) => watched(leader, watch),
+        Ok(()) => {
+            if let Some(hook) = watch.on_started {
+                hook(group);
+            }
+            watched(leader, watch)
+        }
         Err(error) => Why::Failed(format!("its output could not be read: {error}")),
     };
     if let Some(hook) = watch.on_leader_exit {
@@ -890,8 +919,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        EndedBy, Ending, Forward, Group, GroupEnd, GroupRecord, Halt, NotRan, Settled, Staged, Watch, Why, end_group, login_path, login_path_of,
-        run_bounded, run_watched, settled, signal_log, status_text, stopped_watching,
+        EndedBy, Ending, Forward, Group, GroupEnd, GroupRecord, Halt, KILL_WAIT, NotRan, Settled, Staged, Watch, Why, end_group, is_still_there,
+        login_path, login_path_of, run_bounded, run_watched, settled, signal_log, status_text, still_there_why, stopped_watching,
     };
     use crate::console::{FailingSink, Forwarding, LineSink, Output, RecordingSink, Stream};
     use crate::files::held_for_test;
@@ -948,6 +977,7 @@ mod tests {
             ends_on_gone: true,
             record: None,
             check: None,
+            on_started: None,
             on_leader_exit: None,
         }
     }
@@ -1108,6 +1138,7 @@ mod tests {
             ends_on_gone: false,
             record: Some(&record),
             check: None,
+            on_started: None,
             on_leader_exit: None,
         };
         let ran = run_watched(Command::new("gate-box-no-such-program"), &watch);
@@ -1219,6 +1250,9 @@ mod tests {
         }
     }
 
+    /// The process group a fake group's hooks are given.
+    const FAKE_GROUP: i32 = 4242;
+
     /// A watch with no deadline, no output and no hooks, ending with `SIGKILL`.
     fn quiet_watch<'a>() -> Watch<'a> {
         Watch {
@@ -1230,6 +1264,7 @@ mod tests {
             ends_on_gone: false,
             record: None,
             check: None,
+            on_started: None,
             on_leader_exit: None,
         }
     }
@@ -1246,7 +1281,7 @@ mod tests {
             check: Some(&check),
             ..quiet_watch()
         };
-        let why = stopped_watching(&group, Ok(()), &watch);
+        let why = stopped_watching(&group, FAKE_GROUP, Ok(()), &watch);
         assert!(matches!(&why, Why::Halted(halt) if halt.0 == "ceiling"), "halted at the third check");
         assert_eq!(checks.get(), 3, "the check is made once per poll");
         let settled = settled(&group, &why, Ending::TermThenKill(HANG_GUARD), HANG_GUARD);
@@ -1262,7 +1297,7 @@ mod tests {
             on_leader_exit: Some(&hook),
             ..quiet_watch()
         };
-        let why = stopped_watching(&group, Ok(()), &watch);
+        let why = stopped_watching(&group, FAKE_GROUP, Ok(()), &watch);
         let settled = settled(&group, &why, Ending::TermThenKill(HANG_GUARD), HANG_GUARD);
         assert!(matches!(settled, Settled::Ended), "{settled:?}");
         assert_eq!(
@@ -1277,9 +1312,61 @@ mod tests {
             on_leader_exit: Some(&hook),
             ..quiet_watch()
         };
-        let why = stopped_watching(&unread, Err(io::Error::other("no pipe")), &watch);
+        let why = stopped_watching(&unread, FAKE_GROUP, Err(io::Error::other("no pipe")), &watch);
         assert!(matches!(why, Why::Failed(_)));
         assert_eq!(*unread.events.borrow(), ["hook"], "called once when the readers did not start too");
+    }
+
+    #[test]
+    fn the_started_hook_is_called_once_after_the_readers_start_and_before_the_first_wait() {
+        let group = Fake::new(&[Look::Running, Look::Exited]).emptied();
+        let given = Cell::new(None);
+        let hook = |started: i32| {
+            given.set(Some(started));
+            group.events.borrow_mut().push("started");
+        };
+        let watch = Watch {
+            on_started: Some(&hook),
+            ..quiet_watch()
+        };
+        let why = stopped_watching(&group, FAKE_GROUP, Ok(()), &watch);
+        assert!(matches!(why, Why::Exited));
+        assert_eq!(*group.events.borrow(), ["started", "running", "exited"], "once, before the first look");
+        assert_eq!(given.get(), Some(FAKE_GROUP), "given the program's group");
+    }
+
+    #[test]
+    fn a_group_still_there_after_sigkill_is_told_from_any_other_failure() {
+        assert!(is_still_there(&still_there_why(4242, KILL_WAIT)));
+        assert!(!is_still_there("its group record could not be removed: denied"));
+        assert!(!is_still_there("its exit could not be read: Input/output error"));
+    }
+
+    #[test]
+    fn the_started_hook_is_not_called_when_the_readers_could_not_start() {
+        let group = Fake::new(&[Look::Exited]).emptied();
+        let hook = |_: i32| group.events.borrow_mut().push("started");
+        let watch = Watch {
+            on_started: Some(&hook),
+            ..quiet_watch()
+        };
+        let why = stopped_watching(&group, FAKE_GROUP, Err(io::Error::other("no pipe")), &watch);
+        assert!(matches!(why, Why::Failed(_)));
+        assert!(group.events.borrow().is_empty(), "{:?}", group.events.borrow());
+    }
+
+    #[test]
+    fn the_started_hook_gets_the_group_of_a_real_child() {
+        let given = Cell::new(None);
+        let hook = |started: i32| given.set(Some((started, group_alive(started))));
+        let watch = Watch {
+            deadline: Some(Instant::now() + HANG_GUARD),
+            on_started: Some(&hook),
+            ..quiet_watch()
+        };
+        let ran = run_watched(sh("echo $$; exit 0"), &watch).expect("sh runs");
+        let leader = first_pid(&ran.stdout);
+        assert_eq!(given.get(), Some((leader, true)), "the leader's group, there while the hook ran");
     }
 
     #[test]
@@ -1511,7 +1598,7 @@ mod tests {
     #[test]
     fn the_login_shell_gives_a_path() {
         let path = login_path().expect("the login shell's PATH is read");
-        assert!(!path.is_empty());
+        assert!(!path.is_empty(), "{path:?}");
         assert!(path.contains("/usr/bin"), "{path}");
     }
 

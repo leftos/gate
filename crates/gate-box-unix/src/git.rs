@@ -437,6 +437,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
             ends_on_gone: mode.ends_on_gone,
             record: self.record.as_ref(),
             check: None,
+            on_started: None,
             on_leader_exit: None,
         };
         let ran = run_watched(command, &watch);
