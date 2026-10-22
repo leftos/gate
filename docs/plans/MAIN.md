@@ -11,7 +11,7 @@
 - [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root — High · Remote
 - [ ] GATE-648 Restore pnpm, bun and npm packages on the Unix box, as the Windows box does — High · Remote
 - [/] GATE-701 Build box inputs on the Unix box, so a repo with inputs can route to a Mac — High · Remote
-- [ ] GATE-702 Bring outputs back from a Mac builder, so yaat's tests can route there — High · Remote
+- [/] GATE-702 Bring outputs back from a Mac builder, so yaat's tests can route there — High · Remote
 - [ ] GATE-574 Take the work lock in the box preflight and stamp the lock's time on each run — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
@@ -229,6 +229,10 @@
 - [ ] GATE-706 List the bares once per keyed prune on the Unix box
 - [ ] GATE-707 Report a Unix box key's ref failure even when its record is left
 - [ ] GATE-708 Tell a stale /Volumes mount point from a mounted builder volume in the Unix prune
+- [ ] GATE-710 Remove the sent-build record at a layout change on the Unix box once it has one
+- [ ] GATE-711 Remove the Unix box's git lock files beneath descriptors, not by path
+- [ ] GATE-712 Remove a deep folder tree on the Unix box without one descriptor per level
+- [ ] GATE-713 Close three low edge cases in the Unix box's inputs verb
 
 ## Design
 
