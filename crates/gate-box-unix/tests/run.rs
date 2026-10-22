@@ -24,6 +24,7 @@ mod unix {
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
+    use gate_inputs::archive::{UnpackError, read_members};
     use gate_inputs::hash::sha256_of;
     use gate_inputs::manifest::{Held, Manifest, Stamp, read_sent};
     use gate_inputs::pack::Packer;
@@ -853,6 +854,146 @@ mod unix {
         assert!(!Path::new(&record).exists(), "the record is removed");
         assert!(!Path::new(&temp).exists(), "its leftover temp is removed");
         assert!(!Path::new(&case.work()).exists(), "the work folder is gone");
+    }
+
+    /// yaat's outputs glob: the TRX files its test runs leave below `TestResults`.
+    const TRX_GLOB: &str = "tests/*/bin/*/*/TestResults/*.trx";
+
+    /// The name of a case's outputs archive.
+    fn archive_name() -> String {
+        format!("{KEY}-{NONCE}.tar.zst")
+    }
+
+    /// The `gate-remote-outputs:` line of a pack of `members` files.
+    fn packed_line(members: usize) -> String {
+        format!("gate-remote-outputs: {members} {}", archive_name())
+    }
+
+    impl Case {
+        /// The case's outputs archive, `<root>/outputs/<key>-<nonce>.tar.zst`.
+        fn archive(&self) -> PathBuf {
+            PathBuf::from(format!("{}/outputs/{}", self.root(), archive_name()))
+        }
+
+        /// The request word of a run of `snapshot` with `keys` set over it, followed by the PC's outputs manifest
+        /// `manifest`, as the client sends a run with output globs.
+        fn outputs_request(&self, snapshot: &str, keys: &Value, manifest: &Manifest) -> String {
+            format!("{}\n{}", self.request(snapshot, keys), manifest.line().trim_end())
+        }
+
+        /// Runs `gate-box box outputs --stdin` for the archive `name` of this case's work folder; its status, the bytes
+        /// it sent and its lines on stderr.
+        fn outputs_sent(&self, name: &str) -> (Option<i32>, Vec<u8>, Vec<String>) {
+            let (root, work) = (self.root(), self.work());
+            let payload = json!({ "Key": KEY, "Work": work, "OutputFolder": format!("{root}/outputs"), "Name": name });
+            let mut child = Command::new(env!("CARGO_BIN_EXE_gate-box"))
+                .args(["box", "outputs", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("gate-box starts");
+            let mut stdin = child.stdin.take().expect("stdin is piped");
+            stdin
+                .write_all(format!("{}\n", STANDARD.encode(payload.to_string())).as_bytes())
+                .expect("the request is written");
+            drop(stdin);
+            let ran = child.wait_with_output().expect("gate-box is waited for");
+            let err = String::from_utf8_lossy(&ran.stderr).lines().map(str::to_owned).collect();
+            (ran.status.code(), ran.stdout, err)
+        }
+    }
+
+    /// The keys of a run running `script` in `sh` and asking for the outputs `globs`.
+    fn outputs_keys(script: &str, globs: &[&str]) -> Value {
+        json!({ "Command": ["/bin/sh", "-c", script], "Outputs": globs })
+    }
+
+    /// The path of each member of the outputs archive `archive`, read as the PC's reader reads it, in its list's order.
+    fn members_of(archive: &[u8]) -> Vec<String> {
+        let items = read_members(archive, 1 << 30, 50_000, &Manifest::default().by_hash(&[]), |_, _, data| {
+            data.read_to_end(&mut Vec::new()).map(drop).map_err(UnpackError::from)
+        })
+        .expect("the archive reads back");
+        items.into_iter().map(|item| item.entry.path).collect()
+    }
+
+    /// The `gate-remote-outputs:` lines `ended` said.
+    fn outputs_said(ended: &Ended) -> Vec<&str> {
+        ended
+            .err
+            .iter()
+            .filter(|line| line.starts_with("gate-remote-outputs:"))
+            .map(String::as_str)
+            .collect()
+    }
+
+    #[test]
+    fn a_run_with_yaat_s_trx_glob_packs_the_trx_and_box_outputs_sends_it_then_removes_it() {
+        let case = Case::new("outputs-trx");
+        let commit = case.snapshot_holding(&[(".gitignore", "bin/\n")]);
+        let trx = "tests/Sim.Tests/bin/Release/net10.0/TestResults/sim.trx";
+        let script = format!("mkdir -p \"$(dirname {trx})\" && echo '<TestRun/>' > {trx}");
+        let request = case.outputs_request(&commit, &outputs_keys(&script, &[TRX_GLOB]), &Manifest::default());
+
+        let ended = ran(&[], &request, Reading::All, &case.base.join("beaten"));
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(outputs_said(&ended), [packed_line(1)], "{:?}", ended.err);
+        let (status, sent, err) = case.outputs_sent(&archive_name());
+        assert_eq!(status, Some(0), "{err:?}");
+        assert!(err.is_empty(), "{err:?}");
+        assert!(!case.archive().exists(), "the archive sent is removed");
+        assert_eq!(members_of(&sent), [trx], "the TRX below TestResults comes back");
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_file_the_pc_manifest_holds_unchanged_is_left_out_of_the_archive() {
+        let case = Case::new("outputs-held");
+        let commit = case.snapshot_holding(&[(".gitignore", "bin/\n")]);
+        let script = "mkdir -p bin && echo same > bin/same.txt && echo new > bin/new.txt";
+        let held = manifest_of(&[("bin/same.txt", b"same\n")]);
+        let request = case.outputs_request(&commit, &outputs_keys(script, &["bin/**"]), &held);
+
+        let ended = ran(&[], &request, Reading::All, &case.base.join("beaten"));
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(outputs_said(&ended), [packed_line(1)], "{:?}", ended.err);
+        let archive = fs::read(case.archive()).expect("the archive is read");
+        assert_eq!(members_of(&archive), ["bin/new.txt"], "the file the PC holds stays out");
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_pair_run_brings_back_from_its_main_tree_only() {
+        let case = Case::new("outputs-pair");
+        let commit = case.snapshot_holding(&[(".gitignore", "bin/\n")]);
+        let script = "mkdir -p bin ../lib/bin && echo x > bin/x.txt && echo c > ../lib/c.txt && echo y > ../lib/bin/y.txt";
+        let held = manifest_of(&[("a.txt", b"a\n")]);
+        let mut keys = case.pair_with_lib();
+        if let (Some(object), Some(outputs)) = (keys.as_object_mut(), outputs_keys(script, &["**/*.txt"]).as_object()) {
+            object.extend(outputs.clone());
+        }
+        let request = case.outputs_request(&commit, &keys, &held);
+
+        let ended = ran(&[], &request, Reading::All, &case.base.join("beaten"));
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(outputs_said(&ended), [packed_line(1)], "{:?}", ended.err);
+        let back = ended
+            .err
+            .iter()
+            .position(|line| line.starts_with("gate: remote back commits: repo none, lib "));
+        let packed = ended.err.iter().position(|line| *line == packed_line(1));
+        assert!(
+            back.is_some() && back < packed,
+            "the back commits line, then the outputs line: {:?}",
+            ended.err
+        );
+        let archive = fs::read(case.archive()).expect("the archive is read");
+        assert_eq!(members_of(&archive), ["bin/x.txt"], "nothing of the sibling's tree comes back");
+        case.ended_clean();
     }
 
     #[test]

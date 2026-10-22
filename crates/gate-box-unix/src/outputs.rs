@@ -35,6 +35,7 @@ use gate_wire::{Payload, archive_file_name, archive_key, escaped};
 use crate::beneath::{self, Folder};
 use crate::console::Console;
 use crate::lines::{FAILED_STATUS, USAGE_STATUS};
+use crate::request::{Unread, bounded_line};
 
 /// How long an outputs archive is kept in the output folder before a run with output globs removes it, as the wrapper's
 /// `$OutputArchiveHours` keeps it.
@@ -90,17 +91,12 @@ impl<'a> Asked<'a> {
 ///
 /// Why the manifest cannot be read, which the run says once its command has passed: a line that reaches the limit
 /// without its newline, a failed read, a line that is not UTF-8, or one that is not a manifest.
-pub fn read_manifest(mut input: impl BufRead) -> Result<Manifest, String> {
-    let limit = MANIFEST_LIMIT as u64;
-    let mut line = Vec::new();
-    input
-        .by_ref()
-        .take(limit)
-        .read_until(b'\n', &mut line)
-        .map_err(|error| format!("the outputs manifest could not be read: {error}"))?;
-    if !line.ends_with(b"\n") && line.len() as u64 >= limit {
-        return Err("the outputs manifest reaches 64 MiB without a newline".to_owned());
-    }
+pub fn read_manifest(input: impl BufRead) -> Result<Manifest, String> {
+    let line = match bounded_line(input, MANIFEST_LIMIT as u64) {
+        Ok(line) => line,
+        Err(Unread::OverLimit) => return Err("the outputs manifest reaches 64 MiB without a newline".to_owned()),
+        Err(Unread::Failed(error)) => return Err(format!("the outputs manifest could not be read: {error}")),
+    };
     let line = String::from_utf8(line).map_err(|_| "the outputs manifest is not UTF-8".to_owned())?;
     Manifest::parse(&line)
 }
@@ -143,6 +139,9 @@ fn tree_folder(asked: &Asked<'_>, tree: &Path) -> io::Result<Folder> {
     let (Some(folders), Some(key)) = (below.next(), below.next()) else {
         return Err(not_below());
     };
+    if folders != OsStr::new("work") {
+        return Err(not_below());
+    }
     let mut folder = beneath::work_beneath_root(&root.join(folders).join(key))?;
     for name in below {
         folder = folder.open_child(name)?;
@@ -430,15 +429,32 @@ fn trim_to_fit(outputs: &Outputs<'_>, archives: &[Archive], mine: &Archive, budg
 
 /// Removes the outputs archive `name` in `folder` unless a pack still writes it: the archive is opened beneath the
 /// folder, a link never followed, and removed only under an exclusive `flock` taken without waiting, which the shared
-/// one its pack holds refuses. Whether it is gone, one already gone counting as removed; `false` when a pack holds it.
+/// one its pack holds refuses; and only while the name still names the file locked, its device and inode looked at
+/// again, so a file another run's pack made at the name since the open is never removed ([`remove_held`]). Whether the
+/// archive opened is gone, one already gone or no longer at its name counting as removed; `false` when a pack holds it.
 fn remove_unless_written(folder: &Folder, name: &OsStr) -> io::Result<bool> {
-    let archive = match folder.open_file(name) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
-        opened => opened?,
-    };
-    match flock(&archive, libc::LOCK_EX | libc::LOCK_NB) {
+    match folder.open_file(name) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        opened => remove_held(folder, name, &opened?),
+    }
+}
+
+/// [`remove_unless_written`] once the archive `name` in `folder` is open as `archive`: removed under an exclusive
+/// `flock` taken without waiting, `false` when a pack holds it. The archive opened counts as gone, the folder's total
+/// no longer holding it, when the name no longer names it after the lock, gone or another file in its place, which is
+/// then left alone.
+fn remove_held(folder: &Folder, name: &OsStr, archive: &File) -> io::Result<bool> {
+    match flock(archive, libc::LOCK_EX | libc::LOCK_NB) {
         Err(error) if error.raw_os_error() == Some(libc::EWOULDBLOCK) => return Ok(false),
         locked => locked?,
+    }
+    let locked = beneath::file_stat(archive)?;
+    let named = match folder.stat_child(name) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        looked => looked?,
+    };
+    if (named.st_dev, named.st_ino) != (locked.st_dev, locked.st_ino) {
+        return Ok(true);
     }
     remove_archive(folder, name).map(|()| true)
 }
@@ -602,8 +618,9 @@ fn folders_beneath<'n>(top: &Folder, names: impl IntoIterator<Item = &'n OsStr>)
 }
 
 /// A walked folder held by its descriptor, its path, and the folder of the file last opened below it, held with its
-/// path relative to the top: a walk lists a folder's files together, so they reach their folder by one chain of opens,
-/// and no more than that one folder is held between opens.
+/// path relative to the top: files packed one after another from the same folder reach it by one chain of opens, and a
+/// file of another folder between them, as an order by path may put one, only costs the chain opened again. No more
+/// than that one folder is held between opens.
 struct Tree<'t> {
     top: &'t Folder,
     top_path: &'t Path,
@@ -633,9 +650,10 @@ impl<'t> Tree<'t> {
         };
         let mut last = self.last.borrow_mut();
         // The folder held before is let go before another is opened, so one chain at most is held.
-        let held = match last.take() {
-            Some((path, folder)) if path == parent => (path, folder),
-            _ => (parent.to_path_buf(), folders_beneath(self.top, parent)?),
+        let reused = last.take().filter(|(path, _)| path == parent);
+        let held = match reused {
+            Some(held) => held,
+            None => (parent.to_path_buf(), folders_beneath(self.top, parent)?),
         };
         let opened = held.1.open_file(leaf);
         *last = Some(held);
@@ -661,11 +679,15 @@ pub struct Brought {
     /// `gate-remote-outputs: <n> <archive>`, or [`NOTHING_PACKED`].
     pub line: String,
     /// The archive written, held under its shared `flock`; `None` when nothing was packed.
-    #[expect(
-        dead_code,
-        reason = "held, never read: its shared flock keeps other runs' trims from removing the archive"
-    )]
     archive: Option<File>,
+}
+
+impl Brought {
+    /// Whether the pack wrote an archive, which the run's [`trim`] then keeps within the budget.
+    #[must_use]
+    pub fn wrote_archive(&self) -> bool {
+        self.archive.is_some()
+    }
 }
 
 /// Packs the files under `asked`'s globs in the folder `work` to bring back after a passing command ([`select`]),
@@ -928,7 +950,7 @@ fn send(folder: &Folder, name: &str, sink: &mut impl Write) -> Result<(), Unsent
     clippy::expect_used,
     reason = "a test whose folders, files, payloads or archives cannot be made must fail loudly"
 )]
-mod tests {
+pub(crate) mod tests {
     use std::ffi::{CString, OsStr};
     use std::fs::{self, File};
     use std::io::{self, Cursor, Read, Write};
@@ -953,7 +975,7 @@ mod tests {
 
     use super::{
         ARCHIVE_AGE, Asked, Brought, GONE_BEFORE_SENT, NOTHING_PACKED, OUTPUTS_BUDGET, Opened, answered, bring_back, budget, listing,
-        not_brought_back, output_folder, pack_file, prune, read_manifest, trim,
+        not_brought_back, output_folder, pack_file, prune, read_manifest, remove_held, trim,
     };
     use crate::beneath::Folder;
     use crate::console::Console;
@@ -1356,10 +1378,36 @@ mod tests {
         manifest
     }
 
+    #[test]
+    fn an_archive_whose_name_another_file_took_after_its_open_counts_as_gone_and_the_other_is_left() {
+        let case = Case::new("trim-swapped");
+        case.made_outputs();
+        let folder = case.outputs();
+        let now = SystemTime::now();
+        sized(&folder, &archive('1'), 100, now, Duration::from_secs(30));
+        let outputs = output_folder(&case.folder, false).expect("the output folder opens");
+        let name = archive('1');
+        let opened = outputs.open_file(OsStr::new(&name)).expect("the archive opens");
+        sized(&case.base, "newer", 7, now, Duration::ZERO);
+        fs::rename(case.base.join("newer"), folder.join(&name)).expect("another file takes the archive's name");
+
+        let gone = remove_held(&outputs, OsStr::new(&name), &opened).expect("the removal is tried");
+
+        assert!(gone, "the archive opened is no longer at its name, so it counts as gone");
+        let left = fs::metadata(folder.join(&name)).expect("the other file is there");
+        assert_eq!(left.len(), 7, "the file that took the name is left alone");
+    }
+
     /// The archive `name` of `case`'s output folder read back, copies of the PC's files taken from `manifest` without
     /// `skip`: each member's path and bytes, and every item listed.
     fn read_back(case: &Case, name: &str, manifest: &Manifest, skip: &[String]) -> (Vec<(String, Vec<u8>)>, Vec<Item>) {
-        let bytes = fs::read(case.outputs().join(name)).expect("the archive is read");
+        read_archive(&case.outputs().join(name), manifest, skip)
+    }
+
+    /// The outputs archive at `path` read back as the PC's reader reads it, copies of the PC's files taken from
+    /// `manifest` without `skip`: each member's path and bytes, and every item listed.
+    pub(crate) fn read_archive(path: &Path, manifest: &Manifest, skip: &[String]) -> (Vec<(String, Vec<u8>)>, Vec<Item>) {
+        let bytes = fs::read(path).expect("the archive is read");
         let mut members = Vec::new();
         let items = read_members(&bytes[..], 1 << 30, 50_000, &manifest.by_hash(skip), |path, _, data| {
             let mut read = Vec::new();

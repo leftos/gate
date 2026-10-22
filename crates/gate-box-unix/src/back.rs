@@ -72,6 +72,33 @@ pub fn back_commit<S: LineSink + 'static>(
     Ok(commits)
 }
 
+/// The `/`-separated paths the main repo's back commit `commit` changes against `HEAD`, as the Windows box's
+/// `back_paths` reads them: `git diff-tree --name-only -r -z` in the main repo's tree, a step of the run's own git
+/// ([`run_git`]) under the work lock `lock`, found along `login_path`, its group recorded so `box stop` ends it.
+///
+/// # Errors
+///
+/// Why they could not be read: the step's failure, or a path that is not UTF-8.
+pub fn back_paths<S: LineSink + 'static>(
+    request: &Request<'_>,
+    lock: &HeldLock,
+    login_path: Option<&str>,
+    output: &Arc<Output<S>>,
+    commit: &str,
+) -> Result<Vec<String>, BackFailed> {
+    let git = run_git(request, lock, login_path, output);
+    let repo = &request.main;
+    let tree = repo.git_tree();
+    let args = tree.args(&["diff-tree", "--name-only", "-r", "-z", "HEAD", commit]);
+    let said = git
+        .step_whole(&repo.step("diff-tree"), &args, GitClass::Short)
+        .map_err(|failed| back_failed(output, failed))?;
+    said.split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8(path.to_vec()).map_err(|_| BackFailed::Step("diff-tree printed a path that is not UTF-8".to_owned())))
+        .collect()
+}
+
 /// After a failed push, the back ref of each repo of `pushed` deleted ([`back_ref_cleared`]), every one tried: a
 /// deletion that fails is said, unless the client is gone, and fails nothing more, the push's own failure ending the
 /// run.

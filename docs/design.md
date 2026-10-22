@@ -1232,6 +1232,8 @@ The optional `builders` is an array of further builders that a routed run can go
 
 A bad entry, an alias that repeats the top-level `host`, an earlier `builders` entry or a `hosts` entry in any ASCII letter case, or a `builders` that is not an array makes the whole file unusable: `gate: ignored <path>: builders[N]...; running locally`. The top-level `outputs` apply to `host` alone; a `builders` entry with no `outputs` brings nothing back when it is `macos` and uses the default output globs when it is `windows`.
 
+A `macos` entry's `outputs` are honoured, since the Unix box brings outputs back.
+
 The transport root, the box line, the pack commands, the push URL, the payload paths, the path map and the PC's caches follow the entry's profile (`Profile`: alias, `os`, `root`). A Windows builder's `root` is honoured; a macOS builder's box line is `<root>/bin/gate-box box <verb> --stdin`, its job is named `gate-remote-<key>-<12 hex>` and its paths are joined with `/`. A `hosts` entry is a Windows builder with the default root and the top-level `slots`, and an id of its own, so its remote pool and its hash-cache paths are not `host`'s; its outputs are `host`'s. Under `--test-remote-transport local:<folder>` (and the other test transports) a Windows entry's root gives way to the transport's folder, and a macOS entry keeps its own root.
 
 `warmup` is an array of repo names, matched in any letter case, that consent to the repo's `.gate/warmup.toml` warming its builder work folders (`Config::warmup_consented`); a repo it does not name, or a file without the key, has no consent.
@@ -2524,6 +2526,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     `MvcTestingAppManifest.json` and `.msCoverageSourceRootsMapping_*` are rewritten from the box's path of each tree of the run to that tree's root on the PC (a run of one repo: the work folder to the worktree; a pair: `{Work}\{leaf}` to the worktree and `{Work}\{name}` to that sibling's worktree), the JSON-escaped form first, then the raw one, case-insensitive, the longest path first.
 
+    A tree from a Unix box (its work folder starts with `/`) is rewritten by its own rule: a file whose name ends `.json` gets the JSON-escaped PC root and any other (`.msCoverageSourceRootsMapping_*`) the plain one, only the prefix replaced and the `/`-separated rest kept, so a coverage mapping reads `C:\src\app/tests/...`. A tree from a Windows box is rewritten as above. A `.trx` is not a records-a-root file and is never rewritten.
+
     A coverage roots file holds lines `{csproj}|{originals;…}={mapped}`, written by Microsoft.CodeCoverage's `MsCoverageReferencedPathMaps` target, one per SourceRoot of a referenced project; the collector reads it at the test session's start, matches each PDB document path against the mapped side and swaps that prefix for the original side when the result exists.
 
     Each package folder is a SourceRoot too, so the file also records the builder's NuGet packages root, which the install does not rewrite: it changes a report only for a source file that comes from a package, in a deterministic CI build (the SDK's SourceRoot map takes precedence over the routed `PathMap`) or under `ExcludeAssembliesWithoutSources=MissingAny` (GATE-528; the fix is GATE-534).
@@ -3783,7 +3787,19 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
 - **Verbs.** `preflight`, `boot`, `run`, `stop`, `prune`, `inputs` and `outputs` are built. `run` readies the tree, runs the command under the watch and syncs the tree back (below), in the Windows box's order, the dotnet tool restore (below) included; the pnpm, bun and npm package restores are not built (GATE-648).
 
-  The run does not use the outputs module yet: a payload with `Outputs` or `OutputsFull` is still refused as not built, so a Mac route brings nothing back. Every other verb (`inflight`, `lfs`, `register-desktop`) says `gate: box <verb> is not built on this builder` and exits 2.
+  The run takes `Outputs` and `OutputsFull` and brings outputs back as the Windows box's run does ([The box side](#the-box-side)), through the `outputs` module below. Where it differs: a run with globs reads one more stdin line after the request, the PC's manifest (at most 64 MiB), after the heartbeat starts and before the layout and checkout, and a run without globs reads nothing past the request line.
+
+  The lines come in this order: the prune's `gate: remote could not remove the old outputs archive <path>: <err>` or `gate: remote could not list the old outputs archives in <folder>: <err>` before the layout; `gate: remote could not list the outputs before the command: <err>` after the tool restore.
+
+  After a command that exited 0 and pushed its back commits (on a pair run after `gate: remote back commits: ...`), `gate: remote outputs: skipped <n> file(s) with names this PC cannot take: <first>[, …]` when any, then `gate-remote-outputs: <n> <key>-<nonce>.tar.zst` or `gate-remote-outputs: 0`.
+
+  A PC found gone before the pack or before the trim ends the run 255 with nothing more said and nothing packed or trimmed after it; an archive already packed stays in the output folder until the 24-hour prune. The `diff-tree` step's output is read whole, never cut at the 1 MiB cap the other git steps keep.
+
+  After those come the trim's lines; and last, on failure, `gate: remote outputs not brought back: <reason>`, which turns a passed run's 0 into 1. A failed command or a failed sync-back packs nothing.
+
+  The not-brought-back reasons the Unix box adds are the bad manifest's own text, `diff-tree printed a path that is not UTF-8`, the lines of a failed `diff-tree` step in the Unix sync-back style, and the over-budget and gone-before-sent reasons. The `diff-tree` step (named `diff-tree <leaf>` on a pair run) runs through the run's killable git steps and is recorded in `<work>.pgid`, only when a back commit was pushed for a run with outputs.
+
+  A pair run brings back from its main tree only. `OutputsFull` with no globs is taken and does nothing. `--test-outputs-budget-bytes` reaches the run. Every other verb (`inflight`, `lfs`, `register-desktop`) says `gate: box <verb> is not built on this builder` and exits 2.
 
   The run checks a payload's `InputsDigest` as the Windows box does ([The box side](#the-box-side)), and refuses a `SentDigest` or `LfsDigest` as not built (`gate-remote-refused: <nonce> <tag>`, then `gate: remote <key> is not built on this builder`, status 75), so the PC runs such a run itself.
 
@@ -3876,15 +3892,17 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   The step failures (`gate: remote inputs <step> failed: <why>`, exit 1) the Unix box adds to the Windows box's are: `the work folder lock <lock> is no longer held`, `the stage <path> is on another volume than the work folder <work>`, `its staged copy changed after the unpack`, `what is at its name after the move is not its staged copy`, `'<prefix>' is the work folder's .git`, `<path> changed before the record was sealed` and `<path> cannot be opened before the record is sealed: <error>`.
 
   A member spelt otherwise than the manifest, in letter case alone included, is `the archive's member '<path>' is not in the manifest`. A copy whose device and inode match a manifest file found at its own spelling is never swept, and every recorded file is opened again and its stamp checked just before the record is sealed.
-- **`outputs`** (`outputs.rs`) answers the Windows box's `outputs` ([The box side](#the-box-side)) with the same payload (`Key`, `Work`, `OutputFolder`, `Name`), lines and statuses, and takes no lock; this lists where the Unix box differs. The run does not use the module yet, so the run still refuses `Outputs` and `OutputsFull` as not built and a Mac route brings nothing back.
+- **`outputs`** (`outputs.rs`) answers the Windows box's `outputs` ([The box side](#the-box-side)) with the same payload (`Key`, `Work`, `OutputFolder`, `Name`), lines and statuses, and takes no lock; this lists where the Unix box differs. The run calls the module, so a Mac route brings outputs back.
 
   The output folder is `<root>/outputs`, made 0700 beneath the judged root, or adopted only when it is private (the box user's own, no mode letting another account in) and not a link; archives are `<key>-<32 hex digits>.tar.zst` with mode 0600, and a folder that cannot be made or adopted says `cannot make the output folder <folder>: it is not the box user's own or its mode lets another account in`. A work folder not below the work root is `the work folder is not below the work root`.
 
   The verb opens the archive without following a link and sends only a plain file: a link says the system's ELOOP text and anything else not plain says `it is not a plain file`, both as `gate: remote could not read the outputs archive <name>: <error>` (exit 1). An output folder or root the verb cannot open is that same line; a missing one is `does not exist`. A sent archive that cannot be removed is `gate: remote could not remove the outputs archive <name>: <error>` and the status stays 0.
 
-  The module also holds what the run will call, with the Windows box's lines: the manifest read, the listing before the command, the pack and bring-back, the 24-hour prune of plain outputs archives, the 50 GiB trim and the `gate-remote-outputs:` lines. An archive gone by the time the prune or the trim looks is not reported.
+  The module also holds what the run calls, with the Windows box's lines: the manifest read, the listing before the command, the pack and bring-back, the 24-hour prune of plain outputs archives, the 50 GiB trim and the `gate-remote-outputs:` lines. An archive gone by the time the prune or the trim looks is not reported.
 
-  A pack holds a shared `flock` on its own archive from its creation until the run's trim is done, and a trim removes another archive only under a non-blocking exclusive `flock`, passing over one a pack still writes, as the Windows box's share mode keeps it. A trim that can no longer open the output folder (no longer private, or the root no longer judged) says `gate: remote outputs not brought back: cannot open the output folder <folder>: <error>`.
+  A pack holds a shared `flock` on its own archive from its creation until the run's trim is done, and a trim removes another archive only under a non-blocking exclusive `flock`, passing over one a pack still writes, as the Windows box's share mode keeps it, and over one whose device and inode changed after it was locked.
+
+  A work folder whose middle name is not `work` is refused as not a tree folder. A trim that can no longer open the output folder (no longer private, or the root no longer judged) says `gate: remote outputs not brought back: cannot open the output folder <folder>: <error>`.
 
   The walk goes beneath the work folder's descriptors one component at a time: a link is never followed or listed, only a plain file is listed (a fifo, socket or device is not), and a hard-linked file is packed. The stamp is the size and the last write in nanoseconds, compared box against box only, and a file last written before 1970 fails the pack (`<path> was last written before 1970`).
 

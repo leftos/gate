@@ -35,7 +35,7 @@ pub fn read_request(input: impl BufRead) -> Result<Payload, String> {
 
 /// Why a line could not be read.
 #[derive(Debug)]
-enum Unread {
+pub(crate) enum Unread {
     /// The line reached its limit without a newline.
     OverLimit,
     /// The input failed.
@@ -45,7 +45,7 @@ enum Unread {
 /// The next line of `input`, up to and with its newline, or to the end of the input; empty at the end of the input. It
 /// never waits past the newline and never reads more than `limit` bytes: a line that reaches `limit` without its
 /// newline cannot be read.
-fn bounded_line(mut input: impl BufRead, limit: u64) -> Result<Vec<u8>, Unread> {
+pub(crate) fn bounded_line(mut input: impl BufRead, limit: u64) -> Result<Vec<u8>, Unread> {
     let mut line = Vec::new();
     input.by_ref().take(limit).read_until(b'\n', &mut line).map_err(Unread::Failed)?;
     if !line.ends_with(b"\n") && line.len() as u64 >= limit {

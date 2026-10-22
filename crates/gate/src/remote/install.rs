@@ -733,7 +733,9 @@ fn records_a_root(path: &str) -> bool {
 
 /// Rewrites each box tree of `trees` to the PC root paired with it in the text file at `path`, shown as `shown`, as
 /// [`replaced`] matches them: their JSON-escaped forms (each `\` doubled) first, then their raw forms, each without
-/// regard to case as .NET's `OrdinalIgnoreCase` compares. The file is read in the encoding its byte order mark names
+/// regard to case as .NET's `OrdinalIgnoreCase` compares. A tree holding no `\`, a Unix box's, reads the same in both
+/// forms, so the file's kind decides: the test host's [`TEST_HOST_MANIFEST`], JSON, gets the JSON-escaped PC root, any
+/// other the raw one. The file is read in the encoding its byte order mark names
 /// ([`Encoding`]): UTF-8, or UTF-16 in the byte order its mark gives, read as 16-bit units. A file whose text changes
 /// is written back in the same encoding, with the same byte order mark, and its last write kept. Else the skip
 /// ([`CannotRewrite::Skipped`]): a file over [`REWRITE_LIMIT`] bytes, refused before it is read, or one whose body is
@@ -752,8 +754,11 @@ fn rewrite_file(path: &Path, shown: &str, trees: &[(String, String)]) -> Result<
     // Which byte is not text in the encoding the mark names is no use to the reader; that the file is not is the one
     // reason said.
     let (encoding, text) = decoded(&bytes).ok_or(CannotRewrite::Skipped(Unrewritable::NotText))?;
+    let json = shown.rsplit('/').next().is_some_and(|name| name.eq_ignore_ascii_case(TEST_HOST_MANIFEST));
+    // A tree with no `\` (a Unix box's) reads the same escaped or not, so the file's kind says which root it gets.
     let escaped_trees: Vec<(String, String)> = trees
         .iter()
+        .filter(|(tree, _)| json || tree.contains('\\'))
         .map(|(tree, pc_root)| (tree.replace('\\', r"\\"), pc_root.replace('\\', r"\\")))
         .collect();
     let escaped = replaced(&text, &escaped_trees);
@@ -1305,6 +1310,62 @@ mod tests {
             fs::read_to_string(&untouched).expect("the file is there"),
             raw,
             "another file is left alone"
+        );
+    }
+
+    #[test]
+    fn a_unix_box_work_folder_is_rewritten_to_the_pc_root_and_the_slash_separated_rest_is_kept() {
+        let stage = scratch("rewrite-unix");
+        let unix_work = "/Users/b/gate-remote/work/app-1a2b3c4d";
+        let text = |root: &str| format!(r#"<Deployment runDeploymentRoot="{root}/tests/App.Tests/bin" /><File path="{root}/tests/a.cs" />"#);
+        let coverage = put(&stage, "bin/.msCoverageSourceRootsMapping_App", text(unix_work).as_bytes());
+        let trees = vec![(unix_work.to_owned(), PC_ROOT.to_owned())];
+
+        assert_eq!(
+            rewritten(&stage, &[entry("bin/.msCoverageSourceRootsMapping_App")], &trees),
+            Ok(Vec::new())
+        );
+
+        assert_eq!(
+            fs::read_to_string(&coverage).expect("the file is there"),
+            text(PC_ROOT),
+            "only the box tree is replaced; the rest keeps its `/`"
+        );
+    }
+
+    #[test]
+    fn a_coverage_mapping_named_like_json_gets_the_plain_pc_root_for_a_unix_box_work_folder() {
+        let stage = scratch("rewrite-unix-json-named");
+        let unix_work = "/Users/b/gate-remote/work/app-1a2b3c4d";
+        let path = "bin/.msCoverageSourceRootsMapping_App.Json";
+        let coverage = put(&stage, path, format!("{unix_work}/src;{unix_work}/tests\n").as_bytes());
+        let trees = vec![(unix_work.to_owned(), PC_ROOT.to_owned())];
+
+        assert_eq!(rewritten(&stage, &[entry(path)], &trees), Ok(Vec::new()));
+
+        assert_eq!(
+            fs::read_to_string(&coverage).expect("the file is there"),
+            format!("{PC_ROOT}/src;{PC_ROOT}/tests\n"),
+            "only the test host's manifest takes the JSON-escaped root"
+        );
+    }
+
+    #[test]
+    fn a_unix_box_work_folder_in_a_json_test_host_manifest_reads_back_as_the_pc_root_and_the_slash_separated_rest() {
+        let stage = scratch("rewrite-unix-json");
+        let unix_work = "/Users/b/gate-remote/work/app-1a2b3c4d";
+        let json = format!(r#"{{"App":"{unix_work}/src/App","Tests":"{unix_work}/tests/App.Tests"}}"#);
+        let manifest = put(&stage, "bin/MvcTestingAppManifest.json", json.as_bytes());
+        let trees = vec![(unix_work.to_owned(), PC_ROOT.to_owned())];
+
+        assert_eq!(rewritten(&stage, &[entry("bin/MvcTestingAppManifest.json")], &trees), Ok(Vec::new()));
+
+        let text = fs::read_to_string(&manifest).expect("the file is there");
+        let read: serde_json::Value = serde_json::from_str(&text).expect("the file is still JSON");
+        assert_eq!(
+            read,
+            serde_json::json!({ "App": format!("{PC_ROOT}/src/App"), "Tests": format!("{PC_ROOT}/tests/App.Tests") }),
+            "{text}"
         );
     }
 

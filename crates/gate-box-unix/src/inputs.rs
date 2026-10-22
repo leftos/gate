@@ -50,6 +50,7 @@ use crate::files::{self, HeldLock, Locked};
 use crate::git::Git;
 use crate::lines::{FAILED_STATUS, USAGE_STATUS};
 use crate::preflight::checked_root;
+use crate::request::{Unread, bounded_line};
 use crate::run::{self, Laying, NotLaidOut, REFUSED_STATUS, Repo, Unbuilt};
 use crate::stop::records_folder;
 
@@ -168,14 +169,11 @@ struct Job<'j> {
 /// [`MANIFEST_LIMIT`] bytes ([`read_sent`]); else why it cannot be read, a path in it the box does not take
 /// ([`refused_path`]) among them.
 fn read_manifest(input: &mut impl BufRead) -> Result<Sent, String> {
-    let limit = MANIFEST_LIMIT as u64;
-    let mut line = Vec::new();
-    Read::take(&mut *input, limit)
-        .read_until(b'\n', &mut line)
-        .map_err(|error| format!("the inputs manifest could not be read: {error}"))?;
-    if !line.ends_with(b"\n") && line.len() as u64 >= limit {
-        return Err("the inputs manifest reaches 64 MiB without a newline".to_owned());
-    }
+    let line = match bounded_line(&mut *input, MANIFEST_LIMIT as u64) {
+        Ok(line) => line,
+        Err(Unread::OverLimit) => return Err("the inputs manifest reaches 64 MiB without a newline".to_owned()),
+        Err(Unread::Failed(error)) => return Err(format!("the inputs manifest could not be read: {error}")),
+    };
     let (manifest, digest) = read_sent(line)?;
     Ok(Sent { manifest, digest })
 }

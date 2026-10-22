@@ -80,6 +80,8 @@ A macOS builder (an Apple-silicon Mac, a dedicated builder nobody works on) is s
 
 `remote.json`'s `builders` array (an entry with `os` `macos` and a `root`) is read and routes ([design.md, remote.json](design.md#remotejson)), and the transport, payload layout, path map and PC caches follow the entry's profile.
 
+A Mac entry may carry `outputs`, and its box brings them back like a Windows builder's (a route whose output is a TRX, as yaat's, works). A build whose outputs are launched on the PC still stays off the Mac (GATE-696).
+
 The words a macOS builder is sent are spelled for the Mac: the recognised paths use `/`, and a relative word written with `\` (`src\Duel.sln`) is sent with `/` when the snapshot carries that file or folder, in its exact letter case. A word that still holds a `\` (a regex, a list, script text after `bash -c` or `pwsh -Command`, a path the repo does not carry) keeps the command off the Mac: it runs on a Windows builder or here, silently. A Windows builder is sent the words as written. Details: [design.md, Routing](design.md#routing).
 
 - **Toolchain steps** need no sudo and land under `--prefix` (default `~/gate-tools`), Rust under `CARGO_HOME` and `RUSTUP_HOME`: .NET SDK 10.0.401 and 8.0.425, the wasm-tools workload, PowerShell, Node.js, pnpm, uv and prek, Rust, cargo-nextest, Git LFS, Godot 4.7.2 mono, Bun.

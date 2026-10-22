@@ -1,17 +1,19 @@
 //! `gate-box box run`: the request read and checked as the Windows box reads it, what this builder does not build
 //! refused so the PC runs the command itself, the work root checked, the work lock taken, the subfolder placed, the work
-//! folder laid out, the inputs the PC sent checked and the payload's snapshot checked out; then the command run and the tree it left synced back
-//! ([`run`]). Each line is said as the Windows box says it, byte for byte.
+//! folder laid out, the inputs the PC sent checked and the payload's snapshot checked out; then the command run, the tree it left synced back
+//! and, after a passing command, its outputs packed for the PC to fetch ([`run`]). Each line is said as the Windows box says it, byte for
+//! byte.
 
 use std::ffi::{CStr, OsStr};
 use std::fs;
-use std::io;
+use std::io::{self, BufRead};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use gate_args::BoxSeams;
+use gate_inputs::manifest::{Listing, Manifest};
 use gate_wire::{PairSibling, PathForm, Payload, Refusal, bare_stem, busy_line, escaped, layout_line, refused_line, trees};
 
 use gate_watchdog::Pump;
@@ -21,13 +23,16 @@ use crate::beneath;
 use crate::command::{Launch, Sampler, command_record, run_command};
 use crate::console::{Forwarding, LineSink, Output, Stream};
 use crate::files::{self, HeldLock, Locked};
-use crate::git::{self, AlternatesFailure, Failed, Git, GitClass, RunGit, Steps, Tree, failed_for, for_repo, line_ends_set, origin_set};
+use crate::git::{
+    self, AlternatesFailure, CLOSED_STATUS, Failed, Git, GitClass, RunGit, Steps, Tree, failed_for, for_repo, line_ends_set, origin_set,
+};
 use crate::heartbeat::{self, Periods};
 use crate::inputs::{self, Unmatched};
 use crate::lines::{
     Along, BACK_COMMITS_FAILED, CommandEnd, FAILED_STATUS, Godot, LAYOUT_CHANGING, Login, Translation, USAGE_STATUS, back_commits_line,
     command_status, layout_text, login_path_line, names_another_layout, recorded_group, rosetta_lines, signal_guard, translation, work_layout,
 };
+use crate::outputs::{self, Asked};
 use crate::preflight::{checked_root, layout_record};
 use crate::probe;
 use crate::process::{self, GroupRecord};
@@ -166,14 +171,16 @@ pub struct Request<'p> {
     pub godot: Option<&'p str>,
     /// The digest of the inputs manifest the PC sent before the run, `InputsDigest`; `None` for none.
     pub inputs_digest: Option<&'p str>,
+    /// The outputs the run brings back after a passing command, `Outputs` and `OutputsFull`; `None` without globs.
+    pub outputs: Option<Asked<'p>>,
     /// The first thing the payload asks for that this builder does not build, in the order the payload is read.
     unbuilt: Option<Unbuilt>,
 }
 
 impl<'p> Request<'p> {
-    /// Reads `payload` in the order the Windows box reads it, each key checked as it does; then notes the first key
-    /// asking for what this builder does not build: `Outputs`, `OutputsFull`, `Desktop`, a warm-up's
-    /// `WarmCommands`, `EngineEnv`, `UnrealVersion`, `SentDigest` or `LfsDigest`; then, last, the
+    /// Reads `payload` in the order the Windows box reads it, each key checked as it does, the outputs asked for
+    /// ([`Asked::new`]) read once the output folder is; then notes the first key asking for what this builder does not
+    /// build: `Desktop`, a warm-up's `WarmCommands`, `EngineEnv`, `UnrealVersion`, `SentDigest` or `LfsDigest`; then, last, the
     /// repos ([`repos`]), a sibling pair as `gate-wire` checks it. A work root holding a `:` is refused just after the
     /// work folder is read ([`work_layout`]).
     ///
@@ -186,7 +193,7 @@ impl<'p> Request<'p> {
         let (root, parent) = work_layout(work)?;
         let (globs, full) = (payload.output_globs()?, payload.outputs_full()?);
         let nonce = payload.nonce()?;
-        payload.output_folder(work)?;
+        let outputs = Asked::new(&globs, full, key, nonce, payload.output_folder(work)?)?;
         let (timeout, host) = (payload.timeout()?, payload.optional_text("Host")?);
         let desktop = payload.desktop()?;
         if desktop && payload.desktop_wait()?.is_none() {
@@ -213,8 +220,6 @@ impl<'p> Request<'p> {
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
         let (main, siblings) = repos(payload, work, bare, snapshot)?;
         let unbuilt = [
-            (!globs.is_empty(), Refusal::Layout, "Outputs"),
-            (full, Refusal::Layout, "OutputsFull"),
             (desktop, Refusal::Desktop, "Desktop"),
             (warm, Refusal::Layout, "WarmCommands"),
             (engine_env, Refusal::Layout, "EngineEnv"),
@@ -243,6 +248,7 @@ impl<'p> Request<'p> {
             env,
             godot,
             inputs_digest,
+            outputs,
             unbuilt,
         })
     }
@@ -320,6 +326,41 @@ pub struct Ready<'p> {
     /// The run's own temp folder, the command's `TMPDIR`, removed at the run's end ([`temp_removed`]); `None` when the
     /// caller's `Env` sets `TMPDIR`.
     pub temp: Option<RunTemp>,
+    /// The PC's outputs manifest and the listing taken before the command, for a run with output globs; `None`
+    /// without.
+    pub outputs: Option<RunOutputs>,
+}
+
+/// A run's outputs as they stand before its command, as the Windows box's `RunOutputs` holds them: the PC's manifest
+/// or why it could not be read, said only once the command has passed, and the listing of the files under the globs
+/// taken before the command, `None` under `OutputsFull`.
+pub struct RunOutputs {
+    /// The PC's manifest, or why it could not be read.
+    pub manifest: Result<Manifest, String>,
+    /// The listing taken before the command; `None` until then and under `OutputsFull`.
+    pub listing: Option<Listing>,
+}
+
+impl RunOutputs {
+    /// Reads the PC's manifest from `input`, up to its first newline ([`outputs::read_manifest`]), then removes the
+    /// output folder's old archives ([`outputs::prune`]), saying each line through `output`.
+    fn read<S: LineSink>(asked: &Asked<'_>, input: &mut dyn BufRead, output: &Output<S>) -> RunOutputs {
+        let manifest = outputs::read_manifest(input);
+        for line in outputs::prune(asked, SystemTime::now()) {
+            noted(output, &line);
+        }
+        RunOutputs { manifest, listing: None }
+    }
+
+    /// Takes the listing of the files under `asked`'s globs in `work` ([`outputs::listing`]), saying through `output`
+    /// that it could not be taken.
+    fn list<S: LineSink>(&mut self, asked: &Asked<'_>, work: &Path, output: &Output<S>) {
+        let (listing, line) = outputs::listing(asked, work);
+        if let Some(line) = line {
+            noted(output, &line);
+        }
+        self.listing = listing;
+    }
 }
 
 /// The template `mkdtemp(3)` names each run's temp folder from: short, so the sockets .NET makes under it fit.
@@ -483,18 +524,71 @@ pub type LoginShell = fn() -> Result<Login, String>;
 /// `<work>.pgid` under the run's job while it runs. The heartbeat starts once the subfolder is placed, before the layout
 /// and the checkout, beating every `periods.heartbeat` ([`heartbeat::start`]). The login shell's `PATH` is read from
 /// `login` just before the first git step, after every refusal said before it ([`login_read`]). No start marker
-/// is said.
+/// is said. The heartbeat starts with `sources`' `start`, and one that cannot start is said and the run goes on
+/// without it; a run with output globs reads the PC's outputs manifest from its `input` ([`locked`]).
 ///
 /// # Errors
 ///
 /// The status the run ends on, its lines said.
-pub fn prepare<'p, S: LineSink + 'static>(
+fn prepared<'p, S: LineSink + 'static>(
     payload: &'p Payload,
     output: &Arc<Output<S>>,
     periods: Periods,
-    login: LoginShell,
+    sources: Sources<'_>,
 ) -> Result<Ready<'p>, u8> {
-    prepared(payload, output, periods, login, heartbeat::start)
+    let request = Request::read(payload).map_err(|line| said(output, &[&line], USAGE_STATUS))?;
+    if let Some(unbuilt) = request.unbuilt {
+        return Err(refused(output, &request, unbuilt.refusal, &unbuilt.line(&request.main.bare)));
+    }
+    match translation(crate::command::proc_translated()) {
+        Translation::Native => {}
+        Translation::Unread(line) => {
+            // A note: the run goes on, and a client gone finds out at the next line.
+            let _ = output.say(Stream::Err, &line);
+        }
+        Translation::Rosetta => {
+            let [tag, line] = rosetta_lines(request.nonce);
+            return Err(said(output, &[&tag, &line], REFUSED_STATUS));
+        }
+    }
+    // A usage error says no back commits line; a root or a bare repository the box cannot use, as a lock it cannot
+    // open, is a pair run's back commits never made, as the Windows box says it.
+    root_checked(&request).map_err(|(line, status)| match status {
+        FAILED_STATUS => back_commits_failed(output, &request, said(output, &[&line], status)),
+        _ => said(output, &[&line], status),
+    })?;
+    let lock = match files::take_lock(Path::new(request.lock)) {
+        Ok(Locked::Held(lock)) => lock,
+        Ok(Locked::Busy) => return Err(refused(output, &request, Refusal::Busy, &busy_line(request.key))),
+        Err(error) => {
+            let line = format!("gate: remote could not open the work folder lock {}: {error}", request.lock);
+            return Err(back_commits_failed(output, &request, said(output, &[&line], FAILED_STATUS)));
+        }
+    };
+    match locked(&request, &lock, output, periods.heartbeat, sources) {
+        Ok(Placed {
+            place,
+            pump,
+            login_path,
+            godot_root,
+            temp,
+            outputs,
+        }) => Ok(Ready {
+            request,
+            lock,
+            place,
+            pump,
+            periods,
+            login_path,
+            godot_root,
+            temp,
+            outputs,
+        }),
+        // A refusal sends the PC to run the command itself; any other end, whatever its status, is a pair run's back
+        // commits never made.
+        Err(Unready::Refused) => Err(REFUSED_STATUS),
+        Err(Unready::Ended(status)) => Err(back_commits_failed(output, &request, status)),
+    }
 }
 
 /// The login shell's `PATH` and `GATE_GODOT_ROOT` read from `login`, the `PATH`'s empty and relative folders left out;
@@ -544,11 +638,14 @@ pub struct Watches {
     pub periods: Periods,
     /// Where the ceiling reads the machine's load from.
     pub sampler: Sampler,
+    /// The bytes the output folder's archives are trimmed to after a pack ([`outputs::trim`]).
+    pub budget: u64,
 }
 
 impl Watches {
     /// The watches `seams` ask for: `--test-heartbeat-ms` and `--test-box-sample-ms` over [`Periods::default`];
-    /// `--test-box-sampler-fail`, else `--test-box-free-percent`, over [`Sampler::Machine`], as the Windows box reads
+    /// `--test-box-sampler-fail`, else `--test-box-free-percent`, over [`Sampler::Machine`], and
+    /// `--test-outputs-budget-bytes` over [`outputs::OUTPUTS_BUDGET`] ([`outputs::budget`]), as the Windows box reads
     /// them. All defaults in a box built without the `test-seams` feature.
     #[must_use]
     pub fn of(seams: &BoxSeams) -> Watches {
@@ -562,28 +659,49 @@ impl Watches {
             (false, Some(percent)) => Sampler::FreePercent(percent),
             (false, None) => Sampler::Machine,
         };
-        Watches { periods, sampler }
+        Watches {
+            periods,
+            sampler,
+            budget: outputs::budget(seams),
+        }
     }
 }
 
 /// Runs `payload`'s run, saying its lines through `output`, watched as `watches` says; the status the box exits with.
 ///
-/// The login shell's `PATH` is read once, by [`prepare`] ([`process::login_shell`]); the git steps and the command run
+/// The login shell's `PATH` is read once, by [`prepared`] ([`process::login_shell`]); the git steps and the command run
 /// along it ([`run_along`]), and a Godot run finds its install under the login shell's `GATE_GODOT_ROOT`.
 pub fn run<S: LineSink + 'static>(payload: &Payload, output: &Arc<Output<S>>, watches: Watches) -> u8 {
     run_along(payload, output, watches, process::login_shell)
 }
 
-/// [`run`], the login shell's `PATH` read from `login`, in the Windows box's order: the run readied ([`prepare`]), the
-/// heartbeat beating from the subfolder's check; the command run ([`run_command`]); the back commit made and pushed
-/// when the command reached an end of its own ([`synced_back`]); then the run's temp folder removed
-/// ([`temp_removed`]), the heartbeat stopped ([`heartbeat::stop`]), and the work lock let go.
+/// [`run`], the login shell's `PATH` read from `login` and the PC's outputs manifest from stdin ([`run_reading`]).
 fn run_along<S: LineSink + 'static>(payload: &Payload, output: &Arc<Output<S>>, watches: Watches, login: LoginShell) -> u8 {
-    let ready = match prepare(payload, output, watches.periods, login) {
+    run_reading(payload, output, watches, login, &mut io::stdin().lock())
+}
+
+/// [`run`], the login shell's `PATH` read from `login` and the PC's outputs manifest from `input`, in the Windows box's
+/// order: the run readied ([`prepared`]), the heartbeat beating from the subfolder's check; the command run
+/// ([`run_command`]); the back commit made and pushed when the command reached an end of its own, then, after a
+/// passing command, its outputs brought back ([`synced_back`]); then the run's temp folder removed
+/// ([`temp_removed`]), the heartbeat stopped ([`heartbeat::stop`]), and the work lock let go.
+fn run_reading<S: LineSink + 'static>(
+    payload: &Payload,
+    output: &Arc<Output<S>>,
+    watches: Watches,
+    login: LoginShell,
+    input: &mut dyn BufRead,
+) -> u8 {
+    let sources = Sources {
+        login,
+        start: heartbeat::start,
+        input,
+    };
+    let ready = match prepared(payload, output, watches.periods, sources) {
         Ok(ready) => ready,
         Err(status) => return status,
     };
-    let status = commanded(&ready, output, watches.sampler);
+    let status = commanded(&ready, output, watches);
     let Ready { pump, lock, temp, .. } = ready;
     if let Some(temp) = temp {
         temp_removed(temp, output);
@@ -595,11 +713,11 @@ fn run_along<S: LineSink + 'static>(payload: &Payload, output: &Arc<Output<S>>, 
     status
 }
 
-/// The status of the run `ready` once its command has run, sampled from `sampler`: the command's own
-/// ([`command_status`]), the back commit made only after an end of its own ([`of_its_own`]). A run with a chosen Godot
-/// version runs with the install of it under the login shell's `GATE_GODOT_ROOT` ([`probe::installed_godot`]), or with
-/// Godot missing when there is no root or no such install.
-fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, sampler: Sampler) -> u8 {
+/// The status of the run `ready` once its command has run, sampled from `watches`' sampler: the command's own
+/// ([`command_status`]), the back commit made only after an end of its own ([`of_its_own`]) and the outputs trimmed to
+/// `watches`' budget. A run with a chosen Godot version runs with the install of it under the login shell's
+/// `GATE_GODOT_ROOT` ([`probe::installed_godot`]), or with Godot missing when there is no root or no such install.
+fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, watches: Watches) -> u8 {
     let request = &ready.request;
     let login_path = ready.login_path.as_deref();
     let installed;
@@ -628,7 +746,7 @@ fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, 
         timeout: request.timeout,
         host: request.host,
         sample: ready.periods.sample,
-        sampler,
+        sampler: watches.sampler,
         pump: ready.pump.as_ref(),
     };
     let end = run_command(&launch, output);
@@ -636,7 +754,7 @@ fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, 
     if !of_its_own(end) {
         return back_commits_failed(output, request, status);
     }
-    synced_back(ready, output, status)
+    synced_back(ready, output, status, watches.budget)
 }
 
 /// Whether the command that ended as `end` reached an end of its own, an exit or a signal the box did not send, which
@@ -650,95 +768,121 @@ fn of_its_own(end: CommandEnd) -> bool {
 /// The status of the run `ready`, whose command ended with `status`, once its back commits were made and pushed
 /// ([`back::back_commit`]): `status`, a pair run saying each repo's commit on one line ([`back_commits_line`]); a back
 /// commit that failed says, on a pair run, [`BACK_COMMITS_FAILED`], then `gate: remote sync-back failed: <why>`, and
-/// gives [`FAILED_STATUS`] for a command that exited 0, else `status`; a client gone gives the closed status.
-fn synced_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, status: u8) -> u8 {
+/// gives [`FAILED_STATUS`] for a command that exited 0, else `status`; a client gone gives the closed status. Once the
+/// back commits are pushed, a command that exited 0 with output globs has its outputs brought back ([`brought_back`]),
+/// which gives its status; a failed command or a failed sync-back packs nothing.
+fn synced_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, status: u8, budget: u64) -> u8 {
     let request = &ready.request;
-    match back::back_commit(request, &ready.lock, ready.login_path.as_deref(), output) {
-        Ok(_) if request.siblings.is_empty() => status,
-        Ok(commits) => {
-            let named: Vec<(&str, Option<&str>)> = request
-                .repos()
-                .zip(&commits)
-                .map(|(repo, commit)| (repo.name.as_deref().unwrap_or_default(), commit.as_deref()))
-                .collect();
-            said(output, &[&back_commits_line(&named)], status)
-        }
-        Err(BackFailed::Gone(failed)) => failure(output, &failed),
+    let commits = match back::back_commit(request, &ready.lock, ready.login_path.as_deref(), output) {
+        Ok(commits) => commits,
+        Err(BackFailed::Gone(failed)) => return failure(output, &failed),
         Err(BackFailed::Step(why)) => {
             let failed = if status == 0 { FAILED_STATUS } else { status };
             let line = format!("gate: remote sync-back failed: {why}");
-            if request.siblings.is_empty() {
+            return if request.siblings.is_empty() {
                 said(output, &[&line], failed)
             } else {
                 said(output, &[BACK_COMMITS_FAILED, &line], failed)
-            }
+            };
         }
+    };
+    if !request.siblings.is_empty() {
+        let named: Vec<(&str, Option<&str>)> = request
+            .repos()
+            .zip(&commits)
+            .map(|(repo, commit)| (repo.name.as_deref().unwrap_or_default(), commit.as_deref()))
+            .collect();
+        said(output, &[&back_commits_line(&named)], status);
     }
+    match (&request.outputs, &ready.outputs) {
+        (Some(asked), Some(read)) if status == 0 => {
+            let main = commits.first().and_then(Option::as_deref);
+            brought_back(ready, (asked, read), main, output, budget)
+        }
+        _ => status,
+    }
+}
+
+/// The status of the passing run `ready` once its outputs `asked`, read before the command as `read`, are brought back
+/// from the main repo's tree alone, as the Windows box's `RunOutputs` brings them: the paths the main repo's back
+/// commit `main` changes read first ([`back::back_paths`]), none without one, and left out; then the pack
+/// ([`outputs::bring_back`]), its skipped line, when there is one, and its `gate-remote-outputs:` line said; then, when
+/// it wrote an archive, the output folder trimmed to `budget` bytes ([`outputs::trim`]), each line said, the archive
+/// held under its pack's lock until the trim is done. 0, or [`FAILED_STATUS`] with
+/// [`outputs::not_brought_back`]'s line when the outputs are not brought back; a client gone while the paths are read,
+/// or found gone before the pack or before the trim, gives the closed status, nothing more packed or trimmed.
+fn brought_back<S: LineSink + 'static>(
+    ready: &Ready<'_>,
+    (asked, read): (&Asked<'_>, &RunOutputs),
+    main: Option<&str>,
+    output: &Arc<Output<S>>,
+    budget: u64,
+) -> u8 {
+    let request = &ready.request;
+    // Read after the push and only for outputs, so failing to read them fails the outputs, never the sync-back.
+    let skip = match main.map(|commit| back::back_paths(request, &ready.lock, ready.login_path.as_deref(), output, commit)) {
+        None => Ok(Vec::new()),
+        Some(Ok(paths)) => Ok(paths),
+        Some(Err(BackFailed::Gone(failed))) => return failure(output, &failed),
+        Some(Err(BackFailed::Step(why))) => Err(why),
+    };
+    let work = Path::new(request.tree());
+    if output.client_gone() {
+        return CLOSED_STATUS;
+    }
+    let brought = match skip.and_then(|skip| outputs::bring_back(asked, &read.manifest, read.listing.as_ref(), work, &skip)) {
+        Ok(brought) => brought,
+        Err(reason) => return said(output, &[&outputs::not_brought_back(&reason)], FAILED_STATUS),
+    };
+    if let Some(skipped) = &brought.skipped {
+        noted(output, skipped);
+    }
+    noted(output, &brought.line);
+    if !brought.wrote_archive() {
+        return 0;
+    }
+    // A PC gone takes no archive, so none is trimmed for it: the closed status, as the run's other steps end on.
+    if output.client_gone() {
+        return CLOSED_STATUS;
+    }
+    let trimmed = outputs::trim(asked, budget);
+    // Held to here, so no other run's trim removes the archive before this one's is done.
+    drop(brought);
+    for line in &trimmed.lines {
+        noted(output, line);
+    }
+    match &trimmed.reason {
+        Some(reason) => said(output, &[&outputs::not_brought_back(reason)], FAILED_STATUS),
+        None => 0,
+    }
+}
+
+/// Says `line` on stderr, unless the client is gone: a line the run goes on past.
+fn noted<S: LineSink>(output: &Output<S>, line: &str) {
+    said(output, &[line], 0);
 }
 
 /// How a run starts its heartbeat: [`heartbeat::start`], or a test's own.
 type StartBeat = fn(Arc<dyn Forwarding>, Duration) -> io::Result<Pump>;
 
-/// [`prepare`], the heartbeat started with `start`; a heartbeat that cannot start is said and the run goes on without
-/// one.
-fn prepared<'p, S: LineSink + 'static>(
-    payload: &'p Payload,
-    output: &Arc<Output<S>>,
-    periods: Periods,
+/// Where a run reads what its payload does not hold: the login shell's `PATH`, how its heartbeat starts, and the input
+/// the PC's outputs manifest follows the request line on.
+struct Sources<'i> {
     login: LoginShell,
     start: StartBeat,
-) -> Result<Ready<'p>, u8> {
-    let request = Request::read(payload).map_err(|line| said(output, &[&line], USAGE_STATUS))?;
-    if let Some(unbuilt) = request.unbuilt {
-        return Err(refused(output, &request, unbuilt.refusal, &unbuilt.line(&request.main.bare)));
-    }
-    match translation(crate::command::proc_translated()) {
-        Translation::Native => {}
-        Translation::Unread(line) => {
-            // A note: the run goes on, and a client gone finds out at the next line.
-            let _ = output.say(Stream::Err, &line);
-        }
-        Translation::Rosetta => {
-            let [tag, line] = rosetta_lines(request.nonce);
-            return Err(said(output, &[&tag, &line], REFUSED_STATUS));
-        }
-    }
-    // A usage error says no back commits line; a root or a bare repository the box cannot use, as a lock it cannot
-    // open, is a pair run's back commits never made, as the Windows box says it.
-    root_checked(&request).map_err(|(line, status)| match status {
-        FAILED_STATUS => back_commits_failed(output, &request, said(output, &[&line], status)),
-        _ => said(output, &[&line], status),
-    })?;
-    let lock = match files::take_lock(Path::new(request.lock)) {
-        Ok(Locked::Held(lock)) => lock,
-        Ok(Locked::Busy) => return Err(refused(output, &request, Refusal::Busy, &busy_line(request.key))),
-        Err(error) => {
-            let line = format!("gate: remote could not open the work folder lock {}: {error}", request.lock);
-            return Err(back_commits_failed(output, &request, said(output, &[&line], FAILED_STATUS)));
-        }
+    input: &'i mut dyn BufRead,
+}
+
+/// [`prepared`] with no input past the request line and the heartbeat started with [`heartbeat::start`]: a test's
+/// way to ready a run that asks for no outputs.
+#[cfg(test)]
+fn prepare<'p, S: LineSink + 'static>(payload: &'p Payload, output: &Arc<Output<S>>, periods: Periods, login: LoginShell) -> Result<Ready<'p>, u8> {
+    let sources = Sources {
+        login,
+        start: heartbeat::start,
+        input: &mut io::empty(),
     };
-    match locked(&request, &lock, output, periods.heartbeat, (login, start)) {
-        Ok(Placed {
-            place,
-            pump,
-            login_path,
-            godot_root,
-            temp,
-        }) => Ok(Ready {
-            request,
-            lock,
-            place,
-            pump,
-            periods,
-            login_path,
-            godot_root,
-            temp,
-        }),
-        // A refusal sends the PC to run the command itself; any other end, whatever its status, is a pair run's back
-        // commits never made.
-        Err(Unready::Refused) => Err(REFUSED_STATUS),
-        Err(Unready::Ended(status)) => Err(back_commits_failed(output, &request, status)),
-    }
+    prepared(payload, output, periods, sources)
 }
 
 /// How a run ends before its command, its lines said.
@@ -750,16 +894,19 @@ pub(crate) enum Unready {
 }
 
 /// [`prepared`] once the work lock `lock` of `request` is held: the place the command runs in, the heartbeat's pump,
-/// beating every `heartbeat` once started with `start`, the login shell's `PATH` and `GATE_GODOT_ROOT` read from
-/// `login`, and the run's temp
+/// beating every `heartbeat` once started with `sources`' `start`, the login shell's `PATH` and `GATE_GODOT_ROOT` read
+/// from its `login`, and the run's temp
 /// folder ([`temp_for`]), made after the checks and before the tool restore and removed when the restore ends the run;
-/// else how the run ends, refused or with a status, its lines said.
+/// else how the run ends, refused or with a status, its lines said. A run with output globs reads the PC's manifest
+/// from `sources`' `input` once the heartbeat has started and before the layout and the checkout, without waiting past
+/// its newline, and prunes the old archives ([`RunOutputs::read`]); after the tool restore it lists the files under
+/// the globs, unless `OutputsFull` ([`RunOutputs::list`]). A run without globs reads nothing past its request line.
 fn locked<S: LineSink + 'static>(
     request: &Request<'_>,
     lock: &HeldLock,
     output: &Arc<Output<S>>,
     heartbeat: Duration,
-    (login, start): (LoginShell, StartBeat),
+    Sources { login, start, input }: Sources<'_>,
 ) -> Result<Placed, Unready> {
     let laying = request.laying();
     // Before the sweep, so a git an earlier run left running keeps its lock files.
@@ -786,6 +933,9 @@ fn locked<S: LineSink + 'static>(
             );
         })
         .ok();
+    // Read while the heartbeat beats and before the layout and the checkout, so the client can take its time hashing
+    // the PC's files.
+    let mut outputs = request.outputs.as_ref().map(|asked| RunOutputs::read(asked, input, output));
     let fresh = layout_checked(&laying).map_err(|not| not_laid_out(output, request, not))?;
     let (login_path, godot_root) = login_read(output, login).map_or((None, None), |login| (Some(login.path), login.godot_root));
     let git = run_git(request, lock, login_path.as_deref(), output);
@@ -812,23 +962,28 @@ fn locked<S: LineSink + 'static>(
         }
         return Err(unready);
     }
+    if let (Some(asked), Some(outputs)) = (&request.outputs, outputs.as_mut()) {
+        outputs.list(asked, Path::new(request.tree()), output);
+    }
     Ok(Placed {
         place,
         pump,
         login_path,
         godot_root,
         temp,
+        outputs,
     })
 }
 
 /// What [`locked`] readies for the command: its place, the heartbeat's pump, the login shell's `PATH` and
-/// `GATE_GODOT_ROOT`, and the run's temp folder.
+/// `GATE_GODOT_ROOT`, the run's temp folder, and its outputs as they stand before the command.
 struct Placed {
     place: PathBuf,
     pump: Option<Pump>,
     login_path: Option<String>,
     godot_root: Option<String>,
     temp: Option<RunTemp>,
+    outputs: Option<RunOutputs>,
 }
 
 /// On a pair run of `request`, says [`BACK_COMMITS_FAILED`] after the lines of a run that ends with `status` without
@@ -1307,10 +1462,12 @@ pub(crate) fn back_ref_cleared<S: LineSink>(git: &RunGit<'_, S>, key: &str, repo
 )]
 mod tests {
     use std::fs;
+    use std::io::{BufRead, Cursor, Read};
     use std::os::unix::fs::{MetadataExt, symlink};
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, PoisonError, mpsc};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime};
@@ -1318,14 +1475,15 @@ mod tests {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use gate_inputs::hash::sha256_of;
+    use gate_inputs::manifest::Manifest;
     use gate_wire::{PathForm, Payload, Refusal, busy_line, escaped, layout_line, refused_line, started_line, tools_line};
     use serde_json::{Value, json};
 
     use gate_watchdog::Pump;
 
     use super::{
-        NotLaidOut, REFUSED_STATUS, Ready, Request, Unready, Watches, inputs_matched, login_read, place_of, prepare, prepared, run_along,
-        test_template, work_cleared,
+        NotLaidOut, REFUSED_STATUS, Ready, Request, Sources, Unready, Watches, inputs_matched, login_read, place_of, prepare, prepared, run_along,
+        run_reading, test_template, work_cleared,
     };
     #[cfg(target_os = "macos")]
     use crate::beneath::ANOTHER_VOLUME;
@@ -1334,9 +1492,11 @@ mod tests {
     use crate::console::{LineSink, Output, RecordingSink, Stream};
     use crate::files::{self, Locked, effective_uid, take_lock};
     use crate::git::test_program::{self, real_git};
-    use crate::git::{GitClass, test_limit};
+    use crate::git::{CLOSED_STATUS, GitClass, test_limit};
     use crate::heartbeat::{self, Periods};
     use crate::lines::{Godot, Login, command_status, login_path_line};
+    use crate::outputs::OUTPUTS_BUDGET;
+    use crate::outputs::tests::read_archive;
     use crate::probe::tests::fake_godot;
     use crate::stop::stop;
 
@@ -1557,7 +1717,12 @@ mod tests {
         let commit = case.snapshot(&[("a.txt", "a\n")]);
         let payload = decoded(&case.json(&commit, &json!({})));
         let output = Arc::new(Output::new(RecordingSink::default()));
-        let mut ready = prepared(&payload, &output, quiet_periods(), own_path, no_beat);
+        let sources = Sources {
+            login: own_path,
+            start: no_beat,
+            input: &mut Cursor::new(Vec::new()),
+        };
+        let mut ready = prepared(&payload, &output, quiet_periods(), sources);
         if let Ok(ready) = ready.as_mut() {
             tmp_cleared(ready);
         }
@@ -1646,6 +1811,7 @@ mod tests {
                 ..quiet_periods()
             },
             sampler: Sampler::FreePercent(100),
+            budget: OUTPUTS_BUDGET,
         }
     }
 
@@ -3345,10 +3511,311 @@ mod tests {
     }
 
     #[test]
-    fn outputs_or_outputs_full_are_refused_layout_naming_the_key() {
-        let case = Case::new("outputs");
-        assert_refused(&case, &json!({ "Outputs": ["bin/**"] }), Refusal::Layout, &unbuilt_layout("Outputs"));
-        assert_refused(&case, &json!({ "OutputsFull": true }), Refusal::Layout, &unbuilt_layout("OutputsFull"));
+    fn outputs_or_outputs_full_are_taken() {
+        let (case, commit) = outputs_case("outputs-taken");
+        let (status, said) = run_fed(
+            &case.outputs_json(&commit, "true", &json!(["bin/**"])),
+            &mut fed(NO_FILES),
+            free_watches(),
+        );
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(outputs_said(&said), ["gate-remote-outputs: 0"], "{said:?}");
+
+        let full = case.json(&commit, &json!({ "OutputsFull": true }));
+        let (status, said) = run_fed(&full, &mut fed(NO_FILES), free_watches());
+        assert_eq!(status, 0, "{said:?}");
+        assert!(outputs_said(&said).is_empty(), "no globs bring nothing: {said:?}");
+    }
+
+    /// The PC's outputs manifest line holding no file.
+    const NO_FILES: &str = "{\"files\":{}}\n";
+
+    /// The PC's input after the request line: `text`.
+    fn fed(text: &str) -> Cursor<Vec<u8>> {
+        Cursor::new(text.as_bytes().to_vec())
+    }
+
+    /// Runs the whole run of `json` on the box's own `PATH`, watched as `watches` says, the PC's input after the
+    /// request line read from `input`; the status and every line said, with its stream.
+    fn run_fed(json: &Value, input: &mut Cursor<Vec<u8>>, watches: Watches) -> (u8, Vec<(Stream, String)>) {
+        let payload = decoded(json);
+        let output = Arc::new(Output::new(RecordingSink::default()));
+        let status = run_reading(&payload, &output, watches, own_path, input);
+        (status, output.sink().lines())
+    }
+
+    /// A case whose snapshot holds `a.txt` and ignores `bin/`, so a file a command writes there is in no back commit;
+    /// the case and its snapshot.
+    fn outputs_case(name: &str) -> (Case, String) {
+        let case = Case::new(name);
+        let commit = case.snapshot(&[("a.txt", "a\n"), (".gitignore", "bin/\n")]);
+        (case, commit)
+    }
+
+    /// The name of a case's outputs archive.
+    fn archive_name() -> String {
+        format!("{KEY}-{NONCE}.tar.zst")
+    }
+
+    impl Case {
+        /// The run payload of `snapshot` running `script` in `sh`, with the case's identity, asking for the outputs
+        /// `globs`.
+        fn outputs_json(&self, snapshot: &str, script: &str, globs: &Value) -> Value {
+            self.json(
+                snapshot,
+                &json!({ "Command": ["/bin/sh", "-c", script], "Identity": identity(), "Outputs": globs }),
+            )
+        }
+
+        /// The case's outputs archive, `<root>/outputs/<key>-<nonce>.tar.zst`.
+        fn archive(&self) -> PathBuf {
+            PathBuf::from(format!("{}/outputs/{}", self.root(), archive_name()))
+        }
+    }
+
+    /// The `gate-remote-outputs:` lines of `said`.
+    fn outputs_said(said: &[(Stream, String)]) -> Vec<&str> {
+        said.iter()
+            .filter(|(_, line)| line.starts_with("gate-remote-outputs:"))
+            .map(|(_, line)| line.as_str())
+            .collect()
+    }
+
+    /// The path of each member of the outputs archive at `path`, in its list's order.
+    fn members_of(path: &Path) -> Vec<String> {
+        let (_, items) = read_archive(path, &Manifest::default(), &[]);
+        items.into_iter().map(|item| item.entry.path).collect()
+    }
+
+    #[test]
+    fn a_run_with_globs_packs_a_new_file_and_names_its_archive() {
+        let (case, commit) = outputs_case("outputs-packed");
+        let json = case.outputs_json(&commit, "mkdir -p bin && echo new > bin/new.txt", &json!(["bin/**"]));
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        assert_eq!(status, 0, "{said:?}");
+        let line = format!("gate-remote-outputs: 1 {}", archive_name());
+        assert_eq!(outputs_said(&said), [line.as_str()], "{said:?}");
+        assert_eq!(members_of(&case.archive()), ["bin/new.txt"]);
+    }
+
+    #[test]
+    fn a_run_without_globs_reads_only_the_request_line() {
+        let case = Case::new("outputs-unread");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let mut input = fed(NO_FILES);
+        let (status, said) = run_fed(&case.commanded(&commit, &["true"]), &mut input, free_watches());
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(input.position(), 0, "nothing past the request line is read");
+        assert!(outputs_said(&said).is_empty(), "{said:?}");
+    }
+
+    /// An input that, at its first read, waits within a hang guard for `marker`, which the first heartbeat makes, and
+    /// notes whether it came and whether the work folder `work` was there yet; then reads `bytes`.
+    struct Watched {
+        marker: PathBuf,
+        work: PathBuf,
+        seen: Option<(bool, bool)>,
+        bytes: Cursor<Vec<u8>>,
+    }
+
+    impl Watched {
+        fn look(&mut self) {
+            if self.seen.is_some() {
+                return;
+            }
+            let guard = Instant::now() + HANG_GUARD;
+            while !self.marker.exists() && Instant::now() < guard {
+                thread::sleep(Duration::from_millis(10));
+            }
+            self.seen = Some((self.marker.exists(), self.work.exists()));
+        }
+    }
+
+    impl Read for Watched {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.look();
+            self.bytes.read(buf)
+        }
+    }
+
+    impl BufRead for Watched {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            self.look();
+            self.bytes.fill_buf()
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.bytes.consume(amount);
+        }
+    }
+
+    #[test]
+    fn the_outputs_manifest_is_read_after_the_first_beat_and_before_the_layout() {
+        let case = Case::new("outputs-beat");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let marker = case.base.with_file_name("beaten");
+        let payload = decoded(&case.outputs_json(&commit, "true", &json!(["bin/**"])));
+        let output = Arc::new(Output::new(MarkingSink {
+            lines: Mutex::new(Vec::new()),
+            marker: marker.clone(),
+        }));
+        let periods = Periods {
+            heartbeat: Duration::from_millis(1),
+            ..Periods::default()
+        };
+        let mut input = Watched {
+            marker,
+            work: PathBuf::from(case.work()),
+            seen: None,
+            bytes: fed(NO_FILES),
+        };
+        let sources = Sources {
+            login: own_path,
+            start: heartbeat::start,
+            input: &mut input,
+        };
+        let ready = prepared(&payload, &output, periods, sources);
+        let lines = || output.sink().lines.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert!(ready.is_ok(), "the run is ready: {:?}", lines());
+        let mut ready = ready.expect("the run is ready");
+        tmp_cleared(&mut ready);
+        let Ready { pump, .. } = ready;
+        if let Some(pump) = pump {
+            heartbeat::stop(pump);
+        }
+        assert_eq!(input.seen, Some((true, false)), "read after a beat, before the layout");
+        assert_eq!(input.bytes.position(), NO_FILES.len() as u64, "the manifest line is read whole");
+    }
+
+    #[test]
+    fn a_failed_command_packs_nothing_and_says_no_outputs_line() {
+        let (case, commit) = outputs_case("outputs-failed");
+        let json = case.outputs_json(&commit, "mkdir -p bin && echo new > bin/new.txt; exit 3", &json!(["bin/**"]));
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        assert_eq!(status, 3, "{said:?}");
+        assert!(outputs_said(&said).is_empty(), "{said:?}");
+        assert!(!said.iter().any(|(_, line)| line.starts_with("gate: remote outputs")), "{said:?}");
+        assert!(!case.archive().exists(), "nothing is packed");
+    }
+
+    #[test]
+    fn a_back_commit_s_path_is_not_packed() {
+        let (case, commit) = outputs_case("outputs-back");
+        let script = "mkdir -p out bin && echo c > out/committed.txt && echo k > bin/kept.txt";
+        let (status, said) = run_fed(
+            &case.outputs_json(&commit, script, &json!(["out/**", "bin/**"])),
+            &mut fed(NO_FILES),
+            free_watches(),
+        );
+        assert_eq!(status, 0, "{said:?}");
+        let back = case.back_commit().expect("the back ref is pushed");
+        assert_eq!(
+            git(&[&format!("--git-dir={}", case.bare()), "show", &format!("{back}:out/committed.txt")]),
+            "c"
+        );
+        assert_eq!(members_of(&case.archive()), ["bin/kept.txt"], "the back commit's path stays out");
+    }
+
+    #[test]
+    fn a_malformed_manifest_is_said_after_the_command_and_ends_the_run_1() {
+        let (case, commit) = outputs_case("outputs-malformed");
+        let json = case.outputs_json(&commit, "echo ran; mkdir -p bin && echo new > bin/new.txt", &json!(["bin/**"]));
+        let (status, said) = run_fed(&json, &mut fed("not a manifest\n"), free_watches());
+        assert_eq!(status, 1, "{said:?}");
+        let ran = said.iter().position(|(stream, line)| *stream == Stream::Out && line == "ran");
+        let failed = said
+            .iter()
+            .position(|(stream, line)| *stream == Stream::Err && line.starts_with("gate: remote outputs not brought back: "));
+        assert!(ran.is_some() && failed.is_some() && ran < failed, "said after the command: {said:?}");
+        assert!(!case.archive().exists(), "nothing is packed");
+    }
+
+    #[test]
+    fn the_budget_seam_trims_an_archive_alone_over_it_and_says_so() {
+        let (case, commit) = outputs_case("outputs-budget");
+        let json = case.outputs_json(&commit, "mkdir -p bin && echo new > bin/new.txt", &json!(["bin/**"]));
+        let watches = Watches { budget: 1, ..free_watches() };
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), watches);
+        assert_eq!(status, 1, "{said:?}");
+        let line = format!("gate-remote-outputs: 1 {}", archive_name());
+        assert_eq!(outputs_said(&said), [line.as_str()], "{said:?}");
+        let over = "gate: remote outputs not brought back: the archive is 0.0 GiB, more than the box keeps (50 GiB)";
+        assert_eq!(said.last().map(|(_, line)| line.as_str()), Some(over), "{said:?}");
+        assert!(!case.archive().exists(), "the archive alone over the budget is removed");
+    }
+
+    #[test]
+    fn a_back_commit_listing_more_than_a_mebibyte_of_paths_still_brings_the_outputs_back() {
+        let (case, commit) = outputs_case("outputs-many-paths");
+        // 6000 names of 200 and more bytes: diff-tree lists over 1 MiB of paths.
+        let script = "mkdir -p bin d && echo new > bin/new.txt && long=$(printf '%0200d' 0) && i=0 && \
+                      while [ $i -lt 6000 ]; do : > \"d/${long}_$i\"; i=$((i+1)); done";
+        let (status, said) = run_fed(
+            &case.outputs_json(&commit, script, &json!(["bin/**"])),
+            &mut fed(NO_FILES),
+            free_watches(),
+        );
+        assert_eq!(status, 0, "{:?}", said.iter().rev().take(5).collect::<Vec<_>>());
+        let line = format!("gate-remote-outputs: 1 {}", archive_name());
+        assert_eq!(outputs_said(&said), [line.as_str()]);
+        assert_eq!(members_of(&case.archive()), ["bin/new.txt"]);
+    }
+
+    /// A sink that keeps every line until one starts with `from`: that write, and every one after it, finds the client
+    /// gone.
+    struct GoneFrom {
+        from: &'static str,
+        lines: Mutex<Vec<(Stream, String)>>,
+        gone: AtomicBool,
+    }
+
+    impl GoneFrom {
+        fn new(from: &'static str) -> GoneFrom {
+            GoneFrom {
+                from,
+                lines: Mutex::new(Vec::new()),
+                gone: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl LineSink for GoneFrom {
+        fn write_line(&self, stream: Stream, line: &str) -> std::io::Result<()> {
+            if line.starts_with(self.from) {
+                self.gone.store(true, Ordering::SeqCst);
+            }
+            if self.gone.load(Ordering::SeqCst) {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            self.lines.lock().unwrap_or_else(PoisonError::into_inner).push((stream, line.to_owned()));
+            Ok(())
+        }
+    }
+
+    /// Runs the whole run of `json` as [`run_fed`] does, its lines said to a client that is gone from the first line
+    /// starting with `from`; the status.
+    fn run_gone_from(json: &Value, from: &'static str, watches: Watches) -> u8 {
+        let payload = decoded(json);
+        let output = Arc::new(Output::new(GoneFrom::new(from)));
+        run_reading(&payload, &output, watches, own_path, &mut fed(NO_FILES))
+    }
+
+    #[test]
+    fn a_client_gone_before_the_pack_or_the_trim_packs_or_trims_nothing_and_ends_closed() {
+        let (case, commit) = outputs_case("outputs-gone");
+        let lib = case.lib_snapshot(&[("b.txt", "b\n")]);
+        let script = "mkdir -p bin && echo new > bin/new.txt && echo d > ../lib/d.txt";
+        let extra = json!({ "Command": ["/bin/sh", "-c", script], "Identity": identity(), "Outputs": ["bin/**"] });
+        let status = run_gone_from(&case.pair_json(&commit, &lib, &extra), "gate: remote back commits:", free_watches());
+        assert_eq!(status, CLOSED_STATUS, "gone at the back commits line, before the pack");
+        assert!(!case.archive().exists(), "nothing is packed for a client gone");
+
+        let (case, commit) = outputs_case("outputs-gone-trim");
+        let json = case.outputs_json(&commit, "mkdir -p bin && echo new > bin/new.txt", &json!(["bin/**"]));
+        let watches = Watches { budget: 1, ..free_watches() };
+        let status = run_gone_from(&json, "gate-remote-outputs:", watches);
+        assert_eq!(status, CLOSED_STATUS, "gone at the outputs line, before the trim");
+        assert!(case.archive().exists(), "the archive over the budget is not trimmed for a client gone");
     }
 
     #[test]

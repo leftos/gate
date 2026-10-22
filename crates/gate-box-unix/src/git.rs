@@ -412,6 +412,8 @@ struct Mode {
     forward: bool,
     /// Whether a failed forward ends git, and a client already gone keeps it from starting.
     ends_on_gone: bool,
+    /// The most bytes of git's standard output kept; more fails the step.
+    cap: usize,
 }
 
 impl<'a, S: LineSink + 'static> RunGit<'a, S> {
@@ -451,6 +453,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
         let mode = Mode {
             forward: true,
             ends_on_gone: true,
+            cap: GIT_OUTPUT_CAP,
         };
         self.ran_as(step, args, mode, class, &[])
     }
@@ -473,8 +476,25 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
         let mode = Mode {
             forward: true,
             ends_on_gone: true,
+            cap: GIT_OUTPUT_CAP,
         };
         let ran = self.ran_as(step, args, mode, class, env)?;
+        self.passed(step, ran)
+    }
+
+    /// [`RunGit::step_as`], git's standard output kept whole however long it is, as the Windows box reads a step whose
+    /// output lists paths.
+    ///
+    /// # Errors
+    ///
+    /// The failure of a git that did not run to an exit or exited non-zero, or a client gone.
+    pub fn step_whole(&self, step: &str, args: &[&str], class: GitClass) -> Result<Vec<u8>, Failed> {
+        let mode = Mode {
+            forward: true,
+            ends_on_gone: true,
+            cap: usize::MAX,
+        };
+        let ran = self.ran_as(step, args, mode, class, &[])?;
         self.passed(step, ran)
     }
 
@@ -488,6 +508,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
         let mode = Mode {
             forward: false,
             ends_on_gone: true,
+            cap: GIT_OUTPUT_CAP,
         };
         self.ran_as(step, args, mode, class, &[])
     }
@@ -503,6 +524,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
         let mode = Mode {
             forward: true,
             ends_on_gone: false,
+            cap: GIT_OUTPUT_CAP,
         };
         let ran = self.ran_as(step, args, mode, class, &[])?;
         self.passed(step, ran).map(drop)
@@ -520,7 +542,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
         let limit = step_limit(step, class);
         let output: Arc<dyn Forwarding> = Arc::clone(self.output) as Arc<dyn Forwarding>;
         let watch = Watch {
-            cap: GIT_OUTPUT_CAP,
+            cap: mode.cap,
             deadline: Some(Instant::now() + limit),
             ending: Ending::TermThenKill(END_GRACE),
             output: Some(output),
@@ -544,7 +566,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
             let why = match not {
                 NotRan::Start(error) => error.to_string(),
                 NotRan::TimedOut { .. } => late_git_line(limit),
-                NotRan::OverCap => format!("it printed more than {GIT_OUTPUT_CAP} bytes"),
+                NotRan::OverCap => format!("it printed more than {} bytes", mode.cap),
                 NotRan::Failed(why) => why,
             };
             Failed::line(step_unran(step, &why))
