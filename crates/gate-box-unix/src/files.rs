@@ -243,6 +243,7 @@ pub fn staged_temp(path: &Path) -> io::Result<(PathBuf, File)> {
 pub struct HeldLock {
     file: File,
     path: PathBuf,
+    made: bool,
 }
 
 impl HeldLock {
@@ -250,6 +251,12 @@ impl HeldLock {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Whether the take that holds this lock made its file: nothing was at the name when it opened it.
+    #[must_use]
+    pub fn made(&self) -> bool {
+        self.made
     }
 
     /// Whether the lock's name still names the file this box locked, looked at as itself: false once it is removed or
@@ -313,7 +320,7 @@ pub fn take_lock(path: &Path) -> io::Result<Locked> {
 /// [`take_lock`], calling `between` after each open, before its lock.
 fn take_lock_between(path: &Path, between: &mut dyn FnMut()) -> io::Result<Locked> {
     for _ in 0..=LOCK_RETRIES {
-        let file = lock_file(path)?;
+        let (file, made) = lock_file(path)?;
         between();
         // SAFETY: the descriptor is `file`'s, open for the whole call; `flock` reads nothing else.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
@@ -324,7 +331,11 @@ fn take_lock_between(path: &Path, between: &mut dyn FnMut()) -> io::Result<Locke
                 Err(error)
             };
         }
-        let held = HeldLock { file, path: path.to_owned() };
+        let held = HeldLock {
+            file,
+            path: path.to_owned(),
+            made,
+        };
         if held.still_held()? {
             return Ok(Locked::Held(held));
         }
@@ -336,16 +347,53 @@ fn take_lock_between(path: &Path, between: &mut dyn FnMut()) -> io::Result<Locke
     )))
 }
 
-/// Opens the work lock's file `path` for [`take_lock`]: a plain file of one link, made when missing.
-fn lock_file(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
+/// Opens the work lock's file `path` for [`take_lock`]: a plain file of one link, made when missing, and whether this
+/// open made it ([`lock_file_seen`]).
+fn lock_file(path: &Path) -> io::Result<(File, bool)> {
+    lock_file_seen(path, &|_, _| {})
+}
+
+/// [`lock_file`], calling `before_open` with the path before each open, and with whether that open is the one that
+/// makes the file. A create-new open that finds a file there is followed by a plain open of it, which made nothing;
+/// when that plain open finds the file removed meanwhile, the create-new open is tried again, up to
+/// [`LOCK_RETRIES`] more times.
+fn lock_file_seen(path: &Path, before_open: &dyn Fn(&Path, bool)) -> io::Result<(File, bool)> {
+    let options = |new: bool| {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(new)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        options
+    };
+    let mut opened = None;
+    for _ in 0..=LOCK_RETRIES {
+        before_open(path, true);
+        let made = options(true).open(path);
+        if matches!(&made, Err(error) if error.kind() == io::ErrorKind::AlreadyExists) {
+            before_open(path, false);
+        }
+        match made {
+            Ok(file) => opened = Some((file, true)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => match options(false).open(path) {
+                Ok(file) => opened = Some((file, false)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            },
+            Err(error) => return Err(error),
+        }
+        break;
+    }
+    let Some((file, made)) = opened else {
+        return Err(io::Error::other(format!(
+            "{} was removed each of the {} times it was opened",
+            path.display(),
+            LOCK_RETRIES + 1
+        )));
+    };
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(io::Error::other(format!("{} is not a plain file", path.display())));
@@ -357,7 +405,7 @@ fn lock_file(path: &Path) -> io::Result<File> {
             metadata.nlink()
         )));
     }
-    Ok(file)
+    Ok((file, made))
 }
 
 /// What `path` is, looked at as itself and never through a link, and the box's effective user id.
@@ -428,7 +476,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use super::{HeldLock, Locked, replace_numbered, replace_plain, take_lock, take_lock_between, temp_name};
+    use super::{HeldLock, Locked, lock_file_seen, replace_numbered, replace_plain, take_lock, take_lock_between, temp_name};
 
     /// How long a write may take before the case calls it hung: a hang guard, never reached by a write that works.
     const HANG_GUARD: Duration = Duration::from_secs(300);
@@ -481,6 +529,58 @@ mod tests {
             Ok(Locked::Held(held)) => held,
             other => panic!("the lock is not held: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_lock_take_says_whether_it_made_the_lock_s_file() {
+        let case = Case::new("lock-made");
+        let path = case.base.join("key.lock");
+
+        let first = held_lock(take_lock(&path));
+        let made = first.made();
+        drop(first);
+        let again = held_lock(take_lock(&path));
+
+        assert!(made, "the first take made the file");
+        assert!(!again.made(), "a take that found the file made nothing");
+    }
+
+    #[test]
+    fn a_lock_s_file_removed_between_its_two_opens_is_made_again_and_said_made() {
+        let case = Case::new("lock-removed-once");
+        let path = case.base.join("key.lock");
+        fs::write(&path, "").expect("the lock's file is there");
+        let removed = std::cell::Cell::new(false);
+
+        let (_file, made) = lock_file_seen(&path, &|path, new| {
+            if !new && !removed.replace(true) {
+                fs::remove_file(path).expect("the lock's file is removed");
+            }
+        })
+        .expect("the lock's file is opened");
+
+        assert!(made, "the open that made the file again says it made it");
+        assert!(path.is_file(), "the lock's file is there again");
+    }
+
+    #[test]
+    fn a_lock_s_file_removed_before_each_plain_open_fails_the_open() {
+        let case = Case::new("lock-removed-always");
+        let path = case.base.join("key.lock");
+
+        let opened = lock_file_seen(&path, &|path, new| {
+            if new {
+                fs::write(path, "").expect("the lock's file is put back");
+            } else {
+                fs::remove_file(path).expect("the lock's file is removed");
+            }
+        });
+
+        let error = opened.expect_err("an open that never finds the file fails");
+        assert_eq!(
+            error.to_string(),
+            format!("{} was removed each of the 4 times it was opened", path.display())
+        );
     }
 
     #[test]

@@ -31,6 +31,8 @@ pub mod probe;
 #[cfg(unix)]
 pub mod process;
 #[cfg(unix)]
+pub mod prune;
+#[cfg(unix)]
 pub mod run;
 #[cfg(unix)]
 pub mod stop;

@@ -64,7 +64,10 @@ mod unix {
                 fs::remove_dir_all(&base).expect("a stale case folder is removed");
             }
             let case = Case { base };
-            fs::create_dir_all(format!("{}/work", case.root())).expect("the work folders' parent is made");
+            // Mode 0700 as the box's preflight and prune demand of a root, whatever the umask.
+            std::os::unix::fs::DirBuilderExt::mode(fs::DirBuilder::new().recursive(true), 0o700)
+                .create(format!("{}/work", case.root()))
+                .expect("the work folders' parent is made");
             git(&["init", "--bare", "-q", &case.bare()]);
             case
         }
@@ -512,6 +515,96 @@ mod unix {
         assert_eq!(case.back(), None, "no back commit for a client gone");
         assert!(!Path::new(&format!("{}.pgid", case.work())).exists(), "no .pgid left");
         assert!(case.lock_free(), "the work lock is free");
+    }
+
+    /// Runs `gate-box box prune <words>` with the variables `env` set; its status and its lines on stdout and stderr.
+    fn pruned(words: &[&str], env: &[(&str, &str)]) -> Ended {
+        let ran = Command::new(env!("CARGO_BIN_EXE_gate-box"))
+            .args(["box", "prune"])
+            .args(words)
+            .envs(env.iter().copied())
+            .stdin(Stdio::null())
+            .output()
+            .expect("gate-box runs");
+        let lines = |bytes: &[u8]| String::from_utf8_lossy(bytes).lines().map(str::to_owned).collect();
+        Ended {
+            status: ran.status.code(),
+            out: lines(&ran.stdout),
+            err: lines(&ran.stderr),
+        }
+    }
+
+    /// Sets the last write of `path`, a file or a folder, to `age` ago.
+    fn backdated(path: &Path, age: std::time::Duration) {
+        let when = std::time::SystemTime::now() - age;
+        fs::File::open(path)
+            .and_then(|file| file.set_times(fs::FileTimes::new().set_modified(when)))
+            .expect("the last write is set");
+    }
+
+    #[test]
+    fn an_age_prune_removes_an_idle_work_folder_and_a_leftover_run_folder() {
+        let case = Case::new("prune-aged");
+        let two_days = std::time::Duration::from_hours(48);
+        let work = PathBuf::from(case.work());
+        fs::create_dir(&work).expect("the work folder is made");
+        fs::write(work.join("file"), "x").expect("a file is written in the work folder");
+        backdated(&work.join("file"), two_days);
+        backdated(&work, two_days);
+        let tmp = case.base.join("tmp");
+        let leftover = tmp.join("gate.Ab3dE6g8");
+        fs::create_dir_all(&leftover).expect("the leftover run folder is made");
+        backdated(&leftover, two_days);
+        let tmp_root = tmp.to_str().expect("the temp folder is UTF-8");
+        let free = (1000u64 << 30).to_string();
+
+        let ended = pruned(
+            &["--root", &case.root()],
+            &[("GATE_BOX_TEST_TMP_ROOT", tmp_root), ("GATE_BOX_TEST_FREE_BYTES", &free)],
+        );
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert!(ended.err.is_empty(), "{:?}", ended.err);
+        assert_eq!(
+            ended.out,
+            [
+                format!("gate: remote pruned {KEY}: idle 48 h"),
+                format!("gate: remote removed the leftover run folder {}: idle 48 h", leftover.display()),
+                "gate: remote prune removed 1 of 1 work folders".to_owned(),
+            ]
+        );
+        assert!(!work.exists() && !leftover.exists());
+        assert!(Path::new(&case.lock()).is_file(), "the age prune keeps the lock");
+    }
+
+    #[test]
+    fn a_keyed_prune_removes_the_key_s_folder_and_refs_and_leaves_no_lock_for_a_key_never_had() {
+        let case = Case::new("prune-keyed");
+        let commit = case.snapshot();
+        git(&[&case.bare_dir(), "update-ref", &format!("refs/gate-bridge/{KEY}"), &commit]);
+        let work = PathBuf::from(case.work());
+        fs::create_dir(&work).expect("the work folder is made");
+        let never = "never-0123abcd";
+
+        let ended = pruned(&["--root", &case.root(), "--keys", KEY, never], &[]);
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert!(ended.err.is_empty(), "{:?}", ended.err);
+        assert_eq!(
+            ended.out,
+            [
+                format!("gate: remote pruned {KEY} (worktree gone)"),
+                format!("gate: remote pruned {never} (worktree gone)"),
+            ]
+        );
+        assert_eq!(
+            git(&[&case.bare_dir(), "for-each-ref", "--format=%(refname)"]),
+            "",
+            "the key's refs are gone"
+        );
+        assert!(!work.exists(), "the work folder is gone");
+        let locks = [case.lock(), format!("{}/work/{never}.lock", case.root())];
+        assert!(locks.iter().all(|lock| !Path::new(lock).exists()), "no lock is left");
     }
 
     /// Writes `script` at `path`, runnable.

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Installs the macOS (Apple-silicon) builder's toolchains at pinned versions from official release URLs, its login PATH,
 # its git config and the gate's work root, all as the builder user without sudo. A separate System step, run only under
-# sudo with --system, keeps the machine awake, raises the open-file limits and turns on Remote Login. Two more steps,
-# Homebrew and FFmpeg, need an admin account and change the machine only under --admin.
+# sudo with --system, keeps the machine awake, raises the open-file limits, turns on Remote Login and installs the
+# launchd job dev.gate.prune-work, which runs the box's prune of the work root every two hours as the builder user.
+# Two more steps, Homebrew and FFmpeg, need an admin account and change the machine only under --admin.
 #
 # Run it as the builder user, over ssh or copied to the machine:
 #   ssh <builder> 'bash -s' -- [flags] < tools/builder/install-macos.sh
@@ -17,13 +18,16 @@
 #   --prefix <dir>   where every tool lands (default $HOME/gate-tools): dotnet, pwsh, node, godot, bin, downloads and
 #                    install.log. A leading ~/ is expanded, so a quoted ~/dir passes through ssh.
 #   --root <dir>     the gate's work root (default $HOME/gate-remote), with work/ and bin/ under it, all mode 0700.
+#                    With --system the default is <builder home>/gate-remote, the home read with dscl; a ~/ given
+#                    there expands to root's home under sudo, so give an absolute --root with --system.
 #   --only <p>[,<p>...]  runs just the steps whose names start with one of the prefixes (case-insensitive, like the
 #                    Windows script's -Only), then the summary. A prefix that matches no step exits 2 before anything is
 #                    written; --only Summary matches no step on purpose and runs only the summary.
 #   --list           prints the step names and exits 0.
 #   --system         lets the System step change the machine; needs root and --user. Without it the System step
 #                    prints the commands it would run and logs SKIP.
-#   --user <name>    the builder user, named in the System step's log; only taken with --system.
+#   --user <name>    the builder user, named in the System step's log, who runs the prune job and owns its log
+#                    /Library/Logs/gate/prune-work.log; only taken with --system.
 #   --admin          lets the Homebrew and FFmpeg steps change the machine; needs an account in the admin group, not
 #                    root, not --system, and --only Homebrew,FFmpeg. Without it both print the commands they would run
 #                    and log SKIP. An --admin run logs to stdout only, never into that account's prefix.
@@ -42,6 +46,7 @@ set -euo pipefail
 prog='install-macos'
 prefix="$HOME/gate-tools"
 root="$HOME/gate-remote"
+root_given=0
 only=''
 list=0
 system=0
@@ -59,6 +64,21 @@ expand_home() {
         \~/*) printf '%s/%s' "$HOME" "${1#\~/}" ;;
         *) printf '%s' "$1" ;;
     esac
+}
+
+# Prints the home in the output of `dscl . -read /Users/<user> NFSHomeDirectory`, the value after "NFSHomeDirectory: ";
+# fails when no line gives an absolute one.
+home_from_dscl() {
+    local line
+    while IFS= read -r line; do
+        case "$line" in
+            'NFSHomeDirectory: /'*)
+                printf '%s' "${line#NFSHomeDirectory: }"
+                return 0
+                ;;
+        esac
+    done <<<"$1"
+    return 1
 }
 
 # The prefix and CARGO_HOME reach a double-quoted line in ~/.zprofile, so only a plain absolute path is taken.
@@ -79,7 +99,7 @@ while [ "$#" -gt 0 ]; do
             [ "$#" -ge 2 ] && [ -n "$2" ] || die2 "$1 needs a value"
             case "$1" in
                 --prefix) prefix="$2" ;;
-                --root) root="$2" ;;
+                --root) root="$2" && root_given=1 ;;
                 --only) only="${only:+$only,}$2" ;;
                 --user) builder_user="$2" ;;
             esac
@@ -477,6 +497,169 @@ sys() {
     fi
 }
 
+xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+prune_label='dev.gate.prune-work'
+prune_plist_path="/Library/LaunchDaemons/$prune_label.plist"
+# The prune job's log lives outside the builder's root, in a folder of root's, so root never makes, owns or changes a
+# file at a name the builder controls.
+prune_log_dir='/Library/Logs/gate'
+prune_log_path="$prune_log_dir/prune-work.log"
+# How many half-second looks the System step gives an old prune job to go after its bootout: 10 s.
+prune_bootout_looks=20
+# The job that runs the box's prune every two hours as the builder user: its work root in $1, the user in $2 and the
+# user's home in $3.
+prune_plist() {
+    local r u h
+    r=$(xml_escape "$1")
+    u=$(xml_escape "$2")
+    h=$(xml_escape "$3")
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+        '<plist version="1.0">' '<dict>' \
+        "  <key>Label</key><string>$prune_label</string>" \
+        '  <key>ProgramArguments</key>' \
+        "  <array><string>$r/bin/gate-box</string><string>box</string><string>prune</string><string>--root</string><string>$r</string></array>" \
+        "  <key>UserName</key><string>$u</string>" \
+        '  <key>StartInterval</key><integer>7200</integer>' \
+        '  <key>RunAtLoad</key><true/>' \
+        '  <key>LowPriorityIO</key><true/>' \
+        '  <key>ProcessType</key><string>Background</string>' \
+        "  <key>WorkingDirectory</key><string>$r</string>" \
+        '  <key>EnvironmentVariables</key>' \
+        "  <dict><key>HOME</key><string>$h</string></dict>" \
+        "  <key>StandardOutPath</key><string>$prune_log_path</string>" \
+        "  <key>StandardErrorPath</key><string>$prune_log_path</string>" \
+        '</dict>' '</plist>'
+}
+
+# Whether stat's '%HT|%Su|%Lp' line in $3 for the folder $1 says a folder, not a link, of the user $2's with mode 700;
+# else prints what is wrong and fails. Root's launchd job runs the builder's $root/bin/gate-box, so the root and its
+# bin must be the builder's alone.
+private_folder_of() {
+    local path="$1" user="$2" kind owner mode
+    IFS='|' read -r kind owner mode <<<"$3"
+    if [ "$kind" != Directory ]; then
+        printf '%s is a %s, not a folder: point --root at a real folder\n' "$path" "$kind"
+        return 1
+    fi
+    if [ "$owner" != "$user" ]; then
+        printf '%s is owned by %s, not %s: the prune job runs only in a root of its own user\n' "$path" "$owner" "$user"
+        return 1
+    fi
+    if [ "$mode" != 700 ]; then
+        printf '%s has mode %s, not 700: run the Gate work root step as %s first\n' "$path" "$mode" "$user"
+        return 1
+    fi
+}
+
+# Whether stat's '%HT|%Su|%Lp' line in $2 for the prune job's log folder $1 says a folder, not a link, of root's that
+# no one else can write; else prints what is wrong and fails. Root makes the log in it, so no other account may put a
+# name there first.
+root_log_folder_of() {
+    local path="$1" kind owner mode
+    IFS='|' read -r kind owner mode <<<"$2"
+    if [ "$kind" != Directory ]; then
+        printf '%s is a %s, not a folder: remove it and rerun\n' "$path" "$kind"
+        return 1
+    fi
+    if [ "$owner" != root ]; then
+        printf '%s is owned by %s, not root: remove it and rerun\n' "$path" "$owner"
+        return 1
+    fi
+    case "$mode" in
+        '' | *[!0-7]*)
+            printf '%s has the mode %s, which is not an octal mode\n' "$path" "$mode"
+            return 1
+            ;;
+    esac
+    if [ $((8#$mode & 8#022)) != 0 ]; then
+        printf '%s has mode %s, writable by group or others: remove it and rerun\n' "$path" "$mode"
+        return 1
+    fi
+}
+
+# Whether stat's '%HT|%Su|%l' line in $3 for the prune job's log $1 says a plain file of one link owned by the user
+# $2; else prints what is wrong and fails.
+builder_log_of() {
+    [ "$3" != "Regular File|$2|1" ] || return 0
+    printf '%s is not a plain file of one link owned by %s (stat says %s): remove it and rerun\n' "$1" "$2" "$3"
+    return 1
+}
+
+# Makes the prune job's log folder, root:wheel 0755, and its log, owned by the builder at mode 0600, each when missing;
+# the log is created with noclobber and handed over without following a link, so a name put there meanwhile fails the
+# step rather than being taken over. The folder and its parent must be root's and writable by no one else, and the log,
+# made or found, a plain file of one link owned by the builder; an existing log is left as it is.
+make_prune_log() {
+    local st why parent="${prune_log_dir%/*}"
+    st=$(stat -f '%HT|%Su|%Lp' "$parent" 2>&1) || fail "cannot read $parent: $st"
+    why=$(root_log_folder_of "$parent" "$st") || fail "$why"
+    if [ ! -e "$prune_log_dir" ] && [ ! -L "$prune_log_dir" ]; then
+        mkdir -m 755 "$prune_log_dir"
+        chown root:wheel "$prune_log_dir"
+        log "made $prune_log_dir (root:wheel, 0755)"
+    fi
+    st=$(stat -f '%HT|%Su|%Lp' "$prune_log_dir" 2>&1) || fail "cannot read $prune_log_dir: $st"
+    why=$(root_log_folder_of "$prune_log_dir" "$st") || fail "$why"
+    if [ ! -e "$prune_log_path" ] && [ ! -L "$prune_log_path" ]; then
+        (
+            set -C
+            : >"$prune_log_path"
+        ) || fail "could not create $prune_log_path: something else was put at its name; rerun"
+        chown -h "$builder_user" "$prune_log_path"
+        chmod -h 600 "$prune_log_path"
+        log "created $prune_log_path (owned by $builder_user, 0600)"
+    fi
+    st=$(stat -f '%HT|%Su|%l' "$prune_log_path" 2>&1) || fail "cannot read $prune_log_path: $st"
+    why=$(builder_log_of "$prune_log_path" "$builder_user" "$st") || fail "$why"
+}
+
+# Says when the root's bin has no gate-box yet: a new builder gets the prune job before its first gate push.
+note_missing_gate_box() {
+    [ -e "$root/bin/gate-box" ] || log "gate-box is not in $root/bin yet: the prune job fails until gate push installs it"
+}
+
+# Boots the old prune job out when it is loaded, waits, up to 10 s, until launchd no longer has it, so the bootstrap
+# never finds it still going, and bootstraps the job. The bootout's own status never fails the step: it exits 36 while
+# the job's process is still ending, and the wait decides.
+prune_job_reloaded() {
+    local looks=0 status=0
+    if launchctl print "system/$prune_label" >/dev/null 2>&1; then
+        sys launchctl bootout "system/$prune_label" || status=$?
+        [ "$status" = 0 ] || log "bootout of $prune_label said $status; waiting for it to go"
+        while launchctl print "system/$prune_label" >/dev/null 2>&1; do
+            [ "$looks" -lt "$prune_bootout_looks" ] || fail "system/$prune_label was still loaded 10 s after launchctl bootout"
+            sleep 0.5
+            looks=$((looks + 1))
+        done
+    fi
+    sys launchctl bootstrap system "$prune_plist_path"
+}
+
+# Under --system: reads the builder's home, takes the work root from it when --root was not given, makes and checks
+# the prune job's log, checks the root and its bin, and only then writes the job's plist and reloads the job, so a
+# failed check leaves the old plist and job as they were. The Gate work root step, run as the builder, makes the root.
+install_prune_job() {
+    local out home d st why
+    out=$(dscl . -read "/Users/$builder_user" NFSHomeDirectory 2>&1) ||
+        fail "dscl could not read the home of $builder_user: ${out%%$'\n'*}"
+    home=$(home_from_dscl "$out") || fail "dscl gave no absolute NFSHomeDirectory for $builder_user: ${out%%$'\n'*}"
+    if [ "$root_given" = 0 ]; then root="$home/gate-remote"; fi
+    make_prune_log
+    [ -d "$root" ] || fail "the work root $root is missing: run the Gate work root step as $builder_user first"
+    for d in "$root" "$root/bin"; do
+        st=$(stat -f '%HT|%Su|%Lp' "$d" 2>&1) || fail "cannot read $d: $st"
+        why=$(private_folder_of "$d" "$builder_user" "$st") || fail "$why"
+    done
+    note_missing_gate_box
+    log "writing $prune_plist_path (root:wheel, 0644) for $root, run as $builder_user with HOME $home"
+    prune_plist "$root" "$builder_user" "$home" >"$prune_plist_path"
+    chown root:wheel "$prune_plist_path"
+    chmod 644 "$prune_plist_path"
+    prune_job_reloaded
+}
+
 write_maxfiles_plist() {
     maxfiles_plist >"$maxfiles_plist_path"
     chown root:wheel "$maxfiles_plist_path"
@@ -518,7 +701,20 @@ step_system() {
     sys mdutil -a -i off
     # Some .NET packages ship x86_64-only macOS tools (Grpc.Tools' protoc), which run only under Rosetta.
     sys softwareupdate --install-rosetta --agree-to-license
-    [ "$system" = 1 ] || skip 'run with sudo and --system'
+    # Last, so a missing home or work root fails the step only after every other setting is made.
+    if [ "$system" = 1 ]; then
+        install_prune_job
+    else
+        log "would check that ${prune_log_dir%/*} is a folder of root's no one else can write"
+        log "would make $prune_log_dir (root:wheel, 0755) when it is missing, and check that it is one too"
+        log "would create $prune_log_path (owned by {builder user}, 0600) when it is missing"
+        log "would check that $root and $root/bin are folders of {builder user}'s, mode 700, not links"
+        note_missing_gate_box
+        log "would write $prune_plist_path (root:wheel, 0644): $(prune_plist "$root" '{builder user}' '{builder home}' | tr -d '\n')"
+        log "would run: launchctl bootout system/$prune_label (only when it is loaded), then wait up to 10 s for it to go"
+        sys launchctl bootstrap system "$prune_plist_path"
+        skip 'run with sudo and --system'
+    fi
 }
 
 version_of() {

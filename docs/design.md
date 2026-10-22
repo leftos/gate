@@ -2838,7 +2838,7 @@ For `run` the payload also needs a `Snapshot` key: exactly 40 lowercase hex char
 
 The value is empty for a missing key or JSON null, the string as given with control characters escaped, and compact JSON for any other non-string. Two differences from the wrapper are deliberate: the echoed value has its control characters escaped, and the check is stricter than the wrapper's .NET `$`, which accepts a trailing newline.
 
-Every path comes from the payload and nothing is written under the gate's state root; `gate box` takes no `--state-dir`. Test seams are `test-seams`-gated flags, never environment variables (but the three below), and sit before the verb (`gate box --test-... run --stdin`) in a `BoxSeams` struct on `BoxRequest`, apart from the `gate run` seams, so `--test-print-request` is unchanged.
+Every path comes from the payload and nothing is written under the gate's state root; `gate box` takes no `--state-dir`. Test seams are `test-seams`-gated flags, never environment variables (but the three below, and the two of the Unix box's prune, [The Unix box](#the-unix-box)), and sit before the verb (`gate box --test-... run --stdin`) in a `BoxSeams` struct on `BoxRequest`, apart from the `gate run` seams, so `--test-print-request` is unchanged.
 
 The box seams go in any order before the verb, each also as `--<seam>=<value>`. `--test-heartbeat-ms <n>` sets the period of the command heartbeat, and `--test-box-console fail-before` makes the command's UTF-8 console fail before the command starts (the only accepted value, else `gate: --test-box-console must be fail-before, got '<value>'`).
 
@@ -3754,10 +3754,81 @@ A missing, disabled or different task is a refusal whose why names the fix.
 
 A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It speaks the box side's wire above, so the PC's client reads both alike: `gate-box --version` prints the same `gate <version>` text, and `gate-box box <verb> --stdin` reads the request as `gate box` does and parses it with `gate-wire` under `PathForm::Unix`. This section lists only where it differs.
 
-- **Verbs.** `preflight`, `boot`, `run` and `stop` are built. `run` readies the tree, runs the command under the watch and syncs the tree back (below), in the Windows box's order, the dotnet tool restore (below) included; the pnpm, bun and npm package restores are not built (GATE-648). Every other verb says `gate: box <verb> is not built on this builder` and exits 2.
+- **Verbs.** `preflight`, `boot`, `run`, `stop` and `prune` are built. `run` readies the tree, runs the command under the watch and syncs the tree back (below), in the Windows box's order, the dotnet tool restore (below) included; the pnpm, bun and npm package restores are not built (GATE-648). Every other verb says `gate: box <verb> is not built on this builder` and exits 2.
 
   It has no install tripwire, no desktop helper and no MSYS keeper. Its `test-seams` feature passes `gate-args`' hidden `--test-*` seams through, given before the verb; `--test-heartbeat-ms`, `--test-box-sample-ms`, `--test-box-sampler-fail` and `--test-box-free-percent` reach `box run`.
 - **`boot`** reads `kern.boottime` and prints the same line, with the same format.
+- **`prune`** (`prune.rs`) is the Windows box's prune ([The box side](#the-box-side)) on plain `std::fs` calls: `gate-box box prune --root <folder>` is the age prune and `--keys <key>...` the keyed prune. It reads no request and never reads stdin. The keys follow the Windows rules (1 to 50, a repeat pruned once), and a word that is no key exits 2 as there.
+
+  `--root` must be an absolute path starting with `/` (a trailing `/` is dropped), else `gate: box prune --root is not an absolute path: "<value>"` and exit 2, before anything is opened.
+
+  The root must pass the work-root check of `stop` (owned by the box user, not a link, writable by no one else): the sweep works only in a root private to the box user, so only that user can swap what it looks at between its look and its act. A root the check refuses is left whole, with no folder made, no record or folder removed and no git run.
+
+  The age prune prints the check's line (`gate: the builder's work root is not locked down: <why>`) and exits 1; the keyed prune prints `gate: remote could not prune <key>: <that line without its leading gate: >` for each key and exits 1.
+
+  `<root>/work` and `<root>/pruned` must be plain folders, else `gate: remote could not prune: <path> is not a plain folder` and exit 1. `pruned` is made at mode 0700 when missing, and what an earlier sweep left in it is removed at the start, links removed as themselves (`gate: remote could not remove the pruned folder <path>: <error>` on stderr for one that stays). A folder that cannot be listed prints `gate: remote cannot list <path>: <error>` and exits 1.
+
+  Per key it takes `<key>.lock` without waiting, so a key a run or another sweep holds is kept. A key whose `<key>.pgid` or `<key>.tools.pgid` still names the group its run made, by the stale-record rules of "The run's git steps" (unknown counts as current), is kept too, as a run refuses `busy` for it; a record naming no live group goes with the key.
+
+  A lock the age prune cannot open prints `gate: remote could not open the work folder lock <path>: <error>`, and the keyed prune that key's could-not line.
+
+  Under the lock, an idle key (or any named key) loses its records in this order: `<key>.layout` is written as `changing`; `.warm`, `.packages`, `.tools`, `.inputs`, `.sent-build`, `.command`, `.pgid` and `.tools.pgid` are removed; the folder is renamed to `<root>/pruned/<key>.<pid>.<nanos>`; then `.layout`, `.index`, `.index.lock` and the temp files of the key's records (`<key>.<name>.gate-new-*`) are removed.
+
+  The lock is let go and the renamed folder deleted. A key with no folder has its records removed. A failed rename leaves `.layout` reading `changing`, so the next run clears the folder whole.
+
+  The renamed entry must be the folder that was looked at (device and inode), else `its work folder changed during the sweep` and it stays in `pruned` for the next sweep. A link or non-folder at `<root>/work/<key>` is refused as `<path> is not a plain folder`. An aside folder another sweep already removed counts as removed.
+
+  The `.lock` file stays, but for a keyed prune of a key the builder never had: a lock that prune made is removed while still held (a failure says `gate: remote could not remove the work folder lock <path>: <error>`).
+
+  A key's last use is the newest write time among its folder, the `.git/FETCH_HEAD` of the folder and of each folder directly in it (a pair keeps each tree in its own folder), and its records; the lock is left out, since nothing writes it. A key is idle strictly over 24 hours; a last use in the future is not idle.
+
+  Keys are the names in `work` that are keys and the `<key>.<extension>` of the extensions below, the key being the part before the first `.`, listed without regard to case.
+
+  | Name under `<root>/work` | Written by | A prune |
+  |---|---|---|
+  | `<key>` | the work folder (trees; a pair's trees in `<key>/<leaf>` and `<key>/<name>`) | renames aside, deletes |
+  | `<key>.lock` | the work lock | keeps; the keyed prune removes one it made |
+  | `<key>.pgid`, `<key>.tools.pgid` | the git steps' and the tool restore's process groups | read first (a live group keeps the key), then removes |
+  | `<key>.command`, `<key>.tools` | the command record, the tool manifests' hash | removes before the rename |
+  | `<key>.warm`, `<key>.packages`, `<key>.inputs`, `<key>.sent-build` | not written by the Unix box (named so a later writer needs no prune change) | removes before the rename |
+  | `<key>.layout` | the layout record (`single`, `pair ...`) | marks `changing`, removes after the rename |
+  | `<key>.index`, `<key>.index.lock` | the back commit's copied index and git's lock on it | removes after the rename |
+  | `<key>.<name>.gate-new-<pid>-<n>` | a record write cut short | removes after the rename |
+
+  The age prune's stdout is `gate: remote pruned <key>: idle <h> h` per removed folder, then the leftover-folder lines below, and last, always, `gate: remote prune removed <n> of <m> work folders` (`n` counts the floor pass's folders too, `m` the plain folders among the keys; `0 of 0` when the root or `work` is missing). A key it cannot prune prints `gate: remote could not prune <key>: <reason>` on stderr and is kept.
+
+  The age prune exits 0 unless the sweep ended on the root, a folder or a listing as above, and deletes no ref.
+
+  **The free-space floor.** After its age pass the age prune reads the free bytes of the root's volume that the box user may write (`statfs`). While under 100 GiB are free it removes the work folders the age pass kept and no run holds, oldest last use first, whatever their age, one at a time with the free space read again after each, until 150 GiB are free.
+
+  It prints `gate: remote pruned <key>: <g> GiB free` per folder (`g` the whole GiB free before that removal). On stderr it prints `gate: remote could not read the free space of <root>: <error>` (and does no floor pass) and `gate: remote prune could not reach the free-space floor: <g> GiB free` when it ends under 150 GiB, with no folder left to remove or a removal that freed nothing.
+
+  A key the age pass could not prune is not tried again. The floor pass deletes no ref.
+
+  **The `/tmp` sweep.** Last, the age prune removes the run temp folders a hard-killed run left in `/tmp` (not the caller's `TMPDIR`): `/tmp/gate.` and eight letters or digits, a folder (never a link) owned by the box user whose newest write, and that of each entry directly in it, is over 24 hours old. It prints `gate: remote removed the leftover run folder <path>: idle <h> h`, or `gate: remote could not remove the leftover run folder <path>: <error>` on stderr.
+
+  **The keyed prune** removes exactly the keys given, in the order given, whatever their last use, makes a missing `work`, and prints `gate: remote pruned <key> (worktree gone)`, `gate: remote kept <key>: in use` (a held lock or a live group record) or `gate: remote could not prune <key>: <why>` on stderr, one line per key and no summary. It exits 1 when any key got a could-not line, else 0.
+
+  Under the key's lock and with its folder out of `work` (or absent) it deletes `refs/gate/<key>`, `refs/gate-bridge/<key>` and `refs/gate-back/<key>` in each `<root>/*.git` that is a plain folder (not a link) holding `HEAD`, `objects` and `refs`, one `git update-ref -d --no-deref <ref>` per ref, so a symbolic ref goes itself, not its target.
+
+  Git runs `/usr/bin/git` with `core.hooksPath` pointed at a path that cannot exist and `core.fsmonitor=false`, so nothing in a bare repository runs. Every bare is tried; the first failure is the key's `its refs could not be removed: <why>`, and a key kept for a held lock or a failed rename keeps its refs.
+
+  A root that is missing is gone, and every key answers `pruned`, only when its parent folder can be read; under `/Volumes/<name>` it is unknown while that volume is not mounted. Unknown is never gone: each key gets `gate: remote could not prune <key>: the root's volume is not there` (or `the root cannot be looked at: <error>` for any other failure to look at it) and the exit is 1. A record left once the folder was aside fails the key, as on the Windows box.
+
+  A `test-seams` build of `gate-box-unix` reads two environment variables, the one exception to "never environment variables" for seams, because the prune takes no request and its seams are not in `gate-args`' shared `BoxSeams`: `GATE_BOX_TEST_TMP_ROOT` replaces `/tmp` in the sweep above and `GATE_BOX_TEST_FREE_BYTES` replaces the `statfs` read with a byte count. The installed binary ignores both (`cfg(feature = "test-seams")`).
+
+  **The scheduled job.** The launchd job `dev.gate.prune-work` (`/Library/LaunchDaemons/dev.gate.prune-work.plist`, root:wheel 0644) runs `<root>/bin/gate-box box prune --root <root>` as the builder user at load and every 2 hours (`StartInterval` 7200), with low-priority I/O, background process type, the root as working directory and `HOME` set to the builder's home.
+
+  Its output goes to `/Library/Logs/gate/prune-work.log`, which is not rotated. `install-macos.sh --system --user <name>` installs it in its System step, last after the machine settings, in this order, writing nothing to `/Library/LaunchDaemons` until every check has passed:
+  1. It reads the builder's home with `dscl`; `--root` defaults to `<home>/gate-remote` under `--system` (give an absolute `--root` there, since a `~/` expands to root's home).
+  2. It makes `/Library/Logs/gate` (root:wheel 0755) when missing; an existing one must be a folder owned by root that group and other cannot write. It creates the log when missing, with no-clobber, as root, then hands it to the builder at mode 0600 without following links; the log, made or found, must be a plain file of one link owned by the builder, else the step fails with a line naming the path and what is wrong. The builder's root is never `chown`ed or `chmod`ed by root.
+  3. `<root>` and `<root>/bin` must be folders (not links) owned by the builder at mode 700, else the step fails naming the path. The root is made by the Gate work root step, run as the builder first.
+  4. A missing `<root>/bin/gate-box` does not stop the step (a new builder is provisioned before its first `gate push`): it logs `gate-box is not in <root>/bin yet: the prune job fails until gate push installs it`.
+  5. It writes the plist, then, when the job is loaded, runs `launchctl bootout system/dev.gate.prune-work`.
+
+     A non-zero bootout exit (launchctl says 36 while the old process is still ending) never fails the step: it logs `bootout of dev.gate.prune-work said <n>; waiting for it to go` and waits up to 10 s, polling `launchctl print` every 0.5 s, for the job to go, else the step fails with `system/dev.gate.prune-work was still loaded 10 s after launchctl bootout`. Then it runs `launchctl bootstrap system <plist>`.
+
+  Without `--system` the step logs a `would ...` line for each of these (naming `{builder user}` and `{builder home}` in the plist text) and SKIP.
 - **Commands' `PATH`.** The programs the box starts (the probes, `dotnet --list-sdks`, the git steps of `box run` with its back commit, and the routed command) run along the `PATH` of the box user's login shell, since a non-login ssh command lacks the toolchains' folders: `$SHELL -l -c` of `/usr/bin/printf '\0__GATE_LOGIN_{16 hex}__\0'; /usr/bin/env -0` (`/bin/zsh` when `SHELL` is unset), 10 s, nothing cached between runs. The same one start also gives the builder's `GATE_GODOT_ROOT` (below). `run` reads it once, just before its first git step and after the usage, unbuilt, Rosetta, root, busy, sweep, earlier-group and layout-file checks, so a run those checks end starts no login shell and says no path line. The git steps of `run` keep it in their environment, so a git-lfs filter is found along it, and the command is found along it; the preflight's git steps do not (they run the ssh `PATH`, with git itself found by its absolute path, below). Empty and relative entries of the login `PATH` are dropped. When it cannot be read the box keeps the ssh `PATH` and says `gate: remote path: could not read the login shell's PATH: <why>; using the ssh PATH` on stderr; a `PATH` with no absolute folder left is such a failure, with `<why>` `said a PATH with no absolute folder`. Each program runs in a process group of its own, which a deadline kills with `SIGKILL`; a git step's ending is under "The run's git steps" below.
 
   The marker is made per call from the box's process id and the time, so nothing a login profile prints can pass for it. The two programs are given by absolute path with single-quoted words and expand no variable, so the command parses alike under any login shell (fish, tcsh, a profile with `set -u`).
@@ -3981,7 +4052,7 @@ A virtual Cargo workspace (`resolver = "3"`) with every crate under `crates/`, l
 | `proc-table` | The process snapshot model (`ProcessInfo`, `ProcessTable`, `ProcessTree`) and its Windows reader. Moved with `gate-state` (GATE-4). | yes; its `win32` module is Windows-only |
 | `gate-win32` | The Win32 layer: job objects, process creation, named mutexes and events, priority, console, the registration of the desktop helper's Task Scheduler task and the start of a registered one in a given session (`task.rs`, through COM), the WSL VM's CPU reader, the samples the watchdog consumes. | no |
 | `gate-desktop` | The desktop helper exe and the pipe protocol the box speaks with it and its exit codes. | no |
-| `gate-box-unix` | The Unix box, bin `gate-box` ([The Unix box](#the-unix-box)): `box preflight`, `boot`, `run` and `stop` for a macOS builder, with the process helpers, the CPU source (`cpu.rs`), the heartbeat (`heartbeat.rs`), the backstop watch (through `gate-watchdog`) and the back commit (`back.rs`). Its verbs and helpers are `cfg(unix)`; on another target the bin says `gate-box: runs only on a Unix builder` and exits 1. | yes; the verbs are Unix only |
+| `gate-box-unix` | The Unix box, bin `gate-box` ([The Unix box](#the-unix-box)): `box preflight`, `boot`, `run`, `stop` and `prune` for a macOS builder, with the process helpers, the CPU source (`cpu.rs`), the heartbeat (`heartbeat.rs`), the backstop watch (through `gate-watchdog`) and the back commit (`back.rs`). Its verbs and helpers are `cfg(unix)`; on another target the bin says `gate-box: runs only on a Unix builder` and exits 1. | yes; the verbs are Unix only |
 | `gate-wire` | The box request payload both the PC client and every box parse (`PathForm::Windows` or `Unix`), and the gate's version text `build_version` with the version parse the tool probes share (`version_of`, `first_version`). | yes; a pure crate |
 | `gate-inputs` | What the Windows box and the Unix box must judge alike about a routed run's inputs and outputs: the path-name rules (`names`), the stream SHA-256 (`hash`) and the manifest (`Manifest`, `Held`, `Stamp`, `read_sent`, and `refused_path`, the check of the paths a sent manifest names). No OS calls. | yes; a pure crate |
 | `gate-watchdog` | Free-share, load-adjusted clock, stall, ceiling and backstop arithmetic over samples with the kill lines, and the box heartbeat, on an injected clock; the cores-hint verdict. | yes; a pure crate |
