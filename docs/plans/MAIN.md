@@ -6,14 +6,12 @@
 
 - [ ] GATE-595 Route to more than one builder, choosing by what each builder can run — Urgent · Remote
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
-- [ ] GATE-641 Keep a first launch of freshly built binaries from looking stalled while a scanner loads them — High · Local gate
 - [ ] GATE-616 Move the box's shared wire rules into gate-wire so both boxes say the same bytes — High · Remote
 - [ ] GATE-615 Tie the Unix box's job record to its process group leader's start time — High · Remote
 - [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root — High · Remote
 - [ ] GATE-648 Restore pnpm, bun and npm packages on the Unix box, as the Windows box does — High · Remote
-- [ ] GATE-684 Send a Godot command to a Mac builder with the Mac's Godot binary — High · Remote
-- [ ] GATE-685 Give a routed run on the Unix box a short TMPDIR so .NET named pipes fit — High · Remote
-- [ ] GATE-686 Lay out a sibling pair on the Unix box as the Windows box does — High · Remote
+- [/] GATE-684 Send a Godot command to a Mac builder with the Mac's Godot binary — High · Remote
+- [/] GATE-686 Lay out a sibling pair on the Unix box as the Windows box does — High · Remote
 - [ ] GATE-574 Take the work lock in the box preflight and stamp the lock's time on each run — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
@@ -34,10 +32,9 @@
 - [ ] GATE-647 Find whether the shared snapshot ref gives a second builder a wrong bridge base; key it per builder if so — High · Remote
 - [ ] GATE-649 Bring back every test project's output a routed dotnet test build made — High · Remote
 - [ ] GATE-650 Fall back when a builder's box program is missing (ssh status 126/127) — High · Remote
-- [!] GATE-653 Route towercab-3d's cargo commands: the snapshot lacks its gitignored dist/ and converter exe — High · Remote
 - [ ] GATE-682 Explain or track a stall when a gated command is plain ssh to another machine — High · Remote
 - [/] GATE-683 Prune a deleted worktree's folders from every builder, and prune the Mac by space — High · Remote
-- [/] GATE-689 Prune a gone worktree's keys from the Windows builders and the PC — High · Remote
+- [ ] GATE-689 Prune a gone worktree's keys from the Windows builders and the PC — High · Remote
 - [ ] GATE-690 Prune the Unix box by age, free space and gone keys, on a launchd schedule — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
@@ -224,6 +221,7 @@
 - [ ] GATE-691 Collect the objects a pruned key's refs kept in a builder's bare repos
 - [ ] GATE-692 Give the pin decision its own result type instead of Route::Refused
 - [ ] GATE-695 Skip or guard the Unix box's back commit when a process escaped the command's group
+- [ ] GATE-696 Cross-build Windows outputs on a macOS builder and bring them back
 
 ## Design
 
