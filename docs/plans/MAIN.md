@@ -4,14 +4,15 @@
 
 ## Do first
 
+- [ ] GATE-610 Show each builder's remote pool on the dashboard — Urgent · Remote
 - [ ] GATE-595 Route to more than one builder, choosing by what each builder can run — Urgent · Remote
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [ ] GATE-616 Move the box's shared wire rules into gate-wire so both boxes say the same bytes — High · Remote
 - [ ] GATE-615 Tie the Unix box's job record to its process group leader's start time — High · Remote
 - [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root — High · Remote
 - [ ] GATE-648 Restore pnpm, bun and npm packages on the Unix box, as the Windows box does — High · Remote
-- [/] GATE-684 Send a Godot command to a Mac builder with the Mac's Godot binary — High · Remote
-- [/] GATE-686 Lay out a sibling pair on the Unix box as the Windows box does — High · Remote
+- [ ] GATE-701 Build box inputs on the Unix box, so a repo with inputs can route to a Mac — High · Remote
+- [ ] GATE-702 Bring outputs back from a Mac builder, so yaat's tests can route there — High · Remote
 - [ ] GATE-574 Take the work lock in the box preflight and stamp the lock's time on each run — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
@@ -35,7 +36,7 @@
 - [ ] GATE-682 Explain or track a stall when a gated command is plain ssh to another machine — High · Remote
 - [/] GATE-683 Prune a deleted worktree's folders from every builder, and prune the Mac by space — High · Remote
 - [ ] GATE-689 Prune a gone worktree's keys from the Windows builders and the PC — High · Remote
-- [ ] GATE-690 Prune the Unix box by age, free space and gone keys, on a launchd schedule — High · Remote
+- [/] GATE-690 Prune the Unix box by age, free space and gone keys, on a launchd schedule — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Local gate
@@ -46,7 +47,6 @@
 
 ## Remote
 
-- [ ] GATE-610 Show each builder's remote pool on the dashboard
 - [ ] GATE-663 Keep the Unix box's preflight from racing a run's git lock sweep on the same key
 - [ ] GATE-666 Let the Unix box's stop reach a run between two steps with a stop marker
 - [ ] GATE-667 Keep the Unix box's stop under the client's stop limit when it follows several groups
@@ -222,6 +222,10 @@
 - [ ] GATE-692 Give the pin decision its own result type instead of Route::Refused
 - [ ] GATE-695 Skip or guard the Unix box's back commit when a process escaped the command's group
 - [ ] GATE-696 Cross-build Windows outputs on a macOS builder and bring them back
+- [ ] GATE-697 Refuse a Godot install inside the run's folders on the Unix box
+- [ ] GATE-698 Say the new work tree line for a pair whose tree lost its .git, on both boxes
+- [ ] GATE-699 Match the Windows box when a Godot run has a version and no Godot root on the Unix box
+- [ ] GATE-703 Wait for the open-file-limit job to unload before reloading it on a Mac builder
 
 ## Design
 
@@ -335,3 +339,4 @@
 - [ ] GATE-676 Hold the box's ceiling clock until a box-kill case's command has marked its file
 - [ ] GATE-679 Correct design.md's note on the priority a suite case's gates run at
 - [ ] GATE-693 End a run that never ran its command with a verdict line
+- [ ] GATE-700 Share the Godot version parse between the two boxes in gate-wire
