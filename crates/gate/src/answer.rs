@@ -53,7 +53,15 @@ fn usage_error(problems: &[Problem], console: &mut Console) -> u8 {
 }
 
 fn run(request: &RunRequest, environment: &Environment, console: &mut Console) -> u32 {
-    let resolved = resolve::root(request.state_dir.as_deref(), environment).and_then(|root| Ok((resolve::log(&request.log)?, root)));
+    let resolved = resolve::root(request.state_dir.as_deref(), environment).and_then(|root| {
+        let log = if request.print_request {
+            resolve::log_in(&request.log, request.cd.as_deref())?
+        } else {
+            enter(request.cd.as_deref(), request.spelling)?;
+            resolve::log(&request.log)?
+        };
+        Ok((log, root))
+    });
     match resolved {
         Err(line) => {
             console.err(&line);
@@ -63,13 +71,7 @@ fn run(request: &RunRequest, environment: &Environment, console: &mut Console) -
             console.out(&request_json::run(request, &log, &root));
             0
         }
-        Ok((log, root)) => match enter(request.cd.as_deref(), request.spelling) {
-            Err(line) => {
-                console.err(&line);
-                u32::from(USAGE_STATUS)
-            }
-            Ok(()) => crate::run::run(request, &log, &root, environment, console),
-        },
+        Ok((log, root)) => crate::run::run(request, &log, &root, environment, console),
     }
 }
 
@@ -79,10 +81,10 @@ const ERROR_PATH_NOT_FOUND: i32 = 3;
 const ERROR_DIRECTORY: i32 = 267;
 
 /// Makes `cd` (`--cd`, a relative path read against the caller's folder) the gate's working directory, so the run, its
-/// routing, its command and its journal lines all take it as the folder the gate was started in. Called after the log
-/// and the state root are made absolute, which stay the caller's, and before any slot is taken. Only a folder on a
-/// drive is entered: a UNC, verbatim or device path is refused before any filesystem call. Each line names the flag as
-/// the caller spelled it.
+/// routing, its command and its journal lines all take it as the folder the gate was started in. Called after the state
+/// root is made absolute, which stays the caller's, and before the log is, so a relative log is read against `cd`, and
+/// before any slot is taken. Only a folder on a drive is entered: a UNC, verbatim or device path is refused before any
+/// filesystem call. Each line names the flag as the caller spelled it.
 pub(crate) fn enter(cd: Option<&Path>, spelling: Spelling) -> Result<(), String> {
     let Some(given) = cd else {
         return Ok(());

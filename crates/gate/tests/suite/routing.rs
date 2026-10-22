@@ -970,18 +970,15 @@ fn a_gate_given_cd_routes_as_a_gate_started_in_that_folder() {
 }
 
 #[test]
-fn a_relative_log_is_read_against_the_caller_s_folder_not_the_cd_folder() {
+fn a_relative_log_lands_in_the_cd_folder() {
     let case = Case::new("cd-relative-log");
-    let there = cd_folder(&case, "there");
-    for folder in [case.folder(), there.clone()] {
-        fs::create_dir_all(folder.join(".tmp")).expect("a .tmp folder can be made");
-    }
-    let outcome = finish(case.gate(&run_words(".tmp/x.log", &["--cd", "there"], &[FAKE_TOOL, "out", "logged"])));
+    let work = cd_folder(&case, "work");
+    let outcome = finish(case.gate(&run_words("x.log", &["--cd", "work"], &[FAKE_TOOL, "out", "hi"])));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let log = fs::read_to_string(case.folder().join(".tmp").join("x.log")).expect("the log is under the caller's folder");
-    assert!(log.contains("logged"), "{log}");
-    assert!(!there.join(".tmp").join("x.log").exists(), "no log under the --cd folder");
+    let log = fs::read_to_string(work.join("x.log")).expect("the log is under the --cd folder");
+    assert!(log.contains("hi"), "{log}");
+    assert!(!case.folder().join("x.log").exists(), "no log under the caller's folder");
 }
 
 #[test]

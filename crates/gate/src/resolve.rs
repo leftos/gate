@@ -2,6 +2,7 @@
 //! `%LOCALAPPDATA%\gate\v1`, in that order, and paths made absolute against the working directory. Nothing is created.
 
 use std::ffi::{OsStr, OsString};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use gate_state::{StateRoot, default_root};
@@ -69,6 +70,17 @@ pub(crate) fn root(flag: Option<&Path>, environment: &Environment) -> Result<Res
 /// The log path, absolute against the working directory.
 pub(crate) fn log(log: &Path) -> Result<PathBuf, String> {
     absolute(log, "the log path")
+}
+
+/// The log path as a run given `cd` (`--cd`) reads it without entering the folder: a relative `log` is read against
+/// `cd`, itself read against the working directory, and an absolute one is kept. Without `cd`, [`log`].
+pub(crate) fn log_in(log: &Path, cd: Option<&Path>) -> Result<PathBuf, String> {
+    let Some(cd) = cd else {
+        return self::log(log);
+    };
+    let cannot = |error: io::Error| format!("gate: cannot make the log path {} absolute: {error}", log.display());
+    let folder = std::path::absolute(cd).map_err(cannot)?;
+    std::path::absolute(folder.join(log)).map_err(cannot)
 }
 
 /// A variable's value, with an empty value read as unset.

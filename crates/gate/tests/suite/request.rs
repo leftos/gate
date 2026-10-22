@@ -1,6 +1,8 @@
 //! The request the gate resolves, seen through `--test-print-request`: the absolute log, the defaults, and the state
 //! root chosen from `--state-dir`, then `GATE_STATE_DIR`.
 
+use std::fs;
+
 use serde_json::{Value, json};
 
 use crate::support::{Case, finish, print_run, shown};
@@ -116,6 +118,28 @@ fn print_request_shows_cd_as_given() {
     words.splice(7..7, ["--cd", r"..\other"]);
 
     assert_eq!(case.run(&words).request()["cd"], r"..\other");
+}
+
+#[test]
+fn print_request_reads_a_relative_log_against_cd() {
+    let case = Case::new("print_request_reads_a_relative_log_against_cd");
+    fs::create_dir_all(case.folder().join("sub")).expect("the --cd folder can be made");
+    let mut words = print_run(&["cmd"]);
+    words.splice(7..7, ["--cd", "sub"]);
+
+    assert_eq!(case.run(&words).request()["log"], shown(&case.folder().join("sub").join("out.log")));
+}
+
+#[test]
+fn print_request_keeps_an_absolute_log_with_cd() {
+    let case = Case::new("print_request_keeps_an_absolute_log_with_cd");
+    fs::create_dir_all(case.folder().join("sub")).expect("the --cd folder can be made");
+    let log = shown(&case.folder().join("elsewhere.log"));
+    let mut words: Vec<&str> = print_run(&["cmd"]);
+    words[6] = &log;
+    words.splice(7..7, ["--cd", "sub"]);
+
+    assert_eq!(case.run(&words).request()["log"], log);
 }
 
 #[test]

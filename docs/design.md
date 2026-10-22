@@ -75,7 +75,7 @@ The watchdog samples the command and kills its job on a stall, at the ceiling an
 | `--slot heavy\|light\|critical\|none` | `-Slot` | The slot kind ([Slots](#slots)); `none` takes no slot and is for a command that only dispatches or watches remote work, except for a `git commit`, a commit run, which takes the slot asked (light for `none`; [Commit run](#critical-drain-and-nesting)). | ruling |
 | `--alone` | `-Alone` | With `--slot critical` only: hold the whole machine, the light slots a plain critical gate leaves beside it included ([Critical drain and nesting](#critical-drain-and-nesting), Alone). Any other slot, or a gate's own command, is a usage error (exit 2). Ungated processes keep running: the gate cannot stop them, and the load snapshot it logs is the evidence, not a guarantee. | ruling (GATE-482) |
 | `--timeout <seconds>` | `-TimeoutSeconds` | The ceiling in load-adjusted seconds, a whole number above 0 (W3). `auto:<n>` makes `n` a floor: each take resolves the ceiling to `max(n, ceil(3 x the command's adjusted p99))`, capped at 2147483647, and to `n` with no adjusted p99 ([Output lines](#output-lines), [design/gate-durations.md](design/gate-durations.md), part 4). The new CLI only: `-TimeoutSeconds` refuses it. | ruling |
-| `--log <path>` | `-Log` | The command's log; a relative path is read against the caller's working directory once, at start, before `--cd` (P5). | ruling |
+| `--log <path>` | `-Log` | The command's log; a relative path is read once, at start, against the `--cd` folder when one is given, else against the caller's working directory ([Run folder](#run-folder)). | ruling |
 | `--stall <seconds>` | `-StallSeconds` | The stall window, default 120 (W2); the gate passes it as given, and the remote client raises a value under 15 to 15 on a routed run (F2). | kept (C1, F2) |
 | `--tail <lines>` | `-Tail` | Lines of the log printed at the end, default 20 (V3). | kept (C1, V3) |
 | `--no-markers` | `-NoMarkers` | The command's status is the verdict; the marker scan is off (V2). | ruling |
@@ -95,9 +95,9 @@ The words after `--` reach the command exactly as the caller passed them ([Comma
 
 #### Run folder
 
-`--cd <folder>` (a relative folder is read against the caller's working directory) makes the gate enter `<folder>` once, after `--log` and `--state-dir` are made absolute against the caller's folder and before any slot is taken.
+`--cd <folder>` (a relative folder is read against the caller's working directory) makes the gate enter `<folder>` once, after `--state-dir` is made absolute against the caller's folder, before `--log` is made absolute, and before any slot is taken. A `--cd` it cannot enter is said before a `--log` that cannot be made absolute.
 
-From then on `<folder>` is the folder the gate was started in: [routing](#routing) reads its worktree, the command's working folder and program lookup, a fallback's local run, and the journal's and claim's `cwd` all take it. A relative `--log` or `--state-dir` stays the caller's.
+From then on `<folder>` is the folder the gate was started in: [routing](#routing) reads its worktree, the command's working folder and program lookup, a fallback's local run, and the journal's and claim's `cwd` all take it, and so does a relative `--log`. A relative `--state-dir` stays the caller's. `--test-print-request`, which enters no folder, shows a relative log joined to the `--cd` folder.
 
 It is how a caller in a main checkout gates a command that names another worktree's files: `--cd <worktree>` routes the run as if the gate had been started there. Given twice it is refused (`gate: --cd is given twice`). `gate expect` and `gate check` do not take it (unknown option). The compatibility layer reads it as `-Cd`, one of the two new options it takes (the launcher's callers need it); the frozen PowerShell gate refuses `-Cd`. Nothing is said on success.
 
