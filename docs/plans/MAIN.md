@@ -4,14 +4,13 @@
 
 ## Do first
 
-- [ ] GATE-610 Show each builder's remote pool on the dashboard — Urgent · Remote
 - [ ] GATE-595 Route to more than one builder, choosing by what each builder can run — Urgent · Remote
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [ ] GATE-616 Move the box's shared wire rules into gate-wire so both boxes say the same bytes — High · Remote
 - [ ] GATE-615 Tie the Unix box's job record to its process group leader's start time — High · Remote
 - [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root — High · Remote
 - [ ] GATE-648 Restore pnpm, bun and npm packages on the Unix box, as the Windows box does — High · Remote
-- [ ] GATE-701 Build box inputs on the Unix box, so a repo with inputs can route to a Mac — High · Remote
+- [/] GATE-701 Build box inputs on the Unix box, so a repo with inputs can route to a Mac — High · Remote
 - [ ] GATE-702 Bring outputs back from a Mac builder, so yaat's tests can route there — High · Remote
 - [ ] GATE-574 Take the work lock in the box preflight and stamp the lock's time on each run — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
@@ -36,7 +35,6 @@
 - [ ] GATE-682 Explain or track a stall when a gated command is plain ssh to another machine — High · Remote
 - [/] GATE-683 Prune a deleted worktree's folders from every builder, and prune the Mac by space — High · Remote
 - [ ] GATE-689 Prune a gone worktree's keys from the Windows builders and the PC — High · Remote
-- [/] GATE-690 Prune the Unix box by age, free space and gone keys, on a launchd schedule — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Local gate
@@ -226,6 +224,11 @@
 - [ ] GATE-698 Say the new work tree line for a pair whose tree lost its .git, on both boxes
 - [ ] GATE-699 Match the Windows box when a Godot run has a version and no Godot root on the Unix box
 - [ ] GATE-703 Wait for the open-file-limit job to unload before reloading it on a Mac builder
+- [ ] GATE-704 Rotate the Unix box's prune log
+- [ ] GATE-705 Remove a Unix box key's orphan temp files in the age prune
+- [ ] GATE-706 List the bares once per keyed prune on the Unix box
+- [ ] GATE-707 Report a Unix box key's ref failure even when its record is left
+- [ ] GATE-708 Tell a stale /Volumes mount point from a mounted builder volume in the Unix prune
 
 ## Design
 
