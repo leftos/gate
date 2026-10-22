@@ -2032,7 +2032,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   Every git call runs with `core.hooksPath` off. A clean filter in a repository's own config still runs during the snapshot's `git add`: the repository's config is the user's, an accepted risk.
 
-  The bridge commit has the snapshot's tree and, as its parent, the newest local `refs/gate-remote/*` not ending `-back`; with none it has no parent. The push writes `refs/gate-remote/<key>` once the builder has the snapshot.
+  The local ref of the snapshot a builder last received is per builder: `refs/gate-remote/<key>` for `host`, `refs/gate-remote/<id>/<key>` for a builder with an id (a `builders` or `hosts` entry, the id its pool and caches use). The bridge commit has the snapshot's tree and, as its parent, the receiving builder's own ref of the key, else the newest of that builder's refs not ending `-back`; with none it has no parent. The push writes the builder's ref once the builder has the snapshot.
+
+  The bridge is what keeps a push small: a snapshot has no parent, so git leaves out only what the bridge's parent reaches, and only when the builder holds that parent. One ref shared by two builders would hand each a parent the other received, and every switch between them would send the whole repository.
 
   Every git call of the client goes through `remote/git.rs`, which the routing decision's git calls share: it removes the `GIT_*` location variables, applies the call's time limit (`--test-git-limit-ms`, one value for the routing decision's calls, the client's and the `--test-remote-snapshot` client's), starts git through `remote/launch.rs` (suspended, assigned to an anonymous kill-on-close job of its own and resumed, with its output on pipes read by a thread per stream), reads and drops stderr where nothing reads it and ends git's whole job on Ctrl+C.
 
@@ -2243,7 +2245,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     The project files are every `*.csproj` the snapshot holds, at any depth and in any ASCII letter case: at most 64 files of at most 256 KiB each, read with at most two git calls, the sizes first and then one bounded batch read. A file that cannot be read says `gate: cannot read the Godot pin of <file>: <why>; not checking it` and gives no pin; files past the 64th say `gate: <n> more project files not read for a Godot pin; not checking them`.
 
     `global.json` stays the SDK pin, read by `parity.rs` as above.
-  - **Push.** `git push --no-verify --no-recurse-submodules --progress [--receive-pack=…] -- <host>:<builder root>/<repo>.git +<snapshot>:refs/gate/<key> [+<bridge>:refs/gate-bridge/<key>]`, with `GIT_SSH_COMMAND` carrying the ssh options. Success says `gate: pushed snapshot <8 hex> in <s> s (<size>|up to date)` and moves the local `refs/gate-remote/<key>`.
+  - **Push.** `git push --no-verify --no-recurse-submodules --progress [--receive-pack=…] -- <host>:<builder root>/<repo>.git +<snapshot>:refs/gate/<key> [+<bridge>:refs/gate-bridge/<key>]`, with `GIT_SSH_COMMAND` carrying the ssh options. Success says `gate: pushed snapshot <8 hex> in <s> s (<size>|up to date)` and moves the builder's local snapshot ref (`refs/gate-remote/<key>` for `host`, `refs/gate-remote/<id>/<key>` for a builder with an id).
 
     The builder keeps one bare repo per repo name, `<builder root>/<repo>.git`, shared by every key of that repo; the key is only the ref's name.
 

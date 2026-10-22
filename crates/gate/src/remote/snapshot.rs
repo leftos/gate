@@ -1,8 +1,8 @@
 //! The snapshot a routed run sends the builder: the worktree as `git add -A` would stage it, untracked files in and
 //! ignored ones out, committed with no parent through a copy of the index, so the real index and every worktree file
-//! stay as they were; the bridge commit, the same tree on the previous snapshot; and the local ref naming the snapshot
-//! the builder last received. Every commit is made by git under the `gate-remote` identity, through its environment,
-//! and is never signed.
+//! stay as they were; the bridge commit, the same tree on the previous snapshot that builder received; and the local
+//! ref, one per builder, naming the snapshot each builder last received. Every commit is made by git under the
+//! `gate-remote` identity, through its environment, and is never signed.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -25,7 +25,8 @@ pub(crate) const IDENTITY: [(&str, &str); 4] = [
 const DATES: [&str; 2] = ["GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"];
 const SNAPSHOT_MESSAGE: &str = "gate-remote snapshot";
 const BRIDGE_MESSAGE: &str = "gate-remote bridge";
-/// Where the local refs of the snapshots live, one a key, beside the `-back` refs of changes kept from the builder.
+/// Where the local refs of the snapshots live, one a key for `host` and one a key under each other builder's id
+/// ([`snapshot_ref`]), beside the `-back` refs of changes kept from the builder.
 pub(super) const REFS: &str = "refs/gate-remote/";
 pub(super) const BACK: &str = "-back";
 
@@ -39,13 +40,23 @@ pub(crate) struct Snapshot {
 }
 
 /// The snapshot of each of `roots`, in order, under the work-folder `key`, each git call under `bounds` or ended by the
-/// console `interrupt`; else why the call could not be made. git is found once, for every call of every root.
-pub(crate) fn take(roots: &[PathBuf], key: &str, bounds: GitBounds, interrupt: Option<Interrupt>) -> Result<Vec<Snapshot>, GitError> {
+/// console `interrupt`, each bridge built on the snapshot the builder `builder` ([`gate_router::Builder::id`], `None`
+/// for `host`) last received; else why the call could not be made. git is found once, for every call of every root.
+pub(crate) fn take(
+    roots: &[PathBuf],
+    key: &str,
+    builder: Option<&str>,
+    bounds: GitBounds,
+    interrupt: Option<Interrupt>,
+) -> Result<Vec<Snapshot>, GitError> {
     let Some(first) = roots.first() else {
         return Ok(Vec::new());
     };
     let git = Git::find(first).map_err(GitError::Failed)?;
-    roots.iter().map(|root| take_one(&git, root, &[], key, bounds, interrupt)).collect()
+    roots
+        .iter()
+        .map(|root| take_one(&Calls::new(&git, root, &[], bounds, interrupt), key, builder))
+        .collect()
 }
 
 /// A repository of a sibling pair as its git calls ask about it: its worktree's folder; the folder git's search for a
@@ -88,10 +99,18 @@ pub(crate) struct Place {
 /// repository is given.
 pub(crate) const CEILING: &str = "GIT_CEILING_DIRECTORIES";
 
-/// The snapshot of the pair's repository `repo`, as [`take`] takes one, under the work-folder `key`.
-pub(crate) fn take_bounded(repo: Bounded<'_>, key: &str, bounds: GitBounds, interrupt: Option<Interrupt>) -> Result<Snapshot, GitError> {
+/// The snapshot of the pair's repository `repo`, as [`take`] takes one, under the work-folder `key`, for the builder
+/// `builder`.
+pub(crate) fn take_bounded(
+    repo: Bounded<'_>,
+    key: &str,
+    builder: Option<&str>,
+    bounds: GitBounds,
+    interrupt: Option<Interrupt>,
+) -> Result<Snapshot, GitError> {
     let git = Git::find(repo.root).map_err(GitError::Failed)?;
-    take_one(&git, repo.root, &repo.variables(), key, bounds, interrupt)
+    let variables = repo.variables();
+    take_one(&Calls::new(&git, repo.root, &variables, bounds, interrupt), key, builder)
 }
 
 /// Where git finds the pair's repository `repo`, searching from its root up to its ceiling and given no place, as one
@@ -99,13 +118,7 @@ pub(crate) fn take_bounded(repo: Bounded<'_>, key: &str, bounds: GitBounds, inte
 pub(crate) fn place_of(repo: Bounded<'_>, bounds: GitBounds, interrupt: Option<Interrupt>) -> Result<Place, GitError> {
     let git = Git::find(repo.root).map_err(GitError::Failed)?;
     let ceiling = [(CEILING, repo.ceiling.as_os_str())];
-    let calls = Calls {
-        git: &git,
-        root: repo.root,
-        bound: &ceiling,
-        bounds,
-        interrupt,
-    };
+    let calls = Calls::new(&git, repo.root, &ceiling, bounds, interrupt);
     let args = [
         "rev-parse",
         "--show-toplevel",
@@ -129,13 +142,37 @@ pub(crate) fn place_of(repo: Bounded<'_>, bounds: GitBounds, interrupt: Option<I
     }
 }
 
-/// Points `refs/gate-remote/<key>` at `commit` in the repository of `root`, once the builder has the snapshot, so the
-/// next bridge commit builds on it, git given `bound`, a pair's repository's [`Bounded::variables`], none for a run
-/// of one. git holds the ref's lock while it runs, so it is a [`git::Call::locked`] call, which no Ctrl+C ends: it ends
-/// on its own or at `bounds`' limit.
-pub(crate) fn save(root: &Path, bound: &[(&str, &OsStr)], key: &str, commit: &str, bounds: GitBounds) -> Result<(), GitError> {
+/// The local ref of the snapshot of one work-folder key that one builder last received, made only by [`snapshot_ref`],
+/// so [`save`] can be given no other name.
+#[derive(Debug)]
+pub(crate) struct SnapshotRef(String);
+
+impl SnapshotRef {
+    /// The ref's full name, as git is given it.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The local ref of the snapshot of the work-folder `key` that the builder `builder` last received, by
+/// [`gate_router::Builder::id`]: `refs/gate-remote/<key>` for `host`, `None`, and `refs/gate-remote/<id>/<key>` for the
+/// builder of the id `id`. A key holds a `-` and an id never does, so no two builders' refs meet.
+pub(crate) fn snapshot_ref(key: &str, builder: Option<&str>) -> SnapshotRef {
+    SnapshotRef(format!("{}{key}", builder_refs(builder)))
+}
+
+/// The folder of the local refs of the snapshots the builder `builder` last received, [`REFS`] for `host`, `None`.
+fn builder_refs(builder: Option<&str>) -> String {
+    builder.map_or_else(|| REFS.to_owned(), |id| format!("{REFS}{id}/"))
+}
+
+/// Points `reference`, the builder's [`snapshot_ref`], at `commit` in the repository of `root`, once the builder has
+/// the snapshot, so the next bridge commit to that builder builds on it, git given `bound`, a pair's repository's
+/// [`Bounded::variables`], none for a run of one. git holds the ref's lock while it runs, so it is a
+/// [`git::Call::locked`] call, which no Ctrl+C ends: it ends on its own or at `bounds`' limit.
+pub(crate) fn save(root: &Path, bound: &[(&str, &OsStr)], reference: &SnapshotRef, commit: &str, bounds: GitBounds) -> Result<(), GitError> {
     let git = Git::find(root).map_err(GitError::Failed)?;
-    let args = ["update-ref", &format!("{REFS}{key}"), commit];
+    let args = ["update-ref", reference.as_str(), commit];
     git.output(&git::Call {
         set: bound,
         ..git::Call::locked(root, &args, bounds)
@@ -148,38 +185,24 @@ pub(crate) fn save(root: &Path, bound: &[(&str, &OsStr)], key: &str, commit: &st
 /// `interrupt`.
 pub(super) fn worktree(root: &Path, bounds: GitBounds, interrupt: Option<Interrupt>) -> Result<String, GitError> {
     let git = Git::find(root).map_err(GitError::Failed)?;
-    worktree_tree(&Calls {
-        git: &git,
-        root,
-        bound: &[],
-        bounds,
-        interrupt,
-    })
-    .map(|(tree, _)| tree)
+    worktree_tree(&Calls::new(&git, root, &[], bounds, interrupt)).map(|(tree, _)| tree)
 }
 
-fn take_one(
-    git: &Git,
-    root: &Path,
-    bound: &[(&str, &OsStr)],
-    key: &str,
-    bounds: GitBounds,
-    interrupt: Option<Interrupt>,
-) -> Result<Snapshot, GitError> {
-    let calls = Calls {
-        git,
-        root,
-        bound,
-        bounds,
-        interrupt,
-    };
+/// The snapshot of the worktree `calls` asks about under the work-folder `key`, its bridge built on the snapshot the
+/// builder `builder` last received.
+fn take_one(calls: &Calls<'_>, key: &str, builder: Option<&str>) -> Result<Snapshot, GitError> {
     let listing = calls.output(
-        &["for-each-ref", "--sort=-committerdate", "--format=%(refname) %(objectname)", REFS],
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname) %(objectname)",
+            &builder_refs(builder),
+        ],
         &[],
         &[],
     )?;
-    let previous = previous(&listing, key);
-    let (tree, objects) = worktree_tree(&calls)?;
+    let previous = previous(&listing, key, builder);
+    let (tree, objects) = worktree_tree(calls)?;
     let commit = calls.committed(&["commit-tree", "--no-gpg-sign", &tree, "-m", SNAPSHOT_MESSAGE])?;
     let bridge = match &previous {
         Some(parent) => Some(calls.committed(&["commit-tree", "--no-gpg-sign", &tree, "-p", parent, "-m", BRIDGE_MESSAGE])?),
@@ -188,13 +211,19 @@ fn take_one(
     Ok(Snapshot { commit, bridge, objects })
 }
 
-/// The snapshot a bridge builds on, from `for-each-ref`'s `<ref> <sha>` lines, newest first: the key's own, else the
-/// newest any worktree of the repository made, never a kept `-back` commit; `None` when there is none.
-fn previous(listing: &str, key: &str) -> Option<String> {
-    let refs: Vec<(&str, &str)> = listing.lines().filter_map(|line| line.split_once(' ')).collect();
-    let own = format!("{REFS}{key}");
+/// The snapshot a bridge to the builder `builder` builds on, from `for-each-ref`'s `<ref> <sha>` lines, newest first,
+/// among that builder's own refs only ([`snapshot_ref`]): the key's own, else the newest any worktree of the
+/// repository sent that builder, never a kept `-back` commit; `None` when there is none.
+fn previous(listing: &str, key: &str, builder: Option<&str>) -> Option<String> {
+    let folder = builder_refs(builder);
+    let refs: Vec<(&str, &str)> = listing
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter(|(name, _)| name.strip_prefix(folder.as_str()).is_some_and(|rest| !rest.contains('/')))
+        .collect();
+    let own = snapshot_ref(key, builder);
     refs.iter()
-        .find(|(name, _)| *name == own)
+        .find(|(name, _)| *name == own.as_str())
         .or_else(|| refs.iter().find(|(name, _)| !name.ends_with(BACK)))
         .map(|(_, sha)| (*sha).to_owned())
 }
@@ -209,7 +238,18 @@ struct Calls<'a> {
     interrupt: Option<Interrupt>,
 }
 
-impl Calls<'_> {
+impl<'a> Calls<'a> {
+    /// The calls of `git` about the worktree at `root`, given `bound`, under `bounds` or ended by `interrupt`.
+    fn new(git: &'a Git, root: &'a Path, bound: &'a [(&'a str, &'a OsStr)], bounds: GitBounds, interrupt: Option<Interrupt>) -> Self {
+        Calls {
+            git,
+            root,
+            bound,
+            bounds,
+            interrupt,
+        }
+    }
+
     /// What git wrote on stdout for `args`, with `set` and the bound variables given and `unset` removed.
     fn output(&self, args: &[&str], set: &[(&str, &OsStr)], unset: &[&str]) -> Result<String, GitError> {
         let mut given = set.to_vec();
@@ -368,7 +408,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::slice;
 
-    use super::{Bounded, DATES, IDENTITY, asked, copy_name, git_path, lock_of, place_of, previous, repository, save, take, worktree};
+    use super::{Bounded, DATES, IDENTITY, asked, copy_name, git_path, lock_of, place_of, previous, repository, save, snapshot_ref, take, worktree};
     use crate::remote::git::{GIT_BOUNDS, GitError};
 
     const OWN: &str = "app-1a2b3c4d";
@@ -405,19 +445,80 @@ mod tests {
     #[test]
     fn the_previous_snapshot_is_the_key_s_own_else_the_newest_that_is_no_back_ref() {
         let listing = "refs/gate-remote/other-1-back aaa\nrefs/gate-remote/other-2 bbb\nrefs/gate-remote/app-1a2b3c4d ccc\n";
-        assert_eq!(previous(listing, OWN), Some("ccc".to_owned()), "the key's own ref wins over a newer one");
         assert_eq!(
-            previous(listing, "third-0"),
+            previous(listing, OWN, None),
+            Some("ccc".to_owned()),
+            "the key's own ref wins over a newer one"
+        );
+        assert_eq!(
+            previous(listing, "third-0", None),
             Some("bbb".to_owned()),
             "a -back ref is left out, and the newest of the rest wins"
         );
         assert_eq!(
-            previous("refs/gate-remote/a x\nrefs/gate-remote/b y\n", "c"),
+            previous("refs/gate-remote/a x\nrefs/gate-remote/b y\n", "c", None),
             Some("x".to_owned()),
             "the newest comes first"
         );
-        assert_eq!(previous("refs/gate-remote/app-1a2b3c4d-back aaa\n", OWN), None, "only a -back ref");
-        assert_eq!(previous("", OWN), None, "no snapshot yet");
+        assert_eq!(previous("refs/gate-remote/app-1a2b3c4d-back aaa\n", OWN, None), None, "only a -back ref");
+        assert_eq!(previous("", OWN, None), None, "no snapshot yet");
+    }
+
+    /// The id of a `builders` entry, as [`gate_router::Builder::id`] spells one.
+    const ID: &str = "0a1b2c3d";
+
+    #[test]
+    fn host_bridges_only_on_its_own_flat_refs() {
+        let listing = "refs/gate-remote/0a1b2c3d/app-1a2b3c4d ddd\nrefs/gate-remote/0a1b2c3d/other-3 eee\n\
+                       refs/gate-remote/other-2 bbb\nrefs/gate-remote/app-1a2b3c4d ccc\n";
+        assert_eq!(
+            previous(listing, OWN, None),
+            Some("ccc".to_owned()),
+            "host's own ref, not a builder's newer one"
+        );
+        assert_eq!(
+            previous(listing, "third-0", None),
+            Some("bbb".to_owned()),
+            "the newest of host's refs, a builder's newer refs left out"
+        );
+        assert_eq!(
+            previous("refs/gate-remote/0a1b2c3d/app-1a2b3c4d ddd\n", OWN, None),
+            None,
+            "only another builder's ref"
+        );
+    }
+
+    #[test]
+    fn a_builder_bridges_on_its_own_ref_of_the_key() {
+        let listing = "refs/gate-remote/9f8e7d6c/app-1a2b3c4d eee\nrefs/gate-remote/app-1a2b3c4d ccc\n\
+                       refs/gate-remote/0a1b2c3d/other-2 bbb\nrefs/gate-remote/0a1b2c3d/app-1a2b3c4d ddd\n";
+        assert_eq!(
+            previous(listing, OWN, Some(ID)),
+            Some("ddd".to_owned()),
+            "the builder's own ref of the key, over its newer ref, host's and another builder's"
+        );
+    }
+
+    #[test]
+    fn a_builder_without_the_key_s_ref_takes_its_newest_that_is_no_back_ref() {
+        let listing = "refs/gate-remote/9f8e7d6c/other-4 fff\nrefs/gate-remote/other-5 ggg\n\
+                       refs/gate-remote/0a1b2c3d/other-1-back aaa\nrefs/gate-remote/0a1b2c3d/other-2 bbb\n\
+                       refs/gate-remote/0a1b2c3d/other-3 ccc\n";
+        assert_eq!(
+            previous(listing, OWN, Some(ID)),
+            Some("bbb".to_owned()),
+            "the newest of the builder's own refs, never a -back one, host's or another builder's"
+        );
+    }
+
+    #[test]
+    fn a_builder_with_no_refs_of_its_own_has_no_previous_snapshot() {
+        let listing = "refs/gate-remote/9f8e7d6c/app-1a2b3c4d eee\nrefs/gate-remote/app-1a2b3c4d ccc\nrefs/gate-remote/other-2 bbb\n";
+        assert_eq!(
+            previous(listing, OWN, Some(ID)),
+            None,
+            "host's and another builder's refs are not its own"
+        );
     }
 
     #[test]
@@ -463,13 +564,13 @@ mod tests {
     fn a_saved_snapshot_is_the_parent_of_the_next_bridge_commit() {
         let root = repository("saved");
         let roots = slice::from_ref(&root);
-        let first = take(roots, OWN, GIT_BOUNDS, None).expect("the first snapshot is made");
+        let first = take(roots, OWN, None, GIT_BOUNDS, None).expect("the first snapshot is made");
         assert_eq!(first.len(), 1, "one snapshot for one root");
         assert_eq!(first[0].bridge, None, "no snapshot before the first");
-        save(&root, &[], OWN, &first[0].commit, GIT_BOUNDS).expect("the ref is saved");
+        save(&root, &[], &snapshot_ref(OWN, None), &first[0].commit, GIT_BOUNDS).expect("the ref is saved");
         fs::write(root.join("a.txt"), "b\n").expect("a file can be changed");
 
-        let second = take(roots, OWN, GIT_BOUNDS, None).expect("the second snapshot is made");
+        let second = take(roots, OWN, None, GIT_BOUNDS, None).expect("the second snapshot is made");
 
         let bridge = second[0].bridge.as_deref().expect("a bridge commit");
         let ask = |args: &[&str]| asked(&root, args).expect("git answers");
@@ -487,7 +588,7 @@ mod tests {
         let root = repository("worktree-tree");
         fs::write(root.join("b.txt"), "b\n").expect("a file can be written");
         let roots = slice::from_ref(&root);
-        let made = take(roots, OWN, GIT_BOUNDS, None).expect("the snapshot is made");
+        let made = take(roots, OWN, None, GIT_BOUNDS, None).expect("the snapshot is made");
 
         let tree = worktree(&root, GIT_BOUNDS, None).expect("the worktree tree is written");
 
@@ -509,7 +610,7 @@ mod tests {
         let root = repository("objects");
         let store = fs::canonicalize(root.join(".git").join("objects")).expect("the store is there");
         let objects_of = |folder: &Path| {
-            let made = take(slice::from_ref(&folder.to_path_buf()), OWN, GIT_BOUNDS, None).expect("the snapshot is made");
+            let made = take(slice::from_ref(&folder.to_path_buf()), OWN, None, GIT_BOUNDS, None).expect("the snapshot is made");
             fs::canonicalize(&made[0].objects).expect("the named store is there")
         };
         assert_eq!(objects_of(&root), store, "a plain repository's own");

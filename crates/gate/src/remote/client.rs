@@ -1531,7 +1531,7 @@ impl Attempt<'_, '_> {
     /// The snapshot of the call's worktree.
     fn snapshot(&self) -> Result<Snapshot, End> {
         let roots = [PathBuf::from(self.call.root)];
-        snapshot::take(&roots, self.call.key, self.git, self.call.interrupt)
+        snapshot::take(&roots, self.call.key, self.call.builder.id.as_deref(), self.git, self.call.interrupt)
             .map_err(git_end)?
             .pop()
             .ok_or_else(|| End::Failed("the snapshot made no commit".to_owned()))
@@ -1690,7 +1690,8 @@ impl Attempt<'_, '_> {
                 place: Some(self.place_at(root).map_err(End::Failed)?),
                 ..bounded(repo, &ceiling)
             };
-            let taken = snapshot::take_bounded(bound, self.call.key, self.git, self.call.interrupt);
+            let builder = self.call.builder.id.as_deref();
+            let taken = snapshot::take_bounded(bound, self.call.key, builder, self.git, self.call.interrupt);
             snapshots.push(taken.map_err(|error| repo_end(at, &repo.name, git_end(error)))?);
             #[cfg(feature = "test-seams")]
             if at == 0 {
@@ -2414,7 +2415,8 @@ impl Attempt<'_, '_> {
             ));
             return Err(End::Refused(FallbackReason::Unreachable));
         }
-        let saved = snapshot::save(root, &variables, key, &snapshot.commit, self.git);
+        let reference = snapshot::snapshot_ref(key, self.call.builder.id.as_deref());
+        let saved = snapshot::save(root, &variables, &reference, &snapshot.commit, self.git);
         saved.map_err(|error| repo_end(at, &repo.name, git_end(error)))?;
         // The push is timed to its save; the check of where git finds the repository is not part of it.
         let took = started.elapsed();

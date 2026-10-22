@@ -480,7 +480,7 @@ mod snapshot_only {
                 .chain(call.siblings.iter().map(super::Sibling::root))
                 .map(PathBuf::from)
                 .collect();
-            let (status, lines) = match snapshot::take(&roots, call.key, self.bounds, call.interrupt) {
+            let (status, lines) = match snapshot::take(&roots, call.key, call.builder.id.as_deref(), self.bounds, call.interrupt) {
                 Ok(snapshots) => (0, snapshots.iter().map(said).collect()),
                 // An interrupt is no failure, so it says no line: the run is the interrupt, as the client's `wait`.
                 Err(GitError::Interrupted) => (i64::from(CONTROL_C_EXIT.cast_signed()), Vec::new()),

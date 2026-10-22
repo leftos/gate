@@ -580,6 +580,22 @@ fn pushed_snapshot(case: &Case, log: &str) -> String {
     line["gate: pushed snapshot ".len()..].chars().take(8).collect()
 }
 
+/// The bare repository of the case's repo that the builder laid out under the case's `builder\<letter>` folder
+/// ([`builder_folder`]).
+fn bare_in(case: &Case, letter: &str) -> String {
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    shown(&builder_folder(case, letter).join(format!("{repo}.git")))
+}
+
+/// The commit `name` names in the bare repository of the builder of `letter` ([`bare_in`]), empty when it names none.
+fn ref_in(case: &Case, letter: &str, name: &str) -> String {
+    git_out(
+        case,
+        &[],
+        &["--git-dir", &bare_in(case, letter), "for-each-ref", "--format=%(objectname)", name],
+    )
+}
+
 /// The `gate-remote-*.patch` files the client left in the case's git folder.
 fn patch_files(case: &Case) -> Vec<String> {
     fs::read_dir(case.folder().join(".git"))
@@ -1179,6 +1195,66 @@ fn a_new_worktree_s_first_push_sends_only_its_difference() {
     assert!(
         sent_second < 64.0 * 1024.0,
         "the second push sends only its difference: {sent_second} bytes"
+    );
+}
+
+/// A worktree whose runs alternate between `builder-a` and `host` bridges each push on the snapshot that builder last
+/// received, kept at a ref of its own: going back to `builder-a` after `host` sends only the difference, never host's
+/// snapshot and its whole tree.
+#[test]
+fn alternating_builders_each_bridge_on_their_own_last_snapshot() {
+    let case = next_builder_case("client-alternating-builders");
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({
+        "host": HOST,
+        "repos": { &repo: ["*tool* out b*"] },
+        "outputs": { &repo: [] },
+        "builders": [{ "host": FIRST_BUILDER, "os": "windows", "repos": { &repo: ["*tool* out a*"] } }],
+    });
+    write_remote_json(&case, &routing.to_string());
+    fs::write(case.folder().join("big.bin"), incompressible(3 << 20)).expect("the big file can be written");
+    git(&case, &["add", "-A"]);
+    git(&case, &["commit", "--quiet", "-m", "start"]);
+    let folders = map_folders(&case);
+    let tuned = Tuned {
+        folders: Some(&folders),
+        ..Tuned::default()
+    };
+    let run = |name: &str, letter: &str| {
+        let log = case.folder().join(format!("{name}.log"));
+        let steps = ssh_steps(&case, name, &["ok", "ok", "ok"]);
+        let outcome = finish(client_gate_tuned(&case, &shown(&log), &steps, &tuned, &[r".\tool.exe", "out", letter]));
+        assert_eq!(outcome.code, Some(0), "{name}: {outcome:?}");
+        pushed_bytes(&log)
+    };
+
+    let first = run("first", "a");
+    let key = key_of(&events(&case));
+    let snapshot = format!("refs/gate/{key}");
+    let first_snapshot = ref_in(&case, "a", &snapshot);
+    run("second", "b");
+    let third = run("third", "a");
+
+    assert!(first >= 1024.0 * 1024.0, "the first push sends the big file: {first} bytes");
+    assert!(
+        third < 64.0 * 1024.0,
+        "back on builder-a, the push sends only the difference from its own last snapshot: {third} bytes"
+    );
+    let bridge = ref_in(&case, "a", &format!("refs/gate-bridge/{key}"));
+    assert!(is_sha(&first_snapshot) && is_sha(&bridge), "{first_snapshot:?} {bridge:?}");
+    let parent = git_out(&case, &[], &["--git-dir", &bare_in(&case, "a"), "rev-parse", &format!("{bridge}^")]);
+    assert_eq!(parent, first_snapshot, "the bridge's parent is builder-a's own first snapshot");
+    let id = gate_router::builder_id(FIRST_BUILDER);
+    let local = |name: &str| git_out(&case, &[], &["rev-parse", "--verify", name]);
+    assert_eq!(
+        local(&format!("refs/gate-remote/{id}/{key}")),
+        ref_in(&case, "a", &snapshot),
+        "builder-a's ref names the snapshot builder-a last received"
+    );
+    assert_eq!(
+        local(&format!("refs/gate-remote/{key}")),
+        ref_in(&case, "b", &snapshot),
+        "host's ref names the snapshot host last received"
     );
 }
 
