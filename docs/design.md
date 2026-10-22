@@ -625,12 +625,12 @@ The codes are kept (V4), with 75 added for refusals. 124 is the status coreutils
 
 ## Output lines
 
-Every line the gate says is written and flushed as it is said, never held until exit, so a running or killed gate's lines are already visible. Every line the gate writes for itself starts `gate: ` and goes to stderr and to the end of the log (V1), except the passed line, the stop-tree summary and the `gate burn` start line, which go to stdout (V3, X6). Three forms are the published interface that callers may parse; they keep their wording, and a change to them is a breaking change:
+Every line the gate says is written and flushed as it is said, never held until exit, so a running or killed gate's lines are already visible. Every line the gate writes for itself starts `gate: ` and goes to stderr and to the log, stamped and tagged `gat` there and written as it is said ([Log and tail](#log-and-tail); V1), except the passed line, the stop-tree summary and the `gate burn` start line, which go to stdout (V3, X6). Three forms are the published interface that callers may parse; they keep their wording, and a change to them is a breaking change:
 
 | Line | Where | Meaning |
 |---|---|---|
-| `gate: STALLED: ...`, `gate: TIMED OUT ...`, `gate: BACKSTOP: ...` | at line start in the log and on stderr | The watchdog killed the command; the exit is 124. Match `^gate: (STALLED\|TIMED OUT\|BACKSTOP)`. A routed run's builder says `gate: TIMED OUT on <host> after ...` and `gate: BACKSTOP on <host>: ...` ([Routing](#routing)). A gate wrapping a gate reports the inner kill through its own marker scan (V2). |
-| `gate: TRANSFER TIMED OUT after <n> s fetching the outputs` (or `fetching the sync-back`) | at line start in the log and on stderr | A routed run's fetch after the command outlived its transfer ceiling of 1800 s, counted from the fetch's own start; the exit is 124 and the release verdict `transfer-timed-out`. It is a failure marker of the log scan; it does not match the `TIMED OUT` of the command's ceiling. |
+| `gate: STALLED: ...`, `gate: TIMED OUT ...`, `gate: BACKSTOP: ...` | at line start on stderr, and in the log at the start of the text after the line's stamp and `gat` tag | The watchdog killed the command; the exit is 124. Match `^gate: (STALLED\|TIMED OUT\|BACKSTOP)` against the text ([Log and tail](#log-and-tail)). A routed run's builder says `gate: TIMED OUT on <host> after ...` and `gate: BACKSTOP on <host>: ...` ([Routing](#routing)). A gate wrapping a gate reports the inner kill through its own marker scan (V2). |
+| `gate: TRANSFER TIMED OUT after <n> s fetching the outputs` (or `fetching the sync-back`) | at line start on stderr, and in the log at the start of the text after the stamp and tag | A routed run's fetch after the command outlived its transfer ceiling of 1800 s, counted from the fetch's own start; the exit is 124 and the release verdict `transfer-timed-out`. It is a failure marker of the log scan; it does not match the `TIMED OUT` of the command's ceiling. |
 | `gate: waiting for the machine (critical)` | stderr | A critical gate is queued and waiting for the machine (K5); the stable part is the prefix, and the status after it is prose. A critical gate that takes the machine at once says nothing. |
 | `Full output: <path>` | the end of the verdict line: `gate: passed in ... Full output: <path>` on stdout, `gate: FAILED (status <n>). Full output: <path>` on stderr | Where the whole log is (V3). |
 
@@ -772,7 +772,7 @@ The lines of a run that starts its command:
   `gate: cannot rebuild <store path> (<reason>); expected times are unavailable` when the run's claim on a rebuild fails other than by another gate holding it.
 
   A rebuild says `gate: <note>` for each of `skipped <n> release line(s) of <file> that do not parse`, `could not read <path>: <error>`, `could not list the archive folder <dir>: <error>` and the swap's own notes, and `gate: could not remove <marker path>: <error>` when an interrupted rebuild cannot remove its marker.
-- Notes that never fail the gate: `gate: cannot remove <log>.err: <error>`, `gate: cannot remove the log <path> of the attempt: <error>` (a routed run that fell back could not delete the log the client wrote), `gate: cannot append <log>.err to the log: <error>` and `gate: cannot read this gate's priority class, so the command runs below normal: <error>`.
+- Notes that never fail the gate: `gate: cannot remove the log <path> of the attempt: <error>` (a routed run that fell back could not delete the log the client wrote) and `gate: cannot read this gate's priority class, so the command runs below normal: <error>`.
 
 ## Slots
 
@@ -1487,7 +1487,7 @@ What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K
 
 All kept, with each knob's default unchanged:
 
-- The sampler (W1): every 5 s while the command runs, it reads, in order, the pause state, the log and `.err` sizes, the job's pids, one process snapshot, then the WSL VM, the system times and the job's accounting; nothing goes through WMI.
+- The sampler (W1): every 5 s while the command runs, it reads, in order, the pause state, the bytes the command has written to its stdout and stderr (counted by the readers of its pipes), the job's pids, one process snapshot, then the WSL VM, the system times and the job's accounting; nothing goes through WMI.
 
   Each sample carries two stamps: `began`, taken before its reads, and `at`, taken after them, next to the system times and the job's accounting. The `interval`, the load-adjusted clock, the paused time, the free share and the exit use `at`; the PowerShell gate stamps once, before its reads.
 - Stall (W2): no output, no CPU (at least 1% of one core over the window), no new process in the job, no WSL VM CPU, no nested gate paused behind a critical request and no live nested gate in the job, for `--stall` seconds: `gate: STALLED: ...`.
@@ -1496,7 +1496,9 @@ All kept, with each knob's default unchanged:
 
   A quiet command is therefore killed up to one sample period after its window, plus the read time of the last progress sample and of the latest sample, never before; the PowerShell gate measures to the check and can kill earlier. The ceiling and the backstop read the check's own time.
 
-  Progress as the watchdog crate counts it resets the stall clock when the sum of the log and `.err` sizes changed (grew or shrank), the CPU of the job and of the processes outside it under its members (the escaped tree, below) since the last progress reached 1% of one core over the stall window together, a pid appeared in the job that the last sample did not have, a process outside it appeared that the last sample did not have (by pid and start), a nested gate is paused, or the job holds a live nested gate.
+  Progress as the watchdog crate counts it resets the stall clock when the sum of the bytes the command wrote to its stdout and stderr changed (it only grows), the CPU of the job and of the processes outside it under its members (the escaped tree, below) since the last progress reached 1% of one core over the stall window together, a pid appeared in the job that the last sample did not have, a process outside it appeared that the last sample did not have (by pid and start), a nested gate is paused, or the job holds a live nested gate.
+
+  Output is the command's own bytes alone: a line the gate writes to the log (a `gat` line, a process line included) never resets the stall. A new pid in the job, or the job's CPU, still counts as progress, so a job that keeps starting processes never stalls on a local run, whatever its process lines say.
 
   A nested gate is a `gate.exe` in the job other than the watching gate that started at or after the command's start (a routed or local gate, on any slot; it matters most for a `--slot none` or light parent of a routed hook build, whose child writes next to nothing and uses next to no CPU here). Its own watchdog judges its command, so the parent is not stalled while it lives.
 
@@ -1605,13 +1607,13 @@ All kept, with each knob's default unchanged:
     The escaped-tree kill spares no build server and no shared daemon, since each run's build servers live in its own job ([Command launching](#command-launching)); whether `mspdbsrv` or a .NET Framework MSBuild node can leave the job is unmeasured (GATE-143). The one process it treats apart is a gate's, whose own command's job is terminated before it is ended.
 - The diagnostics block (X3) is gathered before the job is terminated and goes to the log only, between the command's output and the kill line. A command that exits during the gathering keeps its own status and writes no block. Its lines:
   - `gate: diagnostics`, then `gate:   job <pid> parent <ppid> <name>: cpu <s> s, working set <mb> MB: <command line>` for each process of the job (up to 40, then `gate:   ... and <n> more job processes`), and `gate:   outside job ...` lines for the descendants outside the job (up to 20), the recorded escaped processes and their descendants after them.
-  - Up to six sample lines, `gate:   sample at <w> s (load-adjusted <a> s, free <p>%): log <n> B, err <n> B, job cpu <s> s, <n> processes, escaped cpu <s> s`, or `gate:   samples: none` when no sample was taken. `<w>` is the sample's `at` stamp.
+  - Up to six sample lines, `gate:   sample at <w> s (load-adjusted <a> s, free <p>%): out <n> B, err <n> B, job cpu <s> s, <n> processes, escaped cpu <s> s`, with `out` and `err` the bytes the command wrote to its stdout and stderr, or `gate:   samples: none` when no sample was taken. `<w>` is the sample's `at` stamp.
 
     A `wsl` command's sample line also carries `wsl vm cpu <p>%` before the process count: the VM's CPU in percent of one core since the previous reading (`Watch::last_vm_percent`), `wsl vm cpu unavailable` when that sample's read failed, and 0% with no VM. Any other command shows nothing there.
   - `gate:   ... diagnostics cut at <n> ms` when the 2000 ms gather budget ran out. A gathering that failed writes `gate: diagnostics` then `gate: diagnostics failed: <message>` in its place.
   - The working set comes from `gate_win32::working_set` (`None` for a gone or exited process). stderr gets one line, `gate: diagnostics written to <log>` (also in the log), after the terminated line; the block's lines are not on stderr.
 - A command still running 5 s after its job was terminated is reported: `gate: the command was still running 5 s after its job was terminated`. A job that cannot be terminated says `gate: could not terminate the command's job: <error>`. A killed run is not scanned for markers, and its release verdict is `stalled`, `timed-out` or `backstop` by the kill line that ended it.
-- What a sample reads: the job's CPU by accounting (exited members included), the job's pids created at or after the command's start (a pid that answers access denied is not a member), the log's and `.err`'s sizes, and the system times.
+- What a sample reads: the job's CPU by accounting (exited members included), the job's pids created at or after the command's start (a pid that answers access denied is not a member), the bytes the command wrote to its stdout and stderr, and the system times.
 
   It also takes one process snapshot with the job's members read before and after it, and reads the CPU of the escaped tree under the members (`crates/gate/src/watch.rs`).
 
@@ -1692,13 +1694,13 @@ A period with no beat due flushes instead, and the box's flush probes stderr for
 
   A packaged desktop app started by any non-packaged descendant (the Store's pwsh or `winget` under a `cmd`, a git hook's pwsh) runs in a job of its own, outside the gate's, and no documented control keeps it in: only a direct child of the gate, assigned explicitly, with the policy, stays in. `IsProcessInJob(h, NULL)` and the job's `TotalProcesses` tell it in one run; `winget --version` under `cmd` is the packaged reproducer on Windows 11 and Server 2025.
 
-  The layer refuses a `.cmd` or `.bat` application (any case, trailing dots and spaces ignored): the caller wraps batch targets in `"<system folder>\cmd.exe" /d /v:off /s /c "<line>"` itself. It refuses a NUL in the application, command line, working folder, log path or `.err` path before anything is opened.
+  The layer refuses a `.cmd` or `.bat` application (any case, trailing dots and spaces ignored): the caller wraps batch targets in `"<system folder>\cmd.exe" /d /v:off /s /c "<line>"` itself. It refuses a NUL in the application, command line or working folder before anything is opened.
 
-  The log and `<log>.err` are each opened fresh. Any file at the path is deleted first (a link itself, never its target), then created with `CREATE_NEW` and `FILE_FLAG_OPEN_REPARSE_POINT | SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS`; it must be a disk file, not a reparse point, with exactly one name.
+  A local run's command writes to no file: `LaunchOutput::Pipes` makes two new pipes of a 1 MiB buffer, one for its stdout and one for its stderr, whose read ends the gate keeps and reads ([Log and tail](#log-and-tail)). A reader that falls behind does not block the command at once on a full pipe. stdin is `NUL`, opened `OPEN_EXISTING`.
 
-  Both are shared for read, write and delete, so a process the command left running does not block the next run on that log; a second gate on a live log is kept out by the log's mutex ([Kernel object names](#kernel-object-names)). An orphan's old, delete-pending file makes the create fail loudly rather than be shared. stdin is `NUL`, opened `OPEN_EXISTING`.
+  The gate opens the log itself, to append, and writes every line of it. A process the command left running holds no handle to the log, so it does not block the next run on that log; a second gate on a live log is kept out by the log's mutex ([Kernel object names](#kernel-object-names)).
 
-  It inherits exactly three handles, through `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`: stdin from `NUL`, stdout to the log and stderr to `<log>.err`. The gate's own handles to them are not inheritable: the command inherits copies made under the spawn lock, which exist only while the lock is held, and a failed copy is a setup error, `copy a handle for the command to inherit: <message>`.
+  It inherits exactly three handles, through `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`: stdin from `NUL`, stdout and stderr each to the command's end of its pipe. The gate's own handles to them are not inheritable: the command inherits copies made under the spawn lock, which exist only while the lock is held, and a failed copy is a setup error, `copy a handle for the command to inherit: <message>`.
 
   The spawn lock is process-wide and is held while the gate starts any process, so only the launched command inherits the copies. A process the gate starts itself goes through `gate_win32::spawn`, which holds the lock for the start alone; one started any other way could inherit the copies if it started while they are open.
 
@@ -1731,16 +1733,33 @@ A period with no beat due flushes instead, and the box's flush probes stderr for
 
 ## Log and tail
 
-- The log is kept as the command's exact bytes. The log's directory is created, an earlier log and `<log>.err` are removed at start, stdout goes to the log and stderr to `<log>.err`, and at the end the `.err` bytes are appended to the log byte for byte (once) and `.err` is deleted. The gate's own lines follow, starting on a line of their own: every line it said on stderr, and the passed line. So one file holds the output, then the errors, then the gate's lines (kept, V1).
+- Every line of the log is `<stamp> <tag> <text>`: the stamp is the local time to the microsecond with its numeric UTC offset (`2026-10-22T09:31:38.123456-07:00`), the tag says whose line it is, and the text follows one space (a line with no text ends at the tag). The tag is `out` for a line of the command's stdout, `err` for one of its stderr, and `gat` for everything the gate writes, its `gate: ` notes keeping that text after the tag.
 
-  The gate's lines are the run's notes, gathered while it goes and appended to the end of the log. The verdict lines are appended after the tail is printed, so the log ends with them and the printed tail does not hold them. A hard-killed gate's lines are only on stderr.
-- Lines end at CR LF, LF or a lone CR, as .NET's `ReadLine` ends them, for the marker scan and the tail. Both decode the log as UTF-8 lossily: an invalid byte reads as U+FFFD. The gate writes the tail to stdout as UTF-8 (through the wide console API when stdout is a console).
+  So `rg ' (out|err) '` keeps the command's lines and `rg -v ' gat '` likewise. The format is `crates/gate-wire/src/stamp.rs`'s.
+
+  The log's directory is created and an earlier log, and the `<log>.err` the PowerShell gate wrote beside it, are removed at start. The gate opens the log to append and writes it through one lock, so no line lands inside another. The command writes to two pipes the gate reads, one reader each; stderr is therefore interleaved with stdout where it happened, and a line is stamped as it is written.
+
+  CR LF, LF and a lone CR each end a line, the bytes read as UTF-8 with U+FFFD for what is not, and a line with no end is cut every 64 KiB into lines of its own. The stamp is read under the log's lock, just before the write, so the stamps of the lines written live never decrease down the log.
+- The gate's own lines are the run's notes, each stamped when it is said and written to the log live. A note said before the log is open is held, then written, with its own stamp, behind the log's first line. A hard-killed gate's lines are only on stderr.
+
+  The verdict lines are written after the tail is printed, so the log ends with them and the printed tail does not hold them. Notes stand in the order said among the command's lines: the expected-time line comes before the command's first line.
+- Process lines are `gat` lines about the command's job. The first line of the log is the root line, the gate itself: `gate pid=<pid> ppid=<ppid>`. Each process that joins the job has `spawn pid=<pid> ppid=<ppid> <image>` (`?` for a parent or an image that could not be read; an image of more than 260 characters is cut and ends `…`).
+
+  When a process ends it has `exit pid=<pid> code=<code> ran=<s>.<ffffff>s`; a signal (a Unix box's) reads `signal=<n>` for the code, an end that could not be read `code=?`, and a Windows status of 0x80000000 or more is written in decimal followed by its hex (`code=3221225477 (0xC0000005)`).
+
+  A process that joined but could not be read is `spawn pid=<pid> missed (<why>)`. One still in the job when the watch ends is given 2 s to end, then gets `left pid=<pid> (still running at the end of the watch)`. `process lines stopped: <why>` says the job's lines ended early, so a process still running then has no exit or left line. The `ppid`s let a reader rebuild the process tree: the command's own process has the root line's pid as its parent.
+
+  A spawn line carries the process's kernel create time as its stamp and an exit line its kernel exit time, so they can sit a few milliseconds out of order with the lines about them; the stamp is the truth. A process line is not the command's output: it never resets the stall, and the console tail leaves it out.
+- Lines end at CR LF, LF or a lone CR, as .NET's `ReadLine` ends them, for the marker scan and the tail. Both decode the log as UTF-8 lossily: an invalid byte reads as U+FFFD. The scan, the tail and the last-line read behind the verdict read the text after the tag, a line with no stamp whole, so a pattern anchored with `^` anchors at the text.
+
+  Marker line numbers are numbers of the raw log's lines, process lines included. The gate writes the tail to stdout as UTF-8 (through the wide console API when stdout is a console), as text with no stamp or tag.
 - The failure-marker regex is built in (kept, V2): `^Build FAILED\.|error CS\d+|: error |Test run summary: Failed!|^\s*failed: [1-9]|gate: (TIMED OUT|STALLED|BACKSTOP|TRANSFER TIMED OUT)`.
 
   It is matched case-insensitively, per line. A zero exit whose log matches becomes status 1 with `gate: command exited 0 but its log reports a failure -> <log>`; on any non-zero status up to 40 matching lines are printed to stdout as `<line number>:<line>`; a killed run is not scanned. `--no-markers` turns the scan off.
 - The scan reads the log streaming and never whole: at most 64 KiB of any one line, and it stops after 40 matches. The tail is read backwards from the end of the log, at most 1 MiB of it; when the last line is longer than that window, the tail shows `… ` followed by its last 4096 characters, starting on a whole character. Each printed tail or marker line is cut at 4096 characters, ending ` …`.
-- At the end the last `--tail` lines go to stdout, taken from the log without the lines of a kill's diagnostics block (dropped by position, so the command's own lines are never lost), then the verdict line ([Output lines](#output-lines)) (kept, V3).
-- A panic after the slot is taken terminates the job, appends the `.err` file and the gate's notes to the log (when completing the log fails, the notes are kept for the next write), deletes the claim and journals `release` with `status` null and `verdict` unknown.
+- At the end the readers of the command's pipes get 2 s to reach the end of them (`gate: the command's output readers did not finish within 2 s; their last lines may be missing` when one does not), the job's last process lines are written, and the log is sealed: no later line of the command and no process line reaches it, and the gate's own lines still do.
+- Then the last `--tail` lines go to stdout, taken from the log without the process lines and without the lines of a kill's diagnostics block (dropped by position, so the command's own lines are never lost), then the verdict line ([Output lines](#output-lines)) (kept, V3).
+- A panic after the slot is taken terminates the job, ends the readers and process lines as at the end of any run, appends the gate's held notes to the log (when completing the log fails, the notes are kept for the next write), deletes the claim and journals `release` with `status` null and `verdict` unknown.
 
 ## Routing
 
@@ -2312,6 +2331,10 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The box's output passes through to the log and the console, except the box's heartbeats and its machine lines, which the client hides from both and keeps out of the lines it holds: the start marker `gate-remote-started: <nonce>` and the refusal tag `gate-remote-refused: <nonce> busy|tools|layout|inputs|sent|lfs|desktop|install`, each naming this run's `Nonce` and read on stderr only, as a whole line, and the kill tag and the adjusted line below.
 
+    The client matches those protocol lines on the raw line, before any unstamping, so a command's own line, stamped by the box, never reads as one.
+
+    Every other line is unstamped once before it is read: the log gets the line as it came, a line that came with no stamp (an older box's, a setup call's) stamped `gat` on arrival, and the console and the lines the client holds get its text alone. A process line is logged and nothing else: it is neither echoed nor held, and it never marks the call's progress, so the stall watch of a routed run sees only the box's other lines and its heartbeats. The client's own lines in the log are `gat`.
+
     The kill tag `gate-remote-killed: <nonce> timed-out|backstop` is said by the box just after its own kill line, and the client counts a box kill only on this run's tag with a status 124 (a status 124 alone is also what a stopped job or the command itself may end with). The client takes the run's verdict from the tag's kind, never from the log's last kill line.
 
     The adjusted line `gate-remote-adjusted: <nonce> <s.sss>` carries the load-adjusted seconds the box counted, said once the command's output has drained unless the sampler failed, read like the tag on stderr only and the last one winning; another run's, a malformed one or one whose seconds are not a finite number is a line like any other.
@@ -2660,7 +2683,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   **The output cap.** Every call's line is capped at 64 KiB, and a call keeps only its last 1000 lines and at most 1 MiB of them, dropping the oldest first; the newest line is always kept. A `\r` resets the current line, as git's progress does (the Progress and Unlogged readers only). A progress update over 64 KiB, however the pipe splits it, ends a capped call with `... sent a line longer than 64 KiB`. The run call is not capped: its longer lines pass on in pieces.
 
-  **The log cap.** One call may write at most 256 MiB of the builder's output to the gate's log, its standard output and standard error counted together, whole lines and the run call's pieces alike.
+  **The log cap.** One call may write at most 256 MiB of the builder's output to the gate's log, its standard output and standard error counted together, whole lines and the run call's pieces alike. The bytes counted are the bytes written, the stamp and tag of each line among them; the line the cap writes in its place is stamped `gat`.
 
   The piece that would pass the cap is not written: the log gets one line in its place, `gate: the builder's output passed 256 MiB; the rest is not logged`, said once by whichever of the call's two readers passed it first, on a line of its own even when it cuts into a long line passed on in pieces, and nothing more of that call's output.
 
@@ -3009,6 +3032,14 @@ Built verbs:
 
   A payload whose `Needs` is not an object of texts prints `gate: box payload Needs is not an object of texts; probing nothing` on stderr, probes nothing and still exits 0.
 - **`run`** runs the payload's `Command` (a list of texts), or, for a warm-up, each of its `WarmCommands` in order (Warm-up, below), in `Work` (in `Work\{Leaf}` for a sibling pair), and exits with the command's own whole 32-bit status after a successful run. Its stdout is the command's stdout, LF-terminated; its stderr is the command's stderr plus the box's own lines.
+
+  Stamped lines: in `run` alone (every other verb says its lines as it did), every line but the protocol lines and the heartbeat is written `<stamp> <tag> <text>` as a local run's log holds it ([Log and tail](#log-and-tail)), so the PC writes it to its log as it came.
+
+  The command's stdout lines are `out` and its stderr lines `err`; the box's own lines, the forwarded output of git and of the tool and package restores, the root line `gate pid=<pid> ppid=<ppid>` for the box itself, and the process lines of the command's job are `gat`.
+
+  Bare, byte for byte: the start marker, every refusal tag (`busy` included), the kill tag, the adjusted line, the outputs line and the heartbeat. The process lines come from a thread of its own under the output lock, and none follows the box's final lines. The stamp is read once the line's lock is held.
+
+  On the desktop route the command's parent is the helper, a process outside the run's job, so the hand-off writes `gate: the desktop helper pid=<h> started the command pid=<c>`, and the process tree joins the command to the box through it.
 
   The heartbeat: `gate box run` writes `gate-remote-heartbeat: <cpu ms>` on stderr every 5 s, on `gate-watchdog`'s `BeatClock` and `Pump`. Before the command starts (from just before the checkout) and after the command's wait ends it is not CPU-gated, so every period writes a beat, the first one period after it begins.
 
@@ -3993,6 +4024,15 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
     With the client gone the status is 255 and nothing is said. A signal still never gives 124. `box run` runs the command under this watch; `--test-box-sampler-fail` and `--test-box-free-percent` choose the sampler, the first over the second, else the machine's load, and `--test-heartbeat-ms` and `--test-box-sample-ms` set the periods.
   - **Output lock.** A say from the main thread that cannot take the output lock within 30 s (a pump or reader stuck writing to a stalled client) marks the client gone and writes nothing.
+- **Stamped lines.** The same rule as the Windows box's ([The box side](#the-box-side), `run`): in `box run` every line but the protocol lines and the heartbeat is stamped `<stamp> <tag> <text>`, the stamp taken under the output lock.
+
+  The command's streams are `out` and `err`; the box's own lines, git's and the tool restore's forwarded output, the back commit's lines and the process lines are `gat`. The start marker, the refusal and kill tags, the adjusted line, the outputs line and the heartbeat stay bare and byte-exact, and the other verbs are unchanged.
+
+  The box writes a root line for itself, then a spawn line and an exit line for the leader. On macOS a sampler thread lists the command's process group every 10 ms for the spawn lines of the others (ppid, start time, image) and watches each new pid with an `EVFILT_PROC` kqueue knote for its exit code or signal.
+
+  A process shorter than a tick, or one that leaves the group, may be missing, and the box says so once per run (`process lines: the group is sampled every 10 ms; ...`). A spawn line on macOS can name the image before the process has run `exec` (GATE-733). On any other Unix only the leader is listed, and the box says that once.
+
+  The process lines go through a writer thread of their own, so neither the sampler nor the runner waits on the output lock; the writer is given 2 s to say what it holds when the lines end, and nothing is written after the box's final lines. On macOS a process still in the group when the sampler stops gets a `left` line.
 - **Statuses.** Exited `c` gives `c`; killed by signal `s` gives `128+s` (a signal outside 1..126 gives 1); a client gone at a probe or at the end gives 255; the box's ceiling or backstop kill gives 124. A command that cannot start gives 127 with `gate: remote could not start <program>: <error>`, said after the start marker. A runner failure gives 1 with `gate: the gate failed while running the command: <why>`. The rest is as on the Windows box ([The box side](#the-box-side)).
   - **Rosetta.** Before the start marker, a `gate-box` translated by Rosetta (`sysctl.proc_translated` is 1) cannot read the CPU times of the run, so it refuses with status 75, `gate-remote-refused: <nonce> install` and `gate: remote gate-box runs under Rosetta on this builder, whose CPU times it cannot read: install the arm64 build`.
 
