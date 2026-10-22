@@ -2947,7 +2947,9 @@ Built verbs:
 
   `gate box stop` during a git step that is not such a write ends that step and its process tree at once: `gate: remote <step> failed: the job <job> was stopped` and status 1. After a stop no git step that a stop ends is started (nothing is synced back, no `add -A`). A git that exits by itself is never reported stopped. A stop signal that cannot be read says `gate: remote cannot read the stop signal of job <job>: <error>`, at most once per run.
 
-  Before its first git step a run, or the lay-out of a work folder, removes each tree's `.git\index.lock`, `.git\HEAD.lock`, `.git\config.lock`, `{Work}.index.lock` and the bare's `refs\gate-back\<key>.lock` (the lock sweep), through handles held one folder beneath another, never following a link: behind a junction at `.git` it touches nothing. A lock another handle holds open is skipped, and the git that needs it reports it. A folder at a lock's name is left and refuses the run (75) with `<path> is a folder where git's lock file goes`.
+  Before its first git step a run, or the lay-out of a work folder, removes each tree's `.git\index.lock`, `.git\HEAD.lock`, `.git\config.lock`, `{Work}.index.lock` and the bare's `refs\gate-back\<key>.lock` (the lock sweep), through handles held one folder beneath another, never following a link: behind a junction at `.git` it touches nothing.
+
+  A lock another handle holds open is skipped, and the git that needs it reports it. A folder at a lock's name is left and refuses the run (75) with `<path> is a folder where git's lock file goes`.
 
   A bare repository that is missing its `HEAD`, `objects` or `refs`, or a tree whose `.git` holds no `HEAD`, is initialised again, said as `gate: remote created <Bare>`. Before it re-initialises a bare with no `HEAD`, the box removes the bare's root `HEAD.lock` and `config.lock` the same way (the only names in a bare's root it removes); a folder at either fails the step `gate: remote git init --bare failed: <why>` with status 1.
 
@@ -3530,7 +3532,9 @@ Built verbs:
 
   Caps: an archive of more than 50,000 members, or that decompresses to more than 4 GiB (`--test-inputs-budget-bytes` replaces it), is refused as the outputs archive's are, and the put fails (`gate: remote inputs put failed: <why>`, exit 1). The step is not watched on the box; the PC watches both calls ([The remote client's run](#routing), Inputs).
 
-  A payload with a `SentBin`, `<project>/bin/<configuration>` below `Work` (`/`-separated, a plain path whose second-last name is `bin`, else `gate: box payload SentBin is not a plain <project>/bin/<configuration> path: <value>` and exit 2), sends the PC's build of that project instead of the repo's inputs. It installs into its own record, `<Work>.sent-build`, of the inputs record's format and with its own digest, beside `<Work>.inputs`; a layout change removes both records before it clears `Work`.
+  A payload with a `SentBin`, `<project>/bin/<configuration>` below `Work` (`/`-separated, a plain path whose second-last name is `bin`, else `gate: box payload SentBin is not a plain <project>/bin/<configuration> path: <value>` and exit 2), sends the PC's build of that project instead of the repo's inputs.
+
+  It installs into its own record, `<Work>.sent-build`, of the inputs record's format and with its own digest, beside `<Work>.inputs`; a layout change removes both records before it clears `Work`.
 
   A sent build's manifest may name only files below `<project>/bin/<configuration>/` and restore files of `<project>/obj/` itself; any other path fails the step (`the sent build's manifest names '<path>', which is neither below <bin>/ nor a restore file of <project>/obj/`).
 
@@ -3604,7 +3608,13 @@ Built verbs:
 
   **The keyed form** takes 1 to 50 key words, each `[A-Za-z0-9_-]+` and not starting with `-`; any other shape is the box usage (status 2), and a repeated key, in any letter case, is pruned once under its first spelling. A word that is no key, past the parse, prints `gate: box prune --keys holds a word that is not a key: "<word>"` and exits 2 before anything is opened. It judges no age and touches no key it is not given. Each key's lock is still taken without waiting, so a held lock keeps the key. A link or junction work folder is refused, a key with no folder has its records and refs removed, and a missing `work` folder is made, as a run makes it.
 
-  For each key whose folder it set aside or found absent, still under the lock, it runs one `git update-ref --no-deref --stdin` in each bare repository `{root}\*.git`, deleting `refs/gate/{key}`, `refs/gate-bridge/{key}` and `refs/gate-back/{key}` themselves, never what a symbolic one points to. A `*.git` entry is used only when it is a plain folder holding `HEAD`, `objects` and `refs` (checked beneath a handle that is held, without sharing deletion, while git runs, so it cannot be renamed and swapped); a link, a plain file or a folder lacking any of the three is skipped. A bare whose update fails does not stop the others, and the first failure is the key's reason. A key whose lock is held or whose folder could not be set aside keeps its refs. The git step is named `update-ref` for the `--test-box-git-limit` seam.
+  It judges no age and touches no key it is not given. Each key's lock is still taken without waiting, so a held lock keeps the key. A link or junction work folder is refused, a key with no folder has its records and refs removed, and a missing `work` folder is made, as a run makes it.
+
+  For each key whose folder it set aside or found absent, still under the lock, it runs one `git update-ref --no-deref --stdin` in each bare repository `{root}\*.git`, deleting `refs/gate/{key}`, `refs/gate-bridge/{key}` and `refs/gate-back/{key}` themselves, never what a symbolic one points to.
+
+  A `*.git` entry is used only when it is a plain folder holding `HEAD`, `objects` and `refs` (checked beneath a handle that is held, without sharing deletion, while git runs, so it cannot be renamed and swapped); a link, a plain file or a folder lacking any of the three is skipped.
+
+  A bare whose update fails does not stop the others, and the first failure is the key's reason. A key whose lock is held or whose folder could not be set aside keeps its refs. The git step is named `update-ref` for the `--test-box-git-limit` seam.
 
   Before any git step the root is checked as the preflight checks it (`gate_win32::check_work_root`, honouring `--test-box-root-walk-stop <folder>`). When the check fails no git runs: every key keeps its refs and gets `gate: remote could not prune {key}: its refs could not be removed: {the check's reason}`, while its folders and records are still removed.
 
@@ -3863,6 +3873,14 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 - **A pair.** A `Pair` payload with `SiblingSnapshots` is laid out as the Windows box lays it out (Routing, Sibling worktrees; [The box side](#the-box-side)): the main repo in `<Work>/<leaf>` and each sibling in `<Work>/<name>`, each from its own bare `<root>/<name>.git`, and the command runs in the main tree (or its `Subfolder`). Every bare is checked as owned by the box user.
 
   A pair preflight says `gate: remote created <root>/<name>.git` for each missing bare, the main one first, readies no tree, and says `gate: remote new work tree` when the layout record names another layout. The record `<Work>.layout` holds `pair <leaf> <siblings sorted ignoring case>` or `single`, and `changing` while the folder is cleared; a run whose layout differs clears the whole work folder, `.tools` kept. A link at a pair tree refuses the run `layout`.
+
+  The clear (`run.rs`, `beneath.rs`) removes `<Work>.warm` and `<Work>.inputs` first, whether or not the folder is there, then writes `changing`. It then opens `<Work>` with a link at it refused and removes each child beneath that folder's descriptor, a folder with all it holds, a link or a fifo as itself and never followed; every open is `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`.
+
+  A `<Work>` that is a link, or cannot be opened or listed, refuses the run `layout` with `cannot list <Work>: <error>`; a child that stays says `cannot remove <path>: <error>`.
+
+  A child folder whose device differs from its parent's, compared before it is entered, holds another volume mounted in the work folder, at that child or below it: the run is refused `layout` with `cannot remove <Work>/<child>: it holds another volume`, naming the top-level child, and nothing on that volume is touched. The check is the device number alone, so on Linux a bind mount from the same filesystem is not caught. A child that something else removes while the clear runs counts as removed and the clear goes on.
+
+  A name the clear's calls take must be one component (not empty, `.`, `..` or holding `/`) and the folder opened must be an absolute path, else the call is refused. An `<Work>.inputs` that cannot be removed (a folder, say) refuses it `layout` with `cannot remove <Work>.inputs: <error>`.
 
   The run's git failures name the repo: `gate: remote fetch <name> failed …` (and `checkout`, `clean`, `cat-file`, `back ref reset`), `gate: remote git config core.autocrlf failed for <name> …` for the layout steps, and `gate: remote snapshot <sha> is not in the repository of <name> after the fetch`. A single-repo run's lines are unchanged.
 - **Layout check.** One check, shared by `preflight`, `run` and `stop`, requires a `Work` shaped `<root>/work/<key>`, else a usage line and exit 2. A `:` in `<root>` is the same usage error, since git splits `GIT_CEILING_DIRECTORIES` at every `:` with no escape: `gate: box payload Work must be <root>/work/<key> with no ':' in <root>, which GIT_CEILING_DIRECTORIES cannot hold: <Work>`; nothing is made.

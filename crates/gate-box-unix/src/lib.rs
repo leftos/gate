@@ -17,6 +17,8 @@ pub mod request;
 #[cfg(unix)]
 pub mod back;
 #[cfg(unix)]
+pub mod beneath;
+#[cfg(unix)]
 pub mod boot;
 #[cfg(unix)]
 pub mod command;

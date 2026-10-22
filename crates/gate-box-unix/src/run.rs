@@ -17,6 +17,7 @@ use gate_wire::{PairSibling, PathForm, Payload, Refusal, bare_stem, busy_line, e
 use gate_watchdog::Pump;
 
 use crate::back::{self, BackFailed};
+use crate::beneath::Folder;
 use crate::command::{Launch, Sampler, command_record, run_command};
 use crate::console::{Forwarding, LineSink, Output, Stream};
 use crate::files::{self, HeldLock, Locked};
@@ -250,8 +251,41 @@ impl<'p> Request<'p> {
     }
 
     /// Every repo of the run, the main one first.
-    pub fn repos(&self) -> impl Iterator<Item = &Repo<'p>> {
-        std::iter::once(&self.main).chain(&self.siblings)
+    pub fn repos(&self) -> impl Iterator<Item = &Repo<'_>> {
+        self.laying().repos()
+    }
+
+    /// What the work folder's layout reads of the run.
+    pub(crate) fn laying(&self) -> Laying<'_> {
+        Laying {
+            work: self.work,
+            parent: self.parent,
+            key: self.key,
+            main: &self.main,
+            siblings: &self.siblings,
+        }
+    }
+}
+
+/// What the work folder's layout reads of a run, so a step that lays the folder out without a run's request lays it
+/// out as a run does.
+pub(crate) struct Laying<'a> {
+    /// The work folder, `<root>/work/<key>`.
+    pub(crate) work: &'a str,
+    /// The folder holding the work folders, `<root>/work`.
+    pub(crate) parent: &'a Path,
+    /// The work folder's key.
+    pub(crate) key: &'a str,
+    /// The main repo, checked out in the work folder, or in `<work>/<leaf>` on a pair run.
+    pub(crate) main: &'a Repo<'a>,
+    /// Each sibling of a pair run, in the payload's order; none on a run of one repo.
+    pub(crate) siblings: &'a [Repo<'a>],
+}
+
+impl<'a> Laying<'a> {
+    /// Every repo laid out, the main one first.
+    pub(crate) fn repos(&self) -> impl Iterator<Item = &'a Repo<'a>> + use<'a> {
+        std::iter::once(self.main).chain(self.siblings)
     }
 
     /// The layout the work folder is laid out in, as its record says it ([`layout_text`]).
@@ -724,17 +758,18 @@ fn locked<S: LineSink + 'static>(
     heartbeat: Duration,
     (login, start): (LoginShell, StartBeat),
 ) -> Result<Placed, Unready> {
+    let laying = request.laying();
     // Before the sweep, so a git an earlier run left running keeps its lock files.
-    earlier_group_cleared(request).map_err(|not| not_laid_out(output, request, not))?;
+    earlier_group_cleared(&laying).map_err(|not| not_laid_out(output, request, not))?;
     // Before the run's first git step, so no lock file an earlier run's ended git left fails it.
-    swept(request).map_err(|not| not_laid_out(output, request, not))?;
+    swept(&laying).map_err(|not| not_laid_out(output, request, not))?;
     // Refused before the layout, so a payload naming a folder outside the work folder changes nothing there; the
     // earlier run's back ref goes, as the checkout's would, so the client finds none to fetch.
     let Some(place) = place_of(request.tree(), request.subfolder) else {
         said(output, &[&not_inside(request.subfolder)], USAGE_STATUS);
         let login_path = login_read(output, login).map(|login| login.path);
         let git = run_git(request, lock, login_path.as_deref(), output);
-        back_refs_cleared(&git, request).map_err(|failed| Unready::Ended(failure(output, &failed)))?;
+        back_refs_cleared(&git, &laying).map_err(|failed| Unready::Ended(failure(output, &failed)))?;
         return Err(Unready::Ended(USAGE_STATUS));
     };
     // A heartbeat that cannot start ends the heartbeats, never the run. On an error below the pump is dropped, which
@@ -748,10 +783,10 @@ fn locked<S: LineSink + 'static>(
             );
         })
         .ok();
-    let fresh = layout_checked(request).map_err(|not| not_laid_out(output, request, not))?;
+    let fresh = layout_checked(&laying).map_err(|not| not_laid_out(output, request, not))?;
     let (login_path, godot_root) = login_read(output, login).map_or((None, None), |login| (Some(login.path), login.godot_root));
     let git = run_git(request, lock, login_path.as_deref(), output);
-    laid_out(request, &git, &fresh).map_err(|not| not_laid_out(output, request, not))?;
+    laid_out(&laying, &git, &fresh).map_err(|not| not_laid_out(output, request, not))?;
     checked_out(request, &git).map_err(|failed| Unready::Ended(failure(output, &failed)))?;
     if !place.is_dir() {
         let line = format!("gate: remote subfolder {} does not exist in the snapshot", escaped(request.subfolder));
@@ -910,7 +945,7 @@ fn inside_work(work: &str, place: &Path) -> bool {
 }
 
 /// Why the work folder could not be laid out.
-enum NotLaidOut {
+pub(crate) enum NotLaidOut {
     /// An earlier run's recorded process group still runs in it: the run is refused `busy`.
     Busy,
     /// A file-system step failed, or a path is not what the run uses, for this reason: the run is refused `layout`.
@@ -930,15 +965,15 @@ pub(crate) fn group_record(work: &str) -> String {
     format!("{work}.pgid")
 }
 
-/// Looks at each group record an earlier run of `request`'s work folder left, its git step's `<work>.pgid` and its tool
+/// Looks at each group record an earlier run of `laying`'s work folder left, its git step's `<work>.pgid` and its tool
 /// restore's `<work>.tools.pgid` ([`earlier_record_cleared`]), a box that ended without removing it:
 /// whatever job it names, a group that is still the one its run made ([`record_current`]) refuses the run
 /// [`NotLaidOut::Busy`], the group never signalled and its git's lock files never swept; a record naming no group a
 /// run makes (malformed, init, or the box's own), or a group that is no longer its run's (no process left, one the box
 /// may not signal, or its id another's since), is removed under the work lock and the run goes on. A record that
 /// cannot be read, a link or a folder at its name, refuses the run `layout`.
-fn earlier_group_cleared(request: &Request<'_>) -> Result<(), NotLaidOut> {
-    for record in [group_record(request.work), tools::tools_group_record(request.work)] {
+pub(crate) fn earlier_group_cleared(laying: &Laying<'_>) -> Result<(), NotLaidOut> {
+    for record in [group_record(laying.work), tools::tools_group_record(laying.work)] {
         earlier_record_cleared(&record)?;
     }
     Ok(())
@@ -967,12 +1002,12 @@ fn earlier_record_cleared(record: &str) -> Result<(), NotLaidOut> {
 /// ref's `refs/gate-back/<key>.lock`, nothing else there touched. A folder on the way (the work folder included) that is
 /// a link, not a folder or missing has none of its locks looked at; a link, a folder or anything but a file at a lock's
 /// name refuses the run `layout`.
-fn swept(request: &Request<'_>) -> Result<(), NotLaidOut> {
-    if files::plain_folder(request.parent) {
-        lock_removed(Path::new(&format!("{}.index.lock", request.work)))?;
+pub(crate) fn swept(laying: &Laying<'_>) -> Result<(), NotLaidOut> {
+    if files::plain_folder(laying.parent) {
+        lock_removed(Path::new(&format!("{}.index.lock", laying.work)))?;
     }
-    let work = Path::new(request.work);
-    for repo in request.repos() {
+    let work = Path::new(laying.work);
+    for repo in laying.repos() {
         let tree = Path::new(&repo.tree);
         let dot_git = tree.join(".git");
         if [work, tree, dot_git.as_path()].into_iter().all(files::plain_folder) {
@@ -984,7 +1019,7 @@ fn swept(request: &Request<'_>) -> Result<(), NotLaidOut> {
         let refs = bare.join("refs");
         let gate_back = refs.join("gate-back");
         if [bare, &refs, &gate_back].into_iter().all(files::plain_folder) {
-            lock_removed(&gate_back.join(format!("{}.lock", request.key)))?;
+            lock_removed(&gate_back.join(format!("{}.lock", laying.key)))?;
         }
     }
     Ok(())
@@ -1003,7 +1038,7 @@ fn lock_removed(path: &Path) -> Result<(), NotLaidOut> {
 }
 
 /// What [`layout_checked`] found for [`laid_out`].
-struct Checked {
+pub(crate) struct Checked {
     /// For each repo of the run, the main one first, whether its tree is made anew.
     fresh: Vec<bool>,
     /// Whether the work folder was cleared for another layout ([`work_relaid`]), so the run's layout is recorded once
@@ -1011,7 +1046,7 @@ struct Checked {
     relaid: bool,
 }
 
-/// Checks the work folder of `request` before its layout, under the work lock: the interrupted-command record
+/// Checks the work folder of `laying` before its layout, under the work lock: the interrupted-command record
 /// `<work>.command` refused unless it is missing or a file itself, not followed, as the run could neither write nor
 /// remove anything else there; the work folder failed unless it is missing or the box user's own folder
 /// ([`files::unusable_folder`]); the work folder cleared when its layout record names another layout than the run's
@@ -1021,20 +1056,20 @@ struct Checked {
 /// `.git/objects` and `.git/objects/info` refused unless each is missing or a folder itself, and `.git/config` and
 /// `.git/HEAD` unless each is missing or a file itself, none followed; and, when a tree has no `.git/HEAD` or no
 /// `.git/objects`, which [`laid_out`] makes anew, the warm record removed. No git step runs.
-fn layout_checked(request: &Request<'_>) -> Result<Checked, NotLaidOut> {
-    let work = request.work;
+pub(crate) fn layout_checked(laying: &Laying<'_>) -> Result<Checked, NotLaidOut> {
+    let work = laying.work;
     let command = command_record(work);
     plain_or_missing(Path::new(&command), false)?;
     if let Some(line) = files::unusable_folder(Path::new(work)) {
         return Err(NotLaidOut::Failed(Failed::line(line)));
     }
-    let relaid = work_relaid(request)?;
+    let relaid = work_relaid(laying)?;
     if files::exists(Path::new(&command)) {
         for suffix in [".warm", ".tools"] {
             removed(&format!("{work}{suffix}"))?;
         }
     }
-    let fresh = request.repos().map(tree_checked).collect::<Result<Vec<bool>, NotLaidOut>>()?;
+    let fresh = laying.repos().map(tree_checked).collect::<Result<Vec<bool>, NotLaidOut>>()?;
     if fresh.contains(&true) {
         removed(&format!("{work}.warm"))?;
     }
@@ -1060,17 +1095,19 @@ fn tree_checked(repo: &Repo<'_>) -> Result<bool, NotLaidOut> {
     Ok(!files::exists(&dot_git.join("HEAD")) || !files::exists(&objects))
 }
 
-/// Clears the work folder of `request` when its layout record `<work>.layout` names another layout than the run's
+/// Clears the work folder of `laying` when its layout record `<work>.layout` names another layout than the run's
 /// ([`names_another_layout`]), a pair's first run having none, as the Windows box clears it: the warm record removed;
-/// the record saying [`LAYOUT_CHANGING`], so a clear cut short still finds another layout and clears again; every
-/// child of the work folder removed as itself, a link never followed ([`work_cleared`]); then the interrupted-command
-/// record removed, since what it guarded is gone. Whether the folder was cleared.
-fn work_relaid(request: &Request<'_>) -> Result<bool, NotLaidOut> {
-    let work = request.work;
-    if !names_another_layout(&layout_record(work), &request.layout()) {
+/// the inputs record `<work>.inputs` removed, whether or not the work folder is there, so no record names copies the
+/// clear takes away; the layout record saying [`LAYOUT_CHANGING`], so a clear cut short still finds another layout
+/// and clears again; every child of the work folder removed as itself, a link never followed ([`work_cleared`]); then
+/// the interrupted-command record removed, since what it guarded is gone. Whether the folder was cleared.
+fn work_relaid(laying: &Laying<'_>) -> Result<bool, NotLaidOut> {
+    let work = laying.work;
+    if !names_another_layout(&layout_record(work), &laying.layout()) {
         return Ok(false);
     }
     removed(&format!("{work}.warm"))?;
+    removed(&format!("{work}.inputs"))?;
     layout_written(work, LAYOUT_CHANGING)?;
     if files::exists(Path::new(work)) {
         work_cleared(Path::new(work))?;
@@ -1079,20 +1116,17 @@ fn work_relaid(request: &Request<'_>) -> Result<bool, NotLaidOut> {
     Ok(true)
 }
 
-/// Removes every child of the work folder `work`, each as itself: a folder with all it holds, a link never followed.
-/// Else why one could not be removed or the folder not listed.
+/// Removes every child of the work folder `work`, each as itself, beneath the folder's own descriptor: the folder
+/// opened with a link at it never followed, listed from that descriptor, and each child removed beneath it, a folder
+/// with all it holds and a link never followed ([`Folder::remove_child_tree`]). Else why one could not be removed or
+/// the folder not opened or listed, a link at `work` included.
 fn work_cleared(work: &Path) -> Result<(), NotLaidOut> {
     let unlisted = |error: io::Error| NotLaidOut::Refused(format!("cannot list {}: {error}", work.display()));
-    for entry in fs::read_dir(work).map_err(unlisted)? {
-        let path = entry.map_err(unlisted)?.path();
-        let not_removed = |error: io::Error| NotLaidOut::Refused(format!("cannot remove {}: {error}", path.display()));
-        // `remove_dir_all` removes a link inside the folder as itself, never what it leads to.
-        let gone = match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&path),
-            Ok(_) => fs::remove_file(&path),
-            Err(error) => Err(error),
-        };
-        gone.map_err(not_removed)?;
+    let folder = Folder::open(work).map_err(unlisted)?;
+    for name in folder.entries().map_err(unlisted)? {
+        folder
+            .remove_child_tree(&name)
+            .map_err(|error| NotLaidOut::Refused(format!("cannot remove {}: {error}", work.join(&name).display())))?;
     }
     Ok(())
 }
@@ -1104,19 +1138,25 @@ fn layout_written(work: &str, layout: &str) -> Result<(), NotLaidOut> {
     files::replace_plain(Path::new(&record), layout.as_bytes()).map_err(|failure| NotLaidOut::Refused(format!("cannot write {record}: {failure}")))
 }
 
-/// Lays out the work folder of `request`, its files checked as `checked` says ([`layout_checked`]): on a pair run every
+/// Lays out the work folder of `laying`, its files checked as `checked` says ([`layout_checked`]): on a pair run every
 /// repo's back ref deleted first ([`back_refs_cleared`]), so no repo keeps an earlier run's back commit whatever step
-/// of this run fails after; then each repo's tree laid out ([`tree_laid_out`]); then, after a clear, the run's layout
-/// recorded, last, so a layout cut short leaves [`LAYOUT_CHANGING`] and the next run clears again.
-fn laid_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>, checked: &Checked) -> Result<(), NotLaidOut> {
-    if !request.siblings.is_empty() {
-        back_refs_cleared(git, request)?;
+/// of this run fails after; then its trees laid out and its layout recorded ([`trees_laid_out`]).
+fn laid_out<S: LineSink>(laying: &Laying<'_>, git: &RunGit<'_, S>, checked: &Checked) -> Result<(), NotLaidOut> {
+    if !laying.siblings.is_empty() {
+        back_refs_cleared(git, laying)?;
     }
-    for (repo, fresh) in request.repos().zip(&checked.fresh) {
+    trees_laid_out(laying, git, checked)
+}
+
+/// The layout of a run of one repo, and of a pair's once [`laid_out`] has cleared its back refs: each repo's tree laid
+/// out ([`tree_laid_out`]); then, after a clear, the layout recorded, last, so a layout cut short leaves
+/// [`LAYOUT_CHANGING`] and the next run clears again.
+pub(crate) fn trees_laid_out(laying: &Laying<'_>, git: &impl Steps, checked: &Checked) -> Result<(), NotLaidOut> {
+    for (repo, fresh) in laying.repos().zip(&checked.fresh) {
         tree_laid_out(git, repo, *fresh)?;
     }
     if checked.relaid {
-        layout_written(request.work, &request.layout())?;
+        layout_written(laying.work, &laying.layout())?;
     }
     Ok(())
 }
@@ -1124,7 +1164,7 @@ fn laid_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>, checked: &C
 /// Lays out the tree of `repo`: a `fresh` tree made with `git init`; then its `origin`, its line-ending config and its
 /// alternates file naming its own bare repository's objects, written whole ([`git::alternates_written`]). Each step and
 /// its failure name the repo on a pair run, as the Windows box's layout steps do ([`for_repo`], [`failed_for`]).
-fn tree_laid_out<S: LineSink>(git: &RunGit<'_, S>, repo: &Repo<'_>, fresh: bool) -> Result<(), NotLaidOut> {
+fn tree_laid_out(git: &impl Steps, repo: &Repo<'_>, fresh: bool) -> Result<(), NotLaidOut> {
     let name = repo.name.as_deref();
     if fresh {
         let step = "git init";
@@ -1208,8 +1248,8 @@ fn missing_snapshot(repo: &Repo<'_>) -> String {
 }
 
 /// Deletes every repo's `refs/gate-back/<key>` in its bare repository ([`back_ref_cleared`]), the main one first.
-fn back_refs_cleared<S: LineSink>(git: &RunGit<'_, S>, request: &Request<'_>) -> Result<(), Failed> {
-    request.repos().try_for_each(|repo| back_ref_cleared(git, request.key, repo))
+fn back_refs_cleared<S: LineSink>(git: &RunGit<'_, S>, laying: &Laying<'_>) -> Result<(), Failed> {
+    laying.repos().try_for_each(|repo| back_ref_cleared(git, laying.key, repo))
 }
 
 /// Deletes `refs/gate-back/<key>` in the bare repository of `repo`, an earlier run's back commit, so the client finds
@@ -1242,7 +1282,11 @@ mod tests {
 
     use gate_watchdog::Pump;
 
-    use super::{REFUSED_STATUS, Ready, Request, Watches, login_read, place_of, prepare, prepared, run_along, test_template};
+    use super::{
+        NotLaidOut, REFUSED_STATUS, Ready, Request, Watches, login_read, place_of, prepare, prepared, run_along, test_template, work_cleared,
+    };
+    #[cfg(target_os = "macos")]
+    use crate::beneath::ANOTHER_VOLUME;
     use crate::command::{Launch, Sampler, run_command};
     use crate::console::{Console, Forwarding};
     use crate::console::{LineSink, Output, RecordingSink, Stream};
@@ -2668,6 +2712,122 @@ mod tests {
         assert_eq!(case.work_names(), [".git", "a.txt"], "the pair's trees are cleared");
         assert_eq!(case.layout_record(), "single");
         assert_eq!(case.head(), main);
+    }
+
+    #[test]
+    fn a_layout_change_removes_a_link_in_the_work_folder_and_keeps_the_folder_it_leads_to() {
+        let case = Case::new("relaid-link");
+        let main = case.snapshot(&[("a.txt", "a\n")]);
+        let lib = case.lib_snapshot(&[("b.txt", "b\n")]);
+        case.laid_out(&main);
+        let outside = case.base.with_file_name("outside");
+        fs::create_dir_all(&outside).expect("the outside folder is made");
+        fs::write(outside.join("kept.txt"), "kept\n").expect("the outside file is written");
+        symlink(&outside, format!("{}/out", case.work())).expect("the link in the work folder is made");
+
+        let (status, said) = ran(&case.pair_json(&main, &lib, &json!({})));
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(case.work_names(), ["lib", "repo"], "the link is cleared with the single tree");
+        assert_eq!(
+            fs::read(outside.join("kept.txt")).expect("the outside file is read"),
+            b"kept\n",
+            "the folder the link led to keeps its file"
+        );
+    }
+
+    /// Why `cleared` refused the clear; the case fails unless it was refused.
+    #[expect(clippy::panic, reason = "a clear that was not refused must fail the case loudly")]
+    fn refusal_of(cleared: Result<(), NotLaidOut>) -> String {
+        match cleared {
+            Err(NotLaidOut::Refused(why)) => why,
+            Ok(()) => panic!("the clear went through"),
+            Err(NotLaidOut::Busy | NotLaidOut::Failed(_)) => panic!("the clear failed other than refused"),
+        }
+    }
+
+    #[test]
+    fn a_work_folder_that_is_a_link_is_not_cleared_and_the_folder_it_leads_to_kept() {
+        let case = Case::new("clear-link");
+        let outside = case.base.with_file_name("outside");
+        fs::create_dir_all(&outside).expect("the outside folder is made");
+        fs::write(outside.join("kept.txt"), "kept\n").expect("the outside file is written");
+        symlink(&outside, case.work()).expect("the link at the work folder is made");
+
+        let why = refusal_of(work_cleared(Path::new(&case.work())));
+        assert!(why.starts_with("cannot list "), "{why}");
+        assert_eq!(fs::read(outside.join("kept.txt")).expect("the outside file is read"), b"kept\n");
+    }
+
+    /// Runs `hdiutil` with `args`; whether it exited 0.
+    #[cfg(target_os = "macos")]
+    #[expect(clippy::disallowed_methods, reason = "the spawn lock is the Windows gate's; this sets a case's volume up")]
+    fn hdiutil(args: &[&str]) -> bool {
+        Command::new("hdiutil")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .status()
+            .expect("hdiutil starts")
+            .success()
+    }
+
+    /// A volume attached at a mount point, detached when the case ends.
+    #[cfg(target_os = "macos")]
+    struct Attached(String);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Attached {
+        fn drop(&mut self) {
+            // Best effort: a volume left attached shows in `hdiutil info`, named for this process's case.
+            let _ = hdiutil(&["detach", "-force", &self.0]);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_clear_refuses_a_volume_mounted_in_the_work_folder_and_keeps_its_files() {
+        // The mount point in the work folder, and the work folder's child the refusal names.
+        for (at, child) in [("mnt", "mnt"), ("a/b/mnt", "a")] {
+            let case = Case::new(&format!("clear-mount-{child}"));
+            let work = case.work();
+            let mount = format!("{work}/{at}");
+            fs::create_dir_all(&mount).expect("the mount point is made");
+            let image = case.base.with_file_name("volume.dmg");
+            let image = image.to_str().expect("the temp folder is UTF-8");
+            assert!(
+                hdiutil(&["create", "-quiet", "-size", "1m", "-fs", "HFS+", "-volname", "gate-clear", image]),
+                "the image is made"
+            );
+            assert!(
+                hdiutil(&["attach", "-quiet", "-nobrowse", "-mountpoint", &mount, image]),
+                "the image is attached"
+            );
+            let _attached = Attached(mount.clone());
+            fs::write(format!("{mount}/kept.txt"), "kept\n").expect("a file on the volume is written");
+
+            let why = refusal_of(work_cleared(Path::new(&work)));
+            assert_eq!(why, format!("cannot remove {work}/{child}: {ANOTHER_VOLUME}"), "{at}");
+            assert_eq!(
+                fs::read(format!("{mount}/kept.txt")).expect("the volume's file is read"),
+                b"kept\n",
+                "{at}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_layout_change_removes_the_inputs_record() {
+        let case = Case::new("relaid-inputs");
+        let main = case.snapshot(&[("a.txt", "a\n")]);
+        let lib = case.lib_snapshot(&[("b.txt", "b\n")]);
+        case.laid_out(&main);
+        let inputs = format!("{}.inputs", case.work());
+        fs::write(&inputs, "a record of the single tree's inputs\n").expect("the inputs record is written");
+
+        let (status, said) = ran(&case.pair_json(&main, &lib, &json!({})));
+        assert_eq!(status, 0, "{said:?}");
+        assert!(!Path::new(&inputs).exists(), "the inputs record goes with the clear");
+        assert_eq!(case.layout_record(), "pair repo lib");
     }
 
     #[test]
