@@ -63,25 +63,62 @@ pub fn root_unsafe_line(why: &str) -> String {
     )
 }
 
-/// What the login shell prints on each side of its `PATH`, so the box can tell it from what the login profile prints.
-pub const PATH_MARKER: &str = "__GATE_PATH__";
+/// A marker for one print of the login shell: `__GATE_LOGIN_<16 hex>__`, the hex from the box's process id and the
+/// time, so no fixed text a login profile prints can be taken for it. The login shell prints it between two NULs, then
+/// its environment, each entry ended by a NUL: an environment value cannot hold a NUL, so no value can end an entry
+/// early or start another.
+#[must_use]
+pub fn login_marker() -> String {
+    // A clock before the epoch leaves the process id alone to tell one box's marker from another's.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_nanos());
+    format!("__GATE_LOGIN_{:08x}{nanos:08x}__", std::process::id())
+}
 
-/// The `PATH` in the login shell's output `stdout`: the text between the last two [`PATH_MARKER`]s.
+/// What the box reads of its user's login shell, from one print of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Login {
+    /// Its `PATH`.
+    pub path: String,
+    /// Its exported `GATE_GODOT_ROOT`, the folder holding the builder's Godot installs; `None` when it is unset or
+    /// empty, so Godot is missing on the builder.
+    pub godot_root: Option<String>,
+}
+
+/// What the login shell's output `stdout` says in its record: the first NUL, `marker` ([`login_marker`]), NUL, then
+/// its environment, each entry `NAME=value` ended by a NUL, of which the first `PATH` and the first `GATE_GODOT_ROOT`
+/// are read. What the login profile prints before the record is left out, as is what follows its last NUL; marker
+/// text inside a value is part of that value. The root is `None` when it is not there, empty or not UTF-8.
 ///
 /// # Errors
 ///
-/// Why there is none, after the shell's name: no two markers, an empty `PATH`, or one that is not UTF-8.
-pub fn marked_path(stdout: &[u8]) -> Result<String, String> {
-    let text = String::from_utf8_lossy(stdout);
-    let marked = text
-        .rfind(PATH_MARKER)
-        .and_then(|end| text[..end].rfind(PATH_MARKER).map(|start| &text[start + PATH_MARKER.len()..end]));
-    match marked {
-        None => Err("said no marked PATH".to_owned()),
-        Some("") => Err("said an empty PATH".to_owned()),
-        Some(path) if path.contains('\u{FFFD}') => Err("said a PATH that is not UTF-8".to_owned()),
-        Some(path) => Ok(path.to_owned()),
-    }
+/// Why there is no `PATH`, after the shell's name: no record, no `PATH` entry in it, an empty one, or one that is not
+/// UTF-8.
+pub fn marked_login(stdout: &[u8], marker: &str) -> Result<Login, String> {
+    let start = [b"\0", marker.as_bytes(), b"\0"].concat();
+    let Some(block) = stdout
+        .windows(start.len())
+        .position(|window| window == start.as_slice())
+        .map(|at| &stdout[at + start.len()..])
+    else {
+        return Err("said no marked PATH".to_owned());
+    };
+    let mut entries: Vec<&[u8]> = block.split(|byte| *byte == 0).collect();
+    // What follows the last NUL ends no entry: it is what the shell printed after its environment.
+    entries.pop();
+    let value = |name: &[u8]| entries.iter().find_map(|entry| entry.strip_prefix(name));
+    let path = match value(b"PATH=").map(std::str::from_utf8) {
+        None => return Err("said no marked PATH".to_owned()),
+        Some(Ok("")) => return Err("said an empty PATH".to_owned()),
+        Some(Ok(path)) => path.to_owned(),
+        Some(Err(_)) => return Err("said a PATH that is not UTF-8".to_owned()),
+    };
+    let godot_root = value(b"GATE_GODOT_ROOT=")
+        .and_then(|root| std::str::from_utf8(root).ok())
+        .filter(|root| !root.is_empty())
+        .map(str::to_owned);
+    Ok(Login { path, godot_root })
 }
 
 /// The note said when the login shell's `PATH` cannot be read, for `why`.
@@ -560,6 +597,21 @@ pub fn round_trip(seconds: i64, hundreds: i64) -> String {
 /// The variable the run's command reads its job's name from, as on the Windows box (`gate`'s `environment.rs`).
 pub const BOX_JOB_VARIABLE: &str = "GATE_BOX_JOB";
 
+/// The variable the command of a run with a chosen Godot version reads the Godot install it resolved from.
+pub const GODOT_PATH: &str = "GODOT_PATH";
+
+/// The Godot of a run's command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Godot<'a> {
+    /// The run chose no Godot version: its words run as written and [`GODOT_PATH`] is left as the environment has it.
+    Unchosen,
+    /// The program of the install of the run's chosen version: a Godot console word runs it, and [`GODOT_PATH`] names
+    /// it.
+    Installed(&'a str),
+    /// The run's chosen version has no install: a Godot console word cannot start, and [`GODOT_PATH`] is removed.
+    Missing,
+}
+
 /// What the box sets over its own environment for a run's command and its tool restore.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Along<'a> {
@@ -567,13 +619,16 @@ pub struct Along<'a> {
     pub path: Option<&'a str>,
     /// The run's own temp folder with a trailing `/`, the `TMPDIR`; `None` to keep the box's own.
     pub tmp: Option<&'a str>,
+    /// The run's Godot, which sets or removes [`GODOT_PATH`] over the payload's `Env`.
+    pub godot: Godot<'a>,
 }
 
 /// The command's environment: `start` (the box's own), its `PATH` the login shell's `along.path` and its `TMPDIR` the
-/// run's folder `along.tmp` when there are, the payload's `Env` pairs `caller` set over that, each replacing its name,
-/// then the build-server settings of the run `run` ([`gate_wire::build_server_settings`]) and [`BOX_JOB_VARIABLE`] the
-/// job `job`, each first removing every name that differs from it only in case, so the command sees one value per
-/// name, as on the Windows box.
+/// run's folder `along.tmp` when there are, the payload's `Env` pairs `caller` set over that, each replacing its name;
+/// [`GODOT_PATH`] then set to the program of `along.godot`'s install over any value it holds, or removed for a run whose
+/// chosen version has none; then the build-server settings of the run `run` ([`gate_wire::build_server_settings`]) and
+/// [`BOX_JOB_VARIABLE`] the job `job`, each first removing every name that differs from it only in case, so the command
+/// sees one value per name, as on the Windows box.
 #[must_use]
 pub fn command_environment(
     start: Vec<(OsString, OsString)>,
@@ -591,6 +646,11 @@ pub fn command_environment(
     }
     for (name, value) in caller {
         set_variable(&mut environment, name, value, false);
+    }
+    match along.godot {
+        Godot::Unchosen => {}
+        Godot::Installed(program) => set_variable(&mut environment, GODOT_PATH, program, false),
+        Godot::Missing => environment.retain(|(name, _)| name.as_os_str() != OsStr::new(GODOT_PATH)),
     }
     for (name, value) in gate_wire::build_server_settings(run) {
         set_variable(&mut environment, name, &value, true);
@@ -620,14 +680,14 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Along, BACK_COMMITS_FAILED, BOX_JOB_VARIABLE, CommandEnd, ROSETTA_LINE, Translation, back_commits_line, command_environment, command_status,
-        rosetta_lines, round_trip, translation,
+        Along, BACK_COMMITS_FAILED, BOX_JOB_VARIABLE, CommandEnd, GODOT_PATH, Godot, ROSETTA_LINE, Translation, back_commits_line,
+        command_environment, command_status, rosetta_lines, round_trip, translation,
     };
     use super::{
-        JobRecord, PATH_MARKER, Probed, Recorded, RootFacts, boot_line, created_line, folder_failure, folder_flaw, is_git_variable, job_record,
-        job_record_text, layout_text, marked_path, names_another_layout, no_answer, probed, readies_single, record_unread, record_without_group,
-        recorded_group, root_flaw, root_unsafe_line, sdk_list, sdks_line, signal_guard, step_unran, tool_line, version_line, warm_text, work_layout,
-        write_failure,
+        JobRecord, Login, Probed, Recorded, RootFacts, boot_line, created_line, folder_failure, folder_flaw, is_git_variable, is_lower_hex,
+        job_record, job_record_text, layout_text, login_marker, marked_login, names_another_layout, no_answer, probed, readies_single, record_unread,
+        record_without_group, recorded_group, root_flaw, root_unsafe_line, sdk_list, sdks_line, signal_guard, step_unran, tool_line, version_line,
+        warm_text, work_layout, write_failure,
     };
     use gate_wire::BoxKill;
 
@@ -697,7 +757,35 @@ mod tests {
 
     /// What a case's command runs along: the login `PATH` `path` and no folder of the box's own for `TMPDIR`.
     fn along_path(path: Option<&str>) -> Along<'_> {
-        Along { path, tmp: None }
+        Along {
+            path,
+            tmp: None,
+            godot: Godot::Unchosen,
+        }
+    }
+
+    #[test]
+    fn godot_path_is_the_run_s_install_over_the_caller_s_and_removed_when_its_version_has_none() {
+        let start = vec![(OsString::from("GODOT_PATH"), OsString::from("/ssh/godot"))];
+        let theirs = [("GODOT_PATH".to_owned(), "/theirs/godot".to_owned())];
+        let with = |godot: Godot<'_>, caller: &[(String, String)]| {
+            let along = Along { godot, ..along_path(None) };
+            command_environment(start.clone(), along, caller, "r", "j")
+        };
+        let program = "/Users/b/godot/4.7.2/Godot.app/Contents/MacOS/Godot";
+        assert_eq!(values_of(&with(Godot::Installed(program), &theirs), GODOT_PATH), [(GODOT_PATH, program)]);
+        assert_eq!(values_of(&with(Godot::Installed(program), &[]), GODOT_PATH), [(GODOT_PATH, program)]);
+        assert!(
+            values_of(&with(Godot::Missing, &theirs), GODOT_PATH).is_empty(),
+            "no install, no GODOT_PATH"
+        );
+        assert!(values_of(&with(Godot::Missing, &[]), GODOT_PATH).is_empty(), "the box's own goes too");
+        assert_eq!(
+            values_of(&with(Godot::Unchosen, &theirs), GODOT_PATH),
+            [(GODOT_PATH, "/theirs/godot")],
+            "no version keeps the caller's"
+        );
+        assert_eq!(values_of(&with(Godot::Unchosen, &[]), GODOT_PATH), [(GODOT_PATH, "/ssh/godot")]);
     }
 
     #[test]
@@ -716,6 +804,7 @@ mod tests {
         let along = Along {
             path: Some("/login/bin:/usr/bin"),
             tmp: Some("/tmp/gate.abcdefgh/"),
+            godot: Godot::Unchosen,
         };
         let environment = command_environment(start.clone(), along, &caller, "gate-box-n", "gate-remote-k-n");
         assert_eq!(values_of(&environment, "PATH"), [("PATH", "/login/bin:/usr/bin")]);
@@ -752,6 +841,7 @@ mod tests {
         let along = Along {
             path: None,
             tmp: Some("/tmp/gate.abcdefgh/"),
+            godot: Godot::Unchosen,
         };
         let environment = command_environment(start, along, &[], "r", "j");
         assert_eq!(values_of(&environment, "TMPDIR"), [("TMPDIR", "/tmp/gate.abcdefgh/")]);
@@ -770,6 +860,7 @@ mod tests {
         let along = Along {
             path: None,
             tmp: Some("/tmp/gate.abcdefgh/"),
+            godot: Godot::Unchosen,
         };
         let environment = command_environment(start, along, &caller, "r", "j");
         assert_eq!(values_of(&environment, "TMPDIR"), [("TMPDIR", "/theirs/")]);
@@ -1132,21 +1223,118 @@ mod tests {
         assert_eq!(signal_guard(2, 900), Ok(()));
     }
 
+    /// The marker the login-print cases use.
+    const MARKER: &str = "__GATE_LOGIN_0123456789abcdef__";
+
+    /// The login shell's output: `before`, the record of the environment `entries` as the box asks the shell to print
+    /// it, then `after`.
+    fn printed(before: &str, entries: &[&str], after: &str) -> Vec<u8> {
+        let block: String = entries.iter().flat_map(|entry| [*entry, "\0"]).collect();
+        format!("{before}\0{MARKER}\0{block}{after}").into_bytes()
+    }
+
+    /// The login `path` and `root`.
+    fn login(path: &str, root: Option<&str>) -> Login {
+        Login {
+            path: path.to_owned(),
+            godot_root: root.map(str::to_owned),
+        }
+    }
+
     #[test]
-    fn the_path_is_the_text_between_the_markers_whatever_the_profile_prints() {
-        let marked = |path: &str| format!("\n{PATH_MARKER}{path}{PATH_MARKER}\n");
-        assert_eq!(marked_path(marked("/usr/bin:/bin").as_bytes()), Ok("/usr/bin:/bin".to_owned()));
-        let noisy = format!("Last login: today\nwelcome {PATH_MARKER}\n{}", marked("/opt/homebrew/bin:/usr/bin"));
-        assert_eq!(marked_path(noisy.as_bytes()), Ok("/opt/homebrew/bin:/usr/bin".to_owned()), "noise before");
-        assert_eq!(marked_path(b"/usr/bin:/bin"), Err("said no marked PATH".to_owned()));
+    fn each_login_marker_is_its_own() {
+        let marker = login_marker();
+        assert_eq!(marker.len(), "__GATE_LOGIN___".len() + 16, "{marker}");
+        assert!(marker.starts_with("__GATE_LOGIN_") && marker.ends_with("__"), "{marker}");
+        assert!(is_lower_hex(&marker["__GATE_LOGIN_".len()..marker.len() - 2], 16), "{marker}");
+    }
+
+    #[test]
+    fn the_path_and_the_godot_root_are_read_from_one_record_whatever_the_profile_prints() {
+        let both = ["HOME=/Users/b", "PATH=/usr/bin", "GATE_GODOT_ROOT=/Users/b/gate/godot", "TERM=dumb"];
         assert_eq!(
-            marked_path(format!("{PATH_MARKER}/usr/bin").as_bytes()),
-            Err("said no marked PATH".to_owned())
+            marked_login(&printed("", &both, ""), MARKER),
+            Ok(login("/usr/bin", Some("/Users/b/gate/godot")))
         );
-        assert_eq!(marked_path(marked("").as_bytes()), Err("said an empty PATH".to_owned()));
-        let mut bad = format!("\n{PATH_MARKER}/u").into_bytes();
+        let noise = format!("Last login: today\nwelcome {MARKER}\n__GATE_PATH__ ");
+        assert_eq!(
+            marked_login(
+                &printed(&noise, &["PATH=/opt/homebrew/bin:/usr/bin", "GATE_GODOT_ROOT=/g"], "logout\nPATH=/x"),
+                MARKER
+            ),
+            Ok(login("/opt/homebrew/bin:/usr/bin", Some("/g"))),
+            "noise before and after, as from .zlogout"
+        );
+        let fixed = "\0__GATE_LOGIN__\0PATH=/fake\0GATE_GODOT_ROOT=/fake-root\0";
+        assert_eq!(
+            marked_login(&printed(&format!("banner{fixed}"), &["PATH=/usr/bin", "GATE_GODOT_ROOT=/g"], ""), MARKER),
+            Ok(login("/usr/bin", Some("/g"))),
+            "a banner holding the fixed marker text and a fake record"
+        );
+        let after = format!("\0{MARKER}\0PATH=/after\0GATE_GODOT_ROOT=/after-root\0");
+        assert_eq!(
+            marked_login(&printed("", &["PATH=/usr/bin", "GATE_GODOT_ROOT=/g"], &after), MARKER),
+            Ok(login("/usr/bin", Some("/g"))),
+            "the first record is read"
+        );
+        assert_eq!(
+            marked_login(&printed("", &["PATH=/usr/bin", "GATE_GODOT_ROOT=/Users/b/My Godot "], ""), MARKER),
+            Ok(login("/usr/bin", Some("/Users/b/My Godot "))),
+            "spaces are kept"
+        );
+        for no_root in [
+            &["PATH=/usr/bin", "GATE_GODOT_ROOT="][..],
+            &["PATH=/usr/bin"],
+            &["PATH=/usr/bin", "XGATE_GODOT_ROOT=/g"],
+        ] {
+            assert_eq!(
+                marked_login(&printed("", no_root, ""), MARKER),
+                Ok(login("/usr/bin", None)),
+                "{no_root:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn marker_text_inside_either_value_shifts_neither() {
+        let root = format!("/g/__GATE_PATH__/x\u{1}{MARKER}__GATE_GODOT_ROOT__");
+        assert_eq!(
+            marked_login(&printed("", &["PATH=/usr/bin", &format!("GATE_GODOT_ROOT={root}")], ""), MARKER),
+            Ok(login("/usr/bin", Some(&root))),
+            "a root holding the old and the new marker text"
+        );
+        let path = format!("/a{MARKER}:/bPATH=__GATE_PATH__:/usr/bin");
+        assert_eq!(
+            marked_login(&printed("", &[&format!("PATH={path}"), "GATE_GODOT_ROOT=/g"], ""), MARKER),
+            Ok(login(&path, Some("/g"))),
+            "a PATH holding marker text"
+        );
+    }
+
+    #[test]
+    fn a_login_print_with_no_record_or_a_bad_path_gives_no_login() {
+        let none = Err("said no marked PATH".to_owned());
+        assert_eq!(marked_login(b"PATH=/usr/bin\0", MARKER), none);
+        assert_eq!(
+            marked_login(format!("{MARKER}PATH=/usr/bin\0").as_bytes(), MARKER),
+            none,
+            "no NULs around the marker"
+        );
+        assert_eq!(marked_login(&printed("", &["HOME=/h"], ""), MARKER), none, "no PATH entry");
+        assert_eq!(marked_login(&printed("", &[], "PATH=/usr/bin"), MARKER), none, "a PATH no NUL ends");
+        assert_eq!(
+            marked_login(&printed("", &["PATH=/usr/bin"], ""), "__GATE_LOGIN_ffffffffffffffff__"),
+            none,
+            "another call's marker"
+        );
+        assert_eq!(marked_login(&printed("", &["PATH="], ""), MARKER), Err("said an empty PATH".to_owned()));
+        let mut bad = format!("\0{MARKER}\0PATH=/u").into_bytes();
         bad.push(0xff);
-        bad.extend_from_slice(format!("{PATH_MARKER}\n").as_bytes());
-        assert_eq!(marked_path(&bad), Err("said a PATH that is not UTF-8".to_owned()));
+        bad.extend_from_slice(b"\0GATE_GODOT_ROOT=/g\0");
+        assert_eq!(marked_login(&bad, MARKER), Err("said a PATH that is not UTF-8".to_owned()));
+        let mut bad_root = format!("\0{MARKER}\0PATH=/usr/bin\0GATE_GODOT_ROOT=/g").into_bytes();
+        bad_root.push(0xff);
+        bad_root.push(0);
+        assert_eq!(marked_login(&bad_root, MARKER), Ok(login("/usr/bin", None)), "a root that is not UTF-8");
     }
 }

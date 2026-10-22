@@ -272,14 +272,15 @@ fn alternates_written(work: &str, bare: &str) -> Result<(), Failed> {
 }
 
 /// Says the SDK line and one line for each tool the payload's `Needs` names, in its order, the SDK list and the probes
-/// read at the same time along the login shell's `PATH` ([`process::login_path`]), or the box's own `PATH`, said so,
-/// when that cannot be read.
+/// read at the same time along the login shell's `PATH` ([`process::login_shell`]), or the box's own `PATH`, said so,
+/// when that cannot be read; Godot is looked for under the login shell's `GATE_GODOT_ROOT`, and is missing when the
+/// login shell cannot be read.
 fn say_sdks_and_tools(payload: &Payload, console: &mut Console) {
-    let path = match process::login_path() {
-        Ok(path) => Some(path),
+    let (path, godot_root) = match process::login_shell() {
+        Ok(login) => (Some(login.path), login.godot_root),
         Err(why) => {
             console.err(&login_path_line(&why));
-            None
+            (None, None)
         }
     };
     let names: Vec<String> = if let Ok(needs) = payload.pairs("Needs") {
@@ -290,7 +291,7 @@ fn say_sdks_and_tools(payload: &Payload, console: &mut Console) {
     };
     let (sdks, tools) = thread::scope(|scope| {
         let sdks = scope.spawn(|| probe::sdks(path.as_deref()));
-        let tools = probe::probe_all(&names, path.as_deref());
+        let tools = probe::probe_all(&names, path.as_deref(), godot_root.as_deref());
         (sdks.join().unwrap_or_else(|_| Err("the SDK read failed".to_owned())), tools)
     });
     match sdks {
@@ -402,7 +403,7 @@ mod tests {
     #[test]
     fn a_first_preflight_readies_the_bare_and_the_tree_and_says_its_lines_in_order() {
         let case = Case::new("first");
-        let payload = case.payload(&json!({ "Needs": { "godot": "", "bogus": "1.0" } }));
+        let payload = case.payload(&json!({ "Needs": { "unreal": "", "bogus": "1.0" } }));
         let (status, console) = preflighted(&payload);
         assert_eq!(status, 0, "{:?}", console.err);
         let out = &console.out;
@@ -414,7 +415,7 @@ mod tests {
         assert!(out[4].starts_with("gate: remote boot "), "{out:?}");
         assert_sdks_then_tools(
             &out[5..],
-            &["gate: remote tool godot missing", "gate: remote tool bogus skipped: unknown tool"],
+            &["gate: remote tool unreal missing", "gate: remote tool bogus skipped: unknown tool"],
         );
 
         let work = case.work();

@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use crate::console::{Forwarding, Stream};
 use crate::files::{self, HeldLock};
 use crate::forward::{Readers, Take};
+use crate::lines::Login;
 
 /// The most bytes of a program's standard error kept: its tail.
 const STDERR_TAIL: usize = 64 * 1024;
@@ -861,33 +862,37 @@ pub fn status_text(status: ExitStatus) -> String {
     }
 }
 
-/// The `PATH` of the box user's login shell, `$SHELL` (`/bin/zsh` when `SHELL` is unset or empty) as
-/// [`login_path_of`] reads it: an ssh command's own `PATH` lacks what the login profile adds, such as dotnet's folder.
-/// Read anew on every call.
+/// The `PATH` and `GATE_GODOT_ROOT` of the box user's login shell, `$SHELL` (`/bin/zsh` when `SHELL` is unset or empty)
+/// as [`login_shell_of`] reads them: an ssh command's own environment lacks what the login profile adds, such as
+/// dotnet's folder and the installer's Godot root. Read anew on every call.
 ///
 /// # Errors
 ///
-/// Why it cannot be used, as [`login_path_of`] says it.
-pub fn login_path() -> Result<String, String> {
+/// Why it cannot be used, as [`login_shell_of`] says it.
+pub fn login_shell() -> Result<Login, String> {
     let shell = std::env::var_os("SHELL")
         .filter(|shell| !shell.is_empty())
         .unwrap_or_else(|| OsString::from(DEFAULT_SHELL));
-    login_path_of(&shell)
+    login_shell_of(&shell)
 }
 
-/// The `PATH` the login shell `shell` says when run as `shell -l -c` with a command that prints it between two
-/// [`crate::lines::PATH_MARKER`]s, in the bounded runner within [`LOGIN_PATH_LIMIT`]; only the text between the markers
-/// is taken ([`crate::lines::marked_path`]), so anything the login profile prints around it is left out.
+/// The `PATH` and `GATE_GODOT_ROOT` the login shell `shell` says when run once as `shell -l -c` with a command that
+/// prints a marker of its own ([`crate::lines::login_marker`]) between NULs, then the shell's environment NUL-separated,
+/// in the bounded runner within [`LOGIN_PATH_LIMIT`]; only that record is taken ([`crate::lines::marked_login`]), so
+/// anything the login profile prints around it is left out. The command is two programs by absolute path with
+/// single-quoted words, which every login shell (sh, zsh, bash, fish, tcsh) parses alike, and it expands no variable,
+/// so a profile's `set -u` cannot fail it; only an exported `GATE_GODOT_ROOT` is read.
 ///
 /// # Errors
 ///
 /// Why it cannot be used, for [`crate::lines::login_path_line`]: the shell did not start, failed, ran past the limit,
 /// or wrote more than [`LOGIN_PATH_CAP`], no marked `PATH`, an empty one, or text that is not UTF-8.
-pub fn login_path_of(shell: &std::ffi::OsStr) -> Result<String, String> {
+pub fn login_shell_of(shell: &std::ffi::OsStr) -> Result<Login, String> {
     let shown = shell.to_string_lossy().into_owned();
     let mut command = Command::new(shell);
-    let marker = crate::lines::PATH_MARKER;
-    command.args(["-l", "-c", &format!("printf '\\n{marker}%s{marker}\\n' \"$PATH\"")]);
+    let marker = crate::lines::login_marker();
+    let print = format!("/usr/bin/printf '\\0{marker}\\0'; /usr/bin/env -0");
+    command.args(["-l", "-c", &print]);
     let ran = run_bounded(command, LOGIN_PATH_CAP, Instant::now() + LOGIN_PATH_LIMIT).map_err(|not| match not {
         NotRan::Start(error) => format!("cannot run {shown}: {error}"),
         NotRan::TimedOut { .. } => format!("{shown} -l did not answer in {} s", LOGIN_PATH_LIMIT.as_secs()),
@@ -897,7 +902,7 @@ pub fn login_path_of(shell: &std::ffi::OsStr) -> Result<String, String> {
     if !ran.status.success() {
         return Err(format!("{shown} -l exited with {}", status_text(ran.status)));
     }
-    crate::lines::marked_path(&ran.stdout).map_err(|why| format!("{shown} -l {why}"))
+    crate::lines::marked_login(&ran.stdout, &marker).map_err(|why| format!("{shown} -l {why}"))
 }
 
 /// `command` given `path` as its `PATH`, which it is also found along; `None` leaves the box's own.
@@ -919,8 +924,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        EndedBy, Ending, Forward, Group, GroupEnd, GroupRecord, Halt, KILL_WAIT, NotRan, Settled, Staged, Watch, Why, end_group, is_still_there,
-        login_path, login_path_of, run_bounded, run_watched, settled, signal_log, status_text, still_there_why, stopped_watching,
+        EndedBy, Ending, Forward, Group, GroupEnd, GroupRecord, Halt, KILL_WAIT, Login, NotRan, Settled, Staged, Watch, Why, end_group,
+        is_still_there, login_shell, login_shell_of, run_bounded, run_watched, settled, signal_log, status_text, still_there_why, stopped_watching,
     };
     use crate::console::{FailingSink, Forwarding, LineSink, Output, RecordingSink, Stream};
     use crate::files::held_for_test;
@@ -1597,27 +1602,87 @@ mod tests {
 
     #[test]
     fn the_login_shell_gives_a_path() {
-        let path = login_path().expect("the login shell's PATH is read");
+        let path = login_shell().expect("the login shell's PATH is read").path;
         assert!(!path.is_empty(), "{path:?}");
         assert!(path.contains("/usr/bin"), "{path}");
     }
 
-    #[test]
-    fn a_login_profile_that_prints_noise_leaves_the_path_clean() {
-        let folder = std::env::temp_dir().join(format!("gate-box-unix-shell-{}", std::process::id()));
+    /// What `login_shell_of` reads of a login shell whose profile prints a banner and runs `profile`: a script standing
+    /// in for the shell, `-l -c <command>` running the command after it in the same shell, as a login shell does, then
+    /// printing a goodbye as a `.zlogout` would.
+    fn login_after(name: &str, profile: &str) -> Result<Login, String> {
+        login_in(
+            name,
+            &format!("#!/bin/sh\necho 'Welcome to the builder'\nprintf 'no newline'\n{profile}\neval \"$3\"\necho 'Goodbye'\n"),
+        )
+    }
+
+    /// What `login_shell_of` reads of the login shell `script`, a script standing in for the shell.
+    fn login_in(name: &str, script: &str) -> Result<Login, String> {
+        let folder = std::env::temp_dir().join(format!("gate-box-unix-shell-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&folder).expect("the shell's folder is made");
         let shell = folder.join("noisy-shell");
-        // Stands in for a login shell whose profile prints a banner: `-l -c <command>` runs the command after it.
-        std::fs::write(
-            &shell,
-            "#!/bin/sh\necho 'Welcome to the builder'\nprintf 'no newline'\nPATH=/fake/bin:/usr/bin\nexec /bin/sh -c \"$3\"\n",
-        )
-        .expect("the shell is written");
+        std::fs::write(&shell, script).expect("the shell is written");
         std::fs::set_permissions(&shell, std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("the shell is made runnable");
-
-        let path = login_path_of(shell.as_os_str());
+        let login = login_shell_of(shell.as_os_str());
         // Best effort: a folder left behind is in the temp folder and named for this process.
         let _ = std::fs::remove_dir_all(&folder);
-        assert_eq!(path, Ok("/fake/bin:/usr/bin".to_owned()));
+        login
+    }
+
+    #[test]
+    fn a_login_profile_that_prints_noise_leaves_the_path_clean() {
+        let login = login_after("noisy", "PATH=/fake/bin:/usr/bin\nunset GATE_GODOT_ROOT");
+        assert_eq!(
+            login,
+            Ok(Login {
+                path: "/fake/bin:/usr/bin".to_owned(),
+                godot_root: None,
+            }),
+            "no root is Godot missing"
+        );
+    }
+
+    #[test]
+    fn the_login_shell_s_godot_root_is_read_with_its_path_spaces_kept() {
+        let login = login_after(
+            "godot",
+            "PATH=/fake/bin:/usr/bin\nGATE_GODOT_ROOT='/Users/b/gate dir/godot'\nexport GATE_GODOT_ROOT",
+        );
+        assert_eq!(
+            login,
+            Ok(Login {
+                path: "/fake/bin:/usr/bin".to_owned(),
+                godot_root: Some("/Users/b/gate dir/godot".to_owned()),
+            })
+        );
+        let empty = login_after("godot-empty", "GATE_GODOT_ROOT=\nexport GATE_GODOT_ROOT");
+        assert_eq!(empty.map(|login| login.godot_root), Ok(None), "an empty root is none");
+    }
+
+    #[test]
+    fn a_login_shell_that_is_not_posix_like_still_gives_the_path_and_the_godot_root() {
+        // Stands in for fish or tcsh, which cannot parse `${…-}` and fail the whole command.
+        let script = "#!/bin/sh\ncase \"$3\" in *'${'*) echo 'fish: Variables cannot be bracketed' >&2; exit 127;; esac\n\
+                      PATH=/fake/bin:/usr/bin\nGATE_GODOT_ROOT=/g/godot\nexport GATE_GODOT_ROOT\neval \"$3\"\n";
+        assert_eq!(
+            login_in("fish", script),
+            Ok(Login {
+                path: "/fake/bin:/usr/bin".to_owned(),
+                godot_root: Some("/g/godot".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_login_profile_that_sets_nounset_with_no_godot_root_still_gives_the_path() {
+        let login = login_after("nounset", "set -u\nunset GATE_GODOT_ROOT\nPATH=/fake/bin:/usr/bin");
+        assert_eq!(
+            login,
+            Ok(Login {
+                path: "/fake/bin:/usr/bin".to_owned(),
+                godot_root: None,
+            })
+        );
     }
 }

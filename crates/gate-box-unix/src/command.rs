@@ -17,13 +17,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use gate_args::is_godot_console;
 use gate_watchdog::{Config, CpuSource, Kill, Machine, Pump, Sample, SystemTimes, Ticks};
 use gate_wire::{BoxKill, adjusted_line, escaped, killed_line, started_line};
 
 use crate::console::{Forwarding, LineSink, Output, Stream};
 use crate::cpu::{GroupCpu, LoadTotals, host_cpu_load};
 use crate::files::{self, HeldLock};
-use crate::lines::{Along, CommandEnd, command_environment, round_trip, write_failure};
+use crate::lines::{Along, CommandEnd, Godot, command_environment, round_trip, write_failure};
 use crate::process::{EndedBy, Ending, Forward, GroupRecord, Halt, NotRan, Ran, Watch, is_still_there, run_watched};
 use crate::run::group_record;
 
@@ -50,6 +51,8 @@ pub struct Launch<'a> {
     pub login_path: Option<&'a str>,
     /// The run's own temp folder with a trailing `/`, the command's `TMPDIR`; `None` to keep the box's own.
     pub tmp: Option<&'a str>,
+    /// The run's Godot: the program a Godot console word starts ([`started_program`]) and the command's `GODOT_PATH`.
+    pub godot: Godot<'a>,
     /// The work lock, held: no record is written or removed once it is lost.
     pub lock: &'a HeldLock,
     /// The run's ceiling in whole seconds of load-adjusted time, `None` for none.
@@ -397,8 +400,27 @@ fn run_with<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>,
         on_started: Some(&started),
         on_leader_exit: Some(&leader_exited),
     };
-    let ran = run_watched(command_of(launch, program, rest), &watch);
+    let ran = match started_program(launch.godot, program) {
+        Ok(program) => run_watched(command_of(launch, program, rest), &watch),
+        Err(error) => Err(NotRan::Start(error)),
+    };
     ended(launch, &record, ran, &ceiling.verdict(), output)
+}
+
+/// The program the command's first word `word` starts for a run whose Godot is `godot`: for a Godot console word
+/// ([`is_godot_console`]) of a run with a chosen version, the install of that version and nothing else, failing to
+/// start as a program that is not there does when there is none, never looked for along the `PATH`; any other word,
+/// and every word of a run with no chosen version, as written.
+///
+/// # Errors
+///
+/// `ENOENT` for a Godot console word whose run's version has no install.
+fn started_program<'a>(godot: Godot<'a>, word: &'a str) -> io::Result<&'a str> {
+    match godot {
+        Godot::Installed(program) if is_godot_console(word) => Ok(program),
+        Godot::Missing if is_godot_console(word) => Err(io::Error::from_raw_os_error(libc::ENOENT)),
+        Godot::Unchosen | Godot::Installed(_) | Godot::Missing => Ok(word),
+    }
 }
 
 /// How the run's command, `launch`'s words, ended, having run as `ran`, its record `record` removed when the command
@@ -547,6 +569,7 @@ fn command_of(launch: &Launch<'_>, program: &str, rest: &[String]) -> Command {
     let along = Along {
         path: launch.login_path,
         tmp: launch.tmp,
+        godot: launch.godot,
     };
     let environment = command_environment(std::env::vars_os().collect(), along, launch.env, &run, launch.job);
     let mut command = Command::new(program);
@@ -639,7 +662,7 @@ mod tests {
     use crate::console::{Forwarding, HungUpSink, LineSink, Output, RecordingSink, Stream};
     use crate::files::{HeldLock, held_for_test};
     use crate::heartbeat;
-    use crate::lines::{CommandEnd, command_status};
+    use crate::lines::{CommandEnd, Godot, command_status};
     use crate::process::{EndedBy, Halt, NotRan, Ran, still_there_why};
 
     const NONCE: &str = "0123456789ab";
@@ -704,6 +727,7 @@ mod tests {
                 env: &[],
                 login_path: None,
                 tmp: None,
+                godot: Godot::Unchosen,
                 lock: &self.lock,
                 timeout: watched.timeout,
                 host: watched.host,

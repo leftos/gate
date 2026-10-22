@@ -23,10 +23,11 @@ use crate::files::{self, HeldLock, Locked};
 use crate::git::{self, AlternatesFailure, Failed, Git, GitClass, RunGit, Steps, Tree, failed_for, for_repo, line_ends_set, origin_set};
 use crate::heartbeat::{self, Periods};
 use crate::lines::{
-    Along, BACK_COMMITS_FAILED, CommandEnd, FAILED_STATUS, LAYOUT_CHANGING, Translation, USAGE_STATUS, back_commits_line, command_status,
-    layout_text, login_path_line, names_another_layout, recorded_group, rosetta_lines, signal_guard, translation, work_layout,
+    Along, BACK_COMMITS_FAILED, CommandEnd, FAILED_STATUS, Godot, LAYOUT_CHANGING, Login, Translation, USAGE_STATUS, back_commits_line,
+    command_status, layout_text, login_path_line, names_another_layout, recorded_group, rosetta_lines, signal_guard, translation, work_layout,
 };
 use crate::preflight::{checked_root, layout_record};
+use crate::probe;
 use crate::process::{self, GroupRecord};
 use crate::stop::{Record, own_group, record_current, records_folder};
 use crate::tools;
@@ -159,6 +160,8 @@ pub struct Request<'p> {
     pub identity: Vec<(String, String)>,
     /// The caller's variables for the command.
     pub env: Vec<(String, String)>,
+    /// The Godot version the run chose, `GodotVersion`; `None` for none.
+    pub godot: Option<&'p str>,
     /// The first thing the payload asks for that this builder does not build, in the order the payload is read.
     unbuilt: Option<Unbuilt>,
 }
@@ -166,9 +169,9 @@ pub struct Request<'p> {
 impl<'p> Request<'p> {
     /// Reads `payload` in the order the Windows box reads it, each key checked as it does; then notes the first key
     /// asking for what this builder does not build: `Outputs`, `OutputsFull`, `Desktop`, a warm-up's
-    /// `WarmCommands`, `GodotVersion`, `EngineEnv`, `UnrealVersion`, `InputsDigest`, `SentDigest` or `LfsDigest`; then,
-    /// last, the repos ([`repos`]), a sibling pair as `gate-wire` checks it. A work root holding a `:` is refused just
-    /// after the work folder is read ([`work_layout`]).
+    /// `WarmCommands`, `EngineEnv`, `UnrealVersion`, `InputsDigest`, `SentDigest` or `LfsDigest`; then, last, the
+    /// repos ([`repos`]), a sibling pair as `gate-wire` checks it. A work root holding a `:` is refused just after the
+    /// work folder is read ([`work_layout`]).
     ///
     /// # Errors
     ///
@@ -197,7 +200,7 @@ impl<'p> Request<'p> {
         let subfolder = payload.optional_text("Subfolder")?;
         let identity = payload.identity()?;
         let env = payload.caller_env()?;
-        let godot = payload.godot_version()?.is_some();
+        let godot = payload.godot_version()?;
         let engine_env = !payload.engine_env()?.is_empty();
         let unreal = payload.unreal_version()?.is_some();
         let inputs = payload.inputs_digest()?.is_some();
@@ -210,7 +213,6 @@ impl<'p> Request<'p> {
             (full, Refusal::Layout, "OutputsFull"),
             (desktop, Refusal::Desktop, "Desktop"),
             (warm, Refusal::Layout, "WarmCommands"),
-            (godot, Refusal::Layout, "GodotVersion"),
             (engine_env, Refusal::Layout, "EngineEnv"),
             (unreal, Refusal::Layout, "UnrealVersion"),
             (inputs, Refusal::Inputs, "InputsDigest"),
@@ -236,6 +238,7 @@ impl<'p> Request<'p> {
             subfolder,
             identity,
             env,
+            godot,
             unbuilt,
         })
     }
@@ -274,6 +277,9 @@ pub struct Ready<'p> {
     pub periods: Periods,
     /// The login shell's `PATH` the git steps ran along and the command runs along; `None` for the box's own.
     pub login_path: Option<String>,
+    /// The login shell's `GATE_GODOT_ROOT`, the folder of the builder's Godot installs; `None` when it is unset or
+    /// empty, or the login shell could not be read, so Godot is missing.
+    pub godot_root: Option<String>,
     /// The run's own temp folder, the command's `TMPDIR`, removed at the run's end ([`temp_removed`]); `None` when the
     /// caller's `Env` sets `TMPDIR`.
     pub temp: Option<RunTemp>,
@@ -418,8 +424,8 @@ fn temp_removed<S: LineSink>(temp: RunTemp, output: &Output<S>) {
     }
 }
 
-/// Where a run reads the login shell's `PATH` from: [`process::login_path`], or a test's own.
-pub type LoginPath = fn() -> Result<String, String>;
+/// Where a run reads the login shell's `PATH` and `GATE_GODOT_ROOT` from: [`process::login_shell`], or a test's own.
+pub type LoginShell = fn() -> Result<Login, String>;
 
 /// Readies the run of `payload` for its command, saying its lines through `output`: the payload read ([`Request::read`]),
 /// each failure one line and [`USAGE_STATUS`]; what this builder does not build refused with its tag and a line said
@@ -439,7 +445,7 @@ pub type LoginPath = fn() -> Result<String, String>;
 /// folder is removed ([`temp_removed`]). Each git step's process group is recorded in
 /// `<work>.pgid` under the run's job while it runs. The heartbeat starts once the subfolder is placed, before the layout
 /// and the checkout, beating every `periods.heartbeat` ([`heartbeat::start`]). The login shell's `PATH` is read from
-/// `login` just before the first git step, after every refusal said before it ([`login_path_read`]). No start marker
+/// `login` just before the first git step, after every refusal said before it ([`login_read`]). No start marker
 /// is said.
 ///
 /// # Errors
@@ -449,20 +455,24 @@ pub fn prepare<'p, S: LineSink + 'static>(
     payload: &'p Payload,
     output: &Arc<Output<S>>,
     periods: Periods,
-    login: LoginPath,
+    login: LoginShell,
 ) -> Result<Ready<'p>, u8> {
     prepared(payload, output, periods, login, heartbeat::start)
 }
 
-/// The login shell's `PATH` read from `login`, its empty and relative folders left out; `None`, with the box's own
-/// `PATH` kept and [`login_path_line`] said, when it cannot be read or holds no absolute folder.
-fn login_path_read<S: LineSink>(output: &Output<S>, login: LoginPath) -> Option<String> {
-    let read = login().and_then(|path| {
+/// The login shell's `PATH` and `GATE_GODOT_ROOT` read from `login`, the `PATH`'s empty and relative folders left out;
+/// `None`, with the box's own `PATH` kept, no Godot root and [`login_path_line`] said, when it cannot be read or its
+/// `PATH` holds no absolute folder.
+fn login_read<S: LineSink>(output: &Output<S>, login: LoginShell) -> Option<Login> {
+    let read = login().and_then(|Login { path, godot_root }| {
         let folders: Vec<&str> = path.split(':').filter(|folder| folder.starts_with('/')).collect();
         if folders.is_empty() {
             Err("said a PATH with no absolute folder".to_owned())
         } else {
-            Ok(folders.join(":"))
+            Ok(Login {
+                path: folders.join(":"),
+                godot_root,
+            })
         }
     });
     read.inspect_err(|why| {
@@ -521,17 +531,17 @@ impl Watches {
 
 /// Runs `payload`'s run, saying its lines through `output`, watched as `watches` says; the status the box exits with.
 ///
-/// The login shell's `PATH` is read once, by [`prepare`] ([`process::login_path`]); the git steps and the command run
-/// along it ([`run_along`]).
+/// The login shell's `PATH` is read once, by [`prepare`] ([`process::login_shell`]); the git steps and the command run
+/// along it ([`run_along`]), and a Godot run finds its install under the login shell's `GATE_GODOT_ROOT`.
 pub fn run<S: LineSink + 'static>(payload: &Payload, output: &Arc<Output<S>>, watches: Watches) -> u8 {
-    run_along(payload, output, watches, process::login_path)
+    run_along(payload, output, watches, process::login_shell)
 }
 
 /// [`run`], the login shell's `PATH` read from `login`, in the Windows box's order: the run readied ([`prepare`]), the
 /// heartbeat beating from the subfolder's check; the command run ([`run_command`]); the back commit made and pushed
 /// when the command reached an end of its own ([`synced_back`]); then the run's temp folder removed
 /// ([`temp_removed`]), the heartbeat stopped ([`heartbeat::stop`]), and the work lock let go.
-fn run_along<S: LineSink + 'static>(payload: &Payload, output: &Arc<Output<S>>, watches: Watches, login: LoginPath) -> u8 {
+fn run_along<S: LineSink + 'static>(payload: &Payload, output: &Arc<Output<S>>, watches: Watches, login: LoginShell) -> u8 {
     let ready = match prepare(payload, output, watches.periods, login) {
         Ok(ready) => ready,
         Err(status) => return status,
@@ -549,10 +559,24 @@ fn run_along<S: LineSink + 'static>(payload: &Payload, output: &Arc<Output<S>>, 
 }
 
 /// The status of the run `ready` once its command has run, sampled from `sampler`: the command's own
-/// ([`command_status`]), the back commit made only after an end of its own ([`of_its_own`]).
+/// ([`command_status`]), the back commit made only after an end of its own ([`of_its_own`]). A run with a chosen Godot
+/// version runs with the install of it under the login shell's `GATE_GODOT_ROOT` ([`probe::installed_godot`]), or with
+/// Godot missing when there is no root or no such install.
 fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, sampler: Sampler) -> u8 {
     let request = &ready.request;
     let login_path = ready.login_path.as_deref();
+    let installed;
+    let godot = match request.godot {
+        None => Godot::Unchosen,
+        Some(version) => {
+            installed = ready
+                .godot_root
+                .as_deref()
+                .and_then(|root| probe::installed_godot(root, version))
+                .map(|program| program.to_string_lossy().into_owned());
+            installed.as_deref().map_or(Godot::Missing, Godot::Installed)
+        }
+    };
     let launch = Launch {
         words: &request.command,
         place: &ready.place,
@@ -562,6 +586,7 @@ fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, 
         env: &request.env,
         login_path,
         tmp: ready.temp.as_ref().map(RunTemp::tmpdir),
+        godot,
         lock: &ready.lock,
         timeout: request.timeout,
         host: request.host,
@@ -623,7 +648,7 @@ fn prepared<'p, S: LineSink + 'static>(
     payload: &'p Payload,
     output: &Arc<Output<S>>,
     periods: Periods,
-    login: LoginPath,
+    login: LoginShell,
     start: StartBeat,
 ) -> Result<Ready<'p>, u8> {
     let request = Request::read(payload).map_err(|line| said(output, &[&line], USAGE_STATUS))?;
@@ -660,6 +685,7 @@ fn prepared<'p, S: LineSink + 'static>(
             place,
             pump,
             login_path,
+            godot_root,
             temp,
         }) => Ok(Ready {
             request,
@@ -668,6 +694,7 @@ fn prepared<'p, S: LineSink + 'static>(
             pump,
             periods,
             login_path,
+            godot_root,
             temp,
         }),
         // A refusal sends the PC to run the command itself; any other end, whatever its status, is a pair run's back
@@ -686,7 +713,8 @@ pub(crate) enum Unready {
 }
 
 /// [`prepared`] once the work lock `lock` of `request` is held: the place the command runs in, the heartbeat's pump,
-/// beating every `heartbeat` once started with `start`, the login shell's `PATH` read from `login`, and the run's temp
+/// beating every `heartbeat` once started with `start`, the login shell's `PATH` and `GATE_GODOT_ROOT` read from
+/// `login`, and the run's temp
 /// folder ([`temp_for`]), made after the checks and before the tool restore and removed when the restore ends the run;
 /// else how the run ends, refused or with a status, its lines said.
 fn locked<S: LineSink + 'static>(
@@ -694,7 +722,7 @@ fn locked<S: LineSink + 'static>(
     lock: &HeldLock,
     output: &Arc<Output<S>>,
     heartbeat: Duration,
-    (login, start): (LoginPath, StartBeat),
+    (login, start): (LoginShell, StartBeat),
 ) -> Result<Placed, Unready> {
     // Before the sweep, so a git an earlier run left running keeps its lock files.
     earlier_group_cleared(request).map_err(|not| not_laid_out(output, request, not))?;
@@ -704,7 +732,7 @@ fn locked<S: LineSink + 'static>(
     // earlier run's back ref goes, as the checkout's would, so the client finds none to fetch.
     let Some(place) = place_of(request.tree(), request.subfolder) else {
         said(output, &[&not_inside(request.subfolder)], USAGE_STATUS);
-        let login_path = login_path_read(output, login);
+        let login_path = login_read(output, login).map(|login| login.path);
         let git = run_git(request, lock, login_path.as_deref(), output);
         back_refs_cleared(&git, request).map_err(|failed| Unready::Ended(failure(output, &failed)))?;
         return Err(Unready::Ended(USAGE_STATUS));
@@ -721,7 +749,7 @@ fn locked<S: LineSink + 'static>(
         })
         .ok();
     let fresh = layout_checked(request).map_err(|not| not_laid_out(output, request, not))?;
-    let login_path = login_path_read(output, login);
+    let (login_path, godot_root) = login_read(output, login).map_or((None, None), |login| (Some(login.path), login.godot_root));
     let git = run_git(request, lock, login_path.as_deref(), output);
     laid_out(request, &git, &fresh).map_err(|not| not_laid_out(output, request, not))?;
     checked_out(request, &git).map_err(|failed| Unready::Ended(failure(output, &failed)))?;
@@ -737,6 +765,7 @@ fn locked<S: LineSink + 'static>(
     let along = Along {
         path: login_path.as_deref(),
         tmp: temp.as_ref().map(RunTemp::tmpdir),
+        godot: Godot::Unchosen,
     };
     if let Err(unready) = tools::update(request, &place, lock, along, output) {
         if let Some(temp) = temp {
@@ -748,16 +777,18 @@ fn locked<S: LineSink + 'static>(
         place,
         pump,
         login_path,
+        godot_root,
         temp,
     })
 }
 
-/// What [`locked`] readies for the command: its place, the heartbeat's pump, the login shell's `PATH` and the run's
-/// temp folder.
+/// What [`locked`] readies for the command: its place, the heartbeat's pump, the login shell's `PATH` and
+/// `GATE_GODOT_ROOT`, and the run's temp folder.
 struct Placed {
     place: PathBuf,
     pump: Option<Pump>,
     login_path: Option<String>,
+    godot_root: Option<String>,
     temp: Option<RunTemp>,
 }
 
@@ -1211,7 +1242,7 @@ mod tests {
 
     use gate_watchdog::Pump;
 
-    use super::{REFUSED_STATUS, Ready, Request, Watches, place_of, prepare, prepared, run_along, test_template};
+    use super::{REFUSED_STATUS, Ready, Request, Watches, login_read, place_of, prepare, prepared, run_along, test_template};
     use crate::command::{Launch, Sampler, run_command};
     use crate::console::{Console, Forwarding};
     use crate::console::{LineSink, Output, RecordingSink, Stream};
@@ -1219,7 +1250,8 @@ mod tests {
     use crate::git::test_program::{self, real_git};
     use crate::git::{GitClass, test_limit};
     use crate::heartbeat::{self, Periods};
-    use crate::lines::command_status;
+    use crate::lines::{Godot, Login, command_status, login_path_line};
+    use crate::probe::tests::fake_godot;
     use crate::stop::stop;
 
     const KEY: &str = "repo-0123abcd";
@@ -1492,6 +1524,7 @@ mod tests {
             env: &ready.request.env,
             login_path: None,
             tmp: None,
+            godot: Godot::Unchosen,
             lock: &ready.lock,
             timeout: None,
             host: "",
@@ -1666,16 +1699,17 @@ mod tests {
         );
     }
 
-    /// The box's own `PATH` as the login shell's, so a case starts no login shell.
-    fn own_path() -> Result<String, String> {
-        std::env::var("PATH").map_err(|error| error.to_string())
+    /// The box's own `PATH` as the login shell's, and no Godot root, so a case starts no login shell.
+    fn own_path() -> Result<Login, String> {
+        let path = std::env::var("PATH").map_err(|error| error.to_string())?;
+        Ok(Login { path, godot_root: None })
     }
 
     /// Whether [`counted_login`] was called.
     static LOGIN_READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     /// A login shell's `PATH` that cannot be read, noting that it was asked for.
-    fn counted_login() -> Result<String, String> {
+    fn counted_login() -> Result<Login, String> {
         LOGIN_READ.store(true, std::sync::atomic::Ordering::SeqCst);
         Err("the case's login shell".to_owned())
     }
@@ -1685,12 +1719,157 @@ mod tests {
     fn shim_after_add(case: &Case, after_add: &str) {
         let shim = case.base.with_file_name("git-shim");
         let script = format!(
-            "#!/bin/sh\n'{git}' \"$@\"\nstatus=$?\ncase \" $* \" in\n*\" add -A \"*) [ -n \"$GIT_INDEX_FILE\" ] && {{ {after_add}; }};;\nesac\nexit $status\n",
+            "#!/bin/sh\n'{git}' \"$@\"\nstatus=$?\ncase \" $* \" in\n\
+             *\" add -A \"*) [ -n \"$GIT_INDEX_FILE\" ] && {{ {after_add}; }};;\nesac\nexit $status\n",
             git = real_git().display()
         );
         fs::write(&shim, script).expect("the shim is written");
         fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("the shim is made runnable");
         test_program::set(&shim);
+    }
+
+    /// A login shell whose `GATE_GODOT_ROOT` is set but whose `PATH` holds no absolute folder.
+    #[expect(clippy::unnecessary_wraps, reason = "a run reads its login PATH through a `LoginShell`, which may fail")]
+    fn relative_login() -> Result<Login, String> {
+        Ok(Login {
+            path: "bin:".to_owned(),
+            godot_root: Some("/Users/b/godot".to_owned()),
+        })
+    }
+
+    #[test]
+    fn a_login_shell_that_cannot_be_read_keeps_the_box_s_path_and_gives_no_godot_root() {
+        let output = Output::new(RecordingSink::default());
+        let failed = || Err("the case's login shell".to_owned());
+        assert_eq!(login_read(&output, failed), None, "the box's own PATH and no root");
+        assert_eq!(
+            login_read(&output, relative_login),
+            None,
+            "a PATH that cannot be used drops the root with it"
+        );
+        assert_eq!(
+            err_of(&output),
+            [
+                login_path_line("the case's login shell"),
+                login_path_line("said a PATH with no absolute folder")
+            ]
+        );
+        let both = || {
+            Ok(Login {
+                path: "/usr/bin::bin".to_owned(),
+                godot_root: Some("/Users/b/godot".to_owned()),
+            })
+        };
+        assert_eq!(
+            login_read(&output, both),
+            Some(Login {
+                path: "/usr/bin".to_owned(),
+                godot_root: Some("/Users/b/godot".to_owned()),
+            })
+        );
+    }
+
+    thread_local! {
+        /// What [`godot_login`] gives this thread's runs as the login shell's.
+        static GODOT_LOGIN: std::cell::RefCell<Option<Login>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// The login shell this thread's case set ([`godot_login_set`]), else the box's own `PATH` and no Godot root.
+    fn godot_login() -> Result<Login, String> {
+        GODOT_LOGIN.with(|login| login.borrow().clone()).map_or_else(own_path, Ok)
+    }
+
+    /// Makes this thread's runs read `front` before the box's own `PATH`, and `root` as the Godot root.
+    fn godot_login_set(front: Option<&Path>, root: Option<&Path>) {
+        let own = std::env::var("PATH").expect("PATH is set");
+        let login = Login {
+            path: front.map_or_else(|| own.clone(), |front| format!("{}:{own}", front.display())),
+            godot_root: root.map(|root| root.display().to_string()),
+        };
+        GODOT_LOGIN.with(|cell| *cell.borrow_mut() = Some(login));
+    }
+
+    /// A case whose login shell's Godot root holds the install of 4.7.2 only, its program a script that says its words
+    /// and its `GODOT_PATH`, `|`-joined; the case and that program's path.
+    fn godot_case(name: &str) -> (Case, String) {
+        let case = Case::new(name);
+        let root = case.base.with_file_name("godot-root");
+        let program = fake_godot(&root, "4.7.2", "#!/bin/sh\nprintf '%s|%s\\n' \"$*\" \"${GODOT_PATH-unset}\"\n");
+        godot_login_set(None, Some(&root));
+        (case, program.display().to_string())
+    }
+
+    /// Runs `command` with the payload keys `extra` along [`godot_login`]; the status, the command's own lines on stdout
+    /// (the start marker left out) and the lines said on stderr.
+    fn godot_run(case: &Case, command: &[&str], extra: &Value) -> (u8, Vec<String>, Vec<String>) {
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let mut keys = json!({ "Command": command, "Identity": identity() });
+        if let (Some(keys), Some(extra)) = (keys.as_object_mut(), extra.as_object()) {
+            keys.extend(extra.clone());
+        }
+        let payload = decoded(&case.json(&commit, &keys));
+        let output = Arc::new(Output::new(RecordingSink::default()));
+        let status = run_along(&payload, &output, free_watches(), godot_login);
+        let out = output
+            .sink()
+            .lines()
+            .into_iter()
+            .filter(|(stream, line)| *stream == Stream::Out && *line != started_line(NONCE))
+            .map(|(_, line)| line)
+            .collect();
+        (status, out, err_of(&output))
+    }
+
+    /// A command that says its `GODOT_PATH`, or `unset`.
+    const SAYS_GODOT_PATH: [&str; 3] = ["/bin/sh", "-c", "printf '%s\\n' \"${GODOT_PATH-unset}\""];
+
+    #[test]
+    fn a_godot_word_of_a_run_with_a_version_runs_its_install_with_godot_path_naming_it() {
+        let (case, program) = godot_case("godot-installed");
+        let version = json!({ "GodotVersion": "4.7.2" });
+        let words = ["Godot_console", "--headless", "--path", "src/X", "--build-solutions", "--quit"];
+        let (status, out, err) = godot_run(&case, &words, &version);
+        assert_eq!(status, 0, "{err:?}");
+        assert_eq!(out, [format!("--headless --path src/X --build-solutions --quit|{program}")]);
+        let (status, out, err) = godot_run(&case, &SAYS_GODOT_PATH, &version);
+        assert_eq!((status, out), (0, vec![program]), "any other word runs as written: {err:?}");
+    }
+
+    #[test]
+    fn a_payload_env_setting_godot_path_is_refused() {
+        let (case, _) = godot_case("godot-path");
+        let theirs = json!({ "GodotVersion": "4.7.2", "Env": { "GODOT_PATH": "/theirs/godot" } });
+        let (status, out, err) = godot_run(&case, &SAYS_GODOT_PATH, &theirs);
+        assert_eq!((status, out), (2, vec![]), "the caller's is refused: {err:?}");
+        assert_eq!(err, ["gate: box payload Env sets GODOT_PATH, a machine path the builder keeps"]);
+    }
+
+    #[test]
+    fn a_godot_word_whose_version_has_no_install_fails_127_never_using_the_path() {
+        let (case, _) = godot_case("godot-missing");
+        // A Godot console word the login PATH holds, which the run must not fall back to.
+        let shims = case.base.with_file_name("path-godot");
+        fs::create_dir_all(&shims).expect("the PATH folder is made");
+        let on_path = shims.join("Godot_console");
+        fs::write(&on_path, "#!/bin/sh\necho from-path\n").expect("the PATH's Godot is written");
+        fs::set_permissions(&on_path, std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("it is made runnable");
+        godot_login_set(Some(&shims), Some(&case.base.with_file_name("godot-root")));
+        let words = ["Godot_console", "--quit"];
+        let (status, out, err) = godot_run(&case, &words, &json!({}));
+        assert_eq!(
+            (status, out),
+            (0, vec!["from-path".to_owned()]),
+            "no version runs the word as written: {err:?}"
+        );
+
+        let unstarted = "gate: remote could not start Godot_console: No such file or directory (os error 2)".to_owned();
+        let (status, out, err) = godot_run(&case, &words, &json!({ "GodotVersion": "4.8.0" }));
+        assert_eq!(status, 127, "{err:?}");
+        assert!(out.is_empty() && err.contains(&unstarted), "{out:?} {err:?}");
+        godot_login_set(Some(&shims), None);
+        let (status, out, err) = godot_run(&case, &words, &json!({ "GodotVersion": "4.7.2" }));
+        assert_eq!(status, 127, "no Godot root is Godot missing: {err:?}");
+        assert!(out.is_empty() && err.contains(&unstarted), "{out:?} {err:?}");
     }
 
     /// The lines `output` said on stderr.
@@ -2815,14 +2994,8 @@ mod tests {
     }
 
     #[test]
-    fn an_engine_version_or_engine_env_is_refused_layout_naming_the_key() {
+    fn an_unreal_version_or_engine_env_is_refused_layout_naming_the_key() {
         let case = Case::new("engines");
-        assert_refused(
-            &case,
-            &json!({ "GodotVersion": "4.3.0" }),
-            Refusal::Layout,
-            &unbuilt_layout("GodotVersion"),
-        );
         assert_refused(
             &case,
             &json!({ "UnrealVersion": "5.4.0" }),
@@ -3184,9 +3357,12 @@ mod tests {
     }
 
     /// The login shell's `PATH` this thread's case set ([`Case::dotnet_shim`]).
-    #[expect(clippy::unnecessary_wraps, reason = "a run reads its login PATH through a `LoginPath`, which may fail")]
-    fn shim_login() -> Result<String, String> {
-        Ok(SHIM_PATH.with(|path| path.borrow().clone()))
+    #[expect(clippy::unnecessary_wraps, reason = "a run reads its login PATH through a `LoginShell`, which may fail")]
+    fn shim_login() -> Result<Login, String> {
+        Ok(Login {
+            path: SHIM_PATH.with(|path| path.borrow().clone()),
+            godot_root: None,
+        })
     }
 
     /// Writes `script` at `path`, runnable.
@@ -3402,7 +3578,7 @@ mod tests {
         let log = case.dotnet_shim(&format!(": > '{}'\nsleep 600", started.display()));
         let commit = case.snapshot(&[(MANIFEST_PATH, MANIFEST)]);
         let json = case.json(&commit, &json!({}));
-        let (path, run_json) = (shim_login().expect("the shim's PATH is set"), json.clone());
+        let (path, run_json) = (shim_login().expect("the shim's PATH is set").path, json.clone());
         let (sent, got) = mpsc::channel();
         thread::spawn(move || {
             SHIM_PATH.with(|cell| *cell.borrow_mut() = path);

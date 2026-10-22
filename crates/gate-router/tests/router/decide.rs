@@ -3211,6 +3211,29 @@ fn snapshot_asks(facts: &FakeFacts) -> Vec<String> {
 }
 
 #[test]
+fn a_godot_console_command_spelled_by_its_windows_path_picks_a_macos_builder_as_godot_console() {
+    let command = words(&[
+        r"F:\Godot\Godot_console.exe",
+        "--headless",
+        "--path",
+        "src/X",
+        "--build-solutions",
+        "--quit",
+    ]);
+    let facts = mac_facts("", r#"{"yaat": ["*Godot_console*"]}"#, r#"["*Godot_console*"]"#, &[]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "mac-1");
+    assert_eq!(
+        run.words[..6],
+        words(&["Godot_console", "--headless", "--path", "src/X", "--build-solutions", "--quit"]),
+        "{:?}",
+        run.words
+    );
+    assert!(run.words.iter().all(|word| !word.contains('\\')), "no backslash is left: {:?}", run.words);
+    assert_eq!(run.fallback, command, "the fallback runs here as given");
+}
+
+#[test]
 fn a_macos_pick_writes_a_relative_backslash_path_the_snapshot_carries_with_slashes() {
     let command = words(&["dotnet", "build", r"src\Duel.sln"]);
     let facts = mac_facts("", r#"{"yaat": ["dotnet *"]}"#, r#"["dotnet *"]"#, &["src/Duel.sln"]);

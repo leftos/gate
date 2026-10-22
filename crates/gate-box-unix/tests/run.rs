@@ -30,6 +30,8 @@ mod unix {
     const KEY: &str = "repo-0123abcd";
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
     const SAMPLER_FAILED: &str = "gate: sampler failed: ";
+    /// The program of a Godot install, inside its version's folder, where the box runs it from.
+    const GODOT_PROGRAM: &str = "Godot.app/Contents/MacOS/Godot";
 
     /// Runs git with `args`; its standard output, trimmed, and whether it exited 0.
     fn git_said(args: &[&str]) -> (String, bool) {
@@ -548,6 +550,32 @@ mod unix {
         );
         assert_eq!(ended.out, [started_line(NONCE)], "{:?}", ended.err);
         assert!(Path::new(&format!("{}.tools", case.work())).exists(), "the tools record is written");
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_godot_console_command_with_a_version_runs_the_install_under_the_login_shell_s_godot_root() {
+        let case = Case::new("godot");
+        let root = case.base.join("godot root");
+        let program = root.join("4.7.2").join(GODOT_PROGRAM);
+        fs::create_dir_all(program.parent().expect("the program has a folder")).expect("the install is made");
+        runnable(&program, "#!/bin/sh\nprintf '%s|%s\\n' \"$*\" \"$GODOT_PATH\"\n");
+        // The login shell the box reads its PATH and Godot root from exports the root, then runs as `sh`.
+        let shell = case.base.join("login-shell");
+        runnable(
+            &shell,
+            &format!(
+                "#!/bin/sh\nGATE_GODOT_ROOT='{}'\nexport GATE_GODOT_ROOT\nshift\nexec /bin/sh \"$@\"\n",
+                root.display()
+            ),
+        );
+        let commit = case.snapshot();
+        let command = json!(["Godot_console", "--headless", "--path", "src/X", "--build-solutions", "--quit"]);
+        let request = case.request(&commit, &json!({ "Command": command, "GodotVersion": "4.7.2" }));
+        let ended = ran_in(&[], &request, Reading::All, &case.base.join("beaten"), Some(&shell));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        let said = format!("--headless --path src/X --build-solutions --quit|{}", program.display());
+        assert_eq!(ended.out, [started_line(NONCE), said], "{:?}", ended.err);
         case.ended_clean();
     }
 }
