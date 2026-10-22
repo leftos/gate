@@ -252,6 +252,7 @@ version = "0.1.0"
 dependencies = [
  "gate-router",
  "gate-wire",
+ "regex",
  "serde_json",
  "sha2",
  "tar",

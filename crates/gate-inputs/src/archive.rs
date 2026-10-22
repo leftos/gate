@@ -710,7 +710,7 @@ fn member_refused(reason: String) -> UnpackError {
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test that cannot make its archives must fail loudly")]
-mod tests {
+pub(crate) mod tests {
     use std::io::{self, Read, Write};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -724,10 +724,10 @@ mod tests {
     use crate::names::is_device;
 
     /// The byte limit the cases read under, far above what any of them holds.
-    const LIMIT: u64 = 1 << 30;
+    pub(crate) const LIMIT: u64 = 1 << 30;
 
     /// The limits of `bytes` bytes and the archive's own file limit.
-    fn within(bytes: u64) -> Limits {
+    pub(crate) fn within(bytes: u64) -> Limits {
         Limits { bytes, files: MEMBER_LIMIT }
     }
 
@@ -750,18 +750,21 @@ mod tests {
         }
     }
 
-    /// A [`Place`] in memory: each member's path and bytes, and each copy's path and where its bytes are.
+    /// A [`Place`] in memory: each member's path and bytes, each member's path and last write, and each copy's path and
+    /// where its bytes are; the pack's own cases read their archives back through it too.
     #[derive(Default)]
-    struct Memory {
-        members: Vec<(String, Vec<u8>)>,
-        copies: Vec<(String, String)>,
+    pub(crate) struct Memory {
+        pub(crate) members: Vec<(String, Vec<u8>)>,
+        pub(crate) written: Vec<(String, SystemTime)>,
+        pub(crate) copies: Vec<(String, String)>,
     }
 
     impl Place for Memory {
-        fn member(&mut self, path: &str, _modified: SystemTime, data: &mut dyn Read) -> Result<(), UnpackError> {
+        fn member(&mut self, path: &str, modified: SystemTime, data: &mut dyn Read) -> Result<(), UnpackError> {
             let mut bytes = Vec::new();
             data.read_to_end(&mut bytes)?;
             self.members.push((path.to_owned(), bytes));
+            self.written.push((path.to_owned(), modified));
             Ok(())
         }
 
@@ -807,7 +810,7 @@ mod tests {
         assert_eq!(error.to_string(), reason);
     }
 
-    fn entry(path: &str, data: &[u8]) -> Entry {
+    pub(crate) fn entry(path: &str, data: &[u8]) -> Entry {
         let (sha256, size) = sha256_of(data).expect("bytes hash");
         Entry {
             path: path.to_owned(),

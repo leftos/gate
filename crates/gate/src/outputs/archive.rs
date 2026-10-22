@@ -1,10 +1,11 @@
 //! The archive a run's outputs travel in: a tar stream compressed with zstd, named `.tar.zst`. Each file is read once,
 //! hashed with SHA-256 as it is packed, and the list of every path brought back (path, size, SHA-256) follows the files
-//! as the last member, [`LIST_NAME`]. A path whose content an earlier member or a file the PC holds already has is
-//! listed as a copy and not packed. The reader, its limits and its refusals are [`gate_inputs::archive`]'s, which both
-//! boxes share; this module packs, and writes what the reader hands it on Windows: each member while it is hashed, then
-//! each copy from its member or the PC's file, hashing it as it is written. Writer and reader stream: what either holds
-//! in memory does not grow with a file's size.
+//! as the last member, [`LIST_NAME`](gate_inputs::archive::LIST_NAME). A path whose content an earlier member or a file the PC holds already has is
+//! listed as a copy and not packed. The writer is [`gate_inputs::pack`]'s, and the reader, its limits and its refusals
+//! are [`gate_inputs::archive`]'s, which both boxes share; this module opens each file the pack takes on Windows and
+//! hands it to the writer, and writes what the reader hands it on Windows: each member while it is hashed, then each
+//! copy from its member or the PC's file, hashing it as it is written. Writer and reader stream: what either holds in
+//! memory does not grow with a file's size.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -17,26 +18,18 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gate_inputs::archive::{
-    CopyFrom, FolderBudget, Item, Limits, MEMBER_LIMIT, Place, WINDOW_LOG_MAX, check_name, copy_mismatch, extract, held_size, list_json, no_pc_file,
-    outside_destination, refused, stopped,
+    CopyFrom, FolderBudget, Item, Limits, MEMBER_LIMIT, Place, copy_mismatch, extract, held_size, no_pc_file, outside_destination, refused, stopped,
 };
-use tar::{EntryType, Header};
+use gate_inputs::pack::{Packed, Packer, window_log};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
 };
 
-pub(crate) use gate_inputs::archive::{Entry, LIST_NAME, UnpackError, sent_limit};
+pub(crate) use gate_inputs::archive::{Entry, UnpackError, sent_limit};
 
 use crate::outputs::hash::Hashing;
 use crate::outputs::manifest::{Chosen, HeldBy, Manifest};
 use crate::outputs::walk::{Found, in_context, stamp_of};
-
-/// The zstd level the archive is compressed at: zstd's default, which keeps pace with a gigabit link. The writer adds
-/// long-distance matching over a window sized to the archive's files ([`window_log`]), which finds a repeat that far
-/// back in the stream.
-const LEVEL: i32 = 3;
-/// The smallest zstd window the writer compresses with, as a power of two: 1 MiB.
-const WINDOW_LOG_MIN: u32 = 20;
 
 /// The PC's own files a copy may be made from: the worktree root, and the manifest of the files below it that the PC
 /// sent the box, each path holding a copy's SHA-256 tried in turn; and `go_on`, asked before each copy is made and
@@ -45,13 +38,6 @@ pub(crate) struct PcFiles<'a> {
     pub root: &'a Path,
     pub manifest: &'a Manifest,
     pub go_on: &'a dyn Fn() -> bool,
-}
-
-/// What a pack wrote: its entries in order, and the archive's size, compressed.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Packed {
-    pub entries: Vec<Entry>,
-    pub compressed: u64,
 }
 
 /// Packs `files` into `sink` as a `.tar.zst` stream, in their order, over a zstd window sized to their bytes
@@ -75,17 +61,11 @@ pub(crate) fn pack(sink: impl Write, root: &Path, files: &[Chosen<'_>], held: &H
     for chosen in files {
         let known = |sha256: &str| sent.get(sha256).copied().or_else(|| held_size(held, sha256));
         pack_one(&mut packer, &root, chosen, known).map_err(|error| in_context(&chosen.file.full, &error))?;
-        if let Some(Item { entry, copy: None }) = packer.entries.last() {
+        if let Some(Item { entry, copy: None }) = packer.items().last() {
             sent.entry(entry.sha256.clone()).or_insert(entry.size);
         }
     }
     packer.finish()
-}
-
-/// The zstd window, as a power of two, for an archive of files of `total` bytes: the smallest that holds them, within
-/// [`WINDOW_LOG_MIN`] and [`WINDOW_LOG_MAX`].
-fn window_log(total: u64) -> u32 {
-    total.saturating_sub(1).bit_width().clamp(WINDOW_LOG_MIN, WINDOW_LOG_MAX)
 }
 
 /// Packs `chosen`, found below the final path `root`, as [`pack`] does: a copy when it was hashed before the pack, it
@@ -412,101 +392,6 @@ pub(crate) fn check_folder(folder: &Path) -> io::Result<()> {
     }
 }
 
-/// A writer that counts the bytes written through it.
-struct Counting<W> {
-    inner: W,
-    count: u64,
-}
-
-impl<W: Write> Write for Counting<W> {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let written = self.inner.write(buffer)?;
-        self.count += written as u64;
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-/// An archive being written: the tar stream over the zstd encoder over the sink, and the items listed so far.
-struct Packer<W: Write> {
-    tar: tar::Builder<zstd::stream::write::Encoder<'static, Counting<W>>>,
-    entries: Vec<Item>,
-}
-
-impl<W: Write> Packer<W> {
-    /// An archive written to `sink`, compressed over a window of `2^window_log` bytes.
-    fn new(sink: W, window_log: u32) -> io::Result<Packer<W>> {
-        let mut encoder = zstd::stream::write::Encoder::new(Counting { inner: sink, count: 0 }, LEVEL)?;
-        encoder.long_distance_matching(true)?;
-        encoder.window_log(window_log)?;
-        Ok(Packer {
-            tar: tar::Builder::new(encoder),
-            entries: Vec::new(),
-        })
-    }
-
-    /// Packs the `size` bytes of `data` as the file `path`, last written `modified` (seconds since 1970), hashing them
-    /// as they pass. Data that ends before `size` bytes fails the pack; bytes past it are left unread.
-    fn add(&mut self, path: &str, size: u64, modified: u64, data: impl Read) -> io::Result<()> {
-        check_name(path)?;
-        let mut hashing = Hashing::new(data.take(size));
-        self.tar.append_data(&mut file_header(size, modified), path, &mut hashing)?;
-        let (sha256, count) = hashing.finish();
-        if count != size {
-            return Err(refused(format!(
-                "{path} changed while it was packed: {count} of its {size} bytes were read"
-            )));
-        }
-        let path = path.to_owned();
-        self.entries.push(Item {
-            entry: Entry { path, size, sha256 },
-            copy: None,
-        });
-        Ok(())
-    }
-
-    /// Lists the file `path`, last written `modified` (seconds since 1970), as a copy of the `size` bytes with SHA-256
-    /// `sha256` that an earlier member or a file the PC holds has, none of its bytes packed.
-    fn copy(&mut self, path: &str, size: u64, modified: u64, sha256: &str) -> io::Result<()> {
-        check_name(path)?;
-        self.entries.push(Item {
-            entry: Entry {
-                path: path.to_owned(),
-                size,
-                sha256: sha256.to_owned(),
-            },
-            copy: Some(modified),
-        });
-        Ok(())
-    }
-
-    /// Packs the list, ends the tar and zstd streams and flushes the sink.
-    fn finish(mut self) -> io::Result<Packed> {
-        let list = list_json(&self.entries);
-        let mut header = file_header(list.len() as u64, 0);
-        self.tar.append_data(&mut header, LIST_NAME, list.as_bytes())?;
-        let mut sink = self.tar.into_inner()?.finish()?;
-        sink.flush()?;
-        Ok(Packed {
-            entries: self.entries.into_iter().map(|item| item.entry).collect(),
-            compressed: sink.count,
-        })
-    }
-}
-
-/// The header of a plain file of `size` bytes last written `modified`, its path still to be set.
-fn file_header(size: u64, modified: u64) -> Header {
-    let mut header = Header::new_gnu();
-    header.set_entry_type(EntryType::Regular);
-    header.set_size(size);
-    header.set_mode(0o644);
-    header.set_mtime(modified);
-    header
-}
-
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test that cannot make its files or archives must fail loudly")]
 mod tests {
@@ -515,7 +400,6 @@ mod tests {
     use std::io::{self, Read, Write};
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
-    use std::rc::Rc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use tar::{EntryType, Header};
@@ -531,7 +415,6 @@ mod tests {
     use crate::outputs::manifest::{Chosen, Held, HeldBy, Manifest};
     use crate::outputs::walk::{Found, Stamp, walk};
     use crate::test_support::junction;
-    use gate_router::escaped;
 
     /// The byte limit the cases unpack under, far above what any of them holds.
     const LIMIT: u64 = 1 << 30;
@@ -712,21 +595,6 @@ mod tests {
             assert_eq!(modified, written, "{path}");
         }
         assert_eq!(files_below(&destination).len(), files.len(), "the list is not extracted");
-    }
-
-    #[test]
-    fn a_file_named_as_the_list_is_not_packed() {
-        let mut packer = Packer::new(io::sink(), WINDOW_LOG_MAX).expect("a packer");
-        let error = packer.add(".GATE-outputs.json", 1, 0, &b"x"[..]).expect_err("the list's name is refused");
-        assert_eq!(error.to_string(), "the output .GATE-outputs.json has the name of the archive's own list");
-        assert!(packer.add("bin/.gate-outputs.json", 1, 0, &b"x"[..]).is_ok(), "only at the root");
-    }
-
-    #[test]
-    fn a_file_that_ends_before_its_size_fails_the_pack() {
-        let mut packer = Packer::new(io::sink(), WINDOW_LOG_MAX).expect("a packer");
-        let error = packer.add("bin/a.dll", 5, 0, &b"abc"[..]).expect_err("a short file is refused");
-        assert_eq!(error.to_string(), "bin/a.dll changed while it was packed: 3 of its 5 bytes were read");
     }
 
     #[test]
@@ -1493,26 +1361,6 @@ mod tests {
     }
 
     #[test]
-    fn pack_refuses_a_name_the_reader_would_refuse() {
-        let deep = vec!["a"; 65].join("/");
-        for name in [
-            "bin/x~1.log",
-            "bin/a\u{202e}b.dll",
-            "bin/x.dll.",
-            ".git/config",
-            "bin/COM0",
-            deep.as_str(),
-        ] {
-            let mut packer = Packer::new(io::sink(), WINDOW_LOG_MAX).expect("a packer");
-            let error = packer.add(name, 1, 0, &b"x"[..]).expect_err(name);
-            assert_eq!(
-                error.to_string(),
-                format!("the output '{}' has a name the outputs archive's reader refuses", escaped(name))
-            );
-        }
-    }
-
-    #[test]
     fn unpack_refuses_a_junction_in_its_path() {
         let destination = scratch("junction");
         let outside = scratch("junction-outside");
@@ -1618,127 +1466,5 @@ mod tests {
         let error = pack(io::sink(), &root, &chosen, &HeldBy::new()).expect_err("a file outside the work folder is refused");
 
         assert!(error.to_string().ends_with("bin/a.dll resolves outside the work folder"), "{error}");
-    }
-
-    /// Pseudo-random bytes, so zstd cannot shrink them, `left` more of them, counting each one given in `given`.
-    struct Generated {
-        left: u64,
-        state: u64,
-        given: Rc<Cell<u64>>,
-    }
-
-    impl Generated {
-        fn new(size: u64, given: Rc<Cell<u64>>) -> Generated {
-            Generated {
-                left: size,
-                state: 0x9E37_79B9_7F4A_7C15,
-                given,
-            }
-        }
-    }
-
-    impl Read for Generated {
-        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-            let count = usize::try_from(self.left).map_or(buffer.len(), |left| left.min(buffer.len()));
-            for chunk in buffer[..count].chunks_mut(8) {
-                self.state ^= self.state << 13;
-                self.state ^= self.state >> 7;
-                self.state ^= self.state << 17;
-                chunk.copy_from_slice(&self.state.to_le_bytes()[..chunk.len()]);
-            }
-            self.left -= count as u64;
-            self.given.set(self.given.get() + count as u64);
-            Ok(count)
-        }
-    }
-
-    /// A reader counting the bytes read through it in `taken`.
-    struct Taking<R> {
-        inner: R,
-        taken: Rc<Cell<u64>>,
-    }
-
-    impl<R: Read> Read for Taking<R> {
-        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-            let read = self.inner.read(buffer)?;
-            self.taken.set(self.taken.get() + read as u64);
-            Ok(read)
-        }
-    }
-
-    /// A sink noting, at each write, how many bytes its source gave since the last write: the widest such gap is the
-    /// most the stream between them held back.
-    struct Watching {
-        given: Rc<Cell<u64>>,
-        at_last_write: u64,
-        widest: Rc<Cell<u64>>,
-    }
-
-    impl Write for Watching {
-        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            let now = self.given.get();
-            self.widest.set(self.widest.get().max(now - self.at_last_write));
-            self.at_last_write = now;
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// The size streamed through the flat-memory cases.
-    const LARGE: u64 = 256 * 1024 * 1024;
-    /// The most a stream may hold back between its source and its sink: a sixteenth of [`LARGE`]. A writer or reader
-    /// that held a whole file would hold back all of it.
-    const HELD_BACK: u64 = 16 * 1024 * 1024;
-
-    #[test]
-    fn the_writer_holds_back_a_bounded_part_of_a_large_file_whatever_its_size() {
-        let given = Rc::new(Cell::new(0));
-        let widest = Rc::new(Cell::new(0));
-        let sink = Watching {
-            given: Rc::clone(&given),
-            at_last_write: 0,
-            widest: Rc::clone(&widest),
-        };
-        let mut packer = Packer::new(sink, WINDOW_LOG_MAX).expect("a packer");
-        packer
-            .add("bin/large.bin", LARGE, 0, Generated::new(LARGE, Rc::clone(&given)))
-            .expect("the file packs");
-        let packed = packer.finish().expect("the archive ends");
-        assert_eq!(given.get(), LARGE);
-        assert_eq!(packed.entries.len(), 1);
-        assert!(packed.compressed > LARGE / 2, "random bytes do not shrink: {}", packed.compressed);
-        assert!(widest.get() <= HELD_BACK, "the writer held back {} bytes", widest.get());
-    }
-
-    #[test]
-    fn the_reader_holds_back_a_bounded_part_of_a_large_member_whatever_its_size() {
-        let (pipe_reader, pipe_writer) = io::pipe().expect("a pipe");
-        let writer = std::thread::spawn(move || {
-            let mut packer = Packer::new(pipe_writer, WINDOW_LOG_MAX)?;
-            packer.add("bin/large.bin", LARGE, 0, Generated::new(LARGE, Rc::new(Cell::new(0))))?;
-            packer.finish()
-        });
-        let taken = Rc::new(Cell::new(0));
-        let widest = Rc::new(Cell::new(0));
-        let source = Taking {
-            inner: pipe_reader,
-            taken: Rc::clone(&taken),
-        };
-        let read = read_members(source, LIMIT, MEMBER_LIMIT, &HeldBy::new(), |_, _, data| {
-            let mut sink = Watching {
-                given: Rc::clone(&taken),
-                at_last_write: taken.get(),
-                widest: Rc::clone(&widest),
-            };
-            io::copy(data, &mut sink).map(|_| ()).map_err(UnpackError::from)
-        });
-        let packed = writer.join().expect("the writer ends").expect("the archive packs");
-        let read: Vec<Entry> = read.expect("the archive extracts").into_iter().map(|item| item.entry).collect();
-        assert_eq!(read, packed.entries);
-        assert!(taken.get() > LARGE / 2, "random bytes do not shrink: {}", taken.get());
-        assert!(widest.get() <= HELD_BACK, "the reader held back {} bytes", widest.get());
     }
 }

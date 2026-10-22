@@ -2,7 +2,9 @@
 //! `Get-OutputFile` lists them: an excluded folder is not entered, and a link or a junction, to a file or to a folder,
 //! is neither followed nor listed. A file whose name does not fit the outputs archive, or is not Unicode, is not listed,
 //! nor is a folder whose name is not plain or not Unicode entered; the box's pack also notes each such file the globs
-//! would otherwise select, a folder's read through a verbatim path, to say it is skipped.
+//! would otherwise select, a folder's read through a verbatim path, to say it is skipped. What a walk finds, the list a
+//! found file goes on and the relative path of an entry are [`gate_inputs::walk`]'s; of those, only `Found` is
+//! re-exported here.
 
 use std::ffi::OsStr;
 use std::fs::{self, DirEntry, Metadata};
@@ -10,11 +12,13 @@ use std::io;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf, Prefix};
 
+use gate_inputs::walk::{Walked, relative_path};
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT};
 
 use crate::outputs::glob::Globs;
 
 pub(crate) use gate_inputs::manifest::Stamp;
+pub(crate) use gate_inputs::walk::Found;
 
 /// The stamp `metadata` holds: a file's length and its last write as a Windows file time, whether the metadata came
 /// from the folder listing the walk reads ([`DirEntry::metadata`]) or from an open file's handle.
@@ -22,36 +26,6 @@ pub(crate) fn stamp_of(metadata: &Metadata) -> Stamp {
     Stamp {
         size: metadata.file_size(),
         modified: metadata.last_write_time(),
-    }
-}
-
-/// A file the walk found: its path relative to the walk's root, `/`-separated, its full path and its stamp.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Found {
-    pub path: String,
-    pub full: PathBuf,
-    pub stamp: Stamp,
-}
-
-/// What a walk found below a folder: the files its globs match, and the files they would match but for a name that is
-/// not plain ([`Globs::refuses_name`]), each ordered by relative path.
-#[derive(Debug, Default)]
-pub(crate) struct Walked {
-    pub found: Vec<Found>,
-    pub refused: Vec<Found>,
-}
-
-impl Walked {
-    /// The list the file at the relative `path` goes on under `globs`; `None` when it goes on neither. An `unfit` file,
-    /// below a folder read only to count or with a name that is not Unicode, goes on `refused` when the globs select it.
-    fn list_for(&mut self, globs: &Globs, path: &str, unfit: bool) -> Option<&mut Vec<Found>> {
-        if unfit {
-            globs.selects(path).then_some(&mut self.refused)
-        } else if globs.matches(path) {
-            Some(&mut self.found)
-        } else {
-            globs.refuses_name(path).then_some(&mut self.refused)
-        }
     }
 }
 
@@ -164,17 +138,6 @@ impl Walker<'_> {
                 counting: true,
             });
         }
-    }
-}
-
-/// The path of the entry `name` of the folder at the relative path `folder`, `/`-separated; a name that is not Unicode
-/// is read lossily.
-fn relative_path(folder: &str, name: &OsStr) -> String {
-    let name = name.to_string_lossy();
-    if folder.is_empty() {
-        name.into_owned()
-    } else {
-        format!("{folder}/{name}")
     }
 }
 
