@@ -6,8 +6,8 @@ use jiff::Timestamp;
 use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 
 use super::{
-    DRAIN_WAIT_MS, Departure, ERROR_MORE_DATA, JOBOBJECT_BASIC_PROCESS_ID_LIST, Job, Joined, Member, Message, Missed, Opened, Remembered, Settled,
-    Unread, Until, drain_loop, holds, kept, listed_ids, member, open_any, remembered_as, settled, trouble,
+    DRAIN_WAIT_MS, Departure, ERROR_MORE_DATA, JOBOBJECT_BASIC_PROCESS_ID_LIST, Job, JobEvent, Joined, Member, Message, Missed, Opened, Remembered,
+    Settled, Unread, Until, drain_loop, holds, kept, listed_ids, member, open_any, remembered_as, settled, trouble,
 };
 use crate::{EnvironmentBlock, Launch, LaunchOutput, Running, Suspended, start_and_exit_of, system_directory, timestamp_of};
 
@@ -110,7 +110,7 @@ fn ticks(second: u32) -> u64 {
 #[test]
 fn the_job_remembers_a_member_that_started_and_ended_before_the_job_was_listed() {
     let mut job = Job::anonymous_kill_on_close().expect("the job is created");
-    job.remember().expect("the job remembers");
+    job.remember(None).expect("the job remembers");
     let ended = started(&job, "exit 0");
     assert_eq!(ended.wait(HANG_GUARD).expect("the wait answers"), Some(0), "the member ended");
 
@@ -131,7 +131,7 @@ fn the_job_remembers_a_member_that_started_and_ended_before_the_job_was_listed()
 fn a_member_that_ended_before_any_look_keeps_its_exact_window_and_no_handle() {
     // As after a sampler failure: nothing reads the memory until the member has ended.
     let mut job = Job::anonymous_kill_on_close().expect("the job is created");
-    job.remember().expect("the job remembers");
+    job.remember(None).expect("the job remembers");
     let created = suspended("exit 0");
     created.assign(&job).expect("the member is put in the job");
     let pid = created.pid();
@@ -159,7 +159,7 @@ fn a_member_put_in_the_job_after_its_start_can_have_started_a_process_only_since
     // The job's clock is coarser than a process's start: the pause keeps the two apart.
     std::thread::sleep(Duration::from_millis(50));
     let mut job = Job::anonymous_kill_on_close().expect("the job is created");
-    job.remember().expect("the job remembers");
+    job.remember(None).expect("the job remembers");
     created.assign(&job).expect("the member is put in the job");
     let pid = created.pid();
     wait_until("the job remembers the member", || job.remembers(pid));
@@ -306,7 +306,7 @@ fn an_exit_message_closes_the_handle_of_that_member_alone() {
 fn a_running_member_is_traced_by_its_line_and_image_and_once_ended_only_with_its_last_times() {
     const MARKER: &str = "GATE_JOB_TRACE_MARKER";
     let mut job = Job::anonymous_kill_on_close().expect("the job is created");
-    job.remember().expect("the job remembers");
+    job.remember(None).expect("the job remembers");
     let member = started(&job, &format!("ping -n 600 127.0.0.1 >nul & rem {MARKER}"));
     let marked = |job: &Job| job.traced().into_iter().filter(|traced| traced.cmd.contains(MARKER)).collect::<Vec<_>>();
 
@@ -334,7 +334,7 @@ fn a_running_member_is_traced_by_its_line_and_image_and_once_ended_only_with_its
 fn a_burst_of_short_members_is_remembered_whole_while_they_are_named_apart() {
     const CHILDREN: u32 = 40;
     let mut job = Job::anonymous_kill_on_close().expect("the job is created");
-    job.remember().expect("the job remembers");
+    job.remember(None).expect("the job remembers");
     // Each child waits on stdin, a pipe whose write end the test holds, so none is gone before the drain thread opens it.
     let mut parent = suspended(&format!("for /L %i in (1,1,{CHILDREN}) do @start /b cmd /d /c set /p line="));
     let release = parent.take_pipes().expect("a piped launch has pipes");
@@ -358,7 +358,7 @@ fn a_burst_of_short_members_is_remembered_whole_while_they_are_named_apart() {
 #[test]
 fn a_member_reported_twice_is_remembered_once_and_nothing_of_a_forgotten_one_is_kept() {
     let mut job = Job::anonymous_kill_on_close().expect("the job is created");
-    job.remember().expect("the job remembers");
+    job.remember(None).expect("the job remembers");
     let shared = Arc::clone(&job.memory.as_ref().expect("the job remembers").shared);
     shared.lock().add(ended_member(7, 1, 4), Joined::default());
     shared.lock().add(ended_member(7, 1, 4), Joined::default());
@@ -453,7 +453,7 @@ fn the_members_a_memory_could_not_read_are_named_up_to_a_few_and_counted_after()
 #[test]
 fn dropping_a_remembering_job_ends_its_drain_thread_and_releases_what_it_shares() {
     let mut job = Job::anonymous_kill_on_close().expect("the job is created");
-    job.remember().expect("the job remembers");
+    job.remember(None).expect("the job remembers");
     let ended = started(&job, "exit 0");
     assert_eq!(ended.wait(HANG_GUARD).expect("the wait answers"), Some(0), "the member ended");
     wait_until("the job remembers the member", || job.remembers(ended.pid()));
@@ -469,6 +469,173 @@ fn dropping_a_remembering_job_ends_its_drain_thread_and_releases_what_it_shares(
     assert!(
         shared.upgrade().is_none(),
         "the thread has ended: the port, the job's copy and the members are released"
+    );
+}
+
+/// A job that remembers, telling its events to the receiver returned with it.
+fn telling_job() -> (Job, mpsc::Receiver<JobEvent>) {
+    let mut job = Job::anonymous_kill_on_close().expect("the job is created");
+    let (sink, events) = mpsc::channel();
+    job.remember(Some(sink)).expect("the job remembers");
+    (job, events)
+}
+
+/// Every event `events` holds until its sender is dropped, failing at the hang guard.
+fn all_events(events: &mpsc::Receiver<JobEvent>) -> Vec<JobEvent> {
+    let mut all = Vec::new();
+    loop {
+        match events.recv_timeout(HANG_GUARD) {
+            Ok(event) => all.push(event),
+            Err(error) => {
+                assert_eq!(
+                    error,
+                    mpsc::RecvTimeoutError::Disconnected,
+                    "the events end within the hang guard: {all:?}"
+                );
+                return all;
+            }
+        }
+    }
+}
+
+/// The pid `event` is about.
+fn pid_of(event: &JobEvent) -> Option<u32> {
+    match event {
+        JobEvent::Spawned { pid, .. } | JobEvent::Exited { pid, .. } | JobEvent::Missed { pid, .. } | JobEvent::Left { pid } => Some(*pid),
+        JobEvent::Stopped { .. } => None,
+    }
+}
+
+/// The pid of the first cmd.exe `events` say `parent` started.
+fn cmd_started_by(events: &[JobEvent], parent: u32) -> Option<u32> {
+    events.iter().find_map(|event| match event {
+        JobEvent::Spawned {
+            pid,
+            ppid: Some(ppid),
+            image: Some(image),
+            ..
+        } if *ppid == parent && image.eq_ignore_ascii_case("cmd.exe") => Some(*pid),
+        _ => None,
+    })
+}
+
+#[test]
+fn each_member_of_a_tree_is_spawned_before_it_exits_and_names_its_parent() {
+    let (job, events) = telling_job();
+    // The grandchild waits on stdin, a pipe whose write end the test holds, so each process runs while the drain opens it.
+    let mut root = suspended("cmd /d /c cmd /d /c set /p line=");
+    let release = root.take_pipes().expect("a piped launch has pipes");
+    let root = root.assign_and_resume(&job).expect("the root is assigned and resumed");
+    let mut seen = Vec::new();
+    while cmd_started_by(&seen, root.pid()).and_then(|child| cmd_started_by(&seen, child)).is_none() {
+        seen.push(events.recv_timeout(HANG_GUARD).expect("the next event within the hang guard"));
+    }
+
+    drop(release);
+    assert!(root.wait(HANG_GUARD).expect("the wait answers").is_some(), "the tree ended");
+    job.finish_events(HANG_GUARD);
+    seen.extend(all_events(&events));
+
+    let child = cmd_started_by(&seen, root.pid()).expect("the root started the child");
+    let grandchild = cmd_started_by(&seen, child).expect("the child started the grandchild");
+    assert_eq!(
+        cmd_started_by(&seen, std::process::id()),
+        Some(root.pid()),
+        "the root names this process as its parent and cmd.exe as its image: {seen:?}"
+    );
+    for pid in [root.pid(), child, grandchild] {
+        let spawn = seen
+            .iter()
+            .position(|event| matches!(event, JobEvent::Spawned { pid: of, .. } if *of == pid));
+        let exit = seen
+            .iter()
+            .position(|event| matches!(event, JobEvent::Exited { pid: of, .. } if *of == pid));
+        let (spawn, exit) = (spawn.expect("each is spawned"), exit.expect("each exits"));
+        assert!(spawn < exit, "{pid} is spawned before it exits: {seen:?}");
+    }
+}
+
+#[test]
+fn a_member_s_exit_carries_its_code_its_exit_time_and_its_run_time() {
+    let (job, events) = telling_job();
+    let ended = started(&job, "exit 3");
+    assert_eq!(ended.wait(HANG_GUARD).expect("the wait answers"), Some(3), "the member ended");
+
+    job.finish_events(HANG_GUARD);
+    let mine: Vec<JobEvent> = all_events(&events)
+        .into_iter()
+        .filter(|event| pid_of(event) == Some(ended.pid()))
+        .collect();
+
+    assert_eq!(mine.len(), 2, "a spawn and an exit: {mine:?}");
+    let JobEvent::Spawned { at: spawned, .. } = mine[0] else {
+        unreachable!("the spawn comes first: {mine:?}")
+    };
+    let JobEvent::Exited { code, at, ran, .. } = mine[1] else {
+        unreachable!("the exit comes second: {mine:?}")
+    };
+    assert_eq!(code, Some(3));
+    let exited = at.expect("the exit time is read");
+    assert!(exited >= spawned, "{mine:?}");
+    assert_eq!(ran, Some(exited.duration_since(spawned)), "exit less create");
+    assert!(!ran.expect("the run time is read").is_negative(), "{mine:?}");
+}
+
+#[test]
+fn a_member_still_running_at_the_finish_is_left_and_the_events_end_once() {
+    let (job, events) = telling_job();
+    // It waits on stdin, a pipe whose write end the test holds, until the test lets it go.
+    let mut waiting = suspended("set /p line=");
+    let release = waiting.take_pipes().expect("a piped launch has pipes");
+    let waiting = waiting.assign_and_resume(&job).expect("the member is assigned and resumed");
+    wait_until("the job remembers the member", || job.remembers(waiting.pid()));
+
+    job.finish_events(Duration::from_millis(1));
+    let all = all_events(&events);
+    let mine: Vec<&JobEvent> = all.iter().filter(|event| pid_of(event) == Some(waiting.pid())).collect();
+    job.finish_events(HANG_GUARD);
+
+    assert!(
+        matches!(mine.as_slice(), [JobEvent::Spawned { .. }, JobEvent::Left { .. }]),
+        "spawned, then left: {mine:?}"
+    );
+    assert!(
+        !all.iter().any(|event| matches!(event, JobEvent::Stopped { .. })),
+        "a finish is no stop: {all:?}"
+    );
+    assert_eq!(
+        events.try_recv(),
+        Err(mpsc::TryRecvError::Disconnected),
+        "the second finish sends nothing"
+    );
+    drop(release);
+    assert!(
+        waiting.wait(HANG_GUARD).expect("the wait answers").is_some(),
+        "the member ended at its stdin's end"
+    );
+}
+
+#[test]
+fn a_job_dropped_before_its_events_are_finished_says_they_stopped_last() {
+    let (job, events) = telling_job();
+    let ended = started(&job, "exit 0");
+    assert_eq!(ended.wait(HANG_GUARD).expect("the wait answers"), Some(0), "the member ended");
+    wait_until("the job remembers the member", || job.remembers(ended.pid()));
+
+    drop(job);
+    let all = all_events(&events);
+
+    assert_eq!(
+        all.last(),
+        Some(&JobEvent::Stopped {
+            why: "the job was dropped before its events were finished".to_owned()
+        }),
+        "the stop is the last event: {all:?}"
+    );
+    assert_eq!(all.iter().filter(|event| matches!(event, JobEvent::Stopped { .. })).count(), 1, "{all:?}");
+    assert!(
+        !all.iter().any(|event| matches!(event, JobEvent::Left { .. })),
+        "a stop says no leftovers: {all:?}"
     );
 }
 

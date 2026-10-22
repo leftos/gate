@@ -32,7 +32,7 @@ use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_DESKTOP_APP
 
 use crate::create::{Creation, DesktopPolicy, Inherited, check_launch, create_inheriting_on};
 use crate::interrupt::{Woken, wait_with};
-use crate::piped::{pipe_from_child, pipe_to_child};
+use crate::piped::{pipe_from_child, pipe_from_child_sized, pipe_to_child};
 use crate::{Interrupt, Job, own_handle, wait_millis, win32_message};
 
 /// A Unicode environment block, its entries sorted by name as `CreateProcessW` wants them.
@@ -258,6 +258,22 @@ pub enum LaunchOutput {
     /// this process's own stderr as it stands when the command is created, or `NUL` when this process has none: the
     /// command's stderr lines reach whatever this process's own lines reach.
     Piped,
+    /// stdin from `NUL`, as [`LaunchOutput::Files`] gives it, and stdout and stderr each a new pipe of a 1 MiB buffer
+    /// whose read end this process keeps ([`Suspended::take_output`]): a reader that falls behind does not block the
+    /// command at once on a full pipe.
+    Pipes,
+}
+
+/// The buffer asked for each pipe of a [`LaunchOutput::Pipes`] launch: 1 MiB.
+const OUTPUT_PIPE_BUFFER: u32 = 1 << 20;
+
+/// This process's ends of a command's pipes, as its launch made them.
+#[derive(Debug)]
+pub(crate) enum ChildEnds {
+    /// A [`LaunchOutput::Piped`] launch's stdin and stdout.
+    Piped(StdioPipes),
+    /// A [`LaunchOutput::Pipes`] launch's stdout and stderr read ends, in that order.
+    Output(File, File),
 }
 
 /// This process's ends of the pipes of a command launched with [`LaunchOutput::Piped`]; neither is inheritable.
@@ -339,10 +355,12 @@ impl Launch {
     /// process's console and process group, so a console Ctrl+C reaches it as it reaches this process. With
     /// [`LaunchOutput::Piped`] its stdin and stdout are the command's ends of two new pipes, whose other ends the
     /// returned [`Suspended`] holds until [`Suspended::take_pipes`] takes them, and its stderr a copy of this process's
-    /// own. With [`LaunchOutput::Files`] its stdin is `NUL`, its stdout the log and its stderr the `.err` file, each
+    /// own. With [`LaunchOutput::Pipes`] its stdin is `NUL` and its stdout and stderr the command's ends of two new
+    /// pipes of a 1 MiB buffer each, whose read ends the returned [`Suspended`] holds until [`Suspended::take_output`]
+    /// takes them. With [`LaunchOutput::Files`] its stdin is `NUL`, its stdout the log and its stderr the `.err` file, each
     /// file created afresh (an earlier file at the path is deleted first, and a link at it is never followed) and open
     /// to every process for reading, writing and deleting while the command writes them, so a process the command left
-    /// running cannot keep the next run from replacing them. Either way it inherits those three handles and no other.
+    /// running cannot keep the next run from replacing them. Whichever the output, it inherits its three stdio handles and no other.
     /// This process's own handles to them are never inheritable: the command inherits copies
     /// open only while the spawn lock is held, so no process started meanwhile through [`crate::spawn`] or another
     /// launch inherits them. It is created with the desktop-app policy
@@ -370,8 +388,15 @@ impl Launch {
             LaunchOutput::Piped => {
                 let (input, stdin) = pipe_to_child("stdin")?;
                 let (stdout, output) = pipe_from_child("stdout")?;
-                pipes = Some(StdioPipes { stdin, stdout });
+                pipes = Some(ChildEnds::Piped(StdioPipes { stdin, stdout }));
                 (input, output, own_stderr()?)
+            }
+            LaunchOutput::Pipes => {
+                let input = nul(GENERIC_READ)?;
+                let (stdout, output) = pipe_from_child_sized("stdout", OUTPUT_PIPE_BUFFER)?;
+                let (stderr, errors) = pipe_from_child_sized("stderr", OUTPUT_PIPE_BUFFER)?;
+                pipes = Some(ChildEnds::Output(stdout, stderr));
+                (input, output, errors)
             }
         };
         let creation = Creation {
@@ -532,8 +557,9 @@ pub struct Suspended {
     pub(crate) process: Option<OwnedHandle>,
     pub(crate) thread: OwnedHandle,
     pub(crate) pid: u32,
-    /// This process's ends of the command's pipes, for a [`LaunchOutput::Piped`] launch, until taken.
-    pub(crate) pipes: Option<StdioPipes>,
+    /// This process's ends of the command's pipes, for a [`LaunchOutput::Piped`] or [`LaunchOutput::Pipes`] launch,
+    /// until taken.
+    pub(crate) pipes: Option<ChildEnds>,
     /// What the launch could not give the command, for the caller to log: set when a desktop-app policy it only
     /// wanted could not be set, and the command was created without it.
     pub(crate) note: Option<String>,
@@ -638,7 +664,25 @@ impl Suspended {
     /// This process's ends of the command's stdin and stdout: `Some` once for a [`LaunchOutput::Piped`] launch, else
     /// `None`. Ends not taken close when the command is resumed or dropped.
     pub fn take_pipes(&mut self) -> Option<StdioPipes> {
-        self.pipes.take()
+        match self.pipes.take() {
+            Some(ChildEnds::Piped(pipes)) => Some(pipes),
+            other => {
+                self.pipes = other;
+                None
+            }
+        }
+    }
+
+    /// This process's read ends of the command's stdout and stderr, in that order: `Some` once for a
+    /// [`LaunchOutput::Pipes`] launch, else `None`. Ends not taken close when the command is resumed or dropped.
+    pub fn take_output(&mut self) -> Option<(File, File)> {
+        match self.pipes.take() {
+            Some(ChildEnds::Output(stdout, stderr)) => Some((stdout, stderr)),
+            other => {
+                self.pipes = other;
+                None
+            }
+        }
     }
 
     /// Puts the command in `job`, then lets it run, so what it starts runs in the job (but see the module doc for a

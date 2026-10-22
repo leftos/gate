@@ -19,4 +19,8 @@ test-seams = []
 base64 = "0.23.1"
 gate-args = { path = "../gate-args" }
 gate-router = { path = "../gate-router" }
+jiff = "0.2.37"
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
+
+[dev-dependencies]
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }

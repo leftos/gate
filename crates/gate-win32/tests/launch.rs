@@ -190,6 +190,28 @@ fn output_and_errors_land_in_the_log_and_err_files_from_the_given_environment() 
 }
 
 #[test]
+fn output_and_errors_come_through_their_own_pipes_and_stdin_ends_at_once() {
+    let dir = case_dir("pipes");
+    let job = Job::create(&unique_name("pipes")).expect("the job is created");
+    let mut pipes = launch(&dir, &cmd(), "cmd /d /c sort&echo out&1>&2 echo err", &[]);
+    pipes.output = LaunchOutput::Pipes;
+    let mut suspended = pipes.start_suspended().expect("the command starts");
+    assert!(suspended.take_pipes().is_none(), "a launch with output pipes has no stdin pipe");
+    let (mut stdout, mut stderr) = suspended.take_output().expect("a launch with output pipes has them");
+    assert!(suspended.take_output().is_none(), "the output pipes are taken once");
+
+    // sort reads its stdin to its end before it writes anything: a stdin that did not end would hold it to the guard.
+    let running = suspended.assign_and_resume(&job).expect("the command is assigned and resumed");
+    let mut output = String::new();
+    stdout.read_to_string(&mut output).expect("the command's stdout is read to its end");
+    let mut errors = String::new();
+    stderr.read_to_string(&mut errors).expect("the command's stderr is read to its end");
+
+    assert_eq!(exit_code(&running), 0);
+    assert_eq!((output.as_str(), errors.as_str()), ("out\r\n", "err\r\n"));
+}
+
+#[test]
 fn environment_names_match_without_regard_to_case_beyond_ascii() {
     let dir = case_dir("unicode-name");
     let extra = [("ÄPFEL", "1"), ("äpfel", "2")];

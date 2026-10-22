@@ -2384,7 +2384,7 @@ impl Run<'_> {
         };
         // The job remembers every process put in it from the command on, so a kill still reaches what one that has
         // ended started outside it.
-        let created = created.and_then(|mut job| job.remember().map(|()| job));
+        let created = created.and_then(|mut job| job.remember(None).map(|()| job));
         let job = match created {
             Ok(job) => job,
             Err(error) => return self.gate_failed(&format!("cannot create the job {name}: {error}"), None, console),

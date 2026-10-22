@@ -1,12 +1,14 @@
 //! Named job objects: a job holds a command and every process it starts, and can end them all at once.
 
 use std::io;
+use std::os::windows::io::BorrowedHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{Sender, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use proc_table::filetime_to_timestamp;
 use proc_table::win32::OwnedHandle;
 use windows_sys::Win32::Foundation::{
@@ -22,7 +24,9 @@ use windows_sys::Win32::System::JobObjects::{
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS, JOB_OBJECT_MSG_EXIT_PROCESS, JOB_OBJECT_MSG_NEW_PROCESS};
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForMultipleObjects,
+};
 
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 
@@ -49,6 +53,9 @@ const NAMING_QUEUE: usize = 256;
 
 /// How many times a job's process id list is read before a job that keeps outgrowing its buffer is an error.
 const PROCESS_ID_READS: usize = 8;
+
+/// The most handles one `WaitForMultipleObjects` call waits on (`MAXIMUM_WAIT_OBJECTS`).
+const WAIT_CHUNK: usize = 64;
 
 /// A member's identity: its pid and its start.
 type Key = (u32, Timestamp);
@@ -82,6 +89,58 @@ pub struct Departure {
 /// The members a job remembers that have ended, with why what it remembers may lack a member, when it may
 /// ([`Job::departed`]).
 pub type Departures = (Vec<Departure>, Option<String>);
+
+/// A process joining or leaving a remembering job, as the sink given to [`Job::remember`] is told of it. Each is sent
+/// under the memory's lock, so a member's [`JobEvent::Spawned`] always comes before its [`JobEvent::Exited`] or
+/// [`JobEvent::Left`], whichever thread settles it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobEvent {
+    /// The process `pid` joined the job: started by `ppid`, running the program file named `image` (its file name
+    /// alone), created at `at`, its kernel create time. A parent or an image that cannot be read is `None`.
+    Spawned {
+        /// Its pid.
+        pid: u32,
+        /// The pid of the process that started it.
+        ppid: Option<u32>,
+        /// Its program's file name.
+        image: Option<String>,
+        /// Its kernel create time.
+        at: Timestamp,
+    },
+    /// The member `pid` ended: its exit code, its kernel exit time `at` and its run time `ran`, exit less create; each
+    /// `None` when its end could not be read.
+    Exited {
+        /// Its pid.
+        pid: u32,
+        /// Its exit code.
+        code: Option<u32>,
+        /// Its kernel exit time.
+        at: Option<Timestamp>,
+        /// Its exit time less its create time.
+        ran: Option<SignedDuration>,
+    },
+    /// The process `pid` joined the job, but it is no member the job remembers, for the reason `why`, in words.
+    Missed {
+        /// Its pid.
+        pid: u32,
+        /// Why it was missed.
+        why: String,
+    },
+    /// The member `pid` was still running when [`Job::finish_events`] ended the events.
+    Left {
+        /// Its pid.
+        pid: u32,
+    },
+    /// The events ended without [`Job::finish_events`], for the reason `why`: the drain thread stopped on a failure,
+    /// or the job was dropped first. It is the last event; members still running get no [`JobEvent::Left`].
+    Stopped {
+        /// Why the events stopped.
+        why: String,
+    },
+}
+
+/// Why a job's events stopped when it was dropped before [`Job::finish_events`].
+const DROPPED_UNFINISHED: &str = "the job was dropped before its events were finished";
 
 /// A job object, named or anonymous. One made by [`Job::create`] or [`Job::create_breakaway`] has no other limits, and
 /// nothing is killed when it is dropped, which only closes this handle; one made by [`Job::create_kill_on_close`] or
@@ -135,14 +194,21 @@ struct Remembered {
     /// What names each running member, and the members that have ended worth naming, their last times read before
     /// their handles closed ([`Job::traced`]); the naming thread fills in the names.
     traces: Arc<Mutex<Traces<Key>>>,
+    /// Where each [`JobEvent`] is sent, under this lock, until [`Job::finish_events`], the job's drop or a stopped
+    /// drain thread drops it; `None` for a job given no sink.
+    events: Option<Sender<JobEvent>>,
 }
 
-/// What a member's join read of it for [`Job::traced`]: a copy of its handle for the naming thread, and its times
-/// when it had ended already.
+/// What a member's join read of it: for [`Job::traced`], a copy of its handle for the naming thread and its times
+/// when it had ended already; for its [`JobEvent`]s, its parent's pid, its image's file name and, when it had ended
+/// already, its exit code.
 #[derive(Default)]
 struct Joined {
     process: Option<OwnedHandle>,
     span: Option<ProcessSpan>,
+    ppid: Option<u32>,
+    image: Option<String>,
+    code: Option<u32>,
 }
 
 /// The members a memory could not read: how many, and a line for each of the first [`UNREAD_NAMED`].
@@ -249,6 +315,9 @@ impl Drop for Job {
         // The job posts nothing more; a failure leaves the association to end when the port's last handle closes.
         let _ = associate(&self.handle, std::ptr::null_mut());
         memory.shared.closing.store(true, Ordering::Release);
+        // No event is sent after the drop begins; a job dropped without `finish_events` says no `Left`, only that its
+        // events stopped.
+        memory.shared.lock().stop_events(DROPPED_UNFINISHED);
         traced::lock(&memory.traces).close();
         // Wakes the thread at once; without the message, it sees `closing` when its current wait ends.
         // SAFETY: the port is open for the whole call, and no `OVERLAPPED` is passed.
@@ -329,13 +398,17 @@ impl Job {
 
     /// Has the job remember every process that joins it from now on, through a completion port associated with it now,
     /// before any process is put in it, and a thread that takes each of the port's messages as it comes; both stay until
-    /// the job is dropped. A job that remembers already is left as it is.
+    /// the job is dropped. A job that remembers already is left as it is, and `events` dropped.
+    ///
+    /// Given `events`, the job sends a [`JobEvent`] to it for each process that joins it and each member that ends,
+    /// until [`Job::finish_events`] or its drop. The sink is given here, before any process joins, so no member's exit
+    /// comes without its spawn.
     ///
     /// # Errors
     ///
     /// The system's error when the port cannot be created or associated with the job, the job's handle cannot be
     /// copied for the thread, or the thread cannot be started.
-    pub fn remember(&mut self) -> io::Result<()> {
+    pub fn remember(&mut self, events: Option<Sender<JobEvent>>) -> io::Result<()> {
         if self.memory.is_some() {
             return Ok(());
         }
@@ -349,6 +422,7 @@ impl Job {
             closing: AtomicBool::new(false),
             remembered: Mutex::new(Remembered {
                 traces: Arc::clone(&traces),
+                events,
                 ..Remembered::default()
             }),
         });
@@ -577,6 +651,25 @@ impl Job {
         });
         running.chain(traces.ended_members()).collect()
     }
+
+    /// Ends the [`JobEvent`]s given to [`Job::remember`]: waits at most `wait` for the members still running to end,
+    /// settles them, sending [`JobEvent::Exited`] for each that has, sends [`JobEvent::Left`] for each still running,
+    /// then drops the sink, so a receiver's iterator ends. No event is sent after it. The memory's lock is not held
+    /// through the wait. A second call, or a call on a job given no sink, does nothing.
+    pub fn finish_events(&self, wait: Duration) {
+        let Some(memory) = &self.memory else {
+            return;
+        };
+        let waitable = {
+            let remembered = memory.shared.lock();
+            if remembered.events.is_none() {
+                return;
+            }
+            remembered.waitable()
+        };
+        wait_for_all(&waitable, wait);
+        memory.shared.lock().finish();
+    }
 }
 
 impl Shared {
@@ -611,7 +704,11 @@ impl Shared {
         };
         let exited = |pid| self.lock().exited(pid);
         if let Err(error) = drain_loop(take, found, exited, || self.lock().settle()) {
-            self.lock().stopped = Some(error.to_string());
+            let mut remembered = self.lock();
+            let why = error.to_string();
+            // Nothing that joins the job is remembered from here, so no event is sent either.
+            remembered.stop_events(&why);
+            remembered.stopped = Some(why);
         }
     }
 }
@@ -619,15 +716,37 @@ impl Shared {
 impl Remembered {
     /// Adds `member`, with what its join read of it, `joined`, unless the same member, by its pid and start, is
     /// remembered already: a running member is traced until it ends, and one that had ended already goes to the book
-    /// when it is worth naming. What the naming thread is to name, when the member is traced and its handle was copied.
+    /// when it is worth naming. Its [`JobEvent::Spawned`] is sent, and for one that had ended already its
+    /// [`JobEvent::Exited`] with it. What the naming thread is to name, when the member is traced and its handle was
+    /// copied.
     fn add(&mut self, member: Member, joined: Joined) -> Option<Naming<Key>> {
         if self.members.iter().any(|known| known.key() == member.key()) {
             return None;
         }
+        let Joined {
+            process,
+            span,
+            ppid,
+            image,
+            code,
+        } = joined;
+        let events = self.events.as_ref();
+        tell(
+            events,
+            JobEvent::Spawned {
+                pid: member.pid,
+                ppid,
+                image,
+                at: member.start,
+            },
+        );
+        if let Until::Ended(exit) = member.until {
+            tell(events, exited(&member, code, exit));
+        }
         let key = member.key();
         let traced = {
             let mut traces = traced::lock(&self.traces);
-            match (&member.until, joined.span) {
+            match (&member.until, span) {
                 (Until::Running(_), _) => {
                     traces.joined(key, member.pid);
                     true
@@ -637,13 +756,19 @@ impl Remembered {
             }
         };
         self.members.push(member);
-        joined.process.filter(|_| traced).map(|process| Naming { key, process })
+        process.filter(|_| traced).map(|process| Naming { key, process })
     }
 
-    /// Notes the process `pid` the port reported joining the job, which is remembered as no member for `missed`: one
-    /// whose times could not be read is said in [`Remembered::unread`]; one found gone, or whose holder cannot be told,
-    /// is not.
+    /// Notes the process `pid` the port reported joining the job, which is remembered as no member for `missed`: its
+    /// [`JobEvent::Missed`] is sent whatever the reason; one whose times could not be read is also said in
+    /// [`Remembered::unread`]; one found gone, or whose holder cannot be told, is not.
     fn missed(&mut self, pid: u32, missed: Missed) {
+        let why = match &missed {
+            Missed::Gone => "ended before it could be opened".to_owned(),
+            Missed::Unknown => "whether the process at its pid is the member could not be told".to_owned(),
+            Missed::Unread(why) => format!("its times could not be read: {why}"),
+        };
+        tell(self.events.as_ref(), JobEvent::Missed { pid, why });
         if let Missed::Unread(why) = missed {
             self.unread.add(format!("the times of member {pid} could not be read: {why}"));
         }
@@ -662,9 +787,11 @@ impl Remembered {
     }
 
     /// Settles each running member `chosen` picks, as [`Remembered::settle`] says. One that has ended has its last
-    /// times read through its handle before it closes, and goes to the book with its name.
+    /// times and its exit code read through its handle before it closes, goes to the book with its name, and has its
+    /// [`JobEvent::Exited`] sent; one whose exit cannot be read is sent one that knows nothing of its end.
     fn settle_where(&mut self, chosen: impl Fn(&Member) -> bool) {
         let unread = &mut self.unread;
+        let events = self.events.as_ref();
         let mut traces = traced::lock(&self.traces);
         self.members.retain_mut(|member| {
             if !chosen(member) {
@@ -679,16 +806,114 @@ impl Remembered {
                 Settled::Ended(exit) => {
                     // An exited process's times are final: read once more, they are its last.
                     traces.ended(member.key(), span_of(process).ok());
+                    let code = exit_code(process);
+                    tell(events, exited(member, code, exit));
                     member.until = Until::Ended(exit);
                     true
                 }
                 Settled::Unread(why) => {
+                    tell(
+                        events,
+                        JobEvent::Exited {
+                            pid: member.pid,
+                            code: None,
+                            at: None,
+                            ran: None,
+                        },
+                    );
                     traces.forget(member.key());
                     unread.add(format!("the exit of member {} could not be read: {why}", member.pid));
                     false
                 }
             }
         });
+    }
+
+    /// A handle to wait on for each running member, opened by its pid with `SYNCHRONIZE` access, which the member's
+    /// own query handle lacks: the member's handle, held under this lock, keeps its pid from any other process, so the
+    /// pid opens the member. A member whose pid cannot be opened so is not waited on.
+    fn waitable(&self) -> Vec<OwnedHandle> {
+        self.members
+            .iter()
+            .filter(|member| matches!(member.until, Until::Running(_)))
+            // SAFETY: `OpenProcess` takes no pointers. A success is a fresh handle nothing else owns.
+            .filter_map(|member| unsafe { own_handle(OpenProcess(PROCESS_SYNCHRONIZE, 0, member.pid)) }.ok())
+            .collect()
+    }
+
+    /// Settles every running member, sends [`JobEvent::Left`] for each still running, and drops the sink; nothing
+    /// once the sink is gone.
+    fn finish(&mut self) {
+        if self.events.is_none() {
+            return;
+        }
+        self.settle();
+        let events = self.events.take();
+        for member in &self.members {
+            if matches!(member.until, Until::Running(_)) {
+                tell(events.as_ref(), JobEvent::Left { pid: member.pid });
+            }
+        }
+    }
+
+    /// Sends [`JobEvent::Stopped`] for `why` and drops the sink; nothing once the sink is gone.
+    fn stop_events(&mut self, why: &str) {
+        if let Some(events) = self.events.take() {
+            tell(Some(&events), JobEvent::Stopped { why: why.to_owned() });
+        }
+    }
+}
+
+/// Sends `event` to `events`, when there is a sink. A receiver that has gone wants no more events, and the memory is
+/// the same either way, so a failed send is dropped.
+fn tell(events: Option<&Sender<JobEvent>>, event: JobEvent) {
+    if let Some(events) = events {
+        drop(events.send(event));
+    }
+}
+
+/// The [`JobEvent::Exited`] of `member`, which exited at `exit` with `code`.
+fn exited<H>(member: &Member<H>, code: Option<u32>, exit: Timestamp) -> JobEvent {
+    JobEvent::Exited {
+        pid: member.pid,
+        code,
+        at: Some(exit),
+        ran: Some(exit.duration_since(member.start)),
+    }
+}
+
+/// The exit code of the exited process behind `process`, open with query access; `None` when it cannot be read.
+fn exit_code(process: &OwnedHandle) -> Option<u32> {
+    let mut code = 0;
+    // SAFETY: the handle is open for the whole call with `PROCESS_QUERY_LIMITED_INFORMATION` access, which the call
+    // asks for, and `code` is writable.
+    let read = unsafe { GetExitCodeProcess(process.raw(), &raw mut code) };
+    (read != 0).then_some(code)
+}
+
+/// The file name of the program the process behind `process` runs, open with query access; `None` when it cannot be
+/// read.
+fn image_name(process: &OwnedHandle) -> Option<String> {
+    // SAFETY: the handle is open for the whole borrow, which ends with this call.
+    let path = crate::image_path_of(unsafe { BorrowedHandle::borrow_raw(process.raw()) }).ok()?;
+    Some(path.file_name()?.to_string_lossy().into_owned())
+}
+
+/// Waits until every process behind `processes`, open with `SYNCHRONIZE` access, has ended, or `wait` has passed,
+/// [`WAIT_CHUNK`] at a time. A wait that times out or fails only ends early: what has not ended is still running.
+fn wait_for_all(processes: &[OwnedHandle], wait: Duration) {
+    let deadline = Instant::now().checked_add(wait);
+    for chunk in processes.chunks(WAIT_CHUNK) {
+        let left = deadline.map_or(Duration::MAX, |deadline| deadline.saturating_duration_since(Instant::now()));
+        // Below `INFINITE`, so even the longest wait ends.
+        let millis = u32::try_from(left.as_millis()).unwrap_or(u32::MAX).min(u32::MAX - 1);
+        let handles: Vec<HANDLE> = chunk.iter().map(OwnedHandle::raw).collect();
+        let Ok(count) = u32::try_from(handles.len()) else {
+            return;
+        };
+        // SAFETY: `handles` holds `count` handles, each open for the whole call with `SYNCHRONIZE` access, and outlives
+        // the call; at most `MAXIMUM_WAIT_OBJECTS` are passed.
+        let _ = unsafe { WaitForMultipleObjects(count, handles.as_ptr(), 1, millis) };
     }
 }
 
@@ -785,19 +1010,24 @@ fn take_message(port: &OwnedHandle, wait: u32) -> io::Result<Message> {
 }
 
 /// The process `pid` the port reported joining the job behind `job`, which was created at `created_at`, as
-/// [`remembered_as`] remembers it, with a copy of its handle for the naming thread and, when it has ended already, its
-/// times, read while its process object is held; nothing is read of a process that is no member.
+/// [`remembered_as`] remembers it, with a copy of its handle for the naming thread, its parent's pid, its image's file
+/// name and, when it has ended already, its times and its exit code, read while its process object is held; nothing
+/// is read of a process that is no member.
 fn member(job: &OwnedHandle, pid: u32, created_at: Timestamp) -> Result<(Member, Joined), Missed> {
     let mut joined = Joined::default();
     let times = |process: &OwnedHandle| {
         // SAFETY: the handle passed is the one `open_any` opened with `PROCESS_QUERY_LIMITED_INFORMATION` access,
         // borrowed, so open, for the whole call.
         let times = unsafe { start_and_exit_of(process.raw()) };
-        // Read after the exit: one the exit saw ended is ended in its span too, and one that ends between the two
-        // reads stays running, for its settle to book.
+        let ended = matches!(times, Ok((_, exit)) if exit != 0);
+        // Read after the exit: one the exit saw ended is ended in its span too, and its code is final; one that ends
+        // between the two reads stays running, for its settle to book.
         joined = Joined {
             process: duplicate(process).ok(),
             span: span_of(process).ok().filter(|span| span.exited.is_some()),
+            ppid: proc_table::win32::parent_pid_of(process).ok(),
+            image: image_name(process),
+            code: if ended { exit_code(process) } else { None },
         };
         times
     };

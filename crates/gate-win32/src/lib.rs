@@ -59,7 +59,7 @@ pub use device::device_target;
 pub use event::{EventWait, NamedEvent};
 pub use gpu::{AdapterUse, Gpu3dWindow, PdhError};
 pub use interrupt::Interrupt;
-pub use job::{Accounting, Job};
+pub use job::{Accounting, Job, JobEvent};
 pub use launch::{
     AdoptError, EndReport, EnvironmentBlock, Launch, LaunchError, LaunchOutput, PriorityClass, Released, Running, StdioPipes, Suspended, Waited,
     same_variable_name,

@@ -8,6 +8,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+use gate_wire::stamp::{Tag, is_process_line, unstamped};
 use regex::Regex;
 
 use crate::console::Console;
@@ -165,7 +166,8 @@ impl Log {
         markers_in(BufReader::new(File::open(&self.path)?), MARKER_LINES)
     }
 
-    /// The last `count` lines, read back from the end of the log, at most 1 MiB of it, each cut for printing.
+    /// The last `count` lines, read back from the end of the log, at most 1 MiB of it, each shown as its unstamped
+    /// text and cut for printing; the gate's process lines are passed over.
     ///
     /// # Errors
     ///
@@ -175,8 +177,9 @@ impl Log {
     }
 
     /// The log's last line for which `wanted` holds, read line by line from the start and never whole, only the last
-    /// such line held; `None` when none holds. A line ends at CR LF, LF or a lone CR, so a line written after a
-    /// progress line's lone CR is a line of its own.
+    /// such line held; `None` when none holds. `wanted` is given, and the line is returned as, its unstamped text
+    /// ([`unstamped`]): a plain line whole. A line ends at CR LF, LF or a lone CR, so a line written after a progress
+    /// line's lone CR is a line of its own.
     ///
     /// # Errors
     ///
@@ -185,9 +188,10 @@ impl Log {
         let mut lines = LineReader::new(BufReader::new(File::open(&self.path)?), SCAN_LINE_BYTES);
         let mut last = None;
         while let Some(line) = lines.next_line()? {
-            let text = String::from_utf8_lossy(&line);
-            if wanted(&text) {
-                last = Some(text.into_owned());
+            let line = String::from_utf8_lossy(&line);
+            let text = unstamped(&line).text;
+            if wanted(text) {
+                last = Some(text.to_owned());
             }
         }
         Ok(last)
@@ -267,8 +271,8 @@ impl LineState {
     }
 }
 
-/// The first `limit` lines of `reader` holding a failure marker, numbered from 1 and cut for printing; the scan stops
-/// once it has them.
+/// The first `limit` lines of `reader` holding a failure marker in their unstamped text ([`unstamped`]; a plain line
+/// whole), numbered from 1, each kept as that text cut for printing; the scan stops once it has them.
 fn markers_in(reader: impl BufRead, limit: usize) -> io::Result<Vec<(usize, String)>> {
     let mut lines = LineReader::new(reader, SCAN_LINE_BYTES);
     let mut found = Vec::new();
@@ -277,17 +281,27 @@ fn markers_in(reader: impl BufRead, limit: usize) -> io::Result<Vec<(usize, Stri
         && let Some(line) = lines.next_line()?
     {
         number += 1;
-        let text = String::from_utf8_lossy(&line);
-        if MARKER_SCAN.is_match(&text) {
-            found.push((number, shown(&text)));
+        let line = String::from_utf8_lossy(&line);
+        let text = unstamped(&line).text;
+        if MARKER_SCAN.is_match(text) {
+            found.push((number, shown(text)));
         }
     }
     Ok(found)
 }
 
-/// The last `count` lines of `file`, read back from its end in pieces of `chunk` bytes until they hold the lines or
-/// `most` bytes were read, each cut for printing. A tail that needs more than `most` bytes shows the whole lines that
-/// fit, or, for a last line longer than that, its end ([`line_end`]).
+/// Whether `line` is one of the gate's process lines ([`is_process_line`] under the `gat` tag), which a tail passes
+/// over.
+fn is_process_entry(line: &[u8]) -> bool {
+    let line = String::from_utf8_lossy(line);
+    let parts = unstamped(&line);
+    parts.tag == Some(Tag::Gat) && is_process_line(parts.text)
+}
+
+/// The last `count` lines of `file` that are not the gate's process lines ([`is_process_entry`]), read back from its
+/// end in pieces of `chunk` bytes until they hold that many or `most` bytes were read, each shown as its unstamped text
+/// and cut for printing. A tail that needs more than `most` bytes shows the whole lines that fit, or, for a last line
+/// longer than that, its end ([`line_end`]).
 fn tail_in(file: &mut (impl Read + Seek), count: u64, chunk: u64, most: u64) -> io::Result<Vec<String>> {
     let wanted = usize::try_from(count).unwrap_or(usize::MAX);
     if wanted == 0 {
@@ -305,15 +319,17 @@ fn tail_in(file: &mut (impl Read + Seek), count: u64, chunk: u64, most: u64) -> 
         piece.extend_from_slice(&buffer);
         buffer = piece;
         let lines = split(&buffer)?;
-        if start == 0 || end - start >= most || lines.len() > wanted {
+        // The first line may have begun before the bytes read, so only the lines after it are surely whole.
+        let whole = lines.iter().skip(1).filter(|line| !is_process_entry(line)).count();
+        if start == 0 || end - start >= most || whole >= wanted {
             return Ok(last_lines(lines, wanted, start == 0));
         }
     }
 }
 
-/// The last `wanted` of `lines`, cut for printing. Unless they start at the file's start, the first may have begun
-/// before the bytes read: it is dropped when another follows, and shown by its end ([`line_end`]) when it is the only
-/// one.
+/// The last `wanted` of `lines` that are not the gate's process lines, each shown as its unstamped text and cut for
+/// printing. Unless they start at the file's start, the first may have begun before the bytes read: it is dropped when
+/// another follows, and shown by its end ([`line_end`]) when it is the only one.
 fn last_lines(mut lines: Vec<Vec<u8>>, wanted: usize, at_start: bool) -> Vec<String> {
     if !at_start {
         match lines.as_slice() {
@@ -324,8 +340,12 @@ fn last_lines(mut lines: Vec<Vec<u8>>, wanted: usize, at_start: bool) -> Vec<Str
             [] => {}
         }
     }
-    let skipped = lines.len().saturating_sub(wanted);
-    lines[skipped..].iter().map(|line| shown(&String::from_utf8_lossy(line))).collect()
+    let kept: Vec<&Vec<u8>> = lines.iter().filter(|line| !is_process_entry(line)).collect();
+    let skipped = kept.len().saturating_sub(wanted);
+    kept[skipped..]
+        .iter()
+        .map(|line| shown(unstamped(&String::from_utf8_lossy(line)).text))
+        .collect()
 }
 
 /// The end of a line whose start was not read: `… ` and its last 4096 characters, from its first whole character (the
@@ -514,6 +534,49 @@ mod tests {
 
         assert_eq!(log.tail(2).expect("the log reads"), ["ok \u{fffd}\u{fffd} bad", "last"]);
         assert_eq!(log.tail(20).expect("the log reads"), ["first", "ok \u{fffd}\u{fffd} bad", "last"]);
+        fs::remove_dir_all(&folder).expect("the test folder can be removed");
+    }
+
+    /// A stamp as a run's log writes it.
+    const STAMP: &str = "2026-10-22T09:31:38.120001-07:00";
+
+    #[test]
+    fn a_stamped_marker_line_is_caught_and_kept_as_its_text() {
+        let text = format!("{STAMP} out ok\n{STAMP} out Build FAILED.\n{STAMP} err    failed: 3\n{STAMP} out failed: 0\n");
+
+        assert_eq!(
+            markers(&text),
+            numbered(&[(2, "Build FAILED."), (3, "   failed: 3")]),
+            "each anchored marker matches the text after the tag"
+        );
+    }
+
+    #[test]
+    fn the_tail_passes_over_a_burst_of_process_lines_at_the_end() {
+        let outs = ["one", "two", "three"].iter().map(|line| format!("{STAMP} out {line}"));
+        let exits = (1..=50).map(|pid| format!("{STAMP} gat exit pid={pid} code=0 ran=0.010000s"));
+        let text = outs.chain(exits).collect::<Vec<_>>().join("\n") + "\n";
+
+        for chunk in [64, 1024, 64 * 1024] {
+            assert_eq!(tail(&text, 3, chunk, 1024 * 1024), ["one", "two", "three"], "pieces of {chunk}");
+        }
+        assert_eq!(
+            tail(&text, 20, 64, 1024 * 1024),
+            ["one", "two", "three"],
+            "no process line fills a longer tail"
+        );
+    }
+
+    #[test]
+    fn the_last_line_of_a_stamped_log_is_its_text() {
+        let folder = folder("stamped-last");
+        let log = Log::new(&folder.join("out.log"));
+        let text = format!("{STAMP} out working\n{STAMP} gat gate: STALLED: no output for 600 s\n{STAMP} out after\n");
+        fs::write(log.path(), text).expect("the log can be written");
+
+        let last = log.last_line(|text| text.starts_with("gate: STALLED")).expect("the log reads");
+
+        assert_eq!(last.as_deref(), Some("gate: STALLED: no output for 600 s"));
         fs::remove_dir_all(&folder).expect("the test folder can be removed");
     }
 

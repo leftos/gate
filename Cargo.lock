@@ -310,6 +310,8 @@ dependencies = [
  "base64",
  "gate-args",
  "gate-router",
+ "jiff",
+ "proptest",
  "serde_json",
 ]
 

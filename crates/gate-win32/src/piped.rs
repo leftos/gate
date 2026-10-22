@@ -279,8 +279,14 @@ fn open_job(job: &Job) -> Result<OwnedHandle, LaunchError> {
 /// A new pipe the command writes its `stream` to, neither end inheritable: the read end, as a file this process reads,
 /// and the write end, for the command.
 pub(crate) fn pipe_from_child(stream: &str) -> Result<(File, OwnedHandle), LaunchError> {
+    pipe_from_child_sized(stream, 0)
+}
+
+/// A new pipe the command writes its `stream` to, as [`pipe_from_child`] makes it, with a buffer of about `buffer`
+/// bytes, the system's default for 0.
+pub(crate) fn pipe_from_child_sized(stream: &str, buffer: u32) -> Result<(File, OwnedHandle), LaunchError> {
     let operation = format!("create the {stream} pipe");
-    let (read, write) = new_pipe(&operation)?;
+    let (read, write) = new_pipe(&operation, buffer)?;
     // SAFETY: a success returns two fresh handles nothing else owns; each gets exactly one owner here.
     let reader = File::from(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(read) });
     // SAFETY: as above, for the write end.
@@ -333,7 +339,7 @@ fn output_pipe(stream: &str) -> Result<(File, std::os::windows::io::OwnedHandle)
 /// write end, as a file this process writes.
 pub(crate) fn pipe_to_child(stream: &str) -> Result<(OwnedHandle, File), LaunchError> {
     let operation = format!("create the {stream} pipe");
-    let (read, write) = new_pipe(&operation)?;
+    let (read, write) = new_pipe(&operation, 0)?;
     // SAFETY: a success returns two fresh handles nothing else owns; each gets exactly one owner here.
     let writer = File::from(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(write) });
     // SAFETY: as above, for the read end.
@@ -341,14 +347,13 @@ pub(crate) fn pipe_to_child(stream: &str) -> Result<(OwnedHandle, File), LaunchE
     Ok((reader, writer))
 }
 
-/// The read and write ends of a new anonymous pipe, neither inheritable, for the caller to own; `operation` names the
-/// failure.
-fn new_pipe(operation: &str) -> Result<(HANDLE, HANDLE), LaunchError> {
+/// The read and write ends of a new anonymous pipe, neither inheritable, for the caller to own, its buffer about
+/// `buffer` bytes (`CreatePipe`'s suggested size; 0 for the system's default); `operation` names the failure.
+fn new_pipe(operation: &str, buffer: u32) -> Result<(HANDLE, HANDLE), LaunchError> {
     let mut read: HANDLE = std::ptr::null_mut();
     let mut write: HANDLE = std::ptr::null_mut();
-    // SAFETY: both handle pointers are writable; no security attributes are passed, so neither end is inheritable,
-    // and size 0 asks for the default buffer.
-    if unsafe { CreatePipe(&raw mut read, &raw mut write, std::ptr::null(), 0) } == 0 {
+    // SAFETY: both handle pointers are writable; no security attributes are passed, so neither end is inheritable.
+    if unsafe { CreatePipe(&raw mut read, &raw mut write, std::ptr::null(), buffer) } == 0 {
         return Err(setup(io::Error::last_os_error(), operation));
     }
     Ok((read, write))
