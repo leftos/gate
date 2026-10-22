@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use gate_watchdog::{Pump, Ticker};
 
-use crate::console::{Forwarding, Stream};
+use crate::console::{Forwarding, Stamp, Stream};
 use crate::forward::DRAIN;
 
 /// How often the heartbeat looks, and the box's ceiling samples, unless a test says otherwise.
@@ -82,7 +82,7 @@ impl Write for Beats {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let text = String::from_utf8_lossy(buf);
         let line = text.strip_suffix('\n').unwrap_or(&text);
-        self.output.say_unless(&self.never, Stream::Err, line)?;
+        self.output.say_unless(&self.never, Stream::Err, Stamp::Bare, line)?;
         if self.output.client_gone() {
             return Err(io::Error::from(io::ErrorKind::BrokenPipe));
         }

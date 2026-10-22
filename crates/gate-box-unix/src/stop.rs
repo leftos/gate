@@ -607,7 +607,7 @@ mod tests {
         GroupFacts, GroupView, LeaderFacts, Members, Record, StopView, groups_ended, members_of, own_group, record_current, record_decision,
         still_named, stop, stopped_through,
     };
-    use crate::console::{Console, Output, RecordingSink};
+    use crate::console::{Console, Output, RecordingSink, Stamp};
     use crate::files::{effective_uid, held_for_test, user_name};
     use crate::git::{Git, GitClass, RunGit};
     use crate::lines::{Recorded, record_unread, record_without_group, root_unsafe_line};
@@ -1262,6 +1262,7 @@ mod tests {
             &lock,
             &output,
             Some(GroupRecord::new(record.clone(), JOB, &held)),
+            Stamp::Bare,
         );
         // Stands in for a long checkout: a step that would run for a minute.
         let words = ["-c", "alias.x=!sleep 60", "x"];

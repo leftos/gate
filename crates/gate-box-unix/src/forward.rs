@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::console::{Forwarding, Stream};
+use crate::console::{Forwarding, Stamp, Stream};
 
 /// How long the drain waits for every reader to reach its pipe's end.
 pub const DRAIN: Duration = Duration::from_secs(2);
@@ -28,8 +28,8 @@ pub const LINE_CAP: usize = 64 * 1024;
 
 /// What a reader does with what it reads.
 pub enum Take {
-    /// Says each line ([`LineSplitter`]) on the stream through the output.
-    Lines(Arc<dyn Forwarding>, Stream),
+    /// Says each line ([`LineSplitter`]) on the stream through the output, stamped as the caller says.
+    Lines(Arc<dyn Forwarding>, Stream, Stamp),
     /// Keeps the first bytes, this many, and notes whether more came.
     Capped(usize),
     /// Keeps the last bytes, this many.
@@ -122,7 +122,7 @@ impl Readers {
     /// Why the thread could not be started.
     pub fn read(&mut self, pipe: impl Read + Send + 'static, take: Take) -> io::Result<()> {
         let shared = Arc::new(Shared::default());
-        if let Take::Lines(output, _) = &take {
+        if let Take::Lines(output, ..) = &take {
             self.output = Some(Arc::clone(output));
         }
         let reader = Reader {
@@ -257,14 +257,14 @@ impl Reader {
     /// client is gone, looked at before the output lock is taken, so a reader never waits on the lock to write to no
     /// one; a write that fails marks the client gone in the output and drops every later line.
     fn forward(&mut self, line: &[u8]) {
-        let Take::Lines(output, stream) = &self.take else {
+        let Take::Lines(output, stream, stamp) = &self.take else {
             return;
         };
         if self.write_failed || self.stopped.load(Ordering::SeqCst) || output.client_gone() {
             return;
         }
         self.shared.writing.store(true, Ordering::SeqCst);
-        let said = output.say_unless(&self.stopped, *stream, &String::from_utf8_lossy(line));
+        let said = output.say_unless(&self.stopped, *stream, *stamp, &String::from_utf8_lossy(line));
         self.shared.writing.store(false, Ordering::SeqCst);
         if said.is_err() {
             self.write_failed = true;
@@ -317,7 +317,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{LINE_CAP, LineSplitter, Readers, Take};
-    use crate::console::{FailingSink, Forwarding, LineSink, Output, Stream};
+    use gate_wire::stamp::{Tag, unstamped};
+
+    use crate::console::{FailingSink, Forwarding, LineSink, Output, RecordingSink, Stamp, Stream};
 
     /// The lines `bytes`, fed in `chunks` of the given sizes, are cut into.
     fn split(bytes: &[u8], chunk: usize) -> Vec<Vec<u8>> {
@@ -402,7 +404,7 @@ mod tests {
         for (tag, stream) in [("out", Stream::Out), ("err", Stream::Err)] {
             let forwarding: Arc<dyn Forwarding> = output.clone();
             readers
-                .read(Lines::new(tag, LINES), Take::Lines(forwarding, stream))
+                .read(Lines::new(tag, LINES), Take::Lines(forwarding, stream, Stamp::Bare))
                 .expect("the reader starts");
         }
         let drained = readers.drain();
@@ -440,12 +442,12 @@ mod tests {
 
     #[test]
     fn a_reader_held_in_its_read_is_left_behind_and_writes_nothing_after_the_drain() {
-        let output = Arc::new(Output::new(crate::console::RecordingSink::default()));
+        let output = Arc::new(Output::new(RecordingSink::default()));
         let (release, held) = mpsc::channel();
         let mut readers = Readers::default();
         let forwarding: Arc<dyn Forwarding> = output.clone();
         readers
-            .read(Held { given: false, release: held }, Take::Lines(forwarding, Stream::Err))
+            .read(Held { given: false, release: held }, Take::Lines(forwarding, Stream::Err, Stamp::Bare))
             .expect("the reader starts");
         let started = Instant::now();
         let drained = readers.drain_within(Duration::from_millis(300), Duration::from_secs(30));
@@ -476,7 +478,7 @@ mod tests {
         let mut readers = Readers::default();
         let forwarding: Arc<dyn Forwarding> = output.clone();
         readers
-            .read(&b"a\nb\n"[..], Take::Lines(forwarding, Stream::Err))
+            .read(&b"a\nb\n"[..], Take::Lines(forwarding, Stream::Err, Stamp::Bare))
             .expect("the reader starts");
         let started = Instant::now();
         let drained = readers.drain_within(Duration::from_millis(100), Duration::from_millis(500));
@@ -492,7 +494,7 @@ mod tests {
         let mut readers = Readers::default();
         let forwarding: Arc<dyn Forwarding> = output.clone();
         readers
-            .read(Lines::new("err", 50), Take::Lines(forwarding, Stream::Err))
+            .read(Lines::new("err", 50), Take::Lines(forwarding, Stream::Err, Stamp::Bare))
             .expect("the reader starts");
         assert!(readers.drain().all_ended);
         assert!(output.client_gone());
@@ -506,7 +508,7 @@ mod tests {
     }
 
     impl Forwarding for GoneAndHeld {
-        fn say_unless(&self, _stopped: &AtomicBool, _stream: Stream, _line: &str) -> io::Result<()> {
+        fn say_unless(&self, _stopped: &AtomicBool, _stream: Stream, _stamp: Stamp, _line: &str) -> io::Result<()> {
             let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
             self.said.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -530,7 +532,7 @@ mod tests {
         let mut readers = Readers::default();
         let forwarding: Arc<dyn Forwarding> = output.clone();
         readers
-            .read(&b"a\nb\n"[..], Take::Lines(forwarding, Stream::Err))
+            .read(&b"a\nb\n"[..], Take::Lines(forwarding, Stream::Err, Stamp::Bare))
             .expect("the reader starts");
         // Far past what a reader that takes no lock needs to reach its pipe's end.
         let drained = readers.drain_within(Duration::from_secs(10), Duration::from_secs(10));
@@ -538,6 +540,44 @@ mod tests {
         assert!(drained.all_ended, "the reader reached its pipe's end while the test held the lock");
         assert!(!drained.stalled);
         assert_eq!(output.said.load(Ordering::SeqCst), 0, "no line is said to a gone client");
+    }
+
+    #[test]
+    fn each_reader_stamps_its_lines_as_its_take_says_and_a_bare_reader_forwards_them_as_they_are() {
+        let output = Arc::new(Output::new(RecordingSink::default()));
+        let mut readers = Readers::default();
+        for (pipe, stream, stamp) in [
+            (&b"hi\n"[..], Stream::Out, Stamp::Now(Tag::Out)),
+            (&b"oops\n"[..], Stream::Err, Stamp::Now(Tag::Err)),
+            (&b"gate-remote-heartbeat: 5\n"[..], Stream::Err, Stamp::Bare),
+        ] {
+            let forwarding: Arc<dyn Forwarding> = output.clone();
+            readers.read(pipe, Take::Lines(forwarding, stream, stamp)).expect("the reader starts");
+        }
+        assert!(readers.drain().all_ended);
+
+        let mut said: Vec<(Stream, Option<Tag>, String)> = output
+            .sink()
+            .lines()
+            .iter()
+            .map(|(stream, line)| {
+                let read = unstamped(line);
+                (*stream, read.tag, read.text.to_owned())
+            })
+            .collect();
+        said.sort_by(|a, b| a.2.cmp(&b.2));
+        assert_eq!(
+            said,
+            [
+                (Stream::Err, None, "gate-remote-heartbeat: 5".to_owned()),
+                (Stream::Out, Some(Tag::Out), "hi".to_owned()),
+                (Stream::Err, Some(Tag::Err), "oops".to_owned()),
+            ]
+        );
+        assert!(
+            output.sink().lines().iter().any(|(_, line)| line == "gate-remote-heartbeat: 5"),
+            "the bare line is written byte for byte"
+        );
     }
 
     #[test]

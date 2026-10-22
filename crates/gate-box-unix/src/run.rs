@@ -21,7 +21,7 @@ use gate_watchdog::Pump;
 use crate::back::{self, BackFailed};
 use crate::beneath;
 use crate::command::{Launch, Sampler, command_record, run_command};
-use crate::console::{Forwarding, LineSink, Output, Stream};
+use crate::console::{Forwarding, GAT, LineSink, Output, Stamp, Stream};
 use crate::files::{self, HeldLock, Locked};
 use crate::git::{
     self, AlternatesFailure, CLOSED_STATUS, Failed, Git, GitClass, RunGit, Steps, Tree, failed_for, for_repo, line_ends_set, origin_set,
@@ -347,7 +347,7 @@ impl RunOutputs {
     fn read<S: LineSink>(asked: &Asked<'_>, input: &mut dyn BufRead, output: &Output<S>) -> RunOutputs {
         let manifest = outputs::read_manifest(input);
         for line in outputs::prune(asked, SystemTime::now()) {
-            noted(output, &line);
+            noted(output, GAT, &line);
         }
         RunOutputs { manifest, listing: None }
     }
@@ -357,7 +357,7 @@ impl RunOutputs {
     fn list<S: LineSink>(&mut self, asked: &Asked<'_>, work: &Path, output: &Output<S>) {
         let (listing, line) = outputs::listing(asked, work);
         if let Some(line) = line {
-            noted(output, &line);
+            noted(output, GAT, &line);
         }
         self.listing = listing;
     }
@@ -485,7 +485,7 @@ fn temp_removed<S: LineSink>(temp: RunTemp, output: &Output<S>) {
         Ok(found) if (found.dev(), found.ino()) != identity => {
             let line = format!("gate: remote did not remove {}: it is no longer the run's temp folder", path.display());
             // Said; the run's status stands.
-            let _ = output.say(Stream::Err, &line);
+            let _ = output.say(Stream::Err, GAT, &line);
             return;
         }
         Ok(_) => fs::remove_dir_all(&path),
@@ -497,7 +497,7 @@ fn temp_removed<S: LineSink>(temp: RunTemp, output: &Output<S>) {
         Err(error) => {
             let line = format!("gate: remote could not remove the run's temp folder {}: {error}", path.display());
             // Said; the run's status stands.
-            let _ = output.say(Stream::Err, &line);
+            let _ = output.say(Stream::Err, GAT, &line);
         }
     }
 }
@@ -544,11 +544,11 @@ fn prepared<'p, S: LineSink + 'static>(
         Translation::Native => {}
         Translation::Unread(line) => {
             // A note: the run goes on, and a client gone finds out at the next line.
-            let _ = output.say(Stream::Err, &line);
+            let _ = output.say(Stream::Err, GAT, &line);
         }
         Translation::Rosetta => {
             let [tag, line] = rosetta_lines(request.nonce);
-            return Err(said(output, &[&tag, &line], REFUSED_STATUS));
+            return Err(said_as(output, &[(Stamp::Bare, &tag), (GAT, &line)], REFUSED_STATUS));
         }
     }
     // A usage error says no back commits line; a root or a bare repository the box cannot use, as a lock it cannot
@@ -608,7 +608,7 @@ fn login_read<S: LineSink>(output: &Output<S>, login: LoginShell) -> Option<Logi
     });
     read.inspect_err(|why| {
         // A note: the run goes on, and a client gone finds out at the next line.
-        let _ = output.say(Stream::Err, &login_path_line(why));
+        let _ = output.say(Stream::Err, GAT, &login_path_line(why));
     })
     .ok()
 }
@@ -628,6 +628,7 @@ pub(crate) fn run_git<'a, S: LineSink + 'static>(
         request.lock,
         output,
         Some(record),
+        GAT,
     )
 }
 
@@ -835,9 +836,9 @@ fn brought_back<S: LineSink + 'static>(
         Err(reason) => return said(output, &[&outputs::not_brought_back(&reason)], FAILED_STATUS),
     };
     if let Some(skipped) = &brought.skipped {
-        noted(output, skipped);
+        noted(output, GAT, skipped);
     }
-    noted(output, &brought.line);
+    noted(output, Stamp::Bare, &brought.line);
     if !brought.wrote_archive() {
         return 0;
     }
@@ -849,7 +850,7 @@ fn brought_back<S: LineSink + 'static>(
     // Held to here, so no other run's trim removes the archive before this one's is done.
     drop(brought);
     for line in &trimmed.lines {
-        noted(output, line);
+        noted(output, GAT, line);
     }
     match &trimmed.reason {
         Some(reason) => said(output, &[&outputs::not_brought_back(reason)], FAILED_STATUS),
@@ -857,9 +858,9 @@ fn brought_back<S: LineSink + 'static>(
     }
 }
 
-/// Says `line` on stderr, unless the client is gone: a line the run goes on past.
-fn noted<S: LineSink>(output: &Output<S>, line: &str) {
-    said(output, &[line], 0);
+/// Says `line` on stderr as `stamp` says, unless the client is gone: a line the run goes on past.
+fn noted<S: LineSink>(output: &Output<S>, stamp: Stamp, line: &str) {
+    said_as(output, &[(stamp, line)], 0);
 }
 
 /// How a run starts its heartbeat: [`heartbeat::start`], or a test's own.
@@ -929,6 +930,7 @@ fn locked<S: LineSink + 'static>(
             // A note: the run goes on, and a client gone finds out at the next line.
             let _ = output.say(
                 Stream::Err,
+                GAT,
                 &format!("gate: remote heartbeat stopped: cannot start the heartbeat: {error}"),
             );
         })
@@ -996,14 +998,20 @@ fn back_commits_failed<S: LineSink>(output: &Output<S>, request: &Request<'_>, s
     said(output, &[BACK_COMMITS_FAILED], status)
 }
 
-/// Says `lines` on stderr together, unless the client is gone; `status`.
+/// Says `lines` on stderr together, stamped `gat`, unless the client is gone; `status`.
 fn said<S: LineSink>(output: &Output<S>, lines: &[&str], status: u8) -> u8 {
+    let lines: Vec<(Stamp, &str)> = lines.iter().map(|line| (GAT, *line)).collect();
+    said_as(output, &lines, status)
+}
+
+/// Says `lines` on stderr together, each as its stamp says, unless the client is gone; `status`.
+fn said_as<S: LineSink>(output: &Output<S>, lines: &[(Stamp, &str)], status: u8) -> u8 {
     // A client that has gone has no one left to tell, and the status still ends the ssh session; one still connected
     // but no longer reading would hold the write, and the output lock, for good.
     if output.client_gone() {
         return status;
     }
-    let lines: Vec<(Stream, &str)> = lines.iter().map(|line| (Stream::Err, *line)).collect();
+    let lines: Vec<(Stream, Stamp, &str)> = lines.iter().map(|(stamp, line)| (Stream::Err, *stamp, *line)).collect();
     let _ = output.say_together(&lines);
     status
 }
@@ -1029,7 +1037,7 @@ fn inputs_matched<S: LineSink>(request: &Request<'_>, lock: &HeldLock, output: &
         Ok(moved_aside) => {
             if let Some(line) = moved_aside {
                 // A note: the run goes on, and a client gone finds out at the next line.
-                let _ = output.say(Stream::Err, &line);
+                let _ = output.say(Stream::Err, GAT, &line);
             }
             Ok(())
         }
@@ -1051,7 +1059,11 @@ fn inputs_matched<S: LineSink>(request: &Request<'_>, lock: &HeldLock, output: &
 
 /// Refuses the run of `request` for `refusal`: its tag, then `line`, said together; [`REFUSED_STATUS`].
 fn refused<S: LineSink>(output: &Output<S>, request: &Request<'_>, refusal: Refusal, line: &str) -> u8 {
-    said(output, &[&refused_line(request.nonce, refusal), line], REFUSED_STATUS)
+    said_as(
+        output,
+        &[(Stamp::Bare, &refused_line(request.nonce, refusal)), (GAT, line)],
+        REFUSED_STATUS,
+    )
 }
 
 /// Ends the run of `request` whose work folder could not be laid out as `not` says: refused `layout` with the layout
@@ -1696,6 +1708,20 @@ mod tests {
         marker: PathBuf,
     }
 
+    impl MarkingSink {
+        /// The lines written so far with their streams, unstamped, the process lines and their note left out, as
+        /// [`RecordingSink::said`] gives them.
+        fn said(&self) -> Vec<(Stream, String)> {
+            self.lines
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .map(|(stream, line)| (*stream, gate_wire::stamp::unstamped(line).text.to_owned()))
+                .filter(|(_, text)| !gate_wire::stamp::is_process_line(text) && !text.starts_with("process lines: "))
+                .collect()
+        }
+    }
+
     impl LineSink for MarkingSink {
         fn write_line(&self, stream: Stream, line: &str) -> std::io::Result<()> {
             if line.starts_with("gate-remote-heartbeat:") && !self.marker.exists() {
@@ -1726,7 +1752,7 @@ mod tests {
         if let Ok(ready) = ready.as_mut() {
             tmp_cleared(ready);
         }
-        assert!(ready.as_ref().is_ok_and(|ready| ready.pump.is_none()), "{:?}", output.sink().lines());
+        assert!(ready.as_ref().is_ok_and(|ready| ready.pump.is_none()), "{:?}", output.sink().said());
         assert_eq!(
             stderr_of(&output),
             ["gate: remote heartbeat stopped: cannot start the heartbeat: no thread"]
@@ -1762,7 +1788,7 @@ mod tests {
             ..Periods::default()
         };
         let ready = prepare(&payload, &output, periods, own_path);
-        let lines = || output.sink().lines.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let lines = || output.sink().said();
         assert!(ready.is_ok(), "the run is ready: {:?}", lines());
         let mut ready = ready.expect("the run is ready");
         tmp_cleared(&mut ready);
@@ -1830,7 +1856,7 @@ mod tests {
         let payload = decoded(json);
         let output = Arc::new(Output::new(RecordingSink::default()));
         let status = run_along(&payload, &output, free_watches(), own_path);
-        (status, output.sink().lines())
+        (status, output.sink().said())
     }
 
     impl Case {
@@ -1919,7 +1945,7 @@ mod tests {
         let status = run_along(&payload, &output, free_watches(), own_path);
         let err: Vec<String> = output
             .sink()
-            .lines()
+            .said()
             .into_iter()
             .filter(|(stream, _)| *stream == Stream::Err)
             .map(|(_, line)| line)
@@ -2064,7 +2090,7 @@ mod tests {
         let status = run_along(&payload, &output, free_watches(), godot_login);
         let out = output
             .sink()
-            .lines()
+            .said()
             .into_iter()
             .filter(|(stream, line)| *stream == Stream::Out && *line != started_line(NONCE))
             .map(|(_, line)| line)
@@ -2128,7 +2154,7 @@ mod tests {
     fn err_of(output: &Output<RecordingSink>) -> Vec<String> {
         output
             .sink()
-            .lines()
+            .said()
             .into_iter()
             .filter(|(stream, _)| *stream == Stream::Err)
             .map(|(_, line)| line)
@@ -2382,7 +2408,7 @@ mod tests {
     }
 
     fn stderr_of(output: &Output<RecordingSink>) -> Vec<String> {
-        let lines = output.sink().lines();
+        let lines = output.sink().said();
         assert!(lines.iter().all(|(stream, _)| *stream == Stream::Err), "{lines:?}");
         lines.into_iter().map(|(_, line)| line).collect()
     }
@@ -2414,7 +2440,7 @@ mod tests {
         assert!(
             !stderr_of(&output).iter().any(|line| line.starts_with("gate")),
             "no gate line: {:?}",
-            output.sink().lines()
+            output.sink().said()
         );
         drop(ready);
         assert!(matches!(take_lock(Path::new(&case.lock())), Ok(Locked::Held(_))), "let go once dropped");
@@ -3444,7 +3470,7 @@ mod tests {
 
         let checked = inputs_matched(&request, &lock, &output);
 
-        assert!(matches!(checked, Err(Unready::Ended(1))), "{:?}", output.sink().lines());
+        assert!(matches!(checked, Err(Unready::Ended(1))), "{:?}", output.sink().said());
         assert_eq!(
             stderr_of(&output),
             [format!(
@@ -3541,7 +3567,7 @@ mod tests {
         let payload = decoded(json);
         let output = Arc::new(Output::new(RecordingSink::default()));
         let status = run_reading(&payload, &output, watches, own_path, input);
-        (status, output.sink().lines())
+        (status, output.sink().said())
     }
 
     /// A case whose snapshot holds `a.txt` and ignores `bin/`, so a file a command writes there is in no back commit;
@@ -3675,7 +3701,7 @@ mod tests {
             input: &mut input,
         };
         let ready = prepared(&payload, &output, periods, sources);
-        let lines = || output.sink().lines.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let lines = || output.sink().said();
         assert!(ready.is_ok(), "the run is ready: {:?}", lines());
         let mut ready = ready.expect("the run is ready");
         tmp_cleared(&mut ready);
@@ -3781,7 +3807,7 @@ mod tests {
 
     impl LineSink for GoneFrom {
         fn write_line(&self, stream: Stream, line: &str) -> std::io::Result<()> {
-            if line.starts_with(self.from) {
+            if gate_wire::stamp::unstamped(line).text.starts_with(self.from) {
                 self.gone.store(true, Ordering::SeqCst);
             }
             if self.gone.load(Ordering::SeqCst) {

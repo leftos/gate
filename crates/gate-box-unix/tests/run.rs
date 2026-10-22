@@ -28,6 +28,7 @@ mod unix {
     use gate_inputs::hash::sha256_of;
     use gate_inputs::manifest::{Held, Manifest, Stamp, read_sent};
     use gate_inputs::pack::Packer;
+    use gate_wire::stamp::{Tag, unstamped};
     use gate_wire::{BoxKill, Refusal, adjusted_prefix, busy_line, escaped, killed_line, refused_line, started_line};
     use serde_json::{Value, json};
 
@@ -274,6 +275,43 @@ mod unix {
             let prefix = adjusted_prefix(NONCE);
             self.err.iter().any(|line| line.starts_with(&prefix))
         }
+
+        /// Each line said on stderr, unstamped.
+        fn err_texts(&self) -> Vec<&str> {
+            texts(&self.err)
+        }
+
+        /// Checks every protocol line the run said, on either stream, is bare: written as it is, with no stamp.
+        fn protocol_bare(&self) {
+            for line in self.out.iter().chain(&self.err) {
+                let read = unstamped(line);
+                if read.text.starts_with("gate-remote-") {
+                    assert_eq!(read.stamp, None, "a protocol line is never stamped: {line}");
+                }
+            }
+        }
+
+        /// The index and the text of each process line said on stderr, in order, unstamped.
+        fn process_lines(&self) -> Vec<(usize, &str)> {
+            self.err
+                .iter()
+                .enumerate()
+                .filter_map(|(at, line)| {
+                    let read = unstamped(line);
+                    (read.tag == Some(Tag::Gat) && gate_wire::stamp::is_process_line(read.text)).then_some((at, read.text))
+                })
+                .collect()
+        }
+    }
+
+    /// The text of each of `lines`, unstamped.
+    fn texts(lines: &[String]) -> Vec<&str> {
+        lines.iter().map(|line| unstamped(line).text).collect()
+    }
+
+    /// The value of the word `key=<value>` in `text`.
+    fn word<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+        text.split(' ').find_map(|word| word.strip_prefix(key)?.strip_prefix('='))
     }
 
     /// Starts `gate-box box --test-heartbeat-ms 50 --test-box-sample-ms 50 <seams> run --stdin`, writes `request` on
@@ -374,16 +412,20 @@ mod unix {
         );
         assert_eq!(ended.status, Some(0), "{:?}", ended.err);
         assert_eq!(
-            ended.out,
-            [started_line(NONCE), "hi".to_owned()],
+            texts(&ended.out),
+            [started_line(NONCE).as_str(), "hi"],
             "the start marker before the command's output"
         );
+        ended.protocol_bare();
         assert!(beaten.exists(), "a heartbeat was read after the start marker: {:?}", ended.err);
         assert!(ended.adjusted(), "the adjusted line: {:?}", ended.err);
         // The login shell's PATH has a wall-clock bound a busy Mac can cross, which only notes it.
         let unread_path = "gate: remote path: could not read the login shell's PATH";
         assert!(
-            !ended.err.iter().any(|line| line.starts_with("gate: ") && !line.starts_with(unread_path)),
+            !ended
+                .err_texts()
+                .iter()
+                .any(|line| line.starts_with("gate: ") && !line.starts_with(unread_path)),
             "no gate line: {:?}",
             ended.err
         );
@@ -426,8 +468,8 @@ mod unix {
         let ended = ran(&[], &case.request(&commit, &extra), Reading::All, &case.base.join("beaten"));
         assert_eq!(ended.status, Some(0), "{:?}", ended.err);
         assert_eq!(
-            ended.out,
-            [started_line(NONCE), "a".to_owned(), "b".to_owned()],
+            texts(&ended.out),
+            [started_line(NONCE).as_str(), "a", "b"],
             "the command ran in the main tree, its sibling beside it"
         );
         let main_back = case.back().expect("the main repo's back ref is pushed");
@@ -442,11 +484,11 @@ mod unix {
         let line = format!("gate: remote back commits: repo {main_back}, lib {lib_back}");
         assert_eq!(
             ended
-                .err
-                .iter()
+                .err_texts()
+                .into_iter()
                 .filter(|said| said.starts_with("gate: remote back commits:"))
                 .collect::<Vec<_>>(),
-            [&line],
+            [line.as_str()],
             "one line names both back commits: {:?}",
             ended.err
         );
@@ -475,7 +517,7 @@ mod unix {
         assert_eq!(ended.status, Some(0), "{:?}", ended.err);
         assert_eq!(ended.out.len(), 2, "the start marker and the TMPDIR: {:?}", ended.out);
         assert_eq!(ended.out.first(), Some(&started_line(NONCE)));
-        let tmpdir = ended.out.last().expect("the command said its TMPDIR");
+        let tmpdir = ended.out.last().map(|line| unstamped(line).text).expect("the command said its TMPDIR");
         assert!(tmpdir.starts_with("/tmp/gate.") && tmpdir.ends_with('/') && tmpdir.len() < 38, "{tmpdir}");
         assert!(!Path::new(tmpdir).exists(), "the run's temp folder is gone: {tmpdir}");
         case.ended_clean();
@@ -488,7 +530,7 @@ mod unix {
         let request = case.request(&commit, &json!({"Timeout": 3600}));
         let ended = ran(&["--test-box-sampler-fail", "true"], &request, Reading::All, &case.base.join("beaten"));
         assert_eq!(ended.status, Some(0), "{:?}", ended.err);
-        assert!(ended.err.iter().any(|line| line.starts_with(SAMPLER_FAILED)), "{:?}", ended.err);
+        assert!(ended.err_texts().iter().any(|line| line.starts_with(SAMPLER_FAILED)), "{:?}", ended.err);
         assert!(!ended.adjusted(), "no adjusted line: {:?}", ended.err);
         case.ended_clean();
     }
@@ -502,6 +544,7 @@ mod unix {
         let ended = ran(&["--test-box-free-percent", "100"], &request, Reading::All, &case.base.join("beaten"));
         assert_eq!(ended.status, Some(124), "{:?}", ended.err);
         assert!(ended.err_has(&killed_line(NONCE, BoxKill::TimedOut)), "{:?}", ended.err);
+        ended.protocol_bare();
         assert_eq!(case.back(), None, "no back commit, and the earlier back ref is deleted");
         assert!(!Path::new(&format!("{}.pgid", case.work())).exists(), "no .pgid left");
         assert!(case.lock_free(), "the work lock is free");
@@ -527,10 +570,11 @@ mod unix {
         assert!(ended.out.is_empty(), "no start marker: {:?}", ended.out);
         let tag = ended.err.iter().position(|line| *line == refused_line(NONCE, Refusal::Busy));
         assert!(
-            tag.is_some_and(|tag| ended.err.get(tag + 1) == Some(&busy_line(KEY))),
+            tag.is_some_and(|tag| ended.err_texts().get(tag + 1) == Some(&busy_line(KEY).as_str())),
             "the busy tag, then the busy line: {:?}",
             ended.err
         );
+        ended.protocol_bare();
         drop(held);
         assert!(case.lock_free(), "the box let go of nothing it did not hold");
     }
@@ -672,11 +716,11 @@ mod unix {
         assert_eq!(ended.status, Some(0), "{:?}", ended.err);
         assert_eq!(fs::read_to_string(&log).expect("the shim ran"), "tool restore\n", "one restore");
         assert!(
-            ended.err.iter().any(|line| line.starts_with("gate: dotnet tool restore took ")),
+            ended.err_texts().iter().any(|line| line.starts_with("gate: dotnet tool restore took ")),
             "{:?}",
             ended.err
         );
-        assert_eq!(ended.out, [started_line(NONCE)], "{:?}", ended.err);
+        assert_eq!(texts(&ended.out), [started_line(NONCE)], "{:?}", ended.err);
         assert!(Path::new(&format!("{}.tools", case.work())).exists(), "the tools record is written");
         case.ended_clean();
     }
@@ -774,7 +818,7 @@ mod unix {
         let line = format!("gate: remote inputs of work folder {KEY} are not the ones sent: {}", escaped(why));
         let tag = ended.err.iter().position(|said| *said == refused_line(NONCE, Refusal::Inputs));
         assert!(
-            tag.is_some_and(|tag| ended.err.get(tag + 1) == Some(&line)),
+            tag.is_some_and(|tag| ended.err_texts().get(tag + 1) == Some(&line.as_str())),
             "the inputs tag, then {line}: {:?}",
             ended.err
         );
@@ -789,7 +833,7 @@ mod unix {
         let ended = ran_with_inputs(&case, &commit, "cat in.txt cache/x.bin");
 
         assert_eq!(ended.status, Some(0), "{:?}", ended.err);
-        assert_eq!(ended.out, [started_line(NONCE), "input".to_owned(), "cached".to_owned()]);
+        assert_eq!(texts(&ended.out), [started_line(NONCE).as_str(), "input", "cached"]);
         case.ended_clean();
     }
 
@@ -940,6 +984,7 @@ mod unix {
 
         assert_eq!(ended.status, Some(0), "{:?}", ended.err);
         assert_eq!(outputs_said(&ended), [packed_line(1)], "{:?}", ended.err);
+        ended.protocol_bare();
         let (status, sent, err) = case.outputs_sent(&archive_name());
         assert_eq!(status, Some(0), "{err:?}");
         assert!(err.is_empty(), "{err:?}");
@@ -984,7 +1029,7 @@ mod unix {
         let back = ended
             .err
             .iter()
-            .position(|line| line.starts_with("gate: remote back commits: repo none, lib "));
+            .position(|line| unstamped(line).text.starts_with("gate: remote back commits: repo none, lib "));
         let packed = ended.err.iter().position(|line| *line == packed_line(1));
         assert!(
             back.is_some() && back < packed,
@@ -1018,7 +1063,156 @@ mod unix {
         let ended = ran_in(&[], &request, Reading::All, &case.base.join("beaten"), Some(&shell));
         assert_eq!(ended.status, Some(0), "{:?}", ended.err);
         let said = format!("--headless --path src/X --build-solutions --quit|{}", program.display());
-        assert_eq!(ended.out, [started_line(NONCE), said], "{:?}", ended.err);
+        assert_eq!(texts(&ended.out), [started_line(NONCE), said], "{:?}", ended.err);
         case.ended_clean();
+    }
+
+    #[test]
+    fn every_line_of_the_command_is_stamped_out_or_err_and_the_protocol_lines_are_bare() {
+        let case = Case::new("stamped");
+        let commit = case.snapshot();
+        let beaten = case.base.join("beaten");
+        let command = waits_for_a_beat("echo one; echo two >&2; echo three", &beaten);
+        let ended = ran(
+            &[],
+            &case.request(&commit, &json!({"Command": command, "Timeout": 3600})),
+            Reading::All,
+            &beaten,
+        );
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(ended.out.first(), Some(&started_line(NONCE)), "the start marker, bare");
+        let out: Vec<(Option<Tag>, &str)> = ended.out[1..].iter().map(|line| (unstamped(line).tag, unstamped(line).text)).collect();
+        assert_eq!(out, [(Some(Tag::Out), "one"), (Some(Tag::Out), "three")], "{:?}", ended.out);
+        let two: Vec<Option<Tag>> = ended
+            .err
+            .iter()
+            .filter(|line| unstamped(line).text == "two")
+            .map(|line| unstamped(line).tag)
+            .collect();
+        assert_eq!(two, [Some(Tag::Err)], "{:?}", ended.err);
+        for line in &ended.err {
+            let read = unstamped(line);
+            let protocol = read.text.starts_with("gate-remote-");
+            assert!(protocol || read.tag.is_some(), "a line that is not a protocol line is stamped: {line}");
+        }
+        assert!(beaten.exists() && ended.adjusted(), "a heartbeat and the adjusted line: {:?}", ended.err);
+        ended.protocol_bare();
+        case.ended_clean();
+    }
+
+    #[test]
+    fn the_root_line_comes_before_the_leader_s_spawn_whose_parent_is_the_box() {
+        let case = Case::new("root");
+        let commit = case.snapshot();
+        let ended = ran(
+            &[],
+            &case.request(&commit, &json!({"Command": ["/bin/sh", "-c", "exit 0"]})),
+            Reading::All,
+            &case.base.join("beaten"),
+        );
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        let lines = ended.process_lines();
+        let (root_at, root) = *lines.iter().find(|(_, text)| text.starts_with("gate pid=")).expect("a root line");
+        let (spawn_at, spawn) = *lines.iter().find(|(_, text)| text.starts_with("spawn pid=")).expect("a spawn line");
+        assert!(root_at < spawn_at, "the root line first: {:?}", ended.err);
+        assert_eq!(
+            word(root, "ppid"),
+            Some(std::process::id().to_string().as_str()),
+            "the root is the box this case started: {root}"
+        );
+        assert_eq!(word(spawn, "ppid"), word(root, "pid"), "the leader's parent is the box: {spawn}");
+        assert!(spawn.ends_with(" sh"), "the leader's image is its program's file name: {spawn}");
+        let leader = word(spawn, "pid").expect("the spawn names its pid");
+        let exit = format!("exit pid={leader} code=0 ran=");
+        assert!(
+            lines.iter().any(|(at, text)| *at > spawn_at && text.starts_with(&exit)),
+            "the leader's exit: {:?}",
+            ended.err
+        );
+        case.ended_clean();
+    }
+
+    /// Checks each exit line of `lines` comes after the spawn line of its pid.
+    fn exits_follow_spawns(lines: &[(usize, &str)]) {
+        for (at, text) in lines.iter().filter(|(_, text)| text.starts_with("exit pid=")) {
+            let pid = word(text, "pid");
+            assert!(
+                lines
+                    .iter()
+                    .any(|(spawned, spawn)| spawned < at && spawn.starts_with("spawn pid=") && word(spawn, "pid") == pid),
+                "{text} has no spawn before it: {lines:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_shell_s_background_sleep_has_its_spawn_and_exit_before_the_leader_s_exit() {
+        let case = Case::new("descendant");
+        let commit = case.snapshot();
+        let command = json!(["/bin/sh", "-c", "sleep 0.2 & wait; exit 3"]);
+        let ended = ran(
+            &[],
+            &case.request(&commit, &json!({"Command": command})),
+            Reading::All,
+            &case.base.join("beaten"),
+        );
+        assert_eq!(ended.status, Some(3), "{:?}", ended.err);
+        let lines = ended.process_lines();
+        let (_, leader) = *lines.iter().find(|(_, text)| text.starts_with("spawn pid=")).expect("the leader's spawn");
+        let shell = word(leader, "pid").expect("the spawn names its pid");
+        let found = lines
+            .iter()
+            .find(|(_, text)| text.starts_with("spawn pid=") && word(text, "ppid") == Some(shell))
+            .copied();
+        assert!(found.is_some(), "the sleep's spawn, its parent the shell: {:?}", ended.err);
+        let (sleep_at, sleep) = found.expect("the sleep's spawn");
+        let sleep_pid = word(sleep, "pid").expect("the spawn names its pid");
+        let sleep_exit = lines
+            .iter()
+            .find(|(_, text)| text.starts_with(&format!("exit pid={sleep_pid} ")))
+            .expect("the sleep's exit");
+        assert!(sleep_exit.1.contains(" code=0 "), "{sleep_exit:?}");
+        assert!(sleep_exit.0 > sleep_at);
+        let sleep_said = lines.iter().filter(|(_, text)| word(text, "pid") == Some(sleep_pid)).count();
+        assert_eq!(sleep_said, 2, "the sleep's spawn and exit, and no other line of it: {lines:?}");
+        let leader_exit = lines
+            .iter()
+            .find(|(_, text)| text.starts_with(&format!("exit pid={shell} ")))
+            .expect("the leader's exit");
+        assert!(leader_exit.1.contains(" code=3 "), "{leader_exit:?}");
+        assert!(leader_exit.0 > sleep_exit.0, "the sleep's exit before the leader's: {lines:?}");
+        exits_follow_spawns(&lines);
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_killed_run_gives_the_leader_s_exit_by_signal_and_no_process_line_after_its_final_lines() {
+        let case = Case::new("killed-lines");
+        let commit = case.snapshot();
+        let request = case.request(&commit, &json!({"Command": ["/bin/sh", "-c", "sleep 600"], "Timeout": 1}));
+        // The whole machine free, so the ceiling's clock runs with wall time however loaded the machine is.
+        let ended = ran(&["--test-box-free-percent", "100"], &request, Reading::All, &case.base.join("beaten"));
+        assert_eq!(ended.status, Some(124), "{:?}", ended.err);
+        let tag = ended
+            .err
+            .iter()
+            .position(|line| *line == killed_line(NONCE, BoxKill::TimedOut))
+            .expect("the kill tag, bare");
+        let lines = ended.process_lines();
+        let (_, leader) = *lines.iter().find(|(_, text)| text.starts_with("spawn pid=")).expect("the leader's spawn");
+        let shell = word(leader, "pid").expect("the spawn names its pid");
+        let exit = lines
+            .iter()
+            .find(|(_, text)| text.starts_with(&format!("exit pid={shell} signal=")))
+            .expect("the leader's exit, by a signal");
+        assert!(exit.0 < tag, "the leader's exit before the kill lines: {:?}", ended.err);
+        assert!(
+            lines.iter().all(|(at, _)| *at < tag),
+            "no process line after the kill lines: {:?}",
+            ended.err
+        );
+        exits_follow_spawns(&lines);
+        ended.protocol_bare();
     }
 }

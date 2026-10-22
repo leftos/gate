@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::command::removed_if_held;
-use crate::console::{LineSink, Output, Stream};
+use crate::console::{GAT, LineSink, Output, Stream};
 use crate::files::{self, HeldLock};
 use crate::git::{Failed, GitClass, RunGit};
 use crate::run::{Repo, Request, back_ref_cleared, run_git};
@@ -108,7 +108,7 @@ fn undone<S: LineSink + 'static>(request: &Request<'_>, pushed: &[&Repo<'_>], gi
             continue;
         };
         if !output.client_gone() {
-            let lines: Vec<(Stream, &str)> = failed.lines.iter().map(|line| (Stream::Err, line.as_str())).collect();
+            let lines: Vec<(Stream, _, &str)> = failed.lines.iter().map(|line| (Stream::Err, GAT, line.as_str())).collect();
             // A note: the run ends on the push's failure, and a client gone finds out at its line.
             let _ = output.say_together(&lines);
         }

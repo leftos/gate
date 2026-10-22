@@ -19,13 +19,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gate_args::is_godot_console;
 use gate_watchdog::{Config, CpuSource, Kill, Machine, Pump, Sample, SystemTimes, Ticks};
+use gate_wire::stamp::Tag;
 use gate_wire::{BoxKill, adjusted_line, escaped, killed_line, started_line};
 
-use crate::console::{Forwarding, LineSink, Output, Stream};
+use crate::console::{Forwarding, GAT, LineSink, Output, Stamp, Stream};
 use crate::cpu::{GroupCpu, LoadTotals, host_cpu_load};
 use crate::files::{self, HeldLock};
 use crate::lines::{Along, CommandEnd, Godot, command_environment, round_trip, write_failure};
 use crate::process::{EndedBy, Ending, Forward, GroupRecord, Halt, NotRan, Ran, Watch, is_still_there, run_watched};
+use crate::process_lines::ProcessLines;
 use crate::run::group_record;
 
 /// How long the command's group has, once asked to end with `SIGTERM`, before `SIGKILL`: the git steps' grace.
@@ -349,11 +351,11 @@ struct Beat<'a> {
 /// [`run_command`], the heartbeat watching the command as `beat` says.
 fn run_with<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>, beat: &Beat<'_>) -> CommandEnd {
     let Some((program, rest)) = launch.words.split_first() else {
-        let _ = output.say(Stream::Err, &failed_line("the run has no command"));
+        let _ = output.say(Stream::Err, GAT, &failed_line("the run has no command"));
         return CommandEnd::Failed;
     };
     // A client that has gone has no one left to tell; the probe below ends the run.
-    let _ = output.say(Stream::Out, &started_line(launch.nonce));
+    let _ = output.say(Stream::Out, Stamp::Bare, &started_line(launch.nonce));
     if output.client_gone_probe() {
         return CommandEnd::Gone;
     }
@@ -361,7 +363,7 @@ fn run_with<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>,
     if let Err(failure) = files::replace_plain(Path::new(&record), record_text(launch.job).as_bytes()) {
         // The plain write failure, for an unsynced record too: it is removed below.
         let (files::ReplaceFailure::NotWritten(error) | files::ReplaceFailure::Unsynced(error)) = &failure;
-        let _ = output.say(Stream::Err, &write_failure(&record, &error.to_string()));
+        let _ = output.say(Stream::Err, GAT, &write_failure(&record, &error.to_string()));
         // A record put in place but not synced is still at the name: the command never ran.
         removed_if_held(&record, launch.lock, output);
         return CommandEnd::Failed;
@@ -372,6 +374,7 @@ fn run_with<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>,
     }
     let group = GroupRecord::new(PathBuf::from(group_record(launch.work)), launch.job, launch.lock);
     let forwarding: Arc<dyn Forwarding> = Arc::clone(output) as Arc<dyn Forwarding>;
+    let processes = ProcessLines::new(Arc::clone(&forwarding));
     let ceiling = Ceiling::new(launch.timeout, launch.sample, launch.sampler);
     let started = |group: i32| {
         let cpu = (beat.cpu_of)(group);
@@ -393,15 +396,21 @@ fn run_with<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>,
         deadline: None,
         ending: Ending::TermThenKill(END_GRACE),
         output: Some(forwarding),
-        forward: Forward::Both,
+        forward: Forward::Both(Stamp::Now(Tag::Out), Stamp::Now(Tag::Err)),
         ends_on_gone: true,
         record: Some(&group),
         check: Some(&check),
         on_started: Some(&started),
         on_leader_exit: Some(&leader_exited),
+        processes: Some(&processes),
     };
     let ran = match started_program(launch.godot, program) {
-        Ok(program) => run_watched(command_of(launch, program, rest), &watch),
+        Ok(program) => {
+            processes.root();
+            let ran = run_watched(command_of(launch, program, rest), &watch);
+            processes.finish();
+            ran
+        }
         Err(error) => Err(NotRan::Start(error)),
     };
     ended(launch, &record, ran, &ceiling.verdict(), output)
@@ -437,7 +446,7 @@ fn ended<S: LineSink>(launch: &Launch<'_>, record: &str, ran: Result<Ran, NotRan
             removed_if_held(record, launch.lock, output);
             let program = launch.words.first().map_or("", String::as_str);
             let line = format!("gate: remote could not start {}: {}", escaped(program), escaped(&error.to_string()));
-            let _ = output.say(Stream::Err, &line);
+            let _ = output.say(Stream::Err, GAT, &line);
             return CommandEnd::NotStarted;
         }
         Err(not) => {
@@ -445,7 +454,13 @@ fn ended<S: LineSink>(launch: &Launch<'_>, record: &str, ran: Result<Ran, NotRan
             if output.client_gone() {
                 return CommandEnd::Gone;
             }
-            let lines: Vec<String> = verdict.failed.iter().cloned().chain([failed_line(&unran(not))]).collect();
+            let lines: Vec<(Stamp, String)> = verdict
+                .failed
+                .iter()
+                .cloned()
+                .chain([failed_line(&unran(not))])
+                .map(|line| (GAT, line))
+                .collect();
             said_together(output, &lines);
             return CommandEnd::Failed;
         }
@@ -468,18 +483,18 @@ fn said_end_lines<S: LineSink>(launch: &Launch<'_>, verdict: &Verdict, end: Comm
     let adjusted = verdict
         .adjusted
         .filter(|_| matches!(end, CommandEnd::Exited(_) | CommandEnd::Signalled(_)))
-        .map(|seconds| adjusted_line(launch.nonce, seconds));
-    let lines: Vec<String> = verdict.failed.iter().cloned().chain(adjusted).collect();
+        .map(|seconds| (Stamp::Bare, adjusted_line(launch.nonce, seconds)));
+    let lines: Vec<(Stamp, String)> = verdict.failed.iter().map(|line| (GAT, line.clone())).chain(adjusted).collect();
     said_together(output, &lines);
 }
 
-/// Says `lines` on standard error together, nothing for none; a client gone meanwhile hears nothing, and the run's
-/// status stands.
-fn said_together<S: LineSink>(output: &Output<S>, lines: &[String]) {
+/// Says `lines` on standard error together, each as its stamp says, nothing for none; a client gone meanwhile hears
+/// nothing, and the run's status stands.
+fn said_together<S: LineSink>(output: &Output<S>, lines: &[(Stamp, String)]) {
     if lines.is_empty() {
         return;
     }
-    let lines: Vec<(Stream, &str)> = lines.iter().map(|line| (Stream::Err, line.as_str())).collect();
+    let lines: Vec<(Stream, Stamp, &str)> = lines.iter().map(|(stamp, line)| (Stream::Err, *stamp, line.as_str())).collect();
     let _ = output.say_together(&lines);
 }
 
@@ -505,8 +520,17 @@ fn killed<S: LineSink>(launch: &Launch<'_>, kill: Kill, ran: Result<Ran, NotRan>
         kill.line_on(&spoken, &escaped(launch.host))
     };
     let tagged = killed_line(launch.nonce, tag);
-    let adjusted = verdict.adjusted.map(|seconds| adjusted_line(launch.nonce, seconds));
-    let lines: Vec<String> = verdict.failed.iter().cloned().chain(note).chain([line, tagged]).chain(adjusted).collect();
+    let adjusted = verdict.adjusted.map(|seconds| (Stamp::Bare, adjusted_line(launch.nonce, seconds)));
+    let lines: Vec<(Stamp, String)> = verdict
+        .failed
+        .iter()
+        .cloned()
+        .chain(note)
+        .chain([line])
+        .map(|line| (GAT, line))
+        .chain([(Stamp::Bare, tagged)])
+        .chain(adjusted)
+        .collect();
     said_together(output, &lines);
     CommandEnd::Killed(tag)
 }
@@ -558,7 +582,7 @@ pub(crate) fn removed_if_held<S: LineSink>(record: &str, lock: &HeldLock, output
     if let Err(error) = files::remove_if_there(path).and_then(|()| files::folder_synced(path)) {
         let line = format!("gate: remote could not remove {}: {}", escaped(record), escaped(&error.to_string()));
         // Said; the run's status stands.
-        let _ = output.say(Stream::Err, &line);
+        let _ = output.say(Stream::Err, GAT, &line);
     }
 }
 
@@ -656,10 +680,11 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use gate_watchdog::{CpuSource, Kill, Pump};
+    use gate_wire::stamp::{is_process_line, unstamped};
     use gate_wire::{BoxKill, adjusted_prefix, killed_line, started_line};
 
     use super::{Beat, Ceiling, Launch, Sampler, Verdict, command_record, ended, removed_if_held, run_command, run_with};
-    use crate::console::{Forwarding, HungUpSink, LineSink, Output, RecordingSink, Stream};
+    use crate::console::{Forwarding, HungUpSink, LineSink, Output, RecordingSink, Stamp, Stream};
     use crate::files::{HeldLock, held_for_test};
     use crate::heartbeat;
     use crate::lines::{CommandEnd, Godot, command_status};
@@ -1077,7 +1102,7 @@ mod tests {
         let (release, hold) = channel();
         let output = Output::new(BeatSink::holding(beats, hold, HoldFrom::First, None));
         thread::scope(|scope| {
-            let stuck = scope.spawn(|| output.say(Stream::Err, "gate-remote-heartbeat: 0"));
+            let stuck = scope.spawn(|| output.say(Stream::Err, Stamp::Bare, "gate-remote-heartbeat: 0"));
             assert!(beaten.recv_timeout(GUARD).is_ok(), "the other thread holds the output lock in its write");
             // A check that took the lock would wait for the stuck write, which is let go only after it.
             // The failing sampler leaves the backstop the only kill, and its failure is kept, not said.
@@ -1208,14 +1233,15 @@ mod tests {
         Arc::new(Output::new(RecordingSink::default()))
     }
 
-    /// The lines `output` said on `stream`.
+    /// The lines `output` said on `stream`, unstamped, the process lines and their note left out.
     fn said(output: &Output<RecordingSink>, stream: Stream) -> Vec<String> {
         output
             .sink()
             .lines()
             .into_iter()
             .filter(|(said, _)| *said == stream)
-            .map(|(_, line)| line)
+            .map(|(_, line)| unstamped(&line).text.to_owned())
+            .filter(|text| !is_process_line(text) && !text.starts_with("process lines: "))
             .collect()
     }
 

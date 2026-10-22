@@ -20,7 +20,7 @@ use gate_wire::{Refusal, refused_line, tools_line};
 use sha2::{Digest, Sha256};
 
 use crate::command::signals_reset;
-use crate::console::{Forwarding, LineSink, Output, Stream};
+use crate::console::{Forwarding, GAT, LineSink, Output, Stamp, Stream};
 use crate::files::{self, HeldLock};
 use crate::git::CLOSED_STATUS;
 use crate::lines::{Along, FAILED_STATUS};
@@ -146,6 +146,7 @@ pub(crate) fn update<S: LineSink + 'static>(
             // A note: the restore runs, and its record is written anew.
             let _ = output.say(
                 Stream::Err,
+                GAT,
                 &format!("gate: remote could not read {record}: {error}; restoring the tools"),
             );
         }
@@ -159,15 +160,15 @@ pub(crate) fn update<S: LineSink + 'static>(
         }
         Restored::NotStarted(why) => {
             let line = format!("gate: remote could not start the dotnet tool restore: {why}");
-            let _ = output.say(Stream::Err, &line);
+            let _ = output.say(Stream::Err, GAT, &line);
             i32::from(FAILED_STATUS)
         }
         Restored::Ended(status) => return Err(Unready::Ended(status)),
     };
-    let _ = output.say(Stream::Err, &format!("gate: remote tool restore failed (status {status})"));
+    let _ = output.say(Stream::Err, GAT, &format!("gate: remote tool restore failed (status {status})"));
     // Said together, so no heartbeat lands between the tag and the line it tags.
     let tag = refused_line(request.nonce, Refusal::Tools);
-    said(output, &[&tag, &tools_line(request.key)], REFUSED_STATUS);
+    said_as(output, &[(Stamp::Bare, &tag), (GAT, &tools_line(request.key))], REFUSED_STATUS);
     Err(Unready::Refused)
 }
 
@@ -208,12 +209,13 @@ fn restored<S: LineSink + 'static>(request: &Request<'_>, place: &Path, lock: &H
         deadline: None,
         ending: Ending::TermThenKill(END_GRACE),
         output: Some(Arc::clone(output) as Arc<dyn Forwarding>),
-        forward: Forward::Both,
+        forward: Forward::Both(GAT, GAT),
         ends_on_gone: true,
         record: Some(&record),
         check: None,
         on_started: Some(&on_started),
         on_leader_exit: None,
+        processes: None,
     };
     let started = Instant::now();
     let ran = match run_watched(command, &watch) {
@@ -234,7 +236,7 @@ fn restored<S: LineSink + 'static>(request: &Request<'_>, place: &Path, lock: &H
     }
     // Said after the restore's own output and before any line saying it failed.
     let took = format!("gate: dotnet tool restore took {:.1} s", started.elapsed().as_secs_f64());
-    let _ = output.say(Stream::Err, &took);
+    let _ = output.say(Stream::Err, GAT, &took);
     match (ran.status.code(), ran.status.signal()) {
         (Some(code), _) => Restored::Exited(code),
         (None, Some(signal)) => Restored::Signalled(signal),
@@ -256,10 +258,16 @@ fn unran(not: NotRan) -> String {
     }
 }
 
-/// Says `lines` on stderr together, unless the client is gone; `status`.
+/// Says `lines` on stderr together, stamped `gat`, unless the client is gone; `status`.
 fn said<S: LineSink>(output: &Output<S>, lines: &[&str], status: u8) -> u8 {
+    let lines: Vec<(Stamp, &str)> = lines.iter().map(|line| (GAT, *line)).collect();
+    said_as(output, &lines, status)
+}
+
+/// Says `lines` on stderr together, each as its stamp says, unless the client is gone; `status`.
+fn said_as<S: LineSink>(output: &Output<S>, lines: &[(Stamp, &str)], status: u8) -> u8 {
     if !output.client_gone() {
-        let lines: Vec<(Stream, &str)> = lines.iter().map(|line| (Stream::Err, *line)).collect();
+        let lines: Vec<(Stream, Stamp, &str)> = lines.iter().map(|(stamp, line)| (Stream::Err, *stamp, *line)).collect();
         let _ = output.say_together(&lines);
     }
     status

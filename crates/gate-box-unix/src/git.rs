@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use gate_wire::escaped;
 
-use crate::console::{Forwarding, LineSink, Output, Stream};
+use crate::console::{Forwarding, LineSink, Output, Stamp, Stream};
 use crate::files::{self, ReplaceFailure};
 use crate::lines::{FAILED_STATUS, is_git_variable, step_unran};
 use crate::process::{Ending, Forward, GroupRecord, NotRan, Ran, Watch, run_bounded, run_watched, status_text};
@@ -403,6 +403,8 @@ pub struct RunGit<'a, S: LineSink + 'static> {
     options: [String; 8],
     output: &'a Arc<Output<S>>,
     record: Option<GroupRecord<'a>>,
+    /// How the steps' forwarded lines and the runner's own lines about them are stamped: `gat` in `box run`.
+    stamp: Stamp,
 }
 
 /// What a run's git step does with git's standard error and with a client gone.
@@ -420,7 +422,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
     /// The run's git `git`, the run holding the work lock `lock`, its lines said through `output`, each step's group
     /// written to `record` while it runs when one is given.
     #[must_use]
-    pub fn new(git: Git<'a>, lock: &str, output: &'a Arc<Output<S>>, record: Option<GroupRecord<'a>>) -> RunGit<'a, S> {
+    pub fn new(git: Git<'a>, lock: &str, output: &'a Arc<Output<S>>, record: Option<GroupRecord<'a>>, stamp: Stamp) -> RunGit<'a, S> {
         let options = [
             "-c".to_owned(),
             format!("core.hooksPath={lock}/hooks"),
@@ -436,6 +438,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
             options,
             output,
             record,
+            stamp,
         }
     }
 
@@ -546,12 +549,13 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
             deadline: Some(Instant::now() + limit),
             ending: Ending::TermThenKill(END_GRACE),
             output: Some(output),
-            forward: if mode.forward { Forward::Err } else { Forward::Kept },
+            forward: if mode.forward { Forward::Err(self.stamp) } else { Forward::Kept },
             ends_on_gone: mode.ends_on_gone,
             record: self.record.as_ref(),
             check: None,
             on_started: None,
             on_leader_exit: None,
+            processes: None,
         };
         let ran = run_watched(command, &watch);
         if self.output.client_gone() {
@@ -560,7 +564,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
         // A quiet step forwards nothing, so, as on the Windows box, a leftover holding its output is not said.
         if mode.forward && ran.as_ref().is_ok_and(|ran| ran.leftover) {
             // A client that has gone has no one left to tell; the next step finds it gone.
-            let _ = self.output.say(Stream::Err, GIT_LEFTOVER);
+            let _ = self.output.say(Stream::Err, self.stamp, GIT_LEFTOVER);
         }
         ran.map_err(|not| {
             let why = match not {
@@ -710,7 +714,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{CLOSED_STATUS, GIT_LEFTOVER, GIT_OUTPUT_CAP, Git, GitClass, RunGit, Steps, test_limit};
-    use crate::console::{FailingSink, HungUpSink, LineSink, Output, RecordingSink, Stream};
+    use crate::console::{FailingSink, HungUpSink, LineSink, Output, RecordingSink, Stamp, Stream};
     use crate::files::held_for_test;
     use crate::process::{GroupRecord, signal_log};
 
@@ -756,7 +760,7 @@ mod tests {
             let record = held
                 .as_ref()
                 .map(|held| GroupRecord::new(self.record(), "gate-remote-k-0123456789ab", held));
-            check(&RunGit::new(Git::of(self.root(), Path::new(&parent)), &lock, output, record));
+            check(&RunGit::new(Git::of(self.root(), Path::new(&parent)), &lock, output, record, Stamp::Bare));
         }
 
         /// Runs `check` with the run's git of this case writing to `output`.

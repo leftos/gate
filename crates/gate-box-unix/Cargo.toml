@@ -29,6 +29,8 @@ gate-args = { path = "../gate-args" }
 gate-inputs = { path = "../gate-inputs" }
 gate-watchdog = { path = "../gate-watchdog" }
 gate-wire = { path = "../gate-wire" }
+# A process line's own moments: its start and how long it ran, which `gate_wire::stamp` writes.
+jiff = "0.2.37"
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.11.0"
 
