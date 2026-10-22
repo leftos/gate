@@ -22,7 +22,7 @@ use crate::remote_client::{Tuned, client_case, client_gate, client_gate_tuned, f
 use crate::routing::{CONTROL_C_EXIT, HOST, path_map, repo, routed_case};
 use crate::support::{
     ANSWERING, Case, FAKE_SSH, GATE, GATE_VARIABLE, Go, LOCAL_REASON, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running, STEPS_VARIABLE, build_version,
-    calls, events, finish, git, heavy_words, junction, nothing_back, shown, ssh_steps, start, wait_until, write_remote_json,
+    calls, events, finish, git, heavy_words, junction, log_texts, nothing_back, shown, ssh_steps, start, wait_until, write_remote_json,
 };
 
 /// The routing git limit and drain no machine reaches, so a starved gate still finds its worktree.
@@ -907,7 +907,7 @@ fn a_real_client_warm_up_writes_the_record_the_log_and_the_builder_s_record() {
     assert_eq!(record["gate"], build_version(&case), "{record}");
     assert!(record["pid"].as_u64().is_some_and(|pid| pid > 0), "{record}");
     assert_eq!(box_warm(&case).as_deref(), Some(hash.as_str()), "the builder holds the hash");
-    let log = fs::read_to_string(warm_entry(&case, "log").expect("the warm-up wrote its log")).expect("the log can be read");
+    let log = warm_log(&case);
     assert!(
         log.lines().any(|line| line == format!("gate: remote warm {hash}")),
         "the warm log holds the box's line: {log}"
@@ -1226,9 +1226,9 @@ fn pinned_csproj(case: &Case, path: &str, version: &str) {
     fs::write(path, godot_csproj(version)).expect("a project file can be written");
 }
 
-/// The warm-up's log of the case, as text.
+/// The warm-up's log of the case, as the text after each line's stamp and tag, without process lines.
 fn warm_log(case: &Case) -> String {
-    fs::read_to_string(warm_entry(case, "log").expect("the warm-up wrote its log")).expect("the log can be read")
+    log_texts(&warm_entry(case, "log").expect("the warm-up wrote its log"))
 }
 
 /// A warm-up whose one command is a Godot console, of a repo pinning no Godot version, runs on the builder's newest
