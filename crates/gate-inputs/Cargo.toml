@@ -1,0 +1,17 @@
+[package]
+name = "gate-inputs"
+version.workspace = true
+edition = "2024"
+publish = false
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+gate-router = { path = "../gate-router" }
+gate-wire = { path = "../gate-wire" }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+sha2 = "0.11.0"

@@ -36,6 +36,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     WRITE_DAC, WRITE_OWNER,
 };
 
+use gate_inputs::manifest::{read_sent, refused_path};
+
 use crate::answer::USAGE_STATUS;
 use crate::boxside::preflight::{self, is_folder_itself};
 use crate::boxside::run::{self, FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS, SHARING_VIOLATION};
@@ -44,7 +46,7 @@ use crate::console::Console;
 use crate::outputs::archive::{Entry, PcFiles, unpack};
 use crate::outputs::hash::sha256_of;
 use crate::outputs::manifest::{Held, MANIFEST_LIMIT, Manifest};
-use crate::outputs::names::{is_git_s, is_lfs_config, is_plain_path};
+use crate::outputs::names::{is_git_s, is_plain_path};
 use crate::remote::{Refusal, busy_line, refused_line as tagged_line};
 
 /// The bytes in one gibibyte.
@@ -338,34 +340,12 @@ struct Sent {
 /// [`MANIFEST_LIMIT`] bytes, without its `\n` or `\r\n`; else why it cannot be read, a path in it the box does not
 /// take ([`refused_path`]) among them.
 fn read_manifest(input: impl BufRead) -> Result<Sent, String> {
-    let mut line = super::bounded_line(input, MANIFEST_LIMIT as u64).map_err(|unread| match unread {
+    let line = super::bounded_line(input, MANIFEST_LIMIT as u64).map_err(|unread| match unread {
         super::Unread::OverLimit => "the inputs manifest reaches 64 MiB without a newline".to_owned(),
         super::Unread::Failed(error) => format!("the inputs manifest could not be read: {error}"),
     })?;
-    if line.ends_with(b"\n") {
-        line.pop();
-        if line.ends_with(b"\r") {
-            line.pop();
-        }
-    }
-    let (digest, _) = sha256_of(line.as_slice()).map_err(|error| format!("the inputs manifest could not be hashed: {error}"))?;
-    let text = String::from_utf8(line).map_err(|_| "the inputs manifest is not UTF-8".to_owned())?;
-    let manifest = Manifest::parse(&text).map_err(|why| why.replacen("the outputs manifest", "the inputs manifest", 1))?;
-    if let Some((path, why)) = manifest.files().find_map(|(path, _)| refused_path(path).map(|why| (path, why))) {
-        return Err(format!("the inputs manifest names '{}', {why}", escaped(path)));
-    }
+    let (manifest, digest) = read_sent(line)?;
     Ok(Sent { manifest, digest })
-}
-
-/// Why the box does not take the manifest's `path`: one that is not a plain relative path, or one the PC never sends
-/// (a `.git*` name, a `.lfsconfig`, or a `.env` or `*.env` file); `None` when it takes it.
-fn refused_path(path: &str) -> Option<&'static str> {
-    if !is_plain_path(path) {
-        return Some("which is not a plain relative path");
-    }
-    let name = path.rsplit('/').next().unwrap_or(path);
-    let env = name.to_ascii_lowercase().ends_with(".env");
-    (is_git_s(path) || is_lfs_config(path) || env).then_some("which inputs never carry")
 }
 
 /// Answers `gate box inputs`: the request read, then the manifest from stdin, before any lock is taken, so a client

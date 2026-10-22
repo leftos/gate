@@ -14,22 +14,14 @@ use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATT
 
 use crate::outputs::glob::Globs;
 
-/// A file's stat stamp: its length and its last write as a Windows file time. A file whose stamp differs from the one
-/// the pre-command listing holds is one the run created or changed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Stamp {
-    pub size: u64,
-    pub modified: u64,
-}
+pub(crate) use gate_inputs::manifest::Stamp;
 
-impl Stamp {
-    /// The stamp `metadata` holds: a file's length and its last write as a Windows file time, whether the metadata came
-    /// from the folder listing the walk reads ([`DirEntry::metadata`]) or from an open file's handle.
-    pub(crate) fn of(metadata: &Metadata) -> Stamp {
-        Stamp {
-            size: metadata.file_size(),
-            modified: metadata.last_write_time(),
-        }
+/// The stamp `metadata` holds: a file's length and its last write as a Windows file time, whether the metadata came
+/// from the folder listing the walk reads ([`DirEntry::metadata`]) or from an open file's handle.
+pub(crate) fn stamp_of(metadata: &Metadata) -> Stamp {
+    Stamp {
+        size: metadata.file_size(),
+        modified: metadata.last_write_time(),
     }
 }
 
@@ -146,7 +138,7 @@ impl Walker<'_> {
         if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
             self.queue_folder(folder, &name, path, unfit);
         } else if let Some(list) = self.walked.list_for(self.globs, &path, unfit) {
-            let stamp = Stamp::of(&metadata);
+            let stamp = stamp_of(&metadata);
             list.push(Found { path, full, stamp });
         }
         Ok(())

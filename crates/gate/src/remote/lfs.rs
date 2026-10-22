@@ -31,7 +31,7 @@ use super::syncback::{SLICE_CAP, attribute_values, slices_asking};
 use crate::outputs::archive::pack;
 use crate::outputs::hash::sha256_of;
 use crate::outputs::manifest::{Chosen, HeldBy};
-use crate::outputs::walk::{Found, Stamp};
+use crate::outputs::walk::{Found, stamp_of};
 
 /// The most bytes a blob read as a pointer may hold.
 pub(crate) const POINTER_MOST: u64 = 1024;
@@ -550,7 +550,7 @@ fn found_object(folder: &Path, object: &Object) -> Result<Found, String> {
     Ok(Found {
         path: object.oid.clone(),
         full,
-        stamp: Stamp::of(&metadata),
+        stamp: stamp_of(&metadata),
     })
 }
 

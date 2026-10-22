@@ -194,6 +194,7 @@ dependencies = [
  "flate2",
  "gate-args",
  "gate-desktop",
+ "gate-inputs",
  "gate-router",
  "gate-state",
  "gate-watchdog",
@@ -243,6 +244,16 @@ dependencies = [
  "serde",
  "serde_json",
  "windows-sys",
+]
+
+[[package]]
+name = "gate-inputs"
+version = "0.1.0"
+dependencies = [
+ "gate-router",
+ "gate-wire",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

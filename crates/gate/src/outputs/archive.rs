@@ -29,7 +29,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use crate::outputs::hash::Hashing;
 use crate::outputs::manifest::{Chosen, HeldBy, Manifest};
 use crate::outputs::names::is_plain_path;
-use crate::outputs::walk::{Found, Stamp, in_context};
+use crate::outputs::walk::{Found, in_context, stamp_of};
 
 /// The name of the archive's last member, the list of every path the archive brings back.
 pub(crate) const LIST_NAME: &str = ".gate-outputs.json";
@@ -147,7 +147,7 @@ fn pack_one<W: Write>(packer: &mut Packer<W>, root: &Path, chosen: &Chosen<'_>, 
     let copied = chosen
         .sha256
         .as_deref()
-        .filter(|_| Stamp::of(&before) == file.stamp)
+        .filter(|_| stamp_of(&before) == file.stamp)
         .and_then(|sha256| Some((sha256, known(sha256)?)));
     match copied {
         Some((sha256, size)) => packer.copy(&file.path, size, modified, sha256),

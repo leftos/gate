@@ -41,7 +41,7 @@ use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
 use crate::outputs::hash::file_sha256;
 use crate::outputs::manifest::Manifest;
-use crate::outputs::walk::{Stamp, in_context};
+use crate::outputs::walk::{Stamp, in_context, stamp_of};
 
 /// The name of the ASP.NET test host's file of content roots, which records the box's work folder.
 const TEST_HOST_MANIFEST: &str = "MvcTestingAppManifest.json";
@@ -671,7 +671,7 @@ fn pc_file(root: &Path, entry: &Entry, manifest: &Manifest) -> Result<Pc, String
     let target = below(root, &entry.path);
     let now = match fs::metadata(&target) {
         Ok(metadata) if !metadata.is_file() => return Err(format!("{} is not a file", entry.path)),
-        Ok(metadata) => Some(Stamp::of(&metadata)),
+        Ok(metadata) => Some(stamp_of(&metadata)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(in_context(&target, &error).to_string()),
     };
@@ -1008,7 +1008,7 @@ fn move_one(stage: &Path, root: &Path, entry: &Entry, manifest: &Manifest, now: 
     }
     // No stamp is the right answer for a handle that cannot be opened or read: the file is installed, its hash not kept.
     Ok(Placed::Moved(
-        handle.and_then(|file| file.metadata()).ok().map(|metadata| Stamp::of(&metadata)),
+        handle.and_then(|file| file.metadata()).ok().map(|metadata| stamp_of(&metadata)),
     ))
 }
 

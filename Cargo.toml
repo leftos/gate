@@ -5,6 +5,7 @@ members = [
     "crates/gate-args",
     "crates/gate-box-unix",
     "crates/gate-desktop",
+    "crates/gate-inputs",
     "crates/gate-router",
     "crates/gate-state",
     "crates/gate-watchdog",

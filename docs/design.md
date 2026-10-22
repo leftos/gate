@@ -2574,7 +2574,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     That would give a builder a second way to reach the files a sync-back never writes.
 
-    `Globs::matches` is therefore false for any `.git*` path component and a `.lfsconfig` name, matched as the sync-back matches them (`is_git_s`, `is_lfs_config` in `outputs/names.rs`, which `remote/syncback.rs` imports), with the same normalised spellings: `\` as a separator, a cut at the first `:`, trailing dots and spaces stripped, and 8.3 aliases. `Globs::enters` is false for a `.git*` folder, so the box's walk never enters one.
+    `Globs::matches` is therefore false for any `.git*` path component and a `.lfsconfig` name, matched as the sync-back matches them (`is_git_s`, `is_lfs_config` in `gate-inputs`'s `names`, which `remote/syncback.rs` imports through `outputs/names.rs`), with the same normalised spellings: `\` as a separator, a cut at the first `:`, trailing dots and spaces stripped, and 8.3 aliases. `Globs::enters` is false for a `.git*` folder, so the box's walk never enters one.
 
     The box never packs such a file, and the PC's install refuses one that still arrives through the existing `the archive member <path> is not under the output globs` line.
 
@@ -2582,7 +2582,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     So can a file named as the archive's own list, `.gate-outputs.json` at the root in any letter case, or a name that is not Unicode. Packing one would fail the pack, lose the whole archive and turn a passing run into 1.
 
-    `Globs::matches` is therefore false for a path that is not plain (`is_plain_path` in `outputs/names.rs`, which `outputs/archive.rs` imports for its pack and unpack checks) or is the list name, and `Globs::enters` for a folder whose own name `is_plain_part` refuses (the 64-part limit is the file's, not the folder's). The walk passes over a name that is not Unicode. The PC's manifest walk leaves all of these out silently.
+    `Globs::matches` is therefore false for a path that is not plain (`is_plain_path` in `gate-inputs`'s `names`, which `outputs/archive.rs` imports through `outputs/names.rs` for its pack and unpack checks) or is the list name, and `Globs::enters` for a folder whose own name `is_plain_part` refuses (the 64-part limit is the file's, not the folder's). The walk passes over a name that is not Unicode. The PC's manifest walk leaves all of these out silently.
 
     The box's pack skips them and says so once, before its `gate-remote-outputs:` line, and the run keeps its status: `gate: remote outputs: skipped <n> file(s) with names this PC cannot take: <first path>`, with `, …` after the path when n is above 1.
 
@@ -3637,7 +3637,7 @@ Built verbs:
 
 - A member name that is not a plain relative path inside the destination: `.git` in any case, an 8.3 short name (`~` before a digit), a part ending in `.` or a space, any of `<>"|?*:` or `\`, a control or bidirectional character, a device name (`CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM0` to `COM9`, `LPT0` to `LPT9`, also with an extension), or more than 64 parts.
 
-  The rule is `is_plain_path` in `outputs/names.rs`. The globs and the walk apply it too, so the box never packs such a name; the pack still refuses one (`the output '<path>' has a name the outputs archive's reader refuses`), a backstop the walk leaves unreachable.
+  The rule is `is_plain_path` in `gate-inputs`'s `names`. The globs and the walk apply it too, so the box never packs such a name; the pack still refuses one (`the output '<path>' has a name the outputs archive's reader refuses`), a backstop the walk leaves unreachable.
 - A GNU long name over 4096 bytes, a listed path of more than 4096 bytes (`the outputs archive lists a path of more than 4096 bytes: '<first 200 chars>…'`), and any pax, `g`, `K` or `S` entry.
 - More than 50,000 files or folders.
 - A member over the bytes left of the caller's limit (and over 16 GiB). Each copy counts against that limit by its listed size, and in the 50,000-file limit above.
@@ -3983,6 +3983,7 @@ A virtual Cargo workspace (`resolver = "3"`) with every crate under `crates/`, l
 | `gate-desktop` | The desktop helper exe and the pipe protocol the box speaks with it and its exit codes. | no |
 | `gate-box-unix` | The Unix box, bin `gate-box` ([The Unix box](#the-unix-box)): `box preflight`, `boot`, `run` and `stop` for a macOS builder, with the process helpers, the CPU source (`cpu.rs`), the heartbeat (`heartbeat.rs`), the backstop watch (through `gate-watchdog`) and the back commit (`back.rs`). Its verbs and helpers are `cfg(unix)`; on another target the bin says `gate-box: runs only on a Unix builder` and exits 1. | yes; the verbs are Unix only |
 | `gate-wire` | The box request payload both the PC client and every box parse (`PathForm::Windows` or `Unix`), and the gate's version text `build_version` with the version parse the tool probes share (`version_of`, `first_version`). | yes; a pure crate |
+| `gate-inputs` | What the Windows box and the Unix box must judge alike about a routed run's inputs and outputs: the path-name rules (`names`), the stream SHA-256 (`hash`) and the manifest (`Manifest`, `Held`, `Stamp`, `read_sent`, and `refused_path`, the check of the paths a sent manifest names). No OS calls. | yes; a pure crate |
 | `gate-watchdog` | Free-share, load-adjusted clock, stall, ceiling and backstop arithmetic over samples with the kill lines, and the box heartbeat, on an injected clock; the cores-hint verdict. | yes; a pure crate |
 | `gate-args` | The gate's own argv: the subcommand CLI, the compatibility layer, the C-runtime and cmd.exe quoting, the `%VAR%` refusals and the PATHEXT resolution rules over an injected environment and file lookup. | yes; a pure crate |
 | `gate-router` | The routing rules (T2-T4) over strings: what routes, the path rewrite, the `--no-build` drop (`test` and `run` only), the wrapped dotnet form, the builder warm-up's file, hash and judge (`warm.rs`), the caller's variables a routed run does not send, the repo-declared prefixes that add to them (`env.rs`) and the line it says for them (`watch.rs`), the repo's `.gate/local.toml` patterns that keep a command here (`local.rs`), and the one-key list reader the declaration files share (`list.rs`). | yes; a pure crate |

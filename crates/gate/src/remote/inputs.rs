@@ -29,7 +29,7 @@ use crate::outputs::archive::{final_path, pack};
 use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
 use crate::outputs::hash::sha256_of;
-use crate::outputs::manifest::{Chosen, HeldBy, MANIFEST_LIMIT, Manifest};
+use crate::outputs::manifest::{Chosen, HeldBy, MANIFEST_LIMIT, Manifest, build_manifest_with};
 use crate::outputs::walk::{Found, in_context, walk};
 
 /// The most files one put carries: the archive's member limit.
@@ -144,7 +144,7 @@ fn hashed(asked: &Asked<'_>, files: &[Found], go_on: impl Fn() -> bool) -> Resul
     let started = file_time_now();
     let stopped = Cell::new(false);
     let mut next = HashCache::default();
-    let built = Manifest::build_with(files, asked.caps.manifest, |file| {
+    let built = build_manifest_with(files, asked.caps.manifest, |file| {
         let (sha256, stamp) = sha256_for(file, &inside, cache, &go_on, &stopped)?;
         next.keep(&file.path, stamp, &sha256, started);
         Ok((sha256, stamp))

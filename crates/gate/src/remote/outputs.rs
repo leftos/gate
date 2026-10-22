@@ -35,8 +35,8 @@ use crate::outputs::archive::final_path;
 use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
 use crate::outputs::hash::sha256_of;
-use crate::outputs::manifest::{MANIFEST_LIMIT, Manifest};
-use crate::outputs::walk::{Found, Stamp, in_context, walk};
+use crate::outputs::manifest::{MANIFEST_LIMIT, Manifest, build_manifest_with};
+use crate::outputs::walk::{Found, Stamp, in_context, stamp_of, walk};
 
 /// Why a manifest line longer than [`MANIFEST_LIMIT`] is not sent.
 const PAST_THE_CAP: &str = "it is larger than the box takes (64 MiB)";
@@ -622,7 +622,7 @@ fn manifest_line(
     let inside = fs::canonicalize(root).map_err(|error| failed(in_context(root, &error)))?;
     let stopped = Cell::new(false);
     let mut next = HashCache::default();
-    let built = Manifest::build_with(&found, cap, |file| {
+    let built = build_manifest_with(&found, cap, |file| {
         let (sha256, stamp) = sha256_for(file, &inside, cache, &go_on, &stopped)?;
         next.keep(&file.path, stamp, &sha256, started);
         Ok((sha256, stamp))
@@ -660,7 +660,7 @@ pub(super) fn sha256_for(
         return hashed(&file.full, inside, go_on, stopped);
     };
     let opened = opened_inside(&file.full, inside)?;
-    let stamp = Stamp::of(&opened.metadata().map_err(|error| in_context(&file.full, &error))?);
+    let stamp = stamp_of(&opened.metadata().map_err(|error| in_context(&file.full, &error))?);
     if held.stamp == stamp {
         return Ok((held.sha256.clone(), stamp));
     }
@@ -692,7 +692,7 @@ fn opened_inside(path: &Path, inside: &Path) -> io::Result<File> {
 /// [`opened_inside`] finds it inside `inside`. Else why it cannot be read or is refused, its path named.
 fn hashed(path: &Path, inside: &Path, go_on: &dyn Fn() -> bool, stopped: &Cell<bool>) -> io::Result<(String, Stamp)> {
     let file = opened_inside(path, inside)?;
-    let stamp = Stamp::of(&file.metadata().map_err(|error| in_context(path, &error))?);
+    let stamp = stamp_of(&file.metadata().map_err(|error| in_context(path, &error))?);
     Ok((read_sha256(&file, path, go_on, stopped)?, stamp))
 }
 
@@ -800,7 +800,7 @@ mod tests {
     use crate::outputs::cache::{HashCache, file_time_now};
     use crate::outputs::glob::Globs;
     use crate::outputs::hash::file_sha256;
-    use crate::outputs::walk::{Found, Stamp, walk};
+    use crate::outputs::walk::{Found, Stamp, stamp_of, walk};
     use crate::remote::client::End;
     use crate::remote::syncback::{PAIR_NOT_APPLIED, Synced};
 
@@ -1109,7 +1109,7 @@ mod tests {
             .expect("the file opens")
             .metadata()
             .expect("the file's handle reads its stamp");
-        Stamp::of(&held)
+        stamp_of(&held)
     }
 
     /// A worktree holding `bin/a.dll` written `abc`, its last write `at`, and that file's path.
