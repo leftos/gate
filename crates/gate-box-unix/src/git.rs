@@ -229,60 +229,122 @@ fn late_git_line(limit: Duration) -> String {
     format!("git did not answer within {spelled}")
 }
 
-/// The words naming a work folder's repository to git: its `.git` and its tree, so git never looks for another.
+/// The words naming a work folder's repository to git: its `.git` and its tree, so git never looks for another; and,
+/// on a pair run, the repo's name, which its layout steps' names carry.
 pub struct Tree {
-    git_dir: String,
-    work_tree: String,
+    git_dir_arg: String,
+    work_tree_arg: String,
+    name: Option<String>,
 }
 
 impl Tree {
-    /// The repository of the tree at `work`.
+    /// The repository of the tree at `work`, a run of one repo's.
     #[must_use]
     pub fn at(work: &str) -> Tree {
+        Tree::named(work, None)
+    }
+
+    /// The repository of the tree at `tree`, of the repo `name` on a pair run.
+    #[must_use]
+    pub fn named(tree: &str, name: Option<&str>) -> Tree {
         Tree {
-            git_dir: format!("--git-dir={work}/.git"),
-            work_tree: format!("--work-tree={work}"),
+            git_dir_arg: format!("--git-dir={tree}/.git"),
+            work_tree_arg: format!("--work-tree={tree}"),
+            name: name.map(str::to_owned),
         }
+    }
+
+    /// The layout step `step` in this repository as it is run ([`for_repo`]).
+    fn step(&self, step: &str) -> String {
+        for_repo(step, self.name.as_deref())
+    }
+
+    /// The failure `failed` of the layout step `step` in this repository ([`failed_for`]).
+    fn failed_for(&self, step: &str, failed: Failed) -> Failed {
+        failed_for(failed, step, self.name.as_deref())
+    }
+
+    /// Runs the layout step `step` with `args` in this repository through `git`, named for its repo ([`for_repo`]).
+    fn layout_step(&self, git: &impl Steps, step: &str, args: &[&str]) -> Result<(), Failed> {
+        git.step(&self.step(step), &self.args(args))
+            .map(drop)
+            .map_err(|failed| self.failed_for(step, failed))
     }
 
     /// The git words running `rest` in this repository.
     #[must_use]
     pub fn args<'a>(&'a self, rest: &[&'a str]) -> Vec<&'a str> {
-        [self.git_dir.as_str(), self.work_tree.as_str()]
+        [self.git_dir_arg.as_str(), self.work_tree_arg.as_str()]
             .into_iter()
             .chain(rest.iter().copied())
             .collect()
     }
 }
 
-/// Sets the `origin` of the repository `tree` to `bare`: added when it has none, set when it names another.
+/// The layout step `step` as a pair run's step naming the repo `name` is said: `<step> for <name>`, as the Windows
+/// box's `for_repo` names it, which cannot be read as one of the step's own words; `step` on a run of one repo.
+#[must_use]
+pub fn for_repo(step: &str, name: Option<&str>) -> String {
+    match name {
+        Some(name) => format!("{step} for {name}"),
+        None => step.to_owned(),
+    }
+}
+
+/// The failure `failed` of the layout step `step`, run as [`for_repo`] names it: on a pair run its own line, wherever
+/// it falls among git's error lines, says `<step> failed for <name>`, as the Windows box's `failed_for` says it; as it
+/// is on a run of one repo.
+#[must_use]
+pub fn failed_for(failed: Failed, step: &str, name: Option<&str>) -> Failed {
+    let Some(name) = name else {
+        return failed;
+    };
+    let (said, windows) = (
+        format!("gate: remote {step} for {name} failed"),
+        format!("gate: remote {step} failed for {name}"),
+    );
+    let lines = failed
+        .lines
+        .into_iter()
+        .map(|line| match line.strip_prefix(&said) {
+            Some(rest) => format!("{windows}{rest}"),
+            None => line,
+        })
+        .collect();
+    Failed { lines, ..failed }
+}
+
+/// Sets the `origin` of the repository `tree` to `bare`: added when it has none, set when it names another. Each step
+/// is named for the repo on a pair run ([`Tree::step`]).
 ///
 /// # Errors
 ///
 /// The failure of a git step.
 pub fn origin_set(git: &impl Steps, tree: &Tree, bare: &str) -> Result<(), Failed> {
     let step = "git config remote.origin.url";
-    let ran = git.ran(step, &tree.args(&["config", "--get", "remote.origin.url"]))?;
+    let named = tree.step(step);
+    let ran = git
+        .ran(&named, &tree.args(&["config", "--get", "remote.origin.url"]))
+        .map_err(|failed| tree.failed_for(step, failed))?;
     match ran.status.code() {
         Some(0) if String::from_utf8_lossy(&ran.stdout).trim_end_matches(['\r', '\n']) == bare => Ok(()),
-        Some(0) => git
-            .step("git remote set-url", &tree.args(&["remote", "set-url", "origin", bare]))
-            .map(drop),
+        Some(0) => tree.layout_step(git, "git remote set-url", &["remote", "set-url", "origin", bare]),
         // `config --get` exits 1 for a key that is not set.
-        Some(1) => git.step("git remote add", &tree.args(&["remote", "add", "origin", bare])).map(drop),
-        _ => Err(git.failed(step, &ran)),
+        Some(1) => tree.layout_step(git, "git remote add", &["remote", "add", "origin", bare]),
+        _ => Err(tree.failed_for(step, git.failed(&named, &ran))),
     }
 }
 
 /// Writes the line-ending config of the repository `tree`, so the checkout and the sync-back keep the snapshot's bytes
-/// whatever the builder's system and global git config say.
+/// whatever the builder's system and global git config say. Each step is named for the repo on a pair run
+/// ([`Tree::step`]).
 ///
 /// # Errors
 ///
 /// The failure of a git step.
 pub fn line_ends_set(git: &impl Steps, tree: &Tree) -> Result<(), Failed> {
     for (setting, value) in [("core.autocrlf", "false"), ("core.eol", "lf")] {
-        git.step(&format!("git config {setting}"), &tree.args(&["config", setting, value]))?;
+        tree.layout_step(git, &format!("git config {setting}"), &["config", setting, value])?;
     }
     Ok(())
 }
@@ -585,6 +647,21 @@ pub mod test_program {
     #[must_use]
     pub fn get() -> Option<PathBuf> {
         PROGRAM.with(|cell| cell.borrow().clone())
+    }
+
+    /// The first folder along `PATH` holding `git`, which a shim hands every step it does not act on.
+    ///
+    /// # Panics
+    ///
+    /// When `PATH` is unset or holds no `git`.
+    #[must_use]
+    #[expect(clippy::expect_used, reason = "a test without git on PATH must fail loudly")]
+    pub fn real_git() -> PathBuf {
+        let path = std::env::var_os("PATH").expect("PATH is set");
+        std::env::split_paths(&path)
+            .map(|folder| folder.join("git"))
+            .find(|git| git.is_file())
+            .expect("git is on PATH")
     }
 }
 

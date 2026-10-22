@@ -357,6 +357,68 @@ mod unix {
     }
 
     #[test]
+    fn a_pair_run_runs_in_the_main_tree_and_reads_its_sibling_beside_it() {
+        let case = Case::new("pair");
+        let commit = case.snapshot();
+        let lib_bare = format!("{}/lib.git", case.root());
+        git(&["init", "--bare", "-q", &lib_bare]);
+        let lib_source = case.base.join("lib-source");
+        let lib_source = lib_source.to_str().expect("the temp folder is UTF-8");
+        git(&["init", "-q", lib_source]);
+        fs::write(Path::new(lib_source).join("b.txt"), "b\n").expect("the sibling's file is written");
+        git(&["-C", lib_source, "add", "-A"]);
+        git(&[
+            "-C",
+            lib_source,
+            "-c",
+            "user.name=gate",
+            "-c",
+            "user.email=gate@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "sibling",
+        ]);
+        git(&["-C", lib_source, "push", "-q", &lib_bare, &format!("HEAD:refs/gate/{KEY}")]);
+        let lib = git(&["-C", lib_source, "rev-parse", "HEAD"]);
+        let extra = json!({
+            "Pair": { "Leaf": "repo", "Siblings": ["lib"] },
+            "SiblingSnapshots": { "lib": lib },
+            "Command": ["/bin/sh", "-c", "cat a.txt ../lib/b.txt; echo c > c.txt; echo d > ../lib/d.txt"],
+        });
+        let ended = ran(&[], &case.request(&commit, &extra), Reading::All, &case.base.join("beaten"));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(
+            ended.out,
+            [started_line(NONCE), "a".to_owned(), "b".to_owned()],
+            "the command ran in the main tree, its sibling beside it"
+        );
+        let main_back = case.back().expect("the main repo's back ref is pushed");
+        let (lib_back, found) = git_said(&[
+            &format!("--git-dir={lib_bare}"),
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/gate-back/{KEY}"),
+        ]);
+        assert!(found, "the sibling's back ref is pushed: {:?}", ended.err);
+        let line = format!("gate: remote back commits: repo {main_back}, lib {lib_back}");
+        assert_eq!(
+            ended
+                .err
+                .iter()
+                .filter(|said| said.starts_with("gate: remote back commits:"))
+                .collect::<Vec<_>>(),
+            [&line],
+            "one line names both back commits: {:?}",
+            ended.err
+        );
+        case.ended_clean();
+    }
+
+    #[test]
     fn a_command_that_exits_nonzero_still_syncs_back() {
         let case = Case::new("nonzero");
         let commit = case.snapshot();

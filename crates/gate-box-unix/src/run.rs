@@ -12,21 +12,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gate_args::BoxSeams;
-use gate_wire::{PathForm, Payload, Refusal, bare_stem, busy_line, escaped, layout_line, refused_line};
+use gate_wire::{PairSibling, PathForm, Payload, Refusal, bare_stem, busy_line, escaped, layout_line, refused_line, trees};
 
 use gate_watchdog::Pump;
 
 use crate::back::{self, BackFailed};
-use crate::command::{Launch, Sampler, run_command};
+use crate::command::{Launch, Sampler, command_record, run_command};
 use crate::console::{Forwarding, LineSink, Output, Stream};
 use crate::files::{self, HeldLock, Locked};
-use crate::git::{self, AlternatesFailure, Failed, Git, GitClass, RunGit, Steps, Tree, line_ends_set, origin_set};
+use crate::git::{self, AlternatesFailure, Failed, Git, GitClass, RunGit, Steps, Tree, failed_for, for_repo, line_ends_set, origin_set};
 use crate::heartbeat::{self, Periods};
 use crate::lines::{
-    Along, CommandEnd, FAILED_STATUS, Translation, USAGE_STATUS, command_status, login_path_line, recorded_group, rosetta_lines, signal_guard,
-    translation, work_layout,
+    Along, BACK_COMMITS_FAILED, CommandEnd, FAILED_STATUS, LAYOUT_CHANGING, Translation, USAGE_STATUS, back_commits_line, command_status,
+    layout_text, login_path_line, names_another_layout, recorded_group, rosetta_lines, signal_guard, translation, work_layout,
 };
-use crate::preflight::checked_root;
+use crate::preflight::{checked_root, layout_record};
 use crate::process::{self, GroupRecord};
 use crate::stop::{Record, own_group, record_current, records_folder};
 use crate::tools;
@@ -56,13 +56,84 @@ impl Unbuilt {
     }
 }
 
-/// What a run reads of its payload.
-pub struct Request<'p> {
+/// One repo of a run, made once as the payload is read: its name on a pair run, its tree, the bare repository its
+/// snapshot is fetched from and its back ref lives in, and the commit checked out.
+pub struct Repo<'p> {
+    /// The repo's name on a pair run, the leaf's or a sibling's; `None` on a run of one repo.
+    pub name: Option<String>,
+    /// The repo's tree: the work folder itself on a run of one repo, `<work>/<name>` on a pair run.
+    pub tree: String,
+    /// The repo's bare repository, `<root>/<name>.git`.
+    pub bare: String,
     /// The commit checked out, 40 lower-case hex digits.
     pub snapshot: &'p str,
+}
+
+impl Repo<'_> {
+    /// The words naming this repo's tree to git ([`Tree`]), its name carried into its layout steps' names.
+    pub(crate) fn git_tree(&self) -> Tree {
+        Tree::named(&self.tree, self.name.as_deref())
+    }
+
+    /// The checkout step `step` as its lines name it: followed by the repo's name on a pair run, as the Windows box's
+    /// `named_step` says it; `step` itself on a run of one repo.
+    pub(crate) fn step(&self, step: &str) -> String {
+        match &self.name {
+            Some(name) => format!("{step} {name}"),
+            None => step.to_owned(),
+        }
+    }
+}
+
+/// The main repo and the siblings of a run in the work folder `work`, as the Windows box reads them: with no `Pair`, the
+/// one repo of `bare` checked out at `snapshot` in `work` itself; with one, the main repo in `<work>/<leaf>` and each
+/// sibling in `<work>/<name>` with its own bare repository and its commit from `SiblingSnapshots` ([`gate_wire::trees`]).
+/// Else the usage line.
+fn repos<'p>(payload: &'p Payload, work: &str, bare: &str, snapshot: &'p str) -> Result<(Repo<'p>, Vec<Repo<'p>>), String> {
+    let Some(pair) = payload.pair()? else {
+        let (tree, _) = trees(work, None, PathForm::Unix);
+        let main = Repo {
+            name: None,
+            tree,
+            bare: bare.to_owned(),
+            snapshot,
+        };
+        return Ok((main, Vec::new()));
+    };
+    let commits = payload.sibling_snapshots(&pair)?;
+    let names: Vec<&str> = pair.siblings().iter().map(PairSibling::name).collect();
+    let (main_tree, sibling_trees) = trees(work, Some((pair.leaf(), &names)), PathForm::Unix);
+    let main = Repo {
+        name: Some(pair.leaf().to_owned()),
+        tree: main_tree,
+        bare: bare.to_owned(),
+        snapshot,
+    };
+    let siblings = pair
+        .siblings()
+        .iter()
+        .zip(commits)
+        .zip(sibling_trees)
+        .map(|((sibling, commit), tree)| Repo {
+            name: Some(sibling.name().to_owned()),
+            tree,
+            bare: sibling.bare().to_owned(),
+            snapshot: commit,
+        })
+        .collect();
+    Ok((main, siblings))
+}
+
+/// What a run reads of its payload.
+pub struct Request<'p> {
+    /// The main repo, checked out in the work folder, or in `<work>/<leaf>` on a pair run.
+    pub main: Repo<'p>,
+    /// Each sibling of a pair run, in the payload's order, checked out in `<work>/<name>`; none on a run of one repo.
+    pub siblings: Vec<Repo<'p>>,
     /// The work folder's key.
     pub key: &'p str,
-    /// The work folder, `<root>/work/<key>`, which holds the repo's tree.
+    /// The work folder, `<root>/work/<key>`: the main repo's tree on a run of one repo, and the folder holding each
+    /// repo's tree on a pair run. The lock, the index and the run's records sit beside it.
     pub work: &'p str,
     /// The work root, which git never searches up into.
     pub root: String,
@@ -74,8 +145,6 @@ pub struct Request<'p> {
     pub timeout: Option<u64>,
     /// The PC's name for the builder, empty when the payload gives none.
     pub host: &'p str,
-    /// The repo's bare repository, which the snapshot is fetched from.
-    pub bare: &'p str,
     /// The work lock, `<work>.lock`.
     pub lock: &'p str,
     /// The index the back commit is made with, `<work>.index`.
@@ -97,8 +166,9 @@ pub struct Request<'p> {
 impl<'p> Request<'p> {
     /// Reads `payload` in the order the Windows box reads it, each key checked as it does; then notes the first key
     /// asking for what this builder does not build: `Outputs`, `OutputsFull`, `Desktop`, a warm-up's
-    /// `WarmCommands`, `GodotVersion`, `EngineEnv`, `UnrealVersion`, `InputsDigest`, `SentDigest`, `LfsDigest` or
-    /// `Pair`. A work root holding a `:` is refused just after the work folder is read ([`work_layout`]).
+    /// `WarmCommands`, `GodotVersion`, `EngineEnv`, `UnrealVersion`, `InputsDigest`, `SentDigest` or `LfsDigest`; then,
+    /// last, the repos ([`repos`]), a sibling pair as `gate-wire` checks it. A work root holding a `:` is refused just
+    /// after the work folder is read ([`work_layout`]).
     ///
     /// # Errors
     ///
@@ -133,7 +203,8 @@ impl<'p> Request<'p> {
         let inputs = payload.inputs_digest()?.is_some();
         let sent = payload.sent_digest()?.is_some();
         let lfs = payload.lfs_digest()?.is_some();
-        let pair = payload.pair()?.is_some();
+        // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
+        let (main, siblings) = repos(payload, work, bare, snapshot)?;
         let unbuilt = [
             (!globs.is_empty(), Refusal::Layout, "Outputs"),
             (full, Refusal::Layout, "OutputsFull"),
@@ -145,12 +216,12 @@ impl<'p> Request<'p> {
             (inputs, Refusal::Inputs, "InputsDigest"),
             (sent, Refusal::Sent, "SentDigest"),
             (lfs, Refusal::Lfs, "LfsDigest"),
-            (pair, Refusal::Layout, "Pair"),
         ]
         .into_iter()
         .find_map(|(asked, refusal, key)| asked.then_some(Unbuilt { refusal, key }));
         Ok(Request {
-            snapshot,
+            main,
+            siblings,
             key,
             work,
             root,
@@ -158,7 +229,6 @@ impl<'p> Request<'p> {
             nonce,
             timeout,
             host,
-            bare,
             lock,
             index,
             job,
@@ -168,6 +238,23 @@ impl<'p> Request<'p> {
             env,
             unbuilt,
         })
+    }
+
+    /// The main repo's tree, which the command's subfolder is placed in.
+    #[must_use]
+    pub fn tree(&self) -> &str {
+        &self.main.tree
+    }
+
+    /// Every repo of the run, the main one first.
+    pub fn repos(&self) -> impl Iterator<Item = &Repo<'p>> {
+        std::iter::once(&self.main).chain(&self.siblings)
+    }
+
+    /// The layout the work folder is laid out in, as its record says it ([`layout_text`]).
+    fn layout(&self) -> String {
+        let siblings = self.siblings.iter().filter_map(|repo| repo.name.as_deref()).collect();
+        layout_text(self.main.name.as_deref().map(|leaf| (leaf, siblings)))
     }
 }
 
@@ -292,13 +379,14 @@ fn temp_made() -> io::Result<RunTemp> {
 ///
 /// [`REFUSED_STATUS`] when the folder cannot be made, refused `layout` with the line saying why, so the PC runs the
 /// command itself.
-fn temp_for<S: LineSink>(request: &Request<'_>, output: &Output<S>) -> Result<Option<RunTemp>, u8> {
+fn temp_for<S: LineSink>(request: &Request<'_>, output: &Output<S>) -> Result<Option<RunTemp>, Unready> {
     if request.env.iter().any(|(name, _)| name == "TMPDIR") {
         return Ok(None);
     }
     temp_made().map(Some).map_err(|error| {
         let line = format!("gate: remote could not make the run's temp folder in /tmp: {error}");
-        refused(output, request, Refusal::Layout, &line)
+        refused(output, request, Refusal::Layout, &line);
+        Unready::Refused
     })
 }
 
@@ -484,7 +572,7 @@ fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, 
     let end = run_command(&launch, output);
     let status = command_status(end);
     if !of_its_own(end) {
-        return status;
+        return back_commits_failed(output, request, status);
     }
     synced_back(ready, output, status)
 }
@@ -497,16 +585,31 @@ fn of_its_own(end: CommandEnd) -> bool {
     matches!(end, CommandEnd::Exited(_) | CommandEnd::Signalled(_))
 }
 
-/// The status of the run `ready`, whose command ended with `status`, once its back commit was made and pushed
-/// ([`back::back_commit`]): `status`; a back commit that failed says `gate: remote sync-back failed: <why>` and gives
-/// [`FAILED_STATUS`] for a command that exited 0, else `status`; a client gone gives the closed status.
+/// The status of the run `ready`, whose command ended with `status`, once its back commits were made and pushed
+/// ([`back::back_commit`]): `status`, a pair run saying each repo's commit on one line ([`back_commits_line`]); a back
+/// commit that failed says, on a pair run, [`BACK_COMMITS_FAILED`], then `gate: remote sync-back failed: <why>`, and
+/// gives [`FAILED_STATUS`] for a command that exited 0, else `status`; a client gone gives the closed status.
 fn synced_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, status: u8) -> u8 {
-    match back::back_commit(&ready.request, &ready.lock, ready.login_path.as_deref(), output) {
-        Ok(_) => status,
+    let request = &ready.request;
+    match back::back_commit(request, &ready.lock, ready.login_path.as_deref(), output) {
+        Ok(_) if request.siblings.is_empty() => status,
+        Ok(commits) => {
+            let named: Vec<(&str, Option<&str>)> = request
+                .repos()
+                .zip(&commits)
+                .map(|(repo, commit)| (repo.name.as_deref().unwrap_or_default(), commit.as_deref()))
+                .collect();
+            said(output, &[&back_commits_line(&named)], status)
+        }
         Err(BackFailed::Gone(failed)) => failure(output, &failed),
         Err(BackFailed::Step(why)) => {
             let failed = if status == 0 { FAILED_STATUS } else { status };
-            said(output, &[&format!("gate: remote sync-back failed: {why}")], failed)
+            let line = format!("gate: remote sync-back failed: {why}");
+            if request.siblings.is_empty() {
+                said(output, &[&line], failed)
+            } else {
+                said(output, &[BACK_COMMITS_FAILED, &line], failed)
+            }
         }
     }
 }
@@ -525,7 +628,7 @@ fn prepared<'p, S: LineSink + 'static>(
 ) -> Result<Ready<'p>, u8> {
     let request = Request::read(payload).map_err(|line| said(output, &[&line], USAGE_STATUS))?;
     if let Some(unbuilt) = request.unbuilt {
-        return Err(refused(output, &request, unbuilt.refusal, &unbuilt.line(request.bare)));
+        return Err(refused(output, &request, unbuilt.refusal, &unbuilt.line(&request.main.bare)));
     }
     match translation(crate::command::proc_translated()) {
         Translation::Native => {}
@@ -538,31 +641,77 @@ fn prepared<'p, S: LineSink + 'static>(
             return Err(said(output, &[&tag, &line], REFUSED_STATUS));
         }
     }
-    root_checked(&request).map_err(|(line, status)| said(output, &[&line], status))?;
+    // A usage error says no back commits line; a root or a bare repository the box cannot use, as a lock it cannot
+    // open, is a pair run's back commits never made, as the Windows box says it.
+    root_checked(&request).map_err(|(line, status)| match status {
+        FAILED_STATUS => back_commits_failed(output, &request, said(output, &[&line], status)),
+        _ => said(output, &[&line], status),
+    })?;
     let lock = match files::take_lock(Path::new(request.lock)) {
         Ok(Locked::Held(lock)) => lock,
         Ok(Locked::Busy) => return Err(refused(output, &request, Refusal::Busy, &busy_line(request.key))),
         Err(error) => {
             let line = format!("gate: remote could not open the work folder lock {}: {error}", request.lock);
-            return Err(said(output, &[&line], FAILED_STATUS));
+            return Err(back_commits_failed(output, &request, said(output, &[&line], FAILED_STATUS)));
         }
     };
+    match locked(&request, &lock, output, periods.heartbeat, (login, start)) {
+        Ok(Placed {
+            place,
+            pump,
+            login_path,
+            temp,
+        }) => Ok(Ready {
+            request,
+            lock,
+            place,
+            pump,
+            periods,
+            login_path,
+            temp,
+        }),
+        // A refusal sends the PC to run the command itself; any other end, whatever its status, is a pair run's back
+        // commits never made.
+        Err(Unready::Refused) => Err(REFUSED_STATUS),
+        Err(Unready::Ended(status)) => Err(back_commits_failed(output, &request, status)),
+    }
+}
+
+/// How a run ends before its command, its lines said.
+pub(crate) enum Unready {
+    /// Refused, with [`REFUSED_STATUS`]: the PC runs the command itself.
+    Refused,
+    /// Ended with this status, a git step's own 75 among them.
+    Ended(u8),
+}
+
+/// [`prepared`] once the work lock `lock` of `request` is held: the place the command runs in, the heartbeat's pump,
+/// beating every `heartbeat` once started with `start`, the login shell's `PATH` read from `login`, and the run's temp
+/// folder ([`temp_for`]), made after the checks and before the tool restore and removed when the restore ends the run;
+/// else how the run ends, refused or with a status, its lines said.
+fn locked<S: LineSink + 'static>(
+    request: &Request<'_>,
+    lock: &HeldLock,
+    output: &Arc<Output<S>>,
+    heartbeat: Duration,
+    (login, start): (LoginPath, StartBeat),
+) -> Result<Placed, Unready> {
     // Before the sweep, so a git an earlier run left running keeps its lock files.
-    earlier_group_cleared(&request).map_err(|not| not_laid_out(output, &request, not))?;
+    earlier_group_cleared(request).map_err(|not| not_laid_out(output, request, not))?;
     // Before the run's first git step, so no lock file an earlier run's ended git left fails it.
-    swept(&request).map_err(|not| not_laid_out(output, &request, not))?;
+    swept(request).map_err(|not| not_laid_out(output, request, not))?;
     // Refused before the layout, so a payload naming a folder outside the work folder changes nothing there; the
     // earlier run's back ref goes, as the checkout's would, so the client finds none to fetch.
-    let Some(place) = place_of(request.work, request.subfolder) else {
+    let Some(place) = place_of(request.tree(), request.subfolder) else {
         said(output, &[&not_inside(request.subfolder)], USAGE_STATUS);
         let login_path = login_path_read(output, login);
-        let git = run_git(&request, &lock, login_path.as_deref(), output);
-        back_ref_cleared(&git, &request).map_err(|failed| failure(output, &failed))?;
-        return Err(USAGE_STATUS);
+        let git = run_git(request, lock, login_path.as_deref(), output);
+        back_refs_cleared(&git, request).map_err(|failed| Unready::Ended(failure(output, &failed)))?;
+        return Err(Unready::Ended(USAGE_STATUS));
     };
     // A heartbeat that cannot start ends the heartbeats, never the run. On an error below the pump is dropped, which
     // tells it to stop, and the box exits right after.
-    let pump = start(Arc::clone(output) as Arc<dyn Forwarding>, periods.heartbeat)
+    let pump = start(Arc::clone(output) as Arc<dyn Forwarding>, heartbeat)
         .inspect_err(|error| {
             // A note: the run goes on, and a client gone finds out at the next line.
             let _ = output.say(
@@ -571,39 +720,55 @@ fn prepared<'p, S: LineSink + 'static>(
             );
         })
         .ok();
-    let fresh = layout_checked(&request).map_err(|not| not_laid_out(output, &request, not))?;
+    let fresh = layout_checked(request).map_err(|not| not_laid_out(output, request, not))?;
     let login_path = login_path_read(output, login);
-    let git = run_git(&request, &lock, login_path.as_deref(), output);
-    laid_out(&request, &git, fresh).map_err(|not| not_laid_out(output, &request, not))?;
-    checked_out(&request, &git).map_err(|failed| failure(output, &failed))?;
+    let git = run_git(request, lock, login_path.as_deref(), output);
+    laid_out(request, &git, &fresh).map_err(|not| not_laid_out(output, request, not))?;
+    checked_out(request, &git).map_err(|failed| Unready::Ended(failure(output, &failed)))?;
     if !place.is_dir() {
         let line = format!("gate: remote subfolder {} does not exist in the snapshot", escaped(request.subfolder));
-        return Err(said(output, &[&line], USAGE_STATUS));
+        return Err(Unready::Ended(said(output, &[&line], USAGE_STATUS)));
     }
     // A link the snapshot holds may lead the place out of the work folder, which only the checkout shows.
-    if !inside_work(request.work, &place) {
-        return Err(said(output, &[&not_inside(request.subfolder)], USAGE_STATUS));
+    if !inside_work(request.tree(), &place) {
+        return Err(Unready::Ended(said(output, &[&not_inside(request.subfolder)], USAGE_STATUS)));
     }
-    let temp = temp_for(&request, output)?;
+    let temp = temp_for(request, output)?;
     let along = Along {
         path: login_path.as_deref(),
         tmp: temp.as_ref().map(RunTemp::tmpdir),
     };
-    if let Err(status) = tools::update(&request, &place, &lock, along, output) {
+    if let Err(unready) = tools::update(request, &place, lock, along, output) {
         if let Some(temp) = temp {
             temp_removed(temp, output);
         }
-        return Err(status);
+        return Err(unready);
     }
-    Ok(Ready {
-        request,
-        lock,
+    Ok(Placed {
         place,
         pump,
-        periods,
         login_path,
         temp,
     })
+}
+
+/// What [`locked`] readies for the command: its place, the heartbeat's pump, the login shell's `PATH` and the run's
+/// temp folder.
+struct Placed {
+    place: PathBuf,
+    pump: Option<Pump>,
+    login_path: Option<String>,
+    temp: Option<RunTemp>,
+}
+
+/// On a pair run of `request`, says [`BACK_COMMITS_FAILED`] after the lines of a run that ends with `status` without
+/// its back commits pushed, as the Windows box's `back_commits_failed` does, so the PC applies nothing and a back
+/// commits line the command printed itself is no longer the last; `status`. A run of one repo says nothing more.
+fn back_commits_failed<S: LineSink>(output: &Output<S>, request: &Request<'_>, status: u8) -> u8 {
+    if request.siblings.is_empty() {
+        return status;
+    }
+    said(output, &[BACK_COMMITS_FAILED], status)
 }
 
 /// Says `lines` on stderr together, unless the client is gone; `status`.
@@ -631,14 +796,18 @@ fn refused<S: LineSink>(output: &Output<S>, request: &Request<'_>, refusal: Refu
 
 /// Ends the run of `request` whose work folder could not be laid out as `not` says: refused `layout` with the layout
 /// line naming the repo and why, or failed with a step's lines; the status.
-fn not_laid_out<S: LineSink>(output: &Output<S>, request: &Request<'_>, not: NotLaidOut) -> u8 {
+fn not_laid_out<S: LineSink>(output: &Output<S>, request: &Request<'_>, not: NotLaidOut) -> Unready {
     match not {
-        NotLaidOut::Busy => refused(output, request, Refusal::Busy, &busy_line(request.key)),
-        NotLaidOut::Refused(why) => {
-            let line = layout_line(repo_name(request.bare), &escaped(&why));
-            refused(output, request, Refusal::Layout, &line)
+        NotLaidOut::Busy => {
+            refused(output, request, Refusal::Busy, &busy_line(request.key));
+            Unready::Refused
         }
-        NotLaidOut::Failed(failed) => failure(output, &failed),
+        NotLaidOut::Refused(why) => {
+            let line = layout_line(repo_name(&request.main.bare), &escaped(&why));
+            refused(output, request, Refusal::Layout, &line);
+            Unready::Refused
+        }
+        NotLaidOut::Failed(failed) => Unready::Ended(failure(output, &failed)),
     }
 }
 
@@ -648,13 +817,17 @@ fn not_inside(sub: &str) -> String {
 }
 
 /// Checks, making nothing and before the lock, what the run's lock and git steps lie in, as the preflight checks it:
-/// `Bare` at `<root>/<name>.git` ([`checked_root`]); the work root trusted and `<root>/work` the box user's own folder
-/// when they are there ([`records_folder`]); and `Bare` the box user's own folder when it is there
+/// `Bare` at `<root>/<name>.git` unless the run is a pair's, whose bare repositories `gate-wire` checked as it read the
+/// pair ([`checked_root`]); the work root trusted and `<root>/work` the box user's own folder when they are there
+/// ([`records_folder`]); and every repo's bare repository the box user's own folder when it is there
 /// ([`files::unusable_folder`]). Else the line and the status.
 fn root_checked(request: &Request<'_>) -> Result<(), (String, u8)> {
-    checked_root(request.work, request.bare, false).map_err(|line| (line, USAGE_STATUS))?;
+    checked_root(request.work, &request.main.bare, !request.siblings.is_empty()).map_err(|line| (line, USAGE_STATUS))?;
     records_folder(&request.root, request.parent)?;
-    files::unusable_folder(Path::new(request.bare)).map_or(Ok(()), |line| Err((line, FAILED_STATUS)))
+    request
+        .repos()
+        .find_map(|repo| files::unusable_folder(Path::new(&repo.bare)))
+        .map_or(Ok(()), |line| Err((line, FAILED_STATUS)))
 }
 
 /// The name routing gives the repo of the bare repository `bare`: the stem of `<name>.git` ([`bare_stem`]), or the
@@ -758,26 +931,30 @@ fn earlier_record_cleared(record: &str) -> Result<(), NotLaidOut> {
 }
 
 /// Removes the lock files a git step the box ended can leave where the work lock covers them, before the run's first
-/// git step, as the Windows box sweeps them: the copied index's `<work>.index.lock`; the tree's `.git/index.lock`,
-/// `.git/HEAD.lock` and `.git/config.lock`; and in the bare repository the run's own back ref's
-/// `refs/gate-back/<key>.lock`, nothing else there touched. A folder on the way that is a link, not a folder or missing
-/// has none of its locks looked at; a link, a folder or anything but a file at a lock's name refuses the run `layout`.
+/// git step, as the Windows box sweeps them: the copied index's `<work>.index.lock`; each repo's tree's
+/// `.git/index.lock`, `.git/HEAD.lock` and `.git/config.lock`; and in each repo's bare repository the run's own back
+/// ref's `refs/gate-back/<key>.lock`, nothing else there touched. A folder on the way (the work folder included) that is
+/// a link, not a folder or missing has none of its locks looked at; a link, a folder or anything but a file at a lock's
+/// name refuses the run `layout`.
 fn swept(request: &Request<'_>) -> Result<(), NotLaidOut> {
     if files::plain_folder(request.parent) {
         lock_removed(Path::new(&format!("{}.index.lock", request.work)))?;
     }
     let work = Path::new(request.work);
-    let dot_git = work.join(".git");
-    if files::plain_folder(work) && files::plain_folder(&dot_git) {
-        for lock in ["index.lock", "HEAD.lock", "config.lock"] {
-            lock_removed(&dot_git.join(lock))?;
+    for repo in request.repos() {
+        let tree = Path::new(&repo.tree);
+        let dot_git = tree.join(".git");
+        if [work, tree, dot_git.as_path()].into_iter().all(files::plain_folder) {
+            for lock in ["index.lock", "HEAD.lock", "config.lock"] {
+                lock_removed(&dot_git.join(lock))?;
+            }
         }
-    }
-    let bare = Path::new(request.bare);
-    let refs = bare.join("refs");
-    let gate_back = refs.join("gate-back");
-    if [bare, &refs, &gate_back].into_iter().all(files::plain_folder) {
-        lock_removed(&gate_back.join(format!("{}.lock", request.key)))?;
+        let bare = Path::new(&repo.bare);
+        let refs = bare.join("refs");
+        let gate_back = refs.join("gate-back");
+        if [bare, &refs, &gate_back].into_iter().all(files::plain_folder) {
+            lock_removed(&gate_back.join(format!("{}.lock", request.key)))?;
+        }
     }
     Ok(())
 }
@@ -794,27 +971,53 @@ fn lock_removed(path: &Path) -> Result<(), NotLaidOut> {
     }
 }
 
+/// What [`layout_checked`] found for [`laid_out`].
+struct Checked {
+    /// For each repo of the run, the main one first, whether its tree is made anew.
+    fresh: Vec<bool>,
+    /// Whether the work folder was cleared for another layout ([`work_relaid`]), so the run's layout is recorded once
+    /// its trees are laid out.
+    relaid: bool,
+}
+
 /// Checks the work folder of `request` before its layout, under the work lock: the interrupted-command record
 /// `<work>.command` refused unless it is missing or a file itself, not followed, as the run could neither write nor
-/// remove anything else there; when it is there, the warm record `<work>.warm` and the tools record `<work>.tools` removed, so neither
-/// trusts a tree a command was cut short in, the checkout remaking the tree; the work folder failed unless it is
-/// missing or the box user's own folder ([`files::unusable_folder`]); `.git`, `.git/objects` and `.git/objects/info`
-/// refused unless each is missing or a folder itself, and `.git/config` and `.git/HEAD` unless each is missing or a
-/// file itself, none followed; and, for a tree with no `.git/HEAD` or no `.git/objects`, which [`laid_out`] makes
-/// anew, the warm record removed. No git step runs. Whether the tree is made anew.
-fn layout_checked(request: &Request<'_>) -> Result<bool, NotLaidOut> {
+/// remove anything else there; the work folder failed unless it is missing or the box user's own folder
+/// ([`files::unusable_folder`]); the work folder cleared when its layout record names another layout than the run's
+/// ([`work_relaid`]); when the interrupted-command record is still there, the warm record `<work>.warm` and the tools
+/// record `<work>.tools` removed, so neither trusts a tree a command was cut short in, the checkout remaking the tree;
+/// then for each repo's tree, a pair's tree itself refused unless it is missing or a folder itself, `.git`,
+/// `.git/objects` and `.git/objects/info` refused unless each is missing or a folder itself, and `.git/config` and
+/// `.git/HEAD` unless each is missing or a file itself, none followed; and, when a tree has no `.git/HEAD` or no
+/// `.git/objects`, which [`laid_out`] makes anew, the warm record removed. No git step runs.
+fn layout_checked(request: &Request<'_>) -> Result<Checked, NotLaidOut> {
     let work = request.work;
-    let command = format!("{work}.command");
+    let command = command_record(work);
     plain_or_missing(Path::new(&command), false)?;
+    if let Some(line) = files::unusable_folder(Path::new(work)) {
+        return Err(NotLaidOut::Failed(Failed::line(line)));
+    }
+    let relaid = work_relaid(request)?;
     if files::exists(Path::new(&command)) {
         for suffix in [".warm", ".tools"] {
             removed(&format!("{work}{suffix}"))?;
         }
     }
-    if let Some(line) = files::unusable_folder(Path::new(work)) {
-        return Err(NotLaidOut::Failed(Failed::line(line)));
+    let fresh = request.repos().map(tree_checked).collect::<Result<Vec<bool>, NotLaidOut>>()?;
+    if fresh.contains(&true) {
+        removed(&format!("{work}.warm"))?;
     }
-    let dot_git = Path::new(work).join(".git");
+    Ok(Checked { fresh, relaid })
+}
+
+/// [`layout_checked`] for the tree of `repo`: whether it is made anew.
+fn tree_checked(repo: &Repo<'_>) -> Result<bool, NotLaidOut> {
+    let tree = Path::new(&repo.tree);
+    // A pair's tree sits in the work folder; a run of one repo's is the work folder, checked before.
+    if repo.name.is_some() {
+        plain_or_missing(tree, true)?;
+    }
+    let dot_git = tree.join(".git");
     let objects = dot_git.join("objects");
     let info = objects.join("info");
     for folder in [&dot_git, &objects, &info] {
@@ -823,26 +1026,85 @@ fn layout_checked(request: &Request<'_>) -> Result<bool, NotLaidOut> {
     for file in [dot_git.join("config"), dot_git.join("HEAD")] {
         plain_or_missing(&file, false)?;
     }
-    let fresh = !files::exists(&dot_git.join("HEAD")) || !files::exists(&objects);
-    if fresh {
-        removed(&format!("{work}.warm"))?;
-    }
-    Ok(fresh)
+    Ok(!files::exists(&dot_git.join("HEAD")) || !files::exists(&objects))
 }
 
-/// Lays out the work folder of `request`, its files checked ([`layout_checked`]): a `fresh` tree made with `git init`;
-/// then its `origin`, its line-ending config and its alternates file naming the bare repository's objects, written
-/// whole ([`git::alternates_written`]).
-fn laid_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>, fresh: bool) -> Result<(), NotLaidOut> {
+/// Clears the work folder of `request` when its layout record `<work>.layout` names another layout than the run's
+/// ([`names_another_layout`]), a pair's first run having none, as the Windows box clears it: the warm record removed;
+/// the record saying [`LAYOUT_CHANGING`], so a clear cut short still finds another layout and clears again; every
+/// child of the work folder removed as itself, a link never followed ([`work_cleared`]); then the interrupted-command
+/// record removed, since what it guarded is gone. Whether the folder was cleared.
+fn work_relaid(request: &Request<'_>) -> Result<bool, NotLaidOut> {
     let work = request.work;
-    if fresh {
-        git.step("git init", &["init", "-q", work])?;
+    if !names_another_layout(&layout_record(work), &request.layout()) {
+        return Ok(false);
     }
-    let info = Path::new(work).join(".git").join("objects").join("info");
-    let tree = Tree::at(work);
-    origin_set(git, &tree, request.bare)?;
+    removed(&format!("{work}.warm"))?;
+    layout_written(work, LAYOUT_CHANGING)?;
+    if files::exists(Path::new(work)) {
+        work_cleared(Path::new(work))?;
+    }
+    removed(&command_record(work))?;
+    Ok(true)
+}
+
+/// Removes every child of the work folder `work`, each as itself: a folder with all it holds, a link never followed.
+/// Else why one could not be removed or the folder not listed.
+fn work_cleared(work: &Path) -> Result<(), NotLaidOut> {
+    let unlisted = |error: io::Error| NotLaidOut::Refused(format!("cannot list {}: {error}", work.display()));
+    for entry in fs::read_dir(work).map_err(unlisted)? {
+        let path = entry.map_err(unlisted)?.path();
+        let not_removed = |error: io::Error| NotLaidOut::Refused(format!("cannot remove {}: {error}", path.display()));
+        // `remove_dir_all` removes a link inside the folder as itself, never what it leads to.
+        let gone = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&path),
+            Ok(_) => fs::remove_file(&path),
+            Err(error) => Err(error),
+        };
+        gone.map_err(not_removed)?;
+    }
+    Ok(())
+}
+
+/// Writes `layout` as the whole of the layout record of the work folder `work`, `<work>.layout`
+/// ([`files::replace_plain`]); else why it could not be, refusing the run `layout`.
+fn layout_written(work: &str, layout: &str) -> Result<(), NotLaidOut> {
+    let record = format!("{work}.layout");
+    files::replace_plain(Path::new(&record), layout.as_bytes()).map_err(|failure| NotLaidOut::Refused(format!("cannot write {record}: {failure}")))
+}
+
+/// Lays out the work folder of `request`, its files checked as `checked` says ([`layout_checked`]): on a pair run every
+/// repo's back ref deleted first ([`back_refs_cleared`]), so no repo keeps an earlier run's back commit whatever step
+/// of this run fails after; then each repo's tree laid out ([`tree_laid_out`]); then, after a clear, the run's layout
+/// recorded, last, so a layout cut short leaves [`LAYOUT_CHANGING`] and the next run clears again.
+fn laid_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>, checked: &Checked) -> Result<(), NotLaidOut> {
+    if !request.siblings.is_empty() {
+        back_refs_cleared(git, request)?;
+    }
+    for (repo, fresh) in request.repos().zip(&checked.fresh) {
+        tree_laid_out(git, repo, *fresh)?;
+    }
+    if checked.relaid {
+        layout_written(request.work, &request.layout())?;
+    }
+    Ok(())
+}
+
+/// Lays out the tree of `repo`: a `fresh` tree made with `git init`; then its `origin`, its line-ending config and its
+/// alternates file naming its own bare repository's objects, written whole ([`git::alternates_written`]). Each step and
+/// its failure name the repo on a pair run, as the Windows box's layout steps do ([`for_repo`], [`failed_for`]).
+fn tree_laid_out<S: LineSink>(git: &RunGit<'_, S>, repo: &Repo<'_>, fresh: bool) -> Result<(), NotLaidOut> {
+    let name = repo.name.as_deref();
+    if fresh {
+        let step = "git init";
+        git.step(&for_repo(step, name), &["init", "-q", &repo.tree])
+            .map_err(|failed| failed_for(failed, step, name))?;
+    }
+    let info = Path::new(&repo.tree).join(".git").join("objects").join("info");
+    let tree = repo.git_tree();
+    origin_set(git, &tree, &repo.bare)?;
     line_ends_set(git, &tree)?;
-    git::alternates_written(&info, request.bare).map_err(|failure| {
+    git::alternates_written(&info, &repo.bare).map_err(|failure| {
         NotLaidOut::Refused(match failure {
             AlternatesFailure::Folder { path, error } => format!("cannot create {}: {error}", path.display()),
             AlternatesFailure::Write { path, failure } => format!("cannot write {}: {failure}", path.display()),
@@ -868,40 +1130,63 @@ fn plain_or_missing(path: &Path, folder: bool) -> Result<(), NotLaidOut> {
     }
 }
 
-/// The snapshot of `request` fetched from its bare repository at `refs/gate/<key>`, its commit found, and checked out
-/// by its commit over whatever the last run left, untracked files removed and ignored ones (build output) kept; then
-/// the earlier run's back ref deleted. The commit, never the ref's tip, is what is checked out, so a later push of the
-/// key changes nothing this run runs.
+/// Each repo of `request`'s snapshot fetched and checked out, the main one first ([`repo_checked_out`]); then, on a run
+/// of one repo, the earlier run's back ref deleted ([`back_ref_cleared`]). A pair run deleted every repo's as it laid
+/// the work folder out ([`laid_out`]).
 fn checked_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>) -> Result<(), Failed> {
-    let tree = Tree::at(request.work);
-    let refname = format!("refs/gate/{}", request.key);
-    git.step_as("fetch", &tree.args(&["fetch", "-q", request.bare, &refname]), GitClass::Long)?;
-    let commit = format!("{}^{{commit}}", request.snapshot);
+    for repo in request.repos() {
+        repo_checked_out(git, request.key, repo)?;
+    }
+    if request.siblings.is_empty() {
+        back_ref_cleared(git, request.key, &request.main)?;
+    }
+    Ok(())
+}
+
+/// The snapshot of `repo` fetched from its bare repository at `refs/gate/<key>`, its commit found, and checked out by
+/// its commit over whatever the last run left, untracked files removed and ignored ones (build output) kept. The commit,
+/// never the ref's tip, is what is checked out, so a later push of the key changes nothing this run runs. Each step is
+/// named for the repo on a pair run ([`Repo::step`]).
+fn repo_checked_out<S: LineSink>(git: &RunGit<'_, S>, key: &str, repo: &Repo<'_>) -> Result<(), Failed> {
+    let tree = repo.git_tree();
+    let refname = format!("refs/gate/{key}");
+    git.step_as(&repo.step("fetch"), &tree.args(&["fetch", "-q", &repo.bare, &refname]), GitClass::Long)?;
+    let commit = format!("{}^{{commit}}", repo.snapshot);
     if !git
-        .quiet("cat-file", &tree.args(&["cat-file", "-e", &commit]), GitClass::Short)?
+        .quiet(&repo.step("cat-file"), &tree.args(&["cat-file", "-e", &commit]), GitClass::Short)?
         .status
         .success()
     {
-        return Err(Failed::line(format!(
-            "gate: remote snapshot {} is not in the work folder's repository after the fetch",
-            request.snapshot
-        )));
+        return Err(Failed::line(missing_snapshot(repo)));
     }
     git.step_as(
-        "checkout",
-        &tree.args(&["checkout", "-q", "--force", "--detach", request.snapshot]),
+        &repo.step("checkout"),
+        &tree.args(&["checkout", "-q", "--force", "--detach", repo.snapshot]),
         GitClass::Long,
     )?;
-    git.step_as("clean", &tree.args(&["clean", "-fdq"]), GitClass::Long)?;
-    back_ref_cleared(git, request)
+    git.step_as(&repo.step("clean"), &tree.args(&["clean", "-fdq"]), GitClass::Long).map(drop)
 }
 
-/// Deletes `refs/gate-back/<key>` in the bare repository, an earlier run's back commit, so the client finds none to
-/// fetch after a run that makes none.
-fn back_ref_cleared<S: LineSink>(git: &RunGit<'_, S>, request: &Request<'_>) -> Result<(), Failed> {
-    let bare = format!("--git-dir={}", request.bare);
-    let back = format!("refs/gate-back/{}", request.key);
-    git.bare_step("back ref reset", &[&bare, "update-ref", "-d", &back], GitClass::Short)
+/// The line of a snapshot of `repo` its repository lacks after the fetch, as the Windows box says it.
+fn missing_snapshot(repo: &Repo<'_>) -> String {
+    let sha = repo.snapshot;
+    match &repo.name {
+        None => format!("gate: remote snapshot {sha} is not in the work folder's repository after the fetch"),
+        Some(name) => format!("gate: remote snapshot {sha} is not in the repository of {name} after the fetch"),
+    }
+}
+
+/// Deletes every repo's `refs/gate-back/<key>` in its bare repository ([`back_ref_cleared`]), the main one first.
+fn back_refs_cleared<S: LineSink>(git: &RunGit<'_, S>, request: &Request<'_>) -> Result<(), Failed> {
+    request.repos().try_for_each(|repo| back_ref_cleared(git, request.key, repo))
+}
+
+/// Deletes `refs/gate-back/<key>` in the bare repository of `repo`, an earlier run's back commit, so the client finds
+/// none to fetch after a run that makes none.
+pub(crate) fn back_ref_cleared<S: LineSink>(git: &RunGit<'_, S>, key: &str, repo: &Repo<'_>) -> Result<(), Failed> {
+    let bare = format!("--git-dir={}", repo.bare);
+    let back = format!("refs/gate-back/{key}");
+    git.bare_step(&repo.step("back ref reset"), &[&bare, "update-ref", "-d", &back], GitClass::Short)
 }
 
 #[cfg(test)]
@@ -926,12 +1211,13 @@ mod tests {
 
     use gate_watchdog::Pump;
 
-    use super::{REFUSED_STATUS, Ready, Watches, place_of, prepare, prepared, run_along, test_template};
+    use super::{REFUSED_STATUS, Ready, Request, Watches, place_of, prepare, prepared, run_along, test_template};
     use crate::command::{Launch, Sampler, run_command};
     use crate::console::{Console, Forwarding};
     use crate::console::{LineSink, Output, RecordingSink, Stream};
     use crate::files::{self, Locked, effective_uid, take_lock};
-    use crate::git::{GitClass, test_limit, test_program};
+    use crate::git::test_program::{self, real_git};
+    use crate::git::{GitClass, test_limit};
     use crate::heartbeat::{self, Periods};
     use crate::lines::command_status;
     use crate::stop::stop;
@@ -1029,25 +1315,7 @@ mod tests {
         /// A commit holding `files`, written over the case's source tree, pushed to the bare repository as
         /// `refs/gate/<key>`; its sha.
         fn snapshot(&self, files: &[(&str, &str)]) -> String {
-            let source = self.source();
-            let source = source.to_str().expect("the temp folder is UTF-8");
-            if !Path::new(source).exists() {
-                git(&["init", "-q", source]);
-            }
-            for (name, text) in files {
-                let path = Path::new(source).join(name);
-                fs::create_dir_all(path.parent().expect("a file has a folder")).expect("the file's folder is made");
-                fs::write(path, text).expect("the file is written");
-            }
-            git(&["-C", source, "add", "-A"]);
-            let identity = ["-c", "user.name=gate", "-c", "user.email=gate@example.com", "-c", "commit.gpgsign=false"];
-            let mut commit = vec!["-C", source];
-            commit.extend(identity);
-            commit.extend(["commit", "-q", "--allow-empty", "-m", "snapshot"]);
-            git(&commit);
-            let refspec = format!("HEAD:refs/gate/{KEY}");
-            git(&["-C", source, "push", "-q", "--force", &self.bare(), &refspec]);
-            git(&["-C", source, "rev-parse", "HEAD"])
+            snapshot_pushed(&self.source(), &self.bare(), files)
         }
 
         /// Points the earlier run's back ref at `commit`.
@@ -1084,6 +1352,29 @@ mod tests {
                 let _ = fs::remove_dir_all(base);
             }
         }
+    }
+
+    /// A commit holding `files`, written over the source tree `source`, pushed to the bare repository `bare` as
+    /// `refs/gate/<key>`; its sha.
+    fn snapshot_pushed(source: &Path, bare: &str, files: &[(&str, &str)]) -> String {
+        let source = source.to_str().expect("the temp folder is UTF-8");
+        if !Path::new(source).exists() {
+            git(&["init", "-q", source]);
+        }
+        for (name, text) in files {
+            let path = Path::new(source).join(name);
+            fs::create_dir_all(path.parent().expect("a file has a folder")).expect("the file's folder is made");
+            fs::write(path, text).expect("the file is written");
+        }
+        git(&["-C", source, "add", "-A"]);
+        let identity = ["-c", "user.name=gate", "-c", "user.email=gate@example.com", "-c", "commit.gpgsign=false"];
+        let mut commit = vec!["-C", source];
+        commit.extend(identity);
+        commit.extend(["commit", "-q", "--allow-empty", "-m", "snapshot"]);
+        git(&commit);
+        let refspec = format!("HEAD:refs/gate/{KEY}");
+        git(&["-C", source, "push", "-q", "--force", bare, &refspec]);
+        git(&["-C", source, "rev-parse", "HEAD"])
     }
 
     fn decoded(json: &Value) -> Payload {
@@ -1135,15 +1426,6 @@ mod tests {
             self.lines.lock().unwrap_or_else(PoisonError::into_inner).push((stream, line.to_owned()));
             Ok(())
         }
-    }
-
-    /// The first folder along `PATH` holding `git`.
-    fn real_git() -> PathBuf {
-        let path = std::env::var_os("PATH").expect("PATH is set");
-        std::env::split_paths(&path)
-            .map(|folder| folder.join("git"))
-            .find(|git| git.is_file())
-            .expect("git is on PATH")
     }
 
     /// A heartbeat whose thread cannot start.
@@ -1292,6 +1574,11 @@ mod tests {
         case.back_ref_set(&commit);
         let (status, said) = whole_run(&case.commanded(&commit, &["/bin/sh", "-c", "echo new > new.txt; echo b > a.txt"]));
         assert_eq!(status, 0, "{said:?}");
+        assert_eq!(
+            back_commits_said(said.iter().map(|(_, line)| line.as_str())),
+            0,
+            "a run of one repo: {said:?}"
+        );
         let back = case.back_commit().expect("the back ref is pushed");
         assert_ne!(back, commit, "a new commit, not the earlier run's ref");
         assert_eq!(case.shown("%P", &back), commit, "its parent is the snapshot");
@@ -1372,6 +1659,11 @@ mod tests {
         let (status, said) = whole_run(&json);
         assert_eq!(status, 124, "{said:?}");
         assert!(!case.has_back_ref(), "no back ref, the earlier one deleted: {said:?}");
+        assert_eq!(
+            back_commits_said(said.iter().map(|(_, line)| line.as_str())),
+            0,
+            "a run of one repo: {said:?}"
+        );
     }
 
     /// The box's own `PATH` as the login shell's, so a case starts no login shell.
@@ -2031,11 +2323,453 @@ mod tests {
         layout_line("repo", &format!("{key} is not built on this builder"))
     }
 
+    /// The keys of a pair of the leaf `repo` and the sibling `lib`, whose snapshot is `lib_snapshot`.
+    fn pair_keys(lib_snapshot: &str) -> Value {
+        json!({ "Pair": { "Leaf": "repo", "Siblings": ["lib"] }, "SiblingSnapshots": { "lib": lib_snapshot } })
+    }
+
     #[test]
-    fn a_pair_is_refused_layout() {
-        let case = Case::new("pair");
-        let pair = json!({ "Pair": { "Leaf": "repo", "Siblings": ["lib"] } });
-        assert_refused(&case, &pair, Refusal::Layout, &unbuilt_layout("Pair"));
+    fn a_pair_request_reads_its_repos_the_main_one_first() {
+        let case = Case::new("pair-read");
+        let (main, lib) = ("a".repeat(40), "b".repeat(40));
+        let payload = decoded(&case.json(&main, &pair_keys(&lib)));
+        let request = Request::read(&payload).expect("the pair request reads");
+        let repos: Vec<(Option<String>, String, String, String)> = request
+            .repos()
+            .map(|repo| (repo.name.clone(), repo.tree.clone(), repo.bare.clone(), repo.snapshot.to_owned()))
+            .collect();
+        let (work, root) = (case.work(), case.root());
+        assert_eq!(
+            repos,
+            [
+                (Some("repo".to_owned()), format!("{work}/repo"), case.bare(), main),
+                (Some("lib".to_owned()), format!("{work}/lib"), format!("{root}/lib.git"), lib),
+            ]
+        );
+        assert_eq!(request.tree(), format!("{work}/repo"), "the main tree is the run's tree");
+    }
+
+    impl Case {
+        /// The sibling `lib`'s bare repository, beside the main one, made when it is missing.
+        fn lib_bare(&self) -> String {
+            let bare = format!("{}/lib.git", self.root());
+            if !Path::new(&bare).exists() {
+                git(&["init", "--bare", "-q", &bare]);
+            }
+            bare
+        }
+
+        /// A commit of the sibling `lib` holding `files`, pushed to its bare repository as `refs/gate/<key>`; its sha.
+        fn lib_snapshot(&self, files: &[(&str, &str)]) -> String {
+            snapshot_pushed(&self.base.with_file_name("lib-source"), &self.lib_bare(), files)
+        }
+
+        /// The run payload of a pair of this case's main repo at `main` and the sibling `lib` at `lib`, with `extra`
+        /// keys set over it.
+        fn pair_json(&self, main: &str, lib: &str, extra: &Value) -> Value {
+            let mut json = self.json(main, &pair_keys(lib));
+            if let (Some(object), Some(extra)) = (json.as_object_mut(), extra.as_object()) {
+                object.extend(extra.clone());
+            }
+            json
+        }
+
+        /// The tree of the pair's repo `name`.
+        fn tree(&self, name: &str) -> String {
+            format!("{}/{name}", self.work())
+        }
+
+        /// The commit the tree `tree` has checked out.
+        fn head_of(tree: &str) -> String {
+            git(&["-C", tree, "rev-parse", "HEAD"])
+        }
+
+        /// Whether the bare repository `bare` holds this case's back ref.
+        fn has_back_ref_in(bare: &str) -> bool {
+            Case::back_ref_in(bare).is_some()
+        }
+
+        /// The names in the work folder, sorted.
+        fn work_names(&self) -> Vec<String> {
+            let mut names: Vec<String> = fs::read_dir(self.work())
+                .expect("the work folder is read")
+                .map(|entry| entry.expect("an entry is read").file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+
+        fn layout_record(&self) -> String {
+            fs::read_to_string(format!("{}.layout", self.work())).expect("the layout record is read")
+        }
+    }
+
+    #[test]
+    fn a_pair_run_checks_out_every_tree_at_its_snapshot_and_is_placed_in_the_main_tree() {
+        let case = Case::new("pair-run");
+        let main = case.snapshot(&[("a.txt", "a\n")]);
+        let lib = case.lib_snapshot(&[("b.txt", "b\n")]);
+        let payload = decoded(&case.pair_json(&main, &lib, &json!({})));
+        let output = Arc::new(Output::new(RecordingSink::default()));
+        let ready = prepare(&payload, &output, quiet_periods(), own_path);
+        assert!(ready.is_ok(), "{:?}", stderr_of(&output));
+        let ready = ready.expect("the run is ready");
+        assert_eq!(ready.place, PathBuf::from(case.tree("repo")), "the place is the main tree");
+        assert_eq!(Case::head_of(&case.tree("repo")), main);
+        assert_eq!(Case::head_of(&case.tree("lib")), lib);
+        assert!(
+            Path::new(&case.tree("lib")).join("b.txt").is_file(),
+            "the sibling sits beside the main tree"
+        );
+        assert_eq!(case.work_names(), ["lib", "repo"]);
+        assert_eq!(case.layout_record(), "pair repo lib");
+        let alternates = fs::read_to_string(format!("{}/.git/objects/info/alternates", case.tree("lib"))).expect("the alternates are read");
+        assert_eq!(
+            alternates,
+            format!("{}/objects\n", case.lib_bare()),
+            "each tree borrows its own bare's objects"
+        );
+    }
+
+    #[test]
+    fn a_pair_run_sweeps_every_tree_s_stale_locks_and_clears_every_repo_s_back_ref() {
+        let case = Case::new("pair-swept");
+        let main = case.snapshot(&[("a.txt", "a\n")]);
+        let lib = case.lib_snapshot(&[("b.txt", "b\n")]);
+        let json = case.pair_json(&main, &lib, &json!({}));
+        let (status, said) = ran(&json);
+        assert_eq!(status, 0, "{said:?}");
+        let mut locks = Vec::new();
+        for (tree, bare) in [(case.tree("repo"), case.bare()), (case.tree("lib"), case.lib_bare())] {
+            for lock in ["index.lock", "HEAD.lock", "config.lock"] {
+                locks.push(format!("{tree}/.git/{lock}"));
+            }
+            fs::create_dir_all(format!("{bare}/refs/gate-back")).expect("the back refs' folder is made");
+            locks.push(format!("{bare}/refs/gate-back/{KEY}.lock"));
+            git(&[
+                &format!("--git-dir={bare}"),
+                "update-ref",
+                &format!("refs/gate-back/{KEY}"),
+                if bare == case.bare() { &main } else { &lib },
+            ]);
+        }
+        for lock in &locks {
+            fs::write(lock, "").expect("a stale lock file is written");
+        }
+
+        let (status, said) = ran(&json);
+        assert_eq!(status, 0, "{said:?}");
+        for lock in &locks {
+            assert!(!Path::new(lock).exists(), "{lock} is swept");
+        }
+        for bare in [case.bare(), case.lib_bare()] {
+            assert!(!Case::has_back_ref_in(&bare), "{bare}'s back ref is cleared");
+        }
+    }
+
+    #[test]
+    fn a_layout_change_clears_the_whole_work_folder_both_ways() {
+        let case = Case::new("pair-relaid");
+        let main = case.snapshot(&[("a.txt", "a\n")]);
+        let lib = case.lib_snapshot(&[("b.txt", "b\n")]);
+        case.laid_out(&main);
+        fs::write(format!("{}/left.txt", case.work()), "left\n").expect("a file the single run left is written");
+        fs::write(format!("{}.warm", case.work()), "a".repeat(64)).expect("a warm record is written");
+
+        let (status, said) = ran(&case.pair_json(&main, &lib, &json!({})));
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(case.work_names(), ["lib", "repo"], "the single tree is cleared");
+        assert_eq!(case.layout_record(), "pair repo lib");
+        assert!(
+            !Path::new(&format!("{}.warm", case.work())).exists(),
+            "the warm record goes with the clear"
+        );
+
+        case.laid_out(&main);
+        assert_eq!(case.work_names(), [".git", "a.txt"], "the pair's trees are cleared");
+        assert_eq!(case.layout_record(), "single");
+        assert_eq!(case.head(), main);
+    }
+
+    #[test]
+    fn a_pair_run_s_failing_checkout_step_names_its_repo() {
+        let case = Case::new("pair-unfetched");
+        let main = case.snapshot(&[("a.txt", "a\n")]);
+        case.lib_bare();
+        let (status, said) = ran(&case.pair_json(&main, &"b".repeat(40), &json!({})));
+        assert_ne!(status, 0, "{said:?}");
+        let mut from_last = said.iter().rev();
+        let (last, fetch) = (from_last.next().expect("a line is said"), from_last.next().expect("two lines are said"));
+        assert!(fetch.starts_with("gate: remote fetch lib failed"), "{said:?}");
+        assert_eq!(
+            last,
+            crate::lines::BACK_COMMITS_FAILED,
+            "a pair run ending before its command says so last"
+        );
+        assert_eq!(back_commits_said(said.iter().map(String::as_str)), 1, "{said:?}");
+    }
+
+    /// How many of `lines` are back commits lines.
+    fn back_commits_said<'a>(lines: impl IntoIterator<Item = &'a str>) -> usize {
+        lines.into_iter().filter(|line| line.starts_with("gate: remote back commits:")).count()
+    }
+
+    #[test]
+    fn a_pair_run_whose_lock_cannot_be_opened_says_its_back_commits_failed() {
+        let case = Case::new("pair-lock-folder");
+        fs::create_dir_all(case.lock()).expect("a folder takes the lock's name");
+        let (status, said) = ran(&case.pair_json(&"a".repeat(40), &"b".repeat(40), &json!({})));
+        assert_eq!(status, 1, "{said:?}");
+        assert!(
+            said.first()
+                .is_some_and(|line| line.starts_with("gate: remote could not open the work folder lock ")),
+            "{said:?}"
+        );
+        assert_eq!(said.last().map(String::as_str), Some(crate::lines::BACK_COMMITS_FAILED), "{said:?}");
+        assert_eq!(back_commits_said(said.iter().map(String::as_str)), 1, "{said:?}");
+    }
+
+    #[test]
+    fn a_pair_run_whose_sibling_bare_is_unusable_says_its_back_commits_failed() {
+        let case = Case::new("pair-bare-file");
+        fs::create_dir_all(case.root()).expect("the root is made");
+        fs::write(format!("{}/lib.git", case.root()), "kept\n").expect("a file takes the sibling's bare repository's name");
+        let (status, said) = ran(&case.pair_json(&"a".repeat(40), &"b".repeat(40), &json!({})));
+        assert_eq!(status, 1, "{said:?}");
+        assert_eq!(said.len(), 2, "the bare's line, then the failed line: {said:?}");
+        assert_eq!(said.last().map(String::as_str), Some(crate::lines::BACK_COMMITS_FAILED), "{said:?}");
+    }
+
+    #[test]
+    fn a_pair_run_refused_busy_says_no_back_commits_line() {
+        let case = Case::new("pair-busy");
+        fs::create_dir_all(Path::new(&case.work()).parent().expect("the work folder has a parent")).expect("the parent is made");
+        let held = take_lock(Path::new(&case.lock())).expect("the lock opens");
+        assert!(matches!(held, Locked::Held(_)), "the case takes the lock");
+        let (status, said) = ran(&case.pair_json(&"a".repeat(40), &"b".repeat(40), &json!({})));
+        assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        assert_eq!(back_commits_said(said.iter().map(String::as_str)), 0, "{said:?}");
+    }
+
+    #[test]
+    fn a_pair_run_whose_git_step_exits_75_says_its_back_commits_failed() {
+        let case = Case::new("pair-git-75");
+        let main = case.snapshot(&[("a.txt", "a\n")]);
+        let lib = case.lib_snapshot(&[("b.txt", "b\n")]);
+        let shim = case.base.with_file_name("git-shim-75");
+        // Every fetch exits 75, the status a refusal ends on, before any back commit is made.
+        let script = format!(
+            "#!/bin/sh\ncase \" $* \" in\n*\" fetch \"*) echo 'fatal: fetch stopped' >&2; exit 75;;\nesac\nexec '{}' \"$@\"\n",
+            real_git().display()
+        );
+        fs::write(&shim, script).expect("the shim is written");
+        fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("the shim is made runnable");
+        test_program::set(&shim);
+        let (status, said) = ran(&case.pair_json(&main, &lib, &json!({})));
+        assert_eq!(status, REFUSED_STATUS, "the git step's status ends the run: {said:?}");
+        assert!(said.iter().any(|line| line.contains("(status 75)")), "{said:?}");
+        assert_eq!(said.last().map(String::as_str), Some(crate::lines::BACK_COMMITS_FAILED), "{said:?}");
+        assert_eq!(back_commits_said(said.iter().map(String::as_str)), 1, "{said:?}");
+    }
+
+    #[test]
+    fn a_pair_run_whose_subfolder_leaves_the_main_tree_clears_every_back_ref_and_says_its_back_commits_failed() {
+        let case = Case::new("pair-subfolder-out");
+        let main = case.snapshot(&[("a.txt", "a\n")]);
+        let lib = case.lib_snapshot(&[("b.txt", "b\n")]);
+        for (bare, commit) in [(case.bare(), &main), (case.lib_bare(), &lib)] {
+            git(&[&format!("--git-dir={bare}"), "update-ref", &format!("refs/gate-back/{KEY}"), commit]);
+        }
+        let (status, said) = ran(&case.pair_json(&main, &lib, &json!({"Subfolder": "../lib"})));
+        assert_eq!(status, crate::lines::USAGE_STATUS, "{said:?}");
+        assert_eq!(
+            said,
+            [
+                "gate: remote subfolder ../lib is not a folder inside the work folder".to_owned(),
+                crate::lines::BACK_COMMITS_FAILED.to_owned()
+            ]
+        );
+        for bare in [case.bare(), case.lib_bare()] {
+            assert!(!Case::has_back_ref_in(&bare), "{bare}'s back ref is cleared");
+        }
+    }
+
+    #[test]
+    fn a_pair_run_whose_command_the_box_killed_says_its_back_commits_failed() {
+        let case = Case::new("pair-killed");
+        let main = case.snapshot(&[("a.txt", "a\n")]);
+        let lib = case.lib_snapshot(&[("b.txt", "b\n")]);
+        let extra = json!({"Command": ["/bin/sh", "-c", "echo x > x.txt; sleep 600"], "Identity": identity(), "Timeout": 1});
+        let (status, said) = whole_run(&case.pair_json(&main, &lib, &extra));
+        assert_eq!(status, 124, "{said:?}");
+        let err: Vec<&str> = said
+            .iter()
+            .filter(|(stream, _)| *stream == Stream::Err)
+            .map(|(_, line)| line.as_str())
+            .collect();
+        assert_eq!(err.last().copied(), Some(crate::lines::BACK_COMMITS_FAILED), "{said:?}");
+        assert_eq!(back_commits_said(err.iter().copied()), 1, "{said:?}");
+        assert!(!Case::has_back_ref_in(&case.bare()), "no back ref in the main repo");
+        assert!(!Case::has_back_ref_in(&case.lib_bare()), "no back ref in the sibling");
+    }
+
+    impl Case {
+        /// The commit of this case's back ref in the bare repository `bare`, `None` when there is none.
+        fn back_ref_in(bare: &str) -> Option<String> {
+            let back = format!("refs/gate-back/{KEY}");
+            let (said, found) = git_said(&[&format!("--git-dir={bare}"), "rev-parse", "--verify", "-q", &back]);
+            found.then_some(said)
+        }
+
+        /// The whole pair run of this case's main repo holding `a.txt` and the sibling `lib` holding `b.txt`, running
+        /// `script` in the main tree; the main snapshot, the sibling's, the status and the lines said on stderr.
+        fn pair_ran(&self, script: &str) -> (String, String, u8, Vec<String>) {
+            let main = self.snapshot(&[("a.txt", "a\n")]);
+            let lib = self.lib_snapshot(&[("b.txt", "b\n")]);
+            let extra = json!({"Command": ["/bin/sh", "-c", script], "Identity": identity()});
+            let (status, said) = whole_run(&self.pair_json(&main, &lib, &extra));
+            let err = said
+                .into_iter()
+                .filter(|(stream, _)| *stream == Stream::Err)
+                .map(|(_, line)| line)
+                .collect();
+            (main, lib, status, err)
+        }
+    }
+
+    #[test]
+    fn a_pair_run_changing_both_trees_pushes_both_back_refs_and_names_them() {
+        let case = Case::new("pair-back-both");
+        let (main, lib, status, err) = case.pair_ran("echo c > c.txt; echo d > ../lib/d.txt");
+        assert_eq!(status, 0, "{err:?}");
+        let main_back = Case::back_ref_in(&case.bare()).expect("the main repo's back ref is pushed");
+        let lib_back = Case::back_ref_in(&case.lib_bare()).expect("the sibling's back ref is pushed");
+        let parent = |bare: &str, commit: &str| git(&[&format!("--git-dir={bare}"), "show", "-s", "--format=%P", commit]);
+        assert_eq!(parent(&case.bare(), &main_back), main, "the main back commit is on its snapshot");
+        assert_eq!(parent(&case.lib_bare(), &lib_back), lib, "the sibling's back commit is on its snapshot");
+        assert_eq!(
+            git(&[&format!("--git-dir={}", case.lib_bare()), "show", &format!("{lib_back}:d.txt")]),
+            "d"
+        );
+        assert_eq!(
+            err.last(),
+            Some(&format!("gate: remote back commits: repo {main_back}, lib {lib_back}")),
+            "{err:?}"
+        );
+        assert_eq!(back_commits_said(err.iter().map(String::as_str)), 1, "{err:?}");
+    }
+
+    #[test]
+    fn a_pair_run_changing_only_the_sibling_names_the_main_repo_none() {
+        let case = Case::new("pair-back-sibling");
+        let (_, _, status, err) = case.pair_ran("echo d > ../lib/d.txt");
+        assert_eq!(status, 0, "{err:?}");
+        assert!(!Case::has_back_ref_in(&case.bare()), "no back ref in the unchanged main repo");
+        let lib_back = Case::back_ref_in(&case.lib_bare()).expect("the sibling's back ref is pushed");
+        assert_eq!(
+            err.last(),
+            Some(&format!("gate: remote back commits: repo none, lib {lib_back}")),
+            "{err:?}"
+        );
+        assert_eq!(back_commits_said(err.iter().map(String::as_str)), 1, "{err:?}");
+    }
+
+    #[test]
+    fn a_pair_run_changing_nothing_names_every_repo_none() {
+        let case = Case::new("pair-back-none");
+        let (_, _, status, err) = case.pair_ran("cat a.txt");
+        assert_eq!(status, 0, "{err:?}");
+        assert!(
+            !Case::has_back_ref_in(&case.bare()) && !Case::has_back_ref_in(&case.lib_bare()),
+            "no back ref"
+        );
+        assert_eq!(
+            err.last().map(String::as_str),
+            Some("gate: remote back commits: repo none, lib none"),
+            "{err:?}"
+        );
+        assert_eq!(back_commits_said(err.iter().map(String::as_str)), 1, "{err:?}");
+    }
+
+    #[test]
+    fn a_pair_run_whose_second_push_fails_deletes_the_first_and_says_its_back_commits_failed() {
+        let case = Case::new("pair-back-push-fails");
+        // A folder holding a file at the sibling's back ref, put there once the layout cleared the ref, fails its push.
+        let in_the_way = format!("{}/refs/gate-back/{KEY}", case.lib_bare());
+        let script = format!("echo c > c.txt; echo d > ../lib/d.txt; mkdir -p '{in_the_way}'; echo x > '{in_the_way}/in-the-way'");
+        let (_, _, status, err) = case.pair_ran(&script);
+        assert_eq!(status, 1, "{err:?}");
+        assert!(
+            !Case::has_back_ref_in(&case.bare()),
+            "the main repo's pushed back ref is deleted: {err:?}"
+        );
+        let mut from_last = err.iter().rev();
+        let (sync_back, failed) = (from_last.next().expect("a line is said"), from_last.next().expect("two lines are said"));
+        assert_eq!(failed, crate::lines::BACK_COMMITS_FAILED, "{err:?}");
+        assert!(sync_back.starts_with("gate: remote sync-back failed: push lib failed"), "{err:?}");
+        assert_eq!(back_commits_said(err.iter().map(String::as_str)), 1, "{err:?}");
+    }
+
+    #[test]
+    fn a_pair_run_whose_lock_is_lost_between_its_pushes_undoes_nothing() {
+        let case = Case::new("pair-back-lock-lost");
+        let shim = case.base.with_file_name("git-shim-lock");
+        // The main repo's push, the first, takes the lock's name from the run once it is done, as another run would
+        // take it: the push step's own lock check fails it with its back ref pushed, and the sibling is never pushed.
+        let script = format!(
+            "#!/bin/sh\n'{git}' \"$@\"\nstatus=$?\ncase \" $* \" in\n*\" push -q {bare} \"*) rm -f '{lock}';;\nesac\nexit $status\n",
+            git = real_git().display(),
+            bare = case.bare(),
+            lock = case.lock()
+        );
+        fs::write(&shim, script).expect("the shim is written");
+        fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("the shim is made runnable");
+        test_program::set(&shim);
+        let (_, _, status, err) = case.pair_ran("echo c > c.txt; echo d > ../lib/d.txt");
+        assert_eq!(status, 1, "{err:?}");
+        assert!(
+            Case::has_back_ref_in(&case.bare()),
+            "the main repo's pushed back ref is left to whoever holds the lock: {err:?}"
+        );
+        assert!(!Case::has_back_ref_in(&case.lib_bare()), "the sibling is never pushed: {err:?}");
+        assert!(
+            err.iter().all(|line| !line.contains("back ref reset")),
+            "no back ref deletion is tried without the lock: {err:?}"
+        );
+        let mut from_last = err.iter().rev();
+        let (sync_back, failed) = (from_last.next().expect("a line is said"), from_last.next().expect("two lines are said"));
+        assert_eq!(failed, crate::lines::BACK_COMMITS_FAILED, "{err:?}");
+        assert_eq!(
+            sync_back,
+            &format!(
+                "gate: remote sync-back failed: push repo failed: the work folder lock {} is no longer held",
+                case.lock()
+            ),
+            "{err:?}"
+        );
+        assert_eq!(back_commits_said(err.iter().map(String::as_str)), 1, "{err:?}");
+    }
+
+    #[test]
+    fn a_malformed_pair_is_a_usage_error_and_nothing_is_laid_out() {
+        let case = Case::new("pair-malformed");
+        let commit = "a".repeat(40);
+        for (extra, line) in [
+            (
+                json!({ "Pair": { "Leaf": "repo", "Siblings": ["lib"] } }),
+                "gate: box payload SiblingSnapshots must name exactly the Pair's siblings: lib".to_owned(),
+            ),
+            (
+                json!({ "Pair": { "Leaf": "other", "Siblings": ["lib"] }, "SiblingSnapshots": { "lib": commit } }),
+                format!("gate: box payload Key {KEY} is not the work-folder key of the Pair's Leaf other"),
+            ),
+        ] {
+            let (status, said) = ran(&case.json(&commit, &extra));
+            assert_eq!(status, 2, "{line}: {said:?}");
+            assert_eq!(said, [line]);
+            assert!(!Path::new(&case.lock()).exists(), "the lock is not taken");
+            assert!(!Path::new(&case.work()).exists(), "nothing is laid out");
+        }
     }
 
     #[test]
@@ -2430,7 +3164,7 @@ mod tests {
             (json!(["a[b"]), "gate: box payload Outputs glob 'a[b' holds '[' or ']'"),
             (json!("bin"), "gate: box payload Outputs is not a list of texts"),
         ] {
-            let extra = json!({ "Outputs": outputs, "Desktop": true, "DesktopWait": 60, "Pair": { "Leaf": "repo", "Siblings": ["lib"] } });
+            let extra = json!({ "Outputs": outputs, "Desktop": true, "DesktopWait": 60, "LfsDigest": DIGEST });
             let (status, said) = ran(&case.json(&"a".repeat(40), &extra));
             assert_eq!(status, 2, "{line}: {said:?}");
             assert_eq!(said, [line]);
@@ -2549,6 +3283,27 @@ mod tests {
         assert_eq!(restores(&log).len(), 2, "one more restore for the changed manifest: {said:?}");
         let rerecorded = fs::read_to_string(case.tools_record()).expect("the tools record is written");
         assert_ne!(rerecorded, recorded, "the changed manifest's hash is recorded");
+    }
+
+    #[test]
+    fn a_pair_run_never_restores_from_a_manifest_above_its_main_tree() {
+        let case = Case::new("tools-pair-bound");
+        let log = case.dotnet_shim("exit 0");
+        let main = case.snapshot(&[("a.txt", "a\n")]);
+        let lib = case.lib_snapshot(&[("b.txt", "b\n")]);
+        let json = case.pair_json(&main, &lib, &json!({}));
+        let (status, said) = ran_along_shim(&json);
+        assert_eq!(status, 0, "{said:?}");
+        // The work folder holds the pair's trees; a manifest beside them, as a command may leave one, is outside the
+        // main tree the walk is bounded by.
+        let above = Path::new(&case.work()).join(MANIFEST_PATH);
+        fs::create_dir_all(above.parent().expect("the manifest has a folder")).expect("the manifest's folder is made");
+        fs::write(&above, MANIFEST).expect("the manifest is written");
+        let (status, said) = ran_along_shim(&json);
+        assert_eq!(status, 0, "{said:?}");
+        assert!(above.is_file(), "the layout kept the work folder's own files: {said:?}");
+        assert!(restores(&log).is_empty(), "no restore ran: {said:?}");
+        assert!(!case.tools_record().exists(), "no tools record");
     }
 
     #[test]

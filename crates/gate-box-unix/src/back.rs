@@ -1,6 +1,6 @@
-//! A run's back commit, as the Windows box makes it: the tree the command left committed on the snapshot's `HEAD` with
-//! the payload's identity and pushed to the bare repository's `refs/gate-back/<key>`, which the PC fetches; nothing for
-//! a tree the command left unchanged. Every git step is the run's own ([`run_git`]), with the attribute and LFS storage
+//! A run's back commits, as the Windows box makes them: each repo's tree the command left committed on its snapshot's
+//! `HEAD` with the payload's identity and pushed to its bare repository's `refs/gate-back/<key>`, which the PC fetches,
+//! all or none; nothing for a tree the command left unchanged. Every git step is the run's own ([`run_git`]), with the attribute and LFS storage
 //! pins its checkout ran with, its group recorded in `<work>.pgid`.
 
 use std::fs::{self, File, OpenOptions};
@@ -10,10 +10,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::command::removed_if_held;
-use crate::console::{LineSink, Output};
+use crate::console::{LineSink, Output, Stream};
 use crate::files::{self, HeldLock};
-use crate::git::{Failed, GitClass, Tree};
-use crate::run::{Request, run_git};
+use crate::git::{Failed, GitClass, RunGit};
+use crate::run::{Repo, Request, back_ref_cleared, run_git};
 
 /// The back commit's message, as the Windows box writes it.
 const MESSAGE: &str = "gate-remote back";
@@ -27,66 +27,121 @@ pub enum BackFailed {
     Gone(Failed),
 }
 
-/// Makes the back commit of `request`'s work folder and pushes it to `refs/gate-back/<key>` in its bare repository,
-/// under the work lock `lock`, git found along `login_path` (the box's own `PATH` for `None`), its lines said through
-/// `output`. The commit, `None` when the tree is unchanged and nothing was pushed.
-///
-/// The work folder's index, which the checkout just refreshed, is copied to `<work>.index` ([`index_copied`]), so
-/// `add -A` skips every unchanged file; `add -A` and `write-tree` run on that copy, `write-tree` only while the copy is
-/// still there and the lock held, so a vanished copy never commits an empty tree. The copy is removed after while the
-/// lock is held ([`removed_if_held`]), a removal that fails said and failing nothing. A tree equal to `HEAD^{tree}` is
-/// no commit; else `commit-tree -p HEAD` with the payload's identity, then `push -q`, which runs to its end though the
-/// client goes, as it writes the shared bare repository; the lock is looked at before each.
+/// Makes the back commit of each repo of `request` and pushes it to `refs/gate-back/<key>` in its bare repository, all
+/// or none, as the Windows box's `back_commit` does: every repo's commit made first, the main one first
+/// ([`repo_back_commit`]), then each pushed, and a failed push deleting every back ref this run pushed and, on a pair
+/// run, the failing repo's own ([`undone`]), so the PC finds a back commit of every changed repo or of none; a work
+/// lock found lost before or after a push deletes nothing, as another run may hold the back refs then. All under
+/// the work lock `lock`, git found along `login_path` (the box's own `PATH` for `None`), its lines said through
+/// `output`. Each repo's commit in the order of [`Request::repos`], `None` for a repo whose tree is unchanged.
 ///
 /// # Errors
 ///
-/// Why the commit was not made or pushed.
+/// Why a commit was not made or pushed.
 pub fn back_commit<S: LineSink + 'static>(
     request: &Request<'_>,
     lock: &HeldLock,
     login_path: Option<&str>,
     output: &Arc<Output<S>>,
-) -> Result<Option<String>, BackFailed> {
+) -> Result<Vec<Option<String>>, BackFailed> {
     let git = run_git(request, lock, login_path, output);
+    let mut commits = Vec::with_capacity(1 + request.siblings.len());
+    for repo in request.repos() {
+        commits.push(repo_back_commit(request, repo, lock, &git, output)?);
+    }
+    let mut pushed = Vec::with_capacity(commits.len());
+    for (repo, commit) in request.repos().zip(&commits) {
+        let Some(commit) = commit else { continue };
+        let target = format!("{commit}:refs/gate-back/{}", request.key);
+        let step = repo.step("push");
+        // A lock lost before the push deletes nothing: another run may hold the work folder and its back refs now.
+        held(request, lock, &step).map_err(|failed| back_failed(output, failed))?;
+        if let Err(failed) = git.bare_step(&step, &repo.git_tree().args(&["push", "-q", &repo.bare, &target]), GitClass::Long) {
+            // On a pair run, the failing repo's own ref too: a push that failed after its ref was updated leaves it
+            // behind. A run of one repo takes no step it did not take before. Nothing is undone once the lock is lost.
+            if !request.siblings.is_empty() {
+                pushed.push(repo);
+            }
+            if matches!(lock.still_held(), Ok(true)) {
+                undone(request, &pushed, &git, output);
+            }
+            return Err(back_failed(output, failed));
+        }
+        pushed.push(repo);
+    }
+    Ok(commits)
+}
+
+/// After a failed push, the back ref of each repo of `pushed` deleted ([`back_ref_cleared`]), every one tried: a
+/// deletion that fails is said, unless the client is gone, and fails nothing more, the push's own failure ending the
+/// run.
+fn undone<S: LineSink + 'static>(request: &Request<'_>, pushed: &[&Repo<'_>], git: &RunGit<'_, S>, output: &Output<S>) {
+    for repo in pushed {
+        let Err(failed) = back_ref_cleared(git, request.key, repo) else {
+            continue;
+        };
+        if !output.client_gone() {
+            let lines: Vec<(Stream, &str)> = failed.lines.iter().map(|line| (Stream::Err, line.as_str())).collect();
+            // A note: the run ends on the push's failure, and a client gone finds out at its line.
+            let _ = output.say_together(&lines);
+        }
+    }
+}
+
+/// The tree the command left in `repo` committed on its snapshot's `HEAD` with the payload's identity, unpushed;
+/// nothing when the tree is unchanged. Each step is named for the repo on a pair run ([`Repo::step`]).
+///
+/// The tree's index, which the checkout just refreshed, is copied to `<work>.index` ([`index_copied`]), so `add -A`
+/// skips every unchanged file; `add -A` and `write-tree` run on that copy, `write-tree` only while the copy is still
+/// there and the lock held, so a vanished copy never commits an empty tree. The copy is removed after while the lock is
+/// held ([`removed_if_held`]), a removal that fails said and failing nothing; the run's one copy is used by each repo
+/// in turn. A tree equal to `HEAD^{tree}` is no commit; else `commit-tree -p HEAD`, the lock looked at before it. Else
+/// why the commit was not made.
+fn repo_back_commit<S: LineSink + 'static>(
+    request: &Request<'_>,
+    repo: &Repo<'_>,
+    lock: &HeldLock,
+    git: &RunGit<'_, S>,
+    output: &Arc<Output<S>>,
+) -> Result<Option<String>, BackFailed> {
     let failed = |failed: Failed| back_failed(output, failed);
-    let tree = Tree::at(request.work);
-    index_copied(request, lock, output)?;
+    let tree = repo.git_tree();
+    index_copied(request, &repo.tree, lock, output)?;
     let index = [("GIT_INDEX_FILE", request.index)];
+    let (add, write_tree) = (repo.step("add"), repo.step("write-tree"));
     let written = git
-        .step_with("add", &tree.args(&["add", "-A"]), GitClass::Long, &index)
-        .and_then(|_| copy_still_there(request, lock))
-        .and_then(|()| git.step_with("write-tree", &tree.args(&["write-tree"]), GitClass::Short, &index))
-        .and_then(|said| first_line("write-tree", &said));
+        .step_with(&add, &tree.args(&["add", "-A"]), GitClass::Long, &index)
+        .and_then(|_| copy_still_there(request, lock, &write_tree))
+        .and_then(|()| git.step_with(&write_tree, &tree.args(&["write-tree"]), GitClass::Short, &index))
+        .and_then(|said| first_line(&write_tree, &said));
     removed_if_held(request.index, lock, output);
     let written = written.map_err(failed)?;
+    let rev_parse = repo.step("rev-parse");
     let head = git
-        .step_as("rev-parse", &tree.args(&["rev-parse", "HEAD^{tree}"]), GitClass::Short)
-        .and_then(|said| first_line("rev-parse", &said))
+        .step_as(&rev_parse, &tree.args(&["rev-parse", "HEAD^{tree}"]), GitClass::Short)
+        .and_then(|said| first_line(&rev_parse, &said))
         .map_err(failed)?;
     if written == head {
         return Ok(None);
     }
     let identity: Vec<(&str, &str)> = request.identity.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
     let commit_args = ["commit-tree", written.as_str(), "-p", "HEAD", "-m", MESSAGE];
-    let commit = held(request, lock, "commit-tree")
-        .and_then(|()| git.step_with("commit-tree", &tree.args(&commit_args), GitClass::Short, &identity))
-        .and_then(|said| first_line("commit-tree", &said))
-        .map_err(failed)?;
-    let target = format!("{commit}:refs/gate-back/{}", request.key);
-    held(request, lock, "push")
-        .and_then(|()| git.bare_step("push", &tree.args(&["push", "-q", request.bare, &target]), GitClass::Long))
+    let commit_tree = repo.step("commit-tree");
+    let commit = held(request, lock, &commit_tree)
+        .and_then(|()| git.step_with(&commit_tree, &tree.args(&commit_args), GitClass::Short, &identity))
+        .and_then(|said| first_line(&commit_tree, &said))
         .map_err(failed)?;
     Ok(Some(commit))
 }
 
-/// The work folder's `.git/index` copied to `request`'s `<work>.index` while the work lock `lock` is held: `.git` a
+/// The `.git/index` of the repo tree `tree` copied to `request`'s `<work>.index` while the work lock `lock` is held: `.git` a
 /// plain folder, not a link; an earlier copy, a plain file, removed, and anything else at the name refused;
 /// `.git/index` opened without following a link and without waiting on a FIFO (`O_NOFOLLOW | O_NONBLOCK`), and the
 /// opened file checked a plain file before it is read, so nothing swapped in at its name can hold the run; the copy
 /// made new (`O_CREAT | O_EXCL | O_NOFOLLOW`, mode 0600) and, when the copying fails partway, removed again. Git's
 /// `add -A` then replaces the copy through `<work>.index.lock`, which leaves it with git's own mode. Else why not.
-fn index_copied<S: LineSink>(request: &Request<'_>, lock: &HeldLock, output: &Output<S>) -> Result<(), BackFailed> {
-    let dot_git = Path::new(request.work).join(".git");
+fn index_copied<S: LineSink>(request: &Request<'_>, tree: &str, lock: &HeldLock, output: &Output<S>) -> Result<(), BackFailed> {
+    let dot_git = Path::new(tree).join(".git");
     let index = dot_git.join("index");
     let copy = Path::new(request.index);
     let not_copied = |why: String| BackFailed::Step(format!("cannot copy {} to {}: {why}", index.display(), request.index));
@@ -129,14 +184,14 @@ fn index_copied<S: LineSink>(request: &Request<'_>, lock: &HeldLock, output: &Ou
 }
 
 /// Whether the copied index of `request` is still a plain file at its name and the work lock `lock` still held, just
-/// before `write-tree`: git reads a missing index as an empty one. Else the step's failure.
-fn copy_still_there(request: &Request<'_>, lock: &HeldLock) -> Result<(), Failed> {
-    held(request, lock, "write-tree")?;
+/// before the `write-tree` step `step`: git reads a missing index as an empty one. Else the step's failure.
+fn copy_still_there(request: &Request<'_>, lock: &HeldLock, step: &str) -> Result<(), Failed> {
+    held(request, lock, step)?;
     if fs::symlink_metadata(request.index).is_ok_and(|metadata| metadata.is_file()) {
         Ok(())
     } else {
         Err(Failed::line(format!(
-            "gate: remote write-tree failed: the copied index {} is gone",
+            "gate: remote {step} failed: the copied index {} is gone",
             request.index
         )))
     }

@@ -8,14 +8,14 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 use std::thread;
 
-use gate_wire::{Pair, PairSibling, PathForm, Payload, bare_stem, escaped};
+use gate_wire::{Pair, PairSibling, PathForm, Payload, bare_stem, escaped, trees};
 
 use crate::console::Console;
-use crate::git::{self, AlternatesFailure, Failed, Git, Steps, Tree, line_ends_set, origin_set};
+use crate::git::{self, AlternatesFailure, Failed, Git, Steps, Tree, failed_for, for_repo, line_ends_set, origin_set};
 use crate::lines::{
-    FAILED_STATUS, NEEDS_REFUSED, NEW_WORK_TREE, PAIR_NOT_BUILT, ROOT_STATUS, USAGE_STATUS, created_line, folder_failure, layout_text,
-    login_path_line, names_another_layout, readies_single, root_flaw, root_unsafe_line, sdks_failure, sdks_line, tool_line, unsynced_failure,
-    version_line, warm_line, warm_text, work_layout, write_failure,
+    FAILED_STATUS, NEEDS_REFUSED, NEW_WORK_TREE, ROOT_STATUS, USAGE_STATUS, created_line, folder_failure, layout_text, login_path_line,
+    names_another_layout, readies_single, root_flaw, root_unsafe_line, sdks_failure, sdks_line, tool_line, unsynced_failure, version_line, warm_line,
+    warm_text, work_layout, write_failure,
 };
 use crate::{boot, files, probe, process};
 
@@ -54,22 +54,30 @@ pub fn preflight(payload: &Payload, console: &mut Console) -> u8 {
             return ROOT_STATUS;
         }
     }
-    // A pair's bare repositories are not this payload's `Bare`, which a pair leaves unused.
-    let used = [Some(work), pair.is_none().then_some(bare)];
-    if let Some(line) = used.into_iter().flatten().find_map(|folder| files::unusable_folder(Path::new(folder))) {
+    // Every repo's bare repository: `Bare`, the main repo's, then on a pair each sibling's beside it.
+    let bares = bares(bare, pair.as_ref());
+    let unusable = std::iter::once(work)
+        .chain(bares.iter().map(|(bare, _)| *bare))
+        .find_map(|folder| files::unusable_folder(Path::new(folder)));
+    if let Some(line) = unusable {
         console.err(&line);
         return FAILED_STATUS;
     }
-    // Read before the tree is readied, which would make a missing `.git`, and so a stale record, look current.
+    // Read before the tree is readied, which would make a missing `.git`, and so a stale record, look current. A
+    // record naming another layout than the run's, a pair's first run having none, has the run clear the whole folder
+    // and lay its trees out again.
     let layout = layout_record(work);
-    let warm = warm_state(work, &layout);
-    let interrupted = files::exists(Path::new(&format!("{work}.command")));
     let relaid = names_another_layout(&layout, &wanted_layout(pair.as_ref()));
-    let readied = if pair.is_some() {
-        console.err(PAIR_NOT_BUILT);
-        Ok(false)
-    } else {
-        ready(&Git::of(&root, parent), bare, work, &layout, console)
+    let warm = warm_state(work, pair.as_ref(), relaid);
+    let interrupted = files::exists(Path::new(&format!("{work}.command")));
+    let git = Git::of(&root, parent);
+    // A pair's trees are laid out by its run, under the work lock.
+    let readied = match &pair {
+        None => ready(&git, bare, work, &layout, console),
+        Some(_) => bares
+            .iter()
+            .try_for_each(|(bare, name)| bare_made(&git, bare, *name, console))
+            .map(|()| false),
     };
     let made = match readied {
         Ok(made) => made,
@@ -145,7 +153,7 @@ fn wanted_layout(pair: Option<&Pair>) -> String {
 }
 
 /// The work folder's layout record, `<work>.layout`, read as a plain file; `None` when it is missing.
-fn layout_record(work: &str) -> io::Result<Option<String>> {
+pub(crate) fn layout_record(work: &str) -> io::Result<Option<String>> {
     match files::read_plain(Path::new(&format!("{work}.layout")), files::RECORD_LIMIT) {
         Ok(bytes) => String::from_utf8(bytes)
             .map(Some)
@@ -155,10 +163,28 @@ fn layout_record(work: &str) -> io::Result<Option<String>> {
     }
 }
 
-/// The hash the work folder's warm record, `<work>.warm`, names ([`warm_text`]); `None` when the layout is not a single
-/// tree's, the tree's `.git` is not a plain folder, or the record is missing or not a plain file.
-fn warm_state(work: &str, layout: &io::Result<Option<String>>) -> Option<String> {
-    if !readies_single(layout) || !files::plain_folder(&Path::new(work).join(".git")) {
+/// Each bare repository of the run, with the repo's name on a pair run: `bare`, the main repo's, then each sibling's of
+/// `pair`.
+fn bares<'a>(bare: &'a str, pair: Option<&'a Pair>) -> Vec<(&'a str, Option<&'a str>)> {
+    let Some(pair) = pair else {
+        return vec![(bare, None)];
+    };
+    let siblings = pair.siblings().iter().map(|sibling| (sibling.bare(), Some(sibling.name())));
+    std::iter::once((bare, Some(pair.leaf()))).chain(siblings).collect()
+}
+
+/// The hash the work folder's warm record, `<work>.warm`, names ([`warm_text`]); `None` when the layout record names
+/// another layout than the run's (`relaid`), a tree the run's layout holds ([`trees`]) has no plain folder at its
+/// `.git`, or the record is missing or not a plain file.
+fn warm_state(work: &str, pair: Option<&Pair>, relaid: bool) -> Option<String> {
+    let names: Vec<&str> = pair
+        .map(|pair| pair.siblings().iter().map(PairSibling::name).collect())
+        .unwrap_or_default();
+    let (main, siblings) = trees(work, pair.map(|pair| (pair.leaf(), names.as_slice())), PathForm::Unix);
+    let plain = std::iter::once(&main)
+        .chain(&siblings)
+        .all(|tree| files::plain_folder(&Path::new(tree).join(".git")));
+    if relaid || !plain {
         return None;
     }
     let bytes = files::read_plain(Path::new(&format!("{work}.warm")), WARM_READ_LIMIT).ok()?;
@@ -170,10 +196,7 @@ fn warm_state(work: &str, layout: &io::Result<Option<String>>) -> Option<String>
 /// `.git`, its `origin` set to `bare`, its line-ending config written and its alternates file naming `bare`'s objects.
 /// A link or a file at `.git`, `.git/objects` or `.git/objects/info` is never followed. Whether the tree was made now.
 fn ready(git: &Git<'_>, bare: &str, work: &str, layout: &io::Result<Option<String>>, console: &mut Console) -> Result<bool, Failed> {
-    if !files::exists(Path::new(bare)) {
-        console.out(&created_line(bare));
-        git.step("git init --bare", &["init", "--bare", "-q", bare])?;
-    }
+    bare_made(git, bare, None, console)?;
     if !readies_single(layout) {
         return Ok(false);
     }
@@ -192,6 +215,19 @@ fn ready(git: &Git<'_>, bare: &str, work: &str, layout: &io::Result<Option<Strin
     line_ends_set(git, &tree)?;
     alternates_written(work, bare)?;
     Ok(made)
+}
+
+/// Makes the bare repository `bare` of the repo `name` (`None` on a run of one repo) when nothing is at its name, said
+/// as created; its step and its failure name the repo on a pair run ([`for_repo`], [`failed_for`]).
+fn bare_made(git: &Git<'_>, bare: &str, name: Option<&str>, console: &mut Console) -> Result<(), Failed> {
+    if files::exists(Path::new(bare)) {
+        return Ok(());
+    }
+    console.out(&created_line(bare));
+    let step = "git init --bare";
+    git.step(&for_repo(step, name), &["init", "--bare", "-q", bare])
+        .map(drop)
+        .map_err(|failed| failed_for(failed, step, name))
 }
 
 /// Removes the warm record `<work>.warm` of a tree that is gone, so the tree made in its place is not taken as warm;
@@ -283,7 +319,7 @@ mod tests {
     use crate::console::Console;
     use crate::files::{effective_uid, user_name};
     use crate::git::Git;
-    use crate::lines::{NEW_WORK_TREE, PAIR_NOT_BUILT, created_line, root_unsafe_line, version_line, warm_line};
+    use crate::lines::{NEW_WORK_TREE, created_line, root_unsafe_line, version_line, warm_line};
 
     const KEY: &str = "repo-0123abcd";
     const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -466,7 +502,12 @@ mod tests {
 
     /// Checks the preflight of `case` is refused with the folder line for `folder` and `why`, status 1.
     fn assert_folder_refused(case: &Case, folder: &str, why: &str) {
-        let (status, console) = preflighted(&case.payload(&json!({})));
+        assert_folder_refused_with(&case.payload(&json!({})), folder, why);
+    }
+
+    /// [`assert_folder_refused`] for the preflight of `payload`.
+    fn assert_folder_refused_with(payload: &Payload, folder: &str, why: &str) {
+        let (status, console) = preflighted(payload);
         assert_eq!(status, 1, "{:?}", console.out);
         assert_eq!(console.err, [format!("gate: remote could not create the folder {folder}: {why}")]);
     }
@@ -631,19 +672,135 @@ mod tests {
         );
     }
 
+    /// The pair of the leaf `repo` and the sibling `lib`.
+    fn pair() -> Value {
+        json!({ "Pair": { "Leaf": "repo", "Siblings": ["lib"] } })
+    }
+
+    impl Case {
+        /// The sibling `lib`'s bare repository, beside the main one.
+        fn lib_bare(&self) -> String {
+            format!("{}/lib.git", self.root())
+        }
+
+        /// Writes the work folder's layout record as `text`.
+        fn layout_written(&self, text: &str) {
+            fs::create_dir_all(format!("{}/work", self.root())).expect("the work folders' parent is made");
+            fs::write(format!("{}.layout", self.work()), text).expect("the layout record is written");
+        }
+    }
+
     #[test]
-    fn a_pair_is_not_laid_out_here_and_its_first_run_is_new() {
+    fn a_pair_s_first_preflight_readies_every_bare_and_no_tree_and_is_new() {
         let case = Case::new("pair");
-        let payload = case.payload(&json!({ "Pair": { "Leaf": "repo", "Siblings": ["lib"] } }));
+        let (status, console) = preflighted(&case.payload(&pair()));
+        assert_eq!(status, 0, "{:?}", console.err);
+        let out = &console.out;
+        assert_eq!(
+            out[..5],
+            [
+                created_line(&case.bare()),
+                created_line(&case.lib_bare()),
+                version_line(),
+                warm_line(None),
+                NEW_WORK_TREE.to_owned()
+            ],
+            "{out:?}"
+        );
+        assert!(out[5].starts_with("gate: remote boot "), "{out:?}");
+        for bare in [case.bare(), case.lib_bare()] {
+            assert!(PathBuf::from(&bare).join("HEAD").is_file(), "{bare} is made");
+        }
+        assert!(!Path::new(&case.work()).join("repo").exists(), "the run lays the trees out");
+    }
+
+    #[test]
+    fn a_pair_s_bare_that_cannot_be_made_names_its_repo() {
+        let case = Case::new("pair-bare");
+        fs::create_dir_all(case.root()).expect("the root is made");
+        fs::write(case.lib_bare(), "kept\n").expect("a file takes the sibling's bare repository's name");
+
+        assert_folder_refused_with(&case.payload(&pair()), &case.lib_bare(), "it is not a folder");
+        assert_eq!(fs::read(case.lib_bare()).expect("the file is read"), b"kept\n");
+    }
+
+    #[test]
+    fn a_layout_record_naming_the_pair_is_not_a_new_work_tree() {
+        let case = Case::new("pair-kept");
+        let payload = case.payload(&pair());
+        assert_eq!(preflighted(&payload).0, 0);
+        case.layout_written("pair repo lib");
+
         let (status, console) = preflighted(&payload);
         assert_eq!(status, 0, "{:?}", console.err);
-        assert_eq!(console.err.first().map(String::as_str), Some(PAIR_NOT_BUILT));
-        assert_eq!(
-            console.out[..3],
-            [version_line(), warm_line(None), NEW_WORK_TREE.to_owned()],
-            "{:?}",
+        assert_eq!(console.out[..2], [version_line(), warm_line(None)], "{:?}", console.out);
+        assert!(console.out[2].starts_with("gate: remote boot "), "no new work tree: {:?}", console.out);
+    }
+
+    #[test]
+    fn a_pair_whose_sibling_tree_has_no_git_is_warm_none_and_not_a_new_work_tree_as_on_windows() {
+        let case = Case::new("pair-sibling-no-git");
+        let payload = case.payload(&pair());
+        assert_eq!(preflighted(&payload).0, 0);
+        case.layout_written("pair repo lib");
+        let hash = "a".repeat(64);
+        fs::write(format!("{}.warm", case.work()), &hash).expect("the warm record is written");
+        for name in ["repo", "lib"] {
+            fs::create_dir_all(Path::new(&case.work()).join(name).join(".git")).expect("the tree's .git is made");
+        }
+        let (status, console) = preflighted(&payload);
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert_eq!(console.out[..2], [version_line(), warm_line(Some(hash.as_str()))], "{:?}", console.out);
+        assert!(console.out[2].starts_with("gate: remote boot "), "both trees whole: {:?}", console.out);
+
+        fs::remove_dir(Path::new(&case.work()).join("lib").join(".git")).expect("the sibling's .git is removed");
+        let (status, console) = preflighted(&payload);
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert_eq!(console.out[..2], [version_line(), warm_line(None)], "{:?}", console.out);
+        assert!(
+            console.out[2].starts_with("gate: remote boot "),
+            "the sibling's .git missing: {:?}",
             console.out
         );
-        assert!(!PathBuf::from(case.work()).join(".git").exists(), "no tree is made");
+    }
+
+    #[test]
+    fn a_pair_s_bare_whose_git_init_fails_says_the_windows_box_s_step() {
+        let case = Case::new("pair-init-fails");
+        let git = crate::git::test_program::real_git();
+        let shim = case.base.join("git-shim");
+        // The sibling's `git init --bare` says an error and fails; every other step is the real git's.
+        let script = format!(
+            "#!/bin/sh\ncase \" $* \" in\n*\" init --bare \"*lib.git*) echo 'fatal: cannot init' >&2; exit 128;;\nesac\nexec '{}' \"$@\"\n",
+            git.display()
+        );
+        fs::write(&shim, script).expect("the shim is written");
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).expect("the shim is made runnable");
+        crate::git::test_program::set(&shim);
+
+        let (status, console) = preflighted(&case.payload(&pair()));
+        assert_ne!(status, 0, "{:?}", console.err);
+        assert_eq!(
+            console.err.last().map(String::as_str),
+            Some("gate: remote git init --bare failed for lib (status 128)"),
+            "{:?}",
+            console.err
+        );
+        assert!(console.err.iter().all(|line| !line.contains("for lib failed")), "{:?}", console.err);
+    }
+
+    #[test]
+    fn a_layout_record_of_another_layout_has_the_run_clear_the_work_folder() {
+        let case = Case::new("relaid");
+        for (extra, record) in [(pair(), "single"), (json!({}), "pair repo lib")] {
+            case.layout_written(record);
+            let (status, console) = preflighted(&case.payload(&extra));
+            assert_eq!(status, 0, "{record}: {:?}", console.err);
+            assert!(console.out.iter().any(|line| line == NEW_WORK_TREE), "{record}: {:?}", console.out);
+            assert!(
+                !Path::new(&case.work()).join(".git").exists(),
+                "{record}: no tree is readied for the run to clear"
+            );
+        }
     }
 }

@@ -12,9 +12,6 @@ use gate_wire::{BoxKill, PathForm, Refusal, SHA256_DIGITS, build_version, escape
 /// The line saying the work folder's tree is new, which the client raises a run's ceiling for.
 pub const NEW_WORK_TREE: &str = "gate: remote new work tree";
 
-/// The line a preflight with a `Pair` says: this builder lays out no pair, and the run refuses one.
-pub const PAIR_NOT_BUILT: &str = "gate: remote pair layout is not built on this builder";
-
 /// The line a payload whose `Needs` is not an object of texts gets; nothing is probed.
 pub const NEEDS_REFUSED: &str = "gate: box payload Needs is not an object of texts; probing nothing";
 
@@ -33,6 +30,10 @@ pub const FAILED_STATUS: u8 = 1;
 
 /// The layout record's text for a work folder holding one repo's tree.
 pub const LAYOUT_SINGLE: &str = "single";
+
+/// The layout record's text while a run clears the work folder for another layout, as the Windows box writes it: a
+/// layout no run has, so a clear cut short is cleared again.
+pub const LAYOUT_CHANGING: &str = "changing";
 
 /// `gate: remote version <v>`, the version as `gate --version` says it after `gate `.
 #[must_use]
@@ -336,6 +337,22 @@ pub fn layout_text(pair: Option<(&str, Vec<&str>)>) -> String {
     format!("pair {leaf} {}", siblings.join(" "))
 }
 
+/// What a pair run says when its back commits were not all pushed, or were never made because the run ended before
+/// them: the PC applies nothing, as the Windows box's line tells it.
+pub const BACK_COMMITS_FAILED: &str = "gate: remote back commits: failed";
+
+/// The line a pair run says once every back commit is pushed, as the Windows box builds it: `gate: remote back commits: `
+/// and, for each repo of `commits`, the main one first, its name and its back commit, or `none` for a repo whose tree is
+/// unchanged, comma-separated.
+#[must_use]
+pub fn back_commits_line(commits: &[(&str, Option<&str>)]) -> String {
+    let named: Vec<String> = commits
+        .iter()
+        .map(|(name, commit)| format!("{name} {}", commit.unwrap_or("none")))
+        .collect();
+    format!("gate: remote back commits: {}", named.join(", "))
+}
+
 /// Whether the layout record as `read` names another layout than `wanted`: a missing record is a single layout's, a
 /// record is compared ignoring ASCII case, and one that cannot be read counts as another.
 #[must_use]
@@ -603,7 +620,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Along, BOX_JOB_VARIABLE, CommandEnd, ROSETTA_LINE, Translation, command_environment, command_status, rosetta_lines, round_trip, translation,
+        Along, BACK_COMMITS_FAILED, BOX_JOB_VARIABLE, CommandEnd, ROSETTA_LINE, Translation, back_commits_line, command_environment, command_status,
+        rosetta_lines, round_trip, translation,
     };
     use super::{
         JobRecord, PATH_MARKER, Probed, Recorded, RootFacts, boot_line, created_line, folder_failure, folder_flaw, is_git_variable, job_record,
@@ -987,6 +1005,21 @@ mod tests {
     fn the_layout_text_orders_the_siblings_ignoring_case() {
         assert_eq!(layout_text(None), "single");
         assert_eq!(layout_text(Some(("app", vec!["lib", "Core", "b"]))), "pair app b Core lib");
+    }
+
+    #[test]
+    fn the_back_commits_line_is_the_windows_box_s() {
+        let (main, lib) = ("a".repeat(40), "b".repeat(40));
+        // The Windows box's own test of its line (`box_run_with_a_pair_names_each_repo_s_back_commit`) pins this form.
+        assert_eq!(
+            back_commits_line(&[("app", Some(&main)), ("lib", Some(&lib)), ("tools", None)]),
+            format!("gate: remote back commits: app {main}, lib {lib}, tools none")
+        );
+        assert_eq!(
+            back_commits_line(&[("app", None), ("lib", None)]),
+            "gate: remote back commits: app none, lib none"
+        );
+        assert_eq!(BACK_COMMITS_FAILED, "gate: remote back commits: failed");
     }
 
     #[test]

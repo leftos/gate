@@ -25,7 +25,7 @@ use crate::files::{self, HeldLock};
 use crate::git::CLOSED_STATUS;
 use crate::lines::{Along, FAILED_STATUS};
 use crate::process::{self, EndedBy, Ending, Forward, GroupRecord, NotRan, Watch, run_watched};
-use crate::run::{REFUSED_STATUS, Request};
+use crate::run::{REFUSED_STATUS, Request, Unready};
 
 /// The manifest names `dotnet` reads in one folder, the one under `.config` first, as `dotnet` looks for them.
 const MANIFEST_NAMES: [&str; 2] = [".config/dotnet-tools.json", "dotnet-tools.json"];
@@ -112,29 +112,30 @@ enum Restored {
 ///
 /// # Errors
 ///
-/// The status the run ends on, its lines said: 75 when the restore exited nonzero or could not start, after the failed
-/// line, the `tools` tag and [`tools_line`], said together; 1 when a manifest could not be read, the record could not
-/// be written, a signal ended the restore, or the box could not see it to its end; 255 when the client closed the
-/// connection during it.
+/// How the run ends, its lines said: refused when the restore exited nonzero or could not start, after the failed
+/// line, the `tools` tag and [`tools_line`], said together; status 1 when a manifest could not be read, the record
+/// could not be written, a signal ended the restore, or the box could not see it to its end; 255 when the client
+/// closed the connection during it.
 pub(crate) fn update<S: LineSink + 'static>(
     request: &Request<'_>,
     place: &Path,
     lock: &HeldLock,
     along: Along<'_>,
     output: &Arc<Output<S>>,
-) -> Result<(), u8> {
-    let (work, paths) = walk(Path::new(request.work), place).map_err(|error| {
+) -> Result<(), Unready> {
+    // Bounded by the main repo's tree: the work folder itself on a run of one repo, `<work>/<leaf>` on a pair run.
+    let (work, paths) = walk(Path::new(request.tree()), place).map_err(|error| {
         let line = format!(
             "gate: remote could not resolve the work folder {} or the folder {}: {error}",
-            request.work,
+            request.tree(),
             place.display()
         );
-        said(output, &[&line], FAILED_STATUS)
+        Unready::Ended(said(output, &[&line], FAILED_STATUS))
     })?;
     if paths.is_empty() {
         return Ok(());
     }
-    let digest = hash(&paths, &work).map_err(|line| said(output, &[&line], FAILED_STATUS))?;
+    let digest = hash(&paths, &work).map_err(|line| Unready::Ended(said(output, &[&line], FAILED_STATUS)))?;
     let record = format!("{}.tools", request.work);
     match files::read_plain(Path::new(&record), files::RECORD_LIMIT) {
         // The record holds this walk's hash: the tools are the ones the command will read, so nothing runs.
@@ -150,23 +151,24 @@ pub(crate) fn update<S: LineSink + 'static>(
         }
     }
     let status = match restored(request, place, lock, along, output) {
-        Restored::Exited(0) => return record_written(&record, &digest, lock, output),
+        Restored::Exited(0) => return record_written(&record, &digest, lock, output).map_err(Unready::Ended),
         Restored::Exited(status) => status,
         Restored::Signalled(signal) => {
             let line = format!("gate: remote tool restore failed (signal {signal})");
-            return Err(said(output, &[&line], FAILED_STATUS));
+            return Err(Unready::Ended(said(output, &[&line], FAILED_STATUS)));
         }
         Restored::NotStarted(why) => {
             let line = format!("gate: remote could not start the dotnet tool restore: {why}");
             let _ = output.say(Stream::Err, &line);
             i32::from(FAILED_STATUS)
         }
-        Restored::Ended(status) => return Err(status),
+        Restored::Ended(status) => return Err(Unready::Ended(status)),
     };
     let _ = output.say(Stream::Err, &format!("gate: remote tool restore failed (status {status})"));
     // Said together, so no heartbeat lands between the tag and the line it tags.
     let tag = refused_line(request.nonce, Refusal::Tools);
-    Err(said(output, &[&tag, &tools_line(request.key)], REFUSED_STATUS))
+    said(output, &[&tag, &tools_line(request.key)], REFUSED_STATUS);
+    Err(Unready::Refused)
 }
 
 /// Writes `digest` as the whole of the record `record` while the work lock `lock` is held; a failure is said and
