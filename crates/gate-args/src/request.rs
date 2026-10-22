@@ -33,7 +33,8 @@ pub enum Invocation {
     Expect(ExpectRequest),
     /// `gate warm`.
     Warm(WarmRequest),
-    /// The hidden `gate box <verb> --stdin`, `gate box register-desktop`, or `gate box prune --root <folder>`.
+    /// The hidden `gate box <verb> --stdin`, `gate box register-desktop`, or `gate box prune --root <folder>
+    /// [--keys <key>...]`.
     Box(BoxRequest),
 }
 
@@ -45,6 +46,9 @@ pub struct BoxRequest {
     pub seams: BoxSeams,
     /// The builder root `prune` sweeps, the word after its `--root`; `None` for every other verb.
     pub root: Option<PathBuf>,
+    /// The keys a keyed `prune` removes, the words after its `--keys`, each once in any case as first spelled, in the order given; empty for the
+    /// age prune and every other verb.
+    pub keys: Vec<String>,
 }
 
 /// What the black-box suite sets on `gate box` through the hidden `--test-*` flags given before the verb; each field

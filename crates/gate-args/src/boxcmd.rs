@@ -1,6 +1,7 @@
 //! The hidden `gate box <verb> --stdin`: the builder side of a routed run. Only the words are read here; the request
 //! is stdin's first line, which the binary reads and decodes. `gate box register-desktop` takes no `--stdin`: it reads
-//! no request; nor does `gate box prune --root <folder>`, whose one word is its root. A `test-seams` build also reads the hidden
+//! no request; nor does `gate box prune --root <folder> [--keys <key>...]`, whose words are its root and the keys it
+//! removes. A `test-seams` build also reads the hidden
 //! `--test-heartbeat-ms <n>`, `--test-box-console fail-before`, `--test-box-token refused`, `--test-box-park-launch <path>`,
 //! `--test-outputs-budget-bytes <n>`, `--test-inputs-budget-bytes <n>`, `--test-lfs-budget-bytes <n>`, `--test-dotnet-limit-ms <n>`,
 //! `--test-box-sample-ms <n>`, `--test-box-sampler-fail true|false`, `--test-box-free-percent <1-100>`,
@@ -20,6 +21,10 @@ use crate::request::{BoxRequest, BoxSeams, BoxVerb};
 const STDIN: &str = "--stdin";
 /// The word after `prune`, before its root.
 const ROOT: &str = "--root";
+/// The word after a keyed `prune`'s root, before its keys.
+const KEYS: &str = "--keys";
+/// The most keys one keyed `prune` takes.
+const MOST_KEYS: usize = 50;
 
 /// The values `--test-box-register` takes: the registration succeeds, or fails as the seam refusing.
 #[cfg(feature = "test-seams")]
@@ -27,30 +32,64 @@ const REGISTER_RESULTS: &[&str] = &["ok", "fail"];
 
 /// Reads the words after `gate box`: the seams, then a verb, then exactly `--stdin`, and nothing after it; or, for
 /// `register-desktop`, which reads no request, nothing after the verb at all; or, for `prune`, exactly `--root` and
-/// one word, its root. A seam refused is its own problem, as `gate run` reports it; any other shape is the one box
-/// usage problem, after those.
+/// one word, its root, then nothing or `--keys` and its keys ([`prune_keys`]). A seam refused is its own problem, as
+/// `gate run` reports it; any other shape is the one box usage problem, after those.
 pub(crate) fn parse(words: impl Iterator<Item = OsString>) -> Result<BoxRequest, Vec<Problem>> {
     let mut words = words.peekable();
     let mut problems = Vec::new();
     let seams = seams(&mut words, &mut problems);
     let verb = words.next().as_deref().and_then(OsStr::to_str).and_then(verb);
-    let (closed, root) = match verb {
+    let (closed, root, keys) = match verb {
         Some(BoxVerb::Prune) => match (words.next(), words.next()) {
-            (Some(flag), Some(root)) if flag == ROOT => (true, Some(PathBuf::from(root))),
-            _ => (false, None),
+            (Some(flag), Some(root)) if flag == ROOT => match prune_keys(&mut words) {
+                Some(keys) => (true, Some(PathBuf::from(root)), keys),
+                None => (false, None, Vec::new()),
+            },
+            _ => (false, None, Vec::new()),
         },
         // A verb that reads no request must have no word after it, which stands where `--stdin` stands for the others.
-        Some(verb) if !verb.takes_request() => (words.peek().is_none(), None),
-        _ => (words.next().is_some_and(|word| word == STDIN), None),
+        Some(verb) if !verb.takes_request() => (words.peek().is_none(), None, Vec::new()),
+        _ => (words.next().is_some_and(|word| word == STDIN), None, Vec::new()),
     };
     match (verb, closed, words.next()) {
-        (Some(verb), true, None) if problems.is_empty() => Ok(BoxRequest { verb, seams, root }),
+        (Some(verb), true, None) if problems.is_empty() => Ok(BoxRequest { verb, seams, root, keys }),
         (Some(_), true, None) => Err(problems),
         _ => {
             problems.push(Problem::BoxUsage);
             Err(problems)
         }
     }
+}
+
+/// The keys after a `prune`'s root: none when no word follows the root; else, after exactly `--keys`, every word left,
+/// 1 to [`MOST_KEYS`] words, each a key ([`is_key_word`]), a repeat in any case dropped. `None` for any other words, which is
+/// the box usage.
+fn prune_keys(words: &mut Peekable<impl Iterator<Item = OsString>>) -> Option<Vec<String>> {
+    let Some(flag) = words.next() else {
+        return Some(Vec::new());
+    };
+    if flag != KEYS {
+        return None;
+    }
+    let mut keys: Vec<String> = Vec::new();
+    for (given, word) in words.by_ref().enumerate() {
+        let key = word.into_string().ok().filter(|key| is_key_word(key) && given < MOST_KEYS)?;
+        // The builder's file system knows no case, so a key in another case names the same work folder.
+        if !keys.iter().any(|kept| kept.eq_ignore_ascii_case(&key)) {
+            keys.push(key);
+        }
+    }
+    (!keys.is_empty()).then_some(keys)
+}
+
+/// Whether `word` is a key `--keys` takes: what `gate_wire::is_key` accepts, ASCII letters of either case, digits,
+/// `-` and `_`, at least one, so no word can name a path; and not starting with `-`, so a flag is never read as a key.
+fn is_key_word(word: &str) -> bool {
+    !word.is_empty()
+        && !word.starts_with('-')
+        && word
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
 fn verb(text: &str) -> Option<BoxVerb> {

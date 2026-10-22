@@ -38,7 +38,7 @@ mod warm;
 
 const BOX_USAGE: &str = concat!(
     "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)\n",
-    "       gate box prune --root <folder>\n",
+    "       gate box prune --root <folder> [--keys <key>...]\n",
 );
 
 /// The request line for `json`, as the remote client encodes it: base64 of the JSON, without its newline.

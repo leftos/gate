@@ -585,9 +585,9 @@ The lines, each on stderr and escaped to one line where it carries a path, a rep
 
 Hidden from the usage and from `--help`. It is the builder side of a routed run, run over ssh on the builder ([The box side](#the-box-side)).
 
-`gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin` takes exactly one verb and the word `--stdin`, and no `--state-dir`: the request is the first line of stdin, and every path comes from it. Two exceptions take no request and no `--stdin`: `gate box register-desktop`, and `gate box prune --root <folder>`, which takes the root as its one option.
+`gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin` takes exactly one verb and the word `--stdin`, and no `--state-dir`: the request is the first line of stdin, and every path comes from it. Two exceptions take no request and no `--stdin`: `gate box register-desktop`, and `gate box prune --root <folder> [--keys <key>...]`, which takes the root and, optionally, the keys to remove.
 
-Any other shape (no verb, no `--stdin`, any other word in its place, an unknown verb, an extra word) prints the box usage alone on stderr and exits 2. The usage is two lines: `usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)`, then the `gate box prune --root <folder>` line.
+Any other shape (no verb, no `--stdin`, any other word in its place, an unknown verb, an extra word) prints the box usage alone on stderr and exits 2. The usage is two lines: `usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)`, then the `       gate box prune --root <folder> [--keys <key>...]` line.
 
 ### Later subcommands
 
@@ -2854,7 +2854,7 @@ The box's ceiling has three seams: `--test-box-sample-ms <n>` replaces the 5 s s
 
 `--test-lfs-budget-bytes <n>` replaces the 16 GiB a `gate box lfs` put unpacks, in bytes.
 
-`--test-box-root-walk-stop <folder>` ends the preflight's walk over the folders above the work root at that folder, which and those above it go unjudged (any path; an empty value is no value), so a case does not depend on the host's folders.
+`--test-box-root-walk-stop <folder>`, which the keyed `gate box prune` also honours, ends the preflight's walk over the folders above the work root at that folder, which and those above it go unjudged (any path; an empty value is no value), so a case does not depend on the host's folders.
 
 The other five box seams are `--test-outputs-budget-bytes <n>`, which replaces the 50 GiB outputs budget of the box's trim, in bytes, `--test-inputs-budget-bytes <n>`, which replaces the 4 GiB a `gate box inputs` put unpacks, decompressed, in bytes, `--test-dotnet-limit-ms <n>`, which replaces the 30 s bound of the preflight's `dotnet --list-sdks` read, in milliseconds, `--test-probe-limit-ms <n>`, which replaces the 10 s shared bound of the preflight's tool probes, in milliseconds, and `--test-probe-drain-ms <n>`, which replaces the 2 s the output readers of each probe and of the preflight's `dotnet --list-sdks` get to finish after the program exits, in milliseconds.
 
@@ -3575,7 +3575,7 @@ Built verbs:
 
   A `test-seams` build given `--test-box-register ok|fail` skips the Task Scheduler: `ok` says the registered line, `fail` says `failed: the test seam refused`.
 
-- **`prune`** (`boxside/prune.rs`) removes the work folders of keys idle for over 24 hours, from `gate box prune --root <folder>` (an absolute path on a drive; anything else prints `gate: box prune --root is not an absolute path on a drive: "<value>"` and exits 2). It reads no request and never reads stdin, and any other shape is the box usage. The builder's scheduled task runs it every 6 hours ([Builder setup](routing-a-repo.md#builder-setup)).
+- **`prune`** (`boxside/prune.rs`) removes the work folders of keys idle for over 24 hours, from `gate box prune --root <folder>` (an absolute path on a drive; anything else prints `gate: box prune --root is not an absolute path on a drive: "<value>"` and exits 2), or the named keys' whatever their age, from `gate box prune --root <folder> --keys <key> [<key>...]`. It reads no request and never reads stdin, and any other shape is the box usage. The builder's scheduled task runs the age form every 6 hours ([Builder setup](routing-a-repo.md#builder-setup)).
 
   The `root`, `{root}\work` and `{root}\pruned` must each be a plain folder, else `gate: remote could not prune: <path> is not a plain folder` and exit 1; a folder it cannot list prints `gate: remote cannot list <path>: <error>` and exits 1. Leftovers in `pruned` are deleted at the start of each sweep, and one that cannot be removed prints `gate: remote could not remove the pruned folder <path>: <error>`.
 
@@ -3588,6 +3588,18 @@ Built verbs:
   A key it cannot prune prints `gate: remote could not prune <key>: <reason>` on stderr (reasons include `its work folder is not a plain folder` and `its work folder changed during the sweep`), keeps the key, and the exit stays 0.
 
   On stdout it prints `gate: remote pruned <key>: idle <h> h` per removed folder and, last, always, `gate: remote prune removed <n> of <m> work folders`.
+
+  The age form deletes no ref: a worktree still alive may have pushed `refs/gate/{key}` just before the lock was taken, and deleting it would fail that run's fetch. Only the keyed form deletes refs, below.
+
+  **The keyed form** takes 1 to 50 key words, each `[A-Za-z0-9_-]+` and not starting with `-`; any other shape is the box usage (status 2), and a repeated key, in any letter case, is pruned once under its first spelling. A word that is no key, past the parse, prints `gate: box prune --keys holds a word that is not a key: "<word>"` and exits 2 before anything is opened. It judges no age and touches no key it is not given. Each key's lock is still taken without waiting, so a held lock keeps the key. A link or junction work folder is refused, a key with no folder has its records and refs removed, and a missing `work` folder is made, as a run makes it.
+
+  For each key whose folder it set aside or found absent, still under the lock, it runs one `git update-ref --no-deref --stdin` in each bare repository `{root}\*.git`, deleting `refs/gate/{key}`, `refs/gate-bridge/{key}` and `refs/gate-back/{key}` themselves, never what a symbolic one points to. A `*.git` entry is used only when it is a plain folder holding `HEAD`, `objects` and `refs` (checked beneath a handle that is held, without sharing deletion, while git runs, so it cannot be renamed and swapped); a link, a plain file or a folder lacking any of the three is skipped. A bare whose update fails does not stop the others, and the first failure is the key's reason. A key whose lock is held or whose folder could not be set aside keeps its refs. The git step is named `update-ref` for the `--test-box-git-limit` seam.
+
+  Before any git step the root is checked as the preflight checks it (`gate_win32::check_work_root`, honouring `--test-box-root-walk-stop <folder>`). When the check fails no git runs: every key keeps its refs and gets `gate: remote could not prune {key}: its refs could not be removed: {the check's reason}`, while its folders and records are still removed.
+
+  A key the builder never had is left no lock: a `{key}.lock` the keyed form created is deleted as it is let go (a failure says `gate: remote could not remove the work folder lock {path}: {error}`), while a lock that existed before stays.
+
+  It prints `gate: remote pruned {key} (worktree gone)` and `gate: remote kept {key}: in use` on stdout, and `gate: remote could not prune {key}: {why}` on stderr (reasons include `its work folder is not a plain folder`, `its refs could not be removed: {the first failure's reason}`, and `the root's drive is not there`, said for every key when the root's drive is absent; a missing root on a present drive holds nothing and answers `pruned`). A lock that cannot be opened, other than one held, and a record left after the rename are each the key's single could-not line, with no `pruned` line. Every key gets exactly one line. It prints no summary line, and exits 1 when any key got a could-not line, else 0.
 
 **The outputs module** (GATE-44) is shared by both ends, this exe, in `crates/gate/src/outputs/`. The box's `run` packs with it and the box's `outputs` verb sends the archive. The PC's manifest, the pending marker, the reading of the box's `gate-remote-outputs: ` line, the fetch of the archive and its install are built in the Rust remote client ([The remote client's run](#routing)).
 

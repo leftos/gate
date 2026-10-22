@@ -1,5 +1,6 @@
 //! The hidden `gate box`: its eight verbs that read a request, each followed by the literal `--stdin` (the request comes
-//! on stdin), `register-desktop` alone, `prune --root <folder>`, and the one usage every other shape gets.
+//! on stdin), `register-desktop` alone, `prune --root <folder> [--keys <key>...]`, and the one usage every other shape
+//! gets.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -10,7 +11,7 @@ use crate::support::{invocation, os, problems, problems_of, unreadable_word};
 
 const BOX_USAGE: &str = concat!(
     "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)\n",
-    "       gate box prune --root <folder>",
+    "       gate box prune --root <folder> [--keys <key>...]",
 );
 
 #[test]
@@ -31,6 +32,7 @@ fn each_verb_parses_with_stdin() {
                 verb,
                 seams: BoxSeams::default(),
                 root: None,
+                keys: Vec::new(),
             }),
             "{word}"
         );
@@ -50,6 +52,7 @@ fn prune_parses_its_root_and_refuses_any_other_shape() {
             verb: BoxVerb::Prune,
             seams: BoxSeams::default(),
             root: Some(PathBuf::from(r"C:\x")),
+            keys: Vec::new(),
         })
     );
     assert_eq!(BoxVerb::Prune.as_str(), "prune", "the verb as the CLI spells it");
@@ -61,6 +64,80 @@ fn prune_parses_its_root_and_refuses_any_other_shape() {
         &["box", "prune", r"--root=C:\x"],
         &["box", "prune", "--ROOT", r"C:\x"],
         &["box", "prune", "--root", r"C:\x", "--stdin"],
+    ];
+    for words in shapes {
+        assert_eq!(problems(words), [BOX_USAGE], "{words:?}");
+    }
+}
+
+/// The words `gate box prune --root C:\x --keys` and then `keys`.
+fn keyed_words<'a>(keys: &[&'a str]) -> Vec<&'a str> {
+    let mut words = vec!["box", "prune", "--root", r"C:\x", "--keys"];
+    words.extend_from_slice(keys);
+    words
+}
+
+/// The keyed prune of the root `C:\x` that names `keys`.
+fn keyed(keys: &[&str]) -> Invocation {
+    Invocation::Box(BoxRequest {
+        verb: BoxVerb::Prune,
+        seams: BoxSeams::default(),
+        root: Some(PathBuf::from(r"C:\x")),
+        keys: keys.iter().map(|key| (*key).to_owned()).collect(),
+    })
+}
+
+#[test]
+fn prune_takes_one_key_after_its_root() {
+    assert_eq!(invocation(&keyed_words(&["app-1a2b3c4d"])), keyed(&["app-1a2b3c4d"]));
+}
+
+#[test]
+fn prune_takes_a_key_in_upper_case_as_given() {
+    assert_eq!(invocation(&keyed_words(&["App_X-1A2B"])), keyed(&["App_X-1A2B"]));
+}
+
+#[test]
+fn prune_takes_fifty_keys_and_refuses_fifty_one() {
+    let names: Vec<String> = (1..=51).map(|n| format!("k{n}")).collect();
+    let fifty: Vec<&str> = names[..50].iter().map(String::as_str).collect();
+    let fifty_one: Vec<&str> = names.iter().map(String::as_str).collect();
+
+    assert_eq!(invocation(&keyed_words(&fifty)), keyed(&fifty));
+    assert_eq!(problems(&keyed_words(&fifty_one)), [BOX_USAGE]);
+}
+
+#[test]
+fn prune_takes_a_repeated_key_once() {
+    assert_eq!(invocation(&keyed_words(&["k", "j", "k"])), keyed(&["k", "j"]));
+}
+
+/// The builder's file system knows no case, so `K` names the same work folder as `k`: the first spelling is kept.
+#[test]
+fn prune_takes_a_key_repeated_in_another_case_once_as_first_spelled() {
+    assert_eq!(invocation(&keyed_words(&["App-1", "j", "app-1", "APP-1"])), keyed(&["App-1", "j"]));
+}
+
+#[test]
+fn prune_refuses_keys_with_no_key_after_them() {
+    assert_eq!(problems(&keyed_words(&[])), [BOX_USAGE]);
+}
+
+#[test]
+fn prune_refuses_a_word_that_is_no_key_or_a_flag_among_its_keys() {
+    for word in ["a.b", r"a\b", "a/b", "-a", "--stdin", "", "a b", ".."] {
+        assert_eq!(problems(&keyed_words(&[word])), [BOX_USAGE], "{word:?} alone");
+        assert_eq!(problems(&keyed_words(&["k", word])), [BOX_USAGE], "{word:?} after a key");
+    }
+}
+
+#[test]
+fn prune_refuses_keys_before_its_root_or_spelled_otherwise() {
+    let shapes: [&[&str]; 4] = [
+        &["box", "prune", "--keys", "k", "--root", r"C:\x"],
+        &["box", "prune", "--root", r"C:\x", "--keys=k"],
+        &["box", "prune", "--root", r"C:\x", "--KEYS", "k"],
+        &["box", "prune", "--root", r"C:\x", "k"],
     ];
     for words in shapes {
         assert_eq!(problems(words), [BOX_USAGE], "{words:?}");
@@ -106,6 +183,7 @@ fn box_takes_the_inflight_verb() {
             verb: BoxVerb::Inflight,
             seams: BoxSeams::default(),
             root: None,
+            keys: Vec::new(),
         })
     );
     assert_eq!(BoxVerb::Inflight.as_str(), "inflight", "the verb as the CLI spells it");
@@ -120,6 +198,7 @@ fn register_desktop_parses_alone_and_refuses_stdin_or_another_word() {
             verb: BoxVerb::RegisterDesktop,
             seams: BoxSeams::default(),
             root: None,
+            keys: Vec::new(),
         })
     );
     assert_eq!(BoxVerb::RegisterDesktop.as_str(), "register-desktop", "the verb as the CLI spells it");

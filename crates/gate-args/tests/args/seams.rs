@@ -938,6 +938,7 @@ fn box_seams_of_the_ceiling_are_read_before_the_verb() {
                 ..BoxSeams::default()
             },
             root: None,
+            keys: Vec::new(),
         })
     );
 }
@@ -956,7 +957,7 @@ fn the_bridge_seams_are_unknown_options() {
 /// The usage a malformed `gate box` prints.
 const BOX_USAGE: &str = concat!(
     "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)\n",
-    "       gate box prune --root <folder>",
+    "       gate box prune --root <folder> [--keys <key>...]",
 );
 
 #[cfg(feature = "test-seams")]
@@ -974,6 +975,7 @@ fn box_seam_heartbeat_ms_is_read_before_the_verb() {
                 ..BoxSeams::default()
             },
             root: None,
+            keys: Vec::new(),
         })
     };
     assert_eq!(invocation(&["box", "--test-heartbeat-ms", "30", "run", "--stdin"]), beating(Some(30)));
@@ -1045,6 +1047,7 @@ fn box_seam_outputs_budget_bytes_is_read_before_the_verb() {
                 ..BoxSeams::default()
             },
             root: None,
+            keys: Vec::new(),
         })
     };
     assert_eq!(
@@ -1125,6 +1128,7 @@ fn box_seam_inputs_budget_bytes_is_read_before_the_verb() {
                 ..BoxSeams::default()
             },
             root: None,
+            keys: Vec::new(),
         })
     };
     assert_eq!(
@@ -1219,6 +1223,7 @@ fn box_seam_dotnet_limit_ms_is_read_before_the_verb() {
                 ..BoxSeams::default()
             },
             root: None,
+            keys: Vec::new(),
         })
     };
     assert_eq!(
@@ -1284,6 +1289,7 @@ fn box_seam_probe_limit_ms_is_read_before_the_verb() {
                 ..BoxSeams::default()
             },
             root: None,
+            keys: Vec::new(),
         })
     };
     assert_eq!(
@@ -1342,6 +1348,7 @@ fn box_seam_git_limit_names_a_step_and_its_bound_before_the_verb() {
                 ..BoxSeams::default()
             },
             root: None,
+            keys: Vec::new(),
         })
     };
     assert_eq!(
@@ -1416,6 +1423,7 @@ fn box_seam_probe_drain_ms_is_read_before_the_verb() {
                 ..BoxSeams::default()
             },
             root: None,
+            keys: Vec::new(),
         })
     };
     assert_eq!(
@@ -1487,6 +1495,7 @@ fn box_seam_console_and_park_launch_are_read_before_the_verb() {
             verb: BoxVerb::Run,
             seams,
             root: None,
+            keys: Vec::new(),
         })
     };
     let failing = || BoxSeams {
@@ -1538,6 +1547,7 @@ fn box_seam_console_and_park_launch_are_read_before_the_verb() {
                 ..BoxSeams::default()
             },
             root: None,
+            keys: Vec::new(),
         }),
         "the seams come in any order before the verb"
     );
@@ -1634,6 +1644,7 @@ fn box_seam_root_walk_stop_is_read_before_the_verb() {
             ..BoxSeams::default()
         },
         root: None,
+        keys: Vec::new(),
     });
     assert_eq!(
         invocation(&["box", "--test-box-root-walk-stop", r"X:\case", "preflight", "--stdin"]),
@@ -1698,6 +1709,7 @@ fn box_seam_token_is_read_before_the_verb() {
             ..BoxSeams::default()
         },
         root: None,
+        keys: Vec::new(),
     });
     assert_eq!(invocation(&["box", "--test-box-token", "refused", "run", "--stdin"]), refused);
     assert_eq!(invocation(&["box", "--test-box-token=refused", "run", "--stdin"]), refused);
@@ -1719,6 +1731,7 @@ fn box_seam_token_is_read_before_the_verb() {
                 ..BoxSeams::default()
             },
             root: None,
+            keys: Vec::new(),
         }),
         "the token seam comes with the others, in any order"
     );
@@ -1768,6 +1781,7 @@ fn the_register_seam_parses_ok_or_fail_and_refuses_another_value() {
                 ..BoxSeams::default()
             },
             root: None,
+            keys: Vec::new(),
         })
     };
     for (word, register_ok) in [("ok", true), ("fail", false)] {
@@ -1836,6 +1850,7 @@ fn desktop_mutex_takes_the_longest_name(longest: &str) {
                 ..BoxSeams::default()
             },
             root: None,
+            keys: Vec::new(),
         }),
         "a name of the most the seam takes"
     );
@@ -1896,6 +1911,7 @@ fn box_run(seams: gate_args::BoxSeams) -> gate_args::Invocation {
         verb: gate_args::BoxVerb::Run,
         seams,
         root: None,
+        keys: Vec::new(),
     })
 }
 
