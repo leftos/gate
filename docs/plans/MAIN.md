@@ -10,8 +10,6 @@
 - [ ] GATE-615 Tie the Unix box's job record to its process group leader's start time — High · Remote
 - [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root — High · Remote
 - [ ] GATE-648 Restore pnpm, bun and npm packages on the Unix box, as the Windows box does — High · Remote
-- [/] GATE-701 Build box inputs on the Unix box, so a repo with inputs can route to a Mac — High · Remote
-- [/] GATE-702 Bring outputs back from a Mac builder, so yaat's tests can route there — High · Remote
 - [ ] GATE-574 Take the work lock in the box preflight and stamp the lock's time on each run — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
@@ -347,3 +345,8 @@
 - [ ] GATE-679 Correct design.md's note on the priority a suite case's gates run at
 - [ ] GATE-693 End a run that never ran its command with a verdict line
 - [ ] GATE-700 Share the Godot version parse between the two boxes in gate-wire
+- [ ] GATE-714 Trust an input copy's stamp only while its ctime is unchanged on the Unix box
+- [ ] GATE-715 Share the outputs wire texts and pack driver between the Windows and Unix boxes
+- [ ] GATE-716 Let the launcher read run's --builder with its value as a separate word
+- [ ] GATE-717 Refuse a work folder that is not `{root}/work/{key}` in every Unix box verb
+- [ ] GATE-718 Pin the Unix outputs run's no-EOF read, OutputsFull skip and gone probe
