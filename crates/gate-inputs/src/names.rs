@@ -3,6 +3,8 @@
 //! archive's reader refuses. The sync-back and the outputs install refuse the `.git*` and `.lfsconfig` names, and the
 //! walk, the pack and the unpack the paths that are not plain, so they live here.
 
+use gate_router::is_reordering_mark;
+
 /// The most `/`-separated parts a plain path may have, its file's name included.
 pub const PATH_DEPTH_LIMIT: usize = 64;
 
@@ -96,4 +98,3 @@ pub fn is_device(part: &str) -> bool {
     };
     matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") || numbered("COM") || numbered("LPT")
 }
-use gate_router::is_reordering_mark;

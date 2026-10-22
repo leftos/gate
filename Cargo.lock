@@ -254,6 +254,8 @@ dependencies = [
  "gate-wire",
  "serde_json",
  "sha2",
+ "tar",
+ "zstd",
 ]
 
 [[package]]

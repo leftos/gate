@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use gate_args::BoxSeams;
+use gate_inputs::manifest::{read_sent, refused_path};
 use gate_router::escaped;
 use gate_win32::{Descriptor, Make, Share};
 use gate_wire::{OUTPUTS_NONCE_DIGITS, Payload, SHA256_DIGITS, grandparent, is_lower_hex, ordinal_upper};
@@ -35,8 +36,6 @@ use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, READ_CONTROL,
     WRITE_DAC, WRITE_OWNER,
 };
-
-use gate_inputs::manifest::{read_sent, refused_path};
 
 use crate::answer::USAGE_STATUS;
 use crate::boxside::preflight::{self, is_folder_itself};
@@ -529,7 +528,7 @@ fn write_record(path: &str, record: &Record) -> Result<(), String> {
 }
 
 /// The stamp of the open file `file`.
-fn stamp_of(file: &File) -> io::Result<Stamp> {
+fn record_stamp_of(file: &File) -> io::Result<Stamp> {
     let metadata = file.metadata()?;
     let (volume, id) = gate_win32::file_id(file)?;
     let hex = id.iter().fold(String::with_capacity(2 * id.len()), |mut hex, byte| {
@@ -609,7 +608,7 @@ fn opened_copy(work: &File, path: &str, access: u32, share: Share) -> io::Result
         Err(error) => return Err(error),
     };
     plain_copy(&file)?;
-    let stamp = stamp_of(&file)?;
+    let stamp = record_stamp_of(&file)?;
     Ok(Some((file, stamp)))
 }
 
@@ -1479,7 +1478,7 @@ fn moved_in(book: Book, files: &File, work: &File, path: &str) -> Result<Stamp, 
         gate_win32::rename_beneath(&source, &folder, leaf)
     };
     moved.map_err(|error| failed(error.to_string()))?;
-    let stamp = stamp_of(&source).map_err(|error| failed(error.to_string()))?;
+    let stamp = record_stamp_of(&source).map_err(|error| failed(error.to_string()))?;
     gate_win32::inherit_security(&source).map_err(|error| failed(error.to_string()))?;
     Ok(stamp)
 }

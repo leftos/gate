@@ -1,89 +1,42 @@
 //! The archive a run's outputs travel in: a tar stream compressed with zstd, named `.tar.zst`. Each file is read once,
 //! hashed with SHA-256 as it is packed, and the list of every path brought back (path, size, SHA-256) follows the files
 //! as the last member, [`LIST_NAME`]. A path whose content an earlier member or a file the PC holds already has is
-//! listed as a copy and not packed. Reading checks each member's path before anything is written, extracts it while
-//! hashing it, checks the members against the list at the end, then makes each copy from its member or the PC's file,
-//! hashing it as it is written. Writer and reader stream: what either holds in memory does not grow with a file's size.
+//! listed as a copy and not packed. The reader, its limits and its refusals are [`gate_inputs::archive`]'s, which both
+//! boxes share; this module packs, and writes what the reader hands it on Windows: each member while it is hashed, then
+//! each copy from its member or the PC's file, hashing it as it is written. Writer and reader stream: what either holds
+//! in memory does not grow with a file's size.
 
-use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::num::NonZeroU64;
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use gate_router::escaped;
-use gate_wire::{SHA256_DIGITS, is_lower_hex, ordinal_upper};
-use serde_json::{Value, json};
+use gate_inputs::archive::{
+    CopyFrom, FolderBudget, Item, Limits, MEMBER_LIMIT, Place, WINDOW_LOG_MAX, check_name, copy_mismatch, extract, held_size, list_json, no_pc_file,
+    outside_destination, refused, stopped,
+};
 use tar::{EntryType, Header};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
 };
 
+pub(crate) use gate_inputs::archive::{Entry, LIST_NAME, UnpackError, sent_limit};
+
 use crate::outputs::hash::Hashing;
 use crate::outputs::manifest::{Chosen, HeldBy, Manifest};
-use crate::outputs::names::is_plain_path;
 use crate::outputs::walk::{Found, in_context, stamp_of};
 
-/// The name of the archive's last member, the list of every path the archive brings back.
-pub(crate) const LIST_NAME: &str = ".gate-outputs.json";
 /// The zstd level the archive is compressed at: zstd's default, which keeps pace with a gigabit link. The writer adds
 /// long-distance matching over a window sized to the archive's files ([`window_log`]), which finds a repeat that far
 /// back in the stream.
 const LEVEL: i32 = 3;
-/// The most bytes the list member is read to.
-const LIST_LIMIT: u64 = 4 * 1024 * 1024;
-/// The most files an archive may hold: more than a list of [`LIST_LIMIT`] bytes can name, each of its items taking at
-/// least 98 bytes.
-const MEMBER_LIMIT: usize = 50_000;
-/// The most bytes one member may hold.
-const MEMBER_SIZE_LIMIT: u64 = 16 * 1024 * 1024 * 1024;
-/// The most bytes a GNU long name member may hold.
-const LONG_NAME_LIMIT: u64 = 4 * 1024;
-/// What the stream as sent may hold beyond zstd's worst-case expansion of the limit's bytes: frame and block headers.
-const SENT_SLACK: u64 = 1024 * 1024;
-
-/// The most bytes a `.tar.zst` stream may hold for an archive of a `limit`-byte limit: zstd's worst case expansion of
-/// the limit's bytes, the ratio a decoder could reach through a skippable frame or empty blocks, plus [`SENT_SLACK`].
-/// The reader refuses a longer stream, and the client fetching one caps its fetch at the same figure, so every archive
-/// the box can legitimately send is one the reader would take. Saturating, and never 0: [`SENT_SLACK`] alone is above
-/// it, so the cap the client writes under can never drop every byte.
-pub(crate) fn sent_limit(limit: u64) -> NonZeroU64 {
-    NonZeroU64::new(limit.saturating_add(limit / 64).saturating_add(SENT_SLACK)).unwrap_or(NonZeroU64::MIN)
-}
-/// The largest zstd window the writer compresses with and the reader accepts, as a power of two: 128 MiB.
-const WINDOW_LOG_MAX: u32 = 27;
 /// The smallest zstd window the writer compresses with, as a power of two: 1 MiB.
 const WINDOW_LOG_MIN: u32 = 20;
-/// The most characters of a path a refusal of the list shows.
-const SHOWN_PATH_CHARS: usize = 200;
-/// The most PC files a refusal of a copy names among those it tried.
-const TRIED_NAMED: usize = 5;
-/// How far past the reader's clock a member's last write may be: a day, for clocks that disagree.
-const CLOCK_SLACK: Duration = Duration::from_hours(24);
-
-/// One packed file: its `/`-separated path relative to the root it was packed from, its size and its SHA-256.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Entry {
-    pub path: String,
-    pub size: u64,
-    pub sha256: String,
-}
-
-/// One item of an archive's list: a file packed as a member, or a copy, whose bytes the archive does not hold, as an
-/// earlier member or a file the PC holds has them. `copy` is a copy's own last write, in seconds since 1970 as a
-/// member's header holds it; `None` for a member.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Item {
-    entry: Entry,
-    copy: Option<u64>,
-}
 
 /// The PC's own files a copy may be made from: the worktree root, and the manifest of the files below it that the PC
 /// sent the box, each path holding a copy's SHA-256 tried in turn; and `go_on`, asked before each copy is made and
@@ -233,8 +186,9 @@ fn pack_file<W: Write>(packer: &mut Packer<W>, file: &Found, opened: &File, data
 /// yet, and into the folders it makes below it, each file with the last write its header holds. Returns the entries;
 /// else why the archive was refused.
 ///
-/// A member whose path is not a plain relative path inside the destination (see [`member_path`]), that is not a plain
-/// file, that is larger than [`MEMBER_SIZE_LIMIT`] or than what is left of `limit`, whose last write is before 1970 or
+/// A member whose path is not a plain relative path inside the destination (see
+/// [`gate_inputs::names::is_plain_path`]), that is not a plain file, that is larger than
+/// [`gate_inputs::archive::MEMBER_SIZE_LIMIT`] or than what is left of `limit`, whose last write is before 1970 or
 /// more than a day past this machine's clock, that would be written through a link or a junction, or that would make
 /// the archive's folders more than [`MEMBER_LIMIT`], is refused before anything of it is written. An archive of more
 /// than [`MEMBER_LIMIT`] files, that decompresses to more than `limit` bytes, or whose stream as sent passes zstd's
@@ -244,10 +198,11 @@ fn pack_file<W: Write>(packer: &mut Packer<W>, file: &Found, opened: &File, data
 /// Each copy the list holds is then made in the destination, with the last write its item lists: from the first member
 /// holding its SHA-256, else from a file below `pc`'s root that its manifest holds with that SHA-256, found inside the
 /// root and checked by hashing its bytes as they are copied. A list naming a path twice, without regard to case, or a
-/// path longer than [`LONG_NAME_LIMIT`], and a copy whose SHA-256 no member listed before it and no file of the manifest
-/// has, whose last write is more than a day past this machine's clock, or past the file or byte limit, are refused
-/// before any copy is written; a copy whose bytes differ from its item as they are written is refused then, and so is
-/// one that no file of the manifest still holds, the refusal naming each file tried and why it was passed over.
+/// path longer than [`gate_inputs::archive::LONG_NAME_LIMIT`], and a copy whose SHA-256 no member listed before it
+/// and no file of the manifest has, whose last write is more than a day past this machine's clock, or past the file or
+/// byte limit, are refused before any copy is written; a copy whose bytes differ from its item as they are written is
+/// refused then, and so is one that no file of the manifest still holds, the refusal naming each file tried and why it
+/// was passed over.
 ///
 /// Nothing is written outside the destination, and on a refusal `unpack` removes the destination it made, and all it
 /// extracted there; when that removal fails too, the refusal says so. The error says whether a member of the archive is
@@ -256,7 +211,7 @@ pub(crate) fn unpack(source: impl Read, destination: &Path, limit: u64, pc: &PcF
     fs::create_dir(destination).map_err(|error| in_context(destination, &error))?;
     extract_into(source, destination, limit, MEMBER_LIMIT, pc).map_err(|error| match fs::remove_dir_all(destination) {
         Ok(()) => error,
-        Err(removal) => error.and_removal(destination, &removal),
+        Err(removal) => error.with_removal(destination, &removal),
     })
 }
 
@@ -265,13 +220,35 @@ pub(crate) fn unpack(source: impl Read, destination: &Path, limit: u64, pc: &PcF
 fn extract_into(source: impl Read, destination: &Path, limit: u64, folder_limit: usize, pc: &PcFiles<'_>) -> Result<Vec<Entry>, UnpackError> {
     let root = std::path::absolute(destination).map_err(|error| in_context(destination, &error))?;
     check_folder(&root)?;
-    let mut folders = Folders {
-        made: 0,
-        limit: folder_limit,
-    };
     let held = pc.manifest.by_hash(&[]);
-    let items = read_members(source, limit, MEMBER_LIMIT, &held, |path, modified, data| {
-        let target = target_below(&root, path, &mut folders)?;
+    let mut place = Unpacking {
+        root,
+        folders: Folders {
+            budget: FolderBudget::new(folder_limit),
+        },
+        pc,
+        held: &held,
+    };
+    let limits = Limits {
+        bytes: limit,
+        files: MEMBER_LIMIT,
+    };
+    extract(source, limits, &held, pc.go_on, &mut place)
+}
+
+/// The Windows box's [`Place`]: each member and copy written below `root`, through the folders it makes there, which
+/// `folders` counts; a copy no member holds made from the first file below `pc`'s root that `held` names for it whose
+/// bytes still hash to it as they are copied ([`copy_from_pc`]), and every copy asking `pc`'s `go_on` after each buffer.
+struct Unpacking<'a> {
+    root: PathBuf,
+    folders: Folders,
+    pc: &'a PcFiles<'a>,
+    held: &'a HeldBy<'a>,
+}
+
+impl Place for Unpacking<'_> {
+    fn member(&mut self, path: &str, modified: SystemTime, data: &mut dyn Read) -> Result<(), UnpackError> {
+        let target = target_below(&self.root, path, &mut self.folders)?;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -280,46 +257,22 @@ fn extract_into(source: impl Read, destination: &Path, limit: u64, folder_limit:
         io::copy(data, &mut file).map_err(|error| in_context(&target, &error))?;
         file.set_modified(modified)
             .map_err(|error| UnpackError::Fault(in_context(&target, &error)))
-    })?;
-    make_copies(&root, &items, pc, &held, &mut folders)?;
-    Ok(items.into_iter().map(|item| item.entry).collect())
-}
+    }
 
-/// Makes each copy of `items` below `root`, where its members were extracted, asking `pc`'s `go_on` before each and
-/// after each buffer it copies: from the first member holding its SHA-256, else from the first file below `pc`'s root
-/// that `held` names for it whose bytes still hash to it as they are copied ([`copy_from_pc`]). Each copy takes the
-/// last write its item lists. Else the refusal, or the interrupt once `go_on` says no.
-fn make_copies(root: &Path, items: &[Item], pc: &PcFiles<'_>, held: &HeldBy<'_>, folders: &mut Folders) -> Result<(), UnpackError> {
-    let now = SystemTime::now();
-    let mut members: HashMap<&str, &str> = HashMap::new();
-    for Item { entry, copy } in items {
-        let Some(seconds) = copy else {
-            members.entry(entry.sha256.as_str()).or_insert(entry.path.as_str());
-            continue;
-        };
-        if !(pc.go_on)() {
-            return Err(stopped());
-        }
-        let modified = copy_last_write(&entry.path, *seconds, now)?;
-        let target = target_below(root, &entry.path, folders)?;
+    fn copy(&mut self, entry: &Entry, modified: SystemTime, from: CopyFrom<'_>) -> Result<(), UnpackError> {
+        let target = target_below(&self.root, &entry.path, &mut self.folders)?;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&target)
             .map_err(|error| in_context(&target, &error))?;
-        match members.get(entry.sha256.as_str()) {
-            Some(member) => copy_member(&below(root, member), &mut file, &target, entry, pc.go_on)?,
-            None => copy_from_pc(pc, held, &mut file, &target, entry)?,
+        match from {
+            CopyFrom::Member(member) => copy_member(&below(&self.root, member), &mut file, &target, entry, self.pc.go_on)?,
+            CopyFrom::Pc => copy_from_pc(self.pc, self.held, &mut file, &target, entry)?,
         }
         file.set_modified(modified)
-            .map_err(|error| UnpackError::Fault(in_context(&target, &error)))?;
+            .map_err(|error| UnpackError::Fault(in_context(&target, &error)))
     }
-    Ok(())
-}
-
-/// The interrupt of an unpack its `go_on` stopped while its copies were made.
-fn stopped() -> UnpackError {
-    io::Error::new(io::ErrorKind::Interrupted, "the unpack was stopped while its copies were made").into()
 }
 
 /// Copies the extracted member at `full` into `file`, the new file `target`, as the copy `entry`, asking `go_on` after
@@ -328,14 +281,7 @@ fn copy_member(full: &Path, file: &mut File, target: &Path, entry: &Entry, go_on
     let source = File::open(full).map_err(|error| in_context(full, &error))?;
     let (sha256, size) = copy_into(source, file, target, entry.size, go_on)?.map_err(|error| in_context(full, &error))?;
     if sha256 != entry.sha256 || size != entry.size {
-        return Err(refused(format!(
-            "the outputs archive copy '{}' does not match its list: {size} bytes with SHA-256 {sha256}, listed as {} bytes \
-             with SHA-256 {}",
-            escaped(&entry.path),
-            entry.size,
-            entry.sha256
-        ))
-        .into());
+        return Err(copy_mismatch(entry, size, &sha256));
     }
     Ok(())
 }
@@ -343,7 +289,7 @@ fn copy_member(full: &Path, file: &mut File, target: &Path, entry: &Entry, go_on
 /// Copies into `file`, the new file `target`, the first file below `pc`'s root that `held` names for `entry`'s
 /// SHA-256, in the manifest's order, whose bytes hash to it as they are copied, asking `pc`'s `go_on` after each
 /// buffer. One missing, a link or a junction, outside the root ([`pc_source`]), unreadable, or whose bytes now differ is
-/// passed over for the next. Else the refusal, naming each file tried and why it was passed over ([`said_tried`]), or
+/// passed over for the next. Else the refusal, naming each file tried and why it was passed over ([`no_pc_file`]), or
 /// the interrupt.
 fn copy_from_pc(pc: &PcFiles<'_>, held: &HeldBy<'_>, file: &mut File, target: &Path, entry: &Entry) -> Result<(), UnpackError> {
     // Resolved as each source's final path is: `canonicalize` is `GetFinalPathNameByHandleW` on the opened folder.
@@ -363,13 +309,7 @@ fn copy_from_pc(pc: &PcFiles<'_>, held: &HeldBy<'_>, file: &mut File, target: &P
             Err(error) => tried.push((path, format!("unreadable: {error}"))),
         }
     }
-    Err(refused(format!(
-        "no PC file still holds the content of {}, SHA-256 {}{}",
-        escaped(&entry.path),
-        entry.sha256,
-        said_tried(&tried)
-    ))
-    .into())
+    Err(no_pc_file(entry, &tried))
 }
 
 /// The PC file `full` opened as a copy's source: the file itself, never a link's target, whose final path, as the
@@ -385,24 +325,6 @@ fn pc_source(full: &Path, inside: &Path) -> Result<File, String> {
         Ok(_) => Err("outside the root".to_owned()),
         Err(error) => Err(format!("unreadable: {error}")),
     }
-}
-
-/// What a refusal of a copy says of the PC files `tried`, each path with why it was passed over: the first
-/// [`TRIED_NAMED`], then how many more; nothing when none was tried.
-fn said_tried(tried: &[(&str, String)]) -> String {
-    if tried.is_empty() {
-        return String::new();
-    }
-    let named: Vec<String> = tried
-        .iter()
-        .take(TRIED_NAMED)
-        .map(|(path, why)| format!("{} ({why})", escaped(path)))
-        .collect();
-    let more = match tried.len().saturating_sub(TRIED_NAMED) {
-        0 => String::new(),
-        more => format!(" and {more} more"),
-    };
-    format!(": tried {}{more}", named.join(", "))
 }
 
 /// Writes the bytes of `source` over whatever `file`, the file `target`, holds, hashing them as they pass and asking
@@ -430,11 +352,6 @@ fn copy_into(source: File, file: &mut File, target: &Path, size: u64, go_on: &dy
     Ok(Ok(hashing.finish()))
 }
 
-/// The size of the first file `held` holds with the SHA-256 `sha256`; `None` when it holds none.
-fn held_size(held: &HeldBy<'_>, sha256: &str) -> Option<u64> {
-    held.get(sha256).and_then(|paths| paths.first()).map(|(_, file)| file.stamp.size)
-}
-
 /// The full path of the `/`-separated `path` below `root`.
 pub(crate) fn below(root: &Path, path: &str) -> PathBuf {
     path.split('/').fold(root.to_path_buf(), |full, part| full.join(part))
@@ -447,10 +364,7 @@ fn target_below(root: &Path, path: &str, folders: &mut Folders) -> Result<PathBu
     let target = below(root, path);
     let full = std::path::absolute(&target).map_err(|error| in_context(&target, &error))?;
     if !full.starts_with(root) {
-        return Err(member_refused(format!(
-            "the outputs archive member '{}' is not a relative path inside the destination",
-            escaped(path)
-        )));
+        return Err(outside_destination(path));
     }
     let parents = path.rsplit_once('/').map_or("", |(parents, _)| parents);
     let mut folder = root.to_path_buf();
@@ -464,8 +378,7 @@ fn target_below(root: &Path, path: &str, folders: &mut Folders) -> Result<PathBu
 
 /// The folders an extraction has made, and the most it may make.
 struct Folders {
-    made: usize,
-    limit: usize,
+    budget: FolderBudget,
 }
 
 impl Folders {
@@ -475,12 +388,10 @@ impl Folders {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             _ => return Ok(()),
         }
-        if self.made == self.limit {
-            return Err(member_refused(format!("the outputs archive makes more than {} folders", self.limit)));
-        }
+        self.budget.check()?;
         match fs::create_dir(folder) {
             Ok(()) => {
-                self.made += 1;
+                self.budget.count();
                 Ok(())
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
@@ -498,28 +409,6 @@ pub(crate) fn check_folder(folder: &Path) -> io::Result<()> {
         Ok(())
     } else {
         Err(in_context(folder, &refused("it is not a folder".to_owned())))
-    }
-}
-
-/// A reader that fails once more than `limit` bytes have been read through it, `left` of them still to read, which it
-/// shares; the refusal names the bytes it counts, `counted`.
-struct Limited<R> {
-    inner: R,
-    left: Rc<Cell<u64>>,
-    limit: u64,
-    counted: &'static str,
-}
-
-impl<R: Read> Read for Limited<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let read = self.inner.read(buffer)?;
-        let left = self
-            .left
-            .get()
-            .checked_sub(read as u64)
-            .ok_or_else(|| refused(format!("the outputs archive holds more than {} bytes {}", self.limit, self.counted)))?;
-        self.left.set(left);
-        Ok(read)
     }
 }
 
@@ -608,20 +497,6 @@ impl<W: Write> Packer<W> {
     }
 }
 
-/// Whether the output `path` may be listed: not the list's own name, and a name the reader takes; else the refusal.
-fn check_name(path: &str) -> io::Result<()> {
-    if path.eq_ignore_ascii_case(LIST_NAME) {
-        return Err(refused(format!("the output {path} has the name of the archive's own list")));
-    }
-    if !is_plain_path(path) {
-        return Err(refused(format!(
-            "the output '{}' has a name the outputs archive's reader refuses",
-            escaped(path)
-        )));
-    }
-    Ok(())
-}
-
 /// The header of a plain file of `size` bytes last written `modified`, its path still to be set.
 fn file_header(size: u64, modified: u64) -> Header {
     let mut header = Header::new_gnu();
@@ -630,431 +505,6 @@ fn file_header(size: u64, modified: u64) -> Header {
     header.set_mode(0o644);
     header.set_mtime(modified);
     header
-}
-
-/// Reads the `.tar.zst` stream `source`, decompressed to at most `limit` bytes, handing each file member's path, last
-/// write and data to `member` and hashing the data as `member` reads it, then checks the members against the list
-/// ([`agree`], each copy's SHA-256 a member's before it or one `held` holds) and the list against the limits: at most
-/// `files` paths, and each copy's bytes within what is left of `limit` ([`Members::fit_copies`]). Returns the list's
-/// items, else why the archive was refused.
-fn read_members(
-    source: impl Read,
-    limit: u64,
-    files: usize,
-    held: &HeldBy<'_>,
-    mut member: impl FnMut(&str, SystemTime, &mut dyn Read) -> Result<(), UnpackError>,
-) -> Result<Vec<Item>, UnpackError> {
-    // zstd's worst case for `limit` bytes, so a skippable frame or empty blocks cannot be read without end either.
-    let sent = sent_limit(limit).get();
-    let source = Limited {
-        inner: source,
-        left: Rc::new(Cell::new(sent)),
-        limit: sent,
-        counted: "as sent",
-    };
-    let mut decoder = zstd::stream::read::Decoder::new(source)?.single_frame();
-    decoder.window_log_max(WINDOW_LOG_MAX)?;
-    let left = Rc::new(Cell::new(limit));
-    let mut archive = tar::Archive::new(Limited {
-        inner: decoder,
-        left: Rc::clone(&left),
-        limit,
-        counted: "once decompressed",
-    });
-    let mut members = Members {
-        seen: Vec::new(),
-        listed: None,
-        long_name: None,
-        now: SystemTime::now(),
-        left,
-        files,
-    };
-    // Raw, so that tar-rs reads no GNU long name or PAX header of its own, each of which it would read whole.
-    for entry in archive.entries()?.raw(true) {
-        members.take(&mut entry?, &mut member)?;
-    }
-    if members.long_name.is_some() {
-        return Err(member_refused("the outputs archive ends with a long name".to_owned()));
-    }
-    // To the end of the zstd frame, so a stream cut short after the tar's end is refused too.
-    io::copy(&mut archive.into_inner(), &mut io::sink())?;
-    let listed = members
-        .listed
-        .take()
-        .ok_or_else(|| member_refused("the outputs archive holds no list of its files".to_owned()))?;
-    agree(&members.seen, &listed, held)?;
-    members.fit_copies(&listed)?;
-    Ok(listed)
-}
-
-/// What the reader has taken of an archive so far: the files, the list once it is read, the long name the next member
-/// takes, the clock each member is held to, the decompressed bytes left of the archive's limit, which the reader under
-/// the tar counts down and each copy then takes its size of, and the most paths the archive may bring back.
-struct Members {
-    seen: Vec<Entry>,
-    listed: Option<Vec<Item>>,
-    long_name: Option<Vec<u8>>,
-    now: SystemTime,
-    left: Rc<Cell<u64>>,
-    files: usize,
-}
-
-impl Members {
-    /// Takes the raw tar entry `entry`: a GNU long name for the next member, the list, or a file handed to `member`;
-    /// else the refusal.
-    fn take(
-        &mut self,
-        entry: &mut tar::Entry<'_, impl Read>,
-        member: &mut impl FnMut(&str, SystemTime, &mut dyn Read) -> Result<(), UnpackError>,
-    ) -> Result<(), UnpackError> {
-        if self.listed.is_some() {
-            return Err(member_refused("the outputs archive has a member after its list".to_owned()));
-        }
-        let kind = entry.header().entry_type();
-        if kind.is_gnu_longname() {
-            return self.take_long_name(entry);
-        }
-        let name = self.long_name.take().unwrap_or_else(|| entry.path_bytes().into_owned());
-        if kind != EntryType::Regular {
-            let shown = String::from_utf8_lossy(&name);
-            return Err(member_refused(format!("the outputs archive member '{}' is not a file", escaped(&shown))));
-        }
-        let path = member_path(&name)?;
-        if path.eq_ignore_ascii_case(LIST_NAME) {
-            self.listed = Some(read_list(entry, self.now)?);
-            return Ok(());
-        }
-        self.check_room(&path, entry.size())?;
-        let modified = last_write(entry.header(), self.now)
-            .map_err(|reason| member_refused(format!("the outputs archive member '{}' has a last write {reason}", escaped(&path))))?;
-        let mut hashing = Hashing::new(entry);
-        member(&path, modified, &mut hashing)?;
-        let (sha256, size) = hashing.finish();
-        self.seen.push(Entry { path, size, sha256 });
-        Ok(())
-    }
-
-    /// Whether one more file, `path` of `size` bytes, fits: within the archive's file limit, and no larger than
-    /// [`MEMBER_SIZE_LIMIT`] or what is left of the archive's byte limit; else the refusal.
-    fn check_room(&self, path: &str, size: u64) -> Result<(), UnpackError> {
-        if self.seen.len() == self.files {
-            return Err(self.too_many());
-        }
-        self.check_size("member", path, size)
-    }
-
-    /// The refusal of an archive holding more paths than its file limit.
-    fn too_many(&self) -> UnpackError {
-        member_refused(format!("the outputs archive holds more than {} files", self.files))
-    }
-
-    /// Whether the copies of `listed` fit once every member is read: the list's paths, copies included, within the
-    /// archive's file limit, and each copy a plain path, not the list's own name, no larger than [`MEMBER_SIZE_LIMIT`]
-    /// or what is left of the byte limit, which it then takes its size of; else the refusal, before any copy is made.
-    fn fit_copies(&self, listed: &[Item]) -> Result<(), UnpackError> {
-        if listed.len() > self.files {
-            return Err(self.too_many());
-        }
-        for Item { entry, .. } in listed.iter().filter(|item| item.copy.is_some()) {
-            let path = member_path(entry.path.as_bytes())?;
-            if path.eq_ignore_ascii_case(LIST_NAME) {
-                return Err(member_refused(format!("the outputs archive lists a copy named as its own list, {path}")));
-            }
-            self.check_size("copy", &path, entry.size)?;
-            self.left.set(self.left.get().saturating_sub(entry.size));
-        }
-        Ok(())
-    }
-
-    /// Whether the file `path` of `size` bytes, a member or a copy as `kind` says, is no larger than
-    /// [`MEMBER_SIZE_LIMIT`] or what is left of the archive's byte limit; else the refusal.
-    fn check_size(&self, kind: &str, path: &str, size: u64) -> Result<(), UnpackError> {
-        let most = MEMBER_SIZE_LIMIT.min(self.left.get());
-        if size > most {
-            return Err(UnpackError::Fault(refused(format!(
-                "the outputs archive {kind} '{}' is {size} bytes, more than the {most} it may be",
-                escaped(path)
-            ))));
-        }
-        Ok(())
-    }
-
-    /// Takes the GNU long name `entry` holds, of at most [`LONG_NAME_LIMIT`] bytes, for the next member; else the
-    /// refusal.
-    fn take_long_name(&mut self, entry: &mut tar::Entry<'_, impl Read>) -> Result<(), UnpackError> {
-        if self.long_name.is_some() {
-            return Err(member_refused("the outputs archive has two long names in a row".to_owned()));
-        }
-        if entry.size() > LONG_NAME_LIMIT {
-            return Err(member_refused(format!(
-                "the outputs archive has a long name of more than {LONG_NAME_LIMIT} bytes"
-            )));
-        }
-        let mut name = Vec::new();
-        entry.read_to_end(&mut name)?;
-        // A GNU long name ends with a NUL, which tar-rs drops too.
-        if name.last() == Some(&0) {
-            name.pop();
-        }
-        self.long_name = Some(name);
-        Ok(())
-    }
-}
-
-/// The last write `header` holds, as a time no more than [`CLOCK_SLACK`] past `now`; else what is wrong with it. A
-/// base-256 time, which this writer never writes, is before 1970 or past what an octal field holds.
-fn last_write(header: &Header, now: SystemTime) -> Result<SystemTime, String> {
-    if header.as_old().mtime[0] & 0x80 != 0 {
-        return Err("in base-256, before 1970 or far past this machine's clock".to_owned());
-    }
-    let seconds = header.mtime().map_err(|error| format!("that cannot be read: {error}"))?;
-    time_at(seconds, now)
-}
-
-/// The time `seconds` after 1970, no more than [`CLOCK_SLACK`] past `now`; else what is wrong with it.
-fn time_at(seconds: u64, now: SystemTime) -> Result<SystemTime, String> {
-    let written = UNIX_EPOCH
-        .checked_add(Duration::from_secs(seconds))
-        .ok_or_else(|| format!("{seconds} seconds after 1970, past what this machine's clock holds"))?;
-    if now.checked_add(CLOCK_SLACK).is_some_and(|latest| written > latest) {
-        return Err(format!("{seconds} seconds after 1970, more than a day past this machine's clock"));
-    }
-    Ok(written)
-}
-
-/// The member name `bytes` as a `/`-separated path inside the destination: UTF-8 and a plain path (see
-/// [`is_plain_path`]); else the refusal.
-fn member_path(bytes: &[u8]) -> Result<String, UnpackError> {
-    let outside = |shown: &str| {
-        member_refused(format!(
-            "the outputs archive member '{}' is not a relative path inside the destination",
-            escaped(shown)
-        ))
-    };
-    let path = std::str::from_utf8(bytes).map_err(|_| outside(&String::from_utf8_lossy(bytes)))?;
-    if is_plain_path(path) { Ok(path.to_owned()) } else { Err(outside(path)) }
-}
-
-/// The items of the list member `data`, a copy marked by `"copy":true` and carrying its own last write as
-/// `"modified"`, in seconds since 1970, and every other item carrying neither key; else why it is not a list the reader
-/// takes ([`check_listed`]), its paths checked against each other and a copy's last write against `now`.
-fn read_list(data: &mut impl Read, now: SystemTime) -> Result<Vec<Item>, UnpackError> {
-    let mut text = String::new();
-    data.take(LIST_LIMIT + 1)
-        .read_to_string(&mut text)
-        .map_err(|error| refused(format!("the outputs archive's list cannot be read: {error}")))?;
-    if text.len() as u64 > LIST_LIMIT {
-        return Err(member_refused(format!("the outputs archive's list is longer than {LIST_LIMIT} bytes")));
-    }
-    let not_a_list = || member_refused("the outputs archive's list is not a list of paths, sizes and SHA-256s".to_owned());
-    let value: Value = serde_json::from_str(&text).map_err(|_| not_a_list())?;
-    let values = value.as_array().ok_or_else(not_a_list)?;
-    let mut paths = HashSet::new();
-    let mut items = Vec::with_capacity(values.len());
-    for value in values {
-        let item = list_item(value).ok_or_else(not_a_list)?;
-        check_listed(&item, &mut paths, now)?;
-        items.push(item);
-    }
-    Ok(items)
-}
-
-/// The list item `value` holds; `None` when it holds none.
-fn list_item(value: &Value) -> Option<Item> {
-    let path = value.get("path")?.as_str()?;
-    let size = value.get("size")?.as_u64()?;
-    let sha256 = value.get("sha256")?.as_str().filter(|sha256| is_lower_hex(sha256, SHA256_DIGITS))?;
-    let copy = match (value.get("copy"), value.get("modified")) {
-        (None, None) => None,
-        (Some(Value::Bool(true)), Some(modified)) => Some(modified.as_u64()?),
-        _ => return None,
-    };
-    Some(Item {
-        entry: Entry {
-            path: path.to_owned(),
-            size,
-            sha256: sha256.to_owned(),
-        },
-        copy,
-    })
-}
-
-/// Whether the list may hold `item` after the items whose paths' simple uppercase `paths` holds, which it then joins:
-/// a path of at most [`LONG_NAME_LIMIT`] bytes that no item before it has in any case, and for a copy a last write no
-/// more than [`CLOCK_SLACK`] past `now`; else the refusal, which shows the path's first [`SHOWN_PATH_CHARS`] characters.
-fn check_listed(item: &Item, paths: &mut HashSet<String>, now: SystemTime) -> Result<(), UnpackError> {
-    let path = item.entry.path.as_str();
-    if path.len() as u64 > LONG_NAME_LIMIT {
-        return Err(member_refused(format!(
-            "the outputs archive lists a path of more than {LONG_NAME_LIMIT} bytes: '{}'",
-            shown(path)
-        )));
-    }
-    if !paths.insert(ordinal_upper(path)) {
-        return Err(member_refused(format!("the outputs archive lists '{}' twice", shown(path))));
-    }
-    if let Some(seconds) = item.copy {
-        copy_last_write(path, seconds, now)?;
-    }
-    Ok(())
-}
-
-/// The last write of the copy `path`, `seconds` after 1970; else the refusal of one more than [`CLOCK_SLACK`] past
-/// `now`, or past what this machine's clock holds.
-fn copy_last_write(path: &str, seconds: u64, now: SystemTime) -> Result<SystemTime, UnpackError> {
-    time_at(seconds, now).map_err(|reason| member_refused(format!("the outputs archive copy '{}' has a last write {reason}", shown(path))))
-}
-
-/// `path` as a refusal of the list shows it: its first [`SHOWN_PATH_CHARS`] characters, escaped, a cut marked.
-fn shown(path: &str) -> String {
-    match path.char_indices().nth(SHOWN_PATH_CHARS) {
-        Some((cut, _)) => format!("{}\u{2026}", escaped(&path[..cut])),
-        None => escaped(path),
-    }
-}
-
-/// The list member's text for `items`: a JSON array of `{"path","size","sha256"}` objects, a copy's with `"copy":true`
-/// and its own last write, `"modified"`.
-fn list_json(items: &[Item]) -> String {
-    let items: Vec<Value> = items
-        .iter()
-        .map(|Item { entry, copy }| {
-            let mut item = json!({ "path": entry.path, "size": entry.size, "sha256": entry.sha256 });
-            if let Some(modified) = copy {
-                item["copy"] = Value::Bool(true);
-                item["modified"] = json!(modified);
-            }
-            item
-        })
-        .collect();
-    Value::Array(items).to_string()
-}
-
-/// Whether the members `seen` are exactly the items `listed` that are not copies, in order, and each copy's SHA-256 and
-/// size are those of a member listed before it or of a file the PC holds (`held`); else the refusal naming the first
-/// difference.
-fn agree(seen: &[Entry], listed: &[Item], held: &HeldBy<'_>) -> io::Result<()> {
-    let mut members = seen.iter();
-    let mut sent: HashMap<&str, u64> = HashMap::new();
-    for Item { entry, copy } in listed {
-        if copy.is_some() {
-            copy_known(entry, &sent, held)?;
-            continue;
-        }
-        let Some(member) = members.next() else {
-            return Err(refused(format!(
-                "the outputs archive lacks '{}', which its list holds",
-                escaped(&entry.path)
-            )));
-        };
-        agree_member(member, entry)?;
-        sent.entry(member.sha256.as_str()).or_insert(member.size);
-    }
-    match members.next() {
-        Some(member) => Err(not_next(member)),
-        None => Ok(()),
-    }
-}
-
-/// Whether the member `member` is the list's item `entry`; else the refusal.
-fn agree_member(member: &Entry, entry: &Entry) -> io::Result<()> {
-    if entry == member {
-        Ok(())
-    } else if entry.path == member.path {
-        Err(refused(format!(
-            "the outputs archive member '{}' does not match its list: {} bytes with SHA-256 {}, listed as {} bytes with \
-             SHA-256 {}",
-            escaped(&member.path),
-            member.size,
-            member.sha256,
-            entry.size,
-            entry.sha256
-        )))
-    } else {
-        Err(not_next(member))
-    }
-}
-
-/// The refusal of the member `member`, which is not the item the list holds next.
-fn not_next(member: &Entry) -> io::Error {
-    refused(format!(
-        "the outputs archive member '{}' is not the file its list holds next",
-        escaped(&member.path)
-    ))
-}
-
-/// Whether the copy `entry` has the SHA-256 and size of a member `sent` before it, or of a file the PC holds (`held`);
-/// else the refusal.
-fn copy_known(entry: &Entry, sent: &HashMap<&str, u64>, held: &HeldBy<'_>) -> io::Result<()> {
-    let sha256 = entry.sha256.as_str();
-    let size = sent.get(sha256).copied().or_else(|| held_size(held, sha256));
-    if size == Some(entry.size) {
-        Ok(())
-    } else {
-        Err(refused(format!(
-            "the outputs archive lists '{}' as a copy of {} bytes with SHA-256 {}, which no member before it and no file \
-             the PC holds has",
-            escaped(&entry.path),
-            entry.size,
-            entry.sha256
-        )))
-    }
-}
-
-fn refused(reason: String) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, reason)
-}
-
-/// Why an archive could not be unpacked: whether its own members are refused for what they are, which a refetch of the
-/// same archive would be refused the same way, or the stream could not be read, which a refetch may clear.
-#[derive(Debug)]
-pub(crate) enum UnpackError {
-    /// A member of the archive is refused for what it is: its path or its kind, a last write it cannot hold, a name the
-    /// reader never takes, or the file or folder limit it passes.
-    Members(io::Error),
-    /// The stream could not be read: an I/O fault, a bad frame or one cut short, a limit it passed as it was read, or a
-    /// member that does not match the archive's own list.
-    Fault(io::Error),
-}
-
-impl UnpackError {
-    /// Whether the archive's own members are refused for what they are, which a refetch would refuse the same way.
-    pub(crate) fn members(&self) -> bool {
-        matches!(self, UnpackError::Members(_))
-    }
-
-    /// Whether this is the fault `kind` names, for a caller that tells one fault from another.
-    pub(crate) fn is_fault(&self, kind: io::ErrorKind) -> bool {
-        matches!(self, UnpackError::Fault(error) if error.kind() == kind)
-    }
-
-    /// This error, with `removal`'s failure to remove `destination` said after it, of the same kind.
-    fn and_removal(self, destination: &Path, removal: &io::Error) -> UnpackError {
-        let said = format!("{self}; and {} could not be removed: {removal}", destination.display());
-        match self {
-            UnpackError::Members(_) => UnpackError::Members(refused(said)),
-            UnpackError::Fault(error) => UnpackError::Fault(io::Error::new(error.kind(), said)),
-        }
-    }
-}
-
-impl std::fmt::Display for UnpackError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            UnpackError::Members(error) | UnpackError::Fault(error) => write!(formatter, "{error}"),
-        }
-    }
-}
-
-impl From<io::Error> for UnpackError {
-    fn from(error: io::Error) -> UnpackError {
-        UnpackError::Fault(error)
-    }
-}
-
-/// The refusal of a member of the archive for what it is, which a refetch of the same archive would refuse the same way.
-fn member_refused(reason: String) -> UnpackError {
-    UnpackError::Members(refused(reason))
 }
 
 #[cfg(test)]
@@ -1070,15 +520,15 @@ mod tests {
 
     use tar::{EntryType, Header};
 
-    use super::{
-        Entry, Item, LIST_NAME, LONG_NAME_LIMIT, MEMBER_LIMIT, Packer, PcFiles, UnpackError, WINDOW_LOG_MAX, extract_into, list_json, member_path,
-        pack, pack_file, read_members, sent_limit, unpack,
+    use gate_inputs::archive::{
+        Entry, Item, LIST_NAME, LONG_NAME_LIMIT, MEMBER_LIMIT, UnpackError, WINDOW_LOG_MAX, list_json, read_members, sent_limit,
     };
+
+    use super::{Packer, PcFiles, extract_into, pack, pack_file, unpack};
     use crate::boxside::outputs::OUTPUTS_BUDGET;
     use crate::outputs::glob::Globs;
     use crate::outputs::hash::sha256_of;
     use crate::outputs::manifest::{Chosen, Held, HeldBy, Manifest};
-    use crate::outputs::names::is_device;
     use crate::outputs::walk::{Found, Stamp, walk};
     use crate::test_support::junction;
     use gate_router::escaped;
@@ -1398,55 +848,6 @@ mod tests {
         for cut in [whole.len() / 2, whole.len() - 1] {
             refusal("cut", &whole[..cut]);
         }
-    }
-
-    /// Checks `member_path` refuses each of `names` as a path outside the destination.
-    fn assert_refused_names(names: &[&str]) {
-        for name in names {
-            let reason = member_path(name.as_bytes()).expect_err(name).to_string();
-            assert!(reason.ends_with("is not a relative path inside the destination"), "{name:?}: {reason}");
-        }
-    }
-
-    /// Checks `member_path` takes each of `names` as it is.
-    fn assert_taken_names(names: &[&str]) {
-        for name in names {
-            assert_eq!(member_path(name.as_bytes()).ok().as_deref(), Some(*name), "{name:?}");
-        }
-    }
-
-    #[test]
-    fn a_member_named_dot_git_in_any_form_is_refused() {
-        assert_refused_names(&[".git/x", ".GIT/x", ".git./x", ".git /x", "git~1/x", "a/.git/x", "a/.Git/hooks/x", ".git"]);
-        assert_taken_names(&[".gitignore", "bin/x.git", "bin/.github/x", "bin/git/x"]);
-    }
-
-    #[test]
-    fn a_member_with_a_short_name_or_trailing_dot_is_refused() {
-        assert_refused_names(&[
-            "GIT~1/x", "x.dll.", "x.dll ", "a~1b/x", "bin./x", "bin /x", "bin/a<b", "bin/a>b", "bin/a\"b", "bin/a|b", "bin/a?b", "bin/a*b",
-        ]);
-        assert_taken_names(&["bin/a~b.dll", "bin/~x", "bin/x~", "bin/.x", "bin/a b.dll", " bin/x"]);
-    }
-
-    #[test]
-    fn a_bidi_control_in_a_member_name_is_refused() {
-        let marks = [
-            '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{200e}', '\u{200f}',
-        ];
-        let names: Vec<String> = marks.iter().map(|mark| format!("bin/a{mark}b.dll")).collect();
-        assert_refused_names(&names.iter().map(String::as_str).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn com0_and_lpt0_are_devices() {
-        for device in ["COM0", "lpt0", "com0.txt", "LPT0 .x", "COM¹", "LPT³"] {
-            assert!(is_device(device), "{device}");
-        }
-        for name in ["COM10", "LPT", "COMA", "com0x"] {
-            assert!(!is_device(name), "{name}");
-        }
-        assert_refused_names(&["bin/COM0", "bin/lpt0.dll"]);
     }
 
     #[test]
@@ -2054,13 +1455,6 @@ mod tests {
             extract_alone(&archive[..], &made("folders-fit"), LIMIT, 3).is_ok(),
             "three folders fit a cap of three"
         );
-    }
-
-    #[test]
-    fn a_member_path_deeper_than_64_parts_is_refused() {
-        let deep = |parts: usize| vec!["a"; parts].join("/");
-        assert_taken_names(&[&deep(64)]);
-        assert_refused_names(&[&deep(65)]);
     }
 
     #[test]
