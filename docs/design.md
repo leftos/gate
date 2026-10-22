@@ -3532,7 +3532,7 @@ Built verbs:
 
   Caps: an archive of more than 50,000 members, or that decompresses to more than 4 GiB (`--test-inputs-budget-bytes` replaces it), is refused as the outputs archive's are, and the put fails (`gate: remote inputs put failed: <why>`, exit 1). The step is not watched on the box; the PC watches both calls ([The remote client's run](#routing), Inputs).
 
-  The Unix box answers `inputs` too, with descriptors for handles and its own stage, modes and record fields (Unix box differences: [The Unix box](#the-unix-box), `inputs`); it does not yet check the run's `InputsDigest`, and refuses `SentBin`.
+  The Unix box answers `inputs` too, with descriptors for handles and its own stage, modes and record fields (Unix box differences: [The Unix box](#the-unix-box), `inputs`); it checks the run's `InputsDigest` too, and refuses `SentBin`.
 
   A payload with a `SentBin`, `<project>/bin/<configuration>` below `Work` (`/`-separated, a plain path whose second-last name is `bin`, else `gate: box payload SentBin is not a plain <project>/bin/<configuration> path: <value>` and exit 2), sends the PC's build of that project instead of the repo's inputs.
 
@@ -3781,7 +3781,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
 - **Verbs.** `preflight`, `boot`, `run`, `stop`, `prune` and `inputs` are built. `run` readies the tree, runs the command under the watch and syncs the tree back (below), in the Windows box's order, the dotnet tool restore (below) included; the pnpm, bun and npm package restores are not built (GATE-648). Every other verb (`outputs`, `inflight`, `lfs`, `register-desktop`) says `gate: box <verb> is not built on this builder` and exits 2.
 
-  The run's `InputsDigest` check is not built: a run whose payload carries an `InputsDigest` is still refused (`gate-remote-refused: <nonce> inputs`, then `gate: remote InputsDigest is not built on this builder`, status 75), as are `SentDigest` and `LfsDigest`, so the PC runs it itself even where `box inputs` has installed the inputs.
+  The run checks a payload's `InputsDigest` as the Windows box does ([The box side](#the-box-side)), and refuses a `SentDigest` or `LfsDigest` as not built (`gate-remote-refused: <nonce> <tag>`, then `gate: remote <key> is not built on this builder`, status 75), so the PC runs such a run itself.
 
   It has no install tripwire, no desktop helper and no MSYS keeper. Its `test-seams` feature passes `gate-args`' hidden `--test-*` seams through, given before the verb; `--test-heartbeat-ms`, `--test-box-sample-ms`, `--test-box-sampler-fail` and `--test-box-free-percent` reach `box run`.
 - **`boot`** reads `kern.boottime` and prints the same line, with the same format.
@@ -3857,7 +3857,15 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
      A non-zero bootout exit (launchctl says 36 while the old process is still ending) never fails the step: it logs `bootout of dev.gate.prune-work said <n>; waiting for it to go` and waits up to 10 s, polling `launchctl print` every 0.5 s, for the job to go, else the step fails with `system/dev.gate.prune-work was still loaded 10 s after launchctl bootout`. Then it runs `launchctl bootstrap system <plist>`.
 
   Without `--system` the step logs a `would ...` line for each of these (naming `{builder user}` and `{builder home}` in the plist text) and SKIP.
-- **`inputs`** (`inputs.rs`) answers the Windows box's `inputs` ([The box side](#the-box-side)), step `diff` or `put`, with the same request, stdin, record format, exclude file, caps and `gate-remote-inputs:` lines; this lists where the Unix box differs. The run's `InputsDigest` check is not built (see Verbs), so a run carrying a digest is refused until it is.
+- **`inputs`** (`inputs.rs`) answers the Windows box's `inputs` ([The box side](#the-box-side)), step `diff` or `put`, with the same request, stdin, record format, exclude file, caps and `gate-remote-inputs:` lines; this lists where the Unix box differs. The run's `InputsDigest` check (`inputs::unmatched`, called from `run.rs`) reads the record by path as the verb does (a link at its name refused) and each copy beneath the held work folder's descriptors, as the put does, and differs as follows.
+
+  A record that is a link, a folder or past the 128 MiB cap, or is not UTF-8, is `<work>.inputs cannot be read: <error>`; a record of another manifest's digest, or unsealed, is `<work>.inputs holds another manifest's digest`. A copy is the one installed when its size, mtime and `{dev}-{ino}` match the record, and one whose equal stamp is untrusted (a negative mtime) is hashed against the record's SHA-256 instead.
+
+  The exclude rewrite runs before the checkout, so inputs survive `clean -fdq` and stay out of the back commit.
+
+  The rewrite writes only while the run's work lock is still held, as the run's other record writes do: else the run says `gate: remote could not write <work>/.git/info/exclude: the work folder lock <lock> is no longer held` (or `could not be looked at: <error>`) and ends 1, with no refusal tag.
+
+  A `<work>/.git is not a folder of its own`, `cannot ready <work>/.git/info` or `cannot write <work>/.git/info/exclude` failure refuses the run `inputs` like a failed check; a folder at the exclude name is moved aside to `exclude.gate-moved-<n>`, said, and the run goes on.
 
   A `Pair` is refused as there (`gate box: inputs for a sibling pair are not taken yet`, exit 2) and a `Step` that is neither word is `gate: box payload Step is not diff or put: <value>` (exit 2). A payload with a `SentBin` is refused after the request is read and before stdin is: `gate-remote-refused: <nonce> sent`, then `gate: remote SentBin is not built on this builder`, status 75.
 

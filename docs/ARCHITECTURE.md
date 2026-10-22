@@ -22,7 +22,7 @@ Its `archive` module holds the `.tar.zst` member reader `read_members`, its chec
 
 It makes no OS calls, builds and tests on any OS, and must never depend on `gate` or any Windows code.
 
-`gate-box-unix` is the gate box of a macOS builder (GATE-607), the bin `gate-box`: `box preflight`, `boot`, `run`, `stop`, `inputs` and `prune`, speaking the wire of the Windows box. It builds on any OS, but its verbs are `cfg(unix)`. The run's `InputsDigest` check is not built, so a run carrying a digest is still refused.
+`gate-box-unix` is the gate box of a macOS builder (GATE-607), the bin `gate-box`: `box preflight`, `boot`, `run`, `stop`, `inputs` and `prune`, speaking the wire of the Windows box. It builds on any OS, but its verbs are `cfg(unix)`. The run checks a payload's `InputsDigest` (`run.rs`, `inputs_matched`, over `inputs::unmatched`); `SentDigest` and `LfsDigest` are not built, so a run carrying either is still refused.
 
 ## Task Index
 

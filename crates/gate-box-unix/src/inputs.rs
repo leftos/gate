@@ -14,6 +14,10 @@
 //! `.git/info/exclude` from the record, so no input is cleaned by the checkout or committed back, and writes the
 //! record's digest last, only once the work folder holds every file of the manifest.
 //!
+//! A run whose payload carries `InputsDigest` checks the record once its work folder is laid out and before its
+//! checkout ([`unmatched`]): the record must hold that digest and every recorded copy the stamp it was installed with,
+//! and the exclude file is rewritten from it; else the run is refused `inputs` and the PC runs the command itself.
+//!
 //! The command the box runs, and anything it leaves running, is the box's own user and may rename, link or rewrite
 //! anything in the work folder, so every name below the work folder or a stage is reached beneath its folder's
 //! descriptor, one name at a time, a link never followed ([`crate::beneath`]); a file below the work folder arrives by
@@ -499,9 +503,7 @@ fn recorded_copy(path: &str, file: &Value) -> Option<Copy> {
 /// still held, and taken as empty, each said; else why such a record could not be removed.
 fn recorded(asked: &Asked<'_>, work: &Work, lock: &HeldLock, console: &mut Console) -> Result<Record, String> {
     let path = &asked.record();
-    let read =
-        files::read_whole(Path::new(path), RECORD_CAP).and_then(|bytes| String::from_utf8(bytes).map_err(|_| io::Error::other("it is not UTF-8")));
-    match read {
+    match read_record(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Record::default()),
         Ok(text) => Ok(Record::parse(&text).unwrap_or_else(|why| {
             console.err(&format!("gate: remote inputs record {path} {why}; every copy is hashed"));
@@ -520,6 +522,12 @@ fn recorded(asked: &Asked<'_>, work: &Work, lock: &HeldLock, console: &mut Conso
             Ok(Record::default())
         }
     }
+}
+
+/// The inputs record at `path`, read whole as itself ([`files::read_whole`]), at most [`RECORD_CAP`] bytes, and UTF-8;
+/// else the system's error, `NotFound` for a record that is not there.
+fn read_record(path: &str) -> io::Result<String> {
+    files::read_whole(Path::new(path), RECORD_CAP).and_then(|bytes| String::from_utf8(bytes).map_err(|_| io::Error::other("it is not UTF-8")))
 }
 
 /// Writes `record` as the record at `path`, whole ([`files::replace_plain`]); else why not.
@@ -1347,6 +1355,73 @@ fn changed_before_seal(work: &Work, now: &Record) -> Option<String> {
     })
 }
 
+/// Why the work folder `work`, its lock held by a run, does not hold the inputs of the manifest whose digest is `sent`,
+/// as the Windows box's check says it: its record `{work}.inputs` missing, unreadable ([`read_record`]), not a record
+/// or of another digest, an unsealed one's empty digest among them; a recorded copy gone, not a plain file of one name,
+/// or not the copy installed ([`still_installed`]), each reached beneath the work folder held through its judged root
+/// ([`Work::held`]); or a tree whose exclude file cannot be written from the record ([`write_exclude`]), each
+/// [`Unmatched::Inputs`]. The exclude file is written only while the run's work lock `lock` is shown still held, as the
+/// run's other record writes are; else [`Unmatched::LockLost`]. `Ok` when it holds them, the exclude file written, with
+/// the line saying where a folder at the exclude file's name was moved aside, when one was, for the caller to say.
+pub(crate) fn unmatched(work: &str, sent: &str, lock: &HeldLock) -> Result<Option<String>, Unmatched> {
+    let record = matching_record(&format!("{work}.inputs"), sent).map_err(Unmatched::Inputs)?;
+    let held = Work::held(work).map_err(|error| Unmatched::Inputs(format!("cannot open {work}: {error}")))?;
+    if let Some(why) = changed_copy(&held, &record) {
+        return Err(Unmatched::Inputs(why));
+    }
+    let shown = lock.path().display();
+    match lock.still_held() {
+        Ok(true) => write_exclude(&held, &record).map_err(Unmatched::Inputs),
+        Ok(false) => Err(Unmatched::LockLost(format!("the work folder lock {shown} is no longer held"))),
+        Err(error) => Err(Unmatched::LockLost(format!(
+            "the work folder lock {shown} could not be looked at: {error}"
+        ))),
+    }
+}
+
+/// Why a run's inputs check did not pass ([`unmatched`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Unmatched {
+    /// The work folder does not hold the inputs sent, or its exclude file cannot be written: the run is refused `inputs`.
+    Inputs(String),
+    /// The exclude file may not be written, the work lock lost or not looked at: the run fails, as its other record
+    /// writes do.
+    LockLost(String),
+}
+
+/// The record at `path` when it holds the digest `sent`; else why not.
+fn matching_record(path: &str, sent: &str) -> Result<Record, String> {
+    match read_record(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(format!("{path} does not exist")),
+        Ok(text) => match Record::parse(&text) {
+            Ok(record) if record.digest == sent => Ok(record),
+            Ok(_) => Err(format!("{path} holds another manifest's digest")),
+            Err(why) => Err(format!("{path} {why}")),
+        },
+        Err(error) => Err(format!("{path} cannot be read: {error}")),
+    }
+}
+
+/// Why a copy `record` holds is not below the held work folder `work` as installed; `None` when each is.
+fn changed_copy(work: &Work, record: &Record) -> Option<String> {
+    record.files.values().find_map(|copy| match opened_copy(work, &copy.path) {
+        Ok(Some(opened)) if still_installed(&opened, copy) => None,
+        Ok(Some(_)) => Some(format!("the input {} is not the copy installed", copy.path)),
+        Ok(None) => Some(format!("the input {} is missing", copy.path)),
+        Err(error) => Some(format!("the input {} cannot be opened: {error}", copy.path)),
+    })
+}
+
+/// Whether the copy `opened` is the one `copy` records: its stamp the record's and trusted ([`Stamp::trusts`]),
+/// unhashed; or its stamp the record's but not trusted, a mtime before 1970, and its bytes hashing to the record's.
+fn still_installed(opened: &Opened, copy: &Copy) -> bool {
+    let stamp = opened.facts.stamp();
+    if stamp.trusts(&copy.stamp) {
+        return true;
+    }
+    stamp == copy.stamp && sha256_of(&opened.file).is_ok_and(|(sha256, _)| sha256 == copy.sha256)
+}
+
 /// Rewrites the tree's `.git/info/exclude` from `record`: one line per path it names, installed or kept, as a literal
 /// pattern ([`literal_pattern`]), in the order of their keys. The `.git` must be a folder of its own, opened beneath the
 /// held work folder `work`; `.git/info` is made a folder of its own beneath it ([`info_folder`]), and the file written
@@ -1502,9 +1577,9 @@ mod tests {
     use serde_json::{Map, Value, json};
 
     use super::{
-        Asked, Copy as Installed, Facts, Job, PAIR_REFUSED, RECORD_CAP, Record, Sent, Staged, Staging, Stamp, Work, answered, finished, flock_taken,
-        free_target, installed, made_stage, matched_copy, moved_in, opened_copy, pruned, recorded, volume_checked, write_exclude,
-        write_record_capped,
+        Asked, Copy as Installed, Facts, Job, PAIR_REFUSED, RECORD_CAP, Record, Sent, Staged, Staging, Stamp, Unmatched, Work, answered, finished,
+        flock_taken, free_target, installed, made_stage, matched_copy, moved_in, opened_copy, pruned, recorded, unmatched, volume_checked,
+        write_exclude, write_record_capped,
     };
     use crate::beneath::Folder;
     use crate::console::Console;
@@ -2495,5 +2570,184 @@ mod tests {
             matched_copy(&work, "a.txt", &held, &record).is_none(),
             "the copy is hashed, never trusted"
         );
+    }
+
+    /// Two inputs, one in a folder of its own.
+    const TWO: [(&str, &[u8]); 2] = [("a.txt", b"a\n"), ("d/b.txt", b"b\n")];
+
+    /// `files` put into the work folder of `case` and sealed; the digest of their manifest.
+    fn sealed(case: &Case, files: &Files<'_>) -> String {
+        let (status, console) = case.put(files, files, &[]);
+        assert_eq!(status, 0, "{:?}", console.err);
+        sent_of(files).digest
+    }
+
+    /// The record of `case` rewritten with `edit` made to its JSON.
+    fn record_edited(case: &Case, edit: impl FnOnce(&mut Value)) {
+        let mut record = case.record();
+        edit(&mut record);
+        fs::write(case.record_path(), record.to_string()).expect("the record is rewritten");
+    }
+
+    /// The run's check of the work folder `work` for the digest `sent`, its work lock held: why the run is refused, or a
+    /// lost lock's line marked as such.
+    fn checked(work: &str, sent: &str) -> Result<Option<String>, String> {
+        let lock = files::held_for_test(Path::new(&format!("{work}.lock")));
+        unmatched(work, sent, &lock).map_err(|unmatched| match unmatched {
+            Unmatched::Inputs(why) => why,
+            Unmatched::LockLost(why) => format!("lock lost: {why}"),
+        })
+    }
+
+    /// The run's check of a case `name` whose sealed [`TWO`] had its `a.txt` changed by `change`.
+    fn changed(name: &str, change: impl FnOnce(&Path)) -> Result<Option<String>, String> {
+        let case = Case::new(name);
+        let digest = sealed(&case, &TWO);
+        change(Path::new(&format!("{}/a.txt", case.work())));
+        checked(&case.work(), &digest)
+    }
+
+    #[test]
+    fn a_sealed_record_whose_copies_are_unchanged_passes_and_the_exclude_file_lists_each() {
+        let case = Case::new("unmatched-pass");
+        let digest = sealed(&case, &TWO);
+        fs::write(format!("{}/.git/info/exclude", case.work()), "").expect("the exclude file is emptied");
+
+        assert_eq!(checked(&case.work(), &digest), Ok(None));
+        assert_eq!(case.exclude(), "/a.txt\n/d/b.txt\n");
+    }
+
+    #[test]
+    fn a_missing_record_refuses_the_run() {
+        let case = Case::new("unmatched-none");
+        drop(case.work_held());
+
+        assert_eq!(
+            checked(&case.work(), &sent_of(&TWO).digest),
+            Err(format!("{} does not exist", case.record_path()))
+        );
+    }
+
+    #[test]
+    fn a_record_of_another_digest_unsealed_or_no_record_at_all_refuses_the_run() {
+        let case = Case::new("unmatched-digest");
+        let digest = sealed(&case, &TWO);
+        let path = case.record_path();
+        let another = Err(format!("{path} holds another manifest's digest"));
+
+        assert_eq!(checked(&case.work(), &"f".repeat(64)), another);
+        record_edited(&case, |record| record["digest"] = json!(""));
+        assert_eq!(checked(&case.work(), &digest), another, "an unsealed record");
+        fs::write(&path, "[]").expect("the record is spoilt");
+        assert_eq!(checked(&case.work(), &digest), Err(format!("{path} is not an inputs record")));
+    }
+
+    #[test]
+    fn a_record_that_is_a_link_cannot_be_read_and_what_it_names_is_left() {
+        let case = Case::new("unmatched-record-link");
+        let digest = sealed(&case, &TWO);
+        let path = case.record_path();
+        let aside = format!("{path}.aside");
+        fs::rename(&path, &aside).expect("the record is moved aside");
+        symlink(&aside, &path).expect("a link takes the record's name");
+
+        let refused = checked(&case.work(), &digest).expect_err("a linked record is refused");
+
+        assert!(refused.starts_with(&format!("{path} cannot be read: ")), "{refused}");
+        assert!(Path::new(&aside).is_file(), "what the link names is left");
+    }
+
+    #[test]
+    fn a_copy_changed_in_size_mtime_or_inode_is_not_the_copy_installed() {
+        let not_installed = Err("the input a.txt is not the copy installed".to_owned());
+        let size = changed("unmatched-size", |path| fs::write(path, "aa\n").expect("the copy grows"));
+        assert_eq!(size, not_installed, "its size");
+        let mtime = changed("unmatched-mtime", |path| {
+            File::options()
+                .write(true)
+                .open(path)
+                .and_then(|file| file.set_modified(UNIX_EPOCH + Duration::from_secs(WRITTEN + 1)))
+                .expect("the copy's mtime moves");
+        });
+        assert_eq!(mtime, not_installed, "its mtime");
+        let inode = changed("unmatched-inode", |path| {
+            let modified = fs::metadata(path).and_then(|metadata| metadata.modified()).expect("the mtime is read");
+            let other = path.with_file_name("other");
+            fs::write(&other, "z\n")
+                .and_then(|()| File::options().write(true).open(&other))
+                .and_then(|file| file.set_modified(modified))
+                .and_then(|()| fs::rename(&other, path))
+                .expect("another file of the same size and mtime takes the copy's name");
+        });
+        assert_eq!(inode, not_installed, "its inode");
+    }
+
+    #[test]
+    fn a_copy_missing_a_link_or_a_folder_refuses_the_run() {
+        let missing = changed("unmatched-missing", |path| fs::remove_file(path).expect("the copy goes"));
+        assert_eq!(missing, Err("the input a.txt is missing".to_owned()));
+        let link = changed("unmatched-copy-link", |path| {
+            fs::remove_file(path)
+                .and_then(|()| symlink("d/b.txt", path))
+                .expect("a link takes the copy's name");
+        });
+        let folder = changed("unmatched-copy-folder", |path| {
+            fs::remove_file(path)
+                .and_then(|()| fs::create_dir(path))
+                .expect("a folder takes the copy's name");
+        });
+        for (refused, what) in [(link, "a link"), (folder, "a folder")] {
+            let why = refused.expect_err(what);
+            assert!(why.starts_with("the input a.txt cannot be opened: "), "{what}: {why}");
+        }
+    }
+
+    #[test]
+    fn a_copy_with_a_negative_mtime_passes_only_while_its_bytes_hash_to_the_record() {
+        let case = Case::new("unmatched-negative");
+        let digest = sealed(&case, &TWO);
+        let path = format!("{}/a.txt", case.work());
+        let written = |bytes: &[u8]| {
+            fs::write(&path, bytes)
+                .and_then(|()| File::options().write(true).open(&path))
+                .and_then(|file| file.set_modified(UNIX_EPOCH - Duration::from_secs(10)))
+                .expect("the copy is written before 1970");
+        };
+        let stamp = || {
+            let work = Work::held(&case.work()).expect("the work folder is held");
+            opened_copy(&work, "a.txt")
+                .expect("the copy opens")
+                .expect("the copy is there")
+                .facts
+                .stamp()
+        };
+        written(b"a\n");
+        let before = stamp();
+        assert!(before.modified < 0, "{before:?}");
+        record_edited(&case, |record| record["files"]["a.txt"]["modified"] = json!(before.modified));
+
+        assert_eq!(checked(&case.work(), &digest), Ok(None), "the same bytes, hashed, pass");
+        written(b"z\n");
+        assert_eq!(stamp(), before, "only its bytes changed");
+        assert_eq!(
+            checked(&case.work(), &digest),
+            Err("the input a.txt is not the copy installed".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_folder_at_the_exclude_file_s_name_is_moved_aside_and_its_line_returned() {
+        let case = Case::new("unmatched-moved");
+        let digest = sealed(&case, &TWO);
+        let exclude = format!("{}/.git/info/exclude", case.work());
+        fs::remove_file(&exclude)
+            .and_then(|()| fs::create_dir(&exclude))
+            .expect("a folder takes the exclude file's name");
+
+        assert_eq!(
+            checked(&case.work(), &digest),
+            Ok(Some(format!("gate: remote moved aside the folder {exclude} to {exclude}.gate-moved-1")))
+        );
+        assert_eq!(case.exclude(), "/a.txt\n/d/b.txt\n");
     }
 }

@@ -1,6 +1,6 @@
 //! `gate-box box run`: the request read and checked as the Windows box reads it, what this builder does not build
 //! refused so the PC runs the command itself, the work root checked, the work lock taken, the subfolder placed, the work
-//! folder laid out and the payload's snapshot checked out; then the command run and the tree it left synced back
+//! folder laid out, the inputs the PC sent checked and the payload's snapshot checked out; then the command run and the tree it left synced back
 //! ([`run`]). Each line is said as the Windows box says it, byte for byte.
 
 use std::ffi::{CStr, OsStr};
@@ -23,6 +23,7 @@ use crate::console::{Forwarding, LineSink, Output, Stream};
 use crate::files::{self, HeldLock, Locked};
 use crate::git::{self, AlternatesFailure, Failed, Git, GitClass, RunGit, Steps, Tree, failed_for, for_repo, line_ends_set, origin_set};
 use crate::heartbeat::{self, Periods};
+use crate::inputs::{self, Unmatched};
 use crate::lines::{
     Along, BACK_COMMITS_FAILED, CommandEnd, FAILED_STATUS, Godot, LAYOUT_CHANGING, Login, Translation, USAGE_STATUS, back_commits_line,
     command_status, layout_text, login_path_line, names_another_layout, recorded_group, rosetta_lines, signal_guard, translation, work_layout,
@@ -163,6 +164,8 @@ pub struct Request<'p> {
     pub env: Vec<(String, String)>,
     /// The Godot version the run chose, `GodotVersion`; `None` for none.
     pub godot: Option<&'p str>,
+    /// The digest of the inputs manifest the PC sent before the run, `InputsDigest`; `None` for none.
+    pub inputs_digest: Option<&'p str>,
     /// The first thing the payload asks for that this builder does not build, in the order the payload is read.
     unbuilt: Option<Unbuilt>,
 }
@@ -170,7 +173,7 @@ pub struct Request<'p> {
 impl<'p> Request<'p> {
     /// Reads `payload` in the order the Windows box reads it, each key checked as it does; then notes the first key
     /// asking for what this builder does not build: `Outputs`, `OutputsFull`, `Desktop`, a warm-up's
-    /// `WarmCommands`, `EngineEnv`, `UnrealVersion`, `InputsDigest`, `SentDigest` or `LfsDigest`; then, last, the
+    /// `WarmCommands`, `EngineEnv`, `UnrealVersion`, `SentDigest` or `LfsDigest`; then, last, the
     /// repos ([`repos`]), a sibling pair as `gate-wire` checks it. A work root holding a `:` is refused just after the
     /// work folder is read ([`work_layout`]).
     ///
@@ -204,7 +207,7 @@ impl<'p> Request<'p> {
         let godot = payload.godot_version()?;
         let engine_env = !payload.engine_env()?.is_empty();
         let unreal = payload.unreal_version()?.is_some();
-        let inputs = payload.inputs_digest()?.is_some();
+        let inputs_digest = payload.inputs_digest()?;
         let sent = payload.sent_digest()?.is_some();
         let lfs = payload.lfs_digest()?.is_some();
         // Last, so a payload a run of one repo refuses is refused with the same line whatever its Pair says.
@@ -216,7 +219,6 @@ impl<'p> Request<'p> {
             (warm, Refusal::Layout, "WarmCommands"),
             (engine_env, Refusal::Layout, "EngineEnv"),
             (unreal, Refusal::Layout, "UnrealVersion"),
-            (inputs, Refusal::Inputs, "InputsDigest"),
             (sent, Refusal::Sent, "SentDigest"),
             (lfs, Refusal::Lfs, "LfsDigest"),
         ]
@@ -240,6 +242,7 @@ impl<'p> Request<'p> {
             identity,
             env,
             godot,
+            inputs_digest,
             unbuilt,
         })
     }
@@ -787,6 +790,7 @@ fn locked<S: LineSink + 'static>(
     let (login_path, godot_root) = login_read(output, login).map_or((None, None), |login| (Some(login.path), login.godot_root));
     let git = run_git(request, lock, login_path.as_deref(), output);
     laid_out(&laying, &git, &fresh).map_err(|not| not_laid_out(output, request, not))?;
+    inputs_matched(request, lock, output)?;
     checked_out(request, &git).map_err(|failed| Unready::Ended(failure(output, &failed)))?;
     if !place.is_dir() {
         let line = format!("gate: remote subfolder {} does not exist in the snapshot", escaped(request.subfolder));
@@ -853,6 +857,41 @@ fn said<S: LineSink>(output: &Output<S>, lines: &[&str], status: u8) -> u8 {
 fn failure<S: LineSink>(output: &Output<S>, failed: &Failed) -> u8 {
     let lines: Vec<&str> = failed.lines.iter().map(String::as_str).collect();
     said(output, &lines, failed.status)
+}
+
+/// Checks the run's `InputsDigest`, when it has one, against the work folder's inputs record and the copies it holds,
+/// and rewrites the tree's exclude file from it ([`inputs::unmatched`]), once the work folder is laid out and before
+/// the checkout: a record missing, unreadable or of another digest, a copy changed or gone, or an exclude file that
+/// cannot be written refuses the run `inputs`, its tag and line said together, so the PC runs the command itself. The
+/// exclude file is written only while the work lock `lock` is shown still held; else the run fails with status 1, its
+/// line said, as its other record writes do. A folder moved aside from the exclude file's name is said and the run
+/// goes on.
+fn inputs_matched<S: LineSink>(request: &Request<'_>, lock: &HeldLock, output: &Output<S>) -> Result<(), Unready> {
+    let Some(sent) = request.inputs_digest else {
+        return Ok(());
+    };
+    match inputs::unmatched(request.work, sent, lock) {
+        Ok(moved_aside) => {
+            if let Some(line) = moved_aside {
+                // A note: the run goes on, and a client gone finds out at the next line.
+                let _ = output.say(Stream::Err, &line);
+            }
+            Ok(())
+        }
+        Err(Unmatched::Inputs(why)) => {
+            let line = format!(
+                "gate: remote inputs of work folder {} are not the ones sent: {}",
+                request.key,
+                escaped(&why)
+            );
+            refused(output, request, Refusal::Inputs, &line);
+            Err(Unready::Refused)
+        }
+        Err(Unmatched::LockLost(why)) => {
+            let line = format!("gate: remote could not write {}/.git/info/exclude: {why}", request.work);
+            Err(Unready::Ended(said(output, &[&line], FAILED_STATUS)))
+        }
+    }
 }
 
 /// Refuses the run of `request` for `refusal`: its tag, then `line`, said together; [`REFUSED_STATUS`].
@@ -1278,13 +1317,15 @@ mod tests {
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use gate_wire::{PathForm, Payload, Refusal, busy_line, layout_line, refused_line, started_line, tools_line};
+    use gate_inputs::hash::sha256_of;
+    use gate_wire::{PathForm, Payload, Refusal, busy_line, escaped, layout_line, refused_line, started_line, tools_line};
     use serde_json::{Value, json};
 
     use gate_watchdog::Pump;
 
     use super::{
-        NotLaidOut, REFUSED_STATUS, Ready, Request, Watches, login_read, place_of, prepare, prepared, run_along, test_template, work_cleared,
+        NotLaidOut, REFUSED_STATUS, Ready, Request, Unready, Watches, inputs_matched, login_read, place_of, prepare, prepared, run_along,
+        test_template, work_cleared,
     };
     #[cfg(target_os = "macos")]
     use crate::beneath::ANOTHER_VOLUME;
@@ -3119,11 +3160,167 @@ mod tests {
         assert_refused(&case, &desktop, Refusal::Desktop, "gate: remote Desktop is not built on this builder");
     }
 
+    /// The `inputs` refusal of `why`: its tag, then the inputs line.
+    fn inputs_refusal(why: &str) -> [String; 2] {
+        [
+            refused_line(NONCE, Refusal::Inputs),
+            format!("gate: remote inputs of work folder {KEY} are not the ones sent: {}", escaped(why)),
+        ]
+    }
+
+    impl Case {
+        /// Writes `files` in the laid-out work folder as installed inputs, and their record sealed with [`DIGEST`].
+        fn inputs_installed(&self, files: &[(&str, &str)]) {
+            let mut recorded = serde_json::Map::new();
+            for (path, text) in files {
+                let full = format!("{}/{path}", self.work());
+                fs::write(&full, text).expect("the input is written");
+                let metadata = fs::metadata(&full).expect("the input is looked at");
+                let file = json!({
+                    "size": metadata.len(),
+                    "sha256": sha256_of(text.as_bytes()).expect("the input hashes").0,
+                    "modified": metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
+                    "id": format!("{}-{}", metadata.dev(), metadata.ino()),
+                });
+                recorded.insert((*path).to_owned(), file);
+            }
+            let record = json!({ "digest": DIGEST, "files": recorded }).to_string();
+            fs::write(format!("{}.inputs", self.work()), record).expect("the inputs record is written");
+        }
+
+        /// The tree's exclude file, `None` when there is none.
+        fn exclude_text(&self) -> Option<String> {
+            fs::read_to_string(format!("{}/.git/info/exclude", self.work())).ok()
+        }
+    }
+
     #[test]
     fn an_inputs_digest_is_refused_inputs() {
         let case = Case::new("inputs");
-        let inputs = json!({ "InputsDigest": DIGEST });
-        assert_refused(&case, &inputs, Refusal::Inputs, "gate: remote InputsDigest is not built on this builder");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+
+        let (status, said) = ran(&case.json(&commit, &json!({ "InputsDigest": DIGEST })));
+
+        assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        assert_eq!(said, inputs_refusal(&format!("{}.inputs does not exist", case.work())));
+        assert!(Path::new(&format!("{}/.git", case.work())).is_dir(), "the work folder is laid out first");
+    }
+
+    #[test]
+    fn a_matching_inputs_record_lets_the_run_start_its_command_and_its_input_outlives_the_checkout() {
+        let case = Case::new("inputs-matched");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.laid_out(&commit);
+        case.inputs_installed(&[("in.txt", "input\n")]);
+        let mut json = case.commanded(&commit, &["/bin/sh", "-c", "cat in.txt"]);
+        json["InputsDigest"] = json!(DIGEST);
+
+        let (status, said) = whole_run(&json);
+
+        assert_eq!(status, 0, "{said:?}");
+        let out: Vec<&str> = said
+            .iter()
+            .filter(|(stream, _)| *stream == Stream::Out)
+            .map(|(_, line)| line.as_str())
+            .collect();
+        assert_eq!(out, [started_line(NONCE).as_str(), "input"], "{said:?}");
+        assert_eq!(case.exclude_text().as_deref(), Some("/in.txt\n"));
+    }
+
+    #[test]
+    fn a_changed_input_refuses_the_run_inputs_and_never_starts_its_command() {
+        let case = Case::new("inputs-changed");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.laid_out(&commit);
+        case.inputs_installed(&[("in.txt", "input\n")]);
+        fs::write(format!("{}/in.txt", case.work()), "changed input\n").expect("the input changes");
+        let marker = case.base.with_file_name("started");
+        let mut json = case.commanded(&commit, &["/bin/sh", "-c", &format!("touch '{}'", marker.display())]);
+        json["InputsDigest"] = json!(DIGEST);
+
+        let (status, said) = whole_run(&json);
+
+        let lines: Vec<String> = said.into_iter().map(|(_, line)| line).collect();
+        assert_eq!(status, REFUSED_STATUS, "{lines:?}");
+        assert_eq!(lines, inputs_refusal("the input in.txt is not the copy installed"));
+        assert!(!marker.exists(), "the command never started");
+    }
+
+    #[test]
+    fn a_run_without_an_inputs_digest_leaves_the_exclude_file_alone() {
+        let case = Case::new("inputs-none");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.laid_out(&commit);
+        case.inputs_installed(&[("in.txt", "input\n")]);
+        let before = case.exclude_text();
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(case.exclude_text(), before, "the exclude file is as the layout left it");
+    }
+
+    #[test]
+    fn a_work_lock_lost_before_the_inputs_check_writes_no_exclude_file_and_fails_the_run() {
+        let case = Case::new("inputs-lock-lost");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.laid_out(&commit);
+        case.inputs_installed(&[("in.txt", "input\n")]);
+        let exclude = format!("{}/.git/info/exclude", case.work());
+        fs::write(&exclude, "before\n").expect("the exclude file is written");
+        let payload = decoded(&case.json(&commit, &json!({ "InputsDigest": DIGEST })));
+        let request = Request::read(&payload).expect("the request reads");
+        let lock = files::held_for_test(Path::new(&case.lock()));
+        fs::remove_file(case.lock())
+            .and_then(|()| fs::write(case.lock(), ""))
+            .expect("another file takes the lock's name");
+        let output = Output::new(RecordingSink::default());
+
+        let checked = inputs_matched(&request, &lock, &output);
+
+        assert!(matches!(checked, Err(Unready::Ended(1))), "{:?}", output.sink().lines());
+        assert_eq!(
+            stderr_of(&output),
+            [format!(
+                "gate: remote could not write {exclude}: the work folder lock {} is no longer held",
+                case.lock()
+            )]
+        );
+        assert_eq!(case.exclude_text().as_deref(), Some("before\n"), "no exclude file is written");
+    }
+
+    #[test]
+    fn a_folder_at_the_exclude_file_s_name_is_moved_aside_said_and_the_run_goes_on() {
+        let case = Case::new("inputs-moved");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.laid_out(&commit);
+        case.inputs_installed(&[("in.txt", "input\n")]);
+        let exclude = format!("{}/.git/info/exclude", case.work());
+        if Path::new(&exclude).exists() {
+            fs::remove_file(&exclude).expect("the exclude file is removed");
+        }
+        fs::create_dir_all(&exclude).expect("a folder takes the exclude file's name");
+
+        let (status, said) = ran(&case.json(&commit, &json!({ "InputsDigest": DIGEST })));
+
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(said, [format!("gate: remote moved aside the folder {exclude} to {exclude}.gate-moved-1")]);
+        assert_eq!(case.exclude_text().as_deref(), Some("/in.txt\n"));
+    }
+
+    #[test]
+    fn the_inputs_check_runs_after_a_layout_change_cleared_the_record() {
+        let case = Case::new("inputs-relaid");
+        let main = case.snapshot(&[("a.txt", "a\n")]);
+        let lib = case.lib_snapshot(&[("b.txt", "b\n")]);
+        case.laid_out(&main);
+        case.inputs_installed(&[]);
+
+        let (status, said) = ran(&case.pair_json(&main, &lib, &json!({ "InputsDigest": DIGEST })));
+
+        assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        assert_eq!(said, inputs_refusal(&format!("{}.inputs does not exist", case.work())));
+        assert_eq!(case.layout_record(), "pair repo lib");
     }
 
     #[test]

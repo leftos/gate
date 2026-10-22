@@ -24,7 +24,10 @@ mod unix {
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use gate_wire::{BoxKill, Refusal, adjusted_prefix, busy_line, killed_line, refused_line, started_line};
+    use gate_inputs::hash::sha256_of;
+    use gate_inputs::manifest::{Held, Manifest, Stamp, read_sent};
+    use gate_inputs::pack::Packer;
+    use gate_wire::{BoxKill, Refusal, adjusted_prefix, busy_line, escaped, killed_line, refused_line, started_line};
     use serde_json::{Value, json};
 
     const KEY: &str = "repo-0123abcd";
@@ -177,6 +180,57 @@ mod unix {
                 .expect("the lock file opens");
             // SAFETY: `file` is open for the call; a lock taken is let go when it closes.
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+        }
+
+        /// The keys of a pair of the leaf `repo` and the sibling `lib`, whose bare repository `<root>/lib.git` is made
+        /// holding a commit of `b.txt`, pushed as `refs/gate/<key>`.
+        fn pair_with_lib(&self) -> Value {
+            let lib_bare = format!("{}/lib.git", self.root());
+            git(&["init", "--bare", "-q", &lib_bare]);
+            let lib_source = self.base.join("lib-source");
+            let lib_source = lib_source.to_str().expect("the temp folder is UTF-8");
+            git(&["init", "-q", lib_source]);
+            fs::write(Path::new(lib_source).join("b.txt"), "b\n").expect("the sibling's file is written");
+            git(&["-C", lib_source, "add", "-A"]);
+            git(&[
+                "-C",
+                lib_source,
+                "-c",
+                "user.name=gate",
+                "-c",
+                "user.email=gate@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "sibling",
+            ]);
+            git(&["-C", lib_source, "push", "-q", &lib_bare, &format!("HEAD:refs/gate/{KEY}")]);
+            let lib = git(&["-C", lib_source, "rev-parse", "HEAD"]);
+            json!({ "Pair": { "Leaf": "repo", "Siblings": ["lib"] }, "SiblingSnapshots": { "lib": lib } })
+        }
+
+        /// The `box inputs` request word of `step` for this case's work folder: base64 of the JSON payload.
+        fn inputs_request(&self, step: &str) -> String {
+            let (root, work) = (self.root(), self.work());
+            let payload = json!({
+                "Key": KEY,
+                "Bare": self.bare(),
+                "Work": work,
+                "Lock": format!("{work}.lock"),
+                "Index": format!("{work}.index"),
+                "OutputFolder": format!("{root}/outputs"),
+                "Job": format!("gate-remote-{KEY}-0123456789ab"),
+                "Nonce": NONCE,
+                "Step": step,
+            });
+            STANDARD.encode(payload.to_string())
+        }
+
+        /// The inputs record, `<work>.inputs`.
+        fn inputs_record(&self) -> String {
+            format!("{}.inputs", self.work())
         }
 
         /// The run left no interrupted-command record nor group record, and let its work lock go.
@@ -366,33 +420,8 @@ mod unix {
         let case = Case::new("pair");
         let commit = case.snapshot();
         let lib_bare = format!("{}/lib.git", case.root());
-        git(&["init", "--bare", "-q", &lib_bare]);
-        let lib_source = case.base.join("lib-source");
-        let lib_source = lib_source.to_str().expect("the temp folder is UTF-8");
-        git(&["init", "-q", lib_source]);
-        fs::write(Path::new(lib_source).join("b.txt"), "b\n").expect("the sibling's file is written");
-        git(&["-C", lib_source, "add", "-A"]);
-        git(&[
-            "-C",
-            lib_source,
-            "-c",
-            "user.name=gate",
-            "-c",
-            "user.email=gate@example.com",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-q",
-            "-m",
-            "sibling",
-        ]);
-        git(&["-C", lib_source, "push", "-q", &lib_bare, &format!("HEAD:refs/gate/{KEY}")]);
-        let lib = git(&["-C", lib_source, "rev-parse", "HEAD"]);
-        let extra = json!({
-            "Pair": { "Leaf": "repo", "Siblings": ["lib"] },
-            "SiblingSnapshots": { "lib": lib },
-            "Command": ["/bin/sh", "-c", "cat a.txt ../lib/b.txt; echo c > c.txt; echo d > ../lib/d.txt"],
-        });
+        let mut extra = case.pair_with_lib();
+        extra["Command"] = json!(["/bin/sh", "-c", "cat a.txt ../lib/b.txt; echo c > c.txt; echo d > ../lib/d.txt"]);
         let ended = ran(&[], &case.request(&commit, &extra), Reading::All, &case.base.join("beaten"));
         assert_eq!(ended.status, Some(0), "{:?}", ended.err);
         assert_eq!(
@@ -526,6 +555,11 @@ mod unix {
             .stdin(Stdio::null())
             .output()
             .expect("gate-box runs");
+        ended_of(&ran)
+    }
+
+    /// What a `gate-box` that has ended said, line by line, and its status.
+    fn ended_of(ran: &std::process::Output) -> Ended {
         let lines = |bytes: &[u8]| String::from_utf8_lossy(bytes).lines().map(str::to_owned).collect();
         Ended {
             status: ran.status.code(),
@@ -644,6 +678,181 @@ mod unix {
         assert_eq!(ended.out, [started_line(NONCE)], "{:?}", ended.err);
         assert!(Path::new(&format!("{}.tools", case.work())).exists(), "the tools record is written");
         case.ended_clean();
+    }
+
+    /// The inputs of the inputs cases, each a path and its bytes: one in a folder of its own, one at the tree's top.
+    const INPUTS: [(&str, &[u8]); 2] = [("cache/x.bin", b"cached\n"), ("in.txt", b"input\n")];
+    /// The last write every packed input carries, in seconds since 1970.
+    const WRITTEN: u64 = 1_700_000_000;
+
+    /// The PC's inputs manifest of `files`.
+    fn manifest_of(files: &[(&str, &[u8])]) -> Manifest {
+        let mut manifest = Manifest::default();
+        for (path, bytes) in files {
+            let stamp = Stamp {
+                size: bytes.len() as u64,
+                modified: 0,
+            };
+            let sha256 = sha256_of(*bytes).expect("the input hashes").0;
+            manifest.insert((*path).to_owned(), Held { stamp, sha256 });
+        }
+        manifest
+    }
+
+    /// The digest of the manifest of `files`, the run's `InputsDigest`.
+    fn digest_of(files: &[(&str, &[u8])]) -> String {
+        read_sent(manifest_of(files).line().into_bytes()).expect("the manifest reads").1
+    }
+
+    /// The inputs archive of `files`, packed as the PC packs it.
+    fn archive_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut sink = Vec::new();
+        let mut packer = Packer::new(&mut sink, 20).expect("a packer is made");
+        for (path, bytes) in files {
+            packer.add(path, bytes.len() as u64, WRITTEN, *bytes).expect("an input is packed");
+        }
+        packer.finish().expect("the archive ends");
+        sink
+    }
+
+    /// Runs `gate-box box inputs --stdin` for `step` of the work folder of `case`, the request, the manifest of `files`
+    /// and, for a put, their archive on its stdin; its status and its lines.
+    fn inputs_answered(case: &Case, step: &str, files: &[(&str, &[u8])]) -> Ended {
+        let mut input = format!("{}\n{}", case.inputs_request(step), manifest_of(files).line()).into_bytes();
+        if step == "put" {
+            input.extend(archive_of(files));
+        }
+        let mut child = Command::new(env!("CARGO_BIN_EXE_gate-box"))
+            .args(["box", "inputs", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("gate-box starts");
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        // Written from a thread of its own, so the box's output is read however much it says, and a box that ends
+        // before reading all its input still has its lines read.
+        let writer = thread::spawn(move || stdin.write_all(&input));
+        let ended = ended_of(&child.wait_with_output().expect("gate-box is waited for"));
+        let written = writer.join().expect("the input's writer ends");
+        assert!(
+            written.is_ok() || ended.status != Some(0),
+            "a box that passed read its whole input: {written:?} {:?}",
+            ended.err
+        );
+        ended
+    }
+
+    /// [`INPUTS`] diffed and put into the work folder of `case`, each step checked.
+    fn inputs_installed(case: &Case) {
+        let diff = inputs_answered(case, "diff", &INPUTS);
+        assert_eq!(diff.status, Some(0), "{:?}", diff.err);
+        assert_eq!(
+            diff.out,
+            [
+                "gate-remote-inputs: need 2",
+                "gate-remote-inputs: path cache/x.bin",
+                "gate-remote-inputs: path in.txt"
+            ]
+        );
+        let put = inputs_answered(case, "put", &INPUTS);
+        assert_eq!(put.status, Some(0), "{:?}", put.err);
+        assert_eq!(put.out, ["gate-remote-inputs: installed 2"]);
+    }
+
+    /// The run of `commit` in the work folder of `case` running `script` in `sh`, with the digest of [`INPUTS`].
+    fn ran_with_inputs(case: &Case, commit: &str, script: &str) -> Ended {
+        let extra = json!({ "Command": ["/bin/sh", "-c", script], "InputsDigest": digest_of(&INPUTS) });
+        ran(&[], &case.request(commit, &extra), Reading::All, &case.base.join("beaten"))
+    }
+
+    /// Checks `ended` was refused `inputs` 75 for `why`, its tag just before its line, before any start marker.
+    fn assert_inputs_refused(ended: &Ended, why: &str) {
+        assert_eq!(ended.status, Some(75), "{:?}", ended.err);
+        assert!(ended.out.is_empty(), "no start marker: {:?}", ended.out);
+        let line = format!("gate: remote inputs of work folder {KEY} are not the ones sent: {}", escaped(why));
+        let tag = ended.err.iter().position(|said| *said == refused_line(NONCE, Refusal::Inputs));
+        assert!(
+            tag.is_some_and(|tag| ended.err.get(tag + 1) == Some(&line)),
+            "the inputs tag, then {line}: {:?}",
+            ended.err
+        );
+    }
+
+    #[test]
+    fn inputs_diffed_and_put_let_a_run_with_their_digest_read_them() {
+        let case = Case::new("inputs");
+        let commit = case.snapshot();
+        inputs_installed(&case);
+
+        let ended = ran_with_inputs(&case, &commit, "cat in.txt cache/x.bin");
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(ended.out, [started_line(NONCE), "input".to_owned(), "cached".to_owned()]);
+        case.ended_clean();
+    }
+
+    #[test]
+    fn an_input_the_command_changed_stays_out_of_the_back_commit_and_refuses_the_next_run_inputs() {
+        let case = Case::new("inputs-changed");
+        let commit = case.snapshot();
+        inputs_installed(&case);
+
+        let ended = ran_with_inputs(&case, &commit, "echo b > a.txt; echo changed > in.txt");
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        let back = case.back().expect("a back commit is pushed");
+        assert_eq!(
+            git(&[&case.bare_dir(), "ls-tree", "-r", "--name-only", &back]),
+            "a.txt",
+            "no input is committed back"
+        );
+        let next = ran_with_inputs(&case, &commit, "true");
+        assert_inputs_refused(&next, "the input in.txt is not the copy installed");
+        assert!(case.lock_free(), "the work lock is free");
+    }
+
+    #[test]
+    fn an_input_changed_between_runs_refuses_the_next_run_inputs() {
+        let case = Case::new("inputs-touched");
+        let commit = case.snapshot();
+        inputs_installed(&case);
+        fs::write(format!("{}/cache/x.bin", case.work()), "other\n").expect("the input changes");
+
+        let ended = ran_with_inputs(&case, &commit, "true");
+
+        assert_inputs_refused(&ended, "the input cache/x.bin is not the copy installed");
+    }
+
+    #[test]
+    fn a_layout_change_removes_the_inputs_record_and_the_next_run_with_the_digest_is_refused() {
+        let case = Case::new("inputs-relaid");
+        let commit = case.snapshot();
+        inputs_installed(&case);
+        let pair = case.request(&commit, &case.pair_with_lib());
+
+        let ended = ran(&[], &pair, Reading::All, &case.base.join("beaten"));
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert!(!Path::new(&case.inputs_record()).exists(), "the record goes with the layout");
+        let next = ran_with_inputs(&case, &commit, "true");
+        assert_inputs_refused(&next, &format!("{} does not exist", case.inputs_record()));
+    }
+
+    #[test]
+    fn a_keyed_prune_removes_the_inputs_record_and_a_leftover_temp_of_it() {
+        let case = Case::new("prune-inputs");
+        inputs_installed(&case);
+        let record = case.inputs_record();
+        let temp = format!("{record}.gate-new-999999-0");
+        fs::write(&temp, "{}").expect("a leftover temp of the record is written");
+
+        let ended = pruned(&["--root", &case.root(), "--keys", KEY], &[]);
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert!(!Path::new(&record).exists(), "the record is removed");
+        assert!(!Path::new(&temp).exists(), "its leftover temp is removed");
+        assert!(!Path::new(&case.work()).exists(), "the work folder is gone");
     }
 
     #[test]
