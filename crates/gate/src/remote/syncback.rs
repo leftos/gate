@@ -3031,7 +3031,7 @@ mod tests {
         assert!(asked(root, &[], &["rev-parse", "--verify", "--quiet", &kept]).is_err(), "no kept ref");
         assert_eq!(quarantine.removed(HANG_GUARD, || {}), None, "the sync-back's removal says nothing");
         assert!(quarantine.folder.join("gate-kept").exists(), "the quarantine stays, marked kept");
-        let said = std::fs::read_to_string(log).expect("the log was written");
+        let said = crate::remote::log_texts(log);
         let owner = "gate: remote changes not applied: the fetched objects could not be moved into the repository: ";
         assert_eq!(said.lines().filter(|line| line.starts_with(owner)).count(), 1, "{said}");
     }
@@ -3159,7 +3159,7 @@ mod tests {
         let fetched = fetch(&mut attempt, &worktree, &remote, &quarantine, 0);
 
         assert!(matches!(fetched, Ok(None)), "{fetched:?}");
-        let said = std::fs::read_to_string(&log).expect("the log was written");
+        let said = crate::remote::log_texts(&log);
         assert!(
             said.contains("gate: builder did not answer the ssh banner; trying again (1 of 3)"),
             "{said}"
@@ -3301,9 +3301,7 @@ mod tests {
 
         /// The lines the sync-back said.
         fn said(&self) -> Vec<String> {
-            std::fs::read_to_string(&self.log)
-                .map(|said| said.lines().map(str::to_owned).collect())
-                .unwrap_or_default()
+            crate::remote::log_texts(&self.log).lines().map(str::to_owned).collect()
         }
 
         /// The commit the repository at `at` keeps at the key's `-back` ref; `None` when it keeps none.

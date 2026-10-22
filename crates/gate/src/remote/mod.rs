@@ -19,6 +19,7 @@ use gate_router::{Builder, FolderId, SendPlan, Target, escaped};
 use gate_state::v1::WarmFailure;
 use gate_state::{FallbackReason, StateRoot, Verdict};
 use gate_win32::{Interrupt, OwnedMutexGuard};
+use gate_wire::stamp::{self, Tag};
 
 use crate::durations::Usual;
 
@@ -361,16 +362,29 @@ impl RemoteOutcome {
     }
 }
 
-/// Appends each of `lines` to `log` and says them on `stream`: the one log-and-console writer the clients say their
-/// lines with.
+/// Appends each of `lines` to `log`, stamped now and tagged `gat`, and says them on `stream` as they are: the one
+/// log-and-console writer the clients say their lines with.
 fn say<S: AsRef<str>>(log: &Path, lines: &[S], mut stream: impl Write) -> Result<(), String> {
     let cannot = |error: io::Error| format!("cannot write to {}: {error}", log.display());
     let mut file = OpenOptions::new().append(true).create(true).open(log).map_err(cannot)?;
     for line in lines {
-        writeln!(file, "{}", line.as_ref()).map_err(cannot)?;
+        writeln!(file, "{}", stamp::stamped(&stamp::now(), Tag::Gat, line.as_ref())).map_err(cannot)?;
         writeln!(stream, "{}", line.as_ref()).map_err(|error| format!("cannot say a line: {error}"))?;
     }
     stream.flush().map_err(|error| format!("cannot say a line: {error}"))
+}
+
+/// The texts of the log at `path` as a case asserts on them: each line without its stamp and tag, ended with a line
+/// feed. A log not written yet, or not UTF-8, reads as nothing.
+#[cfg(all(test, feature = "test-seams"))]
+pub(crate) fn log_texts(path: &Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut texts = String::with_capacity(text.len());
+    for line in text.lines() {
+        texts.push_str(stamp::unstamped(line).text);
+        texts.push('\n');
+    }
+    texts
 }
 
 /// The client `seams` name: the one of `--test-remote-snapshot`, else the Rust client of `--test-remote-transport`,

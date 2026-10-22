@@ -41,6 +41,7 @@ use crate::boxside::run::{
     Beat, Launched, Look, One, Pipes, Prepared, Ran, Request, STARTING_COMMAND, Started, Stopper, box_run_job, command_record, failed, job_made,
     not_started, record_failed, stopped_before_start, unstarted_record_removed, wait_for_path, watch, written_command_record,
 };
+use crate::boxside::stamping;
 use crate::console::Console;
 use crate::remote::{Refusal, install_untrusted_line, refused_line, started_line};
 
@@ -112,8 +113,8 @@ impl Here<'_, '_> {
     /// said together under the output lock, so the PC runs the command itself and journals the fallback `install`.
     fn untrusted(&self, why: &str, console: &mut Console) -> DesktopEnd {
         let _held = self.beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        console.err(&refused_line(self.request.nonce, Refusal::Install));
-        console.err(&install_untrusted_line(why));
+        stamping::protocol(console, &refused_line(self.request.nonce, Refusal::Install));
+        stamping::err(console, &install_untrusted_line(why));
         DesktopEnd::Refused
     }
 
@@ -179,11 +180,11 @@ enum Exchanged {
 /// the helper could not create is said after the marker, as a command that could not be started (127).
 pub(super) fn hand_off(here: &Here<'_, '_>, console: &mut Console) -> Result<Ran, DesktopEnd> {
     let program = identity_of(&here.prepared.application).map_err(|error| here.machinery(with_error(PROGRAM_UNREAD, &error), console))?;
-    let job = match box_run_job(here.request.job, true) {
+    let (job, mut process_lines) = match box_run_job(here.request.job, true) {
         Err(error) if error.kind() != io::ErrorKind::AlreadyExists => {
             return Err(here.machinery(with_error(JOB_UNMADE, &error), console));
         }
-        made => job_made(made, here.request.job, console).map_err(DesktopEnd::Ended)?,
+        made => job_made(made, here.request.job, here.beat, console).map_err(DesktopEnd::Ended)?,
     };
     // Kept until the command's wait is over: the seam's stand-in helper's job holds the command too, nested.
     let (pinned, _stand_in) = pinned_helper(here, &job, console)?;
@@ -192,12 +193,14 @@ pub(super) fn hand_off(here: &Here<'_, '_>, console: &mut Console) -> Result<Ran
         Ok(Exchanged::NotCreated(code)) => return Ok(not_created(here, pinned, code, console)),
         Err(fault) => return Err(ended_on(here, fault, pinned, &job, console)),
     };
+    let helper = pinned.pid;
     release_helper(here, pinned, console);
     let beat = here.beat;
+    beat.say(console, &parent_line(helper, suspended.pid()));
     if let Some(park) = beat.seams.park_launch.as_deref() {
         wait_for_path(park, console);
     }
-    beat.say(console, &started_line(here.request.nonce));
+    beat.say_protocol(console, &started_line(here.request.nonce));
     match beat.stop.look(STARTING_COMMAND) {
         Look::Stopped => return Err(DesktopEnd::Ended(stopped_before_start(&job, beat.lock, console))),
         Look::Go(Some(unread)) => beat.say(console, &unread),
@@ -238,7 +241,14 @@ pub(super) fn hand_off(here: &Here<'_, '_>, console: &mut Console) -> Result<Ran
     };
     let watched = watch(started, console);
     stopper.armed = false;
+    process_lines.finish(&job);
     watched.map_err(DesktopEnd::Ended)
+}
+
+/// The line naming the desktop helper `helper`, a process outside the run's job, as the parent of the command
+/// `command` it created, so the run's process tree joins the command to the box through it.
+fn parent_line(helper: u32, command: u32) -> String {
+    format!("gate: the desktop helper pid={helper} started the command pid={command}")
 }
 
 /// Makes the control pipe, starts the helper's task in the console session with the pipe's name, and checks the
@@ -503,7 +513,7 @@ fn not_created(here: &Here<'_, '_>, pinned: Pinned, code: u32, console: &mut Con
     let ended = end_within(&Watched::new(here, &process), here.limits.end, Instant::now, true);
     say_unended(here, pid, &ended, console);
     sweep(here, pid, created, console);
-    here.beat.say(console, &started_line(here.request.nonce));
+    here.beat.say_protocol(console, &started_line(here.request.nonce));
     let message = gate_win32::win32_message(code);
     Ran::Exited(not_started(console, here.prepared.word, Some(&here.prepared.program), &message))
 }

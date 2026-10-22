@@ -34,6 +34,7 @@ use crate::boxside::helper_trusted;
 use crate::boxside::msys;
 use crate::boxside::probe;
 use crate::boxside::run::{self, FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_SINGLE, StopSignal, WaitEnd, Watched, Watching};
+use crate::boxside::stamping;
 use crate::boxside::stop::terminate_and_wait;
 use crate::console::Console;
 use crate::environment::Variables;
@@ -106,8 +107,8 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
             .map_err(|error| format!("the desktop helper's path cannot be read: {error}"))
             .and_then(|helper| helper_trusted(&helper))
     {
-        console.out(&format!("gate: remote version {}", build_version()));
-        console.err(&install_untrusted_line(&why));
+        stamping::out(console, &format!("gate: remote version {}", build_version()));
+        stamping::err(console, &install_untrusted_line(&why));
         return u32::from(INSTALL_STATUS);
     }
     let read = payload
@@ -116,7 +117,7 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
     let (bare, work, pair) = match read {
         Ok(folders) => folders,
         Err(line) => {
-            console.err(&line);
+            stamping::err(console, &line);
             return u32::from(USAGE_STATUS);
         }
     };
@@ -146,14 +147,14 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
     let made = match readied {
         Ok(made) => made,
         Err(failed) => {
-            console.err(&failed.line);
+            stamping::err(console, &failed.line);
             return failed.status;
         }
     };
-    console.out(&format!("gate: remote version {}", build_version()));
-    console.out(&format!("gate: remote warm {}", warm.as_deref().unwrap_or("none")));
+    stamping::out(console, &format!("gate: remote version {}", build_version()));
+    stamping::out(console, &format!("gate: remote warm {}", warm.as_deref().unwrap_or("none")));
     if made || interrupted || relaid {
-        console.out(NEW_WORK_TREE);
+        stamping::out(console, NEW_WORK_TREE);
     }
     boot::say(console);
     // The run puts Git's `bin` at the front of its command's `PATH` when it finds a trusted one; a machine `PATH` that
@@ -161,7 +162,7 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
     // before the command runs. The client relays a preflight's lines into the log only, so this one never reaches the
     // console.
     if msys::git_bin(&Git::find(), &refused_folders(payload, work)).is_none() {
-        console.out(msys::NO_GIT_BIN);
+        stamping::out(console, msys::NO_GIT_BIN);
     }
     say_sdks_and_tools(payload, work, seams, console);
     0
@@ -175,29 +176,35 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
 /// line ([`root_busy_line`]) for one another process holds open with delete access, or without sharing reading.
 fn held_work_root(work: &str, bare: &str, paired: bool, seams: &BoxSeams, console: &mut Console) -> Result<File, u32> {
     let Some(root) = work_root(work, PathForm::Windows) else {
-        console.err(&format!(
-            r"gate: box payload Work must be <root>\work\<key> to lock its root down: {}",
-            escaped(work)
-        ));
+        stamping::err(
+            console,
+            &format!(
+                r"gate: box payload Work must be <root>\work\<key> to lock its root down: {}",
+                escaped(work)
+            ),
+        );
         return Err(u32::from(USAGE_STATUS));
     };
     // A pair's bare repositories were checked against the root as its layout was read. A drive's own root is compared
     // without its separator, as the bare repository's folder is cut.
     if !paired && bare_stem(bare, root.trim_end_matches(['\\', '/']), PathForm::Windows).is_none() {
-        console.err(&format!(
-            r"gate: box payload Bare must be <root>\<name>.git to lock its root down: {}",
-            escaped(bare)
-        ));
+        stamping::err(
+            console,
+            &format!(
+                r"gate: box payload Bare must be <root>\<name>.git to lock its root down: {}",
+                escaped(bare)
+            ),
+        );
         return Err(u32::from(USAGE_STATUS));
     }
     gate_win32::check_work_root(Path::new(&root), seams.root_walk_stop.as_deref()).map_err(|why| {
-        console.out(&format!("gate: remote version {}", build_version()));
+        stamping::out(console, &format!("gate: remote version {}", build_version()));
         let line = if why.is_busy() {
             root_busy_line(&why.to_string())
         } else {
             root_unsafe_line(&why.to_string())
         };
-        console.err(&line);
+        stamping::err(console, &line);
         u32::from(ROOT_STATUS)
     })
 }
@@ -233,7 +240,7 @@ fn say_sdks_and_tools(payload: &Payload, work: &str, seams: &BoxSeams, console: 
             console,
         );
         if let Err(line) = &names {
-            console.err(line);
+            stamping::err(console, line);
         }
         let Some((names, probes)) = probes else {
             return;
@@ -243,7 +250,7 @@ fn say_sdks_and_tools(payload: &Payload, work: &str, seams: &BoxSeams, console: 
             names.iter().map(|name| (name.clone(), probe::Probed::Skipped(why.clone()))).collect()
         });
         for (name, probed) in found {
-            console.out(&probe::tool_line(&name, &probed));
+            stamping::out(console, &probe::tool_line(&name, &probed));
         }
     });
 }
@@ -403,7 +410,7 @@ fn create_bare(git: &Git, bare: &str, name: Option<&str>, console: &mut Console)
             .map_err(|why| failed_for(Failed::without_status(format!("gate: remote {step} failed: {why}")), step, name))?;
         git.step(&for_repo(step, name), &["init", "--bare", "-q", "--", bare], GitClass::ShortBare, console)
             .map_err(|failed| failed_for(failed, step, name))?;
-        console.out(&format!("gate: remote created {bare}"));
+        stamping::out(console, &format!("gate: remote created {bare}"));
     }
     Ok(())
 }
@@ -505,11 +512,14 @@ fn ready_new_tree(git: &impl TreeGit, at: &TreeAt<'_>, name: Option<&str>, conso
         if let Err(error) = remove_entry(Path::new(at.warm)) {
             if !git.holds_the_lock() {
                 // The preflight leaves the tree to the run, which removes the record under the lock or is refused.
-                console.err(&format!(
-                    "gate: remote could not remove {}: {}",
-                    gate_router::escaped(at.warm),
-                    gate_router::escaped(&error.to_string())
-                ));
+                stamping::err(
+                    console,
+                    &format!(
+                        "gate: remote could not remove {}: {}",
+                        gate_router::escaped(at.warm),
+                        gate_router::escaped(&error.to_string())
+                    ),
+                );
                 return Ok(true);
             }
             return Err(Unready::Folder(format!("cannot remove {}: {error}", at.warm)));
@@ -520,7 +530,7 @@ fn ready_new_tree(git: &impl TreeGit, at: &TreeAt<'_>, name: Option<&str>, conso
         configure(git, bare, tree, name, console)?;
     }
     if let Some(line) = write_alternates(bare, tree, git.holds_the_lock()).map_err(Unready::Folder)? {
-        console.err(&line);
+        stamping::err(console, &line);
     }
     Ok(made)
 }
@@ -1280,7 +1290,7 @@ pub(crate) fn run_git(
     let (ran, all_ended) = git_ran(command, step, streams, shared, console)?;
     if !all_ended {
         let _held = shared.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        console.err(Watching::Git.leftover());
+        stamping::err(console, Watching::Git.leftover());
     }
     if shared.gone.load(Ordering::SeqCst) {
         return Err(GitFailure::ClientGone);
@@ -1400,7 +1410,7 @@ fn ended(job: &Job, forwarders: Forwarders, failure: GitFailure, step: GitStep<'
     let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
     match ending {
         Ok(ending) => ending.say(&name, console),
-        Err(error) => console.err(&format!("gate: remote could not stop job {name}: {error}")),
+        Err(error) => stamping::err(console, &format!("gate: remote could not stop job {name}: {error}")),
     }
     failure
 }
@@ -1437,7 +1447,7 @@ fn readers(stdout: File, stderr: File, stdin: Option<File>, streams: &Streams<'_
     let forwarders = Forwarders::start_git(
         forward_out,
         forward_err,
-        crate::boxside::forward::Stamping::None,
+        stamping::forwarded(),
         crate::boxside::forward::Sink::Own {
             lock: shared.lock,
             gone: shared.gone,
@@ -1517,8 +1527,8 @@ pub(crate) fn locate(word: &str) -> Result<Option<PathBuf>, String> {
 /// that cannot be read is said on stderr instead, and fails nothing.
 fn say_sdks(limit: Duration, drain: Duration, console: &mut Console) {
     match sdks(limit, drain) {
-        Ok(list) => console.out(&format!("gate: remote sdks {list}")),
-        Err(message) => console.err(&format!("gate: remote could not read the SDK list: {message}")),
+        Ok(list) => stamping::out(console, &format!("gate: remote sdks {list}")),
+        Err(message) => stamping::err(console, &format!("gate: remote could not read the SDK list: {message}")),
     }
 }
 

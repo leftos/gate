@@ -12,6 +12,7 @@ use gate_win32::{Job, NamedEvent, OpenedJob};
 use gate_wire::Payload;
 
 use crate::answer::USAGE_STATUS;
+use crate::boxside::stamping;
 use crate::console::Console;
 
 /// The exit code the job's processes are ended with.
@@ -33,7 +34,7 @@ pub(crate) fn stop(payload: &Payload, console: &mut Console) -> u32 {
     let name = match payload.key().and_then(|key| payload.job(key)) {
         Ok(name) => name,
         Err(line) => {
-            console.err(&line);
+            stamping::err(console, &line);
             return u32::from(USAGE_STATUS);
         }
     };
@@ -60,15 +61,15 @@ fn said(name: &str, stopped: io::Result<Option<usize>>, console: &mut Console) -
     match stopped {
         Ok(None) => 0,
         Ok(Some(0)) => {
-            console.out(&format!("gate: remote stopped job {name}"));
+            stamping::out(console, &format!("gate: remote stopped job {name}"));
             0
         }
         Ok(Some(left)) => {
-            console.err(&still_holding(name, left));
+            stamping::err(console, &still_holding(name, left));
             FAILED_STATUS
         }
         Err(error) => {
-            console.err(&format!("gate: remote could not stop job {name}: {error}"));
+            stamping::err(console, &format!("gate: remote could not stop job {name}: {error}"));
             FAILED_STATUS
         }
     }
@@ -143,7 +144,7 @@ impl Ending {
     /// failed, when one did.
     pub(crate) fn say(&self, name: &str, console: &mut Console) {
         if self.left > 0 {
-            console.err(&still_holding(name, self.left));
+            stamping::err(console, &still_holding(name, self.left));
         }
         self.say_late(name, console);
     }
@@ -151,7 +152,7 @@ impl Ending {
     /// Says why a terminate of the job `name` after the first failed, when one did.
     pub(crate) fn say_late(&self, name: &str, console: &mut Console) {
         if let Some(error) = &self.late {
-            console.err(&format!("gate: remote could not terminate job {name} again: {error}"));
+            stamping::err(console, &format!("gate: remote could not terminate job {name} again: {error}"));
         }
     }
 }
@@ -206,7 +207,7 @@ fn signal(name: &str, console: &mut Console) {
         Err(error) => Err(error),
     };
     if let Err(error) = set {
-        console.err(&format!("gate: remote could not signal the stop of job {name}: {error}"));
+        stamping::err(console, &format!("gate: remote could not signal the stop of job {name}: {error}"));
     }
 }
 

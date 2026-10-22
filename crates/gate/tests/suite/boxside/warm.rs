@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 use regex::Regex;
 
+use super::ReadBack;
 use super::{
     BUN_LOCKFILE, BUN_LOCKFILE_PATH, ENDLESS, ENGINE_ENV_NAME, Folders, NODE_MODULES_IGNORED, NPM_LOCKFILE, NPM_LOCKFILE_PATH, PNPM_LOCKFILE,
     PNPM_LOCKFILE_PATH, STALE_UE_ROOT, box_call, bun_install_call, command_call, engine_env, fake_godot, fake_unreal, field, gate_box, godot_root,
@@ -277,7 +278,7 @@ fn box_warm_up_stopped_between_commands_runs_no_more() {
 
     let stopped = gate_box(&case, "stop", &payload_word, None);
     let_go(&park);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     assert_eq!(stopped.code, Some(0), "{stopped:?}");
     assert_eq!(outcome.code, Some(1), "a stop before the second command fails the warm-up: {outcome:?}");
@@ -328,7 +329,7 @@ fn box_warm_up_restores_pnpm_packages_before_its_marker() {
     );
     let stub = stub_pnpm(&case, 0, "");
 
-    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let work = field(&payload, "Work");
@@ -355,7 +356,7 @@ fn box_warm_up_restores_bun_packages_before_its_marker() {
     );
     let stub = stub_bun(&case, 0, "");
 
-    let outcome = pnpm_box(&case, &payload, &path_for_bun(&[stub])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_bun(&[stub])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let work = field(&payload, "Work");
@@ -391,7 +392,7 @@ fn box_warm_up_refuses_commands_that_need_pnpm_and_bun_in_one_folder() {
     );
     let path = path_for_bun(&[stub_pnpm(&case, 0, ""), stub_bun(&case, 0, "")]);
 
-    let outcome = pnpm_box(&case, &payload, &path).finish();
+    let outcome = pnpm_box(&case, &payload, &path).finish_read();
 
     assert_eq!(outcome.code, Some(75), "{outcome:?}");
     let said: Vec<&str> = outcome.stderr.lines().collect();
@@ -418,7 +419,7 @@ fn box_warm_up_installs_npm_once_for_npm_and_npx_commands_in_one_folder() {
     );
     let stub = stub_npm(&case, 0, "");
 
-    let outcome = pnpm_box(&case, &payload, &path_for_npm(&[stub])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_npm(&[stub])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let work = field(&payload, "Work");
@@ -454,7 +455,7 @@ fn box_warm_up_skips_npm_in_a_folder_with_a_pnpm_lockfile() {
     );
     let path = path_for_npm(&[stub_pnpm(&case, 0, ""), stub_npm(&case, 0, "")]);
 
-    let outcome = pnpm_box(&case, &payload, &path).finish();
+    let outcome = pnpm_box(&case, &payload, &path).finish_read();
 
     assert_eq!(outcome.code, Some(0), "pnpm's lockfile folder is no npm folder: {outcome:?}");
     let said: Vec<&str> = outcome.stderr.lines().collect();
@@ -493,7 +494,7 @@ fn box_warm_up_names_the_first_two_of_three_managers_in_one_folder() {
     );
     let path = path_for_npm(&[stub_pnpm(&case, 0, ""), stub_bun(&case, 0, ""), stub_npm(&case, 0, "")]);
 
-    let outcome = pnpm_box(&case, &payload, &path).finish();
+    let outcome = pnpm_box(&case, &payload, &path).finish_read();
 
     assert_eq!(outcome.code, Some(75), "{outcome:?}");
     let said: Vec<&str> = outcome.stderr.lines().collect();
@@ -629,7 +630,7 @@ fn box_warm_up_installs_once_for_a_lockfile_folder_named_in_two_cases() {
     );
     let stub = stub_pnpm(&case, 0, "");
 
-    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(installs(&case), 1, "one install for the one folder: {:?} {outcome:?}", pnpm_calls(&case));
@@ -644,7 +645,7 @@ fn box_warm_up_says_a_pnpm_skip_once_for_commands_that_share_it() {
     snapshot(&case, &mut payload, &[NODE_MODULES_IGNORED, (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE)]);
     let stub = stub_pnpm(&case, 0, "");
 
-    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(

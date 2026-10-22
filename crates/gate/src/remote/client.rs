@@ -16,6 +16,7 @@
 //! but the run call, whose output is passed on whole. The run takes the work-folder key's lock ([`hold_key`], then
 //! [`hold_key_waiting`] in slices from `run.rs` up to its bound) before its remote slot.
 
+use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::num::NonZeroU64;
@@ -36,6 +37,7 @@ use gate_state::v1::{self, WarmFailure};
 use gate_state::{FallbackReason, KernelObject, key_hash};
 use gate_win32::{AcquireError, Interrupt, Job, NamedMutex, OwnedMutexGuard, PipedConsole, Running, Share};
 use gate_wire::build_version;
+use gate_wire::stamp::{self, Tag};
 use jiff::{SignedDuration, Timestamp};
 use regex::Regex;
 
@@ -4104,12 +4106,29 @@ impl Reader {
         }
         let mut piece = std::mem::take(&mut self.pending);
         piece.extend_from_slice(part);
-        if self.head.is_none() {
+        let first = self.head.is_none();
+        if first {
             let start = String::from_utf8_lossy(piece.get(..LINE_CAP).unwrap_or(&piece));
-            self.head = Some(watchdog::truncated(&start).to_owned());
+            self.head = Some(watchdog::truncated(stamp::unstamped(&start).text).to_owned());
         }
-        self.streamed(piece, ended, shared);
+        self.mark_line(shared);
+        self.streamed(piece, ended, first, shared);
         true
+    }
+
+    /// Marks the call's progress for a line, or a piece of one, of a run call, whose bytes are not marked as they come
+    /// ([`relay`]): the box's lines then mark it, its process lines excepted, so a command that only starts processes
+    /// still stalls.
+    fn mark_line(&self, shared: &Shared) {
+        if self.marks_lines() {
+            shared.progress.mark();
+        }
+    }
+
+    /// Whether this reader marks the call's progress per line rather than per chunk read: a run call's does. A setup
+    /// call's git progress ends its updates with a carriage return and no line feed, so its chunks mark it.
+    fn marks_lines(&self) -> bool {
+        self.reading.lines.is_some()
     }
 
     /// `part` less what a git call's reading drops of its progress updates: at a carriage return that more bytes
@@ -4143,60 +4162,78 @@ impl Reader {
     fn finish(&mut self, shared: &Shared) {
         let bytes = std::mem::take(&mut self.pending);
         if self.head.is_some() {
-            self.streamed(bytes, true, shared);
+            self.streamed(bytes, true, false, shared);
         } else if !bytes.is_empty() {
             self.line_ended(&bytes, shared);
         }
     }
 
     /// A whole line, `bytes`, came: it is passed on and kept, unless it is past the cap of a capped reading, which
-    /// stops, `false`. The box's heartbeat, start marker and refusal tag are kept but never passed on.
+    /// stops, `false`. The box's heartbeat, start marker and refusal tag, matched on the line as it came, are kept but
+    /// never passed on. Every other line is read once without its stamp: the log gets it as it came, stamped `gat` now
+    /// when it came with none, and the console and what is kept get its text. A process line is logged alone: it is
+    /// neither echoed nor kept, and marks no progress.
     fn line_ended(&mut self, bytes: &[u8], shared: &Shared) -> bool {
         if self.reading.capped && watchdog::too_long(bytes) {
             shared.progress.cut_too_long();
             return false;
         }
         let line = line_of(bytes, self.reading.echo);
+        // Matched before any unstamping, so a command's own line, stamped by the box, never reads as one.
         let protocol = self.reading.protocol(&line, self.error);
         if protocol == Some(Protocol::Started) {
             shared.progress.mark_started();
         }
-        if protocol.is_none() && !(self.error && is_heartbeat(&line)) {
-            self.passed(&line, true, shared);
+        if protocol.is_some() || (self.error && is_heartbeat(&line)) {
+            self.mark_line(shared);
+            held(&shared.heard).record(&line, self.error, protocol);
+            return true;
         }
-        held(&shared.heard).record(&line, self.error, protocol);
+        let read = stamp::unstamped(&line);
+        if read.tag == Some(Tag::Gat) && stamp::is_process_line(read.text) {
+            self.passed(&line, None, true, shared);
+            return true;
+        }
+        self.mark_line(shared);
+        self.passed(&logged_line(&line, read.tag), Some(read.text), true, shared);
+        held(&shared.heard).record(read.text, self.error, None);
         true
     }
 
     /// Passes on `piece`, the next of a line past the cap, which ends it when `ended`; else the start of a character
-    /// it cuts waits for the next piece. The line's head is kept once it ends.
-    fn streamed(&mut self, mut piece: Vec<u8>, ended: bool, shared: &Shared) {
-        if ended {
-            self.passed(&line_of(&piece, self.reading.echo), true, shared);
-            if let Some(head) = self.head.take() {
-                held(&shared.heard).record(&head, self.error, None);
+    /// it cuts waits for the next piece. The `first` piece alone may carry the line's stamp: the log gets it as it
+    /// came, stamped `gat` now when it came with none, and the console its text. The line's head is kept once it ends.
+    fn streamed(&mut self, mut piece: Vec<u8>, ended: bool, first: bool, shared: &Shared) {
+        let text = if ended {
+            line_of(&piece, self.reading.echo)
+        } else {
+            let mut whole = watchdog::complete(&piece);
+            // A carriage return may start the line end the next piece finishes: it waits for it.
+            if whole > 0 && piece.get(whole - 1) == Some(&b'\r') {
+                whole -= 1;
             }
-            return;
+            self.pending = piece.split_off(whole);
+            String::from_utf8_lossy(&piece).into_owned()
+        };
+        if first {
+            let read = stamp::unstamped(&text);
+            self.passed(&logged_line(&text, read.tag), Some(read.text), ended, shared);
+        } else {
+            self.passed(&text, Some(&text), ended, shared);
         }
-        let mut whole = watchdog::complete(&piece);
-        // A carriage return may start the line end the next piece finishes: it waits for it.
-        if whole > 0 && piece.get(whole - 1) == Some(&b'\r') {
-            whole -= 1;
+        if ended && let Some(head) = self.head.take() {
+            held(&shared.heard).record(&head, self.error, None);
         }
-        self.pending = piece.split_off(whole);
-        self.passed(&String::from_utf8_lossy(&piece), false, shared);
     }
 
-    /// Writes `text`, with a line end when `end`, to the log unless the reading keeps it out or the call's output has
-    /// passed the log cap, which the log is told once, and on its own stream when it echoes to the console, past the
-    /// cap too; the first failure to is kept.
-    fn passed(&mut self, text: &str, end: bool, shared: &Shared) {
-        let mut said = String::with_capacity(text.len() + 1);
-        said.push_str(text);
-        if end {
-            said.push('\n');
-        }
+    /// Writes `logged`, with a line end when `end`, to the log unless the reading keeps it out or the call's output
+    /// has passed the log cap, which the log is told once, its bytes as written counting toward the cap; and `shown`,
+    /// when there is one, on its own stream when it echoes to the console, past the cap too; the first failure to is
+    /// kept.
+    fn passed(&mut self, logged: &str, shown: Option<&str>, end: bool, shared: &Shared) {
+        let line_end = if end { "\n" } else { "" };
         if let Some(log) = &mut self.log {
+            let said = format!("{logged}{line_end}");
             let written = match shared.charged(said.len(), self.reading.log_cap) {
                 Logged::Write => {
                     self.log_open = !end;
@@ -4213,7 +4250,10 @@ impl Reader {
                 held(&shared.heard).failed(format!("cannot write to the log: {error}"));
             }
         }
-        if self.reading.echo == Echo::Console {
+        if let Some(shown) = shown
+            && self.reading.echo == Echo::Console
+        {
+            let said = format!("{shown}{line_end}");
             let written = if self.error {
                 say_on(io::stderr().lock(), &said)
             } else {
@@ -4226,12 +4266,20 @@ impl Reader {
     }
 }
 
-/// The line the log of a call whose output passed the log cap `cap` gets, once, with its line end.
+/// `line` as the log gets it: as it came when it came stamped, its read `tag` given, else stamped now and tagged
+/// `gat`, as a line of an older box or of a setup call comes.
+fn logged_line(line: &str, tag: Option<Tag>) -> Cow<'_, str> {
+    match tag {
+        Some(_) => Cow::Borrowed(line),
+        None => Cow::Owned(stamp::stamped(&stamp::now(), Tag::Gat, line)),
+    }
+}
+
+/// The line the log of a call whose output passed the log cap `cap` gets, once, stamped and tagged `gat`, with its
+/// line end.
 fn log_cut_line(cap: u64) -> String {
-    format!(
-        "gate: the builder's output passed {}; the rest is not logged\n",
-        watchdog::whole_size(cap)
-    )
+    let text = format!("gate: the builder's output passed {}; the rest is not logged", watchdog::whole_size(cap));
+    format!("{}\n", stamp::stamped(&stamp::now(), Tag::Gat, &text))
 }
 
 /// Reads `stream` on a thread of its own as [`relay`] does, then says so on `done`.
@@ -4289,7 +4337,7 @@ fn relay_raw(mut stream: impl Read, sink: &mut impl Write, shown: &str, shared: 
 }
 
 /// Reads `stream` line by line through `reader` until it ends, or a capped reading meets a line past the cap, each
-/// byte that comes marking the call's progress; each line without its line end, read as UTF-8 with U+FFFD for what is
+/// chunk that comes marking the call's progress, or for a run call each line but a process line ([`Reader::take`]); each line without its line end, read as UTF-8 with U+FFFD for what is
 /// not. Neither a write nor a wait for one is made under the lock the watcher could take.
 fn relay(stream: impl Read, mut reader: Reader, shared: &Shared) {
     let mut buffered = BufReader::new(stream);
@@ -4305,7 +4353,9 @@ fn relay(stream: impl Read, mut reader: Reader, shared: &Shared) {
                 return;
             }
         };
-        shared.progress.mark();
+        if !reader.marks_lines() {
+            shared.progress.mark();
+        }
         let (part, used, ended) = match chunk.iter().position(|byte| *byte == b'\n') {
             Some(end) => (chunk.get(..end).unwrap_or(chunk), end + 1, true),
             None => (chunk, chunk.len(), false),
@@ -4872,13 +4922,16 @@ mod tests {
             reader.join().expect("a reader ends");
         }
         drop(file);
-        let said = fs::read_to_string(&log).expect("the log can be read");
+        let said = crate::remote::log_texts(&log);
         fs::remove_file(&log).expect("the log can be removed");
 
         let cut = "gate: the builder's output passed 4 KiB; the rest is not logged";
         assert_eq!(said.lines().filter(|line| *line == cut).count(), 1, "{said}");
         let logged: Vec<&str> = said.lines().filter(|line| *line != cut).collect();
-        assert_eq!(logged.len(), 40, "the whole lines that fit under the cap: {said}");
+        // Each line is logged stamped `gat` on arrival, and the cap counts the bytes written, its stamp among them.
+        let written = 101 + "2026-10-22T09:31:38.120001-07:00 gat ".len();
+        let fit = usize::try_from(CAP).expect("the cap fits a usize") / written;
+        assert_eq!(logged.len(), fit, "the whole lines that fit under the cap: {said}");
         assert!(logged.iter().all(|line| line.len() == 100), "{said}");
     }
 
@@ -6648,7 +6701,7 @@ mod tests {
         relay(stderr.as_bytes(), Reader::new(true, reading, Some(file)), &shared);
         let heard = std::mem::take(&mut *held(&shared.heard));
         let called = called_of(CallEnd::Exited(status), Raised::default(), heard).expect("a call that ended");
-        let said = std::fs::read_to_string(&log).expect("the log can be read");
+        let said = crate::remote::log_texts(&log);
         std::fs::remove_file(&log).expect("the log can be removed");
         (called, said)
     }
@@ -6783,9 +6836,9 @@ mod tests {
 
         let shared = read_through(input.as_bytes(), false, Some(&log));
 
-        let written = std::fs::read(&log).expect("the log was written");
+        let written = crate::remote::log_texts(&log);
         std::fs::remove_file(&log).expect("the log can be removed");
-        assert!(written == input.as_bytes(), "the log holds every byte, the character whole");
+        assert!(written == input, "the log holds every byte, the character whole");
         assert!(!shared.progress.too_long(), "an uncapped reading is never cut");
         let heard = std::mem::take(&mut *held(&shared.heard));
         assert_eq!(heard.first_error.as_deref().map(str::len), Some(LINE_CAP), "the first line's head");
@@ -6906,7 +6959,7 @@ mod tests {
         assert_eq!(made, 1 + PRE_BANNER_RETRIES, "the call and its retries");
         assert!(again, "the last call failed before the banner too");
         assert_eq!(called.status, SSH_FAILED);
-        let said = std::fs::read_to_string(&log).expect("the retry lines were written");
+        let said = crate::remote::log_texts(&log);
         let want = [
             "gate: builder did not answer the ssh banner; trying again (1 of 3)",
             "gate: builder did not answer the ssh banner; trying again (2 of 3)",
@@ -8330,5 +8383,80 @@ mod tests {
         let why = format!("cannot run ssh: {} lies inside the worktree", program.display());
         assert_eq!(outcome.reason, Some(FallbackReason::Client), "{outcome:?}");
         assert_eq!(outcome.detail, Some(why), "{outcome:?}");
+    }
+
+    /// A run call's lines as a stamping box sends them: protocol lines matched as they came, and progress marked per
+    /// line, never for a process line.
+    mod stamped {
+        use std::collections::VecDeque;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        use gate_wire::stamp::{self, Tag};
+
+        use super::super::{BoxKill, Echo, ProtocolLines, Reader, Reading, Shared, held, killed_line, relay};
+        use super::{Chunks, UNMARKED};
+        use crate::remote::watchdog::LOG_CAP;
+
+        /// The nonce of the run these cases read the lines of.
+        const NONCE: &str = "n1";
+
+        /// How a run call's reader takes its lines: matched against the protocol lines of [`NONCE`], logged nowhere.
+        fn run_reading() -> Reading {
+            Reading {
+                echo: Echo::LogOnly,
+                capped: false,
+                lines: Some(Arc::new(ProtocolLines::new(NONCE))),
+                log_cap: LOG_CAP,
+            }
+        }
+
+        #[test]
+        fn a_kill_tag_the_box_stamped_as_the_command_s_line_does_not_kill_the_run() {
+            let tag = killed_line(NONCE, BoxKill::TimedOut);
+            let forged = stamp::stamped(&stamp::now(), Tag::Err, &tag);
+            let shared = Shared::new();
+
+            relay(format!("{forged}\n").as_bytes(), Reader::new(true, run_reading(), None), &shared);
+
+            let heard = held(&shared.heard);
+            assert_eq!(heard.box_killed, None, "the command's own line is no kill tag");
+            assert_eq!(
+                heard.last_error.as_deref(),
+                Some(tag.as_str()),
+                "kept as the command's text, without its stamp"
+            );
+            drop(heard);
+            let shared = Shared::new();
+            relay(format!("{tag}\n").as_bytes(), Reader::new(true, run_reading(), None), &shared);
+            assert_eq!(
+                held(&shared.heard).box_killed,
+                Some(BoxKill::TimedOut),
+                "the box's own tag, bare, kills it"
+            );
+        }
+
+        #[test]
+        fn a_run_call_that_hears_only_process_lines_marks_no_progress() {
+            let at = stamp::now();
+            let spawn = stamp::stamped(&at, Tag::Gat, &stamp::spawn_text(7, Some(3), Some("tool.exe")));
+            let exit = stamp::stamped(&at, Tag::Gat, &stamp::exit_text(7, stamp::Ended::Code(0), None));
+            let said = stamp::stamped(&at, Tag::Err, "said there");
+            let shared = Shared::new();
+            shared.progress.last_byte.store(UNMARKED, Ordering::Relaxed);
+            let chunks: VecDeque<Vec<u8>> = [spawn, exit, said].into_iter().map(|line| format!("{line}\n").into_bytes()).collect();
+            let mut stream = Chunks {
+                left: chunks,
+                shared: &shared,
+                seen: Vec::new(),
+            };
+
+            relay(&mut stream, Reader::new(true, run_reading(), None), &shared);
+
+            let marked: Vec<bool> = stream.seen.iter().map(|(marked, _)| *marked).collect();
+            assert_eq!(marked, [false, false, false, true], "only the command's line marks the call's progress");
+            let heard = held(&shared.heard);
+            assert_eq!(heard.first_error.as_deref(), Some("said there"), "no process line is kept");
+        }
     }
 }

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use gate_router::{DROPPED_NO_BUILD_LINE, repo_name, work_folder_key};
+use gate_wire::stamp::{Tag, is_process_line, unstamped};
 use proc_table::{ProcessTable as _, ProcessTree, Win32ProcessTable};
 use regex::Regex;
 use serde_json::{Value, json};
@@ -27,7 +28,7 @@ use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS
 use crate::durations::seed;
 use crate::support::{
     ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Junction, NetfxKey, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running,
-    STEPS_VARIABLE, allow_breakaway, assert_in_order, beside, build_version, calls, copy_tool, events, finish, git, git_init, heavy_words,
+    STEPS_VARIABLE, allow_breakaway, assert_in_order, beside, build_version, calls, copy_tool, events, finish, git, git_init, heavy_words, log_texts,
     nothing_back, release, shown, ssh_steps, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
 };
 
@@ -110,7 +111,7 @@ fn said(case: &Case, outcome: &Outcome, log: &str) -> (String, Option<String>) {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let lines: Vec<&str> = outcome.stderr.lines().filter(|line| line.starts_with(SAID)).collect();
     assert_eq!(lines.len(), 1, "one snapshot line: {outcome:?}");
-    let logged = fs::read_to_string(case.folder().join(log)).expect("the log was written");
+    let logged = log_texts(&case.folder().join(log));
     assert_eq!(logged.lines().filter(|line| *line == lines[0]).count(), 1, "{logged}");
     let (commit, bridge) = lines[0][SAID.len()..].split_once(" bridge ").expect("the line names the bridge");
     assert!(is_sha(commit), "a full commit: {commit}");
@@ -572,7 +573,7 @@ fn builder_ref(case: &Case, name: &str) -> String {
 
 /// The 8 hex digits of the snapshot the run logging to `log` pushed, from its `gate: pushed snapshot <8> in …` line.
 fn pushed_snapshot(case: &Case, log: &str) -> String {
-    let text = fs::read_to_string(case.folder().join(log)).expect("the log was written");
+    let text = log_texts(&case.folder().join(log));
     let line = text
         .lines()
         .find(|line| line.starts_with("gate: pushed snapshot "))
@@ -637,7 +638,7 @@ fn a_routed_run_runs_on_the_box_and_passes_its_output_and_status() {
     assert!(outcome.stdout.contains("ran there"), "{outcome:?}");
     assert!(outcome.stderr.contains("gate: pushed snapshot "), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight", "run"]);
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(log.contains("ran there") && log.contains("gate: pushed snapshot "), "{log}");
     let events = events(&case);
     assert_eq!(fallbacks(&events), Vec::<&str>::new(), "{events:#?}");
@@ -647,6 +648,77 @@ fn a_routed_run_runs_on_the_box_and_passes_its_output_and_status() {
     assert!(is_sha(&snapshot), "the builder holds the snapshot: {snapshot:?}");
     assert_eq!(git_out(&case, &[], &["rev-parse", &format!("refs/gate-remote/{key}")]), snapshot);
     assert!(log.contains(&format!("gate: pushed snapshot {} in ", &snapshot[..8])), "{log}");
+}
+
+/// The words of each `gat` process line of `log` that starts with `start`, its text split at spaces.
+fn process_words<'l>(log: &'l str, start: &str) -> Vec<Vec<&'l str>> {
+    log.lines()
+        .map(unstamped)
+        .filter(|line| line.tag == Some(Tag::Gat) && is_process_line(line.text) && line.text.starts_with(start))
+        .map(|line| line.text.split(' ').collect())
+        .collect()
+}
+
+/// The box stamps its lines at the source and the PC writes them to its log as they came: the command's own as
+/// `out` and `err`, which no PC stamp would tag, and the box's process lines, its root and the command's spawn naming
+/// the box as its parent, then the command's exit.
+#[test]
+fn a_routed_run_logs_the_box_s_stamped_lines_and_its_process_lines_as_they_came() {
+    let case = client_case("client-stamped");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(
+        &case,
+        "out.log",
+        &steps,
+        &[r".\tool.exe", "out", "ran there", "err", "said there"],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let read: Vec<_> = log.lines().map(unstamped).collect();
+    assert!(read.iter().all(|line| line.stamp.is_some()), "every line is stamped: {log}");
+    assert!(read.iter().any(|line| line.tag == Some(Tag::Out) && line.text == "ran there"), "{log}");
+    assert!(read.iter().any(|line| line.tag == Some(Tag::Err) && line.text == "said there"), "{log}");
+    let spawns = process_words(&log, "spawn pid=");
+    let tool = spawns
+        .iter()
+        .find(|words| words.last() == Some(&"tool.exe"))
+        .expect("the command's spawn is logged");
+    let parent = tool[2].strip_prefix("ppid=").expect("a spawn names its parent");
+    assert!(
+        process_words(&log, "gate pid=").iter().any(|words| words[1] == format!("pid={parent}")),
+        "the command's parent is the box, whose root line is logged: {log}"
+    );
+    assert!(
+        process_words(&log, "exit pid=")
+            .iter()
+            .any(|words| words[1] == tool[1] && words[2] == "code=0"),
+        "the command's exit is logged: {log}"
+    );
+}
+
+/// What a routed run says on the console, the log's tail of a failed run among it, carries no stamp and no process
+/// line.
+#[test]
+fn a_routed_run_s_console_shows_no_stamp_and_no_process_line() {
+    let case = client_case("client-stamped-console");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+
+    let outcome = finish(client_gate(
+        &case,
+        "out.log",
+        &steps,
+        &[r".\tool.exe", "out", "ran there", "err", "said there", "exit", "3"],
+    ));
+
+    assert_eq!(outcome.code, Some(3), "{outcome:?}");
+    assert!(outcome.stdout.lines().any(|line| line == "ran there"), "{outcome:?}");
+    assert!(outcome.stderr.lines().any(|line| line == "said there"), "{outcome:?}");
+    for line in outcome.stdout.lines().chain(outcome.stderr.lines()) {
+        assert_eq!(unstamped(line).stamp, None, "no stamp on the console: {line}");
+        assert!(!is_process_line(line), "no process line on the console: {line}");
+    }
 }
 
 /// The case's worktree root as git gives it, which routing hashes into the work-folder key.
@@ -1041,7 +1113,7 @@ fn a_routed_run_in_a_new_work_folder_is_given_a_raised_ceiling_and_told_to_prewa
     assert_eq!(second.code, Some(0), "{second:?}");
     assert_eq!(calls(&steps), ["preflight", "run", "preflight", "run"]);
     assert_eq!(notes(&first), 1, "said once: {first:?}");
-    let log = fs::read_to_string(case.folder().join("first.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("first.log"));
     assert!(log.lines().any(|line| line == COLD_NOTE), "{log}");
     assert_eq!(first_request["Timeout"], 120, "the box is sent the raised ceiling: {first_request}");
     assert_eq!(notes(&second), 0, "the work folder is there now: {second:?}");
@@ -1129,7 +1201,7 @@ fn incompressible(count: usize) -> Vec<u8> {
 /// The bytes the run logging to `log` says its push wrote, from its `gate: pushed snapshot <8> in <s> s (<size>)` line
 /// in git's own units: 0 for `up to date`.
 fn pushed_bytes(log: &Path) -> f64 {
-    let text = fs::read_to_string(log).expect("the log was written");
+    let text = log_texts(log);
     let line = text
         .lines()
         .find(|line| line.starts_with("gate: pushed snapshot "))
@@ -1284,7 +1356,7 @@ fn a_routed_run_past_3x_its_usual_p90_is_hinted_once() {
 
     assert_eq!(outcome.code, Some(0), "the hint kills nothing: {outcome:?}");
     assert_eq!(hint.find_iter(&outcome.stderr).count(), 1, "{outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert_eq!(hint.find_iter(&log).count(), 1, "{log}");
     let events = events(&case);
     assert_eq!(fallbacks(&events), Vec::<&str>::new(), "{events:#?}");
@@ -1651,7 +1723,7 @@ fn a_dropped_preflight_logs_no_line_saying_its_input_was_not_sent() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight"]);
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(!log.contains("input was not sent"), "the call's own end says why: {log}");
 }
 
@@ -1680,7 +1752,7 @@ fn a_run_call_that_never_answers_before_the_banner_falls_back_unreachable() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 3, "{outcome:?}");
     assert!(outcome.stderr.contains(UNREACHABLE_LINE), "{outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(log.contains("ran here"), "it ran here: {log}");
     assert_eq!(calls(&steps), ["preflight", "run", "run", "run", "run"]);
     assert_eq!(fallbacks(&events(&case)), ["unreachable"]);
@@ -2338,7 +2410,7 @@ fn a_pair_run_whose_sibling_push_fails_falls_back_with_no_run_call() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     // The attempt's lines, the main push's progress among them, are noted after the command's output, so the log's
     // 20-line tail on stdout may not reach it: the log shows the command ran.
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(log.lines().any(|line| line == "ran here"), "the command ran here: {log}");
     let said = &outcome.stderr;
     assert!(
@@ -2381,7 +2453,7 @@ fn a_pair_s_new_sibling_bare_takes_no_bridge_while_the_main_one_does() {
     fs::remove_dir_all(&sibling).expect("the sibling can be removed");
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let log = fs::read_to_string(case.folder().join("second.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("second.log"));
     let created: Vec<&str> = log.lines().filter(|line| line.starts_with("gate: remote created ")).collect();
     assert_eq!(created.len(), 1, "the sibling's bare alone is created: {log}");
     assert!(created[0].ends_with(&format!("{}.git", repo_name(&name))), "{created:?}");
@@ -2466,7 +2538,7 @@ fn a_run_whose_push_fails_falls_back_and_runs_here() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stdout.contains("ran here"), "the command ran here: {outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(log.lines().any(|line| line == "ran here"), "the command ran here: {log}");
     assert!(outcome.stderr.contains("gate: pushing the snapshot to "), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight", "git-receive-pack"], "no run call");
@@ -2508,7 +2580,7 @@ fn beside_sibling(sibling: &Path, suffix: &str) -> PathBuf {
 /// Asserts the command `out ran here` ran here, as the case's `out.log` shows: the attempt's lines, the pushes'
 /// progress among them, come after the command's output, so the log's 20-line tail on stdout may not reach it.
 fn assert_ran_here(case: &Case) {
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(log.lines().any(|line| line == "ran here"), "the command ran here: {log}");
 }
 
@@ -2807,7 +2879,7 @@ fn a_parity_refusal(case: &Case, extra: &[&str], need: &str, box_path: Option<&O
     let mismatch = format!("gate: remote toolchain mismatch: {repo} needs {need}; builder has {BUILDER_SDK}");
     assert!(outcome.stderr.lines().any(|said| said == mismatch), "{mismatch}: {outcome:?}");
     assert!(outcome.stderr.contains(PARITY_LINE), "{outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(log.lines().any(|said| said == mismatch), "{mismatch}: {log}");
     assert_eq!(calls(&steps), ["preflight"], "the preflight alone reached the builder");
     assert_eq!(builder_ref(case, &format!("refs/gate/{}", key_of(&events))), "", "nothing was pushed");
@@ -3058,7 +3130,7 @@ fn log_capped_at(name: &str, steps: &[&str], cap: &str) -> (Outcome, String) {
     ));
     assert_eq!(outcome.code, Some(0), "the run keeps its status: {outcome:?}");
     assert_eq!(runs(&case), (0, 1), "the command ran once, on the builder: {outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     (outcome, log)
 }
 
@@ -3338,7 +3410,7 @@ fn a_toolchain_refusal_with(case: &Case, box_path: &OsString, said: &[String], r
     let want: Vec<&str> = said.iter().map(String::as_str).chain([PARITY_LINE]).collect();
     let console: Vec<&str> = outcome.stderr.lines().filter(|line| is_parity_line(line)).collect();
     assert_eq!(console, want, "{outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     let logged: Vec<&str> = log.lines().filter(|line| line.starts_with("gate: remote toolchain mismatch: ")).collect();
     assert_eq!(logged, said, "{log}");
     assert_eq!(calls(&steps), ["preflight"], "the preflight alone reached the builder");
@@ -3574,7 +3646,7 @@ fn a_manifest_in_the_declarations_folder_is_read_when_the_tree_has_none() {
     let outcome = a_toolchain_refusal(&case, &box_path, &[mismatch_of(&case, "pnpm 10.0.0 or later", "none")], None);
 
     let read = format!("gate: .gate/toolchain.toml read from {}", folder.join("toolchain.toml").display());
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(log.lines().any(|line| line == read), "{read}: {log}");
     assert!(!outcome.stderr.contains("read from"), "the line is the log's alone: {outcome:?}");
 }
@@ -3590,7 +3662,7 @@ fn the_tree_s_manifest_wins_over_the_declarations_folder() {
 
     let outcome = a_toolchain_served(&case, &box_path, ANSWERING, None);
 
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(!log.contains("read from"), "{log}");
     let note = format!("gate: .gate/toolchain.toml shadows {}", folder.join("toolchain.toml").display());
     assert!(log.lines().any(|line| line == note), "{note}: {log}");
@@ -3610,7 +3682,7 @@ fn a_snapshot_whose_gate_is_a_file_reads_no_declarations_folder() {
 
     a_toolchain_served(&case, &box_path, ANSWERING, None);
 
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(!log.contains("read from"), "{log}");
     assert!(
         !marker.exists(),
@@ -4009,7 +4081,7 @@ fn a_file_the_command_changes_on_the_box_is_synced_back() {
         "the box's file, with the box's content: {outcome:?}"
     );
     assert!(outcome.stderr.contains("gate: synced back 1 file(s): made-on-box.txt"), "{outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(log.contains("gate: synced back 1 file(s): made-on-box.txt"), "{log}");
     assert!(!log.contains("refs/gate-back/"), "the sync-back's git output stays out of the log: {log}");
     assert_eq!(patch_files(&case), Vec::<String>::new(), "the patch is removed");
@@ -4568,7 +4640,7 @@ fn a_stalled_run_call_is_killed_and_the_command_stopped() {
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     assert!(outcome.stderr.contains(STALLED_LINE), "{outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(log.contains(STALLED_LINE), "the kill line is in the log: {log}");
     assert!(!log.contains(STOPPING), "a stall's stop says only its kill line: {log}");
     assert!(!outcome.stderr.contains(STOPPING), "{outcome:?}");
@@ -5097,7 +5169,7 @@ const STOPPING: &str = "gate: stopping the command on builder (up to ";
 
 /// The case's log, `out.log`.
 fn out_log(case: &Case) -> String {
-    fs::read_to_string(case.folder().join("out.log")).expect("the log was written")
+    log_texts(&case.folder().join("out.log"))
 }
 
 #[test]
@@ -5335,7 +5407,7 @@ fn a_dropped_run_call_logs_no_line_saying_its_long_input_was_not_sent() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight", "run", "stop", "boot"], "the command is stopped first");
     assert_eq!(fallbacks(&events(&case)), ["rebooted"]);
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     let note = log.lines().find(|line| line.contains("input was not sent"));
     assert_eq!(note, None, "the call's own end says why");
 }
@@ -5348,7 +5420,7 @@ fn a_run_call_that_failed_after_the_banner_unread_logs_that_its_input_was_not_se
 
     let outcome = finish(lost_gate(&case, "local", &steps, &[r".\tool.exe", "out", &long]));
 
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(log.contains("gate: the run call's input was not sent"), "{outcome:?}\n{log}");
 }
 
@@ -5599,7 +5671,7 @@ fn a_routed_run_sends_its_outputs_manifest() {
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stderr.contains("gate-remote-outputs: 1 "), "one file comes back: {outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(log.contains("gate-remote-outputs: 1 "), "the box's line is in the log: {log}");
     assert_eq!(calls(&steps), ["preflight", "run", "outputs"]);
     let differs = fs::read_to_string(case.folder().join("bin").join("differs.txt")).expect("the file is there");
@@ -7931,7 +8003,7 @@ fn a_godot_run_of_a_repo_pinning_several_godot_versions_falls_back_saying_why() 
     assert_eq!(fallbacks(&own(&case, pid)), ["parity"], "{outcome:?}");
     let said: Vec<&str> = outcome.stderr.lines().filter(|line| *line == why || is_parity_line(line)).collect();
     assert_eq!(said, [why, PARITY_LINE], "{outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(log.lines().any(|line| line == why), "{log}");
     assert_eq!(calls(&steps), ["preflight"], "the preflight alone reached the builder");
     assert_eq!(runs(&case), (1, 0), "the command ran once, here: {outcome:?}");
@@ -7959,7 +8031,7 @@ fn a_godot_run_refused_saying_why(case: &Case, root: &Path, local: &Path, why: &
     assert_eq!(fallbacks(&own(case, pid)), ["parity"], "{outcome:?}");
     let said: Vec<&str> = outcome.stderr.lines().filter(|line| *line == why || is_parity_line(line)).collect();
     assert_eq!(said, [why, PARITY_LINE], "{outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(log.lines().any(|line| line == why), "{log}");
     assert_eq!(calls(&steps), ["preflight"], "the preflight alone reached the builder");
     assert_eq!(runs(case), (1, 0), "the command ran once, here: {outcome:?}");
@@ -7989,7 +8061,7 @@ fn a_godot_run_of_a_repo_pinning_no_godot_version_runs_on_the_newest_and_warns()
     let warning = no_pin_warning("4.7.2");
     assert!(ran_the_install(&outcome, &root, "4.7.2"), "{outcome:?}");
     assert_eq!(outcome.stderr.lines().filter(|line| *line == warning).count(), 1, "{outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     let warning_at = line_at(&log, &warning).expect("the warning is logged");
     let output_at = line_at(&log, "4.7.2.stable.mono.official.x").expect("the command's own output is logged");
     assert!(warning_at < output_at, "the warning comes before the command's own output: {log}");
@@ -8170,7 +8242,7 @@ fn sent_build_case(name: &str, missing: Option<&str>) -> Case {
 
 /// Whether the case's log `log` holds a line saying the PC's build was not sent, naming `why` in its reason.
 fn build_not_sent(case: &Case, log: &str, why: &str) -> bool {
-    let said = fs::read_to_string(case.folder().join(log)).expect("the log was written");
+    let said = log_texts(&case.folder().join(log));
     said.lines()
         .any(|line| line.strip_prefix(BUILD_NOT_SENT).is_some_and(|reason| reason.contains(why)))
 }

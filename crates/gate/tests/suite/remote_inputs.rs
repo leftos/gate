@@ -13,7 +13,7 @@ use serde_json::json;
 use crate::remote_client::{
     CLIENT_IGNORED, Tuned, client_case, client_gate, client_gate_tuned, fallbacks, pair_case, sibling_repository, work_folder, write,
 };
-use crate::support::{Case, Go, Outcome, calls, events, finish, shown, ssh_steps, start, write_remote_json};
+use crate::support::{Case, Go, Outcome, calls, events, finish, log_texts, shown, ssh_steps, start, write_remote_json};
 
 /// The case's one input, `/`-separated as its glob matches it, and as the builder's work folder holds it.
 const INPUT: &str = "secrets/keys.json";
@@ -69,7 +69,7 @@ fn inputs_case(name: &str) -> Case {
 
 /// The text of the case's log `log`.
 fn log_of(case: &Case, log: &str) -> String {
-    fs::read_to_string(case.folder().join(log)).expect("the log was written")
+    log_texts(&case.folder().join(log))
 }
 
 /// Whether `text` holds `line` as a line of its own.

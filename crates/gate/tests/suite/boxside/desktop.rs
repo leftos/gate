@@ -6,10 +6,12 @@ use std::fs;
 use std::path::Path;
 
 use gate_win32::{OpenedJob, StoppableProcess};
+use gate_wire::stamp::unstamped;
 use proc_table::{ProcessTable, Win32ProcessTable};
 use regex::Regex;
 use serde_json::{Value, json};
 
+use super::ReadBack;
 use super::{
     BoxCall, ENGINE_ENV_NAME, GIT_BIN_STAND_IN, QUIET_CLIENT_GONE_GUARD, STALE_ENGINE_ENV, adjusted_seconds, bare_box_call, box_call, ended_within,
     engine_env, fake_godot, fake_unreal, field, gate_box, godot_root, let_go, lines_starting, pair_payload, pair_snapshot, path_for_run, path_godot,
@@ -77,12 +79,12 @@ fn run_desktop(case: &Case, payload: &Value, mode: &str, session: &str, ms: &str
     let mut args = vec!["box"];
     args.extend(seams.iter().map(String::as_str));
     args.push("run");
-    desktop_box_call(case, &args, &request_line(payload)).finish()
+    desktop_box_call(case, &args, &request_line(payload)).finish_read()
 }
 
 /// `gate box run` of `payload` handed to the stand-in helper with the fault `mode`, at an active console.
 fn handed_off(case: &Case, payload: &Value, mode: &str) -> Outcome {
-    desktop_call(case, payload, mode, &[]).finish()
+    desktop_call(case, payload, mode, &[]).finish_read()
 }
 
 /// `gate box run` of `payload` with the desktop seams of a hand-off with the fault `mode` at an active console, and the
@@ -280,7 +282,7 @@ fn the_real_helper_checks_the_input_desktop() {
     let mut call = desktop_call(&case, &payload, "ok", &[]);
     call.env_remove(INPUT_DESKTOP_VARIABLE);
 
-    let outcome = call.finish();
+    let outcome = call.finish_read();
 
     let after = on_default_desktop();
     let on_default = if before == after { before } else { outcome.code == Some(0) };
@@ -319,7 +321,7 @@ fn a_desktop_command_is_in_the_runs_job_at_normal_priority() {
         .map(|process| process.name)
         .collect();
     let_go(&go);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let pid: u32 = outcome
@@ -364,7 +366,7 @@ fn a_desktop_command_gets_the_boxs_environment_and_working_folder() {
     let mut command = desktop_call(&case, &payload, "ok", &[]);
     command.env_remove("GIT_CONFIG_COUNT");
 
-    let outcome = command.finish();
+    let outcome = command.finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let lines: Vec<&str> = outcome.stdout.lines().collect();
@@ -395,7 +397,7 @@ fn a_desktop_run_runs_the_godot_install_of_the_chosen_version() {
     command.env("PATH", path_for_run(&[path_godot(&case)]));
     command.env_remove("GODOT_PATH");
 
-    let outcome = command.finish();
+    let outcome = command.finish_read();
 
     let install = root.join("4.7.2").join("Godot_console.exe");
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
@@ -422,7 +424,7 @@ fn a_desktop_run_sets_ue_root_for_the_chosen_unreal() {
     command.env("GATE_UNREAL_ROOT", &root);
     command.env("UE_ROOT", r"C:\stale\UE_5.0");
 
-    let outcome = command.finish();
+    let outcome = command.finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stdout, format!("{}\n", root.join("5.8.0").display()), "{outcome:?}");
@@ -443,7 +445,7 @@ fn a_desktop_run_sets_its_engine_env_names_for_the_chosen_unreal() {
     command.env("GATE_UNREAL_ROOT", &root);
     command.env(ENGINE_ENV_NAME, STALE_ENGINE_ENV);
 
-    let outcome = command.finish();
+    let outcome = command.finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stdout, format!("{}\n", root.join("5.8.0").display()), "{outcome:?}");
@@ -460,7 +462,7 @@ fn a_desktop_run_puts_git_s_bin_first_on_its_command_s_path() {
     let mut command = desktop_call(&case, &payload, "ok", &[]);
     command.env(GIT_BIN_STAND_IN, &bin);
 
-    let outcome = command.finish();
+    let outcome = command.finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     ran_its_command(&outcome, &payload);
@@ -474,7 +476,7 @@ fn a_desktop_run_has_no_donor_and_ignores_the_console_and_token_seams() {
     let payload = ready_payload(&case, COMMAND);
     let extra = ["--test-box-console", "fail-before", "--test-box-token", "refused"];
 
-    let outcome = desktop_call(&case, &payload, "ok", &extra).finish();
+    let outcome = desktop_call(&case, &payload, "ok", &extra).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
@@ -500,7 +502,7 @@ fn a_refused_child_report_leaves_nothing_running() {
     let mut call = desktop_call(&case, &payload, "lie-handle", &[]);
     call.env("GATE_DESKTOP_TEST_RECORD", &record);
 
-    let outcome = call.finish();
+    let outcome = call.finish_read();
 
     let left = left_by(&record);
     assert!(!left.recorded.is_empty(), "the stand-in created a child: {outcome:?}");
@@ -631,7 +633,7 @@ fn a_helper_that_dies_after_creating_the_child_leaves_no_suspended_process() {
     let mut call = desktop_call(&case, &payload, "exit-after-create", &[]);
     call.env("GATE_DESKTOP_TEST_RECORD", &record);
 
-    let outcome = call.finish();
+    let outcome = call.finish_read();
 
     let left = left_by(&record);
     assert!(!left.recorded.is_empty(), "the stand-in created a child: {outcome:?}");
@@ -704,7 +706,7 @@ fn a_helper_that_hangs_refuses_desktop_after_the_message_limit() {
     let case = Case::new("desktop_hang");
     let payload = ready_payload(&case, COMMAND);
 
-    let outcome = desktop_call(&case, &payload, "hang", &["--test-box-desktop-message-ms", HANG_MESSAGE_MS]).finish();
+    let outcome = desktop_call(&case, &payload, "hang", &["--test-box-desktop-message-ms", HANG_MESSAGE_MS]).finish_read();
 
     refused_with(
         &outcome,
@@ -731,7 +733,7 @@ fn a_desktop_run_parks_after_the_command_is_adopted_and_before_it_runs() {
         .expect("the job's processes are listed");
     let ran_before = mark.exists();
     let_go(&park);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     assert!(
         !members.is_empty(),
@@ -824,7 +826,7 @@ fn a_stop_during_the_desktop_wait_on_a_pair_says_back_commits_failed() {
     let running = desktop_box_call(&case, &args, &request_line(&payload)).start();
     running.wait_for_stderr(BUSY_WAIT);
     let stopped = gate_box(&case, "stop", &request_line(&payload), None);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
     drop(held);
 
     assert_eq!(stopped.code, Some(0), "{stopped:?}");
@@ -848,7 +850,7 @@ fn a_second_desktop_run_waits_for_the_first_and_then_runs() {
     let running = desktop_call(&case, &payload, "ok", &[]).start();
     running.wait_for_stderr(BUSY_WAIT);
     drop(held);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     assert_eq!(outcome.code, Some(0), "the run took the desktop once it was free: {outcome:?}");
     assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
@@ -888,7 +890,7 @@ fn box_stop_during_the_desktop_wait_is_stopped_before_the_command_started() {
     running.wait_for_stderr(BUSY_WAIT);
 
     let stopped = gate_box(&case, "stop", &request_line(&payload), None);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
     drop(held);
 
     assert_eq!(stopped.code, Some(0), "{stopped:?}");
@@ -949,7 +951,7 @@ fn box_stop_during_a_desktop_run_ends_it() {
     let printed = running.wait_for_stdout("pid ");
     let pid: u32 = printed
         .lines()
-        .find_map(|line| line.strip_prefix("pid "))
+        .find_map(|line| unstamped(line).text.strip_prefix("pid "))
         .and_then(|pid| pid.trim().parse().ok())
         .expect("the command printed its pid");
     // The pid and the creation time together, so another case's process at a reused pid is never taken for this one.
@@ -975,7 +977,7 @@ fn box_stop_during_a_desktop_run_ends_it() {
             .iter()
             .any(|process| process.pid == pid && process.created == created)
     });
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     assert_eq!(outcome.code, Some(124), "the stopped command's status: {outcome:?}");
     ran_its_command(&outcome, &payload);
@@ -994,7 +996,7 @@ fn a_stop_while_the_desktop_command_is_parked_says_it_was_stopped_before_start()
 
     let stopped = gate_box(&case, "stop", &request_line(&payload), None);
     let_go(&park);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     assert_eq!(stopped.code, Some(0), "{stopped:?}");
     assert_eq!(outcome.code, Some(1), "a stop while the command is parked fails the run: {outcome:?}");
@@ -1142,7 +1144,7 @@ fn the_ceiling_kills_a_desktop_command() {
     snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
     payload["Timeout"] = json!(1);
     payload["Host"] = json!("builder");
-    let outcome = desktop_call(&case, &payload, "ok", &["--test-box-sample-ms", "20", "--test-box-free-percent", "100"]).finish();
+    let outcome = desktop_call(&case, &payload, "ok", &["--test-box-sample-ms", "20", "--test-box-free-percent", "100"]).finish_read();
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     let kill = Regex::new(
@@ -1171,7 +1173,7 @@ fn a_closed_stdout_pipe_stops_a_desktop_job_and_exits_255() {
     running.wait_for_stderr("started");
     let_go(&go);
 
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
     assert!(
@@ -1197,7 +1199,7 @@ fn a_closed_stderr_pipe_stops_a_desktop_job_and_exits_255() {
     stderr.close();
     let_go(&go);
 
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
 }
@@ -1206,7 +1208,7 @@ fn a_closed_stderr_pipe_stops_a_desktop_job_and_exits_255() {
 fn printed_pid(stdout: &str) -> u32 {
     stdout
         .lines()
-        .find_map(|line| line.strip_prefix("pid "))
+        .find_map(|line| unstamped(line).text.strip_prefix("pid "))
         .and_then(|pid| pid.trim().parse().ok())
         .expect("the command printed its pid")
 }

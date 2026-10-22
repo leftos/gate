@@ -37,6 +37,7 @@ use crate::boxside::inputs::{
 };
 use crate::boxside::preflight::is_folder_itself;
 use crate::boxside::run::{FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS, SHARING_VIOLATION};
+use crate::boxside::stamping;
 use crate::console::Console;
 use crate::outputs::archive::{Entry, PcFiles, unpack};
 use crate::outputs::manifest::{MANIFEST_LIMIT, Manifest};
@@ -142,7 +143,7 @@ pub(super) fn lfs(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
     let asked = match Asked::read(payload) {
         Ok(asked) => asked,
         Err(line) => {
-            console.err(&line);
+            stamping::err(console, &line);
             return u32::from(USAGE_STATUS);
         }
     };
@@ -161,8 +162,8 @@ pub(super) fn lfs(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
 
 /// Says the step is refused `lfs` and failed for `why`: the tag line, then the step's failure line; 1.
 fn refused(asked: &Asked<'_>, why: &str, console: &mut Console) -> u32 {
-    console.err(&refused_line(asked.nonce));
-    console.err(&format!("gate: remote lfs {} failed: {}", asked.step.word(), escaped(why)));
+    stamping::protocol(console, &refused_line(asked.nonce));
+    stamping::err(console, &format!("gate: remote lfs {} failed: {}", asked.step.word(), escaped(why)));
     FAILED_STATUS
 }
 
@@ -393,9 +394,9 @@ fn diff(asked: &Asked<'_>, wanted: &[Wanted], console: &mut Console) -> u32 {
     });
     match lacking {
         Ok(Ok(lacking)) => {
-            console.out(&format!("gate-remote-lfs: need {}", lacking.len()));
+            stamping::out(console, &format!("gate-remote-lfs: need {}", lacking.len()));
             for oid in lacking {
-                console.out(&format!("gate-remote-lfs: oid {oid}"));
+                stamping::out(console, &format!("gate-remote-lfs: oid {oid}"));
             }
             0
         }
@@ -427,13 +428,13 @@ fn put(asked: &Asked<'_>, wanted: &[Wanted], seams: &BoxSeams, console: &mut Con
     drop(stage);
     match (done, removal) {
         (Ok(Ok(count)), Ok(())) => {
-            console.out(&format!("gate-remote-lfs: installed {count}"));
+            stamping::out(console, &format!("gate-remote-lfs: installed {count}"));
             0
         }
         (Err(status), Ok(())) => unlocked(asked, status, console),
         (Err(status), Err(why)) => {
             let status = unlocked(asked, status, console);
-            console.err(&format!("gate: remote lfs {} failed: {}", asked.step.word(), escaped(&why)));
+            stamping::err(console, &format!("gate: remote lfs {} failed: {}", asked.step.word(), escaped(&why)));
             status
         }
         (Ok(Err(why)), Ok(())) | (Ok(Ok(_)), Err(why)) => refused(asked, &why, console),
@@ -639,7 +640,10 @@ impl Scratch {
     /// Removes the scratch folder beneath its held handle; a removal that fails is said.
     pub(super) fn close(self, console: &mut Console) {
         if let Err(why) = removed_stage(&self.stage) {
-            console.err(&format!("gate: remote could not remove the LFS scratch folder: {}", escaped(&why)));
+            stamping::err(
+                console,
+                &format!("gate: remote could not remove the LFS scratch folder: {}", escaped(&why)),
+            );
         }
     }
 }

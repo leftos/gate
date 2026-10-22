@@ -9,6 +9,7 @@ use gate_win32::TaskError;
 
 use crate::answer::FAILED_STATUS;
 use crate::boxside::desktop::lines::CONNECT_LIMIT;
+use crate::boxside::stamping;
 use crate::console::Console;
 
 /// How long the Task Scheduler has to answer the registration: the limit a desktop run gives its task start.
@@ -23,11 +24,11 @@ const SEAM_REFUSED: &str = "the test seam refused";
 pub(crate) fn register(seams: &BoxSeams, console: &mut Console) -> u32 {
     match registered(seams) {
         Ok(user_sid) => {
-            console.out(&format!("gate-register: registered {} for {user_sid}", gate_desktop::TASK_PATH));
+            stamping::out(console, &format!("gate-register: registered {} for {user_sid}", gate_desktop::TASK_PATH));
             0
         }
         Err(why) => {
-            console.out(&format!("gate-register: failed: {why}"));
+            stamping::out(console, &format!("gate-register: failed: {why}"));
             u32::from(FAILED_STATUS)
         }
     }

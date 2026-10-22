@@ -19,6 +19,7 @@ use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::boxside::run::FILE_FLAG_OPEN_REPARSE_POINT;
+use crate::boxside::stamping;
 use crate::console::Console;
 use crate::outputs::archive::pack;
 use crate::outputs::glob::Globs;
@@ -392,28 +393,31 @@ pub(super) fn outputs(payload: &Payload, console: &mut Console) -> u32 {
     let folder = match payload.work_folder().and_then(|(_, work)| payload.output_folder(work)) {
         Ok(folder) => folder,
         Err(line) => {
-            console.err(&line);
+            stamping::err(console, &line);
             return u32::from(USAGE_STATUS);
         }
     };
     let name = match payload.archive_name() {
         Ok(name) => name,
         Err(line) => {
-            console.err(&line);
+            stamping::err(console, &line);
             let lacking = payload.text("Name").is_err();
             return u32::from(if lacking { USAGE_STATUS } else { FAILED_STATUS });
         }
     };
     let path = Path::new(folder).join(name);
     if let Err(unsent) = send(&path, &mut io::stdout().lock()) {
-        console.err(&unsent.line(name));
+        stamping::err(console, &unsent.line(name));
         return u32::from(FAILED_STATUS);
     }
     if let Err(error) = remove_archive(&path) {
-        console.err(&format!(
-            "gate: remote could not remove the outputs archive {name}: {}",
-            escaped(&error.to_string())
-        ));
+        stamping::err(
+            console,
+            &format!(
+                "gate: remote could not remove the outputs archive {name}: {}",
+                escaped(&error.to_string())
+            ),
+        );
     }
     0
 }

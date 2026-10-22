@@ -14,6 +14,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
+use super::ReadBack;
 use super::{
     BoxCall, bare_box_call, box_call, field, gate_box, git, git_folder, has_ref, path_for_run, payload, renamed, run_box, run_box_with_path, snapshot,
 };
@@ -62,7 +63,7 @@ fn run_with_manifest(case: &Case, payload: &Value, line: &str) -> Outcome {
 fn finish_with_manifest(call: BoxCall, line: &str) -> Outcome {
     let (running, mut stdin) = call.start_with_stdin();
     stdin.write_all(line.as_bytes()).expect("the manifest can be written");
-    let outcome = running.finish();
+    let outcome = running.finish_read();
     drop(stdin);
     outcome
 }
@@ -230,7 +231,7 @@ fn a_large_output_is_packed_in_flat_memory() {
     let (running, mut stdin) = box_call(&case, &["box", "run"], &self::payload(&payload)).start_with_stdin();
     limit_memory(running.id(), BOX_MEMORY);
     stdin.write_all(manifest(&[]).as_bytes()).expect("the manifest can be written");
-    let outcome = running.finish();
+    let outcome = running.finish_read();
     drop(stdin);
 
     assert_eq!(outcome.code, Some(0), "the pack stays under the memory limit: {outcome:?}");
@@ -253,7 +254,7 @@ fn box_run_beats_before_it_reads_the_outputs_manifest() {
     let before = running.wait_for_stderr_where("two heartbeats before the manifest is written", |stderr| beats(stderr) >= 2);
     assert!(!has_line(&before, "ran"), "the command waits for the manifest: {before}");
     stdin.write_all(manifest(&[]).as_bytes()).expect("the manifest can be written");
-    let outcome = running.finish();
+    let outcome = running.finish_read();
     drop(stdin);
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
@@ -300,7 +301,7 @@ fn box_run_without_output_globs_reads_only_its_request_line() {
     snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
 
     let (running, stdin) = box_call(&case, &["box", "run"], &self::payload(&payload)).start_with_stdin();
-    let outcome = running.finish();
+    let outcome = running.finish_read();
     drop(stdin);
 
     assert_eq!(

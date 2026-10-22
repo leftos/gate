@@ -40,6 +40,7 @@ use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::boxside::forward::{ClientGone, OutputLock};
 use crate::boxside::preflight::{Git, GitClass, GitFailure, GitOutput, GitStep, Pipe, Shared, Streams, is_folder_itself, written_beneath};
 use crate::boxside::run::{FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_CHANGING, LOCK_VIOLATION, SHARING_VIOLATION};
+use crate::boxside::stamping;
 use crate::console::Console;
 
 /// How long a work folder goes unused before a sweep removes it.
@@ -76,14 +77,14 @@ const REFS_STEP: &str = "update-ref";
 pub(crate) fn prune(root: &Path, keys: &[String], walk_stop: Option<&Path>, now: SystemTime, console: &mut Console) -> u32 {
     // The parse takes keys alone; this guards the names the sweep opens beneath `work` all the same.
     if let Some(word) = keys.iter().find(|key| !is_key(key)) {
-        console.err(&format!("gate: box prune --keys holds a word that is not a key: {word:?}"));
+        stamping::err(console, &format!("gate: box prune --keys holds a word that is not a key: {word:?}"));
         return u32::from(USAGE_STATUS);
     }
     let Some(text) = root.to_str().filter(|text| is_drive_path(text)) else {
-        console.err(&format!(
-            "gate: box prune --root is not an absolute path on a drive: {:?}",
-            root.to_string_lossy()
-        ));
+        stamping::err(
+            console,
+            &format!("gate: box prune --root is not an absolute path on a drive: {:?}", root.to_string_lossy()),
+        );
         return u32::from(USAGE_STATUS);
     };
     let root = text.trim_end_matches(['\\', '/']);
@@ -95,7 +96,7 @@ pub(crate) fn prune(root: &Path, keys: &[String], walk_stop: Option<&Path>, now:
     match swept {
         Ok(status) => status,
         Err(line) => {
-            console.err(&line);
+            stamping::err(console, &line);
             u32::from(FAILED_STATUS)
         }
     }
@@ -114,7 +115,7 @@ fn aged(root: &str, now: SystemTime, console: &mut Console) -> Result<u32, Strin
         }
         None => (0, 0),
     };
-    console.out(&format!("gate: remote prune removed {removed} of {folders} work folders"));
+    stamping::out(console, &format!("gate: remote prune removed {removed} of {folders} work folders"));
     Ok(0)
 }
 
@@ -127,13 +128,13 @@ fn aged(root: &str, now: SystemTime, console: &mut Console) -> Result<u32, Strin
 fn named(root: &str, keys: &[String], walk_stop: Option<&Path>, now: SystemTime, console: &mut Console) -> Result<u32, String> {
     if !drive_is_there(root) {
         for key in keys {
-            console.err(&could_not_prune(key, "the root's drive is not there"));
+            stamping::err(console, &could_not_prune(key, "the root's drive is not there"));
         }
         return Ok(u32::from(FAILED_STATUS));
     }
     let Some(mut sweep) = Sweep::opened(root, now, true, console)? else {
         for key in keys {
-            console.out(&gone_line(key));
+            stamping::out(console, &gone_line(key));
         }
         return Ok(0);
     };
@@ -143,8 +144,8 @@ fn named(root: &str, keys: &[String], walk_stop: Option<&Path>, now: SystemTime,
     let mut failed = false;
     for key in keys {
         match sweep.pruned_key(key, console) {
-            Pruned::Removed(_) => console.out(&gone_line(key)),
-            Pruned::Held => console.out(&format!("gate: remote kept {}: in use", escaped(key))),
+            Pruned::Removed(_) => stamping::out(console, &gone_line(key)),
+            Pruned::Held => stamping::out(console, &format!("gate: remote kept {}: in use", escaped(key))),
             // The keyed prune judges no age, so it keeps a key only for a held lock or a failure.
             Pruned::Kept => {}
             Pruned::Failed => failed = true,
@@ -204,11 +205,11 @@ fn leftovers_removed(pruned: &File, path: &Path, console: &mut Console) -> Resul
         let shown = path.join(&name);
         let Some(name) = name.to_str() else {
             let error = io::Error::new(ErrorKind::InvalidData, "its name is not valid Unicode");
-            console.err(&could_not_remove_pruned(&shown, &error));
+            stamping::err(console, &could_not_remove_pruned(&shown, &error));
             continue;
         };
         if let Err(error) = removed_beneath(pruned, name) {
-            console.err(&could_not_remove_pruned(&shown, &error));
+            stamping::err(console, &could_not_remove_pruned(&shown, &error));
         }
     }
     Ok(())
@@ -325,7 +326,7 @@ impl Sweep {
             return false;
         };
         let hours = idle.as_secs() / HOUR_SECONDS;
-        console.out(&format!("gate: remote pruned {}: idle {hours} h", escaped(key)));
+        stamping::out(console, &format!("gate: remote pruned {}: idle {hours} h", escaped(key)));
         true
     }
 
@@ -337,7 +338,7 @@ impl Sweep {
             Ok(Some(lock)) => lock,
             Ok(None) => return Pruned::Held,
             Err(line) => {
-                console.err(&line);
+                stamping::err(console, &line);
                 return Pruned::Failed;
             }
         };
@@ -350,7 +351,7 @@ impl Sweep {
             }
             Err(line) => {
                 self.let_go(key, lock, console);
-                console.err(&line);
+                stamping::err(console, &line);
                 return Pruned::Failed;
             }
         };
@@ -370,14 +371,14 @@ impl Sweep {
         let (idle, left) = match aside {
             Some(aside) => {
                 if let Err(error) = gate_win32::delete_tree_opened(&aside.folder) {
-                    console.err(&could_not_remove_pruned(&aside.path, &error));
+                    stamping::err(console, &could_not_remove_pruned(&aside.path, &error));
                 }
                 (aside.idle, aside.left)
             }
             None => (None, None),
         };
         if let Some(line) = left {
-            console.err(&line);
+            stamping::err(console, &line);
             if self.named {
                 return Pruned::Failed;
             }
@@ -385,7 +386,7 @@ impl Sweep {
         match refs {
             Ok(()) => Pruned::Removed(idle),
             Err(why) => {
-                console.err(&could_not_prune(key, &format!("its refs could not be removed: {why}")));
+                stamping::err(console, &could_not_prune(key, &format!("its refs could not be removed: {why}")));
                 Pruned::Failed
             }
         }
@@ -398,11 +399,14 @@ impl Sweep {
             && lock.written.is_none()
             && let Err(error) = gate_win32::delete_opened(&lock.file)
         {
-            console.err(&format!(
-                "gate: remote could not remove the work folder lock {}: {}",
-                escaped(&format!(r"{}\{key}.lock", self.work_path)),
-                escaped(&error.to_string())
-            ));
+            stamping::err(
+                console,
+                &format!(
+                    "gate: remote could not remove the work folder lock {}: {}",
+                    escaped(&format!(r"{}\{key}.lock", self.work_path)),
+                    escaped(&error.to_string())
+                ),
+            );
         }
         drop(lock);
     }

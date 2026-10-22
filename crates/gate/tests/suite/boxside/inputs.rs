@@ -14,6 +14,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL};
 
+use super::ReadBack;
 use super::{box_call, field, gate_box, git, lines, passed, payload, refused_line, run_box, snapshot};
 use crate::support::{Case, FAKE_TOOL, Outcome, box_payload, junction};
 
@@ -103,7 +104,7 @@ fn inputs_call(case: &Case, payload: &Value, seams: &[&str], manifest: &str, arc
     drop(stdin.write_all(format!("{manifest}\n").as_bytes()));
     drop(stdin.write_all(archive));
     drop(stdin);
-    running.finish()
+    running.finish_read()
 }
 
 /// A diff of `files` in the work folder of `payload`.
@@ -711,7 +712,7 @@ fn a_put_whose_archive_stalls_holds_no_lock() {
 
     stdin.write_all(&archive(&[DATA])).expect("the archive can be sent");
     drop(stdin);
-    let put = running.finish();
+    let put = running.finish_read();
     assert_eq!(concurrent.code, Some(0), "the diff is not refused busy: {concurrent:?}");
     assert_eq!(put.code, Some(0), "{put:?}");
 }

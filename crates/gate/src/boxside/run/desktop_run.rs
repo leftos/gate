@@ -17,6 +17,7 @@ use gate_win32::{Account, AcquireError, ConnectState, LockState, MutexGuard, Pri
 
 use crate::boxside::desktop::lines::{DesktopRefusal, Limits, abandoned_line, busy_timeout_line, busy_wait_line, capped_wait, session_verdict};
 use crate::boxside::run::{Beat, CLOSED_STATUS, One, REFUSED_STATUS, Ran, Request, STARTING_COMMAND, before_the_job, prepared};
+use crate::boxside::stamping;
 use crate::console::Console;
 use crate::remote::{Refusal, refused_line};
 
@@ -81,9 +82,9 @@ pub(super) fn console_takes_it(request: &Request<'_>, seams: &BoxSeams, console:
     match account_and_console(seams) {
         Ok(_) => Ok(()),
         Err(refused) => {
-            console.err(&refused_line(request.nonce, Refusal::Desktop));
+            stamping::protocol(console, &refused_line(request.nonce, Refusal::Desktop));
             for line in refused.lines() {
-                console.err(&line);
+                stamping::err(console, &line);
             }
             Err(REFUSED_STATUS)
         }
@@ -224,9 +225,9 @@ fn desktop_refused(request: &Request<'_>, refused: &ConsoleRefused, beat: &Beat<
 /// output lock, so the PC runs the command itself.
 fn said_refused(request: &Request<'_>, lines: &[String], beat: &Beat<'_>, console: &mut Console) -> DesktopEnd {
     let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
-    console.err(&refused_line(request.nonce, Refusal::Desktop));
+    stamping::protocol(console, &refused_line(request.nonce, Refusal::Desktop));
     for line in lines {
-        console.err(line);
+        stamping::err(console, line);
     }
     DesktopEnd::Refused
 }

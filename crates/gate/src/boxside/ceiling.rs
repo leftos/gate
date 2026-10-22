@@ -12,6 +12,7 @@ use gate_watchdog::{Config, Kill, Sample, SystemTimes, Ticks, Watch};
 use gate_win32::Job;
 
 use crate::boxside::forward::OutputLock;
+use crate::boxside::stamping;
 use crate::boxside::stop::Ending;
 use crate::console::Console;
 use crate::remote::{BoxKill, adjusted_line, killed_line};
@@ -177,25 +178,27 @@ impl<'a> Ceiling<'a> {
             Ok(ending) if ending.left == 0 => ending.say_late(name, console),
             Ok(ending) => {
                 ending.say_late(name, console);
-                console.err(&format!(
-                    "gate: note: the box's {what} kill left {} process(es) running in job {name}",
-                    ending.left
-                ));
+                stamping::err(
+                    console,
+                    &format!("gate: note: the box's {what} kill left {} process(es) running in job {name}", ending.left),
+                );
             }
-            Err(error) => console.err(&format!("gate: note: the box's {what} kill could not end job {name}: {error}")),
+            Err(error) => stamping::err(console, &format!("gate: note: the box's {what} kill could not end job {name}: {error}")),
         }
-        console.err(&self.kill_line(kill));
-        console.err(&killed_line(self.nonce, tag));
+        stamping::err(console, &self.kill_line(kill));
+        stamping::protocol(console, &killed_line(self.nonce, tag));
         if let Some(line) = self.adjusted() {
-            console.err(&line);
+            stamping::protocol(console, &line);
         }
     }
 
     /// The command exited and its readers drained: says the load-adjusted seconds under the box's output lock, unless
     /// the sampler failed.
     pub(super) fn ended(&self, console: &mut Console) {
-        let lines: Vec<String> = self.adjusted().into_iter().collect();
-        self.say(console, &lines);
+        if let Some(line) = self.adjusted() {
+            let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+            stamping::protocol(console, &line);
+        }
     }
 
     /// The line for `kill` of the command, naming the PC's name for the builder when the payload gave one.
@@ -263,7 +266,7 @@ impl<'a> Ceiling<'a> {
     fn say(&self, console: &mut Console, lines: &[String]) {
         let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         for line in lines {
-            console.err(line);
+            stamping::err(console, line);
         }
     }
 }

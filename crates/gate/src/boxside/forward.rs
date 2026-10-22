@@ -219,6 +219,7 @@ impl Forwarders {
                 reading: Arc::clone(&reading),
                 aborted: Arc::clone(&aborted),
                 stamp: stamping.tag(stream),
+                failure_stamped: matches!(sink, Sink::Own { .. }) && stamping.tag(stream).is_some(),
                 counted: bytes.of(stream),
             };
             let sender = sender.clone();
@@ -401,6 +402,9 @@ struct Forwarder {
     aborted: Arc<AtomicBool>,
     /// The tag each line is stamped with when it is read; `None` writes each line as it was read, uncut.
     stamp: Option<Tag>,
+    /// Whether a read failure, said on the box's own stderr, is stamped and tagged `gat`: it is when the lines go
+    /// there stamped.
+    failure_stamped: bool,
     /// The bytes read from the pipe so far, added to as each read returns.
     counted: Arc<AtomicU64>,
 }
@@ -469,7 +473,13 @@ impl Forwarder {
 
     /// Says on stderr that the pipe could not be read; when stderr cannot take it either, nothing is left to say it on.
     fn say_read_failure(&self, error: &io::Error) {
-        let line = format!("gate: remote could not read {} {}: {error}\n", self.source, self.stream.name());
+        let text = format!("gate: remote could not read {} {}: {error}", self.source, self.stream.name());
+        let mut line = if self.failure_stamped {
+            stamp::stamped(&stamp::now(), Tag::Gat, &text)
+        } else {
+            text
+        };
+        line.push('\n');
         let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         let _ = write_flushed(&mut io::stderr().lock(), line.as_bytes());
     }
@@ -622,6 +632,7 @@ mod tests {
             reading: Arc::clone(&reading),
             aborted: Arc::clone(&aborted),
             stamp: None,
+            failure_stamped: false,
             counted: Arc::default(),
         };
         let (sender, ended_rx) = mpsc::channel();
@@ -664,6 +675,7 @@ mod tests {
             reading: Arc::default(),
             aborted: Arc::default(),
             stamp: None,
+            failure_stamped: false,
             counted: Arc::default(),
         };
         let held = lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -994,6 +1006,7 @@ mod tests {
             reading: Arc::default(),
             aborted: Arc::default(),
             stamp: None,
+            failure_stamped: false,
             counted: Arc::default(),
         };
         let line = vec![b'x'; LONG_LINE];
@@ -1144,6 +1157,7 @@ mod stamped_tests {
             reading: Arc::default(),
             aborted: Arc::default(),
             stamp,
+            failure_stamped: false,
             counted: Arc::clone(&counted),
         };
         let feeder = thread::spawn(move || writer.write_all(&bytes).expect("the bytes are written"));

@@ -2,6 +2,7 @@
 //! exit 0, the failure line and exit 1, never a read of stdin, and the box usage for a `--stdin` after it. The seam stands
 //! in for the Task Scheduler, so no case touches this machine's tasks.
 
+use super::ReadBack;
 use super::{BOX_USAGE, bare_box_command};
 use crate::support::{Case, Outcome, finish, start_with_stdin};
 
@@ -10,7 +11,7 @@ fn register(case: &Case, args: &[&str]) -> Outcome {
     let mut words = vec!["box"];
     words.extend_from_slice(args);
     let (running, stdin) = start_with_stdin(bare_box_command(case, &words));
-    let outcome = running.finish();
+    let outcome = running.finish_read();
     drop(stdin);
     outcome
 }

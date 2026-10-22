@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::remote_client::{Tuned, client_case, client_gate, client_gate_tuned, fallbacks, pair_case, sibling_repository, write};
 use crate::routing::assert_refused;
-use crate::support::{Case, Outcome, calls, events, finish, git, shown, ssh_steps};
+use crate::support::{Case, Outcome, calls, events, finish, git, log_texts, shown, ssh_steps};
 
 /// The content of the case's LFS file, `a.bin`, which its snapshot holds as a pointer.
 const CONTENT: &str = "the LFS file's content, never pointer text\n";
@@ -96,7 +96,7 @@ fn pc_object(case: &Case) -> PathBuf {
 
 /// The text of the case's log `log`.
 fn log_of(case: &Case, log: &str) -> String {
-    fs::read_to_string(case.folder().join(log)).expect("the log was written")
+    log_texts(&case.folder().join(log))
 }
 
 /// Whether `text` holds `line` as a line of its own.

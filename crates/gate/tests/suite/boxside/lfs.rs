@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, READ_CONTROL};
 
+use super::ReadBack;
 use super::{
     Does, box_call, field, gate_box, git, has_ref, lines, pair_payload, pair_snapshot, passed, path_for_run, payload, refused_line, renamed, run_box,
     run_box_with_env, run_box_with_path, snapshot, started_line, stub_git_doing,
@@ -96,7 +97,7 @@ fn lfs_call_with(case: &Case, payload: &Value, seams: &[&str], env: &[(&str, &st
     drop(stdin.write_all(format!("{manifest}\n").as_bytes()));
     drop(stdin.write_all(archive));
     drop(stdin);
-    running.finish()
+    running.finish_read()
 }
 
 /// A diff of `objects` in the store of `payload`.
@@ -338,7 +339,7 @@ fn an_object_already_in_the_store_is_kept_not_replaced() {
 
     stdin.write_all(&objects_archive(&[A])).expect("the archive can be sent");
     drop(stdin);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stdout, "gate-remote-lfs: installed 1\n", "{outcome:?}");
@@ -911,7 +912,7 @@ fn a_run_with_pointers_whose_restricted_start_is_refused_fails_the_start() {
     put_all(&case, &payload, &[CONTENT.as_bytes()]);
     let digest = digested(&payload, &[CONTENT.as_bytes()]);
 
-    let outcome = box_call(&case, &["box", "--test-box-token", "refused", "run"], &self::payload(&digest)).finish();
+    let outcome = box_call(&case, &["box", "--test-box-token", "refused", "run"], &self::payload(&digest)).finish_read();
 
     assert_eq!(outcome.code, Some(127), "the start fails: {outcome:?}");
     assert_eq!(outcome.stdout, "", "the command never ran: {outcome:?}");
@@ -1124,7 +1125,7 @@ fn a_command_s_attributes_file_is_found_by_a_box_started_outside_the_work_folder
 
     let mut call = box_call(&case, &["box", "run"], &self::payload(&payload));
     call.current_dir(&elsewhere);
-    let outcome = call.finish();
+    let outcome = call.finish_read();
 
     assert_ne!(outcome.code, Some(0), "the sync-back fails: {outcome:?}");
     assert_eq!(
@@ -1341,7 +1342,7 @@ fn second_run_over_a_leftover(case: &Case, started: Option<&Path>) -> (Value, Ou
     if let Some(started) = started {
         call.current_dir(started);
     }
-    let outcome = call.finish();
+    let outcome = call.finish_read();
 
     assert_planted_untouched(&second, "a.bin", &outcome);
     (second, outcome)
@@ -1406,7 +1407,7 @@ fn a_decoy_attributes_file_where_the_box_started_is_not_taken_for_the_tree_s() {
     let mut call = box_call(&case, &["box", "run"], &self::payload(&second));
     call.current_dir(&decoy);
     call.env("PATH", path_for_run(&[stub]));
-    let outcome = call.finish();
+    let outcome = call.finish_read();
 
     assert_ne!(outcome.code, Some(0), "the checkout fails: {outcome:?}");
     assert_eq!(outcome.stdout, "", "the command never ran: {outcome:?}");

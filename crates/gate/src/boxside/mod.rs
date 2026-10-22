@@ -18,6 +18,7 @@ pub(crate) mod probe;
 mod prune;
 mod register;
 mod run;
+mod stamping;
 mod stop;
 mod tools;
 
@@ -44,7 +45,7 @@ const REQUEST_LIMIT: u64 = 16 * 1024 * 1024;
 pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
     // Before any verb loads a DLL by name, so none planted in a folder the box runs from is loaded.
     if let Err(error) = gate_win32::set_default_dll_directories_system32() {
-        console.err(&format!("gate: the box cannot limit its DLL search to System32: {error}"));
+        stamping::err(console, &format!("gate: the box cannot limit its DLL search to System32: {error}"));
         return u32::from(FAILED_STATUS);
     }
     // Before any verb runs or stdin is read: an elevated box any other process of its user could replace is refused.
@@ -52,9 +53,9 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
         // The preflight says its version line first, so a PC client of another version falls back on the version rather
         // than a bare status 1.
         if matches!(request.verb, BoxVerb::Preflight) {
-            console.out(&format!("gate: remote version {}", build_version()));
+            stamping::out(console, &format!("gate: remote version {}", build_version()));
         }
-        console.err(&install_untrusted_line(&why));
+        stamping::err(console, &install_untrusted_line(&why));
         return u32::from(INSTALL_STATUS);
     }
     let seams = &request.seams;
@@ -68,7 +69,7 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
                 prune::prune(root, &request.keys, seams.root_walk_stop.as_deref(), SystemTime::now(), console)
             } else {
                 // The parse gives `prune` its root always; a request without one is the box's usage error.
-                console.err(&Problem::BoxUsage.to_string());
+                stamping::err(console, &Problem::BoxUsage.to_string());
                 u32::from(USAGE_STATUS)
             }
         }
@@ -123,7 +124,7 @@ fn with_request(console: &mut Console, answer: impl FnOnce(&Payload, &mut Consol
     match read_request(io::stdin().lock()) {
         Ok(payload) => answer(&payload, console),
         Err(line) => {
-            console.err(&line);
+            stamping::err(console, &line);
             u32::from(USAGE_STATUS)
         }
     }

@@ -17,8 +17,8 @@ use crate::nesting::{LOOK_OFTEN, end_parent, first_event, marked, orphaned_as, s
 use crate::remote_client::{Tuned, client_case, client_gate, client_gate_tuned};
 use crate::support::{
     Case, DenyEntry, FAKE_TOOL, GATE, Go, Junction, LOCAL_REASON, Outcome, Running, assert_in_order, beside, calls, copy_tool, events, finish, git,
-    git_init, heavy_words, nothing_back, powershell_folder, record_path, release, run_words, shown, ssh_steps, start, wait_for_journal_line,
-    wait_until, write_counts, write_remote_json,
+    git_init, heavy_words, log_texts, nothing_back, powershell_folder, record_path, release, run_words, shown, ssh_steps, start,
+    wait_for_journal_line, wait_until, write_counts, write_remote_json,
 };
 
 pub(crate) const HOST: &str = "builder";
@@ -313,8 +313,9 @@ fn with_no_ssh_a_routed_run_falls_back_with_reason_client() {
     assert!(outcome.stderr.contains(no_ssh), "{outcome:?}");
     assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
     assert_fell_back(&case, &events(&case));
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
-    assert_in_order(&log, &["ran here", no_ssh]);
+    let log = log_texts(&case.folder().join("out.log"));
+    // The attempt's line is a note said before the run here starts, so the log holds it, in time order, first.
+    assert_in_order(&log, &[no_ssh, "ran here"]);
 }
 
 #[test]
@@ -351,7 +352,7 @@ fn local_runs_here_saying_why_and_journals_not_routed() {
     assert_local(&events[3..], None);
     assert_eq!(events[0]["reason"], LOCAL_REASON[1], "{}", events[0]);
     assert_eq!(events[3]["reason"], LOCAL_REASON[1], "{}", events[3]);
-    let log = fs::read_to_string(case.folder().join("heavy.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("heavy.log"));
     assert!(log.contains("gate: not routed: --local"), "{log}");
 }
 
@@ -508,7 +509,7 @@ fn a_gate_in_a_commit_run_s_hooks_that_ends_on_the_builder_files_its_release_in_
 
     let release = own(&case, inner_pid).into_iter().find(|line| line["event"] == "release");
     assert!(release.is_some_and(|line| has_remote_tag(&line)), "the hook gate released on the builder");
-    let log = fs::read_to_string(case.folder().join("inner.log")).expect("the hook gate wrote its log");
+    let log = log_texts(&case.folder().join("inner.log"));
     assert!(
         log.contains("gate: expected"),
         "the hook gate reads its history and says its expected time: {log}"
@@ -523,7 +524,7 @@ fn a_gate_in_a_commit_run_s_hooks_that_falls_back_runs_under_the_commit_s_slot_s
     // It queues and takes a remote slot beside the commit, then falls back under the commit's slot.
     assert_eq!(names(&inner_lines), ["queue", "take", "fallback", "covered"], "{inner_lines:#?}");
     assert_eq!(inner_lines[3]["parentPid"], Value::from(outer_pid), "{}", inner_lines[3]);
-    let log = fs::read_to_string(case.folder().join("inner.log")).expect("the nested gate wrote its log");
+    let log = log_texts(&case.folder().join("inner.log"));
     let covered = format!("gate: running under the heavy slot of gate {outer_pid}");
     assert_eq!(log.lines().filter(|line| *line == covered).count(), 1, "one nesting line: {log}");
     assert!(log.contains("ran there"), "the command ran here: {log}");
@@ -541,7 +542,7 @@ fn an_unusable_routing_file_is_ignored_with_one_line() {
     assert_eq!(said.len(), 1, "one line: {heavy:?}");
     assert!(said[0].starts_with(&format!("gate: ignored {}: ", path.display())), "{heavy:?}");
     assert!(said[0].ends_with("; running locally"), "{heavy:?}");
-    let log = fs::read_to_string(case.folder().join("heavy.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("heavy.log"));
     assert!(log.contains(said[0]), "{log}");
     assert!(!light.stderr.contains("ignored"), "a light gate reads no routing file: {light:?}");
 }
@@ -617,7 +618,7 @@ fn a_command_in_another_worktree_is_told_to_cd_and_journals_why() {
     assert!(!outcome.stderr.contains("is outside the worktree"), "one line, not both: {outcome:?}");
     assert!(outcome.stdout.contains(&path), "the command ran here: {outcome:?}");
     assert_local(&events(&case), Some(ANOTHER_WORKTREE));
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(log.contains(&line), "{log}");
 }
 
@@ -758,7 +759,7 @@ fn an_env_file_in_the_declarations_folder_is_read_when_the_worktree_has_none() {
         names.iter().any(|name| name == "NuGetAudit") && names.iter().any(|name| name == "ZZ_REPO_SEED"),
         "{outcome:?}"
     );
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     let read = format!("gate: .gate/env.toml read from {}", folder.join("env.toml").display());
     assert!(log.lines().any(|line| line == read), "{read}: {log}");
 }
@@ -976,7 +977,7 @@ fn a_relative_log_lands_in_the_cd_folder() {
     let outcome = finish(case.gate(&run_words("x.log", &["--cd", "work"], &[FAKE_TOOL, "out", "hi"])));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let log = fs::read_to_string(work.join("x.log")).expect("the log is under the --cd folder");
+    let log = log_texts(&work.join("x.log"));
     assert!(log.contains("hi"), "{log}");
     assert!(!case.folder().join("x.log").exists(), "no log under the caller's folder");
 }
@@ -1234,7 +1235,7 @@ fn a_siblings_file_in_the_declarations_folder_is_read_when_the_worktree_has_none
         "the declared sibling was read: {outcome:?}"
     );
     assert!(!outcome.stderr.contains("read from"), "the line is the log's alone: {outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     let read = format!("gate: .gate/siblings.toml read from {}", folder.join("siblings.toml").display());
     assert!(log.lines().any(|line| line == read), "{read}: {log}");
     assert_local(&events(&case), None);
@@ -1295,7 +1296,7 @@ fn an_unusable_declarations_entry_reads_nothing_and_logs_why() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(outcome.stderr.contains(BUSY_LINE), "the run still routed: {outcome:?}");
     assert!(!outcome.stderr.contains("declarations"), "the line is the log's alone: {outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     let why = format!("gate: declarations for {} not read: '{}' does not exist", repo(&case), missing.display());
     assert_eq!(log.lines().filter(|line| *line == why).count(), 1, "said once a run: {why}: {log}");
 }
@@ -1321,7 +1322,7 @@ fn a_broken_siblings_file_in_the_worktree_wins_and_notes_the_copy_it_shadows() {
         "the worktree's broken file wins: {outcome:?}"
     );
     assert!(!outcome.stderr.contains("shadows"), "the note is the log's alone: {outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     let note = format!("gate: .gate/siblings.toml shadows {}", folder.join("siblings.toml").display());
     assert!(log.lines().any(|line| line == note), "{note}: {log}");
     assert_local(&events(&case), None);
@@ -1588,7 +1589,7 @@ fn a_routed_run_goes_to_the_client_and_passes_its_output_and_status_through() {
         ],
     );
     assert!(!outcome.stdout.contains("ran here"), "the command never ran here: {outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(log.contains("ran there") && !log.contains("ran here"), "{log}");
     let events = events(&case);
     assert_eq!(names(&events), ["queue", "take", "release"], "{events:#?}");
@@ -1889,7 +1890,7 @@ fn a_fallback_that_never_starts_the_command_keeps_the_attempts_lines_once() {
     assert_eq!(outcome.code, Some(127), "{outcome:?}");
     assert!(outcome.stderr.contains(BUSY_LINE), "{outcome:?}");
     assert!(outcome.stderr.contains("gate: could not start nonexistent-tool"), "{outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert_eq!(log.matches("attempt line").count(), 1, "the attempt's line stands once: {log}");
     assert_refused(&events(&case), "busy");
 }
@@ -1927,7 +1928,7 @@ fn a_refused_run_falls_back_to_a_local_run_with_the_attempts_lines_in_the_log() 
     ));
     let log = case.folder().join("out.log");
     wait_until("the local command writing its log", || {
-        fs::read_to_string(&log).is_ok_and(|text| text.starts_with("ran here"))
+        log_texts(&log).lines().any(|text| text == "ran here")
     });
 
     assert!(!remote_claim(&case).exists(), "the remote claim is gone once the run fell back");
@@ -1939,8 +1940,9 @@ fn a_refused_run_falls_back_to_a_local_run_with_the_attempts_lines_in_the_log() 
     let line = "gate: remote builder unreachable; running here";
     assert!(outcome.stderr.contains(line), "{outcome:?}");
     assert_in_order(
-        &fs::read_to_string(&log).expect("the log was written"),
-        &["ran here", "attempt line", line],
+        &log_texts(&log),
+        // The attempt's lines are notes said before the run here starts, so the log holds them, in time order, first.
+        &["attempt line", line, "ran here"],
     );
     assert_refused(&events(&case), "unreachable");
 }
@@ -2172,9 +2174,11 @@ fn rewrite_record(case: &Case, text: &str) {
     fs::write(path, text).expect("the record can be written");
 }
 
-/// The lines the command printed: the stdout lines before the first of the gate's own, which the tail repeats.
+/// The lines the command printed: the stdout lines after the notes said before the run and before the next of the
+/// gate's own, which the tail repeats.
 fn command_lines(stdout: &str) -> Vec<&str> {
-    stdout.lines().take_while(|line| !line.starts_with("gate: ")).collect()
+    let note = |line: &&str| line.starts_with("gate: ");
+    stdout.lines().skip_while(note).take_while(|line| !note(line)).collect()
 }
 
 /// Whether the last slot the case's gates took is a heavy one (`...-slot-<n>`), taken by a gate of the heavy kind
@@ -3632,7 +3636,7 @@ fn a_skipped_candidate_is_noted_in_the_log_after_the_refusing_attempt_s_lines() 
     assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
     assert!(has_line(&outcome.stderr, "gate: remote mac-1 version; running here"), "{outcome:?}");
     assert!(!outcome.stderr.contains("not trying"), "the skip is for the log alone: {outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert_in_order(
         &log,
         &["attempt line", "gate: not trying builder: ", "gate: remote mac-1 version; running here"],
@@ -3705,7 +3709,7 @@ fn a_run_going_on_to_the_next_builder_says_the_refusing_attempt_s_lines_first() 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let trying = "gate: remote mac-1 version; trying builder";
     assert_in_order(&outcome.stderr, &["attempt line", trying, "host line"]);
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     let read = format!("gate: .gate/local.toml read from {}", local.display());
     assert_in_order(&log, &["attempt line", &read, trying]);
 }

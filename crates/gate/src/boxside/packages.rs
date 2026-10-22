@@ -36,6 +36,7 @@ use crate::boxside::run::{
     Beat, FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, Folders, Look, REFUSED_STATUS, Request, Stopper, WaitEnd, Watched, Watching, WorkGit,
     before_the_job, box_variables, client_gone, end_job, full_path, said_stopped, with_safe_directory,
 };
+use crate::boxside::stamping;
 use crate::boxside::stop::{packages_job_name, terminate_and_wait};
 use crate::boxside::tools::{read_record, write_record_file};
 use crate::console::Console;
@@ -488,11 +489,14 @@ fn read(path: &str, console: &mut Console) -> Record {
         Ok(Some(text)) => Record::parse(&text),
         Ok(None) => Record::default(),
         Err(error) => {
-            console.err(&format!(
-                "gate: remote could not read {}: {}; installing the packages",
-                escaped(path),
-                escaped(&error.to_string())
-            ));
+            stamping::err(
+                console,
+                &format!(
+                    "gate: remote could not read {}: {}; installing the packages",
+                    escaped(path),
+                    escaped(&error.to_string())
+                ),
+            );
             Record::default()
         }
     }
@@ -522,25 +526,31 @@ fn ignored(manager: &Manager, git: &WorkGit, work: &Path, key: &str, console: &m
     let why = match git.quiet_code("check-ignore", &args, console) {
         Ok(0) => return Ok(true),
         Ok(1) => {
-            console.err(&format!(
-                "gate: remote {} install skipped: node_modules is not ignored in {}",
-                manager.name,
-                escaped(key)
-            ));
+            stamping::err(
+                console,
+                &format!(
+                    "gate: remote {} install skipped: node_modules is not ignored in {}",
+                    manager.name,
+                    escaped(key)
+                ),
+            );
             return Ok(false);
         }
         Ok(status) => format!("status {status}"),
         Err(GitFailure::NotStarted(message) | GitFailure::Failed(message)) => escaped(&message),
         Err(GitFailure::ClientGone) => {
             let gone = client_gone("check-ignore");
-            console.err(&gone.line);
+            stamping::err(console, &gone.line);
             return Err(gone.status);
         }
     };
-    console.err(&format!(
-        "gate: remote could not ask git whether node_modules is ignored in {}: {why}",
-        escaped(key)
-    ));
+    stamping::err(
+        console,
+        &format!(
+            "gate: remote could not ask git whether node_modules is ignored in {}: {why}",
+            escaped(key)
+        ),
+    );
     Ok(false)
 }
 
@@ -614,7 +624,10 @@ fn install(request: &Request<'_>, lockfile: &Lockfile<'_>, key: &str, beat: &Bea
             match drained {
                 Ok(()) => {
                     let place = if key == "." { String::new() } else { format!(" in {}", escaped(key)) };
-                    console.err(&format!("gate: {} install took {:.1} s{place}", manager.name, took.as_secs_f64()));
+                    stamping::err(
+                        console,
+                        &format!("gate: {} install took {:.1} s{place}", manager.name, took.as_secs_f64()),
+                    );
                     Installed::Status(code.cast_signed())
                 }
                 Err(status) => Installed::Ended(status),
@@ -647,7 +660,7 @@ fn start(
     match Forwarders::start(
         stdout,
         stderr,
-        crate::boxside::forward::Stamping::None,
+        stamping::forwarded(),
         crate::boxside::forward::Sink::Own {
             lock: beat.lock,
             gone: beat.gone,
@@ -672,11 +685,10 @@ fn stopped(watched: Watched<'_>, lock: &OutputLock, console: &mut Console) -> u3
 /// Writes `record` at `path`; a failure is said and fails the run with status 1.
 fn write(path: &str, record: &Record, console: &mut Console) -> Result<(), u32> {
     if let Err(error) = write_record_file(path, &record.text()) {
-        console.err(&format!(
-            "gate: remote could not write {}: {}",
-            escaped(path),
-            escaped(&error.to_string())
-        ));
+        stamping::err(
+            console,
+            &format!("gate: remote could not write {}: {}", escaped(path), escaped(&error.to_string())),
+        );
         return Err(FAILED_STATUS);
     }
     Ok(())
@@ -685,11 +697,11 @@ fn write(path: &str, record: &Record, console: &mut Console) -> Result<(), u32> 
 /// Refuses the run for `manager`'s install that ended with `status`: the status line, then the `tools` tag and the
 /// packages line under the heartbeat's lock; status 75.
 fn refused(request: &Request<'_>, manager: &Manager, status: i32, beat: &Beat<'_>, console: &mut Console) -> u32 {
-    console.err(&format!("gate: remote package restore failed (status {status})"));
+    stamping::err(console, &format!("gate: remote package restore failed (status {status})"));
     // Held across both lines, so no heartbeat lands between the tag and the line it tags.
     let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
-    console.err(&refused_line(request.nonce, Refusal::Tools));
-    console.err(&packages_line(manager.name, request.key));
+    stamping::protocol(console, &refused_line(request.nonce, Refusal::Tools));
+    stamping::err(console, &packages_line(manager.name, request.key));
     REFUSED_STATUS
 }
 
@@ -706,7 +718,7 @@ pub(super) fn update(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>
     let mut places: Vec<(&'static Manager, Found)> = Vec::new();
     for words in request.commands() {
         let place = lockfile_for(words, folders).map_err(|line| {
-            console.err(&line);
+            stamping::err(console, &line);
             FAILED_STATUS
         })?;
         let Some((manager, found)) = place else {
@@ -725,21 +737,30 @@ pub(super) fn update(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>
     for (manager, found) in places {
         match found {
             Found::Nothing => {}
-            Found::Outside(outside) => console.err(&format!(
-                "gate: remote {} install skipped: {} is outside the work root",
-                manager.name,
-                escaped(&outside.to_string_lossy())
-            )),
-            Found::Linked(link) => console.err(&format!(
-                "gate: remote {} install skipped: {} is reached through a link",
-                manager.name,
-                escaped(&link)
-            )),
-            Found::OtherManager(folder) => console.err(&format!(
-                "gate: remote {} install skipped: {} holds a pnpm or bun lockfile",
-                manager.name,
-                escaped(&relative(folders.work, &folder))
-            )),
+            Found::Outside(outside) => stamping::err(
+                console,
+                &format!(
+                    "gate: remote {} install skipped: {} is outside the work root",
+                    manager.name,
+                    escaped(&outside.to_string_lossy())
+                ),
+            ),
+            Found::Linked(link) => stamping::err(
+                console,
+                &format!(
+                    "gate: remote {} install skipped: {} is reached through a link",
+                    manager.name,
+                    escaped(&link)
+                ),
+            ),
+            Found::OtherManager(folder) => stamping::err(
+                console,
+                &format!(
+                    "gate: remote {} install skipped: {} holds a pnpm or bun lockfile",
+                    manager.name,
+                    escaped(&relative(folders.work, &folder))
+                ),
+            ),
             Found::Lockfile(folder) => {
                 let lockfile = Lockfile {
                     manager,
@@ -786,14 +807,17 @@ fn shared_folder(places: &[(&'static Manager, Found)], work: &Path) -> Option<Sh
 fn refused_shared(request: &Request<'_>, shared: &Shared, beat: &Beat<'_>, console: &mut Console) -> u32 {
     // Held across both lines, so no heartbeat lands between the tag and the line it tags.
     let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
-    console.err(&refused_line(request.nonce, Refusal::Tools));
-    console.err(&format!(
-        "gate: remote work folder {} uses both {} and {} in {}",
-        request.key,
-        shared.first.name,
-        shared.second.name,
-        escaped(&shared.folder)
-    ));
+    stamping::protocol(console, &refused_line(request.nonce, Refusal::Tools));
+    stamping::err(
+        console,
+        &format!(
+            "gate: remote work folder {} uses both {} and {} in {}",
+            request.key,
+            shared.first.name,
+            shared.second.name,
+            escaped(&shared.folder)
+        ),
+    );
     REFUSED_STATUS
 }
 
@@ -825,7 +849,7 @@ struct Lockfile<'a> {
 fn update_folder(request: &Request<'_>, git: &WorkGit, lockfile: &Lockfile<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
     let (manager, folder) = (lockfile.manager, &lockfile.folder);
     let digest = hash(manager, folder).map_err(|line| {
-        console.err(&line);
+        stamping::err(console, &line);
         FAILED_STATUS
     })?;
     let place = relative(lockfile.work, folder);
@@ -846,11 +870,10 @@ fn update_folder(request: &Request<'_>, git: &WorkGit, lockfile: &Lockfile<'_>, 
         Ok(Installed::Status(status)) => status,
         Ok(Installed::Ended(status)) => return Err(status),
         Err(message) => {
-            console.err(&format!(
-                "gate: remote could not start the {} install: {}",
-                manager.name,
-                escaped(&message)
-            ));
+            stamping::err(
+                console,
+                &format!("gate: remote could not start the {} install: {}", manager.name, escaped(&message)),
+            );
             FAILED_STATUS.cast_signed()
         }
     };

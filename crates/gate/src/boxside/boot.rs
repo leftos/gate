@@ -4,6 +4,7 @@
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
+use crate::boxside::stamping;
 use crate::console::Console;
 
 /// Says the boot line on stdout through `console` and returns whether the boot time was read; a boot time that cannot be
@@ -17,11 +18,11 @@ pub(crate) fn say(console: &mut Console) -> bool {
 pub(crate) fn say_with(reader: impl FnOnce() -> Result<Timestamp, String>, console: &mut Console) -> bool {
     match reader() {
         Ok(time) => {
-            console.out(&boot_line(time));
+            stamping::out(console, &boot_line(time));
             true
         }
         Err(message) => {
-            console.err(&boot_failure(&message));
+            stamping::err(console, &boot_failure(&message));
             false
         }
     }

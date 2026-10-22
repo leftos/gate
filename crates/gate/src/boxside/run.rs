@@ -32,6 +32,7 @@ use gate_watchdog::{Kill, Pump, is_wsl_command};
 use gate_win32::{
     Donor, EnvironmentBlock, Job, LaunchError, NamedEvent, PipedConsole, PipedLaunch, PipedSuspended, RestrictedToken, Running, Utf8Console,
 };
+use gate_wire::stamp::Tag;
 use gate_wire::{PairSibling, PathForm, Payload, bare_stem, ordinal_upper, trees};
 
 use crate::answer::USAGE_STATUS;
@@ -48,6 +49,7 @@ use crate::boxside::preflight::{
     self, Failed, GIT_REDIRECTS, Git, GitClass, GitFailure, GitOutput, GitStep, GitStop, Pipe, Shared, Streams, Unready, git_failed,
 };
 use crate::boxside::probe;
+use crate::boxside::stamping::{self, ProcessLines};
 use crate::boxside::stop::{Ending, STOPPED, stop_event_name, terminate_and_wait};
 use crate::boxside::tools;
 use crate::console::Console;
@@ -369,8 +371,8 @@ pub(super) fn lay_out_alone(asked: &inputs::WorkLock<'_>, console: &mut Console)
 /// heartbeat: its refusal tag naming `nonce`, then the line naming the repo `repo` and why
 /// ([`crate::remote::layout_line`]); 75.
 fn layout_refused_alone(nonce: &str, repo: &str, why: &str, console: &mut Console) -> u32 {
-    console.err(&refused_line(nonce, Refusal::Layout));
-    console.err(&crate::remote::layout_line(repo, &escaped(why)));
+    stamping::protocol(console, &refused_line(nonce, Refusal::Layout));
+    stamping::err(console, &crate::remote::layout_line(repo, &escaped(why)));
     REFUSED_STATUS
 }
 
@@ -457,19 +459,22 @@ fn inputs_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: 
         Ok(moved_aside) => {
             if let Some(line) = moved_aside {
                 let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
-                console.err(&line);
+                stamping::err(console, &line);
             }
             return Ok(());
         }
         Err(why) => why,
     };
     let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
-    console.err(&inputs::refused_line(request.nonce));
-    console.err(&format!(
-        "gate: remote inputs of work folder {} are not the ones sent: {}",
-        request.key,
-        escaped(&why)
-    ));
+    stamping::protocol(console, &inputs::refused_line(request.nonce));
+    stamping::err(
+        console,
+        &format!(
+            "gate: remote inputs of work folder {} are not the ones sent: {}",
+            request.key,
+            escaped(&why)
+        ),
+    );
     Err(REFUSED_STATUS)
 }
 
@@ -487,19 +492,22 @@ fn sent_matched(request: &Request<'_>, held: &File, beat: &Beat<'_>, console: &m
         Ok(moved_aside) => {
             if let Some(line) = moved_aside {
                 let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
-                console.err(&line);
+                stamping::err(console, &line);
             }
             return Ok(());
         }
         Err(why) => why,
     };
     let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
-    console.err(&refused_line(request.nonce, Refusal::Sent));
-    console.err(&format!(
-        "gate: remote build sent to work folder {} is not the one there: {}",
-        request.key,
-        escaped(&why)
-    ));
+    stamping::protocol(console, &refused_line(request.nonce, Refusal::Sent));
+    stamping::err(
+        console,
+        &format!(
+            "gate: remote build sent to work folder {} is not the one there: {}",
+            request.key,
+            escaped(&why)
+        ),
+    );
     Err(REFUSED_STATUS)
 }
 
@@ -571,10 +579,12 @@ impl<'a> Repo<'a> {
 /// Once the subfolder is checked, a heartbeat goes to stderr every period, 5 s unless `seams` set it, until the run
 /// ends; `seams` may also make the command's console fail, or park its launch.
 pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
+    let _stamps = stamping::Stamps::begin();
+    stamping::err(console, &stamping::root_line());
     let request = match Request::read(payload) {
         Ok(request) => request,
         Err(line) => {
-            console.err(&line);
+            stamping::err(console, &line);
             return u32::from(USAGE_STATUS);
         }
     };
@@ -583,12 +593,12 @@ pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
     let _lock = match take_lock(request.lock) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
-            console.err(&refused_line(request.nonce, Refusal::Busy));
-            console.err(&crate::remote::busy_line(request.key));
+            stamping::protocol(console, &refused_line(request.nonce, Refusal::Busy));
+            stamping::err(console, &crate::remote::busy_line(request.key));
             return REFUSED_STATUS;
         }
         Err(line) => {
-            console.err(&line);
+            stamping::err(console, &line);
             no_back_commits(&request, console);
             return FAILED_STATUS;
         }
@@ -670,7 +680,7 @@ impl<'a> StopSignal<'a> {
             Look::Stopped => true,
             Look::Go(unread) => {
                 if let Some(line) = unread {
-                    console.err(&line);
+                    stamping::err(console, &line);
                 }
                 false
             }
@@ -701,7 +711,13 @@ impl Beat<'_> {
     /// Says `line` on stderr holding the box's output lock, so it never lands inside a heartbeat or a forwarded line.
     pub(super) fn say(&self, console: &mut Console, line: &str) {
         let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        console.err(line);
+        stamping::err(console, line);
+    }
+
+    /// Says the protocol `line` on stderr exactly as it is, holding the box's output lock as [`Beat::say`] does.
+    pub(super) fn say_protocol(&self, console: &mut Console, line: &str) {
+        let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        stamping::protocol(console, line);
     }
 }
 
@@ -753,7 +769,7 @@ impl<'a> RunOutputs<'a> {
                 if let Some(skipped) = skipped {
                     beat.say(console, &skipped);
                 }
-                beat.say(console, &line);
+                beat.say_protocol(console, &line);
                 self.trim_outputs(line != outputs::NOTHING_PACKED, beat, console)
             }
             Err(reason) => {
@@ -810,10 +826,13 @@ fn in_work_folder(request: &Request<'_>, stop: &Rc<NamedEvent>, seams: &BoxSeams
     // Refused before the checkout, so a payload naming a folder outside the work folder changes nothing there; the
     // earlier run's back ref goes, as the checkout's would, so the client finds none to fetch.
     let Some((work, place)) = work_and_place(request.tree(), request.subfolder) else {
-        console.err(&format!(
-            "gate: remote subfolder {} is not a folder inside the work folder",
-            escaped(request.subfolder)
-        ));
+        stamping::err(
+            console,
+            &format!(
+                "gate: remote subfolder {} is not a folder inside the work folder",
+                escaped(request.subfolder)
+            ),
+        );
         if request.siblings.is_empty() {
             git.clear_back_ref(request, &request.main, console)
                 .map_err(|failed| said(console, &failed))?;
@@ -823,7 +842,7 @@ fn in_work_folder(request: &Request<'_>, stop: &Rc<NamedEvent>, seams: &BoxSeams
     };
     // A heartbeat that cannot start ends the heartbeats, never the run.
     let pump = heartbeat::start(&lock, &gone, heartbeat::period(seams))
-        .inspect_err(|error| console.err(&format!("gate: remote heartbeat stopped: cannot start the heartbeat: {error}")))
+        .inspect_err(|error| stamping::err(console, &format!("gate: remote heartbeat stopped: cannot start the heartbeat: {error}")))
         .ok();
     let beat = Beat {
         lock: &lock,
@@ -909,7 +928,7 @@ fn commanded(
         Err(failed) => {
             back_commits_failed(request, beat, console);
             let message = failed.or_end(console)?;
-            console.err(&format!("gate: remote sync-back failed: {message}"));
+            stamping::err(console, &format!("gate: remote sync-back failed: {message}"));
             return Ok(if status == 0 { FAILED_STATUS } else { status });
         }
     };
@@ -950,7 +969,7 @@ fn ran_command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &
 fn warm_up(request: &Request<'_>, hash: &str, place: &Path, beat: &Beat<'_>, console: &mut Console) -> Result<u32, u32> {
     let record = warm_record(request.work);
     record_step(preflight::remove_entry(Path::new(&record)), "remove", &record, beat, console)?;
-    beat.say(console, &started_line(request.nonce));
+    beat.say_protocol(console, &started_line(request.nonce));
     let ended = match warm_commands(request, place, beat, console) {
         Ok(0) => {
             let written = written_retrying(&record, hash, || thread::sleep(WARM_WRITE_WAIT));
@@ -1250,7 +1269,7 @@ fn ended_whole(job: &Job, beat: &Beat<'_>, console: &mut Console) {
     let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
     match ending {
         Ok(ending) => ending.say(job.name(), console),
-        Err(error) => console.err(&format!("gate: remote could not end job {}: {error}", job.name())),
+        Err(error) => stamping::err(console, &format!("gate: remote could not end job {}: {error}", job.name())),
     }
 }
 
@@ -1343,8 +1362,8 @@ fn ready(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Bea
 /// command itself; 75.
 fn lfs_refused(request: &Request<'_>, line: &str, beat: &Beat<'_>, console: &mut Console) -> u32 {
     let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
-    console.err(&lfs::refused_line(request.nonce));
-    console.err(line);
+    stamping::protocol(console, &lfs::refused_line(request.nonce));
+    stamping::err(console, line);
     REFUSED_STATUS
 }
 
@@ -1353,10 +1372,10 @@ fn lfs_refused(request: &Request<'_>, line: &str, beat: &Beat<'_>, console: &mut
 /// [`ready`] gives it.
 fn restored(request: &Request<'_>, git: &WorkGit, folders: &Folders<'_>, beat: &Beat<'_>, console: &mut Console) -> Result<(), u32> {
     if !folders.place.is_dir() {
-        console.err(&format!(
-            "gate: remote subfolder {} does not exist in the snapshot",
-            escaped(request.subfolder)
-        ));
+        stamping::err(
+            console,
+            &format!("gate: remote subfolder {} does not exist in the snapshot", escaped(request.subfolder)),
+        );
         return Err(ended_before(u32::from(USAGE_STATUS), request, beat, console));
     }
     let restored =
@@ -1402,13 +1421,13 @@ fn back_commits_failed(request: &Request<'_>, beat: &Beat<'_>, console: &mut Con
 fn no_back_commits(request: &Request<'_>, console: &mut Console) {
     // A warm-up brings nothing back, so it never says how its back commits went.
     if !request.siblings.is_empty() && request.warm_hash.is_none() {
-        console.err("gate: remote back commits: failed");
+        stamping::err(console, "gate: remote back commits: failed");
     }
 }
 
 /// Says the failed step's line; its status.
 fn said(console: &mut Console, failed: &Failed) -> u32 {
-    console.err(&failed.line);
+    stamping::err(console, &failed.line);
     failed.status
 }
 
@@ -1416,8 +1435,8 @@ fn said(console: &mut Console, failed: &Failed) -> u32 {
 /// ([`crate::remote::layout_line`]), said together under the box's output lock, so the PC runs the command itself; 75.
 fn layout_refused(request: &Request<'_>, why: &str, beat: &Beat<'_>, console: &mut Console) -> u32 {
     let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
-    console.err(&refused_line(request.nonce, Refusal::Layout));
-    console.err(&crate::remote::layout_line(request.repo_name(), &escaped(why)));
+    stamping::protocol(console, &refused_line(request.nonce, Refusal::Layout));
+    stamping::err(console, &crate::remote::layout_line(request.repo_name(), &escaped(why)));
     REFUSED_STATUS
 }
 
@@ -1629,7 +1648,7 @@ fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut 
         token: command_token(request, console)?,
     };
     before_the_job(beat.stop.look(STARTING_COMMAND), request.job, beat.lock, console)?;
-    let job = create_job(request.job, console)?;
+    let (job, mut process_lines) = create_job(request.job, beat, console)?;
     // Started right after the job and kept until the command's wait is over, so its console outlives the command.
     let donor = console_donor(&job, launch.token.as_ref(), beat.seams);
     if let Some(park) = beat.seams.park_launch.as_deref() {
@@ -1672,6 +1691,7 @@ fn command(request: &Request<'_>, one: &One<'_>, beat: &Beat<'_>, console: &mut 
     stopper.armed = false;
     // Ended only now, so the command's console stays up for as long as the command may use it.
     drop(donor);
+    process_lines.finish(&job);
     if one.of == Of::WarmUp {
         ended_whole(&job, beat, console);
     }
@@ -1707,7 +1727,7 @@ fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> 
     let variables = match with_unreal(&request.engine, &request.engine_env, variables) {
         Ok(variables) => variables,
         Err(line) => {
-            console.err(&line);
+            stamping::err(console, &line);
             return Err(Ok(Ran::Exited(NOT_STARTED)));
         }
     };
@@ -1721,7 +1741,7 @@ fn prepared<'w>(request: &Request<'_>, one: &One<'w>, console: &mut Console) -> 
     };
     match written(&program, &rest, &variables) {
         Written::Refused(line) => {
-            console.err(&line);
+            stamping::err(console, &line);
             Err(Err(u32::from(USAGE_STATUS)))
         }
         Written::NoShell(message) => Err(Ok(Ran::Exited(not_started(console, word, Some(&program), &message)))),
@@ -1970,7 +1990,7 @@ fn restricted_token(console: &mut Console) -> Option<RestrictedToken> {
     match RestrictedToken::of_this_process() {
         Ok(token) => Some(token),
         Err(error) => {
-            console.err(&own_token_line(&error));
+            stamping::err(console, &own_token_line(&error));
             None
         }
     }
@@ -2045,7 +2065,7 @@ fn console_donor(job: &Job, token: Option<&RestrictedToken>, seams: &BoxSeams) -
 /// said.
 fn start_command(start: &mut Start<'_>, donor: Result<&Donor, &str>, beat: &Beat<'_>, console: &mut Console) -> Result<Launched, Result<u32, u32>> {
     if let Some(nonce) = start.marker {
-        beat.say(console, &started_line(nonce));
+        beat.say_protocol(console, &started_line(nonce));
     }
     let ended = match donor {
         Ok(donor) => on_utf8_console(start, donor, beat, console),
@@ -2090,7 +2110,7 @@ fn on_utf8_console(start: &mut Start<'_>, donor: &Donor, beat: &Beat<'_>, consol
         Ok(utf8) => {
             let ended = launch(start, PipedConsole::Attached);
             if let Err(problem) = utf8.leave() {
-                console.err(&format!("gate: remote {problem}"));
+                stamping::err(console, &format!("gate: remote {problem}"));
             }
             ended
         }
@@ -2123,10 +2143,10 @@ impl Ended {
             say_fallback(console, reason);
         }
         if let Some(line) = self.own_token.as_deref().filter(|_| not_stopped) {
-            console.err(line);
+            stamping::err(console, line);
         }
         if let Some(line) = &self.unread {
-            console.err(line);
+            stamping::err(console, line);
         }
     }
 }
@@ -2250,7 +2270,7 @@ pub(super) fn before_the_job(seen: Look, job: &str, lock: &OutputLock, console: 
         Look::Stopped => Err(stopped_first(console, job)),
         Look::Go(unread) => {
             if let Some(line) = unread {
-                console.err(&line);
+                stamping::err(console, &line);
             }
             Ok(())
         }
@@ -2277,7 +2297,7 @@ pub(super) fn said_stopped(job: &Job, ending: io::Result<Ending>, lock: &OutputL
     let status = stopped_first(console, job.name());
     match ending {
         Ok(ending) => ending.say(job.name(), console),
-        Err(error) => console.err(&format!("gate: and could not terminate the job {}: {error}", job.name())),
+        Err(error) => stamping::err(console, &format!("gate: and could not terminate the job {}: {error}", job.name())),
     }
     status
 }
@@ -2292,9 +2312,10 @@ fn start_refused(console: &mut Console, start: &Start<'_>, error: LaunchError) -
 
 /// Says that the command runs on the box's default code page, for `reason`.
 fn say_fallback(console: &mut Console, reason: &str) {
-    console.err(&format!(
-        "gate: remote could not give the command a UTF-8 console ({reason}); running it on the box's default code page"
-    ));
+    stamping::err(
+        console,
+        &format!("gate: remote could not give the command a UTF-8 console ({reason}); running it on the box's default code page"),
+    );
 }
 
 /// The park seam's wait, before the box's output is locked: it creates the empty file `<path>.parked` as it starts, so
@@ -2304,7 +2325,10 @@ fn wait_for_path(path: &Path, console: &mut Console) {
     let mut parked = path.as_os_str().to_owned();
     parked.push(".parked");
     if let Err(error) = File::create(&parked) {
-        console.err(&format!("gate: remote park seam cannot create {}: {error}", Path::new(&parked).display()));
+        stamping::err(
+            console,
+            &format!("gate: remote park seam cannot create {}: {error}", Path::new(&parked).display()),
+        );
     }
     let started = Instant::now();
     while !path.exists() && started.elapsed() < PARK_LIMIT {
@@ -2321,7 +2345,7 @@ fn start_failed(console: &mut Console, word: &str, program: &Path, code: u32, me
     match gate_win32::breakaway_refused() {
         Ok(false) => Ok(not_started(console, word, Some(program), message)),
         Ok(true) => {
-            console.err(&format!("gate: the box cannot start a command outside its own job: {message}"));
+            stamping::err(console, &format!("gate: the box cannot start a command outside its own job: {message}"));
             Err(FAILED_STATUS)
         }
         Err(error) => Err(failed(
@@ -2341,21 +2365,24 @@ fn create_stop_event(name: &str, console: &mut Console) -> Result<NamedEvent, u3
 /// Creates the run's job `name` with a box run's job's security ([`box_run_job`]); a name some job already has is
 /// refused, so a run never shares a job and a stop meant for an earlier run never reaches it; shared, so the
 /// heartbeat's thread can read its CPU. Else the status 1, its line said.
-fn create_job(name: &str, console: &mut Console) -> Result<Arc<Job>, u32> {
-    job_made(box_run_job(name, false), name, console)
+fn create_job(name: &str, beat: &Beat<'_>, console: &mut Console) -> Result<(Arc<Job>, ProcessLines), u32> {
+    job_made(box_run_job(name, false), name, beat, console)
 }
 
-/// The run's job `name` as `made` gave it, shared, as [`create_job`] gives it; else the status 1, its line said, a
-/// name some job already has said as such.
-pub(super) fn job_made(made: io::Result<Job>, name: &str, console: &mut Console) -> Result<Arc<Job>, u32> {
-    made.map(Arc::new).map_err(|error| {
+/// The run's job `name` as `made` gave it, shared, as [`create_job`] gives it, remembering its processes before any
+/// joins it, each written as a process line under the run's lock ([`ProcessLines`]); else the status 1, its line said,
+/// a name some job already has said as such.
+pub(super) fn job_made(made: io::Result<Job>, name: &str, beat: &Beat<'_>, console: &mut Console) -> Result<(Arc<Job>, ProcessLines), u32> {
+    let mut job = made.map_err(|error| {
         if error.kind() == io::ErrorKind::AlreadyExists {
-            console.err(&format!("gate: the job {name} already exists; a run's job name must be new"));
+            stamping::err(console, &format!("gate: the job {name} already exists; a run's job name must be new"));
             FAILED_STATUS
         } else {
             failed(console, &format!("cannot create the job {name}: {error}"))
         }
-    })
+    })?;
+    let lines = ProcessLines::start(&mut job, beat.lock, beat.gone).map_err(|why| failed(console, &why))?;
+    Ok((Arc::new(job), lines))
 }
 
 /// Terminates the job when dropped armed: the command's on a panic after it was resumed, so the command does not
@@ -2406,7 +2433,7 @@ fn watch(started: Started<'_, '_>, console: &mut Console) -> Result<Ran, u32> {
     let forwarders = match Forwarders::start(
         pipes.stdout,
         pipes.stderr,
-        crate::boxside::forward::Stamping::None,
+        crate::boxside::forward::Stamping::Tags(Tag::Out, Tag::Err),
         crate::boxside::forward::Sink::Own {
             lock: beat.lock,
             gone: beat.gone,
@@ -2506,7 +2533,10 @@ fn end_what_it_left(job: &Job, keep: &[u32], console: &mut Console) {
     if let Ok(root) = resolve::root(None, &Environment::from_process()) {
         end_leftovers(job, &root.root, keep, console);
     } else {
-        console.err("gate: cannot end the run's job: the box's state root cannot be resolved; ending the whole job");
+        stamping::err(
+            console,
+            "gate: cannot end the run's job: the box's state root cannot be resolved; ending the whole job",
+        );
         end_job(job, console);
     }
 }
@@ -2648,7 +2678,7 @@ impl Watched<'_> {
             return Err(closed_connection(self.job, terminate_and_wait(self.job), console));
         }
         if !drained.all_ended {
-            console.err(self.watching.leftover());
+            stamping::err(console, self.watching.leftover());
         }
         Ok(())
     }
@@ -2665,7 +2695,7 @@ impl Watched<'_> {
             return Err(closed_connection(self.job, ending, console));
         }
         if !drained.all_ended {
-            console.err(self.watching.leftover());
+            stamping::err(console, self.watching.leftover());
         }
         Ok(ending)
     }
@@ -2687,7 +2717,7 @@ impl Watched<'_> {
         self.forwarders.drain(DRAIN);
         match ending {
             Ok(ending) => ending.say(self.job.name(), console),
-            Err(error) => console.err(&format!("gate: remote could not stop job {}: {error}", self.job.name())),
+            Err(error) => stamping::err(console, &format!("gate: remote could not stop job {}: {error}", self.job.name())),
         }
         status
     }
@@ -2703,10 +2733,13 @@ fn closed_connection(job: &Job, ending: io::Result<Ending>, console: &mut Consol
     } else {
         "stopping"
     };
-    console.err(&format!("gate: remote the client closed the connection; {said} job {}", job.name()));
+    stamping::err(
+        console,
+        &format!("gate: remote the client closed the connection; {said} job {}", job.name()),
+    );
     match ending {
         Ok(ending) => ending.say(job.name(), console),
-        Err(error) => console.err(&format!("gate: remote could not stop job {}: {error}", job.name())),
+        Err(error) => stamping::err(console, &format!("gate: remote could not stop job {}: {error}", job.name())),
     }
     CLOSED_STATUS
 }
@@ -2714,13 +2747,13 @@ fn closed_connection(job: &Job, ending: io::Result<Ending>, console: &mut Consol
 /// Terminates the job of a process the box no longer watches, saying a terminate that failed.
 pub(super) fn end_job(job: &Job, console: &mut Console) {
     if let Err(error) = job.terminate(STOPPED) {
-        console.err(&format!("gate: and could not terminate the job {}: {error}", job.name()));
+        stamping::err(console, &format!("gate: and could not terminate the job {}: {error}", job.name()));
     }
 }
 
 /// Says the box's own failure; status 1.
 pub(super) fn failed(console: &mut Console, problem: &str) -> u32 {
-    console.err(&format!("gate: the gate failed while running the command: {problem}"));
+    stamping::err(console, &format!("gate: the gate failed while running the command: {problem}"));
     FAILED_STATUS
 }
 
@@ -2728,8 +2761,11 @@ pub(super) fn failed(console: &mut Console, problem: &str) -> u32 {
 fn not_started(console: &mut Console, word: &str, resolved: Option<&Path>, message: &str) -> u32 {
     let resolved = resolved.map(|path| path.to_string_lossy().into_owned());
     match resolved.filter(|resolved| resolved != word) {
-        Some(resolved) => console.err(&format!("gate: could not start {} ({}): {message}", escaped(word), escaped(&resolved))),
-        None => console.err(&format!("gate: could not start {}: {message}", escaped(word))),
+        Some(resolved) => stamping::err(
+            console,
+            &format!("gate: could not start {} ({}): {message}", escaped(word), escaped(&resolved)),
+        ),
+        None => stamping::err(console, &format!("gate: could not start {}: {message}", escaped(word))),
     }
     NOT_STARTED
 }
@@ -3081,7 +3117,7 @@ impl WorkGit {
     /// Says `line` on stderr holding the box's output lock.
     fn say(&self, console: &mut Console, line: &str) {
         let _held = self.output.lock().unwrap_or_else(PoisonError::into_inner);
-        console.err(line);
+        stamping::err(console, line);
     }
 
     /// Each repo's tree and its `.git` made folders of their own ([`plain_tree`]) and readied as the preflight readies
@@ -3263,7 +3299,7 @@ impl WorkGit {
                 return unclean;
             }
             let _held = self.output.lock().unwrap_or_else(PoisonError::into_inner);
-            console.err(&unclean.line);
+            stamping::err(console, &unclean.line);
         }
         Failed {
             line: format!("gate: remote {step} failed: {}", lfs::NO_STORAGE_CHECKOUT),
@@ -3285,7 +3321,7 @@ impl WorkGit {
             Err(GitFailure::ClientGone) => Err(client_gone(&step)),
             Err(GitFailure::NotStarted(message) | GitFailure::Failed(message)) => {
                 let _held = self.output.lock().unwrap_or_else(PoisonError::into_inner);
-                console.err(&format!("gate: remote leftover-LFS check could not run: {message}"));
+                stamping::err(console, &format!("gate: remote leftover-LFS check could not run: {message}"));
                 Ok(false)
             }
         }
@@ -3444,7 +3480,7 @@ impl WorkGit {
                 gone.get_or_insert(undone);
             } else {
                 let _held = self.output.lock().unwrap_or_else(PoisonError::into_inner);
-                console.err(&undone.line);
+                stamping::err(console, &undone.line);
             }
         }
         gone
@@ -3477,7 +3513,7 @@ impl WorkGit {
         }
         if !request.siblings.is_empty() {
             let _held = self.output.lock().unwrap_or_else(PoisonError::into_inner);
-            console.err(&back_commits_line(request, &commits));
+            stamping::err(console, &back_commits_line(request, &commits));
         }
         Ok(commits.into_iter().next().flatten())
     }
@@ -3534,7 +3570,7 @@ impl WorkGit {
         let tree = added.and_then(|()| back.line(("write-tree", GitClass::Short), &["write-tree"], true, console));
         match fs::remove_file(request.index) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                console.err(&format!("gate: remote could not remove {}: {error}", request.index));
+                stamping::err(console, &format!("gate: remote could not remove {}: {error}", request.index));
             }
             _ => {}
         }

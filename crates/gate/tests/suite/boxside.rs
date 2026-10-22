@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use gate_win32::{EnvironmentBlock, Job, Launch, LaunchOutput, OpenedJob, StoppableProcess};
+use gate_wire::stamp::{Tag, is_process_line, unstamped};
 use jiff::{SignedDuration, Timestamp};
 use proc_table::Win32ProcessTable;
 use regex::Regex;
@@ -24,8 +25,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use crate::support::{
     Case, Escapee, FAKE_TOOL, GATE, GIT_REDIRECTS, Go, NetfxKey, Outcome, Running, StderrCloser, UNTIL_KILLED, allow_breakaway, box_payload,
-    build_version, copy_tool, finish, junction, names, shown, start_with_closable_stderr, start_with_closed_stdout, start_with_stdin, wait_until,
-    wait_until_closed,
+    build_version, copy_tool, finish, junction, log_texts, names, shown, start_with_closable_stderr, start_with_closed_stdout, start_with_stdin,
+    wait_until, wait_until_closed,
 };
 
 mod desktop;
@@ -74,7 +75,7 @@ impl BoxCall {
 
     /// Runs the box to its end, its request line written and its stdin then closed.
     fn finish(self) -> Outcome {
-        self.start().finish()
+        read_back(&self.start().finish())
     }
 
     /// Starts the box as [`start_with_closed_stdout`] does, its request line written and its stdin then closed.
@@ -106,7 +107,68 @@ fn ended_within(mut running: Running, guard: Duration) -> Outcome {
         );
         thread::sleep(Duration::from_millis(50));
     }
-    running.finish()
+    read_back(&running.finish())
+}
+
+/// `outcome` with each line of its stdout and stderr as a case asserts on it: read through [`unstamped`], the box's
+/// process lines (its own, and each process joining or leaving the command's job) left out. `box run` stamps every
+/// line but its protocol lines; every other verb's lines read back as they are.
+fn read_back(outcome: &Outcome) -> Outcome {
+    let texts = |said: &str| -> String {
+        let mut texts = String::new();
+        for line in said.lines() {
+            let read = unstamped(line);
+            if read.tag == Some(Tag::Gat) && is_process_line(read.text) {
+                continue;
+            }
+            texts.push_str(read.text);
+            texts.push('\n');
+        }
+        texts
+    };
+    Outcome {
+        stdout: texts(&outcome.stdout),
+        stderr: texts(&outcome.stderr),
+        raw_stdout: raw_texts(&outcome.raw_stdout),
+        code: outcome.code,
+    }
+}
+
+/// The bytes of `raw`, a box's stdout, with each line's stamp and tag cut off and the box's process lines left out,
+/// every other byte as it came.
+fn raw_texts(raw: &[u8]) -> Vec<u8> {
+    let mut texts = Vec::with_capacity(raw.len());
+    for line in raw.split_inclusive(|byte| *byte == b'\n') {
+        let shown = String::from_utf8_lossy(line);
+        let read = unstamped(shown.trim_end_matches(['\r', '\n']));
+        if read.tag == Some(Tag::Gat) && is_process_line(read.text) {
+            continue;
+        }
+        let cut = match read.stamp {
+            // The stamp, a space and the three-letter tag, then the space before a text that is not empty.
+            Some(stamp) => (stamp.len() + 4 + usize::from(!read.text.is_empty())).min(line.len()),
+            None => 0,
+        };
+        texts.extend_from_slice(&line[cut..]);
+    }
+    texts
+}
+
+/// A box's outcome as a case asserts on it ([`read_back`]), for a box run to its end through any of its starts.
+trait ReadBack {
+    fn finish_read(self) -> Outcome;
+}
+
+impl ReadBack for Running {
+    fn finish_read(self) -> Outcome {
+        read_back(&self.finish())
+    }
+}
+
+impl ReadBack for BoxCall {
+    fn finish_read(self) -> Outcome {
+        BoxCall::finish(self)
+    }
 }
 
 impl Deref for BoxCall {
@@ -169,7 +231,7 @@ fn gate_box(case: &Case, verb: &str, request: &str, path: Option<&OsString>) -> 
     if let Some(path) = path {
         call.env("PATH", path);
     }
-    call.finish()
+    call.finish_read()
 }
 
 /// A preflight's two folders under the case folder, laid out as the client lays out a builder's root: the bare
@@ -514,7 +576,7 @@ fn preflight_refuses_a_folder_above_the_work_root_another_account_may_delete_in(
     let above = case.folder().parent().expect("the case folder has a parent").to_owned();
     let request = payload(&box_payload(&case, "k", &["unused"]));
 
-    let outcome = box_call_stopped_at(&case, &above, &["box", "preflight"], &request).finish();
+    let outcome = box_call_stopped_at(&case, &above, &["box", "preflight"], &request).finish_read();
 
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
     assert_eq!(outcome.stdout, format!("gate: remote version {}\n", build_version(&case)));
@@ -831,7 +893,7 @@ fn preflight_sdks_line_from_dotnet() {
         &folders.payload(),
     );
     command.env("PATH", path_with_git(&[stub]));
-    let outcome = command.finish();
+    let outcome = command.finish_read();
 
     assert_eq!(passed(&outcome).last(), Some(&"gate: remote sdks 8.0.404,9.0.100"), "{outcome:?}");
 }
@@ -866,7 +928,7 @@ fn preflight_a_dotnet_that_does_not_answer_is_an_unreadable_sdk_list() {
     let mut command = box_call(&case, &["box", "--test-dotnet-limit-ms", "1000", "preflight"], &folders.payload());
     command.env("PATH", path_with_git(&[stub]));
 
-    let outcome = command.finish();
+    let outcome = command.finish_read();
 
     // A stub that started holds its output file open until its job's kill ends it; one the kill came first never made it.
     if held.exists() {
@@ -1027,7 +1089,7 @@ fn preflight_runs_dotnet_in_the_system_folder() {
         &folders.payload(),
     );
     command.env("PATH", path_with_git(&[stub]));
-    let outcome = command.finish();
+    let outcome = command.finish_read();
 
     assert_eq!(passed(&outcome).last(), Some(&"gate: remote sdks 8.0.404"), "{outcome:?}");
     let ran_in = fs::read_to_string(&ran_in).expect("the stub wrote the folder it ran in");
@@ -1095,7 +1157,7 @@ fn probed(case: &Case, needs: &Value, tools: &[(&str, &str)]) -> Outcome {
         &needing(&folders, needs),
     );
     command.env("PATH", path_with_git(&[stub]));
-    command.finish()
+    command.finish_read()
 }
 
 /// The probe bound every probe case passes but the one about the bound: long enough that no probe of a case reaches it
@@ -1215,7 +1277,7 @@ fn preflight_probes_the_tools_while_dotnet_lists_the_sdks() {
     );
     command.env("PATH", path_with_git(&[stub]));
 
-    let outcome = command.finish();
+    let outcome = command.finish_read();
 
     let printed = passed(&outcome);
     assert_eq!(
@@ -1277,7 +1339,7 @@ fn preflight_a_tool_that_does_not_answer_is_skipped_with_a_line() {
     let mut command = box_call(&case, &["box", "--test-probe-limit-ms", "1000", "preflight"], &needing(&folders, &needs));
     command.env("PATH", path_with_git(&[stub]));
 
-    let outcome = command.finish();
+    let outcome = command.finish_read();
 
     // A stub that started holds its output file open until its job's kill ends it; one the kill came first never made it.
     if held.exists() {
@@ -1389,7 +1451,7 @@ fn probed_with_root(case: &Case, needs: &Value, stubs: &[PathBuf], root: Option<
     } else {
         command.env_remove("GATE_GODOT_ROOT");
     }
-    command.finish()
+    command.finish_read()
 }
 
 /// Every Godot the root names is probed, and the line carries every version found, by number and without repeats.
@@ -1604,7 +1666,7 @@ fn probed_with_unreal_root(case: &Case, root: Option<&Path>) -> Outcome {
     } else {
         command.env_remove("GATE_UNREAL_ROOT");
     }
-    command.finish()
+    command.finish_read()
 }
 
 /// Every engine the root names is read, and the line carries every version found, by number and without repeats.
@@ -1650,7 +1712,7 @@ fn probed_netfx(case: &Case, key: &NetfxKey) -> Outcome {
         &needing(&folders, &json!({"netfx-sdk": "4.6.0"})),
     );
     command.env("PATH", path_with_git(&[]));
-    command.finish()
+    command.finish_read()
 }
 
 /// Every .NET Framework SDK the key lists with a folder that exists is said, by number.
@@ -1866,12 +1928,12 @@ fn box_usage_and_payload_errors_exit_2() {
         assert_eq!(outcome.stderr, BOX_USAGE, "{args:?}: the box usage alone");
     }
 
-    let not_an_object = bare_box_call(&case, &["box", "preflight"], &payload(&json!(["Bare", "Work"]))).finish();
+    let not_an_object = bare_box_call(&case, &["box", "preflight"], &payload(&json!(["Bare", "Work"]))).finish_read();
     assert_eq!(not_an_object.code, Some(2));
     assert_eq!(not_an_object.stdout, "");
     assert_eq!(not_an_object.stderr, "gate: box payload is not base64 JSON: the JSON is not an object\n");
 
-    let lacking = bare_box_call(&case, &["box", "preflight"], &payload(&json!({"Bare": folders.bare}))).finish();
+    let lacking = bare_box_call(&case, &["box", "preflight"], &payload(&json!({"Bare": folders.bare}))).finish_read();
     assert_eq!(lacking.code, Some(2));
     assert_eq!(lacking.stdout, "");
     assert_eq!(lacking.stderr, "gate: box payload lacks Work\n");
@@ -1887,7 +1949,7 @@ fn a_box_call_without_a_request_on_stdin_is_a_usage_error() {
 
     let (running, stdin) = start_with_stdin(bare_box_command(&case, &["box", "preflight", "--stdin"]));
     drop(stdin);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     assert_eq!(outcome.code, Some(2), "{outcome:?}");
     assert_eq!(outcome.stdout, "", "{outcome:?}");
@@ -1906,7 +1968,7 @@ fn a_box_request_over_the_cap_is_a_usage_error() {
     // The box stops reading at the cap and exits, so the write is a thread's: the case waits on the box, not the write,
     // which fails once the box has gone or ends in the pipe and the box's own buffer; either way the box said its line.
     let writer = thread::spawn(move || drop(stdin.write_all(&vec![b'A'; REQUEST_LIMIT + 1])));
-    let outcome = running.finish();
+    let outcome = running.finish_read();
     writer.join().expect("the writer thread ends");
 
     assert_eq!(outcome.code, Some(2), "{outcome:?}");
@@ -1922,7 +1984,7 @@ fn a_box_request_that_is_not_base64_json_is_a_usage_error() {
     let case = Case::new("box_request_not_base64");
 
     for request in ["not-base64!", ""] {
-        let outcome = bare_box_call(&case, &["box", "preflight"], request).finish();
+        let outcome = bare_box_call(&case, &["box", "preflight"], request).finish_read();
 
         assert_eq!(outcome.code, Some(2), "{request:?}: {outcome:?}");
         assert_eq!(outcome.stdout, "", "{request:?}: {outcome:?}");
@@ -1940,26 +2002,26 @@ fn every_box_verb_reads_its_request_from_stdin() {
     let folders = Folders::new(&case);
     let request = folders.payload();
 
-    let preflight = box_call(&case, &["box", "preflight"], &request).finish();
+    let preflight = box_call(&case, &["box", "preflight"], &request).finish_read();
     assert_eq!(preflight.code, Some(0), "{preflight:?}");
     assert!(Path::new(&folders.bare).exists(), "the preflight made the bare repository: {preflight:?}");
 
     let run = payload(&box_payload(&case, "k", &[]));
-    let stop = box_call(&case, &["box", "stop"], &run).finish();
+    let stop = box_call(&case, &["box", "stop"], &run).finish_read();
     assert_eq!(stop.code, Some(0), "no job to stop is no failure: {stop:?}");
     assert_eq!((stop.stdout.as_str(), stop.stderr.as_str()), ("", ""), "{stop:?}");
 
-    let boot = box_call(&case, &["box", "boot"], &payload(&json!({}))).finish();
+    let boot = box_call(&case, &["box", "boot"], &payload(&json!({}))).finish_read();
     assert_eq!(boot.code, Some(0), "{boot:?}");
     assert!(boot.stdout.starts_with("gate: remote boot "), "{boot:?}");
 
-    let outputs = box_call(&case, &["box", "outputs"], &run).finish();
+    let outputs = box_call(&case, &["box", "outputs"], &run).finish_read();
     assert_eq!(outputs.code, Some(2), "the request reached the verb, which wants a Name: {outputs:?}");
     assert_eq!(outputs.stderr, "gate: box payload lacks Name\n");
 
     let root = case.folder().join("remote");
     fs::create_dir_all(root.join("work")).expect("the work folder can be made");
-    let inflight = box_call(&case, &["box", "inflight"], &inflight_payload(&root)).finish();
+    let inflight = box_call(&case, &["box", "inflight"], &inflight_payload(&root)).finish_read();
     assert_eq!(inflight.code, Some(0), "{inflight:?}");
     assert_eq!(inflight.stdout, "gate: remote in flight 0\n", "{inflight:?}");
 }
@@ -2110,7 +2172,7 @@ fn run_box(case: &Case, payload: &Value) -> Outcome {
 fn run_box_with_env(case: &Case, payload: &Value, name: &str, value: &str) -> Outcome {
     let mut command = box_call(case, &["box", "run"], &self::payload(payload));
     command.env(name, value);
-    command.finish()
+    command.finish_read()
 }
 
 /// `gate box run` of `payload` with `PATH` set to `path` when given, as a case about dotnet runs it.
@@ -2716,7 +2778,7 @@ fn box_run_after_a_stop_during_the_command_starts_no_back_commit_step() {
 
     let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
     wait_until_gone(helper);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     assert_eq!(stopped.code, Some(0), "{stopped:?}");
     let line = format!("failed: the job {} was stopped", field(&payload, "Job"));
@@ -2772,7 +2834,10 @@ fn let_go(go: &Path) {
 
 /// The pid in the `spawned <pid>` line of `stdout`.
 fn spawned_pid(stdout: &str) -> u32 {
-    let line = stdout.lines().find_map(|line| line.strip_prefix("spawned ")).expect("a spawned line");
+    let line = stdout
+        .lines()
+        .find_map(|line| unstamped(line).text.strip_prefix("spawned "))
+        .expect("a spawned line");
     line.parse().expect("the spawned line holds a pid")
 }
 
@@ -2802,7 +2867,7 @@ fn box_run_a_second_run_on_a_held_lock_is_busy() {
         format!("{}\ngate: remote work folder k is busy\n", refused_line(&renamed(&held, 1), "busy"))
     );
     let_go(&go);
-    let outcome = first.finish();
+    let outcome = first.finish_read();
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     wait_until_closed(Path::new(field(&held, "Lock")));
 }
@@ -2976,14 +3041,14 @@ fn run_box_with_git_bin(case: &Case, payload: &Value, bin: &Path, path: Option<&
     if let Some(path) = path {
         call.env("PATH", path);
     }
-    call.finish()
+    call.finish_read()
 }
 
 /// `gate box preflight` of the request line `request` with the trusted Git `bin` seam naming `bin`, to its end.
 fn preflight_with_git_bin(case: &Case, request: &str, bin: &Path) -> Outcome {
     let mut call = box_call(case, &["box", "preflight"], request);
     call.env(GIT_BIN_STAND_IN, bin);
-    call.finish()
+    call.finish_read()
 }
 
 /// A fake Git root under the case folder: `cmd\git.cmd` forwarding to the real git with the same words, `usr\bin`'s
@@ -3230,7 +3295,7 @@ fn a_gate_started_inside_a_box_run_passes_its_command_s_status() {
         outcome.stdout.lines().any(|line| line.starts_with("gate: passed in ")),
         "the inner gate's own verdict: {outcome:?}"
     );
-    let log = fs::read_to_string(case.folder().join("inner.log")).expect("the inner gate wrote its log");
+    let log = log_texts(&case.folder().join("inner.log"));
     assert!(log.contains("inner ran"), "{log}");
     assert_took_no_slot(&case, "inner");
 }
@@ -3247,8 +3312,9 @@ fn a_gate_started_inside_a_box_run_hands_its_command_the_box_names_and_no_marker
     let outcome = run_box(&case, &payload);
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let log = fs::read_to_string(case.folder().join("inner.log")).expect("the inner gate wrote its log");
-    let said: Vec<&str> = log.lines().take(3).collect();
+    let log = log_texts(&case.folder().join("inner.log"));
+    // The inner gate's own note, said before its command starts, comes first in the log: the command's lines follow.
+    let said: Vec<&str> = log.lines().filter(|line| !line.starts_with("gate: ")).take(3).collect();
     assert_eq!(
         said,
         ["fake-tool: GATE_SLOT_HELD is not set", handed(field(&payload, "Job")).as_str(), GATE],
@@ -3264,7 +3330,7 @@ fn a_gate_two_levels_inside_a_box_run_takes_no_slot_either() {
     let outcome = box_run_of(&case, &inner_gate(&case, "inner", "heavy", "120", &deep));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let inner_log = fs::read_to_string(case.folder().join("inner.log")).expect("the inner gate wrote its log");
+    let inner_log = log_texts(&case.folder().join("inner.log"));
     assert!(
         inner_log.contains(IN_BOX_LINE),
         "the deeper gate said it runs inside the box run: {inner_log}"
@@ -3472,7 +3538,7 @@ fn run_box_with_godot(case: &Case, payload: &Value, root: Option<&Path>, stubs: 
     } else {
         command.env_remove("GODOT_PATH");
     }
-    command.finish()
+    command.finish_read()
 }
 
 /// A run payload of `words`, snapshotted, with the `GodotVersion` `version` when given.
@@ -3692,7 +3758,7 @@ fn run_box_with_unreal(case: &Case, payload: &Value, root: Option<&Path>, inheri
     } else {
         command.env_remove("UE_ROOT");
     }
-    command.finish()
+    command.finish_read()
 }
 
 /// A run payload of `words`, snapshotted, with the `UnrealVersion` `version` when given.
@@ -3757,7 +3823,7 @@ fn run_box_with_engine_env(case: &Case, payload: &Value, root: Option<&Path>) ->
     command.env("PATH", path_for_run(&[]));
     command.env_remove("UE_ROOT");
     command.env(ENGINE_ENV_NAME, STALE_ENGINE_ENV);
-    command.finish()
+    command.finish_read()
 }
 
 /// The `EngineEnv` naming [`ENGINE_ENV_NAME`].
@@ -4243,7 +4309,7 @@ fn box_run_beats_while_a_busy_command_runs() {
     };
     running.wait_for_stderr_where("two heartbeats after the command's first line", |stderr| beats_after_started(stderr) >= 2);
     let_go(&go);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     assert_eq!(outcome.code, Some(7), "the command's own status: {outcome:?}");
     assert_eq!(outcome.stdout, "burning\n", "no heartbeat on stdout: {outcome:?}");
@@ -4323,7 +4389,7 @@ fn a_git_warning_is_never_split_by_a_heartbeat() {
     let write = format!("@for /L %%i in (1,1,{WARNED_FILES}) do @echo line>w%%i.txt\r\n");
     snapshot(&case, &mut payload, &[(".gitattributes", "*.txt text eol=lf\n"), ("write.cmd", &write)]);
 
-    let outcome = bare_box_call(&case, &["box", "--test-heartbeat-ms", "1", "run"], &self::payload(&payload)).finish();
+    let outcome = bare_box_call(&case, &["box", "--test-heartbeat-ms", "1", "run"], &self::payload(&payload)).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let beat = Regex::new(r"^gate-remote-heartbeat: \d+$").expect("the pattern compiles");
@@ -4392,7 +4458,7 @@ fn run_box_leaving_a_child(case: &Case, with: Option<(&str, &str)>) -> (Outcome,
         .expect("the child runs: it waits for a go file no one has written");
 
     let_go(&proceed);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
     let ended = Escapee::exit_code_once_ended(&child);
     // The child is let go before any assertion, so a failing case leaves no helper waiting.
     let_go(&go);
@@ -4446,7 +4512,7 @@ fn box_run_a_closed_stdout_pipe_stops_the_job_and_exits_255() {
     running.wait_for_stderr("started");
     let_go(&go);
 
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
     assert!(
@@ -4482,7 +4548,7 @@ fn box_run_a_closed_stderr_pipe_stops_the_job_and_exits_255() {
     stderr.close();
     let_go(&go);
 
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     assert_eq!(outcome.code, Some(255), "a closed connection exits 255: {outcome:?}");
     let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
@@ -4675,7 +4741,7 @@ fn box_run_falls_back_to_its_own_token_when_the_restricted_start_is_refused() {
     let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &count_word, "out", "ran"]);
     snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
 
-    let outcome = box_call(&case, &["box", "--test-box-token", "refused", "run"], &self::payload(&payload)).finish();
+    let outcome = box_call(&case, &["box", "--test-box-token", "refused", "run"], &self::payload(&payload)).finish_read();
 
     assert_eq!(outcome.code, Some(0), "the refusal never fails the run: {outcome:?}");
     assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
@@ -4749,7 +4815,7 @@ fn box_run_gives_the_command_safe_directory_for_git() {
     let mut command = box_call(&case, &["box", "run"], &self::payload(&payload));
     command.env_remove("GIT_CONFIG_COUNT");
 
-    let outcome = command.finish();
+    let outcome = command.finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stdout, "1\nsafe.directory\n*\n", "{outcome:?}");
@@ -4794,7 +4860,7 @@ fn box_run_end_spares_the_console_donor() {
     let donor = donor_of(field(&payload, "Job"));
 
     let_go(&proceed);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
     let ended = Escapee::exit_code_once_ended(&donor);
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
@@ -4828,7 +4894,7 @@ fn box_run_falls_back_before_the_start_and_runs_the_command() {
     let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &count_word, "out", "ran"]);
     snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
 
-    let outcome = box_call(&case, &["box", "--test-box-console", "fail-before", "run"], &self::payload(&payload)).finish();
+    let outcome = box_call(&case, &["box", "--test-box-console", "fail-before", "run"], &self::payload(&payload)).finish_read();
 
     assert_eq!(outcome.code, Some(0), "the fallback never fails the run: {outcome:?}");
     assert_eq!(outcome.stdout, "ran\n", "{outcome:?}");
@@ -4887,7 +4953,7 @@ fn stop_before_the_launch(name: &str, seams: &[&str]) {
 
     let stopped = gate_box(&case, "stop", &payload_word, None);
     let_go(&park);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     assert_eq!(stopped.code, Some(0), "{stopped:?}");
     assert_eq!(outcome.code, Some(1), "a stop before the launch fails the run: {outcome:?}");
@@ -4922,7 +4988,7 @@ fn box_stop_ends_a_held_run_and_says_so() {
     assert_eq!(stopped.stderr, "");
     // A terminated process leaves the job's count, which the stop waits for, before its object is signalled.
     wait_until_gone(helper);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
 }
 
@@ -4957,7 +5023,7 @@ fn box_stop_with_an_earlier_runs_job_spares_the_next_run() {
     assert_eq!(stopped.stdout, "", "the earlier run's job is gone");
     assert!(running.is_running(), "the next run goes on");
     let_go(&go);
-    assert_eq!(running.finish().code, Some(0));
+    assert_eq!(running.finish_read().code, Some(0));
 }
 
 /// A `gate box inflight --stdin` request line for the builder's root `root`.
@@ -5211,7 +5277,7 @@ fn box_run_refuses_a_payload_without_a_40_hex_snapshot() {
     }
 
     let_go(&go);
-    assert_eq!(running.finish().code, Some(0), "the held run ends");
+    assert_eq!(running.finish_read().code, Some(0), "the held run ends");
     wait_until_closed(Path::new(field(&payload, "Lock")));
 }
 
@@ -6701,7 +6767,7 @@ fn box_run_a_stop_during_the_restore_ends_it_and_runs_no_command() {
     let helper = spawned_pid(&running.wait_for_stdout("\n"));
 
     let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     assert_eq!(stopped.code, Some(0), "{stopped:?}");
     // The stop opens the restore's job before it sets the run's signal, so the box, seeing the signal, cannot close the
@@ -6820,7 +6886,7 @@ fn box_run_a_stop_before_the_restore_runs_no_restore() {
 
     let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
     let_go(&go);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     assert_eq!(stopped.code, Some(0), "{stopped:?}");
     assert_eq!(outcome.code, Some(1), "a stop before the restore fails the run: {outcome:?}");
@@ -7042,7 +7108,7 @@ fn box_run_installs_pnpm_packages_before_a_pnpm_command() {
     );
     let stub = stub_pnpm(&case, 0, "");
 
-    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let work = field(&payload, "Work");
@@ -7068,10 +7134,10 @@ fn box_run_skips_the_pnpm_install_while_the_lockfile_and_node_modules_are_unchan
     let mut payload = box_payload(&case, "k", &["pnpm", "run", "x"]);
     snapshot(&case, &mut payload, &[NODE_MODULES_IGNORED, (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE)]);
     let path = path_for_pnpm(&[stub_pnpm(&case, 0, "")]);
-    let first = pnpm_box(&case, &payload, &path).finish();
+    let first = pnpm_box(&case, &payload, &path).finish_read();
     assert_eq!(first.code, Some(0), "{first:?}");
 
-    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish_read();
 
     assert_eq!(second.code, Some(0), "{second:?}");
     let work = field(&payload, "Work");
@@ -7089,12 +7155,12 @@ fn box_run_installs_again_when_the_lockfile_changes() {
     let mut payload = box_payload(&case, "k", &["pnpm", "run", "x"]);
     snapshot(&case, &mut payload, &[NODE_MODULES_IGNORED, (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE)]);
     let path = path_for_pnpm(&[stub_pnpm(&case, 0, "")]);
-    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+    assert_eq!(pnpm_box(&case, &payload, &path).finish_read().code, Some(0));
     let record = fs::read_to_string(packages_record(&payload)).expect("the record is written");
 
     let changed = push_snapshot(&case, &payload, &[(PNPM_LOCKFILE_PATH, "lockfileVersion: '9.1'\n")]);
     payload["Snapshot"] = json!(changed);
-    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish_read();
 
     assert_eq!(second.code, Some(0), "{second:?}");
     assert_eq!(installs(&case), 2, "the changed lockfile installs again: {second:?}");
@@ -7112,10 +7178,10 @@ fn box_run_installs_again_when_node_modules_is_gone() {
     let mut payload = box_payload(&case, "k", &["pnpm", "run", "x"]);
     snapshot(&case, &mut payload, &[NODE_MODULES_IGNORED, (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE)]);
     let path = path_for_pnpm(&[stub_pnpm(&case, 0, "")]);
-    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+    assert_eq!(pnpm_box(&case, &payload, &path).finish_read().code, Some(0));
     fs::remove_dir_all(Path::new(field(&payload, "Work")).join("node_modules")).expect("node_modules can be removed");
 
-    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish_read();
 
     assert_eq!(second.code, Some(0), "{second:?}");
     assert_eq!(installs(&case), 2, "a missing node_modules installs again: {second:?}");
@@ -7128,7 +7194,7 @@ fn box_run_installs_in_the_dir_folder_and_names_it() {
     snapshot(&case, &mut payload, &[NODE_MODULES_IGNORED, ("sub/pnpm-lock.yaml", PNPM_LOCKFILE)]);
     let stub = stub_pnpm(&case, 0, "");
 
-    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let work = field(&payload, "Work");
@@ -7148,7 +7214,7 @@ fn box_run_does_not_install_without_a_lockfile_or_for_another_program() {
     let case = Case::new("box_run_pnpm_no_lockfile");
     let mut payload = box_payload(&case, "k", &["pnpm", "run", "x"]);
     snapshot(&case, &mut payload, &[NODE_MODULES_IGNORED, ("package.json", "{}\n")]);
-    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub_pnpm(&case, 0, "")])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub_pnpm(&case, 0, "")])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(
@@ -7163,7 +7229,7 @@ fn box_run_does_not_install_without_a_lockfile_or_for_another_program() {
     let marker = other.folder().join("marker");
     let mut payload = box_payload(&other, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
     snapshot(&other, &mut payload, &[NODE_MODULES_IGNORED, (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE)]);
-    let outcome = pnpm_box(&other, &payload, &path_for_pnpm(&[stub_pnpm(&other, 0, "")])).finish();
+    let outcome = pnpm_box(&other, &payload, &path_for_pnpm(&[stub_pnpm(&other, 0, "")])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert!(marker.exists(), "the command ran: {outcome:?}");
@@ -7177,7 +7243,7 @@ fn box_run_refuses_tools_when_the_pnpm_install_fails() {
     let mut payload = box_payload(&case, "k", &["pnpm", "run", "x"]);
     snapshot(&case, &mut payload, &[NODE_MODULES_IGNORED, (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE)]);
     assert_eq!(
-        pnpm_box(&case, &payload, &path_for_pnpm(&[stub_pnpm(&case, 0, "")])).finish().code,
+        pnpm_box(&case, &payload, &path_for_pnpm(&[stub_pnpm(&case, 0, "")])).finish_read().code,
         Some(0)
     );
     let record = fs::read(packages_record(&payload)).expect("the record is written");
@@ -7185,7 +7251,7 @@ fn box_run_refuses_tools_when_the_pnpm_install_fails() {
     let changed = push_snapshot(&case, &payload, &[(PNPM_LOCKFILE_PATH, "lockfileVersion: '9.1'\n")]);
     payload["Snapshot"] = json!(changed);
     let second = renamed(&payload, 1);
-    let outcome = pnpm_box(&case, &second, &path_for_pnpm(&[stub_pnpm(&case, 3, "")])).finish();
+    let outcome = pnpm_box(&case, &second, &path_for_pnpm(&[stub_pnpm(&case, 3, "")])).finish_read();
 
     assert_eq!(outcome.code, Some(75), "{outcome:?}");
     let said = lines(&outcome.stderr);
@@ -7226,7 +7292,7 @@ fn box_run_refuses_tools_when_pnpm_cannot_start() {
     let mut payload = box_payload(&case, "k", &["pnpm", "run", "x"]);
     snapshot(&case, &mut payload, &[NODE_MODULES_IGNORED, (PNPM_LOCKFILE_PATH, PNPM_LOCKFILE)]);
 
-    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[])).finish_read();
 
     assert_eq!(outcome.code, Some(75), "{outcome:?}");
     // The win32 error `ERROR_FILE_NOT_FOUND`, as `locate` reports a word it does not find.
@@ -7251,7 +7317,7 @@ fn box_run_skips_the_install_when_node_modules_is_not_ignored() {
     let mut payload = box_payload(&case, "k", &["pnpm", "run", "x"]);
     snapshot(&case, &mut payload, &[(PNPM_LOCKFILE_PATH, PNPM_LOCKFILE)]);
 
-    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub_pnpm(&case, 0, "")])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub_pnpm(&case, 0, "")])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "the command still runs: {outcome:?}");
     assert!(
@@ -7276,7 +7342,7 @@ fn box_run_stops_a_pnpm_install_and_names_its_job() {
     let helper = spawned_pid(&running.wait_for_stdout("\n"));
 
     let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     let job = format!("{}-packages", field(&payload, "Job"));
     assert_eq!(stopped.code, Some(0), "{stopped:?}");
@@ -7309,11 +7375,11 @@ fn box_run_installs_again_when_npmrc_changes() {
     let case = Case::new("box_run_pnpm_npmrc_changed");
     let mut payload = pnpm_payload(&case, &[(".npmrc", "a=1\n")]);
     let path = path_for_pnpm(&[stub_pnpm(&case, 0, "")]);
-    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+    assert_eq!(pnpm_box(&case, &payload, &path).finish_read().code, Some(0));
 
     let changed = push_snapshot(&case, &payload, &[(".npmrc", "a=2\n")]);
     payload["Snapshot"] = json!(changed);
-    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish_read();
 
     assert_eq!(second.code, Some(0), "{second:?}");
     assert_eq!(installs(&case), 2, "a changed .npmrc installs again: {second:?}");
@@ -7326,7 +7392,7 @@ fn box_run_runs_the_pnpm_install_with_the_restricted_token() {
     let token = case.folder().join("token.txt");
     let stub = stub_pnpm(&case, 0, &format!("\"{FAKE_TOOL}\" token >\"{}\"\r\n", shown(&token)));
 
-    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let said = fs::read_to_string(&token).expect("the install wrote its token's facts");
@@ -7372,7 +7438,7 @@ fn box_run_a_packages_record_that_is_a_folder_fails_with_status_1() {
     let record = packages_record(&payload);
     fs::create_dir_all(&record).expect("a folder can be put where the record goes");
 
-    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub_pnpm(&case, 0, "")])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub_pnpm(&case, 0, "")])).finish_read();
 
     assert_eq!(outcome.code, Some(1), "a record that cannot be written fails the box: {outcome:?}");
     let refused = format!("gate: remote could not write {record}: ");
@@ -7396,7 +7462,7 @@ fn box_run_an_unreadable_packages_record_installs_and_says_so() {
     // Not UTF-8, so the record opens but cannot be read as text.
     fs::write(&record, [0xff_u8, 0xfe, b'\n']).expect("the record can be written");
 
-    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub_pnpm(&case, 0, "")])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub_pnpm(&case, 0, "")])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let said = format!("gate: remote could not read {record}: ");
@@ -7421,7 +7487,7 @@ fn box_run_an_unreadable_package_file_fails_with_status_1() {
     // A folder where `package.json` is expected: a file in it makes git check the folder out.
     let payload = pnpm_payload(&case, &[("package.json/x.txt", "x\n")]);
 
-    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub_pnpm(&case, 0, "")])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub_pnpm(&case, 0, "")])).finish_read();
 
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
     let said = format!(
@@ -7447,7 +7513,7 @@ fn box_run_a_stop_set_before_the_pnpm_install_runs_none() {
 
     let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
     let_go(&go);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
 
     assert_eq!(stopped.code, Some(0), "{stopped:?}");
     assert_eq!(outcome.code, Some(1), "a stop before the install fails the run: {outcome:?}");
@@ -7462,7 +7528,7 @@ fn box_run_a_node_modules_junction_installs_again() {
     let case = Case::new("box_run_pnpm_node_modules_junction");
     let payload = pnpm_payload(&case, &[]);
     let path = path_for_pnpm(&[stub_pnpm(&case, 0, "")]);
-    let first = pnpm_box(&case, &payload, &path).finish();
+    let first = pnpm_box(&case, &payload, &path).finish_read();
     assert_eq!(first.code, Some(0), "the first run, which lays node_modules out: {first:?}");
     wait_until_closed(Path::new(field(&payload, "Lock")));
     let node_modules = Path::new(field(&payload, "Work")).join("node_modules");
@@ -7472,7 +7538,7 @@ fn box_run_a_node_modules_junction_installs_again() {
     junction(&node_modules, &elsewhere);
 
     let renamed_payload = renamed(&payload, 1);
-    let second = pnpm_box(&case, &renamed_payload, &path).finish();
+    let second = pnpm_box(&case, &renamed_payload, &path).finish_read();
 
     assert_eq!(
         second.code,
@@ -7496,13 +7562,13 @@ fn box_run_skips_the_install_when_the_lockfile_folder_is_reached_through_a_junct
     snapshot(&case, &mut payload, &[(".gitignore", "node_modules/\nlinked\n")]);
     let path = path_for_pnpm(&[stub_pnpm(&case, 0, "")]);
     // The first run lays the work folder out; the junction made after it is ignored, so no checkout removes it.
-    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+    assert_eq!(pnpm_box(&case, &payload, &path).finish_read().code, Some(0));
     let elsewhere = case.folder().join("elsewhere");
     fs::create_dir_all(&elsewhere).expect("the junction's target can be made");
     fs::write(elsewhere.join("pnpm-lock.yaml"), PNPM_LOCKFILE).expect("the lockfile can be written");
     junction(&Path::new(field(&payload, "Work")).join("linked"), &elsewhere);
 
-    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish_read();
 
     assert_eq!(second.code, Some(0), "the command still runs: {second:?}");
     assert!(
@@ -7519,7 +7585,7 @@ fn box_run_restores_dotnet_tools_before_pnpm_packages() {
     let payload = pnpm_payload(&case, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
     let path = path_for_pnpm(&[stub_dotnet(&case, 0), stub_pnpm(&case, 0, "")]);
 
-    let outcome = pnpm_box(&case, &payload, &path).finish();
+    let outcome = pnpm_box(&case, &payload, &path).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let said = lines(&outcome.stderr);
@@ -7542,7 +7608,7 @@ fn box_run_a_tools_refusal_runs_no_pnpm_install() {
     let payload = pnpm_payload(&case, &[(TOOLS_MANIFEST_PATH, TOOLS_MANIFEST)]);
     let path = path_for_pnpm(&[stub_dotnet(&case, 1), stub_pnpm(&case, 0, "")]);
 
-    let outcome = pnpm_box(&case, &payload, &path).finish();
+    let outcome = pnpm_box(&case, &payload, &path).finish_read();
 
     assert_eq!(outcome.code, Some(75), "{outcome:?}");
     assert!(
@@ -7560,7 +7626,7 @@ fn box_run_the_pnpm_install_gets_safe_directory() {
     let variables = case.folder().join("variables.txt");
     let stub = stub_pnpm(&case, 0, &format!("set GIT_CONFIG >\"{}\"\r\n", shown(&variables)));
 
-    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_pnpm(&[stub])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let said = fs::read_to_string(&variables).expect("the install wrote its git variables");
@@ -7587,7 +7653,7 @@ fn box_run_restores_start_without_an_inherited_engine_env_name() {
     let mut call = pnpm_box(&case, &payload, &path);
     call.env(ENGINE_ENV_NAME, STALE_ENGINE_ENV);
 
-    let outcome = call.finish();
+    let outcome = call.finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let said = fs::read_to_string(&seen).expect("the restores wrote what they saw");
@@ -7628,7 +7694,7 @@ fn box_run_installs_bun_packages_in_the_nearest_lockfile_folder_before_a_bunx_co
     );
     let stub = stub_bun(&case, 0, "");
 
-    let outcome = pnpm_box(&case, &payload, &path_for_bun(&[stub])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_bun(&[stub])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let web = format!(r"{}\web", field(&payload, "Work"));
@@ -7657,10 +7723,10 @@ fn box_run_skips_the_bun_install_while_the_lockfile_and_node_modules_are_unchang
     let case = Case::new("box_run_bun_unchanged");
     let payload = bun_payload(&case, &["bun", "test"], &[]);
     let path = path_for_bun(&[stub_bun(&case, 0, "")]);
-    let first = pnpm_box(&case, &payload, &path).finish();
+    let first = pnpm_box(&case, &payload, &path).finish_read();
     assert_eq!(first.code, Some(0), "{first:?}");
 
-    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish_read();
 
     assert_eq!(second.code, Some(0), "{second:?}");
     let work = field(&payload, "Work");
@@ -7677,11 +7743,11 @@ fn box_run_installs_bun_packages_again_when_package_json_changes() {
     let case = Case::new("box_run_bun_package_json_changed");
     let mut payload = bun_payload(&case, &["bun", "test"], &[("package.json", "{}\n")]);
     let path = path_for_bun(&[stub_bun(&case, 0, "")]);
-    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+    assert_eq!(pnpm_box(&case, &payload, &path).finish_read().code, Some(0));
 
     let changed = push_snapshot(&case, &payload, &[("package.json", "{\"name\": \"x\"}\n")]);
     payload["Snapshot"] = json!(changed);
-    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish_read();
 
     assert_eq!(second.code, Some(0), "{second:?}");
     assert_eq!(bun_installs(&case), 2, "a changed package.json installs again: {second:?}");
@@ -7694,7 +7760,7 @@ fn box_run_skips_the_bun_install_when_node_modules_is_not_ignored() {
     let mut payload = box_payload(&case, "k", &["bun", "test"]);
     snapshot(&case, &mut payload, &[(BUN_LOCKFILE_PATH, BUN_LOCKFILE)]);
 
-    let outcome = pnpm_box(&case, &payload, &path_for_bun(&[stub_bun(&case, 0, "")])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_bun(&[stub_bun(&case, 0, "")])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "the command still runs: {outcome:?}");
     assert!(
@@ -7724,11 +7790,11 @@ fn box_run_a_bun_install_drops_the_pnpm_line_of_its_folder_so_pnpm_installs_agai
     let only = |key: &str| Regex::new(&format!(r"^{key}\t[0-9a-f]{{64}}\n$")).expect("the pattern compiles");
     let record = || fs::read_to_string(packages_record(&payload)).expect("the record is written");
 
-    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
-    let after_bun = pnpm_box(&case, &bun, &path).finish();
+    assert_eq!(pnpm_box(&case, &payload, &path).finish_read().code, Some(0));
+    let after_bun = pnpm_box(&case, &bun, &path).finish_read();
     assert_eq!(after_bun.code, Some(0), "{after_bun:?}");
     assert!(only(r"bun:\.").is_match(&record()), "bun's install dropped pnpm's line: {:?}", record());
-    let again = pnpm_box(&case, &renamed(&payload, 2), &path).finish();
+    let again = pnpm_box(&case, &renamed(&payload, 2), &path).finish_read();
 
     assert_eq!(again.code, Some(0), "{again:?}");
     let work = field(&payload, "Work");
@@ -7760,10 +7826,10 @@ fn box_run_a_failed_pnpm_install_drops_the_bun_line_of_its_folder_so_bun_install
     // The stubs lead the `PATH`, so a real pnpm after them is never found.
     let path = path_for_bun(&[stub_pnpm(&case, 3, ""), stub_bun(&case, 0, "")]);
 
-    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
-    let failed = pnpm_box(&case, &pnpm, &path).finish();
+    assert_eq!(pnpm_box(&case, &payload, &path).finish_read().code, Some(0));
+    let failed = pnpm_box(&case, &pnpm, &path).finish_read();
     assert_eq!(failed.code, Some(75), "{failed:?}");
-    let again = pnpm_box(&case, &renamed(&payload, 2), &path).finish();
+    let again = pnpm_box(&case, &renamed(&payload, 2), &path).finish_read();
 
     assert_eq!(again.code, Some(0), "{again:?}");
     let work = field(&payload, "Work");
@@ -7789,7 +7855,7 @@ fn box_run_installs_bun_packages_for_a_bun_lockb_alone() {
     let mut payload = box_payload(&case, "k", &["bun", "test"]);
     snapshot(&case, &mut payload, &[NODE_MODULES_IGNORED, ("bun.lockb", "binary lockfile\n")]);
 
-    let outcome = pnpm_box(&case, &payload, &path_for_bun(&[stub_bun(&case, 0, "")])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_bun(&[stub_bun(&case, 0, "")])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let work = field(&payload, "Work");
@@ -7804,7 +7870,7 @@ fn box_run_refuses_tools_when_the_bun_install_fails() {
     let case = Case::new("box_run_bun_install_fails");
     let payload = bun_payload(&case, &["bunx", "vitest", "run"], &[]);
 
-    let outcome = pnpm_box(&case, &payload, &path_for_bun(&[stub_bun(&case, 3, "")])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_bun(&[stub_bun(&case, 3, "")])).finish_read();
 
     assert_eq!(outcome.code, Some(75), "{outcome:?}");
     let said = lines(&outcome.stderr);
@@ -7847,7 +7913,7 @@ fn box_run_installs_npm_packages_before_an_npm_command() {
     let payload = npm_payload(&case, &["npm", "test"], &[("package.json", "{}\n")]);
     let stub = stub_npm(&case, 0, "");
 
-    let outcome = pnpm_box(&case, &payload, &path_for_npm(&[stub])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_npm(&[stub])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let work = field(&payload, "Work");
@@ -7873,7 +7939,7 @@ fn box_run_installs_npm_packages_with_npm_before_an_npx_command() {
     let payload = npm_payload(&case, &["npx", "vitest", "run"], &[]);
     let stub = stub_npm(&case, 0, "");
 
-    let outcome = pnpm_box(&case, &payload, &path_for_npm(&[stub])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_npm(&[stub])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let work = field(&payload, "Work");
@@ -7901,7 +7967,7 @@ fn box_run_finds_an_npm_shrinkwrap_when_there_is_no_package_lock() {
     );
     let stub = stub_npm(&case, 0, "");
 
-    let outcome = pnpm_box(&case, &payload, &path_for_npm(&[stub])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_npm(&[stub])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let web = format!(r"{}\web", field(&payload, "Work"));
@@ -7925,10 +7991,10 @@ fn box_run_skips_the_npm_install_when_the_lockfile_is_unchanged() {
     let case = Case::new("box_run_npm_unchanged");
     let payload = npm_payload(&case, &["npm", "test"], &[]);
     let path = path_for_npm(&[stub_npm(&case, 0, "")]);
-    let first = pnpm_box(&case, &payload, &path).finish();
+    let first = pnpm_box(&case, &payload, &path).finish_read();
     assert_eq!(first.code, Some(0), "{first:?}");
 
-    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish_read();
 
     assert_eq!(second.code, Some(0), "{second:?}");
     let work = field(&payload, "Work");
@@ -7946,12 +8012,12 @@ fn box_run_installs_npm_packages_again_when_the_lockfile_changes() {
     let case = Case::new("box_run_npm_lockfile_changed");
     let mut payload = npm_payload(&case, &["npm", "test"], &[]);
     let path = path_for_npm(&[stub_npm(&case, 0, "")]);
-    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+    assert_eq!(pnpm_box(&case, &payload, &path).finish_read().code, Some(0));
     let record = fs::read_to_string(packages_record(&payload)).expect("the record is written");
 
     let changed = push_snapshot(&case, &payload, &[(NPM_LOCKFILE_PATH, "{\n  \"lockfileVersion\": 2\n}\n")]);
     payload["Snapshot"] = json!(changed);
-    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish_read();
 
     assert_eq!(second.code, Some(0), "{second:?}");
     assert_eq!(npm_installs(&case), 2, "the changed lockfile installs again: {second:?}");
@@ -7968,11 +8034,11 @@ fn box_run_installs_npm_packages_again_when_package_json_changes() {
     let case = Case::new("box_run_npm_package_json_changed");
     let mut payload = npm_payload(&case, &["npm", "test"], &[("package.json", "{}\n")]);
     let path = path_for_npm(&[stub_npm(&case, 0, "")]);
-    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+    assert_eq!(pnpm_box(&case, &payload, &path).finish_read().code, Some(0));
 
     let changed = push_snapshot(&case, &payload, &[("package.json", "{\"name\": \"x\"}\n")]);
     payload["Snapshot"] = json!(changed);
-    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish();
+    let second = pnpm_box(&case, &renamed(&payload, 1), &path).finish_read();
 
     assert_eq!(second.code, Some(0), "{second:?}");
     assert_eq!(npm_installs(&case), 2, "a changed package.json installs again: {second:?}");
@@ -7991,7 +8057,7 @@ fn box_run_runs_no_npm_install_before_a_node_command() {
     let stub = stub_npm(&case, 0, "");
     fs::write(stub.join("node.cmd"), stub_script(&case, "never", "node ", 0, "")).expect("the node stub can be written");
 
-    let outcome = pnpm_box(&case, &payload, &path_for_npm(&[stub])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_npm(&[stub])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let work = field(&payload, "Work");
@@ -8011,7 +8077,7 @@ fn box_run_runs_the_npm_install_with_the_restricted_token() {
     let token = case.folder().join("token.txt");
     let stub = stub_npm(&case, 0, &format!("\"{FAKE_TOOL}\" token >\"{}\"\r\n", shown(&token)));
 
-    let outcome = pnpm_box(&case, &payload, &path_for_npm(&[stub])).finish();
+    let outcome = pnpm_box(&case, &payload, &path_for_npm(&[stub])).finish_read();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     let said = fs::read_to_string(&token).expect("the install wrote its token's facts");
@@ -8036,11 +8102,11 @@ fn box_run_runs_no_npm_install_in_a_folder_with_a_pnpm_lockfile() {
         ],
     );
     let path = path_for_npm(&[stub_pnpm(&case, 0, ""), stub_npm(&case, 0, "")]);
-    assert_eq!(pnpm_box(&case, &payload, &path).finish().code, Some(0));
+    assert_eq!(pnpm_box(&case, &payload, &path).finish_read().code, Some(0));
 
     let mut npm = renamed(&payload, 1);
     npm["Command"] = json!(["npx", "x"]);
-    let second = pnpm_box(&case, &npm, &path).finish();
+    let second = pnpm_box(&case, &npm, &path).finish_read();
 
     assert_eq!(second.code, Some(0), "the command still runs: {second:?}");
     let work = field(&payload, "Work");
@@ -8065,7 +8131,7 @@ fn run_box_with_seams(case: &Case, payload: &Value, seams: &[&str]) -> Outcome {
     let mut args = vec!["box"];
     args.extend_from_slice(seams);
     args.push("run");
-    box_call(case, &args, &self::payload(payload)).finish()
+    box_call(case, &args, &self::payload(payload)).finish_read()
 }
 
 /// The lines of `outcome`'s stderr that start with `prefix`.
@@ -8227,7 +8293,7 @@ fn box_run_after_a_stopped_run_clears_what_it_wrote() {
     running.wait_for_stderr("mid-write");
     let stopped = gate_box(&case, "stop", &self::payload(&payload), None);
     assert_eq!(stopped.code, Some(0), "{stopped:?}");
-    let outcome = running.finish();
+    let outcome = running.finish_read();
     assert_eq!(outcome.code, Some(124), "the stop ended the command: {outcome:?}");
     let work = PathBuf::from(field(&payload, "Work"));
     assert!(work.join(HALF_WRITTEN).exists(), "the stopped command left its file");
@@ -8959,7 +9025,7 @@ fn run_box_with_keeper(case: &Case, payload: &Value, stand_in: &[&str], limit_ms
     if let Some(ms) = limit_ms {
         call.env(KEEPER_LIMIT_MS, ms);
     }
-    call.finish()
+    call.finish_read()
 }
 
 /// The lines of `outcome`'s stderr saying the keeper could not be started.
@@ -9090,7 +9156,7 @@ fn box_judging_its_image(case: &Case, args: &[&str]) -> Outcome {
     let mut command = bare_box_command(case, &words);
     command.env("GATE_TEST_BOX_TRUST", "check");
     let (running, stdin) = start_with_stdin(command);
-    let outcome = running.finish();
+    let outcome = running.finish_read();
     drop(stdin);
     outcome
 }

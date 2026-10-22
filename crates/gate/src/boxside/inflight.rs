@@ -15,6 +15,7 @@ use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ
 
 use crate::answer::{FAILED_STATUS, USAGE_STATUS};
 use crate::boxside::run::{LOCK_VIOLATION, SHARING_VIOLATION};
+use crate::boxside::stamping;
 use crate::console::Console;
 
 /// Says how many of the work folders under the payload's `Root` a run holds, then one line naming each; the exit
@@ -24,7 +25,7 @@ pub(crate) fn inflight(payload: &Payload, console: &mut Console) -> u32 {
     let root = match payload.path("Root") {
         Ok(root) => root,
         Err(line) => {
-            console.err(&line);
+            stamping::err(console, &line);
             return u32::from(USAGE_STATUS);
         }
     };
@@ -33,14 +34,17 @@ pub(crate) fn inflight(payload: &Payload, console: &mut Console) -> u32 {
         Ok(locks) => locks.into_iter().filter_map(|path| in_flight(&path)).collect::<Vec<_>>(),
         Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
         Err(error) => {
-            console.err(&format!("gate: remote cannot list {}: {}", escaped(&work), escaped(&error.to_string())));
+            stamping::err(
+                console,
+                &format!("gate: remote cannot list {}: {}", escaped(&work), escaped(&error.to_string())),
+            );
             return u32::from(FAILED_STATUS);
         }
     };
     lines.sort();
-    console.out(&counted(lines.len()));
+    stamping::out(console, &counted(lines.len()));
     for line in &lines {
-        console.out(line);
+        stamping::out(console, line);
     }
     0
 }

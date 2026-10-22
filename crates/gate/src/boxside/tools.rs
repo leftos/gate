@@ -28,6 +28,7 @@ use crate::boxside::run::{
     Beat, FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS, Request, Stopper, WaitEnd, Watched, Watching, before_the_job, box_variables,
     end_job, said_stopped,
 };
+use crate::boxside::stamping;
 use crate::boxside::stop::{restore_job_name, terminate_and_wait};
 use crate::console::Console;
 use crate::remote::{Refusal, refused_line};
@@ -130,7 +131,7 @@ pub(super) fn read_record(record: &str) -> io::Result<Option<String>> {
 /// Writes `digest` at the record `<Work>.tools`; a failure is said and fails the run with status 1.
 fn write_record(record: &str, digest: &str, console: &mut Console) -> Result<(), u32> {
     if let Err(error) = write_record_file(record, digest) {
-        console.err(&format!("gate: remote could not write {record}: {error}"));
+        stamping::err(console, &format!("gate: remote could not write {record}: {error}"));
         return Err(FAILED_STATUS);
     }
     Ok(())
@@ -216,7 +217,7 @@ fn restore(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
     let forwarders = match Forwarders::start(
         stdout,
         stderr,
-        crate::boxside::forward::Stamping::None,
+        stamping::forwarded(),
         crate::boxside::forward::Sink::Own {
             lock: beat.lock,
             gone: beat.gone,
@@ -247,7 +248,7 @@ fn restore(request: &Request<'_>, place: &Path, beat: &Beat<'_>, console: &mut C
             match drained {
                 Ok(()) => {
                     // Said after the restore's own output and before any line saying it failed.
-                    console.err(&format!("gate: dotnet tool restore took {:.1} s", took.as_secs_f64()));
+                    stamping::err(console, &format!("gate: dotnet tool restore took {:.1} s", took.as_secs_f64()));
                     Restored::Status(code.cast_signed())
                 }
                 Err(status) => Restored::Ended(status),
@@ -279,7 +280,7 @@ pub(crate) fn update(request: &Request<'_>, work: &Path, place: &Path, beat: &Be
     let digest = match hash(&paths, work) {
         Ok(digest) => digest,
         Err(line) => {
-            console.err(&line);
+            stamping::err(console, &line);
             return Err(FAILED_STATUS);
         }
     };
@@ -289,25 +290,25 @@ pub(crate) fn update(request: &Request<'_>, work: &Path, place: &Path, beat: &Be
         Ok(Some(text)) if text == digest => return Ok(()),
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => console.err(&format!("gate: remote could not read {record}: {error}; restoring the tools")),
+        Err(error) => stamping::err(console, &format!("gate: remote could not read {record}: {error}; restoring the tools")),
     }
     let status = match restore(request, place, beat, console) {
         Ok(Restored::Status(status)) => status,
         Ok(Restored::Ended(status)) => return Err(status),
         Err(message) => {
-            console.err(&format!("gate: remote could not start the dotnet tool restore: {message}"));
+            stamping::err(console, &format!("gate: remote could not start the dotnet tool restore: {message}"));
             FAILED_STATUS.cast_signed()
         }
     };
     if status == 0 {
         return write_record(&record, &digest, console);
     }
-    console.err(&format!("gate: remote tool restore failed (status {status})"));
+    stamping::err(console, &format!("gate: remote tool restore failed (status {status})"));
     {
         // Held across both lines, so no heartbeat lands between the tag and the line it tags.
         let _held = beat.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        console.err(&refused_line(request.nonce, Refusal::Tools));
-        console.err(&tools_line(request.key));
+        stamping::protocol(console, &refused_line(request.nonce, Refusal::Tools));
+        stamping::err(console, &tools_line(request.key));
     }
     Err(REFUSED_STATUS)
 }

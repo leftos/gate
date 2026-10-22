@@ -40,6 +40,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use crate::answer::USAGE_STATUS;
 use crate::boxside::preflight::{self, is_folder_itself};
 use crate::boxside::run::{self, FAILED_STATUS, FILE_FLAG_OPEN_REPARSE_POINT, REFUSED_STATUS, SHARING_VIOLATION};
+use crate::boxside::stamping;
 use crate::boxside::tools;
 use crate::console::Console;
 use crate::outputs::archive::{Entry, PcFiles, unpack};
@@ -354,7 +355,7 @@ pub(super) fn inputs(payload: &Payload, seams: &BoxSeams, console: &mut Console)
     let asked = match Asked::read(payload) {
         Ok(asked) => asked,
         Err(line) => {
-            console.err(&line);
+            stamping::err(console, &line);
             return u32::from(USAGE_STATUS);
         }
     };
@@ -377,7 +378,7 @@ pub(super) fn inputs(payload: &Payload, seams: &BoxSeams, console: &mut Console)
 
 /// Says the step failed for `why`; 1.
 fn failed(asked: &Asked<'_>, why: &str, console: &mut Console) -> u32 {
-    console.err(&asked.failed(why));
+    stamping::err(console, &asked.failed(why));
     FAILED_STATUS
 }
 
@@ -392,12 +393,12 @@ pub(super) fn locked<T>(
     let _lock = match run::take_lock(asked.lock) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
-            console.err(&tagged_line(asked.nonce, Refusal::Busy));
-            console.err(&busy_line(asked.key));
+            stamping::protocol(console, &tagged_line(asked.nonce, Refusal::Busy));
+            stamping::err(console, &busy_line(asked.key));
             return Err(REFUSED_STATUS);
         }
         Err(line) => {
-            console.err(&line);
+            stamping::err(console, &line);
             return Err(FAILED_STATUS);
         }
     };
@@ -508,15 +509,18 @@ fn recorded(path: &str, console: &mut Console) -> Result<Record, String> {
     match tools::read_record(path) {
         Ok(None) => Ok(Record::default()),
         Ok(Some(text)) => Ok(Record::parse(&text).unwrap_or_else(|why| {
-            console.err(&format!("gate: remote inputs record {path} {why}; every copy is hashed"));
+            stamping::err(console, &format!("gate: remote inputs record {path} {why}; every copy is hashed"));
             Record::default()
         })),
         Err(error) => {
             preflight::remove_entry(Path::new(path)).map_err(|removal| format!("cannot remove {path}, which cannot be read ({error}): {removal}"))?;
-            console.err(&format!(
-                "gate: remote removed the inputs record {path}, which cannot be read: {}; every copy is hashed",
-                escaped(&error.to_string())
-            ));
+            stamping::err(
+                console,
+                &format!(
+                    "gate: remote removed the inputs record {path}, which cannot be read: {}; every copy is hashed",
+                    escaped(&error.to_string())
+                ),
+            );
             Ok(Record::default())
         }
     }
@@ -678,12 +682,12 @@ fn diff(asked: &Asked<'_>, sent: &Sent, work: &File, console: &mut Console) -> R
         unsealed(&book, &record)?;
         now.kept = swept(asked.book(), work, &record, &sent.manifest, console);
         for line in finished(asked, work, sent, &record, now)? {
-            console.err(&line);
+            stamping::err(console, &line);
         }
     }
-    console.out(&format!("gate-remote-inputs: need {}", needed.len()));
+    stamping::out(console, &format!("gate-remote-inputs: need {}", needed.len()));
     for path in needed {
-        console.out(&format!("gate-remote-inputs: path {}", escaped(path)));
+        stamping::out(console, &format!("gate-remote-inputs: path {}", escaped(path)));
     }
     Ok(())
 }
@@ -730,12 +734,12 @@ fn put(asked: &Asked<'_>, sent: &Sent, seams: &BoxSeams, console: &mut Console) 
     drop(stage);
     match (done, removal) {
         (Ok(Ok(count)), Ok(())) => {
-            console.out(&format!("gate-remote-inputs: installed {count}"));
+            stamping::out(console, &format!("gate-remote-inputs: installed {count}"));
             0
         }
         (Err(status), Ok(())) => status,
         (Err(status), Err(why)) => {
-            console.err(&asked.failed(&why));
+            stamping::err(console, &asked.failed(&why));
             status
         }
         (Ok(Err(why)), Ok(())) | (Ok(Ok(_)), Err(why)) => failed(asked, &why, console),
@@ -850,7 +854,7 @@ pub(super) fn made_stage_named(named: &StageNamed<'_>, console: &mut Console) ->
     let path = Path::new(named.root).join(named.stages);
     let stages = protected_folder(&root, &path, STAGES_ACCESS, &security, Leftover::Refuse)?;
     for line in pruned(&stages, &path, SystemTime::now()) {
-        console.err(&line);
+        stamping::err(console, &line);
     }
     let name = format!("{}-{}", named.key, named.nonce);
     let stage = gate_win32::make_folder_beneath(&stages, &name, FILE_GENERIC_READ | DELETE, Share::NoDelete, &security)
@@ -1077,7 +1081,7 @@ fn taken_over(at: &Beneath<'_>, security: &Descriptor, console: &mut Console, re
         "{}: its owner, DACL or label was not the box's",
         preflight::moved_aside_line(at.path, &moved)
     );
-    console.err(&escaped(&line));
+    stamping::err(console, &escaped(&line));
     made_or_adopted(at, security)
 }
 
@@ -1250,7 +1254,7 @@ fn installed(asked: &Asked<'_>, sent: &Sent, staged: (&File, &[Entry]), work: &F
         now.files.insert(ordinal_upper(&entry.path), copy);
     }
     for line in finished(asked, work, sent, &record, now)? {
-        console.err(&line);
+        stamping::err(console, &line);
     }
     Ok(entries.len())
 }
@@ -1498,7 +1502,7 @@ fn swept(book: Book, work: &File, record: &Record, manifest: &Manifest, console:
             Ok(Some((file, _))) => file,
             Ok(None) => continue,
             Err(error) => {
-                console.err(&kept(error.to_string()));
+                stamping::err(console, &kept(error.to_string()));
                 kept_copies.insert(key.clone(), copy.path.clone());
                 continue;
             }
@@ -1507,7 +1511,7 @@ fn swept(book: Book, work: &File, record: &Record, manifest: &Manifest, console:
             Ok((sha256, _)) if sha256 == copy.sha256 => removed_stale(&file, copy, console),
             Ok(_) => false,
             Err(error) => {
-                console.err(&kept(format!("it cannot be hashed: {error}")));
+                stamping::err(console, &kept(format!("it cannot be hashed: {error}")));
                 false
             }
         };
@@ -1523,11 +1527,14 @@ fn removed_stale(file: &File, copy: &Copy, console: &mut Console) -> bool {
     let Err(error) = gate_win32::delete_opened(file) else {
         return true;
     };
-    console.err(&format!(
-        "gate: remote could not remove the stale input {}: {}",
-        escaped(&copy.path),
-        escaped(&error.to_string())
-    ));
+    stamping::err(
+        console,
+        &format!(
+            "gate: remote could not remove the stale input {}: {}",
+            escaped(&copy.path),
+            escaped(&error.to_string())
+        ),
+    );
     false
 }
 
