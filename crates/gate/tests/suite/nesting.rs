@@ -16,12 +16,13 @@ use std::time::Duration;
 use gate_state::v1::{self, CoveredMarker};
 use gate_state::{KernelObject, StateRoot};
 use gate_win32::{Job, Priority, StoppableProcess, priority_of};
+use gate_wire::stamp::{Tag, unstamped};
 use jiff::Timestamp;
 use serde_json::Value;
 
 use crate::support::{
-    Case, Escapee, FAKE_TOOL, GATE, Outcome, POLL, Running, assert_in_order, critical_words, events, events_of, finish, heavy_words, none_words,
-    run_words, said_pid, shown, start, take_of, tool, wait_for_file, wait_for_journal_line, wait_until, write_counts,
+    Case, Escapee, FAKE_TOOL, GATE, Outcome, POLL, Running, assert_in_order, critical_words, events, events_of, finish, heavy_words, log_texts,
+    none_words, run_words, said_pid, shown, start, take_of, tool, wait_for_file, wait_for_journal_line, wait_until, write_counts,
 };
 
 /// A heavy pool of one slot.
@@ -158,10 +159,14 @@ fn a_gate_under_a_covering_parent_takes_no_slot() {
         .parse()
         .expect("the start is a time");
     let marker = format!("heavy:{outer_pid}:{}:{}", outer_start.as_millisecond(), root_hash(&case));
-    let inner_log = fs::read_to_string(case.folder().join("inner.log")).expect("the inner gate wrote its log");
+    let inner_log = log_texts(&case.folder().join("inner.log"));
     assert_in_order(
         &inner_log,
-        &[&format!("{marker}\n"), &format!("gate: running under the heavy slot of gate {outer_pid}")],
+        // The gate says it runs under the slot before it starts its command, and the log holds its lines as said.
+        &[
+            &format!("gate: running under the heavy slot of gate {outer_pid}\n"),
+            &format!("{marker}\n"),
+        ],
     );
 }
 
@@ -283,7 +288,7 @@ fn refused(name: &str, held: &str, command: impl FnOnce(&Case) -> Command) -> (O
     gate.env("GATE_SLOT_HELD", test_marker(&case, held));
     let outcome = finish(gate);
     assert_eq!(outcome.code, Some(2), "{outcome:?}");
-    assert_eq!(fs::read_to_string(&log).expect("the earlier log is still there"), "earlier\n");
+    assert_eq!(log_texts(&log), "earlier\n");
     assert!(!case.root().join("events.jsonl").exists(), "the refused gate journals nothing");
     assert!(!has_tickets(&case), "the refused gate queued nothing");
     (outcome, case)
@@ -425,9 +430,9 @@ fn a_gate_under_a_no_slot_run_takes_its_own_slot_and_says_nothing() {
         .expect("the inner gate took a heavy slot");
     let slot = StateRoot::new(&shown(&case.root()), None).object_name(gate_state::KernelObject::HeavySlot(0));
     assert_eq!((&take["slots"], &take["parentPid"]), (&Value::from(vec![slot]), &Value::from(outer_pid)));
-    let inner_log = fs::read_to_string(case.folder().join("inner.log")).expect("the inner gate wrote its log");
+    let inner_log = log_texts(&case.folder().join("inner.log"));
     assert!(inner_log.starts_with(&format!("{}\n", marker_of(&case, "heavy", &take))), "{inner_log}");
-    let outer_log = fs::read_to_string(case.folder().join("outer.log")).expect("the outer gate wrote its log");
+    let outer_log = log_texts(&case.folder().join("outer.log"));
     assert!(
         !outer_log.contains("GATE_SLOT_HELD") && !outer_log.contains("slot of gate"),
         "the inner gate said nothing of its parent: {outer_log}"
@@ -458,7 +463,7 @@ fn a_no_slot_run_marks_its_command_with_kind_none() {
     let outcome = case.run(&none_words("out.log", &[], &[FAKE_TOOL, "env", "GATE_SLOT_HELD"]));
     assert_passed(&outcome);
 
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the gate wrote its log");
+    let log = log_texts(&case.folder().join("out.log"));
     let marker = marker_of(&case, "none", &events(&case)[0]);
     assert!(log.starts_with(&format!("{marker}\n")), "{log}");
 }
@@ -475,10 +480,14 @@ fn a_no_slot_gate_under_a_heavy_gate_is_covered_and_hands_the_marker_on() {
     let line = covered(&case);
     assert_eq!((&line["parentPid"], &line["kind"]), (&Value::from(outer_pid), &Value::from("none")));
     let marker = marker_of(&case, "heavy", &events(&case)[0]);
-    let inner_log = fs::read_to_string(case.folder().join("inner.log")).expect("the inner gate wrote its log");
+    let inner_log = log_texts(&case.folder().join("inner.log"));
     assert_in_order(
         &inner_log,
-        &[&format!("{marker}\n"), &format!("gate: running under the heavy slot of gate {outer_pid}")],
+        // The gate says it runs under the slot before it starts its command, and the log holds its lines as said.
+        &[
+            &format!("gate: running under the heavy slot of gate {outer_pid}\n"),
+            &format!("{marker}\n"),
+        ],
     );
 }
 
@@ -533,7 +542,7 @@ fn a_gate_lent_its_light_parents_slot_hands_its_command_its_own_heavy_marker() {
         .find(|event| event["event"] == "parent" && event["pid"] == child_pid)
         .expect("checked above");
     let marker = marker_of(&case, "heavy", &parent_line);
-    let child_log = fs::read_to_string(case.folder().join("child.log")).expect("the child wrote its log");
+    let child_log = log_texts(&case.folder().join("child.log"));
     assert!(
         child_log.contains(&format!("{marker}\n")),
         "the lent child hands its command its own heavy marker {marker}: {child_log}"
@@ -745,23 +754,31 @@ fn takers_but(case: &Case, but: u32) -> Vec<u64> {
         .collect()
 }
 
-/// Waits until the file at `path` holds a line containing `needle`, and returns that line.
-fn line_with(path: &Path, needle: &str) -> String {
-    line_with_unless_ended(path, needle, || false)
+/// Waits until the log at `path` holds a line of its command's stderr containing `needle`, and returns its text: what
+/// a gate running as that command said, not a line of the log's own gate.
+fn err_line_with(path: &Path, needle: &str) -> String {
+    line_with_unless_ended(path, needle, Some(Tag::Err), || false)
 }
 
-/// [`line_with`], failing at once when `ended` says the process that writes the file has ended without writing the
-/// line. `ended` is asked before the file is read, so a line written just before the end is still found. A missing
-/// file holds no line yet; any other failure to read it fails the case. The bytes are read as UTF-8 with U+FFFD for a
-/// character torn by a write still under way.
-fn line_with_unless_ended(path: &Path, needle: &str, ended: impl Fn() -> bool) -> String {
+/// Waits until the file at `path` holds a line containing `needle`, of the tag `only` when it is given, and returns
+/// that line's text, unstamped; failing at once when `ended` says the process that writes the file has ended without
+/// writing the line. `ended` is asked before the file is read, so a line written just before the end is still found. A
+/// missing file holds no line yet; any other failure to read it fails the case. The bytes are read as UTF-8 with U+FFFD
+/// for a character torn by a write still under way.
+fn line_with_unless_ended(path: &Path, needle: &str, only: Option<Tag>, ended: impl Fn() -> bool) -> String {
     let found = || {
         let bytes = match fs::read(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (None, String::new()),
             read => read.expect("a file a case waits on can be read"),
         };
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        (text.lines().find(|line| line.contains(needle)).map(str::to_owned), text)
+        let found = text
+            .lines()
+            .map(unstamped)
+            .filter(|parts| only.is_none_or(|tag| parts.tag == Some(tag)))
+            .map(|parts| parts.text)
+            .find(|line| line.contains(needle));
+        (found.map(str::to_owned), text)
     };
     let mut line = None;
     wait_until(&format!("a line with {needle:?} in {}", path.display()), || {
@@ -845,7 +862,7 @@ fn a_critical_gate_under_a_gate_standing_in_for_an_ended_critical_parent_is_refu
     assert!(!journalled(), "D never queues for the machine behind A's slot");
     assert_eq!(d.ended(), 2, "D is refused");
     assert_eq!(
-        line_with(&case.folder().join("a.log.err"), "critical cannot run under"),
+        err_line_with(&case.folder().join("a.log"), "critical cannot run under"),
         format!(
             "gate: --slot critical cannot run under the heavy slot of gate {}: it would wait for that slot for good; run the critical \
              command outside that gate",
@@ -883,15 +900,15 @@ fn a_nested_chain_whose_stand_in_ends_too_holds_one_slot() {
     let outer_pid = end_parent(outer, release);
     wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, a.pid));
     // Each gate's lines reach the `.err` file of the gate whose command it runs as.
-    let (a_err, b_err) = (case.folder().join("a.log.err"), case.folder().join("b.log.err"));
+    let (a_err, b_err) = (case.folder().join("a.log"), case.folder().join("b.log"));
     let under_a = format!("gate: the parent gate {outer_pid} ended; running under the heavy slot of gate {}", a.pid);
-    assert_eq!(line_with(&a_err, &format!("gate: the parent gate {outer_pid} ended;")), under_a, "B");
-    assert_eq!(line_with(&b_err, &format!("gate: the parent gate {outer_pid} ended;")), under_a, "C");
+    assert_eq!(err_line_with(&a_err, &format!("gate: the parent gate {outer_pid} ended;")), under_a, "B");
+    assert_eq!(err_line_with(&b_err, &format!("gate: the parent gate {outer_pid} ended;")), under_a, "C");
 
     // A's command ends, leaving B and C running: B takes the slot A lets go, and C stands in under B.
     let_go(b_release);
     assert_eq!(a.ended(), 0);
-    let c_line = line_with(&b_err, &format!("gate: the parent gate {} ended;", a.pid));
+    let c_line = err_line_with(&b_err, &format!("gate: the parent gate {} ended;", a.pid));
     assert_eq!(
         c_line,
         format!("gate: the parent gate {} ended; running under the heavy slot of gate {}", a.pid, b.pid),
@@ -933,7 +950,7 @@ fn a_gate_started_as_its_parent_gate_ends_runs_covered_by_the_gate_whose_command
         "E runs under A rather than queueing before its command: {first}"
     );
     assert_eq!(e.ended(), 0);
-    let e_log = fs::read_to_string(case.folder().join("e.log")).expect("E wrote its log");
+    let e_log = log_texts(&case.folder().join("e.log"));
     assert!(
         e_log.contains(&format!("gate: running under the heavy slot of gate {}", a.id())) && !e_log.contains("ignored GATE_SLOT_HELD"),
         "{e_log}"
@@ -958,7 +975,7 @@ fn a_heavy_gate_under_a_light_covered_gate_takes_its_own_slot_when_their_parent_
     let c = spawned(&case, c_pid);
     wait_for_file(c_started);
     let outer_pid = end_parent(outer, release);
-    let c_line = line_with(&case.folder().join("a.log.err"), &format!("gate: the parent gate {outer_pid} ended;"));
+    let c_line = err_line_with(&case.folder().join("a.log"), &format!("gate: the parent gate {outer_pid} ended;"));
     assert_eq!(c_line, parent_ended_line(outer_pid, "heavy"), "A's light slot does not cover C");
     wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, c.pid));
     assert_eq!(
@@ -1012,7 +1029,7 @@ fn a_gate_started_after_the_parent_ended_runs_covered_by_the_late_gate() {
         .expect("checked above");
     assert_eq!(line["parentPid"], Value::from(late.pid), "it runs under the late gate, not the ended one");
     assert_eq!(claimant(&case, KernelObject::HeavySlot(0)), late.pid, "one claim: the late gate's");
-    let child_log = fs::read_to_string(case.folder().join("child.log")).expect("the child gate wrote its log");
+    let child_log = log_texts(&case.folder().join("child.log"));
     assert!(
         child_log.contains(&format!("gate: running under the heavy slot of gate {}", late.pid)),
         "{child_log}"
@@ -1052,15 +1069,18 @@ fn a_nested_chain_whose_parent_ended_holds_one_slot() {
 
     let outer_pid = end_parent(outer, &release);
     wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, late.pid));
-    // The nested gate runs as the late gate's command, so its lines reach the late gate's `.err` file as it says them.
-    let err = case.folder().join("inner.log.err");
+    // The nested gate runs as the late gate's command, so its lines reach the late gate's log, as its command's
+    // stderr, as it says them.
+    let err = case.folder().join("inner.log");
     let taken_up = format!(
         "gate: the parent gate {outer_pid} ended; running under the heavy slot of gate {}",
         late.pid
     );
-    wait_until("the nested gate staying covered by the late gate", || {
-        fs::read_to_string(&err).is_ok_and(|text| text.contains(&taken_up))
-    });
+    assert_eq!(
+        err_line_with(&err, &taken_up),
+        taken_up,
+        "the nested gate staying covered by the late gate"
+    );
     assert!(!has_tickets(&case), "the nested gate never queued for a slot");
     assert_eq!(claimant(&case, KernelObject::HeavySlot(0)), late.pid, "one claim: the late gate's");
 
@@ -1140,7 +1160,7 @@ fn a_covered_gate_takes_a_slot_when_its_parent_gate_ends_as(name: &str, kind: &s
     assert!(!claim.exists(), "the claim goes with the release");
     assert_eq!(events_of(&case, orphan.pid), ["covered", "take", "release"]);
     assert_eq!(covered_files(&case), Vec::<String>::new(), "the covered marker goes with the release");
-    let inner_log = fs::read_to_string(case.folder().join("inner.log")).expect("the covered gate wrote its log");
+    let inner_log = log_texts(&case.folder().join("inner.log"));
     assert_in_order(
         &inner_log,
         &[
@@ -1175,7 +1195,7 @@ fn a_parent_s_run_end_ends_its_plain_child_and_spares_its_covered_gate() {
     let outer = case.start(&heavy_words("outer.log", &[], &command));
     let orphan = spawned(&case, &pid_file);
     wait_for_file(&started);
-    let outer_log = fs::read_to_string(case.folder().join("outer.log")).expect("the outer gate's log is written");
+    let outer_log = log_texts(&case.folder().join("outer.log"));
     let plain_pid = said_pid(&outer_log, "spawned ");
     let plain = StoppableProcess::open(plain_pid)
         .expect("the plain child is opened")
@@ -1250,7 +1270,7 @@ fn a_covered_gate_waits_for_a_slot_without_pausing_its_command() {
     let order: Vec<&str> = order.iter().map(String::as_str).collect();
     let said = fs::read_to_string(&stderr).expect("the covered gate's stderr can be read");
     assert_in_order(&said, &order);
-    let inner_log = fs::read_to_string(&log).expect("the covered gate wrote its log");
+    let inner_log = log_texts(&log);
     assert_in_order(&inner_log, &order);
 }
 
@@ -1262,7 +1282,7 @@ const WAITING_FOR_THE_LIGHT_SLOT: &str = "gate: waiting for a light slot (1 busy
 /// finds the slot free once the holder lets go, and rightly says nothing, so a case that needs the gate to have found
 /// the slot held waits for the line that says so.
 fn wait_until_said(orphan: &Orphan, stderr: &Path, line: &str) {
-    line_with_unless_ended(stderr, line, || orphan.has_ended());
+    line_with_unless_ended(stderr, line, None, || orphan.has_ended());
 }
 
 #[test]
@@ -1289,7 +1309,7 @@ fn a_covered_gate_whose_command_ends_while_waiting_says_nothing_more() {
     assert!(!has_tickets(&case), "the covered gate's ticket is deleted");
     assert_eq!(claimant(&case, KernelObject::LightSlot(0)), holder.id(), "only the holder claims a slot");
     assert_eq!(covered_files(&case), Vec::<String>::new(), "the covered marker goes with the run");
-    let inner_log = fs::read_to_string(case.folder().join("inner.log")).expect("the covered gate wrote its log");
+    let inner_log = log_texts(&case.folder().join("inner.log"));
     assert_in_order(&inner_log, &[&parent_ended_line(outer_pid, "light"), WAITING_FOR_THE_LIGHT_SLOT]);
     let (waiting, ended) = inner_log.split_once("gate: passed in").expect("the covered gate passed");
     assert!(
@@ -1338,9 +1358,9 @@ fn class_of(pid: u32) -> Option<Priority> {
 /// The pid of the command that wrote `pid <n>` to the log at `log`, once it has.
 fn command_pid(log: &Path) -> u32 {
     wait_until("the command to say its pid", || {
-        fs::read_to_string(log).is_ok_and(|text| text.lines().any(|line| line.starts_with("pid ")))
+        log_texts(log).lines().any(|line| line.starts_with("pid "))
     });
-    said_pid(&fs::read_to_string(log).expect("the log can be read"), "pid ")
+    said_pid(&log_texts(log), "pid ")
 }
 
 #[test]
@@ -1381,7 +1401,7 @@ fn a_light_gate_under_a_critical_parent_that_ends_runs_as_light_under_a_heavy_st
     assert_eq!(class_of(command), Some(Priority::High), "C's command runs as critical");
 
     let outer_pid = end_parent(outer, release);
-    let c_line = line_with(&case.folder().join("a.log.err"), &format!("gate: the parent gate {outer_pid} ended;"));
+    let c_line = err_line_with(&case.folder().join("a.log"), &format!("gate: the parent gate {outer_pid} ended;"));
     assert_eq!(
         c_line,
         format!("gate: the parent gate {outer_pid} ended; running under the heavy slot of gate {}", a.pid),
@@ -1425,10 +1445,9 @@ fn a_gate_given_a_box_job_it_does_not_run_inside_ignores_it() {
 /// The line fake-tool's `priority` step prints at `BELOW_NORMAL_PRIORITY_CLASS`.
 const BELOW_NORMAL_LINE: &str = "priority 0x4000";
 
-/// The lines of the log `name` in the case folder.
+/// The texts of the lines of the log `name` in the case folder, unstamped, without the process lines ([`log_texts`]).
 fn log_lines(case: &Case, name: &str) -> Vec<String> {
-    let text = fs::read_to_string(case.folder().join(name)).expect("the gate wrote its log");
-    text.lines().map(str::to_owned).collect()
+    log_texts(&case.folder().join(name)).lines().map(str::to_owned).collect()
 }
 
 /// The line a commit run asked for on no slot says once, before it waits for the light slot it takes.

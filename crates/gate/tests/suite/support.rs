@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use std::{fs, process, thread};
 
 use gate_win32::StoppableProcess;
+use gate_wire::stamp::{Tag, is_process_line, unstamped};
 use jiff::Timestamp;
 use serde_json::{Value, json};
 use windows_sys::Win32::Foundation::{ERROR_OPERATION_ABORTED, WAIT_OBJECT_0, WAIT_TIMEOUT};
@@ -1910,4 +1911,49 @@ fn reg_status(args: &[&str]) -> io::Result<ExitStatus> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
+}
+
+/// The texts of the log at `path` as a test asserts on them: each line read through [`unstamped`] and ended with a
+/// line feed, the gate's process lines (its own, and each process joining or leaving the command's job) left out. A log
+/// not written yet reads as nothing.
+pub(crate) fn log_texts(path: &Path) -> String {
+    let bytes = fs::read(path).unwrap_or_default();
+    let mut texts = String::new();
+    for line in String::from_utf8_lossy(&bytes).lines() {
+        let parts = unstamped(line);
+        if parts.tag == Some(Tag::Gat) && is_process_line(parts.text) {
+            continue;
+        }
+        texts.push_str(parts.text);
+        texts.push('\n');
+    }
+    texts
+}
+
+/// The texts of the gate's process lines in the log at `path`, in file order: its own `gate pid=` line and each
+/// `spawn`, `exit`, `left`, `missed` and `stopped` line. A log not written yet holds none.
+pub(crate) fn process_lines(path: &Path) -> Vec<String> {
+    let bytes = fs::read(path).unwrap_or_default();
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(unstamped)
+        .filter(|parts| parts.tag == Some(Tag::Gat) && is_process_line(parts.text))
+        .map(|parts| parts.text.to_owned())
+        .collect()
+}
+
+/// The index in `lines` ([`process_lines`]) of the `spawn` line of `pid`, and the parent pid it names; `None` when the
+/// lines hold no spawn of `pid`.
+pub(crate) fn spawn_of(lines: &[String], pid: u32) -> Option<(usize, String)> {
+    let head = format!("spawn pid={pid} ppid=");
+    lines.iter().enumerate().find_map(|(at, line)| {
+        let rest = line.strip_prefix(&head)?;
+        Some((at, rest.split(' ').next().unwrap_or_default().to_owned()))
+    })
+}
+
+/// The index in `lines` ([`process_lines`]) of the `exit` line of `pid`, or `None` when the lines hold none.
+pub(crate) fn exit_of(lines: &[String], pid: u32) -> Option<usize> {
+    let head = format!("exit pid={pid} ");
+    lines.iter().position(|line| line.starts_with(&head))
 }

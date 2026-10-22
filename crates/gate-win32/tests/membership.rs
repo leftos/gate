@@ -60,24 +60,25 @@ impl Drop for Case {
     }
 }
 
-/// `ping` [`LINGER`] started in `job`, its output in `dir`.
+/// `ping` [`LINGER`] started in `job`, in `dir`, its output read to its end by a thread of its own, so a write of the
+/// member's never fails or blocks.
 fn member(dir: &Path, job: &Job) -> Running {
     let system = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot is set"));
-    Launch {
+    let mut suspended = Launch {
         application: system.join(r"System32\PING.EXE"),
         command_line: format!("ping {}", LINGER.join(" ")).encode_utf16().collect(),
         directory: dir.to_path_buf(),
         environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
-        output: LaunchOutput::Files {
-            log: dir.join("out.log"),
-            err_log: dir.join("out.log.err"),
-        },
+        output: LaunchOutput::Pipes,
         priority: None,
     }
     .start_suspended()
-    .expect("the member starts")
-    .assign_and_resume(job)
-    .expect("the member is assigned and resumed")
+    .expect("the member starts");
+    let (stdout, stderr) = suspended.take_output().expect("a launch with output pipes has them");
+    for mut pipe in [stdout, stderr] {
+        std::thread::spawn(move || std::io::copy(&mut pipe, &mut std::io::sink()));
+    }
+    suspended.assign_and_resume(job).expect("the member is assigned and resumed")
 }
 
 /// `ping` [`LINGER`] started outside the job, which starts no process of its own, ended when dropped.

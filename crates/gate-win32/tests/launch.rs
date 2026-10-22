@@ -51,7 +51,7 @@ fn cmd() -> PathBuf {
 }
 
 /// The command `line` of `application` to run in `dir` with this process's environment and `extra` set over it, its
-/// output to `out.log` and its errors to `out.log.err` there.
+/// output and its errors each to a pipe whose read end the launch keeps ([`LaunchOutput::Pipes`]).
 fn launch(dir: &Path, application: &Path, line: &str, extra: &[(&str, &str)]) -> Launch {
     let overrides = extra.iter().map(|(name, value)| (OsString::from(name), OsString::from(value)));
     Launch {
@@ -59,10 +59,7 @@ fn launch(dir: &Path, application: &Path, line: &str, extra: &[(&str, &str)]) ->
         command_line: line.encode_utf16().collect(),
         directory: dir.to_path_buf(),
         environment: EnvironmentBlock::new(std::env::vars_os().chain(overrides)).expect("the block is built"),
-        output: LaunchOutput::Files {
-            log: dir.join("out.log"),
-            err_log: dir.join("out.log.err"),
-        },
+        output: LaunchOutput::Pipes,
         priority: None,
     }
 }
@@ -111,15 +108,17 @@ fn exit_code_of(process: &OwnedHandle) -> u32 {
     code
 }
 
-/// Starts the `cmd` command `line` in `dir`, puts it in a fresh job named for `test` and lets it run to its exit code.
-fn run(test: &str, dir: &Path, line: &str, extra: &[(&str, &str)]) -> u32 {
+/// Starts the `cmd` command `line` in `dir`, puts it in a fresh job named for `test` and lets it run to its exit code:
+/// that, and what it wrote to its stdout and its stderr.
+fn run(test: &str, dir: &Path, line: &str, extra: &[(&str, &str)]) -> (u32, String, String) {
     let job = Job::create(&unique_name(test)).expect("the job is created");
-    let running = launch(dir, &cmd(), line, extra)
-        .start_suspended()
-        .expect("the command starts")
-        .assign_and_resume(&job)
-        .expect("the command is assigned and resumed");
-    exit_code(&running)
+    let mut suspended = launch(dir, &cmd(), line, extra).start_suspended().expect("the command starts");
+    let (mut stdout, mut stderr) = suspended.take_output().expect("a launch with output pipes has them");
+    let running = suspended.assign_and_resume(&job).expect("the command is assigned and resumed");
+    let (mut output, mut errors) = (String::new(), String::new());
+    stdout.read_to_string(&mut output).expect("the command's stdout is read to its end");
+    stderr.read_to_string(&mut errors).expect("the command's stderr is read to its end");
+    (exit_code(&running), output, errors)
 }
 
 /// The exit code of `running`, once it has exited.
@@ -170,19 +169,18 @@ fn a_dropped_suspended_command_is_ended_with_exit_code_1() {
 fn the_exit_code_comes_back() {
     let dir = case_dir("exit-3");
 
-    assert_eq!(run("exit-3", &dir, "cmd /d /c exit 3", &[]), 3);
+    assert_eq!(run("exit-3", &dir, "cmd /d /c exit 3", &[]).0, 3);
 }
 
 #[test]
-fn output_and_errors_land_in_the_log_and_err_files_from_the_given_environment() {
+fn output_and_errors_come_from_the_given_environment() {
     let dir = case_dir("output");
     let extra = [("gate_win32_test_value", "overridden"), ("GATE_WIN32_TEST_VALUE", "from-block")];
 
-    let code = run("output", &dir, "cmd /d /c echo out-%GATE_WIN32_TEST_VALUE%&1>&2 echo err", &extra);
+    let (code, output, errors) = run("output", &dir, "cmd /d /c echo out-%GATE_WIN32_TEST_VALUE%&1>&2 echo err", &extra);
 
     assert_eq!(code, 0);
-    assert_eq!(fs::read(dir.join("out.log")).expect("the log is read"), b"out-from-block\r\n");
-    assert_eq!(fs::read(dir.join("out.log.err")).expect("the errors are read"), b"err\r\n");
+    assert_eq!((output.as_str(), errors.as_str()), ("out-from-block\r\n", "err\r\n"));
     assert!(
         std::env::var_os("GATE_WIN32_TEST_VALUE").is_none(),
         "the gate's own environment is unchanged"
@@ -216,47 +214,10 @@ fn environment_names_match_without_regard_to_case_beyond_ascii() {
     let dir = case_dir("unicode-name");
     let extra = [("ÄPFEL", "1"), ("äpfel", "2")];
 
-    let code = run("unicode-name", &dir, "cmd /d /c echo %ÄPFEL%", &extra);
+    let (code, output, _) = run("unicode-name", &dir, "cmd /d /c echo %ÄPFEL%", &extra);
 
     assert_eq!(code, 0);
-    assert_eq!(
-        fs::read(dir.join("out.log")).expect("the log is read"),
-        b"2\r\n",
-        "one entry, the later value"
-    );
-}
-
-#[test]
-fn an_existing_log_is_replaced() {
-    let dir = case_dir("replaced");
-    fs::write(dir.join("out.log"), "old content that is longer than the new\r\n").expect("the old log is written");
-
-    assert_eq!(run("replaced", &dir, "cmd /d /c echo new", &[]), 0);
-
-    assert_eq!(fs::read(dir.join("out.log")).expect("the log is read"), b"new\r\n");
-}
-
-#[test]
-#[expect(clippy::print_stderr, reason = "a skipped case says why it skipped")]
-fn a_log_path_that_is_a_symlink_never_writes_the_links_target() {
-    let dir = case_dir("symlink");
-    let target = dir.join("target.txt");
-    fs::write(&target, "keep").expect("the target is written");
-    if let Err(error) = std::os::windows::fs::symlink_file(&target, dir.join("out.log")) {
-        eprintln!("skipped: this process may not create a symlink: {error}");
-        return;
-    }
-    let job = Job::create(&unique_name("symlink")).expect("the job is created");
-
-    if let Ok(suspended) = launch(&dir, &cmd(), "cmd /d /c echo new", &[]).start_suspended() {
-        let running = suspended.assign_and_resume(&job).expect("the command is assigned and resumed");
-        assert_eq!(exit_code(&running), 0);
-        let log = fs::symlink_metadata(dir.join("out.log")).expect("the log exists");
-        assert!(!log.file_type().is_symlink(), "the log is a fresh file at the link's own path");
-        assert_eq!(fs::read(dir.join("out.log")).expect("the log is read"), b"new\r\n");
-    }
-
-    assert_eq!(fs::read(&target).expect("the target is read"), b"keep", "the link's target is untouched");
+    assert_eq!(output, "2\r\n", "one entry, the later value");
 }
 
 #[test]
@@ -311,14 +272,13 @@ fn the_priority_class_reaches_the_command() {
     );
     high.priority = Some(PriorityClass::High);
 
-    let running = high
-        .start_suspended()
-        .expect("the command starts")
-        .assign_and_resume(&job)
-        .expect("it is resumed");
+    let mut suspended = high.start_suspended().expect("the command starts");
+    let (mut stdout, _stderr) = suspended.take_output().expect("a launch with output pipes has them");
+    let running = suspended.assign_and_resume(&job).expect("it is resumed");
+    let mut printed = String::new();
+    stdout.read_to_string(&mut printed).expect("the command's stdout is read to its end");
 
     assert_eq!(exit_code(&running), 0);
-    let printed = fs::read_to_string(dir.join("out.log")).expect("the log is read");
     assert_eq!(printed.trim_end(), "High");
 }
 

@@ -5,9 +5,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
-use std::fs;
 use std::io;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gate_args::{RunRequest, Slot};
@@ -20,11 +18,11 @@ use gate_win32::{Interrupt, Job, Priority, ProcessTimes, Running, Waited};
 use jiff::Timestamp;
 use proc_table::{ProcessInfo, ProcessTable, ProcessTree, Win32ProcessTable, filetime_to_timestamp};
 
+use crate::boxside::forward::OutputBytes;
 use crate::console::Console;
 use crate::durations::{Usual, hang_hint};
 use crate::escaped::{self, Departed, Look, Recorded};
 use crate::late::Late;
-use crate::log::Log;
 use crate::nesting::Parent;
 use crate::pause::PauseReader;
 use crate::resolve::ResolvedRoot;
@@ -61,7 +59,7 @@ pub(crate) enum Watched {
 pub(crate) struct Watcher<'a> {
     job: &'a Job,
     running: &'a Running,
-    log: &'a Log,
+    output: OutputBytes,
     /// The command's start as a `FILETIME`, read before it was created: a process of the job created before it is
     /// left out of the sample's processes.
     since: u64,
@@ -181,7 +179,8 @@ impl Start {
 pub(crate) struct Watching<'a> {
     pub job: &'a Job,
     pub running: &'a Running,
-    pub log: &'a Log,
+    /// The bytes the command's readers have read from its stdout and stderr: the only output the stall counts.
+    pub output: OutputBytes,
     /// The run's ceiling in whole seconds, as its take resolved it.
     pub ceiling: u64,
     /// The usual p90 of the run's take, past 3x which the watch says its hang hint once; `None` without history.
@@ -204,11 +203,11 @@ pub(crate) struct Watching<'a> {
     pub late: Option<Late<'a>>,
 }
 
-/// One sample pass's gathered facts: the sample itself, the sizes of the log and its `.err` file, the two kept apart
+/// One sample pass's gathered facts: the sample itself, the bytes of the command's stdout and stderr, the two kept apart
 /// for the diagnostics block, and whether the pass's WSL VM read failed, which that block reports.
 struct Gathered {
     sample: Sample,
-    log_bytes: u64,
+    out_bytes: u64,
     err_bytes: u64,
     vm_failed: bool,
 }
@@ -224,7 +223,7 @@ impl<'a> Watcher<'a> {
         let Watching {
             job,
             running,
-            log,
+            output,
             ceiling,
             usual,
             interrupt,
@@ -246,7 +245,7 @@ impl<'a> Watcher<'a> {
         Ok(Watcher {
             job,
             running,
-            log,
+            output,
             since: start.since,
             started: start.started,
             period: request.test_seams.sample_ms.map_or(SAMPLE_PERIOD, Duration::from_millis),
@@ -446,7 +445,7 @@ impl<'a> Watcher<'a> {
         match self.sample(console, began, paused) {
             Ok(Gathered {
                 sample,
-                log_bytes,
+                out_bytes,
                 err_bytes,
                 vm_failed,
             }) => {
@@ -454,7 +453,7 @@ impl<'a> Watcher<'a> {
                 // part way leaves the last good sample's processes in place.
                 self.counted_escaped = sample.escaped.keys().copied().collect();
                 self.watch.sample(&sample);
-                self.record(&sample, log_bytes, err_bytes, vm_failed);
+                self.record(&sample, out_bytes, err_bytes, vm_failed);
             }
             Err(error) => {
                 self.sampler_works = false;
@@ -467,7 +466,7 @@ impl<'a> Watcher<'a> {
 
     /// Keeps one sample for the diagnostics block a kill writes: the sample's own figures, the WSL VM's CPU the watch
     /// found for a wsl command (`vm_failed` when this sample could not read it).
-    fn record(&mut self, sample: &Sample, log_bytes: u64, err_bytes: u64, vm_failed: bool) {
+    fn record(&mut self, sample: &Sample, out_bytes: u64, err_bytes: u64, vm_failed: bool) {
         let wsl_vm = match (self.watch.last_vm_percent(), vm_failed) {
             (None, _) => WslVm::NotWatched,
             (Some(_), true) => WslVm::Unavailable,
@@ -476,7 +475,7 @@ impl<'a> Watcher<'a> {
         // The sample just taken leaves the share it found, so this is `Some`; 100 is the watch's answer while nothing has
         // been counted.
         let figures = (self.watch.adjusted_seconds(), self.watch.last_free_percent().unwrap_or(100));
-        self.history.push(sample_facts(sample, figures, (log_bytes, err_bytes), wsl_vm));
+        self.history.push(sample_facts(sample, figures, (out_bytes, err_bytes), wsl_vm));
     }
 
     /// The kill due now, as stalled, timed out or past the backstop, or `None`; a command that exited as the kill was
@@ -596,8 +595,8 @@ impl<'a> Watcher<'a> {
         paused
     }
 
-    /// The facts of one sample that began at `began`: the size of the log and its `.err` file, the two kept apart for
-    /// the diagnostics block, the job's processes created since the command started, the processes outside the job
+    /// The facts of one sample that began at `began`: the bytes the command wrote to its stdout and its stderr, the
+    /// two kept apart for the diagnostics block and no gate line among them, the job's processes created since the command started, the processes outside the job
     /// under its members and their CPU, the WSL VM's CPU for a wsl command (its unreadable line said once, when it
     /// first fails), and last the system's times and the job's accounting, stamped with the watch's end time: the
     /// interval the watch counts them over is exactly the stretch the end stamp closes. Under `--test-sampler-fail`
@@ -606,8 +605,7 @@ impl<'a> Watcher<'a> {
         if self.sampler_fail {
             return Err(io::Error::other(SAMPLER_FAIL));
         }
-        let log_bytes = size(self.log.path())?;
-        let err_bytes = size(self.log.err_path())?;
+        let (out_bytes, err_bytes) = self.output.read();
         let looked = escaped::now().ok_or_else(|| io::Error::other(escaped::NO_CLOCK))?;
         let before = self.job.process_ids()?;
         let started = members(before.iter().copied(), self.since, gate_win32::process_times)?;
@@ -646,7 +644,7 @@ impl<'a> Watcher<'a> {
             at,
             system,
             job_cpu,
-            output_size: log_bytes + err_bytes,
+            output_size: out_bytes + err_bytes,
             pids: started.into_keys().collect(),
             paused,
             nested_gate,
@@ -655,7 +653,7 @@ impl<'a> Watcher<'a> {
         };
         Ok(Gathered {
             sample,
-            log_bytes,
+            out_bytes,
             err_bytes,
             vm_failed: vm.is_err(),
         })
@@ -670,14 +668,14 @@ fn outside_the_job(recorded: &mut Recorded, look: Look<'_>, times: impl Fn(u32) 
 }
 
 /// The facts the diagnostics block keeps of `sample`: its own figures, the watch's load-adjusted seconds and the free
-/// share it found (`figures`), the sizes of the log and its `.err` file, and the WSL VM's CPU.
+/// share it found (`figures`), the bytes of the command's stdout and stderr, and the WSL VM's CPU.
 fn sample_facts(sample: &Sample, figures: (f64, u32), sizes: (u64, u64), wsl_vm: WslVm) -> SampleFacts {
-    let ((adjusted_seconds, free_percent), (log_bytes, err_bytes)) = (figures, sizes);
+    let ((adjusted_seconds, free_percent), (out_bytes, err_bytes)) = (figures, sizes);
     SampleFacts {
         wall_seconds: sample.at.as_secs_f64(),
         adjusted_seconds,
         free_percent,
-        log_bytes,
+        out_bytes,
         err_bytes,
         job_cpu: sample.job_cpu,
         wsl_vm,
@@ -870,13 +868,6 @@ pub(crate) fn system_times() -> io::Result<SystemTimes> {
         kernel: times.kernel,
         user: times.user,
     })
-}
-
-/// The size of the file at `path`.
-fn size(path: &Path) -> io::Result<u64> {
-    fs::metadata(path)
-        .map(|metadata| metadata.len())
-        .map_err(|error| io::Error::new(error.kind(), format!("cannot read the size of {}: {error}", path.display())))
 }
 
 #[cfg(test)]

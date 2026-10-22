@@ -1,12 +1,11 @@
 //! The PowerShell form through the binary. The compatibility layer has no `--state-dir`, so these cases give the root
 //! through `GATE_STATE_DIR`.
 
-use std::fs;
 use std::process::Command;
 
 use serde_json::Value;
 
-use crate::support::{Case, FAKE_TOOL, USAGE, finish, print_run};
+use crate::support::{Case, FAKE_TOOL, USAGE, finish, log_texts, print_run};
 
 /// The PowerShell form of a run that prints its request, with `extra` before `--`.
 fn compat_run(extra: &[&'static str]) -> Vec<&'static str> {
@@ -99,7 +98,7 @@ fn compat_env_pair_reaches_the_command() {
     let outcome = finish(with_env_root(&case, &words));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(log.contains("from -Env"), "the command sees the pair: {log}");
 }
 
@@ -126,7 +125,7 @@ fn compat_env_name_forwards_the_caller_s_value() {
     let outcome = finish(command);
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert!(
         log.lines().any(|line| line == "from the caller's environment"),
         "the command sees the forwarded value: {log}"

@@ -4128,10 +4128,7 @@ fn box_stop_refuses_a_job_name_not_of_its_work_folder() {
         command_line: format!("\"{FAKE_TOOL}\" wait \"{}\"", shown(&go)).encode_utf16().collect(),
         directory: case.folder(),
         environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
-        output: LaunchOutput::Files {
-            log: case.folder().join("held.log"),
-            err_log: case.folder().join("held.log.err"),
-        },
+        output: LaunchOutput::Pipes,
         priority: None,
     };
     let held = launch
@@ -8513,10 +8510,7 @@ fn held_in(case: &Case, job: &Job, go: &Path) -> gate_win32::Running {
         command_line: format!("\"{FAKE_TOOL}\" wait \"{}\"", shown(go)).encode_utf16().collect(),
         directory: case.folder(),
         environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
-        output: LaunchOutput::Files {
-            log: case.folder().join("held.log"),
-            err_log: case.folder().join("held.log.err"),
-        },
+        output: LaunchOutput::Pipes,
         priority: None,
     };
     launch

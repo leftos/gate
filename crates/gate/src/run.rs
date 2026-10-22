@@ -12,8 +12,13 @@ use std::fs::OpenOptions;
 use std::os::windows::ffi::OsStrExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use std::{fs, io};
+
+use gate_wire::stamp::{self, Tag};
 
 use gate_args::{
     Ceiling, ProgramSearch, RunRequest, Slot, Spelling, batch_command_line, batch_refusal, command_line, is_batch_target, resolve_program,
@@ -28,7 +33,8 @@ use gate_state::{
 };
 use gate_watchdog::{Cores, Hint, SlotKind, hint};
 use gate_win32::{
-    AcquireError, Interrupt, Job, Launch, LaunchError, LaunchOutput, NamedMutex, OpenedJob, OwnedMutexGuard, PriorityClass, Running, StoppableProcess,
+    AcquireError, Interrupt, Job, JobEvent, Launch, LaunchError, LaunchOutput, NamedMutex, OpenedJob, OwnedMutexGuard, PriorityClass, Running,
+    StoppableProcess, Suspended,
 };
 use jiff::Timestamp;
 use proc_table::{ProcessTree, Win32ProcessTable};
@@ -36,6 +42,7 @@ use serde_json::{Map, Value};
 
 use crate::acquire;
 use crate::answer::USAGE_STATUS;
+use crate::boxside::forward::{DRAIN, Forwarders, OutputBytes, Sink, Stamping};
 use crate::commit;
 use crate::console::Console;
 use crate::covered::Covered;
@@ -48,6 +55,7 @@ use crate::journal::{self, RunJournal};
 use crate::late::{Late, LateOf, LateSlot};
 use crate::load::{self, Measuring, When};
 use crate::log::Log;
+use crate::log_writer::LogWriter;
 use crate::machine::{self, Machine, MachineWait, MachineWaited};
 use crate::nesting::{Nesting, Parent, covers, enclosing_of};
 use crate::no_build::{self, NothingBack, Unfound, Worktree};
@@ -114,7 +122,6 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
     let at = Where {
         root,
         gate: &gate,
-        log: &log,
         nesting: &nesting,
     };
     let (plan, client) = match ready(request, &at, console) {
@@ -167,6 +174,8 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         here_nesting: None,
         heavy_store: Some(&mut heavy),
         trace: RunTrace::default(),
+        writer: None,
+        streams: None,
     };
     let (route, placed) = run.route(environment, console);
     if let Some(status) = ended_at_route(&route, request, &run.log, console) {
@@ -197,9 +206,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
             panic::resume_unwind(payload);
         }
     };
-    if let Err(error) = run.log.append(&console.take_notes()) {
-        console.err(&format!("gate: cannot write to {}: {error}", run.log.path().display()));
-    }
+    run.finish_log(console);
     status
 }
 
@@ -408,11 +415,10 @@ impl NotRun {
     }
 }
 
-/// Where a planned command logs, under which state root, which gate runs it, and under which parent's slot.
+/// Under which state root a planned command runs, which gate runs it, and under which parent's slot.
 struct Where<'a> {
     root: &'a ResolvedRoot,
     gate: &'a ThisGate,
-    log: &'a Log,
     nesting: &'a Nesting,
 }
 
@@ -443,7 +449,7 @@ impl Plan {
     ///
     /// A refused batch word (status 2), or a working folder or environment the gate cannot read or pass on (status 1).
     fn prepare(request: &RunRequest, words: &[OsString], at: &Where<'_>, console: &mut Console) -> Result<Plan, NotRun> {
-        let Where { root, gate, log, nesting } = *at;
+        let Where { root, gate, nesting } = *at;
         let folder = std::env::current_dir().map_err(|error| NotRun::failed(format!("gate: cannot read the working directory: {error}")))?;
         // A covered gate hands on the marker of the parent whose slot its command runs under. Any other hands on its own,
         // a gate its light parent lends its slot included: that gate's marker names it as a heavy holder, so every gate
@@ -499,10 +505,7 @@ impl Plan {
                 command_line,
                 directory: folder,
                 environment,
-                output: LaunchOutput::Files {
-                    log: log.path().to_owned(),
-                    err_log: log.err_path().to_owned(),
-                },
+                output: LaunchOutput::Pipes,
                 priority: priority(nesting.runs_as(request.slot), console),
             }),
         };
@@ -631,6 +634,59 @@ struct Run<'a> {
     /// Where the run's time went, which its `release` line says: what the watch of a command run here found
     /// ([`Watcher::trace`]), or the parts of a routed run the client timed; empty for a run that reached neither.
     trace: RunTrace,
+    /// The log's writer from the run here's start ([`Run::here`]) until the run closes it ([`Run::close_log`]).
+    writer: Option<Arc<LogWriter>>,
+    /// The readers of the started command's output and the consumer of its job's process events, until the run's end
+    /// ends them ([`Run::end_streams`]).
+    streams: Option<Streams>,
+}
+
+/// What writes a started command's lines to its log: the readers of its two pipes, once started, and the thread that
+/// turns its job's events into process lines.
+struct Streams {
+    forwarders: Option<Forwarders>,
+    consumer: JoinHandle<()>,
+}
+
+/// How long the run's end waits for the members of the command's job still running to end, so each gets its exit
+/// line: the rest get a `left` line.
+const EVENTS_WAIT: Duration = Duration::from_secs(2);
+
+/// Starts the thread that writes each of `events` to `writer` as a process line, until the job drops its sender.
+fn spawn_consumer(writer: Arc<LogWriter>, events: Receiver<JobEvent>) -> io::Result<JoinHandle<()>> {
+    thread::Builder::new().name("job-events".to_owned()).spawn(move || {
+        for event in events {
+            let mut line = event_line(event);
+            line.push('\n');
+            writer.command(line.as_bytes());
+        }
+    })
+}
+
+/// `event` as the log's process line: a spawn stamped at the process's kernel create time, an exit at its kernel exit
+/// time when known, every other line now.
+fn event_line(event: JobEvent) -> String {
+    let (at, text) = match event {
+        JobEvent::Spawned { pid, ppid, image, at } => (stamp::local(at), stamp::spawn_text(pid, ppid, image.as_deref())),
+        JobEvent::Exited { pid, code, at, ran } => {
+            let ended = code.map_or(stamp::Ended::Unknown, |code| stamp::Ended::Code(i64::from(code)));
+            (at.map_or_else(stamp::now, stamp::local), stamp::exit_text(pid, ended, ran))
+        }
+        JobEvent::Missed { pid, why } => (stamp::now(), stamp::missed_text(pid, &why)),
+        JobEvent::Left { pid } => (stamp::now(), stamp::left_text(pid)),
+        JobEvent::Stopped { why } => (stamp::now(), stamp::stopped_text(&why)),
+    };
+    stamp::stamped(&at, Tag::Gat, &text)
+}
+
+/// The pid of the process that started this gate, as the system's process table names it.
+fn gate_parent_pid() -> Option<u32> {
+    let me = std::process::id();
+    Win32ProcessTable
+        .snapshot_without_command_lines()
+        .into_iter()
+        .find(|process| process.pid == me)
+        .map(|process| process.parent_pid)
 }
 
 /// What a take of a pool's slot is journalled and claimed with: the run's state root, gate, request, ceiling and log,
@@ -1249,6 +1305,7 @@ impl Run<'_> {
     /// a slot into `hold`, one whose parent's slot does not cover it saying so first, before any wait line. How the run
     /// ended; `None` when a Ctrl+C ended the wait for a slot.
     fn here(&mut self, plan: Plan, hold: &mut Hold, console: &mut Console) -> Option<Ended> {
+        self.open_log(console);
         let nesting = self.nesting;
         let floor = Figures::floor(self.request.timeout);
         if nesting.covering().is_some() {
@@ -2018,7 +2075,6 @@ impl Run<'_> {
         let at = Where {
             root: self.root,
             gate: &self.gate,
-            log: &self.log,
             nesting: self.nesting,
         };
         Plan::prepare(self.request, words, &at, console).map_err(|NotRun { status, line }| {
@@ -2311,6 +2367,8 @@ impl Run<'_> {
     /// notes so far, then releases the slot with the run's end unknown. The job of a started command was terminated
     /// as the panic left its watch.
     fn after_panic(&mut self, hold: Hold, console: &mut Console) {
+        // The unwind dropped the command's job, which ended its events, so the consumer ends without a wait on them.
+        self.end_streams(None, console);
         if let Err(error) = self.log.finish(console) {
             console.err(&format!(
                 "gate: could not write to {} after the failure: {error}",
@@ -2318,6 +2376,96 @@ impl Run<'_> {
             ));
         }
         self.release(hold, None, console);
+        self.finish_log(console);
+    }
+
+    /// Closes the log's writer ([`Run::close_log`]), then appends the notes held since, as the run's last lines.
+    fn finish_log(&mut self, console: &mut Console) {
+        self.close_log(console);
+        if let Err(error) = self.log.finish(console) {
+            console.err(&format!("gate: cannot write to {}: {error}", self.log.path().display()));
+        }
+    }
+
+    /// Opens the log's writer, writes the gate's own process line to it first, then attaches the console, which
+    /// writes the notes it held and every later one; once a run. A log that cannot be opened is said, and the
+    /// command then does not start ([`Run::command`]).
+    fn open_log(&mut self, console: &mut Console) {
+        if self.writer.is_some() {
+            return;
+        }
+        match LogWriter::open(self.log.path()) {
+            Ok(writer) => {
+                let root = stamp::root_text(self.gate.pid, gate_parent_pid());
+                writer.gate_now(&[&root]);
+                console.attach(&writer);
+                self.writer = Some(writer);
+            }
+            Err(error) => console.err(&format!("gate: cannot open the log {}: {error}", self.log.path().display())),
+        }
+    }
+
+    /// Detaches the console and closes the log's writer, so no handle to the log outlives the run's hold on it; a
+    /// write to it that failed is said, held for [`Log::finish`].
+    fn close_log(&mut self, console: &mut Console) {
+        console.detach();
+        if let Some(writer) = self.writer.take()
+            && let Some(error) = writer.close()
+        {
+            console.err(&format!("gate: cannot write to {}: {error}", self.log.path().display()));
+        }
+    }
+
+    /// Wires the command `suspended` to the log before it runs: the job's events to a consumer that writes them as
+    /// process lines, and the command's two pipes to readers that write each line stamped and tagged as its stream's;
+    /// what they read is counted in the bytes returned. What was started is kept in [`Run::streams`] even when a later
+    /// part fails, so [`Run::end_streams`] ends it.
+    fn start_streams(&mut self, job: &mut Job, suspended: &mut Suspended) -> Result<OutputBytes, String> {
+        let writer = self.writer.clone().ok_or_else(|| "the log is not open".to_owned())?;
+        let (stdout, stderr) = suspended
+            .take_output()
+            .ok_or_else(|| "the command's output pipes were not made".to_owned())?;
+        let (events, received) = mpsc::channel();
+        job.remember(Some(events))
+            .map_err(|error| format!("cannot remember the processes of the command's job: {error}"))?;
+        let consumer =
+            spawn_consumer(Arc::clone(&writer), received).map_err(|error| format!("cannot start writing the job's process lines: {error}"))?;
+        let streams = self.streams.insert(Streams { forwarders: None, consumer });
+        let bytes = OutputBytes::default();
+        let sink = Sink::Log {
+            writer: &writer,
+            bytes: &bytes,
+        };
+        let forwarders = Forwarders::start(stdout, stderr, Stamping::Tags(Tag::Out, Tag::Err), sink)
+            .map_err(|error| format!("cannot start reading the command's output: {error}"))?;
+        streams.forwarders = Some(forwarders);
+        Ok(bytes)
+    }
+
+    /// Ends what writes the command's lines to the log, then seals it: the readers get [`DRAIN`] to reach the end of
+    /// their pipes, longer while one is only behind; the job's members still running get [`EVENTS_WAIT`] to end, so
+    /// their exit lines are written (`job`, `None` once the job is gone); the consumer is joined. After the seal no
+    /// line of the command and no process line reaches the log. Nothing is waited for twice.
+    fn end_streams(&mut self, job: Option<&Job>, console: &mut Console) {
+        if let Some(Streams { forwarders, consumer }) = self.streams.take() {
+            if let Some(forwarders) = forwarders
+                && !forwarders.drain(DRAIN).all_ended
+            {
+                console.note(&format!(
+                    "gate: the command's output readers did not finish within {} s; their last lines may be missing",
+                    DRAIN.as_secs()
+                ));
+            }
+            if let Some(job) = job {
+                job.finish_events(EVENTS_WAIT);
+            }
+            if consumer.join().is_err() {
+                console.err("gate: the thread writing the job's process lines failed");
+            }
+        }
+        if let Some(writer) = &self.writer {
+            writer.seal();
+        }
     }
 
     /// Deletes the claim, journals the release with how the run `ended` (status and verdict unknown when it did not
@@ -2382,18 +2530,32 @@ impl Run<'_> {
         } else {
             Job::create(&name)
         };
-        // The job remembers every process put in it from the command on, so a kill still reaches what one that has
-        // ended started outside it.
-        let created = created.and_then(|mut job| job.remember(None).map(|()| job));
-        let job = match created {
+        let mut job = match created {
             Ok(job) => job,
             Err(error) => return self.gate_failed(&format!("cannot create the job {name}: {error}"), None, console),
         };
         let start = Start::now();
-        match launch.start_suspended().and_then(|suspended| suspended.assign_and_resume(&job)) {
-            Ok(running) => self.watched(&job, &running, &start, figures, console),
-            Err(LaunchError::CreateProcess { message, .. }) => self.not_started(&plan.word, plan.resolved.as_deref(), &message, console),
-            Err(error) => self.gate_failed(&error.to_string(), None, console),
+        let mut suspended = match launch.start_suspended() {
+            Ok(suspended) => suspended,
+            Err(LaunchError::CreateProcess { message, .. }) => return self.not_started(&plan.word, plan.resolved.as_deref(), &message, console),
+            Err(error) => return self.gate_failed(&error.to_string(), None, console),
+        };
+        // The job remembers every process put in it from the command on, so a kill still reaches what one that has
+        // ended started outside it, and tells each one's coming and going to the log.
+        let bytes = match self.start_streams(&mut job, &mut suspended) {
+            Ok(bytes) => bytes,
+            Err(problem) => {
+                drop(suspended);
+                self.end_streams(Some(&job), console);
+                return self.gate_failed(&problem, None, console);
+            }
+        };
+        match suspended.assign_and_resume(&job) {
+            Ok(running) => self.watched(&job, &running, &start, &bytes, figures, console),
+            Err(error) => {
+                self.end_streams(Some(&job), console);
+                self.gate_failed(&error.to_string(), None, console)
+            }
         }
     }
 
@@ -2413,7 +2575,7 @@ impl Run<'_> {
 
     /// Watches the started command to its exit, a kill or a Ctrl+C, then reaches the verdict. Should the gate fail
     /// or panic first, the job is terminated, so the command does not outlive the run. The command runs under `figures`.
-    fn watched(&mut self, job: &Job, running: &Running, start: &Start, figures: Figures, console: &mut Console) -> Ended {
+    fn watched(&mut self, job: &Job, running: &Running, start: &Start, output: &OutputBytes, figures: Figures, console: &mut Console) -> Ended {
         // A copy of the run's own reference, so the stopper holds no borrow of the run while it is watched.
         let root = self.root;
         let recorded = RefCell::new(Recorded::default());
@@ -2421,6 +2583,7 @@ impl Run<'_> {
             job,
             running,
             recorded: Some(&recorded),
+            output,
             figures,
         };
         let mut stopper = Stopper {
@@ -2454,7 +2617,7 @@ impl Run<'_> {
         let Figures { ceiling, usual } = started.figures;
         let covering = nesting.covering();
         let (taker, held, covered) = self.late_taker(covering.map(|parent| parent.pid), ceiling);
-        let (root, gate, request, log) = (taker.root, taker.gate, taker.request, taker.log);
+        let (root, gate, request) = (taker.root, taker.gate, taker.request);
         let late = match (covering, Takes::of(request.slot), covered) {
             (Some(parent), Takes::Pool(pool), Some(covered)) => {
                 let of = LateOf {
@@ -2473,7 +2636,7 @@ impl Run<'_> {
         let watching = Watching {
             job: started.job,
             running: started.running,
-            log,
+            output: started.output.clone(),
             ceiling,
             usual,
             interrupt: host.interrupt,
@@ -2524,9 +2687,7 @@ impl Run<'_> {
                 processes,
                 diagnostics,
             } => {
-                for note in &diagnostics {
-                    console.note(note);
-                }
+                console.note_block(&diagnostics);
                 console.err(&line);
                 kill(&self.ender(job, running), recorded, processes, console);
                 console.err(&format!("gate: diagnostics written to {}", self.log.path().display()));
@@ -2553,6 +2714,7 @@ impl Run<'_> {
     /// Reaches the verdict of `outcome`, its markers not scanned when `unscanned`, and the facts its release carries.
     /// `diagnostics` is the block a kill wrote to the log, whose lines the verdict's tail leaves out.
     fn ended(&mut self, outcome: &Outcome<'_>, unscanned: bool, diagnostics: &[String], started: Started<'_>, console: &mut Console) -> Ended {
+        self.end_streams(Some(started.job), console);
         self.log_load(When::End, Some(started.job), console);
         let timing = self.without_nested_cores(outcome.timing, console);
         let passing = Passing {
@@ -2744,6 +2906,7 @@ impl Run<'_> {
         let job = started.as_ref().map(|started| started.job);
         if let Some(Started { job, running, recorded, .. }) = started {
             stop(&self.ender(job, running), recorded, console);
+            self.end_streams(Some(job), console);
         }
         self.log_owed_end_load(job, console);
         if let Err(error) = self.log.finish(console) {
@@ -2816,6 +2979,8 @@ struct Started<'a> {
     job: &'a Job,
     running: &'a Running,
     recorded: Option<&'a RefCell<Recorded>>,
+    /// The bytes the command's readers have read, which the watch's stall counts.
+    output: &'a OutputBytes,
     figures: Figures,
 }
 

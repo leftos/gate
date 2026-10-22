@@ -15,8 +15,8 @@ use serde_json::{Value, json};
 use crate::nesting::{first_event, let_go};
 use crate::routing::{HOST, repo, routed_case, routed_words, stub};
 use crate::support::{
-    CORE_SECOND, Case, Escapee, FAKE_TOOL, GATE, LOCAL_REASON, Outcome, copy_tool, cpu_ticks, events, finish, heavy_words, none_words, run_words,
-    shown, start, wait_until, write_remote_json,
+    CORE_SECOND, Case, Escapee, FAKE_TOOL, GATE, LOCAL_REASON, Outcome, copy_tool, cpu_ticks, events, finish, heavy_words, log_texts, none_words,
+    run_words, shown, start, wait_until, write_remote_json,
 };
 
 /// The fields the release line carries the cores in.
@@ -415,7 +415,7 @@ fn a_long_light_pass_whose_command_would_route_on_heavy_says_so() {
 
     assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
     assert_route_hint_before_passed(&outcome);
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log can be read");
+    let log = log_texts(&case.folder().join("out.log"));
     let pattern = regex::Regex::new(ROUTE_HINT).expect("the pattern is valid");
     assert!(log.lines().any(|line| pattern.is_match(line)), "the log holds the route hint: {log}");
 }

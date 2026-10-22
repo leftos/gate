@@ -68,9 +68,9 @@ pub struct SampleFacts {
     pub adjusted_seconds: f64,
     /// The share of the machine free over the sample's interval, as a whole percent.
     pub free_percent: u32,
-    /// The size of the log, in bytes.
-    pub log_bytes: u64,
-    /// The size of the log's `.err` file, in bytes.
+    /// The bytes the command wrote to its stdout so far.
+    pub out_bytes: u64,
+    /// The bytes the command wrote to its stderr so far.
     pub err_bytes: u64,
     /// The job's total CPU time.
     pub job_cpu: Ticks,
@@ -200,12 +200,12 @@ fn sample_line(sample: &SampleFacts) -> String {
         WslVm::Percent(percent) => format!("wsl vm cpu {}%, ", round_half_even(percent, 1)),
     };
     format!(
-        "gate:   sample at {} s (load-adjusted {} s, free {}%): log {} B, err {} B, job cpu {} s, {vm}{}, \
+        "gate:   sample at {} s (load-adjusted {} s, free {}%): out {} B, err {} B, job cpu {} s, {vm}{}, \
          escaped cpu {} s",
         round_half_even(sample.wall_seconds, 1),
         round_half_even(sample.adjusted_seconds, 1),
         sample.free_percent,
-        sample.log_bytes,
+        sample.out_bytes,
         sample.err_bytes,
         seconds(sample.job_cpu),
         process_count(sample.processes),
@@ -317,7 +317,7 @@ mod tests {
             wall_seconds: wall,
             adjusted_seconds: 6.06,
             free_percent: 49,
-            log_bytes: 1024,
+            out_bytes: 1024,
             err_bytes: 0,
             job_cpu: cpu(3456),
             wsl_vm: WslVm::NotWatched,
@@ -351,7 +351,7 @@ mod tests {
                 "gate: diagnostics",
                 "gate:   job 1 parent 4 cargo.exe: cpu 1.5 s, working set 10 MB: cargo test",
                 "gate:   outside job 2 parent 4 cargo.exe: cpu 1.5 s, working set 10 MB: cargo test",
-                "gate:   sample at 12.3 s (load-adjusted 6.1 s, free 49%): log 1024 B, err 0 B, job cpu 3.46 s, 3 processes, \
+                "gate:   sample at 12.3 s (load-adjusted 6.1 s, free 49%): out 1024 B, err 0 B, job cpu 3.46 s, 3 processes, \
                  escaped cpu 2.5 s",
                 "gate:   ... diagnostics cut at 2003 ms",
             ]

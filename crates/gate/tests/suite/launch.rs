@@ -1,5 +1,5 @@
-//! A real run: the command started with its environment, its output, `.err` bytes and the gate's own lines in the
-//! log, the marker scan, the tail and the verdict line, a start failure, a refused batch word, a log another run's
+//! A real run: the command started with its environment, its output and errors and the gate's own lines in the
+//! log, each stamped, the marker scan, the tail and the verdict line, a start failure, a refused batch word, a log another run's
 //! command holds and a log inside the state root, and words reaching the command exactly, through a program and
 //! through a `.cmd` file.
 
@@ -10,8 +10,8 @@ use gate_state::{KernelObject, StateRoot};
 use gate_win32::{NamedEvent, StoppableProcess};
 
 use crate::support::{
-    Case, Escapee, FAKE_TOOL, GATE, Go, assert_in_order, copy_tool, events, finish, none_words, run_words, said_pid, shown, start, wait_for_file,
-    wait_for_journal_line, wait_until, wait_until_closed, write_counts,
+    Case, Escapee, FAKE_TOOL, GATE, Go, assert_in_order, copy_tool, events, exit_of, finish, log_texts, none_words, process_lines, run_words,
+    said_pid, shown, spawn_of, start, wait_for_file, wait_for_journal_line, wait_until, wait_until_closed, write_counts,
 };
 
 /// The exit code a process the gate ends at its run's end is given.
@@ -44,12 +44,9 @@ fn log_path(case: &Case) -> PathBuf {
     case.folder().join("out.log")
 }
 
-fn log_bytes(case: &Case) -> Vec<u8> {
-    fs::read(log_path(case)).expect("the log was written")
-}
-
+/// The log's texts, unstamped, without the process lines ([`log_texts`]).
 fn log_text(case: &Case) -> String {
-    String::from_utf8_lossy(&log_bytes(case)).into_owned()
+    log_texts(&log_path(case))
 }
 
 /// A `.cmd` file in the case root that hands its words to `fake-tool argv`, by the fake tool's absolute path.
@@ -97,7 +94,7 @@ fn a_run_launches_its_command_and_passes_its_status() {
         text.starts_with("hello\noops\ngate: passed in "),
         "output, errors, then the gate's lines: {text}"
     );
-    assert!(!case.folder().join("out.log.err").exists(), "the .err file went into the log");
+    assert!(!case.folder().join("out.log.err").exists(), "no .err file is written");
 }
 
 #[test]
@@ -120,8 +117,13 @@ fn a_marker_with_exit_0_is_status_1() {
     let outcome = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "out", "Build FAILED.", "exit", "0"]));
 
     let log = shown(&log_path(&case));
+    let number = line_number(&raw_lines(&case), "Build FAILED.");
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
-    assert_eq!(outcome.stdout, "1:Build FAILED.\nBuild FAILED.\n", "the marker lines, then the tail");
+    assert_eq!(
+        outcome.stdout,
+        format!("{number}:Build FAILED.\nBuild FAILED.\n"),
+        "the marker lines, then the tail"
+    );
     assert_eq!(
         outcome.stderr,
         format!("gate: command exited 0 but its log reports a failure -> {log}\ngate: FAILED (status 1). Full output: {log}\n")
@@ -350,9 +352,13 @@ fn a_written_and_a_forwarded_value_may_hold_a_line_end() {
     let outcome = start(gate).finish();
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    // The log holds lines, and a CR LF ends one as a LF does: each value reaches the command whole, its two lines
+    // logged in order.
     let text = log_text(&case);
-    assert!(text.contains("one\ntwo"), "the written value reaches the command as it is: {text:?}");
-    assert!(text.contains("one\r\ntwo"), "the forwarded value reaches the command as it is: {text:?}");
+    assert!(
+        text.starts_with("one\ntwo\none\ntwo\n"),
+        "both values reach the command as they are: {text:?}"
+    );
 }
 
 #[test]
@@ -362,10 +368,7 @@ fn two_runs_give_their_commands_different_compiler_server_ids() {
     let second = case.run(&run_words("second.log", &[], &[FAKE_TOOL, "env", "SharedCompilationId"]));
 
     assert_eq!((first.code, second.code), (Some(0), Some(0)), "{first:?} {second:?}");
-    let id = |log: &str| {
-        let text = fs::read_to_string(case.folder().join(log)).expect("the log was written");
-        text.lines().next().unwrap_or_default().to_owned()
-    };
+    let id = |log: &str| log_texts(&case.folder().join(log)).lines().next().unwrap_or_default().to_owned();
     let (first_id, second_id) = (id("first.log"), id("second.log"));
     assert!(first_id.starts_with("gate-"), "{first_id}");
     assert!(second_id.starts_with("gate-"), "{second_id}");
@@ -384,7 +387,11 @@ fn percent_forms_reach_a_program_untouched_and_a_batch_file_refuses_them() {
     let outcome = finish(gate);
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert!(log_bytes(&case).starts_with(&argv_output(&PERCENT_WORDS)), "{}", log_text(&case));
+    assert!(
+        log_text(&case).as_bytes().starts_with(&argv_output(&PERCENT_WORDS)),
+        "{}",
+        log_text(&case)
+    );
     for word in PERCENT_WORDS {
         let mut gate = case.gate(&run_words("out.log", &[], &[&shim, word]));
         gate.env("VAR", "abcdef");
@@ -410,7 +417,7 @@ fn quoted_spaced_and_non_ascii_words_reach_the_command_byte_for_byte() {
         let outcome = case.run(&run_words("out.log", &[], &command));
 
         assert_eq!(outcome.code, Some(0), "{}: {outcome:?}", command[0]);
-        let bytes = log_bytes(&case);
+        let bytes = log_text(&case).into_bytes();
         assert!(bytes.starts_with(&expected), "{}: {}", command[0], log_text(&case));
         assert!(
             bytes[expected.len()..].starts_with(b"gate: passed in "),
@@ -428,7 +435,7 @@ fn invalid_utf8_keeps_its_bytes_in_the_log_and_prints_as_replacement_characters(
     let outcome = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "bytes", "6f6b20fffe206261640a"]));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert!(log_bytes(&case).starts_with(b"ok \xff\xfe bad\n"), "{:?}", log_bytes(&case));
+    assert!(log_text(&case).starts_with("ok \u{fffd}\u{fffd} bad\n"), "{:?}", log_text(&case));
     assert!(
         outcome.raw_stdout.starts_with("ok \u{fffd}\u{fffd} bad\n".as_bytes()),
         "{:?}",
@@ -437,8 +444,8 @@ fn invalid_utf8_keeps_its_bytes_in_the_log_and_prints_as_replacement_characters(
 }
 
 #[test]
-fn a_takeover_line_follows_the_command_output_in_the_log() {
-    let case = Case::new("a_takeover_line_follows_the_command_output_in_the_log");
+fn a_takeover_line_comes_before_the_command_output_in_the_log() {
+    let case = Case::new("a_takeover_line_comes_before_the_command_output_in_the_log");
     write_counts(&case.root(), ONE_LIGHT);
     let name = StateRoot::new(&shown(&case.root()), None).object_name(KernelObject::LightSlot(0));
     let go = shown(&case.folder().join("go"));
@@ -446,7 +453,7 @@ fn a_takeover_line_follows_the_command_output_in_the_log() {
     let holder = case.start(&run_words("held.log", &[], &[FAKE_TOOL, "out", "holding", "wait", &go]));
     wait_for_journal_line(&case.root(), &format!(r#""event":"take","pid":{},"#, holder.id()));
     wait_until("the holder's command writing its log", || {
-        fs::read(&held_log).is_ok_and(|bytes| bytes.starts_with(b"holding\n"))
+        log_texts(&held_log).lines().any(|text| text == "holding")
     });
     holder.kill();
 
@@ -457,8 +464,9 @@ fn a_takeover_line_follows_the_command_output_in_the_log() {
     wait_until_closed(&held_log);
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    // The take is said before the command starts, and the log holds the gate's lines as they are said.
     let line = format!("gate: took {name}, which a killed gate had left held\n");
-    assert_in_order(&log_text(&case), &["the command's output\n", &line, "gate: passed in "]);
+    assert_in_order(&log_text(&case), &[&line, "the command's output\n", "gate: passed in "]);
 }
 
 #[test]
@@ -484,8 +492,12 @@ fn a_marker_after_a_lone_carriage_return_is_a_line_of_its_own() {
         &[FAKE_TOOL, "bytes", "3530250d4275696c64204641494c45442e0a", "exit", "0"],
     ));
 
+    let number = line_number(&raw_lines(&case), "Build FAILED.");
     assert_eq!(outcome.code, Some(1), "{outcome:?}");
-    assert!(outcome.stdout.starts_with("2:Build FAILED.\n50%\nBuild FAILED.\n"), "{outcome:?}");
+    assert!(
+        outcome.stdout.starts_with(&format!("{number}:Build FAILED.\n50%\nBuild FAILED.\n")),
+        "{outcome:?}"
+    );
 }
 
 #[test]
@@ -500,8 +512,8 @@ fn a_batch_file_named_through_a_dot_dot_is_still_a_batch_target() {
 }
 
 #[test]
-fn a_second_gate_cannot_remove_a_log_a_running_command_holds() {
-    let case = Case::new("a_second_gate_cannot_remove_a_log_a_running_command_holds");
+fn a_second_gate_on_the_log_of_a_running_gate_is_refused_at_once_and_leaves_that_log_whole() {
+    let case = Case::new("a_second_gate_on_the_log_of_a_running_gate_is_refused_at_once_and_leaves_that_log_whole");
     write_counts(&case.root(), TWO_LIGHT);
     let log = case.folder().join("same.log");
     let go = shown(&case.folder().join("go"));
@@ -522,8 +534,9 @@ fn a_second_gate_cannot_remove_a_log_a_running_command_holds() {
         &go,
     ];
     let first = case.start(&held);
+    // The first gate holds its log open while its command runs; the command itself holds no handle on it.
     wait_until("the first command writing its log", || {
-        fs::read(&log).is_ok_and(|bytes| bytes.starts_with(b"started\n"))
+        log_texts(&log).lines().any(|text| text == "started")
     });
 
     let second = case.run(&[
@@ -549,7 +562,7 @@ fn a_second_gate_cannot_remove_a_log_a_running_command_holds() {
     let queued = events(&case).iter().filter(|event| event["event"] == "queue").count();
     assert_eq!(queued, 1, "only the first gate queued");
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let text = fs::read_to_string(&log).expect("the first gate's log was kept");
+    let text = log_texts(&log);
     assert!(text.starts_with("started\ngate: passed in "), "its own output, then its verdict: {text}");
 }
 
@@ -851,11 +864,137 @@ fn a_failed_run_prints_only_the_first_40_marker_lines() {
     let outcome = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "lines", "45", "error CS", "exit", "3"]));
 
     assert_eq!(outcome.code, Some(3), "{outcome:?}");
-    let mut expected: Vec<String> = (1..=40).map(|number| format!("{number}:error CS{number}")).collect();
+    let lines = raw_lines(&case);
+    let mut expected: Vec<String> = (1..=40)
+        .map(|index| format!("{}:error CS{index}", line_number(&lines, &format!("error CS{index}"))))
+        .collect();
     expected.extend((26..=45).map(|number| format!("error CS{number}")));
     assert_eq!(
         outcome.stdout,
         format!("{}\n", expected.join("\n")),
         "the first 40 marker lines, then the default 20-line tail"
     );
+}
+
+/// The log's lines as written, stamps and tags included.
+fn raw_lines(case: &Case) -> Vec<String> {
+    let text = fs::read_to_string(log_path(case)).expect("the log was written");
+    text.lines().map(str::to_owned).collect()
+}
+
+/// The number, counted from 1 over every line of the log the gate's own included, of the first of `lines` whose text
+/// is `text`: the number a marker line is said with.
+fn line_number(lines: &[String], text: &str) -> usize {
+    let index = lines.iter().position(|line| gate_wire::stamp::unstamped(line).text == text);
+    assert!(index.is_some(), "no line {text:?} in the log: {lines:#?}");
+    index.expect("checked above") + 1
+}
+
+#[test]
+fn every_line_of_a_local_runs_log_is_stamped_and_the_first_gate_line_is_the_gates_own() {
+    let case = Case::new("every_line_of_a_local_runs_log_is_stamped_and_the_first_gate_line_is_the_gates_own");
+
+    let outcome = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "out", "hello", "err", "oops", "exit", "0"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let lines = raw_lines(&case);
+    let parts: Vec<_> = lines.iter().map(|line| gate_wire::stamp::unstamped(line)).collect();
+    assert!(parts.iter().all(|part| part.stamp.is_some()), "{lines:#?}");
+    let first_gate = parts
+        .iter()
+        .find(|part| part.tag == Some(gate_wire::stamp::Tag::Gat))
+        .expect("the log has a gate line");
+    let root = regex::Regex::new(r"^gate pid=\d+ ppid=\d+$").expect("the pattern is valid");
+    assert!(root.is_match(first_gate.text), "{lines:#?}");
+    for line in outcome.stdout.lines() {
+        assert!(gate_wire::stamp::unstamped(line).stamp.is_none(), "the console shows no stamp: {line}");
+        assert!(!gate_wire::stamp::is_process_line(line), "the console shows no process line: {line}");
+    }
+}
+
+#[test]
+fn each_streams_lines_keep_their_order_and_the_stamps_of_the_non_process_lines_never_decrease() {
+    let case = Case::new("each_streams_lines_keep_their_order_and_the_stamps_of_the_non_process_lines_never_decrease");
+
+    let outcome = case.run(&run_words(
+        "out.log",
+        &[],
+        &[FAKE_TOOL, "out", "a", "err", "b", "out", "c", "err", "d", "exit", "0"],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let lines = raw_lines(&case);
+    let parts: Vec<_> = lines.iter().map(|line| gate_wire::stamp::unstamped(line)).collect();
+    // The order across the two pipes is a race between their readers; within one pipe it is the order written.
+    let of = |tag: gate_wire::stamp::Tag| -> Vec<&str> { parts.iter().filter(|part| part.tag == Some(tag)).map(|part| part.text).collect() };
+    assert_eq!(of(gate_wire::stamp::Tag::Out), ["a", "c"], "{lines:#?}");
+    assert_eq!(of(gate_wire::stamp::Tag::Err), ["b", "d"], "{lines:#?}");
+    // The process lines carry the kernel's times, so only the others are stamped in the order they are written.
+    let stamps: Vec<_> = parts
+        .iter()
+        .filter(|part| !gate_wire::stamp::is_process_line(part.text))
+        .filter_map(|part| part.stamp)
+        .collect();
+    assert!(stamps.windows(2).all(|pair| pair[0] <= pair[1]), "{lines:#?}");
+}
+
+#[test]
+fn a_progress_line_and_a_last_line_with_no_end_are_each_a_stamped_line() {
+    let case = Case::new("a_progress_line_and_a_last_line_with_no_end_are_each_a_stamped_line");
+
+    // `50%`, a lone CR, then `done` with no line end.
+    let outcome = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "bytes", "3530250d646f6e65"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(log_text(&case).starts_with("50%\ndone\ngate: passed in "), "{}", log_text(&case));
+    let lines = raw_lines(&case);
+    assert!(
+        lines.iter().any(|line| line.ends_with(" out 50%")) && lines.iter().any(|line| line.ends_with(" out done")),
+        "{lines:#?}"
+    );
+}
+
+#[test]
+fn a_stamped_build_failed_line_fails_a_run_that_exited_0_and_is_named() {
+    let case = Case::new("a_stamped_build_failed_line_fails_a_run_that_exited_0_and_is_named");
+
+    let outcome = case.run(&run_words("out.log", &[], &[FAKE_TOOL, "out", "Build FAILED.", "exit", "0"]));
+
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert!(outcome.stderr.contains("but its log reports a failure"), "{outcome:?}");
+    let marker = regex::Regex::new(r"(?m)^\d+:Build FAILED\.$").expect("the pattern is valid");
+    assert!(marker.is_match(&outcome.stdout), "the marker line is shown as its text: {outcome:?}");
+}
+
+#[test]
+fn a_spawned_child_has_spawn_and_exit_lines_naming_its_parent() {
+    let case = Case::new("a_spawned_child_has_spawn_and_exit_lines_naming_its_parent");
+    let (go, proceed) = (case.folder().join("go"), case.folder().join("proceed"));
+    let (go_text, proceed_text) = (shown(&go), shown(&proceed));
+    let command = [FAKE_TOOL, "pid", "spawn-wait", &go_text, "wait", &proceed_text, "exit", "0"];
+
+    let running = case.start(&run_words("out.log", &[], &command));
+    let gate = running.id();
+    wait_until("the child's pid in the log", || log_text(&case).contains("spawned "));
+    // The go file ends the child, and the proceed file the command, so each exits on its own.
+    fs::write(&go, "").expect("the go file can be written");
+    fs::write(&proceed, "").expect("the proceed file can be written");
+    let outcome = running.finish();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let text = log_text(&case);
+    let (command_pid, child_pid) = (said_pid(&text, "pid "), said_pid(&text, "spawned "));
+    let lines = process_lines(&log_path(&case));
+    let (command_spawn, child_spawn) = (spawn_of(&lines, command_pid), spawn_of(&lines, child_pid));
+    assert!(command_spawn.is_some() && child_spawn.is_some(), "a spawn line of each: {lines:#?}");
+    let (command_at, command_parent) = command_spawn.expect("checked above");
+    let (child_at, child_parent) = child_spawn.expect("checked above");
+    assert_eq!(command_parent, gate.to_string(), "the command's parent is the gate: {lines:#?}");
+    assert_eq!(child_parent, command_pid.to_string(), "the child's parent is the command: {lines:#?}");
+    for (pid, spawned) in [(command_pid, command_at), (child_pid, child_at)] {
+        assert!(
+            exit_of(&lines, pid).is_some_and(|exited| exited > spawned),
+            "an exit line of {pid} follows its spawn: {lines:#?}"
+        );
+    }
 }

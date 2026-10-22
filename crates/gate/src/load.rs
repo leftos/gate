@@ -126,9 +126,7 @@ pub(crate) fn log_load(when: When, measuring: &Measuring<'_>, processors: usize,
     };
     let mut said = lines(when, &sample);
     said.extend(problems.iter().map(|problem| format!("gate: load at {}: {problem}", when.as_str())));
-    for line in &said {
-        console.note(line);
-    }
+    console.note_block(&said);
     said
 }
 

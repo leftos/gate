@@ -1,6 +1,7 @@
-//! The command's log: readied before the command runs, completed after it with the `.err` file's bytes and the gate's
-//! own lines, and read back in pieces, never whole: the failure markers line by line from the start, the tail from the
-//! end. A line ends at CR LF, LF or a lone CR, as .NET's `ReadLine` reads it, and is read as UTF-8 lossily.
+//! The command's log: readied before the command runs, written while it runs through its [`crate::log_writer`],
+//! completed after it with the gate's own lines a run held, and read back in pieces, never whole: the failure markers
+//! line by line from the start, the tail from the end. A line ends at CR LF, LF or a lone CR, as .NET's `ReadLine`
+//! reads it, and is read as UTF-8 lossily.
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -11,7 +12,7 @@ use std::sync::LazyLock;
 use gate_wire::stamp::{Tag, is_process_line, unstamped};
 use regex::Regex;
 
-use crate::console::Console;
+use crate::console::{Console, Note};
 
 /// The failure markers (kept, V2), as the PowerShell gate and design.md write them.
 const MARKERS: &str =
@@ -32,36 +33,24 @@ const TAIL_CHUNK: u64 = 64 * 1024;
 /// The most characters a printed line shows.
 const SHOWN_CHARACTERS: usize = 4096;
 
-/// The log at an absolute path, the `.err` file beside it that the command's stderr goes to while it runs, and
-/// whether the `.err` file has been dealt with.
+/// The log at an absolute path.
 pub(crate) struct Log {
     path: PathBuf,
-    err_path: PathBuf,
-    err_done: bool,
 }
 
 impl Log {
     /// The log at `path`, which is absolute.
     pub(crate) fn new(path: &Path) -> Log {
-        let mut err_path = OsString::from(path.as_os_str());
-        err_path.push(".err");
-        Log {
-            path: path.to_owned(),
-            err_path: PathBuf::from(err_path),
-            err_done: false,
-        }
+        Log { path: path.to_owned() }
     }
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
-    pub(crate) fn err_path(&self) -> &Path {
-        &self.err_path
-    }
-
-    /// Creates the log's folder and removes an earlier log and `.err` file, so a run that never starts its command
-    /// leaves only its own lines. A log a running command still writes cannot be removed.
+    /// Creates the log's folder and removes an earlier log, and the `.err` file beside it the PowerShell gate writes,
+    /// so a run that never starts its command leaves only its own lines. A log a running command still writes cannot
+    /// be removed.
     ///
     /// # Errors
     ///
@@ -70,7 +59,9 @@ impl Log {
         if let Some(folder) = self.path.parent() {
             fs::create_dir_all(folder).map_err(|error| format!("cannot create the log's folder {}: {error}", folder.display()))?;
         }
-        for path in [&self.path, &self.err_path] {
+        let mut err_path = OsString::from(self.path.as_os_str());
+        err_path.push(".err");
+        for path in [&self.path, &PathBuf::from(err_path)] {
             match fs::remove_file(path) {
                 Err(error) if error.kind() != io::ErrorKind::NotFound => {
                     return Err(format!("cannot remove the earlier {}: {error}", path.display()));
@@ -81,28 +72,16 @@ impl Log {
         Ok(())
     }
 
-    /// Appends the `.err` file's bytes to the log as they are and deletes it, once a run, then appends the notes
-    /// `console` gathered ([`Log::append`]). A `.err` file that cannot be copied or deleted is said as a note of its
-    /// own; the notes are appended either way, and kept in `console` for a later `finish` when they cannot be.
+    /// Appends the notes `console` holds, each stamped when it was said ([`Note::line`]), in the order they were said
+    /// ([`Log::append`]); kept in `console` for a later `finish` when they cannot be. A console attached to the log
+    /// holds none, having written each as it was said.
     ///
     /// # Errors
     ///
     /// The system's error when the notes cannot be appended.
-    pub(crate) fn finish(&mut self, console: &mut Console) -> io::Result<()> {
-        if !self.err_done {
-            self.err_done = true;
-            match self.copy_err() {
-                Ok(false) => {}
-                Ok(true) => {
-                    if let Err(error) = fs::remove_file(&self.err_path) {
-                        console.err(&format!("gate: cannot remove {}: {error}", self.err_path.display()));
-                    }
-                }
-                Err(error) => console.err(&format!("gate: cannot append {} to the log: {error}", self.err_path.display())),
-            }
-        }
-        let notes = console.take_notes();
-        let appended = self.append(&notes);
+    pub(crate) fn finish(&self, console: &mut Console) -> io::Result<()> {
+        let notes = console.take_held();
+        let appended = self.append(&notes.iter().map(Note::line).collect::<Vec<_>>());
         if appended.is_err() {
             console.put_back_notes(notes);
         }
@@ -120,18 +99,6 @@ impl Log {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             removed => removed,
         }
-    }
-
-    /// Copies the `.err` file's bytes to the end of the log; whether there was one.
-    fn copy_err(&self) -> io::Result<bool> {
-        let mut errors = match File::open(&self.err_path) {
-            Ok(errors) => errors,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        let mut log = OpenOptions::new().append(true).create(true).open(&self.path)?;
-        io::copy(&mut errors, &mut log)?;
-        Ok(true)
     }
 
     /// Appends `notes`, each as a line, starting on a line of its own when the log does not end in a line feed.
@@ -382,10 +349,11 @@ fn shown(text: &str) -> String {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test that cannot write or read its files must fail loudly")]
 mod tests {
-    use std::fs::{self, OpenOptions};
+    use std::fs;
     use std::io::{BufReader, Cursor};
-    use std::os::windows::fs::OpenOptionsExt;
     use std::path::PathBuf;
+
+    use gate_wire::stamp::{Tag, unstamped};
 
     use super::{Log, MARKER_LINES, markers_in, tail_in};
     use crate::console::Console;
@@ -581,62 +549,42 @@ mod tests {
     }
 
     #[test]
-    fn finish_appends_the_err_bytes_exactly_then_the_notes_in_order() {
+    fn finish_appends_the_held_notes_stamped_in_order_on_a_line_of_their_own() {
         let folder = folder("finish");
-        let mut log = Log::new(&folder.join("logs").join("out.log"));
+        let log = Log::new(&folder.join("logs").join("out.log"));
         log.prepare().expect("the log's folder can be made");
-        fs::write(log.path(), b"out\n").expect("the log can be written");
-        fs::write(log.err_path(), b"\xffraw\r\nerr\n").expect("the err file can be written");
+        fs::write(log.path(), b"no line feed").expect("the log can be written");
         let mut console = Console::new();
         console.err("gate: first");
         console.err("gate: second");
 
         log.finish(&mut console).expect("the log completes");
+        log.finish(&mut console).expect("a second finish has nothing to append");
 
+        let text = String::from_utf8(fs::read(log.path()).expect("the log reads")).expect("the log is UTF-8");
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines[0], "no line feed");
+        let notes: Vec<_> = lines[1..].iter().map(|line| unstamped(line)).collect();
         assert_eq!(
-            fs::read(log.path()).expect("the log reads"),
-            b"out\n\xffraw\r\nerr\ngate: first\ngate: second\n"
+            notes.iter().map(|note| note.text).collect::<Vec<_>>(),
+            ["gate: first", "gate: second"],
+            "{text}"
         );
-        assert!(!log.err_path().exists(), "the err file is deleted");
-        fs::write(log.err_path(), b"again").expect("the err file can be written again");
-        console.err("gate: third");
-        log.finish(&mut console).expect("the log completes again");
-        let twice = fs::read(log.path()).expect("the log reads");
-        assert!(
-            twice.ends_with(b"gate: second\ngate: third\n"),
-            "a second finish copies no .err: {twice:?}"
-        );
-
-        let mut fresh = Log::new(&folder.join("fresh.log"));
-        fs::write(fresh.err_path(), b"no line feed").expect("the err file can be written");
-        console.err("gate: own line");
-        fresh.finish(&mut console).expect("the log completes");
-        assert_eq!(fs::read(fresh.path()).expect("the log reads"), b"no line feed\ngate: own line\n");
+        assert!(notes.iter().all(|note| note.tag == Some(Tag::Gat)), "{text}");
         fs::remove_dir_all(&folder).expect("the test folder can be removed");
     }
 
     #[test]
-    fn finish_keeps_the_notes_when_the_err_file_cannot_be_removed() {
-        let folder = folder("undeletable");
-        let mut log = Log::new(&folder.join("out.log"));
-        fs::write(log.path(), b"").expect("the log can be written");
-        fs::write(log.err_path(), b"err\n").expect("the err file can be written");
-        // Read and write sharing only: the file cannot be deleted while this handle is open.
-        let held = OpenOptions::new()
-            .read(true)
-            .share_mode(1 | 2)
-            .open(log.err_path())
-            .expect("the err file opens");
-        let mut console = Console::new();
-        console.err("gate: note");
+    fn prepare_removes_an_earlier_log_and_the_err_file_the_powershell_gate_wrote() {
+        let folder = folder("prepare");
+        let log = Log::new(&folder.join("out.log"));
+        let err = folder.join("out.log.err");
+        fs::write(log.path(), b"earlier").expect("the log can be written");
+        fs::write(&err, b"err").expect("the err file can be written");
 
-        let finished = log.finish(&mut console);
-        drop(held);
+        log.prepare().expect("the log is readied");
 
-        finished.expect("finish keeps going past an err file it cannot remove");
-        let text = String::from_utf8(fs::read(log.path()).expect("the log reads")).expect("the log is UTF-8");
-        let cannot = format!("gate: cannot remove {}: ", log.err_path().display());
-        assert!(text.starts_with(&format!("err\ngate: note\n{cannot}")), "{text}");
+        assert!(!log.path().exists() && !err.exists());
         fs::remove_dir_all(&folder).expect("the test folder can be removed");
     }
 }

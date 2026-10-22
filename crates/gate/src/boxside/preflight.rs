@@ -1434,7 +1434,15 @@ fn git_launch(command: &Command, class: GitClass) -> Result<PipedLaunch, String>
 fn readers(stdout: File, stderr: File, stdin: Option<File>, streams: &Streams<'_>, shared: Shared<'_>) -> io::Result<Readers> {
     let (forward_out, read_out) = taken(stdout, streams.stdout)?;
     let (forward_err, read_err) = taken(stderr, streams.stderr)?;
-    let forwarders = Forwarders::start_git(forward_out, forward_err, shared.lock, shared.gone)?;
+    let forwarders = Forwarders::start_git(
+        forward_out,
+        forward_err,
+        crate::boxside::forward::Stamping::None,
+        crate::boxside::forward::Sink::Own {
+            lock: shared.lock,
+            gone: shared.gone,
+        },
+    )?;
     let fed = match stdin.zip(streams.feed) {
         Some((mut pipe, bytes)) => {
             let bytes = bytes.to_vec();

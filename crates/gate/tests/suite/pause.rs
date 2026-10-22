@@ -13,7 +13,7 @@ use regex::Regex;
 
 use crate::routing::{remote_claim, routed_case, routed_words, stub};
 use crate::support::{
-    Case, FAKE_TOOL, GATE, Outcome, Running, critical_words, events, heavy_words, none_words, run_words, shown, wait_until, write_counts,
+    Case, FAKE_TOOL, GATE, Outcome, Running, critical_words, events, heavy_words, log_texts, none_words, run_words, shown, wait_until, write_counts,
 };
 
 /// The seam that keeps a wait's passes and its still-waiting lines close together.
@@ -121,12 +121,10 @@ fn modified(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
 }
 
-/// What the command of the parent gate logging to `log` has said on its stderr: a gate starts its command with the
-/// command's stderr going to the `.err` file beside its log, and moves those bytes into the log once the command has
-/// ended, so both are read.
+/// What the command of the parent gate logging to `log` has said: a gate writes its command's stderr lines to its
+/// log as they are read, so the log's texts are read.
 fn child_stderr(case: &Case, log: &str) -> String {
-    let read = |path: PathBuf| fs::read_to_string(path).unwrap_or_default();
-    format!("{}{}", read(case.folder().join(log)), read(case.folder().join(format!("{log}.err"))))
+    log_texts(&case.folder().join(log))
 }
 
 /// Returns once the child gate of the parent logging to `log` has said `needle` on its stderr.
@@ -480,7 +478,7 @@ fn a_covered_gate_whose_grandchild_waits_behind_a_critical_request_is_not_stalle
 
     let_go(&go);
     let outcome = parent.finish();
-    let covered_log = fs::read_to_string(case.folder().join("covered.log")).expect("the covered gate wrote its log");
+    let covered_log = log_texts(&case.folder().join("covered.log"));
     assert!(waited_out, "the covered gate was killed while its grandchild waited: {covered_log}");
     assert_passed(&outcome);
     assert!(
@@ -600,7 +598,7 @@ fn a_covered_gate_is_not_paused_by_a_sibling_waiting_under_its_parent() {
         outcome
     });
     let_go(&go);
-    let covered_log = fs::read_to_string(case.folder().join("covered.log")).expect("the covered gate wrote its log");
+    let covered_log = log_texts(&case.folder().join("covered.log"));
     assert_eq!(outcome.code, Some(124), "the covered gate's hung command fails its parent: {outcome:?}");
     assert!(
         covered_log.contains("gate: STALLED: "),
@@ -694,7 +692,7 @@ fn a_none_gate_whose_nested_gate_hangs_is_still_ended_by_the_nested_gate_s_own_s
         "the parent itself is not stalled while its nested gate lives: {outcome:?}"
     );
     assert_eq!(outcome.code, Some(124), "the parent ends with its command's status: {outcome:?}");
-    let child_log = fs::read_to_string(case.folder().join("child.log")).expect("the nested gate wrote its log");
+    let child_log = log_texts(&case.folder().join("child.log"));
     assert!(
         child_log.contains("gate: STALLED: "),
         "the nested gate's own watchdog ends its hung command: {child_log}"

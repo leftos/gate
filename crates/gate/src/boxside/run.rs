@@ -2403,7 +2403,15 @@ fn watch(started: Started<'_, '_>, console: &mut Console) -> Result<Ran, u32> {
         wsl,
     } = started;
     let Launched { running, pipes } = launched;
-    let forwarders = match Forwarders::start(pipes.stdout, pipes.stderr, beat.lock, beat.gone) {
+    let forwarders = match Forwarders::start(
+        pipes.stdout,
+        pipes.stderr,
+        crate::boxside::forward::Stamping::None,
+        crate::boxside::forward::Sink::Own {
+            lock: beat.lock,
+            gone: beat.gone,
+        },
+    ) {
         Ok(forwarders) => forwarders,
         Err(error) => {
             let status = failed(console, &format!("cannot start reading the command's output: {error}"));

@@ -18,9 +18,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Globalization::{CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN, CompareStringOrdinal};
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_CREATION_DISPOSITION,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, FILE_TYPE_UNKNOWN,
-    GetFileInformationByHandle, GetFileType, OPEN_EXISTING, SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_CREATION_DISPOSITION,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, FILE_TYPE_UNKNOWN, GetFileInformationByHandle,
+    GetFileType, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
 use windows_sys::Win32::System::Threading::{
@@ -247,18 +247,11 @@ pub struct Launch {
 /// Where a command's stdin comes from and its stdout and stderr go.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LaunchOutput {
-    /// stdin from `NUL`, and stdout and stderr each to a file created afresh.
-    Files {
-        /// The file the command's stdout goes to.
-        log: PathBuf,
-        /// The file the command's stderr goes to: the log's `.err` file.
-        err_log: PathBuf,
-    },
     /// stdin and stdout each a new pipe whose other end this process keeps ([`Suspended::take_pipes`]), and stderr
     /// this process's own stderr as it stands when the command is created, or `NUL` when this process has none: the
     /// command's stderr lines reach whatever this process's own lines reach.
     Piped,
-    /// stdin from `NUL`, as [`LaunchOutput::Files`] gives it, and stdout and stderr each a new pipe of a 1 MiB buffer
+    /// stdin from `NUL`, and stdout and stderr each a new pipe of a 1 MiB buffer
     /// whose read end this process keeps ([`Suspended::take_output`]): a reader that falls behind does not block the
     /// command at once on a full pipe.
     Pipes,
@@ -357,10 +350,7 @@ impl Launch {
     /// returned [`Suspended`] holds until [`Suspended::take_pipes`] takes them, and its stderr a copy of this process's
     /// own. With [`LaunchOutput::Pipes`] its stdin is `NUL` and its stdout and stderr the command's ends of two new
     /// pipes of a 1 MiB buffer each, whose read ends the returned [`Suspended`] holds until [`Suspended::take_output`]
-    /// takes them. With [`LaunchOutput::Files`] its stdin is `NUL`, its stdout the log and its stderr the `.err` file, each
-    /// file created afresh (an earlier file at the path is deleted first, and a link at it is never followed) and open
-    /// to every process for reading, writing and deleting while the command writes them, so a process the command left
-    /// running cannot keep the next run from replacing them. Whichever the output, it inherits its three stdio handles and no other.
+    /// takes them. Whichever the output, it inherits its three stdio handles and no other.
     /// This process's own handles to them are never inheritable: the command inherits copies
     /// open only while the spawn lock is held, so no process started meanwhile through [`crate::spawn`] or another
     /// launch inherits them. It is created with the desktop-app policy
@@ -371,32 +361,21 @@ impl Launch {
     /// # Errors
     ///
     /// [`LaunchError::CreateProcess`] when `CreateProcessW` fails; [`LaunchError::Setup`] when the launch is refused
-    /// (an application that is relative or a batch file, or a NUL in the application, command line, working folder,
-    /// log or `.err` path) or a handle or the attribute list cannot be made.
+    /// (an application that is relative or a batch file, or a NUL in the application, command line or working folder)
+    /// or a handle or the attribute list cannot be made.
     pub fn start_suspended(&self) -> Result<Suspended, LaunchError> {
-        let mut paths = vec![("working folder", self.directory.as_path())];
-        if let LaunchOutput::Files { log, err_log } = &self.output {
-            paths.extend([("log", log.as_path()), ("err log", err_log.as_path())]);
-        }
-        check_launch(&self.command_line, &self.application, &paths)?;
-        let mut pipes = None;
-        let (input, output, errors) = match &self.output {
-            LaunchOutput::Files { log, err_log } => {
-                let input = nul(GENERIC_READ)?;
-                (input, create_output(log)?, create_output(err_log)?)
-            }
+        check_launch(&self.command_line, &self.application, &[("working folder", self.directory.as_path())])?;
+        let (pipes, (input, output, errors)) = match &self.output {
             LaunchOutput::Piped => {
                 let (input, stdin) = pipe_to_child("stdin")?;
                 let (stdout, output) = pipe_from_child("stdout")?;
-                pipes = Some(ChildEnds::Piped(StdioPipes { stdin, stdout }));
-                (input, output, own_stderr()?)
+                (ChildEnds::Piped(StdioPipes { stdin, stdout }), (input, output, own_stderr()?))
             }
             LaunchOutput::Pipes => {
                 let input = nul(GENERIC_READ)?;
                 let (stdout, output) = pipe_from_child_sized("stdout", OUTPUT_PIPE_BUFFER)?;
                 let (stderr, errors) = pipe_from_child_sized("stderr", OUTPUT_PIPE_BUFFER)?;
-                pipes = Some(ChildEnds::Output(stdout, stderr));
-                (input, output, errors)
+                (ChildEnds::Output(stdout, stderr), (input, output, errors))
             }
         };
         let creation = Creation {
@@ -420,7 +399,7 @@ impl Launch {
         )?;
         // The command holds its own copies of its ends now; with these closed, each pipe ends when the command's does.
         drop((input, output, errors));
-        suspended.pipes = pipes;
+        suspended.pipes = Some(pipes);
         Ok(suspended)
     }
 }
@@ -500,21 +479,6 @@ pub(crate) fn open_shared(
 /// A handle to `NUL` with `access`, never inheritable, open to every process for reading, writing and deleting.
 pub(crate) fn nul(access: u32) -> Result<OwnedHandle, LaunchError> {
     open_shared(Path::new("NUL"), access, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL)
-}
-
-/// A new file at `path` for the command to write: an earlier file there is deleted first (a link itself, never its
-/// target), the file is created only if nothing is at the path then, without following a reparse point and without
-/// letting a named pipe server impersonate this process, and it must be a plain disk file with one name.
-fn create_output(path: &Path) -> Result<OwnedHandle, LaunchError> {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(setup(error, &format!("delete the earlier {}", path.display()))),
-    }
-    let flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS;
-    let handle = open_shared(path, GENERIC_WRITE, CREATE_NEW, flags)?;
-    check_plain_file(handle.raw()).map_err(|error| setup(error, &format!("check {}", path.display())))?;
-    Ok(handle)
 }
 
 /// Refuses a handle that is not to a disk file, is to a reparse point, or is to a file with more than one name, with an

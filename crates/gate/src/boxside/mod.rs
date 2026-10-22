@@ -5,7 +5,7 @@
 mod boot;
 mod ceiling;
 mod desktop;
-mod forward;
+pub(crate) mod forward;
 mod heartbeat;
 mod inflight;
 mod inputs;

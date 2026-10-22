@@ -2,9 +2,12 @@
 //! processes terminated and the run failed with status 124, and a run that passes journals its load-adjusted seconds.
 
 use std::fs;
+use std::io::Read as _;
 use std::os::windows::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread;
 use std::time::Duration;
 
 use gate_win32::{EnvironmentBlock, Job, Launch, LaunchOutput, StoppableProcess};
@@ -12,8 +15,8 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::support::{
-    CORE_SECOND, Case, Escapee, FAKE_TOOL, UNTIL_KILLED, assert_in_order, cpu_ticks, release, run_words, said_pid, shown, start, tool, wait_until,
-    wait_until_closed,
+    CORE_SECOND, Case, Escapee, FAKE_TOOL, UNTIL_KILLED, assert_in_order, cpu_ticks, exit_of, log_texts, process_lines, release, run_words, said_pid,
+    shown, start, tool, wait_until, wait_until_closed,
 };
 
 #[test]
@@ -32,25 +35,34 @@ fn a_process_started_with_breakaway_leaves_a_job_that_allows_it() {
         command_line: line.encode_utf16().collect(),
         directory: case.folder(),
         environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
-        output: LaunchOutput::Files {
-            log: case.folder().join("out.log"),
-            err_log: case.folder().join("out.log.err"),
-        },
+        output: LaunchOutput::Pipes,
         priority: None,
     };
 
-    let running = launch
-        .start_suspended()
-        .expect("the command starts")
-        .assign_and_resume(&job)
-        .expect("the command is assigned and resumed");
+    let mut suspended = launch.start_suspended().expect("the command starts");
+    let (_out, err) = suspended.take_output().expect("the command's pipes are made");
+    // The escapee's lines on the command's stderr, read as they come, so the pipe never fills.
+    let said = Arc::new(Mutex::new(String::new()));
+    let _reader = {
+        let said = Arc::clone(&said);
+        thread::spawn(move || {
+            let mut err = err;
+            let mut chunk = [0_u8; 4096];
+            while let Ok(read @ 1..) = err.read(&mut chunk) {
+                said.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push_str(&String::from_utf8_lossy(&chunk[..read]));
+            }
+        })
+    };
+    let running = suspended.assign_and_resume(&job).expect("the command is assigned and resumed");
     let ended = || !matches!(running.wait(Duration::ZERO), Ok(None));
     let (_, away) = escapee.open(ended);
     let parent = StoppableProcess::open(running.pid())
         .expect("the command is opened")
         .expect("it runs: it waits on the stop file");
 
-    let log = || fs::read_to_string(case.folder().join("out.log.err")).unwrap_or_default();
+    let log = || said.lock().unwrap_or_else(PoisonError::into_inner).clone();
     assert!(parent.in_job(&job).expect("the command's job is read"), "the command is in the job");
     assert!(
         !away.in_job(&job).expect("the escapee's job is read"),
@@ -212,7 +224,7 @@ fn a_silent_idle_command_is_killed_as_stalled() {
     let line = found.expect("checked above").as_str();
     let after = ["gate: terminated the job's 1 process(es)", "gate: FAILED (status 124)"];
     assert_in_order(&outcome.stderr, &[&[line][..], &after[..]].concat());
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert_in_order(&log, &[&["hi\n", line][..], &after[..]].concat());
 
     let release = release(&case);
@@ -257,7 +269,7 @@ fn a_stall_window_from_the_first_output_does_not_count_a_quiet_start() {
     let line = found.expect("checked above").as_str();
     let after = ["gate: terminated the job's 1 process(es)", "gate: FAILED (status 124)"];
     assert_in_order(&outcome.stderr, &[&[line][..], &after[..]].concat());
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert_in_order(&log, &[&["hi\n", line][..], &after[..]].concat());
 
     let release = release(&case);
@@ -294,7 +306,7 @@ fn a_stalled_command_is_killed_with_its_grandchild() {
     assert_eq!(release(&case)["verdict"], "stalled");
     let log_path = case.folder().join("out.log");
     wait_until_closed(&log_path);
-    let log = fs::read_to_string(&log_path).expect("the log was written");
+    let log = log_texts(&log_path);
     for prefix in ["pid ", "spawned "] {
         let pid = said_pid(&log, prefix);
         // A terminated process leaves its job before its object is signalled, so its end is waited for, not read once.
@@ -425,4 +437,45 @@ fn a_passed_run_journals_its_load_adjusted_seconds() {
     let release = release(&case);
     assert!(release["adjustedSeconds"].is_number(), "{release}");
     assert_eq!(release["verdict"], "passed", "{release}");
+}
+
+#[test]
+fn a_quiet_command_that_ran_a_short_child_is_still_stalled_and_its_process_lines_are_no_output() {
+    let case = Case::new("a_quiet_command_that_ran_a_short_child_is_still_stalled_and_its_process_lines_are_no_output");
+    let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100"];
+    let log_path = case.folder().join("out.log");
+
+    // The command runs one child to its end, then sleeps until killed: once the child is gone nothing in the job moves,
+    // and the child's spawn and exit lines in the log must not count as the command's output.
+    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "run-each", "1", "sleep", UNTIL_KILLED]));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: STALLED: "), "{outcome:?}");
+    let text = log_texts(&log_path);
+    let command = said_pid(&text, "pid ");
+    let lines = process_lines(&log_path);
+    let child_head = format!(" ppid={command} ");
+    let child: Option<u32> = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("spawn pid=")?.split_once(&child_head)?.0.parse().ok());
+    assert!(
+        child.is_some_and(|child| exit_of(&lines, child).is_some()),
+        "a spawn and an exit line of the command's child: {lines:#?}"
+    );
+    // The command's own bytes are its `pid` line on stdout, and it wrote nothing on stderr: every sample counts those,
+    // or none yet when it came before the reader had the line, and never the process lines the log holds.
+    let pid_line = format!("pid {command}\n");
+    let counted = [": out 0 B, err 0 B, ".to_owned(), format!(": out {} B, err 0 B, ", pid_line.len())];
+    let samples: Vec<&str> = text.lines().filter(|line| line.starts_with("gate:   sample at ")).collect();
+    assert!(
+        !samples.is_empty() || text.contains("gate:   ... diagnostics cut at "),
+        "the block lists its samples:\n{text}"
+    );
+    for sample in samples {
+        assert!(
+            counted.iter().any(|said| sample.contains(said.as_str())),
+            "the sample counts only the command's bytes, one of {counted:?}: {sample}"
+        );
+    }
+    assert_eq!(release(&case)["verdict"], "stalled", "{outcome:?}");
 }

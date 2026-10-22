@@ -11,8 +11,8 @@ use gate_win32::{NamedMutex, mutex_exists};
 use serde_json::Value;
 
 use crate::support::{
-    Case, FAKE_TOOL, Outcome, Running, assert_in_order, events_of, heavy_words, none_words, run_words, shown, wait_for_file, wait_for_journal_line,
-    wait_until, wait_until_closed, write_counts,
+    Case, FAKE_TOOL, Outcome, Running, assert_in_order, events_of, heavy_words, log_texts, none_words, run_words, shown, wait_for_file,
+    wait_for_journal_line, wait_until, wait_until_closed, write_counts,
 };
 
 /// A light pool of one slot.
@@ -42,9 +42,8 @@ fn holder(case: &Case, log: &str, go: &Path) -> Running {
     let running = start(case, log, Some(go), &[]);
     wait_for_journal_line(&case.root(), &take_needle(running.id()));
     let path = case.folder().join(log);
-    let started = format!("{HOLDING}\n");
     wait_until("the holder's command writing its log", || {
-        fs::read(&path).is_ok_and(|bytes| bytes.starts_with(started.as_bytes()))
+        log_texts(&path).lines().any(|line| line == HOLDING)
     });
     running
 }

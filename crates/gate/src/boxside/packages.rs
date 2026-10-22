@@ -644,7 +644,15 @@ fn start(
         Look::Go(None) => {}
     }
     let running = assigned.and_then(|()| suspended.resume()).map_err(|error| error.to_string())?;
-    match Forwarders::start(stdout, stderr, beat.lock, beat.gone) {
+    match Forwarders::start(
+        stdout,
+        stderr,
+        crate::boxside::forward::Stamping::None,
+        crate::boxside::forward::Sink::Own {
+            lock: beat.lock,
+            gone: beat.gone,
+        },
+    ) {
         Ok(forwarders) => Ok(Ok((running, forwarders))),
         Err(error) => {
             end_job(job, console);

@@ -14,8 +14,8 @@ use serde_json::Value;
 
 use crate::routing::{heavy_words_with_limit, routed_case};
 use crate::support::{
-    Case, FAKE_TOOL, LOCAL_REASON, Outcome, USAGE, assert_in_order, critical_words, events, finish, git, git_init, heavy_words, none_words,
-    run_words, shown, wait_for_file, wait_until, write_counts,
+    Case, FAKE_TOOL, LOCAL_REASON, Outcome, USAGE, assert_in_order, critical_words, events, finish, git, git_init, heavy_words, log_texts,
+    none_words, run_words, shown, wait_for_file, wait_until, write_counts,
 };
 
 /// `FILE_SHARE_READ`: a handle that lets others read the file, but not write, move or delete it.
@@ -110,11 +110,12 @@ fn a_gate_says_the_expected_time_when_it_takes_its_slot() {
 
     assert!(took, "the take is journalled before the line is said");
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert!(outcome.stdout.starts_with("ran\n"), "{outcome:?}");
+    // The line is written to the log as it is said, so the tail shows it before the command's output.
+    assert_in_order(&outcome.stdout, &["gate: expected", "\nran\n"]);
     let line = Regex::new(&format!(r"\A{EXPECTED}\n\z")).expect("the pattern is valid");
     assert!(line.is_match(&outcome.stderr), "{outcome:?}");
     assert_eq!(said_runs(&outcome.stderr), 5);
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert_eq!(said_runs(&log), 5, "the line is in the log too");
 }
 
@@ -1037,7 +1038,7 @@ fn held_run(case: &Case, timeout: &str, seeded: Option<(f64, Option<f64>)>, extr
 
 /// The log of `case`'s runs.
 fn log(case: &Case) -> String {
-    fs::read_to_string(case.folder().join("out.log")).expect("the log was written")
+    log_texts(&case.folder().join("out.log"))
 }
 
 #[test]

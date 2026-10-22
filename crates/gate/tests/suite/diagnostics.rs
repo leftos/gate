@@ -2,11 +2,9 @@
 //! before the kill line, one pointer line on stderr says where the block went, the failed run's tail leaves the block
 //! out, and a gathering that failed ends the run as the kill it was gathering for.
 
-use std::fs;
-
 use regex::Regex;
 
-use crate::support::{Case, FAKE_TOOL, UNTIL_KILLED, assert_in_order, release, run_words, said_pid, shown};
+use crate::support::{Case, FAKE_TOOL, UNTIL_KILLED, assert_in_order, log_texts, release, run_words, said_pid, shown};
 
 /// The failure `--test-diagnostics-fail` makes at the start of a gathering.
 const DIAGNOSTICS_FAIL: &str = "--test-diagnostics-fail makes the diagnostics fail (test seam only)";
@@ -65,7 +63,7 @@ fn a_kill_writes_its_diagnostics_to_the_log_before_the_kill_line() {
     let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "out", "hi", "sleep", UNTIL_KILLED]));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
-    let log = fs::read_to_string(&log_path).expect("the log was written");
+    let log = log_texts(&log_path);
     let pid = said_pid(&log, "pid ");
     let stalled = Regex::new(r"(?m)^gate: STALLED: .*$").expect("the pattern is valid");
     let kill = stalled.find(&log).expect("the log has its STALLED line").as_str();
@@ -109,7 +107,7 @@ fn a_failing_diagnostics_gathering_still_kills() {
     let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "sleep", UNTIL_KILLED]));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert_in_order(
         &log,
         &[
@@ -130,7 +128,7 @@ fn the_failed_tail_holds_the_last_lines_around_a_big_block() {
     let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "lines", "30", "n", "sleep", UNTIL_KILLED]));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
-    let log = fs::read_to_string(&log_path).expect("the log was written");
+    let log = log_texts(&log_path);
     assert!(log.contains("gate: diagnostics\n"), "the log keeps the whole block:\n{log}");
     let stalled = Regex::new(r"(?m)^gate: STALLED: .*$").expect("the pattern is valid");
     let kill = stalled.find(&log).expect("the log has its STALLED line").as_str();
@@ -190,7 +188,7 @@ fn a_timed_out_kill_writes_its_diagnostics_too() {
     let outcome = case.run(&ceiling_words("critical", &["--test-sample-ms", "100"], &command));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert_block(&log, "gate: TIMED OUT", &["gate:   job "]);
     assert_eq!(release(&case)["verdict"], "timed-out", "{outcome:?}");
 }
@@ -205,7 +203,7 @@ fn a_backstop_kill_writes_its_diagnostics_too() {
     let outcome = case.run(&ceiling_words("light", &seams, &command));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
-    let log = fs::read_to_string(case.folder().join("out.log")).expect("the log was written");
+    let log = log_texts(&case.folder().join("out.log"));
     assert_in_order(&log, &["gate: diagnostics\n", "gate:   samples: none\n", "gate: BACKSTOP"]);
     assert_eq!(release(&case)["verdict"], "backstop", "{outcome:?}");
 }

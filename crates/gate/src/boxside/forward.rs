@@ -11,16 +11,29 @@
 //! read still pending on a pipe holding nothing is a leftover's, and is cancelled; the reader is taken for a leftover only if
 //! that read ended through the cancellation, a read that completes anyway forwarding its bytes and being judged
 //! again, or if its thread exits without saying it reached the end. The threads start no process.
+//!
+//! The same readers serve a run here, whose command's lines go to its log ([`Sink::Log`]) through the one
+//! [`LogWriter`] the run's other lines share. Each call chooses whether a line is stamped and tagged as its stream's
+//! ([`Stamping`]); the stamp is read once the line's lock is held, just before the write, so the stamps never decrease
+//! down the sink. A stamped line is cut every [`LINE_CAP`] bytes, so a line with no end cannot grow without limit. Each reader counts the bytes it reads ([`OutputBytes`]) as soon as a read returns, before it
+//! takes any lock.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use gate_wire::stamp::{self, Tag};
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
+
+use crate::log_writer::{LogSink, LogWriter};
+
+/// The most bytes of one stamped line: a longer line is written as several lines of at most this many bytes, each cut
+/// between two characters.
+pub(crate) const LINE_CAP: usize = 64 * 1024;
 
 /// How long the readers get, once the command's main process has exited, to reach the end of its output.
 pub(crate) const DRAIN: Duration = Duration::from_secs(2);
@@ -67,6 +80,56 @@ impl Stream {
     }
 }
 
+/// Whether a reader writes each line as it read it, or stamped with when it read it and tagged: the first tag for the
+/// stdout pipe's lines, the second for the stderr pipe's.
+#[derive(Clone, Copy)]
+pub(crate) enum Stamping {
+    None,
+    Tags(Tag, Tag),
+}
+
+impl Stamping {
+    /// The tag of `stream`'s lines; `None` when the lines are not stamped.
+    fn tag(self, stream: Stream) -> Option<Tag> {
+        match (self, stream) {
+            (Stamping::None, _) => None,
+            (Stamping::Tags(out, _), Stream::Out) => Some(out),
+            (Stamping::Tags(_, err), Stream::Err) => Some(err),
+        }
+    }
+}
+
+/// Where the readers' lines go: the box's own stdout and stderr under the run's [`OutputLock`], a failed write setting
+/// its [`ClientGone`]; or a run's log through its writer, which drops every line once it is sealed.
+#[derive(Clone, Copy)]
+pub(crate) enum Sink<'a> {
+    Own { lock: &'a OutputLock, gone: &'a ClientGone },
+    Log { writer: &'a Arc<LogWriter>, bytes: &'a OutputBytes },
+}
+
+/// The bytes each of the command's pipes has given its reader so far, counted as each read returns, before the reader
+/// takes any lock: the command's own output, which no gate line moves.
+#[derive(Clone, Default)]
+pub(crate) struct OutputBytes {
+    pub(crate) out: Arc<AtomicU64>,
+    pub(crate) err: Arc<AtomicU64>,
+}
+
+impl OutputBytes {
+    /// The counter of `stream`'s pipe.
+    fn of(&self, stream: Stream) -> Arc<AtomicU64> {
+        match stream {
+            Stream::Out => Arc::clone(&self.out),
+            Stream::Err => Arc::clone(&self.err),
+        }
+    }
+
+    /// The bytes read so far from the stdout and the stderr pipe.
+    pub(crate) fn read(&self) -> (u64, u64) {
+        (self.out.load(Ordering::SeqCst), self.err.load(Ordering::SeqCst))
+    }
+}
+
 /// The readers of one process's output, one per pipe.
 pub(crate) struct Forwarders {
     stopped: Arc<AtomicBool>,
@@ -81,41 +144,57 @@ pub(crate) struct Forwarders {
 }
 
 impl Forwarders {
-    /// Starts a reader for the command's `stdout` pipe and one for its `stderr` pipe, writing under `lock`, a failed
-    /// write setting `gone`.
+    /// Starts a reader for the command's `stdout` pipe and one for its `stderr` pipe, each line written as `stamping`
+    /// says to `sink`.
     ///
     /// # Errors
     ///
     /// The system's error when a thread cannot be started; a reader started before it goes on.
-    pub(crate) fn start(stdout: File, stderr: File, lock: &OutputLock, gone: &ClientGone) -> io::Result<Forwarders> {
-        Forwarders::start_each([(stdout, Stream::Out), (stderr, Stream::Err)], "the command's", lock, gone)
+    pub(crate) fn start(stdout: File, stderr: File, stamping: Stamping, sink: Sink<'_>) -> io::Result<Forwarders> {
+        Forwarders::start_with([(stdout, Stream::Out), (stderr, Stream::Err)], "the command's", stamping, sink)
     }
 
-    /// Starts a reader for each of git's `stdout` and `stderr` pipes that is given, writing its lines to the box's own
-    /// stream of its name under `lock`, a failed write setting `gone`; a read that fails is said naming git's pipe. No
-    /// pipe given is no reader, and a drain of none finds every reader ended.
+    /// Starts a reader for each of git's `stdout` and `stderr` pipes that is given, each line written as `stamping`
+    /// says to `sink`; a read that fails is said naming git's pipe. No pipe given is no reader, and a drain of none
+    /// finds every reader ended.
     ///
     /// # Errors
     ///
     /// The system's error when a thread cannot be started; a reader started before it goes on.
-    pub(crate) fn start_git(stdout: Option<File>, stderr: Option<File>, lock: &OutputLock, gone: &ClientGone) -> io::Result<Forwarders> {
+    pub(crate) fn start_git(stdout: Option<File>, stderr: Option<File>, stamping: Stamping, sink: Sink<'_>) -> io::Result<Forwarders> {
         let pipes = stdout
             .map(|pipe| (pipe, Stream::Out))
             .into_iter()
             .chain(stderr.map(|pipe| (pipe, Stream::Err)));
-        Forwarders::start_each(pipes, "git's", lock, gone)
+        Forwarders::start_with(pipes, "git's", stamping, sink)
     }
 
-    /// Starts a reader for each of `pipes`, writing its lines to the box's stream it names under `lock`, a failed write
-    /// setting `gone`; a read that fails is said naming the pipe `source`'s, as in `the command's stdout`.
+    /// Starts a reader for each of `pipes`, writing its lines unstamped to the box's stream it names under `lock`, a
+    /// failed write setting `gone`.
+    #[cfg(test)]
     fn start_each(
         pipes: impl IntoIterator<Item = (File, Stream)>,
         source: &'static str,
         lock: &OutputLock,
         gone: &ClientGone,
     ) -> io::Result<Forwarders> {
+        Forwarders::start_with(pipes, source, Stamping::None, Sink::Own { lock, gone })
+    }
+
+    /// Starts a reader for each of `pipes`, writing its lines as `stamping` says to `sink`; a read that fails is said
+    /// naming the pipe `source`'s, as in `the command's stdout`. A log sink's readers share a lock of their own and a
+    /// client-gone flag no one reads, since a log write never fails the run.
+    fn start_with(
+        pipes: impl IntoIterator<Item = (File, Stream)>,
+        source: &'static str,
+        stamping: Stamping,
+        sink: Sink<'_>,
+    ) -> io::Result<Forwarders> {
         let stopped = Arc::new(AtomicBool::new(false));
-        let client_gone = Arc::clone(gone);
+        let (lock, client_gone, bytes) = match sink {
+            Sink::Own { lock, gone } => (Arc::clone(lock), Arc::clone(gone), OutputBytes::default()),
+            Sink::Log { bytes, .. } => (OutputLock::default(), ClientGone::default(), bytes.clone()),
+        };
         let (sender, ended) = mpsc::channel();
         let mut behind = Vec::new();
         for (pipe, stream) in pipes {
@@ -123,21 +202,24 @@ impl Forwarders {
             let reading = Arc::new(AtomicBool::new(false));
             let ended_reader = Arc::new(AtomicBool::new(false));
             let aborted = Arc::new(AtomicBool::new(false));
-            let sink: Box<dyn Write + Send> = match stream {
-                Stream::Out => Box::new(io::stdout()),
-                Stream::Err => Box::new(io::stderr()),
+            let out: Box<dyn LineSink> = match (sink, stream) {
+                (Sink::Own { .. }, Stream::Out) => Box::new(io::stdout()),
+                (Sink::Own { .. }, Stream::Err) => Box::new(io::stderr()),
+                (Sink::Log { writer, .. }, _) => Box::new(LogSink::new(writer)),
             };
             let forwarder = Forwarder {
-                lock: Arc::clone(lock),
+                lock: Arc::clone(&lock),
                 stopped: Arc::clone(&stopped),
                 client_gone: Arc::clone(&client_gone),
                 stream,
                 source,
-                sink,
+                sink: out,
                 write_failed: false,
                 in_flight: Arc::clone(&in_flight),
                 reading: Arc::clone(&reading),
                 aborted: Arc::clone(&aborted),
+                stamp: stamping.tag(stream),
+                counted: bytes.of(stream),
             };
             let sender = sender.clone();
             let reader_ended = Arc::clone(&ended_reader);
@@ -305,8 +387,8 @@ struct Forwarder {
     stream: Stream,
     /// Whose pipe it reads, as a read failure names it: `the command's`, `git's`.
     source: &'static str,
-    /// The box's stream the lines go to, `stream`'s.
-    sink: Box<dyn Write + Send>,
+    /// Where the lines go: the box's stream, `stream`'s, or the run's log.
+    sink: Box<dyn LineSink>,
     /// Set by the first write to the box's stream that fails; no later line is written by this reader.
     write_failed: bool,
     /// Shared with the drain: set while this reader holds bytes it has read and has not written or dropped yet, and
@@ -317,13 +399,21 @@ struct Forwarder {
     reading: Arc<AtomicBool>,
     /// Shared with the drain: set when a read ended through the drain's cancellation, which is not a read failure.
     aborted: Arc<AtomicBool>,
+    /// The tag each line is stamped with when it is read; `None` writes each line as it was read, uncut.
+    stamp: Option<Tag>,
+    /// The bytes read from the pipe so far, added to as each read returns.
+    counted: Arc<AtomicU64>,
 }
 
 impl Forwarder {
     /// Reads `pipe` to its end, writing each line as it is read. A read that fails ends the reading, said on stderr;
     /// a read the drain cancelled is the drain's own doing and is not said.
     fn pump(mut self, mut pipe: File) {
-        let mut lines = LineSplitter::default();
+        let mut lines = if self.stamp.is_some() {
+            LineSplitter::capped(LINE_CAP)
+        } else {
+            LineSplitter::default()
+        };
         let mut chunk = [0_u8; 4096];
         loop {
             self.reading.store(true, Ordering::SeqCst);
@@ -332,6 +422,7 @@ impl Forwarder {
             match result {
                 Ok(0) => break,
                 Ok(read) => {
+                    self.counted.fetch_add(read as u64, Ordering::SeqCst);
                     self.in_flight.store(true, Ordering::SeqCst);
                     lines.feed(&chunk[..read], |line| self.write(line));
                     self.in_flight.store(false, Ordering::SeqCst);
@@ -363,14 +454,14 @@ impl Forwarder {
         if self.write_failed || self.stopped.load(Ordering::SeqCst) {
             return;
         }
-        let mut text = String::from_utf8_lossy(line).into_owned();
-        text.push('\n');
+        let read = String::from_utf8_lossy(line);
         let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         // Looked at again under the lock: the readers may have been stopped while this one waited for it.
         if self.stopped.load(Ordering::SeqCst) {
             return;
         }
-        if write_flushed(&mut self.sink, text.as_bytes()).is_err() {
+        // Stamped by the sink under the lock, so the stamps of the lines it writes never decrease down its stream.
+        if self.sink.line(self.stamp, &read).is_err() {
             self.write_failed = true;
             self.client_gone.store(true, Ordering::SeqCst);
         }
@@ -384,20 +475,58 @@ impl Forwarder {
     }
 }
 
-fn write_flushed(stream: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+fn write_flushed(stream: &mut (impl Write + ?Sized), bytes: &[u8]) -> io::Result<()> {
     stream.write_all(bytes)?;
     stream.flush()
 }
 
+/// Where a reader writes each line it read: stamped now and tagged when it is given a tag, a line feed after it.
+pub(crate) trait LineSink: Send {
+    /// Writes `text` as one line, stamped with this moment and tagged `tag` when there is one.
+    ///
+    /// # Errors
+    ///
+    /// The system's error when the line cannot be written.
+    fn line(&mut self, tag: Option<Tag>, text: &str) -> io::Result<()>;
+}
+
+impl<W: Write + Send> LineSink for W {
+    fn line(&mut self, tag: Option<Tag>, text: &str) -> io::Result<()> {
+        let mut line = match tag {
+            Some(tag) => stamp::stamped(&stamp::now(), tag, text),
+            None => text.to_owned(),
+        };
+        line.push('\n');
+        write_flushed(self, line.as_bytes())
+    }
+}
+
+impl LineSink for LogSink {
+    fn line(&mut self, tag: Option<Tag>, text: &str) -> io::Result<()> {
+        self.writer().command_line(tag, text);
+        Ok(())
+    }
+}
+
 /// Cuts bytes into lines as .NET's `ReadLine` does: CR LF, LF and a lone CR each end a line, and the bytes after the
-/// last end are a line of their own when there are any.
+/// last end are a line of their own when there are any. A capped splitter also ends a line once it holds more than its
+/// cap, giving the bytes up to the last character that starts within the cap.
 #[derive(Default)]
 struct LineSplitter {
     line: Vec<u8>,
     after_cr: bool,
+    cap: Option<usize>,
 }
 
 impl LineSplitter {
+    /// A splitter that gives no line of more than `cap` bytes.
+    fn capped(cap: usize) -> LineSplitter {
+        LineSplitter {
+            cap: Some(cap),
+            ..LineSplitter::default()
+        }
+    }
+
     /// Takes `bytes`, giving `emit` each line they end, without its end.
     fn feed(&mut self, bytes: &[u8], mut emit: impl FnMut(&[u8])) {
         for &byte in bytes {
@@ -409,7 +538,16 @@ impl LineSplitter {
                     self.line.clear();
                     self.after_cr = byte == b'\r';
                 }
-                _ => self.line.push(byte),
+                _ => {
+                    self.line.push(byte);
+                    if let Some(cap) = self.cap
+                        && self.line.len() > cap
+                    {
+                        let cut = character_start(&self.line, cap);
+                        emit(&self.line[..cut]);
+                        self.line.drain(..cut);
+                    }
+                }
             }
         }
     }
@@ -420,6 +558,12 @@ impl LineSplitter {
             emit(&self.line);
         }
     }
+}
+
+/// The last index at or below `at`, and above 0, where a character of `line` starts, so `line[..index]` ends between
+/// two characters; `at` itself when every byte from 1 to `at` continues a character, as in bytes that are not UTF-8.
+fn character_start(line: &[u8], at: usize) -> usize {
+    (1..=at).rev().find(|&index| line[index] & 0xc0 != 0x80).unwrap_or(at)
 }
 
 #[cfg(test)]
@@ -435,7 +579,7 @@ mod tests {
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
     use windows_sys::Win32::System::Threading::{ResumeThread, SuspendThread};
 
-    use super::{Behind, ClientGone, Forwarder, Forwarders, LineSplitter, OutputLock, Stream};
+    use super::{Behind, ClientGone, Forwarder, Forwarders, LineSink, LineSplitter, OutputLock, Stream};
 
     /// How long the stop case lets its reader run before it stops the readers, so the reader is past its first look at
     /// the stop and waits for the lock: only the case's power to go red rests on it. A reader slower than this looks
@@ -459,7 +603,7 @@ mod tests {
 
     /// One reader of `pipe`, its lines written to `sink`, wired as [`Forwarders::start_each`] wires a reader: the
     /// drain can be watched on it, and the flags it reports through are its own.
-    fn one_reader(pipe: File, sink: Box<dyn Write + Send>, lock: &OutputLock) -> Forwarders {
+    fn one_reader(pipe: File, sink: Box<dyn LineSink>, lock: &OutputLock) -> Forwarders {
         let stopped = Arc::new(AtomicBool::new(false));
         let client_gone = Arc::new(AtomicBool::new(false));
         let in_flight = Arc::new(AtomicBool::new(false));
@@ -477,6 +621,8 @@ mod tests {
             in_flight: Arc::clone(&in_flight),
             reading: Arc::clone(&reading),
             aborted: Arc::clone(&aborted),
+            stamp: None,
+            counted: Arc::default(),
         };
         let (sender, ended_rx) = mpsc::channel();
         let ended_by_close = Arc::clone(&reader_ended);
@@ -517,6 +663,8 @@ mod tests {
             in_flight: Arc::default(),
             reading: Arc::default(),
             aborted: Arc::default(),
+            stamp: None,
+            counted: Arc::default(),
         };
         let held = lock.lock().unwrap_or_else(PoisonError::into_inner);
         let (writing, started) = mpsc::channel();
@@ -845,6 +993,8 @@ mod tests {
             in_flight: Arc::default(),
             reading: Arc::default(),
             aborted: Arc::default(),
+            stamp: None,
+            counted: Arc::default(),
         };
         let line = vec![b'x'; LONG_LINE];
         let writing = line.clone();
@@ -944,5 +1094,127 @@ mod tests {
     #[test]
     fn an_invalid_byte_reads_as_the_replacement_character() {
         assert_eq!(split(&[&[0xff, b'\n']]), ["\u{FFFD}"]);
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test whose pipe or thread cannot be made must fail loudly")]
+mod stamped_tests {
+    use std::fs::File;
+    use std::io::{self, Write};
+    use std::os::windows::io::OwnedHandle;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::thread;
+
+    use gate_wire::stamp::{Tag, unstamped};
+
+    use super::{Forwarder, LINE_CAP, LineSplitter, OutputLock, Stream};
+
+    /// A sink that keeps every byte written to it.
+    #[derive(Clone, Default)]
+    struct Recording(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Recording {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Pumps `bytes`, written by a thread of their own, through one reader stamping as `stamp`; the lines it wrote and
+    /// the bytes it counted.
+    fn pumped(bytes: Vec<u8>, stamp: Option<Tag>) -> (Vec<String>, u64) {
+        let (reader, mut writer) = io::pipe().expect("the pipe is made");
+        let written = Recording::default();
+        let counted = Arc::new(AtomicU64::new(0));
+        let forwarder = Forwarder {
+            lock: OutputLock::default(),
+            stopped: Arc::default(),
+            client_gone: Arc::default(),
+            stream: Stream::Out,
+            source: "the test's",
+            sink: Box::new(written.clone()),
+            write_failed: false,
+            in_flight: Arc::default(),
+            reading: Arc::default(),
+            aborted: Arc::default(),
+            stamp,
+            counted: Arc::clone(&counted),
+        };
+        let feeder = thread::spawn(move || writer.write_all(&bytes).expect("the bytes are written"));
+        forwarder.pump(File::from(OwnedHandle::from(reader)));
+        feeder.join().expect("the feeder does not panic");
+        let text = String::from_utf8(written.0.lock().unwrap_or_else(PoisonError::into_inner).clone()).expect("the lines are UTF-8");
+        (text.lines().map(str::to_owned).collect(), counted.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn a_stamped_reader_tags_each_line_and_its_stamps_do_not_decrease() {
+        let (lines, _) = pumped(b"a\r\nb\rc".to_vec(), Some(Tag::Err));
+
+        let parts: Vec<_> = lines.iter().map(|line| unstamped(line)).collect();
+        assert_eq!(parts.iter().map(|part| part.text).collect::<Vec<_>>(), ["a", "b", "c"], "{lines:?}");
+        assert!(parts.iter().all(|part| part.tag == Some(Tag::Err)), "{lines:?}");
+        let stamps: Vec<_> = parts.iter().map(|part| part.stamp.expect("each line is stamped")).collect();
+        assert!(stamps.windows(2).all(|pair| pair[0] <= pair[1]), "{stamps:?}");
+    }
+
+    #[test]
+    fn an_unstamped_reader_writes_each_line_as_read() {
+        let (lines, _) = pumped(b"a\r\nb\rc".to_vec(), None);
+
+        assert_eq!(lines, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_stamped_line_longer_than_the_cap_is_written_as_lines_of_the_cap() {
+        let mut bytes = vec![b'x'; 2 * LINE_CAP + 100];
+        bytes.push(b'\n');
+
+        let (lines, counted) = pumped(bytes, Some(Tag::Out));
+
+        let lengths: Vec<_> = lines.iter().map(|line| unstamped(line).text.len()).collect();
+        assert_eq!(lengths, [LINE_CAP, LINE_CAP, 100]);
+        assert!(lines.iter().all(|line| unstamped(line).tag == Some(Tag::Out)));
+        assert_eq!(counted, u64::try_from(2 * LINE_CAP + 101).expect("fits"), "every byte read is counted");
+    }
+
+    #[test]
+    fn an_unstamped_line_is_never_cut() {
+        let mut bytes = vec![b'x'; 2 * LINE_CAP + 100];
+        bytes.push(b'\n');
+
+        let (lines, _) = pumped(bytes, None);
+
+        assert_eq!(lines.iter().map(String::len).collect::<Vec<_>>(), [2 * LINE_CAP + 100]);
+    }
+
+    #[test]
+    fn a_capped_line_is_cut_between_two_characters() {
+        let mut lines = Vec::new();
+        let mut splitter = LineSplitter::capped(8);
+        splitter.feed("aaaaaaa\u{e9}bb\n".as_bytes(), |line| {
+            lines.push(String::from_utf8_lossy(line).into_owned());
+        });
+        splitter.finish(|line| lines.push(String::from_utf8_lossy(line).into_owned()));
+
+        assert_eq!(
+            lines,
+            ["aaaaaaa", "\u{e9}bb"],
+            "the cut falls before the two-byte character, not inside it"
+        );
+    }
+
+    #[test]
+    fn the_counter_counts_the_bytes_read_not_the_stamped_bytes_written() {
+        let (lines, counted) = pumped(b"ab\ncd".to_vec(), Some(Tag::Out));
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(counted, 5);
     }
 }

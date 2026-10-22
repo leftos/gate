@@ -32,7 +32,7 @@ fn case_dir(test: &str) -> PathBuf {
     dir
 }
 
-/// The `cmd.exe` command `line`, run in `dir` with this process's environment and its output to `out.log` there.
+/// The `cmd.exe` command `line`, run in `dir` with this process's environment and its output to pipes the launch keeps until its resume closes them.
 fn launch(dir: &Path, line: &str) -> Launch {
     let system = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot is set"));
     Launch {
@@ -40,10 +40,7 @@ fn launch(dir: &Path, line: &str) -> Launch {
         command_line: line.encode_utf16().collect(),
         directory: dir.to_path_buf(),
         environment: EnvironmentBlock::new(std::env::vars_os()).expect("the block is built"),
-        output: LaunchOutput::Files {
-            log: dir.join("out.log"),
-            err_log: dir.join("out.log.err"),
-        },
+        output: LaunchOutput::Pipes,
         priority: None,
     }
 }

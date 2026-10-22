@@ -24,6 +24,7 @@ mod journal;
 mod late;
 mod load;
 mod log;
+mod log_writer;
 mod machine;
 mod nesting;
 mod no_build;

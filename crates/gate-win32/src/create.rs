@@ -461,16 +461,13 @@ pub(crate) mod tests {
             command_line: "cmd /d /c exit 0".encode_utf16().collect(),
             directory: system,
             environment: environment(),
-            output: LaunchOutput::Files {
-                log: dir.join("out.log"),
-                err_log: dir.join("out.log.err"),
-            },
+            output: LaunchOutput::Pipes,
             priority: None,
         };
 
         let suspended = launch.start_suspended().expect("the command is created");
 
-        assert_eq!(CHECKED.take(), Some(3), "the window checked NUL, the log and the .err file");
+        assert_eq!(CHECKED.take(), Some(3), "the window checked NUL and the two pipe write ends");
         assert!(!spawn_lock_held(), "the spawn lock is free once the launch returns");
         drop(suspended);
         std::fs::remove_dir_all(&dir).expect("the case folder is removed");

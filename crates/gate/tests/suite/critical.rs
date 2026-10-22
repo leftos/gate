@@ -17,8 +17,8 @@ use crate::durations::seed;
 use crate::nesting::{marked, test_marker};
 use crate::routing::{HOST, routed_case, routed_words, stub};
 use crate::support::{
-    Case, FAKE_TOOL, GATE, POLL, Running, UNTIL_KILLED, USAGE, assert_in_order, critical_words, events, events_of, finish, heavy_words, none_words,
-    run_words, shown, start, take_of, wait_for_file, wait_for_journal_line, wait_until, write_counts,
+    Case, FAKE_TOOL, GATE, POLL, Running, UNTIL_KILLED, USAGE, assert_in_order, critical_words, events, events_of, finish, heavy_words, log_texts,
+    none_words, run_words, shown, start, take_of, wait_for_file, wait_for_journal_line, wait_until, write_counts,
 };
 
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
@@ -519,7 +519,7 @@ fn a_heavy_child_of_a_light_parent_is_lent_the_parents_slot_while_a_critical_req
         "the queued child left the queue for its parent's slot"
     );
     assert_eq!(events_of(&case, critical_pid), ["queue"], "the child ran while the critical gate drains");
-    let child_log = fs::read_to_string(case.folder().join("child.log")).expect("the child wrote its log");
+    let child_log = log_texts(&case.folder().join("child.log"));
     assert!(child_log.contains(&lent(parent_pid)), "{child_log}");
     assert!(
         child_log.contains(&format!("heavy:{child_pid}:")),
@@ -571,18 +571,20 @@ fn a_lent_auto_run_uses_its_history_for_the_ceiling() {
         parent_outcome.stdout.contains(", ceiling 2520 s). Full output: "),
         "the lent child's passed line names the ceiling its history resolved: {parent_outcome:?}"
     );
-    // The parent shows the child's stderr as it runs, up to the child's passed line, and again in its own log's tail.
+    let raised = "gate: ceiling 42 min (3x this command's p99 of 14 min, above the given 15 min)";
+    let child_log = log_texts(&case.folder().join("child.log"));
+    assert_eq!(
+        child_log.matches(raised).count(),
+        1,
+        "the lent child says its raised ceiling once: {child_log}"
+    );
+    // The parent's log holds the child's stderr line as the child said it, and the child's tail on its stdout says it
+    // again; the parent's tail shows both, before the child's passed line.
     let (child_stream, _) = parent_outcome
         .stdout
         .split_once("child.log")
         .expect("the child's passed line names its log");
-    assert_eq!(
-        child_stream
-            .matches("gate: ceiling 42 min (3x this command's p99 of 14 min, above the given 15 min)")
-            .count(),
-        1,
-        "the lent child says its raised ceiling once: {parent_outcome:?}"
-    );
+    assert_eq!(child_stream.matches(raised).count(), 2, "{parent_outcome:?}");
     let_go(&go);
     assert_passed(&critical.finish());
     assert_passed(&held.finish());
@@ -1167,7 +1169,7 @@ fn a_heavy_gate_nested_in_a_lent_gate_runs_covered_after_the_critical_gate_close
     // The nested gate's first journal line says how it runs: a covered gate journals `covered`, a queued one `queue`.
     wait_until("the nested gate journalling", || !events_of(&case, nested_pid).is_empty());
     assert_eq!(events_of(&case, nested_pid), ["covered"], "the nested gate is neither lent nor queued");
-    let nested_log = || fs::read_to_string(case.folder().join("nested.log")).unwrap_or_default();
+    let nested_log = || log_texts(&case.folder().join("nested.log"));
     wait_until("the nested gate passing", || nested_log().contains("gate: passed in "));
     let log = nested_log();
     assert!(
@@ -1388,7 +1390,7 @@ fn a_critical_take_journals_the_snapshot_and_says_the_holds_line() {
          other live claims: {light_pid} light 0 {light_command}\n"
     );
     assert_in_order(&outcome.stderr, &[HOLDS, " s", &said]);
-    let log = fs::read_to_string(case.folder().join("critical.log")).expect("the critical gate wrote its log");
+    let log = log_texts(&case.folder().join("critical.log"));
     assert_in_order(&log, &[HOLDS, &said]);
 
     let_go(&go);
@@ -1556,7 +1558,7 @@ fn a_nested_gate_under_a_critical_parent_runs_without_waiting_for_the_machine() 
         .find(|event| event["event"] == "covered")
         .expect("checked above");
     assert_eq!(covered["parentPid"], Value::from(outer_pid));
-    let inner_log = fs::read_to_string(case.folder().join("inner.log")).expect("the inner gate wrote its log");
+    let inner_log = log_texts(&case.folder().join("inner.log"));
     assert!(
         inner_log.contains(&format!("gate: running under the critical slot of gate {outer_pid}")),
         "{inner_log}"
@@ -1893,7 +1895,7 @@ fn an_alone_run_logs_the_load_at_its_start_and_end() {
     assert_passed(&outcome);
     assert_no_load_on_the_console(&outcome);
     assert_no_load_in_the_journal(&case);
-    let log = fs::read_to_string(case.folder().join("alone.log")).expect("the alone gate wrote its log");
+    let log = log_texts(&case.folder().join("alone.log"));
     let start = load_block(&log, "start");
     let end = load_block(&log, "end");
     assert_eq!(
@@ -1922,7 +1924,7 @@ fn a_plain_critical_run_logs_no_load() {
     let outcome = case.run(&critical_words("critical.log", &short_windows(), &[FAKE_TOOL, "out", "hi", "exit", "0"]));
 
     assert_passed(&outcome);
-    let log = fs::read_to_string(case.folder().join("critical.log")).expect("the critical gate wrote its log");
+    let log = log_texts(&case.folder().join("critical.log"));
     assert!(log.contains(HOLDS), "{log}");
     assert!(!log.contains("gate: load at"), "{log}");
 }
@@ -1941,7 +1943,7 @@ fn an_alone_run_killed_at_its_ceiling_still_logs_the_load_at_its_end() {
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     assert_no_load_on_the_console(&outcome);
-    let log = fs::read_to_string(case.folder().join("alone.log")).expect("the alone gate wrote its log");
+    let log = log_texts(&case.folder().join("alone.log"));
     let start = load_block(&log, "start");
     let end = load_block(&log, "end");
     assert_in_order(
@@ -1967,7 +1969,7 @@ fn an_alone_run_names_another_gate_s_claim_in_its_load() {
 
     assert_passed(&outcome);
     assert_no_load_on_the_console(&outcome);
-    let log = fs::read_to_string(case.folder().join("alone.log")).expect("the alone gate wrote its log");
+    let log = log_texts(&case.folder().join("alone.log"));
     let other = format!("other gate {} holds remote 2: cargo build", process::id());
     for when in ["start", "end"] {
         let block = load_block(&log, when);
@@ -1987,7 +1989,7 @@ fn an_alone_run_interrupted_still_logs_the_load_at_its_end() {
 
     assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
     assert_no_load_on_the_console(&outcome);
-    let log = fs::read_to_string(case.folder().join("alone.log")).expect("the alone gate wrote its log");
+    let log = log_texts(&case.folder().join("alone.log"));
     let start = load_block(&log, "start");
     // The interrupt that ended the command ends the end window at once, so its CPU times may not have moved: the block
     // is asserted by its ends only.
@@ -2026,7 +2028,7 @@ fn an_alone_run_keeps_its_load_off_the_console_however_long_another_gate_s_comma
 
     assert_passed(&outcome);
     assert_no_load_on_the_console(&outcome);
-    let log = fs::read_to_string(case.folder().join("alone.log")).expect("the alone gate wrote its log");
+    let log = log_texts(&case.folder().join("alone.log"));
     let end = load_block(&log, "end");
     let other = format!(
         "gate: load at end: other gate {} holds remote 2: pwsh -EncodedCommand AAAA",
@@ -2045,7 +2047,7 @@ fn an_alone_run_whose_command_cannot_start_still_logs_the_load_at_its_end() {
 
     assert_eq!(outcome.code, Some(127), "{outcome:?}");
     assert_no_load_on_the_console(&outcome);
-    let log = fs::read_to_string(case.folder().join("alone.log")).expect("the alone gate wrote its log");
+    let log = log_texts(&case.folder().join("alone.log"));
     let start = load_block(&log, "start");
     let end = load_block(&log, "end");
     assert_in_order(

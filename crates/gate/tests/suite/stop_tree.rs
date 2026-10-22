@@ -9,7 +9,7 @@ use jiff::Timestamp;
 use proc_table::{ProcessTable as _, ProcessTree, Win32ProcessTable};
 use regex::Regex;
 
-use crate::support::{Case, FAKE_TOOL, USAGE, run_words, said_pid, shown, start, wait_until, wait_until_closed};
+use crate::support::{Case, FAKE_TOOL, USAGE, log_texts, run_words, said_pid, shown, start, wait_until, wait_until_closed};
 
 /// Writes the go file when dropped, so a helper a failing case leaves behind ends without waiting out its limit. A
 /// case declares it after its [`Case`] and before its running programs, so it lets them go before the folder goes.
@@ -26,9 +26,7 @@ impl Drop for LetGo {
 fn spawned_pid(log: &Path, after: &str) -> u32 {
     let mut pid = None;
     wait_until(&format!("{} naming its spawned helper after {after:?}", log.display()), || {
-        let text = fs::read(log)
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_default();
+        let text = log_texts(log);
         pid = text
             .lines()
             .any(|line| line == after)
@@ -41,11 +39,7 @@ fn spawned_pid(log: &Path, after: &str) -> u32 {
 
 /// The pid of the case's command, from the `pid <pid>` line its own `pid` step printed, once the log holds it.
 fn command_pid(log: &Path) -> u32 {
-    let text = || {
-        fs::read(log)
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_default()
-    };
+    let text = || log_texts(log);
     wait_until(&format!("{} naming its command's pid", log.display()), || {
         text().lines().any(|line| line.starts_with("pid "))
     });
