@@ -1,0 +1,1 @@
+{"host": "build-a", "slots": 2, "repos": {"repo": ["cargo test *"]}, "builders": [{"host": "mac-1", "os": "macos", "root": "/Users/builder", "slots": 2, "repos": {"repo": ["cargo test *"]}}, {"host": "win-a", "os": "windows", "slots": 1, "routed": false}]}

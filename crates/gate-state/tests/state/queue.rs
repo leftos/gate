@@ -1,9 +1,9 @@
 //! The arrival tickets of the gates waiting for a slot or for the machine, and the pools a critical ticket bars.
 
-use gate_state::{DashboardState, QueueTicket, SlotKind};
+use gate_state::{DashboardState, QueueTicket, SlotKind, v1};
 use serde_json::{Value, json};
 
-use crate::support::{CRITICAL_GATE, HEAVY_GATE, LIGHT_GATE, Machine, NOW, START, START_CLOSE, START_FAR, remote_ticket, ticket, ticks};
+use crate::support::{CRITICAL_GATE, HEAVY_GATE, LIGHT_GATE, Machine, NOW, START, START_CLOSE, START_FAR, ms, remote_ticket, ticket, ticks};
 
 const SECOND: i64 = 10_000_000;
 
@@ -67,6 +67,83 @@ fn queue_row_carries_the_ticket_remote_flag() {
         .map(|ticket| ticket.get("remote"))
         .collect();
     assert_eq!(remote, [None, Some(&json!(true))], "remote is written only when true");
+}
+
+#[test]
+fn a_remote_ticket_shows_its_pool_and_pinned_in_the_queue() {
+    let mut machine = Machine::new("a_remote_ticket_shows_its_pool_and_pinned_in_the_queue");
+    machine.add_process(300, 1, "pwsh.exe", Some(LIGHT_GATE), Some(START));
+    machine.add_process(301, 1, "pwsh.exe", Some(HEAVY_GATE), Some(START));
+    machine.write_ticket("waiting", "300.json", &ticket("light", 300, ticks(NOW), false).to_string());
+    let mut pooled = remote_ticket(301, ticks(NOW));
+    pooled["pool"] = json!("1f0efc62");
+    pooled["pinned"] = json!(true);
+    machine.write_ticket("waiting", "301.json", &pooled.to_string());
+    let state = machine.state();
+
+    let remote = state.queue.iter().find(|ticket| ticket.pid == 301).expect("the routed gate's ticket");
+    assert_eq!(
+        (remote.pool.as_deref(), remote.pinned),
+        (Some("1f0efc62"), true),
+        "a ticket of a builders pool's queue says which pool and that it is pinned"
+    );
+    let local = state.queue.iter().find(|ticket| ticket.pid == 300).expect("the local gate's ticket");
+    assert_eq!((local.pool.as_deref(), local.pinned), (None, false), "a local ticket has neither");
+
+    let queue = serde_json::to_value(&state.queue).expect("the queue serialises");
+    let keys: Vec<Vec<&str>> = queue
+        .as_array()
+        .expect("the queue is an array")
+        .iter()
+        .map(crate::support::keys)
+        .collect();
+    assert_eq!(keys[0], ["kind", "holds", "pid", "arrived", "ageSeconds", "cwd", "commandLine"]);
+    assert_eq!(
+        keys[1],
+        [
+            "kind",
+            "holds",
+            "remote",
+            "pool",
+            "pinned",
+            "pid",
+            "arrived",
+            "ageSeconds",
+            "cwd",
+            "commandLine"
+        ],
+        "pool and pinned follow remote, each written only when it has something to say"
+    );
+}
+
+#[test]
+fn a_v1_remote_ticket_shows_its_pool_and_pinned_in_the_queue() {
+    let mut machine = Machine::v1("a_v1_remote_ticket_shows_its_pool_and_pinned_in_the_queue");
+    machine.add_process(400, 1, "gate.exe", Some(HEAVY_GATE), Some(START));
+    let ticket = v1::Ticket {
+        kind: v1::TicketKind::Heavy,
+        arrived: ms(NOW),
+        pid: 400,
+        start_ms: ms(START),
+        holds: false,
+        lends_closed: false,
+        alone: false,
+        remote: Some(true),
+        pool: Some("1f0efc62".to_owned()),
+        pinned: Some(true),
+        reason: None,
+        expected: None,
+    };
+    v1::write_ticket(&v1::ticket_path(&machine.v1_root(), 400, ms(START)), &ticket).expect("the ticket can be written");
+
+    let state = machine.state();
+
+    let shown = state.queue.first().expect("the ticket's gate is live");
+    assert_eq!(
+        (shown.pool.as_deref(), shown.pinned),
+        (Some("1f0efc62"), true),
+        "a gate.exe ticket of a builders pool says which pool and that it is pinned"
+    );
 }
 
 #[test]

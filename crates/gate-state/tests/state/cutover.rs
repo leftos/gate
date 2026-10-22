@@ -43,6 +43,7 @@ fn v1_ticket(machine: &Machine, kind: TicketKind, pid: u32, arrived: &str) {
         alone: false,
         remote: None,
         pool: None,
+        pinned: None,
         reason: None,
         expected: None,
     };
@@ -334,6 +335,7 @@ fn a_v1_tickets_reason_reaches_the_queue_row_before_expected() {
         alone: false,
         remote: None,
         pool: None,
+        pinned: None,
         reason: Some("checking the fallback".to_owned()),
         expected: Some(expected),
     };

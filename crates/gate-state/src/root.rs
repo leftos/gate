@@ -63,7 +63,7 @@ pub fn default_root(local_app_data: &str) -> String {
 }
 
 /// The id of a `builders` entry's own remote pool: the first 8 lower-case hex digits of the SHA-256 of the lower-cased
-/// alias, as `remote.json`'s reader computes it. `host`'s pool has none.
+/// alias, as `gate_router::builder_id` computes it. `host`'s pool has none.
 /// It shows as those 8 digits.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PoolId(u32);

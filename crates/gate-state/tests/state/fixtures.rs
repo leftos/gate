@@ -6,7 +6,7 @@ use std::path::Path;
 use gate_state::{CommandSummary, HistoryRun, JournalCache, RunState, SlotCount, SlotKind, SlotState, Waiting, dashboard_state};
 use serde_json::Value;
 
-use crate::support::{Machine, pool, ts};
+use crate::support::{Machine, START, pool, remote_claim, ts};
 
 /// A heavy slot's claim file, captured while its gate ran `-Log .tmp/o28-capture/first.log`.
 const CLAIM: &str = include_str!("fixtures/claim.json");
@@ -29,6 +29,9 @@ const REMOTE_CLAIM: &str = include_str!("fixtures/remote-claim.json");
 const REMOTE_TICKET: &str = include_str!("fixtures/remote-ticket.json");
 /// The gate's remote settings: two slots, plus routing keys the state ignores.
 const REMOTE_SETTINGS: &str = include_str!("fixtures/remote.json");
+/// A hand-written `remote.json` with `host` and two `builders` entries, the macOS `mac-1` and the Windows `win-a`, which
+/// no pick sends a run to.
+const REMOTE_BUILDERS: &str = include_str!("fixtures/remote-builders.json");
 /// The journal of nine routed and local gates captured under a stub remote: a remote run, a run the full pool sent back,
 /// five runs refused after their remote take, one that fell back onto its parent's slot, and a local one.
 const REMOTE_JOURNAL: &str = include_str!("fixtures/remote-journal.jsonl");
@@ -172,6 +175,38 @@ fn remote_claim_is_read_as_a_busy_remote_slot_with_its_host() {
         "a remote claim is no heavy slot's"
     );
     assert_eq!(pool(&state, SlotKind::Heavy).waiting, Vec::<Waiting>::new());
+}
+
+#[test]
+fn a_remote_json_with_builders_is_read_into_builder_pools() {
+    let mut machine = Machine::new("a_remote_json_with_builders_is_read_into_builder_pools");
+    machine.prefix = REMOTE_PREFIX.to_owned();
+    machine.write_remote(REMOTE_BUILDERS);
+    let claim = remote_claim(53000, 1);
+    machine.write_claim(&format!("{REMOTE_PREFIX}gate-remote-1f0efc62-slot-1.json"), &claim.to_string());
+    machine.add_process(53000, 1, "pwsh.exe", Some(ROUTED_GATE), Some(START));
+
+    let state = machine.state();
+
+    let pools: Vec<(Option<&str>, Option<&str>, bool)> = state
+        .builders
+        .iter()
+        .map(|pool| (pool.name.as_deref(), pool.host.as_deref(), pool.routed))
+        .collect();
+    assert_eq!(
+        pools,
+        [(Some("mac-1"), Some("mac-1"), true), (Some("win-a"), Some("win-a"), false)],
+        "the file's two builders entries, in its order"
+    );
+    let mac = state.builders.first().expect("mac-1's pool is listed");
+    assert_eq!((mac.id.as_str(), mac.os.as_deref(), mac.count), ("1f0efc62", Some("macos"), 2));
+    let busy = mac.slots.get(1).expect("mac-1's slot 1 is listed");
+    assert_eq!(busy.state, SlotState::Busy, "the pooled claim holds it");
+    let shown = busy.claim.as_ref().expect("a busy slot shows its claim");
+    assert_eq!(text(shown, "host"), "builder@build-box");
+    assert_eq!(shown.get("remote"), Some(&Value::Bool(true)));
+    let remote = state.remote.as_ref().expect("the file sizes host's pool");
+    assert_eq!((remote.count, remote.problem.as_deref()), (2, None), "host's pool is as it was");
 }
 
 #[test]

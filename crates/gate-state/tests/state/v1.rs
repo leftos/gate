@@ -64,6 +64,7 @@ fn ticket(pid: u32, arrived: u64) -> Ticket {
         alone: false,
         remote: None,
         pool: None,
+        pinned: None,
         reason: None,
         expected: None,
     }
@@ -862,6 +863,51 @@ fn a_ticket_of_a_builders_pool_carries_its_pool_and_one_of_host_s_pool_none() {
     let text = fs::read_to_string(&path).expect("the pooled ticket is there");
     assert!(text.ends_with(r#""remote":true,"pool":"1f0efc62"}"#), "{text}");
     assert_eq!(v1::read_ticket(&path).expect("the pooled ticket reads"), pooled);
+}
+
+#[test]
+fn a_ticket_without_pinned_reads_as_not_pinned() {
+    let dir = scratch("pinned-absent");
+    let path = v1::ticket_path(&dir, 60080, 1_759_439_762_015);
+    fs::create_dir_all(path.parent().expect("the ticket has a folder")).expect("the ticket folder can be made");
+    fs::write(&path, TICKET_TEXT).expect("the fixture ticket can be written");
+
+    let ticket = v1::read_ticket(&path).expect("the fixture ticket reads");
+
+    assert_eq!(ticket.pinned, None, "a ticket without the key is not pinned");
+}
+
+#[test]
+fn a_not_pinned_ticket_writes_no_pinned_key() {
+    let dir = scratch("pinned-unwritten");
+    let path = v1::ticket_path(&dir, 60080, 1_759_439_762_015);
+    for pinned in [None, Some(false)] {
+        let ticket = Ticket {
+            pinned,
+            ..ticket(60080, 1_759_439_762_015)
+        };
+        v1::write_ticket(&path, &ticket).expect("the ticket is written");
+        let text = fs::read_to_string(&path).expect("the ticket is there");
+        assert!(!text.contains("pinned"), "{pinned:?}: {text}");
+        assert_eq!(text, TICKET_TEXT.trim_end(), "{pinned:?}: the fixture is what the writer writes");
+    }
+}
+
+#[test]
+fn a_pinned_ticket_round_trips() {
+    let dir = scratch("pinned-roundtrip");
+    let path = v1::ticket_path(&dir, 60080, 1_759_439_762_015);
+    let pinned = Ticket {
+        remote: Some(true),
+        pool: Some("1f0efc62".to_owned()),
+        pinned: Some(true),
+        ..ticket(60080, 1_759_439_762_015)
+    };
+    v1::write_ticket(&path, &pinned).expect("the ticket is written");
+    let text = fs::read_to_string(&path).expect("the ticket is there");
+
+    assert!(text.ends_with(r#""pool":"1f0efc62","pinned":true}"#), "{text}");
+    assert_eq!(v1::read_ticket(&path).expect("the written ticket reads"), pinned);
 }
 
 #[test]

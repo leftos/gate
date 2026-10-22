@@ -788,7 +788,7 @@ A slot is a named mutex in the logon session's `Local\` namespace, held by the g
 | builder's remote | `Local\gate-remote-<pool id>-slot-<i>` | a heavy run routed to a `builders` entry, or pinned to a `hosts` entry, one pool per entry, so a run to one builder never waits behind runs to another. |
 | critical | `Local\gate-critical` | a critical gate, for its whole run, so two critical requests run one at a time in arrival order (K1). |
 
-A pool id is the first 8 lower-case hex digits of the SHA-256 of the entry's lower-cased alias (`mac-1` is `1f0efc62`); `host` has none and keeps the plain names. A `hosts` entry has one too, and only a pinned run uses its pool.
+A pool id is the first 8 lower-case hex digits of the SHA-256 of the entry's lower-cased alias (`mac-1` is `1f0efc62`); `host` has none and keeps the plain names. A `hosts` entry has one too, and only a pinned run uses its pool. `gate_router::builder_id` computes it, for the gate and for `gate-state`'s dashboard read alike.
 
 The pools never wait on each other, so a serial test run does not queue behind builds (S1). A gate takes and releases its mutexes on one OS thread, since Windows mutex ownership is per thread.
 
@@ -975,6 +975,14 @@ The environment carries two more names: `GATE_SLOT_HELD`, the slot marker, and `
 
   The waiters in `queue[]`, `pools[].waiting` and `critical.waiting` come from the tickets, not from process command lines: `queue[]` is ordered by (`arrived`, `pid`) with `arrived` as ISO text of 7 fractional digits and a lower-case `kind`; a waiter's `since` is its gate's start and its `commandLine` is the gate's command line from the process table; `pools[].problem` is worded for `gate.exe`'s files.
 
+  `DashboardState.builders`, after `remote`, lists each builder's own remote pool: `[{id, name, host, os, count, problem, routed, slots}]`, `[]` (not skipped) when `remote.json` names none, with `name`, `host` and `os` always serialised and null when unknown. The order is `remote.json`'s `builders` entries, then each `hosts` entry that holds a claim (`routed: false`), then each pooled claim no entry names, sorted by pool id (`name` and `host` null, `problem` `no builders or hosts entry has pool id <pool id>`).
+
+  The entries come from `gate-router`'s own reader of `remote.json` ([remote.json](#remotejson)), so the dashboard lists the pools the gate routes to; `id` is `gate_router::builder_id` of the alias and `routed` is `Config::builder_routed`. `slots` rows are the ordinary slot rows, a claim past `count` an extra row, and a busy builder slot's pid is a dashboard holder as `host`'s remote slots are. `remote` stays `host`'s pool, read as before.
+
+  A file `gate-router` refuses still lists each `builders` entry that has a string `host`, and each `hosts` string that holds a claim, once per pool id, with `count` 0, its claims as extra rows and the refusal text as `problem`; a pooled claim no entry names then carries the refusal text too. A file `gate-router` accepts with a bad `hosts` value lists each `hosts` string that holds a claim with the top-level `slots` and the `hosts` problem's text. A `remote.json` that exists but cannot be read gives every builder pool the problem `remote.json cannot be read: <error>`.
+
+  The `QueueTicket` of a waiter gains `pool` (after `remote`, only when present) and `pinned` (after `pool`, only when true), from the [ticket](#ticket)'s keys.
+
   `DashboardState.covered`, its last key, lists the gates running under a parent gate's slot, from the [covered markers](#covered-marker): `{pid, start, parentPid, command, cwd, since}`, with `start` and `since` as ISO text of 7 fractional digits, sorted by (`since`, `pid`). It holds live markers only, judged by the tickets' pid-and-start check, and is always empty for the `PowerShell` generation.
 
   A `V1` read of the counts takes `v1\slot-counts.json` beside the PowerShell counts path (with `GATE_TEST_SLOT_COUNTS`, `<that file's folder>\v1\slot-counts.json`) and reads it strictly ([Counts file](#counts-file)).
@@ -1030,6 +1038,7 @@ A pid the checking gate may not query is dead too, since it is another user's pr
 | `alone` | bool | optional, written only when true: a critical gate asked for `--alone`, from its first ticket on, kept by the holding rewrite. While a live ticket says it, the beside allowance is 0 for every gate. A ticket without it reads as false, and a build that does not know the key ignores it, so it treats the request as a plain critical one |
 | `remote` | bool | present and true only while queued for the remote pool |
 | `pool` | string | optional, after `remote`: the pool id of the `builders` entry's pool the ticket queues for; absent for `host`'s pool and for a local ticket, so their tickets are unchanged. A build that does not know the key ignores it and counts the ticket as `host`'s, so every gate on a machine is reinstalled together |
+| `pinned` | bool | optional, after `pool`: written only when true, by a run pinned to one builder with `--builder`; a ticket without it reads as not pinned, and a build that does not know the key ignores it. ops-tower shows it as `QueueTicket.pinned` |
 | `reason` | string | optional: the free text the run gave `--reason`; absent when it gave none. A critical (and therefore alone) run always has one, since it is required; a critical gate's rewritten holding ticket keeps it |
 | `expected` | object | optional, last: the same object as a claim's `expected`, written when the gate has history for its command; a critical gate's rewritten holding ticket keeps it; `null` reads as absent |
 
@@ -4067,7 +4076,7 @@ A virtual Cargo workspace (`resolver = "3"`) with every crate under `crates/`, l
 Rules:
 
 - No pure crate's API exposes `windows` or `windows-sys` types; Windows-only code sits in `cfg(windows)` modules. `proc-table` is not a pure crate: its `win32` module's API carries `windows-sys` handle and access-right types.
-- `gate-state` and `proc-table` are also ops-tower's dependencies, by one pinned git rev, so their types unify there.
+- `gate-state` and `proc-table` are also ops-tower's dependencies, by one pinned git rev, so their types unify there. `gate-state` depends on `gate-router` (for `remote.json`'s `builders` and the pool id), so ops-tower's build brings `gate-router` and its `toml` with it.
 - The pure crates are kept buildable off Windows, but nothing builds them there: the repo has no CI.
 
 ## Black-box suite harness

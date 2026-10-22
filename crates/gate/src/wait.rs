@@ -301,6 +301,7 @@ impl<'a> Wait<'a> {
             alone: false,
             remote: pool.is_remote().then_some(true),
             pool: pool.remote_id().map(|id| id.to_string()),
+            pinned: request.builder.is_some().then_some(true),
             reason: request.reason.clone(),
             expected: expected.cloned(),
         };
@@ -1094,6 +1095,7 @@ mod tests {
     use gate_state::v1::{self, Ticket, TicketKind};
     use gate_state::{KernelObject, PoolId, SlotKind, beside_allowance};
 
+    use std::fs;
     use std::time::{Duration, Instant};
 
     use gate_state::v1::ClaimKind;
@@ -1321,9 +1323,79 @@ mod tests {
             alone: false,
             remote: None,
             pool: None,
+            pinned: None,
             reason: None,
             expected: None,
         }
+    }
+
+    #[test]
+    fn a_pinned_run_s_ticket_says_pinned() {
+        let scratch = Scratch::new("pinned-ticket");
+        let mut request = request(Slot::Heavy);
+        request.builder = Some("mac-1".to_owned());
+        let gate = ThisGate::read(&request).expect("this process's start can be read");
+        let mut console = Console::new();
+        let arrival = Arrival {
+            gate: &gate,
+            request: &request,
+            queued: Instant::now(),
+            arrived: gate.start_ms,
+            builder: Some("mac-1"),
+            after_fallback: false,
+            under: None,
+            expected: None,
+        };
+        let host = Host {
+            processors: 4,
+            interrupt: None,
+        };
+        let mac = PoolId::parse("1f0efc62").expect("8 lower-case hex digits are a pool id");
+        let wait = Wait::queue(
+            &scratch.root,
+            Pool::Remote(BuilderPool { slots: 1, id: Some(mac) }),
+            arrival,
+            host,
+            &mut console,
+        );
+        let path = v1::ticket_path(scratch.path(), gate.pid, gate.start_ms);
+        let ticket = v1::read_ticket(&path).expect("the wait wrote its ticket");
+
+        assert_eq!(ticket.pinned, Some(true), "a run pinned to a builder says so, so the queue can show it");
+        assert_eq!(ticket.pool.as_deref(), Some("1f0efc62"), "the pool is its builder's");
+
+        wait.end(&mut console);
+    }
+
+    #[test]
+    fn an_unpinned_run_s_ticket_is_not_pinned() {
+        let scratch = Scratch::new("unpinned-ticket");
+        scratch.one_light_slot();
+        let request = request(Slot::Light);
+        let gate = ThisGate::read(&request).expect("this process's start can be read");
+        let mut console = Console::new();
+        let arrival = Arrival {
+            gate: &gate,
+            request: &request,
+            queued: Instant::now(),
+            arrived: gate.start_ms,
+            builder: None,
+            after_fallback: false,
+            under: None,
+            expected: None,
+        };
+        let host = Host {
+            processors: 4,
+            interrupt: None,
+        };
+        let wait = Wait::queue(&scratch.root, Pool::Local(SlotKind::Light), arrival, host, &mut console);
+        let path = v1::ticket_path(scratch.path(), gate.pid, gate.start_ms);
+        let text = fs::read_to_string(&path).expect("the wait wrote its ticket");
+
+        assert!(!text.contains("pinned"), "a run no pick pinned writes no pinned key: {text}");
+        assert_eq!(v1::read_ticket(&path).expect("the ticket reads").pinned, None);
+
+        wait.end(&mut console);
     }
 
     #[test]

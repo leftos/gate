@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use gate_router::{Builder, BuilderOs, Config, Pattern, ignored_line};
+use gate_router::{Builder, BuilderOs, Config, Pattern, builder_id, ignored_line};
 
 fn reason(text: &str) -> String {
     Config::parse(text).expect_err("the file is unusable")
@@ -794,6 +794,22 @@ fn a_windows_root_is_held_to_layout_names_joined_by_backslashes() {
 /// A routing file whose `host` is `builder-1`, with `builders` holding `builders`.
 fn builders_file(builders: &str) -> String {
     format!(r#"{{"host": "builder-1", "slots": 2, "repos": {{"gate": ["x"]}}, "builders": {builders}}}"#)
+}
+
+#[test]
+fn a_pool_id_is_the_first_four_bytes_of_the_alias_hash() {
+    assert_eq!(builder_id("mac-1"), "1f0efc62", "the first 4 bytes of the SHA-256, as 8 hex digits");
+    assert_eq!(builder_id("MAC-1"), "1f0efc62", "the alias is lower-cased before the hash");
+    let config = Config::parse(&builders_file(
+        r#"[{"host": "MAC-1", "os": "macos", "root": "/Users/me/gate", "routed": false}]"#,
+    ))
+    .expect("usable");
+    let entry = config.builder_entries().next().expect("the file names one entry");
+    assert_eq!(
+        entry.id.as_deref(),
+        Some(builder_id(&entry.alias).as_str()),
+        "an entry's id is the same function's, over its alias as spelled"
+    );
 }
 
 #[test]

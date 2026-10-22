@@ -147,6 +147,7 @@ impl<'a> MachineWait<'a> {
             alone: arrival.request.alone,
             remote: None,
             pool: None,
+            pinned: None,
             reason: arrival.request.reason.clone(),
             expected: arrival.expected.cloned(),
         };
@@ -843,6 +844,7 @@ mod tests {
             alone: false,
             remote: None,
             pool: None,
+            pinned: None,
             reason: None,
             expected: None,
         }

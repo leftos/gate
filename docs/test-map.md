@@ -107,8 +107,8 @@ Suite = `crates/gate/tests/suite/` (binary `suite`, needs `--all-features`; test
 | gate-state archive.rs | `journal` (rollover and archive with concurrent appenders) | state `archive` | no |
 | gate-state durations.rs | `durations` (the `gate` crate's `durations.rs` calls it), `hold`, `journal` | state `durations` (incl. the adjusted p90 and p99, not raised to the wall p50, and needing 5 adjusted samples) | no |
 | gate-state cutover.rs / drain.rs / counts.rs | `cutover`, `launcher` (gate/src/cutover.rs imports `copy_slot_counts_to_v1, powershell_gates, write_cutover_flag`); `counts.rs`'s `write_replacing` (the temp names) also writes the v1 files, so a change there adds `routing` | state `cutover`, `counts`; a unit test inside `counts.rs` for the temp names | no |
-| gate-state tests/state/fixtures/ (captured files, `capture-*.ps1`; the `v1-*-expected.json` pair is hand-written) and tests/state/fixtures.rs | none (the fixtures are captured from `gate.exe` and the PowerShell gate by script and only read by the state tests) | state `fixtures` (incl. `remote_run_journal_from_gate_exe_is_read_into_runs_and_a_split_summary`) | no |
-| gate-state claims.rs / remote.rs / state.rs / win32.rs / journal.rs (reader) | NOT imported by gate src (ops-tower-only, ARCHITECTURE.md Layers; except `normalize_command` from journal.rs, used by `slots.rs`:642 and journal.rs's command text -> `journal`, `slots`) | state tests | no (journal.rs: `journal`, `slots`) |
+| gate-state tests/state/fixtures/ (captured files, `capture-*.ps1`; the `v1-*-expected.json` pair and `remote-builders.json` are hand-written) and tests/state/fixtures.rs | none (the fixtures are captured from `gate.exe` and the PowerShell gate by script and only read by the state tests) | state `fixtures` (incl. `remote_run_journal_from_gate_exe_is_read_into_runs_and_a_split_summary`) | no |
+| gate-state claims.rs / remote.rs / state.rs / win32.rs / journal.rs (reader) | NOT imported by gate src (ops-tower-only, ARCHITECTURE.md Layers; `remote.rs` and `state.rs` read `remote.json` through `gate-router`'s `Config` and `builder_id` for the dashboard's `builders`, so a change in `gate-router`'s `config.rs` reaches them too; except `normalize_command` from journal.rs, used by `slots.rs`:642 and journal.rs's command text -> `journal`, `slots`) | state tests (`slots`, `shape`, `queue` and `fixtures` for the builders read) | no (journal.rs: `journal`, `slots`) |
 | gate-watchdog share.rs / watch.rs | `stall`, `ceiling`, `cores`, `pause`, `diagnostics`, `interrupt`, `boxside` (the box's ceiling and its kill lines) | unit | no (wide) |
 | gate-watchdog cores.rs | `cores`, `journal` (cores fields) | unit | no |
 | gate-watchdog diagnostics.rs | `diagnostics`, `stall`, `ceiling` (`--test-diagnostics-budget-ms` cuts every block) | unit | no |
@@ -215,13 +215,13 @@ Always add `checkout` to any change that touches a suite file or adds a seam.
 | gate-router watch.rs, env.rs | `-E 'package(gate-router) or (binary(suite) and test(/^routing::/))'` |
 | gate-router local.rs | `-E 'package(gate-router) or (binary(suite) and test(/^(routing\|cores)::/)) or (U and test(/^route::/))'` |
 | gate-router list.rs | `-E 'package(gate-router) or (binary(suite) and test(/^routing::/)) or (U and test(/^(route\|remote::payload)::/))'` |
-| gate-router (any) | `-E 'package(gate-router) or (binary(suite) and test(/^(routing\|remote_client\|request\|check\|boxside\|warm)::/)) or (U and test(/^(route\|remote\|check\|boxside)::/))'` (do NOT use `rdeps(gate-router)`: it pulls the full gate package) |
+| gate-router (any) | `-E 'package(gate-router) or package(gate-state) or (binary(suite) and test(/^(routing\|remote_client\|request\|check\|boxside\|warm)::/)) or (U and test(/^(route\|remote\|check\|boxside)::/))'` (do NOT use `rdeps(gate-router)`: it pulls the full gate package; `package(gate-state)` is there because gate-state's builder-pool read calls `Config` and `builder_id`) |
 | gate-state journal_writer/verdict | `-E 'package(gate-state) or (binary(suite) and test(/^(journal\|cores\|nesting\|slots\|critical\|routing\|stall\|launch\|interrupt)::/))'` |
 | gate-state archive | `-E 'package(gate-state) or (binary(suite) and test(/^journal::/))'` |
 | gate-state durations | `-E 'package(gate-state) or (binary(suite) and test(/^(durations\|hold\|journal)::/))'` |
 | gate-state cutover/drain/counts | `-E 'package(gate-state) or (binary(suite) and test(/^(cutover\|launcher)::/))'` |
-| gate-state fixtures and fixtures.rs | `-E 'package(gate-state)'` |
-| gate-state claims/remote/state/win32 (ops-tower-only readers) | `-E 'package(gate-state)'` (no gate suite module reads them; gate src does not import them) |
+| gate-state fixtures and fixtures.rs | `-E 'package(gate-state) or package(gate-router)'` (`remote-builders.json` is read through `gate-router`) |
+| gate-state claims/remote/state/win32 (ops-tower-only readers) | `-E 'package(gate-state) or package(gate-router)'` (the builders read goes through `gate-router`'s `Config`; no gate suite module reads them, and gate src does not import them) |
 | gate-state journal.rs (reader, `normalize_command`) | `-E 'package(gate-state) or (binary(suite) and test(/^(journal\|slots)::/))'` |
 | gate-state v1/root/model/lib | full: `-E 'rdeps(gate-state)'` (includes whole gate suite; accurate, the binary uses v1 on every run) |
 | gate-watchdog share/watch | `-E 'package(gate-watchdog) or (binary(suite) and test(/^(stall\|ceiling\|cores\|pause\|diagnostics\|interrupt\|boxside)::/))'` |

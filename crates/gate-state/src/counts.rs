@@ -107,9 +107,9 @@ fn read_counts_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
-/// The counts file's bytes parsed: `Err` with the reason the gate gives when they are not valid JSON or not a JSON
-/// object.
-fn parse_counts(bytes: &[u8]) -> Result<Map<String, Value>, String> {
+/// The counts file's bytes parsed, as [`read_counts_file`] parses the bytes it reads: `Err` with the reason the gate
+/// gives when they are not valid JSON or not a JSON object.
+pub(crate) fn parse_counts(bytes: &[u8]) -> Result<Map<String, Value>, String> {
     let text = String::from_utf8_lossy(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes));
     // The gate's JSON reader gives no value at all for blank text, which it then refuses as not an object.
     if text.trim().is_empty() {
@@ -424,7 +424,7 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
 }
 
 /// Text as one line, so a problem line stays one line however the message it quotes was wrapped.
-fn prose(text: &str) -> String {
+pub(crate) fn prose(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 

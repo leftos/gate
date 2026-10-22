@@ -1,9 +1,10 @@
 //! The dashboard state assembled from the claim files, the arrival tickets, the counts file, the process table and the
 //! slot mutexes, of the PowerShell gate or of `gate.exe` as the inputs' [`Generation`] says.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 
+use gate_router::builder_id;
 use jiff::{SignedDuration, Timestamp};
 use proc_table::{ProcessInfo, ProcessTable, ProcessTree};
 use regex::Regex;
@@ -14,10 +15,11 @@ use crate::claims::{
 };
 use crate::counts::{PoolCount, pool_count, read_counts_file, state_counts_path};
 use crate::model::{
-    CoveredRun, CriticalState, CwdReader, DashboardState, Generation, MutexProbe, PoolState, QueueTicket, RemotePool, SlotKind, SlotRow, SlotState,
-    StateInputs, Waiting,
+    BuilderPool, CoveredRun, CriticalState, CwdReader, DashboardState, Generation, MutexProbe, PoolState, QueueTicket, RemotePool, SlotKind, SlotRow,
+    SlotState, StateInputs, Waiting,
 };
-use crate::remote::{RemoteCount, read_remote_count, remote_settings_path};
+use crate::remote::{BuilderSetting, RemoteCount, RemoteFile, builder_settings, read_remote_file, remote_count, remote_settings_path};
+use crate::root::PoolId;
 use crate::v1;
 
 /// .NET ticks in a millisecond, the unit of `gate.exe`'s ticket times.
@@ -26,8 +28,9 @@ const TICKS_PER_MILLISECOND: i128 = 10_000;
 pub(crate) const CRITICAL: &str = "critical";
 
 /// The state the Gates tab shows: the critical request, the queue of arrival tickets, each pool's counts, its slots
-/// and, when it is full or a critical request bars it, the gates waiting for it; then the remote pool, when the gate's
-/// `remote.json` or a remote claim file exists. A gate routed to the remote pool shows only as its queue ticket.
+/// and, when it is full or a critical request bars it, the gates waiting for it; then `host`'s remote pool, when the
+/// gate's `remote.json` or a remote claim file exists, and each `builders` entry's own remote pool beside it. A gate
+/// routed to a remote pool shows only as its queue ticket.
 ///
 /// The claims, tickets and counts file are the PowerShell gate's under `gate\` or, for [`Generation::V1`], `gate.exe`'s
 /// under `gate\v1\` and the slots' claims under the PowerShell root, where a missing folder is an empty state.
@@ -75,8 +78,12 @@ pub fn dashboard_state(inputs: &StateInputs, processes: &dyn ProcessTable, mutex
         holders.extend(pool.slots.iter().filter_map(busy_pid));
         pools.push(pool);
     }
-    let remote = machine.remote_pool(inputs);
+    let remote_path = remote_settings_path(inputs);
+    let remote_file = read_remote_file(&remote_path);
+    let remote = machine.remote_pool(inputs, &remote_path, &remote_file);
     holders.extend(remote.iter().flat_map(|pool| pool.slots.iter().filter_map(busy_pid)));
+    let builders = machine.builder_pools(inputs, &remote_file);
+    holders.extend(builders.iter().flat_map(|pool| pool.slots.iter().filter_map(busy_pid)));
     // A gate routed to the remote pool keeps `-Slot heavy`: it shows only as its ticket in the queue, so it is held out
     // of the pools' waiting gates.
     let routed: HashSet<u32> = queue.iter().filter(|ticket| ticket.remote).map(|ticket| ticket.pid).collect();
@@ -105,6 +112,7 @@ pub fn dashboard_state(inputs: &StateInputs, processes: &dyn ProcessTable, mutex
         queue,
         pools,
         remote,
+        builders,
         covered,
     }
 }
@@ -153,6 +161,8 @@ fn ticket_from_v1(ticket: &v1::Ticket) -> Option<Ticket> {
         start_ticks: ticks_of_ms(ticket.start_ms)?,
         arrived_ticks: ticks_of_ms(ticket.arrived)?,
         remote: ticket.remote == Some(true),
+        pool: ticket.pool.clone(),
+        pinned: ticket.pinned.unwrap_or(false),
         exact_start_ms: Some(ticket.start_ms),
         expected: ticket.expected.clone(),
         reason: ticket.reason.clone(),
@@ -392,6 +402,8 @@ impl Table {
             kind: ticket.kind.clone(),
             holds: ticket.holds,
             remote: ticket.remote,
+            pool: ticket.pool.clone(),
+            pinned: ticket.pinned,
             pid: ticket.pid,
             expected: ticket.expected.clone(),
         })
@@ -431,13 +443,12 @@ impl Machine<'_> {
         }
     }
 
-    /// The remote pool, sized by the gate's `remote.json`; `None` while that file is absent and no remote claim file
-    /// exists.
-    fn remote_pool(&self, inputs: &StateInputs) -> Option<RemotePool> {
-        let path = remote_settings_path(inputs);
+    /// The remote pool, sized by the gate's `remote.json` at `path` as `file` read it; `None` while that file is absent
+    /// and no remote claim file exists.
+    fn remote_pool(&self, inputs: &StateInputs, path: &Path, file: &RemoteFile) -> Option<RemotePool> {
         let prefix = format!("{}gate-remote-slot-", inputs.slot_prefix);
         let claimed = self.claimed_indexes(&prefix);
-        let setting = read_remote_count(&path);
+        let setting = remote_count(file, path);
         if setting.is_none() && claimed.is_empty() {
             return None;
         }
@@ -450,6 +461,86 @@ impl Machine<'_> {
             problem,
             slots: self.slot_rows(&prefix, count, claimed),
         })
+    }
+
+    /// The remote pool of each `builders` entry, in `remote.json`'s order as `file` read it; then each `hosts` entry's
+    /// that holds a claim, which only a run pinned to it reaches; then a pool for each pooled claim no entry names, by
+    /// pool id.
+    fn builder_pools(&self, inputs: &StateInputs, file: &RemoteFile) -> Vec<BuilderPool> {
+        let mut claimed = self.pooled_claims(&inputs.slot_prefix);
+        let settings = builder_settings(file);
+        let mut pools: Vec<BuilderPool> = settings
+            .entries
+            .iter()
+            .map(|setting| self.builder_pool(inputs, setting, claimed.remove(&builder_id(&setting.alias)).unwrap_or_default()))
+            .collect();
+        for setting in &settings.hosts {
+            // A `hosts` entry takes no slot until a run pinned to it holds one, so it is listed only while it does.
+            let Some(indexes) = claimed.remove(&builder_id(&setting.alias)) else {
+                continue;
+            };
+            pools.push(self.builder_pool(inputs, setting, indexes));
+        }
+        for (id, indexes) in claimed {
+            let prefix = format!("{}gate-remote-{id}-slot-", inputs.slot_prefix);
+            // A claim no entry names is no orphan when the file names none — it cannot be read, or the gate refuses it
+            // whole: the entry that names it may be missing from what the file gave.
+            let problem = settings
+                .problem
+                .clone()
+                .unwrap_or_else(|| format!("no builders or hosts entry has pool id {id}"));
+            pools.push(BuilderPool {
+                problem: Some(problem),
+                slots: self.slot_rows(&prefix, 0, indexes),
+                id,
+                name: None,
+                host: None,
+                os: None,
+                count: 0,
+                routed: false,
+            });
+        }
+        pools
+    }
+
+    /// The pool of the `builders` or `hosts` entry `setting` names, its slots the claims `claimed` indexes.
+    fn builder_pool(&self, inputs: &StateInputs, setting: &BuilderSetting, claimed: BTreeSet<u32>) -> BuilderPool {
+        let id = builder_id(&setting.alias);
+        let prefix = format!("{}gate-remote-{id}-slot-", inputs.slot_prefix);
+        BuilderPool {
+            slots: self.slot_rows(&prefix, setting.count, claimed),
+            id,
+            name: Some(setting.alias.clone()),
+            host: Some(setting.alias.clone()),
+            os: setting.os.map(str::to_owned),
+            count: setting.count,
+            problem: setting.problem.clone(),
+            routed: setting.routed,
+        }
+    }
+
+    /// The claimed slot indexes of each `builders` pool, by pool id, from the claim files named
+    /// `{prefix}gate-remote-<pool id>-slot-<n>`. The claim map's names are lowered, so the match carries no case: the
+    /// eight digits between the dashes must parse as a pool id ([`PoolId::parse`]) and the rest be a whole number.
+    fn pooled_claims(&self, slot_prefix: &str) -> BTreeMap<String, BTreeSet<u32>> {
+        let prefix = slot_prefix.to_ascii_lowercase();
+        let mut pools: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+        for name in self.claims.keys() {
+            let Some(rest) = name.strip_prefix(prefix.as_str()).and_then(|rest| rest.strip_prefix("gate-remote-")) else {
+                continue;
+            };
+            let Some(at) = rest.find("-slot-") else {
+                continue;
+            };
+            let (pool, slot) = rest.split_at(at);
+            let digits = &slot["-slot-".len()..];
+            let index = digits.parse::<u32>().ok();
+            let Some(index) = index.filter(|_| PoolId::parse(pool).is_some()) else {
+                continue;
+            };
+            pools.entry(pool.to_owned()).or_default().insert(index);
+        }
+        pools
     }
 
     /// The indexes of the claim files whose name is `prefix` and a number, the prefix matched in any letter case.

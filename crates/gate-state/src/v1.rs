@@ -598,6 +598,10 @@ pub struct Ticket {
     /// `host`'s pool and for a local ticket.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool: Option<String>,
+    /// True only for a run pinned to this builder with `--builder`, which no pick chose. Written only when true, so a
+    /// ticket without it is not pinned.
+    #[serde(default, skip_serializing_if = "is_not_true")]
+    pub pinned: Option<bool>,
     /// The free text the run gave `--reason`, for a local, critical or alone run or any run that said one; absent when
     /// it said none.
     #[serde(skip_serializing_if = "Option::is_none")]

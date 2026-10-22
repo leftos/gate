@@ -104,6 +104,7 @@ fn write_ticket(case: &Case, kind: TicketKind, (pid, start): (u32, Timestamp), a
         alone: false,
         remote: remote.then_some(true),
         pool: None,
+        pinned: None,
         reason: None,
         expected: None,
     };

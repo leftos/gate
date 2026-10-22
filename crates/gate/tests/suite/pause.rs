@@ -370,6 +370,7 @@ fn a_pause_marker_is_deleted_when_the_child_is_lent_its_parents_slot() {
         alone: false,
         remote: None,
         pool: None,
+        pinned: None,
         reason: None,
         expected: None,
     };
@@ -573,6 +574,7 @@ fn a_covered_gate_is_not_paused_by_a_sibling_waiting_under_its_parent() {
         alone: false,
         remote: None,
         pool: None,
+        pinned: None,
         reason: None,
         expected: None,
     };

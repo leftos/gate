@@ -274,6 +274,7 @@ fn a_holder_whose_ticket_was_not_deleted_does_not_block_the_queue() {
         alone: false,
         remote: None,
         pool: None,
+        pinned: None,
         reason: None,
         expected: None,
     };
@@ -315,6 +316,7 @@ fn a_waiter_deferring_to_a_gate_that_took_its_slot_does_not_say_it_waits() {
         alone: false,
         remote: None,
         pool: None,
+        pinned: None,
         reason: None,
         expected: None,
     };

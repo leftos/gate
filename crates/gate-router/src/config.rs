@@ -317,6 +317,14 @@ impl Config {
         self.entries.iter().map(|entry| &entry.builder)
     }
 
+    /// Whether `builder`, a `builders` entry as [`Config::builder_entries`] gives it, may be among the builders a pick
+    /// sends a run to: `false` for an entry the file marks `"routed": false`, which only a run pinned to it, `gate push`
+    /// and `gate check` reach. It is `false` too for `host` and for a `hosts` entry, which are no entry of this list.
+    #[must_use]
+    pub fn builder_routed(&self, builder: &Builder) -> bool {
+        self.entries.iter().any(|entry| entry.routed && entry.builder == *builder)
+    }
+
     /// The builder whose alias is `alias` in any ASCII letter case: `host`, else a `builders` entry; `None` for any
     /// other alias, a `hosts` entry among them.
     #[must_use]
@@ -785,7 +793,11 @@ fn root_name(name: &str) -> bool {
 }
 
 /// A `builders` entry's id: the first 8 lower-case hex digits of the SHA-256 of `alias` in ASCII lower case.
-fn builder_id(alias: &str) -> String {
+///
+/// A `hosts` entry's id is the same function over its alias, and the gate names that entry's remote slots, its claims
+/// and its cache folders by it; `host` has none.
+#[must_use]
+pub fn builder_id(alias: &str) -> String {
     let digest = Sha256::digest(alias.to_ascii_lowercase().as_bytes());
     let mut id = String::with_capacity(8);
     id.extend(digest.iter().take(4).map(|byte| format!("{byte:02x}")));

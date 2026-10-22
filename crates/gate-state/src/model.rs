@@ -298,6 +298,9 @@ pub struct DashboardState {
     /// The remote pool, whose slots the gate runs on a build box; `None` while the gate's `remote.json` is absent and no
     /// remote claim file exists.
     pub remote: Option<RemotePool>,
+    /// Each `builders` entry's own remote pool, in `remote.json`'s order; then each `hosts` entry's that holds a claim;
+    /// then a pool for each pooled claim no entry names. [`DashboardState::remote`] stays `host`'s pool.
+    pub builders: Vec<BuilderPool>,
     /// The live gates running under a parent gate's slot, from the covered markers they keep, oldest marker first;
     /// always empty for [`Generation::PowerShell`], whose gate writes none.
     pub covered: Vec<CoveredRun>,
@@ -336,6 +339,30 @@ pub struct RemotePool {
     pub slots: Vec<SlotRow>,
 }
 
+/// A `builders` entry's own remote pool: heavy gates the gate routes to one build box over ssh, its size the entry's
+/// `slots` in the gate's `remote.json`. `host`'s pool is [`RemotePool`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BuilderPool {
+    /// The pool id: the first 8 lower-case hex digits of its alias's SHA-256, which the pool's slot mutex names carry.
+    pub id: String,
+    /// The builder's alias, the ssh destination `remote.json` spells; `None` for a pooled claim no entry names.
+    pub name: Option<String>,
+    /// The builder's ssh destination, as [`BuilderPool::name`]; `None` for a pooled claim no entry names.
+    pub host: Option<String>,
+    /// The builder's operating system, `windows` or `macos` as `remote.json` spells it; `None` when it names neither.
+    pub os: Option<String>,
+    /// The slots gates may take: the entry's `slots`, or 0 for an entry of a file the gate refuses and for a pooled claim
+    /// no entry names.
+    pub count: u32,
+    /// Why the gate refuses `remote.json`, on an entry of a refused one, or the pool id no entry names; `None` otherwise.
+    pub problem: Option<String>,
+    /// Whether a pick may send a run to the builder: `false` for a `hosts` entry, which only a run pinned to it reaches,
+    /// and for a pooled claim no entry names.
+    pub routed: bool,
+    /// The slots `0..count`, plus any slot past the count that has a claim file.
+    pub slots: Vec<SlotRow>,
+}
+
 /// The critical request: who holds the machine and who waits to.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CriticalState {
@@ -357,6 +384,12 @@ pub struct QueueTicket {
     /// True for a heavy gate routed to the remote pool and waiting for a remote slot; serialised only when true.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub remote: bool,
+    /// The id of the `builders` entry's pool the gate queues for; serialised only when the ticket carries one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    /// True for a run pinned to one builder with `--builder`; serialised only when true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
     /// The gate's process id.
     pub pid: u32,
     /// When the gate arrived, ISO 8601 UTC with seven fractional digits.

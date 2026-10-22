@@ -26,7 +26,7 @@ mod rewrite;
 pub mod warm;
 mod watch;
 
-pub use config::{Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAULT_OUTPUTS, ignored_line, is_unix_root, is_usable_host};
+pub use config::{Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAULT_OUTPUTS, builder_id, ignored_line, is_unix_root, is_usable_host};
 pub use decide::{
     BuildSettings, BuildTarget, BuilderWords, CarriedSibling, DROPPED_NO_BUILD_LINE, DotnetTarget, Facts, FolderId, Inputs, LaterCandidate,
     LocalReason, NO_OUTPUTS_LINE, OUTPUT_PROPERTIES, PROJECT_EXTENSIONS, PinRefusal, Place, RemoteRun, Route, SendPlan, SiblingFolder, Slot, Target,

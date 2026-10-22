@@ -5,10 +5,25 @@ use serde_json::Value;
 
 use crate::support::{CRITICAL_GATE, HEAVY_GATE, LIGHT_GATE, Machine, NOW, START, claim, keys, ms, remote_claim, remote_ticket, ticket, ticks};
 
-const TOP: [&str; 8] = ["now", "machine", "processors", "critical", "queue", "pools", "remote", "covered"];
+/// A `remote.json` with two `builders` entries, the macOS `mac-1` whose pool id is `1f0efc62` and the Windows `win-a`.
+const BUILDERS_REMOTE: &str = include_str!("fixtures/remote-builders.json");
+
+const TOP: [&str; 9] = [
+    "now",
+    "machine",
+    "processors",
+    "critical",
+    "queue",
+    "pools",
+    "remote",
+    "builders",
+    "covered",
+];
 const COVERED: [&str; 6] = ["pid", "start", "parentPid", "command", "cwd", "since"];
 const POOL: [&str; 7] = ["kind", "count", "default", "set", "problem", "slots", "waiting"];
 const REMOTE: [&str; 3] = ["count", "problem", "slots"];
+/// A `builders` entry's pool: its id, alias, ssh destination, os, size, problem, routed flag and slots.
+const BUILDER: [&str; 8] = ["id", "name", "host", "os", "count", "problem", "routed", "slots"];
 /// A remote ticket's keys: a ticket's, with `remote` after `holds`.
 const QUEUE_REMOTE: [&str; 8] = ["kind", "holds", "remote", "pid", "arrived", "ageSeconds", "cwd", "commandLine"];
 const SLOT: [&str; 9] = ["index", "name", "state", "claim", "stale", "processes", "lastLine", "critical", "extra"];
@@ -55,6 +70,12 @@ fn assert_shape(value: &Value) {
             assert_eq!(keys(&slot), SLOT);
         }
     }
+    for builder in array(value, "builders") {
+        assert_eq!(keys(&builder), BUILDER);
+        for slot in array(&builder, "slots") {
+            assert_eq!(keys(&slot), SLOT);
+        }
+    }
     for covered in array(value, "covered") {
         assert_eq!(keys(&covered), COVERED);
     }
@@ -91,6 +112,25 @@ fn remote_pool_and_ticket_keys_follow_dashboard_order() {
     claim_keys.extend(["remote", "host", "key"]);
     assert_eq!(keys(busy.get("claim").expect("a busy slot has its claim")), claim_keys);
     assert_eq!(array(&state, "queue").len(), 2);
+}
+
+#[test]
+fn builder_pool_keys_follow_their_order() {
+    let mut machine = Machine::new("builder_pool_keys_follow_their_order");
+    machine.write_remote(BUILDERS_REMOTE);
+    machine.write_claim("gate-remote-1f0efc62-slot-0.json", &remote_claim(800, 0).to_string());
+    machine.add_process(800, 1, "pwsh.exe", Some(HEAVY_GATE), Some(START));
+    let state = serde_json::to_value(machine.state()).expect("the state serialises");
+
+    assert_shape(&state);
+    let builders = array(&state, "builders");
+    assert_eq!(builders.len(), 2, "the file's two builders entries");
+    let mac = builders.first().expect("mac-1's pool is first");
+    assert_eq!(keys(mac), BUILDER);
+    let busy = array(mac, "slots").into_iter().next().expect("mac-1's slot 0 is listed");
+    let mut claim_keys = CLAIM.to_vec();
+    claim_keys.extend(["remote", "host", "key"]);
+    assert_eq!(keys(busy.get("claim").expect("a busy slot has its claim")), claim_keys);
 }
 
 #[test]
