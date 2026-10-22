@@ -31,6 +31,64 @@ fn live_claim_is_busy_with_descendants_and_last_line() {
     assert_eq!(row.extra, Some(false));
 }
 
+/// The heavy slot's last log line for a claim of pid 100 whose log holds `log`.
+fn last_log_line(test: &str, log: &str) -> Option<String> {
+    let mut machine = Machine::new(test);
+    let path = machine.dir.join("build.log");
+    fs::write(&path, log).expect("the log can be written");
+    let claim = claim(100, Some(path.to_str().expect("the log path is text")), "C:\\elsewhere");
+    machine.write_claim("gate-slot-1.json", &claim.to_string());
+    machine.add_process(100, 1, "pwsh.exe", None, Some(START_CLOSE));
+    machine.open.insert("gate-slot-1".to_owned());
+
+    heavy_slot(&machine, 1).last_line
+}
+
+#[test]
+fn stamped_log_last_line_is_the_text_after_the_tag() {
+    let log = concat!(
+        "2026-10-22T11:18:27.735525-07:00 gat gate pid=100 ppid=1\n",
+        "2026-10-22T11:18:31.287046-07:00 out [main 58dcf94] docs: a change\n",
+        "2026-10-22T11:18:31.287056-07:00 out  1 file changed, 2 insertions(+)\n",
+    );
+
+    assert_eq!(
+        last_log_line("stamped_log_last_line_is_the_text_after_the_tag", log).as_deref(),
+        Some(" 1 file changed, 2 insertions(+)")
+    );
+}
+
+#[test]
+fn stamped_log_last_line_passes_over_process_lines() {
+    let log = concat!(
+        "2026-10-22T11:18:31.287046-07:00 out [main 58dcf94] docs: a change\n",
+        "2026-10-22T11:18:31.287056-07:00 out  1 file changed, 2 insertions(+)\n",
+        "2026-10-22T11:18:31.287962-07:00 gat exit pid=10220 code=0 ran=3.418502s\n",
+        "2026-10-22T11:18:31.288000-07:00 gat spawn pid=4 ppid=100 git.exe\n",
+        "2026-10-22T11:18:31.289000-07:00 gat left pid=4 (still running at the end of the watch)\n",
+        "2026-10-22T11:18:31.300000-07:00 out\n",
+    );
+
+    assert_eq!(
+        last_log_line("stamped_log_last_line_passes_over_process_lines", log).as_deref(),
+        Some(" 1 file changed, 2 insertions(+)")
+    );
+}
+
+#[test]
+fn stamped_log_last_line_keeps_a_gate_note() {
+    let log = concat!(
+        "2026-10-22T11:18:31.287046-07:00 out [main 58dcf94] docs: a change\n",
+        "2026-10-22T11:18:31.287056-07:00 out  1 file changed, 2 insertions(+)\n",
+        "2026-10-22T11:18:31.295548-07:00 gat gate: passed in 3 s\n",
+    );
+
+    assert_eq!(
+        last_log_line("stamped_log_last_line_keeps_a_gate_note", log).as_deref(),
+        Some("gate: passed in 3 s")
+    );
+}
+
 #[test]
 fn claim_with_mismatched_process_start_is_stale() {
     let mut machine = Machine::new("claim_with_mismatched_process_start_is_stale");
@@ -142,10 +200,10 @@ fn relative_claim_log_resolves_against_claim_cwd() {
 }
 
 #[test]
-fn last_line_reads_only_the_final_4096_bytes() {
-    let mut machine = Machine::new("last_line_reads_only_the_final_4096_bytes");
+fn last_line_reads_only_the_final_64_kib() {
+    let mut machine = Machine::new("last_line_reads_only_the_final_64_kib");
     let log = machine.dir.join("long.log");
-    let line = format!("start-{}-end", "x".repeat(5000));
+    let line = "x".repeat(70_000);
     fs::write(&log, format!("earlier\n{line}\n")).expect("the log can be written");
     machine.write_claim(
         "gate-slot-0.json",
@@ -155,11 +213,11 @@ fn last_line_reads_only_the_final_4096_bytes() {
 
     let row = heavy_slot(&machine, 0);
 
-    let tail = line.get(line.len() - 4095..).expect("the line is longer than the tail");
+    let tail = line.get(line.len() - 65_535..).expect("the line is longer than the tail");
     assert_eq!(
         row.last_line.as_deref(),
         Some(tail),
-        "the final 4096 bytes are the line's last 4095 and its newline"
+        "the final 65536 bytes are the line's last 65535 and its newline"
     );
 }
 

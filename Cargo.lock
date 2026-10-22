@@ -278,6 +278,7 @@ dependencies = [
  "flate2",
  "gate-args",
  "gate-router",
+ "gate-wire",
  "jiff",
  "proc-table",
  "proptest",

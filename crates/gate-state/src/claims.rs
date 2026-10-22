@@ -6,14 +6,15 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use gate_wire::stamp::{Tag, is_process_line, unstamped};
 use jiff::Timestamp;
 use serde_json::{Map, Value};
 
 use crate::counts::powershell_text;
 use crate::root::PoolId;
 
-/// How much of a log's end is read for its last line.
-const LOG_TAIL_BYTES: u64 = 4096;
+/// How much of a log's end is read for its last line: a busy build's last few KiB can be all process lines.
+const LOG_TAIL_BYTES: u64 = 64 * 1024;
 /// How far a live process's start may be from the one its PowerShell claim records, in nanoseconds (2 s).
 const CLAIM_START_TOLERANCE_NANOS: i128 = 2_000_000_000;
 /// How far a live process's start may be from its PowerShell ticket's `startTicks`, in .NET ticks (2 s).
@@ -303,7 +304,8 @@ fn unreadable(message: &str) -> Claim {
     Claim::Unreadable(Value::Object(object))
 }
 
-/// The last non-blank line of the log, read from its final 4 KB without locking out the gate that writes it; `None`
+/// The last non-blank line of the log, read from its final 64 KB without locking out the gate that writes it, as its
+/// text after its stamp and tag: a `gat` process line is passed over, and a line with no stamp is read whole. `None`
 /// when there is no log or no such line, or `(could not read the log: <why>)`.
 pub(crate) fn last_log_line(path: Option<&Path>) -> Option<String> {
     let path = path?;
@@ -317,9 +319,11 @@ pub(crate) fn last_log_line(path: Option<&Path>) -> Option<String> {
     let mut last = None;
     for line in text.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
-        if !line.trim().is_empty() {
-            last = Some(line);
+        let parts = unstamped(line);
+        if parts.text.trim().is_empty() || (parts.tag == Some(Tag::Gat) && is_process_line(parts.text)) {
+            continue;
         }
+        last = Some(parts.text);
     }
     last.map(str::to_owned)
 }
