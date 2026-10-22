@@ -37,8 +37,8 @@ pub fn action(args: Vec<OsString>) -> Action {
 #[must_use]
 pub fn unbuilt(verb: BoxVerb) -> Option<String> {
     match verb {
-        BoxVerb::Preflight | BoxVerb::Boot | BoxVerb::Stop | BoxVerb::Run | BoxVerb::Prune => None,
-        BoxVerb::Outputs | BoxVerb::Inflight | BoxVerb::Inputs | BoxVerb::Lfs | BoxVerb::RegisterDesktop => {
+        BoxVerb::Preflight | BoxVerb::Boot | BoxVerb::Stop | BoxVerb::Run | BoxVerb::Prune | BoxVerb::Inputs => None,
+        BoxVerb::Outputs | BoxVerb::Inflight | BoxVerb::Lfs | BoxVerb::RegisterDesktop => {
             Some(format!("gate: box {} is not built on this builder", verb.as_str()))
         }
     }
@@ -106,6 +106,7 @@ fn answer(action: Action, console: &mut crate::console::Console) -> u8 {
         BoxVerb::Preflight => crate::preflight::preflight(&payload, console),
         BoxVerb::Stop => crate::stop::stop(&payload, console),
         BoxVerb::Boot => crate::boot::status(crate::boot::say(console)),
+        BoxVerb::Inputs => crate::inputs::inputs(&payload, &request.seams, console),
         BoxVerb::Run => {
             // The run says its lines through an output its threads share; the console says nothing more.
             let output = std::sync::Arc::new(crate::console::Output::new(crate::console::StdioSink));
@@ -152,6 +153,7 @@ mod tests {
         assert_eq!(action(words("box boot --stdin")), verb(BoxVerb::Boot));
         assert_eq!(action(words("box stop --stdin")), verb(BoxVerb::Stop));
         assert_eq!(action(words("box run --stdin")), verb(BoxVerb::Run));
+        assert_eq!(action(words("box inputs --stdin")), verb(BoxVerb::Inputs));
     }
 
     #[cfg(feature = "test-seams")]
@@ -206,16 +208,17 @@ mod tests {
 
     #[test]
     fn the_built_verbs_are_answered_and_the_others_are_not_built_here() {
-        for verb in [BoxVerb::Preflight, BoxVerb::Boot, BoxVerb::Stop, BoxVerb::Run, BoxVerb::Prune] {
+        for verb in [
+            BoxVerb::Preflight,
+            BoxVerb::Boot,
+            BoxVerb::Stop,
+            BoxVerb::Run,
+            BoxVerb::Prune,
+            BoxVerb::Inputs,
+        ] {
             assert_eq!(unbuilt(verb), None, "{verb:?}");
         }
-        for verb in [
-            BoxVerb::Outputs,
-            BoxVerb::Inputs,
-            BoxVerb::Lfs,
-            BoxVerb::Inflight,
-            BoxVerb::RegisterDesktop,
-        ] {
+        for verb in [BoxVerb::Outputs, BoxVerb::Lfs, BoxVerb::Inflight, BoxVerb::RegisterDesktop] {
             assert_eq!(
                 unbuilt(verb),
                 Some(format!("gate: box {} is not built on this builder", verb.as_str())),

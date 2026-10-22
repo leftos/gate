@@ -17,7 +17,7 @@ use gate_wire::{PairSibling, PathForm, Payload, Refusal, bare_stem, busy_line, e
 use gate_watchdog::Pump;
 
 use crate::back::{self, BackFailed};
-use crate::beneath::Folder;
+use crate::beneath;
 use crate::command::{Launch, Sampler, command_record, run_command};
 use crate::console::{Forwarding, LineSink, Output, Stream};
 use crate::files::{self, HeldLock, Locked};
@@ -39,16 +39,16 @@ pub const REFUSED_STATUS: u8 = 75;
 
 /// What a run asks for that this builder does not build, refused with the tag of its refusal.
 #[derive(Clone, Copy, Debug)]
-struct Unbuilt {
-    refusal: Refusal,
+pub(crate) struct Unbuilt {
+    pub(crate) refusal: Refusal,
     /// The payload key that asks for it.
-    key: &'static str,
+    pub(crate) key: &'static str,
 }
 
 impl Unbuilt {
     /// The line said after the refusal's tag: the layout line naming the repo of the bare repository `bare` for a
     /// `layout` refusal ([`layout_line`]), else `gate: remote <key> is not built on this builder`.
-    fn line(self, bare: &str) -> String {
+    pub(crate) fn line(self, bare: &str) -> String {
         let why = format!("{} is not built on this builder", self.key);
         if self.refusal == Refusal::Layout {
             layout_line(repo_name(bare), &escaped(&why))
@@ -898,7 +898,7 @@ fn root_checked(request: &Request<'_>) -> Result<(), (String, u8)> {
 
 /// The name routing gives the repo of the bare repository `bare`: the stem of `<name>.git` ([`bare_stem`]), or the
 /// bare repository's whole file name when it is not of that form.
-fn repo_name(bare: &str) -> &str {
+pub(crate) fn repo_name(bare: &str) -> &str {
     let (folder, file) = bare.rsplit_once('/').unwrap_or(("", bare));
     bare_stem(bare, folder, PathForm::Unix).unwrap_or(file)
 }
@@ -1117,12 +1117,13 @@ fn work_relaid(laying: &Laying<'_>) -> Result<bool, NotLaidOut> {
 }
 
 /// Removes every child of the work folder `work`, each as itself, beneath the folder's own descriptor: the folder
-/// opened with a link at it never followed, listed from that descriptor, and each child removed beneath it, a folder
-/// with all it holds and a link never followed ([`Folder::remove_child_tree`]). Else why one could not be removed or
-/// the folder not opened or listed, a link at `work` included.
+/// reached beneath its judged root and `<root>/work`, a link at any of them never followed
+/// ([`beneath::work_beneath_root`]), listed from that descriptor, and each child removed beneath it, a folder with all
+/// it holds and a link never followed ([`beneath::Folder::remove_child_tree`]). Else why one could not be removed or the folder
+/// not opened or listed, a link at `work` or an untrusted root included.
 fn work_cleared(work: &Path) -> Result<(), NotLaidOut> {
     let unlisted = |error: io::Error| NotLaidOut::Refused(format!("cannot list {}: {error}", work.display()));
-    let folder = Folder::open(work).map_err(unlisted)?;
+    let folder = beneath::work_beneath_root(work).map_err(unlisted)?;
     for name in folder.entries().map_err(unlisted)? {
         folder
             .remove_child_tree(&name)

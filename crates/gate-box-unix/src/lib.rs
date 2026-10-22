@@ -27,6 +27,8 @@ pub mod files;
 #[cfg(unix)]
 pub mod git;
 #[cfg(unix)]
+pub mod inputs;
+#[cfg(unix)]
 pub mod preflight;
 #[cfg(unix)]
 pub mod probe;

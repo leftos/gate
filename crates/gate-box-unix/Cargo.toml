@@ -26,6 +26,7 @@ test-seams = ["gate-args/test-seams", "gate-wire/test-seams"]
 
 [dependencies]
 gate-args = { path = "../gate-args" }
+gate-inputs = { path = "../gate-inputs" }
 gate-watchdog = { path = "../gate-watchdog" }
 gate-wire = { path = "../gate-wire" }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }

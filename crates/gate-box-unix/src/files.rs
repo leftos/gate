@@ -47,6 +47,37 @@ pub fn read_plain_dated(path: &Path, limit: u64) -> io::Result<(Vec<u8>, SystemT
     Ok((bytes, metadata.modified()?))
 }
 
+/// Opens `path` as [`read_plain`] does and reads it whole: a plain file of one name of no more than `cap` bytes, a
+/// longer one refused, never cut short.
+///
+/// # Errors
+///
+/// The open (a missing file is `NotFound`), the read, or `path` not being a plain file of one name of at most `cap`
+/// bytes, each said.
+pub fn read_whole(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::other("it is not a plain file"));
+    }
+    if metadata.nlink() != 1 {
+        return Err(io::Error::other(format!("it has {} names", metadata.nlink())));
+    }
+    let longer = || io::Error::other(format!("it is longer than {cap} bytes"));
+    if metadata.len() > cap {
+        return Err(longer());
+    }
+    let mut bytes = Vec::new();
+    file.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(longer());
+    }
+    Ok(bytes)
+}
+
 /// Removes the file `path`; a missing one is fine.
 ///
 /// # Errors

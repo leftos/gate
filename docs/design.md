@@ -3532,6 +3532,8 @@ Built verbs:
 
   Caps: an archive of more than 50,000 members, or that decompresses to more than 4 GiB (`--test-inputs-budget-bytes` replaces it), is refused as the outputs archive's are, and the put fails (`gate: remote inputs put failed: <why>`, exit 1). The step is not watched on the box; the PC watches both calls ([The remote client's run](#routing), Inputs).
 
+  The Unix box answers `inputs` too, with descriptors for handles and its own stage, modes and record fields (Unix box differences: [The Unix box](#the-unix-box), `inputs`); it does not yet check the run's `InputsDigest`, and refuses `SentBin`.
+
   A payload with a `SentBin`, `<project>/bin/<configuration>` below `Work` (`/`-separated, a plain path whose second-last name is `bin`, else `gate: box payload SentBin is not a plain <project>/bin/<configuration> path: <value>` and exit 2), sends the PC's build of that project instead of the repo's inputs.
 
   It installs into its own record, `<Work>.sent-build`, of the inputs record's format and with its own digest, beside `<Work>.inputs`; a layout change removes both records before it clears `Work`.
@@ -3777,7 +3779,9 @@ A missing, disabled or different task is a refusal whose why names the fix.
 
 A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It speaks the box side's wire above, so the PC's client reads both alike: `gate-box --version` prints the same `gate <version>` text, and `gate-box box <verb> --stdin` reads the request as `gate box` does and parses it with `gate-wire` under `PathForm::Unix`. This section lists only where it differs.
 
-- **Verbs.** `preflight`, `boot`, `run`, `stop` and `prune` are built. `run` readies the tree, runs the command under the watch and syncs the tree back (below), in the Windows box's order, the dotnet tool restore (below) included; the pnpm, bun and npm package restores are not built (GATE-648). Every other verb says `gate: box <verb> is not built on this builder` and exits 2.
+- **Verbs.** `preflight`, `boot`, `run`, `stop`, `prune` and `inputs` are built. `run` readies the tree, runs the command under the watch and syncs the tree back (below), in the Windows box's order, the dotnet tool restore (below) included; the pnpm, bun and npm package restores are not built (GATE-648). Every other verb (`outputs`, `inflight`, `lfs`, `register-desktop`) says `gate: box <verb> is not built on this builder` and exits 2.
+
+  The run's `InputsDigest` check is not built: a run whose payload carries an `InputsDigest` is still refused (`gate-remote-refused: <nonce> inputs`, then `gate: remote InputsDigest is not built on this builder`, status 75), as are `SentDigest` and `LfsDigest`, so the PC runs it itself even where `box inputs` has installed the inputs.
 
   It has no install tripwire, no desktop helper and no MSYS keeper. Its `test-seams` feature passes `gate-args`' hidden `--test-*` seams through, given before the verb; `--test-heartbeat-ms`, `--test-box-sample-ms`, `--test-box-sampler-fail` and `--test-box-free-percent` reach `box run`.
 - **`boot`** reads `kern.boottime` and prints the same line, with the same format.
@@ -3813,7 +3817,8 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   | `<key>.lock` | the work lock | keeps; the keyed prune removes one it made |
   | `<key>.pgid`, `<key>.tools.pgid` | the git steps' and the tool restore's process groups | read first (a live group keeps the key), then removes |
   | `<key>.command`, `<key>.tools` | the command record, the tool manifests' hash | removes before the rename |
-  | `<key>.warm`, `<key>.packages`, `<key>.inputs`, `<key>.sent-build` | not written by the Unix box (named so a later writer needs no prune change) | removes before the rename |
+  | `<key>.inputs` | the `inputs` verb's record of installed inputs | removes before the rename |
+  | `<key>.warm`, `<key>.packages`, `<key>.sent-build` | not written by the Unix box (named so a later writer needs no prune change) | removes before the rename |
   | `<key>.layout` | the layout record (`single`, `pair ...`) | marks `changing`, removes after the rename |
   | `<key>.index`, `<key>.index.lock` | the back commit's copied index and git's lock on it | removes after the rename |
   | `<key>.<name>.gate-new-<pid>-<n>` | a record write cut short | removes after the rename |
@@ -3852,6 +3857,37 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
      A non-zero bootout exit (launchctl says 36 while the old process is still ending) never fails the step: it logs `bootout of dev.gate.prune-work said <n>; waiting for it to go` and waits up to 10 s, polling `launchctl print` every 0.5 s, for the job to go, else the step fails with `system/dev.gate.prune-work was still loaded 10 s after launchctl bootout`. Then it runs `launchctl bootstrap system <plist>`.
 
   Without `--system` the step logs a `would ...` line for each of these (naming `{builder user}` and `{builder home}` in the plist text) and SKIP.
+- **`inputs`** (`inputs.rs`) answers the Windows box's `inputs` ([The box side](#the-box-side)), step `diff` or `put`, with the same request, stdin, record format, exclude file, caps and `gate-remote-inputs:` lines; this lists where the Unix box differs. The run's `InputsDigest` check is not built (see Verbs), so a run carrying a digest is refused until it is.
+
+  A `Pair` is refused as there (`gate box: inputs for a sibling pair are not taken yet`, exit 2) and a `Step` that is neither word is `gate: box payload Step is not diff or put: <value>` (exit 2). A payload with a `SentBin` is refused after the request is read and before stdin is: `gate-remote-refused: <nonce> sent`, then `gate: remote SentBin is not built on this builder`, status 75.
+
+  The step failures (`gate: remote inputs <step> failed: <why>`, exit 1) the Unix box adds to the Windows box's are: `the work folder lock <lock> is no longer held`, `the stage <path> is on another volume than the work folder <work>`, `its staged copy changed after the unpack`, `what is at its name after the move is not its staged copy`, `'<prefix>' is the work folder's .git`, `<path> changed before the record was sealed` and `<path> cannot be opened before the record is sealed: <error>`.
+
+  A member spelt otherwise than the manifest, in letter case alone included, is `the archive's member '<path>' is not in the manifest`. A copy whose device and inode match a manifest file found at its own spelling is never swept, and every recorded file is opened again and its stamp checked just before the record is sealed.
+
+  The work root, `<root>/work` and the bare repository are judged as a run judges them, before the lock, and a refusal says the run's line and status. Both steps take `<Work>.lock` as `run` does (a held lock is `busy`, 75) and lay the work folder out as a run of one repo does, so a later run finds the layout unchanged and clears nothing. An earlier run's group record still naming a live group refuses `busy` (75) before anything is laid out, as it refuses a run.
+
+  Every name below the work folder or a stage is reached beneath its folder's descriptor, one name at a time, a link never followed (`beneath.rs`, with `inputs.rs`'s walk). The work folder is itself reached beneath its judged root and `<root>/work`. A file below the work folder arrives by a rename over its name and leaves by an unlink, never written through.
+
+  A folder on its way that is a link or a file refuses the put (`cannot install '<path>': ...`); the work folder's `.git` is never walked through. Files the box makes are mode 0600 and folders 0700 whatever the umask.
+
+  The put's stage is `<root>/inputs-stage/<key>-<nonce>`, with `<key>-<nonce>.lock` beside it, held with a non-blocking `flock` for the put's whole life and removed with the stage on every way out.
+
+  The stages folder is made 0700 or adopted only when it is the box user's own with no group or other bit (`cannot use <path>: its owner or mode is not the box's; remove it`; a link or non-folder is `<path> is a link or not a folder`); the stage and its lock file are made new, never adopted, and the stage must be on the work folder's volume (`the stage <path> is on another volume than the work folder <path>`).
+
+  Before it makes its own, a put sweeps the stages folder: a stage whose lock file was last written over 24 hours ago and that no live put holds (the sweep takes its `flock`) is removed with that file, as is a stage with no lock file whose own last write is over 24 hours old.
+
+  A stage it cannot look at, open or lock stays (`gate: remote kept the stage <path>: <why>`), one it cannot remove says `gate: remote could not remove the old stage <path>: <error>`, and a folder it cannot list says `gate: remote could not list <path>: <error>`, each on stderr.
+
+  The record `<Work>.inputs` is the Windows box's, holding per file its path, size, SHA-256, the mtime in nanoseconds (`modified`) and the file's `id`, `{dev}-{ino}`. A diff trusts a copy whose size, mtime and id match and never one whose mtime is negative. A record over 128 MiB (twice the manifest's limit) is not read, and one that would be is not written (`cannot write <path>: the record would be longer than <n> bytes`); an unreadable one is removed as the Windows record is.
+
+  A member is installed only under the manifest's exact spelling of its path: one spelt otherwise, in case alone included, is `the archive's member '<path>' is not in the manifest`. The exclude file is written to a new `exclude.gate-new-<pid>-<n>` beside it and renamed over it, and a folder at its name is moved aside to `exclude.gate-moved-<n>` as on the Windows box.
+
+  The lines are the Windows box's: `gate-remote-inputs: need <n>`, `gate-remote-inputs: path <path>`, `gate-remote-inputs: installed <n>` and `gate: remote inputs <diff|put> failed: <why>` (exit 1).
+
+  The record and exclude lines are `gate: remote kept the stale input <path>: <why>`, `gate: remote could not remove the stale input <path>: <error>`, `gate: remote inputs record <path> <why>; every copy is hashed`, `gate: remote removed the inputs record <path>, which cannot be read: <error>; every copy is hashed` and `gate: remote moved aside the folder <old> to <new>`.
+
+  The 50,000-member and 4 GiB caps and the `--test-inputs-budget-bytes` seam are the Windows box's.
 - **Commands' `PATH`.** The programs the box starts (the probes, `dotnet --list-sdks`, the git steps of `box run` with its back commit, and the routed command) run along the `PATH` of the box user's login shell, since a non-login ssh command lacks the toolchains' folders: `$SHELL -l -c` of `/usr/bin/printf '\0__GATE_LOGIN_{16 hex}__\0'; /usr/bin/env -0` (`/bin/zsh` when `SHELL` is unset), 10 s, nothing cached between runs. The same one start also gives the builder's `GATE_GODOT_ROOT` (below). `run` reads it once, just before its first git step and after the usage, unbuilt, Rosetta, root, busy, sweep, earlier-group and layout-file checks, so a run those checks end starts no login shell and says no path line. The git steps of `run` keep it in their environment, so a git-lfs filter is found along it, and the command is found along it; the preflight's git steps do not (they run the ssh `PATH`, with git itself found by its absolute path, below). Empty and relative entries of the login `PATH` are dropped. When it cannot be read the box keeps the ssh `PATH` and says `gate: remote path: could not read the login shell's PATH: <why>; using the ssh PATH` on stderr; a `PATH` with no absolute folder left is such a failure, with `<why>` `said a PATH with no absolute folder`. Each program runs in a process group of its own, which a deadline kills with `SIGKILL`; a git step's ending is under "The run's git steps" below.
 
   The marker is made per call from the box's process id and the time, so nothing a login profile prints can pass for it. The two programs are given by absolute path with single-quoted words and expand no variable, so the command parses alike under any login shell (fish, tcsh, a profile with `set -u`).
@@ -3874,7 +3910,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   A pair preflight says `gate: remote created <root>/<name>.git` for each missing bare, the main one first, readies no tree, and says `gate: remote new work tree` when the layout record names another layout. The record `<Work>.layout` holds `pair <leaf> <siblings sorted ignoring case>` or `single`, and `changing` while the folder is cleared; a run whose layout differs clears the whole work folder, `.tools` kept. A link at a pair tree refuses the run `layout`.
 
-  The clear (`run.rs`, `beneath.rs`) removes `<Work>.warm` and `<Work>.inputs` first, whether or not the folder is there, then writes `changing`. It then opens `<Work>` with a link at it refused and removes each child beneath that folder's descriptor, a folder with all it holds, a link or a fifo as itself and never followed; every open is `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`.
+  The clear (`run.rs`, `beneath.rs`) removes `<Work>.warm` and `<Work>.inputs` first, whether or not the folder is there, then writes `changing`. It then opens `<Work>` beneath its judged root and `<root>/work`, a link at any of the three refused, and removes each child beneath that folder's descriptor, a folder with all it holds, a link or a fifo as itself and never followed; every open is `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`.
 
   A `<Work>` that is a link, or cannot be opened or listed, refuses the run `layout` with `cannot list <Work>: <error>`; a child that stays says `cannot remove <path>: <error>`.
 
@@ -4083,7 +4119,7 @@ A virtual Cargo workspace (`resolver = "3"`) with every crate under `crates/`, l
 | `proc-table` | The process snapshot model (`ProcessInfo`, `ProcessTable`, `ProcessTree`) and its Windows reader. Moved with `gate-state` (GATE-4). | yes; its `win32` module is Windows-only |
 | `gate-win32` | The Win32 layer: job objects, process creation, named mutexes and events, priority, console, the registration of the desktop helper's Task Scheduler task and the start of a registered one in a given session (`task.rs`, through COM), the WSL VM's CPU reader, the samples the watchdog consumes. | no |
 | `gate-desktop` | The desktop helper exe and the pipe protocol the box speaks with it and its exit codes. | no |
-| `gate-box-unix` | The Unix box, bin `gate-box` ([The Unix box](#the-unix-box)): `box preflight`, `boot`, `run`, `stop` and `prune` for a macOS builder, with the process helpers, the CPU source (`cpu.rs`), the heartbeat (`heartbeat.rs`), the backstop watch (through `gate-watchdog`) and the back commit (`back.rs`). Its verbs and helpers are `cfg(unix)`; on another target the bin says `gate-box: runs only on a Unix builder` and exits 1. | yes; the verbs are Unix only |
+| `gate-box-unix` | The Unix box, bin `gate-box` ([The Unix box](#the-unix-box)): `box preflight`, `boot`, `run`, `stop`, `inputs` and `prune` for a macOS builder, with the process helpers, the CPU source (`cpu.rs`), the heartbeat (`heartbeat.rs`), the backstop watch (through `gate-watchdog`) and the back commit (`back.rs`). Its verbs and helpers are `cfg(unix)`; on another target the bin says `gate-box: runs only on a Unix builder` and exits 1. | yes; the verbs are Unix only |
 | `gate-wire` | The box request payload both the PC client and every box parse (`PathForm::Windows` or `Unix`), and the gate's version text `build_version` with the version parse the tool probes share (`version_of`, `first_version`). | yes; a pure crate |
 | `gate-inputs` | What the Windows box and the Unix box must judge alike about a routed run's inputs and outputs: the path-name rules (`names`), the stream SHA-256 (`hash`) and the manifest (`Manifest`, `Held`, `Stamp`, `read_sent`, and `refused_path`, the check of the paths a sent manifest names) and the archive member reader (`archive`: `read_members`, its limits and refusals, and the `Place` trait each box writes through), the archive writer's core (`pack`: `Packer`, `Packed`, `window_log`), the output globs (`glob`: `Globs`, `regex_upto`) and the walk's result types (`walk`: `Found`, `Walked`, `relative_path`); `manifest` also holds `Listing`, `Chosen`, `select` and `hash_possible_copies`. No OS calls. | yes; a pure crate |
 | `gate-watchdog` | Free-share, load-adjusted clock, stall, ceiling and backstop arithmetic over samples with the kill lines, and the box heartbeat, on an injected clock; the cores-hint verdict. | yes; a pure crate |
