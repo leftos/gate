@@ -1133,6 +1133,7 @@ impl Run<'_> {
             Route::Routed(remote) => Some(RemoteTag {
                 host: remote.builder.alias.clone(),
                 key: remote.key.clone(),
+                critical_pid: None,
             }),
             Route::Local { .. } | Route::Refused(_) => None,
         };
@@ -1477,6 +1478,7 @@ impl Run<'_> {
         self.tag = Some(RemoteTag {
             host: next.builder.alias.clone(),
             key: next.key.clone(),
+            critical_pid: None,
         });
         Ok(next)
     }

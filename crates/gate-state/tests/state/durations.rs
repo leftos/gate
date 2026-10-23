@@ -793,6 +793,7 @@ impl Release<'_> {
         let tag = self.host.map(|host| RemoteTag {
             host: host.to_owned(),
             key: "repo-1234".to_owned(),
+            critical_pid: None,
         });
         journal_line(&identity, ts(self.time), &event, tag.as_ref(), None)
     }

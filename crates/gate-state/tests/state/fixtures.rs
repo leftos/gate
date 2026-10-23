@@ -525,6 +525,7 @@ fn captured_exit_0_row() -> HistoryRun {
         abandoned: Vec::new(),
         remote_take: None,
         cold: None,
+        critical_pid: None,
     }
 }
 
@@ -558,6 +559,7 @@ fn captured_exit_3_row() -> HistoryRun {
         abandoned: Vec::new(),
         remote_take: None,
         cold: None,
+        critical_pid: None,
     }
 }
 
@@ -616,6 +618,7 @@ fn powershell_journal_is_read_into_runs() {
         abandoned: Vec::new(),
         remote_take: None,
         cold: None,
+        critical_pid: None,
     };
     assert_eq!(history.runs[4], exit_0);
     assert_eq!(

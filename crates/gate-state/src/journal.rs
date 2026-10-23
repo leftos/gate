@@ -155,6 +155,11 @@ pub struct HistoryRun {
     /// as `cold`, absent for `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cold: Option<bool>,
+    /// The gate of the critical request whose barrier sent this light run to a builder: the `criticalPid` of the run's
+    /// latest remote line; `None` for any other run and once a fallback brought the run back. Serialized as
+    /// `criticalPid`, absent for `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub critical_pid: Option<u32>,
 }
 
 /// The remote slot a routed run held before it fell back to run here: the `take` of its remote attempt, and when the
@@ -276,6 +281,8 @@ struct Run {
     fallback: Option<String>,
     /// Whether the run's release says it was routed to a builder with a cold work folder: the release line's `cold`.
     cold: Option<bool>,
+    /// The gate of the critical request whose barrier sent the run to a builder, from its latest remote line.
+    critical_pid: Option<u32>,
     /// The free text the run's `queue` line carries from `--reason`; the first such line's when more than one names one.
     reason: Option<String>,
     /// The remote take a fallback ended, kept for the reader: its start and wait, and when the run fell back.
@@ -339,6 +346,9 @@ struct Line {
     /// Whether the run was routed to a builder with a cold work folder: read from a `release` line only.
     #[serde(default)]
     cold: Option<bool>,
+    /// The gate of the critical request whose barrier sent the run to a builder: read from any line that names it.
+    #[serde(default)]
+    critical_pid: Option<u32>,
     #[serde(default)]
     parent_pid: Option<u32>,
     #[serde(default)]
@@ -601,6 +611,7 @@ impl Run {
             host: None,
             fallback: None,
             cold: None,
+            critical_pid: None,
             reason: None,
             remote_take: None,
             waited_seconds: None,
@@ -633,7 +644,7 @@ impl Run {
                 if self.reason.is_none() {
                     self.reason.clone_from(&line.reason);
                 }
-                self.route(line.remote, line.host.clone());
+                self.route(line.remote, line.host.clone(), line.critical_pid);
             }
             "take" => {
                 self.started = Some(stamp);
@@ -641,7 +652,7 @@ impl Run {
                 self.slots = names(&line.slots).collect();
                 self.machine = line.machine();
                 self.waited_seconds = line.waited_seconds;
-                self.route(line.remote, line.host.clone());
+                self.route(line.remote, line.host.clone(), line.critical_pid);
             }
             "release" => {
                 self.held_seconds = line.held_seconds;
@@ -654,7 +665,7 @@ impl Run {
                 // A release line that says `remote` marks a run whose queue and take rolled out of the journal; one that
                 // does not leaves the run as its take left it.
                 if line.remote {
-                    self.route(true, line.host.clone());
+                    self.route(true, line.host.clone(), line.critical_pid);
                 }
             }
             "fallback" => {
@@ -669,7 +680,7 @@ impl Run {
                     _ => None,
                 };
                 // The run holds nothing until a local take: a remote take's slots, snapshot, start and wait no longer stand.
-                self.route(false, None);
+                self.route(false, None, None);
                 self.slot = None;
                 self.slots.clear();
                 self.machine = None;
@@ -685,11 +696,13 @@ impl Run {
         }
     }
 
-    /// Marks the run remote on `host`, or local. A remote line after a `fallback` makes the run a plain remote one again,
-    /// dropping the remote take that fallback kept.
-    fn route(&mut self, remote: bool, host: Option<String>) {
+    /// Marks the run remote on `host`, naming the critical request that sent it there as `critical_pid`, or local. A
+    /// remote line after a `fallback` makes the run a plain remote one again, dropping the remote take that fallback
+    /// kept.
+    fn route(&mut self, remote: bool, host: Option<String>, critical_pid: Option<u32>) {
         self.remote = remote;
         self.host = host.filter(|_| remote);
+        self.critical_pid = critical_pid.filter(|_| remote);
         if remote {
             self.fallback = None;
             self.remote_take = None;
@@ -766,6 +779,7 @@ impl Run {
             abandoned: self.abandoned.clone(),
             remote_take: self.remote_take.clone(),
             cold: self.cold,
+            critical_pid: self.critical_pid,
         }
     }
 

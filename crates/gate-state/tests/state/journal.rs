@@ -298,6 +298,38 @@ fn a_cold_routed_release_parses() {
 }
 
 #[test]
+fn a_rerouted_light_run_names_its_critical_request() {
+    let rerouted = Gate::new(1, START, COMMAND);
+    let plain = Gate::new(2, START, "cargo build");
+    let remote = json!({
+        "remote": true, "host": "builder@build-box", "key": "repo-ba4a1013",
+        "routedFor": "critical", "criticalPid": 52000,
+    });
+    let unnamed = json!({"remote": true, "host": "builder@build-box", "key": "repo-ba4a1013"});
+    let lines = vec![
+        versioned(&plain.queue(&ago(30)), 1),
+        versioned(&with_fields(&plain.take(&ago(29), 0.5), &unnamed), 1),
+        versioned(&with_fields(&plain.release(&ago(28), 4.0, json!(0)), &unnamed), 1),
+        versioned(&rerouted.queue(&ago(25)), 1),
+        versioned(&with_fields(&rerouted.take(&ago(24), 0.5), &remote), 1),
+        versioned(&with_fields(&rerouted.release(&ago(23), 4.0, json!(0)), &remote), 1),
+    ];
+
+    let history = history_of("a_rerouted_light_run_names_its_critical_request", &lines);
+
+    assert_eq!(states(&history), [RunState::Ok, RunState::Ok]);
+    let named = &history.runs[0];
+    assert_eq!(named.critical_pid, Some(52000));
+    let serialized = serde_json::to_value(named).expect("the run serializes");
+    assert_eq!(serialized["criticalPid"], 52000);
+
+    let other = &history.runs[1];
+    assert_eq!(other.critical_pid, None);
+    let serialized = serde_json::to_value(other).expect("the run serializes");
+    assert!(serialized.get("criticalPid").is_none(), "{serialized}");
+}
+
+#[test]
 fn a_cold_release_gives_its_run_cold() {
     let gate = Gate::new(1, START, COMMAND);
     let cold = json!({"wallSeconds": 3.5, "adjustedSeconds": 2.0, "verdict": "passed", "cold": true});
@@ -627,6 +659,7 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 abandoned: Vec::new(),
                 remote_take: None,
                 cold: None,
+                critical_pid: None,
             },
             HistoryRun {
                 command: "cargo build".to_owned(),
@@ -656,6 +689,7 @@ fn runs_pair_queue_take_release_by_pid_and_process_start() {
                 abandoned: Vec::new(),
                 remote_take: None,
                 cold: None,
+                critical_pid: None,
             },
         ]
     );

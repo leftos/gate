@@ -187,6 +187,15 @@ fn tag() -> RemoteTag {
     RemoteTag {
         host: REMOTE_HOST.to_owned(),
         key: REMOTE_KEY.to_owned(),
+        critical_pid: None,
+    }
+}
+
+/// The tag of a light run a critical request's barrier sent to the builder.
+fn rerouted_tag() -> RemoteTag {
+    RemoteTag {
+        critical_pid: Some(52000),
+        ..tag()
     }
 }
 
@@ -301,6 +310,40 @@ fn a_routed_take_line_puts_the_remote_fields_after_waited_seconds_and_before_aba
     assert_eq!(
         own_keys(&take(vec![REMOTE_SLOT.to_owned()])),
         ["slots", "waitedSeconds", "remote", "host", "key", "abandoned"]
+    );
+}
+
+#[test]
+fn a_rerouted_light_run_s_remote_fields_name_the_critical_request() {
+    let take = || JournalEvent::Take {
+        slots: vec![REMOTE_SLOT.to_owned()],
+        waited_seconds: 0.135,
+        abandoned: Vec::new(),
+        machine: None,
+        parent_pid: None,
+    };
+
+    let line = journal_line(&identity(), ts(NOW), &take(), Some(&rerouted_tag()), None);
+    assert_eq!(
+        own_keys(&line),
+        ["slots", "waitedSeconds", "remote", "host", "key", "routedFor", "criticalPid"]
+    );
+    assert_eq!(parsed(&line)["routedFor"], "critical");
+    assert_eq!(parsed(&line)["criticalPid"], 52000);
+
+    let fallback = JournalEvent::Fallback {
+        reason: FallbackReason::Full,
+    };
+    let fallback_line = journal_line(&identity(), ts(NOW), &fallback, Some(&rerouted_tag()), None);
+    assert_eq!(own_keys(&fallback_line), ["reason", "remote", "host", "key", "routedFor", "criticalPid"]);
+    assert_eq!(parsed(&fallback_line)["routedFor"], "critical");
+    assert_eq!(parsed(&fallback_line)["criticalPid"], 52000);
+
+    let local = journal_line(&identity(), ts(NOW), &take(), Some(&tag()), None);
+    assert_eq!(
+        own_keys(&local),
+        ["slots", "waitedSeconds", "remote", "host", "key"],
+        "a run no critical request sent writes neither field"
     );
 }
 

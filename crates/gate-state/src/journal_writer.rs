@@ -293,13 +293,17 @@ impl FallbackReason {
     }
 }
 
-/// The remote fields of a routed run's lines up to its fallback: `remote: true`, `host` and `key`.
+/// The remote fields of a routed run's lines up to its fallback: `remote: true`, `host` and `key`, and, when a critical
+/// request's barrier sent a light run to the builder, the optional `routedFor` and `criticalPid`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteTag {
     /// The build box the run was routed to, as `user@host`.
     pub host: String,
     /// The run's key on the build box.
     pub key: String,
+    /// The gate of the critical request whose barrier held this light run back and sent it to the builder; `None` for
+    /// every other routed run.
+    pub critical_pid: Option<u32>,
 }
 
 /// What a `release` line says of the run.
@@ -415,7 +419,8 @@ impl fmt::Display for JournalNote {
 /// `unknown`.
 ///
 /// `remote` is the tag of a routed run up to its fallback: when it is `Some`, the event's own fields are followed by
-/// `remote: true`, `host` and `key`; when it is `None`, the line has none of the three.
+/// `remote: true`, `host` and `key`, and, when the tag names a critical request, `routedFor: critical` and `criticalPid`;
+/// when it is `None`, the line has none of them.
 ///
 /// `lock_abandoned` is the journal lock's name when it was taken abandoned. When it is `Some`, the line carries
 /// `abandoned` as its last field: a `take`'s own names followed by the lock's, any other event's just the lock's.
@@ -449,6 +454,10 @@ pub fn journal_line(
         line.insert("remote".to_owned(), Value::Bool(true));
         line.insert("host".to_owned(), Value::from(tag.host.as_str()));
         line.insert("key".to_owned(), Value::from(tag.key.as_str()));
+        if let Some(critical_pid) = tag.critical_pid {
+            line.insert("routedFor".to_owned(), Value::from("critical"));
+            line.insert("criticalPid".to_owned(), Value::from(critical_pid));
+        }
     }
     let mut abandoned: Vec<Value> = match event {
         JournalEvent::Take { abandoned, .. } => abandoned.iter().map(|name| Value::from(name.as_str())).collect(),
