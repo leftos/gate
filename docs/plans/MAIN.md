@@ -6,6 +6,7 @@
 
 - [ ] GATE-595 Route to more than one builder, choosing by what each builder can run — Urgent · Remote
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
+- [ ] GATE-732 Make the Unix box's back-commit test hold under load — Urgent · No project
 - [ ] GATE-616 Move the box's shared wire rules into gate-wire so both boxes say the same bytes — High · Remote
 - [ ] GATE-615 Tie the Unix box's job record to its process group leader's start time — High · Remote
 - [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root — High · Remote
@@ -27,13 +28,17 @@
 - [ ] GATE-639 Test the macOS snapshot from a subfolder and list the repo once per decision — High · Remote
 - [ ] GATE-640 Refuse a macOS builder root holding ':' when remote.json is read — High · Remote
 - [ ] GATE-643 Say why a routed command naming a project under .tmp cannot route, and check --no-build after a routed build — High · Remote
-- [ ] GATE-647 Find whether the shared snapshot ref gives a second builder a wrong bridge base; key it per builder if so — High · Remote
 - [ ] GATE-649 Bring back every test project's output a routed dotnet test build made — High · Remote
 - [ ] GATE-650 Fall back when a builder's box program is missing (ssh status 126/127) — High · Remote
 - [ ] GATE-682 Explain or track a stall when a gated command is plain ssh to another machine — High · Remote
 - [/] GATE-683 Prune a deleted worktree's folders from every builder, and prune the Mac by space — High · Remote
 - [ ] GATE-689 Prune a gone worktree's keys from the Windows builders and the PC — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
+- [ ] GATE-723 Route herdr-gpui's cargo and just ci to the Mac mini — High · No project
+- [ ] GATE-724 Accept the two-word `--builder {host}` form in gate run — High · No project
+- [ ] GATE-729 Make a sequence of gate runs die with whoever stops it — High · No project
+- [ ] GATE-730 Let the PC see the Unix box's start marker — High · No project
+- [!] GATE-731 Route yaat's test-all to the Mac mini — High · No project
 
 ## Local gate
 
@@ -231,6 +236,7 @@
 - [ ] GATE-711 Remove the Unix box's git lock files beneath descriptors, not by path
 - [ ] GATE-712 Remove a deep folder tree on the Unix box without one descriptor per level
 - [ ] GATE-713 Close three low edge cases in the Unix box's inputs verb
+- [ ] GATE-720 Bridge each push on a snapshot the builder still advertises
 
 ## Design
 
@@ -350,3 +356,9 @@
 - [ ] GATE-716 Let the launcher read run's --builder with its value as a separate word
 - [ ] GATE-717 Refuse a work folder that is not `{root}/work/{key}` in every Unix box verb
 - [ ] GATE-718 Pin the Unix outputs run's no-EOF read, OutputsFull skip and gone probe
+
+## No project
+
+- [ ] GATE-733 Say a descendant's exec on the Unix box when its image changes after spawn
+- [ ] GATE-736 Route rustling-tulip's rt.ps1 native-e2e to the builder
+- [ ] GATE-737 Routed Godot --build-solutions fails on the builder: no .godot/imported in its copy
