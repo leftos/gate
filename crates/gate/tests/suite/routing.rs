@@ -52,7 +52,7 @@ pub(crate) fn routed_words<'a>(log: &'a str, stub: &'a str, extra: &[&'a str], c
 
 /// The routing git limit of an hour and the drain of the suite's 600 s hang guard: a starved gate whose git readers
 /// reach their pipes' ends late still routes, so a case holds however long git takes on a loaded machine.
-const GIT_HANG_GUARDS: [&str; 4] = ["--test-git-limit-ms", "3600000", "--test-git-drain-ms", "600000"];
+pub(crate) const GIT_HANG_GUARDS: [&str; 4] = ["--test-git-limit-ms", "3600000", "--test-git-drain-ms", "600000"];
 
 /// The words of a heavy run of this suite, with [`GIT_HANG_GUARDS`] for the routing decision's git calls.
 pub(crate) fn heavy_words_with_limit<'a>(log: &'a str, extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
@@ -88,11 +88,11 @@ fn recorded_words(call: &Value) -> Vec<&str> {
 }
 
 /// The journal lines of the gate `pid`.
-fn own(case: &Case, pid: u32) -> Vec<Value> {
+pub(crate) fn own(case: &Case, pid: u32) -> Vec<Value> {
     events(case).into_iter().filter(|event| event["pid"] == pid).collect()
 }
 
-fn has_remote_tag(event: &Value) -> bool {
+pub(crate) fn has_remote_tag(event: &Value) -> bool {
     event["remote"] == true && event["host"] == HOST && event["key"].is_string()
 }
 
@@ -170,7 +170,7 @@ pub(crate) fn names(events: &[Value]) -> Vec<&str> {
         .collect()
 }
 
-fn has_no_remote_fields(event: &Value) -> bool {
+pub(crate) fn has_no_remote_fields(event: &Value) -> bool {
     ["remote", "host", "key"].iter().all(|field| event.get(field).is_none())
 }
 

@@ -177,16 +177,7 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
         Route::Local { reason: Some(reason) } => console.err(&reason.line()),
         Route::Local { reason: None } => {}
         Route::Refused(refusal) => console.err(&refusal.line()),
-        Route::Routed(run) => {
-            run.lines().iter().for_each(|line| console.err(line));
-            let prefixes = declared.unwrap_or_else(|line| {
-                console.err(&line);
-                Vec::new()
-            });
-            if let Some(line) = dropped_line(request, &prefixes) {
-                console.err(&line);
-            }
-        }
+        Route::Routed(run) => say_routed(request, run, declared, console),
     }
     Decided {
         route,
@@ -196,18 +187,64 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
     }
 }
 
+/// Says the lines of `request`'s routed `run`: its route lines, the problem of its repo's `.gate/env.toml` when
+/// `declared` is one ([`declared_prefixes`]), and the line of the watched variables it does not send ([`dropped_line`]).
+fn say_routed(request: &RunRequest, run: &RemoteRun, declared: Result<Vec<String>, String>, console: &mut Console) {
+    run.lines().iter().for_each(|line| console.err(line));
+    let prefixes = declared.unwrap_or_else(|line| {
+        console.err(&line);
+        Vec::new()
+    });
+    if let Some(line) = dropped_line(request, &prefixes) {
+        console.err(&line);
+    }
+}
+
+/// The routed run a light gate held back behind a critical request gets when its command would route on heavy: the
+/// decision `decision` saw asked again with the heavy slot ([`would_route_on_heavy`]'s question), with the git limits
+/// and the `HEAD` a routed run reads. Says that the critical request of gate `by` sends the run to its builder, then
+/// the routed run's lines as [`route`] does, and notes the decision's log lines. `None`, saying nothing, when the
+/// decision would keep the run here or a word is not valid Unicode. With the run, the hash of its repo's warm-up file
+/// when its warm-up is set up ([`consented_hash`]).
+pub(crate) fn route_as_heavy(request: &RunRequest, decision: &Decision, by: u32, console: &mut Console) -> Option<(RemoteRun, Option<String>)> {
+    let machine = Machine::of(decision.local_app_data.as_deref(), &request.test_seams);
+    let routed = match decide(&decision.inputs(gate_router::Slot::Heavy), &machine) {
+        Route::Routed(run) if decision.unicode => Some(run),
+        Route::Routed(_) | Route::Local { .. } | Route::Refused(_) => None,
+    };
+    let Some(run) = routed else {
+        for line in machine.unsaid_notes() {
+            console.note(&line);
+        }
+        return None;
+    };
+    let warm_hash = consented_hash(&run, &machine);
+    let declared = declared_prefixes(&run, &machine);
+    for line in machine.unsaid_notes() {
+        console.note(&line);
+    }
+    console.err(&format!(
+        "gate: held back by the critical request of gate {by}; sending this light run to {}",
+        run.builder.alias
+    ));
+    say_routed(request, &run, declared, console);
+    Some((*run, warm_hash))
+}
+
 /// The routed run of `request` on `candidate`, a later builder of the run its decision `decision` routed
-/// ([`gate_router::later_run`]), its facts asked again of this machine as the decision asked them, the log lines of the
-/// declaration files it reads noted for the log. `Err(None)` when the candidate is steered off, `Err(Some(why))` when
-/// it is skipped for a reason ([`gate_router::later_run`]).
+/// ([`gate_router::later_run`]), its facts asked again of this machine as the decision asked them with the slot
+/// `asked`: the run's own, or heavy for a light run a critical request sent to a builder. The log lines of the
+/// declaration files it reads are noted for the log. `Err(None)` when the candidate is steered off, `Err(Some(why))`
+/// when it is skipped for a reason ([`gate_router::later_run`]).
 pub(crate) fn later_run(
     request: &RunRequest,
     decision: &Decision,
     candidate: &LaterCandidate,
+    asked: Slot,
     console: &mut Console,
 ) -> Result<RemoteRun, Option<String>> {
     let machine = Machine::of(decision.local_app_data.as_deref(), &request.test_seams);
-    let run = gate_router::later_run(&decision.inputs(slot(request.slot)), &machine, candidate);
+    let run = gate_router::later_run(&decision.inputs(slot(asked)), &machine, candidate);
     for line in machine.unsaid_notes() {
         console.note(&line);
     }

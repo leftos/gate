@@ -205,6 +205,10 @@ pub(crate) struct UnderParent {
 }
 
 /// A gate queued for a slot of its pool.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent flag of the wait, read by name; no two form a state machine"
+)]
 pub(crate) struct Wait<'a> {
     root: &'a ResolvedRoot,
     pool: Pool,
@@ -227,6 +231,10 @@ pub(crate) struct Wait<'a> {
     waiter: Waiter,
     said_waiting: bool,
     said_ignored: bool,
+    /// Whether a local light wait may end held back to route ([`Wait::may_route`]).
+    may_route: bool,
+    /// Whether a remote wait takes a slot only when another stays free after it ([`Wait::keep_spare`]).
+    spare: bool,
 }
 
 /// The earliest critical request ahead of a waiting gate, which holds it back: its gate's pid, and whether it holds the
@@ -276,6 +284,9 @@ pub(crate) enum Waited {
     Interrupted,
     /// The wait's limit passed with no slot taken.
     TimedOut,
+    /// A critical request, its gate's pid, holds this light gate back with no place beside it left, and the gate may
+    /// leave its wait to route ([`Wait::may_route`]).
+    HeldBack(u32),
 }
 
 impl<'a> Wait<'a> {
@@ -325,7 +336,19 @@ impl<'a> Wait<'a> {
             waiter,
             said_waiting: false,
             said_ignored: false,
+            may_route: false,
+            spare: false,
         }
+    }
+
+    /// Lets a local light wait end held back ([`Waited::HeldBack`]) instead of waiting behind a critical request.
+    pub(crate) fn may_route(&mut self) {
+        self.may_route = true;
+    }
+
+    /// Makes a remote wait take a slot only when another slot of the pool stays free after it ([`spare_left`]).
+    pub(crate) fn keep_spare(&mut self) {
+        self.spare = true;
     }
 
     /// Limits a remote wait to `left`, what is left of the run's remote budget ([`remote_budget`]), in place of the whole
@@ -372,10 +395,22 @@ impl<'a> Wait<'a> {
         let beside = self.beside(&others, survey, console);
         let (range, room) = self.range(count, &others, &beside, survey, console);
         self.range = range.clone();
+        if let Some(pid) = held_back(self.pool, self.barrier, room, matches!(beside, Beside::Busy), self.may_route) {
+            drop(beside);
+            return Some(Waited::HeldBack(pid));
+        }
         let (may_try, probe) = self.may_try(&others, range.clone(), room, survey, console);
         if may_try && let Some(mut taken) = slots::try_pool(self.root, self.pool, range.clone(), survey, console) {
-            taken.beside = beside.into_guard();
-            return Some(Waited::Taken(taken));
+            // The slot just taken reads busy in this probe, so a spare is another slot free beside it.
+            if !self.spare || spare_left(&self.probe(0..count, survey, console)) {
+                taken.beside = beside.into_guard();
+                return Some(Waited::Taken(taken));
+            }
+            // A slot a dead gate left loses that gate's claim, as a takeover's would, before it is let go untaken.
+            if taken.abandoned {
+                slots::delete_claim(&taken.held, console);
+            }
+            drop(taken);
         }
         drop(beside);
         // A wait with nothing left of its remote budget says no wait.
@@ -916,6 +951,20 @@ impl Beside {
     }
 }
 
+/// The pid of the critical request that holds a gate of `pool` back with no place beside it, by the pass's `barrier`
+/// and `room` ([`Wait::range`]), when its wait `may_route`; `None` when it does not, when the beside mutex was `busy`
+/// this pass (no count was made), and for any pool but the local light one.
+fn held_back(pool: Pool, barrier: Option<Barrier>, room: Option<usize>, busy: bool, may_route: bool) -> Option<u32> {
+    let held = may_route && !busy && room == Some(0) && matches!(pool, Pool::Local(SlotKind::Light));
+    barrier.filter(|_| held).map(|barrier| barrier.pid)
+}
+
+/// Whether the probe of a pool, taken while this gate holds one of its slots, finds another free; a slot that could not
+/// be probed leaves none.
+fn spare_left(probe: &[Option<bool>]) -> bool {
+    !probe.iter().any(Option::is_none) && slots_where(probe, false) > 0
+}
+
 /// How many slots of `probe` some gate has open (`held`) or none has (not `held`); a slot that could not be probed is
 /// neither.
 fn slots_where(probe: &[Option<bool>], held: bool) -> usize {
@@ -1103,8 +1152,8 @@ mod tests {
 
     use super::scratch::{Holder, Scratch, holding, request};
     use super::{
-        Arrival, Barrier, Beside, Host, LendFacts, Wait, Waited, Which, barrier, beside_of, beside_place, beside_room, first_heartbeat, holder_eta,
-        lends, light_barrier, may_take, pool_eta, queued_ahead, slot_range,
+        Arrival, Barrier, Beside, Host, LendFacts, Wait, Waited, Which, barrier, beside_of, beside_place, beside_room, first_heartbeat, held_back,
+        holder_eta, lends, light_barrier, may_take, pool_eta, queued_ahead, slot_range, spare_left,
     };
     use crate::console::Console;
     use crate::slots::BesideTry;
@@ -1556,6 +1605,51 @@ mod tests {
         assert!(may_take(1, 4, Some(2)), "two places, one for each");
         assert!(may_take(1, 4, None), "no request holds it back: the free slots alone");
         assert!(!may_take(2, 2, None));
+    }
+
+    const LIGHT: Pool = Pool::Local(SlotKind::Light);
+    const PLAIN: Barrier = Barrier { pid: 12, alone: false };
+
+    #[test]
+    fn held_back_names_the_request_that_leaves_a_light_gate_no_place_beside_it() {
+        assert_eq!(held_back(LIGHT, Some(PLAIN), Some(0), false, true), Some(12));
+        let alone = Barrier { pid: 21, alone: true };
+        assert_eq!(
+            held_back(LIGHT, Some(alone), Some(0), false, true),
+            Some(21),
+            "a request to hold the machine alone"
+        );
+    }
+
+    #[test]
+    fn held_back_is_none_with_a_place_left_no_count_no_leave_to_route_no_barrier_or_another_pool() {
+        assert_eq!(
+            held_back(LIGHT, Some(PLAIN), Some(0), true, true),
+            None,
+            "the beside mutex was busy: no count"
+        );
+        assert_eq!(
+            held_back(LIGHT, Some(PLAIN), Some(1), false, true),
+            None,
+            "a place is left beside the request"
+        );
+        assert_eq!(held_back(LIGHT, Some(PLAIN), None, false, true), None, "no cap but the free slots");
+        assert_eq!(held_back(LIGHT, Some(PLAIN), Some(0), false, false), None, "the wait may not route");
+        assert_eq!(held_back(LIGHT, None, Some(0), false, true), None, "no request holds it back");
+        assert_eq!(held_back(Pool::Local(SlotKind::Heavy), Some(PLAIN), Some(0), false, true), None);
+        let remote = Pool::Remote(BuilderPool { slots: 1, id: None });
+        assert_eq!(held_back(remote, Some(PLAIN), Some(0), false, true), None);
+    }
+
+    #[test]
+    fn spare_left_needs_another_free_slot_and_every_slot_probed() {
+        assert!(spare_left(&[Some(true), Some(false)]), "the slot taken and one free");
+        assert!(!spare_left(&[Some(true)]), "the only slot is the one taken");
+        assert!(!spare_left(&[Some(true), Some(true)]), "every other slot is busy");
+        assert!(
+            !spare_left(&[Some(true), None, Some(false)]),
+            "a slot that could not be probed leaves none"
+        );
     }
 
     /// One row of the lend table: the other gates' tickets, whether the critical mutex is open, whether the read found

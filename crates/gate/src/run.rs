@@ -176,6 +176,8 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         trace: RunTrace::default(),
         writer: None,
         streams: None,
+        rerouted_for: None,
+        reroute_tried: false,
     };
     let (route, placed) = run.route(environment, console);
     if let Some(status) = ended_at_route(&route, request, &run.log, console) {
@@ -612,8 +614,9 @@ struct Run<'a> {
     /// The run's first arrival in Unix epoch milliseconds, which every ticket it writes keeps.
     arrived: u64,
     /// The moment of the run's `queue` line: the moment the local `take` of a run the full remote pool sent back counts
-    /// its wait from, while every other wait counts from its own take. `None` for a run that is not routed, and for one
-    /// sent back for any other reason.
+    /// its wait from, while every other wait counts from its own take. A light run the critical barrier held back keeps
+    /// the instant of its first queue too, for its later waits here and its remote take. `None` for a run that is not
+    /// routed and was not held back, and for one sent back for any other reason.
     queued_at: Option<Instant>,
     /// Whether the run's light parent lent it its slot while a critical request drained, before it queued or once it
     /// journalled `parent` as it waited, so it takes, journals and releases no slot.
@@ -639,6 +642,11 @@ struct Run<'a> {
     /// The readers of the started command's output and the consumer of its job's process events, until the run's end
     /// ends them ([`Run::end_streams`]).
     streams: Option<Streams>,
+    /// The critical request whose barrier sent this light run to a builder, from its route on; `None` for every other
+    /// run.
+    rerouted_for: Option<u32>,
+    /// Whether the light run has asked to route once a critical request held it back; it asks at most once.
+    reroute_tried: bool,
 }
 
 /// What writes a started command's lines to its log: the readers of its two pipes, once started, and the thread that
@@ -932,6 +940,9 @@ enum Taking {
     Interrupted,
     /// The remote pool stayed full past the wait's limit.
     Full,
+    /// A critical request, its gate `by`, holds this light run back with no place beside it; the run left the queue it
+    /// joined at `queued`.
+    HeldBack { by: u32, queued: Instant },
 }
 
 /// How one builder's attempt of a routed run ended ([`Run::attempt`]).
@@ -1298,13 +1309,19 @@ impl Run<'_> {
             Err(ended) => return Some((ended, None)),
         };
         let ended = self.here(plan, hold, console)?;
-        Some((ended, here))
+        // A light run a critical request sent to a builder ran its words there; one that came back keeps them, since
+        // its fallback cleared its tag ([`Run::give_up`]).
+        Some((ended, here.filter(|_| self.tag.is_none())))
     }
 
     /// Runs the command here. A gate a parent's slot covers takes no slot; nor does one whose light parent lends it its
     /// slot while a critical request drains, before it queued or as it waits ([`Run::on_parent`]). Any other gate takes
-    /// a slot into `hold`, one whose parent's slot does not cover it saying so first, before any wait line. How the run
-    /// ended; `None` when a Ctrl+C ended the wait for a slot.
+    /// a slot into `hold`, one whose parent's slot does not cover it saying so first, before any wait line. A light run
+    /// a critical request holds back with no place beside it asks once whether its command would route on heavy
+    /// ([`route::route_as_heavy`]): when it would, it says so, closes its log and runs on the builder ([`Run::routed`]),
+    /// its remote tag naming the request; a refusal or fallback, or a command that would not route, sends it back to
+    /// its wait here, keeping the instant it queued. How the run ended; `None` when a Ctrl+C ended the wait for a slot
+    /// or for the remote client to start.
     fn here(&mut self, plan: Plan, hold: &mut Hold, console: &mut Console) -> Option<Ended> {
         self.open_log(console);
         let nesting = self.nesting;
@@ -1318,16 +1335,61 @@ impl Run<'_> {
             }
             console.err(&parent.uncovered_line(self.request.slot));
         }
-        match self.take_own(hold, console) {
-            Taking::Took(took, figures) => {
-                hold.took = Some(took);
-                Some(self.command(plan, figures, console))
+        loop {
+            match self.take_own(hold, console) {
+                Taking::Took(took, figures) => {
+                    hold.took = Some(took);
+                    return Some(self.command(plan, figures, console));
+                }
+                Taking::Lent(figures) => return Some(self.lent_as_it_waited(plan, hold, figures, console)),
+                Taking::Interrupted => return None,
+                // Only a remote pool has a wait limit, so a local take never times out.
+                Taking::Full => unreachable!("a local pool is never full past a limit"),
+                Taking::HeldBack { by, queued } => match self.route_held_back(by, queued, hold, console) {
+                    Remotely::Ended(ended) => return Some(ended),
+                    Remotely::Interrupted => return None,
+                    // Back to its wait, in its first place.
+                    Remotely::Here => {}
+                },
             }
-            Taking::Lent(figures) => Some(self.lent_as_it_waited(plan, hold, figures, console)),
-            Taking::Interrupted => None,
-            // Only a remote pool has a wait limit, so a local take never times out.
-            Taking::Full => unreachable!("a local pool is never full past a limit"),
         }
+    }
+
+    /// Asks once whether the light run the critical request of gate `by` held back, out of the queue it joined at
+    /// `queued`, would route on heavy, and runs it on the builder when it would ([`Run::here`]). How the run ended
+    /// there; [`Remotely::Here`] when it goes back to its wait here, its command not routing or its route fallen back.
+    /// The lines the route says are held, not written to the log, as a heavy routed run's are before its log opens: a
+    /// fallback removes the log the client wrote, and the reopened log takes them, the fallback line after them.
+    fn route_held_back(&mut self, by: u32, queued: Instant, hold: &mut Hold, console: &mut Console) -> Remotely {
+        self.reroute_tried = true;
+        self.queued_at = Some(queued);
+        console.detach();
+        let routed = self
+            .would
+            .as_ref()
+            .and_then(|decision| route::route_as_heavy(self.request, decision, by, console));
+        let Some((remote, warm_hash)) = routed else {
+            // It waits on, held back like any light gate, its log taking the notes the decision held.
+            if let Some(writer) = &self.writer {
+                console.attach(writer);
+            }
+            return Remotely::Here;
+        };
+        self.close_log(console);
+        self.warm_hash = warm_hash;
+        self.rerouted_for = Some(by);
+        self.tag = Some(RemoteTag {
+            host: remote.builder.alias.clone(),
+            key: remote.key.clone(),
+            critical_pid: Some(by),
+        });
+        let remotely = self.routed(&remote, hold, console);
+        if matches!(remotely, Remotely::Here) {
+            self.rerouted_for = None;
+            self.queued_at = Some(queued);
+            self.open_log(console);
+        }
+        remotely
     }
 
     /// Waits for and takes the run's own slot of its pool into `hold`, or the machine for a critical run; a no-slot run
@@ -1478,7 +1540,7 @@ impl Run<'_> {
         self.tag = Some(RemoteTag {
             host: next.builder.alias.clone(),
             key: next.key.clone(),
-            critical_pid: None,
+            critical_pid: self.rerouted_for,
         });
         Ok(next)
     }
@@ -1515,7 +1577,8 @@ impl Run<'_> {
     /// The run of the later builder `candidate` ([`route::later_run`]) under the routing `decision`; `None` when it is
     /// skipped, noting in the log why, naming it, when the skip says why.
     fn build_candidate(&self, decision: &route::Decision, candidate: &LaterCandidate, console: &mut Console) -> Option<RemoteRun> {
-        let built = route::later_run(self.request, decision, candidate, console);
+        let asked = if self.rerouted_for.is_some() { Slot::Heavy } else { self.request.slot };
+        let built = route::later_run(self.request, decision, candidate, asked, console);
         // The seam raises the console interrupt once the walk has built a candidate, before the run tries it.
         if self.request.test_seams.interrupt_before_later
             && let Some(interrupt) = self.host.interrupt
@@ -1538,9 +1601,22 @@ impl Run<'_> {
     /// attempts, which this wait adds to, then calls the client ([`Run::call_builder`]). A full pool is a refusal. A
     /// Ctrl+C ends the run here, with the remote slot released: one raised before the call, or during it over a refusal.
     fn attempt(&mut self, remote: &RemoteRun, hold: &mut Hold, waited: &mut Duration, console: &mut Console) -> Attempt {
-        let left = wait::remote_budget(self.request).saturating_sub(*waited);
+        // A light run a critical request sent here never waits for a remote slot.
+        let left = if self.rerouted_for.is_some() {
+            Duration::ZERO
+        } else {
+            wait::remote_budget(self.request).saturating_sub(*waited)
+        };
         let begun = Instant::now();
-        let taking = self.take(Pool::Remote(BuilderPool::of(&remote.builder)), None, Some(left), &mut hold.taken, console);
+        // A light run a critical request sent here counts its remote take's wait from its first queue line.
+        let since = self.queued_at.filter(|_| self.rerouted_for.is_some());
+        let taking = self.take(
+            Pool::Remote(BuilderPool::of(&remote.builder)),
+            since,
+            Some(left),
+            &mut hold.taken,
+            console,
+        );
         *waited += begun.elapsed();
         let figures = match taking {
             Taking::Took(took, figures) => {
@@ -1550,6 +1626,7 @@ impl Run<'_> {
             Taking::Lent(_) => unreachable!("only a local wait is lent a parent's slot"),
             Taking::Interrupted => return Attempt::Done(Remotely::Interrupted),
             Taking::Full => return Attempt::refused(FallbackReason::Full, RemoteOutcome::default(), None),
+            Taking::HeldBack { .. } => unreachable!("only a local light wait is held back to route"),
         };
         // A Ctrl+C that came once the remote slot was held, before the client was called, ends the run as an
         // interrupt before a command starts does here; the caller releases the slot with the run's tag.
@@ -1741,6 +1818,10 @@ impl Run<'_> {
         // A Ctrl+C raised before the take reads as the lock's busy; it ends the run as an interrupted wait does.
         if self.host.interrupt.is_some_and(Interrupt::is_raised) {
             return Err(self.interrupted_key_wait(remote, Duration::ZERO, console));
+        }
+        // A light run a critical request sent here never waits for the key.
+        if self.rerouted_for.is_some() {
+            return Err(busy(self, console));
         }
         let mut probe_said = false;
         if warm_up_holds(&self.root.path, &remote.key, console, &mut probe_said) {
@@ -2175,7 +2256,8 @@ impl Run<'_> {
 
     /// Waits its turn for a slot of `pool` and takes it into `held` the moment it has it, then writes the claim and
     /// journals the take, with the remote tag while the run has one. `since` is the moment the wait counts from, the run's
-    /// own `queue` line for a run the full remote pool sent back and `None` for every other wait, which counts from now;
+    /// own `queue` line for a run the full remote pool sent back and for a light run the critical barrier held back, in
+    /// its later waits here and its remote take, and `None` for every other wait, which counts from now;
     /// the wait, its still-waiting lines and its journal all count from that one instant. `left` limits a remote wait
     /// to what is left of the run's remote budget, `None` waiting for the whole budget ([`Wait::limit_to`]).
     /// When the slot was taken; else a Ctrl+C ended the wait, which deletes the ticket at once, wakes the waiters and
@@ -2212,6 +2294,12 @@ impl Run<'_> {
         if let Some(left) = left {
             wait.limit_to(left);
         }
+        if matches!(pool, Pool::Local(gate_state::SlotKind::Light)) && self.would.is_some() && !self.reroute_tried && self.request.builder.is_none() {
+            wait.may_route();
+        }
+        if pool.is_remote() && self.rerouted_for.is_some() {
+            wait.keep_spare();
+        }
         let taken = loop {
             match wait.until_taken(&mut self.survey, console) {
                 Waited::Taken(taken) => break held.insert(taken),
@@ -2232,6 +2320,11 @@ impl Run<'_> {
                     wait.end(console);
                     slots::wake_waiters(self.root, &mut self.survey, console);
                     return Taking::Full;
+                }
+                Waited::HeldBack(by) => {
+                    wait.end(console);
+                    slots::wake_waiters(self.root, &mut self.survey, console);
+                    return Taking::HeldBack { by, queued };
                 }
             }
         };

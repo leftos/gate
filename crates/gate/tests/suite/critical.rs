@@ -15,10 +15,10 @@ use serde_json::{Value, json};
 
 use crate::durations::seed;
 use crate::nesting::{marked, test_marker};
-use crate::routing::{HOST, routed_case, routed_words, stub};
+use crate::routing::{BUSY_LINE, GIT_HANG_GUARDS, HOST, has_no_remote_fields, has_remote_tag, names, own, repo, routed_case, routed_words, stub};
 use crate::support::{
-    Case, FAKE_TOOL, GATE, POLL, Running, UNTIL_KILLED, USAGE, assert_in_order, critical_words, events, events_of, finish, heavy_words, log_texts,
-    none_words, run_words, shown, start, take_of, wait_for_file, wait_for_journal_line, wait_until, write_counts,
+    Case, FAKE_TOOL, GATE, LOCAL_REASON, POLL, Running, UNTIL_KILLED, USAGE, assert_in_order, critical_words, events, events_of, finish, heavy_words,
+    log_texts, none_words, run_words, shown, start, take_of, wait_for_file, wait_for_journal_line, wait_until, write_counts, write_remote_json,
 };
 
 /// The status Windows reports for a process Ctrl+C ended, `STATUS_CONTROL_C_EXIT`, as a signed exit code.
@@ -647,6 +647,345 @@ fn a_pinned_run_under_a_light_parent_routes_while_a_critical_request_drains() {
     let_go(&go);
     assert_passed(&critical.finish());
     assert_passed(&held.finish());
+}
+
+/// The prefix of the still-waiting line of a light gate held back by the critical request of gate `pid`.
+fn still_beside(pid: u32) -> String {
+    format!("gate: still waiting for a light slot beside the critical request of gate {pid} (")
+}
+
+/// The line of a light gate the critical request of gate `pid` held back as it sends its run to the builder.
+fn sent_to_builder(pid: u32) -> String {
+    format!("gate: held back by the critical request of gate {pid}; sending this light run to {HOST}")
+}
+
+/// A routed case of `name` whose builder has `slots` remote slots, with three light slots here.
+fn reroute_case(name: &str, slots: u32) -> Case {
+    let case = routed_case(name);
+    if slots != 1 {
+        let routing = json!({ "host": HOST, "slots": slots, "repos": { repo(&case): ["*tool*"] } });
+        write_remote_json(&case, &routing.to_string());
+    }
+    write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":3}"#);
+    case
+}
+
+/// The gates that hold a light gate back: a critical gate holding until `go`, and light gates beside it holding until
+/// `light_go`.
+struct HeldBack {
+    critical: Running,
+    go: PathBuf,
+    lights: Vec<Running>,
+    light_go: PathBuf,
+}
+
+impl HeldBack {
+    /// Starts a critical gate, asked for `--alone` when `alone`, then `lights` light gates beside it, each once the one
+    /// before it has taken its slot.
+    fn start(case: &Case, alone: bool, lights: usize) -> HeldBack {
+        let go = case.folder().join("go");
+        let go_word = shown(&go);
+        let command = [FAKE_TOOL, "wait", go_word.as_str(), "exit", "0"];
+        let words = if alone {
+            alone_words("critical.log", &POLL, &command)
+        } else {
+            critical_words("critical.log", &POLL, &command)
+        };
+        let critical = holder(case, &words);
+        let (lights, light_go) = light_holders(case, lights);
+        HeldBack {
+            critical,
+            go,
+            lights,
+            light_go,
+        }
+    }
+
+    fn critical_pid(&self) -> u32 {
+        self.critical.id()
+    }
+
+    fn let_lights_go(&self) {
+        let_go(&self.light_go);
+    }
+
+    /// Lets every holder go and asserts each passed.
+    fn finish(self) {
+        let_go(&self.light_go);
+        for light in self.lights {
+            assert_passed(&light.finish());
+        }
+        let_go(&self.go);
+        assert_passed(&self.critical.finish());
+    }
+}
+
+/// Starts `count` light gates, each once the one before it has taken its slot, holding until the file `light-go` of the
+/// case folder exists; them and that file's path.
+fn light_holders(case: &Case, count: usize) -> (Vec<Running>, PathBuf) {
+    let light_go = case.folder().join("light-go");
+    let light_go_word = shown(&light_go);
+    let lights = (0..count)
+        .map(|index| {
+            let log = format!("light-{index}.log");
+            holder(case, &run_words(&log, &POLL, &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"]))
+        })
+        .collect();
+    (lights, light_go)
+}
+
+/// Starts a light run logging to `log` that calls the scripted client of the step file `steps`, with the routing git
+/// guards and `extra` before `--` and `command` after it.
+fn light_with_client(case: &Case, log: &str, steps: &Path, extra: &[&str], command: &[&str]) -> Running {
+    let steps = shown(steps);
+    let mut before = vec!["--test-remote-client", steps.as_str()];
+    before.extend(GIT_HANG_GUARDS);
+    before.extend(extra);
+    case.start(&run_words(log, &before, command))
+}
+
+/// The command of a light run that would route on heavy.
+const ROUTED_COMMAND: [&str; 3] = [r".\tool.exe", "out", "hi"];
+
+/// The scripted client's steps that record the call at `call` and pass.
+fn recording_stub(case: &Case, call: &Path) -> PathBuf {
+    stub(case, &[&format!("record {}", shown(call)), "status 0"])
+}
+
+/// Asserts the journal lines of a light run sent to the builder by the critical request of gate `critical_pid`: a
+/// `queue` with no remote field, then a `take` and a `release` with the remote tag naming that request.
+fn assert_rerouted(events: &[Value], critical_pid: u32) {
+    assert_eq!(names(events), ["queue", "take", "release"], "{events:#?}");
+    assert!(has_no_remote_fields(&events[0]), "{events:#?}");
+    for event in &events[1..] {
+        assert!(has_remote_tag(event), "{events:#?}");
+        assert_eq!(event["routedFor"], "critical", "{event}");
+        assert_eq!(event["criticalPid"], critical_pid, "{event}");
+    }
+}
+
+/// Asserts the journal lines of a light run that ran here all along: `queue`, `take` and `release` with no remote field.
+fn assert_stayed_here(events: &[Value]) {
+    assert_eq!(names(events), ["queue", "take", "release"], "{events:#?}");
+    assert!(events.iter().all(has_no_remote_fields), "{events:#?}");
+}
+
+#[test]
+fn a_light_gate_the_critical_barrier_holds_back_routes_to_a_free_builder() {
+    let case = reroute_case("a_light_gate_the_critical_barrier_holds_back_routes_to_a_free_builder", 2);
+    let held = HeldBack::start(&case, false, 2);
+    let critical_pid = held.critical_pid();
+    let call = case.folder().join("call.json");
+    let steps = recording_stub(&case, &call);
+
+    let light = light_with_client(&case, "light.log", &steps, &POLL, &ROUTED_COMMAND);
+    let pid = light.id();
+    let outcome = light.finish();
+
+    assert_passed(&outcome);
+    assert!(outcome.stderr.contains(&sent_to_builder(critical_pid)), "{outcome:?}");
+    assert!(call.exists(), "the builder ran the command: {outcome:?}");
+    assert_rerouted(&own(&case, pid), critical_pid);
+    held.finish();
+}
+
+#[test]
+fn a_light_gate_sent_to_a_builder_says_why_before_its_route_lines() {
+    let case = reroute_case("a_light_gate_sent_to_a_builder_says_why_before_its_route_lines", 2);
+    let held = HeldBack::start(&case, false, 2);
+    let critical_pid = held.critical_pid();
+    let call = case.folder().join("call.json");
+    let steps = recording_stub(&case, &call);
+
+    // The outside path's rewrite says a route line, `gate: routed <path> as fake-tool`.
+    let outcome = light_with_client(&case, "light.log", &steps, &POLL, &[FAKE_TOOL, "out", "hi"]).finish();
+
+    assert_passed(&outcome);
+    assert_in_order(&outcome.stderr, &[&sent_to_builder(critical_pid), "gate: routed "]);
+    held.finish();
+}
+
+#[test]
+fn a_light_gate_held_back_after_a_wait_counts_its_remote_take_from_its_queue_line() {
+    let case = reroute_case("a_light_gate_held_back_after_a_wait_counts_its_remote_take_from_its_queue_line", 2);
+    let (lights, light_go) = light_holders(&case, 3);
+    let call = case.folder().join("call.json");
+    let steps = recording_stub(&case, &call);
+    let light = light_with_client(&case, "light.log", &steps, &with_heartbeat(), &ROUTED_COMMAND);
+    let pid = light.id();
+    // Twenty still-waiting lines, one each 50 ms, make the wait before the barrier longer than the assertion's slack.
+    light.wait_for_stderr_where("twenty still-waiting lines", |text| {
+        text.matches("gate: still waiting for a light slot (").count() >= 20
+    });
+
+    // A critical request ahead of it, naming this live process, leaves it no place beside it.
+    let planted = (process::id(), own_start());
+    write_ticket(&case, TicketKind::Critical, planted, 0, false);
+    let outcome = light.finish();
+
+    assert_passed(&outcome);
+    let events = own(&case, pid);
+    assert_rerouted(&events, planted.0);
+    let time = |event: &Value| -> Timestamp {
+        event["time"]
+            .as_str()
+            .expect("a line has a time")
+            .parse()
+            .expect("the time is a timestamp")
+    };
+    let gap = time(&events[1]).duration_since(time(&events[0])).as_secs_f64();
+    let waited = events[1]["waitedSeconds"].as_f64().expect("the take says its wait");
+    assert!(
+        waited >= gap - 0.5,
+        "the remote take counts from the queue line, {gap} s before it: {events:#?}"
+    );
+    let ticket = v1::ticket_path(&case.root(), planted.0, planted.1.as_millisecond().unsigned_abs());
+    fs::remove_file(&ticket).expect("the planted ticket can be deleted");
+    let_go(&light_go);
+    for light in lights {
+        assert_passed(&light.finish());
+    }
+}
+
+#[test]
+fn a_light_gate_with_a_place_beside_the_critical_request_stays_here() {
+    let case = reroute_case("a_light_gate_with_a_place_beside_the_critical_request_stays_here", 2);
+    let held = HeldBack::start(&case, false, 1);
+    let call = case.folder().join("call.json");
+    let steps = recording_stub(&case, &call);
+
+    let light = light_with_client(&case, "light.log", &steps, &POLL, &ROUTED_COMMAND);
+    let pid = light.id();
+    let outcome = light.finish();
+
+    assert_passed(&outcome);
+    assert!(!outcome.stderr.contains("sending this light run"), "{outcome:?}");
+    assert!(!call.exists(), "the builder ran nothing: {outcome:?}");
+    assert_stayed_here(&own(&case, pid));
+    held.finish();
+}
+
+#[test]
+fn a_light_gate_behind_a_request_to_hold_the_machine_alone_routes() {
+    let case = reroute_case("a_light_gate_behind_a_request_to_hold_the_machine_alone_routes", 2);
+    let held = HeldBack::start(&case, true, 0);
+    let critical_pid = held.critical_pid();
+    let call = case.folder().join("call.json");
+    let steps = recording_stub(&case, &call);
+
+    let light = light_with_client(&case, "light.log", &steps, &POLL, &ROUTED_COMMAND);
+    let pid = light.id();
+    let outcome = light.finish();
+
+    assert_passed(&outcome);
+    assert!(outcome.stderr.contains(&sent_to_builder(critical_pid)), "{outcome:?}");
+    assert!(call.exists(), "the builder ran the command: {outcome:?}");
+    assert_rerouted(&own(&case, pid), critical_pid);
+    held.finish();
+}
+
+#[test]
+fn a_light_gate_finds_no_spare_remote_slot_and_waits_here_in_its_place() {
+    let case = reroute_case("a_light_gate_finds_no_spare_remote_slot_and_waits_here_in_its_place", 1);
+    let held = HeldBack::start(&case, false, 2);
+    let critical_pid = held.critical_pid();
+    let call = case.folder().join("call.json");
+    let steps = recording_stub(&case, &call);
+
+    let light = light_with_client(&case, "light.log", &steps, &with_heartbeat(), &ROUTED_COMMAND);
+    let pid = light.id();
+    wait_for_journal_line(&case.root(), &format!(r#""event":"fallback","pid":{pid},"#));
+    light.wait_for_stderr(&still_beside(critical_pid));
+
+    let waiting = own(&case, pid);
+    assert_eq!(names(&waiting), ["queue", "fallback"], "{waiting:#?}");
+    assert!(has_no_remote_fields(&waiting[0]), "{waiting:#?}");
+    assert_eq!(waiting[1]["reason"], "full", "{waiting:#?}");
+    assert_eq!(waiting[1]["criticalPid"], critical_pid, "{waiting:#?}");
+    assert!(!call.exists(), "the builder ran nothing");
+    held.let_lights_go();
+    let outcome = light.finish();
+
+    assert_passed(&outcome);
+    let events = own(&case, pid);
+    assert_eq!(names(&events), ["queue", "fallback", "take", "release"], "{events:#?}");
+    assert!(events[2..].iter().all(has_no_remote_fields), "{events:#?}");
+    assert!(!call.exists(), "the builder ran nothing: {outcome:?}");
+    held.finish();
+}
+
+#[test]
+fn a_light_gate_the_builder_refuses_waits_here_and_never_routes_again() {
+    let case = reroute_case("a_light_gate_the_builder_refuses_waits_here_and_never_routes_again", 2);
+    let held = HeldBack::start(&case, false, 2);
+    let critical_pid = held.critical_pid();
+    let call = case.folder().join("call.json");
+    let steps = stub(&case, &[&format!("record {}", shown(&call)), "refuse busy"]);
+
+    let light = light_with_client(&case, "light.log", &steps, &with_heartbeat(), &ROUTED_COMMAND);
+    let pid = light.id();
+    let still = still_beside(critical_pid);
+    light.wait_for_stderr_where("two still-waiting lines after the fallback line", |text| {
+        text.split_once(BUSY_LINE)
+            .is_some_and(|(_, after)| after.matches(still.as_str()).count() >= 2)
+    });
+    held.let_lights_go();
+    let outcome = light.finish();
+
+    assert_passed(&outcome);
+    assert_eq!(outcome.stderr.matches(&sent_to_builder(critical_pid)).count(), 1, "{outcome:?}");
+    let events = own(&case, pid);
+    assert_eq!(names(&events), ["queue", "take", "fallback", "take", "release"], "{events:#?}");
+    assert!(has_no_remote_fields(&events[0]), "{events:#?}");
+    for event in &events[1..3] {
+        assert!(has_remote_tag(event), "{events:#?}");
+        assert_eq!(event["criticalPid"], critical_pid, "{event}");
+    }
+    assert_eq!(events[2]["reason"], "busy", "{events:#?}");
+    assert!(events[3..].iter().all(has_no_remote_fields), "{events:#?}");
+    let log = fs::read_to_string(case.folder().join("light.log")).expect("the gate's log was written");
+    assert_in_order(&log, &[&sent_to_builder(critical_pid), BUSY_LINE]);
+    held.finish();
+}
+
+/// Starts the light run with `extra` and `command`, which never routes, behind a critical request with no place
+/// beside it, and asserts it waits there as any light gate does, then runs here once the light gates beside it go.
+fn assert_waits_behind_the_request(name: &str, extra: &[&str], command: &[&str]) {
+    let case = reroute_case(name, 2);
+    let held = HeldBack::start(&case, false, 2);
+    let critical_pid = held.critical_pid();
+    let call = case.folder().join("call.json");
+    let steps = recording_stub(&case, &call);
+
+    let light = light_with_client(&case, "light.log", &steps, extra, command);
+    let pid = light.id();
+    light.wait_for_stderr(&beside(critical_pid));
+    assert_eq!(events_of(&case, pid), ["queue"], "two light gates run beside the critical gate already");
+    held.let_lights_go();
+    let outcome = light.finish();
+
+    assert_passed(&outcome);
+    assert!(!outcome.stderr.contains("sending this light run"), "{outcome:?}");
+    assert!(!call.exists(), "the builder ran nothing: {outcome:?}");
+    assert_stayed_here(&own(&case, pid));
+    held.finish();
+}
+
+#[test]
+fn a_light_gate_whose_command_would_not_route_waits_behind_the_critical_request() {
+    assert_waits_behind_the_request(
+        "a_light_gate_whose_command_would_not_route_waits_behind_the_critical_request",
+        &POLL,
+        &["cmd", "/c", "exit", "0"],
+    );
+}
+
+#[test]
+fn a_light_gate_run_with_local_waits_behind_the_critical_request() {
+    let mut extra = POLL.to_vec();
+    extra.push("--local");
+    extra.extend(LOCAL_REASON);
+    assert_waits_behind_the_request("a_light_gate_run_with_local_waits_behind_the_critical_request", &extra, &ROUTED_COMMAND);
 }
 
 #[test]
