@@ -39,7 +39,7 @@ For a repo with a `.gate/warmup.toml` or `remote.json` consent to warm-ups, it a
 
   A critical gate does not wait for a `none` run and does not protect it.
 
-  The gate tells the caller when a run's slot did not fit it: for example, `gate: used 7.4 cores on average … on a light slot; work that keeps more than 2 busy belongs on heavy`. Act on that line: the next run of the same command uses the slot it names. The hint is how the slot gets chosen right; ignoring it keeps a heavy command on light, where it never routes to a builder, or a light one holding a heavy slot.
+  The gate tells the caller when a run's slot did not fit it: for example, `gate: used 7.4 cores on average … on a light slot; work that keeps more than 2 busy belongs on heavy`. Act on that line: the next run of the same command uses the slot it names. The hint is how the slot gets chosen right; ignoring it keeps a heavy command on light, where it routes to a builder only when a critical request holds it back, or a light one holding a heavy slot.
 
   A gated `git commit` takes a slot for all its hooks: pass `--slot heavy` when the hooks build or run analyzers, else `--slot light` (`--slot none` runs on a light slot and says so). Its hint reads `gate: the commit's hooks used … cores on average … on a light slot; hooks that keep more than 2 busy belong on --slot heavy`. A gate in its hooks that asks for `--slot critical` or `--alone` is refused.
 

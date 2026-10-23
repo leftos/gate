@@ -755,6 +755,7 @@ The lines of a run that starts its command:
   The refusal of a critical gate, and of an `--alone` gate under a gate's command, is there too.
 
   The late take adds `the parent gate <pid> ended; ...` and `cannot watch the parent gate ...` lines, in the same section.
+- A light gate the barrier holds back with no place beside the request, whose command would route, says `gate: held back by the critical request of gate <pid>; sending this light run to <alias>` on stderr and in the log, then the route lines, in place of its waiting line ([Routing](#routing), "What routes"). It is prose.
 - The gate prints no `queued for` or `took ... slot` line, for a local, a routed or a no-slot run: the queue and the take are in the journal, and a wait longer than 30 s says `gate: still waiting for a <kind> slot (<s> s)`, with the busy count and an ETA when every slot is busy ([Slots](#slots), step 6). A no-slot run never waits.
 - The expected-time line, on stderr and in the log, once a run that takes a slot has written its claim and woken the waiters and before the command's output: `gate: expected about <n> s (usual <n> s, p90 <n> s, <runs> runs)`, or in whole minutes from 90 s: `gate: expected about <n> min (usual <n> min, p90 <n> min, <runs> runs)`. A local light or heavy take says it, a critical gate after its holds line, a routed run at its remote take, and a fallback a second one at its local take.
 
@@ -810,12 +811,16 @@ A missing file or key means the default; an unreadable or invalid value is ignor
 2. Waiters of one kind take slots in ticket `arrived` order, ties broken by pid; a remote waiter counts only the tickets of its own pool (a ticket without `pool` is `host`'s). A gate tries a slot only when fewer live tickets of its kind are ahead of it than the pool has free slots (indices whose mutex no handle holds, a probe that fails counting as not free), not counting a ticket whose gate already holds a live claim (it holds a slot and only failed to delete its ticket), so a try never takes the slot an earlier waiter would get.
 
    It then tries indices 0 up to the count in order and takes the first free one. A live critical ticket that arrived before the gate (by `arrived`, then pid; the barrier, Q3) narrows that: a heavy gate tries no slot, and a light gate tries any light slot, and none once as many light gates run beside the critical request as the beside allowance (K3), which is 0 while a critical ticket says `alone`. See [Critical drain and nesting](#critical-drain-and-nesting).
+
+   A local light gate left with no place beside the request may route instead of waiting on.
+
+   A remote wait of such a rerouted light gate takes a slot only when it is free at once and another slot of the pool stays free after it: it takes the slot first, then probes the pool, and lets the slot go untaken when none is spare. A pool of one slot never takes such a run, and a slot that cannot be probed counts as no spare. A slot a dead gate left abandoned that the check lets go loses that gate's claim, as a takeover deletes it, and journals no `take`. Two such gates may both let go.
 3. A take deletes the gate's own ticket, writes the claim, journals `take` and wakes the waiters, so the next in line tries at once. A release deletes the claim, journals `release`, lets the mutex go and wakes the waiters. A critical gate takes the machine instead ([Critical drain and nesting](#critical-drain-and-nesting)): its `take` and `release` list every slot it holds, and it writes one claim, `gate-critical.json`, and none for the slots.
 4. A waiter sleeps on its own wake event, `Local\gate-wake-<pid>-<start>` (auto-reset). A gate that takes or releases a slot, or deletes a dead gate's ticket, signals the wake event of every live ticket in its state root. An auto-reset event stays signalled until its waiter wakes, so no wakeup is lost between a waiter's check and its wait. A wake that cannot be opened or set is not said: the fallback poll covers it.
 5. Each wait has a fallback poll as its timeout (2 s, kept from S4's interval). The poll re-reads the counts and the tickets, which deletes a dead waiter's ticket so it cannot hold the queue (Q1), and picks up a count changed by hand. A pass that found the [beside mutex](GLOSSARY.md) held by another gate (a light gate's, a lend's, a critical gate's) sleeps 100 ms at most, since that gate wakes the waiters only once it took or lent something.
 6. A waiter prints `gate: waiting for a <kind> slot (<n> busy)` once, on the first pass whose own [probe by open](#probe-by-open) finds none of the pool's slots free, where `<n>` is how many slots that same probe reports held, followed by `, the first frees in about <eta>` when the ETA below is known.
 
-   A gate that waits only behind earlier tickets while a slot is free for it does not print it. A gate held back by a critical request prints the barrier line instead, on its first pass ([Critical drain and nesting](#critical-drain-and-nesting)).
+   A gate that waits only behind earlier tickets while a slot is free for it does not print it. A gate held back by a critical request prints the barrier line instead, on its first pass ([Critical drain and nesting](#critical-drain-and-nesting)); a light gate held back with no room that routes prints the line saying so, and never its local waiting line.
 
    It prints `gate: still waiting for a <kind> slot (<s> s)` every 30 s from its queueing, on stderr and in the log, so a gate around it does not read the wait as a stall (kept, S4). When a probe of the last pass's slots finds every one busy, the line reads `(<s> s; <n> busy)`, with the ETA before the `)`. Its watchdog starts only once it holds a slot.
 
@@ -826,6 +831,8 @@ A missing file or key means the default; an unreadable or invalid value is ignor
    `waitedSeconds` in its `take` counts from its `queue` line; the local `take` of a routed run that fell back counts from the `fallback` line, as the PowerShell gate does, except when the last fallback was `full`, whose local `take` counts from the run's `queue` line (as the PowerShell gate did for it).
 
    A routed run's remote wait is one budget of 60 s (`--test-remote-wait-ms` in a test build), shared by every builder it tries ([Routing](#routing), The next builder): each builder's pool waits only for what the earlier attempts left of it, so the run never waits longer for a remote slot than for one builder. An attempt reached with nothing left takes a free slot and otherwise finds the pool full at once, saying no waiting line.
+
+   A rerouted light gate does not use this budget: its remote wait is zero, and its `take` counts its `waitedSeconds` from its first `queue` line.
 
    After a `full` fallback the wait's schedule, its still-waiting lines and its `take` or `abandon` `waitedSeconds` all count from that one instant, the run's `queue` line, so the `(<s> s)` includes the remote wait. The first still-waiting line of a wait entering from a fallback comes at the next whole heartbeat period past what it has already waited, never at once: for a 60 s remote wait and a 30 s heartbeat, the first line comes at 90 s.
 7. A problem a pass meets is said as a prose line, once per name or path per wait: `gate: could not take <name>: <error>`, `gate: cannot probe <name>: <error>`, `gate: cannot create the wake event <name>: <error>` (the gate then waits on the poll alone), `gate: cannot wait on the wake event <name>: <error>`, `gate: cannot write the ticket <path>: <error>`, `gate: cannot write the claim <path>: <error>`.
@@ -1100,7 +1107,7 @@ The event's own fields:
 | `release` | `slots` (the same list), `heldSeconds`, `status` (null when the gate failed before its command had one), `wallSeconds`, `adjustedSeconds`, optionally `avgCores`, `peakCores`, `freeCores`, `verdict`, the [run trace](GLOSSARY.md#run-trace) (`cpuSeconds`, `processes`, `peakProcesses`, `priority`, `loadFreeShare`, `children`, `phases`), and `cold` for a cold routed run |
 | `abandon` | `waitedSeconds`: the gate ended while still queued (Ctrl+C while waiting for a slot, or, for a routed run, while its client waited to start or while it waited for its work folder's key, remote-tagged) |
 | `parent`, `covered` | `parentPid`; a lent gate writes `parent` after its `queue` when it was lent the slot as it waited, and alone, with no `queue`, when it was lent it before it queued |
-| `fallback` | `reason`, then `remote`, `host`, `key`: it ends the routed attempt, so a remote `take` that falls back gets no `release`; a `full` fallback, and a `client` fallback with no client built, follow no remote `take` |
+| `fallback` | `reason`, then `remote`, `host`, `key` (and `routedFor`, `criticalPid` for a light run a critical request sent to a builder): it ends the routed attempt, so a remote `take` that falls back gets no `release`; a `full` fallback, and a `client` fallback with no client built, follow no remote `take` |
 
 A release with no run facts writes `wallSeconds: null`, `adjustedSeconds: null` and `verdict: "unknown"`.
 
@@ -1142,6 +1149,7 @@ Fields beyond J1's:
   The local `take` after the last attempt counts from the `queue` line when that attempt's fallback was `full`, else from the last `fallback`.
 
   A `release` writes `"heldSeconds":0.0` when the run holds no slot at that point: a Ctrl+C ended the walk over the later builders after a builder's refusal let its remote slot go.
+- `take`, `release`, `abandon` and `fallback` of a light run the critical barrier sent to a builder ([Routing](#routing), "What routes"): `"routedFor": "critical"` and `"criticalPid": <pid>` right after `key`, the pid of the critical request's gate. The run's `queue` line is the local, untagged one, and the remote `take`'s `waitedSeconds` counts from that `queue` line. No other run has either field; a run that fell back writes its later local lines untagged.
 - a routed run's `take`, `release` and `abandon` carry the tag; its `release` has the builder's `adjustedSeconds` (null when it said none) and a `wallSeconds` of the whole remote call, and the verdict `timed-out` or `backstop` after a kill by the builder or by the client's backstop.
 
 The verdict comes from the run's end: a kill line matching `^gate: (STALLED|TIMED OUT|BACKSTOP|TRANSFER TIMED OUT)\b` gives `stalled`, `timed-out`, `backstop` or `transfer-timed-out`; otherwise a command status of 0 with a non-zero gate status is `log-failure`, a status of 0 is `passed`, anything else `failed`; `unknown` when there are no run facts.
@@ -1159,6 +1167,8 @@ The history that ops-tower serves (`HistoryRun`, `GET /api/gate/history`) carrie
 It also carries `reason`, the free text the run's `queue` line holds from `--reason`, omitted when the run gave none; the first `queue` line that names one wins. A covered run, and one lent its parent's slot before queueing, writes no `queue` line, so it carries no reason.
 
 It carries `cold` (`true`) when the run's `release` line says `"cold": true` ([Cold run](GLOSSARY.md#cold-run)), and omits it otherwise: a run with no release, and a release without the field, have none.
+
+It carries `criticalPid` when the run's latest remote line names one ([Routing](#routing), "What routes"): the gate of the critical request that sent the light run to a builder. A fallback clears it, and every other run omits it.
 
 The history lists the 50 newest runs that are not covered, and at most the 50 newest covered runs newer than the oldest of them: at most 100 runs, newest first by the time of each run's first journal line (its queue line, or the `parent` or `covered` line of a gate that never queued), then by pid and process start.
 
@@ -1417,6 +1427,10 @@ What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K
   While a live critical ticket says `alone` (the earliest such ticket, ahead of the gate or not, once a request holds the gate back) the allowance is 0 and no light gate tries a slot.
 
   The light gates beside a request are the other gates' live light claims, whichever slots they hold, counted by a gate that holds the beside mutex from its count to the write of its own claim, so a gate between its take and its claim is counted. A pass that finds the mutex held by another gate has no room. The allowance is taken from the light count as it stands on each pass. A remote wait has no barrier.
+
+  A local light gate the barrier holds back with no room beside the request (a plain request whose allowance is used up, or an `--alone` one) may leave its wait to route: it is a [rerouted light gate](GLOSSARY.md), described in [Routing](#routing), "What routes".
+
+  The pass that finds no room, with the beside mutex not busy, ends the wait as held back instead of sleeping, once per run and only for a gate that asked the routing decision at its start, is neither lent nor covered, and passed no `--builder`.
 - **The lend (N2).**
 
   A heavy gate under a light parent (the one nesting case where the parent's slot does not cover the gate) is lent the parent's slot, whichever light slot the parent holds, takes no slot of its own and says the lend line, while a critical request is pending and none refuses a new lend.
@@ -1474,7 +1488,8 @@ What `gate.exe` does of it today is part A, nesting under the slot marker (N1, K
   The holders are the heavy slots some gate has open, the light slots past the count that live claims hold, and of the light slots some gate has open, all but the allowance of those whose usual ends come soonest, each by its live claim's `expected`, and each live lend marker by its own `expected`. It is given when only lent gates block, and dropped when a marker cannot be read or has none.
   - `gate: holds the machine (critical) at <yyyy-MM-ddTHH:mm:ss.fffffffZ> after <s.d> s: counts heavy <H>, light <L>; other gates hold <h> heavy and <l> light slots (<r> ... beside it); other live claims: <pid> <kind> <index> <command>, ...`, the claims ending as `none` or `unknown (<reason>)` when they could not be listed.
   - `gate: waiting for a heavy slot behind the critical request of gate <pid>`, from a heavy gate the barrier holds back, on its first pass whether or not a slot is free, with `<pid>` the earliest request's gate; then `gate: still waiting for a heavy slot (<s> s)` on each heartbeat.
-  - `gate: waiting for a light slot beside the critical request of gate <pid>`, from a light gate the barrier holds back, likewise, then `gate: still waiting for a light slot beside the critical request of gate <pid> (<s> s)`.
+  - `gate: waiting for a light slot beside the critical request of gate <pid>`, from a light gate the barrier holds back, likewise, then `gate: still waiting for a light slot beside the critical request of gate <pid> (<s> s)`. A light gate held back with no room whose command would route prints neither: it says the line below instead.
+  - `gate: held back by the critical request of gate <pid>; sending this light run to <alias>`, from a rerouted light gate, then the route lines ([Routing](#routing)), then the run goes on the builder. Prose, not a stable line.
   - `gate: waiting for a light slot behind the request of gate <pid> that holds the machine alone`, and `gate: still waiting for a light slot behind the request of gate <pid> that holds the machine alone (<s> s)`, from a light gate the barrier holds back once a request to hold the machine alone is live, in place of the two lines above. `<pid>` is the earliest live alone request, ahead of the light gate or not.
   - `gate: running under the <held kind> slot of gate <pid> while a critical request drains; taking no slot`, from a lent gate, said before its command starts.
   - `gate: interrupted while waiting for the machine`, on Ctrl+C: the journal gets `abandon`, everything taken is released and the exit is 0xC000013A.
@@ -1767,6 +1782,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
 - **What routes** is kept (T2): a heavy gate, not `--local`, under no covering or lending parent (a commit run's slot is not one for this rule, [Commit run](#critical-drain-and-nesting)), outside a git hook (`GIT_INDEX_FILE` set to a non-empty value) unless `remote.json`'s `hooks` names the repo, whose first word is not `git` or `prek`, in a git worktree of a repo `remote.json` lists, whose words with in-worktree paths rewritten (T3) match one of that repo's patterns.
 
+  A light gate the critical barrier holds back also routes (**A light gate held back**, below).
+
   **Which builder.** The run goes to the first routed `builders` entry, in file order, whose own `repos.<repo>` patterns match the Windows-form rewritten words, else to `host` when the top-level patterns match. A warm-up always goes to `host`. A command matching a `.gate/desktop.toml` pattern is never picked by a `macos` entry. A `sendBuild` repo's `--no-build` test picked by a `macos` entry drops `--no-build` and sends no build. The words sent to a `macos` builder use `/` inside the recognised path spans. A repo listed only in a `builders` entry is routed ([`gate check`](#gate-check) treats it so).
 
   **Pinned run.** `gate run --builder <host>` routes a heavy run to the one builder `<host>` names, which must be `host`, a `hosts` name or a `builders` alias (routed or not), matched ignoring ASCII case as `gate check --builder` matches. The pin needs the repo's consent and a command matching one of its patterns: the pinned builder's own listing when it names the repo (its `builders` entry's `repos`, routed or not; the top-level `repos` for `host`), else the first match across the repo's routes, any builder; a `hosts` entry has no listing of its own. It replaces the builder pick and the next-builder list, and a pinned run never takes a slot a light parent lends, so it routes whatever a critical request is doing. The flag is never passed to nested gates.
@@ -1776,6 +1793,18 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   Any other keep-here reason says `gate: --builder <host> cannot route this run: <why>`, with `<why>` one of `a parent gate's slot covers this gate`, `git, prek and an empty command never route`, `a gate started in a git hook routes only for a repo remote.json's hooks names`, `the gate's folder is in no git worktree`, `it asks for a desktop, which a macOS builder does not have`, `a word still holds a \, which a macOS builder reads another way`, `a word of the command is not valid Unicode`, or the text of another kept-here reason.
 
   A pinned run its builder refuses (any reason), cannot reach, whose client cannot start, or whose work-folder key another run holds, ends with exit 1 and `gate: remote <host> <reason>; --builder given, so not running here` (or `gate: remote <host> client could not start: <detail>; --builder given, so not running here`). No other builder is tried, nothing runs here and no `fallback` event is journaled: the journal holds `queue`, `take` and a `release` with status 1, and no `take` when the run ended before a slot.
+
+  **A light gate held back.** A local light gate whose wait the critical barrier holds back with no place beside the request ([Critical drain and nesting](#critical-drain-and-nesting), "The barrier"), a plain request whose beside allowance is used up or an `--alone` one, asks the routing decision once more, with the heavy slot.
+
+  It does so only when it is not lent, not covered, not pinned with `--builder`, and asked the decision at its start. When its command would route, it says `gate: held back by the critical request of gate <pid>; sending this light run to <alias>`, then the route lines, and runs on the builder; it never prints its local waiting line.
+
+  A command that would not route waits on as before and says nothing new, as do `--local`, `--builder`, covered, lent, in-box and commit gates.
+
+  Such a run takes a builder remote slot only when one is free at once and another slot of that pool stays free after it ([Slots](#taking-a-slot)).
+
+  It never waits for a remote slot or for the work-folder key, a held key being `busy`. A fallback for any reason (`full`, `busy`, a refusal, `client`) sends it back to its local wait with its first arrival and first queue instant kept; its log holds the announce and route lines, then the fallback line. It asks to route once per run, and the next-builder walk below asks later builders as heavy.
+
+  Its remote journal lines (`take`, `release`, `abandon`, `fallback`) carry `routedFor` and `criticalPid` ([Journal](#journal)); its `queue` line is the local, untagged one.
 
   **The next builder.** A builder that sends a routed run back for `full`, `busy` (its own refusal), `unreachable`, `version`, `parity`, `install` or `tools` is followed by the next capable builder before the run goes to the PC. The candidates are, held by alias, each `builders` entry listing the repo whose own patterns match the command, in `remote.json` file order, then `host` when its patterns match, minus the pick.
 
@@ -4454,6 +4483,8 @@ When a run that passed did not fit its slot, the gate says how many cores the co
 - The route hint tells the caller of a light run that it could have gone to a builder. It is said on stdout after any cores line and before the passed line: `gate: ran <n> s on a light slot; on heavy, remote.json would send this command to a builder`, `<n>` the whole unpaused seconds, rounded down.
 
   Only a passed run that took its own light slot and ran here for 30 s or more of unpaused wall time is asked (about twice the routing overhead, so the push costs well under half the run), and only once it has passed, never before. The decision is asked again as heavy with every other input as the run's own: it reads the routing file and git as the decision does, starts no warm-up and says none of the decision's lines.
+
+  The hint still applies only to a light run that ran here: a light run the critical barrier sent to a builder ([Routing](#routing)) is a routed run and gets none, and one that fell back and ran here is judged like any light run.
 
   It is silent on any other slot, on any failure, under the floor, with `--local`, under a covering or lending parent, inside a git hook of a repo `hooks` does not name, with a command word that is not Unicode, and when the heavy decision keeps the command local. The hint runs while the run still holds its slot, so each git call it makes is limited to 5 s, and one that does not answer in time leaves the run silent. Act on it as on the cores hint: move the command to heavy.
 - The journal's `release` line records `avgCores`, `peakCores` and `freeCores` ([Journal](#journal)), the history `--slot auto` will read (GATE-8). `--slot auto` runs a command with too little history on heavy and says it guessed; it never chooses critical or none.
