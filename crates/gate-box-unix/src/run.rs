@@ -48,7 +48,7 @@ pub const REFUSED_STATUS: u8 = 75;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Unbuilt {
     pub(crate) refusal: Refusal,
-    /// The payload key that asks for it.
+    /// What asks for it: the payload key, or `package restore` for a pnpm, bun or npm command.
     pub(crate) key: &'static str,
 }
 
@@ -63,6 +63,19 @@ impl Unbuilt {
             format!("gate: remote {why}")
         }
     }
+}
+
+/// Whether the command whose first word is `program` is a package manager's: its file stem, after any folder and less
+/// its last extension, is `pnpm`, `bun`, `bunx`, `npm` or `npx`, compared in any case.
+fn is_package_manager(program: &str) -> bool {
+    let name = program.rsplit('/').next().unwrap_or(program);
+    let stem = match name.rfind('.') {
+        Some(dot) if dot > 0 => &name[..dot],
+        _ => name,
+    };
+    ["pnpm", "bun", "bunx", "npm", "npx"]
+        .iter()
+        .any(|manager| stem.eq_ignore_ascii_case(manager))
 }
 
 /// One repo of a run, made once as the payload is read: its name on a pair run, its tree, the bare repository its
@@ -182,10 +195,10 @@ pub struct Request<'p> {
 
 impl<'p> Request<'p> {
     /// Reads `payload` in the order the Windows box reads it, each key checked as it does, the outputs asked for
-    /// ([`Asked::new`]) read once the output folder is; then notes the first key asking for what this builder does not
-    /// build: `Desktop`, a warm-up's `WarmCommands`, `EngineEnv`, `UnrealVersion`, `SentDigest` or `LfsDigest`; then, last, the
-    /// repos ([`repos`]), a sibling pair as `gate-wire` checks it. A work root holding a `:` is refused just after the
-    /// work folder is read ([`work_layout`]).
+    /// ([`Asked::new`]) read once the output folder is; then notes the first thing asking for what this builder does not
+    /// build: `Desktop`, a warm-up's `WarmCommands`, `EngineEnv`, `UnrealVersion`, `SentDigest`, `LfsDigest` or a
+    /// package manager's command ([`is_package_manager`]); then, last, the repos ([`repos`]), a sibling pair as
+    /// `gate-wire` checks it. A work root holding a `:` is refused just after the work folder is read ([`work_layout`]).
     ///
     /// # Errors
     ///
@@ -209,6 +222,11 @@ impl<'p> Request<'p> {
         let index = payload.beside_work("Index", work, "index")?;
         let job = payload.job(key)?;
         let commands = payload.commands()?;
+        let packages = commands
+            .words
+            .first()
+            .and_then(|words| words.first())
+            .is_some_and(|program| is_package_manager(program));
         let warm = commands.warm_hash.is_some();
         if desktop && warm {
             return Err("gate: box payload asks a warm-up for the desktop".to_owned());
@@ -231,6 +249,7 @@ impl<'p> Request<'p> {
             (unreal, Refusal::Layout, "UnrealVersion"),
             (sent, Refusal::Sent, "SentDigest"),
             (lfs, Refusal::Lfs, "LfsDigest"),
+            (packages, Refusal::Tools, "package restore"),
         ]
         .into_iter()
         .find_map(|(asked, refusal, key)| asked.then_some(Unbuilt { refusal, key }));
@@ -3582,6 +3601,41 @@ mod tests {
         let case = Case::new("lfs");
         let lfs = json!({ "LfsDigest": DIGEST });
         assert_refused(&case, &lfs, Refusal::Lfs, "gate: remote LfsDigest is not built on this builder");
+    }
+
+    /// Commands whose first word is a package manager's: the stems of the Windows box's `MANAGERS`, in any case, after
+    /// any folder and less any extension.
+    const PACKAGE_MANAGER_COMMANDS: [&[&str]; 5] = [
+        &["pnpm", "test"],
+        &["/opt/homebrew/bin/npm", "ci"],
+        &["NPX", "vitest"],
+        &["bunx", "tsc"],
+        &["bun.exe", "run", "build"],
+    ];
+
+    #[test]
+    fn a_package_manager_command_is_refused_tools() {
+        for (n, command) in PACKAGE_MANAGER_COMMANDS.iter().enumerate() {
+            let case = Case::new(&format!("packages-{n}"));
+
+            assert_refused(
+                &case,
+                &json!({ "Command": command }),
+                Refusal::Tools,
+                "gate: remote package restore is not built on this builder",
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_named_like_a_package_manager_but_not_one_runs() {
+        for (name, command) in [("pnpm-helper", ["pnpm-helper"]), ("npmrc-check", ["./npmrc-check"])] {
+            let case = Case::new(&format!("not-packages-{name}"));
+            let payload = decoded(&case.json(&"a".repeat(40), &json!({ "Command": command })));
+            let request = Request::read(&payload).expect("the request reads");
+
+            assert!(request.unbuilt.is_none(), "{command:?} is not refused");
+        }
     }
 
     #[test]

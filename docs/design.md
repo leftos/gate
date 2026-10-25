@@ -3939,7 +3939,7 @@ A missing, disabled or different task is a refusal whose why names the fix.
 
 A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It speaks the box side's wire above, so the PC's client reads both alike: `gate-box --version` prints the same `gate <version>` text, and `gate-box box <verb> --stdin` reads the request as `gate box` does and parses it with `gate-wire` under `PathForm::Unix`. This section lists only where it differs.
 
-- **Verbs.** `preflight`, `boot`, `run`, `stop`, `prune`, `inputs` and `outputs` are built. `run` readies the tree, runs the command under the watch and syncs the tree back (below), in the Windows box's order, the dotnet tool restore (below) included; the pnpm, bun and npm package restores are not built (GATE-648).
+- **Verbs.** `preflight`, `boot`, `run`, `stop`, `prune`, `inputs` and `outputs` are built. `run` readies the tree, runs the command under the watch and syncs the tree back (below), in the Windows box's order, the dotnet tool restore (below) included; the pnpm, bun and npm package restores are not built (GATE-648), so a run whose command's program is `pnpm`, `bun`, `bunx`, `npm` or `npx` (its file stem, in any case) is refused `tools` with `gate: remote package restore is not built on this builder`, and the PC retries it on the next builder.
 
   The run takes `Outputs` and `OutputsFull` and brings outputs back as the Windows box's run does ([The box side](#the-box-side)), through the `outputs` module below. Where it differs: a run with globs reads one more stdin line after the request, the PC's manifest (at most 64 MiB), after the heartbeat starts and before the layout and checkout, and a run without globs reads nothing past the request line.
 
