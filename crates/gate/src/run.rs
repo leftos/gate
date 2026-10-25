@@ -1,8 +1,9 @@
 //! `gate run`: a log inside the state root refused, the parent gate's slot marker read and a critical gate under a heavy
-//! or light one refused, the program found and the words written into its command line, a batch word refused, the log's
-//! mutex taken so no other gate writes the same log, the log readied, a slot queued for and taken unless a parent's slot
-//! covers the gate, the command started in its job with its environment and priority and waited for, the log completed,
-//! the failure markers scanned, the tail and the verdict line said, and the slot released.
+//! or light one refused, a gate under an orphaned script refused, the program found and the words written into its
+//! command line, a batch word refused, the log's mutex taken so no other gate writes the same log, the log readied, a
+//! slot queued for and taken unless a parent's slot covers the gate, the command started in its job with its environment
+//! and priority and waited for, the log completed, the failure markers scanned, the tail and the verdict line said, and
+//! the slot released.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -59,6 +60,7 @@ use crate::log_writer::LogWriter;
 use crate::machine::{self, Machine, MachineWait, MachineWaited};
 use crate::nesting::{Nesting, Parent, covers, enclosing_of};
 use crate::no_build::{self, NothingBack, Unfound, Worktree};
+use crate::orphan::{self, Orphan};
 use crate::outputs::{stale, walk::walk};
 use crate::remote::{self, KEY_WAIT_SLICE, KeyWait, RemoteCall, RemoteClient, RemoteOutcome, Split, git};
 use crate::resolve::{Environment, ResolvedRoot};
@@ -104,14 +106,19 @@ const KEY_WAIT: Duration = Duration::from_secs(90);
 /// it started, 124 for a command killed as stalled, timed out or past the backstop, 127 when it could not be started,
 /// 0xC000013A for a Ctrl+C in the queue, before the command started, or with the command still running 5 s after it,
 /// or 2 for a log inside the state root, a critical gate under a heavy or light parent's slot, a critical or `--alone`
-/// gate inside a commit run's hooks, a batch word refused before anything was queued, a `--builder` pin refused
-/// before anything was queued or an `--alone` gate whose `--no-build` would be dropped ([`alone_refused`]). A run
+/// gate inside a commit run's hooks, a gate started under a script whose caller is gone ([`orphan_refusal`]), a batch
+/// word refused before anything was queued, a `--builder` pin refused before anything was queued or an `--alone` gate
+/// whose `--no-build` would be dropped ([`alone_refused`]). A run
 /// pinned with `--builder` that its builder did not run ends with 1.
 pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: &Environment, console: &mut Console) -> u32 {
     let (nesting, asked) = match admitted(request, log, root, environment, console) {
         Ok(admitted) => admitted,
         Err(status) => return status,
     };
+    if let Some(orphan) = orphan_refusal(&nesting) {
+        console.err(&orphan.line());
+        return u32::from(USAGE_STATUS);
+    }
     let request = &*asked;
     let gate = match ThisGate::read(request) {
         Ok(gate) => gate,
@@ -331,6 +338,16 @@ fn refusal(nesting: &Nesting, request: &RunRequest, console: &mut Console) -> Op
         return Some(u32::from(USAGE_STATUS));
     }
     None
+}
+
+/// The orphaned script a gate under `nesting` refuses to start under ([`orphan::orphaned_caller`]), looked for only when
+/// no live parent gate holds this one: a gate a parent covers, lends to or stands beside, or one inside a box run, is
+/// started by that gate's command, and a refused one has already ended.
+fn orphan_refusal(nesting: &Nesting) -> Option<Orphan> {
+    match nesting {
+        Nesting::Own | Nesting::Malformed(_) | Nesting::Ended { .. } | Nesting::Unbound { .. } => orphan::orphaned_caller(),
+        Nesting::Covered(_) | Nesting::Refused(_) | Nesting::Under(_) | Nesting::Beside(_) | Nesting::InBox => None,
+    }
 }
 
 /// Says the lines of the `nesting` a gate of `request` runs under, once it is final: the line of a marker whose binding

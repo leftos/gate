@@ -169,6 +169,25 @@ pub fn current_user_sid() -> io::Result<String> {
     user_sid_of(&this_process_token(TOKEN_QUERY)?)
 }
 
+/// The owners, as SIDs' string forms, that this process's token gives what its user creates: its user, and its default
+/// owner (`TokenOwner`) too when the token is elevated, as an elevated token's objects are owned by Administrators.
+///
+/// # Errors
+///
+/// The system's error when the token cannot be opened or read.
+pub(crate) fn own_object_owners() -> io::Result<Vec<String>> {
+    let token = this_process_token(TOKEN_QUERY)?;
+    let user = Information::<TOKEN_USER>::read(&token, TokenUser)?;
+    // SAFETY: the SID points into the buffer the system wrote it in, which lives across the call.
+    let mut owners = vec![unsafe { sid_string(user.get().User.Sid) }?];
+    if Information::<TOKEN_ELEVATION>::read(&token, TokenElevation)?.get().TokenIsElevated != 0 {
+        let owner = Information::<TOKEN_OWNER>::read(&token, TokenOwner)?;
+        // SAFETY: as above.
+        owners.push(unsafe { sid_string(owner.get().Owner) }?);
+    }
+    Ok(owners)
+}
+
 /// An account's name and the domain it belongs to (the computer's name for a local account), as the system names the
 /// account a SID stands for.
 #[derive(Clone, Debug, PartialEq, Eq)]

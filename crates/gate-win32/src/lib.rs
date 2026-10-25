@@ -6,8 +6,9 @@
 //! open folder, a file opened again through its reparse point's filter, an open file's volume serial and file id
 //! ([`file_id`]), whether two open files are one, whether an open file is on a network volume ([`on_network_volume`]),
 //! the synchronous I/O a thread waits on cancelled ([`cancel_synchronous_io`]), the GPU's 3D use per adapter over a
-//! window ([`Gpu3dWindow`]), the subkeys of a registry key with a string value of each ([`registry_subkeys`]), and the
-//! Windows message of an error code. And what a run on the interactive desktop needs: a named pipe for one
+//! window ([`Gpu3dWindow`]), the subkeys of a registry key with a string value of each ([`registry_subkeys`]), a
+//! process's parent as the MSYS runtime records it ([`msys_parent`]), and the Windows message of an error code. And
+//! what a run on the interactive desktop needs: a named pipe for one
 //! user's local client, handles copied into and out of another process and the checks on a process taken that way, a
 //! command created on the interactive desktop, the console session's state, and a registered scheduled task started in
 //! a given session once its definition is checked ([`run_task`]), and whether an installed file only SYSTEM,
@@ -31,6 +32,7 @@ mod interrupt;
 mod job;
 mod launch;
 mod memory;
+mod msys;
 mod mutex;
 mod pipe;
 mod piped;
@@ -65,6 +67,7 @@ pub use launch::{
     same_variable_name,
 };
 pub use memory::working_set;
+pub use msys::{MsysParent, msys_parent};
 pub use mutex::{AcquireError, MutexGuard, NamedMutex, OwnedMutexGuard, PrivateMutex, PrivateName, mutex_exists};
 pub use pipe::{ConnectWait, PipeClient, PipeOwner, PipeRead, PipeServer, PipeWrite};
 pub use piped::{DesktopLaunch, OutputPipes, PipedConsole, PipedFed, PipedLaunch, PipedSuspended, breakaway_refused, output_pipes};
