@@ -27,6 +27,9 @@ use std::io::{self, BufRead, Read};
 use std::path::Path;
 use std::time::SystemTime;
 
+#[cfg(test)]
+pub(crate) use preflight::WORK_ROOT_STEP;
+
 use gate_args::{BoxRequest, BoxVerb, Problem};
 use gate_wire::build_version;
 use gate_wire::{PathForm, Payload};

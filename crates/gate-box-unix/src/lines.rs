@@ -15,12 +15,9 @@ pub const NEW_WORK_TREE: &str = "gate: remote new work tree";
 /// The line a payload whose `Needs` is not an object of texts gets; nothing is probed.
 pub const NEEDS_REFUSED: &str = "gate: box payload Needs is not an object of texts; probing nothing";
 
-/// What the preflight says on stderr, before why, when another account may write in the builder's work root, as the
-/// Windows box says it; the client reads it, with status [`ROOT_STATUS`], as a `root` fallback.
-pub const ROOT_UNSAFE: &str = "gate: the builder's work root is not locked down: ";
-
-/// The status of a preflight that refused its work root with [`ROOT_UNSAFE`].
-pub const ROOT_STATUS: u8 = 1;
+/// The macOS installer step that locks the builder's work root down, as the work-root refusal names it
+/// ([`gate_wire::root_unsafe_line`]).
+pub const WORK_ROOT_STEP: &str = "install-macos.sh --only \"Gate work root\"";
 
 /// The status of a usage error: a request or payload the box cannot act on.
 pub const USAGE_STATUS: u8 = 2;
@@ -51,16 +48,6 @@ pub fn warm_line(hash: Option<&str>) -> String {
 #[must_use]
 pub fn created_line(bare: &str) -> String {
     format!("gate: remote created {}", escaped(bare))
-}
-
-/// The line refusing the work root for `why`, escaped ([`ROOT_UNSAFE`]), naming the macOS installer step that locks it
-/// down.
-#[must_use]
-pub fn root_unsafe_line(why: &str) -> String {
-    format!(
-        "{ROOT_UNSAFE}{}; run the installer's \"Gate work root\" step (install-macos.sh --only \"Gate work root\")",
-        escaped(why)
-    )
 }
 
 /// A marker for one print of the login shell: `__GATE_LOGIN_<16 hex>__`, the hex from the box's process id and the
@@ -165,14 +152,6 @@ pub fn boot_failure(message: &str) -> String {
     format!("gate: remote could not read the boot time: {message}")
 }
 
-/// The SDK list of `dotnet --list-sdks`'s output `listing`: the first word of each non-empty line, joined by `,`;
-/// `none` when there is none.
-#[must_use]
-pub fn sdk_list(listing: &str) -> String {
-    let versions: Vec<&str> = listing.lines().filter_map(|line| line.split_whitespace().next()).collect();
-    if versions.is_empty() { "none".to_owned() } else { versions.join(",") }
-}
-
 /// `gate: remote sdks <list>`, the list escaped, as `dotnet` wrote it.
 #[must_use]
 pub fn sdks_line(list: &str) -> String {
@@ -197,29 +176,6 @@ pub fn sdks_failure(message: &str) -> String {
     format!("gate: remote could not read the SDK list: {message}")
 }
 
-/// What a probe found of one tool.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Probed {
-    /// It ran, and its version reads as this text.
-    Version(String),
-    /// It ran, and no version reads in what it wrote, or it exited non-zero.
-    Present,
-    /// It is not found.
-    Missing,
-    /// It was not probed to an answer, for this reason.
-    Skipped(String),
-}
-
-/// What a probe whose program ran to its exit found: present when it exited non-zero (`succeeded` false) or its first
-/// line holds no version ([`gate_wire::version_of`]); else that version.
-#[must_use]
-pub fn probed(succeeded: bool, stdout: &[u8], stderr: &[u8]) -> Probed {
-    if !succeeded {
-        return Probed::Present;
-    }
-    gate_wire::version_of(&String::from_utf8_lossy(stdout), &String::from_utf8_lossy(stderr)).map_or(Probed::Present, Probed::Version)
-}
-
 /// Why a probe cut by its deadline `limit` was skipped: `no answer in <n> s`, or `<n> ms` when the limit is not whole
 /// seconds.
 #[must_use]
@@ -228,19 +184,6 @@ pub fn no_answer(limit: Duration) -> String {
         format!("no answer in {} s", limit.as_secs())
     } else {
         format!("no answer in {} ms", limit.as_millis())
-    }
-}
-
-/// The line the preflight says for the tool `name`, as its probe found it: `gate: remote tool <name> <version>`,
-/// `present`, `missing` or `skipped: <why>`, the name and the reason escaped, as either may come from outside.
-#[must_use]
-pub fn tool_line(name: &str, probed: &Probed) -> String {
-    let name = escaped(name);
-    match probed {
-        Probed::Version(version) => format!("gate: remote tool {name} {version}"),
-        Probed::Present => format!("gate: remote tool {name} present"),
-        Probed::Missing => format!("gate: remote tool {name} missing"),
-        Probed::Skipped(why) => format!("gate: remote tool {name} skipped: {}", escaped(why)),
     }
 }
 
@@ -684,10 +627,9 @@ mod tests {
         command_environment, command_status, rosetta_lines, round_trip, translation,
     };
     use super::{
-        JobRecord, Login, Probed, Recorded, RootFacts, boot_line, created_line, folder_failure, folder_flaw, is_git_variable, is_lower_hex,
-        job_record, job_record_text, layout_text, login_marker, marked_login, names_another_layout, no_answer, probed, readies_single, record_unread,
-        record_without_group, recorded_group, root_flaw, root_unsafe_line, sdk_list, sdks_line, signal_guard, step_unran, tool_line, version_line,
-        warm_text, work_layout, write_failure,
+        JobRecord, Login, Recorded, RootFacts, WORK_ROOT_STEP, boot_line, created_line, folder_failure, folder_flaw, is_git_variable, is_lower_hex,
+        job_record, job_record_text, layout_text, login_marker, marked_login, names_another_layout, no_answer, readies_single, record_unread,
+        record_without_group, recorded_group, root_flaw, sdks_line, signal_guard, step_unran, version_line, warm_text, work_layout, write_failure,
     };
     use gate_wire::BoxKill;
 
@@ -935,27 +877,6 @@ mod tests {
     }
 
     #[test]
-    fn the_sdk_list_is_the_first_word_of_each_line_joined() {
-        assert_eq!(
-            sdk_list("8.0.415 [/usr/local/share/dotnet/sdk]\n10.0.100 [/usr/local/share/dotnet/sdk]\n"),
-            "8.0.415,10.0.100"
-        );
-        assert_eq!(sdk_list(""), "none");
-        assert_eq!(sdk_list("\n  \n"), "none", "blank lines name nothing");
-    }
-
-    #[test]
-    fn a_tool_line_says_what_the_probe_found_escaped() {
-        assert_eq!(tool_line("rust", &Probed::Version("1.99.0".to_owned())), "gate: remote tool rust 1.99.0");
-        assert_eq!(tool_line("node", &Probed::Present), "gate: remote tool node present");
-        assert_eq!(tool_line("godot", &Probed::Missing), "gate: remote tool godot missing");
-        assert_eq!(
-            tool_line("x\u{1b}", &Probed::Skipped("unknown\ntool".to_owned())),
-            r"gate: remote tool x\u{1b} skipped: unknown\ntool"
-        );
-    }
-
-    #[test]
     fn every_git_variable_is_scrubbed_in_any_case_and_nothing_else() {
         let environment = [
             "GIT_CONFIG",
@@ -983,25 +904,6 @@ mod tests {
         assert_eq!(step_unran("git init", "no such\nfile"), r"gate: remote git init failed: no such\nfile");
         assert_eq!(record_unread("/w/k\n.pgid", "denied\u{1b}"), r"cannot read /w/k\n.pgid: denied\u{1b}");
         assert_eq!(record_without_group("/w/k\n.pgid"), r"/w/k\n.pgid names no process group");
-    }
-
-    #[test]
-    fn a_probe_that_ran_reads_its_version_or_is_present() {
-        assert_eq!(
-            probed(true, b"rustc 1.99.0 (abc 2026-09-28)\n", b""),
-            Probed::Version("1.99.0".to_owned())
-        );
-        assert_eq!(
-            probed(true, b"git-lfs/3.8.0 (GitHub; darwin arm64; go 1.24.4)\n", b""),
-            Probed::Version("3.8.0".to_owned())
-        );
-        assert_eq!(
-            probed(true, b"", b"PowerShell 7.6.6\n"),
-            Probed::Version("7.6.6".to_owned()),
-            "stderr when stdout is blank"
-        );
-        assert_eq!(probed(true, b"no version\n", b""), Probed::Present);
-        assert_eq!(probed(false, b"v24.19.0\n", b""), Probed::Present, "a non-zero exit is present");
     }
 
     #[test]
@@ -1064,7 +966,7 @@ mod tests {
     #[test]
     fn the_root_line_escapes_its_why_and_names_the_mac_installer_step() {
         assert_eq!(
-            root_unsafe_line("/g\n is not owned by b or is writable by others"),
+            gate_wire::root_unsafe_line("/g\n is not owned by b or is writable by others", WORK_ROOT_STEP),
             concat!(
                 r"gate: the builder's work root is not locked down: /g\n is not owned by b or is writable by others; ",
                 r#"run the installer's "Gate work root" step (install-macos.sh --only "Gate work root")"#

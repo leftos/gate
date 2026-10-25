@@ -20,7 +20,7 @@ use gate_args::BoxSeams;
 use gate_router::escaped;
 use gate_win32::{Job, LaunchError, Make, NamedEvent, PipedConsole, PipedLaunch, Share};
 use gate_wire::build_version;
-use gate_wire::{Pair, PairSibling, PathForm, Payload, bare_stem, work_root};
+use gate_wire::{Pair, PairSibling, PathForm, Payload, ROOT_STATUS, bare_stem, root_busy_line, root_unsafe_line, work_root};
 use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
@@ -38,8 +38,12 @@ use crate::boxside::stamping;
 use crate::boxside::stop::terminate_and_wait;
 use crate::console::Console;
 use crate::environment::Variables;
-use crate::remote::{INSTALL_STATUS, NEW_WORK_TREE, ROOT_STATUS, git, install_untrusted_line, launch, root_busy_line, root_unsafe_line};
+use crate::remote::{INSTALL_STATUS, NEW_WORK_TREE, git, install_untrusted_line, launch};
 use crate::run::{ERROR_FILE_NOT_FOUND, Written, find_program};
+
+/// The Windows installer step that locks the builder's work root down, as the work-root refusal names it
+/// ([`gate_wire::root_unsafe_line`]).
+pub(crate) const WORK_ROOT_STEP: &str = "install-toolchains.ps1 -Only \"Gate work root\"";
 
 /// The status of a step that failed with no status of its own: git or a folder that could not be made or written.
 const FAILED_STATUS: u32 = 1;
@@ -202,7 +206,7 @@ fn held_work_root(work: &str, bare: &str, paired: bool, seams: &BoxSeams, consol
         let line = if why.is_busy() {
             root_busy_line(&why.to_string())
         } else {
-            root_unsafe_line(&why.to_string())
+            root_unsafe_line(&why.to_string(), WORK_ROOT_STEP)
         };
         stamping::err(console, &line);
         u32::from(ROOT_STATUS)
@@ -247,10 +251,10 @@ fn say_sdks_and_tools(payload: &Payload, work: &str, seams: &BoxSeams, console: 
         };
         let found = probes.join().unwrap_or_else(|panic| {
             let why = probe::panic_reason(&*panic);
-            names.iter().map(|name| (name.clone(), probe::Probed::Skipped(why.clone()))).collect()
+            names.iter().map(|name| (name.clone(), gate_wire::Probed::Skipped(why.clone()))).collect()
         });
         for (name, probed) in found {
-            stamping::out(console, &probe::tool_line(&name, &probed));
+            stamping::out(console, &gate_wire::tool_line(&name, &probed));
         }
     });
 }
@@ -1586,13 +1590,7 @@ fn say_sdks(limit: Duration, drain: Duration, console: &mut Console) {
 /// of, ended with its job past `limit`, its readers given `drain` once it has exited.
 fn sdks(limit: Duration, drain: Duration) -> Result<String, String> {
     let listing = git::sdk_listing(Variables::from_process(), limit, drain, None, &[])?;
-    Ok(sdk_list(&listing))
-}
-
-/// The first space-separated word of each non-empty line of `listing`, joined by `,`; `none` when there is none.
-fn sdk_list(listing: &str) -> String {
-    let versions = crate::remote::parity::sdk_versions(listing);
-    if versions.is_empty() { "none".to_owned() } else { versions.join(",") }
+    Ok(gate_wire::sdk_list(&listing))
 }
 
 #[cfg(test)]
@@ -1613,7 +1611,7 @@ mod tests {
 
     use super::{
         Bound, Git, GitClass, GitFailure, GitStep, Shared, Streams, TreeAt, fresh_config, fresh_config_written, git_failed, git_launch, git_ran,
-        readers, ready_tree, refused_folders, replace_config, sdk_list, waited,
+        readers, ready_tree, refused_folders, replace_config, waited,
     };
     use crate::boxside::forward::{ClientGone, OutputLock};
     use crate::boxside::helper_trusted;
@@ -1946,13 +1944,5 @@ mod tests {
         );
         assert_eq!(fresh_config(&format!("{INIT_CONFIG}\u{feff}"), bare), None, "U+FEFF at the end");
         assert_eq!(fresh_config(&format!("{INIT_CONFIG}\tx = y \\\n"), bare), None, "a continued last line");
-    }
-
-    #[test]
-    fn the_sdk_list_is_the_first_word_of_each_line() {
-        let listing = "8.0.404 [C:\\Program Files\\dotnet\\sdk]\r\n\r\n  9.0.100 [C:\\Program Files\\dotnet\\sdk]\r\n";
-        assert_eq!(sdk_list(listing), "8.0.404,9.0.100");
-        assert_eq!(sdk_list(""), "none");
-        assert_eq!(sdk_list("\r\n  \n"), "none");
     }
 }

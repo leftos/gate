@@ -1048,10 +1048,13 @@ mod tests {
     use std::process::{Child, Command};
     use std::time::{Duration, SystemTime};
 
+    use gate_wire::ROOT_UNSAFE;
+
     use super::{GIB, IDLE_AGE, Seams, free_bytes, idle_for, key_file_stem, no_rename_seen, prune, pruned_with};
     use crate::console::Console;
     use crate::files::held_for_test;
-    use crate::lines::{FAILED_STATUS, ROOT_UNSAFE, USAGE_STATUS};
+
+    use crate::lines::{FAILED_STATUS, USAGE_STATUS};
 
     const KEY: &str = "repo-0123abcd";
     const TWO_DAYS: Duration = Duration::from_hours(48);

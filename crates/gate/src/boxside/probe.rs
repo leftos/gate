@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use gate_router::escaped;
 use gate_win32::{Hive, PipedConsole, Subkey};
-use gate_wire::{MAX_PART_DIGITS, is_canonical_version, is_drive_path, version_of};
+use gate_wire::{MAX_PART_DIGITS, Probed, is_canonical_version, is_drive_path};
 use serde_json::Value;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
 
@@ -81,20 +81,6 @@ const NETFX_SDK_KEY: &str = r"SOFTWARE\Microsoft\Microsoft SDKs\NETFXSDK";
 /// The value of a .NET Framework SDK's subkey that names the folder it is installed in.
 const NETFX_KITS_FOLDER: &str = "KitsInstallationFolder";
 
-/// What a probe found of one tool.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Probed {
-    /// It ran, and its version reads as this text: a tool the box has several installs of names every version found,
-    /// `,`-joined.
-    Version(String),
-    /// It ran, and no version reads in what it wrote.
-    Present,
-    /// It is not found.
-    Missing,
-    /// It was not probed to an answer, for this reason.
-    Skipped(String),
-}
-
 /// How the table probes a tool it knows.
 enum ToolProbe {
     /// Runs `program` with `args`.
@@ -107,19 +93,13 @@ enum ToolProbe {
     NetfxSdk,
 }
 
-/// The table's probe of the tool `name`; `None` for a name it does not know. cargo-nextest is run as the plugin itself,
-/// never through cargo, which would read a `.cargo\config.toml` in every folder above its working folder and run the
-/// alias one defines.
+/// The table's probe of the tool `name`; `None` for a name it does not know. The rows that run a program come from
+/// [`gate_wire::runs_probe`].
 fn probe_of(name: &str) -> Option<ToolProbe> {
-    let runs = |program, args| Some(ToolProbe::Runs { program, args });
+    if let Some((program, args)) = gate_wire::runs_probe(name) {
+        return Some(ToolProbe::Runs { program, args });
+    }
     match name {
-        "rust" => runs("rustc", &["--version"]),
-        "cargo-nextest" => runs("cargo-nextest", &["nextest", "--version"]),
-        "node" => runs("node", &["--version"]),
-        "pnpm" => runs("pnpm", &["--version"]),
-        "pwsh" => runs("pwsh", &["--version"]),
-        "ffmpeg" => runs("ffmpeg", &["-version"]),
-        "git-lfs" => runs("git-lfs", &["version"]),
         "godot" => Some(ToolProbe::Godot),
         "unreal" => Some(ToolProbe::Unreal),
         "netfx-sdk" => Some(ToolProbe::NetfxSdk),
@@ -213,7 +193,11 @@ fn started<'scope, 'env>(
         None => Pending::Found(Probed::Skipped("unknown tool".to_owned())),
         Some(ToolProbe::Runs { program, args }) => match place {
             Err(why) => Pending::Found(Probed::Skipped(format!("cannot run {program}: {why}"))),
-            Ok(place) => Pending::Running(scope.spawn(move || ran(program, args, place, batch, read))),
+            Ok(place) => Pending::Running(scope.spawn(move || {
+                ran(program, args, place, batch, |output| {
+                    gate_wire::probed(output.status.success(), &output.stdout, &output.stderr)
+                })
+            })),
         },
         Some(ToolProbe::Godot) => match place {
             Err(why) => Pending::Found(Probed::Skipped(format!("cannot run {GODOT}: {why}"))),
@@ -707,15 +691,6 @@ pub(crate) fn panic_reason(panic: &(dyn Any + Send)) -> String {
     message.map_or_else(|| "the probe failed".to_owned(), |message| format!("the probe failed: {message}"))
 }
 
-/// What a probe that ran to its exit with `output` found: present when it exited non-zero or its first line holds no
-/// version ([`version_of`]); else that version.
-fn read(output: &ProgramOutput) -> Probed {
-    if !output.status.success() {
-        return Probed::Present;
-    }
-    version_of(&String::from_utf8_lossy(&output.stdout), &String::from_utf8_lossy(&output.stderr)).map_or(Probed::Present, Probed::Version)
-}
-
 /// The versions `versions` names, deduplicated and ordered by number, joined by `,`.
 fn version_list(versions: &[String]) -> String {
     let mut ordered: Vec<&String> = versions.iter().collect();
@@ -736,18 +711,6 @@ fn number(run: &str) -> (usize, &str) {
     (held.len(), held)
 }
 
-/// The line the preflight says for the tool `name`, as its probe found it: `gate: remote tool <name> <version>`,
-/// `present`, `missing` or `skipped: <why>`, the name and the reason escaped, as either may come from outside.
-pub(crate) fn tool_line(name: &str, probed: &Probed) -> String {
-    let name = escaped(name);
-    match probed {
-        Probed::Version(version) => format!("gate: remote tool {name} {version}"),
-        Probed::Present => format!("gate: remote tool {name} present"),
-        Probed::Missing => format!("gate: remote tool {name} missing"),
-        Probed::Skipped(why) => format!("gate: remote tool {name} skipped: {}", escaped(why)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::ffi::{OsStr, OsString};
@@ -761,7 +724,7 @@ mod tests {
     use super::GODOT;
     use super::{
         Batch, Candidate, Pending, Probed, Windows, build_version, godot_candidates, godot_gave_no_version, godot_version, is_reparse_point,
-        is_version_name, late_reason, named_as_found, netfx_sdk, panic_reason, probe, read_godot, started, tool_line, unreal_installs, unreal_read,
+        is_version_name, late_reason, named_as_found, netfx_sdk, panic_reason, probe, read_godot, started, unreal_installs, unreal_read,
         unreal_version, version_list,
     };
     use crate::environment::Variables;
@@ -842,25 +805,6 @@ mod tests {
         assert_eq!(panic_reason(&"boom"), "the probe failed: boom");
         assert_eq!(panic_reason(&"bang".to_owned()), "the probe failed: bang");
         assert_eq!(panic_reason(&7_u8), "the probe failed");
-    }
-
-    #[test]
-    fn each_finding_says_its_line() {
-        assert_eq!(
-            tool_line("node", &Probed::Version("24.19.0".to_owned())),
-            "gate: remote tool node 24.19.0"
-        );
-        assert_eq!(tool_line("ffmpeg", &Probed::Present), "gate: remote tool ffmpeg present");
-        assert_eq!(tool_line("pnpm", &Probed::Missing), "gate: remote tool pnpm missing");
-        assert_eq!(
-            tool_line("node", &Probed::Skipped("no answer in 10 s".to_owned())),
-            "gate: remote tool node skipped: no answer in 10 s"
-        );
-        assert_eq!(
-            tool_line("a\nb", &Probed::Skipped("why\r".to_owned())),
-            r"gate: remote tool a\nb skipped: why\r",
-            "a name and a reason from outside are escaped"
-        );
     }
 
     #[test]

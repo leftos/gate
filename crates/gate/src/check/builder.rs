@@ -434,16 +434,17 @@ mod tests {
     use gate_router::warm::warmup_hash;
     use gate_router::work_folder_key;
     use gate_state::v1::{self, WarmRecord, WarmState};
+    use gate_wire::{build_version, root_busy_line, root_unsafe_line};
     use jiff::Timestamp;
 
     use super::{Answer, Failure, Heard, builder_warmth, failure, refusal, root_problem, warm_items};
+    use crate::boxside::WORK_ROOT_STEP;
     use crate::check::local::{Consent, Declarations, Declared, SiblingsFile, WarmSources};
     use crate::check::report::{At, Checked, Line, Sdk, Warmup, said};
     use crate::remote::git::GitError;
+    use crate::remote::install_untrusted_line;
     use crate::remote::parity::pin_of;
     use crate::remote::toolchain::{self, Manifest, Pin, Reported, ToolNeed, Version};
-    use crate::remote::{install_untrusted_line, root_busy_line, root_unsafe_line};
-    use gate_wire::build_version;
 
     const HOST: &str = "builder-1";
     const AT: At<'static> = At::Builder {
@@ -866,7 +867,7 @@ mod tests {
     fn a_box_that_refuses_its_work_root_is_no_refusal_of_the_check() {
         let root = r"D:\gate-remote";
         let version = format!("gate: remote version {}", build_version());
-        let unsafe_root = root_unsafe_line(r"D:\gate-remote lets S-1-5-11 add files to it");
+        let unsafe_root = root_unsafe_line(r"D:\gate-remote lets S-1-5-11 add files to it", WORK_ROOT_STEP);
         let busy_root = root_busy_line(r"D:\gate-remote is open in another process; retry when it is closed");
         for line in [unsafe_root.as_str(), busy_root.as_str()] {
             assert_eq!(refusal(HOST, root, &heard(Some(1), lines(&[&version]), Some(line))), None, "{line}");
@@ -883,7 +884,7 @@ mod tests {
     #[test]
     fn a_box_that_refuses_its_work_root_is_said_as_its_problem() {
         let version = format!("gate: remote version {}", build_version());
-        let unsafe_root = root_unsafe_line(r"D:\gate-remote lets S-1-5-11 add files to it");
+        let unsafe_root = root_unsafe_line(r"D:\gate-remote lets S-1-5-11 add files to it", WORK_ROOT_STEP);
         let busy_root = root_busy_line(r"D:\gate-remote is open in another process; retry when it is closed");
         assert_eq!(
             root_problem(&heard(Some(1), lines(&[&version]), Some(&unsafe_root))),
@@ -913,7 +914,7 @@ mod tests {
         };
         let (root, state) = warm_scratch("refused-root");
         let version = format!("gate: remote version {}", build_version());
-        let line = root_unsafe_line(r"D:\gate-remote lets S-1-5-11 add files to it");
+        let line = root_unsafe_line(r"D:\gate-remote lets S-1-5-11 add files to it", WORK_ROOT_STEP);
         let refused = heard(Some(1), lines(&[&version]), Some(&line));
         let mut pinned = declared(vec![need("godot", "4.7.2")], None);
         pinned.godot = Some(vec![pin]);

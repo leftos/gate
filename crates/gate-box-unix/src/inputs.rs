@@ -1571,7 +1571,7 @@ mod tests {
     use gate_inputs::hash::sha256_of;
     use gate_inputs::manifest::{Held, Manifest, Stamp as HeldStamp, read_sent};
     use gate_inputs::pack::Packer;
-    use gate_wire::{PathForm, Payload, Refusal, busy_line, ordinal_upper, refused_line};
+    use gate_wire::{PathForm, Payload, ROOT_STATUS, Refusal, busy_line, ordinal_upper, refused_line, root_unsafe_line};
     use serde_json::{Map, Value, json};
 
     use super::{
@@ -1582,7 +1582,7 @@ mod tests {
     use crate::beneath::Folder;
     use crate::console::Console;
     use crate::files;
-    use crate::lines::{FAILED_STATUS, ROOT_STATUS, USAGE_STATUS, folder_failure, root_unsafe_line};
+    use crate::lines::{FAILED_STATUS, USAGE_STATUS, WORK_ROOT_STEP, folder_failure};
     use crate::run::REFUSED_STATUS;
 
     const KEY: &str = "repo-0123abcd";
@@ -2207,7 +2207,10 @@ mod tests {
         let user = files::user_name(files::effective_uid());
         assert_eq!(
             console.err,
-            [root_unsafe_line(&format!("{root} is not owned by {user} or is writable by others"))]
+            [root_unsafe_line(
+                &format!("{root} is not owned by {user} or is writable by others"),
+                WORK_ROOT_STEP
+            )]
         );
         assert!(!Path::new(&case.lock()).exists(), "no lock is taken");
 

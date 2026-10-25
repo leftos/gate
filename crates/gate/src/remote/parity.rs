@@ -437,12 +437,6 @@ pub(crate) fn newest_major<'v>(versions: impl IntoIterator<Item = &'v str>) -> u
         .unwrap_or(0)
 }
 
-/// The version each non-empty line of a `dotnet --list-sdks` listing starts with, in listing order: the line's first
-/// word, before the `[<folder>]` dotnet writes after it.
-pub(crate) fn sdk_versions(listing: &str) -> Vec<&str> {
-    listing.lines().filter_map(|line| line.split_whitespace().next()).collect()
-}
-
 /// What a toolchain need is of.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NeedKind {

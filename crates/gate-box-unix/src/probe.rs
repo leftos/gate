@@ -10,9 +10,9 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gate_wire::MAX_PART_DIGITS;
+use gate_wire::{MAX_PART_DIGITS, Probed, probed, sdk_list};
 
-use crate::lines::{Probed, no_answer, probed, sdk_list};
+use crate::lines::no_answer;
 use crate::process::{NotRan, Ran, run_bounded, status_text, with_path};
 
 /// The deadline every probe of one preflight shares.
@@ -47,15 +47,10 @@ enum Plan {
 
 /// The probe of the tool `name`.
 fn plan(name: &str) -> Plan {
-    let runs = |program, args| Plan::Runs { program, args };
+    if let Some((program, args)) = gate_wire::runs_probe(name) {
+        return Plan::Runs { program, args };
+    }
     match name {
-        "rust" => runs("rustc", &["--version"]),
-        "cargo-nextest" => runs("cargo-nextest", &["nextest", "--version"]),
-        "node" => runs("node", &["--version"]),
-        "pnpm" => runs("pnpm", &["--version"]),
-        "pwsh" => runs("pwsh", &["--version"]),
-        "ffmpeg" => runs("ffmpeg", &["-version"]),
-        "git-lfs" => runs("git-lfs", &["version"]),
         "godot" => Plan::Godot,
         "unreal" | "netfx-sdk" => Plan::Missing,
         _ => Plan::Unknown,
@@ -319,8 +314,9 @@ pub(crate) mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
+    use gate_wire::Probed;
+
     use super::{GODOT_PROGRAM, Plan, godot_version, installed_godot, listed, plan, probe_all};
-    use crate::lines::Probed;
 
     #[test]
     fn each_tool_has_its_probe() {

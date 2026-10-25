@@ -645,7 +645,7 @@ pub(super) fn sdk_listed(pin: Option<&parity::Pin>, sdks: impl FnOnce() -> Resul
 /// list cannot be read.
 fn sdk_list(root: &Path, limit: Duration, drain: Duration) -> Result<Vec<String>, String> {
     let listing = local_sdk_listing(Variables::from_process(), &[root], limit, drain, None)?;
-    Ok(parity::sdk_versions(&listing).into_iter().map(str::to_owned).collect())
+    Ok(gate_wire::sdk_versions(&listing).into_iter().map(str::to_owned).collect())
 }
 
 /// Each sibling `<root>\.gate\siblings.toml` declares, checked in routing's order: one `allowed` does not name is not

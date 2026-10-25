@@ -2318,7 +2318,7 @@ impl Attempt<'_, '_> {
             .chain(call.siblings.iter().map(|sibling| Path::new(sibling.root())))
             .collect();
         match local_sdk_listing(Variables::from_process(), &worktrees, self.dotnet_limit, self.git.drain, call.interrupt) {
-            Ok(listing) => parity::newest_major(parity::sdk_versions(&listing)),
+            Ok(listing) => parity::newest_major(gate_wire::sdk_versions(&listing)),
             Err(_) if self.call.interrupt.is_some_and(Interrupt::is_raised) => 0,
             Err(error) => {
                 let why = String::from(error);
@@ -4812,6 +4812,7 @@ mod tests {
     use gate_args::TestSeams;
     use gate_state::{FallbackReason, StateRoot};
     use gate_win32::{Interrupt, PipedConsole};
+    use gate_wire::{ROOT_UNSAFE, root_busy_line, root_unsafe_line};
 
     use super::retry::PRE_BANNER_RETRIES;
     use super::{
@@ -4824,6 +4825,7 @@ mod tests {
     use super::{CSPROJ_BYTES, CSPROJ_FILES, Entry, csproj_pins, entries_of, manifest_entry, small_blobs_of};
     use super::{DRAIN, KILLED, Received};
     use super::{KeyHold, RunEnd, Warm, cold_line, hold_key, hold_key_waiting, new_work_tree, status_end, warm_end, warm_of};
+    use crate::boxside::WORK_ROOT_STEP;
     use crate::environment::Variables;
     use crate::remote::git::{self, DOTNET_LIMIT, GIT_BOUNDS, Git, GitBounds, GitError};
     use crate::remote::held::tests::{Pair, junction};
@@ -4835,7 +4837,7 @@ mod tests {
     use crate::remote::transport::{Local, Profile, Transport};
     use crate::remote::watchdog::{self, Kill, LOG_CAP};
     use crate::remote::worktree_lock::tests::{held_elsewhere, lock_name};
-    use crate::remote::{INSTALL_UNTRUSTED, ROOT_UNSAFE, install_untrusted_line, root_busy_line, root_unsafe_line};
+    use crate::remote::{INSTALL_UNTRUSTED, install_untrusted_line};
     use crate::remote::{Refusal, RemoteCall, RemoteClient, Sibling, WarmEnd, Warmth, adjusted_line, busy_line, carried, refused_line, started_line};
     use crate::run::CONTROL_C_EXIT;
     use gate_router::BuilderOs;
@@ -7124,7 +7126,7 @@ mod tests {
     /// routed, saying the box's why escaped; any other status, or a line after the marker, is no root refusal.
     #[test]
     fn a_box_that_refuses_its_work_root_is_not_routed_with_its_why() {
-        let unsafe_line = root_unsafe_line(r"D:\gate-remote lets S-1-5-11 add files to it");
+        let unsafe_line = root_unsafe_line(r"D:\gate-remote lets S-1-5-11 add files to it", WORK_ROOT_STEP);
         let busy_line = root_busy_line(r"D:\gate-remote is open in another process; retry when it is closed");
         let (unsafe_root, _) = run_call_ended("", &format!("{unsafe_line}\n"), 1, "root-unsafe");
         let (busy_root, _) = run_call_ended("", &format!("{busy_line}\n"), 1, "root-busy");
@@ -7161,7 +7163,7 @@ mod tests {
     #[test]
     fn the_install_refusal_is_read_before_the_root_refusal() {
         let install = install_untrusted_line("the helper is owned by S-1-5-21-1");
-        let root = root_unsafe_line(r"D:\gate-remote is a reparse point");
+        let root = root_unsafe_line(r"D:\gate-remote is a reparse point", WORK_ROOT_STEP);
         let (both, _) = run_call_ended("", &format!("{root}\n{install}\n"), 1, "root-and-install");
         let (root_alone, _) = run_call_ended("", &format!("{root}\n"), 1, "root-alone");
 

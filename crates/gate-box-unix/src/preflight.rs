@@ -8,14 +8,14 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 use std::thread;
 
-use gate_wire::{Pair, PairSibling, PathForm, Payload, bare_stem, escaped, trees};
+use gate_wire::{Pair, PairSibling, PathForm, Payload, ROOT_STATUS, bare_stem, escaped, root_unsafe_line, tool_line, trees};
 
 use crate::console::Console;
 use crate::git::{self, AlternatesFailure, Failed, Git, Steps, Tree, failed_for, for_repo, line_ends_set, origin_set};
 use crate::lines::{
-    FAILED_STATUS, NEEDS_REFUSED, NEW_WORK_TREE, ROOT_STATUS, USAGE_STATUS, created_line, folder_failure, layout_text, login_path_line,
-    names_another_layout, readies_single, root_flaw, root_unsafe_line, sdks_failure, sdks_line, tool_line, unsynced_failure, version_line, warm_line,
-    warm_text, work_layout, write_failure,
+    FAILED_STATUS, NEEDS_REFUSED, NEW_WORK_TREE, USAGE_STATUS, WORK_ROOT_STEP, created_line, folder_failure, layout_text, login_path_line,
+    names_another_layout, readies_single, root_flaw, sdks_failure, sdks_line, unsynced_failure, version_line, warm_line, warm_text, work_layout,
+    write_failure,
 };
 use crate::{boot, files, probe, process};
 
@@ -50,7 +50,7 @@ pub fn preflight(payload: &Payload, console: &mut Console) -> u8 {
         }
         Err(Refusal::Untrusted(why)) => {
             console.out(&version_line());
-            console.err(&root_unsafe_line(&why));
+            console.err(&root_unsafe_line(&why, WORK_ROOT_STEP));
             return ROOT_STATUS;
         }
     }
@@ -313,14 +313,14 @@ mod tests {
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use gate_wire::{PathForm, Payload};
+    use gate_wire::{PathForm, Payload, root_unsafe_line};
     use serde_json::{Value, json};
 
     use super::preflight;
     use crate::console::Console;
     use crate::files::{effective_uid, user_name};
     use crate::git::Git;
-    use crate::lines::{NEW_WORK_TREE, created_line, root_unsafe_line, version_line, warm_line};
+    use crate::lines::{NEW_WORK_TREE, WORK_ROOT_STEP, created_line, version_line, warm_line};
 
     const KEY: &str = "repo-0123abcd";
     const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -629,7 +629,7 @@ mod tests {
         assert_eq!(status, 1);
         assert_eq!(console.out, [version_line()]);
         let why = format!("{root} is not owned by {} or is writable by others", user_name(effective_uid()));
-        assert_eq!(console.err, [root_unsafe_line(&why)]);
+        assert_eq!(console.err, [root_unsafe_line(&why, WORK_ROOT_STEP)]);
         assert!(!PathBuf::from(&root).join("work").exists(), "nothing is made in a refused root");
     }
 

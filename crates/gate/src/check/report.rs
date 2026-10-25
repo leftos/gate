@@ -595,9 +595,8 @@ mod tests {
     use super::{At, Checked, Found, GLOBAL_JSON, HERE, Line, Problem, SIBLINGS, Said, Sdk, Sibling, TOOLCHAIN, Tool, WARMUP, Warmup, said};
     use gate_router::warm::{FailureClass, FileRead, Record, RecordRead, RecordState, WarmupFile, lock_problem_text};
     use gate_router::{FolderId, SiblingFolder};
-    use gate_wire::build_version;
+    use gate_wire::{Probed, build_version};
 
-    use crate::boxside::probe::Probed;
     use crate::check::local::record_item;
     use crate::remote::toolchain::{Pin, Reported, ToolNeed, Version};
 

@@ -9,13 +9,13 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use gate_wire::Payload;
+use gate_wire::{Payload, ROOT_STATUS, root_unsafe_line};
 
 use crate::console::Console;
 use crate::files;
 use crate::lines::{
-    FAILED_STATUS, JobRecord, ROOT_STATUS, Recorded, USAGE_STATUS, job_record, record_unread, record_without_group, root_flaw, root_unsafe_line,
-    signal_guard, work_layout,
+    FAILED_STATUS, JobRecord, Recorded, USAGE_STATUS, WORK_ROOT_STEP, job_record, record_unread, record_without_group, root_flaw, signal_guard,
+    work_layout,
 };
 
 /// How long the group has to end after `SIGTERM`.
@@ -61,11 +61,11 @@ pub fn stop(payload: &Payload, console: &mut Console) -> u8 {
 pub(crate) fn records_folder(root: &str, parent: &Path) -> Result<bool, (String, u8)> {
     let facts = match files::facts(Path::new(root)) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err((root_unsafe_line(&format!("cannot read {root}: {error}")), ROOT_STATUS)),
+        Err(error) => return Err((root_unsafe_line(&format!("cannot read {root}: {error}"), WORK_ROOT_STEP), ROOT_STATUS)),
         Ok(facts) => facts,
     };
     if let Some(why) = root_flaw(facts, root, &files::user_name(facts.euid)) {
-        return Err((root_unsafe_line(&why), ROOT_STATUS));
+        return Err((root_unsafe_line(&why, WORK_ROOT_STEP), ROOT_STATUS));
     }
     if !files::exists(parent) {
         return Ok(false);
@@ -600,7 +600,7 @@ mod tests {
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use gate_wire::{PathForm, Payload};
+    use gate_wire::{PathForm, Payload, root_unsafe_line};
     use serde_json::json;
 
     use super::{
@@ -610,7 +610,7 @@ mod tests {
     use crate::console::{Console, Output, RecordingSink, Stamp};
     use crate::files::{effective_uid, held_for_test, user_name};
     use crate::git::{Git, GitClass, RunGit};
-    use crate::lines::{Recorded, record_unread, record_without_group, root_unsafe_line};
+    use crate::lines::{Recorded, WORK_ROOT_STEP, record_unread, record_without_group};
     use crate::process::GroupRecord;
 
     const KEY: &str = "repo-0123abcd";
@@ -1220,7 +1220,7 @@ mod tests {
         let (status, console, alive) = stopped_beside_a_sleep(&case.work());
         assert_eq!(status, 1, "{:?}", console.out);
         let why = format!("{root} is not owned by {} or is writable by others", user_name(effective_uid()));
-        assert_eq!(console.err, [root_unsafe_line(&why)]);
+        assert_eq!(console.err, [root_unsafe_line(&why, WORK_ROOT_STEP)]);
         assert!(alive, "no signal is sent");
     }
 
@@ -1232,7 +1232,7 @@ mod tests {
 
         let (status, console, alive) = stopped_beside_a_sleep(&format!("{root}/work/{KEY}"));
         assert_eq!(status, 1, "{:?}", console.out);
-        assert_eq!(console.err, [root_unsafe_line(&format!("{root} is a symbolic link"))]);
+        assert_eq!(console.err, [root_unsafe_line(&format!("{root} is a symbolic link"), WORK_ROOT_STEP)]);
         assert!(alive, "no signal is sent");
     }
 

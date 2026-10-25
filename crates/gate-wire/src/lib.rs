@@ -1273,13 +1273,118 @@ pub fn adjusted_prefix(nonce: &str) -> String {
     format!("gate-remote-adjusted: {nonce} ")
 }
 
+/// What a box says on standard error, before why, when its preflight refuses the builder's work root: the Windows box
+/// when an account other than SYSTEM, Administrators, `TrustedInstaller` and the box's user may write in the root, or in
+/// a folder above it, or anyone else may empty, remove, re-permission or take one; the Unix box when the root is not the
+/// box user's own or others may write in it. The box says its version line first and exits [`ROOT_STATUS`]; the client
+/// and `gate check --builder` read the refusal by this prefix.
+pub const ROOT_UNSAFE: &str = "gate: the builder's work root is not locked down: ";
+
+/// The exit status of a box whose preflight refused its work root with [`ROOT_UNSAFE`].
+pub const ROOT_STATUS: u8 = 1;
+
+/// What the box says on standard error, before why, when its preflight cannot hold the builder's work root because
+/// another process has it open with delete access, or without sharing reading, and the root and the folders above pass
+/// all the same: the root is not unsafe, only busy, so the line carries no installer step. The Windows box says it, its
+/// version line said first, and exits [`ROOT_STATUS`].
+pub const ROOT_BUSY: &str = "gate: the builder's work root is busy: ";
+
+/// The box's line refusing its work root for `why`, shown escaped, and naming the installer step `installer_step` that
+/// locks it down ([`ROOT_UNSAFE`]); each box names its own step, as the two installers differ.
+#[must_use]
+pub fn root_unsafe_line(why: &str, installer_step: &str) -> String {
+    format!(
+        "{ROOT_UNSAFE}{}; run the installer's \"Gate work root\" step ({installer_step})",
+        escaped(why)
+    )
+}
+
+/// The box's line saying its work root is busy for `why`, shown escaped ([`ROOT_BUSY`]).
+#[must_use]
+pub fn root_busy_line(why: &str) -> String {
+    format!("{ROOT_BUSY}{}", escaped(why))
+}
+
+/// What a probe found of one tool, as the preflight says it ([`tool_line`]) and the client reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Probed {
+    /// It ran, and its version reads as this text: a tool the box has several installs of names every version found,
+    /// `,`-joined.
+    Version(String),
+    /// It ran, and no version reads in what it wrote, or it exited non-zero.
+    Present,
+    /// It is not found.
+    Missing,
+    /// It was not probed to an answer, for this reason.
+    Skipped(String),
+}
+
+/// What a probe whose program ran to its exit found: present when it exited non-zero (`succeeded` false) or its first
+/// line holds no version ([`version_of`]); else that version.
+#[must_use]
+pub fn probed(succeeded: bool, stdout: &[u8], stderr: &[u8]) -> Probed {
+    if !succeeded {
+        return Probed::Present;
+    }
+    version_of(&String::from_utf8_lossy(stdout), &String::from_utf8_lossy(stderr)).map_or(Probed::Present, Probed::Version)
+}
+
+/// The line the preflight says for the tool `name`, as its probe found it: `gate: remote tool <name> <version>`,
+/// `present`, `missing` or `skipped: <why>`, the name and the reason escaped, as either may come from outside.
+#[must_use]
+pub fn tool_line(name: &str, probed: &Probed) -> String {
+    let name = escaped(name);
+    match probed {
+        Probed::Version(version) => format!("gate: remote tool {name} {version}"),
+        Probed::Present => format!("gate: remote tool {name} present"),
+        Probed::Missing => format!("gate: remote tool {name} missing"),
+        Probed::Skipped(why) => format!("gate: remote tool {name} skipped: {}", escaped(why)),
+    }
+}
+
+/// The program and arguments a probe of the tool `name` runs to read its version; `None` for every other name, which each
+/// box probes its own way (Godot, Unreal, the .NET Framework SDKs) or answers as unknown. cargo-nextest is run as the
+/// plugin itself, never through cargo, which would read a `.cargo\config.toml` in every folder above its working folder
+/// and run the alias one defines.
+#[must_use]
+pub fn runs_probe(name: &str) -> Option<(&'static str, &'static [&'static str])> {
+    match name {
+        "rust" => Some(("rustc", &["--version"])),
+        "cargo-nextest" => Some(("cargo-nextest", &["nextest", "--version"])),
+        "node" => Some(("node", &["--version"])),
+        "pnpm" => Some(("pnpm", &["--version"])),
+        "pwsh" => Some(("pwsh", &["--version"])),
+        "ffmpeg" => Some(("ffmpeg", &["-version"])),
+        "git-lfs" => Some(("git-lfs", &["version"])),
+        _ => None,
+    }
+}
+
+/// The version each non-empty line of a `dotnet --list-sdks` listing starts with, in listing order: the line's first
+/// word, before the `[<folder>]` dotnet writes after it.
+#[must_use]
+pub fn sdk_versions(listing: &str) -> Vec<&str> {
+    listing.lines().filter_map(|line| line.split_whitespace().next()).collect()
+}
+
+/// The SDK list of a `dotnet --list-sdks` listing: the first word of each non-empty line, joined by `,` ([`sdk_versions`]);
+/// `none` when there is none.
+#[must_use]
+pub fn sdk_list(listing: &str) -> String {
+    let versions = sdk_versions(listing);
+    if versions.is_empty() { "none".to_owned() } else { versions.join(",") }
+}
+
 #[cfg(test)]
 mod tests {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use serde_json::json;
 
-    use super::{CrossBuild, PathForm, Payload, escaped, first_version, version_of, version_text, work_root};
+    use super::{
+        CrossBuild, PathForm, Payload, Probed, escaped, first_version, probed, root_busy_line, root_unsafe_line, runs_probe, sdk_list, tool_line,
+        version_of, version_text, work_root,
+    };
 
     #[expect(clippy::expect_used, reason = "a payload a case cannot build must fail the case loudly")]
     mod run_lines {
@@ -2758,5 +2863,89 @@ mod tests {
             None,
             "the folder is compared byte for byte"
         );
+    }
+
+    #[test]
+    fn root_lines_are_the_prefix_the_escaped_why_and_the_step() {
+        assert_eq!(
+            root_unsafe_line("D:\\g lets S-1-5-11 add\u{1b}", "install-x -Only \"Gate work root\""),
+            r#"gate: the builder's work root is not locked down: D:\g lets S-1-5-11 add\u{1b}; run the installer's "Gate work root" step (install-x -Only "Gate work root")"#
+        );
+        assert_eq!(
+            root_busy_line("D:\\g is open\u{1b}"),
+            r"gate: the builder's work root is busy: D:\g is open\u{1b}"
+        );
+    }
+
+    #[test]
+    fn the_sdk_list_is_the_first_word_of_each_line_joined() {
+        assert_eq!(
+            sdk_list("8.0.415 [/usr/local/share/dotnet/sdk]\n10.0.100 [/usr/local/share/dotnet/sdk]\n"),
+            "8.0.415,10.0.100"
+        );
+        assert_eq!(sdk_list(""), "none");
+        assert_eq!(sdk_list("\n  \n"), "none", "blank lines name nothing");
+        let crlf = "8.0.404 [C:\\Program Files\\dotnet\\sdk]\r\n\r\n  9.0.100 [C:\\Program Files\\dotnet\\sdk]\r\n";
+        assert_eq!(sdk_list(crlf), "8.0.404,9.0.100");
+        assert_eq!(sdk_list("\r\n  \n"), "none");
+    }
+
+    #[test]
+    fn the_seven_run_probes_are_pinned() {
+        assert_eq!(runs_probe("rust"), Some(("rustc", &["--version"][..])));
+        assert_eq!(runs_probe("cargo-nextest"), Some(("cargo-nextest", &["nextest", "--version"][..])));
+        assert_eq!(runs_probe("node"), Some(("node", &["--version"][..])));
+        assert_eq!(runs_probe("pnpm"), Some(("pnpm", &["--version"][..])));
+        assert_eq!(runs_probe("pwsh"), Some(("pwsh", &["--version"][..])));
+        assert_eq!(runs_probe("ffmpeg"), Some(("ffmpeg", &["-version"][..])));
+        assert_eq!(runs_probe("git-lfs"), Some(("git-lfs", &["version"][..])));
+        for name in ["godot", "unreal", "netfx-sdk", "nope"] {
+            assert_eq!(runs_probe(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_tool_line_says_what_the_probe_found_escaped() {
+        assert_eq!(tool_line("rust", &Probed::Version("1.99.0".to_owned())), "gate: remote tool rust 1.99.0");
+        assert_eq!(
+            tool_line("node", &Probed::Version("24.19.0".to_owned())),
+            "gate: remote tool node 24.19.0"
+        );
+        assert_eq!(tool_line("node", &Probed::Present), "gate: remote tool node present");
+        assert_eq!(tool_line("ffmpeg", &Probed::Present), "gate: remote tool ffmpeg present");
+        assert_eq!(tool_line("godot", &Probed::Missing), "gate: remote tool godot missing");
+        assert_eq!(tool_line("pnpm", &Probed::Missing), "gate: remote tool pnpm missing");
+        assert_eq!(
+            tool_line("node", &Probed::Skipped("no answer in 10 s".to_owned())),
+            "gate: remote tool node skipped: no answer in 10 s"
+        );
+        assert_eq!(
+            tool_line("x\u{1b}", &Probed::Skipped("unknown\ntool".to_owned())),
+            r"gate: remote tool x\u{1b} skipped: unknown\ntool"
+        );
+        assert_eq!(
+            tool_line("a\nb", &Probed::Skipped("why\r".to_owned())),
+            r"gate: remote tool a\nb skipped: why\r",
+            "a name and a reason from outside are escaped"
+        );
+    }
+
+    #[test]
+    fn a_probe_that_ran_reads_its_version_or_is_present() {
+        assert_eq!(
+            probed(true, b"rustc 1.99.0 (abc 2026-09-28)\n", b""),
+            Probed::Version("1.99.0".to_owned())
+        );
+        assert_eq!(
+            probed(true, b"git-lfs/3.8.0 (GitHub; darwin arm64; go 1.24.4)\n", b""),
+            Probed::Version("3.8.0".to_owned())
+        );
+        assert_eq!(
+            probed(true, b"", b"PowerShell 7.6.6\n"),
+            Probed::Version("7.6.6".to_owned()),
+            "stderr when stdout is blank"
+        );
+        assert_eq!(probed(true, b"no version\n", b""), Probed::Present);
+        assert_eq!(probed(false, b"v24.19.0\n", b""), Probed::Present, "a non-zero exit is present");
     }
 }
