@@ -131,6 +131,30 @@ fn a_marker_with_exit_0_is_status_1() {
 }
 
 #[test]
+fn a_no_test_projects_line_with_exit_0_is_status_1() {
+    let case = Case::new("a_no_test_projects_line_with_exit_0_is_status_1");
+
+    let outcome = case.run(&run_words(
+        "out.log",
+        &[],
+        &[FAKE_TOOL, "out", "No test projects were found.", "exit", "0"],
+    ));
+
+    let log = shown(&log_path(&case));
+    let number = line_number(&raw_lines(&case), "No test projects were found.");
+    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout,
+        format!("{number}:No test projects were found.\nNo test projects were found.\n"),
+        "the marker lines, then the tail"
+    );
+    assert_eq!(
+        outcome.stderr,
+        format!("gate: command exited 0 but its log reports a failure -> {log}\ngate: FAILED (status 1). Full output: {log}\n")
+    );
+}
+
+#[test]
 fn no_markers_keeps_status_0() {
     let case = Case::new("no_markers_keeps_status_0");
 

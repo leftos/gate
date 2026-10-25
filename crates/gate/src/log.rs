@@ -15,8 +15,7 @@ use regex::Regex;
 use crate::console::{Console, Note};
 
 /// The failure markers (kept, V2), as the PowerShell gate and design.md write them.
-const MARKERS: &str =
-    r"^Build FAILED\.|error CS\d+|: error |Test run summary: Failed!|^\s*failed: [1-9]|gate: (TIMED OUT|STALLED|BACKSTOP|TRANSFER TIMED OUT)";
+const MARKERS: &str = r"^Build FAILED\.|error CS\d+|: error |Test run summary: Failed!|No test projects were found|^\s*failed: [1-9]|gate: (TIMED OUT|STALLED|BACKSTOP|TRANSFER TIMED OUT)";
 
 /// [`MARKERS`] matched without regard to case, as the PowerShell gate's `Select-String` matches them.
 #[expect(clippy::expect_used, reason = "the pattern is a constant, compiled by every unit test that scans a line")]
@@ -391,6 +390,7 @@ mod tests {
             "Program.cs(3,1): error CS1002: ; expected",
             "src/main.rs: error : something",
             "Test run summary: Failed!",
+            "No test projects were found.",
             "failed: 1",
             "gate: TIMED OUT after 900 s",
             "gate: STALLED: no output",
@@ -400,6 +400,13 @@ mod tests {
         for line in lines {
             assert!(matched(line), "{line}");
         }
+    }
+
+    #[test]
+    fn the_no_test_projects_line_is_a_marker_anywhere_in_its_line() {
+        assert!(matched("  No test projects were found."), "leading text");
+        assert!(matched("NO TEST PROJECTS WERE FOUND."), "case is ignored");
+        assert!(!matched("Found 3 test projects"), "a run that found test projects is not a failure");
     }
 
     #[test]
