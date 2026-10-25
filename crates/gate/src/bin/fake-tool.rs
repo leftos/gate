@@ -212,11 +212,19 @@ fn keeper_step<'a>(step: &str, steps: &mut impl Iterator<Item = &'a OsString>, s
         "swallow" => io::copy(&mut io::stdin().lock(), &mut io::sink())
             .map(drop)
             .map_err(|error| format!("cannot read stdin: {error}")),
-        "pid-to" => write_file(&operand(steps, "pid-to")?, &std::process::id().to_string()),
+        "pid-to" => pid_to(&operand(steps, "pid-to")?),
         "alive" => alive(&operand(steps, "alive")?, stdout),
         "run-each" => run_each(&operand(steps, "run-each")?),
         other => Err(format!("unknown step '{other}'")),
     }
+}
+
+/// The `pid-to` step: writes this process's pid to the file at `path`, through a file beside it moved over it, so a
+/// case that arms a bound by the path never finds it there empty.
+fn pid_to(path: &str) -> Result<(), String> {
+    let staged = format!("{path}.tmp");
+    write_file(&staged, &std::process::id().to_string())?;
+    std::fs::rename(&staged, path).map_err(|error| format!("cannot move {staged} over {path}: {error}"))
 }
 
 /// The `echo` step: writes each line of stdin back to stdout as it comes, flushed, until stdin ends.

@@ -109,6 +109,9 @@ pub enum Problem {
         option: String,
         value: String,
     },
+    /// A `--test-box-git-armed-by` given without the `--test-box-git-limit` whose bound it arms.
+    #[cfg(feature = "test-seams")]
+    GitArmedByNeedsLimit,
     NeedsValue(String),
     /// A bare `--timeout auto`, which carries no floor.
     AutoNeedsFloor(String),
@@ -217,6 +220,8 @@ impl fmt::Display for Problem {
             }
             #[cfg(feature = "test-seams")]
             Problem::BadGitLimit { option, value } => write!(f, "gate: {option} must be <step>:<ms>, got '{value}'"),
+            #[cfg(feature = "test-seams")]
+            Problem::GitArmedByNeedsLimit => f.write_str("gate: --test-box-git-armed-by needs --test-box-git-limit"),
             Problem::NeedsValue(option) => write!(f, "gate: {option} needs a value"),
             Problem::AutoNeedsFloor(option) => write!(f, "gate: {option} auto needs a floor in seconds: auto:<n>"),
             Problem::GivenTwice(option) => write!(f, "gate: {option} is given twice"),

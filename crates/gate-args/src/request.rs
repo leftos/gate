@@ -122,6 +122,9 @@ pub struct BoxSeams {
     /// A git step of `gate box`, named as the box's lines name it (`checkout`, say), and how long it may take, in
     /// milliseconds, in place of its built-in bound; every other step keeps its own. `None` without the feature.
     pub git_limit: Option<(String, u64)>,
+    /// The file whose existence starts the bound of the git step `--test-box-git-limit` names; `None` without the
+    /// feature, and every bound starts with its step.
+    pub git_armed_by: Option<PathBuf>,
 }
 
 /// A fault `--test-box-desktop` makes the box's desktop run take, in place of the real task start and helper.

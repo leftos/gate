@@ -1030,12 +1030,19 @@ pub(crate) const GIT_LONG_LIMIT: Duration = Duration::from_mins(30);
 /// lines name it, and the bound it takes in place of its class's.
 static GIT_LIMIT_SEAM: OnceLock<(String, Duration)> = OnceLock::new();
 
+/// `--test-box-git-armed-by <path>`, set once beside the limit it arms ([`set_git_limit`]): the file whose appearance
+/// starts the bound of the step the limit names, that step having none until then.
+static GIT_ARMED_BY: OnceLock<PathBuf> = OnceLock::new();
+
 /// Makes `--test-box-git-limit`, when `seams` gives it, the bound of the git step it names in place of
-/// [`GIT_SHORT_LIMIT`] or [`GIT_LONG_LIMIT`], every other step keeping its own; called once, before the box's verb
-/// runs.
+/// [`GIT_SHORT_LIMIT`] or [`GIT_LONG_LIMIT`], every other step keeping its own, and `--test-box-git-armed-by` the file
+/// that step's bound waits for before it starts counting; called once, before the box's verb runs.
 pub(crate) fn set_git_limit(seams: &BoxSeams) {
     if let Some((step, ms)) = &seams.git_limit {
         GIT_LIMIT_SEAM.get_or_init(|| (step.clone(), Duration::from_millis(*ms)));
+    }
+    if let Some(path) = &seams.git_armed_by {
+        GIT_ARMED_BY.get_or_init(|| path.clone());
     }
 }
 
@@ -1082,6 +1089,15 @@ impl GitStep<'_> {
         match GIT_LIMIT_SEAM.get() {
             Some((step, limit)) if step == self.name => *limit,
             _ => self.class.limit(),
+        }
+    }
+
+    /// The file `--test-box-git-armed-by` names when this is the step `--test-box-git-limit` names and the box was
+    /// given both; `None` for a step whose bound counts from its start.
+    fn armed_by(&self) -> Option<&'static Path> {
+        match GIT_LIMIT_SEAM.get() {
+            Some((step, _)) if step == self.name => GIT_ARMED_BY.get().map(PathBuf::as_path),
+            _ => None,
         }
     }
 }
@@ -1334,8 +1350,8 @@ fn git_ran(
         forwarders: readers.forwarders,
         watching: Watching::Git,
     };
-    let deadline = Instant::now() + step.limit();
-    let end = waited(&watched, (step.class, deadline), signal.as_ref(), shared, console);
+    let mut bound = Bound::new(step);
+    let end = waited(&watched, &mut bound, signal.as_ref(), shared, console);
     let Watched { forwarders, .. } = watched;
     let failure = match end {
         WaitEnd::Exited { code, stopped: false } => {
@@ -1365,22 +1381,55 @@ fn git_ran(
     Err(ended(&job, forwarders, failure, step, shared.lock, console))
 }
 
-/// The wait for a started git ([`Watched::wait`]), each look probing stderr and ending the wait at `deadline`; for a
-/// step a gone client or a stop ends, once `shared`'s flag is set, and on the run's stop `signal`, which ends the job,
-/// given only to such a step. A write of the shared bare repository waits on past both, to its exit or its bound.
-fn waited(
-    watched: &Watched<'_>,
-    (class, deadline): (GitClass, Instant),
-    signal: Option<&StopSignal<'_>>,
-    shared: Shared<'_>,
-    console: &mut Console,
-) -> WaitEnd<GitEnd> {
+/// The bound of a git step's wait: counted from the step's start, or, for the step `--test-box-git-armed-by` arms, only
+/// from the moment its file appears, so a step that has not reached that moment has no bound to beat.
+struct Bound {
+    /// Whether a gone client or a stop ends the step.
+    class: GitClass,
+    /// How long the step may take once the bound is set.
+    limit: Duration,
+    /// The file the seam arms the bound by; `None` for a bound set from the step's start, and set then.
+    armed_by: Option<&'static Path>,
+    /// When the bound fires, once it is set.
+    deadline: Option<Instant>,
+}
+
+impl Bound {
+    /// `step`'s bound: set now, unless the seam arms it by a file, which each look then waits for ([`Bound::fired`]).
+    fn new(step: GitStep<'_>) -> Bound {
+        let limit = step.limit();
+        let armed_by = step.armed_by();
+        Bound {
+            class: step.class,
+            limit,
+            armed_by,
+            deadline: armed_by.is_none().then(|| Instant::now() + limit),
+        }
+    }
+
+    /// Whether the bound has fired, setting it first once the seam's file exists: before that, nothing can fire it.
+    fn fired(&mut self) -> bool {
+        if self.deadline.is_none() {
+            match self.armed_by {
+                Some(path) if path.exists() => self.deadline = Some(Instant::now() + self.limit),
+                _ => return false,
+            }
+        }
+        self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
+    }
+}
+
+/// The wait for a started git ([`Watched::wait`]), each look probing stderr and ending the wait at `bound`; for a step
+/// a gone client or a stop ends, once `shared`'s flag is set, and on the run's stop `signal`, which ends the job, given
+/// only to such a step. A write of the shared bare repository waits on past both, to its exit or its bound.
+fn waited(watched: &Watched<'_>, bound: &mut Bound, signal: Option<&StopSignal<'_>>, shared: Shared<'_>, console: &mut Console) -> WaitEnd<GitEnd> {
+    let class = bound.class;
     loop {
         let end = watched.wait(
             signal,
             |_| {
                 heartbeat::probe_stderr(shared.lock, shared.gone);
-                if Instant::now() >= deadline {
+                if bound.fired() {
                     return Some(GitEnd::Bound);
                 }
                 (class.ends_early() && shared.gone.load(Ordering::SeqCst)).then_some(GitEnd::Gone)
@@ -1390,7 +1439,7 @@ fn waited(
         match end {
             // Each wait looks for git's exit for a step before it answers a gone client, so this loop is not a spin.
             WaitEnd::ClientGone if !class.ends_early() => {
-                if Instant::now() >= deadline {
+                if bound.fired() {
                     return WaitEnd::Killed(GitEnd::Bound);
                 }
             }
@@ -1563,8 +1612,8 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
     use super::{
-        Git, GitClass, GitFailure, GitStep, Shared, Streams, TreeAt, fresh_config, fresh_config_written, git_failed, git_launch, git_ran, readers,
-        ready_tree, refused_folders, replace_config, sdk_list, waited,
+        Bound, Git, GitClass, GitFailure, GitStep, Shared, Streams, TreeAt, fresh_config, fresh_config_written, git_failed, git_launch, git_ran,
+        readers, ready_tree, refused_folders, replace_config, sdk_list, waited,
     };
     use crate::boxside::forward::{ClientGone, OutputLock};
     use crate::boxside::helper_trusted;
@@ -1664,13 +1713,13 @@ mod tests {
             watching: Watching::Git,
         };
 
-        let end = waited(
-            &watched,
-            (GitClass::Short, Instant::now() + Duration::from_secs(600)),
-            Some(&signal),
-            shared,
-            &mut Console::new(),
-        );
+        let mut bound = Bound {
+            class: GitClass::Short,
+            limit: Duration::from_secs(600),
+            armed_by: None,
+            deadline: Some(Instant::now() + Duration::from_secs(600)),
+        };
+        let end = waited(&watched, &mut bound, Some(&signal), shared, &mut Console::new());
 
         assert!(
             matches!(end, WaitEnd::Exited { code: 0, stopped: false }),

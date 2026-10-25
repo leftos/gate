@@ -2941,6 +2941,8 @@ The box's ceiling has three seams: `--test-box-sample-ms <n>` replaces the 5 s s
 
 `--test-box-git-limit <step>:<ms>` replaces the bound of the one git step it names (as the box's lines name it, `checkout`, `git init --bare`, `push lib`) with `ms` milliseconds, every other step keeping its own; a value that is not `<step>:<ms>` with `ms` a whole number above 0 is `gate: --test-box-git-limit must be <step>:<ms>, got '<value>'`.
 
+`--test-box-git-armed-by <path>` makes the bound `--test-box-git-limit` gives its step start only once `<path>` exists, checked at each look of the step's wait: until then that step has no bound, and the steps the limit does not name keep their class bound from their start. Without this flag the limit's bound starts with its step; given without `--test-box-git-limit` it is `gate: --test-box-git-armed-by needs --test-box-git-limit`.
+
 `--test-lfs-budget-bytes <n>` replaces the 16 GiB a `gate box lfs` put unpacks, in bytes.
 
 `--test-box-root-walk-stop <folder>`, which the keyed `gate box prune` also honours, ends the preflight's walk over the folders above the work root at that folder, which and those above it go unjudged (any path; an empty value is no value), so a case does not depend on the host's folders.

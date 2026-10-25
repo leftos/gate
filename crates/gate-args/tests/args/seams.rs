@@ -1401,6 +1401,107 @@ fn box_seam_git_limit_refuses_a_value_without_a_step_or_whole_milliseconds() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn box_seam_git_armed_by_names_the_file_that_arms_a_bound() {
+    use std::path::PathBuf;
+
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    let armed = |git_armed_by: Option<&str>| {
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Run,
+            seams: BoxSeams {
+                git_limit: Some(("checkout".to_owned(), 2000)),
+                git_armed_by: git_armed_by.map(PathBuf::from),
+                ..BoxSeams::default()
+            },
+            root: None,
+            keys: Vec::new(),
+        })
+    };
+    assert_eq!(
+        invocation(&[
+            "box",
+            "--test-box-git-limit",
+            "checkout:2000",
+            "--test-box-git-armed-by",
+            "C:\\case\\parked",
+            "run",
+            "--stdin",
+        ]),
+        armed(Some("C:\\case\\parked"))
+    );
+    assert_eq!(
+        invocation(&[
+            "box",
+            "--test-box-git-limit=checkout:2000",
+            "--test-box-git-armed-by=C:\\case\\parked",
+            "run",
+            "--stdin",
+        ]),
+        armed(Some("C:\\case\\parked")),
+        "each seam in its = spelling"
+    );
+}
+
+#[cfg(not(feature = "test-seams"))]
+#[test]
+fn box_seam_git_armed_by_is_an_unknown_word_without_the_feature() {
+    let words = [
+        "box",
+        "--test-box-git-limit",
+        "checkout:2000",
+        "--test-box-git-armed-by",
+        "parked",
+        "run",
+        "--stdin",
+    ];
+    assert_eq!(problems(&words), [BOX_USAGE]);
+    assert_eq!(problems(&["box", "--test-box-git-armed-by=parked", "run", "--stdin"]), [BOX_USAGE]);
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_git_armed_by_needs_the_git_limit_it_arms() {
+    let rows: [(&[&str], &[&str]); 3] = [
+        (
+            &["box", "--test-box-git-armed-by", "C:\\case\\parked", "run", "--stdin"],
+            &["gate: --test-box-git-armed-by needs --test-box-git-limit"],
+        ),
+        (
+            &[
+                "box",
+                "--test-box-git-limit",
+                "checkout",
+                "--test-box-git-armed-by",
+                "C:\\case\\parked",
+                "run",
+                "--stdin",
+            ],
+            &["gate: --test-box-git-limit must be <step>:<ms>, got 'checkout'"],
+        ),
+        (
+            &[
+                "box",
+                "--test-box-git-limit",
+                "checkout:2000",
+                "--test-box-git-armed-by",
+                "C:\\case\\parked",
+                "--test-box-git-armed-by=C:\\case\\other",
+                "run",
+                "--stdin",
+            ],
+            &["gate: --test-box-git-armed-by is given twice"],
+        ),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), want, "{words:?}");
+    }
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn the_probe_limit_seam_is_refused_outside_gate_box() {
     assert_eq!(
         problems(&refs(&with(&RUN, &["--test-probe-limit-ms", "5", "--", "cmd"]))),

@@ -8,7 +8,8 @@
 //! `--test-box-kill-leaves <n>`, `--test-probe-limit-ms <n>`, `--test-probe-drain-ms <n>`, `--test-box-desktop <fault>`,
 //! `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>`, `--test-box-desktop-ms <n>`,
 //! `--test-box-desktop-message-ms <n>` and `--test-box-register ok|fail`, `--test-box-root-walk-stop <folder>`,
-//! `--test-box-git-limit <step>:<ms>` (each also as `--<seam>=<value>`) before the verb; without the feature each is no verb, and so the box usage.
+//! `--test-box-git-limit <step>:<ms>` and `--test-box-git-armed-by <path>` (each also as `--<seam>=<value>`) before the
+//! verb; without the feature each is no verb, and so the box usage.
 
 use std::ffi::{OsStr, OsString};
 use std::iter::Peekable;
@@ -160,6 +161,9 @@ enum Seam {
     RootWalkStop,
     /// `--test-box-git-limit <step>:<ms>`: how long the box's git step `step` may take, in milliseconds.
     GitLimit,
+    /// `--test-box-git-armed-by <path>`: the bound `--test-box-git-limit` gives its step starts only once this file
+    /// exists.
+    GitArmedBy,
 }
 
 #[cfg(feature = "test-seams")]
@@ -191,6 +195,7 @@ impl Seam {
             "--test-box-register" => Some(Seam::Register),
             "--test-box-root-walk-stop" => Some(Seam::RootWalkStop),
             "--test-box-git-limit" => Some(Seam::GitLimit),
+            "--test-box-git-armed-by" => Some(Seam::GitArmedBy),
             _ => None,
         }
     }
@@ -221,6 +226,7 @@ impl Seam {
             Seam::Register => "--test-box-register",
             Seam::RootWalkStop => "--test-box-root-walk-stop",
             Seam::GitLimit => "--test-box-git-limit",
+            Seam::GitArmedBy => "--test-box-git-armed-by",
         }
     }
 }
@@ -250,13 +256,18 @@ fn seams(words: &mut Peekable<impl Iterator<Item = OsString>>, problems: &mut Ve
             problems.push(problem);
         }
     }
+    // A file that arms a bound is the bound's, so one given without `--test-box-git-limit` has nothing to arm; a limit
+    // given with a value it refuses is that value's problem alone.
+    if seams.git_armed_by.is_some() && !given.contains(&Seam::GitLimit) {
+        problems.push(Problem::GitArmedByNeedsLimit);
+    }
     seams
 }
 
 /// Sets `seam` from `value`: whole milliseconds above 0 for the heartbeat, the dotnet limit, the sample period, the
 /// probe limit, the probe drain, the desktop waits and the desktop message limit, a step and whole milliseconds above 0 after its last `:` for
 /// the git limit,
-/// `fail-before` for the console, `refused` for the token, any path for the park,
+/// `fail-before` for the console, `refused` for the token, any path for the park and for the git bound's arm,
 /// whole bytes above 0 for the outputs, the inputs and the LFS budgets, `true` or `false` for the sampler's failure, a whole
 /// percent from 1 to 100 for the free share, a whole count above 0 for the processes a kill leaves, one of the desktop
 /// faults for the desktop, one of the session states for the desktop session, 1 to 64 letters, digits and `-` for the
@@ -288,6 +299,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::DesktopMs => seams.desktop_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::DesktopMessageMs => seams.desktop_message_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::GitLimit => seams.git_limit = Some(crate::values::git_limit(name, &value)?),
+        Seam::GitArmedBy => seams.git_armed_by = Some(PathBuf::from(value)),
         Seam::Register => seams.register_ok = Some(crate::values::remote_call(name, &value, REGISTER_RESULTS)? == "ok"),
         Seam::Console => seams.fail_console = the_word(name, value, "fail-before", |option, value| Problem::BadConsoleFailure { option, value })?,
         Seam::Token => seams.refuse_token = the_word(name, value, "refused", |option, value| Problem::BadTokenRefusal { option, value })?,
