@@ -27,7 +27,7 @@ use crate::remote::toolchain::{self, Reported};
 use crate::remote::transport::ssh::Ssh;
 use crate::remote::transport::{Program, Transport, Wire};
 use crate::remote::{
-    BOX_USAGE, CREATED, NOT_RECOGNIZED, SSH_FAILED, Warm, install_why, other_build, root_busy_why, root_why, sdks_of, their_version, warm_of,
+    CREATED, SSH_FAILED, Warm, install_why, no_box, other_build, root_busy_why, root_why, sdks_of, shell_said, their_version, warm_of,
 };
 use crate::route;
 use gate_wire::build_version;
@@ -314,9 +314,10 @@ fn refusal(host: &str, root: &str, heard: &Heard) -> Option<String> {
                 .unwrap_or_else(|| format!("ssh exited {SSH_FAILED} with no message"));
             return Some(format!("check: {host}: unreachable: {why}"));
         }
-        Some(status @ (NOT_RECOGNIZED | BOX_USAGE)) => {
+        Some(status) if no_box(status, &heard.lines, heard.errors.iter().map(String::as_str)) => {
+            let said = shell_said(status, heard.last_error.as_deref());
             return Some(format!(
-                "check: {host}: has no gate box that takes this call (status {status}); run gate push"
+                "check: {host}: has no gate box that takes this call (status {status}); run gate push{said}"
             ));
         }
         status => {
@@ -803,7 +804,7 @@ mod tests {
             ),
             Some("check: builder-1: unreachable: ssh: connect to host builder-1 port 22: Connection refused".to_owned())
         );
-        for status in [9009, 2] {
+        for status in [9009, 2, 126, 127] {
             assert_eq!(
                 refusal(HOST, root, &heard(Some(status), Vec::new(), None)),
                 Some(format!(
@@ -811,6 +812,31 @@ mod tests {
                 ))
             );
         }
+        assert_eq!(
+            refusal(HOST, root, &heard(Some(127), Vec::new(), Some("zsh: command not found: gate-box"))),
+            Some("check: builder-1: has no gate box that takes this call (status 127); run gate push: zsh: command not found: gate-box".to_owned()),
+            "a shell's line of its own is kept"
+        );
+        assert_eq!(
+            refusal(
+                HOST,
+                root,
+                &heard(Some(127), Vec::new(), Some("gate: remote git init failed (status 127)"))
+            ),
+            Some(r"check: builder-1: preparing D:\gate-remote failed (status 127): gate: remote git init failed (status 127)".to_owned()),
+            "a box that spoke on standard error is not a missing box"
+        );
+        assert_eq!(
+            refusal(HOST, root, &heard(Some(127), lines(&["gate: remote git init failed (status 127)"]), None)),
+            Some(r"check: builder-1: preparing D:\gate-remote failed (status 127)".to_owned()),
+            "a box that spoke on standard output is not a missing box"
+        );
+        let stamped = "2026-10-25T00:00:00.000000+00:00 gat gate: remote git init failed (status 127)";
+        assert_eq!(
+            refusal(HOST, root, &heard(Some(127), Vec::new(), Some(stamped))),
+            Some(format!(r"check: builder-1: preparing D:\gate-remote failed (status 127): {stamped}")),
+            "a stamped box line is read without its stamp"
+        );
         assert_eq!(
             refusal(
                 HOST,

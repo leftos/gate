@@ -62,6 +62,8 @@
 //! the word as a line on standard output, then does as `hold <path>`; `progress-ok <n>` writes at least `<n>` bytes of
 //! short progress updates, each ended by a carriage return, and a line end on standard error, then does as `ok`;
 //! `ok-then-out <line>` does as `ok`, then writes the line on standard output, after all the call wrote;
+//! `out-exit <n> <line>` runs nothing, writes the line on standard output and exits `<n>`, as a box that says its own
+//! failure line and ends with that status does;
 //! `truncate <n>` does as `ok` with the call's standard output read, only its first `<n>` bytes passed on raw and the
 //! rest read and dropped, then writes ssh's `Connection timed out during banner exchange` on standard error and exits
 //! 255, so only the bytes it sent tell the drop from one before the banner; `garbage <n>` runs nothing, writes `<n>`
@@ -226,6 +228,7 @@ fn run() -> Result<i32, String> {
             writeln!(io::stdout().lock(), "{line}").map_err(|error| format!("cannot write: {error}"))?;
             Ok(status)
         }
+        Some(("out-exit", rest)) => out_exit(&step, rest),
         Some(("truncate", bytes)) => call.truncated(byte_count(&step, bytes)?),
         Some(("flood-ok", bytes)) => {
             filler(byte_count(&step, bytes)?)?;
@@ -321,6 +324,14 @@ fn progress(step: &str, bytes: &str) -> Result<(), String> {
         .write_all(updates.as_bytes())
         .and_then(|()| stderr.flush())
         .map_err(|error| format!("cannot write: {error}"))
+}
+
+/// `out-exit <n> <line>`, given as `rest` after the step's name: writes the line on standard output and gives `<n>`.
+fn out_exit(step: &str, rest: &str) -> Result<i32, String> {
+    let (status, line) = rest.split_once(' ').ok_or_else(|| format!("the step '{step}' names no line"))?;
+    let status = status.parse().map_err(|_| format!("the step '{step}' names no status"))?;
+    writeln!(io::stdout().lock(), "{line}").map_err(|error| format!("cannot write: {error}"))?;
+    Ok(status)
 }
 
 /// `say-exit <n> <line>`, given as `rest` after the step's name: writes the line on standard error and gives `<n>`.

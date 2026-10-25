@@ -1966,21 +1966,81 @@ fn a_routed_run_whose_command_is_longer_than_cmd_s_line_runs_on_the_box() {
     assert!(events.iter().all(|event| event["remote"] == true), "a remote run: {events:#?}");
 }
 
+/// A builder whose preflight ends with cmd's 9009, or a Unix shell's 126 or 127 with no line of the box's own, has no
+/// gate box that takes the run: the run is not routed and falls back, here to the PC. A shell's line of its own, which
+/// says why it could not run the box, is kept after the status.
 #[test]
 fn a_builder_without_a_usable_gate_box_is_not_routed() {
-    let case = client_case("client-no-box");
-    let steps = ssh_steps(&case, "ssh", &["exit 9009"]);
+    let cases = [
+        (
+            "client-no-box",
+            "exit 9009",
+            "gate: not routed: builder has no gate box that takes this run (preflight status 9009)",
+        ),
+        (
+            "client-no-box-127",
+            "say-exit 127 zsh: command not found: gate-box",
+            "gate: not routed: builder has no gate box that takes this run (preflight status 127): zsh: command not found: gate-box",
+        ),
+        (
+            "client-no-box-126",
+            "say-exit 126 zsh: permission denied: gate-box",
+            "gate: not routed: builder has no gate box that takes this run (preflight status 126): zsh: permission denied: gate-box",
+        ),
+    ];
+    for (name, step, line) in cases {
+        let case = client_case(name);
+        let steps = ssh_steps(&case, "ssh", &[step]);
+
+        let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+        assert_eq!(outcome.code, Some(0), "{name}: {outcome:?}");
+        assert!(outcome.stderr.contains(line), "{name}: {outcome:?}");
+        assert!(
+            outcome.stderr.contains("gate: remote builder version; running here"),
+            "{name}: {outcome:?}"
+        );
+        assert!(outcome.stdout.contains("ran here"), "{name}: {outcome:?}");
+        assert_eq!(calls(&steps), ["preflight"], "{name}");
+        assert_eq!(fallbacks(&events(&case)), ["version"], "{name}");
+        assert!(!case.folder().join("builder").exists(), "{name}: nothing reached the builder");
+    }
+}
+
+/// A preflight that ended with a shell's status after the box said its own `gate: remote … failed (status …)` line on
+/// standard error, as both boxes do, has a gate box that takes the run: the run ends with that status, and the PC does
+/// not run the command instead.
+#[test]
+fn a_builder_whose_box_said_a_git_step_failed_is_not_fallen_back_from() {
+    let case = client_case("client-box-said-127");
+    let steps = ssh_steps(&case, "ssh", &["say-exit 127 gate: remote git init failed (status 127)"]);
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
 
-    assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let line = "gate: not routed: builder has no gate box that takes this run (preflight status 9009)";
-    assert!(outcome.stderr.contains(line), "{outcome:?}");
-    assert!(outcome.stderr.contains("gate: remote builder version; running here"), "{outcome:?}");
-    assert!(outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(outcome.code, Some(127), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: preparing "), "{outcome:?}");
+    assert!(outcome.stderr.contains("failed (status 127)"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("not routed"), "{outcome:?}");
+    assert!(!outcome.stdout.contains("ran here"), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight"]);
-    assert_eq!(fallbacks(&events(&case)), ["version"]);
-    assert!(!case.folder().join("builder").exists(), "nothing reached the builder");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "{:?}", events(&case));
+}
+
+/// The same when the box said its line on standard output instead: a `gate:` line on either stream is the box speaking.
+#[test]
+fn a_builder_whose_box_said_a_git_step_failed_on_its_output_is_not_fallen_back_from() {
+    let case = client_case("client-box-said-127-out");
+    let steps = ssh_steps(&case, "ssh", &["out-exit 127 gate: remote git init failed (status 127)"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", "ran here"]));
+
+    assert_eq!(outcome.code, Some(127), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: preparing "), "{outcome:?}");
+    assert!(outcome.stderr.contains("failed (status 127)"), "{outcome:?}");
+    assert!(!outcome.stderr.contains("not routed"), "{outcome:?}");
+    assert!(!outcome.stdout.contains("ran here"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight"]);
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "{:?}", events(&case));
 }
 
 /// The id of the `builders` entry `mac-1`: the first 8 hex digits of the SHA-256 of its alias.

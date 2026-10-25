@@ -80,9 +80,44 @@ use crate::run::find_program;
 use crate::run::{CONTROL_C_EXIT, is_within, resolved};
 
 /// The statuses of a preflight whose builder has no `gate box` that takes the run: cmd's for a program it cannot find,
-/// and a gate's usage error for a payload it does not read.
+/// a gate's usage error for a payload it does not read, and a Unix shell's for a program it found but could not run and
+/// for one it did not find, the last two only when the shell said no line of the box's own ([`no_box`]).
 pub(crate) const NOT_RECOGNIZED: i32 = 9009;
 pub(crate) const USAGE: i32 = 2;
+pub(crate) const SHELL_CANNOT_EXECUTE: i32 = 126;
+pub(crate) const SHELL_NOT_FOUND: i32 = 127;
+
+/// Whether the preflight call that ended with `status`, its standard output `lines` and standard error `errors`, came
+/// from a builder with no gate box that takes the run: cmd's status for a program it cannot find, a gate's usage
+/// status, or a Unix shell's 126 or 127 with no line of the box's own on either stream, since a box that ran says
+/// `gate: …` before it ends with a status.
+pub(crate) fn no_box<'a>(status: i32, lines: &'a [String], errors: impl IntoIterator<Item = &'a str>) -> bool {
+    if matches!(status, NOT_RECOGNIZED | USAGE) {
+        return true;
+    }
+    matches!(status, SHELL_CANNOT_EXECUTE | SHELL_NOT_FOUND) && !box_spoke(lines, errors)
+}
+
+/// Whether a preflight call said one of the box's own lines, `gate: …` once its stamp is taken off, on standard output
+/// `lines` or standard error `errors`: both boxes stamp the lines they say themselves.
+fn box_spoke<'a>(lines: &'a [String], errors: impl IntoIterator<Item = &'a str>) -> bool {
+    lines
+        .iter()
+        .map(String::as_str)
+        .chain(errors)
+        .any(|line| stamp::unstamped(line).text.starts_with("gate:"))
+}
+
+/// How a no-box line ends for a call that ended with `status` and gave `last` on standard error: `: {last}`, escaped,
+/// after a Unix shell's 126 or 127 only, whose statuses can be a program's own failure; nothing otherwise, and nothing
+/// for a shell that said no line.
+pub(crate) fn shell_said(status: i32, last: Option<&str>) -> String {
+    match last.filter(|line| !line.trim().is_empty()) {
+        Some(last) if matches!(status, SHELL_CANNOT_EXECUTE | SHELL_NOT_FOUND) => format!(": {}", git::failure_text(&[last])),
+        _ => String::new(),
+    }
+}
+
 /// The most bytes a call's job may have written and still be made again after a failure before the banner: ssh's own
 /// failure writes one line, and another fetch from a builder would start a fresh count against its cap.
 const RETRY_WRITTEN: u64 = 1 << 20;
@@ -1961,6 +1996,7 @@ impl Attempt<'_, '_> {
         let tools = toolchain::reported(&called.lines, &sent);
         let host = self.call.host();
         let refused = preflight_refusal(host, &called);
+        let box_missing = no_box(called.status, &called.lines, called.last_error.as_deref());
         self.lines.append(&mut called.lines);
         self.not_started_if_killed("the preflight", &called)?;
         if let Some((line, reason)) = refused {
@@ -1974,9 +2010,10 @@ impl Attempt<'_, '_> {
                 self.say(format!("gate: remote {host} unreachable: {last}"));
                 return Err(End::Refused(FallbackReason::Unreachable));
             }
-            status @ (NOT_RECOGNIZED | USAGE) => {
+            status if box_missing => {
+                let said = shell_said(status, called.last_error.as_deref());
                 self.say(format!(
-                    "gate: not routed: {host} has no gate box that takes this run (preflight status {status})"
+                    "gate: not routed: {host} has no gate box that takes this run (preflight status {status}){said}"
                 ));
                 return Err(End::Refused(FallbackReason::Version));
             }

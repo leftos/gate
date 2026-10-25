@@ -1780,17 +1780,23 @@ fn check_builder_matches_the_host_in_any_letter_case() {
 
 #[test]
 fn check_builder_says_a_builder_with_no_gate_box() {
-    let case = builder_case("check_builder_no_gate_box");
-    let steps = ssh_steps(&case, "ssh", &["exit 9009"]);
+    for (name, step, status) in [
+        ("check_builder_no_gate_box", "exit 9009", 9009),
+        ("check_builder_no_gate_box_127", "exit 127", 127),
+    ] {
+        let case = builder_case(name);
+        let steps = ssh_steps(&case, "ssh", &[step]);
 
-    let outcome = check_builder(&case, "builder-1", &[], &steps);
+        let outcome = check_builder(&case, "builder-1", &[], &steps);
 
-    assert_eq!(outcome.stdout, "", "{outcome:?}");
-    assert_eq!(
-        outcome.stderr, "check: builder-1: has no gate box that takes this call (status 9009); run gate push\n",
-        "{outcome:?}"
-    );
-    assert_eq!(outcome.code, Some(1), "{outcome:?}");
+        assert_eq!(outcome.stdout, "", "{name}: {outcome:?}");
+        assert_eq!(
+            outcome.stderr,
+            format!("check: builder-1: has no gate box that takes this call (status {status}); run gate push\n"),
+            "{name}: {outcome:?}"
+        );
+        assert_eq!(outcome.code, Some(1), "{name}: {outcome:?}");
+    }
 }
 
 /// A check of a macOS `builders` entry calls that builder's `gate-box` under its own root, not the transport's, and a
