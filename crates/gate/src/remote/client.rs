@@ -17,6 +17,7 @@
 //! [`hold_key_waiting`] in slices from `run.rs` up to its bound) before its remote slot.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::num::NonZeroU64;
@@ -109,6 +110,9 @@ const BOOT_SLACK: SignedDuration = SignedDuration::from_secs(30);
 const NO_HANDLER: &str = "gate: --test-remote-interrupt-at needs the console handler; it could not be installed";
 /// The most of a call's standard output one read of a raw copy takes.
 const RAW_CHUNK: usize = 64 * 1024;
+/// How often an outputs pull says its progress while it runs, counted from the pull's start, before its first call,
+/// across all its calls.
+const OUTPUTS_PROGRESS: Duration = Duration::from_secs(30);
 
 /// The Rust client: over ssh, or over the local transport of `--test-remote-transport`.
 pub(crate) struct RustClient {
@@ -154,6 +158,10 @@ pub(crate) struct RustClient {
     log_cap: u64,
     /// `--test-own-start-fails`: this gate's start, which names the sync-back's quarantine, cannot be read.
     own_start_fails: bool,
+    /// `--test-remote-hint-from-pull`: the hang hint is due only during the outputs pull, counted from its start.
+    hint_from_pull: bool,
+    /// How often an outputs pull says its progress: `--test-outputs-progress-ms`, else 30 s.
+    outputs_progress: Duration,
     /// `--test-remote-tamper`: the change the client makes to its own folders at one point of the run.
     #[cfg(feature = "test-seams")]
     tamper: Option<String>,
@@ -196,6 +204,8 @@ impl RustClient {
             lfs_budget: seams.remote_lfs_budget_bytes.unwrap_or(lfs::LFS_BUDGET),
             log_cap: seams.remote_log_cap_bytes.unwrap_or(watchdog::LOG_CAP),
             own_start_fails: seams.own_start_fails,
+            hint_from_pull: seams.remote_hint_from_pull,
+            outputs_progress: seams.outputs_progress_ms.map_or(OUTPUTS_PROGRESS, Duration::from_millis),
             #[cfg(feature = "test-seams")]
             tamper: seams.remote_tamper.clone(),
         }
@@ -353,6 +363,7 @@ impl RemoteClient for RustClient {
             lfs_budget: self.lfs_budget,
             log_cap: self.log_cap,
             own_start_fails: self.own_start_fails,
+            hint_from_pull: self.hint_from_pull,
             #[cfg(feature = "test-seams")]
             tamper: self.tamper.as_deref(),
             brought_back: None,
@@ -361,6 +372,12 @@ impl RemoteClient for RustClient {
             lines: Vec::new(),
             problem: None,
             hang_said: false,
+            command_started: None,
+            outputs_progress: self.outputs_progress,
+            pulling: None,
+            pull_periods_said: Cell::new(0),
+            pulled_bytes: 0,
+            pulled_last: None,
             adjusted: None,
             box_killed: None,
             held_run: None,
@@ -1054,8 +1071,9 @@ pub(super) struct Called {
     first_error: Option<String>,
     pub(super) last_error: Option<String>,
     pub(super) lines: Vec<String>,
-    /// Its last standard error line that is the box's outputs line, however many lines came after it.
-    outputs_line: Option<String>,
+    /// Its last standard error line that is the box's outputs line, however many lines came after it, and the size
+    /// line heard just before it.
+    outputs: Option<outputs::OutputsLines>,
     /// Its last standard error line that is the box's back commits line, however many lines came after it.
     back_commits: Option<String>,
     /// Whether it said on standard error that the box skipped outputs for names this PC cannot take.
@@ -1172,6 +1190,9 @@ pub(super) struct Attempt<'c, 'a> {
     log_cap: u64,
     /// `--test-own-start-fails`: this gate's start, which names the sync-back's quarantine, cannot be read.
     pub(super) own_start_fails: bool,
+    /// `--test-remote-hint-from-pull`: the hang hint is not due before the outputs pull starts, and counts from the
+    /// pull's start instead of the box's start marker.
+    hint_from_pull: bool,
     /// `--test-remote-tamper`: the change made to the run's own folders at one point of it ([`tamper::at`]).
     #[cfg(feature = "test-seams")]
     tamper: Option<&'c str>,
@@ -1184,8 +1205,24 @@ pub(super) struct Attempt<'c, 'a> {
     pub(super) split: Split,
     lines: Vec<String>,
     problem: Option<String>,
-    /// Whether the run call said its hang hint, which an attempt says once.
+    /// Whether the run call or the outputs pull said the hang hint, which an attempt says once.
     hang_said: bool,
+    /// When the box's start marker of the run came, which the hang hint counts the run from through the outputs pull
+    /// too; `None` until a run call heard it.
+    command_started: Option<Instant>,
+    /// How often an outputs pull says its progress while it runs.
+    outputs_progress: Duration,
+    /// The outputs pull the call being made is, while the outputs call is made; `None` for every other call.
+    pulling: Option<Pull>,
+    /// The progress periods the outputs pull being made has said, one count across all its calls, so a call made again
+    /// says no period an earlier call of the pull said; 0 as each pull starts.
+    pull_periods_said: Cell<u128>,
+    /// The bytes the last call with a raw copy had written into its sink by its end: what the outputs pull received,
+    /// which for a pull whose call was made again is the last call's alone, each call writing its archive anew.
+    pub(super) pulled_bytes: u64,
+    /// When that call's raw copy wrote its last byte, `None` when it wrote none: the outputs archive's last byte, which
+    /// for a pull whose call was made again is the last call's too.
+    pub(super) pulled_last: Option<Instant>,
     /// The load-adjusted seconds the box said it counted for the command, `None` until the run call that counts said
     /// them.
     adjusted: Option<f64>,
@@ -1223,12 +1260,12 @@ struct Landed {
 }
 
 /// How a run call ended ([`Attempt::run_call`]): its end, the last standard error lines of the call that counts that
-/// are the box's outputs line and its back commits line, whether that call said on standard error that the box
-/// skipped outputs for names this PC cannot take, whether the box said the run's start marker, and the call's last
-/// standard error line that is neither a heartbeat nor one of the box's protocol lines.
+/// are the box's outputs line, its outputs size line and its back commits line, whether that call said on standard
+/// error that the box skipped outputs for names this PC cannot take, whether the box said the run's start marker, and
+/// the call's last standard error line that is neither a heartbeat nor one of the box's protocol lines.
 struct RunEnd {
     end: End,
-    outputs_line: Option<String>,
+    outputs: Option<outputs::OutputsLines>,
     back_commits: Option<String>,
     names_skipped: bool,
     started: bool,
@@ -1326,7 +1363,7 @@ impl Attempt<'_, '_> {
                     Some(targets) => syncback::sync_back(self, &targets, back_commits.as_deref(), status)?,
                     None => syncback::unmatched(self, status),
                 };
-                let brought = outputs::accepted(called.outputs_line.as_deref(), self.call.key, &nonce);
+                let brought = outputs::accepted(called.outputs.as_ref(), self.call.key, &nonce);
                 let ran = outputs::Ran {
                     location: &location,
                     nonce: &nonce,
@@ -1488,13 +1525,44 @@ impl Attempt<'_, '_> {
         self.say(cold_line(self.call.timeout, raised, warm_up));
     }
 
-    /// The hang hint a call watches for: the run call's (`run_call`) until it has said it, from the call's usual p90,
-    /// which a run whose ceiling was raised for a new work tree has none of ([`routed_usual`]); `None` for any other
-    /// call.
+    /// The hang hint a call watches for until the attempt has said it: the run call's (`run_call`), or the outputs
+    /// pull's once the run call heard the box's start marker, from the call's usual p90, which a run whose ceiling was
+    /// raised for a new work tree has none of ([`routed_usual`]); `None` for any other call. With
+    /// `--test-remote-hint-from-pull` the run call watches for none, and the pull's counts from the pull's start.
     fn run_hang(&self, run_call: bool) -> Option<RunHang<'_>> {
+        let phase = if run_call {
+            if self.hint_from_pull {
+                return None;
+            }
+            HangPhase::Running
+        } else {
+            let pull_started = self.pulling?.started;
+            let command_started = self.command_started?;
+            HangPhase::Pulling {
+                counted_from: if self.hint_from_pull { pull_started } else { command_started },
+                pull_started,
+            }
+        };
         routed_usual(self.call.usual, self.raised.is_some())
-            .filter(|_| run_call && !self.hang_said)
-            .map(|usual| RunHang { usual, log: self.call.log })
+            .filter(|_| !self.hang_said)
+            .map(|usual| RunHang {
+                usual,
+                log: self.call.log,
+                phase,
+                builder: self.call.host(),
+            })
+    }
+
+    /// The pull's progress the call being made says: the outputs pull's, against the attempt's one count of the periods
+    /// the pull said; `None` for every call but an outputs call.
+    fn pull_watch(&self) -> Option<PullWatch<'_>> {
+        self.pulling.map(|pull| PullWatch {
+            total: pull.total,
+            started: pull.started,
+            every: self.outputs_progress,
+            log: self.call.log,
+            periods_said: &self.pull_periods_said,
+        })
     }
 
     /// Whether the call is a warm-up, whose run call ended as `called`: its end is then classed and kept for the outcome.
@@ -2522,7 +2590,7 @@ impl Attempt<'_, '_> {
                 wire: Wire::Compressed,
             };
             let called = attempt.ssh(BoxVerb::Run, Echo::Console, Watch::Run(limits), raise, run)?;
-            heard.clone_from(&called.outputs_line);
+            heard.clone_from(&called.outputs);
             back_commits.clone_from(&called.back_commits);
             names_skipped = called.names_skipped;
             adjusted = called.adjusted;
@@ -2535,7 +2603,7 @@ impl Attempt<'_, '_> {
         let end = made?;
         Ok(RunEnd {
             end,
-            outputs_line: heard,
+            outputs: heard,
             back_commits,
             names_skipped,
             started,
@@ -2776,20 +2844,35 @@ impl Attempt<'_, '_> {
     /// The outputs call to the builder at `location` for the archive `name`: `gate box outputs`, made again when it
     /// failed before the banner, watched as a fetch by `limits`, and the console interrupt raised after its first
     /// output byte with `--test-remote-interrupt-at outputs`. Each attempt writes its standard output raw to the file
-    /// `archive` makes new for it; its standard error lines go to the log. The call that counts, its lines kept; else
-    /// why the file or the call could not be made, or the interrupt.
-    pub(super) fn outputs_call(&mut self, location: &Location, name: &str, archive: &mut outputs::Archive, limits: Limits) -> Result<Called, End> {
+    /// `archive` makes new for it; its standard error lines go to the log. Each attempt is watched as the outputs pull
+    /// `pull`, whose progress it says against the archive's size when the box said it. What the pull received is
+    /// counted from nothing before the call, so a Ctrl+C that ends it before it starts leaves no earlier call's figures.
+    /// The call that counts, its lines kept; else why the file or the call could not be made, or the interrupt.
+    pub(super) fn outputs_call(
+        &mut self,
+        location: &Location,
+        name: &str,
+        archive: &mut outputs::Archive,
+        limits: Limits,
+        pull: Pull,
+    ) -> Result<Called, End> {
+        self.pulled_bytes = 0;
+        self.pulled_last = None;
         self.go_on()?;
         let input = payload::input(&payload::outputs_word(location, name), None);
         let raise = self.raises_at("outputs");
-        let (mut called, _) = self.with_retry(SSH_FAILED, |attempt| {
+        self.pull_periods_said.set(0);
+        self.pulling = Some(pull);
+        let retried = self.with_retry(SSH_FAILED, |attempt| {
             let cap = sent_limit(attempt.outputs_budget);
             let only = CallOnly {
                 sink: Some(archive.create(cap).map_err(End::Failed)?),
                 ..CallOnly::plain(Arc::clone(&input))
             };
             attempt.ssh(BoxVerb::Outputs, Echo::LogOnly, Watch::Fetch(limits, None), raise, only)
-        })?;
+        });
+        self.pulling = None;
+        let (mut called, _) = retried?;
         self.lines.append(&mut called.lines);
         Ok(called)
     }
@@ -2920,7 +3003,7 @@ impl Attempt<'_, '_> {
         let feeding = Arc::new(Feeding::default());
         let feeder = stdin.zip(starts.input).map(|(stdin, input)| fed(stdin, input, Arc::clone(&feeding)));
         let shared = Arc::new(Shared::new());
-        // Only the run call carries the run's nonce, and only it says the hang hint.
+        // Only the run call carries the run's nonce.
         let run_call = starts.nonce.is_some();
         let (done, readers) = mpsc::channel();
         let reading = Reading {
@@ -2956,6 +3039,7 @@ impl Attempt<'_, '_> {
             readers: &readers,
             shown: &shown,
             hang: self.run_hang(run_call),
+            pull: self.pull_watch(),
         };
         let raise = self.call.interrupt.filter(|_| starts.raise);
         let watching = watched.watch(watch, self.call.interrupt, raise);
@@ -2965,6 +3049,8 @@ impl Attempt<'_, '_> {
             let drained = watching.ended.as_ref().is_ok_and(|(ended, _)| ended.drained());
             self.ended_raw(raw, drained);
         }
+        let cut = watching.ended.as_ref().ok().and_then(|(_, looks)| looks.received);
+        self.kept_from_watch(&shared.progress, copied, run_call, cut);
         let watched = self.watched_out(watching);
         // Kept whatever the call's end, so a warm-up that fails after the marker counts its commands as run.
         self.marker_seen |= held(&shared.heard).started;
@@ -2972,11 +3058,21 @@ impl Attempt<'_, '_> {
         if let Some(line) = &looks.unread {
             self.logged(line);
         }
+        if let Some(why) = &looks.unsaid {
+            self.problem.get_or_insert_with(|| why.clone());
+        }
         if watch.byte_cap().is_some() && !matches!(ended, CallEnd::Exited(0)) {
             self.emptied(&job, &shown);
         }
         let heard = std::mem::take(&mut *held(&shared.heard));
-        match called_of(ended, shared.progress.raised(), heard) {
+        self.call_result(called_of(ended, shared.progress.raised(), heard), feeder, &looks, copied)
+    }
+
+    /// The watched call's result from what it came to, `ended`: a call that finished, its feeder's end checked when
+    /// `feeder` fed it, with the bytes its job wrote and, for a call with a raw copy (`copied`), what that copy had
+    /// received at a cut, as `looks` found; else why it failed, or the interrupt, its note said first.
+    fn call_result(&mut self, ended: Result<Called, Unfinished>, feeder: Option<Feeder>, looks: &Looks, copied: bool) -> Result<Called, End> {
+        match ended {
             Ok(called) => {
                 if let Some(feeder) = feeder {
                     self.fed_out(feeder, &called);
@@ -2995,6 +3091,22 @@ impl Attempt<'_, '_> {
                 }
                 Err(End::Interrupted)
             }
+        }
+    }
+
+    /// Keeps what a watched call's `progress` says the attempt reads after it, once its raw copy has stopped: for a call
+    /// with a raw copy (`copied`), the bytes it received and when the last of them came, or, for a call the watch cut,
+    /// the bytes at the cut, `cut`, and the cut's moment, the figure the watchdog's line says; and for the run call
+    /// (`run_call`), when the box's start marker came, once it did.
+    fn kept_from_watch(&mut self, progress: &Progress, copied: bool, run_call: bool, cut: Option<Received>) {
+        if copied {
+            (self.pulled_bytes, self.pulled_last) = match cut {
+                Some(Received { bytes, after }) => (bytes, Some(progress.begun + after)),
+                None => (progress.received(), progress.last_received()),
+            };
+        }
+        if run_call && let Some(started) = progress.started_at() {
+            self.command_started = Some(started);
         }
     }
 
@@ -3192,6 +3304,7 @@ impl<'c, 'a> Attempt<'c, 'a> {
             lfs_budget: lfs::LFS_BUDGET,
             log_cap: watchdog::LOG_CAP,
             own_start_fails: false,
+            hint_from_pull: false,
             tamper: None,
             brought_back: None,
             dropped_no_build: call.dropped_no_build,
@@ -3199,6 +3312,12 @@ impl<'c, 'a> Attempt<'c, 'a> {
             lines: Vec::new(),
             problem: None,
             hang_said: false,
+            command_started: None,
+            outputs_progress: OUTPUTS_PROGRESS,
+            pulling: None,
+            pull_periods_said: Cell::new(0),
+            pulled_bytes: 0,
+            pulled_last: None,
             adjusted: None,
             box_killed: None,
             held_run: None,
@@ -3282,7 +3401,7 @@ fn called_of(ended: CallEnd, raised: Raised, mut heard: Heard) -> Result<Called,
         first_error: heard.first_error,
         last_error: heard.last_error,
         lines: heard.kept.into_lines(),
-        outputs_line: heard.outputs_line,
+        outputs: heard.outputs,
         back_commits: heard.back_commits,
         names_skipped: heard.names_skipped,
         started: heard.started,
@@ -3309,22 +3428,92 @@ struct Watching {
     hinted: Option<Result<String, String>>,
 }
 
-/// The hang hint a run call says once its command has run 3x its usual p90 on the builder: that p90, and the log the
-/// hint is written to beside stderr.
+/// The hang hint a routed run says once its command has run 3x its usual p90: that p90, the log the hint is written to
+/// beside stderr, the phase the call watched is, and the builder's alias the phase names.
 #[derive(Clone, Copy)]
 struct RunHang<'w> {
     usual: Usual,
     log: &'w Path,
+    phase: HangPhase,
+    builder: &'w str,
+}
+
+/// The phase of a routed run a call's hang hint names: the run call, whose command counts from the box's start marker
+/// it hears, or the outputs pull, whose run counts from `counted_from`, the start marker the run call heard then (the
+/// pull's start under `--test-remote-hint-from-pull`), and whose own time counts from the pull's start,
+/// `pull_started`, however many times its call was made.
+#[derive(Clone, Copy)]
+enum HangPhase {
+    Running,
+    Pulling { counted_from: Instant, pull_started: Instant },
+}
+
+impl HangPhase {
+    /// How long, now, the run has run and the phase has, with the words naming the phase, for the call whose `progress`
+    /// the watch reads: the run call's command and phase both since the box's start marker, `None` before it came; the
+    /// outputs pull's run since `counted_from` and its phase since `pull_started`, both from one look at the clock, never
+    /// since the call's own start.
+    fn times(self, progress: &Progress) -> Option<(Duration, &'static str, Duration)> {
+        match self {
+            HangPhase::Running => {
+                let running = progress.since_started()?;
+                Some((running, "running on", running))
+            }
+            HangPhase::Pulling { counted_from, pull_started } => {
+                let now = Instant::now();
+                Some((
+                    now.saturating_duration_since(counted_from),
+                    "pulling outputs from",
+                    now.saturating_duration_since(pull_started),
+                ))
+            }
+        }
+    }
+}
+
+/// The outputs pull an outputs call is: the archive's size in bytes, when the box said it, and when the pull started,
+/// which its end line and the hang hint's phase both count from.
+#[derive(Clone, Copy)]
+pub(super) struct Pull {
+    pub(super) total: Option<u64>,
+    pub(super) started: Instant,
+}
+
+/// The progress an outputs call's watch says of its pull, whose size and start it carries ([`Pull`]): how often it says
+/// it, the log it is written to beside stderr, and the pull's one count of the periods said, which every call of the
+/// pull reads and advances.
+#[derive(Clone, Copy)]
+struct PullWatch<'w> {
+    total: Option<u64>,
+    started: Instant,
+    every: Duration,
+    log: &'w Path,
+    periods_said: &'w Cell<u128>,
+}
+
+impl PullWatch<'_> {
+    /// Whether a progress line is due `elapsed` after the pull's start: a whole period has passed that the pull's count
+    /// does not hold yet, which it then holds, so a tick that comes late past more than one finds one line due, and a call
+    /// made again finds none due of the periods an earlier call of the pull said.
+    fn due(&self, elapsed: Duration) -> bool {
+        let periods = elapsed.as_nanos() / self.every.as_nanos().max(1);
+        if periods <= self.periods_said.get() {
+            return false;
+        }
+        self.periods_said.set(periods);
+        true
+    }
 }
 
 /// What the looks at the bytes a capped call's job wrote found: the count at the last look that succeeded, and the
-/// line saying the first look that failed; and, for a call the watch cut, what a raw copy of its output had written
-/// into its sink by then.
+/// line saying the first look that failed; for a call the watch cut, what a raw copy of its output had written into its
+/// sink by then; and why the first progress line of an outputs pull could not be said.
 #[derive(Default)]
 struct Looks {
     written: Option<u64>,
     unread: Option<String>,
     received: Option<Received>,
+    unsaid: Option<String>,
 }
 
 /// What the looks at the bytes a call's feeder wrote to its standard input found: the count at the last look, and
@@ -3368,8 +3557,8 @@ struct Feeding {
 }
 
 /// A started call the client watches: its process and job, when its streams last sent a byte, how many bytes its feeder
-/// wrote to its standard input, the channel each of its two readers says its end on, its program as shown, and the run
-/// call's hang hint while it is still to be said.
+/// wrote to its standard input, the channel each of its two readers says its end on, its program as shown, the routed
+/// run's hang hint while it is still to be said, and, for an outputs call, the pull's progress it says.
 struct Watched<'w> {
     running: &'w Running,
     job: &'w Job,
@@ -3378,6 +3567,7 @@ struct Watched<'w> {
     readers: &'w Receiver<()>,
     shown: &'w str,
     hang: Option<RunHang<'w>>,
+    pull: Option<PullWatch<'w>>,
 }
 
 impl Watched<'_> {
@@ -3410,6 +3600,7 @@ impl Watched<'_> {
             if hinted.is_none() {
                 *hinted = self.hint_if_hung();
             }
+            self.say_progress(&mut looks);
             if open == 0
                 && let Some(code) = self.running.wait(Duration::ZERO).map_err(|error| cannot_wait(self.shown, &error))?
             {
@@ -3427,7 +3618,7 @@ impl Watched<'_> {
             if let Some(cut) = watch.cut(now, begun, idle, self.progress.raised(), written) {
                 looks.received = Some(Received {
                     bytes: self.progress.received(),
-                    after: now.saturating_duration_since(begun),
+                    after: now.saturating_duration_since(self.progress.begun),
                 });
                 let ended = CallEnd::Cut(cut, self.end(open));
                 return Ok((ended, looks));
@@ -3461,14 +3652,34 @@ impl Watched<'_> {
         }
     }
 
-    /// Says the run call's hang hint, on stderr and in the log, once its command has been running on the builder 3x its
-    /// usual p90, counted from the box's start marker: the line said, or why it could not be said; `None` before then,
-    /// and for every other call.
+    /// Says the routed run's hang hint, on stderr and in the log, once its command has been running 3x its usual p90,
+    /// counted from the box's start marker, naming the phase the call is and how long it has run: the run call's
+    /// `running on {builder}` since that marker, the outputs pull's `pulling outputs from {builder}` since the pull's
+    /// start, before its first call. The line said, or why it could not be said; `None` before then, and for every other call.
     fn hint_if_hung(&self) -> Option<Result<String, String>> {
         let hang = self.hang?;
-        let running = self.progress.since_started()?;
-        let line = hang_hint(running.as_secs_f64(), hang.usual)?;
+        let (running, phase, during) = hang.phase.times(self.progress)?;
+        let phase = format!("{phase} {}", hang.builder);
+        let line = hang_hint(running.as_secs_f64(), hang.usual, &phase, during.as_secs_f64())?;
         Some(super::say(hang.log, &[&line], io::stderr().lock()).map(|()| line))
+    }
+
+    /// Says an outputs pull's progress line ([`outputs::progress_line`]), on stderr and in the log, when one is due
+    /// ([`PullWatch::due`]), its elapsed time and rate counted from the pull's start, before its first call, and every
+    /// figure on it from one look at that time and one at the bytes received. Why the first line could not be said is kept
+    /// in `looks`. Nothing for every other call.
+    fn say_progress(&self, looks: &mut Looks) {
+        let Some(pull) = self.pull else {
+            return;
+        };
+        let elapsed = pull.started.elapsed();
+        if !pull.due(elapsed) {
+            return;
+        }
+        let line = outputs::progress_line(self.progress.received(), pull.total, elapsed);
+        if let Err(why) = super::say(pull.log, &[&line], io::stderr().lock()) {
+            looks.unsaid.get_or_insert(why);
+        }
     }
 
     /// The bytes the call's job has written, looked at only when `watch` caps them, and kept in `looks`; `None` when
@@ -3774,7 +3985,7 @@ struct Heard {
     output_seen: bool,
     first_error: Option<String>,
     last_error: Option<String>,
-    outputs_line: Option<String>,
+    outputs: Option<outputs::OutputsLines>,
     back_commits: Option<String>,
     names_skipped: bool,
     started: bool,
@@ -3822,13 +4033,11 @@ impl Heard {
         }
     }
 
-    /// Keeps `line`, already cut, of standard error when `error`: the last error line, the outputs line, the back
-    /// commits line and the skipped names it may be, and the line among those kept for the log.
+    /// Keeps `line`, already cut, of standard error when `error`: the last error line, the outputs line and the size line
+    /// heard just before it, the back commits line and the skipped names it may be, and the line among those kept for the log.
     fn kept_line(&mut self, line: &str, error: bool) {
-        if error {
-            self.last_error = Some(line.to_owned());
-        }
-        outputs::keep_outputs_line(&mut self.outputs_line, line, error);
+        let previous = if error { self.last_error.replace(line.to_owned()) } else { None };
+        outputs::keep_outputs_lines(&mut self.outputs, previous.as_deref(), line, error);
         syncback::keep_back_commits_line(&mut self.back_commits, line, error);
         self.names_skipped |= error && line.starts_with(NAMES_SKIPPED);
         self.kept.push(line);
@@ -3853,6 +4062,8 @@ struct Progress {
     passed: AtomicU64,
     /// The bytes a raw copy of the call's standard output has written into its sink.
     received: AtomicU64,
+    /// Milliseconds from `begun` to the last byte a raw copy wrote into its sink, [`NOT_STARTED`] until one did.
+    last_received: AtomicU64,
     /// Milliseconds from `begun` to the box's start marker of the run, [`NOT_STARTED`] until it came.
     started: AtomicU64,
 }
@@ -3887,21 +4098,31 @@ impl Progress {
             too_long: AtomicBool::new(false),
             passed: AtomicU64::new(0),
             received: AtomicU64::new(0),
+            last_received: AtomicU64::new(NOT_STARTED),
             started: AtomicU64::new(NOT_STARTED),
         }
     }
 
-    /// Marks a byte that came now.
+    /// Marks a byte that came now. The mark is stored with `Release`, so whoever sees it through [`Progress::heard_any`]'s
+    /// `Acquire` sees every count [`Progress::took`] made before it.
     fn mark(&self) {
         let millis = u64::try_from(self.begun.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.last_byte.store(millis, Ordering::Relaxed);
-        self.any.store(true, Ordering::Relaxed);
+        self.any.store(true, Ordering::Release);
     }
 
     /// Marks the box's start marker of the run, which came now.
     fn mark_started(&self) {
         let millis = u64::try_from(self.begun.elapsed().as_millis()).unwrap_or(NOT_STARTED - 1);
         self.started.store(millis, Ordering::Relaxed);
+    }
+
+    /// When the box's start marker of the run came, `None` before it did.
+    fn started_at(&self) -> Option<Instant> {
+        match self.started.load(Ordering::Relaxed) {
+            NOT_STARTED => None,
+            millis => Some(self.begun + Duration::from_millis(millis)),
+        }
     }
 
     /// How long since the box's start marker of the run came, `None` before it did.
@@ -3919,7 +4140,7 @@ impl Progress {
     }
 
     fn heard_any(&self) -> bool {
-        self.any.load(Ordering::Relaxed)
+        self.any.load(Ordering::Acquire)
     }
 
     fn too_long(&self) -> bool {
@@ -3943,14 +4164,25 @@ impl Progress {
         self.passed.store(cap, Ordering::Relaxed);
     }
 
-    /// Counts `bytes` more that a raw copy of the call's standard output wrote into its sink.
+    /// Counts `bytes` more that a raw copy of the call's standard output wrote into its sink, now. The count is added with
+    /// `Release`, so a mark made after it and seen through `Acquire` publishes it too ([`Progress::mark`]).
     fn took(&self, bytes: u64) {
-        self.received.fetch_add(bytes, Ordering::Relaxed);
+        self.received.fetch_add(bytes, Ordering::Release);
+        let millis = u64::try_from(self.begun.elapsed().as_millis()).unwrap_or(NOT_STARTED - 1);
+        self.last_received.store(millis, Ordering::Relaxed);
+    }
+
+    /// When a raw copy of the call's standard output last wrote into its sink, `None` before it first did.
+    fn last_received(&self) -> Option<Instant> {
+        match self.last_received.load(Ordering::Relaxed) {
+            NOT_STARTED => None,
+            millis => Some(self.begun + Duration::from_millis(millis)),
+        }
     }
 
     /// The bytes a raw copy of the call's standard output has written into its sink so far.
     fn received(&self) -> u64 {
-        self.received.load(Ordering::Relaxed)
+        self.received.load(Ordering::Acquire)
     }
 
     /// What the call's readers have raised by now.
@@ -4312,9 +4544,12 @@ fn relayed_raw(
 }
 
 /// Copies `stream` into `sink`, shown as `shown`, byte for byte until it ends, in chunks of at most [`RAW_CHUNK`]: no
-/// line is read, so no length cuts it. Each chunk marks the call's progress, and marks that the call wrote on standard
-/// output, so a call that sent a byte is past the banner. A read or a write that fails is the call's problem, and ends
-/// the copy. No write is made under the lock the watcher could take.
+/// line is read, so no length cuts it. Each chunk, once written into the sink, marks the call's progress, and marks that
+/// the call wrote on standard output, so a call that sent a byte is past the banner, and a chunk whose write failed marks
+/// nothing. A capped sink has counted the chunk by then: the count is added with `Release` and the mark stored with
+/// `Release` after it, so the interrupt raised once [`Progress::heard_any`] reads the mark with `Acquire` finds the chunk
+/// counted by [`Progress::received`], which reads with `Acquire` too. A read or a write that fails is the call's problem,
+/// and ends the copy. No write is made under the lock the watcher could take.
 fn relay_raw(mut stream: impl Read, sink: &mut impl Write, shown: &str, shared: &Shared) {
     let mut buffer = vec![0_u8; RAW_CHUNK];
     loop {
@@ -4327,18 +4562,19 @@ fn relay_raw(mut stream: impl Read, sink: &mut impl Write, shown: &str, shared: 
                 return;
             }
         };
-        shared.progress.mark();
-        held(&shared.heard).output_seen = true;
         if let Err(error) = sink.write_all(buffer.get(..read).unwrap_or_default()) {
             held(&shared.heard).failed(format!("cannot write {shown}: {error}"));
             return;
         }
+        shared.progress.mark();
+        held(&shared.heard).output_seen = true;
     }
 }
 
 /// Reads `stream` line by line through `reader` until it ends, or a capped reading meets a line past the cap, each
-/// chunk that comes marking the call's progress, or for a run call each line but a process line ([`Reader::take`]); each line without its line end, read as UTF-8 with U+FFFD for what is
-/// not. Neither a write nor a wait for one is made under the lock the watcher could take.
+/// chunk that comes marking the call's progress, or for a run call each line but a process line ([`Reader::take`]);
+/// each line without its line end, read as UTF-8 with U+FFFD for what is not. Neither a write nor a wait for one is
+/// made under the lock the watcher could take.
 fn relay(stream: impl Read, mut reader: Reader, shared: &Shared) {
     let mut buffered = BufReader::new(stream);
     loop {
@@ -4800,6 +5036,7 @@ fn seconds(elapsed: Duration) -> String {
 #[cfg(all(test, feature = "test-seams"))]
 #[expect(clippy::expect_used, reason = "a test whose interrupt or transport cannot be made must fail loudly")]
 mod tests {
+    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::fs;
     use std::io::{self, Cursor, Read, Write};
@@ -4987,6 +5224,7 @@ mod tests {
             outputs_budget: OUTPUTS_BUDGET,
             log_cap: LOG_CAP,
             own_start_fails: false,
+            hint_from_pull: false,
             tamper: None,
             inputs_budget: super::inputs::INPUTS_BUDGET,
             lfs_budget: super::lfs::LFS_BUDGET,
@@ -4996,6 +5234,12 @@ mod tests {
             lines: Vec::new(),
             problem: None,
             hang_said: false,
+            command_started: None,
+            outputs_progress: super::OUTPUTS_PROGRESS,
+            pulling: None,
+            pull_periods_said: Cell::new(0),
+            pulled_bytes: 0,
+            pulled_last: None,
             adjusted: None,
             box_killed: None,
             held_run: None,
@@ -5484,7 +5728,7 @@ mod tests {
             first_error: Some(first_error.to_owned()),
             last_error: Some(first_error.to_owned()),
             lines: vec![first_error.to_owned()],
-            outputs_line: None,
+            outputs: None,
             back_commits: None,
             names_skipped: false,
             started: false,
@@ -5626,6 +5870,45 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    /// A sink that notes, at each write, whether the call's progress was marked already and whether the call counts as
+    /// having written on standard output.
+    struct MarkedAtWrite<'s> {
+        shared: &'s Shared,
+        seen: Vec<(bool, bool)>,
+    }
+
+    impl Write for MarkedAtWrite<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let output_seen = held(&self.shared.heard).output_seen;
+            self.seen.push((self.shared.progress.heard_any(), output_seen));
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A raw copy marks a chunk only once it is written into the sink, which counts it, so the interrupt raised at the
+    /// call's first mark finds that chunk counted.
+    #[test]
+    fn a_raw_copy_marks_a_chunk_only_once_it_is_written() {
+        let shared = Shared::new();
+        let mut sink = MarkedAtWrite {
+            shared: &shared,
+            seen: Vec::new(),
+        };
+
+        relay_raw(&b"archive bytes"[..], &mut sink, "the archive", &shared);
+
+        assert_eq!(sink.seen, [(false, false)], "the one chunk is written before any mark");
+        assert!(shared.progress.heard_any(), "then marked");
+        assert!(
+            held(&shared.heard).output_seen,
+            "and the call counts as having written on standard output"
+        );
     }
 
     /// The raw copy hands back the thread that writes the archive, so the fetch can join it within the drain before the
@@ -5794,7 +6077,7 @@ mod tests {
             after: Duration::from_millis(2_500),
         });
 
-        let end = outputs::judged(&mut attempt, &archive, &stalled, End::Status(0));
+        let end = outputs::judged(&mut attempt, &archive, &stalled, End::Status(0), false);
 
         assert!(matches!(end, End::Killed), "{end:?}");
         assert_eq!(
@@ -5804,6 +6087,53 @@ mod tests {
                 "gate: remote outputs not brought back: the fetch was stopped by the watchdog after 100 B in 2 s (50 B/s)"
             ]
         );
+    }
+
+    /// A Ctrl+C come before the outputs call leaves no figure of an earlier raw copy (an inputs or LFS diff) as the pull's:
+    /// the call makes nothing, and the pull has received nothing.
+    #[test]
+    fn an_outputs_call_a_ctrl_c_ends_before_it_starts_has_received_nothing() {
+        let log = unwritten_log();
+        let given = call(&log);
+        let transport = nowhere();
+        let mut attempt = attempt(&given, &transport);
+        attempt.pulled_bytes = 300_000;
+        attempt.pulled_last = Some(Instant::now());
+        let mut archive = outputs::Archive::new(
+            Path::new(r"C:\gate-client-tests-no-such-folder"),
+            PathBuf::from(r"C:\gate-client-tests-no-such-folder\app.tar.zst"),
+        );
+        let pull = super::Pull {
+            total: None,
+            started: Instant::now(),
+        };
+
+        let called = attempt.outputs_call(&location(), "app.tar.zst", &mut archive, Limits::for_tests(), pull);
+
+        assert!(matches!(called, Err(End::Interrupted)), "the raised Ctrl+C ends it");
+        assert_eq!(attempt.pulled_bytes, 0, "no earlier call's bytes");
+        assert_eq!(attempt.pulled_last, None, "no earlier call's last byte");
+    }
+
+    /// A pull says each progress period once across its calls: the call made again after one that said period 1 finds
+    /// no line due at the same elapsed time.
+    #[test]
+    fn a_call_made_again_says_no_progress_period_an_earlier_call_of_the_pull_said() {
+        let log = Path::new(r"C:\no-such-log.log");
+        let given = call(log);
+        let transport = nowhere();
+        let mut attempt = attempt(&given, &transport);
+        attempt.outputs_progress = Duration::from_secs(1);
+        attempt.pulling = Some(super::Pull {
+            total: None,
+            started: Instant::now(),
+        });
+        let past_period_1 = Duration::from_millis(1_500);
+
+        let first = attempt.pull_watch().expect("an outputs call watches its pull").due(past_period_1);
+        let again = attempt.pull_watch().expect("so does the call made again").due(past_period_1);
+
+        assert_eq!([first, again], [true, false], "period 1 is said once across the pull's calls");
     }
 
     #[test]
@@ -6042,7 +6372,7 @@ mod tests {
         );
         let mut cut = ended_with(0, "");
         cut.cut = Some(Cut::ArchiveTooBig(262_144));
-        let end = outputs::judged(&mut attempt, &archive, &cut, End::Status(0));
+        let end = outputs::judged(&mut attempt, &archive, &cut, End::Status(0), false);
         (end, std::mem::take(&mut attempt.lines))
     }
 
@@ -6154,7 +6484,7 @@ mod tests {
         let mut cut = ended_with(0, "");
         cut.cut = Some(Cut::ArchiveTooBig(262_144));
 
-        let end = outputs::judged(&mut attempt, &archive, &cut, End::Status(0));
+        let end = outputs::judged(&mut attempt, &archive, &cut, End::Status(0), false);
 
         assert!(matches!(end, End::Status(0)), "the run keeps its status: {end:?}");
         assert!(!path.exists(), "the partial archive a cut fetch wrote is removed");
@@ -6175,7 +6505,7 @@ mod tests {
         );
         let failed = ended_with(SSH_FAILED, "Connection reset by peer");
 
-        let end = outputs::judged(&mut attempt, &archive, &failed, End::Status(0));
+        let end = outputs::judged(&mut attempt, &archive, &failed, End::Status(0), true);
 
         assert!(matches!(end, End::Interrupted), "{end:?}");
         assert_eq!(attempt.lines, Vec::<String>::new());
@@ -6257,6 +6587,7 @@ mod tests {
             Some(outputs::Brought::Archive {
                 count: 1,
                 name: "app-1a2b3c4d-0123456789ab.tar.zst".to_owned(),
+                size: None,
             })
         };
         let nothing = || Some(outputs::Brought::Nothing);
@@ -6366,7 +6697,11 @@ mod tests {
         let called = called_of(CallEnd::Exited(0), Raised::default(), heard).expect("a call that ended");
 
         assert!(!called.lines.iter().any(|kept| kept == line), "the window no longer holds the line");
-        assert_eq!(called.outputs_line.as_deref(), Some(line), "the last standard error outputs line is kept");
+        assert_eq!(
+            called.outputs.as_ref().map(|heard| heard.line.as_str()),
+            Some(line),
+            "the last standard error outputs line is kept"
+        );
     }
 
     #[test]
@@ -7372,6 +7707,72 @@ mod tests {
         assert!(attempt.run_hang(true).is_none(), "a cold run call compares with none");
     }
 
+    /// The pull's hang hint counts the run from the box's start marker, as the run call's does; only
+    /// `--test-remote-hint-from-pull` moves it to the pull's start, and leaves the run call none.
+    #[test]
+    fn the_pull_s_hang_hint_counts_from_the_start_marker_unless_the_seam_says_the_pull_s_start() {
+        let log = Path::new(r"C:\no-such-log.log");
+        let call = RemoteCall {
+            usual: Some(crate::durations::Usual { p90: 30.0, family: false }),
+            ..call(log)
+        };
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+        let marker = Instant::now().checked_sub(Duration::from_secs(10)).expect("the clock is past 10 s");
+        let pull_started = Instant::now();
+        attempt.command_started = Some(marker);
+        attempt.pulling = Some(super::Pull {
+            total: None,
+            started: pull_started,
+        });
+        let counted = |attempt: &Attempt<'_, '_>| match attempt.run_hang(false).map(|hang| hang.phase) {
+            Some(super::HangPhase::Pulling { counted_from, .. }) => Some(counted_from),
+            _ => None,
+        };
+
+        assert_eq!(counted(&attempt), Some(marker), "without the seam: from the start marker");
+        assert!(attempt.run_hang(true).is_some(), "without the seam the run call watches for it");
+        attempt.hint_from_pull = true;
+        assert_eq!(counted(&attempt), Some(pull_started), "with the seam: from the pull's start");
+        assert!(attempt.run_hang(true).is_none(), "with the seam the run call watches for none");
+    }
+
+    /// The pull's hang hint names its phase's time from the pull's start, a retry's pause in it, never from the start of
+    /// the call watched, which a retry makes anew: with the pull begun 8 s before a call that starts now, the phase is
+    /// at least 8 s and longer than the call has run.
+    #[test]
+    fn the_pull_s_hang_hint_counts_its_phase_from_the_pull_s_start_not_the_call_s() {
+        let log = Path::new(r"C:\no-such-log.log");
+        let call = RemoteCall {
+            usual: Some(crate::durations::Usual { p90: 30.0, family: false }),
+            ..call(log)
+        };
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+        let paused = Duration::from_secs(8);
+        let pull_started = Instant::now()
+            .checked_sub(paused)
+            .expect("this PC's clock reads at least 8 s, so the pull can start 8 s back");
+        attempt.command_started = Some(pull_started);
+        attempt.pulling = Some(super::Pull {
+            total: None,
+            started: pull_started,
+        });
+        let phase = attempt.run_hang(false).expect("the pull watches for the hint").phase;
+        let call_started = super::Progress::new();
+
+        // Read before the phase's time, so the call's own time can only be the shorter however the two reads are spaced.
+        let call_ran = call_started.begun.elapsed();
+        let (_, named, during) = phase.times(&call_started).expect("the pull's phase has its times");
+
+        assert_eq!(named, "pulling outputs from");
+        assert!(during >= paused, "the phase counts from the pull's start, the pause in it: {during:?}");
+        assert!(
+            call_ran < during,
+            "not from the call's start: the call ran {call_ran:?}, the phase {during:?}"
+        );
+    }
+
     /// How the warm-up of [`WARM_HASH`] ended whose run call said `stdout` and `stderr` and exited `status`, as the run
     /// call ends one that neither a kill nor an interrupt ended.
     fn warm_said(stdout: &str, stderr: &str, status: i32, test: &str) -> WarmEnd {
@@ -7490,7 +7891,7 @@ mod tests {
     fn ran(end: End, started: bool, last_error: Option<String>) -> RunEnd {
         RunEnd {
             end,
-            outputs_line: None,
+            outputs: None,
             back_commits: None,
             names_skipped: false,
             started,

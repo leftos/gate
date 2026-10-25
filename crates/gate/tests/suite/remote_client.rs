@@ -497,6 +497,8 @@ pub(super) struct Tuned<'a> {
     /// The folders part after the transport's form, `alias=folder|alias=folder` giving each builder of a map its own
     /// folder; the case's `builder` folder for every builder when `None`.
     pub(super) folders: Option<&'a str>,
+    /// The run's `--test-remote-retry-pause-ms`, `1` unless the case is about the time a retry pauses.
+    pub(super) pause: &'a str,
 }
 
 impl Default for Tuned<'_> {
@@ -509,6 +511,7 @@ impl Default for Tuned<'_> {
             ssh: None,
             preflight_seams: ANSWERING,
             folders: None,
+            pause: "1",
         }
     }
 }
@@ -524,7 +527,7 @@ pub(super) fn client_gate_tuned(case: &Case, log: &str, steps: &Path, tuned: &Tu
         "--test-remote-ssh",
         ssh,
         "--test-remote-retry-pause-ms",
-        "1",
+        tuned.pause,
         "--stall",
         tuned.stall,
     ];
@@ -1345,7 +1348,9 @@ fn a_routed_run_past_3x_its_usual_p90_is_hinted_once() {
     fs::remove_file(case.folder().join("go")).expect("the go file can be removed");
     // The builder key's five runs, rewritten to a wall p90 of 1 s.
     seed(&case, " out ran", 1.0, None);
-    let hint = Regex::new(r"gate: still running after \d+ s, \d+x its usual p90 of 1 s\n").expect("the pattern is valid");
+    // Each span in seconds or, for a hint a starved watch says 90 s or more into the run, in minutes.
+    let hint = Regex::new(r"gate: still running after (\d+ (?:s|min)), \d+x its usual p90 of 1 s; running on builder for (\d+ (?:s|min))\n")
+        .expect("the pattern is valid");
     // Written as it drops, the go file lets the command go when the case fails before its own write.
     let go = Go(case.folder().join("builder").join("work").join(key_of(&events(&case))).join("go"));
 
@@ -1356,6 +1361,11 @@ fn a_routed_run_past_3x_its_usual_p90_is_hinted_once() {
 
     assert_eq!(outcome.code, Some(0), "the hint kills nothing: {outcome:?}");
     assert_eq!(hint.find_iter(&outcome.stderr).count(), 1, "{outcome:?}");
+    let said = hint.captures(&outcome.stderr).expect("the hint");
+    assert_eq!(
+        said[1], said[2],
+        "the run call's phase counts from the command's start, as the hint does: {outcome:?}"
+    );
     let log = log_texts(&case.folder().join("out.log"));
     assert_eq!(hint.find_iter(&log).count(), 1, "{log}");
     let events = events(&case);
@@ -6299,7 +6309,339 @@ fn outputs_leftovers(case: &Case) -> Vec<PathBuf> {
 }
 
 /// The success line of an outputs step that installed one file, its figures any.
-const ONE_INSTALLED: &str = r"(?m)^gate: outputs: 1 file\(s\), \d+\.\d MB \(\d+\.\d MB compressed\) in \d+\.\d s\r?$";
+const ONE_INSTALLED: &str =
+    r"(?m)^gate: outputs: 1 file\(s\), \d+\.\d MB \(\d+\.\d MB compressed\) in (\d+\.\d) s \(pulled in (\d+\.\d) s, \d+\.\d MB/s\)\r?$";
+
+/// The size the box's own size line in `stderr` names, in bytes.
+fn box_outputs_size(stderr: &str) -> u64 {
+    let line = Regex::new(r"(?m)^gate-remote-outputs-size: (\d+)\r?$").expect("the line's pattern");
+    let found = line.captures(stderr);
+    assert!(found.is_some(), "the box says the archive's size on a line of its own: {stderr}");
+    found.expect("the box's line")[1].parse().expect("whole bytes")
+}
+
+/// The bytes a stand-in sends on a pull that does not end whole: one write, well inside the call's 1 MiB pipe, said as
+/// `0.3 MB` by the pull's lines.
+const PULL_BYTES: u64 = 300_000;
+
+/// [`PULL_BYTES`] as the pull's lines say a size, in megabytes of 1048576 bytes to one decimal.
+const SENT_MEGABYTES: f64 = 0.3;
+
+/// The line of a pull that ended other than whole, its figure any.
+const PULL_ENDED_ANY: &str = r"(?m)^gate: pulling outputs ended after \d+\.\d s with (\d+\.\d) MB received\r?$";
+
+/// The megabytes the line of a pull that ended other than whole in `stderr` says it received.
+fn ended_megabytes(stderr: &str) -> f64 {
+    let found = Regex::new(PULL_ENDED_ANY).expect("the line's pattern").captures(stderr);
+    assert!(found.is_some(), "the pull's early end: {stderr}");
+    found.expect("the early end")[1].parse().expect("a figure")
+}
+
+/// The line of a pull that ended other than whole having received `received`, as the pull's lines say a size.
+fn pull_ended(received: &str) -> Regex {
+    let pattern = format!(
+        r"(?m)^gate: pulling outputs ended after \d+\.\d s with {} received\r?$",
+        regex::escape(received)
+    );
+    Regex::new(&pattern).expect("the line's pattern")
+}
+
+#[test]
+fn a_pull_stopped_by_ctrl_c_says_how_much_it_received() {
+    let case = outputs_case("client-outputs-pull-ctrl-c", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("bytes-hold {PULL_BYTES} {}", never(&case))]);
+    let tuned = Tuned {
+        extra: &["--test-remote-interrupt-at", "outputs"],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &WRITE_BUILT));
+
+    assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
+    // The interrupt is raised at the call's first mark, which the raw copy makes only once the chunk it read is written
+    // into the archive and counted, and the stand-in says nothing on standard error first: the figure is at least that
+    // first chunk's, by order, however late the interrupt lands. `received > 0.0` also rests on that chunk being the raw
+    // copy's first read, 64 KiB of the stand-in's one 300 000-byte write, past the 52 429 bytes below which the
+    // one-decimal figure says 0.0. The call's drain can end before the stand-in's bytes are all read, so it is at most
+    // what was sent.
+    let ended = Regex::new(PULL_ENDED_ANY).expect("the line's pattern");
+    assert_eq!(ended.find_iter(&outcome.stderr).count(), 1, "{outcome:?}");
+    let received = ended_megabytes(&outcome.stderr);
+    assert!(
+        received > 0.0 && received <= SENT_MEGABYTES,
+        "{received} MB of {PULL_BYTES} bytes sent: {outcome:?}"
+    );
+    let started = outcome.stderr.find("gate: pulling outputs from builder: 1 file(s)");
+    assert!(
+        started.is_some() && started < ended.find(&outcome.stderr).map(|found| found.start()),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn a_failed_pull_says_how_much_it_received() {
+    let case = outputs_case("client-outputs-pull-failed", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("bytes-exit {PULL_BYTES} 3")]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &WRITE_BUILT));
+
+    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
+    let ended = pull_ended("0.3 MB");
+    let at = ended.find(&outcome.stderr).map(|found| found.start());
+    let failed = outcome
+        .stderr
+        .find("gate: remote outputs not brought back: the outputs call failed (status 3)");
+    assert!(at.is_some() && at < failed, "the early end, then the existing line: {outcome:?}");
+}
+
+/// The hang hint as any phase says it, against a p90 seeded to 1 s, its run in seconds or, for a hint a starved watch
+/// says 90 s or more into the run, in minutes.
+const ANY_HINT: &str = r"gate: still running after \d+ (?:s|min), \d+x its usual p90 of 1 s; [^\n]+\n";
+
+/// The seams of a run whose outputs call the stand-in holds: a stall window on that call alone that no case reaches, and
+/// a progress line every 200 ms.
+const PULL_HELD: [&str; 6] = [
+    "--test-remote-watch-call",
+    "outputs",
+    "--test-stall-ms",
+    "600000",
+    "--test-outputs-progress-ms",
+    "200",
+];
+
+/// [`PULL_HELD`] with `--test-remote-hint-from-pull`: the hang hint is due only during the pull, counted from its
+/// start, so a case reads a hint said during the pull however long the run call and the sync-back take.
+const PULL_HINTED: [&str; 7] = [
+    PULL_HELD[0],
+    PULL_HELD[1],
+    PULL_HELD[2],
+    PULL_HELD[3],
+    PULL_HELD[4],
+    PULL_HELD[5],
+    "--test-remote-hint-from-pull",
+];
+
+/// Starts `command` routed under `seams` ([`PULL_HELD`] or [`PULL_HINTED`]), logging to `log`, its calls taking the
+/// steps of a file named for `log`, its outputs call held by the stand-in until the file `release` names is made.
+fn start_held_pull(case: &Case, log: &str, release: &Go, command: &[&str], seams: &[&str]) -> Running {
+    let steps = ssh_steps(case, log, &["ok", "ok", &format!("bytes-hold 100 {}", shown(release.path()))]);
+    let tuned = Tuned {
+        extra: seams,
+        ..Tuned::default()
+    };
+    start(client_gate_tuned(case, log, &steps, &tuned, command))
+}
+
+/// The command waits for `go` in the folder it runs in, then writes an output: the first five runs' snapshots send `go`,
+/// so they pass at once. The first held run keeps `go` and, under `--test-remote-hint-from-pull`, can be hinted only
+/// during its held pull; the second has none, so it is hinted during its run call, which it holds until the hint, and,
+/// let go, says no second hint during its pull, which outlasts 3x the p90 too.
+#[test]
+fn a_routed_run_hinted_during_its_pull_names_the_pull_once() {
+    let case = outputs_case("client-outputs-pull-hint", &BIN);
+    let command = [r".\tool.exe", "wait", "go", "write", r"bin\new.txt", "hinted"];
+    let history = ssh_steps(&case, "history", &["ok"; 15]);
+    write(&case, "go", "");
+    for _ in 0..5 {
+        let outcome = finish(client_gate(&case, "history.log", &history, &command));
+        assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    }
+    let hint = Regex::new(ANY_HINT).expect("the pattern is valid");
+    // Each span in seconds or, for a hint a starved watch says 90 s or more into its phase, in minutes.
+    let pulling = Regex::new(r"gate: still running after \d+ (?:s|min), \d+x its usual p90 of 1 s; pulling outputs from builder for \d+ (?:s|min)\n")
+        .expect("the pattern is valid");
+    let running_on = Regex::new(r"gate: still running after \d+ (?:s|min), \d+x its usual p90 of 1 s; running on builder for \d+ (?:s|min)\n")
+        .expect("the pattern is valid");
+    // The PC must lack the output, or the box packs nothing and no pull is made.
+    let take_output = |case: &Case| {
+        let built = case.folder().join("bin").join("new.txt");
+        if built.exists() {
+            fs::remove_file(&built).expect("the output can be removed");
+        }
+    };
+
+    seed(&case, " hinted", 1.0, None);
+    take_output(&case);
+    let release = Go(case.folder().join("release-pull"));
+    let mut running = start_held_pull(&case, "pull.log", &release, &command, &PULL_HINTED);
+    running.wait_for_stderr_while_running("the pull's hint", |stderr| pulling.is_match(stderr));
+    fs::write(release.path(), "").expect("the release file can be made");
+    let during_pull = running.finish();
+    assert_eq!(hint.find_iter(&during_pull.stderr).count(), 1, "one hint: {during_pull:?}");
+    assert!(pulling.is_match(&during_pull.stderr), "it names the pull: {during_pull:?}");
+
+    seed(&case, " hinted", 1.0, None);
+    take_output(&case);
+    fs::remove_file(case.folder().join("go")).expect("the go file can be removed");
+    let go = Go(case.folder().join("builder").join("work").join(key_of(&events(&case))).join("go"));
+    let release = Go(case.folder().join("release-run"));
+    let progress = Regex::new(r"(?m)^gate: pulling outputs: ").expect("the pattern is valid");
+    let mut running = start_held_pull(&case, "run.log", &release, &command, &PULL_HELD);
+    running.wait_for_stderr_while_running("the run call's hint", |stderr| running_on.is_match(stderr));
+    fs::write(go.path(), "").expect("the go file can be made");
+    // Two progress lines: the pull has run past 3x the p90 as its run counts, the hint already said.
+    running.wait_for_stderr_while_running("the pull's progress", |stderr| progress.find_iter(stderr).count() >= 2);
+    fs::write(release.path(), "").expect("the release file can be made");
+    let both = running.finish();
+
+    assert_eq!(hint.find_iter(&both.stderr).count(), 1, "one hint across both phases: {both:?}");
+    assert!(running_on.is_match(&both.stderr), "it names the run call: {both:?}");
+}
+
+/// The pause before the retried outputs call of [`a_pull_retried_names_its_phase_time_from_the_pull_s_start`], in
+/// milliseconds and in whole seconds.
+const PULL_RETRY_PAUSE: (&str, u64) = ("8000", 8);
+
+/// The pull's first outputs call fails before the banner and the retry waits [`PULL_RETRY_PAUSE`]. Under
+/// `--test-remote-hint-from-pull` the hint is due only during the pull, 9 s after its start against a p90 of 3 s; the
+/// retried call is held until the hint is said, by either call's watch, so the case asks no order of the retry and the
+/// hint. Due 9 s into the pull, the hint names a phase of at least the pause either way; that the phase counts from the
+/// pull's start, never the call's, is the client's unit test of the hint's times.
+#[test]
+fn a_pull_retried_names_its_phase_time_from_the_pull_s_start() {
+    let case = outputs_case("client-outputs-pull-retried", &BIN);
+    let command = [r".\tool.exe", "write", r"bin\new.txt", "retried"];
+    let history = ssh_steps(&case, "history", &["ok"; 15]);
+    for _ in 0..5 {
+        let outcome = finish(client_gate(&case, "history.log", &history, &command));
+        assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    }
+    seed(&case, " retried", 3.0, None);
+    // The PC must lack the output, or the box packs nothing and no pull is made.
+    fs::remove_file(case.folder().join("bin").join("new.txt")).expect("the output can be removed");
+    let release = Go(case.folder().join("release"));
+    let steps = ssh_steps(
+        &case,
+        "ssh",
+        &["ok", "ok", "fail-banner", &format!("bytes-hold 100 {}", shown(release.path()))],
+    );
+    let tuned = Tuned {
+        extra: &PULL_HINTED,
+        pause: PULL_RETRY_PAUSE.0,
+        ..Tuned::default()
+    };
+    // In seconds or, for a hint a starved watch says 90 s or more into the pull, in minutes.
+    let pulling =
+        Regex::new(r"gate: still running after \d+ (?:s|min), \d+x its usual p90 of 3 s; pulling outputs from builder for (\d+) (s|min)\r?\n")
+            .expect("the pattern is valid");
+
+    let mut running = start(client_gate_tuned(&case, "out.log", &steps, &tuned, &command));
+    running.wait_for_stderr_while_running("the pull's hint", |stderr| pulling.is_match(stderr));
+    fs::write(release.path(), "").expect("the release file can be made");
+    // The stand-in's 100 bytes are no archive, so the install fails: the case reads the hint alone.
+    let outcome = running.finish();
+
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: builder did not answer the ssh banner; trying again (1 of "),
+        "the first outputs call was made again: {outcome:?}"
+    );
+    let found = pulling.captures(&outcome.stderr).expect("the pull's hint");
+    let figure: u64 = found[1].parse().expect("a whole number");
+    let phase = if &found[2] == "min" { figure * 60 } else { figure };
+    assert!(
+        phase >= PULL_RETRY_PAUSE.1,
+        "the pull's phase is at least the pause, due 9 s into the pull: {phase} s: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_routed_pull_says_its_start_with_the_box_s_size() {
+    let case = outputs_case("client-outputs-pull-start", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &WRITE_BUILT));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let size = box_outputs_size(&outcome.stderr);
+    assert!(size > 0 && size < 50_000, "a one-file archive is said as 0.0 MB: {size} bytes");
+    let start = "gate: pulling outputs from builder: 1 file(s), 0.0 MB";
+    let said = outcome.stderr.lines().position(|line| line == start);
+    let installed = outcome.stderr.lines().position(|line| line.starts_with("gate: outputs: 1 file(s)"));
+    assert!(said.is_some() && said < installed, "the start line, then the end line: {outcome:?}");
+    assert_eq!(outcome.stderr.matches(start).count(), 1, "said once: {outcome:?}");
+    assert!(log_texts(&case.folder().join("out.log")).contains(start), "the log has it too");
+}
+
+#[test]
+fn a_long_pull_says_its_progress_every_period() {
+    let case = outputs_case("client-outputs-pull-progress", &BIN);
+    let release = Go(case.folder().join("release"));
+    // The box's size line names a size, so a progress line with bytes in says how much of it and how long is left.
+    let progress =
+        Regex::new(r"(?m)^gate: pulling outputs: \d+\.\d MB of \d+\.\d MB, \d+\.\d MB/s, about \d+ (s|min) left\r?$").expect("the line's pattern");
+
+    let mut running = start_held_pull(&case, "out.log", &release, &WRITE_BUILT, &PULL_HELD);
+    running.wait_for_stderr_while_running("two progress lines", |stderr| progress.find_iter(stderr).count() >= 2);
+    fs::write(release.path(), "").expect("the release file can be made");
+    let outcome = running.finish();
+
+    assert!(progress.find_iter(&outcome.stderr).count() >= 2, "{outcome:?}");
+    let log = log_texts(&case.folder().join("out.log"));
+    assert!(progress.find_iter(&log).count() >= 2, "the log has them too: {log}");
+}
+
+#[test]
+fn a_passing_pull_s_end_line_says_the_fetch_alone() {
+    let case = outputs_case("client-outputs-pull-end", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &WRITE_BUILT));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let line = Regex::new(ONE_INSTALLED).expect("the line's pattern");
+    let found = line.captures(&outcome.stderr);
+    assert!(found.is_some(), "{outcome:?}");
+    let found = found.expect("the end line");
+    let whole: f64 = found[1].parse().expect("the step's seconds");
+    let pulled: f64 = found[2].parse().expect("the fetch's seconds");
+    assert!(pulled <= whole, "the fetch alone is within the whole step: {outcome:?}");
+    assert!(
+        !outcome.stderr.contains("gate: pulling outputs ended"),
+        "a passing pull says no early end: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_stopped_pull_says_how_much_it_received() {
+    let case = outputs_case("client-outputs-pull-stopped", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("bytes-hold {PULL_BYTES} {}", never(&case))]);
+    let tuned = Tuned {
+        extra: &["--test-remote-watch-call", "outputs", "--test-stall-ms", WATCHED_MS],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &WRITE_BUILT));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    // The cut can come before the stand-in's write or between any two of the raw copy's 64 KiB reads: whatever the bytes
+    // by then, the early end says the count the watchdog's line says, both read at the cut.
+    let stopped = Regex::new(&format!(
+        r"(?m)^{} after (\d+(?:\.\d)?) (B|KiB|MiB) in \d+ s ",
+        regex::escape(FETCH_STOPPED_LINE)
+    ))
+    .expect("the line's pattern");
+    let found = stopped.captures(&outcome.stderr);
+    assert!(found.is_some(), "the watchdog's line: {outcome:?}");
+    let found = found.expect("the watchdog's line");
+    let unit = match &found[2] {
+        "B" => 1.0,
+        "KiB" => 1024.0,
+        _ => 1_048_576.0,
+    };
+    let watchdog_bytes: f64 = found[1].parse::<f64>().expect("a figure") * unit;
+    let ended = Regex::new(PULL_ENDED_ANY).expect("the line's pattern");
+    let at = ended.find(&outcome.stderr).map(|found| found.start());
+    let received = ended_megabytes(&outcome.stderr);
+    // Each line rounds to its own tenth; one 64 KiB read more or fewer (0.0625 MB) is past what the two roundings allow.
+    assert!(
+        (received - watchdog_bytes / 1_048_576.0).abs() <= 0.051,
+        "the early end's {received} MB and the watchdog's {watchdog_bytes} bytes are one count: {outcome:?}"
+    );
+    let stalled = outcome.stderr.find(STALLED_LINE);
+    assert!(at.is_some() && at < stalled, "the early end, then the existing lines: {outcome:?}");
+}
 
 #[test]
 fn a_passing_run_installs_its_fetched_outputs() {

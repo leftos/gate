@@ -355,6 +355,12 @@ pub struct TestSeams {
     /// The remote client's backstop on the run call in milliseconds, counted from the run call's start, in place of
     /// five ceilings and 60 s.
     pub remote_backstop_ms: Option<u64>,
+    /// How often the remote client says an outputs pull's progress while it runs, in milliseconds, counted from the
+    /// pull's start, before its first call, across all its calls, in place of 30 s.
+    pub outputs_progress_ms: Option<u64>,
+    /// The remote client's hang hint is not due before the outputs pull starts, and counts from the pull's start
+    /// instead of the box's start marker.
+    pub remote_hint_from_pull: bool,
     /// This PC's SDK list as the remote client's parity check reads it, in place of `dotnet --list-sdks`: versions
     /// separated by commas, or `none`.
     pub local_sdks: Option<String>,

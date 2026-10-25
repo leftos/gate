@@ -31,6 +31,8 @@ use crate::trace;
 
 /// How long the watch waits for the command between two samples.
 const SAMPLE_PERIOD: Duration = Duration::from_secs(5);
+/// The phase a local command's hang hint names.
+const RUNNING_HERE: &str = "running here";
 /// `ERROR_ACCESS_DENIED`, as a raw OS error.
 const ACCESS_DENIED: i32 = 5;
 /// The failure every sample has under `--test-sampler-fail`.
@@ -371,13 +373,15 @@ impl<'a> Watcher<'a> {
     }
 
     /// Says the hang hint once, on the first sample at which the run has been running 3x its usual p90: the wall time
-    /// since the command started less the time paused, as the backstop counts it. It kills nothing.
+    /// since the command started less the time paused, as the backstop counts it, which is also how long its phase,
+    /// [`RUNNING_HERE`], has run. It kills nothing.
     fn hint_if_hung(&mut self, console: &mut Console) {
         let running = self.started.elapsed().saturating_sub(self.watch.paused_time());
         let Some(hang) = self.hang.as_mut().filter(|hang| !hang.said) else {
             return;
         };
-        if let Some(hint) = hang_hint(running.as_secs_f64(), hang.usual) {
+        let running = running.as_secs_f64();
+        if let Some(hint) = hang_hint(running, hang.usual, RUNNING_HERE, running) {
             hang.said = true;
             console.err(&hint);
         }

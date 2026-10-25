@@ -177,20 +177,22 @@ pub(crate) fn ceiling_hint(resolved: u64, estimate: &Estimate) -> Option<String>
 }
 
 /// The hint a run says once while it runs, when it has been running `running_seconds` and that is 3x or more its
-/// `usual` p90: `gate: still running after {running}, {k}x its usual p90 of {p90}`, each a span by [`span_text`] and `k`
-/// the whole times the p90 it has run, and "similar commands' usual p90" for a family key's; `None` below 3x, and for a
-/// p90 under 1 s.
-pub(crate) fn hang_hint(running_seconds: f64, usual: Usual) -> Option<String> {
+/// `usual` p90: `gate: still running after {running}, {k}x its usual p90 of {p90}; {phase} for {phase_seconds}`, each
+/// time a span by [`span_text`] and `k` the whole times the p90 it has run, and "similar commands' usual p90" for a
+/// family key's; `None` below 3x, and for a p90 under 1 s. `phase` names what the run is doing now (`running here`,
+/// `running on {builder}`, `pulling outputs from {builder}`), and `phase_seconds` is how long it has been doing it.
+pub(crate) fn hang_hint(running_seconds: f64, usual: Usual, phase: &str, phase_seconds: f64) -> Option<String> {
     let Usual { p90, family } = usual;
     if p90 < HANG_HINT_FLOOR || running_seconds < USUAL_TIMES * p90 {
         return None;
     }
     let whose = if family { "similar commands'" } else { "its" };
     Some(format!(
-        "gate: still running after {}, {}x {whose} usual p90 of {}",
+        "gate: still running after {}, {}x {whose} usual p90 of {}; {phase} for {}",
         span_text(running_seconds),
         (running_seconds / p90).floor(),
-        span_text(p90)
+        span_text(p90),
+        span_text(phase_seconds)
     ))
 }
 
@@ -787,21 +789,42 @@ mod tests {
         Usual { p90, family: false }
     }
 
+    /// The phase a local command's hang hint names.
+    const HERE: &str = "running here";
+
     #[test]
     fn the_hang_hint_fires_from_3x_the_p90_with_a_whole_k() {
-        assert_eq!(hang_hint(2.99 * 840.0, usual(840.0)), None, "below 3x the p90");
+        assert_eq!(hang_hint(2.99 * 840.0, usual(840.0), HERE, 2.99 * 840.0), None, "below 3x the p90");
         assert_eq!(
-            hang_hint(2520.0, usual(840.0)).as_deref(),
-            Some("gate: still running after 42 min, 3x its usual p90 of 14 min")
+            hang_hint(2520.0, usual(840.0), HERE, 2520.0).as_deref(),
+            Some("gate: still running after 42 min, 3x its usual p90 of 14 min; running here for 42 min")
         );
         assert_eq!(
-            hang_hint(3.7 * 840.0, usual(840.0)).as_deref(),
-            Some("gate: still running after 52 min, 3x its usual p90 of 14 min"),
+            hang_hint(3.7 * 840.0, usual(840.0), HERE, 3.7 * 840.0).as_deref(),
+            Some("gate: still running after 52 min, 3x its usual p90 of 14 min; running here for 52 min"),
             "3.7x says 3x"
         );
         assert_eq!(
-            hang_hint(41.0, usual(10.0)).as_deref(),
-            Some("gate: still running after 41 s, 4x its usual p90 of 10 s")
+            hang_hint(41.0, usual(10.0), HERE, 41.0).as_deref(),
+            Some("gate: still running after 41 s, 4x its usual p90 of 10 s; running here for 41 s")
+        );
+    }
+
+    #[test]
+    fn a_hang_hint_names_its_phase_and_how_long_it_ran() {
+        assert_eq!(
+            hang_hint(2520.0, usual(840.0), "pulling outputs from mac-1", 125.0).as_deref(),
+            Some("gate: still running after 42 min, 3x its usual p90 of 14 min; pulling outputs from mac-1 for 2 min"),
+            "the phase's own time, spelt as the run's is"
+        );
+        assert_eq!(
+            hang_hint(41.0, usual(10.0), "running on builder", 41.0).as_deref(),
+            Some("gate: still running after 41 s, 4x its usual p90 of 10 s; running on builder for 41 s")
+        );
+        assert_eq!(
+            hang_hint(29.0, usual(10.0), "pulling outputs from mac-1", 29.0),
+            None,
+            "the phase does not move the 3x threshold"
         );
     }
 
@@ -809,18 +832,22 @@ mod tests {
     fn a_cold_routed_run_gets_no_hang_hint() {
         let compared = routed_usual(Some(usual(840.0)), true);
         assert_eq!(compared, None, "a cold run compares with no p90");
-        assert_eq!(compared.and_then(|usual| hang_hint(10.0 * 840.0, usual)), None, "even at 10x the p90");
+        assert_eq!(
+            compared.and_then(|usual| hang_hint(10.0 * 840.0, usual, HERE, 10.0 * 840.0)),
+            None,
+            "even at 10x the p90"
+        );
         assert_eq!(routed_usual(Some(usual(840.0)), false), Some(usual(840.0)), "a warm run keeps its p90");
         assert_eq!(routed_usual(None, false), None, "no history");
     }
 
     #[test]
     fn no_hang_hint_below_a_1_s_p90() {
-        assert_eq!(hang_hint(5.0, usual(0.0)), None, "a p90 of 0 s");
-        assert_eq!(hang_hint(60.0, usual(0.999)), None, "a p90 just under 1 s");
+        assert_eq!(hang_hint(5.0, usual(0.0), HERE, 5.0), None, "a p90 of 0 s");
+        assert_eq!(hang_hint(60.0, usual(0.999), HERE, 60.0), None, "a p90 just under 1 s");
         assert_eq!(
-            hang_hint(3.0, usual(1.0)).as_deref(),
-            Some("gate: still running after 3 s, 3x its usual p90 of 1 s"),
+            hang_hint(3.0, usual(1.0), HERE, 3.0).as_deref(),
+            Some("gate: still running after 3 s, 3x its usual p90 of 1 s; running here for 3 s"),
             "a p90 of 1 s"
         );
     }
@@ -840,8 +867,8 @@ mod tests {
             Some("gate: the ceiling 10 min is below similar commands' load-adjusted p90 of 14 min")
         );
         assert_eq!(
-            hang_hint(2520.0, Usual { p90: 840.0, family: true }).as_deref(),
-            Some("gate: still running after 42 min, 3x similar commands' usual p90 of 14 min")
+            hang_hint(2520.0, Usual { p90: 840.0, family: true }, HERE, 2520.0).as_deref(),
+            Some("gate: still running after 42 min, 3x similar commands' usual p90 of 14 min; running here for 42 min")
         );
     }
 

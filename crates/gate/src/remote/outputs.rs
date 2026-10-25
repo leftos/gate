@@ -14,7 +14,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gate_router::escaped;
 use gate_state::v1;
@@ -42,6 +42,9 @@ use crate::outputs::walk::{Found, Stamp, in_context, stamp_of, walk};
 const PAST_THE_CAP: &str = "it is larger than the box takes (64 MiB)";
 /// The start of the box's line saying what it packed: `gate-remote-outputs: 0`, or `gate-remote-outputs: <n> <archive>`.
 const OUTPUTS: &str = "gate-remote-outputs: ";
+/// The start of the box's line, said just before its outputs line when it packed an archive, saying the archive's size:
+/// `gate-remote-outputs-size: <bytes>`.
+const OUTPUTS_SIZE: &str = "gate-remote-outputs-size: ";
 /// Why a passing run whose box said no outputs line the client accepts brings nothing back, as the PowerShell client
 /// says it.
 const NO_OUTPUTS_LINE: &str = "the box printed no 'gate-remote-outputs: <n> <archive>' line";
@@ -212,11 +215,12 @@ pub(super) enum Unbuilt {
     Failed(String),
 }
 
-/// What the box's accepted outputs line says it packed: nothing, or `count` files in the archive `name`.
+/// What the box's accepted outputs line says it packed: nothing, or `count` files in the archive `name`, `size` bytes
+/// long when the box said its size (a box not yet pushed says none).
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Brought {
     Nothing,
-    Archive { count: u64, name: String },
+    Archive { count: u64, name: String, size: Option<u64> },
 }
 
 /// What a run call carries of the run's outputs, and what the client keeps for after it.
@@ -359,11 +363,13 @@ fn step_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synce
     let reason = match (&sent.built, brought) {
         (Err(reason), _) => format!("the manifest could not be built: {reason}"),
         (Ok(_), None) => NO_OUTPUTS_LINE.to_owned(),
-        (Ok(files), Some(Brought::Archive { .. })) => {
+        (Ok(files), Some(Brought::Archive { count, size, .. })) => {
             let kept = Kept {
                 globs: sent.globs,
                 files,
                 marker,
+                count: *count,
+                size: *size,
             };
             return fetched(attempt, &kept, ran, synced);
         }
@@ -379,12 +385,15 @@ fn step_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synce
     (End::Status(1), false)
 }
 
-/// What the outputs step of a passing run whose box packed an archive keeps for its install: the run's output globs,
-/// the PC's manifest and the pending marker.
+/// What the outputs step of a passing run whose box packed an archive keeps for its pull and install: the run's output
+/// globs, the PC's manifest and the pending marker; and the files the box said it packed, and the archive's size in
+/// bytes when it said one.
 struct Kept<'k> {
     globs: &'k [String],
     files: &'k Manifest,
     marker: &'k Path,
+    count: u64,
+    size: Option<u64>,
 }
 
 /// Each tree the box checked the run out in, as [`trees`] places it in the work folder of `location`, with the PC root
@@ -438,20 +447,35 @@ pub(super) fn trees_of<'a>(
 /// but the interrupt. The worktree's outputs cap record ([`uncapped`]) is removed once the fetch ends whole, before the
 /// install, and on every other end but the cap and a Ctrl+C during the fetch. With the end, whether the install was
 /// complete; a fetch that did not end whole installs nothing.
+///
+/// The pull says its start ([`pull_start_line`]) before the outputs call, and its progress while it runs, as the call's
+/// watch does; one that did not end whole says how long it ran and what it received ([`pull_ended_line`]) before any
+/// other line of its end.
 fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced: End) -> (End, bool) {
     let started = Instant::now();
+    attempt.say(pull_start_line(attempt.call.host(), kept.count, kept.size));
     let name = archive_file_name(attempt.call.key, ran.nonce);
     let tmp = Path::new(attempt.call.root).join(TMP);
     let mut archive = Archive::new(Path::new(attempt.call.root), tmp.join(&name));
     let limits = attempt.limits_for("outputs");
-    let called = attempt.outputs_call(ran.location, &name, &mut archive, limits);
+    let pull = client::Pull { total: kept.size, started };
+    let called = attempt.outputs_call(ran.location, &name, &mut archive, limits, pull);
     attempt.split.outputs = Some(started.elapsed());
+    // The fetch alone runs to the archive's last byte; one that wrote none, to the call's end.
+    let pulled = attempt
+        .pulled_last
+        .map_or_else(|| started.elapsed(), |last| last.saturating_duration_since(started));
+    // A Ctrl+C raised by the call's end is read once, so the early end's line and `judged` agree on a pull not whole.
+    let interrupted = attempt.go_on().is_err();
+    if !matches!(&called, Ok(called) if pulled_whole(called, interrupted)) {
+        attempt.say(pull_ended_line(pulled, attempt.pulled_bytes));
+    }
     match called {
         // `judged` hands back the run's passing end only when the archive was fetched whole, and `called` a cut when it
         // was not: an archive past the fetch cap installs nothing.
         Ok(called) => {
             let at_the_cap = matches!(called.cut, Some(Cut::ArchiveTooBig(_)));
-            match judged(attempt, &archive, &called, synced) {
+            match judged(attempt, &archive, &called, synced, interrupted) {
                 End::Status(0) if called.cut.is_none() => {
                     // The fetch ended whole, under the cap: how the install ends no longer bears on the count.
                     uncapped(attempt);
@@ -465,6 +489,7 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
                         main_tree,
                         sibling_trees,
                         started,
+                        pulled,
                     };
                     install::installed(attempt, &fetched)
                 }
@@ -482,6 +507,12 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
     }
 }
 
+/// Whether the outputs call that ended as `called` brought its archive whole: it ended 0, uncut, and no Ctrl+C was
+/// raised by its end (`interrupted`). [`judged`] hands back the run's end so far for such a pull alone.
+fn pulled_whole(called: &Called, interrupted: bool) -> bool {
+    !interrupted && called.cut.is_none() && called.status == 0
+}
+
 /// `end`, that of a fetch that did not end whole, the worktree's outputs cap record removed first ([`uncapped`]) unless
 /// the fetch ended `at_the_cap` or by a Ctrl+C.
 fn settled(attempt: &mut Attempt<'_, '_>, at_the_cap: bool, end: End) -> End {
@@ -491,11 +522,15 @@ fn settled(attempt: &mut Attempt<'_, '_>, at_the_cap: bool, end: End) -> End {
     end
 }
 
-/// The end of the outputs step once its outputs call ended as `called`, having written to
-/// `archive`, the run's end so far `synced`: as [`fetched`] says.
-pub(super) fn judged(attempt: &mut Attempt<'_, '_>, archive: &Archive, called: &Called, synced: End) -> End {
+/// The end of the outputs step once its outputs call ended as `called`, having written to `archive`, a Ctrl+C raised by
+/// its end or not (`interrupted`, read once by the caller), the run's end so far `synced`: as [`fetched`] says, `synced`
+/// for a pull whole ([`pulled_whole`]).
+pub(super) fn judged(attempt: &mut Attempt<'_, '_>, archive: &Archive, called: &Called, synced: End, interrupted: bool) -> End {
+    if pulled_whole(called, interrupted) {
+        return synced;
+    }
     // A Ctrl+C raised by the call's end is the run's end, however the call ended, as after the run call.
-    if attempt.go_on().is_err() {
+    if interrupted {
         removed(attempt, archive, PARTIAL);
         return End::Interrupted;
     }
@@ -511,14 +546,12 @@ pub(super) fn judged(attempt: &mut Attempt<'_, '_>, archive: &Archive, called: &
         }
         return unfetched(attempt, archive, &cut.reason("the outputs call"), End::Status(1));
     }
-    if called.status != 0 {
-        let reason = match &called.last_error {
-            Some(line) => first_bytes(line, FAILURE_BYTES).to_owned(),
-            None => format!("the outputs call failed (status {})", called.status),
-        };
-        return unfetched(attempt, archive, &reason, End::Status(1));
-    }
-    synced
+    // Neither whole, nor interrupted, nor cut: the call failed.
+    let reason = match &called.last_error {
+        Some(line) => first_bytes(line, FAILURE_BYTES).to_owned(),
+        None => format!("the outputs call failed (status {})", called.status),
+    };
+    unfetched(attempt, archive, &reason, End::Status(1))
 }
 
 /// Why a fetch the watchdog stopped brings nothing back: [`STOPPED`], and, when its raw copy's count is known
@@ -755,30 +788,124 @@ pub(super) fn clear_pending(marker: &Path) -> Result<(), String> {
     }
 }
 
+/// A call's last outputs line on standard error, and the size line heard just before it, when there was one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct OutputsLines {
+    pub(super) line: String,
+    pub(super) size: Option<String>,
+}
+
 /// Keeps `line` as `kept`, a call's last outputs line, when it came on standard error (`stderr`) and starts
-/// `gate-remote-outputs: `: a line on standard output never counts, and a later line replaces an earlier one.
-pub(super) fn keep_outputs_line(kept: &mut Option<String>, line: &str, stderr: bool) {
+/// `gate-remote-outputs: `, with `previous`, the standard error line heard just before it, as its size line when that
+/// starts `gate-remote-outputs-size: `. A line on standard output never counts, and a later outputs line replaces an
+/// earlier one with its own size line or none. The box says its size line just before its outputs line, so a size line
+/// the command printed anywhere else is never taken; the size line does not start as the outputs line does, so a PC that
+/// reads only the outputs line passes it by. With a box too old to say the size line, a command's own last standard
+/// error line that starts `gate-remote-outputs-size: ` is read as the size, which only misstates the size and the
+/// estimate the pull's start and progress lines say.
+pub(super) fn keep_outputs_lines(kept: &mut Option<OutputsLines>, previous: Option<&str>, line: &str, stderr: bool) {
     if stderr && line.starts_with(OUTPUTS) {
-        *kept = Some(line.to_owned());
+        *kept = Some(OutputsLines {
+            line: line.to_owned(),
+            size: previous.filter(|previous| previous.starts_with(OUTPUTS_SIZE)).map(str::to_owned),
+        });
     }
 }
 
-/// What the box packed, from `line`, the run call's last outputs line on standard error ([`keep_outputs_line`]): when
-/// it is `gate-remote-outputs: 0` or names `<count> <key>-<nonce>.tar.zst`, the archive of the work folder `key` and of
-/// this run's outputs `nonce`. Any other line, or none, brings nothing back: the command's own output can print such a
-/// line, but not after the box's own, which comes last.
-pub(super) fn accepted(line: Option<&str>, key: &str, nonce: &str) -> Option<Brought> {
-    let said = line?.strip_prefix(OUTPUTS)?;
+/// What the box packed, from `heard`, the run call's last outputs line on standard error and its size line
+/// ([`keep_outputs_lines`]): when the outputs line is `gate-remote-outputs: 0` or names `<count> <key>-<nonce>.tar.zst`,
+/// the archive of the work folder `key` and of this run's outputs `nonce`, its size in bytes read from the size line
+/// when that is `gate-remote-outputs-size: <bytes>`; a box not yet pushed says none, and any other size line gives no
+/// size. Any other outputs line, or none, brings nothing back: the command's own output can print such a line, but not
+/// after the box's own, which comes last.
+pub(super) fn accepted(heard: Option<&OutputsLines>, key: &str, nonce: &str) -> Option<Brought> {
+    let heard = heard?;
+    let size_line = heard.size.as_deref();
+    let said = heard.line.strip_prefix(OUTPUTS)?;
     if said == "0" {
         return Some(Brought::Nothing);
     }
     let (count, name) = said.split_once(' ')?;
-    let digits = !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit());
-    let count: u64 = count.parse().ok().filter(|count| digits && *count > 0)?;
+    let count = whole_number(count).filter(|count| *count > 0)?;
+    let size = size_line.and_then(|line| line.strip_prefix(OUTPUTS_SIZE)).and_then(whole_number);
     (name == archive_file_name(key, nonce)).then(|| Brought::Archive {
         count,
         name: name.to_owned(),
+        size,
     })
+}
+
+/// `text` as a whole number when it is ASCII digits alone and fits a `u64`; else `None`.
+fn whole_number(text: &str) -> Option<u64> {
+    let digits = !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    digits.then(|| text.parse().ok()).flatten()
+}
+
+/// `bytes` in the outputs success line's megabytes (1048576 bytes, [`install::MB`]) to one decimal, a half rounded away
+/// from zero, as `{x.x} MB`, so every `MB` figure one pull says is the same number for the same bytes. Every figure of
+/// the outputs pull's lines is said through this; a rate is this of the bytes per second, followed by `/s`
+/// ([`mb_rate`]).
+pub(super) fn mb_size(bytes: f64) -> String {
+    format!("{} MB", install::one_decimal(bytes / install::MB))
+}
+
+/// The mean rate of `bytes` over `seconds`, as [`mb_size`] says it, followed by `/s`; 0 over no time at all.
+#[expect(clippy::cast_precision_loss, reason = "a rate said to one decimal of a megabyte")]
+pub(super) fn mb_rate(bytes: u64, seconds: f64) -> String {
+    let per_second = if seconds > 0.0 { bytes as f64 / seconds } else { 0.0 };
+    format!("{}/s", mb_size(per_second))
+}
+
+/// The line an outputs pull says as it starts, from the builder `builder` (its alias), for `count` files and, when the
+/// box said it, the archive's `size` in bytes.
+#[expect(clippy::cast_precision_loss, reason = "a size said to one decimal of a megabyte")]
+fn pull_start_line(builder: &str, count: u64, size: Option<u64>) -> String {
+    match size {
+        Some(size) => format!("gate: pulling outputs from {builder}: {count} file(s), {}", mb_size(size as f64)),
+        None => format!("gate: pulling outputs from {builder}: {count} file(s)"),
+    }
+}
+
+/// The line an outputs pull says every period while it runs, `done` bytes in after `elapsed`, of the archive's `total`
+/// when the box said it: how much, the mean rate since the pull's start and, with a total and a rate above 0, about how
+/// long is left at that rate ([`left_text`]).
+#[expect(clippy::cast_precision_loss, reason = "sizes said to one decimal of a megabyte")]
+pub(super) fn progress_line(done: u64, total: Option<u64>, elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs_f64();
+    let rate = mb_rate(done, seconds);
+    let shown = mb_size(done as f64);
+    match total {
+        None => format!("gate: pulling outputs: {shown} so far, {rate}"),
+        Some(total) if done > 0 && seconds > 0.0 => {
+            let left = total.saturating_sub(done) as f64 / (done as f64 / seconds);
+            format!(
+                "gate: pulling outputs: {shown} of {}, {rate}, about {} left",
+                mb_size(total as f64),
+                left_text(left)
+            )
+        }
+        Some(total) => format!("gate: pulling outputs: {shown} of {}, {rate}", mb_size(total as f64)),
+    }
+}
+
+/// How long an outputs pull has left, `seconds`: in whole minutes, rounded to the nearest, from 60 s, else in whole
+/// seconds, rounded to the nearest.
+fn left_text(seconds: f64) -> String {
+    if seconds >= 60.0 {
+        return format!("{} min", (seconds / 60.0).round());
+    }
+    format!("{} s", seconds.round())
+}
+
+/// The line an outputs pull that ended other than whole says before its end's own lines: how long it ran, `pulled`,
+/// and the bytes it had `received` by then.
+#[expect(clippy::cast_precision_loss, reason = "a size said to one decimal of a megabyte")]
+fn pull_ended_line(pulled: Duration, received: u64) -> String {
+    format!(
+        "gate: pulling outputs ended after {} s with {} received",
+        install::one_decimal(pulled.as_secs_f64()),
+        mb_size(received as f64)
+    )
 }
 
 #[cfg(test)]
@@ -794,8 +921,8 @@ mod tests {
     use gate_router::DEFAULT_OUTPUTS;
 
     use super::{
-        Archive, Brought, MANIFEST_LIMIT, NonZeroU64, PARTIAL, PAST_THE_CAP, Unbuilt, accepted, hashed, keep_outputs_line, manifest_line, pending,
-        sha256_for, stopped_reason, turned_reason, within_cap,
+        Archive, Brought, MANIFEST_LIMIT, NonZeroU64, PARTIAL, PAST_THE_CAP, Unbuilt, accepted, hashed, keep_outputs_lines, manifest_line, mb_size,
+        pending, sha256_for, stopped_reason, turned_reason, within_cap,
     };
     use crate::outputs::cache::{HashCache, file_time_now};
     use crate::outputs::glob::Globs;
@@ -846,11 +973,14 @@ mod tests {
 
     /// What the client accepts of a run call that wrote `lines`, each on standard error or not, in order.
     fn accepted_of(lines: &[(bool, &str)]) -> Option<Brought> {
-        let mut kept = None;
+        let (mut kept, mut previous) = (None, None);
         for (stderr, line) in lines {
-            keep_outputs_line(&mut kept, line, *stderr);
+            keep_outputs_lines(&mut kept, previous, line, *stderr);
+            if *stderr {
+                previous = Some(*line);
+            }
         }
-        accepted(kept.as_deref(), KEY, NONCE)
+        accepted(kept.as_ref(), KEY, NONCE)
     }
 
     /// The box's line for `count` files packed in the archive of `key` and `nonce`.
@@ -863,7 +993,135 @@ mod tests {
         Brought::Archive {
             count,
             name: format!("{KEY}-{NONCE}.tar.zst"),
+            size: None,
         }
+    }
+
+    /// What the box's size line and outputs line for `count` files of this run's archive, `size` bytes, say it brought.
+    fn sized(count: u64, size: u64) -> Brought {
+        Brought::Archive {
+            count,
+            name: format!("{KEY}-{NONCE}.tar.zst"),
+            size: Some(size),
+        }
+    }
+
+    #[test]
+    fn the_pc_reads_the_box_s_size_line() {
+        let line = named(2, KEY, NONCE);
+        assert_eq!(
+            accepted_of(&[(ERR, "gate-remote-outputs-size: 4096"), (ERR, line.as_str())]),
+            Some(sized(2, 4096))
+        );
+        assert_eq!(
+            accepted_of(&[(ERR, "gate-remote-outputs-size: 0"), (ERR, line.as_str())]),
+            Some(sized(2, 0)),
+            "a size of 0 is a size"
+        );
+        assert_eq!(
+            accepted_of(&[
+                (ERR, "gate-remote-outputs-size: 1"),
+                (ERR, "gate-remote-outputs-size: 7"),
+                (ERR, line.as_str())
+            ]),
+            Some(sized(2, 7)),
+            "the last size line counts"
+        );
+        assert_eq!(
+            accepted_of(&[(OUT, "gate-remote-outputs-size: 4096"), (ERR, line.as_str())]),
+            Some(archive(2)),
+            "a size line on standard output never counts"
+        );
+        assert_eq!(
+            accepted_of(&[(ERR, "gate-remote-outputs-size: 4096"), (ERR, "gate-remote-outputs: 0")]),
+            Some(Brought::Nothing),
+            "no archive has no size"
+        );
+    }
+
+    #[test]
+    fn only_the_size_line_just_before_the_outputs_line_gives_a_size() {
+        let line = named(2, KEY, NONCE);
+        assert_eq!(
+            accepted_of(&[(ERR, "gate-remote-outputs-size: 4096"), (ERR, line.as_str())]),
+            Some(sized(2, 4096)),
+            "the size line just before the outputs line"
+        );
+        assert_eq!(
+            accepted_of(&[
+                (ERR, "gate-remote-outputs-size: 4096"),
+                (ERR, "the command's own line"),
+                (ERR, line.as_str())
+            ]),
+            Some(archive(2)),
+            "a size line with another standard error line between gives no size"
+        );
+        assert_eq!(
+            accepted_of(&[
+                (ERR, "gate-remote-outputs-size: 4096"),
+                (ERR, line.as_str()),
+                (ERR, "the command's own line"),
+                (ERR, line.as_str())
+            ]),
+            Some(archive(2)),
+            "the size goes with the last outputs line, not an earlier one"
+        );
+        assert_eq!(
+            accepted_of(&[
+                (ERR, "gate-remote-outputs-size: 4096"),
+                (OUT, "a line on standard output"),
+                (ERR, line.as_str())
+            ]),
+            Some(sized(2, 4096)),
+            "a standard output line between does not part them"
+        );
+    }
+
+    #[test]
+    fn an_outputs_line_without_a_size_line_still_reads() {
+        let bare = named(2, KEY, NONCE);
+        assert_eq!(
+            accepted_of(&[(ERR, bare.as_str())]),
+            Some(archive(2)),
+            "a builder not yet pushed says no size"
+        );
+    }
+
+    #[test]
+    fn a_size_line_whose_size_is_not_a_number_gives_no_size() {
+        let line = named(1, KEY, NONCE);
+        for size in ["x", "+5", "-5", "1.5", "", " 5", "5 ", "5 6", "99999999999999999999999"] {
+            let said = format!("gate-remote-outputs-size: {size}");
+            assert_eq!(accepted_of(&[(ERR, said.as_str()), (ERR, line.as_str())]), Some(archive(1)), "{said:?}");
+        }
+    }
+
+    /// An older PC keeps the last line starting `gate-remote-outputs: `, as [`keep_outputs_lines`] does: the size line
+    /// does not start so, so it is never kept as the outputs line and cannot replace the box's own.
+    #[test]
+    fn an_older_pc_s_reading_ignores_the_size_line() {
+        let mut kept = None;
+        keep_outputs_lines(&mut kept, None, "gate-remote-outputs-size: 4096", ERR);
+        assert_eq!(kept, None, "the size line is no outputs line");
+        let line = named(1, KEY, NONCE);
+        keep_outputs_lines(&mut kept, None, &line, ERR);
+        keep_outputs_lines(&mut kept, Some(line.as_str()), "gate-remote-outputs-size: 4096", ERR);
+        assert_eq!(
+            kept.map(|kept| kept.line),
+            Some(line),
+            "a size line after it leaves the outputs line kept"
+        );
+    }
+
+    #[test]
+    fn sizes_read_in_the_success_line_s_megabytes() {
+        assert_eq!(mb_size(0.0), "0.0 MB");
+        assert_eq!(mb_size(52_428.0), "0.0 MB", "just under half a tenth of 1048576 bytes");
+        assert_eq!(mb_size(52_429.0), "0.1 MB", "a half rounds away from zero");
+        assert_eq!(mb_size(300_000.0), "0.3 MB");
+        assert_eq!(mb_size(1_048_576.0), "1.0 MB", "1048576 bytes, as the success line counts a megabyte");
+        assert_eq!(mb_size(1_000_000_000.0), "953.7 MB");
+        assert_eq!(mb_size(12_345_678_901.0), "11773.8 MB", "never another unit");
     }
 
     #[test]
@@ -969,6 +1227,7 @@ mod tests {
             format!("gate-remote-outputs:  1 {name}"),
             format!("gate-remote-outputs: 1 {name} "),
             format!("gate-remote-outputs: 1 {name} more"),
+            format!("gate-remote-outputs: 1 {name} 4096"),
             format!("gate-remote-outputs: 1 {KEY}-{NONCE}.tar.xz"),
         ] {
             assert_eq!(accepted_of(&[(ERR, line.as_str())]), None, "{line:?}");

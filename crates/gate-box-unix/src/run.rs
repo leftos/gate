@@ -873,6 +873,9 @@ fn brought_back<S: LineSink + 'static>(
     if let Some(skipped) = &brought.skipped {
         noted(output, GAT, skipped);
     }
+    if let Some(size) = &brought.size {
+        noted(output, Stamp::Bare, size);
+    }
     noted(output, Stamp::Bare, &brought.line);
     if !brought.wrote_archive() {
         return 0;
@@ -3672,6 +3675,19 @@ mod tests {
         assert_eq!(status, 0, "{said:?}");
         let line = format!("gate-remote-outputs: 1 {}", archive_name());
         assert_eq!(outputs_said(&said), [line.as_str()], "{said:?}");
+        let size = format!(
+            "gate-remote-outputs-size: {}",
+            fs::metadata(case.archive()).expect("the archive is there").len()
+        );
+        let before = said
+            .iter()
+            .position(|(_, said)| *said == line)
+            .and_then(|at| at.checked_sub(1))
+            .and_then(|before| said.get(before));
+        assert!(
+            before.is_some_and(|(_, before)| *before == size),
+            "the archive's size line, just before the outputs line: {said:?}"
+        );
         assert_eq!(members_of(&case.archive()), ["bin/new.txt"]);
     }
 

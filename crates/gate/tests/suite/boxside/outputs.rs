@@ -83,6 +83,12 @@ fn packed_line(payload: &Value, count: usize) -> String {
     format!("gate-remote-outputs: {count} {}", archive_name(payload))
 }
 
+/// The line a run of `payload` that packed an archive says just before its outputs line: the archive's size.
+fn size_line(payload: &Value) -> String {
+    let size = fs::metadata(archive_path(payload)).expect("the archive the run packed is there").len();
+    format!("gate-remote-outputs-size: {size}")
+}
+
 /// Whether `text` holds the whole line `line`.
 fn has_line(text: &str, line: &str) -> bool {
     text.lines().any(|said| said == line)
@@ -285,13 +291,18 @@ fn a_passing_runs_last_stderr_line_is_its_outputs_line() {
     let outcome = run_with_manifest(&case, &payload, &manifest(&[]));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    let last = outcome
+    let said: Vec<&str> = outcome
         .stderr
         .lines()
         .rev()
-        .find(|line| !line.starts_with("gate-remote-heartbeat: "))
-        .expect("the run said a line on standard error");
-    assert_eq!(last, packed_line(&payload, 1), "{outcome:?}");
+        .filter(|line| !line.starts_with("gate-remote-heartbeat: "))
+        .take(2)
+        .collect();
+    assert_eq!(
+        said,
+        [packed_line(&payload, 1), size_line(&payload)],
+        "the size line, then the outputs line last: {outcome:?}"
+    );
 }
 
 #[test]

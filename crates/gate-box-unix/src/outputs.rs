@@ -704,6 +704,8 @@ impl<'t> Tree<'t> {
 pub struct Brought {
     /// The line saying the files left out for names this PC cannot take, `None` when there were none.
     pub skipped: Option<String>,
+    /// `gate-remote-outputs-size: <bytes>`, the archive's size, said just before `line`; `None` when nothing was packed.
+    pub size: Option<String>,
     /// `gate-remote-outputs: <n> <archive>`, or [`NOTHING_PACKED`].
     pub line: String,
     /// The line refusing a cross build's outputs for a program the PC cannot run among them ([`cross::refused_line`]),
@@ -723,7 +725,8 @@ impl Brought {
 
 /// Packs the files under `asked`'s globs in the folder `work` to bring back after a passing command ([`select`]),
 /// leaving out `skip`, the paths of the run's back commit, which the sync-back replaces on the PC, so no copy is made
-/// from the PC's file at one of them either: the line saying how many were packed and the archive's name, or
+/// from the PC's file at one of them either: the line saying how many were packed and the archive's name, with the line
+/// saying the archive's size in bytes to say before it, or
 /// `gate-remote-outputs: 0` with no archive written when none were, and before it the line saying the files [`select`]
 /// would have packed but for a name this PC cannot take ([`skipped_line`]), when there were any. The output folder is
 /// made when missing ([`output_folder`]), and the archive is made anew beneath it, 0600: a file or a link already at
@@ -759,6 +762,7 @@ pub fn bring_back(
             Portable::Refused(path) => {
                 return Ok(Brought {
                     skipped: None,
+                    size: None,
                     line: NOTHING_PACKED.to_owned(),
                     refused: Some(cross::refused_line(rid, &path)),
                     archive: None,
@@ -769,6 +773,7 @@ pub fn bring_back(
     if chosen.is_empty() {
         return Ok(Brought {
             skipped,
+            size: None,
             line: NOTHING_PACKED.to_owned(),
             refused: None,
             archive: None,
@@ -787,6 +792,7 @@ pub fn bring_back(
     match packed {
         Ok(packed) => Ok(Brought {
             skipped,
+            size: Some(format!("gate-remote-outputs-size: {}", packed.compressed)),
             line: format!("gate-remote-outputs: {} {}", packed.entries.len(), asked.archive),
             refused: None,
             archive: Some(file),
@@ -1494,7 +1500,12 @@ pub(crate) mod tests {
         format!("gate-remote-outputs: {count} {}", archive(digit))
     }
 
-    /// [`bring_back`]'s lines, the archive it held let go.
+    /// [`bring_back`]'s lines, the archive it held let go, once its size line is found to name the size of the archive
+    /// it wrote, and to be there only when it wrote one.
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "a test helper: a wrong size line fails the test, never the Result it hands on"
+    )]
     fn bring(
         asked: &Asked<'_>,
         manifest: &Result<Manifest, String>,
@@ -1502,7 +1513,14 @@ pub(crate) mod tests {
         work: &Path,
         skip: &[String],
     ) -> Result<(Option<String>, String), String> {
-        bring_back(asked, manifest, listing, work, skip).map(|brought: Brought| (brought.skipped, brought.line))
+        bring_back(asked, manifest, listing, work, skip).map(|brought: Brought| {
+            let size = brought.wrote_archive().then(|| {
+                let written = fs::metadata(Path::new(asked.folder).join(&asked.archive)).expect("the archive packed is there");
+                format!("gate-remote-outputs-size: {}", written.len())
+            });
+            assert_eq!(brought.size, size, "the size line names the archive's size");
+            (brought.skipped, brought.line)
+        })
     }
 
     /// Whether an exclusive `flock` on the file at `path`, asked without waiting on a descriptor of its own, is refused.

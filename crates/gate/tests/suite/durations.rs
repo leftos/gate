@@ -1150,7 +1150,7 @@ fn no_ceiling_hint_at_or_above_the_load_adjusted_p90_or_without_history_or_witho
 #[test]
 fn a_run_past_3x_its_usual_p90_is_hinted_once_and_not_killed() {
     let case = Case::new("durations-hang-hint");
-    let hint = Regex::new(r"gate: still running after \d+ s, \d+x its usual p90 of 1 s\n").expect("the pattern is valid");
+    let hint = Regex::new(r"gate: still running after \d+ s, \d+x its usual p90 of 1 s; running here for \d+ s\n").expect("the pattern is valid");
 
     // Sampled every 100 ms, the run passes 3x its p90 of 1 s while its command waits.
     let (_, outcome) = held_run(&case, "3600", Some((1.0, None)), &["--test-sample-ms", "100"], |stderr| {

@@ -23,7 +23,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use gate_router::{escaped, is_layout_char};
 use gate_state::v1;
@@ -59,7 +59,7 @@ const UTF32_LE_BOM: &[u8] = b"\xFF\xFE\x00\x00";
 /// The largest file the install rewrites, 16 MiB: a larger one is skipped before it is read.
 const REWRITE_LIMIT: u64 = 16 * 1024 * 1024;
 /// The bytes in a megabyte, as the success line counts them.
-const MB: f64 = 1024.0 * 1024.0;
+pub(super) const MB: f64 = 1024.0 * 1024.0;
 /// The seam's name for the install, to `--test-remote-interrupt-at`: the interrupt is raised before the second file's
 /// move, never for an install of a single file.
 const INSTALL: &str = "install";
@@ -81,6 +81,8 @@ pub(super) struct Fetched<'f> {
     /// Each sibling's tree on the box and the sibling's root it stands for, in the pair's order; none for one repo.
     pub(super) sibling_trees: Vec<(String, &'f str)>,
     pub(super) started: Instant,
+    /// How long the fetch alone took, from its start to the archive's last byte.
+    pub(super) pulled: Duration,
 }
 
 /// What an install put into the worktree: the files it moved, their bytes, and the archive's bytes; the paths of the
@@ -267,7 +269,7 @@ pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) ->
                 &done,
                 started,
             );
-            let lines = said(&done, fetched.started.elapsed().as_secs_f64());
+            let lines = said(&done, fetched.started.elapsed().as_secs_f64(), fetched.pulled.as_secs_f64());
             let complete = done.complete();
             (End::Status(0), lines, complete, complete)
         }
@@ -543,9 +545,9 @@ fn reasons(entries: &[Entry], tracked: &HashSet<&str>, in_use: &HashSet<&str>) -
         .collect()
 }
 
-/// The lines an install that put `installed` into the worktree says, `seconds` after its fetch started: one for each
-/// file it skipped, saying why, then the success line.
-fn said(installed: &Installed, seconds: f64) -> Vec<String> {
+/// The lines an install that put `installed` into the worktree says, `seconds` after its fetch started, the fetch alone
+/// having taken `pulled`: one for each file it skipped, saying why, then the success line.
+fn said(installed: &Installed, seconds: f64, pulled: f64) -> Vec<String> {
     let mut lines: Vec<String> = installed
         .skipped
         .iter()
@@ -556,25 +558,28 @@ fn said(installed: &Installed, seconds: f64) -> Vec<String> {
             )
         })
         .collect();
-    lines.push(success_line(installed, seconds));
+    lines.push(success_line(installed, seconds, pulled));
     lines
 }
 
-/// The line an install that put `installed` into the worktree says, `seconds` after its fetch started.
+/// The line an install that put `installed` into the worktree says, `seconds` after its fetch started, the fetch alone
+/// having taken `pulled`: the fetch's seconds and the archive's mean rate over them close it.
 #[expect(clippy::cast_precision_loss, reason = "a size said to one decimal of a megabyte")]
-fn success_line(installed: &Installed, seconds: f64) -> String {
+fn success_line(installed: &Installed, seconds: f64, pulled: f64) -> String {
     let bytes = one_decimal(installed.bytes as f64 / MB);
     let compressed = one_decimal(installed.compressed as f64 / MB);
     let seconds = one_decimal(seconds);
+    let rate = super::outputs::mb_rate(installed.compressed, pulled);
     format!(
-        "gate: outputs: {} file(s), {bytes} MB ({compressed} MB compressed) in {seconds} s",
-        installed.count
+        "gate: outputs: {} file(s), {bytes} MB ({compressed} MB compressed) in {seconds} s (pulled in {} s, {rate})",
+        installed.count,
+        one_decimal(pulled)
     )
 }
 
 /// `value` to one decimal, a half rounded away from zero as .NET's `{0:0.0}` rounds it; Rust's `{:.1}` rounds a half
 /// to even.
-fn one_decimal(value: f64) -> String {
+pub(super) fn one_decimal(value: f64) -> String {
     format!("{:.1}", (value * 10.0).round() / 10.0)
 }
 
@@ -1559,7 +1564,7 @@ mod tests {
         };
 
         let line = "gate: remote outputs not fully brought back: bin/big.json cannot be rewritten (16777217 bytes, over 16 MiB)";
-        assert_eq!(said(&installed, 0.0).first().map(String::as_str), Some(line));
+        assert_eq!(said(&installed, 0.0, 0.0).first().map(String::as_str), Some(line));
     }
 
     /// An install that skipped a file it cannot rewrite is whole, which the marker, `brought_back` and the hash cache
@@ -1598,12 +1603,12 @@ mod tests {
             skipped: vec![("bin/held.dll".to_owned(), Skip::InUse), ("bin/kept.dll".to_owned(), Skip::Tracked)],
             moved: Vec::new(),
         };
-        let success = "gate: outputs: 3 file(s), 3.0 MB (1.0 MB compressed) in 2.3 s";
-        assert_eq!(success_line(&installed, 2.25), success, "half a tenth rounds away from zero");
+        let success = "gate: outputs: 3 file(s), 3.0 MB (1.0 MB compressed) in 2.3 s (pulled in 0.5 s, 2.0 MB/s)";
+        assert_eq!(success_line(&installed, 2.25, 0.5), success, "half a tenth rounds away from zero");
         let in_use = "gate: remote outputs not fully brought back: bin/held.dll is in use or read-only";
         let tracked = "gate: remote outputs not fully brought back: bin/kept.dll is tracked by git";
         assert_eq!(
-            said(&installed, 2.25),
+            said(&installed, 2.25, 0.5),
             [in_use, tracked, success],
             "each skipped file and why, then the success line"
         );

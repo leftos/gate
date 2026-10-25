@@ -65,7 +65,8 @@
 //! `truncate <n>` does as `ok` with the call's standard output read, only its first `<n>` bytes passed on raw and the
 //! rest read and dropped, then writes ssh's `Connection timed out during banner exchange` on standard error and exits
 //! 255, so only the bytes it sent tell the drop from one before the banner; `garbage <n>` runs nothing, writes `<n>`
-//! bytes of `x`, no outputs archive, raw on standard output and exits 0; `flood-ok <n>` writes `<n>` bytes of `x` and
+//! bytes of `x`, no outputs archive, raw on standard output and exits 0; `bytes-exit <n> <status>` runs nothing, writes
+//! `<n>` bytes of `x` raw on standard output and exits `<status>`; `flood-ok <n>` writes `<n>` bytes of `x` and
 //! no line end on standard output, then does as `ok`, whose output goes on that one line; `bytes-hold <n> <path>` writes `<n>` bytes of
 //! `x` raw on standard output, then does as `hold <path>`; `away` runs the call as `ok` does, but outside this
 //! process's job (`CREATE_BREAKAWAY_FROM_JOB`, which the job must allow), its three standard streams pipes this process
@@ -233,6 +234,11 @@ fn run() -> Result<i32, String> {
         Some(("garbage", bytes)) => {
             filler(byte_count(&step, bytes)?)?;
             Ok(0)
+        }
+        Some(("bytes-exit", rest)) => {
+            let (bytes, status) = rest.split_once(' ').ok_or_else(|| format!("the step '{step}' names no status"))?;
+            filler(byte_count(&step, bytes)?)?;
+            status.parse().map_err(|_| format!("the step '{step}' names no status"))
         }
         Some(("bytes-hold", rest)) => {
             let (bytes, path) = rest.split_once(' ').ok_or_else(|| format!("the step '{step}' names no path"))?;

@@ -316,20 +316,20 @@ pub(super) fn listing(asked: &Asked<'_>, work: &Path) -> (Option<Listing>, Optio
 
 /// Packs the files under `asked`'s globs in `work` to bring back after a passing command ([`select`]), leaving out
 /// `skip`, the paths of the run's back commit, which the sync-back replaces on the PC, so no copy is made from the PC's
-/// file at one of them either: the line saying how many were packed and the archive's name, or
-/// `gate-remote-outputs: 0` with no archive written when none were, and before it the line saying the files [`select`]
-/// would have packed but for a name this PC cannot take ([`skipped_line`]), when there were any. Else why the outputs
-/// are not brought back; an archive left half written is removed. The archive is made anew: a file or a link already
-/// at its name fails the pack and is left as it is. A file whose final path is not inside `work` fails the pack
-/// ([`pack`]). The archive is opened sharing reads only while it is packed, so another run's trim cannot remove it
-/// before it is whole.
+/// file at one of them either: the line saying how many were packed and the archive's name, and the line before it
+/// saying the archive's size in bytes as the pack wrote them ([`size_line`]); or `gate-remote-outputs: 0` with no
+/// archive written when none were; and before them the line saying the files [`select`] would have packed but for a
+/// name this PC cannot take ([`skipped_line`]), when there were any. Else why the outputs are not brought back; an
+/// archive left half written is removed. The archive is made anew: a file or a link already at its name fails the
+/// pack and is left as it is. A file whose final path is not inside `work` fails the pack ([`pack`]). The archive is
+/// opened sharing reads only while it is packed, so another run's trim cannot remove it before it is whole.
 pub(super) fn bring_back(
     asked: &Asked<'_>,
     manifest: &Result<Manifest, String>,
     listing: Option<&Listing>,
     work: &Path,
     skip: &[String],
-) -> Result<(Option<String>, String), String> {
+) -> Result<Brought, String> {
     let manifest = manifest.as_ref().map_err(Clone::clone)?;
     let walked = walk_with_refused(work, &asked.globs).map_err(|error| format!("the outputs could not be listed: {error}"))?;
     let hash = |file: &Found| file_sha256(&file.full);
@@ -337,7 +337,11 @@ pub(super) fn bring_back(
     let skipped = skipped_line(&refused.iter().map(|chosen| chosen.file).collect::<Vec<_>>());
     let mut chosen = select(&walked.found, manifest, listing, skip, hash).map_err(|error| error.to_string())?;
     if chosen.is_empty() {
-        return Ok((skipped, NOTHING_PACKED.to_owned()));
+        return Ok(Brought {
+            skipped,
+            size: None,
+            line: NOTHING_PACKED.to_owned(),
+        });
     }
     hash_possible_copies(&mut chosen, manifest, hash).map_err(|error| error.to_string())?;
     fs::create_dir_all(asked.folder).map_err(|error| format!("cannot make the output folder {}: {error}", asked.folder))?;
@@ -349,12 +353,31 @@ pub(super) fn bring_back(
         .open(&path)
         .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
     match pack(BufWriter::new(file), work, &chosen, &manifest.by_hash(skip)) {
-        Ok(packed) => Ok((skipped, format!("gate-remote-outputs: {} {}", packed.entries.len(), asked.archive))),
+        Ok(packed) => Ok(Brought {
+            skipped,
+            size: Some(size_line(packed.compressed)),
+            line: format!("gate-remote-outputs: {} {}", packed.entries.len(), asked.archive),
+        }),
         Err(error) => match fs::remove_file(&path) {
             Ok(()) => Err(error.to_string()),
             Err(removal) => Err(format!("{error}; and {} could not be removed: {removal}", path.display())),
         },
     }
+}
+
+/// What [`bring_back`] has the box say: the line of the files left out for names this PC cannot take, when there were
+/// any; the archive's size line, when it packed one; and the outputs line, said last.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Brought {
+    pub(super) skipped: Option<String>,
+    pub(super) size: Option<String>,
+    pub(super) line: String,
+}
+
+/// The line the box says just before its outputs line once it packed an archive of `bytes`: a line of its own, so a PC
+/// that reads only the outputs line, which it compares whole, still takes the box's.
+fn size_line(bytes: u64) -> String {
+    format!("gate-remote-outputs-size: {bytes}")
 }
 
 /// The start of the line saying the run's outputs leave out files for names this PC cannot take ([`skipped_line`]),

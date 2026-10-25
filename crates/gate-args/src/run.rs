@@ -91,6 +91,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     RemoteBackstopMs,
     #[cfg(feature = "test-seams")]
+    OutputsProgressMs,
+    #[cfg(feature = "test-seams")]
     LocalSdks,
     #[cfg(feature = "test-seams")]
     RemoteFetchCapBytes,
@@ -149,6 +151,8 @@ pub(crate) enum SwitchOption {
     StallFromOutput,
     #[cfg(feature = "test-seams")]
     OwnStartFails,
+    #[cfg(feature = "test-seams")]
+    RemoteHintFromPull,
     #[cfg(feature = "test-seams")]
     ParentJobTrusted,
     #[cfg(feature = "test-seams")]
@@ -369,6 +373,8 @@ impl RunBuilder {
             #[cfg(feature = "test-seams")]
             ValueOption::RemoteBackstopMs => self.test_seams.remote_backstop_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
+            ValueOption::OutputsProgressMs => self.test_seams.outputs_progress_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
             ValueOption::LocalSdks => self.test_seams.local_sdks = Some(value.to_owned()),
             #[cfg(feature = "test-seams")]
             ValueOption::RemoteFetchCapBytes => self.test_seams.remote_fetch_cap_bytes = Some(values::above_zero(spelled, value)?),
@@ -460,6 +466,8 @@ impl RunBuilder {
             SwitchOption::StallFromOutput => self.test_seams.stall_from_output = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::OwnStartFails => self.test_seams.own_start_fails = on,
+            #[cfg(feature = "test-seams")]
+            SwitchOption::RemoteHintFromPull => self.test_seams.remote_hint_from_pull = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::ParentJobTrusted => self.test_seams.parent_job_trusted = on,
             #[cfg(feature = "test-seams")]
@@ -566,7 +574,9 @@ impl RunBuilder {
 
     /// Refuses the remote client's seams that cannot work together: `--test-remote-ssh`,
     /// `--test-remote-retry-pause-ms`, `--test-remote-bound-ms`, `--test-remote-interrupt-at`,
-    /// `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-remote-backstop-ms`, `--test-local-sdks`,
+    /// `--test-remote-watch-call`, `--test-remote-timeout-ms`, `--test-remote-backstop-ms`, `--test-outputs-progress-ms`,
+    /// `--test-remote-hint-from-pull`,
+    /// `--test-local-sdks`,
     /// `--test-remote-fetch-cap-bytes`,
     /// `--test-remote-apply-cap-bytes`, `--test-remote-outputs-budget-bytes`, `--test-remote-inputs-budget-bytes`,
     /// `--test-remote-lfs-budget-bytes`, `--test-remote-log-cap-bytes` and
@@ -587,6 +597,8 @@ impl RunBuilder {
             (self.test_seams.remote_watch_call.is_some(), "--test-remote-watch-call"),
             (self.test_seams.remote_timeout_ms.is_some(), "--test-remote-timeout-ms"),
             (self.test_seams.remote_backstop_ms.is_some(), "--test-remote-backstop-ms"),
+            (self.test_seams.outputs_progress_ms.is_some(), "--test-outputs-progress-ms"),
+            (self.test_seams.remote_hint_from_pull, "--test-remote-hint-from-pull"),
             (self.test_seams.local_sdks.is_some(), "--test-local-sdks"),
             (self.test_seams.remote_fetch_cap_bytes.is_some(), "--test-remote-fetch-cap-bytes"),
             (self.test_seams.remote_apply_cap_bytes.is_some(), "--test-remote-apply-cap-bytes"),
