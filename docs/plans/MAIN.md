@@ -4,12 +4,11 @@
 
 ## Do first
 
+- [ ] GATE-787 Make diagnostics::a_kill_writes_its_diagnostics_to_the_log_before_the_kill_line hold under load — Urgent · Local gate
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [/] GATE-696 Cross-build Windows outputs on a macOS builder and bring them back — Urgent · Remote
-- [ ] GATE-768 Make critical::a_count_raised_during_the_critical_run_lets_no_more_light_in hold under load — Urgent · No project
-- [/] GATE-729 Make a sequence of gate runs die with whoever stops it — High · Local gate
 - [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root — High · Remote
-- [ ] GATE-648 Restore pnpm, bun and npm packages on the Unix box, as the Windows box does — High · Remote
+- [/] GATE-648 Restore pnpm, bun and npm packages on the Unix box, as the Windows box does — High · Remote
 - [ ] GATE-574 Take the work lock in the box preflight and stamp the lock's time on each run — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
@@ -28,11 +27,9 @@
 - [ ] GATE-640 Refuse a macOS builder root holding ':' when remote.json is read — High · Remote
 - [ ] GATE-643 Say why a routed command naming a project under .tmp cannot route, and check --no-build after a routed build — High · Remote
 - [ ] GATE-649 Bring back every test project's output a routed dotnet test build made — High · Remote
-- [ ] GATE-650 Fall back when a builder's box program is missing (ssh status 126/127) — High · Remote
 - [ ] GATE-682 Explain or track a stall when a gated command is plain ssh to another machine — High · Remote
 - [/] GATE-683 Prune a deleted worktree's folders from every builder, and prune the Mac by space — High · Remote
 - [ ] GATE-689 Prune a gone worktree's keys from the Windows builders and the PC — High · Remote
-- [ ] GATE-730 Let the PC see the Unix box's start marker — High · Remote
 - [!] GATE-731 Route yaat's test-all to the Mac mini — High · Remote
 - [ ] GATE-745 Bring back the files a routed dotnet command's /flp and /getResultOutputFile switches name — High · Remote
 - [ ] GATE-751 Make a routed build's outputs pull fast enough for yaat's trees, or skip it for verdict-only runs — High · Remote
@@ -53,6 +50,16 @@
 
 ## Remote
 
+- [/] GATE-774 Tighten the Unix box's folder modes, umask, lock owner and git options
+- [ ] GATE-775 Judge the Unix box's login PATH folders and the folder xcode-select names
+- [ ] GATE-776 Walk the folders above the Unix box's work root to /
+- [ ] GATE-777 Pin the Unix box's work root at install and refuse any other
+- [ ] GATE-778 Keep the Unix box's own binary out of reach of the commands it runs
+- [ ] GATE-779 Refuse extended ACL write entries on the Unix box's root and strip them from a root it makes
+- [ ] GATE-780 Hold the Unix box's root open through preflight, layout, records, lock and stop
+- [ ] GATE-781 Write the Unix box's .git/config whole at layout, under the work lock
+- [ ] GATE-782 Keep a bare repository's hooks from running on the Unix box's pushes
+- [ ] GATE-786 Check the Unix box's tree and bare before its lock sweep, and the rest of .git
 - [ ] GATE-663 Keep the Unix box's preflight from racing a run's git lock sweep on the same key
 - [ ] GATE-666 Let the Unix box's stop reach a run between two steps with a stop marker
 - [ ] GATE-667 Keep the Unix box's stop under the client's stop limit when it follows several groups
@@ -245,7 +252,15 @@
 - [ ] GATE-747 Read --artifacts-path and --property as option values in dotnet target parsing
 - [ ] GATE-748 Let a --builder pin use the repo's other routes when the pinned entry's listing misses
 - [ ] GATE-750 Harden the Unix box's cross build: one read for check and pack, a command record, the stop window
+- [ ] GATE-769 Say how long a gate waited when it takes its slot
+- [ ] GATE-770 Say a routed run's builder preflight and snapshot push as they start, and the preflight's duration
+- [ ] GATE-771 Say a routed run's inputs, LFS and cross-build puts as they start
+- [ ] GATE-772 Say the box's checkout, with its duration, on both boxes
+- [ ] GATE-773 Say the sync-back's start, the outputs install's end and the restore here, with durations
 - [ ] GATE-758 Say the hang hint in every phase of a routed run, not only while a call is watched
+- [ ] GATE-783 Check which ssh a gate under Git Bash runs, and its exit-status width
+- [ ] GATE-784 Fall back when a tcsh or csh login shell finds no gate box (status 1)
+- [ ] GATE-785 Say every Unix box protocol line through one standard-error call
 
 ## Cutover sweep
 
