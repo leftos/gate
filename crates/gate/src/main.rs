@@ -29,7 +29,6 @@ mod log_writer;
 mod machine;
 mod nesting;
 mod no_build;
-mod orphan;
 #[cfg_attr(
     not(test),
     expect(

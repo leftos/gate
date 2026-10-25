@@ -27,7 +27,6 @@ mod journal;
 mod launch;
 mod launcher;
 mod nesting;
-mod orphan;
 mod pause;
 mod push;
 mod remote_client;

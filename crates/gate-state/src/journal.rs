@@ -918,8 +918,7 @@ pub fn normalize_command(command: &str) -> String {
 /// separate words, `"` opens or closes a quoted span, `""` inside a span is one literal quote and the span continues,
 /// and a backslash run before a `"` is halved with the quote literal when the run is odd (any other backslash is
 /// literal). A word that was `""` is empty and kept. The first word takes the same rule as the rest.
-#[must_use]
-pub fn split_words(command: &str) -> Vec<String> {
+pub(crate) fn split_words(command: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut started = false;

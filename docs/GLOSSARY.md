@@ -165,7 +165,6 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 
   A passing local dotnet `build`, `test` or `run` of one project adds that project's key (its folder relative to the worktree root, lower-cased) to `built`, unless the build moved its output.
 - **Open run**: a journal run that took its slot, has not released or abandoned it, did not run on its parent's slot, and whose gate is live by pid and process start; the history's `open` list holds every one, uncapped.
-- **Orphaned script**: a shell running a script or a command whose parent process is gone or reused, found by the ancestor walk of a gate with no live parent gate (a PowerShell started with `-NoExit` is interactive, never an orphaned script); the gate refuses to start (exit 2) because a background script whose shell was killed keeps starting gate steps.
 - **Output cap**: the remote client's limit of 64 KiB on one line of a call's output (a `\r` resets the line, so git's progress counts per update), which kills a capped call that sends a longer one.
 - **Output path map**: the rule that lists a cross build's file under `bin/<a>/<b>/<rid>/...` at its path with the `<rid>` folder removed, so the output globs judge and the PC receives the path a native Windows build writes.
 - **Outputs archive**: the `<key>-<nonce>.tar.zst` a routed run's changed output files travel in, its last member `.gate-outputs.json` listing every path it brings back, in pack order, the files before it and the copies that have no member.
