@@ -66,7 +66,14 @@ fn argv_output(words: &[&str]) -> Vec<u8> {
     words.iter().flat_map(|word| format!("{word}\n").into_bytes()).collect()
 }
 
-/// The journal's events, in order.
+/// Whether `text` opens with the lines `hello` and `oops`, in either order, then the passed verdict: the two come
+/// from separate pipes read by separate readers, so their order is a race.
+fn starts_with_hello_and_oops_then_passed(text: &str) -> bool {
+    let mut parts = text.splitn(3, '\n');
+    let mut first_two = [parts.next().unwrap_or_default(), parts.next().unwrap_or_default()];
+    first_two.sort_unstable();
+    first_two == ["hello", "oops"] && parts.next().is_some_and(|rest| rest.starts_with("gate: passed in "))
+}
 
 #[test]
 fn a_run_launches_its_command_and_passes_its_status() {
@@ -78,7 +85,7 @@ fn a_run_launches_its_command_and_passes_its_status() {
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     assert_eq!(outcome.stderr, "", "{outcome:?}");
     assert!(
-        outcome.stdout.starts_with("hello\noops\ngate: passed in "),
+        starts_with_hello_and_oops_then_passed(&outcome.stdout),
         "the tail, then the verdict: {outcome:?}"
     );
     let passed = format!(
@@ -91,8 +98,8 @@ fn a_run_launches_its_command_and_passes_its_status() {
     );
     let text = log_text(&case);
     assert!(
-        text.starts_with("hello\noops\ngate: passed in "),
-        "output, errors, then the gate's lines: {text}"
+        starts_with_hello_and_oops_then_passed(&text),
+        "output and errors, then the gate's lines: {text}"
     );
     assert!(!case.folder().join("out.log.err").exists(), "no .err file is written");
 }
