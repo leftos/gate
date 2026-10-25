@@ -459,7 +459,6 @@ fn a_count_raised_during_the_critical_run_lets_no_more_light_in() {
     let light_go_word = shown(&light_go);
     let first = holder(&case, &run_words("first.log", &POLL, &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"]));
     let second = holder(&case, &run_words("second.log", &POLL, &[FAKE_TOOL, "wait", &light_go_word, "exit", "0"]));
-    let (first_pid, second_pid) = (first.id(), second.id());
     write_counts(&case.root(), r#"{"v":1,"heavy":1,"light":5}"#);
 
     let third = case.start(&run_words("third.log", &POLL, &[FAKE_TOOL, "exit", "0"]));
@@ -476,15 +475,12 @@ fn a_count_raised_during_the_critical_run_lets_no_more_light_in() {
         "a slot the raised count added is free, and the third gate still waits"
     );
 
+    // The third gate waited with a raised slot free (above); which journal line comes first once the light gates end
+    // is not pinned: a gate deletes its claim before it journals its release.
     let_go(&light_go);
     assert_passed(&third.finish());
     assert_passed(&first.finish());
     assert_passed(&second.finish());
-    let released = at(&case, "release", first_pid).min(at(&case, "release", second_pid));
-    assert!(
-        released < at(&case, "take", third_pid),
-        "the third gate takes a slot only once a light gate beside the critical gate let one go"
-    );
     let_go(&go);
     assert_passed(&critical.finish());
 }
