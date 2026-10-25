@@ -14,14 +14,15 @@ use std::time::{Duration, SystemTime};
 
 use gate_args::BoxSeams;
 use gate_inputs::manifest::{Listing, Manifest};
-use gate_wire::{PairSibling, PathForm, Payload, Refusal, bare_stem, busy_line, escaped, layout_line, refused_line, trees};
+use gate_wire::{CrossBuild, PairSibling, PathForm, Payload, Refusal, bare_stem, busy_line, escaped, layout_line, refused_line, trees};
 
 use gate_watchdog::Pump;
 
 use crate::back::{self, BackFailed};
 use crate::beneath;
-use crate::command::{Launch, Sampler, command_record, run_command};
+use crate::command::{self, CrossEnd, Launch, Sampler, command_record, run_command};
 use crate::console::{Forwarding, GAT, LineSink, Output, Stamp, Stream};
+use crate::cross;
 use crate::files::{self, HeldLock, Locked};
 use crate::git::{
     self, AlternatesFailure, CLOSED_STATUS, Failed, Git, GitClass, RunGit, Steps, Tree, failed_for, for_repo, line_ends_set, origin_set,
@@ -173,6 +174,8 @@ pub struct Request<'p> {
     pub inputs_digest: Option<&'p str>,
     /// The outputs the run brings back after a passing command, `Outputs` and `OutputsFull`; `None` without globs.
     pub outputs: Option<Asked<'p>>,
+    /// The cross build run after a passing command, before its outputs are brought back, `CrossBuild`; `None` for none.
+    pub cross: Option<CrossBuild>,
     /// The first thing the payload asks for that this builder does not build, in the order the payload is read.
     unbuilt: Option<Unbuilt>,
 }
@@ -192,8 +195,10 @@ impl<'p> Request<'p> {
         let (key, work) = payload.work_folder()?;
         let (root, parent) = work_layout(work)?;
         let (globs, full) = (payload.output_globs()?, payload.outputs_full()?);
+        let cross = payload.cross_build()?;
         let nonce = payload.nonce()?;
-        let outputs = Asked::new(&globs, full, key, nonce, payload.output_folder(work)?)?;
+        let outputs = Asked::new(&globs, full, key, nonce, payload.output_folder(work)?)?
+            .map(|asked| asked.crossed_for(cross.as_ref().map(|cross| cross.rid.as_str())));
         let (timeout, host) = (payload.timeout()?, payload.optional_text("Host")?);
         let desktop = payload.desktop()?;
         if desktop && payload.desktop_wait()?.is_none() {
@@ -249,6 +254,7 @@ impl<'p> Request<'p> {
             godot,
             inputs_digest,
             outputs,
+            cross,
             unbuilt,
         })
     }
@@ -755,7 +761,7 @@ fn commanded<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, 
     if !of_its_own(end) {
         return back_commits_failed(output, request, status);
     }
-    synced_back(ready, output, status, watches.budget)
+    synced_back(ready, output, status, watches.budget, &launch)
 }
 
 /// Whether the command that ended as `end` reached an end of its own, an exit or a signal the box did not send, which
@@ -770,9 +776,10 @@ fn of_its_own(end: CommandEnd) -> bool {
 /// ([`back::back_commit`]): `status`, a pair run saying each repo's commit on one line ([`back_commits_line`]); a back
 /// commit that failed says, on a pair run, [`BACK_COMMITS_FAILED`], then `gate: remote sync-back failed: <why>`, and
 /// gives [`FAILED_STATUS`] for a command that exited 0, else `status`; a client gone gives the closed status. Once the
-/// back commits are pushed, a command that exited 0 with output globs has its outputs brought back ([`brought_back`]),
-/// which gives its status; a failed command or a failed sync-back packs nothing.
-fn synced_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, status: u8, budget: u64) -> u8 {
+/// back commits are pushed, a command that exited 0 with output globs has its cross build run, when the payload asks
+/// for one, as `launch` started the command ([`cross_built`]), then its outputs brought back ([`brought_back`]), which
+/// gives its status; a failed command, a failed sync-back or a cross build that did not pass packs nothing.
+fn synced_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, status: u8, budget: u64, launch: &Launch<'_>) -> u8 {
     let request = &ready.request;
     let commits = match back::back_commit(request, &ready.lock, ready.login_path.as_deref(), output) {
         Ok(commits) => commits,
@@ -797,10 +804,34 @@ fn synced_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>
     }
     match (&request.outputs, &ready.outputs) {
         (Some(asked), Some(read)) if status == 0 => {
+            if let Some(ended) = request.cross.as_ref().and_then(|cross| cross_built(launch, cross, output)) {
+                return ended;
+            }
             let main = commits.first().and_then(Option::as_deref);
             brought_back(ready, (asked, read), main, output, budget)
         }
         _ => status,
+    }
+}
+
+/// Runs the cross build `build` as `launch` started the command ([`command::run_cross`]): `None` once it passed, the
+/// line saying how long it took said; else the status the run ends on, its outputs not brought back: [`FAILED_STATUS`]
+/// after the line saying the cross build failed and [`outputs::not_brought_back`]'s, as any outputs failure ends, or
+/// the closed status for a client gone before or during it.
+fn cross_built<S: LineSink + 'static>(launch: &Launch<'_>, build: &CrossBuild, output: &Arc<Output<S>>) -> Option<u8> {
+    if output.client_gone() {
+        return Some(CLOSED_STATUS);
+    }
+    match command::run_cross(launch, &build.words, output) {
+        CrossEnd::Passed(took) => {
+            noted(output, GAT, &cross::passed_line(&build.rid, took.as_secs_f64()));
+            None
+        }
+        CrossEnd::Failed(status) => {
+            let not_brought = outputs::not_brought_back(cross::FAILED_REASON);
+            Some(said(output, &[&cross::failed_line(&build.rid, status), &not_brought], FAILED_STATUS))
+        }
+        CrossEnd::Gone => Some(CLOSED_STATUS),
     }
 }
 
@@ -835,6 +866,10 @@ fn brought_back<S: LineSink + 'static>(
         Ok(brought) => brought,
         Err(reason) => return said(output, &[&outputs::not_brought_back(&reason)], FAILED_STATUS),
     };
+    // A cross build that built a program the PC cannot run brings nothing back, as any outputs failure.
+    if let Some(refused) = &brought.refused {
+        return said(output, &[refused, &outputs::not_brought_back(cross::REFUSED_REASON)], FAILED_STATUS);
+    }
     if let Some(skipped) = &brought.skipped {
         noted(output, GAT, skipped);
     }

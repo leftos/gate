@@ -56,6 +56,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Critical drain**: a critical gate's wait for the gates that arrived before it to free their slots, while it holds back the gates that arrive after it.
 - **Critical gate**: a gate run with `--slot critical`, which takes every heavy slot and every light slot but the beside allowance and runs its command at High priority.
 - **Critical request**: a critical gate's queued ticket and run, from its arrival until it releases the machine; critical requests run one at a time in arrival order.
+- **Cross build**: the second command a macOS builder's run makes after a passing command, the payload's `CrossBuild` `Words` for a Windows runtime identifier (`Rid`), whose outputs it brings back at the PC paths a Windows build would use ([The Unix box](design.md#the-unix-box)).
 - **Cutover**: switching a machine's gates from the PowerShell gate to `gate.exe`; `gate cutover` runs the local one.
 - **Cutover flag**: the file `%LOCALAPPDATA%\gate\cutover.flag`, whose existence tells ops-tower's state to read `gate.exe`'s files; the launcher does not read it.
 - **Cutover sweep**: the change of every calling repo from the PowerShell launcher to the slim wrapper (`tools/gate.ps1`), after which the PowerShell gate is deleted.
@@ -165,6 +166,7 @@ Terms the gate's docs use in a project sense, in alphabetical order.
   A passing local dotnet `build`, `test` or `run` of one project adds that project's key (its folder relative to the worktree root, lower-cased) to `built`, unless the build moved its output.
 - **Open run**: a journal run that took its slot, has not released or abandoned it, did not run on its parent's slot, and whose gate is live by pid and process start; the history's `open` list holds every one, uncapped.
 - **Output cap**: the remote client's limit of 64 KiB on one line of a call's output (a `\r` resets the line, so git's progress counts per update), which kills a capped call that sends a longer one.
+- **Output path map**: the rule that lists a cross build's file under `bin/<a>/<b>/<rid>/...` at its path with the `<rid>` folder removed, so the output globs judge and the PC receives the path a native Windows build writes.
 - **Outputs archive**: the `<key>-<nonce>.tar.zst` a routed run's changed output files travel in, its last member `.gate-outputs.json` listing every path it brings back, in pack order, the files before it and the copies that have no member.
 - **Outputs cap record**: the file `remote\<key>.outputs-capped` in the state root, `{"v":1,"hits":<n>}`, counting a worktree's routed runs in a row whose outputs fetch passed the fetch cap; the first hit keeps the pass, a second in a row fails the run, and any other end of its outputs fetch but a Ctrl+C during it, or a box that packed nothing, removes it.
 - **Outputs manifest**: the Manifest of the PC's files under a routed run's output globs, as the Rust client builds it before the run call and writes it as one line on that call's stdin, for the box to read.

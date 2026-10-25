@@ -2905,7 +2905,7 @@ A routed run therefore moves to one long-lived connection carrying every verb, `
 
 The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`.
 
-A `run` payload also holds `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, `SentDigest`, `LfsDigest`, `GodotVersion` and `EngineEnv`. An `outputs` payload also holds `Name`.
+A `run` payload also holds `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, `SentDigest`, `LfsDigest`, `GodotVersion`, `EngineEnv` and `CrossBuild` (a macOS builder's key: an object of `Rid` and `Words`, with `Outputs`; [The Unix box](#the-unix-box)). An `outputs` payload also holds `Name`.
 
 `inflight` reads only `Root`.
 
@@ -3880,6 +3880,14 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   After those come the trim's lines; and last, on failure, `gate: remote outputs not brought back: <reason>`, which turns a passed run's 0 into 1. A failed command or a failed sync-back packs nothing.
 
   The not-brought-back reasons the Unix box adds are the bad manifest's own text, `diff-tree printed a path that is not UTF-8`, the lines of a failed `diff-tree` step in the Unix sync-back style, and the over-budget and gone-before-sent reasons. The `diff-tree` step (named `diff-tree <leaf>` on a pair run) runs through the run's killable git steps and is recorded in `<work>.pgid`, only when a back commit was pushed for a run with outputs.
+
+    A run can also carry `CrossBuild`, an object of `Rid` (a runtime identifier of letters, digits, `-` and `.`, not starting with `.`) and `Words` (the cross build's command, a non-empty list of non-empty texts), and only with `Outputs` globs. After a command that exited 0 and pushed its back commits, and before the outputs are walked, the box runs `Words` as a second command with the first's working folder, environment and `Timeout`, a fresh ceiling of its own; its output is forwarded as the command's, and `box stop` ends it as it ends the command. It says no start marker, kill tag or adjusted line of its own.
+
+  A cross build that exits 0 says `gate: the cross build for <rid> took <s> s` and the outputs are brought back. One that ends otherwise says `gate: the cross build for <rid> failed with exit <status>; the Windows outputs were not brought back`, then `gate: remote outputs not brought back: the cross build failed`, and the run ends 1. A client gone before or during it ends the run 255.
+
+  The outputs of a run with a cross build are listed at the output path map: a file under `bin/<a>/<b>/<rid>/...` is judged by the output globs, and brought back, at its path with the `<rid>` folder removed, which is the path a native Windows build writes it at; a folder is entered by the globs at its mapped path too. A native file at a mapped file's path is left out, the mapped one being the only file at it. Only the files to be sent are checked, by their first bytes (a file the PC holds unchanged is never opened). A file at its own path that opens as a Mach-O or ELF program, which the PC cannot run, is left out. A mapped file that opens as one was not built for Windows: nothing is brought back, and the run says `gate: the cross build for <rid> left a non-Windows file <path>; the Windows outputs were not brought back` (the PC path, control characters escaped), then `gate: remote outputs not brought back: the cross build left a non-Windows file`, and ends 1.
+
+  The Windows box refuses a `CrossBuild` payload with `gate: box payload CrossBuild is a macOS builder's key; this box cannot cross-build`. A malformed one, or one without `Outputs`, is a usage line on either box (`gate: box payload CrossBuild is not an object`, `lacks Rid`, `Rid is not a text`, `lacks Words`, `Words holds an empty word`, `needs Outputs`, among them). The PC's client does not send `CrossBuild` yet.
 
   A pair run brings back from its main tree only. `OutputsFull` with no globs is taken and does nothing. `--test-outputs-budget-bytes` reaches the run. Every other verb (`inflight`, `lfs`, `register-desktop`) says `gate: box <verb> is not built on this builder` and exits 2.
 

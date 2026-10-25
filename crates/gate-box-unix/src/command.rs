@@ -25,7 +25,7 @@ use gate_wire::{BoxKill, adjusted_line, escaped, killed_line, started_line};
 use crate::console::{Forwarding, GAT, LineSink, Output, Stamp, Stream};
 use crate::cpu::{GroupCpu, LoadTotals, host_cpu_load};
 use crate::files::{self, HeldLock};
-use crate::lines::{Along, CommandEnd, Godot, command_environment, round_trip, write_failure};
+use crate::lines::{Along, CommandEnd, Godot, command_environment, command_status, round_trip, write_failure};
 use crate::process::{EndedBy, Ending, Forward, GroupRecord, Halt, NotRan, Ran, Watch, is_still_there, run_watched};
 use crate::process_lines::ProcessLines;
 use crate::run::group_record;
@@ -414,6 +414,96 @@ fn run_with<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>,
         Err(error) => Err(NotRan::Start(error)),
     };
     ended(launch, &record, ran, &ceiling.verdict(), output)
+}
+
+/// How a run's cross build ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrossEnd {
+    /// It exited 0, after this long.
+    Passed(Duration),
+    /// It ended otherwise, with the status a command that ended so gives ([`command_status`]): the box's ceiling kill
+    /// [`crate::lines::KILLED_STATUS`], a `box stop`'s `SIGTERM` 143.
+    Failed(u8),
+    /// Its client is gone.
+    Gone,
+}
+
+/// Runs a passing command's cross build, `words`, as `launch` started the command: in its place, with its
+/// environment, its group written to `<work>.pgid` from the child so `box stop` ends it, its streams forwarded as the
+/// command's, ended `SIGTERM` first on a gone client; under a ceiling of its own of the payload's `Timeout`
+/// ([`Ceiling`]) and watched by the heartbeat while it runs. No start marker, interrupted-command record, kill tag or
+/// load-adjusted line is said or written for it: the run's are the command's.
+pub fn run_cross<S: LineSink + 'static>(launch: &Launch<'_>, words: &[String], output: &Arc<Output<S>>) -> CrossEnd {
+    let Some((program, rest)) = words.split_first() else {
+        return CrossEnd::Failed(command_status(CommandEnd::NotStarted));
+    };
+    let group = GroupRecord::new(PathBuf::from(group_record(launch.work)), launch.job, launch.lock);
+    let ceiling = Ceiling::new(launch.timeout, launch.sample, launch.sampler);
+    let started = |group: i32| {
+        let cpu: Arc<dyn CpuSource> = Arc::new(GroupCpu::new(group));
+        ceiling.begin(Arc::clone(&cpu));
+        if let Some(pump) = launch.pump {
+            pump.watch(cpu);
+        }
+    };
+    let leader_exited = || {
+        ceiling.close();
+        if let Some(pump) = launch.pump {
+            pump.unwatch();
+        }
+    };
+    let check = || ceiling.check();
+    let watch = Watch {
+        cap: 0,
+        deadline: None,
+        ending: Ending::TermThenKill(END_GRACE),
+        output: Some(Arc::clone(output) as Arc<dyn Forwarding>),
+        forward: Forward::Both(Stamp::Now(Tag::Out), Stamp::Now(Tag::Err)),
+        ends_on_gone: true,
+        record: Some(&group),
+        check: Some(&check),
+        on_started: Some(&started),
+        on_leader_exit: Some(&leader_exited),
+        processes: None,
+    };
+    let began = Instant::now();
+    let ran = run_watched(command_of(launch, program, rest), &watch);
+    let took = began.elapsed();
+    cross_end(program, ran, &ceiling.verdict(), took, output)
+}
+
+/// How the cross build of `program` that ran as `ran` in `took` ended, the ceiling's `verdict` on it: gone once the
+/// client is; else the line of its ceiling's sampler's failure said when there is one, then the line of a start that
+/// failed or of the box's own failure.
+fn cross_end<S: LineSink>(program: &str, ran: Result<Ran, NotRan>, verdict: &Verdict, took: Duration, output: &Output<S>) -> CrossEnd {
+    if output.client_gone() {
+        return CrossEnd::Gone;
+    }
+    let failed = verdict.failed.iter().map(|line| (GAT, line.clone()));
+    let end = match (verdict.kill, ran) {
+        (Some(kill), _) => {
+            said_together(output, &failed.collect::<Vec<_>>());
+            CommandEnd::Killed(tag_of(kill).0)
+        }
+        (None, Ok(ran)) => {
+            said_together(output, &failed.collect::<Vec<_>>());
+            end_of(&ran, false)
+        }
+        (None, Err(NotRan::Start(error))) => {
+            let line = format!("gate: remote could not start {}: {}", escaped(program), escaped(&error.to_string()));
+            said_together(output, &failed.chain([(GAT, line)]).collect::<Vec<_>>());
+            CommandEnd::NotStarted
+        }
+        (None, Err(not)) => {
+            said_together(output, &failed.chain([(GAT, failed_line(&unran(not)))]).collect::<Vec<_>>());
+            CommandEnd::Failed
+        }
+    };
+    match end {
+        CommandEnd::Gone => CrossEnd::Gone,
+        CommandEnd::Exited(0) => CrossEnd::Passed(took),
+        end => CrossEnd::Failed(command_status(end)),
+    }
 }
 
 /// The program the command's first word `word` starts for a run whose Godot is `godot`: for a Godot console word

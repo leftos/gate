@@ -972,6 +972,185 @@ mod unix {
             .collect()
     }
 
+    /// The keys of a run running `script` in `sh`, asking for the outputs `bin/**` and the TRX files below `bin`'s
+    /// `TestResults`, and for a cross build for `win-x64` running `cross` in `sh`.
+    fn cross_keys(script: &str, cross: &str) -> Value {
+        json!({
+            "Command": ["/bin/sh", "-c", script],
+            "Outputs": ["bin/**", "bin/*/*/TestResults/*.trx"],
+            "CrossBuild": { "Rid": "win-x64", "Words": ["/bin/sh", "-c", cross] },
+        })
+    }
+
+    /// The folder a cross build for `win-x64` of a `Debug` build of `net10.0` writes to, and its native build's.
+    const CROSS_FOLDER: &str = "bin/Debug/net10.0/win-x64";
+    const NATIVE_FOLDER: &str = "bin/Debug/net10.0";
+    /// A Mach-O 64-bit program's first bytes and more, as `printf` writes them.
+    const MACH_O: &str = r"\317\372\355\376rest";
+    /// A Windows program's first bytes, as `printf` writes them.
+    const PE: &str = r"MZ\220\000";
+
+    /// A cross build for `win-x64` that failed with `status`, as the box says it.
+    fn cross_failed_line(status: u8) -> String {
+        format!("gate: the cross build for win-x64 failed with exit {status}; the Windows outputs were not brought back")
+    }
+
+    /// The reasons a cross build's outputs are not brought back: it failed, or it left a program the PC cannot run.
+    const CROSS_FAILED: &str = "the cross build failed";
+    const CROSS_REFUSED: &str = "the cross build left a non-Windows file";
+
+    /// `ended` said `line` and, right after it, that the outputs were not brought back for `reason`, and said no
+    /// `gate-remote-outputs:` line.
+    fn assert_said_then_not_brought_back(ended: &Ended, line: &str, reason: &str) {
+        let texts = ended.err_texts();
+        let not_brought = format!("gate: remote outputs not brought back: {reason}");
+        assert!(
+            texts.windows(2).any(|pair| pair[0] == line && pair[1] == not_brought),
+            "{line} then {not_brought}: {:?}",
+            ended.err
+        );
+        assert!(outputs_said(ended).is_empty(), "{:?}", ended.err);
+    }
+
+    #[test]
+    fn cross_build_outputs_come_back_at_their_pc_paths_with_the_trx_and_a_native_program_stays_behind() {
+        let case = Case::new("cross-built");
+        let commit = case.snapshot_holding(&[(".gitignore", "bin/\n")]);
+        let script = format!(
+            "mkdir -p {NATIVE_FOLDER}/TestResults && echo '<TestRun/>' > {NATIVE_FOLDER}/TestResults/t.trx \
+             && printf '{MACH_O}' > {NATIVE_FOLDER}/A && echo native > {NATIVE_FOLDER}/A.dll"
+        );
+        let cross = format!("mkdir -p {CROSS_FOLDER} && printf '{PE}' > {CROSS_FOLDER}/A.exe && printf '{PE}' > {CROSS_FOLDER}/A.dll");
+        let request = case.outputs_request(&commit, &cross_keys(&script, &cross), &Manifest::default());
+
+        let ended = ran(&[], &request, Reading::All, &case.base.join("beaten"));
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert!(
+            ended
+                .err_texts()
+                .iter()
+                .any(|line| line.starts_with("gate: the cross build for win-x64 took ") && line.ends_with(" s")),
+            "{:?}",
+            ended.err
+        );
+        let archive = fs::read(case.archive()).expect("the archive is read");
+        assert_eq!(
+            members_of(&archive),
+            [
+                format!("{NATIVE_FOLDER}/A.dll"),
+                format!("{NATIVE_FOLDER}/A.exe"),
+                format!("{NATIVE_FOLDER}/TestResults/t.trx")
+            ],
+            "the cross build's files at their PC paths, one A.dll, and no Mach-O: {:?}",
+            ended.err
+        );
+        assert_eq!(outputs_said(&ended), [packed_line(3)], "{:?}", ended.err);
+        assert!(
+            Path::new(&format!("{}/{NATIVE_FOLDER}/A", case.work())).exists(),
+            "the native program stays on the builder"
+        );
+        case.ended_clean();
+    }
+
+    #[test]
+    fn cross_build_that_fails_says_so_and_fails_the_outputs_bringing_nothing_back() {
+        let case = Case::new("cross-failed");
+        let commit = case.snapshot_holding(&[(".gitignore", "bin/\n")]);
+        let script = format!("mkdir -p {NATIVE_FOLDER} && echo native > {NATIVE_FOLDER}/A.dll");
+        let request = case.outputs_request(&commit, &cross_keys(&script, "echo cross said; exit 3"), &Manifest::default());
+
+        let ended = ran(&[], &request, Reading::All, &case.base.join("beaten"));
+
+        assert_eq!(ended.status, Some(1), "{:?}", ended.err);
+        assert_said_then_not_brought_back(&ended, &cross_failed_line(3), CROSS_FAILED);
+        assert!(texts(&ended.out).contains(&"cross said"), "its output is forwarded: {:?}", ended.out);
+        assert!(outputs_said(&ended).is_empty(), "{:?}", ended.err);
+        assert!(!case.archive().exists(), "nothing is packed");
+        case.ended_clean();
+    }
+
+    #[test]
+    fn cross_build_that_leaves_a_mach_o_among_its_outputs_brings_nothing_back() {
+        let case = Case::new("cross-mach-o");
+        let commit = case.snapshot_holding(&[(".gitignore", "bin/\n")]);
+        let cross = format!("mkdir -p {CROSS_FOLDER} && printf '{PE}' > {CROSS_FOLDER}/A.exe && printf '{MACH_O}' > {CROSS_FOLDER}/A");
+        let request = case.outputs_request(&commit, &cross_keys("true", &cross), &Manifest::default());
+
+        let ended = ran(&[], &request, Reading::All, &case.base.join("beaten"));
+
+        assert_eq!(ended.status, Some(1), "{:?}", ended.err);
+        let refused =
+            format!("gate: the cross build for win-x64 left a non-Windows file {NATIVE_FOLDER}/A; the Windows outputs were not brought back");
+        assert_said_then_not_brought_back(&ended, &refused, CROSS_REFUSED);
+        assert!(outputs_said(&ended).is_empty(), "{:?}", ended.err);
+        assert!(!case.archive().exists(), "nothing is packed");
+        case.ended_clean();
+    }
+
+    #[test]
+    fn cross_build_does_not_run_after_a_failing_command() {
+        let case = Case::new("cross-unrun");
+        let commit = case.snapshot_holding(&[(".gitignore", "bin/\n")]);
+        let marker = case.base.join("cross-ran");
+        let cross = format!(": > '{}'", marker.display());
+        let request = case.outputs_request(&commit, &cross_keys("exit 4", &cross), &Manifest::default());
+
+        let ended = ran(&[], &request, Reading::All, &case.base.join("beaten"));
+
+        assert_eq!(ended.status, Some(4), "{:?}", ended.err);
+        assert!(!marker.exists(), "no cross build ran");
+        assert!(
+            !ended.err_texts().iter().any(|line| line.starts_with("gate: the cross build")),
+            "{:?}",
+            ended.err
+        );
+        case.ended_clean();
+    }
+
+    #[test]
+    fn cross_build_is_ended_by_a_stop_and_brings_nothing_back() {
+        let case = Case::new("cross-stopped");
+        let commit = case.snapshot_holding(&[(".gitignore", "bin/\n")]);
+        let marker = case.base.join("cross-started");
+        let cross = format!(": > '{}'; sleep 600", marker.display());
+        let keys = cross_keys("true", &cross);
+        let request = case.outputs_request(&commit, &keys, &Manifest::default());
+        let beaten = case.base.join("beaten");
+        let run = thread::spawn(move || ran(&[], &request, Reading::All, &beaten));
+        // A hang guard only: the wait is on the cross build's own marker.
+        let guard = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !marker.exists() && !run.is_finished() && std::time::Instant::now() < guard {
+            thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(marker.exists(), "the cross build started");
+        assert!(
+            Path::new(&format!("{}.pgid", case.work())).exists(),
+            "the cross build's group is recorded"
+        );
+
+        let mut stop = Command::new(env!("CARGO_BIN_EXE_gate-box"))
+            .args(["box", "stop", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("gate-box starts");
+        let mut stdin = stop.stdin.take().expect("stdin is piped");
+        stdin
+            .write_all(format!("{}\n", case.request(&commit, &keys)).as_bytes())
+            .expect("the request is written");
+        drop(stdin);
+        let stopped = stop.wait_with_output().expect("the stop is waited for");
+        let ended = run.join().expect("the run's reader ends");
+
+        assert_eq!(stopped.status.code(), Some(0), "{}", String::from_utf8_lossy(&stopped.stderr));
+        assert_eq!(ended.status, Some(1), "{:?}", ended.err);
+        assert_said_then_not_brought_back(&ended, &cross_failed_line(143), CROSS_FAILED);
+        assert!(outputs_said(&ended).is_empty(), "{:?}", ended.err);
+        case.ended_clean();
+    }
+
     #[test]
     fn a_run_with_yaat_s_trx_glob_packs_the_trx_and_box_outputs_sends_it_then_removes_it() {
         let case = Case::new("outputs-trx");

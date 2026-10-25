@@ -34,6 +34,7 @@ use gate_wire::{Payload, archive_file_name, archive_key, escaped};
 
 use crate::beneath::{self, Folder};
 use crate::console::Console;
+use crate::cross::{self, Portable};
 use crate::lines::{FAILED_STATUS, USAGE_STATUS};
 use crate::request::{Unread, bounded_line};
 
@@ -57,6 +58,9 @@ const NANOS: i128 = 1_000_000_000;
 pub struct Asked<'a> {
     globs: Globs,
     full: bool,
+    /// The runtime identifier of the run's cross build, whose outputs the walk lists at their PC paths
+    /// ([`cross::crossed`]); `None` for a run without one.
+    rid: Option<String>,
     /// The name of the run's own outputs archive in its output folder.
     pub archive: String,
     /// The output folder the archive is written in, `<root>/outputs`.
@@ -77,9 +81,25 @@ impl<'a> Asked<'a> {
         Ok(Some(Asked {
             globs,
             full,
+            rid: None,
             archive: archive_file_name(key, nonce),
             folder,
         }))
+    }
+
+    /// These outputs, brought back from a run whose cross build is for `rid`, `None` for a run without one.
+    #[must_use]
+    pub fn crossed_for(self, rid: Option<&str>) -> Asked<'a> {
+        Asked {
+            rid: rid.map(str::to_owned),
+            ..self
+        }
+    }
+
+    /// The files `found`, listed at their PC paths, less each native file a cross build's file replaces
+    /// ([`cross::crossed`]); all of them for a run without a cross build.
+    fn deduped(&self, found: Vec<Found>) -> Vec<Found> {
+        if self.rid.is_some() { cross::crossed(found) } else { found }
     }
 }
 
@@ -483,9 +503,9 @@ pub fn listing(asked: &Asked<'_>, work: &Path) -> (Option<Listing>, Option<Strin
     }
     let walked = tree_folder(asked, work)
         .map_err(|error| in_context(work, &error))
-        .and_then(|top| walk(&top, work, &asked.globs, false));
+        .and_then(|top| walk(&top, work, asked, false));
     match walked {
-        Ok(walked) => (Some(Listing::of(&walked.found)), None),
+        Ok(walked) => (Some(Listing::of(&asked.deduped(walked.found))), None),
         Err(error) => (
             Some(Listing::default()),
             Some(format!(
@@ -510,23 +530,27 @@ struct Walker<'w> {
     top: &'w Folder,
     top_path: &'w Path,
     globs: &'w Globs,
+    /// The runtime identifier of the run's cross build, whose files are listed and matched at their PC paths.
+    rid: Option<&'w str>,
     noting: bool,
     walked: Walked,
     folders: Vec<Queued>,
 }
 
-/// Every plain file below the folder `top`, at `top_path`, that `globs` match, and, when `noting`, beside them the files
-/// `globs` refuse for their names ([`Globs::refuses_name`]), a name that is not Unicode included, named lossily; each
-/// ordered by relative path. Each folder is opened beneath the top one name at a time, a link never followed; a link,
+/// Every plain file below the folder `top`, at `top_path`, that `asked`'s globs match, and, when `noting`, beside them the
+/// files the globs refuse for their names ([`Globs::refuses_name`]), a name that is not Unicode included, named lossily;
+/// each at its PC path, a cross build's file mapped ([`cross::mapped_path`]) before the globs judge it, and ordered by
+/// that path. Each folder is opened beneath the top one name at a time, a link never followed; a link,
 /// a FIFO, a socket or a device is neither followed nor listed. A folder whose name is not plain or not Unicode is
 /// read, when `noting`, only to count the files below it ([`Globs::counts_below`]), which are only ever refused. Else
 /// the first folder that cannot be read, or entry that cannot be looked at, its path in the error; a name gone before
 /// its look is passed over.
-fn walk(top: &Folder, top_path: &Path, globs: &Globs, noting: bool) -> io::Result<Walked> {
+fn walk(top: &Folder, top_path: &Path, asked: &Asked<'_>, noting: bool) -> io::Result<Walked> {
     let mut walker = Walker {
         top,
         top_path,
-        globs,
+        globs: &asked.globs,
+        rid: asked.rid.as_deref(),
         noting,
         walked: Walked::default(),
         folders: vec![Queued {
@@ -576,24 +600,28 @@ impl Walker<'_> {
         let unfit = queued.counting || name.to_str().is_none();
         if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
             self.queue_folder(queued, name, path, unfit);
-        } else if is_plain(&stat)
-            && let Some(list) = self.walked.list_for(self.globs, &path, unfit)
-        {
-            list.push(Found {
-                path,
-                full: file,
-                stamp: stamp_of(&stat),
-            });
+        } else if is_plain(&stat) {
+            let path = self.rid.and_then(|rid| cross::mapped_path(&path, rid)).unwrap_or(path);
+            if let Some(list) = self.walked.list_for(self.globs, &path, unfit) {
+                list.push(Found {
+                    path,
+                    full: file,
+                    stamp: stamp_of(&stat),
+                });
+            }
         }
         Ok(())
     }
 
-    /// Queues the folder `name` of `parent`, at the relative `path`, to enter when the globs enter it and it is not
-    /// `unfit`, else to count below when the walk notes refused files and the globs count below it.
+    /// Queues the folder `name` of `parent`, at the relative `path`, to enter when the globs enter it, judged at its PC
+    /// path ([`cross::mapped_folder`]), and it is not `unfit`, else to count below when the walk notes refused files
+    /// and the globs count below it.
     fn queue_folder(&mut self, parent: &Queued, name: OsString, path: String, unfit: bool) {
-        let counting = if !unfit && self.globs.enters(&path) {
+        let pc = self.rid.and_then(|rid| cross::mapped_folder(&path, rid));
+        let judged = pc.as_deref().unwrap_or(&path);
+        let counting = if !unfit && self.globs.enters(judged) {
             false
-        } else if self.noting && self.globs.counts_below(&path) {
+        } else if self.noting && self.globs.counts_below(judged) {
             true
         } else {
             return;
@@ -678,6 +706,9 @@ pub struct Brought {
     pub skipped: Option<String>,
     /// `gate-remote-outputs: <n> <archive>`, or [`NOTHING_PACKED`].
     pub line: String,
+    /// The line refusing a cross build's outputs for a program the PC cannot run among them ([`cross::refused_line`]),
+    /// `None` when they were not refused. Refused, nothing was packed, and neither `skipped` nor `line` is said.
+    pub refused: Option<String>,
     /// The archive written, held under its shared `flock`; `None` when nothing was packed.
     archive: Option<File>,
 }
@@ -713,17 +744,33 @@ pub fn bring_back(
     let manifest = manifest.as_ref().map_err(Clone::clone)?;
     let walked = tree_folder(asked, work)
         .map_err(|error| in_context(work, &error))
-        .and_then(|top| walk(&top, work, &asked.globs, true).map(|walked| (walked, top)));
+        .and_then(|top| walk(&top, work, asked, true).map(|walked| (walked, top)));
     let (walked, top) = walked.map_err(|error| format!("the outputs could not be listed: {error}"))?;
     let tree = Tree::new(&top, work);
+    let found = asked.deduped(walked.found);
     let hash = |file: &Found| tree.sha256(file);
     let refused = select(&walked.refused, manifest, listing, skip, hash).map_err(|error| error.to_string())?;
     let skipped = skipped_line(&refused.iter().map(|chosen| chosen.file).collect::<Vec<_>>());
-    let mut chosen = select(&walked.found, manifest, listing, skip, hash).map_err(|error| error.to_string())?;
+    let chosen = select(&found, manifest, listing, skip, hash).map_err(|error| error.to_string())?;
+    let mut chosen = match &asked.rid {
+        None => chosen,
+        Some(rid) => match portable_chosen(&tree, chosen)? {
+            Portable::Kept(kept) => kept,
+            Portable::Refused(path) => {
+                return Ok(Brought {
+                    skipped: None,
+                    line: NOTHING_PACKED.to_owned(),
+                    refused: Some(cross::refused_line(rid, &path)),
+                    archive: None,
+                });
+            }
+        },
+    };
     if chosen.is_empty() {
         return Ok(Brought {
             skipped,
             line: NOTHING_PACKED.to_owned(),
+            refused: None,
             archive: None,
         });
     }
@@ -741,6 +788,7 @@ pub fn bring_back(
         Ok(packed) => Ok(Brought {
             skipped,
             line: format!("gate-remote-outputs: {} {}", packed.entries.len(), asked.archive),
+            refused: None,
             archive: Some(file),
         }),
         Err(error) => match folder.remove_child(name, false) {
@@ -748,6 +796,19 @@ pub fn bring_back(
             Err(removal) => Err(format!("{error}; and {} could not be removed: {removal}", path.display())),
         },
     }
+}
+
+/// The files of `chosen`, found below `tree` and picked to send, that a run with a cross build sends
+/// ([`cross::portable`]), each's first [`cross::HEAD_BYTES`] bytes read as [`Tree::open`] opens it; else why not.
+fn portable_chosen<'f>(tree: &Tree<'_>, chosen: Vec<Chosen<'f>>) -> Result<Portable<'f>, String> {
+    let head = |file: &Found| {
+        let mut head = Vec::new();
+        tree.open(file)
+            .and_then(|opened| opened.take(cross::HEAD_BYTES).read_to_end(&mut head))
+            .map(|_| head)
+            .map_err(|error| in_context(&file.full, &error))
+    };
+    cross::portable(chosen, head).map_err(|error| format!("the outputs could not be read: {error}"))
 }
 
 /// Packs `files`, found below `tree`, into `sink` as a `.tar.zst` stream, in their order, over a zstd window sized to
@@ -1567,6 +1628,43 @@ pub(crate) mod tests {
         );
         assert_eq!(mode_of(&case.outputs()), 0o700, "the output folder is made the box user's own");
         assert_eq!(mode_of(&case.outputs().join(archive('1'))), 0o600);
+    }
+
+    #[test]
+    fn a_cross_build_s_file_matches_a_glob_on_its_pc_path() {
+        let case = Case::new("cross-glob");
+        case.write("tests/T/bin/Debug/net10.0/win-x64/T.dll", b"MZ\x90\x00dll");
+        case.write("tests/T/bin/Debug/net10.0/T.dll", b"native");
+        let asked = case.asked(&["tests/*/bin/*/*/*.dll"], true, '1').crossed_for(Some("win-x64"));
+
+        let brought = bring(&asked, &Ok(manifest_of(&[])), None, &case.work(), &[]);
+
+        assert_eq!(brought, Ok((None, packed_line(1, '1'))));
+        let (members, _) = read_back(&case, &archive('1'), &Manifest::default(), &[]);
+        assert_eq!(members, [("tests/T/bin/Debug/net10.0/T.dll".to_owned(), b"MZ\x90\x00dll".to_vec())]);
+    }
+
+    #[test]
+    fn a_cross_build_never_opens_a_file_it_does_not_send() {
+        let case = Case::new("cross-unsent");
+        let native = "bin/Debug/net10.0/A";
+        let mach_o = [0xCF, 0xFA, 0xED, 0xFE, 0, 0, 0, 0];
+        case.write(native, &mach_o);
+        fs::set_permissions(case.work().join(native), fs::Permissions::from_mode(0o000)).expect("the file is made unreadable");
+        let asked = case.asked(&["bin/**"], false, '1').crossed_for(Some("win-x64"));
+        let (before, line) = listing(&asked, &case.work());
+        assert!(line.is_none(), "{line:?}");
+        case.write("bin/Debug/net10.0/win-x64/A.exe", b"MZ\x90\x00");
+
+        let brought = bring(&asked, &Ok(manifest_of(&[(native, &mach_o)])), before.as_ref(), &case.work(), &[]);
+
+        assert_eq!(
+            brought,
+            Ok((None, packed_line(1, '1'))),
+            "the unreadable file the PC holds unchanged is never read"
+        );
+        let (members, _) = read_back(&case, &archive('1'), &Manifest::default(), &[]);
+        assert_eq!(members, [("bin/Debug/net10.0/A.exe".to_owned(), b"MZ\x90\x00".to_vec())]);
     }
 
     #[test]

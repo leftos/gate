@@ -9,6 +9,7 @@
 pub mod cli;
 pub mod console;
 pub mod cpu;
+pub mod cross;
 pub mod forward;
 pub mod heartbeat;
 pub mod lines;

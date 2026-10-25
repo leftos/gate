@@ -168,6 +168,16 @@ pub fn engine_env_name_refused(name: &str) -> bool {
     !well_formed || git || env_refusal(name, "").is_some()
 }
 
+/// A macOS builder's cross build, the payload's `CrossBuild`: a second build the box runs after a passing command, whose
+/// outputs for `rid` it brings back at the paths a native Windows build writes them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrossBuild {
+    /// The runtime identifier the cross build writes its outputs for, the folder the box's output path map takes out.
+    pub rid: String,
+    /// The cross build's words, its program first.
+    pub words: Vec<String>,
+}
+
 impl Payload {
     /// Decodes the payload word, its paths to be read under `form`; else the usage line saying why it cannot be read.
     pub fn decode(word: &str, form: PathForm) -> Result<Payload, String> {
@@ -286,6 +296,55 @@ impl Payload {
             Some(Value::Bool(full)) => Ok(*full),
             Some(_) => Err("gate: box payload OutputsFull is not true or false".to_owned()),
         }
+    }
+
+    /// The run's cross build, `CrossBuild`: an object whose `Rid` is a non-empty text of ASCII letters, digits, `-` and
+    /// `.`, not starting with `.`, and whose `Words` are a non-empty list of non-empty texts, its program first, in a
+    /// payload that asks for `Outputs` globs; `None` when the key is absent or null. Else the usage line, a `Rid` shown
+    /// with its control characters escaped.
+    pub fn cross_build(&self) -> Result<Option<CrossBuild>, String> {
+        let object = match self.object.get("CrossBuild") {
+            None | Some(Value::Null) => return Ok(None),
+            Some(Value::Object(object)) => object,
+            Some(_) => return Err("gate: box payload CrossBuild is not an object".to_owned()),
+        };
+        let rid = match object.get("Rid") {
+            None | Some(Value::Null) => return Err("gate: box payload CrossBuild lacks Rid".to_owned()),
+            Some(Value::String(rid)) if rid.is_empty() => return Err("gate: box payload CrossBuild lacks Rid".to_owned()),
+            Some(Value::String(rid)) => rid,
+            Some(_) => return Err("gate: box payload CrossBuild Rid is not a text".to_owned()),
+        };
+        if !rid.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.') {
+            return Err(format!(
+                "gate: box payload CrossBuild Rid '{}' holds a character other than a letter, a digit, '-' or '.'",
+                escaped(rid)
+            ));
+        }
+        // `.`, `..` or a hidden name would map a folder that is no runtime identifier's.
+        if rid.starts_with('.') {
+            return Err(format!("gate: box payload CrossBuild Rid '{rid}' is not a runtime identifier"));
+        }
+        let not_words = || "gate: box payload CrossBuild Words is not a list of texts".to_owned();
+        let list = match object.get("Words") {
+            None | Some(Value::Null) => return Err("gate: box payload CrossBuild lacks Words".to_owned()),
+            Some(value) => value.as_array().ok_or_else(not_words)?,
+        };
+        if list.is_empty() {
+            return Err("gate: box payload CrossBuild lacks Words".to_owned());
+        }
+        let words = list
+            .iter()
+            .map(|word| match word.as_str() {
+                None => Err(not_words()),
+                Some("") => Err("gate: box payload CrossBuild Words holds an empty word".to_owned()),
+                Some(word) => Ok(word.to_owned()),
+            })
+            .collect::<Result<Vec<String>, String>>()?;
+        // A cross build exists only to feed the outputs brought back: one without them is a payload built wrong.
+        if self.output_globs()?.is_empty() {
+            return Err("gate: box payload CrossBuild needs Outputs".to_owned());
+        }
+        Ok(Some(CrossBuild { rid: rid.clone(), words }))
     }
 
     /// The run's outputs `Nonce`: 32 lower-case hex digits, as the client draws it; else the usage line, the value
@@ -1220,7 +1279,7 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use serde_json::json;
 
-    use super::{PathForm, Payload, escaped, first_version, version_of, version_text, work_root};
+    use super::{CrossBuild, PathForm, Payload, escaped, first_version, version_of, version_text, work_root};
 
     #[expect(clippy::expect_used, reason = "a payload a case cannot build must fail the case loudly")]
     mod run_lines {
@@ -1924,6 +1983,97 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// The cross build of the payload `json`, given `Outputs` globs when it names none.
+    fn cross_build(json: &serde_json::Value) -> Result<Option<CrossBuild>, String> {
+        let mut json = json.clone();
+        if json.get("Outputs").is_none() {
+            json["Outputs"] = json!(["**/bin/**"]);
+        }
+        decoded(&json.to_string()).and_then(|payload| payload.cross_build())
+    }
+
+    #[test]
+    fn a_cross_build_without_output_globs_is_refused() {
+        let asking = |outputs: serde_json::Value| {
+            cross_build(&json!({ "Outputs": outputs, "CrossBuild": { "Rid": "win-x64", "Words": ["dotnet", "build"] } }))
+        };
+        let needs = Err("gate: box payload CrossBuild needs Outputs".to_owned());
+        assert_eq!(asking(json!(null)), needs, "null");
+        assert_eq!(asking(json!([])), needs, "an empty list");
+        assert_eq!(
+            decoded(&json!({ "CrossBuild": { "Rid": "win-x64", "Words": ["make"] } }).to_string()).and_then(|payload| payload.cross_build()),
+            needs,
+            "absent"
+        );
+        assert_eq!(cross_build(&json!({ "Outputs": [] })), Ok(None), "no cross build needs none");
+    }
+
+    #[test]
+    fn a_cross_build_is_none_when_absent_and_its_rid_and_words_when_given() {
+        assert_eq!(cross_build(&json!({})), Ok(None), "absent");
+        assert_eq!(cross_build(&json!({ "CrossBuild": null })), Ok(None), "null");
+        assert_eq!(
+            cross_build(&json!({ "CrossBuild": { "Rid": "win-x64", "Words": ["dotnet", "build", "-r", "win-x64"] } })),
+            Ok(Some(CrossBuild {
+                rid: "win-x64".to_owned(),
+                words: ["dotnet", "build", "-r", "win-x64"].map(str::to_owned).to_vec(),
+            }))
+        );
+        assert_eq!(
+            cross_build(&json!({ "CrossBuild": { "Rid": "osx.13-arm64", "Words": ["make"] } })).map(|cross| cross.map(|cross| cross.rid)),
+            Ok(Some("osx.13-arm64".to_owned())),
+            "letters, digits, '-' and '.'"
+        );
+    }
+
+    #[test]
+    fn a_malformed_cross_build_is_refused_with_its_usage_line() {
+        let refused = |value: serde_json::Value, line: &str| {
+            assert_eq!(cross_build(&json!({ "CrossBuild": value })), Err(line.to_owned()), "{value}");
+        };
+        let words = json!(["dotnet", "build"]);
+        for value in [json!("win-x64"), json!(["win-x64"]), json!(1), json!(true)] {
+            refused(value, "gate: box payload CrossBuild is not an object");
+        }
+        refused(json!({ "Words": words }), "gate: box payload CrossBuild lacks Rid");
+        refused(json!({ "Rid": null, "Words": words }), "gate: box payload CrossBuild lacks Rid");
+        refused(json!({ "Rid": "", "Words": words }), "gate: box payload CrossBuild lacks Rid");
+        refused(json!({ "Rid": 64, "Words": words }), "gate: box payload CrossBuild Rid is not a text");
+        refused(
+            json!({ "Rid": "win x64", "Words": words }),
+            "gate: box payload CrossBuild Rid 'win x64' holds a character other than a letter, a digit, '-' or '.'",
+        );
+        refused(
+            json!({ "Rid": "../win", "Words": words }),
+            "gate: box payload CrossBuild Rid '../win' holds a character other than a letter, a digit, '-' or '.'",
+        );
+        refused(
+            json!({ "Rid": "win\u{1b}", "Words": words }),
+            r"gate: box payload CrossBuild Rid 'win\u{1b}' holds a character other than a letter, a digit, '-' or '.'",
+        );
+        for rid in [".", "..", ".win-x64"] {
+            refused(
+                json!({ "Rid": rid, "Words": words }),
+                &format!("gate: box payload CrossBuild Rid '{rid}' is not a runtime identifier"),
+            );
+        }
+        refused(json!({ "Rid": "win-x64" }), "gate: box payload CrossBuild lacks Words");
+        refused(json!({ "Rid": "win-x64", "Words": null }), "gate: box payload CrossBuild lacks Words");
+        refused(json!({ "Rid": "win-x64", "Words": [] }), "gate: box payload CrossBuild lacks Words");
+        refused(
+            json!({ "Rid": "win-x64", "Words": "dotnet build" }),
+            "gate: box payload CrossBuild Words is not a list of texts",
+        );
+        refused(
+            json!({ "Rid": "win-x64", "Words": ["dotnet", 1] }),
+            "gate: box payload CrossBuild Words is not a list of texts",
+        );
+        refused(
+            json!({ "Rid": "win-x64", "Words": ["dotnet", ""] }),
+            "gate: box payload CrossBuild Words holds an empty word",
+        );
     }
 
     const NONCE: &str = "0123456789abcdef0123456789abcdef";

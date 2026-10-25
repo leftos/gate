@@ -204,6 +204,10 @@ impl Request<'_> {
         let snapshot = payload.snapshot()?;
         let (key, work) = payload.work_folder()?;
         let (globs, full) = (payload.output_globs()?, payload.outputs_full()?);
+        // Only a macOS builder cross-builds: a run asking for one is refused rather than run without it.
+        if payload.cross_build()?.is_some() {
+            return Err("gate: box payload CrossBuild is a macOS builder's key; this box cannot cross-build".to_owned());
+        }
         let nonce = payload.nonce()?;
         let outputs = Asked::new(&globs, full, key, nonce, payload.output_folder(work)?)?;
         let (timeout, host) = (payload.timeout()?, payload.optional_text("Host")?);
@@ -4072,6 +4076,30 @@ mod tests {
             Request::read(&run_payload(&not_asking)).err(),
             None,
             "a warm-up of the box's own session is read"
+        );
+    }
+
+    #[test]
+    fn a_cross_build_is_refused_and_a_malformed_one_with_its_usage_line() {
+        let cross = run_payload(&json!({ "Outputs": ["**/bin/**"], "CrossBuild": { "Rid": "win-x64", "Words": ["dotnet", "build"] } }));
+        assert_eq!(
+            Request::read(&cross).err(),
+            Some("gate: box payload CrossBuild is a macOS builder's key; this box cannot cross-build".to_owned())
+        );
+        let unasked = run_payload(&json!({ "CrossBuild": { "Rid": "win-x64", "Words": ["dotnet", "build"] } }));
+        assert_eq!(
+            Request::read(&unasked).err(),
+            Some("gate: box payload CrossBuild needs Outputs".to_owned())
+        );
+        let malformed = run_payload(&json!({ "CrossBuild": "win-x64" }));
+        assert_eq!(
+            Request::read(&malformed).err(),
+            Some("gate: box payload CrossBuild is not an object".to_owned())
+        );
+        assert_eq!(
+            Request::read(&run_payload(&json!({ "CrossBuild": null }))).err(),
+            None,
+            "a null CrossBuild asks for none"
         );
     }
 
