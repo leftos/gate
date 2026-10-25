@@ -116,6 +116,10 @@ pub struct FakeFacts {
     pub builder_root: Option<String>,
     /// The box trees and PC roots given as they stand, in place of the layout under [`FakeFacts::builder_root`].
     pub given_trees: Option<Vec<(String, String)>>,
+    /// Whether a `dotnet test`'s test projects are Windows-only.
+    pub windows_only: bool,
+    /// How many times that was asked, kept apart from [`FakeFacts::asked`].
+    pub windows_only_asked: Cell<u32>,
 }
 
 impl FakeFacts {
@@ -152,6 +156,8 @@ impl FakeFacts {
             ids: Vec::new(),
             builder_root: None,
             given_trees: None,
+            windows_only: false,
+            windows_only_asked: Cell::new(0),
         }
     }
 
@@ -206,6 +212,12 @@ impl Facts for FakeFacts {
     fn moves_build_output(&self, _place: &Place, _folder: &str, _file: Option<&str>) -> bool {
         self.ask("moves_build_output".to_owned());
         false
+    }
+
+    /// What [`FakeFacts::windows_only`] says.
+    fn windows_only_tests(&self, _place: &Place, _words: &[String]) -> bool {
+        self.windows_only_asked.set(self.windows_only_asked.get() + 1);
+        self.windows_only
     }
 
     /// The box's layout under [`FakeFacts::builder_root`]: the work folder `{root}\work\{key}` itself with no sibling,

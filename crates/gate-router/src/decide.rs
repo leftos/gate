@@ -58,6 +58,8 @@ const TARGET_SWITCH_NAMES: [&str; 2] = ["target", "t"];
 const NO_BUILD_DROP_VERBS: [&str; 2] = ["test", "run"];
 /// The dotnet verb that hands its words to `MSBuild` as they are: a target such as `-t:Restore` may build nothing.
 const MSBUILD: &str = "msbuild";
+/// The dotnet verb that runs tests.
+const TEST_VERB: &str = "test";
 /// The option that names the project a dotnet command builds.
 const PROJECT_OPTION: &str = "--project";
 /// The file extensions of a project file, compared ignoring letter case.
@@ -226,6 +228,13 @@ pub trait Facts {
     /// [`OUTPUT_PROPERTIES`]; `true` too when such a file is there and cannot be read. Asked only of a routed
     /// `dotnet test --no-build` that could keep its `--no-build` by a send ([`send_bin`]).
     fn moves_build_output(&self, place: &Place, folder: &str, file: Option<&str>) -> bool;
+
+    /// Whether a test project the `dotnet test` command `words` would run is Windows-only, read from its project files:
+    /// the project or solution the words name, else their folder argument, else the gate's folder at `place`, each read
+    /// against the gate's folder; a solution by each member that is a test project. `true` too when that cannot be
+    /// read. Asked only of a macOS pick of a `dotnet test` whose own words name no response file, which a `true`
+    /// sends on to the next builder that is no macOS one.
+    fn windows_only_tests(&self, place: &Place, words: &[String]) -> bool;
 
     /// Whether a file of exactly this name is in the gate's folder.
     fn file_in_folder(&self, name: &str) -> bool;
@@ -1011,13 +1020,45 @@ fn dotnet_start(words: &[String]) -> Option<usize> {
 /// to the program the command runs; `None` for a command that is no dotnet command, and for one whose own words name
 /// a response file (a word starting with `@`), whose words the gate cannot see: no rule reads such a command.
 fn dotnet_own(words: &[String]) -> Option<Range<usize>> {
+    let own = dotnet_words(words)?;
+    let opaque = words[own.clone()].iter().any(|word| word.starts_with(RESPONSE_FILE));
+    (!opaque).then_some(own)
+}
+
+/// A dotnet command's own words as [`dotnet_own`] finds them, a response file among them or not.
+fn dotnet_words(words: &[String]) -> Option<Range<usize>> {
     let start = dotnet_start(words)?;
     let end = words[start + 1..]
         .iter()
         .position(|word| word == SEPARATOR)
         .map_or(words.len(), |at| start + 1 + at);
-    let opaque = words[start..end].iter().any(|word| word.starts_with(RESPONSE_FILE));
-    (!opaque).then_some(start..end)
+    Some(start..end)
+}
+
+/// What a `dotnet test` command is, for a macOS pick ([`steer_off_macos`]).
+enum DotnetTest {
+    /// No dotnet command, or one whose verb is not `test`.
+    No,
+    /// A `dotnet test` whose own words the gate can read.
+    Readable,
+    /// A `dotnet test` whose own words name a response file: what it runs cannot be read.
+    Opaque,
+}
+
+/// Whether the words are a dotnet command ([`is_dotnet`]) whose verb ([`verb`]) is [`TEST_VERB`], ignoring letter case,
+/// and whether its own words can be read ([`dotnet_own`]).
+fn dotnet_test(words: &[String]) -> DotnetTest {
+    let Some(own) = dotnet_words(words) else {
+        return DotnetTest::No;
+    };
+    if !verb_in(&words[own], &[TEST_VERB]) {
+        return DotnetTest::No;
+    }
+    if dotnet_own(words).is_some() {
+        DotnetTest::Readable
+    } else {
+        DotnetTest::Opaque
+    }
 }
 
 /// Whether a word names the program `name`: its file name without extension, as Windows reads a path, is `name`,
@@ -1223,7 +1264,7 @@ pub fn later_run(inputs: &Inputs<'_>, facts: &dyn Facts, candidate: &LaterCandid
     let pattern = first_match(patterns, &sent.words).ok_or_else(|| Some("none of its patterns matches the command now".to_owned()))?;
     kept_run(&config, (opened, drives, sent), (builder, pattern), inputs.words, facts).map_err(|unkept| match unkept {
         Unkept::Here(here) => Some(kept_here(here)),
-        Unkept::Desktop | Unkept::Backslash => None,
+        Unkept::Desktop | Unkept::WindowsOnly | Unkept::Backslash => None,
     })
 }
 
@@ -1233,6 +1274,8 @@ enum Unkept {
     Here(Here),
     /// A macOS builder, and the command asks for a desktop ([`DesktopRead::steers_off`]).
     Desktop,
+    /// A macOS builder, and the command may test a Windows-only project ([`macos_windows_only`]).
+    WindowsOnly,
     /// A macOS builder, and a word of the command's Unix form still holds a `\` ([`Slashed::Backslash`]).
     Backslash,
 }
@@ -1252,6 +1295,9 @@ fn kept_run(config: &Config, sent: OpenedAndSent, chosen: (Builder, String), giv
     let found = macos_desktop(&builder, &opened, &sent.words, facts).map_err(Unkept::Here)?;
     if found.steers_off() {
         return Err(Unkept::Desktop);
+    }
+    if macos_windows_only(&builder, &opened.place, &sent.words, facts) {
+        return Err(Unkept::WindowsOnly);
     }
     let unix = match slashed(&builder, &opened, given, &drives, facts) {
         Slashed::Backslash => return Err(Unkept::Backslash),
@@ -1306,6 +1352,7 @@ fn pinned(inputs: &Inputs<'_>, host: &str, facts: &dyn Facts) -> Result<RemoteRu
     kept_run(&config, (opened, drives, sent), (builder, pattern), inputs.words, facts).map_err(|unkept| match unkept {
         Unkept::Here(reason) => here(reason),
         Unkept::Desktop => cannot("it asks for a desktop, which a macOS builder does not have"),
+        Unkept::WindowsOnly => cannot("it may test a Windows-only project, which a macOS builder cannot run"),
         Unkept::Backslash => cannot(r"a word still holds a \, which a macOS builder reads another way"),
     })
 }
@@ -1615,9 +1662,9 @@ fn desktop_pattern(place: &Place, words: &[String], facts: &dyn Facts) -> Result
 }
 
 /// The pick `first` of the opened worktree's command `words`, kept unless it is a macOS builder and a declared desktop
-/// pattern matches the command ([`desktop_pattern`]): a macOS builder has no desktop to run it on, so the pick goes on
-/// to the next builder that is no macOS one. Also what it read of the desktop file; `Err(None)` when no other
-/// builder's pattern matches.
+/// pattern matches the command ([`desktop_pattern`]), as a macOS builder has no desktop to run it on, or the command is
+/// a `dotnet test` of a Windows-only test project ([`macos_windows_only`]): the pick then goes on to the next builder
+/// that is no macOS one. Also what it read of the desktop file; `Err(None)` when no other builder's pattern matches.
 fn steer_off_macos(
     config: &Config,
     opened: &Opened,
@@ -1626,7 +1673,7 @@ fn steer_off_macos(
     first: (Builder, String),
 ) -> Result<(Builder, String, DesktopRead), Here> {
     let read = macos_desktop(&first.0, opened, words, facts)?;
-    if !read.steers_off() {
+    if !read.steers_off() && !macos_windows_only(&first.0, &opened.place, words, facts) {
         return Ok((first.0, first.1, read));
     }
     let (builder, pattern) = pick(config, &opened.repo, words, |builder| builder.os != BuilderOs::Macos).ok_or(None)?;
@@ -1640,6 +1687,20 @@ fn macos_desktop(builder: &Builder, opened: &Opened, words: &[String], facts: &d
         return Ok(DesktopRead::NotRead);
     }
     Ok(DesktopRead::Read(desktop_pattern(&opened.place, words, facts)?))
+}
+
+/// Whether a pick of `builder` for the command `words` of the worktree at `place` runs a Windows-only test: a macOS
+/// builder and a `dotnet test` ([`dotnet_test`]) whose own words cannot be read, or whose test projects the facts say are
+/// Windows-only ([`Facts::windows_only_tests`]); `false` for any other builder or command, which reads nothing.
+fn macos_windows_only(builder: &Builder, place: &Place, words: &[String], facts: &dyn Facts) -> bool {
+    if builder.os != BuilderOs::Macos {
+        return false;
+    }
+    match dotnet_test(words) {
+        DotnetTest::No => false,
+        DotnetTest::Opaque => true,
+        DotnetTest::Readable => facts.windows_only_tests(place, words),
+    }
 }
 
 /// What the pick read of the worktree's `.gate/desktop.toml` ([`steer_off_macos`]).

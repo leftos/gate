@@ -3445,6 +3445,34 @@ fn has_line_once(text: &str, line: &str) -> bool {
 }
 
 #[test]
+fn a_dotnet_test_of_a_windows_only_project_goes_past_the_mac_to_host() {
+    let case = routed_case("routing-windows-only-test");
+    let project = case.folder().join("tests").join("Win");
+    fs::create_dir_all(&project).expect("the project folder can be made");
+    let text = "<Project><PropertyGroup><TargetFramework>net10.0-windows</TargetFramework></PropertyGroup></Project>\n";
+    fs::write(project.join("Win.csproj"), text).expect("the project can be written");
+    let routing = json!({
+        "host": HOST,
+        "repos": { repo(&case): ["dotnet test *"] },
+        "builders": [{ "host": MAC, "os": "macos", "root": "/m", "repos": { repo(&case): ["dotnet test *"] } }],
+    });
+    write_remote_json(&case, &routing.to_string());
+    let call = case.folder().join("call.json");
+    let record = format!("record {}", shown(&call));
+    let steps = shown(&stub(&case, &[&record, "status 0"]));
+
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &["dotnet", "test", "tests/Win"])));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        recorded(&call)["host"],
+        HOST,
+        "the Mac cannot run a Windows-only test project: {outcome:?}"
+    );
+    assert!(events(&case).iter().all(has_remote_tag), "every journal line names host");
+}
+
+#[test]
 fn a_mac_refusing_version_sends_the_run_on_to_host_which_runs_it() {
     let case = two_builder_case("routing-next-builder");
     let call = case.folder().join("call.json");

@@ -29,7 +29,7 @@ const GIT_LANGUAGE: [&str; 1] = ["LANGUAGE"];
 /// The most of a nothing-back record read: a record is a few dozen bytes.
 const RECORD_CAP: u64 = 4096;
 /// The most of a solution or a worktree's build file read; a larger one cannot be told.
-const FILE_CAP: usize = 1 << 20;
+pub(crate) const FILE_CAP: usize = 1 << 20;
 /// The files at a worktree's root whose `MSBuild` properties apply to every project in it.
 const BUILD_FILES: [&str; 2] = ["Directory.Build.props", "Directory.Build.targets"];
 /// The `MSBuild` properties that can move a project's `project.assets.json` out of its `obj` folder.
@@ -229,7 +229,7 @@ pub(crate) fn read_worktree_record(path: &Path) -> Option<v1::WorktreeRecord> {
 /// # Errors
 ///
 /// A file that is missing (`NotFound`), cannot be opened or read, is not a regular file or is too large.
-fn read_regular(path: &Path) -> io::Result<Vec<u8>> {
+pub(crate) fn read_regular(path: &Path) -> io::Result<Vec<u8>> {
     read_regular_within(path, FILE_CAP).map_err(|error| match error.kind() {
         io::ErrorKind::FileTooLarge => io::Error::other("it is larger than 1 MiB"),
         _ => error,
@@ -306,7 +306,7 @@ pub(crate) fn moves_output(root: &Path, folder: &str, file: Option<&str>) -> Res
 }
 
 /// The files in `folder` whose name ends in a project extension ([`PROJECT_EXTENSIONS`]), ignoring letter case.
-fn project_files(folder: &Path) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn project_files(folder: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(folder)? {
         let path = entry?.path();
@@ -414,7 +414,7 @@ fn is_plain(path: &Path) -> bool {
 }
 
 /// The path of each `Project("{type}") = "Name", "path", "{guid}"` line of a `.sln`.
-fn sln_entries(text: &str) -> Vec<String> {
+pub(crate) fn sln_entries(text: &str) -> Vec<String> {
     text.lines()
         .filter(|line| line.trim_start().starts_with("Project("))
         .filter_map(|line| line.split_once('=').and_then(|(_, values)| values.split('"').nth(3)).map(str::to_owned))
@@ -422,7 +422,7 @@ fn sln_entries(text: &str) -> Vec<String> {
 }
 
 /// The `Path` attribute of each `<Project ...>` element of a `.slnx`, in double or single quotes.
-fn slnx_entries(text: &str) -> Vec<String> {
+pub(crate) fn slnx_entries(text: &str) -> Vec<String> {
     text.split("<Project")
         .skip(1)
         .filter(|element| element.starts_with(char::is_whitespace))

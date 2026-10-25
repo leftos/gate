@@ -3190,6 +3190,98 @@ fn on_a_macos_pick_a_desktop_pattern_written_with_backslashes_still_matches() {
     assert_eq!(run.words, stamped(&["dotnet", "build", r"src\Duel.sln"]));
 }
 
+/// A macOS builder `mac-1`, then a Windows builder `win-2`, each running `yaat`'s `dotnet test` commands.
+const MAC_THEN_WINDOWS_TEST: &str = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet test*"]}},
+    {"host": "win-2", "os": "windows", "repos": {"yaat": ["dotnet test*"]}}]"#;
+
+/// A gate at the root whose `dotnet test` test projects are Windows-only when `windows_only`, under a routing file whose
+/// `host` lists `yaat` as `host_repos` says, with the `builders` entries `builders`.
+fn windows_only_facts(host_repos: &str, builders: &str, windows_only: bool) -> FakeFacts {
+    FakeFacts {
+        windows_only,
+        ..FakeFacts::with_config(with_builders(host_repos, builders))
+    }
+}
+
+#[test]
+fn a_macos_pick_of_a_windows_only_test_goes_on_to_the_next_builder_that_is_no_macos_one() {
+    for verb in ["test", "TEST"] {
+        let command = words(&["dotnet", verb, "tests/X"]);
+        let facts = windows_only_facts(r#"{"other": ["*"]}"#, MAC_THEN_WINDOWS_TEST, true);
+        let run = routed(decide(&heavy(&command), &facts));
+        assert_eq!(run.builder.alias, "win-2", "the Windows-only test leaves the Mac");
+        assert_eq!(facts.windows_only_asked.get(), 1, "the projects are read once");
+    }
+}
+
+#[test]
+fn a_macos_pick_of_a_windows_only_test_no_other_builder_runs_stays_here() {
+    let mac = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet test*"]}}]"#;
+    let facts = windows_only_facts(r#"{"other": ["*"]}"#, mac, true);
+    assert_eq!(decide(&heavy(&words(&["dotnet", "test", "tests/X"])), &facts), SILENT);
+}
+
+#[test]
+fn a_macos_pick_of_a_test_not_windows_only_stays_on_the_mac_unless_its_words_cannot_be_read() {
+    let facts = windows_only_facts(r#"{"other": ["*"]}"#, MAC_THEN_WINDOWS_TEST, false);
+    let run = routed(decide(&heavy(&words(&["dotnet", "test", "tests/X"])), &facts));
+    assert_eq!(run.builder.alias, "mac-1");
+    assert_eq!(facts.windows_only_asked.get(), 1);
+
+    let facts = windows_only_facts(r#"{"other": ["*"]}"#, MAC_THEN_WINDOWS_TEST, false);
+    let run = routed(decide(&heavy(&words(&["dotnet", "test", "@args.rsp"])), &facts));
+    assert_eq!(
+        run.builder.alias, "win-2",
+        "a response file's words cannot be read, so the test leaves the Mac"
+    );
+    assert_eq!(facts.windows_only_asked.get(), 0, "nothing is read for it");
+}
+
+#[test]
+fn a_build_or_a_pick_of_no_macos_builder_never_asks_whether_a_test_is_windows_only() {
+    let mac = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet *"]}}]"#;
+    let facts = windows_only_facts(r#"{"other": ["*"]}"#, mac, true);
+    let run = routed(decide(&heavy(&words(&["dotnet", "build", "tests/X"])), &facts));
+    assert_eq!(run.builder.alias, "mac-1", "a build is no test");
+    assert_eq!(facts.windows_only_asked.get(), 0);
+
+    let windows = r#"[{"host": "win-2", "os": "windows", "repos": {"yaat": ["dotnet test*"]}}]"#;
+    let facts = windows_only_facts(r#"{"other": ["*"]}"#, windows, true);
+    let run = routed(decide(&heavy(&words(&["dotnet", "test", "tests/X"])), &facts));
+    assert_eq!(run.builder.alias, "win-2");
+    assert_eq!(facts.windows_only_asked.get(), 0, "a Windows builder runs it without reading");
+}
+
+#[test]
+fn a_macos_later_candidate_of_a_windows_only_test_is_skipped_silently() {
+    let command = words(&["dotnet", "test", "tests/X"]);
+    let mac = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet test*"]}}]"#;
+    let facts = windows_only_facts(r#"{"yaat": ["dotnet test*"]}"#, mac, true);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "builder-1", "the pick leaves the Mac");
+    assert_eq!(later_aliases(&run), ["mac-1"]);
+    assert!(
+        matches!(later_of(&run, 0, &command, &facts), Err(None)),
+        "host turned the run away, and the Mac is still no run for it"
+    );
+
+    let windows_then_mac = r#"[{"host": "win-2", "os": "windows", "repos": {"yaat": ["dotnet test*"]}},
+        {"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet test*"]}}]"#;
+    let facts = windows_only_facts(r#"{"other": ["*"]}"#, windows_then_mac, true);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "win-2");
+    assert!(matches!(later_of(&run, 0, &command, &facts), Err(None)), "the Mac is never tried for it");
+}
+
+#[test]
+fn a_pin_to_a_macos_builder_of_a_windows_only_test_is_refused() {
+    let facts = windows_only_facts(r#"{"other": ["*"]}"#, MAC_THEN_WINDOWS_TEST, true);
+    assert_eq!(
+        refused(decide(&pinned_to(&words(&["dotnet", "test", "tests/X"]), "mac-1"), &facts)).line(),
+        "gate: --builder mac-1 cannot route this run: it may test a Windows-only project, which a macOS builder cannot run"
+    );
+}
+
 /// A gate at `prefix` below the root whose snapshot carries `snapshot`, under a routing file whose `host` lists `yaat`
 /// as `host_repos` says and whose one `builders` entry, `mac-1`, runs `yaat`'s commands matching `mac_patterns`.
 fn mac_facts(prefix: &str, host_repos: &str, mac_patterns: &str, snapshot: &[&str]) -> FakeFacts {

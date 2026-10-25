@@ -24,6 +24,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::console::Console;
+use crate::dotnet_projects;
 use crate::no_build;
 use crate::remote::{self, git, siblings};
 use crate::resolve::Environment;
@@ -592,6 +593,14 @@ impl Facts for Machine<'_> {
     fn moves_build_output(&self, place: &Place, folder: &str, file: Option<&str>) -> bool {
         no_build::moves_output(Path::new(&place.root), folder, file).unwrap_or_else(|why| {
             self.notes.borrow_mut().push(format!("gate: not sending the PC's build: {why}"));
+            true
+        })
+    }
+
+    /// A project that cannot be read counts as Windows-only, saying why in the log.
+    fn windows_only_tests(&self, place: &Place, words: &[String]) -> bool {
+        dotnet_projects::windows_only_tests(Path::new(&place.root), &place.prefix, words).unwrap_or_else(|why| {
+            self.notes.borrow_mut().push(format!("gate: kept off the macOS builder: {why}"));
             true
         })
     }
@@ -1578,6 +1587,16 @@ mod tests {
         let notes = machine.notes.take();
         assert_eq!(notes.len(), 1, "one line says why: {notes:?}");
         assert!(notes[0].starts_with("gate: cannot tell what the snapshot carries: "), "{notes:?}");
+    }
+
+    #[test]
+    fn a_test_whose_projects_cannot_be_read_is_windows_only_and_notes_why() {
+        let (root, _removed) = scratch("windows-only-unreadable");
+        let machine = Machine::at(None, Duration::from_secs(60), Duration::from_secs(5));
+        assert!(machine.windows_only_tests(&place_of(&root), &["dotnet".to_owned(), "test".to_owned()]));
+        let notes = machine.notes.take();
+        assert_eq!(notes.len(), 1, "one line says why: {notes:?}");
+        assert!(notes[0].starts_with("gate: kept off the macOS builder: "), "{notes:?}");
     }
 
     #[test]

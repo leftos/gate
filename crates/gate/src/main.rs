@@ -16,6 +16,7 @@ mod commit;
 mod console;
 mod covered;
 mod cutover;
+mod dotnet_projects;
 mod durations;
 mod environment;
 mod escaped;
