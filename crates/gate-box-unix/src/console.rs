@@ -485,11 +485,11 @@ mod tests {
     #[test]
     fn a_recording_sink_keeps_each_line_and_its_stream_in_order() {
         let output = Output::new(RecordingSink::default());
-        assert!(output.say(Stream::Out, Stamp::Bare, "gate-remote-started: n").is_ok());
-        assert!(output.say(Stream::Err, Stamp::Bare, "a note").is_ok());
+        assert!(output.say(Stream::Err, Stamp::Bare, "gate-remote-started: n").is_ok());
+        assert!(output.say(Stream::Out, Stamp::Bare, "a note").is_ok());
         assert_eq!(
             output.sink().lines(),
-            [(Stream::Out, "gate-remote-started: n".to_owned()), (Stream::Err, "a note".to_owned())]
+            [(Stream::Err, "gate-remote-started: n".to_owned()), (Stream::Out, "a note".to_owned())]
         );
         assert!(!output.client_gone());
     }
@@ -498,7 +498,7 @@ mod tests {
     fn each_say_stamps_its_line_as_its_caller_says_and_a_bare_line_is_written_as_it_is() {
         let output = Output::new(RecordingSink::default());
         let at = Timestamp::constant(1_790_000_000, 0);
-        assert!(output.say(Stream::Out, Stamp::Bare, "gate-remote-started: n").is_ok());
+        assert!(output.say(Stream::Err, Stamp::Bare, "gate-remote-started: n").is_ok());
         assert!(output.say(Stream::Err, Stamp::At(Tag::Gat, at), "spawn pid=1 ppid=2 sh").is_ok());
         let together = [
             (Stream::Out, Stamp::Now(Tag::Out), "hi"),
@@ -509,7 +509,7 @@ mod tests {
 
         let lines = output.sink().lines();
         assert_eq!(lines.len(), 5, "{lines:?}");
-        assert_eq!(lines[0], (Stream::Out, "gate-remote-started: n".to_owned()), "a protocol line is bare");
+        assert_eq!(lines[0], (Stream::Err, "gate-remote-started: n".to_owned()), "a protocol line is bare");
         assert_eq!(lines[1], (Stream::Err, stamped(&local(at), Tag::Gat, "spawn pid=1 ppid=2 sh")));
         let hi = unstamped(&lines[2].1);
         assert_eq!((lines[2].0, hi.tag, hi.text), (Stream::Out, Some(Tag::Out), "hi"));

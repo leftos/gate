@@ -355,7 +355,7 @@ fn run_with<S: LineSink + 'static>(launch: &Launch<'_>, output: &Arc<Output<S>>,
         return CommandEnd::Failed;
     };
     // A client that has gone has no one left to tell; the probe below ends the run.
-    let _ = output.say(Stream::Out, Stamp::Bare, &started_line(launch.nonce));
+    let _ = output.say(Stream::Err, Stamp::Bare, &started_line(launch.nonce));
     if output.client_gone_probe() {
         return CommandEnd::Gone;
     }
@@ -1115,7 +1115,7 @@ mod tests {
         let status = case.watched(&["/bin/sh", "-c", "echo $$; sleep 600"], &watched, &idle_beat(), &output);
         assert_eq!(status, 124, "{:?}", output.sink().lines());
         let out = said(&output, Stream::Out);
-        let group: i32 = out.get(1).and_then(|line| line.parse().ok()).expect("the command said its pid");
+        let group: i32 = out.first().and_then(|line| line.parse().ok()).expect("the command said its pid");
         let err = said(&output, Stream::Err);
         assert!(err.len() >= 3, "the sampler's failure, the kill line and the tag: {err:?}");
         assert_eq!(err[err.len() - 3], SAMPLER_FAILED, "the sampler's failure is said with the end lines");
@@ -1230,7 +1230,7 @@ mod tests {
         let status = case.watched(&["/bin/sh", "-c", "echo $$; sleep 600"], &watched, &idle_beat(), &output);
         assert_eq!(status, 124, "{:?}", output.sink().lines());
         let group: i32 = said(&output, Stream::Out)
-            .get(1)
+            .first()
             .and_then(|line| line.parse().ok())
             .expect("the command said its pid");
         let err = said(&output, Stream::Err);
@@ -1275,7 +1275,9 @@ mod tests {
             (0.0..60.0).contains(&seconds) && seconds <= wall + 0.001,
             "under the 60 s ceiling and within the case's {wall} s: {seconds}"
         );
-        assert_eq!(said(&output, Stream::Err).first().map(String::as_str), Some("there"));
+        let err = said(&output, Stream::Err);
+        assert_eq!(err.first().map(String::as_str), Some(started_line(NONCE).as_str()), "{err:?}");
+        assert_eq!(err.get(1).map(String::as_str), Some("there"), "{err:?}");
     }
 
     #[test]
@@ -1309,7 +1311,7 @@ mod tests {
         };
         let status = case.watched(&["/bin/sh", "-c", "echo hi; sleep 0.1"], &watched, &idle_beat(), &output);
         assert_eq!(status, 0, "{:?}", output.sink().lines());
-        assert_eq!(said(&output, Stream::Err), [SAMPLER_FAILED]);
+        assert_eq!(said(&output, Stream::Err), [started_line(NONCE), SAMPLER_FAILED.to_owned()]);
     }
 
     impl Drop for Case {
@@ -1341,8 +1343,8 @@ mod tests {
         let output = recording();
         let status = case.run(&["/bin/sh", "-c", "echo hi; echo there >&2; exit 3"], &[], None, &output);
         assert_eq!(status, 3);
-        assert_eq!(said(&output, Stream::Out), [started_line(NONCE), "hi".to_owned()]);
-        assert_eq!(said(&output, Stream::Err), ["there"]);
+        assert_eq!(said(&output, Stream::Out), ["hi".to_owned()]);
+        assert_eq!(said(&output, Stream::Err), [started_line(NONCE), "there".to_owned()]);
         assert!(!case.record().exists(), "a clean end removes the record");
         assert!(!PathBuf::from(format!("{}.pgid", case.work)).exists(), "the group record is removed");
     }
@@ -1369,7 +1371,7 @@ mod tests {
         assert!(!case.record().exists(), "a command that never started leaves no record");
         let lines = said(&output, Stream::Err);
         assert!(
-            lines.len() == 1 && lines[0].starts_with("gate: remote could not start gate-box-no-such-program: "),
+            lines.len() == 2 && lines[0] == started_line(NONCE) && lines[1].starts_with("gate: remote could not start gate-box-no-such-program: "),
             "{lines:?}"
         );
     }

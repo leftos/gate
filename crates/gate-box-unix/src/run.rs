@@ -1879,7 +1879,7 @@ mod tests {
             .position(|(stream, line)| *stream == Stream::Err && line.starts_with("gate-remote-heartbeat:"));
         let started = said
             .iter()
-            .position(|(stream, line)| *stream == Stream::Out && *line == started_line(NONCE));
+            .position(|(stream, line)| *stream == Stream::Err && *line == started_line(NONCE));
         assert!(
             beat.is_some() && started.is_some() && beat < started,
             "a beat before the start marker: {said:?}"
@@ -2151,8 +2151,8 @@ mod tests {
         (case, program.display().to_string())
     }
 
-    /// Runs `command` with the payload keys `extra` along [`godot_login`]; the status, the command's own lines on stdout
-    /// (the start marker left out) and the lines said on stderr.
+    /// Runs `command` with the payload keys `extra` along [`godot_login`]; the status, the command's own lines on
+    /// standard output, and the lines said on standard error, the run's start marker among them.
     fn godot_run(case: &Case, command: &[&str], extra: &Value) -> (u8, Vec<String>, Vec<String>) {
         let commit = case.snapshot(&[("a.txt", "a\n")]);
         let mut keys = json!({ "Command": command, "Identity": identity() });
@@ -2166,7 +2166,7 @@ mod tests {
             .sink()
             .said()
             .into_iter()
-            .filter(|(stream, line)| *stream == Stream::Out && *line != started_line(NONCE))
+            .filter(|(stream, _)| *stream == Stream::Out)
             .map(|(_, line)| line)
             .collect();
         (status, out, err_of(&output))
@@ -3489,7 +3489,7 @@ mod tests {
             .filter(|(stream, _)| *stream == Stream::Out)
             .map(|(_, line)| line.as_str())
             .collect();
-        assert_eq!(out, [started_line(NONCE).as_str(), "input"], "{said:?}");
+        assert_eq!(out, ["input"], "{said:?}");
         assert_eq!(case.exclude_text().as_deref(), Some("/in.txt\n"));
     }
 

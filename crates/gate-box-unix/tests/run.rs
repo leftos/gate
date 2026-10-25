@@ -255,7 +255,7 @@ mod unix {
     enum Reading {
         /// Every line, to the end.
         All,
-        /// Until the start marker and a heartbeat after it, then both pipes closed: a client gone.
+        /// Until the start marker and a heartbeat after it, then standard error closed: a client gone.
         CloseAfterStart,
     }
 
@@ -340,25 +340,30 @@ mod unix {
         let mut stdin = child.stdin.take().expect("stdin is piped");
         stdin.write_all(format!("{request}\n").as_bytes()).expect("the request is written");
         drop(stdin);
-        let started = Arc::new(AtomicBool::new(false));
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
-        let out_started = Arc::clone(&started);
-        let out = thread::spawn(move || lines_of(stdout, reading, |line| line == started_line(NONCE), &out_started));
-        let err_started = Arc::clone(&started);
+        let stop = Arc::new(AtomicBool::new(false));
+        let out_stop = Arc::clone(&stop);
+        let out = thread::spawn(move || lines_of(stdout, reading, &out_stop));
         let beaten = beaten.to_owned();
         let err = thread::spawn(move || {
             let mut said = Vec::new();
+            let marker = started_line(NONCE);
+            let mut started = false;
             let mut reader = BufReader::new(stderr);
             let mut line = String::new();
             while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
                 let text = line.trim_end_matches('\n').to_owned();
                 line.clear();
-                let beat = text.starts_with("gate-remote-heartbeat:") && err_started.load(Ordering::SeqCst);
+                started |= text == marker;
+                let beat = text.starts_with("gate-remote-heartbeat:") && started;
                 said.push(text);
-                if beat && !beaten.exists() {
-                    fs::write(&beaten, "").expect("the beaten marker is made");
+                if beat {
+                    if !beaten.exists() {
+                        fs::write(&beaten, "").expect("the beaten marker is made");
+                    }
                     if reading == Reading::CloseAfterStart {
+                        stop.store(true, Ordering::SeqCst);
                         break;
                     }
                 }
@@ -371,22 +376,45 @@ mod unix {
         Ended { status, out, err }
     }
 
-    /// The lines of `pipe`, read to its end, or for [`Reading::CloseAfterStart`] up to the line `marks` takes for the
-    /// start marker, which sets `started`.
-    fn lines_of(pipe: impl Read, reading: Reading, marks: impl Fn(&str) -> bool, started: &AtomicBool) -> Vec<String> {
+    /// How long a reader watching for a stop waits for bytes before it looks at the stop again.
+    const READ_SLICE_MS: i32 = 20;
+
+    /// The lines of `pipe`, read to its end; in [`Reading::CloseAfterStart`], until `stop` is set, when the reader
+    /// stops and drops the pipe as a client that hung up drops both.
+    fn lines_of(pipe: impl Read + AsRawFd, reading: Reading, stop: &AtomicBool) -> Vec<String> {
+        let mut reader = BufReader::new(pipe);
         let mut said = Vec::new();
-        for line in BufReader::new(pipe).lines() {
-            let Ok(line) = line else { break };
-            let start = marks(&line);
-            said.push(line);
-            if start {
-                started.store(true, Ordering::SeqCst);
-                if reading == Reading::CloseAfterStart {
+        let mut line = String::new();
+        loop {
+            if reading == Reading::CloseAfterStart {
+                if stop.load(Ordering::SeqCst) {
                     break;
                 }
+                if !readable(reader.get_ref()) {
+                    continue;
+                }
+            }
+            match reader.read_line(&mut line) {
+                Ok(read) if read > 0 => {
+                    said.push(line.trim_end_matches('\n').to_owned());
+                    line.clear();
+                }
+                _ => break,
             }
         }
         said
+    }
+
+    /// Whether `pipe` has bytes to read within a slice of the clock, so a reader watching for a stop never waits on a
+    /// pipe that stays quiet; a broken pipe reads as ready, its read being what fails.
+    fn readable(pipe: &impl AsRawFd) -> bool {
+        let mut polled = libc::pollfd {
+            fd: pipe.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `polled` is one `pollfd` that lives across the call, and its count is passed with it.
+        unsafe { libc::poll(&mut polled, 1, READ_SLICE_MS) != 0 }
     }
 
     /// A command that writes `file` and waits until `beaten` is made, so a heartbeat is read while it runs.
@@ -403,7 +431,7 @@ mod unix {
         let case = Case::new("beats");
         let commit = case.snapshot();
         let beaten = case.base.join("beaten");
-        let command = waits_for_a_beat("echo hi", &beaten);
+        let command = waits_for_a_beat("echo hi; echo there >&2", &beaten);
         let ended = ran(
             &[],
             &case.request(&commit, &json!({"Command": command, "Timeout": 3600})),
@@ -411,10 +439,18 @@ mod unix {
             &beaten,
         );
         assert_eq!(ended.status, Some(0), "{:?}", ended.err);
-        assert_eq!(
-            texts(&ended.out),
-            [started_line(NONCE).as_str(), "hi"],
-            "the start marker before the command's output"
+        assert_eq!(texts(&ended.out), ["hi"], "the command's output");
+        let marker = started_line(NONCE);
+        let err = ended.err_texts();
+        let started = err.iter().position(|line| *line == marker).expect("the start marker on standard error");
+        let there = err
+            .iter()
+            .position(|line| *line == "there")
+            .expect("the command's line on standard error");
+        assert!(
+            started < there,
+            "the start marker before the command's line on the one pipe that says both: {:?}",
+            ended.err
         );
         ended.protocol_bare();
         assert!(beaten.exists(), "a heartbeat was read after the start marker: {:?}", ended.err);
@@ -467,11 +503,8 @@ mod unix {
         extra["Command"] = json!(["/bin/sh", "-c", "cat a.txt ../lib/b.txt; echo c > c.txt; echo d > ../lib/d.txt"]);
         let ended = ran(&[], &case.request(&commit, &extra), Reading::All, &case.base.join("beaten"));
         assert_eq!(ended.status, Some(0), "{:?}", ended.err);
-        assert_eq!(
-            texts(&ended.out),
-            [started_line(NONCE).as_str(), "a", "b"],
-            "the command ran in the main tree, its sibling beside it"
-        );
+        assert_eq!(texts(&ended.out), ["a", "b"], "the command ran in the main tree, its sibling beside it");
+        assert!(ended.err_has(&started_line(NONCE)), "the start marker on standard error: {:?}", ended.err);
         let main_back = case.back().expect("the main repo's back ref is pushed");
         let (lib_back, found) = git_said(&[
             &format!("--git-dir={lib_bare}"),
@@ -515,8 +548,8 @@ mod unix {
         let request = case.request(&commit, &json!({"Command": ["/bin/sh", "-c", script]}));
         let ended = ran(&[], &request, Reading::All, &case.base.join("beaten"));
         assert_eq!(ended.status, Some(0), "{:?}", ended.err);
-        assert_eq!(ended.out.len(), 2, "the start marker and the TMPDIR: {:?}", ended.out);
-        assert_eq!(ended.out.first(), Some(&started_line(NONCE)));
+        assert_eq!(ended.out.len(), 1, "the TMPDIR: {:?}", ended.out);
+        assert!(ended.err_has(&started_line(NONCE)), "the start marker on standard error: {:?}", ended.err);
         let tmpdir = ended.out.last().map(|line| unstamped(line).text).expect("the command said its TMPDIR");
         assert!(tmpdir.starts_with("/tmp/gate.") && tmpdir.ends_with('/') && tmpdir.len() < 38, "{tmpdir}");
         assert!(!Path::new(tmpdir).exists(), "the run's temp folder is gone: {tmpdir}");
@@ -567,7 +600,8 @@ mod unix {
         assert_eq!(locked, 0, "the case holds the work lock");
         let ended = ran(&[], &case.request(&commit, &json!({})), Reading::All, &case.base.join("beaten"));
         assert_eq!(ended.status, Some(75), "{:?}", ended.err);
-        assert!(ended.out.is_empty(), "no start marker: {:?}", ended.out);
+        assert!(ended.out.is_empty(), "nothing ran: {:?}", ended.out);
+        assert!(!ended.err_has(&started_line(NONCE)), "no start marker: {:?}", ended.err);
         let tag = ended.err.iter().position(|line| *line == refused_line(NONCE, Refusal::Busy));
         assert!(
             tag.is_some_and(|tag| ended.err_texts().get(tag + 1) == Some(&busy_line(KEY).as_str())),
@@ -720,7 +754,8 @@ mod unix {
             "{:?}",
             ended.err
         );
-        assert_eq!(texts(&ended.out), [started_line(NONCE)], "{:?}", ended.err);
+        assert!(ended.out.is_empty(), "the command says nothing on standard output: {:?}", ended.out);
+        assert!(ended.err_has(&started_line(NONCE)), "the start marker on standard error: {:?}", ended.err);
         assert!(Path::new(&format!("{}.tools", case.work())).exists(), "the tools record is written");
         case.ended_clean();
     }
@@ -814,7 +849,8 @@ mod unix {
     /// Checks `ended` was refused `inputs` 75 for `why`, its tag just before its line, before any start marker.
     fn assert_inputs_refused(ended: &Ended, why: &str) {
         assert_eq!(ended.status, Some(75), "{:?}", ended.err);
-        assert!(ended.out.is_empty(), "no start marker: {:?}", ended.out);
+        assert!(ended.out.is_empty(), "nothing ran: {:?}", ended.out);
+        assert!(!ended.err_has(&started_line(NONCE)), "no start marker: {:?}", ended.err);
         let line = format!("gate: remote inputs of work folder {KEY} are not the ones sent: {}", escaped(why));
         let tag = ended.err.iter().position(|said| *said == refused_line(NONCE, Refusal::Inputs));
         assert!(
@@ -833,7 +869,8 @@ mod unix {
         let ended = ran_with_inputs(&case, &commit, "cat in.txt cache/x.bin");
 
         assert_eq!(ended.status, Some(0), "{:?}", ended.err);
-        assert_eq!(texts(&ended.out), [started_line(NONCE).as_str(), "input", "cached"]);
+        assert_eq!(texts(&ended.out), ["input", "cached"]);
+        assert!(ended.err_has(&started_line(NONCE)), "the start marker on standard error: {:?}", ended.err);
         case.ended_clean();
     }
 
@@ -1250,7 +1287,8 @@ mod unix {
         let ended = ran_in(&[], &request, Reading::All, &case.base.join("beaten"), Some(&shell));
         assert_eq!(ended.status, Some(0), "{:?}", ended.err);
         let said = format!("--headless --path src/X --build-solutions --quit|{}", program.display());
-        assert_eq!(texts(&ended.out), [started_line(NONCE), said], "{:?}", ended.err);
+        assert_eq!(texts(&ended.out), [said.as_str()], "{:?}", ended.err);
+        assert!(ended.err_has(&started_line(NONCE)), "the start marker on standard error: {:?}", ended.err);
         case.ended_clean();
     }
 
@@ -1267,8 +1305,8 @@ mod unix {
             &beaten,
         );
         assert_eq!(ended.status, Some(0), "{:?}", ended.err);
-        assert_eq!(ended.out.first(), Some(&started_line(NONCE)), "the start marker, bare");
-        let out: Vec<(Option<Tag>, &str)> = ended.out[1..].iter().map(|line| (unstamped(line).tag, unstamped(line).text)).collect();
+        assert!(ended.err_has(&started_line(NONCE)), "the start marker on standard error: {:?}", ended.err);
+        let out: Vec<(Option<Tag>, &str)> = ended.out.iter().map(|line| (unstamped(line).tag, unstamped(line).text)).collect();
         assert_eq!(out, [(Some(Tag::Out), "one"), (Some(Tag::Out), "three")], "{:?}", ended.out);
         let two: Vec<Option<Tag>> = ended
             .err
