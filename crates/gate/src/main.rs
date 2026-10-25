@@ -43,6 +43,7 @@ mod push;
 mod remote;
 mod request_json;
 mod resolve;
+mod restore;
 mod route;
 mod run;
 mod slots;

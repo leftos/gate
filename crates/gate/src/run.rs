@@ -62,6 +62,7 @@ use crate::no_build::{self, NothingBack, Unfound, Worktree};
 use crate::outputs::{stale, walk::walk};
 use crate::remote::{self, KEY_WAIT_SLICE, KeyWait, RemoteCall, RemoteClient, RemoteOutcome, Split, git};
 use crate::resolve::{Environment, ResolvedRoot};
+use crate::restore::{self, NotRestoring, RestorePlan};
 use crate::route::{self, Placed};
 use crate::slots::{self, BuilderPool, ClaimOf, LendMarker, Pool, Survey, Taken, Takes, ThisGate, epoch_ms};
 use crate::stopping::{TERMINATE_CHECK, failure};
@@ -177,6 +178,8 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         streams: None,
         rerouted_for: None,
         reroute_tried: false,
+        restore_after: None,
+        closing: Vec::new(),
     };
     let (route, placed) = run.route(environment, console);
     if let Some(status) = ended_at_route(&route, request, &run.log, console) {
@@ -192,16 +195,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
     let mut hold = Hold::nothing();
     let watched = panic::catch_unwind(AssertUnwindSafe(|| run.through(&route, plan, local, &mut hold, console)));
     let status = match watched {
-        Ok(Some((ended, here))) => {
-            run.release(hold, Some(&ended), console);
-            if ended.status == 0
-                && let Some(here) = here
-            {
-                run.settle_nothing_back(here, console);
-            }
-            run.rebuild_durations(console);
-            exit_status(ended.status)
-        }
+        Ok(Some((ended, here))) => run.ended_through(hold, &ended, here, console),
         Ok(None) => CONTROL_C_EXIT,
         Err(payload) => {
             run.after_panic(hold, console);
@@ -476,6 +470,15 @@ impl Plan {
     ///
     /// A refused batch word (status 2), or a working folder or environment the gate cannot read or pass on (status 1).
     fn prepare(request: &RunRequest, words: &[OsString], at: &Where<'_>, console: &mut Console) -> Result<Plan, NotRun> {
+        Plan::prepare_without(request, words, at, &[], console)
+    }
+
+    /// [`Plan::prepare`], with the variables named `withheld` left out of the command's environment.
+    ///
+    /// # Errors
+    ///
+    /// As [`Plan::prepare`].
+    fn prepare_without(request: &RunRequest, words: &[OsString], at: &Where<'_>, withheld: &[&str], console: &mut Console) -> Result<Plan, NotRun> {
         let Where { root, gate, nesting } = *at;
         let folder = std::env::current_dir().map_err(|error| NotRun::failed(format!("gate: cannot read the working directory: {error}")))?;
         // A covered gate hands on the marker of the parent whose slot its command runs under. Any other hands on its own,
@@ -503,6 +506,7 @@ impl Plan {
         } else {
             variables.without(COMMIT_SLOT_VARIABLE)
         };
+        let variables = withheld.iter().fold(variables, |variables, name| variables.without(name));
         let environment = variables
             .block()
             .map_err(|error| NotRun::failed(format!("gate: cannot build the command's environment: {error}")))?;
@@ -672,6 +676,36 @@ struct Run<'a> {
     rerouted_for: Option<u32>,
     /// Whether the light run has asked to route once a critical request held it back; it asks at most once.
     reroute_tried: bool,
+    /// The routed dotnet build that passed and brought everything back, whose target a restore here may need once the
+    /// run has let its remote hold go ([`Run::restore_and_close`]); `None` for every other run.
+    restore_after: Option<RoutedBuild>,
+    /// The verdict's closing lines, held while a restore here is still to run so they stay the run's last lines.
+    closing: Vec<Said>,
+}
+
+/// A routed dotnet build that passed and brought everything back: its words, its worktree's root, the routed command's
+/// ceiling and when the routed call started, from which that ceiling counts for a restore here.
+struct RoutedBuild {
+    words: Vec<String>,
+    root: PathBuf,
+    ceiling: Duration,
+    started: Instant,
+}
+
+/// A line the verdict says: on stderr, or as a note on stdout ([`Console::note_out`]).
+enum Said {
+    Err(String),
+    NoteOut(String),
+}
+
+/// Says `lines` on `console`, each as it was meant.
+fn say(lines: Vec<Said>, console: &mut Console) {
+    for line in lines {
+        match line {
+            Said::Err(line) => console.err(&line),
+            Said::NoteOut(line) => console.note_out(&line),
+        }
+    }
 }
 
 /// What writes a started command's lines to its log: the readers of its two pipes, once started, and the thread that
@@ -1722,11 +1756,13 @@ impl Run<'_> {
         self.cold = outcome.raised.is_some();
         let words = unicode_words(&self.request.command);
         self.leave_nothing_back(remote, &outcome, words.as_deref(), console);
+        // A cold run's line names the ceiling the box was given.
+        let ceiling = outcome.raised.unwrap_or(figures.ceiling);
+        self.restore_after = restore_candidate(remote, &outcome, words.as_deref(), ceiling, started);
         let stale = stale_lines(remote, &outcome, words.as_deref());
         let passing = Passing {
             pass: Pass::On(&remote.builder.alias, wall, outcome.split, outcome.adjusted),
-            // A cold run's line names the ceiling the box was given.
-            ceiling: outcome.raised.unwrap_or(figures.ceiling),
+            ceiling,
             stale: &stale,
         };
         Attempt::Done(Remotely::Ended(self.remote_ended(&outcome, passing, wall, console)))
@@ -1825,6 +1861,106 @@ impl Run<'_> {
         if let Err(error) = v1::write_nothing_back(&path, &record) {
             console.err(&format!("gate: cannot write {}: {error}", path.display()));
         }
+    }
+
+    /// Ends a run that has let its slots and its work folder's key go: after a routed dotnet build that passed and
+    /// brought everything back ([`restore_candidate`]), runs a `dotnet restore` here of the target the command names
+    /// when that target has no `obj\project.assets.json` on this PC ([`restore_due`]), so a later `--no-build`
+    /// run here keeps its word; then says the verdict's closing lines it held ([`Run::verdict`]), which stay the run's
+    /// last. The restore runs as a run here of its words would, in the command's working folder with its environment,
+    /// on no slot, bounded by [`Run::restore_limit`], its output in a side file beside the log ([`restore::side_log`]),
+    /// and says how it went ([`restore::said`]). The status `ended` holds was fixed before, the console interrupt read
+    /// for it among the rest ([`Run::remote_ended`]): however the restore goes, a Ctrl+C during it included, the run's
+    /// status and verdict are the routed command's. A run that did not pass restores nothing and says nothing of it, and
+    /// so does a passing run that is no restore candidate, a publish or a build that moves its output among them; one
+    /// that cannot restore its target here says why ([`Run::restore_here`]).
+    fn restore_and_close(&mut self, ended: &Ended, console: &mut Console) {
+        let candidate = self.restore_after.take();
+        let closing = std::mem::take(&mut self.closing);
+        if let Some(build) = candidate.filter(|_| ended.status == 0) {
+            self.restore_here(&build, console);
+        }
+        say(closing, console);
+    }
+
+    /// Ends a run that went through as `ended`, with the words `here` a run here ran: lets its `hold` go, restores here
+    /// when a routed build needs it and says the verdict's closing lines ([`Run::restore_and_close`]), updates the
+    /// worktree's nothing-back record after a passing run here ([`Run::settle_nothing_back`]) and rebuilds the duration
+    /// history; the gate's exit status.
+    fn ended_through(&mut self, hold: Hold, ended: &Ended, here: Option<HereWords>, console: &mut Console) -> u32 {
+        self.release(hold, Some(ended), console);
+        self.restore_and_close(ended, console);
+        if ended.status == 0
+            && let Some(here) = here
+        {
+            self.settle_nothing_back(here, console);
+        }
+        self.rebuild_durations(console);
+        exit_status(ended.status)
+    }
+
+    /// The restore here of `build` ([`Run::restore_and_close`]), when its target needs one ([`restore_due`]), which says
+    /// nothing otherwise. A target that needs one but is no project or solution file ([`restore::names_restorable`]),
+    /// a Ctrl+C already pressed, or under [`restore::RESTORE_LEAST_LEFT`] of the routed command's ceiling left, in that
+    /// order, skips it with a line saying why ([`restore::not_restoring`]).
+    fn restore_here(&self, build: &RoutedBuild, console: &mut Console) {
+        let Some(plan) = restore_due(build, console) else {
+            return;
+        };
+        let limit = if !restore::names_restorable(plan.target()) {
+            Err(NotRestoring::NotProjectOrSolution)
+        } else if self.host.interrupt.is_some_and(Interrupt::is_raised) {
+            Err(NotRestoring::Interrupted)
+        } else {
+            self.restore_limit(build).ok_or(NotRestoring::TooLittleLeft)
+        };
+        let limit = match limit {
+            Ok(limit) => limit,
+            Err(why) => {
+                console.err(&restore::not_restoring(&plan, &why));
+                return;
+            }
+        };
+        let side = restore::side_log(self.log.path());
+        let started = Instant::now();
+        let ran = self
+            .restore_launch(&plan, console)
+            .and_then(|launch| restore::run_restore(&launch, &side, limit, self.host.interrupt));
+        for line in restore::said(&plan, &side, started.elapsed(), limit, ran) {
+            console.err(&line);
+        }
+    }
+
+    /// How long the restore here of `build` may take: [`restore::RESTORE_LIMIT`], or `--test-restore-limit-ms`, cut to
+    /// what is left of the routed command's ceiling counted from the routed call's start; `None` when under
+    /// [`restore::RESTORE_LEAST_LEFT`] is left.
+    fn restore_limit(&self, build: &RoutedBuild) -> Option<Duration> {
+        let limit = self
+            .request
+            .test_seams
+            .restore_limit_ms
+            .map_or(restore::RESTORE_LIMIT, Duration::from_millis);
+        let left = build.ceiling.saturating_sub(build.started.elapsed());
+        (left >= restore::RESTORE_LEAST_LEFT).then(|| limit.min(left))
+    }
+
+    /// The launch of `plan`'s words, planned as a run here of them is ([`Plan::prepare`]); else why it cannot be made,
+    /// without the `gate: ` its line starts with. It is planned under the nesting a run here has, so a gate that routed
+    /// beside the commit run whose slot covers it ([`Run::route_beside_commit`]) plans it under that cover again. A run
+    /// no parent covers hands on no slot marker ([`SLOT_HELD_VARIABLE`]), as it released its slot before the restore
+    /// starts. A covered run hands on its parent's, as that parent still holds its slot while the restore runs.
+    fn restore_launch(&self, plan: &RestorePlan, console: &mut Console) -> Result<Launch, String> {
+        let words: Vec<OsString> = plan.words().into_iter().map(OsString::from).collect();
+        let nesting = self.here_nesting.unwrap_or(self.nesting);
+        let at = Where {
+            root: self.root,
+            gate: &self.gate,
+            nesting,
+        };
+        let withheld: &[&str] = if nesting.covering().is_none() { &[SLOT_HELD_VARIABLE] } else { &[] };
+        let planned = Plan::prepare_without(self.request, &words, &at, withheld, console)
+            .map_err(|NotRun { line, .. }| line.strip_prefix("gate: ").map(str::to_owned).unwrap_or(line))?;
+        planned.launch
     }
 
     /// Takes the lock of the call's work-folder key: at once when no other run of the worktree holds it, and else after
@@ -3049,27 +3185,28 @@ impl Run<'_> {
         for line in &tail {
             console.out(line);
         }
-        match passing {
-            Some(passed) if status == 0 => self.say_passed(passed, &shown, console),
-            _ => console.err(&format!("gate: FAILED (status {status}). Full output: {shown}")),
+        let closing = match passing {
+            Some(passed) if status == 0 => self.passed_lines(passed, &shown),
+            _ => vec![Said::Err(format!("gate: FAILED (status {status}). Full output: {shown}"))],
+        };
+        // A routed build whose restore here is still to run keeps its verdict line for after it ([`Run::restore_and_close`]).
+        if self.restore_after.is_some() {
+            self.closing = closing;
+        } else {
+            say(closing, console);
         }
         Ok(status)
     }
 
-    /// Says what a passed run says: the lines naming the folders it left stale when it has any, the cores hint, the
-    /// route line, and the passed line.
-    fn say_passed(&self, passing: Passing<'_>, shown: &str, console: &mut Console) {
+    /// What a passed run says: the lines naming the folders it left stale when it has any, the cores hint, the route
+    /// line, and the passed line.
+    fn passed_lines(&self, passing: Passing<'_>, shown: &str) -> Vec<Said> {
         let Passing { pass, ceiling, stale } = passing;
-        for line in stale {
-            console.err(line);
-        }
-        if let Some(line) = self.cores_hint(pass) {
-            console.note_out(&line);
-        }
-        if let Some(line) = self.route_hint(pass) {
-            console.note_out(&line);
-        }
-        console.note_out(&passed_line(pass, ceiling, shown));
+        let mut lines: Vec<Said> = stale.iter().map(|line| Said::Err(line.clone())).collect();
+        lines.extend(self.cores_hint(pass).map(Said::NoteOut));
+        lines.extend(self.route_hint(pass).map(Said::NoteOut));
+        lines.push(Said::NoteOut(passed_line(pass, ceiling, shown)));
+        lines
     }
 
     /// The cores line of a passed run that ran as `pass` says, when its slot did not fit ([`cores_hint_for`]).
@@ -3974,6 +4111,51 @@ fn remove_record(path: &Path, console: &mut Console) {
 /// clear it, and its outputs are known to be brought back.
 fn brought_everything_back(outcome: &RemoteOutcome) -> bool {
     outcome.status == 0 && outcome.brought_back == Some(true)
+}
+
+/// The routed run `remote`'s dotnet build of the command's `words` that builds in place ([`builds_in_place`]), passed
+/// and brought everything back ([`brought_everything_back`]), whose target a restore here may need
+/// ([`Run::restore_and_close`]), under the routed command's `ceiling` in whole seconds, counted from the routed call's
+/// start `started`; `None` for any other run, a publish, a pack or a build whose output or assets go elsewhere among
+/// them, and for words that are not all valid Unicode.
+fn restore_candidate(remote: &RemoteRun, outcome: &RemoteOutcome, words: Option<&[String]>, ceiling: u64, started: Instant) -> Option<RoutedBuild> {
+    let words = words?;
+    (builds_in_place(words) && brought_everything_back(outcome)).then(|| RoutedBuild {
+        words: words.to_vec(),
+        root: PathBuf::from(&remote.root),
+        ceiling: Duration::from_secs(ceiling),
+        started,
+    })
+}
+
+/// The restore `build` needs ([`restore::restore_words`], read against the working folder): one whose target, the
+/// one the command names, has no `obj\project.assets.json` ([`no_build::named_without_assets`]). `None` for a
+/// command that names no target or is no direct dotnet command, a target with its assets file, and a worktree whose
+/// build files may move it ([`no_build::moves_intermediates`]); a working folder, build file or solution that cannot
+/// be read is said.
+fn restore_due(build: &RoutedBuild, console: &mut Console) -> Option<RestorePlan> {
+    let folder = match std::env::current_dir() {
+        Ok(folder) => folder,
+        Err(error) => {
+            console.err(&restore::cannot_run(&format!("cannot read the working directory: {error}")));
+            return None;
+        }
+    };
+    let plan = restore::restore_words(&build.words, &folder)?;
+    let missing = no_build::moves_intermediates(&build.root).and_then(|moves| {
+        if moves {
+            Ok(None)
+        } else {
+            no_build::named_without_assets(plan.check(), &build.root)
+        }
+    });
+    match missing {
+        Ok(missing) => missing.map(|_| plan),
+        Err(error) => {
+            console.err(&format!("gate: {error}"));
+            None
+        }
+    }
 }
 
 /// The lines a passing routed build says of the folders it left stale, none when it says none: the folders in the

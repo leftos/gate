@@ -316,6 +316,9 @@ pub struct TestSeams {
     /// place of 2 s: the routing decision's calls, the remote client's, the `--test-remote-snapshot` client's, the call
     /// that places a run's folder for its duration key, and the drain of this PC's `dotnet --list-sdks` read.
     pub git_drain_ms: Option<u64>,
+    /// How long a routed run's `dotnet restore` here may take before its process tree is ended, in place of 300 s; what
+    /// is left of the run's own timeout still bounds it.
+    pub restore_limit_ms: Option<u64>,
     /// The file a local light gate waits for, holding the beside mutex, between taking its slot and writing its claim,
     /// its arrival written to `<file>.reached` before the wait: it writes the claim, then journals its take, once the file
     /// exists.

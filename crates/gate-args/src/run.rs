@@ -69,6 +69,8 @@ pub(crate) enum ValueOption {
     #[cfg(feature = "test-seams")]
     GitDrainMs,
     #[cfg(feature = "test-seams")]
+    RestoreLimitMs,
+    #[cfg(feature = "test-seams")]
     BesideClaimWait,
     #[cfg(feature = "test-seams")]
     DotnetLimitMs,
@@ -340,6 +342,8 @@ impl RunBuilder {
             ValueOption::GitLimitMs => self.test_seams.git_limit_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::GitDrainMs => self.test_seams.git_drain_ms = Some(values::above_zero(spelled, value)?),
+            #[cfg(feature = "test-seams")]
+            ValueOption::RestoreLimitMs => self.test_seams.restore_limit_ms = Some(values::above_zero(spelled, value)?),
             #[cfg(feature = "test-seams")]
             ValueOption::BesideClaimWait => self.test_seams.beside_claim_wait = Some(PathBuf::from(value)),
             #[cfg(feature = "test-seams")]

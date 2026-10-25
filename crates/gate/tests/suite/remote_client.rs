@@ -29,7 +29,7 @@ use crate::durations::seed;
 use crate::support::{
     ANSWERING, Case, FAKE_SSH, FAKE_TOOL, GATE, GATE_VARIABLE, GIT_REDIRECTS, Go, Junction, NetfxKey, Outcome, PREFLIGHT_SEAMS_VARIABLE, Running,
     STEPS_VARIABLE, allow_breakaway, assert_in_order, beside, build_version, calls, copy_tool, events, finish, git, git_init, heavy_words, log_texts,
-    nothing_back, release, shown, ssh_steps, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
+    nothing_back, release, run_words, shown, ssh_steps, start, wait_for_journal_line, wait_until, wait_until_closed, write_remote_json,
 };
 
 const HOST: &str = "builder";
@@ -7371,6 +7371,313 @@ fn a_routed_build_of_one_project_that_brings_everything_back_leaves_the_record()
 
     assert_eq!(worktree_text(&case, r"bin\new.txt"), "built", "{outcome:?}");
     assert_eq!(nothing_back(&case).as_deref(), Some(planted), "{outcome:?}");
+}
+
+/// The project a restore-here case's routed build names.
+const RESTORED_PROJECT: &str = "app/App.csproj";
+/// The start of the line a restore here that passed says.
+const RESTORED_LINE: &str = "gate: restored app/App.csproj here in ";
+/// The end of the line a restore here that passed says.
+const RESTORED_END: &str = " s, so a --no-build run here can use the routed build's outputs";
+/// The file whose presence makes the stand-in dotnet's restore fail ([`restore_case`]).
+const RESTORE_FAILS: &str = "restore-fails";
+/// The file whose presence makes the stand-in dotnet's restore wait about a minute first ([`restore_case`]).
+const RESTORE_SLEEPS: &str = "restore-sleeps";
+/// The file whose presence makes the stand-in dotnet's build write no output ([`restore_case`]).
+const NO_OUTPUTS: &str = "no-outputs";
+/// The start of the line of a restore here that could not run.
+const CANNOT_RESTORE: &str = "gate: cannot run dotnet restore here: ";
+/// The file the stand-in dotnet's restore writes its environment to ([`STAND_IN_DOTNET`]).
+const RESTORE_ENV: &str = "restore.env";
+/// A stand-in `dotnet.cmd`. On `build` or `publish` it writes `bin\new.txt` beside itself, unless [`NO_OUTPUTS`] is
+/// there. On `restore` it writes its environment to [`RESTORE_ENV`], waits about a minute when [`RESTORE_SLEEPS`] is
+/// there, exits 1 when [`RESTORE_FAILS`] is, and else writes the assets file of the project or folder its second word
+/// names and exits 0. Any other verb exits 0; every call says its words first.
+const STAND_IN_DOTNET: &str = "@echo off\r\necho %*\r\nif \"%1\"==\"build\" goto build\r\nif \"%1\"==\"publish\" goto build\r\n\
+                               if not \"%1\"==\"restore\" exit /b 0\r\nset > \"%~dp0restore.env\"\r\n\
+                               if exist \"%~dp0restore-sleeps\" ping -n 60 127.0.0.1 > nul\r\nif exist \"%~dp0restore-fails\" exit /b 1\r\n\
+                               if exist \"%~f2\\*\" (set \"obj=%~f2\\obj\") else (set \"obj=%~dp2obj\")\r\n\
+                               if not exist \"%obj%\" mkdir \"%obj%\"\r\necho {}> \"%obj%\\project.assets.json\"\r\nexit /b 0\r\n\
+                               :build\r\nif exist \"%~dp0no-outputs\" exit /b 0\r\nif not exist \"%~dp0bin\" mkdir \"%~dp0bin\"\r\n\
+                               echo built> \"%~dp0bin\\new.txt\"\r\nexit /b 0\r\n";
+
+/// A [`build_case`] holding [`RESTORED_PROJECT`], with its `obj\project.assets.json` when `restored`, and the stand-in
+/// dotnet [`STAND_IN_DOTNET`] as `dotnet.cmd`, which its snapshot sends, so the builder runs it too.
+fn restore_case(name: &str, restored: bool) -> Case {
+    let case = build_case(name);
+    write(&case, RESTORED_PROJECT, "<Project />\n");
+    if restored {
+        write(&case, r"app\obj\project.assets.json", "{}\n");
+    }
+    write(&case, "dotnet.cmd", STAND_IN_DOTNET);
+    case
+}
+
+/// The words of a routed `dotnet build` of `target` through the stand-in dotnet, run directly.
+fn direct_build(target: &str) -> Vec<&str> {
+    vec![r".\dotnet.cmd", "build", target]
+}
+
+/// Whether the run said a line of a restore here.
+fn says_a_restore(outcome: &Outcome) -> bool {
+    outcome
+        .stderr
+        .lines()
+        .any(|line| line.starts_with("gate: restored ") || line.starts_with("gate: not restoring ") || line.contains("dotnet restore"))
+}
+
+/// The side file a restore here of a run logging to `out.log` writes its output to.
+fn restore_log(case: &Case) -> PathBuf {
+    case.folder().join("out.log.restore.log")
+}
+
+/// `path` as the gate's lines show it.
+fn escaped_path(path: &Path) -> String {
+    gate_router::escaped(&path.to_string_lossy())
+}
+
+#[test]
+fn restore_here_after_a_routed_build_that_brought_everything_back_keeps_a_later_no_build() {
+    let case = restore_case("client-restore-here", false);
+
+    let outcome = passing_build(&case, &["ok", "ok", "ok"], &direct_build(RESTORED_PROJECT));
+    let here = finish(case.gate(&run_words("here.log", &[], &[r".\dotnet.cmd", "test", RESTORED_PROJECT, "--no-build"])));
+
+    assert!(case.folder().join(r"bin\new.txt").is_file(), "{outcome:?}");
+    let said = outcome.stderr.lines().find(|line| line.starts_with(RESTORED_LINE));
+    assert!(said.is_some_and(|line| line.ends_with(RESTORED_END)), "{outcome:?}");
+    assert!(restore_log(&case).is_file(), "{outcome:?}");
+    assert!(case.folder().join(r"app\obj\project.assets.json").is_file(), "{outcome:?}");
+    assert_eq!(here.code, Some(0), "{here:?}");
+    assert!(!here.stderr.contains("gate: dropped --no-build"), "{here:?}");
+}
+
+#[test]
+fn restore_here_that_fails_says_so_and_keeps_the_run_s_pass() {
+    let case = restore_case("client-restore-here-fails", false);
+    write(&case, RESTORE_FAILS, "");
+
+    let outcome = passing_build(&case, &["ok", "ok", "ok"], &direct_build(RESTORED_PROJECT));
+
+    let failed = format!(
+        "gate: dotnet restore of app/App.csproj here failed with exit 1 ({}); a --no-build run here builds first",
+        escaped_path(&restore_log(&case))
+    );
+    assert!(outcome.stderr.lines().any(|line| line == failed), "{outcome:?}");
+    assert!(restore_log(&case).is_file(), "{outcome:?}");
+}
+
+#[test]
+fn no_restore_here_when_the_project_has_its_assets_file() {
+    let case = restore_case("client-restore-here-present", true);
+
+    let outcome = passing_build(&case, &["ok", "ok", "ok"], &direct_build(RESTORED_PROJECT));
+
+    assert!(!says_a_restore(&outcome), "{outcome:?}");
+    assert!(!restore_log(&case).exists(), "{outcome:?}");
+}
+
+/// The PC holds no output and the build packs none, so it did not bring everything back.
+#[test]
+fn no_restore_here_after_a_routed_build_that_did_not_bring_everything_back() {
+    let case = restore_case("client-restore-here-not-back", false);
+    write(&case, NO_OUTPUTS, "");
+
+    let outcome = passing_build(&case, &["ok", "ok"], &direct_build(RESTORED_PROJECT));
+
+    assert!(outcome.stderr.contains("gate-remote-outputs: 0"), "{outcome:?}");
+    assert!(!says_a_restore(&outcome), "{outcome:?}");
+    assert!(!restore_log(&case).exists(), "{outcome:?}");
+}
+
+/// The build names the folder `tests/X`, which has its assets file; another project of the worktree lacks its own.
+#[test]
+fn no_restore_here_for_a_project_the_build_does_not_name() {
+    let case = restore_case("client-restore-here-named", false);
+    write(&case, r"tools\Gen\Gen.csproj", "<Project />\n");
+    write(&case, r"tests\X\X.csproj", "<Project />\n");
+    write(&case, r"tests\X\obj\project.assets.json", "{}\n");
+
+    let outcome = passing_build(&case, &["ok", "ok", "ok"], &direct_build("tests/X"));
+
+    assert!(!says_a_restore(&outcome), "{outcome:?}");
+    assert!(!restore_log(&case).exists(), "{outcome:?}");
+}
+
+#[test]
+fn a_wrapped_dotnet_build_gets_no_restore_here() {
+    let case = restore_case("client-restore-here-wrapped", false);
+    let wrapped = [
+        r".\pwsh.exe",
+        "write",
+        r"bin\new.txt",
+        "built",
+        "argv",
+        "--",
+        r".\dotnet.cmd",
+        "build",
+        RESTORED_PROJECT,
+    ];
+
+    let outcome = passing_build(&case, &["ok", "ok", "ok"], &wrapped);
+
+    assert!(!says_a_restore(&outcome), "{outcome:?}");
+    assert!(!restore_log(&case).exists(), "{outcome:?}");
+}
+
+#[test]
+fn restore_here_past_its_limit_is_stopped_and_keeps_the_run_s_pass() {
+    let case = restore_case("client-restore-here-stopped", false);
+    write(&case, RESTORE_SLEEPS, "");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-restore-limit-ms", "500"],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &direct_build(RESTORED_PROJECT)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let stopped = format!(
+        "gate: dotnet restore of app/App.csproj here ran past 500 ms and was stopped ({}); a --no-build run here builds first",
+        escaped_path(&restore_log(&case))
+    );
+    assert!(outcome.stderr.lines().any(|line| line == stopped), "{outcome:?}");
+}
+
+#[test]
+fn restore_here_whose_side_file_name_is_a_folder_cannot_run() {
+    let case = restore_case("client-restore-here-side-folder", false);
+    fs::create_dir_all(restore_log(&case)).expect("the folder can be made");
+
+    let outcome = passing_build(&case, &["ok", "ok", "ok"], &direct_build(RESTORED_PROJECT));
+
+    let line = outcome.stderr.lines().find(|line| line.starts_with(CANNOT_RESTORE));
+    let earlier = format!("cannot remove the earlier {}", escaped_path(&restore_log(&case)));
+    assert!(line.is_some_and(|line| line.contains(&earlier)), "{outcome:?}");
+    assert!(restore_log(&case).is_dir(), "{outcome:?}");
+}
+
+#[test]
+#[expect(clippy::print_stderr, reason = "a case this machine cannot run says why it skipped")]
+fn restore_here_replaces_a_link_at_its_side_file_name_and_leaves_its_target() {
+    let case = restore_case("client-restore-here-side-link", false);
+    let other = case.folder().join("other.txt");
+    fs::write(&other, "keep").expect("the other file can be written");
+    if let Err(error) = std::os::windows::fs::symlink_file(&other, restore_log(&case)) {
+        eprintln!("skipped: this process cannot make a symbolic link: {error}");
+        return;
+    }
+
+    let outcome = passing_build(&case, &["ok", "ok", "ok"], &direct_build(RESTORED_PROJECT));
+
+    assert!(outcome.stderr.lines().any(|line| line.starts_with(RESTORED_LINE)), "{outcome:?}");
+    assert_eq!(fs::read_to_string(&other).expect("the other file is there"), "keep", "{outcome:?}");
+    let side = fs::symlink_metadata(restore_log(&case)).expect("the side file is there");
+    assert!(side.is_file() && !side.file_type().is_symlink(), "{outcome:?}");
+}
+
+/// A publish may put its outputs elsewhere, so the assets check after a restore could not find what it restored.
+#[test]
+fn a_routed_publish_restores_nothing_here() {
+    let case = restore_case("client-restore-here-publish", false);
+
+    let outcome = passing_build(&case, &["ok", "ok", "ok"], &[r".\dotnet.cmd", "publish", RESTORED_PROJECT]);
+
+    assert!(case.folder().join(r"bin\new.txt").is_file(), "{outcome:?}");
+    assert!(!says_a_restore(&outcome), "{outcome:?}");
+    assert!(!restore_log(&case).exists(), "{outcome:?}");
+}
+
+/// A build with an artifacts path writes its assets outside the project's `obj` folder.
+#[test]
+fn a_routed_build_with_an_artifacts_path_restores_nothing_here() {
+    let case = restore_case("client-restore-here-artifacts", false);
+
+    let outcome = passing_build(
+        &case,
+        &["ok", "ok", "ok"],
+        &[r".\dotnet.cmd", "build", RESTORED_PROJECT, "--artifacts-path", "out"],
+    );
+
+    assert!(case.folder().join(r"bin\new.txt").is_file(), "{outcome:?}");
+    assert!(!says_a_restore(&outcome), "{outcome:?}");
+    assert!(!restore_log(&case).exists(), "{outcome:?}");
+}
+
+#[test]
+fn a_routed_build_of_a_folder_says_it_is_not_restored_here() {
+    let case = restore_case("client-restore-here-folder", false);
+    write(&case, r"tests\X\X.csproj", "<Project />\n");
+
+    let outcome = passing_build(&case, &["ok", "ok", "ok"], &direct_build("tests/X"));
+
+    let line = "gate: not restoring tests/X here: it is not a project or solution file; a --no-build run here builds first";
+    assert!(outcome.stderr.lines().any(|said| said == line), "{outcome:?}");
+    assert!(!restore_log(&case).exists(), "{outcome:?}");
+    assert!(!case.folder().join(r"tests\X\obj\project.assets.json").exists(), "{outcome:?}");
+}
+
+/// Five routed builds make the key's history, seeded to a load-adjusted 100 s, so `auto:10` resolves to a 300 s
+/// ceiling on the sixth, a warm run. Counted from the run's arrival against the floor, under 10 s would be left and
+/// the restore skipped; counted from the routed call's start against the ceiling, nearly 300 s are.
+#[test]
+fn a_restore_after_an_auto_ceiling_raised_by_history_gets_the_time_left() {
+    let case = restore_case("client-restore-here-auto", false);
+    let steps = ssh_steps(&case, "ssh", &["ok"; 30]);
+    for run in 0..5 {
+        let outcome = finish(client_gate(&case, &format!("history-{run}.log"), &steps, &direct_build(RESTORED_PROJECT)));
+        assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    }
+    crate::durations::seed(&case, "App.csproj", 1.0, Some(100.0));
+    fs::remove_file(case.folder().join(r"app\obj\project.assets.json")).expect("the first run's restore wrote the assets file");
+    let tuned = Tuned {
+        timeout: "auto:10",
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &direct_build(RESTORED_PROJECT)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stdout.contains(", ceiling 300 s; command "), "{outcome:?}");
+    assert!(outcome.stderr.lines().any(|line| line.starts_with(RESTORED_LINE)), "{outcome:?}");
+}
+
+/// A routed build in a commit run's hooks, under the commit's marker, which this test process stands in for: the commit
+/// still holds its slot while the restore runs, so the restore is handed the commit's marker.
+#[test]
+fn a_restore_under_a_commit_run_keeps_the_commit_s_marker() {
+    let case = restore_case("client-restore-here-commit", false);
+    let marker = crate::nesting::test_marker(&case, "heavy");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--test-parent-job-trusted"],
+        ..Tuned::default()
+    };
+    let mut gate = client_gate_tuned(&case, "out.log", &steps, &tuned, &direct_build(RESTORED_PROJECT));
+    gate.env("GATE_SLOT_HELD", &marker).env("GATE_COMMIT_SLOT", &marker);
+
+    let outcome = finish(gate);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.lines().any(|line| line.starts_with(RESTORED_LINE)), "{outcome:?}");
+    let environment = fs::read_to_string(case.folder().join(RESTORE_ENV)).expect("the restore wrote its environment");
+    let handed = format!("GATE_SLOT_HELD={marker}");
+    assert!(environment.lines().any(|line| line == handed), "{outcome:?}\n{environment}");
+}
+
+#[test]
+fn a_restore_here_gets_no_slot_marker() {
+    let case = restore_case("client-restore-here-marker", false);
+
+    let outcome = passing_build(&case, &["ok", "ok", "ok"], &direct_build(RESTORED_PROJECT));
+
+    assert!(outcome.stderr.lines().any(|line| line.starts_with(RESTORED_LINE)), "{outcome:?}");
+    let environment = fs::read_to_string(case.folder().join(RESTORE_ENV)).expect("the restore wrote its environment");
+    assert!(
+        !environment.lines().any(|line| line.to_ascii_uppercase().starts_with("GATE_SLOT_HELD=")),
+        "{environment}"
+    );
 }
 
 /// The box installs `bin/new.txt` but skips `bin/m~10.txt`, a name this PC cannot take: the install is complete, but
