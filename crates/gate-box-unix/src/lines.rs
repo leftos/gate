@@ -362,7 +362,8 @@ pub enum JobRecord {
     Other,
     /// The record is the job's, and records this.
     Group(Recorded),
-    /// The record is the job's, and its second line is no process group, or its third no session.
+    /// The record is the job's, and its second line is no process group, its third no session, or its fourth no
+    /// leader start.
     Malformed,
 }
 
@@ -373,10 +374,14 @@ pub struct Recorded {
     pub group: i32,
     /// The session the group's leader was in when it wrote the record; `None` for a two-line record of an older box.
     pub session: Option<i32>,
+    /// When the group's leader started, seconds and microseconds after the Unix epoch, which the run adds once it
+    /// started the leader; `None` for a record written before that, or by an older box.
+    pub started: Option<(u64, u32)>,
 }
 
 /// What the job record holding `bytes` says of the job `job`: the job's name, then its process group in decimal, then
-/// optionally its session in decimal, each on a line, a final line end optional.
+/// optionally its session in decimal and then its leader's start ([`leader_start_text`]), each on a line, a final line
+/// end optional.
 #[must_use]
 pub fn job_record(bytes: &[u8], job: &str) -> JobRecord {
     match record_lines(bytes) {
@@ -400,16 +405,37 @@ fn record_lines(bytes: &[u8]) -> Option<(&str, Option<Recorded>)> {
     Some((job, recorded_lines(&mut lines)))
 }
 
-/// The lines after a job record's first: its process group in decimal, then optionally its session in decimal, and
-/// nothing after; else `None`. A run writes only digits, a group above 1 and a session above 0, so any other value,
-/// a sign included, is no record of a run's.
+/// The lines after a job record's first: its process group in decimal, then optionally its session in decimal and
+/// then its leader's start ([`leader_start`]), and nothing after; else `None`. A run writes only digits, a group above
+/// 1 and a session above 0, so any other value, a sign included, is no record of a run's.
 fn recorded_lines(lines: &mut std::str::Lines<'_>) -> Option<Recorded> {
     let group = digits_above(lines.next()?, 1)?;
     let session = match lines.next() {
         None => None,
         Some(line) => Some(digits_above(line, 0)?),
     };
-    lines.next().is_none().then_some(Recorded { group, session })
+    let started = match lines.next() {
+        None => None,
+        Some(line) => Some(leader_start(line)?),
+    };
+    lines.next().is_none().then_some(Recorded { group, session, started })
+}
+
+/// `line` read as a group leader's start ([`leader_start_text`]): digits, a dot, then six digits; else `None`.
+fn leader_start(line: &str) -> Option<(u64, u32)> {
+    let (seconds, micros) = line.split_once('.')?;
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    if !digits(seconds) || micros.len() != 6 || !digits(micros) {
+        return None;
+    }
+    Some((seconds.parse().ok()?, micros.parse().ok()?))
+}
+
+/// A job record's line of its group leader's start `started`: its seconds in decimal, a dot, then its microseconds
+/// in six digits.
+#[must_use]
+pub fn leader_start_text((seconds, micros): (u64, u32)) -> String {
+    format!("{seconds}.{micros:06}")
 }
 
 /// `line` read as a decimal number above `least`, written in digits only; else `None`.
@@ -420,13 +446,13 @@ fn digits_above(line: &str, least: i32) -> Option<i32> {
     line.parse::<i32>().ok().filter(|value| *value > least)
 }
 
-/// The text of the job record of the job `job` whose process group is `group`, made in the session `session`, as
-/// [`job_record`] reads it: the job's name, the group, then the session in decimal, each on a line. The child writes
-/// the record itself, so only the tests make its text.
+/// The text of the job record of the job `job` whose process group is `group`, made in the session `session`, its
+/// leader started at `started`, as [`job_record`] reads it: the job's name, the group, the session in decimal, then the
+/// start ([`leader_start_text`]), each on a line. The run writes the record itself, so only the tests make its text.
 #[cfg(test)]
 #[must_use]
-fn job_record_text(job: &str, group: i32, session: i32) -> String {
-    format!("{job}\n{group}\n{session}\n")
+pub(crate) fn job_record_text(job: &str, group: i32, session: i32, started: (u64, u32)) -> String {
+    format!("{job}\n{group}\n{session}\n{}\n", leader_start_text(started))
 }
 
 /// Refuses to signal the process group `group` when it is the box's own `own`; a group of 1 or below is never read
@@ -811,15 +837,20 @@ mod tests {
     #[test]
     fn a_recorded_group_is_read_whatever_job_the_record_names() {
         assert_eq!(
-            recorded_group(job_record_text("gate-remote-k-0123456789ab", 4242, 99).as_bytes()),
+            recorded_group(job_record_text("gate-remote-k-0123456789ab", 4242, 99, (1_700_000_000, 5)).as_bytes()),
             Some(Recorded {
                 group: 4242,
-                session: Some(99)
+                session: Some(99),
+                started: Some((1_700_000_000, 5)),
             })
         );
         assert_eq!(
             recorded_group(b"another-job\n17"),
-            Some(Recorded { group: 17, session: None }),
+            Some(Recorded {
+                group: 17,
+                session: None,
+                started: None
+            }),
             "a two-line record of an older box, a final line end optional"
         );
         for malformed in [
@@ -1037,7 +1068,11 @@ mod tests {
 
     /// What a two-line record of `group` records.
     fn two_line(group: i32) -> JobRecord {
-        JobRecord::Group(Recorded { group, session: None })
+        JobRecord::Group(Recorded {
+            group,
+            session: None,
+            started: None,
+        })
     }
 
     #[test]
@@ -1052,27 +1087,73 @@ mod tests {
             job_record(format!("{JOB}\n4242\n77").as_bytes(), JOB),
             JobRecord::Group(Recorded {
                 group: 4242,
-                session: Some(77)
+                session: Some(77),
+                started: None,
             }),
-            "then its session"
+            "then its session, a record that names no leader start"
         );
     }
 
     #[test]
-    fn a_job_record_s_text_reads_back_as_its_job_group_and_session() {
-        assert_eq!(job_record_text(JOB, 4242, 77), format!("{JOB}\n4242\n77\n"));
+    fn a_job_record_s_text_reads_back_as_its_job_group_session_and_leader_start() {
         assert_eq!(
-            job_record(job_record_text(JOB, 4242, 77).as_bytes(), JOB),
+            job_record_text(JOB, 4242, 77, (1_700_000_000, 42)),
+            format!("{JOB}\n4242\n77\n1700000000.000042\n")
+        );
+        assert_eq!(
+            job_record(job_record_text(JOB, 4242, 77, (1_700_000_000, 42)).as_bytes(), JOB),
             JobRecord::Group(Recorded {
                 group: 4242,
-                session: Some(77)
+                session: Some(77),
+                started: Some((1_700_000_000, 42)),
             })
         );
         assert_eq!(
-            job_record(job_record_text(JOB, -7, 77).as_bytes(), JOB),
+            job_record(job_record_text(JOB, -7, 77, (1_700_000_000, 42)).as_bytes(), JOB),
             JobRecord::Malformed,
             "a group no run writes"
         );
+    }
+
+    #[test]
+    fn a_four_line_record_names_its_leader_s_start() {
+        assert_eq!(
+            job_record(format!("{JOB}\r\n4242\r\n77\r\n0.999999").as_bytes(), JOB),
+            JobRecord::Group(Recorded {
+                group: 4242,
+                session: Some(77),
+                started: Some((0, 999_999)),
+            }),
+            "CRLF, no final line end"
+        );
+        assert_eq!(
+            recorded_group(format!("{JOB}\n4242\n77\n1700000000.000000\n").as_bytes()).and_then(|recorded| recorded.started),
+            Some((1_700_000_000, 0))
+        );
+    }
+
+    #[test]
+    fn a_record_whose_fourth_line_is_no_leader_start_is_malformed() {
+        for start in [
+            "12.34",
+            "x.000001",
+            "12",
+            ".000001",
+            "12.",
+            "12.0000001",
+            "12.00000x",
+            "+12.000001",
+            "-12.000001",
+            "12.000001 ",
+            "12,000001",
+            "",
+        ] {
+            let bad = format!("{JOB}\n4242\n77\n{start}\n");
+            assert_eq!(job_record(bad.as_bytes(), JOB), JobRecord::Malformed, "start {start:?}");
+            assert_eq!(recorded_group(bad.as_bytes()), None, "start {start:?}");
+        }
+        let fifth = format!("{JOB}\n4242\n77\n12.000034\n5\n");
+        assert_eq!(job_record(fifth.as_bytes(), JOB), JobRecord::Malformed, "a fifth line");
     }
 
     #[test]
@@ -1107,7 +1188,11 @@ mod tests {
         }
         assert_eq!(
             job_record(format!("{JOB}\n2\n1\n").as_bytes(), JOB),
-            JobRecord::Group(Recorded { group: 2, session: Some(1) }),
+            JobRecord::Group(Recorded {
+                group: 2,
+                session: Some(1),
+                started: None
+            }),
             "the least group and session a run writes"
         );
     }

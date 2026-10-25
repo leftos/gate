@@ -1544,9 +1544,10 @@ mod tests {
     use crate::git::test_program::{self, real_git};
     use crate::git::{CLOSED_STATUS, GitClass, test_limit};
     use crate::heartbeat::{self, Periods};
-    use crate::lines::{Godot, Login, command_status, login_path_line};
+    use crate::lines::{Godot, Login, command_status, job_record_text, login_path_line, recorded_group};
     use crate::outputs::OUTPUTS_BUDGET;
     use crate::outputs::tests::read_archive;
+    use crate::pid_info::start_of;
     use crate::probe::tests::fake_godot;
     use crate::stop::stop;
 
@@ -4122,7 +4123,7 @@ mod tests {
         case.laid_out(&commit);
         let mut child = sleeping_group();
         let record = record_of(&case);
-        fs::write(&record, format!("gate-remote-{KEY}-ffffffffffff\n{}\n", child.id())).expect("the record is written");
+        fs::write(&record, live_record_text(&format!("gate-remote-{KEY}-ffffffffffff"), child.id())).expect("the record is written");
         let index_lock = format!("{}/.git/index.lock", case.work());
         fs::write(&index_lock, "").expect("the earlier git's lock is planted");
 
@@ -4150,7 +4151,11 @@ mod tests {
         // SAFETY: signal 0 only asks whether the group exists; it touches no memory.
         assert!(unsafe { libc::killpg(group, 0) } != 0, "the group is gone");
         let record = record_of(&case);
-        fs::write(&record, format!("gate-remote-{KEY}-ffffffffffff\n{group}\n")).expect("the record is written");
+        fs::write(
+            &record,
+            job_record_text(&format!("gate-remote-{KEY}-ffffffffffff"), group, own_session(), (1, 0)),
+        )
+        .expect("the record is written");
 
         let (status, said) = ran(&case.json(&commit, &json!({})));
 
@@ -4159,12 +4164,48 @@ mod tests {
         assert!(!Path::new(&record).exists(), "the stale record is removed");
     }
 
-    /// Writes the group record of the case naming `group` in this process's session, as a box's git step writes it,
-    /// its time set `back` before now.
+    /// This process's session.
+    fn own_session() -> i32 {
+        // SAFETY: `getsid(0)` asks for the caller's own session and touches no memory.
+        unsafe { libc::getsid(0) }
+    }
+
+    /// The text of the record of the job `job` naming the group of the live process `pid`, made in this process's
+    /// session, with that process's start, as a run writes it.
+    fn live_record_text(job: &str, pid: u32) -> String {
+        let pid = i32::try_from(pid).expect("a pid is a pid_t");
+        job_record_text(job, pid, own_session(), start_of(pid).expect("the process's start is read"))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_record_whose_group_id_is_a_process_with_another_start_is_removed_and_the_process_left_alone() {
+        let case = Case::new("earlier-restarted");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let mut child = sleeping_group();
+        let pid = i32::try_from(child.id()).expect("a pid is a pid_t");
+        let (seconds, micros) = start_of(pid).expect("the sleep's start is read");
+        let record = record_of(&case);
+        // The process with the recorded id started a second after the recorded leader: a pid reused since.
+        let text = job_record_text(&format!("gate-remote-{KEY}-ffffffffffff"), pid, own_session(), (seconds - 1, micros));
+        fs::write(&record, text).expect("the record is written");
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        let alive = child.try_wait().expect("the sleep is looked at").is_none();
+        // Best effort: the sleep is this case's own.
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(status, 0, "{said:?}");
+        assert!(alive, "the process the stale record's id now names is never signalled");
+        assert!(!Path::new(&record).exists(), "the stale record is removed");
+    }
+
+    /// Writes the group record of the case naming `group` in this process's session, as an older box's git step wrote
+    /// it, naming no leader start, its time set `back` before now.
     fn record_written_back(case: &Case, group: u32, back: Duration) -> String {
         let record = record_of(case);
-        // SAFETY: `getsid(0)` asks for the caller's session and touches no memory.
-        let session = unsafe { libc::getsid(0) };
+        let session = own_session();
         fs::write(&record, format!("gate-remote-{KEY}-ffffffffffff\n{group}\n{session}\n")).expect("the record is written");
         let file = fs::File::options().write(true).open(&record).expect("the record opens");
         file.set_modified(SystemTime::now() - back).expect("the record's time is set");
@@ -4510,7 +4551,17 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         }
         let record = format!("{}.tools.pgid", case.work());
-        assert!(Path::new(&record).exists(), "the restore's group is recorded");
+        // The run adds the restore's leader's start to the record once it started; only then may a stop signal it.
+        let names_a_start = || {
+            fs::read(&record)
+                .ok()
+                .and_then(|bytes| recorded_group(&bytes))
+                .is_some_and(|recorded| recorded.started.is_some())
+        };
+        while !names_a_start() {
+            assert!(Instant::now() < guard, "the restore's group and its leader's start are never recorded");
+            thread::sleep(Duration::from_millis(50));
+        }
         let mut console = Console::captured();
         assert_eq!(stop(&decoded(&json), &mut console), 0, "the stop ends the restore's group");
         let ended = got.recv_timeout(HANG_GUARD).expect("the run ends once its restore is stopped");
@@ -4532,7 +4583,7 @@ mod tests {
         case.laid_out(&commit);
         let mut child = sleeping_group();
         let record = tools_group_of(&case);
-        fs::write(&record, format!("gate-remote-{KEY}-ffffffffffff-tools\n{}\n", child.id())).expect("the record is written");
+        fs::write(&record, live_record_text(&format!("gate-remote-{KEY}-ffffffffffff-tools"), child.id())).expect("the record is written");
 
         let (status, said) = ran(&case.json(&commit, &json!({})));
 
@@ -4558,7 +4609,8 @@ mod tests {
         assert!(unsafe { libc::killpg(group, 0) } != 0, "the group is gone");
         let record = tools_group_of(&case);
         fs::create_dir_all(Path::new(&record).parent().expect("the record has a folder")).expect("the folder is made");
-        fs::write(&record, format!("gate-remote-{KEY}-ffffffffffff-tools\n{group}\n")).expect("the record is written");
+        let text = job_record_text(&format!("gate-remote-{KEY}-ffffffffffff-tools"), group, own_session(), (1, 0));
+        fs::write(&record, text).expect("the record is written");
 
         let (status, said) = ran(&case.json(&commit, &json!({})));
 

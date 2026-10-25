@@ -256,6 +256,7 @@ mod mac {
 
     use super::{Lines, TICK, image_of};
     use crate::console::{GAT, Stamp};
+    use crate::pid_info::{self, Process, Start};
 
     /// The most exit events read in one call.
     const EVENTS: usize = 64;
@@ -358,7 +359,10 @@ mod mac {
 
         /// Looks at the listed process `pid`: a process not seen before, or one whose pid another took, is said.
         fn looked_at(&mut self, pid: i32) {
-            let start = bsd_info(pid).map(|info| (info.pbi_ppid, started_at(&info)));
+            let start = match pid_info::running(pid) {
+                Process::Present { parent, started, .. } => Some((parent, started_at(started))),
+                Process::Absent | Process::Unknown => None,
+            };
             match (self.known.get(&pid), start) {
                 // A process seen before whose info can no longer be read has exited, its end still to come.
                 (Some(_), None) => {}
@@ -514,20 +518,10 @@ mod mac {
         }
     }
 
-    /// The BSD info of `pid` (`proc_pidinfo(PROC_PIDTBSDINFO)`): its parent and its start; `None` when it cannot be read.
-    fn bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
-        // SAFETY: an all-zero `proc_bsdinfo` is a valid value, which the call fills.
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
-        // SAFETY: `info` is `size` bytes, which is all the call writes.
-        let read = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
-        (read == size).then_some(info)
-    }
-
-    /// The start `info` gives, `None` when it is out of range.
-    fn started_at(info: &libc::proc_bsdinfo) -> Option<Timestamp> {
-        let seconds = i64::try_from(info.pbi_start_tvsec).ok()?;
-        let nanos = i32::try_from(info.pbi_start_tvusec.checked_mul(1_000)?).ok()?;
+    /// The start `started` as a time, `None` when it is out of range.
+    fn started_at((seconds, micros): Start) -> Option<Timestamp> {
+        let seconds = i64::try_from(seconds).ok()?;
+        let nanos = i32::try_from(micros.checked_mul(1_000)?).ok()?;
         Timestamp::new(seconds, nanos).ok()
     }
 

@@ -16,13 +16,15 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::console::{Forwarding, Stamp, Stream};
+use crate::console::{Forwarding, GAT, Stamp, Stream};
 use crate::files::{self, HeldLock};
 use crate::forward::{Readers, Take};
-use crate::lines::Login;
+use crate::lines::{Login, leader_start_text};
+use crate::pid_info;
 use crate::process_lines::{ProcessLines, image_of};
 
 /// The most bytes of a program's standard error kept: its tail.
@@ -107,8 +109,9 @@ pub enum Ending {
 }
 
 /// The job record a program's process group is written to as the program starts, so `box stop` finds it: the job's
-/// name, the group, then the group's session in decimal ([`crate::lines::job_record`]). It is written and removed
-/// only while the run's work lock is held.
+/// name, the group, then the group's session in decimal, written from the child before its exec, then rewritten once
+/// the child started with its start as well ([`crate::lines::job_record`]). It is written and removed only while the
+/// run's work lock is held.
 #[derive(Debug)]
 pub struct GroupRecord<'a> {
     path: PathBuf,
@@ -130,12 +133,7 @@ impl<'a> GroupRecord<'a> {
     /// Why the record may not be changed now: the work lock no longer held ([`HeldLock::still_held`]), or not looked
     /// at; `None` while it is held.
     fn lock_lost(&self) -> Option<String> {
-        let shown = self.lock.path().display();
-        match self.lock.still_held() {
-            Ok(true) => None,
-            Ok(false) => Some(format!("the work folder lock {shown} is no longer held")),
-            Err(error) => Some(format!("the work folder lock {shown} could not be looked at: {error}")),
-        }
+        lock_lost(self.lock)
     }
 
     /// Removes the record, a missing one fine, and syncs its folder, while the work lock is held; else why not, the
@@ -147,6 +145,17 @@ impl<'a> GroupRecord<'a> {
         files::remove_if_there(&self.path)
             .and_then(|()| files::folder_synced(&self.path))
             .map_err(|error| format!("its group record could not be removed: {error}"))
+    }
+}
+
+/// Why a record may not be changed now: the work lock `lock` no longer held ([`HeldLock::still_held`]), or not looked
+/// at; `None` while it is held.
+fn lock_lost(lock: &HeldLock) -> Option<String> {
+    let shown = lock.path().display();
+    match lock.still_held() {
+        Ok(true) => None,
+        Ok(false) => Some(format!("the work folder lock {shown} is no longer held")),
+        Err(error) => Some(format!("the work folder lock {shown} could not be looked at: {error}")),
     }
 }
 
@@ -367,12 +376,28 @@ fn spawned_recorded(mut command: Command, watch: &Watch<'_>) -> Result<Child, No
             command.pre_exec(move || child_side.write());
         }
     }
-    spawned(&mut command).map_err(|error| {
+    let child = spawned(&mut command).map_err(|error| {
         if let Some(staged) = &staged {
             staged.abandon();
         }
         NotRan::Start(error)
-    })
+    })?;
+    if let Some(staged) = &staged
+        && let Err(why) = staged.stamped(&child)
+    {
+        unstamped_said(watch, &staged.path, &why);
+    }
+    Ok(child)
+}
+
+/// Says on the run's standard error, through `watch.output`, that the job record `record` keeps no leader start, and
+/// `why`; a run with no output says nothing.
+fn unstamped_said(watch: &Watch<'_>, record: &Path, why: &str) {
+    if let Some(output) = &watch.output {
+        let line = format!("gate: remote job record {} keeps no leader start: {why}", record.display());
+        // A client gone takes no line; the run goes on whether or not it was said.
+        let _ = output.say_unless(&AtomicBool::new(false), Stream::Err, GAT, &line);
+    }
 }
 
 /// Starts the readers of `child`'s standard output, kept up to the cap, and of its standard error, forwarded or its
@@ -747,6 +772,31 @@ impl<'a> Staged<'a> {
             abandoned(&self.path);
         }
     }
+
+    /// Rewrites the record the child `child` wrote before its exec with the start of `child`, its group's leader, read
+    /// now ([`pid_info::start_of`]), through a temp file synced and renamed over it ([`files::replace_plain`]), while
+    /// the work lock is held. Else why not: a start that cannot be read (the child already gone), the lock lost, the
+    /// session unread, or a rewrite that failed, each leaving the record as the child wrote it, so a stop signals
+    /// nothing; the run goes on.
+    fn stamped(&self, child: &Child) -> Result<(), String> {
+        let pid = child.id();
+        let started = i32::try_from(pid)
+            .ok()
+            .and_then(pid_info::start_of)
+            .ok_or_else(|| format!("the start of its leader {pid} could not be read"))?;
+        if let Some(why) = lock_lost(self.lock) {
+            return Err(why);
+        }
+        // SAFETY: `getsid(0)` asks for the caller's own session and touches no memory. The child, forked from this
+        // process, was in its session when it wrote the record.
+        let session = unsafe { libc::getsid(0) };
+        if session < 0 {
+            return Err(format!("the session could not be read: {}", io::Error::last_os_error()));
+        }
+        let mut text = self.job.clone();
+        text.extend_from_slice(format!("{pid}\n{session}\n{}\n", leader_start_text(started)).as_bytes());
+        files::replace_plain(&self.path, &text).map_err(|error| format!("it could not be rewritten: {error}"))
+    }
 }
 
 /// `path` as a C string; a path holding a NUL, which no file has, is the empty name, which every call refuses.
@@ -955,6 +1005,8 @@ mod tests {
     };
     use crate::console::{FailingSink, Forwarding, LineSink, Output, RecordingSink, Stamp, Stream};
     use crate::files::held_for_test;
+    #[cfg(target_os = "macos")]
+    use crate::lines::job_record_text;
 
     /// How long a program the tests expect to end may take: a hang guard only.
     const HANG_GUARD: Duration = Duration::from_secs(120);
@@ -1182,6 +1234,51 @@ mod tests {
         let _ = std::fs::remove_file(&lock_path);
         assert!(matches!(ran, Err(NotRan::Start(_))), "{ran:?}");
         assert!(left.is_empty(), "neither the record nor its temp file is left: {left:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_recorded_run_s_record_names_its_leader_s_start_as_read_after_the_spawn() {
+        let job = "gate-remote-k-0123456789ab";
+        let folder = std::env::temp_dir().join(format!("gate-box-unix-started-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).expect("the case folder is made");
+        let lock = held_for_test(&folder.join("k.lock"));
+        let path = folder.join("k.pgid");
+        let record = GroupRecord::new(path.clone(), job, &lock);
+        let seen = RefCell::new(None);
+        let on_started = |group: i32| {
+            let text = std::fs::read_to_string(&path).ok();
+            *seen.borrow_mut() = Some((group, text, crate::pid_info::start_of(group)));
+        };
+        let mut sleep = Command::new("sleep");
+        sleep.arg("600");
+        // The deadline has passed once the leader is looked at, so the sleep is killed right after its start is read.
+        let watch = Watch {
+            cap: 4,
+            deadline: Some(Instant::now()),
+            ending: Ending::Kill,
+            output: None,
+            forward: Forward::Kept,
+            ends_on_gone: false,
+            record: Some(&record),
+            check: None,
+            on_started: Some(&on_started),
+            on_leader_exit: None,
+            processes: None,
+        };
+        let ran = run_watched(sleep, &watch);
+        // Best effort: a folder left behind is in the temp folder and named for this process.
+        let _ = std::fs::remove_dir_all(&folder);
+        assert!(matches!(ran, Err(NotRan::TimedOut { .. })), "{ran:?}");
+        let (group, text, started) = seen.take().expect("the run told its start");
+        let started = started.expect("the leader's start is read while it runs");
+        // SAFETY: `getsid(0)` asks for the caller's own session and touches no memory.
+        let session = unsafe { libc::getsid(0) };
+        assert_eq!(
+            text,
+            Some(job_record_text(job, group, session, started)),
+            "the record holds four lines, its start the leader's as read after its spawn"
+        );
     }
 
     #[test]

@@ -1582,7 +1582,8 @@ mod tests {
     use crate::beneath::Folder;
     use crate::console::Console;
     use crate::files;
-    use crate::lines::{FAILED_STATUS, USAGE_STATUS, WORK_ROOT_STEP, folder_failure};
+    use crate::lines::{FAILED_STATUS, USAGE_STATUS, WORK_ROOT_STEP, folder_failure, job_record_text};
+    use crate::pid_info::start_of;
     use crate::run::REFUSED_STATUS;
 
     const KEY: &str = "repo-0123abcd";
@@ -1839,7 +1840,15 @@ mod tests {
         let case = Case::new("earlier-live");
         let mut child = sleeping_group();
         let record = format!("{}.pgid", case.work());
-        fs::write(&record, format!("gate-remote-{KEY}-ffffffffffff\n{}\n", child.id())).expect("the record is written");
+        let pid = i32::try_from(child.id()).expect("a pid is a pid_t");
+        // SAFETY: `getsid(0)` asks for the caller's own session and touches no memory.
+        let session = unsafe { libc::getsid(0) };
+        let started = start_of(pid).expect("the sleep's start is read");
+        fs::write(
+            &record,
+            job_record_text(&format!("gate-remote-{KEY}-ffffffffffff"), pid, session, started),
+        )
+        .expect("the record is written");
 
         let (status, console) = case.diff(&[("a.txt", b"a\n")]);
 

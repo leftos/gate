@@ -1124,10 +1124,18 @@ mod unix {
             thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(marker.exists(), "the cross build started");
-        assert!(
-            Path::new(&format!("{}.pgid", case.work())).exists(),
-            "the cross build's group is recorded"
-        );
+        // The run adds the cross build's leader's start to its record once it started; only then may a stop signal it.
+        let record = format!("{}.pgid", case.work());
+        let names_a_start = || {
+            fs::read(&record)
+                .ok()
+                .and_then(|bytes| gate_box_unix::lines::recorded_group(&bytes))
+                .is_some_and(|recorded| recorded.started.is_some())
+        };
+        while !names_a_start() && !run.is_finished() && std::time::Instant::now() < guard {
+            thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(names_a_start(), "the cross build's group and its leader's start are recorded");
 
         let mut stop = Command::new(env!("CARGO_BIN_EXE_gate-box"))
             .args(["box", "stop", "--stdin"])

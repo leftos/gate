@@ -1054,7 +1054,8 @@ mod tests {
     use crate::console::Console;
     use crate::files::held_for_test;
 
-    use crate::lines::{FAILED_STATUS, USAGE_STATUS};
+    use crate::lines::{FAILED_STATUS, USAGE_STATUS, job_record_text};
+    use crate::pid_info::start_of;
 
     const KEY: &str = "repo-0123abcd";
     const TWO_DAYS: Duration = Duration::from_hours(48);
@@ -1265,12 +1266,25 @@ mod tests {
         child.id()
     }
 
+    /// This process's session.
+    fn own_session() -> i32 {
+        // SAFETY: `getsid(0)` asks for the caller's own session and touches no memory.
+        unsafe { libc::getsid(0) }
+    }
+
+    /// The text of a record naming the group of the live process `pid`, made in this process's session, with that
+    /// process's start, as a run writes it.
+    fn live_record_text(pid: u32) -> String {
+        let pid = i32::try_from(pid).expect("a pid is a pid_t");
+        job_record_text("job", pid, own_session(), start_of(pid).expect("the process's start is read"))
+    }
+
     #[test]
     fn a_group_record_still_its_run_s_keeps_the_key_s_records() {
         let case = Case::new("live");
         let mut child = sleeping_group();
         let record = case.work().join(format!("{KEY}.pgid"));
-        fs::write(&record, format!("job\n{}\n", child.id())).expect("the record is written");
+        fs::write(&record, live_record_text(child.id())).expect("the record is written");
         let warm = case.record("warm", "w", TWO_DAYS);
 
         let (status, console) = case.sweep();
@@ -1286,7 +1300,8 @@ mod tests {
     fn a_stale_group_record_goes_with_the_key() {
         let case = Case::new("stale");
         case.folder(TWO_DAYS);
-        let record = case.record("pgid", &format!("job\n{}\n", ended_group()), TWO_DAYS);
+        let group = i32::try_from(ended_group()).expect("a pid is a pid_t");
+        let record = case.record("pgid", &job_record_text("job", group, own_session(), (1, 0)), TWO_DAYS);
         let tools = case.record("tools.pgid", "not a record", TWO_DAYS);
 
         let (status, console) = case.sweep();
@@ -1767,7 +1782,7 @@ mod tests {
         let lock = held_for_test(&case.work().join(format!("{LOCKED}.lock")));
         let live = case.folder_of(LIVE, Duration::from_hours(21));
         let mut child = sleeping_group();
-        fs::write(case.work().join(format!("{LIVE}.pgid")), format!("job\n{}\n", child.id())).expect("the record is written");
+        fs::write(case.work().join(format!("{LIVE}.pgid")), live_record_text(child.id())).expect("the record is written");
         let free = freeing(&case.work(), &[OLDEST, OLDER, RECENT, NEWEST], 90, 25);
 
         let (status, console) = case.sweep_freeing(&free);
