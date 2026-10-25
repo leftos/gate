@@ -38,7 +38,7 @@ pub use durations::{
     abandon_rebuild, begin_rebuild, duration_key, durations_path, normalize_for_durations, place_by_shape, read_store, rebuild_store,
     rebuilding_path, record_run, swap_rebuilt, write_store,
 };
-pub use journal::{CommandSummary, History, HistoryRun, JournalCache, RemoteTake, RunState, normalize_command};
+pub use journal::{CommandSummary, History, HistoryRun, JournalCache, RemoteTake, RunState, normalize_command, split_words};
 pub use journal_writer::{
     Appended, FallbackReason, HeavyLight, Held, JOURNAL_CAP_BYTES, JOURNAL_FILE, JOURNAL_WAIT, JournalEvent, JournalIdentity, JournalLock,
     JournalNote, LockError, MachineSnapshot, OtherClaim, ROLLED_JOURNAL_FILE, RemoteTag, RunFacts, RunTrace, TracedChild, append_line,

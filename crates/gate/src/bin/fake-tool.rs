@@ -13,7 +13,9 @@
 //! writes its pid to the file at the path, whole, through a file beside it moved over it, prints `spawned <its pid>`,
 //! and goes on holding the program's handle until the file at the release path comes, so the program's parent outlives
 //! the case's own opening of it; `spawn-pid-err <err-path> <path> <release> <program> [words]` does the same with the
-//! program's stderr sent to a file it creates at the err path; `exit <n>` exits with status n, any 32-bit code,
+//! program's stderr sent to a file it creates at the err path; `orphan-run <program> [words]` starts the program with
+//! those words and no standard handles, prints `spawned <its pid>` and ends at once without waiting for it, so the
+//! program is left with its parent gone, and is always the last step; `exit <n>` exits with status n, any 32-bit code,
 //! negative ones as Windows reads them back;
 //! `env <name>` prints the variable's value, or `fake-tool: <name> is not set`, on its own line; `bytes <hex>` writes the
 //! bytes the hex digits spell to stdout as they are, with no line feed added; `lines <n> <text>` prints n lines on
@@ -155,6 +157,7 @@ fn run(args: &[OsString]) -> Result<i32, String> {
                 stdout.flush().map_err(|error| write_failed(&error))?;
                 spawn_orphan(&operand(&mut steps, "spawn-orphan")?)?;
             }
+            "orphan-run" => orphan_run(&mut steps, &mut stdout)?,
             name @ ("spawn-pid" | "spawn-pid-err") => {
                 spawn_pid(name, &mut steps, &mut stdout)?;
                 break;
@@ -560,6 +563,23 @@ fn spawn_orphan(path: &str) -> Result<(), String> {
     } else {
         Err(format!("the orphaning helper ended with {status}"))
     }
+}
+
+/// The `orphan-run <program> [words]` step: starts the program with those words and no standard handles, prints
+/// `spawned <its pid>` and ends without waiting for it, so the program's parent is gone once this process exits.
+fn orphan_run<'a>(steps: &mut impl Iterator<Item = &'a OsString>, stdout: &mut impl Write) -> Result<(), String> {
+    let program = operand(steps, "orphan-run")?;
+    let words: Vec<OsString> = steps.by_ref().cloned().collect();
+    let pid = Command::new(program.as_str())
+        .args(&words)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|child| child.id())
+        .map_err(|error| format!("cannot start {program}: {error}"))?;
+    writeln!(stdout, "spawned {pid}").map_err(|error| write_failed(&error))?;
+    stdout.flush().map_err(|error| write_failed(&error))
 }
 
 /// Adds the line `run` to the file at `path`, creating it when missing.
