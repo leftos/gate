@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use gate_router::windows::WindowsChange;
 use gate_router::{
     BuildSettings, BuildTarget, Builder, BuilderOs, Config, ConfigProblem, DROPPED_NO_BUILD_LINE, DotnetTarget, Facts, Inputs, LocalReason,
     NO_OUTPUTS_LINE, PROJECT_EXTENSIONS, Pattern, PinRefusal, Place, RemoteRun, Route, SiblingFolder, Slot, Target, build_settings, builder_words,
@@ -3280,6 +3281,173 @@ fn a_pin_to_a_macos_builder_of_a_windows_only_test_is_refused() {
         refused(decide(&pinned_to(&words(&["dotnet", "test", "tests/X"]), "mac-1"), &facts)).line(),
         "gate: --builder mac-1 cannot route this run: it may test a Windows-only project, which a macOS builder cannot run"
     );
+}
+
+/// A macOS builder `mac-1`, then a Windows builder `win-2`, each running `yaat`'s `dotnet` commands.
+const MAC_THEN_WINDOWS_DOTNET: &str = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet *"]}},
+    {"host": "win-2", "os": "windows", "repos": {"yaat": ["dotnet *"]}}]"#;
+
+/// A macOS builder `mac-1` alone, running `yaat`'s `dotnet` commands.
+const MAC_DOTNET: &str = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet *"]}}]"#;
+
+/// The change touching `tools/Hook/a.cs`, one of `.gate/windows.toml`'s paths.
+fn touched() -> WindowsChange {
+    WindowsChange::Touched {
+        path: "tools/Hook/a.cs".to_owned(),
+    }
+}
+
+/// A change whose touch of `.gate/windows.toml`'s paths cannot be told.
+fn unknown() -> WindowsChange {
+    WindowsChange::Unknown {
+        why: "no refs/remotes/origin/HEAD or refs/remotes/origin/main".to_owned(),
+    }
+}
+
+#[test]
+fn a_sibling_that_is_a_junction_or_not_allowed_steers_nothing_and_reads_no_change() {
+    let command = words(&["dotnet", "build", "tests/X"]);
+    let config = |allowed: &str| {
+        let text = format!(
+            r#"{{"host": "builder-1", "repos": {{"other": ["*"]}}, "builders": {MAC_THEN_WINDOWS_DOTNET}, "siblings": {{"yaat": [{allowed}]}}}}"#
+        );
+        Config::parse(&text).expect("usable")
+    };
+    for (allowed, folder, reason) in [
+        (
+            r#""b""#,
+            SiblingFolder::Refused("is a link or a junction".to_owned()),
+            "sibling b is a link or a junction",
+        ),
+        (
+            r#""c""#,
+            SiblingFolder::Present(fake_id(&sibling_root("b"))),
+            "sibling b is not allowed in remote.json",
+        ),
+    ] {
+        let facts = FakeFacts {
+            siblings: Ok(words(&["b"])),
+            folders: vec![(sibling_root("b"), Ok(folder))],
+            windows_change: touched(),
+            ..FakeFacts::with_config(config(allowed))
+        };
+        let line = refused(decide(&pinned_to(&command, "mac-1"), &facts)).line();
+        assert_eq!(
+            line,
+            format!("gate: --builder mac-1 cannot route this run: {reason}"),
+            "the sibling's own reason, not a change the gate cannot tell"
+        );
+        assert_eq!(facts.windows_change_asked.get(), 0, "nothing is read in the sibling: {line}");
+    }
+}
+
+#[test]
+fn a_mac_only_builder_with_a_refused_sibling_and_no_windows_file_says_the_sibling() {
+    let config = Config::parse(&format!(
+        r#"{{"host": "builder-1", "repos": {{"other": ["*"]}}, "builders": {MAC_DOTNET}, "siblings": {{"yaat": ["b"]}}}}"#
+    ))
+    .expect("usable");
+    let facts = FakeFacts {
+        siblings: Ok(words(&["b"])),
+        folders: vec![(sibling_root("b"), Ok(SiblingFolder::Refused("is a link or a junction".to_owned())))],
+        ..FakeFacts::with_config(config)
+    };
+    let route = decide(&heavy(&words(&["dotnet", "build", "tests/X"])), &facts);
+    assert_eq!(
+        local_line(&route).as_deref(),
+        Some("gate: not routed: sibling b is a link or a junction"),
+        "no other builder to steer to, and the sibling's own reason keeps it here"
+    );
+    assert_eq!(facts.windows_change_asked.get(), 0, "no .gate/windows.toml is read for it");
+}
+
+/// A gate at the root whose change is `change` to `.gate/windows.toml`'s paths, under a routing file whose `host`
+/// lists `yaat` as `host_repos` says, with the `builders` entries `builders`.
+fn windows_change_facts(host_repos: &str, builders: &str, change: WindowsChange) -> FakeFacts {
+    FakeFacts {
+        windows_change: change,
+        ..FakeFacts::with_config(with_builders(host_repos, builders))
+    }
+}
+
+#[test]
+fn a_macos_pick_of_a_change_touching_the_windows_paths_or_not_known_to_goes_on_to_the_next_builder_that_is_no_macos_one() {
+    for change in [touched(), unknown()] {
+        for command in [words(&["dotnet", "build", "tests/X"]), words(&["dotnet", "test", "tests/X"])] {
+            let facts = windows_change_facts(r#"{"other": ["*"]}"#, MAC_THEN_WINDOWS_DOTNET, change.clone());
+            let run = routed(decide(&heavy(&command), &facts));
+            assert_eq!(run.builder.alias, "win-2", "{change:?} {command:?} leaves the Mac");
+            assert_eq!(facts.windows_change_asked.get(), 1, "the change is read once");
+        }
+    }
+}
+
+#[test]
+fn a_macos_pick_of_a_change_touching_the_windows_paths_goes_to_host_else_stays_here() {
+    let facts = windows_change_facts(r#"{"yaat": ["dotnet *"]}"#, MAC_DOTNET, touched());
+    let run = routed(decide(&heavy(&words(&["dotnet", "build", "tests/X"])), &facts));
+    assert_eq!(run.builder.alias, "builder-1", "host runs it when no other builder does");
+
+    let facts = windows_change_facts(r#"{"other": ["*"]}"#, MAC_DOTNET, unknown());
+    assert_eq!(decide(&heavy(&words(&["dotnet", "build", "tests/X"])), &facts), SILENT);
+}
+
+#[test]
+fn a_macos_pick_of_a_change_untouched_stays_on_the_mac() {
+    let facts = windows_change_facts(r#"{"other": ["*"]}"#, MAC_THEN_WINDOWS_DOTNET, WindowsChange::Untouched);
+    let run = routed(decide(&heavy(&words(&["dotnet", "build", "tests/X"])), &facts));
+    assert_eq!(run.builder.alias, "mac-1");
+    assert_eq!(facts.windows_change_asked.get(), 1);
+}
+
+#[test]
+fn a_pick_of_no_macos_builder_never_asks_what_the_change_touches() {
+    let windows = r#"[{"host": "win-2", "os": "windows", "repos": {"yaat": ["dotnet *"]}}]"#;
+    let facts = windows_change_facts(r#"{"other": ["*"]}"#, windows, touched());
+    let run = routed(decide(&heavy(&words(&["dotnet", "build", "tests/X"])), &facts));
+    assert_eq!(run.builder.alias, "win-2");
+    assert_eq!(facts.windows_change_asked.get(), 0, "a Windows builder runs it without reading");
+
+    let facts = windows_change_facts(r#"{"yaat": ["dotnet *"]}"#, "[]", touched());
+    let run = routed(decide(&heavy(&words(&["dotnet", "build", "tests/X"])), &facts));
+    assert_eq!(run.builder.alias, "builder-1");
+    assert_eq!(facts.windows_change_asked.get(), 0, "host runs it without reading");
+}
+
+#[test]
+fn a_macos_later_candidate_of_a_change_touching_the_windows_paths_is_skipped_silently() {
+    let command = words(&["dotnet", "build", "tests/X"]);
+    let facts = windows_change_facts(r#"{"yaat": ["dotnet *"]}"#, MAC_DOTNET, touched());
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.builder.alias, "builder-1", "the pick leaves the Mac");
+    assert_eq!(later_aliases(&run), ["mac-1"]);
+    assert!(
+        matches!(later_of(&run, 0, &command, &facts), Err(None)),
+        "host turned the run away, and the Mac is still no run for it"
+    );
+}
+
+#[test]
+fn a_pin_to_a_macos_builder_of_a_change_touching_the_windows_paths_is_refused_and_to_a_windows_one_is_not() {
+    let command = words(&["dotnet", "build", "tests/X"]);
+    for (change, why) in [
+        (touched(), "the change touches tools/Hook/a.cs (.gate/windows.toml)"),
+        (
+            unknown(),
+            "cannot tell whether the change touches .gate/windows.toml's paths: no refs/remotes/origin/HEAD or refs/remotes/origin/main",
+        ),
+    ] {
+        let facts = windows_change_facts(r#"{"other": ["*"]}"#, MAC_THEN_WINDOWS_DOTNET, change);
+        assert_eq!(
+            refused(decide(&pinned_to(&command, "mac-1"), &facts)).line(),
+            format!("gate: --builder mac-1 cannot route this run: {why}")
+        );
+    }
+
+    let facts = windows_change_facts(r#"{"other": ["*"]}"#, MAC_THEN_WINDOWS_DOTNET, touched());
+    let run = routed(decide(&pinned_to(&command, "win-2"), &facts));
+    assert_eq!(run.builder.alias, "win-2");
+    assert_eq!(facts.windows_change_asked.get(), 0);
 }
 
 /// A gate at `prefix` below the root whose snapshot carries `snapshot`, under a routing file whose `host` lists `yaat`

@@ -3472,6 +3472,163 @@ fn a_dotnet_test_of_a_windows_only_project_goes_past_the_mac_to_host() {
     assert!(events(&case).iter().all(has_remote_tag), "every journal line names host");
 }
 
+/// The note a routed run's log holds when the change touches `path`, one of `.gate/windows.toml`'s paths.
+fn touched_note(path: &str) -> String {
+    format!("gate: kept off the macOS builder: the change touches {path} (.gate/windows.toml)")
+}
+
+/// A [`two_builder_case`] whose `.gate/windows.toml` declares `paths`, its checkout holding one commit of every file
+/// but the logs and step files, which `.gitignore` leaves out; that commit is `refs/remotes/origin/main` when `origin`.
+/// The tools stay in it: the Mac takes `.\tool.exe` only when the snapshot carries it.
+fn windows_paths_case(name: &str, paths: &str, origin: bool) -> Case {
+    let case = two_builder_case(name);
+    let folder = case.folder();
+    fs::write(folder.join(".gitignore"), "*.log\nstub-*.txt\ncall.json\n").expect("the ignore file can be written");
+    fs::create_dir_all(folder.join(".gate")).expect("the .gate folder can be made");
+    fs::write(folder.join(".gate").join("windows.toml"), format!("paths = {paths}\n")).expect("the declaration can be written");
+    commit_all(&case, &folder, "base");
+    if origin {
+        git(&case, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    }
+    case
+}
+
+/// Commits every file of the repo at `folder` not ignored, with the message `message`.
+fn commit_all(case: &Case, folder: &Path, message: &str) {
+    let at = folder.to_str().expect("the folder is Unicode");
+    git(case, &["-C", at, "add", "--all"]);
+    git(case, &["-C", at, "commit", "--quiet", "--message", message]);
+}
+
+/// Writes the file `path`, `/`-separated below the repo at `folder`, and the folders above it.
+fn write_below(folder: &Path, path: &str) {
+    let file = folder.join(path);
+    fs::create_dir_all(file.parent().expect("the file has a folder")).expect("the file's folder can be made");
+    fs::write(&file, "a\n").expect("the file can be written");
+}
+
+/// Runs the case's `.\tool.exe` routed through a scripted client that records its call; the host the call went to and
+/// the run's log.
+fn windows_paths_run(case: &Case) -> (Value, String) {
+    let call = case.folder().join("call.json");
+    let record = format!("record {}", shown(&call));
+    let steps = shown(&stub(case, &[&record, "status 0"]));
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", "ran"])));
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    (recorded(&call)["host"].clone(), log_texts(&case.folder().join("out.log")))
+}
+
+#[test]
+fn a_committed_change_under_a_windows_path_goes_past_the_mac_to_host_saying_why() {
+    let case = windows_paths_case("routing-windows-paths-committed", "['tools/Hook/*']", true);
+    write_below(&case.folder(), "tools/Hook/a.cs");
+    commit_all(&case, &case.folder(), "hook");
+
+    let (host, log) = windows_paths_run(&case);
+
+    assert_eq!(host, HOST, "{log}");
+    assert!(has_line(&log, &touched_note("tools/Hook/a.cs")), "{log}");
+}
+
+#[test]
+fn an_untracked_file_under_a_windows_path_goes_past_the_mac_to_host_saying_why() {
+    let case = windows_paths_case("routing-windows-paths-untracked", "['tools/Hook/*']", true);
+    write_below(&case.folder(), "tools/Hook/b.cs");
+
+    let (host, log) = windows_paths_run(&case);
+
+    assert_eq!(host, HOST, "{log}");
+    assert!(has_line(&log, &touched_note("tools/Hook/b.cs")), "{log}");
+}
+
+#[test]
+fn a_change_outside_the_windows_paths_stays_on_the_mac() {
+    let case = windows_paths_case("routing-windows-paths-outside", "['tools/Hook/*']", true);
+    write_below(&case.folder(), "src/a.cs");
+    commit_all(&case, &case.folder(), "outside");
+    write_below(&case.folder(), "docs/b.md");
+
+    let (host, log) = windows_paths_run(&case);
+
+    assert_eq!(host, MAC, "{log}");
+    assert!(!log.contains("kept off the macOS builder"), "{log}");
+}
+
+#[test]
+fn a_checkout_with_no_origin_ref_goes_past_the_mac_to_host_saying_it_cannot_tell() {
+    let case = windows_paths_case("routing-windows-paths-no-origin", "['tools/Hook/*']", false);
+
+    let (host, log) = windows_paths_run(&case);
+
+    assert_eq!(host, HOST, "{log}");
+    let note = "gate: kept off the macOS builder: cannot tell whether the change touches .gate/windows.toml's paths: ";
+    assert!(
+        log.lines()
+            .any(|line| line.starts_with(note) && line.ends_with("has no refs/remotes/origin/HEAD or refs/remotes/origin/main")),
+        "{log}"
+    );
+}
+
+#[test]
+fn a_change_under_a_siblings_windows_path_goes_past_the_mac_to_host_saying_why() {
+    let case = two_builder_case("routing-windows-paths-sibling");
+    let (name, beside) = declare_sibling(&case);
+    fs::create_dir_all(&beside).expect("the sibling can be made");
+    let sibling = beside.to_str().expect("the sibling's folder is Unicode");
+    git(&case, &["-C", sibling, "init", "--quiet"]);
+    write_below(&beside, "tools/X/base.cs");
+    commit_all(&case, &beside, "base");
+    git(&case, &["-C", sibling, "update-ref", "refs/remotes/origin/main", "HEAD"]);
+    write_below(&beside, "tools/X/a.cs");
+    commit_all(&case, &beside, "hook");
+    let folder = case.folder();
+    fs::write(folder.join(".gitignore"), "*.log\nstub-*.txt\ncall.json\n").expect("the ignore file can be written");
+    let paths = format!("paths = ['tools/Hook/*', '../{name}/tools/X/*']\n");
+    fs::write(folder.join(".gate").join("windows.toml"), paths).expect("the declaration can be written");
+    commit_all(&case, &folder, "base");
+    git(&case, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+    let (host, log) = windows_paths_run(&case);
+    fs::remove_dir_all(&beside).expect("the sibling can be removed");
+
+    assert_eq!(host, HOST, "{log}");
+    assert!(has_line(&log, &touched_note(&format!("../{name}/tools/X/a.cs"))), "{log}");
+}
+
+#[test]
+fn a_windows_file_with_a_problem_goes_past_the_mac_to_host_naming_the_problem() {
+    let case = windows_paths_case("routing-windows-paths-problem", "['']", true);
+
+    let (host, log) = windows_paths_run(&case);
+
+    assert_eq!(host, HOST, "{log}");
+    let note = "gate: kept off the macOS builder: cannot tell whether the change touches .gate/windows.toml's paths: paths[0] is empty";
+    assert!(has_line(&log, note), "{log}");
+}
+
+/// The checkout has no origin ref, so a read of its change could not tell it and would keep the run off the Mac.
+#[test]
+fn a_windows_file_declaring_no_paths_asks_no_git_and_leaves_the_mac() {
+    let case = windows_paths_case("routing-windows-paths-none", "[]", false);
+
+    let (host, log) = windows_paths_run(&case);
+
+    assert_eq!(host, MAC, "{log}");
+    assert!(!log.contains("kept off the macOS builder"), "{log}");
+}
+
+/// The checkout has no commit and no origin ref, so a read of its change could not tell it and would keep the run off
+/// the Mac.
+#[test]
+fn a_repo_without_a_windows_file_asks_no_git_for_it_and_leaves_the_mac() {
+    let case = two_builder_case("routing-windows-paths-no-file");
+
+    let (host, log) = windows_paths_run(&case);
+
+    assert_eq!(host, MAC, "{log}");
+    assert!(!log.contains("kept off the macOS builder"), "{log}");
+}
+
 #[test]
 fn a_mac_refusing_version_sends_the_run_on_to_host_which_runs_it() {
     let case = two_builder_case("routing-next-builder");

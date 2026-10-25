@@ -7,7 +7,8 @@
 //! parse failure text its readers share with the gate ([`spelled`], [`parse_failure`]), and the repo's desktop
 //! declaration ([`desktop`]). It holds too the caller's
 //! environment a routed run does not send ([`dropped_env`]) and the repo's declaration of the prefixes its commands
-//! read ([`env`]) and of the commands that stay on this PC ([`local`]).
+//! read ([`env`]), of the commands that stay on this PC ([`local`]) and of the paths whose change keeps a run off a
+//! macOS builder ([`windows`]).
 //!
 //! The crate is pure: it reads no file, runs no git or other process and reads no environment or clock. The decision
 //! asks the caller for each fact it needs through [`Facts`], and only at the rule that needs it, so it builds and tests
@@ -25,6 +26,7 @@ pub mod local;
 mod rewrite;
 pub mod warm;
 mod watch;
+pub mod windows;
 
 pub use config::{Builder, BuilderOs, CARGO_OUTPUTS, Config, ConfigProblem, DEFAULT_OUTPUTS, builder_id, ignored_line, is_unix_root, is_usable_host};
 pub use decide::{

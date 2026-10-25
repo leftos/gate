@@ -11,6 +11,7 @@ use crate::escape::escaped;
 use crate::key::{is_layout_name, repo_name, work_folder_key};
 use crate::like::{Pattern, eq_ignoring_case};
 use crate::rewrite::{RewritePlace, Rewritten, Separators, SiblingRoot, drive_letters, is_script_text, rewrite_named, root_letter, split_root};
+use crate::windows::{WINDOWS_NAME, WindowsChange};
 
 /// The line said when `--no-build` was dropped from the builder's words.
 pub const DROPPED_NO_BUILD_LINE: &str = "gate: dropped --no-build: the last build may have run on the other machine";
@@ -235,6 +236,14 @@ pub trait Facts {
     /// read. Asked only of a macOS pick of a `dotnet test` whose own words name no response file, which a `true`
     /// sends on to the next builder that is no macOS one.
     fn windows_only_tests(&self, place: &Place, words: &[String]) -> bool;
+
+    /// What the change of the worktree at `place`, and of each of its declared `siblings` an entry of its
+    /// `.gate/windows.toml` names, is to that file's paths ([`WindowsChange`]): untouched when there is no such file,
+    /// touched with the first changed path a declared path matches, or unknown, with why, when that cannot be told.
+    /// `siblings_problem` is how the lines name the siblings file when it has a problem, and `siblings` then empty.
+    /// Asked only of a macOS pick, whatever the command, which a touched or unknown change sends on to the next builder
+    /// that is no macOS one; the lines name the file as [`Facts::declaration_said`] says.
+    fn windows_change(&self, place: &Place, siblings: &[SiblingRoot], siblings_problem: Option<&str>) -> WindowsChange;
 
     /// Whether a file of exactly this name is in the gate's folder.
     fn file_in_folder(&self, name: &str) -> bool;
@@ -1264,7 +1273,7 @@ pub fn later_run(inputs: &Inputs<'_>, facts: &dyn Facts, candidate: &LaterCandid
     let pattern = first_match(patterns, &sent.words).ok_or_else(|| Some("none of its patterns matches the command now".to_owned()))?;
     kept_run(&config, (opened, drives, sent), (builder, pattern), inputs.words, facts).map_err(|unkept| match unkept {
         Unkept::Here(here) => Some(kept_here(here)),
-        Unkept::Desktop | Unkept::WindowsOnly | Unkept::Backslash => None,
+        Unkept::Desktop | Unkept::WindowsOnly | Unkept::WindowsChange(_) | Unkept::Backslash => None,
     })
 }
 
@@ -1276,6 +1285,9 @@ enum Unkept {
     Desktop,
     /// A macOS builder, and the command may test a Windows-only project ([`macos_windows_only`]).
     WindowsOnly,
+    /// A macOS builder, and the change touches the paths of the worktree's `.gate/windows.toml`, or cannot be told to,
+    /// for the reason given ([`macos_windows_change`]).
+    WindowsChange(String),
     /// A macOS builder, and a word of the command's Unix form still holds a `\` ([`Slashed::Backslash`]).
     Backslash,
 }
@@ -1292,12 +1304,9 @@ fn kept_run(config: &Config, sent: OpenedAndSent, chosen: (Builder, String), giv
     let (opened, drives, sent) = sent;
     let (builder, pattern) = chosen;
     check_local(&opened.place, &sent.words, facts).map_err(Unkept::Here)?;
-    let found = macos_desktop(&builder, &opened, &sent.words, facts).map_err(Unkept::Here)?;
-    if found.steers_off() {
-        return Err(Unkept::Desktop);
-    }
-    if macos_windows_only(&builder, &opened.place, &sent.words, facts) {
-        return Err(Unkept::WindowsOnly);
+    let (found, unkept) = macos_kept_off(config, &builder, &opened, &sent.words, facts).map_err(Unkept::Here)?;
+    if let Some(unkept) = unkept {
+        return Err(unkept);
     }
     let unix = match slashed(&builder, &opened, given, &drives, facts) {
         Slashed::Backslash => return Err(Unkept::Backslash),
@@ -1336,7 +1345,7 @@ fn pinned(inputs: &Inputs<'_>, host: &str, facts: &dyn Facts) -> Result<RemoteRu
         host: host.to_owned(),
         why: why.to_owned(),
     };
-    let here = |here: Here| cannot(&here.map_or_else(|| "the routing decision runs it here".to_owned(), |reason| reason.reason()));
+    let here = |here: Here| cannot(&here_why(here));
     let (config, builder) = pinned_builder(inputs, host, facts)?;
     let listed = |repo: &str| config.own_patterns(&builder, repo).is_some() || config.is_routed(repo);
     let (opened, drives, sent) =
@@ -1353,6 +1362,7 @@ fn pinned(inputs: &Inputs<'_>, host: &str, facts: &dyn Facts) -> Result<RemoteRu
         Unkept::Here(reason) => here(reason),
         Unkept::Desktop => cannot("it asks for a desktop, which a macOS builder does not have"),
         Unkept::WindowsOnly => cannot("it may test a Windows-only project, which a macOS builder cannot run"),
+        Unkept::WindowsChange(reason) => cannot(&reason),
         Unkept::Backslash => cannot(r"a word still holds a \, which a macOS builder reads another way"),
     })
 }
@@ -1663,8 +1673,10 @@ fn desktop_pattern(place: &Place, words: &[String], facts: &dyn Facts) -> Result
 
 /// The pick `first` of the opened worktree's command `words`, kept unless it is a macOS builder and a declared desktop
 /// pattern matches the command ([`desktop_pattern`]), as a macOS builder has no desktop to run it on, or the command is
-/// a `dotnet test` of a Windows-only test project ([`macos_windows_only`]): the pick then goes on to the next builder
-/// that is no macOS one. Also what it read of the desktop file; `Err(None)` when no other builder's pattern matches.
+/// a `dotnet test` of a Windows-only test project ([`macos_windows_only`]), or the change touches the paths of the
+/// worktree's `.gate/windows.toml` or cannot be told to ([`macos_windows_change`]): the pick then goes on to the next
+/// builder that is no macOS one. Also what it read of the desktop file; `Err(None)` when no other builder's pattern
+/// matches.
 fn steer_off_macos(
     config: &Config,
     opened: &Opened,
@@ -1672,8 +1684,8 @@ fn steer_off_macos(
     facts: &dyn Facts,
     first: (Builder, String),
 ) -> Result<(Builder, String, DesktopRead), Here> {
-    let read = macos_desktop(&first.0, opened, words, facts)?;
-    if !read.steers_off() && !macos_windows_only(&first.0, &opened.place, words, facts) {
+    let (read, unkept) = macos_kept_off(config, &first.0, opened, words, facts)?;
+    if unkept.is_none() {
         return Ok((first.0, first.1, read));
     }
     let (builder, pattern) = pick(config, &opened.repo, words, |builder| builder.os != BuilderOs::Macos).ok_or(None)?;
@@ -1701,6 +1713,69 @@ fn macos_windows_only(builder: &Builder, place: &Place, words: &[String], facts:
         DotnetTest::Opaque => true,
         DotnetTest::Readable => facts.windows_only_tests(place, words),
     }
+}
+
+/// Why a pick of `builder` for the opened worktree's run is kept off it for the change: a macOS builder and a change the
+/// facts say touches the paths of the worktree's `.gate/windows.toml`, or cannot be told to
+/// ([`Facts::windows_change`]), whatever the command; `None` for any other builder, which reads nothing, and for a
+/// worktree whose declared siblings fail their checks ([`checked_siblings`]), which steers nothing: settling the run
+/// checks them again and keeps it here with that reason ([`settle`]).
+fn macos_windows_change(config: &Config, builder: &Builder, opened: &Opened, facts: &dyn Facts) -> Option<String> {
+    if builder.os != BuilderOs::Macos {
+        return None;
+    }
+    checked_siblings(config, opened, facts).ok()?;
+    let siblings_problem = opened.problem.as_ref().map(|_| opened.file.as_str());
+    facts
+        .windows_change(&opened.place, &opened.siblings, siblings_problem)
+        .reason(&facts.declaration_said(&opened.place, WINDOWS_NAME))
+}
+
+/// The opened worktree's declared siblings put through the checks a routed run's siblings pass ([`check_siblings`]:
+/// each folder present and no link or junction, each allowed by the routing file, no two one folder), before the change
+/// read runs git in any of them; none declared, or a siblings file with a problem, which declares none, passes. A
+/// failed check steers nothing off a macOS builder: the run is kept here with that reason when [`settle`] checks the
+/// siblings again, whatever builder it would have gone to.
+fn checked_siblings(config: &Config, opened: &Opened, facts: &dyn Facts) -> Result<(), Here> {
+    if opened.siblings.is_empty() {
+        return Ok(());
+    }
+    let declared = Declared {
+        problem: opened.problem.clone(),
+        file: &opened.file,
+        root: &opened.place.root,
+        leaf: &opened.leaf,
+        siblings: &opened.siblings,
+    };
+    check_siblings(&declared, config.allowed_siblings(&opened.repo), facts).map(|_| ())
+}
+
+/// Why the decision keeps a run here, on one line: the reason it says, or that it runs it here silently.
+fn here_why(here: Here) -> String {
+    here.map_or_else(|| "the routing decision runs it here".to_owned(), |reason| reason.reason())
+}
+
+/// The first rule that keeps a pick of `builder` for the opened worktree's command `words` off it, as a macOS builder:
+/// a declared desktop pattern the command matches ([`macos_desktop`]), a Windows-only test ([`macos_windows_only`]) or
+/// the change ([`macos_windows_change`]), each asked only when no earlier one keeps it off; `None` when none does, or
+/// for any other builder. Also what it read of the desktop file. The one list of these rules that the first pick
+/// ([`steer_off_macos`]) and a later or pinned builder ([`kept_run`]) both follow.
+fn macos_kept_off(
+    config: &Config,
+    builder: &Builder,
+    opened: &Opened,
+    words: &[String],
+    facts: &dyn Facts,
+) -> Result<(DesktopRead, Option<Unkept>), Here> {
+    let read = macos_desktop(builder, opened, words, facts)?;
+    let unkept = if read.steers_off() {
+        Some(Unkept::Desktop)
+    } else if macos_windows_only(builder, &opened.place, words, facts) {
+        Some(Unkept::WindowsOnly)
+    } else {
+        macos_windows_change(config, builder, opened, facts).map(Unkept::WindowsChange)
+    };
+    Ok((read, unkept))
 }
 
 /// What the pick read of the worktree's `.gate/desktop.toml` ([`steer_off_macos`]).

@@ -145,6 +145,22 @@ A command it matches runs here with `gate: not routed: .gate/local.toml keeps it
 
 A `.gate/local.toml` the gate cannot use keeps every routed command of the repo here with `gate: not routed: .gate/local.toml: <problem>`, so fix it before relying on routing. A repo that cannot commit the file keeps it in its declarations folder ([design.md](design.md#remotejson)). `gate check` does not report it.
 
+## A repo with Windows-only projects its commands do not name
+
+A routed `dotnet test` of a Windows-only project already stays off a macOS builder, but a script such as `pwsh tools/test-all.ps1` hides which projects it tests. A repo that wants such a script on the Mac only while no Windows-only project is affected declares the paths of those projects in a tracked `.gate/windows.toml`, `paths = ["tools/Windows.Hook/*", "tests/Windows.Hook.Tests/*"]`, at most 32 `-like` patterns matched against whole root-relative `/` paths, letter case ignored and `*` crossing `/`.
+
+A root entry matches only the worktree's own paths, and a sibling's paths match only the entries starting `../<sibling>/`. A project of a declared sibling is written `../<sibling>/<path>/*`, the sibling being one `.gate/siblings.toml` declares: all three of yaat's Windows-only test projects live in its sibling yaat-server, so yaat lists each project's tool and test folders there: `../yaat-server/tools/Yaat.CrcDriverHook/*`, `../yaat-server/tests/Yaat.CrcDriverHook.Tests/*`, and the same two for `Yaat.ClientDriver.Mcp` and `Yaat.CrcProbeHook`. No consent in `remote.json` is needed, since the file only keeps runs off the Mac.
+
+A macOS pick (whatever the command) of a change that touches a declared path, or whose change cannot be read, goes to the next builder that is no macOS one, else `host`, else runs here, saying `gate: kept off the macOS builder: the change touches <path> (<file>)` or `gate: kept off the macOS builder: cannot tell whether the change touches <file>'s paths: <why>`, `<file>` being `.gate/windows.toml` or the path of the declarations-folder copy that was read.
+
+A `--builder` pin to the Mac is refused with the same words.
+
+The change is what differs from the merge-base of `HEAD` with `refs/remotes/origin/HEAD` (else `refs/remotes/origin/main`, which also stands in for an `origin/HEAD` that names no commit): committed, staged or unstaged changes and untracked files git does not ignore. A clone without either ref, a detached `HEAD`, a shallow clone, a merge-base git cannot find, a git call that fails or does not answer in time (10 s in all) or a changed path that is not valid UTF-8 cannot be told, so the run goes to Windows.
+
+A declared sibling that is a link or junction, has no folder or no `.git`, is not allowed in `remote.json` or is the worktree's own folder is checked before any git runs, and steers nothing: the run stays here with the sibling's own reason, `gate: not routed: sibling <name> is a link or a junction`, and a `--builder` pin to the Mac is refused with `gate: --builder <builder> cannot route this run: sibling <name> is a link or a junction`.
+
+A `.gate/windows.toml` with a problem (an entry naming a sibling but no path in it, for one) also sends the run to Windows, and the log names the problem. The main repo's change is read only when some entry is not a `../<sibling>/` one, and git runs without taking `.git/index.lock`. A repo with no file, or with `paths = []`, asks no git. The file may sit in the declarations folder; `gate check` does not report it ([design.md](design.md#routing), Windows paths).
+
 ## A repo whose builds read its own variables
 
 A routed run sends none of the caller's environment but the `--env` pairs, and warns when the caller holds a variable that run drops. The warning knows the build variables (`NuGetAudit`, `RUSTFLAGS` and the `NUGET_`, `MSBUILD`, `CARGO_BUILD_` and `CARGO_PROFILE_` families); a repo whose commands read others declares their name prefixes in a tracked `.gate/env.toml`, `prefixes = ["COLLIE_"]`, at most 32, each ASCII letters, digits and `_`, none starting `GATE_`.

@@ -3,6 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 
+use gate_router::windows::WindowsChange;
 use gate_router::{CarriedSibling, Config, ConfigProblem, Facts, FolderId, Inputs, Pattern, Place, SiblingFolder, SiblingRoot, Slot, Target};
 
 /// The worktree root the fixtures use.
@@ -120,6 +121,10 @@ pub struct FakeFacts {
     pub windows_only: bool,
     /// How many times that was asked, kept apart from [`FakeFacts::asked`].
     pub windows_only_asked: Cell<u32>,
+    /// What the change is to `.gate/windows.toml`'s paths.
+    pub windows_change: WindowsChange,
+    /// How many times that was asked, kept apart from [`FakeFacts::asked`].
+    pub windows_change_asked: Cell<u32>,
 }
 
 impl FakeFacts {
@@ -158,6 +163,8 @@ impl FakeFacts {
             given_trees: None,
             windows_only: false,
             windows_only_asked: Cell::new(0),
+            windows_change: WindowsChange::Untouched,
+            windows_change_asked: Cell::new(0),
         }
     }
 
@@ -218,6 +225,12 @@ impl Facts for FakeFacts {
     fn windows_only_tests(&self, _place: &Place, _words: &[String]) -> bool {
         self.windows_only_asked.set(self.windows_only_asked.get() + 1);
         self.windows_only
+    }
+
+    /// What [`FakeFacts::windows_change`] says.
+    fn windows_change(&self, _place: &Place, _siblings: &[SiblingRoot], _siblings_problem: Option<&str>) -> WindowsChange {
+        self.windows_change_asked.set(self.windows_change_asked.get() + 1);
+        self.windows_change.clone()
     }
 
     /// The box's layout under [`FakeFacts::builder_root`]: the work folder `{root}\work\{key}` itself with no sibling,

@@ -225,14 +225,29 @@ impl Git {
         self.output_within(call, cap, ERRORS_KEPT)
     }
 
-    /// [`Git::output_bytes`] with standard output read up to `cap` bytes and the last `kept` bytes of standard error
-    /// kept: a call that writes more than `cap` is ended as soon as its reader sees it, and is an over-cap call.
-    fn output_within(&self, call: &Call<'_>, cap: usize, kept: usize) -> Result<Vec<u8>, GitError> {
+    /// git run as [`Git::output_bytes_within`] runs it, with its exit status beside what it wrote on standard output, read
+    /// up to `cap` bytes, and the last [`ERRORS_KEPT`] bytes of its standard error, whatever the status: for a caller
+    /// that judges the status itself and says [`failed_line`] when it fails. A call that writes more than `cap` is ended
+    /// as soon as its reader sees it, and is an over-cap call.
+    pub(crate) fn status_within(&self, call: &Call<'_>, cap: usize) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), GitError> {
+        self.capped(call, cap, ERRORS_KEPT)
+    }
+
+    /// git run with standard output read up to `cap` bytes and the last `kept` bytes of standard error kept, and its
+    /// exit status: a call that writes more than `cap` is ended as soon as its reader sees it, and is an over-cap call.
+    fn capped(&self, call: &Call<'_>, cap: usize, kept: usize) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), GitError> {
         let (over, read_capped) = capped_reader(cap, over_line(call, cap));
         let (status, output, errors) = self.spawned(call, read_capped, move |pipe: File| tail(pipe, kept), Some(&over))?;
         let Some(output) = output else {
             return Err(GitError::OverCap(over.line));
         };
+        Ok((status, output, errors))
+    }
+
+    /// [`Git::output_bytes`] with standard output read up to `cap` bytes and the last `kept` bytes of standard error
+    /// kept: a call that writes more than `cap` is ended as soon as its reader sees it, and is an over-cap call.
+    fn output_within(&self, call: &Call<'_>, cap: usize, kept: usize) -> Result<Vec<u8>, GitError> {
+        let (status, output, errors) = self.capped(call, cap, kept)?;
         if !status.success() {
             return Err(GitError::Failed(failed_line(call, status.code(), &errors, &output)));
         }
@@ -944,7 +959,7 @@ pub(crate) fn spelled_limit(limit: Duration) -> String {
 /// about, its status, and what [`failure_text`] keeps of the lines it wrote, standard output's first and standard
 /// error's last, so that its last error lines are the ones kept. The args, the folder and the lines are each escaped
 /// once, as any of them may name what the builder sent.
-fn failed_line(call: &Call<'_>, status: Option<i32>, errors: &[u8], output: &[u8]) -> String {
+pub(crate) fn failed_line(call: &Call<'_>, status: Option<i32>, errors: &[u8], output: &[u8]) -> String {
     let status = status.map_or_else(|| "unknown".to_owned(), |code| code.to_string());
     let errors = String::from_utf8_lossy(errors);
     let output = String::from_utf8_lossy(output);

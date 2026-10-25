@@ -2,20 +2,21 @@
 //! drive table, then, for a command that would still route in a repo whose warm-up is set up, the hash of its warm-up
 //! file, and the lines they say. git runs on the run thread, before any command is started.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gate_args::{GATE_SET_NAMES, RunRequest, Slot, TestSeams, env_refusal};
 use gate_router::warm::FileRead;
+use gate_router::windows::{self, WindowsChange};
 use gate_router::{
-    Config, ConfigProblem, Facts, FolderId, Inputs, LaterCandidate, LocalReason, Pattern, PinRefusal, Place, RemoteRun, Route, SiblingFolder, Target,
-    decide, dropped_env, dropped_env_line, escaped, repo_name,
+    Config, ConfigProblem, Facts, FolderId, Inputs, LaterCandidate, LocalReason, Pattern, PinRefusal, Place, RemoteRun, Route, SiblingFolder,
+    SiblingRoot, Target, decide, dropped_env, dropped_env_line, escaped, repo_name,
 };
 use gate_win32::Share;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -53,6 +54,19 @@ const NOT_UNICODE: &str = "a word of the command is not valid Unicode";
 /// How long a git call of the hint's decision may take while the run still holds its light slot: a call that cannot
 /// answer in time means no hint, silently ([`would_route_on_heavy`]).
 const HINT_GIT_LIMIT: Duration = Duration::from_secs(5);
+/// How long the git calls of one read of the change against `.gate/windows.toml`'s paths may take together, for the
+/// worktree and every sibling it reads ([`Facts::windows_change`]); each call's own limit is what is left of it.
+const CHANGE_DEADLINE: Duration = Duration::from_secs(10);
+/// The ref the default branch's upstream is taken from when `refs/remotes/origin/HEAD` names none.
+const ORIGIN_MAIN: &str = "refs/remotes/origin/main";
+/// The ref the default branch's upstream is first taken from, followed when it is symbolic.
+const ORIGIN_HEAD: &str = "refs/remotes/origin/HEAD";
+
+/// How long the git calls of one read of a change may take together: the `--test-git-limit-ms` seam when it is given,
+/// so a case on a loaded machine never reaches it, else [`CHANGE_DEADLINE`].
+fn change_deadline(seams: &TestSeams) -> Duration {
+    seams.git_limit_ms.map_or(CHANGE_DEADLINE, Duration::from_millis)
+}
 
 /// The arguments of the git call that places a folder: its worktree root, the folder below it, and the common git
 /// folder, whose parent's name is the checkout's.
@@ -260,7 +274,16 @@ pub(crate) fn later_run(
 /// worktree an outside path lies in, which only changes the line of a run kept here.
 pub(crate) fn would_route_on_heavy(decision: &Decision, seams: &TestSeams) -> bool {
     let machine = Machine::hint(decision.local_app_data.as_deref(), seams);
-    decision.unicode && matches!(decide(&decision.inputs(gate_router::Slot::Heavy), &machine), Route::Routed(_))
+    hint_holds(decision.unicode, &machine, |machine| {
+        matches!(decide(&decision.inputs(gate_router::Slot::Heavy), machine), Route::Routed(_))
+    })
+}
+
+/// Whether the hint's decision gives a hint: only for a command whose words are all valid Unicode (`unicode`), which
+/// alone asks `routes` whether the decision on `machine` routes it, and only when it does and the read of the change
+/// against `.gate/windows.toml`'s paths, if `machine` made one, could tell it.
+fn hint_holds(unicode: bool, machine: &Machine<'_>, routes: impl FnOnce(&Machine<'_>) -> bool) -> bool {
+    unicode && routes(machine) && !machine.change_unknown.get()
 }
 
 /// The line a routed run says for the watched variables of the gate's environment it does not send
@@ -376,6 +399,16 @@ pub(crate) struct Machine<'a> {
     local_app_data: Option<&'a OsStr>,
     git_limit: Duration,
     git_drain: Duration,
+    /// The most bytes of a change listing git may write before it is ended and the change cannot be told: the git
+    /// module's [`git::OUTPUT_CAP`].
+    listing_cap: usize,
+    /// How long the git calls of one read of the change against `.gate/windows.toml`'s paths may take together
+    /// ([`Facts::windows_change`]): [`CHANGE_DEADLINE`], or the `--test-git-limit-ms` seam when it is given; the hint's
+    /// decision's own git limit for the hint's ([`would_route_on_heavy`]).
+    change_deadline: Duration,
+    /// Whether a read of the change could not tell it ([`Facts::windows_change`]): the hint's decision then gives no
+    /// hint ([`would_route_on_heavy`]).
+    change_unknown: Cell<bool>,
     /// Whether a placement call's readers get as long as git itself may take once it exits by itself
     /// ([`git::placing_drain`]): true for the decision, false for the hint's, which keeps the ordinary drain while the
     /// run holds its light slot ([`would_route_on_heavy`]).
@@ -410,6 +443,7 @@ impl<'a> Machine<'a> {
     fn of(local_app_data: Option<&'a OsStr>, seams: &TestSeams) -> Machine<'a> {
         Machine {
             remote_transport: seams.remote_transport.clone(),
+            change_deadline: change_deadline(seams),
             ..Machine::at(local_app_data, git::limit(seams), git::drain(seams))
         }
     }
@@ -422,6 +456,9 @@ impl<'a> Machine<'a> {
             local_app_data,
             git_limit,
             git_drain,
+            change_deadline: CHANGE_DEADLINE,
+            change_unknown: Cell::new(false),
+            listing_cap: git::OUTPUT_CAP,
             placing: true,
             found: RefCell::new(Placed::NotAsked),
             config: RefCell::new(None),
@@ -437,11 +474,13 @@ impl<'a> Machine<'a> {
     /// calls under [`HINT_GIT_LIMIT`] or the seams' limit when that is shorter, its readers under the seams' drain,
     /// which its placement call keeps, and neither the worktree of an outside path nor the worktree's `HEAD` read.
     fn hint(local_app_data: Option<&'a OsStr>, seams: &TestSeams) -> Machine<'a> {
+        let limit = git::limit(seams).min(HINT_GIT_LIMIT);
         Machine {
             look_up_trees: false,
             read_head: false,
             placing: false,
-            ..Machine::at(local_app_data, git::limit(seams).min(HINT_GIT_LIMIT), git::drain(seams))
+            change_deadline: limit,
+            ..Machine::at(local_app_data, limit, git::drain(seams))
         }
     }
 
@@ -493,6 +532,181 @@ impl<'a> Machine<'a> {
             .filter(|path| listed.iter().any(|file| lists_path(file, path.as_bytes())))
             .cloned()
             .collect())
+    }
+
+    /// What the change of the worktree at `place`, and of each of `siblings` an entry names, is to the paths its
+    /// `.gate/windows.toml` declares ([`Facts::windows_change`]): untouched with no file or no entry, else the first path
+    /// a declared path matches of the worktree's change, read only when an entry is not a sibling's, then of each named
+    /// sibling's in declared order, its paths prefixed `../{name}/` ([`Machine::touched_in`]). A repo is read only while
+    /// no earlier path is touched. Every git call shares one deadline of [`Machine::change_deadline`].
+    ///
+    /// # Errors
+    ///
+    /// Why it cannot be told: the file cannot be read or has a problem, git cannot be found, or a repo's change cannot
+    /// be read.
+    fn read_change(&self, place: &Place, siblings: &[SiblingRoot], siblings_problem: Option<&str>) -> Result<WindowsChange, String> {
+        let Some(bytes) = self.declaration(place, windows::WINDOWS_NAME)? else {
+            return Ok(WindowsChange::Untouched);
+        };
+        let names: Vec<&str> = siblings.iter().map(|sibling| sibling.name.as_str()).collect();
+        let declared = siblings_problem.map_or(Ok(names.as_slice()), Err);
+        let patterns = windows::read_windows(&bytes, declared)?;
+        if patterns.is_empty() {
+            return Ok(WindowsChange::Untouched);
+        }
+        let deadline = Instant::now() + self.change_deadline;
+        let own = std::iter::once(ChangedRepo {
+            root: Path::new(&place.root),
+            sibling: None,
+        });
+        let named = siblings.iter().map(|sibling| ChangedRepo {
+            root: Path::new(&sibling.root),
+            sibling: Some(&sibling.name),
+        });
+        let git = git::Git::find(Path::new(&place.root))?;
+        for repo in own.chain(named) {
+            let entries = windows::entries_for(&patterns, repo.sibling);
+            if entries.is_empty() {
+                continue;
+            }
+            if let Some(path) = self.touched_in(&git, &repo, &entries, deadline)? {
+                return Ok(WindowsChange::Touched { path });
+            }
+        }
+        Ok(WindowsChange::Untouched)
+    }
+
+    /// The first path of `repo`'s change that one of its `entries` ([`windows::entries_for`]) matches, its path prefixed
+    /// `../{name}/` for a sibling: the tracked paths `git diff --name-only --no-renames` lists against the merge-base
+    /// ([`Machine::change_base`]), committed, staged or not, then, only when none of them is touched, the untracked ones
+    /// `git ls-files --others --exclude-standard` lists, each in git's order and read up to [`Machine::listing_cap`].
+    /// Each git call runs under what is left of `deadline`.
+    ///
+    /// # Errors
+    ///
+    /// Why the change cannot be read ([`Machine::change_base`]), a listing git refuses, writes past the cap or writes
+    /// with a path that is not valid UTF-8, or the deadline passed.
+    fn touched_in(&self, git: &git::Git, repo: &ChangedRepo<'_>, entries: &[Pattern], deadline: Instant) -> Result<Option<String>, String> {
+        let base = self.change_base(git, repo.root, deadline)?;
+        let diff = ["--no-optional-locks", "diff", "--name-only", "--no-renames", "-z", base.as_str(), "--"];
+        let others = ["--no-optional-locks", "ls-files", "--others", "--exclude-standard", "-z"];
+        for args in [&diff[..], &others[..]] {
+            let listing = self
+                .change_answer(git, repo.root, args, deadline, self.listing_cap)?
+                .map_err(|refused| refused.line)?;
+            let mut paths = nul_separated(&listing, repo.root)?;
+            if let Some(name) = repo.sibling {
+                paths = paths.iter().map(|path| windows::sibling_path(name, path)).collect();
+            }
+            if let Some(path) = windows::first_touched(entries, &paths) {
+                return Ok(Some(path.to_owned()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The merge-base of the `HEAD` of the repo at `root` with the default branch's upstream ([`Machine::upstream`]).
+    ///
+    /// # Errors
+    ///
+    /// A shallow clone, a detached or unborn `HEAD`, a `HEAD` git cannot read (its failure line), no upstream ref, no
+    /// merge-base, a git call that fails or does not answer, or the deadline passed.
+    fn change_base(&self, git: &git::Git, root: &Path, deadline: Instant) -> Result<String, String> {
+        let shown = root.display();
+        let head_args = [
+            "--no-optional-locks",
+            "rev-parse",
+            "--is-shallow-repository",
+            "--symbolic-full-name",
+            "HEAD",
+        ];
+        let head = match self.change_answer(git, root, &head_args, deadline, git::OUTPUT_CAP)? {
+            Ok(head) => utf8_answer(head, "rev-parse", root)?,
+            Err(refused) => return Err(self.head_failure(git, root, refused, deadline)?),
+        };
+        let mut lines = head.lines();
+        if lines.next() != Some("false") {
+            return Err(format!("{shown} is a shallow clone"));
+        }
+        if !lines.next().is_some_and(|name| name.starts_with("refs/")) {
+            return Err(format!("HEAD is detached in {shown}"));
+        }
+        let upstream = self.upstream(git, root, deadline)?;
+        let no_base = || format!("HEAD and {upstream} have no merge-base in {shown}");
+        let merge_base = ["--no-optional-locks", "merge-base", "HEAD", upstream];
+        match self.change_answer(git, root, &merge_base, deadline, git::OUTPUT_CAP)? {
+            Ok(base) => Some(utf8_answer(base, "merge-base", root)?.trim().to_owned())
+                .filter(|base| !base.is_empty())
+                .ok_or_else(no_base),
+            Err(Refused { code: Some(1), .. }) => Err(no_base()),
+            Err(refused) => Err(refused.line),
+        }
+    }
+
+    /// Why the `HEAD` of the repo at `root` could not be read, git having `refused` it: that it names no commit when
+    /// `HEAD` names a branch (an unborn one), else git's own failure line, as for a pruned worktree or a folder git
+    /// will not read.
+    ///
+    /// # Errors
+    ///
+    /// The deadline passed, or git cannot be started or does not answer within its limit.
+    fn head_failure(&self, git: &git::Git, root: &Path, refused: Refused, deadline: Instant) -> Result<String, String> {
+        let branch = ["--no-optional-locks", "symbolic-ref", "--quiet", "HEAD"];
+        Ok(match self.change_answer(git, root, &branch, deadline, git::OUTPUT_CAP)? {
+            Ok(_) => format!("HEAD names no commit in {}", root.display()),
+            Err(_) => refused.line,
+        })
+    }
+
+    /// The default branch's upstream of the repo at `root`, as the ref that names it: [`ORIGIN_HEAD`] when it names a
+    /// commit, a symbolic ref followed, else [`ORIGIN_MAIN`] when it names one, as after the target of `origin/HEAD` was
+    /// pruned. Each is asked with `git rev-parse --verify --quiet <ref>^{commit}`, whose exit 1 says there is none.
+    ///
+    /// # Errors
+    ///
+    /// Neither ref names a commit, a rev-parse fails otherwise (its failure line), or a git call does not answer.
+    fn upstream(&self, git: &git::Git, root: &Path, deadline: Instant) -> Result<&'static str, String> {
+        for name in [ORIGIN_HEAD, ORIGIN_MAIN] {
+            let commit = format!("{name}^{{commit}}");
+            let verify = ["--no-optional-locks", "rev-parse", "--verify", "--quiet", commit.as_str()];
+            match self.change_answer(git, root, &verify, deadline, git::OUTPUT_CAP)? {
+                Ok(_) => return Ok(name),
+                Err(Refused { code: Some(1), .. }) => {}
+                Err(refused) => return Err(refused.line),
+            }
+        }
+        Err(format!("{} has no {ORIGIN_HEAD} or {ORIGIN_MAIN}", root.display()))
+    }
+
+    /// What one git call of a change's read with `args` in `root` wrote on standard output, read up to `cap` bytes by a
+    /// reader that ends git as soon as it passes them ([`git::Git::status_within`]); `Err` with the call's status and
+    /// failure line when git exits with a failure status. The call's limit is what is left of `deadline`, never more
+    /// than the decision's own ([`change_limit`]).
+    ///
+    /// # Errors
+    ///
+    /// The deadline passed, or the call was ended at what was left of it ([`change_error`]); git cannot be started,
+    /// does not answer within its own limit, or writes more than `cap`.
+    fn change_answer(&self, git: &git::Git, root: &Path, args: &[&str], deadline: Instant, cap: usize) -> Result<Result<Vec<u8>, Refused>, String> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Some(limit) = change_limit(left, self.git_limit) else {
+            return Err(deadline_line(self.change_deadline));
+        };
+        let call = git::Call {
+            drain: self.git_drain,
+            ..git::Call::plain(root, args, limit)
+        };
+        let (status, output, errors) = git
+            .status_within(&call, cap)
+            .map_err(|error| change_error(error, limit, limit < self.git_limit, self.change_deadline))?;
+        if !status.success() {
+            let code = status.code();
+            return Ok(Err(Refused {
+                code,
+                line: git::failed_line(&call, code, &errors, &output),
+            }));
+        }
+        Ok(Ok(output))
     }
 
     /// The decision's git call in `folder` with `args`, under the decision's limit and drain.
@@ -603,6 +817,21 @@ impl Facts for Machine<'_> {
             self.notes.borrow_mut().push(format!("gate: kept off the macOS builder: {why}"));
             true
         })
+    }
+
+    /// A change that touches a declared path, or cannot be told to, says why in the log ([`Machine::read_change`]).
+    /// The hint's machine notes an unknown change apart, which means no hint ([`would_route_on_heavy`]).
+    fn windows_change(&self, place: &Place, siblings: &[SiblingRoot], siblings_problem: Option<&str>) -> WindowsChange {
+        let change = self
+            .read_change(place, siblings, siblings_problem)
+            .unwrap_or_else(|why| WindowsChange::Unknown { why });
+        if matches!(change, WindowsChange::Unknown { .. }) {
+            self.change_unknown.set(true);
+        }
+        if let Some(reason) = change.reason(&self.declaration_said(place, windows::WINDOWS_NAME)) {
+            self.notes.borrow_mut().push(format!("gate: kept off the macOS builder: {reason}"));
+        }
+        change
     }
 
     fn file_in_folder(&self, name: &str) -> bool {
@@ -841,6 +1070,65 @@ fn read_siblings(read: Result<Option<Vec<u8>>, String>) -> Result<Vec<String>, S
         Some(problem) => Err(problem),
         None => Ok(declared.names),
     }
+}
+
+/// `answer`, the output of the git call `name` in `root`, as UTF-8 text.
+fn utf8_answer(answer: Vec<u8>, name: &str, root: &Path) -> Result<String, String> {
+    String::from_utf8(answer).map_err(|_| format!("the output of git {name} in {} is not valid UTF-8", root.display()))
+}
+
+/// The non-empty paths of the `-z` listing git wrote of the repo at `root`, in order; `Err` naming the first path that
+/// is not valid UTF-8, which cannot be judged.
+fn nul_separated(listing: &[u8], root: &Path) -> Result<Vec<String>, String> {
+    listing
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            String::from_utf8(path.to_vec()).map_err(|_| {
+                format!(
+                    "git listed a path that is not valid UTF-8 in {}: {}",
+                    root.display(),
+                    String::from_utf8_lossy(path)
+                )
+            })
+        })
+        .collect()
+}
+
+/// How long the next git call of a change's read may take with `left` of its deadline left: all of it, never more
+/// than `per_call`; `None` once nothing is left.
+fn change_limit(left: Duration, per_call: Duration) -> Option<Duration> {
+    (!left.is_zero()).then(|| left.min(per_call))
+}
+
+/// What a git call of a change's read that git `error` ended says: the deadline's own line when the call was killed at
+/// its `limit` and that limit was the time left of the shared `deadline` (`by_deadline`), else the error's line.
+fn change_error(error: git::GitError, limit: Duration, by_deadline: bool, deadline: Duration) -> String {
+    let why = String::from(error);
+    if by_deadline && why == git::late_git_line(limit) {
+        deadline_line(deadline)
+    } else {
+        why
+    }
+}
+
+/// Why a change's read stopped once its git calls together passed `deadline`.
+fn deadline_line(deadline: Duration) -> String {
+    format!("its git calls did not answer within {}", git::spelled_limit(deadline))
+}
+
+/// A repo whose change a read of `.gate/windows.toml`'s paths asks git for: its root, and the sibling name its paths
+/// are prefixed with, `None` for the worktree's own.
+struct ChangedRepo<'a> {
+    root: &'a Path,
+    sibling: Option<&'a str>,
+}
+
+/// A git call of a change's read that git answered with a failure status: the status, and the failure line naming the
+/// call, its folder, its status and its last lines.
+struct Refused {
+    code: Option<i32>,
+    line: String,
 }
 
 /// The patterns a pattern file (`desktop.toml` or `local.toml`) declares, from its `read` ([`read_declaration`]) and
@@ -1278,13 +1566,15 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use gate_router::{CarriedSibling, Config, Facts, FolderId, LocalReason, Place, Route, SiblingFolder, Target};
+    use gate_router::windows::WindowsChange;
+    use gate_router::{CarriedSibling, Config, Facts, FolderId, LocalReason, Place, Route, SiblingFolder, SiblingRoot, Target};
     use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
     use super::{
-        DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, GATE_FILE_NOT_A_FILE, HINT_GIT_LIMIT, Machine, Origin, SIBLING_GIT_LINK, SIBLING_LINK,
-        SIBLING_NOT_A_FOLDER, Source, checkout_of, holds_existing_path, is_fixed_local, is_share_target, judge_declarations, not_routed, parse_head,
-        parse_place, read_declaration, read_siblings, sibling_folder, worktree_of,
+        CHANGE_DEADLINE, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, GATE_FILE_NOT_A_FILE, HINT_GIT_LIMIT, Machine, Origin, SIBLING_GIT_LINK,
+        SIBLING_LINK, SIBLING_NOT_A_FOLDER, Source, change_error, change_limit, checkout_of, hint_holds, holds_existing_path, is_fixed_local,
+        is_share_target, judge_declarations, not_routed, nul_separated, parse_head, parse_place, read_declaration, read_siblings, sibling_folder,
+        worktree_of,
     };
     use crate::remote::box_trees;
     use crate::remote::git;
@@ -1597,6 +1887,247 @@ mod tests {
         let notes = machine.notes.take();
         assert_eq!(notes.len(), 1, "one line says why: {notes:?}");
         assert!(notes[0].starts_with("gate: kept off the macOS builder: "), "{notes:?}");
+    }
+
+    /// Commits every file of the repo at `root` with the message `message`, as a committer of the test's own, with no
+    /// hook and no signing.
+    fn commit_all(root: &Path, message: &str) {
+        git_in(root, &["add", "--all"]);
+        let identity = [
+            "-c",
+            "user.name=gate test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ];
+        let commit = [
+            "-c",
+            "core.hooksPath=.no-hooks",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "--message",
+            message,
+        ];
+        git_in(root, &[&identity[..], &commit[..]].concat());
+    }
+
+    /// Makes `root` a repo whose `.gate/windows.toml` declares `paths`, its one commit `refs/remotes/origin/main`.
+    fn change_repo(root: &Path, paths: &str) {
+        git_in(root, &["init", "--quiet"]);
+        put(root, ".gate/windows.toml");
+        fs::write(root.join(".gate").join("windows.toml"), format!("paths = {paths}\n")).expect("the declaration can be written");
+        commit_all(root, "base");
+        git_in(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    }
+
+    /// What the decision's machine reads of the change of the worktree at `root` carrying `siblings`.
+    fn change_of(root: &Path, siblings: &[SiblingRoot]) -> WindowsChange {
+        change_machine().windows_change(&place_of(root), siblings, None)
+    }
+
+    /// The decision's machine with its git calls, readers and change deadline under [`git::TEST_HANG_GUARD`], so a read
+    /// on a loaded machine never reaches the production deadline.
+    fn change_machine() -> Machine<'static> {
+        Machine {
+            change_deadline: git::TEST_HANG_GUARD,
+            ..Machine::at(None, git::TEST_HANG_GUARD, git::TEST_HANG_GUARD)
+        }
+    }
+
+    #[test]
+    fn a_call_killed_at_the_time_left_of_the_deadline_says_the_deadline() {
+        let left = Duration::from_millis(3);
+        let late = || git::GitError::Failed(git::late_git_line(left));
+        let deadline = Duration::from_secs(10);
+        assert_eq!(change_error(late(), left, true, deadline), "its git calls did not answer within 10 s");
+        assert_eq!(
+            change_error(late(), left, false, deadline),
+            "git did not answer within 3 ms",
+            "its own limit"
+        );
+        assert_eq!(change_error(git::GitError::Failed("other".to_owned()), left, true, deadline), "other");
+    }
+
+    #[test]
+    fn a_hint_reads_nothing_for_a_word_not_unicode_and_none_holds_for_an_unknown_change() {
+        let machine = Machine::hint(None, &TestSeams::default());
+        assert!(!hint_holds(false, &machine, |_| panic!("the decision is not asked")));
+        assert!(hint_holds(true, &machine, |_| true), "a routed decision with a change told");
+        assert!(!hint_holds(true, &machine, |_| false));
+        let unknown = |machine: &Machine<'_>| {
+            machine.change_unknown.set(true);
+            true
+        };
+        assert!(
+            !hint_holds(true, &Machine::hint(None, &TestSeams::default()), unknown),
+            "a routed decision, change unknown"
+        );
+    }
+
+    #[test]
+    fn a_head_git_cannot_read_says_git_failure_line_and_an_unborn_one_names_no_commit() {
+        let (broken, _removed) = scratch("change-broken-git");
+        put(&broken, ".gate/windows.toml");
+        fs::write(broken.join(".gate").join("windows.toml"), "paths = ['a/*']\n").expect("the declaration can be written");
+        fs::write(broken.join(".git"), "gitdir: missing\n").expect("a broken .git file can be written");
+        let WindowsChange::Unknown { why } = change_of(&broken, &[]) else {
+            panic!("a broken .git cannot be read");
+        };
+        assert!(why.starts_with("git --no-optional-locks rev-parse --is-shallow-repository"), "{why}");
+        assert!(why.contains("(status 128)"), "{why}");
+
+        let (unborn, _removed_unborn) = scratch("change-unborn");
+        git_in(&unborn, &["init", "--quiet"]);
+        put(&unborn, ".gate/windows.toml");
+        fs::write(unborn.join(".gate").join("windows.toml"), "paths = ['a/*']\n").expect("the declaration can be written");
+        assert_eq!(change_of(&unborn, &[]), unknown(format!("HEAD names no commit in {}", unborn.display())));
+    }
+
+    #[test]
+    fn a_plain_origin_head_naming_a_commit_is_the_base_with_no_origin_main() {
+        let (root, _removed) = scratch("change-plain-origin-head");
+        change_repo(&root, "['tools/Hook/*']");
+        git_in(&root, &["update-ref", "refs/remotes/origin/HEAD", "HEAD"]);
+        git_in(&root, &["update-ref", "-d", "refs/remotes/origin/main"]);
+        put(&root, "tools/Hook/a.cs");
+        commit_all(&root, "hook");
+        assert_eq!(
+            change_of(&root, &[]),
+            WindowsChange::Touched {
+                path: "tools/Hook/a.cs".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn a_listing_past_the_cap_ends_git_and_cannot_be_told() {
+        let (root, _removed) = scratch("change-over-cap");
+        change_repo(&root, "['tools/Hook/*']");
+        put(&root, "docs/a-long-untracked-name.md");
+        let machine = Machine {
+            listing_cap: 8,
+            ..change_machine()
+        };
+        let WindowsChange::Unknown { why } = machine.windows_change(&place_of(&root), &[], None) else {
+            panic!("a listing past the cap cannot be judged");
+        };
+        assert!(why.starts_with("git --no-optional-locks ls-files"), "{why}");
+        assert!(why.ends_with("its output passed 8 bytes"), "{why}");
+    }
+
+    /// A change that cannot be told, for `why`.
+    fn unknown(why: String) -> WindowsChange {
+        WindowsChange::Unknown { why }
+    }
+
+    /// The sibling `name` at `root`.
+    fn sibling_at(name: &str, root: &Path) -> SiblingRoot {
+        SiblingRoot {
+            name: name.to_owned(),
+            root: root.to_string_lossy().into_owned(),
+        }
+    }
+
+    #[test]
+    fn the_limit_of_a_change_call_is_what_is_left_and_never_above_the_per_call_limit() {
+        let per_call = Duration::from_secs(60);
+        assert_eq!(change_limit(Duration::from_secs(3), per_call), Some(Duration::from_secs(3)));
+        assert_eq!(change_limit(Duration::from_secs(90), per_call), Some(per_call));
+        assert_eq!(change_limit(Duration::ZERO, per_call), None, "the deadline passed");
+    }
+
+    #[test]
+    fn the_hint_reads_the_change_under_its_own_limit_and_an_unknown_one_means_no_hint() {
+        let seams = TestSeams::default();
+        let hint = Machine::hint(None, &seams);
+        assert_eq!((hint.change_deadline, hint.git_limit), (HINT_GIT_LIMIT, HINT_GIT_LIMIT));
+        assert_eq!(Machine::of(None, &seams).change_deadline, CHANGE_DEADLINE);
+        let (root, _removed) = scratch("change-hint");
+        git_in(&root, &["init", "--quiet"]);
+        put(&root, ".gate/windows.toml");
+        fs::write(root.join(".gate").join("windows.toml"), "paths = ['a/*']\n").expect("the declaration can be written");
+        let machine = Machine::hint(None, &seams);
+        assert!(matches!(
+            machine.windows_change(&place_of(&root), &[], None),
+            WindowsChange::Unknown { .. }
+        ));
+        assert!(machine.change_unknown.get(), "the hint's decision gives no hint");
+    }
+
+    #[test]
+    fn a_detached_head_a_shallow_clone_and_no_merge_base_are_unknown_saying_so() {
+        let (root, _removed) = scratch("change-detached");
+        change_repo(&root, "['a/*']");
+        git_in(&root, &["checkout", "--quiet", "--detach"]);
+        assert_eq!(change_of(&root, &[]), unknown(format!("HEAD is detached in {}", root.display())));
+
+        let (from, _removed_from) = scratch("change-shallow-from");
+        change_repo(&from, "['a/*']");
+        commit_all(&from, "second");
+        let (shallow, _removed_shallow) = scratch("change-shallow");
+        let url = format!("file:///{}", from.to_string_lossy().replace('\\', "/"));
+        let into = shallow.to_string_lossy().into_owned();
+        git_in(&from, &["clone", "--quiet", "--depth", "1", &url, &into]);
+        assert_eq!(change_of(&shallow, &[]), unknown(format!("{} is a shallow clone", shallow.display())));
+
+        let (unrelated, _removed_unrelated) = scratch("change-unrelated");
+        change_repo(&unrelated, "['a/*']");
+        git_in(&unrelated, &["branch", "--move", "--force", "work"]);
+        git_in(&unrelated, &["checkout", "--quiet", "--orphan", "lone"]);
+        commit_all(&unrelated, "lone");
+        git_in(&unrelated, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(&unrelated, &["checkout", "--quiet", "work"]);
+        assert_eq!(
+            change_of(&unrelated, &[]),
+            unknown(format!("HEAD and refs/remotes/origin/main have no merge-base in {}", unrelated.display()))
+        );
+    }
+
+    #[test]
+    fn a_dangling_origin_head_falls_back_to_origin_main() {
+        let (root, _removed) = scratch("change-dangling-origin-head");
+        change_repo(&root, "['tools/Hook/*']");
+        git_in(&root, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/pruned"]);
+        put(&root, "tools/Hook/a.cs");
+        commit_all(&root, "hook");
+        assert_eq!(
+            change_of(&root, &[]),
+            WindowsChange::Touched {
+                path: "tools/Hook/a.cs".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn a_sibling_only_file_reads_the_sibling_alone() {
+        let (root, _removed) = scratch("change-sibling-root");
+        git_in(&root, &["init", "--quiet"]);
+        put(&root, ".gate/windows.toml");
+        fs::write(root.join(".gate").join("windows.toml"), "paths = ['../s/tools/*']\n").expect("the declaration can be written");
+
+        let (sibling, _removed_sibling) = scratch("change-sibling");
+        change_repo(&sibling, "[]");
+        put(&sibling, "tools/a.cs");
+        commit_all(&sibling, "tools");
+        assert_eq!(
+            change_of(&root, &[sibling_at("s", &sibling)]),
+            WindowsChange::Touched {
+                path: "../s/tools/a.cs".to_owned()
+            },
+            "the root, with no commit and no origin, is never read"
+        );
+    }
+
+    #[test]
+    fn a_listed_path_that_is_not_utf8_cannot_be_judged() {
+        let root = Path::new("X:/r");
+        assert_eq!(nul_separated(b"a.cs\0b/c.cs\0", root), Ok(vec!["a.cs".to_owned(), "b/c.cs".to_owned()]));
+        assert_eq!(
+            nul_separated(b"a.cs\0\xff.cs\0", root),
+            Err("git listed a path that is not valid UTF-8 in X:/r: \u{fffd}.cs".to_owned())
+        );
     }
 
     #[test]
