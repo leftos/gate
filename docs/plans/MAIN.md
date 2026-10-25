@@ -6,9 +6,8 @@
 
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [/] GATE-696 Cross-build Windows outputs on a macOS builder and bring them back — Urgent · Remote
-- [ ] GATE-760 Make boxside::box_run_ends_the_git_tree_of_a_step_it_bounded hold under load — Urgent · Remote
-- [ ] GATE-729 Make a sequence of gate runs die with whoever stops it — High · Local gate
-- [ ] GATE-615 Tie the Unix box's job record to its process group leader's start time — High · Remote
+- [ ] GATE-768 Make critical::a_count_raised_during_the_critical_run_lets_no_more_light_in hold under load — Urgent · No project
+- [/] GATE-729 Make a sequence of gate runs die with whoever stops it — High · Local gate
 - [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root — High · Remote
 - [ ] GATE-648 Restore pnpm, bun and npm packages on the Unix box, as the Windows box does — High · Remote
 - [ ] GATE-574 Take the work lock in the box preflight and stamp the lock's time on each run — High · Remote
@@ -35,11 +34,9 @@
 - [ ] GATE-689 Prune a gone worktree's keys from the Windows builders and the PC — High · Remote
 - [ ] GATE-730 Let the PC see the Unix box's start marker — High · Remote
 - [!] GATE-731 Route yaat's test-all to the Mac mini — High · Remote
-- [/] GATE-755 Run a Mac-routed test-all's Windows-only test projects on a Windows builder — High · Remote
 - [ ] GATE-745 Bring back the files a routed dotnet command's /flp and /getResultOutputFile switches name — High · Remote
 - [ ] GATE-751 Make a routed build's outputs pull fast enough for yaat's trees, or skip it for verdict-only runs — High · Remote
 - [ ] GATE-753 Log every step of a run in the gate's log: start, progress, end and duration — High · Remote
-- [/] GATE-752 Say a routed run's outputs pull: start, progress with an estimate, phase in the late warning, end — High · Remote
 - [ ] GATE-757 Retry a transfer that fails after a passing routed command, and say the command's verdict — High · Remote
 - [ ] GATE-759 Move the rest of the box's shared wire rules into gate-wire (GATE-616 slices 2, 3, 5, 6) — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
@@ -359,3 +356,10 @@
 - [ ] GATE-715 Share the outputs wire texts and pack driver between the Windows and Unix boxes
 - [ ] GATE-717 Refuse a work folder that is not `{root}/work/{key}` in every Unix box verb
 - [ ] GATE-718 Pin the Unix outputs run's no-EOF read, OutputsFull skip and gone probe
+- [ ] GATE-761 Remove wall-clock time assertions from the tests
+- [ ] GATE-762 Check a sibling is its own git root before reading its change
+- [ ] GATE-763 Match the hang hint's minute spans in the local hint case
+- [ ] GATE-764 Keep the outputs pull's unsaid-progress line and hint without a start marker
+- [ ] GATE-765 Refuse a Unix box work folder others can write
+- [ ] GATE-766 Keep a stop's escalation waiting when its leader cannot be looked at
+- [ ] GATE-767 Keep the orphan check on when another account plants MSYS objects
