@@ -5,9 +5,8 @@
 ## Do first
 
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
-- [ ] GATE-696 Cross-build Windows outputs on a macOS builder and bring them back — Urgent · Remote
-- [ ] GATE-739 Bring a routed build's outputs back so a later --no-build runs on them — Urgent · Remote
-- [ ] GATE-729 Make a sequence of gate runs die with whoever stops it — High · Local gate
+- [/] GATE-696 Cross-build Windows outputs on a macOS builder and bring them back — Urgent · Remote
+- [/] GATE-729 Make a sequence of gate runs die with whoever stops it — High · Local gate
 - [ ] GATE-616 Move the box's shared wire rules into gate-wire so both boxes say the same bytes — High · Remote
 - [ ] GATE-615 Tie the Unix box's job record to its process group leader's start time — High · Remote
 - [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root — High · Remote
@@ -34,13 +33,14 @@
 - [ ] GATE-682 Explain or track a stall when a gated command is plain ssh to another machine — High · Remote
 - [/] GATE-683 Prune a deleted worktree's folders from every builder, and prune the Mac by space — High · Remote
 - [ ] GATE-689 Prune a gone worktree's keys from the Windows builders and the PC — High · Remote
-- [ ] GATE-741 Keep a dotnet test of Windows-only test projects off the macOS builder — High · Remote
-- [ ] GATE-742 Keep test projects that need the PC's interactive user from failing a routed run — High · Remote
-- [ ] GATE-743 Bring back tracked files a routed run writes, or say they stayed on the builder — High · Remote
-- [ ] GATE-723 Route herdr-gpui's cargo and just ci to the Mac mini — High · Remote
 - [ ] GATE-730 Let the PC see the Unix box's start marker — High · Remote
 - [!] GATE-731 Route yaat's test-all to the Mac mini — High · Remote
+- [ ] GATE-755 Run a Mac-routed test-all's Windows-only test projects on a Windows builder — High · Remote
 - [ ] GATE-745 Bring back the files a routed dotnet command's /flp and /getResultOutputFile switches name — High · Remote
+- [ ] GATE-751 Make a routed build's outputs pull fast enough for yaat's trees, or skip it for verdict-only runs — High · Remote
+- [ ] GATE-753 Log every step of a run in the gate's log: start, progress, end and duration — High · Remote
+- [/] GATE-752 Say a routed run's outputs pull: start, progress with an estimate, phase in the late warning, end — High · Remote
+- [ ] GATE-757 Retry a transfer that fails after a passing routed command, and say the command's verdict — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -51,6 +51,7 @@
 
 - [ ] GATE-652 Refuse a gate.exe built with its test seams at install
 - [ ] GATE-678 Make pause suite cases fail at once when the gate they wait on exits
+- [ ] GATE-756 Make a light run's load adjustment see contention below saturation
 
 ## Remote
 
@@ -242,6 +243,10 @@
 - [ ] GATE-736 Route rustling-tulip's rt.ps1 native-e2e to the builder
 - [ ] GATE-737 Routed Godot --build-solutions fails on the builder: no .godot/imported in its copy
 - [ ] GATE-744 Say why a local project build adds no key to the nothing-back record
+- [ ] GATE-746 Pin a failing routed command's written tracked files coming back
+- [ ] GATE-747 Read --artifacts-path and --property as option values in dotnet target parsing
+- [ ] GATE-748 Let a --builder pin use the repo's other routes when the pinned entry's listing misses
+- [ ] GATE-750 Harden the Unix box's cross build: one read for check and pack, a command record, the stop window
 
 ## Cutover sweep
 
