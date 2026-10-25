@@ -15,16 +15,7 @@ linear: gate
 - The plan lives in Linear: every task is an issue in team GATE, per `~/.claude/docs/plan-operations.md`; `docs/plans/MAIN.md` is its generated snapshot, never edited by hand.
 
   Project order, which is the order the queue is worked: `Design`, `gate-state move`, `Local gate`, `Remote`, `Cutover sweep`, `After cutover`, `Backlog` (claude-config's `docs/plans/gate-rust-port.md`, "Steps"). `After cutover` holds the Rust gate's new features (cores hint, learned durations, `--slot auto`), built once GATE-9 has landed.
-- **Owner fence: the Mac mini as a builder, and nothing else without the owner's explicit approval.** This fence sits above every other rule in this profile, the focus fence below and the standing High rule included. The session works only on what makes the Mac mini a routed builder:
-  - GATE-686 and GATE-684, the Unix box items in flight;
-  - GATE-690, the Unix box's own prune and its launchd job;
-  - the Mac setup: its `remote.json` entry, the full suite, the reinstall and `gate push` to it;
-  - the Mac routing trials (in-the-sky, opening-hand, delve-the-dungeon, yaat and yaat-server, as `docs/routing-a-repo.md` gives them) and flipping the entry to routed;
-  - a failure a trial shows that keeps that repo off the Mac.
-
-  A route sends a repo's tests, format and lint to the Mac. A build whose outputs are launched on the PC afterwards stays on the Windows builder or the PC, until GATE-696 (cross-built Windows outputs) is approved.
-
-  Everything else waits, whatever its priority or project order, until the owner names it in a session: GATE-689's briefs 2 and 3, GATE-696, GATE-648, every other High issue, the inbox's requests and triage's new issues. A finding off the path gets an **add**, not a fix. An inbox request is **add**ed and filed, never started. The fence ends when the owner says so.
+- **What the Mac mini runs.** A route sends a repo's tests, format and lint to the Mac mini. A build whose outputs are launched on the PC afterwards stays on the Windows builder or the PC, until GATE-696 (cross-built Windows outputs) is approved.
 - **Focus fence: remote routing for every caller repo.** Until each repo GATE-192 names (delve-the-dungeon, godot-mcp, yaat, yaat-server, opening-hand, in-the-sky, rustling-tulip, towercab-3d) routes, or has its trial failure booked as GATE-192's ruling says, the queue holds only the items on that path, as a release fence does: the Urgent issues (each repo's next step) and the High ones (the tier after).
 
   Everything else waits, however high it sits in the project order; a finding off the path gets an **add**, not a fix. The path is kept in Linear's priorities: a step that lands moves the next one up.
