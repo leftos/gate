@@ -68,6 +68,7 @@ fn print_request_shows_the_new_cli_request() {
         "tail": 20,
         "noMarkers": false,
         "local": false,
+        "builder": null,
         "reason": null,
         "bringTracked": [],
         "env": [],
