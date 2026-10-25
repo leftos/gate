@@ -33,7 +33,7 @@
 #                    and log SKIP. An --admin run logs to stdout only, never into that account's prefix.
 # An unknown argument exits 2. Every step but System, Homebrew and FFmpeg refuses to run as root (exit 2): the
 # toolchains must land in the builder user's home, and --admin refuses root itself. Rust and cargo-nextest go to
-# $CARGO_HOME (default ~/.cargo) and rustup's $RUSTUP_HOME, as rustup itself places them.
+# $CARGO_HOME (default ~/.cargo) and rustup's $RUSTUP_HOME, as rustup itself places them; just goes to $CARGO_HOME/bin.
 #
 # Each step logs BEGIN, then OK, SKIP or FAIL with the reason, to stdout and timestamped to <prefix>/install.log; a
 # failed step does not stop the later ones, and the script exits 1 when any step failed. Rerunnable: finished downloads
@@ -288,6 +288,14 @@ step_nextest() {
     check_sum 256 "$fetched" '6c23b7fb4ca82c571fc8dfedbab45bfa773d45918f933170c85d21cd7f4b852b'
     mkdir -p "$cargo_home/bin"
     tar -xzf "$fetched" -C "$cargo_home/bin"
+}
+
+step_just() {
+    # From https://github.com/casey/just/releases/download/1.58.0/SHA256SUMS
+    fetch 'https://github.com/casey/just/releases/download/1.58.0/just-1.58.0-aarch64-apple-darwin.tar.gz'
+    check_sum 256 "$fetched" '50ae3e996c974a0bf32ea7d10f495070df33f1b43e0616b2769e3d4821ed8f48'
+    mkdir -p "$cargo_home/bin"
+    tar -xzf "$fetched" -C "$cargo_home/bin" just
 }
 
 step_git_lfs() {
@@ -755,6 +763,7 @@ summary() {
     version_of rustc "$cargo_home/bin/rustc" --version
     version_of cargo "$cargo_home/bin/cargo" --version
     version_of cargo-nextest "$cargo_home/bin/cargo-nextest" nextest --version
+    version_of just "$cargo_home/bin/just" --version
     version_of git-lfs "$prefix/bin/git-lfs" --version
     version_of godot "$prefix/godot/4.7.2/Godot.app/Contents/MacOS/Godot" --headless --version
     version_of bun "$prefix/bin/bun" --version
@@ -770,6 +779,7 @@ step 'pnpm 12.5.1' step_pnpm
 step 'uv 0.12.18 and prek 0.5.0' step_uv_prek
 step 'Rust (stable, 1.98.1, 1.96.1, 1.89.0)' step_rust
 step 'cargo-nextest 0.9.148' step_nextest
+step 'just 1.58.0' step_just
 step 'Git LFS 3.8.0' step_git_lfs
 step 'Godot 4.7.2 mono' step_godot
 step 'Bun 1.4.2' step_bun

@@ -90,6 +90,7 @@ pnpm 12.5.1
 uv 0.12.18 and prek 0.5.0
 Rust (stable, 1.98.1, 1.96.1, 1.89.0)
 cargo-nextest 0.9.148
+just 1.58.0
 Git LFS 3.8.0
 Godot 4.7.2 mono
 Bun 1.4.2
@@ -353,9 +354,9 @@ case_root_step_beside_system_refused() {
 case_list_homebrew() {
     run --list
     expect rc_is 0 &&
-        expect [ "$(sed -n '13p' "$scratch/out")" = 'Homebrew' ] &&
-        expect [ "$(sed -n '14p' "$scratch/out")" = 'FFmpeg' ] &&
-        expect [ "$(sed -n '15p' "$scratch/out")" = 'Login PATH' ]
+        expect [ "$(sed -n '14p' "$scratch/out")" = 'Homebrew' ] &&
+        expect [ "$(sed -n '15p' "$scratch/out")" = 'FFmpeg' ] &&
+        expect [ "$(sed -n '16p' "$scratch/out")" = 'Login PATH' ]
 }
 
 # The dry run comes before the steps may change the machine: it prints both steps' commands and logs SKIP for both.
