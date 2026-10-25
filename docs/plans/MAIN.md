@@ -7,8 +7,6 @@
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [ ] GATE-696 Cross-build Windows outputs on a macOS builder and bring them back — Urgent · Remote
 - [ ] GATE-739 Bring a routed build's outputs back so a later --no-build runs on them — Urgent · Remote
-- [/] GATE-740 Keep a run's slot, --alone and --local when the gate drops --no-build, and clear the routed-build record on a local build — Urgent · Remote
-- [/] GATE-724 Accept the two-word `--builder {host}` form in gate run — High · Local gate
 - [ ] GATE-729 Make a sequence of gate runs die with whoever stops it — High · Local gate
 - [ ] GATE-616 Move the box's shared wire rules into gate-wire so both boxes say the same bytes — High · Remote
 - [ ] GATE-615 Tie the Unix box's job record to its process group leader's start time — High · Remote
@@ -36,13 +34,13 @@
 - [ ] GATE-682 Explain or track a stall when a gated command is plain ssh to another machine — High · Remote
 - [/] GATE-683 Prune a deleted worktree's folders from every builder, and prune the Mac by space — High · Remote
 - [ ] GATE-689 Prune a gone worktree's keys from the Windows builders and the PC — High · Remote
-- [ ] GATE-738 End a test run that finds no test projects or runs zero tests red — High · Remote
 - [ ] GATE-741 Keep a dotnet test of Windows-only test projects off the macOS builder — High · Remote
 - [ ] GATE-742 Keep test projects that need the PC's interactive user from failing a routed run — High · Remote
 - [ ] GATE-743 Bring back tracked files a routed run writes, or say they stayed on the builder — High · Remote
 - [ ] GATE-723 Route herdr-gpui's cargo and just ci to the Mac mini — High · Remote
 - [ ] GATE-730 Let the PC see the Unix box's start marker — High · Remote
 - [!] GATE-731 Route yaat's test-all to the Mac mini — High · Remote
+- [ ] GATE-745 Bring back the files a routed dotnet command's /flp and /getResultOutputFile switches name — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -243,6 +241,7 @@
 - [ ] GATE-733 Say a descendant's exec on the Unix box when its image changes after spawn
 - [ ] GATE-736 Route rustling-tulip's rt.ps1 native-e2e to the builder
 - [ ] GATE-737 Routed Godot --build-solutions fails on the builder: no .godot/imported in its copy
+- [ ] GATE-744 Say why a local project build adds no key to the nothing-back record
 
 ## Cutover sweep
 
