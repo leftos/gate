@@ -44,6 +44,16 @@ const PATH_MAP_PAIR_SEPARATOR: &str = "%2C";
 const PROPERTY_SWITCH_NAMES: [&str; 2] = ["property", "p"];
 /// The dotnet verbs that build: the ones a command-line property reaches `MSBuild` through.
 const BUILD_VERBS: [&str; 6] = ["build", "test", "publish", "pack", "run", "msbuild"];
+/// The dotnet verbs that build a project where its later `--no-build` runs find it: `pack` and `publish` may not, and
+/// `msbuild` may build nothing.
+const IN_PLACE_VERBS: [&str; 3] = ["build", "test", "run"];
+/// The `MSBuild` properties whose setting builds a project under settings the words' own `-c`, `-f` and `-r` do not
+/// show, beside [`OUTPUT_PROPERTIES`], which move its output.
+const SETTING_PROPERTIES: [&str; 3] = ["Configuration", "TargetFramework", "RuntimeIdentifier"];
+/// The dotnet options that set the runtime identifier as `-r` does, which [`build_settings`] does not read.
+const RUNTIME_PART_OPTIONS: [&str; 4] = ["-a", "--arch", "--os", "--ucr"];
+/// The names of the switch that sets the `MSBuild` targets a build runs, the longer first; their case is ignored.
+const TARGET_SWITCH_NAMES: [&str; 2] = ["target", "t"];
 /// The dotnet verbs whose `--no-build` the gate drops; `pack` and `publish` keep theirs.
 const NO_BUILD_DROP_VERBS: [&str; 2] = ["test", "run"];
 /// The dotnet verb that hands its words to `MSBuild` as they are: a target such as `-t:Restore` may build nothing.
@@ -895,6 +905,25 @@ pub fn sdk_build_target(words: &[String]) -> Option<BuildTarget> {
     if matches!(dotnet_target(words), Some(DotnetTarget::Project(_))) {
         return Some(BuildTarget::Other);
     }
+    Some(match named_words(own)?.as_slice() {
+        [] => BuildTarget::Unnamed,
+        [one] if has_extension(one, &SOLUTION_EXTENSIONS) => BuildTarget::Solution,
+        _ => BuildTarget::Other,
+    })
+}
+
+/// The first word a dotnet command ([`is_dotnet`]) names among its own words after its verb, as [`sdk_build_target`]
+/// reads them: not starting with `-` or `/`, and no value of a known option. `None` for a command that names none, and
+/// for any other command.
+#[must_use]
+pub fn positional_target(words: &[String]) -> Option<String> {
+    let own = dotnet_own(words)?;
+    named_words(&words[own])?.first().map(|word| (*word).clone())
+}
+
+/// The words a dotnet command's own words (`own`, its dotnet word first) name after its verb: each not starting with
+/// `-` or `/` that is no value of a known option ([`BuildSettings`]'s, [`VALUE_OPTIONS`]). `None` without a verb.
+fn named_words(own: &[String]) -> Option<Vec<&String>> {
     let takes_value = |word: &str| {
         [&CONFIGURATION_OPTIONS[..], &FRAMEWORK_OPTIONS, &RUNTIME_OPTIONS, &VALUE_OPTIONS]
             .iter()
@@ -909,10 +938,32 @@ pub fn sdk_build_target(words: &[String]) -> Option<BuildTarget> {
             named.push(word);
         }
     }
-    Some(match named.as_slice() {
-        [] => BuildTarget::Unnamed,
-        [one] if has_extension(one, &SOLUTION_EXTENSIONS) => BuildTarget::Solution,
-        _ => BuildTarget::Other,
+    Some(named)
+}
+
+/// Whether the words are a dotnet command that builds ([`dotnet_builds`]) with one of [`IN_PLACE_VERBS`] ignoring
+/// letter case, whose own words name no output option ([`OUTPUT_OPTIONS`]), no runtime part ([`RUNTIME_PART_OPTIONS`])
+/// and no target switch ([`is_target_switch`]), and set none of [`OUTPUT_PROPERTIES`] and [`SETTING_PROPERTIES`]: a
+/// build whose project a later `--no-build` run of it under the same `-c`, `-f` and `-r` finds built.
+#[must_use]
+pub fn builds_in_place(words: &[String]) -> bool {
+    dotnet_builds(words)
+        && dotnet_own(words).is_some_and(|own| {
+            let own = &words[own];
+            let moves = |word: &String| is_output_option(word) || is_option_of(word, &RUNTIME_PART_OPTIONS) || is_target_switch(word);
+            verb_in(own, &IN_PLACE_VERBS)
+                && !own.iter().any(moves)
+                && !OUTPUT_PROPERTIES.iter().chain(&SETTING_PROPERTIES).any(|name| sets_property(own, name))
+        })
+}
+
+/// Whether `word` is a target switch: an optional `--`, `-` or `/`, one of [`TARGET_SWITCH_NAMES`] (any case), then `:`
+/// or `=` and the targets.
+fn is_target_switch(word: &str) -> bool {
+    let unprefixed = word.strip_prefix("--").or_else(|| word.strip_prefix(['-', '/'])).unwrap_or(word);
+    TARGET_SWITCH_NAMES.iter().any(|switch| {
+        unprefixed.get(..switch.len()).is_some_and(|start| eq_ignoring_case(start, switch))
+            && matches!(unprefixed.as_bytes().get(switch.len()), Some(b':' | b'='))
     })
 }
 
@@ -2202,7 +2253,12 @@ fn send_bin(words: &[String], place: &Place, moves_output: impl FnOnce(&str, Opt
 
 /// Whether `word` is one of [`OUTPUT_OPTIONS`], alone or with its value after `=` or `:`, ignoring letter case.
 fn is_output_option(word: &str) -> bool {
-    OUTPUT_OPTIONS.iter().any(|option| {
+    is_option_of(word, &OUTPUT_OPTIONS)
+}
+
+/// Whether `word` is one of `options`, alone or with its value after `=` or `:`, ignoring letter case.
+fn is_option_of(word: &str, options: &[&str]) -> bool {
+    options.iter().any(|option| {
         word.get(..option.len()).is_some_and(|head| eq_ignoring_case(head, option))
             && matches!(word.as_bytes().get(option.len()), None | Some(b'=' | b':'))
     })

@@ -168,18 +168,20 @@ pub fn sent_build_hashes_path(root: &Path, id: Option<&str>, key: &str) -> PathB
 }
 
 /// The nothing-back record of the work folder `key`, `<root>\remote\<key>.nothing-back`: the JSON object
-/// `{"v": 1, "host": "<builder>", "configuration": …, "framework": …, "runtime": …}` ([`NothingBackRecord`]). It is
-/// written when a routed dotnet build of that worktree ends without its outputs known to be brought back, and when a
-/// routed dotnet `--no-build` run whose word the builder dropped ends while no record stands. It is removed by a
-/// passing dotnet build of the whole worktree here, and under the same rule by a routed one that brought all its
-/// outputs back, so a dotnet `--no-build` run here meanwhile builds.
+/// `{"v": 1, "host": "<builder>", "configuration": …, "framework": …, "runtime": …, "built": […]}`
+/// ([`NothingBackRecord`]). It is written when a routed dotnet build of that worktree ends without its outputs known to
+/// be brought back, and when a routed dotnet `--no-build` run whose word the builder dropped ends while no record stands.
+/// It is removed by a passing dotnet build of the whole worktree here, and under the same rule by a routed one that
+/// brought all its outputs back, so a dotnet `--no-build` run here meanwhile builds, unless a passing build of its
+/// project here added that project to `built`.
 #[must_use]
 pub fn nothing_back_path(root: &Path, key: &str) -> PathBuf {
     remote_dir(root).join(format!("{key}.nothing-back"))
 }
 
-/// The body of a nothing-back record ([`nothing_back_path`]) after its `v`: the builder the routed build ran on, and
-/// the configuration, framework and runtime its words set, each left out when they set none.
+/// The body of a nothing-back record ([`nothing_back_path`]) after its `v`: the builder the routed build ran on, the
+/// configuration, framework and runtime its words set, each left out when they set none, and the project folders built
+/// here since it was written, left out when there are none and read as none when absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NothingBackRecord {
     pub host: String,
@@ -189,6 +191,17 @@ pub struct NothingBackRecord {
     pub framework: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub built: Vec<String>,
+}
+
+/// The text [`write_nothing_back`] writes for `record`.
+///
+/// # Errors
+///
+/// A record that cannot be serialized.
+pub fn nothing_back_text(record: &NothingBackRecord) -> io::Result<String> {
+    versioned_text(record)
 }
 
 /// Writes the nothing-back `record` at `path` whole or not at all, as [`write_replacing`] writes: the temp file beside

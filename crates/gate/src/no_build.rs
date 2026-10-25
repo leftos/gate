@@ -9,7 +9,7 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use gate_router::{BuildSettings, DotnetTarget, OUTPUT_PROPERTIES, PROJECT_EXTENSIONS, escaped, is_usable_host};
+use gate_router::{BuildSettings, DotnetTarget, OUTPUT_PROPERTIES, PROJECT_EXTENSIONS, dotnet_target, escaped, is_usable_host, positional_target};
 use gate_state::v1;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT};
 
@@ -45,10 +45,12 @@ const NOT_A_REPOSITORY: &str = "not a git repository";
 const CANNOT_RUN_GIT: &str = "cannot run git: ";
 
 /// A nothing-back record found: the builder it names, `None` when it names none that can be read and used as a host,
-/// and the configuration, framework and runtime of the build that left it, none when it cannot be read.
+/// the configuration, framework and runtime of the build that left it, none when it cannot be read, and the keys of the
+/// projects built here since it was written ([`project_key`]), none when it cannot be read.
 pub(crate) struct NothingBack {
     pub host: Option<String>,
     pub settings: BuildSettings,
+    pub built: Vec<String>,
 }
 
 /// The git worktree the gate runs in: its root as git gives it, and the gate's folder below it, empty at the root.
@@ -96,27 +98,121 @@ pub(crate) fn drop_reason(record: Option<NothingBack>, without_assets: impl FnOn
 /// A record that is there but cannot be opened or read, which counts as there: a record wrongly taken as there costs
 /// one build here, one wrongly taken as missing a `--no-build` run that finds no build.
 pub(crate) fn read_record(path: &Path) -> io::Result<Option<NothingBack>> {
+    let Some(bytes) = record_bytes(path)? else {
+        return Ok(None);
+    };
+    // A record of another shape is still a record: only what it would say is lost.
+    let Ok(record) = v1::nothing_back_record(&bytes) else {
+        return Ok(Some(NothingBack {
+            host: None,
+            settings: BuildSettings::default(),
+            built: Vec::new(),
+        }));
+    };
+    Ok(Some(NothingBack {
+        host: Some(record.host.clone()).filter(|host| is_usable_host(host)),
+        settings: settings_of(&record),
+        built: record.built,
+    }))
+}
+
+/// The bytes of the nothing-back record at `path`, `None` when there is none: a link or junction at its name opened as
+/// itself, and at most [`RECORD_CAP`] bytes of it read.
+///
+/// # Errors
+///
+/// A record that is there but cannot be opened or read.
+fn record_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
     let file = match OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         opened => opened?,
     };
     let mut bytes = Vec::new();
     file.take(RECORD_CAP).read_to_end(&mut bytes)?;
-    // A record of another shape is still a record: only what it would say is lost.
-    let Ok(record) = v1::nothing_back_record(&bytes) else {
-        return Ok(Some(NothingBack {
-            host: None,
-            settings: BuildSettings::default(),
-        }));
+    Ok(Some(bytes))
+}
+
+/// The configuration, framework and runtime `record`'s build set.
+fn settings_of(record: &v1::NothingBackRecord) -> BuildSettings {
+    BuildSettings {
+        configuration: record.configuration.clone(),
+        framework: record.framework.clone(),
+        runtime: record.runtime.clone(),
+    }
+}
+
+/// Adds the project key `key` ([`project_key`]) to the `built` list of the nothing-back record at `path` when the
+/// record's build set `settings` ([`BuildSettings::same_as`]), rewriting it whole ([`v1::write_nothing_back`]). A key it
+/// lists already, no record, and a record not of its format, which stands as it is, are left alone.
+///
+/// # Errors
+///
+/// The line saying why the key was not added: a record that cannot be read or written, or one the key would take past
+/// [`RECORD_CAP`] bytes, which is left as it is.
+pub(crate) fn add_built(path: &Path, key: &str, settings: &BuildSettings) -> Result<(), String> {
+    let bytes = match record_bytes(path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(()),
+        Err(error) => return Err(format!("gate: cannot read {}: {error}", path.display())),
     };
-    Ok(Some(NothingBack {
-        host: Some(record.host).filter(|host| is_usable_host(host)),
-        settings: BuildSettings {
-            configuration: record.configuration,
-            framework: record.framework,
-            runtime: record.runtime,
-        },
-    }))
+    let Ok(mut record) = v1::nothing_back_record(&bytes) else {
+        return Ok(());
+    };
+    if !settings_of(&record).same_as(settings) || record.built.iter().any(|built| built == key) {
+        return Ok(());
+    }
+    record.built.push(key.to_owned());
+    let cannot_write = |error: io::Error| format!("gate: cannot write {}: {error}", path.display());
+    let text = v1::nothing_back_text(&record).map_err(cannot_write)?;
+    if u64::try_from(text.len()).unwrap_or(u64::MAX) > RECORD_CAP {
+        return Err(format!("gate: cannot add to {}: the record is full", path.display()));
+    }
+    v1::write_nothing_back(path, &record).map_err(cannot_write)
+}
+
+/// The key of the project a dotnet command names (`project`, as [`DotnetTarget::Project`] holds it) in the worktree at
+/// `root`, read against the working folder `folder`: the project's folder (the parent of a project file, else `project`
+/// itself) made relative to `root`, `.` and `..` resolved by name, `/`-separated and lower-cased, `.` for the root
+/// itself. `None` for a project outside the worktree.
+pub(crate) fn project_key(project: &str, folder: &Path, root: &Path) -> Option<String> {
+    let named = Path::new(project);
+    let project_folder = if is_project_file(project) {
+        named.parent().unwrap_or_else(|| Path::new(""))
+    } else {
+        named
+    };
+    let spelled = |path: &Path| path.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_lowercase();
+    let full = spelled(&lexical(&folder.join(project_folder)));
+    let root = spelled(&lexical(root));
+    if full == root {
+        return Some(".".to_owned());
+    }
+    full.strip_prefix(&root)?.strip_prefix('/').map(str::to_owned)
+}
+
+/// The key ([`project_key`]) of the one project the dotnet command `words` names in the worktree at `root`, read
+/// against the gate's working folder: the project file or `--project` value [`dotnet_target`] gives, else its first
+/// positional word ([`positional_target`]) when that names a folder on disk. `None` when it names none, names a
+/// solution or a folder that is not there, or the working folder cannot be read, so it counts as no project built here.
+pub(crate) fn named_project_key(words: &[String], root: &Path) -> Option<String> {
+    let folder = std::env::current_dir().ok()?;
+    project_key(&named_project(words, &folder)?, &folder, root)
+}
+
+/// Whether the dotnet command `words` names one project, as [`named_project_key`] reads it against the gate's working
+/// folder, whatever worktree it is in: asked before the worktree is looked for.
+pub(crate) fn names_project(words: &[String]) -> bool {
+    std::env::current_dir().is_ok_and(|folder| named_project(words, &folder).is_some())
+}
+
+/// The one project the dotnet command `words` names, read against `folder`: the project file or `--project` value
+/// [`dotnet_target`] gives, else its first positional word ([`positional_target`]) when that names a folder on disk.
+fn named_project(words: &[String], folder: &Path) -> Option<String> {
+    match dotnet_target(words) {
+        Some(DotnetTarget::Project(project)) => Some(project),
+        Some(DotnetTarget::Solution(_)) => None,
+        None => positional_target(words).filter(|word| folder.join(word).is_dir()),
+    }
 }
 
 /// The worktree record at `path` ([`v1::worktree_record_path`]), read as the nothing-back record is: opened as itself,
@@ -481,8 +577,8 @@ mod tests {
     use gate_state::v1;
 
     use super::{
-        NothingBack, drop_reason, first_without_assets, moves_intermediates, moves_output, named_without_assets, parse_worktree, read_record,
-        read_worktree_record, solution_projects,
+        NothingBack, add_built, drop_reason, first_without_assets, moves_intermediates, moves_output, named_without_assets, parse_worktree,
+        project_key, read_record, read_worktree_record, solution_projects,
     };
 
     /// A folder of this test process's own named `name`, empty.
@@ -554,6 +650,117 @@ mod tests {
     }
 
     #[test]
+    fn a_record_reads_its_built_list_and_one_whose_list_is_not_of_strings_cannot_be_read() {
+        let folder = scratch("record-built");
+        let path = folder.join("app-1a2b3c4d.nothing-back");
+        let read = |text: &str| {
+            fs::write(&path, text).expect("the record can be written");
+            let record = read_record(&path).expect("the record reads").expect("the record is there");
+            (record.host, record.built)
+        };
+        let builder = Some("builder".to_owned());
+
+        assert_eq!(read(r#"{"v":1,"host":"builder"}"#), (builder.clone(), Vec::new()), "absent");
+        assert_eq!(read(r#"{"v":1,"host":"builder","built":[]}"#), (builder.clone(), Vec::new()), "empty");
+        assert_eq!(
+            read(r#"{"v":1,"host":"builder","built":["one","tools/app"]}"#),
+            (builder, vec!["one".to_owned(), "tools/app".to_owned()]),
+            "two keys"
+        );
+        for text in [
+            r#"{"v":1,"host":"builder","built":["one",7]}"#,
+            r#"{"v":1,"host":"builder","built":"one"}"#,
+        ] {
+            assert_eq!(read(text), (None, Vec::new()), "a record that cannot be read still stands: {text}");
+        }
+
+        let two = v1::NothingBackRecord {
+            built: vec!["one".to_owned(), "two".to_owned()],
+            ..release_record("builder")
+        };
+        v1::write_nothing_back(&path, &two).expect("the record can be written");
+        assert_eq!(
+            fs::read_to_string(&path).expect("the record can be read"),
+            r#"{"v":1,"host":"builder","configuration":"Release","built":["one","two"]}"#
+        );
+        v1::write_nothing_back(&path, &release_record("builder")).expect("the record can be written");
+        assert_eq!(
+            fs::read_to_string(&path).expect("the record can be read"),
+            r#"{"v":1,"host":"builder","configuration":"Release"}"#,
+            "an empty list is left out"
+        );
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_key_is_added_once_under_the_record_settings_and_never_past_the_cap() {
+        let folder = scratch("record-add");
+        let path = folder.join("app-1a2b3c4d.nothing-back");
+        let release = BuildSettings {
+            configuration: Some("release".to_owned()),
+            ..BuildSettings::default()
+        };
+        let debug = BuildSettings {
+            configuration: Some("Debug".to_owned()),
+            ..BuildSettings::default()
+        };
+        let text = || fs::read_to_string(&path).expect("the record can be read");
+
+        assert_eq!(add_built(&path, "one", &release), Ok(()), "no record");
+        assert!(!path.exists(), "no record is written for an add");
+        v1::write_nothing_back(&path, &release_record("builder")).expect("the record can be written");
+        let added = r#"{"v":1,"host":"builder","configuration":"Release","built":["one"]}"#;
+        assert_eq!(add_built(&path, "one", &release), Ok(()));
+        assert_eq!(text(), added);
+        assert_eq!(add_built(&path, "one", &release), Ok(()));
+        assert_eq!(text(), added, "a key already listed is not added twice");
+        assert_eq!(add_built(&path, "two", &debug), Ok(()));
+        assert_eq!(text(), added, "another configuration adds nothing");
+
+        fs::write(&path, r#"{"v":1}"#).expect("the record can be written");
+        assert_eq!(add_built(&path, "one", &BuildSettings::default()), Ok(()));
+        assert_eq!(text(), r#"{"v":1}"#, "a record not of its format stands as it is");
+
+        let full = v1::NothingBackRecord {
+            built: vec!["x".repeat(4000)],
+            ..release_record("builder")
+        };
+        v1::write_nothing_back(&path, &full).expect("the record can be written");
+        let before = text();
+        assert_eq!(
+            add_built(&path, &"y".repeat(100), &release),
+            Err(format!("gate: cannot add to {}: the record is full", path.display()))
+        );
+        assert_eq!(text(), before, "a full record is left as it is");
+        fs::remove_dir_all(&folder).expect("the folder can be removed");
+    }
+
+    #[test]
+    fn a_project_key_is_its_folder_below_the_worktree_root_lower_cased() {
+        let root = Path::new(r"X:\dev\app");
+        let key = |project: &str, folder: &Path| project_key(project, folder, root);
+
+        assert_eq!(key("tools/App/App.csproj", root).as_deref(), Some("tools/app"), "a project file");
+        assert_eq!(key(r"tools\App", root).as_deref(), Some("tools/app"), "its folder");
+        assert_eq!(key("./a/../b", root).as_deref(), Some("b"), ". and .. resolved");
+        assert_eq!(key("One/One.CsProj", root).as_deref(), Some("one"), "letter case");
+        assert_eq!(key("App.fsproj", root).as_deref(), Some("."), "a project at the root");
+        assert_eq!(
+            key("../lib/Lib.vbproj", &root.join("sub")).as_deref(),
+            Some("lib"),
+            "read against the folder"
+        );
+        assert_eq!(
+            project_key("tools/App", root, Path::new("x:/DEV/app/")).as_deref(),
+            Some("tools/app"),
+            "the root as git spells it"
+        );
+        assert_eq!(key("../other/Other.csproj", root), None, "outside the worktree");
+        assert_eq!(key(r"X:\dev\app2\A.csproj", root), None, "a folder whose name starts with the root's");
+        assert_eq!(key(r"Y:\app\A.csproj", root), None, "another drive");
+    }
+
+    #[test]
     fn a_junction_at_the_record_name_counts_as_a_record() {
         let folder = scratch("record-junction");
         let target = folder.join("elsewhere");
@@ -611,6 +818,7 @@ mod tests {
         let builder = Some(NothingBack {
             host: Some("builder".to_owned()),
             settings: BuildSettings::default(),
+            built: Vec::new(),
         });
         let reason = drop_reason(builder, || {
             asked = true;
@@ -621,6 +829,7 @@ mod tests {
         let unknown = NothingBack {
             host: None,
             settings: BuildSettings::default(),
+            built: Vec::new(),
         };
         assert_eq!(
             drop_reason(Some(unknown), || None).as_deref(),

@@ -442,7 +442,7 @@ It makes no OS calls, builds and tests on any OS, and must never depend on `gate
 
   `late.rs` is the late take of a covered heavy or light gate: the watch of its parent gate through a waitable handle, the stand-in search once the parent ends, and the queue and take of a slot of its own kind beside the running command, driven one step a wake by the watch loop in `watch.rs`; `covered.rs` rewrites the covered marker's `kind` to `none` when the watch is given up.
 
-  `no_build.rs` is the facts of a local dotnet `--no-build` run: the nothing-back record read as itself, the obj check (the projects without `obj\project.assets.json`, the solution readers, the `Directory.Build.*` skip) and the git calls for the worktree and its tracked projects; `run.rs` decides the drop and the clear from it.
+  `no_build.rs` is the facts of a local dotnet `--no-build` run: the nothing-back record read as itself and the project keys added to its `built` list, the obj check (the projects without `obj\project.assets.json`, the solution readers, the `Directory.Build.*` skip) and the git calls for the worktree and its tracked projects; `run.rs` decides the drop and the clear from it.
 
   `nesting/binding.rs` judges whether the marker binds to the parent gate's job: the walk from this gate up a process snapshot, pure over an injected job, snapshot and `holds`.
 

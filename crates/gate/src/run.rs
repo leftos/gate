@@ -25,11 +25,11 @@ use gate_args::{
 };
 use gate_router::warm::{RecordRead, RecordState};
 use gate_router::{
-    BuildSettings, BuildTarget, DEFAULT_OUTPUTS, LaterCandidate, PinRefusal, Place, RemoteRun, Route, build_settings, dotnet_builds, dotnet_target,
-    sdk_build_target, without_no_build, work_folder_key,
+    BuildSettings, BuildTarget, DEFAULT_OUTPUTS, LaterCandidate, PinRefusal, Place, RemoteRun, Route, build_settings, builds_in_place, dotnet_builds,
+    dotnet_target, sdk_build_target, without_no_build, work_folder_key,
 };
 use gate_state::{
-    Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RunFacts, RunTrace, StateRoot, Verdict, log_hash, v1,
+    Estimate, FallbackReason, JournalEvent, KernelObject, RebuildOwner, RemoteTag, RunFacts, RunTrace, StateRoot, Verdict, key_hash, log_hash, v1,
 };
 use gate_watchdog::{Cores, Hint, SlotKind, hint};
 use gate_win32::{
@@ -103,8 +103,9 @@ const KEY_WAIT: Duration = Duration::from_secs(90);
 /// it started, 124 for a command killed as stalled, timed out or past the backstop, 127 when it could not be started,
 /// 0xC000013A for a Ctrl+C in the queue, before the command started, or with the command still running 5 s after it,
 /// or 2 for a log inside the state root, a critical gate under a heavy or light parent's slot, a critical or `--alone`
-/// gate inside a commit run's hooks, a batch word refused before anything was queued or a `--builder` pin refused
-/// before anything was queued. A run pinned with `--builder` that its builder did not run ends with 1.
+/// gate inside a commit run's hooks, a batch word refused before anything was queued, a `--builder` pin refused
+/// before anything was queued or an `--alone` gate whose `--no-build` would be dropped ([`alone_refused`]). A run
+/// pinned with `--builder` that its builder did not run ends with 1.
 pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environment: &Environment, console: &mut Console) -> u32 {
     let (nesting, asked) = match admitted(request, log, root, environment, console) {
         Ok(admitted) => admitted,
@@ -139,16 +140,14 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
             return exit_status(GATE_FAILED);
         }
     };
-    // A pinned run readies its log only once routing accepted the pin, so a refused pin leaves an earlier log alone.
-    if request.builder.is_none()
+    if readies_log_first(request)
         && let Err(status) = prepare_log(&log, console)
     {
         return status;
     }
-    // The request and nesting of a run here that dropped its `--no-build` and asks for a heavy slot.
-    let mut heavy = None;
-    // The nesting a gate a commit run's slot covers routes under, beside that run.
-    let mut beside = None;
+    // The request and nesting of a run here that dropped its `--no-build`, and the nesting a gate a commit run's slot
+    // covers routes under, beside that run.
+    let (mut heavy, mut beside) = (None, None);
     let mut run = Run {
         request,
         root,
@@ -184,9 +183,10 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
         return status;
     }
     run.route_beside_commit(&route, &mut beside);
-    let local = run.local_words(&route, placed.place(), console);
-    take_heavy(&mut run, local.as_ref(), console);
-    run.durations = run.open_durations(&placed);
+    let local = match run.take_local(&route, &placed, console) {
+        Ok(local) => local,
+        Err(status) => return status,
+    };
     say_nesting(run.nesting, run.request, console);
     run.queue(&route, console);
     let mut hold = Hold::nothing();
@@ -197,7 +197,7 @@ pub(crate) fn run(request: &RunRequest, log: &Path, root: &ResolvedRoot, environ
             if ended.status == 0
                 && let Some(here) = here
             {
-                run.clear_nothing_back(here, console);
+                run.settle_nothing_back(here, console);
             }
             run.rebuild_durations(console);
             exit_status(ended.status)
@@ -228,9 +228,10 @@ fn host(console: &mut Console) -> Host {
     }
 }
 
-/// Has `run` run as a run here that asks for a heavy slot ([`Run::run_as_heavy`]) when `local` dropped its
-/// `--no-build` ([`Run::local_words`]), and says the line saying so.
-fn take_heavy(run: &mut Run<'_>, local: Option<&HereWords>, console: &mut Console) {
+/// Has `run` run the words `local` left when it dropped its `--no-build` ([`Run::local_words`]), and says the line saying
+/// so: a critical run on its own critical slot ([`Run::run_as_critical`]), any other as a run here that asks for a heavy
+/// slot ([`Run::run_as_heavy`]).
+fn take_dropped(run: &mut Run<'_>, local: Option<&HereWords>, console: &mut Console) {
     let Some(HereWords {
         words,
         dropped: Some(reason),
@@ -239,8 +240,32 @@ fn take_heavy(run: &mut Run<'_>, local: Option<&HereWords>, console: &mut Consol
     else {
         return;
     };
-    run.run_as_heavy(words, console);
+    if run.request.slot == Slot::Critical {
+        run.run_as_critical(words);
+    } else {
+        run.run_as_heavy(words, console);
+    }
     console.err(&run.dropped_line(reason));
+}
+
+/// Whether an `--alone` run whose `local` words dropped their `--no-build` ([`Run::local_words`]) is refused: it measures
+/// the command as given, so it is refused before it takes a slot or readies its log, its line said.
+fn alone_refused(local: Option<&HereWords>, console: &mut Console) -> bool {
+    let Some(reason) = local.and_then(|here| here.dropped.as_deref()) else {
+        return false;
+    };
+    console.err(&format!(
+        "gate: refused: --no-build cannot stand: {reason}; an --alone run measures the command as given, so build first \
+         (a passing local build of the project clears the record) and run it again"
+    ));
+    true
+}
+
+/// Whether a run of `request` readies its log before it is routed: not one pinned with `--builder`, which readies it
+/// once routing accepted the pin ([`ended_at_route`]), nor an `--alone` run, which readies it once its `--no-build` is
+/// known to stand ([`Run::take_local`]), so a refused run leaves an earlier log alone.
+fn readies_log_first(request: &RunRequest) -> bool {
+    request.builder.is_none() && !request.alone
 }
 
 /// The nesting `request` runs under, or the status of a run refused before anything is taken or written, its lines
@@ -588,8 +613,8 @@ struct Run<'a> {
     /// The nesting read for a gate a commit run's slot covers while it routes beside that run, which it runs under
     /// again once it falls back here ([`Run::route_beside_commit`]); `None` for every other run.
     here_nesting: Option<&'a Nesting>,
-    /// Where the request and nesting of the run go once it drops its `--no-build` and asks for a heavy slot
-    /// ([`Run::run_as_heavy`]), which a run does at most once; `None` once it has.
+    /// Where the request and nesting of the run go once it drops its `--no-build` ([`Run::run_as_heavy`],
+    /// [`Run::run_as_critical`]), which a run does at most once; `None` once it has.
     heavy_store: Option<&'a mut Option<(RunRequest, Nesting)>>,
     gate: ThisGate,
     log: Log,
@@ -1060,14 +1085,41 @@ impl<'a> Run<'a> {
     ///
     /// When the run already ran as heavy: a run drops its `--no-build` once, here from the start or after a fallback.
     fn run_as_heavy(&mut self, words: &[String], console: &mut Console) {
+        let heavy = self.as_heavy(words, console);
+        self.run_as(heavy);
+        self.lend_again(console);
+    }
+
+    /// Has a critical run that dropped its `--no-build` run `words` on the critical slot it asked for, its request and
+    /// nesting as they were but for the command, kept in [`Run::heavy_store`]. Its journal lines, ticket and claim then
+    /// name the command it runs.
+    ///
+    /// # Panics
+    ///
+    /// As [`Run::run_as_heavy`] does.
+    fn run_as_critical(&mut self, words: &[String]) {
+        let request = RunRequest {
+            command: words.iter().map(OsString::from).collect(),
+            ..self.request.clone()
+        };
+        let nesting = self.nesting.clone();
+        self.run_as((request, nesting));
+    }
+
+    /// Has the run take `dropped`, the request and nesting of a run here that dropped its `--no-build`, kept in
+    /// [`Run::heavy_store`], and open its journal for the gate running that request.
+    ///
+    /// # Panics
+    ///
+    /// When the run already took one: a run drops its `--no-build` once, here from the start or after a fallback.
+    fn run_as(&mut self, dropped: (RunRequest, Nesting)) {
         #[expect(clippy::expect_used, reason = "a run drops its --no-build once, here from the start or after a fallback")]
-        let store = self.heavy_store.take().expect("a run runs as heavy at most once");
-        let (request, nesting) = store.insert(self.as_heavy(words, console));
+        let store = self.heavy_store.take().expect("a run drops its --no-build at most once");
+        let (request, nesting) = store.insert(dropped);
         self.request = request;
         self.nesting = nesting;
         self.gate = self.gate.running(request);
         self.journal = RunJournal::open(self.root, &self.gate);
-        self.lend_again(console);
     }
 
     /// Puts a gate that routed beside a commit run ([`Run::route_beside_commit`]) back under that run's slot as it falls
@@ -1768,6 +1820,7 @@ impl Run<'_> {
             configuration: settings.configuration,
             framework: settings.framework,
             runtime: settings.runtime,
+            built: Vec::new(),
         };
         if let Err(error) = v1::write_nothing_back(&path, &record) {
             console.err(&format!("gate: cannot write {}: {error}", path.display()));
@@ -1982,6 +2035,30 @@ impl Run<'_> {
         }
     }
 
+    /// The words of a run here from the start ([`Run::local_words`]), once the run took the words it left when it
+    /// dropped its `--no-build` ([`take_dropped`]) and read its durations, as it now knows the command it journals
+    /// ([`Run::open_durations`]). An `--alone` run not pinned with `--builder` readies its log here, once its
+    /// `--no-build` is known to stand ([`readies_log_first`]).
+    ///
+    /// # Errors
+    ///
+    /// The usage status of an `--alone` run whose `--no-build` would be dropped, refused with its line said
+    /// ([`alone_refused`]), or the failed status of a log that cannot be readied ([`prepare_log`]).
+    fn take_local(&mut self, route: &Route, placed: &Placed, console: &mut Console) -> Result<Option<HereWords>, u32> {
+        let local = self.local_words(route, placed.place(), console);
+        if self.request.alone {
+            if alone_refused(local.as_ref(), console) {
+                return Err(u32::from(USAGE_STATUS));
+            }
+            if self.request.builder.is_none() {
+                prepare_log(&self.log, console)?;
+            }
+        }
+        take_dropped(self, local.as_ref(), console);
+        self.durations = self.open_durations(placed);
+        Ok(local)
+    }
+
     /// The words of a run here from the start, its worktree when it is known, and why its `--no-build` was dropped
     /// ([`Run::no_build_words`]). Its worktree comes from the route's `place`, else from one git call, asked only when
     /// the words have a `--no-build` word to drop; a command outside a worktree keeps its words. `None` for a routed
@@ -2051,15 +2128,20 @@ impl Run<'_> {
     }
 
     /// The line a run says as it drops its `--no-build` for `reason`, naming where it builds: on the slot of the parent
-    /// gate that covers or lent it, on no slot inside a box run, else on a heavy slot of its own ([`dropped_line`]).
+    /// gate that covers or lent it, on no slot inside a box run, else on the critical slot of a critical run or a heavy
+    /// slot of its own ([`dropped_line`]).
     fn dropped_line(&self, reason: &str) -> String {
         let lent_by = self.lent.then(|| self.nesting.uncovering()).flatten();
-        dropped_line(reason, self.nesting.covering().or(lent_by), matches!(self.nesting, Nesting::InBox))
+        let parent = self.nesting.covering().or(lent_by);
+        dropped_line(reason, parent, matches!(self.nesting, Nesting::InBox), self.request.slot)
     }
 
     /// Why a dotnet `--no-build` run of `words` in the worktree at `root` drops the word, `None` when it keeps it: the
-    /// worktree has a nothing-back record, or a project it builds has no `obj\project.assets.json` ([`Run::without_assets`]),
-    /// asked only without a record ([`no_build::drop_reason`]). A record that cannot be read counts as there, said.
+    /// worktree has a nothing-back record that does not list the project the words name as built here
+    /// ([`no_build::named_project_key`]) under the configuration, framework and runtime the words set
+    /// ([`BuildSettings::same_as`]), or a project it builds has no `obj\project.assets.json`
+    /// ([`Run::without_assets`]), asked only without such a record ([`no_build::drop_reason`]). A record that cannot be
+    /// read counts as there, said.
     fn no_build_reason(&self, root: &str, words: &[String], console: &mut Console) -> Option<String> {
         let path = v1::nothing_back_path(&self.root.path, &work_folder_key(root));
         let record = no_build::read_record(&path).unwrap_or_else(|error| {
@@ -2067,7 +2149,12 @@ impl Run<'_> {
             Some(NothingBack {
                 host: None,
                 settings: BuildSettings::default(),
+                built: Vec::new(),
             })
+        });
+        let record = record.filter(|record| {
+            let built = no_build::named_project_key(words, Path::new(root)).is_some_and(|key| record.built.contains(&key));
+            !(built && record.settings.same_as(&build_settings(words)))
         });
         no_build::drop_reason(record, || self.without_assets(Path::new(root), words, console))
     }
@@ -2109,39 +2196,98 @@ impl Run<'_> {
         }
     }
 
-    /// Removes the worktree's nothing-back record after a run here that passed, once its slot is released, or after a
-    /// routed run that brought its outputs back ([`Run::leave_nothing_back`]), when the words it ran are a dotnet build
-    /// of the whole worktree that rebuilt what the record stands for ([`Run::cleared_record`]). A record that cannot be
-    /// removed is said.
-    fn clear_nothing_back(&self, here: HereWords, console: &mut Console) {
-        let Some(path) = self.cleared_record(here, console) else {
-            return;
-        };
-        match fs::remove_file(&path) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                console.err(&format!("gate: cannot remove {}: {error}", path.display()));
+    /// Updates the worktree's nothing-back record after a run here that passed, once its slot is released: a dotnet
+    /// build of the whole worktree clears it ([`Run::clear_nothing_back`]), and a build of one project adds that project
+    /// to the record's `built` list ([`Run::record_change`], [`no_build::add_built`]). A key that cannot be added is
+    /// said.
+    fn settle_nothing_back(&self, here: HereWords, console: &mut Console) {
+        let settings = build_settings(&here.words);
+        match self.record_change(here, console) {
+            Some(RecordChange::Clear(path)) => remove_record(&path, console),
+            Some(RecordChange::Add { path, folder, project }) => {
+                // The key lock a routed run writes the record under, so a fresh record it writes meanwhile is kept.
+                let added = self
+                    .hold_folder_key(&folder)
+                    .map_err(|reason| format!("gate: cannot add to {}: {reason}", path.display()))
+                    .and_then(|_held| no_build::add_built(&path, &project, &settings));
+                if let Err(line) = added {
+                    console.err(&line);
+                }
             }
-            _ => {}
+            None => {}
         }
     }
 
-    /// The nothing-back record a passing run here of `here`'s words clears: that of its worktree (`here`'s, else the
-    /// one git gives, git that cannot be found or started counting as none, unsaid), when the words are an SDK dotnet
-    /// build other than `msbuild` ([`sdk_build_target`]) of a solution, or of nothing run at the worktree's root, and
-    /// set the configuration, framework and runtime the record's build set ([`BuildSettings::same_as`]). `None` when
-    /// there is no such record; a record that cannot be read is said and left.
-    fn cleared_record(&self, here: HereWords, console: &mut Console) -> Option<PathBuf> {
-        let target = sdk_build_target(&here.words).filter(|target| *target != BuildTarget::Other)?;
+    /// Holds the lock of the work-folder key `folder`, the one a routed run of the worktree holds while it writes the
+    /// worktree's nothing-back record ([`Run::take_key`]), waiting for another holder up to the run's key-wait bound in
+    /// slices, between which a Ctrl+C ends the wait.
+    ///
+    /// # Errors
+    ///
+    /// Why the lock is not held: it cannot be opened or taken, another run held it for the whole bound, or a Ctrl+C
+    /// ended the wait.
+    fn hold_folder_key(&self, folder: &str) -> Result<OwnedMutexGuard, String> {
+        let name = self.root.root.object_name(KernelObject::Routed { hash: key_hash(folder) });
+        let bound = self.request.test_seams.key_wait_ms.map_or(KEY_WAIT, Duration::from_millis);
+        let begun = Instant::now();
+        loop {
+            // A wait that times out gives its handle up, so each slice waits on one of its own.
+            let mutex = NamedMutex::open(&name).map_err(|error| format!("cannot open the mutex {name}: {error}"))?;
+            match mutex.acquire_owned(KEY_WAIT_SLICE) {
+                Ok(held) => return Ok(held),
+                Err(AcquireError::Timeout) => {}
+                Err(AcquireError::Failed(error)) => return Err(format!("cannot take the mutex {name}: {error}")),
+            }
+            if self.host.interrupt.is_some_and(Interrupt::is_raised) {
+                return Err("Ctrl+C ended the wait for the work folder's key".to_owned());
+            }
+            if begun.elapsed() >= bound {
+                return Err(format!(
+                    "another run of the worktree held the work folder's key for {} ms",
+                    bound.as_millis()
+                ));
+            }
+        }
+    }
+
+    /// Removes the worktree's nothing-back record after a routed run that brought its outputs back
+    /// ([`Run::leave_nothing_back`]), when the words it ran are a dotnet build of the whole worktree that rebuilt what the
+    /// record stands for ([`Run::record_change`]); a build of one project there adds nothing. A record that cannot be
+    /// removed is said.
+    fn clear_nothing_back(&self, here: HereWords, console: &mut Console) {
+        if let Some(RecordChange::Clear(path)) = self.record_change(here, console) {
+            remove_record(&path, console);
+        }
+    }
+
+    /// What a passing run of `here`'s words does to its worktree's nothing-back record (`here`'s worktree, else the one
+    /// git gives, git that cannot be found or started counting as none, unsaid), for words that are an SDK dotnet build
+    /// other than `msbuild` ([`sdk_build_target`]). One of a solution, or of nothing run at the worktree's root, clears
+    /// it when it set the configuration, framework and runtime the record's build set ([`BuildSettings::same_as`]);
+    /// one of a single project inside the worktree, built in place ([`builds_in_place`]), adds the project's key
+    /// ([`no_build::named_project_key`]), which [`no_build::add_built`] does only under the same settings rule. `None`
+    /// for any other words, and when there is no record to clear; a record that cannot be read is said and left. Words
+    /// that name something other than a project built in place ([`no_build::names_project`]) look for no worktree, so
+    /// they start no git process and say nothing.
+    fn record_change(&self, here: HereWords, console: &mut Console) -> Option<RecordChange> {
+        let target = sdk_build_target(&here.words)?;
+        if target == BuildTarget::Other && !(builds_in_place(&here.words) && no_build::names_project(&here.words)) {
+            return None;
+        }
         let worktree = here.worktree.or_else(|| self.worktree(true, console))?;
+        let folder = work_folder_key(&worktree.root);
+        let path = v1::nothing_back_path(&self.root.path, &folder);
         let whole = match target {
             BuildTarget::Solution => true,
             BuildTarget::Unnamed => worktree.prefix.is_empty(),
             BuildTarget::Other => false,
         };
         if !whole {
-            return None;
+            let project = builds_in_place(&here.words)
+                .then(|| no_build::named_project_key(&here.words, Path::new(&worktree.root)))
+                .flatten()?;
+            return Some(RecordChange::Add { path, folder, project });
         }
-        let path = v1::nothing_back_path(&self.root.path, &work_folder_key(&worktree.root));
         let record = match no_build::read_record(&path) {
             Ok(record) => record?,
             Err(error) => {
@@ -2149,7 +2295,7 @@ impl Run<'_> {
                 return None;
             }
         };
-        record.settings.same_as(&build_settings(&here.words)).then_some(path)
+        record.settings.same_as(&build_settings(&here.words)).then_some(RecordChange::Clear(path))
     }
 
     /// A plan of `words`, which a run here runs in place of the command as given; else how the run ended when they
@@ -3594,11 +3740,13 @@ struct Judged {
 }
 
 /// The line a run says as it drops its `--no-build` for `reason`: building on the slot of `parent`, the parent gate that
-/// covers or lent it, on no slot when it runs inside a box run (`in_box`), else on a heavy slot of its own.
-fn dropped_line(reason: &str, parent: Option<&Parent>, in_box: bool) -> String {
+/// covers or lent it, on no slot when it runs inside a box run (`in_box`), else on its critical slot when the run is of
+/// the `slot` kind critical, and on a heavy slot of its own otherwise.
+fn dropped_line(reason: &str, parent: Option<&Parent>, in_box: bool, slot: Slot) -> String {
     let building = match parent {
         Some(parent) => format!("building on the parent gate's {} slot", parent.held.as_str()),
         None if in_box => "building on no slot".to_owned(),
+        None if slot == Slot::Critical => "building on its critical slot".to_owned(),
         None => "building on a heavy slot".to_owned(),
     };
     format!("gate: dropped --no-build: {reason}; {building}")
@@ -3801,6 +3949,24 @@ impl HereWords {
             }),
             dropped: None,
         }
+    }
+}
+
+/// What a passing run does to its worktree's nothing-back record at the path each holds ([`Run::record_change`]).
+enum RecordChange {
+    /// Removes it.
+    Clear(PathBuf),
+    /// Adds the key of the project built to its `built` list, under the lock of the worktree's work-folder key.
+    Add { path: PathBuf, folder: String, project: String },
+}
+
+/// Removes the nothing-back record at `path`; one that cannot be removed is said, one already gone is not.
+fn remove_record(path: &Path, console: &mut Console) {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            console.err(&format!("gate: cannot remove {}: {error}", path.display()));
+        }
+        _ => {}
     }
 }
 
@@ -4175,15 +4341,15 @@ mod tests {
             commit: false,
         };
         assert_eq!(
-            dropped_line(reason, None, true),
+            dropped_line(reason, None, true, Slot::Heavy),
             format!("gate: dropped --no-build: {reason}; building on no slot")
         );
         assert_eq!(
-            dropped_line(reason, None, false),
+            dropped_line(reason, None, false, Slot::Heavy),
             format!("gate: dropped --no-build: {reason}; building on a heavy slot")
         );
         assert_eq!(
-            dropped_line(reason, Some(&parent), false),
+            dropped_line(reason, Some(&parent), false, Slot::Heavy),
             format!("gate: dropped --no-build: {reason}; building on the parent gate's light slot")
         );
     }

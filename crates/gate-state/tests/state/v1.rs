@@ -315,6 +315,7 @@ fn record(host: &str, configuration: Option<&str>) -> v1::NothingBackRecord {
         configuration: configuration.map(str::to_owned),
         framework: None,
         runtime: None,
+        built: Vec::new(),
     }
 }
 
