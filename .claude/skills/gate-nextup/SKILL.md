@@ -72,6 +72,8 @@ A test that asserts on timing must hold on a busy machine: no wall-clock bound a
 
 A case that fails once and passes alone, or runs to nextest's per-case limit, is never a known red left in the backlog: its issue is booked or raised Urgent at once and is worked next (the `load-proof-tests` skill, "A flaky or timing-out test is Urgent"). A brief may name such a case as not the implementer's for that one run only.
 
+Before working a flake seen in a worktree's run, check that the run's base holds the case's latest fix: `git log -S '<the failure text>'` finds the commit that last changed it, and `git merge-base --is-ancestor <fix> <base>` says whether the tree has it. GATE-760 was GATE-754's flake, seen in a tree cut before GATE-754 landed.
+
 A routed suite case that ends -1 (0xFFFFFFFF) or ABORTs with no output was ended from outside the gate: the gate's own kills give 124, 1 or 0xC000013A, a job close gives 0 and a console close 0xC000013A. Before suspecting the case, check the journal (`%LOCALAPPDATA%\gate\v1\events*.jsonl` and `archive\`) for other repos' routed runs that overlapped it on the builder.
 
 The machine-alone case is `stall::a_command_whose_only_work_is_a_child_outside_its_job_is_not_stalled`.
@@ -92,7 +94,7 @@ To check a timing case holds under load, run it inside `~/.claude/tools/load-bur
 
 load-burn does not starve a BelowNormal process: its critical gate runs the command at High, and Windows hands a child only Idle or BelowNormal, so a test under the burn runs at Normal beside the burners. A fault that shows only in the BelowNormal full suite is reproduced by suspending just the gate under test for seconds at a time (`NtSuspendProcess` / `NtResumeProcess` on the gate.exe the suite started), which costs no burn budget; GATE-128 was found that way.
 
-Suspending gate.exe cannot starve a test stand-in such as `fake-ssh`: to reproduce a stand-in that gets no CPU in time, put a wrapper that delays before running the real one in place of `target\test-release\fake-ssh.exe` (an untracked build file) and restore it afterwards; GATE-488 was found that way.
+Suspending gate.exe cannot starve a test stand-in such as `fake-ssh`: to reproduce a stand-in that gets no CPU in time, put a wrapper that delays before running the real one in place of `target\test-release\fake-ssh.exe` (an untracked build file) and restore it afterwards; GATE-488 was found that way. The same wrapper in place of `target\test-release\fake-tool.exe`, delaying only its `pid-to` step, holds a parked git stub before it writes its pid file. A parked-run case starts other gate.exe calls before the box under test, so a rig picks the box by its seam in the command line (`--test-box-git-armed-by`), not as the first gate.exe child.
 
 To hold a process's end open with no load (a process asked to end but not yet gone), attach as its debugger (`DebugActiveProcess`) and hold its exit-process debug event: it stays in Toolhelp and its handle stays unsignalled until the event is continued. The debugger does not pass to the children the debuggee creates, so attach to each process itself; to catch a short-lived stand-in, watch for a file the box writes while it is still suspended, since a Toolhelp poll (about 16 ms a snapshot) misses it. GATE-694 was found that way (rig in `.tmp/map-694-rig/` while it lasts).
 
