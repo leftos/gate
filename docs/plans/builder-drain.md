@@ -2,7 +2,7 @@
 
 A way to drain the builder before a redeploy: `gate drain` raises a barrier on the builder, waits until nothing of a routed run is going there, and says so; the operator redeploys and lifts it. This file holds the design until the work lands; its rulings then move into `docs/design.md` and the glossary.
 
-Inputs: the code map `.tmp/map-gate-559.md` and an invariant pass by oracle, both at `main` 9e14daaa with GATE-542's uncommitted work in view.
+Inputs: the code map `.tmp/map-gate-559.md` and an invariant pass by oracle, taken at an earlier `main`; the code cites below are found again at `main` 5655afaf.
 
 ## Owner rulings (settled on GATE-559)
 
@@ -12,9 +12,9 @@ Inputs: the code map `.tmp/map-gate-559.md` and an invariant pass by oracle, bot
 
 ## What the box knows today
 
-A run is visible on the builder only while one of `run`, `inputs` or `lfs` holds its share-none work lock, `{root}\work\{key}.lock` (`boxside/run.rs:1245-1260`). The preflight, the staging of both puts (before their lock: `inputs.rs:561`, `lfs.rs:410`), the git push and sync-back fetch (`git-receive-pack` / `git-upload-pack`), the outputs call, and a job left behind after the box process ended (the run's job has no kill-on-close, `run.rs:2016`; spared nested gates, `run.rs:2107`) are not registered anywhere. `gate box inflight` lists held locks only, with no command or age, and its probe makes a run whose `take_lock` lands during it refuse `busy` (`inflight.rs:1-5`).
+A run is visible on the builder only while one of `run`, `inputs` or `lfs` holds its share-none work lock, `{root}\work\{key}.lock` (`boxside/run.rs:1564`, `take_lock`). The preflight, the staging of both puts (before their lock: `inputs.rs:727`, `lfs.rs:412`), the git push and sync-back fetch (`git-receive-pack` / `git-upload-pack`), the outputs call, and a job left behind after the box process ended (the run's job has no kill-on-close, `run.rs:2368`; spared nested gates, `run.rs:2470`) are not registered anywhere. `gate box inflight` lists held locks only, with no command or age, and its probe makes a run whose `take_lock` lands during it refuse `busy` (`inflight.rs:1-5`).
 
-On the PC, a run that waits inside its attempt holds its remote slot: with the default one remote slot (`gate-router/src/config.rs:472`) every other routed run falls back `full` after 60 s (`wait.rs:34`), runs of the same worktree fall back `busy` after 90 s (`run.rs:86`), and the setup's 1800 s transfer ceiling (`client.rs:899`) would cut the wait as `unreachable`.
+On the PC, a run that waits inside its attempt holds its remote slot: with the default one remote slot (`gate-router/src/config.rs:646`) every other routed run falls back `full` after 60 s (`wait.rs:34`), runs of the same worktree fall back `busy` after 90 s (`run.rs:97`), and the setup's 1800 s transfer ceiling (`remote/client.rs:906`) would cut the wait as `unreachable`.
 
 ## Invariants
 
@@ -33,7 +33,7 @@ On the PC, a run that waits inside its attempt holds its remote slot: with the d
 ## Decisions (orchestrator; not owner rulings, open to the owner)
 
 **Barrier home.** Files under `{Root}\drain\`, every one read and written through the box's record I/O that refuses links, `Root` taken from the payload as `inflight` does (no suite case may reach the real root):
-- `lock`: the drain lock, opened exactly as `take_lock` opens the work lock and retried as `warm.rs:800-827` retries; held only around a read-modify of the files below, never across a wait or a child process.
+- `lock`: the drain lock, opened exactly as `take_lock` opens the work lock and retried as `warm.rs:802-829` retries; held only around a read-modify of the files below, never across a wait or a child process.
 - `barrier`: raised time, lapse time, generation.
 - `tickets\{seq}-{session}`: one per waiting run, with its last poll time.
 - `sessions\{session}`: one per admitted run, with its phase, last call time, PC host name, repo, command text (escaped, capped at 300 characters) and job name.
@@ -69,4 +69,4 @@ A Windows mutex is rejected: its waiters are not FIFO, a `Global\` name can be s
 
 ## Sites
 
-`boxside/mod.rs:60-71` (dispatch), `preflight.rs:88-137` (gate before `ready` at `:111`), `inputs.rs:242` (before the stage unpack), `lfs.rs:140` (before the store is made ready), `run.rs:487` (before `take_lock` at `:497`; warm-ups and desktop runs go through it), `inflight.rs`; `remote/client.rs:377` (`RustClient::run`), `:1762-1781` (read the `drain` tag before the version refusal), `:3870` and `:4169` (the tag never a `FallbackReason`), `:2468-2514` (retry, unreachable, lost connection); `run.rs:1136-1190` (routed, wall time), `:1259-1368` (key and remote waits), `wait.rs:34`, `:308-310`; `warm.rs:800-827`; `check/builder.rs:146`; `gate-args` `lib.rs:57-82`, `cli.rs`, `usage.rs`; `answer.rs:31-39`; `cutover.rs:39-140` (the model for the drain's loop and Ctrl+C); `docs/routing-a-repo.md:93-101` (the manual maintenance procedure this replaces).
+`boxside/mod.rs:63-85` (dispatch), `preflight.rs:104-169` (gate before `ready` at `:143`), `inputs.rs:354` (before the stage unpack), `lfs.rs:142` (before the store is made ready), `run.rs:581` (before `take_lock` at `:593`; warm-ups and desktop runs go through it), `inflight.rs`; `remote/client.rs:310` (`RustClient::run`), `:1900-1923` (read the `drain` tag before the version refusal), `:4055` and `:4402` (the tag never a `FallbackReason`), `:2620-2668` (retry, unreachable, lost connection); `run.rs:1452-1680` (routed, wall time), `:1603-1875` (key and remote waits), `wait.rs:34`, `:327`; `warm.rs:802-829`; `check/builder.rs:147`; `gate-args` `lib.rs:57-82`, `cli.rs`, `usage.rs`; `answer.rs:31-39`; `cutover.rs:39-140` (the model for the drain's loop and Ctrl+C); `docs/routing-a-repo.md:200-207` (the manual maintenance procedure this replaces).

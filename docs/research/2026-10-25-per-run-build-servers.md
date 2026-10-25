@@ -2,7 +2,7 @@
 
 Each gate run has build servers of its own, on this PC and the builder; the mechanism is in [design.md, Watchdog](../design.md#watchdog) and [Command launching](../design.md#command-launching). With node reuse on, MSBuild nodes idle about 15 minutes inside the command's job, so anything waiting on its whole tree would hang; the command gets `MSBUILDDISABLENODEREUSE=1` beside the per-run `SharedCompilationId` and `MSBUILDNODEHANDSHAKESALT`.
 
-This file holds what GATE-140, GATE-143, GATE-163, GATE-222 and GATE-225 cite: the measurements, the mechanisms with their sources, and the facts about where a server lives. Sources: the gated repos' docs and scripts, Microsoft Learn, the dotnet/msbuild, dotnet/sdk and dotnet/roslyn sources (quotes below, pins: msbuild c1c99ee0, sdk 680d5f1e, roslyn `main`), the local SDK 10.0.401 targets, and 28 gated builds plus one probe on this PC.
+Date: 2026-10-25. Written for GATE-190, and what GATE-140, GATE-143, GATE-163, GATE-222 and GATE-225 cite: the measurements, the mechanisms with their sources, and the facts about where a server lives. Sources: the gated repos' docs and scripts, Microsoft Learn, the dotnet/msbuild, dotnet/sdk and dotnet/roslyn sources (quotes below, pins: msbuild c1c99ee0, sdk 680d5f1e, roslyn `main`), the local SDK 10.0.401 targets, and 28 gated builds plus one probe on this PC.
 
 ## 1. Toolchains and how a server is kept inside the run
 

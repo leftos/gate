@@ -15,7 +15,7 @@ linear: gate
 - The plan lives in Linear: every task is an issue in team GATE, per `~/.claude/docs/plan-operations.md`; `docs/plans/MAIN.md` is its generated snapshot, never edited by hand.
 
   Project order, which is the order the queue is worked: `Design`, `gate-state move`, `Local gate`, `Remote`, `Cutover sweep`, `After cutover`, `Backlog` (claude-config's `docs/plans/gate-rust-port.md`, "Steps"). `After cutover` holds the Rust gate's new features (cores hint, learned durations, `--slot auto`), built once GATE-9 has landed.
-- **What the Mac mini runs.** A route sends a repo's tests, format and lint to the Mac mini. A build whose outputs are launched on the PC afterwards stays on the Windows builder or the PC, until GATE-696 (cross-built Windows outputs) is approved.
+- **What the Mac mini runs.** A route sends a repo's tests, format and lint to the Mac mini. A build whose outputs are launched on the PC afterwards stays on the Windows builder or the PC, until GATE-696 (cross-built Windows outputs) lands.
 - **Focus fence: remote routing for every caller repo.** Until each repo GATE-192 names (delve-the-dungeon, godot-mcp, yaat, yaat-server, opening-hand, in-the-sky, rustling-tulip, towercab-3d) routes, or has its trial failure booked as GATE-192's ruling says, the queue holds only the items on that path, as a release fence does: the Urgent issues (each repo's next step) and the High ones (the tier after).
 
   Everything else waits, however high it sits in the project order; a finding off the path gets an **add**, not a fix. The path is kept in Linear's priorities: a step that lands moves the next one up.

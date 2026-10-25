@@ -740,7 +740,7 @@ The lines of a run that starts its command:
   With no figure from the builder (its sampler failed) the clause reads `load-adjusted unknown: the sampler failed` and the past-ceiling check uses `<c>`. The client's status is the gate's own, passed through as `N`.
 - The stale line, on stderr and in the log, before the passed line, when a routed dotnet build (verb `build`, `test`, `publish`, `pack`, `run` or `msbuild`, with no `--no-build` of its own) passed and did not bring everything back: `gate: routed build left stale: <folders>`.
 
-  The folders are every PC-side folder (no cap) that a judging glob matches and no brought-back glob covers, judged per file: a folder whose every matching file came back is not named. The judging globs are the run's `outputs`, or the default globs when the repo's entry is absent or `[]`, plus the defaults `**/bin/**` and `**/.godot/mono/temp/bin/**`. The folders are sorted, relative to the worktree root, `/`-separated, escaped and joined with `, `.
+  The folders are every PC-side folder (no cap) that a judging glob matches and no brought-back glob covers, judged per file: a folder whose every matching file came back is not named. The judging globs are the run's `outputs` (the repo's own list, kept as it is when it is `[]`; the default globs when its entry is absent, none on a macOS builder), plus the defaults `**/bin/**` and `**/.godot/mono/temp/bin/**` always. The folders are sorted, relative to the worktree root, `/`-separated, escaped and joined with `, `.
 
   A pair (a run with siblings) names each sibling's output folders after the main's, written `../<sibling>/<folder>` (`../lib/src/App/bin`), judged by the same globs with nothing brought back, since no sibling's output ever comes back; the siblings follow in declared order.
 
@@ -1735,6 +1735,8 @@ A period with no beat due flushes instead, and the box's flush probes stderr for
 
   `GATE_BOX_JOB` and `GATE_BOX_EXE`, given to a box run's command ([The box side](#the-box-side)), pass through a trusted in-box gate to its command, which gets no `GATE_SLOT_HELD`; any other gate removes `GATE_BOX_JOB` from its command's environment.
 
+  The vendor-source quotes for these settings, the cold-start cost of a per-run server and the priority a server runs at are in [research/2026-10-25-per-run-build-servers.md](research/2026-10-25-per-run-build-servers.md).
+
   `UseSharedCompilation=false` keeps Roslyn's compiler server from idling in the command's job for up to ten minutes after a build: a command that waits for its whole job, as Godot's console wrapper does, never ended while the server held it, and the stall kill fired. The same setting is on a `gate box run` command and a routed one.
 
   Under the default root an inherited `GATE_STATE_DIR` is removed. The gate's own environment is never changed.
@@ -1744,7 +1746,7 @@ A period with no beat due flushes instead, and the box's flush probes stderr for
   The batch refusal's `%NAME%` check answers for this exact block.
 
   The block is built with names matched and sorted as Windows does (`CompareStringOrdinal`, case-insensitive over all of Unicode), and a later pair wins.
-- **Working directory.** The caller's (P5), or the `--cd` folder when given ([Run folder](#run-folder)).
+- **Working directory.** The caller's (P5), or the `--cd` folder when given, which a relative `--log` is read against too ([Run folder](#run-folder)).
 
 ## Log and tail
 
@@ -4213,9 +4215,9 @@ During the drain a PowerShell gate neither reads `gate.exe`'s tickets nor signal
 
 ops-tower follows the flag: it reads the PowerShell gate's files until the flag exists and then `v1\`, plus the PowerShell claims of a slot whose mutex is open, and its waiters come from `gate.exe`'s tickets ([Common rules](#common-rules)). The hooks and scripts that read gate command lines or output (inventory section 4) change in the same drain.
 
-The caller sweep keeps each repo's `tools/gate.ps1` as the slim pass-through ([The launcher's hand-over](#the-launchers-hand-over)), so a clone on a machine without `gate.exe` still runs its commands, and switches that repo's docs and scripts to `gate run` where they call the gate directly.
+The caller sweep keeps each repo's `tools/gate.ps1` as the slim pass-through ([The launcher's hand-over](#the-launchers-hand-over)), so a clone on a machine without `gate.exe` still runs its commands, and switches that repo's docs and scripts to `tools/gate.ps1 run` where they call the gate directly.
 
-Those callers write `gate run --log <path> --timeout <s> --slot <kind> -- <command>` (`--stall`, `--tail`, `--no-markers`, `--local`; `gate stop-tree <pid>`), never `gate.exe` or a path. `tools/install.ps1` builds with a plain `cargo build`, not through a gate, so a broken installed gate can always be replaced.
+Every caller runs the gate through its repo's `tools/gate.ps1`: `pwsh -NoProfile -File tools/gate.ps1 run --log <path> --timeout <s> --slot <kind> -- <command>` (`--stall`, `--tail`, `--no-markers`, `--local`; `tools/gate.ps1 stop-tree <pid>`). Nothing calls `gate.exe` directly or by a path. `tools/install.ps1` builds with a plain `cargo build`, not through a gate, so a broken installed gate can always be replaced.
 
 A caller that runs `gate ...` on PATH gets "command not found" on a machine without it, and each repo's docs name the install script; a caller that runs the launcher gets the launcher's direct run there, not `gate.exe`'s.
 
