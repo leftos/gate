@@ -165,8 +165,10 @@ fn repo_back_commit<S: LineSink + 'static>(
 /// plain folder, not a link; an earlier copy, a plain file, removed, and anything else at the name refused;
 /// `.git/index` opened without following a link and without waiting on a FIFO (`O_NOFOLLOW | O_NONBLOCK`), and the
 /// opened file checked a plain file before it is read, so nothing swapped in at its name can hold the run; the copy
-/// made new (`O_CREAT | O_EXCL | O_NOFOLLOW`, mode 0600) and, when the copying fails partway, removed again. Git's
-/// `add -A` then replaces the copy through `<work>.index.lock`, which leaves it with git's own mode. Else why not.
+/// made new (`O_CREAT | O_EXCL | O_NOFOLLOW`, mode 0600) and, when the copying fails partway, removed again. The copy
+/// keeps the index's modification time, so git's racy-git check still compares the content of entries written in the
+/// index's own second. Git's `add -A` then replaces the copy through `<work>.index.lock`, which leaves it with git's own
+/// mode. Else why not.
 fn index_copied<S: LineSink>(request: &Request<'_>, tree: &str, lock: &HeldLock, output: &Output<S>) -> Result<(), BackFailed> {
     let dot_git = Path::new(tree).join(".git");
     let index = dot_git.join("index");
@@ -203,11 +205,15 @@ fn index_copied<S: LineSink>(request: &Request<'_>, tree: &str, lock: &HeldLock,
         .custom_flags(libc::O_NOFOLLOW)
         .open(copy)
         .map_err(|error| not_copied(error.to_string()))?;
-    io::copy(&mut source, &mut made).map(drop).map_err(|error| {
-        drop(made);
-        removed_if_held(request.index, lock, output);
-        not_copied(error.to_string())
-    })
+    io::copy(&mut source, &mut made)
+        .map(drop)
+        .and_then(|()| metadata.modified())
+        .and_then(|modified| made.set_times(fs::FileTimes::new().set_modified(modified)))
+        .map_err(|error| {
+            drop(made);
+            removed_if_held(request.index, lock, output);
+            not_copied(error.to_string())
+        })
 }
 
 /// Whether the copied index of `request` is still a plain file at its name and the work lock `lock` still held, just

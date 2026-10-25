@@ -1905,6 +1905,22 @@ mod tests {
     }
 
     #[test]
+    fn a_same_size_rewrite_in_the_second_the_index_was_written_is_in_the_back_commit() {
+        let case = Case::new("back-racy");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        // The command rewrites a.txt at its size and leaves it, and the tree's index, in one second the index's entry
+        // for a.txt also names, as a fast command leaves them within its checkout's second: the stat data alone cannot
+        // tell the rewrite, and only the index's own mtime makes git look at the content. git compares ctime only to
+        // the second, so it is left out of the comparison here rather than raced.
+        let script = "git config core.trustctime false && touch -t 200101010000 a.txt && git update-index -q --refresh \
+                      && echo b > a.txt && touch -t 200101010000 a.txt .git/index";
+        let (status, said) = whole_run(&case.commanded(&commit, &["/bin/sh", "-c", script]));
+        assert_eq!(status, 0, "{said:?}");
+        let back = case.back_commit().expect("the rewritten a.txt makes a back commit");
+        assert_eq!(git(&[&format!("--git-dir={}", case.bare()), "show", &format!("{back}:a.txt")]), "b");
+    }
+
+    #[test]
     fn a_command_that_changes_nothing_makes_no_commit_and_leaves_no_back_ref() {
         let case = Case::new("back-unchanged");
         let commit = case.snapshot(&[("a.txt", "a\n")]);
