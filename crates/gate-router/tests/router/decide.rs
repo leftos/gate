@@ -1144,6 +1144,155 @@ fn a_repo_s_own_outputs_replace_the_cargo_default() {
 }
 
 #[test]
+fn a_dotnet_build_of_one_project_brings_back_its_bin_beside_the_repo_s_own_outputs() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let command = words(&["dotnet", "build", "src/App/App.csproj"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**", "src/App/bin/**"]);
+}
+
+#[test]
+fn a_dotnet_build_of_a_project_option_folder_brings_back_that_folder_s_bin() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let command = words(&["dotnet", "build", "--project", "src\\App"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**", "src/App/bin/**"]);
+}
+
+#[test]
+fn a_dotnet_build_in_a_subfolder_brings_back_the_bin_under_it() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let facts = FakeFacts {
+        config: Ok(Some(config)),
+        ..FakeFacts::at("src/c/")
+    };
+    let command = words(&["dotnet", "build", "App.csproj"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.outputs, ["tools/X/bin/**", "src/c/bin/**"]);
+}
+
+#[test]
+fn a_dotnet_build_whose_glob_is_already_listed_adds_no_copy() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["src/App/bin/**"]}}"#).expect("usable");
+    let command = words(&["dotnet", "build", "src/App/App.csproj"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["src/App/bin/**"]);
+}
+
+#[test]
+fn no_bin_is_derived_for_a_solution_a_test_or_an_output_folder() {
+    for command in [
+        words(&["dotnet", "build", "App.sln"]),
+        words(&["dotnet", "test", "src/App/App.csproj"]),
+        words(&["dotnet", "build", "src/App/App.csproj", "-o", "out"]),
+        words(&["dotnet", "build"]),
+    ] {
+        let config =
+            Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+        let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+        assert_eq!(run.outputs, ["tools/X/bin/**"], "{command:?}");
+    }
+}
+
+#[test]
+fn no_bin_is_derived_for_an_empty_outputs_list() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": []}}"#).expect("usable");
+    let command = words(&["dotnet", "build", "src/App/App.csproj"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, Vec::<String>::new());
+}
+
+#[test]
+fn no_bin_is_derived_on_a_macos_builder() {
+    let mac = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet build*"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}]"#;
+    let config = with_builders(r#"{"yaat": ["*"]}"#, mac);
+    let command = words(&["dotnet", "build", "src/App/App.csproj"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**"]);
+}
+
+#[test]
+fn the_bin_is_derived_for_a_build_of_a_folder() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let command = words(&["dotnet", "build", "src/Yaat.Client"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**", "src/Yaat.Client/bin/**"]);
+}
+
+#[test]
+fn the_bin_is_derived_under_the_subfolder_for_a_build_with_no_target() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let facts = FakeFacts {
+        config: Ok(Some(config)),
+        ..FakeFacts::at("src/c/")
+    };
+    let command = words(&["dotnet", "build"]);
+    let run = routed(decide(&heavy(&command), &facts));
+    assert_eq!(run.outputs, ["tools/X/bin/**", "src/c/bin/**"]);
+}
+
+#[test]
+fn the_bin_is_derived_for_a_build_of_a_project_file_at_the_root() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let command = words(&["dotnet", "build", ".\\App.csproj"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**", "bin/**"]);
+}
+
+#[test]
+fn the_bin_is_derived_for_a_build_of_a_project_file_written_with_extra_segments() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let command = words(&["dotnet", "build", "src//App/./App.csproj"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**", "src/App/bin/**"]);
+}
+
+#[test]
+fn the_bin_is_derived_for_a_platform_property() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let command = words(&["dotnet", "build", "src/App/App.csproj", "-p:Platform=x64"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**", "src/App/bin/**"]);
+}
+
+#[test]
+fn no_bin_is_derived_for_an_output_path_property() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let command = words(&["dotnet", "build", "src/App/App.csproj", "-p:OutputPath=x"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**"]);
+}
+
+#[test]
+fn the_bin_is_derived_for_a_project_option_in_every_spelling() {
+    for command in [
+        words(&["dotnet", "build", "--project=src/App"]),
+        words(&["dotnet", "build", "--project:src/App"]),
+    ] {
+        let config =
+            Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+        let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+        assert_eq!(run.outputs, ["tools/X/bin/**", "src/App/bin/**"], "{command:?}");
+    }
+}
+
+#[test]
+fn the_bin_is_derived_for_a_build_spelled_in_any_case() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let command = words(&["DOTNET", "BUILD", "src/App/App.CSPROJ"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**", "src/App/bin/**"]);
+}
+
+#[test]
+fn no_bin_is_derived_for_an_empty_project_option() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let command = words(&["dotnet", "build", "--project", ""]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**"]);
+}
+
+#[test]
 fn a_cargo_command_of_a_repo_without_outputs_brings_back_the_profile_folders() {
     let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["cargo *"]}}"#).expect("usable");
     let command = words(&["cargo", "build"]);

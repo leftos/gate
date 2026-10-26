@@ -12,7 +12,7 @@ Every repo that runs heavy gates is in scope, and every heavy command family in 
 
   Either it cannot run anywhere but this PC (a command that names this PC's own WSL state, such as a `/mnt/x` path or a distro folder only this PC has, an install into this PC's own folders, a git operation that writes this checkout's refs: any command whose first word is `git` or `prek`, a `git commit` included, stays local silently whatever its hooks need), or its run time is measured as shorter than what routing adds: the push, the outputs, the compression and the call overhead, taken from the repo's routed runs in the journal.
 
-  A reason that work can remove does not keep a family local. It is a blocker to book. Examples: a tool or SDK the builder lacks, a window or GL the desktop route can serve, a `--local` whose recorded reason shows a routing gap, an outputs list that would need to grow.
+  A reason that work can remove does not keep a family local. It is a blocker to book. Examples: a tool or SDK the builder lacks, a window or GL the desktop route can serve, a `--local` whose recorded reason shows a routing gap, an outputs list that would need to grow (a routed `dotnet build`'s own project bin needs no entry: it comes back with the repo's list).
 
 Coverage is judged from the journal's history of gated commands per repo, not from the commands guessed to matter. Light-slot runs never route (the router considers heavy runs only), so a repo whose gates are all light, short checks stays local without an entry.
 
@@ -80,7 +80,7 @@ A macOS builder (an Apple-silicon Mac, a dedicated builder nobody works on) is s
 
 `remote.json`'s `builders` array (an entry with `os` `macos` and a `root`) is read and routes ([design.md, remote.json](design.md#remotejson)), and the transport, payload layout, path map and PC caches follow the entry's profile.
 
-A Mac entry may carry `outputs`, and its box brings them back like a Windows builder's (a route whose output is a TRX, as yaat's, works). That a build whose outputs are launched on the PC stays off the Mac is a convention of the `remote.json` entries: no code enforces it until GATE-696 lands.
+A Mac entry may carry `outputs`, and its box brings them back like a Windows builder's (a route whose output is a TRX, as yaat's, works); the project bin a Windows builder's routed `dotnet build` adds to a repo's own list is not derived for a Mac. That a build whose outputs are launched on the PC stays off the Mac is a convention of the `remote.json` entries: no code enforces it until GATE-696 lands.
 
 The words a macOS builder is sent are spelled for the Mac: the recognised paths use `/`, and a relative word written with `\` (`src\Duel.sln`) is sent with `/` when the snapshot carries that file or folder, in its exact letter case. A word that still holds a `\` (a regex, a list, script text after `bash -c` or `pwsh -Command`, a path the repo does not carry) keeps the command off the Mac: it runs on a Windows builder or here, silently. A Windows builder is sent the words as written. Details: [design.md, Routing](design.md#routing).
 

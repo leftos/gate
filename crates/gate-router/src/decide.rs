@@ -2140,6 +2140,63 @@ fn device_path(letter: char, facts: &dyn Facts, answers: &mut Vec<(char, Option<
     path
 }
 
+/// The output glob a routed dotnet build adds beside the repo's own list, for the folder its own project is built in:
+/// `None` unless the verb is `build` and the words name no output option ([`OUTPUT_OPTIONS`]) and set none of
+/// [`DERIVED_OUTPUT_PROPERTIES`]. The glob is [`target_folder`]'s folder under the subfolder ([`bin_glob`]).
+fn derived_outputs(words: &[String], subfolder: &str) -> Option<String> {
+    let own = &words[dotnet_own(words)?];
+    let moves = own.iter().any(|word| is_output_option(word)) || DERIVED_OUTPUT_PROPERTIES.iter().any(|name| sets_property(own, name));
+    if !verb_in(own, &["build"]) || moves {
+        return None;
+    }
+    bin_glob(subfolder, &target_folder(words, subfolder)?)
+}
+
+/// The folder a routed dotnet build builds in, as its words write it ([`dotnet_target`], [`positional_target`]): the
+/// project file's own, the `--project` or lone folder word itself, or the gate's own folder for a build naming no target
+/// below the repo root. `None` for a solution, an empty project name, and a build of the root naming no target.
+fn target_folder(words: &[String], subfolder: &str) -> Option<String> {
+    Some(match dotnet_target(words) {
+        Some(DotnetTarget::Solution(_)) => return None,
+        Some(DotnetTarget::Project(project)) if project.is_empty() => return None,
+        Some(DotnetTarget::Project(project)) if has_extension(&project, &PROJECT_EXTENSIONS) => {
+            project.rfind(['/', '\\']).map_or(String::new(), |at| project[..at].to_owned())
+        }
+        Some(DotnetTarget::Project(project)) => project,
+        None => match positional_target(words) {
+            Some(word) => word,
+            None if !subfolder.is_empty() => String::new(),
+            None => return None,
+        },
+    })
+}
+
+/// The glob `folder`, built under `subfolder`, keeps its output in: their segments together, each kept unless empty or
+/// `.`, a `..` popping the last kept one, so the target climbs back to the repo root but not above it; `None` for an
+/// absolute folder or one that climbs above the root. The kept segments joined with `/`, then `/bin/**`.
+fn bin_glob(subfolder: &str, folder: &str) -> Option<String> {
+    let folder = folder.replace('\\', "/");
+    if folder.starts_with('/') || folder.as_bytes().get(1) == Some(&b':') {
+        return None;
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    for part in subfolder.split('/').chain(folder.split('/')) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                kept.pop()?;
+            }
+            part => kept.push(part),
+        }
+    }
+    let prefix = if kept.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", kept.join("/"))
+    };
+    Some(format!("{prefix}bin/**"))
+}
+
 /// The routed run of a matched command: its target, its rewritten words with `--no-build` dropped, then marked and
 /// stamped as [`builder_words`] marks and stamps them, the worktree's `HEAD` sha, asked once whatever the command, and
 /// the builders the run may try next ([`RemoteRun::later`]), which the config alone gives.
@@ -2165,19 +2222,25 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
             mark_bare_first_word(&mut kept, facts, program_named);
             SendPlan { words: kept, bin }
         });
-    let mut words = without_no_build(sent);
-    let dropped_no_build = words.len() != sent_count;
     let fallback = without_no_build(given.to_vec());
-    let mut outputs = match config.own_outputs_on(&target.builder, &target.repo) {
+    let own_outputs = config.own_outputs_on(&target.builder, &target.repo);
+    let derives = target.builder.os == BuilderOs::Windows && own_outputs.as_ref().is_some_and(|globs| !globs.is_empty());
+    let derived = derives.then(|| derived_outputs(&sent, &subfolder)).flatten();
+    let mut outputs = match own_outputs {
         Some(globs) => globs,
         None if target.builder.os == BuilderOs::Macos => Vec::new(),
         None if cargo => CARGO_OUTPUTS.iter().map(|glob| (*glob).to_owned()).collect(),
         None => DEFAULT_OUTPUTS.iter().map(|glob| (*glob).to_owned()).collect(),
     };
+    if let Some(glob) = derived.filter(|glob| !outputs.contains(glob)) {
+        outputs.push(glob);
+    }
     let outputs_withheld = fallback.len() != given.len() && !outputs.is_empty();
     if outputs_withheld {
         outputs.clear();
     }
+    let mut words = without_no_build(sent);
+    let dropped_no_build = words.len() != sent_count;
     mark_bare_first_word(&mut words, facts, program_named);
     let source_revision = head_of(&target.place, facts);
     stamp(&mut words, || source_revision.clone(), &target, facts);
@@ -2359,6 +2422,9 @@ const OUTPUT_OPTIONS: [&str; 3] = ["-o", "--output", "--artifacts-path"];
 /// `--no-build` no send keeps: `Platform` among them, as a platform other than `AnyCPU` builds into
 /// `bin\{platform}\{configuration}`.
 pub const OUTPUT_PROPERTIES: [&str; 5] = ["OutputPath", "BaseOutputPath", "UseArtifactsOutput", "OutDir", "Platform"];
+/// The [`OUTPUT_PROPERTIES`] that move a routed dotnet build's output out of the project's `bin` folder, which
+/// [`derived_outputs`] reads: `Platform` left out, whose build lands under `bin\{platform}\{configuration}` still.
+const DERIVED_OUTPUT_PROPERTIES: [&str; 4] = ["OutputPath", "BaseOutputPath", "UseArtifactsOutput", "OutDir"];
 
 /// The bin folder whose files a routed `dotnet test --no-build` sends so the builder keeps its `--no-build`
 /// ([`SendPlan::bin`]), read from the command `words` as given at `place`: the dotnet command's verb is `test`, its own
@@ -2448,7 +2514,7 @@ fn project_folder(project: &str, place: &Place) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Place, send_bin};
+    use super::{Place, derived_outputs, send_bin};
 
     /// The place of a gate at `prefix` below the worktree root `X:/dev/app`.
     fn place(prefix: &str) -> Place {
@@ -2467,6 +2533,30 @@ mod tests {
     /// The bin folder [`send_bin`] gives `text` at the root, the build files moving nothing.
     fn sent(text: &str) -> Option<String> {
         send_bin(&words(text), &place(""), |_, _| false)
+    }
+
+    /// The glob [`derived_outputs`] adds for the command `text` at the subfolder `folder`.
+    fn derived(text: &str, folder: &str) -> Option<String> {
+        derived_outputs(&words(text), folder)
+    }
+
+    #[test]
+    fn the_bin_is_derived_for_a_folder_target_resolved_against_the_subfolder() {
+        assert_eq!(derived(r"dotnet build ../App/App.csproj", "src/c"), Some("src/App/bin/**".to_owned()));
+        assert_eq!(derived(r"dotnet build ../../App/App.csproj", "src/c"), Some("App/bin/**".to_owned()));
+        assert_eq!(derived("dotnet build", "src/c"), Some("src/c/bin/**".to_owned()));
+    }
+
+    #[test]
+    fn no_bin_is_derived_for_a_build_that_escapes_the_worktree() {
+        assert_eq!(derived(r"dotnet build ../App/App.csproj", ""), None, "a folder that climbs out");
+        assert_eq!(
+            derived(r"dotnet build ../../../App/App.csproj", "src/c"),
+            None,
+            "a folder that climbs out"
+        );
+        assert_eq!(derived(r"dotnet build C:\App\App.csproj", ""), None, "an absolute folder");
+        assert_eq!(derived("dotnet build", ""), None, "a build of the root with no target");
     }
 
     #[test]
