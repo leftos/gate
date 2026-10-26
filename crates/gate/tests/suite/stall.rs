@@ -129,7 +129,7 @@ fn a_quiet_command_is_stalled_beside_a_busy_compiler_server_outside_its_job() {
     let server = start(command);
     server.wait_for_stdout("burning");
     let burned_before = cpu_ticks(server.id());
-    let seams = ["--test-stall-ms", "2000", "--test-sample-ms", "100"];
+    let seams = ["--test-stall-ms", "2000", "--test-sample-ms", "100", "--test-stall-from-output"];
 
     let outcome = case.run(&run_words("out.log", &seams, &[&msbuild, "out", "building", "sleep", UNTIL_KILLED]));
     let burned_by_the_kill = cpu_ticks(server.id());
@@ -442,7 +442,7 @@ fn a_passed_run_journals_its_load_adjusted_seconds() {
 #[test]
 fn a_quiet_command_that_ran_a_short_child_is_still_stalled_and_its_process_lines_are_no_output() {
     let case = Case::new("a_quiet_command_that_ran_a_short_child_is_still_stalled_and_its_process_lines_are_no_output");
-    let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100"];
+    let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100", "--test-stall-from-output"];
     let log_path = case.folder().join("out.log");
 
     // The command runs one child to its end, then sleeps until killed: once the child is gone nothing in the job moves,

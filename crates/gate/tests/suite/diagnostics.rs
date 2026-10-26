@@ -57,7 +57,7 @@ fn assert_block(log: &str, kill: &str, lines: &[&str]) {
 #[test]
 fn a_kill_writes_its_diagnostics_to_the_log_before_the_kill_line() {
     let case = Case::new("a_kill_writes_its_diagnostics_to_the_log_before_the_kill_line");
-    let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100"];
+    let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100", "--test-stall-from-output"];
     let log_path = case.folder().join("out.log");
 
     let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "out", "hi", "sleep", UNTIL_KILLED]));
@@ -122,7 +122,7 @@ fn a_failing_diagnostics_gathering_still_kills() {
 #[test]
 fn the_failed_tail_holds_the_last_lines_around_a_big_block() {
     let case = Case::new("the_failed_tail_holds_the_last_lines_around_a_big_block");
-    let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100"];
+    let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100", "--test-stall-from-output"];
     let log_path = case.folder().join("out.log");
 
     let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "lines", "30", "n", "sleep", UNTIL_KILLED]));
