@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Tests install-macos.sh without downloading anything or touching the real HOME: the argument handling, the Homebrew
 # and FFmpeg steps' dry run, their --admin refusals, the System step's dry run with its prune-job plist (linted where
-# plutil exists), the builder-home parse of dscl's output, the Login PATH block in a temporary HOME and the root
-# refusal. Runs on macOS and in Git Bash.
+# plutil exists), the builder-home parse of dscl's output, the Login PATH block in a temporary HOME, the Private home
+# step and the root refusal. Runs on macOS and in Git Bash.
 # Usage: bash tools/builder/test-install-macos.sh
 set -euo pipefail
 
@@ -54,6 +54,10 @@ absent() { [ ! -e "$1" ]; }
 rc_is() { [ "$rc" = "$1" ]; }
 lacks() { ! grep -qF -- "$1" "$2"; }
 line_count() { grep -cxF -- "$1" "$2" || true; }
+# A folder's mode, as stat spells it on the box this runs on.
+mode_of() {
+    if [ "$(uname -s)" = Darwin ]; then stat -f '%Lp' "$1"; else stat -c '%a' "$1"; fi
+}
 # Whether the run's output holds a line with each of the texts given, in the order given.
 in_order() {
     local at=0 now text
@@ -81,7 +85,8 @@ check() {
     fi
 }
 
-expected_steps='.NET SDK 10.0.401
+expected_steps='Private home
+.NET SDK 10.0.401
 .NET SDK 8.0.425
 .NET workload wasm-tools
 PowerShell 7.6.6
@@ -108,7 +113,7 @@ case_list() {
 
 case_only_bogus() {
     run --prefix "$scratch/p-bogus" --root "$scratch/r-bogus" --only 'uv,Bogus'
-    expect rc_is 2 && expect has "--only 'Bogus' matches no step. Steps: .NET SDK 10.0.401, " &&
+    expect rc_is 2 && expect has "--only 'Bogus' matches no step. Steps: Private home, .NET SDK 10.0.401, " &&
         expect absent "$scratch/p-bogus" && expect absent "$scratch/r-bogus"
 }
 
@@ -339,6 +344,40 @@ case_login_path_block() {
         expect [ "$(head -n 1 "$zp")" = 'export KEEP_ME=1' ]
 }
 
+# The package caches the box's restores make land in the builder's home are readable by every account the home's mode
+# lets in, and every standard macOS account is in that group; the step makes the home 0700, and says so once.
+case_private_home() {
+    chmod 750 "$home"
+    run --only 'Private home'
+    expect rc_is 0 || return 1
+    # Git Bash cannot hold a folder's mode, so the mode and the line it makes are checked on the Unix boxes only.
+    case "$(uname -s)" in
+        Darwin | Linux) ;;
+        *) return 0 ;;
+    esac
+    expect [ "$(mode_of "$home")" = 700 ] || return 1
+    expect has 'had mode 750; set to 700' || return 1
+    run --only 'Private home'
+    expect rc_is 0 && expect lacks 'set to 700' "$scratch/out"
+}
+
+# A home that is a link is refused before anything is changed; a trailing slash would make -L follow it.
+case_private_home_refuses_a_link() {
+    # Git Bash writes ln -s as a copy, not a link, so the refusal is checked on the Unix boxes only.
+    case "$(uname -s)" in
+        Darwin | Linux) ;;
+        *) return 0 ;;
+    esac
+    mkdir -p "$scratch/real-home"
+    ln -s "$scratch/real-home" "$scratch/link-home"
+    set +e
+    env HOME="$scratch/link-home" CARGO_HOME="$scratch/cargo" INSTALL_MACOS_TEST_UID=501 \
+        bash "$script" --only 'Private home' >"$scratch/out" 2>&1
+    rc=$?
+    set -e
+    expect rc_is 1 && expect has 'is a symlink; point HOME at the builder'"'"'s own folder'
+}
+
 case_root_refused() {
     run_as 0 --prefix "$scratch/p-root" --only cargo-nextest
     expect rc_is 2 && expect has "running as root: the toolchain steps must land in the builder user's home" &&
@@ -354,9 +393,9 @@ case_root_step_beside_system_refused() {
 case_list_homebrew() {
     run --list
     expect rc_is 0 &&
-        expect [ "$(sed -n '14p' "$scratch/out")" = 'Homebrew' ] &&
-        expect [ "$(sed -n '15p' "$scratch/out")" = 'FFmpeg' ] &&
-        expect [ "$(sed -n '16p' "$scratch/out")" = 'Login PATH' ]
+        expect [ "$(sed -n '15p' "$scratch/out")" = 'Homebrew' ] &&
+        expect [ "$(sed -n '16p' "$scratch/out")" = 'FFmpeg' ] &&
+        expect [ "$(sed -n '17p' "$scratch/out")" = 'Login PATH' ]
 }
 
 # The dry run comes before the steps may change the machine: it prints both steps' commands and logs SKIP for both.
@@ -462,6 +501,8 @@ check 'the prune log folder must be root'"'"'s and writable by no one else, its 
 check 'a bootout still in progress is waited out and the prune job bootstrapped' case_prune_bootout_in_progress
 check '--system without root exits 2' case_system_needs_root
 check 'the Login PATH block is written once and replaced on rerun' case_login_path_block
+check 'the Private home step makes the home mode 0700 and says so only when it changes it' case_private_home
+check 'a home that is a link is refused' case_private_home_refuses_a_link
 check 'a toolchain step as root is refused' case_root_refused
 check 'a toolchain step beside System under --system as root is refused' case_root_step_beside_system_refused
 

@@ -4246,6 +4246,8 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   A lockfile folder whose relative name is not UTF-8 or holds a control character is skipped with `gate: remote <name> install skipped: <folder> has a name the packages record cannot hold`, and the command runs.
 
+  The installs leave their caches in the builder's home (`~/.npm`, `~/Library/pnpm/store`, `~/.bun/install/cache`) at mode 0755 and 0644, and every standard macOS account is in the home's group `staff`. The installer's first step, `Private home`, makes the home mode 0700 so other accounts cannot read them, and refuses a home that is a symlink or owned by another account.
+
   Package files and lockfiles are read whole up to 256 MiB, and one with more than one name is refused as on the Windows box: `gate: remote could not read the package file <path>: it has <n> names`, the same for `the lockfile`, or `...: it is longer than 268435456 bytes`, with status 1.
 
   A link at a lockfile's name stops the walk and fails the run on the read (`gate: remote could not read the lockfile <path>: <error>`), as on Windows; a start folder that is a file walks on up.

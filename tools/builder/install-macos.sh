@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Installs the macOS (Apple-silicon) builder's toolchains at pinned versions from official release URLs, its login PATH,
-# its git config and the gate's work root, all as the builder user without sudo. A separate System step, run only under
-# sudo with --system, keeps the machine awake, raises the open-file limits, turns on Remote Login and installs the
-# launchd job dev.gate.prune-work, which runs the box's prune of the work root every two hours as the builder user.
+# Makes the macOS (Apple-silicon) builder's home mode 0700, and installs its toolchains at pinned versions from official
+# release URLs, its login PATH, its git config and the gate's work root, all as the builder user without sudo. A
+# separate System step, run only under sudo with --system, keeps the machine awake, raises the open-file limits, turns
+# on Remote Login and installs the launchd job dev.gate.prune-work, which runs the box's prune of the work root every
+# two hours as the builder user.
 # Two more steps, Homebrew and FFmpeg, need an admin account and change the machine only under --admin.
 #
 # Run it as the builder user, over ssh or copied to the machine:
@@ -224,6 +225,23 @@ unpack_zip() {
     rm -rf "$unpacked"
     mkdir -p "$unpacked"
     ditto -x -k "$1" "$unpacked"
+}
+
+# A folder's mode, as stat spells it on the box this runs on.
+mode_of() {
+    if [ "$(uname -s)" = Darwin ]; then stat -f '%Lp' "$1"; else stat -c '%a' "$1"; fi
+}
+
+# Package caches the box's restores make land in the builder's home, so other accounts must not read it.
+step_private_home() {
+    local home=${HOME%/} mode
+    [ ! -L "$home" ] || fail "$home is a symlink; point HOME at the builder's own folder"
+    [ -O "$home" ] || fail "$home is owned by another account; the builder's home must be its own"
+    mode=$(mode_of "$home")
+    if [ "${mode: -3}" != 700 ]; then
+        chmod 700 "$home"
+        log "$home had mode $mode; set to 700"
+    fi
 }
 
 # Microsoft publishes no checksum for dotnet-install.sh; the script fetches the SDK itself.
@@ -463,10 +481,6 @@ step_git_config() {
         log "core.autocrlf was ${old:-unset}; set to false"
     fi
     git config --global gc.pruneExpire never
-}
-
-mode_of() {
-    if [ "$(uname -s)" = Darwin ]; then stat -f '%Lp' "$1"; else stat -c '%a' "$1"; fi
 }
 
 # The box refuses a work root that is a link, not its user's, or writable by group or others.
@@ -772,6 +786,7 @@ summary() {
     ffmpeg_summary
 }
 
+step 'Private home' step_private_home
 step '.NET SDK 10.0.401' step_dotnet_10
 step '.NET SDK 8.0.425' step_dotnet_8
 step '.NET workload wasm-tools' step_wasm_tools
