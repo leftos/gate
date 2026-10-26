@@ -439,7 +439,9 @@ impl RunTemp {
 }
 
 /// A new temp folder for the run, made by `mkdtemp(3)` from [`TEMP_TEMPLATE`]: at mode 0700, owned by the builder
-/// user, and never at a name that is already there, so no other account can plant it or a link in its place.
+/// user, in the builder user's own group, and never at a name that is already there, so no other account can plant it
+/// or a link in its place. The group is the builder user's own, else the kernel drops `S_ISGID` from a file made in the
+/// folder and made setgid there.
 fn temp_made() -> io::Result<RunTemp> {
     let template = test_template::get().unwrap_or_else(|| TEMP_TEMPLATE.to_owned());
     let mut template = template.into_bytes_with_nul();
@@ -453,10 +455,13 @@ fn temp_made() -> io::Result<RunTemp> {
     let path = String::from_utf8_lossy(&template).into_owned();
     let tmpdir = format!("{path}/");
     let path = PathBuf::from(path);
-    let made = fs::symlink_metadata(&path).inspect_err(|_| {
-        // The run is refused with this look's error; the folder just made is empty, and `remove_dir` takes no link.
-        let _ = fs::remove_dir(&path);
-    })?;
+    let made = std::os::unix::fs::lchown(&path, None, Some(files::effective_gid()))
+        .and_then(|()| fs::symlink_metadata(&path))
+        .inspect_err(|_| {
+            // The run is refused with this call's or this look's error; the folder just made is empty, and
+            // `remove_dir` takes no link.
+            let _ = fs::remove_dir(&path);
+        })?;
     Ok(RunTemp {
         path,
         tmpdir,
@@ -1589,7 +1594,7 @@ mod tests {
 
     use super::{
         NotLaidOut, REFUSED_STATUS, Ready, Request, Sources, Unready, Watches, inputs_matched, login_read, place_of, prepare, prepared, run_along,
-        run_reading, test_template, work_cleared,
+        run_reading, temp_made, test_template, work_cleared,
     };
     #[cfg(target_os = "macos")]
     use crate::beneath::ANOTHER_VOLUME;
@@ -2424,6 +2429,29 @@ mod tests {
         assert!(meta.is_dir(), "a folder, not a link");
         assert_eq!(meta.mode() & 0o7777, 0o700, "private to its owner");
         assert_eq!(meta.uid(), effective_uid(), "owned by the builder user");
+    }
+
+    #[test]
+    fn a_run_s_tmp_folder_keeps_setgid_on_a_file_made_in_it() {
+        let temp = temp_made().expect("the run's temp folder is made");
+        let folder = fs::symlink_metadata(temp.path());
+        let file = temp.path().join("setgid");
+        let written = fs::write(&file, "")
+            .and_then(|()| fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o2700)))
+            .and_then(|()| fs::symlink_metadata(&file));
+        let removed = fs::remove_dir_all(temp.path());
+        removed.expect("the case removes the folder");
+        let folder = folder.expect("the folder is there");
+        let mode = written.expect("the file is made setgid").mode();
+        // SAFETY: `getegid` takes nothing, touches no memory and always succeeds.
+        let egid = unsafe { libc::getegid() };
+        assert_eq!(
+            mode & 0o7777,
+            0o2700,
+            "chmod kept S_ISGID in the run's TMPDIR (folder group {})",
+            folder.gid()
+        );
+        assert_eq!(folder.gid(), egid, "the folder takes the builder user's own group");
     }
 
     #[test]

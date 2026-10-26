@@ -534,6 +534,13 @@ pub fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// The box's effective group id.
+#[must_use]
+pub fn effective_gid() -> u32 {
+    // SAFETY: `getegid` takes nothing, touches no memory and always succeeds.
+    unsafe { libc::getegid() }
+}
+
 /// The name the box's lines give its user, whose effective id is `euid`: `USER`, else `uid <euid>`.
 #[must_use]
 pub fn user_name(euid: u32) -> String {
