@@ -87,6 +87,20 @@ impl<'a> Asked<'a> {
         }))
     }
 
+    /// These outputs narrowed to the globs that name a `TestResults` folder ([`Globs::test_results_only`]), which a
+    /// failed command brings back, in the same archive and folder and without a cross build's: `None` when no glob
+    /// names one.
+    #[must_use]
+    pub fn test_reports(&self) -> Option<Asked<'a>> {
+        Some(Asked {
+            globs: self.globs.test_results_only()?,
+            full: self.full,
+            rid: None,
+            archive: self.archive.clone(),
+            folder: self.folder,
+        })
+    }
+
     /// These outputs, brought back from a run whose cross build is for `rid`, `None` for a run without one.
     #[must_use]
     pub fn crossed_for(self, rid: Option<&str>) -> Asked<'a> {
@@ -723,10 +737,10 @@ impl Brought {
     }
 }
 
-/// Packs the files under `asked`'s globs in the folder `work` to bring back after a passing command ([`select`]),
-/// leaving out `skip`, the paths of the run's back commit, which the sync-back replaces on the PC, so no copy is made
-/// from the PC's file at one of them either: the line saying how many were packed and the archive's name, with the line
-/// saying the archive's size in bytes to say before it, or
+/// Packs the files under `asked`'s globs in the folder `work` to bring back after a passing command ([`select`]), or a
+/// failed one's test reports ([`Asked::test_reports`]), leaving out `skip`, the paths of the run's back commit, which
+/// the sync-back replaces on the PC, so no copy is made from the PC's file at one of them either: the line saying how
+/// many were packed and the archive's name, with the line saying the archive's size in bytes to say before it, or
 /// `gate-remote-outputs: 0` with no archive written when none were, and before it the line saying the files [`select`]
 /// would have packed but for a name this PC cannot take ([`skipped_line`]), when there were any. The output folder is
 /// made when missing ([`output_folder`]), and the archive is made anew beneath it, 0600: a file or a link already at

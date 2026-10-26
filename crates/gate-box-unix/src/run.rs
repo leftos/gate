@@ -174,7 +174,8 @@ pub struct Request<'p> {
     pub godot: Option<&'p str>,
     /// The digest of the inputs manifest the PC sent before the run, `InputsDigest`; `None` for none.
     pub inputs_digest: Option<&'p str>,
-    /// The outputs the run brings back after a passing command, `Outputs` and `OutputsFull`; `None` without globs.
+    /// The outputs the run brings back after a passing command, and the test reports among them after a failed one,
+    /// `Outputs` and `OutputsFull`; `None` without globs.
     pub outputs: Option<Asked<'p>>,
     /// The cross build run after a passing command, before its outputs are brought back, `CrossBuild`; `None` for none.
     pub cross: Option<CrossBuild>,
@@ -788,7 +789,9 @@ fn of_its_own(end: CommandEnd) -> bool {
 /// gives [`FAILED_STATUS`] for a command that exited 0, else `status`; a client gone gives the closed status. Once the
 /// back commits are pushed, a command that exited 0 with output globs has its cross build run, when the payload asks
 /// for one, as `launch` started the command ([`cross_built`]), then its outputs brought back ([`brought_back`]), which
-/// gives its status; a failed command, a failed sync-back or a cross build that did not pass packs nothing.
+/// gives its status; a failed command has only its test reports brought back ([`Asked::test_reports`]), with no cross
+/// build, and ends on its own status whatever the pack gives, and one with no glob naming a `TestResults` folder, a
+/// failed sync-back or a cross build that did not pass packs nothing.
 fn synced_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>, status: u8, budget: u64, launch: &Launch<'_>) -> u8 {
     let request = &ready.request;
     let commits = match back::back_commit(request, &ready.lock, ready.login_path.as_deref(), output) {
@@ -812,13 +815,20 @@ fn synced_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>
             .collect();
         said(output, &[&back_commits_line(&named)], status);
     }
+    let main = commits.first().and_then(Option::as_deref);
     match (&request.outputs, &ready.outputs) {
         (Some(asked), Some(read)) if status == 0 => {
             if let Some(ended) = request.cross.as_ref().and_then(|cross| cross_built(launch, cross, output)) {
                 return ended;
             }
-            let main = commits.first().and_then(Option::as_deref);
             brought_back(ready, (asked, read), main, output, budget)
+        }
+        (Some(asked), Some(read)) => {
+            if let Some(reports) = asked.test_reports() {
+                // A failed command ends on its own status, so the pack's own is only said.
+                let _ = brought_back(ready, (&reports, read), main, output, budget);
+            }
+            status
         }
         _ => status,
     }
@@ -845,14 +855,15 @@ fn cross_built<S: LineSink + 'static>(launch: &Launch<'_>, build: &CrossBuild, o
     }
 }
 
-/// The status of the passing run `ready` once its outputs `asked`, read before the command as `read`, are brought back
-/// from the main repo's tree alone, as the Windows box's `RunOutputs` brings them: the paths the main repo's back
-/// commit `main` changes read first ([`back::back_paths`]), none without one, and left out; then the pack
-/// ([`outputs::bring_back`]), its skipped line, when there is one, and its `gate-remote-outputs:` line said; then, when
-/// it wrote an archive, the output folder trimmed to `budget` bytes ([`outputs::trim`]), each line said, the archive
-/// held under its pack's lock until the trim is done. 0, or [`FAILED_STATUS`] with
-/// [`outputs::not_brought_back`]'s line when the outputs are not brought back; a client gone while the paths are read,
-/// or found gone before the pack or before the trim, gives the closed status, nothing more packed or trimmed.
+/// The status of the run `ready` once its outputs `asked`, a passing command's or a failed one's test reports, read
+/// before the command as `read`, are brought back from the main repo's tree alone, as the Windows box's `RunOutputs`
+/// brings them: the paths the main repo's back commit `main` changes read first ([`back::back_paths`]), none without
+/// one, and left out; then the pack ([`outputs::bring_back`]), its skipped line, when there is one, and its
+/// `gate-remote-outputs:` line said; then, when it wrote an archive, the output folder trimmed to `budget` bytes
+/// ([`outputs::trim`]), each line said, the archive held under its pack's lock until the trim is done. 0, or
+/// [`FAILED_STATUS`] with [`outputs::not_brought_back`]'s line when the outputs are not brought back; a client gone
+/// while the paths are read, or found gone before the pack or before the trim, gives the closed status, nothing more
+/// packed or trimmed.
 fn brought_back<S: LineSink + 'static>(
     ready: &Ready<'_>,
     (asked, read): (&Asked<'_>, &RunOutputs),
@@ -3916,13 +3927,86 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_command_packs_nothing_and_says_no_outputs_line() {
+    fn a_failed_command_with_no_test_results_glob_packs_nothing_and_says_no_outputs_line() {
         let (case, commit) = outputs_case("outputs-failed");
         let json = case.outputs_json(&commit, "mkdir -p bin && echo new > bin/new.txt; exit 3", &json!(["bin/**"]));
         let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
         assert_eq!(status, 3, "{said:?}");
         assert!(outputs_said(&said).is_empty(), "{said:?}");
         assert!(!said.iter().any(|(_, line)| line.starts_with("gate: remote outputs")), "{said:?}");
+        assert!(!case.archive().exists(), "nothing is packed");
+    }
+
+    /// A case whose snapshot holds `a.txt` and ignores `bin/` and `TestResults/`, so neither a file a command writes in
+    /// `bin` nor a report it leaves in `TestResults` is in a back commit; the case and its snapshot.
+    fn reports_case(name: &str) -> (Case, String) {
+        let case = Case::new(name);
+        let commit = case.snapshot(&[("a.txt", "a\n"), (".gitignore", "bin/\nTestResults/\n")]);
+        (case, commit)
+    }
+
+    /// A command that writes `bin/new.txt` and the report `TestResults/r.trx`, then fails with 3.
+    const FAILS_WITH_A_REPORT: &str = "mkdir -p bin TestResults && echo new > bin/new.txt && echo trx > TestResults/r.trx; exit 3";
+
+    /// The output globs of a run that writes [`FAILS_WITH_A_REPORT`]'s files: one of its build, one of its reports.
+    const BIN_AND_REPORTS: [&str; 2] = ["bin/**", "**/TestResults/**"];
+
+    #[test]
+    fn a_failed_command_packs_its_test_reports_alone() {
+        let (case, commit) = reports_case("outputs-failed-reports");
+        let json = case.outputs_json(&commit, FAILS_WITH_A_REPORT, &json!(BIN_AND_REPORTS));
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        assert_eq!(status, 3, "the command's own status: {said:?}");
+        let line = format!("gate-remote-outputs: 1 {}", archive_name());
+        assert_eq!(outputs_said(&said), [line.as_str()], "{said:?}");
+        assert_eq!(members_of(&case.archive()), ["TestResults/r.trx"], "only the report comes back");
+    }
+
+    #[test]
+    fn a_failed_command_with_a_cross_build_packs_its_test_reports_without_it() {
+        let (case, commit) = reports_case("outputs-failed-cross");
+        let marker = case.base.with_file_name("cross-ran");
+        let cross = format!(": > '{}'", marker.display());
+        let json = case.json(
+            &commit,
+            &json!({
+                "Command": ["/bin/sh", "-c", FAILS_WITH_A_REPORT],
+                "Identity": identity(),
+                "Outputs": BIN_AND_REPORTS,
+                "CrossBuild": { "Rid": "win-x64", "Words": ["/bin/sh", "-c", cross] },
+            }),
+        );
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        assert_eq!(status, 3, "the command's own status: {said:?}");
+        assert!(!marker.exists(), "no cross build ran");
+        assert!(!said.iter().any(|(_, line)| line.starts_with("gate: the cross build")), "{said:?}");
+        let line = format!("gate-remote-outputs: 1 {}", archive_name());
+        assert_eq!(outputs_said(&said), [line.as_str()], "{said:?}");
+        assert_eq!(members_of(&case.archive()), ["TestResults/r.trx"], "only the report comes back");
+    }
+
+    #[test]
+    fn a_failed_command_whose_test_results_glob_matches_nothing_says_nothing_packed() {
+        let (case, commit) = reports_case("outputs-failed-unmatched");
+        let script = "mkdir -p bin && echo new > bin/new.txt; exit 3";
+        let json = case.outputs_json(&commit, script, &json!(BIN_AND_REPORTS));
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        assert_eq!(status, 3, "the command's own status: {said:?}");
+        assert_eq!(outputs_said(&said), ["gate-remote-outputs: 0"], "{said:?}");
+        assert!(!case.archive().exists(), "nothing is packed");
+    }
+
+    #[test]
+    fn a_failed_command_whose_reports_are_not_brought_back_keeps_its_status() {
+        let (case, commit) = reports_case("outputs-failed-malformed");
+        let json = case.outputs_json(&commit, FAILS_WITH_A_REPORT, &json!(BIN_AND_REPORTS));
+        let (status, said) = run_fed(&json, &mut fed("not a manifest\n"), free_watches());
+        assert_eq!(status, 3, "the command's own status, not 1: {said:?}");
+        assert!(
+            said.iter()
+                .any(|(stream, line)| *stream == Stream::Err && line.starts_with("gate: remote outputs not brought back: ")),
+            "{said:?}"
+        );
         assert!(!case.archive().exists(), "nothing is packed");
     }
 

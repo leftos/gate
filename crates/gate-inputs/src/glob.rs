@@ -91,6 +91,7 @@ struct Exclusions {
 }
 
 /// One of [`Globs`]' globs.
+#[derive(Clone)]
 struct Pattern {
     regex: Regex,
     /// The `TestResults` folders the glob names, `None` when it names none ([`test_results_of`]).
@@ -98,6 +99,7 @@ struct Pattern {
 }
 
 /// The `TestResults` folders a glob names.
+#[derive(Clone)]
 struct TestResults {
     /// How many of the glob's folder segments are exactly `TestResults`, in any letter case.
     folders: usize,
@@ -139,6 +141,22 @@ impl Globs {
             patterns: patterns_of(globs, noun, true)?,
             excluded: Regex::clone(&EXCLUDED),
             beyond_test_results: Regex::clone(&EXCLUDED_BEYOND_TEST_RESULTS),
+        })
+    }
+
+    /// This matcher narrowed to its globs that name a `TestResults` folder ([`test_results_of`]), in their order and
+    /// held by the same exclusions: those a failed command's outputs are narrowed to, so its test reports come back and
+    /// nothing else does. `None` when no glob names one.
+    #[must_use]
+    pub fn test_results_only(&self) -> Option<Globs> {
+        let patterns: Vec<Pattern> = self.patterns.iter().filter(|pattern| pattern.test_results.is_some()).cloned().collect();
+        if patterns.is_empty() {
+            return None;
+        }
+        Some(Globs {
+            patterns,
+            excluded: self.excluded.clone(),
+            beyond_test_results: self.beyond_test_results.clone(),
         })
     }
 
@@ -357,6 +375,45 @@ mod tests {
     fn globs(globs: &[&str]) -> Globs {
         let owned: Vec<String> = globs.iter().map(|glob| (*glob).to_owned()).collect();
         Globs::new(&owned).expect("the globs can be matched")
+    }
+
+    /// The regex of each glob of `matcher`, in its order.
+    fn regexes(matcher: &Globs) -> Vec<String> {
+        matcher.patterns.iter().map(|pattern| pattern.regex.as_str().to_owned()).collect()
+    }
+
+    /// The regexes of the globs `of` narrowed to those that name a `TestResults` folder, `None` when none does.
+    fn narrowed(of: &[&str]) -> Option<Vec<String>> {
+        globs(of).test_results_only().map(|only| regexes(&only))
+    }
+
+    #[test]
+    fn test_results_only_keeps_a_glob_with_a_test_results_folder() {
+        let kept = ["**/TestResults/**", "src/TestResults/*.trx"];
+        assert_eq!(narrowed(&kept), Some(regexes(&globs(&kept))));
+    }
+
+    #[test]
+    fn test_results_only_keeps_a_test_results_folder_in_any_letter_case() {
+        let kept = ["**/testresults/**"];
+        assert_eq!(narrowed(&kept), Some(regexes(&globs(&kept))));
+    }
+
+    #[test]
+    fn test_results_only_drops_a_glob_without_a_test_results_folder() {
+        for dropped in ["**", "bin/**", "*TestResults*/**", "out/TestResults"] {
+            assert_eq!(narrowed(&[dropped]), None, "{dropped} names no TestResults folder");
+        }
+    }
+
+    #[test]
+    fn test_results_only_keeps_the_order_of_a_mixed_list() {
+        let mixed = ["b/TestResults/*.trx", "bin/**", "a/TestResults/**", "**"];
+        assert_eq!(narrowed(&mixed), Some(regexes(&globs(&["b/TestResults/*.trx", "a/TestResults/**"]))));
+        let only = globs(&mixed).test_results_only().expect("two globs name TestResults");
+        assert!(only.matches("b/TestResults/r.trx"), "a kept glob still lifts the TestResults exclusion");
+        assert!(!only.matches("bin/a.dll"), "a dropped glob brings nothing back");
+        assert!(!only.matches("a/TestResults/.tmp/r.trx"), "the other exclusions still hold");
     }
 
     #[test]

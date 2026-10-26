@@ -504,7 +504,7 @@ fn box_run_never_packs_an_excluded_path_or_a_path_through_a_junction() {
 }
 
 #[test]
-fn box_run_of_a_failed_command_packs_nothing() {
+fn box_run_of_a_failed_command_with_no_test_results_glob_packs_nothing() {
     let case = Case::new("box_outputs_failed_command");
     let mut payload = outputs_payload(&case, &[FAKE_TOOL, "write", r"bin\a.txt", "a", "exit", "3"], &["bin/**"]);
     snapshot(&case, &mut payload, &[IGNORE_BIN]);
@@ -513,6 +513,53 @@ fn box_run_of_a_failed_command_packs_nothing() {
 
     assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
     assert!(!outcome.stderr.contains("gate-remote-outputs"), "{outcome:?}");
+    assert!(!archive_path(&payload).exists(), "nothing is packed");
+}
+
+#[test]
+fn box_run_of_a_failed_command_packs_its_test_reports_alone() {
+    let case = Case::new("box_outputs_failed_reports");
+    let command = [FAKE_TOOL, "write", r"bin\a.txt", "a", "write", r"TestResults\r.trx", "trx", "exit", "3"];
+    let mut payload = outputs_payload(&case, &command, &["bin/**", "**/TestResults/**"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\nTestResults/\n")]);
+
+    let outcome = run_with_manifest(&case, &payload, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert!(has_line(&outcome.stderr, &packed_line(&payload, 1)), "{outcome:?}");
+    assert_eq!(
+        archive_members(&archive_path(&payload)),
+        ["TestResults/r.trx"],
+        "only the glob that names TestResults brings anything back"
+    );
+}
+
+#[test]
+fn box_run_of_a_failed_command_whose_test_results_glob_matches_nothing_packs_nothing_and_says_so() {
+    let case = Case::new("box_outputs_failed_no_reports");
+    let command = [FAKE_TOOL, "write", r"bin\a.txt", "a", "exit", "3"];
+    let mut payload = outputs_payload(&case, &command, &["bin/**", "**/TestResults/**"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "bin/\nTestResults/\n")]);
+
+    let outcome = run_with_manifest(&case, &payload, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    let said: Vec<&str> = outcome.stderr.lines().filter(|line| line.starts_with("gate-remote-outputs")).collect();
+    assert_eq!(said, ["gate-remote-outputs: 0"], "{outcome:?}");
+    assert!(!archive_path(&payload).exists(), "nothing is packed");
+}
+
+#[test]
+fn box_run_of_a_failed_command_whose_reports_are_not_brought_back_keeps_its_status() {
+    let case = Case::new("box_outputs_failed_bad_manifest");
+    let command = [FAKE_TOOL, "write", r"TestResults\r.trx", "trx", "exit", "3"];
+    let mut payload = outputs_payload(&case, &command, &["**/TestResults/**"]);
+    snapshot(&case, &mut payload, &[(".gitignore", "TestResults/\n")]);
+
+    let outcome = run_with_manifest(&case, &payload, "not a manifest\n");
+
+    assert_eq!(outcome.code, Some(3), "the command's own status, not 1: {outcome:?}");
+    assert!(not_brought_back(&outcome), "{outcome:?}");
     assert!(!archive_path(&payload).exists(), "nothing is packed");
 }
 

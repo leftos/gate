@@ -66,6 +66,17 @@ impl<'a> Asked<'a> {
             folder,
         }))
     }
+
+    /// These outputs narrowed to the globs that name a `TestResults` folder ([`Globs::test_results_only`]), which a
+    /// failed command brings back, in the same archive and folder: `None` when no glob names one.
+    pub(super) fn test_reports(&self) -> Option<Asked<'a>> {
+        Some(Asked {
+            globs: self.globs.test_results_only()?,
+            full: self.full,
+            archive: self.archive.clone(),
+            folder: self.folder,
+        })
+    }
 }
 
 /// The PC's manifest, read from `input` up to its first newline or its end, never waiting past the newline and never
@@ -314,15 +325,16 @@ pub(super) fn listing(asked: &Asked<'_>, work: &Path) -> (Option<Listing>, Optio
     }
 }
 
-/// Packs the files under `asked`'s globs in `work` to bring back after a passing command ([`select`]), leaving out
-/// `skip`, the paths of the run's back commit, which the sync-back replaces on the PC, so no copy is made from the PC's
-/// file at one of them either: the line saying how many were packed and the archive's name, and the line before it
-/// saying the archive's size in bytes as the pack wrote them ([`size_line`]); or `gate-remote-outputs: 0` with no
-/// archive written when none were; and before them the line saying the files [`select`] would have packed but for a
-/// name this PC cannot take ([`skipped_line`]), when there were any. Else why the outputs are not brought back; an
-/// archive left half written is removed. The archive is made anew: a file or a link already at its name fails the
-/// pack and is left as it is. A file whose final path is not inside `work` fails the pack ([`pack`]). The archive is
-/// opened sharing reads only while it is packed, so another run's trim cannot remove it before it is whole.
+/// Packs the files under `asked`'s globs in `work` to bring back after a passing command ([`select`]), or a failed one's
+/// test reports ([`Asked::test_reports`]), leaving out `skip`, the paths of the run's back commit, which the sync-back
+/// replaces on the PC, so no copy is made from the PC's file at one of them either: the line saying how many were
+/// packed and the archive's name, and the line before it saying the archive's size in bytes as the pack wrote them
+/// ([`size_line`]); or `gate-remote-outputs: 0` with no archive written when none were; and before them the line saying
+/// the files [`select`] would have packed but for a name this PC cannot take ([`skipped_line`]), when there were any.
+/// Else why the outputs are not brought back; an archive left half written is removed. The archive is made anew: a file
+/// or a link already at its name fails the pack and is left as it is. A file whose final path is not inside `work`
+/// fails the pack ([`pack`]). The archive is opened sharing reads only while it is packed, so another run's trim cannot
+/// remove it before it is whole.
 pub(super) fn bring_back(
     asked: &Asked<'_>,
     manifest: &Result<Manifest, String>,

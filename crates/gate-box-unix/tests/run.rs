@@ -1261,6 +1261,13 @@ mod unix {
             "{:?}",
             ended.err
         );
+        assert_eq!(
+            outputs_said(&ended),
+            ["gate-remote-outputs: 0"],
+            "its TestResults glob matched nothing: {:?}",
+            ended.err
+        );
+        assert!(!case.archive().exists(), "nothing is packed");
         case.ended_clean();
     }
 

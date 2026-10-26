@@ -763,11 +763,11 @@ impl<'a> RunOutputs<'a> {
         self.listing = listing;
     }
 
-    /// Packs the outputs of a passed command run in `work`, leaving out `skip`, the back commit's paths or why they
-    /// could not be read, and says how it went: 0, or 1 when the outputs are not brought back, the run's own archive
-    /// among them when it alone is over the box's outputs budget.
-    fn bring_back(&self, work: &Path, skip: Result<Vec<String>, String>, beat: &Beat<'_>, console: &mut Console) -> u32 {
-        let brought = skip.and_then(|skip| outputs::bring_back(self.asked, &self.manifest, self.listing.as_ref(), work, &skip));
+    /// Packs the outputs `asked` of a command run in `work`, the run's own or a failed command's test reports, leaving
+    /// out `skip`, the back commit's paths or why they could not be read, and says how it went: 0, or 1 when the
+    /// outputs are not brought back, the run's own archive among them when it alone is over the box's outputs budget.
+    fn bring_back(&self, asked: &Asked<'_>, work: &Path, skip: Result<Vec<String>, String>, beat: &Beat<'_>, console: &mut Console) -> u32 {
+        let brought = skip.and_then(|skip| outputs::bring_back(asked, &self.manifest, self.listing.as_ref(), work, &skip));
         match brought {
             Ok(brought) => {
                 if let Some(skipped) = &brought.skipped {
@@ -880,8 +880,9 @@ fn in_work_folder(request: &Request<'_>, stop: &Rc<NamedEvent>, seams: &BoxSeams
 
 /// The run once the heartbeat beats: the snapshot checked out, the repo's dotnet tools restored, a pnpm, bun or npm
 /// command's packages installed, the outputs listed, the command seen to its end in the place, the tree it left committed back
-/// unless the box's ceiling killed it, and, after a passed command, its outputs packed; the status as
-/// [`in_work_folder`] gives it, 1 for a passed command whose outputs are not brought back, [`KILLED`] for a killed one.
+/// unless the box's ceiling killed it, and, after a passed command, its outputs packed, after a failed one its test
+/// reports ([`reports_brought_back`]); the status as [`in_work_folder`] gives it, 1 for a passed command whose outputs
+/// are not brought back, [`KILLED`] for a killed one.
 fn checked_out(
     request: &Request<'_>,
     git: &WorkGit,
@@ -943,10 +944,35 @@ fn commanded(
         Some(outputs) if status == 0 => {
             // Read after the push and only for outputs, so failing to read them fails the outputs, never the sync-back.
             let skip = back_skip(request, git, commit.as_deref(), console)?;
-            Ok(outputs.bring_back(folders.work, skip, beat, console))
+            Ok(outputs.bring_back(outputs.asked, folders.work, skip, beat, console))
         }
-        _ => Ok(status),
+        Some(outputs) => {
+            reports_brought_back((request, git), (outputs, commit.as_deref()), folders.work, beat, console);
+            Ok(status)
+        }
+        None => Ok(status),
     }
+}
+
+/// Packs the test reports of a failed command of `request` run in `work` ([`outputs::Asked::test_reports`]), leaving
+/// out the paths of the back commit `commit`, read with `git`, as a passing command's outputs are packed; nothing, and
+/// no line, when no output glob names a `TestResults` folder. The failed command ends on its own status whatever the
+/// pack says, a client gone while the paths are read or during the pack included.
+fn reports_brought_back(
+    (request, git): (&Request<'_>, &WorkGit),
+    (outputs, commit): (&RunOutputs<'_>, Option<&str>),
+    work: &Path,
+    beat: &Beat<'_>,
+    console: &mut Console,
+) {
+    let Some(reports) = outputs.asked.test_reports() else {
+        return;
+    };
+    let Ok(skip) = back_skip(request, git, commit, console) else {
+        return;
+    };
+    // A failed command ends on its own status, so the pack's own is only said.
+    let _ = outputs.bring_back(&reports, work, skip, beat, console);
 }
 
 /// The run's command seen to its end: on the builder's desktop for a run that asks for it
