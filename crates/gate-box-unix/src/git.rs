@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::io;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::Arc;
@@ -50,6 +51,21 @@ const NO_SYSTEM_ATTRIBUTES: &str = "GIT_ATTR_NOSYSTEM";
 const NO_SYSTEM_CONFIG: &str = "GIT_CONFIG_NOSYSTEM";
 /// The git every step runs: macOS's own, owned by root, so no folder on a `PATH` can put another in its place.
 const GIT_PROGRAM: &str = "/usr/bin/git";
+/// The variable naming the only transports git may use, which overrides every config: set to `file`.
+const ALLOW_PROTOCOL: &str = "GIT_ALLOW_PROTOCOL";
+/// The options every git step starts with: no transport but local files by default, no submodule recursed into unless
+/// a step's words ask, and the files git makes moded by the box's umask. A repository's own `protocol.<name>.allow`
+/// outranks the first two; [`ALLOW_PROTOCOL`], set on every step, is what holds every step to local files.
+const PINNED_OPTIONS: [&str; 8] = [
+    "-c",
+    "protocol.allow=never",
+    "-c",
+    "protocol.file.allow=always",
+    "-c",
+    "submodule.recurse=false",
+    "-c",
+    "core.sharedRepository=umask",
+];
 
 /// A step that failed: the lines saying so, on stderr, and the status the box exits with.
 #[derive(Debug)]
@@ -101,15 +117,19 @@ impl<'a> Git<'a> {
     }
 
     /// The command running git with `args` as this git runs it: [`GIT_PROGRAM`] by its path, never one found along a
-    /// `PATH`, which still reaches git's own helpers and filters; no system-wide config read.
+    /// `PATH`, which still reaches git's own helpers and filters; no system-wide config read; and [`PINNED_OPTIONS`]
+    /// before `args`, whatever a repository's config says.
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(test_program::get().unwrap_or_else(|| PathBuf::from(GIT_PROGRAM)));
         crate::process::with_path(&mut command, self.path);
-        command.args(args).current_dir(self.folder);
+        command.args(PINNED_OPTIONS).args(args).current_dir(self.folder);
         for (name, _) in std::env::vars_os().filter(|(name, _)| is_git_variable(name)) {
             command.env_remove(name);
         }
-        command.env("GIT_CEILING_DIRECTORIES", self.ceiling).env(NO_SYSTEM_CONFIG, "1");
+        command
+            .env("GIT_CEILING_DIRECTORIES", self.ceiling)
+            .env(NO_SYSTEM_CONFIG, "1")
+            .env(ALLOW_PROTOCOL, "file");
         command
     }
 
@@ -416,6 +436,17 @@ struct Mode {
     ends_on_gone: bool,
     /// The most bytes of git's standard output kept; more fails the step.
     cap: usize,
+    /// Whether git runs with the usual umask 022 in place of the box's 077 ([`shared_umask`]).
+    shared: bool,
+}
+
+/// Sets the umask to 022, in a git step's child before its exec, so the files a checkout writes in the tree are moded
+/// as on the PC.
+fn shared_umask() {
+    // SAFETY: `umask` only sets the process's mask and returns the old one; it is async-signal-safe.
+    unsafe {
+        libc::umask(0o022);
+    }
 }
 
 impl<'a, S: LineSink + 'static> RunGit<'a, S> {
@@ -457,6 +488,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
             forward: true,
             ends_on_gone: true,
             cap: GIT_OUTPUT_CAP,
+            shared: false,
         };
         self.ran_as(step, args, mode, class, &[])
     }
@@ -480,8 +512,26 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
             forward: true,
             ends_on_gone: true,
             cap: GIT_OUTPUT_CAP,
+            shared: false,
         };
         let ran = self.ran_as(step, args, mode, class, env)?;
+        self.passed(step, ran)
+    }
+
+    /// [`RunGit::step_as`] for a step that writes the tree's files (the checkout, the clean), git run with the umask 022
+    /// ([`shared_umask`]) in place of the box's 077, so a tracked file is 0644 as the routed command and the PC expect.
+    ///
+    /// # Errors
+    ///
+    /// The failure of a git that did not run to an exit or exited non-zero, or a client gone.
+    pub fn tree_step(&self, step: &str, args: &[&str], class: GitClass) -> Result<Vec<u8>, Failed> {
+        let mode = Mode {
+            forward: true,
+            ends_on_gone: true,
+            cap: GIT_OUTPUT_CAP,
+            shared: true,
+        };
+        let ran = self.ran_as(step, args, mode, class, &[])?;
         self.passed(step, ran)
     }
 
@@ -496,6 +546,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
             forward: true,
             ends_on_gone: true,
             cap: usize::MAX,
+            shared: false,
         };
         let ran = self.ran_as(step, args, mode, class, &[])?;
         self.passed(step, ran)
@@ -512,6 +563,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
             forward: false,
             ends_on_gone: true,
             cap: GIT_OUTPUT_CAP,
+            shared: false,
         };
         self.ran_as(step, args, mode, class, &[])
     }
@@ -528,6 +580,7 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
             forward: true,
             ends_on_gone: false,
             cap: GIT_OUTPUT_CAP,
+            shared: false,
         };
         let ran = self.ran_as(step, args, mode, class, &[])?;
         self.passed(step, ran).map(drop)
@@ -542,6 +595,16 @@ impl<'a, S: LineSink + 'static> RunGit<'a, S> {
         }
         let mut command = self.git.command(&self.args(args));
         command.env(NO_SYSTEM_ATTRIBUTES, "1").envs(env.iter().copied());
+        if mode.shared {
+            // SAFETY: the closure runs in the child between fork and exec and only calls `umask`, which is
+            // async-signal-safe; it allocates nothing and takes no lock.
+            unsafe {
+                command.pre_exec(|| {
+                    shared_umask();
+                    Ok(())
+                });
+            }
+        }
         let limit = step_limit(step, class);
         let output: Arc<dyn Forwarding> = Arc::clone(self.output) as Arc<dyn Forwarding>;
         let watch = Watch {
@@ -1129,9 +1192,36 @@ mod tests {
                 )
             })
             .collect();
-        for wanted in [("GIT_CONFIG_NOSYSTEM", "1"), ("PATH", "/opt/homebrew/bin:/usr/bin")] {
+        for wanted in [
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_ALLOW_PROTOCOL", "file"),
+            ("PATH", "/opt/homebrew/bin:/usr/bin"),
+        ] {
             assert!(envs.contains(&(wanted.0.to_owned(), Some(wanted.1.to_owned()))), "{wanted:?}: {envs:?}");
         }
+    }
+
+    #[test]
+    fn every_git_step_pins_its_protocols_and_submodules_before_its_own_words() {
+        let case = Case::new("pinned");
+        let parent = case.parent();
+        let command = Git::of(case.root(), &parent).command(&["status", "-s"]);
+        let words: Vec<String> = command.get_args().map(|word| word.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            words,
+            [
+                "-c",
+                "protocol.allow=never",
+                "-c",
+                "protocol.file.allow=always",
+                "-c",
+                "submodule.recurse=false",
+                "-c",
+                "core.sharedRepository=umask",
+                "status",
+                "-s"
+            ]
+        );
     }
 
     #[test]

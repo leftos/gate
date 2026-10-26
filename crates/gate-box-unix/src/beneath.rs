@@ -11,7 +11,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 use crate::files;
-use crate::lines::{RootFacts, root_flaw};
+use crate::lines::{OPEN_TO_OTHERS, RootFacts, WRITABLE_BY_OTHERS, owner_flaw, root_flaw};
 
 /// The flags every folder is opened with: a folder only, a link at the name never followed, a FIFO never waited on,
 /// and the descriptor closed in every program the box starts.
@@ -26,8 +26,6 @@ const NEW_FILE_FLAGS: libc::c_int = libc::O_WRONLY | libc::O_CREAT | libc::O_EXC
 const FOLDER_MODE: libc::mode_t = 0o700;
 /// The mode of every file the box makes beneath a folder: its user's alone, to read and write.
 const FILE_MODE: libc::mode_t = 0o600;
-/// The group and other bits of a mode, none of which a private folder of the box's holds.
-const OTHERS_BITS: libc::mode_t = 0o077;
 
 /// Why a folder the box made or adopts beneath a folder is refused: another user owns it, or a group or other bit is
 /// set in its mode.
@@ -98,12 +96,12 @@ impl Folder {
 
     /// Opens the work root at the absolute path `root` as [`Folder::open`] opens a folder, a link at it never
     /// followed, and judges it on that descriptor as the preflight judges a work root ([`root_flaw`]): the box user's
-    /// own folder, writable by no group or other.
+    /// own folder, open to no group or other.
     ///
     /// # Errors
     ///
     /// The open, a link at `root` failing it with `ELOOP` and a file with `ENOTDIR`, or the look; a root another user
-    /// owns or a group or other may write is `PermissionDenied`, saying the flaw as [`root_flaw`] says it.
+    /// owns or a group or other may reach into is `PermissionDenied`, saying the flaw as [`root_flaw`] says it.
     pub fn open_root(root: &Path) -> io::Result<Folder> {
         let folder = Folder::open(root)?;
         if let Some(why) = root_judged(&folder.stat()?, files::effective_uid(), &root.display().to_string()) {
@@ -305,11 +303,15 @@ fn stat_of(fd: &impl AsRawFd) -> io::Result<libc::stat> {
 ///
 /// # Errors
 ///
-/// `work` not of three names below its root (`InvalidInput`), the root's open or judging, or the open of `<root>/work`.
+/// `work` not of three names below its root (`InvalidInput`), the root's open or judging, or the open of `<root>/work`;
+/// a `<root>/work` another user owns or a group or other may reach into is `PermissionDenied` ([`owner_judged`]).
 pub fn work_parent(work: &Path) -> io::Result<(Folder, &OsStr)> {
     let parent = work.parent();
-    match (parent.and_then(Path::parent), parent.and_then(Path::file_name), work.file_name()) {
-        (Some(root), Some(folders), Some(key)) => Ok((Folder::open_root(root)?.open_child(folders)?, key)),
+    match (parent, parent.and_then(Path::parent), parent.and_then(Path::file_name), work.file_name()) {
+        (Some(parent), Some(root), Some(folders), Some(key)) => {
+            let folders = Folder::open_root(root)?.open_child(folders)?;
+            Ok((owner_judged(folders, parent, OPEN_TO_OTHERS, "open to others")?, key))
+        }
         _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "the work folder is not <root>/work/<key>")),
     }
 }
@@ -319,10 +321,34 @@ pub fn work_parent(work: &Path) -> io::Result<(Folder, &OsStr)> {
 ///
 /// # Errors
 ///
-/// As [`work_parent`], or the work folder's own open.
+/// As [`work_parent`], or the work folder's own open; a work folder another user owns or a group or other may write is
+/// `PermissionDenied` ([`owner_judged`]).
 pub fn work_beneath_root(work: &Path) -> io::Result<Folder> {
+    work_and_parent_beneath_root(work).map(|(_, folder)| folder)
+}
+
+/// [`work_beneath_root`], with the folder holding it, `<root>/work`, as [`work_parent`] opened and judged it: the
+/// parent, then the work folder.
+///
+/// # Errors
+///
+/// As [`work_beneath_root`].
+pub fn work_and_parent_beneath_root(work: &Path) -> io::Result<(Folder, Folder)> {
     let (parent, key) = work_parent(work)?;
-    parent.open_child(key)
+    let folder = owner_judged(parent.open_child(key)?, work, WRITABLE_BY_OTHERS, "writable by others")?;
+    Ok((parent, folder))
+}
+
+/// `folder`, open at `path`, judged on its descriptor ([`owner_flaw`]): the box user's own, no bit of `mask` set in
+/// its mode. Else `PermissionDenied`, saying `<path> is not owned by <user> or is <open>`.
+fn owner_judged(folder: Folder, path: &Path, mask: u32, open: &str) -> io::Result<Folder> {
+    let stat = folder.stat()?;
+    let euid = files::effective_uid();
+    if owner_flaw(stat.st_uid, u32::from(stat.st_mode), euid, mask).is_some() {
+        let why = format!("{} is not owned by {} or is {open}", path.display(), files::user_name(euid));
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, why));
+    }
+    Ok(folder)
 }
 
 /// Why the work root `root`, as `stat` of its open descriptor says it is, is not trusted by the box whose effective
@@ -342,7 +368,7 @@ fn root_judged(stat: &libc::stat, euid: u32, root: &str) -> Option<String> {
 /// Whether a folder, as `stat` says it is, is private to the box whose effective user is `euid`: its own, no group or
 /// other bit set; else [`NOT_PRIVATE`] (`PermissionDenied`).
 fn private_judged(stat: &libc::stat, euid: u32) -> io::Result<()> {
-    if stat.st_uid != euid || stat.st_mode & OTHERS_BITS != 0 {
+    if owner_flaw(stat.st_uid, u32::from(stat.st_mode), euid, OPEN_TO_OTHERS).is_some() {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, NOT_PRIVATE));
     }
     Ok(())
@@ -669,13 +695,13 @@ mod tests {
         let flaw = super::root_judged(&stat, euid + 1, "/r").expect("a root another user owns is refused");
         assert!(flaw.starts_with("/r is not owned by "), "{flaw}");
 
-        for mode in [0o770, 0o707, 0o722] {
+        for mode in [0o770, 0o707, 0o722, 0o755, 0o750, 0o711] {
             fs::set_permissions(&case.base, fs::Permissions::from_mode(mode)).expect("the root's mode is set");
             let refused = Folder::open_root(&case.base).map(drop).map_err(|error| error.kind());
             assert_eq!(refused, Err(ErrorKind::PermissionDenied), "{mode:o}");
         }
-        fs::set_permissions(&case.base, fs::Permissions::from_mode(0o755)).expect("the root's mode is set");
-        assert!(Folder::open_root(&case.base).is_ok(), "a root others may only read opens");
+        fs::set_permissions(&case.base, fs::Permissions::from_mode(0o700)).expect("the root's mode is set");
+        assert!(Folder::open_root(&case.base).is_ok(), "a root open to no one else opens");
     }
 
     #[test]
@@ -693,12 +719,43 @@ mod tests {
 
         fs::remove_file(root.join("work")).expect("the link at work is removed");
         fs::create_dir(root.join("work")).expect("work is made");
+        fs::set_permissions(root.join("work"), fs::Permissions::from_mode(0o700)).expect("work is made private");
         symlink(elsewhere.join("key"), &work).expect("a link at the key is made");
         assert!(super::work_beneath_root(&work).is_err(), "a link at the key is not followed");
 
         fs::remove_file(&work).expect("the link at the key is removed");
         fs::create_dir(&work).expect("the work folder is made");
         assert!(super::work_beneath_root(&work).is_ok(), "the folders themselves open");
+    }
+
+    #[test]
+    fn a_work_folder_or_its_parent_another_account_may_reach_into_is_refused() {
+        let case = Case::new("chain-modes");
+        let root = case.base.join("root");
+        let parent = root.join("work");
+        let work = parent.join("key");
+        fs::create_dir_all(&work).expect("the work folder is made");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("the root is made private");
+        let user = crate::files::user_name(crate::files::effective_uid());
+
+        for mode in [0o750, 0o705] {
+            fs::set_permissions(&parent, fs::Permissions::from_mode(mode)).expect("work's mode is set");
+            let refused = super::work_beneath_root(&work).map(drop).expect_err("an open <root>/work is refused");
+            assert_eq!(refused.kind(), ErrorKind::PermissionDenied, "{mode:o}");
+            let why = format!("{} is not owned by {user} or is open to others", parent.display());
+            assert_eq!(refused.to_string(), why, "{mode:o}");
+        }
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("work is made private");
+
+        for mode in [0o775, 0o757] {
+            fs::set_permissions(&work, fs::Permissions::from_mode(mode)).expect("the work folder's mode is set");
+            let refused = super::work_beneath_root(&work).map(drop).expect_err("a writable work folder is refused");
+            assert_eq!(refused.kind(), ErrorKind::PermissionDenied, "{mode:o}");
+            let why = format!("{} is not owned by {user} or is writable by others", work.display());
+            assert_eq!(refused.to_string(), why, "{mode:o}");
+        }
+        fs::set_permissions(&work, fs::Permissions::from_mode(0o755)).expect("the work folder's mode is set");
+        assert!(super::work_beneath_root(&work).is_ok(), "a work folder others may only read opens");
     }
 
     #[test]

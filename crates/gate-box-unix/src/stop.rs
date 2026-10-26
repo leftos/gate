@@ -15,8 +15,8 @@ use gate_wire::{Payload, ROOT_STATUS, root_unsafe_line};
 use crate::console::Console;
 use crate::files;
 use crate::lines::{
-    FAILED_STATUS, JobRecord, Recorded, USAGE_STATUS, WORK_ROOT_STEP, job_record, record_unread, record_without_group, root_flaw, signal_guard,
-    work_layout,
+    FAILED_STATUS, FolderFlaw, JobRecord, Recorded, USAGE_STATUS, WORK_ROOT_STEP, folder_unsafe_line, job_record, record_unread,
+    record_without_group, root_flaw, signal_guard, work_layout,
 };
 use crate::pid_info::{self, Process, Start};
 
@@ -58,8 +58,9 @@ pub fn stop(payload: &Payload, console: &mut Console) -> u8 {
 
 /// Whether the job records may be read from `parent`, the work root `root`'s `<root>/work`, judged as the preflight
 /// judges them and making nothing: `true` when the root is trusted ([`root_flaw`]) and `parent` is the box user's own
-/// plain folder, `false` when either is missing, so no run of this builder recorded a job there. Else the line refusing
-/// it and the status: the work-root line, [`ROOT_STATUS`], or the folder's line, [`FAILED_STATUS`].
+/// plain folder open to no group or other, `false` when either is missing, so no run of this builder recorded a job
+/// there. Else the line refusing it and the status ([`unusable_refusal`]): the work-root line, [`ROOT_STATUS`], or the
+/// folder's line, [`FAILED_STATUS`].
 pub(crate) fn records_folder(root: &str, parent: &Path) -> Result<bool, (String, u8)> {
     let facts = match files::facts(Path::new(root)) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -72,7 +73,28 @@ pub(crate) fn records_folder(root: &str, parent: &Path) -> Result<bool, (String,
     if !files::exists(parent) {
         return Ok(false);
     }
-    files::unusable_folder(parent).map_or(Ok(true), |line| Err((line, FAILED_STATUS)))
+    files::unusable_folder(parent, true).map_or(Ok(true), |flaw| Err(unusable_refusal(flaw, true)))
+}
+
+/// The line refusing a folder of the work root the box does not use, and the status: a folder another account may
+/// reach into said as a refused work root is ([`root_unsafe_line`], [`ROOT_STATUS`]), which the PC falls back on;
+/// else the folder's own line, [`FAILED_STATUS`].
+pub(crate) fn unusable_refusal(flaw: FolderFlaw, private: bool) -> (String, u8) {
+    match flaw {
+        FolderFlaw::Open { path, why } => (open_folder_line(&path, &why, private), ROOT_STATUS),
+        FolderFlaw::Failed(line) => (line, FAILED_STATUS),
+    }
+}
+
+/// The line refusing the folder `path` of the work root, which another account may reach into for `why`, as a work root
+/// not locked down is refused: `<root>/work` (`private`) naming the installer's step ([`root_unsafe_line`]), a work
+/// folder or a bare repository naming itself to remove ([`folder_unsafe_line`]).
+pub(crate) fn open_folder_line(path: &str, why: &str, private: bool) -> String {
+    if private {
+        root_unsafe_line(why, WORK_ROOT_STEP)
+    } else {
+        folder_unsafe_line(why, path)
+    }
 }
 
 /// The most process groups of one job a stop ends: once one has ended, the record may name the group of a later step
@@ -740,7 +762,10 @@ mod tests {
             if base.exists() {
                 fs::remove_dir_all(&base).expect("a stale case folder is removed");
             }
-            fs::create_dir_all(base.join("work")).expect("the case folder is made");
+            // Mode 0700 as the box demands of a root and its `<root>/work`, whatever the umask.
+            std::os::unix::fs::DirBuilderExt::mode(fs::DirBuilder::new().recursive(true), 0o700)
+                .create(base.join("work"))
+                .expect("the case folder is made");
             Case { base }
         }
 
@@ -1601,7 +1626,7 @@ mod tests {
 
         let (status, console, alive) = stopped_beside_a_sleep(&case.work());
         assert_eq!(status, 1, "{:?}", console.out);
-        let why = format!("{root} is not owned by {} or is writable by others", user_name(effective_uid()));
+        let why = format!("{root} is not owned by {} or is open to others", user_name(effective_uid()));
         assert_eq!(console.err, [root_unsafe_line(&why, WORK_ROOT_STEP)]);
         assert!(alive, "no signal is sent");
     }
@@ -1625,7 +1650,9 @@ mod tests {
         let (status, console) = stopped_at(&format!("{base}/absent/work/{KEY}"));
         assert_eq!((status, console.out.len(), console.err.len()), (0, 0, 0), "no root");
 
-        fs::create_dir(format!("{base}/bare-root")).expect("a root without work is made");
+        std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
+            .create(format!("{base}/bare-root"))
+            .expect("a root without work is made");
         let (status, console) = stopped_at(&format!("{base}/bare-root/work/{KEY}"));
         assert_eq!((status, console.out.len(), console.err.len()), (0, 0, 0), "no <root>/work");
     }

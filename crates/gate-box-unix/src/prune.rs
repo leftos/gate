@@ -37,8 +37,8 @@ use gate_wire::{escaped, is_key};
 use crate::console::Console;
 use crate::files::{self, HeldLock, Locked};
 use crate::git::Git;
-use crate::lines::{FAILED_STATUS, LAYOUT_CHANGING, USAGE_STATUS, recorded_group, signal_guard};
-use crate::stop::{Record, own_group, record_current, records_folder};
+use crate::lines::{FAILED_STATUS, LAYOUT_CHANGING, OwnerFlaw, USAGE_STATUS, WRITABLE_BY_OTHERS, owner_flaw, recorded_group, signal_guard};
+use crate::stop::{Record, own_group, record_current, records_folder, unusable_refusal};
 
 /// How long a work folder goes unused before a sweep removes it.
 const IDLE_AGE: Duration = Duration::from_hours(24);
@@ -389,8 +389,8 @@ impl<'a> Sweep<'a> {
         } else if !plain_folder_there(&work)? {
             return Ok(None);
         }
-        if let Some(line) = files::unusable_folder(&work) {
-            return Err(line);
+        if let Some(unusable) = files::unusable_folder(&work, true) {
+            return Err(unusable_refusal(unusable, true).0);
         }
         Ok(Some(Sweep {
             root: root.to_owned(),
@@ -593,6 +593,22 @@ impl<'a> Sweep<'a> {
             match whole_bare(&bare) {
                 Ok(true) => {}
                 Ok(false) => continue,
+                Err(error) => {
+                    first.get_or_insert(error.to_string());
+                    continue;
+                }
+            }
+            // A bare another account may write in is left whole, its refs and all, and named.
+            let flaw = files::facts(&bare).map(|facts| {
+                let shown = bare.display().to_string();
+                bare_flaw(&shown, facts.owner, facts.mode, facts.euid, &files::user_name(facts.euid))
+            });
+            match flaw {
+                Ok(None) => {}
+                Ok(Some(why)) => {
+                    first.get_or_insert(why);
+                    continue;
+                }
                 Err(error) => {
                     first.get_or_insert(error.to_string());
                     continue;
@@ -852,6 +868,16 @@ fn whole_bare(path: &Path) -> io::Result<bool> {
         return Ok(false);
     }
     Ok(["HEAD", "objects", "refs"].iter().all(|part| files::exists(&path.join(part))))
+}
+
+/// Why the keyed prune leaves the whole bare repository `bare`, owned by `owner` with mode `mode`, as it is, the box's
+/// effective user `euid` named `user`: `<bare> is not owned by <user>` or `<bare> is writable by others`
+/// ([`owner_flaw`]); `None` when its refs may be removed.
+fn bare_flaw(bare: &str, owner: u32, mode: u32, euid: u32, user: &str) -> Option<String> {
+    match owner_flaw(owner, mode, euid, WRITABLE_BY_OTHERS)? {
+        OwnerFlaw::Owner => Some(format!("{bare} is not owned by {user}")),
+        OwnerFlaw::Open => Some(format!("{bare} is writable by others")),
+    }
 }
 
 /// Whether `name` names a bare repository of the root: `<name>.git`, the extension in any case.
@@ -1642,6 +1668,40 @@ mod tests {
         assert!(console.err[0].starts_with(&format!("gate: remote could not prune {KEY}: ")));
         assert!(folder.is_dir());
         assert_eq!(refs(&bare), all_refs());
+    }
+
+    #[test]
+    fn a_bare_others_may_write_keeps_its_refs_and_is_named_while_the_others_are_pruned() {
+        let case = Case::new("refs-open-bare");
+        case.folder(Duration::ZERO);
+        let path = case.root.join("a.git");
+        let open = bare_with_refs(&path);
+        let other = bare_with_refs(&case.root.join("b.git"));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o775)).expect("the bare is opened to the group");
+
+        let (status, console) = case.keyed(&[KEY]);
+
+        assert_eq!(status, FAILED_STATUS, "{:?}", console.err);
+        let shown = path.display();
+        let line = format!("gate: remote could not prune {KEY}: its refs could not be removed: {shown} is writable by others");
+        assert_eq!(console.err, [line]);
+        assert_eq!(refs(&open), all_refs(), "the open bare is untouched");
+        assert_eq!(refs(&other), [format!("refs/gate/{OTHER}")]);
+    }
+
+    #[test]
+    fn a_bare_another_user_owns_or_others_may_write_is_named_raw_in_the_key_s_line() {
+        use crate::prune::{bare_flaw, could_not_prune};
+        let why = bare_flaw("/r/a.git", 502, 0o755, 501, "b").expect("another user's bare is left");
+        assert_eq!(
+            could_not_prune(KEY, &format!("its refs could not be removed: {why}")),
+            format!("gate: remote could not prune {KEY}: its refs could not be removed: /r/a.git is not owned by b")
+        );
+        assert_eq!(
+            bare_flaw("/r/a.git", 501, 0o775, 501, "b"),
+            Some("/r/a.git is writable by others".to_owned())
+        );
+        assert_eq!(bare_flaw("/r/a.git", 501, 0o755, 501, "b"), None);
     }
 
     #[test]

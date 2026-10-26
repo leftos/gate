@@ -195,8 +195,8 @@ fn restored<S: LineSink + 'static>(request: &Request<'_>, place: &Path, lock: &H
     if let Some(tmp) = along.tmp {
         command.env("TMPDIR", tmp);
     }
-    // SAFETY: the closure runs in the child between fork and exec and only resets signal dispositions and the mask with
-    // async-signal-safe calls ([`signals_reset`]), as the command's does.
+    // SAFETY: the closure runs in the child between fork and exec and only resets the umask, signal dispositions and the
+    // mask with async-signal-safe calls ([`signals_reset`]), as the command's does.
     unsafe {
         command.pre_exec(signals_reset);
     }

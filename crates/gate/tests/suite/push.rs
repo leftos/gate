@@ -1245,6 +1245,18 @@ fn a_macos_builder_without_perl_is_refused_before_the_git_push() {
 }
 
 #[test]
+fn a_macos_builder_whose_root_another_account_may_enter_is_refused_before_the_git_push() {
+    let mac = mac_case(
+        "a_macos_builder_whose_root_another_account_may_enter_is_refused_before_the_git_push",
+        &mac_routing(&[], &[MAC_HOST]),
+    );
+    // The builder's user is the case's own account, named as the stand-in's `id -un` says it.
+    assert_prepare_refused(&mac, "root-open", |failed| {
+        failed.contains("/root is not owned by ") && failed.ends_with(" or is open to others")
+    });
+}
+
+#[test]
 fn a_macos_builder_without_cargo_is_refused_before_the_git_push() {
     let mac = mac_case(
         "a_macos_builder_without_cargo_is_refused_before_the_git_push",

@@ -52,7 +52,7 @@ use crate::lines::{FAILED_STATUS, USAGE_STATUS};
 use crate::preflight::checked_root;
 use crate::request::{Unread, bounded_line};
 use crate::run::{self, Laying, NotLaidOut, REFUSED_STATUS, Repo, Unbuilt};
-use crate::stop::records_folder;
+use crate::stop::{records_folder, unusable_refusal};
 
 /// The bytes in one gibibyte.
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -229,7 +229,7 @@ fn answered(payload: &Payload, seams: &BoxSeams, input: &mut impl BufRead, conso
 /// repository the box user's own folder when it is there ([`files::unusable_folder`]). Else the line and the status.
 fn root_checked(asked: &Asked<'_>) -> Result<(), (String, u8)> {
     records_folder(&asked.root, asked.parent)?;
-    files::unusable_folder(Path::new(asked.bare)).map_or(Ok(()), |line| Err((line, FAILED_STATUS)))
+    files::unusable_folder(Path::new(asked.bare), false).map_or(Ok(()), |flaw| Err(unusable_refusal(flaw, false)))
 }
 
 /// Says the step failed for `why`; 1.
@@ -256,10 +256,7 @@ fn locked<T>(
     let lock = match files::take_lock(Path::new(asked.lock)) {
         Ok(Locked::Held(lock)) => lock,
         Ok(Locked::Busy) => return Err(busy(asked, console)),
-        Err(error) => {
-            console.err(&format!("gate: remote could not open the work folder lock {}: {error}", asked.lock));
-            return Err(FAILED_STATUS);
-        }
+        Err(error) => return Err(not_laid_out(asked, run::lock_untaken(&error, asked.lock), console)),
     };
     let work = laid_out(asked).map_err(|not| not_laid_out(asked, not, console))?;
     Ok(step(&work, &lock, console))
@@ -323,11 +320,10 @@ struct Work {
 }
 
 impl Work {
-    /// The work folder at `path`, held beneath its judged root ([`beneath::work_parent`]), and its `.git` looked at as
-    /// itself.
+    /// The work folder at `path`, held and judged beneath its judged root and `<root>/work`
+    /// ([`beneath::work_and_parent_beneath_root`]), and its `.git` looked at as itself.
     fn held(path: &str) -> io::Result<Work> {
-        let (parent, key) = beneath::work_parent(Path::new(path))?;
-        let folder = parent.open_child(key)?;
+        let (parent, folder) = beneath::work_and_parent_beneath_root(Path::new(path))?;
         let git = match folder.stat_child(OsStr::new(".git")) {
             Ok(stat) => Some(Facts::of(&stat)).filter(Facts::is_folder).map(|facts| (facts.dev, facts.ino)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -1609,15 +1605,16 @@ mod tests {
                 fs::remove_dir_all(&base).expect("a stale case folder is removed");
             }
             let case = Case { base };
-            fs::create_dir_all(case.root().join("work")).expect("the work folders' parent is made");
-            fs::set_permissions(case.root(), fs::Permissions::from_mode(0o700)).expect("the root is made private");
+            // Mode 0700 as the box demands of a root and its `<root>/work`, whatever the umask.
+            std::os::unix::fs::DirBuilderExt::mode(fs::DirBuilder::new().recursive(true), 0o700)
+                .create(case.root().join("work"))
+                .expect("the work folders' parent is made");
             case
         }
 
         fn root(&self) -> PathBuf {
             self.base.join("gate-remote")
         }
-
         fn work(&self) -> String {
             format!("{}/work/{KEY}", self.root().to_str().expect("the temp folder is UTF-8"))
         }
@@ -2217,7 +2214,7 @@ mod tests {
         assert_eq!(
             console.err,
             [root_unsafe_line(
-                &format!("{root} is not owned by {user} or is writable by others"),
+                &format!("{root} is not owned by {user} or is open to others"),
                 WORK_ROOT_STEP
             )]
         );
@@ -2759,5 +2756,21 @@ mod tests {
             Ok(Some(format!("gate: remote moved aside the folder {exclude} to {exclude}.gate-moved-1")))
         );
         assert_eq!(case.exclude(), "/a.txt\n/d/b.txt\n");
+    }
+
+    #[test]
+    fn a_work_folder_others_may_write_is_not_held() {
+        let case = Case::new("open-work");
+        fs::create_dir(case.work()).expect("the work folder is made");
+        fs::set_permissions(case.work(), fs::Permissions::from_mode(0o775)).expect("the work folder is opened to the group");
+
+        let refused = Work::held(&case.work()).map(drop).expect_err("an open work folder is not held");
+
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied, "{refused}");
+        let user = files::user_name(files::effective_uid());
+        assert_eq!(
+            refused.to_string(),
+            format!("{} is not owned by {user} or is writable by others", case.work())
+        );
     }
 }

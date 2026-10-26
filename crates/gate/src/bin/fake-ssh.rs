@@ -25,7 +25,8 @@
 //! variable `GATE_FAKE_SSH_UNIX_ROOT`'s value as a word of the line, is made `<builder>/root` in the builder's folder, the
 //! folder named as the host in `GATE_FAKE_SSH_BUILDERS`, made when missing, its `root` left for the script to make; a git
 //! service's path under that root is made the same folder's. The stand-ins are written afresh on every call: in
-//! `system`, `lockf`, which locks nothing; `stat`, which answers macOS's `stat -f %l` with the link count; and `mv`,
+//! `system`, `lockf`, which locks nothing; `stat`, which answers macOS's `stat -f %l` with the link count and its
+//! `stat -f %Lp` with `700`, or `750` on a `root-open` call, as Git for Windows shows no folder's own mode; and `mv`,
 //! which takes macOS's `mv -fh` as `mv -fT`; in `tools`, `cc`; `cargo`, which logs `GATE_BUILD_ID=<id>` and its words as
 //! a line of `<builder>/cargo.args` and the `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER` and `RUSTFLAGS` it was given, each
 //! in brackets and `unset` for one it was not, and its working folder, as a line of `<builder>/cargo.env`, writes
@@ -112,6 +113,9 @@ const MAC_BUILD: &str = "mac-build";
 /// The marks the `no-perl` and `no-cargo` steps give a macOS call, among its variables.
 const NO_PERL: &str = "GATE_FAKE_NO_PERL";
 const NO_CARGO: &str = "GATE_FAKE_NO_CARGO";
+/// The variable naming the mode bits the stand-in `stat` answers macOS's `stat -f %Lp` with; `700` when unset, as Git
+/// for Windows lists every folder `drwxr-xr-x` whatever its mode.
+const ROOT_MODE: &str = "GATE_FAKE_ROOT_MODE";
 /// The variable naming the root the routing file gives the macOS builders.
 const UNIX_ROOT_VARIABLE: &str = "GATE_FAKE_SSH_UNIX_ROOT";
 /// The stand-in `lockf`: busy when `GATE_FAKE_LOCKF` is `busy`, else it takes the words the script gives and locks
@@ -139,9 +143,11 @@ printf '#!/bin/sh\necho "gate 0.1.0+%s"\n' "$GATE_BUILD_ID" >"$exe" || exit 2
 printf '{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"gate-box"},"executable":"%s","fresh":false}\n' "$exe"
 printf '{"reason":"build-finished","success":true}\n'
 "#;
-/// The stand-in `stat`: macOS's `stat -f %l <file>`, the link count, as GNU `stat -c %h`.
+/// The stand-in `stat`: macOS's `stat -f %l <file>`, the link count, as GNU `stat -c %h`; and `stat -f %Lp <path>`,
+/// the mode bits, as [`ROOT_MODE`] names them, else `700`.
 const STAT: &str = r#"#!/bin/sh
 if [ "$1" = -f ] && [ "$2" = %l ]; then shift 2; exec /usr/bin/stat -c %h "$@"; fi
+if [ "$1" = -f ] && [ "$2" = %Lp ]; then echo "${GATE_FAKE_ROOT_MODE:-700}"; exit 0; fi
 exec /usr/bin/stat "$@"
 "#;
 /// The stand-in `mv`: macOS's `mv -fh`, which never moves into a folder a link names, as GNU `mv -fT`.
@@ -353,6 +359,7 @@ fn bare_step(step: &str, call: &BoxCall<'_>) -> Result<i32, String> {
         "broken-src-git" => call.broken_src_git().and_then(|()| call.mac_call(&[])),
         "no-perl" => call.mac_call(&[(NO_PERL, "1")]),
         "no-cargo" => call.mac_call(&[(NO_CARGO, "1")]),
+        "root-open" => call.mac_call(&[(ROOT_MODE, "750")]),
         "drop" => Ok(SSH_FAILED),
         "fail-banner" => said(&mut io::stderr().lock(), PRE_BANNER),
         "fail-other" => said(&mut io::stderr().lock(), "ssh: connect to host builder port 22: Connection refused"),

@@ -58,6 +58,14 @@ pub fn main(args: Vec<OsString>) -> std::process::ExitCode {
     unsafe {
         libc::signal(libc::SIGCHLD, libc::SIG_DFL);
     }
+    // Everything the box and its git steps make is its user's alone; the routed command, the cross build and the tool
+    // restore get the usual 022 back in their child ([`crate::command::signals_reset`]).
+    #[expect(clippy::cast_possible_truncation, reason = "0o077 fits the 16 bits of macOS's mode_t")]
+    let private = crate::lines::OPEN_TO_OTHERS as libc::mode_t;
+    // SAFETY: `umask` only sets the process's mask and returns the old one; no thread of the box runs yet.
+    unsafe {
+        libc::umask(private);
+    }
     let mut console = crate::console::Console::stdio();
     std::process::ExitCode::from(answer(action(args), &mut console))
 }

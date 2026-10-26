@@ -56,7 +56,18 @@ pub fn back_commit<S: LineSink + 'static>(
         let step = repo.step("push");
         // A lock lost before the push deletes nothing: another run may hold the work folder and its back refs now.
         held(request, lock, &step).map_err(|failed| back_failed(output, failed))?;
-        if let Err(failed) = git.bare_step(&step, &repo.git_tree().args(&["push", "-q", &repo.bare, &target]), GitClass::Long) {
+        if let Err(failed) = git.bare_step(
+            &step,
+            &repo.git_tree().args(&[
+                "push",
+                "-q",
+                "--no-recurse-submodules",
+                "--receive-pack=git-receive-pack",
+                &repo.bare,
+                &target,
+            ]),
+            GitClass::Long,
+        ) {
             // On a pair run, the failing repo's own ref too: a push that failed after its ref was updated leaves it
             // behind. A run of one repo takes no step it did not take before. Nothing is undone once the lock is lost.
             if !request.siblings.is_empty() {

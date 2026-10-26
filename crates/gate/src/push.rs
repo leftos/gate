@@ -465,9 +465,9 @@ tool cargo 'run install-macos.sh --only "Rust"'
 if [ -L "$root" ]; then fail "$root is a symbolic link"; fi
 if [ ! -e "$root" ]; then /bin/mkdir -p -m 700 "$root" || fail "could not create the folder $root"; fi
 [ -d "$root" ] || fail "$root is not a folder"
-m=$(ls -ld "$root") || fail "could not read $root"
-case $m in ?????w*|????????w*) fail "$root is not owned by $user or is writable by others";; esac
-owned "$root" || fail "$root is not owned by $user or is writable by others"
+m=$(/usr/bin/stat -f %Lp "$root") || fail "could not read $root"
+case $m in *00) ;; *) fail "$root is not owned by $user or is open to others";; esac
+owned "$root" || fail "$root is not owned by $user or is open to others"
 folder "$root/bin"
 gp=$root/gate-push
 folder "$gp"

@@ -485,6 +485,32 @@ mod unix {
     }
 
     #[test]
+    fn the_command_makes_files_under_a_022_umask_while_the_box_s_git_makes_its_own_private() {
+        let case = Case::new("umask");
+        let commit = case.snapshot();
+        let request = case.request(&commit, &json!({"Command": ["/bin/sh", "-c", "echo x > made.txt"]}));
+        let ended = ran(&[], &request, Reading::All, &case.base.join("beaten"));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        let mode = |path: String| std::os::unix::fs::MetadataExt::mode(&fs::symlink_metadata(&path).expect("it is looked at")) & 0o777;
+        assert_eq!(mode(format!("{}/made.txt", case.work())), 0o644, "the command's file");
+        assert_eq!(
+            mode(format!("{}/.git/config", case.work())),
+            0o600,
+            "the fresh tree's config, made by the box's git"
+        );
+    }
+
+    #[test]
+    fn a_tracked_file_the_checkout_writes_is_readable_as_on_the_pc() {
+        let case = Case::new("checkout-umask");
+        let commit = case.snapshot();
+        let ended = ran(&[], &case.request(&commit, &json!({})), Reading::All, &case.base.join("beaten"));
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        let looked = fs::symlink_metadata(format!("{}/a.txt", case.work())).expect("the tracked file is looked at");
+        assert_eq!(std::os::unix::fs::MetadataExt::mode(&looked) & 0o777, 0o644, "the checkout's file");
+    }
+
+    #[test]
     fn a_run_that_changes_nothing_pushes_no_back_ref() {
         let case = Case::new("unchanged");
         let commit = case.snapshot();

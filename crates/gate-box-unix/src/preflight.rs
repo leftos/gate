@@ -13,11 +13,12 @@ use gate_wire::{Pair, PairSibling, PathForm, Payload, ROOT_STATUS, bare_stem, es
 use crate::console::Console;
 use crate::git::{self, AlternatesFailure, Failed, Git, Steps, Tree, failed_for, for_repo, line_ends_set, origin_set};
 use crate::lines::{
-    FAILED_STATUS, NEEDS_REFUSED, NEW_WORK_TREE, USAGE_STATUS, WORK_ROOT_STEP, created_line, folder_failure, layout_text, login_path_line,
-    names_another_layout, readies_single, root_flaw, sdks_failure, sdks_line, unsynced_failure, version_line, warm_line, warm_text, work_layout,
-    write_failure,
+    FAILED_STATUS, FolderFlaw, NEEDS_REFUSED, NEW_WORK_TREE, USAGE_STATUS, WORK_ROOT_STEP, created_line, folder_failure, layout_text,
+    login_path_line, names_another_layout, readies_single, root_flaw, sdks_failure, sdks_line, unsynced_failure, version_line, warm_line, warm_text,
+    work_layout, write_failure,
 };
-use crate::{boot, files, probe, process};
+use crate::stop::open_folder_line;
+use crate::{boot, files, probe, process, run};
 
 /// The most bytes of the warm record read: one past a hash, so a longer record is seen as not one.
 const WARM_READ_LIMIT: u64 = 65;
@@ -26,8 +27,19 @@ const WARM_READ_LIMIT: u64 = 65;
 enum Refusal {
     /// A folder could not be made or is not the box user's own: this line, [`FAILED_STATUS`].
     Folder(String),
-    /// The root is not trusted, for this reason: the version line, then the work-root line, [`ROOT_STATUS`].
+    /// The root, or a folder of it another account may reach into, is not trusted: the version line, then this
+    /// work-root line, [`ROOT_STATUS`].
     Untrusted(String),
+}
+
+/// The refusal of a folder of the work root `flaw` says the box does not use, `private` when it is `<root>/work`: the
+/// folder's line, or for a folder another account may reach into the work-root line naming its remedy
+/// ([`open_folder_line`]).
+fn folder_refusal(flaw: FolderFlaw, private: bool) -> Refusal {
+    match flaw {
+        FolderFlaw::Failed(line) => Refusal::Folder(line),
+        FolderFlaw::Open { path, why } => Refusal::Untrusted(open_folder_line(&path, &why, private)),
+    }
 }
 
 /// Answers the preflight of `payload` through `console`; the status. Usage errors (a key the payload lacks or that does
@@ -42,26 +54,25 @@ pub fn preflight(payload: &Payload, console: &mut Console) -> u8 {
             return USAGE_STATUS;
         }
     };
-    match trusted_root(&root, parent) {
+    // Every repo's bare repository: `Bare`, the main repo's, then on a pair each sibling's beside it.
+    let bares = bares(bare, pair.as_ref());
+    let trusted = trusted_root(&root, parent).and_then(|()| {
+        std::iter::once(work)
+            .chain(bares.iter().map(|(bare, _)| *bare))
+            .find_map(|folder| files::unusable_folder(Path::new(folder), false))
+            .map_or(Ok(()), |flaw| Err(folder_refusal(flaw, false)))
+    });
+    match trusted {
         Ok(()) => {}
         Err(Refusal::Folder(line)) => {
             console.err(&line);
             return FAILED_STATUS;
         }
-        Err(Refusal::Untrusted(why)) => {
+        Err(Refusal::Untrusted(line)) => {
             console.out(&version_line());
-            console.err(&root_unsafe_line(&why, WORK_ROOT_STEP));
+            console.err(&line);
             return ROOT_STATUS;
         }
-    }
-    // Every repo's bare repository: `Bare`, the main repo's, then on a pair each sibling's beside it.
-    let bares = bares(bare, pair.as_ref());
-    let unusable = std::iter::once(work)
-        .chain(bares.iter().map(|(bare, _)| *bare))
-        .find_map(|folder| files::unusable_folder(Path::new(folder)));
-    if let Some(line) = unusable {
-        console.err(&line);
-        return FAILED_STATUS;
     }
     // Read before the tree is readied, which would make a missing `.git`, and so a stale record, look current. A
     // record naming another layout than the run's, a pair's first run having none, has the run clear the whole folder
@@ -122,20 +133,22 @@ pub(crate) fn checked_root<'w>(work: &'w str, bare: &str, paired: bool) -> Resul
 }
 
 /// Makes the work root `root` with mode 0700 when it is missing, judges it ([`root_flaw`]), then makes `parent`, its
-/// `<root>/work`, with mode 0700 when it is missing, and refuses it unless it is the box user's own plain folder.
+/// `<root>/work`, with mode 0700 when it is missing, and refuses it unless it is the box user's own plain folder open
+/// to no group or other.
 fn trusted_root(root: &str, parent: &Path) -> Result<(), Refusal> {
     let path = Path::new(root);
     if !files::exists(path) {
         made_folder(path, true)?;
     }
-    let facts = files::facts(path).map_err(|error| Refusal::Untrusted(format!("cannot read {root}: {error}")))?;
+    let untrusted = |why: &str| Refusal::Untrusted(root_unsafe_line(why, WORK_ROOT_STEP));
+    let facts = files::facts(path).map_err(|error| untrusted(&format!("cannot read {root}: {error}")))?;
     if let Some(why) = root_flaw(facts, root, &files::user_name(facts.euid)) {
-        return Err(Refusal::Untrusted(why));
+        return Err(untrusted(&why));
     }
     if !files::exists(parent) {
         made_folder(parent, false)?;
     }
-    files::unusable_folder(parent).map_or(Ok(()), |line| Err(Refusal::Folder(line)))
+    files::unusable_folder(parent, true).map_or(Ok(()), |flaw| Err(folder_refusal(flaw, true)))
 }
 
 /// Makes the folder `path` with mode 0700, and the folders above it when `recursive`.
@@ -194,10 +207,17 @@ fn warm_state(work: &str, pair: Option<&Pair>, relaid: bool) -> Option<String> {
 /// Readies the bare repository `bare`, made when missing, and, when the layout record lets it ([`readies_single`]),
 /// the tree at `work`: made, its stale warm record removed first, when nothing is at its `.git`; then, a folder at
 /// `.git`, its `origin` set to `bare`, its line-ending config written and its alternates file naming `bare`'s objects.
-/// A link or a file at `.git`, `.git/objects` or `.git/objects/info` is never followed. Whether the tree was made now.
+/// A link or a file at `.git`, `.git/objects` or `.git/objects/info` is never followed, and a tree the run's layout
+/// check refuses ([`run::tree_checked`]: another account may write in it, or its `.git/commondir` names another
+/// repository's folders) is left as it is, no git step run on it. Whether the tree was made now.
 fn ready(git: &Git<'_>, bare: &str, work: &str, layout: &io::Result<Option<String>>, console: &mut Console) -> Result<bool, Failed> {
     bare_made(git, bare, None, console)?;
     if !readies_single(layout) {
+        return Ok(false);
+    }
+    // A tree another account may write in, or whose `.git` names another repository's folders: the run refuses it
+    // under its lock.
+    if run::tree_checked(Path::new(work), false).is_err() {
         return Ok(false);
     }
     let made = match fs::symlink_metadata(Path::new(work).join(".git")) {
@@ -325,6 +345,14 @@ mod tests {
     const KEY: &str = "repo-0123abcd";
     const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+    /// Makes the folder `path` and each missing one above it with mode 0700, as the box makes a root and its
+    /// `<root>/work`, whatever the umask.
+    fn private_folders(path: &str) {
+        std::os::unix::fs::DirBuilderExt::mode(fs::DirBuilder::new().recursive(true), 0o700)
+            .create(path)
+            .expect("the private folders are made");
+    }
+
     /// A temp folder of the case `name`, private to this process, removed when the case ends.
     struct Case {
         base: PathBuf,
@@ -430,6 +458,23 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_whose_git_names_another_repository_s_folders_is_left_alone_for_the_run() {
+        let case = Case::new("commondir");
+        let payload = case.payload(&json!({}));
+        assert_eq!(preflighted(&payload).0, 0);
+        let commondir = format!("{}/.git/commondir", case.work());
+        fs::write(&commondir, "../elsewhere\n").expect("the commondir file is written");
+        let alternates = format!("{}/.git/objects/info/alternates", case.work());
+        fs::remove_file(&alternates).expect("the alternates file is removed");
+
+        let (status, console) = preflighted(&payload);
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert!(!Path::new(&alternates).exists(), "the tree is not readied");
+        assert_eq!(fs::read(&commondir).expect("the file is read"), b"../elsewhere\n");
+    }
+
+    #[test]
     fn a_second_preflight_is_idempotent_and_reads_the_warm_record() {
         let case = Case::new("again");
         let payload = case.payload(&json!({}));
@@ -472,7 +517,7 @@ mod tests {
         git_in_case(&["init", "-q", case.base.to_str().expect("the temp folder is UTF-8")]);
         let config = case.base.join(".git").join("config");
         let before = fs::read(&config).expect("the parent's config is read");
-        fs::create_dir_all(format!("{}/.git", case.work())).expect("an empty .git is made");
+        private_folders(&format!("{}/.git", case.work()));
 
         let (status, console) = preflighted(&case.payload(&json!({})));
         assert_ne!(status, 0, "{:?}", console.out);
@@ -490,7 +535,7 @@ mod tests {
         let case = Case::new("ceiling");
         git_in_case(&["init", "-q", case.base.to_str().expect("the temp folder is UTF-8")]);
         let (root, parent) = (case.root(), format!("{}/work", case.root()));
-        fs::create_dir_all(&parent).expect("the work folders' parent is made");
+        private_folders(&parent);
 
         let git = Git::of(&root, Path::new(&parent));
         let ran = git.run("git rev-parse", &["rev-parse", "--git-dir"]).expect("git runs");
@@ -518,7 +563,7 @@ mod tests {
         let case = Case::new("linked-parent");
         let target = case.base.join("elsewhere");
         fs::create_dir_all(&target).expect("the link's target is made");
-        fs::create_dir_all(case.root()).expect("the root is made");
+        private_folders(&case.root());
         let parent = format!("{}/work", case.root());
         symlink(&target, &parent).expect("the link is made");
 
@@ -535,7 +580,7 @@ mod tests {
         let case = Case::new("linked-bare");
         let target = case.base.join("elsewhere.git");
         fs::create_dir_all(&target).expect("the link's target is made");
-        fs::create_dir_all(format!("{}/work", case.root())).expect("the work folders' parent is made");
+        private_folders(&format!("{}/work", case.root()));
         symlink(&target, case.bare()).expect("the link is made");
 
         assert_folder_refused(&case, &case.bare(), "it is a symbolic link");
@@ -549,7 +594,7 @@ mod tests {
     #[test]
     fn a_file_where_the_work_folder_belongs_is_refused_and_kept() {
         let case = Case::new("file-work");
-        fs::create_dir_all(format!("{}/work", case.root())).expect("the work folders' parent is made");
+        private_folders(&format!("{}/work", case.root()));
         fs::write(case.work(), "kept\n").expect("the file is written");
 
         assert_folder_refused(&case, &case.work(), "it is not a folder");
@@ -559,7 +604,7 @@ mod tests {
     #[test]
     fn a_new_tree_drops_a_stale_warm_record() {
         let case = Case::new("stale-warm");
-        fs::create_dir_all(format!("{}/work", case.root())).expect("the work folders' parent is made");
+        private_folders(&format!("{}/work", case.root()));
         let warm = format!("{}.warm", case.work());
         fs::write(&warm, HASH).expect("the warm record is written");
 
@@ -577,7 +622,7 @@ mod tests {
     #[test]
     fn a_tree_without_the_line_end_config_gets_it_on_its_next_preflight() {
         let case = Case::new("config");
-        fs::create_dir_all(case.work()).expect("the work folder is made");
+        private_folders(&case.work());
         git_in_case(&["init", "-q", &case.work()]);
 
         let (status, console) = preflighted(&case.payload(&json!({})));
@@ -591,7 +636,7 @@ mod tests {
         let case = Case::new("linked-work");
         let target = case.base.join("elsewhere");
         fs::create_dir_all(&target).expect("the link's target is made");
-        fs::create_dir_all(format!("{}/work", case.root())).expect("the work folders' parent is made");
+        private_folders(&format!("{}/work", case.root()));
         symlink(&target, case.work()).expect("the link is made");
 
         let (status, console) = preflighted(&case.payload(&json!({})));
@@ -628,9 +673,53 @@ mod tests {
         let (status, console) = preflighted(&case.payload(&json!({})));
         assert_eq!(status, 1);
         assert_eq!(console.out, [version_line()]);
-        let why = format!("{root} is not owned by {} or is writable by others", user_name(effective_uid()));
+        let why = format!("{root} is not owned by {} or is open to others", user_name(effective_uid()));
         assert_eq!(console.err, [root_unsafe_line(&why, WORK_ROOT_STEP)]);
         assert!(!PathBuf::from(&root).join("work").exists(), "nothing is made in a refused root");
+    }
+
+    /// Checks the preflight of the case `name` with the folder `folder` of it made at 0775 is refused as not locked
+    /// down, naming the folder to remove.
+    fn assert_open_folder_refused(name: &str, folder: fn(&Case) -> String) {
+        let case = Case::new(name);
+        let path = folder(&case);
+        private_folders(&path);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o775)).expect("the folder is opened to the group");
+
+        let (status, console) = preflighted(&case.payload(&json!({})));
+        assert_eq!(status, 1);
+        assert_eq!(console.out, [version_line()]);
+        let line =
+            format!("gate: the builder's work root is not locked down: {path} is writable by others; remove {path} and the box makes it again");
+        assert_eq!(console.err, [line]);
+    }
+
+    #[test]
+    fn a_bare_repository_others_may_write_is_refused_naming_it_to_remove() {
+        assert_open_folder_refused("open-bare", Case::bare);
+    }
+
+    #[test]
+    fn a_work_folder_others_may_write_is_refused_naming_it_to_remove() {
+        assert_open_folder_refused("open-work", Case::work);
+    }
+
+    #[test]
+    fn a_tree_whose_git_others_may_write_is_left_alone_for_the_run() {
+        let case = Case::new("open-git");
+        let payload = case.payload(&json!({}));
+        assert_eq!(preflighted(&payload).0, 0);
+        let dot_git = format!("{}/.git", case.work());
+        fs::set_permissions(&dot_git, fs::Permissions::from_mode(0o775)).expect("the .git is opened to the group");
+        let alternates = format!("{dot_git}/objects/info/alternates");
+        fs::remove_file(&alternates).expect("the alternates file is removed");
+
+        let (status, console) = preflighted(&payload);
+
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert!(!Path::new(&alternates).exists(), "the tree is not readied");
+        let mode = fs::symlink_metadata(&dot_git).expect("the .git is looked at").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o775, "the .git is left as it is");
     }
 
     #[test]
@@ -686,7 +775,7 @@ mod tests {
 
         /// Writes the work folder's layout record as `text`.
         fn layout_written(&self, text: &str) {
-            fs::create_dir_all(format!("{}/work", self.root())).expect("the work folders' parent is made");
+            private_folders(&format!("{}/work", self.root()));
             fs::write(format!("{}.layout", self.work()), text).expect("the layout record is written");
         }
     }
@@ -718,7 +807,7 @@ mod tests {
     #[test]
     fn a_pair_s_bare_that_cannot_be_made_names_its_repo() {
         let case = Case::new("pair-bare");
-        fs::create_dir_all(case.root()).expect("the root is made");
+        private_folders(&case.root());
         fs::write(case.lib_bare(), "kept\n").expect("a file takes the sibling's bare repository's name");
 
         assert_folder_refused_with(&case.payload(&pair()), &case.lib_bare(), "it is not a folder");

@@ -30,14 +30,15 @@ use crate::git::{
 use crate::heartbeat::{self, Periods};
 use crate::inputs::{self, Unmatched};
 use crate::lines::{
-    Along, BACK_COMMITS_FAILED, CommandEnd, FAILED_STATUS, Godot, LAYOUT_CHANGING, Login, Translation, USAGE_STATUS, back_commits_line,
-    command_status, layout_text, login_path_line, names_another_layout, recorded_group, rosetta_lines, signal_guard, translation, work_layout,
+    Along, BACK_COMMITS_FAILED, CommandEnd, FAILED_STATUS, FolderFlaw, Godot, LAYOUT_CHANGING, Login, OwnerFlaw, Translation, USAGE_STATUS,
+    WRITABLE_BY_OTHERS, back_commits_line, command_status, layout_text, login_path_line, names_another_layout, owner_flaw, recorded_group,
+    rosetta_lines, signal_guard, translation, work_layout,
 };
 use crate::outputs::{self, Asked};
 use crate::preflight::{checked_root, layout_record};
 use crate::probe;
 use crate::process::{self, GroupRecord};
-use crate::stop::{Record, own_group, record_current, records_folder};
+use crate::stop::{Record, own_group, record_current, records_folder, unusable_refusal};
 use crate::tools;
 
 /// The status of a run refused: another run holds the work folder, it could not be laid out, or it asks for what this
@@ -586,8 +587,10 @@ fn prepared<'p, S: LineSink + 'static>(
         Ok(Locked::Held(lock)) => lock,
         Ok(Locked::Busy) => return Err(refused(output, &request, Refusal::Busy, &busy_line(request.key))),
         Err(error) => {
-            let line = format!("gate: remote could not open the work folder lock {}: {error}", request.lock);
-            return Err(back_commits_failed(output, &request, said(output, &[&line], FAILED_STATUS)));
+            return Err(match not_laid_out(output, &request, lock_untaken(&error, request.lock)) {
+                Unready::Refused => REFUSED_STATUS,
+                Unready::Ended(status) => back_commits_failed(output, &request, status),
+            });
         }
     };
     match locked(&request, &lock, output, periods.heartbeat, sources) {
@@ -1140,6 +1143,17 @@ fn not_laid_out<S: LineSink>(output: &Output<S>, request: &Request<'_>, not: Not
     }
 }
 
+/// Why the work lock `lock` could not be taken, for `error`: a lock file another user owns ([`files::lock_not_owned`])
+/// refused `layout`, so the PC runs the command itself; any other failure the line saying it, [`FAILED_STATUS`].
+pub(crate) fn lock_untaken(error: &io::Error, lock: &str) -> NotLaidOut {
+    let not_owned = files::lock_not_owned(Path::new(lock));
+    if error.kind() == io::ErrorKind::PermissionDenied && error.to_string() == not_owned {
+        NotLaidOut::Refused(not_owned)
+    } else {
+        NotLaidOut::Failed(Failed::line(format!("gate: remote could not open the work folder lock {lock}: {error}")))
+    }
+}
+
 /// `gate: remote subfolder <sub> is not a folder inside the work folder`, as the Windows box says it.
 fn not_inside(sub: &str) -> String {
     format!("gate: remote subfolder {} is not a folder inside the work folder", escaped(sub))
@@ -1155,8 +1169,8 @@ fn root_checked(request: &Request<'_>) -> Result<(), (String, u8)> {
     records_folder(&request.root, request.parent)?;
     request
         .repos()
-        .find_map(|repo| files::unusable_folder(Path::new(&repo.bare)))
-        .map_or(Ok(()), |line| Err((line, FAILED_STATUS)))
+        .find_map(|repo| files::unusable_folder(Path::new(&repo.bare), false))
+        .map_or(Ok(()), |flaw| Err(unusable_refusal(flaw, false)))
 }
 
 /// The name routing gives the repo of the bare repository `bare`: the stem of `<name>.git` ([`bare_stem`]), or the
@@ -1317,14 +1331,17 @@ pub(crate) struct Checked {
 /// record `<work>.tools` removed, so neither trusts a tree a command was cut short in, the checkout remaking the tree;
 /// then for each repo's tree, a pair's tree itself refused unless it is missing or a folder itself, `.git`,
 /// `.git/objects` and `.git/objects/info` refused unless each is missing or a folder itself, and `.git/config` and
-/// `.git/HEAD` unless each is missing or a file itself, none followed; and, when a tree has no `.git/HEAD` or no
+/// `.git/HEAD` unless each is missing or a file itself, none followed, and each there the box user's own and writable by
+/// no group or other ([`plain_or_missing`]); a tree with anything at `.git/commondir` refused; and, when a tree has no `.git/HEAD` or no
 /// `.git/objects`, which [`laid_out`] makes anew, the warm record removed. No git step runs.
 pub(crate) fn layout_checked(laying: &Laying<'_>) -> Result<Checked, NotLaidOut> {
     let work = laying.work;
     let command = command_record(work);
     plain_or_missing(Path::new(&command), false)?;
-    if let Some(line) = files::unusable_folder(Path::new(work)) {
-        return Err(NotLaidOut::Failed(Failed::line(line)));
+    match files::unusable_folder(Path::new(work), false) {
+        None => {}
+        Some(FolderFlaw::Failed(line)) => return Err(NotLaidOut::Failed(Failed::line(line))),
+        Some(FolderFlaw::Open { why, .. }) => return Err(NotLaidOut::Refused(why)),
     }
     let relaid = work_relaid(laying)?;
     if files::exists(Path::new(&command)) {
@@ -1332,18 +1349,21 @@ pub(crate) fn layout_checked(laying: &Laying<'_>) -> Result<Checked, NotLaidOut>
             removed(&format!("{work}{suffix}"))?;
         }
     }
-    let fresh = laying.repos().map(tree_checked).collect::<Result<Vec<bool>, NotLaidOut>>()?;
+    let fresh = laying
+        .repos()
+        .map(|repo| tree_checked(Path::new(&repo.tree), repo.name.is_some()))
+        .collect::<Result<Vec<bool>, NotLaidOut>>()?;
     if fresh.contains(&true) {
         removed(&format!("{work}.warm"))?;
     }
     Ok(Checked { fresh, relaid })
 }
 
-/// [`layout_checked`] for the tree of `repo`: whether it is made anew.
-fn tree_checked(repo: &Repo<'_>) -> Result<bool, NotLaidOut> {
-    let tree = Path::new(&repo.tree);
+/// [`layout_checked`] for the tree `tree`, a pair's when `paired`: whether it is made anew. No git step runs, so the
+/// preflight judges a tree by it before readying it.
+pub(crate) fn tree_checked(tree: &Path, paired: bool) -> Result<bool, NotLaidOut> {
     // A pair's tree sits in the work folder; a run of one repo's is the work folder, checked before.
-    if repo.name.is_some() {
+    if paired {
         plain_or_missing(tree, true)?;
     }
     let dot_git = tree.join(".git");
@@ -1354,6 +1374,10 @@ fn tree_checked(repo: &Repo<'_>) -> Result<bool, NotLaidOut> {
     }
     for file in [dot_git.join("config"), dot_git.join("HEAD")] {
         plain_or_missing(&file, false)?;
+    }
+    let commondir = dot_git.join("commondir");
+    if files::exists(&commondir) {
+        return Err(NotLaidOut::Refused(format!("{} names another repository's folders", commondir.display())));
     }
     Ok(!files::exists(&dot_git.join("HEAD")) || !files::exists(&objects))
 }
@@ -1452,16 +1476,26 @@ fn removed(path: &str) -> Result<(), NotLaidOut> {
     files::remove_if_there(Path::new(path)).map_err(|error| NotLaidOut::Refused(format!("cannot remove {path}: {error}")))
 }
 
-/// Whether `path` is missing or, looked at without following a link, a folder itself (`folder`) or a file itself.
+/// Whether `path` is missing or, looked at without following a link, a folder itself (`folder`) or a file itself, the
+/// box user's own and writable by no group or other.
 fn plain_or_missing(path: &Path, folder: bool) -> Result<(), NotLaidOut> {
     let shown = path.display();
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(NotLaidOut::Refused(format!("cannot read {shown}: {error}"))),
-        Ok(metadata) if folder && metadata.is_dir() => Ok(()),
-        Ok(metadata) if !folder && metadata.is_file() => Ok(()),
-        Ok(_) if folder => Err(NotLaidOut::Refused(format!("{shown} is a link or not a folder"))),
-        Ok(_) => Err(NotLaidOut::Refused(format!("{shown} is a link or not a file"))),
+    let metadata = match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(NotLaidOut::Refused(format!("cannot read {shown}: {error}"))),
+        Ok(metadata) => metadata,
+    };
+    let euid = files::effective_uid();
+    if folder && !metadata.is_dir() {
+        Err(NotLaidOut::Refused(format!("{shown} is a link or not a folder")))
+    } else if !folder && !metadata.is_file() {
+        Err(NotLaidOut::Refused(format!("{shown} is a link or not a file")))
+    } else {
+        match owner_flaw(metadata.uid(), metadata.mode(), euid, WRITABLE_BY_OTHERS) {
+            Some(OwnerFlaw::Owner) => Err(NotLaidOut::Refused(format!("{shown} is not owned by {}", files::user_name(euid)))),
+            Some(OwnerFlaw::Open) => Err(NotLaidOut::Refused(format!("{shown} is writable by others"))),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1485,7 +1519,18 @@ fn checked_out<S: LineSink>(request: &Request<'_>, git: &RunGit<'_, S>) -> Resul
 fn repo_checked_out<S: LineSink>(git: &RunGit<'_, S>, key: &str, repo: &Repo<'_>) -> Result<(), Failed> {
     let tree = repo.git_tree();
     let refname = format!("refs/gate/{key}");
-    git.step_as(&repo.step("fetch"), &tree.args(&["fetch", "-q", &repo.bare, &refname]), GitClass::Long)?;
+    git.step_as(
+        &repo.step("fetch"),
+        &tree.args(&[
+            "fetch",
+            "-q",
+            "--no-recurse-submodules",
+            "--upload-pack=git-upload-pack",
+            &repo.bare,
+            &refname,
+        ]),
+        GitClass::Long,
+    )?;
     let commit = format!("{}^{{commit}}", repo.snapshot);
     if !git
         .quiet(&repo.step("cat-file"), &tree.args(&["cat-file", "-e", &commit]), GitClass::Short)?
@@ -1494,12 +1539,13 @@ fn repo_checked_out<S: LineSink>(git: &RunGit<'_, S>, key: &str, repo: &Repo<'_>
     {
         return Err(Failed::line(missing_snapshot(repo)));
     }
-    git.step_as(
+    git.tree_step(
         &repo.step("checkout"),
         &tree.args(&["checkout", "-q", "--force", "--detach", repo.snapshot]),
         GitClass::Long,
     )?;
-    git.step_as(&repo.step("clean"), &tree.args(&["clean", "-fdq"]), GitClass::Long).map(drop)
+    git.tree_step(&repo.step("clean"), &tree.args(&["clean", "-fdq"]), GitClass::Long)
+        .map(drop)
 }
 
 /// The line of a snapshot of `repo` its repository lacks after the fetch, as the Windows box says it.
@@ -1614,7 +1660,10 @@ mod tests {
                 fs::remove_dir_all(&base).expect("a stale case folder is removed");
             }
             let case = Case { base: base.join(leaf) };
-            fs::create_dir_all(format!("{}/work", case.root())).expect("the work folders' parent is made");
+            // Mode 0700 as the box demands of a root and its `<root>/work`, whatever the umask.
+            std::os::unix::fs::DirBuilderExt::mode(fs::DirBuilder::new().recursive(true), 0o700)
+                .create(format!("{}/work", case.root()))
+                .expect("the work folders' parent is made");
             git(&["init", "--bare", "-q", &case.bare()]);
             case
         }
@@ -1960,6 +2009,34 @@ mod tests {
         assert_eq!(git(&[&bare, "show", &format!("{back}:a.txt")]), "b");
         assert!(!Path::new(&format!("{}.index", case.work())).exists(), "the copied index is removed");
         assert!(matches!(take_lock(Path::new(&case.lock())), Ok(Locked::Held(_))), "the lock is let go");
+    }
+
+    #[test]
+    fn the_fetch_and_the_back_push_recurse_into_no_submodule() {
+        let case = Case::new("no-submodules");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let words = case.base.with_file_name("git-words");
+        let shim = case.base.with_file_name("git-shim-words");
+        let script = format!(
+            "#!/bin/sh\nprintf ' %s \\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            words.display(),
+            real_git().display()
+        );
+        fs::write(&shim, script).expect("the shim is written");
+        fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("the shim is made runnable");
+        test_program::set(&shim);
+
+        let (status, said) = whole_run(&case.commanded(&commit, &["/bin/sh", "-c", "echo new > new.txt"]));
+
+        assert_eq!(status, 0, "{said:?}");
+        assert!(case.back_commit().is_some(), "the back ref is pushed");
+        let words = fs::read_to_string(&words).expect("the shim's words are read");
+        for step in [
+            " fetch -q --no-recurse-submodules --upload-pack=git-upload-pack ",
+            " push -q --no-recurse-submodules --receive-pack=git-receive-pack ",
+        ] {
+            assert!(words.lines().any(|line| line.contains(step)), "{step}: {words}");
+        }
     }
 
     #[test]
@@ -3364,7 +3441,11 @@ mod tests {
         // The main repo's push, the first, takes the lock's name from the run once it is done, as another run would
         // take it: the push step's own lock check fails it with its back ref pushed, and the sibling is never pushed.
         let script = format!(
-            "#!/bin/sh\n'{git}' \"$@\"\nstatus=$?\ncase \" $* \" in\n*\" push -q {bare} \"*) rm -f '{lock}';;\nesac\nexit $status\n",
+            concat!(
+                "#!/bin/sh\n'{git}' \"$@\"\nstatus=$?\ncase \" $* \" in\n",
+                "*\" push -q --no-recurse-submodules --receive-pack=git-receive-pack {bare} \"*) rm -f '{lock}';;\n",
+                "esac\nexit $status\n"
+            ),
             git = real_git().display(),
             bare = case.bare(),
             lock = case.lock()
@@ -4064,9 +4145,12 @@ mod tests {
             // The case runs as root, whose own folder `/usr` is; no other user's folder is at hand.
             return;
         }
-        let line = files::unusable_folder(Path::new("/usr")).expect("a root-owned folder is not the box user's");
+        let line = files::unusable_folder(Path::new("/usr"), false).expect("a root-owned folder is not the box user's");
         let user = files::user_name(effective_uid());
-        assert_eq!(line, format!("gate: remote could not create the folder /usr: it is not owned by {user}"));
+        assert_eq!(
+            line,
+            crate::lines::FolderFlaw::Failed(format!("gate: remote could not create the folder /usr: it is not owned by {user}"))
+        );
     }
 
     #[test]
@@ -4105,6 +4189,90 @@ mod tests {
             assert_eq!(said, layout_refusal(&format!("{linked} is a link or not a {kind}")), "{at}");
             assert!(fs::symlink_metadata(&linked).expect("the link stands").file_type().is_symlink(), "{at}");
         }
+    }
+
+    #[test]
+    fn a_tree_s_git_folder_or_file_others_may_write_is_refused_layout_and_left_alone() {
+        for (at, mode) in [
+            (".git", 0o775),
+            (".git/objects", 0o757),
+            (".git/objects/info", 0o770),
+            (".git/config", 0o666),
+            (".git/HEAD", 0o620),
+        ] {
+            let case = Case::new("git-open");
+            let commit = case.snapshot(&[("a.txt", "a\n")]);
+            case.laid_out(&commit);
+            let path = format!("{}/{at}", case.work());
+            fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(mode)).expect("the mode is set");
+
+            let (status, said) = ran(&case.json(&commit, &json!({})));
+
+            assert_eq!(status, REFUSED_STATUS, "{at}: {said:?}");
+            assert_eq!(said, layout_refusal(&format!("{path} is writable by others")), "{at}");
+            let left = fs::symlink_metadata(&path).expect("it is looked at").mode() & 0o777;
+            assert_eq!(left, mode, "{at} is not changed");
+        }
+    }
+
+    #[test]
+    fn a_lock_file_another_user_owns_is_refused_layout_and_any_other_lock_failure_fails() {
+        let lock = "/g/work/k.lock";
+        let not_owned = files::lock_not_owned(Path::new(lock));
+        let owned = std::io::Error::new(std::io::ErrorKind::PermissionDenied, not_owned.clone());
+        assert!(
+            matches!(super::lock_untaken(&owned, lock), NotLaidOut::Refused(why) if why == not_owned),
+            "another user's lock is a layout refusal"
+        );
+
+        for other in [
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+            std::io::Error::other(not_owned.clone()),
+        ] {
+            let line = format!("gate: remote could not open the work folder lock {lock}: {other}");
+            assert!(
+                matches!(super::lock_untaken(&other, lock), NotLaidOut::Failed(failed) if failed.lines == [line.clone()] && failed.status == 1),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tree_whose_git_names_another_repository_s_folders_is_refused_layout_and_left_alone() {
+        let case = Case::new("commondir");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.laid_out(&commit);
+        let commondir = format!("{}/.git/commondir", case.work());
+        fs::write(&commondir, "../elsewhere\n").expect("the commondir file is written");
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        assert_eq!(said, layout_refusal(&format!("{commondir} names another repository's folders")));
+        assert_eq!(fs::read(&commondir).expect("the file is read"), b"../elsewhere\n");
+    }
+
+    #[test]
+    fn a_tree_others_may_only_read_is_laid_out_and_run() {
+        let case = Case::new("git-readable");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.laid_out(&commit);
+        for (at, mode) in [
+            ("", 0o755),
+            (".git", 0o755),
+            (".git/objects", 0o755),
+            (".git/objects/info", 0o755),
+            (".git/config", 0o644),
+            (".git/HEAD", 0o644),
+        ] {
+            let path = format!("{}/{at}", case.work());
+            fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(mode)).expect("the mode is set");
+        }
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(case.head(), commit);
     }
 
     #[test]

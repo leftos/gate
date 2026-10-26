@@ -1070,8 +1070,10 @@ pub(crate) mod tests {
                 fs::remove_dir_all(&base).expect("a stale case folder is removed");
             }
             let root = base.join("gate-remote");
-            fs::create_dir_all(root.join("work").join(KEY)).expect("the work folder is made");
-            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("the root is made private");
+            // Mode 0700 as the box demands of a root and its `<root>/work`, whatever the umask.
+            std::os::unix::fs::DirBuilderExt::mode(fs::DirBuilder::new().recursive(true), 0o700)
+                .create(root.join("work").join(KEY))
+                .expect("the work folder is made");
             let folder = format!("{}/outputs", root.to_str().expect("the temp folder is UTF-8"));
             Case { base, folder }
         }

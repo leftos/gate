@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
-use crate::lines::{RootFacts, folder_failure, folder_flaw};
+use crate::lines::{FolderFlaw, OPEN_TO_OTHERS, OwnerFlaw, RootFacts, folder_failure, folder_flaw, owner_flaw};
 
 /// The most bytes of a record beside the work folder, or of a tree's alternates file, read.
 pub const RECORD_LIMIT: u64 = 64 * 1024;
@@ -342,8 +342,9 @@ const LOCK_RETRIES: u32 = 3;
 /// # Errors
 ///
 /// The open, `path` being anything but a plain file of one link (a link at it is `ELOOP`; a hard-linked one names the
-/// file to remove), a failed `flock` other than a busy lock, a look at the name failing, or the locked file no longer
-/// at the name on every try.
+/// file to remove), a file another user owns, a failed `flock` other than a busy lock, a look at the name failing, or
+/// the locked file no longer at the name on every try. The box user's own file a group or other may open is set to
+/// 0600 on its descriptor before its lock.
 pub fn take_lock(path: &Path) -> io::Result<Locked> {
     take_lock_between(path, &mut || {})
 }
@@ -412,9 +413,9 @@ fn lock_file_seen(path: &Path, before_open: &dyn Fn(&Path, bool)) -> io::Result<
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => match options(false).open(path) {
                 Ok(file) => opened = Some((file, false)),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
+                Err(error) => return Err(lock_open_failed(path, error)),
             },
-            Err(error) => return Err(error),
+            Err(error) => return Err(lock_open_failed(path, error)),
         }
         break;
     }
@@ -429,6 +430,11 @@ fn lock_file_seen(path: &Path, before_open: &dyn Fn(&Path, bool)) -> io::Result<
     if !metadata.is_file() {
         return Err(io::Error::other(format!("{} is not a plain file", path.display())));
     }
+    let flaw = lock_flaw(metadata.uid(), metadata.mode(), effective_uid());
+    // Another user's lock is refused as such, hard-linked or not.
+    if flaw == Some(LockFlaw::Owner) {
+        return Err(not_owned_error(path));
+    }
     if metadata.nlink() != 1 {
         let shown = path.display();
         return Err(io::Error::other(format!(
@@ -436,7 +442,61 @@ fn lock_file_seen(path: &Path, before_open: &dyn Fn(&Path, bool)) -> io::Result<
             metadata.nlink()
         )));
     }
+    // SAFETY: the descriptor is `file`'s, open for the whole call; `fchmod` reads nothing else.
+    if flaw == Some(LockFlaw::Loose) && unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok((file, made))
+}
+
+/// The error of an open of the lock file `path` that failed with `error`: a plain file at the name another user owns,
+/// which the box may not open to write, is refused as another user's lock ([`not_owned_error`]); else `error`.
+fn lock_open_failed(path: &Path, error: io::Error) -> io::Error {
+    let owner = fs::symlink_metadata(path)
+        .ok()
+        .filter(fs::Metadata::is_file)
+        .map(|metadata| metadata.uid());
+    if open_refused_as_not_owned(error.kind(), owner, effective_uid()) {
+        not_owned_error(path)
+    } else {
+        error
+    }
+}
+
+/// Whether an open of a lock file that failed as `kind`, the file at its name owned by `owner` (`None` when no plain
+/// file is there), is another user's lock to the box whose effective user is `euid`: denied, and not the box's own.
+fn open_refused_as_not_owned(kind: io::ErrorKind, owner: Option<u32>, euid: u32) -> bool {
+    kind == io::ErrorKind::PermissionDenied && owner.is_some_and(|owner| owner != euid)
+}
+
+/// The `PermissionDenied` error refusing the lock file `path` another user owns, saying [`lock_not_owned`].
+fn not_owned_error(path: &Path) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, lock_not_owned(path))
+}
+
+/// Why a work lock's file is not used as it is ([`lock_flaw`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LockFlaw {
+    /// Another user owns it: the lock is refused.
+    Owner,
+    /// The box user's own, a group or other bit set in its mode: it is set to 0600 before its lock.
+    Loose,
+}
+
+/// Why the lock file owned by `uid`, of mode `mode`, is not one the box whose effective user is `euid` locks as it is
+/// ([`owner_flaw`] with [`OPEN_TO_OTHERS`]); `None` when it is.
+fn lock_flaw(uid: u32, mode: u32, euid: u32) -> Option<LockFlaw> {
+    match owner_flaw(uid, mode, euid, OPEN_TO_OTHERS)? {
+        OwnerFlaw::Owner => Some(LockFlaw::Owner),
+        OwnerFlaw::Open => Some(LockFlaw::Loose),
+    }
+}
+
+/// `<path> is not owned by <user>`: why [`take_lock`] refused the lock file `path` another user owns, as the message
+/// of its `PermissionDenied` error, by which its callers tell that refusal apart.
+#[must_use]
+pub fn lock_not_owned(path: &Path) -> String {
+    format!("{} is not owned by {}", path.display(), user_name(effective_uid()))
 }
 
 /// What `path` is, looked at as itself and never through a link, and the box's effective user id.
@@ -455,16 +515,16 @@ pub fn facts(path: &Path) -> io::Result<RootFacts> {
     })
 }
 
-/// Why the folder `path` is not one the box uses ([`folder_flaw`]), as the line saying it: a link, no folder, another
-/// user's, or one that cannot be looked at. `None` when it is the box user's own folder or is missing.
+/// Why the folder `path` is not one the box uses ([`folder_flaw`], `private` as it takes it), a look that fails said as
+/// [`FolderFlaw::Failed`]. `None` when it is the box user's own folder or is missing.
 #[must_use]
-pub fn unusable_folder(path: &Path) -> Option<String> {
-    let why = match facts(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
-        Err(error) => error.to_string(),
-        Ok(facts) => folder_flaw(facts, &user_name(facts.euid))?,
-    };
-    Some(folder_failure(&path.display().to_string(), &why))
+pub fn unusable_folder(path: &Path, private: bool) -> Option<FolderFlaw> {
+    let shown = path.display().to_string();
+    match facts(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => Some(FolderFlaw::Failed(folder_failure(&shown, &error.to_string()))),
+        Ok(facts) => folder_flaw(facts, &shown, &user_name(facts.euid), private),
+    }
 }
 
 /// The box's effective user id.
@@ -749,6 +809,38 @@ mod tests {
         assert!(matches!(take_lock(&path).expect("the lock opens"), Locked::Busy));
         drop(held);
         assert!(matches!(take_lock(&path).expect("the lock opens"), Locked::Held(_)), "free once dropped");
+    }
+
+    #[test]
+    fn a_lock_file_another_user_owns_is_refused_and_an_own_open_one_is_tightened() {
+        use super::{LockFlaw, lock_flaw};
+        assert_eq!(lock_flaw(502, 0o600, 501), Some(LockFlaw::Owner));
+        assert_eq!(lock_flaw(502, 0o644, 501), Some(LockFlaw::Owner));
+        assert_eq!(lock_flaw(501, 0o644, 501), Some(LockFlaw::Loose));
+        assert_eq!(lock_flaw(501, 0o600, 501), None);
+    }
+
+    #[test]
+    fn a_lock_another_user_owns_that_cannot_be_opened_is_refused_as_theirs() {
+        use super::open_refused_as_not_owned;
+        use std::io::ErrorKind;
+        assert!(open_refused_as_not_owned(ErrorKind::PermissionDenied, Some(502), 501));
+        assert!(!open_refused_as_not_owned(ErrorKind::PermissionDenied, Some(501), 501), "the box's own");
+        assert!(!open_refused_as_not_owned(ErrorKind::PermissionDenied, None, 501), "no plain file there");
+        assert!(!open_refused_as_not_owned(ErrorKind::NotFound, Some(502), 501), "another failure");
+    }
+
+    #[test]
+    fn an_own_lock_others_may_read_is_made_private_by_its_take() {
+        let case = Case::new("lock-open");
+        let path = case.base.join("k.lock");
+        fs::write(&path, "").expect("the lock file is written");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("the mode is set");
+
+        let held = take_lock(&path).expect("the lock opens");
+        assert!(matches!(held, Locked::Held(_)), "{held:?}");
+        let mode = fs::metadata(&path).expect("the lock file is looked at").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
     }
 
     #[test]

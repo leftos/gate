@@ -688,7 +688,7 @@ fn command_of(launch: &Launch<'_>, program: &str, rest: &[String]) -> Command {
     let environment = command_environment(std::env::vars_os().collect(), along, launch.env, &run, launch.job);
     let mut command = Command::new(program);
     command.args(rest).current_dir(launch.place).env_clear().envs(environment);
-    // SAFETY: the closure runs in the child between fork and exec, and calls only `sigaction`, `sigemptyset` and
+    // SAFETY: the closure runs in the child between fork and exec, and calls only `umask`, `sigaction`, `sigemptyset` and
     // `sigprocmask`, which are async-signal-safe, on values on its own stack; it allocates nothing and takes no lock.
     unsafe {
         command.pre_exec(signals_reset);
@@ -698,8 +698,13 @@ fn command_of(launch: &Launch<'_>, program: &str, rest: &[String]) -> Command {
 
 /// Puts `SIGTERM`, `SIGINT`, `SIGHUP` and `SIGQUIT` back to their default action and clears the signal mask, in the
 /// child before its exec: an ignored signal stays ignored across `exec`, so a command whose ssh session ignored
-/// `SIGTERM` would wait out every ending's grace; std resets only `SIGPIPE` and keeps the parent's mask.
+/// `SIGTERM` would wait out every ending's grace; std resets only `SIGPIPE` and keeps the parent's mask. Then sets the
+/// umask to 022 in place of the box's private 077, so a build or test makes the files it would on the PC.
 pub(crate) fn signals_reset() -> io::Result<()> {
+    // SAFETY: `umask` only sets the process's mask and returns the old one; it is async-signal-safe.
+    unsafe {
+        libc::umask(0o022);
+    }
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
         // SAFETY: an all-zero `sigaction` is a valid value: no flags and an empty mask; its handler is set below.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };

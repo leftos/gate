@@ -224,36 +224,98 @@ pub fn work_layout(work: &str) -> Result<(String, &Path), String> {
 }
 
 /// The group and other write bits of a mode.
-const WRITABLE_BY_OTHERS: u32 = 0o022;
+pub const WRITABLE_BY_OTHERS: u32 = 0o022;
+/// Every group and other bit of a mode.
+pub const OPEN_TO_OTHERS: u32 = 0o077;
+
+/// Why a file or folder is not the box user's own with none of a mask's bits set ([`owner_flaw`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerFlaw {
+    /// Another user owns it.
+    Owner,
+    /// The box user's own, with a bit of the mask set in its mode.
+    Open,
+}
+
+/// Why a file or folder owned by `owner`, of mode `mode`, is not the own of the box whose effective user is `euid` with
+/// no bit of `mask` set in its mode; `None` when it is. The one owner and mode check every site of the box makes.
+#[must_use]
+pub fn owner_flaw(owner: u32, mode: u32, euid: u32, mask: u32) -> Option<OwnerFlaw> {
+    if owner != euid {
+        Some(OwnerFlaw::Owner)
+    } else if mode & mask != 0 {
+        Some(OwnerFlaw::Open)
+    } else {
+        None
+    }
+}
 
 /// Why the work root `root`, as `facts` say it is, is not trusted, the box's user named `user`; `None` when it is: a
-/// folder, no link, owned by the box's effective user and writable by no group or other.
+/// folder, no link, owned by the box's effective user and open to no group or other.
 #[must_use]
 pub fn root_flaw(facts: RootFacts, root: &str, user: &str) -> Option<String> {
     if facts.is_symlink {
         Some(format!("{root} is a symbolic link"))
     } else if !facts.is_dir {
         Some(format!("{root} is not a folder"))
-    } else if facts.owner != facts.euid || facts.mode & WRITABLE_BY_OTHERS != 0 {
-        Some(format!("{root} is not owned by {user} or is writable by others"))
+    } else if owner_flaw(facts.owner, facts.mode, facts.euid, OPEN_TO_OTHERS).is_some() {
+        Some(format!("{root} is not owned by {user} or is open to others"))
     } else {
         None
     }
 }
 
-/// Why a folder of the work root (`<root>/work`, a work folder, a bare repository), as `facts` say it is, is not one
-/// the box uses, its user named `user`; `None` when it is a folder, no link, owned by the box's effective user.
+/// Why the folder `path` of the work root (`<root>/work`, a work folder, a bare repository), as `facts` say it is, is
+/// not one the box uses, its user named `user`; `None` when it is a folder, no link, owned by the box's effective user,
+/// and open to no group or other when `private` (`<root>/work`), else writable by none.
 #[must_use]
-pub fn folder_flaw(facts: RootFacts, user: &str) -> Option<String> {
-    if facts.is_symlink {
-        Some("it is a symbolic link".to_owned())
-    } else if !facts.is_dir {
-        Some("it is not a folder".to_owned())
-    } else if facts.owner != facts.euid {
-        Some(format!("it is not owned by {user}"))
+pub fn folder_flaw(facts: RootFacts, path: &str, user: &str, private: bool) -> Option<FolderFlaw> {
+    let (mask, open) = if private {
+        (OPEN_TO_OTHERS, "open to others")
     } else {
-        None
+        (WRITABLE_BY_OTHERS, "writable by others")
+    };
+    let failed = |why: &str| Some(FolderFlaw::Failed(folder_failure(path, why)));
+    if facts.is_symlink {
+        failed("it is a symbolic link")
+    } else if !facts.is_dir {
+        failed("it is not a folder")
+    } else {
+        match owner_flaw(facts.owner, facts.mode, facts.euid, mask)? {
+            OwnerFlaw::Owner => failed(&format!("it is not owned by {user}")),
+            OwnerFlaw::Open => Some(FolderFlaw::Open {
+                path: path.to_owned(),
+                why: format!("{path} is {open}"),
+            }),
+        }
     }
+}
+
+/// Why a folder of the work root is not one the box uses ([`folder_flaw`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FolderFlaw {
+    /// A link, no folder, another user's, or one that cannot be looked at: the line saying so ([`folder_failure`]).
+    Failed(String),
+    /// The box user's own folder whose mode lets another account in.
+    Open {
+        /// The folder.
+        path: String,
+        /// Why, `<path> is open to others` or `<path> is writable by others`.
+        why: String,
+    },
+}
+
+/// `gate: the builder's work root is not locked down: <why>; remove <path> and the box makes it again`, both escaped:
+/// a work folder or a bare repository another account may write in, refused as a work root not locked down is
+/// ([`gate_wire::ROOT_UNSAFE`]), so the PC falls back; the box makes the folder again once it is removed.
+#[must_use]
+pub fn folder_unsafe_line(why: &str, path: &str) -> String {
+    format!(
+        "{}{}; remove {} and the box makes it again",
+        gate_wire::ROOT_UNSAFE,
+        escaped(why),
+        escaped(path)
+    )
 }
 
 /// `gate: remote could not create the folder <path>: <why>`, both escaped.
@@ -653,9 +715,10 @@ mod tests {
         command_environment, command_status, rosetta_lines, round_trip, translation,
     };
     use super::{
-        JobRecord, Login, Recorded, RootFacts, WORK_ROOT_STEP, boot_line, created_line, folder_failure, folder_flaw, is_git_variable, is_lower_hex,
-        job_record, job_record_text, layout_text, login_marker, marked_login, names_another_layout, no_answer, readies_single, record_unread,
-        record_without_group, recorded_group, root_flaw, sdks_line, signal_guard, step_unran, version_line, warm_text, work_layout, write_failure,
+        FolderFlaw, JobRecord, Login, Recorded, RootFacts, WORK_ROOT_STEP, boot_line, created_line, folder_failure, folder_flaw, is_git_variable,
+        is_lower_hex, job_record, job_record_text, layout_text, login_marker, marked_login, names_another_layout, no_answer, readies_single,
+        record_unread, record_without_group, recorded_group, root_flaw, sdks_line, signal_guard, step_unran, version_line, warm_text, work_layout,
+        write_failure,
     };
     use gate_wire::BoxKill;
 
@@ -954,16 +1017,16 @@ mod tests {
     }
 
     #[test]
-    fn a_root_owned_by_the_box_user_and_writable_by_no_one_else_is_trusted() {
-        for mode in [0o700, 0o755, 0o40_755, 0o711] {
+    fn a_root_owned_by_the_box_user_and_open_to_no_one_else_is_trusted() {
+        for mode in [0o700, 0o40_700, 0o500] {
             assert_eq!(root_flaw(facts(501, mode, false, true), "/g", "b"), None, "{mode:o}");
         }
     }
 
     #[test]
-    fn a_root_another_account_may_write_in_is_refused() {
-        let refused = Some("/g is not owned by b or is writable by others".to_owned());
-        for mode in [0o777, 0o775, 0o757, 0o720, 0o702] {
+    fn a_root_another_account_may_enter_is_refused() {
+        let refused = Some("/g is not owned by b or is open to others".to_owned());
+        for mode in [0o777, 0o775, 0o757, 0o755, 0o750, 0o711, 0o720, 0o702, 0o40_755] {
             assert_eq!(root_flaw(facts(501, mode, false, true), "/g", "b"), refused, "{mode:o}");
         }
         assert_eq!(root_flaw(facts(0, 0o700, false, true), "/g", "b"), refused, "owned by root");
@@ -984,10 +1047,47 @@ mod tests {
 
     #[test]
     fn a_folder_in_the_root_must_be_the_box_user_s_own_plain_folder() {
-        assert_eq!(folder_flaw(facts(501, 0o40_755, false, true), "b"), None);
-        assert_eq!(folder_flaw(facts(501, 0o777, true, false), "b"), Some("it is a symbolic link".to_owned()));
-        assert_eq!(folder_flaw(facts(501, 0o644, false, false), "b"), Some("it is not a folder".to_owned()));
-        assert_eq!(folder_flaw(facts(0, 0o700, false, true), "b"), Some("it is not owned by b".to_owned()));
+        for private in [false, true] {
+            assert_eq!(folder_flaw(facts(501, 0o40_700, false, true), "/g", "b", private), None, "{private}");
+            let unusable = |why: &str| Some(FolderFlaw::Failed(folder_failure("/g", why)));
+            assert_eq!(
+                folder_flaw(facts(501, 0o777, true, false), "/g", "b", private),
+                unusable("it is a symbolic link")
+            );
+            assert_eq!(
+                folder_flaw(facts(501, 0o644, false, false), "/g", "b", private),
+                unusable("it is not a folder")
+            );
+            assert_eq!(
+                folder_flaw(facts(0, 0o700, false, true), "/g", "b", private),
+                unusable("it is not owned by b")
+            );
+            assert_eq!(
+                folder_flaw(facts(0, 0o777, false, true), "/g", "b", private),
+                unusable("it is not owned by b")
+            );
+        }
+        assert_eq!(folder_flaw(facts(501, 0o40_755, false, true), "/g", "b", false), None);
+        let open = |why: &str| {
+            Some(FolderFlaw::Open {
+                path: "/g".to_owned(),
+                why: why.to_owned(),
+            })
+        };
+        for mode in [0o750, 0o705, 0o755] {
+            assert_eq!(
+                folder_flaw(facts(501, mode, false, true), "/g", "b", true),
+                open("/g is open to others"),
+                "{mode:o}"
+            );
+        }
+        for mode in [0o775, 0o757, 0o720] {
+            assert_eq!(
+                folder_flaw(facts(501, mode, false, true), "/g", "b", false),
+                open("/g is writable by others"),
+                "{mode:o}"
+            );
+        }
         assert_eq!(
             folder_failure("/g/work/k\n", "it is a symbolic link"),
             r"gate: remote could not create the folder /g/work/k\n: it is a symbolic link"
