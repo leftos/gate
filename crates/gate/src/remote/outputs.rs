@@ -324,11 +324,14 @@ pub(super) fn marked(sent: &Sent<'_>) -> Result<(), End> {
 /// sync-back's reason ([`turned_reason`]). A passing run whose manifest was not built, or whose box said no outputs line the client
 /// accepts, says why and ends 1. A passing run whose box packed an archive fetches it, as [`fetched`] says. A passing
 /// run whose box packed nothing removes the pending marker and the outputs cap record ([`uncapped`]); one that cannot be
-/// removed is said, and the run's status stands. The other ends that do not reach [`fetched`] leave both.
+/// removed is said, and the run's status stands. The other ends that do not reach [`fetched`] leave both. A run whose
+/// command failed brings back its test reports when its box packed them, as [`reports_end`] says, keeping its status,
+/// and otherwise says nothing and leaves both.
 ///
-/// The attempt's outputs are marked brought back only when the install ends complete, as [`install::installed`] says,
-/// or when the box packed nothing for a manifest that held files; never when the box said it skipped outputs for names
-/// this PC cannot take. Every other end marks them not brought back.
+/// The attempt's outputs are marked brought back only when a passing run's install ends complete, as
+/// [`install::installed`] says, or when its box packed nothing for a manifest that held files; never when the box said
+/// it skipped outputs for names this PC cannot take, nor for a failed run, whatever its reports' install did. Every
+/// other end marks them not brought back.
 pub(super) fn ended(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synced: Synced, brought: Option<&Brought>) -> End {
     let (end, complete) = step_end(attempt, sent, ran, synced, brought);
     attempt.brought_back = Some(complete && !ran.names_skipped);
@@ -346,7 +349,7 @@ fn turned_reason(status: i64, synced: &Synced) -> Option<&'static str> {
 const WORKTREE_CHANGED: &str = "the worktree changed during the run";
 
 /// The end of the outputs step [`ended`] says, and whether it left the PC every output the box packed or found the PC
-/// holding them all, the box's names skip aside.
+/// holding them all, the box's names skip aside: never for a failed run, whose end [`reports_end`] gives.
 fn step_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synced: Synced, brought: Option<&Brought>) -> (End, bool) {
     let reason = turned_reason(ran.status, &synced);
     let synced = synced.end;
@@ -354,11 +357,11 @@ fn step_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synce
         return (synced, false);
     };
     if let Some(reason) = reason {
-        attempt.say(not_brought_back(reason));
+        attempt.say(not_brought_back(Bringing::Outputs, reason));
         return (synced, false);
     }
     if *now != 0 {
-        return (synced, false);
+        return reports_end(attempt, sent, ran, (marker, *now), brought);
     }
     let reason = match (&sent.built, brought) {
         (Err(reason), _) => format!("the manifest could not be built: {reason}"),
@@ -370,6 +373,7 @@ fn step_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synce
                 marker,
                 count: *count,
                 size: *size,
+                reports: None,
             };
             return fetched(attempt, &kept, ran, synced);
         }
@@ -381,19 +385,105 @@ fn step_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synce
             return (synced, *files != Manifest::default());
         }
     };
-    attempt.say(not_brought_back(&reason));
+    attempt.say(not_brought_back(Bringing::Outputs, &reason));
     (End::Status(1), false)
 }
 
-/// What the outputs step of a passing run whose box packed an archive keeps for its pull and install: the run's output
-/// globs, the PC's manifest and the pending marker; and the files the box said it packed, and the archive's size in
-/// bytes when it said one.
+/// The end of the outputs step of a run whose command failed with the status `now`, the pending marker `marker`, whose
+/// box said it `brought` its outputs or not: when the box packed an archive, the PC's manifest was built and one of the
+/// run's output globs names a `TestResults` folder, the failed run's test reports are fetched and installed as
+/// [`fetched`] says for [`Bringing::Reports`]. Every end of that but a Ctrl+C or the watchdog's stop keeps `now`: a
+/// failure of the pull or the install is said and never takes the command's status. Any other failed run says nothing
+/// and touches neither the pending marker nor the outputs cap record. A failed run's outputs are never marked brought
+/// back.
+fn reports_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, (marker, now): (&Path, i64), brought: Option<&Brought>) -> (End, bool) {
+    let (Ok(files), Some(Brought::Archive { count, size, .. })) = (&sent.built, brought) else {
+        return (End::Status(now), false);
+    };
+    let Some(reports) = Globs::new(sent.globs).ok().and_then(|globs| globs.test_results_only()) else {
+        return (End::Status(now), false);
+    };
+    let kept = Kept {
+        globs: sent.globs,
+        files,
+        marker,
+        count: *count,
+        size: *size,
+        reports: Some(&reports),
+    };
+    let end = match fetched(attempt, &kept, ran, End::Status(now)).0 {
+        End::Status(_) | End::Failed(_) => End::Status(now),
+        end => end,
+    };
+    (end, false)
+}
+
+/// What an outputs pull brings back, which its lines, its install and the records it keeps follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Bringing {
+    /// A passing run's outputs, under every output glob of the run.
+    Outputs,
+    /// A failed run's test reports: its outputs under the globs that name a `TestResults` folder
+    /// ([`Globs::test_results_only`]). Their pull and install keep the run's status, leave the outputs cap record and
+    /// never clear the pending marker.
+    Reports,
+}
+
+impl Bringing {
+    /// What the pull's lines and the install's success line say they bring: `outputs`, or the failed run's test reports.
+    pub(super) fn pulled(self) -> &'static str {
+        match self {
+            Bringing::Outputs => "outputs",
+            Bringing::Reports => REPORTS,
+        }
+    }
+
+    /// What the lines saying what was not brought back name: `remote outputs`, or the failed run's test reports.
+    pub(super) fn unbrought(self) -> &'static str {
+        match self {
+            Bringing::Outputs => "remote outputs",
+            Bringing::Reports => REPORTS,
+        }
+    }
+
+    /// The words the pull's hang hint names its phase with, before the builder's alias.
+    pub(super) fn pulling_from(self) -> &'static str {
+        match self {
+            Bringing::Outputs => "pulling outputs from",
+            Bringing::Reports => "pulling the failed run's test reports from",
+        }
+    }
+
+    /// What the watchdog's line says a fetch it stopped was doing.
+    fn fetching(self) -> &'static str {
+        match self {
+            Bringing::Outputs => "fetching the outputs",
+            Bringing::Reports => "fetching the failed run's test reports",
+        }
+    }
+}
+
+/// What the lines of a failed run's pull and install call what they bring back.
+const REPORTS: &str = "the failed run's test reports";
+
+/// What the outputs step of a run whose box packed an archive keeps for its pull and install: the run's output globs,
+/// the PC's manifest and the pending marker; the files the box said it packed, and the archive's size in bytes when it
+/// said one; and, for a failed run's test reports, the run's output globs narrowed to those that name a `TestResults`
+/// folder, which the install is held to.
 struct Kept<'k> {
     globs: &'k [String],
     files: &'k Manifest,
     marker: &'k Path,
     count: u64,
     size: Option<u64>,
+    reports: Option<&'k Globs>,
+}
+
+impl Kept<'_> {
+    /// What the pull brings: a failed run's test reports when it carries their narrowed globs, else outputs.
+    fn bringing(&self) -> Bringing {
+        if self.reports.is_some() { Bringing::Reports } else { Bringing::Outputs }
+    }
 }
 
 /// Each tree the box checked the run out in, as [`trees`] places it in the work folder of `location`, with the PC root
@@ -437,7 +527,7 @@ pub(super) fn trees_of<'a>(
     ((main, main_root), trees.into_iter().zip(siblings.iter().map(|(_, root)| *root)).collect())
 }
 
-/// The outputs call of a passing run whose box packed an archive, `synced` its end so far: the archive the run's own
+/// The outputs call of a run whose box packed an archive, `synced` its end so far: the archive the run's own
 /// key and nonce name, never the box's line, is fetched raw into the worktree's `.tmp` folder, which is held until this
 /// run's end. One fetched whole is installed, as [`install::installed`] says, through a stage folder beside it named
 /// for the same key and nonce. A fetch the watchdog stops says the watchdog's line and ends the run killed; a Ctrl+C
@@ -451,14 +541,24 @@ pub(super) fn trees_of<'a>(
 /// The pull says its start ([`pull_start_line`]) before the outputs call, and its progress while it runs, as the call's
 /// watch does; one that did not end whole says how long it ran and what it received ([`pull_ended_line`]) before any
 /// other line of its end.
+///
+/// A failed run's test reports (a `kept` carrying their narrowed globs, [`Bringing::Reports`]) are pulled and installed
+/// the same way, each line naming them, but the outputs cap record is neither removed nor counted on any end, a fetch
+/// past the cap only says so, and the install is held to the narrowed globs; the ends that fail a passing run are
+/// handed back as they are, and [`reports_end`] turns them to the command's status.
 fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced: End) -> (End, bool) {
     let started = Instant::now();
-    attempt.say(pull_start_line(attempt.call.host(), kept.count, kept.size));
+    let bringing = kept.bringing();
+    attempt.say(pull_start_line(bringing, attempt.call.host(), kept.count, kept.size));
     let name = archive_file_name(attempt.call.key, ran.nonce);
     let tmp = Path::new(attempt.call.root).join(TMP);
     let mut archive = Archive::new(Path::new(attempt.call.root), tmp.join(&name));
     let limits = attempt.limits_for("outputs");
-    let pull = client::Pull { total: kept.size, started };
+    let pull = client::Pull {
+        total: kept.size,
+        started,
+        bringing,
+    };
     let called = attempt.outputs_call(ran.location, &name, &mut archive, limits, pull);
     attempt.split.outputs = Some(started.elapsed());
     // The fetch alone runs to the archive's last byte; one that wrote none, to the call's end.
@@ -468,17 +568,21 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
     // A Ctrl+C raised by the call's end is read once, so the early end's line and `judged` agree on a pull not whole.
     let interrupted = attempt.go_on().is_err();
     if !matches!(&called, Ok(called) if pulled_whole(called, interrupted)) {
-        attempt.say(pull_ended_line(pulled, attempt.pulled_bytes));
+        attempt.say(pull_ended_line(bringing, pulled, attempt.pulled_bytes));
     }
     match called {
-        // `judged` hands back the run's passing end only when the archive was fetched whole, and `called` a cut when it
+        // `judged` hands back the run's end so far only when the archive was fetched whole, and `called` a cut when it
         // was not: an archive past the fetch cap installs nothing.
         Ok(called) => {
             let at_the_cap = matches!(called.cut, Some(Cut::ArchiveTooBig(_)));
-            match judged(attempt, &archive, &called, synced, interrupted) {
-                End::Status(0) if called.cut.is_none() => {
-                    // The fetch ended whole, under the cap: how the install ends no longer bears on the count.
-                    uncapped(attempt);
+            let whole = pulled_whole(&called, interrupted);
+            match judged(attempt, (&archive, bringing), &called, synced, interrupted) {
+                End::Status(_) if whole => {
+                    // The fetch ended whole, under the cap: how the install ends no longer bears on the count, which a
+                    // failed run's pull never does.
+                    if bringing == Bringing::Outputs {
+                        uncapped(attempt);
+                    }
                     let (main_tree, sibling_trees) = box_trees(ran.location, attempt.call);
                     let fetched = Fetched {
                         archive: &archive,
@@ -490,19 +594,20 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
                         sibling_trees,
                         started,
                         pulled,
+                        reports: kept.reports,
                     };
                     install::installed(attempt, &fetched)
                 }
-                end => (settled(attempt, at_the_cap, end), false),
+                end => (settled(attempt, bringing, at_the_cap, end), false),
             }
         }
         Err(End::Failed(reason)) => {
-            let end = unfetched(attempt, &archive, &reason, End::Status(1));
-            (settled(attempt, false, end), false)
+            let end = unfetched(attempt, (&archive, bringing), &reason, End::Status(1));
+            (settled(attempt, bringing, false, end), false)
         }
         Err(end) => {
             removed(attempt, &archive, PARTIAL);
-            (settled(attempt, false, end), false)
+            (settled(attempt, bringing, false, end), false)
         }
     }
 }
@@ -513,19 +618,27 @@ fn pulled_whole(called: &Called, interrupted: bool) -> bool {
     !interrupted && called.cut.is_none() && called.status == 0
 }
 
-/// `end`, that of a fetch that did not end whole, the worktree's outputs cap record removed first ([`uncapped`]) unless
-/// the fetch ended `at_the_cap` or by a Ctrl+C.
-fn settled(attempt: &mut Attempt<'_, '_>, at_the_cap: bool, end: End) -> End {
-    if !at_the_cap && !matches!(end, End::Interrupted) {
+/// `end`, that of a fetch of what `bringing` names that did not end whole, the worktree's outputs cap record removed
+/// first ([`uncapped`]) unless the fetch ended `at_the_cap` or by a Ctrl+C, or brought a failed run's test reports,
+/// whose pull never bears on the record.
+fn settled(attempt: &mut Attempt<'_, '_>, bringing: Bringing, at_the_cap: bool, end: End) -> End {
+    if bringing == Bringing::Outputs && !at_the_cap && !matches!(end, End::Interrupted) {
         uncapped(attempt);
     }
     end
 }
 
-/// The end of the outputs step once its outputs call ended as `called`, having written to `archive`, a Ctrl+C raised by
-/// its end or not (`interrupted`, read once by the caller), the run's end so far `synced`: as [`fetched`] says, `synced`
-/// for a pull whole ([`pulled_whole`]).
-pub(super) fn judged(attempt: &mut Attempt<'_, '_>, archive: &Archive, called: &Called, synced: End, interrupted: bool) -> End {
+/// The end of the outputs step once its outputs call ended as `called`, having written to `archive` what it brings
+/// (`bringing`), a Ctrl+C raised by its end or not (`interrupted`, read once by the caller), the run's end so far
+/// `synced`: as [`fetched`] says, `synced` for a pull whole ([`pulled_whole`]). A failed run's test reports past the
+/// fetch cap are said not brought back, with `synced`, and no hit is counted.
+pub(super) fn judged(
+    attempt: &mut Attempt<'_, '_>,
+    (archive, bringing): (&Archive, Bringing),
+    called: &Called,
+    synced: End,
+    interrupted: bool,
+) -> End {
     if pulled_whole(called, interrupted) {
         return synced;
     }
@@ -534,24 +647,28 @@ pub(super) fn judged(attempt: &mut Attempt<'_, '_>, archive: &Archive, called: &
         removed(attempt, archive, PARTIAL);
         return End::Interrupted;
     }
+    let fetch = (archive, bringing);
     if let Some(cut) = called.cut {
-        if let Some(line) = client::watchdog_line(cut, "fetching the outputs") {
+        if let Some(line) = client::watchdog_line(cut, bringing.fetching()) {
             attempt.say(line);
             attempt.noted(called);
-            return unfetched(attempt, archive, &stopped_reason(called.received), End::Killed);
+            return unfetched(attempt, fetch, &stopped_reason(called.received), End::Killed);
         }
         attempt.noted(called);
         if let Cut::ArchiveTooBig(_) = cut {
+            if bringing == Bringing::Reports {
+                return unfetched(attempt, fetch, &cut.reason("the archive"), synced);
+            }
             return capped(attempt, archive, &cut.reason("the archive"), synced);
         }
-        return unfetched(attempt, archive, &cut.reason("the outputs call"), End::Status(1));
+        return unfetched(attempt, fetch, &cut.reason("the outputs call"), End::Status(1));
     }
     // Neither whole, nor interrupted, nor cut: the call failed.
     let reason = match &called.last_error {
         Some(line) => first_bytes(line, FAILURE_BYTES).to_owned(),
         None => format!("the outputs call failed (status {})", called.status),
     };
-    unfetched(attempt, archive, &reason, End::Status(1))
+    unfetched(attempt, fetch, &reason, End::Status(1))
 }
 
 /// Why a fetch the watchdog stopped brings nothing back: [`STOPPED`], and, when its raw copy's count is known
@@ -571,7 +688,7 @@ fn stopped_reason(received: Option<client::Received>) -> String {
 /// hit in a row keeps the run's status: the box's work is sound, the archive of it is not, and the next routed run asks
 /// for it again. A later hit in a row says the cap was passed again and fails the run.
 fn capped(attempt: &mut Attempt<'_, '_>, archive: &Archive, reason: &str, synced: End) -> End {
-    let end = unfetched(attempt, archive, reason, synced);
+    let end = unfetched(attempt, (archive, Bringing::Outputs), reason, synced);
     let hits = counted_hit(attempt);
     if hits < 2 {
         return end;
@@ -617,9 +734,10 @@ pub(super) fn uncapped(attempt: &mut Attempt<'_, '_>) {
     }
 }
 
-/// Says the run's outputs were not brought back, for `reason`, and removes what `archive` holds of them; `end`.
-fn unfetched(attempt: &mut Attempt<'_, '_>, archive: &Archive, reason: &str, end: End) -> End {
-    attempt.say(not_brought_back(reason));
+/// Says what the pull brings (`bringing`) was not brought back, for `reason`, and removes what `archive` holds of it;
+/// `end`.
+fn unfetched(attempt: &mut Attempt<'_, '_>, (archive, bringing): (&Archive, Bringing), reason: &str, end: End) -> End {
+    attempt.say(not_brought_back(bringing, reason));
     removed(attempt, archive, PARTIAL);
     end
 }
@@ -758,9 +876,9 @@ fn within_cap(length: usize, cap: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// The line saying a run's outputs are not brought back, for `reason`.
-pub(super) fn not_brought_back(reason: &str) -> String {
-    format!("gate: remote outputs not brought back: {}", escaped(reason))
+/// The line saying what a run's pull brings (`bringing`) is not brought back, for `reason`.
+pub(super) fn not_brought_back(bringing: Bringing, reason: &str) -> String {
+    format!("gate: {} not brought back: {}", bringing.unbrought(), escaped(reason))
 }
 
 /// Whether the pending marker at `marker` is there. One whose presence cannot be read counts as there: the run then
@@ -856,35 +974,37 @@ pub(super) fn mb_rate(bytes: u64, seconds: f64) -> String {
     format!("{}/s", mb_size(per_second))
 }
 
-/// The line an outputs pull says as it starts, from the builder `builder` (its alias), for `count` files and, when the
-/// box said it, the archive's `size` in bytes.
+/// The line an outputs pull of what it brings (`bringing`) says as it starts, from the builder `builder` (its alias),
+/// for `count` files and, when the box said it, the archive's `size` in bytes.
 #[expect(clippy::cast_precision_loss, reason = "a size said to one decimal of a megabyte")]
-fn pull_start_line(builder: &str, count: u64, size: Option<u64>) -> String {
+fn pull_start_line(bringing: Bringing, builder: &str, count: u64, size: Option<u64>) -> String {
+    let what = bringing.pulled();
     match size {
-        Some(size) => format!("gate: pulling outputs from {builder}: {count} file(s), {}", mb_size(size as f64)),
-        None => format!("gate: pulling outputs from {builder}: {count} file(s)"),
+        Some(size) => format!("gate: pulling {what} from {builder}: {count} file(s), {}", mb_size(size as f64)),
+        None => format!("gate: pulling {what} from {builder}: {count} file(s)"),
     }
 }
 
-/// The line an outputs pull says every period while it runs, `done` bytes in after `elapsed`, of the archive's `total`
-/// when the box said it: how much, the mean rate since the pull's start and, with a total and a rate above 0, about how
-/// long is left at that rate ([`left_text`]).
+/// The line an outputs pull of what it brings (`bringing`) says every period while it runs, `done` bytes in after
+/// `elapsed`, of the archive's `total` when the box said it: how much, the mean rate since the pull's start and, with a
+/// total and a rate above 0, about how long is left at that rate ([`left_text`]).
 #[expect(clippy::cast_precision_loss, reason = "sizes said to one decimal of a megabyte")]
-pub(super) fn progress_line(done: u64, total: Option<u64>, elapsed: Duration) -> String {
+pub(super) fn progress_line(bringing: Bringing, done: u64, total: Option<u64>, elapsed: Duration) -> String {
     let seconds = elapsed.as_secs_f64();
     let rate = mb_rate(done, seconds);
     let shown = mb_size(done as f64);
+    let what = bringing.pulled();
     match total {
-        None => format!("gate: pulling outputs: {shown} so far, {rate}"),
+        None => format!("gate: pulling {what}: {shown} so far, {rate}"),
         Some(total) if done > 0 && seconds > 0.0 => {
             let left = total.saturating_sub(done) as f64 / (done as f64 / seconds);
             format!(
-                "gate: pulling outputs: {shown} of {}, {rate}, about {} left",
+                "gate: pulling {what}: {shown} of {}, {rate}, about {} left",
                 mb_size(total as f64),
                 left_text(left)
             )
         }
-        Some(total) => format!("gate: pulling outputs: {shown} of {}, {rate}", mb_size(total as f64)),
+        Some(total) => format!("gate: pulling {what}: {shown} of {}, {rate}", mb_size(total as f64)),
     }
 }
 
@@ -897,12 +1017,13 @@ fn left_text(seconds: f64) -> String {
     format!("{} s", seconds.round())
 }
 
-/// The line an outputs pull that ended other than whole says before its end's own lines: how long it ran, `pulled`,
-/// and the bytes it had `received` by then.
+/// The line an outputs pull of what it brings (`bringing`) that ended other than whole says before its end's own lines:
+/// how long it ran, `pulled`, and the bytes it had `received` by then.
 #[expect(clippy::cast_precision_loss, reason = "a size said to one decimal of a megabyte")]
-fn pull_ended_line(pulled: Duration, received: u64) -> String {
+fn pull_ended_line(bringing: Bringing, pulled: Duration, received: u64) -> String {
     format!(
-        "gate: pulling outputs ended after {} s with {} received",
+        "gate: pulling {} ended after {} s with {} received",
+        bringing.pulled(),
         install::one_decimal(pulled.as_secs_f64()),
         mb_size(received as f64)
     )

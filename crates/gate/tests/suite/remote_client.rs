@@ -7043,7 +7043,7 @@ fn a_failing_run_between_two_fetches_past_the_cap_leaves_the_count() {
 }
 
 #[test]
-fn a_failing_run_makes_no_outputs_call() {
+fn a_failing_run_with_no_test_results_glob_makes_no_outputs_call() {
     let case = outputs_case("client-outputs-failing", &BIN);
     let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
     let command = [r".\tool.exe", "write", r"bin\built.txt", "box", "exit", "3"];
@@ -7053,6 +7053,209 @@ fn a_failing_run_makes_no_outputs_call() {
     assert_eq!(outcome.code, Some(3), "{outcome:?}");
     assert_eq!(calls(&steps), ["preflight", "run"]);
     assert_eq!(fetched_archives(&case), Vec::<PathBuf>::new());
+    assert!(pending_marker(&case).exists(), "{outcome:?}");
+}
+
+/// The output globs of a reports case: every file under a top `bin` folder, and every file under a `TestResults` folder.
+const REPORTS: [&str; 2] = ["bin/**", "**/TestResults/**"];
+
+/// A failing command that builds `bin\built.txt` and writes the test report `TestResults\r.trx`, then exits 3.
+const FAILING_WITH_A_REPORT: [&str; 8] = [
+    r".\tool.exe",
+    "write",
+    r"bin\built.txt",
+    "box",
+    "write",
+    r"TestResults\r.trx",
+    "<TestRun />",
+    "exit",
+];
+
+/// [`FAILING_WITH_A_REPORT`] with its exit status.
+fn failing_with_a_report() -> Vec<&'static str> {
+    FAILING_WITH_A_REPORT.iter().copied().chain(["3"]).collect()
+}
+
+/// An [`outputs_case`] with the [`REPORTS`] globs, whose `.gitignore` leaves `TestResults/` out beside `bin/`, as a test
+/// run's does.
+fn reports_case(name: &str) -> Case {
+    let case = outputs_case(name, &REPORTS);
+    write(&case, ".gitignore", &format!("{CLIENT_IGNORED}bin/\nTestResults/\n"));
+    case
+}
+
+/// Whether a line of `outcome`'s standard output or standard error starts with `start`.
+fn says_a_line_starting(outcome: &Outcome, start: &str) -> bool {
+    outcome.stdout.lines().chain(outcome.stderr.lines()).any(|line| line.starts_with(start))
+}
+
+#[test]
+fn a_failing_run_brings_its_test_reports_back() {
+    let case = reports_case("client-outputs-failing-reports");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &failing_with_a_report()));
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"], "{outcome:?}");
+    assert_eq!(worktree_text(&case, r"TestResults\r.trx"), "<TestRun />", "the report is installed");
+    assert!(
+        !case.folder().join("bin").join("built.txt").exists(),
+        "nothing under bin is installed: {outcome:?}"
+    );
+    assert!(
+        says_a_line_starting(&outcome, "gate: the failed run's test reports: 1 file(s)"),
+        "{outcome:?}"
+    );
+    assert!(!says_a_line_starting(&outcome, "gate: outputs:"), "{outcome:?}");
+    assert!(pending_marker(&case).exists(), "a failed run leaves the marker: {outcome:?}");
+}
+
+#[test]
+fn a_failing_run_whose_test_reports_cannot_be_fetched_keeps_its_status() {
+    let case = reports_case("client-outputs-failing-reports-unfetched");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "exit 3"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &failing_with_a_report()));
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert!(
+        says_a_line_starting(&outcome, "gate: the failed run's test reports not brought back:"),
+        "{outcome:?}"
+    );
+    assert!(
+        !case.folder().join("TestResults").join("r.trx").exists(),
+        "nothing is installed: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_failing_run_whose_box_packed_no_report_says_nothing() {
+    let case = reports_case("client-outputs-failing-no-report");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let command = [r".\tool.exe", "write", r"bin\built.txt", "box", "exit", "3"];
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &command));
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert!(outcome.stderr.contains("gate-remote-outputs: 0"), "the box packed nothing: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run"], "{outcome:?}");
+    let said = format!("{}{}", outcome.stdout, outcome.stderr);
+    assert!(!said.contains("test reports"), "{outcome:?}");
+    assert!(!said.contains("outputs not brought back"), "{outcome:?}");
+    assert!(pending_marker(&case).exists(), "a failed run leaves the marker: {outcome:?}");
+}
+
+/// A failing run that brings its test reports back leaves the count: the hits on either side of it are in a row.
+#[test]
+fn a_failing_run_bringing_reports_between_two_fetches_past_the_cap_leaves_the_count() {
+    let case = reports_case("client-outputs-cap-then-failing-reports");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", PAST_THE_CAP, "ok", "ok", "ok", "ok", "ok", PAST_THE_CAP]);
+
+    let first = low_budget_run(&case, &steps, "first.log", &WRITE_BUILT);
+    let failed = low_budget_run(&case, &steps, "second.log", &failing_with_a_report());
+    let after_failed = cap_record_text(&case);
+    let third = low_budget_run(&case, &steps, "third.log", &WRITE_BUILT);
+
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(failed.code, Some(3), "{failed:?}");
+    assert_eq!(
+        worktree_text(&case, r"TestResults\r.trx"),
+        "<TestRun />",
+        "the report came back: {failed:?}"
+    );
+    assert_eq!(after_failed.as_deref(), Some(r#"{"v":1,"hits":1}"#), "the failing run leaves the count");
+    assert_eq!(third.code, Some(1), "{third:?}");
+    assert!(third.stderr.contains(&capped_again(2)), "{third:?}");
+    assert_eq!(
+        calls(&steps),
+        [
+            "preflight",
+            "run",
+            "outputs",
+            "preflight",
+            "run",
+            "outputs",
+            "preflight",
+            "run",
+            "outputs"
+        ]
+    );
+}
+
+/// A passing run's fetch past the cap counts one hit; the failing run after it fetches its reports past the cap too,
+/// which neither counts a second hit nor clears the first.
+#[test]
+fn a_failing_run_s_reports_past_the_fetch_cap_keep_its_status_and_the_count() {
+    let case = reports_case("client-outputs-failing-reports-capped");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", PAST_THE_CAP, "ok", "ok", PAST_THE_CAP]);
+
+    let first = low_budget_run(&case, &steps, "first.log", &WRITE_BUILT);
+    let failed = low_budget_run(&case, &steps, "second.log", &failing_with_a_report());
+
+    assert_eq!(first.code, Some(0), "{first:?}");
+    assert_eq!(failed.code, Some(3), "the command's own status: {failed:?}");
+    let line = "gate: the failed run's test reports not brought back: the archive passed 2.0 MiB";
+    assert!(failed.stderr.contains(line), "{failed:?}");
+    assert!(!failed.stderr.contains("passed the cap again"), "{failed:?}");
+    assert_eq!(
+        cap_record_text(&case).as_deref(),
+        Some(r#"{"v":1,"hits":1}"#),
+        "the count is unchanged: {failed:?}"
+    );
+    assert!(
+        !case.folder().join("TestResults").join("r.trx").exists(),
+        "nothing is installed: {failed:?}"
+    );
+}
+
+/// The box's archive of the failed run's reports is swapped for one holding `bin/built.txt`, which the run's full globs
+/// match but the narrowed ones do not: the install refuses it, as it refuses a member outside the globs, the run keeps
+/// its status, and the refusal, which a passing run's would clear the marker for, leaves it.
+#[test]
+fn a_refused_install_of_a_failing_run_s_reports_keeps_its_status_and_the_marker() {
+    let case = reports_case("client-outputs-failing-reports-refused");
+    let go = Go(case.folder().join("ssh").join("go"));
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("hold {}", shown(go.path()))]);
+    let run = start(client_gate(&case, "out.log", &steps, &failing_with_a_report()));
+    run.wait_until("the outputs call", || calls(&steps).len() == 3);
+    fs::write(box_output_archive(&case), crafted_archive("bin/built.txt", "box")).expect("the archive can be replaced");
+    fs::write(go.path(), "").expect("the go file can be made");
+
+    let outcome = run.finish();
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    let line = "gate: the failed run's test reports not brought back: the archive member bin/built.txt is not under the output globs";
+    assert!(outcome.stderr.contains(line), "{outcome:?}");
+    assert!(
+        !case.folder().join("bin").join("built.txt").exists(),
+        "nothing of it is installed: {outcome:?}"
+    );
+    assert!(pending_marker(&case).exists(), "a failed run leaves the marker: {outcome:?}");
+}
+
+/// The reports' pull sends a few bytes, then nothing: the watchdog stops it, and the run ends killed, as a passing
+/// run's does, not on the command's status.
+#[test]
+fn a_failing_run_s_reports_pull_the_watchdog_stops_ends_124() {
+    let case = reports_case("client-outputs-failing-reports-stalled");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", &format!("bytes-hold 100 {}", never(&case))]);
+    let tuned = Tuned {
+        extra: &["--test-remote-watch-call", "outputs", "--test-stall-ms", WATCHED_MS],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, "out.log", &steps, &tuned, &failing_with_a_report()));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(outcome.stderr.contains(STALLED_LINE), "{outcome:?}");
+    assert!(
+        says_a_line_starting(
+            &outcome,
+            "gate: the failed run's test reports not brought back: the fetch was stopped by the watchdog"
+        ),
+        "{outcome:?}"
+    );
     assert!(pending_marker(&case).exists(), "{outcome:?}");
 }
 

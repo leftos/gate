@@ -1571,11 +1571,12 @@ impl Attempt<'_, '_> {
             }
             HangPhase::Running
         } else {
-            let pull_started = self.pulling?.started;
+            let pull = self.pulling?;
             let command_started = self.command_started?;
             HangPhase::Pulling {
-                counted_from: if self.hint_from_pull { pull_started } else { command_started },
-                pull_started,
+                counted_from: if self.hint_from_pull { pull.started } else { command_started },
+                pull_started: pull.started,
+                bringing: pull.bringing,
             }
         };
         routed_usual(self.call.usual, self.raised.is_some())
@@ -1594,6 +1595,7 @@ impl Attempt<'_, '_> {
         self.pulling.map(|pull| PullWatch {
             total: pull.total,
             started: pull.started,
+            bringing: pull.bringing,
             every: self.outputs_progress,
             log: self.call.log,
             periods_said: &self.pull_periods_said,
@@ -3478,11 +3480,15 @@ struct RunHang<'w> {
 /// The phase of a routed run a call's hang hint names: the run call, whose command counts from the box's start marker
 /// it hears, or the outputs pull, whose run counts from `counted_from`, the start marker the run call heard then (the
 /// pull's start under `--test-remote-hint-from-pull`), and whose own time counts from the pull's start,
-/// `pull_started`, however many times its call was made.
+/// `pull_started`, however many times its call was made, and whose words name what it brings (`bringing`).
 #[derive(Clone, Copy)]
 enum HangPhase {
     Running,
-    Pulling { counted_from: Instant, pull_started: Instant },
+    Pulling {
+        counted_from: Instant,
+        pull_started: Instant,
+        bringing: outputs::Bringing,
+    },
 }
 
 impl HangPhase {
@@ -3496,11 +3502,15 @@ impl HangPhase {
                 let running = progress.since_started()?;
                 Some((running, "running on", running))
             }
-            HangPhase::Pulling { counted_from, pull_started } => {
+            HangPhase::Pulling {
+                counted_from,
+                pull_started,
+                bringing,
+            } => {
                 let now = Instant::now();
                 Some((
                     now.saturating_duration_since(counted_from),
-                    "pulling outputs from",
+                    bringing.pulling_from(),
                     now.saturating_duration_since(pull_started),
                 ))
             }
@@ -3509,20 +3519,22 @@ impl HangPhase {
 }
 
 /// The outputs pull an outputs call is: the archive's size in bytes, when the box said it, and when the pull started,
-/// which its end line and the hang hint's phase both count from.
+/// which its end line and the hang hint's phase both count from; and what it brings, which its progress line names.
 #[derive(Clone, Copy)]
 pub(super) struct Pull {
     pub(super) total: Option<u64>,
     pub(super) started: Instant,
+    pub(super) bringing: outputs::Bringing,
 }
 
-/// The progress an outputs call's watch says of its pull, whose size and start it carries ([`Pull`]): how often it says
-/// it, the log it is written to beside stderr, and the pull's one count of the periods said, which every call of the
-/// pull reads and advances.
+/// The progress an outputs call's watch says of its pull, whose size, start and what it brings it carries ([`Pull`]):
+/// how often it says it, the log it is written to beside stderr, and the pull's one count of the periods said, which
+/// every call of the pull reads and advances.
 #[derive(Clone, Copy)]
 struct PullWatch<'w> {
     total: Option<u64>,
     started: Instant,
+    bringing: outputs::Bringing,
     every: Duration,
     log: &'w Path,
     periods_said: &'w Cell<u128>,
@@ -3713,7 +3725,7 @@ impl Watched<'_> {
         if !pull.due(elapsed) {
             return;
         }
-        let line = outputs::progress_line(self.progress.received(), pull.total, elapsed);
+        let line = outputs::progress_line(pull.bringing, self.progress.received(), pull.total, elapsed);
         if let Err(why) = super::say(pull.log, &[&line], io::stderr().lock()) {
             looks.unsaid.get_or_insert(why);
         }
@@ -6114,7 +6126,7 @@ mod tests {
             after: Duration::from_millis(2_500),
         });
 
-        let end = outputs::judged(&mut attempt, &archive, &stalled, End::Status(0), false);
+        let end = outputs::judged(&mut attempt, (&archive, outputs::Bringing::Outputs), &stalled, End::Status(0), false);
 
         assert!(matches!(end, End::Killed), "{end:?}");
         assert_eq!(
@@ -6141,6 +6153,7 @@ mod tests {
             PathBuf::from(r"C:\gate-client-tests-no-such-folder\app.tar.zst"),
         );
         let pull = super::Pull {
+            bringing: outputs::Bringing::Outputs,
             total: None,
             started: Instant::now(),
         };
@@ -6162,6 +6175,7 @@ mod tests {
         let mut attempt = attempt(&given, &transport);
         attempt.outputs_progress = Duration::from_secs(1);
         attempt.pulling = Some(super::Pull {
+            bringing: outputs::Bringing::Outputs,
             total: None,
             started: Instant::now(),
         });
@@ -6409,7 +6423,7 @@ mod tests {
         );
         let mut cut = ended_with(0, "");
         cut.cut = Some(Cut::ArchiveTooBig(262_144));
-        let end = outputs::judged(&mut attempt, &archive, &cut, End::Status(0), false);
+        let end = outputs::judged(&mut attempt, (&archive, outputs::Bringing::Outputs), &cut, End::Status(0), false);
         (end, std::mem::take(&mut attempt.lines))
     }
 
@@ -6521,7 +6535,7 @@ mod tests {
         let mut cut = ended_with(0, "");
         cut.cut = Some(Cut::ArchiveTooBig(262_144));
 
-        let end = outputs::judged(&mut attempt, &archive, &cut, End::Status(0), false);
+        let end = outputs::judged(&mut attempt, (&archive, outputs::Bringing::Outputs), &cut, End::Status(0), false);
 
         assert!(matches!(end, End::Status(0)), "the run keeps its status: {end:?}");
         assert!(!path.exists(), "the partial archive a cut fetch wrote is removed");
@@ -6542,7 +6556,7 @@ mod tests {
         );
         let failed = ended_with(SSH_FAILED, "Connection reset by peer");
 
-        let end = outputs::judged(&mut attempt, &archive, &failed, End::Status(0), true);
+        let end = outputs::judged(&mut attempt, (&archive, outputs::Bringing::Outputs), &failed, End::Status(0), true);
 
         assert!(matches!(end, End::Interrupted), "{end:?}");
         assert_eq!(attempt.lines, Vec::<String>::new());
@@ -7759,6 +7773,7 @@ mod tests {
         let pull_started = Instant::now();
         attempt.command_started = Some(marker);
         attempt.pulling = Some(super::Pull {
+            bringing: outputs::Bringing::Outputs,
             total: None,
             started: pull_started,
         });
@@ -7792,6 +7807,7 @@ mod tests {
             .expect("this PC's clock reads at least 8 s, so the pull can start 8 s back");
         attempt.command_started = Some(pull_started);
         attempt.pulling = Some(super::Pull {
+            bringing: outputs::Bringing::Outputs,
             total: None,
             started: pull_started,
         });
@@ -7808,6 +7824,30 @@ mod tests {
             call_ran < during,
             "not from the call's start: the call ran {call_ran:?}, the phase {during:?}"
         );
+    }
+
+    /// The hang hint of a failed run's pull of its test reports names them where a passing run's names its outputs.
+    #[test]
+    fn the_hang_hint_of_a_reports_pull_names_the_failed_run_s_test_reports() {
+        let log = Path::new(r"C:\no-such-log.log");
+        let call = RemoteCall {
+            usual: Some(crate::durations::Usual { p90: 30.0, family: false }),
+            ..call(log)
+        };
+        let transport = nowhere();
+        let mut attempt = attempt(&call, &transport);
+        let started = Instant::now();
+        attempt.command_started = Some(started);
+        attempt.pulling = Some(super::Pull {
+            bringing: outputs::Bringing::Reports,
+            total: None,
+            started,
+        });
+        let phase = attempt.run_hang(false).expect("the pull watches for the hint").phase;
+
+        let (_, named, _) = phase.times(&super::Progress::new()).expect("the pull's phase has its times");
+
+        assert_eq!(named, "pulling the failed run's test reports from");
     }
 
     /// How the warm-up of [`WARM_HASH`] ended whose run call said `stdout` and `stderr` and exited `status`, as the run

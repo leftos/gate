@@ -35,7 +35,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use super::client::{Attempt, End};
 use super::git::{Git, GitError};
-use super::outputs::{self, Archive, Polled};
+use super::outputs::{self, Archive, Bringing, Polled};
 use crate::outputs::archive::{Entry, PcFiles, UnpackError, below, check_folder, unpack};
 use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
@@ -83,6 +83,16 @@ pub(super) struct Fetched<'f> {
     pub(super) started: Instant,
     /// How long the fetch alone took, from its start to the archive's last byte.
     pub(super) pulled: Duration,
+    /// For a failed run's test reports, the run's output globs narrowed to those that name a `TestResults` folder: the
+    /// install is held to them in place of `globs`, never clears the pending marker, and its lines name the reports.
+    pub(super) reports: Option<&'f Globs>,
+}
+
+impl Fetched<'_> {
+    /// What the archive brings: a failed run's test reports when it carries their narrowed globs, else outputs.
+    fn bringing(&self) -> Bringing {
+        if self.reports.is_some() { Bringing::Reports } else { Bringing::Outputs }
+    }
 }
 
 /// What an install put into the worktree: the files it moved, their bytes, and the archive's bytes; the paths of the
@@ -260,8 +270,12 @@ pub(super) fn pc_spelling(root: &str) -> io::Result<PathBuf> {
 /// it put in place ([`cached`]), which no other end does.
 /// With the end, whether the install was complete ([`Installed::complete`]): a success whose skips are all ones a
 /// refetch of the same outputs would clear, and so the one whose files the hash cache may keep.
+///
+/// A failed run's test reports ([`Bringing::Reports`]) are installed the same way, each line naming them, but no end
+/// clears the pending marker.
 pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) -> (End, bool) {
     let staged = Cell::new(false);
+    let bringing = fetched.bringing();
     let (end, lines, complete, clear) = match install(attempt, fetched, &staged) {
         Ok((done, started)) => {
             cached(
@@ -269,16 +283,17 @@ pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) ->
                 &done,
                 started,
             );
-            let lines = said(&done, fetched.started.elapsed().as_secs_f64(), fetched.pulled.as_secs_f64());
+            let lines = said(bringing, &done, fetched.started.elapsed().as_secs_f64(), fetched.pulled.as_secs_f64());
             let complete = done.complete();
             (End::Status(0), lines, complete, complete)
         }
         Err(unmet) => {
             let clear = matches!(&unmet, Unmet::Refused(refused) if refused.kind == Kind::Deterministic);
-            let (end, lines) = ending(unmet);
+            let (end, lines) = ending(bringing, unmet);
             (end, lines, false, clear)
         }
     };
+    let clear = clear && bringing == Bringing::Outputs;
     for line in lines {
         attempt.say(line);
     }
@@ -295,18 +310,18 @@ pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) ->
     (end, complete)
 }
 
-/// The end of an install that did not complete as `unmet` says, and the lines it says: one for each reason of a refusal,
-/// none for a Ctrl+C before any file was moved, which the run's own interrupt handling says.
-fn ending(unmet: Unmet) -> (End, Vec<String>) {
+/// The end of an install of what `bringing` names that did not complete as `unmet` says, and the lines it says: one for
+/// each reason of a refusal, none for a Ctrl+C before any file was moved, which the run's own interrupt handling says.
+fn ending(bringing: Bringing, unmet: Unmet) -> (End, Vec<String>) {
     match unmet {
         Unmet::Interrupted { done: 0, .. } => (End::Interrupted, Vec::new()),
         Unmet::Interrupted { done, total } => {
             let reason = format!("{done} of {total} files were installed before the interrupt");
-            (End::Interrupted, vec![outputs::not_brought_back(&reason)])
+            (End::Interrupted, vec![outputs::not_brought_back(bringing, &reason)])
         }
         Unmet::Refused(refused) => (
             End::Status(1),
-            refused.reasons.iter().map(|reason| outputs::not_brought_back(reason)).collect(),
+            refused.reasons.iter().map(|reason| outputs::not_brought_back(bringing, reason)).collect(),
         ),
     }
 }
@@ -338,8 +353,14 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
             unopened(&error)
         }
     })?;
-    let globs = Globs::new(fetched.globs).map_err(transient)?;
-    let checks = checked(&root, &entries, &globs, fetched.manifest).map_err(Unmet::Refused)?;
+    let all;
+    let globs = if let Some(reports) = fetched.reports {
+        reports
+    } else {
+        all = Globs::new(fetched.globs).map_err(transient)?;
+        &all
+    };
+    let checks = checked(&root, &entries, globs, fetched.manifest).map_err(Unmet::Refused)?;
     let in_place: HashSet<&str> = checks.in_place.iter().map(String::as_str).collect();
     let entries: Vec<Entry> = entries.into_iter().filter(|entry| !in_place.contains(entry.path.as_str())).collect();
     let mut skipped = skips(attempt, &root, &entries, &checks.in_use)?;
@@ -545,33 +566,35 @@ fn reasons(entries: &[Entry], tracked: &HashSet<&str>, in_use: &HashSet<&str>) -
         .collect()
 }
 
-/// The lines an install that put `installed` into the worktree says, `seconds` after its fetch started, the fetch alone
-/// having taken `pulled`: one for each file it skipped, saying why, then the success line.
-fn said(installed: &Installed, seconds: f64, pulled: f64) -> Vec<String> {
+/// The lines an install of what `bringing` names that put `installed` into the worktree says, `seconds` after its fetch
+/// started, the fetch alone having taken `pulled`: one for each file it skipped, saying why, then the success line.
+fn said(bringing: Bringing, installed: &Installed, seconds: f64, pulled: f64) -> Vec<String> {
     let mut lines: Vec<String> = installed
         .skipped
         .iter()
         .map(|(path, skip)| {
             format!(
-                "gate: remote outputs not fully brought back: {}",
+                "gate: {} not fully brought back: {}",
+                bringing.unbrought(),
                 escaped(&format!("{path} {}", skip.said()))
             )
         })
         .collect();
-    lines.push(success_line(installed, seconds, pulled));
+    lines.push(success_line(bringing, installed, seconds, pulled));
     lines
 }
 
-/// The line an install that put `installed` into the worktree says, `seconds` after its fetch started, the fetch alone
-/// having taken `pulled`: the fetch's seconds and the archive's mean rate over them close it.
+/// The line an install of what `bringing` names that put `installed` into the worktree says, `seconds` after its fetch
+/// started, the fetch alone having taken `pulled`: the fetch's seconds and the archive's mean rate over them close it.
 #[expect(clippy::cast_precision_loss, reason = "a size said to one decimal of a megabyte")]
-fn success_line(installed: &Installed, seconds: f64, pulled: f64) -> String {
+fn success_line(bringing: Bringing, installed: &Installed, seconds: f64, pulled: f64) -> String {
     let bytes = one_decimal(installed.bytes as f64 / MB);
     let compressed = one_decimal(installed.compressed as f64 / MB);
     let seconds = one_decimal(seconds);
     let rate = super::outputs::mb_rate(installed.compressed, pulled);
     format!(
-        "gate: outputs: {} file(s), {bytes} MB ({compressed} MB compressed) in {seconds} s (pulled in {} s, {rate})",
+        "gate: {}: {} file(s), {bytes} MB ({compressed} MB compressed) in {seconds} s (pulled in {} s, {rate})",
+        bringing.pulled(),
         installed.count,
         one_decimal(pulled)
     )
@@ -1087,8 +1110,8 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
 
     use super::{
-        Checked, Index, Installed, Moved, Moves, Refused, Skip, Unmet, Unmoved, Unrewritable, cached, checked, ending, moved, reasons, rewritten,
-        said, stage_made, success_line, tracked, unmet_of, unpacked,
+        Bringing, Checked, Index, Installed, Moved, Moves, Refused, Skip, Unmet, Unmoved, Unrewritable, cached, checked, ending, moved, reasons,
+        rewritten, said, stage_made, success_line, tracked, unmet_of, unpacked,
     };
     use crate::boxside::outputs::OUTPUTS_BUDGET;
     use crate::outputs::archive::{Entry, PcFiles, UnpackError, pack};
@@ -1564,7 +1587,7 @@ mod tests {
         };
 
         let line = "gate: remote outputs not fully brought back: bin/big.json cannot be rewritten (16777217 bytes, over 16 MiB)";
-        assert_eq!(said(&installed, 0.0, 0.0).first().map(String::as_str), Some(line));
+        assert_eq!(said(Bringing::Outputs, &installed, 0.0, 0.0).first().map(String::as_str), Some(line));
     }
 
     /// An install that skipped a file it cannot rewrite is whole, which the marker, `brought_back` and the hash cache
@@ -1604,11 +1627,15 @@ mod tests {
             moved: Vec::new(),
         };
         let success = "gate: outputs: 3 file(s), 3.0 MB (1.0 MB compressed) in 2.3 s (pulled in 0.5 s, 2.0 MB/s)";
-        assert_eq!(success_line(&installed, 2.25, 0.5), success, "half a tenth rounds away from zero");
+        assert_eq!(
+            success_line(Bringing::Outputs, &installed, 2.25, 0.5),
+            success,
+            "half a tenth rounds away from zero"
+        );
         let in_use = "gate: remote outputs not fully brought back: bin/held.dll is in use or read-only";
         let tracked = "gate: remote outputs not fully brought back: bin/kept.dll is tracked by git";
         assert_eq!(
-            said(&installed, 2.25, 0.5),
+            said(Bringing::Outputs, &installed, 2.25, 0.5),
             [in_use, tracked, success],
             "each skipped file and why, then the success line"
         );
@@ -1777,12 +1804,12 @@ mod tests {
                 GitError::Failed(why) | GitError::OverCap(why) => why.as_str(),
                 GitError::Interrupted => "",
             });
-            let (end, line) = ending(unmet_of(error));
+            let (end, line) = ending(Bringing::Outputs, unmet_of(error));
             assert!(matches!(end, End::Status(1)), "{end:?}");
             assert_eq!(line, [format!("gate: remote outputs not brought back: {why}")]);
         }
         assert_eq!(unmet_of(GitError::Interrupted), Unmet::Interrupted { done: 0, total: 0 });
-        let (end, line) = ending(unmet_of(GitError::Interrupted));
+        let (end, line) = ending(Bringing::Outputs, unmet_of(GitError::Interrupted));
         assert!(matches!(end, End::Interrupted) && line.is_empty(), "{end:?} {line:?}");
     }
 
@@ -2146,15 +2173,18 @@ mod tests {
 
     #[test]
     fn an_interrupt_before_the_first_move_says_no_count() {
-        let (end, line) = ending(Unmet::Interrupted { done: 0, total: 3 });
+        let (end, line) = ending(Bringing::Outputs, Unmet::Interrupted { done: 0, total: 3 });
         assert!(matches!(end, End::Interrupted) && line.is_empty(), "{end:?} {line:?}");
 
-        let (end, line) = ending(Unmet::Interrupted { done: 1, total: 3 });
+        let (end, line) = ending(Bringing::Outputs, Unmet::Interrupted { done: 1, total: 3 });
         assert!(matches!(end, End::Interrupted), "{end:?}");
         let counted = "gate: remote outputs not brought back: 1 of 3 files were installed before the interrupt";
         assert_eq!(line, [counted]);
 
-        let (end, line) = ending(Unmet::Refused(Refused::transient("bin/a.dll changed during the run".to_owned())));
+        let (end, line) = ending(
+            Bringing::Outputs,
+            Unmet::Refused(Refused::transient("bin/a.dll changed during the run".to_owned())),
+        );
         assert!(matches!(end, End::Status(1)), "{end:?}");
         let refused = "gate: remote outputs not brought back: bin/a.dll changed during the run";
         assert_eq!(line, [refused]);
@@ -2197,7 +2227,7 @@ mod tests {
         let entries: Vec<Entry> = paths.iter().map(|path| entry(path)).collect();
 
         let refused = checked(&root, &entries, &bin_globs(), &manifest).expect_err("every file changed");
-        let (end, lines) = ending(Unmet::Refused(refused));
+        let (end, lines) = ending(Bringing::Outputs, Unmet::Refused(refused));
 
         assert!(matches!(end, End::Status(1)), "{end:?}");
         let mut expected: Vec<String> = paths[..10]
@@ -2222,7 +2252,7 @@ mod tests {
         let entries: Vec<Entry> = paths.iter().map(|path| entry(path)).collect();
 
         let refused = checked(&root, &entries, &bin_globs(), &manifest).expect_err("every file changed");
-        let (_, lines) = ending(Unmet::Refused(refused));
+        let (_, lines) = ending(Bringing::Outputs, Unmet::Refused(refused));
 
         let expected: Vec<String> = paths
             .iter()
@@ -2243,7 +2273,7 @@ mod tests {
         let entries = [entry("bin/a.dll"), entry("bin/b.dll"), entry("bin/c.dll")];
 
         let refused = checked(&root, &entries, &bin_globs(), &manifest).expect_err("the files changed");
-        let (_, lines) = ending(Unmet::Refused(refused));
+        let (_, lines) = ending(Bringing::Outputs, Unmet::Refused(refused));
 
         assert_eq!(
             lines,
