@@ -4,12 +4,9 @@
 
 ## Do first
 
-- [ ] GATE-791 Count an exiting process as stopped in gate stop-tree, not as access denied — Urgent · Local gate
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [/] GATE-696 Cross-build Windows outputs on a macOS builder and bring them back — Urgent · Remote
 - [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root — High · Remote
-- [/] GATE-648 Restore pnpm, bun and npm packages on the Unix box, as the Windows box does — High · Remote
-- [ ] GATE-574 Take the work lock in the box preflight and stamp the lock's time on each run — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
@@ -35,6 +32,7 @@
 - [ ] GATE-753 Log every step of a run in the gate's log: start, progress, end and duration — High · Remote
 - [ ] GATE-757 Retry a transfer that fails after a passing routed command, and say the command's verdict — High · Remote
 - [ ] GATE-759 Move the rest of the box's shared wire rules into gate-wire (GATE-616 slices 2, 3, 5, 6) — High · Remote
+- [ ] GATE-798 Give Mac runs a TMPDIR whose group the builder user is in, so setgid survives — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -46,9 +44,11 @@
 - [ ] GATE-652 Refuse a gate.exe built with its test seams at install
 - [ ] GATE-678 Make pause suite cases fail at once when the gate they wait on exits
 - [ ] GATE-756 Make a light run's load adjustment see contention below saturation
+- [ ] GATE-794 Count a process already ending as ended at the other refused-terminate sites
 
 ## Remote
 
+- [ ] GATE-792 Read a work folder's idleness from its stamped lock alone in the Windows box prune
 - [ ] GATE-775 Judge the Unix box's login PATH folders and the folder xcode-select names (sub-issue of GATE-614)
 - [ ] GATE-776 Walk the folders above the Unix box's work root to / (sub-issue of GATE-614)
 - [ ] GATE-777 Pin the Unix box's work root at install and refuse any other (sub-issue of GATE-614)
@@ -260,6 +260,10 @@
 - [ ] GATE-783 Check which ssh a gate under Git Bash runs, and its exit-status width
 - [ ] GATE-784 Fall back when a tcsh or csh login shell finds no gate box (status 1)
 - [ ] GATE-785 Say every Unix box protocol line through one standard-error call
+- [ ] GATE-793 Stamp the work lock and take it in the preflight on the Unix box, as the Windows box does
+- [ ] GATE-795 Find why a routed cargo clippy on the Mac passed without checking a changed file
+- [ ] GATE-796 Check for a gone client while the Windows box preflight waits for a bare lock
+- [ ] GATE-797 Drop the installing manager's own record line before a Windows box package install
 
 ## Cutover sweep
 
