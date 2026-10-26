@@ -9,7 +9,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -782,6 +782,68 @@ fn preflight_of_a_new_work_tree_says_so_once() {
         "right after the warm line: {first:?}"
     );
     assert_eq!(new_tree(&passed(&second)), 0, "the tree is there the second time: {second:?}");
+}
+
+/// The folder `remote\work` of `folders`, where the key's lock `k.lock` lies, made.
+fn made_work_root(folders: &Folders) -> PathBuf {
+    let work_root = Path::new(&folders.work).parent().expect("a work folder has a folder").to_path_buf();
+    fs::create_dir_all(&work_root).expect("the work root can be made");
+    work_root
+}
+
+/// A preflight whose key's lock another process holds (a run, a prune) leaves the work folder to the run, which is
+/// refused busy, and still says the tree is new, so the client raises the ceiling of a cold run.
+#[test]
+fn a_preflight_whose_work_lock_is_held_writes_nothing_in_the_work_folder_and_says_it_is_new() {
+    let case = Case::new("preflight_work_lock_held");
+    let folders = Folders::new(&case);
+    let held = hold_lock(&made_work_root(&folders), "k.lock");
+
+    let outcome = gate_box(&case, "preflight", &folders.payload(), None);
+
+    drop(held);
+    let printed = passed(&outcome);
+    assert!(printed.contains(&"gate: remote new work tree"), "{outcome:?}");
+    assert!(
+        !Path::new(&folders.work).join(".git").exists(),
+        "nothing is written in the work folder: {outcome:?}"
+    );
+    assert!(
+        Path::new(&folders.bare).join("HEAD").is_file(),
+        "the bare repository is still made: {outcome:?}"
+    );
+}
+
+/// The preflight leaves the key's lock made, and free for the run that follows.
+#[test]
+fn a_preflight_leaves_its_work_lock_made_and_free() {
+    let case = Case::new("preflight_work_lock_let_go");
+    let folders = Folders::new(&case);
+
+    let outcome = gate_box(&case, "preflight", &folders.payload(), None);
+
+    passed(&outcome);
+    let work_root = Path::new(&folders.work).parent().expect("a work folder has a folder");
+    assert!(work_root.join("k.lock").is_file(), "the preflight took the lock: {outcome:?}");
+    drop(hold_lock(work_root, "k.lock"));
+}
+
+/// A folder where the key's lock goes cannot be opened as the lock: the preflight says why, writes nothing in the work
+/// folder and passes, leaving the run to fail on the same lock.
+#[test]
+fn a_preflight_whose_work_lock_is_a_folder_says_why_and_writes_nothing() {
+    let case = Case::new("preflight_work_lock_folder");
+    let folders = Folders::new(&case);
+    fs::create_dir_all(made_work_root(&folders).join("k.lock")).expect("a folder can be made where the lock goes");
+
+    let outcome = gate_box(&case, "preflight", &folders.payload(), None);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: remote could not open the work folder lock"), "{outcome:?}");
+    assert!(
+        !Path::new(&folders.work).join(".git").exists(),
+        "nothing is written in the work folder: {outcome:?}"
+    );
 }
 
 /// The preflight's lines of `outcome`, a passed one, and whether it says the work folder is cold: the new work tree
@@ -2890,6 +2952,29 @@ fn preflight_initialises_a_bare_left_with_its_init_s_locks() {
     assert!(bare.join("HEAD").is_file(), "the bare repository has its HEAD: {outcome:?}");
 }
 
+/// A half-made bare repository beside a lock `{bare}.lock` another process held and let go is readied, and the
+/// preflight passes. The `lock_waited` unit tests in `preflight.rs` prove the wait itself.
+#[test]
+fn a_preflight_readies_a_half_made_bare_beside_a_bare_lock_another_held() {
+    let case = Case::new("preflight_half_made_bare_held");
+    let folders = Folders::new(&case);
+    let bare = Path::new(&folders.bare);
+    for folder in ["objects", "refs"] {
+        fs::create_dir_all(bare.join(folder)).expect("a half-made bare repository can be made");
+    }
+    let remote = bare.parent().expect("a bare repository has a folder");
+    let held = hold_lock(remote, "k.git.lock");
+    let running = box_call(&case, &["box", "preflight"], &folders.payload()).start();
+    let work_root = Path::new(&folders.work).parent().expect("a work folder has a folder").to_path_buf();
+    wait_until("the preflight making the work root before the bare", || work_root.is_dir());
+
+    drop(held);
+    let outcome = running.finish_read();
+
+    passed(&outcome);
+    assert!(bare.join("HEAD").is_file(), "the bare repository has its HEAD: {outcome:?}");
+}
+
 /// A `git clean` after a failed checkout that exits 255 itself, the client still there, is the clean's own failure:
 /// the run ends with the checkout's status, never read as a gone client.
 #[test]
@@ -2951,6 +3036,67 @@ fn box_run_a_second_run_on_a_held_lock_is_busy() {
     let outcome = first.finish_read();
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
     wait_until_closed(Path::new(field(&held, "Lock")));
+}
+
+/// Makes the work folder lock of `payload` a plain file last written two days back; that time.
+fn lock_written_long_ago(payload: &Value) -> SystemTime {
+    let lock = Path::new(field(payload, "Lock"));
+    fs::create_dir_all(lock.parent().expect("a lock has a folder")).expect("the lock's folder can be made");
+    let long_ago = SystemTime::now() - Duration::from_hours(48);
+    let file = fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock)
+        .expect("the lock can be made");
+    file.set_modified(long_ago).expect("the lock's last write can be set");
+    long_ago
+}
+
+/// The last-write time of the file at `path`.
+fn modified(path: &Path) -> SystemTime {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .expect("the file's last write can be read")
+}
+
+/// A run writes the lock's last-write time when it takes the lock and again when it lets it go, so the lock ends no
+/// older than what the command wrote.
+#[test]
+fn a_run_stamps_the_work_lock_when_it_takes_and_releases_it() {
+    let case = Case::new("box_run_lock_stamped");
+    let marker = case.folder().join("marker");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "mark", &shown(&marker)]);
+    snapshot(&case, &mut payload, &[("a.txt", "a\n")]);
+    let long_ago = lock_written_long_ago(&payload);
+
+    let outcome = run_box(&case, &payload);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let lock = modified(Path::new(field(&payload, "Lock")));
+    assert!(lock > long_ago, "the lock was stamped: {outcome:?}");
+    assert!(lock >= modified(&marker), "the lock was stamped as the run let it go: {outcome:?}");
+}
+
+/// An inputs call takes the lock as a run does, and stamps it.
+#[test]
+fn an_inputs_call_stamps_the_work_lock() {
+    let case = Case::new("box_inputs_lock_stamped");
+    let mut payload = box_payload(&case, "k", &[FAKE_TOOL, "out", "ran"]);
+    payload["Step"] = json!("diff");
+    passed(&gate_box(&case, "preflight", &self::payload(&payload), None));
+    let long_ago = lock_written_long_ago(&payload);
+
+    let (running, mut stdin) = box_call(&case, &["box", "inputs"], &self::payload(&payload)).start_with_stdin();
+    stdin.write_all(b"{\"files\":{}}\n").expect("the manifest can be sent");
+    drop(stdin);
+    let outcome = running.finish_read();
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(
+        modified(Path::new(field(&payload, "Lock"))) > long_ago,
+        "the lock was stamped: {outcome:?}"
+    );
 }
 
 /// The start marker the box says for the run of `payload` just before its command starts.

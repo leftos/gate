@@ -1,6 +1,7 @@
 //! `gate box inflight`: how many of the builder's work folders a run holds. A run holds its work folder by holding `<root>\work\<key>.lock`
 //! open with no sharing at all (`gate box run`, and the PowerShell wrapper's `Invoke-Run`), so a probe that opens each
-//! lock for reading, sharing everything, is refused exactly while a run holds it. Each handle is closed at once, so a
+//! lock for reading, sharing everything, is refused exactly while a run holds it. A preflight holds the same lock for its
+//! reads of the key's records and its writes in the work folder, so its key counts as in flight meanwhile. Each handle is closed at once, so a
 //! run that starts just after the probe can still take its lock; one whose own open lands while the probe holds it is
 //! refused busy (status 75), and its PC runs the command here instead.
 

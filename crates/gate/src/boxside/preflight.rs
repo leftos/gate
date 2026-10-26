@@ -33,7 +33,7 @@ use crate::boxside::heartbeat;
 use crate::boxside::helper_trusted;
 use crate::boxside::msys;
 use crate::boxside::probe;
-use crate::boxside::run::{self, FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_SINGLE, StopSignal, WaitEnd, Watched, Watching};
+use crate::boxside::run::{self, FILE_FLAG_OPEN_REPARSE_POINT, LAYOUT_SINGLE, Stamp, StopSignal, WaitEnd, Watched, Watching};
 use crate::boxside::stamping;
 use crate::boxside::stop::terminate_and_wait;
 use crate::console::Console;
@@ -104,7 +104,9 @@ pub(crate) fn git_failed(step: &str, code: i32) -> Failed {
 /// version line comes first, so a PC client of another version falls back on the version rather than a bare status 1.
 /// Then, once the payload is read and before any record is read or folder readied, it makes the work root locked when
 /// it is missing and refuses one another account may write in, after its version line, with the root line and
-/// [`ROOT_STATUS`] ([`held_work_root`]), holding it until the folders are readied.
+/// [`ROOT_STATUS`] ([`held_work_root`]), holding it until the folders are readied. It readies the bare repositories,
+/// then takes the key's work-folder lock `Lock` around its reads of the key's records and its writes in the work
+/// folder ([`ready`]), and lets it go before its version line, so the run right after it is never refused busy by it.
 pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u32 {
     if crate::boxside::judges_trust()
         && let Err(why) = gate_desktop::helper_path()
@@ -115,10 +117,11 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
         stamping::err(console, &install_untrusted_line(&why));
         return u32::from(INSTALL_STATUS);
     }
-    let read = payload
-        .path("Bare")
-        .and_then(|bare| Ok((bare, payload.work_folder()?.1, payload.pair()?)));
-    let (bare, work, pair) = match read {
+    let read = payload.path("Bare").and_then(|bare| {
+        let work = payload.work_folder()?.1;
+        Ok((bare, work, payload.beside_work("Lock", work, "lock")?, payload.pair()?))
+    });
+    let (bare, work, lock, pair) = match read {
         Ok(folders) => folders,
         Err(line) => {
             stamping::err(console, &line);
@@ -130,26 +133,10 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
         Ok(held) => held,
         Err(status) => return status,
     };
-    // Read once, before the folders are readied, which would make a missing `.git` and so a stale record look current.
-    let layout = layout_record(work);
-    let warm = warm_state(work, &layout);
-    // A command ended mid-run left the record: the run clears what it wrote, so the folder is cold again. A record
-    // naming another layout than the run's, a pair's first run having none, or one cut short mid-change, has the run
-    // clear the whole folder and lay its trees out again. Any entry at the record's name counts, a folder or a link
-    // included, looked at as itself, never followed: the run takes one it cannot read as a record of no form.
-    let interrupted = fs::symlink_metadata(crate::boxside::run::command_record(work)).is_ok();
-    let wanted = match &pair {
-        None => run::layout_text(None, Vec::new()),
-        Some(pair) => run::layout_text(Some(pair.leaf()), pair.siblings().iter().map(PairSibling::name).collect()),
-    };
-    let relaid = run::names_another_layout(&layout, &wanted);
-    let readied = match &pair {
-        None => ready(bare, work, &layout, console),
-        Some(pair) => ready_bares(bare, work, pair, console).map(|()| false),
-    };
+    let readied = ready(bare, work, lock, pair.as_ref(), console);
     drop(held_root);
-    let made = match readied {
-        Ok(made) => made,
+    let Readied { made, warm, cleared } = match readied {
+        Ok(readied) => readied,
         Err(failed) => {
             stamping::err(console, &failed.line);
             return failed.status;
@@ -157,7 +144,7 @@ pub(crate) fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Conso
     };
     stamping::out(console, &format!("gate: remote version {}", build_version()));
     stamping::out(console, &format!("gate: remote warm {}", warm.as_deref().unwrap_or("none")));
-    if made || interrupted || relaid {
+    if made || cleared {
         stamping::out(console, NEW_WORK_TREE);
     }
     boot::say(console);
@@ -343,14 +330,68 @@ fn laid_out_trees(work: &str, layout: &io::Result<Option<String>>) -> Option<Vec
     named.then(|| names.iter().map(|name| format!(r"{work}\{name}")).collect())
 }
 
-/// The folder above `work`; the bare repository, said as created; and the work folder's repository ([`ready_tree`],
-/// which readies nothing through a link at its `.git`), unless the work folder is laid out for another layout
-/// ([`laid_out_for_one_repo`] of its record `layout`): a run of the key changes it under its lock, which the
-/// preflight does not take. Whether the work folder's tree is new to this run ([`ready_new_tree`]).
-fn ready(bare: &str, work: &str, layout: &io::Result<Option<String>>, console: &mut Console) -> Result<bool, Failed> {
+/// What the preflight read of the key's records under the key's lock, and whether the work folder's tree is new.
+struct Readied {
+    /// The tree is new to this run ([`ready_new_tree`]); when the preflight could not take the lock, it has no
+    /// `.git\HEAD` file, read with `HEAD` itself not followed (a link at `.git` is followed).
+    made: bool,
+    /// The warm record's hash ([`warm_state`]).
+    warm: Option<String>,
+    /// The run clears what the folder holds: a command ended mid-run left its record, or the layout record names
+    /// another layout than the run's ([`run::names_another_layout`]).
+    cleared: bool,
+}
+
+/// The folder above `work`; the bare repository `bare`, or each of the pair `pair`'s ([`ready_bares`]), said as
+/// created; then, under the key's lock `lock` ([`run::take_lock`], unstamped), the key's records read and, for a run
+/// of one repo, the work folder's repository readied ([`ready_one_tree`]); the lock is let go before this returns. A
+/// lock another process holds, or one that cannot be opened (its line said on stderr), leaves the tree to the run,
+/// which is refused busy or fails on the same lock: nothing is written in the work folder.
+fn ready(bare: &str, work: &str, lock: &str, pair: Option<&Pair>, console: &mut Console) -> Result<Readied, Failed> {
     let git = Git::find();
     create_parent(work)?;
-    create_bare(&git, bare, None, console)?;
+    match pair {
+        None => create_bare(&git, bare, None, console)?,
+        Some(pair) => ready_bares(&git, bare, pair, console)?,
+    }
+    let held = match run::take_lock(lock, run::WORK_LOCK, Stamp::NoUse, console) {
+        Ok(held) => held,
+        Err(line) => {
+            stamping::err(console, &line);
+            None
+        }
+    };
+    // Read before the tree is readied, which would make a missing `.git` and so a stale record look current.
+    let layout = layout_record(work);
+    let warm = warm_state(work, &layout);
+    // A command ended mid-run left the record: the run clears what it wrote, so the folder is cold again. A record
+    // naming another layout than the run's, a pair's first run having none, or one cut short mid-change, has the run
+    // clear the whole folder and lay its trees out again. Any entry at the record's name counts, a folder or a link
+    // included, looked at as itself, never followed: the run takes one it cannot read as a record of no form.
+    let interrupted = fs::symlink_metadata(run::command_record(work)).is_ok();
+    let wanted = match pair {
+        None => run::layout_text(None, Vec::new()),
+        Some(pair) => run::layout_text(Some(pair.leaf()), pair.siblings().iter().map(PairSibling::name).collect()),
+    };
+    let relaid = run::names_another_layout(&layout, &wanted);
+    let made = match (pair, &held) {
+        (Some(_), _) => false,
+        (None, Some(_)) => ready_one_tree(&git, bare, work, &layout, console)?,
+        (None, None) => !fs::symlink_metadata(Path::new(work).join(".git").join("HEAD")).is_ok_and(|metadata| metadata.is_file()),
+    };
+    drop(held);
+    Ok(Readied {
+        made,
+        warm,
+        cleared: interrupted || relaid,
+    })
+}
+
+/// The work folder `work`'s repository ([`ready_tree`], which readies nothing through a link at its `.git`), unless
+/// the work folder is laid out for another layout ([`laid_out_for_one_repo`] of its record `layout`), which a run of
+/// the key changes. The preflight's lock only guards its writes ([`TreeGit::holds_the_lock`] is false). Whether the
+/// work folder's tree is new to this run ([`ready_new_tree`]).
+fn ready_one_tree(git: &Git, bare: &str, work: &str, layout: &io::Result<Option<String>>, console: &mut Console) -> Result<bool, Failed> {
     if !laid_out_for_one_repo(layout) {
         return Ok(false);
     }
@@ -360,7 +401,7 @@ fn ready(bare: &str, work: &str, layout: &io::Result<Option<String>>, console: &
         bare,
         warm: &warm,
     };
-    ready_new_tree(&git, &at, None, console).map_err(|unready| match unready {
+    ready_new_tree(git, &at, None, console).map_err(|unready| match unready {
         Unready::Git(failed) => failed,
         Unready::Folder(why) => Failed::without_status(format!("gate: remote {why}")),
     })
@@ -376,15 +417,12 @@ fn laid_out_for_one_repo(layout: &io::Result<Option<String>>) -> bool {
     }
 }
 
-/// For a run of the sibling pair `pair`: the folder above `work`, and the bare repository of the main checkout,
-/// `bare`, and of each sibling, each said as created, a failure naming its repo. Nothing inside `work`, which only a
-/// run holding its lock changes.
-fn ready_bares(bare: &str, work: &str, pair: &Pair, console: &mut Console) -> Result<(), Failed> {
-    let git = Git::find();
-    create_parent(work)?;
-    create_bare(&git, bare, Some(pair.leaf()), console)?;
+/// For a run of the sibling pair `pair`: the bare repository of the main checkout, `bare`, and of each sibling, each
+/// said as created, a failure naming its repo. Nothing inside the work folder, which only a run changes.
+fn ready_bares(git: &Git, bare: &str, pair: &Pair, console: &mut Console) -> Result<(), Failed> {
+    create_bare(git, bare, Some(pair.leaf()), console)?;
     for sibling in pair.siblings() {
-        create_bare(&git, sibling.bare(), Some(sibling.name()), console)?;
+        create_bare(git, sibling.bare(), Some(sibling.name()), console)?;
     }
     Ok(())
 }
@@ -406,17 +444,60 @@ fn create_folder(folder: &Path) -> Result<(), Failed> {
 /// Creates the bare repository `bare` when it is missing or lacks what `git init --bare` makes ([`is_whole_bare`]), as
 /// one an `init` cut short leaves, said as created; a failure's line names the repo `name` on a pair run
 /// ([`failed_for`]). A write of the shared bare repository, which a gone client does not cut short
-/// ([`GitClass::ShortBare`]).
+/// ([`GitClass::ShortBare`]). The repair runs under the bare's own lock, `{bare}.lock` ([`run::take_lock`], never
+/// deleted), since every key of the repo shares the bare: one another preflight holds is waited for, opened again every
+/// [`BARE_LOCK_POLL`] up to [`BARE_LOCK_WAIT`], and the bare is looked at again once it is taken.
 fn create_bare(git: &Git, bare: &str, name: Option<&str>, console: &mut Console) -> Result<(), Failed> {
-    if !is_whole_bare(Path::new(bare)) {
-        let step = "git init --bare";
-        unlock_half_made_bare(Path::new(bare))
-            .map_err(|why| failed_for(Failed::without_status(format!("gate: remote {step} failed: {why}")), step, name))?;
-        git.step(&for_repo(step, name), &["init", "--bare", "-q", "--", bare], GitClass::ShortBare, console)
-            .map_err(|failed| failed_for(failed, step, name))?;
-        stamping::out(console, &format!("gate: remote created {bare}"));
+    if is_whole_bare(Path::new(bare)) {
+        return Ok(());
     }
+    let lock = format!("{bare}.lock");
+    let held = lock_waited(
+        || run::take_lock(&lock, "bare lock", Stamp::NoUse, console),
+        BARE_LOCK_WAIT,
+        BARE_LOCK_POLL,
+    )
+    .map_err(Failed::without_status)?;
+    let Some(_held) = held else {
+        return Err(Failed::without_status(format!(
+            "gate: remote {bare} is being made by another preflight and was not whole within {} s",
+            BARE_LOCK_WAIT.as_secs()
+        )));
+    };
+    // The preflight that held the lock may have made it.
+    if is_whole_bare(Path::new(bare)) {
+        return Ok(());
+    }
+    let step = "git init --bare";
+    unlock_half_made_bare(Path::new(bare))
+        .map_err(|why| failed_for(Failed::without_status(format!("gate: remote {step} failed: {why}")), step, name))?;
+    git.step(&for_repo(step, name), &["init", "--bare", "-q", "--", bare], GitClass::ShortBare, console)
+        .map_err(|failed| failed_for(failed, step, name))?;
+    stamping::out(console, &format!("gate: remote created {bare}"));
     Ok(())
+}
+
+/// How often a preflight opens a bare repository's lock again while another preflight holds it ([`create_bare`]).
+const BARE_LOCK_POLL: Duration = Duration::from_millis(100);
+
+/// How long a preflight waits for a bare repository's lock another preflight holds ([`create_bare`]): the holder's
+/// `git init --bare` bound, [`GIT_SHORT_LIMIT`], and a margin, so a holder whose init takes nearly its whole bound
+/// still lets the waiter find the bare whole.
+const BARE_LOCK_WAIT: Duration = GIT_SHORT_LIMIT.saturating_add(Duration::from_secs(30));
+
+/// What `open` gives once it gives a held lock, opened again every `poll` while it says the lock is held (`Ok(None)`),
+/// until `bound` has passed: `Ok(None)` when the lock was still held then; an open's error as it came.
+fn lock_waited<T>(mut open: impl FnMut() -> Result<Option<T>, String>, bound: Duration, poll: Duration) -> Result<Option<T>, String> {
+    let deadline = Instant::now() + bound;
+    loop {
+        if let Some(held) = open()? {
+            return Ok(Some(held));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(poll);
+    }
 }
 
 /// Removes the `HEAD.lock` and `config.lock` an `init` cut short can leave in the root of the bare repository `bare`
@@ -479,7 +560,7 @@ impl TreeGit for Git {
         self.alone(args, step, &streams, console).map(|ran| ran.code)
     }
 
-    /// The preflight takes no lock.
+    /// The preflight's hold of the work folder's lock only guards its writes: it repairs nothing through a link.
     fn holds_the_lock(&self) -> bool {
         false
     }
@@ -1611,7 +1692,7 @@ mod tests {
 
     use super::{
         Bound, Git, GitClass, GitFailure, GitStep, Shared, Streams, TreeAt, fresh_config, fresh_config_written, git_failed, git_launch, git_ran,
-        readers, ready_tree, refused_folders, replace_config, waited,
+        lock_waited, readers, ready_tree, refused_folders, replace_config, waited,
     };
     use crate::boxside::forward::{ClientGone, OutputLock};
     use crate::boxside::helper_trusted;
@@ -1636,6 +1717,37 @@ mod tests {
             "{:?}",
             command.get_envs().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn the_bare_lock_wait_takes_the_lock_once_it_is_free() {
+        let mut calls = 0;
+
+        let taken = lock_waited(
+            || {
+                calls += 1;
+                Ok((calls == 3).then_some(calls))
+            },
+            Duration::from_hours(1),
+            Duration::ZERO,
+        );
+
+        assert_eq!(taken, Ok(Some(3)));
+        assert_eq!(calls, 3, "the lock is opened until it is taken, and no more");
+    }
+
+    #[test]
+    fn the_bare_lock_wait_gives_up_after_its_bound() {
+        let taken = lock_waited(|| Ok(None::<()>), Duration::ZERO, Duration::ZERO);
+
+        assert_eq!(taken, Ok(None));
+    }
+
+    #[test]
+    fn the_bare_lock_wait_passes_an_open_error_on() {
+        let taken = lock_waited(|| Err::<Option<()>, _>("cannot open".to_owned()), Duration::from_hours(1), Duration::ZERO);
+
+        assert_eq!(taken, Err("cannot open".to_owned()));
     }
 
     #[test]

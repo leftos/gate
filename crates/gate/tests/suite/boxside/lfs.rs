@@ -296,6 +296,7 @@ fn an_unprotected_store_lock_refuses_the_lfs_route() {
 fn a_work_folder_lock_that_cannot_be_opened_is_tagged_lfs() {
     let case = Case::new("box_lfs_lock_unopened");
     let payload = lfs_payload(&case);
+    fs::remove_file(field(&payload, "Lock")).expect("the lock the preflight made can be removed");
     fs::create_dir_all(field(&payload, "Lock")).expect("a folder can stand at the lock's path");
 
     let outcome = diff(&case, &payload, &[A]);

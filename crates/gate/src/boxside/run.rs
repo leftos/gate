@@ -594,7 +594,7 @@ pub(crate) fn run(payload: &Payload, seams: &BoxSeams, console: &mut Console) ->
     };
     // Held until the run returns; the command does not inherit it, so no process it leaves running keeps the work
     // folder busy.
-    let _lock = match take_lock(request.lock) {
+    let _lock = match take_lock(request.lock, WORK_LOCK, Stamp::Use, console) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
             stamping::protocol(console, &refused_line(request.nonce, Refusal::Busy));
@@ -1565,10 +1565,39 @@ fn write_layout(record: &str, layout: &str) -> Result<(), NotLaidOut> {
     tools::write_record_file(record, layout).map_err(|error| NotLaidOut::Refused(format!("cannot write {record}: {error}")))
 }
 
-/// The work folder's lock: `path` opened for reading and writing, created when missing, shared with no one, never
-/// through a link, and only as a plain disk file. `None` when another process has it open; else the line saying why it
-/// could not be opened.
-pub(super) fn take_lock(path: &str) -> Result<Option<File>, String> {
+/// The name the lines of [`take_lock`] give the work folder's lock.
+pub(super) const WORK_LOCK: &str = "work folder lock";
+
+/// Whether a take of the work folder's lock ([`take_lock`]) writes the lock's last-write time, which the prune reads as
+/// one sign of when the work folder was last used.
+pub(super) enum Stamp {
+    /// The lock's last-write time is set to now when it is taken and again when it is let go.
+    Use,
+    /// The lock's last-write time is left as it was.
+    NoUse,
+}
+
+/// The work folder's lock, held until dropped; with [`Stamp::Use`], dropping it sets the lock's last-write time to now.
+pub(super) struct HeldWorkLock {
+    file: File,
+    stamp: Stamp,
+}
+
+impl Drop for HeldWorkLock {
+    fn drop(&mut self) {
+        if matches!(self.stamp, Stamp::Use) {
+            // A failed stamp here is safe to leave unsaid: the prune reads the work folder's idleness as the newest of
+            // the lock's time and the records the run wrote, so the lock keeps the stamp its take wrote.
+            drop(self.file.set_modified(SystemTime::now()));
+        }
+    }
+}
+
+/// A lock file, the work folder's or a bare repository's: `path` opened for reading and writing, created when missing,
+/// shared with no one, never through a link, and only as a plain disk file. With [`Stamp::Use`], the lock's last-write
+/// time is set to now once it is taken, and a stamp that fails is said on `console` and the lock still held. `None`
+/// when another process has it open; else the line saying why it could not be opened. Both lines call the lock `name`.
+pub(super) fn take_lock(path: &str, name: &str, stamp: Stamp, console: &mut Console) -> Result<Option<HeldWorkLock>, String> {
     let opened = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1577,9 +1606,17 @@ pub(super) fn take_lock(path: &str) -> Result<Option<File>, String> {
         .share_mode(0)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path);
-    let cannot = |error: io::Error| format!("gate: remote could not open the work folder lock {path}: {error}");
+    let cannot = |error: io::Error| format!("gate: remote could not open the {name} {path}: {error}");
     match opened {
-        Ok(lock) => gate_win32::check_plain_file(&lock).map(|()| Some(lock)).map_err(cannot),
+        Ok(lock) => {
+            gate_win32::check_plain_file(&lock).map_err(cannot)?;
+            if matches!(stamp, Stamp::Use)
+                && let Err(error) = lock.set_modified(SystemTime::now())
+            {
+                stamping::err(console, &format!("gate: remote could not stamp the {name} {path}: {error}"));
+            }
+            Ok(Some(HeldWorkLock { file: lock, stamp }))
+        }
         Err(error) if matches!(error.raw_os_error(), Some(SHARING_VIOLATION | LOCK_VIOLATION)) => Ok(None),
         Err(error) => Err(cannot(error)),
     }

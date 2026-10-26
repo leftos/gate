@@ -390,7 +390,7 @@ pub(super) fn locked<T>(
     console: &mut Console,
     step: impl FnOnce(&File, &mut Console) -> Result<T, String>,
 ) -> Result<Result<T, String>, u32> {
-    let _lock = match run::take_lock(asked.lock) {
+    let _lock = match run::take_lock(asked.lock, run::WORK_LOCK, run::Stamp::Use, console) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
             stamping::protocol(console, &tagged_line(asked.nonce, Refusal::Busy));

@@ -1884,11 +1884,15 @@ fn check_builder_says_the_folders_its_preflight_created() {
         names.sort();
         names
     };
-    assert_eq!(entries(&builder_root(&case)), ["app.git", "work"]);
+    assert_eq!(
+        entries(&builder_root(&case)),
+        ["app.git", "app.git.lock", "work"],
+        "the bare and the lock of its making"
+    );
     assert_eq!(
         entries(&builder_root(&case).join("work")),
-        [key(&case)],
-        "the work folder of the run's key alone"
+        [key(&case), format!("{}.lock", key(&case))],
+        "the work folder of the run's key and its lock alone"
     );
 }
 

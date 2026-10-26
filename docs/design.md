@@ -3072,7 +3072,9 @@ Built verbs:
 
   Any other config, or one it cannot take, gets its lock deleted and the git steps run as before (`config --get remote.origin.url`, `remote add`, two `config` calls).
 
-  Apart from that config write, the preflight takes no lock, so a link, a junction or a file at the tree's `.git`, `.git\objects` or `.git\objects\info`, or anything but a file at `.git\config`, is never followed: it readies nothing there (no git step, nothing written) and the run repairs it under the lock.
+  The preflight takes the work-folder lock `{Work}.lock` (made when missing, its write time never stamped) around its reads of `.layout`, `.warm` and `.command` and its writes inside the work folder, and lets it go before its SDK and tool probes. A lock another process holds leaves the work folder alone: it writes nothing there, exits 0 and still prints `gate: remote new work tree` when `.git\HEAD` is missing, and the run that follows is refused `busy`. A lock that cannot be opened (a folder, a link) prints `gate: remote could not open the work folder lock <path>: <error>` on stderr and exits 0, with nothing written there either.
+
+  A link, a junction or a file at the tree's `.git`, `.git\objects` or `.git\objects\info`, or anything but a file at `.git\config`, is never followed: the preflight readies nothing there (no git step, nothing written) and the run repairs it under the lock.
 
   It readies the work folder's repository only when the folder's layout record says a run of one repo or is missing; a record that says a pair, `changing`, or cannot be read leaves the folder to the run.
 
@@ -3108,6 +3110,8 @@ Built verbs:
   A lock another handle holds open is skipped, and the git that needs it reports it. A folder at a lock's name is left and refuses the run (75) with `<path> is a folder where git's lock file goes`.
 
   A bare repository that is missing its `HEAD`, `objects` or `refs`, or a tree whose `.git` holds no `HEAD`, is initialised again, said as `gate: remote created <Bare>`. Before it re-initialises a bare with no `HEAD`, the box removes the bare's root `HEAD.lock` and `config.lock` the same way (the only names in a bare's root it removes); a folder at either fails the step `gate: remote git init --bare failed: <why>` with status 1.
+
+  That repair runs under the bare's own lock `{root}\{repo}.git.lock`, a file beside the bare that the preflight opens with no sharing and never deletes, since every key of the repo shares the bare and the work-folder lock is the key's. The bare is checked whole before the lock, and again once it is taken (a preflight that held the lock may have made it), then the lock removal and `git init --bare` follow. A lock another preflight holds is opened again every 100 ms up to the short git bound plus 30 s (330 s), then the preflight fails `gate: remote <bare> is being made by another preflight and was not whole within 330 s`. A whole bare takes no lock.
 
   A folder or file that cannot be made prints `gate: remote could not create the folder <path>: <error>` or `gate: remote could not write <path>: <error>` and exits 1. An SDK list that cannot be read prints `gate: remote could not read the SDK list: <message>`, omits the sdks line and still exits 0; the client then skips the parity check.
 
@@ -3259,6 +3263,8 @@ Built verbs:
   `Key` is `[A-Za-z0-9_-]+` and is the last name of `Work`; `Job` is `Local\gate-remote-<Key>-<12 hex digits>`. `run`, `stop` and `preflight` check the key; `run` and `stop` check the job.
 
   The lock `<Work>.lock` is opened with no sharing and without following links, must be a plain disk file, and is held for the run's life; a held lock prints `gate-remote-refused: <nonce> busy` then `gate: remote work folder <key> is busy` and exits 75. A lock that cannot be opened prints `gate: remote could not open the work folder lock <path>: <error>` and exits 1.
+
+  A run, `inputs` and `lfs` set the lock file's last-write time to now when they take it and again when they let it go, so the prune reads the last take or release as use; a stamp that fails at the take prints `gate: remote could not stamp the work folder lock <path>: <error>` and the run goes on. The preflight takes the lock without stamping it.
 
   `Work` must not end with a separator (`gate: box payload Work must not end with a separator: <work>`, exit 2). Every git call in a tree passes `-c core.hooksPath=<Lock>\hooks -c core.fsmonitor=false`, a hooks path that cannot exist while the box holds the lock, so a repository's own hooks (one a build installed) never run in the box's git; fetch and push name the repo's bare repository by its path, never `origin`.
 
@@ -3762,7 +3768,7 @@ Built verbs:
 
   The `root`, `{root}\work` and `{root}\pruned` must each be a plain folder, else `gate: remote could not prune: <path> is not a plain folder` and exit 1; a folder it cannot list prints `gate: remote cannot list <path>: <error>` and exits 1. Leftovers in `pruned` are deleted at the start of each sweep, and one that cannot be removed prints `gate: remote could not remove the pruned folder <path>: <error>`.
 
-  For each key under `work` it takes `{key}.lock` (a lock it cannot open prints `gate: remote could not open the work folder lock <path>: <error>`), so a key whose lock a run or a sweep holds is kept, and `inflight` does not see a key whose lock a sweep holds. Idleness is the newest write time among the folder, each tree's `.git\FETCH_HEAD`, the key's records and the lock's prior write time.
+  For each key under `work` it takes `{key}.lock` (a lock it cannot open prints `gate: remote could not open the work folder lock <path>: <error>`), so a key whose lock a run or a sweep holds is kept, and `inflight` does not see a key whose lock a sweep holds. Idleness is the newest write time among the folder, each tree's `.git\FETCH_HEAD`, the key's records and the lock's write time (the stamp of the last take or release by a run, `inputs` or `lfs`).
 
   A key idle for over 24 hours loses its records in this order: `.layout` is written as `changing` first; `.warm`, `.packages`, `.tools`, `.inputs`, `.sent-build` and `.command` are removed; the folder is renamed by handle into `{root}\pruned\{key}-{pid}-{nanos}`; `.layout` and `.index` are removed. The lock is released and the renamed folder is deleted through its handle. The `.lock` file stays.
 
