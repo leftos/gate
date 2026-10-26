@@ -4,7 +4,7 @@
 
 ## Do first
 
-- [ ] GATE-787 Make diagnostics::a_kill_writes_its_diagnostics_to_the_log_before_the_kill_line hold under load — Urgent · Local gate
+- [ ] GATE-791 Count an exiting process as stopped in gate stop-tree, not as access denied — Urgent · Local gate
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [/] GATE-696 Cross-build Windows outputs on a macOS builder and bring them back — Urgent · Remote
 - [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root — High · Remote
@@ -21,7 +21,6 @@
 - [ ] GATE-563 Builder drain 2: make a routed run wait on its PC for the lift — High · Remote
 - [ ] GATE-564 Builder drain 3: gate drain on the PC, and its docs — High · Remote
 - [ ] GATE-572 Refuse routing when the builder's work drive is under a free-space floor — High · Remote
-- [ ] GATE-600 Print a routed run's command tail once, not twice — High · Remote
 - [ ] GATE-621 Ask for a full outputs send when a worktree's routed runs switch builder — High · Remote
 - [ ] GATE-639 Test the macOS snapshot from a subfolder and list the repo once per decision — High · Remote
 - [ ] GATE-640 Refuse a macOS builder root holding ':' when remote.json is read — High · Remote
@@ -36,7 +35,6 @@
 - [ ] GATE-753 Log every step of a run in the gate's log: start, progress, end and duration — High · Remote
 - [ ] GATE-757 Retry a transfer that fails after a passing routed command, and say the command's verdict — High · Remote
 - [ ] GATE-759 Move the rest of the box's shared wire rules into gate-wire (GATE-616 slices 2, 3, 5, 6) — High · Remote
-- [ ] GATE-788 Bring back a routed dotnet build's own project output, so the PC can launch it — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -51,7 +49,6 @@
 
 ## Remote
 
-- [/] GATE-774 Tighten the Unix box's folder modes, umask, lock owner and git options (sub-issue of GATE-614)
 - [ ] GATE-775 Judge the Unix box's login PATH folders and the folder xcode-select names (sub-issue of GATE-614)
 - [ ] GATE-776 Walk the folders above the Unix box's work root to / (sub-issue of GATE-614)
 - [ ] GATE-777 Pin the Unix box's work root at install and refuse any other (sub-issue of GATE-614)
@@ -61,6 +58,7 @@
 - [ ] GATE-781 Write the Unix box's .git/config whole at layout, under the work lock (sub-issue of GATE-614)
 - [ ] GATE-782 Keep a bare repository's hooks from running on the Unix box's pushes (sub-issue of GATE-614)
 - [ ] GATE-786 Check the Unix box's tree and bare before its lock sweep, and the rest of .git (sub-issue of GATE-614)
+- [ ] GATE-790 Fall back, not fail, on a leftover hard link or foreign entry at the Unix box's work lock (sub-issue of GATE-614)
 - [ ] GATE-663 Keep the Unix box's preflight from racing a run's git lock sweep on the same key (sub-issue of GATE-593)
 - [ ] GATE-666 Let the Unix box's stop reach a run between two steps with a stop marker (sub-issue of GATE-593)
 - [ ] GATE-667 Keep the Unix box's stop under the client's stop limit when it follows several groups (sub-issue of GATE-593)
