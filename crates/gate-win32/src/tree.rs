@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use proc_table::win32::OwnedHandle;
+use windows_sys::Wdk::System::Threading::NtTerminateProcess;
 use windows_sys::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_SUCCESS, LocalFree, NTSTATUS, STATUS_OBJECT_TYPE_MISMATCH,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_SUCCESS, LocalFree, NTSTATUS, RtlNtStatusToDosError,
+    STATUS_OBJECT_TYPE_MISMATCH, STATUS_PROCESS_IS_TERMINATING, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
 use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
@@ -17,7 +18,7 @@ use windows_sys::Win32::System::JobObjects::OpenJobObjectW;
 use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    TerminateProcess, WaitForSingleObject,
+    WaitForSingleObject,
 };
 
 use crate::token::sid_string;
@@ -300,16 +301,35 @@ impl StoppableProcess {
         Ok(code)
     }
 
-    /// Ends the process with `exit_code`.
+    /// Ends the process with `exit_code`: [`Terminated::Now`] when this ended it, [`Terminated::AlreadyEnding`] when it
+    /// was ending already (`STATUS_PROCESS_IS_TERMINATING`), and keeps the code it was ending with.
     ///
     /// # Errors
     ///
-    /// The system's error when it cannot be terminated, as when it is ending already.
-    pub fn terminate(&self, exit_code: u32) -> io::Result<()> {
+    /// The system's error, converted from the NT status, when it cannot be terminated, as when the handle lacks the
+    /// access.
+    pub fn terminate(&self, exit_code: u32) -> io::Result<Terminated> {
         // SAFETY: the handle is open for the whole call, with the `PROCESS_TERMINATE` access the call asks for.
-        let terminated = unsafe { TerminateProcess(self.handle.raw(), exit_code) };
-        if terminated == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+        let status = unsafe { NtTerminateProcess(self.handle.raw(), exit_code.cast_signed()) };
+        match status {
+            STATUS_PROCESS_IS_TERMINATING => Ok(Terminated::AlreadyEnding),
+            _ if status >= 0 => Ok(Terminated::Now),
+            _ => {
+                // SAFETY: the call reads nothing but the status it is given.
+                let code = unsafe { RtlNtStatusToDosError(status) };
+                Err(io::Error::from_raw_os_error(code.cast_signed()))
+            }
+        }
     }
+}
+
+/// What a termination [`StoppableProcess::terminate`] asked for came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Terminated {
+    /// This call ended the process.
+    Now,
+    /// The process was ending already, so this call changed nothing.
+    AlreadyEnding,
 }
 
 /// A process opened to wait for its end, with the access a wait needs and no more: the process that started this one.

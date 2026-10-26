@@ -5,11 +5,8 @@
 use std::io;
 use std::time::Duration;
 
-use gate_win32::{Job, StoppableProcess, win32_message};
+use gate_win32::{Job, StoppableProcess, Terminated, win32_message};
 use jiff::Timestamp;
-
-/// How long a process whose termination failed is given to end before the failure counts.
-pub(crate) const TERMINATE_CHECK: Duration = Duration::from_secs(1);
 
 /// One process, as the snapshot saw it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,8 +19,8 @@ pub(crate) struct Node {
 
 /// What stopping one process came to.
 pub(crate) enum Stop {
-    /// It had ended, ended within its grace, its pid now belongs to another process, or whether it does could not be
-    /// read.
+    /// It had ended, ended within its grace, was ending already, its pid now belongs to another process, or whether it
+    /// does could not be read.
     Gone,
     /// This terminated it.
     Terminated,
@@ -87,8 +84,8 @@ pub(crate) fn open_checked(node: &Node, job: Option<&Job>) -> Opened {
 }
 
 /// Terminates the process `node` with `status` unless it has ended, ends within `grace`, or is not the process the
-/// snapshot saw, or whether it is cannot be read. A failed termination counts as a failure only when the process is
-/// still running [`TERMINATE_CHECK`] later.
+/// snapshot saw, or whether it is cannot be read. A process found ending already is gone, as one that has ended is;
+/// a termination the system refuses is a failure.
 pub(crate) fn stop_process(node: &Node, grace: Duration, status: u32) -> Stop {
     let process = match open_checked(node, None) {
         Opened::Same(process) => process,
@@ -100,8 +97,8 @@ pub(crate) fn stop_process(node: &Node, grace: Duration, status: u32) -> Stop {
         return Stop::Gone;
     }
     match process.terminate(status) {
-        Ok(()) => Stop::Terminated,
-        Err(_) if matches!(process.wait(TERMINATE_CHECK), Ok(true)) => Stop::Gone,
+        Ok(Terminated::Now) => Stop::Terminated,
+        Ok(Terminated::AlreadyEnding) => Stop::Gone,
         Err(error) => Stop::Failed(failure(&format!("TerminateProcess({})", node.pid), &error)),
     }
 }

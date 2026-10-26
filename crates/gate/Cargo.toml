@@ -55,12 +55,14 @@ zstd = "0.14.2"
 # and the crate is test-only.
 object = { version = "0.40.0", default-features = false, features = ["read_core", "pe", "std"] }
 # The MSYS keeper's machine-alone case reads Git's MSYS section (`Wdk_*`, `Win32_Security`, `Win32_System_Memory`,
-# `Win32_System_RemoteDesktop`); the heartbeat's probe tests fill a pipe that does not wait (`Win32_System_Pipes`).
+# `Win32_System_RemoteDesktop`); the heartbeat's probe tests fill a pipe that does not wait (`Win32_System_Pipes`);
+# stop-tree's already-ending case holds a process's exit as its debugger (`Win32_System_Diagnostics_Debug`).
 windows-sys = { version = "0.61.2", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_System_Diagnostics_Debug",
     "Win32_System_JobObjects",
     "Win32_System_Memory",
     "Win32_System_Pipes",

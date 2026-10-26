@@ -143,7 +143,7 @@ It terminates the job of every gate in the tree first, then the tree's processes
 
 A job or process it stops ends with status 124. Gate jobs are found under the resolved [state root](#state-root), named as the job of each gate pid in the tree, so `--state-dir` and `GATE_STATE_DIR` are honoured.
 
-A failed terminate is a failure only if the process is still alive 1 s later. It prints `gate: stopped <n> gate job(s) and <m> process(es) under <pid>` on stdout and each failure as `gate: could not stop: <reason>` on stderr, and exits 0 when nothing failed and 1 when anything did. A gate whose routed run holds an ssh call prints `gate: stopped 0 gate job(s) and 2 process(es) under <pid>`: the ssh call's job is anonymous, so stop-tree ends ssh by pid.
+A process found already ending (the system answers `STATUS_PROCESS_IS_TERMINATING`) counts as gone, not as stopped or failed, so a tree holding one exits 0 with only the summary line. A terminate the system refuses is a failure at once (`Access is denied` is Win32 error 5). It prints `gate: stopped <n> gate job(s) and <m> process(es) under <pid>` on stdout and each failure as `gate: could not stop: <reason>` on stderr, and exits 0 when nothing failed and 1 when anything did. A gate whose routed run holds an ssh call prints `gate: stopped 0 gate job(s) and 2 process(es) under <pid>`: the ssh call's job is anonymous, so stop-tree ends ssh by pid.
 
 A reason reads `<Op>(<arg>) failed with Win32 error <n>: <message>`, where `<Op>` is `OpenJobObjectW`, `TerminateJobObject`, `OpenProcess` or `TerminateProcess`, or `listing the processes of <job name> failed: QueryInformationJobObject failed with Win32 error <n>: <message>`.
 

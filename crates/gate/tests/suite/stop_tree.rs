@@ -1,13 +1,23 @@
 //! `gate stop-tree`: a gate and its command's processes stopped, a process only the gate's job still reaches, a tree
-//! with no gate in it, a pid no live process has, and a case's own drop ending the command its gate left.
+//! with no gate in it, a pid no live process has, a process already ending counted as stopped, and a case's own drop
+//! ending the command its gate left.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use jiff::Timestamp;
 use proc_table::{ProcessTable as _, ProcessTree, Win32ProcessTable};
 use regex::Regex;
+use windows_sys::Win32::Foundation::{CloseHandle, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    CREATE_PROCESS_DEBUG_EVENT, ContinueDebugEvent, DEBUG_EVENT, DebugActiveProcess, DebugSetProcessKillOnExit, EXCEPTION_DEBUG_EVENT,
+    EXIT_PROCESS_DEBUG_EVENT, LOAD_DLL_DEBUG_EVENT, WaitForDebugEvent,
+};
+use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 
 use crate::support::{Case, FAKE_TOOL, USAGE, log_texts, run_words, said_pid, shown, start, wait_until, wait_until_closed};
 
@@ -198,4 +208,116 @@ fn stop_tree_of_a_dead_pid_is_a_usage_error() {
     assert_eq!(outcome.code, Some(2), "{outcome:?}");
     assert_eq!(outcome.stdout, "");
     assert_eq!(outcome.stderr, format!("gate: stop-tree: no live process has the id {pid}\n{USAGE}"));
+}
+
+/// How long the exit hold waits for any one debug event or release before it fails as hung.
+const EXIT_HOLD_GUARD: Duration = Duration::from_secs(600);
+const STATUS_BREAKPOINT: u32 = 0x8000_0003;
+
+/// A process's end held open as its debugger holds it: every debug event but its exit is continued, and the exit is
+/// held until this is dropped, so meanwhile the process is ending, listed, and its handle unsignalled.
+struct ExitHeld {
+    release: Option<mpsc::Sender<()>>,
+    debugger: Option<thread::JoinHandle<()>>,
+}
+
+impl ExitHeld {
+    /// Attaches to `pid`, ends it with `status`, and returns once its exit is held.
+    fn end_and_hold(pid: u32, status: u32) -> ExitHeld {
+        let (attached_tx, attached) = mpsc::channel();
+        let (held_tx, held) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let debugger = thread::spawn(move || hold_exit(pid, &attached_tx, &held_tx, &released));
+        attached
+            .recv_timeout(EXIT_HOLD_GUARD)
+            .expect("the case attaches as the process's debugger");
+        // SAFETY: takes no pointers; a null handle fails the assert below.
+        let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        assert!(!process.is_null(), "the case opens {pid} to end it");
+        // SAFETY: `process` is open with PROCESS_TERMINATE and closed right after.
+        let ended = unsafe { TerminateProcess(process, status) };
+        // SAFETY: as above.
+        unsafe { CloseHandle(process) };
+        assert_ne!(ended, 0, "the case ends {pid}, as a job's termination does");
+        held.recv_timeout(EXIT_HOLD_GUARD).expect("the process's exit is held");
+        ExitHeld {
+            release: Some(release),
+            debugger: Some(debugger),
+        }
+    }
+}
+
+impl Drop for ExitHeld {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(debugger) = self.debugger.take() {
+            let _ = debugger.join();
+        }
+    }
+}
+
+fn hold_exit(pid: u32, attached: &mpsc::Sender<()>, held: &mpsc::Sender<()>, released: &mpsc::Receiver<()>) {
+    // SAFETY: takes no pointers; this thread is the debugger and waits for the events below.
+    assert_ne!(unsafe { DebugActiveProcess(pid) }, 0, "attach to {pid}");
+    // SAFETY: takes no pointers; this thread's end detaches rather than kills.
+    unsafe { DebugSetProcessKillOnExit(0) };
+    attached.send(()).expect("the case waits for the attach");
+    let guard = u32::try_from(EXIT_HOLD_GUARD.as_millis()).expect("the guard fits a u32");
+    loop {
+        let mut event = DEBUG_EVENT::default();
+        // SAFETY: `event` is a writable DEBUG_EVENT that outlives the call.
+        assert_ne!(
+            unsafe { WaitForDebugEvent(&raw mut event, guard) },
+            0,
+            "no debug event from {pid} within the hang guard"
+        );
+        // SAFETY: the union member read is the one the event code names; the file handles are the debugger's to close.
+        unsafe {
+            match event.dwDebugEventCode {
+                CREATE_PROCESS_DEBUG_EVENT => CloseHandle(event.u.CreateProcessInfo.hFile),
+                LOAD_DLL_DEBUG_EVENT => CloseHandle(event.u.LoadDll.hFile),
+                _ => 0,
+            };
+        }
+        if event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT {
+            held.send(()).expect("the case waits for the hold");
+            // A release, or a case that failed and dropped its sender, lets the exit go.
+            let _ = released.recv_timeout(EXIT_HOLD_GUARD);
+            // SAFETY: continues the event this thread received.
+            unsafe { ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE) };
+            return;
+        }
+        // SAFETY: the exception member is the one an exception event carries.
+        let foreign = event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT
+            && unsafe { event.u.Exception.ExceptionRecord.ExceptionCode }.cast_unsigned() != STATUS_BREAKPOINT;
+        let status = if foreign { DBG_EXCEPTION_NOT_HANDLED } else { DBG_CONTINUE };
+        // SAFETY: continues the event this thread received.
+        unsafe { ContinueDebugEvent(event.dwProcessId, event.dwThreadId, status) };
+    }
+}
+
+#[test]
+fn stop_tree_counts_a_process_already_ending_as_stopped() {
+    let case = Case::new("stop_tree_counts_a_process_already_ending_as_stopped");
+    let go = case.folder().join("go");
+    let _let_go = LetGo(go.clone());
+    let go = shown(&go);
+    let mut command = Command::new(FAKE_TOOL);
+    command.args(["err", "up", "wait", &go]);
+    let tool = start(command);
+    tool.wait_for_stderr("up");
+    let pid = tool.id();
+    let held = ExitHeld::end_and_hold(pid, 7);
+
+    let outcome = case.run(&["stop-tree", &pid.to_string()]);
+    drop(held);
+    let ended = tool.finish();
+
+    assert_eq!((outcome.code, outcome.stderr.as_str()), (Some(0), ""), "{outcome:?}");
+    assert_eq!(
+        outcome.stdout,
+        format!("gate: stopped 0 gate job(s) and 0 process(es) under {pid}\n"),
+        "an already-ending process counts as gone, not as stopped"
+    );
+    assert_eq!(ended.code, Some(7), "it ends with the status it was already ending with: {ended:?}");
 }

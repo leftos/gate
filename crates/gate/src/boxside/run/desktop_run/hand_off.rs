@@ -799,7 +799,8 @@ impl SweptProcess for StoppableProcess {
     }
 
     fn terminate(&self, exit_code: u32) -> io::Result<()> {
-        StoppableProcess::terminate(self, exit_code)
+        // A process found ending already is being ended, as one this terminated is.
+        StoppableProcess::terminate(self, exit_code).map(|_| ())
     }
 
     fn wait(&self, bound: Duration) -> io::Result<bool> {

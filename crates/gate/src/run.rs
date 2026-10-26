@@ -67,7 +67,7 @@ use crate::resolve::{Environment, ResolvedRoot};
 use crate::restore::{self, NotRestoring, RestorePlan};
 use crate::route::{self, Placed};
 use crate::slots::{self, BuilderPool, ClaimOf, LendMarker, Pool, Survey, Taken, Takes, ThisGate, epoch_ms};
-use crate::stopping::{TERMINATE_CHECK, failure};
+use crate::stopping::failure;
 use crate::wait::{self, Arrival, Host, UnderParent, Wait, Waited};
 use crate::warm;
 use crate::watch::{Start, Watched, Watcher, Watching};
@@ -3621,10 +3621,13 @@ fn by_start<T>(started: Vec<((u32, T), Origin)>, tree: &ProcessTree) -> ByStart<
     }
 }
 
+/// How long a process whose termination failed is given to end before the failure counts.
+const TERMINATE_CHECK: Duration = Duration::from_secs(1);
+
 /// Terminates every one of `doomed`, then gives them [`TERMINATE_CHECK`] together, from the first wait, to leave the
 /// job before the next pass lists it, each wait taking what is left of that time ([`escaped::wait_left`]). A process
-/// that refused the terminate is added to `problems` only when its wait has not seen it end, as one that was ending
-/// already refuses it and is not a failure once it has ended.
+/// that was ending already counts as terminated; one that refused the terminate is added to `problems` only when its
+/// wait has not seen it end.
 fn end_and_wait(doomed: &[(u32, impl Endable)], problems: &mut Vec<String>) {
     let refusals: Vec<Option<io::Error>> = doomed.iter().map(|(_, process)| process.terminate(STOPPED).err()).collect();
     let mut deadline = None;
@@ -3651,7 +3654,8 @@ trait Endable {
 
 impl Endable for StoppableProcess {
     fn terminate(&self, status: u32) -> io::Result<()> {
-        StoppableProcess::terminate(self, status)
+        // A process found ending already counts as terminated.
+        StoppableProcess::terminate(self, status).map(|_| ())
     }
 
     fn wait(&self, timeout: Duration) -> io::Result<bool> {

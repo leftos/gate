@@ -323,7 +323,8 @@ impl Ending<'_> {
         if is_gate(&process.image) {
             self.stop_gate_job(process);
         }
-        handle.terminate(self.status)
+        // A process found ending already counts as terminated.
+        handle.terminate(self.status).map(|_| ())
     }
 
     /// Terminates the job of the gate `gate`, named as `gate stop-tree` names it; a gate with no such job has none.
