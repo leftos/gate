@@ -3,8 +3,9 @@
 //! each tree's `.git/FETCH_HEAD` (every run fetches into each tree it checks out) and the key's records. A key's work
 //! folder `<root>/work/<key>` goes only with its lock `<root>/work/<key>.lock` held, so no run is using it and none can
 //! start in it meanwhile (one that tries is refused busy, status 75, and its PC runs the command itself); a key whose
-//! lock is held is kept, and so is one whose recorded process group, a git step's `<key>.pgid` or a tool restore's
-//! `<key>.tools.pgid`, is still the one its run made, as a run refuses `busy` for it.
+//! lock is held is kept, and so is one whose recorded process group, a git step's `<key>.pgid`, a tool restore's
+//! `<key>.tools.pgid` or a package restore's `<key>.packages.pgid`, is still the one its run made, as a run refuses
+//! `busy` for it.
 //! The folder's layout record is marked changing and its other records removed first, then the folder is renamed into
 //! `<root>/pruned` under the lock, so no run ever sees it half removed, and its layout and index records go once it is
 //! there; a rename that fails leaves the layout marked changing, so the next run clears the folder whole. The folder is
@@ -43,7 +44,7 @@ use crate::stop::{Record, own_group, record_current, records_folder, unusable_re
 /// How long a work folder goes unused before a sweep removes it.
 const IDLE_AGE: Duration = Duration::from_hours(24);
 /// The extensions of the files beside a work folder `<key>` named `<key>.<extension>`: its lock and its records.
-const KEY_FILES: [&str; 12] = [
+const KEY_FILES: [&str; 13] = [
     "lock",
     "warm",
     "layout",
@@ -55,13 +56,24 @@ const KEY_FILES: [&str; 12] = [
     "command",
     "pgid",
     "tools.pgid",
+    "packages.pgid",
     "index.lock",
 ];
-/// The records naming a run's process group: its git step's and its tool restore's.
-const GROUP_RECORDS: [&str; 2] = ["pgid", "tools.pgid"];
+/// The records naming a run's process group: its git step's, its tool restore's and its package restore's.
+const GROUP_RECORDS: [&str; 3] = ["pgid", "tools.pgid", "packages.pgid"];
 /// The records a sweep removes before it renames the work folder aside, in the order the box clears them, then the
 /// group records; `command` is the interrupted-command record, cleared like the others.
-const RECORDS_BEFORE: [&str; 8] = ["warm", "packages", "tools", "inputs", "sent-build", "command", "pgid", "tools.pgid"];
+const RECORDS_BEFORE: [&str; 9] = [
+    "warm",
+    "packages",
+    "tools",
+    "inputs",
+    "sent-build",
+    "command",
+    "pgid",
+    "tools.pgid",
+    "packages.pgid",
+];
 /// The records a sweep removes once the work folder is renamed aside: the layout, marked changing until then, the
 /// index and git's lock on it. The lock stays.
 const RECORDS_AFTER: [&str; 3] = ["layout", "index", "index.lock"];
@@ -1329,12 +1341,16 @@ mod tests {
         let group = i32::try_from(ended_group()).expect("a pid is a pid_t");
         let record = case.record("pgid", &job_record_text("job", group, own_session(), (1, 0)), TWO_DAYS);
         let tools = case.record("tools.pgid", "not a record", TWO_DAYS);
+        let packages = case.record("packages.pgid", "not a record", TWO_DAYS);
 
         let (status, console) = case.sweep();
 
         assert_eq!(status, 0, "{:?}", console.err);
         assert_eq!(console.out, [format!("gate: remote pruned {KEY}: idle 48 h"), summary(1, 1)]);
-        assert!(!record.exists() && !tools.exists(), "a stale and a malformed record go with the key");
+        assert!(
+            !record.exists() && !tools.exists() && !packages.exists(),
+            "a stale and a malformed record go with the key"
+        );
     }
 
     #[test]
@@ -1450,6 +1466,7 @@ mod tests {
             ("command", "c"),
             ("layout", "single"),
             ("tools.pgid", "x"),
+            ("packages.pgid", "x"),
             ("index.lock", "l"),
         ] {
             case.record(extension, text, Duration::ZERO);
@@ -2054,6 +2071,7 @@ mod tests {
     #[test]
     fn a_key_s_records_are_named_by_the_part_before_the_first_dot() {
         assert_eq!(key_file_stem("k.tools.pgid"), Some("k"));
+        assert_eq!(key_file_stem("k.packages.pgid"), Some("k"));
         assert_eq!(key_file_stem("k.INDEX.lock"), Some("k"));
         assert_eq!(key_file_stem("k.layout.gate-new-1-0"), None, "a temp file names no key");
         assert_eq!(key_file_stem("k.nope"), None);

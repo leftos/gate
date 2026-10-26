@@ -3951,7 +3951,7 @@ A missing, disabled or different task is a refusal whose why names the fix.
 
 A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It speaks the box side's wire above, so the PC's client reads both alike: `gate-box --version` prints the same `gate <version>` text, and `gate-box box <verb> --stdin` reads the request as `gate box` does and parses it with `gate-wire` under `PathForm::Unix`. This section lists only where it differs.
 
-- **Verbs.** `preflight`, `boot`, `run`, `stop`, `prune`, `inputs` and `outputs` are built. `run` readies the tree, runs the command under the watch and syncs the tree back (below), in the Windows box's order, the dotnet tool restore (below) included; the pnpm, bun and npm package restores are not built (GATE-648), so a run whose command's program is `pnpm`, `bun`, `bunx`, `npm` or `npx` (its file stem, in any case) is refused `tools` with `gate: remote package restore is not built on this builder`, and the PC retries it on the next builder.
+- **Verbs.** `preflight`, `boot`, `run`, `stop`, `prune`, `inputs` and `outputs` are built. `run` readies the tree, runs the command under the watch and syncs the tree back (below), in the Windows box's order, the dotnet tool restore and the pnpm, bun and npm package restore (below) included.
 
   The run takes `Outputs` and `OutputsFull` and brings outputs back as the Windows box's run does ([The box side](#the-box-side)), through the `outputs` module below. Where it differs: a run with globs reads one more stdin line after the request, the PC's manifest (at most 64 MiB), after the heartbeat starts and before the layout and checkout, and a run without globs reads nothing past the request line.
 
@@ -3989,11 +3989,11 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   `<root>/work` and `<root>/pruned` must be plain folders, else `gate: remote could not prune: <path> is not a plain folder` and exit 1. `pruned` is made at mode 0700 when missing, and what an earlier sweep left in it is removed at the start, links removed as themselves (`gate: remote could not remove the pruned folder <path>: <error>` on stderr for one that stays). A folder that cannot be listed prints `gate: remote cannot list <path>: <error>` and exits 1.
 
-  Per key it takes `<key>.lock` without waiting, so a key a run or another sweep holds is kept. A key whose `<key>.pgid` or `<key>.tools.pgid` still names the group its run made, by the stale-record rules of "The run's git steps" (unknown counts as current), is kept too, as a run refuses `busy` for it; a record naming no live group goes with the key.
+  Per key it takes `<key>.lock` without waiting, so a key a run or another sweep holds is kept. A key whose `<key>.pgid`, `<key>.tools.pgid` or `<key>.packages.pgid` still names the group its run made, by the stale-record rules of "The run's git steps" (unknown counts as current), is kept too, as a run refuses `busy` for it; a record naming no live group goes with the key.
 
   A lock the age prune cannot open prints `gate: remote could not open the work folder lock <path>: <error>`, and the keyed prune that key's could-not line.
 
-  Under the lock, an idle key (or any named key) loses its records in this order: `<key>.layout` is written as `changing`; `.warm`, `.packages`, `.tools`, `.inputs`, `.sent-build`, `.command`, `.pgid` and `.tools.pgid` are removed; the folder is renamed to `<root>/pruned/<key>.<pid>.<nanos>`; then `.layout`, `.index`, `.index.lock` and the temp files of the key's records (`<key>.<name>.gate-new-*`) are removed.
+  Under the lock, an idle key (or any named key) loses its records in this order: `<key>.layout` is written as `changing`; `.warm`, `.packages`, `.tools`, `.inputs`, `.sent-build`, `.command`, `.pgid`, `.tools.pgid` and `.packages.pgid` are removed; the folder is renamed to `<root>/pruned/<key>.<pid>.<nanos>`; then `.layout`, `.index`, `.index.lock` and the temp files of the key's records (`<key>.<name>.gate-new-*`) are removed.
 
   The lock is let go and the renamed folder deleted. A key with no folder has its records removed. A failed rename leaves `.layout` reading `changing`, so the next run clears the folder whole.
 
@@ -4009,10 +4009,11 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   |---|---|---|
   | `<key>` | the work folder (trees; a pair's trees in `<key>/<leaf>` and `<key>/<name>`) | renames aside, deletes |
   | `<key>.lock` | the work lock | keeps; the keyed prune removes one it made |
-  | `<key>.pgid`, `<key>.tools.pgid` | the git steps' and the tool restore's process groups | read first (a live group keeps the key), then removes |
+  | `<key>.pgid`, `<key>.tools.pgid`, `<key>.packages.pgid` | the git steps', the tool restore's and the package restore's process groups | read first (a live group keeps the key), then removes |
   | `<key>.command`, `<key>.tools` | the command record, the tool manifests' hash | removes before the rename |
   | `<key>.inputs` | the `inputs` verb's record of installed inputs | removes before the rename |
-  | `<key>.warm`, `<key>.packages`, `<key>.sent-build` | not written by the Unix box (named so a later writer needs no prune change) | removes before the rename |
+  | `<key>.packages` | the package restore's record of the lockfile folders whose install passed | removes before the rename |
+  | `<key>.warm`, `<key>.sent-build` | not written by the Unix box (named so a later writer needs no prune change) | removes before the rename |
   | `<key>.layout` | the layout record (`single`, `pair ...`) | marks `changing`, removes after the rename |
   | `<key>.index`, `<key>.index.lock` | the back commit's copied index and git's lock on it | removes after the rename |
   | `<key>.<name>.gate-new-<pid>-<n>` | a record write cut short | removes after the rename |
@@ -4118,7 +4119,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   The preflight's `ready` makes the same check on a tree's owner and modes (and `commondir`) before any git step: a tree that fails is left alone, not made ready, and the run refuses it `layout`.
 
-  **Umask.** The box runs with umask 077. The routed command, the cross build, the tool restore and git's checkout and clean steps run with umask 022, so checked-out tracked files are 0644 as on the PC.
+  **Umask.** The box runs with umask 077. The routed command, the cross build, the tool restore, the package restore and git's checkout and clean steps run with umask 022, so checked-out tracked files are 0644 as on the PC.
 - **The git program.** Every git step of the box (the preflight's, `run`'s and the back commit's) runs `/usr/bin/git`, macOS's own git, by its absolute path, with every inherited `GIT_*` variable removed and then `GIT_CONFIG_NOSYSTEM=1` set, so a builder with only a Homebrew git still uses Apple's git for the gate's steps and no system config is read.
 
   Each step also gets `-c protocol.allow=never -c protocol.file.allow=always -c submodule.recurse=false -c core.sharedRepository=umask` and `GIT_ALLOW_PROTOCOL=file`, with `--upload-pack` and `--receive-pack` pinned, so only local-path repositories are spoken to and no submodule is followed; the fetch and the back push also get `--no-recurse-submodules`. The checkout and clean steps run with umask 022 (Umask, under Work root).
@@ -4151,7 +4152,11 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 - **The work lock.** The work-folder lock `<Work>.lock` is an exclusive, non-blocking `flock` on a plain file made with mode 0600 and opened `O_NOFOLLOW`; a lock another holds is busy, any other failure an error. The locked file is checked, by device and inode, to be still what the name names, else it is let go and locked again, up to 3 more times. A lock file with more than one hard link is refused: `<path> has <n> hard links, so another name shares its lock: remove <path>`.
 
   A lock file another account owns is refused `layout` (status 75) with `<lock> is not owned by <user>`, whether or not the box can open it, so the PC runs the command itself. The box user's own lock open to others (a group or other bit) is set to 0600 on its descriptor before it is locked.
-- **`stop`** needs a `Work` laid out as above. It judges the root as the preflight does and makes nothing: an untrusted root is the root line with status 1, a linked or foreign `<root>/work` the folder line with status 1, and a missing root or `<root>/work` exits 0 with no output. A run records each git step's process group in `<Work>.pgid` (the job name, the decimal group, the decimal session id and the leader's start as `<sec>.<usec>` with six digits, one per line) and a tool restore's in `<Work>.tools.pgid`; a record that does not name the payload's job (`<Job>-tools` for the second) stops nothing, and neither does a record that is stale (the stale-record rules in "The run's git steps" below): `stop` says nothing, exits 0 and leaves the record, since only a run removes one, under the work lock.
+- **`stop`** needs a `Work` laid out as above. It judges the root as the preflight does and makes nothing: an untrusted root is the root line with status 1, a linked or foreign `<root>/work` the folder line with status 1, and a missing root or `<root>/work` exits 0 with no output.
+
+  A run records each git step's process group in `<Work>.pgid` (the job name, the decimal group, the decimal session id and the leader's start as `<sec>.<usec>` with six digits, one per line) a tool restore's in `<Work>.tools.pgid` and a package restore's in `<Work>.packages.pgid`.
+
+  A record that does not name the payload's job (`<Job>-tools` for the second, `<Job>-packages` for the third) stops nothing, and neither does a record that is stale (the stale-record rules in "The run's git steps" below): `stop` says nothing, exits 0 and leaves the record, since only a run removes one, under the work lock.
 
     The group gets `SIGTERM` with `SIGCONT` right after it (so a stopped group takes the TERM), then `SIGKILL` after 10 s, and 2 s more to end; the record is read again before each signal, and a group it no longer names is never signalled.
 
@@ -4224,6 +4229,32 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
   It says `gate: dotnet tool restore took <s> s`. A nonzero exit says `gate: remote tool restore failed (status <n>)`, then the `tools` refusal tag and `gate: remote work folder <key> could not restore its dotnet tools`, and the run ends 75, so the PC runs the command itself. A restore that never started (no `dotnet`, its group record not readied, or the lock lost first) says `gate: remote could not start the dotnet tool restore: <error>`, then the same three lines, status 75.
 
   A restore ended by a signal, a `box stop` among them, says `gate: remote tool restore failed (signal <n>)` and ends 1 with no tag. Status 1 also follows `gate: remote could not read the tool manifest <path>: <error>`, `gate: remote could not place the tool manifest <path> under the work folder <work>`, `gate: remote could not write <Work>.tools: <why>`, `gate: remote could not resolve the work folder <work> or the folder <place>: <error>`, and `gate: remote could not see the dotnet tool restore to its end: <why>`; an unreadable record only notes `gate: remote could not read <Work>.tools: <error>; restoring the tools` and restores. A client gone during it ends 255.
+- **The package restore.** After the tool restore and before the command, `run` installs the packages of a command whose first word's file stem is `pnpm`, `bun`, `bunx`, `npm` or `npx` (any case), by the Windows box's rules ([The box side](#the-box-side)): the same start-folder reading, nearest lockfile, hashes, one-manager-per-folder rule, skips and lines, in the same order.
+
+  The rules live in `packages.rs`, pure and built on every target; the install runs on a Unix machine only. Where it differs from the Windows box's:
+
+  It handles the one command of the request (the Unix box builds no warm-up), runs `pnpm install --frozen-lockfile`, `bun install --frozen-lockfile` or `npm ci --ignore-scripts --no-audit --no-fund` along the login `PATH` with the inherited signal state reset, `CI=true` and `TMPDIR` the run's temp folder, with umask 022 and no time limit, and forwards its output like the tool restore's.
+
+  It has no restricted token and no job: it is the leader of a process group of its own recorded in `<Work>.packages.pgid` (job `<Job>-packages`), so `box stop` ends it (`gate: remote stopped job <Job>-packages`). A live group in `<Work>.packages.pgid` left by an earlier run refuses the next run `busy` (75), and a stale one is removed.
+
+  The record `<Work>.packages` holds the same `{key}\t{hash}` lines (keys `.`, `web`, `bun:web`, `npm:web`, with `/` between folder names), sorted and compared as bytes. It is cleared with `<Work>.warm` and `<Work>.tools` by an interrupted command's record and kept across a layout change. The install is skipped while the folder's line matches and `node_modules` is a real folder.
+
+  A failed or stopped install leaves no line for its folder: its own line is dropped with the other managers' lines for the folder, and the record is written before the install runs, so the next run installs again.
+
+  A `node_modules` that is a link, a file or a fifo is never installed through: the run says `gate: remote <name> install skipped: <place>/node_modules is reached through a link` (at the root, `node_modules is reached through a link`) and the command runs. One that cannot be looked at fails the run with status 1 and `gate: remote could not read the folder <path>: <error>`, and so does a folder on the lockfile walk that cannot be looked at (it does not read as a link).
+
+  A lockfile folder whose relative name is not UTF-8 or holds a control character is skipped with `gate: remote <name> install skipped: <folder> has a name the packages record cannot hold`, and the command runs.
+
+  Package files and lockfiles are read whole up to 256 MiB, and one with more than one name is refused as on the Windows box: `gate: remote could not read the package file <path>: it has <n> names`, the same for `the lockfile`, or `...: it is longer than 268435456 bytes`, with status 1.
+
+  A link at a lockfile's name stops the walk and fails the run on the read (`gate: remote could not read the lockfile <path>: <error>`), as on Windows; a start folder that is a file walks on up.
+
+  A `check-ignore` ended by a signal, a `box stop` among them, ends the run with status 1 and `gate: remote check-ignore failed: git ended with signal <n>`.
+
+  A manager missing from the login `PATH`, or an install that fails, refuses the run 75 with the `tools` tag and `gate: remote work folder <key> could not restore its <name> packages`, the failed install first saying `gate: remote package restore failed (status <n>)`; one ended by a signal says `(signal <n>)` and ends 1 with no tag.
+
+  The other lines are the Windows box's, with `could not start the <name> install: <why>` and `could not see the <name> install to its end: <why>` for the Unix install's own failures; a client gone during it ends 255.
+
 - **The run's git steps.** Each step runs as the leader of a process group of its own. Its output is read by one thread per pipe, which writes each line to the client itself, one write per line, so the thread that waits on git never writes and a stalled client cannot delay a step's bound.
   - **Bound by class.** Fetch, checkout, clean, `lfs checkout` and `add`: 30 min; `push`: long; `commit-tree` and the rest: 5 min. A step past its bound gets `SIGTERM`, then `SIGKILL` after 2 s, to the group.
   - **Ending.** The box learns of the leader's exit without reaping it, judges the group ended only when the leader has exited and the group lists no other process, ends the group's leftovers (`SIGTERM` with `SIGCONT` right after it, `SIGKILL` after 2 s), removes the record, then reaps, so no signal reaches the group after the reap. The step keeps git's status. The drain then waits for the readers, bounded at 30 s from its start. A reader still blocked in a read is a leftover process's and is left behind, with `gate: remote git's output is still held open by a leftover process; stopped reading` on stderr, said only for a step whose output is forwarded; a reader still in a write is held by a client that stopped reading, which counts as gone.

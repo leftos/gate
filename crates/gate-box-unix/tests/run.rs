@@ -414,7 +414,7 @@ mod unix {
             revents: 0,
         };
         // SAFETY: `polled` is one `pollfd` that lives across the call, and its count is passed with it.
-        unsafe { libc::poll(&mut polled, 1, READ_SLICE_MS) != 0 }
+        unsafe { libc::poll(&raw mut polled, 1, READ_SLICE_MS) != 0 }
     }
 
     /// A command that writes `file` and waits until `beaten` is made, so a heartbeat is read while it runs.
@@ -783,6 +783,99 @@ mod unix {
         assert!(ended.out.is_empty(), "the command says nothing on standard output: {:?}", ended.out);
         assert!(ended.err_has(&started_line(NONCE)), "the start marker on standard error: {:?}", ended.err);
         assert!(Path::new(&format!("{}.tools", case.work())).exists(), "the tools record is written");
+        case.ended_clean();
+    }
+
+    /// A login shell for `case` whose `PATH` starts with a folder holding only the runnable `program`, `script` its
+    /// text; the shell's path.
+    fn shell_with_shim(case: &Case, program: &str, script: &str) -> PathBuf {
+        let shims = case.base.join("shims");
+        fs::create_dir_all(&shims).expect("the shim folder is made");
+        runnable(&shims.join(program), script);
+        let shell = case.base.join("login-shell");
+        runnable(
+            &shell,
+            &format!(
+                "#!/bin/sh\nPATH='{}':\"$PATH\"\nexport PATH\nshift\nexec /bin/sh \"$@\"\n",
+                shims.display()
+            ),
+        );
+        shell
+    }
+
+    /// The lines of the shim's log at `log`; none when the shim never wrote it.
+    fn logged(log: &Path) -> Vec<String> {
+        fs::read_to_string(log)
+            .map(|text| text.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    /// The package files of a node project of `lockfile`, its `node_modules` ignored.
+    fn node_project(lockfile: &'static str) -> [(&'static str, &'static str); 3] {
+        [(lockfile, "{}\n"), ("package.json", "{}\n"), (".gitignore", "node_modules/\n")]
+    }
+
+    #[test]
+    fn a_pnpm_run_restores_its_packages_before_the_command_and_skips_them_the_next_time() {
+        let case = Case::new("pnpm");
+        let log = case.base.join("pnpm.log");
+        let shim = format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\nif [ \"$1\" = install ]; then mkdir -p node_modules; fi\n",
+            log.display()
+        );
+        let shell = shell_with_shim(&case, "pnpm", &shim);
+        let commit = case.snapshot_holding(&node_project("pnpm-lock.yaml"));
+        let request = case.request(&commit, &json!({ "Command": ["pnpm", "test"] }));
+        let ended = ran_in(&[], &request, Reading::All, &case.base.join("beaten"), Some(&shell));
+        assert_eq!(ended.status, Some(0), "the command's status: {:?}", ended.err);
+        assert_eq!(logged(&log), ["install --frozen-lockfile", "test"], "the install, then the command");
+        assert!(
+            ended.err_texts().iter().any(|line| line.starts_with("gate: pnpm install took ")),
+            "{:?}",
+            ended.err
+        );
+        let record = fs::read_to_string(format!("{}.packages", case.work())).expect("the packages record is written");
+        assert!(
+            record.lines().any(|line| line
+                .strip_prefix(".\t")
+                .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))),
+            "the work folder's line, a SHA-256 in hex: {record:?}"
+        );
+        case.ended_clean();
+
+        let again = ran_in(&[], &request, Reading::All, &case.base.join("beaten-again"), Some(&shell));
+        assert_eq!(again.status, Some(0), "the command's status: {:?}", again.err);
+        assert_eq!(
+            logged(&log),
+            ["install --frozen-lockfile", "test", "test"],
+            "the command alone, no second install: {:?}",
+            again.err
+        );
+        case.ended_clean();
+    }
+
+    #[test]
+    fn a_failing_npm_install_refuses_the_run_75_with_the_tools_tag_and_never_runs_the_command() {
+        let case = Case::new("npm-fails");
+        let log = case.base.join("npm.log");
+        let shim = format!("#!/bin/sh\nif [ \"$1\" = ci ]; then exit 1; fi\necho \"$*\" >> '{}'\n", log.display());
+        let shell = shell_with_shim(&case, "npm", &shim);
+        let commit = case.snapshot_holding(&node_project("package-lock.json"));
+        let request = case.request(&commit, &json!({ "Command": ["npm", "test"] }));
+        let ended = ran_in(&[], &request, Reading::All, &case.base.join("beaten"), Some(&shell));
+        assert_eq!(ended.status, Some(75), "{:?}", ended.err);
+        let tag = ended.err.iter().position(|line| *line == refused_line(NONCE, Refusal::Tools));
+        let packages = format!("gate: remote work folder {KEY} could not restore its npm packages");
+        assert!(
+            tag.is_some_and(|tag| ended.err_texts().get(tag + 1) == Some(&packages.as_str())),
+            "the tools tag, then the packages line: {:?}",
+            ended.err
+        );
+        assert!(
+            !logged(&log).iter().any(|line| line == "test"),
+            "the command never ran: {:?}",
+            logged(&log)
+        );
         case.ended_clean();
     }
 

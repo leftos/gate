@@ -35,6 +35,7 @@ use crate::lines::{
     rosetta_lines, signal_guard, translation, work_layout,
 };
 use crate::outputs::{self, Asked};
+use crate::packages;
 use crate::preflight::{checked_root, layout_record};
 use crate::probe;
 use crate::process::{self, GroupRecord};
@@ -49,7 +50,7 @@ pub const REFUSED_STATUS: u8 = 75;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Unbuilt {
     pub(crate) refusal: Refusal,
-    /// What asks for it: the payload key, or `package restore` for a pnpm, bun or npm command.
+    /// What asks for it: the payload key.
     pub(crate) key: &'static str,
 }
 
@@ -64,19 +65,6 @@ impl Unbuilt {
             format!("gate: remote {why}")
         }
     }
-}
-
-/// Whether the command whose first word is `program` is a package manager's: its file stem, after any folder and less
-/// its last extension, is `pnpm`, `bun`, `bunx`, `npm` or `npx`, compared in any case.
-fn is_package_manager(program: &str) -> bool {
-    let name = program.rsplit('/').next().unwrap_or(program);
-    let stem = match name.rfind('.') {
-        Some(dot) if dot > 0 => &name[..dot],
-        _ => name,
-    };
-    ["pnpm", "bun", "bunx", "npm", "npx"]
-        .iter()
-        .any(|manager| stem.eq_ignore_ascii_case(manager))
 }
 
 /// One repo of a run, made once as the payload is read: its name on a pair run, its tree, the bare repository its
@@ -197,9 +185,9 @@ pub struct Request<'p> {
 impl<'p> Request<'p> {
     /// Reads `payload` in the order the Windows box reads it, each key checked as it does, the outputs asked for
     /// ([`Asked::new`]) read once the output folder is; then notes the first thing asking for what this builder does not
-    /// build: `Desktop`, a warm-up's `WarmCommands`, `EngineEnv`, `UnrealVersion`, `SentDigest`, `LfsDigest` or a
-    /// package manager's command ([`is_package_manager`]); then, last, the repos ([`repos`]), a sibling pair as
-    /// `gate-wire` checks it. A work root holding a `:` is refused just after the work folder is read ([`work_layout`]).
+    /// build: `Desktop`, a warm-up's `WarmCommands`, `EngineEnv`, `UnrealVersion`, `SentDigest` or `LfsDigest`; then,
+    /// last, the repos ([`repos`]), a sibling pair as `gate-wire` checks it. A work root holding a `:` is refused just
+    /// after the work folder is read ([`work_layout`]).
     ///
     /// # Errors
     ///
@@ -223,11 +211,6 @@ impl<'p> Request<'p> {
         let index = payload.beside_work("Index", work, "index")?;
         let job = payload.job(key)?;
         let commands = payload.commands()?;
-        let packages = commands
-            .words
-            .first()
-            .and_then(|words| words.first())
-            .is_some_and(|program| is_package_manager(program));
         let warm = commands.warm_hash.is_some();
         if desktop && warm {
             return Err("gate: box payload asks a warm-up for the desktop".to_owned());
@@ -250,7 +233,6 @@ impl<'p> Request<'p> {
             (unreal, Refusal::Layout, "UnrealVersion"),
             (sent, Refusal::Sent, "SentDigest"),
             (lfs, Refusal::Lfs, "LfsDigest"),
-            (packages, Refusal::Tools, "package restore"),
         ]
         .into_iter()
         .find_map(|(asked, refusal, key)| asked.then_some(Unbuilt { refusal, key }));
@@ -545,8 +527,9 @@ pub type LoginShell = fn() -> Result<Login, String>;
 /// it cannot be; the snapshot fetched and checked out ([`checked_out`]); and the subfolder found in it, a folder inside
 /// the work folder once its links are followed, else [`USAGE_STATUS`]; then the run's temp folder made ([`temp_for`]),
 /// one that cannot be made refused `layout`; then the repo's dotnet tools restored when a
-/// manifest changed ([`tools::update`]), with the folder as its `TMPDIR`, a restore that fails refused `tools` once the
-/// folder is removed ([`temp_removed`]). Each git step's process group is recorded in
+/// manifest changed ([`tools::update`]), then the packages of a pnpm, bun or npm command restored when its lockfile's
+/// folder changed ([`packages::update`]), each with the folder as its `TMPDIR`, a restore that fails refused `tools`
+/// once the folder is removed ([`temp_removed`]). Each git step's process group is recorded in
 /// `<work>.pgid` under the run's job while it runs. The heartbeat starts once the subfolder is placed, before the layout
 /// and the checkout, beating every `periods.heartbeat` ([`heartbeat::start`]). The login shell's `PATH` is read from
 /// `login` just before the first git step, after every refusal said before it ([`login_read`]). No start marker
@@ -1018,7 +1001,8 @@ fn locked<S: LineSink + 'static>(
         tmp: temp.as_ref().map(RunTemp::tmpdir),
         godot: Godot::Unchosen,
     };
-    if let Err(unready) = tools::update(request, &place, lock, along, output) {
+    let restored = tools::update(request, &place, lock, along, output).and_then(|()| packages::update(request, &place, lock, along, &git, output));
+    if let Err(unready) = restored {
         if let Some(temp) = temp {
             temp_removed(temp, output);
         }
@@ -1242,22 +1226,28 @@ pub(crate) fn group_record(work: &str) -> String {
     format!("{work}.pgid")
 }
 
-/// Looks at each group record an earlier run of `laying`'s work folder left, its git step's `<work>.pgid` and its tool
-/// restore's `<work>.tools.pgid` ([`earlier_record_cleared`]), a box that ended without removing it:
+/// Looks at each group record an earlier run of `laying`'s work folder left, its git step's `<work>.pgid`, its tool
+/// restore's `<work>.tools.pgid` and its package restore's `<work>.packages.pgid` ([`earlier_record_cleared`]), a box
+/// that ended without removing it:
 /// whatever job it names, a group that is still the one its run made ([`record_current`]) refuses the run
 /// [`NotLaidOut::Busy`], the group never signalled and its git's lock files never swept; a record naming no group a
 /// run makes (malformed, init, or the box's own), or a group that is no longer its run's (no process left, one the box
 /// may not signal, or its id another's since), is removed under the work lock and the run goes on. A record that
 /// cannot be read, a link or a folder at its name, refuses the run `layout`.
 pub(crate) fn earlier_group_cleared(laying: &Laying<'_>) -> Result<(), NotLaidOut> {
-    for record in [group_record(laying.work), tools::tools_group_record(laying.work)] {
+    let records = [
+        group_record(laying.work),
+        tools::tools_group_record(laying.work),
+        packages::packages_group_record(laying.work),
+    ];
+    for record in records {
         earlier_record_cleared(&record)?;
     }
     Ok(())
 }
 
-/// [`earlier_group_cleared`] for the one group record `record`: a git step's `<work>.pgid` or a tool restore's
-/// `<work>.tools.pgid`.
+/// [`earlier_group_cleared`] for the one group record `record`: a git step's `<work>.pgid`, a tool restore's
+/// `<work>.tools.pgid` or a package restore's `<work>.packages.pgid`.
 fn earlier_record_cleared(record: &str) -> Result<(), NotLaidOut> {
     let (bytes, written) = match files::read_plain_dated(Path::new(record), files::RECORD_LIMIT) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -1327,8 +1317,9 @@ pub(crate) struct Checked {
 /// `<work>.command` refused unless it is missing or a file itself, not followed, as the run could neither write nor
 /// remove anything else there; the work folder failed unless it is missing or the box user's own folder
 /// ([`files::unusable_folder`]); the work folder cleared when its layout record names another layout than the run's
-/// ([`work_relaid`]); when the interrupted-command record is still there, the warm record `<work>.warm` and the tools
-/// record `<work>.tools` removed, so neither trusts a tree a command was cut short in, the checkout remaking the tree;
+/// ([`work_relaid`]); when the interrupted-command record is still there, the warm record `<work>.warm`, the tools
+/// record `<work>.tools` and the packages record `<work>.packages` removed, so none trusts a tree a command was cut
+/// short in, the checkout remaking the tree;
 /// then for each repo's tree, a pair's tree itself refused unless it is missing or a folder itself, `.git`,
 /// `.git/objects` and `.git/objects/info` refused unless each is missing or a folder itself, and `.git/config` and
 /// `.git/HEAD` unless each is missing or a file itself, none followed, and each there the box user's own and writable by
@@ -1345,7 +1336,7 @@ pub(crate) fn layout_checked(laying: &Laying<'_>) -> Result<Checked, NotLaidOut>
     }
     let relaid = work_relaid(laying)?;
     if files::exists(Path::new(&command)) {
-        for suffix in [".warm", ".tools"] {
+        for suffix in [".warm", ".tools", ".packages"] {
             removed(&format!("{work}{suffix}"))?;
         }
     }
@@ -3684,38 +3675,18 @@ mod tests {
         assert_refused(&case, &lfs, Refusal::Lfs, "gate: remote LfsDigest is not built on this builder");
     }
 
-    /// Commands whose first word is a package manager's: the stems of the Windows box's `MANAGERS`, in any case, after
-    /// any folder and less any extension.
-    const PACKAGE_MANAGER_COMMANDS: [&[&str]; 5] = [
-        &["pnpm", "test"],
-        &["/opt/homebrew/bin/npm", "ci"],
-        &["NPX", "vitest"],
-        &["bunx", "tsc"],
-        &["bun.exe", "run", "build"],
-    ];
-
     #[test]
-    fn a_package_manager_command_is_refused_tools() {
-        for (n, command) in PACKAGE_MANAGER_COMMANDS.iter().enumerate() {
-            let case = Case::new(&format!("packages-{n}"));
-
-            assert_refused(
-                &case,
-                &json!({ "Command": command }),
-                Refusal::Tools,
-                "gate: remote package restore is not built on this builder",
-            );
-        }
-    }
-
-    #[test]
-    fn a_command_named_like_a_package_manager_but_not_one_runs() {
+    fn a_command_named_like_a_package_manager_but_not_one_restores_nothing() {
         for (name, command) in [("pnpm-helper", ["pnpm-helper"]), ("npmrc-check", ["./npmrc-check"])] {
             let case = Case::new(&format!("not-packages-{name}"));
             let payload = decoded(&case.json(&"a".repeat(40), &json!({ "Command": command })));
             let request = Request::read(&payload).expect("the request reads");
 
             assert!(request.unbuilt.is_none(), "{command:?} is not refused");
+            let work = Path::new(request.tree());
+            // Every path a lockfile and every folder a folder: only a manager's command could lead to an install.
+            let found = crate::packages::lockfile_for(&request.command, work, work, &|_| Ok(true), &|_| Ok(true));
+            assert!(matches!(found, Ok(None)), "{command:?} is no package manager's");
         }
     }
 
@@ -4061,18 +4032,19 @@ mod tests {
     }
 
     #[test]
-    fn an_interrupted_command_record_removes_the_warm_and_tools_records_before_the_checkout() {
+    fn an_interrupted_command_record_removes_the_warm_tools_and_packages_records_before_the_checkout() {
         let case = Case::new("interrupted");
         let commit = case.snapshot(&[("a.txt", "a\n")]);
         case.laid_out(&commit);
         let (warm, tools) = (format!("{}.warm", case.work()), format!("{}.tools", case.work()));
-        for record in [&warm, &tools] {
+        let packages = format!("{}.packages", case.work());
+        for record in [&warm, &tools, &packages] {
             fs::write(record, DIGEST).expect("the record is written");
         }
 
         case.laid_out(&commit);
         assert!(
-            Path::new(&warm).exists() && Path::new(&tools).exists(),
+            Path::new(&warm).exists() && Path::new(&tools).exists() && Path::new(&packages).exists(),
             "no interrupted command, the records stand"
         );
 
@@ -4082,11 +4054,12 @@ mod tests {
         assert_eq!(status, 0, "{said:?}");
         assert!(!Path::new(&warm).exists(), "the warm record is removed");
         assert!(!Path::new(&tools).exists(), "the tools record is removed");
+        assert!(!Path::new(&packages).exists(), "the packages record is removed");
     }
 
     #[test]
-    fn a_folder_at_the_warm_or_tools_record_of_an_interrupted_command_is_refused_layout() {
-        for suffix in [".warm", ".tools"] {
+    fn a_folder_at_the_warm_tools_or_packages_record_of_an_interrupted_command_is_refused_layout() {
+        for suffix in [".warm", ".tools", ".packages"] {
             let case = Case::new("record-folder");
             let commit = case.snapshot(&[("a.txt", "a\n")]);
             case.laid_out(&commit);
@@ -4832,6 +4805,49 @@ mod tests {
         let record = tools_group_of(&case);
         fs::create_dir_all(Path::new(&record).parent().expect("the record has a folder")).expect("the folder is made");
         let text = job_record_text(&format!("gate-remote-{KEY}-ffffffffffff-tools"), group, own_session(), (1, 0));
+        fs::write(&record, text).expect("the record is written");
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(case.head(), commit);
+        assert!(!Path::new(&record).exists(), "the stale record is removed");
+    }
+
+    #[test]
+    fn a_live_packages_group_left_by_an_earlier_run_refuses_the_next_run_busy() {
+        let case = Case::new("packages-earlier-live");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        case.laid_out(&commit);
+        let mut child = sleeping_group();
+        let record = format!("{}.packages.pgid", case.work());
+        fs::write(&record, live_record_text(&format!("gate-remote-{KEY}-ffffffffffff-packages"), child.id())).expect("the record is written");
+
+        let (status, said) = ran(&case.json(&commit, &json!({})));
+
+        let alive = child.try_wait().expect("the sleep is looked at").is_none();
+        // Best effort: the sleep is this case's own.
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(status, REFUSED_STATUS, "{said:?}");
+        assert_eq!(said, [refused_line(NONCE, Refusal::Busy), busy_line(KEY)]);
+        assert!(alive, "the earlier install's group is never signalled");
+        assert!(Path::new(&record).exists(), "its record stands");
+    }
+
+    #[test]
+    fn a_packages_group_record_naming_no_process_is_removed_and_the_run_goes_on() {
+        let case = Case::new("packages-earlier-dead");
+        let commit = case.snapshot(&[("a.txt", "a\n")]);
+        let mut child = sleeping_group();
+        let group = i32::try_from(child.id()).expect("a pid is a pid_t");
+        child.kill().expect("the sleep is killed");
+        child.wait().expect("the sleep is reaped");
+        // SAFETY: signal 0 only asks whether the group exists; it touches no memory.
+        assert!(unsafe { libc::killpg(group, 0) } != 0, "the group is gone");
+        let record = format!("{}.packages.pgid", case.work());
+        fs::create_dir_all(Path::new(&record).parent().expect("the record has a folder")).expect("the folder is made");
+        let text = job_record_text(&format!("gate-remote-{KEY}-ffffffffffff-packages"), group, own_session(), (1, 0));
         fs::write(&record, text).expect("the record is written");
 
         let (status, said) = ran(&case.json(&commit, &json!({})));

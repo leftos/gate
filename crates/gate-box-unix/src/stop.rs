@@ -1,9 +1,10 @@
-//! `gate-box box stop`: ends the process group of the run whose job the payload names, and the group of its tool
-//! restore, `<job>-tools`. A run records each group beside its work folder, `<Work>.pgid` and `<Work>.tools.pgid`: the
-//! job's name, the group, the group's session in decimal, then its leader's start, one per line. A group is signalled
-//! only while its record names it for the payload's own job and the process whose pid is the group's id has the
-//! recorded start, so a stop that arrives late finds another run's record, or none, or a group id another's took, and
-//! signals nothing; once a group ends, the stop follows the record to a later group of the same job.
+//! `gate-box box stop`: ends the process group of the run whose job the payload names, the group of its tool restore,
+//! `<job>-tools`, and the group of its package restore, `<job>-packages`. A run records each group beside its work
+//! folder, `<Work>.pgid`, `<Work>.tools.pgid` and `<Work>.packages.pgid`: the job's name, the group, the group's
+//! session in decimal, then its leader's start, one per line. A group is signalled only while its record names it for
+//! the payload's own job and the process whose pid is the group's id has the recorded start, so a stop that arrives
+//! late finds another run's record, or none, or a group id another's took, and signals nothing; once a group ends, the
+//! stop follows the record to a later group of the same job.
 
 use std::io;
 use std::path::Path;
@@ -29,7 +30,7 @@ const POLL: Duration = Duration::from_millis(100);
 /// The most bytes of a job record read.
 const RECORD_LIMIT: u64 = 4096;
 
-/// Stops the payload's job and its tool restore's job; the status: 0 when each is gone or there was none, 1 when one
+/// Stops the payload's job, its tool restore's job and its package restore's job; the status: 0 when each is gone or there was none, 1 when one
 /// is left or could not be stopped or the work root is refused, 2 for a payload whose `Key`, `Work` or `Job` does not
 /// fit its work folder or whose `Work` is not `<root>/work/<key>`.
 pub fn stop(payload: &Payload, console: &mut Console) -> u8 {
@@ -53,7 +54,8 @@ pub fn stop(payload: &Payload, console: &mut Console) -> u8 {
     }
     let main = stopped(Path::new(&format!("{work}.pgid")), job, console);
     let tools = stopped(Path::new(&format!("{work}.tools.pgid")), &format!("{job}-tools"), console);
-    main.max(tools)
+    let packages = stopped(Path::new(&format!("{work}.packages.pgid")), &format!("{job}-packages"), console);
+    main.max(tools).max(packages)
 }
 
 /// Whether the job records may be read from `parent`, the work root `root`'s `<root>/work`, judged as the preflight
@@ -997,6 +999,22 @@ mod tests {
         let (status, console) = stopped(&case);
         assert_eq!(status, 0, "{:?}", console.err);
         assert_eq!(console.out, [format!("gate: remote stopped job {JOB}-tools")]);
+        assert!(reaper.join().expect("the reaper ends").is_ok());
+    }
+
+    #[test]
+    fn stop_ends_the_package_restore_group_too() {
+        let case = Case::new("packages");
+        let child = sleeping_group();
+        case.record(".packages.pgid", &format!("{JOB}-packages"), pid_of(&child));
+        let reaper = thread::spawn(move || {
+            let mut child = child;
+            child.wait()
+        });
+
+        let (status, console) = stopped(&case);
+        assert_eq!(status, 0, "{:?}", console.err);
+        assert_eq!(console.out, [format!("gate: remote stopped job {JOB}-packages")]);
         assert!(reaper.join().expect("the reaper ends").is_ok());
     }
 

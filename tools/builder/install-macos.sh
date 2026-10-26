@@ -424,7 +424,7 @@ step_login_path() {
     log "wrote the gate builder block to $zp"
     # shellcheck disable=SC2016 # the zsh script expands its own variables
     if ! out=$(env -i HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-}" TERM=dumb /bin/zsh -l -c \
-        'for t in dotnet pwsh node cargo; do
+        'for t in dotnet pwsh node cargo pnpm npm bun; do
              p=$(command -v "$t") || { echo "$t: not found"; exit 1; }
              v=$("$t" --version 2>&1) || { echo "$t: --version failed: $v"; exit 1; }
              echo "$t $p $v"
@@ -437,6 +437,8 @@ step_login_path() {
             pwsh) want="$prefix/bin/" ;;
             node) want="$prefix/node/bin/" ;;
             cargo) want="$cargo_home/bin/" ;;
+            pnpm|npm) want="$prefix/node/bin/" ;;
+            bun) want="$prefix/bin/" ;;
             *) continue ;;
         esac
         case "$path" in
