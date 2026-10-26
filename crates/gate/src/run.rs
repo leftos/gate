@@ -3173,7 +3173,8 @@ impl Run<'_> {
     /// line; the gate's status. `exited` is the command's status, and `passing` how long it ran and under what ceiling
     /// for the passed line, `None` when it never started; a run the gate ended itself is `unscanned`, its markers not
     /// read. `diagnostics` is the block a kill wrote to the log: the log keeps it, and the tail leaves exactly its lines
-    /// out.
+    /// out. A routed run's tail is not said: its command's output was already shown live, as the box sent it, so saying
+    /// the last lines again would repeat them.
     fn verdict(
         &mut self,
         exited: i64,
@@ -3199,8 +3200,11 @@ impl Run<'_> {
                 console.out(&format!("{number}:{line}"));
             }
         }
-        for line in &tail {
-            console.out(line);
+        let routed = matches!(passing, Some(Passing { pass: Pass::On(..), .. }));
+        if !routed {
+            for line in &tail {
+                console.out(line);
+            }
         }
         let closing = match passing {
             Some(passed) if status == 0 => self.passed_lines(passed, &shown),

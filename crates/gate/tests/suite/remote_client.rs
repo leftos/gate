@@ -724,6 +724,54 @@ fn a_routed_run_s_console_shows_no_stamp_and_no_process_line() {
     }
 }
 
+/// A routed run shows its command's last line once: what the box streamed live is not said again as the verdict's tail,
+/// even when `--tail` names enough lines to hold the command's own.
+#[test]
+fn a_routed_run_shows_its_command_s_output_once_with_a_tail() {
+    let case = client_case("client-routed-tail-once");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--tail", "15"],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(
+        &case,
+        "out.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran there", "exit", "0"],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let shown = outcome.stdout.lines().filter(|line| *line == "ran there").count();
+    assert_eq!(shown, 1, "the command's line is shown once: {outcome:?}");
+}
+
+/// A failed routed run shows its command's last line once too, and still says the verdict line.
+#[test]
+fn a_failed_routed_run_shows_its_command_s_output_once_with_a_tail() {
+    let case = client_case("client-routed-failed-tail-once");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok"]);
+    let tuned = Tuned {
+        extra: &["--tail", "15"],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(
+        &case,
+        "out.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "out", "ran there", "exit", "3"],
+    ));
+
+    assert_eq!(outcome.code, Some(3), "{outcome:?}");
+    let shown = outcome.stdout.lines().filter(|line| *line == "ran there").count();
+    assert_eq!(shown, 1, "the command's line is shown once: {outcome:?}");
+    assert!(outcome.stderr.contains("gate: FAILED (status 3)"), "{outcome:?}");
+}
+
 /// The case's worktree root as git gives it, which routing hashes into the work-folder key.
 fn git_root(case: &Case) -> String {
     git_out(case, &[], &["rev-parse", "--show-toplevel"])
