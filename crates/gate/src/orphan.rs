@@ -1,7 +1,10 @@
 //! The refusal of a gate started under an orphaned script: at start, a gate with no live parent gate walks its own
 //! ancestors to the first one whose parent is gone, stepping over Git Bash's fork stub to a live MSYS parent as the
 //! MSYS runtime records it, and refuses when that one is a shell running a script or a command, whose caller was killed
-//! and left the script stepping on alone.
+//! and left the script stepping on alone. An elevated gate is not judged: an agent's killed sequence never runs
+//! elevated, and `sudo`'s elevated side exits once it has started its command.
+
+use std::io;
 
 use gate_win32::MsysParent;
 use jiff::Timestamp;
@@ -34,18 +37,30 @@ const MSYS_STEPS: usize = 16;
 
 /// The orphaned script this process was started under, read from the machine's process table and the MSYS runtime's
 /// records: `None` when the walk ends anywhere else, or when the snapshot, this process's place in it, an MSYS record
-/// or the orphan's command line cannot be read.
+/// or the orphan's command line cannot be read. An elevated gate is not judged, since an agent's killed sequence never
+/// runs elevated and `sudo`'s elevated side exits once it has started its command.
 pub(crate) fn orphaned_caller() -> Option<Orphan> {
-    let processes = Win32ProcessTable.try_snapshot_without_command_lines().ok()?;
-    orphan_of(
-        processes,
-        std::process::id(),
-        |process| {
-            let line = command_line_of(process.pid)?;
-            Some(gate_state::split_words(&line).into_iter().skip(1).collect())
-        },
-        gate_win32::msys_parent,
-    )
+    orphan_unless_elevated(gate_win32::token_facts().map(|facts| facts.elevated), || {
+        let processes = Win32ProcessTable.try_snapshot_without_command_lines().ok()?;
+        orphan_of(
+            processes,
+            std::process::id(),
+            |process| {
+                let line = command_line_of(process.pid)?;
+                Some(gate_state::split_words(&line).into_iter().skip(1).collect())
+            },
+            gate_win32::msys_parent,
+        )
+    })
+}
+
+/// What `walk` finds, unless `elevated`, this process's own token's elevation as it reads it, says the gate runs
+/// elevated: an elevated gate walks nothing, and one whose elevation cannot be read is judged as an unelevated one is.
+fn orphan_unless_elevated(elevated: io::Result<bool>, walk: impl FnOnce() -> Option<Orphan>) -> Option<Orphan> {
+    if elevated.is_ok_and(|is_elevated| is_elevated) {
+        return None;
+    }
+    walk()
 }
 
 /// The orphan `own`'s ancestor walk over `processes` ends at: the last process of [`ProcessTree::ancestors`], when its
@@ -168,11 +183,13 @@ impl Shell {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a test timestamp that does not parse must fail loudly")]
 mod tests {
+    use std::io;
+
     use gate_win32::MsysParent;
     use jiff::Timestamp;
     use proc_table::ProcessInfo;
 
-    use super::{Orphan, orphan_of};
+    use super::{Orphan, orphan_of, orphan_unless_elevated};
 
     /// The gate's pid in every chain.
     const GATE: u32 = 100;
@@ -467,6 +484,34 @@ mod tests {
             walk(chain("cmd.exe"), 4242, |_| words(&["/c", "x"])),
             None,
             "a gate missing from its own snapshot"
+        );
+    }
+
+    /// The orphan an unelevated gate's walk finds, its shell and pids unlike any in a [`chain`].
+    fn found_orphan() -> Orphan {
+        Orphan {
+            image: "pwsh.exe".into(),
+            pid: 2,
+            parent_pid: 1,
+        }
+    }
+
+    #[expect(clippy::panic, reason = "a gate that walks despite its elevation fails the case")]
+    #[test]
+    fn an_elevated_gate_is_never_refused() {
+        assert_eq!(orphan_unless_elevated(Ok(true), || panic!("an elevated gate walks nothing")), None);
+    }
+
+    #[test]
+    fn an_unelevated_gate_is_judged_by_its_walk() {
+        assert_eq!(orphan_unless_elevated(Ok(false), || Some(found_orphan())), Some(found_orphan()));
+    }
+
+    #[test]
+    fn a_gate_whose_token_cannot_be_read_is_judged_by_its_walk() {
+        assert_eq!(
+            orphan_unless_elevated(Err(io::Error::other("no token")), || Some(found_orphan())),
+            Some(found_orphan())
         );
     }
 }
