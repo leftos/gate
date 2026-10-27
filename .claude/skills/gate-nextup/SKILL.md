@@ -42,7 +42,7 @@ Merging is the agents' call too. Once every item under a feature marker has land
 ## Agents
 
 - Explore: `Explore`. Behaviour questions about the PowerShell gate point the explorer at `~/.claude/tools/gate/` by path, and at the behaviour inventory, `docs/research/2026-10-09-powershell-gate-inventory.md`.
-- Implementer: `implementer`. Review: `code-review` at `high`, plus `security-auditor` when the diff touches how a command is launched, quoted or given its environment, the ssh transport, or files other users' processes can write.
+- Implementer: `implementer`. Review: `code-review` at `high`. No routine `security-auditor` pass: the owner is the gate's only user ("Decisions", functional work first); run one only when the owner asks.
 - Concurrency ceiling: three implementers.
 
 ## Gates
