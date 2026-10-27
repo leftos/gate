@@ -30,6 +30,41 @@ On the PC, a run that waits inside its attempt holds its remote slot: with the d
 - **I10 Accounting.** The drain wait counts toward no learned duration, `--timeout auto` or hang hint.
 - **I11 GATE-542.** The interrupted-command clear runs only inside admitted verbs, and the drained test waits for every live job a `{Work}.command` record names.
 
+## Second invariant pass (oracle, at `main` 6898d4fd)
+
+This pass was run before GATE-562's brief. Where it differs from the sections below, it wins, and the code cites in this section are current. Unix box: a sibling item. GATE-562 adds only `BoxVerb::Drain` to the not-built verbs (`gate-box-unix/src/cli.rs:40-41`). A Mac never holds a barrier, and GATE-564 reports a Mac's not-built answer as "cannot drain", never as drained.
+
+- **J1 Atomic admission.** One hold of `drain\lock` covers three things: the barrier and ticket decision, the creation of the verb's holder, and the session record.
+  - The holder is an OS handle on a per-process file, `drain\sessions\{session}.{pid}`, so a dead process frees it.
+  - The drained test decides in one hold of the same lock. So the gap between admission and registration cannot open.
+  - The admission function is shared and returns a guard whose drop releases the holder. GATE-572's free-space check goes between deciding and registering.
+  - Sites:
+    - `preflight.rs`: between `held_work_root` (:132) and `ready` (:136);
+    - `run.rs`: between :594 and `take_lock` (:597);
+    - `inputs.rs`: after `Asked::read` (:361), before the manifest is read (:362);
+    - `lfs.rs`: after :149, before `elevation()` (:150).
+- **J2 A session counts until it ends.** A session is live while any of these holds:
+  - a verb holds its holder;
+  - its last call falls within the 120 s lease;
+  - the job its record names (the payload's `Job`) still holds a process.
+
+  The job is checked as `run.rs:3122-3128` checks it, and `{Work}.command` stays a second source. This covers spared nested gates after a clean end, and the job of a killed box.
+- **J3 Nothing is admitted after "drained".** "Drained" is said only from a lock hold that found no live session. That same hold removes every session it judged dead, so no session can revive. While a barrier stands:
+  - `inputs`, `lfs` and `run` refuse a missing or dead session with `drain`;
+  - `outputs` for a dead session sends its archive but deletes nothing (`outputs.rs:4-5`);
+  - both prune forms read the barrier, read only, before `Sweep::opened` (`prune.rs:91-95`) and before each key (:113, :145). The age prune exits 0 with a line. The keyed prune answers each key `kept` (GATE-689's parser reads it as kept).
+- **J4 The barrier survives a crashed caller.** The barrier file is written to a temp file and renamed into place under the held `drain\`. The lock is retried as `warm.rs:802-829` retries, with that loop copied into the drain code, since the box cannot call it.
+- **J5 Arrival order.** A ticket is numbered under the lock at a run's first refused preflight, keyed by session, and renewed on each re-poll, never renumbered. A run is admitted only when no older live ticket waits, even with no barrier standing. A refusal with no barrier standing has a waiting line form without raise and lapse times. `gate check --builder` and warm-ups preflight with a no-ticket payload flag, so they never queue.
+- **J6 A payload with no `Session` is refused under a standing barrier,** with `drain` and status 75. An older PC fails that run rather than running on a drained builder. Only the window between GATE-562 and GATE-563 has such a PC, and no barrier is raised before GATE-564.
+- **J7 Only the elevated box writes the drain's files.** `drain\` is made with `protected_folder` and `protected_security` (`inputs.rs:880-883`, :901), which gives it a High label with no write-up. A routed command runs at medium integrity and so cannot delete the barrier or its own session. A planted `drain\` is moved aside (`Leftover::MoveAside`, `inputs.rs:894`), never refused. A medium reader, such as the prune, can still read the barrier.
+- **J8 The drain itself causes no fallback.**
+  - The drained test never opens a `{key}.lock`.
+  - The drain verb holds the root as the preflight does: read access and `Share::NoDelete`, never DELETE. That keeps it clear of `check_work_root`'s busy test (`gate-win32` `trust.rs:410-414`).
+- **J9 A prune counts for its whole life.** The drained test counts a live process whose command line holds `box prune --root {this root}`, with case and separators folded. Prune registers no session: that would make `drain\` writable at medium integrity, which J7 forbids.
+- **J10 git pack processes count.** The drained test also counts each process whose command line names the root (`/` and `\` folded, matched on a path boundary), and every descendant of such a process (`proc-table` `lib.rs:114`). A git, gate or pwsh image whose command line cannot be read counts as a match, so the test fails closed. The Windows bares' `receive.autogc` is turned off in the receive-pack command (`remote/transport.rs:21`), so maintenance never detaches past a drain.
+- **Still a hole, booked apart:** the push is not gated (see "Not in this item"). A PC whose session lapsed between its preflight and its push can push after "drained", and a pack process watch only narrows that window.
+- **`inflight` stays as it is.** `gate box drain`'s status is the listing. `inflight` has no caller on the PC.
+
 ## Decisions (orchestrator; not owner rulings, open to the owner)
 
 **Barrier home.** Files under `{Root}\drain\`, every one read and written through the box's record I/O that refuses links, `Root` taken from the payload as `inflight` does (no suite case may reach the real root):
