@@ -100,7 +100,7 @@ pub use security::{
 };
 pub use thread::cancel_synchronous_io;
 pub use tree::{JobOpened, Membership, OpenedJob, StoppableProcess, Terminated, WaitableProcess};
-pub use trust::{TRUSTED_OWNERS, Untrusted, check_installed_file, check_work_root};
+pub use trust::{TRUSTED_OWNERS, Untrusted, check_installed_file, check_work_root, usual_final_path};
 
 pub use priority::{Priority, priority_of, set_priority};
 pub use registry::{Hive, Subkey, registry_subkeys};

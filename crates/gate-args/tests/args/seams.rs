@@ -943,6 +943,74 @@ fn box_seams_of_the_ceiling_are_read_before_the_verb() {
     );
 }
 
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seams_of_the_drain_are_read_before_the_verb() {
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    assert_eq!(
+        invocation(&[
+            "box",
+            "--test-box-drain-lease-ms",
+            "500",
+            "--test-box-drain-lapse-ms=60000",
+            "--test-box-now",
+            "1800000000",
+            "--test-box-drain-readable-only=true",
+            "drain",
+            "--stdin"
+        ]),
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Drain,
+            seams: BoxSeams {
+                drain_lease_ms: Some(500),
+                drain_lapse_ms: Some(60_000),
+                now: Some(1_800_000_000),
+                drain_readable_only: gate_args::ProcessScan::ReadableOnly,
+                ..BoxSeams::default()
+            },
+            root: None,
+            keys: Vec::new(),
+        })
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seams_of_the_drain_refuse_bad_values() {
+    let rows: [(&[&str], &[&str]); 6] = [
+        (
+            &["box", "--test-box-drain-lease-ms", "0", "drain", "--stdin"],
+            &["gate: --test-box-drain-lease-ms must be a whole number above 0, got '0'"],
+        ),
+        (
+            &["box", "--test-box-drain-lapse-ms", "soon", "drain", "--stdin"],
+            &["gate: --test-box-drain-lapse-ms must be a whole number above 0, got 'soon'"],
+        ),
+        (
+            &["box", "--test-box-now", "0", "drain", "--stdin"],
+            &["gate: --test-box-now must be a whole number above 0, got '0'"],
+        ),
+        (
+            &["box", "--test-box-drain-readable-only", "yes", "drain", "--stdin"],
+            &["gate: --test-box-drain-readable-only takes true or false, got 'yes'"],
+        ),
+        (
+            &["box", "--test-box-now=1", "--test-box-now=2", "drain", "--stdin"],
+            &["gate: --test-box-now is given twice"],
+        ),
+        (
+            &["box", "--test-box-drain-lease-ms=", "drain", "--stdin"],
+            &["gate: --test-box-drain-lease-ms needs a value"],
+        ),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), want, "{words:?}");
+    }
+}
+
 #[test]
 fn the_bridge_seams_are_unknown_options() {
     for flag in ["--test-remote-script", "--test-bridge-pwsh"] {
@@ -956,7 +1024,7 @@ fn the_bridge_seams_are_unknown_options() {
 
 /// The usage a malformed `gate box` prints.
 const BOX_USAGE: &str = concat!(
-    "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)\n",
+    "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin (the base64 JSON request as stdin's first line)\n",
     "       gate box prune --root <folder> [--keys <key>...]",
 );
 
@@ -1722,6 +1790,10 @@ fn box_seam_console_and_park_launch_are_unknown_words_without_the_feature() {
         ("--test-box-sampler-fail", "true"),
         ("--test-box-free-percent", "5"),
         ("--test-box-kill-leaves", "1"),
+        ("--test-box-drain-lease-ms", "500"),
+        ("--test-box-drain-lapse-ms", "60000"),
+        ("--test-box-now", "1800000000"),
+        ("--test-box-drain-readable-only", "true"),
     ] {
         assert_eq!(problems(&["box", seam, value, "run", "--stdin"]), [BOX_USAGE], "{seam}");
         let joined = format!("{seam}={value}");

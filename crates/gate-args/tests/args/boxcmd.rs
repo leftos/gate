@@ -10,7 +10,7 @@ use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation, USAGE};
 use crate::support::{invocation, os, problems, problems_of, unreadable_word};
 
 const BOX_USAGE: &str = concat!(
-    "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)\n",
+    "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin (the base64 JSON request as stdin's first line)\n",
     "       gate box prune --root <folder> [--keys <key>...]",
 );
 

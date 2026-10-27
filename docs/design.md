@@ -589,13 +589,13 @@ The lines, each on stderr and escaped to one line where it carries a path, a rep
 
 Hidden from the usage and from `--help`. It is the builder side of a routed run, run over ssh on the builder ([The box side](#the-box-side)).
 
-`gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin` takes exactly one verb and the word `--stdin`, and no `--state-dir`: the request is the first line of stdin, and every path comes from it. Two exceptions take no request and no `--stdin`: `gate box register-desktop`, and `gate box prune --root <folder> [--keys <key>...]`, which takes the root and, optionally, the keys to remove.
+`gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin` takes exactly one verb and the word `--stdin`, and no `--state-dir`: the request is the first line of stdin, and every path comes from it. Two exceptions take no request and no `--stdin`: `gate box register-desktop`, and `gate box prune --root <folder> [--keys <key>...]`, which takes the root and, optionally, the keys to remove.
 
-Any other shape (no verb, no `--stdin`, any other word in its place, an unknown verb, an extra word) prints the box usage alone on stderr and exits 2. The usage is two lines: `usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)`, then the `       gate box prune --root <folder> [--keys <key>...]` line.
+Any other shape (no verb, no `--stdin`, any other word in its place, an unknown verb, an extra word) prints the box usage alone on stderr and exits 2. The usage is two lines: `usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin (the base64 JSON request as stdin's first line)`, then the `       gate box prune --root <folder> [--keys <key>...]` line.
 
 ### Later subcommands
 
-Further modes arrive as subcommands of the same binary, each designed with its issue: `gate status` and `gate drain`. New options, such as `--timeout auto:<n>` (GATE-16) and `--slot auto` (GATE-8), exist only in the new CLI, never in the compatibility layer. The one exception is `--cd` (GATE-323), which the compatibility layer reads as `-Cd` because the launcher's callers need it.
+Further modes arrive as subcommands of the same binary, each designed with its issue: `gate status` and `gate drain` (the PC's command; its builder side, the box verb `drain`, is in [The box side](#the-box-side)). New options, such as `--timeout auto:<n>` (GATE-16) and `--slot auto` (GATE-8), exist only in the new CLI, never in the compatibility layer. The one exception is `--cd` (GATE-323), which the compatibility layer reads as `-Cd` because the launcher's callers need it.
 
 ### Compatibility layer
 
@@ -3021,6 +3021,10 @@ A `run` payload also holds `Command` (or, for a warm-up, `WarmCommands` and `War
 
 `inflight` reads only `Root`.
 
+`drain` reads `Root` and `Action` (`raise`, `status` or `lift`).
+
+The optional `Session` (1 to 64 ASCII letters, digits, `_` and `-`: the run's drain session id; absent or null for a PC older than the drain) and `NoTicket` (true or false, false when absent: a refused call takes no place in the drain's line) are parsed by `gate_wire::Payload` for the drain's admission; no routed verb reads them yet.
+
 `inputs` and `lfs` read `Key`, `Bare`, `Work`, `Lock`, `Nonce` and `Step`, and `inputs` the optional `SentBin`.
 
 A warm-up's `run` payload sets `WarmCommands` (1 to 8 commands, each a non-empty list of non-empty texts) and `WarmHash` (64 lower-case hex digits, the hash of the warm-up file the commands come from), sets no `Command`, and asks for no outputs. The PC's client sends it (The remote client's run, Warm-up call) for `gate warm`. It may carry `GodotVersion` too, and its commands resolve Godot as a run's do.
@@ -3833,6 +3837,32 @@ Built verbs:
 
   It prints `gate: remote pruned {key} (worktree gone)` and `gate: remote kept {key}: in use` on stdout, and `gate: remote could not prune {key}: {why}` on stderr (reasons include `its work folder is not a plain folder`, `its refs could not be removed: {the first failure's reason}`, and `the root's drive is not there`, said for every key when the root's drive is absent; a missing root on a present drive holds nothing and answers `pruned`). A lock that cannot be opened, other than one held, and a record left after the rename are each the key's single could-not line, with no `pruned` line. Every key gets exactly one line. It prints no summary line, and exits 1 when any key got a could-not line, else 0.
 
+- **`drain`** (`boxside/drain.rs`) is the builder drain's barrier, from `gate box drain --stdin` with the payload `{"Root","Action"}`, `Action` being `raise`, `status` or `lift`. It answers each call once and exits; a missing `Root` or an `Action` that is none of the three is the usage line and exit 2. No routed verb passes the drain yet, so a raised barrier stops nothing.
+
+  Everything lives under `{Root}\drain\`, which the box makes with a High integrity label and no write-up, so a routed command at medium integrity cannot delete the barrier or its own session. A `drain` that is not that folder (a link, a junction, a file, or a folder of other security) is renamed aside as itself and never followed, and the call says `gate: drain moved aside {path} to drain.gate-moved-{n}: it was not the box's protected folder`.
+
+  The root is held as the preflight holds it (read access, no delete sharing), and a raise makes a missing root and `drain\`; a `status` or a `lift` of a root or `drain\` that is not there answers as no barrier and changes nothing.
+
+  - `lock`: the drain lock, shared with no one, held around each read-modify of the files below and never across a wait or a child process; a call that finds it held tries again for 10 s, then fails.
+  - `barrier`: `{"Raised","Lapses","Generation"}`, written by a raise. It lapses 30 minutes after the last raise, and a raise while it stands raises the generation by one. A barrier file that does not read stands as one raised at its last write, so a damaged one holds the drain for one lapse and no longer.
+  - `lapsed` and `lifted`: `{"At"}`, the time the barrier lapsed or was lifted. A lift removes `barrier` and `lapsed` and writes `lifted`.
+  - `tickets\{seq:08}-{session}`: `{"Session","Polled"}`, one per run waiting in line; a ticket is live for 120 s after its last poll, the box's boot or the last lift or lapse, whichever is latest.
+  - `sessions\{session}`: `{"Pc","Repo","Command","Job","Called"}`, one per admitted run, live for 120 s after its last call. `sessions\{session}.{pid}` is the holder each admitted box process keeps open, shared with no one, so a session is live while its process lives.
+
+  A call that reads the drain answers with one line each, in this order: `gate: drain barrier {raised} {lapses}` (Unix seconds), `gate: drain barrier none` or `gate: drain barrier lapsed {at}`.
+
+  Then `gate: drain session {age_s} {json}` per live session, the json `{"Pc","Repo","Command"}` with `null` for a field it lacks; then `gate: drain process {pid} prune|git|job` per process the drained test counts; then `gate: drain command {key} unreadable` per work folder whose `.command` record could not be read and whose job no live session names; then `gate: drain tickets {n}` (live tickets); and last `gate: drain state drained|waiting|open`.
+
+  The state is `drained` under a standing barrier with no live session and no counted process, `waiting` under one with any, and `open` with none standing.
+
+  The drained test counts a process whose command line holds `box prune --root {root}` (`prune`), a process whose command line names the root, with every descendant (`git`), a process of a job a `{Work}.command` record names (`job`), and a git, gate or pwsh image whose command line cannot be read, which counts as a match. The call that finds the barrier standing with nothing live removes the sessions it judged dead.
+
+  The exit status is 0 once it answered, 1 after `gate: drain failed: {why}`, 2 on usage. The test seams `--test-box-drain-lease-ms <n>` (the 120 s lease), `--test-box-drain-lapse-ms <n>` (the 30 minute lapse), `--test-box-now <unix s>` (the time the drain judges at) and `--test-box-drain-readable-only true|false` (count only processes whose command line it reads) go before the verb.
+
+  `admit` in the same module is the one admission function the routed verbs will pass: in one hold of the lock it admits a call or refuses it, a refusal being the `Refused` place in line with the barrier's raise and lapse times.
+
+  It writes the session record and takes the holder on admission, and takes or renews the ticket on a refusal unless `NoTicket`. The refusal tag word `drain` (`gate_wire::Refusal::Drain`, `gate-remote-refused: {nonce} drain`) is for that refusal; nothing emits it yet and the client does not read it.
+
 **The outputs module** (GATE-44) is shared by both ends, this exe, in `crates/gate/src/outputs/`. The box's `run` packs with it and the box's `outputs` verb sends the archive. The PC's manifest, the pending marker, the reading of the box's `gate-remote-outputs: ` line, the fetch of the archive and its install are built in the Rust remote client ([The remote client's run](#routing)).
 
 - Globs: each is relative to the work folder's root and `/`-separated, matched without regard to case: `**/` is any number of folders (none included), `**` anything, `*` any run of characters within one name, `?` one character within one name.
@@ -4010,7 +4040,7 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
   The Windows box refuses a `CrossBuild` payload with `gate: box payload CrossBuild is a macOS builder's key; this box cannot cross-build`. A malformed one, or one without `Outputs`, is a usage line on either box (`gate: box payload CrossBuild is not an object`, `lacks Rid`, `Rid is not a text`, `lacks Words`, `Words holds an empty word`, `needs Outputs`, among them). The PC's client does not send `CrossBuild` yet.
 
-  A pair run brings back from its main tree only. `OutputsFull` with no globs is taken and does nothing. `--test-outputs-budget-bytes` reaches the run. Every other verb (`inflight`, `lfs`, `register-desktop`) says `gate: box <verb> is not built on this builder` and exits 2.
+  A pair run brings back from its main tree only. `OutputsFull` with no globs is taken and does nothing. `--test-outputs-budget-bytes` reaches the run. Every other verb (`inflight`, `lfs`, `register-desktop`, `drain`) says `gate: box <verb> is not built on this builder` and exits 2.
 
   The run checks a payload's `InputsDigest` as the Windows box does ([The box side](#the-box-side)), and refuses a `SentDigest` or `LfsDigest` as not built (`gate-remote-refused: <nonce> <tag>`, then `gate: remote <key> is not built on this builder`, status 75), so the PC runs such a run itself.
 

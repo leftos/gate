@@ -233,7 +233,7 @@ impl fmt::Display for Problem {
             Problem::BadPid(value) => write!(f, "gate: the process id must be a whole number above 0, got '{value}'"),
             Problem::Unreadable(lossy) => write!(f, "gate: cannot read the argument {lossy}"),
             Problem::BoxUsage => f.write_str(concat!(
-                "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)\n",
+                "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin (the base64 JSON request as stdin's first line)\n",
                 "       gate box prune --root <folder> [--keys <key>...]",
             )),
             Problem::SeamNeeds { option, needs } => write!(f, "gate: {option} needs {needs}"),

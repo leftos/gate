@@ -5,7 +5,8 @@
 //! to running here when the builder turns it away. It stops a process tree with the gates in it, moves the machine from
 //! the PowerShell gate to itself (`gate cutover`), copies the installed exe to the builders (`gate push`), and checks
 //! what this machine lacks for the repo it is run in (`gate check`). On a
-//! builder, the hidden `gate box` answers `boot`, `preflight`, `run`, `stop`, `outputs` and `inflight`.
+//! builder, the hidden `gate box` answers `preflight`, `run`, `stop`, `boot`, `outputs`, `inflight`, `inputs`, `lfs`,
+//! `drain`, `register-desktop` and `prune`.
 
 mod acquire;
 mod answer;

@@ -5,6 +5,7 @@
 mod boot;
 mod ceiling;
 mod desktop;
+mod drain;
 pub(crate) mod forward;
 mod heartbeat;
 mod inflight;
@@ -84,6 +85,7 @@ pub(crate) fn answer(request: &BoxRequest, console: &mut Console) -> u32 {
         BoxVerb::Inflight => with_request(console, inflight::inflight),
         BoxVerb::Inputs => with_request(console, |payload, console| inputs::inputs(payload, seams, console)),
         BoxVerb::Lfs => with_request(console, |payload, console| lfs::lfs(payload, seams, console)),
+        BoxVerb::Drain => with_request(console, |payload, console| drain::drain(payload, seams, console)),
     }
 }
 

@@ -5,6 +5,8 @@
 //! `--test-heartbeat-ms <n>`, `--test-box-console fail-before`, `--test-box-token refused`, `--test-box-park-launch <path>`,
 //! `--test-outputs-budget-bytes <n>`, `--test-inputs-budget-bytes <n>`, `--test-lfs-budget-bytes <n>`, `--test-dotnet-limit-ms <n>`,
 //! `--test-box-sample-ms <n>`, `--test-box-sampler-fail true|false`, `--test-box-free-percent <1-100>`,
+//! `--test-box-drain-lease-ms <n>`, `--test-box-drain-lapse-ms <n>`, `--test-box-now <unix s>`,
+//! `--test-box-drain-readable-only true|false`,
 //! `--test-box-kill-leaves <n>`, `--test-probe-limit-ms <n>`, `--test-probe-drain-ms <n>`, `--test-box-desktop <fault>`,
 //! `--test-box-desktop-session <state>`, `--test-box-desktop-mutex <name>`, `--test-box-desktop-ms <n>`,
 //! `--test-box-desktop-message-ms <n>` and `--test-box-register ok|fail`, `--test-box-root-walk-stop <folder>`,
@@ -105,6 +107,7 @@ fn verb(text: &str) -> Option<BoxVerb> {
         "lfs" => Some(BoxVerb::Lfs),
         "register-desktop" => Some(BoxVerb::RegisterDesktop),
         "prune" => Some(BoxVerb::Prune),
+        "drain" => Some(BoxVerb::Drain),
         _ => None,
     }
 }
@@ -135,6 +138,15 @@ enum Seam {
     SamplerFail,
     /// `--test-box-free-percent <1-100>`: the share of the machine the samples find free.
     FreePercent,
+    /// `--test-box-drain-lease-ms <n>`: how long a drain ticket and a drain session stay live after their last poll or
+    /// call.
+    DrainLeaseMs,
+    /// `--test-box-drain-lapse-ms <n>`: how long a drain barrier stands after its last raise.
+    DrainLapseMs,
+    /// `--test-box-now <unix s>`: the fixed time the drain judges its barrier, tickets and sessions at.
+    Now,
+    /// `--test-box-drain-readable-only true|false`: the drained test counts only processes whose command line it reads.
+    DrainReadableOnly,
     /// `--test-box-kill-leaves <n>`: how many processes the ending of a job the ceiling killed reports left.
     KillLeaves,
     /// `--test-probe-limit-ms <n>`: how long the preflight's tool probes may take together.
@@ -183,6 +195,10 @@ impl Seam {
             "--test-box-sample-ms" => Some(Seam::SampleMs),
             "--test-box-sampler-fail" => Some(Seam::SamplerFail),
             "--test-box-free-percent" => Some(Seam::FreePercent),
+            "--test-box-drain-lease-ms" => Some(Seam::DrainLeaseMs),
+            "--test-box-drain-lapse-ms" => Some(Seam::DrainLapseMs),
+            "--test-box-now" => Some(Seam::Now),
+            "--test-box-drain-readable-only" => Some(Seam::DrainReadableOnly),
             "--test-box-kill-leaves" => Some(Seam::KillLeaves),
             "--test-probe-limit-ms" => Some(Seam::ProbeLimitMs),
             "--test-probe-drain-ms" => Some(Seam::ProbeDrainMs),
@@ -214,6 +230,10 @@ impl Seam {
             Seam::SampleMs => "--test-box-sample-ms",
             Seam::SamplerFail => "--test-box-sampler-fail",
             Seam::FreePercent => "--test-box-free-percent",
+            Seam::DrainLeaseMs => "--test-box-drain-lease-ms",
+            Seam::DrainLapseMs => "--test-box-drain-lapse-ms",
+            Seam::Now => "--test-box-now",
+            Seam::DrainReadableOnly => "--test-box-drain-readable-only",
             Seam::KillLeaves => "--test-box-kill-leaves",
             Seam::ProbeLimitMs => "--test-probe-limit-ms",
             Seam::ProbeDrainMs => "--test-probe-drain-ms",
@@ -289,6 +309,16 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
         Seam::SampleMs => seams.sample_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::SamplerFail => seams.sampler_fail = crate::values::true_or_false(name, &value)?,
         Seam::FreePercent => seams.free_percent = Some(crate::values::in_range(name, &value, 1, 100)?),
+        Seam::DrainLeaseMs => seams.drain_lease_ms = Some(crate::values::above_zero(name, &value)?),
+        Seam::DrainLapseMs => seams.drain_lapse_ms = Some(crate::values::above_zero(name, &value)?),
+        Seam::Now => seams.now = Some(crate::values::above_zero(name, &value)?),
+        Seam::DrainReadableOnly => {
+            seams.drain_readable_only = if crate::values::true_or_false(name, &value)? {
+                crate::request::ProcessScan::ReadableOnly
+            } else {
+                crate::request::ProcessScan::All
+            };
+        }
         Seam::KillLeaves => seams.kill_leaves = Some(crate::values::above_zero(name, &value)?),
         Seam::ProbeLimitMs => seams.probe_limit_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::ProbeDrainMs => seams.probe_drain_ms = Some(crate::values::above_zero(name, &value)?),

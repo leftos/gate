@@ -30,6 +30,7 @@ use crate::support::{
 };
 
 mod desktop;
+mod drain;
 mod inputs;
 mod lfs;
 mod outputs;
@@ -38,7 +39,7 @@ mod register;
 mod warm;
 
 const BOX_USAGE: &str = concat!(
-    "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs --stdin (the base64 JSON request as stdin's first line)\n",
+    "usage: gate box preflight|run|stop|boot|outputs|inflight|inputs|lfs|drain --stdin (the base64 JSON request as stdin's first line)\n",
     "       gate box prune --root <folder> [--keys <key>...]\n",
 );
 

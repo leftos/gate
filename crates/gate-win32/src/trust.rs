@@ -772,6 +772,16 @@ fn same_units(left: &[u16], right: &[u16]) -> bool {
     left.len() == right.len() && left.iter().map(fold).eq(right.iter().map(fold))
 }
 
+/// The final path of the open `file`, normalized, in its usual form (`C:\…`, `\\server\…`), so two spellings of one
+/// folder read the same.
+///
+/// # Errors
+///
+/// The system's error when the path cannot be read.
+pub fn usual_final_path(file: &File) -> io::Result<PathBuf> {
+    final_path(file).map(|full| shown(&full))
+}
+
 /// The final path of the open `file`, normalized, as the system gives it (`\\?\C:\…`).
 fn final_path(file: &File) -> io::Result<PathBuf> {
     let mut buffer = vec![0_u16; 512];

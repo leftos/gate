@@ -1185,9 +1185,9 @@ const CLEAR_WAIT: Duration = Duration::from_millis(500);
 /// What an interrupted-command record says: the time from which a file counts as the command's, `None` to count every
 /// file, and the job to end first, `None` for none.
 #[derive(Debug, PartialEq, Eq)]
-struct Interrupted {
+pub(super) struct Interrupted {
     since: Option<SystemTime>,
-    job: Option<String>,
+    pub(super) job: Option<String>,
 }
 
 impl Interrupted {
@@ -1195,7 +1195,7 @@ impl Interrupted {
     /// the job one of the work folder's job names, the key in any case ([`gate_wire::is_recorded_job_name`]); a file
     /// counts from the earlier of the start and `now`, less [`INTERRUPTED_SLACK`]. A record of any other form, an empty
     /// one included, counts every file and names no job.
-    fn read(text: &str, key: &str, now: SystemTime) -> Interrupted {
+    pub(super) fn read(text: &str, key: &str, now: SystemTime) -> Interrupted {
         let parsed = text.split_once(' ').and_then(|(start, job)| {
             let start: jiff::Timestamp = start.parse().ok()?;
             gate_wire::is_recorded_job_name(job, key, PathForm::Windows).then(|| (SystemTime::from(start), job.to_owned()))
@@ -1218,10 +1218,9 @@ impl Interrupted {
 /// not be read, removed or written.
 fn interrupted(work: &str, key: &str) -> Result<Option<Interrupted>, NotLaidOut> {
     let record = command_record(work);
-    let text = match retried(|| tools::read_record(&record), || thread::sleep(WARM_WRITE_WAIT)) {
+    let text = match read_command_record(&record) {
         Ok(None) => return Ok(None),
         Ok(Some(text)) => text,
-        Err(error) if error.kind() == io::ErrorKind::InvalidData => String::new(),
         Err(error) if error.raw_os_error() == Some(SHARING_VIOLATION) => {
             return Err(NotLaidOut::Refused(format!("cannot read {record}: {error}")));
         }
@@ -1231,6 +1230,16 @@ fn interrupted(work: &str, key: &str) -> Result<Option<Interrupted>, NotLaidOut>
         }
     };
     Ok(Some(Interrupted::read(&text, key, SystemTime::now())))
+}
+
+/// The text of the interrupted-command record `record`, `None` when there is none: read as the tools record is, never
+/// through a link, tried again while another process holds it ([`retried`]); one that is not UTF-8 reads as empty, a
+/// record of no form. Else why it could not be read.
+pub(super) fn read_command_record(record: &str) -> io::Result<Option<String>> {
+    match retried(|| tools::read_record(record), || thread::sleep(WARM_WRITE_WAIT)) {
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(Some(String::new())),
+        read => read,
+    }
 }
 
 /// Puts an empty interrupted-command record, flushed to the disk, at `record` in place of one that cannot be read:

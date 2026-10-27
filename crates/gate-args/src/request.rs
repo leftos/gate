@@ -85,6 +85,18 @@ pub struct BoxSeams {
     /// The share of its machine, in whole percent from 1 to 100, that `gate box run`'s samples find free, others
     /// holding the rest, in place of what the machine's times say; `None` without the feature.
     pub free_percent: Option<u32>,
+    /// How long, in milliseconds, a drain ticket and a drain session stay live after their last poll or call, in place
+    /// of 120 s; `None` without the feature.
+    pub drain_lease_ms: Option<u64>,
+    /// How long, in milliseconds, a drain barrier stands after its last raise, in place of 30 minutes; `None` without
+    /// the feature.
+    pub drain_lapse_ms: Option<u64>,
+    /// The time, in whole seconds since the Unix epoch, the drain's barrier, tickets and sessions are judged at, in
+    /// place of the clock's; `None` without the feature.
+    pub now: Option<u64>,
+    /// Which processes the drained test counts: every one, or only those whose command line it can read, leaving out
+    /// a git, gate or pwsh image it cannot read; [`ProcessScan::All`] without the feature.
+    pub drain_readable_only: ProcessScan,
     /// How many processes the ending of a job `gate box run`'s ceiling killed reports left, in place of what the job
     /// holds after it; `None` without the feature.
     pub kill_leaves: Option<u64>,
@@ -193,6 +205,16 @@ pub(crate) const DESKTOP_SESSIONS: &[(&str, DesktopSession)] = &[
     ("disconnected", DesktopSession::Disconnected),
 ];
 
+/// Which processes `gate box drain`'s drained test counts, as `--test-box-drain-readable-only` says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProcessScan {
+    /// Every process its rules count, an unreadable git, gate or pwsh image included.
+    #[default]
+    All,
+    /// Only processes whose command line it can read.
+    ReadableOnly,
+}
+
 /// What `gate box` was asked to do on the builder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BoxVerb {
@@ -211,6 +233,8 @@ pub enum BoxVerb {
     RegisterDesktop,
     /// The removal of the builder's work folders no run has used for over a day; it takes no request, only its root.
     Prune,
+    /// The builder's drain barrier: raised or raised again, read, or lifted, as the request's `Action` says.
+    Drain,
 }
 
 impl BoxVerb {
@@ -228,6 +252,7 @@ impl BoxVerb {
             BoxVerb::Lfs => "lfs",
             BoxVerb::RegisterDesktop => "register-desktop",
             BoxVerb::Prune => "prune",
+            BoxVerb::Drain => "drain",
         }
     }
 

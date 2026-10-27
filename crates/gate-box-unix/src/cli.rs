@@ -38,7 +38,9 @@ pub fn action(args: Vec<OsString>) -> Action {
 pub fn unbuilt(verb: BoxVerb) -> Option<String> {
     match verb {
         BoxVerb::Preflight | BoxVerb::Boot | BoxVerb::Stop | BoxVerb::Run | BoxVerb::Prune | BoxVerb::Inputs | BoxVerb::Outputs => None,
-        BoxVerb::Inflight | BoxVerb::Lfs | BoxVerb::RegisterDesktop => Some(format!("gate: box {} is not built on this builder", verb.as_str())),
+        BoxVerb::Inflight | BoxVerb::Lfs | BoxVerb::RegisterDesktop | BoxVerb::Drain => {
+            Some(format!("gate: box {} is not built on this builder", verb.as_str()))
+        }
     }
 }
 

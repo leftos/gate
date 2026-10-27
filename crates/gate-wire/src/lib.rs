@@ -381,6 +381,42 @@ impl Payload {
         }
     }
 
+    /// The run's drain session id, `Session`: 1 to [`MOST_SESSION_CHARS`] ASCII letters, digits, `_` and `-`; `None`
+    /// when the key is absent or null, as a PC older than the drain sends it. Else the usage line, the value shown with
+    /// its control characters escaped.
+    pub fn session(&self) -> Result<Option<&str>, String> {
+        match self.object.get("Session") {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(session)) if is_session_id(session) => Ok(Some(session)),
+            Some(Value::String(session)) => Err(format!(
+                "gate: box payload Session must be 1 to {MOST_SESSION_CHARS} letters, digits, _ and -: {}",
+                escaped(session)
+            )),
+            Some(_) => Err("gate: box payload Session is not a text".to_owned()),
+        }
+    }
+
+    /// Whether a refused call takes no place in the drain's line, `NoTicket`: true or false, false when the key is
+    /// absent or null; else the usage line saying it is not true or false.
+    pub fn no_ticket(&self) -> Result<bool, String> {
+        match self.object.get("NoTicket") {
+            None | Some(Value::Null) => Ok(false),
+            Some(Value::Bool(no_ticket)) => Ok(*no_ticket),
+            Some(_) => Err("gate: box payload NoTicket is not true or false".to_owned()),
+        }
+    }
+
+    /// What `gate box drain` is asked to do, `Action`: `raise`, `status` or `lift`; else the usage line saying the
+    /// payload lacks it or naming the value, its control characters escaped.
+    pub fn drain_action(&self) -> Result<DrainAction, String> {
+        match self.text("Action")? {
+            "raise" => Ok(DrainAction::Raise),
+            "status" => Ok(DrainAction::Status),
+            "lift" => Ok(DrainAction::Lift),
+            other => Err(format!("gate: box payload Action must be raise, status or lift: {}", escaped(other))),
+        }
+    }
+
     /// The run's `DesktopWait`: whole seconds from 1 to 2147483647, how long the box may wait for the builder's
     /// desktop; `None` when the key is absent or null. Else the usage line.
     pub fn desktop_wait(&self) -> Result<Option<u64>, String> {
@@ -894,6 +930,30 @@ impl Payload {
     }
 }
 
+/// The most characters a drain session id, the payload's `Session`, may have.
+pub const MOST_SESSION_CHARS: usize = 64;
+
+/// Whether `text` is a drain session id: 1 to [`MOST_SESSION_CHARS`] ASCII letters, digits, `_` and `-`, so it names
+/// one file of the drain's folders and nothing else.
+#[must_use]
+pub fn is_session_id(text: &str) -> bool {
+    (1..=MOST_SESSION_CHARS).contains(&text.len())
+        && text
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+}
+
+/// What `gate box drain` is asked to do, as the payload's `Action` names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainAction {
+    /// Raise the barrier, or raise it again, then say how the drain stands.
+    Raise,
+    /// Say how the drain stands, changing nothing but the removal of dead records.
+    Status,
+    /// Lift the barrier, then say how the drain stands.
+    Lift,
+}
+
 /// Whether `job` is a run's job name of the work folder `key` under `form`: `Local\gate-remote-<key>-<nonce>` under
 /// [`PathForm::Windows`], `gate-remote-<key>-<nonce>` under [`PathForm::Unix`], the nonce 12 hex digits, as the client
 /// names it.
@@ -1161,6 +1221,9 @@ pub enum Refusal {
     Install,
     /// The repo's LFS store does not hold what the run's snapshot's pointers name as its `LfsDigest` says.
     Lfs,
+    /// A drain barrier stands on the builder, an older run waits in the drain's line, or the run's drain session has
+    /// ended.
+    Drain,
 }
 
 impl Refusal {
@@ -1176,6 +1239,7 @@ impl Refusal {
             Refusal::Desktop => "desktop",
             Refusal::Install => "install",
             Refusal::Lfs => "lfs",
+            Refusal::Drain => "drain",
         }
     }
 }
@@ -1394,8 +1458,8 @@ mod tests {
         use serde_json::{Value, json};
 
         use crate::{
-            BoxKill, IDENTITY_NAMES, PathForm, Payload, Refusal, adjusted_line, adjusted_prefix, busy_line, killed_line, layout_line, refused_line,
-            started_line, tools_line,
+            BoxKill, DrainAction, IDENTITY_NAMES, PathForm, Payload, Refusal, adjusted_line, adjusted_prefix, busy_line, killed_line, layout_line,
+            refused_line, started_line, tools_line,
         };
 
         const NONCE: &str = "0123456789abcdef0123456789abcdef";
@@ -1415,10 +1479,66 @@ mod tests {
                 (Refusal::Desktop, "desktop"),
                 (Refusal::Install, "install"),
                 (Refusal::Lfs, "lfs"),
+                (Refusal::Drain, "drain"),
             ] {
                 assert_eq!(refusal.word(), word);
                 assert_eq!(refused_line(NONCE, refusal), format!("gate-remote-refused: {NONCE} {word}"));
             }
+        }
+
+        #[test]
+        fn a_session_is_one_to_sixty_four_safe_characters_and_absent_is_none() {
+            let longest = "a".repeat(64);
+            for (value, expected) in [
+                (json!("run-1_A"), Ok(Some("run-1_A"))),
+                (json!(longest), Ok(Some(longest.as_str()))),
+                (Value::Null, Ok(None)),
+            ] {
+                assert_eq!(payload(&json!({ "Session": value })).session(), expected, "{value}");
+            }
+            assert_eq!(payload(&json!({})).session(), Ok(None), "an older PC sends no Session");
+            for bad in [json!(""), json!("a".repeat(65)), json!("a/b"), json!("a.b"), json!("a b"), json!("é")] {
+                let asked = payload(&json!({ "Session": bad }));
+                let refused = asked.session();
+                assert!(
+                    refused
+                        .as_ref()
+                        .is_err_and(|line| line.starts_with("gate: box payload Session must be 1 to 64")),
+                    "{bad}: {refused:?}"
+                );
+            }
+            assert_eq!(
+                payload(&json!({ "Session": 7 })).session(),
+                Err("gate: box payload Session is not a text".to_owned())
+            );
+        }
+
+        #[test]
+        fn no_ticket_is_a_bool_that_defaults_to_false() {
+            assert_eq!(payload(&json!({})).no_ticket(), Ok(false));
+            assert_eq!(payload(&json!({ "NoTicket": null })).no_ticket(), Ok(false));
+            assert_eq!(payload(&json!({ "NoTicket": true })).no_ticket(), Ok(true));
+            assert_eq!(payload(&json!({ "NoTicket": false })).no_ticket(), Ok(false));
+            assert_eq!(
+                payload(&json!({ "NoTicket": "yes" })).no_ticket(),
+                Err("gate: box payload NoTicket is not true or false".to_owned())
+            );
+        }
+
+        #[test]
+        fn the_drain_action_is_raise_status_or_lift() {
+            for (word, action) in [
+                ("raise", DrainAction::Raise),
+                ("status", DrainAction::Status),
+                ("lift", DrainAction::Lift),
+            ] {
+                assert_eq!(payload(&json!({ "Action": word })).drain_action(), Ok(action));
+            }
+            assert_eq!(payload(&json!({})).drain_action(), Err("gate: box payload lacks Action".to_owned()));
+            assert_eq!(
+                payload(&json!({ "Action": "Raise" })).drain_action(),
+                Err("gate: box payload Action must be raise, status or lift: Raise".to_owned())
+            );
         }
 
         #[test]
