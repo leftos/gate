@@ -290,14 +290,16 @@ fn a_stalled_command_is_killed_with_its_grandchild() {
     let case = Case::new("a_stalled_command_is_killed_with_its_grandchild");
     // Never created: the grandchild waits on it until the kill ends it.
     let go = shown(&case.folder().join("go"));
-    // The command's own pid, its `pid` line, the grandchild's pid and its `spawned` line each restart the stall
-    // window, so the stall can only come once both processes are in the job and the command has gone quiet.
+    let pid_file = case.folder().join("command.pid");
+    // The window opens at the command's first output byte, its `spawned` line, written only once the grandchild is in
+    // the job; its own pid goes to a file before that, without output, so nothing the case reads has to come before the
+    // window closes.
     let seams = ["--test-stall-ms", "3000", "--test-sample-ms", "100", "--test-stall-from-output"];
 
     let outcome = case.run(&run_words(
         "out.log",
         &seams,
-        &[FAKE_TOOL, "pid", "spawn-wait", &go, "sleep", UNTIL_KILLED],
+        &[FAKE_TOOL, "pid-to", &shown(&pid_file), "spawn-wait", &go, "sleep", UNTIL_KILLED],
     ));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
@@ -307,10 +309,14 @@ fn a_stalled_command_is_killed_with_its_grandchild() {
     let log_path = case.folder().join("out.log");
     wait_until_closed(&log_path);
     let log = log_texts(&log_path);
-    for prefix in ["pid ", "spawned "] {
-        let pid = said_pid(&log, prefix);
+    let command: u32 = fs::read_to_string(&pid_file)
+        .expect("the command wrote its pid before its first output")
+        .trim()
+        .parse()
+        .expect("the pid file holds a pid");
+    for (pid, which) in [(command, "command"), (said_pid(&log, "spawned "), "grandchild")] {
         // A terminated process leaves its job before its object is signalled, so its end is waited for, not read once.
-        wait_until(&format!("the killed process {pid} ({prefix:?}) ending"), || {
+        wait_until(&format!("the killed {which} {pid} ending"), || {
             gate_win32::process_start_of(pid).is_ok_and(|start| start.is_none())
         });
     }
@@ -445,9 +451,10 @@ fn a_quiet_command_that_ran_a_short_child_is_still_stalled_and_its_process_lines
     let seams = ["--test-stall-ms", "1500", "--test-sample-ms", "100", "--test-stall-from-output"];
     let log_path = case.folder().join("out.log");
 
-    // The command runs one child to its end, then sleeps until killed: once the child is gone nothing in the job moves,
-    // and the child's spawn and exit lines in the log must not count as the command's output.
-    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "pid", "run-each", "1", "sleep", UNTIL_KILLED]));
+    // The command runs one child to its end, waiting for it, and only then writes its first byte, its `pid` line, which
+    // opens the stall window; then it sleeps until killed. So the child has ended before the window opens, however long
+    // it waits for CPU, and the child's spawn and exit lines must not count as the command's output.
+    let outcome = case.run(&run_words("out.log", &seams, &[FAKE_TOOL, "run-each", "1", "pid", "sleep", UNTIL_KILLED]));
 
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     assert!(outcome.stderr.contains("gate: STALLED: "), "{outcome:?}");
@@ -458,9 +465,14 @@ fn a_quiet_command_that_ran_a_short_child_is_still_stalled_and_its_process_lines
     let child: Option<u32> = lines
         .iter()
         .find_map(|line| line.strip_prefix("spawn pid=")?.split_once(&child_head)?.0.parse().ok());
+    let ran_to_its_end = |child: u32| {
+        exit_of(&lines, child)
+            .and_then(|at| lines.get(at))
+            .is_some_and(|line| line.starts_with(&format!("exit pid={child} code=0 ")))
+    };
     assert!(
-        child.is_some_and(|child| exit_of(&lines, child).is_some()),
-        "a spawn and an exit line of the command's child: {lines:#?}"
+        child.is_some_and(ran_to_its_end),
+        "a spawn and an exit line of the command's child, which ran to its end: {lines:#?}"
     );
     // The command's own bytes are its `pid` line on stdout, and it wrote nothing on stderr: every sample counts those,
     // or none yet when it came before the reader had the line, and never the process lines the log holds.
