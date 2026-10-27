@@ -371,9 +371,12 @@ fn a_test_root_names_its_slots_with_its_hash() {
     let running = start(&case, "out.log", Some(&go), &[]);
     let claim = claim_path(&case);
 
-    wait_for_file(&claim);
+    let needle = take_needle(running.id());
+    running.wait_until("the gate journalling its take", || {
+        fs::read_to_string(case.root().join("events.jsonl")).is_ok_and(|text| text.contains(&needle))
+    });
 
-    let read = read_claim(&claim).expect("the claim reads as a v1 claim");
+    let read = read_claim(&claim).expect("the claim is written before the take is journalled");
     assert_eq!(read.pid, running.id());
     assert!(mutex_exists(&name).expect("the slot can be probed"), "{name} is held");
     let take = takes(&case).pop().expect("the gate journalled its take");

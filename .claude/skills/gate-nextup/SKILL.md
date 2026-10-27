@@ -102,6 +102,8 @@ To hold a process's end open with no load (a process asked to end but not yet go
 
 To make a gate wait on its journal, hold the case root's journal mutex, `Local\gate-<first 8 hex of the SHA-256 of the lower-cased state path>-journal`, for under 2 s: past 2 s the gate drops the line by design. To freeze a child gate outside a journal write, take the mutex first, suspend the child, then let the mutex go; GATE-658 was settled that way.
 
+A gate writes a slot's claim file before its journal take line, on one thread, and stamps the take line's `time` before its journal wait: a case that needs the take waits for the take line and reads the claim after it, never the reverse. To hold a gate between its claim and its take, hold the case root's light slot before the gate starts (the case folder is `<name>-<test pid>-0`, so the hash is known once the suite process starts), take the journal mutex once the queue line appears, then let the slot go; GATE-813 was settled that way.
+
 The rig needs the case's gate.exe on this PC, but the launcher routes nextest to the builder: build once with `-Local -Reason "the rig needs this PC's gate.exe"` and `--no-run`, then run the suite binary directly under the rig. A fault in a parent gate's timing shows by freezing the child gate it waits on, not the parent (GATE-480). A rig that reads the case folder opens its files with delete sharing, or it causes the case's `os error 32` on folder removal itself.
 
 A builder run over plain ssh has only a pseudo-console, so a fault that needs a real console (as the box gives a routed command) never shows there. Start such a repro with `CREATE_NEW_CONSOLE`, or route it.
