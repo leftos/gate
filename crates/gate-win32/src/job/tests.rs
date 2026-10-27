@@ -1,15 +1,16 @@
 use std::io;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
-use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::System::IO::{CreateIoCompletionPort, PostQueuedCompletionStatus};
 
 use super::{
-    DRAIN_WAIT_MS, Departure, ERROR_MORE_DATA, JOBOBJECT_BASIC_PROCESS_ID_LIST, Job, JobEvent, Joined, Member, Message, Missed, Opened, Remembered,
-    Settled, Unread, Until, drain_loop, holds, kept, listed_ids, member, open_any, remembered_as, settled, trouble,
+    DRAIN_WAIT_MS, Departure, ERROR_MORE_DATA, FINISH_KEY, Hold, JOBOBJECT_BASIC_PROCESS_ID_LIST, Job, JobEvent, Joined, Member, Message, Missed,
+    Opened, Remembered, Settled, Unread, Until, drain_loop, holds, kept, listed_ids, member, open_any, remembered_as, settled, take_message, trouble,
 };
-use crate::{EnvironmentBlock, Launch, LaunchOutput, Running, Suspended, start_and_exit_of, system_directory, timestamp_of};
+use crate::{EnvironmentBlock, Launch, LaunchOutput, Running, Suspended, own_handle, start_and_exit_of, system_directory, timestamp_of};
 
 /// The longest a test waits for its member to end, for the job to remember it, or for the job's drop.
 const HANG_GUARD: Duration = Duration::from_secs(600);
@@ -262,6 +263,7 @@ fn the_drain_loop_hands_each_message_to_its_own_step_and_moves_nothing_on_anothe
         |pid| found.push(pid),
         |pid| exited.push(pid),
         || idle += 1,
+        || {},
     )
     .expect("the loop ends on the close");
 
@@ -269,6 +271,42 @@ fn the_drain_loop_hands_each_message_to_its_own_step_and_moves_nothing_on_anothe
     assert_eq!(exited, vec![7], "the process that exited");
     assert_eq!(idle, 2, "each empty wait, and nothing else, lets the members settle");
     assert!(waits.iter().all(|&wait| wait == DRAIN_WAIT_MS), "no wait is endless: {waits:?}");
+}
+
+#[test]
+fn the_drain_loop_hands_the_finish_to_its_finish_step_and_carries_on() {
+    let mut script = vec![Message::Finish, Message::NewProcess(7), Message::Close].into_iter();
+    let mut found = Vec::new();
+    let mut finished = 0;
+
+    drain_loop(
+        |_| Ok(script.next().expect("a scripted message")),
+        |pid| found.push(pid),
+        |_| {},
+        || {},
+        || finished += 1,
+    )
+    .expect("the loop ends on the close");
+
+    assert_eq!(finished, 1, "the finish ran once");
+    assert_eq!(found, vec![7], "the loop took the message after the finish");
+}
+
+#[test]
+fn take_message_reads_a_finish_packet_as_the_finish() {
+    // SAFETY: an invalid file handle with no existing port asks for a new port, which takes no pointers. A success is a
+    // fresh handle nothing else owns.
+    let port = unsafe { own_handle(CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1)) }.expect("the port is created");
+    // SAFETY: the port is open for the whole call, and no `OVERLAPPED` is passed.
+    let posted = unsafe { PostQueuedCompletionStatus(port.raw(), 0, FINISH_KEY, std::ptr::null()) };
+    assert_ne!(posted, 0, "the finish is posted");
+
+    assert_eq!(take_message(&port, 0).expect("the packet is taken"), Message::Finish);
+    assert_eq!(
+        take_message(&port, 0).expect("the port is read"),
+        Message::Empty,
+        "one packet, taken once"
+    );
 }
 
 #[test]
@@ -472,6 +510,30 @@ fn dropping_a_remembering_job_ends_its_drain_thread_and_releases_what_it_shares(
     );
 }
 
+/// A test's hold on a drain thread, released when dropped, so a panic in the test never leaves the thread held for the
+/// job's drop to wait on.
+struct Held<'a>(&'a Hold);
+
+impl<'a> Held<'a> {
+    /// Holds the drain thread of `hold` before it takes its next message.
+    fn on(hold: &'a Hold) -> Self {
+        hold.state.lock().unwrap_or_else(PoisonError::into_inner).held = true;
+        Held(hold)
+    }
+
+    /// Whether the drain thread waits on the hold.
+    fn parked(&self) -> bool {
+        self.0.state.lock().unwrap_or_else(PoisonError::into_inner).parked
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap_or_else(PoisonError::into_inner).held = false;
+        self.0.changed.notify_all();
+    }
+}
+
 /// A job that remembers, telling its events to the receiver returned with it.
 fn telling_job() -> (Job, mpsc::Receiver<JobEvent>) {
     let mut job = Job::anonymous_kill_on_close().expect("the job is created");
@@ -560,6 +622,7 @@ fn a_member_s_exit_carries_its_code_its_exit_time_and_its_run_time() {
     let (job, events) = telling_job();
     let ended = started(&job, "exit 3");
     assert_eq!(ended.wait(HANG_GUARD).expect("the wait answers"), Some(3), "the member ended");
+    wait_until("the job remembers the member", || job.remembers(ended.pid()));
 
     job.finish_events(HANG_GUARD);
     let mine: Vec<JobEvent> = all_events(&events)
@@ -579,6 +642,31 @@ fn a_member_s_exit_carries_its_code_its_exit_time_and_its_run_time() {
     assert!(exited >= spawned, "{mine:?}");
     assert_eq!(ran, Some(exited.duration_since(spawned)), "exit less create");
     assert!(!ran.expect("the run time is read").is_negative(), "{mine:?}");
+}
+
+#[test]
+fn a_member_the_drain_thread_has_not_taken_by_the_finish_still_gets_its_spawn_and_exit() {
+    let (job, events) = telling_job();
+    let memory = job.memory.as_ref().expect("the job remembers");
+    let held = Held::on(&memory.shared.hold);
+    wait_until("the drain thread is parked on the hold", || held.parked());
+    let late = started(&job, "exit 0");
+    assert_eq!(late.wait(HANG_GUARD).expect("the wait answers"), Some(0), "the member ended");
+
+    assert!(job.post_finish(), "the finish is posted behind the member's messages");
+    drop(held);
+    // The drain thread itself drops the sink, so the caller's own finish below is not what sends the events.
+    wait_until("the drain thread drops the sink", || memory.shared.lock().events.is_none());
+    job.finish_events(HANG_GUARD);
+    let mine: Vec<JobEvent> = all_events(&events)
+        .into_iter()
+        .filter(|event| pid_of(event) == Some(late.pid()))
+        .collect();
+
+    assert!(
+        matches!(mine.as_slice(), [JobEvent::Spawned { .. }, JobEvent::Exited { code: Some(0), .. }]),
+        "a spawn and an exit of the member the drain thread had not taken: {mine:?}"
+    );
 }
 
 #[test]

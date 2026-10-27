@@ -1006,7 +1006,14 @@ fn a_spawned_child_has_spawn_and_exit_lines_naming_its_parent() {
 
     let running = case.start(&run_words("out.log", &[], &command));
     let gate = running.id();
-    wait_until("the child's pid in the log", || log_text(&case).contains("spawned "));
+    running.wait_until("the gate's spawn line of the child", || {
+        // Read without asserting: a `spawned ` line still being written has no pid yet.
+        let child: Option<u32> = log_text(&case)
+            .lines()
+            .find_map(|line| line.strip_prefix("spawned "))
+            .and_then(|pid| pid.parse().ok());
+        child.is_some_and(|child| spawn_of(&process_lines(&log_path(&case)), child).is_some())
+    });
     // The go file ends the child, and the proceed file the command, so each exits on its own.
     fs::write(&go, "").expect("the go file can be written");
     fs::write(&proceed, "").expect("the proceed file can be written");

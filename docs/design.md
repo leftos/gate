@@ -1643,6 +1643,8 @@ All kept, with each knob's default unchanged:
 
     `Job::remember` starts a thread (`job-memory`) that waits on the port 100 ms at a time and reads each new member's start the moment its `JOB_OBJECT_MSG_NEW_PROCESS` message arrives, keeping its handle open while it runs. The handle is closed, the exit time kept, when the member's `JOB_OBJECT_MSG_EXIT_PROCESS` or `JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS` message arrives, or after a wait that came back empty. Samples and the kill's look only read the memory.
 
+    When the process lines end (`Job::finish_events`), the job waits on its running members, then posts a finish packet to the port. The thread, the port's one reader, takes it after every message queued before it, so a member it had not yet taken when the command ended still gets its `spawn` and `exit` lines before the finish runs; the call waits for that within what is left of the same budget. It runs the finish itself when the thread has ended, the post fails or the budget is spent, so the gate's exit stays bounded by the caller's wait. A member that lives through the whole budget leaves the thread no turn.
+
     Dropping the job removes the port association, sets a closing flag, posts a close message and waits for the thread to end; the port stays open until then, and a thread that misses the message sees the flag when its wait ends.
 
     A failure in the thread is stored, and `Job::departed` returns it with the members it has (`Departures`): the job then no longer remembers the processes that join it, so a kill may miss a process that left the job under one that ended. A member whose start or exit cannot be read is dropped and reported the same way, the first three by pid and the rest as `<n> more member(s) could not be read`.

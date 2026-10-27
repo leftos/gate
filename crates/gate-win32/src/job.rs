@@ -4,7 +4,7 @@ use std::io;
 use std::os::windows::io::BorrowedHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, SyncSender};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,11 @@ use crate::{own_handle, start_and_exit_of, timestamp_of, wide};
 /// The completion key a job's drop posts to its port to wake its drain thread; the job's own messages carry the key 0
 /// the port was associated with.
 const CLOSE_KEY: usize = 1;
+
+/// The completion key [`Job::finish_events`] posts to the job's port to have the drain thread finish the events. The port
+/// queues its packets in order, and the drain thread is the one thread that takes them, so it takes them in that order:
+/// every message the job posted before the finish is taken first. Order across several dequeuing threads is not kept.
+const FINISH_KEY: usize = 2;
 
 /// The longest the drain thread waits for a message before it looks again, in milliseconds: a port found empty for that
 /// long lets the members that have exited settle, and the job's drop is seen within it.
@@ -180,6 +185,42 @@ struct Shared {
     /// Set by the job's drop: the drain thread ends at its next look at the port.
     closing: AtomicBool,
     remembered: Mutex<Remembered>,
+    /// Signalled, with `remembered`, once the drain thread has dropped the sink: on the finish, or on a failure.
+    sink_dropped: Condvar,
+    /// What a test holds the drain thread on before it takes each message.
+    #[cfg(test)]
+    hold: Hold,
+}
+
+/// A test's hold on the drain thread: while it is held, the thread waits before it takes its next message, outside the
+/// memory's locks, and says it is parked.
+#[cfg(test)]
+#[derive(Default)]
+struct Hold {
+    state: Mutex<HoldState>,
+    changed: Condvar,
+}
+
+/// Whether a test holds the drain thread, and whether the thread waits on the hold.
+#[cfg(test)]
+#[derive(Default)]
+struct HoldState {
+    held: bool,
+    parked: bool,
+}
+
+#[cfg(test)]
+impl Hold {
+    /// Waits while the hold is held, parked.
+    fn wait_while_held(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while state.held {
+            state.parked = true;
+            self.changed.notify_all();
+            state = self.changed.wait(state).unwrap_or_else(PoisonError::into_inner);
+        }
+        state.parked = false;
+    }
 }
 
 /// The members the drain thread has found, and what keeps the memory from being whole.
@@ -197,6 +238,8 @@ struct Remembered {
     /// Where each [`JobEvent`] is sent, under this lock, until [`Job::finish_events`], the job's drop or a stopped
     /// drain thread drops it; `None` for a job given no sink.
     events: Option<Sender<JobEvent>>,
+    /// Whether the finish is posted to the drain thread already ([`Job::post_finish`]), so it is posted once.
+    finish_posted: bool,
 }
 
 /// What a member's join read of it: for [`Job::traced`], a copy of its handle for the naming thread and its times
@@ -249,6 +292,8 @@ enum Message {
     Other,
     /// The job's drop asks the drain thread to end.
     Close,
+    /// [`Job::finish_events`] asks the drain thread to finish the events, after every message posted before it.
+    Finish,
     /// No message came within the wait.
     Empty,
 }
@@ -425,6 +470,9 @@ impl Job {
                 events,
                 ..Remembered::default()
             }),
+            sink_dropped: Condvar::new(),
+            #[cfg(test)]
+            hold: Hold::default(),
         });
         let (namer, joins) = std::sync::mpsc::sync_channel(NAMING_QUEUE);
         let named = Arc::clone(&traces);
@@ -656,10 +704,15 @@ impl Job {
     /// settles them, sending [`JobEvent::Exited`] for each that has, sends [`JobEvent::Left`] for each still running,
     /// then drops the sink, so a receiver's iterator ends. No event is sent after it. The memory's lock is not held
     /// through the wait. A second call, or a call on a job given no sink, does nothing.
+    ///
+    /// The finish is run by the drain thread, after every message the job posted before it, so a member the drain
+    /// thread had not taken yet still gets its [`JobEvent::Spawned`]; what is left of `wait` bounds the wait for it.
+    /// A drain thread that has ended, or has not run the finish by then, leaves the finish to this call.
     pub fn finish_events(&self, wait: Duration) {
         let Some(memory) = &self.memory else {
             return;
         };
+        let begun = Instant::now();
         let waitable = {
             let remembered = memory.shared.lock();
             if remembered.events.is_none() {
@@ -668,7 +721,37 @@ impl Job {
             remembered.waitable()
         };
         wait_for_all(&waitable, wait);
-        memory.shared.lock().finish();
+        let draining = !memory.drainer.as_ref().is_some_and(JoinHandle::is_finished);
+        let mut remembered = if self.post_finish() && draining {
+            let left = wait.saturating_sub(begun.elapsed());
+            let waited = memory
+                .shared
+                .sink_dropped
+                .wait_timeout_while(memory.shared.lock(), left, |remembered| remembered.events.is_some());
+            waited.unwrap_or_else(PoisonError::into_inner).0
+        } else {
+            memory.shared.lock()
+        };
+        remembered.finish();
+    }
+
+    /// Posts the finish to the drain thread, once, behind every message the job has posted; nothing for a job whose
+    /// sink is gone. Whether a finish is on its way to the drain thread, posted now or before.
+    fn post_finish(&self) -> bool {
+        let Some(memory) = &self.memory else {
+            return false;
+        };
+        let mut remembered = memory.shared.lock();
+        if remembered.events.is_none() {
+            return false;
+        }
+        if remembered.finish_posted {
+            return true;
+        }
+        // SAFETY: the port is open for the whole call, and no `OVERLAPPED` is passed.
+        let posted = unsafe { PostQueuedCompletionStatus(memory.shared.port.raw(), 0, FINISH_KEY, std::ptr::null()) } != 0;
+        remembered.finish_posted = posted;
+        posted
     }
 }
 
@@ -686,6 +769,8 @@ impl Shared {
     /// `namer`, and a full queue or an ended naming thread leaves it unnamed.
     fn drain(&self, created_at: Timestamp, namer: &SyncSender<Naming<Key>>) {
         let take = |wait| {
+            #[cfg(test)]
+            self.hold.wait_while_held();
             if self.closing.load(Ordering::Acquire) {
                 Ok(Message::Close)
             } else {
@@ -703,12 +788,18 @@ impl Shared {
             Err(missed) => self.lock().missed(pid, missed),
         };
         let exited = |pid| self.lock().exited(pid);
-        if let Err(error) = drain_loop(take, found, exited, || self.lock().settle()) {
+        let finish = || {
+            self.lock().finish();
+            self.sink_dropped.notify_all();
+        };
+        if let Err(error) = drain_loop(take, found, exited, || self.lock().settle(), finish) {
             let mut remembered = self.lock();
             let why = error.to_string();
             // Nothing that joins the job is remembered from here, so no event is sent either.
             remembered.stop_events(&why);
             remembered.stopped = Some(why);
+            drop(remembered);
+            self.sink_dropped.notify_all();
         }
     }
 }
@@ -953,17 +1044,19 @@ impl<H> Member<H> {
 }
 
 /// The drain thread's loop: takes each message ([`take_message`], waiting at most [`DRAIN_WAIT_MS`]), hands each
-/// process reported joining the job to `found` and each reported exiting to `exited`, and runs `idle` after each wait
-/// that found no message. Returns when a message asks it to close.
+/// process reported joining the job to `found` and each reported exiting to `exited`, runs `idle` after each wait
+/// that found no message and `finish` on the finish. Returns when a message asks it to close.
 fn drain_loop(
     mut take: impl FnMut(u32) -> io::Result<Message>,
     mut found: impl FnMut(u32),
     mut exited: impl FnMut(u32),
     mut idle: impl FnMut(),
+    mut finish: impl FnMut(),
 ) -> io::Result<()> {
     loop {
         match take(DRAIN_WAIT_MS)? {
             Message::Close => return Ok(()),
+            Message::Finish => finish(),
             Message::Empty => idle(),
             Message::NewProcess(pid) => found(pid),
             Message::Exited(pid) => exited(pid),
@@ -990,6 +1083,9 @@ fn take_message(port: &OwnedHandle, wait: u32) -> io::Result<Message> {
     }
     if key == CLOSE_KEY {
         return Ok(Message::Close);
+    }
+    if key == FINISH_KEY {
+        return Ok(Message::Finish);
     }
     if ![
         JOB_OBJECT_MSG_NEW_PROCESS,
