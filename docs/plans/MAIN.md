@@ -4,33 +4,30 @@
 
 ## Do first
 
+- [ ] GATE-812 Make launch::a_spawned_child_has_spawn_and_exit_lines_naming_its_parent load-proof — Urgent · Local gate
+- [ ] GATE-813 Make slots::a_test_root_names_its_slots_with_its_hash wait for its take line — Urgent · Local gate
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [/] GATE-696 Cross-build Windows outputs on a macOS builder and bring them back — Urgent · Remote
-- [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root — High · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [/] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [ ] GATE-559 Drain the builder behind a barrier so it can be redeployed — High · Remote
-- [ ] GATE-562 Builder drain 1: the barrier, admission and gated verbs on the box — High · Remote
+- [/] GATE-562 Builder drain 1: the barrier, admission and gated verbs on the box — High · Remote
 - [ ] GATE-563 Builder drain 2: make a routed run wait on its PC for the lift — High · Remote
 - [ ] GATE-564 Builder drain 3: gate drain on the PC, and its docs — High · Remote
-- [ ] GATE-572 Refuse routing when the builder's work drive is under a free-space floor — High · Remote
+- [ ] GATE-807 Builder drain 1b: the barrier on the Unix box — High · Remote
 - [ ] GATE-621 Ask for a full outputs send when a worktree's routed runs switch builder — High · Remote
-- [ ] GATE-639 Test the macOS snapshot from a subfolder and list the repo once per decision — High · Remote
-- [ ] GATE-640 Refuse a macOS builder root holding ':' when remote.json is read — High · Remote
-- [ ] GATE-643 Say why a routed command naming a project under .tmp cannot route, and check --no-build after a routed build — High · Remote
-- [ ] GATE-649 Bring back every test project's output a routed dotnet test build made — High · Remote
 - [ ] GATE-682 Explain or track a stall when a gated command is plain ssh to another machine — High · Remote
 - [/] GATE-683 Prune a deleted worktree's folders from every builder, and prune the Mac by space — High · Remote
 - [ ] GATE-689 Prune a gone worktree's keys from the Windows builders and the PC — High · Remote
-- [!] GATE-731 Route yaat's test-all to the Mac mini — High · Remote
+- [ ] GATE-731 Route yaat's test-all to the Mac mini — High · Remote
 - [ ] GATE-745 Bring back the files a routed dotnet command's /flp and /getResultOutputFile switches name — High · Remote
 - [ ] GATE-751 Make a routed build's outputs pull fast enough for yaat's trees, or skip it for verdict-only runs — High · Remote
 - [ ] GATE-753 Log every step of a run in the gate's log: start, progress, end and duration — High · Remote
-- [ ] GATE-757 Retry a transfer that fails after a passing routed command, and say the command's verdict — High · Remote
 - [ ] GATE-759 Move the rest of the box's shared wire rules into gate-wire (GATE-616 slices 2, 3, 5, 6) — High · Remote
+- [ ] GATE-806 Send the gitignored project inputs a routed command names to the builder — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -47,18 +44,19 @@
 ## Remote
 
 - [ ] GATE-792 Read a work folder's idleness from its stamped lock alone in the Windows box prune
-- [ ] GATE-775 Judge the Unix box's login PATH folders and the folder xcode-select names (sub-issue of GATE-614)
-- [ ] GATE-776 Walk the folders above the Unix box's work root to / (sub-issue of GATE-614)
-- [ ] GATE-777 Pin the Unix box's work root at install and refuse any other (sub-issue of GATE-614)
-- [ ] GATE-778 Keep the Unix box's own binary out of reach of the commands it runs (sub-issue of GATE-614)
-- [ ] GATE-779 Refuse extended ACL write entries on the Unix box's root and strip them from a root it makes (sub-issue of GATE-614)
-- [ ] GATE-780 Hold the Unix box's root open through preflight, layout, records, lock and stop (sub-issue of GATE-614)
-- [ ] GATE-781 Write the Unix box's .git/config whole at layout, under the work lock (sub-issue of GATE-614)
-- [ ] GATE-782 Keep a bare repository's hooks from running on the Unix box's pushes (sub-issue of GATE-614)
-- [ ] GATE-786 Check the Unix box's tree and bare before its lock sweep, and the rest of .git (sub-issue of GATE-614)
-- [ ] GATE-790 Fall back, not fail, on a leftover hard link or foreign entry at the Unix box's work lock (sub-issue of GATE-614)
-- [ ] GATE-800 Give folders the Unix box makes under the work root the box user's group, or judge the root's group (sub-issue of GATE-614)
-- [ ] GATE-801 Check the Mac builder's home stays private after install, or move the restore caches under the work root (sub-issue of GATE-614)
+- [ ] GATE-614 Lock the Unix box's work root down: held open, ACLs, the folders above it, a pinned root
+  - [ ] GATE-775 Judge the Unix box's login PATH folders and the folder xcode-select names
+  - [ ] GATE-776 Walk the folders above the Unix box's work root to /
+  - [ ] GATE-777 Pin the Unix box's work root at install and refuse any other
+  - [ ] GATE-778 Keep the Unix box's own binary out of reach of the commands it runs
+  - [ ] GATE-779 Refuse extended ACL write entries on the Unix box's root and strip them from a root it makes
+  - [ ] GATE-780 Hold the Unix box's root open through preflight, layout, records, lock and stop
+  - [ ] GATE-781 Write the Unix box's .git/config whole at layout, under the work lock
+  - [ ] GATE-782 Keep a bare repository's hooks from running on the Unix box's pushes
+  - [ ] GATE-786 Check the Unix box's tree and bare before its lock sweep, and the rest of .git
+  - [ ] GATE-790 Fall back, not fail, on a leftover hard link or foreign entry at the Unix box's work lock
+  - [ ] GATE-800 Give folders the Unix box makes under the work root the box user's group, or judge the root's group
+  - [ ] GATE-801 Check the Mac builder's home stays private after install, or move the restore caches under the work root
 - [ ] GATE-663 Keep the Unix box's preflight from racing a run's git lock sweep on the same key (sub-issue of GATE-593)
 - [ ] GATE-666 Let the Unix box's stop reach a run between two steps with a stop marker (sub-issue of GATE-593)
 - [ ] GATE-667 Keep the Unix box's stop under the client's stop limit when it follows several groups (sub-issue of GATE-593)
@@ -199,6 +197,7 @@
 - [ ] GATE-566 Gate the builder's git push and fetch by drain session
 - [ ] GATE-568 Check whether an OutputsFull pack puts an older builder build over a newer local one
 - [ ] GATE-569 Finish the interrupted-command clear: pid fallback, undeletable files, warm line
+- [ ] GATE-572 Refuse routing when the builder's work drive is under a free-space floor
 - [ ] GATE-575 Close the narrow windows in the interrupted-command clear
 - [ ] GATE-577 Follow-ups to the builder work-folder prune: lock files, failure exit, installer guard
 - [ ] GATE-586 Keep a sent build per project, so lanes alternating test projects do not re-upload
@@ -216,6 +215,8 @@
 - [ ] GATE-627 Read a repo's outputs, inputs and routed-command wishes from its tracked .gate/, not remote.json
 - [ ] GATE-633 Give a commit hook gate's heavy fallback build its durations
 - [ ] GATE-634 Route a commit's whole pre-commit hook stage to a builder as one run
+- [ ] GATE-639 Test the macOS snapshot from a subfolder and list the repo once per decision
+- [ ] GATE-640 Refuse a macOS builder root holding ':' when remote.json is read
 - [ ] GATE-642 Give the remaining suite probe and git reads seam windows above load
 - [ ] GATE-644 Harden the desktop closed-pipe cases: stdout's must-beat sleep, job-gone checks, the 60 s guard
 - [ ] GATE-654 Flush gate-box with F_FULLFSYNC before the macOS push renames it into place
@@ -264,6 +265,10 @@
 - [ ] GATE-795 Find why a routed cargo clippy on the Mac passed without checking a changed file
 - [ ] GATE-796 Check for a gone client while the Windows box preflight waits for a bare lock
 - [ ] GATE-797 Drop the installing manager's own record line before a Windows box package install
+- [ ] GATE-808 Skip the gitignored-input check-ignore call for tracked candidates
+- [ ] GATE-809 Release the worktree lock across a sync-back's transfer retry pauses
+- [ ] GATE-810 Keep a builder's outputs archive until the PC has it, so a dropped pull can be retried
+- [ ] GATE-811 Close the gitignored-input rule's edge cases: nested repos, unreadable metadata, spelled case, one check-ignore helper
 
 ## Cutover sweep
 
@@ -382,3 +387,9 @@
 - [ ] GATE-766 Keep a stop's escalation waiting when its leader cannot be looked at
 - [ ] GATE-767 Keep the orphan check on when another account plants MSYS objects
 - [ ] GATE-802 Find why test-install-macos.sh takes 19 minutes on the PC under load
+
+## No project
+
+- [ ] GATE-803 Add Task Index rows for suite cases, gate.ps1 arguments and the state journal
+- [ ] GATE-804 Refuse or flag a timing or burn run whose local build is missing
+- [ ] GATE-805 Smoke-test a gate install from Git Bash and pwsh, rolling back on failure
