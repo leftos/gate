@@ -89,7 +89,9 @@ The decision:
 
 Worst case: the second binary. `push.rs` gains a second file in its stdin protocol, along with `install.ps1`, `suite/install.rs`, `suite/push.rs` and fake-ssh. Version skew between the two files is caught by the HELLO check and becomes a `desktop` refusal.
 
-**D2. Registering the task.** Generate the task XML with a pure, unit-tested function. Register it through COM `ITaskFolder::RegisterTask(..., TASK_CREATE_OR_UPDATE, TASK_LOGON_INTERACTIVE_TOKEN)` with the K settings, at `\gate\desktop-helper`. The command is a hidden verb (`gate box register-desktop`) that `gate push` runs on every builder after it installs the helper beside gate.exe (the script `tools/install.ps1` places the helper first; the push places gate.exe first), and that builder setup may run by hand over ssh. An elevated session-0 process can register a same-user interactive-token task with no password; the spike measured that. The box checks the definition on every run (K).
+**D2. Registering the task.** Generate the task XML with a pure, unit-tested function. Register it through COM `ITaskFolder::RegisterTask(..., TASK_CREATE_OR_UPDATE, TASK_LOGON_INTERACTIVE_TOKEN)` with the K settings, at `\gate\desktop-helper`.
+
+The command is a hidden verb (`gate box register-desktop`) that `gate push` runs on every builder after it installs the helper beside gate.exe (the script `tools/install.ps1` places the helper first; the push places gate.exe first), and that builder setup may run by hand over ssh. An elevated session-0 process can register a same-user interactive-token task with no password; the spike measured that. The box checks the definition on every run (K).
 
 The verb registers the task in the folder `\gate`, makes the folder when it is missing, and gives both the same protected descriptor: owner Administrators, full access for SYSTEM and Administrators, read for the builder user's SID. The string the code writes is `O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;<user SID>)`; Windows reads it back as `O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;<user SID>)`, the `AI` being the auto-inherited flag it sets, so a hand check compares the ACEs and not the flags.
 
@@ -148,9 +150,13 @@ Run the COM calls on a short-lived multithreaded-apartment thread, and release e
 
 The Task Scheduler's class is made from `taskschd.dll`, loaded once for the process by its full path in the system folder (`LOAD_LIBRARY_SEARCH_SYSTEM32`) and never freed, never looked up in the registry, where a user's own class entry could stand in for it; the loaded module's path is checked against the system folder.
 
-`run_task(&TaskStart { path, argument, session_id, helper, pid_wait }, deadline, wake)` returns `StartedTask::Process(pid)`, or `NoPid` when the task started but the Task Scheduler gave no process within `pid_wait` (the helper may be running; only the caller's deadline bounds the wait for it). It reads the definition first and checks every K setting plus the task's owner (SYSTEM or Administrators) and DACL (no one else allowed more than read); it runs with `TASK_RUN_USE_SESSION_ID | TASK_RUN_IGNORE_CONSTRAINTS`.
+`run_task(&TaskStart { path, argument, session_id, helper, pid_wait }, deadline, wake)` returns `StartedTask::Process(pid)`, or `NoPid` when the task started but the Task Scheduler gave no process within `pid_wait` (the helper may be running; only the caller's deadline bounds the wait for it).
 
-`TaskError` tells the caller whether the helper may exist. `NotRegistered`, `SetUpWrong` and `Failed`: nothing was started. `StartedUnknown`: started, then a later call failed. `TimedOut`, `Woken` and `Unanswered` (the wait failed or the start thread panicked): the start may have happened, the thread that asked is left to finish, one that has not yet run the task starts nothing, and the caller drops its pipe server. Every text is escaped and cut, so none can carry a line break or control character to the console.
+It reads the definition first and checks every K setting plus the task's owner (SYSTEM or Administrators) and DACL (no one else allowed more than read); it runs with `TASK_RUN_USE_SESSION_ID | TASK_RUN_IGNORE_CONSTRAINTS`.
+
+`TaskError` tells the caller whether the helper may exist. `NotRegistered`, `SetUpWrong` and `Failed`: nothing was started. `StartedUnknown`: started, then a later call failed.
+
+`TimedOut`, `Woken` and `Unanswered` (the wait failed or the start thread panicked): the start may have happened, the thread that asked is left to finish, one that has not yet run the task starts nothing, and the caller drops its pipe server. Every text is escaped and cut, so none can carry a line break or control character to the console.
 
 The alternatives are hand-written vtables for five interfaces, or pwsh `Schedule.Service` per run (about 1 s and a pwsh dependency). Neither is better.
 
@@ -169,7 +175,9 @@ Worst case: compile time, and a second Windows API crate in the Layers rule (ARC
 10. Console-fallback line, stop look, resume, watch, drain.
 11. Release the mutex, session note, back commit.
 
-The helper ends the child it started only when its control pipe reads closed, or fails with a pipe-gone error (`ERROR_BROKEN_PIPE`, `ERROR_NO_DATA`, `ERROR_PIPE_NOT_CONNECTED`), before `DONE` has been read: the box is gone and nothing will resume the child. Any other read error leaves the child. It never ends the child on a timeout alone, since the box may have pulled the child and be about to resume it; the box bounds the helper instead (step 8) and ends the child itself through the handles it pulled. The helper ends the child through the copy of its process handle that its release kept, never by finding the pid again, so a reused pid is never ended.
+The helper ends the child it started only when its control pipe reads closed, or fails with a pipe-gone error (`ERROR_BROKEN_PIPE`, `ERROR_NO_DATA`, `ERROR_PIPE_NOT_CONNECTED`), before `DONE` has been read: the box is gone and nothing will resume the child. Any other read error leaves the child.
+
+It never ends the child on a timeout alone, since the box may have pulled the child and be about to resume it; the box bounds the helper instead (step 8) and ends the child itself through the handles it pulled. The helper ends the child through the copy of its process handle that its release kept, never by finding the pid again, so a reused pid is never ended.
 
 A received stdout or stderr value is used only when it passes `adopt::is_handle_value`, names a pipe, and is not the helper's own control-pipe handle (`adopt::check_received_output`).
 
@@ -250,7 +258,9 @@ Plus unit tests: task XML, `Arg0` parsing, the why texts, and a security-descrip
 
 ## 7. Items for the plan and the docs
 
-- **Addressed by GATE-425:** ssh used to run a `gate.exe` elevated from a folder any Medium process of the builder user could write. `gate push` now installs into the admin-owned `C:\Program Files\gate\bin`, and the box refuses every verb when its own image or the helper is not installed where only administrators and SYSTEM can change them (design.md, "Install tripwire"). The user's own Medium processes stay outside the boundary (I1): they cannot replace the trusted install, and anything else they can do is what I1 already grants them.
+- **Addressed by GATE-425:** ssh used to run a `gate.exe` elevated from a folder any Medium process of the builder user could write. `gate push` now installs into the admin-owned `C:\Program Files\gate\bin`, and the box refuses every verb when its own image or the helper is not installed where only administrators and SYSTEM can change them (design.md, "Install tripwire").
+
+  The user's own Medium processes stay outside the boundary (I1): they cannot replace the trusted install, and anything else they can do is what I1 already grants them.
 - **Glossary terms:** desktop command, desktop helper, desktop task, console session, session 0.
 - **ARCHITECTURE.md:** the Task Index row the map proposed. Integration Footguns:
   - the desktop wait counts against the client's backstop;

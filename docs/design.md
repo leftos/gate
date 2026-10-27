@@ -840,7 +840,9 @@ The lines of a run that starts its command:
 
   A routed run that finds its work folder's key held by another run on this PC says `gate: waiting for this worktree's work folder on <host>, which another of its runs holds`, with ` (about <figure> left)` after it when the key's latest claim (by `started`) has an expected time not yet reached, `<figure>` by the gate's figure rule (`<n> s` below 90 s, else whole `<n> min`, never below 1). Each heartbeat it says `gate: still waiting for this worktree's work folder on <host> (<s> s)`.
 
-  A routed run that cannot write its worktree record ([State root](#state-root), Files) says `gate: cannot write <path>: <error>` on stderr, at most once per routed run however many builders it tries, before the first builder is called; the run's status, verdict and journal are as they would be. `gate warm` writes the record only when it can take the key's mutex at once: when another gate holds it, warm writes nothing and says nothing, and when the mutex cannot be opened or taken it says `gate: cannot take the mutex <name>: <error>` and warms up without writing the record.
+  A routed run that cannot write its worktree record ([State root](#state-root), Files) says `gate: cannot write <path>: <error>` on stderr, at most once per routed run however many builders it tries, before the first builder is called; the run's status, verdict and journal are as they would be.
+
+  `gate warm` writes the record only when it can take the key's mutex at once: when another gate holds it, warm writes nothing and says nothing, and when the mutex cannot be opened or taken it says `gate: cannot take the mutex <name>: <error>` and warms up without writing the record.
 
   A warm-up lock that cannot be probed says `gate: cannot probe the warm-up lock <path>: <error>` once (path and error escaped) and the wait goes on. A Ctrl+C during that wait, or raised at the key take, says `gate: interrupted while waiting for this worktree's work folder on <host>` and ends the gate with 0xC000013A, never a `busy` fallback.
 
@@ -1366,7 +1368,9 @@ Two rolls within one second collide on the archive name: the second archive fail
 
 ### remote.json
 
-`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos`, the optional `builders` and the optional per-repo `outputs`, `failureOutputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks`, `sendBuild` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
+`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos`, the optional `builders` and the optional per-repo `outputs`, `failureOutputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks`, `sendBuild` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable.
+
+A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
 
 The optional `hosts` is an array of strings naming further builders, which `gate push`, `gate check --builder` and `gate run --builder` reach; an unpinned routed run goes to `host` or a routed `builders` entry, never to a `hosts` entry. Each entry passes the checks `host` does, with the same reasons worded `hosts entries ...`.
 
@@ -2704,9 +2708,13 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     The failure's reason is built from the end alone, never from a line the builder or the commands said: `command stopped with status {n}`, `the builder ended the warm-up before its commands with status {n}`, `the box did not confirm the warm hash`, `the builder refused: {reason}`, `the warm-up was killed: it ran out of its budget or went silent`, `the connection to the builder was lost`, `the client could not send the warm-up` or `the client failed`.
 
     A warm-up touches no outputs state (it reads, saves and marks none, whatever globs the call holds) and syncs nothing back; a lost connection is handled as a run's is. The key mutex a caller holds around it can be taken with a wait (`hold_key_waiting` in `remote/client.rs`): it waits in slices of 100 ms, looks at the console interrupt between them, and a Ctrl+C ends the wait.
-  - **Outputs.** In `remote/outputs.rs`, for a run with output globs or failure output globs (`failureOutputs`); a run without either sends `Outputs` `[]` and `OutputsFull` false, no manifest, and says nothing here, and writes no marker unless the route withheld its outputs (a dotnet `--no-build` command the builder built): that run writes the pending marker after the push, as below, and no end of it clears the marker. The client builds the manifest ([The outputs module](#the-box-side)) before the run call, hashing every matching file.
+  - **Outputs.** In `remote/outputs.rs`, for a run with output globs or failure output globs (`failureOutputs`); a run without either sends `Outputs` `[]` and `OutputsFull` false, no manifest, and says nothing here, and writes no marker unless the route withheld its outputs (a dotnet `--no-build` command the builder built): that run writes the pending marker after the push, as below, and no end of it clears the marker.
 
-    The manifest covers both lists. When it cannot be built over both, the client builds it again over the output globs alone. When that build succeeds, the run says `gate: failure outputs not asked for this run: <why>` and carries no failure globs. When it fails too, the run ends as a failed manifest build does, with no such line. A run with no output globs whose build fails carries nothing, as one with no globs at all. A run with only failure globs writes the pending marker and sends a manifest like one with output globs, but its passing command brings nothing back.
+    The client builds the manifest ([The outputs module](#the-box-side)) before the run call, hashing every matching file.
+
+    The manifest covers both lists. When it cannot be built over both, the client builds it again over the output globs alone. When that build succeeds, the run says `gate: failure outputs not asked for this run: <why>` and carries no failure globs.
+
+    When it fails too, the run ends as a failed manifest build does, with no such line. A run with no output globs whose build fails carries nothing, as one with no globs at all. A run with only failure globs writes the pending marker and sends a manifest like one with output globs, but its passing command brings nothing back.
 
     **Manifest time** (GATE-23): SHA-256 streams, with no whole-file read into memory, and only the PC hashes every file (the box hashes changed files only; `obj` is not under the default globs). No timing line is added to routed runs.
 
@@ -2718,7 +2726,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The cache is a hint checked against each file's stamp, not a record of a completed outputs step. It is saved right after each manifest the client builds, whatever the run's end; a build that fails or is interrupted saves nothing, and one that would save what the cache already holds skips the write. A file the install replaces gets a new stamp, the time its attempt began its snapshot.
 
-    An outputs install that completes (no member skipped but ones it cannot rewrite) therefore also saves the hashes of the files it put in place, so the next run does not rehash them. Each entry takes the stamp the installed file's handle reads after the move and the future-time clamp, with the SHA-256 the unpack verified against the box's manifest, under the 2 s rule below measured against the PC's clock when the moves began: a file clamped to the PC's clock is not kept. The stamp read after the move is the snapshot time (below), so a run that took over 2 s keeps its hashes under that rule.
+    An outputs install that completes (no member skipped but ones it cannot rewrite) therefore also saves the hashes of the files it put in place, so the next run does not rehash them.
+
+    Each entry takes the stamp the installed file's handle reads after the move and the future-time clamp, with the SHA-256 the unpack verified against the box's manifest, under the 2 s rule below measured against the PC's clock when the moves began: a file clamped to the PC's clock is not kept. The stamp read after the move is the snapshot time (below), so a run that took over 2 s keeps its hashes under that rule.
 
     A member the install rewrites after the hash check (the files that record a box tree's path) is not kept, its bytes no longer being the hash's. The install loads the cache file again, adds its entries and saves once; a failed, refused, partial or interrupted install saves nothing.
 
@@ -2752,7 +2762,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     After an accepted `0` the marker is removed (`gate: cannot remove the outputs pending marker <path>: <error>` if it cannot, and the status stands); so does an install that ends as the Outputs install below says, and every other end leaves it, so the next run sends `OutputsFull`.
 
-    An accepted line naming an archive leaves the marker; the fetch of the archive and its install (the Outputs fetch and Outputs install phases, below the sync-back) follow. After a failed run the marker is never removed, an accepted `0` included, and the fetch that follows an archive is only of the failed run's test reports and failure outputs (Outputs fetch). A `--no-build` run whose outputs were withheld never writes the marker through its manifest, and never clears it or the outputs cap record on a passing end, with `failureOutputs` too. A failing withheld run still brings back its failure outputs, whether or not its send of the PC's build landed.
+    An accepted line naming an archive leaves the marker; the fetch of the archive and its install (the Outputs fetch and Outputs install phases, below the sync-back) follow. After a failed run the marker is never removed, an accepted `0` included, and the fetch that follows an archive is only of the failed run's test reports and failure outputs (Outputs fetch).
+
+    A `--no-build` run whose outputs were withheld never writes the marker through its manifest, and never clears it or the outputs cap record on a passing end, with `failureOutputs` too. A failing withheld run still brings back its failure outputs, whether or not its send of the PC's build landed.
 
     A run says at most one of these lines (a passing run then exits 1; a failed run keeps the command's own status, see the box side): `gate: remote outputs not brought back: the worktree changed during the run` (wins when it applies), `gate: remote outputs not brought back: the manifest could not be built: <msg>` (`<path> resolves outside the worktree`, `it is larger than the box takes (64 MiB)`, checked as the manifest is built before the rest is hashed, or the read error), or a third.
 
@@ -2949,7 +2961,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     Each file is then moved with a rename, after a link and junction check on the way, its last write set in the stage before the move to the snapshot time and the PC file checked against the manifest once more just before the rename (a file found holding the member's bytes only then is left in place, as above).
 
-    **The snapshot time.** The last write every moved file takes, whatever the box wrote, is the time the attempt began its snapshot on the PC, clamped to the PC's clock as the moves begin; a sibling pair's roots take the same attempt's time, and a retried attempt takes its own. A file left in place, a skipped file and an in-use file keep their own times. A source changed on the PC after the snapshot is then newer than every output the run built from it, so incremental tools (MSBuild, Godot's assembly reload) rebuild; the box's own time could be older than a source restored locally afterwards.
+    **The snapshot time.** The last write every moved file takes, whatever the box wrote, is the time the attempt began its snapshot on the PC, clamped to the PC's clock as the moves begin; a sibling pair's roots take the same attempt's time, and a retried attempt takes its own.
+
+    A file left in place, a skipped file and an in-use file keep their own times. A source changed on the PC after the snapshot is then newer than every output the run built from it, so incremental tools (MSBuild, Godot's assembly reload) rebuild; the box's own time could be older than a source restored locally afterwards.
 
   A member git tracks, one whose target is in use or read-only, or one of the rewritten files above that cannot be rewritten, is skipped, not refused: `gate: remote outputs not fully brought back: <path> is tracked by git`, `... <path> is in use or read-only`, `... <path> cannot be rewritten (it is not UTF-8 or UTF-16 with a byte order mark)` or `... <path> cannot be rewritten (<n> bytes, over 16 MiB)`.
 
@@ -2959,7 +2973,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The tracked and in-use skips keep the pending marker, so the next routed run sends `OutputsFull`; a run whose only skips are files that cannot be rewritten clears it, since a refetch would skip them again.
 
-    A failed run's test reports and failure outputs are installed the same way, with the same snapshot time, and only the members under the failed run's set (the globs narrowed by `Globs::test_results_only` followed by the failure output globs, `gate_inputs::failure::failed_run_globs`) and each line naming `the failed run's test reports` where it says outputs: `gate: the failed run's test reports: <n> file(s), <MB> MB (<MB> MB compressed) in <s> s (pulled in <s> s, <rate>)`, `gate: the failed run's test reports not brought back: <reason>` and `gate: the failed run's test reports not fully brought back: <path> <why>`. No end of it clears the pending marker, never touches the cap record, and the run is never marked as outputs back; the hash cache keeps the hashes of the files it placed. A set holding a failure output glob says `the failed run's outputs` in place of `the failed run's test reports` in each of these lines.
+    A failed run's test reports and failure outputs are installed the same way, with the same snapshot time, and only the members under the failed run's set (the globs narrowed by `Globs::test_results_only` followed by the failure output globs, `gate_inputs::failure::failed_run_globs`) and each line naming `the failed run's test reports` where it says outputs: `gate: the failed run's test reports: <n> file(s), <MB> MB (<MB> MB compressed) in <s> s (pulled in <s> s, <rate>)`, `gate: the failed run's test reports not brought back: <reason>` and `gate: the failed run's test reports not fully brought back: <path> <why>`.
+
+    No end of it clears the pending marker, never touches the cap record, and the run is never marked as outputs back; the hash cache keeps the hashes of the files it placed. A set holding a failure output glob says `the failed run's outputs` in place of `the failed run's test reports` in each of these lines.
 
     The success line is `gate: outputs: <n> file(s), <X.X> MB (<Y.Y> MB compressed) in <Z.Z> s (pulled in <F.F> s, <rate>/s)`: `<n>` counts installed files only (a file left in place is not counted), the seconds run from the start of the fetch to the end of the install, `<F.F>` is the fetch alone, from its start to the archive's last byte (to the call's end when it received none), and `<rate>` the compressed size over it in the same MB (`<x.x> MB/s`), and each decimal rounds a half away from zero.
 
@@ -3246,7 +3262,9 @@ A routed run therefore moves to one long-lived connection carrying every verb, `
 
 The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`.
 
-A `run` payload also holds `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, the optional `FailureOutputs` (a list of globs read like `Outputs`; an older box ignores it), `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, `SentDigest`, `LfsDigest`, `GodotVersion`, `EngineEnv` and `CrossBuild` (a macOS builder's key: an object of `Rid` and `Words`, with `Outputs`; [The Unix box](#the-unix-box)). An `outputs` payload also holds `Name`.
+A `run` payload also holds `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, the optional `FailureOutputs` (a list of globs read like `Outputs`; an older box ignores it), `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, `SentDigest`, `LfsDigest`, `GodotVersion`, `EngineEnv` and `CrossBuild` (a macOS builder's key: an object of `Rid` and `Words`, with `Outputs`; [The Unix box](#the-unix-box)).
+
+An `outputs` payload also holds `Name`.
 
 `inflight` reads only `Root`.
 
@@ -3927,7 +3945,9 @@ Built verbs:
   - The run's own archive is opened sharing reads only, so another run's trim cannot remove it mid-write; such a removal fails, is said as above (`gate: remote could not remove the old outputs archive <path>: <error>`) and that trim goes on to the next oldest. An entry whose metadata cannot be read is said (`gate: remote could not read the outputs archive <path>: <error>`, control characters escaped), left out of the total, and the trim goes on.
   - A run whose own archive alone is larger than the budget removes only its own archive, leaves the others, and says `gate: remote outputs not brought back: the archive is <X.X> GiB, more than the box keeps (50 GiB)`. A run whose own archive is gone before its trim says `gate: remote outputs not brought back: the archive was removed before it could be sent`. Either turns a passed 0 into 1.
   - A pack that fails removes its half-written archive, says `gate: remote outputs not brought back: <reason>` and turns the passed 0 into 1 (a failed run ends on the command's own status, whatever the pack does). A killed command or a failed sync-back packs nothing.
-  - A failed command (exit other than 0; a killed one packs nothing) packs only the files matched by the failed run's set: the output globs that name a `TestResults` folder (`Globs::test_results_only` in `gate-inputs`: a folder segment, not the last, equal to `TestResults` in any letter case) followed by the `FailureOutputs` globs (`failure::failed_run_globs`). It says its usual `gate-remote-outputs-size:` and `gate-remote-outputs:` lines, or `gate-remote-outputs: 0` when nothing matched. With neither kind of glob a failed run packs nothing and says no outputs line.
+  - A failed command (exit other than 0; a killed one packs nothing) packs only the files matched by the failed run's set: the output globs that name a `TestResults` folder (`Globs::test_results_only` in `gate-inputs`: a folder segment, not the last, equal to `TestResults` in any letter case) followed by the `FailureOutputs` globs (`failure::failed_run_globs`).
+
+    It says its usual `gate-remote-outputs-size:` and `gate-remote-outputs:` lines, or `gate-remote-outputs: 0` when nothing matched. With neither kind of glob a failed run packs nothing and says no outputs line.
 
     A passing command never packs a file only a failure output glob matches.
   - A file only a `FailureOutputs` glob matches is held to caps in walk order (`gate_inputs::failure`): one over 256 MiB, or one that would take the failure files past 1 GiB in all (it and every later one are left; a file over the per-file cap does not count toward the total), stays on the builder. A file the `TestResults` globs match is never capped.
@@ -4181,7 +4201,9 @@ Built verbs:
   The PC holds a content when a file of the manifest sent with the run has its SHA-256 and is outside the paths of the run's back commit; the box never uses a back-commit path as a copy source. A copy carries the box file's own last write as `modified`, not its source's, and the install stamps it as it does a member (the snapshot time, not `modified`).
 
   Before the pack the box hashes only the chosen files whose size matches another chosen file's or a manifest-held file's, since only those can be copies. Copy or member is decided at the file's turn: a file hashed before the pack becomes a copy only when its size and last write still match the walk and its hash matches an earlier member's, or a manifest hash outside the back commit; otherwise it is packed as a member, with the hash from that read.
-- Payload: `Nonce` is 32 lower-case hex digits, `OutputFolder` is `<root>\outputs` for the work folder `<root>\work\<key>`, `Outputs` and `FailureOutputs` lists of non-empty globs holding no `[` or `]` (`gate: box payload FailureOutputs is not a list of texts`, `... holds an empty glob`, `... glob '<glob>' holds '[' or ']'`), `OutputsFull` true or false, and `Name` an archive name of the payload's own key and nonce, so that the outputs verb reaches no file in `OutputFolder` but an archive of this work folder. A refusal is a `gate: box payload ...` line.
+- Payload: `Nonce` is 32 lower-case hex digits, `OutputFolder` is `<root>\outputs` for the work folder `<root>\work\<key>`, `Outputs` and `FailureOutputs` lists of non-empty globs holding no `[` or `]` (`gate: box payload FailureOutputs is not a list of texts`, `... holds an empty glob`, `... glob '<glob>' holds '[' or ']'`), `OutputsFull` true or false, and `Name` an archive name of the payload's own key and nonce, so that the outputs verb reaches no file in `OutputFolder` but an archive of this work folder.
+
+  A refusal is a `gate: box payload ...` line.
 
 The reader (`read_members`, with the member checks, the limits, the long names and the list) is `gate_inputs::archive`'s, shared by both boxes; each box writes what it reads through the `Place` trait (`member`, and `copy` from an earlier member or a PC file).
 
@@ -4976,7 +4998,9 @@ A Rust integration suite drives the built `gate.exe` through its CLI and reads o
 
   `--test-remote-backstop-ms <n>` (whole milliseconds above 0) replaces the run call's backstop of 5 x `--timeout` + 60 s for the client, counted from the run call's start.
 
-  `--test-remote-snapshot-age-ms <n>` (whole milliseconds above 0, on `gate run` and `gate warm`) puts each attempt's [snapshot time](GLOSSARY.md#snapshot-time) `n` ms before the moment the snapshot begins, so a case can have the install stamp its files well before the moves and keep their hashes. Refused without the transport with `gate: --test-remote-snapshot-age-ms needs --test-remote-transport`, and a value that is not a whole number above 0 with `gate: --test-remote-snapshot-age-ms must be a whole number above 0, got '<v>'`. `--test-print-request` does not show it.
+  `--test-remote-snapshot-age-ms <n>` (whole milliseconds above 0, on `gate run` and `gate warm`) puts each attempt's [snapshot time](GLOSSARY.md#snapshot-time) `n` ms before the moment the snapshot begins, so a case can have the install stamp its files well before the moves and keep their hashes.
+
+  Refused without the transport with `gate: --test-remote-snapshot-age-ms needs --test-remote-transport`, and a value that is not a whole number above 0 with `gate: --test-remote-snapshot-age-ms must be a whole number above 0, got '<v>'`. `--test-print-request` does not show it.
 
   `--test-remote-tamper <point>:<step>` makes the client change its own folders at one point of its run, so a case can change a folder after the route checked it. It exists only in a `test-seams` build and needs `--test-remote-transport`.
 

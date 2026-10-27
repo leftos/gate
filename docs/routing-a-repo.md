@@ -26,7 +26,9 @@ Every `--local` run must give `--reason "<why>"` (the gate refuses it otherwise)
 
 A command run from one worktree that names a path in another worktree of a listed repo stays local, saying `gate: not routed: the command works in <tree>; run it with --cd <tree>`. Run it again with `--cd <tree>` to route it from that worktree ([design.md, Routing](design.md#routing)). A path in an unlisted repo, on a network drive or in no worktree keeps the plain `is outside the worktree` line.
 
-A command whose word names an existing gitignored project input (a project, solution, `.targets`, `.props`, `.rsp` or `.runsettings` file, or a dotnet folder whose project files are all ignored) that no `inputs` glob covers routes and carries those files to the builder as inputs, with no `inputs` entry needed. A command whose files hold more than 64 MiB or 2000 files, that runs in a sibling pair, or whose files cannot be sent stays local, saying `gate: not routed: <path> is gitignored ...` with the reason, and is journalled `notRouted: gitignored input` ([design.md, Routing](design.md#routing)).
+A command whose word names an existing gitignored project input (a project, solution, `.targets`, `.props`, `.rsp` or `.runsettings` file, or a dotnet folder whose project files are all ignored) that no `inputs` glob covers routes and carries those files to the builder as inputs, with no `inputs` entry needed.
+
+A command whose files hold more than 64 MiB or 2000 files, that runs in a sibling pair, or whose files cannot be sent stays local, saying `gate: not routed: <path> is gitignored ...` with the reason, and is journalled `notRouted: gitignored input` ([design.md, Routing](design.md#routing)).
 
 ## Adding a repo
 
@@ -80,23 +82,31 @@ This repo's `tools/builder/install-toolchains.ps1` does the rest: the toolchains
 - **claude-config's `C:\build-box` rules:** its provisioning re-asserts the `C:\build-box` DACL on every run and strips explicit ACEs under it. The gate half therefore re-applies anything it needs under `C:\build-box\gate` on every run: an ACE set on the root that inherits survives, an explicit ACE on a child does not.
 
   Any SYSTEM or highest-run-level task the gate half adds whose action names a script under `C:\build-box` goes through claude-config's `C:\Program Files\build-box\run-pinned.ps1`; the gate half adds none today.
-- **Smart App Control off:** in Evaluation, Smart App Control asks the cloud for the reputation of every unsigned image the first time it is mapped, whatever the Defender exclusions, so each freshly built exe in the work root waited 1.5-16 s before its first start (0.05 s with it off). The step sets `VerifiedAndReputablePolicyState` to 0 and refreshes the policies with `CiTool`; Defender's real-time, cloud and behaviour protection stay as they are. A policy still enforced after the refresh asks for a restart of the drained builder.
+- **Smart App Control off:** in Evaluation, Smart App Control asks the cloud for the reputation of every unsigned image the first time it is mapped, whatever the Defender exclusions, so each freshly built exe in the work root waited 1.5-16 s before its first start (0.05 s with it off).
+
+  The step sets `VerifiedAndReputablePolicyState` to 0 and refreshes the policies with `CiTool`; Defender's real-time, cloud and behaviour protection stay as they are. A policy still enforced after the refresh asks for a restart of the drained builder.
 - **Test:** `pwsh -NoProfile -File tools/builder/test-install-toolchains.ps1`, run through `tools/gate.ps1 -Slot light`. It installs nothing and needs no admin.
 - **The Unreal engine install is not in the installer.**
 
 ### A macOS builder
 
-A macOS builder (an Apple-silicon Mac, a dedicated builder nobody works on) is set up by `tools/builder/install-macos.sh`, run as the builder user over ssh. The box gets onto the Mac by `gate push`, which builds it there ([design.md, `gate push`](design.md#gate-push)): the Mac needs git, cc (the Xcode Command Line Tools, `xcode-select --install`) and the Rust step below, and the PC needs a clean, committed `tools/install.ps1` install, whose `source.json` names the commit the Mac builds. The box lands in `<root>/bin/gate-box`, and the build's checkout, target folder and `build.log` live in `<root>/gate-push`.
+A macOS builder (an Apple-silicon Mac, a dedicated builder nobody works on) is set up by `tools/builder/install-macos.sh`, run as the builder user over ssh.
+
+The box gets onto the Mac by `gate push`, which builds it there ([design.md, `gate push`](design.md#gate-push)): the Mac needs git, cc (the Xcode Command Line Tools, `xcode-select --install`) and the Rust step below, and the PC needs a clean, committed `tools/install.ps1` install, whose `source.json` names the commit the Mac builds. The box lands in `<root>/bin/gate-box`, and the build's checkout, target folder and `build.log` live in `<root>/gate-push`.
 
 `remote.json`'s `builders` array (an entry with `os` `macos` and a `root`) is read and routes ([design.md, remote.json](design.md#remotejson)), and the transport, payload layout, path map and PC caches follow the entry's profile.
 
 A Mac entry may carry `outputs`, and its box brings them back like a Windows builder's (a route whose output is a TRX, as yaat's, works); the project bin a Windows builder's routed `dotnet build` adds to a repo's own list is not derived for a Mac. That a build whose outputs are launched on the PC stays off the Mac is a convention of the `remote.json` entries: no code enforces it until GATE-696 lands.
 
-The words a macOS builder is sent are spelled for the Mac: the recognised paths use `/`, and a relative word written with `\` (`src\Duel.sln`) is sent with `/` when the snapshot carries that file or folder, in its exact letter case. A word that still holds a `\` (a regex, a list, script text after `bash -c` or `pwsh -Command`, a path the repo does not carry) keeps the command off the Mac: it runs on a Windows builder or here, silently. A Windows builder is sent the words as written. Details: [design.md, Routing](design.md#routing).
+The words a macOS builder is sent are spelled for the Mac: the recognised paths use `/`, and a relative word written with `\` (`src\Duel.sln`) is sent with `/` when the snapshot carries that file or folder, in its exact letter case.
+
+A word that still holds a `\` (a regex, a list, script text after `bash -c` or `pwsh -Command`, a path the repo does not carry) keeps the command off the Mac: it runs on a Windows builder or here, silently. A Windows builder is sent the words as written. Details: [design.md, Routing](design.md#routing).
 
 - **Private home** runs first, before every toolchain step: it sets the builder's home to mode 700 (logging `<home> had mode <mode>; set to 700` when it changed), since the package restore's caches (`~/.npm`, `~/Library/pnpm/store`, `~/.bun/install/cache`) are made at 755 and 644 and every standard macOS account is in the home's group `staff`. It refuses a home that is a symlink or owned by another account.
 - **Toolchain steps** need no sudo and land under `--prefix` (default `~/gate-tools`), Rust under `CARGO_HOME` and `RUSTUP_HOME`: .NET SDK 10.0.401 and 8.0.425, the wasm-tools workload, PowerShell, Node.js, pnpm, uv and prek, Rust, cargo-nextest, just, Git LFS, Godot 4.7.2 mono, Bun.
-- **Homebrew and FFmpeg** come from Homebrew, since no official source publishes a macOS arm64 FFmpeg build with a checksum. Homebrew's installer needs an admin account and refuses root, so these two steps run as an admin account, never the builder user or `sudo`: `bash install-macos.sh --admin --only Homebrew,FFmpeg`, interactively (over `ssh -t`), since the installer may ask for the admin's password. The builder's home is mode 700, so the admin cannot read an installer copy kept there: it runs its own copy, or pipes the script in (`ssh <admin> 'bash -s' -- --admin --only Homebrew,FFmpeg < install-macos.sh`). Without `--admin` they print the commands they would run. Auto-update and analytics are off for the builder, and its login PATH puts `/opt/homebrew/bin` after the pinned tools, so a pinned tool always wins.
+- **Homebrew and FFmpeg** come from Homebrew, since no official source publishes a macOS arm64 FFmpeg build with a checksum. Homebrew's installer needs an admin account and refuses root, so these two steps run as an admin account, never the builder user or `sudo`: `bash install-macos.sh --admin --only Homebrew,FFmpeg`, interactively (over `ssh -t`), since the installer may ask for the admin's password.
+
+  The builder's home is mode 700, so the admin cannot read an installer copy kept there: it runs its own copy, or pipes the script in (`ssh <admin> 'bash -s' -- --admin --only Homebrew,FFmpeg < install-macos.sh`). Without `--admin` they print the commands they would run. Auto-update and analytics are off for the builder, and its login PATH puts `/opt/homebrew/bin` after the pinned tools, so a pinned tool always wins.
 - **Login PATH** writes a marked block to `~/.zprofile`. The box reads its commands' PATH from the builder user's login shell, since a non-login ssh command lacks the prefix's tools.
 
   The block also exports `GATE_GODOT_ROOT` (`<prefix>/godot`, one folder per Godot version holding `Godot.app`), which the box reads from the same login shell to probe the builder's Godot and to run a pinned version's install for a Godot console command.
@@ -114,7 +124,9 @@ The words a macOS builder is sent are spelled for the Mac: the recognised paths 
 - **Flags and exits** follow the Windows installer: `--only <prefix>,...` (case-insensitive prefixes, then the summary; `--only Summary` alone), `--list`, exit 2 on a bad argument or a prefix that matches no step, exit 1 when a step failed. Every step logs `OK`, `SKIP` or `FAIL` to stdout and `<prefix>/install.log`.
 - **Slots:** the entry's `slots` is set by memory, not cores. Several copies of yaat-server's whole `dotnet test` suite (about 4,900 tests, 1.2-1.3 GB each), started together on a 15-core, 24 GB Mac mini, gave 1.64x one run's throughput at 2, 2.66x at 4, 3.3x at 6 and 3.74x at 8, with memory pressure normal and no swap throughout; but at 8 the Mac had under 300 MB unused against about 2 GB at 6, and one run took 2.1 times as long as alone (1.8 times at 6).
 
-  The entry uses 6: about 90% of 8's throughput with room for a heavier suite. A cargo build or clippy run uses every core and far more memory per job, so a Mac that takes routed Rust work needs fewer slots; measure again before routing one. To measure, start N copies of a routed repo's suite at once, each in its own folder and `TMPDIR`, and sample `memory_pressure -Q`, `sysctl vm.swapusage` and the load every 5 s; count as foreign any `cargo`, `rustc`, `nextest`, `dotnet` or ssh-started shell outside the round's own processes, since a `gate-box` check alone misses direct runs, and take the Mac off routing (`"routed": false`) while it runs.
+  The entry uses 6: about 90% of 8's throughput with room for a heavier suite. A cargo build or clippy run uses every core and far more memory per job, so a Mac that takes routed Rust work needs fewer slots; measure again before routing one.
+
+  To measure, start N copies of a routed repo's suite at once, each in its own folder and `TMPDIR`, and sample `memory_pressure -Q`, `sysctl vm.swapusage` and the load every 5 s; count as foreign any `cargo`, `rustc`, `nextest`, `dotnet` or ssh-started shell outside the round's own processes, since a `gate-box` check alone misses direct runs, and take the Mac off routing (`"routed": false`) while it runs.
 - **Test:** `bash tools/builder/test-install-macos.sh`, on this PC or the Mac; it installs nothing. `bash tools/builder/test-build-box-macos.sh` runs the script `gate push` sends (`MAC_SCRIPT`) against a scratch root with a real cargo build of the box; it runs on macOS only.
 
 `gate check --builder` hints at the installer for a missing node, pwsh, ffmpeg, netfx-sdk or a rust with no minimum: the hint names `tools/builder/install-toolchains.ps1` and points to this section.
@@ -146,7 +158,9 @@ A first routed run in a new work folder is cold, as is the first run after the b
 
 ## A repo with a command that needs the builder's desktop
 
-A repo with a routed command that needs the builder's logged-on desktop (a GUI test run) declares its `-like` patterns in a tracked `.gate/desktop.toml`, `patterns = ["dotnet test *Ui*"]`, at most 32, matched against the same rewritten words as the repo's `repos` patterns. The PC consents in `remote.json`: `"desktop": {"<repo>": ["dotnet test *Ui*"]}`, each pattern listed exactly as the file spells it, letter case included. The first declared pattern a command matches decides, and a command no pattern matches asks for no desktop.
+A repo with a routed command that needs the builder's logged-on desktop (a GUI test run) declares its `-like` patterns in a tracked `.gate/desktop.toml`, `patterns = ["dotnet test *Ui*"]`, at most 32, matched against the same rewritten words as the repo's `repos` patterns.
+
+The PC consents in `remote.json`: `"desktop": {"<repo>": ["dotnet test *Ui*"]}`, each pattern listed exactly as the file spells it, letter case included. The first declared pattern a command matches decides, and a command no pattern matches asks for no desktop.
 
 Without the consent the command runs here with `gate: not routed: desktop pattern '<pattern>' not allowed in remote.json`.
 
@@ -162,15 +176,23 @@ A `.gate/local.toml` the gate cannot use keeps every routed command of the repo 
 
 ## A repo with Windows-only projects its commands do not name
 
-A routed `dotnet test` of a Windows-only project already stays off a macOS builder, but a script such as `pwsh tools/test-all.ps1` hides which projects it tests. A repo that wants such a script on the Mac only while no Windows-only project is affected declares the paths of those projects in a tracked `.gate/windows.toml`, `paths = ["tools/Windows.Hook/*", "tests/Windows.Hook.Tests/*"]`, at most 32 `-like` patterns matched against whole root-relative `/` paths, letter case ignored and `*` crossing `/`.
+A routed `dotnet test` of a Windows-only project already stays off a macOS builder, but a script such as `pwsh tools/test-all.ps1` hides which projects it tests.
 
-A root entry matches only the worktree's own paths, and a sibling's paths match only the entries starting `../<sibling>/`. A project of a declared sibling is written `../<sibling>/<path>/*`, the sibling being one `.gate/siblings.toml` declares: all three of yaat's Windows-only test projects live in its sibling yaat-server, so yaat lists each project's tool and test folders there: `../yaat-server/tools/Yaat.CrcDriverHook/*`, `../yaat-server/tests/Yaat.CrcDriverHook.Tests/*`, and the same two for `Yaat.ClientDriver.Mcp` and `Yaat.CrcProbeHook`. No consent in `remote.json` is needed, since the file only keeps runs off the Mac.
+A repo that wants such a script on the Mac only while no Windows-only project is affected declares the paths of those projects in a tracked `.gate/windows.toml`, `paths = ["tools/Windows.Hook/*", "tests/Windows.Hook.Tests/*"]`, at most 32 `-like` patterns matched against whole root-relative `/` paths, letter case ignored and `*` crossing `/`.
+
+A root entry matches only the worktree's own paths, and a sibling's paths match only the entries starting `../<sibling>/`.
+
+A project of a declared sibling is written `../<sibling>/<path>/*`, the sibling being one `.gate/siblings.toml` declares: all three of yaat's Windows-only test projects live in its sibling yaat-server, so yaat lists each project's tool and test folders there: `../yaat-server/tools/Yaat.CrcDriverHook/*`, `../yaat-server/tests/Yaat.CrcDriverHook.Tests/*`, and the same two for `Yaat.ClientDriver.Mcp` and `Yaat.CrcProbeHook`.
+
+No consent in `remote.json` is needed, since the file only keeps runs off the Mac.
 
 A macOS pick (whatever the command) of a change that touches a declared path, or whose change cannot be read, goes to the next builder that is no macOS one, else `host`, else runs here, saying `gate: kept off the macOS builder: the change touches <path> (<file>)` or `gate: kept off the macOS builder: cannot tell whether the change touches <file>'s paths: <why>`, `<file>` being `.gate/windows.toml` or the path of the declarations-folder copy that was read.
 
 A `--builder` pin to the Mac is refused with the same words.
 
-The change is what differs from the merge-base of `HEAD` with `refs/remotes/origin/HEAD` (else `refs/remotes/origin/main`, which also stands in for an `origin/HEAD` that names no commit): committed, staged or unstaged changes and untracked files git does not ignore. A clone without either ref, a detached `HEAD`, a shallow clone, a merge-base git cannot find, a git call that fails or does not answer in time (10 s in all) or a changed path that is not valid UTF-8 cannot be told, so the run goes to Windows.
+The change is what differs from the merge-base of `HEAD` with `refs/remotes/origin/HEAD` (else `refs/remotes/origin/main`, which also stands in for an `origin/HEAD` that names no commit): committed, staged or unstaged changes and untracked files git does not ignore.
+
+A clone without either ref, a detached `HEAD`, a shallow clone, a merge-base git cannot find, a git call that fails or does not answer in time (10 s in all) or a changed path that is not valid UTF-8 cannot be told, so the run goes to Windows.
 
 A declared sibling that is a link or junction, has no folder or no `.git`, is not allowed in `remote.json` or is the worktree's own folder is checked before any git runs, and steers nothing: the run stays here with the sibling's own reason, `gate: not routed: sibling <name> is a link or a junction`, and a `--builder` pin to the Mac is refused with `gate: --builder <builder> cannot route this run: sibling <name> is a link or a junction`.
 
