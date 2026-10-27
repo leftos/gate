@@ -27,6 +27,8 @@ pub enum Invocation {
     Push(PushRequest),
     /// `gate check`.
     Check(CheckRequest),
+    /// `gate drain`.
+    Drain(DrainRequest),
     /// `gate burn`.
     Burn(BurnRequest),
     /// `gate expect`.
@@ -561,6 +563,50 @@ pub struct CheckSeams {
     pub remote_ssh: Option<PathBuf>,
     /// How long the builder check's call may take, in milliseconds, in place of 120 s (`--test-remote-timeout-ms`).
     pub remote_timeout_ms: Option<u64>,
+}
+
+/// A valid `gate drain`, which takes no words: what it does to the builder's barrier, the builder it drains in place of
+/// the one `remote.json`'s `host` names, and the hidden seams the black-box suite gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DrainRequest {
+    /// `--lift`, `--status`, or neither: raise the barrier and wait.
+    pub action: DrainAction,
+    /// `--builder <host>` as given: the builder to drain; `None` drains the one `remote.json`'s `host` names.
+    pub builder: Option<String>,
+    /// The hidden `--test-*` flags that set the wait's timing, its interrupt and the transport.
+    pub seams: DrainSeams,
+}
+
+/// What `gate drain` does to the builder's barrier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainAction {
+    /// `gate drain`: raise the barrier, or raise it again, and wait until the builder is drained.
+    Raise,
+    /// `gate drain --lift`: lift the barrier.
+    Lift,
+    /// `gate drain --status`: say what stands, changing nothing.
+    Status,
+}
+
+/// What the black-box suite sets on `gate drain` through its hidden `--test-*` flags; each field keeps its default,
+/// `None` or off, in a gate built without the `test-seams` feature.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DrainSeams {
+    /// The wait's poll, in milliseconds, in place of 2 s (`--test-poll-ms`).
+    pub poll_ms: Option<u64>,
+    /// The period of the wait's still-waiting line, in milliseconds, in place of 30 s (`--test-heartbeat-ms`).
+    pub heartbeat_ms: Option<u64>,
+    /// How often the wait raises the barrier again, in milliseconds, in place of 5 minutes (`--test-drain-raise-ms`).
+    pub raise_ms: Option<u64>,
+    /// Raise the console interrupt right after the first list of the runs waited on is said
+    /// (`--test-drain-interrupt-after-list`).
+    pub interrupt_after_list: bool,
+    /// Raise the console interrupt just before the first raise is asked (`--test-drain-interrupt-before-raise`).
+    pub interrupt_before_raise: bool,
+    /// The local transport to the builder, as `gate check --builder` takes it (`--test-remote-transport`).
+    pub remote_transport: Option<String>,
+    /// The program the local transport's call starts with ssh's own words (`--test-remote-ssh`).
+    pub remote_ssh: Option<PathBuf>,
 }
 
 /// A valid `gate warm`, which takes no words: the folder to warm from, whether it runs in the background, the state

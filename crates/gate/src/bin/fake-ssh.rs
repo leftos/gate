@@ -39,11 +39,11 @@
 //! `/usr/bin/perl` looking for a path that does not exist; `no-cargo` runs it with no `cargo` stand-in and a login `PATH`
 //! of `tools`, `/usr/bin` and the first folder holding a `git.exe` along `PATH` alone.
 //!
-//! `ok` runs `<gate> box <verb> --stdin` with the gate the variable `GATE_FAKE_SSH_GATE` names, a `run`, `lfs` or `inputs` call
-//! given the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`, when set, before its verb as box seams, and a `preflight` call
-//! those of `GATE_FAKE_SSH_PREFLIGHT_SEAMS` the same way, then `--test-box-root-walk-stop <folder>` when the variable
-//! `GATE_FAKE_SSH_ROOT_WALK_STOP` names the folder, one path never split, or `git
-//! upload-pack <path>` or `git receive-pack <path>`, or a push call's words with this PC's `pwsh`, its `LOCALAPPDATA`
+//! `ok` runs `<gate> box <verb> --stdin` with the gate the variable `GATE_FAKE_SSH_GATE` names, a `run`, `lfs`,
+//! `inputs` or `drain` call given the words of the variable `GATE_FAKE_SSH_BOX_SEAMS`, when set, before its verb as box
+//! seams, and a `preflight` call those of `GATE_FAKE_SSH_PREFLIGHT_SEAMS` the same way, a `preflight` or `drain` call
+//! then `--test-box-root-walk-stop <folder>` when the variable `GATE_FAKE_SSH_ROOT_WALK_STOP` names the folder, one path
+//! never split, or `git upload-pack <path>` or `git receive-pack <path>`, or a push call's words with this PC's `pwsh`, its `LOCALAPPDATA`
 //! the folder named as the host, the word before the line, in the folder the variable `GATE_FAKE_SSH_BUILDERS` names,
 //! made when missing, fed this process's standard input, which it reads whole first and keeps as `<steps file>.input`;
 //! its standard streams are otherwise this process's, and it exits with its status;
@@ -54,7 +54,8 @@
 //! its `gate: remote boot` line, said as `gate: remote boot <time>`, and `no-boot` with that line dropped;
 //! `drop` exits 255 with nothing written, as a connection lost after the banner; `fail-banner` writes ssh's
 //! `Connection timed out during banner exchange` on standard error and exits 255; `fail-other` writes another first line
-//! there and exits 255; `out-then-drop` writes a line on standard output and exits 255; `exit <n>` runs nothing and
+//! there and exits 255; `fail-host` writes ssh's `connect to host <host>` refusal there, naming the host it was given,
+//! and exits 255; `out-then-drop` writes a line on standard output and exits 255; `exit <n>` runs nothing and
 //! exits `<n>`, as cmd's 9009 for a program it cannot find; `say-exit <n> <line>` runs nothing, writes the line on
 //! standard error and exits `<n>`, as a call that fails with a line of its own does; `flood <n>` runs nothing, writes `<n>` bytes of `x`
 //! and no line end on standard error, which git passes through as its own, and exits 0; `lines <count> <length>` writes
@@ -363,6 +364,10 @@ fn bare_step(step: &str, call: &BoxCall<'_>) -> Result<i32, String> {
         "drop" => Ok(SSH_FAILED),
         "fail-banner" => said(&mut io::stderr().lock(), PRE_BANNER),
         "fail-other" => said(&mut io::stderr().lock(), "ssh: connect to host builder port 22: Connection refused"),
+        "fail-host" => said(
+            &mut io::stderr().lock(),
+            &format!("ssh: connect to host {} port 22: Connection refused", call.host),
+        ),
         "out-then-drop" => said(&mut io::stdout().lock(), "fake-ssh: a line before the connection dropped"),
         other => Err(format!("unknown step '{other}'")),
     }
@@ -379,7 +384,7 @@ fn variable(name: &str) -> Result<String, String> {
 }
 
 /// The box seams a call's gate is given before its verb: the words of the variable `name`, `GATE_FAKE_SSH_BOX_SEAMS`
-/// for a `run`, `lfs` or `inputs` call and `GATE_FAKE_SSH_PREFLIGHT_SEAMS` for a preflight, none when it is unset.
+/// for a `run`, `lfs`, `inputs` or `drain` call and `GATE_FAKE_SSH_PREFLIGHT_SEAMS` for a preflight, none when it is unset.
 fn seams_of(name: &str) -> Result<String, String> {
     match std::env::var(name) {
         Err(std::env::VarError::NotPresent) => Ok(String::new()),
@@ -676,14 +681,14 @@ impl<'a> BoxCall<'a> {
         let mut command = Command::new(variable("GATE_FAKE_SSH_GATE")?);
         command.arg("box");
         let seams = match self.verb {
-            "run" | "lfs" | "inputs" => Some("GATE_FAKE_SSH_BOX_SEAMS"),
+            "run" | "lfs" | "inputs" | "drain" => Some("GATE_FAKE_SSH_BOX_SEAMS"),
             "preflight" => Some("GATE_FAKE_SSH_PREFLIGHT_SEAMS"),
             _ => None,
         };
         if let Some(name) = seams {
             command.args(seams_of(name)?.split_whitespace());
         }
-        if self.verb == "preflight"
+        if matches!(self.verb, "preflight" | "drain")
             && let Some(stop) = std::env::var_os("GATE_FAKE_SSH_ROOT_WALK_STOP")
         {
             command.arg("--test-box-root-walk-stop").arg(stop);

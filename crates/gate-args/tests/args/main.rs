@@ -9,6 +9,7 @@ mod burn;
 mod check;
 mod compat;
 mod cutover;
+mod drain;
 mod expect;
 mod program;
 mod push;

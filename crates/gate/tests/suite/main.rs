@@ -17,6 +17,7 @@ mod cores;
 mod critical;
 mod cutover;
 mod diagnostics;
+mod drain;
 mod durations;
 mod harness;
 mod hold;

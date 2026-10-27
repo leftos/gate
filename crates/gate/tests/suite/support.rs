@@ -35,6 +35,7 @@ usage: gate run --slot heavy|light|critical|none [--alone] [--reason \"<why>\"] 
        gate stop-tree <pid>
        gate cutover
        gate push
+       gate drain [--lift | --status] [--builder <host>]
        gate check [--builder <host>]
        gate warm [--cd <folder>] [--background] [--state-dir <path>]
        gate burn [--cores <n>] --seconds <s>
@@ -1242,7 +1243,7 @@ pub const STEPS_VARIABLE: &str = "GATE_FAKE_SSH_STEPS";
 pub const GATE_VARIABLE: &str = "GATE_FAKE_SSH_GATE";
 /// The variable whose words the stand-in gives the box's `preflight` before its verb.
 pub const PREFLIGHT_SEAMS_VARIABLE: &str = "GATE_FAKE_SSH_PREFLIGHT_SEAMS";
-/// The variable naming the folder the stand-in gives the box's `preflight` as `--test-box-root-walk-stop`, so the
+/// The variable naming the folder the stand-in gives the box's `preflight` and `drain` as `--test-box-root-walk-stop`, so the
 /// walk above the builder's root ends at the case folder and no case depends on the host's folders above it.
 pub const ROOT_WALK_STOP_VARIABLE: &str = "GATE_FAKE_SSH_ROOT_WALK_STOP";
 /// The preflight seams of a tool case whose probes and SDK list must answer: bounds no run reaches, the probes' limit,

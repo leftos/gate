@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use crate::problem::{Problem, Required, Spelling};
 use crate::request::{
-    BurnRequest, Ceiling, CheckRequest, CheckSeams, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, ExpectRequest,
-    PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams, WarmRequest,
+    BurnRequest, Ceiling, CheckRequest, CheckSeams, CutoverRequest, CutoverSeams, DEFAULT_STALL_SECONDS, DEFAULT_TAIL_LINES, DrainAction,
+    DrainRequest, DrainSeams, ExpectRequest, PushRequest, PushSeams, RunRequest, Slot, StopRequest, TestSeams, WarmRequest,
 };
 use crate::values;
 
@@ -130,6 +130,8 @@ pub(crate) enum ValueOption {
     NetfxKey,
     #[cfg(feature = "test-seams")]
     WarmWaitMs,
+    #[cfg(feature = "test-seams")]
+    DrainRaiseMs,
 }
 
 /// An option that is on or off.
@@ -139,6 +141,8 @@ pub(crate) enum SwitchOption {
     Local,
     Alone,
     Background,
+    Lift,
+    Status,
     #[cfg(feature = "test-seams")]
     PrintRequest,
     #[cfg(feature = "test-seams")]
@@ -167,6 +171,10 @@ pub(crate) enum SwitchOption {
     JobBreakaway,
     #[cfg(feature = "test-seams")]
     CutoverInterruptAfterList,
+    #[cfg(feature = "test-seams")]
+    DrainInterruptAfterList,
+    #[cfg(feature = "test-seams")]
+    DrainInterruptBeforeRaise,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,6 +207,14 @@ pub(crate) struct RunBuilder {
     reason: Option<String>,
     /// `gate warm`'s `--background`.
     background: bool,
+    /// `gate drain`'s `--lift`.
+    lift: bool,
+    /// `gate drain`'s `--status`.
+    status: bool,
+    /// `gate drain`'s own seams, `--test-drain-raise-ms`, `--test-drain-interrupt-after-list` and
+    /// `--test-drain-interrupt-before-raise`; its poll,
+    /// still-waiting period and transport are read into `test_seams`, as a run's are.
+    drain_seams: DrainSeams,
     bring_tracked: Vec<String>,
     /// The `--env` pairs the gate can set, in the order given.
     env: Vec<(String, String)>,
@@ -323,83 +339,42 @@ impl RunBuilder {
             ValueOption::Reason => self.reason = Some(Self::reason_value(spelled, value)?),
             ValueOption::Builder => self.builder = Some(value.to_owned()),
             #[cfg(feature = "test-seams")]
-            ValueOption::SampleMs => self.test_seams.sample_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RouteHintFloorMs => self.test_seams.route_hint_floor_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::LoadWindowMs => self.test_seams.load_window_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::HeartbeatMs => self.test_seams.heartbeat_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::PollMs => self.test_seams.poll_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::DrainPollMs => self.test_seams.drain_poll_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::StallMs => self.test_seams.stall_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::DiagnosticsBudgetMs => {
-                self.test_seams.diagnostics_budget_ms = Some(values::above_zero(spelled, value)?);
-            }
-            #[cfg(feature = "test-seams")]
-            ValueOption::InterruptAfterSamples => self.test_seams.interrupt_after_samples = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteClient => self.test_seams.remote_client = Some(PathBuf::from(value)),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteWaitMs => self.test_seams.remote_wait_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::KeyWaitMs => self.test_seams.key_wait_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::GitLimitMs => self.test_seams.git_limit_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::GitDrainMs => self.test_seams.git_drain_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RestoreLimitMs => self.test_seams.restore_limit_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::BesideClaimWait => self.test_seams.beside_claim_wait = Some(PathBuf::from(value)),
-            #[cfg(feature = "test-seams")]
-            ValueOption::DotnetLimitMs => self.test_seams.dotnet_limit_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteTransport => self.test_seams.remote_transport = Some(value.to_owned()),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteSsh => self.test_seams.remote_ssh = Some(PathBuf::from(value)),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteRetryPauseMs => self.test_seams.remote_retry_pause_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteBoundMs => self.test_seams.remote_bound_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteInterruptAt => {
-                self.test_seams.remote_interrupt_at = Some(values::remote_call(spelled, value, values::INTERRUPTED_CALLS)?);
-            }
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteWatchCall => {
-                self.test_seams.remote_watch_call = Some(values::remote_call(spelled, value, values::WATCHED_CALLS)?);
-            }
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteTimeoutMs => self.test_seams.remote_timeout_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteBackstopMs => self.test_seams.remote_backstop_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteSnapshotAgeMs => self.test_seams.remote_snapshot_age_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::OutputsProgressMs => self.test_seams.outputs_progress_ms = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::LocalSdks => self.test_seams.local_sdks = Some(value.to_owned()),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteFetchCapBytes => self.test_seams.remote_fetch_cap_bytes = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteApplyCapBytes => self.test_seams.remote_apply_cap_bytes = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteOutputsBudgetBytes => self.test_seams.remote_outputs_budget_bytes = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteInputsBudgetBytes => self.test_seams.remote_inputs_budget_bytes = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteLfsBudgetBytes => self.test_seams.remote_lfs_budget_bytes = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteLogCapBytes => self.test_seams.remote_log_cap_bytes = Some(values::above_zero(spelled, value)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::RemoteTamper => self.test_seams.remote_tamper = Some(values::remote_call(spelled, value, values::TAMPERS)?),
-            #[cfg(feature = "test-seams")]
-            ValueOption::ConfirmMs
+            ValueOption::SampleMs
+            | ValueOption::RouteHintFloorMs
+            | ValueOption::LoadWindowMs
+            | ValueOption::HeartbeatMs
+            | ValueOption::PollMs
+            | ValueOption::DrainPollMs
+            | ValueOption::StallMs
+            | ValueOption::DiagnosticsBudgetMs
+            | ValueOption::InterruptAfterSamples
+            | ValueOption::RemoteClient
+            | ValueOption::RemoteWaitMs
+            | ValueOption::KeyWaitMs
+            | ValueOption::GitLimitMs
+            | ValueOption::GitDrainMs
+            | ValueOption::RestoreLimitMs
+            | ValueOption::BesideClaimWait
+            | ValueOption::DotnetLimitMs
+            | ValueOption::RemoteTransport
+            | ValueOption::RemoteSsh
+            | ValueOption::RemoteRetryPauseMs
+            | ValueOption::RemoteBoundMs
+            | ValueOption::RemoteInterruptAt
+            | ValueOption::RemoteWatchCall
+            | ValueOption::RemoteTimeoutMs
+            | ValueOption::RemoteBackstopMs
+            | ValueOption::RemoteSnapshotAgeMs
+            | ValueOption::OutputsProgressMs
+            | ValueOption::LocalSdks
+            | ValueOption::RemoteFetchCapBytes
+            | ValueOption::RemoteApplyCapBytes
+            | ValueOption::RemoteOutputsBudgetBytes
+            | ValueOption::RemoteInputsBudgetBytes
+            | ValueOption::RemoteLfsBudgetBytes
+            | ValueOption::RemoteLogCapBytes
+            | ValueOption::RemoteTamper
+            | ValueOption::ConfirmMs
             | ValueOption::PushSsh
             | ValueOption::PushBoundMs
             | ValueOption::PushRegister
@@ -407,16 +382,56 @@ impl RunBuilder {
             | ValueOption::ProbeDrainMs
             | ValueOption::SdkLimitMs
             | ValueOption::NetfxKey
-            | ValueOption::WarmWaitMs => self.apply_subcommand_seam(option, spelled, value)?,
+            | ValueOption::WarmWaitMs
+            | ValueOption::DrainRaiseMs => self.apply_seam(option, spelled, value)?,
         }
         Ok(())
     }
 
-    /// Sets the seam of `gate cutover`, `gate push`, `gate check` or `gate warm` that `option` names from `value`; any
-    /// other option is [`Self::apply`]'s and sets nothing here.
+    /// Sets the test seam `option` names from `value`. The options [`Self::apply`] sets itself are named here too, and
+    /// set nothing, so each match names every option and a new one is placed in both.
     #[cfg(feature = "test-seams")]
-    fn apply_subcommand_seam(&mut self, option: ValueOption, spelled: &str, value: &str) -> Result<(), Problem> {
+    fn apply_seam(&mut self, option: ValueOption, spelled: &str, value: &str) -> Result<(), Problem> {
+        let seams = &mut self.test_seams;
         match option {
+            ValueOption::SampleMs => seams.sample_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::RouteHintFloorMs => seams.route_hint_floor_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::LoadWindowMs => seams.load_window_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::HeartbeatMs => seams.heartbeat_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::PollMs => seams.poll_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::DrainPollMs => seams.drain_poll_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::StallMs => seams.stall_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::DiagnosticsBudgetMs => seams.diagnostics_budget_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::InterruptAfterSamples => seams.interrupt_after_samples = Some(values::above_zero(spelled, value)?),
+            ValueOption::RemoteClient => seams.remote_client = Some(PathBuf::from(value)),
+            ValueOption::RemoteWaitMs => seams.remote_wait_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::KeyWaitMs => seams.key_wait_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::GitLimitMs => seams.git_limit_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::GitDrainMs => seams.git_drain_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::RestoreLimitMs => seams.restore_limit_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::BesideClaimWait => seams.beside_claim_wait = Some(PathBuf::from(value)),
+            ValueOption::DotnetLimitMs => seams.dotnet_limit_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::RemoteTransport => seams.remote_transport = Some(value.to_owned()),
+            ValueOption::RemoteSsh => seams.remote_ssh = Some(PathBuf::from(value)),
+            ValueOption::RemoteRetryPauseMs => seams.remote_retry_pause_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::RemoteBoundMs => seams.remote_bound_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::RemoteInterruptAt => {
+                seams.remote_interrupt_at = Some(values::remote_call(spelled, value, values::INTERRUPTED_CALLS)?);
+            }
+            ValueOption::RemoteWatchCall => seams.remote_watch_call = Some(values::remote_call(spelled, value, values::WATCHED_CALLS)?),
+            ValueOption::RemoteTimeoutMs => seams.remote_timeout_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::RemoteBackstopMs => seams.remote_backstop_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::RemoteSnapshotAgeMs => seams.remote_snapshot_age_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::OutputsProgressMs => seams.outputs_progress_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::LocalSdks => seams.local_sdks = Some(value.to_owned()),
+            ValueOption::RemoteFetchCapBytes => seams.remote_fetch_cap_bytes = Some(values::above_zero(spelled, value)?),
+            ValueOption::RemoteApplyCapBytes => seams.remote_apply_cap_bytes = Some(values::above_zero(spelled, value)?),
+            ValueOption::RemoteOutputsBudgetBytes => seams.remote_outputs_budget_bytes = Some(values::above_zero(spelled, value)?),
+            ValueOption::RemoteInputsBudgetBytes => seams.remote_inputs_budget_bytes = Some(values::above_zero(spelled, value)?),
+            ValueOption::RemoteLfsBudgetBytes => seams.remote_lfs_budget_bytes = Some(values::above_zero(spelled, value)?),
+            ValueOption::RemoteLogCapBytes => seams.remote_log_cap_bytes = Some(values::above_zero(spelled, value)?),
+            ValueOption::RemoteTamper => seams.remote_tamper = Some(values::remote_call(spelled, value, values::TAMPERS)?),
+            ValueOption::WarmWaitMs => seams.warm_wait_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::ConfirmMs => self.cutover_seams.confirm_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::PushSsh => self.push_seams.ssh = Some(PathBuf::from(value)),
             ValueOption::PushBoundMs => self.push_seams.bound_ms = Some(values::above_zero(spelled, value)?),
@@ -425,8 +440,20 @@ impl RunBuilder {
             ValueOption::ProbeDrainMs => self.check_seams.probe_drain_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::SdkLimitMs => self.check_seams.sdk_limit_ms = Some(values::above_zero(spelled, value)?),
             ValueOption::NetfxKey => self.check_seams.netfx_key = Some(value.to_owned()),
-            ValueOption::WarmWaitMs => self.test_seams.warm_wait_ms = Some(values::above_zero(spelled, value)?),
-            _ => {}
+            ValueOption::DrainRaiseMs => self.drain_seams.raise_ms = Some(values::above_zero(spelled, value)?),
+            ValueOption::Slot
+            | ValueOption::Timeout
+            | ValueOption::Log
+            | ValueOption::Stall
+            | ValueOption::Tail
+            | ValueOption::StateDir
+            | ValueOption::Cd
+            | ValueOption::Cores
+            | ValueOption::Seconds
+            | ValueOption::BringTracked
+            | ValueOption::Env
+            | ValueOption::Reason
+            | ValueOption::Builder => {}
         }
         Ok(())
     }
@@ -458,6 +485,8 @@ impl RunBuilder {
             SwitchOption::Local => self.local = on,
             SwitchOption::Alone => self.alone = on,
             SwitchOption::Background => self.background = on,
+            SwitchOption::Lift => self.lift = on,
+            SwitchOption::Status => self.status = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::PrintRequest => self.print_request = on,
             #[cfg(feature = "test-seams")]
@@ -486,6 +515,10 @@ impl RunBuilder {
             SwitchOption::JobBreakaway => self.test_seams.job_breakaway = on,
             #[cfg(feature = "test-seams")]
             SwitchOption::CutoverInterruptAfterList => self.cutover_seams.interrupt_after_list = on,
+            #[cfg(feature = "test-seams")]
+            SwitchOption::DrainInterruptAfterList => self.drain_seams.interrupt_after_list = on,
+            #[cfg(feature = "test-seams")]
+            SwitchOption::DrainInterruptBeforeRaise => self.drain_seams.interrupt_before_raise = on,
         }
     }
 
@@ -696,6 +729,44 @@ impl RunBuilder {
             return Err(self.problems);
         }
         Ok(PushRequest { seams: self.push_seams })
+    }
+
+    /// The drain request, its action from `--lift` or `--status`, its builder and its seams, or every problem found:
+    /// those found while reading, then `--lift` with `--status`, then `--test-remote-ssh` without
+    /// `--test-remote-transport`, whose local transport alone starts it.
+    pub(crate) fn finish_drain(mut self) -> Result<DrainRequest, Vec<Problem>> {
+        if self.lift && self.status {
+            self.problems.push(Problem::OptionsConflict {
+                option: "--lift",
+                other: "--status",
+            });
+        }
+        #[cfg(feature = "test-seams")]
+        if self.test_seams.remote_ssh.is_some() && self.test_seams.remote_transport.is_none() {
+            self.problems.push(Problem::SeamNeeds {
+                option: "--test-remote-ssh",
+                needs: "--test-remote-transport",
+            });
+        }
+        if !self.problems.is_empty() {
+            return Err(self.problems);
+        }
+        let action = match (self.lift, self.status) {
+            (true, _) => DrainAction::Lift,
+            (false, true) => DrainAction::Status,
+            (false, false) => DrainAction::Raise,
+        };
+        Ok(DrainRequest {
+            action,
+            builder: self.builder,
+            seams: DrainSeams {
+                poll_ms: self.test_seams.poll_ms,
+                heartbeat_ms: self.test_seams.heartbeat_ms,
+                remote_transport: self.test_seams.remote_transport,
+                remote_ssh: self.test_seams.remote_ssh,
+                ..self.drain_seams
+            },
+        })
     }
 
     /// The check request, its builder and its seams the probe limit, transport, ssh and bound read, or every problem

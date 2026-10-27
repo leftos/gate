@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::iter::Peekable;
 
 use crate::problem::Problem;
-use crate::request::{BurnRequest, CheckRequest, CutoverRequest, ExpectRequest, PushRequest, RunRequest, StopRequest, WarmRequest};
+use crate::request::{BurnRequest, CheckRequest, CutoverRequest, DrainRequest, ExpectRequest, PushRequest, RunRequest, StopRequest, WarmRequest};
 use crate::run::{RunBuilder, RunOption, SwitchOption, ValueOption, next_text};
 use crate::values;
 
@@ -88,6 +88,21 @@ pub(crate) fn parse_push(words: impl Iterator<Item = OsString>) -> Result<PushRe
         }
     }
     builder.finish_push()
+}
+
+/// Reads the words after `gate drain`, which takes none: every word is a problem, `--` included, save `--lift`,
+/// `--status`, `--builder <host>` and the hidden seams of a build with the `test-seams` feature.
+pub(crate) fn parse_drain(words: impl Iterator<Item = OsString>) -> Result<DrainRequest, Vec<Problem>> {
+    let mut words = words.peekable();
+    let mut builder = RunBuilder::default();
+    while let Some(text) = next_text(&mut words, &mut builder) {
+        if text.starts_with('-') && text != "--" {
+            read_option(&mut builder, &mut words, &text, drain_option);
+        } else {
+            builder.problems.push(Problem::UnexpectedArgument(text));
+        }
+    }
+    builder.finish_drain()
 }
 
 /// Reads the words after `gate check`, which takes none: every word is a problem, `--` included, save `--builder
@@ -228,6 +243,36 @@ fn push_option(name: &str) -> Option<RunOption> {
 
 #[cfg(not(feature = "test-seams"))]
 fn push_option(_name: &str) -> Option<RunOption> {
+    None
+}
+
+fn drain_option(name: &str) -> Option<RunOption> {
+    match name {
+        "lift" => Some(RunOption::Switch(SwitchOption::Lift)),
+        "status" => Some(RunOption::Switch(SwitchOption::Status)),
+        "builder" => Some(RunOption::Value(ValueOption::Builder)),
+        _ => drain_seam_option(name),
+    }
+}
+
+/// The wait's poll and still-waiting period as cutover's, its re-raise period and interrupt, and the transport as
+/// `gate check --builder` takes it.
+#[cfg(feature = "test-seams")]
+fn drain_seam_option(name: &str) -> Option<RunOption> {
+    match name {
+        "test-poll-ms" => Some(RunOption::Value(ValueOption::PollMs)),
+        "test-heartbeat-ms" => Some(RunOption::Value(ValueOption::HeartbeatMs)),
+        "test-drain-raise-ms" => Some(RunOption::Value(ValueOption::DrainRaiseMs)),
+        "test-drain-interrupt-after-list" => Some(RunOption::Switch(SwitchOption::DrainInterruptAfterList)),
+        "test-drain-interrupt-before-raise" => Some(RunOption::Switch(SwitchOption::DrainInterruptBeforeRaise)),
+        "test-remote-transport" => Some(RunOption::Value(ValueOption::RemoteTransport)),
+        "test-remote-ssh" => Some(RunOption::Value(ValueOption::RemoteSsh)),
+        _ => None,
+    }
+}
+
+#[cfg(not(feature = "test-seams"))]
+fn drain_seam_option(_name: &str) -> Option<RunOption> {
     None
 }
 

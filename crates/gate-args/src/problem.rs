@@ -153,6 +153,11 @@ pub enum Problem {
         option: &'static str,
         other: &'static str,
     },
+    /// Two options that each choose what the command does, given together.
+    OptionsConflict {
+        option: &'static str,
+        other: &'static str,
+    },
     /// A test seam the form `with` chooses does not read, given with it.
     #[cfg(feature = "test-seams")]
     SeamNotUsedWith {
@@ -250,7 +255,9 @@ impl fmt::Display for Problem {
                 (false, false, _) => unreachable!("a run that needs no reason is given no ReasonNeeded problem"),
             }),
             Problem::EmptyReason(option) => write!(f, "gate: {option} must not be empty"),
-            Problem::SeamsConflict { option, other } => write!(f, "gate: {option} cannot be given with {other}"),
+            Problem::SeamsConflict { option, other } | Problem::OptionsConflict { option, other } => {
+                write!(f, "gate: {option} cannot be given with {other}")
+            }
             #[cfg(feature = "test-seams")]
             Problem::SeamNotUsedWith { option, with } => write!(f, "gate: {option} is not used with {with}"),
             Problem::EnvRefused { refusal, name, position } => f.write_str(&refusal.usage_line(&escaped(&shown_name(name)), *position)),

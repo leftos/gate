@@ -32,6 +32,7 @@ pub(crate) fn answer(args: Vec<OsString>, environment: &Environment, console: &m
         Ok(Invocation::StopTree(request)) => u32::from(stop_tree(&request, environment, console)),
         Ok(Invocation::Cutover(request)) => crate::cutover::cutover(&request, environment, console),
         Ok(Invocation::Push(request)) => crate::push::push(&request, environment, console),
+        Ok(Invocation::Drain(request)) => crate::drain_cmd::drain(&request, environment, console),
         Ok(Invocation::Check(request)) => crate::check::check(&request, console),
         Ok(Invocation::Warm(request)) => crate::warm::warm(&request, environment, console),
         Ok(Invocation::Burn(request)) => crate::burn::burn(&request, console),

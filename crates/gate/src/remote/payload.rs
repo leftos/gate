@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use gate_args::BoxVerb;
+use gate_args::{BoxVerb, DrainAction};
 use gate_wire::PathForm;
 use serde_json::{Map, Value, json};
 
@@ -222,6 +222,20 @@ pub(crate) fn preflight_word(location: &Location, needs: &[(String, String)], no
 pub(crate) fn outputs_word(location: &Location, name: &str) -> String {
     let mut object = location.object();
     object.insert("Name".to_owned(), Value::String(name.to_owned()));
+    word(&object)
+}
+
+/// The payload word of the drain verb (design.md, "gate box drain"): the builder's `Root` and the `Action` taken on its
+/// barrier, `raise`, `status` or `lift`.
+pub(crate) fn drain_word(root: &str, action: DrainAction) -> String {
+    let action = match action {
+        DrainAction::Raise => "raise",
+        DrainAction::Status => "status",
+        DrainAction::Lift => "lift",
+    };
+    let mut object = Map::new();
+    object.insert("Root".to_owned(), json!(root));
+    object.insert("Action".to_owned(), json!(action));
     word(&object)
 }
 

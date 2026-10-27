@@ -19,6 +19,7 @@ use proc_table::{Win32ProcessTable, command_line_of};
 
 use crate::answer::USAGE_STATUS;
 use crate::console::Console;
+use crate::heartbeat::Heartbeat;
 use crate::request_json;
 use crate::resolve::Environment;
 use crate::run::CONTROL_C_EXIT;
@@ -136,36 +137,6 @@ fn drain(local_app_data: &Path, flag_time: Timestamp, seams: &CutoverSeams, inte
             return Drained::Interrupted;
         }
         thread::sleep(poll.min(heartbeat.until_due(start.elapsed())));
-    }
-}
-
-/// When the next still-waiting line is due, counted from the start of the drain.
-#[derive(Debug)]
-struct Heartbeat {
-    period: Duration,
-    next: Duration,
-}
-
-impl Heartbeat {
-    fn new(period: Duration) -> Heartbeat {
-        Heartbeat { period, next: period }
-    }
-
-    /// `elapsed`, the time since the start of the drain, when a still-waiting line is due then, which moves the next one
-    /// to the first period boundary after it, skipping any missed; else `None`.
-    fn due(&mut self, elapsed: Duration) -> Option<Duration> {
-        if elapsed < self.next {
-            return None;
-        }
-        while self.next <= elapsed {
-            self.next += self.period;
-        }
-        Some(elapsed)
-    }
-
-    /// How long after `elapsed` the next still-waiting line is due.
-    fn until_due(&self, elapsed: Duration) -> Duration {
-        self.next.saturating_sub(elapsed)
     }
 }
 
@@ -361,7 +332,7 @@ mod tests {
     use gate_state::{PowerShellGate, PowerShellHold, PowerShellSlot};
     use jiff::Timestamp;
 
-    use super::{Confirm, Drain, Gate, Heartbeat, group, still_waiting};
+    use super::{Confirm, Drain, Gate, group, still_waiting};
 
     fn at(second: i64) -> Timestamp {
         Timestamp::from_second(second).expect("a test second is a timestamp")
@@ -615,20 +586,6 @@ mod tests {
                 r"gate: cutover: cannot read 1 claim or ticket file under C:\appdata\gate; they are not waited on",
             ]
         );
-    }
-
-    #[test]
-    fn the_heartbeat_keeps_its_cadence_from_the_start_and_skips_missed_periods() {
-        let mut heartbeat = Heartbeat::new(Duration::from_secs(30));
-        assert_eq!(heartbeat.due(secs(29.9)), None);
-        assert_eq!(heartbeat.until_due(secs(29.9)), secs(30.0).saturating_sub(secs(29.9)));
-        assert_eq!(heartbeat.due(secs(30.0)), Some(secs(30.0)));
-        assert_eq!(heartbeat.until_due(secs(30.0)), secs(30.0), "the next is at 60 s");
-        assert_eq!(heartbeat.due(secs(61.0)), Some(secs(61.0)));
-        assert_eq!(heartbeat.until_due(secs(61.0)), secs(29.0), "the next is at 90 s, not 91 s");
-        assert_eq!(heartbeat.due(secs(95.0)), Some(secs(95.0)));
-        assert_eq!(heartbeat.until_due(secs(95.0)), secs(25.0), "the next is at 120 s");
-        assert_eq!(heartbeat.due(secs(119.0)), None);
     }
 
     #[test]
