@@ -4,8 +4,6 @@
 
 ## Do first
 
-- [ ] GATE-812 Make launch::a_spawned_child_has_spawn_and_exit_lines_naming_its_parent load-proof — Urgent · Local gate
-- [ ] GATE-813 Make slots::a_test_root_names_its_slots_with_its_hash wait for its take line — Urgent · Local gate
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [/] GATE-696 Cross-build Windows outputs on a macOS builder and bring them back — Urgent · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
@@ -14,7 +12,6 @@
 - [/] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [ ] GATE-559 Drain the builder behind a barrier so it can be redeployed — High · Remote
-- [/] GATE-562 Builder drain 1: the barrier, admission and gated verbs on the box — High · Remote
 - [ ] GATE-563 Builder drain 2: make a routed run wait on its PC for the lift — High · Remote
 - [ ] GATE-564 Builder drain 3: gate drain on the PC, and its docs — High · Remote
 - [ ] GATE-807 Builder drain 1b: the barrier on the Unix box — High · Remote
@@ -40,6 +37,8 @@
 - [ ] GATE-678 Make pause suite cases fail at once when the gate they wait on exits
 - [ ] GATE-756 Make a light run's load adjustment see contention below saturation
 - [ ] GATE-794 Count a process already ending as ended at the other refused-terminate sites
+- [ ] GATE-817 Give the job's drain thread a turn when a member outlives the command
+- [ ] GATE-819 Reorder the other stall-window suite cases that need a step inside the window
 
 ## Remote
 
@@ -269,6 +268,8 @@
 - [ ] GATE-809 Release the worktree lock across a sync-back's transfer retry pauses
 - [ ] GATE-810 Keep a builder's outputs archive until the PC has it, so a dropped pull can be retried
 - [ ] GATE-811 Close the gitignored-input rule's edge cases: nested repos, unreadable metadata, spelled case, one check-ignore helper
+- [ ] GATE-816 Check the drain folder's protection before the prune trusts a barrier
+- [ ] GATE-818 Run the box prune's gc in a root with bares but no work folder
 
 ## Cutover sweep
 
