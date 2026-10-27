@@ -45,6 +45,10 @@ Merging is the agents' call too. Once every item under a feature marker has land
 - Implementer: `implementer`. Review: `code-review` at `high`. No routine `security-auditor` pass: the owner is the gate's only user ("Decisions", functional work first); run one only when the owner asks.
 - Concurrency ceiling: three implementers.
 
+## Pre-loop hooks
+
+- **Weekly local-run census.** On a full start, when the newest `docs/research/*-local-run-census.md` is 7 or more days old, run the `local-run-census` skill (`.claude/skills/local-run-census/SKILL.md`) over the days since that note, and book its findings as the skill says, before the slice is cut. Its bookings join the queue like any **add**.
+
 ## Gates
 
 test mode: unstable
