@@ -10,20 +10,25 @@
 //!   `sessions\{session}.{pid}`, the holder each admitted box process keeps open, sharing nothing, for its whole life.
 //!
 //! The drain is "drained" only from one hold of the lock that finds the barrier standing, no live session, and no
-//! process of the root running ([`counted_processes`], [`command_jobs`]); that hold removes every session it found dead.
+//! process of the root running ([`gate_wire::drain::counted_processes`], [`command_jobs`]); that hold removes every session it found dead.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime};
 
 use gate_args::BoxSeams;
 use gate_win32::{Descriptor, Make, Share};
+use gate_wire::drain::{
+    BARRIER, Barrier, Clock, DRAIN, Kind, LAPSED, LIFTED, LOCK, LOCK_RETRY, LOCK_STEP, LiveSession, MOST_COMMAND_CHARS, MOST_NAME_CHARS, Record,
+    Refused, SESSIONS, TICKETS, Ticket, at_of, barrier_line, barrier_of, counted_processes, decided, older_live, refused_lines, session_line,
+    state_line, ticket_live, ticket_name, ticket_of_name, ticket_seq, tickets_line, unix_ms, unix_s,
+};
 use gate_wire::{DrainAction, PathForm, Payload, escaped, is_recorded_job_name, is_session_id};
-use proc_table::{ProcessInfo, ProcessTable, ProcessTree, Win32ProcessTable};
+use proc_table::{ProcessTable, Win32ProcessTable};
 use serde_json::{Value, json};
 use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES};
 
@@ -32,26 +37,6 @@ use crate::boxside::inputs::{Leftover, protected_folder, protected_security};
 use crate::boxside::run::{Interrupted, LOCK_VIOLATION, SHARING_VIOLATION, read_command_record};
 use crate::boxside::{preflight, stamping};
 use crate::console::Console;
-
-/// How long a ticket and a session stay live after their last poll or call.
-const LEASE_MS: u64 = 120_000;
-/// How long a barrier stands after its last raise.
-const LAPSE_MS: u64 = 30 * 60 * 1000;
-/// How long a call waits for the drain lock another call holds, and how long between its tries.
-const LOCK_RETRY: Duration = Duration::from_secs(10);
-const LOCK_STEP: Duration = Duration::from_millis(20);
-/// The most characters of a run's command a session record keeps.
-const MOST_COMMAND_CHARS: usize = 300;
-/// The most characters of a PC's host name and of a repository's name a session record keeps.
-const MOST_NAME_CHARS: usize = 100;
-
-const DRAIN: &str = "drain";
-const LOCK: &str = "lock";
-const BARRIER: &str = "barrier";
-const LAPSED: &str = "lapsed";
-const LIFTED: &str = "lifted";
-const TICKETS: &str = "tickets";
-const SESSIONS: &str = "sessions";
 
 /// Answers `gate box drain`: raises, reads or lifts the barrier under the payload's `Root` as its `Action` says, then
 /// says how the drain stands, one line each ([`State::status`]). The exit status: 0 once it answered,
@@ -207,101 +192,6 @@ fn cannot(what: &str, path: &Path, error: &io::Error) -> String {
     format!("cannot {what} {}: {}", escaped(&path.to_string_lossy()), escaped(&error.to_string()))
 }
 
-/// The time the drain judges at, and its lease and lapse, all in milliseconds.
-#[derive(Clone, Copy, Debug)]
-struct Clock {
-    now: u64,
-    lease: u64,
-    lapse: u64,
-}
-
-impl Clock {
-    /// The clock's time, or `--test-box-now`'s, with the lease and the lapse the seams give, else their defaults.
-    fn of(seams: &BoxSeams) -> Clock {
-        let now = seams
-            .now
-            .map_or_else(|| unix_ms(SystemTime::now()), |seconds| seconds.saturating_mul(1000));
-        Clock {
-            now,
-            lease: seams.drain_lease_ms.unwrap_or(LEASE_MS),
-            lapse: seams.drain_lapse_ms.unwrap_or(LAPSE_MS),
-        }
-    }
-
-    /// Now in whole seconds since the Unix epoch.
-    fn now_s(self) -> u64 {
-        self.now / 1000
-    }
-
-    /// Whether a lease counted from `since_s` (Unix seconds) still holds now.
-    fn within_lease(self, since_s: u64) -> bool {
-        self.now < since_s.saturating_mul(1000).saturating_add(self.lease)
-    }
-
-    /// The Unix second a barrier raised at `raised_s` lapses at.
-    fn lapses_at(self, raised_s: u64) -> u64 {
-        raised_s.saturating_mul(1000).saturating_add(self.lapse) / 1000
-    }
-
-    /// Now as a system time.
-    fn system_time(self) -> SystemTime {
-        UNIX_EPOCH + Duration::from_millis(self.now)
-    }
-}
-
-/// `time` in whole milliseconds since the Unix epoch; 0 for a time before it, which no clock of a builder reads.
-fn unix_ms(time: SystemTime) -> u64 {
-    time.duration_since(UNIX_EPOCH)
-        .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
-}
-
-/// `time` in whole seconds since the Unix epoch.
-fn unix_s(time: SystemTime) -> u64 {
-    unix_ms(time) / 1000
-}
-
-/// A raised barrier: when it was last raised, when it lapses, and how many raises in a row it has had.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Raising {
-    raised: u64,
-    lapses: u64,
-    generation: u64,
-}
-
-/// How the barrier stands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Barrier {
-    /// None was raised, or the last was lifted.
-    None,
-    /// It stands.
-    Standing(Raising),
-    /// The last one lapsed at this Unix second without a lift.
-    Lapsed(u64),
-}
-
-/// How the barrier file `text`, last written at `written_s`, stands at `clock`'s time: standing until its `Lapses`,
-/// then lapsed at it. A file that does not read as a barrier stands as one raised at its last write, so a damaged
-/// barrier holds the drain closed for one lapse and no longer.
-fn barrier_of(text: &str, written_s: u64, clock: Clock) -> Barrier {
-    let read = serde_json::from_str::<Value>(text).ok().and_then(|value| {
-        Some(Raising {
-            raised: value.get("Raised")?.as_u64()?,
-            lapses: value.get("Lapses")?.as_u64()?,
-            generation: value.get("Generation")?.as_u64()?,
-        })
-    });
-    let raised = read.unwrap_or(Raising {
-        raised: written_s,
-        lapses: clock.lapses_at(written_s),
-        generation: 0,
-    });
-    if clock.now < raised.lapses.saturating_mul(1000) {
-        Barrier::Standing(raised)
-    } else {
-        Barrier::Lapsed(raised.lapses)
-    }
-}
-
 /// Whether a barrier stands under the root `root` at the time `seams` give ([`Clock::of`]), read only: no lock is
 /// taken and nothing is written, so a process that may not write `drain\`, the prune, can ask. A root that is not a
 /// folder of its own, or has no `drain\` folder of its own or no `barrier` in it, has none standing; a barrier that
@@ -322,211 +212,6 @@ pub(crate) fn barrier_stands(root: &Path, seams: &BoxSeams) -> Result<bool, Stri
     }
     let read = read_text(&drain, BARRIER).map_err(|error| cannot("read", &drain_path.join(BARRIER), &error))?;
     Ok(read.is_some_and(|(text, written)| matches!(barrier_of(&text, written, Clock::of(seams)), Barrier::Standing(_))))
-}
-
-/// The `At` of a `lapsed` or `lifted` record `text`; `written_s`, its last write, when it does not read as one.
-fn at_of(text: &str, written_s: u64) -> u64 {
-    serde_json::from_str::<Value>(text)
-        .ok()
-        .and_then(|value| value.get("At")?.as_u64())
-        .unwrap_or(written_s)
-}
-
-/// One run's place in the drain's line.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Ticket {
-    seq: u64,
-    session: String,
-    /// The Unix second of its last poll; its file's last write when it does not read.
-    polled: u64,
-}
-
-/// The file name of the ticket `seq` of `session`.
-fn ticket_name(seq: u64, session: &str) -> String {
-    format!("{seq:08}-{session}")
-}
-
-/// The number and session a ticket's file name `name` gives; `None` for any other name.
-fn ticket_of_name(name: &str) -> Option<(u64, &str)> {
-    let (seq, session) = name.split_once('-')?;
-    let numbered = seq.len() >= 8 && seq.bytes().all(|byte| byte.is_ascii_digit());
-    (numbered && is_session_id(session)).then_some(())?;
-    Some((seq.parse().ok()?, session))
-}
-
-/// The number `session`'s ticket has among `tickets`: its own, so a renewal never renumbers it, else one more than the
-/// highest.
-fn ticket_seq(tickets: &[Ticket], session: &str) -> u64 {
-    tickets.iter().find(|ticket| ticket.session == session).map_or_else(
-        || tickets.iter().map(|ticket| ticket.seq).max().unwrap_or(0).saturating_add(1),
-        |own| own.seq,
-    )
-}
-
-/// Whether a ticket last polled at `polled` is live at `clock`'s time: within the lease of the latest of its poll,
-/// the box's boot `boot`, and the last lift or lapse `lift`, so no waiter dies of a reboot or of the wait the barrier
-/// itself made.
-fn ticket_live(polled: u64, boot: u64, lift: u64, clock: Clock) -> bool {
-    clock.within_lease(polled.max(boot).max(lift))
-}
-
-/// How many live tickets of other sessions wait ahead of `session`: older than its own ticket, or every one when it has
-/// none.
-fn older_live(tickets: &[Ticket], session: Option<&str>, live: impl Fn(&Ticket) -> bool) -> usize {
-    let own = session
-        .and_then(|session| tickets.iter().find(|ticket| ticket.session == session))
-        .map(|ticket| ticket.seq);
-    tickets
-        .iter()
-        .filter(|ticket| Some(ticket.session.as_str()) != session && own.is_none_or(|seq| ticket.seq < seq) && live(ticket))
-        .count()
-}
-
-/// Why the drain refused a call: its place in line (`None` for a call that cannot queue), and the standing barrier's
-/// raise and lapse times, `None` when none stands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Refused {
-    pub(crate) place: Option<u32>,
-    pub(crate) raised: Option<u64>,
-    pub(crate) lapses: Option<u64>,
-}
-
-/// The drain's decision for a call of `session` with `older` live tickets ahead of it while `standing` stands: a call of
-/// a session `live` already (its holder held, or called within the lease) is admitted whatever stands or waits; a call
-/// with no session is refused under a standing barrier and admitted otherwise, as it cannot queue; any other call of a
-/// session is refused while a barrier stands or an older live ticket waits.
-fn decided(standing: Option<Raising>, older: usize, session: Option<&str>, live: bool) -> Result<(), Refused> {
-    let refused = |place| Refused {
-        place,
-        raised: standing.map(|raised| raised.raised),
-        lapses: standing.map(|raised| raised.lapses),
-    };
-    let place = Some(u32::try_from(older.saturating_add(1)).unwrap_or(u32::MAX));
-    match (standing, session) {
-        (_, Some(_)) if live => Ok(()),
-        (Some(_), None) => Err(refused(None)),
-        (Some(_), Some(_)) => Err(refused(place)),
-        (None, Some(_)) if older > 0 => Err(refused(place)),
-        (None, _) => Ok(()),
-    }
-}
-
-/// Whether `character` belongs to a file name, so a root followed or preceded by one is not that root.
-fn is_name_char(character: char) -> bool {
-    character.is_alphanumeric() || matches!(character, '-' | '_' | '.')
-}
-
-/// `text` with its ASCII letters lowercased and every `/` made `\`, so two spellings of one path compare equal.
-fn folded(text: &str) -> String {
-    text.chars()
-        .map(|character| if character == '/' { '\\' } else { character.to_ascii_lowercase() })
-        .collect()
-}
-
-/// The root `root` folded ([`folded`]), its trailing separators dropped.
-fn folded_root(root: &str) -> String {
-    folded(root.trim_end_matches(['\\', '/']))
-}
-
-/// Whether the command line `line` names the root `root` on a path boundary, case and separators folded: so
-/// `D:/gate-remote/x.git` names `D:\gate-remote`, and `D:\gate-remote-old` does not.
-fn names_root(line: &str, root: &str) -> bool {
-    let root = folded_root(root);
-    let line = folded(line);
-    !root.is_empty()
-        && line.match_indices(&root).any(|(at, _)| {
-            let before = line.get(..at).and_then(|start| start.chars().next_back());
-            let after = line.get(at + root.len()..).and_then(|rest| rest.chars().next());
-            !before.is_some_and(is_name_char) && !after.is_some_and(is_name_char)
-        })
-}
-
-/// Whether the command line `line` is a `gate box prune --root {root}`, case and separators folded.
-fn names_prune(line: &str, root: &str) -> bool {
-    const PRUNE: &str = " prune --root ";
-    let root = folded_root(root);
-    let line = folded(line);
-    line.match_indices(PRUNE).any(|(at, _)| {
-        let rest = line.get(at + PRUNE.len()..).unwrap_or_default().trim_start_matches(['"', '\'']);
-        line.get(..at).is_some_and(|start| start.contains("box"))
-            && rest.strip_prefix(root.as_str()).is_some_and(|after| !after.starts_with(is_name_char))
-    })
-}
-
-/// Whether `process`, whose command line could not be read, counts as the root's, so the drained test fails closed on
-/// it: an image whose stem, case ignored, is `git`, starts with `git-`, or is `gate` or `pwsh`.
-fn unreadable_counts(process: &ProcessInfo) -> bool {
-    let name = process.name.to_ascii_lowercase();
-    let stem = name.strip_suffix(".exe").unwrap_or(&name);
-    process.command_line.is_none() && (matches!(stem, "git" | "gate" | "pwsh") || stem.starts_with("git-"))
-}
-
-/// What a counted process is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Kind {
-    /// A `gate box prune` of the root, or a process under one.
-    Prune,
-    /// A process naming the root, one whose command line cannot be read, or a process under one.
-    Git,
-    /// A process of a job a `{Work}.command` record names.
-    Job,
-}
-
-impl Kind {
-    fn word(self) -> &'static str {
-        match self {
-            Kind::Prune => "prune",
-            Kind::Git => "git",
-            Kind::Job => "job",
-        }
-    }
-}
-
-/// The processes of `processes` the drained test counts for the root `root`, by pid, but `own`, the box itself: a
-/// prune of the root, a process whose command line names it ([`names_root`]) or cannot be read ([`unreadable_counts`]),
-/// and every process under one of them ([`under`]).
-///
-/// With `readable_only`, a process whose command line cannot be read never counts.
-fn counted_processes(processes: Vec<ProcessInfo>, root: &str, own: u32, readable_only: bool) -> BTreeMap<u32, Kind> {
-    let tree = ProcessTree::new(processes);
-    let mut by_parent: HashMap<u32, Vec<&ProcessInfo>> = HashMap::new();
-    for process in tree.iter().filter(|process| process.pid != process.parent_pid) {
-        by_parent.entry(process.parent_pid).or_default().push(process);
-    }
-    let mut found: BTreeMap<u32, Kind> = BTreeMap::new();
-    for process in tree.iter() {
-        let kind = match process.command_line.as_deref() {
-            Some(line) if names_prune(line, root) => Kind::Prune,
-            Some(line) if names_root(line, root) => Kind::Git,
-            None if !readable_only && unreadable_counts(process) => Kind::Git,
-            _ => continue,
-        };
-        for pid in std::iter::once(process.pid).chain(under(&by_parent, process)) {
-            if pid != own {
-                found.entry(pid).and_modify(|known| *known = (*known).min(kind)).or_insert(kind);
-            }
-        }
-    }
-    found
-}
-
-/// The pids under `top`, breadth first, each once, its children found in `by_parent`. A child counts unless both its
-/// creation time and its parent's are read and it started before its parent, so it holds a pid the parent's real child
-/// left; a time that cannot be read never hides a process, so the drained test fails closed.
-fn under<'a>(by_parent: &HashMap<u32, Vec<&'a ProcessInfo>>, top: &'a ProcessInfo) -> Vec<u32> {
-    let mut visited = HashSet::from([top.pid]);
-    let mut found = Vec::new();
-    let mut queue = VecDeque::from([top]);
-    while let Some(parent) = queue.pop_front() {
-        for &child in by_parent.get(&parent.pid).into_iter().flatten() {
-            let reused = matches!((parent.created, child.created), (Some(parent_created), Some(created)) if created < parent_created);
-            if !reused && visited.insert(child.pid) {
-                found.push(child.pid);
-                queue.push_back(child);
-            }
-        }
-    }
-    found
 }
 
 /// The ids of the processes the job `job` holds; none when no job has the name or it holds none. Else the system's
@@ -627,39 +312,6 @@ fn removed(folder: &File, name: &str) -> io::Result<bool> {
         Ok(found) => gate_win32::delete_opened(&found).map(|()| true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
-    }
-}
-
-/// A session found live by the drained test, as its status line shows it.
-#[derive(Debug, PartialEq, Eq)]
-struct LiveSession {
-    age: u64,
-    pc: Option<String>,
-    repo: Option<String>,
-    command: Option<String>,
-    job: Option<String>,
-}
-
-/// What a session record says; its last write stands in for `Called` when it does not read.
-struct Record {
-    called: u64,
-    pc: Option<String>,
-    repo: Option<String>,
-    command: Option<String>,
-    job: Option<String>,
-}
-
-impl Record {
-    fn of(text: &str, written_s: u64) -> Record {
-        let value = serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
-        let text_of = |key: &str| value.get(key).and_then(Value::as_str).filter(|text| !text.is_empty()).map(str::to_owned);
-        Record {
-            called: value.get("Called").and_then(Value::as_u64).unwrap_or(written_s),
-            pc: text_of("Pc"),
-            repo: text_of("Repo"),
-            command: text_of("Command"),
-            job: text_of("Job"),
-        }
     }
 }
 
@@ -883,7 +535,13 @@ impl State<'_> {
             })
             .collect();
         let mut processes: BTreeMap<u32, Kind> = commands.pids.into_iter().map(|pid| (pid, Kind::Job)).collect();
-        for (pid, kind) in counted_processes(Win32ProcessTable.snapshot(), &self.scanned_root, std::process::id(), self.readable_only) {
+        for (pid, kind) in counted_processes(
+            Win32ProcessTable.snapshot(),
+            &self.scanned_root,
+            std::process::id(),
+            self.readable_only,
+            PathForm::Windows,
+        ) {
             processes.entry(pid).and_modify(|known| *known = (*known).min(kind)).or_insert(kind);
         }
         let mut lines = vec![barrier_line(barrier)];
@@ -913,22 +571,6 @@ fn boot_s() -> Result<u64, String> {
         .map_err(|error| format!("cannot read the boot time: {error}"))
 }
 
-/// The barrier's status line.
-fn barrier_line(barrier: Barrier) -> String {
-    match barrier {
-        Barrier::None => "gate: drain barrier none".to_owned(),
-        Barrier::Standing(raised) => format!("gate: drain barrier {} {}", raised.raised, raised.lapses),
-        Barrier::Lapsed(at) => format!("gate: drain barrier lapsed {at}"),
-    }
-}
-
-/// A live session's status line: its age, then one compact JSON object `{"Pc","Repo","Command"}`, `null` for a field it
-/// lacks.
-fn session_line(session: &LiveSession) -> String {
-    let fields = json!({ "Pc": session.pc, "Repo": session.repo, "Command": session.command });
-    format!("gate: drain session {} {fields}", session.age)
-}
-
 /// The session a holder's file name `{session}.{pid}` names; `None` for any other name.
 fn holder_of(name: &str) -> Option<&str> {
     let (id, pid) = name.split_once('.')?;
@@ -939,22 +581,6 @@ fn holder_of(name: &str) -> Option<&str> {
 /// could not be read, or it holds a process, or it cannot be listed, so the drained test fails closed.
 fn job_live(job: &str, unreadable: &[String]) -> bool {
     unreadable.iter().any(|key| is_recorded_job_name(job, key, PathForm::Windows)) || !job_processes(job).is_ok_and(|pids| pids.is_empty())
-}
-
-/// The live tickets' status line.
-fn tickets_line(count: usize) -> String {
-    format!("gate: drain tickets {count}")
-}
-
-/// The state's status line: drained under a standing barrier with nothing `idle` says is going, waiting under one
-/// with something going, open with none.
-fn state_line(barrier: Barrier, idle: bool) -> String {
-    let state = match barrier {
-        Barrier::Standing(_) if idle => "drained",
-        Barrier::Standing(_) => "waiting",
-        Barrier::None | Barrier::Lapsed(_) => "open",
-    };
-    format!("gate: drain state {state}")
 }
 
 /// A routed run's drain session, as its payload names it.
@@ -1163,22 +789,6 @@ fn held_holder(state: &State<'_>, folder: &File, id: &str) -> Result<File, Strin
     .map_err(|error| state.cannot("hold", &holder_name, &error))
 }
 
-/// The two lines a refused call says after its `drain` tag: its place in line (`gate: drain place {n}`, or `none` for a
-/// call that cannot queue), then the standing barrier's raise and lapse times as [`barrier_line`] says them, or
-/// `gate: drain barrier none` when no barrier stands.
-pub(crate) fn refused_lines(refused: Refused) -> [String; 2] {
-    let place = refused.place.map_or_else(|| "none".to_owned(), |place| place.to_string());
-    let barrier = match (refused.raised, refused.lapses) {
-        (Some(raised), Some(lapses)) => Barrier::Standing(Raising {
-            raised,
-            lapses,
-            generation: 0,
-        }),
-        _ => Barrier::None,
-    };
-    [format!("gate: drain place {place}"), barrier_line(barrier)]
-}
-
 /// What an `outputs` call may do under the drain: the hold of its session while it sends, when the session is live, and
 /// whether it may remove the archive it sent.
 pub(crate) struct Renewal {
@@ -1348,155 +958,14 @@ mod tests {
     use proc_table::ProcessInfo;
     use serde_json::{Value, json};
 
-    use super::{HeldRoot, Session, admit, refused_lines, renewed};
+    use gate_wire::PathForm;
+    use gate_wire::drain::{LAPSE_MS, Refused, counted_processes};
+
+    use super::{HeldRoot, Session, admit, renewed};
     use crate::boxside::preflight;
     use crate::console::Console;
 
-    use super::{
-        Barrier, Clock, Kind, Raising, Refused, Ticket, barrier_of, barrier_stands, counted_processes, decided, names_prune, names_root, older_live,
-        root_text, ticket_live, ticket_name, ticket_of_name, ticket_seq,
-    };
-
-    const LEASE_MS: u64 = 120_000;
-    const LAPSE_MS: u64 = 1_800_000;
-
-    fn clock(now_s: u64) -> Clock {
-        Clock {
-            now: now_s * 1000,
-            lease: LEASE_MS,
-            lapse: LAPSE_MS,
-        }
-    }
-
-    fn ticket(seq: u64, session: &str, polled: u64) -> Ticket {
-        Ticket {
-            seq,
-            session: session.to_owned(),
-            polled,
-        }
-    }
-
-    #[test]
-    fn a_new_ticket_is_one_past_the_highest_and_a_renewal_keeps_its_number() {
-        let tickets = [ticket(3, "a", 0), ticket(7, "b", 0), ticket(5, "c", 0)];
-        assert_eq!(ticket_seq(&[], "a"), 1, "the first ticket is number 1");
-        assert_eq!(ticket_seq(&tickets, "new"), 8, "one more than the highest");
-        assert_eq!(ticket_seq(&tickets, "c"), 5, "a renewal is never renumbered");
-        assert_eq!(ticket_name(8, "new"), "00000008-new");
-        assert_eq!(ticket_of_name("00000008-new-run"), Some((8, "new-run")));
-        for other in ["8-new", "0000000x-new", "00000008-", "00000008-a.new-12", "lock"] {
-            assert_eq!(ticket_of_name(other), None, "{other}");
-        }
-    }
-
-    #[test]
-    fn only_older_live_tickets_of_other_sessions_wait_ahead() {
-        let tickets = [ticket(1, "a", 0), ticket(2, "dead", 0), ticket(3, "b", 0), ticket(4, "c", 0)];
-        let live = |ticket: &Ticket| ticket.session != "dead";
-        assert_eq!(older_live(&tickets, Some("b"), live), 1, "a waits ahead of b; dead does not");
-        assert_eq!(older_live(&tickets, Some("a"), live), 0);
-        assert_eq!(
-            older_live(&tickets, Some("new"), live),
-            3,
-            "a session with no ticket waits behind every live one"
-        );
-    }
-
-    #[test]
-    fn a_ticket_dies_a_lease_after_the_latest_of_its_poll_the_boot_and_the_lift() {
-        let now = 10_000;
-        assert!(ticket_live(now - 119, 0, 0, clock(now)), "polled within the lease");
-        assert!(!ticket_live(now - 120, 0, 0, clock(now)), "dead a whole lease after its poll");
-        assert!(ticket_live(now - 500, now - 60, 0, clock(now)), "a boot since restarts its lease");
-        assert!(ticket_live(now - 500, 0, now - 60, clock(now)), "a lift since restarts its lease");
-        assert!(
-            !ticket_live(now - 500, now - 300, now - 200, clock(now)),
-            "dead a lease after the latest of all three"
-        );
-    }
-
-    #[test]
-    fn a_barrier_stands_until_its_lapse_then_lapses_at_it() {
-        let text = r#"{"Raised":1000,"Lapses":2800,"Generation":3}"#;
-        let raised = Raising {
-            raised: 1000,
-            lapses: 2800,
-            generation: 3,
-        };
-        assert_eq!(barrier_of(text, 0, clock(2799)), Barrier::Standing(raised));
-        assert_eq!(barrier_of(text, 0, clock(2800)), Barrier::Lapsed(2800));
-    }
-
-    #[test]
-    fn an_unreadable_barrier_stands_until_its_last_write_plus_the_lapse() {
-        let written = 5000;
-        let standing = barrier_of("{not json", written, clock(written + 1799));
-        assert_eq!(
-            standing,
-            Barrier::Standing(Raising {
-                raised: written,
-                lapses: written + 1800,
-                generation: 0
-            })
-        );
-        assert_eq!(barrier_of("", written, clock(written + 1800)), Barrier::Lapsed(written + 1800));
-    }
-
-    #[test]
-    fn a_call_without_a_session_is_refused_under_a_standing_barrier_only() {
-        let raised = Raising {
-            raised: 10,
-            lapses: 1810,
-            generation: 1,
-        };
-        let refused = |place| Refused {
-            place,
-            raised: Some(10),
-            lapses: Some(1810),
-        };
-        assert_eq!(decided(Some(raised), 0, None, false), Err(refused(None)), "no session under a barrier");
-        assert_eq!(
-            decided(Some(raised), 2, Some("s"), false),
-            Err(refused(Some(3))),
-            "a session waits its place"
-        );
-        assert_eq!(decided(None, 0, None, false), Ok(()), "no barrier and no session is admitted");
-        assert_eq!(decided(None, 3, None, false), Ok(()), "a call with no session cannot queue");
-        assert_eq!(
-            decided(None, 1, Some("s"), false),
-            Err(Refused {
-                place: Some(2),
-                raised: None,
-                lapses: None
-            }),
-            "an older live ticket waits even with no barrier"
-        );
-        assert_eq!(decided(None, 0, Some("s"), false), Ok(()));
-    }
-
-    #[test]
-    fn a_live_session_is_admitted_past_a_barrier_and_older_tickets_and_a_dead_one_is_not() {
-        let raised = Raising {
-            raised: 10,
-            lapses: 1810,
-            generation: 1,
-        };
-        assert_eq!(
-            decided(Some(raised), 0, Some("s"), true),
-            Ok(()),
-            "a live session under a standing barrier"
-        );
-        assert_eq!(decided(None, 2, Some("s"), true), Ok(()), "a live session with older tickets waiting");
-        assert_eq!(
-            decided(Some(raised), 0, Some("s"), false),
-            Err(Refused {
-                place: Some(1),
-                raised: Some(10),
-                lapses: Some(1810)
-            }),
-            "a dead session under a standing barrier"
-        );
-    }
+    use super::{barrier_stands, root_text};
 
     /// A scratch root `gate-drain-{name}-{pid}` under the temp folder, made empty, and held as the preflight holds one.
     fn scratch_root(name: &str) -> (std::path::PathBuf, std::fs::File) {
@@ -1577,28 +1046,14 @@ mod tests {
             .expect("it is a folder");
         let named = format!("git-receive-pack '{}/k.git'", root.to_string_lossy().replace('\\', "/"));
         let text = root_text(&held).expect("the held root's final path can be read");
-        let counted = counted_processes(vec![process(10, 1, "git-receive-pack.exe", Some(&named))], &text, 0, true);
+        let counted = counted_processes(
+            vec![process(10, 1, "git-receive-pack.exe", Some(&named))],
+            &text,
+            0,
+            true,
+            PathForm::Windows,
+        );
         assert_eq!(counted.into_keys().collect::<Vec<_>>(), [10], "{text} {named}");
-    }
-
-    #[test]
-    fn the_root_is_named_only_on_a_path_boundary_with_separators_and_case_folded() {
-        let root = r"D:\gate-remote";
-        assert!(names_root("git-receive-pack 'D:/gate-remote/x.git'", root));
-        assert!(names_root(r#"git.exe --git-dir="d:\GATE-REMOTE\work\k\.git" fetch"#, root));
-        assert!(names_root(r"tool D:\gate-remote", r"D:\gate-remote\"));
-        assert!(!names_root(r"git-upload-pack D:\gate-remote-old\x.git", root));
-        assert!(!names_root(r"git-upload-pack XD:\gate-remote\x.git", root));
-        assert!(!names_root(r"git status", root));
-    }
-
-    #[test]
-    fn a_prune_of_the_root_is_matched_with_separators_and_case_folded() {
-        let root = r"D:\gate-remote";
-        assert!(names_prune(r"C:\gate\gate.exe box prune --root D:/Gate-Remote", root));
-        assert!(names_prune(r#""C:\gate\gate.exe" BOX prune --root "D:\gate-remote" --keys k"#, root));
-        assert!(!names_prune(r"C:\gate\gate.exe box prune --root D:\gate-remote-old", root));
-        assert!(!names_prune(r"C:\gate\gate.exe prune --root D:\gate-remote", root), "only a box prune");
     }
 
     #[test]
@@ -1676,24 +1131,6 @@ mod tests {
             json!({ "Session": "s3", "Polled": T }),
             "the dead session takes a ticket"
         );
-    }
-
-    #[test]
-    fn a_refusal_says_its_place_and_the_standing_barrier_or_none() {
-        let refused = |place, barrier: Option<(u64, u64)>| Refused {
-            place,
-            raised: barrier.map(|(raised, _)| raised),
-            lapses: barrier.map(|(_, lapses)| lapses),
-        };
-        assert_eq!(
-            refused_lines(refused(Some(2), Some((100, 1900)))),
-            ["gate: drain place 2", "gate: drain barrier 100 1900"]
-        );
-        assert_eq!(
-            refused_lines(refused(None, Some((100, 1900)))),
-            ["gate: drain place none", "gate: drain barrier 100 1900"]
-        );
-        assert_eq!(refused_lines(refused(Some(1), None)), ["gate: drain place 1", "gate: drain barrier none"]);
     }
 
     /// Writes a barrier raised at `raised` under the scratch root `root`'s `drain\`.
@@ -1888,61 +1325,6 @@ mod tests {
             command_line: line.map(str::to_owned),
             created: Some(Timestamp::from_second(i64::from(pid)).unwrap_or(Timestamp::UNIX_EPOCH)),
         }
-    }
-
-    /// A process whose creation time cannot be read.
-    fn untimed(pid: u32, parent: u32, name: &str, line: Option<&str>) -> ProcessInfo {
-        ProcessInfo {
-            created: None,
-            ..process(pid, parent, name, line)
-        }
-    }
-
-    #[test]
-    fn the_root_s_processes_their_children_and_unreadable_git_gate_or_pwsh_count() {
-        let root = r"D:\gate-remote";
-        let processes = vec![
-            process(1, 0, "sshd.exe", Some("sshd")),
-            process(10, 1, "git-receive-pack.exe", Some("git-receive-pack 'D:/gate-remote/k.git'")),
-            process(11, 10, "git.exe", Some("git index-pack --stdin")),
-            untimed(12, 10, "conhost.exe", Some("conhost")),
-            process(5, 10, "old.exe", Some("started before its parent")),
-            untimed(60, 1, "git.exe", Some("git -C D:/gate-remote/k.git gc")),
-            process(61, 60, "git.exe", Some("git repack")),
-            untimed(33, 1, "Git-Upload-Pack.EXE", None),
-            untimed(34, 1, "gitk.exe", None),
-            untimed(35, 1, "gate.exe", None),
-            process(20, 1, "gate.exe", Some(r"gate.exe box prune --root D:\gate-remote")),
-            process(21, 20, "git.exe", Some("git update-ref")),
-            process(30, 1, "pwsh.exe", None),
-            process(31, 1, "GIT.EXE", None),
-            process(32, 1, "notepad.exe", None),
-            process(40, 1, "git.exe", Some(r"git -C D:\gate-remote-old status")),
-            process(50, 1, "gate.exe", Some(r"gate.exe box drain --stdin")),
-        ];
-        let readable: Vec<u32> = counted_processes(processes.clone(), root, 50, true).into_keys().collect();
-        assert_eq!(
-            readable,
-            [10, 11, 12, 20, 21, 60, 61],
-            "the readable-only seam leaves out what cannot be read; a child counts whatever times are unknown"
-        );
-        let counted: Vec<(u32, Kind)> = counted_processes(processes, root, 50, false).into_iter().collect();
-        assert_eq!(
-            counted,
-            [
-                (10, Kind::Git),
-                (11, Kind::Git),
-                (12, Kind::Git),
-                (20, Kind::Prune),
-                (21, Kind::Prune),
-                (30, Kind::Git),
-                (31, Kind::Git),
-                (33, Kind::Git),
-                (35, Kind::Git),
-                (60, Kind::Git),
-                (61, Kind::Git)
-            ]
-        );
     }
 
     /// The seams of a box at the Unix second `now_s`, with the default lapse.

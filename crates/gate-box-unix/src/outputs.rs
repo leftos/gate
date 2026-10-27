@@ -35,6 +35,7 @@ use gate_wire::{Payload, archive_file_name, archive_key, escaped};
 use crate::beneath::{self, Folder};
 use crate::console::Console;
 use crate::cross::{self, Portable};
+use crate::drain;
 use crate::lines::{FAILED_STATUS, USAGE_STATUS};
 use crate::request::{Unread, bounded_line};
 
@@ -942,15 +943,36 @@ pub fn not_brought_back(reason: &str) -> String {
 /// is said and left for a later run's [`prune`], status 0; one already gone says nothing. The archive is opened beneath
 /// the output folder, itself reached beneath the judged root: a link at its name or anything but a plain file is not
 /// sent.
+///
+/// Before it sends, the call renews the payload's drain session ([`drain::renewed_at`]), its clock as `seams` set it,
+/// and holds it until it returns. It is never refused: an archive of a session the drain found dead while a barrier
+/// stands is sent and kept, said with [`KEPT_DRAINED`], as is one sent when the drain could not be read, said
+/// `gate: drain failed: {why}`.
 #[must_use]
-pub fn outputs(payload: &Payload, console: &mut Console) -> u8 {
-    answered(payload, &mut io::stdout().lock(), console)
+pub fn outputs(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u8 {
+    answered(payload, seams, &mut io::stdout().lock(), console)
+}
+
+/// The line an `outputs` call says when it keeps the archive it sent, its session dead under a standing barrier.
+const KEPT_DRAINED: &str = "gate: remote outputs kept: the builder is drained";
+
+/// What an `outputs` call does with the archive it sent.
+enum Removal {
+    /// Removes it.
+    Remove,
+    /// Keeps it, its session dead under a standing barrier, and says [`KEPT_DRAINED`].
+    KeepDrained,
+    /// Keeps it, the drain unread, its failure said.
+    Keep,
 }
 
 /// [`outputs`], the archive sent to `sink`.
-fn answered(payload: &Payload, sink: &mut impl Write, console: &mut Console) -> u8 {
-    let folder = match payload.work_folder().and_then(|(_, work)| payload.output_folder(work)) {
-        Ok(folder) => folder,
+fn answered(payload: &Payload, seams: &BoxSeams, sink: &mut impl Write, console: &mut Console) -> u8 {
+    let read = payload
+        .work_folder()
+        .and_then(|(_, work)| Ok((work, payload.output_folder(work)?, payload.session()?)));
+    let (work, folder, session) = match read {
+        Ok(read) => read,
         Err(line) => {
             console.err(&line);
             return USAGE_STATUS;
@@ -964,6 +986,14 @@ fn answered(payload: &Payload, sink: &mut impl Write, console: &mut Console) -> 
             return if lacking { USAGE_STATUS } else { FAILED_STATUS };
         }
     };
+    let (_held, removal) = match drain::renewed_at(work, session, seams, console) {
+        Ok(renewal) if renewal.may_delete => (renewal.held, Removal::Remove),
+        Ok(renewal) => (renewal.held, Removal::KeepDrained),
+        Err(why) => {
+            console.err(&drain::failed_line(&why));
+            (None, Removal::Keep)
+        }
+    };
     let sent = output_folder(folder, false)
         .map_err(Unsent::of_open)
         .and_then(|outputs| send(&outputs, name, sink).map(|()| outputs));
@@ -974,11 +1004,17 @@ fn answered(payload: &Payload, sink: &mut impl Write, console: &mut Console) -> 
             return FAILED_STATUS;
         }
     };
-    if let Err(error) = remove_archive(&outputs, OsStr::new(name)) {
-        console.err(&format!(
-            "gate: remote could not remove the outputs archive {name}: {}",
-            escaped(&error.to_string())
-        ));
+    match removal {
+        Removal::Remove => {
+            if let Err(error) = remove_archive(&outputs, OsStr::new(name)) {
+                console.err(&format!(
+                    "gate: remote could not remove the outputs archive {name}: {}",
+                    escaped(&error.to_string())
+                ));
+            }
+        }
+        Removal::KeepDrained => console.err(KEPT_DRAINED),
+        Removal::Keep => {}
     }
     0
 }
@@ -1330,7 +1366,7 @@ pub(crate) mod tests {
     fn verb(payload: &Payload) -> (u8, Vec<u8>, Console) {
         let mut console = Console::captured();
         let mut sent = Vec::new();
-        let status = answered(payload, &mut sent, &mut console);
+        let status = answered(payload, &BoxSeams::default(), &mut sent, &mut console);
         (status, sent, console)
     }
 

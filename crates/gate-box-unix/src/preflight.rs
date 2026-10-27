@@ -8,6 +8,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 use std::thread;
 
+use gate_args::BoxSeams;
 use gate_wire::{Pair, PairSibling, PathForm, Payload, ROOT_STATUS, bare_stem, escaped, root_unsafe_line, tool_line, trees};
 
 use crate::console::Console;
@@ -18,13 +19,13 @@ use crate::lines::{
     work_layout, write_failure,
 };
 use crate::stop::open_folder_line;
-use crate::{boot, files, probe, process, run};
+use crate::{boot, drain, files, probe, process, run};
 
 /// The most bytes of the warm record read: one past a hash, so a longer record is seen as not one.
 const WARM_READ_LIMIT: u64 = 65;
 
 /// Why the work root is not used.
-enum Refusal {
+pub(crate) enum Refusal {
     /// A folder could not be made or is not the box user's own: this line, [`FAILED_STATUS`].
     Folder(String),
     /// The root, or a folder of it another account may reach into, is not trusted: the version line, then this
@@ -42,12 +43,16 @@ fn folder_refusal(flaw: FolderFlaw, private: bool) -> Refusal {
     }
 }
 
-/// Answers the preflight of `payload` through `console`; the status. Usage errors (a key the payload lacks or that does
-/// not fit the work folder) exit [`USAGE_STATUS`] before anything is made; a work root another account may write in is
-/// refused after the version line with the work-root line, as the Windows box refuses one.
-pub fn preflight(payload: &Payload, console: &mut Console) -> u8 {
+/// Answers the preflight of `payload` through `console`, its drain clock as `seams` set it; the status. Usage errors (a
+/// key the payload lacks or that does not fit the work folder, a drain session named wrong) exit [`USAGE_STATUS`]
+/// before anything is made; a work root another account may write in is refused after the version line with the
+/// work-root line, as the Windows box refuses one. Once the root is trusted and before any record of the work folder is
+/// read, the call is admitted by the drain ([`drain::admit`]) or refused after the version line, as the Windows box
+/// refuses it, so a refused preflight writes nothing under the work folder.
+pub fn preflight(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u8 {
     let checked = folders(payload).and_then(|(bare, work, pair)| Ok((bare, work, checked_root(work, bare, pair.is_some())?, pair)));
-    let (bare, work, (root, parent), pair) = match checked {
+    let drain_read = drain::session_of(payload, "", "").and_then(|session| Ok((session, payload.no_ticket()?)));
+    let ((bare, work, (root, parent), pair), (session, no_ticket)) = match checked.and_then(|checked| Ok((checked, drain_read?))) {
         Ok(checked) => checked,
         Err(line) => {
             console.err(&line);
@@ -74,6 +79,14 @@ pub fn preflight(payload: &Payload, console: &mut Console) -> u8 {
             return ROOT_STATUS;
         }
     }
+    // Held until the preflight returns, so a drain counts it as going.
+    let _admitted = match drain::admission_of(drain::admit(Path::new(&root), session.as_ref(), no_ticket, seams, console)) {
+        Ok(admitted) => admitted,
+        Err(unpassed) => {
+            console.out(&version_line());
+            return unpassed.said(payload, console);
+        }
+    };
     // Read before the tree is readied, which would make a missing `.git`, and so a stale record, look current. A
     // record naming another layout than the run's, a pair's first run having none, has the run clear the whole folder
     // and lay its trees out again.
@@ -132,23 +145,30 @@ pub(crate) fn checked_root<'w>(work: &'w str, bare: &str, paired: bool) -> Resul
     Ok((root, parent))
 }
 
-/// Makes the work root `root` with mode 0700 when it is missing, judges it ([`root_flaw`]), then makes `parent`, its
-/// `<root>/work`, with mode 0700 when it is missing, and refuses it unless it is the box user's own plain folder open
-/// to no group or other.
+/// Makes the work root `root` with mode 0700 when it is missing, judges it ([`trusted_work_root`]), then makes
+/// `parent`, its `<root>/work`, with mode 0700 when it is missing, and refuses it unless it is the box user's own plain
+/// folder open to no group or other.
 fn trusted_root(root: &str, parent: &Path) -> Result<(), Refusal> {
+    trusted_work_root(root)?;
+    if !files::exists(parent) {
+        made_folder(parent, false)?;
+    }
+    files::unusable_folder(parent, true).map_or(Ok(()), |flaw| Err(folder_refusal(flaw, true)))
+}
+
+/// Makes the work root `root`, and the folders above it, with mode 0700 when it is missing, then refuses it unless it
+/// is trusted ([`root_flaw`]): the line saying why not.
+pub(crate) fn trusted_work_root(root: &str) -> Result<(), Refusal> {
     let path = Path::new(root);
     if !files::exists(path) {
         made_folder(path, true)?;
     }
     let untrusted = |why: &str| Refusal::Untrusted(root_unsafe_line(why, WORK_ROOT_STEP));
     let facts = files::facts(path).map_err(|error| untrusted(&format!("cannot read {root}: {error}")))?;
-    if let Some(why) = root_flaw(facts, root, &files::user_name(facts.euid)) {
-        return Err(untrusted(&why));
+    match root_flaw(facts, root, &files::user_name(facts.euid)) {
+        Some(why) => Err(untrusted(&why)),
+        None => Ok(()),
     }
-    if !files::exists(parent) {
-        made_folder(parent, false)?;
-    }
-    files::unusable_folder(parent, true).map_or(Ok(()), |flaw| Err(folder_refusal(flaw, true)))
 }
 
 /// Makes the folder `path` with mode 0700, and the folders above it when `recursive`.
@@ -416,7 +436,7 @@ mod tests {
     /// Runs the preflight of `payload`; its status and console.
     fn preflighted(payload: &Payload) -> (u8, Console) {
         let mut console = Console::captured();
-        let status = preflight(payload, &mut console);
+        let status = preflight(payload, &gate_args::BoxSeams::default(), &mut console);
         (status, console)
     }
 

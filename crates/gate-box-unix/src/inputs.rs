@@ -46,6 +46,7 @@ use serde_json::{Map, Value, json};
 
 use crate::beneath::{self, Folder, NOT_PRIVATE};
 use crate::console::Console;
+use crate::drain;
 use crate::files::{self, HeldLock, Locked};
 use crate::git::Git;
 use crate::lines::{FAILED_STATUS, USAGE_STATUS};
@@ -178,11 +179,13 @@ fn read_manifest(input: &mut impl BufRead) -> Result<Sent, String> {
     Ok(Sent { manifest, digest })
 }
 
-/// Answers `gate-box box inputs`: the request read, then the manifest from stdin, before any lock is taken, so a client
-/// that stalls holds nothing; then the work root, `<root>/work` and the bare repository judged as a run judges them
-/// ([`root_checked`]); then the step. A payload refused is a usage error (2), a `SentBin` the builder does not take, a
-/// held lock, a live earlier group or a layout refusal is refused (75), a manifest that cannot be read fails the step
-/// (1), and a root or folder the box does not use says the run's line and status.
+/// Answers `gate-box box inputs`: the request read; the work root, `<root>/work` and the bare repository judged as a run
+/// judges them ([`root_checked`]), making nothing, before the drain beneath the root is touched; the call passed through
+/// the drain ([`drain::passed`]), refused `drain` (75) for a session the drain does not admit; then the manifest from
+/// stdin, before any lock is taken, so a client that stalls holds nothing; then the step. A payload refused is a usage
+/// error (2), a `SentBin` the builder does not take, a held lock, a live earlier group or a layout refusal is refused
+/// (75), a manifest that cannot be read fails the step (1), and a root or folder the box does not use says the run's
+/// line and status.
 #[must_use]
 pub fn inputs(payload: &Payload, seams: &BoxSeams, console: &mut Console) -> u8 {
     answered(payload, seams, &mut io::stdin().lock(), console)
@@ -197,6 +200,16 @@ fn answered(payload: &Payload, seams: &BoxSeams, input: &mut impl BufRead, conso
             return USAGE_STATUS;
         }
     };
+    // The root is judged, making nothing, before the drain beneath it is touched.
+    if let Err((line, status)) = root_checked(&asked) {
+        console.err(&line);
+        return status;
+    }
+    // Held until the step returns, so a drain counts it as going; refused before the manifest is read.
+    let _admitted = match drain::passed(&asked.root, payload, None, seams, console) {
+        Ok(admitted) => admitted,
+        Err(unpassed) => return unpassed.said(payload, console),
+    };
     if asked.sent_bin {
         let unbuilt = Unbuilt {
             refusal: Refusal::Sent,
@@ -210,10 +223,6 @@ fn answered(payload: &Payload, seams: &BoxSeams, input: &mut impl BufRead, conso
         Ok(sent) => sent,
         Err(why) => return failed(&asked, &why, console),
     };
-    if let Err((line, status)) = root_checked(&asked) {
-        console.err(&line);
-        return status;
-    }
     match asked.step {
         Step::Diff => match locked(&asked, console, |work, lock, console| diff(&asked, &sent, work, lock, console)) {
             Ok(Ok(())) => 0,

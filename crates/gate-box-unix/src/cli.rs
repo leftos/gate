@@ -37,10 +37,10 @@ pub fn action(args: Vec<OsString>) -> Action {
 #[must_use]
 pub fn unbuilt(verb: BoxVerb) -> Option<String> {
     match verb {
-        BoxVerb::Preflight | BoxVerb::Boot | BoxVerb::Stop | BoxVerb::Run | BoxVerb::Prune | BoxVerb::Inputs | BoxVerb::Outputs => None,
-        BoxVerb::Inflight | BoxVerb::Lfs | BoxVerb::RegisterDesktop | BoxVerb::Drain => {
-            Some(format!("gate: box {} is not built on this builder", verb.as_str()))
+        BoxVerb::Preflight | BoxVerb::Boot | BoxVerb::Stop | BoxVerb::Run | BoxVerb::Prune | BoxVerb::Inputs | BoxVerb::Outputs | BoxVerb::Drain => {
+            None
         }
+        BoxVerb::Inflight | BoxVerb::Lfs | BoxVerb::RegisterDesktop => Some(format!("gate: box {} is not built on this builder", verb.as_str())),
     }
 }
 
@@ -101,7 +101,7 @@ fn answer(action: Action, console: &mut crate::console::Console) -> u8 {
             console.err(&Problem::BoxUsage.to_string());
             return crate::lines::USAGE_STATUS;
         };
-        return crate::prune::prune(root, &request.keys, std::time::SystemTime::now(), console);
+        return crate::prune::prune(root, &request.keys, std::time::SystemTime::now(), &request.seams, console);
     }
     let payload = match crate::request::read_request(std::io::stdin().lock()) {
         Ok(payload) => payload,
@@ -111,11 +111,12 @@ fn answer(action: Action, console: &mut crate::console::Console) -> u8 {
         }
     };
     match verb {
-        BoxVerb::Preflight => crate::preflight::preflight(&payload, console),
+        BoxVerb::Preflight => crate::preflight::preflight(&payload, &request.seams, console),
         BoxVerb::Stop => crate::stop::stop(&payload, console),
         BoxVerb::Boot => crate::boot::status(crate::boot::say(console)),
         BoxVerb::Inputs => crate::inputs::inputs(&payload, &request.seams, console),
-        BoxVerb::Outputs => crate::outputs::outputs(&payload, console),
+        BoxVerb::Outputs => crate::outputs::outputs(&payload, &request.seams, console),
+        BoxVerb::Drain => crate::drain::drain(&payload, &request.seams, console),
         BoxVerb::Run => {
             // The run says its lines through an output its threads share; the console says nothing more.
             let output = std::sync::Arc::new(crate::console::Output::new(crate::console::StdioSink));
@@ -236,5 +237,14 @@ mod tests {
                 "{verb:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_drain_verb_is_built_here() {
+        assert_eq!(
+            action(words("box drain --stdin")),
+            verb_action(BoxVerb::Drain, BoxSeams::default(), None, &[])
+        );
+        assert_eq!(unbuilt(BoxVerb::Drain), None);
     }
 }

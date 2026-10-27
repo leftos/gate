@@ -25,6 +25,8 @@ pub mod boot;
 #[cfg(unix)]
 pub mod command;
 #[cfg(unix)]
+mod drain;
+#[cfg(unix)]
 pub mod files;
 #[cfg(unix)]
 pub mod git;
@@ -42,6 +44,8 @@ pub mod probe;
 pub mod process;
 #[cfg(unix)]
 pub mod process_lines;
+#[cfg(unix)]
+mod process_scan;
 #[cfg(unix)]
 pub mod prune;
 #[cfg(unix)]

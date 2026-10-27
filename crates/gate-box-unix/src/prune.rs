@@ -33,12 +33,15 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use gate_args::BoxSeams;
+use gate_wire::drain::Clock;
 use gate_wire::{escaped, is_key};
 
 use crate::console::Console;
+use crate::drain::barrier_stands;
 use crate::files::{self, HeldLock, Locked};
 use crate::git::Git;
-use crate::lines::{FAILED_STATUS, LAYOUT_CHANGING, OwnerFlaw, USAGE_STATUS, WRITABLE_BY_OTHERS, owner_flaw, recorded_group, signal_guard};
+use crate::lines::{FAILED_STATUS, LAYOUT_CHANGING, OwnerFlaw, Recorded, USAGE_STATUS, WRITABLE_BY_OTHERS, owner_flaw, recorded_group, signal_guard};
 use crate::stop::{Record, own_group, record_current, records_folder, unusable_refusal};
 
 /// How long a work folder goes unused before a sweep removes it.
@@ -61,6 +64,12 @@ const KEY_FILES: [&str; 13] = [
 ];
 /// The records naming a run's process group: its git step's, its tool restore's and its package restore's.
 const GROUP_RECORDS: [&str; 3] = ["pgid", "tools.pgid", "packages.pgid"];
+
+/// Whether the group record written at `written` holding `recorded` names a group that is still its run's: not the
+/// box's own group ([`signal_guard`]) and current ([`record_current`], unknown counting as current).
+pub(crate) fn group_current(recorded: Recorded, written: SystemTime) -> bool {
+    signal_guard(recorded.group, own_group()).is_ok() && record_current(recorded, written) == Record::Current
+}
 /// The records a sweep removes before it renames the work folder aside, in the order the box clears them, then the
 /// group records; `command` is the interrupted-command record, cleared like the others.
 const RECORDS_BEFORE: [&str; 9] = [
@@ -92,7 +101,11 @@ const REFS_STEP: &str = "update-ref";
 /// [`USAGE_STATUS`] for a root that is not an absolute path or a key that is no key, before anything is opened;
 /// [`FAILED_STATUS`] when the root, the work folders or the `pruned` folder could not be read or listed, or `work` or
 /// `pruned` is not a plain folder, and for an age prune of a root [`records_folder`] refuses; else each mode's own.
-pub fn prune(root: &Path, keys: &[String], now: SystemTime, console: &mut Console) -> u8 {
+///
+/// Both modes first read the builder's drain barrier, read only, at the clock `drain_seams` give ([`barrier_stands`]):
+/// while one stands the age prune says it skipped and removes nothing, and the keyed prune keeps each key it has not
+/// begun; a barrier that cannot be read fails the prune.
+pub fn prune(root: &Path, keys: &[String], now: SystemTime, drain_seams: &BoxSeams, console: &mut Console) -> u8 {
     let tmp = tmp_root();
     let seams = Seams {
         before_rename: &no_rename_seen,
@@ -102,6 +115,7 @@ pub fn prune(root: &Path, keys: &[String], now: SystemTime, console: &mut Consol
         floor_low: FLOOR_LOW,
         floor_high: FLOOR_HIGH,
         tmp: &tmp,
+        clock: Clock::of(drain_seams),
     };
     pruned_with(root, keys, now, &seams, console)
 }
@@ -120,7 +134,8 @@ const FLOOR_HIGH: u64 = 150 * GIB;
 
 /// What a prune is given besides its words, which a test replaces: what it calls with each work folder just before
 /// renaming it aside and with its new name just after, the folder the volumes are mounted in, the reader of the free
-/// bytes of the volume holding a folder, the free-space floors, and the folder runs make their temp folders in.
+/// bytes of the volume holding a folder, the free-space floors, the folder runs make their temp folders in, and the
+/// clock the drain barrier is judged at.
 struct Seams<'a> {
     before_rename: &'a dyn Fn(&Path),
     after_rename: &'a dyn Fn(&Path),
@@ -129,6 +144,23 @@ struct Seams<'a> {
     floor_low: u64,
     floor_high: u64,
     tmp: &'a Path,
+    clock: Clock,
+}
+
+/// The line of an age prune that removed nothing, a drain barrier standing.
+const SKIPPED_DRAINED: &str = "gate: remote prune skipped: the builder is drained";
+
+/// Whether a drain barrier stands on the root `root` at the clock `clock` ([`barrier_stands`]); else the line saying
+/// the prune failed for why it could not be read.
+fn drained(root: &str, clock: Clock) -> Result<bool, String> {
+    barrier_stands(Path::new(root), clock).map_err(|why| format!("gate: remote prune failed: {why}"))
+}
+
+/// Says each key of `keys` kept, the builder being drained.
+fn kept_drained(keys: &[String], console: &mut Console) {
+    for key in keys {
+        console.out(&format!("gate: remote kept {}: the builder is drained", escaped(key)));
+    }
 }
 
 /// Nothing: what a prune calls before and after each rename outside the tests.
@@ -212,6 +244,12 @@ fn pruned_with(root: &Path, keys: &[String], now: SystemTime, seams: &Seams<'_>,
 /// key kept for a failure, and gives 0. Else the line saying why the sweep ended. A root or work folder that is not
 /// there holds nothing to remove.
 fn aged(root: &str, now: SystemTime, seams: &Seams<'_>, console: &mut Console) -> Result<u8, String> {
+    // Before anything is opened, so a drained builder has nothing of its root removed: no work folder, no floor pass
+    // and no leftover run folder.
+    if drained(root, seams.clock)? {
+        console.out(SKIPPED_DRAINED);
+        return Ok(0);
+    }
     let (removed, folders) = match Sweep::opened(root, now, seams, false, console)? {
         Some(sweep) => {
             let listed = listed(&sweep.work).map_err(|error| cannot_list(&sweep.work, &error))?;
@@ -247,6 +285,10 @@ fn named(root: &str, keys: &[String], now: SystemTime, seams: &Seams<'_>, consol
         }
         Ok(FAILED_STATUS)
     };
+    if drained(root, seams.clock)? {
+        kept_drained(keys, console);
+        return Ok(0);
+    }
     let sweep = match root_found(Path::new(root), seams.volumes) {
         RootFound::Unknown(why) => return every_key_failed(&why, console),
         RootFound::Gone => None,
@@ -265,7 +307,12 @@ fn named(root: &str, keys: &[String], now: SystemTime, seams: &Seams<'_>, consol
         return Ok(0);
     };
     let mut failed = false;
-    for key in keys {
+    for (at, key) in keys.iter().enumerate() {
+        // Read again before each key, so a barrier raised meanwhile keeps every key not yet begun.
+        if drained(root, seams.clock)? {
+            kept_drained(keys.get(at..).unwrap_or_default(), console);
+            break;
+        }
         match sweep.pruned_key(key, Mode::Named, console) {
             Pruned::Removed(_) => console.out(&gone_line(key)),
             Pruned::Held => console.out(&format!("gate: remote kept {}: in use", escaped(key))),
@@ -637,8 +684,8 @@ impl<'a> Sweep<'a> {
     }
 
     /// Whether a group record of the key `key` ([`GROUP_RECORDS`]) names a group that is still its run's
-    /// ([`record_current`], unknown counting as current); one naming no group a run makes, or a group no longer its
-    /// run's, goes with the key. Else the line saying a record could not be read, a link or a folder at its name.
+    /// ([`group_current`]); one naming no group a run makes, or a group no longer its run's, goes with the key. Else the
+    /// line saying a record could not be read, a link or a folder at its name.
     fn group_live(&self, key: &str) -> Result<bool, String> {
         for extension in GROUP_RECORDS {
             let path = self.work.join(format!("{key}.{extension}"));
@@ -647,10 +694,7 @@ impl<'a> Sweep<'a> {
                 Err(error) => return Err(could_not_prune(key, &format!("cannot read {}: {error}", path.display()))),
                 Ok(read) => read,
             };
-            if let Some(recorded) = recorded_group(&bytes)
-                && signal_guard(recorded.group, own_group()).is_ok()
-                && record_current(recorded, written) == Record::Current
-            {
+            if recorded_group(&bytes).is_some_and(|recorded| group_current(recorded, written)) {
                 return Ok(true);
             }
         }
@@ -1086,7 +1130,9 @@ mod tests {
     use std::process::{Child, Command};
     use std::time::{Duration, SystemTime};
 
+    use gate_args::BoxSeams;
     use gate_wire::ROOT_UNSAFE;
+    use gate_wire::drain::Clock;
 
     use super::{GIB, IDLE_AGE, Seams, free_bytes, idle_for, key_file_stem, no_rename_seen, prune, pruned_with};
     use crate::console::Console;
@@ -1184,6 +1230,7 @@ mod tests {
                 floor_low: 100 * GIB,
                 floor_high: 150 * GIB,
                 tmp: &self.tmp,
+                clock: Clock::of(&BoxSeams::default()),
             }
         }
 
@@ -1504,8 +1551,9 @@ mod tests {
         let case = Case::new("usage");
         let mut console = Console::captured();
 
-        let relative = prune(Path::new("gate-remote"), &[], case.now, &mut console);
-        let not_a_key = prune(&case.root, &[KEY.to_owned(), "../x".to_owned()], case.now, &mut console);
+        let seams = BoxSeams::default();
+        let relative = prune(Path::new("gate-remote"), &[], case.now, &seams, &mut console);
+        let not_a_key = prune(&case.root, &[KEY.to_owned(), "../x".to_owned()], case.now, &seams, &mut console);
 
         assert_eq!((relative, not_a_key), (USAGE_STATUS, USAGE_STATUS));
         assert_eq!(

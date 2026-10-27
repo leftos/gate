@@ -313,6 +313,7 @@ dependencies = [
  "gate-args",
  "gate-router",
  "jiff",
+ "proc-table",
  "proptest",
  "serde_json",
 ]

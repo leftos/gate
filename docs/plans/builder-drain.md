@@ -32,7 +32,7 @@ On the PC, a run that waits inside its attempt holds its remote slot: with the d
 
 ## Second invariant pass (oracle, at `main` 6898d4fd)
 
-This pass was run before GATE-562's brief. Where it differs from the sections below, it wins, and the code cites in this section are current. Unix box: a sibling item. GATE-562 adds only `BoxVerb::Drain` to the not-built verbs (`gate-box-unix/src/cli.rs:40-41`). A Mac never holds a barrier, and GATE-564 reports a Mac's not-built answer as "cannot drain", never as drained.
+This pass was run before GATE-562's brief. Where it differs from the sections below, it wins, and the code cites in this section are current. Unix box: a sibling item (GATE-807), which builds `BoxVerb::Drain` there (`gate-box-unix/src/cli.rs`). GATE-564 reports an older Mac box's usage answer as "too old", never as drained.
 
 - **J1 Atomic admission.** One hold of `drain\lock` covers three things: the barrier and ticket decision, the creation of the verb's holder, and the session record.
   - The holder is an OS handle on a per-process file, `drain\sessions\{session}.{pid}`, so a dead process frees it.
@@ -80,6 +80,8 @@ Built (GATE-562 part A): `crates/gate/src/boxside/drain.rs` holds `drain\` and i
 Built (GATE-562 part B): `preflight`, `run`, `inputs` and `lfs` call `admit` after the root is held, and a refusal says the tag `drain` with the place and barrier lines and exits 75 (the client does not read it yet). A call writes and holds its session and stamps `Called` at its end, so the lease runs from the last call's end. `outputs` is never refused and renews a live session, and for a dead one under a barrier it sends the archive and keeps it.
 
 `gate box prune` reads the barrier (read only) and prunes nothing under it, and after an age sweep runs `git gc --auto` in each bare under the root, one at a time, each with a 30-minute bound, the barrier read before each. A push to a Windows builder runs `git-receive-pack` with `receive.autogc` off.
+
+Built (GATE-807, part 1b): `gate-box box drain` (raise, lift, status) on the Unix box, in `crates/gate-box-unix/src/drain.rs`, with the shared pure rules moved to `crates/gate-wire/src/drain.rs`. `preflight`, `run` and `inputs` call the admission, `outputs` renews and keeps an archive of a dead session, and `prune` reads the barrier and prunes nothing under it (no gc: a Mac's bares run none). The drained test reads a session's group records and a libc scan of the box user's processes. The routed command shares the box's uid and could delete the barrier; that is accepted.
 
 A Windows mutex is rejected: its waiters are not FIFO, a `Global\` name can be squatted, and the `gate\` private namespace needs elevation.
 

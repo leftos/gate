@@ -1,9 +1,9 @@
 //! The box request payload both the PC client and every box parse: the payload of a `gate box` call, one base64 word
 //! (standard alphabet, padded) of UTF-8 JSON holding an object, as the remote client sends it as the first line of the
 //! call's standard input. Keys are read by their exact name; keys no verb reads are ignored. Its path rules follow the
-//! box's [`PathForm`]. It also holds the stamped line of a run's log ([`stamp`]). Nothing here touches the operating
-//! system but [`stamp::now`] and [`stamp::local`], which read the clock and the system time zone, so it builds for
-//! every box.
+//! box's [`PathForm`]. It also holds the stamped line of a run's log ([`stamp`]) and the builder drain's rules
+//! ([`drain`]). Nothing here touches the operating system but [`stamp::now`], [`stamp::local`] and
+//! [`drain::Clock::of`], which read the clock and the system time zone, so it builds for every box.
 #![expect(
     clippy::missing_errors_doc,
     reason = "each reader's own doc names the usage line it refuses with, as the parser's docs always have"
@@ -17,6 +17,7 @@ use gate_router::warm::MOST_COMMANDS;
 use gate_router::{is_layout_name, repo_name};
 use serde_json::{Map, Value};
 
+pub mod drain;
 pub mod stamp;
 
 /// The commit this build was made from, from `GATE_BUILD_ID` at compile time; `None` for a build made without one, or

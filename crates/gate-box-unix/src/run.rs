@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use gate_args::BoxSeams;
 use gate_inputs::manifest::{Listing, Manifest};
+use gate_wire::drain::refused_lines;
 use gate_wire::{CrossBuild, PairSibling, PathForm, Payload, Refusal, bare_stem, busy_line, escaped, layout_line, refused_line, trees};
 
 use gate_watchdog::Pump;
@@ -21,8 +22,9 @@ use gate_watchdog::Pump;
 use crate::back::{self, BackFailed};
 use crate::beneath;
 use crate::command::{self, CrossEnd, Launch, Sampler, command_record, run_command};
-use crate::console::{Forwarding, GAT, LineSink, Output, Stamp, Stream};
+use crate::console::{Console, Forwarding, GAT, LineSink, Output, Stamp, Stream};
 use crate::cross;
+use crate::drain::{self, Unpassed};
 use crate::files::{self, HeldLock, Locked};
 use crate::git::{
     self, AlternatesFailure, CLOSED_STATUS, Failed, Git, GitClass, RunGit, Steps, Tree, failed_for, for_repo, line_ends_set, origin_set,
@@ -338,6 +340,9 @@ pub struct Ready<'p> {
     /// The PC's outputs manifest and the listing taken before the command, for a run with output globs; `None`
     /// without.
     pub outputs: Option<RunOutputs>,
+    /// The run's hold of its drain session, its end stamped once the run is done ([`drain::passed`]).
+    #[expect(dead_code, reason = "a guard, held for its drop, which stamps the session's end")]
+    pub(crate) admitted: drain::Admitted,
 }
 
 /// A run's outputs as they stand before its command, as the Windows box's `RunOutputs` holds them: the PC's manifest
@@ -572,6 +577,8 @@ fn prepared<'p, S: LineSink + 'static>(
         FAILED_STATUS => back_commits_failed(output, &request, said(output, &[&line], status)),
         _ => said(output, &[&line], status),
     })?;
+    // Held until the run ends, its command and back commit done, so a drain counts the run as going.
+    let admitted = admitted(payload, &request, &sources.drain.seams(), output)?;
     let lock = match files::take_lock(Path::new(request.lock)) {
         Ok(Locked::Held(lock)) => lock,
         Ok(Locked::Busy) => return Err(refused(output, &request, Refusal::Busy, &busy_line(request.key))),
@@ -600,6 +607,7 @@ fn prepared<'p, S: LineSink + 'static>(
             godot_root,
             temp,
             outputs,
+            admitted,
         }),
         // A refusal sends the PC to run the command itself; any other end, whatever its status, is a pair run's back
         // commits never made.
@@ -658,13 +666,49 @@ pub struct Watches {
     pub sampler: Sampler,
     /// The bytes the output folder's archives are trimmed to after a pack ([`outputs::trim`]).
     pub budget: u64,
+    /// The drain's clock the run is admitted by.
+    pub drain: DrainSeams,
+}
+
+/// What the drain's clock reads of the test seams: `--test-box-now`, `--test-box-drain-lease-ms` and
+/// `--test-box-drain-lapse-ms`, each `None` for its default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DrainSeams {
+    /// The Unix second the drain judges at.
+    pub now: Option<u64>,
+    /// The lease of a ticket and a session, in milliseconds.
+    pub lease_ms: Option<u64>,
+    /// The lapse of a barrier, in milliseconds.
+    pub lapse_ms: Option<u64>,
+}
+
+impl DrainSeams {
+    /// The drain's seams of `seams`.
+    #[must_use]
+    pub fn of(seams: &BoxSeams) -> DrainSeams {
+        DrainSeams {
+            now: seams.now,
+            lease_ms: seams.drain_lease_ms,
+            lapse_ms: seams.drain_lapse_ms,
+        }
+    }
+
+    /// The seams the drain reads, every other one its default.
+    fn seams(self) -> BoxSeams {
+        BoxSeams {
+            now: self.now,
+            drain_lease_ms: self.lease_ms,
+            drain_lapse_ms: self.lapse_ms,
+            ..BoxSeams::default()
+        }
+    }
 }
 
 impl Watches {
     /// The watches `seams` ask for: `--test-heartbeat-ms` and `--test-box-sample-ms` over [`Periods::default`];
     /// `--test-box-sampler-fail`, else `--test-box-free-percent`, over [`Sampler::Machine`], and
-    /// `--test-outputs-budget-bytes` over [`outputs::OUTPUTS_BUDGET`] ([`outputs::budget`]), as the Windows box reads
-    /// them. All defaults in a box built without the `test-seams` feature.
+    /// `--test-outputs-budget-bytes` over [`outputs::OUTPUTS_BUDGET`] ([`outputs::budget`]), and the drain's clock
+    /// ([`DrainSeams::of`]), as the Windows box reads them. All defaults in a box built without the `test-seams` feature.
     #[must_use]
     pub fn of(seams: &BoxSeams) -> Watches {
         let defaults = Periods::default();
@@ -681,6 +725,7 @@ impl Watches {
             periods,
             sampler,
             budget: outputs::budget(seams),
+            drain: DrainSeams::of(seams),
         }
     }
 }
@@ -714,6 +759,7 @@ fn run_reading<S: LineSink + 'static>(
         login,
         start: heartbeat::start,
         input,
+        drain: watches.drain,
     };
     let ready = match prepared(payload, output, watches.periods, sources) {
         Ok(ready) => ready,
@@ -925,12 +971,13 @@ fn noted<S: LineSink>(output: &Output<S>, stamp: Stamp, line: &str) {
 /// How a run starts its heartbeat: [`heartbeat::start`], or a test's own.
 type StartBeat = fn(Arc<dyn Forwarding>, Duration) -> io::Result<Pump>;
 
-/// Where a run reads what its payload does not hold: the login shell's `PATH`, how its heartbeat starts, and the input
-/// the PC's outputs manifest follows the request line on.
+/// Where a run reads what its payload does not hold: the login shell's `PATH`, how its heartbeat starts, the input
+/// the PC's outputs manifest follows the request line on, and the drain's clock the run is admitted by.
 struct Sources<'i> {
     login: LoginShell,
     start: StartBeat,
     input: &'i mut dyn BufRead,
+    drain: DrainSeams,
 }
 
 /// [`prepared`] with no input past the request line and the heartbeat started with [`heartbeat::start`]: a test's
@@ -941,6 +988,7 @@ fn prepare<'p, S: LineSink + 'static>(payload: &'p Payload, output: &Arc<Output<
         login,
         start: heartbeat::start,
         input: &mut io::empty(),
+        drain: DrainSeams::default(),
     };
     prepared(payload, output, periods, sources)
 }
@@ -966,7 +1014,7 @@ fn locked<S: LineSink + 'static>(
     lock: &HeldLock,
     output: &Arc<Output<S>>,
     heartbeat: Duration,
-    Sources { login, start, input }: Sources<'_>,
+    Sources { login, start, input, .. }: Sources<'_>,
 ) -> Result<Placed, Unready> {
     let laying = request.laying();
     // Before the sweep, so a git an earlier run left running keeps its lock files.
@@ -1115,6 +1163,34 @@ fn inputs_matched<S: LineSink>(request: &Request<'_>, lock: &HeldLock, output: &
             Err(Unready::Ended(said(output, &[&line], FAILED_STATUS)))
         }
     }
+}
+
+/// The run of `request`, from `payload`, passed through the drain ([`drain::passed`]) as the session `payload` names,
+/// with its command's words joined by spaces and its job, the drain's clock as `seams` set it: the guard, held until the
+/// run ends. A line the drain said, a drain moved aside, is said stamped `gat`. Else the status the run ends on, its
+/// lines said: a refusal's `drain` tag, place and barrier lines, bare, and [`REFUSED_STATUS`]; a drain that could not
+/// be read or written fails the run as a lock that could not be taken does, its back commits never made.
+fn admitted<S: LineSink>(payload: &Payload, request: &Request<'_>, seams: &BoxSeams, output: &Output<S>) -> Result<drain::Admitted, u8> {
+    let command = request.command.join(" ");
+    let mut console = Console::captured();
+    let passed = drain::passed(&request.root, payload, Some((&command, request.job)), seams, &mut console);
+    for line in &console.err {
+        // A note: the run goes on, and a client gone finds out at the next line.
+        let _ = output.say(Stream::Err, GAT, line);
+    }
+    passed.map_err(|unpassed| match unpassed {
+        Unpassed::Usage(line) => said(output, &[&line], USAGE_STATUS),
+        Unpassed::Failed(why) => back_commits_failed(output, request, said(output, &[&drain::failed_line(&why)], FAILED_STATUS)),
+        Unpassed::Refused(refused) => {
+            let tag = refused_line(request.nonce, Refusal::Drain);
+            let [place, barrier] = refused_lines(refused);
+            said_as(
+                output,
+                &[(Stamp::Bare, &tag), (Stamp::Bare, &place), (Stamp::Bare, &barrier)],
+                REFUSED_STATUS,
+            )
+        }
+    })
 }
 
 /// Refuses the run of `request` for `refusal`: its tag, then `line`, said together; [`REFUSED_STATUS`].
@@ -1604,8 +1680,8 @@ mod tests {
     use gate_watchdog::Pump;
 
     use super::{
-        NotLaidOut, REFUSED_STATUS, Ready, Request, Sources, Unready, Watches, inputs_matched, login_read, place_of, prepare, prepared, run_along,
-        run_reading, temp_made, test_template, work_cleared,
+        DrainSeams, NotLaidOut, REFUSED_STATUS, Ready, Request, Sources, Unready, Watches, inputs_matched, login_read, place_of, prepare, prepared,
+        run_along, run_reading, temp_made, test_template, work_cleared,
     };
     #[cfg(target_os = "macos")]
     use crate::beneath::ANOTHER_VOLUME;
@@ -1861,6 +1937,7 @@ mod tests {
             login: own_path,
             start: no_beat,
             input: &mut Cursor::new(Vec::new()),
+            drain: DrainSeams::default(),
         };
         let mut ready = prepared(&payload, &output, quiet_periods(), sources);
         if let Ok(ready) = ready.as_mut() {
@@ -1952,6 +2029,7 @@ mod tests {
             },
             sampler: Sampler::FreePercent(100),
             budget: OUTPUTS_BUDGET,
+            drain: DrainSeams::default(),
         }
     }
 
@@ -3912,6 +3990,7 @@ mod tests {
             login: own_path,
             start: heartbeat::start,
             input: &mut input,
+            drain: DrainSeams::default(),
         };
         let ready = prepared(&payload, &output, periods, sources);
         let lines = || output.sink().said();

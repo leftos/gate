@@ -16,6 +16,7 @@ mod unix {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::sync::Arc;
@@ -215,8 +216,13 @@ mod unix {
 
         /// The `box inputs` request word of `step` for this case's work folder: base64 of the JSON payload.
         fn inputs_request(&self, step: &str) -> String {
+            self.inputs_request_with(step, &json!({}))
+        }
+
+        /// [`Case::inputs_request`], with `extra` keys set over it.
+        fn inputs_request_with(&self, step: &str, extra: &Value) -> String {
             let (root, work) = (self.root(), self.work());
-            let payload = json!({
+            let mut payload = json!({
                 "Key": KEY,
                 "Bare": self.bare(),
                 "Work": work,
@@ -227,6 +233,9 @@ mod unix {
                 "Nonce": NONCE,
                 "Step": step,
             });
+            if let (Some(object), Some(extra)) = (payload.as_object_mut(), extra.as_object()) {
+                object.extend(extra.clone());
+            }
             STANDARD.encode(payload.to_string())
         }
 
@@ -653,8 +662,15 @@ mod unix {
 
     /// Runs `gate-box box prune <words>` with the variables `env` set; its status and its lines on stdout and stderr.
     fn pruned(words: &[&str], env: &[(&str, &str)]) -> Ended {
+        pruned_with(&[], words, env)
+    }
+
+    /// [`pruned`] with the box's test seams `seams` given before the verb.
+    fn pruned_with(seams: &[&str], words: &[&str], env: &[(&str, &str)]) -> Ended {
         let ran = Command::new(env!("CARGO_BIN_EXE_gate-box"))
-            .args(["box", "prune"])
+            .arg("box")
+            .args(seams)
+            .arg("prune")
             .args(words)
             .envs(env.iter().copied())
             .stdin(Stdio::null())
@@ -1084,10 +1100,20 @@ mod unix {
         /// Runs `gate-box box outputs --stdin` for the archive `name` of this case's work folder; its status, the bytes
         /// it sent and its lines on stderr.
         fn outputs_sent(&self, name: &str) -> (Option<i32>, Vec<u8>, Vec<String>) {
+            self.outputs_sent_as(name, &json!({}), &[])
+        }
+
+        /// [`Case::outputs_sent`], with `extra` keys set over the payload and the box given the seams `seams`.
+        fn outputs_sent_as(&self, name: &str, extra: &Value, seams: &[&str]) -> (Option<i32>, Vec<u8>, Vec<String>) {
             let (root, work) = (self.root(), self.work());
-            let payload = json!({ "Key": KEY, "Work": work, "OutputFolder": format!("{root}/outputs"), "Name": name });
+            let mut payload = json!({ "Key": KEY, "Work": work, "OutputFolder": format!("{root}/outputs"), "Name": name });
+            if let (Some(object), Some(extra)) = (payload.as_object_mut(), extra.as_object()) {
+                object.extend(extra.clone());
+            }
             let mut child = Command::new(env!("CARGO_BIN_EXE_gate-box"))
-                .args(["box", "outputs", "--stdin"])
+                .arg("box")
+                .args(seams)
+                .args(["outputs", "--stdin"])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -1565,5 +1591,781 @@ mod unix {
         );
         exits_follow_spawns(&lines);
         ended.protocol_bare();
+    }
+
+    /// The Unix second the drain cases judge at, through `--test-box-now`.
+    const DRAIN_NOW: u64 = 1_800_000_000;
+
+    /// The lines of a drain with no barrier, no ticket and nothing going.
+    const OPEN_LINES: [&str; 3] = ["gate: drain barrier none", "gate: drain tickets 0", "gate: drain state open"];
+
+    /// Runs `gate-box box --test-box-now <DRAIN_NOW> --test-box-drain-readable-only true drain --stdin` asking `action`
+    /// of the root `root`; its status and its lines. The process scan counts only what it can read, so a process of
+    /// another case caught mid-exec never holds this case's drain.
+    fn drained(root: &str, action: &str) -> Ended {
+        drained_at(root, action, DRAIN_NOW)
+    }
+
+    /// [`drained`] at the Unix second `now`.
+    fn drained_at(root: &str, action: &str, now: u64) -> Ended {
+        let request = STANDARD.encode(json!({ "Root": root, "Action": action }).to_string());
+        let now = now.to_string();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_gate-box"))
+            .args([
+                "box",
+                "--test-box-now",
+                &now,
+                "--test-box-drain-readable-only",
+                "true",
+                "drain",
+                "--stdin",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("gate-box starts");
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        // A box that refuses the verb before reading its request closes stdin early; its lines are read all the same.
+        let _ = stdin.write_all(format!("{request}\n").as_bytes());
+        drop(stdin);
+        ended_of(&child.wait_with_output().expect("gate-box is waited for"))
+    }
+
+    /// The JSON of the drain record `name` under the root `root`.
+    fn drain_record(root: &str, name: &str) -> Value {
+        let text = fs::read_to_string(format!("{root}/drain/{name}")).expect("the drain record is read");
+        serde_json::from_str(&text).expect("the drain record is JSON")
+    }
+
+    /// The permission bits of `path`, looked at as itself.
+    fn mode_of(path: &str) -> u32 {
+        std::os::unix::fs::MetadataExt::mode(&fs::symlink_metadata(path).expect("the path is looked at")) & 0o7777
+    }
+
+    #[test]
+    fn drain_raise_status_lift_round_trip() {
+        let case = Case::new("drain-round-trip");
+        let root = case.root();
+        let raised = format!("gate: drain barrier {DRAIN_NOW} {}", DRAIN_NOW + 1800);
+        let drained_lines = [raised.as_str(), "gate: drain tickets 0", "gate: drain state drained"];
+
+        let raise = drained(&root, "raise");
+        assert_eq!(raise.status, Some(0), "{:?}", raise.err);
+        assert_eq!(raise.out, drained_lines);
+        assert!(raise.err.is_empty(), "{:?}", raise.err);
+        assert_eq!(
+            drain_record(&root, "barrier"),
+            json!({ "Raised": DRAIN_NOW, "Lapses": DRAIN_NOW + 1800, "Generation": 1 })
+        );
+        for folder in ["drain", "drain/tickets", "drain/sessions"] {
+            assert_eq!(mode_of(&format!("{root}/{folder}")), 0o700, "{folder}");
+        }
+
+        let status = drained(&root, "status");
+        assert_eq!(status.status, Some(0), "{:?}", status.err);
+        assert_eq!(status.out, drained_lines);
+        let again = drained(&root, "raise");
+        assert_eq!(again.status, Some(0), "{:?}", again.err);
+        assert_eq!(
+            drain_record(&root, "barrier")["Generation"],
+            json!(2),
+            "a raise while one stands is one generation on"
+        );
+
+        let lift = drained(&root, "lift");
+        assert_eq!(lift.status, Some(0), "{:?}", lift.err);
+        assert_eq!(lift.out, OPEN_LINES);
+        assert!(!Path::new(&format!("{root}/drain/barrier")).exists(), "the lift removes the barrier");
+        assert_eq!(drain_record(&root, "lifted"), json!({ "At": DRAIN_NOW }));
+        let after = drained(&root, "status");
+        assert_eq!(after.status, Some(0), "{:?}", after.err);
+        assert_eq!(after.out, OPEN_LINES);
+    }
+
+    #[test]
+    fn drain_status_on_a_missing_root_reads_open() {
+        let case = Case::new("drain-missing-root");
+        let missing = case.base.join("missing");
+        let root = missing.join("gate-remote");
+        for action in ["status", "lift"] {
+            let ended = drained(root.to_str().expect("the temp folder is UTF-8"), action);
+            assert_eq!(ended.status, Some(0), "{action}: {:?}", ended.err);
+            assert_eq!(ended.out, OPEN_LINES, "{action}");
+            assert!(ended.err.is_empty(), "{action}: {:?}", ended.err);
+        }
+        assert!(!missing.exists(), "no root is made");
+
+        let without_drain = drained(&case.root(), "status");
+        assert_eq!(without_drain.status, Some(0), "{:?}", without_drain.err);
+        assert_eq!(without_drain.out, OPEN_LINES);
+        assert!(!Path::new(&format!("{}/drain", case.root())).exists(), "a root with no drain/ is left so");
+    }
+
+    /// A planted shape's name, how it is planted, and whether a file type is that shape.
+    type Shape<'a> = (&'a str, &'a dyn Fn(), fn(&fs::FileType) -> bool);
+
+    #[test]
+    fn a_planted_drain_link_file_or_open_folder_is_moved_aside() {
+        use std::os::unix::fs::PermissionsExt;
+        let case = Case::new("drain-planted");
+        let root = case.root();
+        let drain = format!("{root}/drain");
+        let moved = format!("{root}/drain.gate-moved-1");
+        let standing = json!({ "Raised": DRAIN_NOW, "Lapses": DRAIN_NOW + 1800, "Generation": 1 }).to_string();
+        let elsewhere = case.base.join("elsewhere");
+        fs::create_dir(&elsewhere).expect("the link's target is made");
+        fs::write(elsewhere.join("barrier"), &standing).expect("the target's barrier is written");
+        let moved_line = format!(
+            "gate: drain moved aside {} to drain.gate-moved-1: it was not the box's protected folder",
+            escaped(&drain)
+        );
+
+        let plant_link = || std::os::unix::fs::symlink(&elsewhere, &drain).expect("the link is planted");
+        let plant_file = || fs::write(&drain, &standing).expect("the file is planted");
+        let plant_open_folder = || {
+            fs::create_dir(&drain).expect("the folder is planted");
+            fs::write(format!("{drain}/barrier"), &standing).expect("the folder's barrier is written");
+            fs::set_permissions(&drain, fs::Permissions::from_mode(0o755)).expect("the folder is opened to others");
+        };
+        let shapes: [Shape<'_>; 3] = [
+            ("link", &plant_link, fs::FileType::is_symlink),
+            ("file", &plant_file, fs::FileType::is_file),
+            ("open folder", &plant_open_folder, fs::FileType::is_dir),
+        ];
+        for (shape, plant, is_shape) in shapes {
+            plant();
+            let ended = drained(&root, "status");
+            assert_eq!(ended.status, Some(0), "{shape}: {:?}", ended.err);
+            assert_eq!(ended.out, OPEN_LINES, "{shape}: the planted barrier is never read");
+            assert_eq!(ended.err, [moved_line.as_str()], "{shape}");
+            let aside = fs::symlink_metadata(&moved).expect("the planted drain is moved aside");
+            assert!(is_shape(&aside.file_type()), "{shape}: moved aside as itself");
+            assert!(fs::symlink_metadata(&drain).expect("a drain is made").is_dir(), "{shape}");
+            assert_eq!(mode_of(&drain), 0o700, "{shape}");
+
+            fs::remove_dir_all(&drain).expect("the made drain is removed");
+            if aside.is_dir() {
+                fs::remove_dir_all(&moved).expect("the moved folder is removed");
+            } else {
+                fs::remove_file(&moved).expect("the moved link or file is removed");
+            }
+        }
+        assert_eq!(
+            fs::read_to_string(elsewhere.join("barrier")).expect("the link's target is untouched"),
+            standing
+        );
+    }
+
+    #[test]
+    fn a_lapsed_barrier_reads_lapsed_and_is_recorded() {
+        let case = Case::new("drain-lapsed");
+        let root = case.root();
+        let raise = drained(&root, "raise");
+        assert_eq!(raise.status, Some(0), "{:?}", raise.err);
+        let lapses = DRAIN_NOW + 1800;
+        let lapsed = format!("gate: drain barrier lapsed {lapses}");
+        let lapsed_lines = [lapsed.as_str(), "gate: drain tickets 0", "gate: drain state open"];
+
+        let standing = drained_at(&root, "status", lapses - 1);
+        assert_eq!(
+            standing.out[0],
+            format!("gate: drain barrier {DRAIN_NOW} {lapses}"),
+            "it stands until its lapse"
+        );
+        let at_lapse = drained_at(&root, "status", lapses);
+        assert_eq!(at_lapse.status, Some(0), "{:?}", at_lapse.err);
+        assert_eq!(at_lapse.out, lapsed_lines);
+        assert!(!Path::new(&format!("{root}/drain/barrier")).exists(), "the lapsed barrier is removed");
+        assert_eq!(drain_record(&root, "lapsed"), json!({ "At": lapses }));
+        let later = drained_at(&root, "status", lapses + 600);
+        assert_eq!(later.out, lapsed_lines, "read again from the lapsed record");
+    }
+
+    #[test]
+    fn an_unreadable_barrier_stands_as_raised() {
+        let case = Case::new("drain-unreadable");
+        let root = case.root();
+        let raise = drained(&root, "raise");
+        assert_eq!(raise.status, Some(0), "{:?}", raise.err);
+        let barrier = format!("{root}/drain/barrier");
+        fs::write(&barrier, "{not json").expect("the barrier is damaged");
+        let written = fs::metadata(&barrier)
+            .and_then(|metadata| metadata.modified())
+            .expect("the barrier's last write is read")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after 1970")
+            .as_secs();
+
+        let within = drained_at(&root, "status", written + 1799);
+        assert_eq!(within.status, Some(0), "{:?}", within.err);
+        let stands = format!("gate: drain barrier {written} {}", written + 1800);
+        assert_eq!(within.out, [stands.as_str(), "gate: drain tickets 0", "gate: drain state drained"]);
+        let past = drained_at(&root, "status", written + 1800);
+        assert_eq!(
+            past.out[0],
+            format!("gate: drain barrier lapsed {}", written + 1800),
+            "for one lapse and no longer"
+        );
+    }
+
+    #[test]
+    fn a_planted_tickets_or_sessions_folder_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let case = Case::new("drain-planted-inner");
+        let root = case.root();
+        let raise = drained(&root, "raise");
+        assert_eq!(raise.status, Some(0), "{:?}", raise.err);
+        let (tickets, sessions) = (format!("{root}/drain/tickets"), format!("{root}/drain/sessions"));
+
+        fs::remove_dir(&tickets).expect("the tickets folder is removed");
+        fs::write(&tickets, "").expect("a file is planted at tickets");
+        let as_file = drained(&root, "status");
+        fs::remove_file(&tickets).expect("the planted file is removed");
+        fs::set_permissions(&sessions, fs::Permissions::from_mode(0o755)).expect("sessions is opened to others");
+        let as_open = drained(&root, "status");
+
+        let refused = |path: &str| format!("gate: drain failed: {} is not the box user's own folder at mode 0700", escaped(path));
+        assert_eq!(as_file.status, Some(1), "{:?}", as_file.err);
+        assert_eq!(as_file.err, [refused(&tickets)]);
+        assert!(as_file.out.is_empty(), "{:?}", as_file.out);
+        assert_eq!(as_open.status, Some(1), "{:?}", as_open.err);
+        assert_eq!(as_open.err, [refused(&sessions)]);
+        assert_eq!(mode_of(&sessions), 0o755, "a planted folder within drain/ is left as it is");
+    }
+
+    #[test]
+    fn a_drain_on_an_untrusted_root_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let case = Case::new("drain-untrusted");
+        let root = case.root();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).expect("the root is opened to others");
+
+        let ended = drained(&root, "raise");
+
+        assert_eq!(ended.status, Some(1), "{:?}", ended.err);
+        assert_eq!(ended.err.len(), 1, "{:?}", ended.err);
+        let wanted = format!("gate: drain failed: the builder's work root is not locked down: {root} is not owned by ");
+        assert!(ended.err[0].starts_with(&wanted), "{:?}", ended.err);
+        assert!(ended.err[0].contains(" or is open to others; run the installer's "), "{:?}", ended.err);
+        assert!(!Path::new(&format!("{root}/drain")).exists(), "nothing is made under a root not trusted");
+    }
+
+    /// Runs `gate-box box <words> --stdin` with `input` on its stdin; its status and its lines. A box that ends before
+    /// reading all its input has its lines read all the same.
+    fn boxed(words: &[&str], input: Vec<u8>) -> Ended {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_gate-box"))
+            .arg("box")
+            .args(words)
+            .arg("--stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("gate-box starts");
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        let writer = thread::spawn(move || stdin.write_all(&input));
+        let ended = ended_of(&child.wait_with_output().expect("gate-box is waited for"));
+        // A box refused before it reads its input closes stdin early, and the write fails; that is no failure here.
+        drop(writer.join().expect("the input's writer ends"));
+        ended
+    }
+
+    /// The payload keys naming the drain session `id` of the PC `pc1` and the repo `repo`.
+    fn session_keys(id: &str) -> Value {
+        json!({ "Session": id, "Pc": "pc1", "Repo": "repo" })
+    }
+
+    /// Runs `gate-box box --test-box-now <DRAIN_NOW> preflight --stdin` for the work folder of `case`, with `extra` keys
+    /// set over its payload; its status and its lines.
+    fn preflighted(case: &Case, extra: &Value) -> Ended {
+        let now = DRAIN_NOW.to_string();
+        boxed(
+            &["--test-box-now", &now, "preflight"],
+            format!("{}\n", case.request("", extra)).into_bytes(),
+        )
+    }
+
+    /// The lines a call refused by the barrier raised at [`DRAIN_NOW`] says, at `place` in line.
+    fn drain_refusal(place: &str) -> [String; 3] {
+        [
+            refused_line(NONCE, Refusal::Drain),
+            format!("gate: drain place {place}"),
+            format!("gate: drain barrier {DRAIN_NOW} {}", DRAIN_NOW + 1800),
+        ]
+    }
+
+    /// The names in the drain folder `folder` of the root `root`, in order.
+    fn drain_names(root: &str, folder: &str) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(format!("{root}/drain/{folder}"))
+            .expect("the drain folder is listed")
+            .map(|entry| entry.expect("an entry is read").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Raises the barrier on the root `root` at [`DRAIN_NOW`].
+    fn raised(root: &str) {
+        let raise = drained(root, "raise");
+        assert_eq!(raise.status, Some(0), "{:?}", raise.err);
+    }
+
+    #[test]
+    fn a_preflight_under_a_barrier_refuses_75_after_its_version_line() {
+        let case = Case::new("drain-preflight");
+        let root = case.root();
+        raised(&root);
+
+        let ended = preflighted(&case, &session_keys("s1"));
+
+        assert_eq!(ended.status, Some(75), "{:?}", ended.err);
+        assert_eq!(ended.out.len(), 1, "only the version line: {:?}", ended.out);
+        assert!(ended.out[0].starts_with("gate: remote version "), "{:?}", ended.out);
+        assert_eq!(ended.err, drain_refusal("1"));
+        assert_eq!(
+            drain_record(&root, "tickets/00000001-s1"),
+            json!({ "Session": "s1", "Polled": DRAIN_NOW }),
+            "the refused session takes ticket 1"
+        );
+        assert!(!Path::new(&case.work()).exists(), "a refused preflight makes no work folder");
+    }
+
+    #[test]
+    fn a_no_ticket_preflight_under_a_barrier_refuses_and_takes_no_place() {
+        let case = Case::new("drain-no-ticket");
+        let root = case.root();
+        raised(&root);
+
+        let ended = preflighted(&case, &json!({ "Session": "s1", "Pc": "pc1", "Repo": "repo", "NoTicket": true }));
+
+        assert_eq!(ended.status, Some(75), "{:?}", ended.err);
+        assert_eq!(ended.err, drain_refusal("1"));
+        assert!(drain_names(&root, "tickets").is_empty(), "no ticket is taken");
+        let next = preflighted(&case, &session_keys("s2"));
+        assert_eq!(next.err, drain_refusal("1"), "no place was taken ahead of the next session");
+    }
+
+    #[test]
+    fn a_waiting_session_is_admitted_by_its_preflight_after_the_lift() {
+        let case = Case::new("drain-after-lift");
+        let root = case.root();
+        raised(&root);
+        let waiting = preflighted(&case, &session_keys("s1"));
+        assert_eq!(waiting.status, Some(75), "{:?}", waiting.err);
+        let lift = drained(&root, "lift");
+        assert_eq!(lift.status, Some(0), "{:?}", lift.err);
+
+        let admitted = preflighted(&case, &session_keys("s1"));
+
+        assert_eq!(admitted.status, Some(0), "{:?}", admitted.err);
+        assert!(
+            admitted.out.first().is_some_and(|line| line.starts_with("gate: remote version ")),
+            "{:?}",
+            admitted.out
+        );
+        assert!(drain_names(&root, "tickets").is_empty(), "the admitted session gives up its ticket");
+        assert_eq!(
+            drain_record(&root, "sessions/s1"),
+            json!({ "Pc": "pc1", "Repo": "repo", "Command": "", "Job": "", "Called": DRAIN_NOW })
+        );
+        assert_eq!(drain_names(&root, "sessions"), ["s1"], "the holder is removed at the call's end");
+    }
+
+    #[test]
+    fn a_run_of_a_dead_session_under_a_barrier_is_refused_drain() {
+        let case = Case::new("drain-run-dead");
+        let commit = case.snapshot();
+        let root = case.root();
+        raised(&root);
+        let now = DRAIN_NOW.to_string();
+
+        let ended = ran(
+            &["--test-box-now", &now],
+            &case.request(&commit, &session_keys("s9")),
+            Reading::All,
+            &case.base.join("beaten"),
+        );
+
+        assert_eq!(ended.status, Some(75), "{:?}", ended.err);
+        assert!(ended.out.is_empty(), "nothing ran: {:?}", ended.out);
+        assert!(!ended.err_has(&started_line(NONCE)), "no start marker: {:?}", ended.err);
+        let refusal = drain_refusal("1");
+        let tag = ended.err.iter().position(|line| *line == refusal[0]);
+        assert!(
+            tag.is_some_and(|tag| ended.err.get(tag..tag + 3) == Some(&refusal[..])),
+            "the drain tag, then the place and barrier lines, bare: {:?}",
+            ended.err
+        );
+        ended.protocol_bare();
+        assert!(drain_names(&root, "tickets").is_empty(), "a run takes no ticket");
+        assert!(case.lock_free(), "the work lock is free");
+    }
+
+    #[test]
+    fn a_run_of_a_live_session_under_a_barrier_runs() {
+        let case = Case::new("drain-run-live");
+        let commit = case.snapshot();
+        let root = case.root();
+        raised(&root);
+        let record = json!({ "Pc": "pc1", "Repo": "repo", "Command": "", "Job": "", "Called": DRAIN_NOW });
+        fs::write(format!("{root}/drain/sessions/s1"), record.to_string()).expect("the session's record is written");
+        let later = (DRAIN_NOW + 60).to_string();
+
+        let ended = ran(
+            &["--test-box-now", &later],
+            &case.request(&commit, &session_keys("s1")),
+            Reading::All,
+            &case.base.join("beaten"),
+        );
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert!(ended.err_has(&started_line(NONCE)), "the run started: {:?}", ended.err);
+        assert_eq!(
+            drain_record(&root, "sessions/s1"),
+            json!({
+                "Pc": "pc1",
+                "Repo": "repo",
+                "Command": "true",
+                "Job": format!("gate-remote-{KEY}-0123456789ab"),
+                "Called": DRAIN_NOW + 60
+            }),
+            "the run records its command and job, and its end"
+        );
+        assert_eq!(drain_names(&root, "sessions"), ["s1"], "the holder is removed at the run's end");
+        case.ended_clean();
+    }
+
+    #[test]
+    fn an_inputs_call_under_a_barrier_is_refused_before_its_manifest_is_read() {
+        let case = Case::new("drain-inputs");
+        let root = case.root();
+        raised(&root);
+        let now = DRAIN_NOW.to_string();
+        let request = case.inputs_request_with("diff", &session_keys("s9"));
+
+        let ended = boxed(&["--test-box-now", &now, "inputs"], format!("{request}\nnot a manifest\n").into_bytes());
+
+        assert_eq!(ended.status, Some(75), "{:?}", ended.err);
+        assert_eq!(ended.err, drain_refusal("1"), "refused drain, the manifest never read");
+        assert!(ended.out.is_empty(), "{:?}", ended.out);
+        assert!(!Path::new(&case.work()).exists(), "nothing is laid out");
+    }
+
+    #[test]
+    fn outputs_of_a_dead_session_under_a_barrier_keeps_the_archive() {
+        let case = Case::new("drain-outputs");
+        let root = case.root();
+        raised(&root);
+        std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
+            .create(format!("{root}/outputs"))
+            .expect("the output folder is made");
+        fs::write(case.archive(), b"archive bytes").expect("the archive is written");
+        let now = DRAIN_NOW.to_string();
+
+        let (status, sent, err) = case.outputs_sent_as(&archive_name(), &json!({ "Session": "s9" }), &["--test-box-now", &now]);
+
+        assert_eq!(status, Some(0), "{err:?}");
+        assert_eq!(sent, b"archive bytes", "the archive is sent");
+        assert_eq!(err, ["gate: remote outputs kept: the builder is drained"]);
+        assert!(case.archive().exists(), "and kept");
+    }
+
+    #[test]
+    fn a_holder_is_not_inherited_by_the_routed_command() {
+        let case = Case::new("drain-holder-cloexec");
+        let commit = case.snapshot();
+        let root = case.root();
+        let (held, open) = (case.base.join("held.txt"), case.base.join("open.txt"));
+        // The command lists the holders while it runs, then the files its own shell holds open.
+        let script = format!(
+            "ls '{root}/drain/sessions' > '{}'; /usr/sbin/lsof -a -p $$ -Fn > '{}'",
+            held.display(),
+            open.display()
+        );
+        let mut keys = session_keys("s1");
+        keys["Command"] = json!(["/bin/sh", "-c", script]);
+
+        let ended = ran(&[], &case.request(&commit, &keys), Reading::All, &case.base.join("beaten"));
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        let holders = fs::read_to_string(&held).expect("the holders were listed");
+        assert!(
+            holders.lines().any(|name| name.starts_with("s1.")),
+            "the run held its holder while its command ran: {holders:?}"
+        );
+        let files = fs::read_to_string(&open).expect("the open files were listed");
+        assert!(
+            files.lines().any(|line| line.starts_with('n')),
+            "lsof listed the shell's files: {files:?}"
+        );
+        assert!(!files.contains("/drain/"), "the command holds no file of the drain open: {files:?}");
+        assert_eq!(drain_names(&root, "sessions"), ["s1"], "the holder is removed at the run's end");
+    }
+
+    #[test]
+    fn a_session_with_a_job_is_not_removed_on_its_lease_alone() {
+        let case = Case::new("drain-job-session");
+        let root = case.root();
+        raised(&root);
+        let called_long_ago = |job: &str| json!({ "Pc": "pc1", "Repo": "repo", "Command": "x", "Job": job, "Called": DRAIN_NOW - 1000 });
+        fs::write(format!("{root}/drain/sessions/s1"), called_long_ago("gate-remote-job").to_string()).expect("a record naming a job is written");
+        fs::write(format!("{root}/drain/sessions/s2"), called_long_ago("").to_string()).expect("a record naming no job is written");
+        // The job is live by its work folder's group record, which names it and a group still its run's: the leader of a
+        // group of its own, started before the record was written.
+        let mut leader = Command::new("/bin/sleep")
+            .arg("600")
+            .process_group(0)
+            .spawn()
+            .expect("the group's leader starts");
+        fs::write(format!("{}.pgid", case.work()), format!("gate-remote-job\n{}\n", leader.id())).expect("the group record is written");
+
+        let status = drained(&root, "status");
+        leader.kill().expect("the leader is killed");
+        leader.wait().expect("the leader is waited for");
+
+        assert_eq!(status.status, Some(0), "{:?}", status.err);
+        let sessions: Vec<&String> = status.out.iter().filter(|line| line.starts_with("gate: drain session ")).collect();
+        assert_eq!(sessions.len(), 1, "{:?}", status.out);
+        assert!(sessions[0].starts_with("gate: drain session 1000 "), "{:?}", status.out);
+        assert_eq!(status.out.last().map(String::as_str), Some("gate: drain state waiting"));
+        assert_eq!(drain_names(&root, "sessions"), ["s1"], "only the record naming no job is removed");
+    }
+
+    // The process scan is built for macOS only.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_process_naming_the_root_keeps_the_drain_waiting() {
+        let case = Case::new("drain-process");
+        let root = case.root();
+        raised(&root);
+        // The shell waits on its input itself, so no child of it outlives it, and its last argument names the root.
+        let mut held = Command::new("/bin/sh")
+            .args(["-c", "read line", "sh", &case.work()])
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("the shell starts");
+        let pid = held.id();
+
+        let waiting = drained(&root, "status");
+        held.kill().expect("the shell is killed");
+        held.wait().expect("the shell is waited for");
+        let after = drained(&root, "status");
+
+        assert_eq!(waiting.status, Some(0), "{:?}", waiting.err);
+        assert!(
+            waiting.out.contains(&format!("gate: drain process {pid} git")),
+            "the shell naming the root is counted: {:?}",
+            waiting.out
+        );
+        assert_eq!(waiting.out.last().map(String::as_str), Some("gate: drain state waiting"));
+        assert_eq!(after.status, Some(0), "{:?}", after.err);
+        assert_eq!(after.out.last().map(String::as_str), Some("gate: drain state drained"), "{:?}", after.out);
+    }
+
+    // The process scan is built for macOS only.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_box_preflight_polling_during_the_status_does_not_hold_the_drain() {
+        let case = Case::new("drain-box-poll");
+        let root = case.root();
+        raised(&root);
+        // A program at the box's own path, as each box call runs it, waiting on its input; its arguments name the root.
+        std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
+            .create(format!("{root}/bin"))
+            .expect("the box's folder is made");
+        let program = format!("{root}/bin/gate-box");
+        // `cat` reads its input first, so it waits there before it would read the work folder it names.
+        fs::copy("/bin/cat", &program).expect("a stand-in for the box is copied");
+        let mut polling = Command::new(&program)
+            .args(["-", &case.work()])
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("the stand-in starts");
+
+        let status = drained(&root, "status");
+        polling.kill().expect("the stand-in is killed");
+        polling.wait().expect("the stand-in is waited for");
+
+        assert_eq!(status.status, Some(0), "{:?}", status.err);
+        assert_eq!(
+            status.out.last().map(String::as_str),
+            Some("gate: drain state drained"),
+            "{:?}",
+            status.out
+        );
+    }
+
+    #[test]
+    fn an_inputs_call_on_an_untrusted_root_touches_no_drain() {
+        use std::os::unix::fs::PermissionsExt;
+        let case = Case::new("drain-inputs-untrusted");
+        let root = case.root();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).expect("the root is opened to others");
+        let now = DRAIN_NOW.to_string();
+        let request = case.inputs_request_with("diff", &session_keys("s1"));
+
+        let ended = boxed(&["--test-box-now", &now, "inputs"], format!("{request}\nnot a manifest\n").into_bytes());
+
+        assert_ne!(ended.status, Some(0), "{:?}", ended.err);
+        assert!(
+            ended.err.iter().any(|line| line.contains("work root is not locked down")),
+            "the root's own line: {:?}",
+            ended.err
+        );
+        assert!(!Path::new(&format!("{root}/drain")).exists(), "nothing is made under drain/");
+    }
+
+    // The process scan is built for macOS only.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_run_without_a_session_keeps_the_drain_waiting() {
+        let case = Case::new("drain-sessionless-run");
+        let commit = case.snapshot();
+        let root = case.root();
+        // Two pipes the command waits on, outside the root: it says it is up on one, then waits to be let go on the other.
+        let (up, go) = (case.base.join("up"), case.base.join("go"));
+        for pipe in [&up, &go] {
+            let made = Command::new("mkfifo").arg(pipe).status().expect("mkfifo runs");
+            assert!(made.success(), "the pipe {} is made", pipe.display());
+        }
+        let script = r#"echo up > "$0"; read line < "$1""#;
+        let keys = json!({ "Command": ["/bin/sh", "-c", script, up.to_str().expect("UTF-8"), go.to_str().expect("UTF-8")] });
+        let request = case.request(&commit, &keys);
+        let beaten = case.base.join("beaten");
+        let run = thread::spawn(move || ran(&[], &request, Reading::All, &beaten));
+        // Opened once the command writes to it: the run is going, its group recorded.
+        fs::read_to_string(&up).expect("the command says it is up");
+        raised(&root);
+
+        let waiting = drained(&root, "status");
+        fs::write(&go, "go\n").expect("the command is let go");
+        let ended = run.join().expect("the run's thread ends");
+        let after = drained(&root, "status");
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert!(
+            waiting
+                .out
+                .iter()
+                .any(|line| line.starts_with("gate: drain process ") && line.ends_with(" job")),
+            "the run's group holds the drain: {:?}",
+            waiting.out
+        );
+        assert_eq!(waiting.out.last().map(String::as_str), Some("gate: drain state waiting"));
+        assert_eq!(after.out.last().map(String::as_str), Some("gate: drain state drained"), "{:?}", after.out);
+    }
+
+    // The process scan is built for macOS only.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn drain_status_reads_drained_after_a_run_ends() {
+        let case = Case::new("drain-after-run");
+        let commit = case.snapshot();
+        let root = case.root();
+        let now = DRAIN_NOW.to_string();
+        let ended = ran(
+            &["--test-box-now", &now],
+            &case.request(&commit, &session_keys("s1")),
+            Reading::All,
+            &case.base.join("beaten"),
+        );
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        raised(&root);
+
+        // Past the session's lease, its job's group gone with the run.
+        let status = drained_at(&root, "status", DRAIN_NOW + 600);
+
+        assert_eq!(status.status, Some(0), "{:?}", status.err);
+        assert_eq!(
+            status.out.last().map(String::as_str),
+            Some("gate: drain state drained"),
+            "{:?}",
+            status.out
+        );
+        assert!(drain_names(&root, "sessions").is_empty(), "the dead session's record is removed");
+    }
+
+    /// An idle work folder of `case` and a leftover run folder in its own temp folder, both two days old; the
+    /// variables an age prune of it runs with, the free space plenty.
+    fn idle_work(case: &Case) -> (PathBuf, PathBuf, [(&'static str, String); 2]) {
+        let two_days = std::time::Duration::from_hours(48);
+        let work = PathBuf::from(case.work());
+        fs::create_dir(&work).expect("the work folder is made");
+        backdated(&work, two_days);
+        let tmp = case.base.join("tmp");
+        let leftover = tmp.join("gate.Ab3dE6g8");
+        fs::create_dir_all(&leftover).expect("the leftover run folder is made");
+        backdated(&leftover, two_days);
+        let env = [
+            ("GATE_BOX_TEST_TMP_ROOT", tmp.to_str().expect("the temp folder is UTF-8").to_owned()),
+            ("GATE_BOX_TEST_FREE_BYTES", (1000u64 << 30).to_string()),
+        ];
+        (work, leftover, env)
+    }
+
+    #[test]
+    fn a_prune_under_a_standing_barrier_prunes_nothing() {
+        let case = Case::new("prune-drained");
+        let (work, leftover, env) = idle_work(&case);
+        raised(&case.root());
+        let later = (DRAIN_NOW + 60).to_string();
+        // A volume nearly full would have the floor pass remove the folder too.
+        let env = [(env[0].0, env[0].1.as_str()), ("GATE_BOX_TEST_FREE_BYTES", "1")];
+
+        let ended = pruned_with(&["--test-box-now", &later], &["--root", &case.root()], &env);
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(ended.out, ["gate: remote prune skipped: the builder is drained"]);
+        assert!(ended.err.is_empty(), "{:?}", ended.err);
+        assert!(work.exists() && leftover.exists(), "nothing is removed");
+    }
+
+    #[test]
+    fn a_keyed_prune_under_a_barrier_keeps_every_key() {
+        let case = Case::new("prune-keyed-drained");
+        let commit = case.snapshot();
+        let work = PathBuf::from(case.work());
+        fs::create_dir(&work).expect("the work folder is made");
+        raised(&case.root());
+        let later = (DRAIN_NOW + 60).to_string();
+        let never = "never-0123abcd";
+
+        let ended = pruned_with(&["--test-box-now", &later], &["--root", &case.root(), "--keys", KEY, never], &[]);
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(
+            ended.out,
+            [
+                format!("gate: remote kept {KEY}: the builder is drained"),
+                format!("gate: remote kept {never}: the builder is drained"),
+            ]
+        );
+        assert!(work.exists(), "the work folder is kept");
+        assert_eq!(
+            git(&[&case.bare_dir(), "rev-parse", &format!("refs/gate/{KEY}")]),
+            commit,
+            "the key's refs are kept"
+        );
+    }
+
+    #[test]
+    fn a_prune_after_the_lapse_sweeps() {
+        let case = Case::new("prune-lapsed");
+        let (work, leftover, env) = idle_work(&case);
+        raised(&case.root());
+        let lapsed = (DRAIN_NOW + 1800).to_string();
+        let env = env.each_ref().map(|(name, value)| (*name, value.as_str()));
+
+        let ended = pruned_with(&["--test-box-now", &lapsed], &["--root", &case.root()], &env);
+
+        assert_eq!(ended.status, Some(0), "{:?}", ended.err);
+        assert_eq!(
+            ended.out.first().map(String::as_str),
+            Some(format!("gate: remote pruned {KEY}: idle 48 h").as_str()),
+            "{:?}",
+            ended.out
+        );
+        assert!(!work.exists() && !leftover.exists(), "the sweep removes both");
     }
 }

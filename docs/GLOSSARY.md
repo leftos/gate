@@ -76,7 +76,8 @@ Terms the gate's docs use in a project sense, in alphabetical order.
 - **Desktop task**: the Task Scheduler task `\gate\desktop-helper` that `gate box register-desktop` registers on a builder (`gate push` runs it on every builder after installing the helper; it can also be run by hand over ssh), which starts the desktop helper in the logged-on user's session when the box asks.
 - **Diagnostics block**: the record of what was running that a kill writes to the log before it terminates the job: the job's processes, the descendants outside the job and the last samples.
 - **Drain**: see critical drain; for the builder drain, see builder drain.
-- **Drain barrier**: the file `{root}\drain\barrier` that `gate box drain` writes on a builder, which stands until a lift or until 30 minutes after its last raise, when it lapses.
+- **Drain barrier**: the file `{root}\drain\barrier` that `gate box drain` writes on a builder, which stands until a lift or until 30 minutes after its last raise, when it lapses (`{root}/drain/barrier` on the Unix box).
+- **Drain holder**: the file `{root}\drain\sessions\{session}.{pid}` that each admitted box process keeps open, shared with no one (an `flock` on the Unix box), so its drain session is live while the process lives.
 - **Drain session**: the record `{root}\drain\sessions\{session}` of a routed run the drain admitted, live while a box process holds its holder file `{session}.{pid}` or for 120 s after its last call.
 - **Drain ticket**: the file `{root}\drain\tickets\{seq:08}-{session}` that marks a run waiting in the builder drain's line, live for 120 s after its last poll.
 - **Drained cutover**: a cutover in which every gate of the old generation finishes before the switch completes, while the two generations share the slot mutexes and take turns on them.

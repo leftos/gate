@@ -20,6 +20,7 @@ base64 = "0.23.1"
 gate-args = { path = "../gate-args" }
 gate-router = { path = "../gate-router" }
 jiff = "0.2.37"
+proc-table = { path = "../proc-table" }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 
 [dev-dependencies]
