@@ -411,6 +411,7 @@ fn worktree(last_routed: Timestamp) -> v1::WorktreeRecord {
         common_dir: r"X:\dev\repo\.git".to_owned(),
         repo: "repo".to_owned(),
         last_routed,
+        gone_since: None,
     }
 }
 
@@ -448,7 +449,7 @@ fn a_worktree_record_is_written_with_v_and_its_four_keys_and_read_back() {
 
 #[test]
 fn a_worktree_record_with_a_field_it_does_not_know_reads() {
-    let text = r#"{"v":1,"root":"X:/dev/repo.wt/a","commonDir":"X:\\dev\\repo\\.git","repo":"repo","lastRouted":"2026-10-21T12:00:00Z","goneSince":"2026-10-21T13:00:00Z"}"#;
+    let text = r#"{"v":1,"root":"X:/dev/repo.wt/a","commonDir":"X:\\dev\\repo\\.git","repo":"repo","lastRouted":"2026-10-21T12:00:00Z","laterField":"2026-10-21T13:00:00Z"}"#;
 
     assert_eq!(v1::worktree_record(text.as_bytes()).expect("the record reads"), worktree(worktree_now()));
 }

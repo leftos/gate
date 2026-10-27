@@ -15,6 +15,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gate_router::warm::warmup_hash;
+use gate_router::work_folder_key;
 use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 
@@ -346,6 +347,104 @@ fn a_warm_up_record_is_what_the_client_says_of_its_end() {
     let (_, outcome, deleted) = warmed_with("warm-deleted", &["warm-deleted"]);
     assert_eq!(outcome.code, Some(CONTROL_C_EXIT), "{outcome:?}");
     assert_eq!(deleted, None, "Ctrl+C deletes the record");
+}
+
+/// A warm-up leaves `remote\<key>.worktree` in the state root, as a routed run does: the worktree root the key was
+/// made from, the repo's git common folder, the repo name and when it was written, and no `goneSince`.
+#[test]
+fn a_warm_up_records_which_worktree_its_key_came_from() {
+    let (case, outcome, _) = warmed_with("warm-worktree-record", &["warmed"]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let root = git(&case, &["rev-parse", "--show-toplevel"]);
+    let key = work_folder_key(&root);
+    let warm = warm_entry(&case, "json").expect("the warm-up record is written");
+    assert_eq!(
+        warm.file_stem().and_then(|stem| stem.to_str()),
+        Some(key.as_str()),
+        "the key is the root's"
+    );
+    let path = case.root().join("remote").join(format!("{key}.worktree"));
+    let text = fs::read_to_string(&path).expect("the worktree record was written");
+    let record: Value = serde_json::from_str(&text).expect("the record is JSON");
+    assert_eq!(record["v"], 1, "{text}");
+    assert_eq!(record["root"], root.as_str(), "{text}");
+    assert_eq!(record["repo"], repo(&case).as_str(), "{text}");
+    let common = record["commonDir"].as_str().expect("the common folder is text");
+    assert_eq!(
+        fs::canonicalize(common).expect("the common folder exists"),
+        fs::canonicalize(case.folder().join(".git")).expect("the case's git folder exists"),
+        "{text}"
+    );
+    let written = record["lastRouted"].as_str().expect("the time is text");
+    written.parse::<Timestamp>().expect("lastRouted is a time");
+    assert!(record.get("goneSince").is_none(), "{text}");
+}
+
+/// The path of the case's worktree record, `<state>\remote\<key>.worktree`, the key its worktree root's.
+fn worktree_record_path(case: &Case) -> PathBuf {
+    let key = work_folder_key(&git(case, &["rev-parse", "--show-toplevel"]));
+    case.root().join("remote").join(format!("{key}.worktree"))
+}
+
+/// A second warm-up of the worktree within the hour leaves its worktree record byte for byte as the first wrote it.
+#[test]
+fn a_second_warm_up_within_the_hour_leaves_the_record_as_it_was() {
+    let (case, outcome, _) = warmed_with("warm-worktree-again", &["warmed"]);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let path = worktree_record_path(&case);
+    let first = fs::read(&path).expect("the first warm-up wrote the worktree record");
+
+    let again = steps(&case, &["warmed"]);
+    let outcome = warm(&case, &again, &[]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        fs::read(&path).expect("the worktree record stands"),
+        first,
+        "the record is as the first warm-up left it"
+    );
+}
+
+/// A warm-up rewrites a worktree record that says the worktree is gone without its `goneSince`, though the record's
+/// `lastRouted` is inside the hour.
+#[test]
+fn a_warm_up_clears_gone_since_from_a_record_inside_the_hour() {
+    let (case, outcome, _) = warmed_with("warm-worktree-gone", &["warmed"]);
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let path = worktree_record_path(&case);
+    let mut gone: Value = serde_json::from_str(&fs::read_to_string(&path).expect("the record can be read")).expect("the record is JSON");
+    gone["goneSince"] = json!(gone["lastRouted"].clone());
+    fs::write(&path, gone.to_string()).expect("the record can be marked gone");
+
+    let again = steps(&case, &["warmed"]);
+    let outcome = warm(&case, &again, &[]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let text = fs::read_to_string(&path).expect("the worktree record stands");
+    let record: Value = serde_json::from_str(&text).expect("the record is JSON");
+    assert!(record.get("goneSince").is_none(), "{text}");
+    for field in ["v", "root", "commonDir", "repo"] {
+        assert_eq!(record[field], gone[field], "{field}: {text}");
+    }
+}
+
+/// A warm-up of a worktree whose `.git` is a junction, so its git common folder cannot be read, warms, writes no
+/// worktree record and says nothing of it.
+#[test]
+fn a_warm_up_with_no_common_folder_writes_no_record_and_says_nothing() {
+    let case = warm_case("warm-worktree-no-common");
+    let real = case.folder().join("real-git");
+    fs::rename(case.folder().join(".git"), &real).expect("the git folder can be moved");
+    junction(&case.folder().join(".git"), &real);
+    let steps = steps(&case, &["warmed"]);
+
+    let outcome = warm(&case, &steps, &[]);
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(record(&case).expect("the warm-up record is written")["state"], "warm");
+    assert!(!worktree_record_path(&case).exists(), "no worktree record");
+    assert!(!outcome.stderr.contains(".worktree"), "{outcome:?}");
 }
 
 #[test]

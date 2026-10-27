@@ -22,7 +22,8 @@ use gate_args::{DEFAULT_STALL_SECONDS, Spelling, TestSeams, WarmRequest};
 use gate_router::warm::{FailureClass, FileRead, Record, RecordRead, RecordState, WarmupFile, read_warmup, warmup_hash};
 use gate_router::{Config, Facts, Place, Target, builder_words, escaped, repo_name, stays_local, target};
 use gate_state::v1::{self, WarmFailure, WarmRecord, WarmState};
-use gate_win32::{Interrupt, OwnedMutexGuard};
+use gate_state::{KernelObject, key_hash};
+use gate_win32::{AcquireError, Interrupt, NamedMutex, OwnedMutexGuard};
 use gate_wire::build_version;
 use jiff::Timestamp;
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
@@ -33,6 +34,7 @@ use crate::remote::{self, KeyWait, RemoteCall, RemoteClient, RemoteOutcome, Warm
 use crate::resolve::{self, Environment, ResolvedRoot};
 use crate::route::{self, Machine, Origin, Source};
 use crate::run::CONTROL_C_EXIT;
+use crate::worktree_record;
 
 /// `ERROR_SHARING_VIOLATION`: another handle holds the file without sharing it.
 const SHARING_VIOLATION: i32 = 32;
@@ -484,6 +486,7 @@ fn warm_up(prepared: &Prepared<'_>, request: &WarmRequest, started: Timestamp, c
             return End::Failed(line).say(request.background, console);
         }
     };
+    leave_worktree_record(prepared, console);
     let log_path = v1::warm_log_path(state, key);
     let _log = match fresh_log(&log_path).and_then(|log| noted(log, &log_path, &prepared.machine.unsaid_notes())) {
         Ok(log) => log,
@@ -509,6 +512,26 @@ fn warm_up(prepared: &Prepared<'_>, request: &WarmRequest, started: Timestamp, c
     let status = conclude(ending, &record, request.background, console);
     drop(held);
     status
+}
+
+/// Writes the worktree record of the warm-up's key ([`worktree_record::leave`]) under the key's mutex, the one a routed
+/// run writes it under, taken without waiting and let go at once. A mutex another gate holds writes none and says
+/// nothing: its routed run writes the record. A mutex that cannot be opened or taken is said, and writes none.
+fn leave_worktree_record(prepared: &Prepared<'_>, console: &mut Console) {
+    let target = &prepared.target;
+    let name = prepared.root.root.object_name(KernelObject::Routed { hash: key_hash(&target.key) });
+    let held = NamedMutex::open(&name)
+        .map_err(|error| error.to_string())
+        .and_then(|mutex| match mutex.acquire_owned(Duration::ZERO) {
+            Ok(held) => Ok(Some(held)),
+            Err(AcquireError::Timeout) => Ok(None),
+            Err(AcquireError::Failed(error)) => Err(error.to_string()),
+        });
+    match held {
+        Ok(Some(_key)) => worktree_record::leave(&prepared.root.path, &target.place.root, &target.repo, &target.key, console),
+        Ok(None) => {}
+        Err(error) => console.err(&format!("gate: cannot take the mutex {name}: {error}")),
+    }
 }
 
 /// The key's mutex and the cap a warm-up holds until its record is written.

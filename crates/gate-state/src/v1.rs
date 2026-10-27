@@ -288,17 +288,19 @@ pub fn outputs_capped_record(bytes: &[u8]) -> Result<OutputsCappedRecord, Format
 }
 
 /// The worktree record of the work folder `key`, `<root>\remote\<key>.worktree` ([`WorktreeRecord`]): which worktree
-/// the key, a one-way hash of its root, was made from, written by a routed run as [`needs_write`] says.
+/// the key, a one-way hash of its root, was made from, written by a routed run or `gate warm` as [`needs_write`] says.
 #[must_use]
 pub fn worktree_record_path(root: &Path, key: &str) -> PathBuf {
     remote_dir(root).join(format!("{key}.worktree"))
 }
 
-/// How long a worktree record's `lastRouted` stands before a routed run of the same worktree writes it again.
+/// How long a worktree record's `lastRouted` stands before a routed run or `gate warm` of the same worktree writes it
+/// again, moving `lastRouted`.
 const WORKTREE_RECORD_FRESH: SignedDuration = SignedDuration::from_hours(1);
 
 /// The worktree record of a work folder ([`worktree_record_path`]): the JSON object `{"v": 1, "root": …, "commonDir": …,
-/// "repo": …, "lastRouted": …}`. A field it does not know is ignored when read.
+/// "repo": …, "lastRouted": …}`, with `"goneSince": …` once the worktree was found gone ([`mark_gone`]). A field it does
+/// not know is ignored when read.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeRecord {
@@ -308,24 +310,41 @@ pub struct WorktreeRecord {
     pub common_dir: String,
     /// The repo name the routing file listed.
     pub repo: String,
-    /// When a routed run last wrote the record, written as a claim's times are.
+    /// When a routed run or `gate warm` last wrote the record, written as a claim's times are.
     #[serde(with = "iso_time")]
     pub last_routed: Timestamp,
+    /// When the worktree was first found gone, written as `lastRouted` is; `None`, and no key, while it is live.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "optional_iso_time")]
+    pub gone_since: Option<Timestamp>,
 }
 
-/// Whether a routed run whose record would be `fresh` writes it over `existing`, the record on disk, `None` when there
-/// is none or it cannot be read: when there is none, when its root, common folder or repo differ from `fresh`'s, or
-/// when its `lastRouted` is an hour or more before `fresh`'s, or after it (a clock that went back).
+/// Whether a routed run or `gate warm`, whose record of a live worktree would be `fresh`, writes it over `existing`,
+/// the record on disk, `None` when there is none or it cannot be read: when there is none, when it says the worktree
+/// is gone (`goneSince`), when its root, common folder or repo differ from `fresh`'s, or when its `lastRouted` is an
+/// hour or more before `fresh`'s, or after it (a clock that went back).
 #[must_use]
 pub fn needs_write(existing: Option<&WorktreeRecord>, fresh: &WorktreeRecord) -> bool {
     let Some(existing) = existing else {
         return true;
     };
+    if existing.gone_since.is_some() {
+        return true;
+    }
     if existing.root != fresh.root || existing.common_dir != fresh.common_dir || existing.repo != fresh.repo {
         return true;
     }
     let age = fresh.last_routed.duration_since(existing.last_routed);
     age.is_negative() || age >= WORKTREE_RECORD_FRESH
+}
+
+/// `record` marked as the record of a worktree found gone at `now`: its `goneSince` set to `now` when it had none, and
+/// kept as it was when it had one.
+#[must_use]
+pub fn mark_gone(record: WorktreeRecord, now: Timestamp) -> WorktreeRecord {
+    WorktreeRecord {
+        gone_since: record.gone_since.or(Some(now)),
+        ..record
+    }
 }
 
 /// Writes the worktree `record` at `path` whole or not at all, as [`write_nothing_back`] writes, but with one move over
@@ -1075,16 +1094,128 @@ mod iso_time {
     }
 }
 
+/// A time that may be absent, written as [`iso_time`] writes one; read as absent when it is `null`, not text, or text
+/// that is no time, so the record that holds it still reads.
+mod optional_iso_time {
+    use jiff::Timestamp;
+    use serde::de::IgnoredAny;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use crate::state::iso_utc;
+
+    #[expect(clippy::ref_option, reason = "serde's serialize_with passes the field by reference")]
+    pub(super) fn serialize<S: Serializer>(time: &Option<Timestamp>, serializer: S) -> Result<S::Ok, S::Error> {
+        match time {
+            Some(time) => serializer.serialize_str(&iso_utc(*time)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    /// The value at the key: text, or anything else, which is not looked into.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Loose {
+        Text(String),
+        Other(IgnoredAny),
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Timestamp>, D::Error> {
+        Ok(match Loose::deserialize(deserializer)? {
+            Loose::Text(text) => text.parse().ok(),
+            Loose::Other(_) => None,
+        })
+    }
+}
+
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "a test whose record cannot be made must fail loudly")]
 mod tests {
     use std::path::Path;
 
-    use super::read_listed_ticket;
+    use jiff::{SignedDuration, Timestamp};
+
+    use super::{WorktreeRecord, mark_gone, needs_write, read_listed_ticket, versioned_text, worktree_record};
 
     #[test]
     fn a_ticket_deleted_between_list_and_read_is_dropped() {
         let gone = Path::new(env!("CARGO_MANIFEST_DIR")).join("no-such-ticket").join("1-1.json");
 
         assert!(read_listed_ticket(&gone).is_none(), "a ticket gone after the listing is not reported");
+    }
+
+    /// The time `text` names.
+    fn at(text: &str) -> Timestamp {
+        text.parse().expect("a time")
+    }
+
+    /// A worktree record of the worktree `X:/dev/repo.wt/a`, last routed at noon, gone since `gone_since`.
+    fn record(gone_since: Option<Timestamp>) -> WorktreeRecord {
+        WorktreeRecord {
+            root: "X:/dev/repo.wt/a".to_owned(),
+            common_dir: r"X:\dev\repo\.git".to_owned(),
+            repo: "repo".to_owned(),
+            last_routed: at("2026-10-21T12:00:00Z"),
+            gone_since,
+        }
+    }
+
+    #[test]
+    fn a_record_with_gone_since_round_trips_and_one_without_writes_no_key() {
+        let gone = record(Some(at("2026-10-21T13:00:00Z")));
+        let text = versioned_text(&gone).expect("the record has a text");
+        assert!(text.contains(r#""goneSince":"2026-10-21T13:00:00.0000000Z""#), "{text}");
+        assert_eq!(worktree_record(text.as_bytes()).expect("the record reads"), gone);
+
+        let live = versioned_text(&record(None)).expect("the record has a text");
+        assert!(!live.contains("goneSince"), "{live}");
+        assert_eq!(worktree_record(live.as_bytes()).expect("the record reads"), record(None));
+    }
+
+    /// The record [`record`] makes, written with `gone_since` as the raw JSON value of its `goneSince` key.
+    fn with_gone_since(gone_since: &str) -> String {
+        let live = versioned_text(&record(None)).expect("the record has a text");
+        let body = live.strip_suffix('}').expect("the record is an object");
+        format!(r#"{body},"goneSince":{gone_since}}}"#)
+    }
+
+    #[test]
+    fn a_gone_since_of_null_reads_as_none() {
+        let text = with_gone_since("null");
+
+        assert_eq!(worktree_record(text.as_bytes()).expect("the record reads"), record(None), "{text}");
+    }
+
+    #[test]
+    fn a_gone_since_it_cannot_parse_reads_as_none_and_the_record_reads() {
+        for gone_since in ["1761051600", r#""noon""#, r#"{"at":"2026-10-21T13:00:00Z"}"#] {
+            let text = with_gone_since(gone_since);
+
+            assert_eq!(worktree_record(text.as_bytes()).expect("the record reads"), record(None), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_live_write_clears_gone_since_even_inside_the_fresh_hour() {
+        let existing = record(Some(at("2026-10-21T12:05:00Z")));
+        let fresh = WorktreeRecord {
+            last_routed: at("2026-10-21T12:10:00Z"),
+            ..record(None)
+        };
+
+        assert!(needs_write(Some(&existing), &fresh), "a gone record is rewritten without goneSince");
+        assert!(!needs_write(Some(&record(None)), &fresh), "a live record inside the hour stands");
+    }
+
+    #[test]
+    fn mark_gone_keeps_the_first_gone_since() {
+        let first = at("2026-10-21T13:00:00Z");
+        let later = first.checked_add(SignedDuration::from_hours(2)).expect("a time");
+
+        assert_eq!(mark_gone(record(None), first), record(Some(first)), "a live record is marked now");
+        assert_eq!(
+            mark_gone(record(Some(first)), later),
+            record(Some(first)),
+            "a gone record keeps its first time"
+        );
     }
 }

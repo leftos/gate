@@ -59,6 +59,7 @@ mod trace;
 mod wait;
 mod warm;
 mod watch;
+mod worktree_record;
 
 use std::io::{self, Write};
 
