@@ -59,6 +59,8 @@ This repo's `tools/builder/install-toolchains.ps1` does the rest: the toolchains
   The sccache server's log is `%LOCALAPPDATA%\build-box\sccache-server.log` in the builder user's profile, not under `C:\build-box`; the step refuses a `LOCALAPPDATA` that holds a quote or bracket.
 - **Work-folder prune task:** the step `Work-folder prune task` (`-Only Work-folder`) registers `\build-box\gate-prune-work`, which runs every 6 hours from 00:17 with a 2 h limit, IgnoreNew and StartWhenAvailable. Its command runs inline, with no script file and module auto-loading off: `C:\Program Files\gate\bin\gate.exe box prune --root <GateRoot>` ([design.md, The box side](design.md#the-box-side), `prune`).
 
+  Under a standing drain barrier the prune touches nothing. After its sweep it runs `git gc --auto` in each bare repository under the work root, which a push no longer starts (a push to the builder runs with `receive.autogc` off).
+
   Its output goes to the Application log under the event source `gate-prune`, event ID 1: each output line is an Information event, and a closing event `gate box prune exited {code}; {drive}: free {n} GB` (`(no exit code)` when there is none) is Information on exit 0 and Warning otherwise.
 
   The step logs `event source gate-prune: already registered` or `registered in the Application log`, and `task \build-box\gate-prune-work registered: ...`, adding that the task `will fail until a gate push installs C:\Program Files\gate\bin\gate.exe` when that exe is not there yet.

@@ -2401,7 +2401,11 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     The project files are every `*.csproj` the snapshot holds, at any depth and in any ASCII letter case: at most 64 files of at most 256 KiB each, read with at most two git calls, the sizes first and then one bounded batch read. A file that cannot be read says `gate: cannot read the Godot pin of <file>: <why>; not checking it` and gives no pin; files past the 64th say `gate: <n> more project files not read for a Godot pin; not checking them`.
 
     `global.json` stays the SDK pin, read by `parity.rs` as above.
-  - **Push.** `git push --no-verify --no-recurse-submodules --progress [--receive-pack=…] -- <host>:<builder root>/<repo>.git +<snapshot>:refs/gate/<key> [+<bridge>:refs/gate-bridge/<key>]`, with `GIT_SSH_COMMAND` carrying the ssh options. Success says `gate: pushed snapshot <8 hex> in <s> s (<size>|up to date)` and moves the builder's local snapshot ref (`refs/gate-remote/<key>` for `host`, `refs/gate-remote/<id>/<key>` for a builder with an id).
+  - **Push.** `git push --no-verify --no-recurse-submodules --progress [--receive-pack=…] -- <host>:<builder root>/<repo>.git +<snapshot>:refs/gate/<key> [+<bridge>:refs/gate-bridge/<key>]`, with `GIT_SSH_COMMAND` carrying the ssh options.
+
+    A Windows builder's `--receive-pack` is `pwsh -NoProfile -NonInteractive -Command $env:GIT_CONFIG_COUNT='1'; $env:GIT_CONFIG_KEY_0='receive.autogc'; $env:GIT_CONFIG_VALUE_0='false'; git-receive-pack '<path>'`, so a push never starts a gc on the builder.
+
+    Success says `gate: pushed snapshot <8 hex> in <s> s (<size>|up to date)` and moves the builder's local snapshot ref (`refs/gate-remote/<key>` for `host`, `refs/gate-remote/<id>/<key>` for a builder with an id).
 
     The builder keeps one bare repo per repo name, `<builder root>/<repo>.git`, shared by every key of that repo; the key is only the ref's name.
 
@@ -3025,7 +3029,9 @@ A `run` payload also holds `Command` (or, for a warm-up, `WarmCommands` and `War
 
 `drain` reads `Root` and `Action` (`raise`, `status` or `lift`).
 
-The optional `Session` (1 to 64 ASCII letters, digits, `_` and `-`: the run's drain session id; absent or null for a PC older than the drain) and `NoTicket` (true or false, false when absent: a refused call takes no place in the drain's line) are parsed by `gate_wire::Payload` for the drain's admission; no routed verb reads them yet.
+The optional `Session` (1 to 64 ASCII letters, digits, `_` and `-`: the run's drain session id; absent or null for a PC older than the drain) and `NoTicket` (true or false, false when absent: a refused call takes no place in the drain's line) are parsed by `gate_wire::Payload` for the drain's admission, which `preflight`, `run`, `inputs` and `lfs` read.
+
+The optional `Pc` and `Repo` (texts, null or absent for an older PC; else `gate: box payload Pc is not a text` or `gate: box payload Repo is not a text` and exit 2) are what the admitted session's record keeps.
 
 `inputs` and `lfs` read `Key`, `Bare`, `Work`, `Lock`, `Nonce` and `Step`, and `inputs` the optional `SentBin`.
 
@@ -3691,7 +3697,9 @@ Built verbs:
 
   Processes still alive 10 s after the termination print `gate: remote job <name> still has <n> process(es) 10 s after it was terminated` and exit 1, and a job that cannot be terminated prints `gate: remote could not stop job <name>: <error>` and exits 1.
 
-- **`outputs`** sends the archive the payload's `Name` names in its `OutputFolder` raw on stdout, then removes it. It takes no work-folder lock, so it never waits on a run.
+- **`outputs`** sends the archive the payload's `Name` names in its `OutputFolder` raw on stdout, then removes it. It takes no work-folder lock, so it never waits on a run, and the drain never refuses it.
+
+  It renews a live drain session. For a session that is dead or missing under a standing barrier it still sends the archive and keeps it, saying `gate: remote outputs kept: the builder is drained` on stderr; a drain error also sends and keeps it.
 
   A payload without `Name`, `Work` or `OutputFolder`, or with a `Work` or `OutputFolder` that is not the work folder's own, exits 2.
 
@@ -3823,9 +3831,19 @@ Built verbs:
 
   The age form deletes no ref: a worktree still alive may have pushed `refs/gate/{key}` just before the lock was taken, and deleting it would fail that run's fetch. Only the keyed form deletes refs, below.
 
+  Under a standing drain barrier ([`drain`](#the-box-side), below) the age form touches nothing and says `gate: remote prune skipped: the builder is drained` on stdout, exit 0. A barrier that cannot be read is `gate: remote prune failed: {why}` on stderr and exit 1. The barrier read is read only: the prune takes no drain lock, and a `drain` entry that is a link, junction or file reads as no barrier.
+
+  **The gc.** After the sweep, once the root passes `check_work_root` (checked only when the root holds a `*.git` name; a refusal says `gate: remote prune gc failed: {root}: {why}`), the age form runs `git --git-dir={root}\{name} -c gc.autoDetach=false gc --auto` in each whole bare under the root, in name order, one at a time.
+
+  Each run is in a kill-on-close job with a 30-minute bound, and the barrier is read before each bare: a standing one ends the loop with `gate: remote prune gc stopped: the builder is drained`.
+
+  A bare whose gc fails says `gate: remote prune gc failed: {bare}: {why}` on stdout and the exit does not change; a gone client ends the loop. The step is named `gc` for `--test-box-git-limit`. This is the cleanup a push no longer starts: a push to a Windows builder runs `git-receive-pack` with `receive.autogc` off (Push, in the remote client's section).
+
   **The keyed form** takes 1 to 50 key words, each `[A-Za-z0-9_-]+` and not starting with `-`; any other shape is the box usage (status 2), and a repeated key, in any letter case, is pruned once under its first spelling. A word that is no key, past the parse, prints `gate: box prune --keys holds a word that is not a key: "<word>"` and exits 2 before anything is opened. It judges no age and touches no key it is not given. Each key's lock is still taken without waiting, so a held lock keeps the key. A link or junction work folder is refused, a key with no folder has its records and refs removed, and a missing `work` folder is made, as a run makes it.
 
   It judges no age and touches no key it is not given. Each key's lock is still taken without waiting, so a held lock keeps the key. A link or junction work folder is refused, a key with no folder has its records and refs removed, and a missing `work` folder is made, as a run makes it.
+
+  The barrier is read before the sweep and again before each key: under a standing one each remaining key says `gate: remote kept {key}: the builder is drained` on stdout, and an unreadable barrier is `gate: remote prune failed: {why}` on stderr and exit 1.
 
   For each key whose folder it set aside or found absent, still under the lock, it runs one `git update-ref --no-deref --stdin` in each bare repository `{root}\*.git`, deleting `refs/gate/{key}`, `refs/gate-bridge/{key}` and `refs/gate-back/{key}` themselves, never what a symbolic one points to.
 
@@ -3839,7 +3857,7 @@ Built verbs:
 
   It prints `gate: remote pruned {key} (worktree gone)` and `gate: remote kept {key}: in use` on stdout, and `gate: remote could not prune {key}: {why}` on stderr (reasons include `its work folder is not a plain folder`, `its refs could not be removed: {the first failure's reason}`, and `the root's drive is not there`, said for every key when the root's drive is absent; a missing root on a present drive holds nothing and answers `pruned`). A lock that cannot be opened, other than one held, and a record left after the rename are each the key's single could-not line, with no `pruned` line. Every key gets exactly one line. It prints no summary line, and exits 1 when any key got a could-not line, else 0.
 
-- **`drain`** (`boxside/drain.rs`) is the builder drain's barrier, from `gate box drain --stdin` with the payload `{"Root","Action"}`, `Action` being `raise`, `status` or `lift`. It answers each call once and exits; a missing `Root` or an `Action` that is none of the three is the usage line and exit 2. No routed verb passes the drain yet, so a raised barrier stops nothing.
+- **`drain`** (`boxside/drain.rs`) is the builder drain's barrier, from `gate box drain --stdin` with the payload `{"Root","Action"}`, `Action` being `raise`, `status` or `lift`. It answers each call once and exits; a missing `Root` or an `Action` that is none of the three is the usage line and exit 2. `preflight`, `run`, `inputs` and `lfs` pass the drain's admission (below), so a standing barrier refuses their new runs.
 
   Everything lives under `{Root}\drain\`, which the box makes with a High integrity label and no write-up, so a routed command at medium integrity cannot delete the barrier or its own session. A `drain` that is not that folder (a link, a junction, a file, or a folder of other security) is renamed aside as itself and never followed, and the call says `gate: drain moved aside {path} to drain.gate-moved-{n}: it was not the box's protected folder`.
 
@@ -3861,9 +3879,17 @@ Built verbs:
 
   The exit status is 0 once it answered, 1 after `gate: drain failed: {why}`, 2 on usage. The test seams `--test-box-drain-lease-ms <n>` (the 120 s lease), `--test-box-drain-lapse-ms <n>` (the 30 minute lapse), `--test-box-now <unix s>` (the time the drain judges at) and `--test-box-drain-readable-only true|false` (count only processes whose command line it reads) go before the verb.
 
-  `admit` in the same module is the one admission function the routed verbs will pass: in one hold of the lock it admits a call or refuses it, a refusal being the `Refused` place in line with the barrier's raise and lapse times.
+  `admit` in the same module is the one admission function the routed verbs pass: in one hold of the lock it admits a call or refuses it, a refusal being the `Refused` place in line with the barrier's raise and lapse times.
 
-  It writes the session record and takes the holder on admission, and takes or renews the ticket on a refusal unless `NoTicket`. The refusal tag word `drain` (`gate_wire::Refusal::Drain`, `gate-remote-refused: {nonce} drain`) is for that refusal; nothing emits it yet and the client does not read it.
+  It writes the session record and takes the holder on admission, and takes or renews the ticket on a refusal unless `NoTicket`. The refusal tag word `drain` (`gate_wire::Refusal::Drain`, `gate-remote-refused: {nonce} drain`) is for that refusal; the client does not read it yet.
+
+  **The gated verbs.** `preflight`, `run`, `inputs` and `lfs` pass `admit` after the work root is held and before their work, with the payload's `Session`, `NoTicket`, `Pc` and `Repo` and the command and job they record. A call with no `Session` on a root with no `drain\` folder makes nothing and goes on.
+
+  An admitted call writes `sessions\{session}` (`Pc`; `Repo` capped at 100 characters; `Command` capped at 300; `Job`; `Called`) and holds `sessions\{session}.{pid}` while it runs. At its end it stamps `Called` with its end time, taking the drain lock if it is free, so a session's 120 s lease runs from the end of its last call. A call passing an empty command or job keeps the recorded ones. `run` records its job and its commands (a warm-up's joined by ` && `).
+
+  A refused `preflight` says `gate: remote version {v}` on stdout, then on stderr and unstamped: `gate-remote-refused: {nonce} drain` (when the payload has a `Nonce`), `gate: drain place {n}` or `gate: drain place none`, and `gate: drain barrier {raised} {lapses}` or `gate: drain barrier none`, and exits 75. Unless `NoTicket`, it leaves a ticket `drain\tickets\{seq:08}-{session}`.
+
+  A refused `run`, `inputs` or `lfs` says the same stderr lines, leaves no ticket and exits 75; `inputs` refuses before it reads its stdin manifest, and `lfs` is tagged `drain`, not `lfs`. A drain error from any gated verb is `gate: drain failed: {why}` on stderr and exit 1 (a preflight says its version line first, and a sibling pair's `run` also says `gate: remote back commits: failed`).
 
 **The outputs module** (GATE-44) is shared by both ends, this exe, in `crates/gate/src/outputs/`. The box's `run` packs with it and the box's `outputs` verb sends the archive. The PC's manifest, the pending marker, the reading of the box's `gate-remote-outputs: ` line, the fetch of the archive and its install are built in the Rust remote client ([The remote client's run](#routing)).
 

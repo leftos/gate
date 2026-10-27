@@ -61,7 +61,9 @@ This pass was run before GATE-562's brief. Where it differs from the sections be
   - The drained test never opens a `{key}.lock`.
   - The drain verb holds the root as the preflight does: read access and `Share::NoDelete`, never DELETE. That keeps it clear of `check_work_root`'s busy test (`gate-win32` `trust.rs:410-414`).
 - **J9 A prune counts for its whole life.** The drained test counts a live process whose command line holds `box prune --root {this root}`, with case and separators folded. Prune registers no session: that would make `drain\` writable at medium integrity, which J7 forbids.
-- **J10 git pack processes count.** The drained test also counts each process whose command line names the root (`/` and `\` folded, matched on a path boundary), and every descendant of such a process (`proc-table` `lib.rs:114`). A git, gate or pwsh image whose command line cannot be read counts as a match, so the test fails closed. The Windows bares' `receive.autogc` is turned off in the receive-pack command (`remote/transport.rs:21`), so maintenance never detaches past a drain. The cleanup it did moves to the scheduled age prune: after its sweep, the prune runs `git gc --auto` in each bare under the root (`{root}\*.git`), one at a time, in a kill-on-close job, under the prune's own 2 h limit. The prune reads the barrier first (J3) and counts as a prune process while it runs (J9), so a drain waits for it and it never starts under a standing barrier. A bare's gc that fails says so in the prune's log line and does not stop the sweep.
+- **J10 git pack processes count.** The drained test also counts each process whose command line names the root (`/` and `\` folded, matched on a path boundary), and every descendant of such a process (`proc-table` `lib.rs:114`). A git, gate or pwsh image whose command line cannot be read counts as a match, so the test fails closed. The Windows bares' `receive.autogc` is turned off in the receive-pack command (`remote/transport.rs:21`), so maintenance never detaches past a drain.
+
+  The cleanup it did moves to the scheduled age prune: after its sweep, the prune runs `git gc --auto` in each bare under the root (`{root}\*.git`), one at a time, in a kill-on-close job, each with a 30-minute bound. The prune reads the barrier first (J3) and counts as a prune process while it runs (J9), so a drain waits for it and it never starts under a standing barrier. A bare's gc that fails says so on the prune's stdout and changes neither the exit nor the other bares' gc.
 - **Still a hole, booked apart:** the push is not gated (see "Not in this item"). A PC whose session lapsed between its preflight and its push can push after "drained", and a pack process watch only narrows that window.
 - **`inflight` stays as it is.** `gate box drain`'s status is the listing. `inflight` has no caller on the PC.
 
@@ -73,7 +75,11 @@ This pass was run before GATE-562's brief. Where it differs from the sections be
 - `tickets\{seq}-{session}`: one per waiting run, with its last poll time.
 - `sessions\{session}`: one per admitted run, with its phase, last call time, PC host name, repo, command text (escaped, capped at 300 characters) and job name.
 
-Built (GATE-562 part A): `crates/gate/src/boxside/drain.rs` holds `drain\` and its `lock`, `barrier`, `lapsed`, `lifted`, `tickets` and `sessions` files, the `gate box drain` verb and the shared `admit` function. No verb calls `admit` yet, and the refusal tag `drain` is emitted by nothing; the gated verbs are part B.
+Built (GATE-562 part A): `crates/gate/src/boxside/drain.rs` holds `drain\` and its `lock`, `barrier`, `lapsed`, `lifted`, `tickets` and `sessions` files, the `gate box drain` verb and the shared `admit` function.
+
+Built (GATE-562 part B): `preflight`, `run`, `inputs` and `lfs` call `admit` after the root is held, and a refusal says the tag `drain` with the place and barrier lines and exits 75 (the client does not read it yet). A call writes and holds its session and stamps `Called` at its end, so the lease runs from the last call's end. `outputs` is never refused and renews a live session, and for a dead one under a barrier it sends the archive and keeps it.
+
+`gate box prune` reads the barrier (read only) and prunes nothing under it, and after an age sweep runs `git gc --auto` in each bare under the root, one at a time, each with a 30-minute bound, the barrier read before each. A push to a Windows builder runs `git-receive-pack` with `receive.autogc` off.
 
 A Windows mutex is rejected: its waiters are not FIFO, a `Global\` name can be squatted, and the `gate\` private namespace needs elevation.
 
