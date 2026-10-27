@@ -3251,28 +3251,34 @@ mod tests {
         assert_eq!(fs::read(outside.join("kept.txt")).expect("the outside file is read"), b"kept\n");
     }
 
-    /// Runs `hdiutil` with `args`; whether it exited 0.
+    /// Runs `hdiutil` with `args`; whether it exited 0, and what it said: its exit status, standard output and error.
     #[cfg(target_os = "macos")]
     #[expect(clippy::disallowed_methods, reason = "the spawn lock is the Windows gate's; this sets a case's volume up")]
-    fn hdiutil(args: &[&str]) -> bool {
-        Command::new("hdiutil")
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .status()
-            .expect("hdiutil starts")
-            .success()
+    fn hdiutil(args: &[&str]) -> (bool, String) {
+        let ran = Command::new("hdiutil").args(args).stdin(Stdio::null()).output().expect("hdiutil starts");
+        let said = format!(
+            "hdiutil {args:?} {}; stdout {:?}; stderr {:?}",
+            ran.status,
+            String::from_utf8_lossy(&ran.stdout),
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        (ran.status.success(), said)
     }
 
-    /// A volume attached at a mount point, detached when the case ends.
+    /// A volume attached at `mount` from the disk image `image`; detached and its image removed when the case ends.
     #[cfg(target_os = "macos")]
-    struct Attached(String);
+    struct Attached {
+        mount: String,
+        image: String,
+    }
 
     #[cfg(target_os = "macos")]
     impl Drop for Attached {
         fn drop(&mut self) {
-            // Best effort: a volume left attached shows in `hdiutil info`, named for this process's case.
-            let _ = hdiutil(&["detach", "-force", &self.0]);
+            // Best effort: a volume left attached shows in `hdiutil info`, and an image left behind sits in this
+            // process's case folder, both named for this process's case.
+            let _ = hdiutil(&["detach", "-force", &self.mount]);
+            let _ = fs::remove_file(&self.image);
         }
     }
 
@@ -3287,23 +3293,23 @@ mod tests {
             fs::create_dir_all(&mount).expect("the mount point is made");
             let image = case.base.with_file_name("volume.dmg");
             let image = image.to_str().expect("the temp folder is UTF-8");
-            assert!(
-                hdiutil(&["create", "-quiet", "-size", "1m", "-fs", "HFS+", "-volname", "gate-clear", image]),
-                "the image is made"
-            );
-            assert!(
-                hdiutil(&["attach", "-quiet", "-nobrowse", "-mountpoint", &mount, image]),
-                "the image is attached"
-            );
-            let _attached = Attached(mount.clone());
+            let volume = format!("gate-clear-{}-{child}", std::process::id());
+            let (made, said) = hdiutil(&["create", "-quiet", "-size", "1m", "-fs", "HFS+", "-volname", &volume, image]);
+            assert!(made, "the image is made: {said}");
+            let (attached, said) = hdiutil(&["attach", "-quiet", "-nobrowse", "-mountpoint", &mount, image]);
+            assert!(attached, "the image is attached: {said}");
+            let _attached = Attached {
+                mount: mount.clone(),
+                image: image.to_owned(),
+            };
             fs::write(format!("{mount}/kept.txt"), "kept\n").expect("a file on the volume is written");
 
             let why = refusal_of(work_cleared(Path::new(&work)));
-            assert_eq!(why, format!("cannot remove {work}/{child}: {ANOTHER_VOLUME}"), "{at}");
+            assert_eq!(why, format!("cannot remove {work}/{child}: {ANOTHER_VOLUME}"), "{at}; attached by {said}");
             assert_eq!(
                 fs::read(format!("{mount}/kept.txt")).expect("the volume's file is read"),
                 b"kept\n",
-                "{at}"
+                "{at}; attached by {said}"
             );
         }
     }
