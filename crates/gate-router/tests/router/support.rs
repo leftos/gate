@@ -4,7 +4,9 @@ use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 
 use gate_router::windows::WindowsChange;
-use gate_router::{CarriedSibling, Config, ConfigProblem, Facts, FolderId, Inputs, Pattern, Place, SiblingFolder, SiblingRoot, Slot, Target};
+use gate_router::{
+    CarriedSibling, Config, ConfigProblem, Facts, FolderId, GitignoredInput, Inputs, Pattern, Place, SiblingFolder, SiblingRoot, Slot, Target,
+};
 
 /// The worktree root the fixtures use.
 pub const ROOT: &str = "X:/dev/yaat.wt/a";
@@ -125,8 +127,9 @@ pub struct FakeFacts {
     pub windows_change: WindowsChange,
     /// How many times that was asked, kept apart from [`FakeFacts::asked`].
     pub windows_change_asked: Cell<u32>,
-    /// The paths, `/`-separated from the root, that name a gitignored project input the snapshot leaves out.
-    pub gitignored: Vec<String>,
+    /// The paths, `/`-separated from the root, that name a gitignored project input the snapshot leaves out, each with
+    /// the files that carry it.
+    pub gitignored: Vec<GitignoredInput>,
     /// Each gitignored-inputs question, its paths then `|` and the input globs, kept apart from [`FakeFacts::asked`].
     pub gitignored_asked: RefCell<Vec<String>>,
 }
@@ -279,12 +282,15 @@ impl Facts for FakeFacts {
         paths.iter().filter(|path| carried(path)).cloned().collect()
     }
 
-    /// Each path asked that is in [`FakeFacts::gitignored`].
-    fn gitignored_inputs(&self, _place: &Place, paths: &[String], inputs: &[String]) -> Vec<String> {
+    /// Each input of [`FakeFacts::gitignored`] whose path was asked, in the order asked.
+    fn gitignored_inputs(&self, _place: &Place, paths: &[String], inputs: &[String]) -> Vec<GitignoredInput> {
         self.gitignored_asked
             .borrow_mut()
             .push(format!("{} | {}", paths.join(" "), inputs.join(" ")));
-        paths.iter().filter(|path| self.gitignored.contains(path)).cloned().collect()
+        paths
+            .iter()
+            .filter_map(|path| self.gitignored.iter().find(|input| input.path == *path).cloned())
+            .collect()
     }
 
     fn subst_target(&self, letter: char) -> Option<String> {

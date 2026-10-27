@@ -1415,7 +1415,7 @@ impl Attempt<'_, '_> {
         self.release_run()?;
         // After the push, so a route refused before it sends no input, and before the marker, so one the inputs refuse
         // leaves none.
-        self.sent_contents(&location, &nonce, inputs.as_ref(), lfs.as_ref())?;
+        let inputs_landed = self.sent_contents(&location, &nonce, inputs.as_ref(), lfs.as_ref())?;
         let (sent_digest, withheld) = self
             .sent_build(&location, &mut sent)?
             .map_or((None, None), |landed| (Some(landed.digest), landed.withheld));
@@ -1439,7 +1439,7 @@ impl Attempt<'_, '_> {
             timeout: raised.unwrap_or(self.call.timeout),
             host: self.call.host(),
             sibling_snapshots: &sibling_snapshots,
-            inputs_digest: inputs.as_ref().map(|built| built.digest.as_str()),
+            inputs_digest: inputs.as_ref().filter(|_| inputs_landed).map(|built| built.digest.as_str()),
             lfs_digest: lfs.as_ref().map(|sending| sending.digest.as_str()),
             sent_digest: sent_digest.as_deref(),
             env: self.call.env,
@@ -1507,15 +1507,17 @@ impl Attempt<'_, '_> {
     }
 
     /// The run's inputs `inputs` and its LFS content `lfs` sent to `location` for the run of `nonce`, each when the run
-    /// has some ([`inputs::send`], [`lfs::send`]), the inputs first; else the end a send ended the attempt on.
-    fn sent_contents(&mut self, location: &Location, nonce: &str, inputs: Option<&inputs::Built>, lfs: Option<&lfs::Sending>) -> Result<(), End> {
-        if let Some(built) = inputs {
-            inputs::send(self, location, nonce, built)?;
-        }
+    /// has some ([`inputs::send`], [`lfs::send`]), the inputs first: whether the inputs landed, so the run call carries
+    /// their digest, which a run with none never does; else the end a send ended the attempt on.
+    fn sent_contents(&mut self, location: &Location, nonce: &str, inputs: Option<&inputs::Built>, lfs: Option<&lfs::Sending>) -> Result<bool, End> {
+        let landed = match inputs {
+            Some(built) => inputs::send(self, location, nonce, built)?,
+            None => false,
+        };
         if let Some(sending) = lfs {
             lfs::send(self, location, nonce, sending)?;
         }
-        Ok(())
+        Ok(landed)
     }
 
     /// The send of the PC's build the route plans ([`inputs::sent_build`]), after the inputs and the LFS content. Once it

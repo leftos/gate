@@ -15,7 +15,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use gate_router::escaped;
+use gate_router::{CARRIED_INPUT, escaped};
 use gate_state::{FallbackReason, v1};
 use gate_win32::Interrupt;
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_DELETE_ON_CLOSE, FILE_SHARE_READ};
@@ -37,7 +37,7 @@ pub(super) const MEMBERS: usize = 50_000;
 /// The paths inputs never carry, whatever the globs: anything under a `.git` folder, a `.env.<name>` file, a `.env` or
 /// `*.env` file, and a `.envrc` file. Matched without regard to case; the gate's own files are added per run
 /// ([`exclusions`]).
-const EXCLUDED: &str = r"(^|/)\.git/|(^|/)\.env\.[^/]*$|\.env$|(^|/)\.envrc$";
+pub(crate) const EXCLUDED: &str = r"(^|/)\.git/|(^|/)\.env\.[^/]*$|\.env$|(^|/)\.envrc$";
 /// The worktree's folder the inputs' diff answer and archive are made in, held from before the diff until the put ends.
 pub(super) const TMP: &str = ".tmp";
 /// `GENERIC_READ`, which lives in `Win32_Foundation`, a feature this crate does not enable: the access the diff answer
@@ -75,15 +75,27 @@ pub(super) struct Asked<'a> {
 }
 
 /// A run's inputs manifest as built: its line, newline included, the SHA-256 of that line without its newline (the
-/// run call's `InputsDigest`), the manifest it holds, the files it names as the walk found them, and the log-only lines
+/// run call's `InputsDigest`), the manifest it holds, the files it names as the walk found them, the log-only lines
 /// the build said: each glob that matched nothing, each folder that is another repository and each match that is in
-/// the snapshot.
+/// the snapshot, and what its landing does with the work folder's carried marker.
 pub(super) struct Built {
     pub(super) line: String,
     pub(super) digest: String,
     pub(super) manifest: Manifest,
     pub(super) found: Vec<Found>,
     pub(super) said: Vec<String>,
+    pub(super) marking: Marking,
+}
+
+/// What a landed inputs step does with its work folder's carried marker ([`v1::inputs_carried_path`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Marking {
+    /// Nothing: the step carried no path a command named.
+    Leave,
+    /// Writes the marker: the step carried a path a command named.
+    Write,
+    /// Removes the marker and the inputs hash cache: the step was the empty manifest that removed the carried copies.
+    Clear,
 }
 
 /// The inputs manifest `asked` names: the matched files git reports ignored, outside any folder holding a `.git` of its
@@ -93,9 +105,27 @@ pub(super) struct Built {
 /// interrupted; else why the globs, the walk, git or a file failed, or why the set is not sent.
 pub(super) fn built(asked: &Asked<'_>, go_on: impl Fn() -> bool) -> Result<Built, Unbuilt> {
     let excluded = exclusions(asked.root, asked.key, asked.log);
-    let globs = Globs::inputs(asked.globs, &excluded).map_err(Unbuilt::Failed)?;
+    let own = regex::Regex::new(&excluded).map_err(|error| Unbuilt::Failed(error.to_string()))?;
+    // A carried path the exclusions match, such as the run's own log, is neither sent nor reported missing.
+    let asked_globs: Vec<String> = asked
+        .globs
+        .iter()
+        .filter(|glob| glob.strip_prefix(CARRIED_INPUT).is_none_or(|path| !own.is_match(path)))
+        .cloned()
+        .collect();
+    let matched: Vec<String> = asked_globs
+        .iter()
+        .map(|glob| glob.strip_prefix(CARRIED_INPUT).unwrap_or(glob).to_owned())
+        .collect();
+    let globs = Globs::inputs(&matched, &excluded).map_err(Unbuilt::Failed)?;
     let found = walk(asked.root, &globs).map_err(|error| Unbuilt::Failed(error.to_string()))?;
-    let mut said = unmatched(asked.globs, &globs, &found);
+    if let Some(path) = unsent_carried(&asked_globs, &found) {
+        return Err(Unbuilt::Failed(format!(
+            "{} was named by the command but could not be sent",
+            escaped(path)
+        )));
+    }
+    let mut said = unmatched(&asked_globs, &globs, &found);
     let (found, nested) = outside_nested(asked.root, found);
     said.extend(
         nested
@@ -122,12 +152,18 @@ pub(super) fn built(asked: &Asked<'_>, go_on: impl Fn() -> bool) -> Result<Built
         return Err(Unbuilt::Failed(PAST_THE_CAP.to_owned()));
     }
     let (digest, _) = sha256_of(line.trim_end_matches('\n').as_bytes()).map_err(|error| Unbuilt::Failed(error.to_string()))?;
+    let marking = if asked_globs.iter().any(|glob| glob.starts_with(CARRIED_INPUT)) {
+        Marking::Write
+    } else {
+        Marking::Leave
+    };
     Ok(Built {
         line,
         digest,
         manifest,
         found: kept,
         said,
+        marking,
     })
 }
 
@@ -178,7 +214,7 @@ fn exclusions(root: &Path, key: &str, log: &Path) -> String {
 /// The file `path` as a `/`-separated path relative to `root`, compared without regard to case, both as the system
 /// resolves them: the root's canonical path, and the file's folder's canonical path with its name. `None` when it is
 /// not below the root, or when either cannot be resolved: a file whose folder cannot be resolved is none a walk finds.
-fn relative(root: &Path, path: &Path) -> Option<String> {
+pub(crate) fn relative(root: &Path, path: &Path) -> Option<String> {
     let spelled = |path: &Path| path.to_string_lossy().replace('\\', "/");
     let path = std::path::absolute(path).ok()?;
     let folder = fs::canonicalize(path.parent()?).ok()?;
@@ -189,11 +225,22 @@ fn relative(root: &Path, path: &Path) -> Option<String> {
     (head.eq_ignore_ascii_case(root) && !rest.is_empty()).then(|| rest.to_owned())
 }
 
-/// The line of each of the input globs `asked` that matches none of `found`, matched by `globs`, built from them.
+/// The first exact path of `asked` that a command carries ([`CARRIED_INPUT`]) that the walk's `found` does not hold,
+/// compared without regard to ASCII letter case: one gone since the decision, or one the exclusions drop.
+fn unsent_carried<'a>(asked: &'a [String], found: &[Found]) -> Option<&'a str> {
+    asked
+        .iter()
+        .filter_map(|glob| glob.strip_prefix(CARRIED_INPUT))
+        .find(|path| !found.iter().any(|file| file.path.eq_ignore_ascii_case(path)))
+}
+
+/// The line of each of the repo's input globs among `asked` that matches none of `found`, matched by `globs`, built
+/// from them; an exact path a command carries ([`CARRIED_INPUT`]) is never one.
 fn unmatched(asked: &[String], globs: &Globs, found: &[Found]) -> Vec<String> {
     asked
         .iter()
         .enumerate()
+        .filter(|(_, glob)| !glob.starts_with(CARRIED_INPUT))
         .filter(|(index, _)| !found.iter().any(|file| globs.matched_by(*index, &file.path)))
         .map(|(_, glob)| format!("gate: inputs: {} matched nothing", escaped(glob)))
         .collect()
@@ -219,7 +266,7 @@ fn outside_nested(root: &Path, found: Vec<Found>) -> (Vec<Found>, Vec<String>) {
 /// The outermost folder of the `/`-separated `path` below `root` that holds a `.git` entry, each folder looked at once
 /// and its answer kept in `known`. A `.git` whose entry cannot be read counts as none: git is asked about the path, and
 /// says why it cannot answer.
-fn nested_folder(root: &Path, path: &str, known: &mut HashMap<String, bool>) -> Option<String> {
+pub(crate) fn nested_folder(root: &Path, path: &str, known: &mut HashMap<String, bool>) -> Option<String> {
     for (end, _) in path.match_indices('/') {
         let folder = path.get(..end)?;
         let holds = *known
@@ -296,12 +343,14 @@ pub(super) fn run_refused(attempt: &mut Attempt<'_, '_>) -> End {
     refused(attempt, NOT_HELD)
 }
 
-/// The inputs manifest of `attempt`'s run, its lines logged; `None` for a run with no input globs. A pair's run, and
-/// a manifest that cannot be built or is past a cap, refuse the route `inputs` before anything is sent.
+/// The inputs manifest of `attempt`'s run, its lines logged. A run with no input globs sends the empty manifest when
+/// an earlier run's carried copies are to be removed ([`emptied`]), else none, as a pair's run with none does. A pair's
+/// run with input globs, and a manifest that cannot be built or is past a cap, refuse the route `inputs` before
+/// anything is sent.
 pub(super) fn sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> {
     let call = attempt.call;
     if call.inputs.is_empty() {
-        return Ok(None);
+        return if call.siblings.is_empty() { emptied(attempt) } else { Ok(None) };
     }
     if !call.siblings.is_empty() {
         return Err(refused(attempt, PAIR));
@@ -329,10 +378,79 @@ pub(super) fn sent(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> 
     }
 }
 
+/// The empty inputs manifest of a run with no inputs whose work folder holds copies a command's carried paths put, its
+/// carried marker there ([`v1::inputs_carried_path`]): the box's diff, needing nothing, deletes those copies, and
+/// [`send`] removes the marker once it landed. `None` when there is no marker. A digest that cannot be made refuses the
+/// route `inputs`.
+fn emptied(attempt: &mut Attempt<'_, '_>) -> Result<Option<Built>, End> {
+    let call = attempt.call;
+    if !v1::inputs_carried_path(call.state_dir, call.builder.id.as_deref(), call.key).exists() {
+        return Ok(None);
+    }
+    let manifest = Manifest::default();
+    let line = manifest.line();
+    match sha256_of(line.trim_end_matches('\n').as_bytes()) {
+        Ok((digest, _)) => Ok(Some(Built {
+            line,
+            digest,
+            manifest,
+            found: Vec::new(),
+            said: Vec::new(),
+            marking: Marking::Clear,
+        })),
+        Err(error) => Err(refused(attempt, &error.to_string())),
+    }
+}
+
+/// The log line of a run whose empty manifest removed the copies an earlier run carried.
+const REMOVED: &str = "gate: inputs: removed the carried copies of an earlier run";
+
+/// Does what the landed inputs step's `marking` says with `attempt`'s work folder's carried marker: writes it, empty,
+/// its folder made; or removes it and the inputs hash cache, so the next run with no inputs sends none, and says
+/// [`REMOVED`]. A marker that cannot be written, or a file that cannot be removed, is said in the log: a later run
+/// then sends the empty manifest once fewer, or once more.
+fn landed(attempt: &mut Attempt<'_, '_>, marking: Marking) {
+    let call = attempt.call;
+    let marker = v1::inputs_carried_path(call.state_dir, call.builder.id.as_deref(), call.key);
+    match marking {
+        Marking::Leave => {}
+        Marking::Write => {
+            let written = marker.parent().map_or(Ok(()), fs::create_dir_all).and_then(|()| fs::write(&marker, ""));
+            if let Err(error) = written {
+                attempt.logged(&format!("gate: inputs: cannot write the carried marker {}: {error}", marker.display()));
+            }
+        }
+        Marking::Clear => {
+            let cache = v1::inputs_hashes_path(call.state_dir, call.builder.id.as_deref(), call.key);
+            for path in [cache, marker] {
+                match fs::remove_file(&path) {
+                    Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                        attempt.logged(&format!("gate: inputs: cannot remove {}: {error}", path.display()));
+                    }
+                    _ => {}
+                }
+            }
+            attempt.logged(REMOVED);
+        }
+    }
+}
+
+/// Why the inputs call ended `unsent`, as the log says it.
+fn unsent_why(unsent: &Unsent) -> String {
+    match unsent {
+        Unsent::Ended(End::Failed(why)) | Unsent::Refused(why) => why.clone(),
+        Unsent::Ended(End::Refused(reason)) => format!("the inputs call ended {}", reason.as_str()),
+        Unsent::Ended(other) => format!("the inputs call ended {}", unexpected(other)),
+    }
+}
+
 /// Sends `built` to the work folder at `location` for the run of `nonce`: the diff call, then, when the box needs any
-/// file, the put of an archive of exactly those, timed in the run's split. A Ctrl+C ends the run; any other failure of
-/// either call refuses the route `inputs`, its reason in the log. An end no inputs call returns fails the run.
-pub(super) fn send(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, built: &Built) -> Result<(), End> {
+/// file, the put of an archive of exactly those, timed in the run's split; once it landed, the carried marker is kept
+/// as `built` says ([`landed`]). Whether it landed, so the run call carries its digest. A Ctrl+C ends the run. Any other
+/// failure of the empty manifest that removes carried copies ([`Marking::Clear`]) is said in the log and the run goes
+/// on without it, its marker kept for a later run; of any other manifest, it refuses the route `inputs`, its reason in
+/// the log. An end no inputs call returns fails the run.
+pub(super) fn send(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &str, built: &Built) -> Result<bool, End> {
     let started = Instant::now();
     let request = Request {
         location,
@@ -342,8 +460,16 @@ pub(super) fn send(attempt: &mut Attempt<'_, '_>, location: &Location, nonce: &s
     let ended = sent_to(attempt, &request, built);
     attempt.split.inputs = Some(started.elapsed());
     match ended {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            landed(attempt, built.marking);
+            Ok(true)
+        }
         Err(Unsent::Ended(End::Interrupted)) => Err(End::Interrupted),
+        Err(unsent) if built.marking == Marking::Clear => {
+            let why = unsent_why(&unsent);
+            attempt.logged(&format!("gate: inputs: the carried copies were not removed: {}", escaped(&why)));
+            Ok(false)
+        }
         Err(Unsent::Ended(End::Failed(why)) | Unsent::Refused(why)) => Err(refused(attempt, &why)),
         // The box refused for its install, its line said: the run falls back for that, not for its inputs.
         Err(Unsent::Ended(End::Refused(FallbackReason::Install))) => Err(End::Refused(FallbackReason::Install)),
@@ -462,6 +588,7 @@ fn build_built(attempt: &mut Attempt<'_, '_>, bin: &str) -> Result<Built, Unbuil
         manifest,
         found,
         said: Vec::new(),
+        marking: Marking::Leave,
     })
 }
 
@@ -590,7 +717,10 @@ fn sent_to(attempt: &mut Attempt<'_, '_>, request: &Request<'_>, built: &Built) 
         .map_err(|error| Unsent::Refused(format!("cannot hold {}: {error}", folder.display())))?;
     let needed = diffed(attempt, request, built)?;
     if needed.is_empty() {
-        attempt.logged(&format!("gate: {}: {} file(s) unchanged", kind.label(), built.manifest.files().count()));
+        // The empty manifest that removes carried copies says so once it landed ([`landed`]).
+        if built.marking != Marking::Clear {
+            attempt.logged(&format!("gate: {}: {} file(s) unchanged", kind.label(), built.manifest.files().count()));
+        }
         return Ok(());
     }
     let bytes = needed.iter().fold(0_u64, |total, file| total.saturating_add(file.stamp.size));
@@ -843,6 +973,7 @@ mod tests {
     use std::process::Command;
     use std::time::{Duration, SystemTime};
 
+    use gate_router::CARRIED_INPUT;
     use serde_json::Value;
 
     use super::{Asked, Built, Caps, End, PAST_THE_CAP, Pack, Unsent, built, installed_all, made_in_tmp, needed, packed, relative};
@@ -940,6 +1071,25 @@ mod tests {
             Err(Unbuilt::Interrupted) => "the build was interrupted".to_owned(),
             Ok(built) => format!("the build passed: {:?}", paths(&built)),
         }
+    }
+
+    #[test]
+    fn a_carried_path_the_exclusions_match_is_neither_sent_nor_missing() {
+        let root = worktree("carried-excluded", "*.log\n*.err\n.tmp/\nprobe/\n");
+        let stage = format!(".tmp/{KEY}-x");
+        let carried = ["probe/P.csproj", "logs/run.log", "logs/run.log.err", stage.as_str()];
+        for path in carried {
+            put(&root, path, "x");
+        }
+        let globs: Vec<String> = carried.iter().map(|path| format!("{CARRIED_INPUT}{path}")).collect();
+
+        let built = build(&root, &globs.iter().map(String::as_str).collect::<Vec<_>>()).map_err(|unbuilt| failure(Err(unbuilt)));
+
+        assert_eq!(
+            built.as_ref().map(paths),
+            Ok::<_, &String>(vec!["probe/P.csproj"]),
+            "neither the log, its .err nor a stage is sent, and none is missing"
+        );
     }
 
     /// Packs every file of `built` in `root` into a new archive in its `.tmp`, the cache at [`cache_of`] forgotten from,

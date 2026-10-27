@@ -39,7 +39,7 @@ mod client;
 pub(crate) use client::KEY_WAIT_SLICE;
 pub(crate) mod git;
 mod held;
-mod inputs;
+pub(crate) mod inputs;
 mod install;
 pub(crate) mod launch;
 pub(crate) mod lfs;

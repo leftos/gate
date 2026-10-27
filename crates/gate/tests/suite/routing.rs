@@ -1776,22 +1776,23 @@ fn run_routed_naming(case: &Case, path: &str) -> (Outcome, bool) {
 }
 
 #[test]
-fn a_command_naming_a_gitignored_project_runs_here_and_says_why() {
+fn a_command_naming_a_gitignored_project_routes_and_the_client_is_called_with_it() {
     let case = routed_case("routing-gitignored-project");
     ignore_and_write(&case, ".tmp/\n", ".tmp/probe/Probe.csproj");
+    fs::write(case.folder().join(".tmp").join("probe").join("Program.cs"), "class P {}\n").expect("the file can be written");
+    let call = case.folder().join("call.json");
+    let steps = shown(&stub(&case, &[&format!("record {}", shown(&call)), "status 0"]));
 
-    let (outcome, called) = run_routed_naming(&case, ".tmp/probe/Probe.csproj");
+    let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\tool.exe", "out", ".tmp/probe/Probe.csproj"])));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert!(!called, "the client never ran: {outcome:?}");
-    assert!(
-        outcome
-            .stderr
-            .contains("gate: not routed: .tmp/probe/Probe.csproj is gitignored, so the snapshot leaves it out\n"),
-        "{outcome:?}"
+    assert!(!outcome.stderr.contains("gitignored"), "{outcome:?}");
+    let call = recorded(&call);
+    assert_eq!(
+        call["inputs"],
+        json!(["[carried].tmp/probe/Probe.csproj", "[carried].tmp/probe/Program.cs"]),
+        "{call}"
     );
-    assert!(outcome.stdout.contains(".tmp/probe/Probe.csproj"), "the command ran here: {outcome:?}");
-    assert_local(&events(&case), Some("gitignored input"));
 }
 
 #[test]
@@ -1822,7 +1823,7 @@ fn a_command_naming_a_tracked_project_still_routes() {
 }
 
 #[test]
-fn a_dotnet_command_naming_a_gitignored_project_folder_runs_here_and_says_why() {
+fn a_dotnet_command_naming_a_gitignored_project_folder_routes_carrying_its_files() {
     let case = routed_case("routing-gitignored-folder");
     copy_tool(&case, "dotnet.exe");
     ignore_and_write(&case, ".tmp/\n", ".tmp/probe/Probe.csproj");
@@ -1831,14 +1832,10 @@ fn a_dotnet_command_naming_a_gitignored_project_folder_runs_here_and_says_why() 
 
     let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &[r".\dotnet.exe", "test", r".tmp\probe"])));
 
-    assert!(!call.exists(), "the client never ran: {outcome:?}");
-    assert!(
-        outcome
-            .stderr
-            .contains("gate: not routed: .tmp\\probe is gitignored, so the snapshot leaves it out\n"),
-        "{outcome:?}"
-    );
-    assert_local(&events(&case), Some("gitignored input"));
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains("gitignored"), "{outcome:?}");
+    let call = recorded(&call);
+    assert_eq!(call["inputs"], json!(["[carried].tmp/probe/Probe.csproj"]), "{call}");
 }
 
 #[test]
@@ -1896,13 +1893,8 @@ fn a_path_git_refuses_hides_no_gitignored_project_beside_it() {
     let outcome = finish(case.gate(&routed_words("out.log", &steps, &[], &command)));
 
     assert_eq!(outcome.code, Some(0), "{outcome:?}");
-    assert!(!call.exists(), "the client never ran: {outcome:?}");
-    assert!(
-        outcome
-            .stderr
-            .contains("gate: not routed: .tmp/probe/Probe.csproj is gitignored, so the snapshot leaves it out\n"),
-        "{outcome:?}"
-    );
+    let recorded = recorded(&call);
+    assert_eq!(recorded["inputs"], json!(["[carried].tmp/probe/Probe.csproj"]), "{recorded}");
     let log = log_texts(&case.folder().join("out.log"));
     assert_eq!(
         log.matches("gate: cannot tell which words are gitignored: ").count(),

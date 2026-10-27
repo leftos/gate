@@ -3,6 +3,7 @@
 //! file, and the lines they say. git runs on the run thread, before any command is started.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
@@ -15,8 +16,8 @@ use gate_args::{GATE_SET_NAMES, RunRequest, Slot, TestSeams, env_refusal};
 use gate_router::warm::FileRead;
 use gate_router::windows::{self, WindowsChange};
 use gate_router::{
-    Config, ConfigProblem, Facts, FolderId, Inputs, LaterCandidate, LocalReason, Pattern, PinRefusal, Place, RemoteRun, Route, SiblingFolder,
-    SiblingRoot, Target, decide, dropped_env, dropped_env_line, escaped, is_input_file, is_project_or_solution, repo_name,
+    Config, ConfigProblem, Facts, FolderId, GitignoredInput, Inputs, LaterCandidate, LocalReason, Pattern, PinRefusal, Place, RemoteRun, Route,
+    SiblingFolder, SiblingRoot, Target, decide, dropped_env, dropped_env_line, escaped, is_input_file, is_project_or_solution, repo_name,
 };
 use gate_win32::Share;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -28,9 +29,12 @@ use crate::console::Console;
 use crate::dotnet_projects;
 use crate::no_build;
 use crate::outputs::glob::Globs;
+use crate::outputs::walk::walk;
+use crate::remote::inputs::{EXCLUDED, nested_folder, relative};
 use crate::remote::{self, git, siblings};
-use crate::resolve::Environment;
+use crate::resolve::{self, Environment};
 use crate::warm;
+use gate_inputs::names::PATH_DEPTH_LIMIT;
 
 /// The `notRouted` value of a heavy gate its caller kept here with `--local`.
 const LOCAL_FLAG: &str = "--local";
@@ -163,7 +167,8 @@ impl Decision {
 /// warm-up is set up, the hash of its warm-up file ([`consented_hash`]).
 pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_parent: bool, console: &mut Console) -> Decided {
     let decision = Decision::of(request, environment, covering_parent);
-    let machine = Machine::new(environment, &request.test_seams);
+    let mut machine = Machine::new(environment, &request.test_seams);
+    machine.run_log = run_log(request);
     let route = match decide(&decision.inputs(slot(request.slot)), &machine) {
         Route::Routed(_) if !decision.unicode => match &decision.pin {
             Some(host) => Route::Refused(PinRefusal::CannotRoute {
@@ -203,6 +208,13 @@ pub(crate) fn route(request: &RunRequest, environment: &Environment, covering_pa
         warm_hash,
         decision,
     }
+}
+
+/// The log `request`'s run writes, absolute against the working folder the run has entered, as the run resolved it.
+/// `None` when it cannot be made absolute, which the run's own resolution of the same words refused before any
+/// decision.
+fn run_log(request: &RunRequest) -> Option<PathBuf> {
+    resolve::log(&request.log).ok()
 }
 
 /// Says the lines of `request`'s routed `run`: its route lines, the problem of its repo's `.gate/env.toml` when
@@ -359,7 +371,7 @@ pub(crate) fn not_routed(route: &Route) -> Option<String> {
             reason: Some(LocalReason::DeclaredLocal { .. } | LocalReason::LocalFile { .. }),
         } => Some(DECLARED_LOCAL.to_owned()),
         Route::Local {
-            reason: Some(LocalReason::GitignoredInput { .. }),
+            reason: Some(LocalReason::GitignoredPastCap { .. } | LocalReason::GitignoredPair { .. } | LocalReason::GitignoredUnsent { .. }),
         } => Some(GITIGNORED_INPUT.to_owned()),
         _ => None,
     }
@@ -368,6 +380,123 @@ pub(crate) fn not_routed(route: &Route) -> Option<String> {
 /// The exclusions of the input globs a word's project input is matched against ([`Machine::uncovered`]): none, a
 /// regex no path matches. The inputs' own exclusions hold only for paths no project input has.
 const NOTHING_EXCLUDED: &str = r"[^\s\S]";
+
+/// The folders a sweep ([`swept_folder`]) never enters, at any depth below the swept folder, in any ASCII letter case.
+const NOT_SWEPT: &str = r"(^|/)(bin|obj)/";
+
+/// Why a gitignored candidate whose project files lie in another repository cannot be carried.
+const IN_NESTED: &str = "it is inside a nested repository";
+
+/// Why a gitignored candidate whose folder is, or lies under, a link or a junction cannot be carried.
+const IN_LINK: &str = "the folder is a link or junction";
+
+/// The files the gitignored candidate `path`, `/`-separated below `root`, carries to the builder, each with its size:
+/// a folder, and a project or solution file ([`is_project_or_solution`]) below the root, carry their folder's files
+/// ([`swept_folder`]); any other file candidate carries only itself.
+///
+/// # Errors
+///
+/// Why the candidate cannot be carried whole: its folder is, or lies under, a link or a junction ([`IN_LINK`]), one of
+/// its project files `own` lies in another repository ([`IN_NESTED`]) or is left out of its folder's files, or its
+/// folder or file cannot be read.
+fn swept(root: &Path, path: &str, own: &[String], globs: &Globs, log: Option<&str>) -> Result<Vec<(String, u64)>, String> {
+    let file = is_input_file(path);
+    let folder = if file {
+        path.rsplit_once('/').map_or("", |(folder, _)| folder)
+    } else {
+        path
+    };
+    if under_link(root, folder) {
+        return Err(IN_LINK.to_owned());
+    }
+    let mut known = HashMap::new();
+    if own.iter().any(|own| nested_folder(root, own, &mut known).is_some()) {
+        return Err(IN_NESTED.to_owned());
+    }
+    if file && (folder.is_empty() || !is_project_or_solution(path)) {
+        let metadata = fs::metadata(root.join(path)).map_err(|error| format!("cannot read {}: {error}", escaped(path)))?;
+        return Ok(vec![(path.to_owned(), metadata.len())]);
+    }
+    let carried = swept_folder(root, folder, globs, log, &mut known)?;
+    match own.iter().find(|own| !carried.iter().any(|(file, _)| file.eq_ignore_ascii_case(own))) {
+        Some(left) => Err(format!("{} is left out of the files its folder sends", escaped(left))),
+        None => Ok(carried),
+    }
+}
+
+/// Every file at any depth below `folder`, `/`-separated below `root` (the root itself when empty), that a walk lists
+/// ([`walk`]: links and junctions neither followed nor listed), with its size, but those below a `bin` or `obj` folder
+/// of it ([`NOT_SWEPT`]), those the inputs never send ([`EXCLUDED`]), those of more than [`PATH_DEPTH_LIMIT`] parts
+/// from the root, those inside another repository ([`nested_folder`], its answers kept in `known`), those one of
+/// the input `globs` already carries, and the run's own `log` and its `.err` file ([`is_run_log`]). Which of them git
+/// ignores is not asked here.
+///
+/// # Errors
+///
+/// Why the inputs' exclusions cannot be matched, or the folder walked.
+fn swept_folder(
+    root: &Path,
+    folder: &str,
+    globs: &Globs,
+    log: Option<&str>,
+    known: &mut HashMap<String, bool>,
+) -> Result<Vec<(String, u64)>, String> {
+    let sweep = Globs::inputs(&["**".to_owned()], &format!("(?i){EXCLUDED}|{NOT_SWEPT}"))?;
+    let found = walk(&root.join(folder), &sweep).map_err(|error| error.to_string())?;
+    Ok(found
+        .into_iter()
+        .map(|file| {
+            let full = if folder.is_empty() {
+                file.path
+            } else {
+                format!("{folder}/{}", file.path)
+            };
+            (full, file.stamp.size)
+        })
+        .filter(|(file, _)| !is_run_log(file, log))
+        .filter(|(file, _)| file.split('/').count() <= PATH_DEPTH_LIMIT && !globs.matches(file) && nested_folder(root, file, known).is_none())
+        .collect())
+}
+
+/// Whether `file` is the run's own `log` or its `.err` file, both `/`-separated below the root, compared without regard
+/// to ASCII letter case as the inputs compare it ([`relative`]); never when the log lies outside the worktree.
+fn is_run_log(file: &str, log: Option<&str>) -> bool {
+    log.is_some_and(|log| file.eq_ignore_ascii_case(log) || file.eq_ignore_ascii_case(&format!("{log}.err")))
+}
+
+/// Whether `folder`, `/`-separated below `root`, or a folder above it below the root, is a link, a junction or another
+/// reparse point. One whose attributes cannot be read counts as none: its walk says why it cannot be read.
+fn under_link(root: &Path, folder: &str) -> bool {
+    let mut at = root.to_path_buf();
+    folder.split('/').filter(|part| !part.is_empty()).any(|part| {
+        at.push(part);
+        fs::symlink_metadata(&at).is_ok_and(|metadata| metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+    })
+}
+
+/// A candidate [`Machine::gitignored_inputs`] judges: its path and the project files it names ([`input_files`]).
+type Judged<'p> = (&'p String, Vec<String>);
+
+/// A gitignored candidate [`Machine::gitignored_inputs`] sweeps: its path, and the files it carries or why it cannot be
+/// carried ([`swept`]).
+type Swept<'p> = (&'p String, Result<Vec<(String, u64)>, String>);
+
+/// Each file the candidates `swept` carry, once each.
+fn carried_of<'s>(swept: &[&'s Swept<'_>]) -> Vec<&'s String> {
+    let mut seen = HashSet::new();
+    swept
+        .iter()
+        .filter_map(|(_, carried)| carried.as_ref().ok())
+        .flatten()
+        .map(|(file, _)| file)
+        .filter(|file| seen.insert(file.as_str()))
+        .collect()
+}
+
+/// The files of `carried` that are in `ignored`.
+fn kept_ignored(carried: &[(String, u64)], ignored: &HashSet<String>) -> Vec<(String, u64)> {
+    carried.iter().filter(|(file, _)| ignored.contains(file)).cloned().collect()
+}
 
 /// The files the candidate `path`, `/`-separated below `root`, names as a build's input: itself when it has an input
 /// file's extension ([`is_input_file`]) and is a file; else, when it is a folder, each file directly in it that is a
@@ -447,9 +576,10 @@ pub(crate) struct Machine<'a> {
     /// ([`Facts::windows_change`]): [`CHANGE_DEADLINE`], or the `--test-git-limit-ms` seam when it is given; the hint's
     /// decision's own git limit for the hint's ([`would_route_on_heavy`]).
     change_deadline: Duration,
-    /// Whether a read of the change could not tell it ([`Facts::windows_change`]), or which words are gitignored could
-    /// not be told for every candidate ([`Facts::gitignored_inputs`]): the hint's decision then gives no hint
-    /// ([`would_route_on_heavy`]).
+    /// Whether a read of the change could not tell it ([`Facts::windows_change`]), which words are gitignored could not
+    /// be told for every candidate, or a word names a gitignored project input ([`Facts::gitignored_inputs`]): the
+    /// hint's decision then gives no hint ([`would_route_on_heavy`]), so a light run naming a gitignored project says
+    /// nothing whether heavy would carry it or keep it here.
     change_unknown: Cell<bool>,
     /// Whether a placement call's readers get as long as git itself may take once it exits by itself
     /// ([`git::placing_drain`]): true for the decision, false for the hint's, which keeps the ordinary drain while the
@@ -471,6 +601,9 @@ pub(crate) struct Machine<'a> {
     /// The remote transport the test seams name, whose builder root the box trees lie under ([`Facts::box_trees`]);
     /// `None` for the ssh transport.
     remote_transport: Option<String>,
+    /// The absolute path of the log the run writes, which a sweep leaves out ([`swept_folder`]); `None` for a decision
+    /// that runs nothing (`gate warm`, the route hint).
+    run_log: Option<PathBuf>,
 }
 
 impl<'a> Machine<'a> {
@@ -509,6 +642,7 @@ impl<'a> Machine<'a> {
             notes: RefCell::new(Vec::new()),
             said: RefCell::new(Vec::new()),
             remote_transport: None,
+            run_log: None,
         }
     }
 
@@ -625,6 +759,59 @@ impl<'a> Machine<'a> {
             .borrow_mut()
             .push(format!("gate: cannot tell which words are gitignored: {why}"));
         self.change_unknown.set(true);
+    }
+
+    /// The candidates of `judged` all of whose project files one `git check-ignore` in `root` reports ignored
+    /// ([`Machine::check_ignore`]). When that call fails, each candidate's files are asked alone, and each candidate
+    /// whose call fails too is left out, saying why ([`Machine::cannot_tell`]): one path git refuses (one in a
+    /// submodule) hides no other.
+    fn ignored_candidates<'j, 'p>(&self, root: &Path, judged: &'j [Judged<'p>]) -> Vec<&'j Judged<'p>> {
+        let all_ignored = |files: &[String], ignored: &[String]| files.iter().all(|file| ignored.contains(file));
+        let every: Vec<&String> = judged.iter().flat_map(|(_, files)| files).collect();
+        match self.check_ignore(root, &every) {
+            Ok(ignored) => judged.iter().filter(|(_, files)| all_ignored(files, &ignored)).collect(),
+            Err(_) => judged
+                .iter()
+                .filter(|(_, files)| match self.check_ignore(root, &files.iter().collect::<Vec<_>>()) {
+                    Ok(ignored) => all_ignored(files, &ignored),
+                    Err(why) => {
+                        self.cannot_tell(&why);
+                        false
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Each candidate of `swept` as a gitignored input: the files it carries that one `git check-ignore` in `root`
+    /// reports ignored ([`Machine::check_ignore`]), or why it cannot be carried. When that call fails, each candidate's
+    /// files are asked alone, and a candidate whose call fails too cannot be carried, for git's reason.
+    fn carried_ignored(&self, root: &Path, swept: &[Swept<'_>]) -> Vec<GitignoredInput> {
+        let set = |ignored: Vec<String>| ignored.into_iter().collect::<HashSet<_>>();
+        let every = carried_of(&swept.iter().collect::<Vec<_>>());
+        if every.is_empty() {
+            return swept
+                .iter()
+                .map(|(path, files)| GitignoredInput {
+                    path: (*path).clone(),
+                    files: files.clone(),
+                })
+                .collect();
+        }
+        let whole = self.check_ignore(root, &every).map(set);
+        swept
+            .iter()
+            .map(|one| {
+                let files = match (&one.1, &whole) {
+                    (Err(why), _) => Err(why.clone()),
+                    (Ok(carried), Ok(ignored)) => Ok(kept_ignored(carried, ignored)),
+                    (Ok(carried), Err(_)) => self
+                        .check_ignore(root, &carried_of(&[one]))
+                        .map(|ignored| kept_ignored(carried, &set(ignored))),
+                };
+                GitignoredInput { path: one.0.clone(), files }
+            })
+            .collect()
     }
 
     /// What the change of the worktree at `place`, and of each of `siblings` an entry names, is to the paths its
@@ -943,12 +1130,12 @@ impl Facts for Machine<'_> {
         })
     }
 
-    /// The files each path names that no input glob of `inputs` matches, as the inputs' own matcher matches them
-    /// ([`Machine::uncovered`]), are asked of one `git check-ignore` ([`Machine::check_ignore`]), made only when there is
-    /// such a file; a path is given back when git reports every one of its files ignored. When that call fails, each
-    /// path's files are asked alone, and each path whose call fails too is left out, saying why
-    /// ([`Machine::cannot_tell`]): one path git refuses (one in a submodule) hides no other.
-    fn gitignored_inputs(&self, place: &Place, paths: &[String], inputs: &[String]) -> Vec<String> {
+    /// The project files each path names that no input glob of `inputs` matches, as the inputs' own matcher matches
+    /// them ([`Machine::uncovered`]), are asked of one `git check-ignore` ([`Machine::ignored_candidates`]), made only
+    /// when there is such a file; a path is given back when git reports every one of its project files ignored, and only
+    /// such a path is swept, carrying its swept files git reports ignored, or why it cannot be carried
+    /// ([`Machine::carried_ignored`]). A decision given any path back gives no route hint ([`Machine::change_unknown`]).
+    fn gitignored_inputs(&self, place: &Place, paths: &[String], inputs: &[String]) -> Vec<GitignoredInput> {
         let root = Path::new(&place.root);
         let globs = match Globs::inputs(inputs, NOTHING_EXCLUDED) {
             Ok(globs) => globs,
@@ -961,27 +1148,18 @@ impl Facts for Machine<'_> {
         if judged.is_empty() {
             return Vec::new();
         }
-        let all_ignored = |files: &[String], ignored: &[String]| files.iter().all(|file| ignored.contains(file));
-        let every: Vec<&String> = judged.iter().flat_map(|(_, files)| files).collect();
-        let kept: Vec<&String> = match self.check_ignore(root, &every) {
-            Ok(ignored) => judged
-                .iter()
-                .filter(|(_, files)| all_ignored(files, &ignored))
-                .map(|(path, _)| *path)
-                .collect(),
-            Err(_) => judged
-                .iter()
-                .filter(|(_, files)| match self.check_ignore(root, &files.iter().collect::<Vec<_>>()) {
-                    Ok(ignored) => all_ignored(files, &ignored),
-                    Err(why) => {
-                        self.cannot_tell(&why);
-                        false
-                    }
-                })
-                .map(|(path, _)| *path)
-                .collect(),
-        };
-        kept.into_iter().cloned().collect()
+        let log = self.run_log.as_deref().and_then(|log| relative(root, log));
+        let swept: Vec<Swept<'_>> = self
+            .ignored_candidates(root, &judged)
+            .into_iter()
+            .map(|(path, own)| (*path, swept(root, path, own, &globs, log.as_deref())))
+            .collect();
+        let found = self.carried_ignored(root, &swept);
+        // A light run naming a gitignored project input gives no route hint, whether or not heavy would carry it.
+        if !found.is_empty() {
+            self.change_unknown.set(true);
+        }
+        found
     }
 
     fn subst_target(&self, letter: char) -> Option<String> {
@@ -1701,8 +1879,10 @@ mod tests {
     use std::time::Duration;
 
     use gate_router::windows::WindowsChange;
-    use gate_router::{CarriedSibling, Config, Facts, FolderId, LocalReason, Place, Route, SiblingFolder, SiblingRoot, Target};
-    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+    use gate_router::{CarriedSibling, Config, Facts, FolderId, GitignoredInput, LocalReason, Place, Route, SiblingFolder, SiblingRoot, Target};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
     use super::{
         CHANGE_DEADLINE, DRIVE_FIXED, DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, GATE_FILE_NOT_A_FILE, HINT_GIT_LIMIT, Machine, Origin, SIBLING_GIT_LINK,
@@ -1999,6 +2179,174 @@ mod tests {
         let machine = Machine::at(None, Duration::from_secs(60), Duration::from_secs(5));
         let asked = ["src/Duel.sln", "src", "tests", "bin/x", "nope"].map(str::to_owned);
         assert_eq!(machine.snapshot_carries(&place_of(&root), &asked), ["src/Duel.sln", "src", "tests"]);
+    }
+
+    /// The gitignored input `path` carrying each of `files`, a path and its size.
+    fn carrying(path: &str, files: &[(&str, u64)]) -> GitignoredInput {
+        GitignoredInput {
+            path: path.to_owned(),
+            files: Ok(files.iter().map(|(file, size)| ((*file).to_owned(), *size)).collect()),
+        }
+    }
+
+    /// The gitignored input `path` that cannot be carried, for the reason `why`.
+    fn unsent(path: &str, why: &str) -> GitignoredInput {
+        GitignoredInput {
+            path: path.to_owned(),
+            files: Err(why.to_owned()),
+        }
+    }
+
+    /// A worktree at a fresh scratch folder for the case `name` whose `.gitignore` is `ignore`, holding a file at each
+    /// of `files`, and a machine to ask about it.
+    fn ignoring_tree(name: &str, ignore: &str, files: &[&str]) -> (PathBuf, Removed, Machine<'static>) {
+        let (root, removed) = scratch(name);
+        git_in(&root, &["init", "--quiet"]);
+        fs::write(root.join(".gitignore"), ignore).expect("the ignore file can be written");
+        for path in files {
+            put(&root, path);
+        }
+        (root, removed, Machine::at(None, Duration::from_secs(60), Duration::from_secs(5)))
+    }
+
+    /// Holds the folder `path` open sharing nothing, so no listing of it can be read while the handle lives.
+    fn held_open(path: &Path) -> fs::File {
+        fs::create_dir_all(path).expect("the folder can be made");
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .expect("the folder can be held open sharing nothing")
+    }
+
+    #[test]
+    fn no_check_ignore_runs_when_no_candidate_swept_a_file() {
+        let (root, _removed) = scratch("gitignored-swept-nothing");
+        // Every git call in the folder fails, so a candidate given back carrying nothing was given back without one.
+        fs::write(root.join(".git"), "gitdir: missing\n").expect("a broken .git file can be written");
+        let machine = Machine::at(None, Duration::from_secs(60), Duration::from_secs(5));
+        let (empty, gone) = ("probe".to_owned(), "gone".to_owned());
+        let swept = [(&empty, Ok(Vec::new())), (&gone, Err("why".to_owned()))];
+        assert_eq!(machine.carried_ignored(&root, &swept), [carrying("probe", &[]), unsent("gone", "why")]);
+    }
+
+    #[test]
+    fn a_tracked_candidate_is_never_swept() {
+        let (root, _removed, machine) = ignoring_tree("gitignored-tracked", "*.log\n", &["src/A.csproj"]);
+        git_in(&root, &["add", "--", "src/A.csproj"]);
+        let held = held_open(&root.join("src").join("locked"));
+        let found = machine.gitignored_inputs(&place_of(&root), &["src/A.csproj".to_owned(), "src".to_owned()], &[]);
+        drop(held);
+        assert_eq!(found, []);
+        assert_eq!(*machine.notes.borrow(), Vec::<String>::new(), "no folder was walked, so none failed");
+    }
+
+    #[test]
+    fn an_ignored_settings_file_carries_only_itself() {
+        let files = [".tmp/probe/x.props", ".tmp/probe/Program.cs"];
+        let (root, _removed, machine) = ignoring_tree("gitignored-settings", ".tmp/\n", &files);
+        assert_eq!(
+            machine.gitignored_inputs(&place_of(&root), &[".tmp/probe/x.props".to_owned()], &[]),
+            [carrying(".tmp/probe/x.props", &[(".tmp/probe/x.props", 1)])]
+        );
+    }
+
+    #[test]
+    fn an_ignored_project_at_the_root_carries_only_itself() {
+        let (root, _removed, machine) = ignoring_tree("gitignored-root", "A.csproj\nother.txt\n", &["A.csproj", "other.txt"]);
+        assert_eq!(
+            machine.gitignored_inputs(&place_of(&root), &["A.csproj".to_owned()], &[]),
+            [carrying("A.csproj", &[("A.csproj", 1)])]
+        );
+    }
+
+    #[test]
+    fn a_candidate_in_a_nested_clone_stays_here_saying_why() {
+        let (root, _removed, machine) = ignoring_tree("gitignored-nested", ".tmp/\n", &[".tmp/clone/P.csproj"]);
+        git_in(&root.join(".tmp").join("clone"), &["init", "--quiet"]);
+        assert_eq!(
+            machine.gitignored_inputs(&place_of(&root), &[".tmp/clone/P.csproj".to_owned()], &[]),
+            [unsent(".tmp/clone/P.csproj", "it is inside a nested repository")]
+        );
+    }
+
+    #[test]
+    fn a_candidate_whose_sweep_fails_stays_here_saying_why() {
+        let (root, _removed, machine) = ignoring_tree("gitignored-unswept", ".tmp/\n", &[".tmp/probe/P.csproj"]);
+        let held = held_open(&root.join(".tmp").join("probe").join("locked"));
+        let found = machine.gitignored_inputs(&place_of(&root), &[".tmp/probe/P.csproj".to_owned()], &[]);
+        drop(held);
+        let [GitignoredInput { path, files: Err(why) }] = found.as_slice() else {
+            panic!("the candidate cannot be carried: {found:?}");
+        };
+        assert_eq!(path, ".tmp/probe/P.csproj");
+        assert!(why.contains("locked"), "the walk's own error names the folder: {why}");
+    }
+
+    #[test]
+    fn a_candidate_under_a_junction_stays_here_saying_why() {
+        let (root, _removed, machine) = ignoring_tree("gitignored-junction", ".tmp/\n", &[".tmp/real/P.csproj"]);
+        junction(&root.join(".tmp").join("link"), &root.join(".tmp").join("real"));
+        assert_eq!(
+            machine.gitignored_inputs(&place_of(&root), &[".tmp/link/P.csproj".to_owned()], &[]),
+            [unsent(".tmp/link/P.csproj", "the folder is a link or junction")]
+        );
+    }
+
+    #[test]
+    fn a_folder_candidate_lists_its_ignored_files_but_bin_and_obj() {
+        let (root, _removed) = scratch("gitignored-folder");
+        git_in(&root, &["init", "--quiet"]);
+        fs::write(root.join(".gitignore"), "probe/*\n!probe/Readme.md\n").expect("the ignore file can be written");
+        for path in [
+            "probe/Probe.csproj",
+            "probe/sub/deep.props",
+            "probe/bin/y.dll",
+            "probe/OBJ/x.json",
+            "probe/src/Obj/z.json",
+            "probe/keys.json",
+            "probe/.env.local",
+            "probe/nested/.git",
+            "probe/nested/a.cs",
+            "probe/Readme.md",
+        ] {
+            put(&root, path);
+        }
+        fs::write(root.join("probe").join("Program.cs"), "12345").expect("the file can be written");
+        let machine = Machine::at(None, Duration::from_secs(60), Duration::from_secs(5));
+        let globs = ["probe/keys.json".to_owned()];
+        assert_eq!(
+            machine.gitignored_inputs(&place_of(&root), &["probe".to_owned()], &globs),
+            [carrying(
+                "probe",
+                &[("probe/Probe.csproj", 1), ("probe/Program.cs", 5), ("probe/sub/deep.props", 1)]
+            )],
+            "neither bin, obj, a glob's file, an env file, another repository's file nor a file git keeps is carried"
+        );
+    }
+
+    #[test]
+    fn a_file_candidate_carries_its_folder_s_ignored_files() {
+        let (root, _removed) = scratch("gitignored-file");
+        git_in(&root, &["init", "--quiet"]);
+        fs::write(root.join(".gitignore"), ".tmp/\n").expect("the ignore file can be written");
+        for path in [
+            ".tmp/probe/Probe.csproj",
+            ".tmp/probe/Program.cs",
+            ".tmp/probe/obj/x.json",
+            ".tmp/other/z.cs",
+        ] {
+            put(&root, path);
+        }
+        let machine = Machine::at(None, Duration::from_secs(60), Duration::from_secs(5));
+        assert_eq!(
+            machine.gitignored_inputs(&place_of(&root), &[".tmp/probe/Probe.csproj".to_owned()], &[]),
+            [carrying(
+                ".tmp/probe/Probe.csproj",
+                &[(".tmp/probe/Probe.csproj", 1), (".tmp/probe/Program.cs", 1)]
+            )]
+        );
     }
 
     #[test]

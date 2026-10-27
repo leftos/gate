@@ -158,6 +158,14 @@ pub fn inputs_hashes_path(root: &Path, id: Option<&str>, key: &str) -> PathBuf {
     builder_cache_dir(root, id).join(format!("{key}.inputs-hashes"))
 }
 
+/// The carried marker of the work folder `key` on the builder whose id is `id`, `<folder>\<key>.inputs-carried` in its
+/// folder ([`builder_cache_dir`]), beside the inputs hash cache: an empty file, there once an inputs step that carried a
+/// path a command named landed, until a run with no inputs has removed the copies it put.
+#[must_use]
+pub fn inputs_carried_path(root: &Path, id: Option<&str>, key: &str) -> PathBuf {
+    builder_cache_dir(root, id).join(format!("{key}.inputs-carried"))
+}
+
 /// The sent-build hash cache of the work folder `key` on the builder whose id is `id`, `<folder>\<key>.sent-build-hashes`
 /// in its folder ([`builder_cache_dir`]): the manifest line of the PC's build of one project last sent to it for a
 /// routed `dotnet test --no-build`, its files whose last write came well before that build, kept apart from the inputs

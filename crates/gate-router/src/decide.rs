@@ -201,6 +201,17 @@ pub struct Place {
     pub folder: String,
 }
 
+/// A candidate a matched command's word names that is a gitignored project input ([`Facts::gitignored_inputs`]),
+/// with the gitignored files that carry it to the builder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitignoredInput {
+    /// The candidate, `/`-separated from the worktree root, as it was asked.
+    pub path: String,
+    /// Each gitignored file to carry, `/`-separated from the worktree root, with its size in bytes; else why the
+    /// candidate cannot be carried whole, on one line.
+    pub files: Result<Vec<(String, u64)>, String>,
+}
+
 /// The facts the decision asks the caller for, each only when a rule needs it.
 pub trait Facts {
     /// The routing file, read and given to [`Config::parse`]: `Ok(None)` when there is no such file. Asked only of a
@@ -280,9 +291,11 @@ pub trait Facts {
     /// this PC that none of the repo's input globs `inputs` matches and git reports ignored. Any other path counts only
     /// when it is a folder on this PC directly holding a project or solution file ([`is_project_or_solution`]), each
     /// of which no input glob matches and git reports ignored. A path whose answer cannot be told is left out, so the
-    /// command routes. Asked once, with every candidate ([`gitignored_reason`]), of every matched command that
-    /// would otherwise route.
-    fn gitignored_inputs(&self, place: &Place, paths: &[String], inputs: &[String]) -> Vec<String>;
+    /// command routes. Each path given back carries the gitignored files no input glob matches below its folder (a
+    /// folder candidate's own, a project or solution file's parent below the root), swept at any depth past each `bin`
+    /// and `obj` folder; any other file carries only itself. A path that cannot be carried whole says why. Asked
+    /// once, with every candidate ([`carried_inputs`]), of every matched command that would otherwise route.
+    fn gitignored_inputs(&self, place: &Place, paths: &[String], inputs: &[String]) -> Vec<GitignoredInput>;
 
     /// What the drive `letter` (upper case) stands for, as `QueryDosDevice` gives it (`\??\X:\dev` for a subst drive);
     /// `None` when there is no such device.
@@ -470,9 +483,16 @@ pub enum LocalReason {
     /// The local file `file` ([`Facts::declaration_said`]) declares `pattern`, the first of its patterns the command
     /// matches.
     DeclaredLocal { file: String, pattern: String },
-    /// A matched command's word names `path`, as the word wrote it, a project input that is gitignored, which the
-    /// snapshot leaves out ([`Facts::gitignored_inputs`]).
-    GitignoredInput { path: String },
+    /// A matched command's word names `path`, as the word wrote it, a gitignored project input
+    /// ([`Facts::gitignored_inputs`]), and the gitignored files its run would carry hold `bytes` in `files`, past the
+    /// 64 MiB or the 2,000 files a command's inputs carry.
+    GitignoredPastCap { path: String, bytes: u64, files: usize },
+    /// A matched command's word names `path`, as the word wrote it, a gitignored project input
+    /// ([`Facts::gitignored_inputs`]), and its run is a sibling pair's, which carries no inputs.
+    GitignoredPair { path: String },
+    /// A matched command's word names `path`, as the word wrote it, a gitignored project input
+    /// ([`Facts::gitignored_inputs`]) whose files cannot all be carried, for the reason `why`.
+    GitignoredUnsent { path: String, why: String },
 }
 
 impl LocalReason {
@@ -504,7 +524,15 @@ impl LocalReason {
                 format!("{file}: {problem}")
             }
             Self::DeclaredLocal { file, pattern } => format!("{file} keeps it here ({})", escaped(pattern)),
-            Self::GitignoredInput { path } => format!("{} is gitignored, so the snapshot leaves it out", escaped(path)),
+            Self::GitignoredPastCap { path, bytes, files } => format!(
+                "{} is gitignored and a command's inputs carry at most {} MiB in {CARRIED_FILES} files; its files hold {} MiB in \
+                 {files} files",
+                escaped(path),
+                CARRIED_BYTES / MIB,
+                bytes.div_ceil(MIB)
+            ),
+            Self::GitignoredPair { path } => format!("{} is gitignored, and a sibling pair does not send inputs yet", escaped(path)),
+            Self::GitignoredUnsent { path, why } => format!("{} is gitignored and its files cannot be sent: {why}", escaped(path)),
             Self::SiblingMissing { name } => format!("sibling {name} not found beside the worktree"),
             Self::SiblingRefused { name, reason } => format!("sibling {name} {reason}"),
             Self::SiblingsNotAllowed { names, problem } => not_allowed_reason(names, problem.as_deref()),
@@ -582,8 +610,9 @@ pub struct RemoteRun {
     pub program_named: bool,
     /// The output globs the run brings back; none for a dotnet `--no-build` command.
     pub outputs: Vec<String>,
-    /// The input globs the run sends: the repo's `inputs` list, none when it has no entry; kept for a dotnet
-    /// `--no-build` command, whose outputs alone are withheld.
+    /// The input globs the run sends: the repo's `inputs` list, none when it has no entry, then the exact path of each
+    /// gitignored file the command names, after [`CARRIED_INPUT`]; kept for a dotnet `--no-build` command, whose
+    /// outputs alone are withheld.
     pub inputs: Vec<String>,
     /// Whether `--no-build` was dropped from the builder's words.
     pub dropped_no_build: bool,
@@ -1194,8 +1223,9 @@ fn built(config: &Config, opened: Opened, sent: Rewritten, kept: Kept, facts: &d
 
 /// The routed run of the `matched` command, as the decision ends: here, saying why, when a word names a path outside
 /// the worktree ([`outside_reason`]), when the gate's folder below the root holds nothing the snapshot sends, or when a
-/// word names a gitignored project input the snapshot leaves out ([`gitignored_reason`]); else the run on its builder
-/// ([`remote_run`]), for the command as `given`. What [`route`] and [`later_run`] both end with.
+/// word names a gitignored project input the run cannot carry ([`carried_inputs`]); else the run on its builder
+/// ([`remote_run`]), for the command as `given`, its input globs followed by the exact paths of the gitignored files
+/// it carries. What [`route`] and [`later_run`] both end with.
 fn ended(config: &Config, matched: Matched, given: &[String], facts: &dyn Facts) -> Result<RemoteRun, Here> {
     if let Some(word) = matched.outside.clone() {
         return Err(Some(outside_reason(config, word, &matched, facts)));
@@ -1205,20 +1235,78 @@ fn ended(config: &Config, matched: Matched, given: &[String], facts: &dyn Facts)
     if !place.prefix.is_empty() && !facts.folder_has_files(place).map_err(|reason| Some(failed(&reason)))? {
         return Err(Some(LocalReason::NothingSent { subfolder }));
     }
-    if let Some(reason) = gitignored_reason(&matched, facts) {
-        return Err(Some(reason));
-    }
-    Ok(remote_run(config, matched, subfolder, given, facts))
+    let carried = carried_inputs(&matched, facts).map_err(Some)?;
+    let mut run = remote_run(config, matched, subfolder, given, facts);
+    run.inputs.extend(carried.into_iter().map(|file| format!("{CARRIED_INPUT}{file}")));
+    Ok(run)
 }
 
-/// Why the `matched` command runs here when one of its words before a script's text ([`script_start`]) names a
-/// project input the snapshot leaves out: each value of each word ([`input_values`]) that names a path below the root
+/// The files the run of the `matched` command carries to its builder as exact input paths beside the repo's input
+/// globs, because one of its words before a script's text names a project input the snapshot leaves out
+/// ([`input_candidates`]). The facts are asked once, with every candidate and the repo's input globs
+/// ([`Facts::gitignored_inputs`]); each file of each candidate they give back is carried once, in their order, unless
+/// one of the repo's input globs is that very path. None when there is no candidate or none is given back.
+///
+/// # Errors
+///
+/// Why the run stays here instead, naming the first candidate in word order the facts give back, as the word wrote it:
+/// a sibling pair's run carries no inputs, a candidate whose files cannot all be carried names it and why, and the
+/// files carried, the repo's own input globs left out, hold at most
+/// [`CARRIED_BYTES`] by their sizes in at most [`CARRIED_FILES`] files. Either is told before anything is sent.
+fn carried_inputs(matched: &Matched, facts: &dyn Facts) -> Result<Vec<String>, LocalReason> {
+    let candidates = input_candidates(matched);
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut seen = HashSet::new();
+    let asked: Vec<String> = candidates
+        .iter()
+        .filter(|(_, path)| seen.insert(path.as_str()))
+        .map(|(_, path)| path.clone())
+        .collect();
+    let inputs = &matched.target.inputs;
+    let ignored = facts.gitignored_inputs(&matched.target.place, &asked, inputs);
+    let given: Vec<(&str, &GitignoredInput)> = candidates
+        .iter()
+        .filter_map(|(shown, path)| ignored.iter().find(|input| input.path == *path).map(|input| (*shown, input)))
+        .collect();
+    let Some((shown, _)) = given.first() else {
+        return Ok(Vec::new());
+    };
+    let path = (*shown).to_owned();
+    if !matched.target.siblings.is_empty() {
+        return Err(LocalReason::GitignoredPair { path });
+    }
+    if let Some((shown, why)) = given.iter().find_map(|(shown, input)| input.files.as_ref().err().map(|why| (shown, why))) {
+        return Err(LocalReason::GitignoredUnsent {
+            path: (*shown).to_owned(),
+            why: why.clone(),
+        });
+    }
+    let mut seen: HashSet<&str> = inputs.iter().map(String::as_str).collect();
+    let carried: Vec<&(String, u64)> = ignored
+        .iter()
+        .filter_map(|input| input.files.as_ref().ok())
+        .flatten()
+        .filter(|(file, _)| seen.insert(file.as_str()))
+        .collect();
+    let bytes = carried.iter().map(|(_, size)| size).sum();
+    if bytes > CARRIED_BYTES || carried.len() > CARRIED_FILES {
+        return Err(LocalReason::GitignoredPastCap {
+            path,
+            bytes,
+            files: carried.len(),
+        });
+    }
+    Ok(carried.into_iter().map(|(file, _)| file.clone()).collect())
+}
+
+/// The candidates of the `matched` command's words before a script's text ([`script_start`]), each as the word wrote
+/// it and as the path it names: each value of each word ([`input_values`]) that names a path below the root
 /// ([`input_path`]) is a candidate when it has an input file's extension ([`is_input_file`]), or, as a folder, when it
 /// comes after a dotnet command's verb ([`folders_from`]). No word after the first `--` is read, nor, in a dotnet
-/// command, an output option's value ([`output_values`]). The facts are asked once, with every candidate and the repo's
-/// input globs ([`Facts::gitignored_inputs`]), and the first candidate in word order they give back decides, shown as
-/// the word wrote it. `None` when there is no candidate or none is given back.
-fn gitignored_reason(matched: &Matched, facts: &dyn Facts) -> Option<LocalReason> {
+/// command, an output option's value ([`output_values`]).
+fn input_candidates(matched: &Matched) -> Vec<(&str, String)> {
     let place = &matched.target.place;
     let words = &matched.words[..script_start(&matched.words)];
     let words = &words[..words.iter().position(|word| word == SEPARATOR).unwrap_or(words.len())];
@@ -1228,29 +1316,27 @@ fn gitignored_reason(matched: &Matched, facts: &dyn Facts) -> Option<LocalReason
     } else {
         vec![false; words.len()]
     };
-    let candidates: Vec<(&str, String)> = words
+    words
         .iter()
         .enumerate()
         .filter(|(index, _)| !outputs[*index])
         .flat_map(|(index, word)| input_values(word).into_iter().map(move |value| (index, value)))
         .filter(|(index, value)| is_input_file(value) || folders.is_some_and(|from| *index >= from))
         .filter_map(|(_, value)| input_path(&place.prefix, value).map(|path| (value, path)))
-        .collect();
-    if candidates.is_empty() {
-        return None;
-    }
-    let mut seen = HashSet::new();
-    let asked: Vec<String> = candidates
-        .iter()
-        .filter(|(_, path)| seen.insert(path.as_str()))
-        .map(|(_, path)| path.clone())
-        .collect();
-    let ignored = facts.gitignored_inputs(place, &asked, &matched.target.inputs);
-    candidates
-        .into_iter()
-        .find(|(_, path)| ignored.contains(path))
-        .map(|(shown, _)| LocalReason::GitignoredInput { path: shown.to_owned() })
+        .collect()
 }
+
+/// The start of each entry of a routed run's input globs ([`RemoteRun::inputs`]) that is the exact path of a gitignored
+/// file the command names ([`carried_inputs`]), not one of the repo's globs: no input glob holds `[`, nor does a path a
+/// word names ([`input_path`]).
+pub const CARRIED_INPUT: &str = "[carried]";
+
+/// The bytes of a mebibyte.
+const MIB: u64 = 1024 * 1024;
+/// The most raw bytes the gitignored files a command's run carries may hold ([`carried_inputs`]).
+const CARRIED_BYTES: u64 = 64 * MIB;
+/// The most gitignored files a command's run may carry ([`carried_inputs`]).
+const CARRIED_FILES: usize = 2000;
 
 /// The options of a dotnet command whose value names something the command writes, matched in any letter case.
 const WRITTEN_OPTIONS: [&str; 11] = [

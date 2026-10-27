@@ -2,18 +2,22 @@
 //! diff and the put before the run call, an unchanged set sent no more, and each way the step refuses the route
 //! `inputs` and runs the command here.
 
+use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use gate_router::repo_name;
 use regex::Regex;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::remote_client::{
     CLIENT_IGNORED, Tuned, client_case, client_gate, client_gate_tuned, fallbacks, pair_case, sibling_repository, work_folder, write,
 };
-use crate::support::{Case, Go, Outcome, calls, events, finish, log_texts, shown, ssh_steps, start, write_remote_json};
+use crate::support::{Case, Go, Outcome, beside, calls, events, finish, log_texts, shown, ssh_steps, start, write_remote_json};
 
 /// The case's one input, `/`-separated as its glob matches it, and as the builder's work folder holds it.
 const INPUT: &str = "secrets/keys.json";
@@ -122,6 +126,248 @@ fn an_unchanged_input_is_not_sent_again() {
     assert!(has_line(&log_of(&case, "second.log"), UNCHANGED), "{outcome:?}");
     assert!(!outcome.stderr.contains(UNCHANGED), "the line is the log's alone: {outcome:?}");
     assert!(!sent_line().is_match(&outcome.stderr), "{outcome:?}");
+}
+
+/// The command naming the gitignored probe project, which its repo declares no input glob for.
+const PROBE_RAN: [&str; 3] = [r".\tool.exe", "out", ".tmp/probe/Probe.csproj"];
+
+/// A client case whose repo declares no input glob, holding the gitignored probe project `.tmp/probe`: its project
+/// and its source, and below it a restore's `obj/x.json` and a build's `bin/y.dll`.
+fn probe_case(name: &str) -> Case {
+    let case = client_case(name);
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({ "host": "builder", "slots": 2, "repos": { &repo: ["*tool*"] }, "outputs": { &repo: [] } });
+    write_remote_json(&case, &routing.to_string());
+    for (path, text) in [
+        (".tmp/probe/Probe.csproj", "<Project />"),
+        (".tmp/probe/Program.cs", "class P {}"),
+        (".tmp/probe/obj/x.json", "{}"),
+        (".tmp/probe/bin/y.dll", "dll"),
+    ] {
+        write(&case, path, text);
+    }
+    case
+}
+
+#[test]
+fn a_gitignored_project_a_command_names_is_in_the_builder_s_work_folder_when_the_command_runs() {
+    let case = probe_case("client-inputs-probe");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &PROBE_RAN));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run"], "the diff, then the put");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+    let probe = work_folder(&case).join(".tmp").join("probe");
+    assert_eq!(fs::read_to_string(probe.join("Probe.csproj")).ok().as_deref(), Some("<Project />"));
+    assert_eq!(fs::read_to_string(probe.join("Program.cs")).ok().as_deref(), Some("class P {}"));
+    assert!(!probe.join("obj").join("x.json").exists(), "a restore's output is not sent");
+    assert!(!probe.join("bin").join("y.dll").exists(), "a build's output is not sent");
+}
+
+#[test]
+fn a_command_naming_the_same_gitignored_project_again_sends_nothing() {
+    let case = probe_case("client-inputs-probe-again");
+    let first = ssh_steps(&case, "first", &["ok"; 4]);
+    let sent = finish(client_gate(&case, "first.log", &first, &PROBE_RAN));
+    assert_eq!(sent.code, Some(0), "{sent:?}");
+    let second = ssh_steps(&case, "second", &["ok"; 4]);
+
+    let outcome = finish(client_gate(&case, "second.log", &second, &PROBE_RAN));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&second), ["preflight", "inputs", "run"], "the diff alone, no put");
+    assert!(has_line(&log_of(&case, "second.log"), "gate: inputs: 2 file(s) unchanged"), "{outcome:?}");
+}
+
+#[test]
+fn a_carried_file_the_pipeline_cannot_send_falls_back_inputs() {
+    let case = probe_case("client-inputs-probe-unsent");
+    // The inputs' walk enters no folder whose name is shaped like a short alias, so it never finds the file.
+    write(&case, ".tmp/pro~1/P.csproj", "<Project />");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "out", ".tmp/pro~1/P.csproj"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains(FELL_BACK), "{outcome:?}");
+    assert!(outcome.stdout.contains(".tmp/pro~1/P.csproj"), "the command ran here: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), ["inputs"]);
+    let said = log_of(&case, "out.log");
+    assert!(
+        has_line(
+            &said,
+            "gate: remote inputs not sent: .tmp/pro~1/P.csproj was named by the command but could not be sent"
+        ),
+        "{said}"
+    );
+}
+
+/// The paths the builder's inputs record of the case's work folder names, sorted.
+fn recorded(case: &Case) -> Vec<String> {
+    let mut record = work_folder(case).into_os_string();
+    record.push(".inputs");
+    let text = fs::read_to_string(&record).expect("the builder keeps an inputs record");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("the inputs record is JSON");
+    let mut paths: Vec<String> = value["files"]
+        .as_object()
+        .expect("the inputs record names its files")
+        .keys()
+        .cloned()
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// The run's own log, inside the probe folder its command names.
+const PROBE_LOG: &str = ".tmp/probe/run.log";
+
+#[test]
+fn a_carried_folder_holding_the_run_s_log_routes_and_leaves_the_log_out() {
+    let case = probe_case("client-inputs-probe-log");
+    write(&case, PROBE_LOG, "an earlier run's log\n");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+    // A run pinned to its builder readies its log only once routed, so the earlier log is there when the folder is swept.
+    let pinned = Tuned {
+        extra: &["--builder", "builder"],
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(&case, PROBE_LOG, &steps, &pinned, &PROBE_RAN));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "inputs", "inputs", "run"],
+        "the diff, then the put: {outcome:?}"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+    let said = log_of(&case, PROBE_LOG);
+    assert!(!said.contains("gate: remote inputs not sent"), "{said}");
+    assert_eq!(
+        recorded(&case),
+        [".tmp/probe/Probe.csproj", ".tmp/probe/Program.cs"],
+        "the log is not sent"
+    );
+}
+
+/// The SHA-256 of `bytes`, as lowercase hex.
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().fold(String::new(), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
+}
+
+/// The steps file `name` of the case's stand-in: `before` each answered as its step says, then the run call, whose
+/// request the stand-in keeps ([`kept_inputs_digest`]), its go file made first.
+fn run_kept(case: &Case, name: &str, before: &[&str]) -> PathBuf {
+    let go = case.folder().join("ssh").join("go");
+    fs::write(&go, "").expect("the go file can be made");
+    let held = format!("fed-hold {}", shown(&go));
+    let mut steps = before.to_vec();
+    steps.push(&held);
+    ssh_steps(case, name, &steps)
+}
+
+/// The `InputsDigest` of the request the stand-in of the steps file `steps` kept, `None` when it carries none.
+fn kept_inputs_digest(steps: &Path) -> Option<String> {
+    let input = fs::read_to_string(beside(steps, ".input")).expect("the stand-in kept the call's input");
+    let word = input.lines().next().expect("the input has a request line");
+    let request: serde_json::Value = serde_json::from_slice(&STANDARD.decode(word).expect("the request is base64")).expect("the request is JSON");
+    request["InputsDigest"].as_str().map(str::to_owned)
+}
+
+/// The marker files below `folder`, at any depth, that say a run carried a command's inputs to a work folder.
+fn carried_markers(folder: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let path = entry.expect("an entry can be read").path();
+        if path.is_dir() {
+            found.extend(carried_markers(&path));
+        } else if path.extension().is_some_and(|extension| extension == "inputs-carried") {
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// Runs the probe case's command carrying its gitignored project, which lands in the builder's work folder.
+fn carried_run(case: &Case) {
+    let first = ssh_steps(case, "first", &["ok"; 4]);
+    let carried = finish(client_gate(case, "first.log", &first, &PROBE_RAN));
+    assert_eq!(carried.code, Some(0), "{carried:?}");
+    let probe = work_folder(case).join(".tmp").join("probe");
+    assert!(probe.join("Probe.csproj").exists(), "the carried run installed the probe: {carried:?}");
+}
+
+/// The log line of a run that removed the copies an earlier run carried.
+const REMOVED: &str = "gate: inputs: removed the carried copies of an earlier run";
+
+#[test]
+fn a_run_with_no_inputs_after_a_carried_run_deletes_the_carried_copies() {
+    // The probe's files are written just now, so the inputs hash cache keeps none of them.
+    let case = probe_case("client-inputs-probe-stale");
+    carried_run(&case);
+    let probe = work_folder(&case).join(".tmp").join("probe");
+    let second = run_kept(&case, "second", &["ok", "ok"]);
+
+    let plain = finish(client_gate(&case, "second.log", &second, &RAN));
+
+    assert_eq!(plain.code, Some(0), "{plain:?}");
+    assert_eq!(
+        calls(&second),
+        ["preflight", "inputs", "run"],
+        "the diff of an empty manifest alone: {plain:?}"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+    assert!(!probe.join("Probe.csproj").exists(), "the carried project is deleted");
+    assert!(!probe.join("Program.cs").exists(), "the carried source is deleted");
+    assert_eq!(recorded(&case), Vec::<String>::new());
+    assert_eq!(
+        kept_inputs_digest(&second),
+        Some(sha256_hex(br#"{"files":{}}"#)),
+        "the run call carries the empty manifest's digest"
+    );
+    assert!(has_line(&log_of(&case, "second.log"), REMOVED), "{plain:?}");
+    assert_eq!(carried_markers(&case.root()), Vec::<PathBuf>::new(), "the marker is removed");
+
+    let third = ssh_steps(&case, "third", &["ok"; 4]);
+    let again = finish(client_gate(&case, "third.log", &third, &RAN));
+
+    assert_eq!(again.code, Some(0), "{again:?}");
+    assert_eq!(calls(&third), ["preflight", "run"], "no inputs step once no copy is left: {again:?}");
+    let said = log_of(&case, "third.log");
+    assert!(!said.contains("gate: inputs:"), "{said}");
+}
+
+#[test]
+fn a_removal_of_carried_copies_the_box_fails_still_routes_and_keeps_the_marker() {
+    let case = probe_case("client-inputs-probe-removal-fails");
+    carried_run(&case);
+    assert_eq!(carried_markers(&case.root()).len(), 1, "the carried run leaves its marker");
+    let steps = run_kept(&case, "second", &["ok", "say-exit 2 gate: the inputs request is refused"]);
+
+    let outcome = finish(client_gate(&case, "second.log", &steps, &RAN));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "inputs", "run"],
+        "the failed diff, then the run: {outcome:?}"
+    );
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+    let said = log_of(&case, "second.log");
+    assert!(
+        has_line(&said, "gate: inputs: the carried copies were not removed: the inputs request is refused"),
+        "{said}"
+    );
+    assert_eq!(kept_inputs_digest(&steps), None, "the run call carries no inputs digest");
+    assert_eq!(carried_markers(&case.root()).len(), 1, "the marker is kept for a later run");
 }
 
 #[test]

@@ -6,10 +6,10 @@ use std::path::PathBuf;
 
 use gate_router::windows::WindowsChange;
 use gate_router::{
-    BuildSettings, BuildTarget, Builder, BuilderOs, Config, ConfigProblem, DROPPED_NO_BUILD_LINE, DotnetTarget, Facts, Inputs, LocalReason,
-    NO_OUTPUTS_LINE, PROJECT_EXTENSIONS, Pattern, PinRefusal, Place, RemoteRun, Route, SiblingFolder, Slot, Target, build_settings, builder_words,
-    decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host, later_run, sdk_build_target, target, without_no_build,
-    work_folder_key,
+    BuildSettings, BuildTarget, Builder, BuilderOs, CARRIED_INPUT, Config, ConfigProblem, DROPPED_NO_BUILD_LINE, DotnetTarget, Facts,
+    GitignoredInput, Inputs, LocalReason, NO_OUTPUTS_LINE, PROJECT_EXTENSIONS, Pattern, PinRefusal, Place, RemoteRun, Route, SiblingFolder, Slot,
+    Target, build_settings, builder_words, decide, dotnet_builds, dotnet_target, is_cargo, is_dotnet, is_usable_host, later_run, sdk_build_target,
+    target, without_no_build, work_folder_key,
 };
 
 use crate::support::{FakeFacts, HEAD, ROOT, carried, fake_id, heavy, place_at, sibling_root, words};
@@ -3891,24 +3891,30 @@ fn a_file_without_builders_gives_the_target_it_always_gave() {
     );
 }
 
-/// The line of a command kept here because its word names the gitignored project input `path`.
-fn gitignored_line(path: &str) -> String {
-    format!("gate: not routed: {path} is gitignored, so the snapshot leaves it out")
-}
-
 /// A gate at `prefix` below the root, under a routing file routing every command of `yaat`, whose facts report the
-/// paths `ignored` as gitignored project inputs.
+/// paths `ignored` as gitignored project inputs, each carried by one file of its own name holding one byte.
 fn ignoring(prefix: &str, ignored: &[&str]) -> FakeFacts {
     FakeFacts {
         config: Ok(Some(routing_all())),
-        gitignored: words(ignored),
+        gitignored: ignored
+            .iter()
+            .map(|path| GitignoredInput {
+                path: (*path).to_owned(),
+                files: Ok(vec![((*path).to_owned(), 1)]),
+            })
+            .collect(),
         ..FakeFacts::at(prefix)
     }
 }
 
+/// Each of `paths` as a routed run's input globs carry it: after [`CARRIED_INPUT`].
+fn marked(paths: &[&str]) -> Vec<String> {
+    paths.iter().map(|path| format!("{CARRIED_INPUT}{path}")).collect()
+}
+
 #[test]
-fn a_word_naming_a_gitignored_project_input_keeps_the_command_here_saying_so() {
-    let cases: [(&[&str], &str, &str, &str); 11] = [
+fn a_word_naming_a_gitignored_project_input_is_carried_in_the_run_s_inputs() {
+    let cases: [(&[&str], &str, &str); 11] = [
         (
             &[
                 "dotnet",
@@ -3917,21 +3923,14 @@ fn a_word_naming_a_gitignored_project_input_keeps_the_command_here_saying_so() {
             ],
             "",
             ".tmp/probe/probe.targets",
-            ".tmp/probe/probe.targets",
         ),
         (
             &["dotnet", "build", "-p:CustomAfterMicrosoftCommonTargets=.tmp/a.targets;.tmp/b.targets"],
             "",
             ".tmp/b.targets",
-            ".tmp/b.targets",
         ),
-        (
-            &["dotnet", "test", ".tmp/probe/Probe.csproj"],
-            "",
-            ".tmp/probe/Probe.csproj",
-            ".tmp/probe/Probe.csproj",
-        ),
-        (&["dotnet", "test", r".tmp\probe"], "", ".tmp/probe", r".tmp\probe"),
+        (&["dotnet", "test", ".tmp/probe/Probe.csproj"], "", ".tmp/probe/Probe.csproj"),
+        (&["dotnet", "test", r".tmp\probe"], "", ".tmp/probe"),
         (
             &[
                 "dotnet",
@@ -3941,34 +3940,22 @@ fn a_word_naming_a_gitignored_project_input_keeps_the_command_here_saying_so() {
             ],
             "",
             ".tmp/probe/probe.targets",
-            ".tmp/probe/probe.targets",
         ),
-        (&["dotnet", "build", r"/p:Extra=.tmp\x.props"], "", ".tmp/x.props", r".tmp\x.props"),
-        (&["dotnet", "build", r"-p:.tmp\x.props"], "", ".tmp/x.props", r".tmp\x.props"),
-        (
-            &["dotnet", "test", "--settings", ".tmp/x.runsettings"],
-            "",
-            ".tmp/x.runsettings",
-            ".tmp/x.runsettings",
-        ),
-        (&["dotnet", "build", "@.tmp/args.rsp"], "", ".tmp/args.rsp", ".tmp/args.rsp"),
-        (
-            &["dotnet", "test", r"X:\dev\yaat.wt\a\.tmp\probe\P.csproj"],
-            "",
-            ".tmp/probe/P.csproj",
-            r".tmp\probe\P.csproj",
-        ),
-        (&["dotnet", "test", "./.tmp/P.CSPROJ"], "src/", "src/.tmp/P.CSPROJ", "./.tmp/P.CSPROJ"),
+        (&["dotnet", "build", r"/p:Extra=.tmp\x.props"], "", ".tmp/x.props"),
+        (&["dotnet", "build", r"-p:.tmp\x.props"], "", ".tmp/x.props"),
+        (&["dotnet", "test", "--settings", ".tmp/x.runsettings"], "", ".tmp/x.runsettings"),
+        (&["dotnet", "build", "@.tmp/args.rsp"], "", ".tmp/args.rsp"),
+        (&["dotnet", "test", r"X:\dev\yaat.wt\a\.tmp\probe\P.csproj"], "", ".tmp/probe/P.csproj"),
+        (&["dotnet", "test", "./.tmp/P.CSPROJ"], "src/", "src/.tmp/P.CSPROJ"),
     ];
-    for (command, prefix, ignored, shown) in cases {
+    for (command, prefix, ignored) in cases {
         let command = words(command);
         let facts = ignoring(prefix, &[ignored]);
-        let route = decide(&heavy(&command), &facts);
-        assert_eq!(local_line(&route), Some(gitignored_line(shown)), "{command:?}");
+        let run = routed(decide(&heavy(&command), &facts));
+        assert_eq!(run.inputs, marked(&[ignored]), "{command:?}");
         let asked = facts.gitignored_asked.borrow();
         assert_eq!(asked.len(), 1, "asked once: {asked:?}");
         assert!(asked[0].split(' ').any(|path| path == ignored), "{asked:?}");
-        assert_eq!(head_asks(&facts), 0, "a command kept here asks no HEAD");
     }
 }
 
@@ -4071,7 +4058,7 @@ fn a_folder_is_a_candidate_only_after_a_dotnet_command_s_verb() {
             !matches!(
                 route,
                 Route::Local {
-                    reason: Some(LocalReason::GitignoredInput { .. })
+                    reason: Some(LocalReason::GitignoredPastCap { .. } | LocalReason::GitignoredPair { .. })
                 }
             ),
             "{command:?}: {route:?}"
@@ -4087,9 +4074,199 @@ fn a_folder_is_a_candidate_only_after_a_dotnet_command_s_verb() {
     let command = words(&["cargo", "build", "--manifest-path", ".tmp/p.props"]);
     let facts = ignoring("", &[".tmp/p.props"]);
     assert_eq!(
-        local_line(&decide(&heavy(&command), &facts)),
-        Some(gitignored_line(".tmp/p.props")),
+        routed(decide(&heavy(&command), &facts)).inputs,
+        marked(&[".tmp/p.props"]),
         "a file candidate is taken from any command"
+    );
+}
+
+/// A gate at the root under a routing file routing every command of `yaat` to `builder-1` with the input globs
+/// `inputs`, whose facts report each `(path, files)` of `ignored` as a gitignored project input carried by `files`.
+fn carrying(inputs: &[&str], ignored: &[(&str, &[&str])]) -> FakeFacts {
+    let globs = inputs.iter().map(|glob| format!("{glob:?}")).collect::<Vec<_>>().join(", ");
+    let text = format!(r#"{{"host": "builder-1", "repos": {{"yaat": ["*"]}}, "inputs": {{"yaat": [{globs}]}}}}"#);
+    FakeFacts {
+        config: Ok(Some(Config::parse(&text).expect("usable"))),
+        gitignored: ignored
+            .iter()
+            .map(|(path, files)| GitignoredInput {
+                path: (*path).to_owned(),
+                files: Ok(files.iter().map(|file| ((*file).to_owned(), 1)).collect()),
+            })
+            .collect(),
+        ..FakeFacts::at_root()
+    }
+}
+
+/// The files of the probe project `.tmp/probe`.
+const PROBE: [&str; 2] = [".tmp/probe/Probe.csproj", ".tmp/probe/Program.cs"];
+
+#[test]
+fn a_gitignored_project_a_command_names_is_carried_in_the_run_s_inputs() {
+    for (command, path) in [
+        (&["dotnet", "test", ".tmp/probe/Probe.csproj"][..], ".tmp/probe/Probe.csproj"),
+        (&["dotnet", "test", r".tmp\probe"], ".tmp/probe"),
+    ] {
+        let command = words(command);
+        let facts = carrying(&["keys.json"], &[(path, &PROBE)]);
+        let run = routed(decide(&heavy(&command), &facts));
+        let mut expected = vec!["keys.json".to_owned()];
+        expected.extend(marked(&PROBE));
+        assert_eq!(run.inputs, expected, "{command:?}");
+    }
+}
+
+#[test]
+fn a_gitignored_input_an_inputs_glob_covers_is_not_carried_twice() {
+    let command = words(&["dotnet", "build", ".tmp/probe/Probe.csproj", "-p:Extra=.tmp/probe/p.props"]);
+    let facts = carrying(
+        &[".tmp/probe/Program.cs"],
+        &[
+            (".tmp/probe/Probe.csproj", &PROBE),
+            (".tmp/probe/p.props", &[".tmp/probe/p.props", PROBE[1]]),
+        ],
+    );
+    let run = routed(decide(&heavy(&command), &facts));
+    let mut expected = vec![PROBE[1].to_owned()];
+    expected.extend(marked(&[PROBE[0], ".tmp/probe/p.props"]));
+    assert_eq!(run.inputs, expected, "each path once");
+}
+
+/// The bytes of a mebibyte.
+const MIB: u64 = 1024 * 1024;
+
+/// A gate at the root under a routing file routing every command of `yaat`, whose facts report `.tmp/probe` as a
+/// gitignored project input carried by `files`, each a path and its size.
+fn probe_of(files: Vec<(String, u64)>) -> FakeFacts {
+    FakeFacts {
+        gitignored: vec![GitignoredInput {
+            path: ".tmp/probe".to_owned(),
+            files: Ok(files),
+        }],
+        ..ignoring("", &[])
+    }
+}
+
+/// `count` files of `size` bytes each in `.tmp/probe`.
+fn probe_files(count: usize, size: u64) -> Vec<(String, u64)> {
+    (0..count).map(|index| (format!(".tmp/probe/{index}.cs"), size)).collect()
+}
+
+/// The files of a probe past the byte cap: 64 MiB and one byte, in two files.
+fn past_bytes() -> Vec<(String, u64)> {
+    vec![(".tmp/probe/Probe.csproj".to_owned(), 64 * MIB), (".tmp/probe/big.dmp".to_owned(), 1)]
+}
+
+/// The reason a run whose probe's files hold `held` is kept here for.
+fn past_cap(held: &str) -> String {
+    format!(
+        r"{} is gitignored and a command's inputs carry at most 64 MiB in 2000 files; its files hold {held}",
+        r".tmp\probe"
+    )
+}
+
+#[test]
+fn a_gitignored_input_past_the_size_cap_keeps_the_command_here_saying_so() {
+    for (files, held) in [(past_bytes(), "65 MiB in 2 files"), (probe_files(2001, 1), "1 MiB in 2001 files")] {
+        let command = words(&["dotnet", "test", r".tmp\probe", "-p:Extra=.tmp/x.props"]);
+        let facts = probe_of(files);
+        assert_eq!(
+            local_line(&decide(&heavy(&command), &facts)),
+            Some(format!("gate: not routed: {}", past_cap(held))),
+            "{held}"
+        );
+        assert_eq!(head_asks(&facts), 0, "a command kept here asks no HEAD");
+    }
+}
+
+#[test]
+fn a_gitignored_input_at_the_cap_is_carried() {
+    let at_bytes = vec![(".tmp/probe/Probe.csproj".to_owned(), 64 * MIB - 1), (".tmp/probe/big.dmp".to_owned(), 1)];
+    for files in [at_bytes, probe_files(2000, 1)] {
+        let count = files.len();
+        let command = words(&["dotnet", "test", r".tmp\probe"]);
+        let run = routed(decide(&heavy(&command), &probe_of(files)));
+        assert_eq!(run.inputs.len(), count, "every file is carried");
+    }
+}
+
+#[test]
+fn a_candidate_that_cannot_be_sent_keeps_the_command_here_saying_why() {
+    let command = words(&["dotnet", "test", ".tmp/a.props", r".tmp\probe"]);
+    let facts = FakeFacts {
+        gitignored: vec![
+            GitignoredInput {
+                path: ".tmp/a.props".to_owned(),
+                files: Ok(vec![(".tmp/a.props".to_owned(), 1)]),
+            },
+            GitignoredInput {
+                path: ".tmp/probe".to_owned(),
+                files: Err("it is inside a nested repository".to_owned()),
+            },
+        ],
+        ..ignoring("", &[])
+    };
+    assert_eq!(
+        local_line(&decide(&heavy(&command), &facts)).as_deref(),
+        Some(r"gate: not routed: .tmp\probe is gitignored and its files cannot be sent: it is inside a nested repository")
+    );
+    assert_eq!(head_asks(&facts), 0, "a command kept here asks no HEAD");
+}
+
+/// A gate at the root of a worktree with the sibling `b`, whose facts report `.tmp/probe` as a gitignored project
+/// input carried by its project file.
+fn pair_probe() -> FakeFacts {
+    FakeFacts {
+        gitignored: vec![GitignoredInput {
+            path: ".tmp/probe".to_owned(),
+            files: Ok(vec![(".tmp/probe/Probe.csproj".to_owned(), 1)]),
+        }],
+        ..FakeFacts::with_siblings("", &["b"], &["b"])
+    }
+}
+
+/// The reason a sibling pair's run naming the probe is kept here for.
+const PAIR_PROBE: &str = r".tmp\probe is gitignored, and a sibling pair does not send inputs yet";
+
+#[test]
+fn a_sibling_pair_s_gitignored_input_keeps_the_command_here_saying_so() {
+    let command = words(&["dotnet", "test", r".tmp\probe"]);
+    let facts = pair_probe();
+    assert_eq!(
+        local_line(&decide(&heavy(&command), &facts)),
+        Some(format!("gate: not routed: {PAIR_PROBE}"))
+    );
+    assert_eq!(head_asks(&facts), 0, "a command kept here asks no HEAD");
+}
+
+#[test]
+fn a_pinned_run_carries_a_gitignored_input() {
+    let command = words(&["dotnet", "test", ".tmp/probe/Probe.csproj"]);
+    let facts = carrying(&[], &[(".tmp/probe/Probe.csproj", &PROBE)]);
+    let run = routed(decide(&pinned_to(&command, "builder-1"), &facts));
+    assert_eq!(run.inputs, marked(&PROBE));
+}
+
+#[test]
+fn a_pinned_run_past_the_size_cap_cannot_route_saying_why() {
+    let command = words(&["dotnet", "test", r".tmp\probe"]);
+    let facts = probe_of(past_bytes());
+    assert_eq!(
+        local_line(&decide(&pinned_to(&command, "builder-1"), &facts)),
+        Some(format!(
+            "gate: --builder builder-1 cannot route this run: {}",
+            past_cap("65 MiB in 2 files")
+        ))
+    );
+}
+
+#[test]
+fn a_pinned_pair_run_naming_a_gitignored_input_cannot_route_saying_why() {
+    let command = words(&["dotnet", "test", r".tmp\probe"]);
+    let facts = pair_probe();
+    assert_eq!(
+        local_line(&decide(&pinned_to(&command, "builder-1"), &facts)),
+        Some(format!("gate: --builder builder-1 cannot route this run: {PAIR_PROBE}"))
     );
 }
 

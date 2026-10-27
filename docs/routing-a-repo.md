@@ -24,7 +24,7 @@ Every `--local` run must give `--reason "<why>"` (the gate refuses it otherwise)
 
 A command run from one worktree that names a path in another worktree of a listed repo stays local, saying `gate: not routed: the command works in <tree>; run it with --cd <tree>`. Run it again with `--cd <tree>` to route it from that worktree ([design.md, Routing](design.md#routing)). A path in an unlisted repo, on a network drive or in no worktree keeps the plain `is outside the worktree` line.
 
-A command whose word names an existing gitignored project input (a project, solution, `.targets`, `.props`, `.rsp` or `.runsettings` file, or a dotnet folder whose project files are all ignored) that no `inputs` glob covers stays local, saying `gate: not routed: <path> is gitignored, so the snapshot leaves it out`, and is journalled `notRouted: gitignored input`. List the file in `inputs` to route it ([design.md, Routing](design.md#routing)).
+A command whose word names an existing gitignored project input (a project, solution, `.targets`, `.props`, `.rsp` or `.runsettings` file, or a dotnet folder whose project files are all ignored) that no `inputs` glob covers routes and carries those files to the builder as inputs, with no `inputs` entry needed. A command whose files hold more than 64 MiB or 2000 files, that runs in a sibling pair, or whose files cannot be sent stays local, saying `gate: not routed: <path> is gitignored ...` with the reason, and is journalled `notRouted: gitignored input` ([design.md, Routing](design.md#routing)).
 
 ## Adding a repo
 
@@ -125,7 +125,7 @@ A new builder is trialled before it joins that list ([Trialling a new builder](#
 
 Add the builder as a `builders` entry with `"routed": false` (its `os`, `root` and `slots`; `repos` may stay empty or missing). No unpinned run picks or tries a not-routed builder, so the repos' ordinary runs are unaffected. Then run `gate push`, and `gate check --builder <alias>` from the repo.
 
-Route trial commands to it with `gate run --builder <alias> --slot heavy -- <command>`. The pin needs the repo listed in `remote.json` and a command matching its patterns there; list the repo under the not-routed entry itself to trial it on patterns of its own, without routing it anywhere else. A refusal or an unreachable builder fails the run (exit 1) instead of running here, so a trial that passes ran on the new builder.
+Route trial commands to it with `gate run --builder <alias> --slot heavy -- <command>`. The pin needs the repo listed in `remote.json` and a command matching its patterns there; list the repo under the not-routed entry itself to trial it on patterns of its own, without routing it anywhere else. The builder's own refusal or an unreachable builder fails the run (exit 1) instead of running here, and a pin the decision itself refuses exits 2, so a trial that passes ran on the new builder.
 
 Once the trials are clean, set `routed` to `true` (or drop the key) and list the repos the builder runs ([design.md, remote.json](design.md#remotejson)).
 
