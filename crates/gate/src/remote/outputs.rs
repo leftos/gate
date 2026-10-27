@@ -24,10 +24,11 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo, GetFileInformationByHandle, SetFileInformationByHandle,
 };
 
-use super::client::{self, Attempt, Called, End, RawSink};
+use super::client::{self, Attempt, Called, End, Limits, RawSink, Transferred, Watch};
 use super::git::{FAILURE_BYTES, first_bytes};
 use super::install::{self, Fetched};
 use super::payload::Location;
+use super::retry::SSH_FAILED;
 use super::syncback::Synced;
 use super::watchdog::Cut;
 use super::{RemoteCall, Sibling};
@@ -559,7 +560,11 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
         started,
         bringing,
     };
-    let called = attempt.outputs_call(ran.location, &name, &mut archive, limits, pull);
+    let retried = retried_call(attempt, (ran.location, &name), &mut archive, (limits, pull), bringing);
+    let (called, exhausted) = match retried {
+        Ok((called, exhausted)) => (Ok(called), exhausted),
+        Err(end) => (Err(end), false),
+    };
     attempt.split.outputs = Some(started.elapsed());
     // The fetch alone runs to the archive's last byte; one that wrote none, to the call's end.
     let pulled = attempt
@@ -576,7 +581,7 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
         Ok(called) => {
             let at_the_cap = matches!(called.cut, Some(Cut::ArchiveTooBig(_)));
             let whole = pulled_whole(&called, interrupted);
-            match judged(attempt, (&archive, bringing), &called, synced, interrupted) {
+            match judged(attempt, (&archive, bringing), (&called, exhausted), synced, interrupted) {
                 End::Status(_) if whole => {
                     // The fetch ended whole, under the cap: how the install ends no longer bears on the count, which a
                     // failed run's pull never does.
@@ -612,6 +617,58 @@ fn fetched(attempt: &mut Attempt<'_, '_>, kept: &Kept<'_>, ran: &Ran<'_>, synced
     }
 }
 
+/// The outputs call to the builder at `location` for the archive `name`, made by [`Attempt::outputs_call`] into
+/// `archive`, watched by `limits` as the pull `pull` of what `bringing` names, and made again as
+/// [`Attempt::transfer_call`] makes a transfer after ssh's own failure status, each retry said with the line the
+/// failure gives. A retry the box answers that the archive does not exist, as it removes the archive once it sent it
+/// all, ends the pull as [`End::TransferFailed`] for the first call's failure. What the pull received is summed over
+/// every call. The call that counts, and whether it failed as a connection fails with no retry left; else that end, why
+/// the file or the call could not be made, or the interrupt.
+fn retried_call(
+    attempt: &mut Attempt<'_, '_>,
+    (location, name): (&Location, &str),
+    archive: &mut Archive,
+    (limits, pull): (Limits, client::Pull),
+    bringing: Bringing,
+) -> Result<(Called, bool), End> {
+    let mut received = 0;
+    let transferred = attempt.transfer_call(
+        SSH_FAILED,
+        Watch::Fetch(limits, None),
+        |attempt, watch| {
+            let called = attempt.outputs_call(location, name, archive, watch, pull);
+            received += attempt.pulled_bytes;
+            called
+        },
+        |called| unbrought(bringing, &failure(called)),
+    );
+    attempt.pulled_bytes = received;
+    match transferred? {
+        Transferred {
+            called, first: Some(first), ..
+        } if archive_gone(&called) => Err(End::TransferFailed(first)),
+        Transferred { called, exhausted, .. } => Ok((called, exhausted)),
+    }
+}
+
+/// Whether the outputs call that ended as `called` failed for the box's answer, on any line it said, that the archive
+/// does not exist.
+fn archive_gone(called: &Called) -> bool {
+    called.status != 0
+        && called
+            .said()
+            .any(|line| line.starts_with("gate: remote outputs archive ") && line.ends_with(" does not exist"))
+}
+
+/// Why the outputs call that ended as `called`, neither whole nor cut, failed: the box's last standard error line,
+/// its first [`FAILURE_BYTES`], or its status when it said none.
+fn failure(called: &Called) -> String {
+    match &called.last_error {
+        Some(line) => first_bytes(line, FAILURE_BYTES).to_owned(),
+        None => format!("the outputs call failed (status {})", called.status),
+    }
+}
+
 /// Whether the outputs call that ended as `called` brought its archive whole: it ended 0, uncut, and no Ctrl+C was
 /// raised by its end (`interrupted`). [`judged`] hands back the run's end so far for such a pull alone.
 fn pulled_whole(called: &Called, interrupted: bool) -> bool {
@@ -628,14 +685,15 @@ fn settled(attempt: &mut Attempt<'_, '_>, bringing: Bringing, at_the_cap: bool, 
     end
 }
 
-/// The end of the outputs step once its outputs call ended as `called`, having written to `archive` what it brings
-/// (`bringing`), a Ctrl+C raised by its end or not (`interrupted`, read once by the caller), the run's end so far
-/// `synced`: as [`fetched`] says, `synced` for a pull whole ([`pulled_whole`]). A failed run's test reports past the
-/// fetch cap are said not brought back, with `synced`, and no hit is counted.
+/// The end of the outputs step once its outputs call ended as `called`, `exhausted` when it failed as a connection
+/// fails with no retry left ([`retried_call`]), having written to `archive` what it brings (`bringing`), a Ctrl+C
+/// raised by its end or not (`interrupted`, read once by the caller), the run's end so far `synced`: as [`fetched`]
+/// says, `synced` for a pull whole ([`pulled_whole`]). A failed run's test reports past the fetch cap are said not
+/// brought back, with `synced`, and no hit is counted.
 pub(super) fn judged(
     attempt: &mut Attempt<'_, '_>,
     (archive, bringing): (&Archive, Bringing),
-    called: &Called,
+    (called, exhausted): (&Called, bool),
     synced: End,
     interrupted: bool,
 ) -> End {
@@ -663,11 +721,13 @@ pub(super) fn judged(
         }
         return unfetched(attempt, fetch, &cut.reason("the outputs call"), End::Status(1));
     }
-    // Neither whole, nor interrupted, nor cut: the call failed.
-    let reason = match &called.last_error {
-        Some(line) => first_bytes(line, FAILURE_BYTES).to_owned(),
-        None => format!("the outputs call failed (status {})", called.status),
-    };
+    // Neither whole, nor interrupted, nor cut: the call failed. One that failed as a connection fails with no retry left
+    // ends the run saying the transfer failed.
+    let reason = failure(called);
+    if exhausted {
+        removed(attempt, archive, PARTIAL);
+        return End::TransferFailed(unbrought(bringing, &reason));
+    }
     unfetched(attempt, fetch, &reason, End::Status(1))
 }
 
@@ -878,7 +938,13 @@ fn within_cap(length: usize, cap: usize) -> Result<(), String> {
 
 /// The line saying what a run's pull brings (`bringing`) is not brought back, for `reason`.
 pub(super) fn not_brought_back(bringing: Bringing, reason: &str) -> String {
-    format!("gate: {} not brought back: {}", bringing.unbrought(), escaped(reason))
+    format!("gate: {}", unbrought(bringing, reason))
+}
+
+/// What a run's pull brings (`bringing`) not brought back for `reason`, as [`not_brought_back`] says it without its
+/// `gate: `.
+fn unbrought(bringing: Bringing, reason: &str) -> String {
+    format!("{} not brought back: {}", bringing.unbrought(), escaped(reason))
 }
 
 /// Whether the pending marker at `marker` is there. One whose presence cannot be read counts as there: the run then

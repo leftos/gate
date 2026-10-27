@@ -644,7 +644,10 @@ fn has_back(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, remote: &Rem
         watch: Watch::Deadline(attempt.deadline_for("ls-remote", attempt.git.limit)),
         set: &[],
     };
-    let called = to_the_builder(attempt, worktree, remote, &ls_remote, &remote.args(&["ls-remote"]))?;
+    let args = remote.args(&["ls-remote"]);
+    let called = transfer_retried(attempt, worktree, remote, (&ls_remote, &args), |attempt, called| {
+        checked(attempt, worktree, &ls_remote, &args, called)
+    })?;
     Ok(advertised(&called.lines, remote.reference))
 }
 
@@ -686,23 +689,23 @@ fn fetch(
     };
     let args = remote.args(&FETCH_WORDS);
     let begun = Instant::now();
-    let called = reached(attempt, worktree, remote, &fetch, &args)?;
-    // A pair's sync-back fetches once per repository, and its part of the run's split is their sum.
-    attempt.split.sync_back = Some(attempt.split.sync_back.unwrap_or_default() + begun.elapsed());
-    match called.cut {
+    let stopped = transfer_retried(attempt, worktree, remote, (&fetch, &args), |attempt, called| match called.cut {
         Some(Cut::TooBig(cap)) => {
             attempt.noted(&called);
             attempt.say(worktree.said(stopped_line(cap, remote.reference)));
-            return Ok(Some(End::Status(not_passing(status))));
+            Ok(Some(End::Status(not_passing(status))))
         }
         Some(Cut::Ceiling(ceiling)) => {
             attempt.say(watchdog::transfer_line(ceiling, "fetching the sync-back"));
             attempt.noted(&called);
-            return if status == 0 { Err(End::Killed) } else { Ok(Some(End::Status(status))) };
+            if status == 0 { Err(End::Killed) } else { Ok(Some(End::Status(status))) }
         }
-        _ => {}
-    }
-    checked(attempt, worktree, &fetch, &args, called).map(|_| None)
+        _ => checked(attempt, worktree, &fetch, &args, called).map(|_| None),
+    });
+    // A pair's sync-back fetches once per repository, and its part of the run's split is their sum, retries and their
+    // pauses included.
+    attempt.split.sync_back = Some(attempt.split.sync_back.unwrap_or_default() + begun.elapsed());
+    stopped
 }
 
 /// `status`, but 1 for a passing run: how a run whose changes were not applied ends.
@@ -1048,23 +1051,42 @@ struct Network<'a> {
     set: &'a [(&'a str, &'a OsStr)],
 }
 
-/// git with `args`, the call `network` that reaches the builder: retried when it failed before the banner, its
-/// lines kept out of the log, and killed as its watch says or at a line longer than the cap. A failure is the run's,
-/// or its interrupt when the console interrupt was raised during the call.
-fn to_the_builder(
+/// git with `args`, the call `network` that reaches the builder, made by [`reached`] as [`Attempt::transfer_call`]
+/// makes a transfer, each retry said with the reason [`failure_why`] gives, and its last call ended by `judge`. When
+/// that call failed as a connection fails with no retry left, the failure `judge` gives is the run's
+/// [`End::TransferFailed`]. A retried fetch writes into the same quarantine.
+fn transfer_retried<T>(
     attempt: &mut Attempt<'_, '_>,
     worktree: &Worktree<'_>,
     remote: &Remote<'_>,
-    network: &Network<'_>,
-    args: &[String],
-) -> Result<Called, End> {
-    let called = reached(attempt, worktree, remote, network, args)?;
-    checked(attempt, worktree, network, args, called)
+    (network, args): (&Network<'_>, &[String]),
+    mut judge: impl FnMut(&mut Attempt<'_, '_>, Called) -> Result<T, End>,
+) -> Result<T, End> {
+    let transferred = attempt.transfer_call(
+        GIT_SSH_FAILED,
+        network.watch,
+        |attempt, watch| reached(attempt, worktree, remote, &Network { watch, ..*network }, args),
+        |called| failure_why(worktree.target.root, network, args, called),
+    )?;
+    match judge(attempt, transferred.called) {
+        Err(End::Failed(why)) if transferred.exhausted => Err(End::TransferFailed(why)),
+        end => end,
+    }
 }
 
-/// git with `args` in `worktree`, the call `network` that reaches the builder, made as [`to_the_builder`] makes it: the
-/// call that counts, however it ended. A retried call is given the same variables, so a retried fetch writes into the
-/// same quarantine.
+/// Why the call `network` with `args` in the worktree at `root`, made by [`reached`], failed: its cut, or git's
+/// failure.
+fn failure_why(root: &str, network: &Network<'_>, args: &[String], called: &Called) -> String {
+    match called.cut {
+        Some(cut) => escaped(&cut.reason(&format!("git {}", network.verb))),
+        None => git_failure_why(root, args, called),
+    }
+}
+
+/// git with `args` in `worktree`, the call `network` that reaches the builder: retried when it failed before the
+/// banner, its lines kept out of the log, and killed as its watch says or at a line longer than the cap; the call that
+/// counts, however it ended. A retried call is given the same variables, so a retried fetch writes into the same
+/// quarantine.
 fn reached(
     attempt: &mut Attempt<'_, '_>,
     worktree: &Worktree<'_>,
@@ -1080,16 +1102,16 @@ fn reached(
     Ok(called)
 }
 
-/// The call `network` with `args` that [`reached`] made, as [`to_the_builder`] ends it: a cut or a failure is the run's,
-/// or its interrupt when the console interrupt was raised during the call.
+/// The call `network` with `args` that [`reached`] made, ended: a cut or a failure is the run's, or its interrupt when
+/// the console interrupt was raised during the call.
 fn checked(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, network: &Network<'_>, args: &[String], called: Called) -> Result<Called, End> {
-    if let Some(cut) = called.cut {
+    if called.cut.is_some() {
         attempt.noted(&called);
-        return Err(End::Failed(escaped(&cut.reason(&format!("git {}", network.verb)))));
+        return Err(End::Failed(failure_why(worktree.target.root, network, args, &called)));
     }
     if called.status != 0 {
         attempt.go_on()?;
-        return Err(git_failure(worktree.target.root, args, &called));
+        return Err(End::Failed(failure_why(worktree.target.root, network, args, &called)));
     }
     Ok(called)
 }
@@ -1611,8 +1633,13 @@ fn kept_after(attempt: &mut Attempt<'_, '_>, worktree: &Worktree<'_>, back: &Bac
 /// beside it is said.
 fn after_keep(failed: End, kept: Result<(), String>, see: &str) -> (End, Option<String>) {
     match (failed, kept) {
-        (End::Failed(why), Ok(())) => (End::Failed(format!("{why}; the changes are kept: {see}")), None),
-        (End::Failed(why), Err(not_kept)) => (End::Failed(format!("{why}; the changes could not be kept either: {not_kept}")), None),
+        (failed @ (End::Failed(_) | End::TransferFailed(_)), kept) => {
+            let said = |why: String| match &kept {
+                Ok(()) => format!("{why}; the changes are kept: {see}"),
+                Err(not_kept) => format!("{why}; the changes could not be kept either: {not_kept}"),
+            };
+            (failure_said(failed, said), None)
+        }
         (End::Interrupted, Ok(())) => (
             End::Interrupted,
             Some(format!("gate: the run was interrupted; the changes are kept: {see}")),
@@ -1623,6 +1650,16 @@ fn after_keep(failed: End, kept: Result<(), String>, see: &str) -> (End, Option<
         ),
         (other, Ok(())) => (other, None),
         (other, Err(not_kept)) => (other, Some(format!("gate: the changes could not be kept: {not_kept}"))),
+    }
+}
+
+/// `failed`, a failure of the run or of its transfer after the command, its reason as `said` turns it; any other end
+/// as it is.
+fn failure_said(failed: End, said: impl FnOnce(String) -> String) -> End {
+    match failed {
+        End::Failed(why) => End::Failed(said(why)),
+        End::TransferFailed(why) => End::TransferFailed(said(why)),
+        other => other,
     }
 }
 
@@ -1752,14 +1789,15 @@ fn line(attempt: &Attempt<'_, '_>, worktree: &Worktree<'_>, args: &[&str], set: 
         .ok_or_else(|| End::Failed(format!("git {} printed nothing", args.join(" "))))
 }
 
-/// The git call of the sync-back that failed, as the attempt's own failure: no fallback, the run's status 1.
-fn git_failure(root: &str, args: &[String], called: &Called) -> End {
-    End::Failed(escaped(&format!(
+/// Why the git call of the sync-back with `args` in the worktree at `root` failed: the attempt's own failure, with no
+/// fallback and the run's status 1.
+fn git_failure_why(root: &str, args: &[String], called: &Called) -> String {
+    escaped(&format!(
         "git {} failed in {root} (status {}): {}",
         args.join(" "),
         called.status,
         git::failure_text(&called.lines)
-    )))
+    ))
 }
 
 /// The hash `ls-remote` printed among its `lines` for exactly `reference`: a ref that only ends in it is another's.

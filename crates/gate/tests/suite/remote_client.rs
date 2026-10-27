@@ -4629,12 +4629,12 @@ fn a_refused_run_call_syncs_nothing_back() {
     assert_eq!(calls(&second), ["preflight", "run"]);
 }
 
-/// Through `local-ssh`, the box's run succeeds, then the sync-back's `ls-remote` is refused by ssh: the run fails
-/// with no fallback, and nothing after that call runs.
+/// Through `local-ssh`, the box's run succeeds, then the sync-back's `ls-remote` is refused by ssh on each of its three
+/// attempts: the run ends TRANSFER FAILED with no fallback, and nothing after that call runs.
 #[test]
-fn a_git_failure_of_the_sync_back_fails_the_run_with_no_fallback() {
+fn a_git_failure_of_the_sync_back_on_every_attempt_ends_transfer_failed_with_no_fallback() {
     let case = client_case("client-back-git-failure");
-    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", "fail-other"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", "fail-other", "fail-other", "fail-other"]);
 
     let outcome = finish(client_gate_through(
         &case,
@@ -4644,10 +4644,157 @@ fn a_git_failure_of_the_sync_back_fails_the_run_with_no_fallback() {
         &[r".\tool.exe", "mark", "made-on-box.txt"],
     ));
 
-    assert_eq!(outcome.code, Some(1), "{outcome:?}");
-    assert!(outcome.stderr.contains("gate: the remote run failed: git ls-remote"), "{outcome:?}");
+    assert_eq!(outcome.code, Some(74), "{outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: TRANSFER FAILED: the command exited 0 on builder; git ls-remote"),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr.matches(TRANSFER_RETRY).count(), 2, "{outcome:?}");
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
-    assert_eq!(calls(&steps), ["preflight", "git-receive-pack", "run", "git-upload-pack"]);
+    assert_eq!(
+        calls(&steps),
+        [
+            "preflight",
+            "git-receive-pack",
+            "run",
+            "git-upload-pack",
+            "git-upload-pack",
+            "git-upload-pack"
+        ]
+    );
+}
+
+/// The start of every retry line of a transfer after the command; its reason and `n of 2` follow it.
+const TRANSFER_RETRY: &str = "gate: bringing the results back from builder failed (";
+
+/// Through `local-ssh`, the sync-back's first `ls-remote` exits 255 with nothing said, a connection dropped after the
+/// banner: it is made again after the pause, and the run passes with the box's change brought back.
+#[test]
+fn a_passing_run_whose_ls_remote_fails_once_retries_it_and_passes() {
+    let case = client_case("client-back-ls-remote-retried");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", "drop", "ok", "ok"]);
+
+    let outcome = finish(client_gate_through(
+        &case,
+        "local-ssh",
+        "out.log",
+        &steps,
+        &[r".\tool.exe", "mark", "made-on-box.txt"],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(TRANSFER_RETRY).count(), 1, "{outcome:?}");
+    assert!(outcome.stderr.contains("); trying again (1 of 2)"), "{outcome:?}");
+    assert!(!outcome.stderr.contains(RETRY_LINE), "no pre-banner retry: {outcome:?}");
+    assert!(outcome.stderr.contains("gate: synced back 1 file(s): made-on-box.txt"), "{outcome:?}");
+    assert_eq!(
+        fs::read_to_string(case.folder().join("made-on-box.txt")).expect("the box's file is here"),
+        "run\n"
+    );
+    assert_eq!(
+        calls(&steps),
+        [
+            "preflight",
+            "git-receive-pack",
+            "run",
+            "git-upload-pack",
+            "git-upload-pack",
+            "git-upload-pack"
+        ]
+    );
+}
+
+/// Through `local-ssh`, a command that made a file on the builder and exited 3, then every attempt of the sync-back's
+/// `ls-remote` exits 255: the run says the transfer failed and keeps the command's own status and verdict.
+#[test]
+fn a_failing_run_whose_transfer_fails_keeps_the_command_s_status() {
+    let case = client_case("client-back-failed-transfer");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", "drop", "drop", "drop"]);
+
+    let outcome = finish(client_gate_through(
+        &case,
+        "local-ssh",
+        "out.log",
+        &steps,
+        &[r".\tool.exe", "mark", "made-on-box.txt", "exit", "3"],
+    ));
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert!(
+        outcome
+            .stderr
+            .contains("gate: TRANSFER FAILED: the command exited 3 on builder; git ls-remote"),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr.matches(TRANSFER_RETRY).count(), 2, "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: FAILED (status 3)"), "{outcome:?}");
+    assert!(!case.folder().join("made-on-box.txt").exists(), "nothing was applied: {outcome:?}");
+    assert_eq!(verdict(&case), "failed");
+}
+
+/// Through `local-ssh`, the sync-back's first fetch drops with git's 128 and ssh's words of a lost connection, said
+/// beside it as git's own error text: the retry line carries that text into the log, and the run still passes, not
+/// failing as a log that reports an error.
+#[test]
+fn a_retried_fetch_whose_reason_reads_as_an_error_still_passes() {
+    let case = client_case("client-fetch-retry-error-text");
+    let dropped = "say-exit 255 fatal: the remote end hung up unexpectedly: error in libcrypto";
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", "ok", dropped, "ok"]);
+
+    let outcome = finish(client_gate_through(
+        &case,
+        "local-ssh",
+        "out.log",
+        &steps,
+        &[r".\tool.exe", "mark", "made-on-box.txt"],
+    ));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(TRANSFER_RETRY).count(), 1, "{outcome:?}");
+    assert!(outcome.stderr.contains("error in libcrypto"), "the reason is said: {outcome:?}");
+    assert!(out_log(&case).contains("error in libcrypto"), "the reason is logged");
+    assert!(outcome.stderr.contains("gate: synced back 1 file(s): made-on-box.txt"), "{outcome:?}");
+}
+
+/// The transfer ceiling `--test-remote-watch-call fetch` gives the sync-back's fetch, and the pause before its retry,
+/// no shorter: a fetch that drops has less than the pause left of the ceiling it shares with its retries.
+const SHARED_CEILING_MS: &str = "5000";
+
+/// Through `local-ssh`, the sync-back's fetch drops once less than the pause before a retry is left of its transfer
+/// ceiling, which every attempt shares: it is not made again, and the run ends as a fetch past its ceiling does.
+#[test]
+fn a_fetch_that_drops_near_its_transfer_ceiling_is_not_retried_past_it() {
+    let case = client_case("client-fetch-retry-past-ceiling");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", "ok", "drop", "drop", "drop"]);
+    let tuned = Tuned {
+        kind: "local-ssh",
+        extra: &["--test-remote-watch-call", "fetch", "--test-remote-timeout-ms", SHARED_CEILING_MS],
+        pause: SHARED_CEILING_MS,
+        ..Tuned::default()
+    };
+
+    let outcome = finish(client_gate_tuned(
+        &case,
+        "out.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "mark", "made-on-box.txt"],
+    ));
+
+    assert_eq!(outcome.code, Some(124), "{outcome:?}");
+    assert!(!outcome.stderr.contains(TRANSFER_RETRY), "no retry: {outcome:?}");
+    assert!(
+        outcome.stderr.contains("gate: TRANSFER TIMED OUT after 5 s fetching the sync-back"),
+        "{outcome:?}"
+    );
+    assert!(!case.folder().join("made-on-box.txt").exists(), "nothing was applied: {outcome:?}");
+    assert_eq!(verdict(&case), "transfer-timed-out");
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "git-receive-pack", "run", "git-upload-pack", "git-upload-pack"]
+    );
 }
 
 /// The case's own exclude file leaves `made-on-box.txt` out of the snapshot, so the box's command makes it anew while
@@ -5426,21 +5573,131 @@ fn a_sync_back_fetch_past_its_transfer_ceiling_keeps_a_failed_command_s_status()
     assert_eq!(verdict(&case), "failed");
 }
 
+/// Through `local-ssh`, every attempt of the sync-back's `ls-remote` is held past the deadline
+/// `--test-remote-watch-call ls-remote` gives it alone, after a command that exited 0.
 #[test]
-fn a_sync_back_ls_remote_past_its_deadline_fails_the_run() {
+fn a_passing_run_whose_ls_remote_never_answers_ends_74_saying_the_command_passed() {
+    let case = client_case("client-ls-remote-late");
+    let hold = format!("hold {}", never(&case));
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok", &hold, &hold, &hold]);
     let tuned = Tuned {
+        kind: "local-ssh",
         extra: &["--test-remote-watch-call", "ls-remote", "--test-remote-timeout-ms", WATCHED_MS],
         ..Tuned::default()
     };
 
-    let outcome = a_failed_sync_back("client-ls-remote-late", |case| vec![format!("hold {}", never(case))], &tuned);
+    let outcome = finish(client_gate_tuned(
+        &case,
+        "out.log",
+        &steps,
+        &tuned,
+        &[r".\tool.exe", "mark", "made-on-box.txt"],
+    ));
+
+    assert_eq!(outcome.code, Some(74), "{outcome:?}");
+    let line = "gate: TRANSFER FAILED: the command exited 0 on builder; git ls-remote did not answer within 300 ms";
+    assert!(outcome.stderr.contains(line), "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(TRANSFER_RETRY).count(), 2, "{outcome:?}");
+    let last = "gate: bringing the results back from builder failed (git ls-remote did not answer within 300 ms); trying \
+                again (2 of 2)";
+    assert!(outcome.stderr.contains(last), "{outcome:?}");
+    assert!(!case.folder().join("made-on-box.txt").exists(), "nothing was applied: {outcome:?}");
+    assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new(), "no fallback");
+    assert_eq!(verdict(&case), "transfer-failed");
+}
+
+/// The sync-back's fetch is answered with bytes that are no protocol: git exits 128 for its own error, with no word of
+/// a lost connection, so the fetch is not made again and the run fails as any git failure does.
+#[test]
+fn a_sync_back_fetch_that_git_fails_with_128_on_its_own_is_not_retried() {
+    let outcome = a_failed_sync_back(
+        "client-fetch-not-network",
+        |_| vec!["ok".to_owned(), "garbage 8".to_owned()],
+        &Tuned::default(),
+    );
+
+    assert!(outcome.stderr.contains("gate: the remote run failed: git "), "{outcome:?}");
+    assert!(outcome.stderr.contains("(status 128)"), "{outcome:?}");
+    assert!(!outcome.stderr.contains(TRANSFER_RETRY), "{outcome:?}");
+    assert!(!outcome.stderr.contains("TRANSFER FAILED"), "{outcome:?}");
+}
+
+/// A sync-back fetch the watchdog stops for its silence is not made again.
+#[test]
+fn a_sync_back_fetch_that_stalls_is_not_retried() {
+    let tuned = Tuned {
+        extra: &["--test-remote-watch-call", "fetch", "--test-stall-ms", WATCHED_MS],
+        ..Tuned::default()
+    };
+
+    let outcome = a_failed_sync_back(
+        "client-fetch-stall-once",
+        |case| vec!["ok".to_owned(), format!("hold {}", never(case))],
+        &tuned,
+    );
 
     assert!(
         outcome
             .stderr
-            .contains("gate: the remote run failed: git ls-remote did not answer within 300 ms"),
+            .contains("gate: the remote run failed: git fetch did not answer for 300 ms"),
         "{outcome:?}"
     );
+    assert!(!outcome.stderr.contains(TRANSFER_RETRY), "{outcome:?}");
+}
+
+/// Through `local-ssh`, a pair's main repository is fetched, then every attempt of the sibling's `ls-remote` exits
+/// 255: the main repository's back commit is kept, and the TRANSFER FAILED line says where.
+#[test]
+fn a_pair_whose_second_transfer_fails_keeps_the_first_and_says_so() {
+    let (case, _, name, sibling) = pair_case("client-pair-transfer-failed", &[], sibling_repository);
+    let mut all = vec!["ok"; 6];
+    all.extend(["drop"; 3]);
+    let steps = ssh_steps(&case, "ssh", &all);
+    let on_sibling = format!(r"..\{name}\made-on-sibling.txt");
+
+    let outcome = finish(client_gate_through(
+        &case,
+        "local-ssh",
+        "out.log",
+        &steps,
+        &[r".\tool.exe", "mark", "made-on-box.txt", "mark", &on_sibling],
+    ));
+    let synced = sibling.join("made-on-sibling.txt").exists();
+    fs::remove_dir_all(&sibling).expect("the sibling can be removed");
+
+    assert_eq!(outcome.code, Some(74), "{outcome:?}");
+    let said = outcome
+        .stderr
+        .lines()
+        .find(|line| line.starts_with("gate: TRANSFER FAILED: the command exited 0 on builder; git ls-remote"));
+    assert!(
+        said.is_some_and(|line| line.contains("; the changes are kept: see git diff in each repo at refs/gate-remote/")),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.stderr.matches(TRANSFER_RETRY).count(), 2, "{outcome:?}");
+    assert!(!case.folder().join("made-on-box.txt").exists(), "nothing was applied: {outcome:?}");
+    assert!(!synced, "nothing was applied to the sibling: {outcome:?}");
+    assert_eq!(verdict(&case), "transfer-failed");
+}
+
+/// The first outputs call passes part of the stream through, then fails as a dropped connection does, but the box sent
+/// it all and removed the archive: the retry is answered that the archive does not exist, so the pull stops there and
+/// says the first call's failure.
+#[test]
+fn an_outputs_retry_that_finds_the_archive_gone_ends_transfer_failed_for_the_first_failure() {
+    let case = outputs_case("client-outputs-fetch-gone", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "truncate 8", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\new.txt", "built"]));
+
+    assert_eq!(outcome.code, Some(74), "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(TRANSFER_RETRY).count(), 1, "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs", "outputs"]);
+    let line = "gate: TRANSFER FAILED: the command exited 0 on builder; remote outputs not brought back: Connection timed out \
+                during banner exchange";
+    assert!(outcome.stderr.contains(line), "{outcome:?}");
+    assert_eq!(fetched_archives(&case), Vec::<PathBuf>::new(), "no archive is left");
+    assert_eq!(verdict(&case), "transfer-failed");
 }
 
 #[test]
@@ -7301,38 +7558,68 @@ fn ctrl_c_during_the_fetch_ends_as_an_interrupt() {
     assert!(pending_marker(&case).exists(), "{outcome:?}");
 }
 
+/// Each of the outputs call's three attempts is made again before the banner until its own retries run out: the run
+/// that passed ends TRANSFER FAILED.
 #[test]
-fn a_fetch_dropped_before_any_byte_is_made_again_until_its_retries_run_out() {
+fn a_fetch_dropped_before_any_byte_ends_transfer_failed_once_every_retry_ran_out() {
     let case = outputs_case("client-outputs-fetch-banner", &BIN);
-    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "fail-banner", "fail-banner", "fail-banner", "fail-banner"]);
+    let mut all = vec!["ok", "ok"];
+    all.extend(["fail-banner"; 12]);
+    let steps = ssh_steps(&case, "ssh", &all);
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\new.txt", "built"]));
 
-    assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
-    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 3, "{outcome:?}");
-    assert_eq!(calls(&steps), ["preflight", "run", "outputs", "outputs", "outputs", "outputs"]);
-    let line = "gate: remote outputs not brought back: Connection timed out during banner exchange";
+    assert_eq!(outcome.code, Some(74), "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(RETRY_LINE).count(), 9, "{outcome:?}");
+    assert_eq!(outcome.stderr.matches(TRANSFER_RETRY).count(), 2, "{outcome:?}");
+    let mut expected = vec!["preflight", "run"];
+    expected.extend(["outputs"; 12]);
+    assert_eq!(calls(&steps), expected);
+    let line = "gate: TRANSFER FAILED: the command exited 0 on builder; remote outputs not brought back: Connection timed out \
+                during banner exchange";
     assert!(outcome.stderr.contains(line), "{outcome:?}");
-    assert_eq!(fetched_archives(&case), Vec::<PathBuf>::new(), "nothing is left of either attempt");
+    assert_eq!(fetched_archives(&case), Vec::<PathBuf>::new(), "nothing is left of any attempt");
     assert!(pending_marker(&case).exists(), "{outcome:?}");
+    assert_eq!(verdict(&case), "transfer-failed");
 }
 
-/// The stand-in passes the archive's first 8 bytes, then says ssh's pre-banner line and exits 255: only the bytes it
-/// sent tell the drop from one before the banner.
+/// The stand-in passes 8 bytes of the stream, then exits 255 as a connection dropped mid-stream does: the box still
+/// holds its archive, so the call is made again after the pause and brings the outputs back whole.
 #[test]
-fn a_fetch_dropped_after_bytes_is_not_retried() {
-    let case = outputs_case("client-outputs-fetch-truncated", &BIN);
-    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "truncate 8", "ok"]);
+fn a_passing_run_whose_outputs_fetch_fails_once_retries_it_and_brings_them_back() {
+    let case = outputs_case("client-outputs-fetch-retried", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "bytes-exit 8 255", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\new.txt", "built"]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(!outcome.stderr.contains(RETRY_LINE), "no pre-banner retry: {outcome:?}");
+    assert_eq!(outcome.stderr.matches(TRANSFER_RETRY).count(), 1, "{outcome:?}");
+    let retry = "gate: bringing the results back from builder failed (remote outputs not brought back: the outputs call \
+                 failed (status 255)); trying again (1 of 2)";
+    assert!(outcome.stderr.contains(retry), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs", "outputs"]);
+    let installed = fs::read_to_string(case.folder().join("bin").join("new.txt"));
+    assert_eq!(installed.ok().as_deref(), Some("built"), "{outcome:?}");
+    assert_eq!(fetched_archives(&case), Vec::<PathBuf>::new(), "no archive is left");
+}
+
+/// The outputs call exits 1 with an error line of its own, no failure of ssh's: it is not made again, and the run that
+/// passed fails as before.
+#[test]
+fn a_fetch_failure_that_is_not_ssh_s_is_not_retried() {
+    let case = outputs_case("client-outputs-fetch-not-ssh", &BIN);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "say-exit 1 fatal: the archive cannot be read"]);
 
     let outcome = finish(client_gate(&case, "out.log", &steps, &[r".\tool.exe", "write", r"bin\new.txt", "built"]));
 
     assert_eq!(outcome.code, Some(1), "a passing run becomes 1: {outcome:?}");
-    assert!(!outcome.stderr.contains(RETRY_LINE), "{outcome:?}");
-    assert_eq!(calls(&steps), ["preflight", "run", "outputs"]);
-    let line = "gate: remote outputs not brought back: Connection timed out during banner exchange";
+    assert!(!outcome.stderr.contains(TRANSFER_RETRY), "{outcome:?}");
+    assert!(!outcome.stderr.contains("TRANSFER FAILED"), "{outcome:?}");
+    let line = "gate: remote outputs not brought back: fatal: the archive cannot be read";
     assert!(outcome.stderr.contains(line), "{outcome:?}");
-    assert_eq!(fetched_archives(&case), Vec::<PathBuf>::new(), "the partial archive is removed");
-    assert!(pending_marker(&case).exists(), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"]);
+    assert_eq!(verdict(&case), "failed");
 }
 
 /// The outputs call sends a few bytes, then nothing, past the transfer ceiling `--test-remote-watch-call outputs` gives

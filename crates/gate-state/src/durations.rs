@@ -464,11 +464,11 @@ enum Outcome {
 }
 
 impl Outcome {
-    /// How a run with `verdict` counts: `None` for an unknown verdict or a transfer that timed out, or a passing run
-    /// with no finite wall time.
+    /// How a run with `verdict` counts: `None` for an unknown verdict, a transfer that timed out or one that failed, or a
+    /// passing run with no finite wall time.
     fn new(verdict: Verdict, sample: Option<Sample>) -> Option<Outcome> {
         match verdict {
-            Verdict::Unknown | Verdict::TransferTimedOut => None,
+            Verdict::Unknown | Verdict::TransferTimedOut | Verdict::TransferFailed => None,
             Verdict::Passed => sample.map(Outcome::Passed),
             _ => Some(Outcome::Failed),
         }

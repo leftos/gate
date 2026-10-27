@@ -475,6 +475,7 @@ pub(super) fn unexpected(end: &End) -> &'static str {
         End::Refused(_) => "refused",
         End::SentRefused => "refused for the PC's build",
         End::Failed(_) => "failed",
+        End::TransferFailed(_) => "with a failed transfer",
         End::Interrupted => "interrupted",
     }
 }

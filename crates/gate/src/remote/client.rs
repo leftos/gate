@@ -159,6 +159,8 @@ pub(crate) struct RustClient {
     git: GitBounds,
     /// The pause before a retry.
     pause: Duration,
+    /// The pauses before the first and the second retry of a transfer after the command.
+    transfer_pauses: [Duration; retry::TRANSFER_RETRIES],
     /// How long a bounded call, the `stop` or the `boot`, may take.
     bound: Duration,
     /// `--test-stall-ms`: the stall window, given as it is, with no floor.
@@ -224,6 +226,7 @@ impl RustClient {
             transport,
             git: GitBounds::of(seams),
             pause: retry::pause(seams),
+            transfer_pauses: retry::transfer_pauses(seams),
             bound: retry::bound(seams),
             stall_ms: seams.stall_ms,
             timeout_ms: seams.remote_timeout_ms,
@@ -375,6 +378,8 @@ impl RemoteClient for RustClient {
             git: self.git,
             lock_wait: self.git.limit,
             pause: self.pause,
+            transfer_pauses: self.transfer_pauses,
+            transfer_failed: false,
             limits: Limits {
                 started,
                 stall,
@@ -382,6 +387,7 @@ impl RemoteClient for RustClient {
                 backstop: self.backstop_ms.map_or_else(|| watchdog::backstop(call.timeout), Duration::from_millis),
                 transfer: TRANSFER_CEILING,
                 bound: self.bound,
+                transfer_from: None,
             },
             one_call: one.map(|name| OneCall {
                 name,
@@ -583,6 +589,9 @@ pub(super) enum End {
     /// One of a sibling pair's repositories cannot be sent as the route decided, for the reason this line, `gate: not
     /// routed: sibling {name} {why}`, says: the run falls back `client` before the run call.
     NotRouted(String),
+    /// A transfer after the command, the sync-back's or the outputs call, failed as a connection fails on every attempt,
+    /// for this reason: [`Attempt::transferred`] turns it into the TRANSFER FAILED line and the run's status.
+    TransferFailed(String),
 }
 
 /// What the preflight found: the bare repositories it created just now, as its `gate: remote created {bare}` lines name
@@ -969,6 +978,9 @@ pub(super) struct Limits {
     backstop: Duration,
     transfer: Duration,
     bound: Duration,
+    /// Where a fetch's or a put's transfer ceiling counts from when not from its own start: the first attempt's start
+    /// of a transfer after the command that is made again ([`Attempt::transfer_call`]), whose attempts share one ceiling.
+    transfer_from: Option<Instant>,
 }
 
 impl Limits {
@@ -1007,8 +1019,9 @@ pub(super) enum Watch {
     /// attempt's start: the setup's calls, the preflight and the push.
     Setup(Limits),
     /// Killed once it sent nothing for the stall window of these limits, or at the transfer ceiling counted from its own
-    /// start, or once its job wrote more bytes than the cap when it has one: the sync-back's fetch, the outputs call,
-    /// and the inputs' diff call, which has no cap.
+    /// start, or from its transfer's first attempt when it is made again ([`Watch::counted_from`]), or once its job
+    /// wrote more bytes than the cap when it has one: the sync-back's fetch, the outputs call, and the inputs' diff
+    /// call, which has no cap.
     Fetch(Limits, Option<u64>),
     /// Killed once, while its feeder still writes the archive, neither a byte was fed nor one of its output came for
     /// the stall window of these limits, or at the transfer ceiling counted from its own start, which alone watches it
@@ -1042,7 +1055,8 @@ impl Watch {
             Watch::Setup(limits) => limits.setup_cut(now, idle),
             Watch::Fetch(limits, _) | Watch::Put(limits) if idle >= limits.stall => Some(Cut::Silent(limits.stall)),
             Watch::Fetch(limits, _) | Watch::Put(limits) => {
-                (now.saturating_duration_since(begun) >= limits.transfer).then_some(Cut::Ceiling(limits.transfer))
+                let from = limits.transfer_from.unwrap_or(begun);
+                (now.saturating_duration_since(from) >= limits.transfer).then_some(Cut::Ceiling(limits.transfer))
             }
             Watch::Deadline(limit) | Watch::Bounded(limit) => (now.saturating_duration_since(begun) >= limit).then_some(Cut::Late(limit)),
         }
@@ -1061,6 +1075,27 @@ impl Watch {
     fn byte_cap(self) -> Option<u64> {
         match self {
             Watch::Fetch(_, cap) => cap,
+            Watch::Run(_) | Watch::Setup(_) | Watch::Put(_) | Watch::Deadline(_) | Watch::Bounded(_) => None,
+        }
+    }
+
+    /// The watch of one attempt of a transfer after the command whose first attempt began at `first`: a fetch's
+    /// transfer ceiling counts from then, so every attempt shares it; any other watch as it is.
+    fn counted_from(self, first: Instant) -> Watch {
+        match self {
+            Watch::Fetch(mut limits, cap) => {
+                limits.transfer_from = Some(first);
+                Watch::Fetch(limits, cap)
+            }
+            other => other,
+        }
+    }
+
+    /// The transfer ceiling a call watched so is cut at: a fetch's; `None` for a call [`Attempt::transfer_call`] makes
+    /// with any other watch, a deadline's.
+    fn transfer_ceiling(self) -> Option<Duration> {
+        match self {
+            Watch::Fetch(limits, _) => Some(limits.transfer),
             Watch::Run(_) | Watch::Setup(_) | Watch::Put(_) | Watch::Deadline(_) | Watch::Bounded(_) => None,
         }
     }
@@ -1129,6 +1164,14 @@ pub(super) struct Called {
     pub(super) received: Option<Received>,
 }
 
+/// What a transfer after the command came to ([`Attempt::transfer_call`]): the call that counts, whether it failed as
+/// a connection fails with no retry left, and the reason of the first call that failed so, when one was made again.
+pub(super) struct Transferred {
+    pub(super) called: Called,
+    pub(super) exhausted: bool,
+    pub(super) first: Option<String>,
+}
+
 /// What a call's raw copy had written into its sink when the watch cut the call: the bytes, and how long the call had
 /// run by then, counted from its own start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1144,15 +1187,33 @@ impl Called {
         self.written.is_some_and(|bytes| bytes > RETRY_WRITTEN)
     }
 
+    /// Whether the call, a transfer after the command by a program that exits `fail_status` when ssh failed, failed as a
+    /// connection fails, so it is made again ([`retry::transfer_failed`]).
+    pub(super) fn transfer_failed(&self, fail_status: i32) -> bool {
+        retry::transfer_failed(&self.ended(fail_status))
+    }
+
     /// Whether the call failed before the banner, for a program that exits `fail_status` when ssh failed.
     fn before_the_banner(&self, fail_status: i32) -> bool {
-        retry::before_the_banner(&Ended {
+        retry::before_the_banner(&self.ended(fail_status))
+    }
+
+    /// How the call, by a program that exits `fail_status` when ssh failed, ended, as both retry rules read it.
+    fn ended(&self, fail_status: i32) -> Ended<'_> {
+        Ended {
             status: self.status,
             fail_status,
             output_seen: self.output_seen,
             first_error: self.first_error.as_deref(),
             started: self.started,
-        })
+            cut: self.cut,
+            said: self.said().collect(),
+        }
+    }
+
+    /// Every line of the call it kept: its first and its last standard error lines, and its last lines but heartbeats.
+    pub(super) fn said(&self) -> impl Iterator<Item = &str> {
+        self.first_error.iter().chain(&self.last_error).chain(&self.lines).map(String::as_str)
     }
 
     /// The box's refusal of the run, from its tag; none once the box said the start marker, which no refusal follows.
@@ -1198,6 +1259,10 @@ pub(super) struct Attempt<'c, 'a> {
     /// shorten without shortening its git calls.
     pub(super) lock_wait: Duration,
     pause: Duration,
+    /// The pauses before the first and the second retry of a transfer after the command ([`Attempt::transfer_call`]).
+    transfer_pauses: [Duration; retry::TRANSFER_RETRIES],
+    /// Whether the command exited 0 but a transfer after it failed every attempt ([`Attempt::transferred`]).
+    transfer_failed: bool,
     pub(super) limits: Limits,
     one_call: Option<OneCall<'c>>,
     /// The call, `preflight`, `run` or `outputs`, after whose first output byte the console interrupt is raised, as a
@@ -1395,21 +1460,38 @@ impl Attempt<'_, '_> {
             End::Status(status) => {
                 let back_commits = called.back_commits.as_deref().and_then(syncback::back_commits);
                 let synced = match syncback::targets(self.call, snapshot, siblings) {
-                    Some(targets) => syncback::sync_back(self, &targets, back_commits.as_deref(), status)?,
-                    None => syncback::unmatched(self, status),
+                    Some(targets) => syncback::sync_back(self, &targets, back_commits.as_deref(), status),
+                    None => Ok(syncback::unmatched(self, status)),
                 };
-                let brought = outputs::accepted(called.outputs.as_ref(), self.call.key, &nonce);
-                let ran = outputs::Ran {
-                    location: &location,
-                    nonce: &nonce,
-                    status,
-                    names_skipped: called.names_skipped,
-                };
-                Ok(outputs::ended(self, &sent, &ran, synced, brought.as_ref()))
+                let end = synced.map(|synced| {
+                    let brought = outputs::accepted(called.outputs.as_ref(), self.call.key, &nonce);
+                    let ran = outputs::Ran {
+                        location: &location,
+                        nonce: &nonce,
+                        status,
+                        names_skipped: called.names_skipped,
+                    };
+                    outputs::ended(self, &sent, &ran, synced, brought.as_ref())
+                });
+                self.transferred(status, end)
             }
             End::Lost(output) => Ok(self.connection_lost(&location, prepared.boot.as_deref(), output)),
             end => Ok(self.refused_end(end, called.last_error.as_deref())),
         }
+    }
+
+    /// The end of a run whose command exited `status` once its transfers after it ended at `end`. A transfer that failed
+    /// every attempt says the TRANSFER FAILED line with the command's exit and its reason, and ends the run as
+    /// [`super::TRANSFER_FAILED`] after a command that exited 0, else as the command's own status; any other end stands.
+    fn transferred(&mut self, status: i64, end: Result<End, End>) -> Result<End, End> {
+        let why = match end {
+            Ok(End::TransferFailed(why)) | Err(End::TransferFailed(why)) => why,
+            end => return end,
+        };
+        let host = self.call.host();
+        self.say(format!("gate: TRANSFER FAILED: the command exited {status} on {host}; {why}"));
+        self.transfer_failed = status == 0;
+        Ok(End::Status(if status == 0 { super::TRANSFER_FAILED } else { status }))
     }
 
     /// Whether the run needs git-lfs of the builder, its need then added to `needs` ([`toolchain::with_git_lfs`]): when
@@ -2741,6 +2823,60 @@ impl Attempt<'_, '_> {
         Ok((called, again))
     }
 
+    /// A transfer after the command, each attempt made with `make` under `watch` by a program that exits `fail_status`
+    /// when ssh failed. A call that failed as a connection fails ([`Called::transfer_failed`]) has its problem noted
+    /// and is said with the reason `reason` gives it, then made again after its pause, up to
+    /// [`retry::TRANSFER_RETRIES`] times; a Ctrl+C before a retry or during its pause ends the attempt instead. Every
+    /// attempt of a fetch shares one transfer ceiling, counted from the first one's start: with less than the pause
+    /// left of it, the call is not made again but ends as one cut at the ceiling. What the transfer came to, or why a
+    /// call could not be made.
+    pub(super) fn transfer_call(
+        &mut self,
+        fail_status: i32,
+        watch: Watch,
+        mut make: impl FnMut(&mut Self, Watch) -> Result<Called, End>,
+        reason: impl Fn(&Called) -> String,
+    ) -> Result<Transferred, End> {
+        let begun = Instant::now();
+        let watch = watch.counted_from(begun);
+        let mut first = None;
+        let mut retries = (1..).zip(self.transfer_pauses);
+        loop {
+            let mut called = make(self, watch)?;
+            if !called.transfer_failed(fail_status) {
+                return Ok(Transferred {
+                    called,
+                    exhausted: false,
+                    first,
+                });
+            }
+            let Some((retry, pause)) = retries.next() else {
+                return Ok(Transferred {
+                    called,
+                    exhausted: true,
+                    first,
+                });
+            };
+            if let Some(ceiling) = watch.transfer_ceiling()
+                && ceiling.saturating_sub(begun.elapsed()) < pause
+            {
+                called.cut = Some(Cut::Ceiling(ceiling));
+                return Ok(Transferred {
+                    called,
+                    exhausted: false,
+                    first,
+                });
+            }
+            self.noted(&called);
+            let why = reason(&called);
+            self.go_on()?;
+            self.say(retry::transfer_retry_line(self.call.host(), &why, retry));
+            paused(pause, self.call.interrupt)?;
+            self.go_on()?;
+            first.get_or_insert(why);
+        }
+    }
+
     /// After the run call's connection to the builder at `location` was lost: stops the command, then, when the
     /// preflight said the builder's boot time, `before`, asks for it again, as [`after_loss`] reads the two. A restart
     /// falls back `rebooted`, and no boot time to compare by `unreachable`; either leaves the run call's own lines,
@@ -2881,18 +3017,19 @@ impl Attempt<'_, '_> {
     }
 
     /// The outputs call to the builder at `location` for the archive `name`: `gate box outputs`, made again when it
-    /// failed before the banner, watched as a fetch by `limits`, and the console interrupt raised after its first
+    /// failed before the banner, watched as `watch` says, a fetch's, and the console interrupt raised after its first
     /// output byte with `--test-remote-interrupt-at outputs`. Each attempt writes its standard output raw to the file
     /// `archive` makes new for it; its standard error lines go to the log. Each attempt is watched as the outputs pull
     /// `pull`, whose progress it says against the archive's size when the box said it. What the pull received is
     /// counted from nothing before the call, so a Ctrl+C that ends it before it starts leaves no earlier call's figures.
-    /// The call that counts, its lines kept; else why the file or the call could not be made, or the interrupt.
+    /// The call that counts, its lines kept and still on it; else why the file or the call could not be made, or the
+    /// interrupt.
     pub(super) fn outputs_call(
         &mut self,
         location: &Location,
         name: &str,
         archive: &mut outputs::Archive,
-        limits: Limits,
+        watch: Watch,
         pull: Pull,
     ) -> Result<Called, End> {
         self.pulled_bytes = 0;
@@ -2908,11 +3045,11 @@ impl Attempt<'_, '_> {
                 sink: Some(archive.create(cap).map_err(End::Failed)?),
                 ..CallOnly::plain(Arc::clone(&input))
             };
-            attempt.ssh(BoxVerb::Outputs, Echo::LogOnly, Watch::Fetch(limits, None), raise, only)
+            attempt.ssh(BoxVerb::Outputs, Echo::LogOnly, watch, raise, only)
         });
         self.pulling = None;
-        let (mut called, _) = retried?;
-        self.lines.append(&mut called.lines);
+        let (called, _) = retried?;
+        self.lines.extend_from_slice(&called.lines);
         Ok(called)
     }
 
@@ -3283,15 +3420,17 @@ impl Attempt<'_, '_> {
             End::Interrupted => (i64::from(CONTROL_C_EXIT.cast_signed()), None),
             End::Killed => (i64::from(KILLED), None),
             End::Lost(_) => (i64::from(SSH_FAILED), None),
-            End::Failed(why) => {
+            // A transfer's failure is turned into the run's end once the command's exit is known; one that is not
+            // fails the run as any client failure does.
+            End::Failed(why) | End::TransferFailed(why) => {
                 self.say(format!("{FAILED_RUN}: {why}"));
                 (FAILED, None)
             }
         };
         // A line that could not be written fails the run, unless the watchdog killed it: the kill stays the run's end.
-        let (status, reason, killed) = match (&self.problem, killed) {
-            (Some(_), false) => (FAILED, None, false),
-            _ => (status, reason, killed),
+        let (status, reason, killed, transfer_failed) = match (&self.problem, killed) {
+            (Some(_), false) => (FAILED, None, false, false),
+            _ => (status, reason, killed, self.transfer_failed),
         };
         let status = warm_status(status, warm.as_ref());
         RemoteOutcome {
@@ -3305,6 +3444,7 @@ impl Attempt<'_, '_> {
             split: self.split,
             adjusted: self.adjusted,
             box_killed: self.box_killed,
+            transfer_failed,
             warm,
             raised: self.raised,
         }
@@ -3331,6 +3471,8 @@ impl<'c, 'a> Attempt<'c, 'a> {
             git: git::GIT_BOUNDS,
             lock_wait: git::TEST_HANG_GUARD,
             pause: Duration::ZERO,
+            transfer_pauses: [Duration::ZERO; crate::remote::retry::TRANSFER_RETRIES],
+            transfer_failed: false,
             limits: Limits::for_tests(),
             one_call: None,
             interrupt_at: None,
@@ -3382,6 +3524,7 @@ impl Limits {
             backstop: Duration::from_secs(3600),
             transfer: Duration::from_secs(3600),
             bound: Duration::from_secs(30),
+            transfer_from: None,
         }
     }
 }
@@ -4777,7 +4920,7 @@ fn warm_reason(end: &End, started: bool) -> String {
         End::Killed => "the warm-up was killed: it ran out of its budget or went silent".to_owned(),
         End::Lost(_) => "the connection to the builder was lost".to_owned(),
         End::NotRouted(_) => "the client could not send the warm-up".to_owned(),
-        End::Failed(_) => "the client failed".to_owned(),
+        End::Failed(_) | End::TransferFailed(_) => "the client failed".to_owned(),
         End::Interrupted => "the warm-up was interrupted".to_owned(),
     }
 }
@@ -5263,6 +5406,8 @@ mod tests {
             git: GIT_BOUNDS,
             lock_wait: git::TEST_HANG_GUARD,
             pause: LONG,
+            transfer_pauses: [LONG; crate::remote::retry::TRANSFER_RETRIES],
+            transfer_failed: false,
             limits: Limits::for_tests(),
             one_call: None,
             interrupt_at: None,
@@ -6126,7 +6271,13 @@ mod tests {
             after: Duration::from_millis(2_500),
         });
 
-        let end = outputs::judged(&mut attempt, (&archive, outputs::Bringing::Outputs), &stalled, End::Status(0), false);
+        let end = outputs::judged(
+            &mut attempt,
+            (&archive, outputs::Bringing::Outputs),
+            (&stalled, false),
+            End::Status(0),
+            false,
+        );
 
         assert!(matches!(end, End::Killed), "{end:?}");
         assert_eq!(
@@ -6158,7 +6309,7 @@ mod tests {
             started: Instant::now(),
         };
 
-        let called = attempt.outputs_call(&location(), "app.tar.zst", &mut archive, Limits::for_tests(), pull);
+        let called = attempt.outputs_call(&location(), "app.tar.zst", &mut archive, Watch::Fetch(Limits::for_tests(), None), pull);
 
         assert!(matches!(called, Err(End::Interrupted)), "the raised Ctrl+C ends it");
         assert_eq!(attempt.pulled_bytes, 0, "no earlier call's bytes");
@@ -6198,6 +6349,7 @@ mod tests {
             backstop: 360 * second,
             transfer: 1800 * second,
             bound: 30 * second,
+            transfer_from: None,
         };
         let put = Watch::Put(limits);
         let mut sending = super::Sending::new(begun);
@@ -6233,6 +6385,7 @@ mod tests {
             backstop: 360 * second,
             transfer: 1800 * second,
             bound: 30 * second,
+            transfer_from: None,
         };
         let put = Watch::Put(limits);
         let mut sending = super::Sending::new(begun);
@@ -6368,6 +6521,7 @@ mod tests {
             backstop: 360 * second,
             transfer: 60 * second,
             bound: 30 * second,
+            transfer_from: None,
         };
         let cap = 262_144;
         let raised = Raised {
@@ -6423,7 +6577,7 @@ mod tests {
         );
         let mut cut = ended_with(0, "");
         cut.cut = Some(Cut::ArchiveTooBig(262_144));
-        let end = outputs::judged(&mut attempt, (&archive, outputs::Bringing::Outputs), &cut, End::Status(0), false);
+        let end = outputs::judged(&mut attempt, (&archive, outputs::Bringing::Outputs), (&cut, false), End::Status(0), false);
         (end, std::mem::take(&mut attempt.lines))
     }
 
@@ -6535,7 +6689,7 @@ mod tests {
         let mut cut = ended_with(0, "");
         cut.cut = Some(Cut::ArchiveTooBig(262_144));
 
-        let end = outputs::judged(&mut attempt, (&archive, outputs::Bringing::Outputs), &cut, End::Status(0), false);
+        let end = outputs::judged(&mut attempt, (&archive, outputs::Bringing::Outputs), (&cut, false), End::Status(0), false);
 
         assert!(matches!(end, End::Status(0)), "the run keeps its status: {end:?}");
         assert!(!path.exists(), "the partial archive a cut fetch wrote is removed");
@@ -6556,7 +6710,13 @@ mod tests {
         );
         let failed = ended_with(SSH_FAILED, "Connection reset by peer");
 
-        let end = outputs::judged(&mut attempt, (&archive, outputs::Bringing::Outputs), &failed, End::Status(0), true);
+        let end = outputs::judged(
+            &mut attempt,
+            (&archive, outputs::Bringing::Outputs),
+            (&failed, false),
+            End::Status(0),
+            true,
+        );
 
         assert!(matches!(end, End::Interrupted), "{end:?}");
         assert_eq!(attempt.lines, Vec::<String>::new());
@@ -6889,6 +7049,7 @@ mod tests {
             backstop: 360 * second,
             transfer: 90 * second,
             bound: 30 * second,
+            transfer_from: None,
         };
         let begun = started + 40 * second;
         let fetch = Watch::Fetch(limits, None);
@@ -6977,6 +7138,7 @@ mod tests {
             backstop: 360 * second,
             transfer: 60 * second,
             bound: 30 * second,
+            transfer_from: None,
         };
         let (now, cap) = (started + second, 262_144);
         let capped = Watch::Fetch(limits, Some(cap));

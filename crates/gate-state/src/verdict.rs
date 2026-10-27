@@ -26,6 +26,8 @@ pub enum Verdict {
     Backstop,
     /// A routed run's transfer, after the command ended, outlived its own transfer ceiling and was stopped.
     TransferTimedOut,
+    /// A routed command exited 0, but a transfer after it failed every attempt, so its results were not brought back.
+    TransferFailed,
     /// The gate ended before its command had a verdict.
     Unknown,
 }
@@ -57,6 +59,7 @@ impl Verdict {
             Verdict::TimedOut => "timed-out",
             Verdict::Backstop => "backstop",
             Verdict::TransferTimedOut => "transfer-timed-out",
+            Verdict::TransferFailed => "transfer-failed",
             Verdict::Unknown => "unknown",
         }
     }
@@ -71,6 +74,7 @@ impl Verdict {
             "timed-out" => Some(Verdict::TimedOut),
             "backstop" => Some(Verdict::Backstop),
             "transfer-timed-out" => Some(Verdict::TransferTimedOut),
+            "transfer-failed" => Some(Verdict::TransferFailed),
             "unknown" => Some(Verdict::Unknown),
             _ => None,
         }
@@ -117,6 +121,34 @@ mod tests {
             Verdict::of(Some("gate: TRANSFERX TIMED OUT after 1800 s"), 3, 3),
             Verdict::Failed,
             "the kill words end at a word boundary"
+        );
+    }
+
+    #[test]
+    fn a_transfer_failed_line_is_no_kill_line_and_its_word_reads_back() {
+        let line = "gate: TRANSFER FAILED: the command exited 3 on b1; git ls-remote did not answer within 60 s";
+        assert_eq!(Verdict::of(Some(line), 3, 3), Verdict::Failed, "the watchdog never writes it");
+        let passed = "gate: TRANSFER FAILED: the command exited 0 on b1; git ls-remote did not answer within 60 s";
+        assert_eq!(
+            Verdict::of(Some(passed), 0, 74),
+            Verdict::LogFailure,
+            "as for any line that is no kill line"
+        );
+        assert_eq!(Verdict::TransferFailed.as_str(), "transfer-failed");
+        assert_eq!(
+            Verdict::named(Verdict::TransferFailed.as_str()),
+            Some(Verdict::TransferFailed),
+            "the word reads back"
+        );
+        assert_eq!(
+            Verdict::of(Some("gate: TRANSFER TIMED OUT after 1800 s fetching the outputs"), 0, 124),
+            Verdict::TransferTimedOut,
+            "a transfer past its ceiling is still transfer-timed-out"
+        );
+        assert_eq!(
+            Verdict::of(Some("gate: TRANSFER FAILEDX: the command exited 0"), 3, 3),
+            Verdict::Failed,
+            "the word ends at a word boundary"
         );
     }
 }

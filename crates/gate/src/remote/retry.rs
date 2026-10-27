@@ -1,10 +1,14 @@
-//! The one rule a call of the client is retried on: it failed before the ssh banner, so the builder never started
-//! anything and the call is safe to make again. It is made again up to [`PRE_BANNER_RETRIES`] times, each after a pause,
-//! for as long as every call fails the same way.
+//! The two rules a call of the client is retried on. Any call that failed before the ssh banner, so the builder never
+//! started anything and the call is safe to make again, is made again up to [`PRE_BANNER_RETRIES`] times, each after a
+//! pause, for as long as every call fails the same way. A transfer after the command, the sync-back's `ls-remote` and
+//! `fetch` and the outputs call, that failed as a connection fails ([`transfer_failed`]) is made again up to
+//! [`TRANSFER_RETRIES`] times, each after its own pause, the first rule nested inside each attempt.
 
 use std::time::Duration;
 
 use gate_args::TestSeams;
+
+use super::watchdog::Cut;
 
 /// The status ssh exits with when it fails itself, and the one git exits with when the ssh it ran failed.
 pub(crate) const SSH_FAILED: i32 = 255;
@@ -26,15 +30,17 @@ const PRE_BANNER: [&str; 3] = [
     "banner exchange: ",
 ];
 
-/// How one call ended, as the rule reads it: its exit status, the status its program exits with when ssh failed,
-/// whether it wrote anything on standard output, its first standard error line as it came, and whether the box said
-/// the run's start marker.
+/// How one call ended, as the rules read it: its exit status, the status its program exits with when ssh failed,
+/// whether it wrote anything on standard output, its first standard error line as it came, whether the box said the
+/// run's start marker, why the client cut it, if it did, and every line it said that it kept.
 pub(crate) struct Ended<'a> {
     pub status: i32,
     pub fail_status: i32,
     pub output_seen: bool,
     pub first_error: Option<&'a str>,
     pub started: bool,
+    pub cut: Option<Cut>,
+    pub said: Vec<&'a str>,
 }
 
 /// Whether the call failed before the banner: no start marker from the box, ssh's own failure status, nothing on
@@ -57,6 +63,58 @@ pub(crate) fn retry_line(host: &str, n: usize, total: usize) -> String {
 /// The pause before a retry: `--test-remote-retry-pause-ms` when given, else 2 s.
 pub(crate) fn pause(seams: &TestSeams) -> Duration {
     seams.remote_retry_pause_ms.map_or(PAUSE, Duration::from_millis)
+}
+
+/// How many times a transfer after the command that failed as a connection fails is made again.
+pub(crate) const TRANSFER_RETRIES: usize = 2;
+/// The pauses before a transfer's first and second retries, when `--test-remote-retry-pause-ms` gives none.
+const TRANSFER_PAUSES: [Duration; TRANSFER_RETRIES] = [Duration::from_secs(5), Duration::from_secs(15)];
+
+/// The words, compared without regard to case, that git or its ssh says when the connection to the builder failed: a
+/// git call's [`GIT_SSH_FAILED`] counts as a connection failure only beside one of them or of [`PRE_BANNER`]'s.
+const CONNECTION_WORDS: [&str; 8] = [
+    "Could not read from remote repository",
+    "the remote end hung up unexpectedly",
+    "early EOF",
+    "Connection reset",
+    "Connection closed",
+    "Connection timed out",
+    "Broken pipe",
+    "kex_exchange_identification",
+];
+
+/// Whether a transfer after the command failed as a connection fails: cut at its deadline, or uncut with its program's
+/// own status for a failed ssh. ssh's own [`SSH_FAILED`] counts as it is; git's [`GIT_SSH_FAILED`], which git also
+/// exits with for its own errors, only when a line it said holds one of [`CONNECTION_WORDS`] or [`PRE_BANNER`]'s. Any
+/// other cut, a stall or the transfer ceiling among them, and any other status are not.
+pub(crate) fn transfer_failed(ended: &Ended<'_>) -> bool {
+    match ended.cut {
+        Some(Cut::Late(_)) => true,
+        Some(_) => false,
+        None if ended.status != ended.fail_status => false,
+        None => ended.fail_status == SSH_FAILED || ended.said.iter().any(|line| connection_lost(line)),
+    }
+}
+
+/// Whether `line` holds one of [`CONNECTION_WORDS`] or [`PRE_BANNER`]'s, in any case.
+fn connection_lost(line: &str) -> bool {
+    let line = line.to_lowercase();
+    CONNECTION_WORDS
+        .iter()
+        .chain(PRE_BANNER.iter())
+        .any(|words| line.contains(&words.to_lowercase()))
+}
+
+/// The line said before the retry `n`, counted from 1, of a transfer from `host` that failed for `reason`.
+pub(crate) fn transfer_retry_line(host: &str, reason: &str, n: usize) -> String {
+    format!("gate: bringing the results back from {host} failed ({reason}); trying again ({n} of {TRANSFER_RETRIES})")
+}
+
+/// The pauses before a transfer's retries: each `--test-remote-retry-pause-ms` when given, else 5 s and then 15 s.
+pub(crate) fn transfer_pauses(seams: &TestSeams) -> [Duration; TRANSFER_RETRIES] {
+    seams
+        .remote_retry_pause_ms
+        .map_or(TRANSFER_PAUSES, |ms| [Duration::from_millis(ms); TRANSFER_RETRIES])
 }
 
 /// The bound of a bounded call, the `stop` or the `boot`: `--test-remote-bound-ms` when given, else 30 s.
@@ -96,6 +154,8 @@ mod tests {
             output_seen,
             first_error,
             started: false,
+            cut: None,
+            said: Vec::new(),
         })
     }
 
@@ -112,6 +172,8 @@ mod tests {
                 output_seen: false,
                 first_error: Some(line),
                 started: true,
+                cut: None,
+                said: Vec::new(),
             });
             assert!(!started, "{line}");
         }
@@ -137,6 +199,8 @@ mod tests {
                 output_seen: false,
                 first_error: Some("kex_exchange_identification: Connection closed by remote host"),
                 started: false,
+                cut: None,
+                said: Vec::new(),
             })
         };
         assert!(git(128));

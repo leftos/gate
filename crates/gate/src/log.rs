@@ -15,7 +15,14 @@ use regex::Regex;
 use crate::console::{Console, Note};
 
 /// The failure markers (kept, V2), as the PowerShell gate and design.md write them.
-const MARKERS: &str = r"^Build FAILED\.|error CS\d+|: error |Test run summary: Failed!|No test projects were found|^\s*failed: [1-9]|gate: (TIMED OUT|STALLED|BACKSTOP|TRANSFER TIMED OUT)";
+const MARKERS: &str = concat!(
+    r"^Build FAILED\.|error CS\d+|: error |Test run summary: Failed!|No test projects were found|^\s*failed: [1-9]|",
+    r"gate: (TIMED OUT|STALLED|BACKSTOP|TRANSFER TIMED OUT|TRANSFER FAILED)"
+);
+
+/// The start of the line the gate says before it makes a transfer after a routed command again, which carries the
+/// failure's own text: a log line that starts with it is no failure marker, whatever that text holds.
+const TRANSFER_RETRY_PREFIX: &str = "gate: bringing the results back from ";
 
 /// [`MARKERS`] matched without regard to case, as the PowerShell gate's `Select-String` matches them.
 #[expect(clippy::expect_used, reason = "the pattern is a constant, compiled by every unit test that scans a line")]
@@ -249,7 +256,7 @@ fn markers_in(reader: impl BufRead, limit: usize) -> io::Result<Vec<(usize, Stri
         number += 1;
         let line = String::from_utf8_lossy(&line);
         let text = unstamped(&line).text;
-        if MARKER_SCAN.is_match(text) {
+        if !text.starts_with(TRANSFER_RETRY_PREFIX) && MARKER_SCAN.is_match(text) {
             found.push((number, shown(text)));
         }
     }
@@ -400,6 +407,13 @@ mod tests {
         for line in lines {
             assert!(matched(line), "{line}");
         }
+    }
+
+    #[test]
+    fn a_transfer_failed_line_is_a_marker() {
+        assert!(matched(
+            "gate: TRANSFER FAILED: the command exited 0 on builder; git ls-remote did not answer within 60 s"
+        ));
     }
 
     #[test]

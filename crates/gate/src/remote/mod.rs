@@ -69,6 +69,8 @@ mod worktree_lock;
 pub(crate) const REFUSED: i64 = 75;
 /// The status of a run whose client failed.
 const FAILED: i64 = 1;
+/// The status of a run whose command exited 0 but whose transfer after it failed every attempt.
+const TRANSFER_FAILED: i64 = 74;
 /// What a client failure says: `gate: the remote run failed: <why>`.
 const FAILED_RUN: &str = "gate: the remote run failed";
 
@@ -287,6 +289,9 @@ pub(crate) struct RemoteOutcome {
     /// The kill the box's kill tag named, when the box killed the command itself; the run's verdict comes from it,
     /// never from the log. `None` for any other end, a kill of the client's own included.
     pub box_killed: Option<BoxKill>,
+    /// Whether the command exited 0 but a transfer after it failed every attempt, as the TRANSFER FAILED line says: the
+    /// run's verdict is `transfer-failed`.
+    pub transfer_failed: bool,
     /// How a warm-up ended; `None` for a call that is no warm-up.
     pub warm: Option<WarmEnd>,
     /// The ceiling, in whole seconds, the run call was sent once the builder's preflight found the run's work tree new,
