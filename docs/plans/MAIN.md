@@ -7,27 +7,20 @@
 - [ ] GATE-593 Build a gate box for a macOS builder — Urgent · Remote
 - [/] GATE-696 Cross-build Windows outputs on a macOS builder and bring them back — Urgent · Remote
 - [!] GATE-828 Fix the flaky Unix box test a_clear_refuses_a_volume_mounted_in_the_work_folder_and_keeps_its_files — Urgent · Remote
-- [ ] GATE-849 Make remote_client's transfer-ceiling retry case hold on a loaded PC — Urgent · Remote
 - [!] GATE-214 Toolchain 7: roll the manifest out to the gated repos — High · Remote
 - [ ] GATE-192 Turn routing back on, on the Rust remote client — High · Remote
-- [ ] GATE-834 Route rustling-tulip's rt.ps1 test and cargo check (census 2026-10-27) — High · Remote
-- [ ] GATE-835 Route towercab-3d's cargo test (census 2026-10-27) — High · Remote
-- [ ] GATE-836 Route godot-mcp's uv run pytest and dotnet test (census 2026-10-27) — High · Remote
-- [ ] GATE-837 Route race-anywhere's uv run pytest (census 2026-10-27) — High · Remote
-- [ ] GATE-847 Route what yaat's commit hooks run locally, and make the census look inside commit runs — High · Remote
+- [!] GATE-834 Route rustling-tulip's rt.ps1 test and cargo check (census 2026-10-27) — High · Remote
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [/] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
-- [ ] GATE-559 Drain the builder behind a barrier so it can be redeployed — High · Remote
 - [ ] GATE-621 Ask for a full outputs send when a worktree's routed runs switch builder — High · Remote
 - [ ] GATE-682 Explain or track a stall when a gated command is plain ssh to another machine — High · Remote
 - [/] GATE-683 Prune a deleted worktree's folders from every builder, and prune the Mac by space — High · Remote
-- [ ] GATE-689 Prune a gone worktree's keys from the Windows builders and the PC — High · Remote
+- [/] GATE-689 Prune a gone worktree's keys from the Windows builders and the PC — High · Remote
 - [ ] GATE-745 Bring back the files a routed dotnet command's /flp and /getResultOutputFile switches name — High · Remote
 - [ ] GATE-751 Make a routed build's outputs pull fast enough for yaat's trees, or skip it for verdict-only runs — High · Remote
 - [ ] GATE-753 Log every step of a run in the gate's log: start, progress, end and duration — High · Remote
 - [ ] GATE-759 Move the rest of the box's shared wire rules into gate-wire (GATE-616 slices 2, 3, 5, 6) — High · Remote
-- [/] GATE-824 Copy chosen outputs back after a failing or killed routed run — High · Remote
 - [ ] GATE-838 Find what keeps godot-mcp's itest build --local after GATE-557, and remove it — High · Remote
 - [ ] GATE-839 Route race-anywhere's Unreal editor and game runs: a desktop route with a GPU — High · Remote
 - [ ] GATE-840 Route towercab-3d's vite build with dist/ brought back as outputs — High · Remote
@@ -294,6 +287,11 @@
 - [ ] GATE-845 Refresh a drain barrier only while it still stands, so a re-raise never undoes a lift
 - [ ] GATE-846 Leave the box call's ancestors out of the Windows box's drain count, as the Unix box does
 - [ ] GATE-848 Name the builder on a routed run's FAILED line, as the passed line does
+- [ ] GATE-850 Let the Unix box take the failure-cap test seam and test its caps
+- [ ] GATE-851 Measure and cut the failure globs' manifest cost on passing runs
+- [ ] GATE-852 Count only carried bytes toward the failure outputs' 1 GiB total
+- [ ] GATE-854 Measure yaat's routed commit-hook build against a local one
+- [ ] GATE-855 Keep a passing failure-only routed run's status when its outputs line is missing
 
 ## Cutover sweep
 
@@ -413,3 +411,4 @@
 - [ ] GATE-766 Keep a stop's escalation waiting when its leader cannot be looked at
 - [ ] GATE-767 Keep the orphan check on when another account plants MSYS objects
 - [ ] GATE-802 Find why test-install-macos.sh takes 19 minutes on the PC under load
+- [ ] GATE-853 Say in design.md that a routed hook gate writes take with parentPid and is not covered
