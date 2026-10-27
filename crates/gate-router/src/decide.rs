@@ -2307,13 +2307,15 @@ fn device_path(letter: char, facts: &dyn Facts, answers: &mut Vec<(char, Option<
     path
 }
 
-/// The output glob a routed dotnet build adds beside the repo's own list, for the folder its own project is built in:
-/// `None` unless the verb is `build` and the words name no output option ([`OUTPUT_OPTIONS`]) and set none of
-/// [`DERIVED_OUTPUT_PROPERTIES`]. The glob is [`target_folder`]'s folder under the subfolder ([`bin_glob`]).
+/// The output glob a routed dotnet build or test adds beside the repo's own list, for the folder its own project is built
+/// in: `None` unless the verb is `build`, or `test` with no `--no-build` among its own words, and the words name no
+/// output option ([`OUTPUT_OPTIONS`]) and set none of [`DERIVED_OUTPUT_PROPERTIES`]. The glob is [`target_folder`]'s
+/// folder under the subfolder ([`bin_glob`]).
 fn derived_outputs(words: &[String], subfolder: &str) -> Option<String> {
     let own = &words[dotnet_own(words)?];
     let moves = own.iter().any(|word| is_output_option(word)) || DERIVED_OUTPUT_PROPERTIES.iter().any(|name| sets_property(own, name));
-    if !verb_in(own, &["build"]) || moves {
+    let builds = verb_in(own, &["build"]) || (verb_in(own, &["test"]) && !own.iter().any(|word| word == NO_BUILD));
+    if !builds || moves {
         return None;
     }
     bin_glob(subfolder, &target_folder(words, subfolder)?)
@@ -2705,6 +2707,12 @@ mod tests {
     /// The glob [`derived_outputs`] adds for the command `text` at the subfolder `folder`.
     fn derived(text: &str, folder: &str) -> Option<String> {
         derived_outputs(&words(text), folder)
+    }
+
+    #[test]
+    fn no_bin_is_derived_for_a_test_with_no_build() {
+        assert_eq!(derived("dotnet test tests/A.Tests --no-build", ""), None);
+        assert_eq!(derived("dotnet test tests/A.Tests", ""), Some("tests/A.Tests/bin/**".to_owned()));
     }
 
     #[test]

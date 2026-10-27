@@ -1180,10 +1180,9 @@ fn a_dotnet_build_whose_glob_is_already_listed_adds_no_copy() {
 }
 
 #[test]
-fn no_bin_is_derived_for_a_solution_a_test_or_an_output_folder() {
+fn no_bin_is_derived_for_a_solution_or_an_output_folder() {
     for command in [
         words(&["dotnet", "build", "App.sln"]),
-        words(&["dotnet", "test", "src/App/App.csproj"]),
         words(&["dotnet", "build", "src/App/App.csproj", "-o", "out"]),
         words(&["dotnet", "build"]),
     ] {
@@ -1217,6 +1216,39 @@ fn the_bin_is_derived_for_a_build_of_a_folder() {
     let command = words(&["dotnet", "build", "src/Yaat.Client"]);
     let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
     assert_eq!(run.outputs, ["tools/X/bin/**", "src/Yaat.Client/bin/**"]);
+}
+
+#[test]
+fn the_bin_is_derived_for_a_test_of_a_project_folder() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let command = words(&["dotnet", "test", "tests/A.Tests", "-c", "Release"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**", "tests/A.Tests/bin/**"]);
+}
+
+#[test]
+fn the_bin_is_derived_for_a_test_of_a_project_file() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let command = words(&["dotnet", "test", "src/App/App.csproj"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**", "src/App/bin/**"]);
+}
+
+#[test]
+fn no_bin_is_derived_for_a_test_on_a_macos_builder() {
+    let mac = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet test*"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}]"#;
+    let config = with_builders(r#"{"yaat": ["*"]}"#, mac);
+    let command = words(&["dotnet", "test", "tests/A.Tests", "-c", "Release"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**"]);
+}
+
+#[test]
+fn no_bin_is_derived_for_a_test_of_a_solution() {
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["dotnet *"]}, "outputs": {"yaat": ["tools/X/bin/**"]}}"#).expect("usable");
+    let command = words(&["dotnet", "test", "App.sln"]);
+    let run = routed(decide(&heavy(&command), &FakeFacts::with_config(config)));
+    assert_eq!(run.outputs, ["tools/X/bin/**"]);
 }
 
 #[test]
