@@ -395,6 +395,912 @@ class RunTests(unittest.TestCase):
         self.assertIn(census.NO_HEAVY_LOCAL, report)
 
 
+COMMIT_COMMAND = "git commit -m x"
+BUILD_COMMAND = "dotnet build -p:TreatWarningsAsErrors=true"
+
+
+class CommitSplitTests(unittest.TestCase):
+    """A commit whose hooks run gates: what the census sorts inside it."""
+
+    @staticmethod
+    def census_of(*events: dict[str, object]) -> dict[str, object]:
+        return census.census_data(journal_of(*events), START, END, census.RepoNamer())
+
+    @staticmethod
+    def rows(data: dict) -> dict[tuple[str, str], dict]:
+        return {(row["repo"], row["family"]): row for row in data["heavy"]}
+
+    def test_a_commit_s_nested_gate_linked_by_parent_pid_is_sorted_as_its_own_family(
+        self,
+    ) -> None:
+        at = START + timedelta(hours=2)
+        events = [
+            line(
+                "queue",
+                10,
+                at - timedelta(seconds=100),
+                commit=True,
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "take",
+                11,
+                at - timedelta(seconds=80),
+                parentPid=10,
+                command=BUILD_COMMAND,
+            ),
+            line("queue", 11, at - timedelta(seconds=80), command=BUILD_COMMAND),
+            line(
+                "release",
+                11,
+                at - timedelta(seconds=20),
+                wallSeconds=60.0,
+                verdict="passed",
+                remote=True,
+                command=BUILD_COMMAND,
+            ),
+            line(
+                "release",
+                10,
+                at,
+                commit=True,
+                wallSeconds=100.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+            ),
+        ]
+        data = self.census_of(*events)
+        rows = self.rows(data)
+        self.assertNotIn(("demo", "git commit"), rows)
+        build = rows[("demo", "dotnet build")]
+        self.assertEqual((build["routed"], build["local"]), (1, 0))
+        self.assertEqual(build["routedMedianSeconds"], 60.0)
+        self.assertEqual(data["commitSplit"]["demo"]["linkedByParentPid"], 1)
+        self.assertIn(
+            "nested gates linked by parentPid: 1; by containment: 0",
+            census.render(data),
+        )
+
+    def test_a_nested_gate_on_an_archive_day_is_linked_by_containment(self) -> None:
+        at = START + timedelta(hours=3)
+        events = [
+            line(
+                "release",
+                20,
+                at,
+                commit=True,
+                wallSeconds=100.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "release",
+                21,
+                at + timedelta(seconds=1),
+                wallSeconds=60.0,
+                verdict="passed",
+                remote=True,
+                command=BUILD_COMMAND,
+            ),
+        ]
+        data = self.census_of(*events)
+        rows = self.rows(data)
+        self.assertEqual(rows[("demo", "dotnet build")]["routed"], 1)
+        self.assertEqual(
+            rows[("demo", "git commit (ungated hooks)")]["localSecondsTotal"], 40.0
+        )
+        split = data["commitSplit"]["demo"]
+        self.assertEqual(
+            (split["commits"], split["withNested"], split["linkedByContainment"]),
+            (1, 1, 1),
+        )
+
+    def test_a_commit_s_uncovered_share_is_its_own_blocked_row(self) -> None:
+        at = START + timedelta(hours=4)
+        events = [
+            line(
+                "queue",
+                30,
+                at - timedelta(seconds=100),
+                commit=True,
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "take",
+                31,
+                at - timedelta(seconds=80),
+                parentPid=30,
+                command=BUILD_COMMAND,
+            ),
+            line("queue", 31, at - timedelta(seconds=80), command=BUILD_COMMAND),
+            line(
+                "release",
+                31,
+                at - timedelta(seconds=50),
+                wallSeconds=50.0,
+                verdict="passed",
+                remote=True,
+                command=BUILD_COMMAND,
+            ),
+            line(
+                "release",
+                30,
+                at,
+                commit=True,
+                wallSeconds=100.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+            ),
+        ]
+        data = self.census_of(*events)
+        share = self.rows(data)[("demo", "git commit (ungated hooks)")]
+        self.assertEqual((share["local"], share["localSecondsTotal"]), (1, 50.0))
+        self.assertEqual(share["state"], "blocked on work")
+        self.assertEqual(
+            share["blocker"], "ungated hook commands in the repo's git hooks"
+        )
+        self.assertIn(
+            "| demo | `git commit (ungated hooks)` | 1 | 0 | 0 | 0 | 50.0 | 50.0 | - | - | - | - "
+            "| blocked on work: ungated hook commands in the repo's git hooks |",
+            census.render(data),
+        )
+
+    def test_a_commit_without_nested_gates_stays_truly_local(self) -> None:
+        at = START + timedelta(hours=5)
+        events = [
+            line(
+                "queue",
+                40,
+                at - timedelta(seconds=6),
+                commit=True,
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "release",
+                40,
+                at,
+                commit=True,
+                wallSeconds=6.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+            ),
+        ]
+        data = self.census_of(*events)
+        (row,) = data["heavy"]
+        self.assertEqual(
+            (row["repo"], row["family"], row["local"], row["localSecondsTotal"]),
+            ("demo", "git commit", 1, 6.0),
+        )
+        self.assertNotIn("state", row)
+        split = data["commitSplit"]["demo"]
+        self.assertEqual(
+            (split["commits"], split["withNested"], split["uncoveredSeconds"]),
+            (1, 0, 0.0),
+        )
+
+    def test_a_covered_nested_gate_counts_with_no_seconds(self) -> None:
+        at = START + timedelta(hours=6)
+        events = [
+            line(
+                "queue",
+                50,
+                at - timedelta(seconds=100),
+                commit=True,
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "queue",
+                51,
+                at - timedelta(seconds=80),
+                command="dotnet csharpier check .",
+            ),
+            line(
+                "covered",
+                51,
+                at - timedelta(seconds=10),
+                parentPid=50,
+                command="dotnet csharpier check .",
+            ),
+            line(
+                "release",
+                50,
+                at,
+                commit=True,
+                wallSeconds=100.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+            ),
+        ]
+        data = self.census_of(*events)
+        rows = self.rows(data)
+        check = rows[("demo", "dotnet csharpier")]
+        self.assertEqual(
+            (check["local"], check["covered"], check["unfinished"]), (1, 1, 0)
+        )
+        self.assertEqual(check["localSecondsTotal"], 0)
+        self.assertIsNone(check["localMedianSeconds"])
+        self.assertNotIn(("demo", "git commit (ungated hooks)"), rows)
+        self.assertEqual(rows[("demo", "git commit")]["localSecondsTotal"], 100.0)
+        self.assertEqual(data["headless"], 0)
+
+    def test_a_gate_after_the_commit_s_release_is_not_contained(self) -> None:
+        at = START + timedelta(hours=7)
+        events = [
+            line(
+                "release",
+                60,
+                at,
+                commit=True,
+                wallSeconds=100.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "release",
+                61,
+                at + timedelta(seconds=2),
+                wallSeconds=60.0,
+                verdict="passed",
+                remote=True,
+                command=BUILD_COMMAND,
+            ),
+        ]
+        data = self.census_of(*events)
+        rows = self.rows(data)
+        self.assertEqual(rows[("demo", "dotnet build")]["routed"], 1)
+        self.assertEqual(rows[("demo", "git commit")]["localSecondsTotal"], 100.0)
+        split = data["commitSplit"]["demo"]
+        self.assertEqual(
+            (
+                split["withNested"],
+                split["linkedByContainment"],
+                split["uncoveredSeconds"],
+            ),
+            (0, 0, 0.0),
+        )
+
+    def test_census_data_carries_the_commit_split(self) -> None:
+        at = START + timedelta(hours=8)
+        other = r"X:\dev\other.wt\tree"
+        events = [
+            line(
+                "queue",
+                70,
+                at - timedelta(seconds=100),
+                commit=True,
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "take",
+                71,
+                at - timedelta(seconds=80),
+                parentPid=70,
+                command=BUILD_COMMAND,
+            ),
+            line("queue", 71, at - timedelta(seconds=80), command=BUILD_COMMAND),
+            line(
+                "release",
+                71,
+                at - timedelta(seconds=20),
+                wallSeconds=60.0,
+                verdict="passed",
+                remote=True,
+                command=BUILD_COMMAND,
+            ),
+            line(
+                "release",
+                70,
+                at,
+                commit=True,
+                wallSeconds=100.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "release",
+                80,
+                at,
+                commit=True,
+                wallSeconds=20.0,
+                verdict="passed",
+                command="git commit -m s",
+                cwd=other,
+            ),
+        ]
+        data = self.census_of(*events)
+        self.assertEqual(
+            data["commitSplit"],
+            {
+                "demo": {
+                    "commits": 1,
+                    "withNested": 1,
+                    "uncoveredSeconds": 40.0,
+                    "unsplitCommits": 0,
+                    "linkedByParentPid": 1,
+                    "linkedByContainment": 0,
+                },
+                "other": {
+                    "commits": 1,
+                    "withNested": 0,
+                    "uncoveredSeconds": 0.0,
+                    "unsplitCommits": 0,
+                    "linkedByParentPid": 0,
+                    "linkedByContainment": 0,
+                },
+            },
+        )
+        for key in (
+            "window",
+            "files",
+            "unreadable",
+            "skipped",
+            "duplicates",
+            "headless",
+            "queuesFrom",
+            "lent",
+            "heavy",
+            "local",
+        ):
+            self.assertIn(key, data)
+
+
+def started(seconds: float) -> str:
+    """A ``processStart`` that many seconds after the fixture's base, to reuse a pid later."""
+    return stamp(START - timedelta(days=30) + timedelta(seconds=seconds))
+
+
+class NestedLinkTests(unittest.TestCase):
+    """How a gate is linked to the commit it runs under, and what that costs the commit."""
+
+    @staticmethod
+    def census_of(*events: dict[str, object]) -> dict[str, object]:
+        return census.census_data(journal_of(*events), START, END, census.RepoNamer())
+
+    @staticmethod
+    def rows(data: dict) -> dict[tuple[str, str], dict]:
+        return {(row["repo"], row["family"]): row for row in data["heavy"]}
+
+    def test_a_reused_pid_of_a_non_commit_gate_does_not_link_to_an_old_commit(
+        self,
+    ) -> None:
+        at = START + timedelta(hours=2)
+        events = [
+            line(
+                "queue",
+                100,
+                at - timedelta(seconds=1000),
+                commit=True,
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "release",
+                100,
+                at - timedelta(seconds=900),
+                commit=True,
+                wallSeconds=100.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "queue",
+                100,
+                at - timedelta(seconds=500),
+                command="cargo test",
+                processStart=started(500),
+            ),
+            line(
+                "release",
+                100,
+                at - timedelta(seconds=400),
+                wallSeconds=50.0,
+                verdict="passed",
+                command="cargo test",
+                processStart=started(500),
+            ),
+            line(
+                "take",
+                101,
+                at - timedelta(seconds=300),
+                parentPid=100,
+                command=BUILD_COMMAND,
+                processStart=started(600),
+            ),
+            line(
+                "queue",
+                101,
+                at - timedelta(seconds=300),
+                command=BUILD_COMMAND,
+                processStart=started(600),
+            ),
+            line(
+                "release",
+                101,
+                at - timedelta(seconds=200),
+                wallSeconds=60.0,
+                verdict="passed",
+                remote=True,
+                command=BUILD_COMMAND,
+                processStart=started(600),
+            ),
+        ]
+        data = self.census_of(*events)
+        rows = self.rows(data)
+        self.assertEqual(rows[("demo", "git commit")]["localSecondsTotal"], 100.0)
+        self.assertEqual(rows[("demo", "dotnet build")]["routed"], 1)
+        split = data["commitSplit"]["demo"]
+        self.assertEqual((split["withNested"], split["linkedByParentPid"]), (0, 0))
+
+    def test_a_gate_inside_a_nested_gate_is_not_counted_against_the_commit(
+        self,
+    ) -> None:
+        at = START + timedelta(hours=3)
+        events = [
+            line(
+                "queue",
+                200,
+                at - timedelta(seconds=100),
+                commit=True,
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "take",
+                201,
+                at - timedelta(seconds=80),
+                parentPid=200,
+                command=BUILD_COMMAND,
+            ),
+            line("queue", 201, at - timedelta(seconds=80), command=BUILD_COMMAND),
+            line(
+                "release",
+                201,
+                at - timedelta(seconds=20),
+                wallSeconds=60.0,
+                verdict="passed",
+                remote=True,
+                command=BUILD_COMMAND,
+            ),
+            line(
+                "take",
+                202,
+                at - timedelta(seconds=15),
+                parentPid=201,
+                command="dotnet csharpier check .",
+            ),
+            line(
+                "queue",
+                202,
+                at - timedelta(seconds=15),
+                command="dotnet csharpier check .",
+            ),
+            line(
+                "release",
+                202,
+                at - timedelta(seconds=10),
+                wallSeconds=20.0,
+                verdict="passed",
+                command="dotnet csharpier check .",
+            ),
+            line(
+                "release",
+                200,
+                at,
+                commit=True,
+                wallSeconds=100.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+            ),
+        ]
+        data = self.census_of(*events)
+        rows = self.rows(data)
+        self.assertEqual(
+            rows[("demo", "git commit (ungated hooks)")]["localSecondsTotal"], 40.0
+        )
+        self.assertEqual(rows[("demo", "dotnet csharpier")]["localSecondsTotal"], 20.0)
+        split = data["commitSplit"]["demo"]
+        self.assertEqual((split["withNested"], split["linkedByContainment"]), (1, 0))
+
+    def test_a_live_run_without_parent_pid_in_the_commit_s_folder_is_not_contained(
+        self,
+    ) -> None:
+        at = START + timedelta(hours=4)
+        events = [
+            line(
+                "release",
+                300,
+                at,
+                commit=True,
+                wallSeconds=100.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+            ),
+            line("take", 301, at - timedelta(seconds=30), command=BUILD_COMMAND),
+            line("queue", 301, at - timedelta(seconds=30), command=BUILD_COMMAND),
+            line(
+                "release",
+                301,
+                at + timedelta(seconds=1),
+                wallSeconds=60.0,
+                verdict="passed",
+                remote=True,
+                command=BUILD_COMMAND,
+            ),
+        ]
+        data = self.census_of(*events)
+        rows = self.rows(data)
+        self.assertEqual(rows[("demo", "git commit")]["localSecondsTotal"], 100.0)
+        self.assertEqual(rows[("demo", "dotnet build")]["routed"], 1)
+        split = data["commitSplit"]["demo"]
+        self.assertEqual((split["withNested"], split["linkedByContainment"]), (0, 0))
+
+    def test_an_unfinished_commit_is_not_split(self) -> None:
+        at = START + timedelta(hours=5)
+        events = [
+            line(
+                "queue",
+                400,
+                at - timedelta(seconds=50),
+                commit=True,
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "take",
+                401,
+                at - timedelta(seconds=40),
+                parentPid=400,
+                command=BUILD_COMMAND,
+            ),
+            line("queue", 401, at - timedelta(seconds=40), command=BUILD_COMMAND),
+            line(
+                "release",
+                401,
+                at - timedelta(seconds=20),
+                wallSeconds=60.0,
+                verdict="passed",
+                remote=True,
+                command=BUILD_COMMAND,
+            ),
+        ]
+        data = self.census_of(*events)
+        rows = self.rows(data)
+        self.assertEqual(rows[("demo", "git commit")]["unfinished"], 1)
+        self.assertNotIn(("demo", "git commit (ungated hooks)"), rows)
+        self.assertEqual(rows[("demo", "dotnet build")]["routed"], 1)
+        split = data["commitSplit"]["demo"]
+        self.assertEqual((split["commits"], split["withNested"]), (1, 0))
+
+    def test_a_child_of_a_light_commit_is_kept_by_its_own_moment(self) -> None:
+        at = START + timedelta(hours=6)
+        events = [
+            line(
+                "queue",
+                500,
+                at - timedelta(seconds=60),
+                commit=True,
+                kind="light",
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "release",
+                500,
+                at,
+                commit=True,
+                kind="light",
+                wallSeconds=60.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "take",
+                501,
+                START - timedelta(hours=2),
+                parentPid=500,
+                command="dotnet csharpier check .",
+            ),
+            line(
+                "queue",
+                501,
+                START - timedelta(hours=2),
+                command="dotnet csharpier check .",
+            ),
+            line(
+                "release",
+                501,
+                START - timedelta(hours=1),
+                wallSeconds=20.0,
+                verdict="passed",
+                command="dotnet csharpier check .",
+            ),
+        ]
+        data = self.census_of(*events)
+        self.assertEqual(data["headless"], 0)
+        self.assertNotIn(("demo", "dotnet csharpier"), self.rows(data))
+        self.assertEqual(data["commitSplit"], {})
+
+    def test_a_covered_child_of_a_light_commit_still_counts_as_headless(self) -> None:
+        at = START + timedelta(hours=7)
+        events = [
+            line(
+                "queue",
+                600,
+                at - timedelta(seconds=60),
+                commit=True,
+                kind="light",
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "release",
+                600,
+                at,
+                commit=True,
+                kind="light",
+                wallSeconds=60.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "covered",
+                601,
+                at - timedelta(seconds=30),
+                parentPid=600,
+                kind="light",
+                command="dotnet csharpier check .",
+            ),
+        ]
+        data = self.census_of(*events)
+        self.assertEqual(data["headless"], 1)
+        self.assertEqual(data["heavy"], [])
+
+
+class SplitRuleTests(unittest.TestCase):
+    """What the census does with a split commit's gates, its share and its window."""
+
+    @staticmethod
+    def census_of(*events: dict[str, object]) -> dict[str, object]:
+        return census.census_data(journal_of(*events), START, END, census.RepoNamer())
+
+    @staticmethod
+    def rows(data: dict) -> dict[tuple[str, str], dict]:
+        return {(row["repo"], row["family"]): row for row in data["heavy"]}
+
+    def test_a_local_nested_gate_still_shows_in_the_local_table(self) -> None:
+        at = START + timedelta(hours=2)
+        events = [
+            line(
+                "queue",
+                700,
+                at - timedelta(seconds=100),
+                commit=True,
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "take",
+                701,
+                at - timedelta(seconds=80),
+                parentPid=700,
+                command=BUILD_COMMAND,
+            ),
+            line(
+                "queue",
+                701,
+                at - timedelta(seconds=80),
+                notRouted="--local",
+                reason=r"needs C:\Users\x\f.txt",
+                command=BUILD_COMMAND,
+            ),
+            line(
+                "release",
+                701,
+                at - timedelta(seconds=20),
+                wallSeconds=60.0,
+                verdict="passed",
+                command=BUILD_COMMAND,
+            ),
+            line(
+                "release",
+                700,
+                at,
+                commit=True,
+                wallSeconds=100.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+            ),
+        ]
+        data = self.census_of(*events)
+        self.assertEqual(
+            data["local"],
+            [
+                {
+                    "repo": "demo",
+                    "family": "dotnet build",
+                    "reason": "needs <path>",
+                    "runs": 1,
+                }
+            ],
+        )
+
+    def test_a_commit_with_a_covered_hook_gate_gets_no_ungated_share(self) -> None:
+        at = START + timedelta(hours=3)
+        events = [
+            line(
+                "queue",
+                710,
+                at - timedelta(seconds=100),
+                commit=True,
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "take",
+                711,
+                at - timedelta(seconds=80),
+                parentPid=710,
+                command=BUILD_COMMAND,
+            ),
+            line("queue", 711, at - timedelta(seconds=80), command=BUILD_COMMAND),
+            line(
+                "release",
+                711,
+                at - timedelta(seconds=40),
+                wallSeconds=60.0,
+                verdict="passed",
+                remote=True,
+                command=BUILD_COMMAND,
+            ),
+            line(
+                "queue",
+                712,
+                at - timedelta(seconds=30),
+                command="dotnet csharpier check .",
+            ),
+            line(
+                "covered",
+                712,
+                at - timedelta(seconds=20),
+                parentPid=710,
+                command="dotnet csharpier check .",
+            ),
+            line(
+                "release",
+                710,
+                at,
+                commit=True,
+                wallSeconds=100.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+            ),
+        ]
+        data = self.census_of(*events)
+        rows = self.rows(data)
+        self.assertNotIn(("demo", "git commit (ungated hooks)"), rows)
+        commit = rows[("demo", "git commit")]
+        self.assertEqual((commit["local"], commit["localSecondsTotal"]), (1, 100.0))
+        self.assertEqual(rows[("demo", "dotnet build")]["routed"], 1)
+        self.assertEqual(rows[("demo", "dotnet csharpier")]["covered"], 1)
+        split = data["commitSplit"]["demo"]
+        self.assertEqual(
+            (split["withNested"], split["uncoveredSeconds"], split["unsplitCommits"]),
+            (1, 0.0, 1),
+        )
+        self.assertIn(
+            "commits with covered hook gates, share not split: 1", census.render(data)
+        )
+
+    def test_a_commit_fully_covered_by_its_nested_gates_adds_no_share_row(self) -> None:
+        at = START + timedelta(hours=4)
+        events = [
+            line(
+                "queue",
+                720,
+                at - timedelta(seconds=60),
+                commit=True,
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "take",
+                721,
+                at - timedelta(seconds=50),
+                parentPid=720,
+                command=BUILD_COMMAND,
+            ),
+            line("queue", 721, at - timedelta(seconds=50), command=BUILD_COMMAND),
+            line(
+                "release",
+                721,
+                at,
+                wallSeconds=60.0,
+                verdict="passed",
+                remote=True,
+                command=BUILD_COMMAND,
+            ),
+            line(
+                "release",
+                720,
+                at,
+                commit=True,
+                wallSeconds=60.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+            ),
+        ]
+        data = self.census_of(*events)
+        rows = self.rows(data)
+        self.assertNotIn(("demo", "git commit (ungated hooks)"), rows)
+        self.assertEqual(rows[("demo", "dotnet build")]["routed"], 1)
+        self.assertEqual(data["commitSplit"]["demo"]["uncoveredSeconds"], 0.0)
+
+    def test_a_nested_gate_counts_only_in_its_commit_s_window(self) -> None:
+        events = [
+            line(
+                "queue",
+                730,
+                START - timedelta(hours=2),
+                commit=True,
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "release",
+                730,
+                START - timedelta(hours=1),
+                commit=True,
+                wallSeconds=100.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "take",
+                731,
+                START + timedelta(minutes=30),
+                parentPid=730,
+                command=BUILD_COMMAND,
+            ),
+            line("queue", 731, START + timedelta(minutes=30), command=BUILD_COMMAND),
+            line(
+                "release",
+                731,
+                START + timedelta(hours=1),
+                wallSeconds=60.0,
+                verdict="passed",
+                remote=True,
+                command=BUILD_COMMAND,
+            ),
+        ]
+        data = self.census_of(*events)
+        self.assertEqual(data["heavy"], [])
+        self.assertEqual(data["commitSplit"], {})
+
+    def test_containment_matches_a_folder_spelled_differently_or_below(self) -> None:
+        at = START + timedelta(hours=5)
+        below = "x:/dev/demo.wt/tree/sub/"
+        events = [
+            line(
+                "release",
+                740,
+                at,
+                commit=True,
+                wallSeconds=100.0,
+                verdict="passed",
+                command=COMMIT_COMMAND,
+            ),
+            line(
+                "release",
+                741,
+                at + timedelta(seconds=1),
+                wallSeconds=60.0,
+                verdict="passed",
+                remote=True,
+                command=BUILD_COMMAND,
+                cwd=below,
+            ),
+        ]
+        data = self.census_of(*events)
+        rows = self.rows(data)
+        self.assertEqual(
+            rows[("demo", "git commit (ungated hooks)")]["localSecondsTotal"], 40.0
+        )
+        self.assertEqual(rows[("demo", "dotnet build")]["routed"], 1)
+        split = data["commitSplit"]["demo"]
+        self.assertEqual((split["withNested"], split["linkedByContainment"]), (1, 1))
+
+
 class NoMachinePathTests(unittest.TestCase):
     """No machine path reaches the Markdown or the JSON."""
 

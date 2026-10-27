@@ -20,6 +20,7 @@ import statistics
 import subprocess
 import sys
 import zlib
+from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -63,6 +64,13 @@ NO_REPO = "(no repo)"
 GONE = "(gone)"
 CLAUDE_CONFIG = "claude-config"
 NO_HEAVY_LOCAL = "No heavy local runs in the window."
+COMMIT_FAMILY = "git commit"
+UNGATED_FAMILY = "git commit (ungated hooks)"
+UNGATED_BLOCKER = "ungated hook commands in the repo's git hooks"
+BLOCKED_ON_WORK = "blocked on work"
+LINKED_BY_PARENT_PID = "parentPid"
+LINKED_BY_CONTAINMENT = "containment"
+CONTAINMENT_SLACK = timedelta(seconds=1)
 
 
 # ---------------------------------------------------------------- paths
@@ -432,14 +440,26 @@ class Run:
     fallbacks: list[str] = field(default_factory=list)
     lent: bool = False
     last: datetime | None = None
+    first: dict[str, Any] | None = None
+    pid: int | None = None
+    process_start: datetime | None = None
+    parent_pid: int | None = None
+    parent: Run | None = None
+    parent_method: str = ""
+    commit: bool = False
+    commit_cache: bool | None = None
+    taken: bool = False
+    split: bool = False
+    nested: list[Run] = field(default_factory=list)
 
     @property
     def head(self) -> dict[str, Any]:
-        """The line the run's kind, ``cwd`` and ``command`` are read from: its ``queue``, else its ``release``.
+        """The line the run's kind, ``cwd`` and ``command`` are read from: its ``queue``, else its ``release``, else its first.
 
-        The archive keeps only ``release`` lines, and every line carries the common fields.
+        The archive keeps only ``release`` lines, and every line carries the common fields,
+        so a gate that was covered by its parent and never queued still has a head.
         """
-        head = self.queue or self.release
+        head = self.queue or self.release or self.first
         assert head is not None
         return head
 
@@ -452,40 +472,291 @@ class Run:
         return self.last
 
 
-def _add_line(run: Run, event: dict[str, Any]) -> None:
-    kind = event.get("event")
-    if kind == "queue":
-        run.queue = event
-    elif kind == "release":
-        run.release = event
-    elif kind == "fallback":
-        run.fallbacks.append(str(event.get("reason")))
-    elif kind in {"covered", "parent"}:
-        run.lent = True
+def _mark_nesting(run: Run, kind: object, event: dict[str, Any]) -> None:
+    """Keeps what nesting reads from a ``take``, ``covered`` or ``parent`` line: its flags and parent pid."""
+    if kind == "take":
+        run.taken = True
+    if kind in {"take", "covered", "parent"} and isinstance(
+        event.get("parentPid"), int
+    ):
+        run.parent_pid = event["parentPid"]
+
+
+def _keep_last(run: Run, event: dict[str, Any]) -> None:
+    """Keeps the latest line time of the run."""
     moment = parse_time(event.get("time"))
     if moment is not None and (run.last is None or moment > run.last):
         run.last = moment
 
 
-def group_runs(
-    events: Iterable[dict[str, Any]], start: datetime, end: datetime
-) -> tuple[list[Run], int]:
-    """Joins lines into runs and keeps those whose moment falls in ``[start, end]``.
+def _add_line(run: Run, event: dict[str, Any]) -> None:
+    """Adds one journal line to its run, keeping what nesting reads: the parent pid and the ``commit`` flag."""
+    kind = event.get("event")
+    if run.first is None:
+        run.first = event
+    if kind == "queue":
+        run.queue = event
+        run.commit = run.commit or event.get("commit") is True
+    elif kind == "release":
+        run.release = event
+        run.commit = run.commit or event.get("commit") is True
+    elif kind == "fallback":
+        run.fallbacks.append(str(event.get("reason")))
+    elif kind in {"covered", "parent"}:
+        run.lent = True
+    _mark_nesting(run, kind, event)
+    _keep_last(run, event)
 
-    Returns the kept runs with a ``queue`` or ``release`` line, and the count of kept
-    runs with neither. A self-test run (its ``cwd`` holds ``gate-selftest``) is left out.
+
+def is_commit(run: Run) -> bool:
+    """Whether a run is a ``git commit``: its head says ``commit``, or, older than that flag, its command's first words do."""
+    if run.commit_cache is None:
+        run.commit_cache = (
+            run.commit or family_of(str(run.head.get("command", ""))) == COMMIT_FAMILY
+        )
+    return run.commit_cache
+
+
+def _splits(run: Run) -> bool:
+    """Whether the census splits a commit run: a finished, heavy commit, no one's child, with gates nested in it."""
+    return (
+        run.parent is None
+        and run.release is not None
+        and run.head.get("kind") == "heavy"
+        and is_commit(run)
+        and bool(run.nested)
+    )
+
+
+def _runs_by_pid(
+    runs: list[Run],
+) -> tuple[dict[int, list[Run]], dict[int, list[datetime]]]:
+    """Every run with a pid and a start, grouped by pid, sorted by start, with their starts beside them."""
+    by_pid: dict[int, list[Run]] = defaultdict(list)
+    for run in runs:
+        if run.pid is not None and run.process_start is not None:
+            by_pid[run.pid].append(run)
+    starts: dict[int, list[datetime]] = {}
+    for pid, same in by_pid.items():
+        same.sort(key=lambda run: run.process_start)
+        starts[pid] = [run.process_start for run in same]
+    return by_pid, starts
+
+
+def _parent_by_pid(
+    run: Run,
+    by_pid: dict[int, list[Run]],
+    starts: dict[int, list[datetime]],
+) -> Run | None:
+    """The commit run the child names by pid, when the child started before that commit released."""
+    same = by_pid.get(run.parent_pid)
+    if not same:
+        return None
+    index = bisect_left(starts[run.parent_pid], run.process_start)
+    if index == 0:
+        return None
+    parent = same[index - 1]
+    if not is_commit(parent):
+        return None
+    if parent.release is not None:
+        released = parse_time(parent.release.get("time"))
+        if released is not None and run.process_start >= released:
+            return None
+    return parent
+
+
+def _link_by_parent_pid(runs: list[Run]) -> None:
+    """Links a run whose ``take``, ``covered`` or ``parent`` line names a pid to that pid's run.
+
+    The candidate is the latest run with that pid that started before the child, so a
+    reused pid names the process that held it then. The link is made only when that run
+    is a commit run and the child started before its release, or when it has no release:
+    a commit that had already released cannot have begun a child.
     """
+    by_pid, starts = _runs_by_pid(runs)
+    for run in runs:
+        if (
+            run.parent is not None
+            or run.parent_pid is None
+            or run.process_start is None
+        ):
+            continue
+        parent = _parent_by_pid(run, by_pid, starts)
+        if parent is not None:
+            run.parent = parent
+            run.parent_method = LINKED_BY_PARENT_PID
+
+
+@dataclass
+class _Folder:
+    """A folder's finished commit runs, sorted by start, and how long its longest one ran."""
+
+    starts: list[datetime]
+    entries: list[tuple[datetime, datetime, Run]]
+    longest: timedelta
+
+
+def _norm_cwd(cwd: object) -> str:
+    """A folder as containment compares it: lower case, backslashes, no trailing separator."""
+    return str(cwd).lower().replace("/", "\\").rstrip("\\")
+
+
+def _folders_of(cwd: object) -> Iterator[str]:
+    """A folder and each folder above it, normalized, deepest first."""
+    folder = _norm_cwd(cwd)
+    while folder:
+        yield folder
+        cut = folder.rfind("\\")
+        if cut <= 0:
+            return
+        folder = folder[:cut]
+
+
+def _commit_folders(runs: list[Run]) -> dict[str, _Folder]:
+    """The finished commit runs per normalized folder, sorted by start, with the folder's longest wall time."""
+    found: dict[str, list[tuple[datetime, datetime, Run]]] = defaultdict(list)
+    for run in runs:
+        if run.parent is not None or run.release is None or run.process_start is None:
+            continue
+        released = parse_time(run.release.get("time"))
+        if released is None or not is_commit(run):
+            continue
+        found[_norm_cwd(run.head.get("cwd", ""))].append(
+            (run.process_start, released, run)
+        )
+    folders: dict[str, _Folder] = {}
+    for cwd, entries in found.items():
+        entries.sort(key=lambda entry: entry[0])
+        folders[cwd] = _Folder(
+            starts=[entry[0] for entry in entries],
+            entries=entries,
+            longest=max(entry[1] - entry[0] for entry in entries),
+        )
+    return folders
+
+
+def _containable(run: Run) -> bool:
+    """Whether containment may read a run: a bare archive release that names no parent of its own."""
+    return (
+        run.parent is None
+        and run.parent_pid is None
+        and run.release is not None
+        and run.queue is None
+        and not run.taken
+        and not run.lent
+    )
+
+
+def _contained_in(run: Run, released: datetime, folder: _Folder) -> Run | None:
+    """The latest commit in one folder whose span holds the run, walking back only as far as a commit can reach."""
+    oldest = run.process_start - folder.longest
+    index = bisect_right(folder.starts, run.process_start) - 1
+    while index >= 0:
+        start, commit_released, parent = folder.entries[index]
+        if start < oldest:
+            return None
+        if parent is not run and released <= commit_released + CONTAINMENT_SLACK:
+            return parent
+        index -= 1
+    return None
+
+
+def _contained(run: Run, folders: dict[str, _Folder]) -> Run | None:
+    """The commit a bare-release gate released under: the latest one in a folder that holds it, if any."""
+    released = parse_time(run.release.get("time"))
+    if released is None:
+        return None
+    best: Run | None = None
+    for folder in _folders_of(run.head.get("cwd", "")):
+        found = folders.get(folder)
+        if found is None:
+            continue
+        parent = _contained_in(run, released, found)
+        if parent is not None and (
+            best is None or parent.process_start > best.process_start
+        ):
+            best = parent
+    return best
+
+
+def _link_by_containment(runs: list[Run]) -> None:
+    """Links a gate the archive kept as a bare ``release`` to the commit it released under.
+
+    The archive keeps only ``release`` lines, so a gate nested in a commit's hooks is
+    read from what is left: a folder that is the commit's or inside it, once both are
+    normalized, a ``processStart`` at or after the commit's, and a release at most a
+    second past the commit's. Only a run the archive kept as a release alone is read
+    this way: a live run says for itself whether it is nested, and a run that names a
+    ``parentPid`` belongs to that run, never to a commit.
+    """
+    folders = _commit_folders(runs)
+    for run in runs:
+        if not _containable(run) or run.process_start is None:
+            continue
+        parent = _contained(run, folders)
+        if parent is not None:
+            run.parent = parent
+            run.parent_method = LINKED_BY_CONTAINMENT
+
+
+def _link_parents(runs: list[Run]) -> None:
+    """Links every gate nested in a commit run to it, by ``parentPid`` first, else by containment."""
+    _link_by_parent_pid(runs)
+    _link_by_containment(runs)
+
+
+def _group_lines(events: Iterable[dict[str, Any]]) -> list[Run]:
+    """Joins the journal lines into runs, each run with its pid and start, a self-test run left out."""
     runs: dict[tuple[Any, Any], Run] = defaultdict(Run)
     for event in events:
         if SELFTEST_MARKER in str(event.get("cwd", "")):
             continue
         _add_line(runs[(event.get("pid"), event.get("processStart"))], event)
-    kept = [
-        run
-        for run in runs.values()
+    for (pid, started), run in runs.items():
+        run.pid = pid if isinstance(pid, int) else None
+        run.process_start = parse_time(started)
+    return list(runs.values())
+
+
+def group_runs(
+    events: Iterable[dict[str, Any]], start: datetime, end: datetime
+) -> tuple[list[Run], int]:
+    """Joins lines into runs, links the gates nested in commits, and keeps the window's runs.
+
+    A run is kept by its own moment. A gate nested in a commit run that will be split
+    is counted with that commit alone: it is kept when the commit is in the window and
+    dropped otherwise, whatever its own moment. Returns the kept runs with a ``queue``
+    or ``release`` line or a split commit parent, and the count of the other kept runs.
+    A self-test run (its ``cwd`` holds ``gate-selftest``) is left out.
+    """
+    every = _group_lines(events)
+    _link_parents(every)
+    for run in every:
+        if run.parent is not None:
+            run.parent.nested.append(run)
+    for run in every:
+        run.split = _splits(run)
+    inside = {
+        id(run)
+        for run in every
         if run.moment is not None and start <= run.moment <= end
+    }
+
+    def kept_run(run: Run) -> bool:
+        """Whether the window counts the run: with its split commit, else by its own moment."""
+        parent = run.parent
+        if parent is not None and parent.split:
+            return id(parent) in inside
+        return id(run) in inside
+
+    kept = [run for run in every if kept_run(run)]
+    headed = [
+        run
+        for run in kept
+        if run.queue is not None
+        or run.release is not None
+        or (run.parent is not None and run.parent.split)
     ]
-    headed = [run for run in kept if run.queue is not None or run.release is not None]
     return headed, len(kept) - len(headed)
 
 
@@ -498,12 +769,17 @@ class Family:
     local: int = 0
     routed: int = 0
     unfinished: int = 0
+    covered: int = 0
     verdicts: Counter[str] = field(default_factory=Counter)
     not_routed: Counter[str] = field(default_factory=Counter)
     fallbacks: Counter[str] = field(default_factory=Counter)
 
-    def add(self, run: Run) -> None:
-        """Counts one heavy run into the family."""
+    def add(self, run: Run, covered: bool) -> None:
+        """Counts one heavy run into the family; a covered run counts as local with no seconds."""
+        if covered:
+            self.local += 1
+            self.covered += 1
+            return
         not_routed = run.queue.get("notRouted") if run.queue else None
         if not_routed:
             self.not_routed[str(not_routed)] += 1
@@ -523,6 +799,38 @@ class Family:
                 float(seconds)
             )
 
+    def add_share(self, seconds: float) -> None:
+        """Counts one commit's uncovered share: a local run with its seconds and no verdict."""
+        self.local += 1
+        self.local_seconds.append(seconds)
+
+
+@dataclass
+class CommitSplit:
+    """What the census read of commit runs and the gates nested in them, per repo."""
+
+    commits: Counter[str] = field(default_factory=Counter)
+    with_nested: Counter[str] = field(default_factory=Counter)
+    uncovered: dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    unsplit: Counter[str] = field(default_factory=Counter)
+    by_parent_pid: Counter[str] = field(default_factory=Counter)
+    by_containment: Counter[str] = field(default_factory=Counter)
+
+    def as_data(self) -> dict[str, dict[str, Any]]:
+        """The split as the census's JSON key: one entry per repo with a commit run."""
+        repos = sorted(set(self.commits) | set(self.uncovered))
+        return {
+            repo: {
+                "commits": self.commits[repo],
+                "withNested": self.with_nested[repo],
+                "uncoveredSeconds": round(self.uncovered.get(repo, 0.0), 1),
+                "unsplitCommits": self.unsplit[repo],
+                "linkedByParentPid": self.by_parent_pid[repo],
+                "linkedByContainment": self.by_containment[repo],
+            }
+            for repo in repos
+        }
+
 
 @dataclass
 class Census:
@@ -531,16 +839,100 @@ class Census:
     families: dict[tuple[str, str], Family]
     local_runs: Counter[tuple[str, str, str]]
     lent: int
+    split: CommitSplit = field(default_factory=CommitSplit)
+
+
+def _wall_seconds(line: dict[str, Any] | None) -> float | None:
+    """A release line's ``wallSeconds``, or None when the run measured none."""
+    if line is None:
+        return None
+    seconds = line.get("wallSeconds")
+    return float(seconds) if isinstance(seconds, int | float) else None
+
+
+def _count_nested(
+    child: Run,
+    repo: str,
+    families: dict[tuple[str, str], Family],
+    split: CommitSplit,
+    name_repo: RepoNamer,
+) -> float | None:
+    """Counts one nested gate in its own family and its link method, and gives its seconds, or None if it had none."""
+    head = child.head
+    key = (
+        name_repo(str(head.get("cwd", ""))),
+        family_of(str(head.get("command", ""))),
+    )
+    if head.get("kind") == "heavy":
+        families[key].add(child, covered=child.release is None and child.lent)
+    if child.parent_method == LINKED_BY_PARENT_PID:
+        split.by_parent_pid[repo] += 1
+    elif child.parent_method == LINKED_BY_CONTAINMENT:
+        split.by_containment[repo] += 1
+    return _wall_seconds(child.release)
+
+
+def _add_share(
+    run: Run,
+    nested_seconds: float,
+    repo: str,
+    families: dict[tuple[str, str], Family],
+    split: CommitSplit,
+) -> None:
+    """Adds the commit's uncovered share as its own row, unless it measured no wall time or no share."""
+    wall = _wall_seconds(run.release)
+    if wall is None:
+        return
+    share = max(0.0, wall - nested_seconds)
+    if share <= 0:
+        return
+    families[(repo, UNGATED_FAMILY)].add_share(share)
+    split.uncovered[repo] += share
+
+
+def _split_commit(
+    run: Run,
+    repo: str,
+    families: dict[tuple[str, str], Family],
+    split: CommitSplit,
+    name_repo: RepoNamer,
+) -> None:
+    """Counts a commit's nested gates in their own families and, when their time is known, its uncovered share.
+
+    A gate with no ``release`` has no time to take out of the commit's wall seconds, so
+    a commit with one of those is not split at all: its whole wall time counts in
+    ``git commit``, truly local, and the footer counts it.
+    """
+    split.commits[repo] += 1
+    split.with_nested[repo] += 1
+    nested_seconds = 0.0
+    unknown = False
+    for child in run.nested:
+        seconds = _count_nested(child, repo, families, split, name_repo)
+        if seconds is None:
+            unknown = True
+        else:
+            nested_seconds += seconds
+    if unknown:
+        split.unsplit[repo] += 1
+        families[(repo, COMMIT_FAMILY)].add(run, covered=False)
+        return
+    _add_share(run, nested_seconds, repo, families, split)
 
 
 def take_census(runs: Iterable[Run], name_repo: RepoNamer) -> Census:
     """Sums the heavy runs per (repo, family) and the ``--local`` runs of every kind.
 
-    A heavy run lent or covered by its parent's slot, with no ``release`` of its own,
-    is counted apart and left out of the figures.
+    A heavy commit run with gates nested in it is split: each nested gate counts in its
+    own family, and the commit's share no nested gate covers becomes its own
+    ``git commit (ungated hooks)`` row. A heavy run lent or covered by its parent's slot,
+    with no ``release`` of its own and no split commit parent, is counted apart and left
+    out. A nested gate still counts in the ``--local`` table, as a top-level run does.
     """
+    runs = list(runs)
     families: dict[tuple[str, str], Family] = defaultdict(Family)
     local_runs: Counter[tuple[str, str, str]] = Counter()
+    split = CommitSplit()
     lent = 0
     for run in runs:
         head = run.head
@@ -550,13 +942,20 @@ def take_census(runs: Iterable[Run], name_repo: RepoNamer) -> Census:
         )
         if head.get("notRouted") == "--local":
             local_runs[(*key, str(head.get("reason", "")))] += 1
+        if run.parent is not None and run.parent.split:
+            continue
         if head.get("kind") != "heavy":
             continue
         if run.lent and run.release is None:
             lent += 1
             continue
-        families[key].add(run)
-    return Census(dict(families), local_runs, lent)
+        if run.split:
+            _split_commit(run, key[0], families, split, name_repo)
+            continue
+        if is_commit(run):
+            split.commits[key[0]] += 1
+        families[key].add(run, covered=False)
+    return Census(dict(families), local_runs, lent, split)
 
 
 # ---------------------------------------------------------------- output
@@ -577,13 +976,15 @@ def _cell(value: object) -> str:
 
 def heavy_rows(census: Census) -> list[dict[str, Any]]:
     """The heavy-family rows, largest total local seconds first."""
-    rows = [
-        {
+    rows = []
+    for (repo, family), figures in census.families.items():
+        row = {
             "repo": repo,
             "family": family,
             "local": figures.local,
             "routed": figures.routed,
             "unfinished": figures.unfinished,
+            "covered": figures.covered,
             "localSecondsTotal": round(sum(figures.local_seconds), 1),
             "localMedianSeconds": _median(figures.local_seconds),
             "routedMedianSeconds": _median(figures.routed_seconds),
@@ -591,8 +992,10 @@ def heavy_rows(census: Census) -> list[dict[str, Any]]:
             "notRouted": dict(figures.not_routed.most_common()),
             "fallbacks": dict(figures.fallbacks.most_common()),
         }
-        for (repo, family), figures in census.families.items()
-    ]
+        if family == UNGATED_FAMILY:
+            row["state"] = BLOCKED_ON_WORK
+            row["blocker"] = UNGATED_BLOCKER
+        rows.append(row)
     rows.sort(key=lambda row: (-row["localSecondsTotal"], row["repo"], row["family"]))
     return rows
 
@@ -611,22 +1014,31 @@ def _heavy_table(rows: list[dict[str, Any]]) -> list[str]:
     lines = [
         "## Heavy families",
         "",
-        "| Repo | Family | Local | Routed | Unfinished | Local s total | Local median s | Routed median s | Local verdicts | notRouted | Fallbacks |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        (
+            "| Repo | Family | Local | Routed | Unfinished | Covered | Local s total "
+            "| Local median s | Routed median s | Local verdicts | notRouted "
+            "| Fallbacks | State |"
+        ),
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for row in rows:
+        state = row.get("state")
+        if state and row.get("blocker"):
+            state = f"{state}: {row['blocker']}"
         cells = [
             row["repo"],
             f"`{row['family']}`",
             row["local"],
             row["routed"],
             row["unfinished"],
+            row.get("covered", 0),
             row["localSecondsTotal"],
             row["localMedianSeconds"],
             row["routedMedianSeconds"],
             _counts(Counter(row["localVerdicts"])),
             _counts(Counter(row["notRouted"])),
             _counts(Counter(row["fallbacks"])),
+            state or "-",
         ]
         lines.append("| " + " | ".join(_cell(cell) for cell in cells) + " |")
     if not any(row["local"] for row in rows):
@@ -658,6 +1070,10 @@ def _footer(data: dict[str, Any]) -> list[str]:
         coverage = "cover the whole window."
     else:
         coverage = f"cover only the runs queued from {queues_from}."
+    split = data["commitSplit"]
+    by_parent_pid = sum(entry["linkedByParentPid"] for entry in split.values())
+    by_containment = sum(entry["linkedByContainment"] for entry in split.values())
+    unsplit = sum(entry["unsplitCommits"] for entry in split.values())
     return [
         f"- Window: {window['start']} to {window['end']} (UTC).",
         (
@@ -670,6 +1086,8 @@ def _footer(data: dict[str, Any]) -> list[str]:
             f"heavy runs lent or covered, with no release of their own, left out: {data['lent']}."
         ),
         f"- The archive keeps only release lines, so notRouted, the fallbacks and the --local table {coverage}",
+        f"- nested gates linked by parentPid: {by_parent_pid}; by containment: {by_containment}.",
+        f"- commits with covered hook gates, share not split: {unsplit}.",
     ]
 
 
@@ -761,6 +1179,7 @@ def census_data(
         "headless": headless,
         "queuesFrom": _first_queue(journal.events),
         "lent": census.lent,
+        "commitSplit": census.split.as_data(),
         "heavy": heavy_rows(census),
         "local": local_rows(census),
     }

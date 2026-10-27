@@ -10,7 +10,9 @@ Every repo that runs heavy gates is in scope, and every heavy command family in 
 - it is booked with what blocks it (a GATE issue, High when it blocks the repo's adoption);
 - it stays local, but only for one of two reasons, named beside the family.
 
-  Either it cannot run anywhere but this PC (a command that names this PC's own WSL state, such as a `/mnt/x` path or a distro folder only this PC has, an install into this PC's own folders, a git operation that writes this checkout's refs: any command whose first word is `git` or `prek`, a `git commit` included, stays local silently whatever its hooks need), or its run time is measured as shorter than what routing adds: the push, the outputs, the compression and the call overhead, taken from the repo's routed runs in the journal.
+  Either it cannot run anywhere but this PC (a command that names this PC's own WSL state, such as a `/mnt/x` path or a distro folder only this PC has, an install into this PC's own folders, or a git operation that writes this checkout's refs), or its run time is measured as shorter than what routing adds: the push, the outputs, the compression and the call overhead, taken from the repo's routed runs in the journal.
+
+  Any command whose first word is `git` or `prek` stays local silently, a `git commit` included. The commit itself stays local, its hooks' gates route by their own patterns (`hooks` in `remote.json`), and a hook command that runs without a gate is never seen by routing.
 
   A reason that work can remove does not keep a family local. It is a blocker to book. Examples: a tool or SDK the builder lacks, a window or GL the desktop route can serve, a `--local` whose recorded reason shows a routing gap, an outputs list that would need to grow (a routed `dotnet build`'s own project bin needs no entry: it comes back with the repo's list).
 
