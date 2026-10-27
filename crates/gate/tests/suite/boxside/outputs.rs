@@ -563,6 +563,114 @@ fn box_run_of_a_failed_command_whose_reports_are_not_brought_back_keeps_its_stat
     assert!(!archive_path(&payload).exists(), "nothing is packed");
 }
 
+/// The ignore file of a failure outputs case's snapshot: neither build output, test reports nor dumps are committed.
+const IGNORE_ALL: (&str, &str) = (".gitignore", "bin/\nTestResults/\ndumps/\n");
+
+/// The payload of a run of `command` asking for the outputs under `globs` and the failure outputs under `failure`.
+fn failure_payload(case: &Case, command: &[&str], globs: &[&str], failure: &[&str]) -> Value {
+    let mut payload = outputs_payload(case, command, globs);
+    payload["FailureOutputs"] = json!(failure);
+    payload
+}
+
+#[test]
+fn box_run_of_a_failed_command_with_a_failure_output_glob_packs_its_file() {
+    let case = Case::new("box_outputs_failed_dump");
+    let command = [FAKE_TOOL, "write", r"bin\a.txt", "a", "write", r"dumps\a.dmp", "dmp", "exit", "3"];
+    let mut payload = failure_payload(&case, &command, &["bin/**"], &["dumps/*.dmp"]);
+    snapshot(&case, &mut payload, &[IGNORE_ALL]);
+
+    let outcome = run_with_manifest(&case, &payload, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert!(has_line(&outcome.stderr, &packed_line(&payload, 1)), "{outcome:?}");
+    assert_eq!(
+        archive_members(&archive_path(&payload)),
+        ["dumps/a.dmp"],
+        "the dump comes back, the build does not"
+    );
+}
+
+#[test]
+fn box_run_of_a_failed_command_with_both_kinds_of_glob_packs_both() {
+    let case = Case::new("box_outputs_failed_both");
+    let command = [
+        FAKE_TOOL,
+        "write",
+        r"bin\a.txt",
+        "a",
+        "write",
+        r"TestResults\r.trx",
+        "trx",
+        "write",
+        r"dumps\a.dmp",
+        "dmp",
+        "exit",
+        "3",
+    ];
+    let mut payload = failure_payload(&case, &command, &["bin/**", "**/TestResults/**"], &["dumps/*.dmp"]);
+    snapshot(&case, &mut payload, &[IGNORE_ALL]);
+
+    let outcome = run_with_manifest(&case, &payload, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert!(has_line(&outcome.stderr, &packed_line(&payload, 2)), "{outcome:?}");
+    assert_eq!(archive_members(&archive_path(&payload)), ["TestResults/r.trx", "dumps/a.dmp"]);
+}
+
+#[test]
+fn box_run_of_a_passing_command_does_not_pack_a_file_only_a_failure_output_glob_matches() {
+    let case = Case::new("box_outputs_passed_dump");
+    let command = [FAKE_TOOL, "write", r"dumps\a.dmp", "dmp"];
+    let mut payload = failure_payload(&case, &command, &[], &["dumps/*.dmp"]);
+    snapshot(&case, &mut payload, &[IGNORE_ALL]);
+
+    let outcome = run_with_manifest(&case, &payload, &manifest(&[]));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    let said: Vec<&str> = outcome.stderr.lines().filter(|line| line.starts_with("gate-remote-outputs")).collect();
+    assert_eq!(said, ["gate-remote-outputs: 0"], "{outcome:?}");
+    assert!(!archive_path(&payload).exists(), "nothing is packed");
+}
+
+#[test]
+fn box_run_of_a_failed_command_leaves_a_failure_output_over_the_cap_and_names_it() {
+    let case = Case::new("box_outputs_failed_capped");
+    let command = [
+        FAKE_TOOL,
+        "write",
+        r"dumps\a.dmp",
+        "ab",
+        "write",
+        r"dumps\big.dmp",
+        "0123456789",
+        "exit",
+        "3",
+    ];
+    let mut payload = failure_payload(&case, &command, &[], &["dumps/*.dmp"]);
+    snapshot(&case, &mut payload, &[IGNORE_ALL]);
+
+    let outcome = finish_with_manifest(
+        box_call(&case, &["box", "--test-box-failure-cap-bytes", "8", "run"], &self::payload(&payload)),
+        &manifest(&[]),
+    );
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    let left = "gate: remote failure output left on the builder: dumps/big.dmp (1 MiB, past the 8 bytes cap)";
+    let lines: Vec<&str> = outcome.stderr.lines().collect();
+    let said = lines.iter().position(|line| *line == left);
+    let packed = lines.iter().position(|line| *line == packed_line(&payload, 1));
+    assert!(
+        said.is_some() && said < packed,
+        "the file left is named before the packed line: {outcome:?}"
+    );
+    assert_eq!(
+        archive_members(&archive_path(&payload)),
+        ["dumps/a.dmp"],
+        "the file under the cap comes back"
+    );
+}
+
 #[test]
 fn box_run_leaves_a_file_of_the_back_commit_out_of_the_archive() {
     let case = Case::new("box_outputs_back_commit");

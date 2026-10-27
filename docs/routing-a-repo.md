@@ -34,11 +34,15 @@ A command whose word names an existing gitignored project input (a project, solu
 2. Set the builder up ([Builder setup](#builder-setup)). A session installs what a routed repo needs, at the repo's pinned version, and changes the builder's configuration (PATH, ACLs, environment) directly over ssh.
 
    A change to the builder's toolchains, tools, work root or git config is also made in `tools/builder/install-toolchains.ps1` in the same item, so a new builder gets the same setup. A change to the machine's provisioning goes to claude-config as a repo inbox note with what changed and the exact commands. Run `gate check --builder` from the repo.
-3. Back up `remote.json` beside it (`remote.json.bak-<UTC stamp>`), then add the repo's patterns under `repos.<repo>`, plus `outputs`, `inputs`, `siblings`, `desktop`, `warmup` or `sendBuild` consent where the repo needs them. Re-read the file just before writing and change only the repo's own keys: other sessions edit it too.
+3. Back up `remote.json` beside it (`remote.json.bak-<UTC stamp>`), then add the repo's patterns under `repos.<repo>`, plus `outputs`, `failureOutputs`, `inputs`, `siblings`, `desktop`, `warmup` or `sendBuild` consent where the repo needs them. Re-read the file just before writing and change only the repo's own keys: other sessions edit it too.
 
    `sendBuild` is an array of repo names: a routed `dotnet test <project> -c <configuration> --no-build` of a listed repo sends the PC's build of that project to the builder and keeps `--no-build` there, where an unlisted repo has the word dropped and the builder builds ([design.md, Routing](design.md#routing)).
 
-   A test report under a `TestResults` folder (an MTP TRX) comes back only through a glob that names the `TestResults` folder, such as `tests/*/bin/*/*/TestResults/*.trx`, and only after a passing command. `**` and `*TestResults*` bring back nothing under it.
+   A test report under a `TestResults` folder (an MTP TRX) comes back only through a glob that names the `TestResults` folder, such as `tests/*/bin/*/*/TestResults/*.trx`. `**` and `*TestResults*` bring back nothing under it.
+
+   A routed run copies back its `outputs` only after a passing command. A failed command (exit other than 0) copies back only its `TestResults` globs' files and the files under `failureOutputs`, an object of repo to globs beside `outputs` (the same glob rules and `[`/`]` ban; a `builders` entry's own list wins for a run on it; absent by default, no derived globs), such as `{"yaat": ["**/*.dmp"]}`.
+
+   A failure output over 256 MiB, or past 1 GiB in all, stays on the builder and the box says so (`gate: remote failure output left on the builder: ...`). A killed run brings nothing back.
 4. Run one routing trial (below). The repo counts as routed once its trial passes.
 
 ## Builder setup

@@ -1556,6 +1556,7 @@ impl Attempt<'_, '_> {
             nonce: &nonce,
             snapshot: &snapshot.commit,
             outputs: sent.globs,
+            failure_outputs: sent.failure_globs,
             full: sent.full,
             timeout: raised.unwrap_or(self.call.timeout),
             host: self.call.host(),
@@ -5600,6 +5601,7 @@ mod tests {
             words: &[],
             outputs: &[],
             outputs_withheld: false,
+            failure_outputs: &[],
             dropped_no_build: false,
             send: None,
             desktop: false,
@@ -8311,7 +8313,7 @@ mod tests {
         let started = Instant::now();
         attempt.command_started = Some(started);
         attempt.pulling = Some(super::Pull {
-            bringing: outputs::Bringing::Reports,
+            bringing: outputs::Bringing::Reports(outputs::Narrowed::TestReports),
             total: None,
             started,
         });
@@ -8500,6 +8502,7 @@ mod tests {
             words: &[],
             outputs: &[],
             outputs_withheld: false,
+            failure_outputs: &[],
             dropped_no_build: false,
             send: None,
             desktop: false,
@@ -8563,6 +8566,7 @@ mod tests {
         let warm_call = RemoteCall {
             outputs: &globs,
             outputs_withheld: true,
+            failure_outputs: &[],
             dropped_no_build: false,
             send: None,
             desktop: false,

@@ -36,7 +36,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use super::client::{Attempt, End};
 use super::git::{Git, GitError};
-use super::outputs::{self, Archive, Bringing, Polled};
+use super::outputs::{self, Archive, Bringing, Narrowed, Polled};
 use crate::outputs::archive::{Entry, PcFiles, UnpackError, below, check_folder, unpack};
 use crate::outputs::cache::{HashCache, file_time_now};
 use crate::outputs::glob::Globs;
@@ -67,13 +67,13 @@ const INSTALL: &str = "install";
 /// The most members whose PC files changed during the run a refusal names, one line each; the rest are counted.
 const CHANGED_NAMED: usize = 10;
 
-/// What the install of a fetched archive needs: the archive, the stage folder beside it, the pending marker, the PC's
-/// manifest and the run's output globs, the box path of each of the run's trees with the PC root it stands for, and
-/// when the fetch started.
+/// What the install of a fetched archive needs: the archive, the stage folder beside it, the pending marker (`None` for
+/// a withheld run whose send of the PC's build landed, which records none), the PC's manifest and the run's output
+/// globs, the box path of each of the run's trees with the PC root it stands for, and when the fetch started.
 pub(super) struct Fetched<'f> {
     pub(super) archive: &'f Archive,
     pub(super) stage: PathBuf,
-    pub(super) marker: &'f Path,
+    pub(super) marker: Option<&'f Path>,
     pub(super) manifest: &'f Manifest,
     pub(super) globs: &'f [String],
     /// The main repo's tree on the box, which stands for the worktree: the work folder for a run of one repo,
@@ -88,15 +88,16 @@ pub(super) struct Fetched<'f> {
     pub(super) snapshot: SystemTime,
     /// How long the fetch alone took, from its start to the archive's last byte.
     pub(super) pulled: Duration,
-    /// For a failed run's test reports, the run's output globs narrowed to those that name a `TestResults` folder: the
-    /// install is held to them in place of `globs`, never clears the pending marker, and its lines name the reports.
-    pub(super) reports: Option<&'f Globs>,
+    /// For a failed run, its narrowed set, the output globs that name a `TestResults` folder joined with its failure
+    /// output globs, and what the set holds: the install is held to them in place of `globs`, never clears the pending
+    /// marker, and its lines name what the set holds.
+    pub(super) reports: Option<(&'f Globs, Narrowed)>,
 }
 
 impl Fetched<'_> {
-    /// What the archive brings: a failed run's test reports when it carries their narrowed globs, else outputs.
+    /// What the archive brings: a failed run's narrowed set when it carries one, else outputs.
     fn bringing(&self) -> Bringing {
-        if self.reports.is_some() { Bringing::Reports } else { Bringing::Outputs }
+        self.reports.map_or(Bringing::Outputs, |(_, narrowed)| Bringing::Reports(narrowed))
     }
 }
 
@@ -309,7 +310,10 @@ pub(super) fn installed(attempt: &mut Attempt<'_, '_>, fetched: &Fetched<'_>) ->
         attempt.say(format!("gate: cannot remove the outputs stage {}: {error}", fetched.stage.display()));
     }
     outputs::removed(attempt, fetched.archive, outputs::FETCHED);
-    if clear && let Err(why) = outputs::clear_pending(fetched.marker) {
+    if clear
+        && let Some(marker) = fetched.marker
+        && let Err(why) = outputs::clear_pending(marker)
+    {
         attempt.say(format!("gate: {why}"));
     }
     (end, complete)
@@ -359,7 +363,7 @@ fn install(attempt: &Attempt<'_, '_>, fetched: &Fetched<'_>, staged: &Cell<bool>
         }
     })?;
     let all;
-    let globs = if let Some(reports) = fetched.reports {
+    let globs = if let Some((reports, _)) = fetched.reports {
         reports
     } else {
         all = Globs::new(fetched.globs).map_err(transient)?;

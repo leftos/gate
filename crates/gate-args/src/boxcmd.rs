@@ -3,7 +3,9 @@
 //! no request; nor does `gate box prune --root <folder> [--keys <key>...]`, whose words are its root and the keys it
 //! removes. A `test-seams` build also reads the hidden
 //! `--test-heartbeat-ms <n>`, `--test-box-console fail-before`, `--test-box-token refused`, `--test-box-park-launch <path>`,
-//! `--test-outputs-budget-bytes <n>`, `--test-inputs-budget-bytes <n>`, `--test-lfs-budget-bytes <n>`, `--test-dotnet-limit-ms <n>`,
+//! `--test-outputs-budget-bytes <n>`, `--test-box-failure-cap-bytes <n>` (the Windows box's alone: the Unix box always
+//! holds failure outputs to the built-in caps), `--test-inputs-budget-bytes <n>`, `--test-lfs-budget-bytes <n>`,
+//! `--test-dotnet-limit-ms <n>`,
 //! `--test-box-sample-ms <n>`, `--test-box-sampler-fail true|false`, `--test-box-free-percent <1-100>`,
 //! `--test-box-drain-lease-ms <n>`, `--test-box-drain-lapse-ms <n>`, `--test-box-now <unix s>`,
 //! `--test-box-drain-readable-only true|false`,
@@ -126,6 +128,9 @@ enum Seam {
     ParkLaunch,
     /// `--test-outputs-budget-bytes <n>`: the output folder's outputs size budget, in bytes.
     OutputsBudgetBytes,
+    /// `--test-box-failure-cap-bytes <n>`: the per-file cap on a failed run's failure outputs, in bytes, the total
+    /// cap four times it. Only the Windows box takes it; the Unix box always uses the built-in caps.
+    FailureCapBytes,
     /// `--test-inputs-budget-bytes <n>`: the most bytes one inputs put unpacks, decompressed.
     InputsBudgetBytes,
     /// `--test-lfs-budget-bytes <n>`: the most bytes one LFS put unpacks.
@@ -189,6 +194,7 @@ impl Seam {
             "--test-box-token" => Some(Seam::Token),
             "--test-box-park-launch" => Some(Seam::ParkLaunch),
             "--test-outputs-budget-bytes" => Some(Seam::OutputsBudgetBytes),
+            "--test-box-failure-cap-bytes" => Some(Seam::FailureCapBytes),
             "--test-inputs-budget-bytes" => Some(Seam::InputsBudgetBytes),
             "--test-lfs-budget-bytes" => Some(Seam::LfsBudgetBytes),
             "--test-dotnet-limit-ms" => Some(Seam::DotnetLimitMs),
@@ -224,6 +230,7 @@ impl Seam {
             Seam::Token => "--test-box-token",
             Seam::ParkLaunch => "--test-box-park-launch",
             Seam::OutputsBudgetBytes => "--test-outputs-budget-bytes",
+            Seam::FailureCapBytes => "--test-box-failure-cap-bytes",
             Seam::InputsBudgetBytes => "--test-inputs-budget-bytes",
             Seam::LfsBudgetBytes => "--test-lfs-budget-bytes",
             Seam::DotnetLimitMs => "--test-dotnet-limit-ms",
@@ -303,6 +310,7 @@ fn set_seam(seams: &mut BoxSeams, seam: Seam, value: Result<Option<String>, Prob
     match seam {
         Seam::HeartbeatMs => seams.heartbeat_ms = Some(crate::values::above_zero(name, &value)?),
         Seam::OutputsBudgetBytes => seams.outputs_budget_bytes = Some(crate::values::above_zero(name, &value)?),
+        Seam::FailureCapBytes => seams.failure_cap_bytes = Some(crate::values::above_zero(name, &value)?),
         Seam::InputsBudgetBytes => seams.inputs_budget_bytes = Some(crate::values::above_zero(name, &value)?),
         Seam::LfsBudgetBytes => seams.lfs_budget_bytes = Some(crate::values::above_zero(name, &value)?),
         Seam::DotnetLimitMs => seams.dotnet_limit_ms = Some(crate::values::above_zero(name, &value)?),

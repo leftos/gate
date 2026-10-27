@@ -71,6 +71,9 @@ pub struct BoxSeams {
     /// The outputs folder's size budget in bytes for `gate box run`, over the built-in 50 GiB; `None` without the
     /// feature.
     pub outputs_budget_bytes: Option<u64>,
+    /// The per-file cap on a failed run's failure outputs for `gate box run`, in bytes, over the built-in 256 MiB, and a
+    /// total cap four times it, over the built-in 1 GiB; `None` without the feature.
+    pub failure_cap_bytes: Option<u64>,
     /// The most bytes `gate box inputs` unpacks from one put, decompressed, over the built-in 4 GiB; `None` without the
     /// feature.
     pub inputs_budget_bytes: Option<u64>,

@@ -66,6 +66,7 @@ struct BuilderEntry {
     builder: Builder,
     repos: RepoTable,
     outputs: RepoTable,
+    failure_outputs: RepoTable,
     routed: bool,
 }
 
@@ -82,6 +83,8 @@ pub struct Config {
     entries: Vec<BuilderEntry>,
     repos: Vec<(String, Vec<Pattern>)>,
     outputs: Vec<(String, Vec<Pattern>)>,
+    /// Each repo name's globs for the files a failed routed run brings back beside its test reports.
+    failure_outputs: Vec<(String, Vec<Pattern>)>,
     inputs: Vec<(String, Vec<Pattern>)>,
     /// Each repo name's allowed sibling names, or why `siblings` cannot be used, which allows none.
     siblings: Result<Vec<(String, Vec<String>)>, String>,
@@ -158,6 +161,7 @@ impl Config {
         let slots = read_slots(&data, "")?;
         let repos = read_table(&data, "repos", true, "")?;
         let outputs = read_table(&data, "outputs", false, "")?;
+        let failure_outputs = read_table(&data, "failureOutputs", false, "")?;
         let inputs = read_table(&data, "inputs", false, "")?;
         let entries = read_builder_entries(&data, &host)?;
         let (builders, hosts_problem) = match read_builders(&data, &host) {
@@ -177,6 +181,7 @@ impl Config {
             entries,
             repos,
             outputs,
+            failure_outputs,
             inputs,
             siblings: read_siblings(&data),
             warmup: read_warmup_consent(&data),
@@ -406,6 +411,21 @@ impl Config {
             Some(entry) => find(&entry.outputs, repo).map(globs_text),
             None => self.own_outputs(repo),
         }
+    }
+
+    /// The failure output globs listed for `repo` on `builder`: the entry's own `failureOutputs` for a `builders` entry,
+    /// the top-level `failureOutputs` for `host` and a `hosts` entry; none when that list does not name the repo.
+    pub(crate) fn failure_outputs_on(&self, builder: &Builder, repo: &str) -> Vec<String> {
+        match self.entries.iter().find(|entry| entry.builder == *builder) {
+            Some(entry) => find(&entry.failure_outputs, repo).map(globs_text).unwrap_or_default(),
+            None => self.failure_outputs(repo),
+        }
+    }
+
+    /// The failure output globs the top-level `failureOutputs` lists for `repo`: none when it does not name it.
+    #[must_use]
+    pub fn failure_outputs(&self, repo: &str) -> Vec<String> {
+        find(&self.failure_outputs, repo).map(globs_text).unwrap_or_default()
     }
 
     /// The patterns `repos` lists for `repo`, matched in any letter case, or `None` when it does not list it.
@@ -742,11 +762,13 @@ fn read_builder_entry(object: &Map<String, Value>, prefix: &str) -> Result<Build
         return Err(format!("{prefix}repos must name at least one repo"));
     }
     let outputs = read_table(object, "outputs", false, prefix)?;
+    let failure_outputs = read_table(object, "failureOutputs", false, prefix)?;
     let id = Some(builder_id(&alias));
     Ok(BuilderEntry {
         builder: Builder { alias, os, root, slots, id },
         repos,
         outputs,
+        failure_outputs,
         routed,
     })
 }
@@ -949,7 +971,7 @@ fn read_pattern(key: &str, item: &Value) -> Result<Pattern, &'static str> {
     let pattern = Pattern::parse(text).map_err(|_| "is not a valid wildcard pattern")?;
     if text.contains(['[', ']']) {
         match key {
-            "outputs" => return Err("is not a valid output glob: '[' and ']' are not allowed"),
+            "outputs" | "failureOutputs" => return Err("is not a valid output glob: '[' and ']' are not allowed"),
             "inputs" => return Err("is not a valid input glob: '[' and ']' are not allowed"),
             _ => {}
         }

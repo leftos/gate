@@ -25,6 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gate_args::BoxSeams;
 use gate_inputs::archive::{Item, held_size, refused};
+use gate_inputs::failure::{self, Capping, Caps};
 use gate_inputs::glob::Globs;
 use gate_inputs::hash::sha256_of;
 use gate_inputs::manifest::{Chosen, HeldBy, Listing, MANIFEST_LIMIT, Manifest, Stamp, hash_possible_copies, select};
@@ -54,11 +55,16 @@ const SEND_BUFFER: usize = 64 * 1024;
 /// The nanoseconds in a second.
 const NANOS: i128 = 1_000_000_000;
 
-/// What a run with output globs asks for: the globs, whether every file counts as changed (`OutputsFull`), the name of
-/// its archive and the folder it goes in.
+/// What a run with output or failure output globs asks for: the globs, the failure output globs, whether every file
+/// counts as changed (`OutputsFull`), the caps a failed command's set is held to, the name of its archive and the folder
+/// it goes in.
 pub struct Asked<'a> {
     globs: Globs,
+    /// The run's failure output globs, which a failed command brings back beside its test reports; `None` for a run
+    /// without any.
+    failure: Option<Globs>,
     full: bool,
+    capping: Capping,
     /// The runtime identifier of the run's cross build, whose outputs the walk lists at their PC paths
     /// ([`cross::crossed`]); `None` for a run without one.
     rid: Option<String>,
@@ -69,33 +75,44 @@ pub struct Asked<'a> {
 }
 
 impl<'a> Asked<'a> {
-    /// The outputs of a run of the work folder `key`, its outputs nonce `nonce`: `None` when `globs` is empty.
+    /// The outputs of a run of the work folder `key`, its outputs nonce `nonce`, asking for the output globs `globs`
+    /// and the failure output globs `failure`: `None` when both are empty.
     ///
     /// # Errors
     ///
     /// The usage line saying why a glob cannot be matched.
-    pub fn new(globs: &[String], full: bool, key: &str, nonce: &str, folder: &'a str) -> Result<Option<Asked<'a>>, String> {
-        if globs.is_empty() {
+    pub fn new((globs, failure): (&[String], &[String]), full: bool, key: &str, nonce: &str, folder: &'a str) -> Result<Option<Asked<'a>>, String> {
+        if globs.is_empty() && failure.is_empty() {
             return Ok(None);
         }
         let globs = Globs::new(globs).map_err(|reason| format!("gate: box payload Outputs {reason}"))?;
+        let failure = if failure.is_empty() {
+            None
+        } else {
+            Some(Globs::new(failure).map_err(|reason| format!("gate: box payload FailureOutputs {reason}"))?)
+        };
         Ok(Some(Asked {
             globs,
+            failure,
             full,
+            capping: Capping::Uncapped,
             rid: None,
             archive: archive_file_name(key, nonce),
             folder,
         }))
     }
 
-    /// These outputs narrowed to the globs that name a `TestResults` folder ([`Globs::test_results_only`]), which a
-    /// failed command brings back, in the same archive and folder and without a cross build's: `None` when no glob
-    /// names one.
+    /// What a failed command brings back, in the same archive and folder and without a cross build's: the failed run's
+    /// set of these outputs ([`failure::failed_run_globs`]), its failure outputs held to `caps` ([`Capping`]); `None`
+    /// when no glob names a `TestResults` folder and there are no failure output globs.
     #[must_use]
-    pub fn test_reports(&self) -> Option<Asked<'a>> {
+    pub fn failed_run(&self, caps: Caps) -> Option<Asked<'a>> {
+        let (globs, capping) = failure::failed_run_globs(&self.globs, self.failure.as_ref(), caps)?;
         Some(Asked {
-            globs: self.globs.test_results_only()?,
+            globs,
+            failure: None,
             full: self.full,
+            capping,
             rid: None,
             archive: self.archive.clone(),
             folder: self.folder,
@@ -516,6 +533,9 @@ pub fn listing(asked: &Asked<'_>, work: &Path) -> (Option<Listing>, Option<Strin
     if asked.full {
         return (None, None);
     }
+    if asked.globs.is_empty() {
+        return (Some(Listing::default()), None);
+    }
     let walked = tree_folder(asked, work)
         .map_err(|error| in_context(work, &error))
         .and_then(|top| walk(&top, work, asked, false));
@@ -719,6 +739,8 @@ impl<'t> Tree<'t> {
 pub struct Brought {
     /// The line saying the files left out for names this PC cannot take, `None` when there were none.
     pub skipped: Option<String>,
+    /// The line saying each failure output left on the builder for a cap, in walk order, said after `skipped`.
+    pub left: Vec<String>,
     /// `gate-remote-outputs-size: <bytes>`, the archive's size, said just before `line`; `None` when nothing was packed.
     pub size: Option<String>,
     /// `gate-remote-outputs: <n> <archive>`, or [`NOTHING_PACKED`].
@@ -739,7 +761,8 @@ impl Brought {
 }
 
 /// Packs the files under `asked`'s globs in the folder `work` to bring back after a passing command ([`select`]), or a
-/// failed one's test reports ([`Asked::test_reports`]), leaving out `skip`, the paths of the run's back commit, which
+/// failed one's test reports and failure outputs ([`Asked::failed_run`]), the failure outputs held to their caps,
+/// leaving out `skip`, the paths of the run's back commit, which
 /// the sync-back replaces on the PC, so no copy is made from the PC's file at one of them either: the line saying how
 /// many were packed and the archive's name, with the line saying the archive's size in bytes to say before it, or
 /// `gate-remote-outputs: 0` with no archive written when none were, and before it the line saying the files [`select`]
@@ -760,6 +783,16 @@ pub fn bring_back(
     skip: &[String],
 ) -> Result<Brought, String> {
     let manifest = manifest.as_ref().map_err(Clone::clone)?;
+    if asked.globs.is_empty() {
+        return Ok(Brought {
+            skipped: None,
+            left: Vec::new(),
+            size: None,
+            line: NOTHING_PACKED.to_owned(),
+            refused: None,
+            archive: None,
+        });
+    }
     let walked = tree_folder(asked, work)
         .map_err(|error| in_context(work, &error))
         .and_then(|top| walk(&top, work, asked, true).map(|walked| (walked, top)));
@@ -770,13 +803,14 @@ pub fn bring_back(
     let refused = select(&walked.refused, manifest, listing, skip, hash).map_err(|error| error.to_string())?;
     let skipped = skipped_line(&refused.iter().map(|chosen| chosen.file).collect::<Vec<_>>());
     let chosen = select(&found, manifest, listing, skip, hash).map_err(|error| error.to_string())?;
-    let mut chosen = match &asked.rid {
+    let chosen = match &asked.rid {
         None => chosen,
         Some(rid) => match portable_chosen(&tree, chosen)? {
             Portable::Kept(kept) => kept,
             Portable::Refused(path) => {
                 return Ok(Brought {
                     skipped: None,
+                    left: Vec::new(),
                     size: None,
                     line: NOTHING_PACKED.to_owned(),
                     refused: Some(cross::refused_line(rid, &path)),
@@ -785,9 +819,11 @@ pub fn bring_back(
             }
         },
     };
+    let (mut chosen, left) = asked.capping.capped(chosen);
     if chosen.is_empty() {
         return Ok(Brought {
             skipped,
+            left,
             size: None,
             line: NOTHING_PACKED.to_owned(),
             refused: None,
@@ -807,6 +843,7 @@ pub fn bring_back(
     match packed {
         Ok(packed) => Ok(Brought {
             skipped,
+            left,
             size: Some(format!("gate-remote-outputs-size: {}", packed.compressed)),
             line: format!("gate-remote-outputs: {} {}", packed.entries.len(), asked.archive),
             refused: None,
@@ -1147,7 +1184,7 @@ pub(crate) mod tests {
         /// copies of `digit`.
         fn asked(&self, globs: &[&str], full: bool, digit: char) -> Asked<'_> {
             let globs: Vec<String> = globs.iter().map(|glob| (*glob).to_owned()).collect();
-            Asked::new(&globs, full, KEY, &digit.to_string().repeat(32), &self.folder)
+            Asked::new((&globs, &[]), full, KEY, &digit.to_string().repeat(32), &self.folder)
                 .expect("the globs are fine")
                 .expect("globs ask")
         }
@@ -1810,7 +1847,7 @@ pub(crate) mod tests {
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let globs = ["bin/**".to_owned()];
-            let asked = Asked::new(&globs, true, KEY, &"1".repeat(32), &folder)
+            let asked = Asked::new((&globs, &[]), true, KEY, &"1".repeat(32), &folder)
                 .expect("the globs are fine")
                 .expect("globs ask");
             sender.send(bring(&asked, &Ok(Manifest::default()), None, &work, &[]))

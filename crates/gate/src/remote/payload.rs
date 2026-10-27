@@ -144,6 +144,9 @@ pub(crate) struct RunCall<'a> {
     pub nonce: &'a str,
     pub snapshot: &'a str,
     pub outputs: &'a [String],
+    /// The failure output globs a failed run brings back beside its test reports (`FailureOutputs`, sent only when
+    /// there is one); a warm-up never sends them.
+    pub failure_outputs: &'a [String],
     pub full: bool,
     pub timeout: u64,
     pub host: &'a str,
@@ -262,6 +265,9 @@ pub(crate) fn run_word(location: &Location, run: &RunCall<'_>) -> String {
         let env: Map<String, Value> = run.env.iter().map(|(name, value)| (name.clone(), Value::String(value.clone()))).collect();
         object.insert("Env".to_owned(), Value::Object(env));
     }
+    if !run.failure_outputs.is_empty() {
+        object.insert("FailureOutputs".to_owned(), json!(run.failure_outputs));
+    }
     if run.desktop {
         object.insert("Desktop".to_owned(), json!(true));
         object.insert("DesktopWait".to_owned(), json!(REMOTE_LIMIT.as_secs()));
@@ -278,8 +284,9 @@ pub(crate) struct WarmCall<'a> {
 }
 
 /// The payload word of a warm-up's run call: the keys of `run`'s word, its `Timeout` always among them, with the
-/// warm-up's `WarmCommands` and `WarmHash` in place of `Command`, and no `Outputs` or `OutputsFull`, as the box takes a
-/// warm-up only without them; `run`'s words, output globs and `full` are not read.
+/// warm-up's `WarmCommands` and `WarmHash` in place of `Command`, and no `Outputs`, `FailureOutputs` or `OutputsFull`,
+/// as the box takes a warm-up only without them; `run`'s words, output globs, failure output globs and `full` are not
+/// read.
 pub(crate) fn warm_word(location: &Location, run: &RunCall<'_>, warm: &WarmCall<'_>) -> String {
     let mut object = location.object();
     for (name, value) in [
@@ -547,6 +554,7 @@ mod tests {
             nonce: "0123456789abcdef0123456789abcdef",
             snapshot: SHA,
             outputs: &[],
+            failure_outputs: &[],
             full: false,
             timeout: 1,
             host: "builder",
@@ -677,6 +685,7 @@ mod tests {
             nonce: "n1",
             snapshot: sha,
             outputs: &[],
+            failure_outputs: &[],
             full: false,
             timeout: 300,
             host: "builder",
@@ -723,6 +732,7 @@ mod tests {
             nonce: "n2",
             snapshot: "0123456789abcdef0123456789abcdef01234567",
             outputs: &globs,
+            failure_outputs: &[],
             full: true,
             timeout: 1,
             host: "builder",
@@ -765,6 +775,26 @@ mod tests {
     }
 
     #[test]
+    fn a_run_sends_its_failure_output_globs_only_when_it_has_some_and_the_box_reads_them_back() {
+        let words = ["./tool.exe".to_owned()];
+        let globs = ["**/bin/**".to_owned()];
+        let dumps = ["dumps/*.dmp".to_owned()];
+        let run = RunCall {
+            failure_outputs: &dumps,
+            outputs: &globs,
+            words: &words,
+            ..warm_run(&[], None)
+        };
+        let sent = decoded(&run_word(&location(), &run));
+        assert_eq!(sent["FailureOutputs"], json!(["dumps/*.dmp"]));
+        assert_eq!(sent["Outputs"], json!(["**/bin/**"]), "beside Outputs, which it leaves as it is");
+        assert_eq!(on_the_box(&run_word(&location(), &run)).failure_output_globs(), Ok(dumps.to_vec()));
+        let without = RunCall { failure_outputs: &[], ..run };
+        let sent = decoded(&run_word(&location(), &without));
+        assert!(sent.get("FailureOutputs").is_none(), "a run with none sends no FailureOutputs: {sent}");
+    }
+
+    #[test]
     fn a_run_with_env_pairs_sends_them_in_order_and_the_box_reads_them_back() {
         let words = ["./tool.exe".to_owned()];
         let env = [("NuGetAudit".to_owned(), "false".to_owned()), ("EMPTY".to_owned(), String::new())];
@@ -774,6 +804,7 @@ mod tests {
             nonce: "n3",
             snapshot: SHA,
             outputs: &[],
+            failure_outputs: &[],
             full: false,
             timeout: 1,
             host: "builder",
@@ -813,6 +844,7 @@ mod tests {
             nonce: "0123456789abcdef0123456789abcdef",
             snapshot: SHA,
             outputs: &[],
+            failure_outputs: &[],
             full: false,
             timeout: 1,
             host: "builder",
@@ -858,6 +890,7 @@ mod tests {
             nonce: "0123456789abcdef0123456789abcdef",
             snapshot: SHA,
             outputs: &[],
+            failure_outputs: &[],
             full: false,
             timeout: 1,
             host: "builder",
@@ -904,6 +937,7 @@ mod tests {
             nonce: "0123456789abcdef0123456789abcdef",
             snapshot: SHA,
             outputs: &[],
+            failure_outputs: &[],
             full: false,
             timeout: 1,
             host: "builder",
@@ -954,6 +988,7 @@ mod tests {
             nonce: "0123456789abcdef0123456789abcdef",
             snapshot: SHA,
             outputs: &[],
+            failure_outputs: &[],
             full: false,
             timeout: 300,
             host: "builder",
@@ -1011,6 +1046,7 @@ mod tests {
             nonce: WARM_NONCE,
             snapshot: SHA,
             outputs: &[],
+            failure_outputs: &[],
             full: false,
             timeout: 1800,
             host: "builder",
@@ -1033,7 +1069,12 @@ mod tests {
             commands: &commands,
             hash: WARM_HASH,
         };
-        let sent = decoded(&warm_word(&location(), &warm_run(&[], None), &warm));
+        let dumps = ["dumps/*.dmp".to_owned()];
+        let run = RunCall {
+            failure_outputs: &dumps,
+            ..warm_run(&[], None)
+        };
+        let sent = decoded(&warm_word(&location(), &run, &warm));
 
         let mut expected = decoded(&location_word(&location()));
         let extra = json!({
@@ -1055,7 +1096,7 @@ mod tests {
             expected[name] = value.clone();
         }
         assert_eq!(sent, expected);
-        for key in ["Command", "Outputs", "OutputsFull"] {
+        for key in ["Command", "Outputs", "FailureOutputs", "OutputsFull"] {
             assert!(sent.get(key).is_none(), "a warm word sends no {key}: {sent}");
         }
     }

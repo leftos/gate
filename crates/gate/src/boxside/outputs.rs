@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use gate_args::BoxSeams;
+use gate_inputs::failure::{self, Capping, Caps};
 use gate_router::escaped;
 use gate_wire::{Payload, archive_file_name, archive_key};
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
@@ -42,11 +43,16 @@ pub(crate) const OUTPUTS_BUDGET: u64 = 50 * GIB;
 /// The line a pack says when there was nothing to bring back, and so no archive was written.
 pub(super) const NOTHING_PACKED: &str = "gate-remote-outputs: 0";
 
-/// What a run with output globs asks for: the globs, whether every file counts as changed (`OutputsFull`), the name of
-/// its archive and the folder it goes in.
+/// What a run with output or failure output globs asks for: the globs, the failure output globs, whether every file
+/// counts as changed (`OutputsFull`), the caps a failed command's set is held to, the name of its archive and the folder
+/// it goes in.
 pub(super) struct Asked<'a> {
     globs: Globs,
+    /// The run's failure output globs, which a failed command brings back beside its test reports; `None` for a run
+    /// without any.
+    failure: Option<Globs>,
     full: bool,
+    capping: Capping,
     /// The name of the run's own outputs archive in its output folder.
     pub(super) archive: String,
     /// The output folder the archive is written in.
@@ -54,31 +60,55 @@ pub(super) struct Asked<'a> {
 }
 
 impl<'a> Asked<'a> {
-    /// The outputs of a run of the work folder `key`, its outputs nonce `nonce`: `None` when `globs` is empty; else
-    /// the usage line saying why a glob cannot be matched.
-    pub(super) fn new(globs: &[String], full: bool, key: &str, nonce: &str, folder: &'a str) -> Result<Option<Asked<'a>>, String> {
-        if globs.is_empty() {
+    /// The outputs of a run of the work folder `key`, its outputs nonce `nonce`, asking for the output globs `globs`
+    /// and the failure output globs `failure`: `None` when both are empty; else the usage line saying why a glob cannot
+    /// be matched.
+    pub(super) fn new(
+        (globs, failure): (&[String], &[String]),
+        full: bool,
+        key: &str,
+        nonce: &str,
+        folder: &'a str,
+    ) -> Result<Option<Asked<'a>>, String> {
+        if globs.is_empty() && failure.is_empty() {
             return Ok(None);
         }
         let globs = Globs::new(globs).map_err(|reason| format!("gate: box payload Outputs {reason}"))?;
+        let failure = if failure.is_empty() {
+            None
+        } else {
+            Some(Globs::new(failure).map_err(|reason| format!("gate: box payload FailureOutputs {reason}"))?)
+        };
         Ok(Some(Asked {
             globs,
+            failure,
             full,
+            capping: Capping::Uncapped,
             archive: archive_file_name(key, nonce),
             folder,
         }))
     }
 
-    /// These outputs narrowed to the globs that name a `TestResults` folder ([`Globs::test_results_only`]), which a
-    /// failed command brings back, in the same archive and folder: `None` when no glob names one.
-    pub(super) fn test_reports(&self) -> Option<Asked<'a>> {
+    /// What a failed command brings back, in the same archive and folder: the failed run's set of these outputs
+    /// ([`failure::failed_run_globs`]), its failure outputs held to `caps` ([`Capping`]); `None` when no glob names a
+    /// `TestResults` folder and there are no failure output globs.
+    pub(super) fn failed_run(&self, caps: Caps) -> Option<Asked<'a>> {
+        let (globs, capping) = failure::failed_run_globs(&self.globs, self.failure.as_ref(), caps)?;
         Some(Asked {
-            globs: self.globs.test_results_only()?,
+            globs,
+            failure: None,
             full: self.full,
+            capping,
             archive: self.archive.clone(),
             folder: self.folder,
         })
     }
+}
+
+/// The caps a failed command's failure outputs are held to: the `--test-box-failure-cap-bytes` seam's when given, else
+/// [`Caps::BUILT_IN`].
+pub(super) fn failure_caps(seams: &BoxSeams) -> Caps {
+    seams.failure_cap_bytes.map_or(Caps::BUILT_IN, Caps::of_seam)
 }
 
 /// The PC's manifest, read from `input` up to its first newline or its end, never waiting past the newline and never
@@ -315,6 +345,9 @@ pub(super) fn listing(asked: &Asked<'_>, work: &Path) -> (Option<Listing>, Optio
     if asked.full {
         return (None, None);
     }
+    if asked.globs.is_empty() {
+        return (Some(Listing::default()), None);
+    }
     match walk(work, &asked.globs) {
         Ok(found) => (Some(Listing::of(&found)), None),
         Err(error) => (
@@ -328,8 +361,9 @@ pub(super) fn listing(asked: &Asked<'_>, work: &Path) -> (Option<Listing>, Optio
 }
 
 /// Packs the files under `asked`'s globs in `work` to bring back after a passing command ([`select`]), or a failed one's
-/// test reports ([`Asked::test_reports`]), leaving out `skip`, the paths of the run's back commit, which the sync-back
-/// replaces on the PC, so no copy is made from the PC's file at one of them either: the line saying how many were
+/// test reports and failure outputs ([`Asked::failed_run`]), the failure outputs held to their caps, leaving out `skip`,
+/// the paths of the run's back commit, which the sync-back replaces on the PC, so no copy is made from the PC's file at
+/// one of them either: the line saying how many were
 /// packed and the archive's name, and the line before it saying the archive's size in bytes as the pack wrote them
 /// ([`size_line`]); or `gate-remote-outputs: 0` with no archive written when none were; and before them the line saying
 /// the files [`select`] would have packed but for a name this PC cannot take ([`skipped_line`]), when there were any.
@@ -345,14 +379,24 @@ pub(super) fn bring_back(
     skip: &[String],
 ) -> Result<Brought, String> {
     let manifest = manifest.as_ref().map_err(Clone::clone)?;
+    if asked.globs.is_empty() {
+        return Ok(Brought {
+            skipped: None,
+            left: Vec::new(),
+            size: None,
+            line: NOTHING_PACKED.to_owned(),
+        });
+    }
     let walked = walk_with_refused(work, &asked.globs).map_err(|error| format!("the outputs could not be listed: {error}"))?;
     let hash = |file: &Found| file_sha256(&file.full);
     let refused = select(&walked.refused, manifest, listing, skip, hash).map_err(|error| error.to_string())?;
     let skipped = skipped_line(&refused.iter().map(|chosen| chosen.file).collect::<Vec<_>>());
-    let mut chosen = select(&walked.found, manifest, listing, skip, hash).map_err(|error| error.to_string())?;
+    let chosen = select(&walked.found, manifest, listing, skip, hash).map_err(|error| error.to_string())?;
+    let (mut chosen, left) = asked.capping.capped(chosen);
     if chosen.is_empty() {
         return Ok(Brought {
             skipped,
+            left,
             size: None,
             line: NOTHING_PACKED.to_owned(),
         });
@@ -369,6 +413,7 @@ pub(super) fn bring_back(
     match pack(BufWriter::new(file), work, &chosen, &manifest.by_hash(skip)) {
         Ok(packed) => Ok(Brought {
             skipped,
+            left,
             size: Some(size_line(packed.compressed)),
             line: format!("gate-remote-outputs: {} {}", packed.entries.len(), asked.archive),
         }),
@@ -380,10 +425,12 @@ pub(super) fn bring_back(
 }
 
 /// What [`bring_back`] has the box say: the line of the files left out for names this PC cannot take, when there were
-/// any; the archive's size line, when it packed one; and the outputs line, said last.
+/// any; the line saying each failure output left on the builder for a cap, in walk order; the archive's size line, when
+/// it packed one; and the outputs line, said last.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Brought {
     pub(super) skipped: Option<String>,
+    pub(super) left: Vec<String>,
     pub(super) size: Option<String>,
     pub(super) line: String,
 }
@@ -586,13 +633,13 @@ mod tests {
 
     #[test]
     fn no_globs_ask_for_no_outputs() {
-        let asked = Asked::new(&[], true, "k", "n", r"C:\outputs").expect("no globs are fine");
+        let asked = Asked::new((&[], &[]), true, "k", "n", r"C:\outputs").expect("no globs are fine");
         assert!(asked.is_none());
     }
 
     /// The outputs of a run of the work folder `k` asking for every file, its output folder `folder`.
     fn asked(folder: &str) -> Asked<'_> {
-        Asked::new(&["**".to_owned()], false, "k", "n", folder)
+        Asked::new((&["**".to_owned()], &[]), false, "k", "n", folder)
             .expect("the glob is fine")
             .expect("globs ask")
     }

@@ -69,6 +69,7 @@ fn always_valid(pattern: &str) -> Regex {
 /// exactly `TestResults`, in any letter case, lifts [`EXCLUDED_TEST_RESULTS`] for itself alone: it brings back what it
 /// matches below a `TestResults` folder, at most as many such folders as it names, and the walk enters a `TestResults`
 /// folder when a glob of the set names it on the way to it.
+#[derive(Clone)]
 pub struct Globs {
     patterns: Vec<Pattern>,
     /// The exclusions every glob is held by: [`EXCLUDED`], or the inputs' own regex.
@@ -158,6 +159,23 @@ impl Globs {
             excluded: self.excluded.clone(),
             beyond_test_results: self.beyond_test_results.clone(),
         })
+    }
+
+    /// This matcher's globs followed by `more`'s, in their order, held by this matcher's exclusions: the set a failed
+    /// command brings back, its test reports' globs joined with its failure output globs, both output matchers.
+    #[must_use]
+    pub fn joined(&self, more: &Globs) -> Globs {
+        Globs {
+            patterns: self.patterns.iter().chain(&more.patterns).cloned().collect(),
+            excluded: self.excluded.clone(),
+            beyond_test_results: self.beyond_test_results.clone(),
+        }
+    }
+
+    /// Whether this matcher holds no glob, and so matches nothing: a walk under it finds nothing to list.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
     }
 
     /// Whether the file at the `/`-separated relative `path` may come back: [`Globs::selects`] it, it is neither a

@@ -7429,6 +7429,87 @@ fn a_failing_run_whose_box_packed_no_report_says_nothing() {
     assert!(pending_marker(&case).exists(), "a failed run leaves the marker: {outcome:?}");
 }
 
+/// An [`outputs_case`] with the output globs `globs` and the failure output globs `failure`, whose `.gitignore` leaves
+/// `dumps/` out beside `bin/`, as a run that writes crash dumps does.
+fn failure_case(name: &str, globs: &[&str], failure: &[&str]) -> Case {
+    let case = client_case(name);
+    write(&case, ".gitignore", &format!("{CLIENT_IGNORED}bin/\ndumps/\n"));
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({
+        "host": HOST,
+        "slots": 2,
+        "repos": { &repo: ["*tool*", "*dotnet*"] },
+        "outputs": { &repo: globs },
+        "failureOutputs": { &repo: failure },
+    });
+    write_remote_json(&case, &routing.to_string());
+    case
+}
+
+/// A failing command that builds `bin\built.txt` and writes the dump `dumps\a.dmp`, then exits 3.
+const FAILING_WITH_A_DUMP: [&str; 9] = [
+    r".\tool.exe",
+    "write",
+    r"bin\built.txt",
+    "box",
+    "write",
+    r"dumps\a.dmp",
+    "dump",
+    "exit",
+    "3",
+];
+
+#[test]
+fn a_failing_run_with_a_failure_output_glob_brings_its_file_back_keeps_its_status_and_names_the_outputs() {
+    let case = failure_case("client-failure-outputs", &BIN, &["dumps/*.dmp"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &FAILING_WITH_A_DUMP));
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"], "{outcome:?}");
+    assert_eq!(worktree_text(&case, r"dumps\a.dmp"), "dump", "the dump is installed");
+    assert!(
+        !case.folder().join("bin").join("built.txt").exists(),
+        "nothing under bin is installed: {outcome:?}"
+    );
+    assert!(says_a_line_starting(&outcome, "gate: the failed run's outputs: 1 file(s)"), "{outcome:?}");
+    assert!(!says_a_line_starting(&outcome, "gate: the failed run's test reports"), "{outcome:?}");
+    assert!(pending_marker(&case).exists(), "a failed run leaves the marker: {outcome:?}");
+}
+
+#[test]
+fn a_passing_run_does_not_bring_back_a_file_only_a_failure_output_glob_matches() {
+    let case = failure_case("client-failure-outputs-passing", &BIN, &["dumps/*.dmp"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+    let command = [r".\tool.exe", "write", r"bin\built.txt", "box", "write", r"dumps\a.dmp", "dump"];
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &command));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(worktree_text(&case, r"bin\built.txt"), "box", "the build comes back");
+    assert!(
+        !case.folder().join("dumps").join("a.dmp").exists(),
+        "the dump stays on the builder: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_failing_run_with_only_failure_outputs_builds_the_manifest_and_brings_its_file_back() {
+    let case = failure_case("client-failure-outputs-only", &[], &["dumps/*.dmp"]);
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &FAILING_WITH_A_DUMP));
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"], "{outcome:?}");
+    assert_eq!(worktree_text(&case, r"dumps\a.dmp"), "dump", "the dump is installed");
+    assert!(
+        !case.folder().join("bin").join("built.txt").exists(),
+        "no output glob names bin: {outcome:?}"
+    );
+}
+
 /// A failing run that brings its test reports back leaves the count: the hits on either side of it are in a row.
 #[test]
 fn a_failing_run_bringing_reports_between_two_fetches_past_the_cap_leaves_the_count() {
@@ -8677,6 +8758,86 @@ fn a_routed_no_build_test_whose_outputs_are_withheld_writes_the_pending_marker_a
     assert_eq!(nothing_back(&case).as_deref(), Some(RELEASE_RECORD), "{outcome:?}");
 }
 
+/// A dotnet test whose `--no-build` the builder dropped, in a repo with output and failure output globs: the run still
+/// carries its failure output globs, and its passing end leaves the withheld run's marker as one without them does.
+#[test]
+fn a_passing_no_build_run_with_failure_outputs_keeps_its_withheld_marker() {
+    let case = withheld_failure_case("client-failure-outputs-withheld");
+    let capped = planted_state(&case, "outputs-capped", r#"{"v":1,"hits":1}"#);
+    // The run call keeps its request: it waits on the case folder, which is there already.
+    let fed = format!("fed-hold {}", shown(&case.folder()));
+    let steps = ssh_steps(&case, "ssh", &["ok", &fed, "ok"]);
+
+    let outcome = finish(client_gate(&case, "out.log", &steps, &wrapped_dotnet(&WRITE_NEW, &NO_BUILD_RELEASE_TEST)));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert!(outcome.stderr.contains("gate: dropped --no-build"), "{outcome:?}");
+    assert_eq!(
+        last_request(&steps)["FailureOutputs"],
+        json!(["dumps/*.dmp"]),
+        "the run call carries its failure output globs: {outcome:?}"
+    );
+    assert!(!case.folder().join("bin").join("new.txt").exists(), "nothing comes back: {outcome:?}");
+    assert!(pending_marker(&case).exists(), "the next run asks for every output: {outcome:?}");
+    assert_eq!(
+        fs::read_to_string(&capped).ok().as_deref(),
+        Some(r#"{"v":1,"hits":1}"#),
+        "the outputs cap record is left as it was: {outcome:?}"
+    );
+}
+
+/// The hash cache holds the outputs' hashes; a withheld run's manifest lists only the files under its failure output
+/// globs, so saving its cache would replace every output's.
+#[test]
+fn a_withheld_run_with_failure_outputs_leaves_the_hash_cache_as_it_was() {
+    let case = withheld_failure_case("client-failure-outputs-withheld-cache");
+    write(&case, r"dumps\old.dmp", "an earlier dump");
+    let planted = "a cache an earlier run saved\n";
+    let hashes = planted_state(&case, "outputs-hashes", planted);
+
+    let outcome = passing_build(&case, &["ok", "ok", "ok"], &wrapped_dotnet(&WRITE_NEW, &NO_BUILD_RELEASE_TEST));
+
+    assert!(outcome.stderr.contains("gate: dropped --no-build"), "{outcome:?}");
+    assert_eq!(
+        fs::read_to_string(&hashes).ok().as_deref(),
+        Some(planted),
+        "the cache is left as it was: {outcome:?}"
+    );
+}
+
+/// A [`failure_case`] with the output globs [`BIN`] and the failure output glob `dumps/*.dmp`, holding fake-tool as
+/// `pwsh.exe` too, and its `.gitignore` committed so a routed build has a `HEAD` to pin.
+fn withheld_failure_case(name: &str) -> Case {
+    let case = failure_case(name, &BIN, &["dumps/*.dmp"]);
+    copy_tool(&case, "pwsh.exe");
+    git(&case, &["add", ".gitignore"]);
+    git(&case, &["commit", "--quiet", "-m", "start"]);
+    case
+}
+
+/// The builder builds for a dotnet test whose `--no-build` it dropped, then the command writes a crash dump and fails:
+/// the withheld run still brings back the files under its failure output globs.
+#[test]
+fn a_failing_withheld_no_build_run_brings_its_failure_outputs_back() {
+    let case = withheld_failure_case("client-failure-outputs-withheld-failing");
+    let steps = ssh_steps(&case, "ssh", &["ok", "ok", "ok"]);
+    let dump_then_fail = ["write", r"dumps\a.dmp", "dump", "exit", "3"];
+
+    let outcome = finish(client_gate(
+        &case,
+        "out.log",
+        &steps,
+        &wrapped_dotnet(&dump_then_fail, &NO_BUILD_RELEASE_TEST),
+    ));
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert!(outcome.stderr.contains("gate: dropped --no-build"), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "run", "outputs"], "{outcome:?}");
+    assert_eq!(worktree_text(&case, r"dumps\a.dmp"), "dump", "the dump is installed: {outcome:?}");
+    assert!(says_a_line_starting(&outcome, "gate: the failed run's outputs: 1 file(s)"), "{outcome:?}");
+    assert!(pending_marker(&case).exists(), "the withheld run's marker stays: {outcome:?}");
+}
+
 /// A record already stands for a Debug build: the builder built a Release one for the withheld run, but the record is
 /// never rewritten.
 #[test]
@@ -9557,6 +9718,97 @@ fn a_sent_build_lands_and_the_builder_keeps_no_build() {
     assert_eq!(nothing_back(&case), None, "a kept --no-build leaves no nothing-back record: {outcome:?}");
     assert!(!pending_marker(&case).exists(), "nor an outputs-pending marker: {outcome:?}");
     assert_eq!(fallbacks(&events(&case)), Vec::<&str>::new());
+}
+
+/// A withheld run whose send of the PC's build lands keeps `--no-build` and builds nothing on the builder, so it
+/// writes no marker of its own; nor does its passing end clear the one an earlier run left, though it carries failure
+/// output globs.
+#[test]
+fn a_withheld_no_build_run_with_failure_outputs_whose_send_lands_leaves_an_earlier_marker() {
+    let case = sent_failure_case("client-sent-build-failure-outputs");
+    let marker = planted_state(&case, "outputs-pending", "");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(dotnet_gate(&case, "out.log", &steps, &SENT_TEST));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run"], "the send landed: {outcome:?}");
+    assert!(!outcome.stderr.contains(DROPPED_NO_BUILD_LINE), "{outcome:?}");
+    assert!(marker.exists(), "the earlier run's marker stays: {outcome:?}");
+}
+
+/// A withheld run whose send of the PC's build lands builds nothing on the builder, so it writes no marker of its own.
+#[test]
+fn a_withheld_no_build_run_whose_send_lands_writes_no_marker() {
+    let case = sent_failure_case("client-sent-build-failure-outputs-no-marker");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 4]);
+
+    let outcome = finish(dotnet_gate(&case, "out.log", &steps, &SENT_TEST));
+
+    assert_eq!(outcome.code, Some(0), "{outcome:?}");
+    assert_eq!(calls(&steps), ["preflight", "inputs", "inputs", "run"], "the send landed: {outcome:?}");
+    assert!(!pending_marker(&case).exists(), "no marker is written: {outcome:?}");
+}
+
+/// A withheld run whose send of the PC's build lands, whose command writes a crash dump and fails: it has no marker,
+/// but still brings back the files under its failure output globs.
+#[test]
+fn a_failing_withheld_no_build_run_whose_send_lands_brings_its_failure_outputs_back() {
+    let case = sent_failure_case("client-sent-build-failure-outputs-failing");
+    let steps = ssh_steps(&case, "ssh", &["ok"; 5]);
+    let command = [
+        r".\dotnet.exe",
+        "test",
+        "write",
+        r"dumps\a.dmp",
+        "dump",
+        "exit",
+        "3",
+        "argv",
+        "App.csproj",
+        "-c",
+        "Release",
+        "--no-build",
+    ];
+
+    let outcome = finish(dotnet_gate(&case, "out.log", &steps, &command));
+
+    assert_eq!(outcome.code, Some(3), "the command's own status: {outcome:?}");
+    assert_eq!(
+        calls(&steps),
+        ["preflight", "inputs", "inputs", "run", "outputs"],
+        "the send landed: {outcome:?}"
+    );
+    assert_eq!(worktree_text(&case, r"dumps\a.dmp"), "dump", "the dump is installed: {outcome:?}");
+    assert!(says_a_line_starting(&outcome, "gate: the failed run's outputs: 1 file(s)"), "{outcome:?}");
+    assert!(!pending_marker(&case).exists(), "no marker is written: {outcome:?}");
+}
+
+/// A [`sent_build_case`] whose repo has the failure output glob `dumps/*.dmp` too, `dumps/` ignored by git.
+fn sent_failure_case(name: &str) -> Case {
+    let case = sent_build_case(name, None);
+    write(&case, ".gitignore", &format!("{CLIENT_IGNORED}bin/\nobj/\ndumps/\n"));
+    let repo = repo_name(&case.folder().file_name().expect("the case folder has a name").to_string_lossy());
+    let routing = json!({
+        "host": HOST,
+        "slots": 2,
+        "repos": { &repo: ["*tool*", "*dotnet*"] },
+        "outputs": { &repo: BIN },
+        "failureOutputs": { &repo: ["dumps/*.dmp"] },
+        "sendBuild": [repo],
+    });
+    write_remote_json(&case, &routing.to_string());
+    case
+}
+
+/// Plants `text` as the case's worktree's `<key>.<suffix>` state file in its state root, before any run names the key;
+/// its path.
+fn planted_state(case: &Case, suffix: &str, text: &str) -> PathBuf {
+    let key = work_folder_key(&git(case, &["rev-parse", "--show-toplevel"]));
+    let path = case.root().join("remote").join(format!("{key}.{suffix}"));
+    fs::create_dir_all(path.parent().expect("the state file has a folder")).expect("the state folder can be made");
+    fs::write(&path, text).expect("the state file can be planted");
+    path
 }
 
 #[test]

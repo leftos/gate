@@ -710,6 +710,7 @@ fn call_of<'a>(
         words: &[],
         outputs: &[],
         outputs_withheld: false,
+        failure_outputs: &[],
         dropped_no_build: false,
         send: None,
         desktop: false,

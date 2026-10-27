@@ -29,6 +29,57 @@ fn a_good_file_gives_host_slots_patterns_and_outputs() {
 }
 
 #[test]
+fn a_failure_outputs_entry_is_read_and_a_repo_it_does_not_name_has_none() {
+    let config = Config::parse(
+        r#"{"host": "builder-1", "repos": {"gate": [], "other": []},
+            "outputs": {"gate": ["target/**"]},
+            "failureOutputs": {"Gate": ["dumps/*.dmp", "**/*.crashreport.json"]}}"#,
+    )
+    .expect("usable");
+    assert_eq!(config.failure_outputs("gate"), ["dumps/*.dmp", "**/*.crashreport.json"]);
+    assert_eq!(config.failure_outputs("other"), Vec::<String>::new());
+    assert_eq!(config.own_outputs("gate"), Some(vec!["target/**".to_owned()]), "outputs is its own list");
+    assert_eq!(
+        Config::parse(r#"{"host": "builder-1", "repos": {"gate": []}}"#)
+            .expect("usable")
+            .failure_outputs("gate"),
+        Vec::<String>::new(),
+        "absent, it has no defaults"
+    );
+}
+
+#[test]
+fn an_unusable_failure_outputs_entry_is_refused_as_an_outputs_entry_is() {
+    let cases = [
+        (
+            r#"{"host": "bx", "repos": {"g": ["x"]}, "failureOutputs": []}"#,
+            "failureOutputs must be a JSON object",
+        ),
+        (
+            r#"{"host": "bx", "repos": {"g": ["x"]}, "failureOutputs": {"g": ["x", ""]}}"#,
+            "failureOutputs.g[1] is not a non-empty string",
+        ),
+        (
+            r#"{"host": "bx", "repos": {"g": ["x"]}, "failureOutputs": {"g": ["dumps/[x"]}}"#,
+            "failureOutputs.g[0] is not a valid wildcard pattern",
+        ),
+        (
+            r#"{"host": "bx", "repos": {"g": ["x"]}, "failureOutputs": {"g": ["dumps/[x]"]}}"#,
+            "failureOutputs.g[0] is not a valid output glob: '[' and ']' are not allowed",
+        ),
+        (
+            r#"{"host": "bx", "repos": {"g": ["x"]},
+                "builders": [{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"g": ["x"]},
+                              "failureOutputs": {"g": ["x]"]}}]}"#,
+            "builders[0].failureOutputs.g[0] is not a valid output glob: '[' and ']' are not allowed",
+        ),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(reason(text), expected, "{text}");
+    }
+}
+
+#[test]
 fn an_inputs_entry_is_read_and_a_repo_it_does_not_name_has_none() {
     let config = Config::parse(
         r#"{"host": "builder-1", "repos": {"gate": [], "other": []},

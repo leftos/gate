@@ -205,12 +205,13 @@ impl Request<'_> {
         let snapshot = payload.snapshot()?;
         let (key, work) = payload.work_folder()?;
         let (globs, full) = (payload.output_globs()?, payload.outputs_full()?);
+        let failure = payload.failure_output_globs()?;
         // Only a macOS builder cross-builds: a run asking for one is refused rather than run without it.
         if payload.cross_build()?.is_some() {
             return Err("gate: box payload CrossBuild is a macOS builder's key; this box cannot cross-build".to_owned());
         }
         let nonce = payload.nonce()?;
-        let outputs = Asked::new(&globs, full, key, nonce, payload.output_folder(work)?)?;
+        let outputs = Asked::new((&globs, &failure), full, key, nonce, payload.output_folder(work)?)?;
         let (timeout, host) = (payload.timeout()?, payload.optional_text("Host")?);
         // A run of the builder's desktop has to say how long it may wait for one; a wait no run asks for is ignored,
         // whatever it says.
@@ -785,6 +786,9 @@ impl<'a> RunOutputs<'a> {
                 if let Some(skipped) = &brought.skipped {
                     beat.say(console, skipped);
                 }
+                for left in &brought.left {
+                    beat.say(console, left);
+                }
                 if let Some(size) = &brought.size {
                     beat.say_protocol(console, size);
                 }
@@ -966,10 +970,12 @@ fn commanded(
     }
 }
 
-/// Packs the test reports of a failed command of `request` run in `work` ([`outputs::Asked::test_reports`]), leaving
+/// Packs the test reports and failure outputs of a failed command of `request` run in `work`
+/// ([`outputs::Asked::failed_run`]), the failure outputs held to the box's caps ([`outputs::failure_caps`]), leaving
 /// out the paths of the back commit `commit`, read with `git`, as a passing command's outputs are packed; nothing, and
-/// no line, when no output glob names a `TestResults` folder. The failed command ends on its own status whatever the
-/// pack says, a client gone while the paths are read or during the pack included.
+/// no line, when no output glob names a `TestResults` folder and the run has no failure output globs. The failed
+/// command ends on its own status whatever the pack says, a client gone while the paths are read or during the pack
+/// included.
 fn reports_brought_back(
     (request, git): (&Request<'_>, &WorkGit),
     (outputs, commit): (&RunOutputs<'_>, Option<&str>),
@@ -977,7 +983,7 @@ fn reports_brought_back(
     beat: &Beat<'_>,
     console: &mut Console,
 ) {
-    let Some(reports) = outputs.asked.test_reports() else {
+    let Some(reports) = outputs.asked.failed_run(outputs::failure_caps(beat.seams)) else {
         return;
     };
     let Ok(skip) = back_skip(request, git, commit, console) else {

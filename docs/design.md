@@ -1366,23 +1366,27 @@ Two rolls within one second collide on the archive name: the second archive fail
 
 ### remote.json
 
-`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos`, the optional `builders` and the optional per-repo `outputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks`, `sendBuild` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
+`remote.json` keeps the PowerShell gate's format (T1), read by `gate-router` as [Routing](#routing) describes: `host`, `slots`, `repos`, the optional `builders` and the optional per-repo `outputs`, `failureOutputs`, `inputs`, `siblings` and `desktop` and the optional `warmup`, `hooks`, `sendBuild` and `declarations`, read afresh by each routed gate and ignored as a whole with one line when unusable. A host of one letter is refused (`host must not be a single letter, which a git host:path URL reads as a drive`).
 
 The optional `hosts` is an array of strings naming further builders, which `gate push`, `gate check --builder` and `gate run --builder` reach; an unpinned routed run goes to `host` or a routed `builders` entry, never to a `hosts` entry. Each entry passes the checks `host` does, with the same reasons worded `hosts entries ...`.
 
 The push order is `host`, then `hosts` in file order, an entry equal to an earlier one in any letter case skipped. A `hosts` that is not an array of strings, or holds a bad entry, never affects routing: `gate push` alone refuses the file with `push: ignored <path>: <reason>`.
 
-The optional `builders` is an array of further builders that a routed run can go to, each `{"host", "os", "root", "slots", "routed", "repos", "outputs"}`:
+The optional `builders` is an array of further builders that a routed run can go to, each `{"host", "os", "root", "slots", "routed", "repos", "outputs", "failureOutputs"}`:
 - `host` is the builder's ssh alias, passing the checks the top-level `host` does (`Builder::alias`).
 - `os` is `windows` or `macos` in any letter case.
 - `root` is the builder's work root. It is required for `macos`: an absolute path rooted at `/`, each name made of ASCII letters, digits, `.`, `_` and `-`, none empty, `.` or `..`. For `windows` it defaults to `D:\gate-remote` and must be `X:\` followed by names joined by `\`, each made of ASCII letters, digits, `.`, `_` and `-`, none starting or ending with `.` or a reserved device name; `/` is refused (`builders[N].root must be an absolute drive path for a windows builder`).
 - `slots` is 1 to 16, default 1.
 - `routed` is an optional boolean, default `true`; a value that is not `true` or `false` makes the file unusable (`builders[N].routed must be true or false`). With `false` the entry is a not-routed builder: `repos` may be empty or missing and no unpinned run picks or tries it, while `gate push`, `gate check --builder` and `gate run --builder` reach it like any `builders` entry.
-- `repos` and `outputs` are the entry's own, shaped like the top-level ones.
+- `repos`, `outputs` and `failureOutputs` are the entry's own, shaped like the top-level ones.
 
 A bad entry, an alias that repeats the top-level `host`, an earlier `builders` entry or a `hosts` entry in any ASCII letter case, or a `builders` that is not an array makes the whole file unusable: `gate: ignored <path>: builders[N]...; running locally`. The top-level `outputs` apply to `host` alone; a `builders` entry with no `outputs` brings nothing back when it is `macos` and uses the default output globs when it is `windows`.
 
 A `macos` entry's `outputs` are honoured, since the Unix box brings outputs back.
+
+`failureOutputs` is an optional object of repo name to an array of globs, beside `outputs`, with the same glob rules (non-empty `-like` patterns, no `[` or `]`) and the same key on a `builders` entry, whose list wins for a run on that builder (an entry that does not name the repo has none). It is absent by default and has no default or derived globs. The files under them come back only from a failed command (Routing, Outputs).
+
+A bad value makes the file unusable, with the refusals of `outputs`: `failureOutputs must be a JSON object`, `failureOutputs.<repo>[<i>] is not a non-empty string`, `failureOutputs.<repo>[<i>] is not a valid wildcard pattern`, `failureOutputs.<repo>[<i>] is not a valid output glob: '[' and ']' are not allowed`, and the `builders[N].failureOutputs...` forms.
 
 The transport root, the box line, the pack commands, the push URL, the payload paths, the path map and the PC's caches follow the entry's profile (`Profile`: alias, `os`, `root`). A Windows builder's `root` is honoured; a macOS builder's box line is `<root>/bin/gate-box box <verb> --stdin`, its job is named `gate-remote-<key>-<12 hex>` and its paths are joined with `/`.
 
@@ -2263,6 +2267,8 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   `slots` is a whole number 1 to 16 (1 when missing), `repos` an object whose values are arrays of non-empty `-like` patterns, and `outputs` an optional object of the same shape whose globs may not hold `[` or `]`; a repo with no `outputs` entry brings back `**/bin/**` and `**/.godot/mono/temp/bin/**`.
 
+  `failureOutputs` is an optional object of the same shape with the same `[`/`]` ban, read by the same table reader; the route puts the repo's list (the builder entry's own for a `builders` entry) in `RemoteRun.failure_outputs`, none when the repo is not named, with no default.
+
   `inputs` is an optional object of the same shape with the same `[`/`]` ban (`is not a valid input glob: '[' and ']' are not allowed`), read by the same table reader; a repo with no `inputs` entry sends nothing, and there is no default list. The route carries the repo's list as `RemoteRun.inputs` and `RemoteCall.inputs`, kept for a dotnet `--no-build` command, whose outputs alone are withheld.
 
   `sendBuild` is an optional array of repo names, matched in any letter case, whose routed `dotnet test --no-build` may send the PC's build so the builder keeps the word (`Config::send_build_allowed`); a repo it does not name, or a file without the key, sends no build.
@@ -2685,7 +2691,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
   - **Desktop.** A routed run whose `RemoteRun.desktop` is true (Routing, the desktop paragraphs) sends `Desktop: true` and `DesktopWait` in its run call's payload (`payload::run_word`), `DesktopWait` being the usual remote wait, `REMOTE_LIMIT` (60 s), which the box caps at the run's `Timeout`. No other call sends either key, a warm-up included; the scripted test client's recorded call has a `desktop` key.
 
     A desktop run holds a normal remote slot while it waits for the builder's desktop, so other routed runs of this PC can fall back `full` meanwhile, and the wait counts against the client's backstop.
-  - **Warm-up call.** A call whose `warmth` is a warm-up (`Warmth::WarmUp` in `remote/mod.rs`) runs the phases above with the run call's payload built by `payload::warm_word`: the run's keys, `Timeout` always among them, with `WarmCommands` and `WarmHash` in place of `Command` and no `Outputs` or `OutputsFull` key.
+  - **Warm-up call.** A call whose `warmth` is a warm-up (`Warmth::WarmUp` in `remote/mod.rs`) runs the phases above with the run call's payload built by `payload::warm_word`: the run's keys, `Timeout` always among them, with `WarmCommands` and `WarmHash` in place of `Command` and no `Outputs`, `FailureOutputs` or `OutputsFull` key.
 
     Its limits are a run's, from the call's `timeout`. `gate warm` makes such a call. A routed run's call of a repo whose warm-up is set up carries `warmth: {"consented": <hash>}` instead, which only words the cold note.
 
@@ -2698,7 +2704,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
     The failure's reason is built from the end alone, never from a line the builder or the commands said: `command stopped with status {n}`, `the builder ended the warm-up before its commands with status {n}`, `the box did not confirm the warm hash`, `the builder refused: {reason}`, `the warm-up was killed: it ran out of its budget or went silent`, `the connection to the builder was lost`, `the client could not send the warm-up` or `the client failed`.
 
     A warm-up touches no outputs state (it reads, saves and marks none, whatever globs the call holds) and syncs nothing back; a lost connection is handled as a run's is. The key mutex a caller holds around it can be taken with a wait (`hold_key_waiting` in `remote/client.rs`): it waits in slices of 100 ms, looks at the console interrupt between them, and a Ctrl+C ends the wait.
-  - **Outputs.** In `remote/outputs.rs`, for a run with output globs; a run without them sends `Outputs` `[]` and `OutputsFull` false, no manifest, and says nothing here, and writes no marker unless the route withheld its outputs (a dotnet `--no-build` command the builder built): that run writes the pending marker after the push, as below, and no end of it clears the marker. The client builds the manifest ([The outputs module](#the-box-side)) before the run call, hashing every matching file.
+  - **Outputs.** In `remote/outputs.rs`, for a run with output globs or failure output globs (`failureOutputs`); a run without either sends `Outputs` `[]` and `OutputsFull` false, no manifest, and says nothing here, and writes no marker unless the route withheld its outputs (a dotnet `--no-build` command the builder built): that run writes the pending marker after the push, as below, and no end of it clears the marker. The client builds the manifest ([The outputs module](#the-box-side)) before the run call, hashing every matching file.
+
+    The manifest covers both lists. When it cannot be built over both, the client builds it again over the output globs alone. When that build succeeds, the run says `gate: failure outputs not asked for this run: <why>` and carries no failure globs. When it fails too, the run ends as a failed manifest build does, with no such line. A run with no output globs whose build fails carries nothing, as one with no globs at all. A run with only failure globs writes the pending marker and sends a manifest like one with output globs, but its passing command brings nothing back.
 
     **Manifest time** (GATE-23): SHA-256 streams, with no whole-file read into memory, and only the PC hashes every file (the box hashes changed files only; `obj` is not under the default globs). No timing line is added to routed runs.
 
@@ -2732,7 +2740,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     Once the push succeeds, and before the run call, it writes the pending marker `<state root>\remote\<key>.outputs-pending` (an empty file; a marker whose existence cannot be read counts as present), so a run refused at the preflight or by the parity check leaves none.
 
-    The payload carries the globs as `Outputs` and `OutputsFull` (true when the marker was there), and the manifest goes as the line after the request on the run call's stdin, which is then closed; a pre-banner retry feeds both again. A marker that cannot be written says `gate: the remote run failed: cannot write the outputs pending marker <path>: <error>`.
+    The payload carries the globs as `Outputs`, the failure output globs as `FailureOutputs` (only when there is one, never on a warm-up) and `OutputsFull` (true when the marker was there), and the manifest goes as the line after the request on the run call's stdin, which is then closed; a pre-banner retry feeds both again. A marker that cannot be written says `gate: the remote run failed: cannot write the outputs pending marker <path>: <error>`.
 
     A call whose input could not be sent logs `gate: the <verb> call's input was not sent: <error>`, only when the call reached the box's banner and ended neither refused nor with ssh's 255, since any other end says why on its own lines. An input still being sent 2 s after the call ended logs `gate: the <verb> call's input was still being sent 2 s after the call ended`, and a feeder thread that panicked `gate: the <verb> call's input feeder panicked`.
 
@@ -2744,7 +2752,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     After an accepted `0` the marker is removed (`gate: cannot remove the outputs pending marker <path>: <error>` if it cannot, and the status stands); so does an install that ends as the Outputs install below says, and every other end leaves it, so the next run sends `OutputsFull`.
 
-    An accepted line naming an archive leaves the marker; the fetch of the archive and its install (the Outputs fetch and Outputs install phases, below the sync-back) follow. After a failed run the marker is never removed, an accepted `0` included, and the fetch that follows an archive is only of the failed run's test reports (Outputs fetch).
+    An accepted line naming an archive leaves the marker; the fetch of the archive and its install (the Outputs fetch and Outputs install phases, below the sync-back) follow. After a failed run the marker is never removed, an accepted `0` included, and the fetch that follows an archive is only of the failed run's test reports and failure outputs (Outputs fetch). A `--no-build` run whose outputs were withheld never writes the marker through its manifest, and never clears it or the outputs cap record on a passing end, with `failureOutputs` too. A failing withheld run still brings back its failure outputs, whether or not its send of the PC's build landed.
 
     A run says at most one of these lines (a passing run then exits 1; a failed run keeps the command's own status, see the box side): `gate: remote outputs not brought back: the worktree changed during the run` (wins when it applies), `gate: remote outputs not brought back: the manifest could not be built: <msg>` (`<path> resolves outside the worktree`, `it is larger than the box takes (64 MiB)`, checked as the manifest is built before the rest is hashed, or the read error), or a third.
 
@@ -2801,7 +2809,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
       The run says `gate: synced back <n> file(s): <names joined by ", ">`, names from `git diff-tree -r -z --name-only` with control characters escaped; it reads `0 file(s): ` with nothing after the colon when no files changed.
     - A git failure here ends the run with status 1 and `gate: the remote run failed: ...`, with no fallback, except a failure as a connection fails, which is retried as below.
-    - **Retry of the transfers after the command.** The `ls-remote`, the `fetch` and the outputs pull (a failed run's test-report pull included) are each made up to 3 times in all, after pauses of 5 s and then 15 s, saying before each retry `gate: bringing the results back from <host> failed (<reason>); trying again (<n> of 2)`. `<reason>` is the failure's own text without its `gate: ` prefix. The pre-banner retry of each call nests inside each attempt.
+    - **Retry of the transfers after the command.** The `ls-remote`, the `fetch` and the outputs pull (a failed run's pull included) are each made up to 3 times in all, after pauses of 5 s and then 15 s, saying before each retry `gate: bringing the results back from <host> failed (<reason>); trying again (<n> of 2)`. `<reason>` is the failure's own text without its `gate: ` prefix. The pre-banner retry of each call nests inside each attempt.
 
       A git call is retried on status 128 only when a line git or ssh said holds one of `Could not read from remote repository`, `the remote end hung up unexpectedly`, `early EOF`, `Connection reset`, `Connection closed`, `Connection timed out`, `Broken pipe`, `kex_exchange_identification` or a pre-banner phrase, in any case, and when the call was cut at its own deadline (the `ls-remote`'s 60 s).
 
@@ -2854,9 +2862,9 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
   - **Outputs fetch.** In `remote/outputs.rs` and `remote/client.rs`, after a passing run whose box said an accepted outputs line naming an archive and a passing sync-back.
 
-    After a failed run it fetches only when the box packed an archive (see the box side), the PC's manifest was built and a glob of the run's outputs names a `TestResults` folder; a failed sync-back that returned a status does not stop it. A failed run whose box said no outputs line or `gate-remote-outputs: 0`, whose manifest was not built, or with no such glob says nothing about outputs.
+    After a failed run it fetches only when the box packed an archive (see the box side), the PC's manifest was built and a glob of the run's outputs names a `TestResults` folder or the run has failure output globs; a failed sync-back that returned a status does not stop it. A failed run whose box said no outputs line or `gate-remote-outputs: 0`, whose manifest was not built, or with neither kind of glob says nothing about outputs.
 
-    The failed run's fetch is the same pull with `the failed run's test reports` where the lines say outputs: `gate: pulling the failed run's test reports from <builder>: <n> file(s)[, <size>]`, the three progress forms as `gate: pulling the failed run's test reports: ...`, `gate: pulling the failed run's test reports ended after <f> s with <size> received`, the watchdog's `fetching the failed run's test reports` and the hang hint `pulling the failed run's test reports from <builder>`.
+    The failed run's fetch is the same pull with `the failed run's test reports` where the lines say outputs (`the failed run's outputs` when its set holds a failure output glob; the lines below keep the first wording): `gate: pulling the failed run's test reports from <builder>: <n> file(s)[, <size>]`, the three progress forms as `gate: pulling the failed run's test reports: ...`, `gate: pulling the failed run's test reports ended after <f> s with <size> received`, the watchdog's `fetching the failed run's test reports` and the hang hint `pulling the failed run's test reports from <builder>`.
 
     Its failures say `gate: the failed run's test reports not brought back: <reason>` (a fetch past the size cap only says that), and every end keeps the command's own status, except that a watchdog stop or a Ctrl+C during the pull still ends as 124 or an interrupt. It never clears the pending marker and never counts toward or clears the outputs cap record, and the attempt's outputs stay not brought back.
 
@@ -2891,7 +2899,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     Every other end of an outputs step removes the record: an archive fetched whole, removed before its install, so outputs brought back, an install that refused and a Ctrl+C during the install all clear it; a box that packed nothing (`gate-remote-outputs: 0`); or a fetch that failed another way, a watchdog kill included.
 
-    A run that made no outputs call (refused, fallen back, failed, lost, or a pass the client turned to 1 before the fetch) leaves it, and so does a Ctrl+C during the fetch. A failed run's fetch of its test reports neither counts a hit nor removes the record, whatever its end; past the cap it says `gate: the failed run's test reports not brought back: the archive passed <cap>` and no more.
+    A run that made no outputs call (refused, fallen back, failed, lost, or a pass the client turned to 1 before the fetch) leaves it, and so does a Ctrl+C during the fetch. A failed run's fetch of its test reports and failure outputs neither counts a hit nor removes the record, whatever its end; past the cap it says `gate: the failed run's test reports not brought back: the archive passed <cap>` and no more.
 
     A record that is missing or cannot be read counts no hit. One that cannot be written says `gate: cannot write the outputs cap record <path>: <error>`, one that cannot be removed says `gate: cannot remove the outputs cap record <path>: <error>`, and the end the count read decides stands.
 
@@ -2951,9 +2959,7 @@ Routing is off on a machine with no `remote.json` in `%LOCALAPPDATA%\gate\`: not
 
     The tracked and in-use skips keep the pending marker, so the next routed run sends `OutputsFull`; a run whose only skips are files that cannot be rewritten clears it, since a refetch would skip them again.
 
-    A failed run's test reports are installed the same way, with the same snapshot time, and only the members under the globs narrowed by `Globs::test_results_only` and each line naming `the failed run's test reports` where it says outputs: `gate: the failed run's test reports: <n> file(s), <MB> MB (<MB> MB compressed) in <s> s (pulled in <s> s, <rate>)`, `gate: the failed run's test reports not brought back: <reason>` and `gate: the failed run's test reports not fully brought back: <path> <why>`. No end of it clears the pending marker, and the hash cache keeps the hashes of the reports it placed.
-
-    No end of it clears the pending marker, and the hash cache keeps the hashes of the reports it placed.
+    A failed run's test reports and failure outputs are installed the same way, with the same snapshot time, and only the members under the failed run's set (the globs narrowed by `Globs::test_results_only` followed by the failure output globs, `gate_inputs::failure::failed_run_globs`) and each line naming `the failed run's test reports` where it says outputs: `gate: the failed run's test reports: <n> file(s), <MB> MB (<MB> MB compressed) in <s> s (pulled in <s> s, <rate>)`, `gate: the failed run's test reports not brought back: <reason>` and `gate: the failed run's test reports not fully brought back: <path> <why>`. No end of it clears the pending marker, never touches the cap record, and the run is never marked as outputs back; the hash cache keeps the hashes of the files it placed. A set holding a failure output glob says `the failed run's outputs` in place of `the failed run's test reports` in each of these lines.
 
     The success line is `gate: outputs: <n> file(s), <X.X> MB (<Y.Y> MB compressed) in <Z.Z> s (pulled in <F.F> s, <rate>/s)`: `<n>` counts installed files only (a file left in place is not counted), the seconds run from the start of the fetch to the end of the install, `<F.F>` is the fetch alone, from its start to the archive's last byte (to the call's end when it received none), and `<rate>` the compressed size over it in the same MB (`<x.x> MB/s`), and each decimal rounds a half away from zero.
 
@@ -3240,7 +3246,7 @@ A routed run therefore moves to one long-lived connection carrying every verb, `
 
 The payload is one base64 word (standard alphabet, padded) of UTF-8 JSON, sent as the first line of the call's stdin (never on a command line), holding the wrapper's keys: `Key`, `Bare`, `Work`, `Lock`, `Index`, `OutputFolder` and `Job`.
 
-A `run` payload also holds `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, `SentDigest`, `LfsDigest`, `GodotVersion`, `EngineEnv` and `CrossBuild` (a macOS builder's key: an object of `Rid` and `Words`, with `Outputs`; [The Unix box](#the-unix-box)). An `outputs` payload also holds `Name`.
+A `run` payload also holds `Command` (or, for a warm-up, `WarmCommands` and `WarmHash` in its place), `Subfolder`, `Identity`, the optional `Env`, `Outputs`, the optional `FailureOutputs` (a list of globs read like `Outputs`; an older box ignores it), `Nonce`, `OutputsFull`, `Timeout`, `Host` and the optional `InputsDigest`, `SentDigest`, `LfsDigest`, `GodotVersion`, `EngineEnv` and `CrossBuild` (a macOS builder's key: an object of `Rid` and `Words`, with `Outputs`; [The Unix box](#the-unix-box)). An `outputs` payload also holds `Name`.
 
 `inflight` reads only `Root`.
 
@@ -3288,7 +3294,7 @@ The box's ceiling has three seams: `--test-box-sample-ms <n>` replaces the 5 s s
 
 `--test-box-root-walk-stop <folder>`, which the keyed `gate box prune` also honours, ends the preflight's walk over the folders above the work root at that folder, which and those above it go unjudged (any path; an empty value is no value), so a case does not depend on the host's folders.
 
-The other five box seams are `--test-outputs-budget-bytes <n>`, which replaces the 50 GiB outputs budget of the box's trim, in bytes, `--test-inputs-budget-bytes <n>`, which replaces the 4 GiB a `gate box inputs` put unpacks, decompressed, in bytes, `--test-dotnet-limit-ms <n>`, which replaces the 30 s bound of the preflight's `dotnet --list-sdks` read, in milliseconds, `--test-probe-limit-ms <n>`, which replaces the 10 s shared bound of the preflight's tool probes, in milliseconds, and `--test-probe-drain-ms <n>`, which replaces the 2 s the output readers of each probe and of the preflight's `dotnet --list-sdks` get to finish after the program exits, in milliseconds.
+The other six box seams are `--test-outputs-budget-bytes <n>`, which replaces the 50 GiB outputs budget of the box's trim, in bytes, `--test-box-failure-cap-bytes <n>`, which sets the per-file cap on a failed run's failure outputs to `n` bytes and the total to `4n` (the Windows box's alone; the Unix box always uses 256 MiB and 1 GiB), `--test-inputs-budget-bytes <n>`, which replaces the 4 GiB a `gate box inputs` put unpacks, decompressed, in bytes, `--test-dotnet-limit-ms <n>`, which replaces the 30 s bound of the preflight's `dotnet --list-sdks` read, in milliseconds, `--test-probe-limit-ms <n>`, which replaces the 10 s shared bound of the preflight's tool probes, in milliseconds, and `--test-probe-drain-ms <n>`, which replaces the 2 s the output readers of each probe and of the preflight's `dotnet --list-sdks` get to finish after the program exits, in milliseconds.
 
 Three seams of the MSYS keeper and the command's `PATH` are environment variables, read only in a `test-seams` build (the installed binary ignores them), because a stand-in is a program plus words or a folder the box reads in several places.
 
@@ -3509,7 +3515,7 @@ Built verbs:
 
   `EngineEnv` and `Env` share the one cap, counted over both raw objects. A null `EngineEnv` is not set. A malformed `EngineEnv` is refused when the request is read, before the engine folder is probed; a warm-up may carry it though it may not carry `Env`.
 
-  A warm-up payload's: `gate: box payload sets both Command and WarmCommands`, `gate: box payload lacks WarmHash`, `gate: box payload asks a warm-up for outputs` (an `Outputs` glob or `OutputsFull` true), `gate: box payload asks a warm-up for Env` (an `Env` that is not null, even `{}`), `gate: box payload WarmCommands is not a list of 1 to 8 commands, each a non-empty list of non-empty texts` and `gate: box payload WarmHash is not 64 lower-case hex digits: <value>`.
+  A warm-up payload's: `gate: box payload sets both Command and WarmCommands`, `gate: box payload lacks WarmHash`, `gate: box payload asks a warm-up for outputs` (an `Outputs` or `FailureOutputs` glob or `OutputsFull` true), `gate: box payload asks a warm-up for Env` (an `Env` that is not null, even `{}`), `gate: box payload WarmCommands is not a list of 1 to 8 commands, each a non-empty list of non-empty texts` and `gate: box payload WarmHash is not 64 lower-case hex digits: <value>`.
 
   A `WarmHash` beside a `Command` is ignored, and a null `WarmCommands` is not set.
 
@@ -3907,7 +3913,7 @@ Built verbs:
 
   A failed wait ends the job and drains its output first, so no line of the command follows. A refusal (`busy`, `layout`, `tools`) says no such line, and a run of one repo never does. The PC applies nothing of a `failed` pair.
 
-  A payload with `Outputs` globs adds these steps (GATE-44):
+  A payload with `Outputs` or `FailureOutputs` globs adds these steps (GATE-44):
 
   - Once the heartbeat beats and before the checkout, `run` reads the PC's manifest from stdin, the line after the request, up to its newline (at most 64 MiB; a manifest that cannot be read is said only once the command has passed), then removes the old archives from `OutputFolder`: each file named `<key>-<32 lower-case hex digits>.tar.zst`, whatever the key, last written more than a day ago, and no other file.
 
@@ -3921,7 +3927,12 @@ Built verbs:
   - The run's own archive is opened sharing reads only, so another run's trim cannot remove it mid-write; such a removal fails, is said as above (`gate: remote could not remove the old outputs archive <path>: <error>`) and that trim goes on to the next oldest. An entry whose metadata cannot be read is said (`gate: remote could not read the outputs archive <path>: <error>`, control characters escaped), left out of the total, and the trim goes on.
   - A run whose own archive alone is larger than the budget removes only its own archive, leaves the others, and says `gate: remote outputs not brought back: the archive is <X.X> GiB, more than the box keeps (50 GiB)`. A run whose own archive is gone before its trim says `gate: remote outputs not brought back: the archive was removed before it could be sent`. Either turns a passed 0 into 1.
   - A pack that fails removes its half-written archive, says `gate: remote outputs not brought back: <reason>` and turns the passed 0 into 1 (a failed run ends on the command's own status, whatever the pack does). A killed command or a failed sync-back packs nothing.
-  - A failed command packs only the files matched by the output globs that name a `TestResults` folder (`Globs::test_results_only` in `gate-inputs`: a folder segment, not the last, equal to `TestResults` in any letter case), and says its usual `gate-remote-outputs-size:` and `gate-remote-outputs:` lines, or `gate-remote-outputs: 0` when nothing matched. With no such glob a failed run packs nothing and says no outputs line.
+  - A failed command (exit other than 0; a killed one packs nothing) packs only the files matched by the failed run's set: the output globs that name a `TestResults` folder (`Globs::test_results_only` in `gate-inputs`: a folder segment, not the last, equal to `TestResults` in any letter case) followed by the `FailureOutputs` globs (`failure::failed_run_globs`). It says its usual `gate-remote-outputs-size:` and `gate-remote-outputs:` lines, or `gate-remote-outputs: 0` when nothing matched. With neither kind of glob a failed run packs nothing and says no outputs line.
+
+    A passing command never packs a file only a failure output glob matches.
+  - A file only a `FailureOutputs` glob matches is held to caps in walk order (`gate_inputs::failure`): one over 256 MiB, or one that would take the failure files past 1 GiB in all (it and every later one are left; a file over the per-file cap does not count toward the total), stays on the builder. A file the `TestResults` globs match is never capped.
+
+    Each file left is said, before the size line, as `gate: remote failure output left on the builder: <path> (<n> MiB, past the <cap> cap)`, `<n>` rounded up and `<cap>` `256 MiB` or `1 GiB in all`. The Windows box's seam `--test-box-failure-cap-bytes <n>` sets the per-file cap to `n` bytes and the total to `4n`; the Unix box always uses the built-in caps.
 - **`stop`** sets the job's stop event, then terminates the payload's job, taking no lock. It terminates the job again on every 100 ms poll of the job's process ids, until the job is empty or 10 s pass, so a process that joins late is ended; its processes end with 124.
 
   A terminate after the first that fails is not a failure of the stop: it is said once, `gate: remote could not terminate job <name> again: <error>`, after the other lines. An event that cannot be set prints `gate: remote could not signal the stop of job <name>: <error>` on stderr, and the job is terminated all the same. A stopped job prints `gate: remote stopped job <name>` on stdout and exits 0; no such job exits 0 with no output.
@@ -4170,7 +4181,7 @@ Built verbs:
   The PC holds a content when a file of the manifest sent with the run has its SHA-256 and is outside the paths of the run's back commit; the box never uses a back-commit path as a copy source. A copy carries the box file's own last write as `modified`, not its source's, and the install stamps it as it does a member (the snapshot time, not `modified`).
 
   Before the pack the box hashes only the chosen files whose size matches another chosen file's or a manifest-held file's, since only those can be copies. Copy or member is decided at the file's turn: a file hashed before the pack becomes a copy only when its size and last write still match the walk and its hash matches an earlier member's, or a manifest hash outside the back commit; otherwise it is packed as a member, with the hash from that read.
-- Payload: `Nonce` is 32 lower-case hex digits, `OutputFolder` is `<root>\outputs` for the work folder `<root>\work\<key>`, `Outputs` a list of non-empty globs holding no `[` or `]`, `OutputsFull` true or false, and `Name` an archive name of the payload's own key and nonce, so that the outputs verb reaches no file in `OutputFolder` but an archive of this work folder. A refusal is a `gate: box payload ...` line.
+- Payload: `Nonce` is 32 lower-case hex digits, `OutputFolder` is `<root>\outputs` for the work folder `<root>\work\<key>`, `Outputs` and `FailureOutputs` lists of non-empty globs holding no `[` or `]` (`gate: box payload FailureOutputs is not a list of texts`, `... holds an empty glob`, `... glob '<glob>' holds '[' or ']'`), `OutputsFull` true or false, and `Name` an archive name of the payload's own key and nonce, so that the outputs verb reaches no file in `OutputFolder` but an archive of this work folder. A refusal is a `gate: box payload ...` line.
 
 The reader (`read_members`, with the member checks, the limits, the long names and the list) is `gate_inputs::archive`'s, shared by both boxes; each box writes what it reads through the `Place` trait (`member`, and `copy` from an earlier member or a PC file).
 
@@ -4299,15 +4310,15 @@ A macOS builder runs `gate-box` (crate `gate-box-unix`), not `gate.exe`. It spea
 
 - **Verbs.** `preflight`, `boot`, `run`, `stop`, `prune`, `inputs`, `outputs` and `drain` are built. `run` readies the tree, runs the command under the watch and syncs the tree back (below), in the Windows box's order, the dotnet tool restore and the pnpm, bun and npm package restore (below) included.
 
-  The run takes `Outputs` and `OutputsFull` and brings outputs back as the Windows box's run does ([The box side](#the-box-side)), through the `outputs` module below. Where it differs: a run with globs reads one more stdin line after the request, the PC's manifest (at most 64 MiB), after the heartbeat starts and before the layout and checkout, and a run without globs reads nothing past the request line.
+  The run takes `Outputs`, `FailureOutputs` and `OutputsFull` and brings outputs back as the Windows box's run does ([The box side](#the-box-side)), through the `outputs` module below. Where it differs: a run with globs reads one more stdin line after the request, the PC's manifest (at most 64 MiB), after the heartbeat starts and before the layout and checkout, and a run without globs reads nothing past the request line.
 
   The lines come in this order: the prune's `gate: remote could not remove the old outputs archive <path>: <err>` or `gate: remote could not list the old outputs archives in <folder>: <err>` before the layout; `gate: remote could not list the outputs before the command: <err>` after the tool restore.
 
-  After a command that exited 0 and pushed its back commits, or one that ran to its end and failed with its back commits pushed and an output glob naming a `TestResults` folder (on a pair run after `gate: remote back commits: ...`), `gate: remote outputs: skipped <n> file(s) with names this PC cannot take: <first>[, …]` when any, then, for an archive, `gate-remote-outputs-size: <bytes>` (the pack's own count of compressed bytes) and `gate-remote-outputs: <n> <key>-<nonce>.tar.zst`, else `gate-remote-outputs: 0`.
+  After a command that exited 0 and pushed its back commits, or one that ran to its end and failed with its back commits pushed and an output glob naming a `TestResults` folder or a `FailureOutputs` glob (on a pair run after `gate: remote back commits: ...`), `gate: remote outputs: skipped <n> file(s) with names this PC cannot take: <first>[, …]` when any, then, for an archive, `gate-remote-outputs-size: <bytes>` (the pack's own count of compressed bytes) and `gate-remote-outputs: <n> <key>-<nonce>.tar.zst`, else `gate-remote-outputs: 0`.
 
   A PC found gone before the pack or before the trim ends the run 255 with nothing more said and nothing packed or trimmed after it; an archive already packed stays in the output folder until the 24-hour prune. The `diff-tree` step's output is read whole, never cut at the 1 MiB cap the other git steps keep.
 
-  After those come the trim's lines; and last, on failure, `gate: remote outputs not brought back: <reason>`, which turns a passed run's 0 into 1. A failed command packs only the reports under its `TestResults` globs, never runs the cross build and skips the Mach-O/ELF refusal; a killed command or a failed sync-back packs nothing; a client gone keeps the command's status.
+  After those come the trim's lines; and last, on failure, `gate: remote outputs not brought back: <reason>`, which turns a passed run's 0 into 1. A failed command packs only the reports under its `TestResults` globs and the files under its `FailureOutputs` globs (held to the built-in caps, each file left said as the Windows box says it), never runs the cross build and skips the Mach-O/ELF refusal; a killed command or a failed sync-back packs nothing; a client gone keeps the command's status.
 
   The not-brought-back reasons the Unix box adds are the bad manifest's own text, `diff-tree printed a path that is not UTF-8`, the lines of a failed `diff-tree` step in the Unix sync-back style, and the over-budget and gone-before-sent reasons. The `diff-tree` step (named `diff-tree <leaf>` on a pair run) runs through the run's killable git steps and is recorded in `<work>.pgid`, only when a back commit was pushed for a run with outputs.
 

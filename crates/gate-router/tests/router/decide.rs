@@ -92,6 +92,7 @@ fn the_control_command_routes_from_the_root() {
             fallback: command.clone(),
             program_named: false,
             outputs: words(&["**/bin/**", "**/.godot/mono/temp/bin/**"]),
+            failure_outputs: Vec::new(),
             inputs: Vec::new(),
             dropped_no_build: false,
             send: None,
@@ -1109,6 +1110,43 @@ fn a_repo_with_its_own_outputs_gets_them() {
     let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["*"]}, "outputs": {"Yaat": ["target/**"]}}"#).expect("usable");
     let command = words(&["cargo", "build"]);
     assert_eq!(routed(decide(&heavy(&command), &FakeFacts::with_config(config))).outputs, ["target/**"]);
+}
+
+#[test]
+fn a_repo_s_failure_outputs_reach_the_run_beside_its_outputs_and_a_no_build_command_keeps_them() {
+    let config = Config::parse(
+        r#"{"host": "builder-1", "repos": {"yaat": ["*"], "other": ["*"]},
+            "outputs": {"yaat": ["target/**"]}, "failureOutputs": {"Yaat": ["dumps/*.dmp"]}}"#,
+    )
+    .expect("usable");
+    let facts = FakeFacts::with_config(config);
+    let run = routed(decide(&heavy(&words(&["cargo", "build"])), &facts));
+    assert_eq!(run.outputs, ["target/**"]);
+    assert_eq!(run.failure_outputs, ["dumps/*.dmp"]);
+    let run = routed(decide(&heavy(&words(&["dotnet", "test", "--no-build"])), &facts));
+    assert!(run.outputs_withheld);
+    assert_eq!(run.failure_outputs, ["dumps/*.dmp"], "the drop withholds outputs, not failure outputs");
+
+    let config = Config::parse(r#"{"host": "builder-1", "repos": {"yaat": ["*"]}, "failureOutputs": {"other": ["x"]}}"#).expect("usable");
+    let run = routed(decide(&heavy(&words(&["cargo", "build"])), &FakeFacts::with_config(config)));
+    assert_eq!(run.failure_outputs, Vec::<String>::new());
+}
+
+#[test]
+fn a_builder_entry_s_own_failure_outputs_reach_a_run_on_it_and_not_the_top_level_list() {
+    let mac = r#"[{"host": "mac-1", "os": "macos", "root": "/m", "repos": {"yaat": ["dotnet build*"]},
+                   "failureOutputs": {"yaat": ["crash/*.dmp"]}}]"#;
+    let config = Config::parse(&format!(
+        r#"{{"host": "builder-1", "repos": {{"yaat": ["*"]}}, "failureOutputs": {{"yaat": ["top/*.dmp"]}}, "builders": {mac}}}"#
+    ))
+    .expect("usable");
+    let facts = FakeFacts::with_config(config);
+    let run = routed(decide(&heavy(&words(&["dotnet", "build"])), &facts));
+    assert_eq!(run.builder.alias, "mac-1");
+    assert_eq!(run.failure_outputs, ["crash/*.dmp"]);
+    let run = routed(decide(&heavy(&words(&["cargo", "build"])), &facts));
+    assert_eq!(run.builder.alias, "builder-1");
+    assert_eq!(run.failure_outputs, ["top/*.dmp"]);
 }
 
 #[test]

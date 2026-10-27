@@ -274,16 +274,28 @@ impl Payload {
     /// The run's output globs, `Outputs`: a list of non-empty texts holding no `[` or `]`, as the routing file allows
     /// them; none when the key is absent or null. Else the usage line, a glob shown with its control characters escaped.
     pub fn output_globs(&self) -> Result<Vec<String>, String> {
-        let not_globs = || "gate: box payload Outputs is not a list of texts".to_owned();
-        let list = match self.object.get("Outputs") {
+        self.globs_at("Outputs")
+    }
+
+    /// The run's failure output globs, `FailureOutputs`, which a failed run brings back beside its test reports: read as
+    /// [`Payload::output_globs`] reads `Outputs`; none when the key is absent or null. Else the usage line.
+    pub fn failure_output_globs(&self) -> Result<Vec<String>, String> {
+        self.globs_at("FailureOutputs")
+    }
+
+    /// The globs at `key`: a list of non-empty texts holding no `[` or `]`; none when the key is absent or null. Else
+    /// the usage line naming `key`, a glob shown with its control characters escaped.
+    fn globs_at(&self, key: &str) -> Result<Vec<String>, String> {
+        let not_globs = || format!("gate: box payload {key} is not a list of texts");
+        let list = match self.object.get(key) {
             None | Some(Value::Null) => return Ok(Vec::new()),
             Some(value) => value.as_array().ok_or_else(not_globs)?,
         };
         list.iter()
             .map(|glob| match glob.as_str() {
                 None => Err(not_globs()),
-                Some("") => Err("gate: box payload Outputs holds an empty glob".to_owned()),
-                Some(glob) if glob.contains(['[', ']']) => Err(format!("gate: box payload Outputs glob '{}' holds '[' or ']'", escaped(glob))),
+                Some("") => Err(format!("gate: box payload {key} holds an empty glob")),
+                Some(glob) if glob.contains(['[', ']']) => Err(format!("gate: box payload {key} glob '{}' holds '[' or ']'", escaped(glob))),
                 Some(glob) => Ok(glob.to_owned()),
             })
             .collect()
@@ -547,8 +559,8 @@ impl Payload {
     }
 
     /// What the run runs ([`Commands`]): the one `Command` of a payload that sets no `WarmCommands`, else the warm-up's
-    /// `WarmCommands` and its `WarmHash`, in a payload that sets no `Command`, asks for no outputs (no `Outputs` glob,
-    /// `OutputsFull` not true) and gives a `Timeout`. Else the usage line.
+    /// `WarmCommands` and its `WarmHash`, in a payload that sets no `Command`, asks for no outputs (no `Outputs` or
+    /// `FailureOutputs` glob, `OutputsFull` not true) and gives a `Timeout`. Else the usage line.
     pub fn commands(&self) -> Result<Commands<'_>, String> {
         if !self.sets("WarmCommands") {
             return Ok(Commands {
@@ -561,7 +573,7 @@ impl Payload {
         }
         let words = self.warm_commands()?;
         let warm_hash = self.warm_hash()?;
-        if !self.output_globs()?.is_empty() || self.outputs_full()? {
+        if !self.output_globs()?.is_empty() || !self.failure_output_globs()?.is_empty() || self.outputs_full()? {
             return Err("gate: box payload asks a warm-up for outputs".to_owned());
         }
         if self.sets("Env") {
@@ -2086,6 +2098,7 @@ mod tests {
         for json in [
             json!({"WarmCommands": [["x"]], "WarmHash": WARM_HASH, "Outputs": ["bin/**"]}),
             json!({"WarmCommands": [["x"]], "WarmHash": WARM_HASH, "OutputsFull": true}),
+            json!({"WarmCommands": [["x"]], "WarmHash": WARM_HASH, "FailureOutputs": ["dumps/*.dmp"]}),
         ] {
             assert_eq!(commands(&json), Err("gate: box payload asks a warm-up for outputs".to_owned()), "{json}");
         }
@@ -2230,6 +2243,35 @@ mod tests {
             output_globs(&json!({ "Outputs": ["\u{1b}]"] })),
             Err(r"gate: box payload Outputs glob '\u{1b}]' holds '[' or ']'".to_owned()),
             "a glob shown with its control characters escaped"
+        );
+    }
+
+    #[test]
+    fn failure_output_globs_are_a_list_of_texts_none_when_absent() {
+        let failure = |json: serde_json::Value| decoded(&json.to_string()).and_then(|payload| payload.failure_output_globs());
+        assert_eq!(failure(json!({})), Ok(vec![]), "absent");
+        assert_eq!(failure(json!({ "FailureOutputs": null })), Ok(vec![]), "null");
+        assert_eq!(
+            failure(json!({ "FailureOutputs": ["dumps/*.dmp"], "Outputs": ["bin/**"] })),
+            Ok(vec!["dumps/*.dmp".to_owned()]),
+            "its own key, not Outputs"
+        );
+        assert_eq!(
+            failure(json!({ "FailureOutputs": "dumps/*.dmp" })),
+            Err("gate: box payload FailureOutputs is not a list of texts".to_owned())
+        );
+        assert_eq!(
+            failure(json!({ "FailureOutputs": [""] })),
+            Err("gate: box payload FailureOutputs holds an empty glob".to_owned())
+        );
+        assert_eq!(
+            failure(json!({ "FailureOutputs": ["d/[x].dmp"] })),
+            Err("gate: box payload FailureOutputs glob 'd/[x].dmp' holds '[' or ']'".to_owned())
+        );
+        assert_eq!(
+            output_globs(&json!({ "FailureOutputs": ["d/*.dmp"] })),
+            Ok(vec![]),
+            "Outputs is not read from it"
         );
     }
 

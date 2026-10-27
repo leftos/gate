@@ -610,6 +610,9 @@ pub struct RemoteRun {
     pub program_named: bool,
     /// The output globs the run brings back; none for a dotnet `--no-build` command.
     pub outputs: Vec<String>,
+    /// The failure output globs a failed run brings back beside its test reports: the routing file's `failureOutputs`
+    /// for the repo on the builder, none when it names none; kept for a dotnet `--no-build` command.
+    pub failure_outputs: Vec<String>,
     /// The input globs the run sends: the repo's `inputs` list, none when it has no entry, then the exact path of each
     /// gitignored file the command names, after [`CARRIED_INPUT`]; kept for a dotnet `--no-build` command, whose
     /// outputs alone are withheld.
@@ -2494,6 +2497,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
     if outputs_withheld {
         outputs.clear();
     }
+    let failure_outputs = config.failure_outputs_on(&target.builder, &target.repo);
     let mut words = without_no_build(sent);
     let dropped_no_build = words.len() != sent_count;
     mark_bare_first_word(&mut words, facts, program_named);
@@ -2513,6 +2517,7 @@ fn remote_run(config: &Config, matched: Matched, subfolder: String, given: &[Str
         fallback,
         program_named,
         outputs,
+        failure_outputs,
         inputs: target.inputs,
         dropped_no_build,
         send,

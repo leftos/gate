@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use gate_inputs::failure;
 use gate_router::escaped;
 use gate_state::v1;
 use gate_wire::{PathForm, archive_file_name, trees};
@@ -228,17 +229,24 @@ pub(super) enum Brought {
 pub(super) struct Sent<'a> {
     /// The output globs the run call carries: the run's, or none when it has none or its manifest was not built.
     pub(super) globs: &'a [String],
+    /// The failure output globs the run call carries: the run's, or none when it has none, its manifest was not built,
+    /// or they were dropped because the manifest over both lists could not be built ([`manifest_over`]).
+    pub(super) failure_globs: &'a [String],
     /// Whether the run asks for every output that differs from the PC's: the pending marker was there.
     pub(super) full: bool,
     /// The manifest line, fed on the run call's standard input.
     pub(super) manifest: Option<Arc<str>>,
-    /// The pending marker, written after the push by [`marked`]; `None` for a run with no output globs.
+    /// The pending marker, written after the push by [`marked`]; `None` for a run with no output globs and no failure
+    /// output globs, for one with only failure output globs whose manifest could not be built, which carries nothing,
+    /// and for a run whose outputs the route withheld, whose marker is [`Sent::withheld`] alone.
     marker: Option<PathBuf>,
     /// The pending marker a run whose outputs the route withheld writes after the push ([`marked`]) and never clears:
     /// the builder builds and nothing comes back, so the next run asks for every output that differs from the PC's.
+    /// Taken out when its send of the PC's build lands ([`Sent::take_withheld`]), so such a run writes no marker.
     withheld: Option<PathBuf>,
-    /// The manifest the line holds, its files' stamps, which the install checks the PC's files against; empty for a
-    /// run with no output globs. Else why it could not be built, which a passing run says as it fails.
+    /// The manifest the line holds, its files' stamps, which the install checks the PC's files against: over the output
+    /// and failure output globs, or the output globs alone when the failure output globs were dropped ([`sent`]); empty
+    /// for a run that carries nothing. Else why it could not be built, which a passing run says as it fails.
     built: Result<Manifest, String>,
 }
 
@@ -247,12 +255,18 @@ impl Sent<'_> {
     pub(super) fn nothing() -> Self {
         Sent {
             globs: &[],
+            failure_globs: &[],
             full: false,
             manifest: None,
             marker: None,
             withheld: None,
             built: Ok(Manifest::default()),
         }
+    }
+
+    /// Whether the run has an outputs step ([`ended`]): a manifest build was made for it, built or not.
+    fn stepped(&self) -> bool {
+        self.manifest.is_some() || self.built.is_err()
     }
 
     /// Takes out the withheld-outputs marker [`marked`] would write, for a run whose send of the PC's build landed: it
@@ -268,20 +282,26 @@ impl Sent<'_> {
     }
 }
 
-/// What `attempt`'s run call carries of its outputs. A run with no output globs carries none, and reads no pending
-/// marker; one whose outputs the route withheld records the marker's path for [`marked`] to write. One with globs reads
-/// whether the marker is there, builds the manifest, polling the console interrupt as it hashes and taking each hash
-/// the worktree's hash cache holds at the file's stamp, unless the marker is there, saves the cache that build leaves,
-/// whatever the run's end, unless it equals the one it read, and records the marker's path for [`marked`] to write
-/// once the snapshot is pushed; a manifest that cannot be built is kept for the outputs step, saves no cache, and the
-/// run call then carries no globs. Else the interrupt that ended the build.
+/// What `attempt`'s run call carries of its outputs. A run whose outputs the route withheld records the marker's path
+/// as [`Sent::withheld`] alone, for [`marked`] to write unless its send of the PC's build lands, and no end to clear,
+/// whatever globs it has. A run with no output globs and no failure output globs carries none, and reads no pending
+/// marker. One with either reads whether the marker is there, builds the manifest over both lists ([`manifest_over`]),
+/// polling the console interrupt as it hashes and taking each hash the worktree's hash cache holds at the file's stamp,
+/// unless the marker is there, saves the cache that build leaves, whatever the run's end, unless it equals the one it
+/// read, and, unless the route withheld its outputs, records the marker's path for [`marked`] to write once the
+/// snapshot is pushed. A run with only failure output globs does so too: a failed command brings back the
+/// files under them, and a passing one nothing. When the build over both lists fails and one over the output globs
+/// alone does not, the failure output globs are dropped from the run call, said in a line, and that manifest is sent; a
+/// run with no output globs then carries nothing, as one with no globs at all. When the output globs alone fail too,
+/// the run ends as one whose manifest could not be built, and says no such line. A manifest that cannot be built is kept for the
+/// outputs step, saves no cache, and the run call then carries no globs. Else the interrupt that ended the build.
 pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
     let call: &RemoteCall<'a> = attempt.call;
     let mut sent = Sent::nothing();
-    if call.outputs.is_empty() {
-        if call.outputs_withheld {
-            sent.withheld = Some(v1::outputs_pending_path(call.state_dir, call.key));
-        }
+    if call.outputs_withheld {
+        sent.withheld = Some(v1::outputs_pending_path(call.state_dir, call.key));
+    }
+    if call.outputs.is_empty() && call.failure_outputs.is_empty() {
         return Ok(sent);
     }
     let marker = v1::outputs_pending_path(call.state_dir, call.key);
@@ -291,27 +311,40 @@ pub(super) fn sent<'a>(attempt: &mut Attempt<'_, 'a>) -> Result<Sent<'a>, End> {
     let previous = if full { None } else { HashCache::load(&hashes) };
     let none = HashCache::default();
     let cache = previous.as_ref().unwrap_or(&none);
-    match manifest_line(Path::new(call.root), call.outputs, MANIFEST_LIMIT, cache, || attempt.go_on().is_ok()) {
-        Ok((line, files, next)) => {
-            if previous.as_ref() != Some(&next) {
+    let lists = (call.outputs, call.failure_outputs);
+    let manifested = manifest_over(Path::new(call.root), lists, MANIFEST_LIMIT, cache, || attempt.go_on().is_ok());
+    if let Some(why) = &manifested.dropped {
+        attempt.say(format!("gate: failure outputs not asked for this run: {why}"));
+    }
+    let failure_globs: &'a [String] = if manifested.dropped.is_some() { &[] } else { call.failure_outputs };
+    // A withheld run's marker lives in `sent.withheld` alone, so a landed send of the PC's build leaves none to write.
+    let marker = (!call.outputs_withheld).then_some(marker);
+    match manifested.built {
+        None => return Ok(sent),
+        Some(Ok((line, files, next))) => {
+            // A withheld run's manifest covers its failure output globs alone: saved, it would replace every output's hash.
+            if !call.outputs_withheld && previous.as_ref() != Some(&next) {
                 next.save(&hashes);
             }
             sent.globs = call.outputs;
+            sent.failure_globs = failure_globs;
             sent.full = full;
             sent.manifest = Some(Arc::from(line));
             sent.built = Ok(files);
         }
-        Err(Unbuilt::Interrupted) => return Err(End::Interrupted),
-        Err(Unbuilt::Failed(reason)) => sent.built = Err(reason),
+        Some(Err(Unbuilt::Interrupted)) => return Err(End::Interrupted),
+        Some(Err(Unbuilt::Failed(reason))) => sent.built = Err(reason),
     }
-    sent.marker = Some(marker);
+    sent.marker = marker;
     Ok(sent)
 }
 
 /// Writes the pending marker `sent` records, once the snapshot is pushed and before the run call, so a run the client
 /// sends after the push leaves it on every end but a passing run whose box packed nothing, and a run refused before
-/// the push, at the preflight or by the parity check, leaves none. A run with no output globs records none, unless the
-/// route withheld its outputs, whose marker no end clears. Else why it could not be written.
+/// the push, at the preflight or by the parity check, leaves none. A run with no output globs and no failure output
+/// globs records none, nor does one with only failure output globs whose manifest could not be built, unless the route
+/// withheld its outputs, whose marker no end clears and which a landed send of the PC's build takes out. A run with
+/// only failure output globs records it as one with output globs does. Else why it could not be written.
 pub(super) fn marked(sent: &Sent<'_>) -> Result<(), End> {
     match sent.marker.as_ref().or(sent.withheld.as_ref()) {
         Some(marker) => mark_pending(marker).map_err(End::Failed),
@@ -320,19 +353,23 @@ pub(super) fn marked(sent: &Sent<'_>) -> Result<(), End> {
 }
 
 /// The end of `attempt`'s run once its sync-back ended it `synced`, its run call having ended as `ran` says, and the
-/// box having said it `brought` its outputs or not, for a run that carried `sent`: the outputs step of a run with
-/// output globs. A run whose passing status the sync-back turned to 1 says its outputs were not brought back, for the
-/// sync-back's reason ([`turned_reason`]). A passing run whose manifest was not built, or whose box said no outputs line the client
-/// accepts, says why and ends 1. A passing run whose box packed an archive fetches it, as [`fetched`] says. A passing
-/// run whose box packed nothing removes the pending marker and the outputs cap record ([`uncapped`]); one that cannot be
-/// removed is said, and the run's status stands. The other ends that do not reach [`fetched`] leave both. A run whose
-/// command failed brings back its test reports when its box packed them, as [`reports_end`] says, keeping its status,
-/// and otherwise says nothing and leaves both.
+/// box having said it `brought` its outputs or not, for a run that carried `sent`: the outputs step of a run with output
+/// globs or failure output globs; a run with neither, or with only failure output globs whose manifest was not built,
+/// has none. A run whose passing status the sync-back turned to 1 says its outputs were not brought back, for the
+/// sync-back's reason ([`turned_reason`]). A passing run whose manifest was not built, or whose box said no outputs
+/// line the client accepts, says why and ends 1. A passing run whose box packed an archive fetches it, as [`fetched`]
+/// says. A passing run whose box packed nothing removes the pending marker and the outputs cap record ([`uncapped`]),
+/// unless the route withheld its outputs, when it touches neither; one that cannot be removed is said, and the run's
+/// status stands. A withheld run whose send of the PC's build landed has no marker, but still its outputs step. The other
+/// ends that do not reach [`fetched`] leave both. A run whose command failed brings back its test reports and the files
+/// under its failure output globs when its box packed them, as [`reports_end`] says, keeping its status, and otherwise
+/// says nothing and leaves both. A run with only failure output globs takes the same steps: its passing command's box
+/// packs nothing.
 ///
 /// The attempt's outputs are marked brought back only when a passing run's install ends complete, as
-/// [`install::installed`] says, or when its box packed nothing for a manifest that held files; never when the box said
-/// it skipped outputs for names this PC cannot take, nor for a failed run, whatever its reports' install did. Every
-/// other end marks them not brought back.
+/// [`install::installed`] says, or when its box packed nothing for a manifest that held files under its output globs
+/// ([`holds_outputs`]); never when the box said it skipped outputs for names this PC cannot take, nor for a failed run,
+/// whatever its reports' install did. Every other end marks them not brought back.
 pub(super) fn ended(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synced: Synced, brought: Option<&Brought>) -> End {
     let (end, complete) = step_end(attempt, sent, ran, synced, brought);
     attempt.brought_back = Some(complete && !ran.names_skipped);
@@ -354,9 +391,14 @@ const WORKTREE_CHANGED: &str = "the worktree changed during the run";
 fn step_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synced: Synced, brought: Option<&Brought>) -> (End, bool) {
     let reason = turned_reason(ran.status, &synced);
     let synced = synced.end;
-    let (Some(marker), End::Status(now)) = (&sent.marker, &synced) else {
+    let End::Status(now) = &synced else {
         return (synced, false);
     };
+    if !sent.stepped() {
+        return (synced, false);
+    }
+    // The marker is only ever cleared here, and a withheld run's never is: `sent.withheld` stays out of it.
+    let marker = sent.marker.as_deref();
     if let Some(reason) = reason {
         attempt.say(not_brought_back(Bringing::Outputs, reason));
         return (synced, false);
@@ -379,30 +421,58 @@ fn step_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, synce
             return fetched(attempt, &kept, ran, synced);
         }
         (Ok(files), Some(Brought::Nothing)) => {
-            if let Err(why) = clear_pending(marker) {
-                attempt.say(format!("gate: {why}"));
+            if !attempt.call.outputs_withheld {
+                if let Some(marker) = marker
+                    && let Err(why) = clear_pending(marker)
+                {
+                    attempt.say(format!("gate: {why}"));
+                }
+                uncapped(attempt);
             }
-            uncapped(attempt);
-            return (synced, *files != Manifest::default());
+            return (synced, holds_outputs(files, sent.globs));
         }
     };
     attempt.say(not_brought_back(Bringing::Outputs, &reason));
     (End::Status(1), false)
 }
 
+/// Whether the manifest `files` holds a file under the output globs `globs`: what a passing run whose box packed
+/// nothing finds the PC already holding, the files only its failure output globs list left out.
+fn holds_outputs(files: &Manifest, globs: &[String]) -> bool {
+    Globs::new(globs).is_ok_and(|globs| files.files().any(|(path, _)| globs.matches(path)))
+}
+
 /// The end of the outputs step of a run whose command failed with the status `now`, the pending marker `marker`, whose
 /// box said it `brought` its outputs or not: when the box packed an archive, the PC's manifest was built and one of the
-/// run's output globs names a `TestResults` folder, the failed run's test reports are fetched and installed as
-/// [`fetched`] says for [`Bringing::Reports`]. Every end of that but a Ctrl+C or the watchdog's stop keeps `now`: a
-/// failure of the pull or the install is said and never takes the command's status. Any other failed run says nothing
+/// run's output globs names a `TestResults` folder or the run has failure output globs, the failed run's narrowed set
+/// ([`failure::failed_run_set`]) is fetched and installed as [`fetched`] says for [`Bringing::Reports`], its lines
+/// naming the failed run's outputs when the set holds a failure output glob. Every end of that but a Ctrl+C or the
+/// watchdog's stop keeps `now`: a failure of the pull or the install is said and never takes the command's status. Any other failed run says nothing
 /// and touches neither the pending marker nor the outputs cap record. A failed run's outputs are never marked brought
 /// back.
-fn reports_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, (marker, now): (&Path, i64), brought: Option<&Brought>) -> (End, bool) {
+fn reports_end(
+    attempt: &mut Attempt<'_, '_>,
+    sent: &Sent<'_>,
+    ran: &Ran<'_>,
+    (marker, now): (Option<&Path>, i64),
+    brought: Option<&Brought>,
+) -> (End, bool) {
     let (Ok(files), Some(Brought::Archive { count, size, .. })) = (&sent.built, brought) else {
         return (End::Status(now), false);
     };
-    let Some(reports) = Globs::new(sent.globs).ok().and_then(|globs| globs.test_results_only()) else {
+    // Output globs that cannot be matched name no `TestResults` folder, as an empty list names none.
+    let outputs = Globs::new(sent.globs).or_else(|_| Globs::new(&[]));
+    let failure_globs = Some(sent.failure_globs)
+        .filter(|globs| !globs.is_empty())
+        .and_then(|globs| Globs::new(globs).ok());
+    let reports = outputs.ok().and_then(|outputs| outputs.test_results_only());
+    let Some(narrowed) = failure::failed_run_set(reports.as_ref(), failure_globs.as_ref()) else {
         return (End::Status(now), false);
+    };
+    let named = if failure_globs.is_some() {
+        Narrowed::Outputs
+    } else {
+        Narrowed::TestReports
     };
     let kept = Kept {
         globs: sent.globs,
@@ -410,7 +480,7 @@ fn reports_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, (m
         marker,
         count: *count,
         size: *size,
-        reports: Some(&reports),
+        reports: Some((&narrowed, named)),
     };
     let end = match fetched(attempt, &kept, ran, End::Status(now)).0 {
         End::Status(_) | End::Failed(_) => End::Status(now),
@@ -424,26 +494,37 @@ fn reports_end(attempt: &mut Attempt<'_, '_>, sent: &Sent<'_>, ran: &Ran<'_>, (m
 pub(super) enum Bringing {
     /// A passing run's outputs, under every output glob of the run.
     Outputs,
-    /// A failed run's test reports: its outputs under the globs that name a `TestResults` folder
-    /// ([`Globs::test_results_only`]). Their pull and install keep the run's status, leave the outputs cap record and
-    /// never clear the pending marker.
-    Reports,
+    /// A failed run's narrowed set: its outputs under the globs that name a `TestResults` folder
+    /// ([`Globs::test_results_only`]) and under its failure output globs, which the lines name as [`Narrowed`] says.
+    /// Their pull and install keep the run's status, leave the outputs cap record and never clear the pending marker.
+    Reports(Narrowed),
+}
+
+/// What a failed run's narrowed set holds, which the lines of its pull and install name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Narrowed {
+    /// The globs that name a `TestResults` folder alone: the failed run's test reports.
+    TestReports,
+    /// A failure output glob among them: the failed run's outputs.
+    Outputs,
 }
 
 impl Bringing {
-    /// What the pull's lines and the install's success line say they bring: `outputs`, or the failed run's test reports.
+    /// What the pull's lines and the install's success line say they bring: `outputs`, or the failed run's
+    /// ([`Bringing::failed`]).
     pub(super) fn pulled(self) -> &'static str {
         match self {
             Bringing::Outputs => "outputs",
-            Bringing::Reports => REPORTS,
+            Bringing::Reports(narrowed) => Bringing::failed(narrowed),
         }
     }
 
-    /// What the lines saying what was not brought back name: `remote outputs`, or the failed run's test reports.
+    /// What the lines saying what was not brought back name: `remote outputs`, or the failed run's
+    /// ([`Bringing::failed`]).
     pub(super) fn unbrought(self) -> &'static str {
         match self {
             Bringing::Outputs => "remote outputs",
-            Bringing::Reports => REPORTS,
+            Bringing::Reports(narrowed) => Bringing::failed(narrowed),
         }
     }
 
@@ -451,7 +532,8 @@ impl Bringing {
     pub(super) fn pulling_from(self) -> &'static str {
         match self {
             Bringing::Outputs => "pulling outputs from",
-            Bringing::Reports => "pulling the failed run's test reports from",
+            Bringing::Reports(Narrowed::TestReports) => "pulling the failed run's test reports from",
+            Bringing::Reports(Narrowed::Outputs) => "pulling the failed run's outputs from",
         }
     }
 
@@ -459,31 +541,38 @@ impl Bringing {
     fn fetching(self) -> &'static str {
         match self {
             Bringing::Outputs => "fetching the outputs",
-            Bringing::Reports => "fetching the failed run's test reports",
+            Bringing::Reports(Narrowed::TestReports) => "fetching the failed run's test reports",
+            Bringing::Reports(Narrowed::Outputs) => "fetching the failed run's outputs",
+        }
+    }
+
+    /// What the lines of a failed run's pull and install call what they bring back: its test reports, or its outputs
+    /// when its narrowed set holds a failure output glob.
+    fn failed(narrowed: Narrowed) -> &'static str {
+        match narrowed {
+            Narrowed::TestReports => "the failed run's test reports",
+            Narrowed::Outputs => "the failed run's outputs",
         }
     }
 }
 
-/// What the lines of a failed run's pull and install call what they bring back.
-const REPORTS: &str = "the failed run's test reports";
-
 /// What the outputs step of a run whose box packed an archive keeps for its pull and install: the run's output globs,
-/// the PC's manifest and the pending marker; the files the box said it packed, and the archive's size in bytes when it
-/// said one; and, for a failed run's test reports, the run's output globs narrowed to those that name a `TestResults`
-/// folder, which the install is held to.
+/// the PC's manifest and the pending marker, `None` for a withheld run whose send of the PC's build landed; the files
+/// the box said it packed, and the archive's size in bytes when it said one; and, for a failed run, its narrowed set
+/// ([`reports_end`]), which the install is held to, and what the set holds.
 struct Kept<'k> {
     globs: &'k [String],
     files: &'k Manifest,
-    marker: &'k Path,
+    marker: Option<&'k Path>,
     count: u64,
     size: Option<u64>,
-    reports: Option<&'k Globs>,
+    reports: Option<(&'k Globs, Narrowed)>,
 }
 
 impl Kept<'_> {
-    /// What the pull brings: a failed run's test reports when it carries their narrowed globs, else outputs.
+    /// What the pull brings: a failed run's narrowed set when it carries one, else outputs.
     fn bringing(&self) -> Bringing {
-        if self.reports.is_some() { Bringing::Reports } else { Bringing::Outputs }
+        self.reports.map_or(Bringing::Outputs, |(_, narrowed)| Bringing::Reports(narrowed))
     }
 }
 
@@ -722,7 +811,7 @@ pub(super) fn judged(
         }
         attempt.noted(called);
         if let Cut::ArchiveTooBig(_) = cut {
-            if bringing == Bringing::Reports {
+            if matches!(bringing, Bringing::Reports(_)) {
                 return unfetched(attempt, fetch, &cut.reason("the archive"), synced);
             }
             return capped(attempt, archive, &cut.reason("the archive"), synced);
@@ -815,6 +904,57 @@ fn unfetched(attempt: &mut Attempt<'_, '_>, (archive, bringing): (&Archive, Brin
 pub(super) fn removed(attempt: &mut Attempt<'_, '_>, archive: &Archive, which: &str) {
     if let Err(why) = archive.remove(which) {
         attempt.say(format!("gate: {why}"));
+    }
+}
+
+/// The manifest a run with output or failure output globs sends, and what its run call carries of them.
+#[derive(Debug, PartialEq, Eq)]
+struct Manifested {
+    /// The manifest line, the manifest it holds and the hash cache its build leaves ([`manifest_line`]); else why it was
+    /// not built. `None` for a run with no output globs whose failure output globs were dropped: it carries nothing.
+    built: Option<Result<(String, Manifest, HashCache), Unbuilt>>,
+    /// Why the run's failure output globs were dropped from its run call: the reason the build over both lists failed.
+    /// `None` when the run carries them, or has none.
+    dropped: Option<String>,
+}
+
+/// The manifest of the files under the output globs `outputs` and the failure output globs `failure` in the worktree
+/// `root`, built as [`manifest_line`] builds one, held to `cap` bytes. A build over both lists that fails for any reason
+/// but an interrupt is built again over `outputs` alone; when that build is made, the failure output globs are dropped
+/// from the run. A run with no output globs then builds nothing and carries nothing. When the build over `outputs`
+/// alone fails too, nothing is dropped: the run ends as one whose manifest could not be built, for the reason that
+/// build gave, since the failure output globs were not the cause; an interrupt of it is the build's end. A failure output glob so never fails a
+/// manifest the output globs alone fit.
+fn manifest_over(root: &Path, (outputs, failure): (&[String], &[String]), cap: usize, cache: &HashCache, go_on: impl Fn() -> bool) -> Manifested {
+    let listed: Vec<String> = outputs.iter().chain(failure).cloned().collect();
+    let reason = match manifest_line(root, &listed, cap, cache, &go_on) {
+        Err(Unbuilt::Failed(reason)) if !failure.is_empty() => reason,
+        built => {
+            return Manifested {
+                built: Some(built),
+                dropped: None,
+            };
+        }
+    };
+    if outputs.is_empty() {
+        return Manifested {
+            built: None,
+            dropped: Some(reason),
+        };
+    }
+    match manifest_line(root, outputs, cap, cache, &go_on) {
+        Ok(built) => Manifested {
+            built: Some(Ok(built)),
+            dropped: Some(reason),
+        },
+        Err(Unbuilt::Interrupted) => Manifested {
+            built: Some(Err(Unbuilt::Interrupted)),
+            dropped: None,
+        },
+        Err(Unbuilt::Failed(alone)) => Manifested {
+            built: Some(Err(Unbuilt::Failed(alone))),
+            dropped: None,
+        },
     }
 }
 
@@ -1116,8 +1256,8 @@ mod tests {
     use gate_router::DEFAULT_OUTPUTS;
 
     use super::{
-        Archive, Brought, MANIFEST_LIMIT, NonZeroU64, PARTIAL, PAST_THE_CAP, Unbuilt, accepted, hashed, keep_outputs_lines, manifest_line, mb_size,
-        pending, sha256_for, stopped_reason, turned_reason, within_cap,
+        Archive, Brought, MANIFEST_LIMIT, Manifest, Manifested, NonZeroU64, PARTIAL, PAST_THE_CAP, Unbuilt, accepted, hashed, holds_outputs,
+        keep_outputs_lines, manifest_line, manifest_over, mb_size, pending, sha256_for, stopped_reason, turned_reason, within_cap,
     };
     use crate::outputs::cache::{HashCache, file_time_now};
     use crate::outputs::glob::Globs;
@@ -1456,6 +1596,109 @@ mod tests {
         assert_eq!(manifest_line(&root, &globs, line.len() - 1, &none, || true), refused, "the whole line");
         assert_eq!(manifest_line(&root, &globs, 10, &none, || true), refused, "the entries, before any hash");
         assert_eq!(manifest_line(&root, &globs, MANIFEST_LIMIT, &none, || false), Err(Unbuilt::Interrupted));
+    }
+
+    /// The output globs and the failure output globs of [`dumped_worktree`].
+    fn dumped_lists() -> ([String; 1], [String; 1]) {
+        (["bin/**".to_owned()], ["dumps/*.dmp".to_owned()])
+    }
+
+    /// A worktree holding `dumps/a.dmp`, which only the failure output globs of [`dumped_lists`] list, and
+    /// `bin/a.dll` too when `with_output`.
+    fn dumped_worktree(name: &str, with_output: bool) -> PathBuf {
+        let root = scratch(name);
+        fs::create_dir_all(root.join("dumps")).expect("the folder can be made");
+        fs::write(root.join("dumps").join("a.dmp"), "dump").expect("the file can be written");
+        if with_output {
+            fs::create_dir_all(root.join("bin")).expect("the folder can be made");
+            fs::write(root.join("bin").join("a.dll"), "abc").expect("the file can be written");
+        }
+        root
+    }
+
+    #[test]
+    fn a_failure_glob_past_the_limit_drops_the_failure_globs_and_keeps_the_outputs_manifest() {
+        let root = dumped_worktree("failure-past-the-limit", true);
+        let (outputs, failure) = dumped_lists();
+        let none = HashCache::default();
+        let (alone, alone_files, _) = manifest_line(&root, &outputs, MANIFEST_LIMIT, &none, || true).expect("the outputs fit");
+        let limit = alone.len();
+
+        let Manifested { built, dropped } = manifest_over(&root, (&outputs, &failure), limit, &none, || true);
+
+        assert_eq!(
+            dropped.as_deref(),
+            Some(PAST_THE_CAP),
+            "the failure output globs are dropped for the failed build's reason"
+        );
+        let (line, files, _) = built.expect("the outputs manifest is built").expect("the outputs alone fit");
+        assert_eq!((line, files), (alone, alone_files), "the manifest holds the outputs alone");
+        let roomy = manifest_over(&root, (&outputs, &failure), MANIFEST_LIMIT, &none, || true);
+        assert_eq!(roomy.dropped, None, "both lists fit, so the failure output globs are carried");
+        let (_, files, _) = roomy.built.expect("the manifest is built").expect("both lists fit");
+        assert_eq!(files.files().count(), 2, "both files are listed");
+        let interrupted = manifest_over(&root, (&outputs, &failure), limit, &none, || false);
+        assert_eq!(
+            interrupted,
+            Manifested {
+                built: Some(Err(Unbuilt::Interrupted)),
+                dropped: None
+            },
+            "an interrupt builds nothing again"
+        );
+    }
+
+    #[test]
+    fn outputs_past_the_limit_too_says_no_failure_outputs_line() {
+        let root = dumped_worktree("outputs-past-the-limit-too", true);
+        let (outputs, failure) = dumped_lists();
+
+        let none = HashCache::default();
+        let alone = manifest_line(&root, &outputs, 10, &none, || true).map(|_| ());
+
+        let manifested = manifest_over(&root, (&outputs, &failure), 10, &none, || true);
+
+        assert_eq!(alone, Err(Unbuilt::Failed(PAST_THE_CAP.to_owned())), "the outputs alone do not fit");
+        assert_eq!(
+            manifested,
+            Manifested {
+                built: Some(Err(Unbuilt::Failed(PAST_THE_CAP.to_owned()))),
+                dropped: None
+            },
+            "the run ends as a failed build for the outputs alone's reason, the failure output globs not named as the cause"
+        );
+    }
+
+    #[test]
+    fn a_failure_only_list_past_the_limit_carries_nothing() {
+        let root = dumped_worktree("failure-only-past-the-limit", false);
+        let (_, failure) = dumped_lists();
+
+        let manifested = manifest_over(&root, (&[], &failure), 10, &HashCache::default(), || true);
+
+        assert_eq!(
+            manifested,
+            Manifested {
+                built: None,
+                dropped: Some(PAST_THE_CAP.to_owned())
+            }
+        );
+    }
+
+    #[test]
+    fn a_passing_run_whose_manifest_holds_only_failure_files_brought_nothing_back() {
+        let (outputs, failure) = dumped_lists();
+        let listed = [outputs[0].clone(), failure[0].clone()];
+        let none = HashCache::default();
+        let root = dumped_worktree("failure-files-only", false);
+        let (_, files, _) = manifest_line(&root, &listed, MANIFEST_LIMIT, &none, || true).expect("the manifest is built");
+        assert_ne!(files, Manifest::default(), "the manifest holds the dump");
+
+        assert!(!holds_outputs(&files, &outputs), "a failure output is not an output brought back");
+
+        let root = dumped_worktree("failure-files-and-outputs", true);
+        let (_, files, _) = manifest_line(&root, &listed, MANIFEST_LIMIT, &none, || true).expect("the manifest is built");
+        assert!(holds_outputs(&files, &outputs), "an output the PC holds is");
     }
 
     /// An hour, the age a file is given so a build takes it as settled.

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use gate_args::BoxSeams;
+use gate_inputs::failure::Caps;
 use gate_inputs::manifest::{Listing, Manifest};
 use gate_wire::drain::refused_lines;
 use gate_wire::{CrossBuild, PairSibling, PathForm, Payload, Refusal, bare_stem, busy_line, escaped, layout_line, refused_line, trees};
@@ -200,9 +201,10 @@ impl<'p> Request<'p> {
         let (key, work) = payload.work_folder()?;
         let (root, parent) = work_layout(work)?;
         let (globs, full) = (payload.output_globs()?, payload.outputs_full()?);
+        let failure = payload.failure_output_globs()?;
         let cross = payload.cross_build()?;
         let nonce = payload.nonce()?;
-        let outputs = Asked::new(&globs, full, key, nonce, payload.output_folder(work)?)?
+        let outputs = Asked::new((&globs, &failure), full, key, nonce, payload.output_folder(work)?)?
             .map(|asked| asked.crossed_for(cross.as_ref().map(|cross| cross.rid.as_str())));
         let (timeout, host) = (payload.timeout()?, payload.optional_text("Host")?);
         let desktop = payload.desktop()?;
@@ -870,7 +872,7 @@ fn synced_back<S: LineSink + 'static>(ready: &Ready<'_>, output: &Arc<Output<S>>
             brought_back(ready, (asked, read), main, output, budget)
         }
         (Some(asked), Some(read)) => {
-            if let Some(reports) = asked.test_reports() {
+            if let Some(reports) = asked.failed_run(Caps::BUILT_IN) {
                 // A failed command ends on its own status, so the pack's own is only said.
                 let _ = brought_back(ready, (&reports, read), main, output, budget);
             }
@@ -939,6 +941,9 @@ fn brought_back<S: LineSink + 'static>(
     }
     if let Some(skipped) = &brought.skipped {
         noted(output, GAT, skipped);
+    }
+    for left in &brought.left {
+        noted(output, GAT, left);
     }
     if let Some(size) = &brought.size {
         noted(output, Stamp::Bare, size);
@@ -4045,6 +4050,64 @@ mod tests {
         let line = format!("gate-remote-outputs: 1 {}", archive_name());
         assert_eq!(outputs_said(&said), [line.as_str()], "{said:?}");
         assert_eq!(members_of(&case.archive()), ["TestResults/r.trx"], "only the report comes back");
+    }
+
+    /// A command that writes `bin/new.txt`, the report `TestResults/r.trx` and the dump `dumps/a.dmp`, then fails with
+    /// 3.
+    const FAILS_WITH_A_DUMP: &str =
+        "mkdir -p bin TestResults dumps && echo new > bin/new.txt && echo trx > TestResults/r.trx && echo dmp > dumps/a.dmp; exit 3";
+
+    /// The payload of a run of `command` asking for the outputs `outputs` and the failure outputs `failure`.
+    fn failure_json(case: &Case, commit: &str, command: &str, (outputs, failure): (&[&str], &[&str])) -> Value {
+        case.json(
+            commit,
+            &json!({
+                "Command": ["/bin/sh", "-c", command],
+                "Identity": identity(),
+                "Outputs": outputs,
+                "FailureOutputs": failure,
+            }),
+        )
+    }
+
+    /// A case like [`reports_case`] whose snapshot also ignores `dumps/`.
+    fn dumps_case(name: &str) -> (Case, String) {
+        let case = Case::new(name);
+        let commit = case.snapshot(&[("a.txt", "a\n"), (".gitignore", "bin/\nTestResults/\ndumps/\n")]);
+        (case, commit)
+    }
+
+    #[test]
+    fn a_failed_command_with_a_failure_output_glob_packs_its_file() {
+        let (case, commit) = dumps_case("outputs-failed-dump");
+        let json = failure_json(&case, &commit, FAILS_WITH_A_DUMP, (&["bin/**"], &["dumps/*.dmp"]));
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        assert_eq!(status, 3, "the command's own status: {said:?}");
+        let line = format!("gate-remote-outputs: 1 {}", archive_name());
+        assert_eq!(outputs_said(&said), [line.as_str()], "{said:?}");
+        assert_eq!(members_of(&case.archive()), ["dumps/a.dmp"], "the dump comes back, the build does not");
+    }
+
+    #[test]
+    fn a_failed_command_with_both_kinds_of_glob_packs_both() {
+        let (case, commit) = dumps_case("outputs-failed-both");
+        let json = failure_json(&case, &commit, FAILS_WITH_A_DUMP, (&BIN_AND_REPORTS, &["dumps/*.dmp"]));
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        assert_eq!(status, 3, "the command's own status: {said:?}");
+        let line = format!("gate-remote-outputs: 2 {}", archive_name());
+        assert_eq!(outputs_said(&said), [line.as_str()], "{said:?}");
+        assert_eq!(members_of(&case.archive()), ["TestResults/r.trx", "dumps/a.dmp"]);
+    }
+
+    #[test]
+    fn a_passing_command_does_not_pack_a_file_only_a_failure_output_glob_matches() {
+        let (case, commit) = dumps_case("outputs-passed-dump");
+        let command = "mkdir -p dumps && echo dmp > dumps/a.dmp";
+        let json = failure_json(&case, &commit, command, (&[], &["dumps/*.dmp"]));
+        let (status, said) = run_fed(&json, &mut fed(NO_FILES), free_watches());
+        assert_eq!(status, 0, "{said:?}");
+        assert_eq!(outputs_said(&said), [crate::outputs::NOTHING_PACKED], "{said:?}");
+        assert!(!case.archive().exists(), "nothing is packed");
     }
 
     #[test]

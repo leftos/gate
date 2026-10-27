@@ -1206,6 +1206,87 @@ fn box_seam_outputs_budget_bytes_refuses_what_the_run_seams_refuse() {
 
 #[cfg(feature = "test-seams")]
 #[test]
+fn box_seam_failure_cap_bytes_is_read_before_the_verb() {
+    use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
+
+    use crate::support::invocation;
+
+    let capped = |failure_cap_bytes| {
+        Invocation::Box(BoxRequest {
+            verb: BoxVerb::Run,
+            seams: BoxSeams {
+                failure_cap_bytes,
+                ..BoxSeams::default()
+            },
+            root: None,
+            keys: Vec::new(),
+        })
+    };
+    assert_eq!(
+        invocation(&["box", "--test-box-failure-cap-bytes", "1024", "run", "--stdin"]),
+        capped(Some(1024))
+    );
+    assert_eq!(
+        invocation(&["box", "--test-box-failure-cap-bytes=1024", "run", "--stdin"]),
+        capped(Some(1024))
+    );
+    assert_eq!(invocation(&["box", "run", "--stdin"]), capped(None), "no seam given, none set");
+    assert_eq!(
+        invocation(&["box", "--test-box-failure-cap-bytes", "2147483647", "run", "--stdin"]),
+        capped(Some(2_147_483_647))
+    );
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn box_seam_failure_cap_bytes_refuses_what_the_run_seams_refuse() {
+    let rows: [(&[&str], &[&str]); 7] = [
+        (
+            &["box", "--test-box-failure-cap-bytes", "--test-box-failure-cap-bytes=2", "run", "--stdin"],
+            &[
+                "gate: --test-box-failure-cap-bytes needs a value",
+                "gate: --test-box-failure-cap-bytes is given twice",
+            ],
+        ),
+        (
+            &["box", "--test-box-failure-cap-bytes=", "run", "--stdin"],
+            &["gate: --test-box-failure-cap-bytes needs a value"],
+        ),
+        (
+            &["box", "--test-box-failure-cap-bytes", "0", "run", "--stdin"],
+            &["gate: --test-box-failure-cap-bytes must be a whole number above 0, got '0'"],
+        ),
+        (
+            &["box", "--test-box-failure-cap-bytes", "fast", "run", "--stdin"],
+            &["gate: --test-box-failure-cap-bytes must be a whole number above 0, got 'fast'"],
+        ),
+        (
+            &["box", "--test-box-failure-cap-bytes", "2147483648", "run", "--stdin"],
+            &["gate: --test-box-failure-cap-bytes must be at most 2147483647, got '2147483648'"],
+        ),
+        (
+            &[
+                "box",
+                "--test-box-failure-cap-bytes",
+                "1",
+                "--test-box-failure-cap-bytes=2",
+                "run",
+                "--stdin",
+            ],
+            &["gate: --test-box-failure-cap-bytes is given twice"],
+        ),
+        (
+            &["box", "--test-box-failure-cap-bytes"],
+            &["gate: --test-box-failure-cap-bytes needs a value", BOX_USAGE],
+        ),
+    ];
+    for (words, want) in rows {
+        assert_eq!(problems(words), want, "{words:?}");
+    }
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
 fn box_seam_inputs_budget_bytes_is_read_before_the_verb() {
     use gate_args::{BoxRequest, BoxSeams, BoxVerb, Invocation};
 

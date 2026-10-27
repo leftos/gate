@@ -214,6 +214,9 @@ pub(crate) struct RemoteCall<'a> {
     /// Whether the route withheld the run's outputs, its command a dotnet `--no-build` one whose word the builder
     /// dropped: the builder builds, and nothing comes back.
     pub outputs_withheld: bool,
+    /// The failure output globs a failed run brings back beside its test reports
+    /// ([`gate_router::RemoteRun::failure_outputs`]).
+    pub failure_outputs: &'a [String],
     /// Whether [`RemoteCall::words`] are a dotnet command's with `--no-build` dropped ([`gate_router::RemoteRun::dropped_no_build`]).
     pub dropped_no_build: bool,
     /// The route's send of the PC's build, which lets the builder keep a `dotnet test`'s `--no-build`
@@ -554,6 +557,7 @@ mod snapshot_only {
                 words: &[],
                 outputs: &[],
                 outputs_withheld: false,
+                failure_outputs: &[],
                 dropped_no_build: false,
                 send: None,
                 desktop: false,

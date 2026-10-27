@@ -426,6 +426,7 @@ pub(super) mod tests {
                 dropped_no_build: false,
                 send: None,
                 outputs_withheld: false,
+                failure_outputs: Vec::new(),
                 desktop: false,
                 source_revision: None,
                 later: Vec::new(),
