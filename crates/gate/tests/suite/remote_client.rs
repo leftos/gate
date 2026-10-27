@@ -4760,8 +4760,9 @@ fn a_retried_fetch_whose_reason_reads_as_an_error_still_passes() {
 }
 
 /// The transfer ceiling `--test-remote-watch-call fetch` gives the sync-back's fetch, and the pause before its retry,
-/// no shorter: a fetch that drops has less than the pause left of the ceiling it shares with its retries.
-const SHARED_CEILING_MS: &str = "5000";
+/// the same: a fetch that drops always has less than the pause left of the ceiling it shares with its retries, however
+/// long the machine took to get there. Ten minutes, so no attempt that ends is cut by it.
+const SHARED_CEILING_MS: &str = "600000";
 
 /// Through `local-ssh`, the sync-back's fetch drops once less than the pause before a retry is left of its transfer
 /// ceiling, which every attempt shares: it is not made again, and the run ends as a fetch past its ceiling does.
@@ -4787,7 +4788,7 @@ fn a_fetch_that_drops_near_its_transfer_ceiling_is_not_retried_past_it() {
     assert_eq!(outcome.code, Some(124), "{outcome:?}");
     assert!(!outcome.stderr.contains(TRANSFER_RETRY), "no retry: {outcome:?}");
     assert!(
-        outcome.stderr.contains("gate: TRANSFER TIMED OUT after 5 s fetching the sync-back"),
+        outcome.stderr.contains("gate: TRANSFER TIMED OUT after 600 s fetching the sync-back"),
         "{outcome:?}"
     );
     assert!(!case.folder().join("made-on-box.txt").exists(), "nothing was applied: {outcome:?}");
