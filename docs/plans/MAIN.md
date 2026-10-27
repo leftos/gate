@@ -12,19 +12,19 @@
 - [/] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
 - [ ] GATE-559 Drain the builder behind a barrier so it can be redeployed — High · Remote
-- [ ] GATE-563 Builder drain 2: make a routed run wait on its PC for the lift — High · Remote
+- [/] GATE-563 Builder drain 2: make a routed run wait on its PC for the lift — High · Remote
 - [ ] GATE-564 Builder drain 3: gate drain on the PC, and its docs — High · Remote
-- [ ] GATE-807 Builder drain 1b: the barrier on the Unix box — High · Remote
+- [/] GATE-807 Builder drain 1b: the barrier on the Unix box — High · Remote
 - [ ] GATE-621 Ask for a full outputs send when a worktree's routed runs switch builder — High · Remote
 - [ ] GATE-682 Explain or track a stall when a gated command is plain ssh to another machine — High · Remote
 - [/] GATE-683 Prune a deleted worktree's folders from every builder, and prune the Mac by space — High · Remote
 - [ ] GATE-689 Prune a gone worktree's keys from the Windows builders and the PC — High · Remote
-- [ ] GATE-731 Route yaat's test-all to the Mac mini — High · Remote
 - [ ] GATE-745 Bring back the files a routed dotnet command's /flp and /getResultOutputFile switches name — High · Remote
 - [ ] GATE-751 Make a routed build's outputs pull fast enough for yaat's trees, or skip it for verdict-only runs — High · Remote
 - [ ] GATE-753 Log every step of a run in the gate's log: start, progress, end and duration — High · Remote
 - [ ] GATE-759 Move the rest of the box's shared wire rules into gate-wire (GATE-616 slices 2, 3, 5, 6) — High · Remote
-- [ ] GATE-806 Send the gitignored project inputs a routed command names to the builder — High · Remote
+- [/] GATE-806 Send the gitignored project inputs a routed command names to the builder — High · Remote
+- [ ] GATE-820 Stamp a routed run's installed outputs with the time they land on the PC — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -272,6 +272,9 @@
 - [ ] GATE-811 Close the gitignored-input rule's edge cases: nested repos, unreadable metadata, spelled case, one check-ignore helper
 - [ ] GATE-816 Check the drain folder's protection before the prune trusts a barrier
 - [ ] GATE-818 Run the box prune's gc in a root with bares but no work folder
+- [ ] GATE-821 Balance routed runs across every builder that can take them, not first-in-file-order
+- [ ] GATE-822 Remove a dead drain ticket by its listed name, not a rebuilt one, on both boxes
+- [ ] GATE-823 Settle GATE-806's carried inputs: the exact-path match cost and what the sweep skips
 
 ## Cutover sweep
 
