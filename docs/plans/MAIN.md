@@ -12,7 +12,6 @@
 - [!] GATE-361 Answer yaat's routed-run report: env forwarding, a corrupt ref assembly, the stale line, formatter fixes — High · Remote
 - [/] GATE-439 Trial routing all of delve-the-dungeon's work, Godot imports and test-all.ps1 included — High · Remote
 - [/] GATE-449 Trial routed commit hooks in delve-the-dungeon and ship the slim pass-through launcher — High · Remote
-- [ ] GATE-554 Bring a failed routed run's test reports back — High · Remote
 - [ ] GATE-559 Drain the builder behind a barrier so it can be redeployed — High · Remote
 - [ ] GATE-562 Builder drain 1: the barrier, admission and gated verbs on the box — High · Remote
 - [ ] GATE-563 Builder drain 2: make a routed run wait on its PC for the lift — High · Remote
@@ -32,7 +31,6 @@
 - [ ] GATE-753 Log every step of a run in the gate's log: start, progress, end and duration — High · Remote
 - [ ] GATE-757 Retry a transfer that fails after a passing routed command, and say the command's verdict — High · Remote
 - [ ] GATE-759 Move the rest of the box's shared wire rules into gate-wire (GATE-616 slices 2, 3, 5, 6) — High · Remote
-- [ ] GATE-798 Give Mac runs a TMPDIR whose group the builder user is in, so setgid survives — High · Remote
 - [ ] GATE-594 Route Godot exports and Unreal builds to the Mac builder — High · Backlog
 
 ## Design
@@ -59,6 +57,8 @@
 - [ ] GATE-782 Keep a bare repository's hooks from running on the Unix box's pushes (sub-issue of GATE-614)
 - [ ] GATE-786 Check the Unix box's tree and bare before its lock sweep, and the rest of .git (sub-issue of GATE-614)
 - [ ] GATE-790 Fall back, not fail, on a leftover hard link or foreign entry at the Unix box's work lock (sub-issue of GATE-614)
+- [ ] GATE-800 Give folders the Unix box makes under the work root the box user's group, or judge the root's group (sub-issue of GATE-614)
+- [ ] GATE-801 Check the Mac builder's home stays private after install, or move the restore caches under the work root (sub-issue of GATE-614)
 - [ ] GATE-663 Keep the Unix box's preflight from racing a run's git lock sweep on the same key (sub-issue of GATE-593)
 - [ ] GATE-666 Let the Unix box's stop reach a run between two steps with a stop marker (sub-issue of GATE-593)
 - [ ] GATE-667 Keep the Unix box's stop under the client's stop limit when it follows several groups (sub-issue of GATE-593)
@@ -381,3 +381,4 @@
 - [ ] GATE-765 Refuse a Unix box work folder others can write
 - [ ] GATE-766 Keep a stop's escalation waiting when its leader cannot be looked at
 - [ ] GATE-767 Keep the orphan check on when another account plants MSYS objects
+- [ ] GATE-802 Find why test-install-macos.sh takes 19 minutes on the PC under load
